@@ -1,0 +1,16 @@
+[package]
+name = "reap-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "reap"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+reap-backtest.workspace = true
+reap-strategy.workspace = true
+serde_json.workspace = true
+toml.workspace = true

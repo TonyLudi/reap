@@ -196,16 +196,61 @@ dependencies = [
 ]
 
 [[package]]
-name = "reap"
+name = "reap-backtest"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "csv",
+ "reap-book",
+ "reap-core",
+ "reap-order",
+ "reap-strategy",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "reap-book"
+version = "0.1.0"
+dependencies = [
+ "reap-core",
+ "serde",
+]
+
+[[package]]
+name = "reap-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "csv",
+ "reap-backtest",
+ "reap-strategy",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
+name = "reap-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "reap-order"
+version = "0.1.0"
+dependencies = [
+ "reap-core",
+ "serde",
+]
+
+[[package]]
+name = "reap-strategy"
+version = "0.1.0"
+dependencies = [
+ "reap-core",
  "serde",
  "serde_json",
- "thiserror",
- "toml",
 ]
 
 [[package]]
@@ -281,26 +326,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
-]
-
-[[package]]
-name = "thiserror"
-version = "2.0.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
-dependencies = [
- "thiserror-impl",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "2.0.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]

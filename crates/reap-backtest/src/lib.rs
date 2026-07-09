@@ -3,7 +3,9 @@ mod portfolio;
 mod replay;
 
 pub use matching::MatchingEngine;
-pub use replay::{ReplayRow, load_events_from_path};
+pub use replay::{
+    ReplayRow, load_events_from_path, load_normalized_jsonl, load_normalized_jsonl_from_path,
+};
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -11,9 +13,12 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::backtest::portfolio::Portfolio;
-use crate::strategy::{ChaosConfig, ChaosStrategy, Strategy};
-use crate::types::{FillLiquidity, MarketEvent, NewOrder, OrderUpdate, StrategyCommand, Symbol};
+use crate::portfolio::Portfolio;
+use reap_core::{
+    FillLiquidity, MarketEvent, NewOrder, NormalizedEvent, OrderIntent, OrderUpdate, StrategyEvent,
+    Symbol,
+};
+use reap_strategy::{ChaosConfig, ChaosStrategy, Strategy};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BacktestReport {
@@ -66,33 +71,49 @@ impl BacktestRunner {
         self.run(events)
     }
 
+    pub fn run_normalized_jsonl_path(mut self, path: impl AsRef<Path>) -> Result<BacktestReport> {
+        let events = load_normalized_jsonl_from_path(path.as_ref()).with_context(|| {
+            format!(
+                "failed to load normalized replay events from {}",
+                path.as_ref().display()
+            )
+        })?;
+        self.run(events)
+    }
+
     pub fn run<I>(&mut self, events: I) -> Result<BacktestReport>
     where
-        I: IntoIterator<Item = MarketEvent>,
+        I: IntoIterator<Item = NormalizedEvent>,
     {
         for event in events {
             match &event {
-                MarketEvent::Depth(book) => {
+                NormalizedEvent::Market(MarketEvent::Depth(book)) => {
                     let updates = self.matcher_mut(&book.symbol)?.on_depth(book.clone());
                     let commands = self.process_updates(updates)?;
                     self.process_commands(commands)?;
-                    let commands = self.strategy.on_market_event(&event);
-                    self.process_commands(commands)?;
+                    self.process_strategy_event(event.clone().into_strategy_event())?;
                 }
-                MarketEvent::Trade {
+                NormalizedEvent::Market(MarketEvent::Trade {
+                    ts_ms,
                     symbol,
                     price,
                     qty,
                     taker_side,
                     ..
-                } => {
-                    let updates = self
-                        .matcher_mut(symbol)?
-                        .on_trade(*price, *qty, *taker_side);
+                }) => {
+                    let updates =
+                        self.matcher_mut(symbol)?
+                            .on_trade(*ts_ms, *price, *qty, *taker_side);
                     let commands = self.process_updates(updates)?;
                     self.process_commands(commands)?;
-                    let commands = self.strategy.on_market_event(&event);
+                    self.process_strategy_event(event.clone().into_strategy_event())?;
+                }
+                NormalizedEvent::Order(update) => {
+                    let commands = self.process_updates(vec![update.clone()])?;
                     self.process_commands(commands)?;
+                }
+                NormalizedEvent::Timer(_) | NormalizedEvent::Control(_) => {
+                    self.process_strategy_event(event.clone().into_strategy_event())?;
                 }
             }
         }
@@ -122,18 +143,18 @@ impl BacktestRunner {
             .with_context(|| format!("no matcher configured for symbol {symbol}"))
     }
 
-    fn process_commands(&mut self, commands: Vec<StrategyCommand>) -> Result<()> {
+    fn process_commands(&mut self, commands: Vec<OrderIntent>) -> Result<()> {
         let mut queue = commands;
         while !queue.is_empty() {
             let mut next = Vec::new();
             for command in queue {
                 match command {
-                    StrategyCommand::NewOrder(order) => {
+                    OrderIntent::NewOrder(order) => {
                         self.orders_sent += 1;
                         let updates = self.submit_order(order)?;
                         next.extend(self.process_updates(updates)?);
                     }
-                    StrategyCommand::CancelOrder { order_id, reason } => {
+                    OrderIntent::CancelOrder { order_id, reason } => {
                         let updates = self.cancel_order(&order_id, &reason)?;
                         next.extend(self.process_updates(updates)?);
                     }
@@ -157,7 +178,7 @@ impl BacktestRunner {
         Ok(Vec::new())
     }
 
-    fn process_updates(&mut self, updates: Vec<OrderUpdate>) -> Result<Vec<StrategyCommand>> {
+    fn process_updates(&mut self, updates: Vec<OrderUpdate>) -> Result<Vec<OrderIntent>> {
         let mut commands = Vec::new();
         for update in updates {
             if update.has_fill() {
@@ -169,16 +190,21 @@ impl BacktestRunner {
                 }
                 self.portfolio.apply_fill(&update);
             }
-            commands.extend(self.strategy.on_order_update(&update));
+            commands.extend(self.strategy.on_event(&StrategyEvent::Order(update)));
         }
         Ok(commands)
+    }
+
+    fn process_strategy_event(&mut self, event: StrategyEvent) -> Result<()> {
+        let commands = self.strategy.on_event(&event);
+        self.process_commands(commands)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::strategy::{InstrumentConfig, InstrumentKindConfig, RiskGroupConfig};
-    use crate::types::{Level, OrderBook, Side};
+    use reap_core::{Level, OrderBook, Side};
+    use reap_strategy::{InstrumentConfig, InstrumentKindConfig, RiskGroupConfig};
 
     use super::*;
 
@@ -230,25 +256,25 @@ mod tests {
     fn replayed_quote_fill_triggers_hedge_order() {
         let mut runner = BacktestRunner::new(config());
         let events = vec![
-            MarketEvent::Depth(OrderBook::one_level(
+            NormalizedEvent::from(MarketEvent::Depth(OrderBook::one_level(
                 "BTC-USDT",
                 1,
                 Level::new(50_000.0, 2.0),
                 Level::new(50_001.0, 2.0),
-            )),
-            MarketEvent::Depth(OrderBook::one_level(
+            ))),
+            NormalizedEvent::from(MarketEvent::Depth(OrderBook::one_level(
                 "BTC-PERP",
                 1,
                 Level::new(50_003.0, 10_000.0),
                 Level::new(50_004.0, 10_000.0),
-            )),
-            MarketEvent::Trade {
+            ))),
+            NormalizedEvent::from(MarketEvent::Trade {
                 ts_ms: 2,
                 symbol: "BTC-USDT".to_string(),
                 price: 49_000.0,
                 qty: 1.0,
                 taker_side: Side::Sell,
-            },
+            }),
         ];
 
         let report = runner.run(events).unwrap();
@@ -256,5 +282,22 @@ mod tests {
         assert!(report.fills >= 1);
         assert!(report.taker_fills >= 1);
         assert!(report.final_delta_usd.abs() < 5_000.0);
+    }
+
+    #[test]
+    fn normalized_fixture_replays_quote_and_hedge_path() {
+        let events = load_normalized_jsonl(
+            include_str!("../../../fixtures/normalized/chaos_quote_hedge.jsonl").as_bytes(),
+        )
+        .unwrap();
+        let mut runner = BacktestRunner::new(config());
+
+        let report = runner.run(events).unwrap();
+
+        assert!(report.orders_sent >= 1);
+        assert_eq!(report.fills, 2);
+        assert_eq!(report.maker_fills, 1);
+        assert_eq!(report.taker_fills, 1);
+        assert!(report.final_delta_usd.abs() < 1_000.0);
     }
 }

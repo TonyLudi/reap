@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use crate::strategy::{InstrumentConfig, InstrumentKindConfig};
-use crate::types::{FillLiquidity, OrderUpdate, Side, Symbol};
+use reap_core::{FillLiquidity, OrderUpdate, Side, Symbol};
+use reap_strategy::{InstrumentConfig, InstrumentKindConfig};
 
 #[derive(Debug, Clone)]
 pub struct Portfolio {

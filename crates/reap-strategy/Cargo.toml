@@ -1,0 +1,11 @@
+[package]
+name = "reap-strategy"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+reap-core.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

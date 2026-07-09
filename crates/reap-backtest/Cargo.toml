@@ -1,0 +1,14 @@
+[package]
+name = "reap-backtest"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+csv.workspace = true
+reap-book.workspace = true
+reap-core.workspace = true
+reap-order.workspace = true
+reap-strategy.workspace = true
+serde.workspace = true
+serde_json.workspace = true

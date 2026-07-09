@@ -170,13 +170,14 @@ pub struct NewOrder {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum StrategyCommand {
+pub enum OrderIntent {
     NewOrder(NewOrder),
     CancelOrder { order_id: String, reason: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderUpdate {
+    pub ts_ms: TimeMs,
     pub order_id: String,
     pub symbol: Symbol,
     pub side: Side,
@@ -213,6 +214,96 @@ pub enum MarketEvent {
         qty: Quantity,
         taker_side: Side,
     },
+}
+
+impl MarketEvent {
+    pub fn ts_ms(&self) -> TimeMs {
+        match self {
+            Self::Depth(book) => book.ts_ms,
+            Self::Trade { ts_ms, .. } => *ts_ms,
+        }
+    }
+
+    pub fn symbol(&self) -> &str {
+        match self {
+            Self::Depth(book) => &book.symbol,
+            Self::Trade { symbol, .. } => symbol,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimerEvent {
+    pub ts_ms: TimeMs,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlEvent {
+    pub ts_ms: TimeMs,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StrategyEvent {
+    Market(MarketEvent),
+    Order(OrderUpdate),
+    Timer(TimerEvent),
+    Control(ControlEvent),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum NormalizedEvent {
+    Market(MarketEvent),
+    Order(OrderUpdate),
+    Timer(TimerEvent),
+    Control(ControlEvent),
+}
+
+impl NormalizedEvent {
+    pub fn market(event: MarketEvent) -> Self {
+        Self::Market(event)
+    }
+
+    pub fn order(update: OrderUpdate) -> Self {
+        Self::Order(update)
+    }
+
+    pub fn ts_ms(&self) -> TimeMs {
+        match self {
+            Self::Market(event) => event.ts_ms(),
+            Self::Order(update) => update.ts_ms,
+            Self::Timer(event) => event.ts_ms,
+            Self::Control(event) => event.ts_ms,
+        }
+    }
+
+    pub fn into_strategy_event(self) -> StrategyEvent {
+        match self {
+            Self::Market(event) => StrategyEvent::Market(event),
+            Self::Order(update) => StrategyEvent::Order(update),
+            Self::Timer(event) => StrategyEvent::Timer(event),
+            Self::Control(event) => StrategyEvent::Control(event),
+        }
+    }
+}
+
+impl From<MarketEvent> for NormalizedEvent {
+    fn from(event: MarketEvent) -> Self {
+        Self::Market(event)
+    }
+}
+
+impl From<OrderUpdate> for NormalizedEvent {
+    fn from(update: OrderUpdate) -> Self {
+        Self::Order(update)
+    }
+}
+
+impl From<NormalizedEvent> for StrategyEvent {
+    fn from(event: NormalizedEvent) -> Self {
+        event.into_strategy_event()
+    }
 }
 
 pub fn round_to_tick(px: Price, tick_size: f64) -> Price {

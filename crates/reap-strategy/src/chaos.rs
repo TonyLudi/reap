@@ -2,10 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::strategy::Strategy;
-use crate::types::{
-    MarketEvent, NewOrder, OrderBook, OrderEvent, OrderUpdate, Price, Quantity, Side,
-    StrategyCommand, Symbol, TimeInForce, TimeMs, round_down_to_lot, round_to_tick,
+use crate::Strategy;
+use reap_core::{
+    MarketEvent, NewOrder, OrderBook, OrderEvent, OrderIntent, OrderUpdate, Price, Quantity, Side,
+    StrategyEvent, Symbol, TimeInForce, TimeMs, round_down_to_lot, round_to_tick,
 };
 
 const HEDGE_VOL_TO_DELTA_RATIO: f64 = 1.5;
@@ -243,7 +243,7 @@ impl ChaosStrategy {
         self.risk_groups.get(name)
     }
 
-    fn on_depth(&mut self, book: &OrderBook) -> Vec<StrategyCommand> {
+    fn on_depth(&mut self, book: &OrderBook) -> Vec<OrderIntent> {
         self.now_ms = book.ts_ms;
         if let Some(entity) = self.entities.get_mut(&book.symbol) {
             entity.book = Some(book.clone());
@@ -251,7 +251,7 @@ impl ChaosStrategy {
         self.refresh_quotes()
     }
 
-    fn refresh_quotes(&mut self) -> Vec<StrategyCommand> {
+    fn refresh_quotes(&mut self) -> Vec<OrderIntent> {
         self.update_risk();
         self.update_best_hedges();
         self.update_theo_quotes();
@@ -295,13 +295,13 @@ impl ChaosStrategy {
         symbol: &str,
         side: Side,
         desired: Option<TheoQuote>,
-        commands: &mut Vec<StrategyCommand>,
+        commands: &mut Vec<OrderIntent>,
     ) {
         let key = (symbol.to_string(), side);
         let current = self.active_quotes.get(&key).cloned();
         let Some(desired) = desired else {
             if let Some(active) = current {
-                commands.push(StrategyCommand::CancelOrder {
+                commands.push(OrderIntent::CancelOrder {
                     order_id: active.order_id,
                     reason: "quote_disabled".to_string(),
                 });
@@ -313,13 +313,13 @@ impl ChaosStrategy {
             if approx_eq(active.price, desired.price) && approx_eq(active.qty, desired.qty) {
                 return;
             }
-            commands.push(StrategyCommand::CancelOrder {
+            commands.push(OrderIntent::CancelOrder {
                 order_id: active.order_id,
                 reason: "replace_quote".to_string(),
             });
         }
 
-        commands.push(StrategyCommand::NewOrder(NewOrder {
+        commands.push(OrderIntent::NewOrder(NewOrder {
             symbol: symbol.to_string(),
             side,
             qty: desired.qty,
@@ -657,7 +657,7 @@ impl ChaosStrategy {
         total
     }
 
-    fn maybe_hedge(&mut self, fill_symbol: &str, source_reason: &str) -> Vec<StrategyCommand> {
+    fn maybe_hedge(&mut self, fill_symbol: &str, source_reason: &str) -> Vec<OrderIntent> {
         if source_reason.starts_with("hedge") {
             return Vec::new();
         }
@@ -711,7 +711,7 @@ impl ChaosStrategy {
                 if target.qty < entity.config.min_trade_size {
                     return None;
                 }
-                Some(StrategyCommand::NewOrder(NewOrder {
+                Some(OrderIntent::NewOrder(NewOrder {
                     symbol: target.symbol,
                     side: hedge_side,
                     qty: target.qty,
@@ -801,8 +801,8 @@ impl ChaosStrategy {
     }
 }
 
-impl Strategy for ChaosStrategy {
-    fn on_market_event(&mut self, event: &MarketEvent) -> Vec<StrategyCommand> {
+impl ChaosStrategy {
+    fn on_market_event(&mut self, event: &MarketEvent) -> Vec<OrderIntent> {
         match event {
             MarketEvent::Depth(book) => self.on_depth(book),
             MarketEvent::Trade { ts_ms, .. } => {
@@ -812,7 +812,7 @@ impl Strategy for ChaosStrategy {
         }
     }
 
-    fn on_order_update(&mut self, update: &OrderUpdate) -> Vec<StrategyCommand> {
+    fn on_order_update(&mut self, update: &OrderUpdate) -> Vec<OrderIntent> {
         let key = (update.symbol.clone(), update.side);
         match update.event {
             OrderEvent::New if update.reason.starts_with("quote") => {
@@ -835,10 +835,25 @@ impl Strategy for ChaosStrategy {
             if let Some(entity) = self.entities.get_mut(&update.symbol) {
                 entity.apply_fill(update.side, update.last_fill_qty);
             }
+            self.update_risk();
             return self.maybe_hedge(&update.symbol, &update.reason);
         }
 
         Vec::new()
+    }
+}
+
+impl Strategy for ChaosStrategy {
+    fn on_event(&mut self, event: &StrategyEvent) -> Vec<OrderIntent> {
+        match event {
+            StrategyEvent::Market(market) => self.on_market_event(market),
+            StrategyEvent::Order(update) => self.on_order_update(update),
+            StrategyEvent::Timer(timer) => {
+                self.now_ms = timer.ts_ms;
+                self.refresh_quotes()
+            }
+            StrategyEvent::Control(_) => Vec::new(),
+        }
     }
 }
 
@@ -1235,7 +1250,7 @@ fn approx_eq(a: f64, b: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Level, MarketEvent, OrderBook, OrderStatus};
+    use reap_core::{Level, MarketEvent, NormalizedEvent, OrderBook, OrderStatus, StrategyEvent};
 
     fn config() -> ChaosConfig {
         ChaosConfig {
@@ -1300,13 +1315,13 @@ mod tests {
             Level::new(50_004.0, 200.0),
         );
 
-        strategy.on_market_event(&MarketEvent::Depth(spot));
-        let commands = strategy.on_market_event(&MarketEvent::Depth(perp));
+        strategy.on_event(&StrategyEvent::Market(MarketEvent::Depth(spot)));
+        let commands = strategy.on_event(&StrategyEvent::Market(MarketEvent::Depth(perp)));
 
         assert!(
             commands
                 .iter()
-                .any(|cmd| matches!(cmd, StrategyCommand::NewOrder(o) if o.reason == "quote"))
+                .any(|cmd| matches!(cmd, OrderIntent::NewOrder(o) if o.reason == "quote"))
         );
         let spot_state = strategy.entity("BTC-USDT").unwrap();
         assert!(spot_state.theo(Side::Buy).unwrap().price < 50_001.0);
@@ -1316,20 +1331,25 @@ mod tests {
     #[test]
     fn quote_fill_triggers_ioc_hedge_excluding_fill_symbol() {
         let mut strategy = ChaosStrategy::new(config());
-        strategy.on_market_event(&MarketEvent::Depth(OrderBook::one_level(
-            "BTC-USDT",
-            1,
-            Level::new(50_000.0, 1.0),
-            Level::new(50_001.0, 1.0),
+        strategy.on_event(&StrategyEvent::Market(MarketEvent::Depth(
+            OrderBook::one_level(
+                "BTC-USDT",
+                1,
+                Level::new(50_000.0, 1.0),
+                Level::new(50_001.0, 1.0),
+            ),
         )));
-        strategy.on_market_event(&MarketEvent::Depth(OrderBook::one_level(
-            "BTC-PERP",
-            1,
-            Level::new(50_003.0, 2000.0),
-            Level::new(50_004.0, 2000.0),
+        strategy.on_event(&StrategyEvent::Market(MarketEvent::Depth(
+            OrderBook::one_level(
+                "BTC-PERP",
+                1,
+                Level::new(50_003.0, 2000.0),
+                Level::new(50_004.0, 2000.0),
+            ),
         )));
 
-        let hedge = strategy.on_order_update(&OrderUpdate {
+        let hedge = strategy.on_event(&StrategyEvent::Order(OrderUpdate {
+            ts_ms: 2,
             order_id: "q1".to_string(),
             symbol: "BTC-USDT".to_string(),
             side: Side::Buy,
@@ -1344,9 +1364,31 @@ mod tests {
             last_fill_price: 50_000.0,
             last_fill_liquidity: None,
             reason: "quote".to_string(),
-        });
+        }));
 
-        assert!(hedge.iter().any(|cmd| matches!(cmd, StrategyCommand::NewOrder(o)
+        assert!(hedge.iter().any(|cmd| matches!(cmd, OrderIntent::NewOrder(o)
             if o.symbol == "BTC-PERP" && o.side == Side::Sell && o.time_in_force == TimeInForce::Ioc)));
+    }
+
+    #[test]
+    fn normalized_fixture_drives_quote_then_hedge_decisions() {
+        let events = include_str!("../../../fixtures/normalized/chaos_quote_hedge.jsonl")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<NormalizedEvent>(line).unwrap())
+            .collect::<Vec<_>>();
+        let mut strategy = ChaosStrategy::new(config());
+
+        let mut all_intents = Vec::new();
+        for event in events {
+            let intents = strategy.on_event(&event.into_strategy_event());
+            all_intents.push(intents);
+        }
+
+        assert!(all_intents[1].iter().any(
+            |intent| matches!(intent, OrderIntent::NewOrder(order) if order.reason == "quote")
+        ));
+        assert!(all_intents[2].iter().any(|intent| matches!(intent, OrderIntent::NewOrder(order)
+            if order.symbol == "BTC-PERP" && order.side == Side::Sell && order.time_in_force == TimeInForce::Ioc)));
     }
 }
