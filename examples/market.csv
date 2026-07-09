@@ -1,0 +1,7 @@
+ts_ms,symbol,bid_px,bid_qty,ask_px,ask_qty,trade_px,trade_qty,taker_side
+1,BTC-USDT,50000.0,2.0,50001.0,2.0,,,
+1,BTC-PERP,50003.0,20000.0,50004.0,20000.0,,,
+2,BTC-USDT,,,,,49000.0,1.0,sell
+3,BTC-PERP,50002.0,20000.0,50003.0,20000.0,,,
+4,BTC-USDT,50001.0,2.0,50002.0,2.0,,,
+5,BTC-USDT,,,,,50015.0,1.0,buy

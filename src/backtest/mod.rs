@@ -1,0 +1,260 @@
+mod matching;
+mod portfolio;
+mod replay;
+
+pub use matching::MatchingEngine;
+pub use replay::{ReplayRow, load_events_from_path};
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+use crate::backtest::portfolio::Portfolio;
+use crate::strategy::{ChaosConfig, ChaosStrategy, Strategy};
+use crate::types::{FillLiquidity, MarketEvent, NewOrder, OrderUpdate, StrategyCommand, Symbol};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BacktestReport {
+    pub orders_sent: usize,
+    pub fills: usize,
+    pub maker_fills: usize,
+    pub taker_fills: usize,
+    pub final_delta_usd: f64,
+    pub final_pending_delta_usd: f64,
+    pub final_equity_usd: f64,
+    pub cash_usd: f64,
+    pub positions: HashMap<Symbol, f64>,
+}
+
+pub struct BacktestRunner {
+    strategy: ChaosStrategy,
+    matchers: HashMap<Symbol, MatchingEngine>,
+    portfolio: Portfolio,
+    orders_sent: usize,
+    fills: usize,
+    maker_fills: usize,
+    taker_fills: usize,
+}
+
+impl BacktestRunner {
+    pub fn new(config: ChaosConfig) -> Self {
+        let matchers = config
+            .instruments
+            .iter()
+            .map(|inst| (inst.symbol.clone(), MatchingEngine::new(inst.clone())))
+            .collect();
+        Self {
+            portfolio: Portfolio::new(&config.instruments),
+            strategy: ChaosStrategy::new(config),
+            matchers,
+            orders_sent: 0,
+            fills: 0,
+            maker_fills: 0,
+            taker_fills: 0,
+        }
+    }
+
+    pub fn run_csv_path(mut self, path: impl AsRef<Path>) -> Result<BacktestReport> {
+        let events = load_events_from_path(path.as_ref()).with_context(|| {
+            format!(
+                "failed to load replay events from {}",
+                path.as_ref().display()
+            )
+        })?;
+        self.run(events)
+    }
+
+    pub fn run<I>(&mut self, events: I) -> Result<BacktestReport>
+    where
+        I: IntoIterator<Item = MarketEvent>,
+    {
+        for event in events {
+            match &event {
+                MarketEvent::Depth(book) => {
+                    let updates = self.matcher_mut(&book.symbol)?.on_depth(book.clone());
+                    let commands = self.process_updates(updates)?;
+                    self.process_commands(commands)?;
+                    let commands = self.strategy.on_market_event(&event);
+                    self.process_commands(commands)?;
+                }
+                MarketEvent::Trade {
+                    symbol,
+                    price,
+                    qty,
+                    taker_side,
+                    ..
+                } => {
+                    let updates = self
+                        .matcher_mut(symbol)?
+                        .on_trade(*price, *qty, *taker_side);
+                    let commands = self.process_updates(updates)?;
+                    self.process_commands(commands)?;
+                    let commands = self.strategy.on_market_event(&event);
+                    self.process_commands(commands)?;
+                }
+            }
+        }
+
+        let marks = self
+            .matchers
+            .iter()
+            .filter_map(|(symbol, matcher)| Some((symbol.clone(), matcher.depth()?.mid()?)))
+            .collect::<HashMap<_, _>>();
+
+        Ok(BacktestReport {
+            orders_sent: self.orders_sent,
+            fills: self.fills,
+            maker_fills: self.maker_fills,
+            taker_fills: self.taker_fills,
+            final_delta_usd: self.strategy.delta_usd(),
+            final_pending_delta_usd: self.strategy.pending_delta_usd(),
+            final_equity_usd: self.portfolio.equity_usd(&marks),
+            cash_usd: self.portfolio.cash_usd(),
+            positions: self.portfolio.positions().clone(),
+        })
+    }
+
+    fn matcher_mut(&mut self, symbol: &str) -> Result<&mut MatchingEngine> {
+        self.matchers
+            .get_mut(symbol)
+            .with_context(|| format!("no matcher configured for symbol {symbol}"))
+    }
+
+    fn process_commands(&mut self, commands: Vec<StrategyCommand>) -> Result<()> {
+        let mut queue = commands;
+        while !queue.is_empty() {
+            let mut next = Vec::new();
+            for command in queue {
+                match command {
+                    StrategyCommand::NewOrder(order) => {
+                        self.orders_sent += 1;
+                        let updates = self.submit_order(order)?;
+                        next.extend(self.process_updates(updates)?);
+                    }
+                    StrategyCommand::CancelOrder { order_id, reason } => {
+                        let updates = self.cancel_order(&order_id, &reason)?;
+                        next.extend(self.process_updates(updates)?);
+                    }
+                }
+            }
+            queue = next;
+        }
+        Ok(())
+    }
+
+    fn submit_order(&mut self, order: NewOrder) -> Result<Vec<OrderUpdate>> {
+        Ok(self.matcher_mut(&order.symbol)?.submit(order))
+    }
+
+    fn cancel_order(&mut self, order_id: &str, reason: &str) -> Result<Vec<OrderUpdate>> {
+        for matcher in self.matchers.values_mut() {
+            if matcher.contains_order(order_id) {
+                return Ok(matcher.cancel(order_id, reason));
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    fn process_updates(&mut self, updates: Vec<OrderUpdate>) -> Result<Vec<StrategyCommand>> {
+        let mut commands = Vec::new();
+        for update in updates {
+            if update.has_fill() {
+                self.fills += 1;
+                match update.last_fill_liquidity {
+                    Some(FillLiquidity::Maker) => self.maker_fills += 1,
+                    Some(FillLiquidity::Taker) => self.taker_fills += 1,
+                    None => {}
+                }
+                self.portfolio.apply_fill(&update);
+            }
+            commands.extend(self.strategy.on_order_update(&update));
+        }
+        Ok(commands)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::strategy::{InstrumentConfig, InstrumentKindConfig, RiskGroupConfig};
+    use crate::types::{Level, OrderBook, Side};
+
+    use super::*;
+
+    fn config() -> ChaosConfig {
+        ChaosConfig {
+            ref_symbol: "BTC-USDT".to_string(),
+            active_hedge_threshold_usd: 500.0,
+            min_hedge_interval_ms: 0,
+            risk_groups: vec![RiskGroupConfig {
+                name: "main".to_string(),
+                symbols: vec!["BTC-USDT".to_string(), "BTC-PERP".to_string()],
+                soft_delta_limit_usd: 50_000.0,
+                hard_delta_limit_usd: 75_000.0,
+                live_order_limit_usd: 100_000.0,
+                ..RiskGroupConfig::default()
+            }],
+            instruments: vec![
+                InstrumentConfig {
+                    symbol: "BTC-USDT".to_string(),
+                    risk_group: "main".to_string(),
+                    kind: InstrumentKindConfig::Spot,
+                    max_order_size_usd: 5_000.0,
+                    min_order_size_usd: 100.0,
+                    max_order_size: 1.0,
+                    tick_size: 0.1,
+                    lot_size: 0.0001,
+                    ..InstrumentConfig::default()
+                },
+                InstrumentConfig {
+                    symbol: "BTC-PERP".to_string(),
+                    risk_group: "main".to_string(),
+                    kind: InstrumentKindConfig::Future,
+                    contract_value: 0.001,
+                    max_order_size_usd: 10_000.0,
+                    min_order_size_usd: 100.0,
+                    max_order_size: 10_000.0,
+                    min_trade_size: 1.0,
+                    lot_size: 1.0,
+                    min_position: -100_000.0,
+                    max_position: 100_000.0,
+                    ..InstrumentConfig::default()
+                },
+            ],
+            ..ChaosConfig::default()
+        }
+    }
+
+    #[test]
+    fn replayed_quote_fill_triggers_hedge_order() {
+        let mut runner = BacktestRunner::new(config());
+        let events = vec![
+            MarketEvent::Depth(OrderBook::one_level(
+                "BTC-USDT",
+                1,
+                Level::new(50_000.0, 2.0),
+                Level::new(50_001.0, 2.0),
+            )),
+            MarketEvent::Depth(OrderBook::one_level(
+                "BTC-PERP",
+                1,
+                Level::new(50_003.0, 10_000.0),
+                Level::new(50_004.0, 10_000.0),
+            )),
+            MarketEvent::Trade {
+                ts_ms: 2,
+                symbol: "BTC-USDT".to_string(),
+                price: 49_000.0,
+                qty: 1.0,
+                taker_side: Side::Sell,
+            },
+        ];
+
+        let report = runner.run(events).unwrap();
+        assert!(report.orders_sent >= 3);
+        assert!(report.fills >= 1);
+        assert!(report.taker_fills >= 1);
+        assert!(report.final_delta_usd.abs() < 5_000.0);
+    }
+}
