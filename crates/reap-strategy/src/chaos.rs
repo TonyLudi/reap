@@ -43,6 +43,223 @@ impl Default for ChaosConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigValidation {
+    pub valid: bool,
+    pub errors: Vec<String>,
+}
+
+impl ChaosConfig {
+    pub fn validate(&self) -> ConfigValidation {
+        let mut errors = Vec::new();
+        if self.strategy_name.trim().is_empty() {
+            errors.push("strategy_name must not be empty".to_string());
+        }
+        if self.instruments.is_empty() {
+            errors.push("at least one instrument is required".to_string());
+        }
+        check_positive("delta_limit_usd", self.delta_limit_usd, &mut errors);
+        check_non_negative(
+            "active_hedge_threshold_usd",
+            self.active_hedge_threshold_usd,
+            &mut errors,
+        );
+
+        let mut symbols = HashSet::new();
+        for instrument in &self.instruments {
+            if instrument.symbol.trim().is_empty() {
+                errors.push("instrument symbol must not be empty".to_string());
+            } else if !symbols.insert(instrument.symbol.clone()) {
+                errors.push(format!("duplicate instrument symbol {}", instrument.symbol));
+            }
+            check_positive(
+                &format!("{}.tick_size", instrument.symbol),
+                instrument.tick_size,
+                &mut errors,
+            );
+            check_positive(
+                &format!("{}.lot_size", instrument.symbol),
+                instrument.lot_size,
+                &mut errors,
+            );
+            check_positive(
+                &format!("{}.max_order_size", instrument.symbol),
+                instrument.max_order_size,
+                &mut errors,
+            );
+            check_positive(
+                &format!("{}.max_order_size_usd", instrument.symbol),
+                instrument.max_order_size_usd,
+                &mut errors,
+            );
+            check_non_negative(
+                &format!("{}.min_order_size_usd", instrument.symbol),
+                instrument.min_order_size_usd,
+                &mut errors,
+            );
+            check_positive(
+                &format!("{}.min_trade_size", instrument.symbol),
+                instrument.min_trade_size,
+                &mut errors,
+            );
+            for (field, value) in [
+                ("maker_fee", instrument.maker_fee),
+                ("taker_fee", instrument.taker_fee),
+                ("hedge_profit_margin", instrument.hedge_profit_margin),
+                ("quote_profit_margin", instrument.quote_profit_margin),
+                ("hedge_aggression", instrument.hedge_aggression),
+                ("fv_offset", instrument.fv_offset),
+                ("position_offset", instrument.position_offset),
+                ("pos_skew", instrument.pos_skew),
+                ("neg_skew", instrument.neg_skew),
+                ("pos_extra_skew", instrument.pos_extra_skew),
+                ("neg_extra_skew", instrument.neg_extra_skew),
+                ("pos_activation", instrument.pos_activation),
+                ("neg_activation", instrument.neg_activation),
+            ] {
+                check_finite(
+                    &format!("{}.{field}", instrument.symbol),
+                    value,
+                    &mut errors,
+                );
+            }
+            if instrument.min_order_size_usd > instrument.max_order_size_usd {
+                errors.push(format!(
+                    "{}.min_order_size_usd exceeds max_order_size_usd",
+                    instrument.symbol
+                ));
+            }
+            if instrument.min_trade_size > instrument.max_order_size {
+                errors.push(format!(
+                    "{}.min_trade_size exceeds max_order_size",
+                    instrument.symbol
+                ));
+            }
+            if instrument.min_position > instrument.max_position {
+                errors.push(format!(
+                    "{}.min_position exceeds max_position",
+                    instrument.symbol
+                ));
+            }
+            if instrument.kind == InstrumentKindConfig::Future {
+                check_positive(
+                    &format!("{}.contract_value", instrument.symbol),
+                    instrument.contract_value,
+                    &mut errors,
+                );
+            }
+        }
+        if self.ref_symbol.trim().is_empty() {
+            errors.push("ref_symbol must not be empty".to_string());
+        } else if !symbols.contains(&self.ref_symbol) {
+            errors.push(format!(
+                "ref_symbol {} is not configured as an instrument",
+                self.ref_symbol
+            ));
+        }
+
+        let mut group_names = HashSet::new();
+        for group in &self.risk_groups {
+            if group.name.trim().is_empty() {
+                errors.push("risk group name must not be empty".to_string());
+            } else if !group_names.insert(group.name.clone()) {
+                errors.push(format!("duplicate risk group {}", group.name));
+            }
+            check_positive(
+                &format!("{}.soft_delta_limit_usd", group.name),
+                group.soft_delta_limit_usd,
+                &mut errors,
+            );
+            check_positive(
+                &format!("{}.hard_delta_limit_usd", group.name),
+                group.hard_delta_limit_usd,
+                &mut errors,
+            );
+            check_positive(
+                &format!("{}.delta_stop_limit_usd", group.name),
+                group.delta_stop_limit_usd,
+                &mut errors,
+            );
+            check_positive(
+                &format!("{}.live_order_limit_usd", group.name),
+                group.live_order_limit_usd,
+                &mut errors,
+            );
+            check_positive(
+                &format!("{}.turnover_limit_usd", group.name),
+                group.turnover_limit_usd,
+                &mut errors,
+            );
+            check_non_negative(
+                &format!("{}.basis_limit", group.name),
+                group.basis_limit,
+                &mut errors,
+            );
+            check_finite(
+                &format!("{}.coin_offset", group.name),
+                group.coin_offset,
+                &mut errors,
+            );
+            if !(group.soft_delta_limit_usd <= group.hard_delta_limit_usd
+                && group.hard_delta_limit_usd <= group.delta_stop_limit_usd)
+            {
+                errors.push(format!(
+                    "{} delta limits must satisfy soft <= hard <= stop",
+                    group.name
+                ));
+            }
+            let mut group_symbols = HashSet::new();
+            for symbol in &group.symbols {
+                if !group_symbols.insert(symbol) {
+                    errors.push(format!(
+                        "risk group {} contains duplicate symbol {}",
+                        group.name, symbol
+                    ));
+                }
+                if !symbols.contains(symbol) {
+                    errors.push(format!(
+                        "risk group {} references unknown symbol {}",
+                        group.name, symbol
+                    ));
+                }
+            }
+        }
+        if !self.risk_groups.is_empty() {
+            for instrument in &self.instruments {
+                if !group_names.contains(&instrument.risk_group) {
+                    errors.push(format!(
+                        "instrument {} references unknown risk group {}",
+                        instrument.symbol, instrument.risk_group
+                    ));
+                }
+            }
+        }
+
+        ConfigValidation {
+            valid: errors.is_empty(),
+            errors,
+        }
+    }
+}
+
+fn check_positive(name: &str, value: f64, errors: &mut Vec<String>) {
+    if !value.is_finite() || value <= 0.0 {
+        errors.push(format!("{name} must be finite and positive"));
+    }
+}
+
+fn check_non_negative(name: &str, value: f64, errors: &mut Vec<String>) {
+    if !value.is_finite() || value < 0.0 {
+        errors.push(format!("{name} must be finite and non-negative"));
+    }
+}
+
+fn check_finite(name: &str, value: f64, errors: &mut Vec<String>) {
+    if !value.is_finite() {
+        errors.push(format!("{name} must be finite"));
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RiskGroupConfig {
     pub name: String,
@@ -852,7 +1069,9 @@ impl Strategy for ChaosStrategy {
                 self.now_ms = timer.ts_ms;
                 self.refresh_quotes()
             }
-            StrategyEvent::Control(_) => Vec::new(),
+            StrategyEvent::Account(_) | StrategyEvent::Control(_) | StrategyEvent::System(_) => {
+                Vec::new()
+            }
         }
     }
 }
@@ -1390,5 +1609,29 @@ mod tests {
         ));
         assert!(all_intents[2].iter().any(|intent| matches!(intent, OrderIntent::NewOrder(order)
             if order.symbol == "BTC-PERP" && order.side == Side::Sell && order.time_in_force == TimeInForce::Ioc)));
+    }
+
+    #[test]
+    fn config_validation_catches_duplicate_symbols_and_invalid_ticks() {
+        let valid = config();
+        assert!(valid.validate().valid);
+
+        let mut invalid = valid;
+        invalid.instruments[1].symbol = invalid.instruments[0].symbol.clone();
+        invalid.instruments[0].tick_size = 0.0;
+        let report = invalid.validate();
+        assert!(!report.valid);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("duplicate instrument symbol"))
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("tick_size"))
+        );
     }
 }

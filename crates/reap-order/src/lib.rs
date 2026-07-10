@@ -1,3 +1,15 @@
+mod client_id;
+mod gateway;
+mod pacing;
+mod private;
+mod reconcile;
+
+pub use client_id::*;
+pub use gateway::*;
+pub use pacing::*;
+pub use private::*;
+pub use reconcile::*;
+
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
@@ -91,6 +103,7 @@ impl OrderSnapshot {
         self.last_fill_qty = update.last_fill_qty;
         self.last_fill_price = update.last_fill_price;
         self.last_fill_liquidity = update.last_fill_liquidity;
+        self.reason = update.reason.clone();
     }
 
     fn to_update(&self, ts_ms: TimeMs, event: OrderEvent, reason: &str) -> OrderUpdate {
@@ -141,6 +154,12 @@ impl OrderReducer {
 
     pub fn get(&self, order_id: &str) -> Option<&OrderSnapshot> {
         self.orders.get(order_id)
+    }
+
+    pub fn orders(&self) -> impl Iterator<Item = (&str, &OrderSnapshot)> {
+        self.orders
+            .iter()
+            .map(|(order_id, snapshot)| (order_id.as_str(), snapshot))
     }
 
     pub fn is_live(&self, order_id: &str) -> bool {

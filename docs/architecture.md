@@ -3,9 +3,10 @@
 This document describes the target architecture for `reap` as a Rust trading
 system that can run the same strategy logic in live trading and backtest.
 
-The current repository is intentionally small: it contains the first clean-room
-strategy and backtest scaffold. The target design below is the direction for the
-next refactor.
+The workspace now implements the migration baseline described here: strategy
+and backtest parity, live OKX feed/order boundaries, deterministic risk,
+telemetry, and durable capture. Exchange certification and deployment-specific
+orchestration remain operational responsibilities rather than strategy code.
 
 ## Goals
 
@@ -591,6 +592,10 @@ state transitions.
 
 ### Phase 4: Live Feed Skeleton
 
+Status: implemented as `reap-venue` and `reap-feed`, with OKX books/trades,
+supervised socket plans, bounded deduplication, sequence recovery, and the raw
+capture checker.
+
 - Add `reap-venue` and `reap-feed`.
 - Implement one venue public depth/trade adapter.
 - Implement reconnect, dedup, sequence checks, and snapshot recovery.
@@ -598,11 +603,19 @@ state transitions.
 
 ### Phase 5: Live Order Gateway
 
+Status: implemented for OKX REST and private websocket contracts, including
+signing, submit/cancel, canonical private reduction, idempotency, pacing, and
+pending-order/fill reconciliation.
+
 - Implement signed order submit/cancel for one venue.
 - Add private websocket order/fill reducer.
 - Add reconciliation and idempotency.
 
 ### Phase 6: Production Hardening
+
+Status: implemented as `reap-risk`, `reap-engine`, `reap-telemetry`, and
+`reap-storage`, with configuration validation, an operations guide, and a
+measured event-loop benchmark.
 
 - Add risk gates, kill switch, stale feed policy, metrics, storage.
 - Add operational runbooks and config checks.

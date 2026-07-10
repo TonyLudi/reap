@@ -112,7 +112,10 @@ impl BacktestRunner {
                     let commands = self.process_updates(vec![update.clone()])?;
                     self.process_commands(commands)?;
                 }
-                NormalizedEvent::Timer(_) | NormalizedEvent::Control(_) => {
+                NormalizedEvent::Account(_)
+                | NormalizedEvent::Timer(_)
+                | NormalizedEvent::Control(_)
+                | NormalizedEvent::System(_) => {
                     self.process_strategy_event(event.clone().into_strategy_event())?;
                 }
             }

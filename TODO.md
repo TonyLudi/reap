@@ -31,26 +31,31 @@ architecture in [docs/architecture.md](docs/architecture.md).
 
 ## Step 4: Live Feed Skeleton
 
-- [ ] Add `reap-venue` for exchange-specific parsers and request builders.
-- [ ] Add `reap-feed` for websocket supervision.
-- [ ] Implement multi-websocket subscription partitioning.
-- [ ] Implement deduplication by channel-aware event ids.
-- [ ] Implement sequence checks and snapshot recovery.
-- [ ] Add raw replay checker for captured websocket data.
+- [x] Add `reap-venue` for exchange-specific parsers and request builders.
+- [x] Add `reap-feed` for websocket supervision.
+- [x] Implement multi-websocket subscription partitioning.
+- [x] Implement deduplication by channel-aware event ids.
+- [x] Implement sequence checks and snapshot recovery.
+- [x] Add raw replay checker for captured websocket data.
 
 ## Step 5: Live Order Gateway
 
-- [ ] Implement signed submit/cancel for one venue.
-- [ ] Add private websocket order/fill/account reducer.
-- [ ] Add REST reconciliation for open orders and fills.
-- [ ] Add idempotent client-order-id handling.
-- [ ] Add rate-limit and request pacing policy.
+- [x] Implement signed submit/cancel for one venue.
+- [x] Add private websocket order/fill/account reducer.
+- [x] Add REST reconciliation for open orders and fills.
+- [x] Add idempotent client-order-id handling.
+- [x] Add rate-limit and request pacing policy.
 
 ## Step 6: Production Hardening
 
-- [ ] Add pre-trade and post-trade risk gates.
-- [ ] Add kill switch and manual symbol halt events.
-- [ ] Add stale feed/private stream fail-closed policy.
-- [ ] Add structured telemetry and health metrics.
-- [ ] Add storage for raw events, normalized events, intents, orders, and fills.
-- [ ] Profile the hot path before lower-level queue/thread optimizations.
+- [x] Add pre-trade and post-trade risk gates.
+- [x] Add kill switch and manual symbol halt events.
+- [x] Add stale feed/private stream fail-closed policy.
+- [x] Add structured telemetry and health metrics.
+- [x] Add storage for raw events, normalized events, intents, orders, and fills.
+- [x] Profile the hot path before lower-level queue/thread optimizations.
+
+Completion evidence is documented in [README.md](README.md),
+[docs/operations.md](docs/operations.md), and
+[docs/performance.md](docs/performance.md). The workspace test, lint, replay,
+configuration, backtest, and benchmark commands are the acceptance gates.

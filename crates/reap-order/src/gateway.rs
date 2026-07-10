@@ -1,0 +1,312 @@
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use reap_core::NewOrder;
+use reap_venue::okx::{
+    HttpTransport, OkxCancelOrder, OkxPlaceOrder, OkxRestClient, OkxTradeMode, RestError,
+};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::{
+    ClientIdError, ClientOrderIdGenerator, IdempotencyError, IdempotencyRegistry, PacingPolicy,
+    PrivateStateReducer, ReconciliationSnapshot, RequestKind, RequestPacer, Reservation, reconcile,
+};
+
+#[derive(Debug, Error)]
+pub enum GatewayError {
+    #[error("OKX gateway request failed: {0}")]
+    Rest(#[from] RestError),
+    #[error("client order id configuration is invalid: {0}")]
+    ClientId(#[from] ClientIdError),
+    #[error("idempotency check failed: {0}")]
+    Idempotency(#[from] IdempotencyError),
+    #[error("no OKX trade mode configured for {0}")]
+    MissingTradeMode(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmitOutcome {
+    Submitted {
+        client_order_id: String,
+        exchange_order_id: String,
+    },
+    Duplicate {
+        client_order_id: String,
+        exchange_order_id: String,
+    },
+    PendingReconciliation {
+        client_order_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelOutcome {
+    pub client_order_id: String,
+    pub exchange_order_id: String,
+}
+
+pub struct OkxOrderGateway<T> {
+    client: OkxRestClient<T>,
+    ids: ClientOrderIdGenerator,
+    idempotency: IdempotencyRegistry,
+    pacer: RequestPacer,
+    trade_modes: HashMap<String, OkxTradeMode>,
+}
+
+impl<T> OkxOrderGateway<T>
+where
+    T: HttpTransport,
+{
+    pub fn new(
+        client: OkxRestClient<T>,
+        id_prefix: impl Into<String>,
+        node_id: u16,
+        trade_modes: HashMap<String, OkxTradeMode>,
+        pacing: PacingPolicy,
+    ) -> Result<Self, GatewayError> {
+        Ok(Self {
+            client,
+            ids: ClientOrderIdGenerator::new(id_prefix, node_id)?,
+            idempotency: IdempotencyRegistry::default(),
+            pacer: RequestPacer::new(pacing),
+            trade_modes,
+        })
+    }
+
+    pub async fn submit(
+        &mut self,
+        idempotency_key: impl Into<String>,
+        order: NewOrder,
+    ) -> Result<SubmitOutcome, GatewayError> {
+        let idempotency_key = idempotency_key.into();
+        let trade_mode = self
+            .trade_modes
+            .get(&order.symbol)
+            .copied()
+            .ok_or_else(|| GatewayError::MissingTradeMode(order.symbol.clone()))?;
+        let generated_id = self.ids.next(unix_time_ms());
+        let reservation =
+            self.idempotency
+                .reserve(idempotency_key.clone(), &order, generated_id)?;
+        let client_order_id = match reservation {
+            Reservation::Accepted {
+                client_order_id,
+                exchange_order_id,
+            } => {
+                return Ok(SubmitOutcome::Duplicate {
+                    client_order_id,
+                    exchange_order_id,
+                });
+            }
+            Reservation::Pending { client_order_id } => {
+                return Ok(SubmitOutcome::PendingReconciliation { client_order_id });
+            }
+            Reservation::New { client_order_id } => client_order_id,
+        };
+        self.pacer.pace(RequestKind::Submit, "account").await;
+        self.pacer.pace(RequestKind::Submit, &order.symbol).await;
+        let result = self
+            .client
+            .place_order(&OkxPlaceOrder {
+                symbol: order.symbol,
+                trade_mode,
+                side: order.side,
+                time_in_force: order.time_in_force,
+                price: order.price,
+                qty: order.qty,
+                client_order_id: client_order_id.clone(),
+            })
+            .await;
+        let ack = match result {
+            Ok(ack) => ack,
+            Err(error) => {
+                if !matches!(error, RestError::Transport(_)) {
+                    self.idempotency.release_pending(&idempotency_key)?;
+                }
+                return Err(error.into());
+            }
+        };
+        self.idempotency
+            .mark_accepted(&idempotency_key, ack.exchange_order_id.clone())?;
+        Ok(SubmitOutcome::Submitted {
+            client_order_id,
+            exchange_order_id: ack.exchange_order_id,
+        })
+    }
+
+    pub fn resolve_pending_submit(
+        &mut self,
+        idempotency_key: &str,
+        exchange_order_id: impl Into<String>,
+    ) -> Result<(), GatewayError> {
+        self.idempotency
+            .mark_accepted(idempotency_key, exchange_order_id)?;
+        Ok(())
+    }
+
+    pub async fn cancel(
+        &mut self,
+        symbol: &str,
+        exchange_order_id: Option<String>,
+        client_order_id: Option<String>,
+    ) -> Result<CancelOutcome, GatewayError> {
+        self.pacer.pace(RequestKind::Cancel, symbol).await;
+        let ack = self
+            .client
+            .cancel_order(&OkxCancelOrder {
+                symbol: symbol.to_string(),
+                exchange_order_id,
+                client_order_id,
+            })
+            .await?;
+        Ok(CancelOutcome {
+            client_order_id: ack.client_order_id,
+            exchange_order_id: ack.exchange_order_id,
+        })
+    }
+
+    pub async fn reconcile_state(
+        &mut self,
+        state: &PrivateStateReducer,
+        instrument_type: Option<&str>,
+        symbol: Option<&str>,
+    ) -> Result<ReconciliationSnapshot, GatewayError> {
+        self.pacer.pace(RequestKind::Reconcile, "account").await;
+        let remote_orders = self.client.open_orders(instrument_type, symbol).await?;
+        self.pacer.pace(RequestKind::Reconcile, "account").await;
+        let remote_fills = self.client.fills(instrument_type, symbol).await?;
+        let report = reconcile(
+            state.order_reducer(),
+            state.seen_fill_ids(),
+            &remote_orders,
+            &remote_fills,
+        );
+        Ok(ReconciliationSnapshot {
+            remote_orders,
+            remote_fills,
+            report,
+        })
+    }
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use reap_core::{Side, TimeInForce};
+    use reap_venue::okx::{HttpResponse, OkxCredentials, OkxSigner, SignedRequest};
+
+    use super::*;
+
+    #[derive(Clone)]
+    struct MockTransport {
+        responses: Arc<Mutex<VecDeque<Result<HttpResponse, RestError>>>>,
+        calls: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl HttpTransport for MockTransport {
+        async fn execute(&self, _request: SignedRequest) -> Result<HttpResponse, RestError> {
+            *self.calls.lock().unwrap() += 1;
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("mock response")
+        }
+    }
+
+    fn order() -> NewOrder {
+        NewOrder {
+            symbol: "BTC-USDT".to_string(),
+            side: Side::Buy,
+            qty: 0.1,
+            price: 100.0,
+            time_in_force: TimeInForce::PostOnly,
+            reason: "quote".to_string(),
+        }
+    }
+
+    fn gateway(
+        responses: Vec<Result<HttpResponse, RestError>>,
+    ) -> (OkxOrderGateway<MockTransport>, Arc<Mutex<usize>>) {
+        let calls = Arc::new(Mutex::new(0));
+        let transport = MockTransport {
+            responses: Arc::new(Mutex::new(responses.into())),
+            calls: Arc::clone(&calls),
+        };
+        let client = OkxRestClient::new(
+            transport,
+            OkxSigner::new(OkxCredentials::new("key", "secret", "pass"), true),
+        );
+        let gateway = OkxOrderGateway::new(
+            client,
+            "reap",
+            1,
+            HashMap::from([("BTC-USDT".to_string(), OkxTradeMode::Cash)]),
+            PacingPolicy::default(),
+        )
+        .unwrap();
+        (gateway, calls)
+    }
+
+    #[tokio::test]
+    async fn accepted_idempotent_submit_does_not_send_twice() {
+        let response = HttpResponse {
+            status: 200,
+            body: r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"ignored","sCode":"0","sMsg":""}]}"#.to_string(),
+        };
+        let (mut gateway, calls) = gateway(vec![Ok(response)]);
+
+        let first = gateway.submit("decision-1", order()).await.unwrap();
+        let second = gateway.submit("decision-1", order()).await.unwrap();
+
+        assert!(matches!(first, SubmitOutcome::Submitted { .. }));
+        assert!(matches!(second, SubmitOutcome::Duplicate { .. }));
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_failure_is_held_for_reconciliation() {
+        let (mut gateway, calls) = gateway(vec![Err(RestError::Transport("timeout".to_string()))]);
+        assert!(gateway.submit("decision-1", order()).await.is_err());
+
+        let retry = gateway.submit("decision-1", order()).await.unwrap();
+        assert!(matches!(retry, SubmitOutcome::PendingReconciliation { .. }));
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_api_rejection_releases_idempotency_key_for_retry() {
+        let response = HttpResponse {
+            status: 200,
+            body: r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"ignored","sCode":"0","sMsg":""}]}"#.to_string(),
+        };
+        let (mut gateway, calls) = gateway(vec![
+            Err(RestError::Api {
+                code: "51000".to_string(),
+                message: "parameter error".to_string(),
+            }),
+            Ok(response),
+        ]);
+
+        assert!(gateway.submit("decision-1", order()).await.is_err());
+        assert!(matches!(
+            gateway.submit("decision-1", order()).await.unwrap(),
+            SubmitOutcome::Submitted { .. }
+        ));
+        assert_eq!(*calls.lock().unwrap(), 2);
+    }
+}

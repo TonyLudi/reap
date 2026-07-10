@@ -1,10 +1,16 @@
 [workspace]
 members = [
     "crates/reap-core",
+    "crates/reap-venue",
+    "crates/reap-feed",
     "crates/reap-book",
     "crates/reap-order",
+    "crates/reap-risk",
     "crates/reap-strategy",
+    "crates/reap-engine",
     "crates/reap-backtest",
+    "crates/reap-storage",
+    "crates/reap-telemetry",
     "crates/reap-cli",
 ]
 default-members = ["crates/reap-cli"]
@@ -16,13 +22,40 @@ edition = "2024"
 
 [workspace.dependencies]
 anyhow = "1"
+async-trait = "0.1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 csv = "1"
+futures-util = "0.3"
+hmac = "0.12"
 reap-backtest = { path = "crates/reap-backtest" }
 reap-book = { path = "crates/reap-book" }
 reap-core = { path = "crates/reap-core" }
+reap-feed = { path = "crates/reap-feed" }
+reap-engine = { path = "crates/reap-engine" }
 reap-order = { path = "crates/reap-order" }
+reap-risk = { path = "crates/reap-risk" }
+reap-storage = { path = "crates/reap-storage" }
 reap-strategy = { path = "crates/reap-strategy" }
+reap-telemetry = { path = "crates/reap-telemetry" }
+reap-venue = { path = "crates/reap-venue" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = "2"
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false

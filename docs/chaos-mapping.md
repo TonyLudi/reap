@@ -1,6 +1,8 @@
 # Chaos Mapping
 
-This repo ports the decision flow, not the production runtime.
+This repo ports the decision flow and the reusable live-runtime boundaries. It
+does not reproduce the Java infrastructure stack or constitute exchange
+certification.
 
 The strategy-facing boundary is now `StrategyEvent -> Vec<OrderIntent>`, with
 live and backtest inputs represented as `NormalizedEvent`.
@@ -14,10 +16,13 @@ live and backtest inputs represented as `NormalizedEvent`.
 | `RiskGroup` | `RiskGroupState` | Soft/hard delta quote gates and group-only hedge behavior are represented. |
 | `QueueMatchingEngine` | `crates/reap-backtest/src/matching.rs`, `crates/reap-book`, `crates/reap-order` | Supports `PostOnly`, `IOC`, current-depth taker fills, later maker fills from trades/depth, queue-ahead tracking, and shared canonical book/order reducers. |
 | `BackTestEngine` | `BacktestRunner` | Drives replay events through matcher -> strategy -> matcher feedback until commands drain. |
+| Exchange market/private clients | `crates/reap-venue`, `crates/reap-feed`, `crates/reap-order` | OKX books/trades/orders/fills/account parsing, websocket supervision, dedup/sequence recovery, signing, pacing, and reconciliation. |
+| Runtime risk and controls | `crates/reap-risk`, `crates/reap-engine` | Pre/post-trade gates, stream-health fail-closed policy, kill switch, symbol halt, and cancellation routing. |
 
-Out of scope for this first repo:
+Remaining out of scope:
 
-- Live exchange connectors, Redis control plane, Spring/Luban bootstrapping, alerting, and flight recorders.
+- Redis control plane, Spring/Luban bootstrapping, venue certification, and
+  deployment-specific alert delivery.
 - Full spot account borrowing/margin model and OKX/Binance-specific fee assets.
 - Funding-rate manager and index-deviation stop logic beyond configurable fair-value offsets.
 - Multi-level historical depth file formats from Qubyte. The runner uses a small CSV replay format that is easy to convert into.

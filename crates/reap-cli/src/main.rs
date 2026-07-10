@@ -25,6 +25,20 @@ enum Command {
         #[arg(long)]
         pretty: bool,
     },
+    ReplayCheck {
+        #[arg(short, long)]
+        events: PathBuf,
+        #[arg(long)]
+        strict: bool,
+        #[arg(long)]
+        pretty: bool,
+    },
+    ConfigCheck {
+        #[arg(short, long)]
+        config: PathBuf,
+        #[arg(long)]
+        pretty: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -55,6 +69,36 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 println!("{}", serde_json::to_string(&report)?);
+            }
+        }
+        Command::ReplayCheck {
+            events,
+            strict,
+            pretty,
+        } => {
+            let report = reap_feed::replay_check_path(&events)?;
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+            if strict && !report.is_healthy() {
+                anyhow::bail!("raw replay check failed");
+            }
+        }
+        Command::ConfigCheck { config, pretty } => {
+            let config_text = std::fs::read_to_string(&config)
+                .with_context(|| format!("failed to read config {}", config.display()))?;
+            let config: ChaosConfig = toml::from_str(&config_text)
+                .with_context(|| format!("failed to parse config {}", config.display()))?;
+            let report = config.validate();
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+            if !report.valid {
+                anyhow::bail!("configuration validation failed");
             }
         }
     }

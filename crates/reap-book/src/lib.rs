@@ -68,6 +68,32 @@ impl BookReducer {
         self.status
     }
 
+    pub fn apply_delta(&mut self, ts_ms: TimeMs, bids: &[Level], asks: &[Level]) -> BookStatus {
+        if bids
+            .iter()
+            .chain(asks.iter())
+            .any(|level| !level.px.is_finite() || !level.qty.is_finite() || level.qty < 0.0)
+        {
+            self.status = BookStatus::Gapped;
+            return self.status;
+        }
+
+        let Some(book) = self.book.as_mut() else {
+            self.status = BookStatus::Empty;
+            return self.status;
+        };
+        apply_side_delta(&mut book.bids, bids, Side::Buy);
+        apply_side_delta(&mut book.asks, asks, Side::Sell);
+        book.ts_ms = ts_ms;
+        self.last_update_ms = Some(ts_ms);
+        self.status = if valid_book(book) {
+            BookStatus::Ready
+        } else {
+            BookStatus::Empty
+        };
+        self.status
+    }
+
     pub fn mark_recovering(&mut self) {
         self.status = BookStatus::Recovering;
     }
@@ -140,6 +166,24 @@ impl BookReducer {
         };
         fills
     }
+}
+
+fn apply_side_delta(levels: &mut Vec<Level>, updates: &[Level], side: Side) {
+    for update in updates {
+        if let Some(index) = levels.iter().position(|level| level.px == update.px) {
+            if update.qty == 0.0 {
+                levels.remove(index);
+            } else {
+                levels[index].qty = update.qty;
+            }
+        } else if update.qty > 0.0 {
+            levels.push(*update);
+        }
+    }
+    levels.sort_by(|left, right| match side {
+        Side::Buy => right.px.total_cmp(&left.px),
+        Side::Sell => left.px.total_cmp(&right.px),
+    });
 }
 
 fn valid_book(book: &OrderBook) -> bool {
@@ -218,5 +262,27 @@ mod tests {
         let best_ask = reducer.best(Side::Sell).unwrap();
         assert_eq!(best_ask.px, 102.0);
         assert!((best_ask.qty - 0.2).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn delta_replaces_inserts_and_deletes_levels_in_price_order() {
+        let mut reducer = BookReducer::new("BTC-USDT");
+        reducer.apply_snapshot(OrderBook {
+            symbol: "BTC-USDT".to_string(),
+            ts_ms: 1,
+            bids: vec![Level::new(100.0, 1.0), Level::new(99.0, 2.0)],
+            asks: vec![Level::new(101.0, 1.0), Level::new(102.0, 2.0)],
+        });
+
+        let status = reducer.apply_delta(
+            2,
+            &[Level::new(100.0, 0.0), Level::new(100.5, 3.0)],
+            &[Level::new(101.0, 4.0), Level::new(100.75, 1.5)],
+        );
+
+        assert_eq!(status, BookStatus::Ready);
+        assert_eq!(reducer.best(Side::Buy), Some(Level::new(100.5, 3.0)));
+        assert_eq!(reducer.best(Side::Sell), Some(Level::new(100.75, 1.5)));
+        assert_eq!(reducer.last_update_ms(), Some(2));
     }
 }

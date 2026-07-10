@@ -7,6 +7,134 @@ pub type TimeMs = u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum Venue {
+    Okx,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Channel {
+    Books,
+    Trades,
+    Orders,
+    Fills,
+    Account,
+    Custom(String),
+}
+
+impl Channel {
+    pub fn is_private(&self) -> bool {
+        matches!(self, Self::Orders | Self::Fills | Self::Account)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ConnId(pub String);
+
+impl ConnId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
+impl std::fmt::Display for ConnId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedPriority {
+    Critical,
+    High,
+    Normal,
+    Low,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Subscription {
+    pub venue: Venue,
+    pub channel: Channel,
+    pub symbol: Option<Symbol>,
+    pub priority: FeedPriority,
+    #[serde(default = "one_connection")]
+    pub connections: usize,
+}
+
+fn one_connection() -> usize {
+    1
+}
+
+impl Subscription {
+    pub fn public(
+        venue: Venue,
+        channel: Channel,
+        symbol: impl Into<Symbol>,
+        priority: FeedPriority,
+    ) -> Self {
+        debug_assert!(!channel.is_private());
+        Self {
+            venue,
+            channel,
+            symbol: Some(symbol.into()),
+            priority,
+            connections: 1,
+        }
+    }
+
+    pub fn private(venue: Venue, channel: Channel, priority: FeedPriority) -> Self {
+        debug_assert!(channel.is_private());
+        Self {
+            venue,
+            channel,
+            symbol: None,
+            priority,
+            connections: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawEnvelope {
+    pub venue: Venue,
+    pub conn_id: ConnId,
+    pub channel: Channel,
+    pub symbol: Option<Symbol>,
+    pub recv_ts_ns: u64,
+    pub raw_hash: u64,
+    pub payload: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EventId {
+    pub venue: Venue,
+    pub channel: Channel,
+    pub symbol: Option<Symbol>,
+    pub key: EventKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKey {
+    BookSequence {
+        action: BookAction,
+        seq_id: i64,
+    },
+    Trade(String),
+    OrderVersion {
+        order_id: String,
+        update_time_ms: TimeMs,
+        state: String,
+        cumulative_fill_bits: u64,
+    },
+    Fill(String),
+    Timestamp(TimeMs),
+    RawHash(u64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Side {
     Buy,
     Sell,
@@ -50,7 +178,7 @@ impl Side {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InstrumentKind {
     Spot,
@@ -112,6 +240,35 @@ pub struct OrderBook {
     pub ts_ms: TimeMs,
     pub bids: Vec<Level>,
     pub asks: Vec<Level>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BookAction {
+    Snapshot,
+    Update,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SequencedBookUpdate {
+    pub action: BookAction,
+    pub symbol: Symbol,
+    pub ts_ms: TimeMs,
+    pub prev_seq_id: i64,
+    pub seq_id: i64,
+    pub bids: Vec<Level>,
+    pub asks: Vec<Level>,
+}
+
+impl SequencedBookUpdate {
+    pub fn as_book(&self) -> OrderBook {
+        OrderBook {
+            symbol: self.symbol.clone(),
+            ts_ms: self.ts_ms,
+            bids: self.bids.clone(),
+            asks: self.asks.clone(),
+        }
+    }
 }
 
 impl OrderBook {
@@ -244,20 +401,74 @@ pub struct ControlEvent {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Balance {
+    pub currency: String,
+    pub total: Quantity,
+    pub available: Quantity,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Position {
+    pub symbol: Symbol,
+    pub qty: Quantity,
+    pub avg_price: Price,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccountUpdate {
+    pub ts_ms: TimeMs,
+    pub balances: Vec<Balance>,
+    pub positions: Vec<Position>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemEventKind {
+    FeedStale,
+    FeedGap,
+    FeedHeartbeat,
+    FeedRecovered,
+    BookRecoveryStarted,
+    BookRecoveryFailed,
+    PrivateStreamStale,
+    PrivateStreamHeartbeat,
+    PrivateStreamRecovered,
+    ReconcileDrift,
+    RiskBreach,
+    KillSwitchActivated,
+    KillSwitchReset,
+    SymbolHalted,
+    SymbolResumed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemEvent {
+    pub ts_ms: TimeMs,
+    pub kind: SystemEventKind,
+    pub venue: Option<Venue>,
+    pub symbol: Option<Symbol>,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StrategyEvent {
     Market(MarketEvent),
     Order(OrderUpdate),
+    Account(AccountUpdate),
     Timer(TimerEvent),
     Control(ControlEvent),
+    System(SystemEvent),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NormalizedEvent {
     Market(MarketEvent),
     Order(OrderUpdate),
+    Account(AccountUpdate),
     Timer(TimerEvent),
     Control(ControlEvent),
+    System(SystemEvent),
 }
 
 impl NormalizedEvent {
@@ -273,8 +484,10 @@ impl NormalizedEvent {
         match self {
             Self::Market(event) => event.ts_ms(),
             Self::Order(update) => update.ts_ms,
+            Self::Account(update) => update.ts_ms,
             Self::Timer(event) => event.ts_ms,
             Self::Control(event) => event.ts_ms,
+            Self::System(event) => event.ts_ms,
         }
     }
 
@@ -282,8 +495,10 @@ impl NormalizedEvent {
         match self {
             Self::Market(event) => StrategyEvent::Market(event),
             Self::Order(update) => StrategyEvent::Order(update),
+            Self::Account(update) => StrategyEvent::Account(update),
             Self::Timer(event) => StrategyEvent::Timer(event),
             Self::Control(event) => StrategyEvent::Control(event),
+            Self::System(event) => StrategyEvent::System(event),
         }
     }
 }

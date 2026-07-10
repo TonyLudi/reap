@@ -1,0 +1,16 @@
+[package]
+name = "reap-engine"
+version.workspace = true
+edition.workspace = true
+
+[[bench]]
+name = "event_loop"
+harness = false
+
+[dependencies]
+reap-core.workspace = true
+reap-risk.workspace = true
+reap-strategy.workspace = true
+
+[dev-dependencies]
+toml.workspace = true

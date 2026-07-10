@@ -1,0 +1,8 @@
+[package]
+name = "reap-risk"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+reap-core.workspace = true
+serde.workspace = true
