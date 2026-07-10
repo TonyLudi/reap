@@ -35,6 +35,20 @@ Three consecutive runs measured:
 | 2 | 1,822.969 ms | 7,291.9 ns |
 | 3 | 1,825.108 ms | 7,300.4 ns |
 
+After the Chaos iarb2 parity work, the same benchmark was rerun on the same
+host and toolchain shape:
+
+| Run | Elapsed | Time/event |
+| --- | ---: | ---: |
+| 1 | 3,204.350 ms | 12,817.4 ns |
+| 2 | 3,220.288 ms | 12,881.2 ns |
+| 3 | 3,208.327 ms | 12,833.3 ns |
+
+The parity implementation therefore costs about `12.84 us/event` in this
+synthetic workload, roughly 76% above the scaffold baseline. The benchmark
+emits nearly four intents per event and exercises the full quote, hedge, and
+risk recalculation path; it is not a market-data-only latency measurement.
+
 This is a regression baseline, not an exchange-to-exchange latency claim. The
 next optimization gate should use production-shaped captures and sampling or
 hardware counters to attribute allocation, strategy, reducer, and channel
@@ -43,6 +57,8 @@ costs separately.
 ## Decision
 
 Keep Tokio at the IO edges, bounded channels at ownership handoffs, and the
-single-writer event loop. There is no evidence yet that custom SPSC queues,
-pinned threads, or lower-level IO would improve the dominant cost. Re-run this
-benchmark and collect profiles before making those changes.
+single-writer event loop. The measured parity regression now warrants profiles
+with production-shaped captures before demo trading. Attribute collections,
+allocation, quote synchronization, and risk recalculation first; custom SPSC
+queues, pinned threads, or lower-level IO should follow evidence rather than
+precede it.

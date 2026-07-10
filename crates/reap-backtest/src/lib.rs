@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::portfolio::Portfolio;
 use reap_core::{
-    FillLiquidity, MarketEvent, NewOrder, NormalizedEvent, OrderIntent, OrderUpdate, StrategyEvent,
-    Symbol,
+    AccountUpdate, FillLiquidity, MarketEvent, NewOrder, NormalizedEvent, OrderIntent, OrderUpdate,
+    Position, StrategyEvent, Symbol,
 };
 use reap_strategy::{ChaosConfig, ChaosStrategy, Strategy};
 
@@ -44,21 +44,21 @@ pub struct BacktestRunner {
 }
 
 impl BacktestRunner {
-    pub fn new(config: ChaosConfig) -> Self {
+    pub fn new(config: ChaosConfig) -> Result<Self> {
         let matchers = config
             .instruments
             .iter()
             .map(|inst| (inst.symbol.clone(), MatchingEngine::new(inst.clone())))
             .collect();
-        Self {
+        Ok(Self {
             portfolio: Portfolio::new(&config.instruments),
-            strategy: ChaosStrategy::new(config),
+            strategy: ChaosStrategy::new(config).context("invalid chaos/iarb2 configuration")?,
             matchers,
             orders_sent: 0,
             fills: 0,
             maker_fills: 0,
             taker_fills: 0,
-        }
+        })
     }
 
     pub fn run_csv_path(mut self, path: impl AsRef<Path>) -> Result<BacktestReport> {
@@ -106,6 +106,14 @@ impl BacktestRunner {
                             .on_trade(*ts_ms, *price, *qty, *taker_side);
                     let commands = self.process_updates(updates)?;
                     self.process_commands(commands)?;
+                    self.process_strategy_event(event.clone().into_strategy_event())?;
+                }
+                NormalizedEvent::Market(
+                    MarketEvent::IndexPrice { .. }
+                    | MarketEvent::FundingRate { .. }
+                    | MarketEvent::BurstSignal { .. }
+                    | MarketEvent::PriceLimits { .. },
+                ) => {
                     self.process_strategy_event(event.clone().into_strategy_event())?;
                 }
                 NormalizedEvent::Order(update) => {
@@ -193,7 +201,35 @@ impl BacktestRunner {
                 }
                 self.portfolio.apply_fill(&update);
             }
-            commands.extend(self.strategy.on_event(&StrategyEvent::Order(update)));
+            commands.extend(
+                self.strategy
+                    .on_event(&StrategyEvent::Order(update.clone())),
+            );
+            if update.has_fill() {
+                let qty = self
+                    .portfolio
+                    .positions()
+                    .get(&update.symbol)
+                    .copied()
+                    .unwrap_or(0.0);
+                commands.extend(
+                    self.strategy
+                        .on_event(&StrategyEvent::Account(AccountUpdate {
+                            ts_ms: update.ts_ms,
+                            balances: Vec::new(),
+                            positions: vec![Position {
+                                symbol: update.symbol,
+                                qty,
+                                avg_price: if update.avg_fill_price > 0.0 {
+                                    update.avg_fill_price
+                                } else {
+                                    update.last_fill_price
+                                },
+                            }],
+                            margins: Vec::new(),
+                        })),
+                );
+            }
         }
         Ok(commands)
     }
@@ -221,6 +257,7 @@ mod tests {
                 symbols: vec!["BTC-USDT".to_string(), "BTC-PERP".to_string()],
                 soft_delta_limit_usd: 50_000.0,
                 hard_delta_limit_usd: 75_000.0,
+                delta_stop_limit_usd: 100_000.0,
                 live_order_limit_usd: 100_000.0,
                 ..RiskGroupConfig::default()
             }],
@@ -257,7 +294,7 @@ mod tests {
 
     #[test]
     fn replayed_quote_fill_triggers_hedge_order() {
-        let mut runner = BacktestRunner::new(config());
+        let mut runner = BacktestRunner::new(config()).unwrap();
         let events = vec![
             NormalizedEvent::from(MarketEvent::Depth(OrderBook::one_level(
                 "BTC-USDT",
@@ -293,7 +330,7 @@ mod tests {
             include_str!("../../../fixtures/normalized/chaos_quote_hedge.jsonl").as_bytes(),
         )
         .unwrap();
-        let mut runner = BacktestRunner::new(config());
+        let mut runner = BacktestRunner::new(config()).unwrap();
 
         let report = runner.run(events).unwrap();
 

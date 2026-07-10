@@ -19,12 +19,16 @@ pub enum Channel {
     Orders,
     Fills,
     Account,
+    Positions,
     Custom(String),
 }
 
 impl Channel {
     pub fn is_private(&self) -> bool {
-        matches!(self, Self::Orders | Self::Fills | Self::Account)
+        matches!(
+            self,
+            Self::Orders | Self::Fills | Self::Account | Self::Positions
+        )
     }
 }
 
@@ -195,6 +199,14 @@ pub enum TimeInForce {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum SelfTradePrevention {
+    CancelMaker,
+    CancelTaker,
+    CancelBoth,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OrderStatus {
     PendingNew,
     Live,
@@ -323,6 +335,10 @@ pub struct NewOrder {
     pub qty: Quantity,
     pub price: Price,
     pub time_in_force: TimeInForce,
+    #[serde(default)]
+    pub reduce_only: bool,
+    #[serde(default)]
+    pub self_trade_prevention: Option<SelfTradePrevention>,
     pub reason: String,
 }
 
@@ -371,20 +387,51 @@ pub enum MarketEvent {
         qty: Quantity,
         taker_side: Side,
     },
+    IndexPrice {
+        ts_ms: TimeMs,
+        symbol: Symbol,
+        price: Price,
+    },
+    FundingRate {
+        ts_ms: TimeMs,
+        symbol: Symbol,
+        rate: f64,
+        funding_time_ms: TimeMs,
+    },
+    BurstSignal {
+        ts_ms: TimeMs,
+        symbol: Symbol,
+        value: f64,
+    },
+    PriceLimits {
+        ts_ms: TimeMs,
+        symbol: Symbol,
+        mark_price: Price,
+        limit_down: Price,
+        limit_up: Price,
+    },
 }
 
 impl MarketEvent {
     pub fn ts_ms(&self) -> TimeMs {
         match self {
             Self::Depth(book) => book.ts_ms,
-            Self::Trade { ts_ms, .. } => *ts_ms,
+            Self::Trade { ts_ms, .. }
+            | Self::IndexPrice { ts_ms, .. }
+            | Self::FundingRate { ts_ms, .. }
+            | Self::BurstSignal { ts_ms, .. }
+            | Self::PriceLimits { ts_ms, .. } => *ts_ms,
         }
     }
 
     pub fn symbol(&self) -> &str {
         match self {
             Self::Depth(book) => &book.symbol,
-            Self::Trade { symbol, .. } => symbol,
+            Self::Trade { symbol, .. }
+            | Self::IndexPrice { symbol, .. }
+            | Self::FundingRate { symbol, .. }
+            | Self::BurstSignal { symbol, .. }
+            | Self::PriceLimits { symbol, .. } => symbol,
         }
     }
 }
@@ -403,9 +450,17 @@ pub struct ControlEvent {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Balance {
+    #[serde(default)]
+    pub account_id: Option<String>,
     pub currency: String,
     pub total: Quantity,
     pub available: Quantity,
+    #[serde(default)]
+    pub equity: Quantity,
+    #[serde(default)]
+    pub liability: Quantity,
+    #[serde(default)]
+    pub max_loan: Quantity,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -416,10 +471,26 @@ pub struct Position {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarginSnapshot {
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
+    pub ratio: Option<f64>,
+    #[serde(default)]
+    pub exchange_ratio: Option<f64>,
+    #[serde(default)]
+    pub adjusted_equity_usd: Option<f64>,
+    #[serde(default)]
+    pub notional_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccountUpdate {
     pub ts_ms: TimeMs,
     pub balances: Vec<Balance>,
     pub positions: Vec<Position>,
+    #[serde(default)]
+    pub margins: Vec<MarginSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -447,6 +518,8 @@ pub struct SystemEvent {
     pub ts_ms: TimeMs,
     pub kind: SystemEventKind,
     pub venue: Option<Venue>,
+    #[serde(default)]
+    pub account_id: Option<String>,
     pub symbol: Option<Symbol>,
     pub reason: String,
 }

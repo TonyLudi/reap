@@ -82,6 +82,7 @@ impl FeedProcessor {
         }
         self.stats.accepted += 1;
         let venue = parsed.id.venue;
+        let account_id = parsed.account_id;
 
         match parsed.event {
             VenueEvent::Book(update) => self.process_book(venue, update),
@@ -90,17 +91,17 @@ impl FeedProcessor {
                 vec![FeedOutput::Event(event)]
             }
             VenueEvent::PrivateOrder(update) => vec![
-                private_heartbeat(venue, update.ts_ms),
+                private_heartbeat(venue, account_id.clone(), update.ts_ms),
                 FeedOutput::PrivateOrder(update),
             ],
             VenueEvent::PrivateFill(fill) => vec![
-                private_heartbeat(venue, fill.ts_ms),
+                private_heartbeat(venue, account_id.clone(), fill.ts_ms),
                 FeedOutput::PrivateFill(fill),
             ],
             VenueEvent::Account(update) => {
                 self.stats.normalized_events += 1;
                 vec![
-                    private_heartbeat(venue, update.ts_ms),
+                    private_heartbeat(venue, account_id, update.ts_ms),
                     FeedOutput::Event(NormalizedEvent::Account(update)),
                 ]
             }
@@ -139,6 +140,7 @@ impl FeedProcessor {
                     ts_ms: now_ms,
                     kind: SystemEventKind::FeedStale,
                     venue: Some(stream.venue),
+                    account_id: None,
                     symbol: Some(stream.symbol.clone()),
                     reason: format!("book exceeded max age of {max_age_ms}ms"),
                 })
@@ -177,6 +179,7 @@ impl FeedProcessor {
                             ts_ms,
                             kind: SystemEventKind::FeedRecovered,
                             venue: Some(venue),
+                            account_id: None,
                             symbol: Some(stream_id.symbol.clone()),
                             reason: if was_recovering {
                                 "snapshot and buffered deltas are contiguous".to_string()
@@ -189,6 +192,7 @@ impl FeedProcessor {
                         ts_ms,
                         kind: SystemEventKind::FeedHeartbeat,
                         venue: Some(venue),
+                        account_id: None,
                         symbol: Some(stream_id.symbol.clone()),
                         reason: "sequenced book update accepted".to_string(),
                     }));
@@ -219,6 +223,7 @@ impl FeedProcessor {
                         ts_ms,
                         kind: SystemEventKind::FeedGap,
                         venue: Some(venue),
+                        account_id: None,
                         symbol: Some(stream_id.symbol.clone()),
                         reason: format!(
                             "expected prev sequence {expected_prev:?}, received {received_prev}"
@@ -228,6 +233,7 @@ impl FeedProcessor {
                         ts_ms,
                         kind: SystemEventKind::BookRecoveryStarted,
                         venue: Some(venue),
+                        account_id: None,
                         symbol: Some(stream_id.symbol.clone()),
                         reason: "request a fresh websocket snapshot".to_string(),
                     }),
@@ -246,6 +252,7 @@ impl FeedProcessor {
                     ts_ms,
                     kind: SystemEventKind::BookRecoveryFailed,
                     venue: Some(venue),
+                    account_id: None,
                     symbol: Some(stream_id.symbol),
                     reason,
                 })]
@@ -254,11 +261,12 @@ impl FeedProcessor {
     }
 }
 
-fn private_heartbeat(venue: Venue, ts_ms: TimeMs) -> FeedOutput {
+fn private_heartbeat(venue: Venue, account_id: Option<String>, ts_ms: TimeMs) -> FeedOutput {
     FeedOutput::System(SystemEvent {
         ts_ms,
         kind: SystemEventKind::PrivateStreamHeartbeat,
         venue: Some(venue),
+        account_id,
         symbol: None,
         reason: "private websocket event accepted".to_string(),
     })
@@ -308,6 +316,7 @@ mod tests {
                     seq_id: seq,
                 },
             },
+            account_id: None,
             event: VenueEvent::Book(update),
         }
     }

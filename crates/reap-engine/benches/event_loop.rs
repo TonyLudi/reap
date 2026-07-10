@@ -19,7 +19,7 @@ fn main() {
         max_turnover_usd: f64::MAX,
         ..RiskLimits::default()
     };
-    let mut engine = TradingEngine::new(ChaosStrategy::new(config), RiskGate::new(limits));
+    let mut engine = TradingEngine::new(ChaosStrategy::new(config).unwrap(), RiskGate::new(limits));
 
     let started = Instant::now();
     let mut intents = 0_usize;

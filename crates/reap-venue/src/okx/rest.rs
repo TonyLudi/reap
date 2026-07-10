@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use chrono::{SecondsFormat, Utc};
-use reap_core::{FillLiquidity, Side, TimeInForce};
+use reap_core::{FillLiquidity, SelfTradePrevention, Side, TimeInForce};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -123,6 +123,8 @@ pub struct OkxPlaceOrder {
     pub price: f64,
     pub qty: f64,
     pub client_order_id: String,
+    pub reduce_only: bool,
+    pub self_trade_prevention: Option<SelfTradePrevention>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,6 +262,10 @@ where
             sz: String,
             #[serde(rename = "clOrdId")]
             client_order_id: &'a str,
+            #[serde(rename = "reduceOnly", skip_serializing_if = "Option::is_none")]
+            reduce_only: Option<bool>,
+            #[serde(rename = "stpMode", skip_serializing_if = "Option::is_none")]
+            self_trade_prevention: Option<&'static str>,
         }
 
         let body = serde_json::to_string(&Body {
@@ -270,6 +276,8 @@ where
             px: decimal_string(order.price),
             sz: decimal_string(order.qty),
             client_order_id: &order.client_order_id,
+            reduce_only: order.reduce_only.then_some(true),
+            self_trade_prevention: order.self_trade_prevention.map(stp_mode_string),
         })?;
         Ok(self
             .signer
@@ -385,6 +393,14 @@ fn time_in_force_string(time_in_force: TimeInForce) -> &'static str {
         TimeInForce::Gtc => "limit",
         TimeInForce::Ioc => "ioc",
         TimeInForce::PostOnly => "post_only",
+    }
+}
+
+fn stp_mode_string(mode: SelfTradePrevention) -> &'static str {
+    match mode {
+        SelfTradePrevention::CancelMaker => "cancel_maker",
+        SelfTradePrevention::CancelTaker => "cancel_taker",
+        SelfTradePrevention::CancelBoth => "cancel_both",
     }
 }
 
@@ -617,6 +633,8 @@ mod tests {
                     price: 100.5,
                     qty: 0.1,
                     client_order_id: "reap1".to_string(),
+                    reduce_only: false,
+                    self_trade_prevention: Some(SelfTradePrevention::CancelMaker),
                 },
             )
             .await
@@ -638,6 +656,7 @@ mod tests {
         let requests = requests.lock().unwrap();
         assert_eq!(requests[0].path, PLACE_ORDER_PATH);
         assert!(requests[0].body.contains(r#""clOrdId":"reap1""#));
+        assert!(requests[0].body.contains(r#""stpMode":"cancel_maker""#));
         assert_eq!(requests[1].path, CANCEL_ORDER_PATH);
         assert!(requests[1].body.contains(r#""clOrdId":"reap1""#));
         assert!(

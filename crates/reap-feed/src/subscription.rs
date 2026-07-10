@@ -118,6 +118,7 @@ fn channel_label(channel: &Channel) -> String {
         Channel::Orders => "orders".to_string(),
         Channel::Fills => "fills".to_string(),
         Channel::Account => "account".to_string(),
+        Channel::Positions => "positions".to_string(),
         Channel::Custom(value) => {
             value.replace(|character: char| !character.is_ascii_alphanumeric(), "_")
         }

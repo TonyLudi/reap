@@ -1,7 +1,8 @@
 mod chaos;
 
 pub use chaos::{
-    ChaosConfig, ChaosStrategy, InstrumentConfig, InstrumentKindConfig, RiskGroupConfig,
+    ChaosConfig, ChaosStrategy, CoinConfig, ConfigValidation, HaltIntervalConfig, InstrumentConfig,
+    InstrumentKindConfig, MissedHedge, RiskGroupConfig, RiskGroupKindConfig, SkewTypeConfig,
 };
 
 use reap_core::{OrderIntent, StrategyEvent};

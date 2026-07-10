@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use reap_core::{AccountUpdate, Balance, OrderEvent, OrderStatus, OrderUpdate, Position};
+use reap_core::{AccountUpdate, Balance, NewOrder, OrderEvent, OrderStatus, OrderUpdate, Position};
 use reap_venue::{PrivateOrderState, PrivateOrderUpdate, RemoteFill};
 
 use crate::OrderReducer;
@@ -46,6 +46,17 @@ impl PrivateStateReducer {
         self.exchange_to_client
             .get(exchange_order_id)
             .map(String::as_str)
+    }
+
+    pub fn register_local_order(&mut self, client_order_id: impl Into<String>, order: NewOrder) {
+        let client_order_id = client_order_id.into();
+        if !self.orders.contains_order(&client_order_id) {
+            self.orders.create_pending(client_order_id, order);
+        }
+    }
+
+    pub fn remove_local_order(&mut self, client_order_id: &str) {
+        self.orders.remove(client_order_id);
     }
 
     pub fn apply_account(&mut self, update: AccountUpdate) {
@@ -140,6 +151,10 @@ impl PrivateStateReducer {
         } else {
             canonical_event(update.state)
         };
+        let local_reason = existing
+            .as_ref()
+            .map(|order| order.reason.clone())
+            .filter(|reason| !reason.is_empty());
         let canonical = OrderUpdate {
             ts_ms: update.ts_ms,
             order_id,
@@ -177,10 +192,11 @@ impl PrivateStateReducer {
             } else {
                 None
             },
-            reason: if update.reject_reason.is_empty() {
-                "okx_private".to_string()
-            } else {
-                format!("okx_private:{}", update.reject_reason)
+            reason: match (local_reason, update.reject_reason.is_empty()) {
+                (Some(reason), true) => reason,
+                (Some(reason), false) => format!("{reason}:{}", update.reject_reason),
+                (None, true) => "okx_private".to_string(),
+                (None, false) => format!("okx_private:{}", update.reject_reason),
             },
         };
         self.orders
@@ -235,7 +251,7 @@ impl PrivateStateReducer {
             last_fill_qty: applied_qty,
             last_fill_price: fill.price,
             last_fill_liquidity: Some(fill.liquidity),
-            reason: "okx_private_fill".to_string(),
+            reason: existing.reason,
         };
         self.orders
             .apply_update(canonical.clone())
@@ -317,20 +333,51 @@ mod tests {
     }
 
     #[test]
+    fn private_updates_preserve_registered_strategy_reason() {
+        let mut reducer = PrivateStateReducer::new();
+        reducer.register_local_order(
+            "client-1",
+            NewOrder {
+                symbol: "BTC-USDT".to_string(),
+                side: Side::Buy,
+                qty: 1.0,
+                price: 100.0,
+                time_in_force: reap_core::TimeInForce::PostOnly,
+                reduce_only: false,
+                self_trade_prevention: None,
+                reason: "quote:1".to_string(),
+            },
+        );
+
+        let update = reducer.apply_order(private_fill()).unwrap();
+
+        assert_eq!(update.reason, "quote:1");
+        assert_eq!(
+            reducer.order_reducer().get("client-1").unwrap().reason,
+            "quote:1"
+        );
+    }
+
+    #[test]
     fn account_updates_replace_currency_and_position_state() {
         let mut reducer = PrivateStateReducer::new();
         reducer.apply_account(AccountUpdate {
             ts_ms: 1,
             balances: vec![Balance {
+                account_id: None,
                 currency: "USDT".to_string(),
                 total: 100.0,
                 available: 90.0,
+                equity: 100.0,
+                liability: 0.0,
+                max_loan: 0.0,
             }],
             positions: vec![Position {
                 symbol: "BTC-USDT-SWAP".to_string(),
                 qty: -2.0,
                 avg_price: 100.0,
             }],
+            margins: Vec::new(),
         });
 
         assert_eq!(reducer.balances()["USDT"].available, 90.0);
@@ -348,6 +395,8 @@ mod tests {
                 qty: 1.0,
                 price: 100.0,
                 time_in_force: reap_core::TimeInForce::Gtc,
+                reduce_only: false,
+                self_trade_prevention: None,
                 reason: "test".to_string(),
             },
             1,

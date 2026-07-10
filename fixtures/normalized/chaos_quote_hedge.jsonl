@@ -1,3 +1,4 @@
 {"Market":{"Depth":{"symbol":"BTC-USDT","ts_ms":1,"bids":[{"px":50000.0,"qty":2.0}],"asks":[{"px":50001.0,"qty":2.0}]}}}
 {"Market":{"Depth":{"symbol":"BTC-PERP","ts_ms":1,"bids":[{"px":50003.0,"qty":10000.0}],"asks":[{"px":50004.0,"qty":10000.0}]}}}
 {"Order":{"ts_ms":2,"order_id":"fixture-quote-fill","symbol":"BTC-USDT","side":"buy","event":"fully_filled","status":"filled","price":50000.0,"qty":0.1,"open_qty":0.0,"filled_qty":0.1,"avg_fill_price":50000.0,"last_fill_qty":0.1,"last_fill_price":50000.0,"last_fill_liquidity":"maker","reason":"quote"}}
+{"Account":{"ts_ms":2,"balances":[],"positions":[{"symbol":"BTC-USDT","qty":0.1,"avg_price":50000.0}],"margins":[]}}

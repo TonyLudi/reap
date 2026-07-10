@@ -133,6 +133,8 @@ mod tests {
                     qty: 1.0,
                     price: 100.0,
                     time_in_force: TimeInForce::PostOnly,
+                    reduce_only: false,
+                    self_trade_prevention: None,
                     reason: "test".to_string(),
                 })]
             } else {
@@ -146,6 +148,7 @@ mod tests {
             ts_ms,
             kind,
             venue: Some(Venue::Okx),
+            account_id: None,
             symbol: (kind == SystemEventKind::FeedRecovered).then(|| "BTC-USDT".to_string()),
             reason: "test".to_string(),
         })
@@ -198,6 +201,7 @@ mod tests {
             ts_ms: 2,
             kind: SystemEventKind::KillSwitchActivated,
             venue: None,
+            account_id: None,
             symbol: None,
             reason: "operator".to_string(),
         }));

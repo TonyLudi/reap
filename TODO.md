@@ -55,7 +55,36 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Add storage for raw events, normalized events, intents, orders, and fills.
 - [x] Profile the hot path before lower-level queue/thread optimizations.
 
-Completion evidence is documented in [README.md](README.md),
+## Step 7: Chaos Iarb2 Decision Parity
+
+- [x] Cross-check Rust configuration, pricing, hedging, skew, funding, account
+  risk, and stop behavior against Java `chaos-iarb2` source and fixtures.
+- [x] Reject one-symbol and self-only hedge topologies before startup.
+- [x] Cover spot, linear, and inverse quote/hedge vectors with parity tests.
+- [x] Make account/position updates authoritative for hedge triggers.
+- [x] Add funding, index, mark/limit, account, margin, and position events.
+- [x] Preserve quote/hedge identity across REST and private websocket races.
+- [x] Scope private feed health and deduplication by account.
+- [x] Document execution-policy and platform differences without claiming
+  Binance or Java control-plane parity.
+
+## Step 8: Demo-Tradable Runtime
+
+- [ ] Add a live composition crate/command with one strategy event-loop owner.
+- [ ] Verify exchange instrument metadata, account mode, trade mode, and risk
+  valuation before subscriptions are considered ready.
+- [ ] Implement the complete startup and restart reconciliation state machine.
+- [ ] Wire accepted intents through registered submit/cancel and private
+  feedback into the engine.
+- [ ] Add end-to-end fault tests for disconnects, gaps, duplicates, partial
+  fills, IOC misses, ambiguous submits, rate limits, and restart recovery.
+- [ ] Profile the parity event loop with production-shaped captures and remove
+  measured hot-path allocation/collection bottlenecks.
+- [ ] Complete an OKX demo soak with no unexplained reconciliation drift.
+
+Completed-step evidence is documented in [README.md](README.md),
 [docs/operations.md](docs/operations.md), and
 [docs/performance.md](docs/performance.md). The workspace test, lint, replay,
 configuration, backtest, and benchmark commands are the acceptance gates.
+The remaining path to trading is tracked in
+[docs/trading-readiness.md](docs/trading-readiness.md).

@@ -36,6 +36,64 @@ impl Default for RiskLimits {
     }
 }
 
+impl RiskLimits {
+    pub fn validation_error(&self) -> Option<String> {
+        for (name, value) in [
+            ("max_order_notional_usd", self.max_order_notional_usd),
+            (
+                "max_abs_position_notional_usd",
+                self.max_abs_position_notional_usd,
+            ),
+            (
+                "max_live_order_notional_usd",
+                self.max_live_order_notional_usd,
+            ),
+            ("max_turnover_usd", self.max_turnover_usd),
+            ("max_drawdown_usd", self.max_drawdown_usd),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Some(format!("{name} must be finite and non-negative"));
+            }
+        }
+        if self.max_feed_age_ms == 0 {
+            return Some("max_feed_age_ms must be positive".to_string());
+        }
+        if self.max_private_age_ms == 0 {
+            return Some("max_private_age_ms must be positive".to_string());
+        }
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum InstrumentRiskModel {
+    Spot,
+    LinearDerivative { contract_value: f64 },
+    InverseDerivative { contract_value: f64 },
+}
+
+impl InstrumentRiskModel {
+    pub fn is_valid(self) -> bool {
+        match self {
+            Self::Spot => true,
+            Self::LinearDerivative { contract_value }
+            | Self::InverseDerivative { contract_value } => {
+                contract_value.is_finite() && contract_value > 0.0
+            }
+        }
+    }
+
+    fn notional_usd(self, qty: f64, price: f64) -> f64 {
+        match self {
+            Self::Spot => qty * price,
+            Self::LinearDerivative { contract_value } => qty * contract_value * price,
+            Self::InverseDerivative { contract_value } => qty * contract_value,
+        }
+        .abs()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskRejectReason {
@@ -83,8 +141,9 @@ pub struct RiskGate {
     kill_switch: Option<String>,
     halted_symbols: HashMap<Symbol, String>,
     feed_health: HashMap<(Venue, Symbol), StreamHealth>,
-    private_health: HashMap<Venue, StreamHealth>,
+    private_health: HashMap<(Venue, Option<String>), StreamHealth>,
     marks: HashMap<Symbol, f64>,
+    instrument_models: HashMap<Symbol, InstrumentRiskModel>,
     positions: HashMap<Symbol, f64>,
     live_orders: HashMap<String, LiveOrderRisk>,
     turnover_usd: f64,
@@ -95,13 +154,17 @@ pub struct RiskGate {
 
 impl RiskGate {
     pub fn new(limits: RiskLimits) -> Self {
+        let kill_switch = limits
+            .validation_error()
+            .map(|error| format!("invalid risk limits: {error}"));
         Self {
             limits,
-            kill_switch: None,
+            kill_switch,
             halted_symbols: HashMap::new(),
             feed_health: HashMap::new(),
             private_health: HashMap::new(),
             marks: HashMap::new(),
+            instrument_models: HashMap::new(),
             positions: HashMap::new(),
             live_orders: HashMap::new(),
             turnover_usd: 0.0,
@@ -135,6 +198,25 @@ impl RiskGate {
         self.positions.get(symbol).copied().unwrap_or(0.0)
     }
 
+    pub fn set_instrument_model(
+        &mut self,
+        symbol: impl Into<Symbol>,
+        model: InstrumentRiskModel,
+    ) -> bool {
+        if !model.is_valid() {
+            return false;
+        }
+        self.instrument_models.insert(symbol.into(), model);
+        true
+    }
+
+    fn instrument_model(&self, symbol: &str) -> InstrumentRiskModel {
+        self.instrument_models
+            .get(symbol)
+            .copied()
+            .unwrap_or(InstrumentRiskModel::Spot)
+    }
+
     pub fn live_order_ids(&self) -> impl Iterator<Item = &str> {
         self.live_orders.keys().map(String::as_str)
     }
@@ -165,8 +247,17 @@ impl RiskGate {
     }
 
     pub fn mark_private_ready(&mut self, venue: Venue, ts_ms: TimeMs) {
+        self.mark_private_account_ready(venue, None, ts_ms);
+    }
+
+    pub fn mark_private_account_ready(
+        &mut self,
+        venue: Venue,
+        account_id: Option<String>,
+        ts_ms: TimeMs,
+    ) {
         self.private_health.insert(
-            venue,
+            (venue, account_id),
             StreamHealth {
                 last_ready_ms: ts_ms,
                 stale: false,
@@ -191,11 +282,14 @@ impl RiskGate {
             OrderStatus::Live | OrderStatus::PartiallyFilled | OrderStatus::PendingNew
         ) && update.open_qty > 0.0
         {
+            let risk_price = risk_price(update.price, update.avg_fill_price);
             self.live_orders.insert(
                 update.order_id.clone(),
                 LiveOrderRisk {
                     symbol: update.symbol.clone(),
-                    notional_usd: update.open_qty * risk_price(update.price, update.avg_fill_price),
+                    notional_usd: self
+                        .instrument_model(&update.symbol)
+                        .notional_usd(update.open_qty, risk_price),
                     signed_qty: update.side.factor() * update.open_qty,
                 },
             );
@@ -218,7 +312,9 @@ impl RiskGate {
                 }
                 *self.positions.entry(update.symbol.clone()).or_default() +=
                     update.side.factor() * update.last_fill_qty;
-                self.turnover_usd += (update.last_fill_qty * update.last_fill_price).abs();
+                self.turnover_usd += self
+                    .instrument_model(&update.symbol)
+                    .notional_usd(update.last_fill_qty, update.last_fill_price);
             }
         }
         self.evaluate_post_trade(update.ts_ms, Some(&update.symbol))
@@ -241,6 +337,7 @@ impl RiskGate {
             ts_ms,
             kind: SystemEventKind::KillSwitchActivated,
             venue: None,
+            account_id: None,
             symbol: None,
             reason,
         }
@@ -252,6 +349,7 @@ impl RiskGate {
             ts_ms,
             kind: SystemEventKind::KillSwitchReset,
             venue: None,
+            account_id: None,
             symbol: None,
             reason: reason.into(),
         }
@@ -270,6 +368,7 @@ impl RiskGate {
             ts_ms,
             kind: SystemEventKind::SymbolHalted,
             venue: None,
+            account_id: None,
             symbol: Some(symbol),
             reason,
         }
@@ -287,6 +386,7 @@ impl RiskGate {
             ts_ms,
             kind: SystemEventKind::SymbolResumed,
             venue: None,
+            account_id: None,
             symbol: Some(symbol),
             reason: reason.into(),
         }
@@ -309,7 +409,23 @@ impl RiskGate {
             }
             SystemEventKind::PrivateStreamStale | SystemEventKind::ReconcileDrift => {
                 if let Some(venue) = event.venue {
-                    self.private_health.entry(venue).or_default().stale = true;
+                    if event.account_id.is_some() {
+                        self.private_health
+                            .entry((venue, event.account_id.clone()))
+                            .or_default()
+                            .stale = true;
+                    } else {
+                        let mut matched = false;
+                        for ((health_venue, _), health) in &mut self.private_health {
+                            if *health_venue == venue {
+                                health.stale = true;
+                                matched = true;
+                            }
+                        }
+                        if !matched {
+                            self.private_health.entry((venue, None)).or_default().stale = true;
+                        }
+                    }
                 } else {
                     for health in self.private_health.values_mut() {
                         health.stale = true;
@@ -318,7 +434,7 @@ impl RiskGate {
             }
             SystemEventKind::PrivateStreamHeartbeat | SystemEventKind::PrivateStreamRecovered => {
                 if let Some(venue) = event.venue {
-                    self.mark_private_ready(venue, event.ts_ms);
+                    self.mark_private_account_ready(venue, event.account_id.clone(), event.ts_ms);
                 }
             }
             SystemEventKind::KillSwitchActivated | SystemEventKind::RiskBreach => {
@@ -350,12 +466,13 @@ impl RiskGate {
                     ts_ms: now_ms,
                     kind: SystemEventKind::FeedStale,
                     venue: Some(*venue),
+                    account_id: None,
                     symbol: Some(symbol.clone()),
                     reason: format!("feed age exceeded {}ms", self.limits.max_feed_age_ms),
                 });
             }
         }
-        for (venue, health) in &mut self.private_health {
+        for ((venue, account_id), health) in &mut self.private_health {
             if !health.stale
                 && now_ms.saturating_sub(health.last_ready_ms) > self.limits.max_private_age_ms
             {
@@ -364,6 +481,7 @@ impl RiskGate {
                     ts_ms: now_ms,
                     kind: SystemEventKind::PrivateStreamStale,
                     venue: Some(*venue),
+                    account_id: account_id.clone(),
                     symbol: None,
                     reason: format!(
                         "private stream age exceeded {}ms",
@@ -431,7 +549,7 @@ impl RiskGate {
             if self.private_health.is_empty() {
                 return Some(RiskRejectReason::PrivateStreamNotReady);
             }
-            if self.private_health.values().all(|health| {
+            if self.private_health.values().any(|health| {
                 health.stale
                     || now_ms.saturating_sub(health.last_ready_ms) > self.limits.max_private_age_ms
             }) {
@@ -439,7 +557,8 @@ impl RiskGate {
             }
         }
 
-        let notional = order.qty * order.price;
+        let model = self.instrument_model(&order.symbol);
+        let notional = model.notional_usd(order.qty, order.price);
         if notional > self.limits.max_order_notional_usd {
             return Some(RiskRejectReason::OrderNotional {
                 value: notional,
@@ -453,8 +572,10 @@ impl RiskGate {
             .filter(|live| live.symbol == order.symbol)
             .map(|live| live.signed_qty)
             .sum::<f64>();
-        let projected =
-            ((position + pending_qty + order.side.factor() * order.qty) * order.price).abs();
+        let projected = model.notional_usd(
+            position + pending_qty + order.side.factor() * order.qty,
+            order.price,
+        );
         if projected > self.limits.max_abs_position_notional_usd {
             return Some(RiskRejectReason::PositionNotional {
                 value: projected,
@@ -492,7 +613,9 @@ impl RiskGate {
     fn evaluate_post_trade(&mut self, ts_ms: TimeMs, symbol: Option<&str>) -> PostTradeOutcome {
         let breach = symbol.and_then(|symbol| {
             let mark = self.marks.get(symbol).copied().unwrap_or(0.0);
-            let exposure = (self.position(symbol) * mark).abs();
+            let exposure = self
+                .instrument_model(symbol)
+                .notional_usd(self.position(symbol), mark);
             (exposure > self.limits.max_abs_position_notional_usd).then(|| {
                 format!(
                     "position notional {exposure} exceeds {}",
@@ -540,6 +663,7 @@ impl RiskGate {
                     ts_ms,
                     kind: SystemEventKind::RiskBreach,
                     venue: None,
+                    account_id: None,
                     symbol: symbol.map(str::to_string),
                     reason: reason.clone(),
                 },
@@ -547,6 +671,7 @@ impl RiskGate {
                     ts_ms,
                     kind: SystemEventKind::KillSwitchActivated,
                     venue: None,
+                    account_id: None,
                     symbol: symbol.map(str::to_string),
                     reason,
                 },
@@ -597,6 +722,8 @@ mod tests {
             qty: 1.0,
             price: 100.0,
             time_in_force: TimeInForce::PostOnly,
+            reduce_only: false,
+            self_trade_prevention: None,
             reason: "quote".to_string(),
         })
     }
@@ -623,6 +750,25 @@ mod tests {
         assert!(matches!(
             gate.pre_trade(100, order()),
             RiskDecision::Allowed(_)
+        ));
+    }
+
+    #[test]
+    fn invalid_limits_activate_kill_switch_at_construction() {
+        let gate = RiskGate::new(RiskLimits {
+            max_order_notional_usd: f64::NAN,
+            require_feed_health: false,
+            require_private_health: false,
+            ..RiskLimits::default()
+        });
+
+        assert!(gate.is_killed());
+        assert!(matches!(
+            gate.pre_trade(1, order()),
+            RiskDecision::Rejected {
+                reason: RiskRejectReason::KillSwitch(_),
+                ..
+            }
         ));
     }
 
@@ -660,6 +806,7 @@ mod tests {
             ts_ms: 2_102,
             kind: SystemEventKind::FeedHeartbeat,
             venue: Some(Venue::Okx),
+            account_id: None,
             symbol: Some("BTC-USDT".to_string()),
             reason: "book".to_string(),
         });
@@ -667,6 +814,7 @@ mod tests {
             ts_ms: 2_102,
             kind: SystemEventKind::PrivateStreamHeartbeat,
             venue: Some(Venue::Okx),
+            account_id: None,
             symbol: None,
             reason: "orders".to_string(),
         });
@@ -788,5 +936,111 @@ mod tests {
 
         assert!(gate.is_killed());
         assert_eq!(outcome.events[0].kind, SystemEventKind::RiskBreach);
+    }
+
+    #[test]
+    fn private_health_is_enforced_for_every_account() {
+        let limits = RiskLimits {
+            require_feed_health: false,
+            ..RiskLimits::default()
+        };
+        let mut gate = RiskGate::new(limits);
+        gate.mark_private_account_ready(Venue::Okx, Some("maker".to_string()), 2_101);
+        gate.mark_private_account_ready(Venue::Okx, Some("hedge".to_string()), 100);
+
+        let events = gate.check_staleness(2_101);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].account_id.as_deref(), Some("hedge"));
+        assert!(matches!(
+            gate.pre_trade(2_101, order()),
+            RiskDecision::Rejected {
+                reason: RiskRejectReason::PrivateStreamStale,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn derivative_contract_models_drive_all_notional_checks() {
+        let limits = RiskLimits {
+            max_order_notional_usd: 2_500.0,
+            max_abs_position_notional_usd: 2_500.0,
+            max_live_order_notional_usd: 2_500.0,
+            max_turnover_usd: 2_500.0,
+            require_feed_health: false,
+            require_private_health: false,
+            ..RiskLimits::default()
+        };
+        let mut inverse_gate = RiskGate::new(limits.clone());
+        assert!(inverse_gate.set_instrument_model(
+            "BTC-USD-SWAP",
+            InstrumentRiskModel::InverseDerivative {
+                contract_value: 100.0,
+            },
+        ));
+        let inverse_order = OrderIntent::NewOrder(NewOrder {
+            symbol: "BTC-USD-SWAP".to_string(),
+            side: Side::Buy,
+            qty: 20.0,
+            price: 50_000.0,
+            time_in_force: TimeInForce::Ioc,
+            reduce_only: false,
+            self_trade_prevention: None,
+            reason: "hedge".to_string(),
+        });
+        assert!(matches!(
+            inverse_gate.pre_trade(1, inverse_order),
+            RiskDecision::Allowed(_)
+        ));
+
+        let outcome = inverse_gate.on_order_update(&OrderUpdate {
+            ts_ms: 2,
+            order_id: "inverse-fill".to_string(),
+            symbol: "BTC-USD-SWAP".to_string(),
+            side: Side::Buy,
+            event: OrderEvent::FullyFilled,
+            status: OrderStatus::Filled,
+            price: 50_000.0,
+            qty: 20.0,
+            open_qty: 0.0,
+            filled_qty: 20.0,
+            avg_fill_price: 50_000.0,
+            last_fill_qty: 20.0,
+            last_fill_price: 50_000.0,
+            last_fill_liquidity: Some(FillLiquidity::Taker),
+            reason: "hedge".to_string(),
+        });
+        assert!(outcome.events.is_empty());
+        assert!(!inverse_gate.is_killed());
+        assert_eq!(inverse_gate.turnover_usd(), 2_000.0);
+
+        let mut linear_gate = RiskGate::new(limits);
+        assert!(linear_gate.set_instrument_model(
+            "BTC-USDT-SWAP",
+            InstrumentRiskModel::LinearDerivative {
+                contract_value: 0.01,
+            },
+        ));
+        let linear_order = OrderIntent::NewOrder(NewOrder {
+            symbol: "BTC-USDT-SWAP".to_string(),
+            side: Side::Sell,
+            qty: 4.0,
+            price: 50_000.0,
+            time_in_force: TimeInForce::Ioc,
+            reduce_only: false,
+            self_trade_prevention: None,
+            reason: "hedge".to_string(),
+        });
+        assert!(matches!(
+            linear_gate.pre_trade(1, linear_order),
+            RiskDecision::Allowed(_)
+        ));
+
+        assert!(!linear_gate.set_instrument_model(
+            "BROKEN",
+            InstrumentRiskModel::LinearDerivative {
+                contract_value: 0.0,
+            },
+        ));
     }
 }

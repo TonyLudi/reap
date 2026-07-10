@@ -11,15 +11,42 @@ controls before it can trade.
    relationship.
 2. Start structured telemetry and bounded storage before feed or order tasks.
 3. Build the OKX adapter with the regional websocket/REST domains associated
-   with the account. Never infer a regional domain from a symbol.
-4. Start isolated private and partitioned public websocket plans. Authenticate
-   private sockets before subscriptions.
+   with each account. Call `with_account_id` for every private adapter; never
+   infer account identity or a regional domain from a symbol.
+4. Start isolated private and partitioned public websocket plans. Public plans
+   must include sequenced books for every instrument, trades where required,
+   funding rates for swaps, configured index tickers, and derivative mark/price
+   limits. Private plans for every account must include orders, fills, account,
+   and positions. Authenticate private sockets before subscriptions.
 5. Wait for a sequenced book snapshot for every traded symbol. A
    `FeedRecovered` event marks the public side ready.
-6. Reconcile pending orders and recent fills over REST, then mark the private
-   stream ready only when the report is clean.
-7. Confirm storage queue depth, feed age, private age, and kill-switch state.
+6. Fetch initial account balances, margins, and positions. Reconcile pending
+   orders and recent fills over REST, then mark each account's private stream
+   ready only when its report is clean.
+7. Register each symbol's `InstrumentRiskModel` as spot, linear derivative, or
+   inverse derivative with the correct contract value. A derivative must not
+   inherit the risk gate's spot default.
+8. Confirm storage queue depth, every feed age, every private account age,
+   position/account freshness, exchange and calculated margin ratios, and
+   kill-switch state.
    Only then may the risk gate authorize new orders.
+
+The repository currently provides these steps as library boundaries; no live
+composition process owns the complete startup gate yet.
+
+## Order Path
+
+- Register the local `NewOrder` with the private reducer before awaiting the
+  network request. Use `OkxOrderGateway::submit_registered` so an early
+  websocket acknowledgement cannot lose its `quote` or `hedge` reason.
+- Route explicit REST rejections back through the gateway state. Treat timeout
+  and transport ambiguity as pending until REST/private reconciliation resolves
+  it; do not blindly resubmit.
+- Feed every order acknowledgement, fill, account update, and position update
+  into the single-writer event loop. Strategy state must not be mutated from a
+  websocket task.
+- Keep private deduplication and health account-scoped. One healthy account must
+  never mask another stale account.
 
 ## Fail-Closed Matrix
 
@@ -43,6 +70,10 @@ controls before it can trade.
 
 Control and health events must be captured as normalized records so the exact
 live decision path can be replayed.
+
+For multi-account strategies, a private stale or reconciliation drift event
+must carry `account_id`. A venue-wide event without an account scope is treated
+as affecting every tracked account on that venue.
 
 ## Credentials
 

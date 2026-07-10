@@ -18,6 +18,8 @@ pub enum VenueError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedEvent {
     pub id: EventId,
+    #[serde(default)]
+    pub account_id: Option<String>,
     pub event: VenueEvent,
 }
 

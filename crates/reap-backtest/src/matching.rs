@@ -388,6 +388,8 @@ mod tests {
             qty: 1.0,
             price: 101.0,
             time_in_force: TimeInForce::PostOnly,
+            reduce_only: false,
+            self_trade_prevention: None,
             reason: "quote".to_string(),
         });
         assert_eq!(updates[0].event, OrderEvent::Cancelled);
@@ -408,6 +410,8 @@ mod tests {
             qty: 0.5,
             price: 101.0,
             time_in_force: TimeInForce::Ioc,
+            reduce_only: false,
+            self_trade_prevention: None,
             reason: "hedge".to_string(),
         });
         assert_eq!(updates[0].event, OrderEvent::FullyFilled);

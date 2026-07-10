@@ -60,7 +60,7 @@ fn main() -> Result<()> {
                 .with_context(|| format!("failed to read config {}", config.display()))?;
             let config: ChaosConfig = toml::from_str(&config_text)
                 .with_context(|| format!("failed to parse config {}", config.display()))?;
-            let runner = BacktestRunner::new(config);
+            let runner = BacktestRunner::new(config)?;
             let report = match format {
                 ReplayFormat::Csv => runner.run_csv_path(&data)?,
                 ReplayFormat::NormalizedJsonl => runner.run_normalized_jsonl_path(&data)?,
@@ -91,7 +91,7 @@ fn main() -> Result<()> {
                 .with_context(|| format!("failed to read config {}", config.display()))?;
             let config: ChaosConfig = toml::from_str(&config_text)
                 .with_context(|| format!("failed to parse config {}", config.display()))?;
-            let report = config.validate();
+            let report = config.effective().validate();
             if pretty {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {

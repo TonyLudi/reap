@@ -152,6 +152,10 @@ impl OrderReducer {
         self.orders.contains_key(order_id)
     }
 
+    pub fn remove(&mut self, order_id: &str) -> Option<OrderSnapshot> {
+        self.orders.remove(order_id)
+    }
+
     pub fn get(&self, order_id: &str) -> Option<&OrderSnapshot> {
         self.orders.get(order_id)
     }
@@ -382,6 +386,8 @@ mod tests {
             qty: 1.0,
             price: 100.0,
             time_in_force: TimeInForce::Gtc,
+            reduce_only: false,
+            self_trade_prevention: None,
             reason: "quote".to_string(),
         }
     }

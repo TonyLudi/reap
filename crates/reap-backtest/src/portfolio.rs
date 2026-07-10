@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 
 use reap_core::{FillLiquidity, OrderUpdate, Side, Symbol};
-use reap_strategy::{InstrumentConfig, InstrumentKindConfig};
+use reap_strategy::InstrumentConfig;
 
 #[derive(Debug, Clone)]
 pub struct Portfolio {
     instruments: HashMap<Symbol, InstrumentConfig>,
     positions: HashMap<Symbol, f64>,
+    inverse_cash_coin: HashMap<Symbol, f64>,
     cash_usd: f64,
 }
 
@@ -18,6 +19,7 @@ impl Portfolio {
                 .map(|inst| (inst.symbol.clone(), inst.clone()))
                 .collect(),
             positions: HashMap::new(),
+            inverse_cash_coin: HashMap::new(),
             cash_usd: 0.0,
         }
     }
@@ -32,15 +34,23 @@ impl Portfolio {
         let signed_qty = update.side.factor() * update.last_fill_qty;
         *self.positions.entry(update.symbol.clone()).or_default() += signed_qty;
 
-        let notional = match inst.kind {
-            InstrumentKindConfig::Spot => update.last_fill_qty * update.last_fill_price,
-            InstrumentKindConfig::Future => {
-                update.last_fill_qty * inst.contract_value * update.last_fill_price
-            }
+        let notional = if inst.kind.is_spot() {
+            update.last_fill_qty * update.last_fill_price
+        } else if inst.kind.is_inverse() {
+            update.last_fill_qty * inst.contract_value
+        } else {
+            update.last_fill_qty * inst.contract_value * update.last_fill_price
         };
-        match update.side {
-            Side::Buy => self.cash_usd -= notional,
-            Side::Sell => self.cash_usd += notional,
+        if inst.kind.is_inverse() {
+            *self
+                .inverse_cash_coin
+                .entry(update.symbol.clone())
+                .or_default() += signed_qty * inst.contract_value / update.last_fill_price;
+        } else {
+            match update.side {
+                Side::Buy => self.cash_usd -= notional,
+                Side::Sell => self.cash_usd += notional,
+            }
         }
 
         let fee_rate = match update.last_fill_liquidity {
@@ -60,9 +70,13 @@ impl Portfolio {
             let Some(mark) = marks.get(symbol) else {
                 continue;
             };
-            equity += match inst.kind {
-                InstrumentKindConfig::Spot => qty * mark,
-                InstrumentKindConfig::Future => qty * inst.contract_value * mark,
+            equity += if inst.kind.is_spot() {
+                qty * mark
+            } else if inst.kind.is_inverse() {
+                let cash_coin = self.inverse_cash_coin.get(symbol).copied().unwrap_or(0.0);
+                (cash_coin - qty * inst.contract_value / mark) * mark
+            } else {
+                qty * inst.contract_value * mark
             };
         }
         equity

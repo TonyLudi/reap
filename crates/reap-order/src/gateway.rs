@@ -53,6 +53,7 @@ pub struct OkxOrderGateway<T> {
     idempotency: IdempotencyRegistry,
     pacer: RequestPacer,
     trade_modes: HashMap<String, OkxTradeMode>,
+    local_orders: HashMap<String, NewOrder>,
 }
 
 impl<T> OkxOrderGateway<T>
@@ -72,7 +73,24 @@ where
             idempotency: IdempotencyRegistry::default(),
             pacer: RequestPacer::new(pacing),
             trade_modes,
+            local_orders: HashMap::new(),
         })
+    }
+
+    pub fn register_local_order(
+        &self,
+        client_order_id: &str,
+        state: &mut PrivateStateReducer,
+    ) -> bool {
+        let Some(order) = self.local_orders.get(client_order_id) else {
+            return false;
+        };
+        state.register_local_order(client_order_id, order.clone());
+        true
+    }
+
+    pub fn forget_local_order(&mut self, client_order_id: &str) {
+        self.local_orders.remove(client_order_id);
     }
 
     pub async fn submit(
@@ -80,7 +98,25 @@ where
         idempotency_key: impl Into<String>,
         order: NewOrder,
     ) -> Result<SubmitOutcome, GatewayError> {
-        let idempotency_key = idempotency_key.into();
+        self.submit_inner(idempotency_key.into(), order, None).await
+    }
+
+    pub async fn submit_registered(
+        &mut self,
+        idempotency_key: impl Into<String>,
+        order: NewOrder,
+        state: &mut PrivateStateReducer,
+    ) -> Result<SubmitOutcome, GatewayError> {
+        self.submit_inner(idempotency_key.into(), order, Some(state))
+            .await
+    }
+
+    async fn submit_inner(
+        &mut self,
+        idempotency_key: String,
+        order: NewOrder,
+        mut state: Option<&mut PrivateStateReducer>,
+    ) -> Result<SubmitOutcome, GatewayError> {
         let trade_mode = self
             .trade_modes
             .get(&order.symbol)
@@ -95,16 +131,27 @@ where
                 client_order_id,
                 exchange_order_id,
             } => {
+                if let Some(state) = state.as_deref_mut() {
+                    self.register_local_order(&client_order_id, state);
+                }
                 return Ok(SubmitOutcome::Duplicate {
                     client_order_id,
                     exchange_order_id,
                 });
             }
             Reservation::Pending { client_order_id } => {
+                if let Some(state) = state.as_deref_mut() {
+                    self.register_local_order(&client_order_id, state);
+                }
                 return Ok(SubmitOutcome::PendingReconciliation { client_order_id });
             }
             Reservation::New { client_order_id } => client_order_id,
         };
+        self.local_orders
+            .insert(client_order_id.clone(), order.clone());
+        if let Some(state) = state.as_deref_mut() {
+            state.register_local_order(&client_order_id, order.clone());
+        }
         self.pacer.pace(RequestKind::Submit, "account").await;
         self.pacer.pace(RequestKind::Submit, &order.symbol).await;
         let result = self
@@ -117,6 +164,8 @@ where
                 price: order.price,
                 qty: order.qty,
                 client_order_id: client_order_id.clone(),
+                reduce_only: order.reduce_only,
+                self_trade_prevention: order.self_trade_prevention,
             })
             .await;
         let ack = match result {
@@ -124,6 +173,10 @@ where
             Err(error) => {
                 if !matches!(error, RestError::Transport(_)) {
                     self.idempotency.release_pending(&idempotency_key)?;
+                    self.local_orders.remove(&client_order_id);
+                    if let Some(state) = state {
+                        state.remove_local_order(&client_order_id);
+                    }
                 }
                 return Err(error.into());
             }
@@ -235,6 +288,8 @@ mod tests {
             qty: 0.1,
             price: 100.0,
             time_in_force: TimeInForce::PostOnly,
+            reduce_only: false,
+            self_trade_prevention: None,
             reason: "quote".to_string(),
         }
     }
@@ -269,13 +324,27 @@ mod tests {
             body: r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"ignored","sCode":"0","sMsg":""}]}"#.to_string(),
         };
         let (mut gateway, calls) = gateway(vec![Ok(response)]);
+        let mut state = PrivateStateReducer::new();
 
-        let first = gateway.submit("decision-1", order()).await.unwrap();
+        let first = gateway
+            .submit_registered("decision-1", order(), &mut state)
+            .await
+            .unwrap();
         let second = gateway.submit("decision-1", order()).await.unwrap();
 
-        assert!(matches!(first, SubmitOutcome::Submitted { .. }));
-        assert!(matches!(second, SubmitOutcome::Duplicate { .. }));
+        assert!(matches!(&first, SubmitOutcome::Submitted { .. }));
+        assert!(matches!(&second, SubmitOutcome::Duplicate { .. }));
         assert_eq!(*calls.lock().unwrap(), 1);
+        let SubmitOutcome::Submitted {
+            client_order_id, ..
+        } = first
+        else {
+            unreachable!();
+        };
+        assert_eq!(
+            state.order_reducer().get(&client_order_id).unwrap().reason,
+            "quote"
+        );
     }
 
     #[tokio::test]

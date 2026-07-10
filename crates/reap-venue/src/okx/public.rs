@@ -1,6 +1,7 @@
 use reap_core::{
     AccountUpdate, Balance, BookAction, Channel, EventId, EventKey, FillLiquidity, Level,
-    MarketEvent, NormalizedEvent, RawEnvelope, SequencedBookUpdate, Side, Subscription, Venue,
+    MarginSnapshot, MarketEvent, NormalizedEvent, Position, RawEnvelope, SequencedBookUpdate, Side,
+    Subscription, Venue,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -17,6 +18,7 @@ const DEFAULT_PRIVATE_WS: &str = "wss://ws.okx.com:8443/ws/v5/private";
 pub struct OkxAdapter {
     public_ws_url: String,
     private_ws_url: String,
+    account_id: Option<String>,
 }
 
 impl Default for OkxAdapter {
@@ -24,6 +26,7 @@ impl Default for OkxAdapter {
         Self {
             public_ws_url: DEFAULT_PUBLIC_WS.to_string(),
             private_ws_url: DEFAULT_PRIVATE_WS.to_string(),
+            account_id: None,
         }
     }
 }
@@ -33,7 +36,13 @@ impl OkxAdapter {
         Self {
             public_ws_url: public_ws_url.into(),
             private_ws_url: private_ws_url.into(),
+            account_id: None,
         }
+    }
+
+    pub fn with_account_id(mut self, account_id: impl Into<String>) -> Self {
+        self.account_id = Some(account_id.into());
+        self
     }
 
     fn invalid(message: impl Into<String>) -> VenueError {
@@ -84,6 +93,7 @@ impl OkxAdapter {
                             seq_id: update.seq_id,
                         },
                     },
+                    account_id: None,
                     event: VenueEvent::Book(update),
                 })
             })
@@ -129,8 +139,147 @@ impl OkxAdapter {
                             EventKey::Trade(trade_id)
                         },
                     },
+                    account_id: None,
                     event: VenueEvent::Normalized(event),
                 })
+            })
+            .collect()
+    }
+
+    fn parse_funding_rates(
+        &self,
+        envelope: &RawEnvelope,
+        push: &OkxPush,
+        arg: &OkxArg,
+    ) -> Result<Vec<ParsedEvent>, VenueError> {
+        let arg_symbol = arg
+            .inst_id
+            .clone()
+            .or_else(|| envelope.symbol.clone())
+            .ok_or_else(|| Self::invalid("funding-rate message has no instId"))?;
+        push.data
+            .iter()
+            .map(|value| {
+                let data: OkxFundingRate = serde_json::from_value(value.clone())
+                    .map_err(|error| Self::invalid(error.to_string()))?;
+                let symbol = if data.inst_id.is_empty() {
+                    arg_symbol.clone()
+                } else {
+                    data.inst_id
+                };
+                let ts_ms = parse_u64("ts", &data.ts)?;
+                Ok(normalized_market_event(
+                    envelope,
+                    arg,
+                    symbol.clone(),
+                    ts_ms,
+                    MarketEvent::FundingRate {
+                        ts_ms,
+                        symbol,
+                        rate: parse_f64("fundingRate", &data.funding_rate)?,
+                        funding_time_ms: parse_u64("fundingTime", &data.funding_time)?,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    fn parse_index_tickers(
+        &self,
+        envelope: &RawEnvelope,
+        push: &OkxPush,
+        arg: &OkxArg,
+    ) -> Result<Vec<ParsedEvent>, VenueError> {
+        push.data
+            .iter()
+            .map(|value| {
+                let data: OkxIndexTicker = serde_json::from_value(value.clone())
+                    .map_err(|error| Self::invalid(error.to_string()))?;
+                let symbol = data
+                    .inst_id
+                    .or_else(|| arg.inst_id.clone())
+                    .or_else(|| envelope.symbol.clone())
+                    .ok_or_else(|| Self::invalid("index-tickers message has no instId"))?;
+                let ts_ms = parse_u64("ts", &data.ts)?;
+                Ok(normalized_market_event(
+                    envelope,
+                    arg,
+                    symbol.clone(),
+                    ts_ms,
+                    MarketEvent::IndexPrice {
+                        ts_ms,
+                        symbol,
+                        price: parse_f64("idxPx", &data.index_price)?,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    fn parse_price_limits(
+        &self,
+        envelope: &RawEnvelope,
+        push: &OkxPush,
+        arg: &OkxArg,
+    ) -> Result<Vec<ParsedEvent>, VenueError> {
+        push.data
+            .iter()
+            .map(|value| {
+                let data: OkxPriceLimit = serde_json::from_value(value.clone())
+                    .map_err(|error| Self::invalid(error.to_string()))?;
+                let symbol = data
+                    .inst_id
+                    .or_else(|| arg.inst_id.clone())
+                    .or_else(|| envelope.symbol.clone())
+                    .ok_or_else(|| Self::invalid("price-limit message has no instId"))?;
+                let ts_ms = parse_u64("ts", &data.ts)?;
+                Ok(normalized_market_event(
+                    envelope,
+                    arg,
+                    symbol.clone(),
+                    ts_ms,
+                    MarketEvent::PriceLimits {
+                        ts_ms,
+                        symbol,
+                        mark_price: 0.0,
+                        limit_down: parse_optional_f64("sellLmt", &data.sell_limit)?,
+                        limit_up: parse_optional_f64("buyLmt", &data.buy_limit)?,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    fn parse_mark_prices(
+        &self,
+        envelope: &RawEnvelope,
+        push: &OkxPush,
+        arg: &OkxArg,
+    ) -> Result<Vec<ParsedEvent>, VenueError> {
+        push.data
+            .iter()
+            .map(|value| {
+                let data: OkxMarkPrice = serde_json::from_value(value.clone())
+                    .map_err(|error| Self::invalid(error.to_string()))?;
+                let symbol = data
+                    .inst_id
+                    .or_else(|| arg.inst_id.clone())
+                    .or_else(|| envelope.symbol.clone())
+                    .ok_or_else(|| Self::invalid("mark-price message has no instId"))?;
+                let ts_ms = parse_u64("ts", &data.ts)?;
+                Ok(normalized_market_event(
+                    envelope,
+                    arg,
+                    symbol.clone(),
+                    ts_ms,
+                    MarketEvent::PriceLimits {
+                        ts_ms,
+                        symbol,
+                        mark_price: parse_f64("markPx", &data.mark_price)?,
+                        limit_down: 0.0,
+                        limit_up: 0.0,
+                    },
+                ))
             })
             .collect()
     }
@@ -152,7 +301,10 @@ impl OkxAdapter {
                     id: EventId {
                         venue: Venue::Okx,
                         channel: Channel::Orders,
-                        symbol: Some(update.symbol.clone()),
+                        symbol: Some(scoped_private_symbol(
+                            self.account_id.as_deref(),
+                            &update.symbol,
+                        )),
                         key: EventKey::OrderVersion {
                             order_id: if update.exchange_order_id.is_empty() {
                                 update.client_order_id.clone()
@@ -164,6 +316,7 @@ impl OkxAdapter {
                             cumulative_fill_bits,
                         },
                     },
+                    account_id: self.account_id.clone(),
                     event: VenueEvent::PrivateOrder(update),
                 })
             })
@@ -188,14 +341,35 @@ impl OkxAdapter {
                 let data: OkxAccount = serde_json::from_value(value.clone())
                     .map_err(|error| Self::invalid(error.to_string()))?;
                 let ts_ms = parse_u64("uTime", &data.update_time)?;
+                let exchange_ratio = parse_optional_f64_value("mgnRatio", &data.margin_ratio)?;
+                let adjusted_equity_usd = parse_optional_f64_value("adjEq", &data.adjusted_equity)?;
+                let notional_usd = parse_optional_f64_value("notionalUsd", &data.notional_usd)?;
+                let margins = if exchange_ratio.is_none()
+                    && adjusted_equity_usd.is_none()
+                    && notional_usd.is_none()
+                {
+                    Vec::new()
+                } else {
+                    vec![MarginSnapshot {
+                        account_id: self.account_id.clone(),
+                        ratio: None,
+                        exchange_ratio,
+                        adjusted_equity_usd,
+                        notional_usd,
+                    }]
+                };
                 let balances = data
                     .details
                     .into_iter()
                     .map(|detail| {
                         Ok(Balance {
+                            account_id: self.account_id.clone(),
                             currency: detail.currency,
                             total: parse_optional_f64("cashBal", &detail.cash_balance)?,
                             available: parse_optional_f64("availBal", &detail.available_balance)?,
+                            equity: parse_optional_f64("eq", &detail.equity)?,
+                            liability: parse_optional_f64("liab", &detail.liability)?,
+                            max_loan: parse_optional_f64("maxLoan", &detail.max_loan)?,
                         })
                     })
                     .collect::<Result<Vec<_>, VenueError>>()?;
@@ -203,19 +377,59 @@ impl OkxAdapter {
                     ts_ms,
                     balances,
                     positions: Vec::new(),
+                    margins,
                 };
                 Ok(ParsedEvent {
                     id: EventId {
                         venue: Venue::Okx,
                         channel: Channel::Account,
-                        symbol: None,
+                        symbol: self.account_id.clone(),
                         key: if ts_ms == 0 {
                             EventKey::RawHash(envelope.raw_hash)
                         } else {
                             EventKey::Timestamp(ts_ms)
                         },
                     },
+                    account_id: self.account_id.clone(),
                     event: VenueEvent::Account(update),
+                })
+            })
+            .collect()
+    }
+
+    fn parse_positions(&self, push: &OkxPush) -> Result<Vec<ParsedEvent>, VenueError> {
+        push.data
+            .iter()
+            .map(|value| {
+                let data: OkxPosition = serde_json::from_value(value.clone())
+                    .map_err(|error| Self::invalid(error.to_string()))?;
+                let ts_ms = parse_u64("uTime", &data.update_time)?;
+                let mut qty = parse_f64("pos", &data.qty)?;
+                if data.position_side == "short" && qty > 0.0 {
+                    qty = -qty;
+                }
+                let symbol = data.symbol;
+                Ok(ParsedEvent {
+                    id: EventId {
+                        venue: Venue::Okx,
+                        channel: Channel::Positions,
+                        symbol: Some(match &self.account_id {
+                            Some(account_id) => format!("{account_id}:{symbol}"),
+                            None => symbol.clone(),
+                        }),
+                        key: EventKey::Timestamp(ts_ms),
+                    },
+                    account_id: self.account_id.clone(),
+                    event: VenueEvent::Account(AccountUpdate {
+                        ts_ms,
+                        balances: Vec::new(),
+                        positions: vec![Position {
+                            symbol,
+                            qty,
+                            avg_price: parse_optional_f64("avgPx", &data.average_price)?,
+                        }],
+                        margins: Vec::new(),
+                    }),
                 })
             })
             .collect()
@@ -236,17 +450,51 @@ impl OkxAdapter {
                     id: EventId {
                         venue: Venue::Okx,
                         channel: Channel::Fills,
-                        symbol: Some(fill.symbol.clone()),
+                        symbol: Some(scoped_private_symbol(
+                            self.account_id.as_deref(),
+                            &fill.symbol,
+                        )),
                         key: if fill.fill_id.is_empty() {
                             EventKey::RawHash(envelope.raw_hash)
                         } else {
                             EventKey::Fill(fill.fill_id.clone())
                         },
                     },
+                    account_id: self.account_id.clone(),
                     event: VenueEvent::PrivateFill(fill),
                 })
             })
             .collect()
+    }
+}
+
+fn scoped_private_symbol(account_id: Option<&str>, symbol: &str) -> String {
+    match account_id {
+        Some(account_id) => format!("{account_id}:{symbol}"),
+        None => symbol.to_string(),
+    }
+}
+
+fn normalized_market_event(
+    envelope: &RawEnvelope,
+    arg: &OkxArg,
+    symbol: String,
+    ts_ms: u64,
+    event: MarketEvent,
+) -> ParsedEvent {
+    ParsedEvent {
+        id: EventId {
+            venue: Venue::Okx,
+            channel: Channel::Custom(arg.channel.clone()),
+            symbol: Some(symbol),
+            key: if ts_ms == 0 {
+                EventKey::RawHash(envelope.raw_hash)
+            } else {
+                EventKey::Timestamp(ts_ms)
+            },
+        },
+        account_id: None,
+        event: VenueEvent::Normalized(NormalizedEvent::Market(event)),
     }
 }
 
@@ -286,9 +534,14 @@ impl VenueAdapter for OkxAdapter {
         match arg.channel.as_str() {
             "books" | "books-l2-tbt" | "books50-l2-tbt" => self.parse_book(envelope, &push, arg),
             "trades" | "trades-all" => self.parse_trades(envelope, &push, arg),
+            "funding-rate" => self.parse_funding_rates(envelope, &push, arg),
+            "index-tickers" => self.parse_index_tickers(envelope, &push, arg),
+            "price-limit" => self.parse_price_limits(envelope, &push, arg),
+            "mark-price" => self.parse_mark_prices(envelope, &push, arg),
             "orders" => self.parse_orders(envelope, &push),
             "fills" => self.parse_fills(envelope, &push),
             "account" => self.parse_account(envelope, &push),
+            "positions" => self.parse_positions(&push),
             channel => Err(VenueError::UnsupportedChannel {
                 venue: Venue::Okx,
                 channel: channel.to_string(),
@@ -309,12 +562,13 @@ impl VenueAdapter for OkxAdapter {
                     Channel::Orders => "orders",
                     Channel::Fills => "fills",
                     Channel::Account => "account",
+                    Channel::Positions => "positions",
                     Channel::Custom(ref channel) => channel,
                 };
                 let mut arg = json!({ "channel": channel });
                 if let Some(symbol) = &subscription.symbol {
                     arg["instId"] = Value::String(symbol.clone());
-                } else if subscription.channel == Channel::Orders {
+                } else if matches!(subscription.channel, Channel::Orders | Channel::Positions) {
                     arg["instType"] = Value::String("ANY".to_string());
                 }
                 Ok(arg)
@@ -369,6 +623,46 @@ struct OkxTrade {
     px: String,
     sz: String,
     side: String,
+    ts: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OkxFundingRate {
+    #[serde(default, rename = "instId")]
+    inst_id: String,
+    #[serde(rename = "fundingRate")]
+    funding_rate: String,
+    #[serde(rename = "fundingTime")]
+    funding_time: String,
+    ts: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OkxIndexTicker {
+    #[serde(default, rename = "instId")]
+    inst_id: Option<String>,
+    #[serde(rename = "idxPx")]
+    index_price: String,
+    ts: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OkxPriceLimit {
+    #[serde(default, rename = "instId")]
+    inst_id: Option<String>,
+    #[serde(default, rename = "buyLmt")]
+    buy_limit: String,
+    #[serde(default, rename = "sellLmt")]
+    sell_limit: String,
+    ts: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OkxMarkPrice {
+    #[serde(default, rename = "instId")]
+    inst_id: Option<String>,
+    #[serde(rename = "markPx")]
+    mark_price: String,
     ts: String,
 }
 
@@ -459,6 +753,26 @@ struct OkxAccount {
     update_time: String,
     #[serde(default)]
     details: Vec<OkxBalance>,
+    #[serde(default, rename = "mgnRatio")]
+    margin_ratio: String,
+    #[serde(default, rename = "adjEq")]
+    adjusted_equity: String,
+    #[serde(default, rename = "notionalUsd")]
+    notional_usd: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OkxPosition {
+    #[serde(rename = "instId")]
+    symbol: String,
+    #[serde(rename = "pos")]
+    qty: String,
+    #[serde(default, rename = "avgPx")]
+    average_price: String,
+    #[serde(default, rename = "posSide")]
+    position_side: String,
+    #[serde(rename = "uTime")]
+    update_time: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -469,6 +783,12 @@ struct OkxBalance {
     cash_balance: String,
     #[serde(default, rename = "availBal")]
     available_balance: String,
+    #[serde(default, rename = "eq")]
+    equity: String,
+    #[serde(default, rename = "liab")]
+    liability: String,
+    #[serde(default, rename = "maxLoan")]
+    max_loan: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -539,9 +859,13 @@ fn parse_side(value: &str) -> Result<Side, VenueError> {
 }
 
 fn parse_f64(name: &str, value: &str) -> Result<f64, VenueError> {
-    value
+    let parsed: f64 = value
         .parse()
-        .map_err(|error| OkxAdapter::invalid(format!("invalid {name} {value:?}: {error}")))
+        .map_err(|error| OkxAdapter::invalid(format!("invalid {name} {value:?}: {error}")))?;
+    if !parsed.is_finite() {
+        return Err(OkxAdapter::invalid(format!("non-finite {name} {value:?}")));
+    }
+    Ok(parsed)
 }
 
 fn parse_optional_f64(name: &str, value: &str) -> Result<f64, VenueError> {
@@ -549,6 +873,14 @@ fn parse_optional_f64(name: &str, value: &str) -> Result<f64, VenueError> {
         Ok(0.0)
     } else {
         parse_f64(name, value)
+    }
+}
+
+fn parse_optional_f64_value(name: &str, value: &str) -> Result<Option<f64>, VenueError> {
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        parse_f64(name, value).map(Some)
     }
 }
 
@@ -618,6 +950,78 @@ mod tests {
     }
 
     #[test]
+    fn parses_strategy_pricing_channels() {
+        let adapter = OkxAdapter::default();
+        let funding = r#"{"arg":{"channel":"funding-rate","instId":"BTC-USDT-SWAP"},"data":[{"instId":"BTC-USDT-SWAP","fundingRate":"0.0001","fundingTime":"2000","ts":"1000"}]}"#;
+        let index = r#"{"arg":{"channel":"index-tickers","instId":"BTC-USDT"},"data":[{"instId":"BTC-USDT","idxPx":"50000","ts":"1001"}]}"#;
+        let limits = r#"{"arg":{"channel":"price-limit","instId":"BTC-USDT-SWAP"},"data":[{"instId":"BTC-USDT-SWAP","buyLmt":"55000","sellLmt":"45000","ts":"1002"}]}"#;
+        let mark = r#"{"arg":{"channel":"mark-price","instId":"BTC-USDT-SWAP"},"data":[{"instId":"BTC-USDT-SWAP","markPx":"50010","ts":"1003"}]}"#;
+
+        let funding_events = adapter
+            .parse(&envelope(
+                Channel::Custom("funding-rate".to_string()),
+                funding,
+            ))
+            .unwrap();
+        let index_events = adapter
+            .parse(&envelope(
+                Channel::Custom("index-tickers".to_string()),
+                index,
+            ))
+            .unwrap();
+        let limit_events = adapter
+            .parse(&envelope(
+                Channel::Custom("price-limit".to_string()),
+                limits,
+            ))
+            .unwrap();
+        let mark_events = adapter
+            .parse(&envelope(Channel::Custom("mark-price".to_string()), mark))
+            .unwrap();
+
+        assert!(matches!(
+            funding_events[0].event,
+            VenueEvent::Normalized(NormalizedEvent::Market(MarketEvent::FundingRate {
+                rate,
+                funding_time_ms: 2000,
+                ..
+            })) if rate == 0.0001
+        ));
+        assert!(matches!(
+            index_events[0].event,
+            VenueEvent::Normalized(NormalizedEvent::Market(MarketEvent::IndexPrice {
+                price: 50_000.0,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            limit_events[0].event,
+            VenueEvent::Normalized(NormalizedEvent::Market(MarketEvent::PriceLimits {
+                limit_down: 45_000.0,
+                limit_up: 55_000.0,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            mark_events[0].event,
+            VenueEvent::Normalized(NormalizedEvent::Market(MarketEvent::PriceLimits {
+                mark_price: 50_010.0,
+                ..
+            }))
+        ));
+
+        let non_finite = r#"{"arg":{"channel":"funding-rate","instId":"BTC-USDT-SWAP"},"data":[{"instId":"BTC-USDT-SWAP","fundingRate":"NaN","fundingTime":"2000","ts":"1000"}]}"#;
+        assert!(
+            adapter
+                .parse(&envelope(
+                    Channel::Custom("funding-rate".to_string()),
+                    non_finite,
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn builds_public_and_private_subscriptions() {
         let adapter = OkxAdapter::default();
         let public = adapter
@@ -648,14 +1052,18 @@ mod tests {
 
     #[test]
     fn parses_private_order_fill_and_account_updates() {
-        let adapter = OkxAdapter::default();
+        let adapter = OkxAdapter::default().with_account_id("main");
         let order = r#"{"arg":{"channel":"orders","instType":"ANY"},"data":[{"ordId":"123","clOrdId":"reap1","instId":"BTC-USDT","side":"buy","state":"partially_filled","px":"100","sz":"1","accFillSz":"0.4","avgPx":"99.5","fillSz":"0.4","fillPx":"99.5","execType":"M","tradeId":"fill1","uTime":"1000","fillTime":"1000"}]}"#;
         let fills = r#"{"arg":{"channel":"fills","instId":"BTC-USDT"},"data":[{"tradeId":"fill2","ordId":"123","clOrdId":"reap1","instId":"BTC-USDT","side":"buy","fillPx":"99.4","fillSz":"0.1","execType":"T","ts":"1001"}]}"#;
-        let account = r#"{"arg":{"channel":"account"},"data":[{"uTime":"1002","details":[{"ccy":"USDT","cashBal":"1000","availBal":"900"}]}]}"#;
+        let account = r#"{"arg":{"channel":"account"},"data":[{"uTime":"1002","mgnRatio":"10","adjEq":"1000","notionalUsd":"100","details":[{"ccy":"USDT","cashBal":"1000","availBal":"900"}]}]}"#;
+        let positions = r#"{"arg":{"channel":"positions","instType":"ANY"},"data":[{"instId":"BTC-USDT-SWAP","pos":"2","posSide":"short","avgPx":"50000","uTime":"1003"}]}"#;
 
         let order_events = adapter.parse(&envelope(Channel::Orders, order)).unwrap();
         let fill_events = adapter.parse(&envelope(Channel::Fills, fills)).unwrap();
         let account_events = adapter.parse(&envelope(Channel::Account, account)).unwrap();
+        let position_events = adapter
+            .parse(&envelope(Channel::Positions, positions))
+            .unwrap();
 
         assert!(matches!(
             order_events[0].event,
@@ -675,7 +1083,38 @@ mod tests {
         ));
         assert!(matches!(
             account_events[0].event,
-            VenueEvent::Account(AccountUpdate { ref balances, .. }) if balances[0].available == 900.0
+            VenueEvent::Account(AccountUpdate { ref balances, .. })
+                if balances[0].available == 900.0
+                    && balances[0].account_id.as_deref() == Some("main")
         ));
+        assert!(matches!(
+            account_events[0].event,
+            VenueEvent::Account(AccountUpdate { ref margins, .. })
+                if margins[0].exchange_ratio == Some(10.0)
+                    && margins[0].adjusted_equity_usd == Some(1_000.0)
+                    && margins[0].notional_usd == Some(100.0)
+        ));
+        assert!(matches!(
+            position_events[0].event,
+            VenueEvent::Account(AccountUpdate { ref positions, .. })
+                if positions[0].symbol == "BTC-USDT-SWAP" && positions[0].qty == -2.0
+        ));
+    }
+
+    #[test]
+    fn private_deduplication_identity_is_scoped_by_account() {
+        let order = r#"{"arg":{"channel":"orders","instType":"ANY"},"data":[{"ordId":"123","clOrdId":"reap1","instId":"BTC-USDT","side":"buy","state":"live","px":"100","sz":"1","accFillSz":"0","avgPx":"","fillSz":"0","fillPx":"","execType":"","tradeId":"","uTime":"1000","fillTime":""}]}"#;
+        let maker = OkxAdapter::default()
+            .with_account_id("maker")
+            .parse(&envelope(Channel::Orders, order))
+            .unwrap();
+        let hedge = OkxAdapter::default()
+            .with_account_id("hedge")
+            .parse(&envelope(Channel::Orders, order))
+            .unwrap();
+
+        assert_eq!(maker[0].id.symbol.as_deref(), Some("maker:BTC-USDT"));
+        assert_eq!(hedge[0].id.symbol.as_deref(), Some("hedge:BTC-USDT"));
+        assert_ne!(maker[0].id, hedge[0].id);
     }
 }

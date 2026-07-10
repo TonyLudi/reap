@@ -180,6 +180,8 @@ mod tests {
                 qty: 1.0,
                 price: 100.0,
                 time_in_force: TimeInForce::Gtc,
+                reduce_only: false,
+                self_trade_prevention: None,
                 reason: "test".to_string(),
             },
             1,

@@ -221,6 +221,8 @@ mod tests {
             qty: 1.0,
             price,
             time_in_force: TimeInForce::PostOnly,
+            reduce_only: false,
+            self_trade_prevention: None,
             reason: "quote".to_string(),
         }
     }

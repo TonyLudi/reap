@@ -342,7 +342,7 @@ Metrics should be cheap to emit and safe to drop under pressure.
 
 User-facing binaries.
 
-Commands:
+Target command surface:
 
 ```text
 reap live --config config/live.toml
@@ -351,6 +351,9 @@ reap replay-check --events data/events.jsonl
 reap inspect-book --capture raw/ws.jsonl --symbol BTC-USDT
 reap config-check --config config/live.toml
 ```
+
+`backtest`, `replay-check`, and `config-check` are implemented. `live` and
+`inspect-book` remain planned; see [trading-readiness.md](trading-readiness.md).
 
 ## Multi-Websocket Design
 
@@ -552,10 +555,7 @@ Useful fixtures:
 ```text
 fixtures/
   raw/okx/depth-gap.jsonl
-  raw/binance/trade-duplicates.jsonl
-  normalized/chaos-fill-hedge.jsonl
-  expected/book-top.csv
-  expected/orders.jsonl
+  normalized/chaos_quote_hedge.jsonl
 ```
 
 ## Migration Plan
@@ -611,15 +611,39 @@ pending-order/fill reconciliation.
 - Add private websocket order/fill reducer.
 - Add reconciliation and idempotency.
 
-### Phase 6: Production Hardening
+### Phase 6: Runtime Safeguards
 
 Status: implemented as `reap-risk`, `reap-engine`, `reap-telemetry`, and
 `reap-storage`, with configuration validation, an operations guide, and a
-measured event-loop benchmark.
+measured event-loop benchmark. These are reusable components, not a completed
+production deployment.
 
 - Add risk gates, kill switch, stale feed policy, metrics, storage.
 - Add operational runbooks and config checks.
 - Profile hot path before low-level optimization.
+
+### Phase 7: Chaos Iarb2 Decision Parity
+
+Status: implemented for the documented OKX decision boundary, including
+explicit rejection of one-symbol/self-only hedge topologies. Exact Java quote
+optimizer order churn and non-OKX platform behavior remain outside this
+boundary.
+
+- Cross-check configuration, quote, hedge, account risk, and stop behavior.
+- Cover Java fixture vectors and edge-case timing in deterministic tests.
+- Normalize all pricing, account, position, order, and fill inputs needed by the
+  strategy.
+
+### Phase 8: Demo-Tradable Composition
+
+Status: planned. This is the current deployment blocker.
+
+- Add the live composition process and single-writer event-loop owner.
+- Implement executable startup, readiness, reconciliation, and restart gates.
+- Verify instrument metadata, account mode, and risk valuation.
+- Complete fault injection and OKX demo soak acceptance.
+
+See [trading-readiness.md](trading-readiness.md) for the detailed gate.
 
 ## Architectural Decisions
 
