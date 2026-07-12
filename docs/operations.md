@@ -90,12 +90,19 @@ as affecting every tracked account on that venue.
 
 ## Shutdown
 
-`SIGINT` or `SIGTERM` in demo mode activates the kill switch, dispatches
-cancels, keeps private sockets and REST reconciliation running, and waits for
-zero active canonical orders and clean accounts. It then flushes critical
-storage and stops sockets/tasks. Exceeding `shutdown_timeout_ms` returns an
-error with unresolved counts; treat that as an incident. Observe mode performs
-no exchange mutation and shuts down directly.
+Every demo event-loop exit, including `SIGINT`, `SIGTERM`, bounded completion,
+adapter failure, gateway-task failure, channel failure, and storage failure,
+uses one fail-closed path. It disables new submits without disabling cancels,
+activates the kill switch, dispatches every canonical cancel, and requires a
+post-cancel REST reconciliation result for every account. Only zero active
+canonical orders plus clean account reconciliation permits task teardown.
+
+The `shutdown_timeout_ms` deadline covers cancel queueing, reconciliation, and
+event processing. A persistence failure is retained as an error but does not
+suppress cancel or reconciliation commands. Any unresolved order/account or
+secondary teardown failure is included in the returned lifecycle error and
+must be treated as an incident. Observe mode performs no exchange mutation and
+shuts down directly.
 
 ## Bounded Soak Acceptance
 

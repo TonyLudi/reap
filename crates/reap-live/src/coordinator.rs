@@ -99,6 +99,7 @@ pub struct LiveCoordinator {
     startup: StartupGate,
     private_states: HashMap<String, PrivateStateReducer>,
     client_ids: HashMap<String, ClientOrderIdGenerator>,
+    gateway_actions_enabled: bool,
     order_entry_enabled: bool,
     session_id: String,
     decision_sequence: u64,
@@ -108,7 +109,7 @@ impl LiveCoordinator {
     pub fn new(
         config: LiveConfig,
         verified: VerifiedBootstrap,
-        order_entry_enabled: bool,
+        gateway_actions_enabled: bool,
         session_id: impl Into<String>,
     ) -> Result<Self, CoordinatorError> {
         let session_id = session_id.into();
@@ -151,7 +152,8 @@ impl LiveCoordinator {
             startup,
             private_states,
             client_ids,
-            order_entry_enabled,
+            gateway_actions_enabled,
+            order_entry_enabled: gateway_actions_enabled,
             session_id,
             decision_sequence: 0,
         })
@@ -592,13 +594,15 @@ impl LiveCoordinator {
     ) {
         match intent {
             OrderIntent::NewOrder(order) => {
-                if !self.startup.can_submit_new(self.order_entry_enabled) {
+                let submit_enabled = self.gateway_actions_enabled && self.order_entry_enabled;
+                if !self.startup.can_submit_new(submit_enabled) {
                     output.records.push(StorageRecord::IntentRejected {
                         ts_ms: now_ms,
                         intent: OrderIntent::NewOrder(order),
                         reason: format!(
-                            "live gate is {:?}; order entry enabled={}",
+                            "live gate is {:?}; gateway actions enabled={}; new order entry enabled={}",
                             self.startup.phase(),
+                            self.gateway_actions_enabled,
                             self.order_entry_enabled
                         ),
                     });
@@ -648,11 +652,19 @@ impl LiveCoordinator {
                 }
             }
             OrderIntent::CancelOrder { order_id, reason } => {
-                if !self.order_entry_enabled || !self.startup.can_cancel() {
+                if !self.gateway_actions_enabled || !self.startup.can_cancel() {
+                    let rejection_reason = if self.gateway_actions_enabled {
+                        format!(
+                            "live gate is {:?}; cancellation is unavailable",
+                            self.startup.phase()
+                        )
+                    } else {
+                        "live gateway actions are disabled in observe mode".to_string()
+                    };
                     output.records.push(StorageRecord::IntentRejected {
                         ts_ms: now_ms,
                         intent: OrderIntent::CancelOrder { order_id, reason },
-                        reason: "live gateway actions are disabled in observe mode".to_string(),
+                        reason: rejection_reason,
                     });
                     return;
                 }
@@ -826,7 +838,7 @@ mod tests {
 
     use super::*;
 
-    fn coordinator() -> LiveCoordinator {
+    fn coordinator_with_gateway_actions(gateway_actions_enabled: bool) -> LiveCoordinator {
         let mut strategy: ChaosConfig =
             toml::from_str(include_str!("../../../examples/iarb2-basic.toml")).unwrap();
         strategy.risk_groups[0].account_id = Some("main".to_string());
@@ -907,7 +919,11 @@ mod tests {
             )]),
             baseline_fill_ids: HashMap::from([("main".to_string(), HashSet::new())]),
         };
-        LiveCoordinator::new(config, verified, true, "test-session").unwrap()
+        LiveCoordinator::new(config, verified, gateway_actions_enabled, "test-session").unwrap()
+    }
+
+    fn coordinator() -> LiveCoordinator {
+        coordinator_with_gateway_actions(true)
     }
 
     fn ready(coordinator: &mut LiveCoordinator) {
@@ -1167,12 +1183,11 @@ mod tests {
 
     #[test]
     fn observe_mode_never_dispatches_gateway_cancels() {
-        let mut coordinator = coordinator();
+        let mut coordinator = coordinator_with_gateway_actions(false);
         ready(&mut coordinator);
         coordinator
             .register_local_order("main", "client-1", order(), 3)
             .unwrap();
-        coordinator.set_order_entry_enabled(false);
         let output = coordinator.process_event(NormalizedEvent::System(SystemEvent {
             ts_ms: 4,
             kind: SystemEventKind::KillSwitchActivated,
@@ -1193,5 +1208,38 @@ mod tests {
             StorageRecord::IntentRejected { reason, .. }
                 if reason.contains("observe mode")
         )));
+    }
+
+    #[test]
+    fn disabling_new_order_entry_preserves_kill_switch_cancels() {
+        let mut coordinator = coordinator();
+        ready(&mut coordinator);
+        coordinator
+            .register_local_order("main", "client-1", order(), 3)
+            .unwrap();
+        coordinator.set_order_entry_enabled(false);
+
+        let output = coordinator.process_event(NormalizedEvent::System(SystemEvent {
+            ts_ms: 4,
+            kind: SystemEventKind::KillSwitchActivated,
+            venue: None,
+            account_id: None,
+            symbol: None,
+            reason: "shutdown".to_string(),
+        }));
+
+        assert!(output.actions.iter().any(|action| matches!(
+            action,
+            LiveAction::Cancel(CancelAction {
+                client_order_id,
+                ..
+            }) if client_order_id == "client-1"
+        )));
+        assert!(
+            !output
+                .actions
+                .iter()
+                .any(|action| matches!(action, LiveAction::Submit(_)))
+        );
     }
 }

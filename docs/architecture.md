@@ -669,6 +669,8 @@ the deployment blocker.
   Done.
 - Emit bounded soak evidence for readiness recovery, reconciliation drift,
   storage pressure, and zero-order shutdown. Done.
+- Route every demo exit through submit-disabled cancellation and per-account
+  post-cancel REST reconciliation, even when persistence has failed. Done.
 - Complete fault injection and OKX demo soak acceptance.
 
 See [trading-readiness.md](trading-readiness.md) for the detailed gate.

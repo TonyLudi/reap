@@ -82,6 +82,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
   measured hot-path allocation/collection bottlenecks.
 - [x] Add bounded observe/demo soak execution with machine-verifiable readiness,
   drift, storage, and shutdown evidence.
+- [x] Make every demo exit disable new submits while preserving cancellation,
+  then require zero active orders and post-cancel REST reconciliation even when
+  storage has failed.
 - [ ] Complete an OKX demo soak with no unexplained reconciliation drift.
 
 Completed-step evidence is documented in [README.md](README.md),

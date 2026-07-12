@@ -11,7 +11,9 @@ use reap_feed::{
     ConnectionStatus, ConnectionStatusKind, FeedOutput, FeedProcessor, ReconnectPolicy, SocketPlan,
     SupervisedFeed, okx_login_bootstrap, partition_subscriptions, spawn_supervised_feed,
 };
-use reap_order::{CancelOutcome, OkxOrderGateway, SubmitOutcome, SubmitPreparation, reconcile};
+use reap_order::{
+    CancelOutcome, OkxOrderGateway, ReconcileReport, SubmitOutcome, SubmitPreparation, reconcile,
+};
 use reap_storage::{
     BootstrapRecord, OrderOperation, OrderRequestRecord, StorageConfig, StorageError,
     StorageRecord, StorageRuntime, StorageSink, recover_jsonl, start_jsonl_storage,
@@ -101,10 +103,14 @@ pub enum LiveRuntimeError {
     Coordinator(#[from] CoordinatorError),
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error("storage remained unavailable during graceful shutdown: {0}")]
+    ShutdownStorage(String),
     #[error("runtime event channel closed")]
     EventChannelClosed,
     #[error("order command queue for account {0} is unavailable or full")]
     OrderQueueUnavailable(String),
+    #[error("graceful shutdown generated an unsafe new-order action")]
+    UnsafeShutdownSubmit,
     #[error("book recovery request had no matching public socket for {0}")]
     MissingRecoveryRoute(String),
     #[error("live readiness timed out after {0}ms")]
@@ -124,6 +130,12 @@ pub enum LiveRuntimeError {
     Join(#[from] tokio::task::JoinError),
     #[error("shutdown signal failed: {0}")]
     Signal(#[from] std::io::Error),
+    #[error("{primary}; additional lifecycle failures: {secondary}")]
+    LifecycleFailure {
+        #[source]
+        primary: Box<LiveRuntimeError>,
+        secondary: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -225,6 +237,28 @@ fn qualifies_as_clean_soak(
         && evidence.reconciliation_drift_events == 0
         && dropped_storage_records == 0
         && active_orders_after_shutdown == 0
+}
+
+fn is_zero_order_reconciliation(report: &ReconcileReport) -> bool {
+    report.is_clean() && report.local_live_orders == 0 && report.remote_live_orders == 0
+}
+
+fn combine_lifecycle_errors(
+    primary: LiveRuntimeError,
+    additional: Vec<(&'static str, LiveRuntimeError)>,
+) -> LiveRuntimeError {
+    if additional.is_empty() {
+        return primary;
+    }
+    let secondary = additional
+        .into_iter()
+        .map(|(stage, error)| format!("{stage}: {error}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    LiveRuntimeError::LifecycleFailure {
+        primary: Box::new(primary),
+        secondary,
+    }
 }
 
 pub async fn run_live_path(
@@ -504,6 +538,10 @@ struct LiveRuntime {
     max_feed_age_ms: u64,
     shutdown_timeout_ms: u64,
     evidence: RuntimeEvidence,
+    shutdown_in_progress: bool,
+    shutdown_storage_error: Option<String>,
+    shutdown_reconciliation_requested: HashSet<String>,
+    shutdown_reconciled_accounts: HashSet<String>,
 }
 
 impl LiveRuntime {
@@ -677,6 +715,18 @@ impl LiveRuntime {
                 },
             })?);
         }
+        let public_subscriptions = public_subscriptions(&config);
+        let public_plans = partition_subscriptions(
+            &public_subscriptions,
+            config.runtime.max_subscriptions_per_socket,
+        )
+        .map_err(|error| LiveRuntimeError::Subscription(error.to_string()))?;
+        let private_subscriptions = private_subscriptions(config.venue.enable_vip_fills_channel);
+        let private_plans = partition_subscriptions(
+            &private_subscriptions,
+            config.runtime.max_subscriptions_per_socket,
+        )
+        .map_err(|error| LiveRuntimeError::Subscription(error.to_string()))?;
         let storage = start_jsonl_storage(StorageConfig {
             path: config.storage.path.clone(),
             channel_capacity: config.storage.channel_capacity,
@@ -692,12 +742,6 @@ impl LiveRuntime {
         let mut feed_tasks = Vec::new();
         let mut sources = Vec::new();
 
-        let public_subscriptions = public_subscriptions(&config);
-        let public_plans = partition_subscriptions(
-            &public_subscriptions,
-            config.runtime.max_subscriptions_per_socket,
-        )
-        .map_err(|error| LiveRuntimeError::Subscription(error.to_string()))?;
         let public_adapter: Arc<dyn VenueAdapter> = Arc::new(OkxAdapter::new(
             &config.venue.public_ws_url,
             &config.venue.private_ws_url,
@@ -723,13 +767,6 @@ impl LiveRuntime {
         let mut order_senders = HashMap::new();
         let mut order_tasks = Vec::new();
         for seed in seeds {
-            let private_subscriptions =
-                private_subscriptions(config.venue.enable_vip_fills_channel);
-            let private_plans = partition_subscriptions(
-                &private_subscriptions,
-                config.runtime.max_subscriptions_per_socket,
-            )
-            .map_err(|error| LiveRuntimeError::Subscription(error.to_string()))?;
             let private_adapter: Arc<dyn VenueAdapter> = Arc::new(
                 OkxAdapter::new(&config.venue.public_ws_url, &config.venue.private_ws_url)
                     .with_account_id(&seed.account_id),
@@ -787,18 +824,67 @@ impl LiveRuntime {
             max_feed_age_ms: config.risk.max_feed_age_ms,
             shutdown_timeout_ms: config.runtime.shutdown_timeout_ms,
             evidence: RuntimeEvidence::default(),
+            shutdown_in_progress: false,
+            shutdown_storage_error: None,
+            shutdown_reconciliation_requested: HashSet::new(),
+            shutdown_reconciled_accounts: HashSet::new(),
         };
         for output in initial_outputs {
-            runtime.commit_output(output)?;
+            if let Err(primary) = runtime.commit_output(output) {
+                let context = format!("runtime initialization failure: {primary}");
+                let stop_result = runtime.graceful_stop(&context).await;
+                let shutdown_result = runtime.shutdown().await;
+                let mut additional = Vec::new();
+                if let Err(error) = stop_result {
+                    additional.push(("fail-closed cleanup", error));
+                }
+                if let Err(error) = shutdown_result {
+                    additional.push(("runtime teardown", error));
+                }
+                return Err(combine_lifecycle_errors(primary, additional));
+            }
         }
         Ok(runtime)
     }
 
     async fn run(mut self) -> Result<LiveRunReport, LiveRuntimeError> {
-        let result = self.run_loop().await;
+        let loop_result = self.run_loop().await;
+        let stop_context = match &loop_result {
+            Ok(outcome) => match outcome.stop_reason {
+                LiveStopReason::OperatorSignal => "operator signal".to_string(),
+                LiveStopReason::DurationElapsed => "bounded duration elapsed".to_string(),
+                LiveStopReason::ReadinessTimeout => "bounded readiness timeout".to_string(),
+                LiveStopReason::Validation => "validation".to_string(),
+            },
+            Err(error) => format!("runtime failure: {error}"),
+        };
+        let stop_result = self.graceful_stop(&stop_context).await;
         let shutdown_result = self.shutdown().await;
-        let outcome = result?;
-        shutdown_result?;
+        let outcome = match loop_result {
+            Ok(outcome) => match stop_result {
+                Ok(()) => {
+                    shutdown_result?;
+                    outcome
+                }
+                Err(primary) => {
+                    let additional = shutdown_result
+                        .err()
+                        .map(|error| vec![("runtime teardown", error)])
+                        .unwrap_or_default();
+                    return Err(combine_lifecycle_errors(primary, additional));
+                }
+            },
+            Err(primary) => {
+                let mut additional = Vec::new();
+                if let Err(error) = stop_result {
+                    additional.push(("fail-closed cleanup", error));
+                }
+                if let Err(error) = shutdown_result {
+                    additional.push(("runtime teardown", error));
+                }
+                return Err(combine_lifecycle_errors(primary, additional));
+            }
+        };
         let readiness = self.coordinator.readiness();
         let dropped_storage_records = self.storage_sink.dropped_records();
         let active_orders_after_shutdown = self.coordinator.active_order_count();
@@ -861,7 +947,6 @@ impl LiveRuntime {
                         elapsed_ms,
                         self.coordinator.readiness(),
                     );
-                    self.graceful_stop().await?;
                     return Ok(outcome);
                 }
                 _ = &mut duration_elapsed => {
@@ -872,7 +957,6 @@ impl LiveRuntime {
                         elapsed_ms,
                         self.coordinator.readiness(),
                     );
-                    self.graceful_stop().await?;
                     return Ok(outcome);
                 }
                 event = self.control_rx.recv() => {
@@ -917,7 +1001,6 @@ impl LiveRuntime {
                         elapsed_ms,
                         readiness,
                     );
-                    self.graceful_stop().await?;
                     return Ok(outcome);
                 }
                 return Err(LiveRuntimeError::ReadinessTimeout(
@@ -931,10 +1014,32 @@ impl LiveRuntime {
         self.max_feed_age_ms
     }
 
-    async fn graceful_stop(&mut self) -> Result<(), LiveRuntimeError> {
+    async fn graceful_stop(&mut self, reason: &str) -> Result<(), LiveRuntimeError> {
         if self.mode != LiveMode::Demo {
             return Ok(());
         }
+        self.shutdown_in_progress = true;
+        let result = match tokio::time::timeout(
+            Duration::from_millis(self.shutdown_timeout_ms),
+            self.graceful_stop_inner(reason),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(self.shutdown_unresolved_error()),
+        };
+        match (result, self.shutdown_storage_error.take()) {
+            (Ok(()), None) => Ok(()),
+            (Ok(()), Some(error)) => Err(LiveRuntimeError::ShutdownStorage(error)),
+            (Err(primary), None) => Err(primary),
+            (Err(primary), Some(error)) => Err(combine_lifecycle_errors(
+                primary,
+                vec![("shutdown storage", LiveRuntimeError::ShutdownStorage(error))],
+            )),
+        }
+    }
+
+    async fn graceful_stop_inner(&mut self, reason: &str) -> Result<(), LiveRuntimeError> {
         self.coordinator.set_order_entry_enabled(false);
         let now_ms = unix_time_ms();
         let output = self
@@ -945,47 +1050,82 @@ impl LiveRuntime {
                 venue: None,
                 account_id: None,
                 symbol: None,
-                reason: "operator shutdown".to_string(),
+                reason: reason.to_string(),
             }));
-        self.commit_output(output)?;
+        self.commit_shutdown_output(output).await?;
+        self.request_shutdown_reconciliation(now_ms, true).await?;
 
-        let deadline = tokio::time::sleep(Duration::from_millis(self.shutdown_timeout_ms));
-        tokio::pin!(deadline);
         let mut retry = tokio::time::interval(Duration::from_millis(100));
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            self.drain_queued_events()?;
+            self.drain_shutdown_events()?;
             let readiness = self.coordinator.readiness();
             if self.coordinator.active_order_count() == 0
                 && readiness.missing_reconciliation.is_empty()
+                && self.reconcile_inflight.is_empty()
+                && self.shutdown_reconciled_accounts.len() == self.order_senders.len()
             {
                 return Ok(());
             }
             tokio::select! {
                 biased;
-                _ = &mut deadline => {
-                    return Err(LiveRuntimeError::ShutdownUnresolved {
-                        active_orders: self.coordinator.active_order_count(),
-                        unreconciled_accounts: self
-                            .coordinator
-                            .readiness()
-                            .missing_reconciliation
-                            .len(),
-                    });
+                event = self.control_rx.recv(), if !self.control_rx.is_closed() => {
+                    if let Some(event) = event {
+                        self.handle_runtime_event(event)?;
+                    }
                 }
-                event = self.control_rx.recv() => {
-                    let event = event.ok_or(LiveRuntimeError::EventChannelClosed)?;
-                    self.handle_runtime_event(event)?;
-                }
-                event = self.feed_rx.recv() => {
-                    let event = event.ok_or(LiveRuntimeError::EventChannelClosed)?;
-                    self.handle_runtime_event(event)?;
+                event = self.feed_rx.recv(), if !self.feed_rx.is_closed() => {
+                    if let Some(event) = event {
+                        self.handle_runtime_event(event)?;
+                    }
                 }
                 _ = retry.tick() => {
-                    self.retry_reconciliation(unix_time_ms())?;
+                    self.request_shutdown_reconciliation(unix_time_ms(), false).await?;
                 }
             }
         }
+    }
+
+    fn shutdown_unresolved_error(&self) -> LiveRuntimeError {
+        LiveRuntimeError::ShutdownUnresolved {
+            active_orders: self.coordinator.active_order_count(),
+            unreconciled_accounts: self
+                .coordinator
+                .readiness()
+                .missing_reconciliation
+                .into_iter()
+                .chain(self.reconcile_inflight.iter().cloned())
+                .chain(
+                    self.order_senders
+                        .keys()
+                        .filter(|account_id| {
+                            !self.shutdown_reconciled_accounts.contains(*account_id)
+                        })
+                        .cloned(),
+                )
+                .collect::<HashSet<_>>()
+                .len(),
+        }
+    }
+
+    fn drain_shutdown_events(&mut self) -> Result<(), LiveRuntimeError> {
+        let pending_control = self.control_rx.len();
+        for _ in 0..pending_control {
+            match self.control_rx.try_recv() {
+                Ok(event) => self.handle_runtime_event(event)?,
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        let pending_feed = self.feed_rx.len();
+        for _ in 0..pending_feed {
+            match self.feed_rx.try_recv() {
+                Ok(event) => self.handle_runtime_event(event)?,
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        Ok(())
     }
 
     fn drain_queued_events(&mut self) -> Result<(), LiveRuntimeError> {
@@ -1139,7 +1279,17 @@ impl LiveRuntime {
                     &remote_orders,
                     &remote_fills,
                 );
-                let reason = if report.is_clean() {
+                let clean = report.is_clean();
+                if self.shutdown_in_progress
+                    && self.shutdown_reconciliation_requested.contains(&account_id)
+                {
+                    if is_zero_order_reconciliation(&report) {
+                        self.shutdown_reconciled_accounts.insert(account_id.clone());
+                    } else {
+                        self.shutdown_reconciled_accounts.remove(&account_id);
+                    }
+                }
+                let reason = if clean {
                     "REST and canonical private state agree".to_string()
                 } else {
                     format!("{:?}", report.issues)
@@ -1147,7 +1297,7 @@ impl LiveRuntime {
                 let output = self.coordinator.on_reconciliation(ReconciliationResult {
                     account_id,
                     ts_ms,
-                    clean: report.is_clean(),
+                    clean,
                     local_live_orders: report.local_live_orders,
                     remote_live_orders: report.remote_live_orders,
                     remote_recent_fills: report.remote_fills,
@@ -1161,6 +1311,7 @@ impl LiveRuntime {
                 reason,
             } => {
                 self.reconcile_inflight.remove(&account_id);
+                self.shutdown_reconciled_accounts.remove(&account_id);
                 let output = self.coordinator.on_reconciliation(ReconciliationResult {
                     account_id,
                     ts_ms,
@@ -1253,9 +1404,62 @@ impl LiveRuntime {
         Ok(())
     }
 
+    async fn commit_shutdown_output(
+        &mut self,
+        output: CoordinatorOutput,
+    ) -> Result<(), LiveRuntimeError> {
+        for record in output.records {
+            self.record_storage(record)?;
+        }
+        for action in output.actions {
+            match action {
+                LiveAction::Submit(_) => return Err(LiveRuntimeError::UnsafeShutdownSubmit),
+                LiveAction::Cancel(action) => self.dispatch_shutdown_cancel(action).await?,
+                LiveAction::RecoverBook(_) => {}
+                LiveAction::Reconcile(action) => {
+                    self.dispatch_shutdown_reconcile(action).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn dispatch_shutdown_cancel(
+        &mut self,
+        action: CancelAction,
+    ) -> Result<(), LiveRuntimeError> {
+        let cancel_key = (action.account_id.clone(), action.client_order_id.clone());
+        if !self.cancel_inflight.insert(cancel_key.clone()) {
+            return Ok(());
+        }
+        self.record_storage(StorageRecord::OrderRequest(OrderRequestRecord {
+            ts_ms: action.ts_ms,
+            account_id: action.account_id.clone(),
+            operation: OrderOperation::Cancel,
+            idempotency_key: None,
+            client_order_id: Some(action.client_order_id.clone()),
+            exchange_order_id: None,
+            symbol: action.symbol.clone(),
+        }))?;
+        let sender = self.order_sender(&action.account_id)?.clone();
+        if sender.send(OrderTaskCommand::Cancel(action)).await.is_err() {
+            self.cancel_inflight.remove(&cancel_key);
+            return Err(LiveRuntimeError::OrderQueueUnavailable(cancel_key.0));
+        }
+        Ok(())
+    }
+
     fn record_storage(&mut self, record: StorageRecord) -> Result<(), LiveRuntimeError> {
         self.evidence.observe_record(&record);
-        self.storage_sink.try_record(record)?;
+        if let Err(error) = self.storage_sink.try_record(record) {
+            if !self.shutdown_in_progress {
+                return Err(error.into());
+            }
+            tracing::error!(%error, "storage unavailable during fail-closed shutdown");
+            self.shutdown_storage_error
+                .get_or_insert_with(|| error.to_string());
+            return Ok(());
+        }
         self.evidence.max_storage_queue_depth = self
             .evidence
             .max_storage_queue_depth
@@ -1320,11 +1524,71 @@ impl LiveRuntime {
         }
         self.last_reconcile_attempt
             .insert(action.account_id.clone(), Instant::now());
+        let orders = match self.reconciliation_order_refs(&action.account_id) {
+            Ok(orders) => orders,
+            Err(error) => {
+                self.reconcile_inflight.remove(&action.account_id);
+                return Err(error);
+            }
+        };
+        let sender = match self.order_sender(&action.account_id) {
+            Ok(sender) => sender.clone(),
+            Err(error) => {
+                self.reconcile_inflight.remove(&action.account_id);
+                return Err(error);
+            }
+        };
+        sender
+            .try_send(OrderTaskCommand::Reconcile(orders))
+            .map_err(|_| {
+                self.reconcile_inflight.remove(&action.account_id);
+                LiveRuntimeError::OrderQueueUnavailable(action.account_id)
+            })
+    }
+
+    async fn dispatch_shutdown_reconcile(
+        &mut self,
+        action: ReconcileAction,
+    ) -> Result<(), LiveRuntimeError> {
+        if !self.reconcile_inflight.insert(action.account_id.clone()) {
+            return Ok(());
+        }
+        self.last_reconcile_attempt
+            .insert(action.account_id.clone(), Instant::now());
+        let orders = match self.reconciliation_order_refs(&action.account_id) {
+            Ok(orders) => orders,
+            Err(error) => {
+                self.reconcile_inflight.remove(&action.account_id);
+                return Err(error);
+            }
+        };
+        let sender = match self.order_sender(&action.account_id) {
+            Ok(sender) => sender.clone(),
+            Err(error) => {
+                self.reconcile_inflight.remove(&action.account_id);
+                return Err(error);
+            }
+        };
+        if sender
+            .send(OrderTaskCommand::Reconcile(orders))
+            .await
+            .is_err()
+        {
+            self.reconcile_inflight.remove(&action.account_id);
+            return Err(LiveRuntimeError::OrderQueueUnavailable(action.account_id));
+        }
+        Ok(())
+    }
+
+    fn reconciliation_order_refs(
+        &self,
+        account_id: &str,
+    ) -> Result<Vec<ReconcileOrderRef>, LiveRuntimeError> {
         let state = self
             .coordinator
-            .private_state(&action.account_id)
-            .ok_or_else(|| CoordinatorError::UnknownAccount(action.account_id.clone()))?;
-        let orders = state
+            .private_state(account_id)
+            .ok_or_else(|| CoordinatorError::UnknownAccount(account_id.to_string()))?;
+        Ok(state
             .order_reducer()
             .orders()
             .filter(|(_, order)| {
@@ -1343,13 +1607,39 @@ impl LiveRuntime {
                 average_fill_price: order.avg_fill_price,
                 last_update_ms: state.last_order_update_ms(order_id).unwrap_or(0),
             })
-            .collect();
-        self.order_sender(&action.account_id)?
-            .try_send(OrderTaskCommand::Reconcile(orders))
-            .map_err(|_| {
-                self.reconcile_inflight.remove(&action.account_id);
-                LiveRuntimeError::OrderQueueUnavailable(action.account_id)
+            .collect())
+    }
+
+    async fn request_shutdown_reconciliation(
+        &mut self,
+        ts_ms: u64,
+        force: bool,
+    ) -> Result<(), LiveRuntimeError> {
+        let accounts = self
+            .order_senders
+            .keys()
+            .filter(|account_id| !self.shutdown_reconciled_accounts.contains(*account_id))
+            .filter(|account_id| !self.reconcile_inflight.contains(*account_id))
+            .filter(|account_id| {
+                !self.shutdown_reconciliation_requested.contains(*account_id)
+                    || force
+                    || self
+                        .last_reconcile_attempt
+                        .get(*account_id)
+                        .is_none_or(|last| last.elapsed() >= Duration::from_secs(2))
             })
+            .cloned()
+            .collect::<Vec<_>>();
+        for account_id in accounts {
+            self.dispatch_shutdown_reconcile(ReconcileAction {
+                ts_ms,
+                account_id: account_id.clone(),
+                reason: "verify zero exchange orders during graceful shutdown".to_string(),
+            })
+            .await?;
+            self.shutdown_reconciliation_requested.insert(account_id);
+        }
+        Ok(())
     }
 
     fn retry_reconciliation(&mut self, ts_ms: u64) -> Result<(), LiveRuntimeError> {
@@ -1958,8 +2248,9 @@ async fn shutdown_signal() -> Result<(), std::io::Error> {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    use reap_core::{AccountUpdate, Balance};
+    use reap_core::{AccountUpdate, Balance, OrderEvent, OrderUpdate, Side};
     use reap_risk::{InstrumentRiskModel, RiskLimits};
     use reap_strategy::{ChaosConfig, InstrumentKindConfig};
     use reap_venue::okx::{OkxAccountLevel, OkxInstrumentType, OkxPositionMode};
@@ -2108,12 +2399,16 @@ mod tests {
         }
     }
 
-    fn ready_coordinator(config: &LiveConfig, now_ms: u64) -> LiveCoordinator {
+    fn ready_coordinator(
+        config: &LiveConfig,
+        now_ms: u64,
+        gateway_actions_enabled: bool,
+    ) -> LiveCoordinator {
         let update = account_update(now_ms);
         let mut coordinator = LiveCoordinator::new(
             config.clone(),
             verified(config, update.clone()),
-            false,
+            gateway_actions_enabled,
             "bounded-test",
         )
         .unwrap();
@@ -2238,6 +2533,17 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_reconciliation_requires_clean_zero_order_state() {
+        let mut report = ReconcileReport::default();
+        assert!(is_zero_order_reconciliation(&report));
+
+        report.local_live_orders = 1;
+        report.remote_live_orders = 1;
+        assert!(report.is_clean());
+        assert!(!is_zero_order_reconciliation(&report));
+    }
+
+    #[test]
     fn runtime_evidence_classifies_persisted_system_events() {
         let system = |kind| {
             StorageRecord::System(SystemEvent {
@@ -2299,7 +2605,7 @@ mod tests {
     async fn bounded_ready_runtime_completes_with_clean_soak_report() {
         let config = config();
         let now_ms = unix_time_ms();
-        let coordinator = ready_coordinator(&config, now_ms);
+        let coordinator = ready_coordinator(&config, now_ms, false);
         let path = std::env::temp_dir().join(format!(
             "reap-bounded-soak-{}-{}.jsonl",
             std::process::id(),
@@ -2338,6 +2644,10 @@ mod tests {
             max_feed_age_ms: 60_000,
             shutdown_timeout_ms: 100,
             evidence: RuntimeEvidence::default(),
+            shutdown_in_progress: false,
+            shutdown_storage_error: None,
+            shutdown_reconciliation_requested: HashSet::new(),
+            shutdown_reconciled_accounts: HashSet::new(),
         };
 
         let report = runtime.run().await.unwrap();
@@ -2354,6 +2664,142 @@ mod tests {
         assert_eq!(report.dropped_storage_records, 0);
         assert_eq!(report.active_orders_after_shutdown, 0);
         assert!(report.clean_soak);
+    }
+
+    #[tokio::test]
+    async fn fatal_runtime_error_with_closed_storage_still_resolves_live_orders() {
+        let config = config();
+        let now_ms = unix_time_ms();
+        let mut coordinator = ready_coordinator(&config, now_ms, true);
+        coordinator
+            .restore_order(
+                "main",
+                OrderUpdate {
+                    ts_ms: now_ms,
+                    order_id: "client-live".to_string(),
+                    symbol: "BTC-USDT".to_string(),
+                    side: Side::Buy,
+                    event: OrderEvent::New,
+                    status: OrderStatus::Live,
+                    price: 100.0,
+                    qty: 1.0,
+                    open_qty: 1.0,
+                    filled_qty: 0.0,
+                    avg_fill_price: 0.0,
+                    last_fill_qty: 0.0,
+                    last_fill_price: 0.0,
+                    last_fill_liquidity: None,
+                    reason: "test live order".to_string(),
+                },
+            )
+            .unwrap();
+        coordinator.set_order_entry_enabled(false);
+        assert_eq!(coordinator.active_order_count(), 1);
+
+        let path = std::env::temp_dir().join(format!(
+            "reap-fail-closed-{}-{}.jsonl",
+            std::process::id(),
+            unix_time_ns()
+        ));
+        let storage = start_jsonl_storage(StorageConfig {
+            path: path.clone(),
+            channel_capacity: 1_024,
+            flush_every_records: 1,
+        })
+        .await
+        .unwrap();
+        let storage_sink = storage.sink();
+        storage.shutdown().await.unwrap();
+        let (control_tx, control_rx) = mpsc::channel(16);
+        let (feed_tx, feed_rx) = mpsc::channel(16);
+        let (order_tx, mut order_rx) = mpsc::channel(16);
+        let cancel_observed = Arc::new(AtomicBool::new(false));
+        let task_cancel_observed = Arc::clone(&cancel_observed);
+        let task_events = control_tx.clone();
+        let order_task = tokio::spawn(async move {
+            while let Some(command) = order_rx.recv().await {
+                match command {
+                    OrderTaskCommand::Cancel(action) => {
+                        assert_eq!(action.client_order_id, "client-live");
+                        task_cancel_observed.store(true, Ordering::SeqCst);
+                    }
+                    OrderTaskCommand::Reconcile(orders) => {
+                        assert!(task_cancel_observed.load(Ordering::SeqCst));
+                        assert_eq!(orders.len(), 1);
+                        task_events
+                            .send(RuntimeEvent::RemoteState {
+                                account_id: "main".to_string(),
+                                remote_orders: vec![RemoteOrder {
+                                    exchange_order_id: "exchange-live".to_string(),
+                                    client_order_id: "client-live".to_string(),
+                                    symbol: "BTC-USDT".to_string(),
+                                    side: Side::Buy,
+                                    state: PrivateOrderState::Cancelled,
+                                    price: 100.0,
+                                    qty: 1.0,
+                                    cumulative_filled_qty: 0.0,
+                                    average_fill_price: 0.0,
+                                    update_time_ms: unix_time_ms(),
+                                }],
+                                remote_fills: Vec::new(),
+                                ts_ms: unix_time_ms(),
+                            })
+                            .await
+                            .unwrap();
+                    }
+                    OrderTaskCommand::Submit(_) => panic!("shutdown dispatched a submit"),
+                    OrderTaskCommand::Shutdown => return,
+                }
+            }
+        });
+        control_tx
+            .send(RuntimeEvent::Fatal("injected runtime failure".to_string()))
+            .await
+            .unwrap();
+        let runtime = LiveRuntime {
+            mode: LiveMode::Demo,
+            run_duration: None,
+            coordinator,
+            processor: FeedProcessor::new(16, 16),
+            storage: None,
+            storage_sink,
+            control_rx,
+            feed_rx,
+            order_senders: HashMap::from([("main".to_string(), order_tx)]),
+            order_tasks: vec![order_task],
+            feeds: Vec::new(),
+            feed_tasks: Vec::new(),
+            sources: Vec::new(),
+            public_feed_index: 0,
+            reconcile_inflight: HashSet::new(),
+            cancel_inflight: HashSet::new(),
+            last_reconcile_attempt: HashMap::new(),
+            readiness_timeout_ms: 1_000,
+            timer_interval_ms: 100,
+            max_feed_age_ms: 60_000,
+            shutdown_timeout_ms: 1_000,
+            evidence: RuntimeEvidence::default(),
+            shutdown_in_progress: false,
+            shutdown_storage_error: None,
+            shutdown_reconciliation_requested: HashSet::new(),
+            shutdown_reconciled_accounts: HashSet::new(),
+        };
+
+        let error = runtime.run().await.unwrap_err();
+        drop(control_tx);
+        drop(feed_tx);
+        let _ = std::fs::remove_file(path);
+
+        let LiveRuntimeError::LifecycleFailure { primary, secondary } = error else {
+            panic!("expected combined runtime and shutdown-storage failure");
+        };
+        assert!(matches!(
+            *primary,
+            LiveRuntimeError::GatewayTask(message) if message == "injected runtime failure"
+        ));
+        assert!(secondary.contains("fail-closed cleanup"));
+        assert!(secondary.contains("storage remained unavailable"));
+        assert!(cancel_observed.load(Ordering::SeqCst));
     }
 
     #[test]

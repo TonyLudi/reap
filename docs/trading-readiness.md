@@ -13,7 +13,7 @@ production trading process.
 | Deterministic backtest | Shared strategy code, depth matching, queue-ahead model, fees, and normalized replay | Needs venue-data calibration before capital decisions |
 | Feed components | Redundant public sockets, isolated private sockets, ping/idle supervision, account-scoped deduplication, sequencing, and recovery are composed | Needs credentialed soak evidence |
 | Order components | Event-loop client IDs/registration, signed submit/cancel, pacing, private reduction, ambiguity handling, and REST reconciliation are composed | Needs demo exchange fault evidence |
-| Runtime risk | Instrument models, authoritative startup positions, account-scoped health, kill switch, symbol halt, and fail-closed cancellation are wired | Needs limits review against the target demo account |
+| Runtime risk | Instrument models, authoritative startup positions, account-scoped health, kill switch, symbol halt, and all-exit fail-closed cancellation/reconciliation are wired | Needs limits review against the target demo account |
 | Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, and strict bounded soak reports | Demo-capable; production entry intentionally unavailable |
 | Instrument/account bootstrap | Account instruments/config/balance/positions are typed and verified before readiness | Needs target-account certification |
 | Startup/restart gate | Executable phase state, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, and clean REST reconciliation | Needs process-kill demo test |
@@ -44,6 +44,11 @@ production trading process.
    adaptation, redundant-feed deduplication, sequencing, 400-level books,
    strategy/risk evaluation, and coordinator record construction. The measured
    optimizations and exclusions are recorded in `docs/performance.md`.
+8. Normal stops and runtime failures share one bounded shutdown path. New
+   submits are disabled independently from cancel permission; every account
+   must return a post-cancel REST reconciliation result before teardown.
+   Integration coverage injects a fatal runtime error and closed storage while
+   a canonical order is live, then verifies cancel-before-reconcile ordering.
 
 ## Remaining Demo Gate
 
