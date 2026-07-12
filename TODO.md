@@ -80,6 +80,8 @@ architecture in [docs/architecture.md](docs/architecture.md).
   fills, IOC misses, ambiguous submits, rate limits, and restart recovery.
 - [x] Profile the parity event loop with production-shaped captures and remove
   measured hot-path allocation/collection bottlenecks.
+- [x] Add bounded observe/demo soak execution with machine-verifiable readiness,
+  drift, storage, and shutdown evidence.
 - [ ] Complete an OKX demo soak with no unexplained reconciliation drift.
 
 Completed-step evidence is documented in [README.md](README.md),

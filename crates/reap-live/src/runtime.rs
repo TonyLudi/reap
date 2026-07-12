@@ -44,13 +44,37 @@ pub enum LiveMode {
 pub struct LiveRunOptions {
     pub mode: LiveMode,
     pub demo_confirmed: bool,
+    pub run_duration: Option<Duration>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveStopReason {
+    Validation,
+    OperatorSignal,
+    DurationElapsed,
+    ReadinessTimeout,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveRunReport {
     pub mode: LiveMode,
+    pub stop_reason: LiveStopReason,
+    pub elapsed_ms: u64,
+    pub reached_ready: bool,
+    pub time_to_ready_ms: Option<u64>,
+    pub readiness_loss_count: u64,
+    pub max_readiness_outage_ms: u64,
+    pub reconciliation_drift_events: u64,
+    pub book_recovery_events: u64,
+    pub stream_stale_events: u64,
+    pub connection_disconnect_events: u64,
+    pub max_storage_queue_depth: usize,
+    pub readiness_at_stop: ReadinessSnapshot,
     pub readiness: ReadinessSnapshot,
     pub dropped_storage_records: u64,
+    pub active_orders_after_shutdown: usize,
+    pub clean_soak: bool,
 }
 
 #[derive(Debug, Error)]
@@ -61,6 +85,8 @@ pub enum LiveRuntimeError {
     DemoConfirmationRequired,
     #[error("demo mode refuses production exchange configuration")]
     DemoRequiresSimulatedTrading,
+    #[error("live run duration must be greater than zero")]
+    InvalidRunDuration,
     #[error("account {account_id} bootstrap failed: {message}")]
     Bootstrap { account_id: String, message: String },
     #[error("bootstrap verification failed: {0}")]
@@ -100,6 +126,107 @@ pub enum LiveRuntimeError {
     Signal(#[from] std::io::Error),
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct RuntimeEvidence {
+    reconciliation_drift_events: u64,
+    book_recovery_events: u64,
+    stream_stale_events: u64,
+    connection_disconnect_events: u64,
+    max_storage_queue_depth: usize,
+}
+
+impl RuntimeEvidence {
+    fn observe_record(&mut self, record: &StorageRecord) {
+        let StorageRecord::System(event) = record else {
+            return;
+        };
+        match event.kind {
+            SystemEventKind::ReconcileDrift => self.reconciliation_drift_events += 1,
+            SystemEventKind::BookRecoveryStarted => self.book_recovery_events += 1,
+            SystemEventKind::FeedStale | SystemEventKind::PrivateStreamStale => {
+                self.stream_stale_events += 1;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RunLoopOutcome {
+    stop_reason: LiveStopReason,
+    elapsed_ms: u64,
+    reached_ready: bool,
+    time_to_ready_ms: Option<u64>,
+    readiness_loss_count: u64,
+    max_readiness_outage_ms: u64,
+    readiness_at_stop: ReadinessSnapshot,
+}
+
+#[derive(Debug, Default)]
+struct ReadinessTracker {
+    reached_ready: bool,
+    time_to_ready_ms: Option<u64>,
+    readiness_loss_count: u64,
+    outage_started_ms: Option<u64>,
+    max_readiness_outage_ms: u64,
+}
+
+impl ReadinessTracker {
+    fn observe(&mut self, elapsed_ms: u64, readiness: &ReadinessSnapshot) {
+        if readiness.is_ready() {
+            if !self.reached_ready {
+                self.reached_ready = true;
+                self.time_to_ready_ms = Some(elapsed_ms);
+            }
+            if let Some(started_ms) = self.outage_started_ms.take() {
+                self.max_readiness_outage_ms = self
+                    .max_readiness_outage_ms
+                    .max(elapsed_ms.saturating_sub(started_ms));
+            }
+        } else if self.reached_ready && self.outage_started_ms.is_none() {
+            self.readiness_loss_count += 1;
+            self.outage_started_ms = Some(elapsed_ms);
+        }
+    }
+
+    fn finish(
+        mut self,
+        stop_reason: LiveStopReason,
+        elapsed_ms: u64,
+        readiness: ReadinessSnapshot,
+    ) -> RunLoopOutcome {
+        self.observe(elapsed_ms, &readiness);
+        if let Some(started_ms) = self.outage_started_ms {
+            self.max_readiness_outage_ms = self
+                .max_readiness_outage_ms
+                .max(elapsed_ms.saturating_sub(started_ms));
+        }
+        RunLoopOutcome {
+            stop_reason,
+            elapsed_ms,
+            reached_ready: self.reached_ready,
+            time_to_ready_ms: self.time_to_ready_ms,
+            readiness_loss_count: self.readiness_loss_count,
+            max_readiness_outage_ms: self.max_readiness_outage_ms,
+            readiness_at_stop: readiness,
+        }
+    }
+}
+
+fn qualifies_as_clean_soak(
+    outcome: &RunLoopOutcome,
+    evidence: RuntimeEvidence,
+    dropped_storage_records: u64,
+    active_orders_after_shutdown: usize,
+) -> bool {
+    outcome.stop_reason == LiveStopReason::DurationElapsed
+        && outcome.reached_ready
+        && outcome.readiness_at_stop.is_ready()
+        && evidence.reconciliation_drift_events == 0
+        && dropped_storage_records == 0
+        && active_orders_after_shutdown == 0
+}
+
 pub async fn run_live_path(
     path: impl AsRef<Path>,
     options: LiveRunOptions,
@@ -113,11 +240,32 @@ pub async fn run_live(
     options: LiveRunOptions,
 ) -> Result<LiveRunReport, LiveRuntimeError> {
     config.ensure_valid()?;
+    if options
+        .run_duration
+        .is_some_and(|duration| duration.is_zero())
+    {
+        return Err(LiveRuntimeError::InvalidRunDuration);
+    }
     if options.mode == LiveMode::Validate {
+        let readiness = StartupGate::new(&config).snapshot();
         return Ok(LiveRunReport {
             mode: options.mode,
-            readiness: StartupGate::new(&config).snapshot(),
+            stop_reason: LiveStopReason::Validation,
+            elapsed_ms: 0,
+            reached_ready: false,
+            time_to_ready_ms: None,
+            readiness_loss_count: 0,
+            max_readiness_outage_ms: 0,
+            reconciliation_drift_events: 0,
+            book_recovery_events: 0,
+            stream_stale_events: 0,
+            connection_disconnect_events: 0,
+            max_storage_queue_depth: 0,
+            readiness_at_stop: readiness.clone(),
+            readiness,
             dropped_storage_records: 0,
+            active_orders_after_shutdown: 0,
+            clean_soak: false,
         });
     }
     if options.mode == LiveMode::Demo {
@@ -128,7 +276,7 @@ pub async fn run_live(
             return Err(LiveRuntimeError::DemoRequiresSimulatedTrading);
         }
     }
-    let runtime = LiveRuntime::build(config, options.mode).await?;
+    let runtime = LiveRuntime::build(config, options.mode, options.run_duration).await?;
     runtime.run().await
 }
 
@@ -335,6 +483,7 @@ fn private_update_from_remote(order: RemoteOrder) -> PrivateOrderUpdate {
 
 struct LiveRuntime {
     mode: LiveMode,
+    run_duration: Option<Duration>,
     coordinator: LiveCoordinator,
     processor: FeedProcessor,
     storage: Option<StorageRuntime>,
@@ -354,10 +503,15 @@ struct LiveRuntime {
     timer_interval_ms: u64,
     max_feed_age_ms: u64,
     shutdown_timeout_ms: u64,
+    evidence: RuntimeEvidence,
 }
 
 impl LiveRuntime {
-    async fn build(config: LiveConfig, mode: LiveMode) -> Result<Self, LiveRuntimeError> {
+    async fn build(
+        config: LiveConfig,
+        mode: LiveMode,
+        run_duration: Option<Duration>,
+    ) -> Result<Self, LiveRuntimeError> {
         let config_fingerprint = config.fingerprint()?;
         let recovered = recover_jsonl(&config.storage.path)?;
         for (account_id, (strategy_name, fingerprint)) in &recovered.bootstrap_identities {
@@ -609,6 +763,7 @@ impl LiveRuntime {
 
         let mut runtime = Self {
             mode,
+            run_duration,
             coordinator,
             processor: FeedProcessor::new(
                 config.runtime.dedup_capacity_per_stream,
@@ -631,6 +786,7 @@ impl LiveRuntime {
             timer_interval_ms: config.runtime.timer_interval_ms,
             max_feed_age_ms: config.risk.max_feed_age_ms,
             shutdown_timeout_ms: config.runtime.shutdown_timeout_ms,
+            evidence: RuntimeEvidence::default(),
         };
         for output in initial_outputs {
             runtime.commit_output(output)?;
@@ -640,33 +796,84 @@ impl LiveRuntime {
 
     async fn run(mut self) -> Result<LiveRunReport, LiveRuntimeError> {
         let result = self.run_loop().await;
+        let shutdown_result = self.shutdown().await;
+        let outcome = result?;
+        shutdown_result?;
         let readiness = self.coordinator.readiness();
         let dropped_storage_records = self.storage_sink.dropped_records();
-        let shutdown_result = self.shutdown().await;
-        result?;
-        shutdown_result?;
+        let active_orders_after_shutdown = self.coordinator.active_order_count();
+        let evidence = self.evidence;
+        let clean_soak = qualifies_as_clean_soak(
+            &outcome,
+            evidence,
+            dropped_storage_records,
+            active_orders_after_shutdown,
+        );
         Ok(LiveRunReport {
             mode: self.mode,
+            stop_reason: outcome.stop_reason,
+            elapsed_ms: outcome.elapsed_ms,
+            reached_ready: outcome.reached_ready,
+            time_to_ready_ms: outcome.time_to_ready_ms,
+            readiness_loss_count: outcome.readiness_loss_count,
+            max_readiness_outage_ms: outcome.max_readiness_outage_ms,
+            reconciliation_drift_events: evidence.reconciliation_drift_events,
+            book_recovery_events: evidence.book_recovery_events,
+            stream_stale_events: evidence.stream_stale_events,
+            connection_disconnect_events: evidence.connection_disconnect_events,
+            max_storage_queue_depth: evidence.max_storage_queue_depth,
+            readiness_at_stop: outcome.readiness_at_stop,
             readiness,
             dropped_storage_records,
+            active_orders_after_shutdown,
+            clean_soak,
         })
     }
 
-    async fn run_loop(&mut self) -> Result<(), LiveRuntimeError> {
+    async fn run_loop(&mut self) -> Result<RunLoopOutcome, LiveRuntimeError> {
         let started = Instant::now();
-        let mut reached_ready = false;
-        let mut last_phase = self.coordinator.readiness().phase;
+        let mut readiness_tracker = ReadinessTracker::default();
+        let initial_readiness = self.coordinator.readiness();
+        readiness_tracker.observe(0, &initial_readiness);
+        let mut last_phase = initial_readiness.phase;
         let mut timer = tokio::time::interval(Duration::from_millis(self.timer_interval_ms));
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let shutdown = shutdown_signal();
         tokio::pin!(shutdown);
+        let run_duration = self.run_duration;
+        let duration_elapsed = async move {
+            match run_duration {
+                Some(duration) => tokio::time::sleep(duration).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(duration_elapsed);
 
         loop {
             tokio::select! {
                 biased;
                 signal = &mut shutdown => {
                     signal?;
-                    return self.graceful_stop().await;
+                    self.drain_queued_events()?;
+                    let elapsed_ms = elapsed_ms(&started);
+                    let outcome = readiness_tracker.finish(
+                        LiveStopReason::OperatorSignal,
+                        elapsed_ms,
+                        self.coordinator.readiness(),
+                    );
+                    self.graceful_stop().await?;
+                    return Ok(outcome);
+                }
+                _ = &mut duration_elapsed => {
+                    self.drain_queued_events()?;
+                    let elapsed_ms = elapsed_ms(&started);
+                    let outcome = readiness_tracker.finish(
+                        LiveStopReason::DurationElapsed,
+                        elapsed_ms,
+                        self.coordinator.readiness(),
+                    );
+                    self.graceful_stop().await?;
+                    return Ok(outcome);
                 }
                 event = self.control_rx.recv() => {
                     let event = event.ok_or(LiveRuntimeError::EventChannelClosed)?;
@@ -695,15 +902,24 @@ impl LiveRuntime {
             }
 
             let readiness = self.coordinator.readiness();
+            let elapsed_ms = elapsed_ms(&started);
+            readiness_tracker.observe(elapsed_ms, &readiness);
             if readiness.phase != last_phase {
                 tracing::info!(from = ?last_phase, to = ?readiness.phase, ?readiness, "live readiness changed");
                 last_phase = readiness.phase;
             }
-            if readiness.is_ready() {
-                reached_ready = true;
-            } else if !reached_ready
+            if !readiness_tracker.reached_ready
                 && started.elapsed() > Duration::from_millis(self.readiness_timeout_ms)
             {
+                if self.run_duration.is_some() {
+                    let outcome = readiness_tracker.finish(
+                        LiveStopReason::ReadinessTimeout,
+                        elapsed_ms,
+                        readiness,
+                    );
+                    self.graceful_stop().await?;
+                    return Ok(outcome);
+                }
                 return Err(LiveRuntimeError::ReadinessTimeout(
                     self.readiness_timeout_ms,
                 ));
@@ -719,6 +935,7 @@ impl LiveRuntime {
         if self.mode != LiveMode::Demo {
             return Ok(());
         }
+        self.coordinator.set_order_entry_enabled(false);
         let now_ms = unix_time_ms();
         let output = self
             .coordinator
@@ -737,6 +954,7 @@ impl LiveRuntime {
         let mut retry = tokio::time::interval(Duration::from_millis(100));
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
+            self.drain_queued_events()?;
             let readiness = self.coordinator.readiness();
             if self.coordinator.active_order_count() == 0
                 && readiness.missing_reconciliation.is_empty()
@@ -770,21 +988,47 @@ impl LiveRuntime {
         }
     }
 
+    fn drain_queued_events(&mut self) -> Result<(), LiveRuntimeError> {
+        let pending_control = self.control_rx.len();
+        for _ in 0..pending_control {
+            match self.control_rx.try_recv() {
+                Ok(event) => self.handle_runtime_event(event)?,
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    return Err(LiveRuntimeError::EventChannelClosed);
+                }
+            }
+        }
+        let pending_feed = self.feed_rx.len();
+        for _ in 0..pending_feed {
+            match self.feed_rx.try_recv() {
+                Ok(event) => self.handle_runtime_event(event)?,
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    return Err(LiveRuntimeError::EventChannelClosed);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn handle_runtime_event(&mut self, event: RuntimeEvent) -> Result<(), LiveRuntimeError> {
         match event {
             RuntimeEvent::Raw {
                 source_id,
                 envelope,
             } => {
-                let source = self.sources.get(source_id).ok_or_else(|| {
-                    LiveRuntimeError::FeedAdapter("unknown feed source".to_string())
-                })?;
-                self.storage_sink.try_record(StorageRecord::Raw {
-                    account_id: source.account_id.clone(),
+                let (account_id, adapter) = {
+                    let source = self.sources.get(source_id).ok_or_else(|| {
+                        LiveRuntimeError::FeedAdapter("unknown feed source".to_string())
+                    })?;
+                    (source.account_id.clone(), Arc::clone(&source.adapter))
+                };
+                self.record_storage(StorageRecord::Raw {
+                    account_id,
                     envelope: envelope.clone(),
                 })?;
-                let parsed = source
-                    .adapter
+                let parsed = adapter
                     .parse(&envelope)
                     .map_err(|error| LiveRuntimeError::FeedAdapter(error.to_string()))?;
                 for event in parsed {
@@ -796,6 +1040,9 @@ impl LiveRuntime {
                 }
             }
             RuntimeEvent::Connection { source_id, status } => {
+                if status.kind == ConnectionStatusKind::Disconnected {
+                    self.evidence.connection_disconnect_events += 1;
+                }
                 let (events, public_connectivity) = {
                     let source = self.sources.get_mut(source_id).ok_or_else(|| {
                         LiveRuntimeError::FeedAdapter("unknown feed source".to_string())
@@ -998,7 +1245,7 @@ impl LiveRuntime {
 
     fn commit_output(&mut self, output: CoordinatorOutput) -> Result<(), LiveRuntimeError> {
         for record in output.records {
-            self.storage_sink.try_record(record)?;
+            self.record_storage(record)?;
         }
         for action in output.actions {
             self.dispatch_action(action)?;
@@ -1006,19 +1253,28 @@ impl LiveRuntime {
         Ok(())
     }
 
+    fn record_storage(&mut self, record: StorageRecord) -> Result<(), LiveRuntimeError> {
+        self.evidence.observe_record(&record);
+        self.storage_sink.try_record(record)?;
+        self.evidence.max_storage_queue_depth = self
+            .evidence
+            .max_storage_queue_depth
+            .max(self.storage_sink.queue_depth());
+        Ok(())
+    }
+
     fn dispatch_action(&mut self, action: LiveAction) -> Result<(), LiveRuntimeError> {
         match action {
             LiveAction::Submit(action) => {
-                self.storage_sink
-                    .try_record(StorageRecord::OrderRequest(OrderRequestRecord {
-                        ts_ms: action.ts_ms,
-                        account_id: action.account_id.clone(),
-                        operation: OrderOperation::Submit,
-                        idempotency_key: Some(action.idempotency_key.clone()),
-                        client_order_id: Some(action.client_order_id.clone()),
-                        exchange_order_id: None,
-                        symbol: action.order.symbol.clone(),
-                    }))?;
+                self.record_storage(StorageRecord::OrderRequest(OrderRequestRecord {
+                    ts_ms: action.ts_ms,
+                    account_id: action.account_id.clone(),
+                    operation: OrderOperation::Submit,
+                    idempotency_key: Some(action.idempotency_key.clone()),
+                    client_order_id: Some(action.client_order_id.clone()),
+                    exchange_order_id: None,
+                    symbol: action.order.symbol.clone(),
+                }))?;
                 self.order_sender(&action.account_id)?
                     .try_send(OrderTaskCommand::Submit(action))
                     .map_err(|_| {
@@ -1030,16 +1286,15 @@ impl LiveRuntime {
                 if !self.cancel_inflight.insert(cancel_key) {
                     return Ok(());
                 }
-                self.storage_sink
-                    .try_record(StorageRecord::OrderRequest(OrderRequestRecord {
-                        ts_ms: action.ts_ms,
-                        account_id: action.account_id.clone(),
-                        operation: OrderOperation::Cancel,
-                        idempotency_key: None,
-                        client_order_id: Some(action.client_order_id.clone()),
-                        exchange_order_id: None,
-                        symbol: action.symbol.clone(),
-                    }))?;
+                self.record_storage(StorageRecord::OrderRequest(OrderRequestRecord {
+                    ts_ms: action.ts_ms,
+                    account_id: action.account_id.clone(),
+                    operation: OrderOperation::Cancel,
+                    idempotency_key: None,
+                    client_order_id: Some(action.client_order_id.clone()),
+                    exchange_order_id: None,
+                    symbol: action.symbol.clone(),
+                }))?;
                 self.order_sender(&action.account_id)?
                     .try_send(OrderTaskCommand::Cancel(action))
                     .map_err(|_| {
@@ -1682,6 +1937,10 @@ fn unix_time_ms() -> u64 {
     unix_time_ns() / 1_000_000
 }
 
+fn elapsed_ms(started: &Instant) -> u64 {
+    started.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
+
 #[cfg(unix)]
 async fn shutdown_signal() -> Result<(), std::io::Error> {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -1698,14 +1957,16 @@ async fn shutdown_signal() -> Result<(), std::io::Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap, HashSet};
 
-    use reap_risk::RiskLimits;
-    use reap_strategy::ChaosConfig;
-    use reap_venue::okx::{OkxAccountLevel, OkxPositionMode};
+    use reap_core::{AccountUpdate, Balance};
+    use reap_risk::{InstrumentRiskModel, RiskLimits};
+    use reap_strategy::{ChaosConfig, InstrumentKindConfig};
+    use reap_venue::okx::{OkxAccountLevel, OkxInstrumentType, OkxPositionMode};
 
     use crate::{
         LiveAccountConfig, LiveStorageConfig, OkxTradeModeConfig, OkxVenueConfig, RuntimeConfig,
+        VerifiedInstrument,
     };
 
     use super::*;
@@ -1761,6 +2022,338 @@ mod tests {
                 ]),
             }],
         }
+    }
+
+    fn readiness(phase: crate::LivePhase) -> ReadinessSnapshot {
+        ReadinessSnapshot {
+            phase,
+            metadata_verified: phase == crate::LivePhase::Ready,
+            storage_ready: phase == crate::LivePhase::Ready,
+            public_connectivity_ready: phase == crate::LivePhase::Ready,
+            missing_reconciliation: Vec::new(),
+            missing_account_snapshots: Vec::new(),
+            missing_books: Vec::new(),
+            missing_private_streams: Vec::new(),
+            faults: BTreeMap::new(),
+        }
+    }
+
+    fn account_update(ts_ms: u64) -> AccountUpdate {
+        AccountUpdate {
+            ts_ms,
+            balances: vec![Balance {
+                account_id: Some("main".to_string()),
+                currency: "USDT".to_string(),
+                total: 10_000.0,
+                available: 10_000.0,
+                equity: 10_000.0,
+                liability: 0.0,
+                max_loan: 0.0,
+            }],
+            positions: Vec::new(),
+            margins: Vec::new(),
+        }
+    }
+
+    fn verified(config: &LiveConfig, update: AccountUpdate) -> VerifiedBootstrap {
+        let instruments = config
+            .strategy
+            .instruments
+            .iter()
+            .map(|instrument| {
+                let account = config.account_for_symbol(&instrument.symbol).unwrap();
+                let instrument_type = match instrument.kind {
+                    InstrumentKindConfig::Spot => OkxInstrumentType::Spot,
+                    InstrumentKindConfig::LinearSwap | InstrumentKindConfig::InverseSwap => {
+                        OkxInstrumentType::Swap
+                    }
+                    InstrumentKindConfig::Future
+                    | InstrumentKindConfig::LinearFuture
+                    | InstrumentKindConfig::InverseFuture => OkxInstrumentType::Futures,
+                };
+                let risk_model = if instrument.kind.is_spot() {
+                    InstrumentRiskModel::Spot
+                } else if instrument.kind.is_inverse() {
+                    InstrumentRiskModel::InverseDerivative {
+                        contract_value: instrument.contract_value,
+                    }
+                } else {
+                    InstrumentRiskModel::LinearDerivative {
+                        contract_value: instrument.contract_value,
+                    }
+                };
+                (
+                    instrument.symbol.clone(),
+                    VerifiedInstrument {
+                        account_id: account.id.clone(),
+                        symbol: instrument.symbol.clone(),
+                        instrument_type,
+                        trade_mode: account.trade_modes[&instrument.symbol],
+                        risk_model,
+                        tick_size: instrument.tick_size,
+                        lot_size: instrument.lot_size,
+                        min_size: instrument.min_trade_size,
+                        contract_value: instrument
+                            .kind
+                            .is_derivative()
+                            .then_some(instrument.contract_value),
+                    },
+                )
+            })
+            .collect();
+        VerifiedBootstrap {
+            instruments,
+            account_updates: HashMap::from([("main".to_string(), update)]),
+            baseline_fill_ids: HashMap::from([("main".to_string(), HashSet::new())]),
+        }
+    }
+
+    fn ready_coordinator(config: &LiveConfig, now_ms: u64) -> LiveCoordinator {
+        let update = account_update(now_ms);
+        let mut coordinator = LiveCoordinator::new(
+            config.clone(),
+            verified(config, update.clone()),
+            false,
+            "bounded-test",
+        )
+        .unwrap();
+        coordinator.mark_storage_ready(true, "test storage");
+        coordinator.mark_public_connectivity(true, "test public sockets");
+        coordinator
+            .process_feed(FeedOutput::PrivateAccount {
+                account_id: Some("main".to_string()),
+                update,
+            })
+            .unwrap();
+        coordinator
+            .on_reconciliation(ReconciliationResult {
+                account_id: "main".to_string(),
+                ts_ms: now_ms,
+                clean: true,
+                local_live_orders: 0,
+                remote_live_orders: 0,
+                remote_recent_fills: 0,
+                reason: "test reconciliation".to_string(),
+            })
+            .unwrap();
+        for symbol in config.required_symbols() {
+            coordinator.process_event(NormalizedEvent::System(SystemEvent {
+                ts_ms: now_ms,
+                kind: SystemEventKind::FeedRecovered,
+                venue: Some(Venue::Okx),
+                account_id: None,
+                symbol: Some(symbol),
+                reason: "test book".to_string(),
+            }));
+        }
+        coordinator.process_event(NormalizedEvent::System(SystemEvent {
+            ts_ms: now_ms,
+            kind: SystemEventKind::PrivateStreamRecovered,
+            venue: Some(Venue::Okx),
+            account_id: Some("main".to_string()),
+            symbol: None,
+            reason: "test private sockets".to_string(),
+        }));
+        assert!(coordinator.readiness().is_ready());
+        coordinator
+    }
+
+    #[test]
+    fn readiness_tracker_records_recovered_outages() {
+        let ready = readiness(crate::LivePhase::Ready);
+        let degraded = readiness(crate::LivePhase::Degraded);
+        let mut tracker = ReadinessTracker::default();
+
+        tracker.observe(100, &ready);
+        tracker.observe(250, &degraded);
+        tracker.observe(425, &ready);
+        let outcome = tracker.finish(LiveStopReason::DurationElapsed, 1_000, ready);
+
+        assert!(outcome.reached_ready);
+        assert_eq!(outcome.time_to_ready_ms, Some(100));
+        assert_eq!(outcome.readiness_loss_count, 1);
+        assert_eq!(outcome.max_readiness_outage_ms, 175);
+    }
+
+    #[test]
+    fn clean_soak_requires_duration_readiness_no_drift_and_no_open_orders() {
+        let mut outcome = RunLoopOutcome {
+            stop_reason: LiveStopReason::DurationElapsed,
+            elapsed_ms: 1_000,
+            reached_ready: true,
+            time_to_ready_ms: Some(10),
+            readiness_loss_count: 1,
+            max_readiness_outage_ms: 25,
+            readiness_at_stop: readiness(crate::LivePhase::Ready),
+        };
+        assert!(qualifies_as_clean_soak(
+            &outcome,
+            RuntimeEvidence::default(),
+            0,
+            0,
+        ));
+
+        outcome.stop_reason = LiveStopReason::OperatorSignal;
+        assert!(!qualifies_as_clean_soak(
+            &outcome,
+            RuntimeEvidence::default(),
+            0,
+            0,
+        ));
+        outcome.stop_reason = LiveStopReason::DurationElapsed;
+        outcome.reached_ready = false;
+        assert!(!qualifies_as_clean_soak(
+            &outcome,
+            RuntimeEvidence::default(),
+            0,
+            0,
+        ));
+        outcome.reached_ready = true;
+        outcome.readiness_at_stop = readiness(crate::LivePhase::Degraded);
+        assert!(!qualifies_as_clean_soak(
+            &outcome,
+            RuntimeEvidence::default(),
+            0,
+            0,
+        ));
+        outcome.readiness_at_stop = readiness(crate::LivePhase::Ready);
+
+        let evidence = RuntimeEvidence {
+            reconciliation_drift_events: 1,
+            ..RuntimeEvidence::default()
+        };
+        assert!(!qualifies_as_clean_soak(&outcome, evidence, 0, 0));
+        assert!(!qualifies_as_clean_soak(
+            &outcome,
+            RuntimeEvidence::default(),
+            1,
+            0,
+        ));
+        assert!(!qualifies_as_clean_soak(
+            &outcome,
+            RuntimeEvidence::default(),
+            0,
+            1,
+        ));
+    }
+
+    #[test]
+    fn runtime_evidence_classifies_persisted_system_events() {
+        let system = |kind| {
+            StorageRecord::System(SystemEvent {
+                ts_ms: 1,
+                kind,
+                venue: Some(Venue::Okx),
+                account_id: None,
+                symbol: Some("BTC-USDT".to_string()),
+                reason: "test".to_string(),
+            })
+        };
+        let mut evidence = RuntimeEvidence::default();
+
+        evidence.observe_record(&system(SystemEventKind::ReconcileDrift));
+        evidence.observe_record(&system(SystemEventKind::BookRecoveryStarted));
+        evidence.observe_record(&system(SystemEventKind::FeedStale));
+        evidence.observe_record(&system(SystemEventKind::PrivateStreamStale));
+
+        assert_eq!(evidence.reconciliation_drift_events, 1);
+        assert_eq!(evidence.book_recovery_events, 1);
+        assert_eq!(evidence.stream_stale_events, 2);
+    }
+
+    #[tokio::test]
+    async fn bounded_run_rejects_zero_duration_before_credentials() {
+        let error = run_live(
+            config(),
+            LiveRunOptions {
+                mode: LiveMode::Observe,
+                demo_confirmed: false,
+                run_duration: Some(Duration::ZERO),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, LiveRuntimeError::InvalidRunDuration));
+    }
+
+    #[tokio::test]
+    async fn validation_report_is_not_a_soak_pass() {
+        let report = run_live(
+            config(),
+            LiveRunOptions {
+                mode: LiveMode::Validate,
+                demo_confirmed: false,
+                run_duration: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.stop_reason, LiveStopReason::Validation);
+        assert!(!report.reached_ready);
+        assert!(!report.clean_soak);
+    }
+
+    #[tokio::test]
+    async fn bounded_ready_runtime_completes_with_clean_soak_report() {
+        let config = config();
+        let now_ms = unix_time_ms();
+        let coordinator = ready_coordinator(&config, now_ms);
+        let path = std::env::temp_dir().join(format!(
+            "reap-bounded-soak-{}-{}.jsonl",
+            std::process::id(),
+            unix_time_ns()
+        ));
+        let storage = start_jsonl_storage(StorageConfig {
+            path: path.clone(),
+            channel_capacity: 1_024,
+            flush_every_records: 1,
+        })
+        .await
+        .unwrap();
+        let storage_sink = storage.sink();
+        let (control_tx, control_rx) = mpsc::channel(16);
+        let (feed_tx, feed_rx) = mpsc::channel(16);
+        let runtime = LiveRuntime {
+            mode: LiveMode::Observe,
+            run_duration: Some(Duration::from_millis(25)),
+            coordinator,
+            processor: FeedProcessor::new(16, 16),
+            storage: Some(storage),
+            storage_sink,
+            control_rx,
+            feed_rx,
+            order_senders: HashMap::new(),
+            order_tasks: Vec::new(),
+            feeds: Vec::new(),
+            feed_tasks: Vec::new(),
+            sources: Vec::new(),
+            public_feed_index: 0,
+            reconcile_inflight: HashSet::new(),
+            cancel_inflight: HashSet::new(),
+            last_reconcile_attempt: HashMap::new(),
+            readiness_timeout_ms: 1_000,
+            timer_interval_ms: 100,
+            max_feed_age_ms: 60_000,
+            shutdown_timeout_ms: 100,
+            evidence: RuntimeEvidence::default(),
+        };
+
+        let report = runtime.run().await.unwrap();
+        drop(control_tx);
+        drop(feed_tx);
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(report.stop_reason, LiveStopReason::DurationElapsed);
+        assert!(report.elapsed_ms >= 20);
+        assert!(report.reached_ready);
+        assert_eq!(report.time_to_ready_ms, Some(0));
+        assert!(report.readiness_at_stop.is_ready());
+        assert_eq!(report.reconciliation_drift_events, 0);
+        assert_eq!(report.dropped_storage_records, 0);
+        assert_eq!(report.active_orders_after_shutdown, 0);
+        assert!(report.clean_soak);
     }
 
     #[test]
@@ -1839,6 +2432,7 @@ mod tests {
             LiveRunOptions {
                 mode: LiveMode::Demo,
                 demo_confirmed: false,
+                run_duration: None,
             },
         )
         .await
@@ -1852,6 +2446,7 @@ mod tests {
             LiveRunOptions {
                 mode: LiveMode::Demo,
                 demo_confirmed: true,
+                run_duration: None,
             },
         )
         .await

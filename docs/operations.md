@@ -96,3 +96,50 @@ zero active canonical orders and clean accounts. It then flushes critical
 storage and stops sockets/tasks. Exceeding `shutdown_timeout_ms` returns an
 error with unresolved counts; treat that as an incident. Observe mode performs
 no exchange mutation and shuts down directly.
+
+## Bounded Soak Acceptance
+
+Use a bounded run for evidence that can be evaluated without an operator-timed
+signal. An observe soak never permits submit or cancel requests:
+
+```bash
+cargo run -p reap-cli -- live \
+  --config examples/live-okx-demo.toml \
+  --mode observe \
+  --duration-secs 3600 \
+  --require-clean-soak \
+  --pretty
+```
+
+After observe acceptance, run a deliberately short minimal-size demo window
+before increasing its duration:
+
+```bash
+cargo run -p reap-cli -- live \
+  --config examples/live-okx-demo.toml \
+  --mode demo \
+  --confirm-demo \
+  --duration-secs 900 \
+  --require-clean-soak \
+  --pretty
+```
+
+`--require-clean-soak` requires `--duration-secs` and exits non-zero unless all
+of these invariants hold:
+
+- the bounded duration, rather than validation, readiness timeout, or an
+  operator signal, ended the run;
+- the runtime reached `ready` and `readiness_at_stop` is still `ready`;
+- no `ReconcileDrift` event or best-effort storage drop occurred; and
+- demo shutdown resolved every active canonical order.
+
+The report also records time-to-ready, recovered readiness losses and maximum
+outage, disconnects, stale-stream events, book recoveries, and the storage queue
+high-water mark. Recovered disconnects do not by themselves fail acceptance,
+but their counts must match the injected fault plan. In demo mode the final
+`readiness` may be degraded by the deliberate shutdown kill switch; acceptance
+uses the pre-shutdown `readiness_at_stop` snapshot.
+
+A `clean_soak` result is evidence for this bounded runtime window only. Review
+the JSONL log, account balances, positions, fills, and checkpoint restart before
+checking off the sustained demo gate.

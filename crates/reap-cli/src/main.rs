@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -47,6 +48,14 @@ enum Command {
         mode: LiveCliMode,
         #[arg(long)]
         confirm_demo: bool,
+        #[arg(long, help = "Stop the live event loop after this many seconds")]
+        duration_secs: Option<u64>,
+        #[arg(
+            long,
+            requires = "duration_secs",
+            help = "Exit non-zero unless the bounded run satisfies soak invariants"
+        )]
+        require_clean_soak: bool,
         #[arg(long)]
         pretty: bool,
     },
@@ -134,6 +143,8 @@ async fn main() -> Result<()> {
             config,
             mode,
             confirm_demo,
+            duration_secs,
+            require_clean_soak,
             pretty,
         } => {
             reap_telemetry::init_json_tracing("info")
@@ -144,6 +155,7 @@ async fn main() -> Result<()> {
                 LiveRunOptions {
                     mode: mode.into(),
                     demo_confirmed: confirm_demo,
+                    run_duration: duration_secs.map(Duration::from_secs),
                 },
             )
             .await?;
@@ -151,6 +163,9 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 println!("{}", serde_json::to_string(&report)?);
+            }
+            if require_clean_soak && !report.clean_soak {
+                anyhow::bail!("bounded live soak did not satisfy clean acceptance invariants");
             }
         }
     }

@@ -14,7 +14,7 @@ production trading process.
 | Feed components | Redundant public sockets, isolated private sockets, ping/idle supervision, account-scoped deduplication, sequencing, and recovery are composed | Needs credentialed soak evidence |
 | Order components | Event-loop client IDs/registration, signed submit/cancel, pacing, private reduction, ambiguity handling, and REST reconciliation are composed | Needs demo exchange fault evidence |
 | Runtime risk | Instrument models, authoritative startup positions, account-scoped health, kill switch, symbol halt, and fail-closed cancellation are wired | Needs limits review against the target demo account |
-| Live process | `live` supports config-only `validate`, read-only `observe`, and explicitly confirmed demo order entry | Demo-capable; production entry intentionally unavailable |
+| Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, and strict bounded soak reports | Demo-capable; production entry intentionally unavailable |
 | Instrument/account bootstrap | Account instruments/config/balance/positions are typed and verified before readiness | Needs target-account certification |
 | Startup/restart gate | Executable phase state, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, and clean REST reconciliation | Needs process-kill demo test |
 | Event-loop profile | Allocation-aware raw OKX parity benchmark covers redundant wire input through strategy/risk and storage-record construction | Needs target-host capture and exchange-latency validation |
@@ -50,11 +50,15 @@ production trading process.
 1. Review `examples/live-okx-demo.toml` against the actual demo account and
    current fee tier.
 2. Run `observe` through reconnects and verify every account reaches `ready`
-   with no reconciliation drift or critical storage backpressure.
+   with no reconciliation drift or critical storage backpressure. Use a bounded
+   run with `--duration-secs <seconds> --require-clean-soak` so the result is
+   machine-verifiable.
 3. Run minimal-size `demo` orders, then inject socket disconnect, process kill,
    IOC miss, partial fill, and REST timeout/rate-limit conditions.
 4. Complete a sustained soak with zero unexplained order, fill, balance,
-   position, or checkpoint drift.
+   position, or checkpoint drift. `clean_soak` covers runtime readiness,
+   reconciliation, storage drops, and shutdown orders; balances, positions,
+   fills, and restart checkpoint state still require log/account review.
 
 ## Production Gate
 

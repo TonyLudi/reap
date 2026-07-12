@@ -67,6 +67,14 @@ export REAP_OKX_PASSPHRASE=...
 cargo run -p reap-cli -- live --config examples/live-okx-demo.toml --mode observe
 ```
 
+Run a bounded observe soak and return a non-zero status unless the runtime
+reaches readiness, finishes the requested window, records no reconciliation
+drift or storage drops, and shuts down with no active orders:
+
+```bash
+cargo run -p reap-cli -- live --config examples/live-okx-demo.toml --mode observe --duration-secs 3600 --require-clean-soak --pretty
+```
+
 Enable demo order entry only with the explicit confirmation flag:
 
 ```bash

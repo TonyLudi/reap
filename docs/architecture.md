@@ -667,6 +667,8 @@ the deployment blocker.
 - Verify instrument metadata, account mode, and risk valuation. Done.
 - Profile the wire-to-action parity loop and remove measured collection churn.
   Done.
+- Emit bounded soak evidence for readiness recovery, reconciliation drift,
+  storage pressure, and zero-order shutdown. Done.
 - Complete fault injection and OKX demo soak acceptance.
 
 See [trading-readiness.md](trading-readiness.md) for the detailed gate.
