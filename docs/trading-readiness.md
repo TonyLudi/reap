@@ -18,7 +18,7 @@ production trading process.
 | Instrument/account bootstrap | Account instruments/config/balance/positions are typed and verified before readiness | Needs target-account certification |
 | Startup/restart gate | Executable phase state, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, and clean REST reconciliation | Needs process-kill demo test |
 | Event-loop profile | Allocation-aware raw OKX parity benchmark covers redundant wire input through strategy/risk and storage-record construction | Needs target-host capture and exchange-latency validation |
-| Operator control and alerts | Typed events and telemetry primitives exist; no authenticated operator service | Production blocker |
+| Operator control and alerts | HMAC-authenticated local status/kill/halt/resume/shutdown service is wired through the single writer | External alert delivery and independent account/exchange controls remain production blockers |
 | Exchange certification | No recorded OKX demo soak, fault injection, or production account-mode certification | Production blocker |
 
 ## Implemented Demo Path
@@ -49,6 +49,10 @@ production trading process.
    must return a post-cancel REST reconciliation result before teardown.
    Integration coverage injects a fatal runtime error and closed storage while
    a canonical order is live, then verifies cancel-before-reconcile ordering.
+9. A `0600` Unix socket accepts bounded HMAC-signed operator commands with
+   timestamp and nonce replay protection. Status and control responses are
+   typed, mutations are persisted, and authenticated shutdown enters the same
+   reconciled lifecycle path.
 
 ## Remaining Demo Gate
 

@@ -671,6 +671,8 @@ the deployment blocker.
   storage pressure, and zero-order shutdown. Done.
 - Route every demo exit through submit-disabled cancellation and per-account
   post-cancel REST reconciliation, even when persistence has failed. Done.
+- Authenticate bounded local operator commands outside the strategy loop and
+  reduce accepted control events on the single writer. Done.
 - Complete fault injection and OKX demo soak acceptance.
 
 See [trading-readiness.md](trading-readiness.md) for the detailed gate.

@@ -22,6 +22,8 @@ pub struct LiveConfig {
     pub runtime: RuntimeConfig,
     #[serde(default)]
     pub storage: LiveStorageConfig,
+    #[serde(default)]
+    pub operator: OperatorConfig,
     pub accounts: Vec<LiveAccountConfig>,
 }
 
@@ -170,6 +172,54 @@ impl RuntimeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct OperatorConfig {
+    pub enabled: bool,
+    pub socket_path: PathBuf,
+    pub token_env: String,
+    pub max_clock_skew_ms: u64,
+    pub nonce_ttl_ms: u64,
+    pub nonce_capacity: usize,
+    pub request_timeout_ms: u64,
+    pub max_request_bytes: usize,
+    pub command_channel_capacity: usize,
+}
+
+impl Default for OperatorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            socket_path: PathBuf::from("var/reap/operator.sock"),
+            token_env: "REAP_OPERATOR_TOKEN".to_string(),
+            max_clock_skew_ms: 5_000,
+            nonce_ttl_ms: 60_000,
+            nonce_capacity: 4_096,
+            request_timeout_ms: 2_000,
+            max_request_bytes: 4_096,
+            command_channel_capacity: 64,
+        }
+    }
+}
+
+impl OperatorConfig {
+    pub fn secret_from_env(&self) -> Result<Option<Vec<u8>>, LiveConfigError> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let secret =
+            std::env::var(&self.token_env).map_err(|_| LiveConfigError::MissingOperatorToken {
+                name: self.token_env.clone(),
+            })?;
+        if secret.len() < 32 {
+            return Err(LiveConfigError::OperatorTokenTooShort {
+                name: self.token_env.clone(),
+            });
+        }
+        Ok(Some(secret.into_bytes()))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LiveStorageConfig {
     pub path: PathBuf,
     pub channel_capacity: usize,
@@ -208,6 +258,10 @@ pub enum LiveConfigError {
     Invalid(String),
     #[error("account {account_id} credential environment variable {name} is not set")]
     MissingCredential { account_id: String, name: String },
+    #[error("operator token environment variable {name} is not set")]
+    MissingOperatorToken { name: String },
+    #[error("operator token environment variable {name} must contain at least 32 bytes")]
+    OperatorTokenTooShort { name: String },
 }
 
 impl LiveConfig {
@@ -268,6 +322,7 @@ impl LiveConfig {
         if self.storage.flush_every_records == 0 {
             errors.push("storage.flush_every_records must be positive".to_string());
         }
+        validate_operator(&self.operator, &self.storage, &mut errors);
 
         let mut account_ids = HashSet::new();
         let mut node_ids = HashSet::new();
@@ -494,6 +549,46 @@ fn validate_positive_runtime(runtime: &RuntimeConfig, errors: &mut Vec<String>) 
     }
 }
 
+fn validate_operator(
+    operator: &OperatorConfig,
+    storage: &LiveStorageConfig,
+    errors: &mut Vec<String>,
+) {
+    if !operator.enabled {
+        return;
+    }
+    if operator.socket_path.as_os_str().is_empty() {
+        errors.push("operator.socket_path must not be empty".to_string());
+    }
+    if operator.socket_path == storage.path {
+        errors.push("operator.socket_path must differ from storage.path".to_string());
+    }
+    if operator.token_env.trim().is_empty() {
+        errors.push("operator.token_env must not be empty".to_string());
+    }
+    for (name, value) in [
+        ("max_clock_skew_ms", operator.max_clock_skew_ms),
+        ("nonce_ttl_ms", operator.nonce_ttl_ms),
+        ("nonce_capacity", operator.nonce_capacity as u64),
+        ("request_timeout_ms", operator.request_timeout_ms),
+        ("max_request_bytes", operator.max_request_bytes as u64),
+        (
+            "command_channel_capacity",
+            operator.command_channel_capacity as u64,
+        ),
+    ] {
+        if value == 0 {
+            errors.push(format!("operator.{name} must be positive"));
+        }
+    }
+    if operator.nonce_ttl_ms < operator.max_clock_skew_ms.saturating_mul(2) {
+        errors.push("operator.nonce_ttl_ms must be at least twice max_clock_skew_ms".to_string());
+    }
+    if operator.max_request_bytes < 512 || operator.max_request_bytes > 65_536 {
+        errors.push("operator.max_request_bytes must be between 512 and 65536".to_string());
+    }
+}
+
 fn validate_url(name: &str, value: &str, schemes: &[&str], errors: &mut Vec<String>) {
     match Url::parse(value) {
         Ok(url) if schemes.contains(&url.scheme()) => {}
@@ -527,6 +622,7 @@ mod tests {
             venue: OkxVenueConfig::default(),
             runtime: RuntimeConfig::default(),
             storage: LiveStorageConfig::default(),
+            operator: OperatorConfig::default(),
             accounts: vec![LiveAccountConfig {
                 id: "main".to_string(),
                 api_key_env: "OKX_API_KEY".to_string(),
@@ -568,6 +664,43 @@ mod tests {
         config.venue.environment = TradingEnvironment::Production;
         assert!(config.validate().valid);
         assert!(!config.venue.environment.is_demo());
+    }
+
+    #[test]
+    fn enabled_operator_service_requires_bounded_distinct_configuration() {
+        assert!(
+            OperatorConfig::default()
+                .secret_from_env()
+                .unwrap()
+                .is_none()
+        );
+
+        let mut config = valid_config();
+        config.operator.enabled = true;
+        config.operator.socket_path = config.storage.path.clone();
+        config.operator.max_request_bytes = 1;
+        config.operator.nonce_ttl_ms = config.operator.max_clock_skew_ms;
+        let report = config.validate();
+
+        assert!(!report.valid);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("must differ from storage.path"))
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("between 512 and 65536"))
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("at least twice max_clock_skew_ms"))
+        );
     }
 
     #[test]

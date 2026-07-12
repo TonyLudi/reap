@@ -58,17 +58,53 @@ production order entry remains intentionally unavailable.
 | Public feed stale | Symbol blocked; live orders cancelled | Restore at least one healthy feed and verify sequence continuity |
 | Private stream stale | Account blocked; live orders cancelled | Reconnect, REST reconcile pending orders/fills, then emit recovery |
 | Reconcile drift | Account blocked; live orders cancelled | Resolve local/remote order and fill differences before recovery |
-| Risk breach | Kill switch active; live orders cancelled | Reduce exposure externally if needed, diagnose, and obtain operator reset |
+| Risk breach | Kill switch active; live orders cancelled | Reduce exposure externally if needed, diagnose, and restart only after approval; live global reset is intentionally unavailable |
 | Critical storage loss/backpressure | Runtime fail-stop; checkpoint reconciliation required on restart | Investigate disk/queue capacity; critical records are never silently dropped |
 
 ## Operator Controls
 
-- A symbol halt blocks new orders for that symbol and generates cancellation
-  intents for its live orders through the event loop.
-- The global kill switch blocks all new orders. Cancels remain permitted.
-- Reset is a separate typed event. Do not reset until feeds are ready, private
-  reconciliation is clean, exposure is within limits, and the initiating cause
-  is understood.
+- The enabled operator service binds only a Unix-domain socket, refuses to
+  replace a non-socket path, and changes the socket mode to `0600`.
+- Requests are bounded JSON lines signed with HMAC-SHA256 using the secret named
+  by `operator.token_env`. The signed payload includes protocol version,
+  request ID, timestamp, nonce, and command. Stale timestamps, reused nonces,
+  invalid signatures, oversized requests, and control-channel backpressure are
+  rejected. Responses are signed and verified by the CLI before acceptance is
+  displayed.
+- Socket parsing and authentication run outside the strategy loop. Accepted
+  commands enter a bounded channel and are reduced by the same single writer as
+  exchange events. Mutations are persisted as normalized/system records with
+  their request ID.
+- Available commands are read-only `status`, global `kill`, symbol `halt`,
+  symbol `resume`, and reconciled `shutdown`. A live global kill reset is not
+  exposed; restart only after the initiating cause and account state are
+  reviewed.
+
+Supply the same secret to the runtime and operator shell through the deployment
+secret provider. It must contain at least 32 bytes:
+
+```bash
+export REAP_OPERATOR_TOKEN=...
+cargo run -p reap-cli -- operator \
+  --config examples/live-okx-demo.toml \
+  status --pretty
+cargo run -p reap-cli -- operator \
+  --config examples/live-okx-demo.toml \
+  halt --symbol BTC-USDT --reason "manual market pause"
+cargo run -p reap-cli -- operator \
+  --config examples/live-okx-demo.toml \
+  resume --symbol BTC-USDT --reason "market reviewed"
+cargo run -p reap-cli -- operator \
+  --config examples/live-okx-demo.toml \
+  kill --reason "unexpected exposure"
+cargo run -p reap-cli -- operator \
+  --config examples/live-okx-demo.toml \
+  shutdown --reason "planned deployment stop"
+```
+
+Synchronize the host clock: signed requests outside `max_clock_skew_ms` are
+rejected. Observe mode remains exchange-read-only, so kill/halt events update
+local state but cannot cancel exchange orders.
 
 Control and health events must be captured as normalized records so the exact
 live decision path can be replayed.
@@ -138,11 +174,13 @@ of these invariants hold:
   operator signal, ended the run;
 - the runtime reached `ready` and `readiness_at_stop` is still `ready`;
 - no `ReconcileDrift` event or best-effort storage drop occurred; and
+- no authenticated operator mutation occurred; and
 - demo shutdown resolved every active canonical order.
 
 The report also records time-to-ready, recovered readiness losses and maximum
 outage, disconnects, stale-stream events, book recoveries, and the storage queue
-high-water mark. Recovered disconnects do not by themselves fail acceptance,
+high-water mark. It also reports authenticated operator commands and mutations.
+Recovered disconnects do not by themselves fail acceptance,
 but their counts must match the injected fault plan. In demo mode the final
 `readiness` may be degraded by the deliberate shutdown kill switch; acceptance
 uses the pre-shutdown `readiness_at_stop` snapshot.

@@ -27,9 +27,10 @@ use tokio::task::JoinHandle;
 
 use crate::{
     AccountBootstrapSnapshot, CancelAction, CoordinatorError, CoordinatorOutput, LiveAction,
-    LiveConfig, LiveConfigError, LiveCoordinator, ReadinessSnapshot, ReconcileAction,
+    LiveConfig, LiveConfigError, LiveCoordinator, OperatorCommand, OperatorEnvelope, OperatorError,
+    OperatorResponse, OperatorService, OperatorStatus, ReadinessSnapshot, ReconcileAction,
     ReconciliationResult, StartupGate, SubmitAction, TradingEnvironment, VerifiedBootstrap,
-    okx_instrument_type, verify_bootstrap,
+    okx_instrument_type, start_operator_service, verify_bootstrap,
 };
 
 type LiveGateway = OkxOrderGateway<ReqwestTransport>;
@@ -54,6 +55,7 @@ pub struct LiveRunOptions {
 pub enum LiveStopReason {
     Validation,
     OperatorSignal,
+    OperatorCommand,
     DurationElapsed,
     ReadinessTimeout,
 }
@@ -71,6 +73,8 @@ pub struct LiveRunReport {
     pub book_recovery_events: u64,
     pub stream_stale_events: u64,
     pub connection_disconnect_events: u64,
+    pub operator_commands: u64,
+    pub operator_mutations: u64,
     pub max_storage_queue_depth: usize,
     pub readiness_at_stop: ReadinessSnapshot,
     pub readiness: ReadinessSnapshot,
@@ -103,10 +107,14 @@ pub enum LiveRuntimeError {
     Coordinator(#[from] CoordinatorError),
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error(transparent)]
+    Operator(#[from] OperatorError),
     #[error("storage remained unavailable during graceful shutdown: {0}")]
     ShutdownStorage(String),
     #[error("runtime event channel closed")]
     EventChannelClosed,
+    #[error("operator command channel closed")]
+    OperatorChannelClosed,
     #[error("order command queue for account {0} is unavailable or full")]
     OrderQueueUnavailable(String),
     #[error("graceful shutdown generated an unsafe new-order action")]
@@ -144,6 +152,8 @@ struct RuntimeEvidence {
     book_recovery_events: u64,
     stream_stale_events: u64,
     connection_disconnect_events: u64,
+    operator_commands: u64,
+    operator_mutations: u64,
     max_storage_queue_depth: usize,
 }
 
@@ -235,6 +245,7 @@ fn qualifies_as_clean_soak(
         && outcome.reached_ready
         && outcome.readiness_at_stop.is_ready()
         && evidence.reconciliation_drift_events == 0
+        && evidence.operator_mutations == 0
         && dropped_storage_records == 0
         && active_orders_after_shutdown == 0
 }
@@ -294,6 +305,8 @@ pub async fn run_live(
             book_recovery_events: 0,
             stream_stale_events: 0,
             connection_disconnect_events: 0,
+            operator_commands: 0,
+            operator_mutations: 0,
             max_storage_queue_depth: 0,
             readiness_at_stop: readiness.clone(),
             readiness,
@@ -542,6 +555,9 @@ struct LiveRuntime {
     shutdown_storage_error: Option<String>,
     shutdown_reconciliation_requested: HashSet<String>,
     shutdown_reconciled_accounts: HashSet<String>,
+    operator_service: Option<OperatorService>,
+    operator_rx: Option<mpsc::Receiver<OperatorEnvelope>>,
+    operator_shutdown_reason: Option<String>,
 }
 
 impl LiveRuntime {
@@ -550,6 +566,8 @@ impl LiveRuntime {
         mode: LiveMode,
         run_duration: Option<Duration>,
     ) -> Result<Self, LiveRuntimeError> {
+        let operator_config = config.operator.clone();
+        let operator_secret = operator_config.secret_from_env()?;
         let config_fingerprint = config.fingerprint()?;
         let recovered = recover_jsonl(&config.storage.path)?;
         for (account_id, (strategy_name, fingerprint)) in &recovered.bootstrap_identities {
@@ -828,23 +846,49 @@ impl LiveRuntime {
             shutdown_storage_error: None,
             shutdown_reconciliation_requested: HashSet::new(),
             shutdown_reconciled_accounts: HashSet::new(),
+            operator_service: None,
+            operator_rx: None,
+            operator_shutdown_reason: None,
         };
         for output in initial_outputs {
             if let Err(primary) = runtime.commit_output(output) {
                 let context = format!("runtime initialization failure: {primary}");
-                let stop_result = runtime.graceful_stop(&context).await;
-                let shutdown_result = runtime.shutdown().await;
-                let mut additional = Vec::new();
-                if let Err(error) = stop_result {
-                    additional.push(("fail-closed cleanup", error));
+                return Err(runtime.close_after_error(primary, &context).await);
+            }
+        }
+        if let Some(secret) = operator_secret {
+            let (operator_tx, operator_rx) =
+                mpsc::channel(operator_config.command_channel_capacity);
+            match start_operator_service(&operator_config, secret, operator_tx).await {
+                Ok(service) => {
+                    runtime.operator_service = Some(service);
+                    runtime.operator_rx = Some(operator_rx);
                 }
-                if let Err(error) = shutdown_result {
-                    additional.push(("runtime teardown", error));
+                Err(error) => {
+                    let primary = LiveRuntimeError::Operator(error);
+                    let context = format!("operator service startup failure: {primary}");
+                    return Err(runtime.close_after_error(primary, &context).await);
                 }
-                return Err(combine_lifecycle_errors(primary, additional));
             }
         }
         Ok(runtime)
+    }
+
+    async fn close_after_error(
+        &mut self,
+        primary: LiveRuntimeError,
+        context: &str,
+    ) -> LiveRuntimeError {
+        let stop_result = self.graceful_stop(context).await;
+        let shutdown_result = self.shutdown().await;
+        let mut additional = Vec::new();
+        if let Err(error) = stop_result {
+            additional.push(("fail-closed cleanup", error));
+        }
+        if let Err(error) = shutdown_result {
+            additional.push(("runtime teardown", error));
+        }
+        combine_lifecycle_errors(primary, additional)
     }
 
     async fn run(mut self) -> Result<LiveRunReport, LiveRuntimeError> {
@@ -852,6 +896,10 @@ impl LiveRuntime {
         let stop_context = match &loop_result {
             Ok(outcome) => match outcome.stop_reason {
                 LiveStopReason::OperatorSignal => "operator signal".to_string(),
+                LiveStopReason::OperatorCommand => self
+                    .operator_shutdown_reason
+                    .clone()
+                    .unwrap_or_else(|| "authenticated operator command".to_string()),
                 LiveStopReason::DurationElapsed => "bounded duration elapsed".to_string(),
                 LiveStopReason::ReadinessTimeout => "bounded readiness timeout".to_string(),
                 LiveStopReason::Validation => "validation".to_string(),
@@ -907,6 +955,8 @@ impl LiveRuntime {
             book_recovery_events: evidence.book_recovery_events,
             stream_stale_events: evidence.stream_stale_events,
             connection_disconnect_events: evidence.connection_disconnect_events,
+            operator_commands: evidence.operator_commands,
+            operator_mutations: evidence.operator_mutations,
             max_storage_queue_depth: evidence.max_storage_queue_depth,
             readiness_at_stop: outcome.readiness_at_stop,
             readiness,
@@ -963,6 +1013,10 @@ impl LiveRuntime {
                     let event = event.ok_or(LiveRuntimeError::EventChannelClosed)?;
                     self.handle_runtime_event(event)?;
                 }
+                operator = receive_operator(&mut self.operator_rx) => {
+                    let operator = operator.ok_or(LiveRuntimeError::OperatorChannelClosed)?;
+                    self.handle_operator_envelope(operator)?;
+                }
                 _ = timer.tick() => {
                     let now_ms = unix_time_ms();
                     for event in self.processor.mark_stale(
@@ -991,6 +1045,13 @@ impl LiveRuntime {
             if readiness.phase != last_phase {
                 tracing::info!(from = ?last_phase, to = ?readiness.phase, ?readiness, "live readiness changed");
                 last_phase = readiness.phase;
+            }
+            if self.operator_shutdown_reason.is_some() {
+                return Ok(readiness_tracker.finish(
+                    LiveStopReason::OperatorCommand,
+                    elapsed_ms,
+                    readiness,
+                ));
             }
             if !readiness_tracker.reached_ready
                 && started.elapsed() > Duration::from_millis(self.readiness_timeout_ms)
@@ -1150,6 +1211,146 @@ impl LiveRuntime {
             }
         }
         Ok(())
+    }
+
+    fn handle_operator_envelope(
+        &mut self,
+        envelope: OperatorEnvelope,
+    ) -> Result<(), LiveRuntimeError> {
+        let OperatorEnvelope {
+            request_id,
+            command,
+            response,
+        } = envelope;
+        self.evidence.operator_commands = self.evidence.operator_commands.saturating_add(1);
+        let result = self.execute_operator_command(&request_id, command);
+        match result {
+            Ok(operator_response) => {
+                let _ = response.send(operator_response);
+                Ok(())
+            }
+            Err(error) => {
+                let _ = response.send(OperatorResponse::rejected(
+                    request_id,
+                    format!("operator command failed: {error}"),
+                ));
+                Err(error)
+            }
+        }
+    }
+
+    fn execute_operator_command(
+        &mut self,
+        request_id: &str,
+        command: OperatorCommand,
+    ) -> Result<OperatorResponse, LiveRuntimeError> {
+        match command {
+            OperatorCommand::Status => Ok(OperatorResponse::accepted(
+                request_id,
+                "runtime status",
+                Some(self.operator_status()),
+            )),
+            OperatorCommand::KillSwitch { reason } => {
+                self.coordinator.set_order_entry_enabled(false);
+                self.commit_operator_system_event(
+                    request_id,
+                    SystemEventKind::KillSwitchActivated,
+                    None,
+                    reason,
+                )?;
+                self.evidence.operator_mutations =
+                    self.evidence.operator_mutations.saturating_add(1);
+                Ok(OperatorResponse::accepted(
+                    request_id,
+                    "kill switch activated",
+                    Some(self.operator_status()),
+                ))
+            }
+            OperatorCommand::HaltSymbol { symbol, reason } => {
+                if !self.coordinator.manages_symbol(&symbol) {
+                    return Ok(OperatorResponse::rejected(
+                        request_id,
+                        format!("symbol {symbol} is not managed by this runtime"),
+                    ));
+                }
+                self.commit_operator_system_event(
+                    request_id,
+                    SystemEventKind::SymbolHalted,
+                    Some(symbol),
+                    reason,
+                )?;
+                self.evidence.operator_mutations =
+                    self.evidence.operator_mutations.saturating_add(1);
+                Ok(OperatorResponse::accepted(
+                    request_id,
+                    "symbol halted",
+                    Some(self.operator_status()),
+                ))
+            }
+            OperatorCommand::ResumeSymbol { symbol, reason } => {
+                if !self.coordinator.manages_symbol(&symbol) {
+                    return Ok(OperatorResponse::rejected(
+                        request_id,
+                        format!("symbol {symbol} is not managed by this runtime"),
+                    ));
+                }
+                self.commit_operator_system_event(
+                    request_id,
+                    SystemEventKind::SymbolResumed,
+                    Some(symbol),
+                    reason,
+                )?;
+                self.evidence.operator_mutations =
+                    self.evidence.operator_mutations.saturating_add(1);
+                Ok(OperatorResponse::accepted(
+                    request_id,
+                    "symbol resumed",
+                    Some(self.operator_status()),
+                ))
+            }
+            OperatorCommand::Shutdown { reason } => {
+                self.coordinator.set_order_entry_enabled(false);
+                self.evidence.operator_mutations =
+                    self.evidence.operator_mutations.saturating_add(1);
+                self.operator_shutdown_reason = Some(format!(
+                    "authenticated operator shutdown {request_id}: {reason}"
+                ));
+                Ok(OperatorResponse::accepted(
+                    request_id,
+                    "graceful shutdown accepted",
+                    Some(self.operator_status()),
+                ))
+            }
+        }
+    }
+
+    fn commit_operator_system_event(
+        &mut self,
+        request_id: &str,
+        kind: SystemEventKind,
+        symbol: Option<String>,
+        reason: String,
+    ) -> Result<(), LiveRuntimeError> {
+        let output = self
+            .coordinator
+            .process_event(NormalizedEvent::System(SystemEvent {
+                ts_ms: unix_time_ms(),
+                kind,
+                venue: None,
+                account_id: None,
+                symbol,
+                reason: format!("authenticated operator request {request_id}: {reason}"),
+            }));
+        self.commit_output(output)
+    }
+
+    fn operator_status(&self) -> OperatorStatus {
+        OperatorStatus {
+            readiness: self.coordinator.readiness(),
+            active_orders: self.coordinator.active_order_count(),
+            shutdown_in_progress: self.shutdown_in_progress
+                || self.operator_shutdown_reason.is_some(),
+        }
     }
 
     fn handle_runtime_event(&mut self, event: RuntimeEvent) -> Result<(), LiveRuntimeError> {
@@ -1432,7 +1633,7 @@ impl LiveRuntime {
         if !self.cancel_inflight.insert(cancel_key.clone()) {
             return Ok(());
         }
-        self.record_storage(StorageRecord::OrderRequest(OrderRequestRecord {
+        if let Err(error) = self.record_storage(StorageRecord::OrderRequest(OrderRequestRecord {
             ts_ms: action.ts_ms,
             account_id: action.account_id.clone(),
             operation: OrderOperation::Cancel,
@@ -1440,8 +1641,17 @@ impl LiveRuntime {
             client_order_id: Some(action.client_order_id.clone()),
             exchange_order_id: None,
             symbol: action.symbol.clone(),
-        }))?;
-        let sender = self.order_sender(&action.account_id)?.clone();
+        })) {
+            self.cancel_inflight.remove(&cancel_key);
+            return Err(error);
+        }
+        let sender = match self.order_sender(&action.account_id) {
+            Ok(sender) => sender.clone(),
+            Err(error) => {
+                self.cancel_inflight.remove(&cancel_key);
+                return Err(error);
+            }
+        };
         if sender.send(OrderTaskCommand::Cancel(action)).await.is_err() {
             self.cancel_inflight.remove(&cancel_key);
             return Err(LiveRuntimeError::OrderQueueUnavailable(cancel_key.0));
@@ -1487,23 +1697,34 @@ impl LiveRuntime {
             }
             LiveAction::Cancel(action) => {
                 let cancel_key = (action.account_id.clone(), action.client_order_id.clone());
-                if !self.cancel_inflight.insert(cancel_key) {
+                if !self.cancel_inflight.insert(cancel_key.clone()) {
                     return Ok(());
                 }
-                self.record_storage(StorageRecord::OrderRequest(OrderRequestRecord {
-                    ts_ms: action.ts_ms,
-                    account_id: action.account_id.clone(),
-                    operation: OrderOperation::Cancel,
-                    idempotency_key: None,
-                    client_order_id: Some(action.client_order_id.clone()),
-                    exchange_order_id: None,
-                    symbol: action.symbol.clone(),
-                }))?;
-                self.order_sender(&action.account_id)?
-                    .try_send(OrderTaskCommand::Cancel(action))
-                    .map_err(|_| {
-                        LiveRuntimeError::OrderQueueUnavailable("cancel account queue".to_string())
-                    })?;
+                if let Err(error) =
+                    self.record_storage(StorageRecord::OrderRequest(OrderRequestRecord {
+                        ts_ms: action.ts_ms,
+                        account_id: action.account_id.clone(),
+                        operation: OrderOperation::Cancel,
+                        idempotency_key: None,
+                        client_order_id: Some(action.client_order_id.clone()),
+                        exchange_order_id: None,
+                        symbol: action.symbol.clone(),
+                    }))
+                {
+                    self.cancel_inflight.remove(&cancel_key);
+                    return Err(error);
+                }
+                let sender = match self.order_sender(&action.account_id) {
+                    Ok(sender) => sender.clone(),
+                    Err(error) => {
+                        self.cancel_inflight.remove(&cancel_key);
+                        return Err(error);
+                    }
+                };
+                if sender.try_send(OrderTaskCommand::Cancel(action)).is_err() {
+                    self.cancel_inflight.remove(&cancel_key);
+                    return Err(LiveRuntimeError::OrderQueueUnavailable(cancel_key.0));
+                }
             }
             LiveAction::RecoverBook(request) => {
                 let routes = self.feeds[self.public_feed_index].request_recovery(&request);
@@ -1674,6 +1895,11 @@ impl LiveRuntime {
     }
 
     async fn shutdown(&mut self) -> Result<(), LiveRuntimeError> {
+        let operator_result = match self.operator_service.take() {
+            Some(service) => service.shutdown().await.map_err(LiveRuntimeError::from),
+            None => Ok(()),
+        };
+        self.operator_rx.take();
         for sender in self.order_senders.values() {
             let _ = sender.try_send(OrderTaskCommand::Shutdown);
         }
@@ -1692,6 +1918,7 @@ impl LiveRuntime {
         if let Some(storage) = self.storage.take() {
             storage.shutdown().await?;
         }
+        operator_result?;
         Ok(())
     }
 }
@@ -2231,6 +2458,15 @@ fn elapsed_ms(started: &Instant) -> u64 {
     started.elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
+async fn receive_operator(
+    receiver: &mut Option<mpsc::Receiver<OperatorEnvelope>>,
+) -> Option<OperatorEnvelope> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 #[cfg(unix)]
 async fn shutdown_signal() -> Result<(), std::io::Error> {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -2298,6 +2534,7 @@ mod tests {
             venue: OkxVenueConfig::default(),
             runtime: RuntimeConfig::default(),
             storage: LiveStorageConfig::default(),
+            operator: crate::OperatorConfig::default(),
             accounts: vec![LiveAccountConfig {
                 id: "main".to_string(),
                 api_key_env: "KEY".to_string(),
@@ -2648,6 +2885,9 @@ mod tests {
             shutdown_storage_error: None,
             shutdown_reconciliation_requested: HashSet::new(),
             shutdown_reconciled_accounts: HashSet::new(),
+            operator_service: None,
+            operator_rx: None,
+            operator_shutdown_reason: None,
         };
 
         let report = runtime.run().await.unwrap();
@@ -2664,6 +2904,134 @@ mod tests {
         assert_eq!(report.dropped_storage_records, 0);
         assert_eq!(report.active_orders_after_shutdown, 0);
         assert!(report.clean_soak);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn authenticated_operator_commands_run_on_event_loop_and_shutdown_cleanly() {
+        use crate::operator::send_operator_command_with_secret;
+
+        const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
+
+        let config = config();
+        let now_ms = unix_time_ms();
+        let coordinator = ready_coordinator(&config, now_ms, false);
+        let storage_path = std::env::temp_dir().join(format!(
+            "reap-operator-runtime-{}-{}.jsonl",
+            std::process::id(),
+            unix_time_ns()
+        ));
+        let socket_path = std::env::temp_dir().join(format!(
+            "reap-operator-runtime-{}-{}.sock",
+            std::process::id(),
+            unix_time_ns()
+        ));
+        let operator_config = crate::OperatorConfig {
+            enabled: true,
+            socket_path: socket_path.clone(),
+            request_timeout_ms: 1_000,
+            ..crate::OperatorConfig::default()
+        };
+        let storage = start_jsonl_storage(StorageConfig {
+            path: storage_path.clone(),
+            channel_capacity: 1_024,
+            flush_every_records: 1,
+        })
+        .await
+        .unwrap();
+        let storage_sink = storage.sink();
+        let (control_tx, control_rx) = mpsc::channel(16);
+        let (feed_tx, feed_rx) = mpsc::channel(16);
+        let (operator_tx, operator_rx) = mpsc::channel(16);
+        let operator_service =
+            start_operator_service(&operator_config, SECRET.to_vec(), operator_tx)
+                .await
+                .unwrap();
+        let runtime = LiveRuntime {
+            mode: LiveMode::Observe,
+            run_duration: None,
+            coordinator,
+            processor: FeedProcessor::new(16, 16),
+            storage: Some(storage),
+            storage_sink,
+            control_rx,
+            feed_rx,
+            order_senders: HashMap::new(),
+            order_tasks: Vec::new(),
+            feeds: Vec::new(),
+            feed_tasks: Vec::new(),
+            sources: Vec::new(),
+            public_feed_index: 0,
+            reconcile_inflight: HashSet::new(),
+            cancel_inflight: HashSet::new(),
+            last_reconcile_attempt: HashMap::new(),
+            readiness_timeout_ms: 1_000,
+            timer_interval_ms: 100,
+            max_feed_age_ms: 60_000,
+            shutdown_timeout_ms: 1_000,
+            evidence: RuntimeEvidence::default(),
+            shutdown_in_progress: false,
+            shutdown_storage_error: None,
+            shutdown_reconciliation_requested: HashSet::new(),
+            shutdown_reconciled_accounts: HashSet::new(),
+            operator_service: Some(operator_service),
+            operator_rx: Some(operator_rx),
+            operator_shutdown_reason: None,
+        };
+        let runtime_task = tokio::spawn(runtime.run());
+
+        let status =
+            send_operator_command_with_secret(&operator_config, SECRET, OperatorCommand::Status)
+                .await
+                .unwrap();
+        assert!(status.ok);
+        assert!(status.status.unwrap().readiness.is_ready());
+
+        let halt = send_operator_command_with_secret(
+            &operator_config,
+            SECRET,
+            OperatorCommand::HaltSymbol {
+                symbol: "BTC-USDT".to_string(),
+                reason: "integration test".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(halt.ok);
+        let resume = send_operator_command_with_secret(
+            &operator_config,
+            SECRET,
+            OperatorCommand::ResumeSymbol {
+                symbol: "BTC-USDT".to_string(),
+                reason: "integration test".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(resume.ok);
+        let shutdown = send_operator_command_with_secret(
+            &operator_config,
+            SECRET,
+            OperatorCommand::Shutdown {
+                reason: "integration test complete".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(shutdown.ok);
+        assert!(shutdown.status.unwrap().shutdown_in_progress);
+
+        let report = runtime_task.await.unwrap().unwrap();
+        drop(control_tx);
+        drop(feed_tx);
+        let _ = std::fs::remove_file(storage_path);
+
+        assert_eq!(report.stop_reason, LiveStopReason::OperatorCommand);
+        assert_eq!(report.operator_commands, 4);
+        assert_eq!(report.operator_mutations, 3);
+        assert_eq!(report.active_orders_after_shutdown, 0);
+        assert!(!report.clean_soak);
+        assert!(!socket_path.exists());
     }
 
     #[tokio::test]
@@ -2756,7 +3124,7 @@ mod tests {
             .send(RuntimeEvent::Fatal("injected runtime failure".to_string()))
             .await
             .unwrap();
-        let runtime = LiveRuntime {
+        let mut runtime = LiveRuntime {
             mode: LiveMode::Demo,
             run_duration: None,
             coordinator,
@@ -2783,7 +3151,22 @@ mod tests {
             shutdown_storage_error: None,
             shutdown_reconciliation_requested: HashSet::new(),
             shutdown_reconciled_accounts: HashSet::new(),
+            operator_service: None,
+            operator_rx: None,
+            operator_shutdown_reason: None,
         };
+
+        assert!(matches!(
+            runtime.dispatch_action(LiveAction::Cancel(CancelAction {
+                ts_ms: unix_time_ms(),
+                account_id: "main".to_string(),
+                symbol: "BTC-USDT".to_string(),
+                client_order_id: "client-live".to_string(),
+                reason: "injected pre-shutdown storage failure".to_string(),
+            })),
+            Err(LiveRuntimeError::Storage(StorageError::Closed))
+        ));
+        assert!(runtime.cancel_inflight.is_empty());
 
         let error = runtime.run().await.unwrap_err();
         drop(control_tx);

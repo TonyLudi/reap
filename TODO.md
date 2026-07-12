@@ -85,6 +85,8 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Make every demo exit disable new submits while preserving cancellation,
   then require zero active orders and post-cancel REST reconciliation even when
   storage has failed.
+- [x] Add a bounded Unix-socket operator service with environment-keyed HMAC,
+  freshness/replay checks, status, kill, symbol halt/resume, and graceful stop.
 - [ ] Complete an OKX demo soak with no unexplained reconciliation drift.
 
 Completed-step evidence is documented in [README.md](README.md),

@@ -167,6 +167,10 @@ impl LiveCoordinator {
         self.order_entry_enabled = enabled;
     }
 
+    pub fn manages_symbol(&self, symbol: &str) -> bool {
+        self.config.account_for_symbol(symbol).is_some()
+    }
+
     pub fn mark_storage_ready(&mut self, ready: bool, reason: impl Into<String>) {
         self.startup.mark_storage(ready, reason);
     }
@@ -852,6 +856,7 @@ mod tests {
             venue: OkxVenueConfig::default(),
             runtime: RuntimeConfig::default(),
             storage: LiveStorageConfig::default(),
+            operator: crate::OperatorConfig::default(),
             accounts: vec![LiveAccountConfig {
                 id: "main".to_string(),
                 api_key_env: "KEY".to_string(),

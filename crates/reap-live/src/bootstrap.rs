@@ -383,6 +383,7 @@ mod tests {
             venue: OkxVenueConfig::default(),
             runtime: RuntimeConfig::default(),
             storage: LiveStorageConfig::default(),
+            operator: crate::OperatorConfig::default(),
             accounts: vec![LiveAccountConfig {
                 id: "main".to_string(),
                 api_key_env: "KEY".to_string(),

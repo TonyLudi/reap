@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use reap_backtest::BacktestRunner;
-use reap_live::{LiveMode, LiveRunOptions};
+use reap_live::{LiveConfig, LiveMode, LiveRunOptions, OperatorCommand, send_operator_command};
 use reap_strategy::ChaosConfig;
 
 #[derive(Debug, Parser)]
@@ -59,6 +59,51 @@ enum Command {
         #[arg(long)]
         pretty: bool,
     },
+    Operator {
+        #[arg(short, long)]
+        config: PathBuf,
+        #[command(subcommand)]
+        command: OperatorCliCommand,
+        #[arg(long, global = true)]
+        pretty: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OperatorCliCommand {
+    Status,
+    Kill {
+        #[arg(long)]
+        reason: String,
+    },
+    Halt {
+        #[arg(long)]
+        symbol: String,
+        #[arg(long)]
+        reason: String,
+    },
+    Resume {
+        #[arg(long)]
+        symbol: String,
+        #[arg(long)]
+        reason: String,
+    },
+    Shutdown {
+        #[arg(long)]
+        reason: String,
+    },
+}
+
+impl From<OperatorCliCommand> for OperatorCommand {
+    fn from(value: OperatorCliCommand) -> Self {
+        match value {
+            OperatorCliCommand::Status => Self::Status,
+            OperatorCliCommand::Kill { reason } => Self::KillSwitch { reason },
+            OperatorCliCommand::Halt { symbol, reason } => Self::HaltSymbol { symbol, reason },
+            OperatorCliCommand::Resume { symbol, reason } => Self::ResumeSymbol { symbol, reason },
+            OperatorCliCommand::Shutdown { reason } => Self::Shutdown { reason },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -166,6 +211,23 @@ async fn main() -> Result<()> {
             }
             if require_clean_soak && !report.clean_soak {
                 anyhow::bail!("bounded live soak did not satisfy clean acceptance invariants");
+            }
+        }
+        Command::Operator {
+            config,
+            command,
+            pretty,
+        } => {
+            let config = LiveConfig::load(&config)
+                .with_context(|| format!("failed to load live config {}", config.display()))?;
+            let response = send_operator_command(&config.operator, command.into()).await?;
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                println!("{}", serde_json::to_string(&response)?);
+            }
+            if !response.ok {
+                anyhow::bail!("operator command was rejected: {}", response.message);
             }
         }
     }

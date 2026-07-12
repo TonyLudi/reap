@@ -102,6 +102,17 @@ path = "var/reap/demo-events.jsonl"
 channel_capacity = 65536
 flush_every_records = 1
 
+[operator]
+enabled = true
+socket_path = "var/reap/demo-operator.sock"
+token_env = "REAP_OPERATOR_TOKEN"
+max_clock_skew_ms = 5000
+nonce_ttl_ms = 60000
+nonce_capacity = 4096
+request_timeout_ms = 2000
+max_request_bytes = 4096
+command_channel_capacity = 64
+
 [[accounts]]
 id = "main"
 api_key_env = "REAP_OKX_API_KEY"

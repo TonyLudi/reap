@@ -64,7 +64,15 @@ cancel request:
 export REAP_OKX_API_KEY=...
 export REAP_OKX_SECRET_KEY=...
 export REAP_OKX_PASSPHRASE=...
+export REAP_OPERATOR_TOKEN=... # at least 32 bytes from the secret provider
 cargo run -p reap-cli -- live --config examples/live-okx-demo.toml --mode observe
+```
+
+From another shell with the same operator token, inspect or stop the runtime:
+
+```bash
+cargo run -p reap-cli -- operator --config examples/live-okx-demo.toml status --pretty
+cargo run -p reap-cli -- operator --config examples/live-okx-demo.toml shutdown --reason "planned stop"
 ```
 
 Run a bounded observe soak and return a non-zero status unless the runtime

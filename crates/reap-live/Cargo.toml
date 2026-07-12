@@ -8,6 +8,8 @@ name = "live_loop"
 harness = false
 
 [dependencies]
+base64.workspace = true
+hmac.workspace = true
 reap-core.workspace = true
 reap-engine.workspace = true
 reap-feed.workspace = true
