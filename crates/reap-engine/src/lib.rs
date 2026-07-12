@@ -1,8 +1,6 @@
 use std::collections::HashSet;
 
-use reap_core::{
-    NormalizedEvent, OrderIntent, StrategyEvent, SystemEvent, SystemEventKind, TimeMs,
-};
+use reap_core::{NormalizedEvent, OrderIntent, SystemEvent, SystemEventKind, TimeMs};
 use reap_risk::{RiskDecision, RiskGate};
 use reap_strategy::Strategy;
 
@@ -50,7 +48,14 @@ where
         let fail_closed = self.risk.is_killed()
             || event_requires_cancel(&event)
             || output.system_events.iter().any(system_requires_cancel);
-        let strategy_intents = self.strategy.on_event(&StrategyEvent::from(event.clone()));
+        let halted_symbol = match &event {
+            NormalizedEvent::System(system) if system.kind == SystemEventKind::SymbolHalted => {
+                system.symbol.clone()
+            }
+            _ => None,
+        };
+        let strategy_event = event.into_strategy_event();
+        let strategy_intents = self.strategy.on_owned_event(strategy_event);
         self.apply_risk(now_ms, strategy_intents, &mut output);
         if fail_closed {
             let existing_cancels = output
@@ -61,13 +66,7 @@ where
                     OrderIntent::NewOrder(_) => None,
                 })
                 .collect::<HashSet<_>>();
-            let halted_symbol = match &event {
-                NormalizedEvent::System(system) if system.kind == SystemEventKind::SymbolHalted => {
-                    system.symbol.as_deref()
-                }
-                _ => None,
-            };
-            let order_ids = match halted_symbol {
+            let order_ids = match halted_symbol.as_deref() {
                 Some(symbol) => self.risk.live_order_ids_for(symbol).collect::<Vec<_>>(),
                 None => self.risk.live_order_ids().collect::<Vec<_>>(),
             };
@@ -116,8 +115,8 @@ fn system_requires_cancel(event: &SystemEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use reap_core::{
-        FillLiquidity, NewOrder, OrderEvent, OrderStatus, OrderUpdate, Side, SystemEvent,
-        TimeInForce, TimerEvent, Venue,
+        FillLiquidity, NewOrder, OrderEvent, OrderStatus, OrderUpdate, Side, StrategyEvent,
+        SystemEvent, TimeInForce, TimerEvent, Venue,
     };
     use reap_risk::RiskLimits;
 

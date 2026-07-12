@@ -3,6 +3,10 @@ name = "reap-live"
 version.workspace = true
 edition.workspace = true
 
+[[bench]]
+name = "live_loop"
+harness = false
+
 [dependencies]
 reap-core.workspace = true
 reap-engine.workspace = true

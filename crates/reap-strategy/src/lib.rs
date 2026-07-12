@@ -9,4 +9,8 @@ use reap_core::{OrderIntent, StrategyEvent};
 
 pub trait Strategy {
     fn on_event(&mut self, event: &StrategyEvent) -> Vec<OrderIntent>;
+
+    fn on_owned_event(&mut self, event: StrategyEvent) -> Vec<OrderIntent> {
+        self.on_event(&event)
+    }
 }

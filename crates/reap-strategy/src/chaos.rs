@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -1038,6 +1039,7 @@ pub struct ChaosStrategy {
     burst: f64,
     burst_symbol: Option<Symbol>,
     best_hedges: HashMap<Side, Vec<HedgeLevel>>,
+    hedge_candidate_scratch: Vec<HedgeCandidate>,
     active_quotes: HashMap<(Symbol, Side, usize), ActiveQuote>,
     active_hedges: HashMap<String, ActiveHedge>,
     quote_targets: HashMap<(Symbol, Side), QuoteTargetState>,
@@ -1171,6 +1173,7 @@ impl ChaosStrategy {
             burst: 0.0,
             burst_symbol: None,
             best_hedges,
+            hedge_candidate_scratch: Vec::new(),
             active_quotes: HashMap::new(),
             active_hedges: HashMap::new(),
             quote_targets: HashMap::new(),
@@ -1235,6 +1238,14 @@ impl ChaosStrategy {
         self.now_ms = book.ts_ms;
         if let Some(entity) = self.entities.get_mut(&book.symbol) {
             entity.book = Some(book.clone());
+        }
+        self.refresh_quotes()
+    }
+
+    fn on_owned_depth(&mut self, book: OrderBook) -> Vec<OrderIntent> {
+        self.now_ms = book.ts_ms;
+        if let Some(entity) = self.entities.get_mut(book.symbol.as_str()) {
+            entity.book = Some(book);
         }
         self.refresh_quotes()
     }
@@ -1963,38 +1974,49 @@ impl ChaosStrategy {
         self.best_hedges.entry(Side::Buy).or_default().clear();
         self.best_hedges.entry(Side::Sell).or_default().clear();
 
+        let mut levels = std::mem::take(&mut self.hedge_candidate_scratch);
         let group_names: Vec<_> = self.risk_groups.keys().cloned().collect();
         for group_name in group_names {
+            let candidate_notional_limit = self
+                .hedge_selection_target(&group_name)
+                .unwrap_or(f64::INFINITY);
             for side in [Side::Buy, Side::Sell] {
-                let mut levels = Vec::new();
-                let symbols: Vec<_> = self
-                    .risk_groups
-                    .get(&group_name)
-                    .map(|rg| rg.symbols.iter().cloned().collect())
-                    .unwrap_or_default();
-                for symbol in symbols {
-                    let Some(entity) = self.entities.get(&symbol) else {
-                        continue;
-                    };
-                    if !entity.can_take(side) {
-                        continue;
+                levels.clear();
+                if let Some(rg) = self.risk_groups.get(&group_name) {
+                    for symbol in &rg.symbols {
+                        let Some(entity) = self.entities.get(symbol) else {
+                            continue;
+                        };
+                        if !entity.can_take(side) {
+                            continue;
+                        }
+                        let own_quotes = self
+                            .active_quotes
+                            .iter()
+                            .filter(|((quote_symbol, _, _), _)| quote_symbol == symbol)
+                            .map(|((_, quote_side, _), quote)| {
+                                (*quote_side, quote.price, quote.qty)
+                            })
+                            .collect::<Vec<_>>();
+                        entity.append_hedge_candidates(
+                            side,
+                            ref_mid,
+                            &own_quotes,
+                            candidate_notional_limit,
+                            &mut levels,
+                        );
                     }
-                    let own_quotes = self
-                        .active_quotes
-                        .iter()
-                        .filter(|((quote_symbol, _, _), _)| quote_symbol == &symbol)
-                        .map(|((_, quote_side, _), quote)| (*quote_side, quote.price, quote.qty))
-                        .collect::<Vec<_>>();
-                    levels.extend(entity.hedge_levels(side, ref_mid, &own_quotes));
                 }
 
-                sort_hedge_levels(side, &mut levels);
-                let selected = self.select_required_hedges(&group_name, side, levels);
+                sort_hedge_candidates(side, &mut levels);
+                let selected = self.select_required_hedges(&group_name, side, &levels);
                 if let Some(rg) = self.risk_groups.get_mut(&group_name) {
                     rg.best_hedges.insert(side, selected);
                 }
             }
         }
+        levels.clear();
+        self.hedge_candidate_scratch = levels;
 
         if self.risk_groups.len() == 1 {
             if let Some(rg) = self.risk_groups.values().next() {
@@ -2120,30 +2142,22 @@ impl ChaosStrategy {
         &self,
         group_name: &str,
         _side: Side,
-        levels: Vec<HedgeLevel>,
+        levels: &[HedgeCandidate],
     ) -> Vec<HedgeLevel> {
         let Some(rg) = self.risk_groups.get(group_name) else {
-            return levels;
+            return levels.iter().map(HedgeCandidate::to_owned_level).collect();
         };
-        let hedge_required_for_quote = rg
-            .symbols
-            .iter()
-            .filter_map(|symbol| self.entities.get(symbol))
-            .map(|entity| entity.config.max_order_size_usd)
-            .sum::<f64>()
-            * 2.0;
-        let min_hedge_usd = self.config.delta_limit_usd.min(hedge_required_for_quote);
-        let delta_need =
-            self.delta_usd.abs().max(self.pending_delta_usd.abs()) * HEDGE_VOL_TO_DELTA_RATIO;
-        let target = min_hedge_usd.max(delta_need);
+        let target = self
+            .hedge_selection_target(group_name)
+            .unwrap_or(f64::INFINITY);
 
         let mut selected = Vec::new();
         let mut total = 0.0;
-        let mut per_symbol: HashMap<Symbol, f64> = HashMap::new();
+        let mut per_symbol: HashMap<&str, f64> = HashMap::new();
         for level in levels {
             total += level.notional_usd;
-            *per_symbol.entry(level.symbol.clone()).or_default() += level.notional_usd;
-            selected.push(level);
+            *per_symbol.entry(level.symbol.as_ref()).or_default() += level.notional_usd;
+            selected.push(level.to_owned_level());
             if total >= target
                 && all_symbols_have_hedge(
                     &per_symbol,
@@ -2156,6 +2170,21 @@ impl ChaosStrategy {
             }
         }
         selected
+    }
+
+    fn hedge_selection_target(&self, group_name: &str) -> Option<f64> {
+        let rg = self.risk_groups.get(group_name)?;
+        let hedge_required_for_quote = rg
+            .symbols
+            .iter()
+            .filter_map(|symbol| self.entities.get(symbol))
+            .map(|entity| entity.config.max_order_size_usd)
+            .sum::<f64>()
+            * 2.0;
+        let min_hedge_usd = self.config.delta_limit_usd.min(hedge_required_for_quote);
+        let delta_need =
+            self.delta_usd.abs().max(self.pending_delta_usd.abs()) * HEDGE_VOL_TO_DELTA_RATIO;
+        Some(min_hedge_usd.max(delta_need))
     }
 
     fn update_theo_quotes(&mut self) {
@@ -2200,17 +2229,25 @@ impl ChaosStrategy {
     }
 
     fn update_theo_for_symbol(&mut self, symbol: &str, side: Side, hedges: &[HedgeLevel]) {
-        let Some(ref_mid) = self.ref_mid() else {
-            return;
-        };
-        let Some(pricing_entity) = self.entities.get(symbol).cloned() else {
-            return;
-        };
-        if pricing_entity.quote_profit_margin() >= 1.0 {
-            if let Some(entity) = self.entities.get_mut(symbol) {
-                entity.clear_theo(side);
+        let quote = self.calculate_theo_for_symbol(symbol, side, hedges);
+        if let Some(entity) = self.entities.get_mut(symbol) {
+            match quote {
+                Some(quote) => entity.set_theo(side, quote),
+                None => entity.clear_theo(side),
             }
-            return;
+        }
+    }
+
+    fn calculate_theo_for_symbol(
+        &self,
+        symbol: &str,
+        side: Side,
+        hedges: &[HedgeLevel],
+    ) -> Option<TheoQuote> {
+        let ref_mid = self.ref_mid()?;
+        let pricing_entity = self.entities.get(symbol)?;
+        if pricing_entity.quote_profit_margin() >= 1.0 {
+            return None;
         }
 
         let mut px_by_hedge = 0.0;
@@ -2231,7 +2268,7 @@ impl ChaosStrategy {
             }
 
             let current_px =
-                price_by_hedge(side, &pricing_entity, hedge_entity, hedge_level, ref_mid);
+                price_by_hedge(side, pricing_entity, hedge_entity, hedge_level, ref_mid);
             if !current_px.is_finite() || current_px <= 0.0 {
                 continue;
             }
@@ -2301,23 +2338,15 @@ impl ChaosStrategy {
             let quote_px = pricing_entity.px_within_limit(side, passive_px);
             let quote_qty = pricing_entity.quote_qty_from_usd(quote_size_usd, ref_mid);
 
-            if let Some(entity) = self.entities.get_mut(symbol) {
-                entity.set_theo(
-                    side,
-                    TheoQuote {
-                        price: quote_px,
-                        qty: quote_qty,
-                        hedge_symbol: best_hedge_symbol,
-                        hedge_px: single_weighted_px(weighted_hedge_px_by_symbol),
-                    },
-                );
-            }
-            return;
+            return Some(TheoQuote {
+                price: quote_px,
+                qty: quote_qty,
+                hedge_symbol: best_hedge_symbol,
+                hedge_px: single_weighted_px(weighted_hedge_px_by_symbol),
+            });
         }
 
-        if let Some(entity) = self.entities.get_mut(symbol) {
-            entity.clear_theo(side);
-        }
+        None
     }
 
     fn calculate_total_pos_skew_adj(
@@ -2907,17 +2936,21 @@ impl ChaosStrategy {
         let Some(entity) = self.entities.get_mut(symbol) else {
             return Vec::new();
         };
-        match event.kind {
-            SystemEventKind::SymbolHalted => entity.system_halted = true,
-            SystemEventKind::SymbolResumed => entity.system_halted = false,
+        let changed = match event.kind {
+            SystemEventKind::SymbolHalted => update_flag(&mut entity.system_halted, true),
+            SystemEventKind::SymbolResumed => update_flag(&mut entity.system_halted, false),
             SystemEventKind::FeedStale
             | SystemEventKind::FeedGap
             | SystemEventKind::BookRecoveryStarted
-            | SystemEventKind::BookRecoveryFailed => entity.feed_stale = true,
+            | SystemEventKind::BookRecoveryFailed => update_flag(&mut entity.feed_stale, true),
             SystemEventKind::FeedHeartbeat | SystemEventKind::FeedRecovered => {
                 entity.feed_stale = false;
+                return Vec::new();
             }
             _ => return Vec::new(),
+        };
+        if !changed {
+            return Vec::new();
         }
         self.refresh_quotes()
     }
@@ -2941,11 +2974,19 @@ impl Strategy for ChaosStrategy {
             StrategyEvent::Control(_) => Vec::new(),
         }
     }
+
+    fn on_owned_event(&mut self, event: StrategyEvent) -> Vec<OrderIntent> {
+        match event {
+            StrategyEvent::Market(MarketEvent::Depth(book)) => self.on_owned_depth(book),
+            event => self.on_event(&event),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct InstrumentState {
     pub config: InstrumentConfig,
+    symbol_key: Arc<str>,
     pub book: Option<OrderBook>,
     pub position_qty: Quantity,
     pub position_avg_price: Price,
@@ -2999,8 +3040,10 @@ pub struct InstrumentState {
 impl InstrumentState {
     fn new(config: InstrumentConfig) -> Self {
         let funding_rate = config.funding_rate;
+        let symbol_key = Arc::<str>::from(config.symbol.as_str());
         Self {
             config,
+            symbol_key,
             book: None,
             position_qty: 0.0,
             position_avg_price: 0.0,
@@ -3417,21 +3460,24 @@ impl InstrumentState {
             .min(size_limit)
     }
 
-    fn hedge_levels(
+    fn append_hedge_candidates(
         &self,
         hedge_side: Side,
         ref_mid: f64,
         own_quotes: &[(Side, Price, Quantity)],
-    ) -> Vec<HedgeLevel> {
-        let mut levels = Vec::new();
+        notional_limit: f64,
+        levels: &mut Vec<HedgeCandidate>,
+    ) {
         let book_side = hedge_side.reverse();
         if self.book.is_none() {
-            return levels;
+            return;
         }
+        levels.reserve(self.effective_levels(book_side).len());
         let skew_bps = self.fv_adjust();
         let adjust_bps = hedge_side.factor() * (self.config.taker_fee + self.hedge_profit_margin());
         let max_chunk = self.max_hedge_chunk_qty(ref_mid);
         let mut acc_qty = 0.0;
+        let mut candidate_notional = 0.0;
 
         for (level_idx, level) in self.effective_levels(book_side).iter().enumerate() {
             if level.qty <= 0.0 || !level.px.is_finite() {
@@ -3457,8 +3503,8 @@ impl InstrumentState {
                     + adjust_bps
                     + hedge_side.factor() * acc_qty * pos_skew_rate * 0.5;
                 let notional_usd = self.notional_usd(qty, level.px, ref_mid);
-                levels.push(HedgeLevel {
-                    symbol: self.config.symbol.clone(),
+                levels.push(HedgeCandidate {
+                    symbol: Arc::clone(&self.symbol_key),
                     priority: self.config.hedge_priority,
                     level: level_idx,
                     px: level.px,
@@ -3467,9 +3513,24 @@ impl InstrumentState {
                     notional_usd,
                     acc_qty,
                 });
+                candidate_notional += notional_usd;
+                if candidate_notional >= notional_limit {
+                    return;
+                }
                 remaining -= qty;
             }
         }
+    }
+
+    #[cfg(test)]
+    fn hedge_levels(
+        &self,
+        hedge_side: Side,
+        ref_mid: f64,
+        own_quotes: &[(Side, Price, Quantity)],
+    ) -> Vec<HedgeCandidate> {
+        let mut levels = Vec::new();
+        self.append_hedge_candidates(hedge_side, ref_mid, own_quotes, f64::INFINITY, &mut levels);
         levels
     }
 
@@ -4058,6 +4119,33 @@ pub struct HedgeLevel {
 }
 
 #[derive(Debug, Clone)]
+struct HedgeCandidate {
+    symbol: Arc<str>,
+    priority: i32,
+    level: usize,
+    px: Price,
+    qty: Quantity,
+    hedge_rate: f64,
+    notional_usd: f64,
+    acc_qty: Quantity,
+}
+
+impl HedgeCandidate {
+    fn to_owned_level(&self) -> HedgeLevel {
+        HedgeLevel {
+            symbol: self.symbol.to_string(),
+            priority: self.priority,
+            level: self.level,
+            px: self.px,
+            qty: self.qty,
+            hedge_rate: self.hedge_rate,
+            notional_usd: self.notional_usd,
+            acc_qty: self.acc_qty,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct HedgeTarget {
     symbol: Symbol,
     orig_px: Price,
@@ -4168,8 +4256,27 @@ fn sort_hedge_levels(side: Side, levels: &mut [HedgeLevel]) {
     }
 }
 
+fn sort_hedge_candidates(side: Side, levels: &mut [HedgeCandidate]) {
+    match side {
+        Side::Buy => levels.sort_by(|a, b| {
+            a.hedge_rate
+                .total_cmp(&b.hedge_rate)
+                .then_with(|| b.priority.cmp(&a.priority))
+                .then_with(|| b.symbol.cmp(&a.symbol))
+                .then_with(|| a.level.cmp(&b.level))
+        }),
+        Side::Sell => levels.sort_by(|a, b| {
+            b.hedge_rate
+                .total_cmp(&a.hedge_rate)
+                .then_with(|| b.priority.cmp(&a.priority))
+                .then_with(|| b.symbol.cmp(&a.symbol))
+                .then_with(|| a.level.cmp(&b.level))
+        }),
+    }
+}
+
 fn all_symbols_have_hedge(
-    per_symbol: &HashMap<Symbol, f64>,
+    per_symbol: &HashMap<&str, f64>,
     total_hedge_size: f64,
     max_quote_size: f64,
     symbol_count: usize,
@@ -4190,6 +4297,12 @@ fn weighted_avg(old_px: f64, old_qty: f64, new_px: f64, new_qty: f64) -> f64 {
         return new_px;
     }
     (old_px * old_qty + new_px * new_qty) / (old_qty + new_qty)
+}
+
+fn update_flag(value: &mut bool, next: bool) -> bool {
+    let changed = *value != next;
+    *value = next;
+    changed
 }
 
 fn update_weighted_px(map: &mut HashMap<Symbol, (f64, f64)>, symbol: &str, px: f64, qty: f64) {
@@ -5243,7 +5356,7 @@ mod tests {
         let mut strategy = ChaosStrategy::new(java_calculator_config()).unwrap();
         seed_java_calculator_books(&mut strategy);
         let entity = strategy.entity("BTC-USD-SWAP.OK").unwrap();
-        let level = entity.hedge_levels(Side::Sell, 50_000.0, &[])[0].clone();
+        let level = entity.hedge_levels(Side::Sell, 50_000.0, &[])[0].to_owned_level();
         strategy.active_hedges.insert(
             "h1".to_string(),
             ActiveHedge {
@@ -5999,6 +6112,66 @@ mod tests {
     }
 
     #[test]
+    fn hedge_candidates_stop_after_covering_notional_target() {
+        let mut entity = InstrumentState::new(InstrumentConfig {
+            symbol: "BTC-USDT".to_string(),
+            kind: InstrumentKindConfig::Spot,
+            lot_size: 0.01,
+            min_trade_size: 0.01,
+            ..InstrumentConfig::default()
+        });
+        entity.book = Some(OrderBook {
+            symbol: "BTC-USDT".to_string(),
+            ts_ms: 1,
+            bids: (0..100)
+                .map(|level| Level::new(99.0 - level as f64 * 0.01, 1.0))
+                .collect(),
+            asks: (0..100)
+                .map(|level| Level::new(101.0 + level as f64 * 0.01, 1.0))
+                .collect(),
+        });
+        let mut candidates = Vec::new();
+
+        entity.append_hedge_candidates(Side::Buy, 100.0, &[], 150.0, &mut candidates);
+
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            candidates
+                .iter()
+                .map(|level| level.notional_usd)
+                .sum::<f64>()
+                >= 150.0
+        );
+    }
+
+    #[test]
+    fn hedge_selection_preserves_rate_order_until_alternative_coverage() {
+        let strategy = ChaosStrategy::new(config()).unwrap();
+        let candidate = |symbol, level| HedgeCandidate {
+            symbol: Arc::from(symbol),
+            priority: 0,
+            level,
+            px: 100.0,
+            qty: 1_000.0,
+            hedge_rate: 1.0,
+            notional_usd: 100_000.0,
+            acc_qty: 1_000.0,
+        };
+        let levels = vec![
+            candidate("BTC-USDT", 0),
+            candidate("BTC-USDT", 1),
+            candidate("BTC-PERP", 0),
+        ];
+
+        let selected = strategy.select_required_hedges("main", Side::Buy, &levels);
+
+        assert_eq!(selected.len(), 3);
+        assert_eq!(selected[0].symbol, "BTC-USDT");
+        assert_eq!(selected[1].symbol, "BTC-USDT");
+        assert_eq!(selected[2].symbol, "BTC-PERP");
+    }
+
+    #[test]
     fn java_parity_stops_after_six_consecutive_anomalous_fills() {
         let mut strategy = ChaosStrategy::new(config()).unwrap();
         strategy.entities.get_mut("BTC-USDT").unwrap().book = Some(OrderBook::one_level(
@@ -6212,6 +6385,56 @@ mod tests {
                 .flatten()
                 .all(|level| { level.symbol != "BTC-USDT-SWAP.OK" })
         );
+    }
+
+    #[test]
+    fn healthy_feed_heartbeat_does_not_recalculate_quotes() {
+        let mut strategy = ChaosStrategy::new(java_calculator_config()).unwrap();
+        seed_java_calculator_books(&mut strategy);
+        assert!(!strategy.startup_basis_checked);
+
+        let intents = strategy.on_system_event(&SystemEvent {
+            ts_ms: 2,
+            kind: SystemEventKind::FeedHeartbeat,
+            venue: None,
+            account_id: None,
+            symbol: Some("BTC-USDT.OK".to_string()),
+            reason: "accepted sequence".to_string(),
+        });
+
+        assert!(intents.is_empty());
+        assert!(!strategy.startup_basis_checked);
+        assert_eq!(strategy.now_ms, 2);
+    }
+
+    #[test]
+    fn feed_recovery_waits_for_the_following_book_before_repricing() {
+        let mut strategy = ChaosStrategy::new(java_calculator_config()).unwrap();
+        seed_java_calculator_books(&mut strategy);
+        let symbol = "BTC-USDT.OK";
+
+        strategy.on_system_event(&SystemEvent {
+            ts_ms: 2,
+            kind: SystemEventKind::FeedStale,
+            venue: None,
+            account_id: None,
+            symbol: Some(symbol.to_string()),
+            reason: "gap".to_string(),
+        });
+        assert!(strategy.entities[symbol].feed_stale);
+
+        let intents = strategy.on_system_event(&SystemEvent {
+            ts_ms: 3,
+            kind: SystemEventKind::FeedRecovered,
+            venue: None,
+            account_id: None,
+            symbol: Some(symbol.to_string()),
+            reason: "snapshot accepted".to_string(),
+        });
+
+        assert!(intents.is_empty());
+        assert!(!strategy.entities[symbol].feed_stale);
+        assert!(!strategy.startup_basis_checked);
     }
 
     #[test]

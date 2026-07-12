@@ -17,6 +17,7 @@ production trading process.
 | Live process | `live` supports config-only `validate`, read-only `observe`, and explicitly confirmed demo order entry | Demo-capable; production entry intentionally unavailable |
 | Instrument/account bootstrap | Account instruments/config/balance/positions are typed and verified before readiness | Needs target-account certification |
 | Startup/restart gate | Executable phase state, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, and clean REST reconciliation | Needs process-kill demo test |
+| Event-loop profile | Allocation-aware raw OKX parity benchmark covers redundant wire input through strategy/risk and storage-record construction | Needs target-host capture and exchange-latency validation |
 | Operator control and alerts | Typed events and telemetry primitives exist; no authenticated operator service | Production blocker |
 | Exchange certification | No recorded OKX demo soak, fault injection, or production account-mode certification | Production blocker |
 
@@ -39,6 +40,10 @@ production trading process.
 6. Component and coordinator tests cover disconnect, duplicate, gap,
    delayed-private-stream, partial-fill, IOC-miss, rate-limit, and process-restart
    behavior.
+7. The production-shaped live benchmark covers raw-record cloning, OKX JSON
+   adaptation, redundant-feed deduplication, sequencing, 400-level books,
+   strategy/risk evaluation, and coordinator record construction. The measured
+   optimizations and exclusions are recorded in `docs/performance.md`.
 
 ## Remaining Demo Gate
 

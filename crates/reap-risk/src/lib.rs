@@ -547,19 +547,24 @@ impl RiskGate {
             return Some(RiskRejectReason::InvalidOrder);
         }
         if self.limits.require_feed_health {
-            let feeds = self
-                .feed_health
-                .iter()
-                .filter(|((_, symbol), _)| symbol == &order.symbol)
-                .map(|(_, health)| health)
-                .collect::<Vec<_>>();
-            if feeds.is_empty() {
+            let mut matching_feed = false;
+            let mut fresh_feed = false;
+            for ((_, symbol), health) in &self.feed_health {
+                if symbol != &order.symbol {
+                    continue;
+                }
+                matching_feed = true;
+                if !health.stale
+                    && now_ms.saturating_sub(health.last_ready_ms) <= self.limits.max_feed_age_ms
+                {
+                    fresh_feed = true;
+                    break;
+                }
+            }
+            if !matching_feed {
                 return Some(RiskRejectReason::FeedNotReady);
             }
-            if feeds.iter().all(|health| {
-                health.stale
-                    || now_ms.saturating_sub(health.last_ready_ms) > self.limits.max_feed_age_ms
-            }) {
+            if !fresh_feed {
                 return Some(RiskRejectReason::FeedStale);
             }
         }

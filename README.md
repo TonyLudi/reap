@@ -84,6 +84,7 @@ Profile the deterministic event loop:
 
 ```bash
 cargo bench -p reap-engine --bench event_loop
+cargo bench -p reap-live --bench live_loop
 ```
 
 `demo` mode rejects a production exchange configuration. `observe` is strictly
@@ -102,5 +103,5 @@ Design docs:
   and credential procedures.
 - [docs/trading-readiness.md](docs/trading-readiness.md) lists the exact gap from
   the current libraries to demo and production trading.
-- [docs/performance.md](docs/performance.md) records the initial hot-path
-  benchmark and optimization decision.
+- [docs/performance.md](docs/performance.md) records the strategy and complete
+  live-parity benchmarks, allocation profile, and measured optimizations.

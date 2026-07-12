@@ -657,11 +657,16 @@ boundary.
 
 ### Phase 8: Demo-Tradable Composition
 
-Status: planned. This is the current deployment blocker.
+Status: implemented for fail-closed OKX demo validation, observation, and
+explicitly confirmed order entry. Credentialed exchange soak acceptance remains
+the deployment blocker.
 
-- Add the live composition process and single-writer event-loop owner.
+- Add the live composition process and single-writer event-loop owner. Done.
 - Implement executable startup, readiness, reconciliation, and restart gates.
-- Verify instrument metadata, account mode, and risk valuation.
+  Done.
+- Verify instrument metadata, account mode, and risk valuation. Done.
+- Profile the wire-to-action parity loop and remove measured collection churn.
+  Done.
 - Complete fault injection and OKX demo soak acceptance.
 
 See [trading-readiness.md](trading-readiness.md) for the detailed gate.

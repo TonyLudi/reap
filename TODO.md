@@ -78,7 +78,7 @@ architecture in [docs/architecture.md](docs/architecture.md).
   feedback into the engine.
 - [x] Add end-to-end fault tests for disconnects, gaps, duplicates, partial
   fills, IOC misses, ambiguous submits, rate limits, and restart recovery.
-- [ ] Profile the parity event loop with production-shaped captures and remove
+- [x] Profile the parity event loop with production-shaped captures and remove
   measured hot-path allocation/collection bottlenecks.
 - [ ] Complete an OKX demo soak with no unexplained reconciliation drift.
 

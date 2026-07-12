@@ -55,10 +55,11 @@ impl OkxAdapter {
     fn parse_book(
         &self,
         envelope: &RawEnvelope,
-        push: &OkxPush,
+        action: Option<&str>,
+        data: Vec<Value>,
         arg: &OkxArg,
     ) -> Result<Vec<ParsedEvent>, VenueError> {
-        let action = match push.action.as_deref() {
+        let action = match action {
             Some("snapshot") => BookAction::Snapshot,
             Some("update") => BookAction::Update,
             other => return Err(Self::invalid(format!("invalid book action {other:?}"))),
@@ -69,10 +70,9 @@ impl OkxAdapter {
             .or_else(|| envelope.symbol.clone())
             .ok_or_else(|| Self::invalid("book message has no instId"))?;
 
-        push.data
-            .iter()
+        data.into_iter()
             .map(|value| {
-                let data: OkxBook = serde_json::from_value(value.clone())
+                let data: OkxBook = serde_json::from_value(value)
                     .map_err(|error| Self::invalid(error.to_string()))?;
                 let update = SequencedBookUpdate {
                     action,
@@ -103,13 +103,12 @@ impl OkxAdapter {
     fn parse_trades(
         &self,
         envelope: &RawEnvelope,
-        push: &OkxPush,
+        data: Vec<Value>,
         arg: &OkxArg,
     ) -> Result<Vec<ParsedEvent>, VenueError> {
-        push.data
-            .iter()
+        data.into_iter()
             .map(|value| {
-                let data: OkxTrade = serde_json::from_value(value.clone())
+                let data: OkxTrade = serde_json::from_value(value)
                     .map_err(|error| Self::invalid(error.to_string()))?;
                 let symbol = if data.inst_id.is_empty() {
                     arg.inst_id
@@ -149,7 +148,7 @@ impl OkxAdapter {
     fn parse_funding_rates(
         &self,
         envelope: &RawEnvelope,
-        push: &OkxPush,
+        data: Vec<Value>,
         arg: &OkxArg,
     ) -> Result<Vec<ParsedEvent>, VenueError> {
         let arg_symbol = arg
@@ -157,10 +156,9 @@ impl OkxAdapter {
             .clone()
             .or_else(|| envelope.symbol.clone())
             .ok_or_else(|| Self::invalid("funding-rate message has no instId"))?;
-        push.data
-            .iter()
+        data.into_iter()
             .map(|value| {
-                let data: OkxFundingRate = serde_json::from_value(value.clone())
+                let data: OkxFundingRate = serde_json::from_value(value)
                     .map_err(|error| Self::invalid(error.to_string()))?;
                 let symbol = if data.inst_id.is_empty() {
                     arg_symbol.clone()
@@ -187,13 +185,12 @@ impl OkxAdapter {
     fn parse_index_tickers(
         &self,
         envelope: &RawEnvelope,
-        push: &OkxPush,
+        data: Vec<Value>,
         arg: &OkxArg,
     ) -> Result<Vec<ParsedEvent>, VenueError> {
-        push.data
-            .iter()
+        data.into_iter()
             .map(|value| {
-                let data: OkxIndexTicker = serde_json::from_value(value.clone())
+                let data: OkxIndexTicker = serde_json::from_value(value)
                     .map_err(|error| Self::invalid(error.to_string()))?;
                 let symbol = data
                     .inst_id
@@ -219,13 +216,12 @@ impl OkxAdapter {
     fn parse_price_limits(
         &self,
         envelope: &RawEnvelope,
-        push: &OkxPush,
+        data: Vec<Value>,
         arg: &OkxArg,
     ) -> Result<Vec<ParsedEvent>, VenueError> {
-        push.data
-            .iter()
+        data.into_iter()
             .map(|value| {
-                let data: OkxPriceLimit = serde_json::from_value(value.clone())
+                let data: OkxPriceLimit = serde_json::from_value(value)
                     .map_err(|error| Self::invalid(error.to_string()))?;
                 let symbol = data
                     .inst_id
@@ -253,13 +249,12 @@ impl OkxAdapter {
     fn parse_mark_prices(
         &self,
         envelope: &RawEnvelope,
-        push: &OkxPush,
+        data: Vec<Value>,
         arg: &OkxArg,
     ) -> Result<Vec<ParsedEvent>, VenueError> {
-        push.data
-            .iter()
+        data.into_iter()
             .map(|value| {
-                let data: OkxMarkPrice = serde_json::from_value(value.clone())
+                let data: OkxMarkPrice = serde_json::from_value(value)
                     .map_err(|error| Self::invalid(error.to_string()))?;
                 let symbol = data
                     .inst_id
@@ -287,12 +282,11 @@ impl OkxAdapter {
     fn parse_orders(
         &self,
         envelope: &RawEnvelope,
-        push: &OkxPush,
+        data: Vec<Value>,
     ) -> Result<Vec<ParsedEvent>, VenueError> {
-        push.data
-            .iter()
+        data.into_iter()
             .map(|value| {
-                let data: OkxOrder = serde_json::from_value(value.clone())
+                let data: OkxOrder = serde_json::from_value(value)
                     .map_err(|error| Self::invalid(error.to_string()))?;
                 let update = data.into_private_update()?;
                 let cumulative_fill_bits = update.cumulative_filled_qty.to_bits();
@@ -333,12 +327,11 @@ impl OkxAdapter {
     fn parse_account(
         &self,
         envelope: &RawEnvelope,
-        push: &OkxPush,
+        data: Vec<Value>,
     ) -> Result<Vec<ParsedEvent>, VenueError> {
-        push.data
-            .iter()
+        data.into_iter()
             .map(|value| {
-                let data: OkxAccount = serde_json::from_value(value.clone())
+                let data: OkxAccount = serde_json::from_value(value)
                     .map_err(|error| Self::invalid(error.to_string()))?;
                 let ts_ms = parse_u64("uTime", &data.update_time)?;
                 let exchange_ratio = parse_optional_f64_value("mgnRatio", &data.margin_ratio)?;
@@ -397,11 +390,10 @@ impl OkxAdapter {
             .collect()
     }
 
-    fn parse_positions(&self, push: &OkxPush) -> Result<Vec<ParsedEvent>, VenueError> {
-        push.data
-            .iter()
+    fn parse_positions(&self, data: Vec<Value>) -> Result<Vec<ParsedEvent>, VenueError> {
+        data.into_iter()
             .map(|value| {
-                let data: OkxPosition = serde_json::from_value(value.clone())
+                let data: OkxPosition = serde_json::from_value(value)
                     .map_err(|error| Self::invalid(error.to_string()))?;
                 let ts_ms = parse_u64("uTime", &data.update_time)?;
                 let mut qty = parse_f64("pos", &data.qty)?;
@@ -438,12 +430,11 @@ impl OkxAdapter {
     fn parse_fills(
         &self,
         envelope: &RawEnvelope,
-        push: &OkxPush,
+        data: Vec<Value>,
     ) -> Result<Vec<ParsedEvent>, VenueError> {
-        push.data
-            .iter()
+        data.into_iter()
             .map(|value| {
-                let data: OkxFill = serde_json::from_value(value.clone())
+                let data: OkxFill = serde_json::from_value(value)
                     .map_err(|error| Self::invalid(error.to_string()))?;
                 let fill = data.into_remote_fill()?;
                 Ok(ParsedEvent {
@@ -517,31 +508,38 @@ impl VenueAdapter for OkxAdapter {
         }
         let push: OkxPush = serde_json::from_str(&envelope.payload)
             .map_err(|error| Self::invalid(error.to_string()))?;
-        if push.event.is_some() {
-            if push.event.as_deref() == Some("error") {
+        let OkxPush {
+            event,
+            code,
+            message,
+            arg,
+            action,
+            data,
+        } = push;
+        if event.is_some() {
+            if event.as_deref() == Some("error") {
                 return Err(Self::invalid(format!(
                     "websocket error {}: {}",
-                    push.code.unwrap_or_default(),
-                    push.message.unwrap_or_default()
+                    code.unwrap_or_default(),
+                    message.unwrap_or_default()
                 )));
             }
             return Ok(Vec::new());
         }
-        let arg = push
-            .arg
-            .as_ref()
-            .ok_or_else(|| Self::invalid("push message has no arg"))?;
+        let arg = arg.ok_or_else(|| Self::invalid("push message has no arg"))?;
         match arg.channel.as_str() {
-            "books" | "books-l2-tbt" | "books50-l2-tbt" => self.parse_book(envelope, &push, arg),
-            "trades" | "trades-all" => self.parse_trades(envelope, &push, arg),
-            "funding-rate" => self.parse_funding_rates(envelope, &push, arg),
-            "index-tickers" => self.parse_index_tickers(envelope, &push, arg),
-            "price-limit" => self.parse_price_limits(envelope, &push, arg),
-            "mark-price" => self.parse_mark_prices(envelope, &push, arg),
-            "orders" => self.parse_orders(envelope, &push),
-            "fills" => self.parse_fills(envelope, &push),
-            "account" => self.parse_account(envelope, &push),
-            "positions" => self.parse_positions(&push),
+            "books" | "books-l2-tbt" | "books50-l2-tbt" => {
+                self.parse_book(envelope, action.as_deref(), data, &arg)
+            }
+            "trades" | "trades-all" => self.parse_trades(envelope, data, &arg),
+            "funding-rate" => self.parse_funding_rates(envelope, data, &arg),
+            "index-tickers" => self.parse_index_tickers(envelope, data, &arg),
+            "price-limit" => self.parse_price_limits(envelope, data, &arg),
+            "mark-price" => self.parse_mark_prices(envelope, data, &arg),
+            "orders" => self.parse_orders(envelope, data),
+            "fills" => self.parse_fills(envelope, data),
+            "account" => self.parse_account(envelope, data),
+            "positions" => self.parse_positions(data),
             channel => Err(VenueError::UnsupportedChannel {
                 venue: Venue::Okx,
                 channel: channel.to_string(),
