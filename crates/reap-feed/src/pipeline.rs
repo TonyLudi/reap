@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use reap_book::{BookReducer, BookStatus};
 use reap_core::{
-    BookAction, Channel, EventId, MarketEvent, NormalizedEvent, SequencedBookUpdate, Symbol,
-    SystemEvent, SystemEventKind, TimeMs, Venue,
+    AccountUpdate, BookAction, Channel, EventId, MarketEvent, NormalizedEvent, SequencedBookUpdate,
+    Symbol, SystemEvent, SystemEventKind, TimeMs, Venue,
 };
 use reap_venue::{ParsedEvent, PrivateOrderUpdate, RemoteFill, VenueEvent};
 
@@ -27,8 +27,18 @@ pub struct RecoveryRequest {
 #[derive(Debug, Clone)]
 pub enum FeedOutput {
     Event(NormalizedEvent),
-    PrivateOrder(PrivateOrderUpdate),
-    PrivateFill(RemoteFill),
+    PrivateOrder {
+        account_id: Option<String>,
+        update: PrivateOrderUpdate,
+    },
+    PrivateFill {
+        account_id: Option<String>,
+        fill: RemoteFill,
+    },
+    PrivateAccount {
+        account_id: Option<String>,
+        update: AccountUpdate,
+    },
     Duplicate(EventId),
     RecoveryRequired(RecoveryRequest),
     System(SystemEvent),
@@ -92,17 +102,17 @@ impl FeedProcessor {
             }
             VenueEvent::PrivateOrder(update) => vec![
                 private_heartbeat(venue, account_id.clone(), update.ts_ms),
-                FeedOutput::PrivateOrder(update),
+                FeedOutput::PrivateOrder { account_id, update },
             ],
             VenueEvent::PrivateFill(fill) => vec![
                 private_heartbeat(venue, account_id.clone(), fill.ts_ms),
-                FeedOutput::PrivateFill(fill),
+                FeedOutput::PrivateFill { account_id, fill },
             ],
             VenueEvent::Account(update) => {
                 self.stats.normalized_events += 1;
                 vec![
-                    private_heartbeat(venue, account_id, update.ts_ms),
-                    FeedOutput::Event(NormalizedEvent::Account(update)),
+                    private_heartbeat(venue, account_id.clone(), update.ts_ms),
+                    FeedOutput::PrivateAccount { account_id, update },
                 ]
             }
         }

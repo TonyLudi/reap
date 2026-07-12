@@ -70,13 +70,13 @@ architecture in [docs/architecture.md](docs/architecture.md).
 
 ## Step 8: Demo-Tradable Runtime
 
-- [ ] Add a live composition crate/command with one strategy event-loop owner.
-- [ ] Verify exchange instrument metadata, account mode, trade mode, and risk
+- [x] Add a live composition crate/command with one strategy event-loop owner.
+- [x] Verify exchange instrument metadata, account mode, trade mode, and risk
   valuation before subscriptions are considered ready.
-- [ ] Implement the complete startup and restart reconciliation state machine.
-- [ ] Wire accepted intents through registered submit/cancel and private
+- [x] Implement the complete startup and restart reconciliation state machine.
+- [x] Wire accepted intents through registered submit/cancel and private
   feedback into the engine.
-- [ ] Add end-to-end fault tests for disconnects, gaps, duplicates, partial
+- [x] Add end-to-end fault tests for disconnects, gaps, duplicates, partial
   fills, IOC misses, ambiguous submits, rate limits, and restart recovery.
 - [ ] Profile the parity event loop with production-shaped captures and remove
   measured hot-path allocation/collection bottlenecks.

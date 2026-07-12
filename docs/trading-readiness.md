@@ -1,8 +1,9 @@
 # Trading Readiness
 
 Strategy parity and a tradable deployment are separate milestones. The iarb2
-decision model is implemented, but `reap` does not yet expose a live command and
-must not be treated as a production trading process.
+decision model and a fail-closed OKX demo composition are implemented. The
+runtime has not completed a credentialed demo soak and must not be treated as a
+production trading process.
 
 ## Current Gap
 
@@ -10,36 +11,45 @@ must not be treated as a production trading process.
 | --- | --- | --- |
 | Iarb2 decision model | Covered for the documented OKX parity boundary | Not a blocker |
 | Deterministic backtest | Shared strategy code, depth matching, queue-ahead model, fees, and normalized replay | Needs venue-data calibration before capital decisions |
-| Feed components | Multi-websocket planning, deduplication, sequencing, recovery, and OKX parsing exist as libraries | Must be composed and soak-tested |
-| Order components | Signed submit/cancel, local registration, private reduction, pacing, and REST reconciliation exist as libraries | Must be composed and restart-tested |
-| Runtime risk | Pre/post-trade limits, account-scoped health, kill switch, symbol halt, and fail-closed cancellation exist | Instrument models and account scopes must be wired from production config |
-| Live process | No `live` CLI command or composition root | **Demo-trading blocker** |
-| Instrument/account bootstrap | Sample config is for replay; no exchange metadata/account-mode verifier | **Demo-trading blocker** |
-| Startup/restart gate | Procedure is documented but no process owns the complete state machine | **Demo-trading blocker** |
+| Feed components | Redundant public sockets, isolated private sockets, ping/idle supervision, account-scoped deduplication, sequencing, and recovery are composed | Needs credentialed soak evidence |
+| Order components | Event-loop client IDs/registration, signed submit/cancel, pacing, private reduction, ambiguity handling, and REST reconciliation are composed | Needs demo exchange fault evidence |
+| Runtime risk | Instrument models, authoritative startup positions, account-scoped health, kill switch, symbol halt, and fail-closed cancellation are wired | Needs limits review against the target demo account |
+| Live process | `live` supports config-only `validate`, read-only `observe`, and explicitly confirmed demo order entry | Demo-capable; production entry intentionally unavailable |
+| Instrument/account bootstrap | Account instruments/config/balance/positions are typed and verified before readiness | Needs target-account certification |
+| Startup/restart gate | Executable phase state, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, and clean REST reconciliation | Needs process-kill demo test |
 | Operator control and alerts | Typed events and telemetry primitives exist; no authenticated operator service | Production blocker |
 | Exchange certification | No recorded OKX demo soak, fault injection, or production account-mode certification | Production blocker |
 
-## Demo-Trading Critical Path
+## Implemented Demo Path
 
-1. Add a `reap-live` composition crate or `reap live` command. It must own the
-   single strategy event loop and route feed, private, timer, risk, storage, and
-   gateway events without concurrent strategy mutation.
-2. Load and verify exchange instrument metadata. Map every symbol to spot,
-   linear, or inverse risk valuation; tick/lot/min size; contract value; settle
-   currency; trade mode; and position mode.
-3. Start all public and account-scoped private sockets, obtain sequenced books,
-   fetch initial balances and positions, and reconcile open orders and recent
-   fills before declaring readiness.
-4. Route accepted `NewOrder` intents through
-   `OkxOrderGateway::submit_registered`. Route cancels idempotently, and feed
-   every private acknowledgement/fill back through the canonical reducer and
-   engine.
-5. Persist raw input, normalized input, intent, request, acknowledgement, fill,
-   system event, and reconciliation result with enough identity to replay one
-   account independently from another.
-6. Run OKX demo trading at minimal size with disconnect, duplicate, gap,
+1. `reap-live` owns one strategy coordinator and routes feed, private, timer,
+   risk, storage, and gateway events without concurrent strategy mutation.
+2. Bootstrap verifies exchange instrument metadata and maps every symbol to
+   spot, linear, or inverse risk valuation; tick/lot/min size; contract value;
+   settle currency; trade mode; and position mode.
+3. The runtime starts all public and account-scoped private sockets, obtains
+   sequenced books, fetches initial balances and positions, and reconciles open
+   orders and recent fills before declaring readiness.
+4. Accepted `NewOrder` intents receive a client ID and canonical `PendingNew`
+   synchronously, then route through the account gateway. Cancels are deduplicated,
+   and every private acknowledgement/fill returns through the reducer/engine.
+5. The critical log persists account-scoped raw input, normalized input,
+   intent, request, acknowledgement, fill, system event, and reconciliation
+   result with enough identity to replay one account independently from another.
+6. Component and coordinator tests cover disconnect, duplicate, gap,
    delayed-private-stream, partial-fill, IOC-miss, rate-limit, and process-restart
-   fault tests.
+   behavior.
+
+## Remaining Demo Gate
+
+1. Review `examples/live-okx-demo.toml` against the actual demo account and
+   current fee tier.
+2. Run `observe` through reconnects and verify every account reaches `ready`
+   with no reconciliation drift or critical storage backpressure.
+3. Run minimal-size `demo` orders, then inject socket disconnect, process kill,
+   IOC miss, partial fill, and REST timeout/rate-limit conditions.
+4. Complete a sustained soak with zero unexplained order, fill, balance,
+   position, or checkpoint drift.
 
 ## Production Gate
 

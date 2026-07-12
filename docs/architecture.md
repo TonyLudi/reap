@@ -3,10 +3,11 @@
 This document describes the target architecture for `reap` as a Rust trading
 system that can run the same strategy logic in live trading and backtest.
 
-The workspace now implements the migration baseline described here: strategy
-and backtest parity, live OKX feed/order boundaries, deterministic risk,
-telemetry, and durable capture. Exchange certification and deployment-specific
-orchestration remain operational responsibilities rather than strategy code.
+The workspace now implements the migration baseline and a demo-capable OKX
+composition root: strategy/backtest parity, live feed/order boundaries,
+deterministic risk, executable readiness/restart state, telemetry, and durable
+capture. Exchange certification and production deployment controls remain
+operational gates rather than strategy code.
 
 ## Goals
 
@@ -78,6 +79,7 @@ reap/
     reap-backtest/
     reap-storage/
     reap-telemetry/
+    reap-live/
     reap-cli/
 ```
 
@@ -259,7 +261,12 @@ state should live here.
 
 ### `reap-engine`
 
-Live orchestration.
+Deterministic strategy/risk enforcement used by both composition tests and the
+live owner.
+
+### `reap-live`
+
+Live composition and lifecycle ownership.
 
 Responsibilities:
 
@@ -270,7 +277,7 @@ Responsibilities:
 - Dispatch timers into strategy loops.
 - Coordinate reconciliation and recovery.
 
-Recommended first topology:
+Implemented topology:
 
 ```text
 tokio runtime
@@ -284,12 +291,26 @@ Strategy shard task:
 
 ```rust
 loop {
-    let event = rx.recv().await?;
-    let intents = strategy.on_event(&event);
-    let commands = risk.check(intents, &state);
-    order_tx.send(commands).await?;
+    let input = prioritized_rx.recv().await?;
+    let output = coordinator.on_input(input)?;
+    critical_storage.try_record_all(output.records)?;
+    order_queues.try_dispatch_all(output.actions)?;
 }
 ```
+
+The coordinator owns strategy, risk, readiness, account-scoped private
+reducers, client-order-id generation, and intent routing. It synchronously
+records `PendingNew` before a submit action can reach an account gateway task.
+REST and websocket IO never borrow strategy state across `.await`.
+
+Startup moves through configured, reconciling, awaiting-streams, ready, and
+degraded phases. Ready requires verified account-scoped instrument metadata,
+matching account/position modes, a writable critical log, clean checkpoint/REST
+reconciliation, every sequenced book, and all configured private channels for
+every account. Orders, account, and positions are required. The dedicated
+fills channel is opt-in because OKX restricts it by fee tier; fills from the
+orders channel remain canonical. Any lost invariant blocks new orders while
+demo-mode cancels remain available.
 
 Later, if the strategy loop becomes latency-critical, replace the async receive
 with a pinned OS thread and a bounded SPSC queue.
@@ -352,8 +373,8 @@ reap inspect-book --capture raw/ws.jsonl --symbol BTC-USDT
 reap config-check --config config/live.toml
 ```
 
-`backtest`, `replay-check`, and `config-check` are implemented. `live` and
-`inspect-book` remain planned; see [trading-readiness.md](trading-readiness.md).
+`live`, `backtest`, `replay-check`, and `config-check` are implemented.
+`inspect-book` remains planned; see [trading-readiness.md](trading-readiness.md).
 
 ## Multi-Websocket Design
 

@@ -1,0 +1,117 @@
+[strategy]
+strategy_name = "reap-chaos-demo"
+underlying = "BTC"
+ref_symbol = "BTC-USDT"
+delta_limit_usd = 1000.0
+active_hedge_threshold_usd = 25.0
+min_hedge_interval_ms = 100
+quote_only = false
+
+[[strategy.risk_groups]]
+name = "main"
+account_id = "main"
+symbols = ["BTC-USDT", "BTC-USDT-SWAP"]
+soft_delta_limit_usd = 500.0
+hard_delta_limit_usd = 750.0
+delta_stop_limit_usd = 1000.0
+live_order_limit_usd = 5000.0
+turnover_limit_usd = 100000.0
+basis_limit = 0.08
+
+[[strategy.instruments]]
+symbol = "BTC-USDT"
+kind = "spot"
+risk_group = "main"
+base_currency = "BTC"
+quote_currency = "USDT"
+maker_fee = 0.0001
+taker_fee = 0.001
+hedge_profit_margin = 0.0005
+quote_profit_margin = 0.0007
+hedge_aggression = 0.0003
+max_order_size_usd = 100.0
+min_order_size_usd = 10.0
+max_order_size = 0.01
+min_trade_size = 0.00001
+tick_size = 0.1
+lot_size = 0.00000001
+min_position = -0.05
+max_position = 0.05
+
+[[strategy.instruments]]
+symbol = "BTC-USDT-SWAP"
+kind = "linear_swap"
+risk_group = "main"
+base_currency = "BTC"
+quote_currency = "USDT"
+settle_currency = "USDT"
+maker_fee = 0.0002
+taker_fee = 0.0005
+hedge_profit_margin = 0.0004
+quote_profit_margin = 0.0006
+hedge_aggression = 0.0003
+max_order_size_usd = 100.0
+min_order_size_usd = 10.0
+max_order_size = 1.0
+min_trade_size = 0.01
+tick_size = 0.1
+lot_size = 0.01
+contract_value = 0.01
+min_position = -10.0
+max_position = 10.0
+
+[risk]
+max_order_notional_usd = 150.0
+max_abs_position_notional_usd = 1500.0
+max_live_order_notional_usd = 1000.0
+max_turnover_usd = 100000.0
+max_drawdown_usd = 250.0
+max_feed_age_ms = 1000
+max_private_age_ms = 30000
+require_feed_health = true
+require_private_health = true
+
+[venue]
+environment = "demo"
+rest_url = "https://openapi.okx.com"
+public_ws_url = "wss://wspap.okx.com:8443/ws/v5/public"
+private_ws_url = "wss://wspap.okx.com:8443/ws/v5/private"
+enable_vip_fills_channel = false
+
+[runtime]
+event_channel_capacity = 65536
+feed_channel_capacity = 65536
+order_channel_capacity = 4096
+dedup_capacity_per_stream = 100000
+max_sequence_buffer = 4096
+max_subscriptions_per_socket = 100
+public_connections_per_subscription = 2
+timer_interval_ms = 100
+readiness_timeout_ms = 30000
+shutdown_timeout_ms = 15000
+rest_connect_timeout_ms = 2000
+rest_request_timeout_ms = 5000
+ambiguous_submit_grace_ms = 5000
+submit_requests_per_window = 50
+cancel_requests_per_window = 50
+reconcile_requests_per_window = 20
+request_window_ms = 2000
+
+[storage]
+path = "var/reap/demo-events.jsonl"
+channel_capacity = 65536
+flush_every_records = 1
+
+[[accounts]]
+id = "main"
+api_key_env = "REAP_OKX_API_KEY"
+secret_key_env = "REAP_OKX_SECRET_KEY"
+passphrase_env = "REAP_OKX_PASSPHRASE"
+expected_account_level = "single_currency_margin"
+expected_position_mode = "net_mode"
+id_prefix = "reap"
+node_id = 1
+
+[accounts.trade_modes]
+BTC-USDT = "cash"
+BTC-USDT-SWAP = "cross"

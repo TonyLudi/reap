@@ -813,10 +813,15 @@ struct OkxFill {
 
 impl OkxFill {
     fn into_remote_fill(self) -> Result<RemoteFill, VenueError> {
+        let client_order_id = if self.client_order_id == "0" {
+            String::new()
+        } else {
+            self.client_order_id
+        };
         Ok(RemoteFill {
             fill_id: self.fill_id,
             exchange_order_id: self.order_id,
-            client_order_id: self.client_order_id,
+            client_order_id,
             symbol: self.symbol,
             side: parse_side(&self.side)?,
             price: parse_f64("fillPx", &self.price)?,

@@ -47,7 +47,8 @@ where
             .system_events
             .extend(self.risk.check_staleness(now_ms));
 
-        let fail_closed = event_requires_cancel(&event)
+        let fail_closed = self.risk.is_killed()
+            || event_requires_cancel(&event)
             || output.system_events.iter().any(system_requires_cancel);
         let strategy_intents = self.strategy.on_event(&StrategyEvent::from(event.clone()));
         self.apply_risk(now_ms, strategy_intents, &mut output);

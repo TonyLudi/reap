@@ -1,44 +1,46 @@
 # Operations Guide
 
-`reap` fails closed: missing or stale state can cancel exposure-reducing orders
-but cannot authorize a new order. The live gateway remains a library so a
-deployment must explicitly wire credentials, health, storage, and operator
-controls before it can trade.
+`reap` fails closed: missing or stale state can trigger cancels in demo mode but
+cannot authorize a new order. `reap live` owns the implemented OKX lifecycle;
+production order entry remains intentionally unavailable.
 
 ## Startup Gate
 
-1. Run `reap config-check` and reject any invalid symbol, sizing, or risk-group
-   relationship.
-2. Start structured telemetry and bounded storage before feed or order tasks.
-3. Build the OKX adapter with the regional websocket/REST domains associated
-   with each account. Call `with_account_id` for every private adapter; never
-   infer account identity or a regional domain from a symbol.
-4. Start isolated private and partitioned public websocket plans. Public plans
-   must include sequenced books for every instrument, trades where required,
-   funding rates for swaps, configured index tickers, and derivative mark/price
-   limits. Private plans for every account must include orders, fills, account,
-   and positions. Authenticate private sockets before subscriptions.
-5. Wait for a sequenced book snapshot for every traded symbol. A
-   `FeedRecovered` event marks the public side ready.
-6. Fetch initial account balances, margins, and positions. Reconcile pending
-   orders and recent fills over REST, then mark each account's private stream
-   ready only when its report is clean.
-7. Register each symbol's `InstrumentRiskModel` as spot, linear derivative, or
-   inverse derivative with the correct contract value. A derivative must not
-   inherit the risk gate's spot default.
-8. Confirm storage queue depth, every feed age, every private account age,
-   position/account freshness, exchange and calculated margin ratios, and
-   kill-switch state.
-   Only then may the risk gate authorize new orders.
-
-The repository currently provides these steps as library boundaries; no live
-composition process owns the complete startup gate yet.
+1. Run `reap live --config <path> --mode validate`. This reads no credentials
+   and opens no network connection.
+2. Start `--mode observe` with credentials supplied through the configured
+   environment-variable names. Observe mode permits neither submits nor
+   cancels.
+   The example uses the global simulated hosts documented in the
+   [OKX API guide](https://www.okx.com/docs-v5/en/); replace REST, public, and
+   private domains together when the account belongs to another region.
+3. The runtime opens the critical JSONL log before sockets and binds its
+   checkpoint to the strategy/config fingerprint. Do not share a storage path
+   between strategy configs.
+4. The runtime fetches account-scoped instruments, account configuration,
+   balances, positions, open orders, recent fills, and exact status for any
+   restored active order.
+5. It verifies live instrument state, type, linear/inverse contract type,
+   tick/lot/minimum size, contract value, currencies, configured trade mode,
+   account level, and `net_mode` before metadata is ready.
+6. It restores canonical active orders and fill identities from JSONL, applies
+   missed known fills/terminal updates from REST, and requires clean
+   account-scoped reconciliation.
+7. It starts redundant public plans and isolated orders, account, and positions
+   sockets for every account. The dedicated fills channel is optional for
+   eligible fee tiers; order-channel fills remain canonical. All configured
+   private sockets must authenticate and remain live.
+8. It waits for a contiguous sequenced book for every instrument and a healthy
+   complete private connection set for every account.
+9. Only phase `ready`, writable storage, healthy risk, and explicit
+   `--mode demo --confirm-demo` permit a new order.
 
 ## Order Path
 
-- Register the local `NewOrder` with the private reducer before awaiting the
-  network request. Use `OkxOrderGateway::submit_registered` so an early
-  websocket acknowledgement cannot lose its `quote` or `hedge` reason.
+- The coordinator generates the client order ID and synchronously records a
+  canonical `PendingNew` before dispatching to the account gateway task. The
+  intent, pending state, and request are enqueued to critical storage before
+  REST IO begins.
 - Route explicit REST rejections back through the gateway state. Treat timeout
   and transport ambiguity as pending until REST/private reconciliation resolves
   it; do not blindly resubmit.
@@ -57,7 +59,7 @@ composition process owns the complete startup gate yet.
 | Private stream stale | Account blocked; live orders cancelled | Reconnect, REST reconcile pending orders/fills, then emit recovery |
 | Reconcile drift | Account blocked; live orders cancelled | Resolve local/remote order and fill differences before recovery |
 | Risk breach | Kill switch active; live orders cancelled | Reduce exposure externally if needed, diagnose, and obtain operator reset |
-| Storage loss | Counter/health degradation | Investigate capacity; critical intent/order/fill records must not be dropped |
+| Critical storage loss/backpressure | Runtime fail-stop; checkpoint reconciliation required on restart | Investigate disk/queue capacity; critical records are never silently dropped |
 
 ## Operator Controls
 
@@ -88,7 +90,9 @@ as affecting every tracked account on that venue.
 
 ## Shutdown
 
-Activate the kill switch, send cancels, wait for private acknowledgements or
-REST reconciliation, flush critical storage records, then stop sockets and
-telemetry. A process exit with unresolved live orders is an incident, not a
-successful shutdown.
+`SIGINT` or `SIGTERM` in demo mode activates the kill switch, dispatches
+cancels, keeps private sockets and REST reconciliation running, and waits for
+zero active canonical orders and clean accounts. It then flushes critical
+storage and stops sockets/tasks. Exceeding `shutdown_timeout_ms` returns an
+error with unresolved counts; treat that as an incident. Observe mode performs
+no exchange mutation and shuts down directly.

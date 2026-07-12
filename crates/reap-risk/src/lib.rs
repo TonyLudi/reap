@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use reap_core::{
-    MarketEvent, NormalizedEvent, OrderIntent, OrderStatus, OrderUpdate, Symbol, SystemEvent,
-    SystemEventKind, TimeMs, Venue,
+    AccountUpdate, MarketEvent, NormalizedEvent, OrderIntent, OrderStatus, OrderUpdate, Symbol,
+    SystemEvent, SystemEventKind, TimeMs, Venue,
 };
 use serde::{Deserialize, Serialize};
 
@@ -148,6 +148,7 @@ pub struct RiskGate {
     live_orders: HashMap<String, LiveOrderRisk>,
     turnover_usd: f64,
     equity_usd: f64,
+    equity_by_account: HashMap<Option<String>, f64>,
     peak_equity_usd: f64,
     seen_fills: HashSet<FillKey>,
 }
@@ -169,6 +170,7 @@ impl RiskGate {
             live_orders: HashMap::new(),
             turnover_usd: 0.0,
             equity_usd: 0.0,
+            equity_by_account: HashMap::new(),
             peak_equity_usd: 0.0,
             seen_fills: HashSet::new(),
         }
@@ -324,6 +326,23 @@ impl RiskGate {
         self.equity_usd = equity_usd;
         self.peak_equity_usd = self.peak_equity_usd.max(equity_usd);
         self.evaluate_post_trade(ts_ms, None)
+    }
+
+    pub fn on_account_update(&mut self, update: &AccountUpdate) -> PostTradeOutcome {
+        for position in &update.positions {
+            self.positions.insert(position.symbol.clone(), position.qty);
+        }
+        for margin in &update.margins {
+            if let Some(equity) = margin.adjusted_equity_usd {
+                self.equity_by_account
+                    .insert(margin.account_id.clone(), equity);
+            }
+        }
+        if !self.equity_by_account.is_empty() {
+            self.equity_usd = self.equity_by_account.values().sum();
+            self.peak_equity_usd = self.peak_equity_usd.max(self.equity_usd);
+        }
+        self.evaluate_post_trade(update.ts_ms, None)
     }
 
     pub fn activate_kill_switch(
@@ -504,9 +523,8 @@ impl RiskGate {
                 self.apply_system_event(system);
                 PostTradeOutcome::default()
             }
-            NormalizedEvent::Account(_)
-            | NormalizedEvent::Timer(_)
-            | NormalizedEvent::Control(_) => PostTradeOutcome::default(),
+            NormalizedEvent::Account(update) => self.on_account_update(update),
+            NormalizedEvent::Timer(_) | NormalizedEvent::Control(_) => PostTradeOutcome::default(),
         }
     }
 
@@ -1041,6 +1059,47 @@ mod tests {
             InstrumentRiskModel::LinearDerivative {
                 contract_value: 0.0,
             },
+        ));
+    }
+
+    #[test]
+    fn bootstrap_position_snapshot_is_authoritative_for_pre_trade_risk() {
+        let mut gate = RiskGate::new(RiskLimits {
+            max_abs_position_notional_usd: 150.0,
+            require_feed_health: false,
+            require_private_health: false,
+            ..RiskLimits::default()
+        });
+        gate.on_account_update(&reap_core::AccountUpdate {
+            ts_ms: 1,
+            balances: Vec::new(),
+            positions: vec![reap_core::Position {
+                symbol: "BTC-USDT".to_string(),
+                qty: 1.0,
+                avg_price: 100.0,
+            }],
+            margins: Vec::new(),
+        });
+
+        assert_eq!(gate.position("BTC-USDT"), 1.0);
+        assert!(matches!(
+            gate.pre_trade(
+                2,
+                OrderIntent::NewOrder(reap_core::NewOrder {
+                    symbol: "BTC-USDT".to_string(),
+                    side: reap_core::Side::Buy,
+                    qty: 1.0,
+                    price: 100.0,
+                    time_in_force: reap_core::TimeInForce::PostOnly,
+                    reduce_only: false,
+                    self_trade_prevention: None,
+                    reason: "test".to_string(),
+                })
+            ),
+            RiskDecision::Rejected {
+                reason: RiskRejectReason::PositionNotional { .. },
+                ..
+            }
         ));
     }
 }

@@ -58,7 +58,10 @@ pub fn reconcile(
 ) -> ReconcileReport {
     let local_live = local
         .orders()
-        .filter(|(_, order)| order.is_live())
+        .filter(|(_, order)| {
+            order.is_live()
+                || (order.status == reap_core::OrderStatus::PendingNew && order.open_qty > 0.0)
+        })
         .collect::<HashMap<_, _>>();
     let remote_live = remote_orders
         .iter()

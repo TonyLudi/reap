@@ -20,7 +20,12 @@ Implemented:
 - Deterministic pre/post-trade risk, stale-stream fail-closed behavior, kill
   switch and symbol halt events, and an event-loop enforcement layer.
 - Bounded structured telemetry and JSONL storage for raw, normalized, intent,
-  order, and fill records.
+  request, acknowledgement, order, fill, system, bootstrap, and reconciliation
+  records, including restart checkpoint recovery.
+- A fail-closed `reap-live` composition root with account-scoped REST bootstrap,
+  exchange metadata/account-mode verification, redundant public sockets,
+  isolated private sockets, one strategy owner, prioritized gateway tasks, and
+  graceful cancel-and-drain shutdown.
 - Backtest matching with `PostOnly`, `IOC`, current-depth fills, trade fills,
   queue-ahead tracking, and simple mark-to-market accounting.
 - CSV/normalized replay, raw-capture validation, configuration validation, and
@@ -45,6 +50,29 @@ cargo run -p reap-cli -- replay-check --events fixtures/raw/okx/depth-gap.jsonl 
 cargo run -p reap-cli -- config-check --config examples/iarb2-basic.toml --pretty
 ```
 
+Validate the live demo configuration without reading credentials or opening a
+network connection:
+
+```bash
+cargo run -p reap-cli -- live --config examples/live-okx-demo.toml --mode validate --pretty
+```
+
+Observe OKX demo feeds and account state without permitting any submit or
+cancel request:
+
+```bash
+export REAP_OKX_API_KEY=...
+export REAP_OKX_SECRET_KEY=...
+export REAP_OKX_PASSPHRASE=...
+cargo run -p reap-cli -- live --config examples/live-okx-demo.toml --mode observe
+```
+
+Enable demo order entry only with the explicit confirmation flag:
+
+```bash
+cargo run -p reap-cli -- live --config examples/live-okx-demo.toml --mode demo --confirm-demo
+```
+
 Run tests:
 
 ```bash
@@ -58,12 +86,10 @@ Profile the deterministic event loop:
 cargo bench -p reap-engine --bench event_loop
 ```
 
-The live order gateway is a library boundary and is not exposed as an
-accidental one-command production launcher. Integrators must supply credentials,
-regional OKX URLs, instrument trade modes, startup reconciliation, storage, and
-health wiring described in the operations guide. The missing live composition
-root is a demo-trading blocker, not a deployment detail. Validate with OKX demo
-trading before enabling production credentials.
+`demo` mode rejects a production exchange configuration. `observe` is strictly
+read-only. Production order entry is intentionally not exposed: a credentialed
+OKX demo soak, fault campaign, latency profile, and operator rollout approval
+remain required before production capital.
 
 Design docs:
 

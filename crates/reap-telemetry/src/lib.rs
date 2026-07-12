@@ -330,6 +330,7 @@ pub fn init_json_tracing(default_filter: &str) -> Result<(), String> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
     tracing_subscriber::fmt()
         .json()
+        .with_writer(std::io::stderr)
         .with_env_filter(filter)
         .finish()
         .try_init()

@@ -25,6 +25,16 @@ pub enum GatewayError {
     MissingTradeMode(String),
 }
 
+impl GatewayError {
+    pub fn is_ambiguous(&self) -> bool {
+        matches!(self, Self::Rest(RestError::Transport(_)))
+    }
+
+    pub fn is_order_not_found(&self) -> bool {
+        matches!(self, Self::Rest(error) if error.is_order_not_found())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubmitOutcome {
@@ -39,6 +49,30 @@ pub enum SubmitOutcome {
     PendingReconciliation {
         client_order_id: String,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedOrder {
+    idempotency_key: String,
+    client_order_id: String,
+    order: NewOrder,
+    trade_mode: OkxTradeMode,
+}
+
+impl PreparedOrder {
+    pub fn client_order_id(&self) -> &str {
+        &self.client_order_id
+    }
+
+    pub fn order(&self) -> &NewOrder {
+        &self.order
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum SubmitPreparation {
+    Ready(PreparedOrder),
+    Complete(SubmitOutcome),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,7 +132,10 @@ where
         idempotency_key: impl Into<String>,
         order: NewOrder,
     ) -> Result<SubmitOutcome, GatewayError> {
-        self.submit_inner(idempotency_key.into(), order, None).await
+        match self.prepare_submit(idempotency_key, order)? {
+            SubmitPreparation::Ready(prepared) => self.execute_submit(prepared).await,
+            SubmitPreparation::Complete(outcome) => Ok(outcome),
+        }
     }
 
     pub async fn submit_registered(
@@ -107,22 +144,68 @@ where
         order: NewOrder,
         state: &mut PrivateStateReducer,
     ) -> Result<SubmitOutcome, GatewayError> {
-        self.submit_inner(idempotency_key.into(), order, Some(state))
-            .await
+        match self.prepare_submit(idempotency_key, order)? {
+            SubmitPreparation::Ready(prepared) => {
+                let client_order_id = prepared.client_order_id.clone();
+                state.register_local_order(&client_order_id, prepared.order.clone());
+                let result = self.execute_submit(prepared).await;
+                if result.is_err() && !self.local_orders.contains_key(&client_order_id) {
+                    state.remove_local_order(&client_order_id);
+                }
+                result
+            }
+            SubmitPreparation::Complete(outcome) => {
+                let client_order_id = match &outcome {
+                    SubmitOutcome::Duplicate {
+                        client_order_id, ..
+                    }
+                    | SubmitOutcome::PendingReconciliation { client_order_id } => client_order_id,
+                    SubmitOutcome::Submitted { .. } => {
+                        unreachable!("submitted outcomes require REST execution")
+                    }
+                };
+                self.register_local_order(client_order_id, state);
+                Ok(outcome)
+            }
+        }
     }
 
-    async fn submit_inner(
+    pub fn prepare_submit(
         &mut self,
-        idempotency_key: String,
+        idempotency_key: impl Into<String>,
         order: NewOrder,
-        mut state: Option<&mut PrivateStateReducer>,
-    ) -> Result<SubmitOutcome, GatewayError> {
+    ) -> Result<SubmitPreparation, GatewayError> {
         let trade_mode = self
             .trade_modes
             .get(&order.symbol)
             .copied()
             .ok_or_else(|| GatewayError::MissingTradeMode(order.symbol.clone()))?;
         let generated_id = self.ids.next(unix_time_ms());
+        self.prepare_submit_with_id(idempotency_key, order, generated_id, trade_mode)
+    }
+
+    pub fn prepare_registered_submit(
+        &mut self,
+        idempotency_key: impl Into<String>,
+        order: NewOrder,
+        client_order_id: impl Into<String>,
+    ) -> Result<SubmitPreparation, GatewayError> {
+        let trade_mode = self
+            .trade_modes
+            .get(&order.symbol)
+            .copied()
+            .ok_or_else(|| GatewayError::MissingTradeMode(order.symbol.clone()))?;
+        self.prepare_submit_with_id(idempotency_key, order, client_order_id.into(), trade_mode)
+    }
+
+    fn prepare_submit_with_id(
+        &mut self,
+        idempotency_key: impl Into<String>,
+        order: NewOrder,
+        generated_id: String,
+        trade_mode: OkxTradeMode,
+    ) -> Result<SubmitPreparation, GatewayError> {
+        let idempotency_key = idempotency_key.into();
         let reservation =
             self.idempotency
                 .reserve(idempotency_key.clone(), &order, generated_id)?;
@@ -131,27 +214,38 @@ where
                 client_order_id,
                 exchange_order_id,
             } => {
-                if let Some(state) = state.as_deref_mut() {
-                    self.register_local_order(&client_order_id, state);
-                }
-                return Ok(SubmitOutcome::Duplicate {
+                return Ok(SubmitPreparation::Complete(SubmitOutcome::Duplicate {
                     client_order_id,
                     exchange_order_id,
-                });
+                }));
             }
             Reservation::Pending { client_order_id } => {
-                if let Some(state) = state.as_deref_mut() {
-                    self.register_local_order(&client_order_id, state);
-                }
-                return Ok(SubmitOutcome::PendingReconciliation { client_order_id });
+                return Ok(SubmitPreparation::Complete(
+                    SubmitOutcome::PendingReconciliation { client_order_id },
+                ));
             }
             Reservation::New { client_order_id } => client_order_id,
         };
         self.local_orders
             .insert(client_order_id.clone(), order.clone());
-        if let Some(state) = state.as_deref_mut() {
-            state.register_local_order(&client_order_id, order.clone());
-        }
+        Ok(SubmitPreparation::Ready(PreparedOrder {
+            idempotency_key,
+            client_order_id,
+            order,
+            trade_mode,
+        }))
+    }
+
+    pub async fn execute_submit(
+        &mut self,
+        prepared: PreparedOrder,
+    ) -> Result<SubmitOutcome, GatewayError> {
+        let PreparedOrder {
+            idempotency_key,
+            client_order_id,
+            order,
+            trade_mode,
+        } = prepared;
         self.pacer.pace(RequestKind::Submit, "account").await;
         self.pacer.pace(RequestKind::Submit, &order.symbol).await;
         let result = self
@@ -174,9 +268,6 @@ where
                 if !matches!(error, RestError::Transport(_)) {
                     self.idempotency.release_pending(&idempotency_key)?;
                     self.local_orders.remove(&client_order_id);
-                    if let Some(state) = state {
-                        state.remove_local_order(&client_order_id);
-                    }
                 }
                 return Err(error.into());
             }
@@ -226,10 +317,8 @@ where
         instrument_type: Option<&str>,
         symbol: Option<&str>,
     ) -> Result<ReconciliationSnapshot, GatewayError> {
-        self.pacer.pace(RequestKind::Reconcile, "account").await;
-        let remote_orders = self.client.open_orders(instrument_type, symbol).await?;
-        self.pacer.pace(RequestKind::Reconcile, "account").await;
-        let remote_fills = self.client.fills(instrument_type, symbol).await?;
+        let (remote_orders, remote_fills) =
+            self.fetch_remote_state(instrument_type, symbol).await?;
         let report = reconcile(
             state.order_reducer(),
             state.seen_fill_ids(),
@@ -241,6 +330,30 @@ where
             remote_fills,
             report,
         })
+    }
+
+    pub async fn fetch_remote_state(
+        &mut self,
+        instrument_type: Option<&str>,
+        symbol: Option<&str>,
+    ) -> Result<(Vec<reap_venue::RemoteOrder>, Vec<reap_venue::RemoteFill>), GatewayError> {
+        self.pacer.pace(RequestKind::Reconcile, "account").await;
+        let remote_orders = self.client.open_orders(instrument_type, symbol).await?;
+        self.pacer.pace(RequestKind::Reconcile, "account").await;
+        let remote_fills = self.client.fills(instrument_type, symbol).await?;
+        Ok((remote_orders, remote_fills))
+    }
+
+    pub async fn fetch_order_details(
+        &mut self,
+        symbol: &str,
+        client_order_id: &str,
+    ) -> Result<reap_venue::RemoteOrder, GatewayError> {
+        self.pacer.pace(RequestKind::Reconcile, "account").await;
+        Ok(self
+            .client
+            .order_details(symbol, None, Some(client_order_id))
+            .await?)
     }
 }
 
@@ -341,6 +454,37 @@ mod tests {
         else {
             unreachable!();
         };
+        assert_eq!(
+            state.order_reducer().get(&client_order_id).unwrap().reason,
+            "quote"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_submit_can_be_registered_before_rest_io() {
+        let response = HttpResponse {
+            status: 200,
+            body: r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"ignored","sCode":"0","sMsg":""}]}"#.to_string(),
+        };
+        let (mut gateway, calls) = gateway(vec![Ok(response)]);
+        let mut state = PrivateStateReducer::new();
+
+        let SubmitPreparation::Ready(prepared) = gateway
+            .prepare_submit("decision-1", order())
+            .expect("submission should be prepared")
+        else {
+            panic!("new submission should require execution");
+        };
+
+        assert_eq!(*calls.lock().unwrap(), 0);
+        state.register_local_order(prepared.client_order_id(), prepared.order().clone());
+        let client_order_id = prepared.client_order_id().to_string();
+
+        assert!(matches!(
+            gateway.execute_submit(prepared).await.unwrap(),
+            SubmitOutcome::Submitted { .. }
+        ));
+        assert_eq!(*calls.lock().unwrap(), 1);
         assert_eq!(
             state.order_reducer().get(&client_order_id).unwrap().reason,
             "quote"

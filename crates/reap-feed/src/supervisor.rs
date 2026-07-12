@@ -7,7 +7,10 @@ use reap_venue::{VenueAdapter, okx::OkxSigner};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
-use crate::{ConnectionError, RecoveryRequest, SocketPlan, run_connection_once};
+use crate::{
+    ConnectionError, ConnectionStatus, ConnectionStatusKind, RecoveryRequest, SocketPlan,
+    run_connection_once,
+};
 
 #[derive(Debug, Clone)]
 pub struct ReconnectPolicy {
@@ -60,12 +63,23 @@ impl ReconnectPolicy {
 
 pub struct SupervisedFeed {
     pub raw: mpsc::Receiver<RawEnvelope>,
+    pub status: mpsc::Receiver<ConnectionStatus>,
     shutdown: watch::Sender<bool>,
     recovery_routes: HashMap<(Venue, Symbol), Vec<watch::Sender<u64>>>,
     tasks: Vec<JoinHandle<()>>,
 }
 
 impl SupervisedFeed {
+    pub fn take_raw(&mut self) -> mpsc::Receiver<RawEnvelope> {
+        let (_sender, replacement) = mpsc::channel(1);
+        std::mem::replace(&mut self.raw, replacement)
+    }
+
+    pub fn take_status(&mut self) -> mpsc::Receiver<ConnectionStatus> {
+        let (_sender, replacement) = mpsc::channel(1);
+        std::mem::replace(&mut self.status, replacement)
+    }
+
     pub fn request_recovery(&self, request: &RecoveryRequest) -> usize {
         let Some(routes) = self
             .recovery_routes
@@ -98,6 +112,7 @@ pub fn spawn_supervised_feed(
     reconnect: ReconnectPolicy,
 ) -> SupervisedFeed {
     let (raw_tx, raw_rx) = mpsc::channel(channel_capacity.max(1));
+    let (status_tx, status_rx) = mpsc::channel(channel_capacity.max(1));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut tasks = Vec::new();
     let mut recovery_routes: HashMap<(Venue, Symbol), Vec<watch::Sender<u64>>> = HashMap::new();
@@ -117,6 +132,7 @@ pub fn spawn_supervised_feed(
         }
         let adapter = Arc::clone(&adapter);
         let output = raw_tx.clone();
+        let status = status_tx.clone();
         let bootstrap = Arc::clone(&bootstrap);
         let shutdown = shutdown_rx.clone();
         let reconnect = reconnect.clone();
@@ -125,32 +141,48 @@ pub fn spawn_supervised_feed(
                 adapter,
                 plan,
                 bootstrap,
-                output,
-                shutdown,
-                recovery_rx,
+                ConnectionChannels {
+                    output,
+                    status,
+                    shutdown,
+                    recovery: recovery_rx,
+                },
                 reconnect,
             )
             .await;
         }));
     }
     drop(raw_tx);
+    drop(status_tx);
     SupervisedFeed {
         raw: raw_rx,
+        status: status_rx,
         shutdown: shutdown_tx,
         recovery_routes,
         tasks,
     }
 }
 
-pub async fn supervise_connection(
+struct ConnectionChannels {
+    output: mpsc::Sender<RawEnvelope>,
+    status: mpsc::Sender<ConnectionStatus>,
+    shutdown: watch::Receiver<bool>,
+    recovery: watch::Receiver<u64>,
+}
+
+async fn supervise_connection(
     adapter: Arc<dyn VenueAdapter>,
     plan: SocketPlan,
     bootstrap: BootstrapFactory,
-    output: mpsc::Sender<RawEnvelope>,
-    mut shutdown: watch::Receiver<bool>,
-    mut recovery: watch::Receiver<u64>,
+    channels: ConnectionChannels,
     reconnect: ReconnectPolicy,
 ) {
+    let ConnectionChannels {
+        output,
+        status,
+        mut shutdown,
+        mut recovery,
+    } = channels;
     let mut delay = reconnect.initial_delay;
     loop {
         if *shutdown.borrow() {
@@ -177,6 +209,7 @@ pub async fn supervise_connection(
             &plan,
             &bootstrap_messages,
             &output,
+            &status,
             &mut shutdown,
             &mut recovery,
         )
@@ -185,6 +218,14 @@ pub async fn supervise_connection(
             return;
         }
         let error = result.expect_err("non-success result must contain an error");
+        let _ = status.try_send(ConnectionStatus {
+            conn_id: plan.conn_id.clone(),
+            venue: plan.venue,
+            private: plan.private,
+            ts_ms: crate::unix_time_ns() / 1_000_000,
+            kind: ConnectionStatusKind::Disconnected,
+            reason: error.to_string(),
+        });
         if matches!(error, ConnectionError::RecoveryRequested) {
             delay = reconnect.initial_delay;
             tracing::info!(conn_id = %plan.conn_id, "feed connection restarting for snapshot recovery");
@@ -255,9 +296,11 @@ mod tests {
     fn recovery_request_notifies_registered_socket() {
         let (route, mut route_rx) = watch::channel(0_u64);
         let (_raw_tx, raw_rx) = mpsc::channel(1);
+        let (_status_tx, status_rx) = mpsc::channel(1);
         let (shutdown, _shutdown_rx) = watch::channel(false);
         let feed = SupervisedFeed {
             raw: raw_rx,
+            status: status_rx,
             shutdown,
             recovery_routes: HashMap::from([((Venue::Okx, "BTC-USDT".to_string()), vec![route])]),
             tasks: Vec::new(),

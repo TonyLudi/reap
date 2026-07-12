@@ -11,6 +11,7 @@ members = [
     "crates/reap-backtest",
     "crates/reap-storage",
     "crates/reap-telemetry",
+    "crates/reap-live",
     "crates/reap-cli",
 ]
 default-members = ["crates/reap-cli"]
@@ -33,6 +34,7 @@ reap-backtest = { path = "crates/reap-backtest" }
 reap-book = { path = "crates/reap-book" }
 reap-core = { path = "crates/reap-core" }
 reap-feed = { path = "crates/reap-feed" }
+reap-live = { path = "crates/reap-live" }
 reap-engine = { path = "crates/reap-engine" }
 reap-order = { path = "crates/reap-order" }
 reap-risk = { path = "crates/reap-risk" }
@@ -45,7 +47,7 @@ serde_json = "1"
 sha2 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 toml = "0.9"
 tracing = "0.1"

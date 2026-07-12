@@ -42,10 +42,26 @@ impl PrivateStateReducer {
         &self.seen_fill_ids
     }
 
+    pub fn seed_fill_ids(&mut self, fill_ids: impl IntoIterator<Item = String>) {
+        self.seen_fill_ids.extend(fill_ids);
+    }
+
+    pub fn restore_order_update(&mut self, update: OrderUpdate) {
+        self.cumulative_fills
+            .insert(update.order_id.clone(), update.filled_qty);
+        self.last_order_update_ms
+            .insert(update.order_id.clone(), update.ts_ms);
+        self.orders.apply_update(update);
+    }
+
     pub fn canonical_order_id(&self, exchange_order_id: &str) -> Option<&str> {
         self.exchange_to_client
             .get(exchange_order_id)
             .map(String::as_str)
+    }
+
+    pub fn last_order_update_ms(&self, order_id: &str) -> Option<u64> {
+        self.last_order_update_ms.get(order_id).copied()
     }
 
     pub fn register_local_order(&mut self, client_order_id: impl Into<String>, order: NewOrder) {
@@ -53,6 +69,30 @@ impl PrivateStateReducer {
         if !self.orders.contains_order(&client_order_id) {
             self.orders.create_pending(client_order_id, order);
         }
+    }
+
+    pub fn register_local_order_at(
+        &mut self,
+        client_order_id: impl Into<String>,
+        order: NewOrder,
+        ts_ms: u64,
+    ) -> Option<OrderUpdate> {
+        let client_order_id = client_order_id.into();
+        if self.orders.contains_order(&client_order_id) {
+            return None;
+        }
+        self.last_order_update_ms
+            .insert(client_order_id.clone(), ts_ms);
+        Some(self.orders.pending_new(client_order_id, order, ts_ms))
+    }
+
+    pub fn reject_local_order(
+        &mut self,
+        client_order_id: &str,
+        ts_ms: u64,
+        reason: &str,
+    ) -> Option<OrderUpdate> {
+        self.orders.reject(client_order_id, ts_ms, reason)
     }
 
     pub fn remove_local_order(&mut self, client_order_id: &str) {
@@ -205,8 +245,11 @@ impl PrivateStateReducer {
     }
 
     pub fn apply_fill(&mut self, fill: RemoteFill) -> Option<OrderUpdate> {
-        let order_id = if fill.client_order_id.is_empty() {
-            fill.exchange_order_id.clone()
+        let order_id = if fill.client_order_id.is_empty() || fill.client_order_id == "0" {
+            self.exchange_to_client
+                .get(&fill.exchange_order_id)
+                .cloned()
+                .unwrap_or_else(|| fill.exchange_order_id.clone())
         } else {
             fill.client_order_id.clone()
         };
@@ -415,6 +458,47 @@ mod tests {
 
         assert_eq!(reducer.apply_fill(fill.clone()).unwrap().filled_qty, 0.4);
         assert!(reducer.apply_fill(fill).is_none());
+    }
+
+    #[test]
+    fn vip_fill_sentinel_resolves_through_exchange_order_mapping() {
+        let mut reducer = PrivateStateReducer::new();
+        reducer.register_local_order(
+            "client-1",
+            reap_core::NewOrder {
+                symbol: "BTC-USDT".to_string(),
+                side: Side::Buy,
+                qty: 1.0,
+                price: 100.0,
+                time_in_force: reap_core::TimeInForce::Gtc,
+                reduce_only: false,
+                self_trade_prevention: None,
+                reason: "test".to_string(),
+            },
+        );
+        let mut live = private_fill();
+        live.state = PrivateOrderState::Live;
+        live.cumulative_filled_qty = 0.0;
+        live.last_fill_qty = 0.0;
+        live.fill_id = None;
+        reducer.apply_order(live).unwrap();
+
+        let update = reducer
+            .apply_fill(RemoteFill {
+                fill_id: "vip-fill".to_string(),
+                exchange_order_id: "exchange-1".to_string(),
+                client_order_id: "0".to_string(),
+                symbol: "BTC-USDT".to_string(),
+                side: Side::Buy,
+                price: 99.5,
+                qty: 0.4,
+                liquidity: FillLiquidity::Maker,
+                ts_ms: 2,
+            })
+            .unwrap();
+
+        assert_eq!(update.order_id, "client-1");
+        assert_eq!(update.filled_qty, 0.4);
     }
 
     #[test]

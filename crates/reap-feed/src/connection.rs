@@ -1,5 +1,5 @@
 use futures_util::{SinkExt, StreamExt};
-use reap_core::{Channel, RawEnvelope};
+use reap_core::{Channel, ConnId, RawEnvelope, Venue};
 use reap_venue::{VenueAdapter, VenueError};
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
@@ -31,6 +31,29 @@ pub enum ConnectionError {
     RecoveryRequested,
     #[error("connection shutdown requested")]
     ShutdownRequested,
+    #[error("websocket received no data before the idle timeout")]
+    IdleTimeout,
+    #[error("websocket subscription acknowledgement timed out")]
+    SubscriptionTimeout,
+    #[error("websocket subscription failed: {0}")]
+    SubscriptionFailed(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionStatusKind {
+    Ready,
+    Heartbeat,
+    Disconnected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionStatus {
+    pub conn_id: ConnId,
+    pub venue: Venue,
+    pub private: bool,
+    pub ts_ms: u64,
+    pub kind: ConnectionStatusKind,
+    pub reason: String,
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for ConnectionError {
@@ -44,6 +67,7 @@ pub async fn run_connection_once(
     plan: &SocketPlan,
     bootstrap_messages: &[String],
     output: &mpsc::Sender<RawEnvelope>,
+    status: &mpsc::Sender<ConnectionStatus>,
     shutdown: &mut watch::Receiver<bool>,
     recovery: &mut watch::Receiver<u64>,
 ) -> Result<(), ConnectionError> {
@@ -61,9 +85,36 @@ pub async fn run_connection_once(
     }
     let subscription = adapter.subscription_message(&plan.subscriptions)?;
     writer.send(Message::Text(subscription.into())).await?;
+    await_subscriptions(
+        &mut writer,
+        &mut reader,
+        plan.subscriptions.len(),
+        plan,
+        output,
+        shutdown,
+        recovery,
+    )
+    .await?;
+    send_status(
+        status,
+        plan,
+        ConnectionStatusKind::Ready,
+        "subscription sent",
+    );
+
+    let mut ping = tokio::time::interval(std::time::Duration::from_secs(15));
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ping.tick().await;
+    let mut last_received = tokio::time::Instant::now();
 
     loop {
         tokio::select! {
+            _ = ping.tick() => {
+                if last_received.elapsed() > std::time::Duration::from_secs(30) {
+                    return Err(ConnectionError::IdleTimeout);
+                }
+                writer.send(Message::Text("ping".into())).await?;
+            }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     let _ = writer.send(Message::Close(None)).await;
@@ -78,13 +129,19 @@ pub async fn run_connection_once(
             }
             message = reader.next() => {
                 let message = message.ok_or(ConnectionError::PeerClosed)??;
+                last_received = tokio::time::Instant::now();
+                send_status(status, plan, ConnectionStatusKind::Heartbeat, "websocket data received");
                 match message {
                     Message::Text(payload) => {
-                        forward_payload(payload.as_str(), plan, output).await?;
+                        if payload.as_str() != "pong" {
+                            reject_server_error(payload.as_str())?;
+                            forward_payload(payload.as_str(), plan, output).await?;
+                        }
                     }
                     Message::Binary(payload) => {
                         let payload = std::str::from_utf8(payload.as_ref())
                             .map_err(|_| ConnectionError::NonUtf8Payload)?;
+                        reject_server_error(payload)?;
                         forward_payload(payload, plan, output).await?;
                     }
                     Message::Ping(payload) => writer.send(Message::Pong(payload)).await?,
@@ -95,6 +152,150 @@ pub async fn run_connection_once(
             }
         }
     }
+}
+
+async fn await_subscriptions<S>(
+    writer: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>,
+    reader: &mut futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<S>>,
+    expected: usize,
+    plan: &SocketPlan,
+    output: &mpsc::Sender<RawEnvelope>,
+    shutdown: &mut watch::Receiver<bool>,
+    recovery: &mut watch::Receiver<u64>,
+) -> Result<(), ConnectionError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    if expected == 0 {
+        return Ok(());
+    }
+    let deadline = tokio::time::sleep(std::time::Duration::from_secs(10));
+    tokio::pin!(deadline);
+    let mut acknowledged = 0_usize;
+    loop {
+        tokio::select! {
+            _ = &mut deadline => return Err(ConnectionError::SubscriptionTimeout),
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Err(ConnectionError::ShutdownRequested);
+                }
+            }
+            changed = recovery.changed() => {
+                if changed.is_ok() {
+                    return Err(ConnectionError::RecoveryRequested);
+                }
+            }
+            message = reader.next() => {
+                let message = message.ok_or(ConnectionError::PeerClosed)??;
+                match message {
+                    Message::Text(payload) => {
+                        match subscription_message(payload.as_str())? {
+                            SubscriptionMessage::Acknowledged => acknowledged += 1,
+                            SubscriptionMessage::Data => {
+                                forward_payload(payload.as_str(), plan, output).await?;
+                            }
+                            SubscriptionMessage::Ignore => {}
+                        }
+                    }
+                    Message::Binary(payload) => {
+                        let payload = std::str::from_utf8(payload.as_ref())
+                            .map_err(|_| ConnectionError::NonUtf8Payload)?;
+                        match subscription_message(payload)? {
+                            SubscriptionMessage::Acknowledged => acknowledged += 1,
+                            SubscriptionMessage::Data => forward_payload(payload, plan, output).await?,
+                            SubscriptionMessage::Ignore => {}
+                        }
+                    }
+                    Message::Ping(payload) => writer.send(Message::Pong(payload)).await?,
+                    Message::Pong(_) => {}
+                    Message::Close(_) => return Err(ConnectionError::PeerClosed),
+                    Message::Frame(_) => {}
+                }
+                if acknowledged >= expected {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubscriptionMessage {
+    Acknowledged,
+    Data,
+    Ignore,
+}
+
+fn subscription_message(payload: &str) -> Result<SubscriptionMessage, ConnectionError> {
+    if payload == "pong" {
+        return Ok(SubscriptionMessage::Ignore);
+    }
+    let value: serde_json::Value = serde_json::from_str(payload)
+        .map_err(|error| ConnectionError::SubscriptionFailed(error.to_string()))?;
+    match value.get("event").and_then(serde_json::Value::as_str) {
+        Some("subscribe")
+            if value
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|code| code == "0") =>
+        {
+            Ok(SubscriptionMessage::Acknowledged)
+        }
+        Some("error") | Some("channel-conn-count-error") => {
+            Err(ConnectionError::SubscriptionFailed(server_error(&value)))
+        }
+        Some("subscribe") | Some("notice") => {
+            Err(ConnectionError::SubscriptionFailed(server_error(&value)))
+        }
+        Some(_) => Ok(SubscriptionMessage::Ignore),
+        None => Ok(SubscriptionMessage::Data),
+    }
+}
+
+fn reject_server_error(payload: &str) -> Result<(), ConnectionError> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return Ok(());
+    };
+    match value.get("event").and_then(serde_json::Value::as_str) {
+        Some("error") | Some("channel-conn-count-error") | Some("notice") => {
+            Err(ConnectionError::SubscriptionFailed(server_error(&value)))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn server_error(value: &serde_json::Value) -> String {
+    format!(
+        "event={} code={} message={}",
+        value
+            .get("event")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(""),
+        value
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(""),
+        value
+            .get("msg")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    )
+}
+
+fn send_status(
+    status: &mpsc::Sender<ConnectionStatus>,
+    plan: &SocketPlan,
+    kind: ConnectionStatusKind,
+    reason: &str,
+) {
+    let _ = status.try_send(ConnectionStatus {
+        conn_id: plan.conn_id.clone(),
+        venue: plan.venue,
+        private: plan.private,
+        ts_ms: unix_time_ns() / 1_000_000,
+        kind,
+        reason: reason.to_string(),
+    });
 }
 
 async fn await_private_login<S>(
@@ -214,6 +415,23 @@ mod tests {
         assert!(matches!(
             login_response(r#"{"event":"error","code":"60009","msg":"Login failed"}"#),
             Err(ConnectionError::LoginFailed(_))
+        ));
+    }
+
+    #[test]
+    fn subscription_readiness_requires_successful_ack() {
+        assert_eq!(
+            subscription_message(
+                r#"{"event":"subscribe","arg":{"channel":"orders"},"connId":"one"}"#
+            )
+            .unwrap(),
+            SubscriptionMessage::Acknowledged
+        );
+        assert!(matches!(
+            subscription_message(
+                r#"{"event":"channel-conn-count-error","code":"60012","msg":"too many"}"#
+            ),
+            Err(ConnectionError::SubscriptionFailed(_))
         ));
     }
 }

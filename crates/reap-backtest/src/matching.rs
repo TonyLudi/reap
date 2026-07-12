@@ -417,4 +417,56 @@ mod tests {
         assert_eq!(updates[0].event, OrderEvent::FullyFilled);
         assert_eq!(updates[0].last_fill_liquidity, Some(FillLiquidity::Taker));
     }
+
+    #[test]
+    fn ioc_miss_is_terminal_without_a_fill() {
+        let mut engine = MatchingEngine::new(inst());
+        engine.on_depth(OrderBook::one_level(
+            "BTC-USDT",
+            1,
+            level(100.0, 1.0),
+            level(101.0, 1.0),
+        ));
+        let updates = engine.submit(NewOrder {
+            symbol: "BTC-USDT".to_string(),
+            side: Side::Buy,
+            qty: 0.5,
+            price: 100.0,
+            time_in_force: TimeInForce::Ioc,
+            reduce_only: false,
+            self_trade_prevention: None,
+            reason: "hedge".to_string(),
+        });
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].event, OrderEvent::Cancelled);
+        assert_eq!(updates[0].filled_qty, 0.0);
+    }
+
+    #[test]
+    fn ioc_partial_fill_cancels_the_remainder() {
+        let mut engine = MatchingEngine::new(inst());
+        engine.on_depth(OrderBook::one_level(
+            "BTC-USDT",
+            1,
+            level(100.0, 1.0),
+            level(101.0, 0.4),
+        ));
+        let updates = engine.submit(NewOrder {
+            symbol: "BTC-USDT".to_string(),
+            side: Side::Buy,
+            qty: 1.0,
+            price: 101.0,
+            time_in_force: TimeInForce::Ioc,
+            reduce_only: false,
+            self_trade_prevention: None,
+            reason: "hedge".to_string(),
+        });
+
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].event, OrderEvent::PartialFill);
+        assert_eq!(updates[0].filled_qty, 0.4);
+        assert_eq!(updates[1].event, OrderEvent::Cancelled);
+        assert_eq!(updates[1].open_qty, 0.6);
+    }
 }

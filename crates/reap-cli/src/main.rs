@@ -3,11 +3,12 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use reap_backtest::BacktestRunner;
+use reap_live::{LiveMode, LiveRunOptions};
 use reap_strategy::ChaosConfig;
 
 #[derive(Debug, Parser)]
 #[command(name = "reap")]
-#[command(about = "Rust replication of the core imm-strategy chaos strategy/backtest loop")]
+#[command(about = "Rust chaos/iarb2 strategy, backtest, replay, and OKX demo runtime")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -39,6 +40,16 @@ enum Command {
         #[arg(long)]
         pretty: bool,
     },
+    Live {
+        #[arg(short, long)]
+        config: PathBuf,
+        #[arg(long, value_enum, default_value_t = LiveCliMode::Validate)]
+        mode: LiveCliMode,
+        #[arg(long)]
+        confirm_demo: bool,
+        #[arg(long)]
+        pretty: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -47,7 +58,25 @@ enum ReplayFormat {
     NormalizedJsonl,
 }
 
-fn main() -> Result<()> {
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum LiveCliMode {
+    Validate,
+    Observe,
+    Demo,
+}
+
+impl From<LiveCliMode> for LiveMode {
+    fn from(value: LiveCliMode) -> Self {
+        match value {
+            LiveCliMode::Validate => Self::Validate,
+            LiveCliMode::Observe => Self::Observe,
+            LiveCliMode::Demo => Self::Demo,
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Backtest {
@@ -99,6 +128,29 @@ fn main() -> Result<()> {
             }
             if !report.valid {
                 anyhow::bail!("configuration validation failed");
+            }
+        }
+        Command::Live {
+            config,
+            mode,
+            confirm_demo,
+            pretty,
+        } => {
+            reap_telemetry::init_json_tracing("info")
+                .map_err(anyhow::Error::msg)
+                .context("failed to initialize live tracing")?;
+            let report = reap_live::run_live_path(
+                config,
+                LiveRunOptions {
+                    mode: mode.into(),
+                    demo_confirmed: confirm_demo,
+                },
+            )
+            .await?;
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
             }
         }
     }

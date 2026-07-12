@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 use chrono::{SecondsFormat, Utc};
-use reap_core::{FillLiquidity, SelfTradePrevention, Side, TimeInForce};
+use reap_core::{
+    AccountUpdate, Balance, FillLiquidity, MarginSnapshot, Position, SelfTradePrevention, Side,
+    TimeInForce,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -14,6 +17,11 @@ const PLACE_ORDER_PATH: &str = "/api/v5/trade/order";
 const CANCEL_ORDER_PATH: &str = "/api/v5/trade/cancel-order";
 const OPEN_ORDERS_PATH: &str = "/api/v5/trade/orders-pending";
 const FILLS_PATH: &str = "/api/v5/trade/fills";
+const ORDER_DETAILS_PATH: &str = "/api/v5/trade/order";
+const ACCOUNT_INSTRUMENTS_PATH: &str = "/api/v5/account/instruments";
+const ACCOUNT_CONFIG_PATH: &str = "/api/v5/account/config";
+const ACCOUNT_BALANCE_PATH: &str = "/api/v5/account/balance";
+const ACCOUNT_POSITIONS_PATH: &str = "/api/v5/account/positions";
 
 #[derive(Debug, Error)]
 pub enum RestError {
@@ -35,6 +43,12 @@ pub enum RestError {
     },
 }
 
+impl RestError {
+    pub fn is_order_not_found(&self) -> bool {
+        matches!(self, Self::Api { code, .. } if code == "51603")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpResponse {
     pub status: u16,
@@ -54,7 +68,22 @@ pub struct ReqwestTransport {
 
 impl ReqwestTransport {
     pub fn new(base_url: impl Into<String>) -> Result<Self, RestError> {
+        Self::with_timeouts(
+            base_url,
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(5),
+        )
+    }
+
+    pub fn with_timeouts(
+        base_url: impl Into<String>,
+        connect_timeout: std::time::Duration,
+        request_timeout: std::time::Duration,
+    ) -> Result<Self, RestError> {
         let client = reqwest::Client::builder()
+            .connect_timeout(connect_timeout)
+            .timeout(request_timeout)
+            .tcp_nodelay(true)
             .build()
             .map_err(|error| RestError::Transport(error.to_string()))?;
         Ok(Self {
@@ -102,6 +131,93 @@ pub enum OkxTradeMode {
     Cash,
     Cross,
     Isolated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OkxInstrumentType {
+    #[serde(rename = "SPOT")]
+    Spot,
+    #[serde(rename = "MARGIN")]
+    Margin,
+    #[serde(rename = "SWAP")]
+    Swap,
+    #[serde(rename = "FUTURES")]
+    Futures,
+    #[serde(rename = "OPTION")]
+    Option,
+}
+
+impl OkxInstrumentType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Spot => "SPOT",
+            Self::Margin => "MARGIN",
+            Self::Swap => "SWAP",
+            Self::Futures => "FUTURES",
+            Self::Option => "OPTION",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OkxContractType {
+    Linear,
+    Inverse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OkxAccountLevel {
+    Simple,
+    SingleCurrencyMargin,
+    MultiCurrencyMargin,
+    PortfolioMargin,
+}
+
+impl OkxAccountLevel {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Simple => "1",
+            Self::SingleCurrencyMargin => "2",
+            Self::MultiCurrencyMargin => "3",
+            Self::PortfolioMargin => "4",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OkxPositionMode {
+    LongShortMode,
+    NetMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OkxInstrument {
+    pub symbol: String,
+    pub instrument_type: OkxInstrumentType,
+    pub instrument_family: String,
+    pub underlying: String,
+    pub base_currency: String,
+    pub quote_currency: String,
+    pub settle_currency: String,
+    pub contract_type: Option<OkxContractType>,
+    pub contract_value: Option<f64>,
+    pub contract_value_currency: String,
+    pub tick_size: f64,
+    pub lot_size: f64,
+    pub min_size: f64,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OkxAccountConfig {
+    pub account_level: OkxAccountLevel,
+    pub position_mode: OkxPositionMode,
+    pub account_stp_mode: String,
+    pub user_id: String,
+    pub main_user_id: String,
 }
 
 impl OkxTradeMode {
@@ -241,6 +357,167 @@ where
             .into_iter()
             .map(RemoteFill::try_from)
             .collect()
+    }
+
+    pub async fn order_details(
+        &self,
+        symbol: &str,
+        exchange_order_id: Option<&str>,
+        client_order_id: Option<&str>,
+    ) -> Result<RemoteOrder, RestError> {
+        self.order_details_at(&timestamp_now(), symbol, exchange_order_id, client_order_id)
+            .await
+    }
+
+    pub async fn order_details_at(
+        &self,
+        timestamp: &str,
+        symbol: &str,
+        exchange_order_id: Option<&str>,
+        client_order_id: Option<&str>,
+    ) -> Result<RemoteOrder, RestError> {
+        if exchange_order_id.is_none() && client_order_id.is_none() {
+            return Err(RestError::InvalidField {
+                field: "ordId/clOrdId",
+                value: String::new(),
+                message: "one identifier is required".to_string(),
+            });
+        }
+        let path = query_path(
+            ORDER_DETAILS_PATH,
+            [
+                ("instId", Some(symbol)),
+                ("ordId", exchange_order_id),
+                ("clOrdId", client_order_id),
+            ],
+        );
+        let request = self
+            .signer
+            .sign_request(timestamp, HttpMethod::Get, path, "")?;
+        let response: OkxResponse<OkxOrderWire> = self.execute(request).await?;
+        response
+            .data
+            .into_iter()
+            .next()
+            .ok_or(RestError::EmptyData {
+                operation: "order details",
+            })?
+            .try_into()
+    }
+
+    pub async fn account_instruments(
+        &self,
+        instrument_type: OkxInstrumentType,
+        symbol: Option<&str>,
+    ) -> Result<Vec<OkxInstrument>, RestError> {
+        self.account_instruments_at(&timestamp_now(), instrument_type, symbol)
+            .await
+    }
+
+    pub async fn account_instruments_at(
+        &self,
+        timestamp: &str,
+        instrument_type: OkxInstrumentType,
+        symbol: Option<&str>,
+    ) -> Result<Vec<OkxInstrument>, RestError> {
+        let path = query_path(
+            ACCOUNT_INSTRUMENTS_PATH,
+            [
+                ("instType", Some(instrument_type.as_str())),
+                ("instId", symbol),
+            ],
+        );
+        let request = self
+            .signer
+            .sign_request(timestamp, HttpMethod::Get, path, "")?;
+        let response: OkxResponse<OkxInstrumentWire> = self.execute(request).await?;
+        response
+            .data
+            .into_iter()
+            .map(OkxInstrument::try_from)
+            .collect()
+    }
+
+    pub async fn account_config(&self) -> Result<OkxAccountConfig, RestError> {
+        self.account_config_at(&timestamp_now()).await
+    }
+
+    pub async fn account_config_at(&self, timestamp: &str) -> Result<OkxAccountConfig, RestError> {
+        let request =
+            self.signer
+                .sign_request(timestamp, HttpMethod::Get, ACCOUNT_CONFIG_PATH, "")?;
+        let response: OkxResponse<OkxAccountConfigWire> = self.execute(request).await?;
+        response
+            .data
+            .into_iter()
+            .next()
+            .ok_or(RestError::EmptyData {
+                operation: "account config",
+            })?
+            .try_into()
+    }
+
+    pub async fn account_balance(&self) -> Result<AccountUpdate, RestError> {
+        self.account_balance_at(&timestamp_now()).await
+    }
+
+    pub async fn account_balance_at(&self, timestamp: &str) -> Result<AccountUpdate, RestError> {
+        let request =
+            self.signer
+                .sign_request(timestamp, HttpMethod::Get, ACCOUNT_BALANCE_PATH, "")?;
+        let response: OkxResponse<OkxAccountBalanceWire> = self.execute(request).await?;
+        response
+            .data
+            .into_iter()
+            .next()
+            .ok_or(RestError::EmptyData {
+                operation: "account balance",
+            })?
+            .try_into()
+    }
+
+    pub async fn account_positions(
+        &self,
+        instrument_type: Option<OkxInstrumentType>,
+        symbol: Option<&str>,
+    ) -> Result<AccountUpdate, RestError> {
+        self.account_positions_at(&timestamp_now(), instrument_type, symbol)
+            .await
+    }
+
+    pub async fn account_positions_at(
+        &self,
+        timestamp: &str,
+        instrument_type: Option<OkxInstrumentType>,
+        symbol: Option<&str>,
+    ) -> Result<AccountUpdate, RestError> {
+        let path = query_path(
+            ACCOUNT_POSITIONS_PATH,
+            [
+                ("instType", instrument_type.map(OkxInstrumentType::as_str)),
+                ("instId", symbol),
+            ],
+        );
+        let request = self
+            .signer
+            .sign_request(timestamp, HttpMethod::Get, path, "")?;
+        let response: OkxResponse<OkxPositionWire> = self.execute(request).await?;
+        let mut ts_ms = 0;
+        let positions = response
+            .data
+            .into_iter()
+            .map(|wire| {
+                let (position_ts_ms, position) = wire.try_into_position()?;
+                ts_ms = ts_ms.max(position_ts_ms);
+                Ok(position)
+            })
+            .collect::<Result<Vec<_>, RestError>>()?;
+        Ok(AccountUpdate {
+            ts_ms,
+            balances: Vec::new(),
+            positions,
+            margins: Vec::new(),
+        })
     }
 
     pub fn build_place_request(
@@ -425,6 +702,202 @@ struct OkxAckWire {
 }
 
 #[derive(Debug, Deserialize)]
+struct OkxInstrumentWire {
+    #[serde(rename = "instId")]
+    symbol: String,
+    #[serde(rename = "instType")]
+    instrument_type: String,
+    #[serde(default, rename = "instFamily")]
+    instrument_family: String,
+    #[serde(default, rename = "uly")]
+    underlying: String,
+    #[serde(default, rename = "baseCcy")]
+    base_currency: String,
+    #[serde(default, rename = "quoteCcy")]
+    quote_currency: String,
+    #[serde(default, rename = "settleCcy")]
+    settle_currency: String,
+    #[serde(default, rename = "ctType")]
+    contract_type: String,
+    #[serde(default, rename = "ctVal")]
+    contract_value: String,
+    #[serde(default, rename = "ctValCcy")]
+    contract_value_currency: String,
+    #[serde(rename = "tickSz")]
+    tick_size: String,
+    #[serde(rename = "lotSz")]
+    lot_size: String,
+    #[serde(rename = "minSz")]
+    min_size: String,
+    state: String,
+}
+
+impl TryFrom<OkxInstrumentWire> for OkxInstrument {
+    type Error = RestError;
+
+    fn try_from(value: OkxInstrumentWire) -> Result<Self, Self::Error> {
+        Ok(Self {
+            symbol: value.symbol,
+            instrument_type: parse_instrument_type(&value.instrument_type)?,
+            instrument_family: value.instrument_family,
+            underlying: value.underlying,
+            base_currency: value.base_currency,
+            quote_currency: value.quote_currency,
+            settle_currency: value.settle_currency,
+            contract_type: parse_contract_type(&value.contract_type)?,
+            contract_value: parse_nullable_number("ctVal", &value.contract_value)?,
+            contract_value_currency: value.contract_value_currency,
+            tick_size: parse_positive_number("tickSz", &value.tick_size)?,
+            lot_size: parse_positive_number("lotSz", &value.lot_size)?,
+            min_size: parse_positive_number("minSz", &value.min_size)?,
+            state: value.state,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct OkxAccountConfigWire {
+    #[serde(rename = "acctLv")]
+    account_level: String,
+    #[serde(rename = "posMode")]
+    position_mode: String,
+    #[serde(default, rename = "acctStpMode")]
+    account_stp_mode: String,
+    #[serde(default)]
+    uid: String,
+    #[serde(default, rename = "mainUid")]
+    main_user_id: String,
+}
+
+impl TryFrom<OkxAccountConfigWire> for OkxAccountConfig {
+    type Error = RestError;
+
+    fn try_from(value: OkxAccountConfigWire) -> Result<Self, Self::Error> {
+        Ok(Self {
+            account_level: parse_account_level(&value.account_level)?,
+            position_mode: parse_position_mode(&value.position_mode)?,
+            account_stp_mode: value.account_stp_mode,
+            user_id: value.uid,
+            main_user_id: value.main_user_id,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct OkxAccountBalanceWire {
+    #[serde(default, rename = "uTime")]
+    update_time: String,
+    #[serde(default, rename = "mgnRatio")]
+    margin_ratio: String,
+    #[serde(default, rename = "adjEq")]
+    adjusted_equity: String,
+    #[serde(default, rename = "notionalUsd")]
+    notional_usd: String,
+    #[serde(default)]
+    details: Vec<OkxBalanceWire>,
+}
+
+impl TryFrom<OkxAccountBalanceWire> for AccountUpdate {
+    type Error = RestError;
+
+    fn try_from(value: OkxAccountBalanceWire) -> Result<Self, Self::Error> {
+        let exchange_ratio = parse_nullable_number("mgnRatio", &value.margin_ratio)?;
+        let adjusted_equity_usd = parse_nullable_number("adjEq", &value.adjusted_equity)?;
+        let notional_usd = parse_nullable_number("notionalUsd", &value.notional_usd)?;
+        let margins = if exchange_ratio.is_none()
+            && adjusted_equity_usd.is_none()
+            && notional_usd.is_none()
+        {
+            Vec::new()
+        } else {
+            vec![MarginSnapshot {
+                account_id: None,
+                ratio: None,
+                exchange_ratio,
+                adjusted_equity_usd,
+                notional_usd,
+            }]
+        };
+        let balances = value
+            .details
+            .into_iter()
+            .map(|detail| {
+                Ok(Balance {
+                    account_id: None,
+                    currency: detail.currency,
+                    total: parse_optional_number("cashBal", &detail.cash_balance)?,
+                    available: parse_optional_number("availBal", &detail.available_balance)?,
+                    equity: parse_optional_number("eq", &detail.equity)?,
+                    liability: parse_optional_number("liab", &detail.liability)?,
+                    max_loan: parse_optional_number("maxLoan", &detail.max_loan)?,
+                })
+            })
+            .collect::<Result<Vec<_>, RestError>>()?;
+        Ok(AccountUpdate {
+            ts_ms: parse_optional_integer("uTime", &value.update_time)?,
+            balances,
+            positions: Vec::new(),
+            margins,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct OkxBalanceWire {
+    #[serde(rename = "ccy")]
+    currency: String,
+    #[serde(default, rename = "cashBal")]
+    cash_balance: String,
+    #[serde(default, rename = "availBal")]
+    available_balance: String,
+    #[serde(default, rename = "eq")]
+    equity: String,
+    #[serde(default, rename = "liab")]
+    liability: String,
+    #[serde(default, rename = "maxLoan")]
+    max_loan: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OkxPositionWire {
+    #[serde(rename = "instId")]
+    symbol: String,
+    #[serde(rename = "pos")]
+    qty: String,
+    #[serde(default, rename = "avgPx")]
+    average_price: String,
+    #[serde(default, rename = "posSide")]
+    position_side: String,
+    #[serde(default, rename = "uTime")]
+    update_time: String,
+}
+
+impl OkxPositionWire {
+    fn try_into_position(self) -> Result<(u64, Position), RestError> {
+        let mut qty = parse_number("pos", &self.qty)?;
+        match self.position_side.as_str() {
+            "" | "net" | "long" => {}
+            "short" => qty = -qty.abs(),
+            other => {
+                return Err(RestError::InvalidField {
+                    field: "posSide",
+                    value: other.to_string(),
+                    message: "expected net, long, or short".to_string(),
+                });
+            }
+        }
+        Ok((
+            parse_optional_integer("uTime", &self.update_time)?,
+            Position {
+                symbol: self.symbol,
+                qty,
+                avg_price: parse_optional_number("avgPx", &self.average_price)?,
+            },
+        ))
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct OkxOrderWire {
     #[serde(default, rename = "ordId")]
     order_id: String,
@@ -493,10 +966,15 @@ impl TryFrom<OkxFillWire> for RemoteFill {
     type Error = RestError;
 
     fn try_from(value: OkxFillWire) -> Result<Self, Self::Error> {
+        let client_order_id = if value.client_order_id == "0" {
+            String::new()
+        } else {
+            value.client_order_id
+        };
         Ok(Self {
             fill_id: value.fill_id,
             exchange_order_id: value.order_id,
-            client_order_id: value.client_order_id,
+            client_order_id,
             symbol: value.symbol,
             side: parse_side(&value.side)?,
             price: parse_number("fillPx", &value.price)?,
@@ -529,6 +1007,60 @@ fn parse_side(value: &str) -> Result<Side, RestError> {
     }
 }
 
+fn parse_instrument_type(value: &str) -> Result<OkxInstrumentType, RestError> {
+    match value {
+        "SPOT" => Ok(OkxInstrumentType::Spot),
+        "MARGIN" => Ok(OkxInstrumentType::Margin),
+        "SWAP" => Ok(OkxInstrumentType::Swap),
+        "FUTURES" => Ok(OkxInstrumentType::Futures),
+        "OPTION" => Ok(OkxInstrumentType::Option),
+        _ => Err(RestError::InvalidField {
+            field: "instType",
+            value: value.to_string(),
+            message: "unsupported instrument type".to_string(),
+        }),
+    }
+}
+
+fn parse_contract_type(value: &str) -> Result<Option<OkxContractType>, RestError> {
+    match value {
+        "" => Ok(None),
+        "linear" => Ok(Some(OkxContractType::Linear)),
+        "inverse" => Ok(Some(OkxContractType::Inverse)),
+        _ => Err(RestError::InvalidField {
+            field: "ctType",
+            value: value.to_string(),
+            message: "expected linear or inverse".to_string(),
+        }),
+    }
+}
+
+fn parse_account_level(value: &str) -> Result<OkxAccountLevel, RestError> {
+    match value {
+        "1" => Ok(OkxAccountLevel::Simple),
+        "2" => Ok(OkxAccountLevel::SingleCurrencyMargin),
+        "3" => Ok(OkxAccountLevel::MultiCurrencyMargin),
+        "4" => Ok(OkxAccountLevel::PortfolioMargin),
+        _ => Err(RestError::InvalidField {
+            field: "acctLv",
+            value: value.to_string(),
+            message: "expected account level 1 through 4".to_string(),
+        }),
+    }
+}
+
+fn parse_position_mode(value: &str) -> Result<OkxPositionMode, RestError> {
+    match value {
+        "long_short_mode" => Ok(OkxPositionMode::LongShortMode),
+        "net_mode" => Ok(OkxPositionMode::NetMode),
+        _ => Err(RestError::InvalidField {
+            field: "posMode",
+            value: value.to_string(),
+            message: "expected long_short_mode or net_mode".to_string(),
+        }),
+    }
+}
+
 fn parse_state(value: &str) -> Result<PrivateOrderState, RestError> {
     match value {
         "live" => Ok(PrivateOrderState::Live),
@@ -545,13 +1077,42 @@ fn parse_state(value: &str) -> Result<PrivateOrderState, RestError> {
 }
 
 fn parse_number(field: &'static str, value: &str) -> Result<f64, RestError> {
-    value
-        .parse()
-        .map_err(|error: std::num::ParseFloatError| RestError::InvalidField {
+    let parsed =
+        value
+            .parse()
+            .map_err(|error: std::num::ParseFloatError| RestError::InvalidField {
+                field,
+                value: value.to_string(),
+                message: error.to_string(),
+            })?;
+    if !f64::is_finite(parsed) {
+        return Err(RestError::InvalidField {
             field,
             value: value.to_string(),
-            message: error.to_string(),
-        })
+            message: "expected a finite number".to_string(),
+        });
+    }
+    Ok(parsed)
+}
+
+fn parse_positive_number(field: &'static str, value: &str) -> Result<f64, RestError> {
+    let parsed = parse_number(field, value)?;
+    if parsed <= 0.0 {
+        return Err(RestError::InvalidField {
+            field,
+            value: value.to_string(),
+            message: "expected a positive number".to_string(),
+        });
+    }
+    Ok(parsed)
+}
+
+fn parse_nullable_number(field: &'static str, value: &str) -> Result<Option<f64>, RestError> {
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        parse_number(field, value).map(Some)
+    }
 }
 
 fn parse_optional_number(field: &'static str, value: &str) -> Result<f64, RestError> {
@@ -692,5 +1253,76 @@ mod tests {
             requests[1].path,
             "/api/v5/trade/fills?instType=SPOT&instId=BTC-USDT"
         );
+    }
+
+    #[tokio::test]
+    async fn queries_terminal_order_details_by_client_id() {
+        let (client, requests) = client(vec![
+            r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"reap1","instId":"BTC-USDT","side":"buy","state":"canceled","px":"100","sz":"1","accFillSz":"0","avgPx":"","uTime":"1000"}]}"#,
+        ]);
+        let order = client
+            .order_details_at("time", "BTC-USDT", None, Some("reap1"))
+            .await
+            .unwrap();
+
+        assert_eq!(order.state, PrivateOrderState::Cancelled);
+        assert_eq!(
+            requests.lock().unwrap()[0].path,
+            "/api/v5/trade/order?instId=BTC-USDT&clOrdId=reap1"
+        );
+    }
+
+    #[tokio::test]
+    async fn parses_signed_bootstrap_metadata_and_account_state() {
+        let (client, requests) = client(vec![
+            r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","instType":"SWAP","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"USDT","ctType":"linear","ctVal":"0.01","ctValCcy":"BTC","tickSz":"0.1","lotSz":"1","minSz":"1","state":"live"}]}"#,
+            r#"{"code":"0","msg":"","data":[{"acctLv":"2","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"7","mainUid":"6"}]}"#,
+            r#"{"code":"0","msg":"","data":[{"uTime":"1000","mgnRatio":"12.5","adjEq":"10000","notionalUsd":"2000","details":[{"ccy":"USDT","cashBal":"9000","availBal":"8000","eq":"10000","liab":"0","maxLoan":"500"}]}]}"#,
+            r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","pos":"2","posSide":"net","avgPx":"50000","uTime":"1001"}]}"#,
+        ]);
+
+        let instruments = client
+            .account_instruments_at("time", OkxInstrumentType::Swap, Some("BTC-USDT-SWAP"))
+            .await
+            .unwrap();
+        let account = client.account_config_at("time").await.unwrap();
+        let balance = client.account_balance_at("time").await.unwrap();
+        let positions = client
+            .account_positions_at("time", Some(OkxInstrumentType::Swap), Some("BTC-USDT-SWAP"))
+            .await
+            .unwrap();
+
+        assert_eq!(instruments[0].contract_type, Some(OkxContractType::Linear));
+        assert_eq!(instruments[0].contract_value, Some(0.01));
+        assert_eq!(account.account_level, OkxAccountLevel::SingleCurrencyMargin);
+        assert_eq!(account.position_mode, OkxPositionMode::NetMode);
+        assert_eq!(balance.balances[0].available, 8000.0);
+        assert_eq!(balance.margins[0].exchange_ratio, Some(12.5));
+        assert_eq!(positions.positions[0].qty, 2.0);
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests[0].path,
+            "/api/v5/account/instruments?instType=SWAP&instId=BTC-USDT-SWAP"
+        );
+        assert_eq!(requests[1].path, ACCOUNT_CONFIG_PATH);
+        assert_eq!(requests[2].path, ACCOUNT_BALANCE_PATH);
+        assert_eq!(
+            requests[3].path,
+            "/api/v5/account/positions?instType=SWAP&instId=BTC-USDT-SWAP"
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.headers.contains_key("OK-ACCESS-SIGN"))
+        );
+    }
+
+    #[test]
+    fn rejects_non_finite_exchange_numbers() {
+        assert!(matches!(
+            parse_number("px", "NaN"),
+            Err(RestError::InvalidField { .. })
+        ));
     }
 }

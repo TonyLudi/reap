@@ -1,0 +1,397 @@
+use std::collections::{BTreeMap, HashSet};
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::LiveConfig;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LivePhase {
+    Configured,
+    Reconciling,
+    AwaitingStreams,
+    Ready,
+    Degraded,
+    Stopping,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadinessSnapshot {
+    pub phase: LivePhase,
+    pub metadata_verified: bool,
+    pub storage_ready: bool,
+    pub public_connectivity_ready: bool,
+    pub missing_reconciliation: Vec<String>,
+    pub missing_account_snapshots: Vec<String>,
+    pub missing_books: Vec<String>,
+    pub missing_private_streams: Vec<String>,
+    pub faults: BTreeMap<String, String>,
+}
+
+impl ReadinessSnapshot {
+    pub fn is_ready(&self) -> bool {
+        self.phase == LivePhase::Ready
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum StartupError {
+    #[error("unknown required account {0}")]
+    UnknownAccount(String),
+    #[error("unknown required symbol {0}")]
+    UnknownSymbol(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct StartupGate {
+    phase: LivePhase,
+    required_symbols: HashSet<String>,
+    required_accounts: HashSet<String>,
+    metadata_verified: bool,
+    storage_ready: bool,
+    public_connectivity_ready: bool,
+    reconciled_accounts: HashSet<String>,
+    account_snapshots: HashSet<String>,
+    ready_books: HashSet<String>,
+    ready_private_streams: HashSet<String>,
+    faults: BTreeMap<String, String>,
+    was_ready: bool,
+}
+
+impl StartupGate {
+    pub fn new(config: &LiveConfig) -> Self {
+        Self {
+            phase: LivePhase::Configured,
+            required_symbols: config.required_symbols(),
+            required_accounts: config.required_accounts(),
+            metadata_verified: false,
+            storage_ready: false,
+            public_connectivity_ready: false,
+            reconciled_accounts: HashSet::new(),
+            account_snapshots: HashSet::new(),
+            ready_books: HashSet::new(),
+            ready_private_streams: HashSet::new(),
+            faults: BTreeMap::new(),
+            was_ready: false,
+        }
+    }
+
+    pub fn phase(&self) -> LivePhase {
+        self.phase
+    }
+
+    pub fn can_submit_new(&self, order_entry_enabled: bool) -> bool {
+        order_entry_enabled && self.phase == LivePhase::Ready
+    }
+
+    pub fn can_cancel(&self) -> bool {
+        self.phase != LivePhase::Stopping
+    }
+
+    pub fn mark_metadata_verified(&mut self) {
+        self.metadata_verified = true;
+        self.faults.remove("metadata");
+        self.refresh();
+    }
+
+    pub fn mark_metadata_failed(&mut self, reason: impl Into<String>) {
+        self.metadata_verified = false;
+        self.faults.insert("metadata".to_string(), reason.into());
+        self.refresh();
+    }
+
+    pub fn mark_storage(&mut self, ready: bool, reason: impl Into<String>) {
+        self.storage_ready = ready;
+        set_fault(&mut self.faults, "storage", ready, reason);
+        self.refresh();
+    }
+
+    pub fn mark_public_connectivity(&mut self, ready: bool, reason: impl Into<String>) {
+        self.public_connectivity_ready = ready;
+        if ready {
+            self.faults.remove("public_connectivity");
+        } else if self.was_ready {
+            self.faults
+                .insert("public_connectivity".to_string(), reason.into());
+        }
+        self.refresh();
+    }
+
+    pub fn mark_reconciled(
+        &mut self,
+        account_id: &str,
+        clean: bool,
+        reason: impl Into<String>,
+    ) -> Result<(), StartupError> {
+        self.require_account(account_id)?;
+        if clean {
+            self.reconciled_accounts.insert(account_id.to_string());
+        } else {
+            self.reconciled_accounts.remove(account_id);
+        }
+        set_fault(
+            &mut self.faults,
+            &format!("reconcile:{account_id}"),
+            clean,
+            reason,
+        );
+        self.refresh();
+        Ok(())
+    }
+
+    pub fn mark_account_snapshot(
+        &mut self,
+        account_id: &str,
+        ready: bool,
+        reason: impl Into<String>,
+    ) -> Result<(), StartupError> {
+        self.require_account(account_id)?;
+        set_membership(&mut self.account_snapshots, account_id, ready);
+        set_fault(
+            &mut self.faults,
+            &format!("account_snapshot:{account_id}"),
+            ready,
+            reason,
+        );
+        self.refresh();
+        Ok(())
+    }
+
+    pub fn mark_book(
+        &mut self,
+        symbol: &str,
+        ready: bool,
+        reason: impl Into<String>,
+    ) -> Result<(), StartupError> {
+        self.require_symbol(symbol)?;
+        set_membership(&mut self.ready_books, symbol, ready);
+        set_fault(&mut self.faults, &format!("book:{symbol}"), ready, reason);
+        self.refresh();
+        Ok(())
+    }
+
+    pub fn mark_private_stream(
+        &mut self,
+        account_id: &str,
+        ready: bool,
+        reason: impl Into<String>,
+    ) -> Result<(), StartupError> {
+        self.require_account(account_id)?;
+        set_membership(&mut self.ready_private_streams, account_id, ready);
+        set_fault(
+            &mut self.faults,
+            &format!("private:{account_id}"),
+            ready,
+            reason,
+        );
+        self.refresh();
+        Ok(())
+    }
+
+    pub fn mark_runtime_health(
+        &mut self,
+        component: &str,
+        healthy: bool,
+        reason: impl Into<String>,
+    ) {
+        set_fault(
+            &mut self.faults,
+            &format!("runtime:{component}"),
+            healthy,
+            reason,
+        );
+        self.refresh();
+    }
+
+    pub fn stop(&mut self) {
+        self.phase = LivePhase::Stopping;
+    }
+
+    pub fn snapshot(&self) -> ReadinessSnapshot {
+        ReadinessSnapshot {
+            phase: self.phase,
+            metadata_verified: self.metadata_verified,
+            storage_ready: self.storage_ready,
+            public_connectivity_ready: self.public_connectivity_ready,
+            missing_reconciliation: missing(&self.required_accounts, &self.reconciled_accounts),
+            missing_account_snapshots: missing(&self.required_accounts, &self.account_snapshots),
+            missing_books: missing(&self.required_symbols, &self.ready_books),
+            missing_private_streams: missing(&self.required_accounts, &self.ready_private_streams),
+            faults: self.faults.clone(),
+        }
+    }
+
+    fn refresh(&mut self) {
+        if self.phase == LivePhase::Stopping {
+            return;
+        }
+        if !self.faults.is_empty() {
+            self.phase = LivePhase::Degraded;
+            return;
+        }
+        if !self.metadata_verified {
+            self.phase = LivePhase::Configured;
+            return;
+        }
+        let accounts_bootstrapped = is_complete(&self.required_accounts, &self.reconciled_accounts)
+            && is_complete(&self.required_accounts, &self.account_snapshots)
+            && self.storage_ready;
+        if !accounts_bootstrapped {
+            self.phase = if self.was_ready {
+                LivePhase::Degraded
+            } else {
+                LivePhase::Reconciling
+            };
+            return;
+        }
+        let streams_ready = is_complete(&self.required_symbols, &self.ready_books)
+            && is_complete(&self.required_accounts, &self.ready_private_streams)
+            && self.public_connectivity_ready;
+        if streams_ready {
+            self.phase = LivePhase::Ready;
+            self.was_ready = true;
+        } else {
+            self.phase = if self.was_ready {
+                LivePhase::Degraded
+            } else {
+                LivePhase::AwaitingStreams
+            };
+        }
+    }
+
+    fn require_account(&self, account_id: &str) -> Result<(), StartupError> {
+        if self.required_accounts.contains(account_id) {
+            Ok(())
+        } else {
+            Err(StartupError::UnknownAccount(account_id.to_string()))
+        }
+    }
+
+    fn require_symbol(&self, symbol: &str) -> Result<(), StartupError> {
+        if self.required_symbols.contains(symbol) {
+            Ok(())
+        } else {
+            Err(StartupError::UnknownSymbol(symbol.to_string()))
+        }
+    }
+}
+
+fn set_membership(values: &mut HashSet<String>, value: &str, present: bool) {
+    if present {
+        values.insert(value.to_string());
+    } else {
+        values.remove(value);
+    }
+}
+
+fn set_fault(
+    faults: &mut BTreeMap<String, String>,
+    key: &str,
+    healthy: bool,
+    reason: impl Into<String>,
+) {
+    if healthy {
+        faults.remove(key);
+    } else {
+        faults.insert(key.to_string(), reason.into());
+    }
+}
+
+fn is_complete(required: &HashSet<String>, ready: &HashSet<String>) -> bool {
+    required.is_subset(ready)
+}
+
+fn missing(required: &HashSet<String>, ready: &HashSet<String>) -> Vec<String> {
+    let mut values = required.difference(ready).cloned().collect::<Vec<_>>();
+    values.sort();
+    values
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use reap_risk::RiskLimits;
+    use reap_strategy::ChaosConfig;
+    use reap_venue::okx::{OkxAccountLevel, OkxPositionMode};
+
+    use crate::{
+        LiveAccountConfig, LiveStorageConfig, OkxTradeModeConfig, OkxVenueConfig, RuntimeConfig,
+    };
+
+    use super::*;
+
+    fn config() -> LiveConfig {
+        let mut strategy: ChaosConfig =
+            toml::from_str(include_str!("../../../examples/iarb2-basic.toml")).unwrap();
+        strategy.risk_groups[0].account_id = Some("main".to_string());
+        LiveConfig {
+            strategy,
+            risk: RiskLimits::default(),
+            venue: OkxVenueConfig::default(),
+            runtime: RuntimeConfig::default(),
+            storage: LiveStorageConfig::default(),
+            accounts: vec![LiveAccountConfig {
+                id: "main".to_string(),
+                api_key_env: "KEY".to_string(),
+                secret_key_env: "SECRET".to_string(),
+                passphrase_env: "PASS".to_string(),
+                expected_account_level: OkxAccountLevel::SingleCurrencyMargin,
+                expected_position_mode: OkxPositionMode::NetMode,
+                id_prefix: "reap".to_string(),
+                node_id: 1,
+                trade_modes: HashMap::from([
+                    ("BTC-USDT".to_string(), OkxTradeModeConfig::Cash),
+                    ("BTC-PERP".to_string(), OkxTradeModeConfig::Cross),
+                ]),
+            }],
+        }
+    }
+
+    #[test]
+    fn readiness_requires_every_bootstrap_and_stream_invariant() {
+        let mut gate = StartupGate::new(&config());
+        assert_eq!(gate.phase(), LivePhase::Configured);
+        gate.mark_metadata_verified();
+        assert_eq!(gate.phase(), LivePhase::Reconciling);
+        gate.mark_storage(true, "open");
+        gate.mark_public_connectivity(true, "connected");
+        gate.mark_reconciled("main", true, "clean").unwrap();
+        gate.mark_account_snapshot("main", true, "loaded").unwrap();
+        assert_eq!(gate.phase(), LivePhase::AwaitingStreams);
+        gate.mark_book("BTC-USDT", true, "snapshot").unwrap();
+        gate.mark_book("BTC-PERP", true, "snapshot").unwrap();
+        assert_eq!(gate.phase(), LivePhase::AwaitingStreams);
+        gate.mark_private_stream("main", true, "heartbeat").unwrap();
+        assert!(gate.snapshot().is_ready());
+        assert!(gate.can_submit_new(true));
+        assert!(!gate.can_submit_new(false));
+    }
+
+    #[test]
+    fn ready_gate_degrades_immediately_and_recovers_explicitly() {
+        let mut gate = StartupGate::new(&config());
+        gate.mark_metadata_verified();
+        gate.mark_storage(true, "open");
+        gate.mark_public_connectivity(true, "connected");
+        gate.mark_reconciled("main", true, "clean").unwrap();
+        gate.mark_account_snapshot("main", true, "loaded").unwrap();
+        gate.mark_book("BTC-USDT", true, "snapshot").unwrap();
+        gate.mark_book("BTC-PERP", true, "snapshot").unwrap();
+        gate.mark_private_stream("main", true, "heartbeat").unwrap();
+
+        gate.mark_book("BTC-USDT", false, "sequence gap").unwrap();
+        assert_eq!(gate.phase(), LivePhase::Degraded);
+        assert!(!gate.can_submit_new(true));
+        assert!(gate.can_cancel());
+        gate.mark_book("BTC-USDT", true, "recovered snapshot")
+            .unwrap();
+        assert_eq!(gate.phase(), LivePhase::Ready);
+
+        gate.mark_public_connectivity(false, "auxiliary channel disconnected");
+        assert_eq!(gate.phase(), LivePhase::Degraded);
+        gate.mark_public_connectivity(true, "redundant channel recovered");
+        assert_eq!(gate.phase(), LivePhase::Ready);
+    }
+}

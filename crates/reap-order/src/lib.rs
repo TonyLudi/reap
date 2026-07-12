@@ -187,6 +187,23 @@ impl OrderReducer {
             .expect("inserted order snapshot must exist")
     }
 
+    pub fn pending_new(
+        &mut self,
+        order_id: impl Into<String>,
+        order: NewOrder,
+        ts_ms: TimeMs,
+    ) -> OrderUpdate {
+        let order_id = order_id.into();
+        self.create_pending(order_id.clone(), order);
+        let update = self
+            .orders
+            .get(&order_id)
+            .expect("newly-created order must exist")
+            .to_update(ts_ms, OrderEvent::PendingNew, "pending_new");
+        self.record_update(&update);
+        update
+    }
+
     pub fn ack_new(
         &mut self,
         order_id: impl Into<String>,
@@ -235,6 +252,17 @@ impl OrderReducer {
         }
         snapshot.status = OrderStatus::Cancelled;
         let update = snapshot.to_update(ts_ms, OrderEvent::Cancelled, reason);
+        self.record_update(&update);
+        Some(update)
+    }
+
+    pub fn reject(&mut self, order_id: &str, ts_ms: TimeMs, reason: &str) -> Option<OrderUpdate> {
+        let snapshot = self.orders.get_mut(order_id)?;
+        if snapshot.is_terminal() {
+            return None;
+        }
+        snapshot.status = OrderStatus::Rejected;
+        let update = snapshot.to_update(ts_ms, OrderEvent::Rejected, reason);
         self.record_update(&update);
         Some(update)
     }
