@@ -215,6 +215,8 @@ Responsibilities:
   with contradictory journal history rejected and active bindings restored
   before startup REST reduction; private order/fill symbol ownership and
   immutable symbol/side checks occur before canonical state mutation.
+- Semantic private-order deduplication treats repeated fill IDs and unchanged
+  terminal order states as duplicates independently of exchange update time.
 - REST reconciliation for open orders, fills, balances, and positions.
 - Authoritative account-snapshot replacement with zero tombstones for balances
   and positions omitted after closure, plus per-row monotonic update guards.

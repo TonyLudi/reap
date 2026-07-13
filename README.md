@@ -24,10 +24,11 @@ Implemented:
   convergence deadlines, global/per-symbol active-order count ceilings, rolling
   exchange-order rejection and unfilled-IOC cancellation circuits, strict
   configured-account position and private-order ownership, restart-recovered
-  one-to-one exchange/client order identity, continuous derivative position
-  margin-mode enforcement, forced-repayment risk blocking, and an event-loop
-  enforcement layer that promotes terminal strategy safety halts into durable
-  global risk latches.
+  one-to-one exchange/client order identity, timestamp-independent private
+  fill/terminal deduplication, continuous derivative position margin-mode
+  enforcement, forced-repayment risk blocking, and an event-loop enforcement
+  layer that promotes terminal strategy safety halts into durable global risk
+  latches.
 - Bounded structured telemetry and JSONL storage for raw, normalized, intent,
   request, acknowledgement, order, fill, system, bootstrap, reconciliation,
   and write-ahead safety-latch records, including restart recovery and an

@@ -133,6 +133,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
   order identity, recover the one-to-one bindings from the journal, resolve
   empty/`0` private IDs consistently across live and reconciliation, and reject
   wrong-account or immutable symbol/side changes before state mutation.
+- [x] Suppress OKX private order duplicates by fill ID or unchanged terminal
+  order state even when repeated channel messages carry a different update
+  timestamp.
 - [x] Require every canonical derivative fill to converge to its position row
   and every spot fill to both currency balances within a configured deadline;
   fail closed and reconcile the account on timeout.

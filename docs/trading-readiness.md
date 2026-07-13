@@ -12,7 +12,7 @@ production trading process.
 | Iarb2 decision model | Covered for the documented OKX parity boundary | Not a blocker |
 | Deterministic backtest/data | Shared strategy code, depth matching, queue-ahead model, fees, credential-free redundant public capture, create-new session files, and raw/normalized replay | Needs sustained full-depth capture and venue-data calibration before capital decisions |
 | Feed components | Redundant public sockets, isolated private sockets, transport/state freshness separation, account-plus-positions health rounds, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
-| Order components | Event-loop client IDs/registration, exchange/client acknowledgement binding, account-scoped immutable private identity, exchange-side place-request expiry, signed submit/cancel, pacing, monotonic private reduction, submit/cancel state-convergence deadlines, typed position margin mode, ambiguity handling, and full order/fill/balance/position REST reconciliation are composed | Needs demo exchange fault evidence |
+| Order components | Event-loop client IDs/registration, exchange/client acknowledgement binding, account-scoped immutable private identity, semantic duplicate suppression across changed exchange timestamps, exchange-side place-request expiry, signed submit/cancel, pacing, monotonic private reduction, submit/cancel state-convergence deadlines, typed position margin mode, ambiguity handling, and full order/fill/balance/position REST reconciliation are composed | Needs demo exchange fault evidence |
 | Runtime risk | Instrument models, authoritative startup positions, active-order count/notional ceilings, rolling submit-rejection and zero-fill IOC-cancel circuits, terminal strategy-halt promotion, position scope/mode enforcement, forced-repayment blocking, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed deadman/depeg/convergence evidence |
 | Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, and strict bounded soak reports | Demo-capable; production entry intentionally unavailable |
 | Instrument/account bootstrap | Account instruments/config/balance/positions are typed; live spot is cash-only; nonzero positions require configured account ownership and derivative mode before strategy/risk application | Needs target-account certification |
@@ -154,6 +154,10 @@ production trading process.
     REST reduction. Empty/`0` private IDs resolve through the same map;
     wrong-account symbols, either-direction rebinding, and known-order
     symbol/side changes fail before canonical order or fill state mutates.
+29. Private order reduction suppresses an already-seen fill ID when status is
+    unchanged and cumulative fill does not advance, plus repeated unchanged
+    terminal states by canonical order ID, even when OKX sends a different
+    update timestamp.
 
 ## Remaining Demo Gate
 

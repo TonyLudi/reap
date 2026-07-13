@@ -339,6 +339,18 @@ impl PrivateStateReducer {
             &update.symbol,
             update.side,
         )?;
+        let incoming_status = canonical_status(update.state);
+        let duplicate_fill_id = update
+            .fill_id
+            .as_ref()
+            .is_some_and(|fill_id| self.seen_fill_ids.contains(fill_id));
+        if existing.as_ref().is_some_and(|order| {
+            order.status == incoming_status
+                && update.cumulative_filled_qty <= prior
+                && (order.is_terminal() || duplicate_fill_id)
+        }) {
+            return Ok(None);
+        }
         let last_update_ms = self
             .last_order_update_ms
             .get(&order_id)
@@ -403,7 +415,7 @@ impl PrivateStateReducer {
         } else {
             existing.as_ref().map(|order| order.price).unwrap_or(0.0)
         };
-        let mut status = canonical_status(update.state);
+        let mut status = incoming_status;
         if existing.as_ref().is_some_and(|order| order.is_terminal()) && !incoming_terminal {
             status = existing.as_ref().expect("checked existing order").status;
         }
@@ -662,6 +674,29 @@ mod tests {
             0.4
         );
         assert_eq!(reducer.canonical_order_id("exchange-1"), Some("client-1"));
+    }
+
+    #[test]
+    fn semantic_private_duplicates_ignore_timestamp_changes() {
+        let mut reducer = PrivateStateReducer::new();
+        reducer.apply_order(private_fill()).unwrap().unwrap();
+
+        let mut duplicate_fill = private_fill();
+        duplicate_fill.ts_ms = 11;
+        assert!(reducer.apply_order(duplicate_fill).unwrap().is_none());
+        assert_eq!(reducer.last_order_update_ms("client-1"), Some(10));
+
+        let mut cancelled = private_fill();
+        cancelled.ts_ms = 12;
+        cancelled.state = PrivateOrderState::Cancelled;
+        cancelled.last_fill_qty = 0.0;
+        let canonical = reducer.apply_order(cancelled.clone()).unwrap().unwrap();
+        assert_eq!(canonical.status, OrderStatus::Cancelled);
+        assert_eq!(canonical.last_fill_qty, 0.0);
+
+        cancelled.ts_ms = 13;
+        assert!(reducer.apply_order(cancelled).unwrap().is_none());
+        assert_eq!(reducer.last_order_update_ms("client-1"), Some(12));
     }
 
     #[test]

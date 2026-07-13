@@ -279,6 +279,11 @@ settings; accepting only their static flags would weaken live stop behavior.
   are fatal lifecycle errors; the raw frame is already journaled, no corrupted
   canonical state is applied, and normal runtime failure cleanup cancels and
   reconciles managed accounts.
+- OKX may repeat order-channel messages with a different `uTime`. Reap suppresses
+  a repeated fill ID when status is unchanged and cumulative fill does not
+  advance, and suppresses an unchanged terminal status by canonical order ID. A
+  genuine state transition or cumulative-fill increase still reaches the event
+  loop. This follows the current [OKX order-channel duplicate guidance](https://www.okx.com/docs-v5/log_en/#order-channel-revamp).
 
 ## Forced Repayment Risk
 
