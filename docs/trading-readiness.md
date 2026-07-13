@@ -10,7 +10,7 @@ production trading process.
 | Area | Current state | Trading impact |
 | --- | --- | --- |
 | Iarb2 decision model | Covered for the documented OKX parity boundary | Not a blocker |
-| Deterministic backtest/data | Shared strategy code, immediate pending-order registration, arrival-time scheduler, configurable market/entry/cancel/order/account delays, Java-referenced conservative depth-fill threshold, queue/trade/depth capacity haircuts, fee/turnover attribution, scheduled linear/inverse funding, accounting completeness signals, credential-free redundant public capture, exact SHA/config provenance, streaming analysis, and raw/normalized replay | Execution/accounting assumptions remain uncalibrated; needs sustained full-depth capture, complete funding intervals, borrow/fee calibration, and statement reconciliation before capital decisions |
+| Deterministic backtest/data | Shared strategy code, immediate pending-order registration, arrival-time scheduler, configurable market/entry/cancel/order/account delays, Java-referenced conservative depth-fill threshold, queue/trade/depth capacity haircuts, event-clock drawdown/exposure/inventory metrics, fee/turnover attribution, scheduled linear/inverse funding, manifest-driven chronological walk-forward selection and stress gates, credential-free redundant public capture, exact provenance, streaming analysis, and raw/normalized replay | Execution/accounting assumptions remain uncalibrated; needs sustained full-depth capture, complete funding intervals, depeg-sensitive quote valuation, borrow/fee calibration, statement reconciliation, and real production-candidate reports before capital decisions |
 | Feed components | Redundant public sockets, isolated private sockets, transport/state freshness separation, account-plus-positions health rounds, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
 | Order components | Event-loop client IDs/registration, exchange/client acknowledgement binding, account-scoped immutable private identity, semantic duplicate suppression across changed exchange timestamps, exchange-side place-request expiry, signed submit/cancel, pacing, monotonic private reduction, submit/cancel state-convergence deadlines, typed position margin mode, ambiguity handling, and full order/fill/balance/position REST reconciliation are composed | Needs demo exchange fault evidence |
 | Runtime risk | Instrument models, authoritative startup positions, active-order count/notional ceilings, rolling submit-rejection and zero-fill IOC-cancel circuits, terminal strategy-halt promotion, position scope/mode enforcement, forced-repayment blocking, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed deadman/depeg/convergence evidence |
@@ -183,6 +183,18 @@ production trading process.
     behavior; higher queue and lower participation/capacity values support
     deterministic stress runs. They remain global heuristics and do not model
     hidden liquidity, cancellation flow, or venue queue priority.
+33. A versioned research manifest now selects candidates from training data
+    only, enforces chronological non-overlap, applies conservative baseline and
+    stress scenarios to the selected candidate's test data, and emits immutable
+    manifest/binary/config/effective-strategy/data fingerprints plus embedded
+    selection and gate policy, accounting, drawdown, position/pending delta,
+    gross position/active-order exposure, inventory-duration, and pending-work
+    results. Production raw inputs must also pass embedded capture-config-bound
+    multi-source/candidate-channel analysis and an independent zero-gap replay
+    check before selection. The checked-in
+    smoke fold validates plumbing with permissive uncalibrated gates and negative
+    fee-adjusted PnL; it is not production evidence. Each dataset currently
+    starts from zero rather than carrying Java's daily ending positions.
 
 ## Remaining Demo Gate
 
@@ -219,8 +231,10 @@ Production enablement additionally requires:
 - Full-depth historical data and calibrated queue, latency, fee, funding, and
   slippage assumptions, including empirical per-message/per-instrument delay
   distributions and empirical validation of the displayed-depth fill threshold.
-- Walk-forward and out-of-sample evaluation, parameter sensitivity, capacity,
-  inventory-duration, and stressed-liquidity reports.
+- Completed `production_candidate` walk-forward and out-of-sample manifests
+  using calibrated assumptions, sustained captures, parameter sensitivity,
+  capacity, inventory-duration, and stressed-liquidity reports. The runner is
+  implemented; no qualifying report has been produced.
 - Target-account calibration and independent exercise of the implemented
   stablecoin guard; either implementation and exercise of external
   strategy-group/master coordination or continued rejection of those settings;

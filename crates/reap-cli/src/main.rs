@@ -1,9 +1,10 @@
 use std::path::PathBuf;
 use std::time::Duration;
+use std::{fs::OpenOptions, io::Write};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use reap_backtest::{BacktestConfig, BacktestRunner};
+use reap_backtest::{BacktestConfig, BacktestRunner, run_research_manifest_path};
 use reap_capture::{CaptureConfig, CaptureRunOptions, analyze_capture_path, run_capture};
 use reap_live::{
     EmergencyCancelOptions, LiveConfig, LiveMode, LiveRunOptions, OperatorCommand,
@@ -35,6 +36,24 @@ enum Command {
             help = "Exit non-zero on late, invalid, missed, or failed funding accounting"
         )]
         require_complete_accounting: bool,
+    },
+    #[command(about = "Run deterministic walk-forward selection and execution sensitivity gates")]
+    Research {
+        #[arg(short, long)]
+        manifest: PathBuf,
+        #[arg(
+            short,
+            long,
+            help = "Create a JSON evidence artifact; an existing path is refused"
+        )]
+        output: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Exit non-zero unless every configured research gate passes"
+        )]
+        require_pass: bool,
+        #[arg(long)]
+        pretty: bool,
     },
     ReplayCheck {
         #[arg(short, long)]
@@ -263,6 +282,37 @@ async fn main() -> Result<()> {
             }
             if require_complete_accounting && !report.accounting_complete {
                 anyhow::bail!("backtest accounting is incomplete");
+            }
+        }
+        Command::Research {
+            manifest,
+            output,
+            require_pass,
+            pretty,
+        } => {
+            let report = run_research_manifest_path(&manifest).with_context(|| {
+                format!("failed to run research manifest {}", manifest.display())
+            })?;
+            let json = if pretty {
+                serde_json::to_string_pretty(&report)?
+            } else {
+                serde_json::to_string(&report)?
+            };
+            if let Some(output) = output {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&output)
+                    .with_context(|| {
+                        format!("failed to create research output {}", output.display())
+                    })?;
+                file.write_all(json.as_bytes())?;
+                file.write_all(b"\n")?;
+                file.sync_all()?;
+            }
+            println!("{json}");
+            if require_pass && !report.passed {
+                anyhow::bail!("research report did not satisfy configured gates");
             }
         }
         Command::ReplayCheck {

@@ -114,6 +114,38 @@ impl MatchingEngine {
             .count()
     }
 
+    /// Gross notional of `PendingNew` and live order remainders at their limit prices.
+    pub fn active_order_notional_usd_checked(&self) -> Option<f64> {
+        let mut total = 0.0;
+        for (_, order) in self
+            .orders
+            .orders()
+            .filter(|(_, order)| order.status == OrderStatus::PendingNew || order.is_live())
+        {
+            let qty = order.open_qty.abs();
+            if !qty.is_finite() {
+                return None;
+            }
+            let notional = if self.instrument.kind.is_inverse() {
+                qty * self.instrument.contract_value
+            } else {
+                if !order.price.is_finite() || order.price <= 0.0 {
+                    return None;
+                }
+                if self.instrument.kind.is_spot() {
+                    qty * order.price
+                } else {
+                    qty * self.instrument.contract_value * order.price
+                }
+            };
+            if !notional.is_finite() {
+                return None;
+            }
+            total += notional;
+        }
+        total.is_finite().then_some(total)
+    }
+
     pub fn prepare_submit(&mut self, mut order: NewOrder, ts_ms: u64) -> (String, OrderUpdate) {
         let order_id = format!("{}-{}", self.symbol, self.next_order_id);
         self.next_order_id += 1;
@@ -575,6 +607,27 @@ mod tests {
         });
         assert_eq!(updates[0].event, OrderEvent::PendingNew);
         assert_eq!(updates[1].event, OrderEvent::Cancelled);
+    }
+
+    #[test]
+    fn active_order_notional_includes_pending_orders() {
+        let mut engine = MatchingEngine::new(inst());
+        engine.prepare_submit(
+            NewOrder {
+                symbol: "BTC-USDT".to_string(),
+                side: Side::Buy,
+                qty: 2.0,
+                price: 100.0,
+                time_in_force: TimeInForce::PostOnly,
+                reduce_only: false,
+                self_trade_prevention: None,
+                reason: "quote".to_string(),
+            },
+            1,
+        );
+
+        assert_eq!(engine.pending_order_count(), 1);
+        assert_eq!(engine.active_order_notional_usd_checked(), Some(200.0));
     }
 
     #[test]

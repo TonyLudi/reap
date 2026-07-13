@@ -129,6 +129,64 @@ impl Portfolio {
         equity
     }
 
+    pub fn equity_usd_checked(&self, marks: &HashMap<Symbol, f64>) -> Option<f64> {
+        let mut equity = self.cash_usd;
+        if !equity.is_finite() {
+            return None;
+        }
+        for (symbol, qty) in &self.positions {
+            let inst = self.instruments.get(symbol)?;
+            let inverse_cash_coin = self.inverse_cash_coin.get(symbol).copied().unwrap_or(0.0);
+            if *qty == 0.0 && (!inst.kind.is_inverse() || inverse_cash_coin == 0.0) {
+                continue;
+            }
+            let mark = marks
+                .get(symbol)
+                .copied()
+                .filter(|mark| mark.is_finite() && *mark > 0.0)?;
+            let contribution = if inst.kind.is_spot() {
+                qty * mark
+            } else if inst.kind.is_inverse() {
+                (inverse_cash_coin - qty * inst.contract_value / mark) * mark
+            } else {
+                qty * inst.contract_value * mark
+            };
+            if !contribution.is_finite() {
+                return None;
+            }
+            equity += contribution;
+        }
+        equity.is_finite().then_some(equity)
+    }
+
+    pub fn gross_exposure_usd_checked(&self, marks: &HashMap<Symbol, f64>) -> Option<f64> {
+        let mut gross_exposure = 0.0;
+        for (symbol, qty) in &self.positions {
+            let inst = self.instruments.get(symbol)?;
+            if *qty == 0.0 {
+                continue;
+            }
+            let notional = if inst.kind.is_inverse() {
+                qty * inst.contract_value
+            } else {
+                let mark = marks
+                    .get(symbol)
+                    .copied()
+                    .filter(|mark| mark.is_finite() && *mark > 0.0)?;
+                if inst.kind.is_spot() {
+                    qty * mark
+                } else {
+                    qty * inst.contract_value * mark
+                }
+            };
+            if !notional.is_finite() {
+                return None;
+            }
+            gross_exposure += notional.abs();
+        }
+        gross_exposure.is_finite().then_some(gross_exposure)
+    }
+
     pub fn cash_usd(&self) -> f64 {
         self.cash_usd
     }
@@ -256,5 +314,89 @@ mod tests {
 
         assert_eq!(funding_pnl, 5.0);
         assert_eq!(portfolio.funding_pnl_usd(), 5.0);
+    }
+
+    #[test]
+    fn checked_equity_requires_a_valid_mark_for_every_position() {
+        let instrument = InstrumentConfig {
+            symbol: "BTC-USDT".to_string(),
+            kind: InstrumentKindConfig::Spot,
+            taker_fee: 0.0,
+            ..InstrumentConfig::default()
+        };
+        let mut portfolio = Portfolio::new(&[instrument]);
+        portfolio.apply_fill(&fill("BTC-USDT", Side::Buy, 1.0, 100.0));
+
+        assert_eq!(portfolio.equity_usd_checked(&HashMap::new()), None);
+        assert_eq!(
+            portfolio.equity_usd_checked(&HashMap::from([("BTC-USDT".to_string(), 110.0)])),
+            Some(10.0)
+        );
+        assert_eq!(
+            portfolio.gross_exposure_usd_checked(&HashMap::from([("BTC-USDT".to_string(), 110.0)])),
+            Some(110.0)
+        );
+    }
+
+    #[test]
+    fn checked_equity_does_not_require_a_mark_for_a_flat_spot_position() {
+        let instrument = InstrumentConfig {
+            symbol: "BTC-USDT".to_string(),
+            kind: InstrumentKindConfig::Spot,
+            taker_fee: 0.0,
+            ..InstrumentConfig::default()
+        };
+        let mut portfolio = Portfolio::new(&[instrument]);
+        portfolio.apply_fill(&fill("BTC-USDT", Side::Buy, 1.0, 100.0));
+        portfolio.apply_fill(&fill("BTC-USDT", Side::Sell, 1.0, 110.0));
+
+        assert_eq!(portfolio.equity_usd_checked(&HashMap::new()), Some(10.0));
+        assert_eq!(
+            portfolio.gross_exposure_usd_checked(&HashMap::new()),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn checked_equity_requires_a_mark_for_flat_inverse_coin_cash() {
+        let instrument = InstrumentConfig {
+            symbol: "BTC-USD-SWAP".to_string(),
+            kind: InstrumentKindConfig::InverseSwap,
+            contract_value: 100.0,
+            taker_fee: 0.0,
+            ..InstrumentConfig::default()
+        };
+        let mut portfolio = Portfolio::new(&[instrument]);
+        portfolio.apply_fill(&fill("BTC-USD-SWAP", Side::Buy, 1.0, 50_000.0));
+        portfolio.apply_fill(&fill("BTC-USD-SWAP", Side::Sell, 1.0, 55_000.0));
+
+        assert_eq!(portfolio.equity_usd_checked(&HashMap::new()), None);
+        let equity = portfolio
+            .equity_usd_checked(&HashMap::from([("BTC-USD-SWAP".to_string(), 55_000.0)]))
+            .unwrap();
+        assert!((equity - 10.0).abs() < 1e-12);
+        assert_eq!(
+            portfolio.gross_exposure_usd_checked(&HashMap::new()),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn checked_gross_exposure_does_not_require_an_inverse_mark() {
+        let instrument = InstrumentConfig {
+            symbol: "BTC-USD-SWAP".to_string(),
+            kind: InstrumentKindConfig::InverseSwap,
+            contract_value: 100.0,
+            taker_fee: 0.0,
+            ..InstrumentConfig::default()
+        };
+        let mut portfolio = Portfolio::new(&[instrument]);
+        portfolio.apply_fill(&fill("BTC-USD-SWAP", Side::Buy, 2.0, 50_000.0));
+
+        assert_eq!(
+            portfolio.gross_exposure_usd_checked(&HashMap::new()),
+            Some(200.0)
+        );
+        assert_eq!(portfolio.equity_usd_checked(&HashMap::new()), None);
     }
 }

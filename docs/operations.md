@@ -99,7 +99,8 @@ Raw replay orders the local event loop by persisted `recv_ts_ns`; CSV and
 normalized replay use event timestamps. The runner applies market data first
 when an activation or cancel is due at the same scheduler instant. It stops at
 the last observed input instead of executing future actions against stale depth.
-Always inspect `input_clock_regressions`, `live_orders`,
+Always inspect `input_clock_regressions`, `live_orders`, `max_active_orders`,
+maximum/final active-order notional, maximum/final position and pending delta,
 `pending_scheduled_actions`, and the five pending-action category counts.
 Concurrent socket tasks can reach the single raw writer in a different order
 from their receive stamps even when each source is monotonic. Replay clamps
@@ -139,13 +140,87 @@ accounting incomplete. A future funding settlement beyond the capture horizon
 is reported as `pending_funding_actions` and is not itself a defect for the
 observed interval.
 
-The portfolio starts at zero and does not model borrowing interest, liquidation,
-margin discounts, taxes, or the future USD drift of coin-denominated fees. A
-research acceptance run must span held funding boundaries, use the target fee
-tier, and reconcile fill, fee, funding, cash, and equity attribution to demo
-account statements before profitability metrics are trusted.
+The portfolio starts at zero and treats USD-equivalent quote currencies at par;
+it does not model depeg-sensitive valuation, borrowing interest, liquidation,
+margin discounts, taxes, or the future USD drift of coin-denominated fees. Live
+stablecoin guards are not a substitute for that backtest limitation. A research
+acceptance run must span held funding boundaries, use the target fee tier, and
+reconcile fill, fee, funding, cash, equity, and active-order notional attribution
+to demo account statements before profitability metrics are trusted.
 Use `--require-complete-accounting` in automated research runs so any reported
 accounting defect also makes the command fail.
+
+### Walk-Forward And Sensitivity Research
+
+Verify the manifest-to-report path without claiming profitability:
+
+```bash
+rm -f /tmp/reap-research-smoke.json
+cargo run -p reap-cli -- research \
+  --manifest examples/research-smoke.toml \
+  --output /tmp/reap-research-smoke.json --require-pass --pretty
+```
+
+The smoke manifest has one tiny fold, one candidate, uncalibrated execution,
+permissive risk gates, and negative fee-adjusted baseline PnL. Its only purpose
+is testing candidate selection, chronology, stress propagation, provenance,
+artifact creation, and exit status.
+
+For real research, create a new manifest alongside immutable capture files:
+
+1. Set `mode = "production_candidate"` and retain the pinned Java revision.
+2. List explicit full candidate TOML files; the runner does not mutate arbitrary
+   strategy fields or generate an implicit parameter grid.
+3. Give every capture a unique dataset ID/path/content hash. Every test window
+   must occur strictly after its fold's training windows, and a test dataset can
+   belong to only one fold. Set each raw dataset's `capture_config` to the exact
+   capture-only TOML used for that session. Production mode reruns and retains
+   strict capture analysis plus a zero-gap raw replay check before candidate
+   evaluation. It also requires at least two connections per stream and the
+   book/trade/index/mark/limit/funding channels needed by every candidate.
+4. Define exactly one baseline using empirically calibrated execution values
+   and at least two stress scenarios. Stress delays, threshold, and queue can
+   only increase; trade/depth participation can only decrease.
+5. Set nonzero event, fill, and duration evidence minimums plus explicit PnL,
+   drawdown, terminal/maximum position and pending-hedge delta,
+   terminal/maximum gross position and active-order exposure, active-order
+   count, inventory-duration, clock-regression, accounting, and pending-work
+   gates.
+6. Run with a create-new `--output` path and `--require-pass`, then archive the
+   JSON beside the exact capture/config files and demo calibration evidence.
+
+Candidate scores use training runs only (`net_pnl_usd` or
+`pnl_per_turnover_bps`). Only the selected candidate is evaluated on test data.
+The report contains the selection rule, gate thresholds, every underlying run,
+aggregate gate failures, and SHA-256 for the manifest, executable, candidate
+files, effective strategies, and datasets. Candidates with identical effective
+strategy configuration are rejected even when file comments or `[backtest]`
+settings differ. Every file-backed input hash is checked again after all runs so
+input mutation aborts artifact creation. Existing output paths are refused so an
+acceptance artifact cannot be silently replaced.
+
+The embedded capture analysis binds the capture-config file hash, expected
+subscriptions, redundant source coverage, per-source timing, depth, session,
+and data hash to the dataset. The independent raw replay check also proves no
+sequence gap/recovery/failure and ready terminal books. File analysis cannot
+reconstruct runtime writer queue pressure, dropped-record counters, or the
+process exit path, so archive the original clean bounded-capture run report as
+separate required evidence.
+
+The three pending-work maxima bound delayed non-funding scheduler work,
+exchange `PendingNew` orders, and unresolved cancel requests at a data cutoff.
+They need not be zero: positive calibrated latency naturally censors the last
+captured event, and the runner does not execute future actions against stale
+depth. Resting live quotes are also valid at an arbitrary dataset boundary;
+bound them with `maximum_test_active_orders`, active-order notional gates, and
+pending-delta gates instead of treating them as completed work.
+
+Each dataset is an independent zero-initial-portfolio run. The report states
+`independent_zero_initial_portfolio`; unlike Java
+`ChaosBackTestMultiRunService`, Rust does not carry ending positions between
+files. Use a single continuous capture for an evaluation segment when position
+continuity matters and gate terminal delta/gross exposure. Never sum cross-file
+PnL as though positions had been carried.
 
 Strict analysis requires one capture session, every configured stream on its
 configured number of source connections, a ready book for every configured
@@ -221,6 +296,18 @@ capacity kept the same no-fill result and exposed three delayed strategy events
 plus the future funding action beyond the capture horizon. This short,
 fill-free run validates scheduling/provenance and assumption propagation only;
 it cannot calibrate any latency or fill assumption.
+
+The research runner then used the 45-second file as a training window and the
+later 60-second file as its test window. It independently reran config-bound
+capture analysis and raw replay for both inputs: all ten expected streams had
+complete redundant source coverage, both analyses were healthy, and both
+replays had zero gaps, recoveries, or errors. Baseline and latency/capacity
+stress runs remained fill-free; the latter retained three horizon-censored
+strategy events within its explicit pending-work limit. The permissive smoke
+artifact passed and has SHA-256
+`f8f6caf0e733d156a8fbd4adc21fd2fc669a1e00629c5cf944721c8bd1c08780`.
+This validates research orchestration and evidence binding only, not candidate
+quality or a production gate.
 
 These are connectivity, integrity, and replay-plumbing evidence only. They are
 not a sustained full-depth dataset, execution-model calibration, profitability

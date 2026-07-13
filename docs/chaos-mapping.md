@@ -87,6 +87,8 @@ The Rust scheduler was cross-checked against the pinned Java
 | Separate market depth/quote/trade delays | One global `market_data_latency_ms`, with raw replay ordered by persisted receive time | Partial; class- and instrument-specific distributions remain calibration work |
 | Conservative depth-fill threshold and queue reset on a shallow cross | `depth_fill_conservative_threshold`; basic cross clears queue-ahead and threshold cross controls displayed-depth fill | Exact formula and pinned Java application default; empirical calibration remains required |
 | Exact displayed queue and full historical trade/depth capacity | `queue_ahead_multiplier`, `historical_trade_fill_fraction`, and `displayed_depth_fill_fraction` | `1.0` preserves Java parity; conservative Rust sensitivity overlays are intentional and require empirical calibration |
+| Date-partitioned multi-run service and per-run result files | Manifest folds, immutable input fingerprints, candidate training selection, and test scenario reports | Rust extends the Java artifact boundary with explicit leakage and acceptance gates |
+| Carry ending positions into the following daily run | Every Rust research dataset starts from a zero portfolio and reports that semantic | Intentional current difference; use a continuous dataset and terminal exposure gates rather than assuming cross-file carry |
 
 Zero-delay and full-capacity fixture compatibility is intentional, but it is
 optimistic evidence, not a calibrated execution claim. Backtest reports retain

@@ -2,6 +2,7 @@ mod execution;
 mod matching;
 mod portfolio;
 mod replay;
+mod research;
 
 pub use execution::{BacktestConfig, BacktestExecutionConfig, BacktestTimeBasis};
 use matching::MatchingAssumptions;
@@ -10,6 +11,14 @@ pub use replay::{
     ReplayRow, TimedReplayEvent, load_events_from_path, load_normalized_jsonl,
     load_normalized_jsonl_from_path, replay_raw_capture, replay_raw_capture_path,
     replay_raw_capture_timed, replay_raw_capture_timed_path,
+};
+pub use research::{
+    CandidateProvenance, CandidateTrainingReport, DatasetPortfolioSemantics, DatasetProvenance,
+    FoldReport, PINNED_JAVA_REVISION, RESEARCH_SCHEMA_VERSION, ResearchAggregate,
+    ResearchCandidate, ResearchDataFormat, ResearchDataset, ResearchFold, ResearchGates,
+    ResearchManifest, ResearchMode, ResearchReport, ResearchRunReport, ResearchScenario,
+    ResearchScenarioKind, RunAggregate, SelectionMetric, TestScenarioReport,
+    run_research_manifest_path,
 };
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -59,11 +68,26 @@ pub struct BacktestReport {
     pub pending_cancel_requests: usize,
     pub final_delta_usd: f64,
     pub final_pending_delta_usd: f64,
+    pub final_active_order_notional_usd: f64,
     pub final_equity_usd: f64,
+    pub final_valuation_complete: bool,
+    pub final_gross_exposure_usd: f64,
     pub cash_usd: f64,
     pub fee_cost_usd: f64,
     pub funding_pnl_usd: f64,
     pub turnover_usd: f64,
+    pub observed_duration_ns: u64,
+    pub max_drawdown_usd: f64,
+    pub max_abs_delta_usd: f64,
+    pub max_abs_pending_delta_usd: f64,
+    pub max_gross_exposure_usd: f64,
+    pub max_active_orders: usize,
+    pub max_active_order_notional_usd: f64,
+    pub average_abs_delta_usd: f64,
+    pub inventory_open_duration_ns: u64,
+    pub inventory_open_fraction: f64,
+    pub risk_metric_samples: u64,
+    pub invalid_risk_metric_samples: u64,
     pub funding_rate_events: u64,
     pub funding_settlements: u64,
     pub late_funding_rate_events: u64,
@@ -71,7 +95,7 @@ pub struct BacktestReport {
     pub missed_funding_settlements: u64,
     pub funding_settlement_failures: u64,
     pub accounting_complete: bool,
-    pub positions: HashMap<Symbol, f64>,
+    pub positions: BTreeMap<Symbol, f64>,
 }
 
 #[derive(Debug)]
@@ -128,6 +152,20 @@ pub struct BacktestRunner {
     invalid_funding_rate_events: u64,
     missed_funding_settlements: u64,
     funding_settlement_failures: u64,
+    peak_equity_usd: f64,
+    max_drawdown_usd: f64,
+    max_abs_delta_usd: f64,
+    max_abs_pending_delta_usd: f64,
+    max_gross_exposure_usd: f64,
+    max_active_orders: usize,
+    max_active_order_notional_usd: f64,
+    abs_delta_time_integral: f64,
+    inventory_open_duration_ns: u64,
+    metric_clock_ns: Option<u64>,
+    current_abs_delta_usd: f64,
+    current_inventory_open: bool,
+    risk_metric_samples: u64,
+    invalid_risk_metric_samples: u64,
 }
 
 impl BacktestRunner {
@@ -196,6 +234,20 @@ impl BacktestRunner {
             invalid_funding_rate_events: 0,
             missed_funding_settlements: 0,
             funding_settlement_failures: 0,
+            peak_equity_usd: 0.0,
+            max_drawdown_usd: 0.0,
+            max_abs_delta_usd: 0.0,
+            max_abs_pending_delta_usd: 0.0,
+            max_gross_exposure_usd: 0.0,
+            max_active_orders: 0,
+            max_active_order_notional_usd: 0.0,
+            abs_delta_time_integral: 0.0,
+            inventory_open_duration_ns: 0,
+            metric_clock_ns: None,
+            current_abs_delta_usd: 0.0,
+            current_inventory_open: false,
+            risk_metric_samples: 0,
+            invalid_risk_metric_samples: 0,
         })
     }
 
@@ -260,6 +312,7 @@ impl BacktestRunner {
     ) -> Result<()> {
         let arrival_ns = self.register_input_arrival(candidate_arrival_ns);
         self.drain_before(arrival_ns)?;
+        self.advance_metric_clock(arrival_ns);
         self.now_ns = arrival_ns;
 
         match &event {
@@ -358,6 +411,7 @@ impl BacktestRunner {
                 self.drain_through(now_ns)?;
             }
         }
+        self.sample_risk_metrics();
         Ok(())
     }
 
@@ -456,6 +510,7 @@ impl BacktestRunner {
                     None => {}
                 }
                 self.portfolio.apply_fill(&update);
+                self.sample_risk_metrics();
                 Some(self.account_update_after_fill(&update))
             } else {
                 None
@@ -612,8 +667,11 @@ impl BacktestRunner {
                 .scheduled
                 .pop_first()
                 .expect("first scheduled action must still exist");
-            self.now_ns = self.now_ns.max(due_ns);
+            let action_ns = self.now_ns.max(due_ns);
+            self.advance_metric_clock(action_ns);
+            self.now_ns = action_ns;
             self.execute_action(action)?;
+            self.sample_risk_metrics();
             processed += 1;
             if processed > MAX_ACTIONS_PER_DRAIN {
                 bail!(
@@ -625,9 +683,80 @@ impl BacktestRunner {
         Ok(())
     }
 
-    fn finish_report(&mut self) -> Result<BacktestReport> {
-        let now_ns = self.now_ns;
-        self.drain_through(now_ns)?;
+    fn advance_metric_clock(&mut self, target_ns: u64) {
+        if let Some(previous_ns) = self.metric_clock_ns {
+            let elapsed_ns = target_ns.saturating_sub(previous_ns);
+            self.abs_delta_time_integral += self.current_abs_delta_usd * elapsed_ns as f64;
+            if self.current_inventory_open {
+                self.inventory_open_duration_ns =
+                    self.inventory_open_duration_ns.saturating_add(elapsed_ns);
+            }
+        }
+        self.metric_clock_ns = Some(target_ns);
+    }
+
+    fn sample_risk_metrics(&mut self) {
+        self.risk_metric_samples = self.risk_metric_samples.saturating_add(1);
+        let mut valid = true;
+        let marks = self.valuation_marks();
+        if let Some(equity_usd) = self.portfolio.equity_usd_checked(&marks) {
+            self.peak_equity_usd = self.peak_equity_usd.max(equity_usd);
+            self.max_drawdown_usd = self.max_drawdown_usd.max(self.peak_equity_usd - equity_usd);
+        } else {
+            valid = false;
+        }
+        if let Some(gross_exposure_usd) = self.portfolio.gross_exposure_usd_checked(&marks) {
+            self.max_gross_exposure_usd = self.max_gross_exposure_usd.max(gross_exposure_usd);
+        } else {
+            valid = false;
+        }
+
+        let abs_delta_usd = self.strategy.delta_usd().abs();
+        if abs_delta_usd.is_finite() {
+            self.current_abs_delta_usd = abs_delta_usd;
+            self.max_abs_delta_usd = self.max_abs_delta_usd.max(abs_delta_usd);
+        } else {
+            valid = false;
+        }
+        let abs_pending_delta_usd = self.strategy.pending_delta_usd().abs();
+        if abs_pending_delta_usd.is_finite() {
+            self.max_abs_pending_delta_usd =
+                self.max_abs_pending_delta_usd.max(abs_pending_delta_usd);
+        } else {
+            valid = false;
+        }
+        let active_orders = self
+            .matchers
+            .values()
+            .map(|matcher| matcher.pending_order_count() + matcher.live_order_count())
+            .sum();
+        self.max_active_orders = self.max_active_orders.max(active_orders);
+        let mut active_order_notional_usd = 0.0;
+        for matcher in self.matchers.values() {
+            let Some(notional_usd) = matcher.active_order_notional_usd_checked() else {
+                valid = false;
+                continue;
+            };
+            active_order_notional_usd += notional_usd;
+        }
+        if active_order_notional_usd.is_finite() {
+            self.max_active_order_notional_usd = self
+                .max_active_order_notional_usd
+                .max(active_order_notional_usd);
+        } else {
+            valid = false;
+        }
+        self.current_inventory_open = self
+            .portfolio
+            .positions()
+            .values()
+            .any(|quantity| *quantity != 0.0);
+        if !valid {
+            self.invalid_risk_metric_samples = self.invalid_risk_metric_samples.saturating_add(1);
+        }
+    }
+
+    fn valuation_marks(&self) -> HashMap<Symbol, f64> {
         let mut marks = self
             .matchers
             .iter()
@@ -635,6 +764,35 @@ impl BacktestRunner {
             .collect::<HashMap<_, _>>();
         marks.extend(self.depth_marks.clone());
         marks.extend(self.exchange_marks.clone());
+        marks
+    }
+
+    fn finish_report(&mut self) -> Result<BacktestReport> {
+        let now_ns = self.now_ns;
+        self.drain_through(now_ns)?;
+        self.advance_metric_clock(now_ns);
+        self.sample_risk_metrics();
+        let marks = self.valuation_marks();
+        let checked_final_equity = self.portfolio.equity_usd_checked(&marks);
+        let checked_final_active_order_notional = self
+            .matchers
+            .values()
+            .try_fold(0.0, |total, matcher| {
+                Some(total + matcher.active_order_notional_usd_checked()?)
+            })
+            .filter(|notional| notional.is_finite());
+        let checked_final_gross_exposure = self.portfolio.gross_exposure_usd_checked(&marks);
+        let final_delta_usd = self.strategy.delta_usd();
+        let final_pending_delta_usd = self.strategy.pending_delta_usd();
+        let final_valuation_complete = checked_final_equity.is_some()
+            && checked_final_active_order_notional.is_some()
+            && checked_final_gross_exposure.is_some()
+            && final_delta_usd.is_finite()
+            && final_pending_delta_usd.is_finite();
+        let final_equity_usd =
+            checked_final_equity.unwrap_or_else(|| self.portfolio.equity_usd(&marks));
+        let final_active_order_notional_usd = checked_final_active_order_notional.unwrap_or(0.0);
+        let final_gross_exposure_usd = checked_final_gross_exposure.unwrap_or(0.0);
         let pending_orders = self
             .matchers
             .values()
@@ -662,7 +820,24 @@ impl BacktestRunner {
         let accounting_complete = self.late_funding_rate_events == 0
             && self.invalid_funding_rate_events == 0
             && self.missed_funding_settlements == 0
-            && self.funding_settlement_failures == 0;
+            && self.funding_settlement_failures == 0
+            && self.invalid_risk_metric_samples == 0
+            && final_valuation_complete;
+        let observed_duration_ns = self
+            .first_arrival_ns
+            .zip(self.last_arrival_ns)
+            .map(|(first, last)| last.saturating_sub(first))
+            .unwrap_or(0);
+        let average_abs_delta_usd = if observed_duration_ns == 0 {
+            0.0
+        } else {
+            self.abs_delta_time_integral / observed_duration_ns as f64
+        };
+        let inventory_open_fraction = if observed_duration_ns == 0 {
+            0.0
+        } else {
+            self.inventory_open_duration_ns as f64 / observed_duration_ns as f64
+        };
 
         Ok(BacktestReport {
             execution: self.execution.clone(),
@@ -691,13 +866,28 @@ impl BacktestRunner {
             pending_orders,
             live_orders,
             pending_cancel_requests: self.pending_cancels.len(),
-            final_delta_usd: self.strategy.delta_usd(),
-            final_pending_delta_usd: self.strategy.pending_delta_usd(),
-            final_equity_usd: self.portfolio.equity_usd(&marks),
+            final_delta_usd,
+            final_pending_delta_usd,
+            final_active_order_notional_usd,
+            final_equity_usd,
+            final_valuation_complete,
+            final_gross_exposure_usd,
             cash_usd: self.portfolio.cash_usd(),
             fee_cost_usd: self.portfolio.fee_cost_usd(),
             funding_pnl_usd: self.portfolio.funding_pnl_usd(),
             turnover_usd: self.portfolio.turnover_usd(),
+            observed_duration_ns,
+            max_drawdown_usd: self.max_drawdown_usd,
+            max_abs_delta_usd: self.max_abs_delta_usd,
+            max_abs_pending_delta_usd: self.max_abs_pending_delta_usd,
+            max_gross_exposure_usd: self.max_gross_exposure_usd,
+            max_active_orders: self.max_active_orders,
+            max_active_order_notional_usd: self.max_active_order_notional_usd,
+            average_abs_delta_usd,
+            inventory_open_duration_ns: self.inventory_open_duration_ns,
+            inventory_open_fraction,
+            risk_metric_samples: self.risk_metric_samples,
+            invalid_risk_metric_samples: self.invalid_risk_metric_samples,
             funding_rate_events: self.funding_rate_events,
             funding_settlements: self.funding_settlements,
             late_funding_rate_events: self.late_funding_rate_events,
@@ -705,7 +895,12 @@ impl BacktestRunner {
             missed_funding_settlements: self.missed_funding_settlements,
             funding_settlement_failures: self.funding_settlement_failures,
             accounting_complete,
-            positions: self.portfolio.positions().clone(),
+            positions: self
+                .portfolio
+                .positions()
+                .iter()
+                .map(|(symbol, quantity)| (symbol.clone(), *quantity))
+                .collect(),
         })
     }
 
@@ -1149,6 +1344,69 @@ mod tests {
 
         assert_eq!(report.missed_funding_settlements, 1);
         assert!(!report.accounting_complete);
+    }
+
+    #[test]
+    fn report_tracks_drawdown_delta_and_inventory_duration_on_the_event_clock() {
+        let mut cfg = config();
+        cfg.active_hedge_threshold_usd = 1_000_000_000.0;
+        for instrument in &mut cfg.instruments {
+            instrument.maker_fee = 0.0;
+            instrument.taker_fee = 0.0;
+            instrument.quote_profit_margin = 0.5;
+            instrument.hedge_profit_margin = 0.5;
+        }
+        let mut runner = BacktestRunner::new(cfg).unwrap();
+        let events = vec![
+            NormalizedEvent::from(MarketEvent::Depth(OrderBook::one_level(
+                "BTC-USDT",
+                1,
+                Level::new(49_999.0, 2.0),
+                Level::new(50_001.0, 2.0),
+            ))),
+            NormalizedEvent::from(MarketEvent::Depth(OrderBook::one_level(
+                "BTC-PERP",
+                1,
+                Level::new(49_999.0, 10_000.0),
+                Level::new(50_001.0, 10_000.0),
+            ))),
+            NormalizedEvent::Order(OrderUpdate {
+                ts_ms: 2,
+                order_id: "external-fill".to_string(),
+                symbol: "BTC-USDT".to_string(),
+                side: Side::Buy,
+                event: OrderEvent::FullyFilled,
+                status: OrderStatus::Filled,
+                price: 50_000.0,
+                time_in_force: Some(TimeInForce::Ioc),
+                qty: 1.0,
+                open_qty: 0.0,
+                filled_qty: 1.0,
+                avg_fill_price: 50_000.0,
+                last_fill_qty: 1.0,
+                last_fill_price: 50_000.0,
+                last_fill_liquidity: Some(FillLiquidity::Taker),
+                reason: "fixture".to_string(),
+            }),
+            NormalizedEvent::from(MarketEvent::Depth(OrderBook::one_level(
+                "BTC-USDT",
+                12,
+                Level::new(44_999.0, 2.0),
+                Level::new(45_001.0, 2.0),
+            ))),
+        ];
+
+        let report = runner.run(events).unwrap();
+
+        assert_eq!(report.observed_duration_ns, 11_000_000);
+        assert_eq!(report.final_equity_usd, -5_000.0);
+        assert_eq!(report.max_drawdown_usd, 5_000.0);
+        assert_eq!(report.max_abs_delta_usd, 50_000.0);
+        assert_eq!(report.inventory_open_duration_ns, 10_000_000);
+        assert!((report.inventory_open_fraction - 10.0 / 11.0).abs() < 1e-12);
+        assert!(report.final_valuation_complete);
+        assert_eq!(report.invalid_risk_metric_samples, 0);
+        assert!(report.accounting_complete);
     }
 
     #[test]

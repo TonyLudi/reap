@@ -478,6 +478,50 @@ event when the source dataset never contained one. Production evaluation must
 reconcile these outputs against demo account statements and complete funding
 coverage across every held interval.
 
+#### Deterministic walk-forward research
+
+The pinned Java `ChaosBackTestMultiRunService` partitions a requested interval
+by day, loads `strategy-%s.json` for each date, carries `endingPositions` into
+the next run, and writes date/run-scoped order, fill, market-value, and result
+artifacts. `ChaosBackTestResult` itself contains engine state, ending time, and
+ending positions. Java's external Python scenario queue is not part of the
+pinned repository, so it is not treated as verified walk-forward logic.
+
+Rust keeps that per-run artifact discipline but makes research selection and
+acceptance explicit in a versioned TOML manifest:
+
+- Candidate configurations are evaluated only on each fold's training data.
+- The deterministically selected candidate alone reaches the later test window.
+- Exactly one baseline and zero or more no-less-conservative execution stress
+  scenarios run on test data.
+- Dataset IDs, canonical paths, and byte-identical content cannot be reused to
+  disguise train/test leakage; event-time windows must be non-overlapping and
+  strictly chronological.
+- Production raw captures must name their capture-only config and pass retained
+  source-coverage analysis plus a one-session, parse-clean, zero-gap replay
+  check with ready terminal books before any candidate runs. Every configured
+  stream must have at least two sources; candidate instruments must have book
+  and trade coverage plus applicable index, mark, limit, and funding streams.
+- Reports embed selection/gate policy, fingerprint the manifest, executable,
+  candidate files, effective strategies, and data, and preserve every
+  underlying `BacktestReport`.
+- Gates cover data/fill duration, accounting and valuation completeness,
+  pending actions/order transitions, clock regressions, net PnL, drawdown,
+  position and pending-hedge delta, gross position and active-order exposure,
+  and inventory-open duration.
+
+Each Rust dataset currently starts from a zero portfolio and independent
+strategy instance, which is emitted as
+`independent_zero_initial_portfolio` in the report. This differs from Java's
+daily position carry. Use one continuous capture as an evaluation dataset when
+inventory continuity matters, and constrain terminal delta/gross exposure in
+the manifest. Cross-file position carry must not be inferred from aggregate
+PnL. A `production_candidate` manifest additionally requires at least three
+folds, two stress scenarios, nonzero event/fill/duration gates, calibrated
+baseline execution, complete accounting, and explicit bounds on non-funding
+work censored by each data horizon. Stress scenarios may use explicitly
+uncalibrated deterministic haircuts.
+
 ### `reap-capture`
 
 Credential-free public market-data composition.

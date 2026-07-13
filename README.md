@@ -123,6 +123,26 @@ late, missed, invalid, or failed funding accounting and retain funding
 settlements beyond the data horizon as pending actions. The model assumes a
 zero initial portfolio and is not an exchange-statement substitute.
 
+Run the checked-in walk-forward plumbing fixture:
+
+```bash
+cargo run -p reap-cli -- research \
+  --manifest examples/research-smoke.toml \
+  --output /tmp/reap-research-smoke.json --require-pass --pretty
+```
+
+`research` selects candidate configuration only from each fold's training
+datasets, then runs the selected candidate on later test data under baseline
+and conservative stress scenarios. Reports embed the selection rule and gate
+thresholds, fingerprint the manifest, binary, candidate files, effective
+strategies, and datasets, and include drawdown, position/pending delta, gross
+position and active-order exposure, inventory duration, fee/funding accounting,
+and pending-work gates. Manifest, executable, candidate, dataset, and capture
+configuration hashes are verified again after all runs;
+production raw datasets also retain and pass capture-config-bound source
+analysis and a zero-gap replay-integrity check. The smoke fixture intentionally
+uses permissive uncalibrated gates and is not trading evidence.
+
 Validate the live demo configuration without reading credentials or opening a
 network connection:
 

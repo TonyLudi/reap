@@ -114,6 +114,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
   shallow-cross queue-ahead reset semantics and application default.
 - [x] Add reportable queue-ahead, historical-trade participation, and
   displayed-depth capacity controls for conservative execution sensitivity.
+- [x] Add manifest-driven walk-forward candidate selection, chronological
+  train/test isolation, conservative sensitivity scenarios, deterministic
+  provenance, and machine-verifiable accounting/risk/performance gates.
 - [x] Attribute fill fees/turnover and port signed linear/inverse swap funding
   settlement with mark fallback, late/missed coverage signals, and explicit
   end-of-horizon funding actions.
@@ -179,10 +182,11 @@ architecture in [docs/architecture.md](docs/architecture.md).
   including process death, deadman expiry, clock skew, REST ambiguity, partial
   fill, reconnect, and durable-latch restart recovery.
 - [ ] Calibrate queue position, latency, fees, funding, and slippage from
-  captured full-depth data; complete walk-forward, sensitivity, capacity, and
-  stressed-liquidity reports. The configurable delay model is implemented but
-  remains explicitly uncalibrated; empirical queue and per-class/per-instrument
-  latency distributions, fee tiers, complete funding intervals, borrow costs,
+  captured full-depth data, then run and archive production-candidate
+  walk-forward, capacity, and stressed-liquidity reports. The orchestration and
+  configurable execution model are implemented but remain uncalibrated;
+  empirical queue and per-class/per-instrument latency distributions, fee tiers,
+  complete funding intervals, depeg-sensitive quote valuation, borrow costs,
   and statement reconciliation are still required.
 - [ ] Deploy and exercise the webhook/host guards, systemd supervision, external
   unit-failure paging, and independent exchange cancel procedure on the target

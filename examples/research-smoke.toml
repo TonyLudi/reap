@@ -1,0 +1,87 @@
+schema_version = 1
+mode = "smoke"
+java_reference_revision = "b6b120c7b7c466d8431bf082f3229328c5d7b2ae"
+selection_metric = "net_pnl_usd"
+
+[[candidates]]
+id = "base"
+config = "iarb2-basic.toml"
+
+[[datasets]]
+id = "train-fixture"
+path = "../fixtures/normalized/chaos_quote_hedge.jsonl"
+format = "normalized_jsonl"
+
+[[datasets]]
+id = "test-fixture"
+path = "../fixtures/normalized/chaos_quote_hedge_later.jsonl"
+format = "normalized_jsonl"
+
+[[scenarios]]
+id = "baseline"
+kind = "baseline"
+
+[scenarios.execution]
+calibrated = false
+market_data_latency_ms = 0
+order_entry_latency_ms = 0
+cancel_latency_ms = 0
+order_update_latency_ms = 0
+fill_account_latency_ms = 0
+depth_fill_conservative_threshold = 0.0
+queue_ahead_multiplier = 1.0
+historical_trade_fill_fraction = 1.0
+displayed_depth_fill_fraction = 1.0
+
+[[scenarios]]
+id = "latency-capacity-stress"
+kind = "stress"
+
+[scenarios.execution]
+calibrated = false
+market_data_latency_ms = 2
+order_entry_latency_ms = 20
+cancel_latency_ms = 15
+order_update_latency_ms = 25
+fill_account_latency_ms = 50
+depth_fill_conservative_threshold = 0.0001
+queue_ahead_multiplier = 2.0
+historical_trade_fill_fraction = 0.25
+displayed_depth_fill_fraction = 0.5
+
+[[folds]]
+id = "fixture-fold"
+train = ["train-fixture"]
+test = ["test-fixture"]
+
+[gates]
+minimum_folds = 1
+minimum_stress_scenarios = 1
+minimum_train_input_events_per_fold = 1
+minimum_train_fills_per_fold = 0
+minimum_test_input_events_per_fold = 1
+minimum_test_fills_per_fold = 0
+minimum_test_duration_ns_per_fold = 1
+minimum_test_pnl_usd_per_fold = -1000000.0
+minimum_total_baseline_test_pnl_usd = -1000000.0
+maximum_test_drawdown_usd = 1000000.0
+maximum_test_abs_delta_usd = 1000000.0
+maximum_test_final_abs_delta_usd = 1000000.0
+maximum_test_abs_pending_delta_usd = 1000000.0
+maximum_test_final_abs_pending_delta_usd = 1000000.0
+maximum_test_gross_exposure_usd = 1000000.0
+maximum_test_final_gross_exposure_usd = 1000000.0
+maximum_test_active_orders = 1000
+maximum_test_active_order_notional_usd = 1000000.0
+maximum_test_final_active_order_notional_usd = 1000000.0
+maximum_test_average_abs_delta_usd = 1000000.0
+maximum_inventory_open_fraction = 1.0
+maximum_pending_non_funding_actions_per_fold = 10
+maximum_terminal_pending_orders_per_run = 10
+maximum_terminal_pending_cancel_requests_per_run = 10
+maximum_clock_regressions_per_run = 0
+minimum_profitable_fold_fraction = 0.0
+minimum_stress_pass_fraction = 1.0
+minimum_passing_fold_fraction = 1.0
+require_complete_accounting = true
+require_calibrated_execution = false

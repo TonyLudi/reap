@@ -998,6 +998,7 @@ dependencies = [
  "anyhow",
  "csv",
  "reap-book",
+ "reap-capture",
  "reap-core",
  "reap-feed",
  "reap-order",
@@ -1005,6 +1006,7 @@ dependencies = [
  "reap-venue",
  "serde",
  "serde_json",
+ "sha2",
  "toml",
 ]
 
