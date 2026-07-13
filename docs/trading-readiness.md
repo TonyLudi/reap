@@ -18,7 +18,7 @@ production trading process.
 | Instrument/account bootstrap | Account instruments/config/balance/positions are typed and verified before readiness | Needs target-account certification |
 | Startup/restart gate | Executable phase state, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, and clean REST reconciliation | Needs process-kill demo test |
 | Event-loop profile | Allocation-aware raw OKX parity benchmark covers redundant wire input through strategy/risk and storage-record construction | Needs target-host capture and exchange-latency validation |
-| Operator control and alerts | HMAC-authenticated local status/kill/halt/resume/shutdown service is wired through the single writer | External alert delivery and independent account/exchange controls remain production blockers |
+| Operator control and alerts | HMAC-authenticated local status/global kill/account kill/symbol halt-resume/shutdown service is wired through the single writer | External alert delivery and independent exchange-side controls remain production blockers |
 | Exchange certification | No recorded OKX demo soak, fault injection, or production account-mode certification | Production blocker |
 
 ## Implemented Demo Path
@@ -53,6 +53,10 @@ production trading process.
    timestamp and nonce replay protection. Status and control responses are
    typed, mutations are persisted, and authenticated shutdown enters the same
    reconciled lifecycle path.
+10. A process-latched account kill blocks only that account's order route,
+    removes its instruments from pricing and hedge selection, guarantees
+    cancellation of its canonical active orders, rejects symbol resume while
+    the account remains halted, and exposes the latch reason in signed status.
 
 ## Remaining Demo Gate
 
@@ -78,7 +82,7 @@ Production enablement additionally requires:
 - Walk-forward and out-of-sample evaluation, parameter sensitivity, capacity,
   inventory-duration, and stressed-liquidity reports.
 - Stablecoin depeg and exchange-rate pause policy, strategy-group risk, master
-  liveness, and independent account/exchange kill controls.
+  liveness, and independent exchange-side kill controls.
 - Clock synchronization monitoring, CPU/thread placement, bounded backpressure,
   memory and disk capacity alarms, and restart supervision.
 - Long-running demo soak with zero unexplained order, fill, position, or balance

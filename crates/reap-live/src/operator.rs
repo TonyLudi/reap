@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::{LiveConfigError, OperatorConfig, ReadinessSnapshot};
 
-const PROTOCOL_VERSION: u16 = 1;
+const PROTOCOL_VERSION: u16 = 2;
 const MIN_SECRET_BYTES: usize = 32;
 const MAX_RESPONSE_BYTES: usize = 65_536;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -25,6 +25,7 @@ type HmacSha256 = Hmac<Sha256>;
 pub enum OperatorCommand {
     Status,
     KillSwitch { reason: String },
+    KillAccount { account_id: String, reason: String },
     HaltSymbol { symbol: String, reason: String },
     ResumeSymbol { symbol: String, reason: String },
     Shutdown { reason: String },
@@ -34,6 +35,8 @@ pub enum OperatorCommand {
 pub struct OperatorStatus {
     pub readiness: ReadinessSnapshot,
     pub active_orders: usize,
+    pub kill_switch_active: bool,
+    pub halted_accounts: BTreeMap<String, String>,
     pub shutdown_in_progress: bool,
 }
 
@@ -328,6 +331,10 @@ fn validate_request_fields(
         OperatorCommand::KillSwitch { reason } | OperatorCommand::Shutdown { reason } => {
             validate_reason(reason)?;
         }
+        OperatorCommand::KillAccount { account_id, reason } => {
+            validate_account_id(account_id)?;
+            validate_reason(reason)?;
+        }
         OperatorCommand::HaltSymbol { symbol, reason }
         | OperatorCommand::ResumeSymbol { symbol, reason } => {
             if symbol.is_empty()
@@ -356,6 +363,15 @@ fn validate_identifier(name: &str, value: &str) -> Result<(), OperatorError> {
         return Err(OperatorError::InvalidRequest(format!(
             "{name} must contain 1-128 safe ASCII characters"
         )));
+    }
+    Ok(())
+}
+
+fn validate_account_id(value: &str) -> Result<(), OperatorError> {
+    if value.trim().is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+        return Err(OperatorError::InvalidRequest(
+            "account_id must contain 1-128 printable characters".to_string(),
+        ));
     }
     Ok(())
 }
@@ -786,6 +802,20 @@ mod tests {
         assert!(matches!(
             verify_response(response, SECRET),
             Err(OperatorError::Authentication)
+        ));
+
+        assert!(matches!(
+            sign_request(
+                OperatorCommand::KillAccount {
+                    account_id: "unsafe\naccount".to_string(),
+                    reason: "test".to_string(),
+                },
+                SECRET,
+                "request-4".to_string(),
+                now_ms,
+                "nonce-4".to_string(),
+            ),
+            Err(OperatorError::InvalidRequest(_))
         ));
     }
 

@@ -471,6 +471,7 @@ impl RiskGate {
                     self.halted_symbols.remove(symbol);
                 }
             }
+            SystemEventKind::AccountHalted => {}
         }
     }
 

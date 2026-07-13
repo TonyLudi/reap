@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use reap_core::{NormalizedEvent, OrderIntent, SystemEvent, SystemEventKind, TimeMs, Venue};
 use reap_engine::{EngineOutput, TradingEngine};
@@ -101,6 +101,7 @@ pub struct LiveCoordinator {
     client_ids: HashMap<String, ClientOrderIdGenerator>,
     gateway_actions_enabled: bool,
     order_entry_enabled: bool,
+    halted_accounts: BTreeMap<String, String>,
     session_id: String,
     decision_sequence: u64,
 }
@@ -154,6 +155,7 @@ impl LiveCoordinator {
             client_ids,
             gateway_actions_enabled,
             order_entry_enabled: gateway_actions_enabled,
+            halted_accounts: BTreeMap::new(),
             session_id,
             decision_sequence: 0,
         })
@@ -169,6 +171,46 @@ impl LiveCoordinator {
 
     pub fn manages_symbol(&self, symbol: &str) -> bool {
         self.config.account_for_symbol(symbol).is_some()
+    }
+
+    pub fn manages_account(&self, account_id: &str) -> bool {
+        self.private_states.contains_key(account_id)
+    }
+
+    pub fn halted_accounts(&self) -> &BTreeMap<String, String> {
+        &self.halted_accounts
+    }
+
+    pub fn halted_account_for_symbol(&self, symbol: &str) -> Option<&str> {
+        let account_id = self.config.account_for_symbol(symbol)?.id.as_str();
+        self.halted_accounts
+            .contains_key(account_id)
+            .then_some(account_id)
+    }
+
+    pub fn kill_switch_active(&self) -> bool {
+        self.engine.risk().is_killed()
+    }
+
+    pub fn halt_account(
+        &mut self,
+        ts_ms: TimeMs,
+        account_id: &str,
+        reason: impl Into<String>,
+    ) -> Result<CoordinatorOutput, CoordinatorError> {
+        if !self.manages_account(account_id) {
+            return Err(CoordinatorError::UnknownAccount(account_id.to_string()));
+        }
+        Ok(
+            self.process_normalized(NormalizedEvent::System(SystemEvent {
+                ts_ms,
+                kind: SystemEventKind::AccountHalted,
+                venue: None,
+                account_id: Some(account_id.to_string()),
+                symbol: None,
+                reason: reason.into(),
+            })),
+        )
     }
 
     pub fn mark_storage_ready(&mut self, ready: bool, reason: impl Into<String>) {
@@ -536,6 +578,24 @@ impl LiveCoordinator {
     }
 
     fn process_normalized(&mut self, event: NormalizedEvent) -> CoordinatorOutput {
+        let account_halt = match &event {
+            NormalizedEvent::System(system)
+                if system.kind == SystemEventKind::AccountHalted
+                    && system
+                        .account_id
+                        .as_deref()
+                        .is_some_and(|account_id| self.private_states.contains_key(account_id)) =>
+            {
+                let account_id = system
+                    .account_id
+                    .clone()
+                    .expect("checked account halt must have an account id");
+                self.halted_accounts
+                    .insert(account_id.clone(), system.reason.clone());
+                Some((account_id, system.reason.clone()))
+            }
+            _ => None,
+        };
         if let NormalizedEvent::System(system) = &event {
             self.apply_system_to_startup(system);
         }
@@ -558,6 +618,9 @@ impl LiveCoordinator {
             records,
         };
         self.handle_engine_output(now_ms, engine_output, &mut output);
+        if let Some((account_id, reason)) = account_halt {
+            self.ensure_account_cancels(now_ms, &account_id, &reason, &mut output);
+        }
         output
     }
 
@@ -599,19 +662,6 @@ impl LiveCoordinator {
         match intent {
             OrderIntent::NewOrder(order) => {
                 let submit_enabled = self.gateway_actions_enabled && self.order_entry_enabled;
-                if !self.startup.can_submit_new(submit_enabled) {
-                    output.records.push(StorageRecord::IntentRejected {
-                        ts_ms: now_ms,
-                        intent: OrderIntent::NewOrder(order),
-                        reason: format!(
-                            "live gate is {:?}; gateway actions enabled={}; new order entry enabled={}",
-                            self.startup.phase(),
-                            self.gateway_actions_enabled,
-                            self.order_entry_enabled
-                        ),
-                    });
-                    return;
-                }
                 let Some(account_id) = self
                     .config
                     .account_for_symbol(&order.symbol)
@@ -629,6 +679,27 @@ impl LiveCoordinator {
                     );
                     return;
                 };
+                if let Some(reason) = self.halted_accounts.get(&account_id) {
+                    output.records.push(StorageRecord::IntentRejected {
+                        ts_ms: now_ms,
+                        intent: OrderIntent::NewOrder(order),
+                        reason: format!("account {account_id} is halted: {reason}"),
+                    });
+                    return;
+                }
+                if !self.startup.can_submit_new(submit_enabled) {
+                    output.records.push(StorageRecord::IntentRejected {
+                        ts_ms: now_ms,
+                        intent: OrderIntent::NewOrder(order),
+                        reason: format!(
+                            "live gate is {:?}; gateway actions enabled={}; new order entry enabled={}",
+                            self.startup.phase(),
+                            self.gateway_actions_enabled,
+                            self.order_entry_enabled
+                        ),
+                    });
+                    return;
+                }
                 self.decision_sequence = self.decision_sequence.wrapping_add(1);
                 let idempotency_key = format!(
                     "{}:{}:{}",
@@ -695,6 +766,53 @@ impl LiveCoordinator {
                     });
                 }
             }
+        }
+    }
+
+    fn ensure_account_cancels(
+        &mut self,
+        now_ms: TimeMs,
+        account_id: &str,
+        halt_reason: &str,
+        output: &mut CoordinatorOutput,
+    ) {
+        let existing = output
+            .actions
+            .iter()
+            .filter_map(|action| match action {
+                LiveAction::Cancel(cancel) if cancel.account_id == account_id => {
+                    Some(cancel.client_order_id.clone())
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let active_orders = self
+            .private_states
+            .get(account_id)
+            .expect("validated account halt must have private state")
+            .order_reducer()
+            .orders()
+            .filter(|(_, order)| {
+                matches!(
+                    order.status,
+                    reap_core::OrderStatus::PendingNew
+                        | reap_core::OrderStatus::Live
+                        | reap_core::OrderStatus::PartiallyFilled
+                )
+            })
+            .map(|(order_id, _)| order_id.to_string())
+            .filter(|order_id| !existing.contains(order_id))
+            .collect::<Vec<_>>();
+        for order_id in active_orders {
+            let intent = OrderIntent::CancelOrder {
+                order_id,
+                reason: format!("account {account_id} halted: {halt_reason}"),
+            };
+            output.records.push(StorageRecord::Intent {
+                ts_ms: now_ms,
+                intent: intent.clone(),
+            });
+            self.route_intent(now_ms, intent, output);
         }
     }
 
@@ -788,7 +906,9 @@ impl LiveCoordinator {
                 self.startup
                     .mark_runtime_health("risk", true, &event.reason);
             }
-            SystemEventKind::SymbolHalted | SystemEventKind::SymbolResumed => {}
+            SystemEventKind::AccountHalted
+            | SystemEventKind::SymbolHalted
+            | SystemEventKind::SymbolResumed => {}
         }
     }
 
@@ -931,6 +1051,89 @@ mod tests {
         coordinator_with_gateway_actions(true)
     }
 
+    fn two_account_coordinator() -> LiveCoordinator {
+        let mut config = coordinator().config.clone();
+        let mut hedge_group = config.strategy.risk_groups[0].clone();
+        config.strategy.risk_groups[0].symbols = vec!["BTC-USDT".to_string()];
+        hedge_group.name = "hedge".to_string();
+        hedge_group.account_id = Some("hedge".to_string());
+        hedge_group.symbols = vec!["BTC-PERP".to_string()];
+        config.strategy.risk_groups.push(hedge_group);
+        config.strategy.instruments[1].risk_group = "hedge".to_string();
+        config.accounts[0].trade_modes.remove("BTC-PERP");
+        config.accounts.push(LiveAccountConfig {
+            id: "hedge".to_string(),
+            api_key_env: "HEDGE_KEY".to_string(),
+            secret_key_env: "HEDGE_SECRET".to_string(),
+            passphrase_env: "HEDGE_PASS".to_string(),
+            expected_account_level: OkxAccountLevel::SingleCurrencyMargin,
+            expected_position_mode: OkxPositionMode::NetMode,
+            id_prefix: "hedge".to_string(),
+            node_id: 2,
+            trade_modes: HashMap::from([("BTC-PERP".to_string(), OkxTradeModeConfig::Cross)]),
+        });
+        let verified = VerifiedBootstrap {
+            instruments: HashMap::from([
+                (
+                    "BTC-USDT".to_string(),
+                    VerifiedInstrument {
+                        account_id: "main".to_string(),
+                        symbol: "BTC-USDT".to_string(),
+                        instrument_type: OkxInstrumentType::Spot,
+                        trade_mode: OkxTradeModeConfig::Cash,
+                        risk_model: InstrumentRiskModel::Spot,
+                        tick_size: 0.1,
+                        lot_size: 0.0001,
+                        min_size: 0.0001,
+                        contract_value: None,
+                    },
+                ),
+                (
+                    "BTC-PERP".to_string(),
+                    VerifiedInstrument {
+                        account_id: "hedge".to_string(),
+                        symbol: "BTC-PERP".to_string(),
+                        instrument_type: OkxInstrumentType::Futures,
+                        trade_mode: OkxTradeModeConfig::Cross,
+                        risk_model: InstrumentRiskModel::LinearDerivative {
+                            contract_value: 0.001,
+                        },
+                        tick_size: 0.1,
+                        lot_size: 1.0,
+                        min_size: 1.0,
+                        contract_value: Some(0.001),
+                    },
+                ),
+            ]),
+            account_updates: HashMap::from([
+                ("main".to_string(), account_update("main", 1)),
+                ("hedge".to_string(), account_update("hedge", 1)),
+            ]),
+            baseline_fill_ids: HashMap::from([
+                ("main".to_string(), HashSet::new()),
+                ("hedge".to_string(), HashSet::new()),
+            ]),
+        };
+        LiveCoordinator::new(config, verified, true, "two-account-test").unwrap()
+    }
+
+    fn account_update(account_id: &str, ts_ms: TimeMs) -> AccountUpdate {
+        AccountUpdate {
+            ts_ms,
+            balances: vec![Balance {
+                account_id: Some(account_id.to_string()),
+                currency: "USDT".to_string(),
+                total: 10_000.0,
+                available: 10_000.0,
+                equity: 10_000.0,
+                liability: 0.0,
+                max_loan: 0.0,
+            }],
+            positions: Vec::new(),
+            margins: Vec::new(),
+        }
+    }
+
     fn ready(coordinator: &mut LiveCoordinator) {
         coordinator.mark_storage_ready(true, "open");
         coordinator.mark_public_connectivity(true, "connected");
@@ -982,6 +1185,51 @@ mod tests {
             symbol: None,
             reason: "connected".to_string(),
         }));
+        assert!(coordinator.readiness().is_ready());
+    }
+
+    fn ready_two_accounts(coordinator: &mut LiveCoordinator) {
+        coordinator.mark_storage_ready(true, "open");
+        coordinator.mark_public_connectivity(true, "connected");
+        for account_id in ["main", "hedge"] {
+            coordinator
+                .process_feed(FeedOutput::PrivateAccount {
+                    account_id: Some(account_id.to_string()),
+                    update: account_update(account_id, 1),
+                })
+                .unwrap();
+            coordinator
+                .on_reconciliation(ReconciliationResult {
+                    account_id: account_id.to_string(),
+                    ts_ms: 2,
+                    clean: true,
+                    local_live_orders: 0,
+                    remote_live_orders: 0,
+                    remote_recent_fills: 0,
+                    reason: "clean".to_string(),
+                })
+                .unwrap();
+        }
+        for symbol in ["BTC-USDT", "BTC-PERP"] {
+            coordinator.process_event(NormalizedEvent::System(SystemEvent {
+                ts_ms: 2,
+                kind: SystemEventKind::FeedRecovered,
+                venue: Some(Venue::Okx),
+                account_id: None,
+                symbol: Some(symbol.to_string()),
+                reason: "snapshot".to_string(),
+            }));
+        }
+        for account_id in ["main", "hedge"] {
+            coordinator.process_event(NormalizedEvent::System(SystemEvent {
+                ts_ms: 2,
+                kind: SystemEventKind::PrivateStreamRecovered,
+                venue: Some(Venue::Okx),
+                account_id: Some(account_id.to_string()),
+                symbol: None,
+                reason: "connected".to_string(),
+            }));
+        }
         assert!(coordinator.readiness().is_ready());
     }
 
@@ -1184,6 +1432,71 @@ mod tests {
             state.order_reducer().get("client-1").unwrap().status,
             OrderStatus::Filled
         );
+    }
+
+    #[test]
+    fn account_halt_cancels_and_blocks_only_the_target_account() {
+        let mut coordinator = two_account_coordinator();
+        ready_two_accounts(&mut coordinator);
+        let mut main_order = order();
+        main_order.reason = "external".to_string();
+        let mut hedge_order = order();
+        hedge_order.symbol = "BTC-PERP".to_string();
+        hedge_order.qty = 1.0;
+        hedge_order.reason = "external".to_string();
+        coordinator
+            .register_local_order("main", "client-main", main_order.clone(), 3)
+            .unwrap();
+        coordinator
+            .register_local_order("hedge", "client-hedge", hedge_order.clone(), 3)
+            .unwrap();
+
+        let output = coordinator
+            .halt_account(4, "main", "unexpected exposure")
+            .unwrap();
+
+        let cancels = output
+            .actions
+            .iter()
+            .filter_map(|action| match action {
+                LiveAction::Cancel(cancel) => {
+                    Some((cancel.account_id.as_str(), cancel.client_order_id.as_str()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cancels, vec![("main", "client-main")]);
+        assert_eq!(
+            coordinator
+                .halted_accounts()
+                .get("main")
+                .map(String::as_str),
+            Some("unexpected exposure")
+        );
+        assert!(output.records.iter().any(|record| matches!(
+            record,
+            StorageRecord::System(SystemEvent {
+                kind: SystemEventKind::AccountHalted,
+                account_id: Some(account_id),
+                ..
+            }) if account_id == "main"
+        )));
+
+        let mut blocked = CoordinatorOutput::default();
+        coordinator.route_intent(5, OrderIntent::NewOrder(main_order), &mut blocked);
+        assert!(blocked.actions.is_empty());
+        assert!(blocked.records.iter().any(|record| matches!(
+            record,
+            StorageRecord::IntentRejected { reason, .. }
+                if reason.contains("account main is halted")
+        )));
+
+        let mut healthy = CoordinatorOutput::default();
+        coordinator.route_intent(5, OrderIntent::NewOrder(hedge_order), &mut healthy);
+        assert!(healthy.actions.iter().any(|action| matches!(
+            action,
+            LiveAction::Submit(submit) if submit.account_id == "hedge"
+        )));
     }
 
     #[test]

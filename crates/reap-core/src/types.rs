@@ -509,6 +509,7 @@ pub enum SystemEventKind {
     RiskBreach,
     KillSwitchActivated,
     KillSwitchReset,
+    AccountHalted,
     SymbolHalted,
     SymbolResumed,
 }

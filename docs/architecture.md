@@ -227,7 +227,7 @@ Responsibilities:
 
 - Static config sanity checks.
 - Notional, delta, live-order, turnover, and drawdown limits.
-- Kill switch and manual symbol halt.
+- Global kill switch and symbol isolation controls.
 - Per-risk-group quote permission.
 - Reject or clip unsafe order intents before they hit the gateway.
 - Post-fill exposure checks.
@@ -276,6 +276,8 @@ Responsibilities:
 - Start/stop/restart strategy instances.
 - Dispatch timers into strategy loops.
 - Coordinate reconciliation and recovery.
+- Reduce authenticated account latches, block halted account routes, and
+  guarantee account-scoped canonical cancellation.
 
 Implemented topology:
 
@@ -673,6 +675,9 @@ the deployment blocker.
   post-cancel REST reconciliation, even when persistence has failed. Done.
 - Authenticate bounded local operator commands outside the strategy loop and
   reduce accepted control events on the single writer. Done.
+- Isolate one account without resetting healthy account routes, while removing
+  its instruments from strategy pricing/hedging and cancelling its canonical
+  orders. Done.
 - Complete fault injection and OKX demo soak acceptance.
 
 See [trading-readiness.md](trading-readiness.md) for the detailed gate.

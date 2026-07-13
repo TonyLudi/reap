@@ -2930,6 +2930,28 @@ impl ChaosStrategy {
 
     fn on_system_event(&mut self, event: &SystemEvent) -> Vec<OrderIntent> {
         self.now_ms = event.ts_ms;
+        if event.kind == SystemEventKind::AccountHalted {
+            let Some(account_id) = event.account_id.as_deref() else {
+                return Vec::new();
+            };
+            let affected_groups = self
+                .risk_groups
+                .iter()
+                .filter(|(_, group)| group.config.account_id.as_deref() == Some(account_id))
+                .map(|(name, _)| name.clone())
+                .collect::<HashSet<_>>();
+            let mut changed = false;
+            for entity in self.entities.values_mut() {
+                if affected_groups.contains(&entity.config.risk_group) {
+                    changed |= update_flag(&mut entity.system_halted, true);
+                }
+            }
+            return if changed {
+                self.refresh_quotes()
+            } else {
+                Vec::new()
+            };
+        }
         let Some(symbol) = event.symbol.as_deref() else {
             return Vec::new();
         };
@@ -6384,6 +6406,30 @@ mod tests {
                 .values()
                 .flatten()
                 .all(|level| { level.symbol != "BTC-USDT-SWAP.OK" })
+        );
+    }
+
+    #[test]
+    fn account_halt_disables_every_instrument_owned_by_the_account() {
+        let mut config = config();
+        config.risk_groups[0].account_id = Some("main".to_string());
+        let mut strategy = ChaosStrategy::new(config).unwrap();
+
+        let intents = strategy.on_system_event(&SystemEvent {
+            ts_ms: 2,
+            kind: SystemEventKind::AccountHalted,
+            venue: None,
+            account_id: Some("main".to_string()),
+            symbol: None,
+            reason: "operator".to_string(),
+        });
+
+        assert!(intents.is_empty());
+        assert!(
+            strategy
+                .entities
+                .values()
+                .all(|entity| entity.system_halted)
         );
     }
 

@@ -59,6 +59,7 @@ production order entry remains intentionally unavailable.
 | Private stream stale | Account blocked; live orders cancelled | Reconnect, REST reconcile pending orders/fills, then emit recovery |
 | Reconcile drift | Account blocked; live orders cancelled | Resolve local/remote order and fill differences before recovery |
 | Risk breach | Kill switch active; live orders cancelled | Reduce exposure externally if needed, diagnose, and restart only after approval; live global reset is intentionally unavailable |
+| Manual account kill | Account route latched off; its instruments are removed from pricing/hedging and its live orders are cancelled | Reconcile the account and review dependent strategy exposure; no live account reset is available |
 | Critical storage loss/backpressure | Runtime fail-stop; checkpoint reconciliation required on restart | Investigate disk/queue capacity; critical records are never silently dropped |
 
 ## Operator Controls
@@ -75,10 +76,20 @@ production order entry remains intentionally unavailable.
   commands enter a bounded channel and are reduced by the same single writer as
   exchange events. Mutations are persisted as normalized/system records with
   their request ID.
-- Available commands are read-only `status`, global `kill`, symbol `halt`,
-  symbol `resume`, and reconciled `shutdown`. A live global kill reset is not
-  exposed; restart only after the initiating cause and account state are
-  reviewed.
+- Protocol version 2 commands are read-only `status`, global `kill`, account
+  `kill-account`, symbol `halt`, symbol `resume`, and reconciled `shutdown`.
+  Status includes the global kill state and account-halt reasons. Older protocol
+  versions are rejected.
+- Account kills are process-latched and journaled as typed `AccountHalted`
+  events. They block new requests to that account, halt every instrument routed
+  to it inside the strategy, and cancel all canonical `PendingNew`, `Live`, and
+  `PartiallyFilled` orders for it. A dependent quote on another account may also
+  be withdrawn when the strategy loses a valid hedge.
+- A symbol belonging to a killed account cannot be resumed. Live global and
+  account reset commands are intentionally unavailable; restart only after the
+  initiating cause and exchange state are reviewed and reconciled. The local
+  latch does not replace exchange-side account controls or a supervisor policy
+  that prevents an automatic restart from clearing it.
 
 Supply the same secret to the runtime and operator shell through the deployment
 secret provider. It must contain at least 32 bytes:
@@ -88,6 +99,9 @@ export REAP_OPERATOR_TOKEN=...
 cargo run -p reap-cli -- operator \
   --config examples/live-okx-demo.toml \
   status --pretty
+cargo run -p reap-cli -- operator \
+  --config examples/live-okx-demo.toml \
+  kill-account --account main --reason "unexpected account exposure"
 cargo run -p reap-cli -- operator \
   --config examples/live-okx-demo.toml \
   halt --symbol BTC-USDT --reason "manual market pause"

@@ -1266,6 +1266,27 @@ impl LiveRuntime {
                     Some(self.operator_status()),
                 ))
             }
+            OperatorCommand::KillAccount { account_id, reason } => {
+                if !self.coordinator.manages_account(&account_id) {
+                    return Ok(OperatorResponse::rejected(
+                        request_id,
+                        format!("account {account_id} is not managed by this runtime"),
+                    ));
+                }
+                let output = self.coordinator.halt_account(
+                    unix_time_ms(),
+                    &account_id,
+                    format!("authenticated operator request {request_id}: {reason}"),
+                )?;
+                self.commit_output(output)?;
+                self.evidence.operator_mutations =
+                    self.evidence.operator_mutations.saturating_add(1);
+                Ok(OperatorResponse::accepted(
+                    request_id,
+                    format!("account {account_id} halted"),
+                    Some(self.operator_status()),
+                ))
+            }
             OperatorCommand::HaltSymbol { symbol, reason } => {
                 if !self.coordinator.manages_symbol(&symbol) {
                     return Ok(OperatorResponse::rejected(
@@ -1292,6 +1313,14 @@ impl LiveRuntime {
                     return Ok(OperatorResponse::rejected(
                         request_id,
                         format!("symbol {symbol} is not managed by this runtime"),
+                    ));
+                }
+                if let Some(account_id) = self.coordinator.halted_account_for_symbol(&symbol) {
+                    return Ok(OperatorResponse::rejected(
+                        request_id,
+                        format!(
+                            "symbol {symbol} belongs to halted account {account_id}; account kills cannot be reset live"
+                        ),
                     ));
                 }
                 self.commit_operator_system_event(
@@ -1348,6 +1377,8 @@ impl LiveRuntime {
         OperatorStatus {
             readiness: self.coordinator.readiness(),
             active_orders: self.coordinator.active_order_count(),
+            kill_switch_active: self.coordinator.kill_switch_active(),
+            halted_accounts: self.coordinator.halted_accounts().clone(),
             shutdown_in_progress: self.shutdown_in_progress
                 || self.operator_shutdown_reason.is_some(),
         }
@@ -2985,7 +3016,10 @@ mod tests {
                 .await
                 .unwrap();
         assert!(status.ok);
-        assert!(status.status.unwrap().readiness.is_ready());
+        let status = status.status.unwrap();
+        assert!(status.readiness.is_ready());
+        assert!(!status.kill_switch_active);
+        assert!(status.halted_accounts.is_empty());
 
         let halt = send_operator_command_with_secret(
             &operator_config,
@@ -3009,6 +3043,51 @@ mod tests {
         .await
         .unwrap();
         assert!(resume.ok);
+        let account_kill = send_operator_command_with_secret(
+            &operator_config,
+            SECRET,
+            OperatorCommand::KillAccount {
+                account_id: "main".to_string(),
+                reason: "integration account isolation".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(account_kill.ok);
+        assert!(
+            account_kill
+                .status
+                .unwrap()
+                .halted_accounts
+                .contains_key("main")
+        );
+        let blocked_resume = send_operator_command_with_secret(
+            &operator_config,
+            SECRET,
+            OperatorCommand::ResumeSymbol {
+                symbol: "BTC-USDT".to_string(),
+                reason: "must remain blocked".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!blocked_resume.ok);
+        assert!(
+            blocked_resume
+                .message
+                .contains("account kills cannot be reset live")
+        );
+        let kill = send_operator_command_with_secret(
+            &operator_config,
+            SECRET,
+            OperatorCommand::KillSwitch {
+                reason: "integration global stop".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(kill.ok);
+        assert!(kill.status.unwrap().kill_switch_active);
         let shutdown = send_operator_command_with_secret(
             &operator_config,
             SECRET,
@@ -3027,8 +3106,8 @@ mod tests {
         let _ = std::fs::remove_file(storage_path);
 
         assert_eq!(report.stop_reason, LiveStopReason::OperatorCommand);
-        assert_eq!(report.operator_commands, 4);
-        assert_eq!(report.operator_mutations, 3);
+        assert_eq!(report.operator_commands, 7);
+        assert_eq!(report.operator_mutations, 5);
         assert_eq!(report.active_orders_after_shutdown, 0);
         assert!(!report.clean_soak);
         assert!(!socket_path.exists());

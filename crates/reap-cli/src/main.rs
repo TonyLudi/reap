@@ -76,6 +76,12 @@ enum OperatorCliCommand {
         #[arg(long)]
         reason: String,
     },
+    KillAccount {
+        #[arg(long)]
+        account: String,
+        #[arg(long)]
+        reason: String,
+    },
     Halt {
         #[arg(long)]
         symbol: String,
@@ -99,6 +105,10 @@ impl From<OperatorCliCommand> for OperatorCommand {
         match value {
             OperatorCliCommand::Status => Self::Status,
             OperatorCliCommand::Kill { reason } => Self::KillSwitch { reason },
+            OperatorCliCommand::KillAccount { account, reason } => Self::KillAccount {
+                account_id: account,
+                reason,
+            },
             OperatorCliCommand::Halt { symbol, reason } => Self::HaltSymbol { symbol, reason },
             OperatorCliCommand::Resume { symbol, reason } => Self::ResumeSymbol { symbol, reason },
             OperatorCliCommand::Shutdown { reason } => Self::Shutdown { reason },

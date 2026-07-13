@@ -17,8 +17,8 @@ Implemented:
 - OKX public/private parsers, HMAC-signed REST order requests, supervised
   multi-websocket feeds, account-scoped channel-aware deduplication, sequence
   recovery, and REST reconciliation.
-- Deterministic pre/post-trade risk, stale-stream fail-closed behavior, kill
-  switch and symbol halt events, and an event-loop enforcement layer.
+- Deterministic pre/post-trade risk, stale-stream fail-closed behavior, global,
+  account, and symbol halt events, and an event-loop enforcement layer.
 - Bounded structured telemetry and JSONL storage for raw, normalized, intent,
   request, acknowledgement, order, fill, system, bootstrap, and reconciliation
   records, including restart checkpoint recovery.
@@ -72,6 +72,7 @@ From another shell with the same operator token, inspect or stop the runtime:
 
 ```bash
 cargo run -p reap-cli -- operator --config examples/live-okx-demo.toml status --pretty
+cargo run -p reap-cli -- operator --config examples/live-okx-demo.toml kill-account --account main --reason "unexpected account exposure"
 cargo run -p reap-cli -- operator --config examples/live-okx-demo.toml shutdown --reason "planned stop"
 ```
 
