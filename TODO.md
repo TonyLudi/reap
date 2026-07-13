@@ -122,6 +122,8 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Retain OKX position `mgnMode`, reject configured derivative margin-mode
   mismatch at bootstrap and runtime, and compare the field during REST
   reconciliation.
+- [x] Enforce the modeled live-account boundary: cash-only spot routing and no
+  nonzero position outside the configured account's derivative universe.
 - [x] Reject crossed books and force fresh-snapshot recovery, matching the
   reviewed Java OKX subscriber behavior with explicit sequence validation.
 - [x] Add order `expTime`, startup/periodic exchange-clock validation, and an

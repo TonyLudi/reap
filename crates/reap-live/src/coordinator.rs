@@ -90,8 +90,8 @@ pub enum CoordinatorError {
         actual: String,
         expected: String,
     },
-    #[error("account {account_id} position margin mode mismatch: {message}")]
-    PositionMarginMode { account_id: String, message: String },
+    #[error("account {account_id} position policy violation: {message}")]
+    PositionPolicy { account_id: String, message: String },
     #[error(transparent)]
     Startup(#[from] StartupError),
 }
@@ -390,11 +390,11 @@ impl LiveCoordinator {
         account_id: &str,
         update: &reap_core::AccountUpdate,
     ) -> Result<(), CoordinatorError> {
-        let errors = self.config.position_margin_mode_errors(account_id, update);
+        let errors = self.config.position_policy_errors(account_id, update);
         if errors.is_empty() {
             Ok(())
         } else {
-            Err(CoordinatorError::PositionMarginMode {
+            Err(CoordinatorError::PositionPolicy {
                 account_id: account_id.to_string(),
                 message: errors.join(", "),
             })
@@ -1469,7 +1469,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            CoordinatorError::PositionMarginMode { ref account_id, ref message }
+            CoordinatorError::PositionPolicy { ref account_id, ref message }
                 if account_id == "main"
                     && message.contains("BTC-PERP expected Cross, received Isolated")
         ));
@@ -1482,7 +1482,7 @@ mod tests {
         );
         assert!(matches!(
             coordinator.apply_authoritative_account_snapshot("main", wrong_mode),
-            Err(CoordinatorError::PositionMarginMode { .. })
+            Err(CoordinatorError::PositionPolicy { .. })
         ));
 
         coordinator
@@ -1493,6 +1493,45 @@ mod tests {
                     balances: Vec::new(),
                     positions: vec![Position {
                         symbol: "BTC-PERP".to_string(),
+                        qty: 0.0,
+                        avg_price: 0.0,
+                        margin_mode: Some(PositionMarginMode::Isolated),
+                    }],
+                    margins: Vec::new(),
+                },
+            })
+            .unwrap();
+
+        let error = coordinator
+            .process_feed(FeedOutput::PrivateAccount {
+                account_id: Some("main".to_string()),
+                update: AccountUpdate {
+                    ts_ms: 5,
+                    balances: Vec::new(),
+                    positions: vec![Position {
+                        symbol: "ETH-USDT-SWAP".to_string(),
+                        qty: 1.0,
+                        avg_price: 3_000.0,
+                        margin_mode: Some(PositionMarginMode::Cross),
+                    }],
+                    margins: Vec::new(),
+                },
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CoordinatorError::PositionPolicy { ref message, .. }
+                if message.contains("unmanaged nonzero position ETH-USDT-SWAP qty=1")
+        ));
+
+        coordinator
+            .process_feed(FeedOutput::PrivateAccount {
+                account_id: Some("main".to_string()),
+                update: AccountUpdate {
+                    ts_ms: 6,
+                    balances: Vec::new(),
+                    positions: vec![Position {
+                        symbol: "ETH-USDT-SWAP".to_string(),
                         qty: 0.0,
                         avg_price: 0.0,
                         margin_mode: Some(PositionMarginMode::Isolated),

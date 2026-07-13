@@ -576,7 +576,7 @@ impl LiveConfig {
         })
     }
 
-    pub(crate) fn position_margin_mode_errors(
+    pub(crate) fn position_policy_errors(
         &self,
         account_id: &str,
         update: &AccountUpdate,
@@ -584,39 +584,69 @@ impl LiveConfig {
         let Some(account) = self.account(account_id) else {
             return vec![format!("unknown account {account_id}")];
         };
-        let mut errors = update
+        let mut errors = Vec::new();
+        for position in update
             .positions
             .iter()
             .filter(|position| position.qty != 0.0)
-            .filter_map(|position| {
-                let instrument = self
-                    .strategy
-                    .instruments
-                    .iter()
-                    .find(|instrument| instrument.symbol == position.symbol)?;
-                if !instrument.kind.is_derivative()
-                    || self.account_for_symbol_unchecked(&position.symbol) != Some(account_id)
-                {
-                    return None;
+        {
+            let Some(owner) = self.account_for_symbol_unchecked(&position.symbol) else {
+                errors.push(format!(
+                    "unmanaged nonzero position {} qty={}",
+                    position.symbol, position.qty
+                ));
+                continue;
+            };
+            if owner != account_id {
+                errors.push(format!(
+                    "position {} belongs to configured account {owner}, received on {account_id}",
+                    position.symbol
+                ));
+                continue;
+            }
+            let instrument = self
+                .strategy
+                .instruments
+                .iter()
+                .find(|instrument| instrument.symbol == position.symbol)
+                .expect("position owner lookup requires a configured instrument");
+            if !instrument.kind.is_derivative() {
+                errors.push(format!(
+                    "nonzero position {} is not a supported derivative position",
+                    position.symbol
+                ));
+                continue;
+            }
+            let Some(trade_mode) = account.trade_modes.get(&position.symbol) else {
+                errors.push(format!(
+                    "position {} has no configured trade mode",
+                    position.symbol
+                ));
+                continue;
+            };
+            let expected = match trade_mode {
+                OkxTradeModeConfig::Cross => PositionMarginMode::Cross,
+                OkxTradeModeConfig::Isolated => PositionMarginMode::Isolated,
+                OkxTradeModeConfig::Cash => {
+                    errors.push(format!(
+                        "derivative position {} cannot use cash trade mode",
+                        position.symbol
+                    ));
+                    continue;
                 }
-                let expected = match account.trade_modes.get(&position.symbol)? {
-                    OkxTradeModeConfig::Cross => PositionMarginMode::Cross,
-                    OkxTradeModeConfig::Isolated => PositionMarginMode::Isolated,
-                    OkxTradeModeConfig::Cash => return None,
-                };
-                (position.margin_mode != Some(expected)).then(|| {
-                    format!(
-                        "{} expected {:?}, received {}",
-                        position.symbol,
-                        expected,
-                        position
-                            .margin_mode
-                            .map(|mode| format!("{mode:?}"))
-                            .unwrap_or_else(|| "no mgnMode".to_string())
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
+            };
+            if position.margin_mode != Some(expected) {
+                errors.push(format!(
+                    "{} expected {:?}, received {}",
+                    position.symbol,
+                    expected,
+                    position
+                        .margin_mode
+                        .map(|mode| format!("{mode:?}"))
+                        .unwrap_or_else(|| "no mgnMode".to_string())
+                ));
+            }
+        }
         errors.sort();
         errors.dedup();
         errors
@@ -696,9 +726,22 @@ fn validate_instrument_account(
     let Some(account) = config.account(account_id) else {
         return;
     };
-    if !account.trade_modes.contains_key(&instrument.symbol) {
+    let Some(trade_mode) = account.trade_modes.get(&instrument.symbol) else {
         errors.push(format!(
             "account {} has no trade mode for symbol {}",
+            account.id, instrument.symbol
+        ));
+        return;
+    };
+    if instrument.kind.is_spot() && *trade_mode != OkxTradeModeConfig::Cash {
+        errors.push(format!(
+            "account {} spot symbol {} must use cash trade mode; margin spot positions are not supported",
+            account.id, instrument.symbol
+        ));
+    }
+    if instrument.kind.is_derivative() && *trade_mode == OkxTradeModeConfig::Cash {
+        errors.push(format!(
+            "account {} derivative symbol {} cannot use cash trade mode",
             account.id, instrument.symbol
         ));
     }
@@ -1016,6 +1059,29 @@ mod tests {
                 .iter()
                 .any(|error| error.contains("no trade mode for symbol BTC-PERP"))
         );
+    }
+
+    #[test]
+    fn live_config_rejects_unmodeled_spot_and_derivative_trade_modes() {
+        let mut margin_spot = valid_config();
+        margin_spot.accounts[0]
+            .trade_modes
+            .insert("BTC-USDT".to_string(), OkxTradeModeConfig::Cross);
+        let report = margin_spot.validate();
+        assert!(report.errors.iter().any(|error| {
+            error.contains(
+                "spot symbol BTC-USDT must use cash trade mode; margin spot positions are not supported",
+            )
+        }));
+
+        let mut cash_derivative = valid_config();
+        cash_derivative.accounts[0]
+            .trade_modes
+            .insert("BTC-PERP".to_string(), OkxTradeModeConfig::Cash);
+        let report = cash_derivative.validate();
+        assert!(report.errors.iter().any(|error| {
+            error.contains("derivative symbol BTC-PERP cannot use cash trade mode")
+        }));
     }
 
     #[test]

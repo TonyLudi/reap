@@ -208,22 +208,27 @@ settings; accepting only their static flags would weaken live stop behavior.
   A demo fault campaign must delay or suppress both derivative and spot state
   updates and verify the drift alert, cancels, REST repair, and clean recovery.
 
-## Position Margin Mode
+## Position Scope And Margin Mode
 
 - OKX REST positions and private position updates must carry `mgnMode` as
   `cross` or `isolated`. Reap retains that field in canonical position state.
+- Live spot symbols must use `cash` trade mode. Every nonzero position returned
+  for an account must be a configured derivative owned by that account. A
+  margin-spot position, a symbol assigned to another configured account, or an
+  unmanaged symbol is a fatal policy violation because strategy/risk cannot
+  safely value that exposure.
 - Every nonzero managed derivative position must match the symbol's configured
   account trade mode. A mismatch aborts bootstrap or the running live
   lifecycle before applying the bad position; demo shutdown then enters the
   normal cancel/reconciliation path and does not disarm the exchange deadman
   unless cleanup proves zero orders and clean state.
 - Zero positions do not fail this check, allowing a closed mismatched position
-  to clear the condition. Full-state reconciliation independently reports a
-  websocket/REST margin-mode disagreement for any nonzero position.
-- Treat a mismatch as account configuration or external-position contamination,
-  not a reconnect issue. Keep order entry stopped, inspect the OKX position and
-  account mode, close or correct it outside Reap, and start again from a clean
-  bootstrap.
+  or foreign position to report closure. Full-state reconciliation independently
+  reports a websocket/REST margin-mode disagreement for any nonzero position.
+- Treat any scope or mode violation as account configuration or external-position
+  contamination, not a reconnect issue. Keep order entry stopped, inspect and
+  close or correct the OKX position outside Reap, and start again from a clean
+  bootstrap. Use a dedicated subaccount for this strategy.
 
 ## Stablecoin Depeg Guard
 
@@ -439,7 +444,7 @@ replacement for exchange-side account limits and operator access controls.
 | Public feed stale | Symbol blocked; live orders cancelled | Restore at least one healthy feed and verify sequence continuity |
 | Private stream stale | Account blocked; live orders cancelled | Reconnect, REST reconcile orders/fills/balances/positions, then emit recovery |
 | Fill/account-state convergence timeout | Account blocked; live orders cancelled; full reconciliation requested | Inspect the missing symbol/currency target and private-channel latency, then require authoritative repair and a clean pass |
-| Position margin-mode mismatch | Bootstrap/runtime abort; demo cleanup attempts cancel/reconcile and retains the deadman unless safe | Keep entry disabled; inspect and correct the nonzero OKX position mode, then require a clean bootstrap |
+| Position scope or margin-mode violation | Bootstrap/runtime abort; demo cleanup attempts cancel/reconcile and retains the deadman unless safe | Keep entry disabled; close/correct the unmodeled position or mode outside Reap, then require a clean bootstrap |
 | Reconcile drift | Account blocked; live orders cancelled | Inspect the recorded full-state differences and require a later clean pass before recovery |
 | Stablecoin reference missing/stale/conflicting/depegged | New entry blocked immediately; durable global kill and live-order cancellation after debounce | Verify both redundant index routes and an independent venue reference; use the stopped-process latch-clear procedure after a sustained breach |
 | Risk breach | Durable global kill active; live orders cancelled | Reduce exposure externally if needed, diagnose, and follow the stopped-process latch-clear procedure; restart alone does not clear it |

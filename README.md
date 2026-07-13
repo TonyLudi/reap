@@ -21,8 +21,8 @@ Implemented:
 - Deterministic pre/post-trade risk, stale-stream fail-closed behavior, global,
   account, and symbol halt events, redundant USDT/USDC reference guards with
   durable depeg latching, per-fill account-state convergence deadlines,
-  continuous derivative position margin-mode enforcement, and an event-loop
-  enforcement layer.
+  strict configured-account position ownership, continuous derivative position
+  margin-mode enforcement, and an event-loop enforcement layer.
 - Bounded structured telemetry and JSONL storage for raw, normalized, intent,
   request, acknowledgement, order, fill, system, bootstrap, reconciliation,
   and write-ahead safety-latch records, including restart recovery and an

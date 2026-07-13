@@ -112,7 +112,7 @@ pub fn verify_bootstrap(
         let account_update = snapshot.scoped_account_update(&account.id);
         errors.extend(
             config
-                .position_margin_mode_errors(&account.id, &account_update)
+                .position_policy_errors(&account.id, &account_update)
                 .into_iter()
                 .map(|error| {
                     format!(
@@ -542,6 +542,27 @@ mod tests {
             error
                 .to_string()
                 .contains("BTC-USDT-SWAP expected Cross, received Isolated")
+        );
+    }
+
+    #[test]
+    fn rejects_unmanaged_nonzero_position() {
+        let config = config();
+        let mut snapshot = snapshot();
+        snapshot.positions.positions.push(Position {
+            symbol: "ETH-USDT-SWAP".to_string(),
+            qty: 1.0,
+            avg_price: 3_000.0,
+            margin_mode: Some(PositionMarginMode::Cross),
+        });
+
+        let error = verify_bootstrap(&config, &HashMap::from([("main".to_string(), snapshot)]))
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("unmanaged nonzero position ETH-USDT-SWAP qty=1")
         );
     }
 }

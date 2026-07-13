@@ -220,6 +220,9 @@ Responsibilities:
 - Typed position margin mode from both websocket and REST inputs, checked
   against each configured derivative trade mode before nonzero state is
   accepted and included in full-state reconciliation.
+- Strict position ownership at the live boundary: spot routing is cash-only,
+  and a nonzero position must be a configured derivative owned by the account
+  that delivered it. Unmodeled exposure is never passed into strategy/risk.
 - Missed cancel and unknown-order handling.
 
 Strategy code sends intents. The order layer owns what actually happened.

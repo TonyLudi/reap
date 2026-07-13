@@ -15,7 +15,7 @@ production trading process.
 | Order components | Event-loop client IDs/registration, exchange-side place-request expiry, signed submit/cancel, pacing, monotonic private reduction, typed position margin mode, ambiguity handling, and full order/fill/balance/position REST reconciliation are composed | Needs demo exchange fault evidence |
 | Runtime risk | Instrument models, authoritative startup positions, configured position margin-mode enforcement, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed deadman/depeg/convergence evidence |
 | Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, and strict bounded soak reports | Demo-capable; production entry intentionally unavailable |
-| Instrument/account bootstrap | Account instruments/config/balance/positions are typed, verified, and applied to strategy/risk before snapshot readiness | Needs target-account certification |
+| Instrument/account bootstrap | Account instruments/config/balance/positions are typed; live spot is cash-only; nonzero positions require configured account ownership and derivative mode before strategy/risk application | Needs target-account certification |
 | Startup/restart gate | Executable phase state, engine-consumed account-snapshot invariant, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, durable latch restore, authoritative account repair, and second-pass clean REST reconciliation | Needs process-kill demo test |
 | Event-loop profile | Allocation-aware raw OKX parity benchmark covers redundant wire input through strategy/risk and storage-record construction | Needs target-host capture and exchange-latency validation |
 | Operator control and alerts | HMAC-authenticated local controls use fsynced write-ahead latches; OKX Cancel All After is maintained independently; a separate CLI can arm the deadman, cancel all regular orders account-wide, and prove post-trigger zero | Must exercise target alert routing and the independent cancel procedure; algo/spread orders remain outside its scope |
@@ -118,13 +118,19 @@ production trading process.
     nonzero derivative position must match the configured `cross` or `isolated`
     trade mode, while full-state reconciliation also compares local and remote
     mode; mismatch fails the live lifecycle before applying the position.
+22. Live position scope is total and fail-closed: spot order routing is
+    cash-only, and every nonzero account position must be a configured
+    derivative owned by the account that produced the update. Unmodeled
+    exposure aborts before strategy/risk application; zero closure rows remain
+    admissible.
 
 ## Remaining Demo Gate
 
 1. Review `examples/live-okx-demo.toml` against the actual demo account and
-   current fee tier. Confirm every existing nonzero derivative position has the
-   configured margin mode. Enable and threshold `[host_guard]`, and route
-   `[alerts]` to a monitored test destination.
+   current fee tier. Confirm the subaccount has no margin-spot or unmanaged
+   position and every nonzero derivative position has the configured owner and
+   margin mode. Enable and threshold `[host_guard]`, and route `[alerts]` to a
+   monitored test destination.
 2. Run `observe` through reconnects and verify every account reaches `ready`
    with no reconciliation drift or critical storage backpressure. Use a bounded
    run with `--duration-secs <seconds> --require-clean-soak` so the result is

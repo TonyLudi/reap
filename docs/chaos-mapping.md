@@ -93,6 +93,11 @@ The following differences do not change the covered quote/hedge calculations:
   optimizer-specific amend/refill mechanics are not copied.
 - Rust live protocol support currently targets OKX. Binance-specific account,
   reduce-only, fee-asset, and position freshness behavior is not claimed.
+- Rust live spot routing is deliberately cash-only. A nonzero OKX position must
+  be a configured derivative owned by the delivering account; margin-spot or
+  foreign exposure is rejected because the iarb2 live risk model does not
+  safely value it. Backtest strategy math remains independent of this live
+  account-isolation policy.
 - Java's `OrderRateLimitAlert` callback adds a three-second recovery margin and
   system-halts only Binance entities; it logs non-Binance entities as
   unexpected. The Rust OKX path instead uses bounded proactive pacing,
