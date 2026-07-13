@@ -298,6 +298,9 @@ Responsibilities:
 - Coordinate reconciliation and recovery.
 - Reduce durable global/account/symbol latches, block halted routes, and
   guarantee scoped canonical cancellation.
+- Promote terminal strategy safety halts into the global risk gate before
+  dispatching intents from the triggering event; global cancellation always
+  takes precedence over simultaneous symbol isolation.
 - Validate exchange time, expire stale place requests at the venue, and own an
   independently scheduled exchange deadman lifecycle per account.
 - Expose a separate minimal-config emergency composition that bypasses strategy,
@@ -329,6 +332,10 @@ loop {
 The coordinator owns strategy, risk, readiness, account-scoped private
 reducers, client-order-id generation, and intent routing. It synchronously
 records `PendingNew` before a submit action can reach an account gateway task.
+After every strategy callback, the engine polls the generic terminal safety
+state. A newly reported halt becomes `RiskBreach` plus `KillSwitchActivated`,
+rejects new intents from that callback, persists through the coordinator's
+global safety latch, and synthesizes cancellation for every canonical order.
 The runtime separately tracks submit-to-private-state and
 cancel-to-terminal-state convergence. A missed event-only order update cannot
 leave either transition pending indefinitely: expiry releases cancel

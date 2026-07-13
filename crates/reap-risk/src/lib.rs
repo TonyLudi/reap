@@ -732,6 +732,17 @@ impl RiskGate {
         }
     }
 
+    pub fn on_strategy_halt(
+        &mut self,
+        ts_ms: TimeMs,
+        reason: impl Into<String>,
+    ) -> PostTradeOutcome {
+        if self.kill_switch.is_some() {
+            return PostTradeOutcome::default();
+        }
+        self.activate_risk_breach(ts_ms, None, format!("strategy halted: {}", reason.into()))
+    }
+
     pub fn reset_kill_switch(&mut self, ts_ms: TimeMs, reason: impl Into<String>) -> SystemEvent {
         self.kill_switch = None;
         SystemEvent {

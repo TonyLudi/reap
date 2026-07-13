@@ -329,6 +329,23 @@ settings; accepting only their static flags would weaken live stop behavior.
   reconciliation, and remains under the cancel-to-terminal convergence guard.
   Amend routing is unsupported.
 
+## Strategy Safety Halt Propagation
+
+- Every terminal chaos `halt_reason`, including delta, PnL, balance-sheet,
+  margin, index, hedge-availability, anomalous-fill, and stuck-hedge stops, is
+  exposed through the generic strategy safety contract. The engine checks that
+  contract after every callback and before dispatching callback-generated
+  intents.
+- The first halt becomes `RiskBreach` plus `KillSwitchActivated`. New orders
+  from the triggering callback are rejected, the coordinator persists a global
+  risk latch, and every canonical active order is cancelled. Global kill scope
+  takes precedence if a symbol halt occurs in the same event.
+- The halt is terminal for that strategy instance. A reset event cannot reopen
+  risk while the same instance still reports the halt, and live global reset is
+  intentionally unavailable. Diagnose and correct the cause, independently
+  verify orders and exposure, then use the stopped-process latch-clear procedure
+  before returning through `observe`.
+
 ## Stablecoin Depeg Guard
 
 - Configure `[[risk.stablecoin_guards]]` with the OKX index symbol and maximum

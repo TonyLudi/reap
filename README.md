@@ -25,7 +25,8 @@ Implemented:
   exchange-order rejection and unfilled-IOC cancellation circuits, strict
   configured-account position ownership, continuous derivative position
   margin-mode enforcement, forced-repayment risk blocking, and an event-loop
-  enforcement layer.
+  enforcement layer that promotes terminal strategy safety halts into durable
+  global risk latches.
 - Bounded structured telemetry and JSONL storage for raw, normalized, intent,
   request, acknowledgement, order, fill, system, bootstrap, reconciliation,
   and write-ahead safety-latch records, including restart recovery and an

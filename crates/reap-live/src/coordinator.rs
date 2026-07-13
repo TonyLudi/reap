@@ -2069,6 +2069,81 @@ mod tests {
     }
 
     #[test]
+    fn chaos_internal_halt_persists_risk_latch_and_cancels_live_orders() {
+        let mut coordinator = coordinator_with_risk(
+            true,
+            RiskLimits {
+                max_abs_position_notional_usd: 1_000_000_000.0,
+                require_feed_health: false,
+                require_private_health: false,
+                ..RiskLimits::default()
+            },
+        );
+        ready(&mut coordinator);
+        coordinator.set_order_entry_enabled(false);
+        coordinator
+            .restore_order(
+                "main",
+                OrderUpdate {
+                    ts_ms: 2,
+                    order_id: "live-order".to_string(),
+                    symbol: "BTC-USDT".to_string(),
+                    side: Side::Sell,
+                    event: OrderEvent::New,
+                    status: OrderStatus::Live,
+                    price: 101.0,
+                    time_in_force: Some(TimeInForce::PostOnly),
+                    qty: 0.1,
+                    open_qty: 0.1,
+                    filled_qty: 0.0,
+                    avg_fill_price: 0.0,
+                    last_fill_qty: 0.0,
+                    last_fill_price: 0.0,
+                    last_fill_liquidity: None,
+                    reason: "quote".to_string(),
+                },
+            )
+            .unwrap();
+        for symbol in ["BTC-USDT", "BTC-PERP"] {
+            coordinator.process_event(NormalizedEvent::Market(MarketEvent::Depth(
+                OrderBook::one_level(
+                    symbol,
+                    3,
+                    Level::new(99.0, 10_000.0),
+                    Level::new(101.0, 10_000.0),
+                ),
+            )));
+        }
+        assert!(!coordinator.kill_switch_active());
+
+        let output = coordinator.process_event(NormalizedEvent::Account(AccountUpdate {
+            ts_ms: 4,
+            balances: Vec::new(),
+            positions: vec![Position {
+                symbol: "BTC-USDT".to_string(),
+                qty: 1_000.0,
+                avg_price: 100.0,
+                margin_mode: None,
+            }],
+            margins: Vec::new(),
+        }));
+
+        assert!(coordinator.kill_switch_active());
+        assert!(output.records.iter().any(|record| matches!(
+            record,
+            StorageRecord::SafetyLatch(latch)
+                if latch.active
+                    && latch.scope == SafetyLatchScope::Global
+                    && latch.source == SafetyLatchSource::Risk
+                    && latch.reason.contains("strategy halted: strategy delta")
+        )));
+        assert!(output.actions.iter().any(|action| matches!(
+            action,
+            LiveAction::Cancel(cancel) if cancel.client_order_id == "live-order"
+        )));
+    }
+
+    #[test]
     fn fill_convergence_fault_cancels_live_orders_and_reconciles_account() {
         let mut coordinator = coordinator();
         ready(&mut coordinator);

@@ -49,7 +49,7 @@ control plane.
 | Spot cash, equity, liability, loan, and borrow limits | Account-scoped balance state | Exact |
 | Derivative position and margin capacity | Position and settle-currency account state | Exact |
 | OKX exchange CMR and calculated portfolio margin checks | Separate margin fields and debouncers | Exact |
-| Balance sheet, turnover, live size, PnL, margin, index, and basis checks | `check_risk_limits` and debounced conditions | Exact |
+| Balance sheet, turnover, live size, PnL, margin, index, and basis checks | `check_risk_limits`, debounced conditions, and generic engine safety-halt promotion | Exact thresholds with a stricter durable global latch and all-order cancellation on terminal halt |
 | `EntityOpenOrderSafeguard.EntityMaxOpenOrder` | Projected pre-trade and authoritative post-trade global/per-symbol active-order count limits | Equivalent per-symbol containment with an additional global ceiling; Rust post-trade breach latches globally |
 | `GatewayOrderStatsSafeguard` submit-rejection controls (`OrderMaxReject`, `SymbolMaxReject`, and total reject scopes) | Deduplicated rolling global/per-symbol canonical `Rejected` order thresholds | Equivalent submit-reject containment with a stricter durable global latch; amend is unsupported and cancel failures reconcile immediately |
 | `GatewayOrderStatsSafeguard.SymbolMaxIOCCancelled` | Deduplicated rolling per-symbol canonical IOC `Cancelled` thresholds when cumulative fill is exactly zero | Equivalent Java zero-fill semantics with multi-socket duplicate suppression and a stricter durable global latch |

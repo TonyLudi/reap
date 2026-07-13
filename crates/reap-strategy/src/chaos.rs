@@ -3013,6 +3013,10 @@ impl Strategy for ChaosStrategy {
             event => self.on_event(&event),
         }
     }
+
+    fn safety_halt_reason(&self) -> Option<&str> {
+        ChaosStrategy::halt_reason(self)
+    }
 }
 
 #[derive(Debug, Clone)]

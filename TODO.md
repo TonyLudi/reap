@@ -126,6 +126,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Add a deduplicated rolling per-symbol zero-fill IOC cancellation threshold
   that preserves local time-in-force through canonical private order updates,
   persists the global risk latch, and cancels active orders.
+- [x] Promote every terminal chaos strategy halt into the engine-owned global
+  risk path before intent dispatch, persist the latch, and make global
+  cancellation scope override simultaneous symbol-only isolation.
 - [x] Require every canonical derivative fill to converge to its position row
   and every spot fill to both currency balances within a configured deadline;
   fail closed and reconcile the account on timeout.
