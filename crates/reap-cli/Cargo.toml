@@ -11,6 +11,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 reap-backtest.workspace = true
+reap-capture.workspace = true
 reap-feed.workspace = true
 reap-live.workspace = true
 reap-strategy.workspace = true

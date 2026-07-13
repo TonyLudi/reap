@@ -77,6 +77,7 @@ reap/
     reap-strategy/
     reap-engine/
     reap-backtest/
+    reap-capture/
     reap-storage/
     reap-telemetry/
     reap-live/
@@ -276,8 +277,10 @@ Responsibilities:
 - Start/stop/restart strategy instances.
 - Dispatch timers into strategy loops.
 - Coordinate reconciliation and recovery.
-- Reduce authenticated account latches, block halted account routes, and
-  guarantee account-scoped canonical cancellation.
+- Reduce durable global/account/symbol latches, block halted routes, and
+  guarantee scoped canonical cancellation.
+- Validate exchange time, expire stale place requests at the venue, and own an
+  independently scheduled exchange deadman lifecycle per account.
 
 Implemented topology:
 
@@ -295,7 +298,8 @@ Strategy shard task:
 loop {
     let input = prioritized_rx.recv().await?;
     let output = coordinator.on_input(input)?;
-    critical_storage.try_record_all(output.records)?;
+    critical_storage.record_bounded(output.normal_records)?;
+    critical_storage.record_durable(output.safety_latches).await?;
     order_queues.try_dispatch_all(output.actions)?;
 }
 ```
@@ -304,6 +308,10 @@ The coordinator owns strategy, risk, readiness, account-scoped private
 reducers, client-order-id generation, and intent routing. It synchronously
 records `PendingNew` before a submit action can reach an account gateway task.
 REST and websocket IO never borrow strategy state across `.await`.
+Normal event records use the bounded non-blocking path. A safety-latch mutation
+is the rare write-ahead exception: it is flushed and synced before its cancel
+actions can leave the coordinator, with a bounded timeout that fails the runtime
+closed.
 
 Startup moves through configured, reconciling, awaiting-streams, ready, and
 degraded phases. Ready requires verified account-scoped instrument metadata,
@@ -331,6 +339,26 @@ Responsibilities:
 
 Backtest should use the same `StrategyEvent` and `OrderEvent` types as live.
 
+### `reap-capture`
+
+Credential-free public market-data composition.
+
+Responsibilities:
+
+- Build explicit public-only subscription plans from TOML.
+- Run redundant websocket connections through `reap-feed` supervision.
+- Persist every received raw frame through a bounded lossless writer.
+- Stamp every frame with a process-session identity so replay cannot hide
+  capture downtime.
+- Optionally persist deduplicated normalized events for short diagnostics.
+- Report connection readiness, queue high-water marks, parser failures,
+  duplicates, gaps, recoveries, and final book health.
+
+Long-running collection uses raw JSONL as the canonical format. Backtest raw
+replay reconstructs full books through the same adapter, deduplication,
+sequencing, and reducer path as live; this avoids materializing a 400-level
+book snapshot for every captured delta.
+
 ### `reap-storage`
 
 Durable capture and replay data.
@@ -341,11 +369,14 @@ Responsibilities:
 - Normalized event logs.
 - Strategy decisions and order intents.
 - Order/fill/account events.
+- Write-ahead operator/risk safety latches and restart reduction.
 - Book snapshots.
 - JSONL initially, Parquet or binary logs later.
 
-Storage must never block the hot path. Use bounded queues and explicit drop or
-degrade policies.
+Normal storage must never block the hot path. Use bounded queues and explicit
+drop or degrade policies. Safety-control mutations are infrequent and may await
+durable media before dispatch because losing a kill across process restart is
+more dangerous than control-path latency.
 
 ### `reap-telemetry`
 
@@ -369,13 +400,14 @@ Target command surface:
 
 ```text
 reap live --config config/live.toml
+reap capture --config config/capture.toml
 reap backtest --config config/backtest.toml --events data/events.jsonl
 reap replay-check --events data/events.jsonl
 reap inspect-book --capture raw/ws.jsonl --symbol BTC-USDT
 reap config-check --config config/live.toml
 ```
 
-`live`, `backtest`, `replay-check`, and `config-check` are implemented.
+`live`, `capture`, `backtest`, `replay-check`, and `config-check` are implemented.
 `inspect-book` remains planned; see [trading-readiness.md](trading-readiness.md).
 
 ## Multi-Websocket Design
@@ -678,6 +710,10 @@ the deployment blocker.
 - Isolate one account without resetting healthy account routes, while removing
   its instruments from strategy pricing/hedging and cancelling its canonical
   orders. Done.
+- Capture redundant public data without credentials and replay it through the
+  live adapter/dedup/sequence/book path. Done.
+- Add exchange-side request expiry, server-clock validation, independent Cancel
+  All After heartbeats, and durable restart latches. Done.
 - Complete fault injection and OKX demo soak acceptance.
 
 See [trading-readiness.md](trading-readiness.md) for the detailed gate.

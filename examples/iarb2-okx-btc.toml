@@ -1,0 +1,59 @@
+strategy_name = "reap-chaos-capture-backtest"
+underlying = "BTC"
+ref_symbol = "BTC-USDT"
+delta_limit_usd = 1000.0
+active_hedge_threshold_usd = 25.0
+min_hedge_interval_ms = 100
+quote_only = false
+
+[[risk_groups]]
+name = "main"
+symbols = ["BTC-USDT", "BTC-USDT-SWAP"]
+soft_delta_limit_usd = 500.0
+hard_delta_limit_usd = 750.0
+delta_stop_limit_usd = 1000.0
+live_order_limit_usd = 5000.0
+turnover_limit_usd = 100000.0
+basis_limit = 0.08
+
+[[instruments]]
+symbol = "BTC-USDT"
+kind = "spot"
+risk_group = "main"
+base_currency = "BTC"
+quote_currency = "USDT"
+maker_fee = 0.0001
+taker_fee = 0.001
+hedge_profit_margin = 0.0005
+quote_profit_margin = 0.0007
+hedge_aggression = 0.0003
+max_order_size_usd = 100.0
+min_order_size_usd = 10.0
+max_order_size = 0.01
+min_trade_size = 0.00001
+tick_size = 0.1
+lot_size = 0.00000001
+min_position = -0.05
+max_position = 0.05
+
+[[instruments]]
+symbol = "BTC-USDT-SWAP"
+kind = "linear_swap"
+risk_group = "main"
+base_currency = "BTC"
+quote_currency = "USDT"
+settle_currency = "USDT"
+maker_fee = 0.0002
+taker_fee = 0.0005
+hedge_profit_margin = 0.0004
+quote_profit_margin = 0.0006
+hedge_aggression = 0.0003
+max_order_size_usd = 100.0
+min_order_size_usd = 10.0
+max_order_size = 1.0
+min_trade_size = 0.01
+tick_size = 0.1
+lot_size = 0.01
+contract_value = 0.01
+min_position = -10.0
+max_position = 10.0

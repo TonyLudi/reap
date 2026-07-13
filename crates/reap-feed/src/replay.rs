@@ -12,6 +12,8 @@ use crate::{FeedOutput, FeedProcessor, payload_hash};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawCapture {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_session_id: Option<String>,
     pub venue: Venue,
     pub conn_id: ConnId,
     pub channel: Channel,
@@ -59,6 +61,7 @@ pub struct ReplayBookHealth {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplayCheckReport {
     pub lines: u64,
+    pub capture_sessions: usize,
     pub parsed_events: u64,
     pub accepted_events: u64,
     pub normalized_events: u64,
@@ -73,7 +76,10 @@ pub struct ReplayCheckReport {
 
 impl ReplayCheckReport {
     pub fn is_healthy(&self) -> bool {
-        self.errors.is_empty()
+        self.lines > 0
+            && self.capture_sessions == 1
+            && !self.books.is_empty()
+            && self.errors.is_empty()
             && self.recovery_failures == 0
             && self.unrecovered_streams == 0
             && self.books.iter().all(|book| book.book_status == "ready")
@@ -91,6 +97,7 @@ pub fn replay_check<R: Read>(reader: R) -> Result<ReplayCheckReport> {
     let mut processor = FeedProcessor::new(16_384, 32_768);
     let mut errors = Vec::new();
     let mut lines = 0_u64;
+    let mut capture_sessions = std::collections::HashSet::new();
 
     for (index, line) in BufReader::new(reader).lines().enumerate() {
         let line_number = index + 1;
@@ -102,6 +109,13 @@ pub fn replay_check<R: Read>(reader: R) -> Result<ReplayCheckReport> {
         lines += 1;
         let result = (|| -> Result<()> {
             let capture: RawCapture = serde_json::from_str(trimmed)?;
+            let session = capture
+                .capture_session_id
+                .as_deref()
+                .map_or_else(|| "legacy:unspecified".to_string(), |id| format!("id:{id}"));
+            if capture_sessions.insert(session) && capture_sessions.len() > 1 {
+                anyhow::bail!("capture contains more than one process session");
+            }
             let envelope = capture.into_envelope()?;
             let adapter = adapters
                 .iter()
@@ -145,6 +159,7 @@ pub fn replay_check<R: Read>(reader: R) -> Result<ReplayCheckReport> {
 
     Ok(ReplayCheckReport {
         lines,
+        capture_sessions: capture_sessions.len(),
         parsed_events: stats.parsed,
         accepted_events: stats.accepted,
         normalized_events: stats.normalized_events,
@@ -169,9 +184,47 @@ mod tests {
 
         assert!(report.is_healthy(), "{report:#?}");
         assert_eq!(report.duplicates, 3);
+        assert_eq!(report.capture_sessions, 1);
         assert_eq!(report.gaps, 1);
         assert_eq!(report.recoveries, 1);
         assert_eq!(report.books[0].last_seq_id, Some(103));
         assert_eq!(report.books[0].best_bid, Some(100.2));
+    }
+
+    #[test]
+    fn checker_rejects_concatenated_capture_sessions() {
+        let first_line = include_str!("../../../fixtures/raw/okx/depth-gap.jsonl")
+            .lines()
+            .next()
+            .unwrap();
+        let mut first: RawCapture = serde_json::from_str(first_line).unwrap();
+        first.capture_session_id = Some("session-a".to_string());
+        let mut second = first.clone();
+        second.capture_session_id = Some("session-b".to_string());
+        let input = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap()
+        );
+
+        let report = replay_check(input.as_bytes()).unwrap();
+
+        assert!(!report.is_healthy());
+        assert_eq!(report.capture_sessions, 2);
+        assert_eq!(report.errors.len(), 1);
+        assert!(
+            report.errors[0]
+                .message
+                .contains("more than one process session")
+        );
+    }
+
+    #[test]
+    fn checker_rejects_empty_input() {
+        let report = replay_check("\n# no records\n".as_bytes()).unwrap();
+
+        assert!(!report.is_healthy());
+        assert_eq!(report.lines, 0);
+        assert_eq!(report.capture_sessions, 0);
     }
 }

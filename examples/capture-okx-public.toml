@@ -1,0 +1,67 @@
+[venue]
+public_ws_url = "wss://ws.okx.com:8443/ws/v5/public"
+
+[runtime]
+feed_channel_capacity = 65536
+writer_channel_capacity = 65536
+dedup_capacity_per_stream = 100000
+max_sequence_buffer = 4096
+max_subscriptions_per_socket = 100
+health_interval_ms = 1000
+max_book_age_ms = 5000
+
+[output]
+raw_path = "var/reap/capture/okx-btc-raw.jsonl"
+flush_every_records = 1024
+fsync_every_records = 10000
+
+# The Java OKX subscriber supports TBT and 400-level depth modes. Public capture
+# defaults to the broadly available 400-level `books` channel; use
+# `books-l2-tbt` only for an account/environment entitled to that channel.
+[[subscriptions]]
+channel = "books"
+symbol = "BTC-USDT"
+connections = 2
+priority = "critical"
+
+[[subscriptions]]
+channel = "trades"
+symbol = "BTC-USDT"
+connections = 2
+priority = "high"
+
+[[subscriptions]]
+channel = "index-tickers"
+symbol = "BTC-USDT"
+connections = 2
+priority = "high"
+
+[[subscriptions]]
+channel = "books"
+symbol = "BTC-USDT-SWAP"
+connections = 2
+priority = "critical"
+
+[[subscriptions]]
+channel = "trades"
+symbol = "BTC-USDT-SWAP"
+connections = 2
+priority = "high"
+
+[[subscriptions]]
+channel = "funding-rate"
+symbol = "BTC-USDT-SWAP"
+connections = 2
+priority = "high"
+
+[[subscriptions]]
+channel = "mark-price"
+symbol = "BTC-USDT-SWAP"
+connections = 2
+priority = "high"
+
+[[subscriptions]]
+channel = "price-limit"
+symbol = "BTC-USDT-SWAP"
+connections = 2
+priority = "high"

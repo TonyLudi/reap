@@ -88,7 +88,33 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Add a bounded Unix-socket operator service with environment-keyed HMAC,
   freshness/replay checks, status, global/account kill, symbol halt/resume, and
   graceful stop.
+- [x] Persist operator and risk latches as write-ahead, fsynced journal records;
+  restore them before live readiness and do not treat normal shutdown as a
+  persistent kill.
 - [ ] Complete an OKX demo soak with no unexplained reconciliation drift.
+
+## Step 9: Production Confidence
+
+- [x] Add credential-free redundant OKX public capture and direct raw-capture
+  replay/backtest through the live adapter, deduplication, sequence, and book
+  reducer path.
+- [x] Reject crossed books and force fresh-snapshot recovery, matching the
+  reviewed Java OKX subscriber behavior with explicit sequence validation.
+- [x] Add order `expTime`, startup/periodic exchange-clock validation, and an
+  independently scheduled OKX Cancel All After heartbeat for demo order entry.
+- [x] Pin the Java strategy/connectivity audit to `imm-strategy` commit
+  `b6b120c7b7c466d8431bf082f3229328c5d7b2ae`.
+- [ ] Run credentialed bounded observe and minimal-size demo fault campaigns,
+  including process death, deadman expiry, clock skew, REST ambiguity, partial
+  fill, reconnect, and durable-latch restart recovery.
+- [ ] Calibrate queue position, latency, fees, funding, and slippage from
+  captured full-depth data; complete walk-forward, sensitivity, capacity, and
+  stressed-liquidity reports.
+- [ ] Deploy external alert delivery, host clock/disk/memory alarms, exclusive
+  process/journal locking, process supervision, and an independent
+  out-of-process exchange kill procedure.
+- [ ] Certify production credentials/account mode/limits and expose production
+  order entry only after every gate in `docs/trading-readiness.md` is signed off.
 
 Completed-step evidence is documented in [README.md](README.md),
 [docs/operations.md](docs/operations.md), and

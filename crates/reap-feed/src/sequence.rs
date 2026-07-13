@@ -54,6 +54,11 @@ impl SequenceTracker {
         self.buffered.len()
     }
 
+    pub fn require_recovery(&mut self) {
+        self.status = SequenceStatus::Recovering;
+        self.buffered.clear();
+    }
+
     pub fn on_update(&mut self, update: SequencedBookUpdate) -> SequenceOutcome {
         if update.action == BookAction::Snapshot {
             return self.on_snapshot(update);
@@ -234,5 +239,20 @@ mod tests {
             SequenceOutcome::RecoveryRequired { .. }
         ));
         assert_eq!(tracker.buffered_len(), 2);
+    }
+
+    #[test]
+    fn explicit_recovery_preserves_last_sequence_and_accepts_fresh_snapshot() {
+        let mut tracker = SequenceTracker::new(8);
+        tracker.on_update(update(BookAction::Snapshot, -1, 10));
+        tracker.require_recovery();
+
+        assert_eq!(tracker.status(), SequenceStatus::Recovering);
+        assert_eq!(tracker.last_seq_id(), Some(10));
+        assert!(matches!(
+            tracker.on_update(update(BookAction::Snapshot, -1, 10)),
+            SequenceOutcome::Apply(_)
+        ));
+        assert_eq!(tracker.status(), SequenceStatus::Ready);
     }
 }

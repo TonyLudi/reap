@@ -14,22 +14,25 @@ Implemented:
   hedges, including pending-liquidity exclusion and missed-hedge records.
 - Shared book and order reducers for top-of-book state, taker liquidity, and
   idempotent order-state transitions.
-- OKX public/private parsers, HMAC-signed REST order requests, supervised
-  multi-websocket feeds, account-scoped channel-aware deduplication, sequence
-  recovery, and REST reconciliation.
+- OKX public/private parsers, expiring HMAC-signed REST order requests,
+  supervised multi-websocket feeds, account-scoped channel-aware
+  deduplication, sequence recovery, and REST reconciliation.
 - Deterministic pre/post-trade risk, stale-stream fail-closed behavior, global,
   account, and symbol halt events, and an event-loop enforcement layer.
 - Bounded structured telemetry and JSONL storage for raw, normalized, intent,
-  request, acknowledgement, order, fill, system, bootstrap, and reconciliation
-  records, including restart checkpoint recovery.
+  request, acknowledgement, order, fill, system, bootstrap, reconciliation,
+  and write-ahead safety-latch records, including restart recovery.
 - A fail-closed `reap-live` composition root with account-scoped REST bootstrap,
   exchange metadata/account-mode verification, redundant public sockets,
   isolated private sockets, one strategy owner, prioritized gateway tasks, and
-  graceful cancel-and-drain shutdown.
+  graceful cancel-and-drain shutdown. Demo entry also validates exchange time
+  and maintains OKX Cancel All After from an independent safety task.
 - Backtest matching with `PostOnly`, `IOC`, current-depth fills, trade fills,
   queue-ahead tracking, and simple mark-to-market accounting.
 - CSV/normalized replay, raw-capture validation, configuration validation, and
   a release-mode hot-path benchmark.
+- Credential-free public OKX capture with redundant websocket plans, raw-frame
+  durability, normalized diagnostic output, and direct raw-capture backtests.
 
 Run the sample:
 
@@ -48,6 +51,32 @@ Validate a captured websocket stream and strategy config:
 ```bash
 cargo run -p reap-cli -- replay-check --events fixtures/raw/okx/depth-gap.jsonl --strict --pretty
 cargo run -p reap-cli -- config-check --config examples/iarb2-basic.toml --pretty
+```
+
+Capture backtest-ready OKX public data without credentials or private/account
+connections. The bounded command exits non-zero on parse, sequence, recovery,
+writer, or end-of-run connectivity defects:
+
+```bash
+cargo run -p reap-cli -- capture \
+  --config examples/capture-okx-public.toml \
+  --duration-secs 3600 \
+  --require-clean-capture \
+  --pretty
+```
+
+Validate and backtest the raw capture directly. Raw replay runs the same OKX
+adapter, redundant-feed deduplicator, sequence tracker, and book reducer used
+by live trading. Use a new output path for each capture process; replay rejects
+concatenated session IDs rather than treating downtime as continuous data:
+
+```bash
+cargo run -p reap-cli -- replay-check \
+  --events var/reap/capture/okx-btc-raw.jsonl --strict --pretty
+cargo run -p reap-cli -- backtest \
+  --config examples/iarb2-okx-btc.toml \
+  --data var/reap/capture/okx-btc-raw.jsonl \
+  --format raw-capture --pretty
 ```
 
 Validate the live demo configuration without reading credentials or opening a

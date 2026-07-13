@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use reap_core::{Channel, RawEnvelope, Symbol, Venue};
+use reap_core::{RawEnvelope, Symbol, Venue};
 use reap_venue::{VenueAdapter, okx::OkxSigner};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -120,7 +120,7 @@ pub fn spawn_supervised_feed(
         let (recovery_tx, recovery_rx) = watch::channel(0_u64);
         let mut routed_symbols = HashSet::new();
         for subscription in &plan.subscriptions {
-            if subscription.channel == Channel::Books
+            if subscription.channel.is_book()
                 && let Some(symbol) = &subscription.symbol
                 && routed_symbols.insert(symbol.clone())
             {
@@ -249,7 +249,7 @@ async fn supervise_connection(
 
 #[cfg(test)]
 mod tests {
-    use reap_core::{FeedPriority, Subscription};
+    use reap_core::{Channel, FeedPriority, Subscription};
     use reap_venue::okx::OkxCredentials;
 
     use super::*;

@@ -15,14 +15,17 @@ use reap_order::{
     CancelOutcome, OkxOrderGateway, ReconcileReport, SubmitOutcome, SubmitPreparation, reconcile,
 };
 use reap_storage::{
-    BootstrapRecord, OrderOperation, OrderRequestRecord, StorageConfig, StorageError,
-    StorageRecord, StorageRuntime, StorageSink, recover_jsonl, start_jsonl_storage,
+    BootstrapRecord, OrderOperation, OrderRequestRecord, RecoveredStorage, SafetyLatchRecord,
+    SafetyLatchScope, SafetyLatchSource, StorageConfig, StorageError, StorageRecord,
+    StorageRuntime, StorageSink, recover_jsonl, start_jsonl_storage,
 };
-use reap_venue::okx::{OkxAdapter, OkxRestClient, OkxSigner, ReqwestTransport};
+use reap_venue::okx::{
+    HttpTransport, OkxAdapter, OkxRestClient, OkxSigner, ReqwestTransport, RestError,
+};
 use reap_venue::{PrivateOrderState, PrivateOrderUpdate, RemoteFill, RemoteOrder, VenueAdapter};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -125,6 +128,8 @@ pub enum LiveRuntimeError {
     ReadinessTimeout(u64),
     #[error("gateway task failed: {0}")]
     GatewayTask(String),
+    #[error("durable safety latch sync timed out after {0}ms")]
+    SafetyLatchSyncTimeout(u64),
     #[error(
         "shutdown timed out with {active_orders} active local orders and {unreconciled_accounts} unreconciled accounts"
     )]
@@ -331,6 +336,7 @@ struct AccountSeed {
     account_id: String,
     signer: OkxSigner,
     gateway: LiveGateway,
+    safety_client: OkxRestClient<ReqwestTransport>,
 }
 
 async fn bootstrap_accounts(
@@ -358,7 +364,23 @@ async fn bootstrap_accounts(
             account_id: account.id.clone(),
             message: error.to_string(),
         })?;
-        let client = OkxRestClient::new(transport, signer.clone());
+        let client = OkxRestClient::new(transport, signer.clone()).with_order_request_expiry(
+            Duration::from_millis(config.runtime.order_request_expiry_ms),
+        );
+        let clock_skew_ms = rest_clock_skew_ms(&client)
+            .await
+            .map_err(|error| bootstrap_error(&account.id, "exchange clock", error.to_string()))?;
+        if clock_skew_ms > config.runtime.max_exchange_clock_skew_ms {
+            return Err(bootstrap_error(
+                &account.id,
+                "exchange clock",
+                format!(
+                    "clock skew {clock_skew_ms}ms exceeds configured maximum {}ms",
+                    config.runtime.max_exchange_clock_skew_ms
+                ),
+            ));
+        }
+        let safety_client = client.clone();
         let account_config = client
             .account_config()
             .await
@@ -478,11 +500,23 @@ async fn bootstrap_accounts(
             account_id: account.id.clone(),
             signer,
             gateway,
+            safety_client,
         });
     }
     let verified = verify_bootstrap(config, &snapshots)
         .map_err(|error| LiveRuntimeError::BootstrapVerification(error.to_string()))?;
     Ok((verified, seeds, snapshots))
+}
+
+async fn rest_clock_skew_ms<T>(client: &OkxRestClient<T>) -> Result<u64, RestError>
+where
+    T: HttpTransport,
+{
+    let before_ms = unix_time_ms();
+    let exchange_ms = client.server_time_ms().await?;
+    let after_ms = unix_time_ms();
+    let midpoint_ms = before_ms.saturating_add(after_ms.saturating_sub(before_ms) / 2);
+    Ok(midpoint_ms.abs_diff(exchange_ms))
 }
 
 fn bootstrap_error(account_id: &str, operation: &str, message: String) -> LiveRuntimeError {
@@ -528,6 +562,76 @@ fn private_update_from_remote(order: RemoteOrder) -> PrivateOrderUpdate {
     }
 }
 
+fn validate_recovered_safety_latches(
+    config: &LiveConfig,
+    recovered: &RecoveredStorage,
+) -> Result<(), LiveRuntimeError> {
+    for account_id in recovered.account_safety_latches.keys() {
+        if config.account(account_id).is_none() {
+            return Err(LiveRuntimeError::BootstrapVerification(format!(
+                "persistent safety latch references unknown account {account_id}; retain the journal and reconcile before changing account identity"
+            )));
+        }
+    }
+    for symbol in recovered.symbol_safety_latches.keys() {
+        if !config.required_symbols().contains(symbol) {
+            return Err(LiveRuntimeError::BootstrapVerification(format!(
+                "persistent safety latch references unmanaged symbol {symbol}; retain the journal and reconcile before changing instrument identity"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn restored_latch_reason(latch: &SafetyLatchRecord) -> String {
+    let source = match latch.source {
+        SafetyLatchSource::Operator => "operator",
+        SafetyLatchSource::Risk => "risk",
+        SafetyLatchSource::LegacySystemEvent => "legacy system-event",
+    };
+    format!(
+        "restored persistent {source} safety latch: {}",
+        latch.reason
+    )
+}
+
+fn restore_safety_latches(
+    coordinator: &mut LiveCoordinator,
+    recovered: &RecoveredStorage,
+) -> Result<Vec<CoordinatorOutput>, CoordinatorError> {
+    let mut outputs = Vec::new();
+    let now_ms = unix_time_ms();
+    if let Some(latch) = &recovered.global_safety_latch {
+        coordinator.set_order_entry_enabled(false);
+        outputs.push(
+            coordinator.process_event(NormalizedEvent::System(SystemEvent {
+                ts_ms: now_ms,
+                kind: SystemEventKind::KillSwitchActivated,
+                venue: None,
+                account_id: None,
+                symbol: None,
+                reason: restored_latch_reason(latch),
+            })),
+        );
+    }
+    for (account_id, latch) in &recovered.account_safety_latches {
+        outputs.push(coordinator.halt_account(now_ms, account_id, restored_latch_reason(latch))?);
+    }
+    for (symbol, latch) in &recovered.symbol_safety_latches {
+        outputs.push(
+            coordinator.process_event(NormalizedEvent::System(SystemEvent {
+                ts_ms: now_ms,
+                kind: SystemEventKind::SymbolHalted,
+                venue: None,
+                account_id: None,
+                symbol: Some(symbol.clone()),
+                reason: restored_latch_reason(latch),
+            })),
+        );
+    }
+    Ok(outputs)
+}
+
 struct LiveRuntime {
     mode: LiveMode,
     run_duration: Option<Duration>,
@@ -539,6 +643,8 @@ struct LiveRuntime {
     feed_rx: mpsc::Receiver<RuntimeEvent>,
     order_senders: HashMap<String, mpsc::Sender<OrderTaskCommand>>,
     order_tasks: Vec<JoinHandle<()>>,
+    safety_senders: HashMap<String, mpsc::Sender<SafetyTaskCommand>>,
+    safety_tasks: Vec<JoinHandle<()>>,
     feeds: Vec<SupervisedFeed>,
     feed_tasks: Vec<JoinHandle<()>>,
     sources: Vec<FeedSourceState>,
@@ -550,9 +656,11 @@ struct LiveRuntime {
     timer_interval_ms: u64,
     max_feed_age_ms: u64,
     shutdown_timeout_ms: u64,
+    safety_latch_sync_timeout_ms: u64,
     evidence: RuntimeEvidence,
     shutdown_in_progress: bool,
     shutdown_storage_error: Option<String>,
+    preserve_deadman_on_shutdown: bool,
     shutdown_reconciliation_requested: HashSet<String>,
     shutdown_reconciled_accounts: HashSet<String>,
     operator_service: Option<OperatorService>,
@@ -570,6 +678,7 @@ impl LiveRuntime {
         let operator_secret = operator_config.secret_from_env()?;
         let config_fingerprint = config.fingerprint()?;
         let recovered = recover_jsonl(&config.storage.path)?;
+        validate_recovered_safety_latches(&config, &recovered)?;
         for (account_id, (strategy_name, fingerprint)) in &recovered.bootstrap_identities {
             if config.account(account_id).is_none() {
                 return Err(LiveRuntimeError::CheckpointIdentity {
@@ -654,6 +763,9 @@ impl LiveRuntime {
         let session_id = format!("{:x}", unix_time_ns());
         let mut coordinator =
             LiveCoordinator::new(config.clone(), verified, mode == LiveMode::Demo, session_id)?;
+        // Apply recovered halt state before replaying anything that can produce an intent.
+        // Reapplying it after reconciliation below generates cancels for restored live orders.
+        let _ = restore_safety_latches(&mut coordinator, &recovered)?;
         let mut initial_outputs = vec![CoordinatorOutput {
             actions: Vec::new(),
             records: bootstrap_records,
@@ -733,6 +845,7 @@ impl LiveRuntime {
                 },
             })?);
         }
+        initial_outputs.extend(restore_safety_latches(&mut coordinator, &recovered)?);
         let public_subscriptions = public_subscriptions(&config);
         let public_plans = partition_subscriptions(
             &public_subscriptions,
@@ -784,32 +897,63 @@ impl LiveRuntime {
 
         let mut order_senders = HashMap::new();
         let mut order_tasks = Vec::new();
+        let mut safety_senders = HashMap::new();
+        let mut safety_tasks = Vec::new();
         for seed in seeds {
+            let AccountSeed {
+                account_id,
+                signer,
+                gateway,
+                safety_client,
+            } = seed;
+            let deadman_timeout_secs =
+                (mode == LiveMode::Demo).then_some(config.runtime.cancel_all_after_timeout_secs);
+            if let Some(timeout_secs) = deadman_timeout_secs {
+                safety_client
+                    .cancel_all_after(timeout_secs)
+                    .await
+                    .map_err(|error| LiveRuntimeError::GatewaySetup {
+                        account_id: account_id.clone(),
+                        message: format!("failed to arm Cancel All After: {error}"),
+                    })?;
+            }
+            let (safety_tx, safety_rx) = mpsc::channel(8);
+            safety_senders.insert(account_id.clone(), safety_tx);
+            safety_tasks.push(tokio::spawn(run_account_safety_task(
+                account_id.clone(),
+                safety_client,
+                safety_rx,
+                control_tx.clone(),
+                deadman_timeout_secs,
+                config.runtime.cancel_all_after_heartbeat_ms,
+                config.runtime.exchange_clock_check_interval_ms,
+                config.runtime.max_exchange_clock_skew_ms,
+            )));
             let private_adapter: Arc<dyn VenueAdapter> = Arc::new(
                 OkxAdapter::new(&config.venue.public_ws_url, &config.venue.private_ws_url)
-                    .with_account_id(&seed.account_id),
+                    .with_account_id(&account_id),
             );
             let mut private_feed = spawn_supervised_feed(
                 Arc::clone(&private_adapter),
                 private_plans.clone(),
-                okx_login_bootstrap(seed.signer),
+                okx_login_bootstrap(signer),
                 config.runtime.feed_channel_capacity,
                 ReconnectPolicy::default(),
             );
             let source_id = sources.len();
             sources.push(FeedSourceState::private(
                 private_adapter,
-                seed.account_id.clone(),
+                account_id.clone(),
                 &private_plans,
             ));
             spawn_feed_forwarders(source_id, &mut private_feed, &feed_tx, &mut feed_tasks);
             feeds.push(private_feed);
 
             let (order_tx, order_rx) = mpsc::channel(config.runtime.order_channel_capacity);
-            order_senders.insert(seed.account_id.clone(), order_tx);
+            order_senders.insert(account_id.clone(), order_tx);
             order_tasks.push(tokio::spawn(run_order_task(
-                seed.account_id,
-                seed.gateway,
+                account_id,
+                gateway,
                 order_rx,
                 control_tx.clone(),
                 config.runtime.ambiguous_submit_grace_ms,
@@ -830,6 +974,8 @@ impl LiveRuntime {
             feed_rx,
             order_senders,
             order_tasks,
+            safety_senders,
+            safety_tasks,
             feeds,
             feed_tasks,
             sources,
@@ -841,9 +987,11 @@ impl LiveRuntime {
             timer_interval_ms: config.runtime.timer_interval_ms,
             max_feed_age_ms: config.risk.max_feed_age_ms,
             shutdown_timeout_ms: config.runtime.shutdown_timeout_ms,
+            safety_latch_sync_timeout_ms: config.runtime.safety_latch_sync_timeout_ms,
             evidence: RuntimeEvidence::default(),
             shutdown_in_progress: false,
             shutdown_storage_error: None,
+            preserve_deadman_on_shutdown: false,
             shutdown_reconciliation_requested: HashSet::new(),
             shutdown_reconciled_accounts: HashSet::new(),
             operator_service: None,
@@ -851,7 +999,7 @@ impl LiveRuntime {
             operator_shutdown_reason: None,
         };
         for output in initial_outputs {
-            if let Err(primary) = runtime.commit_output(output) {
+            if let Err(primary) = runtime.commit_output(output).await {
                 let context = format!("runtime initialization failure: {primary}");
                 return Err(runtime.close_after_error(primary, &context).await);
             }
@@ -990,7 +1138,7 @@ impl LiveRuntime {
                 biased;
                 signal = &mut shutdown => {
                     signal?;
-                    self.drain_queued_events()?;
+                    self.drain_queued_events().await?;
                     let elapsed_ms = elapsed_ms(&started);
                     let outcome = readiness_tracker.finish(
                         LiveStopReason::OperatorSignal,
@@ -1000,7 +1148,7 @@ impl LiveRuntime {
                     return Ok(outcome);
                 }
                 _ = &mut duration_elapsed => {
-                    self.drain_queued_events()?;
+                    self.drain_queued_events().await?;
                     let elapsed_ms = elapsed_ms(&started);
                     let outcome = readiness_tracker.finish(
                         LiveStopReason::DurationElapsed,
@@ -1011,11 +1159,11 @@ impl LiveRuntime {
                 }
                 event = self.control_rx.recv() => {
                     let event = event.ok_or(LiveRuntimeError::EventChannelClosed)?;
-                    self.handle_runtime_event(event)?;
+                    self.handle_runtime_event(event).await?;
                 }
                 operator = receive_operator(&mut self.operator_rx) => {
                     let operator = operator.ok_or(LiveRuntimeError::OperatorChannelClosed)?;
-                    self.handle_operator_envelope(operator)?;
+                    self.handle_operator_envelope(operator).await?;
                 }
                 _ = timer.tick() => {
                     let now_ms = unix_time_ms();
@@ -1024,18 +1172,18 @@ impl LiveRuntime {
                         self.coordinator_risk_max_feed_age(),
                     ) {
                         let output = self.coordinator.process_event(NormalizedEvent::System(event));
-                        self.commit_output(output)?;
+                        self.commit_output(output).await?;
                     }
                     let output = self.coordinator.process_event(NormalizedEvent::Timer(TimerEvent {
                         ts_ms: now_ms,
                         name: "live_tick".to_string(),
                     }));
-                    self.commit_output(output)?;
+                    self.commit_output(output).await?;
                     self.retry_reconciliation(now_ms)?;
                 }
                 event = self.feed_rx.recv() => {
                     let event = event.ok_or(LiveRuntimeError::EventChannelClosed)?;
-                    self.handle_runtime_event(event)?;
+                    self.handle_runtime_event(event).await?;
                 }
             }
 
@@ -1119,25 +1267,28 @@ impl LiveRuntime {
         let mut retry = tokio::time::interval(Duration::from_millis(100));
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            self.drain_shutdown_events()?;
+            self.drain_shutdown_events().await?;
             let readiness = self.coordinator.readiness();
             if self.coordinator.active_order_count() == 0
                 && readiness.missing_reconciliation.is_empty()
                 && self.reconcile_inflight.is_empty()
                 && self.shutdown_reconciled_accounts.len() == self.order_senders.len()
             {
+                if !self.preserve_deadman_on_shutdown {
+                    self.disable_deadman_all().await?;
+                }
                 return Ok(());
             }
             tokio::select! {
                 biased;
                 event = self.control_rx.recv(), if !self.control_rx.is_closed() => {
                     if let Some(event) = event {
-                        self.handle_runtime_event(event)?;
+                        self.handle_runtime_event(event).await?;
                     }
                 }
                 event = self.feed_rx.recv(), if !self.feed_rx.is_closed() => {
                     if let Some(event) = event {
-                        self.handle_runtime_event(event)?;
+                        self.handle_runtime_event(event).await?;
                     }
                 }
                 _ = retry.tick() => {
@@ -1169,11 +1320,11 @@ impl LiveRuntime {
         }
     }
 
-    fn drain_shutdown_events(&mut self) -> Result<(), LiveRuntimeError> {
+    async fn drain_shutdown_events(&mut self) -> Result<(), LiveRuntimeError> {
         let pending_control = self.control_rx.len();
         for _ in 0..pending_control {
             match self.control_rx.try_recv() {
-                Ok(event) => self.handle_runtime_event(event)?,
+                Ok(event) => self.handle_runtime_event(event).await?,
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
@@ -1181,7 +1332,7 @@ impl LiveRuntime {
         let pending_feed = self.feed_rx.len();
         for _ in 0..pending_feed {
             match self.feed_rx.try_recv() {
-                Ok(event) => self.handle_runtime_event(event)?,
+                Ok(event) => self.handle_runtime_event(event).await?,
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
@@ -1189,11 +1340,11 @@ impl LiveRuntime {
         Ok(())
     }
 
-    fn drain_queued_events(&mut self) -> Result<(), LiveRuntimeError> {
+    async fn drain_queued_events(&mut self) -> Result<(), LiveRuntimeError> {
         let pending_control = self.control_rx.len();
         for _ in 0..pending_control {
             match self.control_rx.try_recv() {
-                Ok(event) => self.handle_runtime_event(event)?,
+                Ok(event) => self.handle_runtime_event(event).await?,
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     return Err(LiveRuntimeError::EventChannelClosed);
@@ -1203,7 +1354,7 @@ impl LiveRuntime {
         let pending_feed = self.feed_rx.len();
         for _ in 0..pending_feed {
             match self.feed_rx.try_recv() {
-                Ok(event) => self.handle_runtime_event(event)?,
+                Ok(event) => self.handle_runtime_event(event).await?,
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     return Err(LiveRuntimeError::EventChannelClosed);
@@ -1213,7 +1364,7 @@ impl LiveRuntime {
         Ok(())
     }
 
-    fn handle_operator_envelope(
+    async fn handle_operator_envelope(
         &mut self,
         envelope: OperatorEnvelope,
     ) -> Result<(), LiveRuntimeError> {
@@ -1223,7 +1374,7 @@ impl LiveRuntime {
             response,
         } = envelope;
         self.evidence.operator_commands = self.evidence.operator_commands.saturating_add(1);
-        let result = self.execute_operator_command(&request_id, command);
+        let result = self.execute_operator_command(&request_id, command).await;
         match result {
             Ok(operator_response) => {
                 let _ = response.send(operator_response);
@@ -1239,7 +1390,7 @@ impl LiveRuntime {
         }
     }
 
-    fn execute_operator_command(
+    async fn execute_operator_command(
         &mut self,
         request_id: &str,
         command: OperatorCommand,
@@ -1256,8 +1407,11 @@ impl LiveRuntime {
                     request_id,
                     SystemEventKind::KillSwitchActivated,
                     None,
+                    SafetyLatchScope::Global,
+                    true,
                     reason,
-                )?;
+                )
+                .await?;
                 self.evidence.operator_mutations =
                     self.evidence.operator_mutations.saturating_add(1);
                 Ok(OperatorResponse::accepted(
@@ -1273,12 +1427,25 @@ impl LiveRuntime {
                         format!("account {account_id} is not managed by this runtime"),
                     ));
                 }
-                let output = self.coordinator.halt_account(
-                    unix_time_ms(),
-                    &account_id,
-                    format!("authenticated operator request {request_id}: {reason}"),
-                )?;
-                self.commit_output(output)?;
+                let now_ms = unix_time_ms();
+                let reason = format!("authenticated operator request {request_id}: {reason}");
+                let mut output =
+                    self.coordinator
+                        .halt_account(now_ms, &account_id, reason.clone())?;
+                output.records.insert(
+                    0,
+                    StorageRecord::SafetyLatch(SafetyLatchRecord {
+                        ts_ms: now_ms,
+                        scope: SafetyLatchScope::Account {
+                            account_id: account_id.clone(),
+                        },
+                        active: true,
+                        source: SafetyLatchSource::Operator,
+                        request_id: Some(request_id.to_string()),
+                        reason,
+                    }),
+                );
+                self.commit_output(output).await?;
                 self.evidence.operator_mutations =
                     self.evidence.operator_mutations.saturating_add(1);
                 Ok(OperatorResponse::accepted(
@@ -1297,9 +1464,12 @@ impl LiveRuntime {
                 self.commit_operator_system_event(
                     request_id,
                     SystemEventKind::SymbolHalted,
-                    Some(symbol),
+                    Some(symbol.clone()),
+                    SafetyLatchScope::Symbol { symbol },
+                    true,
                     reason,
-                )?;
+                )
+                .await?;
                 self.evidence.operator_mutations =
                     self.evidence.operator_mutations.saturating_add(1);
                 Ok(OperatorResponse::accepted(
@@ -1326,9 +1496,12 @@ impl LiveRuntime {
                 self.commit_operator_system_event(
                     request_id,
                     SystemEventKind::SymbolResumed,
-                    Some(symbol),
+                    Some(symbol.clone()),
+                    SafetyLatchScope::Symbol { symbol },
+                    false,
                     reason,
-                )?;
+                )
+                .await?;
                 self.evidence.operator_mutations =
                     self.evidence.operator_mutations.saturating_add(1);
                 Ok(OperatorResponse::accepted(
@@ -1353,24 +1526,39 @@ impl LiveRuntime {
         }
     }
 
-    fn commit_operator_system_event(
+    async fn commit_operator_system_event(
         &mut self,
         request_id: &str,
         kind: SystemEventKind,
         symbol: Option<String>,
+        scope: SafetyLatchScope,
+        active: bool,
         reason: String,
     ) -> Result<(), LiveRuntimeError> {
-        let output = self
+        let now_ms = unix_time_ms();
+        let reason = format!("authenticated operator request {request_id}: {reason}");
+        let mut output = self
             .coordinator
             .process_event(NormalizedEvent::System(SystemEvent {
-                ts_ms: unix_time_ms(),
+                ts_ms: now_ms,
                 kind,
                 venue: None,
                 account_id: None,
                 symbol,
-                reason: format!("authenticated operator request {request_id}: {reason}"),
+                reason: reason.clone(),
             }));
-        self.commit_output(output)
+        output.records.insert(
+            0,
+            StorageRecord::SafetyLatch(SafetyLatchRecord {
+                ts_ms: now_ms,
+                scope,
+                active,
+                source: SafetyLatchSource::Operator,
+                request_id: Some(request_id.to_string()),
+                reason,
+            }),
+        );
+        self.commit_output(output).await
     }
 
     fn operator_status(&self) -> OperatorStatus {
@@ -1384,7 +1572,7 @@ impl LiveRuntime {
         }
     }
 
-    fn handle_runtime_event(&mut self, event: RuntimeEvent) -> Result<(), LiveRuntimeError> {
+    async fn handle_runtime_event(&mut self, event: RuntimeEvent) -> Result<(), LiveRuntimeError> {
         match event {
             RuntimeEvent::Raw {
                 source_id,
@@ -1407,7 +1595,7 @@ impl LiveRuntime {
                     for output in self.processor.process(event) {
                         self.observe_feed_output(&output);
                         let output = self.coordinator.process_feed(output)?;
-                        self.commit_output(output)?;
+                        self.commit_output(output).await?;
                     }
                 }
             }
@@ -1433,10 +1621,23 @@ impl LiveRuntime {
                     );
                 }
                 for event in events {
+                    if event.kind == SystemEventKind::PrivateStreamRecovered {
+                        let account_id = event.account_id.as_deref().ok_or_else(|| {
+                            LiveRuntimeError::FeedAdapter(
+                                "private recovery event has no account identity".to_string(),
+                            )
+                        })?;
+                        let output = self.coordinator.require_reconciliation(
+                            account_id,
+                            event.ts_ms,
+                            "verify REST state after private websocket subscription",
+                        )?;
+                        self.commit_output(output).await?;
+                    }
                     let output = self
                         .coordinator
                         .process_event(NormalizedEvent::System(event));
-                    self.commit_output(output)?;
+                    self.commit_output(output).await?;
                 }
             }
             RuntimeEvent::SubmitComplete {
@@ -1447,7 +1648,7 @@ impl LiveRuntime {
                 let output = self
                     .coordinator
                     .on_submit_outcome(&account_id, outcome, ts_ms)?;
-                self.commit_output(output)?;
+                self.commit_output(output).await?;
             }
             RuntimeEvent::SubmitFailed {
                 account_id,
@@ -1463,7 +1664,7 @@ impl LiveRuntime {
                     ambiguous,
                     reason,
                 )?;
-                self.commit_output(output)?;
+                self.commit_output(output).await?;
             }
             RuntimeEvent::CancelComplete {
                 account_id,
@@ -1473,7 +1674,7 @@ impl LiveRuntime {
                 let output = self
                     .coordinator
                     .on_cancel_outcome(&account_id, outcome, ts_ms)?;
-                self.commit_output(output)?;
+                self.commit_output(output).await?;
             }
             RuntimeEvent::CancelFailed {
                 account_id,
@@ -1489,7 +1690,7 @@ impl LiveRuntime {
                     ambiguous,
                     reason,
                 )?;
-                self.commit_output(output)?;
+                self.commit_output(output).await?;
             }
             RuntimeEvent::RemoteState {
                 account_id,
@@ -1500,7 +1701,8 @@ impl LiveRuntime {
                 self.reconcile_inflight.remove(&account_id);
                 self.cancel_inflight
                     .retain(|(cancel_account, _)| cancel_account != &account_id);
-                self.apply_remote_recovery(&account_id, &remote_orders, &remote_fills)?;
+                self.apply_remote_recovery(&account_id, &remote_orders, &remote_fills)
+                    .await?;
                 let state = self
                     .coordinator
                     .private_state(&account_id)
@@ -1535,7 +1737,7 @@ impl LiveRuntime {
                     remote_recent_fills: report.remote_fills,
                     reason,
                 })?;
-                self.commit_output(output)?;
+                self.commit_output(output).await?;
             }
             RuntimeEvent::ReconcileFailed {
                 account_id,
@@ -1553,7 +1755,7 @@ impl LiveRuntime {
                     remote_recent_fills: 0,
                     reason: format!("REST reconciliation request failed: {reason}"),
                 })?;
-                self.commit_output(output)?;
+                self.commit_output(output).await?;
             }
             RuntimeEvent::Fatal(message) => return Err(LiveRuntimeError::GatewayTask(message)),
         }
@@ -1582,7 +1784,7 @@ impl LiveRuntime {
         }
     }
 
-    fn apply_remote_recovery(
+    async fn apply_remote_recovery(
         &mut self,
         account_id: &str,
         remote_orders: &[RemoteOrder],
@@ -1606,7 +1808,7 @@ impl LiveRuntime {
                     account_id: Some(account_id.to_string()),
                     fill: fill.clone(),
                 })?;
-                self.commit_output(output)?;
+                self.commit_output(output).await?;
             }
         }
         for remote in remote_orders {
@@ -1620,15 +1822,19 @@ impl LiveRuntime {
                     account_id: Some(account_id.to_string()),
                     update: private_update_from_remote(remote.clone()),
                 })?;
-                self.commit_output(output)?;
+                self.commit_output(output).await?;
             }
         }
         Ok(())
     }
 
-    fn commit_output(&mut self, output: CoordinatorOutput) -> Result<(), LiveRuntimeError> {
+    async fn commit_output(&mut self, output: CoordinatorOutput) -> Result<(), LiveRuntimeError> {
         for record in output.records {
-            self.record_storage(record)?;
+            if matches!(record, StorageRecord::SafetyLatch(_)) {
+                self.record_durable_storage(record).await?;
+            } else {
+                self.record_storage(record)?;
+            }
         }
         for action in output.actions {
             self.dispatch_action(action)?;
@@ -1641,7 +1847,11 @@ impl LiveRuntime {
         output: CoordinatorOutput,
     ) -> Result<(), LiveRuntimeError> {
         for record in output.records {
-            self.record_storage(record)?;
+            if matches!(record, StorageRecord::SafetyLatch(_)) {
+                self.record_durable_storage(record).await?;
+            } else {
+                self.record_storage(record)?;
+            }
         }
         for action in output.actions {
             match action {
@@ -1706,6 +1916,35 @@ impl LiveRuntime {
             .max_storage_queue_depth
             .max(self.storage_sink.queue_depth());
         Ok(())
+    }
+
+    async fn record_durable_storage(
+        &mut self,
+        record: StorageRecord,
+    ) -> Result<(), LiveRuntimeError> {
+        self.evidence.observe_record(&record);
+        self.evidence.max_storage_queue_depth = self
+            .evidence
+            .max_storage_queue_depth
+            .max(self.storage_sink.queue_depth().saturating_add(1));
+        let result = tokio::time::timeout(
+            Duration::from_millis(self.safety_latch_sync_timeout_ms),
+            self.storage_sink.record_durable(record),
+        )
+        .await;
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                self.preserve_deadman_on_shutdown = true;
+                Err(error.into())
+            }
+            Err(_) => {
+                self.preserve_deadman_on_shutdown = true;
+                Err(LiveRuntimeError::SafetyLatchSyncTimeout(
+                    self.safety_latch_sync_timeout_ms,
+                ))
+            }
+        }
     }
 
     fn dispatch_action(&mut self, action: LiveAction) -> Result<(), LiveRuntimeError> {
@@ -1925,6 +2164,35 @@ impl LiveRuntime {
             .ok_or_else(|| LiveRuntimeError::OrderQueueUnavailable(account_id.to_string()))
     }
 
+    async fn disable_deadman_all(&mut self) -> Result<(), LiveRuntimeError> {
+        let mut acknowledgements = Vec::new();
+        for (account_id, sender) in &self.safety_senders {
+            let (result_tx, result_rx) = oneshot::channel();
+            sender
+                .send(SafetyTaskCommand::DisableDeadMan { result: result_tx })
+                .await
+                .map_err(|_| {
+                    LiveRuntimeError::GatewayTask(format!(
+                        "account {account_id} safety task is unavailable"
+                    ))
+                })?;
+            acknowledgements.push((account_id.clone(), result_rx));
+        }
+        for (account_id, result) in acknowledgements {
+            let result = result.await.map_err(|_| {
+                LiveRuntimeError::GatewayTask(format!(
+                    "account {account_id} safety task dropped disable acknowledgement"
+                ))
+            })?;
+            result.map_err(|message| {
+                LiveRuntimeError::GatewayTask(format!(
+                    "account {account_id} failed to disable Cancel All After: {message}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
     async fn shutdown(&mut self) -> Result<(), LiveRuntimeError> {
         let operator_result = match self.operator_service.take() {
             Some(service) => service.shutdown().await.map_err(LiveRuntimeError::from),
@@ -1935,6 +2203,10 @@ impl LiveRuntime {
             let _ = sender.try_send(OrderTaskCommand::Shutdown);
         }
         self.order_senders.clear();
+        for sender in self.safety_senders.values() {
+            let _ = sender.try_send(SafetyTaskCommand::Shutdown);
+        }
+        self.safety_senders.clear();
         self.control_rx.close();
         self.feed_rx.close();
         for feed in self.feeds.drain(..) {
@@ -1944,6 +2216,9 @@ impl LiveRuntime {
             task.await?;
         }
         for task in self.order_tasks.drain(..) {
+            task.await?;
+        }
+        for task in self.safety_tasks.drain(..) {
             task.await?;
         }
         if let Some(storage) = self.storage.take() {
@@ -2005,6 +2280,13 @@ enum OrderTaskCommand {
     Submit(SubmitAction),
     Cancel(CancelAction),
     Reconcile(Vec<ReconcileOrderRef>),
+    Shutdown,
+}
+
+enum SafetyTaskCommand {
+    DisableDeadMan {
+        result: oneshot::Sender<Result<(), String>>,
+    },
     Shutdown,
 }
 
@@ -2225,6 +2507,74 @@ async fn run_order_task(
                 }
             }
             OrderTaskCommand::Shutdown => return,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_account_safety_task<T>(
+    account_id: String,
+    client: OkxRestClient<T>,
+    mut commands: mpsc::Receiver<SafetyTaskCommand>,
+    events: mpsc::Sender<RuntimeEvent>,
+    mut deadman_timeout_secs: Option<u64>,
+    deadman_heartbeat_ms: u64,
+    clock_check_interval_ms: u64,
+    max_clock_skew_ms: u64,
+) where
+    T: HttpTransport + 'static,
+{
+    let mut deadman = tokio::time::interval(Duration::from_millis(deadman_heartbeat_ms));
+    deadman.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    deadman.tick().await;
+    let mut clock = tokio::time::interval(Duration::from_millis(clock_check_interval_ms));
+    clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    clock.tick().await;
+
+    loop {
+        tokio::select! {
+            command = commands.recv() => {
+                let Some(command) = command else { return; };
+                match command {
+                    SafetyTaskCommand::DisableDeadMan { result } => {
+                        let disabled = match deadman_timeout_secs {
+                            Some(_) => client.cancel_all_after(0).await.map_err(|error| error.to_string()),
+                            None => Ok(()),
+                        };
+                        if disabled.is_ok() {
+                            deadman_timeout_secs = None;
+                        }
+                        let _ = result.send(disabled);
+                    }
+                    SafetyTaskCommand::Shutdown => return,
+                }
+            }
+            _ = deadman.tick(), if deadman_timeout_secs.is_some() => {
+                let timeout_secs = deadman_timeout_secs.expect("guarded dead-man timeout");
+                if let Err(error) = client.cancel_all_after(timeout_secs).await {
+                    let _ = events.send(RuntimeEvent::Fatal(format!(
+                        "account {account_id} Cancel All After heartbeat failed: {error}"
+                    ))).await;
+                    return;
+                }
+            }
+            _ = clock.tick() => {
+                match rest_clock_skew_ms(&client).await {
+                    Ok(skew_ms) if skew_ms <= max_clock_skew_ms => {}
+                    Ok(skew_ms) => {
+                        let _ = events.send(RuntimeEvent::Fatal(format!(
+                            "account {account_id} exchange clock skew {skew_ms}ms exceeds {max_clock_skew_ms}ms"
+                        ))).await;
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = events.send(RuntimeEvent::Fatal(format!(
+                            "account {account_id} exchange clock check failed: {error}"
+                        ))).await;
+                        return;
+                    }
+                }
+            }
         }
     }
 }
@@ -2514,13 +2864,18 @@ async fn shutdown_signal() -> Result<(), std::io::Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
+    use async_trait::async_trait;
     use reap_core::{AccountUpdate, Balance, OrderEvent, OrderUpdate, Side};
     use reap_risk::{InstrumentRiskModel, RiskLimits};
     use reap_strategy::{ChaosConfig, InstrumentKindConfig};
-    use reap_venue::okx::{OkxAccountLevel, OkxInstrumentType, OkxPositionMode};
+    use reap_venue::okx::{
+        HttpResponse, OkxAccountLevel, OkxCredentials, OkxInstrumentType, OkxPositionMode,
+        SignedRequest,
+    };
 
     use crate::{
         LiveAccountConfig, LiveStorageConfig, OkxTradeModeConfig, OkxVenueConfig, RuntimeConfig,
@@ -2528,6 +2883,49 @@ mod tests {
     };
 
     use super::*;
+
+    #[derive(Clone)]
+    struct SafetyMockTransport {
+        responses: Arc<Mutex<VecDeque<Result<String, RestError>>>>,
+        requests: Arc<Mutex<Vec<SignedRequest>>>,
+    }
+
+    #[async_trait]
+    impl HttpTransport for SafetyMockTransport {
+        async fn execute(&self, request: SignedRequest) -> Result<HttpResponse, RestError> {
+            self.requests.lock().unwrap().push(request);
+            let body = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("mock response");
+            Ok(HttpResponse {
+                status: 200,
+                body: body?,
+            })
+        }
+    }
+
+    fn safety_client(
+        responses: Vec<Result<&str, RestError>>,
+    ) -> (
+        OkxRestClient<SafetyMockTransport>,
+        Arc<Mutex<Vec<SignedRequest>>>,
+    ) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let transport = SafetyMockTransport {
+            responses: Arc::new(Mutex::new(
+                responses
+                    .into_iter()
+                    .map(|response| response.map(str::to_string))
+                    .collect(),
+            )),
+            requests: Arc::clone(&requests),
+        };
+        let signer = OkxSigner::new(OkxCredentials::new("key", "secret", "pass"), true);
+        (OkxRestClient::new(transport, signer), requests)
+    }
 
     fn status(conn_id: &str, kind: ConnectionStatusKind) -> ConnectionStatus {
         ConnectionStatus {
@@ -2721,6 +3119,133 @@ mod tests {
         coordinator
     }
 
+    fn latch(scope: SafetyLatchScope, source: SafetyLatchSource) -> SafetyLatchRecord {
+        SafetyLatchRecord {
+            ts_ms: 1,
+            scope,
+            active: true,
+            source,
+            request_id: None,
+            reason: "test latch".to_string(),
+        }
+    }
+
+    #[test]
+    fn recovered_latches_are_validated_and_applied_fail_closed() {
+        let config = config();
+        let mut recovered = RecoveredStorage {
+            global_safety_latch: Some(latch(SafetyLatchScope::Global, SafetyLatchSource::Risk)),
+            ..RecoveredStorage::default()
+        };
+        recovered.account_safety_latches.insert(
+            "main".to_string(),
+            latch(
+                SafetyLatchScope::Account {
+                    account_id: "main".to_string(),
+                },
+                SafetyLatchSource::Operator,
+            ),
+        );
+        recovered.symbol_safety_latches.insert(
+            "BTC-USDT".to_string(),
+            latch(
+                SafetyLatchScope::Symbol {
+                    symbol: "BTC-USDT".to_string(),
+                },
+                SafetyLatchSource::Operator,
+            ),
+        );
+        validate_recovered_safety_latches(&config, &recovered).unwrap();
+
+        let mut coordinator = ready_coordinator(&config, unix_time_ms(), true);
+        let outputs = restore_safety_latches(&mut coordinator, &recovered).unwrap();
+
+        assert_eq!(outputs.len(), 3);
+        assert!(coordinator.kill_switch_active());
+        assert!(coordinator.halted_accounts().contains_key("main"));
+        assert!(coordinator.is_symbol_halted("BTC-USDT"));
+        assert!(!coordinator.readiness().is_ready());
+        assert!(outputs.iter().all(|output| {
+            output
+                .records
+                .iter()
+                .all(|record| !matches!(record, StorageRecord::SafetyLatch(_)))
+        }));
+    }
+
+    #[test]
+    fn recovered_latch_identity_must_match_live_config() {
+        let config = config();
+        let mut recovered = RecoveredStorage::default();
+        recovered.account_safety_latches.insert(
+            "removed".to_string(),
+            latch(
+                SafetyLatchScope::Account {
+                    account_id: "removed".to_string(),
+                },
+                SafetyLatchSource::Operator,
+            ),
+        );
+        let error = validate_recovered_safety_latches(&config, &recovered).unwrap_err();
+        assert!(error.to_string().contains("unknown account removed"));
+    }
+
+    #[test]
+    fn recovered_account_latch_blocks_replay_and_cancels_restored_orders() {
+        let config = config();
+        let mut recovered = RecoveredStorage::default();
+        recovered.account_safety_latches.insert(
+            "main".to_string(),
+            latch(
+                SafetyLatchScope::Account {
+                    account_id: "main".to_string(),
+                },
+                SafetyLatchSource::Operator,
+            ),
+        );
+        let mut coordinator = ready_coordinator(&config, unix_time_ms(), true);
+        let _ = restore_safety_latches(&mut coordinator, &recovered).unwrap();
+        let replay = coordinator
+            .restore_order(
+                "main",
+                OrderUpdate {
+                    ts_ms: 2,
+                    order_id: "restored-live".to_string(),
+                    symbol: "BTC-USDT".to_string(),
+                    side: Side::Buy,
+                    event: OrderEvent::New,
+                    status: OrderStatus::Live,
+                    price: 100.0,
+                    qty: 1.0,
+                    open_qty: 1.0,
+                    filled_qty: 0.0,
+                    avg_fill_price: 0.0,
+                    last_fill_qty: 0.0,
+                    last_fill_price: 0.0,
+                    last_fill_liquidity: None,
+                    reason: "restored quote".to_string(),
+                },
+            )
+            .unwrap();
+
+        assert!(
+            replay
+                .actions
+                .iter()
+                .all(|action| !matches!(action, LiveAction::Submit(_)))
+        );
+        let reapplied = restore_safety_latches(&mut coordinator, &recovered).unwrap();
+        assert!(
+            reapplied
+                .iter()
+                .flat_map(|output| &output.actions)
+                .any(|action| matches!(
+                    action,
+                    LiveAction::Cancel(cancel) if cancel.client_order_id == "restored-live"
+                ))
+        );
+    }
+
     #[test]
     fn readiness_tracker_records_recovered_outages() {
         let ready = readiness(crate::LivePhase::Ready);
@@ -2900,6 +3425,8 @@ mod tests {
             feed_rx,
             order_senders: HashMap::new(),
             order_tasks: Vec::new(),
+            safety_senders: HashMap::new(),
+            safety_tasks: Vec::new(),
             feeds: Vec::new(),
             feed_tasks: Vec::new(),
             sources: Vec::new(),
@@ -2911,9 +3438,11 @@ mod tests {
             timer_interval_ms: 100,
             max_feed_age_ms: 60_000,
             shutdown_timeout_ms: 100,
+            safety_latch_sync_timeout_ms: 1_000,
             evidence: RuntimeEvidence::default(),
             shutdown_in_progress: false,
             shutdown_storage_error: None,
+            preserve_deadman_on_shutdown: false,
             shutdown_reconciliation_requested: HashSet::new(),
             shutdown_reconciled_accounts: HashSet::new(),
             operator_service: None,
@@ -2989,6 +3518,8 @@ mod tests {
             feed_rx,
             order_senders: HashMap::new(),
             order_tasks: Vec::new(),
+            safety_senders: HashMap::new(),
+            safety_tasks: Vec::new(),
             feeds: Vec::new(),
             feed_tasks: Vec::new(),
             sources: Vec::new(),
@@ -3000,9 +3531,11 @@ mod tests {
             timer_interval_ms: 100,
             max_feed_age_ms: 60_000,
             shutdown_timeout_ms: 1_000,
+            safety_latch_sync_timeout_ms: 1_000,
             evidence: RuntimeEvidence::default(),
             shutdown_in_progress: false,
             shutdown_storage_error: None,
+            preserve_deadman_on_shutdown: false,
             shutdown_reconciliation_requested: HashSet::new(),
             shutdown_reconciled_accounts: HashSet::new(),
             operator_service: Some(operator_service),
@@ -3103,6 +3636,10 @@ mod tests {
         let report = runtime_task.await.unwrap().unwrap();
         drop(control_tx);
         drop(feed_tx);
+        let recovered = recover_jsonl(&storage_path).unwrap();
+        assert!(recovered.global_safety_latch.is_some());
+        assert!(recovered.account_safety_latches.contains_key("main"));
+        assert!(recovered.symbol_safety_latches.is_empty());
         let _ = std::fs::remove_file(storage_path);
 
         assert_eq!(report.stop_reason, LiveStopReason::OperatorCommand);
@@ -3214,6 +3751,8 @@ mod tests {
             feed_rx,
             order_senders: HashMap::from([("main".to_string(), order_tx)]),
             order_tasks: vec![order_task],
+            safety_senders: HashMap::new(),
+            safety_tasks: Vec::new(),
             feeds: Vec::new(),
             feed_tasks: Vec::new(),
             sources: Vec::new(),
@@ -3225,9 +3764,11 @@ mod tests {
             timer_interval_ms: 100,
             max_feed_age_ms: 60_000,
             shutdown_timeout_ms: 1_000,
+            safety_latch_sync_timeout_ms: 1_000,
             evidence: RuntimeEvidence::default(),
             shutdown_in_progress: false,
             shutdown_storage_error: None,
+            preserve_deadman_on_shutdown: false,
             shutdown_reconciliation_requested: HashSet::new(),
             shutdown_reconciled_accounts: HashSet::new(),
             operator_service: None,
@@ -3262,6 +3803,69 @@ mod tests {
         assert!(secondary.contains("fail-closed cleanup"));
         assert!(secondary.contains("storage remained unavailable"));
         assert!(cancel_observed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn safety_task_disables_deadman_only_on_explicit_command() {
+        let (client, requests) = safety_client(vec![Ok(
+            r#"{"code":"0","msg":"","data":[{"triggerTime":"0","tag":"","ts":"1"}]}"#,
+        )]);
+        let (command_tx, command_rx) = mpsc::channel(2);
+        let (event_tx, _event_rx) = mpsc::channel(2);
+        let task = tokio::spawn(run_account_safety_task(
+            "main".to_string(),
+            client,
+            command_rx,
+            event_tx,
+            Some(30),
+            60_000,
+            60_000,
+            1_000,
+        ));
+        let (result_tx, result_rx) = oneshot::channel();
+        command_tx
+            .send(SafetyTaskCommand::DisableDeadMan { result: result_tx })
+            .await
+            .unwrap();
+        result_rx.await.unwrap().unwrap();
+        command_tx.send(SafetyTaskCommand::Shutdown).await.unwrap();
+        task.await.unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, "/api/v5/trade/cancel-all-after");
+        assert_eq!(requests[0].body, r#"{"timeOut":"0"}"#);
+    }
+
+    #[tokio::test]
+    async fn deadman_heartbeat_failure_is_fatal() {
+        let (client, _) = safety_client(vec![Err(RestError::Transport(
+            "injected heartbeat failure".to_string(),
+        ))]);
+        let (_command_tx, command_rx) = mpsc::channel(2);
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+        let task = tokio::spawn(run_account_safety_task(
+            "main".to_string(),
+            client,
+            command_rx,
+            event_tx,
+            Some(30),
+            1,
+            60_000,
+            1_000,
+        ));
+
+        let event = tokio::time::timeout(Duration::from_millis(100), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            RuntimeEvent::Fatal(message)
+                if message.contains("Cancel All After heartbeat failed")
+                    && message.contains("injected heartbeat failure")
+        ));
+        task.await.unwrap();
     }
 
     #[test]

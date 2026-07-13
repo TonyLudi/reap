@@ -6,7 +6,8 @@ use reap_feed::{FeedOutput, RecoveryRequest};
 use reap_order::{CancelOutcome, ClientOrderIdGenerator, PrivateStateReducer, SubmitOutcome};
 use reap_risk::{RiskDecision, RiskGate};
 use reap_storage::{
-    FillRecord, OrderAckRecord, OrderAckStatus, OrderOperation, ReconciliationRecord, StorageRecord,
+    FillRecord, OrderAckRecord, OrderAckStatus, OrderOperation, ReconciliationRecord,
+    SafetyLatchRecord, SafetyLatchScope, SafetyLatchSource, StorageRecord,
 };
 use reap_strategy::ChaosStrategy;
 use thiserror::Error;
@@ -190,6 +191,10 @@ impl LiveCoordinator {
 
     pub fn kill_switch_active(&self) -> bool {
         self.engine.risk().is_killed()
+    }
+
+    pub fn is_symbol_halted(&self, symbol: &str) -> bool {
+        self.engine.risk().is_symbol_halted(symbol)
     }
 
     pub fn halt_account(
@@ -577,6 +582,25 @@ impl LiveCoordinator {
         Ok(output)
     }
 
+    pub fn require_reconciliation(
+        &mut self,
+        account_id: &str,
+        ts_ms: TimeMs,
+        reason: impl Into<String>,
+    ) -> Result<CoordinatorOutput, CoordinatorError> {
+        let reason = reason.into();
+        self.startup
+            .mark_reconciled(account_id, false, reason.clone())?;
+        Ok(CoordinatorOutput {
+            actions: vec![LiveAction::Reconcile(ReconcileAction {
+                ts_ms,
+                account_id: account_id.to_string(),
+                reason,
+            })],
+            records: Vec::new(),
+        })
+    }
+
     fn process_normalized(&mut self, event: NormalizedEvent) -> CoordinatorOutput {
         let account_halt = match &event {
             NormalizedEvent::System(system)
@@ -631,6 +655,18 @@ impl LiveCoordinator {
         output: &mut CoordinatorOutput,
     ) {
         for system in engine_output.system_events {
+            if system.kind == SystemEventKind::RiskBreach {
+                output
+                    .records
+                    .push(StorageRecord::SafetyLatch(SafetyLatchRecord {
+                        ts_ms: system.ts_ms,
+                        scope: SafetyLatchScope::Global,
+                        active: true,
+                        source: SafetyLatchSource::Risk,
+                        request_id: None,
+                        reason: system.reason.clone(),
+                    }));
+            }
             self.apply_system_to_startup(&system);
             output.records.push(StorageRecord::System(system));
         }
@@ -1244,6 +1280,40 @@ mod tests {
             self_trade_prevention: None,
             reason: "quote".to_string(),
         }
+    }
+
+    #[test]
+    fn post_connect_reconciliation_blocks_readiness_until_clean() {
+        let mut coordinator = coordinator();
+        ready(&mut coordinator);
+
+        let output = coordinator
+            .require_reconciliation("main", 3, "private stream connected")
+            .unwrap();
+
+        assert!(!coordinator.readiness().is_ready());
+        assert!(
+            coordinator
+                .readiness()
+                .missing_reconciliation
+                .contains(&"main".to_string())
+        );
+        assert!(output.actions.iter().any(
+            |action| matches!(action, LiveAction::Reconcile(action) if action.account_id == "main")
+        ));
+
+        coordinator
+            .on_reconciliation(ReconciliationResult {
+                account_id: "main".to_string(),
+                ts_ms: 4,
+                clean: true,
+                local_live_orders: 0,
+                remote_live_orders: 0,
+                remote_recent_fills: 0,
+                reason: "post-connect REST state is clean".to_string(),
+            })
+            .unwrap();
+        assert!(coordinator.readiness().is_ready());
     }
 
     #[test]

@@ -128,6 +128,12 @@ pub struct RuntimeConfig {
     pub shutdown_timeout_ms: u64,
     pub rest_connect_timeout_ms: u64,
     pub rest_request_timeout_ms: u64,
+    pub order_request_expiry_ms: u64,
+    pub safety_latch_sync_timeout_ms: u64,
+    pub max_exchange_clock_skew_ms: u64,
+    pub exchange_clock_check_interval_ms: u64,
+    pub cancel_all_after_timeout_secs: u64,
+    pub cancel_all_after_heartbeat_ms: u64,
     pub ambiguous_submit_grace_ms: u64,
     pub submit_requests_per_window: usize,
     pub cancel_requests_per_window: usize,
@@ -150,6 +156,12 @@ impl Default for RuntimeConfig {
             shutdown_timeout_ms: 15_000,
             rest_connect_timeout_ms: 2_000,
             rest_request_timeout_ms: 5_000,
+            order_request_expiry_ms: 1_000,
+            safety_latch_sync_timeout_ms: 2_000,
+            max_exchange_clock_skew_ms: 250,
+            exchange_clock_check_interval_ms: 30_000,
+            cancel_all_after_timeout_secs: 30,
+            cancel_all_after_heartbeat_ms: 1_000,
             ambiguous_submit_grace_ms: 5_000,
             submit_requests_per_window: 50,
             cancel_requests_per_window: 50,
@@ -520,6 +532,27 @@ fn validate_positive_runtime(runtime: &RuntimeConfig, errors: &mut Vec<String>) 
         ("shutdown_timeout_ms", runtime.shutdown_timeout_ms),
         ("rest_connect_timeout_ms", runtime.rest_connect_timeout_ms),
         ("rest_request_timeout_ms", runtime.rest_request_timeout_ms),
+        ("order_request_expiry_ms", runtime.order_request_expiry_ms),
+        (
+            "safety_latch_sync_timeout_ms",
+            runtime.safety_latch_sync_timeout_ms,
+        ),
+        (
+            "max_exchange_clock_skew_ms",
+            runtime.max_exchange_clock_skew_ms,
+        ),
+        (
+            "exchange_clock_check_interval_ms",
+            runtime.exchange_clock_check_interval_ms,
+        ),
+        (
+            "cancel_all_after_timeout_secs",
+            runtime.cancel_all_after_timeout_secs,
+        ),
+        (
+            "cancel_all_after_heartbeat_ms",
+            runtime.cancel_all_after_heartbeat_ms,
+        ),
         (
             "ambiguous_submit_grace_ms",
             runtime.ambiguous_submit_grace_ms,
@@ -545,6 +578,34 @@ fn validate_positive_runtime(runtime: &RuntimeConfig, errors: &mut Vec<String>) 
     if runtime.rest_request_timeout_ms < runtime.rest_connect_timeout_ms {
         errors.push(
             "runtime.rest_request_timeout_ms must be at least rest_connect_timeout_ms".to_string(),
+        );
+    }
+    if runtime.order_request_expiry_ms > runtime.rest_request_timeout_ms {
+        errors.push(
+            "runtime.order_request_expiry_ms must not exceed rest_request_timeout_ms".to_string(),
+        );
+    }
+    if runtime.max_exchange_clock_skew_ms >= runtime.order_request_expiry_ms {
+        errors.push(
+            "runtime.max_exchange_clock_skew_ms must be shorter than order_request_expiry_ms"
+                .to_string(),
+        );
+    }
+    if !(10..=120).contains(&runtime.cancel_all_after_timeout_secs) {
+        errors.push("runtime.cancel_all_after_timeout_secs must be between 10 and 120".to_string());
+    }
+    if runtime.cancel_all_after_heartbeat_ms < 1_000 {
+        errors.push(
+            "runtime.cancel_all_after_heartbeat_ms must respect the 1 request/second endpoint limit"
+                .to_string(),
+        );
+    }
+    if runtime.cancel_all_after_heartbeat_ms
+        >= runtime.cancel_all_after_timeout_secs.saturating_mul(1_000)
+    {
+        errors.push(
+            "runtime.cancel_all_after_heartbeat_ms must be shorter than the exchange timeout"
+                .to_string(),
         );
     }
 }
@@ -700,6 +761,21 @@ mod tests {
                 .errors
                 .iter()
                 .any(|error| error.contains("at least twice max_clock_skew_ms"))
+        );
+    }
+
+    #[test]
+    fn exchange_clock_budget_must_fit_inside_order_expiry() {
+        let mut config = valid_config();
+        config.runtime.max_exchange_clock_skew_ms = config.runtime.order_request_expiry_ms;
+
+        let report = config.validate();
+
+        assert!(!report.valid);
+        assert!(
+            report.errors.iter().any(|error| error.contains(
+                "max_exchange_clock_skew_ms must be shorter than order_request_expiry_ms"
+            ))
         );
     }
 

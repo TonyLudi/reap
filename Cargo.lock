@@ -999,8 +999,10 @@ dependencies = [
  "csv",
  "reap-book",
  "reap-core",
+ "reap-feed",
  "reap-order",
  "reap-strategy",
+ "reap-venue",
  "serde",
  "serde_json",
 ]
@@ -1014,12 +1016,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "reap-capture"
+version = "0.1.0"
+dependencies = [
+ "reap-book",
+ "reap-core",
+ "reap-feed",
+ "reap-venue",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "reap-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
  "reap-backtest",
+ "reap-capture",
  "reap-feed",
  "reap-live",
  "reap-strategy",
@@ -1068,6 +1089,7 @@ dependencies = [
 name = "reap-live"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64",
  "hmac",
  "reap-core",

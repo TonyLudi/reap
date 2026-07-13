@@ -635,6 +635,9 @@ impl RiskGate {
     }
 
     fn evaluate_post_trade(&mut self, ts_ms: TimeMs, symbol: Option<&str>) -> PostTradeOutcome {
+        if self.kill_switch.is_some() {
+            return PostTradeOutcome::default();
+        }
         let breach = symbol.and_then(|symbol| {
             let mark = self.marks.get(symbol).copied().unwrap_or(0.0);
             let exposure = self
@@ -895,6 +898,11 @@ mod tests {
 
         assert!(gate.is_killed());
         assert_eq!(outcome.events[0].kind, SystemEventKind::RiskBreach);
+        assert!(
+            gate.evaluate_post_trade(11, Some("BTC-USDT"))
+                .events
+                .is_empty()
+        );
     }
 
     #[test]

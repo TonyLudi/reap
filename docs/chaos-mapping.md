@@ -6,6 +6,10 @@ parity for the iarb2 strategy on OKX: given equivalent normalized market,
 account, position, order, and timer events, Rust should reach equivalent quote,
 hedge, and stop decisions.
 
+The current source cross-check is pinned to `imm-strategy` commit
+`b6b120c7b7c466d8431bf082f3229328c5d7b2ae`. Re-audit this document and the
+fixture-derived Rust tests whenever that reference revision changes.
+
 It is not a byte-for-byte port of the Java runtime, exchange abstractions, or
 control plane.
 
@@ -87,7 +91,26 @@ The following differences do not change the covered quote/hedge calculations:
   liveness, strategy-group PnL aggregation, Redis controls, alerts, and process
   restart policy belong to runtime risk and operations.
 - Qubyte history readers are not copied. Backtests consume normalized JSONL or
-  the documented CSV format.
+  the documented CSV format, and now consume public OKX raw captures through
+  the Rust adapter/reducer path.
+
+## Connectivity Cross-Check
+
+| Java reference | Rust implementation | Result |
+| --- | --- | --- |
+| `OkxNitroL2SubscriberGroupFactory` subscriber groups | `partition_subscriptions` replica/socket plans | Equivalent |
+| `AbstractOkxNitroL2Subscriber` TBT and 400-level modes | Explicit `books-l2-tbt`, `books50-l2-tbt`, or `books` capture subscriptions | Equivalent, entitlement remains operational |
+| Ping, disconnect, resubscribe, and stale checkers | Feed connection loop, reconnect supervisor, idle timeout, and book-age recovery | Equivalent |
+| Clear/rebuild book on resubscribe or crossed-book failure | Invalid/crossed-book detection plus sequence state and fresh websocket snapshot recovery | Equivalent with additional explicit sequence validation |
+| Separate receive and exchange latency tracking | Raw `recv_ts_ns`, exchange timestamps, and capture health counters | Equivalent data retained; external alert delivery remains pending |
+| Batch subscription manager and retry limits | Bounded socket partitioning, acknowledgement timeout, exponential reconnect | Equivalent lifecycle with different batching policy |
+
+The reviewed Java OKX subscriber and `chaos-iarb2` classes do not provide the
+Rust runtime's place-request `expTime`, `/public/time` skew gate, Cancel All
+After heartbeat, or fsynced restart-latch lifecycle. Those are intentional
+deployment-safety additions around the parity strategy, not claims of Java
+strategy equivalence. Re-check them against both the pinned Java revision and
+the current OKX API contract whenever connectivity is upgraded.
 
 ## Live Event Requirements
 

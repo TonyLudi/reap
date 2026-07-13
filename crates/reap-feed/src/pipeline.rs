@@ -176,8 +176,41 @@ impl FeedProcessor {
         let ts_ms = update.ts_ms;
         match state.sequence.on_update(update) {
             SequenceOutcome::Apply(updates) => {
+                let received_prev = updates.last().map_or(0, |update| update.prev_seq_id);
+                let received_seq = updates.last().map_or(0, |update| update.seq_id);
                 for update in updates {
                     apply_book_update(&mut state.book, update);
+                }
+                if !state.book.is_ready() {
+                    self.stats.gaps += 1;
+                    state.sequence.require_recovery();
+                    state.book.mark_gapped();
+                    state.book.mark_recovering();
+                    return vec![
+                        FeedOutput::System(SystemEvent {
+                            ts_ms,
+                            kind: SystemEventKind::FeedGap,
+                            venue: Some(venue),
+                            account_id: None,
+                            symbol: Some(stream_id.symbol.clone()),
+                            reason: "book is empty, invalid, or crossed after sequenced update"
+                                .to_string(),
+                        }),
+                        FeedOutput::System(SystemEvent {
+                            ts_ms,
+                            kind: SystemEventKind::BookRecoveryStarted,
+                            venue: Some(venue),
+                            account_id: None,
+                            symbol: Some(stream_id.symbol.clone()),
+                            reason: "request a fresh websocket snapshot".to_string(),
+                        }),
+                        FeedOutput::RecoveryRequired(RecoveryRequest {
+                            stream: stream_id,
+                            expected_prev: state.sequence.last_seq_id(),
+                            received_prev,
+                            received_seq,
+                        }),
+                    ];
                 }
                 if state.book.is_ready() {
                     let mut outputs = Vec::new();
@@ -361,5 +394,38 @@ mod tests {
         assert_eq!(health[0].sequence_status, SequenceStatus::Ready);
         assert_eq!(health[0].book_status, BookStatus::Ready);
         assert_eq!(health[0].last_seq_id, Some(12));
+    }
+
+    #[test]
+    fn crossed_book_forces_snapshot_recovery() {
+        let mut processor = FeedProcessor::new(16, 16);
+        let mut crossed = parsed(BookAction::Snapshot, -1, 10, 1.0);
+        let VenueEvent::Book(update) = &mut crossed.event else {
+            unreachable!();
+        };
+        update.bids[0].px = 102.0;
+
+        let outputs = processor.process(crossed);
+        assert!(
+            outputs
+                .iter()
+                .any(|output| matches!(output, FeedOutput::RecoveryRequired(_)))
+        );
+        assert!(
+            !outputs
+                .iter()
+                .any(|output| matches!(output, FeedOutput::Event(_)))
+        );
+        let health = processor.stream_health();
+        assert_eq!(health[0].sequence_status, SequenceStatus::Recovering);
+        assert_eq!(health[0].book_status, BookStatus::Recovering);
+
+        let recovered = processor.process(parsed(BookAction::Snapshot, -1, 11, 1.0));
+        assert!(
+            recovered
+                .iter()
+                .any(|output| matches!(output, FeedOutput::Event(_)))
+        );
+        assert_eq!(processor.stats().gaps, 1);
     }
 }

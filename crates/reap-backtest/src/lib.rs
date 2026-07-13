@@ -5,12 +5,13 @@ mod replay;
 pub use matching::MatchingEngine;
 pub use replay::{
     ReplayRow, load_events_from_path, load_normalized_jsonl, load_normalized_jsonl_from_path,
+    replay_raw_capture, replay_raw_capture_path,
 };
 
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::portfolio::Portfolio;
@@ -81,54 +82,75 @@ impl BacktestRunner {
         self.run(events)
     }
 
+    pub fn run_raw_capture_path(mut self, path: impl AsRef<Path>) -> Result<BacktestReport> {
+        replay_raw_capture_path(path.as_ref(), |event| self.process_replay_event(event))
+            .with_context(|| {
+                format!(
+                    "failed to replay raw capture from {}",
+                    path.as_ref().display()
+                )
+            })?;
+        self.require_all_configured_books()?;
+        self.finish_report()
+    }
+
     pub fn run<I>(&mut self, events: I) -> Result<BacktestReport>
     where
         I: IntoIterator<Item = NormalizedEvent>,
     {
         for event in events {
-            match &event {
-                NormalizedEvent::Market(MarketEvent::Depth(book)) => {
-                    let updates = self.matcher_mut(&book.symbol)?.on_depth(book.clone());
-                    let commands = self.process_updates(updates)?;
-                    self.process_commands(commands)?;
-                    self.process_strategy_event(event.clone().into_strategy_event())?;
-                }
-                NormalizedEvent::Market(MarketEvent::Trade {
-                    ts_ms,
-                    symbol,
-                    price,
-                    qty,
-                    taker_side,
-                    ..
-                }) => {
-                    let updates =
-                        self.matcher_mut(symbol)?
-                            .on_trade(*ts_ms, *price, *qty, *taker_side);
-                    let commands = self.process_updates(updates)?;
-                    self.process_commands(commands)?;
-                    self.process_strategy_event(event.clone().into_strategy_event())?;
-                }
-                NormalizedEvent::Market(
-                    MarketEvent::IndexPrice { .. }
-                    | MarketEvent::FundingRate { .. }
-                    | MarketEvent::BurstSignal { .. }
-                    | MarketEvent::PriceLimits { .. },
-                ) => {
-                    self.process_strategy_event(event.clone().into_strategy_event())?;
-                }
-                NormalizedEvent::Order(update) => {
-                    let commands = self.process_updates(vec![update.clone()])?;
-                    self.process_commands(commands)?;
-                }
-                NormalizedEvent::Account(_)
-                | NormalizedEvent::Timer(_)
-                | NormalizedEvent::Control(_)
-                | NormalizedEvent::System(_) => {
-                    self.process_strategy_event(event.clone().into_strategy_event())?;
-                }
-            }
+            self.process_replay_event(event)?;
         }
 
+        self.finish_report()
+    }
+
+    fn process_replay_event(&mut self, event: NormalizedEvent) -> Result<()> {
+        match &event {
+            NormalizedEvent::Market(MarketEvent::Depth(book)) => {
+                let updates = self.matcher_mut(&book.symbol)?.on_depth(book.clone());
+                let commands = self.process_updates(updates)?;
+                self.process_commands(commands)?;
+                self.process_strategy_event(event.into_strategy_event())?;
+            }
+            NormalizedEvent::Market(MarketEvent::Trade {
+                ts_ms,
+                symbol,
+                price,
+                qty,
+                taker_side,
+                ..
+            }) => {
+                let updates = self
+                    .matcher_mut(symbol)?
+                    .on_trade(*ts_ms, *price, *qty, *taker_side);
+                let commands = self.process_updates(updates)?;
+                self.process_commands(commands)?;
+                self.process_strategy_event(event.into_strategy_event())?;
+            }
+            NormalizedEvent::Market(
+                MarketEvent::IndexPrice { .. }
+                | MarketEvent::FundingRate { .. }
+                | MarketEvent::BurstSignal { .. }
+                | MarketEvent::PriceLimits { .. },
+            ) => {
+                self.process_strategy_event(event.into_strategy_event())?;
+            }
+            NormalizedEvent::Order(update) => {
+                let commands = self.process_updates(vec![update.clone()])?;
+                self.process_commands(commands)?;
+            }
+            NormalizedEvent::Account(_)
+            | NormalizedEvent::Timer(_)
+            | NormalizedEvent::Control(_)
+            | NormalizedEvent::System(_) => {
+                self.process_strategy_event(event.into_strategy_event())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_report(&self) -> Result<BacktestReport> {
         let marks = self
             .matchers
             .iter()
@@ -146,6 +168,23 @@ impl BacktestRunner {
             cash_usd: self.portfolio.cash_usd(),
             positions: self.portfolio.positions().clone(),
         })
+    }
+
+    fn require_all_configured_books(&self) -> Result<()> {
+        let mut missing = self
+            .matchers
+            .iter()
+            .filter(|(_, matcher)| matcher.depth().is_none())
+            .map(|(symbol, _)| symbol.clone())
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        missing.sort();
+        bail!(
+            "raw capture did not produce a valid book for configured symbols: {}",
+            missing.join(", ")
+        )
     }
 
     fn matcher_mut(&mut self, symbol: &str) -> Result<&mut MatchingEngine> {
@@ -339,5 +378,19 @@ mod tests {
         assert_eq!(report.maker_fills, 1);
         assert_eq!(report.taker_fills, 1);
         assert!(report.final_delta_usd.abs() < 1_000.0);
+    }
+
+    #[test]
+    fn raw_capture_requires_every_strategy_book() {
+        let mut runner = BacktestRunner::new(config()).unwrap();
+        replay_raw_capture(
+            include_str!("../../../fixtures/raw/okx/depth-gap.jsonl").as_bytes(),
+            |event| runner.process_replay_event(event),
+        )
+        .unwrap();
+
+        let error = runner.require_all_configured_books().unwrap_err();
+
+        assert!(error.to_string().contains("BTC-PERP"));
     }
 }

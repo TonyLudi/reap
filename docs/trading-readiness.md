@@ -10,15 +10,15 @@ production trading process.
 | Area | Current state | Trading impact |
 | --- | --- | --- |
 | Iarb2 decision model | Covered for the documented OKX parity boundary | Not a blocker |
-| Deterministic backtest | Shared strategy code, depth matching, queue-ahead model, fees, and normalized replay | Needs venue-data calibration before capital decisions |
+| Deterministic backtest/data | Shared strategy code, depth matching, queue-ahead model, fees, credential-free redundant public capture, and raw/normalized replay | Needs sustained full-depth capture and venue-data calibration before capital decisions |
 | Feed components | Redundant public sockets, isolated private sockets, ping/idle supervision, account-scoped deduplication, sequencing, and recovery are composed | Needs credentialed soak evidence |
-| Order components | Event-loop client IDs/registration, signed submit/cancel, pacing, private reduction, ambiguity handling, and REST reconciliation are composed | Needs demo exchange fault evidence |
-| Runtime risk | Instrument models, authoritative startup positions, account-scoped health, kill switch, symbol halt, and all-exit fail-closed cancellation/reconciliation are wired | Needs limits review against the target demo account |
+| Order components | Event-loop client IDs/registration, exchange-side place-request expiry, signed submit/cancel, pacing, private reduction, ambiguity handling, and REST reconciliation are composed | Needs demo exchange fault evidence |
+| Runtime risk | Instrument models, authoritative startup positions, account-scoped health, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed deadman evidence |
 | Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, and strict bounded soak reports | Demo-capable; production entry intentionally unavailable |
 | Instrument/account bootstrap | Account instruments/config/balance/positions are typed and verified before readiness | Needs target-account certification |
-| Startup/restart gate | Executable phase state, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, and clean REST reconciliation | Needs process-kill demo test |
+| Startup/restart gate | Executable phase state, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, durable latch restore, and clean REST reconciliation | Needs process-kill demo test |
 | Event-loop profile | Allocation-aware raw OKX parity benchmark covers redundant wire input through strategy/risk and storage-record construction | Needs target-host capture and exchange-latency validation |
-| Operator control and alerts | HMAC-authenticated local status/global kill/account kill/symbol halt-resume/shutdown service is wired through the single writer | External alert delivery and independent exchange-side controls remain production blockers |
+| Operator control and alerts | HMAC-authenticated local controls use fsynced write-ahead latches; OKX Cancel All After is maintained independently of the order queue | External alert delivery and an out-of-process supervisory kill remain production blockers |
 | Exchange certification | No recorded OKX demo soak, fault injection, or production account-mode certification | Production blocker |
 
 ## Implemented Demo Path
@@ -30,13 +30,16 @@ production trading process.
    settle currency; trade mode; and position mode.
 3. The runtime starts all public and account-scoped private sockets, obtains
    sequenced books, fetches initial balances and positions, and reconciles open
-   orders and recent fills before declaring readiness.
+   orders and recent fills before declaring readiness. It also rejects excessive
+   exchange-clock skew.
 4. Accepted `NewOrder` intents receive a client ID and canonical `PendingNew`
    synchronously, then route through the account gateway. Cancels are deduplicated,
-   and every private acknowledgement/fill returns through the reducer/engine.
+   every place request carries an OKX `expTime`, and every private
+   acknowledgement/fill returns through the reducer/engine.
 5. The critical log persists account-scoped raw input, normalized input,
-   intent, request, acknowledgement, fill, system event, and reconciliation
-   result with enough identity to replay one account independently from another.
+   intent, request, acknowledgement, fill, system event, reconciliation result,
+   and safety-latch mutation with enough identity to replay one account
+   independently from another. Latches are synced before their actions dispatch.
 6. Component and coordinator tests cover disconnect, duplicate, gap,
    delayed-private-stream, partial-fill, IOC-miss, rate-limit, and process-restart
    behavior.
@@ -49,14 +52,18 @@ production trading process.
    must return a post-cancel REST reconciliation result before teardown.
    Integration coverage injects a fatal runtime error and closed storage while
    a canonical order is live, then verifies cancel-before-reconcile ordering.
+   Demo mode arms and refreshes OKX Cancel All After from a separate task, and
+   disables it only after clean zero-order shutdown reconciliation.
 9. A `0600` Unix socket accepts bounded HMAC-signed operator commands with
    timestamp and nonce replay protection. Status and control responses are
    typed, mutations are persisted, and authenticated shutdown enters the same
    reconciled lifecycle path.
-10. A process-latched account kill blocks only that account's order route,
+10. A journal-latched account kill blocks only that account's order route,
     removes its instruments from pricing and hedge selection, guarantees
     cancellation of its canonical active orders, rejects symbol resume while
-    the account remains halted, and exposes the latch reason in signed status.
+    the account remains halted, survives restart, and exposes the latch reason
+    in signed status. Global operator kills and post-trade risk breaches also
+    survive restart; normal shutdown does not create a durable latch.
 
 ## Remaining Demo Gate
 
@@ -67,7 +74,9 @@ production trading process.
    run with `--duration-secs <seconds> --require-clean-soak` so the result is
    machine-verifiable.
 3. Run minimal-size `demo` orders, then inject socket disconnect, process kill,
-   IOC miss, partial fill, and REST timeout/rate-limit conditions.
+   deadman expiry, exchange-clock skew, IOC miss, partial fill, and REST
+   timeout/rate-limit conditions. Verify `expTime`, latch restoration, and
+   Cancel All After from exchange/account evidence.
 4. Complete a sustained soak with zero unexplained order, fill, balance,
    position, or checkpoint drift. `clean_soak` covers runtime readiness,
    reconciliation, storage drops, and shutdown orders; balances, positions,
@@ -82,9 +91,10 @@ Production enablement additionally requires:
 - Walk-forward and out-of-sample evaluation, parameter sensitivity, capacity,
   inventory-duration, and stressed-liquidity reports.
 - Stablecoin depeg and exchange-rate pause policy, strategy-group risk, master
-  liveness, and independent exchange-side kill controls.
-- Clock synchronization monitoring, CPU/thread placement, bounded backpressure,
-  memory and disk capacity alarms, and restart supervision.
+  liveness, external alert delivery, and an out-of-process supervisory kill.
+- Host time-service alarms, CPU/thread placement, bounded backpressure, memory
+  and disk capacity alarms, restart supervision, and an exclusive
+  process/journal ownership lock.
 - Long-running demo soak with zero unexplained order, fill, position, or balance
   reconciliation drift.
 - Explicit operator approval of credentials, account mode, limits, symbols,

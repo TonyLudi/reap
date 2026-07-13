@@ -30,6 +30,16 @@ impl Channel {
             Self::Orders | Self::Fills | Self::Account | Self::Positions
         )
     }
+
+    pub fn is_book(&self) -> bool {
+        match self {
+            Self::Books => true,
+            Self::Custom(channel) => {
+                matches!(channel.as_str(), "books-l2-tbt" | "books50-l2-tbt")
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -607,4 +617,17 @@ pub fn round_down_to_lot(qty: Quantity, lot_size: f64) -> Quantity {
         return qty.max(0.0);
     }
     ((qty / lot_size).floor() * lot_size).max(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Channel;
+
+    #[test]
+    fn okx_depth_variants_are_book_channels() {
+        assert!(Channel::Books.is_book());
+        assert!(Channel::Custom("books-l2-tbt".to_string()).is_book());
+        assert!(Channel::Custom("books50-l2-tbt".to_string()).is_book());
+        assert!(!Channel::Custom("mark-price".to_string()).is_book());
+    }
 }

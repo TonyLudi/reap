@@ -9,6 +9,7 @@ members = [
     "crates/reap-strategy",
     "crates/reap-engine",
     "crates/reap-backtest",
+    "crates/reap-capture",
     "crates/reap-storage",
     "crates/reap-telemetry",
     "crates/reap-live",
@@ -32,6 +33,7 @@ futures-util = "0.3"
 hmac = "0.12"
 reap-backtest = { path = "crates/reap-backtest" }
 reap-book = { path = "crates/reap-book" }
+reap-capture = { path = "crates/reap-capture" }
 reap-core = { path = "crates/reap-core" }
 reap-feed = { path = "crates/reap-feed" }
 reap-live = { path = "crates/reap-live" }

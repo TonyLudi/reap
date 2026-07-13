@@ -1,11 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use reap_core::{
     FillLiquidity, NormalizedEvent, OrderIntent, OrderUpdate, Price, Quantity, RawEnvelope, Side,
-    Symbol, SystemEvent, TimeMs,
+    Symbol, SystemEvent, SystemEventKind, TimeMs,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -39,6 +39,7 @@ pub enum StorageRecord {
     },
     Fill(FillRecord),
     System(SystemEvent),
+    SafetyLatch(SafetyLatchRecord),
     Reconciliation(ReconciliationRecord),
 }
 
@@ -98,6 +99,33 @@ pub struct ReconciliationRecord {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum SafetyLatchScope {
+    Global,
+    Account { account_id: String },
+    Symbol { symbol: Symbol },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SafetyLatchSource {
+    Operator,
+    Risk,
+    LegacySystemEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SafetyLatchRecord {
+    pub ts_ms: TimeMs,
+    pub scope: SafetyLatchScope,
+    pub active: bool,
+    pub source: SafetyLatchSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootstrapRecord {
     pub ts_ms: TimeMs,
@@ -114,6 +142,9 @@ pub struct RecoveredStorage {
     pub seen_fill_ids: HashSet<String>,
     pub baseline_fill_ids: HashMap<String, HashSet<String>>,
     pub bootstrap_identities: HashMap<String, (String, String)>,
+    pub global_safety_latch: Option<SafetyLatchRecord>,
+    pub account_safety_latches: BTreeMap<String, SafetyLatchRecord>,
+    pub symbol_safety_latches: BTreeMap<Symbol, SafetyLatchRecord>,
     pub last_ts_ms: TimeMs,
     pub records: u64,
     pub ignored_truncated_tail: bool,
@@ -155,6 +186,8 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
     #[error("storage serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("durable storage write failed: {0}")]
+    Durability(String),
     #[error("storage recovery found an invalid record on line {line}: {message}")]
     Corrupt { line: usize, message: String },
     #[error("storage writer task failed: {0}")]
@@ -163,23 +196,32 @@ pub enum StorageError {
 
 #[derive(Clone)]
 pub struct StorageSink {
-    sender: mpsc::Sender<StorageRecord>,
+    sender: mpsc::Sender<PendingRecord>,
     dropped: Arc<AtomicU64>,
     queued: Arc<AtomicUsize>,
 }
 
+struct PendingRecord {
+    record: StorageRecord,
+    durable_ack: Option<oneshot::Sender<Result<(), String>>>,
+}
+
 impl StorageSink {
     pub async fn record(&self, record: StorageRecord) -> Result<StorageWriteOutcome, StorageError> {
-        if record.is_critical() {
+        let pending = PendingRecord {
+            record,
+            durable_ack: None,
+        };
+        if pending.record.is_critical() {
             self.queued.fetch_add(1, Ordering::Relaxed);
-            if self.sender.send(record).await.is_err() {
+            if self.sender.send(pending).await.is_err() {
                 self.queued.fetch_sub(1, Ordering::Relaxed);
                 return Err(StorageError::Closed);
             }
             return Ok(StorageWriteOutcome::Queued);
         }
         self.queued.fetch_add(1, Ordering::Relaxed);
-        match self.sender.try_send(record) {
+        match self.sender.try_send(pending) {
             Ok(()) => Ok(StorageWriteOutcome::Queued),
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.queued.fetch_sub(1, Ordering::Relaxed);
@@ -193,10 +235,35 @@ impl StorageSink {
         }
     }
 
+    pub async fn record_durable(&self, record: StorageRecord) -> Result<(), StorageError> {
+        let (durable_ack, ack) = oneshot::channel();
+        self.queued.fetch_add(1, Ordering::Relaxed);
+        if self
+            .sender
+            .send(PendingRecord {
+                record,
+                durable_ack: Some(durable_ack),
+            })
+            .await
+            .is_err()
+        {
+            self.queued.fetch_sub(1, Ordering::Relaxed);
+            return Err(StorageError::Closed);
+        }
+        match ack.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(message)) => Err(StorageError::Durability(message)),
+            Err(_) => Err(StorageError::Closed),
+        }
+    }
+
     pub fn try_record(&self, record: StorageRecord) -> Result<StorageWriteOutcome, StorageError> {
         let critical = record.is_critical();
         self.queued.fetch_add(1, Ordering::Relaxed);
-        match self.sender.try_send(record) {
+        match self.sender.try_send(PendingRecord {
+            record,
+            durable_ack: None,
+        }) {
             Ok(()) => Ok(StorageWriteOutcome::Queued),
             Err(mpsc::error::TrySendError::Full(_)) if critical => {
                 self.queued.fetch_sub(1, Ordering::Relaxed);
@@ -247,6 +314,8 @@ struct StoredEnvelope {
     record: StorageRecord,
 }
 
+const CURRENT_SCHEMA_VERSION: u16 = 3;
+
 pub fn recover_jsonl(path: impl AsRef<Path>) -> Result<RecoveredStorage, StorageError> {
     let path = path.as_ref();
     let text = match std::fs::read_to_string(path) {
@@ -259,6 +328,7 @@ pub fn recover_jsonl(path: impl AsRef<Path>) -> Result<RecoveredStorage, Storage
     let trailing_newline = text.ends_with('\n');
     let lines = text.lines().collect::<Vec<_>>();
     let mut recovered = RecoveredStorage::default();
+    let mut explicit_latch_scopes = HashSet::new();
     for (index, line) in lines.iter().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -276,7 +346,7 @@ pub fn recover_jsonl(path: impl AsRef<Path>) -> Result<RecoveredStorage, Storage
                 });
             }
         };
-        if envelope.schema_version != 2 {
+        if !matches!(envelope.schema_version, 2 | CURRENT_SCHEMA_VERSION) {
             return Err(StorageError::Corrupt {
                 line: index + 1,
                 message: format!("unsupported schema version {}", envelope.schema_version),
@@ -306,10 +376,94 @@ pub fn recover_jsonl(path: impl AsRef<Path>) -> Result<RecoveredStorage, Storage
                 recovered.seen_fill_ids.insert(fill.fill_id.clone());
                 recovered.fills.push(fill);
             }
+            StorageRecord::SafetyLatch(latch) => {
+                explicit_latch_scopes.insert(latch.scope.clone());
+                apply_recovered_latch(&mut recovered, latch);
+            }
+            StorageRecord::System(system) => {
+                if let Some(latch) = legacy_system_latch(&system)
+                    && !explicit_latch_scopes.contains(&latch.scope)
+                {
+                    apply_recovered_latch(&mut recovered, latch);
+                }
+            }
             _ => {}
         }
     }
     Ok(recovered)
+}
+
+fn apply_recovered_latch(recovered: &mut RecoveredStorage, latch: SafetyLatchRecord) {
+    match &latch.scope {
+        SafetyLatchScope::Global => {
+            recovered.global_safety_latch = latch.active.then_some(latch);
+        }
+        SafetyLatchScope::Account { account_id } => {
+            if latch.active {
+                recovered
+                    .account_safety_latches
+                    .insert(account_id.clone(), latch);
+            } else {
+                recovered.account_safety_latches.remove(account_id);
+            }
+        }
+        SafetyLatchScope::Symbol { symbol } => {
+            if latch.active {
+                recovered
+                    .symbol_safety_latches
+                    .insert(symbol.clone(), latch);
+            } else {
+                recovered.symbol_safety_latches.remove(symbol);
+            }
+        }
+    }
+}
+
+fn legacy_system_latch(system: &SystemEvent) -> Option<SafetyLatchRecord> {
+    const OPERATOR_REASON_PREFIX: &str = "authenticated operator request ";
+
+    let (scope, active, source) = match system.kind {
+        SystemEventKind::RiskBreach => (SafetyLatchScope::Global, true, SafetyLatchSource::Risk),
+        SystemEventKind::KillSwitchActivated
+            if system.reason.starts_with(OPERATOR_REASON_PREFIX) =>
+        {
+            (
+                SafetyLatchScope::Global,
+                true,
+                SafetyLatchSource::LegacySystemEvent,
+            )
+        }
+        SystemEventKind::AccountHalted if system.reason.starts_with(OPERATOR_REASON_PREFIX) => (
+            SafetyLatchScope::Account {
+                account_id: system.account_id.clone()?,
+            },
+            true,
+            SafetyLatchSource::LegacySystemEvent,
+        ),
+        SystemEventKind::SymbolHalted if system.reason.starts_with(OPERATOR_REASON_PREFIX) => (
+            SafetyLatchScope::Symbol {
+                symbol: system.symbol.clone()?,
+            },
+            true,
+            SafetyLatchSource::LegacySystemEvent,
+        ),
+        SystemEventKind::SymbolResumed if system.reason.starts_with(OPERATOR_REASON_PREFIX) => (
+            SafetyLatchScope::Symbol {
+                symbol: system.symbol.clone()?,
+            },
+            false,
+            SafetyLatchSource::LegacySystemEvent,
+        ),
+        _ => return None,
+    };
+    Some(SafetyLatchRecord {
+        ts_ms: system.ts_ms,
+        scope,
+        active,
+        source,
+        request_id: None,
+        reason: system.reason.clone(),
+    })
 }
 
 fn storage_record_ts_ms(record: &StorageRecord) -> TimeMs {
@@ -323,6 +477,7 @@ fn storage_record_ts_ms(record: &StorageRecord) -> TimeMs {
         StorageRecord::Order { update, .. } => update.ts_ms,
         StorageRecord::Fill(fill) => fill.ts_ms,
         StorageRecord::System(system) => system.ts_ms,
+        StorageRecord::SafetyLatch(latch) => latch.ts_ms,
         StorageRecord::Reconciliation(reconciliation) => reconciliation.ts_ms,
     }
 }
@@ -372,7 +527,7 @@ pub async fn start_jsonl_storage(config: StorageConfig) -> Result<StorageRuntime
 
 async fn run_writer(
     config: StorageConfig,
-    receiver: mpsc::Receiver<StorageRecord>,
+    receiver: mpsc::Receiver<PendingRecord>,
     shutdown: oneshot::Receiver<()>,
     queued: Arc<AtomicUsize>,
 ) -> Result<(), StorageError> {
@@ -394,7 +549,7 @@ async fn open_storage_file(config: &StorageConfig) -> Result<tokio::fs::File, St
 async fn run_writer_with_file(
     config: StorageConfig,
     mut file: tokio::fs::File,
-    mut receiver: mpsc::Receiver<StorageRecord>,
+    mut receiver: mpsc::Receiver<PendingRecord>,
     mut shutdown: oneshot::Receiver<()>,
     queued: Arc<AtomicUsize>,
 ) -> Result<(), StorageError> {
@@ -406,18 +561,24 @@ async fn run_writer_with_file(
             biased;
             _ = &mut shutdown => {
                 receiver.close();
-                while let Some(record) = receiver.recv().await {
-                    write_record(&mut file, record).await?;
+                while let Some(pending) = receiver.recv().await {
+                    let result = write_pending(&mut file, pending).await;
                     queued.fetch_sub(1, Ordering::Relaxed);
+                    result?;
                 }
                 break;
             }
-            record = receiver.recv() => {
-                let Some(record) = record else { break; };
-                write_record(&mut file, record).await?;
+            pending = receiver.recv() => {
+                let Some(pending) = pending else { break; };
+                let result = write_pending(&mut file, pending).await;
                 queued.fetch_sub(1, Ordering::Relaxed);
-                since_flush += 1;
-                if since_flush >= flush_every {
+                let durable = result?;
+                if durable {
+                    since_flush = 0;
+                } else {
+                    since_flush += 1;
+                }
+                if !durable && since_flush >= flush_every {
                     file.flush().await?;
                     since_flush = 0;
                 }
@@ -428,12 +589,40 @@ async fn run_writer_with_file(
     Ok(())
 }
 
+async fn write_pending(
+    file: &mut tokio::fs::File,
+    pending: PendingRecord,
+) -> Result<bool, StorageError> {
+    let PendingRecord {
+        record,
+        durable_ack,
+    } = pending;
+    let durable = durable_ack.is_some();
+    let result = async {
+        write_record(file, record).await?;
+        if durable {
+            file.flush().await?;
+            file.sync_data().await?;
+        }
+        Ok::<(), StorageError>(())
+    }
+    .await;
+    if let Some(ack) = durable_ack {
+        let acknowledgement = match &result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        };
+        let _ = ack.send(acknowledgement);
+    }
+    result.map(|()| durable)
+}
+
 async fn write_record(
     file: &mut tokio::fs::File,
     record: StorageRecord,
 ) -> Result<(), StorageError> {
     let mut line = serde_json::to_vec(&StoredEnvelope {
-        schema_version: 2,
+        schema_version: CURRENT_SCHEMA_VERSION,
         record,
     })?;
     line.push(b'\n');
@@ -508,6 +697,22 @@ mod tests {
             Err(StorageError::Backpressure)
         ));
         assert_eq!(sink.dropped_records(), 0);
+    }
+
+    #[test]
+    fn recovery_remains_compatible_with_v2_journals() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let line = serde_json::to_string(&StoredEnvelope {
+            schema_version: 2,
+            record: raw(),
+        })
+        .unwrap();
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+
+        let recovered = recover_jsonl(path).unwrap();
+
+        assert_eq!(recovered.records, 1);
     }
 
     #[tokio::test]
@@ -590,6 +795,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_record_is_synced_before_acknowledgement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let runtime = start_jsonl_storage(StorageConfig {
+            path: path.clone(),
+            channel_capacity: 4,
+            flush_every_records: 1_000,
+        })
+        .await
+        .unwrap();
+        runtime
+            .sink()
+            .record_durable(StorageRecord::SafetyLatch(SafetyLatchRecord {
+                ts_ms: 1,
+                scope: SafetyLatchScope::Global,
+                active: true,
+                source: SafetyLatchSource::Operator,
+                request_id: Some("request-1".to_string()),
+                reason: "operator".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("safety_latch"));
+        assert!(text.contains("request-1"));
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn recovery_restores_latest_orders_and_fill_identity() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.jsonl");
@@ -665,5 +900,92 @@ mod tests {
         assert!(recovered.seen_fill_ids.contains("fill-1"));
         assert!(recovered.baseline_fill_ids["main"].contains("historical-fill"));
         assert_eq!(recovered.last_ts_ms, 2);
+    }
+
+    #[tokio::test]
+    async fn recovery_reduces_explicit_and_legacy_safety_latches() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let runtime = start_jsonl_storage(StorageConfig {
+            path: path.clone(),
+            channel_capacity: 16,
+            flush_every_records: 1,
+        })
+        .await
+        .unwrap();
+        let sink = runtime.sink();
+        sink.record(StorageRecord::System(SystemEvent {
+            ts_ms: 1,
+            kind: SystemEventKind::KillSwitchActivated,
+            venue: None,
+            account_id: None,
+            symbol: None,
+            reason: "bounded run completed".to_string(),
+        }))
+        .await
+        .unwrap();
+        sink.record(StorageRecord::System(SystemEvent {
+            ts_ms: 2,
+            kind: SystemEventKind::KillSwitchActivated,
+            venue: None,
+            account_id: None,
+            symbol: None,
+            reason: "authenticated operator request legacy: halt".to_string(),
+        }))
+        .await
+        .unwrap();
+        sink.record(StorageRecord::SafetyLatch(SafetyLatchRecord {
+            ts_ms: 3,
+            scope: SafetyLatchScope::Account {
+                account_id: "main".to_string(),
+            },
+            active: true,
+            source: SafetyLatchSource::Operator,
+            request_id: Some("request-2".to_string()),
+            reason: "account exposure".to_string(),
+        }))
+        .await
+        .unwrap();
+        sink.record(StorageRecord::SafetyLatch(SafetyLatchRecord {
+            ts_ms: 4,
+            scope: SafetyLatchScope::Symbol {
+                symbol: "BTC-USDT".to_string(),
+            },
+            active: true,
+            source: SafetyLatchSource::Operator,
+            request_id: Some("request-3".to_string()),
+            reason: "bad book".to_string(),
+        }))
+        .await
+        .unwrap();
+        sink.record(StorageRecord::SafetyLatch(SafetyLatchRecord {
+            ts_ms: 5,
+            scope: SafetyLatchScope::Symbol {
+                symbol: "BTC-USDT".to_string(),
+            },
+            active: false,
+            source: SafetyLatchSource::Operator,
+            request_id: Some("request-4".to_string()),
+            reason: "reviewed".to_string(),
+        }))
+        .await
+        .unwrap();
+        runtime.shutdown().await.unwrap();
+
+        let recovered = recover_jsonl(path).unwrap();
+        assert_eq!(
+            recovered
+                .global_safety_latch
+                .as_ref()
+                .map(|latch| latch.source),
+            Some(SafetyLatchSource::LegacySystemEvent)
+        );
+        assert_eq!(
+            recovered.account_safety_latches["main"]
+                .request_id
+                .as_deref(),
+            Some("request-2")
+        );
+        assert!(recovered.symbol_safety_latches.is_empty());
     }
 }

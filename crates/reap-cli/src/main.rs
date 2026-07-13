@@ -4,12 +4,13 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use reap_backtest::BacktestRunner;
+use reap_capture::CaptureRunOptions;
 use reap_live::{LiveConfig, LiveMode, LiveRunOptions, OperatorCommand, send_operator_command};
 use reap_strategy::ChaosConfig;
 
 #[derive(Debug, Parser)]
 #[command(name = "reap")]
-#[command(about = "Rust chaos/iarb2 strategy, backtest, replay, and OKX demo runtime")]
+#[command(about = "Rust chaos/iarb2 strategy, capture, backtest, replay, and OKX runtime")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -38,6 +39,20 @@ enum Command {
     ConfigCheck {
         #[arg(short, long)]
         config: PathBuf,
+        #[arg(long)]
+        pretty: bool,
+    },
+    Capture {
+        #[arg(short, long)]
+        config: PathBuf,
+        #[arg(long, help = "Stop public data capture after this many seconds")]
+        duration_secs: Option<u64>,
+        #[arg(
+            long,
+            requires = "duration_secs",
+            help = "Exit non-zero unless the bounded capture satisfies integrity invariants"
+        )]
+        require_clean_capture: bool,
         #[arg(long)]
         pretty: bool,
     },
@@ -120,6 +135,7 @@ impl From<OperatorCliCommand> for OperatorCommand {
 enum ReplayFormat {
     Csv,
     NormalizedJsonl,
+    RawCapture,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -157,6 +173,7 @@ async fn main() -> Result<()> {
             let report = match format {
                 ReplayFormat::Csv => runner.run_csv_path(&data)?,
                 ReplayFormat::NormalizedJsonl => runner.run_normalized_jsonl_path(&data)?,
+                ReplayFormat::RawCapture => runner.run_raw_capture_path(&data)?,
             };
             if pretty {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -192,6 +209,31 @@ async fn main() -> Result<()> {
             }
             if !report.valid {
                 anyhow::bail!("configuration validation failed");
+            }
+        }
+        Command::Capture {
+            config,
+            duration_secs,
+            require_clean_capture,
+            pretty,
+        } => {
+            reap_telemetry::init_json_tracing("info")
+                .map_err(anyhow::Error::msg)
+                .context("failed to initialize capture tracing")?;
+            let report = reap_capture::run_capture_path(
+                config,
+                CaptureRunOptions {
+                    run_duration: duration_secs.map(Duration::from_secs),
+                },
+            )
+            .await?;
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+            if require_clean_capture && !report.clean_capture {
+                anyhow::bail!("bounded capture did not satisfy clean integrity invariants");
             }
         }
         Command::Live {

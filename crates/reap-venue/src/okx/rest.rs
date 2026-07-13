@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use async_trait::async_trait;
 use chrono::{SecondsFormat, Utc};
 use reap_core::{
@@ -15,6 +17,8 @@ use super::{AuthError, HttpMethod, OkxSigner, SignedRequest};
 
 const PLACE_ORDER_PATH: &str = "/api/v5/trade/order";
 const CANCEL_ORDER_PATH: &str = "/api/v5/trade/cancel-order";
+const CANCEL_ALL_AFTER_PATH: &str = "/api/v5/trade/cancel-all-after";
+const PUBLIC_TIME_PATH: &str = "/api/v5/public/time";
 const OPEN_ORDERS_PATH: &str = "/api/v5/trade/orders-pending";
 const FILLS_PATH: &str = "/api/v5/trade/fills";
 const ORDER_DETAILS_PATH: &str = "/api/v5/trade/order";
@@ -256,9 +260,11 @@ pub struct OkxOrderAck {
     pub client_order_id: String,
 }
 
+#[derive(Clone)]
 pub struct OkxRestClient<T> {
     transport: T,
     signer: OkxSigner,
+    order_request_expiry_ms: Option<u64>,
 }
 
 impl<T> OkxRestClient<T>
@@ -266,7 +272,16 @@ where
     T: HttpTransport,
 {
     pub fn new(transport: T, signer: OkxSigner) -> Self {
-        Self { transport, signer }
+        Self {
+            transport,
+            signer,
+            order_request_expiry_ms: None,
+        }
+    }
+
+    pub fn with_order_request_expiry(mut self, expiry: std::time::Duration) -> Self {
+        self.order_request_expiry_ms = Some(expiry.as_millis().max(1).min(u64::MAX as u128) as u64);
+        self
     }
 
     pub fn signer(&self) -> &OkxSigner {
@@ -274,7 +289,13 @@ where
     }
 
     pub async fn place_order(&self, order: &OkxPlaceOrder) -> Result<OkxOrderAck, RestError> {
-        self.place_order_at(&timestamp_now(), order).await
+        let now = Utc::now();
+        let timestamp = now.to_rfc3339_opts(SecondsFormat::Millis, true);
+        let expiry_ms = self
+            .order_request_expiry_ms
+            .map(|ttl_ms| (now.timestamp_millis().max(0) as u64).saturating_add(ttl_ms));
+        self.place_order_with_expiry_at(&timestamp, expiry_ms, order)
+            .await
     }
 
     pub async fn place_order_at(
@@ -282,8 +303,77 @@ where
         timestamp: &str,
         order: &OkxPlaceOrder,
     ) -> Result<OkxOrderAck, RestError> {
-        let request = self.build_place_request(timestamp, order)?;
+        let expiry_ms = self
+            .order_request_expiry_ms
+            .map(|ttl_ms| timestamp_ms(timestamp).map(|now_ms| now_ms.saturating_add(ttl_ms)))
+            .transpose()?;
+        self.place_order_with_expiry_at(timestamp, expiry_ms, order)
+            .await
+    }
+
+    pub async fn place_order_with_expiry_at(
+        &self,
+        timestamp: &str,
+        expiry_ms: Option<u64>,
+        order: &OkxPlaceOrder,
+    ) -> Result<OkxOrderAck, RestError> {
+        let request = self.build_place_request_with_expiry(timestamp, expiry_ms, order)?;
         self.execute_ack(request, "place order").await
+    }
+
+    pub async fn server_time_ms(&self) -> Result<u64, RestError> {
+        let request = SignedRequest {
+            method: HttpMethod::Get,
+            path: PUBLIC_TIME_PATH.to_string(),
+            body: String::new(),
+            headers: BTreeMap::new(),
+        };
+        let response: OkxResponse<OkxTimeWire> = self.execute(request).await?;
+        let wire = response
+            .data
+            .into_iter()
+            .next()
+            .ok_or(RestError::EmptyData {
+                operation: "server time",
+            })?;
+        parse_integer("ts", &wire.timestamp)
+    }
+
+    pub async fn cancel_all_after(&self, timeout_secs: u64) -> Result<(), RestError> {
+        self.cancel_all_after_at(&timestamp_now(), timeout_secs)
+            .await
+    }
+
+    pub async fn cancel_all_after_at(
+        &self,
+        timestamp: &str,
+        timeout_secs: u64,
+    ) -> Result<(), RestError> {
+        if timeout_secs != 0 && !(10..=120).contains(&timeout_secs) {
+            return Err(RestError::InvalidField {
+                field: "timeOut",
+                value: timeout_secs.to_string(),
+                message: "must be 0 or between 10 and 120 seconds".to_string(),
+            });
+        }
+        #[derive(Serialize)]
+        struct Body {
+            #[serde(rename = "timeOut")]
+            timeout_secs: String,
+        }
+        let body = serde_json::to_string(&Body {
+            timeout_secs: timeout_secs.to_string(),
+        })?;
+        let request =
+            self.signer
+                .sign_request(timestamp, HttpMethod::Post, CANCEL_ALL_AFTER_PATH, body)?;
+        let response: OkxResponse<OkxCancelAllAfterWire> = self.execute(request).await?;
+        if response.data.is_empty() {
+            return Err(RestError::EmptyData {
+                operation: "cancel all after",
+            });
+        }
+        Ok(())
     }
 
     pub async fn cancel_order(&self, order: &OkxCancelOrder) -> Result<OkxOrderAck, RestError> {
@@ -525,6 +615,15 @@ where
         timestamp: &str,
         order: &OkxPlaceOrder,
     ) -> Result<SignedRequest, RestError> {
+        self.build_place_request_with_expiry(timestamp, None, order)
+    }
+
+    pub fn build_place_request_with_expiry(
+        &self,
+        timestamp: &str,
+        expiry_ms: Option<u64>,
+        order: &OkxPlaceOrder,
+    ) -> Result<SignedRequest, RestError> {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct Body<'a> {
@@ -556,9 +655,15 @@ where
             reduce_only: order.reduce_only.then_some(true),
             self_trade_prevention: order.self_trade_prevention.map(stp_mode_string),
         })?;
-        Ok(self
-            .signer
-            .sign_request(timestamp, HttpMethod::Post, PLACE_ORDER_PATH, body)?)
+        let mut request =
+            self.signer
+                .sign_request(timestamp, HttpMethod::Post, PLACE_ORDER_PATH, body)?;
+        if let Some(expiry_ms) = expiry_ms {
+            request
+                .headers
+                .insert("expTime".to_string(), expiry_ms.to_string());
+        }
+        Ok(request)
     }
 
     pub fn build_cancel_request(
@@ -636,6 +741,21 @@ fn timestamp_now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+fn timestamp_ms(timestamp: &str) -> Result<u64, RestError> {
+    let timestamp = chrono::DateTime::parse_from_rfc3339(timestamp).map_err(|error| {
+        RestError::InvalidField {
+            field: "OK-ACCESS-TIMESTAMP",
+            value: timestamp.to_string(),
+            message: error.to_string(),
+        }
+    })?;
+    u64::try_from(timestamp.timestamp_millis()).map_err(|error| RestError::InvalidField {
+        field: "OK-ACCESS-TIMESTAMP",
+        value: timestamp.to_rfc3339(),
+        message: error.to_string(),
+    })
+}
+
 fn query_path<'a>(
     base: &str,
     parameters: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
@@ -699,6 +819,19 @@ struct OkxAckWire {
     sub_code: String,
     #[serde(default, rename = "sMsg")]
     sub_message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OkxTimeWire {
+    #[serde(rename = "ts")]
+    timestamp: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OkxCancelAllAfterWire {
+    #[allow(dead_code)]
+    #[serde(default, rename = "triggerTime")]
+    trigger_time: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1225,6 +1358,79 @@ mod tests {
                 .iter()
                 .all(|request| request.headers.contains_key("OK-ACCESS-SIGN"))
         );
+    }
+
+    #[tokio::test]
+    async fn place_order_sets_exchange_expiry_header() {
+        let (client, requests) = client(vec![
+            r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"reap1","sCode":"0","sMsg":""}]}"#,
+        ]);
+        let client = client.with_order_request_expiry(std::time::Duration::from_millis(750));
+        let timestamp = "2020-12-08T09:08:57.715Z";
+        client
+            .place_order_at(
+                timestamp,
+                &OkxPlaceOrder {
+                    symbol: "BTC-USDT".to_string(),
+                    trade_mode: OkxTradeMode::Cash,
+                    side: Side::Buy,
+                    time_in_force: TimeInForce::PostOnly,
+                    price: 100.5,
+                    qty: 0.1,
+                    client_order_id: "reap1".to_string(),
+                    reduce_only: false,
+                    self_trade_prevention: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests[0].headers["expTime"],
+            (timestamp_ms(timestamp).unwrap() + 750).to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn public_time_and_cancel_all_after_have_expected_wire_contract() {
+        let (client, requests) = client(vec![
+            r#"{"code":"0","msg":"","data":[{"ts":"1597026383085"}]}"#,
+            r#"{"code":"0","msg":"","data":[{"triggerTime":"1597026443","tag":"","ts":"1597026383"}]}"#,
+            r#"{"code":"0","msg":"","data":[{"triggerTime":"0","tag":"","ts":"1597026384"}]}"#,
+        ]);
+
+        assert_eq!(client.server_time_ms().await.unwrap(), 1_597_026_383_085);
+        client
+            .cancel_all_after_at("2020-12-08T09:08:57.715Z", 30)
+            .await
+            .unwrap();
+        client
+            .cancel_all_after_at("2020-12-08T09:08:58.715Z", 0)
+            .await
+            .unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].path, PUBLIC_TIME_PATH);
+        assert!(requests[0].headers.is_empty());
+        assert_eq!(requests[1].path, CANCEL_ALL_AFTER_PATH);
+        assert_eq!(requests[1].body, r#"{"timeOut":"30"}"#);
+        assert!(requests[1].headers.contains_key("OK-ACCESS-SIGN"));
+        assert_eq!(requests[2].body, r#"{"timeOut":"0"}"#);
+    }
+
+    #[tokio::test]
+    async fn cancel_all_after_rejects_unsafe_timeout() {
+        let (client, _) = client(Vec::new());
+        assert!(matches!(
+            client
+                .cancel_all_after_at("2020-12-08T09:08:57.715Z", 9)
+                .await,
+            Err(RestError::InvalidField {
+                field: "timeOut",
+                ..
+            })
+        ));
     }
 
     #[tokio::test]

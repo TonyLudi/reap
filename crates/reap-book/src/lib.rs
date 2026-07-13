@@ -190,10 +190,12 @@ fn valid_book(book: &OrderBook) -> bool {
     !book.bids.is_empty()
         && !book.asks.is_empty()
         && book
-            .bids
-            .iter()
-            .chain(book.asks.iter())
-            .all(|level| level.px.is_finite() && level.qty.is_finite() && level.qty > 0.0)
+            .best_bid()
+            .zip(book.best_ask())
+            .is_some_and(|(bid, ask)| bid.px < ask.px)
+        && book.bids.iter().chain(book.asks.iter()).all(|level| {
+            level.px.is_finite() && level.px > 0.0 && level.qty.is_finite() && level.qty > 0.0
+        })
 }
 
 #[cfg(test)]
@@ -214,6 +216,34 @@ mod tests {
 
         assert_eq!(status, BookStatus::Ready);
         assert_eq!(reducer.mid(), Some(101.0));
+    }
+
+    #[test]
+    fn crossed_snapshot_is_not_ready() {
+        let mut reducer = BookReducer::new("BTC-USDT");
+        let status = reducer.apply_snapshot(OrderBook::one_level(
+            "BTC-USDT",
+            10,
+            Level::new(102.0, 1.0),
+            Level::new(101.0, 1.0),
+        ));
+
+        assert_eq!(status, BookStatus::Empty);
+        assert!(!reducer.is_ready());
+    }
+
+    #[test]
+    fn non_positive_prices_are_not_ready() {
+        let mut reducer = BookReducer::new("BTC-USDT");
+        let status = reducer.apply_snapshot(OrderBook::one_level(
+            "BTC-USDT",
+            10,
+            Level::new(0.0, 1.0),
+            Level::new(101.0, 1.0),
+        ));
+
+        assert_eq!(status, BookStatus::Empty);
+        assert!(!reducer.is_ready());
     }
 
     #[test]

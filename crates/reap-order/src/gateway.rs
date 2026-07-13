@@ -355,6 +355,14 @@ where
             .order_details(symbol, None, Some(client_order_id))
             .await?)
     }
+
+    pub async fn exchange_time_ms(&self) -> Result<u64, GatewayError> {
+        Ok(self.client.server_time_ms().await?)
+    }
+
+    pub async fn cancel_all_after(&self, timeout_secs: u64) -> Result<(), GatewayError> {
+        Ok(self.client.cancel_all_after(timeout_secs).await?)
+    }
 }
 
 fn unix_time_ms() -> u64 {
