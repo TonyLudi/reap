@@ -1614,11 +1614,7 @@ fn no_less_conservative(
     stress: &BacktestExecutionConfig,
     baseline: &BacktestExecutionConfig,
 ) -> bool {
-    stress.market_data_latency_ms >= baseline.market_data_latency_ms
-        && stress.order_entry_latency_ms >= baseline.order_entry_latency_ms
-        && stress.cancel_latency_ms >= baseline.cancel_latency_ms
-        && stress.order_update_latency_ms >= baseline.order_update_latency_ms
-        && stress.fill_account_latency_ms >= baseline.fill_account_latency_ms
+    stress.latency_is_no_less_conservative_than(baseline)
         && stress.depth_fill_conservative_threshold >= baseline.depth_fill_conservative_threshold
         && stress.queue_ahead_multiplier >= baseline.queue_ahead_multiplier
         && stress.historical_trade_fill_fraction <= baseline.historical_trade_fill_fraction
@@ -1723,6 +1719,7 @@ mod tests {
             cancel_latency_ms: latency_ms,
             order_update_latency_ms: latency_ms,
             fill_account_latency_ms: latency_ms,
+            latency_profile: Default::default(),
             depth_fill_conservative_threshold: 0.0001,
             queue_ahead_multiplier: queue,
             historical_trade_fill_fraction: trade_fraction,
@@ -1820,6 +1817,28 @@ mod tests {
 
         assert!(error.contains("less conservative"));
         assert!(error.contains("both train and test"));
+    }
+
+    #[test]
+    fn manifest_rejects_latency_stress_without_distribution_dominance() {
+        let mut manifest = manifest();
+        let rule = |samples_ms| crate::BacktestLatencyRule {
+            class: crate::BacktestLatencyClass::MarketDepth,
+            symbol: Some("BTC-USDT".to_string()),
+            samples_ms,
+        };
+        manifest.scenarios[0].execution.latency_profile = crate::BacktestLatencyProfile {
+            seed: 23,
+            rules: vec![rule(vec![1, 3, 5])],
+        };
+        manifest.scenarios[1].execution.latency_profile = crate::BacktestLatencyProfile {
+            seed: 23,
+            rules: vec![rule(vec![0, 4, 6])],
+        };
+
+        let error = manifest.validate().unwrap_err().to_string();
+
+        assert!(error.contains("less conservative"));
     }
 
     #[test]

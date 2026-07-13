@@ -112,11 +112,13 @@ cargo run -p reap-cli -- backtest \
 The optional `[backtest]` table controls market-data, order-entry, cancel,
 order-update, and fill/account delays plus the displayed-depth over-cross
 threshold, queue-ahead multiplier, historical-trade participation, and
-displayed-depth capacity. The report embeds those assumptions, the replay time
-basis, clock regressions, live orders, and work still scheduled at the capture
-boundary. The delay values are zero, the threshold is the pinned Java default,
-capacity fractions are 100%, and `calibrated = false`; these parity defaults are
-not an execution-quality or profitability claim.
+displayed-depth capacity. A bounded `latency_profile` can replace each scalar
+fallback with deterministic empirical samples by Java-mapped message class and
+symbol. The report embeds those assumptions, actual sampled-latency usage, the
+replay time basis, clock regressions, live orders, and work still scheduled at
+the capture boundary. The example delay values are zero, the threshold is the
+pinned Java default, capacity fractions are 100%, and `calibrated = false`;
+these parity defaults are not an execution-quality or profitability claim.
 
 Backtest reports also separate fee cost, funding PnL, and turnover. They flag
 late, missed, invalid, or failed funding accounting and retain funding

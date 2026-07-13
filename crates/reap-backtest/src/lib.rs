@@ -4,7 +4,11 @@ mod portfolio;
 mod replay;
 mod research;
 
-pub use execution::{BacktestConfig, BacktestExecutionConfig, BacktestTimeBasis};
+use execution::BacktestLatencySampler;
+pub use execution::{
+    BacktestConfig, BacktestExecutionConfig, BacktestLatencyClass, BacktestLatencyProfile,
+    BacktestLatencyRule, BacktestLatencyUsage, BacktestTimeBasis,
+};
 use matching::MatchingAssumptions;
 pub use matching::MatchingEngine;
 pub use replay::{
@@ -41,6 +45,7 @@ const FUNDING_LATE_TOLERANCE_NS: u64 = 60_000 * NS_PER_MS;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BacktestReport {
     pub execution: BacktestExecutionConfig,
+    pub latency_usage: Vec<BacktestLatencyUsage>,
     pub time_basis: BacktestTimeBasis,
     pub input_events: u64,
     pub first_arrival_ns: Option<u64>,
@@ -105,6 +110,7 @@ enum ScheduledAction {
         order_id: String,
     },
     CancelOrder {
+        symbol: Symbol,
         order_id: String,
         reason: String,
     },
@@ -121,6 +127,7 @@ pub struct BacktestRunner {
     matchers: HashMap<Symbol, MatchingEngine>,
     portfolio: Portfolio,
     execution: BacktestExecutionConfig,
+    latency_sampler: BacktestLatencySampler,
     time_basis: BacktestTimeBasis,
     scheduled: BTreeMap<(u64, u64), ScheduledAction>,
     next_action_seq: u64,
@@ -182,6 +189,7 @@ impl BacktestRunner {
         execution: BacktestExecutionConfig,
     ) -> Result<Self> {
         execution.validate()?;
+        validate_latency_profile_symbols(&execution, &config)?;
         let matching_assumptions = MatchingAssumptions {
             depth_fill_conservative_threshold: execution.depth_fill_conservative_threshold,
             queue_ahead_multiplier: execution.queue_ahead_multiplier,
@@ -198,11 +206,13 @@ impl BacktestRunner {
                 )
             })
             .collect();
+        let latency_sampler = BacktestLatencySampler::new(&execution);
         Ok(Self {
             portfolio: Portfolio::new(&config.instruments),
             strategy: ChaosStrategy::new(config).context("invalid chaos/iarb2 configuration")?,
             matchers,
             execution,
+            latency_sampler,
             time_basis: BacktestTimeBasis::EventTimestampMs,
             scheduled: BTreeMap::new(),
             next_action_seq: 1,
@@ -318,6 +328,9 @@ impl BacktestRunner {
         match &event {
             NormalizedEvent::Market(MarketEvent::Depth(book)) => {
                 let now_ns = self.now_ns;
+                let latency_ms = self
+                    .latency_sampler
+                    .sample(BacktestLatencyClass::MarketDepth, &book.symbol);
                 if let Some(mid) = book.mid().filter(|mid| mid.is_finite() && *mid > 0.0) {
                     self.depth_marks.insert(book.symbol.clone(), mid);
                 }
@@ -327,7 +340,7 @@ impl BacktestRunner {
                 self.route_exchange_updates(updates)?;
                 self.drain_through(now_ns)?;
                 self.schedule_after(
-                    self.execution.market_data_latency_ms,
+                    latency_ms,
                     ScheduledAction::DeliverStrategy(event.into_strategy_event()),
                 );
                 self.drain_through(now_ns)?;
@@ -340,6 +353,9 @@ impl BacktestRunner {
                 ..
             }) => {
                 let now_ns = self.now_ns;
+                let latency_ms = self
+                    .latency_sampler
+                    .sample(BacktestLatencyClass::HistoricalTrade, symbol);
                 let updates = self.matcher_mut(symbol)?.on_trade_at(
                     *price,
                     *qty,
@@ -349,18 +365,21 @@ impl BacktestRunner {
                 self.route_exchange_updates(updates)?;
                 self.drain_through(now_ns)?;
                 self.schedule_after(
-                    self.execution.market_data_latency_ms,
+                    latency_ms,
                     ScheduledAction::DeliverStrategy(event.into_strategy_event()),
                 );
                 self.drain_through(now_ns)?;
             }
             NormalizedEvent::Market(
-                MarketEvent::IndexPrice { .. } | MarketEvent::BurstSignal { .. },
+                MarketEvent::IndexPrice { symbol, .. } | MarketEvent::BurstSignal { symbol, .. },
             ) => {
                 let now_ns = self.now_ns;
+                let latency_ms = self
+                    .latency_sampler
+                    .sample(BacktestLatencyClass::ReferenceData, symbol);
                 self.drain_through(now_ns)?;
                 self.schedule_after(
-                    self.execution.market_data_latency_ms,
+                    latency_ms,
                     ScheduledAction::DeliverStrategy(event.into_strategy_event()),
                 );
                 self.drain_through(now_ns)?;
@@ -372,10 +391,13 @@ impl BacktestRunner {
                 ..
             }) => {
                 let now_ns = self.now_ns;
+                let latency_ms = self
+                    .latency_sampler
+                    .sample(BacktestLatencyClass::ReferenceData, symbol);
                 self.register_funding_rate(symbol, *rate, *funding_time_ms);
                 self.drain_through(now_ns)?;
                 self.schedule_after(
-                    self.execution.market_data_latency_ms,
+                    latency_ms,
                     ScheduledAction::DeliverStrategy(event.into_strategy_event()),
                 );
                 self.drain_through(now_ns)?;
@@ -384,12 +406,15 @@ impl BacktestRunner {
                 symbol, mark_price, ..
             }) => {
                 let now_ns = self.now_ns;
+                let latency_ms = self
+                    .latency_sampler
+                    .sample(BacktestLatencyClass::ReferenceData, symbol);
                 if mark_price.is_finite() && *mark_price > 0.0 {
                     self.exchange_marks.insert(symbol.clone(), *mark_price);
                 }
                 self.drain_through(now_ns)?;
                 self.schedule_after(
-                    self.execution.market_data_latency_ms,
+                    latency_ms,
                     ScheduledAction::DeliverStrategy(event.into_strategy_event()),
                 );
                 self.drain_through(now_ns)?;
@@ -516,13 +541,17 @@ impl BacktestRunner {
                 None
             };
 
-            self.schedule_after(
-                self.execution.order_update_latency_ms,
-                ScheduledAction::DeliverOrder(update),
-            );
+            let order_update_delay_ms = self
+                .latency_sampler
+                .sample(BacktestLatencyClass::OrderUpdate, &update.symbol);
+            let fill_symbol = update.symbol.clone();
+            self.schedule_after(order_update_delay_ms, ScheduledAction::DeliverOrder(update));
             if let Some(account_update) = account_update {
+                let fill_account_delay_ms = self
+                    .latency_sampler
+                    .sample(BacktestLatencyClass::OrderFill, &fill_symbol);
                 self.schedule_after(
-                    self.execution.fill_account_latency_ms,
+                    fill_account_delay_ms,
                     ScheduledAction::DeliverStrategy(StrategyEvent::Account(account_update)),
                 );
             }
@@ -564,8 +593,11 @@ impl BacktestRunner {
                     let now_ms = time_ms(self.now_ns);
                     let (order_id, pending) =
                         self.matcher_mut(&symbol)?.prepare_submit(order, now_ms);
+                    let order_entry_delay_ms = self
+                        .latency_sampler
+                        .sample(BacktestLatencyClass::MatchingNew, &symbol);
                     self.schedule_after(
-                        self.execution.order_entry_latency_ms,
+                        order_entry_delay_ms,
                         ScheduledAction::ActivateOrder {
                             symbol,
                             order_id: order_id.clone(),
@@ -577,17 +609,24 @@ impl BacktestRunner {
                 }
                 OrderIntent::CancelOrder { order_id, reason } => {
                     self.cancel_requests += 1;
-                    if !self.has_open_order(&order_id) {
+                    let Some(symbol) = self.open_order_symbol(&order_id) else {
                         self.ignored_cancel_requests += 1;
                         continue;
-                    }
+                    };
                     if !self.pending_cancels.insert(order_id.clone()) {
                         self.deduplicated_cancel_requests += 1;
                         continue;
                     }
+                    let cancel_delay_ms = self
+                        .latency_sampler
+                        .sample(BacktestLatencyClass::MatchingCancel, &symbol);
                     self.schedule_after(
-                        self.execution.cancel_latency_ms,
-                        ScheduledAction::CancelOrder { order_id, reason },
+                        cancel_delay_ms,
+                        ScheduledAction::CancelOrder {
+                            symbol,
+                            order_id,
+                            reason,
+                        },
                     );
                 }
             }
@@ -609,15 +648,16 @@ impl BacktestRunner {
                 self.exchange_activations += 1;
                 self.route_exchange_updates(updates)?;
             }
-            ScheduledAction::CancelOrder { order_id, reason } => {
+            ScheduledAction::CancelOrder {
+                symbol,
+                order_id,
+                reason,
+            } => {
                 self.pending_cancels.remove(&order_id);
                 let now_ms = time_ms(self.now_ns);
                 let updates = self
-                    .matchers
-                    .values_mut()
-                    .find(|matcher| matcher.is_open_order(&order_id))
-                    .map(|matcher| matcher.cancel_at(&order_id, now_ms, &reason))
-                    .unwrap_or_default();
+                    .matcher_mut(&symbol)?
+                    .cancel_at(&order_id, now_ms, &reason);
                 self.route_exchange_updates(updates)?;
             }
             ScheduledAction::DeliverOrder(update) => {
@@ -841,6 +881,7 @@ impl BacktestRunner {
 
         Ok(BacktestReport {
             execution: self.execution.clone(),
+            latency_usage: self.latency_sampler.usage(),
             time_basis: self.time_basis,
             input_events: self.input_events,
             first_arrival_ns: self.first_arrival_ns,
@@ -927,15 +968,50 @@ impl BacktestRunner {
             .with_context(|| format!("no matcher configured for symbol {symbol}"))
     }
 
-    fn has_open_order(&self, order_id: &str) -> bool {
+    fn open_order_symbol(&self, order_id: &str) -> Option<Symbol> {
         self.matchers
-            .values()
-            .any(|matcher| matcher.is_open_order(order_id))
+            .iter()
+            .find(|(_, matcher)| matcher.is_open_order(order_id))
+            .map(|(symbol, _)| symbol.clone())
     }
 }
 
 fn time_ms(time_ns: u64) -> u64 {
     time_ns / NS_PER_MS
+}
+
+fn validate_latency_profile_symbols(
+    execution: &BacktestExecutionConfig,
+    config: &ChaosConfig,
+) -> Result<()> {
+    let mut known_symbols = config
+        .instruments
+        .iter()
+        .map(|instrument| instrument.symbol.as_str())
+        .collect::<HashSet<_>>();
+    known_symbols.insert(&config.ref_symbol);
+    known_symbols.extend(
+        config
+            .instruments
+            .iter()
+            .filter_map(|instrument| instrument.index_symbol.as_deref()),
+    );
+    let mut unknown = execution
+        .latency_profile
+        .rules
+        .iter()
+        .filter_map(|rule| rule.symbol.as_deref())
+        .filter(|symbol| !known_symbols.contains(symbol))
+        .collect::<Vec<_>>();
+    unknown.sort_unstable();
+    unknown.dedup();
+    if !unknown.is_empty() {
+        bail!(
+            "backtest latency profile references symbols outside the strategy instrument/reference/index universe: {}",
+            unknown.join(", ")
+        );
+    }
+    Ok(())
 }
 
 fn retime_order_update(mut update: OrderUpdate, ts_ms: u64) -> OrderUpdate {
@@ -1109,6 +1185,84 @@ mod tests {
         assert_eq!(report.pending_scheduled_actions, 2);
         assert_eq!(report.pending_strategy_event_actions, 2);
         assert_eq!(report.pending_orders, 0);
+        assert_eq!(report.latency_usage.len(), 2);
+        assert!(report.latency_usage.iter().all(|usage| {
+            usage.class == BacktestLatencyClass::MarketDepth
+                && usage.samples == 1
+                && usage.minimum_latency_ms == 10
+                && usage.maximum_latency_ms == 10
+        }));
+    }
+
+    #[test]
+    fn symbol_latency_rule_overrides_class_rule_in_the_scheduler() {
+        let execution = BacktestExecutionConfig {
+            market_data_latency_ms: 99,
+            latency_profile: BacktestLatencyProfile {
+                seed: 17,
+                rules: vec![
+                    BacktestLatencyRule {
+                        class: BacktestLatencyClass::MarketDepth,
+                        symbol: None,
+                        samples_ms: vec![0],
+                    },
+                    BacktestLatencyRule {
+                        class: BacktestLatencyClass::MarketDepth,
+                        symbol: Some("BTC-PERP".to_string()),
+                        samples_ms: vec![10],
+                    },
+                ],
+            },
+            ..BacktestExecutionConfig::default()
+        };
+        let mut runner = BacktestRunner::with_execution_config(config(), execution).unwrap();
+
+        let report = runner.run(initial_books()).unwrap();
+
+        assert_eq!(report.orders_sent, 0);
+        assert_eq!(report.pending_strategy_event_actions, 1);
+        assert_eq!(report.latency_usage.len(), 2);
+        assert_eq!(
+            report
+                .latency_usage
+                .iter()
+                .find(|usage| usage.symbol == "BTC-USDT")
+                .unwrap()
+                .maximum_latency_ms,
+            0
+        );
+        assert_eq!(
+            report
+                .latency_usage
+                .iter()
+                .find(|usage| usage.symbol == "BTC-PERP")
+                .unwrap()
+                .maximum_latency_ms,
+            10
+        );
+    }
+
+    #[test]
+    fn runner_rejects_unknown_symbol_latency_rule() {
+        let execution = BacktestExecutionConfig {
+            latency_profile: BacktestLatencyProfile {
+                seed: 1,
+                rules: vec![BacktestLatencyRule {
+                    class: BacktestLatencyClass::MarketDepth,
+                    symbol: Some("ETH-USDT".to_string()),
+                    samples_ms: vec![1],
+                }],
+            },
+            ..BacktestExecutionConfig::default()
+        };
+
+        let error = BacktestRunner::with_execution_config(config(), execution)
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert!(error.contains("outside the strategy instrument/reference/index universe"));
+        assert!(error.contains("ETH-USDT"));
     }
 
     #[test]

@@ -10,7 +10,7 @@ production trading process.
 | Area | Current state | Trading impact |
 | --- | --- | --- |
 | Iarb2 decision model | Covered for the documented OKX parity boundary | Not a blocker |
-| Deterministic backtest/data | Shared strategy code, immediate pending-order registration, arrival-time scheduler, configurable market/entry/cancel/order/account delays, Java-referenced conservative depth-fill threshold, queue/trade/depth capacity haircuts, event-clock drawdown/exposure/inventory metrics, fee/turnover attribution, scheduled linear/inverse funding, manifest-driven chronological walk-forward selection and stress gates, credential-free redundant public capture, exact provenance, streaming analysis, and raw/normalized replay | Execution/accounting assumptions remain uncalibrated; needs sustained full-depth capture, complete funding intervals, depeg-sensitive quote valuation, borrow/fee calibration, statement reconciliation, and real production-candidate reports before capital decisions |
+| Deterministic backtest/data | Shared strategy code, immediate pending-order registration, arrival-time scheduler, Java-mapped class/symbol empirical latency profiles with sampled-usage reporting, conservative depth/queue/trade capacity controls, event-clock drawdown/exposure/inventory metrics, fee/turnover attribution, scheduled linear/inverse funding, manifest-driven chronological walk-forward selection and stress gates, credential-free redundant public capture, exact provenance, streaming analysis, and raw/normalized replay | Execution/accounting assumptions remain uncalibrated; needs sustained full-depth capture, populated target-host/demo latency samples, complete funding intervals, depeg-sensitive quote valuation, borrow/fee calibration, statement reconciliation, and real production-candidate reports before capital decisions |
 | Feed components | Redundant public sockets, isolated private sockets, transport/state freshness separation, account-plus-positions health rounds, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
 | Order components | Event-loop client IDs/registration, exchange/client acknowledgement binding, account-scoped immutable private identity, semantic duplicate suppression across changed exchange timestamps, exchange-side place-request expiry, signed submit/cancel, pacing, monotonic private reduction, submit/cancel state-convergence deadlines, typed position margin mode, ambiguity handling, and full order/fill/balance/position REST reconciliation are composed | Needs demo exchange fault evidence |
 | Runtime risk | Instrument models, authoritative startup positions, active-order count/notional ceilings, rolling submit-rejection and zero-fill IOC-cancel circuits, terminal strategy-halt promotion, position scope/mode enforcement, forced-repayment blocking, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed deadman/depeg/convergence evidence |
@@ -195,6 +195,13 @@ production trading process.
     smoke fold validates plumbing with permissive uncalibrated gates and negative
     fee-adjusted PnL; it is not production evidence. Each dataset currently
     starts from zero rather than carrying Java's daily ending positions.
+34. Backtest latency can now use bounded empirical samples for Java-mapped
+    `market_depth`, `historical_trade`, `matching_new`, `matching_cancel`,
+    `order_update`, and `order_fill` classes plus Rust `reference_data`, with
+    optional symbol overrides and scalar fallback. Stable quantile sampling is
+    reproducible and reported by class/symbol. Baseline/stress profiles require
+    the same seed and stochastic dominance, but no representative target-host
+    or demo samples have yet been certified.
 
 ## Remaining Demo Gate
 

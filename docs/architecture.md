@@ -426,6 +426,7 @@ The `[backtest]` fields map to the pinned Java backtest model as follows:
 | `cancel_latency_ms` | `MatchingCancel` | Cancel intent to matching ineligibility |
 | `order_update_latency_ms` | `OrderUpdate` | Exchange order transition to strategy visibility |
 | `fill_account_latency_ms` | `OrderFill` plus live fill-to-account convergence | Exchange fill to synthetic authoritative position visibility; Java couples position/account publication to order-update delay |
+| `latency_profile.rules` | `MarketDepth`, `HistoryTrade`, `MatchingNew`, `MatchingCancel`, `OrderUpdate`, and `OrderFill` | Bounded uniform empirical samples by class and optional symbol; `reference_data` is a Rust extension for index/funding/limit/burst inputs |
 | `depth_fill_conservative_threshold` | `backtest.depth.fill.conservative.threshold` | Required relative over-cross before a resting order fills from displayed depth; trade fills and new taker orders do not use the threshold |
 | `queue_ahead_multiplier` | Java displayed queue at `1.0`; Rust sensitivity overlay | Multiplies displayed quantity ahead of each newly resting order; values below `1.0` are rejected |
 | `historical_trade_fill_fraction` | Java consumes all matching-trade quantity at `1.0`; Rust sensitivity overlay | Haircuts historical trade quantity before queue consumption and maker filling |
@@ -434,12 +435,21 @@ The `[backtest]` fields map to the pinned Java backtest model as follows:
 Latency and threshold fields default to zero, while the queue and capacity
 fields default to `1.0`, preserving backward-compatible deterministic fixtures.
 The OKX example explicitly uses the pinned Java application's conservative
-depth default of `0.0001`, but does not claim it is calibrated. The report
-embeds every effective value and a `calibrated` declaration. That flag must
-remain false for guessed sensitivity values. Assumptions are global in the
-current implementation; production research still requires venue, instrument,
-message class, and percentile distributions from representative captures and
-demo order traces.
+depth default of `0.0001`, but does not claim it is calibrated. Scalar latency
+fields remain backward-compatible fallbacks. A class-wide profile rule replaces
+its scalar, and a symbol rule replaces the class-wide rule. Samples are sorted
+and selected by a stable seed/class/symbol/event-ordinal quantile, so runs are
+reproducible regardless of rule order. Reports include actual per-class/symbol
+sample count, total, minimum, maximum, and mean latency.
+
+Baseline and stress profiles must share a seed. Research accepts a stress
+distribution only when it first-order stochastically dominates the effective
+baseline distribution for every class and every configured symbol override;
+shared quantiles then make each sampled stress delay no smaller than baseline.
+The report embeds every effective value and a `calibrated` declaration. That
+flag must remain false for guessed sensitivity values. Production research
+still requires populated venue/instrument/message-class distributions from
+representative target-host processing measurements and demo order traces.
 
 Events already due strictly before the next input are drained first. Actions due
 at the same instant as a market event execute after that market event, which is

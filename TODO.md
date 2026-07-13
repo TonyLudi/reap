@@ -117,6 +117,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Add manifest-driven walk-forward candidate selection, chronological
   train/test isolation, conservative sensitivity scenarios, deterministic
   provenance, and machine-verifiable accounting/risk/performance gates.
+- [x] Add bounded deterministic empirical latency profiles by Java-mapped
+  message class and instrument, actual sampled-usage reporting, and
+  stochastic-dominance validation for coupled baseline/stress runs.
 - [x] Attribute fill fees/turnover and port signed linear/inverse swap funding
   settlement with mark fallback, late/missed coverage signals, and explicit
   end-of-horizon funding actions.
@@ -185,9 +188,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
   captured full-depth data, then run and archive production-candidate
   walk-forward, capacity, and stressed-liquidity reports. The orchestration and
   configurable execution model are implemented but remain uncalibrated;
-  empirical queue and per-class/per-instrument latency distributions, fee tiers,
-  complete funding intervals, depeg-sensitive quote valuation, borrow costs,
-  and statement reconciliation are still required.
+  empirical queue and populated per-class/per-instrument latency distributions,
+  fee tiers, complete funding intervals, depeg-sensitive quote valuation,
+  borrow costs, and statement reconciliation are still required.
 - [ ] Deploy and exercise the webhook/host guards, systemd supervision, external
   unit-failure paging, and independent exchange cancel procedure on the target
   host/account; add a separate algo/spread kill path if those order classes are

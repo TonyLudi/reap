@@ -95,6 +95,38 @@ historical_trade_fill_fraction = 1.0
 displayed_depth_fill_fraction = 1.0
 ```
 
+Scalar latency values are backward-compatible fallbacks. To replay bounded
+uniform empirical samples by Java-mapped class and optional instrument, add:
+
+```toml
+[backtest.latency_profile]
+seed = 20260713
+
+[[backtest.latency_profile.rules]]
+class = "market_depth"
+samples_ms = [1, 1, 2, 3]
+
+[[backtest.latency_profile.rules]]
+class = "market_depth"
+symbol = "BTC-USDT-SWAP"
+samples_ms = [1, 2, 2, 4]
+
+[[backtest.latency_profile.rules]]
+class = "matching_new"
+samples_ms = [8, 10, 14, 25]
+```
+
+Rules support `market_depth`, `historical_trade`, `reference_data`,
+`matching_new`, `matching_cancel`, `order_update`, and `order_fill`. A symbol
+rule takes precedence over its class-wide rule, then the scalar field is used.
+Duplicate sample values preserve empirical weight. Rules, samples, symbols, and
+latency magnitudes are bounded and validated before replay. The deterministic
+sampler sorts values and couples a stable seed/class/symbol/event ordinal to a
+quantile. `latency_usage` reports actual count, total, minimum, maximum, and mean
+for every sampled class/symbol. Symbol rules must name a configured instrument,
+reference symbol, or instrument index symbol; unknown names fail construction
+instead of silently falling back.
+
 Raw replay orders the local event loop by persisted `recv_ts_ns`; CSV and
 normalized replay use event timestamps. The runner applies market data first
 when an activation or cancel is due at the same scheduler instant. It stops at
@@ -109,11 +141,14 @@ their exact nanosecond count and maximum; investigate large values separately
 from the analyzer's per-source monotonicity gate.
 
 `calibrated = true` is an evidence declaration, not a behavior switch. Set it
-only when the values are derived from representative target-host capture and
+only when the values are derived from representative target-host processing and
 demo order traces. Guessed values may be used with `calibrated = false` for
-sensitivity tests. Current values are global constants; archive the exact TOML,
-raw SHA-256, code revision, report, and the empirical distributions used to
-choose them. The example threshold is inherited from the pinned Java backtest:
+sensitivity tests. Raw replay already begins at persisted local `recv_ts_ns`, so
+do not add exchange-to-host receive delay again as market latency. Measure the
+additional receive-to-strategy path on the target host; use demo traces for
+matching, cancel, private order, and fill/account classes. Archive the exact
+TOML, raw SHA-256, code revision, report, and source distributions. The example
+threshold is inherited from the pinned Java backtest:
 a resting sell needs bid at least `order_px * (1 + threshold)`, while a resting
 buy needs ask at most `order_px * (1 - threshold)`. A shallower cross clears
 queue-ahead without filling. Zero latency and an inherited threshold preserve
@@ -179,8 +214,10 @@ For real research, create a new manifest alongside immutable capture files:
    evaluation. It also requires at least two connections per stream and the
    book/trade/index/mark/limit/funding channels needed by every candidate.
 4. Define exactly one baseline using empirically calibrated execution values
-   and at least two stress scenarios. Stress delays, threshold, and queue can
-   only increase; trade/depth participation can only decrease.
+   and at least two stress scenarios. Profile stress uses the same seed and must
+   first-order stochastically dominate baseline for every effective class/symbol
+   distribution. Threshold and queue can only increase; trade/depth
+   participation can only decrease.
 5. Set nonzero event, fill, and duration evidence minimums plus explicit PnL,
    drawdown, terminal/maximum position and pending-hedge delta,
    terminal/maximum gross position and active-order exposure, active-order
