@@ -576,7 +576,7 @@ impl LiveConfig {
         })
     }
 
-    pub(crate) fn position_policy_errors(
+    pub(crate) fn account_state_policy_errors(
         &self,
         account_id: &str,
         update: &AccountUpdate,
@@ -585,6 +585,16 @@ impl LiveConfig {
             return vec![format!("unknown account {account_id}")];
         };
         let mut errors = Vec::new();
+        for balance in &update.balances {
+            if let Some(indicator) = balance.forced_repayment_indicator
+                && indicator >= self.risk.forced_repayment_indicator_limit
+            {
+                errors.push(format!(
+                    "currency {} forced repayment indicator {} reached limit {}",
+                    balance.currency, indicator, self.risk.forced_repayment_indicator_limit
+                ));
+            }
+        }
         for position in update
             .positions
             .iter()

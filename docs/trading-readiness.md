@@ -13,7 +13,7 @@ production trading process.
 | Deterministic backtest/data | Shared strategy code, depth matching, queue-ahead model, fees, credential-free redundant public capture, create-new session files, and raw/normalized replay | Needs sustained full-depth capture and venue-data calibration before capital decisions |
 | Feed components | Redundant public sockets, isolated private sockets, transport/state freshness separation, account-plus-positions health rounds, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
 | Order components | Event-loop client IDs/registration, exchange-side place-request expiry, signed submit/cancel, pacing, monotonic private reduction, typed position margin mode, ambiguity handling, and full order/fill/balance/position REST reconciliation are composed | Needs demo exchange fault evidence |
-| Runtime risk | Instrument models, authoritative startup positions, configured position margin-mode enforcement, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed deadman/depeg/convergence evidence |
+| Runtime risk | Instrument models, authoritative startup positions, position scope/mode enforcement, forced-repayment blocking, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed deadman/depeg/convergence evidence |
 | Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, and strict bounded soak reports | Demo-capable; production entry intentionally unavailable |
 | Instrument/account bootstrap | Account instruments/config/balance/positions are typed; live spot is cash-only; nonzero positions require configured account ownership and derivative mode before strategy/risk application | Needs target-account certification |
 | Startup/restart gate | Executable phase state, engine-consumed account-snapshot invariant, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, durable latch restore, authoritative account repair, and second-pass clean REST reconciliation | Needs process-kill demo test |
@@ -123,14 +123,20 @@ production trading process.
     derivative owned by the account that produced the update. Unmodeled
     exposure aborts before strategy/risk application; zero closure rows remain
     admissible.
+23. OKX account balance `twap` is retained as a typed per-currency
+    forced-repayment indicator. Values at or above the configured `1..=5`
+    threshold abort bootstrap/runtime before state application, while REST
+    reconciliation compares lower values and authoritative tombstones clear
+    omitted currencies.
 
 ## Remaining Demo Gate
 
 1. Review `examples/live-okx-demo.toml` against the actual demo account and
    current fee tier. Confirm the subaccount has no margin-spot or unmanaged
    position and every nonzero derivative position has the configured owner and
-   margin mode. Enable and threshold `[host_guard]`, and route `[alerts]` to a
-   monitored test destination.
+   margin mode. Confirm every currency's forced-repayment indicator is below
+   the configured limit. Enable and threshold `[host_guard]`, and route
+   `[alerts]` to a monitored test destination.
 2. Run `observe` through reconnects and verify every account reaches `ready`
    with no reconciliation drift or critical storage backpressure. Use a bounded
    run with `--duration-secs <seconds> --require-clean-soak` so the result is

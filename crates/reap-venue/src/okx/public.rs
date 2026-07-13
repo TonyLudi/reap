@@ -366,6 +366,9 @@ impl OkxAdapter {
                             equity: parse_optional_f64("eq", &detail.equity)?,
                             liability: parse_optional_f64("liab", &detail.liability)?,
                             max_loan: parse_optional_f64("maxLoan", &detail.max_loan)?,
+                            forced_repayment_indicator: parse_forced_repayment_indicator(
+                                &detail.forced_repayment_indicator,
+                            )?,
                         })
                     })
                     .collect::<Result<Vec<_>, VenueError>>()?;
@@ -807,6 +810,8 @@ struct OkxBalance {
     liability: String,
     #[serde(default, rename = "maxLoan")]
     max_loan: String,
+    #[serde(default, rename = "twap")]
+    forced_repayment_indicator: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -889,6 +894,21 @@ fn parse_position_margin_mode(value: &str) -> Result<PositionMarginMode, VenueEr
             "invalid mgnMode {other:?}; expected cross or isolated"
         ))),
     }
+}
+
+fn parse_forced_repayment_indicator(value: &str) -> Result<Option<u8>, VenueError> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let indicator = value
+        .parse::<u8>()
+        .map_err(|error| OkxAdapter::invalid(format!("invalid twap {value:?}: {error}")))?;
+    if indicator > 5 {
+        return Err(OkxAdapter::invalid(format!(
+            "invalid twap {indicator}; expected 0 through 5"
+        )));
+    }
+    Ok(Some(indicator))
 }
 
 fn parse_f64(name: &str, value: &str) -> Result<f64, VenueError> {
@@ -1152,7 +1172,7 @@ mod tests {
         let adapter = OkxAdapter::default().with_account_id("main");
         let order = r#"{"arg":{"channel":"orders","instType":"ANY"},"data":[{"ordId":"123","clOrdId":"reap1","instId":"BTC-USDT","side":"buy","state":"partially_filled","px":"100","sz":"1","accFillSz":"0.4","avgPx":"99.5","fillSz":"0.4","fillPx":"99.5","execType":"M","tradeId":"fill1","uTime":"1000","fillTime":"1000"}]}"#;
         let fills = r#"{"arg":{"channel":"fills","instId":"BTC-USDT"},"data":[{"tradeId":"fill2","ordId":"123","clOrdId":"reap1","instId":"BTC-USDT","side":"buy","fillPx":"99.4","fillSz":"0.1","execType":"T","ts":"1001"}]}"#;
-        let account = r#"{"arg":{"channel":"account"},"data":[{"uTime":"1002","mgnRatio":"10","adjEq":"1000","notionalUsd":"100","details":[{"ccy":"USDT","cashBal":"1000","availBal":"900"}]}]}"#;
+        let account = r#"{"arg":{"channel":"account"},"data":[{"uTime":"1002","mgnRatio":"10","adjEq":"1000","notionalUsd":"100","details":[{"ccy":"USDT","cashBal":"1000","availBal":"900","twap":"2"}]}]}"#;
         let positions = r#"{"arg":{"channel":"positions","instType":"ANY"},"data":[{"instId":"BTC-USDT-SWAP","pos":"2","posSide":"short","mgnMode":"cross","avgPx":"50000","uTime":"1003"}]}"#;
 
         let order_events = adapter.parse(&envelope(Channel::Orders, order)).unwrap();
@@ -1183,6 +1203,7 @@ mod tests {
             VenueEvent::Account(AccountUpdate { ref balances, .. })
                 if balances[0].available == 900.0
                     && balances[0].account_id.as_deref() == Some("main")
+                    && balances[0].forced_repayment_indicator == Some(2)
         ));
         assert!(matches!(
             account_events[0].event,
@@ -1216,6 +1237,14 @@ mod tests {
                 .parse(&envelope(Channel::Positions, invalid))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn rejects_invalid_forced_repayment_indicator() {
+        let adapter = OkxAdapter::default().with_account_id("main");
+        let account = r#"{"arg":{"channel":"account"},"data":[{"uTime":"1002","details":[{"ccy":"USDT","twap":"6"}]}]}"#;
+
+        assert!(adapter.parse(&envelope(Channel::Account, account)).is_err());
     }
 
     #[test]

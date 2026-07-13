@@ -124,6 +124,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
   reconciliation.
 - [x] Enforce the modeled live-account boundary: cash-only spot routing and no
   nonzero position outside the configured account's derivative universe.
+- [x] Retain OKX balance `twap`, enforce a configured forced-repayment indicator
+  limit at bootstrap/runtime, clear it with authoritative tombstones, and
+  compare it during REST reconciliation.
 - [x] Reject crossed books and force fresh-snapshot recovery, matching the
   reviewed Java OKX subscriber behavior with explicit sequence validation.
 - [x] Add order `expTime`, startup/periodic exchange-clock validation, and an

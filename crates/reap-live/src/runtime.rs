@@ -3541,6 +3541,7 @@ mod tests {
                 equity: 10_000.0,
                 liability: 0.0,
                 max_loan: 0.0,
+                forced_repayment_indicator: None,
             }],
             positions: Vec::new(),
             margins: Vec::new(),

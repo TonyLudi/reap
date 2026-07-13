@@ -481,6 +481,8 @@ pub struct Balance {
     pub liability: Quantity,
     #[serde(default)]
     pub max_loan: Quantity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forced_repayment_indicator: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -640,7 +642,7 @@ pub fn round_down_to_lot(qty: Quantity, lot_size: f64) -> Quantity {
 
 #[cfg(test)]
 mod tests {
-    use super::{Channel, Position};
+    use super::{Balance, Channel, Position};
 
     #[test]
     fn okx_depth_variants_are_book_channels() {
@@ -661,6 +663,21 @@ mod tests {
             !serde_json::to_string(&position)
                 .unwrap()
                 .contains("margin_mode")
+        );
+    }
+
+    #[test]
+    fn forced_repayment_indicator_is_backward_compatible_with_existing_jsonl() {
+        let balance: Balance = serde_json::from_str(
+            r#"{"account_id":"main","currency":"USDT","total":100.0,"available":90.0,"equity":100.0,"liability":0.0,"max_loan":0.0}"#,
+        )
+        .unwrap();
+
+        assert_eq!(balance.forced_repayment_indicator, None);
+        assert!(
+            !serde_json::to_string(&balance)
+                .unwrap()
+                .contains("forced_repayment_indicator")
         );
     }
 }

@@ -112,14 +112,9 @@ pub fn verify_bootstrap(
         let account_update = snapshot.scoped_account_update(&account.id);
         errors.extend(
             config
-                .position_policy_errors(&account.id, &account_update)
+                .account_state_policy_errors(&account.id, &account_update)
                 .into_iter()
-                .map(|error| {
-                    format!(
-                        "account {} position margin mode mismatch: {error}",
-                        account.id
-                    )
-                }),
+                .map(|error| format!("account {} state policy violation: {error}", account.id)),
         );
         account_updates.insert(account.id.clone(), account_update);
         baseline_fill_ids.insert(
@@ -471,6 +466,7 @@ mod tests {
                     equity: 10_000.0,
                     liability: 0.0,
                     max_loan: 0.0,
+                    forced_repayment_indicator: None,
                 }],
                 positions: Vec::new(),
                 margins: vec![MarginSnapshot {
@@ -563,6 +559,22 @@ mod tests {
             error
                 .to_string()
                 .contains("unmanaged nonzero position ETH-USDT-SWAP qty=1")
+        );
+    }
+
+    #[test]
+    fn rejects_forced_repayment_indicator_at_limit() {
+        let config = config();
+        let mut snapshot = snapshot();
+        snapshot.balance.balances[0].forced_repayment_indicator = Some(1);
+
+        let error = verify_bootstrap(&config, &HashMap::from([("main".to_string(), snapshot)]))
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("currency USDT forced repayment indicator 1 reached limit 1")
         );
     }
 }

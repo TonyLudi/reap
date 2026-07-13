@@ -1080,6 +1080,9 @@ impl TryFrom<OkxAccountBalanceWire> for AccountUpdate {
                     equity: parse_optional_number("eq", &detail.equity)?,
                     liability: parse_optional_number("liab", &detail.liability)?,
                     max_loan: parse_optional_number("maxLoan", &detail.max_loan)?,
+                    forced_repayment_indicator: parse_forced_repayment_indicator(
+                        &detail.forced_repayment_indicator,
+                    )?,
                 })
             })
             .collect::<Result<Vec<_>, RestError>>()?;
@@ -1106,6 +1109,8 @@ struct OkxBalanceWire {
     liability: String,
     #[serde(default, rename = "maxLoan")]
     max_loan: String,
+    #[serde(default, rename = "twap")]
+    forced_repayment_indicator: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1324,6 +1329,27 @@ fn parse_position_margin_mode(value: &str) -> Result<PositionMarginMode, RestErr
             message: "expected cross or isolated".to_string(),
         }),
     }
+}
+
+fn parse_forced_repayment_indicator(value: &str) -> Result<Option<u8>, RestError> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let indicator = value
+        .parse::<u8>()
+        .map_err(|error| RestError::InvalidField {
+            field: "twap",
+            value: value.to_string(),
+            message: error.to_string(),
+        })?;
+    if indicator > 5 {
+        return Err(RestError::InvalidField {
+            field: "twap",
+            value: value.to_string(),
+            message: "expected 0 through 5".to_string(),
+        });
+    }
+    Ok(Some(indicator))
 }
 
 fn parse_state(value: &str) -> Result<PrivateOrderState, RestError> {
@@ -1677,7 +1703,7 @@ mod tests {
         let (client, requests) = client(vec![
             r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","instType":"SWAP","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"USDT","ctType":"linear","ctVal":"0.01","ctValCcy":"BTC","tickSz":"0.1","lotSz":"1","minSz":"1","state":"live"}]}"#,
             r#"{"code":"0","msg":"","data":[{"acctLv":"2","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"7","mainUid":"6"}]}"#,
-            r#"{"code":"0","msg":"","data":[{"uTime":"1000","mgnRatio":"12.5","adjEq":"10000","notionalUsd":"2000","details":[{"ccy":"USDT","cashBal":"9000","availBal":"8000","eq":"10000","liab":"0","maxLoan":"500"}]}]}"#,
+            r#"{"code":"0","msg":"","data":[{"uTime":"1000","mgnRatio":"12.5","adjEq":"10000","notionalUsd":"2000","details":[{"ccy":"USDT","cashBal":"9000","availBal":"8000","eq":"10000","liab":"0","maxLoan":"500","twap":"2"}]}]}"#,
             r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","pos":"2","posSide":"net","mgnMode":"cross","avgPx":"50000","uTime":"1001"}]}"#,
         ]);
 
@@ -1697,6 +1723,7 @@ mod tests {
         assert_eq!(account.account_level, OkxAccountLevel::SingleCurrencyMargin);
         assert_eq!(account.position_mode, OkxPositionMode::NetMode);
         assert_eq!(balance.balances[0].available, 8000.0);
+        assert_eq!(balance.balances[0].forced_repayment_indicator, Some(2));
         assert_eq!(balance.margins[0].exchange_ratio, Some(12.5));
         assert_eq!(positions.positions[0].qty, 2.0);
         assert_eq!(
@@ -1727,6 +1754,10 @@ mod tests {
         assert!(matches!(
             parse_number("px", "NaN"),
             Err(RestError::InvalidField { .. })
+        ));
+        assert!(matches!(
+            parse_forced_repayment_indicator("6"),
+            Err(RestError::InvalidField { field: "twap", .. })
         ));
     }
 

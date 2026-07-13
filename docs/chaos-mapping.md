@@ -125,6 +125,7 @@ The following differences do not change the covered quote/hedge calculations:
 | Batch subscription manager and retry limits | Bounded socket partitioning, acknowledgement timeout, exponential reconnect | Equivalent lifecycle with different batching policy |
 | `PositionGatewaySafeguard.OrsFillDelayToPositionUpdate` and the fill-derived position reconciler | Per-fill derivative-position or spot-currency convergence deadline plus monotonic rows, full REST comparison, tombstone repair, and second-pass confirmation | Equivalent fail-closed intent; Rust uses an explicit post-fill deadline rather than Java's two-cycle timestamp-difference check |
 | `PositionGatewaySafeguard.PosnMgnModeMismatch` | Required OKX `mgnMode` on websocket/REST positions, configured-mode bootstrap/runtime enforcement, and reconciliation comparison | Equivalent fail-closed intent; Rust aborts the live lifecycle instead of pausing inside a separate gateway process |
+| `PositionGatewaySafeguard.ForcedRepaymentIndicator` | Typed OKX balance `twap`, configured `1..=5` limit, bootstrap/runtime account-state rejection, tombstone clearing, and reconciliation comparison | Stronger: Java emits alert-only, while Rust fails closed at or above the configured level |
 | `ChaosStrategyEngine.tryToStop`, `ChaosStrategyBase.cancelAll(entity)`, and `ExchCancelAll` | In-process canonical cancel/reconcile plus a separate account-wide regular-order emergency CLI | Equivalent normal stop with an additional process-independent safety layer |
 
 The reviewed Java OKX subscriber and `chaos-iarb2` classes do not provide the
@@ -181,7 +182,9 @@ not copy Java's exact timer arithmetic: Rust explicitly waits for each fill's
 affected derivative position or both affected spot balances and reconciles the
 whole account on timeout. Each nonzero configured derivative position must also
 carry the configured `cross` or `isolated` mode; missing, unsupported, or
-mismatched mode fails before state application.
+mismatched mode fails before state application. Account balance `twap` is
+retained as a `0..=5` forced-repayment risk level; unlike Java's alert-only
+action, Reap fails the live lifecycle when it reaches the configured limit.
 
 ## Stablecoin Guard Cross-Check
 

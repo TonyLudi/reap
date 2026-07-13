@@ -90,8 +90,8 @@ pub enum CoordinatorError {
         actual: String,
         expected: String,
     },
-    #[error("account {account_id} position policy violation: {message}")]
-    PositionPolicy { account_id: String, message: String },
+    #[error("account {account_id} state policy violation: {message}")]
+    AccountStatePolicy { account_id: String, message: String },
     #[error(transparent)]
     Startup(#[from] StartupError),
 }
@@ -270,7 +270,7 @@ impl LiveCoordinator {
             }),
             FeedOutput::PrivateAccount { account_id, update } => {
                 let account_id = self.require_account_id(account_id)?;
-                self.ensure_position_margin_modes(&account_id, &update)?;
+                self.ensure_account_state_policy(&account_id, &update)?;
                 let mut update = update;
                 scope_account_update(&account_id, &mut update);
                 let Some(update) = self.private_state_mut(&account_id)?.reduce_account(update)
@@ -367,7 +367,7 @@ impl LiveCoordinator {
         if !self.manages_account(account_id) {
             return Err(CoordinatorError::UnknownAccount(account_id.to_string()));
         }
-        self.ensure_position_margin_modes(account_id, &update)?;
+        self.ensure_account_state_policy(account_id, &update)?;
         scope_account_update(account_id, &mut update);
         let update = self
             .private_state_mut(account_id)?
@@ -385,16 +385,16 @@ impl LiveCoordinator {
         self.process_normalized(event)
     }
 
-    fn ensure_position_margin_modes(
+    fn ensure_account_state_policy(
         &self,
         account_id: &str,
         update: &reap_core::AccountUpdate,
     ) -> Result<(), CoordinatorError> {
-        let errors = self.config.position_policy_errors(account_id, update);
+        let errors = self.config.account_state_policy_errors(account_id, update);
         if errors.is_empty() {
             Ok(())
         } else {
-            Err(CoordinatorError::PositionPolicy {
+            Err(CoordinatorError::AccountStatePolicy {
                 account_id: account_id.to_string(),
                 message: errors.join(", "),
             })
@@ -1173,6 +1173,7 @@ mod tests {
                         equity: 10_000.0,
                         liability: 0.0,
                         max_loan: 0.0,
+                        forced_repayment_indicator: None,
                     }],
                     positions: Vec::new(),
                     margins: Vec::new(),
@@ -1264,6 +1265,7 @@ mod tests {
                 equity: 10_000.0,
                 liability: 0.0,
                 max_loan: 0.0,
+                forced_repayment_indicator: None,
             }],
             positions: Vec::new(),
             margins: Vec::new(),
@@ -1286,6 +1288,7 @@ mod tests {
                         equity: 10_000.0,
                         liability: 0.0,
                         max_loan: 0.0,
+                        forced_repayment_indicator: None,
                     }],
                     positions: Vec::new(),
                     margins: Vec::new(),
@@ -1469,7 +1472,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            CoordinatorError::PositionPolicy { ref account_id, ref message }
+            CoordinatorError::AccountStatePolicy { ref account_id, ref message }
                 if account_id == "main"
                     && message.contains("BTC-PERP expected Cross, received Isolated")
         ));
@@ -1482,7 +1485,7 @@ mod tests {
         );
         assert!(matches!(
             coordinator.apply_authoritative_account_snapshot("main", wrong_mode),
-            Err(CoordinatorError::PositionPolicy { .. })
+            Err(CoordinatorError::AccountStatePolicy { .. })
         ));
 
         coordinator
@@ -1520,7 +1523,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             error,
-            CoordinatorError::PositionPolicy { ref message, .. }
+            CoordinatorError::AccountStatePolicy { ref message, .. }
                 if message.contains("unmanaged nonzero position ETH-USDT-SWAP qty=1")
         ));
 
@@ -1540,6 +1543,27 @@ mod tests {
                 },
             })
             .unwrap();
+
+        let mut forced_repayment = account_update("main", 7);
+        forced_repayment.balances[0].total = 9_000.0;
+        forced_repayment.balances[0].forced_repayment_indicator = Some(1);
+        let error = coordinator
+            .process_feed(FeedOutput::PrivateAccount {
+                account_id: Some("main".to_string()),
+                update: forced_repayment,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CoordinatorError::AccountStatePolicy { ref message, .. }
+                if message.contains(
+                    "currency USDT forced repayment indicator 1 reached limit 1"
+                )
+        ));
+        assert_eq!(
+            coordinator.private_state("main").unwrap().balances()["USDT"].total,
+            10_000.0
+        );
     }
 
     #[test]

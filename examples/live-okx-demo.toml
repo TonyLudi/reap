@@ -72,6 +72,7 @@ require_feed_health = true
 require_private_health = true
 stablecoin_max_age_ms = 75000
 stablecoin_breach_debounce_ms = 5000
+forced_repayment_indicator_limit = 1
 
 [[risk.stablecoin_guards]]
 symbol = "USDT-USD"

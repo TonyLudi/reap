@@ -206,6 +206,7 @@ impl PrivateStateReducer {
             balance.equity = 0.0;
             balance.liability = 0.0;
             balance.max_loan = 0.0;
+            balance.forced_repayment_indicator = None;
             update.balances.push(balance);
         }
 
@@ -548,6 +549,7 @@ mod tests {
                 equity: 100.0,
                 liability: 0.0,
                 max_loan: 0.0,
+                forced_repayment_indicator: None,
             }],
             positions: vec![Position {
                 symbol: "BTC-USDT-SWAP".to_string(),
@@ -576,6 +578,7 @@ mod tests {
                     equity: 2.0,
                     liability: 0.0,
                     max_loan: 0.0,
+                    forced_repayment_indicator: Some(2),
                 },
                 Balance {
                     account_id: Some("main".to_string()),
@@ -585,6 +588,7 @@ mod tests {
                     equity: 100.0,
                     liability: 0.0,
                     max_loan: 0.0,
+                    forced_repayment_indicator: None,
                 },
             ],
             positions: vec![Position {
@@ -606,6 +610,7 @@ mod tests {
                 equity: 101.0,
                 liability: 0.0,
                 max_loan: 0.0,
+                forced_repayment_indicator: None,
             }],
             positions: Vec::new(),
             margins: Vec::new(),
@@ -619,6 +624,7 @@ mod tests {
                 && balance.total == 0.0
                 && balance.available == 0.0
                 && balance.equity == 0.0
+                && balance.forced_repayment_indicator.is_none()
         }));
         assert!(applied.positions.iter().any(|position| {
             position.symbol == "BTC-USDT-SWAP" && position.qty == 0.0 && position.avg_price == 0.0

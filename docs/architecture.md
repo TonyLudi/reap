@@ -223,6 +223,9 @@ Responsibilities:
 - Strict position ownership at the live boundary: spot routing is cash-only,
   and a nonzero position must be a configured derivative owned by the account
   that delivered it. Unmodeled exposure is never passed into strategy/risk.
+- Typed per-currency forced-repayment indicator from account websocket and REST
+  state, checked against the live risk threshold before account state is
+  accepted and compared during reconciliation.
 - Missed cancel and unknown-order handling.
 
 Strategy code sends intents. The order layer owns what actually happened.

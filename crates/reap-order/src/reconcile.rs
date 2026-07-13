@@ -265,6 +265,16 @@ fn compare_balance(issues: &mut Vec<ReconcileIssue>, local: &Balance, remote: &B
             });
         }
     }
+    let local_indicator = local.forced_repayment_indicator.unwrap_or(0);
+    let remote_indicator = remote.forced_repayment_indicator.unwrap_or(0);
+    if local_indicator != remote_indicator {
+        issues.push(ReconcileIssue::BalanceMismatch {
+            currency: local.currency.clone(),
+            field: "forced_repayment_indicator".to_string(),
+            local: local_indicator.to_string(),
+            remote: remote_indicator.to_string(),
+        });
+    }
 }
 
 fn compare_position(issues: &mut Vec<ReconcileIssue>, local: &Position, remote: &Position) {
@@ -415,6 +425,7 @@ mod tests {
                 equity: 100.0,
                 liability: 0.0,
                 max_loan: 10.0,
+                forced_repayment_indicator: None,
             }],
             positions: vec![Position {
                 symbol: "BTC-USDT-SWAP".to_string(),
@@ -434,6 +445,7 @@ mod tests {
                 equity: 100.0,
                 liability: 0.0,
                 max_loan: 10.0,
+                forced_repayment_indicator: None,
             }],
             positions: vec![Position {
                 symbol: "BTC-USDT-SWAP".to_string(),
@@ -483,6 +495,49 @@ mod tests {
     }
 
     #[test]
+    fn full_state_reconciliation_reports_forced_repayment_indicator_drift() {
+        let mut local = PrivateStateReducer::new();
+        local.apply_account(AccountUpdate {
+            ts_ms: 1,
+            balances: vec![Balance {
+                account_id: Some("main".to_string()),
+                currency: "USDT".to_string(),
+                total: 100.0,
+                available: 90.0,
+                equity: 100.0,
+                liability: 0.0,
+                max_loan: 0.0,
+                forced_repayment_indicator: Some(1),
+            }],
+            positions: Vec::new(),
+            margins: Vec::new(),
+        });
+        let remote = AccountUpdate {
+            ts_ms: 2,
+            balances: vec![Balance {
+                account_id: None,
+                currency: "USDT".to_string(),
+                total: 100.0,
+                available: 90.0,
+                equity: 100.0,
+                liability: 0.0,
+                max_loan: 0.0,
+                forced_repayment_indicator: Some(2),
+            }],
+            positions: Vec::new(),
+            margins: Vec::new(),
+        };
+
+        let report = reconcile_full_state(&local, &[], &[], &remote);
+
+        assert!(report.issues.iter().any(|issue| matches!(
+            issue,
+            ReconcileIssue::BalanceMismatch { currency, field, .. }
+                if currency == "USDT" && field == "forced_repayment_indicator"
+        )));
+    }
+
+    #[test]
     fn full_state_reconciliation_reports_closed_and_changed_rows() {
         let mut local = PrivateStateReducer::new();
         local.apply_account(AccountUpdate {
@@ -495,6 +550,7 @@ mod tests {
                 equity: 1.0,
                 liability: 0.0,
                 max_loan: 0.0,
+                forced_repayment_indicator: None,
             }],
             positions: vec![Position {
                 symbol: "BTC-USDT-SWAP".to_string(),
@@ -514,6 +570,7 @@ mod tests {
                 equity: 1.5,
                 liability: 0.0,
                 max_loan: 0.0,
+                forced_repayment_indicator: None,
             }],
             positions: Vec::new(),
             margins: Vec::new(),

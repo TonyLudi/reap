@@ -230,6 +230,22 @@ settings; accepting only their static flags would weaken live stop behavior.
   close or correct the OKX position outside Reap, and start again from a clean
   bootstrap. Use a dedicated subaccount for this strategy.
 
+## Forced Repayment Risk
+
+- OKX account websocket and REST balance rows expose `twap`, a forced-repayment
+  risk indicator from `0` through `5`. Reap retains the per-currency value; see
+  the current [OKX balance contract](https://www.okx.com/docs-v5/en/#trading-account-rest-api-get-balance).
+- Set `risk.forced_repayment_indicator_limit` to `1..=5`. The default and demo
+  baseline are `1`, so any nonzero indicator blocks bootstrap or aborts the
+  running live lifecycle before applying that account row.
+- This is intentionally stricter than the pinned Java safeguard, which is
+  alert-only. Demo cleanup enters the normal cancel/reconciliation path and
+  leaves Cancel All After armed unless it proves zero orders and clean state.
+- REST reconciliation compares the websocket and REST indicator, treating an
+  omitted value as zero. An authoritative omitted-currency tombstone clears a
+  prior value. Keep entry stopped until OKX reports every currency below the
+  configured limit and a clean bootstrap succeeds.
+
 ## Stablecoin Depeg Guard
 
 - Configure `[[risk.stablecoin_guards]]` with the OKX index symbol and maximum
@@ -445,6 +461,7 @@ replacement for exchange-side account limits and operator access controls.
 | Private stream stale | Account blocked; live orders cancelled | Reconnect, REST reconcile orders/fills/balances/positions, then emit recovery |
 | Fill/account-state convergence timeout | Account blocked; live orders cancelled; full reconciliation requested | Inspect the missing symbol/currency target and private-channel latency, then require authoritative repair and a clean pass |
 | Position scope or margin-mode violation | Bootstrap/runtime abort; demo cleanup attempts cancel/reconcile and retains the deadman unless safe | Keep entry disabled; close/correct the unmodeled position or mode outside Reap, then require a clean bootstrap |
+| Forced-repayment indicator at/above limit | Bootstrap/runtime abort; demo cleanup attempts cancel/reconcile and retains the deadman unless safe | Keep entry disabled; reduce borrowing/risk outside Reap and require all currencies below limit plus a clean bootstrap |
 | Reconcile drift | Account blocked; live orders cancelled | Inspect the recorded full-state differences and require a later clean pass before recovery |
 | Stablecoin reference missing/stale/conflicting/depegged | New entry blocked immediately; durable global kill and live-order cancellation after debounce | Verify both redundant index routes and an independent venue reference; use the stopped-process latch-clear procedure after a sustained breach |
 | Risk breach | Durable global kill active; live orders cancelled | Reduce exposure externally if needed, diagnose, and follow the stopped-process latch-clear procedure; restart alone does not clear it |

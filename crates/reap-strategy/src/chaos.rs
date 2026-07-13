@@ -5709,6 +5709,7 @@ mod tests {
                     equity: 31.0,
                     liability: 0.5,
                     max_loan: 1.0,
+                    forced_repayment_indicator: None,
                 },
                 Balance {
                     account_id: None,
@@ -5718,6 +5719,7 @@ mod tests {
                     equity: 1_000_000.0,
                     liability: 0.0,
                     max_loan: 0.0,
+                    forced_repayment_indicator: None,
                 },
             ],
             positions: Vec::new(),

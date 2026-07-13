@@ -37,6 +37,7 @@ pub struct RiskLimits {
     pub stablecoin_guards: Vec<StablecoinGuardConfig>,
     pub stablecoin_max_age_ms: TimeMs,
     pub stablecoin_breach_debounce_ms: TimeMs,
+    pub forced_repayment_indicator_limit: u8,
 }
 
 impl Default for RiskLimits {
@@ -54,6 +55,7 @@ impl Default for RiskLimits {
             stablecoin_guards: Vec::new(),
             stablecoin_max_age_ms: 75_000,
             stablecoin_breach_debounce_ms: 5_000,
+            forced_repayment_indicator_limit: 1,
         }
     }
 }
@@ -88,6 +90,9 @@ impl RiskLimits {
         }
         if self.stablecoin_breach_debounce_ms == 0 {
             return Some("stablecoin_breach_debounce_ms must be positive".to_string());
+        }
+        if !(1..=5).contains(&self.forced_repayment_indicator_limit) {
+            return Some("forced_repayment_indicator_limit must be between 1 and 5".to_string());
         }
         let mut symbols = HashSet::new();
         for guard in &self.stablecoin_guards {
@@ -484,6 +489,23 @@ impl RiskGate {
     }
 
     pub fn on_account_update(&mut self, update: &AccountUpdate) -> PostTradeOutcome {
+        if let Some(balance) = update.balances.iter().find(|balance| {
+            balance
+                .forced_repayment_indicator
+                .is_some_and(|indicator| indicator >= self.limits.forced_repayment_indicator_limit)
+        }) {
+            let indicator = balance
+                .forced_repayment_indicator
+                .expect("forced repayment predicate requires an indicator");
+            return self.activate_risk_breach(
+                update.ts_ms,
+                None,
+                format!(
+                    "currency {} forced repayment indicator {} reached limit {}",
+                    balance.currency, indicator, self.limits.forced_repayment_indicator_limit
+                ),
+            );
+        }
         for position in &update.positions {
             self.positions.insert(position.symbol.clone(), position.qty);
         }
@@ -1151,6 +1173,52 @@ mod tests {
             ..RiskLimits::default()
         };
         assert!(invalid_threshold.validation_error().is_some());
+
+        for limit in [0, 6] {
+            let invalid_indicator = RiskLimits {
+                forced_repayment_indicator_limit: limit,
+                ..RiskLimits::default()
+            };
+            assert!(
+                invalid_indicator
+                    .validation_error()
+                    .is_some_and(|error| error.contains("between 1 and 5"))
+            );
+        }
+    }
+
+    #[test]
+    fn forced_repayment_indicator_fails_closed_before_account_state_application() {
+        let mut gate = ready_gate();
+        let outcome = gate.on_account_update(&AccountUpdate {
+            ts_ms: 101,
+            balances: vec![reap_core::Balance {
+                account_id: Some("main".to_string()),
+                currency: "USDT".to_string(),
+                total: 100.0,
+                available: 90.0,
+                equity: 100.0,
+                liability: 10.0,
+                max_loan: 100.0,
+                forced_repayment_indicator: Some(1),
+            }],
+            positions: vec![reap_core::Position {
+                symbol: "BTC-USDT".to_string(),
+                qty: 2.0,
+                avg_price: 100.0,
+                margin_mode: None,
+            }],
+            margins: Vec::new(),
+        });
+
+        assert!(gate.is_killed());
+        assert_eq!(gate.position("BTC-USDT"), 0.0);
+        assert!(outcome.events.iter().any(|event| {
+            event.kind == SystemEventKind::RiskBreach
+                && event
+                    .reason
+                    .contains("forced repayment indicator 1 reached limit 1")
+        }));
     }
 
     #[test]
