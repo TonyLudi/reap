@@ -123,8 +123,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
   both projected pre-trade state and authoritative post-trade order state.
 - [x] Add Java-referenced rolling global/per-symbol exchange submit-rejection
   thresholds that persist the global risk latch and cancel active orders.
-- [ ] Add a rolling per-symbol unfilled-IOC cancellation threshold or prove an
-  equivalent fail-closed policy from the chaos missed-hedge state.
+- [x] Add a deduplicated rolling per-symbol zero-fill IOC cancellation threshold
+  that preserves local time-in-force through canonical private order updates,
+  persists the global risk latch, and cancels active orders.
 - [x] Require every canonical derivative fill to converge to its position row
   and every spot fill to both currency balances within a configured deadline;
   fail closed and reconcile the account on timeout.

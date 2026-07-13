@@ -377,6 +377,8 @@ pub struct OrderUpdate {
     pub event: OrderEvent,
     pub status: OrderStatus,
     pub price: Price,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_in_force: Option<TimeInForce>,
     pub qty: Quantity,
     pub open_qty: Quantity,
     pub filled_qty: Quantity,
@@ -642,7 +644,7 @@ pub fn round_down_to_lot(qty: Quantity, lot_size: f64) -> Quantity {
 
 #[cfg(test)]
 mod tests {
-    use super::{Balance, Channel, Position};
+    use super::{Balance, Channel, OrderUpdate, Position};
 
     #[test]
     fn okx_depth_variants_are_book_channels() {
@@ -678,6 +680,21 @@ mod tests {
             !serde_json::to_string(&balance)
                 .unwrap()
                 .contains("forced_repayment_indicator")
+        );
+    }
+
+    #[test]
+    fn order_time_in_force_is_backward_compatible_with_existing_jsonl() {
+        let update: OrderUpdate = serde_json::from_str(
+            r#"{"ts_ms":1,"order_id":"order-1","symbol":"BTC-USDT","side":"buy","event":"new","status":"live","price":100.0,"qty":1.0,"open_qty":1.0,"filled_qty":0.0,"avg_fill_price":0.0,"last_fill_qty":0.0,"last_fill_price":0.0,"last_fill_liquidity":null,"reason":"quote"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(update.time_in_force, None);
+        assert!(
+            !serde_json::to_string(&update)
+                .unwrap()
+                .contains("time_in_force")
         );
     }
 }

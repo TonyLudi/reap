@@ -338,6 +338,7 @@ impl PrivateStateReducer {
             event,
             status,
             price,
+            time_in_force: existing.as_ref().and_then(|order| order.time_in_force),
             qty,
             open_qty: (qty - cumulative).max(0.0),
             filled_qty: cumulative,
@@ -422,6 +423,7 @@ impl PrivateStateReducer {
             },
             status,
             price: existing.price,
+            time_in_force: existing.time_in_force,
             qty: existing.qty,
             open_qty,
             filled_qty: cumulative,
@@ -530,6 +532,7 @@ mod tests {
         let update = reducer.apply_order(private_fill()).unwrap();
 
         assert_eq!(update.reason, "quote:1");
+        assert_eq!(update.time_in_force, Some(reap_core::TimeInForce::PostOnly));
         assert_eq!(
             reducer.order_reducer().get("client-1").unwrap().reason,
             "quote:1"

@@ -520,6 +520,7 @@ mod tests {
             event: OrderEvent::PartialFill,
             status: OrderStatus::PartiallyFilled,
             price: 100.0,
+            time_in_force: None,
             qty: 2.0,
             open_qty: 1.0,
             filled_qty: 1.0,
@@ -540,6 +541,7 @@ mod tests {
             event,
             status,
             price: 100.0,
+            time_in_force: None,
             qty: 1.0,
             open_qty: if status == OrderStatus::Filled {
                 0.0

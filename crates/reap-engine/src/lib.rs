@@ -188,6 +188,7 @@ mod tests {
             event: OrderEvent::New,
             status: OrderStatus::Live,
             price: 100.0,
+            time_in_force: Some(TimeInForce::PostOnly),
             qty: 1.0,
             open_qty: 1.0,
             filled_qty: 0.0,

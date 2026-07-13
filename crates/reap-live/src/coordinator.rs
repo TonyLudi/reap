@@ -1389,6 +1389,30 @@ mod tests {
         }
     }
 
+    fn cancelled_private_order(
+        client_order_id: &str,
+        exchange_order_id: &str,
+        ts_ms: TimeMs,
+    ) -> PrivateOrderUpdate {
+        PrivateOrderUpdate {
+            ts_ms,
+            exchange_order_id: exchange_order_id.to_string(),
+            client_order_id: client_order_id.to_string(),
+            symbol: "BTC-USDT".to_string(),
+            side: Side::Buy,
+            state: PrivateOrderState::Cancelled,
+            price: 100.0,
+            qty: 0.1,
+            cumulative_filled_qty: 0.0,
+            average_fill_price: 0.0,
+            last_fill_qty: 0.0,
+            last_fill_price: 0.0,
+            liquidity: None,
+            fill_id: None,
+            reject_reason: String::new(),
+        }
+    }
+
     #[test]
     fn account_snapshot_is_ready_only_after_the_engine_consumes_it() {
         let mut coordinator = coordinator();
@@ -1897,6 +1921,7 @@ mod tests {
                     event: OrderEvent::New,
                     status: OrderStatus::Live,
                     price: 100.0,
+                    time_in_force: Some(TimeInForce::PostOnly),
                     qty: 1.0,
                     open_qty: 1.0,
                     filled_qty: 0.0,
@@ -1937,6 +1962,105 @@ mod tests {
                     && latch.scope == SafetyLatchScope::Global
                     && latch.source == SafetyLatchSource::Risk
                     && latch.reason.contains("order rejection count 2 reached limit 2")
+        )));
+        assert!(second.actions.iter().any(|action| matches!(
+            action,
+            LiveAction::Cancel(cancel) if cancel.client_order_id == "live-order"
+        )));
+    }
+
+    #[test]
+    fn repeated_unfilled_ioc_cancels_persist_risk_latch_and_cancel_live_orders() {
+        let mut coordinator = coordinator_with_risk(
+            true,
+            RiskLimits {
+                require_feed_health: false,
+                require_private_health: false,
+                unfilled_ioc_cancel_count_per_symbol_limit: 2,
+                unfilled_ioc_cancel_window_ms: 60_000,
+                ..RiskLimits::default()
+            },
+        );
+        ready(&mut coordinator);
+        coordinator
+            .restore_order(
+                "main",
+                OrderUpdate {
+                    ts_ms: 2,
+                    order_id: "live-order".to_string(),
+                    symbol: "BTC-USDT".to_string(),
+                    side: Side::Sell,
+                    event: OrderEvent::New,
+                    status: OrderStatus::Live,
+                    price: 101.0,
+                    time_in_force: Some(TimeInForce::PostOnly),
+                    qty: 0.1,
+                    open_qty: 0.1,
+                    filled_qty: 0.0,
+                    avg_fill_price: 0.0,
+                    last_fill_qty: 0.0,
+                    last_fill_price: 0.0,
+                    last_fill_liquidity: None,
+                    reason: "quote".to_string(),
+                },
+            )
+            .unwrap();
+
+        let mut ioc = order();
+        ioc.time_in_force = TimeInForce::Ioc;
+        ioc.reason = "hedge:BTC-USDT:100".to_string();
+        coordinator
+            .register_local_order("main", "ioc-1", ioc.clone(), 3)
+            .unwrap();
+        let first_cancel = cancelled_private_order("ioc-1", "exchange-ioc-1", 4);
+        let first = coordinator
+            .process_feed(FeedOutput::PrivateOrder {
+                account_id: Some("main".to_string()),
+                update: first_cancel.clone(),
+            })
+            .unwrap();
+        assert!(!coordinator.kill_switch_active());
+        assert!(first.records.iter().any(|record| matches!(
+            record,
+            StorageRecord::Order { update, .. }
+                if update.order_id == "ioc-1"
+                    && update.status == OrderStatus::Cancelled
+                    && update.time_in_force == Some(TimeInForce::Ioc)
+        )));
+        let duplicate = coordinator
+            .process_feed(FeedOutput::PrivateOrder {
+                account_id: Some("main".to_string()),
+                update: first_cancel,
+            })
+            .unwrap();
+        assert!(!coordinator.kill_switch_active());
+        assert!(
+            !duplicate
+                .records
+                .iter()
+                .any(|record| matches!(record, StorageRecord::SafetyLatch(_)))
+        );
+
+        coordinator
+            .register_local_order("main", "ioc-2", ioc, 5)
+            .unwrap();
+        let second = coordinator
+            .process_feed(FeedOutput::PrivateOrder {
+                account_id: Some("main".to_string()),
+                update: cancelled_private_order("ioc-2", "exchange-ioc-2", 6),
+            })
+            .unwrap();
+
+        assert!(coordinator.kill_switch_active());
+        assert!(second.records.iter().any(|record| matches!(
+            record,
+            StorageRecord::SafetyLatch(latch)
+                if latch.active
+                    && latch.scope == SafetyLatchScope::Global
+                    && latch.source == SafetyLatchSource::Risk
+                    && latch.reason.contains(
+                        "symbol BTC-USDT unfilled IOC cancellation count 2 reached limit 2"
+                    )
         )));
         assert!(second.actions.iter().any(|action| matches!(
             action,
@@ -2052,6 +2176,7 @@ mod tests {
             event: OrderEvent::New,
             status: OrderStatus::Live,
             price: 100.0,
+            time_in_force: Some(TimeInForce::PostOnly),
             qty: 1.0,
             open_qty: 1.0,
             filled_qty: 0.0,

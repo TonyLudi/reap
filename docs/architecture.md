@@ -243,7 +243,8 @@ Responsibilities:
 
 - Static config sanity checks.
 - Notional, delta, global/per-symbol active-order count, live-order notional,
-  rolling exchange-rejection, turnover, and drawdown limits.
+  rolling exchange-rejection and unfilled-IOC cancellation, turnover, and
+  drawdown limits.
 - Global kill switch and symbol isolation controls.
 - Freshness, integrity, and downside-depeg guards for configured stablecoin/USD
   references.

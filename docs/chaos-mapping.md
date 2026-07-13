@@ -51,7 +51,8 @@ control plane.
 | OKX exchange CMR and calculated portfolio margin checks | Separate margin fields and debouncers | Exact |
 | Balance sheet, turnover, live size, PnL, margin, index, and basis checks | `check_risk_limits` and debounced conditions | Exact |
 | `EntityOpenOrderSafeguard.EntityMaxOpenOrder` | Projected pre-trade and authoritative post-trade global/per-symbol active-order count limits | Equivalent per-symbol containment with an additional global ceiling; Rust post-trade breach latches globally |
-| `GatewayOrderStatsSafeguard` submit-rejection controls (`OrderMaxReject`, `SymbolMaxReject`, and total reject scopes) | Deduplicated rolling global/per-symbol canonical `Rejected` order thresholds | Equivalent submit-reject containment with a stricter durable global latch; amend is unsupported, cancel failures reconcile immediately, and rolling IOC-cancel threshold remains open |
+| `GatewayOrderStatsSafeguard` submit-rejection controls (`OrderMaxReject`, `SymbolMaxReject`, and total reject scopes) | Deduplicated rolling global/per-symbol canonical `Rejected` order thresholds | Equivalent submit-reject containment with a stricter durable global latch; amend is unsupported and cancel failures reconcile immediately |
+| `GatewayOrderStatsSafeguard.SymbolMaxIOCCancelled` | Deduplicated rolling per-symbol canonical IOC `Cancelled` thresholds when cumulative fill is exactly zero | Equivalent Java zero-fill semantics with multi-socket duplicate suppression and a stricter durable global latch |
 | `StableCoinDepegCheckerImpl`, startup stablecoin check, and 5-second runtime debounce | `StablecoinGuardConfig`, `RiskGate`, and stablecoin-aware `StartupGate` | Equivalent with stricter immediate entry blocking and durable live latch |
 | Java startup basis limit of one third | Startup basis check | Exact |
 | Java runtime basis return value being diagnostic only | `basis_breaches` without runtime halt | Exact |

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use reap_core::{
     AccountUpdate, MarketEvent, NormalizedEvent, OrderIntent, OrderStatus, OrderUpdate, Symbol,
-    SystemEvent, SystemEventKind, TimeMs, Venue,
+    SystemEvent, SystemEventKind, TimeInForce, TimeMs, Venue,
 };
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +33,8 @@ pub struct RiskLimits {
     pub order_reject_count_limit: usize,
     pub order_reject_count_per_symbol_limit: usize,
     pub order_reject_window_ms: TimeMs,
+    pub unfilled_ioc_cancel_count_per_symbol_limit: usize,
+    pub unfilled_ioc_cancel_window_ms: TimeMs,
     pub max_turnover_usd: f64,
     pub max_drawdown_usd: f64,
     pub max_feed_age_ms: TimeMs,
@@ -56,6 +58,8 @@ impl Default for RiskLimits {
             order_reject_count_limit: 10,
             order_reject_count_per_symbol_limit: 5,
             order_reject_window_ms: 60_000,
+            unfilled_ioc_cancel_count_per_symbol_limit: 10,
+            unfilled_ioc_cancel_window_ms: 60_000,
             max_turnover_usd: 1_000_000.0,
             max_drawdown_usd: 10_000.0,
             max_feed_age_ms: 1_000,
@@ -126,6 +130,12 @@ impl RiskLimits {
         }
         if self.order_reject_window_ms == 0 {
             return Some("order_reject_window_ms must be positive".to_string());
+        }
+        if self.unfilled_ioc_cancel_count_per_symbol_limit == 0 {
+            return Some("unfilled_ioc_cancel_count_per_symbol_limit must be positive".to_string());
+        }
+        if self.unfilled_ioc_cancel_window_ms == 0 {
+            return Some("unfilled_ioc_cancel_window_ms must be positive".to_string());
         }
         if !(1..=5).contains(&self.forced_repayment_indicator_limit) {
             return Some("forced_repayment_indicator_limit must be between 1 and 5".to_string());
@@ -290,6 +300,9 @@ pub struct RiskGate {
     order_rejections: VecDeque<OrderRejection>,
     rejected_order_ids: HashSet<String>,
     last_order_rejection_ms: TimeMs,
+    unfilled_ioc_cancellations: VecDeque<UnfilledIocCancellation>,
+    unfilled_ioc_cancelled_order_ids: HashSet<String>,
+    last_unfilled_ioc_cancel_ms: TimeMs,
     turnover_usd: f64,
     equity_usd: f64,
     equity_by_account: HashMap<Option<String>, f64>,
@@ -317,6 +330,9 @@ impl RiskGate {
             order_rejections: VecDeque::new(),
             rejected_order_ids: HashSet::new(),
             last_order_rejection_ms: 0,
+            unfilled_ioc_cancellations: VecDeque::new(),
+            unfilled_ioc_cancelled_order_ids: HashSet::new(),
+            last_unfilled_ioc_cancel_ms: 0,
             turnover_usd: 0.0,
             equity_usd: 0.0,
             equity_by_account: HashMap::new(),
@@ -530,11 +546,19 @@ impl RiskGate {
                     .notional_usd(update.last_fill_qty, update.last_fill_price);
             }
         }
-        if self.kill_switch.is_none()
-            && update.status == OrderStatus::Rejected
-            && let Some((symbol, reason)) = self.observe_order_rejection(update)
-        {
-            return self.activate_risk_breach(update.ts_ms, symbol, reason);
+        if self.kill_switch.is_none() {
+            if update.status == OrderStatus::Rejected
+                && let Some((symbol, reason)) = self.observe_order_rejection(update)
+            {
+                return self.activate_risk_breach(update.ts_ms, symbol, reason);
+            }
+            if update.status == OrderStatus::Cancelled
+                && update.time_in_force == Some(TimeInForce::Ioc)
+                && update.filled_qty == 0.0
+                && let Some((symbol, reason)) = self.observe_unfilled_ioc_cancel(update)
+            {
+                return self.activate_risk_breach(update.ts_ms, symbol, reason);
+            }
         }
         self.evaluate_post_trade(update.ts_ms, Some(&update.symbol))
     }
@@ -592,6 +616,60 @@ impl RiskGate {
                     self.limits.order_reject_window_ms,
                     update.order_id,
                     update.symbol
+                ),
+            )
+        })
+    }
+
+    fn observe_unfilled_ioc_cancel(
+        &mut self,
+        update: &OrderUpdate,
+    ) -> Option<(Option<Symbol>, String)> {
+        let now_ms = self.last_unfilled_ioc_cancel_ms.max(update.ts_ms);
+        self.last_unfilled_ioc_cancel_ms = now_ms;
+        while self
+            .unfilled_ioc_cancellations
+            .front()
+            .is_some_and(|cancellation| {
+                now_ms.saturating_sub(cancellation.ts_ms)
+                    > self.limits.unfilled_ioc_cancel_window_ms
+            })
+        {
+            let expired = self
+                .unfilled_ioc_cancellations
+                .pop_front()
+                .expect("front IOC cancellation was present");
+            self.unfilled_ioc_cancelled_order_ids
+                .remove(&expired.order_id);
+        }
+        if !self
+            .unfilled_ioc_cancelled_order_ids
+            .insert(update.order_id.clone())
+        {
+            return None;
+        }
+        self.unfilled_ioc_cancellations
+            .push_back(UnfilledIocCancellation {
+                ts_ms: now_ms,
+                order_id: update.order_id.clone(),
+                symbol: update.symbol.clone(),
+            });
+
+        let symbol_count = self
+            .unfilled_ioc_cancellations
+            .iter()
+            .filter(|cancellation| cancellation.symbol == update.symbol)
+            .count();
+        (symbol_count >= self.limits.unfilled_ioc_cancel_count_per_symbol_limit).then(|| {
+            (
+                Some(update.symbol.clone()),
+                format!(
+                    "symbol {} unfilled IOC cancellation count {} reached limit {} in {}ms; latest_order={}",
+                    update.symbol,
+                    symbol_count,
+                    self.limits.unfilled_ioc_cancel_count_per_symbol_limit,
+                    self.limits.unfilled_ioc_cancel_window_ms,
+                    update.order_id
                 ),
             )
         })
@@ -756,6 +834,9 @@ impl RiskGate {
                 self.order_rejections.clear();
                 self.rejected_order_ids.clear();
                 self.last_order_rejection_ms = 0;
+                self.unfilled_ioc_cancellations.clear();
+                self.unfilled_ioc_cancelled_order_ids.clear();
+                self.last_unfilled_ioc_cancel_ms = 0;
             }
             SystemEventKind::SymbolHalted => {
                 if let Some(symbol) = &event.symbol {
@@ -1188,6 +1269,13 @@ struct OrderRejection {
     symbol: Symbol,
 }
 
+#[derive(Debug)]
+struct UnfilledIocCancellation {
+    ts_ms: TimeMs,
+    order_id: String,
+    symbol: Symbol,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FillKey {
     order_id: String,
@@ -1259,6 +1347,7 @@ mod tests {
             event: OrderEvent::New,
             status: OrderStatus::Live,
             price: 100.0,
+            time_in_force: None,
             qty: 1.0,
             open_qty: 1.0,
             filled_qty: 0.0,
@@ -1276,6 +1365,16 @@ mod tests {
         update.status = OrderStatus::Rejected;
         update.open_qty = 0.0;
         update.reason = "okx_private:test rejection".to_string();
+        update
+    }
+
+    fn unfilled_ioc_cancel_update(order_id: &str, symbol: &str, ts_ms: TimeMs) -> OrderUpdate {
+        let mut update = live_order_update(order_id, symbol, ts_ms);
+        update.event = OrderEvent::Cancelled;
+        update.status = OrderStatus::Cancelled;
+        update.time_in_force = Some(TimeInForce::Ioc);
+        update.open_qty = 0.0;
+        update.reason = "hedge:test".to_string();
         update
     }
 
@@ -1392,6 +1491,22 @@ mod tests {
     }
 
     #[test]
+    fn unfilled_ioc_cancel_limits_are_validated() {
+        for limits in [
+            RiskLimits {
+                unfilled_ioc_cancel_count_per_symbol_limit: 0,
+                ..RiskLimits::default()
+            },
+            RiskLimits {
+                unfilled_ioc_cancel_window_ms: 0,
+                ..RiskLimits::default()
+            },
+        ] {
+            assert!(limits.validation_error().is_some());
+        }
+    }
+
+    #[test]
     fn duplicate_rejections_count_once_and_symbol_threshold_latches() {
         let mut gate = RiskGate::new(RiskLimits {
             order_reject_count_limit: 10,
@@ -1465,6 +1580,61 @@ mod tests {
                 .events
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn unfilled_ioc_cancellations_are_deduplicated_and_require_zero_fill() {
+        let mut gate = RiskGate::new(RiskLimits {
+            unfilled_ioc_cancel_count_per_symbol_limit: 2,
+            unfilled_ioc_cancel_window_ms: 100,
+            ..RiskLimits::default()
+        });
+        let first = unfilled_ioc_cancel_update("ioc-1", "BTC-USDT", 1);
+        assert!(gate.on_order_update(&first).events.is_empty());
+        let mut duplicate = first;
+        duplicate.ts_ms = 2;
+        assert!(gate.on_order_update(&duplicate).events.is_empty());
+
+        let mut partially_filled = unfilled_ioc_cancel_update("ioc-partial", "BTC-USDT", 3);
+        partially_filled.filled_qty = 0.1;
+        assert!(gate.on_order_update(&partially_filled).events.is_empty());
+        let mut post_only = unfilled_ioc_cancel_update("post-only", "BTC-USDT", 4);
+        post_only.time_in_force = Some(TimeInForce::PostOnly);
+        assert!(gate.on_order_update(&post_only).events.is_empty());
+
+        let outcome = gate.on_order_update(&unfilled_ioc_cancel_update("ioc-2", "BTC-USDT", 5));
+
+        assert!(gate.is_killed());
+        assert_eq!(outcome.events[0].kind, SystemEventKind::RiskBreach);
+        assert_eq!(outcome.events[0].symbol.as_deref(), Some("BTC-USDT"));
+        assert!(
+            outcome.events[0]
+                .reason
+                .contains("symbol BTC-USDT unfilled IOC cancellation count 2 reached limit 2")
+        );
+    }
+
+    #[test]
+    fn unfilled_ioc_cancel_window_is_per_symbol_and_monotonic() {
+        let limits = RiskLimits {
+            unfilled_ioc_cancel_count_per_symbol_limit: 2,
+            unfilled_ioc_cancel_window_ms: 100,
+            ..RiskLimits::default()
+        };
+        let mut expired = RiskGate::new(limits.clone());
+        expired.on_order_update(&unfilled_ioc_cancel_update("btc-1", "BTC-USDT", 1));
+        expired.on_order_update(&unfilled_ioc_cancel_update("eth-1", "ETH-USDT", 2));
+        assert!(!expired.is_killed());
+        expired.on_order_update(&unfilled_ioc_cancel_update("btc-2", "BTC-USDT", 102));
+        assert!(!expired.is_killed());
+
+        let mut out_of_order = RiskGate::new(limits);
+        out_of_order.on_order_update(&unfilled_ioc_cancel_update("btc-1", "BTC-USDT", 100));
+        let outcome =
+            out_of_order.on_order_update(&unfilled_ioc_cancel_update("btc-2", "BTC-USDT", 50));
+
+        assert!(out_of_order.is_killed());
+        assert_eq!(outcome.events[0].ts_ms, 50);
     }
 
     #[test]
@@ -1835,6 +2005,7 @@ mod tests {
             event: OrderEvent::FullyFilled,
             status: OrderStatus::Filled,
             price: 100.0,
+            time_in_force: Some(TimeInForce::PostOnly),
             qty: 1.0,
             open_qty: 0.0,
             filled_qty: 1.0,
@@ -1871,6 +2042,7 @@ mod tests {
             event: OrderEvent::New,
             status: OrderStatus::Live,
             price: 100.0,
+            time_in_force: Some(TimeInForce::PostOnly),
             qty: 1.0,
             open_qty: 1.0,
             filled_qty: 0.0,
@@ -1905,6 +2077,7 @@ mod tests {
             event: OrderEvent::New,
             status: OrderStatus::Live,
             price: 100.0,
+            time_in_force: Some(TimeInForce::PostOnly),
             qty: 1.0,
             open_qty: 1.0,
             filled_qty: 0.0,
@@ -2007,6 +2180,7 @@ mod tests {
             event: OrderEvent::FullyFilled,
             status: OrderStatus::Filled,
             price: 50_000.0,
+            time_in_force: Some(TimeInForce::Ioc),
             qty: 20.0,
             open_qty: 0.0,
             filled_qty: 20.0,

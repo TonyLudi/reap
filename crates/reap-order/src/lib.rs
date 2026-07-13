@@ -79,7 +79,7 @@ impl OrderSnapshot {
             side: update.side,
             qty: update.qty,
             price: update.price,
-            time_in_force: None,
+            time_in_force: update.time_in_force,
             status: update.status,
             open_qty: update.open_qty,
             filled_qty: update.filled_qty,
@@ -96,6 +96,9 @@ impl OrderSnapshot {
         self.side = update.side;
         self.qty = update.qty;
         self.price = update.price;
+        if update.time_in_force.is_some() {
+            self.time_in_force = update.time_in_force;
+        }
         self.status = update.status;
         self.open_qty = update.open_qty;
         self.filled_qty = update.filled_qty;
@@ -115,6 +118,7 @@ impl OrderSnapshot {
             event,
             status: self.status,
             price: self.price,
+            time_in_force: self.time_in_force,
             qty: self.qty,
             open_qty: self.open_qty,
             filled_qty: self.filled_qty,
@@ -335,6 +339,7 @@ struct UpdateKey {
     event: u8,
     status: u8,
     price: u64,
+    time_in_force: u8,
     qty: u64,
     open_qty: u64,
     filled_qty: u64,
@@ -354,6 +359,7 @@ impl From<&OrderUpdate> for UpdateKey {
             event: event_code(update.event),
             status: status_code(update.status),
             price: update.price.to_bits(),
+            time_in_force: time_in_force_code(update.time_in_force),
             qty: update.qty.to_bits(),
             open_qty: update.open_qty.to_bits(),
             filled_qty: update.filled_qty.to_bits(),
@@ -403,6 +409,15 @@ fn liquidity_code(liquidity: Option<FillLiquidity>) -> u8 {
     }
 }
 
+fn time_in_force_code(time_in_force: Option<TimeInForce>) -> u8 {
+    match time_in_force {
+        None => 0,
+        Some(TimeInForce::Gtc) => 1,
+        Some(TimeInForce::Ioc) => 2,
+        Some(TimeInForce::PostOnly) => 3,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,6 +446,7 @@ mod tests {
             event: OrderEvent::PartialFill,
             status: OrderStatus::PartiallyFilled,
             price: 100.0,
+            time_in_force: Some(TimeInForce::Ioc),
             qty: 1.0,
             open_qty: 0.6,
             filled_qty: 0.4,
@@ -447,6 +463,7 @@ mod tests {
         let snapshot = reducer.get("order-1").unwrap();
         assert_eq!(snapshot.filled_qty, 0.4);
         assert_eq!(snapshot.open_qty, 0.6);
+        assert_eq!(snapshot.time_in_force, Some(TimeInForce::Ioc));
     }
 
     #[test]
@@ -455,6 +472,7 @@ mod tests {
         let update = reducer.ack_new("order-1", new_order(), 1);
         assert_eq!(update.event, OrderEvent::New);
         assert_eq!(update.reason, "quote:new");
+        assert_eq!(update.time_in_force, Some(TimeInForce::Gtc));
 
         let first = reducer
             .fill("order-1", 2, 0.25, 99.0, FillLiquidity::Maker)

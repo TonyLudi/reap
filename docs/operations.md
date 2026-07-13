@@ -296,7 +296,7 @@ settings; accepting only their static flags would weaken live stop behavior.
   limits against configured quote levels, hedge concurrency, account-wide
   exchange limits, and shutdown cancellation capacity before credentialed use.
 
-## Exchange Order Rejection Circuit
+## Exchange Order Failure Circuits
 
 - `risk.order_reject_count_limit` and
   `risk.order_reject_count_per_symbol_limit` bound canonical exchange submit
@@ -311,13 +311,23 @@ settings; accepting only their static flags would weaken live stop behavior.
   canonical active order. This maps the pinned Java submit-reject controls into
   the single-owner risk gate and is intentionally stronger than a transient
   strategy pause.
+- `risk.unfilled_ioc_cancel_count_per_symbol_limit` bounds distinct canonical
+  IOC cancellations with exactly zero cumulative fill per symbol inside
+  `risk.unfilled_ioc_cancel_window_ms`. Both settings must be positive. The demo
+  baseline is three zero-fill IOC cancellations on one symbol in 60 seconds and
+  must be calibrated from demo execution evidence before production use.
+- Canonical order updates retain an optional time-in-force copied from locally
+  registered order state. The optional serde field keeps older JSONL journals
+  readable. Private updates and repeated websocket frames cannot erase the
+  local value, and a given order ID counts once inside the rolling window.
+- Partially filled IOC cancellations do not enter this Java-equivalent counter;
+  chaos still records their residual quantity as `MissedHedge`. Reaching the
+  zero-fill IOC threshold persists the same global risk latch and cancels all
+  active orders.
 - Cancel request failures are not added to this submit-reject counter: one
   cancel failure immediately degrades the account, requests full REST
   reconciliation, and remains under the cancel-to-terminal convergence guard.
-  Amend routing is unsupported. Java's separate rolling per-symbol IOC-cancel
-  threshold is not yet implemented; chaos records missed IOC hedges, and the
-  production gate remains open until that record drives an equivalent stop or
-  a dedicated threshold is added.
+  Amend routing is unsupported.
 
 ## Stablecoin Depeg Guard
 
