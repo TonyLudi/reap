@@ -327,6 +327,11 @@ loop {
 The coordinator owns strategy, risk, readiness, account-scoped private
 reducers, client-order-id generation, and intent routing. It synchronously
 records `PendingNew` before a submit action can reach an account gateway task.
+The runtime separately tracks submit-to-private-state and
+cancel-to-terminal-state convergence. A missed event-only order update cannot
+leave either transition pending indefinitely: expiry releases cancel
+deduplication, blocks the account, retries cancellation, and starts full REST
+reconciliation.
 REST and websocket IO never borrow strategy state across `.await`.
 Normal event records use the bounded non-blocking path. A safety-latch mutation
 is the rare write-ahead exception: it is flushed and synced before its cancel

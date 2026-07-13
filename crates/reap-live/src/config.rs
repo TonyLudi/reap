@@ -141,6 +141,7 @@ pub struct RuntimeConfig {
     pub cancel_all_after_timeout_secs: u64,
     pub cancel_all_after_heartbeat_ms: u64,
     pub ambiguous_submit_grace_ms: u64,
+    pub order_state_convergence_timeout_ms: u64,
     pub fill_state_convergence_timeout_ms: u64,
     pub submit_requests_per_window: usize,
     pub cancel_requests_per_window: usize,
@@ -170,6 +171,7 @@ impl Default for RuntimeConfig {
             cancel_all_after_timeout_secs: 30,
             cancel_all_after_heartbeat_ms: 1_000,
             ambiguous_submit_grace_ms: 5_000,
+            order_state_convergence_timeout_ms: 5_000,
             fill_state_convergence_timeout_ms: 2_000,
             submit_requests_per_window: 50,
             cancel_requests_per_window: 50,
@@ -815,6 +817,10 @@ fn validate_positive_runtime(runtime: &RuntimeConfig, errors: &mut Vec<String>) 
             runtime.ambiguous_submit_grace_ms,
         ),
         (
+            "order_state_convergence_timeout_ms",
+            runtime.order_state_convergence_timeout_ms,
+        ),
+        (
             "fill_state_convergence_timeout_ms",
             runtime.fill_state_convergence_timeout_ms,
         ),
@@ -849,6 +855,18 @@ fn validate_positive_runtime(runtime: &RuntimeConfig, errors: &mut Vec<String>) 
     if runtime.fill_state_convergence_timeout_ms <= runtime.timer_interval_ms {
         errors.push(
             "runtime.fill_state_convergence_timeout_ms must be longer than timer_interval_ms"
+                .to_string(),
+        );
+    }
+    if runtime.order_state_convergence_timeout_ms <= runtime.timer_interval_ms {
+        errors.push(
+            "runtime.order_state_convergence_timeout_ms must be longer than timer_interval_ms"
+                .to_string(),
+        );
+    }
+    if runtime.order_state_convergence_timeout_ms < runtime.rest_request_timeout_ms {
+        errors.push(
+            "runtime.order_state_convergence_timeout_ms must be at least rest_request_timeout_ms"
                 .to_string(),
         );
     }
@@ -1181,6 +1199,20 @@ mod tests {
                 "max_exchange_clock_skew_ms must be shorter than order_request_expiry_ms"
             ))
         );
+    }
+
+    #[test]
+    fn order_state_convergence_budget_must_cover_rest_request() {
+        let mut config = valid_config();
+        config.runtime.order_state_convergence_timeout_ms =
+            config.runtime.rest_request_timeout_ms - 1;
+
+        let report = config.validate();
+
+        assert!(!report.valid);
+        assert!(report.errors.iter().any(|error| error.contains(
+            "order_state_convergence_timeout_ms must be at least rest_request_timeout_ms"
+        )));
     }
 
     #[test]

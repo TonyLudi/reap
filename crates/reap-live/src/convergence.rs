@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use reap_core::{AccountUpdate, OrderUpdate};
+use reap_core::{AccountUpdate, OrderStatus, OrderUpdate};
 
 use crate::LiveConfig;
 
@@ -275,6 +275,209 @@ impl FillConvergenceGuard {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum PendingOrderTransition {
+    Submit,
+    Cancel,
+}
+
+impl PendingOrderTransition {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Submit => "submit_to_private_state",
+            Self::Cancel => "cancel_to_terminal_state",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct ScopedOrderTransition {
+    account_id: String,
+    order_id: String,
+    transition: PendingOrderTransition,
+}
+
+#[derive(Debug, Clone)]
+struct PendingOrderState {
+    symbol: String,
+    first_observed_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OrderStateConvergenceBreach {
+    pub account_id: String,
+    pub symbol: Option<String>,
+    pub expired_cancel_order_ids: Vec<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct OrderStateConvergenceGuard {
+    timeout_ms: u64,
+    pending: HashMap<ScopedOrderTransition, PendingOrderState>,
+}
+
+impl OrderStateConvergenceGuard {
+    pub fn new(timeout_ms: u64) -> Self {
+        Self {
+            timeout_ms,
+            pending: HashMap::new(),
+        }
+    }
+
+    pub fn observe_order(&mut self, account_id: &str, update: &OrderUpdate, observed_ms: u64) {
+        let submit = ScopedOrderTransition {
+            account_id: account_id.to_string(),
+            order_id: update.order_id.clone(),
+            transition: PendingOrderTransition::Submit,
+        };
+        if update.status == OrderStatus::PendingNew {
+            self.pending
+                .entry(submit)
+                .or_insert_with(|| PendingOrderState {
+                    symbol: update.symbol.clone(),
+                    first_observed_ms: observed_ms,
+                });
+        } else {
+            self.pending.remove(&submit);
+        }
+
+        if matches!(
+            update.status,
+            OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected
+        ) {
+            self.pending.remove(&ScopedOrderTransition {
+                account_id: account_id.to_string(),
+                order_id: update.order_id.clone(),
+                transition: PendingOrderTransition::Cancel,
+            });
+        }
+    }
+
+    pub fn observe_cancel(
+        &mut self,
+        account_id: &str,
+        order_id: &str,
+        symbol: &str,
+        observed_ms: u64,
+    ) {
+        self.pending
+            .entry(ScopedOrderTransition {
+                account_id: account_id.to_string(),
+                order_id: order_id.to_string(),
+                transition: PendingOrderTransition::Cancel,
+            })
+            .or_insert_with(|| PendingOrderState {
+                symbol: symbol.to_string(),
+                first_observed_ms: observed_ms,
+            });
+    }
+
+    pub fn has_pending_cancel(&self, account_id: &str, order_id: &str) -> bool {
+        self.pending.contains_key(&ScopedOrderTransition {
+            account_id: account_id.to_string(),
+            order_id: order_id.to_string(),
+            transition: PendingOrderTransition::Cancel,
+        })
+    }
+
+    pub fn pending_reason(&self, account_id: &str) -> Option<String> {
+        let mut pending = self
+            .pending
+            .iter()
+            .filter(|(key, _)| key.account_id == account_id)
+            .map(|(key, state)| {
+                format!(
+                    "{} order={} transition={}",
+                    state.symbol,
+                    key.order_id,
+                    key.transition.label()
+                )
+            })
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return None;
+        }
+        pending.sort();
+        Some(format!(
+            "order-state transitions remain pending after REST recovery: {}",
+            pending.join(", ")
+        ))
+    }
+
+    pub fn expire(&mut self, now_ms: u64) -> Vec<OrderStateConvergenceBreach> {
+        let mut expired = self
+            .pending
+            .iter()
+            .filter_map(|(key, pending)| {
+                let age_ms = now_ms.saturating_sub(pending.first_observed_ms);
+                (age_ms >= self.timeout_ms).then(|| (key.clone(), pending.clone(), age_ms))
+            })
+            .collect::<Vec<_>>();
+        expired.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut by_account =
+            BTreeMap::<String, Vec<(ScopedOrderTransition, PendingOrderState, u64)>>::new();
+        for (key, pending, age_ms) in expired {
+            self.pending.remove(&key);
+            by_account
+                .entry(key.account_id.clone())
+                .or_default()
+                .push((key, pending, age_ms));
+        }
+
+        by_account
+            .into_iter()
+            .map(|(account_id, entries)| {
+                let symbols = entries
+                    .iter()
+                    .map(|(_, pending, _)| pending.symbol.clone())
+                    .collect::<BTreeSet<_>>();
+                let symbol = (symbols.len() == 1)
+                    .then(|| symbols.iter().next().expect("one symbol exists").clone());
+                let mut expired_cancel_order_ids = entries
+                    .iter()
+                    .filter(|(key, _, _)| key.transition == PendingOrderTransition::Cancel)
+                    .map(|(key, _, _)| key.order_id.clone())
+                    .collect::<Vec<_>>();
+                expired_cancel_order_ids.sort();
+                expired_cancel_order_ids.dedup();
+                let oldest_age_ms = entries
+                    .iter()
+                    .map(|(_, _, age_ms)| *age_ms)
+                    .max()
+                    .unwrap_or_default();
+                let details = entries
+                    .into_iter()
+                    .map(|(key, pending, age_ms)| {
+                        format!(
+                            "{} order={} transition={} age_ms={age_ms}",
+                            pending.symbol,
+                            key.order_id,
+                            key.transition.label()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                OrderStateConvergenceBreach {
+                    account_id,
+                    symbol,
+                    expired_cancel_order_ids,
+                    reason: format!(
+                        "order-state convergence exceeded {}ms (oldest_age_ms={oldest_age_ms}): {details}",
+                        self.timeout_ms
+                    ),
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use reap_core::{
@@ -324,6 +527,38 @@ mod tests {
             last_fill_qty: 1.0,
             last_fill_price: 100.0,
             last_fill_liquidity: Some(FillLiquidity::Maker),
+            reason: "quote".to_string(),
+        }
+    }
+
+    fn order_state(status: OrderStatus, event: OrderEvent, ts_ms: u64) -> OrderUpdate {
+        OrderUpdate {
+            ts_ms,
+            order_id: "order-1".to_string(),
+            symbol: "BTC-USDT-SWAP".to_string(),
+            side: Side::Buy,
+            event,
+            status,
+            price: 100.0,
+            qty: 1.0,
+            open_qty: if status == OrderStatus::Filled {
+                0.0
+            } else {
+                1.0
+            },
+            filled_qty: if status == OrderStatus::Filled {
+                1.0
+            } else {
+                0.0
+            },
+            avg_fill_price: if status == OrderStatus::Filled {
+                100.0
+            } else {
+                0.0
+            },
+            last_fill_qty: 0.0,
+            last_fill_price: 0.0,
+            last_fill_liquidity: None,
             reason: "quote".to_string(),
         }
     }
@@ -497,5 +732,61 @@ mod tests {
         guard.observe_authoritative("main", 11);
         guard.observe_fill("main", &fill("BTC-USDT-SWAP", 12), 200);
         assert_eq!(guard.pending_count(), 1);
+    }
+
+    #[test]
+    fn pending_submit_expires_once_or_clears_on_private_state() {
+        let mut guard = OrderStateConvergenceGuard::new(5_000);
+        let pending = order_state(OrderStatus::PendingNew, OrderEvent::PendingNew, 10);
+        guard.observe_order("main", &pending, 100);
+
+        assert!(guard.expire(5_099).is_empty());
+        let breaches = guard.expire(5_100);
+        assert_eq!(breaches.len(), 1);
+        assert_eq!(breaches[0].account_id, "main");
+        assert_eq!(breaches[0].symbol.as_deref(), Some("BTC-USDT-SWAP"));
+        assert!(breaches[0].expired_cancel_order_ids.is_empty());
+        assert!(breaches[0].reason.contains("submit_to_private_state"));
+        assert!(guard.expire(6_000).is_empty());
+
+        guard.observe_order("main", &pending, 6_100);
+        guard.observe_order(
+            "main",
+            &order_state(OrderStatus::Live, OrderEvent::New, 11),
+            6_101,
+        );
+        assert_eq!(guard.pending_count(), 0);
+    }
+
+    #[test]
+    fn pending_cancel_survives_nonterminal_updates_and_rearms_after_expiry() {
+        let mut guard = OrderStateConvergenceGuard::new(5_000);
+        guard.observe_cancel("main", "order-1", "BTC-USDT-SWAP", 100);
+        guard.observe_order(
+            "main",
+            &order_state(OrderStatus::Live, OrderEvent::New, 10),
+            200,
+        );
+        assert!(
+            guard
+                .pending_reason("main")
+                .is_some_and(|reason| reason.contains("cancel_to_terminal_state"))
+        );
+
+        let breaches = guard.expire(5_100);
+        assert_eq!(breaches.len(), 1);
+        assert_eq!(breaches[0].expired_cancel_order_ids, ["order-1"]);
+        assert!(breaches[0].reason.contains("cancel_to_terminal_state"));
+        assert!(!guard.has_pending_cancel("main", "order-1"));
+
+        guard.observe_cancel("main", "order-1", "BTC-USDT-SWAP", 5_200);
+        guard.observe_order(
+            "main",
+            &order_state(OrderStatus::Cancelled, OrderEvent::Cancelled, 11),
+            5_201,
+        );
+        assert_eq!(guard.pending_count(), 0);
+        assert!(guard.pending_reason("main").is_none());
+        assert!(guard.expire(20_000).is_empty());
     }
 }

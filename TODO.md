@@ -116,6 +116,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Reconcile REST balances and positions with websocket-derived state on
   startup, recovery, ambiguity, and shutdown; apply omitted-row tombstones,
   reject stale account rows, and require a second clean pass after repair.
+- [x] Require local submits and dispatched cancels to converge through the
+  event-only OKX orders channel or REST recovery within a configured deadline;
+  retry cancellation and reconcile fail-closed on timeout.
 - [x] Require every canonical derivative fill to converge to its position row
   and every spot fill to both currency balances within a configured deadline;
   fail closed and reconcile the account on timeout.

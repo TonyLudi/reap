@@ -12,7 +12,7 @@ production trading process.
 | Iarb2 decision model | Covered for the documented OKX parity boundary | Not a blocker |
 | Deterministic backtest/data | Shared strategy code, depth matching, queue-ahead model, fees, credential-free redundant public capture, create-new session files, and raw/normalized replay | Needs sustained full-depth capture and venue-data calibration before capital decisions |
 | Feed components | Redundant public sockets, isolated private sockets, transport/state freshness separation, account-plus-positions health rounds, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
-| Order components | Event-loop client IDs/registration, exchange-side place-request expiry, signed submit/cancel, pacing, monotonic private reduction, typed position margin mode, ambiguity handling, and full order/fill/balance/position REST reconciliation are composed | Needs demo exchange fault evidence |
+| Order components | Event-loop client IDs/registration, exchange-side place-request expiry, signed submit/cancel, pacing, monotonic private reduction, submit/cancel state-convergence deadlines, typed position margin mode, ambiguity handling, and full order/fill/balance/position REST reconciliation are composed | Needs demo exchange fault evidence |
 | Runtime risk | Instrument models, authoritative startup positions, position scope/mode enforcement, forced-repayment blocking, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed deadman/depeg/convergence evidence |
 | Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, and strict bounded soak reports | Demo-capable; production entry intentionally unavailable |
 | Instrument/account bootstrap | Account instruments/config/balance/positions are typed; live spot is cash-only; nonzero positions require configured account ownership and derivative mode before strategy/risk application | Needs target-account certification |
@@ -128,6 +128,11 @@ production trading process.
     threshold abort bootstrap/runtime before state application, while REST
     reconciliation compares lower values and authoritative tombstones clear
     omitted currencies.
+24. Local `PendingNew` orders and dispatched cancels have an explicit
+    order-state convergence deadline. Timeout blocks the account, releases the
+    expired cancel from deduplication so it can be retried, and requires full
+    REST reconciliation; only a terminal private or recovered state clears a
+    pending cancel.
 
 ## Remaining Demo Gate
 
@@ -144,9 +149,10 @@ production trading process.
    inject a transient guard failure without creating a durable latch.
 3. Run minimal-size `demo` orders, then inject socket disconnect, process kill,
    deadman expiry, exchange-clock skew, IOC miss, partial fill, and REST
-   timeout/rate-limit conditions. Suppress derivative position updates and each
-   side of a spot balance update long enough to exercise fill convergence.
-   Verify `expTime`, latch restoration, and Cancel All After from
+   timeout/rate-limit conditions. Suppress submit and cancel order pushes to
+   exercise order-state convergence, then suppress derivative position updates
+   and each side of a spot balance update to exercise fill convergence. Verify
+   cancel retry, `expTime`, latch restoration, and Cancel All After from
    exchange/account evidence. Exercise the independent emergency command after
    forced process death and archive its zero-order report.
 4. Complete a sustained soak with zero unexplained order, fill, balance,

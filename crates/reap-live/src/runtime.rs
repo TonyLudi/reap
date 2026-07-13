@@ -34,7 +34,7 @@ use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::convergence::FillConvergenceGuard;
+use crate::convergence::{FillConvergenceGuard, OrderStateConvergenceGuard};
 use crate::{
     AccountBootstrapSnapshot, CancelAction, CoordinatorError, CoordinatorOutput, HostGuardRuntime,
     HostHealthError, HostHealthSnapshot, LiveAction, LiveConfig, LiveConfigError, LiveCoordinator,
@@ -747,6 +747,7 @@ struct LiveRuntime {
     cancel_inflight: HashSet<(String, String)>,
     last_reconcile_attempt: HashMap<String, Instant>,
     fill_convergence: FillConvergenceGuard,
+    order_convergence: OrderStateConvergenceGuard,
     readiness_timeout_ms: u64,
     timer_interval_ms: u64,
     max_feed_age_ms: u64,
@@ -799,6 +800,8 @@ impl LiveRuntime {
         let operator_secret = operator_config.secret_from_env()?;
         let config_fingerprint = config.fingerprint()?;
         let fill_convergence = FillConvergenceGuard::new(&config);
+        let order_convergence =
+            OrderStateConvergenceGuard::new(config.runtime.order_state_convergence_timeout_ms);
         let recovered = recover_jsonl(storage_lease.journal_path())?;
         validate_recovered_safety_latches(&config, &recovered)?;
         for (account_id, (strategy_name, fingerprint)) in &recovered.bootstrap_identities {
@@ -1115,6 +1118,7 @@ impl LiveRuntime {
             cancel_inflight: HashSet::new(),
             last_reconcile_attempt: HashMap::new(),
             fill_convergence: FillConvergenceGuard::default(),
+            order_convergence,
             readiness_timeout_ms: config.runtime.readiness_timeout_ms,
             timer_interval_ms: config.runtime.timer_interval_ms,
             max_feed_age_ms: config.risk.max_feed_age_ms,
@@ -1359,6 +1363,19 @@ impl LiveRuntime {
                         self.commit_output(output).await?;
                     }
                     for breach in self.fill_convergence.expire(now_ms) {
+                        let output = self.coordinator.reconciliation_fault(
+                            &breach.account_id,
+                            now_ms,
+                            breach.symbol,
+                            breach.reason,
+                        )?;
+                        self.commit_output(output).await?;
+                    }
+                    for breach in self.order_convergence.expire(now_ms) {
+                        for order_id in &breach.expired_cancel_order_ids {
+                            self.cancel_inflight
+                                .remove(&(breach.account_id.clone(), order_id.clone()));
+                        }
                         let output = self.coordinator.reconciliation_fault(
                             &breach.account_id,
                             now_ms,
@@ -1922,10 +1939,13 @@ impl LiveRuntime {
                 ts_ms,
             } => {
                 self.reconcile_inflight.remove(&account_id);
-                self.cancel_inflight
-                    .retain(|(cancel_account, _)| cancel_account != &account_id);
                 self.apply_remote_recovery(&account_id, &remote_orders, &remote_fills)
                     .await?;
+                let order_convergence = &self.order_convergence;
+                self.cancel_inflight.retain(|(cancel_account, order_id)| {
+                    cancel_account != &account_id
+                        || order_convergence.has_pending_cancel(cancel_account, order_id)
+                });
                 let report = {
                     let state = self
                         .coordinator
@@ -1940,7 +1960,8 @@ impl LiveRuntime {
                 self.fill_convergence
                     .observe_authoritative(&account_id, remote_account_ts_ms);
                 self.commit_output(account_output).await?;
-                let clean = report.is_clean();
+                let pending_order_state = self.order_convergence.pending_reason(&account_id);
+                let clean = report.is_clean() && pending_order_state.is_none();
                 if self.shutdown_in_progress
                     && self.shutdown_reconciliation_requested.contains(&account_id)
                 {
@@ -1953,8 +1974,16 @@ impl LiveRuntime {
                 let reason = if clean {
                     "REST orders, fills, balances, positions, and canonical private state agree"
                         .to_string()
+                } else if report.is_clean() {
+                    pending_order_state
+                        .expect("non-clean order convergence must include a pending reason")
                 } else {
-                    format!("{:?}", report.issues)
+                    let mut reason = format!("{:?}", report.issues);
+                    if let Some(pending) = pending_order_state {
+                        reason.push_str("; ");
+                        reason.push_str(&pending);
+                    }
+                    reason
                 };
                 let output = self.coordinator.on_reconciliation(ReconciliationResult {
                     account_id,
@@ -2099,6 +2128,7 @@ impl LiveRuntime {
     }
 
     async fn commit_output(&mut self, output: CoordinatorOutput) -> Result<(), LiveRuntimeError> {
+        self.observe_order_convergence(&output, unix_time_ms());
         let alerts = if self.alert_sink.is_some() {
             output
                 .records
@@ -2133,6 +2163,19 @@ impl LiveRuntime {
             {
                 self.fill_convergence
                     .observe_fill(account_id, update, observed_ms);
+            }
+        }
+    }
+
+    fn observe_order_convergence(&mut self, output: &CoordinatorOutput, observed_ms: u64) {
+        for record in &output.records {
+            if let StorageRecord::Order {
+                account_id: Some(account_id),
+                update,
+            } = record
+            {
+                self.order_convergence
+                    .observe_order(account_id, update, observed_ms);
             }
         }
     }
@@ -2186,6 +2229,7 @@ impl LiveRuntime {
         &mut self,
         output: CoordinatorOutput,
     ) -> Result<(), LiveRuntimeError> {
+        self.observe_order_convergence(&output, unix_time_ms());
         for record in output.records {
             if matches!(record, StorageRecord::SafetyLatch(_)) {
                 self.record_durable_storage(record).await?;
@@ -2211,6 +2255,7 @@ impl LiveRuntime {
         action: CancelAction,
     ) -> Result<(), LiveRuntimeError> {
         let cancel_key = (action.account_id.clone(), action.client_order_id.clone());
+        let symbol = action.symbol.clone();
         if !self.cancel_inflight.insert(cancel_key.clone()) {
             return Ok(());
         }
@@ -2237,6 +2282,12 @@ impl LiveRuntime {
             self.cancel_inflight.remove(&cancel_key);
             return Err(LiveRuntimeError::OrderQueueUnavailable(cancel_key.0));
         }
+        self.order_convergence.observe_cancel(
+            &cancel_key.0,
+            &cancel_key.1,
+            &symbol,
+            unix_time_ms(),
+        );
         Ok(())
     }
 
@@ -2307,6 +2358,7 @@ impl LiveRuntime {
             }
             LiveAction::Cancel(action) => {
                 let cancel_key = (action.account_id.clone(), action.client_order_id.clone());
+                let symbol = action.symbol.clone();
                 if !self.cancel_inflight.insert(cancel_key.clone()) {
                     return Ok(());
                 }
@@ -2335,6 +2387,12 @@ impl LiveRuntime {
                     self.cancel_inflight.remove(&cancel_key);
                     return Err(LiveRuntimeError::OrderQueueUnavailable(cancel_key.0));
                 }
+                self.order_convergence.observe_cancel(
+                    &cancel_key.0,
+                    &cancel_key.1,
+                    &symbol,
+                    unix_time_ms(),
+                );
             }
             LiveAction::RecoverBook(request) => {
                 let routes = self.feeds[self.public_feed_index].request_recovery(&request);
@@ -4026,6 +4084,7 @@ mod tests {
             cancel_inflight: HashSet::new(),
             last_reconcile_attempt: HashMap::new(),
             fill_convergence: FillConvergenceGuard::default(),
+            order_convergence: OrderStateConvergenceGuard::new(5_000),
             readiness_timeout_ms: 1_000,
             timer_interval_ms: 100,
             max_feed_age_ms: 60_000,
@@ -4139,6 +4198,7 @@ mod tests {
             cancel_inflight: HashSet::new(),
             last_reconcile_attempt: HashMap::new(),
             fill_convergence: FillConvergenceGuard::default(),
+            order_convergence: OrderStateConvergenceGuard::new(5_000),
             readiness_timeout_ms: 1_000,
             timer_interval_ms: 100,
             max_feed_age_ms: 60_000,
@@ -4386,6 +4446,7 @@ mod tests {
             cancel_inflight: HashSet::new(),
             last_reconcile_attempt: HashMap::new(),
             fill_convergence: FillConvergenceGuard::default(),
+            order_convergence: OrderStateConvergenceGuard::new(5_000),
             readiness_timeout_ms: 1_000,
             timer_interval_ms: 100,
             max_feed_age_ms: 60_000,

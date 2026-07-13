@@ -189,6 +189,28 @@ settings; accepting only their static flags would weaken live stop behavior.
   retries; only a subsequent clean full-state pass restores the reconciliation
   gate. This intentionally favors a brief false stop over trading stale state.
 
+## Order-State Convergence
+
+- OKX's event-only orders channel sends no initial snapshot. Its current API
+  contract also states that a successful cancel response accepts the request
+  but does not prove the order is cancelled; final state comes from the orders
+  channel or an order query. See the [OKX API guide](https://www.okx.com/docs-v5/en/).
+- Every locally registered `PendingNew` must advance to a private or recovered
+  REST state, and every dispatched cancel must advance to `filled`, `cancelled`,
+  or `rejected`, within `runtime.order_state_convergence_timeout_ms`. The limit
+  must cover `rest_request_timeout_ms`; the demo baseline is five seconds.
+- A timeout emits account-scoped `ReconcileDrift`, blocks new entry, cancels all
+  canonical active orders, and starts full REST reconciliation. An expired
+  cancel is removed from in-flight deduplication first, so the fail-closed path
+  retries it instead of suppressing it as a duplicate.
+- A nonterminal REST recovery does not clear an outstanding cancel. Terminal
+  private or REST state clears it. Failed reconciliation remains degraded and
+  follows the existing bounded retry policy.
+- This maps the pinned Java `StaleOrderUpdateSafeguard` and pending-order gateway
+  control into the single-owner runtime. Demo testing must suppress submit and
+  cancel order pushes separately and verify cancel retry, REST repair, and no
+  readiness recovery before authoritative convergence.
+
 ## Fill-To-State Convergence
 
 - Every deduplicated canonical fill starts account-scoped pending targets.
@@ -459,6 +481,7 @@ replacement for exchange-side account limits and operator access controls.
 | Public sequence gap | Book recovering; new orders blocked | Obtain a fresh snapshot and replay contiguous buffered deltas |
 | Public feed stale | Symbol blocked; live orders cancelled | Restore at least one healthy feed and verify sequence continuity |
 | Private stream stale | Account blocked; live orders cancelled | Reconnect, REST reconcile orders/fills/balances/positions, then emit recovery |
+| Submit/cancel order-state convergence timeout | Account blocked; active orders cancelled; expired cancel retried; full reconciliation requested | Suppress each orders-channel transition independently, then verify REST repair and no early readiness recovery |
 | Fill/account-state convergence timeout | Account blocked; live orders cancelled; full reconciliation requested | Inspect the missing symbol/currency target and private-channel latency, then require authoritative repair and a clean pass |
 | Position scope or margin-mode violation | Bootstrap/runtime abort; demo cleanup attempts cancel/reconcile and retains the deadman unless safe | Keep entry disabled; close/correct the unmodeled position or mode outside Reap, then require a clean bootstrap |
 | Forced-repayment indicator at/above limit | Bootstrap/runtime abort; demo cleanup attempts cancel/reconcile and retains the deadman unless safe | Keep entry disabled; reduce borrowing/risk outside Reap and require all currencies below limit plus a clean bootstrap |
