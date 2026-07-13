@@ -110,10 +110,19 @@ impl BacktestRunner {
         execution: BacktestExecutionConfig,
     ) -> Result<Self> {
         execution.validate()?;
+        let depth_fill_conservative_threshold = execution.depth_fill_conservative_threshold;
         let matchers = config
             .instruments
             .iter()
-            .map(|inst| (inst.symbol.clone(), MatchingEngine::new(inst.clone())))
+            .map(|inst| {
+                (
+                    inst.symbol.clone(),
+                    MatchingEngine::with_depth_fill_conservative_threshold(
+                        inst.clone(),
+                        depth_fill_conservative_threshold,
+                    ),
+                )
+            })
             .collect();
         Ok(Self {
             portfolio: Portfolio::new(&config.instruments),

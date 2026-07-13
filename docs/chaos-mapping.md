@@ -83,7 +83,7 @@ The Rust scheduler was cross-checked against the pinned Java
 | Aggressive entry takes current displayed depth; IOC remainder cancels | Activation matches current book and emits taker fills plus terminal IOC update | Equivalent |
 | Per-instrument maker/taker fee map | Maker/taker fee fields on each Rust instrument | Equivalent |
 | Separate market depth/quote/trade delays | One global `market_data_latency_ms`, with raw replay ordered by persisted receive time | Partial; class- and instrument-specific distributions remain calibration work |
-| Conservative depth-fill threshold | Any crossed live order fills from displayed depth | Partial; configurable Java threshold remains unimplemented and is a production-model gap |
+| Conservative depth-fill threshold and queue reset on a shallow cross | `depth_fill_conservative_threshold`; basic cross clears queue-ahead and threshold cross controls displayed-depth fill | Exact formula and pinned Java application default; empirical calibration remains required |
 
 Zero-delay fixture compatibility is intentional, but it is optimistic evidence,
 not a calibrated execution claim. Backtest reports retain the effective delay

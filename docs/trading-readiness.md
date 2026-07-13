@@ -10,7 +10,7 @@ production trading process.
 | Area | Current state | Trading impact |
 | --- | --- | --- |
 | Iarb2 decision model | Covered for the documented OKX parity boundary | Not a blocker |
-| Deterministic backtest/data | Shared strategy code, immediate pending-order registration, arrival-time scheduler, configurable market/entry/cancel/order/account delays, depth matching, queue-ahead model, fees, credential-free redundant public capture, exact SHA/config provenance, streaming source/timing/market analysis, create-new session files, and raw/normalized replay | Delay values remain uncalibrated; needs sustained full-depth capture, conservative depth-fill threshold, and venue-data calibration before capital decisions |
+| Deterministic backtest/data | Shared strategy code, immediate pending-order registration, arrival-time scheduler, configurable market/entry/cancel/order/account delays, Java-referenced conservative depth-fill threshold, queue-ahead model, fees, credential-free redundant public capture, exact SHA/config provenance, streaming source/timing/market analysis, create-new session files, and raw/normalized replay | Execution assumptions remain uncalibrated; needs sustained full-depth capture and venue-data calibration before capital decisions |
 | Feed components | Redundant public sockets, isolated private sockets, transport/state freshness separation, account-plus-positions health rounds, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
 | Order components | Event-loop client IDs/registration, exchange/client acknowledgement binding, account-scoped immutable private identity, semantic duplicate suppression across changed exchange timestamps, exchange-side place-request expiry, signed submit/cancel, pacing, monotonic private reduction, submit/cancel state-convergence deadlines, typed position margin mode, ambiguity handling, and full order/fill/balance/position REST reconciliation are composed | Needs demo exchange fault evidence |
 | Runtime risk | Instrument models, authoritative startup positions, active-order count/notional ceilings, rolling submit-rejection and zero-fill IOC-cancel circuits, terminal strategy-halt promotion, position scope/mode enforcement, forced-repayment blocking, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed deadman/depeg/convergence evidence |
@@ -168,6 +168,9 @@ production trading process.
     retain every effective delay, clock regression, live order, and action left
     beyond the final input. Defaults remain explicitly uncalibrated, and the
     current short public capture had no fills from which to estimate execution.
+    Displayed-depth matching also applies Java's relative over-cross threshold
+    and clears queue-ahead on a shallow cross, but its value is still an
+    inherited conservative default rather than target-venue evidence.
 
 ## Remaining Demo Gate
 
@@ -203,7 +206,7 @@ Production enablement additionally requires:
 
 - Full-depth historical data and calibrated queue, latency, fee, funding, and
   slippage assumptions, including empirical per-message/per-instrument delay
-  distributions and a conservative displayed-depth fill threshold.
+  distributions and empirical validation of the displayed-depth fill threshold.
 - Walk-forward and out-of-sample evaluation, parameter sensitivity, capacity,
   inventory-duration, and stressed-liquidity reports.
 - Target-account calibration and independent exercise of the implemented

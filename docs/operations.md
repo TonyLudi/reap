@@ -89,6 +89,7 @@ order_entry_latency_ms = 0
 cancel_latency_ms = 0
 order_update_latency_ms = 0
 fill_account_latency_ms = 0
+depth_fill_conservative_threshold = 0.0001
 ```
 
 Raw replay orders the local event loop by persisted `recv_ts_ns`; CSV and
@@ -108,8 +109,11 @@ only when the values are derived from representative target-host capture and
 demo order traces. Guessed values may be used with `calibrated = false` for
 sensitivity tests. Current values are global constants; archive the exact TOML,
 raw SHA-256, code revision, report, and the empirical distributions used to
-choose them. Zero latency preserves fixture compatibility but is optimistic and
-cannot support a capital decision.
+choose them. The example threshold is inherited from the pinned Java backtest:
+a resting sell needs bid at least `order_px * (1 + threshold)`, while a resting
+buy needs ask at most `order_px * (1 - threshold)`. A shallower cross clears
+queue-ahead without filling. Zero latency and an inherited threshold preserve
+parity scaffolding but cannot support a capital decision.
 
 Strict analysis requires one capture session, every configured stream on its
 configured number of source connections, a ready book for every configured
@@ -173,8 +177,9 @@ the deterministic latency scheduler was added, receive-time replay of the same
 file reported 3,958 normalized inputs, three cross-socket writer-order clock
 regressions (maximum 148,017 ns), 14 exchange activations, 10 effective
 cancellations, four live quotes at the capture horizon, and no pending scheduled
-actions under the explicit uncalibrated
-zero-delay configuration. An uncalibrated sensitivity pass using 2 ms market,
+actions under the explicit uncalibrated zero-delay configuration with the
+pinned Java `0.0001` depth threshold. An uncalibrated sensitivity pass using
+2 ms market,
 20 ms entry, 15 ms cancel, 25 ms order-update, and 50 ms fill/account delays
 kept the same no-fill result and exposed three delayed strategy events beyond
 the capture horizon. This short, fill-free run validates scheduling/provenance only;

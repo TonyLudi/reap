@@ -426,13 +426,15 @@ The `[backtest]` fields map to the pinned Java backtest model as follows:
 | `cancel_latency_ms` | `MatchingCancel` | Cancel intent to matching ineligibility |
 | `order_update_latency_ms` | `OrderUpdate` | Exchange order transition to strategy visibility |
 | `fill_account_latency_ms` | `OrderFill` plus live fill-to-account convergence | Exchange fill to synthetic authoritative position visibility; Java couples position/account publication to order-update delay |
+| `depth_fill_conservative_threshold` | `backtest.depth.fill.conservative.threshold` | Required relative over-cross before a resting order fills from displayed depth; trade fills and new taker orders are unchanged |
 
-All values default to zero for backward-compatible deterministic fixtures. The
-report embeds the effective values and a `calibrated` declaration. That flag must
-remain false for guessed sensitivity values. Latencies are global in the current
-implementation; production research still requires venue, instrument, message
-class, and percentile distributions from representative captures and demo order
-traces.
+All fields default to zero for backward-compatible deterministic fixtures. The
+OKX example explicitly uses the pinned Java application's conservative depth
+default of `0.0001`, but does not claim it is calibrated. The report embeds the
+effective values and a `calibrated` declaration. That flag must remain false for
+guessed sensitivity values. Assumptions are global in the current implementation;
+production research still requires venue, instrument, message class, and
+percentile distributions from representative captures and demo order traces.
 
 Events already due strictly before the next input are drained first. Actions due
 at the same instant as a market event execute after that market event, which is

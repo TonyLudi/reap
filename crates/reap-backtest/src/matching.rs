@@ -18,11 +18,19 @@ pub struct MatchingEngine {
     next_order_id: u64,
     next_seq: u64,
     px_threshold: f64,
+    depth_fill_conservative_threshold: f64,
     now_ms: u64,
 }
 
 impl MatchingEngine {
     pub fn new(instrument: InstrumentConfig) -> Self {
+        Self::with_depth_fill_conservative_threshold(instrument, 0.0)
+    }
+
+    pub fn with_depth_fill_conservative_threshold(
+        instrument: InstrumentConfig,
+        depth_fill_conservative_threshold: f64,
+    ) -> Self {
         Self {
             symbol: instrument.symbol.clone(),
             px_threshold: instrument.tick_size * 0.1,
@@ -32,6 +40,7 @@ impl MatchingEngine {
             meta: HashMap::new(),
             next_order_id: 1,
             next_seq: 1,
+            depth_fill_conservative_threshold,
             now_ms: 0,
         }
     }
@@ -299,6 +308,14 @@ impl MatchingEngine {
                 if let Some(meta) = self.meta.get_mut(&order_id) {
                     meta.qty_ahead = 0.0;
                 }
+                if !crosses_with_threshold(
+                    market_side,
+                    order_price,
+                    level.px,
+                    self.depth_fill_conservative_threshold,
+                ) {
+                    break;
+                }
 
                 let fill_qty = open_qty.min(level.qty);
                 if fill_qty <= 0.0 {
@@ -430,6 +447,18 @@ struct MatchingMeta {
 
 fn approx_eq(a: f64, b: f64, threshold: f64) -> bool {
     (a - b).abs() <= threshold
+}
+
+fn crosses_with_threshold(
+    taker_side: Side,
+    maker_px: Price,
+    taker_px: Price,
+    threshold: f64,
+) -> bool {
+    match taker_side {
+        Side::Buy => taker_px >= maker_px * (1.0 + threshold),
+        Side::Sell => taker_px <= maker_px * (1.0 - threshold),
+    }
 }
 
 #[allow(dead_code)]
@@ -615,5 +644,107 @@ mod tests {
         assert_eq!(cancelled[0].event, OrderEvent::Cancelled);
         assert!(activated.is_empty());
         assert!(!engine.is_open_order(&order_id));
+    }
+
+    #[test]
+    fn conservative_depth_threshold_blocks_shallow_cross_but_clears_queue_ahead() {
+        let mut engine = MatchingEngine::with_depth_fill_conservative_threshold(inst(), 0.01);
+        engine.on_depth(OrderBook::one_level(
+            "BTC-USDT",
+            1,
+            level(100.0, 1.0),
+            level(101.0, 1.0),
+        ));
+        engine.submit(NewOrder {
+            symbol: "BTC-USDT".to_string(),
+            side: Side::Buy,
+            qty: 0.5,
+            price: 100.0,
+            time_in_force: TimeInForce::PostOnly,
+            reduce_only: false,
+            self_trade_prevention: None,
+            reason: "quote".to_string(),
+        });
+
+        let depth_updates = engine.on_depth(OrderBook::one_level(
+            "BTC-USDT",
+            2,
+            level(99.0, 1.0),
+            level(100.0, 1.0),
+        ));
+        let trade_updates = engine.on_trade(3, 100.0, 0.5, Side::Sell);
+
+        assert!(depth_updates.is_empty());
+        assert_eq!(trade_updates.len(), 1);
+        assert_eq!(trade_updates[0].event, OrderEvent::FullyFilled);
+        assert_eq!(
+            trade_updates[0].last_fill_liquidity,
+            Some(FillLiquidity::Maker)
+        );
+    }
+
+    #[test]
+    fn conservative_depth_threshold_fills_a_sufficiently_deep_cross() {
+        let mut engine = MatchingEngine::with_depth_fill_conservative_threshold(inst(), 0.001);
+        engine.on_depth(OrderBook::one_level(
+            "BTC-USDT",
+            1,
+            level(100.0, 1.0),
+            level(101.0, 1.0),
+        ));
+        engine.submit(NewOrder {
+            symbol: "BTC-USDT".to_string(),
+            side: Side::Buy,
+            qty: 0.5,
+            price: 100.0,
+            time_in_force: TimeInForce::PostOnly,
+            reduce_only: false,
+            self_trade_prevention: None,
+            reason: "quote".to_string(),
+        });
+
+        let updates = engine.on_depth(OrderBook::one_level(
+            "BTC-USDT",
+            2,
+            level(99.0, 1.0),
+            level(99.8, 1.0),
+        ));
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].event, OrderEvent::FullyFilled);
+        assert_eq!(updates[0].last_fill_liquidity, Some(FillLiquidity::Maker));
+    }
+
+    #[test]
+    fn conservative_depth_threshold_is_symmetric_for_resting_sells() {
+        let mut engine = MatchingEngine::with_depth_fill_conservative_threshold(inst(), 0.001);
+        engine.on_depth(OrderBook::one_level(
+            "BTC-USDT",
+            1,
+            level(99.0, 1.0),
+            level(100.0, 1.0),
+        ));
+        engine.submit(NewOrder {
+            symbol: "BTC-USDT".to_string(),
+            side: Side::Sell,
+            qty: 0.5,
+            price: 100.0,
+            time_in_force: TimeInForce::PostOnly,
+            reduce_only: false,
+            self_trade_prevention: None,
+            reason: "quote".to_string(),
+        });
+
+        let updates = engine.on_depth(OrderBook::one_level(
+            "BTC-USDT",
+            2,
+            level(100.2, 1.0),
+            level(101.0, 1.0),
+        ));
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].event, OrderEvent::FullyFilled);
+        assert_eq!(updates[0].side, Side::Sell);
+        assert_eq!(updates[0].last_fill_liquidity, Some(FillLiquidity::Maker));
     }
 }
