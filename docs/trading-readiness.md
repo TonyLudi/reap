@@ -11,7 +11,7 @@ production trading process.
 | --- | --- | --- |
 | Iarb2 decision model | Covered for the documented OKX parity boundary | Not a blocker |
 | Deterministic backtest/data | Shared strategy code, depth matching, queue-ahead model, fees, credential-free redundant public capture, create-new session files, and raw/normalized replay | Needs sustained full-depth capture and venue-data calibration before capital decisions |
-| Feed components | Redundant public sockets, isolated private sockets, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
+| Feed components | Redundant public sockets, isolated private sockets, transport/state freshness separation, account-plus-positions health rounds, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
 | Order components | Event-loop client IDs/registration, exchange-side place-request expiry, signed submit/cancel, pacing, private reduction, ambiguity handling, and REST reconciliation are composed | Needs demo exchange fault evidence |
 | Runtime risk | Instrument models, authoritative startup positions, account-scoped health, redundant stablecoin guards, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed deadman/depeg evidence |
 | Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, and strict bounded soak reports | Demo-capable; production entry intentionally unavailable |
@@ -102,6 +102,10 @@ production trading process.
     has passed through the strategy and risk engine. Live validation rejects
     master/group strategy topology until its external heartbeat, state, and PnL
     feed exists.
+18. Private transport and account-state health are separate. Every socket must
+    remain connected, while only a complete account/positions data round
+    refreshes account health; pongs and event-only order/fill traffic cannot
+    mask a silent state channel.
 
 ## Remaining Demo Gate
 

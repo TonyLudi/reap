@@ -94,5 +94,6 @@ pub trait VenueAdapter: Send + Sync {
     fn venue(&self) -> Venue;
     fn websocket_url(&self, private: bool) -> &str;
     fn parse(&self, envelope: &RawEnvelope) -> Result<Vec<ParsedEvent>, VenueError>;
+    fn is_data_frame(&self, envelope: &RawEnvelope) -> Result<bool, VenueError>;
     fn subscription_message(&self, subscriptions: &[Subscription]) -> Result<String, VenueError>;
 }

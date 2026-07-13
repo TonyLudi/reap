@@ -133,10 +133,11 @@ outside source control.
    that account's private feed or order task.
 10. It starts redundant public plans and isolated orders, account, and positions
    sockets for every account. The dedicated fills channel is optional for
-   eligible fee tiers; order-channel fills remain canonical. Every transition
-   of the private socket set to ready invalidates the earlier reconciliation
-   and requires a fresh REST order/fill check, closing the bootstrap-to-stream
-   subscription window.
+   eligible fee tiers; order-channel fills remain canonical. Transport
+   acknowledgements alone are not private readiness: account and positions must
+   each deliver a real data payload. Every transition of that complete private
+   state to ready invalidates the earlier reconciliation and requires a fresh
+   REST order/fill check, closing the bootstrap-to-stream subscription window.
 11. It waits for a contiguous sequenced book for every instrument and a
     complete, healthy, post-connect reconciled private stream for every account.
 12. It also waits for every configured stablecoin guard to receive a fresh,
@@ -148,6 +149,27 @@ Live validation rejects `strategy.master_strategy` and
 `strategy.strategy_group`. The pinned Java implementation requires external
 `StrategyUpdate` heartbeat, member-state, and aggregate-PnL inputs for those
 settings; accepting only their static flags would weaken live stop behavior.
+
+## Private Stream Health
+
+- Orders, account, positions, and optional fills use isolated sockets. Every
+  socket must acknowledge its subscription; any disconnect immediately emits
+  account-scoped `PrivateStreamStale` and blocks new orders.
+- The [OKX API guide](https://www.okx.com/docs-v5/en/) documents account and
+  positions as initial/regular state channels, while orders and fills are
+  event-only. Reap therefore requires one valid account payload and one valid
+  positions payload to complete each private-health round. Empty state arrays
+  count as valid data frames; subscription and connection-count control frames
+  do not.
+- Ping/pong proves only that one transport is responsive. Pongs, order updates,
+  and fill updates never refresh aggregate account-state health. Repeated data
+  from one state channel cannot mask silence on the other.
+- A completed account/positions round emits `PrivateStreamRecovered` initially
+  or after a disconnect, and `PrivateStreamHeartbeat` thereafter. Risk marks
+  the account stale when no complete round arrives within `max_private_age_ms`.
+  The demo example uses 30 seconds, above OKX's documented regular state-push
+  cadence. Recovery after a transport loss also requires fresh REST
+  reconciliation before readiness returns.
 
 ## Stablecoin Depeg Guard
 

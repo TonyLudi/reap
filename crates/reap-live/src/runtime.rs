@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reap_core::{
     Channel, ConnId, FeedPriority, NormalizedEvent, OrderStatus, Subscription, SystemEvent,
-    SystemEventKind, TimerEvent, Venue,
+    SystemEventKind, TimeMs, TimerEvent, Venue,
 };
 use reap_feed::{
     ConnectionStatus, ConnectionStatusKind, FeedOutput, FeedProcessor, ReconnectPolicy, SocketPlan,
@@ -1755,11 +1755,15 @@ impl LiveRuntime {
                 source_id,
                 envelope,
             } => {
-                let (account_id, adapter) = {
+                let (account_id, adapter, private_source) = {
                     let source = self.sources.get(source_id).ok_or_else(|| {
                         LiveRuntimeError::FeedAdapter("unknown feed source".to_string())
                     })?;
-                    (source.account_id.clone(), Arc::clone(&source.adapter))
+                    (
+                        source.account_id.clone(),
+                        Arc::clone(&source.adapter),
+                        source.account_id.is_some(),
+                    )
                 };
                 self.record_storage(StorageRecord::Raw {
                     account_id,
@@ -1768,12 +1772,28 @@ impl LiveRuntime {
                 let parsed = adapter
                     .parse(&envelope)
                     .map_err(|error| LiveRuntimeError::FeedAdapter(error.to_string()))?;
+                let private_state_frame = private_source
+                    && matches!(envelope.channel, Channel::Account | Channel::Positions)
+                    && (!parsed.is_empty()
+                        || adapter
+                            .is_data_frame(&envelope)
+                            .map_err(|error| LiveRuntimeError::FeedAdapter(error.to_string()))?);
                 for event in parsed {
                     for output in self.processor.process(event) {
                         self.observe_feed_output(&output);
                         let output = self.coordinator.process_feed(output)?;
                         self.commit_output(output).await?;
                     }
+                }
+                if private_state_frame {
+                    let events = self
+                        .sources
+                        .get_mut(source_id)
+                        .ok_or_else(|| {
+                            LiveRuntimeError::FeedAdapter("unknown feed source".to_string())
+                        })?
+                        .on_private_data(envelope.channel.clone(), envelope.recv_ts_ns / 1_000_000);
+                    self.handle_feed_source_events(events).await?;
                 }
             }
             RuntimeEvent::Connection { source_id, status } => {
@@ -1797,25 +1817,7 @@ impl LiveRuntime {
                         },
                     );
                 }
-                for event in events {
-                    if event.kind == SystemEventKind::PrivateStreamRecovered {
-                        let account_id = event.account_id.as_deref().ok_or_else(|| {
-                            LiveRuntimeError::FeedAdapter(
-                                "private recovery event has no account identity".to_string(),
-                            )
-                        })?;
-                        let output = self.coordinator.require_reconciliation(
-                            account_id,
-                            event.ts_ms,
-                            "verify REST state after private websocket subscription",
-                        )?;
-                        self.commit_output(output).await?;
-                    }
-                    let output = self
-                        .coordinator
-                        .process_event(NormalizedEvent::System(event));
-                    self.commit_output(output).await?;
-                }
+                self.handle_feed_source_events(events).await?;
             }
             RuntimeEvent::SubmitComplete {
                 account_id,
@@ -1935,6 +1937,32 @@ impl LiveRuntime {
                 self.commit_output(output).await?;
             }
             RuntimeEvent::Fatal(message) => return Err(LiveRuntimeError::GatewayTask(message)),
+        }
+        Ok(())
+    }
+
+    async fn handle_feed_source_events(
+        &mut self,
+        events: Vec<SystemEvent>,
+    ) -> Result<(), LiveRuntimeError> {
+        for event in events {
+            if event.kind == SystemEventKind::PrivateStreamRecovered {
+                let account_id = event.account_id.as_deref().ok_or_else(|| {
+                    LiveRuntimeError::FeedAdapter(
+                        "private recovery event has no account identity".to_string(),
+                    )
+                })?;
+                let output = self.coordinator.require_reconciliation(
+                    account_id,
+                    event.ts_ms,
+                    "verify REST state after private websocket state recovery",
+                )?;
+                self.commit_output(output).await?;
+            }
+            let output = self
+                .coordinator
+                .process_event(NormalizedEvent::System(event));
+            self.commit_output(output).await?;
         }
         Ok(())
     }
@@ -2893,6 +2921,8 @@ struct FeedSourceState {
     expected_connections: HashSet<ConnId>,
     ready_connections: HashSet<ConnId>,
     public_subscriptions: Vec<PublicSubscriptionRoute>,
+    required_private_data_channels: HashSet<Channel>,
+    private_data_round: HashSet<Channel>,
     private_ready: bool,
 }
 
@@ -2927,6 +2957,8 @@ impl FeedSourceState {
                     connections,
                 })
                 .collect(),
+            required_private_data_channels: HashSet::new(),
+            private_data_round: HashSet::new(),
             private_ready: false,
         }
     }
@@ -2938,6 +2970,8 @@ impl FeedSourceState {
             expected_connections: plans.iter().map(|plan| plan.conn_id.clone()).collect(),
             ready_connections: HashSet::new(),
             public_subscriptions: Vec::new(),
+            required_private_data_channels: HashSet::from([Channel::Account, Channel::Positions]),
+            private_data_round: HashSet::new(),
             private_ready: false,
         }
     }
@@ -2959,31 +2993,12 @@ impl FeedSourceState {
             }
             ConnectionStatusKind::Disconnected => {
                 self.ready_connections.remove(&status.conn_id);
+                self.private_ready = false;
+                self.private_data_round.clear();
             }
         }
         if let Some(account_id) = &self.account_id {
-            let ready = self.expected_connections.is_subset(&self.ready_connections);
-            let transition = ready != self.private_ready;
-            self.private_ready = ready;
-            if ready {
-                return vec![SystemEvent {
-                    ts_ms: status.ts_ms,
-                    kind: if transition {
-                        SystemEventKind::PrivateStreamRecovered
-                    } else {
-                        SystemEventKind::PrivateStreamHeartbeat
-                    },
-                    venue: Some(status.venue),
-                    account_id: Some(account_id.clone()),
-                    symbol: None,
-                    reason: if transition {
-                        "all required private websocket channels are connected".to_string()
-                    } else {
-                        status.reason
-                    },
-                }];
-            }
-            if transition || status.kind == ConnectionStatusKind::Disconnected {
+            if status.kind == ConnectionStatusKind::Disconnected {
                 return vec![SystemEvent {
                     ts_ms: status.ts_ms,
                     kind: SystemEventKind::PrivateStreamStale,
@@ -2996,6 +3011,13 @@ impl FeedSourceState {
                         self.expected_connections.len()
                     ),
                 }];
+            }
+            if let Some(event) = self.private_health_event(
+                status.ts_ms,
+                status.venue,
+                "all private transports and state-data channels are healthy",
+            ) {
+                return vec![event];
             }
             return Vec::new();
         }
@@ -3018,6 +3040,50 @@ impl FeedSourceState {
                 ),
             })
             .collect()
+    }
+
+    fn on_private_data(&mut self, channel: Channel, ts_ms: TimeMs) -> Vec<SystemEvent> {
+        if self.account_id.is_none() || !self.required_private_data_channels.contains(&channel) {
+            return Vec::new();
+        }
+        self.private_data_round.insert(channel);
+        self.private_health_event(
+            ts_ms,
+            self.adapter.venue(),
+            "fresh account and positions websocket payloads received",
+        )
+        .into_iter()
+        .collect()
+    }
+
+    fn private_health_event(
+        &mut self,
+        ts_ms: TimeMs,
+        venue: Venue,
+        reason: &str,
+    ) -> Option<SystemEvent> {
+        if !self.expected_connections.is_subset(&self.ready_connections)
+            || !self
+                .required_private_data_channels
+                .is_subset(&self.private_data_round)
+        {
+            return None;
+        }
+        let kind = if self.private_ready {
+            SystemEventKind::PrivateStreamHeartbeat
+        } else {
+            SystemEventKind::PrivateStreamRecovered
+        };
+        self.private_ready = true;
+        self.private_data_round.clear();
+        Some(SystemEvent {
+            ts_ms,
+            kind,
+            venue: Some(venue),
+            account_id: self.account_id.clone(),
+            symbol: None,
+            reason: reason.to_string(),
+        })
     }
 }
 
@@ -4339,7 +4405,7 @@ mod tests {
     }
 
     #[test]
-    fn private_account_is_ready_only_when_every_channel_is_connected() {
+    fn private_account_requires_every_transport_and_state_data_round() {
         let plans = vec![
             plan("orders", true, Channel::Orders, None),
             plan("fills", true, Channel::Fills, None),
@@ -4364,11 +4430,45 @@ mod tests {
                 .on_status(status("account", ConnectionStatusKind::Ready))
                 .is_empty()
         );
-        let ready = source.on_status(status("positions", ConnectionStatusKind::Ready));
+        assert!(
+            source
+                .on_status(status("positions", ConnectionStatusKind::Ready))
+                .is_empty()
+        );
+        assert!(
+            source
+                .on_status(status("orders", ConnectionStatusKind::Heartbeat))
+                .is_empty()
+        );
+        assert!(source.on_private_data(Channel::Account, 2).is_empty());
+        assert!(
+            source
+                .on_status(status("positions", ConnectionStatusKind::Heartbeat))
+                .is_empty()
+        );
+        let ready = source.on_private_data(Channel::Positions, 3);
         assert_eq!(ready[0].kind, SystemEventKind::PrivateStreamRecovered);
+
+        assert!(source.on_private_data(Channel::Account, 4).is_empty());
+        assert!(source.on_private_data(Channel::Account, 5).is_empty());
+        assert!(
+            source
+                .on_status(status("orders", ConnectionStatusKind::Heartbeat))
+                .is_empty()
+        );
+        let heartbeat = source.on_private_data(Channel::Positions, 6);
+        assert_eq!(heartbeat[0].kind, SystemEventKind::PrivateStreamHeartbeat);
 
         let stale = source.on_status(status("fills", ConnectionStatusKind::Disconnected));
         assert_eq!(stale[0].kind, SystemEventKind::PrivateStreamStale);
+        assert!(
+            source
+                .on_status(status("fills", ConnectionStatusKind::Ready))
+                .is_empty()
+        );
+        assert!(source.on_private_data(Channel::Positions, 7).is_empty());
+        let recovered = source.on_private_data(Channel::Account, 8);
+        assert_eq!(recovered[0].kind, SystemEventKind::PrivateStreamRecovered);
     }
 
     #[test]
@@ -4403,8 +4503,25 @@ mod tests {
         assert!(subscriptions.iter().all(|subscription| {
             subscription.connections == config.runtime.public_connections_per_subscription
         }));
-        assert_eq!(private_subscriptions(false).len(), 3);
-        assert_eq!(private_subscriptions(true).len(), 4);
+        assert_eq!(
+            private_subscriptions(false)
+                .into_iter()
+                .map(|subscription| subscription.channel)
+                .collect::<HashSet<_>>(),
+            HashSet::from([Channel::Orders, Channel::Account, Channel::Positions])
+        );
+        assert_eq!(
+            private_subscriptions(true)
+                .into_iter()
+                .map(|subscription| subscription.channel)
+                .collect::<HashSet<_>>(),
+            HashSet::from([
+                Channel::Orders,
+                Channel::Fills,
+                Channel::Account,
+                Channel::Positions,
+            ])
+        );
     }
 
     #[test]

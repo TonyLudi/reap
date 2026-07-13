@@ -26,9 +26,10 @@ Implemented:
   exclusive canonical journal lease.
 - A fail-closed `reap-live` composition root with account-scoped REST bootstrap,
   exchange metadata/account-mode verification, redundant public sockets,
-  isolated private sockets, one strategy owner, prioritized gateway tasks, and
-  graceful cancel-and-drain shutdown. Demo entry also validates exchange time
-  and maintains OKX Cancel All After from an independent safety task.
+  isolated private sockets, account/positions data-round health, one strategy
+  owner, prioritized gateway tasks, and graceful cancel-and-drain shutdown.
+  Demo entry also validates exchange time and maintains OKX Cancel All After
+  from an independent safety task.
 - Bounded asynchronous HTTPS webhook alerts and optional Linux journal-disk,
   available-memory, and kernel-clock guards, with preflight evidence and
   fail-closed periodic enforcement outside the strategy loop.

@@ -159,6 +159,7 @@ Responsibilities:
 - Multi-websocket subscription partitioning.
 - Redundant websocket support for critical channels.
 - Ping/pong, reconnect, exponential backoff, and stale-feed detection.
+- Separate per-socket transport liveness from aggregate private-state health.
 - Raw message timestamping.
 - Deduplication.
 - Sequence checking and gap detection.
@@ -324,10 +325,13 @@ matching account/position modes, an authoritative account snapshot already
 applied to the strategy and risk engine, a writable critical log, clean
 checkpoint/REST reconciliation, every sequenced book, every configured healthy
 stablecoin reference, and all configured private channels for every account.
-Orders, account, and positions are required. The dedicated
-fills channel is opt-in because OKX restricts it by fee tier; fills from the
-orders channel remain canonical. Any lost invariant blocks new orders while
-demo-mode cancels remain available.
+Orders, account, and positions transports are required, and account plus
+positions must each deliver a real data payload before private recovery. A
+completed pair of fresh state-channel payloads, rather than a socket pong or an
+event-only order/fill message, refreshes account-scoped private health. The
+dedicated fills channel is opt-in because OKX restricts it by fee tier; fills
+from the orders channel remain canonical. Any lost invariant blocks new orders
+while demo-mode cancels remain available.
 
 The strategy core retains static `master_strategy` and `strategy_group` fields
 for parity experiments and backtests. The live configuration boundary rejects

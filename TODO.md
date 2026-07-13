@@ -110,6 +110,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Require account snapshots to pass through strategy/risk before readiness,
   and reject live master/group topology until its external Java coordination
   feed exists.
+- [x] Separate private transport liveness from account-state freshness: require
+  real account and positions payload rounds, and prevent pongs or event-only
+  order/fill traffic from masking a stale state channel.
 - [x] Reject crossed books and force fresh-snapshot recovery, matching the
   reviewed Java OKX subscriber behavior with explicit sequence validation.
 - [x] Add order `expTime`, startup/periodic exchange-clock validation, and an

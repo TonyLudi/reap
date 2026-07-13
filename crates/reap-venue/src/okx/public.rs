@@ -553,6 +553,17 @@ impl VenueAdapter for OkxAdapter {
         }
     }
 
+    fn is_data_frame(&self, envelope: &RawEnvelope) -> Result<bool, VenueError> {
+        if envelope.venue != Venue::Okx {
+            return Err(Self::invalid("envelope venue is not okx"));
+        }
+        let value: Value = serde_json::from_str(&envelope.payload)
+            .map_err(|error| Self::invalid(error.to_string()))?;
+        Ok(value.get("event").is_none()
+            && value.get("arg").is_some_and(Value::is_object)
+            && value.get("data").is_some_and(Value::is_array))
+    }
+
     fn subscription_message(&self, subscriptions: &[Subscription]) -> Result<String, VenueError> {
         let args = subscriptions
             .iter()
@@ -1105,6 +1116,22 @@ mod tests {
             serde_json::from_str::<Value>(&private).unwrap(),
             json!({"op":"subscribe","args":[{"channel":"orders","instType":"ANY"}]})
         );
+    }
+
+    #[test]
+    fn distinguishes_channel_data_from_private_control_frames() {
+        let adapter = OkxAdapter::default();
+        let data = envelope(
+            Channel::Positions,
+            r#"{"arg":{"channel":"positions","instType":"ANY"},"eventType":"snapshot","data":[]}"#,
+        );
+        let control = envelope(
+            Channel::Positions,
+            r#"{"event":"channel-conn-count","channel":"positions","connCount":"1","connId":"test"}"#,
+        );
+
+        assert!(adapter.is_data_frame(&data).unwrap());
+        assert!(!adapter.is_data_frame(&control).unwrap());
     }
 
     #[test]

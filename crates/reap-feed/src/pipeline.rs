@@ -104,20 +104,13 @@ impl FeedProcessor {
                 self.stats.normalized_events += 1;
                 vec![FeedOutput::Event(event)]
             }
-            VenueEvent::PrivateOrder(update) => vec![
-                private_heartbeat(venue, account_id.clone(), update.ts_ms),
-                FeedOutput::PrivateOrder { account_id, update },
-            ],
-            VenueEvent::PrivateFill(fill) => vec![
-                private_heartbeat(venue, account_id.clone(), fill.ts_ms),
-                FeedOutput::PrivateFill { account_id, fill },
-            ],
+            VenueEvent::PrivateOrder(update) => {
+                vec![FeedOutput::PrivateOrder { account_id, update }]
+            }
+            VenueEvent::PrivateFill(fill) => vec![FeedOutput::PrivateFill { account_id, fill }],
             VenueEvent::Account(update) => {
                 self.stats.normalized_events += 1;
-                vec![
-                    private_heartbeat(venue, account_id.clone(), update.ts_ms),
-                    FeedOutput::PrivateAccount { account_id, update },
-                ]
+                vec![FeedOutput::PrivateAccount { account_id, update }]
             }
         }
     }
@@ -323,17 +316,6 @@ impl FeedProcessor {
     }
 }
 
-fn private_heartbeat(venue: Venue, account_id: Option<String>, ts_ms: TimeMs) -> FeedOutput {
-    FeedOutput::System(SystemEvent {
-        ts_ms,
-        kind: SystemEventKind::PrivateStreamHeartbeat,
-        venue: Some(venue),
-        account_id,
-        symbol: None,
-        reason: "private websocket event accepted".to_string(),
-    })
-}
-
 #[derive(Debug)]
 struct BookStream {
     sequence: SequenceTracker,
@@ -384,6 +366,29 @@ mod tests {
             account_id: None,
             event: VenueEvent::Book(update),
         }
+    }
+
+    #[test]
+    fn private_payload_reduction_does_not_infer_aggregate_stream_health() {
+        let mut processor = FeedProcessor::new(16, 16);
+        let outputs = processor.process(ParsedEvent {
+            id: EventId {
+                venue: Venue::Okx,
+                channel: Channel::Account,
+                symbol: Some("main".to_string()),
+                key: EventKey::Timestamp(1),
+            },
+            account_id: Some("main".to_string()),
+            event: VenueEvent::Account(AccountUpdate {
+                ts_ms: 1,
+                balances: Vec::new(),
+                positions: Vec::new(),
+                margins: Vec::new(),
+            }),
+        });
+
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(outputs[0], FeedOutput::PrivateAccount { .. }));
     }
 
     #[test]

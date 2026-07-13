@@ -158,7 +158,9 @@ configured account and instrument, live composition must provide:
 - Funding rate, index ticker, mark price, and price-limit updates where used.
 - Redundant stablecoin/USD index tickers for every configured live risk guard.
 - Account balances, margin snapshots, positions, orders, and fills.
-- Account-scoped private stream heartbeat, stale, and recovery events.
+- Account-scoped private stream heartbeat, stale, and recovery events derived
+  from complete account/positions payload rounds, separately from per-socket
+  ping/pong transport liveness.
 - Timer and system events through the same single-writer strategy loop.
 
 Private order reasons must be registered before REST submission so websocket
