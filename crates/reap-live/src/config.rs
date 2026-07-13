@@ -140,6 +140,7 @@ pub struct RuntimeConfig {
     pub cancel_all_after_timeout_secs: u64,
     pub cancel_all_after_heartbeat_ms: u64,
     pub ambiguous_submit_grace_ms: u64,
+    pub fill_state_convergence_timeout_ms: u64,
     pub submit_requests_per_window: usize,
     pub cancel_requests_per_window: usize,
     pub reconcile_requests_per_window: usize,
@@ -168,6 +169,7 @@ impl Default for RuntimeConfig {
             cancel_all_after_timeout_secs: 30,
             cancel_all_after_heartbeat_ms: 1_000,
             ambiguous_submit_grace_ms: 5_000,
+            fill_state_convergence_timeout_ms: 2_000,
             submit_requests_per_window: 50,
             cancel_requests_per_window: 50,
             reconcile_requests_per_window: 20,
@@ -423,6 +425,12 @@ impl LiveConfig {
             &mut errors,
         );
         validate_positive_runtime(&self.runtime, &mut errors);
+        if self.runtime.fill_state_convergence_timeout_ms > self.risk.max_private_age_ms {
+            errors.push(
+                "runtime.fill_state_convergence_timeout_ms must not exceed risk.max_private_age_ms"
+                    .to_string(),
+            );
+        }
         if self.storage.path.as_os_str().is_empty() {
             errors.push("storage.path must not be empty".to_string());
         }
@@ -707,6 +715,10 @@ fn validate_positive_runtime(runtime: &RuntimeConfig, errors: &mut Vec<String>) 
             runtime.ambiguous_submit_grace_ms,
         ),
         (
+            "fill_state_convergence_timeout_ms",
+            runtime.fill_state_convergence_timeout_ms,
+        ),
+        (
             "submit_requests_per_window",
             runtime.submit_requests_per_window as u64,
         ),
@@ -732,6 +744,12 @@ fn validate_positive_runtime(runtime: &RuntimeConfig, errors: &mut Vec<String>) 
     if runtime.order_request_expiry_ms > runtime.rest_request_timeout_ms {
         errors.push(
             "runtime.order_request_expiry_ms must not exceed rest_request_timeout_ms".to_string(),
+        );
+    }
+    if runtime.fill_state_convergence_timeout_ms <= runtime.timer_interval_ms {
+        errors.push(
+            "runtime.fill_state_convergence_timeout_ms must be longer than timer_interval_ms"
+                .to_string(),
         );
     }
     if runtime.max_exchange_clock_skew_ms >= runtime.order_request_expiry_ms {
@@ -1104,5 +1122,29 @@ mod tests {
             baseline.fingerprint().unwrap(),
             guarded.fingerprint().unwrap()
         );
+    }
+
+    #[test]
+    fn fill_state_convergence_timeout_must_exceed_timer_resolution() {
+        let mut config = valid_config();
+        config.runtime.fill_state_convergence_timeout_ms = config.runtime.timer_interval_ms;
+
+        let report = config.validate();
+
+        assert!(!report.valid);
+        assert!(report.errors.iter().any(|error| {
+            error.contains(
+                "runtime.fill_state_convergence_timeout_ms must be longer than timer_interval_ms",
+            )
+        }));
+
+        let mut config = valid_config();
+        config.runtime.fill_state_convergence_timeout_ms = config.risk.max_private_age_ms + 1;
+        let report = config.validate();
+        assert!(report.errors.iter().any(|error| {
+            error.contains(
+                "runtime.fill_state_convergence_timeout_ms must not exceed risk.max_private_age_ms",
+            )
+        }));
     }
 }

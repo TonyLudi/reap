@@ -189,6 +189,25 @@ settings; accepting only their static flags would weaken live stop behavior.
   retries; only a subsequent clean full-state pass restores the reconciliation
   gate. This intentionally favors a brief false stop over trading stale state.
 
+## Fill-To-State Convergence
+
+- Every deduplicated canonical fill starts account-scoped pending targets.
+  Derivative fills require a covering update for that instrument's position;
+  spot fills require covering updates for both base and quote balances.
+- Coverage uses exchange update time and also handles the case where the state
+  channel is processed before the order channel. Aggregate account/positions
+  health rounds, socket pongs, unrelated currencies, and unrelated symbols do
+  not clear a target.
+- If any target remains pending for `fill_state_convergence_timeout_ms`, the
+  event loop emits `ReconcileDrift`, blocks the account, cancels its canonical
+  live orders, and requests full REST reconciliation. It reports once while the
+  account is unresolved; normal reconciliation retry policy handles REST
+  failure. An authoritative account snapshot clears pending targets.
+- This guard is transient rather than a durable operator latch. Readiness can
+  return only through the normal private-health and clean-reconciliation gates.
+  A demo fault campaign must delay or suppress both derivative and spot state
+  updates and verify the drift alert, cancels, REST repair, and clean recovery.
+
 ## Stablecoin Depeg Guard
 
 - Configure `[[risk.stablecoin_guards]]` with the OKX index symbol and maximum
@@ -375,6 +394,10 @@ replacement for exchange-side account limits and operator access controls.
   websocket task.
 - Keep private deduplication and health account-scoped. One healthy account must
   never mask another stale account.
+- Set `fill_state_convergence_timeout_ms` above `timer_interval_ms`, no higher
+  than `risk.max_private_age_ms`, and calibrate it from demo
+  fill-to-account/position latency. The demo baseline is 5 seconds; lowering it
+  without latency evidence creates avoidable account-wide stops.
 
 ## Exchange Request Safety
 
@@ -398,6 +421,7 @@ replacement for exchange-side account limits and operator access controls.
 | Public sequence gap | Book recovering; new orders blocked | Obtain a fresh snapshot and replay contiguous buffered deltas |
 | Public feed stale | Symbol blocked; live orders cancelled | Restore at least one healthy feed and verify sequence continuity |
 | Private stream stale | Account blocked; live orders cancelled | Reconnect, REST reconcile orders/fills/balances/positions, then emit recovery |
+| Fill/account-state convergence timeout | Account blocked; live orders cancelled; full reconciliation requested | Inspect the missing symbol/currency target and private-channel latency, then require authoritative repair and a clean pass |
 | Reconcile drift | Account blocked; live orders cancelled | Inspect the recorded full-state differences and require a later clean pass before recovery |
 | Stablecoin reference missing/stale/conflicting/depegged | New entry blocked immediately; durable global kill and live-order cancellation after debounce | Verify both redundant index routes and an independent venue reference; use the stopped-process latch-clear procedure after a sustained breach |
 | Risk breach | Durable global kill active; live orders cancelled | Reduce exposure externally if needed, diagnose, and follow the stopped-process latch-clear procedure; restart alone does not clear it |

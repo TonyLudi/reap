@@ -118,7 +118,7 @@ The following differences do not change the covered quote/hedge calculations:
 | Nitro checksum validation block commented out; legacy V5 CRC validation active | No CRC validation after OKX checksum deprecation; WSS, sequence, snapshot, crossed-book, and stale checks remain mandatory | Current-contract adaptation |
 | Separate receive and exchange latency tracking | Raw `recv_ts_ns`, exchange timestamps, capture health counters, and bounded live webhook alerts | Equivalent data retained; alert routing is a deployment concern |
 | Batch subscription manager and retry limits | Bounded socket partitioning, acknowledgement timeout, exponential reconnect | Equivalent lifecycle with different batching policy |
-| `PositionGatewaySafeguard.OrsFillDelayToPositionUpdate` and the fill-derived position reconciler | Monotonic account rows plus fail-closed REST order/fill/balance/position comparison, authoritative tombstone repair, and second-pass confirmation | Partial: state drift is repaired; a continuous per-fill convergence deadline is still pending |
+| `PositionGatewaySafeguard.OrsFillDelayToPositionUpdate` and the fill-derived position reconciler | Per-fill derivative-position or spot-currency convergence deadline plus monotonic rows, full REST comparison, tombstone repair, and second-pass confirmation | Equivalent fail-closed intent; Rust uses an explicit post-fill deadline rather than Java's two-cycle timestamp-difference check |
 | `ChaosStrategyEngine.tryToStop`, `ChaosStrategyBase.cancelAll(entity)`, and `ExchCancelAll` | In-process canonical cancel/reconcile plus a separate account-wide regular-order emergency CLI | Equivalent normal stop with an additional process-independent safety layer |
 
 The reviewed Java OKX subscriber and `chaos-iarb2` classes do not provide the
@@ -171,7 +171,9 @@ Account reconciliation is intentionally account-scoped and authoritative.
 Differences are measured before replacement, omitted REST rows become zero
 events for strategy/risk, and a dirty repair cannot restore readiness until a
 later full-state pass agrees. This closes restart/reconnect state drift but does
-not yet claim Java's continuous fill-to-position delay safeguard.
+not copy Java's exact timer arithmetic: Rust explicitly waits for each fill's
+affected derivative position or both affected spot balances and reconciles the
+whole account on timeout.
 
 ## Stablecoin Guard Cross-Check
 

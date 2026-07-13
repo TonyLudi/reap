@@ -108,6 +108,7 @@ exchange_clock_check_interval_ms = 30000
 cancel_all_after_timeout_secs = 30
 cancel_all_after_heartbeat_ms = 1000
 ambiguous_submit_grace_ms = 5000
+fill_state_convergence_timeout_ms = 5000
 submit_requests_per_window = 50
 cancel_requests_per_window = 50
 reconcile_requests_per_window = 20

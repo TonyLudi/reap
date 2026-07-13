@@ -116,6 +116,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Reconcile REST balances and positions with websocket-derived state on
   startup, recovery, ambiguity, and shutdown; apply omitted-row tombstones,
   reject stale account rows, and require a second clean pass after repair.
+- [x] Require every canonical derivative fill to converge to its position row
+  and every spot fill to both currency balances within a configured deadline;
+  fail closed and reconcile the account on timeout.
 - [x] Reject crossed books and force fresh-snapshot recovery, matching the
   reviewed Java OKX subscriber behavior with explicit sequence validation.
 - [x] Add order `expTime`, startup/periodic exchange-clock validation, and an

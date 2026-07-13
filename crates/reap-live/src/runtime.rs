@@ -34,6 +34,7 @@ use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::convergence::FillConvergenceGuard;
 use crate::{
     AccountBootstrapSnapshot, CancelAction, CoordinatorError, CoordinatorOutput, HostGuardRuntime,
     HostHealthError, HostHealthSnapshot, LiveAction, LiveConfig, LiveConfigError, LiveCoordinator,
@@ -745,6 +746,7 @@ struct LiveRuntime {
     reconcile_inflight: HashSet<String>,
     cancel_inflight: HashSet<(String, String)>,
     last_reconcile_attempt: HashMap<String, Instant>,
+    fill_convergence: FillConvergenceGuard,
     readiness_timeout_ms: u64,
     timer_interval_ms: u64,
     max_feed_age_ms: u64,
@@ -796,6 +798,7 @@ impl LiveRuntime {
         let operator_config = config.operator.clone();
         let operator_secret = operator_config.secret_from_env()?;
         let config_fingerprint = config.fingerprint()?;
+        let fill_convergence = FillConvergenceGuard::new(&config);
         let recovered = recover_jsonl(storage_lease.journal_path())?;
         validate_recovered_safety_latches(&config, &recovered)?;
         for (account_id, (strategy_name, fingerprint)) in &recovered.bootstrap_identities {
@@ -1111,6 +1114,7 @@ impl LiveRuntime {
             reconcile_inflight: HashSet::new(),
             cancel_inflight: HashSet::new(),
             last_reconcile_attempt: HashMap::new(),
+            fill_convergence: FillConvergenceGuard::default(),
             readiness_timeout_ms: config.runtime.readiness_timeout_ms,
             timer_interval_ms: config.runtime.timer_interval_ms,
             max_feed_age_ms: config.risk.max_feed_age_ms,
@@ -1144,6 +1148,7 @@ impl LiveRuntime {
                 return Err(runtime.close_after_error(primary, &context).await);
             }
         }
+        runtime.fill_convergence = fill_convergence;
         if let Some(secret) = operator_secret {
             let (operator_tx, operator_rx) =
                 mpsc::channel(operator_config.command_channel_capacity);
@@ -1351,6 +1356,15 @@ impl LiveRuntime {
                         self.coordinator_risk_max_feed_age(),
                     ) {
                         let output = self.coordinator.process_event(NormalizedEvent::System(event));
+                        self.commit_output(output).await?;
+                    }
+                    for breach in self.fill_convergence.expire(now_ms) {
+                        let output = self.coordinator.reconciliation_fault(
+                            &breach.account_id,
+                            now_ms,
+                            breach.symbol,
+                            breach.reason,
+                        )?;
                         self.commit_output(output).await?;
                     }
                     let output = self.coordinator.process_event(NormalizedEvent::Timer(TimerEvent {
@@ -1783,7 +1797,34 @@ impl LiveRuntime {
                 for event in parsed {
                     for output in self.processor.process(event) {
                         self.observe_feed_output(&output);
+                        let private_account_id = match &output {
+                            FeedOutput::PrivateAccount {
+                                account_id: Some(account_id),
+                                ..
+                            } => Some(account_id.clone()),
+                            _ => None,
+                        };
+                        let private_order_event = matches!(
+                            &output,
+                            FeedOutput::PrivateOrder {
+                                account_id: Some(_),
+                                ..
+                            } | FeedOutput::PrivateFill {
+                                account_id: Some(_),
+                                ..
+                            }
+                        );
                         let output = self.coordinator.process_feed(output)?;
+                        if let Some(account_id) = private_account_id {
+                            self.observe_account_convergence(
+                                &account_id,
+                                &output,
+                                envelope.recv_ts_ns / 1_000_000,
+                            );
+                        }
+                        if private_order_event {
+                            self.observe_fill_convergence(&output, envelope.recv_ts_ns / 1_000_000);
+                        }
                         self.commit_output(output).await?;
                     }
                 }
@@ -1892,9 +1933,12 @@ impl LiveRuntime {
                         .ok_or_else(|| CoordinatorError::UnknownAccount(account_id.clone()))?;
                     reconcile_full_state(state, &remote_orders, &remote_fills, &remote_account)
                 };
+                let remote_account_ts_ms = remote_account.ts_ms;
                 let account_output = self
                     .coordinator
                     .apply_authoritative_account_snapshot(&account_id, remote_account)?;
+                self.fill_convergence
+                    .observe_authoritative(&account_id, remote_account_ts_ms);
                 self.commit_output(account_output).await?;
                 let clean = report.is_clean();
                 if self.shutdown_in_progress
@@ -1994,6 +2038,20 @@ impl LiveRuntime {
         }
     }
 
+    fn observe_account_convergence(
+        &mut self,
+        account_id: &str,
+        output: &CoordinatorOutput,
+        observed_ms: u64,
+    ) {
+        for record in &output.records {
+            if let StorageRecord::Normalized(NormalizedEvent::Account(update)) = record {
+                self.fill_convergence
+                    .observe_account(account_id, update, observed_ms);
+            }
+        }
+    }
+
     async fn apply_remote_recovery(
         &mut self,
         account_id: &str,
@@ -2018,6 +2076,7 @@ impl LiveRuntime {
                     account_id: Some(account_id.to_string()),
                     fill: fill.clone(),
                 })?;
+                self.observe_fill_convergence(&output, unix_time_ms());
                 self.commit_output(output).await?;
             }
         }
@@ -2032,6 +2091,7 @@ impl LiveRuntime {
                     account_id: Some(account_id.to_string()),
                     update: private_update_from_remote(remote.clone()),
                 })?;
+                self.observe_fill_convergence(&output, unix_time_ms());
                 self.commit_output(output).await?;
             }
         }
@@ -2062,6 +2122,19 @@ impl LiveRuntime {
             self.dispatch_action(action)?;
         }
         Ok(())
+    }
+
+    fn observe_fill_convergence(&mut self, output: &CoordinatorOutput, observed_ms: u64) {
+        for record in &output.records {
+            if let StorageRecord::Order {
+                account_id: Some(account_id),
+                update,
+            } = record
+            {
+                self.fill_convergence
+                    .observe_fill(account_id, update, observed_ms);
+            }
+        }
     }
 
     fn emit_alert(&self, alert: AlertEvent) -> Result<(), LiveRuntimeError> {
@@ -3951,6 +4024,7 @@ mod tests {
             reconcile_inflight: HashSet::new(),
             cancel_inflight: HashSet::new(),
             last_reconcile_attempt: HashMap::new(),
+            fill_convergence: FillConvergenceGuard::default(),
             readiness_timeout_ms: 1_000,
             timer_interval_ms: 100,
             max_feed_age_ms: 60_000,
@@ -4063,6 +4137,7 @@ mod tests {
             reconcile_inflight: HashSet::new(),
             cancel_inflight: HashSet::new(),
             last_reconcile_attempt: HashMap::new(),
+            fill_convergence: FillConvergenceGuard::default(),
             readiness_timeout_ms: 1_000,
             timer_interval_ms: 100,
             max_feed_age_ms: 60_000,
@@ -4309,6 +4384,7 @@ mod tests {
             reconcile_inflight: HashSet::new(),
             cancel_inflight: HashSet::new(),
             last_reconcile_attempt: HashMap::new(),
+            fill_convergence: FillConvergenceGuard::default(),
             readiness_timeout_ms: 1_000,
             timer_interval_ms: 100,
             max_feed_age_ms: 60_000,

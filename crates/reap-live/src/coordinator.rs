@@ -940,7 +940,7 @@ impl LiveCoordinator {
             .sum()
     }
 
-    fn reconciliation_fault(
+    pub(crate) fn reconciliation_fault(
         &mut self,
         account_id: &str,
         ts_ms: TimeMs,
@@ -1726,6 +1726,62 @@ mod tests {
         assert!(output.actions.iter().any(
             |action| matches!(action, LiveAction::Reconcile(action) if action.account_id == "main")
         ));
+    }
+
+    #[test]
+    fn fill_convergence_fault_cancels_live_orders_and_reconciles_account() {
+        let mut coordinator = coordinator();
+        ready(&mut coordinator);
+        coordinator
+            .register_local_order("main", "client-1", order(), 3)
+            .unwrap();
+        coordinator
+            .process_feed(FeedOutput::PrivateOrder {
+                account_id: Some("main".to_string()),
+                update: PrivateOrderUpdate {
+                    ts_ms: 4,
+                    exchange_order_id: "exchange-1".to_string(),
+                    client_order_id: "client-1".to_string(),
+                    symbol: "BTC-USDT".to_string(),
+                    side: Side::Buy,
+                    state: PrivateOrderState::Live,
+                    price: 100.0,
+                    qty: 0.1,
+                    cumulative_filled_qty: 0.0,
+                    average_fill_price: 0.0,
+                    last_fill_qty: 0.0,
+                    last_fill_price: 0.0,
+                    liquidity: None,
+                    fill_id: None,
+                    reject_reason: String::new(),
+                },
+            })
+            .unwrap();
+
+        let output = coordinator
+            .reconciliation_fault(
+                "main",
+                5,
+                Some("BTC-USDT".to_string()),
+                "fill-to-account-state convergence exceeded 2000ms".to_string(),
+            )
+            .unwrap();
+
+        assert!(!coordinator.readiness().is_ready());
+        assert!(output.actions.iter().any(|action| matches!(
+            action,
+            LiveAction::Cancel(cancel) if cancel.client_order_id == "client-1"
+        )));
+        assert!(output.actions.iter().any(|action| matches!(
+            action,
+            LiveAction::Reconcile(reconcile) if reconcile.account_id == "main"
+        )));
+        assert!(output.records.iter().any(|record| matches!(
+            record,
+            StorageRecord::System(event)
+                if event.kind == SystemEventKind::ReconcileDrift
+                    && event.account_id.as_deref() == Some("main")
+        )));
     }
 
     #[test]

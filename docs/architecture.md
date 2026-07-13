@@ -214,6 +214,9 @@ Responsibilities:
 - REST reconciliation for open orders, fills, balances, and positions.
 - Authoritative account-snapshot replacement with zero tombstones for balances
   and positions omitted after closure, plus per-row monotonic update guards.
+- Account-scoped fill convergence: derivative fills await their position row;
+  spot fills await both base and quote balance rows; expiry fails closed and
+  requests full reconciliation.
 - Missed cancel and unknown-order handling.
 
 Strategy code sends intents. The order layer owns what actually happened.
@@ -796,4 +799,6 @@ the default behavior should halt quoting and reconcile. Missing private events
 are more dangerous than missing public ticks. Reconciliation compares canonical
 orders, known fills, balances, and positions before applying the REST account
 snapshot. A dirty pass repairs local state but remains failed; only a later
-clean pass restores the reconciliation gate.
+clean pass restores the reconciliation gate. Independently, each canonical fill
+starts a bounded account-state convergence deadline, so healthy aggregate
+heartbeats cannot conceal a missing symbol/currency update.

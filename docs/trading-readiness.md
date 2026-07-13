@@ -13,7 +13,7 @@ production trading process.
 | Deterministic backtest/data | Shared strategy code, depth matching, queue-ahead model, fees, credential-free redundant public capture, create-new session files, and raw/normalized replay | Needs sustained full-depth capture and venue-data calibration before capital decisions |
 | Feed components | Redundant public sockets, isolated private sockets, transport/state freshness separation, account-plus-positions health rounds, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
 | Order components | Event-loop client IDs/registration, exchange-side place-request expiry, signed submit/cancel, pacing, monotonic private reduction, ambiguity handling, and full order/fill/balance/position REST reconciliation are composed | Needs demo exchange fault evidence |
-| Runtime risk | Instrument models, authoritative startup positions, account-scoped health, redundant stablecoin guards, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed deadman/depeg evidence |
+| Runtime risk | Instrument models, authoritative startup positions, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed deadman/depeg/convergence evidence |
 | Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, and strict bounded soak reports | Demo-capable; production entry intentionally unavailable |
 | Instrument/account bootstrap | Account instruments/config/balance/positions are typed, verified, and applied to strategy/risk before snapshot readiness | Needs target-account certification |
 | Startup/restart gate | Executable phase state, engine-consumed account-snapshot invariant, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, durable latch restore, authoritative account repair, and second-pass clean REST reconciliation | Needs process-kill demo test |
@@ -110,6 +110,10 @@ production trading process.
     and fills before replacing account state. Omitted rows clear through zero
     tombstones, stale websocket rows cannot regress the engine, and a repaired
     dirty pass remains degraded until a later full-state pass is clean.
+20. Every canonical derivative fill must be covered by its position row, while
+    every spot fill must be covered by both currency balances. A configured
+    deadline emits account-scoped drift, cancels live orders, and starts full
+    reconciliation independently of aggregate private-stream heartbeat.
 
 ## Remaining Demo Gate
 
@@ -123,15 +127,16 @@ production trading process.
    inject a transient guard failure without creating a durable latch.
 3. Run minimal-size `demo` orders, then inject socket disconnect, process kill,
    deadman expiry, exchange-clock skew, IOC miss, partial fill, and REST
-   timeout/rate-limit conditions. Verify `expTime`, latch restoration, and
-   Cancel All After from exchange/account evidence. Exercise the independent
-   emergency command after forced process death and archive its zero-order
-   report.
+   timeout/rate-limit conditions. Suppress derivative position updates and each
+   side of a spot balance update long enough to exercise fill convergence.
+   Verify `expTime`, latch restoration, and Cancel All After from
+   exchange/account evidence. Exercise the independent emergency command after
+   forced process death and archive its zero-order report.
 4. Complete a sustained soak with zero unexplained order, fill, balance,
    position, or checkpoint drift. `clean_soak` covers runtime readiness,
    full-state reconciliation, storage drops, alert delivery, and shutdown
-   orders; uninterrupted fill-to-position convergence and restart checkpoint
-   state still require log/account review.
+   orders; fill-convergence latency and restart checkpoint state still require
+   log/account review.
 
 ## Production Gate
 

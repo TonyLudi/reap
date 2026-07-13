@@ -1,5 +1,6 @@
 mod bootstrap;
 mod config;
+mod convergence;
 mod coordinator;
 mod emergency;
 mod host;
