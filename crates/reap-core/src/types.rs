@@ -5,6 +5,49 @@ pub type Quantity = f64;
 pub type Symbol = String;
 pub type TimeMs = u64;
 
+pub const PINNED_JAVA_REVISION: &str = "b6b120c7b7c466d8431bf082f3229328c5d7b2ae";
+
+/// Stable delay classes shared by live evidence and deterministic backtests.
+///
+/// The names map to the pinned Java `BackTestDelay` classes except
+/// `ReferenceData`, which groups Rust index, funding, mark, and price-limit
+/// inputs that have no direct Java delay class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BacktestLatencyClass {
+    MarketDepth,
+    HistoricalTrade,
+    ReferenceData,
+    MatchingNew,
+    MatchingCancel,
+    OrderUpdate,
+    OrderFill,
+}
+
+impl BacktestLatencyClass {
+    pub const ALL: [Self; 7] = [
+        Self::MarketDepth,
+        Self::HistoricalTrade,
+        Self::ReferenceData,
+        Self::MatchingNew,
+        Self::MatchingCancel,
+        Self::OrderUpdate,
+        Self::OrderFill,
+    ];
+
+    pub const fn stable_tag(self) -> u8 {
+        match self {
+            Self::MarketDepth => 1,
+            Self::HistoricalTrade => 2,
+            Self::ReferenceData => 3,
+            Self::MatchingNew => 4,
+            Self::MatchingCancel => 5,
+            Self::OrderUpdate => 6,
+            Self::OrderFill => 7,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Venue {

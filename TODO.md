@@ -120,6 +120,10 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Add bounded deterministic empirical latency profiles by Java-mapped
   message class and instrument, actual sampled-usage reporting, and
   stochastic-dominance validation for coupled baseline/stress runs.
+- [x] Collect bounded live latency evidence at the normalized strategy boundary,
+  REST acknowledgement boundary, and fill-to-account convergence boundary;
+  generate config/code/source-bound calibration artifacts and require an exact
+  artifact/profile match for production-candidate research.
 - [x] Attribute fill fees/turnover and port signed linear/inverse swap funding
   settlement with mark fallback, late/missed coverage signals, and explicit
   end-of-horizon funding actions.
@@ -187,10 +191,11 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [ ] Calibrate queue position, latency, fees, funding, and slippage from
   captured full-depth data, then run and archive production-candidate
   walk-forward, capacity, and stressed-liquidity reports. The orchestration and
-  configurable execution model are implemented but remain uncalibrated;
-  empirical queue and populated per-class/per-instrument latency distributions,
-  fee tiers, complete funding intervals, depeg-sensitive quote valuation,
-  borrow costs, and statement reconciliation are still required.
+  configurable execution model and latency evidence pipeline are implemented
+  but have no credentialed calibration artifact; empirical queue and populated
+  per-class/per-instrument latency distributions, fee tiers, complete funding
+  intervals, depeg-sensitive quote valuation, borrow costs, and statement
+  reconciliation are still required.
 - [ ] Deploy and exercise the webhook/host guards, systemd supervision, external
   unit-failure paging, and independent exchange cancel procedure on the target
   host/account; add a separate algo/spread kill path if those order classes are

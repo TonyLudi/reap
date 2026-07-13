@@ -442,6 +442,17 @@ and selected by a stable seed/class/symbol/event-ordinal quantile, so runs are
 reproducible regardless of rule order. Reports include actual per-class/symbol
 sample count, total, minimum, maximum, and mean latency.
 
+The live composition collects corresponding measurements only after an input
+survives parsing, deduplication, sequencing, and reduction. Reports use a
+bounded deterministic reservoir per class/symbol/semantics and bind the full
+serialized live config, Rust executable, pseudonymous machine/account identity,
+and pinned Java revision. `calibrate-latency` validates clean bounded sessions,
+synchronized clocks, complete per-instrument coverage, zero measured-operation
+failures, and explicit acceptance of REST-ack matching upper bounds before
+producing a profile. Production research treats that JSON as untrusted
+evidence, requires the byte-identical executable and an exact baseline-profile
+match, and rechecks its content hash after execution.
+
 Baseline and stress profiles must share a seed. Research accepts a stress
 distribution only when it first-order stochastically dominates the effective
 baseline distribution for every class and every configured symbol override;
@@ -528,7 +539,8 @@ inventory continuity matters, and constrain terminal delta/gross exposure in
 the manifest. Cross-file position carry must not be inferred from aggregate
 PnL. A `production_candidate` manifest additionally requires at least three
 folds, two stress scenarios, nonzero event/fill/duration gates, calibrated
-baseline execution, complete accounting, and explicit bounds on non-funding
+baseline execution whose latency profile exactly matches a passed source-bound
+calibration artifact, complete accounting, and explicit bounds on non-funding
 work censored by each data horizon. Stress scenarios may use explicitly
 uncalibrated deterministic haircuts.
 
@@ -609,13 +621,15 @@ reap operator --config config/live.toml status
 reap backtest --config config/backtest.toml --events data/events.jsonl
 reap replay-check --events data/events.jsonl
 reap analyze-capture --config config/capture.toml --events data/events.jsonl
+reap calibrate-latency --config config/live.toml --report live.json --output latency.json
 reap inspect-book --capture raw/ws.jsonl --symbol BTC-USDT
 reap config-check --config config/live.toml
 ```
 
-`live`, `capture`, `emergency-cancel`, `operator`, `backtest`, `replay-check`,
-`analyze-capture`, and `config-check` are implemented. `inspect-book` remains
-planned; see [trading-readiness.md](trading-readiness.md).
+`live`, `capture`, `emergency-cancel`, `operator`, `backtest`, `research`,
+`replay-check`, `analyze-capture`, `calibrate-latency`, and `config-check` are
+implemented. `inspect-book` remains planned; see
+[trading-readiness.md](trading-readiness.md).
 
 ## Multi-Websocket Design
 

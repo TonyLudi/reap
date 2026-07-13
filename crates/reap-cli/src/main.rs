@@ -12,6 +12,10 @@ use reap_live::{
 };
 use reap_strategy::ChaosConfig;
 
+mod latency;
+
+use latency::{LatencyCalibrationOptions, build_latency_calibration, profile_toml};
+
 #[derive(Debug, Parser)]
 #[command(name = "reap")]
 #[command(about = "Rust chaos/iarb2 strategy, capture, backtest, replay, and OKX runtime")]
@@ -106,6 +110,12 @@ enum Command {
     Live {
         #[arg(short, long)]
         config: PathBuf,
+        #[arg(
+            short,
+            long,
+            help = "Create a JSON evidence artifact; an existing path is refused"
+        )]
+        output: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = LiveCliMode::Validate)]
         mode: LiveCliMode,
         #[arg(long)]
@@ -118,6 +128,41 @@ enum Command {
             help = "Exit non-zero unless the bounded run satisfies soak invariants"
         )]
         require_clean_soak: bool,
+        #[arg(long)]
+        pretty: bool,
+    },
+    #[command(about = "Build a Java-mapped backtest latency profile from bounded live reports")]
+    CalibrateLatency {
+        #[arg(short, long, help = "Live configuration used by every source report")]
+        config: PathBuf,
+        #[arg(
+            long = "report",
+            required = true,
+            help = "Create-new live report; repeat for multiple bounded runs"
+        )]
+        reports: Vec<PathBuf>,
+        #[arg(
+            short,
+            long,
+            help = "Create the JSON calibration artifact; an existing path is refused"
+        )]
+        output: PathBuf,
+        #[arg(
+            long,
+            help = "Optionally create a mergeable [backtest.latency_profile] TOML fragment"
+        )]
+        profile_output: Option<PathBuf>,
+        #[arg(long, default_value_t = 20260713)]
+        seed: u64,
+        #[arg(long, default_value_t = 1000)]
+        minimum_samples_per_series: u64,
+        #[arg(
+            long,
+            help = "Accept dispatch-to-REST-ack samples as conservative matching-delay upper bounds"
+        )]
+        accept_matching_upper_bounds: bool,
+        #[arg(long, help = "Exit non-zero unless every required series passes")]
+        require_pass: bool,
         #[arg(long)]
         pretty: bool,
     },
@@ -401,6 +446,7 @@ async fn main() -> Result<()> {
         }
         Command::Live {
             config,
+            output,
             mode,
             confirm_demo,
             duration_secs,
@@ -419,13 +465,90 @@ async fn main() -> Result<()> {
                 },
             )
             .await?;
-            if pretty {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+            let json = if pretty {
+                serde_json::to_string_pretty(&report)?
             } else {
-                println!("{}", serde_json::to_string(&report)?);
+                serde_json::to_string(&report)?
+            };
+            if let Some(output) = output {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&output)
+                    .with_context(|| {
+                        format!("failed to create live output {}", output.display())
+                    })?;
+                file.write_all(json.as_bytes())?;
+                file.write_all(b"\n")?;
+                file.sync_all()?;
             }
+            println!("{json}");
             if require_clean_soak && !report.clean_soak {
                 anyhow::bail!("bounded live soak did not satisfy clean acceptance invariants");
+            }
+        }
+        Command::CalibrateLatency {
+            config,
+            reports,
+            output,
+            profile_output,
+            seed,
+            minimum_samples_per_series,
+            accept_matching_upper_bounds,
+            require_pass,
+            pretty,
+        } => {
+            if profile_output.as_ref() == Some(&output) {
+                anyhow::bail!("--output and --profile-output must be different paths");
+            }
+            let artifact = build_latency_calibration(
+                &config,
+                &reports,
+                LatencyCalibrationOptions {
+                    seed,
+                    minimum_samples_per_series,
+                    accept_matching_upper_bounds,
+                },
+            )?;
+            let json = if pretty {
+                serde_json::to_string_pretty(&artifact)?
+            } else {
+                serde_json::to_string(&artifact)?
+            };
+            let mut artifact_file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&output)
+                .with_context(|| {
+                    format!("failed to create latency artifact {}", output.display())
+                })?;
+            artifact_file.write_all(json.as_bytes())?;
+            artifact_file.write_all(b"\n")?;
+            artifact_file.sync_all()?;
+            if let Some(profile_output) = profile_output {
+                if !artifact.passed {
+                    anyhow::bail!(
+                        "refusing to emit a latency profile from a failed calibration; inspect {}",
+                        output.display()
+                    );
+                }
+                let toml = profile_toml(&artifact.profile)?;
+                let mut profile_file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&profile_output)
+                    .with_context(|| {
+                        format!(
+                            "failed to create latency profile {}",
+                            profile_output.display()
+                        )
+                    })?;
+                profile_file.write_all(toml.as_bytes())?;
+                profile_file.sync_all()?;
+            }
+            println!("{json}");
+            if require_pass && !artifact.passed {
+                anyhow::bail!("latency calibration did not satisfy evidence gates");
             }
         }
         Command::Operator {

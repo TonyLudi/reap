@@ -90,6 +90,39 @@ The Rust scheduler was cross-checked against the pinned Java
 | Date-partitioned multi-run service and per-run result files | Manifest folds, immutable input fingerprints, candidate training selection, and test scenario reports | Rust extends the Java artifact boundary with explicit leakage and acceptance gates |
 | Carry ending positions into the following daily run | Every Rust research dataset starts from a zero portfolio and reports that semantic | Intentional current difference; use a continuous dataset and terminal exposure gates rather than assuming cross-file carry |
 
+### Live Latency Evidence Cross-Check
+
+The class names remain pinned to
+`chaos/chaos-backtest/backtest-core/.../BackTestDelay.java` at Java revision
+`b6b120c7b7c466d8431bf082f3229328c5d7b2ae`. The live measurement boundaries
+were also checked against these concrete Java paths:
+
+| Java reference | Rust live evidence | Qualification |
+| --- | --- | --- |
+| `AbstractOkxNitroL2Subscriber.createOrderBookPayloadHandler` records `StartProcessMarketDepth` before JSON parsing | accepted raw `recv_ts_ns` through parse, deduplication, sequencing/book reduction, and entry into the coordinator | Measures the additional target-host path needed after raw replay's receive-time boundary |
+| `OkxNitroOrderClient` records websocket send/sent and order-message process stages | dispatch through the account task, pacing, HTTP request, and successful REST acknowledgement | Current Rust gateway uses REST; this is a conservative `MatchingNew`/`MatchingCancel` upper bound, not exchange matching-engine time |
+| `MatchingOrderUpdatePublisher` schedules both `OrderUpdate` and `BackTestOrderUpdate` with `OrderUpdate` delay | exchange order/fill timestamp to canonical strategy visibility | Requires synchronized host and exchange clocks; the REST reconciliation path is excluded |
+| `MatchingOrderFillPublisher` schedules `OrderFill` with `OrderFill` delay; `BackTestDelay` notes account/position publication is coupled to order update | canonical fill visibility until the derivative position or both spot balances are visible | Matches the Rust strategy's authoritative account-state hedge boundary; it is not a claim that Java's internal publisher topology is identical |
+
+The Rust profile has no separate `quote` or `matching_trade` event class because
+those Java message boundaries are not distinct normalized inputs in the current
+Rust strategy loop. `reference_data` is a documented Rust extension for index,
+funding, mark, price-limit, and burst inputs. `MatchingAmend` remains absent
+because the live policy realizes changes with cancel/new. Calibration requires
+every represented class for every relevant symbol, records these omissions
+instead of silently inventing samples, and rejects private classes from
+read-only observe runs.
+
+Live reports carry the full serialized config fingerprint, Reap executable
+SHA-256, pinned Java revision, pseudonymous machine/account identities, unique
+session, synchronized host snapshots, and deterministic bounded sample
+reservoirs. `calibrate-latency` rejects failed operations or malformed/missing
+series, rounds delays upward into backtest milliseconds, and creates an
+integrity-checked artifact. A schema-2 production research manifest must point
+to that artifact, run the byte-identical Reap executable, and use its exact
+baseline profile. The machinery is complete; no credentialed target-host
+artifact has passed yet.
+
 Zero-delay and full-capacity fixture compatibility is intentional, but it is
 optimistic evidence, not a calibrated execution claim. Backtest reports retain
 the effective delay/capacity configuration, local time basis, clock regressions,

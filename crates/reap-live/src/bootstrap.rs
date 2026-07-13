@@ -103,6 +103,14 @@ pub fn verify_bootstrap(
                 account.id, account.expected_position_mode, snapshot.account_config.position_mode
             ));
         }
+        if snapshot.account_config.user_id.trim().is_empty()
+            || snapshot.account_config.main_user_id.trim().is_empty()
+        {
+            errors.push(format!(
+                "account {} returned no stable OKX user identity during bootstrap",
+                account.id
+            ));
+        }
         if snapshot.balance.balances.is_empty() {
             errors.push(format!(
                 "account {} returned no balances during bootstrap",
@@ -508,6 +516,18 @@ mod tests {
                 .as_deref(),
             Some("main")
         );
+    }
+
+    #[test]
+    fn rejects_missing_exchange_account_identity() {
+        let config = config();
+        let mut snapshot = snapshot();
+        snapshot.account_config.user_id.clear();
+
+        let error = verify_bootstrap(&config, &HashMap::from([("main".to_string(), snapshot)]))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("stable OKX user identity"));
     }
 
     #[test]

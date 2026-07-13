@@ -144,12 +144,20 @@ configuration hashes are verified again after all runs;
 production raw datasets also retain and pass capture-config-bound source
 analysis and a zero-gap replay-integrity check. The smoke fixture intentionally
 uses permissive uncalibrated gates and is not trading evidence.
+Production-candidate manifests use schema 2, require a passed
+`latency_calibration` artifact, and require the baseline's empirical latency
+profile to match that artifact exactly.
 
 Validate the live demo configuration without reading credentials or opening a
 network connection:
 
 ```bash
-cargo run -p reap-cli -- live --config examples/live-okx-demo.toml --mode validate --pretty
+rm -f /tmp/reap-live-validate.json
+cargo run -p reap-cli -- live \
+  --config examples/live-okx-demo.toml \
+  --mode validate \
+  --output /tmp/reap-live-validate.json \
+  --pretty
 ```
 
 Observe OKX demo feeds and account state without permitting any submit or
@@ -190,14 +198,58 @@ drift, storage drops, or alert delivery failures, and shuts down with no active
 orders:
 
 ```bash
-cargo run -p reap-cli -- live --config examples/live-okx-demo.toml --mode observe --duration-secs 3600 --require-clean-soak --pretty
+OBSERVE_REPORT="/tmp/reap-live-observe-$(date -u +%Y%m%dT%H%M%SZ).json"
+cargo run -p reap-cli -- live \
+  --config examples/live-okx-demo.toml \
+  --mode observe \
+  --duration-secs 3600 \
+  --output "$OBSERVE_REPORT" \
+  --require-clean-soak \
+  --pretty
 ```
 
-Enable demo order entry only with the explicit confirmation flag:
+Enable demo order entry only with the explicit confirmation flag and a bounded,
+minimal-size configuration:
 
 ```bash
-cargo run -p reap-cli -- live --config examples/live-okx-demo.toml --mode demo --confirm-demo
+DEMO_REPORT="/tmp/reap-live-demo-$(date -u +%Y%m%dT%H%M%SZ).json"
+cargo run -p reap-cli -- live \
+  --config examples/live-okx-demo.toml \
+  --mode demo \
+  --confirm-demo \
+  --duration-secs 900 \
+  --output "$DEMO_REPORT" \
+  --require-clean-soak \
+  --pretty
 ```
+
+Each create-new live report contains the exact checkpoint and full evidence
+config fingerprints, Reap executable hash, pinned Java revision, pseudonymous
+host/account identity, session/readiness/host evidence, and bounded
+per-class/per-symbol latency samples. Generate a profile only from clean
+target-host reports with the same exact config and binary:
+
+```bash
+CALIBRATION="/tmp/reap-latency-calibration-$(date -u +%Y%m%dT%H%M%SZ).json"
+PROFILE="/tmp/reap-latency-profile-$(date -u +%Y%m%dT%H%M%SZ).toml"
+cargo run -p reap-cli -- calibrate-latency \
+  --config examples/live-okx-demo.toml \
+  --report "$OBSERVE_REPORT" \
+  --report "$DEMO_REPORT" \
+  --output "$CALIBRATION" \
+  --profile-output "$PROFILE" \
+  --accept-matching-upper-bounds \
+  --require-pass \
+  --pretty
+```
+
+Public data classes measure host receive to strategy visibility. Private order
+updates use synchronized exchange time, fills measure canonical fill to all
+required account-state rows, and matching new/cancel samples include local
+queueing, pacing, REST transport, and successful acknowledgement. The latter
+are conservative upper bounds, not direct OKX matching-engine latency. Failed
+operations, clock defects, dropped evidence, missing expected classes, or fewer
+than 1,000 valid samples per required series prevent profile output.
 
 Run tests:
 

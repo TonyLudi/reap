@@ -551,6 +551,13 @@ impl LiveConfig {
         Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
     }
 
+    /// Hash every effective setting for run-report and calibration provenance.
+    pub fn evidence_fingerprint(&self) -> Result<String, LiveConfigError> {
+        let canonical = serde_json::to_value(self)?;
+        let digest = Sha256::digest(serde_json::to_vec(&canonical)?);
+        Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+
     pub fn required_accounts(&self) -> HashSet<String> {
         self.accounts
             .iter()
@@ -1262,6 +1269,19 @@ mod tests {
             valid_config().fingerprint().unwrap(),
             valid_config().fingerprint().unwrap()
         );
+
+        let baseline = valid_config();
+        let mut reordered = valid_config();
+        reordered.accounts[0].trade_modes = [
+            ("BTC-PERP".to_string(), OkxTradeModeConfig::Cross),
+            ("BTC-USDT".to_string(), OkxTradeModeConfig::Cash),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            baseline.evidence_fingerprint().unwrap(),
+            reordered.evidence_fingerprint().unwrap()
+        );
     }
 
     #[test]
@@ -1276,6 +1296,10 @@ mod tests {
         assert_eq!(
             baseline.fingerprint().unwrap(),
             guarded.fingerprint().unwrap()
+        );
+        assert_ne!(
+            baseline.evidence_fingerprint().unwrap(),
+            guarded.evidence_fingerprint().unwrap()
         );
     }
 

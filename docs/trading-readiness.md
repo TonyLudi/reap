@@ -10,7 +10,7 @@ production trading process.
 | Area | Current state | Trading impact |
 | --- | --- | --- |
 | Iarb2 decision model | Covered for the documented OKX parity boundary | Not a blocker |
-| Deterministic backtest/data | Shared strategy code, immediate pending-order registration, arrival-time scheduler, Java-mapped class/symbol empirical latency profiles with sampled-usage reporting, conservative depth/queue/trade capacity controls, event-clock drawdown/exposure/inventory metrics, fee/turnover attribution, scheduled linear/inverse funding, manifest-driven chronological walk-forward selection and stress gates, credential-free redundant public capture, exact provenance, streaming analysis, and raw/normalized replay | Execution/accounting assumptions remain uncalibrated; needs sustained full-depth capture, populated target-host/demo latency samples, complete funding intervals, depeg-sensitive quote valuation, borrow/fee calibration, statement reconciliation, and real production-candidate reports before capital decisions |
+| Deterministic backtest/data | Shared strategy code, immediate pending-order registration, arrival-time scheduler, Java-mapped class/symbol empirical latency profiles with sampled-usage reporting, versioned target-host/live collectors, deterministic calibration artifacts bound into production research, conservative depth/queue/trade capacity controls, event-clock drawdown/exposure/inventory metrics, fee/turnover attribution, scheduled linear/inverse funding, manifest-driven chronological walk-forward selection and stress gates, credential-free redundant public capture, exact provenance, streaming analysis, and raw/normalized replay | The evidence pipeline is implemented but execution/accounting assumptions remain uncalibrated; needs sustained full-depth capture, a passing credentialed target-host/demo latency artifact, complete funding intervals, depeg-sensitive quote valuation, borrow/fee calibration, statement reconciliation, and real production-candidate reports before capital decisions |
 | Feed components | Redundant public sockets, isolated private sockets, transport/state freshness separation, account-plus-positions health rounds, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
 | Order components | Event-loop client IDs/registration, exchange/client acknowledgement binding, account-scoped immutable private identity, semantic duplicate suppression across changed exchange timestamps, exchange-side place-request expiry, signed submit/cancel, pacing, monotonic private reduction, submit/cancel state-convergence deadlines, typed position margin mode, ambiguity handling, and full order/fill/balance/position REST reconciliation are composed | Needs demo exchange fault evidence |
 | Runtime risk | Instrument models, authoritative startup positions, active-order count/notional ceilings, rolling submit-rejection and zero-fill IOC-cancel circuits, terminal strategy-halt promotion, position scope/mode enforcement, forced-repayment blocking, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed deadman/depeg/convergence evidence |
@@ -200,8 +200,17 @@ production trading process.
     `order_update`, and `order_fill` classes plus Rust `reference_data`, with
     optional symbol overrides and scalar fallback. Stable quantile sampling is
     reproducible and reported by class/symbol. Baseline/stress profiles require
-    the same seed and stochastic dominance, but no representative target-host
-    or demo samples have yet been certified.
+    the same seed and stochastic dominance.
+35. Versioned live reports now collect bounded per-class/per-symbol target-host
+    visibility, REST-acknowledgement, private-update, and fill-to-account-state
+    samples, binding the Rust executable plus pseudonymous host and exchange
+    account identities. A deterministic CLI rejects mismatched
+    config/code/host/account/session/clock or failed-operation evidence, emits a
+    profile only after every required series passes, and binds the exact
+    artifact/profile into schema-2 production research. Matching new/cancel
+    measurements are explicitly retained as conservative REST-ack upper bounds.
+    No representative credentialed report or passing calibration artifact has
+    yet been certified.
 
 ## Remaining Demo Gate
 
@@ -214,9 +223,10 @@ production trading process.
    route `[alerts]` to a monitored test destination.
 2. Run `observe` through reconnects and verify every account reaches `ready`
    with no reconciliation drift or critical storage backpressure. Use a bounded
-   run with `--duration-secs <seconds> --require-clean-soak` so the result is
-   machine-verifiable. Confirm both stablecoin references remain fresh and
-   inject a transient guard failure without creating a durable latch.
+   run with `--duration-secs <seconds> --output <create-new-report>
+   --require-clean-soak` so the result is machine-verifiable. Confirm both
+   stablecoin references remain fresh and inject a transient guard failure
+   without creating a durable latch.
 3. Run minimal-size `demo` orders, then inject socket disconnect, process kill,
    deadman expiry, exchange-clock skew, IOC miss, partial fill, and REST
    timeout/rate-limit conditions. Suppress submit and cancel order pushes to
@@ -228,8 +238,10 @@ production trading process.
 4. Complete a sustained soak with zero unexplained order, fill, balance,
    position, or checkpoint drift. `clean_soak` covers runtime readiness,
    full-state reconciliation, storage drops, alert delivery, and shutdown
-   orders; fill-convergence latency and restart checkpoint state still require
-   log/account review.
+   orders; restart checkpoint state still requires log/account review. Generate
+   a passing `calibrate-latency` artifact from synchronized target-host observe
+   and demo reports, archive every source hash/file, and reconcile its private
+   timing populations against exchange/account records.
 
 ## Production Gate
 
@@ -238,6 +250,9 @@ Production enablement additionally requires:
 - Full-depth historical data and calibrated queue, latency, fee, funding, and
   slippage assumptions, including empirical per-message/per-instrument delay
   distributions and empirical validation of the displayed-depth fill threshold.
+  Latency requires a passed source-bound calibration artifact; the implemented
+  REST-ack matching measurements must remain labeled and approved as upper
+  bounds unless a closer exchange boundary is added.
 - Completed `production_candidate` walk-forward and out-of-sample manifests
   using calibrated assumptions, sustained captures, parameter sensitivity,
   capacity, inventory-duration, and stressed-liquidity reports. The runner is

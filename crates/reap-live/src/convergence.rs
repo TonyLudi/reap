@@ -4,6 +4,8 @@ use reap_core::{AccountUpdate, OrderStatus, OrderUpdate};
 
 use crate::LiveConfig;
 
+const MAX_PENDING_FILL_LATENCY_OBSERVATIONS: usize = 8_192;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum StateTarget {
     Balance(String),
@@ -34,6 +36,34 @@ struct PendingFill {
     symbol: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct FillLatencyKey {
+    account_id: String,
+    order_id: String,
+    symbol: String,
+    exchange_ms: u64,
+    cumulative_fill_bits: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PendingFillLatency {
+    first_observed_ns: u64,
+    targets: BTreeSet<StateTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FillConvergenceObservation {
+    pub symbol: String,
+    pub first_observed_ns: u64,
+    pub state_visible_ns: u64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct FillConvergenceResult {
+    pub observations: Vec<FillConvergenceObservation>,
+    pub dropped_latency_observation: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FillConvergenceBreach {
     pub account_id: String,
@@ -48,6 +78,7 @@ pub(crate) struct FillConvergenceGuard {
     known_targets: HashSet<ScopedTarget>,
     last_state_exchange_ms: HashMap<ScopedTarget, u64>,
     pending: HashMap<ScopedTarget, PendingFill>,
+    latency_pending: HashMap<FillLatencyKey, PendingFillLatency>,
     reported_accounts: HashSet<String>,
 }
 
@@ -103,13 +134,32 @@ impl FillConvergenceGuard {
             known_targets,
             last_state_exchange_ms: HashMap::new(),
             pending: HashMap::new(),
+            latency_pending: HashMap::new(),
             reported_accounts: HashSet::new(),
         }
     }
 
-    pub fn observe_fill(&mut self, account_id: &str, update: &OrderUpdate, observed_ms: u64) {
+    #[cfg(test)]
+    fn observe_fill(&mut self, account_id: &str, update: &OrderUpdate, observed_ms: u64) {
+        let _ = self.observe_fill_at(
+            account_id,
+            update,
+            observed_ms,
+            observed_ms.saturating_mul(1_000_000),
+            true,
+        );
+    }
+
+    pub fn observe_fill_at(
+        &mut self,
+        account_id: &str,
+        update: &OrderUpdate,
+        observed_ms: u64,
+        observed_ns: u64,
+        track_latency: bool,
+    ) -> FillConvergenceResult {
         if !update.has_fill() {
-            return;
+            return FillConvergenceResult::default();
         }
         let Some(targets) = self
             .routes
@@ -117,17 +167,19 @@ impl FillConvergenceGuard {
             .and_then(|routes| routes.get(&update.symbol))
             .cloned()
         else {
-            return;
+            return FillConvergenceResult::default();
         };
+        let mut latency_targets = BTreeSet::new();
         for target in targets {
             let key = ScopedTarget {
                 account_id: account_id.to_string(),
-                target,
+                target: target.clone(),
             };
             let last_state_ms = self.last_state_exchange_ms.get(&key).copied().unwrap_or(0);
             if update.ts_ms > 0 && last_state_ms >= update.ts_ms {
                 continue;
             }
+            latency_targets.insert(target);
             self.pending
                 .entry(key)
                 .and_modify(|pending| {
@@ -147,33 +199,122 @@ impl FillConvergenceGuard {
                     symbol: update.symbol.clone(),
                 });
         }
+        if !track_latency {
+            return FillConvergenceResult::default();
+        }
+        if latency_targets.is_empty() {
+            return FillConvergenceResult {
+                observations: vec![FillConvergenceObservation {
+                    symbol: update.symbol.clone(),
+                    first_observed_ns: observed_ns,
+                    state_visible_ns: observed_ns,
+                }],
+                dropped_latency_observation: false,
+            };
+        }
+        let latency_key = FillLatencyKey {
+            account_id: account_id.to_string(),
+            order_id: update.order_id.clone(),
+            symbol: update.symbol.clone(),
+            exchange_ms: update.ts_ms,
+            cumulative_fill_bits: update.filled_qty.to_bits(),
+        };
+        if !self.latency_pending.contains_key(&latency_key)
+            && self.latency_pending.len() >= MAX_PENDING_FILL_LATENCY_OBSERVATIONS
+        {
+            return FillConvergenceResult {
+                observations: Vec::new(),
+                dropped_latency_observation: true,
+            };
+        }
+        self.latency_pending
+            .entry(latency_key)
+            .and_modify(|pending| {
+                pending.first_observed_ns = pending.first_observed_ns.min(observed_ns);
+                pending.targets.extend(latency_targets.iter().cloned());
+            })
+            .or_insert(PendingFillLatency {
+                first_observed_ns: observed_ns,
+                targets: latency_targets,
+            });
+        FillConvergenceResult::default()
     }
 
-    pub fn observe_account(&mut self, account_id: &str, update: &AccountUpdate, observed_ms: u64) {
+    #[cfg(test)]
+    fn observe_account(&mut self, account_id: &str, update: &AccountUpdate, observed_ms: u64) {
+        let _ = self.observe_account_at(
+            account_id,
+            update,
+            observed_ms,
+            observed_ms.saturating_mul(1_000_000),
+        );
+    }
+
+    pub fn observe_account_at(
+        &mut self,
+        account_id: &str,
+        update: &AccountUpdate,
+        observed_ms: u64,
+        observed_ns: u64,
+    ) -> FillConvergenceResult {
         for balance in &update.balances {
+            let target = StateTarget::Balance(balance.currency.clone());
             self.observe_target(
                 ScopedTarget {
                     account_id: account_id.to_string(),
-                    target: StateTarget::Balance(balance.currency.clone()),
+                    target: target.clone(),
                 },
                 update.ts_ms,
                 observed_ms,
             );
+            self.observe_latency_target(account_id, &target, update.ts_ms, observed_ns);
         }
         for position in &update.positions {
+            let target = StateTarget::Position(position.symbol.clone());
             self.observe_target(
                 ScopedTarget {
                     account_id: account_id.to_string(),
-                    target: StateTarget::Position(position.symbol.clone()),
+                    target: target.clone(),
                 },
                 update.ts_ms,
                 observed_ms,
             );
+            self.observe_latency_target(account_id, &target, update.ts_ms, observed_ns);
         }
         self.clear_reported_if_converged(account_id);
+        let mut completed = self
+            .latency_pending
+            .iter()
+            .filter(|(key, pending)| key.account_id == account_id && pending.targets.is_empty())
+            .map(|(key, pending)| {
+                (
+                    key.clone(),
+                    FillConvergenceObservation {
+                        symbol: key.symbol.clone(),
+                        first_observed_ns: pending.first_observed_ns,
+                        state_visible_ns: observed_ns,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        completed.sort_by(|left, right| left.0.cmp(&right.0));
+        for (key, _) in &completed {
+            self.latency_pending.remove(key);
+        }
+        FillConvergenceResult {
+            observations: completed
+                .into_iter()
+                .map(|(_, observation)| observation)
+                .collect(),
+            dropped_latency_observation: false,
+        }
     }
 
-    pub fn observe_authoritative(&mut self, account_id: &str, exchange_ms: u64) {
+    /// Clear pending convergence against an authoritative REST snapshot.
+    ///
+    /// Returns the number of live-path latency observations that were censored
+    /// rather than completed by websocket account state.
+    pub fn observe_authoritative(&mut self, account_id: &str, exchange_ms: u64) -> usize {
         let targets = self
             .known_targets
             .iter()
@@ -187,7 +328,12 @@ impl FillConvergenceGuard {
                 .or_insert(exchange_ms);
         }
         self.pending.retain(|key, _| key.account_id != account_id);
+        let latency_before = self.latency_pending.len();
+        self.latency_pending
+            .retain(|key, _| key.account_id != account_id);
+        let censored_latency = latency_before.saturating_sub(self.latency_pending.len());
         self.reported_accounts.remove(account_id);
+        censored_latency
     }
 
     pub fn expire(&mut self, now_ms: u64) -> Vec<FillConvergenceBreach> {
@@ -260,6 +406,28 @@ impl FillConvergenceGuard {
         });
         if covered {
             self.pending.remove(&key);
+        }
+    }
+
+    fn observe_latency_target(
+        &mut self,
+        account_id: &str,
+        target: &StateTarget,
+        exchange_ms: u64,
+        observed_ns: u64,
+    ) {
+        for (key, pending) in &mut self.latency_pending {
+            if key.account_id != account_id || !pending.targets.contains(target) {
+                continue;
+            }
+            let covered = if exchange_ms > 0 && key.exchange_ms > 0 {
+                exchange_ms >= key.exchange_ms
+            } else {
+                observed_ns >= pending.first_observed_ns
+            };
+            if covered {
+                pending.targets.remove(target);
+            }
         }
     }
 
@@ -631,6 +799,94 @@ mod tests {
     }
 
     #[test]
+    fn latency_observation_requires_every_fill_target_and_is_emitted_once() {
+        let mut guard = spot_guard(2_000);
+        assert!(
+            guard
+                .observe_fill_at("main", &fill("BTC-USDT", 10), 100, 100_000_000, true,)
+                .observations
+                .is_empty()
+        );
+        assert!(
+            guard
+                .observe_account_at("main", &balances(11, &["BTC"]), 120, 120_000_000)
+                .observations
+                .is_empty()
+        );
+
+        let result = guard.observe_account_at("main", &balances(11, &["USDT"]), 135, 135_000_000);
+        let observations = result.observations;
+
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].symbol, "BTC-USDT");
+        assert_eq!(observations[0].first_observed_ns, 100_000_000);
+        assert_eq!(observations[0].state_visible_ns, 135_000_000);
+        assert!(
+            guard
+                .observe_account_at("main", &balances(12, &["USDT"]), 140, 140_000_000)
+                .observations
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn already_visible_account_state_produces_zero_fill_visibility_delay() {
+        let mut guard = derivative_guard(2_000);
+        guard.observe_account(
+            "main",
+            &AccountUpdate {
+                ts_ms: 20,
+                balances: Vec::new(),
+                positions: vec![Position {
+                    symbol: "BTC-USDT-SWAP".to_string(),
+                    qty: 1.0,
+                    avg_price: 100.0,
+                    margin_mode: None,
+                }],
+                margins: Vec::new(),
+            },
+            100,
+        );
+
+        let observations = guard
+            .observe_fill_at("main", &fill("BTC-USDT-SWAP", 19), 101, 101_000_000, true)
+            .observations;
+
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].first_observed_ns,
+            observations[0].state_visible_ns
+        );
+    }
+
+    #[test]
+    fn pending_fill_latency_evidence_is_bounded_and_reports_a_drop() {
+        let mut guard = derivative_guard(2_000);
+        for ordinal in 0..MAX_PENDING_FILL_LATENCY_OBSERVATIONS {
+            let mut update = fill("BTC-USDT-SWAP", ordinal as u64 + 1);
+            update.filled_qty = ordinal as f64 + 1.0;
+            let result = guard.observe_fill_at(
+                "main",
+                &update,
+                ordinal as u64 + 1,
+                ordinal as u64 + 1,
+                true,
+            );
+            assert!(!result.dropped_latency_observation);
+        }
+
+        let mut overflow = fill("BTC-USDT-SWAP", 10_000);
+        overflow.filled_qty = 10_000.0;
+        let result = guard.observe_fill_at("main", &overflow, 10_000, 10_000, true);
+
+        assert!(result.dropped_latency_observation);
+        assert_eq!(
+            guard.latency_pending.len(),
+            MAX_PENDING_FILL_LATENCY_OBSERVATIONS
+        );
+    }
+
+    #[test]
     fn newer_state_observed_before_fill_already_covers_it() {
         let mut guard = derivative_guard(2_000);
         guard.observe_account(
@@ -717,9 +973,10 @@ mod tests {
         guard.observe_fill("main", &fill("BTC-USDT", 10), 100);
         assert_eq!(guard.pending_count(), 2);
 
-        guard.observe_authoritative("main", 11);
+        let censored = guard.observe_authoritative("main", 11);
 
         assert_eq!(guard.pending_count(), 0);
+        assert_eq!(censored, 1);
         assert!(guard.expire(5_000).is_empty());
     }
 

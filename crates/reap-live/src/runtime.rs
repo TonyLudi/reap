@@ -1,11 +1,14 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reap_core::{
-    AccountUpdate, Channel, ConnId, FeedPriority, NormalizedEvent, OrderStatus, Subscription,
-    SystemEvent, SystemEventKind, TimeMs, TimerEvent, Venue,
+    AccountUpdate, BacktestLatencyClass, Channel, ConnId, FeedPriority, MarketEvent,
+    NormalizedEvent, OrderStatus, PINNED_JAVA_REVISION, Subscription, SystemEvent, SystemEventKind,
+    TimeMs, TimerEvent, Venue,
 };
 use reap_feed::{
     ConnectionStatus, ConnectionStatusKind, FeedOutput, FeedProcessor, ReconnectPolicy, SocketPlan,
@@ -30,6 +33,7 @@ use reap_venue::okx::{
 };
 use reap_venue::{PrivateOrderState, PrivateOrderUpdate, RemoteFill, RemoteOrder, VenueAdapter};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -38,13 +42,15 @@ use crate::convergence::{FillConvergenceGuard, OrderStateConvergenceGuard};
 use crate::{
     AccountBootstrapSnapshot, CancelAction, CoordinatorError, CoordinatorOutput, HostGuardRuntime,
     HostHealthError, HostHealthSnapshot, LiveAction, LiveConfig, LiveConfigError, LiveCoordinator,
-    OperatorCommand, OperatorEnvelope, OperatorError, OperatorResponse, OperatorService,
-    OperatorStatus, ReadinessSnapshot, ReconcileAction, ReconciliationResult, StartupGate,
-    SubmitAction, TradingEnvironment, VerifiedBootstrap, check_host_health, okx_instrument_type,
+    LiveLatencyCollector, LiveLatencyEvidence, LiveLatencySemantics, OperatorCommand,
+    OperatorEnvelope, OperatorError, OperatorResponse, OperatorService, OperatorStatus,
+    ReadinessSnapshot, ReconcileAction, ReconciliationResult, StartupGate, SubmitAction,
+    TradingEnvironment, VerifiedBootstrap, check_host_health, okx_instrument_type,
     start_host_guard, start_operator_service, verify_bootstrap,
 };
 
 type LiveGateway = OkxOrderGateway<ReqwestTransport>;
+pub const LIVE_RUN_REPORT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -72,7 +78,18 @@ pub enum LiveStopReason {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LiveRunReport {
+    pub schema_version: u32,
+    pub session_id: Option<String>,
+    pub session_started_at_ms: u64,
+    pub config_fingerprint: String,
+    pub evidence_config_fingerprint: String,
+    pub java_reference_revision: String,
+    pub reap_version: String,
+    pub executable_sha256: String,
+    pub host_identity_sha256: Option<String>,
+    pub account_identity_sha256s: BTreeMap<String, String>,
     pub mode: LiveMode,
     pub stop_reason: LiveStopReason,
     pub elapsed_ms: u64,
@@ -98,6 +115,7 @@ pub struct LiveRunReport {
     pub readiness: ReadinessSnapshot,
     pub dropped_storage_records: u64,
     pub active_orders_after_shutdown: usize,
+    pub latency_evidence: LiveLatencyEvidence,
     pub clean_soak: bool,
 }
 
@@ -111,6 +129,8 @@ pub enum LiveRuntimeError {
     DemoRequiresSimulatedTrading,
     #[error("live run duration must be greater than zero")]
     InvalidRunDuration,
+    #[error("live evidence provenance failed: {0}")]
+    Provenance(String),
     #[error("account {account_id} bootstrap failed: {message}")]
     Bootstrap { account_id: String, message: String },
     #[error("bootstrap verification failed: {0}")]
@@ -332,8 +352,26 @@ pub async fn run_live(
         return Err(LiveRuntimeError::InvalidRunDuration);
     }
     if options.mode == LiveMode::Validate {
+        let config_fingerprint = config.fingerprint()?;
+        let evidence_config_fingerprint = config.evidence_fingerprint()?;
+        let executable_sha256 = current_executable_sha256()?;
+        let host_identity_sha256 = config
+            .host_guard
+            .enabled
+            .then(host_identity_sha256)
+            .transpose()?;
         let readiness = StartupGate::new(&config).snapshot();
         return Ok(LiveRunReport {
+            schema_version: LIVE_RUN_REPORT_SCHEMA_VERSION,
+            session_id: None,
+            session_started_at_ms: unix_time_ms(),
+            config_fingerprint,
+            evidence_config_fingerprint,
+            java_reference_revision: PINNED_JAVA_REVISION.to_string(),
+            reap_version: env!("CARGO_PKG_VERSION").to_string(),
+            executable_sha256,
+            host_identity_sha256,
+            account_identity_sha256s: BTreeMap::new(),
             mode: options.mode,
             stop_reason: LiveStopReason::Validation,
             elapsed_ms: 0,
@@ -359,6 +397,7 @@ pub async fn run_live(
             readiness,
             dropped_storage_records: 0,
             active_orders_after_shutdown: 0,
+            latency_evidence: LiveLatencyEvidence::default(),
             clean_soak: false,
         });
     }
@@ -753,6 +792,13 @@ fn alert_for_storage_record(record: &StorageRecord) -> Option<AlertEvent> {
 }
 
 struct LiveRuntime {
+    session_id: String,
+    session_started_at_ms: u64,
+    config_fingerprint: String,
+    evidence_config_fingerprint: String,
+    executable_sha256: String,
+    host_identity_sha256: Option<String>,
+    account_identity_sha256s: BTreeMap<String, String>,
     mode: LiveMode,
     run_duration: Option<Duration>,
     coordinator: LiveCoordinator,
@@ -780,6 +826,7 @@ struct LiveRuntime {
     shutdown_timeout_ms: u64,
     safety_latch_sync_timeout_ms: u64,
     evidence: RuntimeEvidence,
+    latency: LiveLatencyCollector,
     shutdown_in_progress: bool,
     shutdown_storage_error: Option<String>,
     preserve_deadman_on_shutdown: bool,
@@ -808,6 +855,8 @@ impl LiveRuntime {
         mode: LiveMode,
         run_duration: Option<Duration>,
     ) -> Result<Self, LiveRuntimeError> {
+        let session_started_at_ms = unix_time_ms();
+        let executable_sha256 = current_executable_sha256()?;
         let storage_lease = acquire_storage_lease(&config.storage.path)?;
         let journal_path = storage_lease.journal_path().to_path_buf();
         let host_preflight = if config.host_guard.enabled {
@@ -815,6 +864,11 @@ impl LiveRuntime {
         } else {
             None
         };
+        let host_identity_sha256 = config
+            .host_guard
+            .enabled
+            .then(host_identity_sha256)
+            .transpose()?;
         let mut alert_runtime = config
             .alerts
             .webhook_from_env()?
@@ -825,6 +879,7 @@ impl LiveRuntime {
         let operator_config = config.operator.clone();
         let operator_secret = operator_config.secret_from_env()?;
         let config_fingerprint = config.fingerprint()?;
+        let evidence_config_fingerprint = config.evidence_fingerprint()?;
         let fill_convergence = FillConvergenceGuard::new(&config);
         let order_convergence =
             OrderStateConvergenceGuard::new(config.runtime.order_state_convergence_timeout_ms);
@@ -874,6 +929,7 @@ impl LiveRuntime {
         }
         let (mut verified, seeds, snapshots) =
             bootstrap_accounts(&config, &restored_by_account).await?;
+        let account_identity_sha256s = account_identity_sha256s(&config, &snapshots)?;
         let mut bootstrap_records = Vec::new();
         for account in &config.accounts {
             let exchange_baseline = verified
@@ -912,8 +968,12 @@ impl LiveRuntime {
             }
         }
         let session_id = format!("{:x}", unix_time_ns());
-        let mut coordinator =
-            LiveCoordinator::new(config.clone(), verified, mode == LiveMode::Demo, session_id)?;
+        let mut coordinator = LiveCoordinator::new(
+            config.clone(),
+            verified,
+            mode == LiveMode::Demo,
+            session_id.clone(),
+        )?;
         // Apply recovered halt state before replaying anything that can produce an intent.
         // Reapplying it after reconciliation below generates cancels for restored live orders.
         let _ = restore_safety_latches(&mut coordinator, &recovered)?;
@@ -1120,6 +1180,13 @@ impl LiveRuntime {
         }
 
         let mut runtime = Self {
+            session_id,
+            session_started_at_ms,
+            config_fingerprint,
+            evidence_config_fingerprint,
+            executable_sha256,
+            host_identity_sha256,
+            account_identity_sha256s,
             mode,
             run_duration,
             coordinator,
@@ -1150,6 +1217,7 @@ impl LiveRuntime {
             shutdown_timeout_ms: config.runtime.shutdown_timeout_ms,
             safety_latch_sync_timeout_ms: config.runtime.safety_latch_sync_timeout_ms,
             evidence: RuntimeEvidence::default(),
+            latency: LiveLatencyCollector::default(),
             shutdown_in_progress: false,
             shutdown_storage_error: None,
             preserve_deadman_on_shutdown: false,
@@ -1274,6 +1342,16 @@ impl LiveRuntime {
             self.alert_stats.failed,
         );
         Ok(LiveRunReport {
+            schema_version: LIVE_RUN_REPORT_SCHEMA_VERSION,
+            session_id: Some(self.session_id.clone()),
+            session_started_at_ms: self.session_started_at_ms,
+            config_fingerprint: self.config_fingerprint.clone(),
+            evidence_config_fingerprint: self.evidence_config_fingerprint.clone(),
+            java_reference_revision: PINNED_JAVA_REVISION.to_string(),
+            reap_version: env!("CARGO_PKG_VERSION").to_string(),
+            executable_sha256: self.executable_sha256.clone(),
+            host_identity_sha256: self.host_identity_sha256.clone(),
+            account_identity_sha256s: self.account_identity_sha256s.clone(),
             mode: self.mode,
             stop_reason: outcome.stop_reason,
             elapsed_ms: outcome.elapsed_ms,
@@ -1299,6 +1377,7 @@ impl LiveRuntime {
             readiness,
             dropped_storage_records,
             active_orders_after_shutdown,
+            latency_evidence: self.latency.report(),
             clean_soak,
         })
     }
@@ -1838,6 +1917,12 @@ impl LiveRuntime {
                             .map_err(|error| LiveRuntimeError::FeedAdapter(error.to_string()))?);
                 for event in parsed {
                     for output in self.processor.process(event) {
+                        let strategy_visible_ns = unix_time_ns();
+                        self.observe_feed_latency(
+                            &output,
+                            envelope.recv_ts_ns,
+                            strategy_visible_ns,
+                        );
                         let private_account_id = match &output {
                             FeedOutput::PrivateAccount {
                                 account_id: Some(account_id),
@@ -1856,15 +1941,16 @@ impl LiveRuntime {
                             }
                         );
                         let output = self.coordinator.process_feed(output)?;
+                        let convergence_visible_ns = unix_time_ns();
                         if let Some(account_id) = private_account_id {
                             self.observe_account_convergence(
                                 &account_id,
                                 &output,
-                                envelope.recv_ts_ns / 1_000_000,
+                                convergence_visible_ns,
                             );
                         }
                         if private_order_event {
-                            self.observe_fill_convergence(&output, envelope.recv_ts_ns / 1_000_000);
+                            self.observe_fill_convergence(&output, convergence_visible_ns, true);
                         }
                         self.commit_output(output).await?;
                     }
@@ -1905,9 +1991,19 @@ impl LiveRuntime {
             }
             RuntimeEvent::SubmitComplete {
                 account_id,
+                symbol,
                 outcome,
                 ts_ms,
+                latency_us,
             } => {
+                if let Some(latency_us) = latency_us {
+                    self.latency.observe_us(
+                        BacktestLatencyClass::MatchingNew,
+                        &symbol,
+                        LiveLatencySemantics::StrategyDispatchToRestAckUpperBound,
+                        latency_us,
+                    );
+                }
                 let output = self
                     .coordinator
                     .on_submit_outcome(&account_id, outcome, ts_ms)?;
@@ -1916,10 +2012,16 @@ impl LiveRuntime {
             RuntimeEvent::SubmitFailed {
                 account_id,
                 client_order_id,
+                symbol,
                 ts_ms,
                 ambiguous,
                 reason,
             } => {
+                self.latency.observe_operation_failure(
+                    BacktestLatencyClass::MatchingNew,
+                    &symbol,
+                    LiveLatencySemantics::StrategyDispatchToRestAckUpperBound,
+                );
                 let output = self.coordinator.on_submit_error(
                     &account_id,
                     &client_order_id,
@@ -1931,9 +2033,17 @@ impl LiveRuntime {
             }
             RuntimeEvent::CancelComplete {
                 account_id,
+                symbol,
                 outcome,
                 ts_ms,
+                latency_us,
             } => {
+                self.latency.observe_us(
+                    BacktestLatencyClass::MatchingCancel,
+                    &symbol,
+                    LiveLatencySemantics::StrategyDispatchToRestAckUpperBound,
+                    latency_us,
+                );
                 let output = self
                     .coordinator
                     .on_cancel_outcome(&account_id, outcome, ts_ms)?;
@@ -1942,10 +2052,16 @@ impl LiveRuntime {
             RuntimeEvent::CancelFailed {
                 account_id,
                 client_order_id,
+                symbol,
                 ts_ms,
                 ambiguous,
                 reason,
             } => {
+                self.latency.observe_operation_failure(
+                    BacktestLatencyClass::MatchingCancel,
+                    &symbol,
+                    LiveLatencySemantics::StrategyDispatchToRestAckUpperBound,
+                );
                 let output = self.coordinator.on_cancel_error(
                     &account_id,
                     &client_order_id,
@@ -1981,8 +2097,11 @@ impl LiveRuntime {
                 let account_output = self
                     .coordinator
                     .apply_authoritative_account_snapshot(&account_id, remote_account)?;
-                self.fill_convergence
+                let censored_fill_latencies = self
+                    .fill_convergence
                     .observe_authoritative(&account_id, remote_account_ts_ms);
+                self.latency
+                    .observe_dropped_observations(censored_fill_latencies as u64);
                 self.commit_output(account_output).await?;
                 let pending_order_state = self.order_convergence.pending_reason(&account_id);
                 let clean = report.is_clean() && pending_order_state.is_none();
@@ -2069,16 +2188,77 @@ impl LiveRuntime {
         Ok(())
     }
 
+    fn observe_feed_latency(
+        &mut self,
+        output: &FeedOutput,
+        received_ns: u64,
+        strategy_visible_ns: u64,
+    ) {
+        match output {
+            FeedOutput::Event(NormalizedEvent::Market(event)) => {
+                let class = match event {
+                    MarketEvent::Depth(_) => BacktestLatencyClass::MarketDepth,
+                    MarketEvent::Trade { .. } => BacktestLatencyClass::HistoricalTrade,
+                    MarketEvent::IndexPrice { .. }
+                    | MarketEvent::FundingRate { .. }
+                    | MarketEvent::BurstSignal { .. }
+                    | MarketEvent::PriceLimits { .. } => BacktestLatencyClass::ReferenceData,
+                };
+                self.latency.observe_ns(
+                    class,
+                    event.symbol(),
+                    LiveLatencySemantics::HostReceiveToStrategyVisibility,
+                    received_ns,
+                    strategy_visible_ns,
+                );
+            }
+            FeedOutput::PrivateOrder { update, .. } => {
+                self.latency.observe_exchange_ms(
+                    BacktestLatencyClass::OrderUpdate,
+                    &update.symbol,
+                    update.ts_ms,
+                    strategy_visible_ns,
+                );
+            }
+            FeedOutput::PrivateFill { fill, .. } => {
+                self.latency.observe_exchange_ms(
+                    BacktestLatencyClass::OrderUpdate,
+                    &fill.symbol,
+                    fill.ts_ms,
+                    strategy_visible_ns,
+                );
+            }
+            FeedOutput::Event(_)
+            | FeedOutput::PrivateAccount { .. }
+            | FeedOutput::Duplicate(_)
+            | FeedOutput::RecoveryRequired(_)
+            | FeedOutput::System(_) => {}
+        }
+    }
+
     fn observe_account_convergence(
         &mut self,
         account_id: &str,
         output: &CoordinatorOutput,
-        observed_ms: u64,
+        observed_ns: u64,
     ) {
         for record in &output.records {
             if let StorageRecord::Normalized(NormalizedEvent::Account(update)) = record {
-                self.fill_convergence
-                    .observe_account(account_id, update, observed_ms);
+                let result = self.fill_convergence.observe_account_at(
+                    account_id,
+                    update,
+                    observed_ns / 1_000_000,
+                    observed_ns,
+                );
+                for observation in result.observations {
+                    self.latency.observe_ns(
+                        BacktestLatencyClass::OrderFill,
+                        &observation.symbol,
+                        LiveLatencySemantics::FillToAccountStateVisibility,
+                        observation.first_observed_ns,
+                        observation.state_visible_ns,
+                    );
+                }
             }
         }
     }
@@ -2104,7 +2284,7 @@ impl LiveRuntime {
                     account_id: Some(account_id.to_string()),
                     fill: fill.clone(),
                 })?;
-                self.observe_fill_convergence(&output, unix_time_ms());
+                self.observe_fill_convergence(&output, unix_time_ns(), false);
                 self.commit_output(output).await?;
             }
         }
@@ -2122,7 +2302,7 @@ impl LiveRuntime {
                     account_id: Some(account_id.to_string()),
                     update: private_update_from_remote(remote.clone()),
                 })?;
-                self.observe_fill_convergence(&output, unix_time_ms());
+                self.observe_fill_convergence(&output, unix_time_ns(), false);
                 self.commit_output(output).await?;
             }
         }
@@ -2156,15 +2336,39 @@ impl LiveRuntime {
         Ok(())
     }
 
-    fn observe_fill_convergence(&mut self, output: &CoordinatorOutput, observed_ms: u64) {
+    fn observe_fill_convergence(
+        &mut self,
+        output: &CoordinatorOutput,
+        observed_ns: u64,
+        collect_latency: bool,
+    ) {
         for record in &output.records {
             if let StorageRecord::Order {
                 account_id: Some(account_id),
                 update,
             } = record
             {
-                self.fill_convergence
-                    .observe_fill(account_id, update, observed_ms);
+                let result = self.fill_convergence.observe_fill_at(
+                    account_id,
+                    update,
+                    observed_ns / 1_000_000,
+                    observed_ns,
+                    collect_latency,
+                );
+                if collect_latency {
+                    if result.dropped_latency_observation {
+                        self.latency.observe_dropped_observation();
+                    }
+                    for observation in result.observations {
+                        self.latency.observe_ns(
+                            BacktestLatencyClass::OrderFill,
+                            &observation.symbol,
+                            LiveLatencySemantics::FillToAccountStateVisibility,
+                            observation.first_observed_ns,
+                            observation.state_visible_ns,
+                        );
+                    }
+                }
             }
         }
     }
@@ -2263,6 +2467,7 @@ impl LiveRuntime {
         &mut self,
         action: CancelAction,
     ) -> Result<(), LiveRuntimeError> {
+        let enqueued_at = Instant::now();
         let cancel_key = (action.account_id.clone(), action.client_order_id.clone());
         let symbol = action.symbol.clone();
         if !self.cancel_inflight.insert(cancel_key.clone()) {
@@ -2287,7 +2492,14 @@ impl LiveRuntime {
                 return Err(error);
             }
         };
-        if sender.send(OrderTaskCommand::Cancel(action)).await.is_err() {
+        if sender
+            .send(OrderTaskCommand::Cancel {
+                action,
+                enqueued_at,
+            })
+            .await
+            .is_err()
+        {
             self.cancel_inflight.remove(&cancel_key);
             return Err(LiveRuntimeError::OrderQueueUnavailable(cancel_key.0));
         }
@@ -2350,6 +2562,7 @@ impl LiveRuntime {
     fn dispatch_action(&mut self, action: LiveAction) -> Result<(), LiveRuntimeError> {
         match action {
             LiveAction::Submit(action) => {
+                let enqueued_at = Instant::now();
                 self.record_storage(StorageRecord::OrderRequest(OrderRequestRecord {
                     ts_ms: action.ts_ms,
                     account_id: action.account_id.clone(),
@@ -2360,12 +2573,16 @@ impl LiveRuntime {
                     symbol: action.order.symbol.clone(),
                 }))?;
                 self.order_sender(&action.account_id)?
-                    .try_send(OrderTaskCommand::Submit(action))
+                    .try_send(OrderTaskCommand::Submit {
+                        action,
+                        enqueued_at,
+                    })
                     .map_err(|_| {
                         LiveRuntimeError::OrderQueueUnavailable("submit account queue".to_string())
                     })?;
             }
             LiveAction::Cancel(action) => {
+                let enqueued_at = Instant::now();
                 let cancel_key = (action.account_id.clone(), action.client_order_id.clone());
                 let symbol = action.symbol.clone();
                 if !self.cancel_inflight.insert(cancel_key.clone()) {
@@ -2392,7 +2609,13 @@ impl LiveRuntime {
                         return Err(error);
                     }
                 };
-                if sender.try_send(OrderTaskCommand::Cancel(action)).is_err() {
+                if sender
+                    .try_send(OrderTaskCommand::Cancel {
+                        action,
+                        enqueued_at,
+                    })
+                    .is_err()
+                {
                     self.cancel_inflight.remove(&cancel_key);
                     return Err(LiveRuntimeError::OrderQueueUnavailable(cancel_key.0));
                 }
@@ -2721,24 +2944,30 @@ enum RuntimeEvent {
     },
     SubmitComplete {
         account_id: String,
+        symbol: String,
         outcome: SubmitOutcome,
         ts_ms: u64,
+        latency_us: Option<u64>,
     },
     SubmitFailed {
         account_id: String,
         client_order_id: String,
+        symbol: String,
         ts_ms: u64,
         ambiguous: bool,
         reason: String,
     },
     CancelComplete {
         account_id: String,
+        symbol: String,
         outcome: CancelOutcome,
         ts_ms: u64,
+        latency_us: u64,
     },
     CancelFailed {
         account_id: String,
         client_order_id: String,
+        symbol: String,
         ts_ms: u64,
         ambiguous: bool,
         reason: String,
@@ -2759,8 +2988,14 @@ enum RuntimeEvent {
 }
 
 enum OrderTaskCommand {
-    Submit(SubmitAction),
-    Cancel(CancelAction),
+    Submit {
+        action: SubmitAction,
+        enqueued_at: Instant,
+    },
+    Cancel {
+        action: CancelAction,
+        enqueued_at: Instant,
+    },
     Reconcile(Vec<ReconcileOrderRef>),
     Shutdown,
 }
@@ -2793,7 +3028,11 @@ async fn run_order_task(
 ) {
     while let Some(command) = commands.recv().await {
         match command {
-            OrderTaskCommand::Submit(action) => {
+            OrderTaskCommand::Submit {
+                action,
+                enqueued_at,
+            } => {
+                let symbol = action.order.symbol.clone();
                 let client_order_id = action.client_order_id;
                 let preparation = match gateway.prepare_registered_submit(
                     action.idempotency_key,
@@ -2821,8 +3060,10 @@ async fn run_order_task(
                     if events
                         .send(RuntimeEvent::SubmitComplete {
                             account_id: account_id.clone(),
+                            symbol,
                             outcome,
                             ts_ms: unix_time_ms(),
+                            latency_us: None,
                         })
                         .await
                         .is_err()
@@ -2836,8 +3077,10 @@ async fn run_order_task(
                         if events
                             .send(RuntimeEvent::SubmitComplete {
                                 account_id: account_id.clone(),
+                                symbol,
                                 outcome,
                                 ts_ms: unix_time_ms(),
+                                latency_us: Some(elapsed_us(enqueued_at)),
                             })
                             .await
                             .is_err()
@@ -2850,6 +3093,7 @@ async fn run_order_task(
                             .send(RuntimeEvent::SubmitFailed {
                                 account_id: account_id.clone(),
                                 client_order_id,
+                                symbol,
                                 ts_ms: unix_time_ms(),
                                 ambiguous: error.is_ambiguous(),
                                 reason: error.to_string(),
@@ -2862,7 +3106,11 @@ async fn run_order_task(
                     }
                 }
             }
-            OrderTaskCommand::Cancel(action) => {
+            OrderTaskCommand::Cancel {
+                action,
+                enqueued_at,
+            } => {
+                let symbol = action.symbol.clone();
                 match gateway
                     .cancel(&action.symbol, None, Some(action.client_order_id.clone()))
                     .await
@@ -2874,8 +3122,10 @@ async fn run_order_task(
                         if events
                             .send(RuntimeEvent::CancelComplete {
                                 account_id: account_id.clone(),
+                                symbol,
                                 outcome,
                                 ts_ms: unix_time_ms(),
+                                latency_us: elapsed_us(enqueued_at),
                             })
                             .await
                             .is_err()
@@ -2888,6 +3138,7 @@ async fn run_order_task(
                             .send(RuntimeEvent::CancelFailed {
                                 account_id: account_id.clone(),
                                 client_order_id: action.client_order_id,
+                                symbol,
                                 ts_ms: unix_time_ms(),
                                 ambiguous: error.is_ambiguous(),
                                 reason: error.to_string(),
@@ -3363,6 +3614,95 @@ fn push_public_subscription(
     subscriptions.push(subscription);
 }
 
+fn current_executable_sha256() -> Result<String, LiveRuntimeError> {
+    #[cfg(target_os = "linux")]
+    let path = std::path::PathBuf::from("/proc/self/exe");
+    #[cfg(not(target_os = "linux"))]
+    let path =
+        std::env::current_exe().map_err(|error| LiveRuntimeError::Provenance(error.to_string()))?;
+    let mut file = File::open(&path).map_err(|error| {
+        LiveRuntimeError::Provenance(format!(
+            "failed to open executable {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            LiveRuntimeError::Provenance(format!(
+                "failed to hash executable {}: {error}",
+                path.display()
+            ))
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn host_identity_sha256() -> Result<String, LiveRuntimeError> {
+    let machine_id = std::fs::read("/etc/machine-id").map_err(|error| {
+        LiveRuntimeError::Provenance(format!("failed to read /etc/machine-id: {error}"))
+    })?;
+    let machine_id = machine_id
+        .strip_suffix(b"\n")
+        .unwrap_or(machine_id.as_slice());
+    if machine_id.is_empty() {
+        return Err(LiveRuntimeError::Provenance(
+            "/etc/machine-id is empty".to_string(),
+        ));
+    }
+    Ok(identity_sha256(b"reap-host-v1", &[machine_id]))
+}
+
+fn account_identity_sha256s(
+    config: &LiveConfig,
+    snapshots: &HashMap<String, AccountBootstrapSnapshot>,
+) -> Result<BTreeMap<String, String>, LiveRuntimeError> {
+    let environment = match config.venue.environment {
+        TradingEnvironment::Demo => b"demo".as_slice(),
+        TradingEnvironment::Production => b"production".as_slice(),
+    };
+    config
+        .accounts
+        .iter()
+        .map(|account| {
+            let snapshot = snapshots.get(&account.id).ok_or_else(|| {
+                LiveRuntimeError::Provenance(format!(
+                    "missing bootstrap identity for account {}",
+                    account.id
+                ))
+            })?;
+            Ok((
+                account.id.clone(),
+                identity_sha256(
+                    b"reap-okx-account-v1",
+                    &[
+                        environment,
+                        account.id.as_bytes(),
+                        snapshot.account_config.user_id.trim().as_bytes(),
+                        snapshot.account_config.main_user_id.trim().as_bytes(),
+                    ],
+                ),
+            ))
+        })
+        .collect()
+}
+
+fn identity_sha256(domain: &[u8], fields: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update((domain.len() as u64).to_le_bytes());
+    hasher.update(domain);
+    for field in fields {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 fn private_subscriptions(enable_vip_fills_channel: bool) -> Vec<Subscription> {
     let mut channels = vec![Channel::Orders, Channel::Account, Channel::Positions];
     if enable_vip_fills_channel {
@@ -3388,6 +3728,14 @@ fn unix_time_ms() -> u64 {
 
 fn elapsed_ms(started: &Instant) -> u64 {
     started.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
+
+fn elapsed_us(started: Instant) -> u64 {
+    duration_us_ceil(started.elapsed())
+}
+
+fn duration_us_ceil(duration: Duration) -> u64 {
+    (duration.as_nanos().saturating_add(999) / 1_000).min(u64::MAX as u128) as u64
 }
 
 async fn receive_operator(
@@ -3454,6 +3802,23 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn latency_duration_rounds_up_to_microseconds() {
+        assert_eq!(duration_us_ceil(Duration::ZERO), 0);
+        assert_eq!(duration_us_ceil(Duration::from_nanos(1)), 1);
+        assert_eq!(duration_us_ceil(Duration::from_nanos(1_000)), 1);
+        assert_eq!(duration_us_ceil(Duration::from_nanos(1_001)), 2);
+    }
+
+    #[test]
+    fn pseudonymous_identity_hash_is_stable_and_field_delimited() {
+        let first = identity_sha256(b"account", &[b"ab", b"c"]);
+        assert_eq!(first, identity_sha256(b"account", &[b"ab", b"c"]));
+        assert_ne!(first, identity_sha256(b"account", &[b"a", b"bc"]));
+        assert_ne!(first, identity_sha256(b"host", &[b"ab", b"c"]));
+        assert_eq!(first.len(), 64);
+    }
 
     #[derive(Clone)]
     struct SafetyMockTransport {
@@ -4098,6 +4463,12 @@ mod tests {
         assert_eq!(report.stop_reason, LiveStopReason::Validation);
         assert!(!report.reached_ready);
         assert!(!report.clean_soak);
+        assert_eq!(report.schema_version, LIVE_RUN_REPORT_SCHEMA_VERSION);
+        assert_eq!(report.java_reference_revision, PINNED_JAVA_REVISION);
+        assert_eq!(report.executable_sha256.len(), 64);
+        assert!(report.host_identity_sha256.is_none());
+        assert!(report.account_identity_sha256s.is_empty());
+        assert!(report.latency_evidence.series.is_empty());
     }
 
     #[tokio::test]
@@ -4136,6 +4507,13 @@ mod tests {
         let (control_tx, control_rx) = mpsc::channel(16);
         let (feed_tx, feed_rx) = mpsc::channel(16);
         let runtime = LiveRuntime {
+            session_id: "test-alert-session".to_string(),
+            session_started_at_ms: unix_time_ms(),
+            config_fingerprint: "test-config".to_string(),
+            evidence_config_fingerprint: "test-evidence-config".to_string(),
+            executable_sha256: "a".repeat(64),
+            host_identity_sha256: None,
+            account_identity_sha256s: BTreeMap::new(),
             mode: LiveMode::Observe,
             run_duration: Some(Duration::from_millis(25)),
             coordinator,
@@ -4163,6 +4541,7 @@ mod tests {
             shutdown_timeout_ms: 100,
             safety_latch_sync_timeout_ms: 1_000,
             evidence: RuntimeEvidence::default(),
+            latency: LiveLatencyCollector::default(),
             shutdown_in_progress: false,
             shutdown_storage_error: None,
             preserve_deadman_on_shutdown: false,
@@ -4250,6 +4629,13 @@ mod tests {
                 .await
                 .unwrap();
         let runtime = LiveRuntime {
+            session_id: "test-operator-session".to_string(),
+            session_started_at_ms: unix_time_ms(),
+            config_fingerprint: "test-config".to_string(),
+            evidence_config_fingerprint: "test-evidence-config".to_string(),
+            executable_sha256: "a".repeat(64),
+            host_identity_sha256: None,
+            account_identity_sha256s: BTreeMap::new(),
             mode: LiveMode::Observe,
             run_duration: None,
             coordinator,
@@ -4277,6 +4663,7 @@ mod tests {
             shutdown_timeout_ms: 1_000,
             safety_latch_sync_timeout_ms: 1_000,
             evidence: RuntimeEvidence::default(),
+            latency: LiveLatencyCollector::default(),
             shutdown_in_progress: false,
             shutdown_storage_error: None,
             preserve_deadman_on_shutdown: false,
@@ -4460,7 +4847,7 @@ mod tests {
         let order_task = tokio::spawn(async move {
             while let Some(command) = order_rx.recv().await {
                 match command {
-                    OrderTaskCommand::Cancel(action) => {
+                    OrderTaskCommand::Cancel { action, .. } => {
                         assert_eq!(action.client_order_id, "client-live");
                         task_cancel_observed.store(true, Ordering::SeqCst);
                     }
@@ -4489,7 +4876,7 @@ mod tests {
                             .await
                             .unwrap();
                     }
-                    OrderTaskCommand::Submit(_) => panic!("shutdown dispatched a submit"),
+                    OrderTaskCommand::Submit { .. } => panic!("shutdown dispatched a submit"),
                     OrderTaskCommand::Shutdown => return,
                 }
             }
@@ -4499,6 +4886,13 @@ mod tests {
             .await
             .unwrap();
         let mut runtime = LiveRuntime {
+            session_id: "test-shutdown-session".to_string(),
+            session_started_at_ms: unix_time_ms(),
+            config_fingerprint: "test-config".to_string(),
+            evidence_config_fingerprint: "test-evidence-config".to_string(),
+            executable_sha256: "a".repeat(64),
+            host_identity_sha256: None,
+            account_identity_sha256s: BTreeMap::new(),
             mode: LiveMode::Demo,
             run_duration: None,
             coordinator,
@@ -4526,6 +4920,7 @@ mod tests {
             shutdown_timeout_ms: 1_000,
             safety_latch_sync_timeout_ms: 1_000,
             evidence: RuntimeEvidence::default(),
+            latency: LiveLatencyCollector::default(),
             shutdown_in_progress: false,
             shutdown_storage_error: None,
             preserve_deadman_on_shutdown: false,

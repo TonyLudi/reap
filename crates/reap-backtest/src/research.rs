@@ -9,10 +9,13 @@ use reap_feed::{ReplayCheckReport, replay_check_path};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{BacktestConfig, BacktestExecutionConfig, BacktestReport, BacktestRunner};
+use crate::{
+    BacktestConfig, BacktestExecutionConfig, BacktestReport, BacktestRunner,
+    LatencyCalibrationArtifact, MAX_LATENCY_CALIBRATION_ARTIFACT_BYTES,
+};
 
-pub const RESEARCH_SCHEMA_VERSION: u32 = 1;
-pub const PINNED_JAVA_REVISION: &str = "b6b120c7b7c466d8431bf082f3229328c5d7b2ae";
+pub const RESEARCH_SCHEMA_VERSION: u32 = 2;
+pub use reap_core::PINNED_JAVA_REVISION;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -55,6 +58,8 @@ pub struct ResearchManifest {
     pub schema_version: u32,
     pub mode: ResearchMode,
     pub java_reference_revision: String,
+    #[serde(default)]
+    pub latency_calibration: Option<PathBuf>,
     pub selection_metric: SelectionMetric,
     pub candidates: Vec<ResearchCandidate>,
     pub datasets: Vec<ResearchDataset>,
@@ -140,6 +145,7 @@ pub struct ResearchReport {
     pub executable_sha256: String,
     pub reap_version: String,
     pub java_reference_revision: String,
+    pub latency_calibration: Option<LatencyCalibrationProvenance>,
     pub dataset_portfolio_semantics: DatasetPortfolioSemantics,
     pub candidates: Vec<CandidateProvenance>,
     pub datasets: Vec<DatasetProvenance>,
@@ -156,6 +162,24 @@ pub struct CandidateProvenance {
     pub config: PathBuf,
     pub config_sha256: String,
     pub effective_strategy_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatencyCalibrationProvenance {
+    pub path: PathBuf,
+    pub sha256: String,
+    pub schema_version: u32,
+    pub reap_version: String,
+    pub live_executable_sha256: String,
+    pub host_identity_sha256: String,
+    pub account_identity_sha256s: std::collections::BTreeMap<String, String>,
+    pub live_config_sha256: String,
+    pub live_config_fingerprint: String,
+    pub live_config_evidence_fingerprint: String,
+    pub minimum_samples_per_series: u64,
+    pub matching_latency_is_upper_bound: bool,
+    pub source_report_sha256s: Vec<String>,
+    pub calibrated_series: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,6 +307,12 @@ struct LoadedDataset {
     capture_analysis: Option<CaptureAnalysisReport>,
 }
 
+#[derive(Debug, Clone)]
+struct LoadedLatencyCalibration {
+    provenance: LatencyCalibrationProvenance,
+    resolved_path: PathBuf,
+}
+
 pub fn run_research_manifest_path(path: impl AsRef<Path>) -> Result<ResearchReport> {
     let path = path.as_ref();
     let manifest_bytes = std::fs::read(path)
@@ -294,18 +324,25 @@ pub fn run_research_manifest_path(path: impl AsRef<Path>) -> Result<ResearchRepo
     manifest.validate()?;
 
     let base = path.parent().unwrap_or_else(|| Path::new("."));
-    let candidates = load_candidates(&manifest.candidates, base)?;
-    let datasets = load_datasets(&manifest.datasets, base, manifest.mode, &candidates)?;
     let executable_path =
         std::env::current_exe().context("failed to resolve current executable")?;
     let executable_sha256 = sha256_path(&executable_path)?;
-    let manifest_sha256 = sha256_bytes(&manifest_bytes);
-    let mut cache = HashMap::new();
     let baseline = manifest
         .scenarios
         .iter()
         .find(|scenario| scenario.kind == ResearchScenarioKind::Baseline)
         .expect("manifest validation requires one baseline scenario");
+    let latency_calibration = load_latency_calibration(
+        manifest.latency_calibration.as_deref(),
+        base,
+        manifest.mode,
+        baseline,
+        &executable_sha256,
+    )?;
+    let candidates = load_candidates(&manifest.candidates, base)?;
+    let datasets = load_datasets(&manifest.datasets, base, manifest.mode, &candidates)?;
+    let manifest_sha256 = sha256_bytes(&manifest_bytes);
+    let mut cache = HashMap::new();
     let mut folds = Vec::with_capacity(manifest.folds.len());
 
     for fold in &manifest.folds {
@@ -425,6 +462,7 @@ pub fn run_research_manifest_path(path: impl AsRef<Path>) -> Result<ResearchRepo
         &executable_sha256,
         &candidates,
         &datasets,
+        latency_calibration.as_ref(),
     )?;
     let passed = failures.is_empty();
 
@@ -437,6 +475,7 @@ pub fn run_research_manifest_path(path: impl AsRef<Path>) -> Result<ResearchRepo
         executable_sha256,
         reap_version: env!("CARGO_PKG_VERSION").to_string(),
         java_reference_revision: manifest.java_reference_revision,
+        latency_calibration: latency_calibration.map(|loaded| loaded.provenance),
         dataset_portfolio_semantics: DatasetPortfolioSemantics::IndependentZeroInitialPortfolio,
         candidates: candidates
             .iter()
@@ -617,6 +656,11 @@ impl ResearchManifest {
             ));
         }
         if self.mode == ResearchMode::ProductionCandidate {
+            if self.latency_calibration.is_none() {
+                errors.push(
+                    "production_candidate requires a latency_calibration artifact".to_string(),
+                );
+            }
             if self.candidates.len() < 2 {
                 errors.push(
                     "production_candidate requires at least two candidate configs".to_string(),
@@ -967,6 +1011,93 @@ fn load_candidates(specs: &[ResearchCandidate], base: &Path) -> Result<Vec<Loade
     Ok(loaded)
 }
 
+fn load_latency_calibration(
+    spec: Option<&Path>,
+    base: &Path,
+    mode: ResearchMode,
+    baseline: &ResearchScenario,
+    executable_sha256: &str,
+) -> Result<Option<LoadedLatencyCalibration>> {
+    let Some(spec) = spec else {
+        return Ok(None);
+    };
+    let resolved = resolve(base, spec);
+    let canonical = resolved.canonicalize().with_context(|| {
+        format!(
+            "failed to resolve latency calibration {}",
+            resolved.display()
+        )
+    })?;
+    let artifact_size = std::fs::metadata(&canonical)
+        .with_context(|| {
+            format!(
+                "failed to inspect latency calibration {}",
+                canonical.display()
+            )
+        })?
+        .len();
+    if artifact_size > MAX_LATENCY_CALIBRATION_ARTIFACT_BYTES {
+        bail!(
+            "latency calibration is {artifact_size} bytes, maximum is {MAX_LATENCY_CALIBRATION_ARTIFACT_BYTES}"
+        );
+    }
+    let bytes = std::fs::read(&canonical)
+        .with_context(|| format!("failed to read latency calibration {}", canonical.display()))?;
+    let sha256 = sha256_bytes(&bytes);
+    let artifact: LatencyCalibrationArtifact =
+        serde_json::from_slice(&bytes).with_context(|| {
+            format!(
+                "failed to parse latency calibration {}",
+                canonical.display()
+            )
+        })?;
+    artifact.validate_integrity().with_context(|| {
+        format!(
+            "latency calibration {} failed integrity validation",
+            canonical.display()
+        )
+    })?;
+    if artifact.reap_version != env!("CARGO_PKG_VERSION")
+        || artifact.live_executable_sha256 != executable_sha256
+    {
+        bail!(
+            "latency calibration was collected by a different Reap build than this research executable"
+        );
+    }
+    if artifact.profile != baseline.execution.latency_profile {
+        bail!("baseline latency profile does not exactly match the bound calibration artifact");
+    }
+    if mode == ResearchMode::ProductionCandidate && !baseline.execution.calibrated {
+        bail!("production latency calibration requires a calibrated baseline execution");
+    }
+    let mut source_report_sha256s = artifact
+        .source_reports
+        .iter()
+        .map(|source| source.sha256.clone())
+        .collect::<Vec<_>>();
+    source_report_sha256s.sort();
+    source_report_sha256s.dedup();
+    Ok(Some(LoadedLatencyCalibration {
+        provenance: LatencyCalibrationProvenance {
+            path: spec.to_path_buf(),
+            sha256,
+            schema_version: artifact.schema_version,
+            reap_version: artifact.reap_version,
+            live_executable_sha256: artifact.live_executable_sha256,
+            host_identity_sha256: artifact.host_identity_sha256,
+            account_identity_sha256s: artifact.account_identity_sha256s,
+            live_config_sha256: artifact.live_config_sha256,
+            live_config_fingerprint: artifact.live_config_fingerprint,
+            live_config_evidence_fingerprint: artifact.live_config_evidence_fingerprint,
+            minimum_samples_per_series: artifact.minimum_samples_per_series,
+            matching_latency_is_upper_bound: artifact.matching_latency_is_upper_bound,
+            source_report_sha256s,
+            calibrated_series: artifact.series.len(),
+        },
+        resolved_path: canonical,
+    }))
+}
+
 fn load_datasets(
     specs: &[ResearchDataset],
     base: &Path,
@@ -1167,6 +1298,7 @@ fn verify_input_hashes(
     executable_sha256: &str,
     candidates: &[LoadedCandidate],
     datasets: &[LoadedDataset],
+    latency_calibration: Option<&LoadedLatencyCalibration>,
 ) -> Result<()> {
     if sha256_path(manifest_path)? != manifest_sha256 {
         bail!("research manifest changed while research was running");
@@ -1202,6 +1334,11 @@ fn verify_input_hashes(
                 );
             }
         }
+    }
+    if let Some(calibration) = latency_calibration
+        && sha256_path(&calibration.resolved_path)? != calibration.provenance.sha256
+    {
+        bail!("latency calibration changed while research was running");
     }
     Ok(())
 }
@@ -1767,6 +1904,7 @@ mod tests {
             schema_version: RESEARCH_SCHEMA_VERSION,
             mode: ResearchMode::Smoke,
             java_reference_revision: PINNED_JAVA_REVISION.to_string(),
+            latency_calibration: None,
             selection_metric: SelectionMetric::NetPnlUsd,
             candidates: vec![ResearchCandidate {
                 id: "base".to_string(),

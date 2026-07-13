@@ -1,9 +1,15 @@
+mod calibration;
 mod execution;
 mod matching;
 mod portfolio;
 mod replay;
 mod research;
 
+pub use calibration::{
+    LATENCY_CALIBRATION_SCHEMA_VERSION, LatencyCalibrationArtifact, LatencyCalibrationSeries,
+    LatencySourceReport, MAX_LATENCY_CALIBRATION_ARTIFACT_BYTES,
+    MAX_LATENCY_CALIBRATION_RETAINED_INPUT_SAMPLES, MAX_LATENCY_CALIBRATION_SOURCE_REPORTS,
+};
 use execution::BacktestLatencySampler;
 pub use execution::{
     BacktestConfig, BacktestExecutionConfig, BacktestLatencyClass, BacktestLatencyProfile,
@@ -18,10 +24,10 @@ pub use replay::{
 };
 pub use research::{
     CandidateProvenance, CandidateTrainingReport, DatasetPortfolioSemantics, DatasetProvenance,
-    FoldReport, PINNED_JAVA_REVISION, RESEARCH_SCHEMA_VERSION, ResearchAggregate,
-    ResearchCandidate, ResearchDataFormat, ResearchDataset, ResearchFold, ResearchGates,
-    ResearchManifest, ResearchMode, ResearchReport, ResearchRunReport, ResearchScenario,
-    ResearchScenarioKind, RunAggregate, SelectionMetric, TestScenarioReport,
+    FoldReport, LatencyCalibrationProvenance, PINNED_JAVA_REVISION, RESEARCH_SCHEMA_VERSION,
+    ResearchAggregate, ResearchCandidate, ResearchDataFormat, ResearchDataset, ResearchFold,
+    ResearchGates, ResearchManifest, ResearchMode, ResearchReport, ResearchRunReport,
+    ResearchScenario, ResearchScenarioKind, RunAggregate, SelectionMetric, TestScenarioReport,
     run_research_manifest_path,
 };
 

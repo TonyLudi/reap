@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, bail};
+pub use reap_core::BacktestLatencyClass;
 use reap_core::Symbol;
 use reap_strategy::ChaosConfig;
 use serde::{Deserialize, Serialize};
@@ -9,49 +10,6 @@ const MAX_BACKTEST_LATENCY_MS: u64 = 3_600_000;
 const MAX_LATENCY_PROFILE_RULES: usize = 4_096;
 const MAX_LATENCY_SAMPLES_PER_RULE: usize = 65_536;
 const MAX_TOTAL_LATENCY_SAMPLES: usize = 1_000_000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BacktestLatencyClass {
-    /// Pinned Java `MarketDepth`.
-    MarketDepth,
-    /// Pinned Java `HistoryTrade`.
-    HistoricalTrade,
-    /// Index, funding, price-limit, and burst inputs without a direct Java delay class.
-    ReferenceData,
-    /// Pinned Java `MatchingNew`.
-    MatchingNew,
-    /// Pinned Java `MatchingCancel`.
-    MatchingCancel,
-    /// Pinned Java `OrderUpdate`.
-    OrderUpdate,
-    /// Pinned Java `OrderFill`, used for account/position visibility after a fill.
-    OrderFill,
-}
-
-impl BacktestLatencyClass {
-    const ALL: [Self; 7] = [
-        Self::MarketDepth,
-        Self::HistoricalTrade,
-        Self::ReferenceData,
-        Self::MatchingNew,
-        Self::MatchingCancel,
-        Self::OrderUpdate,
-        Self::OrderFill,
-    ];
-
-    fn stable_tag(self) -> u8 {
-        match self {
-            Self::MarketDepth => 1,
-            Self::HistoricalTrade => 2,
-            Self::ReferenceData => 3,
-            Self::MatchingNew => 4,
-            Self::MatchingCancel => 5,
-            Self::OrderUpdate => 6,
-            Self::OrderFill => 7,
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -236,7 +194,7 @@ impl BacktestExecutionConfig {
 }
 
 impl BacktestLatencyProfile {
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         if self.rules.len() > MAX_LATENCY_PROFILE_RULES {
             bail!(
                 "backtest.latency_profile has {} rules, maximum is {MAX_LATENCY_PROFILE_RULES}",

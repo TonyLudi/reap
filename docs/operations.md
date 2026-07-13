@@ -203,7 +203,9 @@ artifact creation, and exit status.
 
 For real research, create a new manifest alongside immutable capture files:
 
-1. Set `mode = "production_candidate"` and retain the pinned Java revision.
+1. Set `schema_version = 2`, `mode = "production_candidate"`, retain the pinned
+   Java revision, and point `latency_calibration` to the passed create-new JSON
+   artifact whose profile is embedded exactly in the baseline scenario.
 2. List explicit full candidate TOML files; the runner does not mutate arbitrary
    strategy fields or generate an implicit parameter grid.
 3. Give every capture a unique dataset ID/path/content hash. Every test window
@@ -213,11 +215,11 @@ For real research, create a new manifest alongside immutable capture files:
    strict capture analysis plus a zero-gap raw replay check before candidate
    evaluation. It also requires at least two connections per stream and the
    book/trade/index/mark/limit/funding channels needed by every candidate.
-4. Define exactly one baseline using empirically calibrated execution values
-   and at least two stress scenarios. Profile stress uses the same seed and must
-   first-order stochastically dominate baseline for every effective class/symbol
-   distribution. Threshold and queue can only increase; trade/depth
-   participation can only decrease.
+4. Define exactly one baseline using empirically calibrated execution values,
+   set `calibrated = true`, and add at least two stress scenarios. Profile stress
+   uses the same seed and must first-order stochastically dominate baseline for
+   every effective class/symbol distribution. Threshold and queue can only
+   increase; trade/depth participation can only decrease.
 5. Set nonzero event, fill, and duration evidence minimums plus explicit PnL,
    drawdown, terminal/maximum position and pending-hedge delta,
    terminal/maximum gross position and active-order exposure, active-order
@@ -657,7 +659,9 @@ settings; accepting only their static flags would weaken live stop behavior.
 - Alert routing and host thresholds are deployment-only and are excluded from
   checkpoint identity, so enabling them does not invalidate an existing
   reconciled journal. Trading, account, runtime, storage, and operator changes
-  remain fingerprint-bound.
+  remain fingerprint-bound. Live evidence reports separately hash every
+  effective setting, so changing either guard invalidates latency calibration
+  compatibility even though checkpoint recovery remains valid.
 - Set `[host_guard].enabled = true` for deployment. Choose disk and memory
   thresholds above the amount needed for a full fault/reconciliation window,
   not merely enough for the next flush. A failed preflight prevents credential
@@ -959,10 +963,13 @@ Use a bounded run for evidence that can be evaluated without an operator-timed
 signal. An observe soak never permits submit or cancel requests:
 
 ```bash
+mkdir -p var/reap/evidence
+OBSERVE_REPORT="var/reap/evidence/observe-$(date -u +%Y%m%dT%H%M%SZ).json"
 cargo run -p reap-cli -- live \
   --config examples/live-okx-demo.toml \
   --mode observe \
   --duration-secs 3600 \
+  --output "$OBSERVE_REPORT" \
   --require-clean-soak \
   --pretty
 ```
@@ -971,11 +978,13 @@ After observe acceptance, run a deliberately short minimal-size demo window
 before increasing its duration:
 
 ```bash
+DEMO_REPORT="var/reap/evidence/demo-$(date -u +%Y%m%dT%H%M%SZ).json"
 cargo run -p reap-cli -- live \
   --config examples/live-okx-demo.toml \
   --mode demo \
   --confirm-demo \
   --duration-secs 900 \
+  --output "$DEMO_REPORT" \
   --require-clean-soak \
   --pretty
 ```
@@ -1004,3 +1013,80 @@ uses the pre-shutdown `readiness_at_stop` snapshot.
 A `clean_soak` result is evidence for this bounded runtime window only. Review
 the JSONL log, account balances, positions, fills, and checkpoint restart before
 checking off the sustained demo gate.
+
+## Live Latency Evidence
+
+`--output` creates and fsyncs a versioned JSON report before enforcing
+`--require-clean-soak`; existing paths are refused. The report binds a unique
+session, start time, Reap version and executable SHA-256, pinned Java revision,
+pseudonymous machine/account identities, checkpoint identity, and a second
+fingerprint over every serialized live setting, including host and alert
+guards. Raw machine IDs and OKX user IDs are not emitted. The report also
+retains a deterministic uniform reservoir of at most 8,192 samples for each
+class/symbol/semantics series. Archive the exact live TOML, binary, and original
+reports; the calibration artifact retains their hashes but is not a replacement
+for those source files.
+
+The measurements map to the backtest scheduler as follows:
+
+| Class | Live boundary | Calibration constraint |
+| --- | --- | --- |
+| `market_depth` | accepted websocket host receive to entry into the strategy coordinator | Raw replay already starts at host receive, so exchange-to-host time is deliberately excluded |
+| `historical_trade` | accepted websocket host receive to strategy visibility | Same local visibility boundary as depth |
+| `reference_data` | accepted index/funding/mark/limit input at host receive to strategy visibility | Rust class with no direct Java `BackTestDelay` member |
+| `matching_new` | event-loop dispatch through storage, account queue, pacing, REST, and successful place acknowledgement | Demo only; conservative upper bound for Java `MatchingNew`, requiring explicit acceptance |
+| `matching_cancel` | event-loop dispatch through storage, account queue, pacing, REST, and successful cancel acknowledgement | Demo only; acknowledgement does not prove terminal cancellation and is an upper bound for Java `MatchingCancel` |
+| `order_update` | OKX exchange event timestamp to canonical strategy visibility | Demo only; cross-clock measurement requires synchronized host-guard snapshots |
+| `order_fill` | canonical fill visibility to the covering derivative position or both spot balances | Demo only; zero is valid when covering state arrived first |
+
+Enable `[host_guard]` on the target host before collecting calibration reports.
+Calibration rejects a validation report, a non-clean or non-ready bounded run,
+different full config fingerprints, duplicate sessions/series, wrong schemas or
+Java revision, mixed binaries/hosts/accounts, unsynchronized preflight/final
+clocks, dropped evidence, rejected clock samples, over-limit samples, malformed
+reservoirs, or any failed measured exchange operation. Every configured
+instrument needs depth, trade, new,
+cancel, order-update, and fill series; derivative/index/stablecoin reference
+symbols also need reference-data series. Private classes are accepted only from
+demo runs. The default minimum is 1,000 valid observations for every required
+series, not 1,000 observations in aggregate.
+
+An authoritative REST recovery clears unresolved fill-convergence tracking but
+does not manufacture a websocket latency sample. The report counts each such
+observation as dropped, so it cannot enter a passing calibration with a
+right-censored slow tail.
+
+After multiple representative bounded runs using the same exact config:
+
+```bash
+CALIBRATION="var/reap/evidence/latency-$(date -u +%Y%m%dT%H%M%SZ).json"
+PROFILE="var/reap/evidence/latency-profile-$(date -u +%Y%m%dT%H%M%SZ).toml"
+cargo run -p reap-cli -- calibrate-latency \
+  --config examples/live-okx-demo.toml \
+  --report "$OBSERVE_REPORT" \
+  --report "$DEMO_REPORT" \
+  --output "$CALIBRATION" \
+  --profile-output "$PROFILE" \
+  --minimum-samples-per-series 1000 \
+  --accept-matching-upper-bounds \
+  --require-pass \
+  --pretty
+```
+
+The generator merges complete samples exactly and otherwise produces a bounded,
+population-weighted deterministic quantile approximation. Nanoseconds are
+rounded up to microseconds during collection and microseconds are rounded up to
+backtest milliseconds. A failed calibration still writes its diagnostic JSON,
+but the CLI refuses to emit a TOML profile from it.
+
+A production-candidate research manifest must use schema 2, set
+`latency_calibration` to the JSON artifact, set the baseline execution
+`calibrated = true`, and embed exactly the artifact's profile. Research treats
+the artifact as untrusted input: it checks source/config hashes, sessions,
+binary/host/account identity, class semantics, demo provenance for private
+classes, sample counts, matching upper-bound acceptance, and exact
+series-to-profile equality. The research executable must be byte-identical to
+the one that collected the live evidence, and the artifact hash is rechecked
+after all runs. Stress profiles must still conservatively dominate that
+baseline. No credentialed latency report or passing calibration artifact has
+been recorded yet.
