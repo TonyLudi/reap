@@ -270,8 +270,10 @@ impl LiveCoordinator {
                 let account_id = self.require_account_id(account_id)?;
                 let mut update = update;
                 scope_account_update(&account_id, &mut update);
-                self.private_state_mut(&account_id)?
-                    .apply_account(update.clone());
+                let Some(update) = self.private_state_mut(&account_id)?.reduce_account(update)
+                else {
+                    return Ok(CoordinatorOutput::default());
+                };
                 let output = self.process_normalized(NormalizedEvent::Account(update));
                 self.startup.mark_account_snapshot(
                     &account_id,
@@ -352,6 +354,27 @@ impl LiveCoordinator {
                 Ok(output)
             }
         }
+    }
+
+    pub fn apply_authoritative_account_snapshot(
+        &mut self,
+        account_id: &str,
+        mut update: reap_core::AccountUpdate,
+    ) -> Result<CoordinatorOutput, CoordinatorError> {
+        if !self.manages_account(account_id) {
+            return Err(CoordinatorError::UnknownAccount(account_id.to_string()));
+        }
+        scope_account_update(account_id, &mut update);
+        let update = self
+            .private_state_mut(account_id)?
+            .replace_account_snapshot(update);
+        let output = self.process_normalized(NormalizedEvent::Account(update));
+        self.startup.mark_account_snapshot(
+            account_id,
+            true,
+            "authoritative REST account snapshot applied to strategy and risk engine",
+        )?;
+        Ok(output)
     }
 
     pub fn process_event(&mut self, event: NormalizedEvent) -> CoordinatorOutput {
@@ -1027,10 +1050,10 @@ mod tests {
 
     use reap_core::{
         AccountUpdate, Balance, FillLiquidity, Level, MarketEvent, NewOrder, OrderBook, OrderEvent,
-        OrderStatus, OrderUpdate, Side, SystemEvent, SystemEventKind, TimeInForce, Venue,
+        OrderStatus, OrderUpdate, Position, Side, SystemEvent, SystemEventKind, TimeInForce, Venue,
     };
     use reap_feed::FeedOutput;
-    use reap_order::reconcile;
+    use reap_order::{ReconcileIssue, reconcile, reconcile_full_state};
     use reap_risk::{
         InstrumentRiskModel, RiskDecision, RiskLimits, RiskRejectReason, StablecoinGuardConfig,
     };
@@ -1433,6 +1456,131 @@ mod tests {
             })
             .unwrap();
         assert!(coordinator.readiness().is_ready());
+    }
+
+    #[test]
+    fn authoritative_reconciliation_clears_closed_position_before_clean_retry() {
+        let mut coordinator = coordinator();
+        ready(&mut coordinator);
+        coordinator
+            .process_feed(FeedOutput::PrivateAccount {
+                account_id: Some("main".to_string()),
+                update: AccountUpdate {
+                    ts_ms: 3,
+                    balances: account_update("main", 3).balances,
+                    positions: vec![Position {
+                        symbol: "BTC-PERP".to_string(),
+                        qty: 4.0,
+                        avg_price: 50_000.0,
+                    }],
+                    margins: Vec::new(),
+                },
+            })
+            .unwrap();
+        assert_eq!(
+            coordinator
+                .engine
+                .strategy()
+                .entity("BTC-PERP")
+                .unwrap()
+                .position_qty,
+            4.0
+        );
+
+        coordinator
+            .require_reconciliation("main", 4, "private stream recovered")
+            .unwrap();
+        let remote_account = account_update("main", 5);
+        let first = reconcile_full_state(
+            coordinator.private_state("main").unwrap(),
+            &[],
+            &[],
+            &remote_account,
+        );
+        assert!(first.issues.iter().any(|issue| matches!(
+            issue,
+            ReconcileIssue::PositionMissingRemote { symbol, .. } if symbol == "BTC-PERP"
+        )));
+
+        coordinator
+            .apply_authoritative_account_snapshot("main", remote_account.clone())
+            .unwrap();
+        assert!(
+            coordinator
+                .private_state("main")
+                .unwrap()
+                .positions()
+                .is_empty()
+        );
+        assert_eq!(
+            coordinator
+                .engine
+                .strategy()
+                .entity("BTC-PERP")
+                .unwrap()
+                .position_qty,
+            0.0
+        );
+        let stale = coordinator
+            .process_feed(FeedOutput::PrivateAccount {
+                account_id: Some("main".to_string()),
+                update: AccountUpdate {
+                    ts_ms: 4,
+                    balances: Vec::new(),
+                    positions: vec![Position {
+                        symbol: "BTC-PERP".to_string(),
+                        qty: 8.0,
+                        avg_price: 49_000.0,
+                    }],
+                    margins: Vec::new(),
+                },
+            })
+            .unwrap();
+        assert!(stale.records.is_empty());
+        assert_eq!(
+            coordinator
+                .engine
+                .strategy()
+                .entity("BTC-PERP")
+                .unwrap()
+                .position_qty,
+            0.0
+        );
+        coordinator
+            .on_reconciliation(ReconciliationResult {
+                account_id: "main".to_string(),
+                ts_ms: 5,
+                clean: first.is_clean(),
+                local_live_orders: first.local_live_orders,
+                remote_live_orders: first.remote_live_orders,
+                remote_recent_fills: first.remote_fills,
+                reason: format!("{:?}", first.issues),
+            })
+            .unwrap();
+        assert_eq!(
+            coordinator.readiness().missing_reconciliation,
+            vec!["main".to_string()]
+        );
+
+        let second = reconcile_full_state(
+            coordinator.private_state("main").unwrap(),
+            &[],
+            &[],
+            &remote_account,
+        );
+        assert!(second.is_clean());
+        coordinator
+            .on_reconciliation(ReconciliationResult {
+                account_id: "main".to_string(),
+                ts_ms: 6,
+                clean: true,
+                local_live_orders: 0,
+                remote_live_orders: 0,
+                remote_recent_fills: 0,
+                reason: "second authoritative pass is clean".to_string(),
+            })
+            .unwrap();
+        assert!(coordinator.readiness().missing_reconciliation.is_empty());
     }
 
     #[test]

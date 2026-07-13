@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use reap_core::NewOrder;
+use reap_core::{AccountUpdate, NewOrder};
 use reap_venue::okx::{
     HttpTransport, OkxCancelOrder, OkxPlaceOrder, OkxRestClient, OkxTradeMode, RestError,
 };
@@ -10,7 +10,8 @@ use thiserror::Error;
 
 use crate::{
     ClientIdError, ClientOrderIdGenerator, IdempotencyError, IdempotencyRegistry, PacingPolicy,
-    PrivateStateReducer, ReconciliationSnapshot, RequestKind, RequestPacer, Reservation, reconcile,
+    PrivateStateReducer, ReconciliationSnapshot, RequestKind, RequestPacer, Reservation,
+    reconcile_full_state,
 };
 
 #[derive(Debug, Error)]
@@ -23,6 +24,8 @@ pub enum GatewayError {
     Idempotency(#[from] IdempotencyError),
     #[error("no OKX trade mode configured for {0}")]
     MissingTradeMode(String),
+    #[error("OKX account reconciliation returned no balance rows")]
+    EmptyAccountBalance,
 }
 
 impl GatewayError {
@@ -319,15 +322,12 @@ where
     ) -> Result<ReconciliationSnapshot, GatewayError> {
         let (remote_orders, remote_fills) =
             self.fetch_remote_state(instrument_type, symbol).await?;
-        let report = reconcile(
-            state.order_reducer(),
-            state.seen_fill_ids(),
-            &remote_orders,
-            &remote_fills,
-        );
+        let remote_account = self.fetch_remote_account_state().await?;
+        let report = reconcile_full_state(state, &remote_orders, &remote_fills, &remote_account);
         Ok(ReconciliationSnapshot {
             remote_orders,
             remote_fills,
+            remote_account,
             report,
         })
     }
@@ -342,6 +342,19 @@ where
         self.pacer.pace(RequestKind::Reconcile, "account").await;
         let remote_fills = self.client.fills(instrument_type, symbol).await?;
         Ok((remote_orders, remote_fills))
+    }
+
+    pub async fn fetch_remote_account_state(&mut self) -> Result<AccountUpdate, GatewayError> {
+        self.pacer.pace(RequestKind::Reconcile, "account").await;
+        let mut account = self.client.account_balance().await?;
+        if account.balances.is_empty() {
+            return Err(GatewayError::EmptyAccountBalance);
+        }
+        self.pacer.pace(RequestKind::Reconcile, "account").await;
+        let positions = self.client.account_positions(None, None).await?;
+        account.ts_ms = account.ts_ms.max(positions.ts_ms);
+        account.positions = positions.positions;
+        Ok(account)
     }
 
     pub async fn fetch_order_details(
@@ -497,6 +510,41 @@ mod tests {
             state.order_reducer().get(&client_order_id).unwrap().reason,
             "quote"
         );
+    }
+
+    #[tokio::test]
+    async fn account_reconciliation_fetches_balances_and_positions() {
+        let balance = HttpResponse {
+            status: 200,
+            body: r#"{"code":"0","msg":"","data":[{"uTime":"100","details":[{"ccy":"USDT","cashBal":"100","availBal":"90","eq":"100","liab":"0","maxLoan":"0"}]}]}"#.to_string(),
+        };
+        let positions = HttpResponse {
+            status: 200,
+            body: r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","pos":"2","avgPx":"50000","posSide":"net","uTime":"101"}]}"#.to_string(),
+        };
+        let (mut gateway, calls) = gateway(vec![Ok(balance), Ok(positions)]);
+
+        let account = gateway.fetch_remote_account_state().await.unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), 2);
+        assert_eq!(account.ts_ms, 101);
+        assert_eq!(account.balances[0].currency, "USDT");
+        assert_eq!(account.positions[0].symbol, "BTC-USDT-SWAP");
+        assert_eq!(account.positions[0].qty, 2.0);
+    }
+
+    #[tokio::test]
+    async fn empty_balance_snapshot_is_not_authoritative() {
+        let balance = HttpResponse {
+            status: 200,
+            body: r#"{"code":"0","msg":"","data":[{"uTime":"100","details":[] }]}"#.to_string(),
+        };
+        let (mut gateway, calls) = gateway(vec![Ok(balance)]);
+
+        let error = gateway.fetch_remote_account_state().await.unwrap_err();
+
+        assert!(matches!(error, GatewayError::EmptyAccountBalance));
+        assert_eq!(*calls.lock().unwrap(), 1);
     }
 
     #[tokio::test]

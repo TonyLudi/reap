@@ -4,15 +4,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reap_core::{
-    Channel, ConnId, FeedPriority, NormalizedEvent, OrderStatus, Subscription, SystemEvent,
-    SystemEventKind, TimeMs, TimerEvent, Venue,
+    AccountUpdate, Channel, ConnId, FeedPriority, NormalizedEvent, OrderStatus, Subscription,
+    SystemEvent, SystemEventKind, TimeMs, TimerEvent, Venue,
 };
 use reap_feed::{
     ConnectionStatus, ConnectionStatusKind, FeedOutput, FeedProcessor, ReconnectPolicy, SocketPlan,
     SupervisedFeed, okx_login_bootstrap, partition_subscriptions, spawn_supervised_feed,
 };
 use reap_order::{
-    CancelOutcome, OkxOrderGateway, ReconcileReport, SubmitOutcome, SubmitPreparation, reconcile,
+    CancelOutcome, OkxOrderGateway, ReconcileReport, SubmitOutcome, SubmitPreparation,
+    reconcile_full_state,
 };
 use reap_storage::{
     BootstrapRecord, OrderOperation, OrderRequestRecord, RecoveredStorage, SafetyLatchRecord,
@@ -936,18 +937,19 @@ impl LiveRuntime {
                     })?);
                 }
             }
-            initial_outputs.push(coordinator.process_feed(FeedOutput::PrivateAccount {
-                account_id: Some(account.id.clone()),
-                update: snapshot.scoped_account_update(&account.id),
-            })?);
+            let account_snapshot = snapshot.scoped_account_update(&account.id);
+            initial_outputs.push(
+                coordinator
+                    .apply_authoritative_account_snapshot(&account.id, account_snapshot.clone())?,
+            );
             let state = coordinator
                 .private_state(&account.id)
                 .ok_or_else(|| CoordinatorError::UnknownAccount(account.id.clone()))?;
-            let report = reconcile(
-                state.order_reducer(),
-                state.seen_fill_ids(),
+            let report = reconcile_full_state(
+                state,
                 &snapshot.open_orders,
                 &snapshot.recent_fills,
+                &account_snapshot,
             );
             initial_outputs.push(coordinator.on_reconciliation(ReconciliationResult {
                 account_id: account.id.clone(),
@@ -1875,6 +1877,7 @@ impl LiveRuntime {
                 account_id,
                 remote_orders,
                 remote_fills,
+                remote_account,
                 ts_ms,
             } => {
                 self.reconcile_inflight.remove(&account_id);
@@ -1882,16 +1885,17 @@ impl LiveRuntime {
                     .retain(|(cancel_account, _)| cancel_account != &account_id);
                 self.apply_remote_recovery(&account_id, &remote_orders, &remote_fills)
                     .await?;
-                let state = self
+                let report = {
+                    let state = self
+                        .coordinator
+                        .private_state(&account_id)
+                        .ok_or_else(|| CoordinatorError::UnknownAccount(account_id.clone()))?;
+                    reconcile_full_state(state, &remote_orders, &remote_fills, &remote_account)
+                };
+                let account_output = self
                     .coordinator
-                    .private_state(&account_id)
-                    .ok_or_else(|| CoordinatorError::UnknownAccount(account_id.clone()))?;
-                let report = reconcile(
-                    state.order_reducer(),
-                    state.seen_fill_ids(),
-                    &remote_orders,
-                    &remote_fills,
-                );
+                    .apply_authoritative_account_snapshot(&account_id, remote_account)?;
+                self.commit_output(account_output).await?;
                 let clean = report.is_clean();
                 if self.shutdown_in_progress
                     && self.shutdown_reconciliation_requested.contains(&account_id)
@@ -1903,7 +1907,8 @@ impl LiveRuntime {
                     }
                 }
                 let reason = if clean {
-                    "REST and canonical private state agree".to_string()
+                    "REST orders, fills, balances, positions, and canonical private state agree"
+                        .to_string()
                 } else {
                     format!("{:?}", report.issues)
                 };
@@ -2602,6 +2607,7 @@ enum RuntimeEvent {
         account_id: String,
         remote_orders: Vec<RemoteOrder>,
         remote_fills: Vec<RemoteFill>,
+        remote_account: AccountUpdate,
         ts_ms: u64,
     },
     ReconcileFailed {
@@ -2814,11 +2820,29 @@ async fn run_order_task(
                             }
                             continue;
                         }
+                        let remote_account = match gateway.fetch_remote_account_state().await {
+                            Ok(account) => account,
+                            Err(error) => {
+                                if events
+                                    .send(RuntimeEvent::ReconcileFailed {
+                                        account_id: account_id.clone(),
+                                        ts_ms: unix_time_ms(),
+                                        reason: error.to_string(),
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                continue;
+                            }
+                        };
                         if events
                             .send(RuntimeEvent::RemoteState {
                                 account_id: account_id.clone(),
                                 remote_orders,
                                 remote_fills,
+                                remote_account,
                                 ts_ms: unix_time_ms(),
                             })
                             .await
@@ -4250,6 +4274,7 @@ mod tests {
                                     update_time_ms: unix_time_ms(),
                                 }],
                                 remote_fills: Vec::new(),
+                                remote_account: account_update(unix_time_ms()),
                                 ts_ms: unix_time_ms(),
                             })
                             .await

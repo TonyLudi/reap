@@ -113,6 +113,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Separate private transport liveness from account-state freshness: require
   real account and positions payload rounds, and prevent pongs or event-only
   order/fill traffic from masking a stale state channel.
+- [x] Reconcile REST balances and positions with websocket-derived state on
+  startup, recovery, ambiguity, and shutdown; apply omitted-row tombstones,
+  reject stale account rows, and require a second clean pass after repair.
 - [x] Reject crossed books and force fresh-snapshot recovery, matching the
   reviewed Java OKX subscriber behavior with explicit sequence validation.
 - [x] Add order `expTime`, startup/periodic exchange-clock validation, and an

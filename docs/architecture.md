@@ -212,6 +212,8 @@ Responsibilities:
 - Rate limiting and request pacing.
 - Canonical order state reducer.
 - REST reconciliation for open orders, fills, balances, and positions.
+- Authoritative account-snapshot replacement with zero tombstones for balances
+  and positions omitted after closure, plus per-row monotonic update guards.
 - Missed cancel and unknown-order handling.
 
 Strategy code sends intents. The order layer owns what actually happened.
@@ -791,4 +793,7 @@ drift.
 
 If private order/fill/account streams are stale or reconciliation detects drift,
 the default behavior should halt quoting and reconcile. Missing private events
-are more dangerous than missing public ticks.
+are more dangerous than missing public ticks. Reconciliation compares canonical
+orders, known fills, balances, and positions before applying the REST account
+snapshot. A dirty pass repairs local state but remains failed; only a later
+clean pass restores the reconciliation gate.

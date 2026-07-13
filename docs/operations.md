@@ -137,7 +137,8 @@ outside source control.
    acknowledgements alone are not private readiness: account and positions must
    each deliver a real data payload. Every transition of that complete private
    state to ready invalidates the earlier reconciliation and requires a fresh
-   REST order/fill check, closing the bootstrap-to-stream subscription window.
+   REST order/fill/balance/position check, closing the bootstrap-to-stream
+   subscription window.
 11. It waits for a contiguous sequenced book for every instrument and a
     complete, healthy, post-connect reconciled private stream for every account.
 12. It also waits for every configured stablecoin guard to receive a fresh,
@@ -170,6 +171,23 @@ settings; accepting only their static flags would weaken live stop behavior.
   The demo example uses 30 seconds, above OKX's documented regular state-push
   cadence. Recovery after a transport loss also requires fresh REST
   reconciliation before readiness returns.
+
+## Account State Reconciliation
+
+- Startup, private-stream recovery, ambiguous gateway outcomes, and shutdown
+  fetch open orders, recent fills, account balances, and all positions under
+  the reconciliation request pacer. An empty balance response is rejected as
+  non-authoritative; an empty position list is a valid flat account.
+- The runtime compares the websocket-derived state before applying REST. Any
+  order, fill, balance-field, position-quantity, or open-position average-price
+  difference emits account-scoped reconciliation drift and cancels live orders.
+- REST then replaces the account reducer and is delivered through the same
+  strategy/risk event path. Locally present balances or positions omitted by
+  REST generate zero tombstones, so a closed position cannot remain in the
+  engine. Older per-currency, per-symbol, or margin websocket rows are ignored.
+- Repair is not proof of agreement. A dirty pass keeps the account degraded and
+  retries; only a subsequent clean full-state pass restores the reconciliation
+  gate. This intentionally favors a brief false stop over trading stale state.
 
 ## Stablecoin Depeg Guard
 
@@ -379,8 +397,8 @@ replacement for exchange-side account limits and operator access controls.
 | --- | --- | --- |
 | Public sequence gap | Book recovering; new orders blocked | Obtain a fresh snapshot and replay contiguous buffered deltas |
 | Public feed stale | Symbol blocked; live orders cancelled | Restore at least one healthy feed and verify sequence continuity |
-| Private stream stale | Account blocked; live orders cancelled | Reconnect, REST reconcile pending orders/fills, then emit recovery |
-| Reconcile drift | Account blocked; live orders cancelled | Resolve local/remote order and fill differences before recovery |
+| Private stream stale | Account blocked; live orders cancelled | Reconnect, REST reconcile orders/fills/balances/positions, then emit recovery |
+| Reconcile drift | Account blocked; live orders cancelled | Inspect the recorded full-state differences and require a later clean pass before recovery |
 | Stablecoin reference missing/stale/conflicting/depegged | New entry blocked immediately; durable global kill and live-order cancellation after debounce | Verify both redundant index routes and an independent venue reference; use the stopped-process latch-clear procedure after a sustained breach |
 | Risk breach | Durable global kill active; live orders cancelled | Reduce exposure externally if needed, diagnose, and follow the stopped-process latch-clear procedure; restart alone does not clear it |
 | Manual account kill | Durable account route latch; its instruments are removed from pricing/hedging and its live orders are cancelled | Reconcile the account and dependent exposure; restart alone does not clear it |
@@ -482,7 +500,8 @@ adapter failure, gateway-task failure, channel failure, and storage failure,
 uses one fail-closed path. It disables new submits without disabling cancels,
 activates the kill switch, dispatches every canonical cancel, and requires a
 post-cancel REST reconciliation result for every account. Only zero active
-canonical orders plus clean account reconciliation permits task teardown.
+canonical orders plus clean order/fill/balance/position reconciliation permits
+task teardown.
 The runtime then explicitly disables Cancel All After unless safety-latch
 durability failed. If any part of shutdown is unresolved or latch durability is
 uncertain, it leaves the exchange timer armed and terminates the safety task so

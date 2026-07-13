@@ -12,11 +12,11 @@ production trading process.
 | Iarb2 decision model | Covered for the documented OKX parity boundary | Not a blocker |
 | Deterministic backtest/data | Shared strategy code, depth matching, queue-ahead model, fees, credential-free redundant public capture, create-new session files, and raw/normalized replay | Needs sustained full-depth capture and venue-data calibration before capital decisions |
 | Feed components | Redundant public sockets, isolated private sockets, transport/state freshness separation, account-plus-positions health rounds, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
-| Order components | Event-loop client IDs/registration, exchange-side place-request expiry, signed submit/cancel, pacing, private reduction, ambiguity handling, and REST reconciliation are composed | Needs demo exchange fault evidence |
+| Order components | Event-loop client IDs/registration, exchange-side place-request expiry, signed submit/cancel, pacing, monotonic private reduction, ambiguity handling, and full order/fill/balance/position REST reconciliation are composed | Needs demo exchange fault evidence |
 | Runtime risk | Instrument models, authoritative startup positions, account-scoped health, redundant stablecoin guards, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed deadman/depeg evidence |
 | Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, and strict bounded soak reports | Demo-capable; production entry intentionally unavailable |
 | Instrument/account bootstrap | Account instruments/config/balance/positions are typed, verified, and applied to strategy/risk before snapshot readiness | Needs target-account certification |
-| Startup/restart gate | Executable phase state, engine-consumed account-snapshot invariant, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, durable latch restore, and clean REST reconciliation | Needs process-kill demo test |
+| Startup/restart gate | Executable phase state, engine-consumed account-snapshot invariant, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, durable latch restore, authoritative account repair, and second-pass clean REST reconciliation | Needs process-kill demo test |
 | Event-loop profile | Allocation-aware raw OKX parity benchmark covers redundant wire input through strategy/risk and storage-record construction | Needs target-host capture and exchange-latency validation |
 | Operator control and alerts | HMAC-authenticated local controls use fsynced write-ahead latches; OKX Cancel All After is maintained independently; a separate CLI can arm the deadman, cancel all regular orders account-wide, and prove post-trigger zero | Must exercise target alert routing and the independent cancel procedure; algo/spread orders remain outside its scope |
 | Process/host controls | Canonical journal ownership is exclusively locked before recovery or network setup; optional Linux disk, memory, and kernel-clock checks run at preflight and periodically; hardened systemd templates encode mode-specific restart policy | Must be installed, enabled, thresholded, monitored, and fault-tested on the target host |
@@ -106,6 +106,10 @@ production trading process.
     remain connected, while only a complete account/positions data round
     refreshes account health; pongs and event-only order/fill traffic cannot
     mask a silent state channel.
+19. Every REST reconciliation compares balances and positions as well as orders
+    and fills before replacing account state. Omitted rows clear through zero
+    tombstones, stale websocket rows cannot regress the engine, and a repaired
+    dirty pass remains degraded until a later full-state pass is clean.
 
 ## Remaining Demo Gate
 
@@ -125,9 +129,9 @@ production trading process.
    report.
 4. Complete a sustained soak with zero unexplained order, fill, balance,
    position, or checkpoint drift. `clean_soak` covers runtime readiness,
-   reconciliation, storage drops, alert delivery, and shutdown orders;
-   balances, positions, fills, and restart checkpoint state still require
-   log/account review.
+   full-state reconciliation, storage drops, alert delivery, and shutdown
+   orders; uninterrupted fill-to-position convergence and restart checkpoint
+   state still require log/account review.
 
 ## Production Gate
 

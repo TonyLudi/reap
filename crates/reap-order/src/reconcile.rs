@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
+use reap_core::{AccountUpdate, Balance, Position};
 use reap_venue::{PrivateOrderState, RemoteFill, RemoteOrder};
 use serde::{Deserialize, Serialize};
 
-use crate::OrderReducer;
+use crate::{OrderReducer, PrivateStateReducer};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -27,6 +28,34 @@ pub enum ReconcileIssue {
         order_id: String,
         symbol: String,
     },
+    BalanceMissingRemote {
+        currency: String,
+        local_total: String,
+    },
+    BalanceMissingLocal {
+        currency: String,
+        remote_total: String,
+    },
+    BalanceMismatch {
+        currency: String,
+        field: String,
+        local: String,
+        remote: String,
+    },
+    PositionMissingRemote {
+        symbol: String,
+        local_qty: String,
+    },
+    PositionMissingLocal {
+        symbol: String,
+        remote_qty: String,
+    },
+    PositionMismatch {
+        symbol: String,
+        field: String,
+        local: String,
+        remote: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -47,6 +76,7 @@ impl ReconcileReport {
 pub struct ReconciliationSnapshot {
     pub remote_orders: Vec<RemoteOrder>,
     pub remote_fills: Vec<RemoteFill>,
+    pub remote_account: AccountUpdate,
     pub report: ReconcileReport,
 }
 
@@ -141,6 +171,150 @@ pub fn reconcile(
     }
 }
 
+pub fn reconcile_full_state(
+    local: &PrivateStateReducer,
+    remote_orders: &[RemoteOrder],
+    remote_fills: &[RemoteFill],
+    remote_account: &AccountUpdate,
+) -> ReconcileReport {
+    let mut report = reconcile(
+        local.order_reducer(),
+        local.seen_fill_ids(),
+        remote_orders,
+        remote_fills,
+    );
+    compare_account_state(local, remote_account, &mut report.issues);
+    report
+        .issues
+        .sort_by(|left, right| format!("{left:?}").cmp(&format!("{right:?}")));
+    report
+}
+
+fn compare_account_state(
+    local: &PrivateStateReducer,
+    remote: &AccountUpdate,
+    issues: &mut Vec<ReconcileIssue>,
+) {
+    let remote_balances = remote
+        .balances
+        .iter()
+        .map(|balance| (balance.currency.as_str(), balance))
+        .collect::<HashMap<_, _>>();
+    for (currency, local_balance) in local.balances() {
+        match remote_balances.get(currency.as_str()) {
+            Some(remote_balance) => compare_balance(issues, local_balance, remote_balance),
+            None if balance_is_nonzero(local_balance) => {
+                issues.push(ReconcileIssue::BalanceMissingRemote {
+                    currency: currency.clone(),
+                    local_total: local_balance.total.to_string(),
+                });
+            }
+            None => {}
+        }
+    }
+    for (currency, remote_balance) in &remote_balances {
+        if !local.balances().contains_key(*currency) && balance_is_nonzero(remote_balance) {
+            issues.push(ReconcileIssue::BalanceMissingLocal {
+                currency: (*currency).to_string(),
+                remote_total: remote_balance.total.to_string(),
+            });
+        }
+    }
+
+    let remote_positions = remote
+        .positions
+        .iter()
+        .map(|position| (position.symbol.as_str(), position))
+        .collect::<HashMap<_, _>>();
+    for (symbol, local_position) in local.positions() {
+        match remote_positions.get(symbol.as_str()) {
+            Some(remote_position) => compare_position(issues, local_position, remote_position),
+            None if number_is_nonzero(local_position.qty) => {
+                issues.push(ReconcileIssue::PositionMissingRemote {
+                    symbol: symbol.clone(),
+                    local_qty: local_position.qty.to_string(),
+                });
+            }
+            None => {}
+        }
+    }
+    for (symbol, remote_position) in &remote_positions {
+        if !local.positions().contains_key(*symbol) && number_is_nonzero(remote_position.qty) {
+            issues.push(ReconcileIssue::PositionMissingLocal {
+                symbol: (*symbol).to_string(),
+                remote_qty: remote_position.qty.to_string(),
+            });
+        }
+    }
+}
+
+fn compare_balance(issues: &mut Vec<ReconcileIssue>, local: &Balance, remote: &Balance) {
+    for (field, local_value, remote_value) in [
+        ("total", local.total, remote.total),
+        ("available", local.available, remote.available),
+        ("equity", local.equity, remote.equity),
+        ("liability", local.liability, remote.liability),
+        ("max_loan", local.max_loan, remote.max_loan),
+    ] {
+        if !numbers_equal(local_value, remote_value) {
+            issues.push(ReconcileIssue::BalanceMismatch {
+                currency: local.currency.clone(),
+                field: field.to_string(),
+                local: local_value.to_string(),
+                remote: remote_value.to_string(),
+            });
+        }
+    }
+}
+
+fn compare_position(issues: &mut Vec<ReconcileIssue>, local: &Position, remote: &Position) {
+    if !numbers_equal(local.qty, remote.qty) {
+        issues.push(ReconcileIssue::PositionMismatch {
+            symbol: local.symbol.clone(),
+            field: "qty".to_string(),
+            local: local.qty.to_string(),
+            remote: remote.qty.to_string(),
+        });
+    }
+    if (number_is_nonzero(local.qty) || number_is_nonzero(remote.qty))
+        && !numbers_equal(local.avg_price, remote.avg_price)
+    {
+        issues.push(ReconcileIssue::PositionMismatch {
+            symbol: local.symbol.clone(),
+            field: "avg_price".to_string(),
+            local: local.avg_price.to_string(),
+            remote: remote.avg_price.to_string(),
+        });
+    }
+}
+
+fn balance_is_nonzero(balance: &Balance) -> bool {
+    [
+        balance.total,
+        balance.available,
+        balance.equity,
+        balance.liability,
+        balance.max_loan,
+    ]
+    .into_iter()
+    .any(number_is_nonzero)
+}
+
+fn number_is_nonzero(value: f64) -> bool {
+    !numbers_equal(value, 0.0)
+}
+
+fn numbers_equal(left: f64, right: f64) -> bool {
+    if left == right {
+        return true;
+    }
+    if !left.is_finite() || !right.is_finite() {
+        return false;
+    }
+    let scale = left.abs().max(right.abs()).max(1.0);
+    (left - right).abs() <= scale * 1e-9
+}
+
 fn remote_id(order: &RemoteOrder) -> String {
     if order.client_order_id.is_empty() {
         order.exchange_order_id.clone()
@@ -216,5 +390,102 @@ mod tests {
         let report = reconcile(&local, &HashSet::new(), &[remote], &[fill]);
         assert!(!report.is_clean());
         assert_eq!(report.issues.len(), 2);
+    }
+
+    #[test]
+    fn full_state_reconciliation_covers_balances_and_positions() {
+        let mut local = PrivateStateReducer::new();
+        local.apply_account(AccountUpdate {
+            ts_ms: 1,
+            balances: vec![Balance {
+                account_id: Some("main".to_string()),
+                currency: "USDT".to_string(),
+                total: 100.0,
+                available: 90.0,
+                equity: 100.0,
+                liability: 0.0,
+                max_loan: 10.0,
+            }],
+            positions: vec![Position {
+                symbol: "BTC-USDT-SWAP".to_string(),
+                qty: 2.0,
+                avg_price: 50_000.0,
+            }],
+            margins: Vec::new(),
+        });
+        let remote = AccountUpdate {
+            ts_ms: 2,
+            balances: vec![Balance {
+                account_id: None,
+                currency: "USDT".to_string(),
+                total: 100.0,
+                available: 90.0,
+                equity: 100.0,
+                liability: 0.0,
+                max_loan: 10.0,
+            }],
+            positions: vec![Position {
+                symbol: "BTC-USDT-SWAP".to_string(),
+                qty: 2.0,
+                avg_price: 50_000.0,
+            }],
+            margins: Vec::new(),
+        };
+
+        assert!(reconcile_full_state(&local, &[], &[], &remote).is_clean());
+    }
+
+    #[test]
+    fn full_state_reconciliation_reports_closed_and_changed_rows() {
+        let mut local = PrivateStateReducer::new();
+        local.apply_account(AccountUpdate {
+            ts_ms: 1,
+            balances: vec![Balance {
+                account_id: Some("main".to_string()),
+                currency: "BTC".to_string(),
+                total: 1.0,
+                available: 1.0,
+                equity: 1.0,
+                liability: 0.0,
+                max_loan: 0.0,
+            }],
+            positions: vec![Position {
+                symbol: "BTC-USDT-SWAP".to_string(),
+                qty: 2.0,
+                avg_price: 50_000.0,
+            }],
+            margins: Vec::new(),
+        });
+        let remote = AccountUpdate {
+            ts_ms: 2,
+            balances: vec![Balance {
+                account_id: None,
+                currency: "BTC".to_string(),
+                total: 1.5,
+                available: 1.5,
+                equity: 1.5,
+                liability: 0.0,
+                max_loan: 0.0,
+            }],
+            positions: Vec::new(),
+            margins: Vec::new(),
+        };
+
+        let report = reconcile_full_state(&local, &[], &[], &remote);
+
+        assert!(!report.is_clean());
+        assert!(report.issues.iter().any(|issue| matches!(
+            issue,
+            ReconcileIssue::BalanceMismatch {
+                currency,
+                field,
+                ..
+            } if currency == "BTC" && field == "total"
+        )));
+        assert!(report.issues.iter().any(|issue| matches!(
+            issue,
+            ReconcileIssue::PositionMissingRemote { symbol, .. }
+                if symbol == "BTC-USDT-SWAP"
+        )));
     }
 }

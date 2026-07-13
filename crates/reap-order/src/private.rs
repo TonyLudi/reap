@@ -15,6 +15,9 @@ pub struct PrivateStateReducer {
     seen_fill_ids: HashSet<String>,
     cumulative_fills: HashMap<String, f64>,
     last_order_update_ms: HashMap<String, u64>,
+    last_balance_update_ms: HashMap<String, u64>,
+    last_position_update_ms: HashMap<String, u64>,
+    last_margin_update_ms: u64,
 }
 
 impl PrivateStateReducer {
@@ -100,12 +103,142 @@ impl PrivateStateReducer {
     }
 
     pub fn apply_account(&mut self, update: AccountUpdate) {
-        for balance in update.balances {
-            self.balances.insert(balance.currency.clone(), balance);
+        let _ = self.reduce_account(update);
+    }
+
+    pub fn reduce_account(&mut self, update: AccountUpdate) -> Option<AccountUpdate> {
+        let AccountUpdate {
+            ts_ms,
+            balances,
+            positions,
+            margins,
+        } = update;
+        let mut accepted_balances = Vec::with_capacity(balances.len());
+        for balance in balances {
+            let last_update_ms = self
+                .last_balance_update_ms
+                .get(&balance.currency)
+                .copied()
+                .unwrap_or(0);
+            if ts_ms < last_update_ms {
+                continue;
+            }
+            self.last_balance_update_ms
+                .insert(balance.currency.clone(), ts_ms);
+            self.balances
+                .insert(balance.currency.clone(), balance.clone());
+            accepted_balances.push(balance);
         }
-        for position in update.positions {
-            self.positions.insert(position.symbol.clone(), position);
+
+        let mut accepted_positions = Vec::with_capacity(positions.len());
+        for position in positions {
+            let last_update_ms = self
+                .last_position_update_ms
+                .get(&position.symbol)
+                .copied()
+                .unwrap_or(0);
+            if ts_ms < last_update_ms {
+                continue;
+            }
+            self.last_position_update_ms
+                .insert(position.symbol.clone(), ts_ms);
+            self.positions
+                .insert(position.symbol.clone(), position.clone());
+            accepted_positions.push(position);
         }
+
+        let accepted_margins = if margins.is_empty() || ts_ms >= self.last_margin_update_ms {
+            if !margins.is_empty() {
+                self.last_margin_update_ms = ts_ms;
+            }
+            margins
+        } else {
+            Vec::new()
+        };
+        if accepted_balances.is_empty()
+            && accepted_positions.is_empty()
+            && accepted_margins.is_empty()
+        {
+            return None;
+        }
+        Some(AccountUpdate {
+            ts_ms,
+            balances: accepted_balances,
+            positions: accepted_positions,
+            margins: accepted_margins,
+        })
+    }
+
+    /// Replaces the reducer's account state with an authoritative snapshot.
+    ///
+    /// The returned update includes zero-valued tombstones for rows that were
+    /// present locally but are absent from the snapshot, allowing downstream
+    /// strategy and risk reducers to clear the same stale state.
+    pub fn replace_account_snapshot(&mut self, mut update: AccountUpdate) -> AccountUpdate {
+        let incoming_balances = update
+            .balances
+            .iter()
+            .cloned()
+            .map(|balance| (balance.currency.clone(), balance))
+            .collect::<HashMap<_, _>>();
+        let incoming_positions = update
+            .positions
+            .iter()
+            .cloned()
+            .map(|position| (position.symbol.clone(), position))
+            .collect::<HashMap<_, _>>();
+
+        let mut missing_currencies = self
+            .balances
+            .keys()
+            .filter(|currency| !incoming_balances.contains_key(*currency))
+            .cloned()
+            .collect::<Vec<_>>();
+        missing_currencies.sort();
+        for currency in missing_currencies {
+            let mut balance = self
+                .balances
+                .get(&currency)
+                .expect("missing currency came from the balance map")
+                .clone();
+            balance.total = 0.0;
+            balance.available = 0.0;
+            balance.equity = 0.0;
+            balance.liability = 0.0;
+            balance.max_loan = 0.0;
+            update.balances.push(balance);
+        }
+
+        let mut missing_symbols = self
+            .positions
+            .keys()
+            .filter(|symbol| !incoming_positions.contains_key(*symbol))
+            .cloned()
+            .collect::<Vec<_>>();
+        missing_symbols.sort();
+        for symbol in missing_symbols {
+            update.positions.push(Position {
+                symbol,
+                qty: 0.0,
+                avg_price: 0.0,
+            });
+        }
+
+        for balance in &update.balances {
+            self.last_balance_update_ms
+                .insert(balance.currency.clone(), update.ts_ms);
+        }
+        for position in &update.positions {
+            self.last_position_update_ms
+                .insert(position.symbol.clone(), update.ts_ms);
+        }
+        if !update.margins.is_empty() {
+            self.last_margin_update_ms = update.ts_ms;
+        }
+
+        self.balances = incoming_balances;
+        self.positions = incoming_positions;
+        update
     }
 
     pub fn apply_order(&mut self, update: PrivateOrderUpdate) -> Option<OrderUpdate> {
@@ -425,6 +558,121 @@ mod tests {
 
         assert_eq!(reducer.balances()["USDT"].available, 90.0);
         assert_eq!(reducer.positions()["BTC-USDT-SWAP"].qty, -2.0);
+    }
+
+    #[test]
+    fn authoritative_snapshot_clears_rows_omitted_by_rest() {
+        let mut reducer = PrivateStateReducer::new();
+        reducer.apply_account(AccountUpdate {
+            ts_ms: 1,
+            balances: vec![
+                Balance {
+                    account_id: Some("main".to_string()),
+                    currency: "BTC".to_string(),
+                    total: 2.0,
+                    available: 1.5,
+                    equity: 2.0,
+                    liability: 0.0,
+                    max_loan: 0.0,
+                },
+                Balance {
+                    account_id: Some("main".to_string()),
+                    currency: "USDT".to_string(),
+                    total: 100.0,
+                    available: 90.0,
+                    equity: 100.0,
+                    liability: 0.0,
+                    max_loan: 0.0,
+                },
+            ],
+            positions: vec![Position {
+                symbol: "BTC-USDT-SWAP".to_string(),
+                qty: -2.0,
+                avg_price: 100.0,
+            }],
+            margins: Vec::new(),
+        });
+
+        let applied = reducer.replace_account_snapshot(AccountUpdate {
+            ts_ms: 2,
+            balances: vec![Balance {
+                account_id: Some("main".to_string()),
+                currency: "USDT".to_string(),
+                total: 101.0,
+                available: 91.0,
+                equity: 101.0,
+                liability: 0.0,
+                max_loan: 0.0,
+            }],
+            positions: Vec::new(),
+            margins: Vec::new(),
+        });
+
+        assert_eq!(reducer.balances().len(), 1);
+        assert_eq!(reducer.balances()["USDT"].total, 101.0);
+        assert!(reducer.positions().is_empty());
+        assert!(applied.balances.iter().any(|balance| {
+            balance.currency == "BTC"
+                && balance.total == 0.0
+                && balance.available == 0.0
+                && balance.equity == 0.0
+        }));
+        assert!(applied.positions.iter().any(|position| {
+            position.symbol == "BTC-USDT-SWAP" && position.qty == 0.0 && position.avg_price == 0.0
+        }));
+    }
+
+    #[test]
+    fn stale_account_rows_cannot_regress_or_resurrect_state() {
+        let mut reducer = PrivateStateReducer::new();
+        reducer.apply_account(AccountUpdate {
+            ts_ms: 10,
+            balances: Vec::new(),
+            positions: vec![Position {
+                symbol: "BTC-USDT-SWAP".to_string(),
+                qty: 2.0,
+                avg_price: 100.0,
+            }],
+            margins: Vec::new(),
+        });
+
+        assert!(
+            reducer
+                .reduce_account(AccountUpdate {
+                    ts_ms: 9,
+                    balances: Vec::new(),
+                    positions: vec![Position {
+                        symbol: "BTC-USDT-SWAP".to_string(),
+                        qty: 1.0,
+                        avg_price: 90.0,
+                    }],
+                    margins: Vec::new(),
+                })
+                .is_none()
+        );
+        assert_eq!(reducer.positions()["BTC-USDT-SWAP"].qty, 2.0);
+
+        reducer.replace_account_snapshot(AccountUpdate {
+            ts_ms: 20,
+            balances: Vec::new(),
+            positions: Vec::new(),
+            margins: Vec::new(),
+        });
+        assert!(
+            reducer
+                .reduce_account(AccountUpdate {
+                    ts_ms: 19,
+                    balances: Vec::new(),
+                    positions: vec![Position {
+                        symbol: "BTC-USDT-SWAP".to_string(),
+                        qty: 3.0,
+                        avg_price: 110.0,
+                    }],
+                    margins: Vec::new(),
+                })
+                .is_none()
+        );
+        assert!(reducer.positions().is_empty());
     }
 
     #[test]
