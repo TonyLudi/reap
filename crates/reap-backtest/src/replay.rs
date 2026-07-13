@@ -23,6 +23,12 @@ pub struct ReplayRow {
     pub taker_side: Option<Side>,
 }
 
+#[derive(Debug, Clone)]
+pub struct TimedReplayEvent {
+    pub recv_ts_ns: u64,
+    pub event: NormalizedEvent,
+}
+
 pub fn load_events_from_path(path: &Path) -> Result<Vec<NormalizedEvent>> {
     let file = File::open(path)?;
     load_events(file)
@@ -54,9 +60,24 @@ pub fn replay_raw_capture_path(
     replay_raw_capture(file, on_event)
 }
 
+pub fn replay_raw_capture_timed_path(
+    path: &Path,
+    on_event: impl FnMut(TimedReplayEvent) -> Result<()>,
+) -> Result<()> {
+    let file = File::open(path)?;
+    replay_raw_capture_timed(file, on_event)
+}
+
 pub fn replay_raw_capture<R: std::io::Read>(
     reader: R,
     mut on_event: impl FnMut(NormalizedEvent) -> Result<()>,
+) -> Result<()> {
+    replay_raw_capture_timed(reader, |timed| on_event(timed.event))
+}
+
+pub fn replay_raw_capture_timed<R: std::io::Read>(
+    reader: R,
+    mut on_event: impl FnMut(TimedReplayEvent) -> Result<()>,
 ) -> Result<()> {
     let adapter = OkxAdapter::default();
     let mut processor = FeedProcessor::new(100_000, 32_768);
@@ -79,6 +100,7 @@ pub fn replay_raw_capture<R: std::io::Read>(
             None => capture_session = Some(capture.capture_session_id.clone()),
             Some(_) => {}
         }
+        let recv_ts_ns = capture.recv_ts_ns;
         let envelope = capture
             .into_envelope()
             .with_context(|| format!("invalid raw capture payload on line {line_number}"))?;
@@ -88,8 +110,11 @@ pub fn replay_raw_capture<R: std::io::Read>(
         for parsed in parsed {
             for output in processor.process(parsed) {
                 match output {
-                    FeedOutput::Event(event) => on_event(event)?,
-                    FeedOutput::System(event) => on_event(NormalizedEvent::System(event))?,
+                    FeedOutput::Event(event) => on_event(TimedReplayEvent { recv_ts_ns, event })?,
+                    FeedOutput::System(event) => on_event(TimedReplayEvent {
+                        recv_ts_ns,
+                        event: NormalizedEvent::System(event),
+                    })?,
                     FeedOutput::Duplicate(_) | FeedOutput::RecoveryRequired(_) => {}
                     FeedOutput::PrivateOrder { .. }
                     | FeedOutput::PrivateFill { .. }
@@ -166,6 +191,8 @@ pub fn load_events<R: std::io::Read>(reader: R) -> Result<Vec<NormalizedEvent>> 
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     #[test]
@@ -208,6 +235,29 @@ mod tests {
 
         assert_eq!(depth_events, 4);
         assert_eq!(recovery_events, 0);
+    }
+
+    #[test]
+    fn timed_raw_replay_exposes_capture_receive_timestamps() {
+        let fixture = include_str!("../../../fixtures/raw/okx/depth-gap.jsonl");
+        let expected = fixture
+            .lines()
+            .map(|line| serde_json::from_str::<RawCapture>(line).unwrap().recv_ts_ns)
+            .collect::<HashSet<_>>();
+        let mut observed = Vec::new();
+
+        replay_raw_capture_timed(fixture.as_bytes(), |timed| {
+            observed.push(timed.recv_ts_ns);
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(!observed.is_empty());
+        assert!(
+            observed
+                .iter()
+                .all(|recv_ts_ns| expected.contains(recv_ts_ns))
+        );
     }
 
     #[test]

@@ -107,6 +107,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Add exact raw/config fingerprints and streaming capture analysis for
   per-subscription source coverage, timing, depth, spread, movement, and trade
   distributions; verify its strict gate against a fresh public capture.
+- [x] Add a deterministic Java-referenced backtest scheduler with receive-time
+  raw replay, explicit market/new/cancel/order/account delays, immediate
+  `PendingNew` registration, and end-of-horizon execution provenance.
 - [x] Add Java-referenced USDT/USDC depeg protection with redundant critical
   index feeds, conflict-aware deduplication, startup readiness, immediate entry
   blocking, and a debounced durable global risk latch.
@@ -170,7 +173,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
   fill, reconnect, and durable-latch restart recovery.
 - [ ] Calibrate queue position, latency, fees, funding, and slippage from
   captured full-depth data; complete walk-forward, sensitivity, capacity, and
-  stressed-liquidity reports.
+  stressed-liquidity reports. The configurable delay model is implemented but
+  remains explicitly uncalibrated; the conservative Java depth-fill threshold
+  and empirical per-class/per-instrument distributions are still required.
 - [ ] Deploy and exercise the webhook/host guards, systemd supervision, external
   unit-failure paging, and independent exchange cancel procedure on the target
   host/account; add a separate algo/spread kill path if those order classes are

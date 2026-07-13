@@ -2707,8 +2707,10 @@ impl ChaosStrategy {
             }
         }
         if update.reason.starts_with("hedge") {
-            if matches!(update.event, OrderEvent::New | OrderEvent::PartialFill)
-                && update.open_qty > 0.0
+            if matches!(
+                update.event,
+                OrderEvent::PendingNew | OrderEvent::New | OrderEvent::PartialFill
+            ) && update.open_qty > 0.0
             {
                 self.active_hedges.insert(
                     update.order_id.clone(),
@@ -2729,7 +2731,7 @@ impl ChaosStrategy {
             }
         }
         match update.event {
-            OrderEvent::New if update.reason.starts_with("quote") => {
+            OrderEvent::PendingNew | OrderEvent::New if update.reason.starts_with("quote") => {
                 let level = quote_level_from_reason(&update.reason);
                 self.active_quotes.insert(
                     (update.symbol.clone(), update.side, level),
@@ -5358,7 +5360,47 @@ mod tests {
     }
 
     #[test]
-    fn java_parity_pending_delta_includes_live_hedges_only() {
+    fn pending_new_quote_blocks_duplicate_intent_before_exchange_ack() {
+        let mut strategy = ChaosStrategy::new(config()).unwrap();
+        let levels = vec![TheoQuote {
+            price: 49_900.0,
+            qty: 0.1,
+            hedge_px: 50_001.0,
+            hedge_symbol: "BTC-PERP".to_string(),
+        }];
+        let mut first = Vec::new();
+        strategy.sync_quotes("BTC-USDT", Side::Buy, &levels, &mut first);
+        let OrderIntent::NewOrder(order) = &first[0] else {
+            panic!("expected quote order");
+        };
+
+        strategy.on_order_update(&OrderUpdate {
+            ts_ms: 2,
+            order_id: "pending-q1".to_string(),
+            symbol: order.symbol.clone(),
+            side: order.side,
+            event: OrderEvent::PendingNew,
+            status: OrderStatus::PendingNew,
+            price: order.price,
+            time_in_force: Some(order.time_in_force),
+            qty: order.qty,
+            open_qty: order.qty,
+            filled_qty: 0.0,
+            avg_fill_price: 0.0,
+            last_fill_qty: 0.0,
+            last_fill_price: 0.0,
+            last_fill_liquidity: None,
+            reason: "quote:pending_new".to_string(),
+        });
+
+        let mut repeated = Vec::new();
+        strategy.sync_quotes("BTC-USDT", Side::Buy, &levels, &mut repeated);
+
+        assert!(repeated.is_empty());
+    }
+
+    #[test]
+    fn java_parity_pending_delta_includes_pending_and_live_hedges() {
         let mut strategy = ChaosStrategy::new(config()).unwrap();
         strategy.entities.get_mut("BTC-USDT").unwrap().book = Some(OrderBook::one_level(
             "BTC-USDT",
@@ -5371,8 +5413,8 @@ mod tests {
             order_id: "h1".to_string(),
             symbol: "BTC-PERP".to_string(),
             side: Side::Sell,
-            event: OrderEvent::New,
-            status: OrderStatus::Live,
+            event: OrderEvent::PendingNew,
+            status: OrderStatus::PendingNew,
             price: 49_990.0,
             time_in_force: Some(TimeInForce::Ioc),
             qty: 100.0,

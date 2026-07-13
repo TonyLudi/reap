@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use reap_backtest::BacktestRunner;
+use reap_backtest::{BacktestConfig, BacktestRunner};
 use reap_capture::{CaptureConfig, CaptureRunOptions, analyze_capture_path, run_capture};
 use reap_live::{
     EmergencyCancelOptions, LiveConfig, LiveMode, LiveRunOptions, OperatorCommand,
@@ -242,9 +242,9 @@ async fn main() -> Result<()> {
         } => {
             let config_text = std::fs::read_to_string(&config)
                 .with_context(|| format!("failed to read config {}", config.display()))?;
-            let config: ChaosConfig = toml::from_str(&config_text)
+            let config: BacktestConfig = toml::from_str(&config_text)
                 .with_context(|| format!("failed to parse config {}", config.display()))?;
-            let runner = BacktestRunner::new(config)?;
+            let runner = BacktestRunner::from_config(config)?;
             let report = match format {
                 ReplayFormat::Csv => runner.run_csv_path(&data)?,
                 ReplayFormat::NormalizedJsonl => runner.run_normalized_jsonl_path(&data)?,

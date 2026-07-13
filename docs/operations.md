@@ -77,6 +77,40 @@ cargo run -p reap-cli -- backtest \
   --format raw-capture --pretty
 ```
 
+### Backtest Execution Assumptions
+
+Strategy TOML may include:
+
+```toml
+[backtest]
+calibrated = false
+market_data_latency_ms = 0
+order_entry_latency_ms = 0
+cancel_latency_ms = 0
+order_update_latency_ms = 0
+fill_account_latency_ms = 0
+```
+
+Raw replay orders the local event loop by persisted `recv_ts_ns`; CSV and
+normalized replay use event timestamps. The runner applies market data first
+when an activation or cancel is due at the same scheduler instant. It stops at
+the last observed input instead of executing future actions against stale depth.
+Always inspect `input_clock_regressions`, `live_orders`,
+`pending_scheduled_actions`, and the four pending-action category counts.
+Concurrent socket tasks can reach the single raw writer in a different order
+from their receive stamps even when each source is monotonic. Replay clamps
+those global regressions, preserves file order as the tie-breaker, and reports
+their exact nanosecond count and maximum; investigate large values separately
+from the analyzer's per-source monotonicity gate.
+
+`calibrated = true` is an evidence declaration, not a behavior switch. Set it
+only when the values are derived from representative target-host capture and
+demo order traces. Guessed values may be used with `calibrated = false` for
+sensitivity tests. Current values are global constants; archive the exact TOML,
+raw SHA-256, code revision, report, and the empirical distributions used to
+choose them. Zero latency preserves fixture compatibility but is optimistic and
+cannot support a capital decision.
+
 Strict analysis requires one capture session, every configured stream on its
 configured number of source connections, a ready book for every configured
 book stream, no unexpected data stream, monotonic per-source receive time, and
@@ -134,7 +168,17 @@ both books. Writer, analyzer, and independent SHA-256 values matched at
 `0054cd3daf322cecd03c08e6e5d93ce8051534d1cc8a4ed128f58801645109b8`;
 capture and analyzer config fingerprints matched at
 `48b582c00352efce667114449b8f10242ee2737a8ee2fd97a68d0db1d2acf3c8`.
-Raw-capture backtest replay produced 14 simulated orders and no fills.
+Raw-capture backtest replay produced 14 simulated orders and no fills. After
+the deterministic latency scheduler was added, receive-time replay of the same
+file reported 3,958 normalized inputs, three cross-socket writer-order clock
+regressions (maximum 148,017 ns), 14 exchange activations, 10 effective
+cancellations, four live quotes at the capture horizon, and no pending scheduled
+actions under the explicit uncalibrated
+zero-delay configuration. An uncalibrated sensitivity pass using 2 ms market,
+20 ms entry, 15 ms cancel, 25 ms order-update, and 50 ms fill/account delays
+kept the same no-fill result and exposed three delayed strategy events beyond
+the capture horizon. This short, fill-free run validates scheduling/provenance only;
+it cannot calibrate any latency or fill assumption.
 
 These are connectivity, integrity, and replay-plumbing evidence only. They are
 not a sustained full-depth dataset, execution-model calibration, profitability

@@ -64,7 +64,31 @@ control plane.
 | No-hedge, all-halted, zombie-hedge, stale-depth, and anomalous-fill stops | Stateful timers and halt reason | Exact |
 | Feed/symbol halt removes an instrument from pricing and hedging | `on_system_event` | Exact |
 | Backtest and live strategy use the same event API | `StrategyEvent -> Vec<OrderIntent>` | Equivalent |
+| Local order registration precedes exchange acknowledgement | Synchronous canonical `PendingNew` in live and backtest; pending quotes/hedges count as working state | Equivalent |
 | Quote fill becomes an account/position update before hedging | Synthetic update in backtest; private account/position push in live | Equivalent |
+
+## Backtest Execution Cross-Check
+
+The Rust scheduler was cross-checked against the pinned Java
+`BackTestDelay`, `FeeAndDelaySpec`, `QueueMatchingEngine`, and
+`QueueMatchingEngineFactory` classes under `chaos/chaos-backtest/backtest-core`.
+
+| Java behavior | Rust implementation | Status |
+| --- | --- | --- |
+| `MatchingNew` schedules matching eligibility | `order_entry_latency_ms` and separate matcher `prepare_submit`/`activate` phases | Equivalent |
+| `MatchingCancel` leaves an order matchable until effective | `cancel_latency_ms` scheduled cancel action | Equivalent |
+| `OrderUpdate` and `OrderFill` publishers have separate delays | `order_update_latency_ms` and `fill_account_latency_ms` | Equivalent at the strategy boundary; Rust has no separate strategy fill event |
+| `PendingNew` then live/terminal update | Immediate canonical `PendingNew`, followed by delayed matcher activation and delayed exchange update | Equivalent to the live gateway boundary; earlier than Java matching publication by design |
+| Queue ahead is consumed by matching trades | Per-order queue-ahead metadata consumed by maker-side trade events | Equivalent |
+| Aggressive entry takes current displayed depth; IOC remainder cancels | Activation matches current book and emits taker fills plus terminal IOC update | Equivalent |
+| Per-instrument maker/taker fee map | Maker/taker fee fields on each Rust instrument | Equivalent |
+| Separate market depth/quote/trade delays | One global `market_data_latency_ms`, with raw replay ordered by persisted receive time | Partial; class- and instrument-specific distributions remain calibration work |
+| Conservative depth-fill threshold | Any crossed live order fills from displayed depth | Partial; configurable Java threshold remains unimplemented and is a production-model gap |
+
+Zero-delay fixture compatibility is intentional, but it is optimistic evidence,
+not a calibrated execution claim. Backtest reports retain the effective delay
+configuration, local time basis, clock regressions, active orders, and scheduled
+work left at the capture horizon.
 
 ## One-Symbol Topology
 

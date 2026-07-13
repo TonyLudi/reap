@@ -6,6 +6,16 @@ active_hedge_threshold_usd = 25.0
 min_hedge_interval_ms = 100
 quote_only = false
 
+# Zero preserves deterministic legacy behavior. Set measured values and mark
+# calibrated=true only after a representative capture/observe run.
+[backtest]
+calibrated = false
+market_data_latency_ms = 0
+order_entry_latency_ms = 0
+cancel_latency_ms = 0
+order_update_latency_ms = 0
+fill_account_latency_ms = 0
+
 [[risk_groups]]
 name = "main"
 symbols = ["BTC-USDT", "BTC-USDT-SWAP"]

@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use reap_book::BookReducer;
 use reap_core::{
-    FillLiquidity, Level, NewOrder, OrderBook, OrderUpdate, Price, Quantity, Side, Symbol,
-    TimeInForce, round_down_to_lot,
+    FillLiquidity, Level, NewOrder, OrderBook, OrderStatus, OrderUpdate, Price, Quantity, Side,
+    Symbol, TimeInForce, round_down_to_lot,
 };
 use reap_order::OrderReducer;
 use reap_strategy::InstrumentConfig;
@@ -44,23 +44,80 @@ impl MatchingEngine {
         self.orders.contains_order(order_id)
     }
 
-    pub fn submit(&mut self, mut order: NewOrder) -> Vec<OrderUpdate> {
+    pub fn is_pending(&self, order_id: &str) -> bool {
+        self.orders
+            .get(order_id)
+            .is_some_and(|order| order.status == OrderStatus::PendingNew)
+    }
+
+    pub fn is_open_order(&self, order_id: &str) -> bool {
+        self.orders
+            .get(order_id)
+            .is_some_and(|order| order.status == OrderStatus::PendingNew || order.is_live())
+    }
+
+    pub fn pending_order_count(&self) -> usize {
+        self.orders
+            .orders()
+            .filter(|(_, order)| order.status == OrderStatus::PendingNew)
+            .count()
+    }
+
+    pub fn live_order_count(&self) -> usize {
+        self.orders
+            .orders()
+            .filter(|(_, order)| order.is_live())
+            .count()
+    }
+
+    pub fn prepare_submit(&mut self, mut order: NewOrder, ts_ms: u64) -> (String, OrderUpdate) {
         let order_id = format!("{}-{}", self.symbol, self.next_order_id);
         self.next_order_id += 1;
+        order.qty = round_down_to_lot(order.qty, self.instrument.lot_size);
+        let pending = self.orders.pending_new(order_id.clone(), order, ts_ms);
+        (order_id, pending)
+    }
+
+    pub fn activate(&mut self, order_id: &str, ts_ms: u64) -> Vec<OrderUpdate> {
+        self.now_ms = ts_ms;
+        let Some(snapshot) = self.orders.get(order_id) else {
+            return Vec::new();
+        };
+        if snapshot.status != OrderStatus::PendingNew {
+            return Vec::new();
+        }
+        let order = NewOrder {
+            symbol: snapshot.symbol.clone(),
+            side: snapshot.side,
+            qty: snapshot.qty,
+            price: snapshot.price,
+            time_in_force: snapshot.time_in_force.unwrap_or(TimeInForce::Gtc),
+            reduce_only: false,
+            self_trade_prevention: None,
+            reason: snapshot.reason.clone(),
+        };
         let seq = self.next_seq;
         self.next_seq += 1;
-        order.qty = round_down_to_lot(order.qty, self.instrument.lot_size);
 
-        self.orders.create_pending(order_id.clone(), order.clone());
         let mut updates = Vec::new();
+
+        if order.qty <= 0.0
+            || !order.qty.is_finite()
+            || order.price <= 0.0
+            || !order.price.is_finite()
+        {
+            updates.extend(self.orders.reject(order_id, self.now_ms, "invalid_order"));
+            self.remove_terminal_orders();
+            return updates;
+        }
 
         if self.book.book().is_none() {
             if order.time_in_force == TimeInForce::Ioc {
-                updates.extend(self.orders.cancel(&order_id, self.now_ms, "no_depth"));
+                updates.extend(self.orders.cancel(order_id, self.now_ms, "no_depth"));
             } else {
-                self.add_matching_meta(order_id.clone(), seq);
-                self.add_qty_ahead(&order_id);
-                updates.extend(self.orders.mark_live(&order_id, self.now_ms, "new"));
+                self.add_matching_meta(order_id.to_string(), seq);
+                self.add_qty_ahead(order_id);
+                updates.extend(self.orders.mark_live(order_id, self.now_ms, "new"));
             }
             self.remove_terminal_orders();
             return updates;
@@ -68,49 +125,54 @@ impl MatchingEngine {
 
         let crosses = self.crosses_current_depth(&order);
         if order.time_in_force == TimeInForce::PostOnly && crosses {
-            updates.extend(
-                self.orders
-                    .cancel(&order_id, self.now_ms, "post_only_cross"),
-            );
+            updates.extend(self.orders.cancel(order_id, self.now_ms, "post_only_cross"));
             self.remove_terminal_orders();
             return updates;
         }
         if order.time_in_force == TimeInForce::Ioc && !crosses {
-            updates.extend(self.orders.cancel(&order_id, self.now_ms, "ioc_miss"));
+            updates.extend(self.orders.cancel(order_id, self.now_ms, "ioc_miss"));
             self.remove_terminal_orders();
             return updates;
         }
 
         if !crosses {
-            self.add_matching_meta(order_id.clone(), seq);
-            self.add_qty_ahead(&order_id);
-            updates.extend(self.orders.mark_live(&order_id, self.now_ms, "new"));
+            self.add_matching_meta(order_id.to_string(), seq);
+            self.add_qty_ahead(order_id);
+            updates.extend(self.orders.mark_live(order_id, self.now_ms, "new"));
             self.remove_terminal_orders();
             return updates;
         }
 
-        updates.extend(self.match_taker_order(&order_id));
+        updates.extend(self.match_taker_order(order_id));
         let open_qty = self
             .orders
-            .get(&order_id)
+            .get(order_id)
             .map(|order| order.open_qty)
             .unwrap_or_default();
         if open_qty > 0.0 && order.time_in_force == TimeInForce::Ioc {
-            updates.extend(self.orders.cancel(&order_id, self.now_ms, "ioc_remainder"));
+            updates.extend(self.orders.cancel(order_id, self.now_ms, "ioc_remainder"));
         } else if open_qty > 0.0 {
-            self.add_matching_meta(order_id.clone(), seq);
-            self.add_qty_ahead(&order_id);
+            self.add_matching_meta(order_id.to_string(), seq);
+            self.add_qty_ahead(order_id);
             updates.extend(
                 self.orders
-                    .mark_live(&order_id, self.now_ms, "resting_remainder"),
+                    .mark_live(order_id, self.now_ms, "resting_remainder"),
             );
         }
         self.remove_terminal_orders();
         updates
     }
 
-    pub fn cancel(&mut self, order_id: &str, reason: &str) -> Vec<OrderUpdate> {
-        if !self.orders.is_live(order_id) {
+    pub fn submit(&mut self, order: NewOrder) -> Vec<OrderUpdate> {
+        let (order_id, pending) = self.prepare_submit(order, self.now_ms);
+        let mut updates = vec![pending];
+        updates.extend(self.activate(&order_id, self.now_ms));
+        updates
+    }
+
+    pub fn cancel_at(&mut self, order_id: &str, ts_ms: u64, reason: &str) -> Vec<OrderUpdate> {
+        self.now_ms = ts_ms;
+        if !self.orders.contains_order(order_id) {
             return Vec::new();
         }
         self.meta.remove(order_id);
@@ -120,8 +182,17 @@ impl MatchingEngine {
             .collect()
     }
 
+    pub fn cancel(&mut self, order_id: &str, reason: &str) -> Vec<OrderUpdate> {
+        self.cancel_at(order_id, self.now_ms, reason)
+    }
+
     pub fn on_depth(&mut self, depth: OrderBook) -> Vec<OrderUpdate> {
-        self.now_ms = depth.ts_ms;
+        let ts_ms = depth.ts_ms;
+        self.on_depth_at(depth, ts_ms)
+    }
+
+    pub fn on_depth_at(&mut self, depth: OrderBook, ts_ms: u64) -> Vec<OrderUpdate> {
+        self.now_ms = ts_ms;
         self.book.apply_snapshot(depth);
         self.match_live_orders_on_depth()
     }
@@ -133,7 +204,17 @@ impl MatchingEngine {
         qty: Quantity,
         taker_side: Side,
     ) -> Vec<OrderUpdate> {
-        self.now_ms = ts_ms;
+        self.on_trade_at(price, qty, taker_side, ts_ms)
+    }
+
+    pub fn on_trade_at(
+        &mut self,
+        price: Price,
+        qty: Quantity,
+        taker_side: Side,
+        simulation_ts_ms: u64,
+    ) -> Vec<OrderUpdate> {
+        self.now_ms = simulation_ts_ms;
         let maker_side = taker_side.reverse();
         let mut qty_remaining = qty;
         let order_ids = self.priority_order_ids(maker_side);
@@ -392,7 +473,8 @@ mod tests {
             self_trade_prevention: None,
             reason: "quote".to_string(),
         });
-        assert_eq!(updates[0].event, OrderEvent::Cancelled);
+        assert_eq!(updates[0].event, OrderEvent::PendingNew);
+        assert_eq!(updates[1].event, OrderEvent::Cancelled);
     }
 
     #[test]
@@ -414,8 +496,9 @@ mod tests {
             self_trade_prevention: None,
             reason: "hedge".to_string(),
         });
-        assert_eq!(updates[0].event, OrderEvent::FullyFilled);
-        assert_eq!(updates[0].last_fill_liquidity, Some(FillLiquidity::Taker));
+        assert_eq!(updates[0].event, OrderEvent::PendingNew);
+        assert_eq!(updates[1].event, OrderEvent::FullyFilled);
+        assert_eq!(updates[1].last_fill_liquidity, Some(FillLiquidity::Taker));
     }
 
     #[test]
@@ -438,9 +521,10 @@ mod tests {
             reason: "hedge".to_string(),
         });
 
-        assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0].event, OrderEvent::Cancelled);
-        assert_eq!(updates[0].filled_qty, 0.0);
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].event, OrderEvent::PendingNew);
+        assert_eq!(updates[1].event, OrderEvent::Cancelled);
+        assert_eq!(updates[1].filled_qty, 0.0);
     }
 
     #[test]
@@ -463,10 +547,73 @@ mod tests {
             reason: "hedge".to_string(),
         });
 
-        assert_eq!(updates.len(), 2);
-        assert_eq!(updates[0].event, OrderEvent::PartialFill);
-        assert_eq!(updates[0].filled_qty, 0.4);
-        assert_eq!(updates[1].event, OrderEvent::Cancelled);
-        assert_eq!(updates[1].open_qty, 0.6);
+        assert_eq!(updates.len(), 3);
+        assert_eq!(updates[0].event, OrderEvent::PendingNew);
+        assert_eq!(updates[1].event, OrderEvent::PartialFill);
+        assert_eq!(updates[1].filled_qty, 0.4);
+        assert_eq!(updates[2].event, OrderEvent::Cancelled);
+        assert_eq!(updates[2].open_qty, 0.6);
+    }
+
+    #[test]
+    fn delayed_activation_matches_against_the_latest_book() {
+        let mut engine = MatchingEngine::new(inst());
+        engine.on_depth(OrderBook::one_level(
+            "BTC-USDT",
+            1,
+            level(99.0, 1.0),
+            level(101.0, 1.0),
+        ));
+        let (order_id, pending) = engine.prepare_submit(
+            NewOrder {
+                symbol: "BTC-USDT".to_string(),
+                side: Side::Buy,
+                qty: 0.5,
+                price: 100.0,
+                time_in_force: TimeInForce::PostOnly,
+                reduce_only: false,
+                self_trade_prevention: None,
+                reason: "quote".to_string(),
+            },
+            2,
+        );
+        assert_eq!(pending.event, OrderEvent::PendingNew);
+
+        engine.on_depth_at(
+            OrderBook::one_level("BTC-USDT", 3, level(99.0, 1.0), level(100.0, 1.0)),
+            5,
+        );
+        let updates = engine.activate(&order_id, 12);
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].event, OrderEvent::Cancelled);
+        assert_eq!(updates[0].ts_ms, 12);
+        assert!(updates[0].reason.ends_with("post_only_cross"));
+    }
+
+    #[test]
+    fn cancel_before_activation_prevents_late_order_entry() {
+        let mut engine = MatchingEngine::new(inst());
+        let (order_id, _) = engine.prepare_submit(
+            NewOrder {
+                symbol: "BTC-USDT".to_string(),
+                side: Side::Buy,
+                qty: 0.5,
+                price: 100.0,
+                time_in_force: TimeInForce::PostOnly,
+                reduce_only: false,
+                self_trade_prevention: None,
+                reason: "quote".to_string(),
+            },
+            2,
+        );
+
+        let cancelled = engine.cancel_at(&order_id, 4, "replace_quote");
+        let activated = engine.activate(&order_id, 10);
+
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0].event, OrderEvent::Cancelled);
+        assert!(activated.is_empty());
+        assert!(!engine.is_open_order(&order_id));
     }
 }

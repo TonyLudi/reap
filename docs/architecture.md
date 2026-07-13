@@ -398,6 +398,49 @@ Responsibilities:
 
 Backtest should use the same `StrategyEvent` and `OrderEvent` types as live.
 
+#### Deterministic execution clock
+
+`reap-backtest` owns a single deterministic scheduler. Normalized JSONL and CSV
+use each event's millisecond timestamp as arrival time. Raw captures instead use
+the persisted host `recv_ts_ns` at full nanosecond resolution, so exchange
+timestamp skew cannot reorder the local event loop and sub-millisecond arrival
+gaps are retained. Existing strategy/order event timestamps are projected to
+milliseconds at delivery. Input clock regressions are clamped and reported
+rather than silently moving simulation time backwards.
+
+Each strategy `NewOrder` creates a canonical `PendingNew` immediately. The order
+becomes eligible for matching only after `order_entry_latency_ms`, against the
+book then visible to the matcher. Likewise, a live order remains matchable until
+`cancel_latency_ms` expires. Exchange lifecycle updates and synthetic
+fill-derived account state reach the strategy after their independently
+configured delays. `PendingNew` counts as working quote/hedge state, matching the
+live coordinator boundary and preventing repeated market events from creating
+duplicate intents while an acknowledgement is in flight.
+
+The `[backtest]` fields map to the pinned Java backtest model as follows:
+
+| Rust field | Java reference | Scope |
+| --- | --- | --- |
+| `market_data_latency_ms` | `MarketDepth`, `Quote`, `HistoryTrade`, and `MatchingTrade` | One additional local visibility delay; raw receive time already contains capture-side transport and scheduling |
+| `order_entry_latency_ms` | `MatchingNew` | Intent to matching eligibility |
+| `cancel_latency_ms` | `MatchingCancel` | Cancel intent to matching ineligibility |
+| `order_update_latency_ms` | `OrderUpdate` | Exchange order transition to strategy visibility |
+| `fill_account_latency_ms` | `OrderFill` plus live fill-to-account convergence | Exchange fill to synthetic authoritative position visibility; Java couples position/account publication to order-update delay |
+
+All values default to zero for backward-compatible deterministic fixtures. The
+report embeds the effective values and a `calibrated` declaration. That flag must
+remain false for guessed sensitivity values. Latencies are global in the current
+implementation; production research still requires venue, instrument, message
+class, and percentile distributions from representative captures and demo order
+traces.
+
+Events already due strictly before the next input are drained first. Actions due
+at the same instant as a market event execute after that market event, which is
+the conservative choice for entry and cancel races. The runner never advances
+past the final observed clock just to empty its scheduler because doing so would
+match future actions against a stale final book. Reports therefore expose live
+orders and every category of pending action at the dataset boundary.
+
 ### `reap-capture`
 
 Credential-free public market-data composition.

@@ -46,8 +46,9 @@ Implemented:
   After, batch-cancels regular orders on every symbol, and requires a post-trigger
   zero-order proof, plus hardened systemd templates with mode-specific restart
   policy.
-- Backtest matching with `PostOnly`, `IOC`, current-depth fills, trade fills,
-  queue-ahead tracking, and simple mark-to-market accounting.
+- Deterministic backtest matching with `PendingNew`, delayed entry/cancel/update
+  boundaries, `PostOnly`, `IOC`, current-depth fills, trade fills, queue-ahead
+  tracking, fees, receive-time raw replay, and mark-to-market accounting.
 - CSV/normalized replay, raw-capture validation, configuration validation, and
   a release-mode hot-path benchmark.
 - Credential-free public OKX capture with redundant websocket plans, raw-frame
@@ -106,6 +107,12 @@ cargo run -p reap-cli -- backtest \
   --data "$RAW_PATH" \
   --format raw-capture --pretty
 ```
+
+The optional `[backtest]` table controls market-data, order-entry, cancel,
+order-update, and fill/account delays. The report embeds those assumptions,
+the replay time basis, clock regressions, live orders, and work still scheduled
+at the capture boundary. Example values are zero and `calibrated = false`; do
+not use them as an execution-quality or profitability claim.
 
 Validate the live demo configuration without reading credentials or opening a
 network connection:
