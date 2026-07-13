@@ -13,7 +13,7 @@ production trading process.
 | Deterministic backtest/data | Shared strategy code, depth matching, queue-ahead model, fees, credential-free redundant public capture, create-new session files, and raw/normalized replay | Needs sustained full-depth capture and venue-data calibration before capital decisions |
 | Feed components | Redundant public sockets, isolated private sockets, transport/state freshness separation, account-plus-positions health rounds, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
 | Order components | Event-loop client IDs/registration, exchange-side place-request expiry, signed submit/cancel, pacing, monotonic private reduction, submit/cancel state-convergence deadlines, typed position margin mode, ambiguity handling, and full order/fill/balance/position REST reconciliation are composed | Needs demo exchange fault evidence |
-| Runtime risk | Instrument models, authoritative startup positions, position scope/mode enforcement, forced-repayment blocking, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed deadman/depeg/convergence evidence |
+| Runtime risk | Instrument models, authoritative startup positions, active-order count/notional ceilings, position scope/mode enforcement, forced-repayment blocking, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed deadman/depeg/convergence evidence |
 | Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, and strict bounded soak reports | Demo-capable; production entry intentionally unavailable |
 | Instrument/account bootstrap | Account instruments/config/balance/positions are typed; live spot is cash-only; nonzero positions require configured account ownership and derivative mode before strategy/risk application | Needs target-account certification |
 | Startup/restart gate | Executable phase state, engine-consumed account-snapshot invariant, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, durable latch restore, authoritative account repair, and second-pass clean REST reconciliation | Needs process-kill demo test |
@@ -133,6 +133,11 @@ production trading process.
     expired cancel from deduplication so it can be retried, and requires full
     REST reconciliation; only a terminal private or recovered state clears a
     pending cancel.
+25. Global and per-symbol active-order count ceilings are checked against the
+    projected pre-trade order set. Canonical private or REST-recovered state
+    above either ceiling triggers the durable post-trade risk kill, preventing
+    low-notional order proliferation from bypassing the live-order notional
+    limit; remote-only orders remain a separate reconciliation blocker.
 
 ## Remaining Demo Gate
 
@@ -140,8 +145,9 @@ production trading process.
    current fee tier. Confirm the subaccount has no margin-spot or unmanaged
    position and every nonzero derivative position has the configured owner and
    margin mode. Confirm every currency's forced-repayment indicator is below
-   the configured limit. Enable and threshold `[host_guard]`, and route
-   `[alerts]` to a monitored test destination.
+   the configured limit. Review global/per-symbol active-order counts against
+   quote levels and hedge concurrency. Enable and threshold `[host_guard]`, and
+   route `[alerts]` to a monitored test destination.
 2. Run `observe` through reconnects and verify every account reaches `ready`
    with no reconciliation drift or critical storage backpressure. Use a bounded
    run with `--duration-secs <seconds> --require-clean-soak` so the result is

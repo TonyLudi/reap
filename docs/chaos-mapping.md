@@ -50,6 +50,7 @@ control plane.
 | Derivative position and margin capacity | Position and settle-currency account state | Exact |
 | OKX exchange CMR and calculated portfolio margin checks | Separate margin fields and debouncers | Exact |
 | Balance sheet, turnover, live size, PnL, margin, index, and basis checks | `check_risk_limits` and debounced conditions | Exact |
+| `EntityOpenOrderSafeguard.EntityMaxOpenOrder` | Projected pre-trade and authoritative post-trade global/per-symbol active-order count limits | Equivalent per-symbol containment with an additional global ceiling; Rust post-trade breach latches globally |
 | `StableCoinDepegCheckerImpl`, startup stablecoin check, and 5-second runtime debounce | `StablecoinGuardConfig`, `RiskGate`, and stablecoin-aware `StartupGate` | Equivalent with stricter immediate entry blocking and durable live latch |
 | Java startup basis limit of one third | Startup basis check | Exact |
 | Java runtime basis return value being diagnostic only | `basis_breaches` without runtime halt | Exact |

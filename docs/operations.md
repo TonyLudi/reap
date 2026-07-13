@@ -268,6 +268,26 @@ settings; accepting only their static flags would weaken live stop behavior.
   prior value. Keep entry stopped until OKX reports every currency below the
   configured limit and a clean bootstrap succeeds.
 
+## Active Order Count Limits
+
+- `risk.max_live_order_count` caps all canonical `PendingNew`, `Live`, and
+  `PartiallyFilled` orders. `risk.max_live_order_count_per_symbol` applies a
+  second ceiling to each symbol and must not exceed the global value. Both must
+  be positive.
+- Pre-trade risk includes the proposed order and rejects it before registration
+  if either projected count would exceed its limit. This complements notional
+  limits because many minimum-size orders can exhaust local queues or exchange
+  order capacity while carrying little aggregate notional.
+- Canonical private websocket and REST-recovered order state is authoritative.
+  If it pushes actual count above either ceiling, post-trade risk persists a
+  global risk latch and cancels active orders. This is stricter than the pinned
+  Java per-entity pause action. A remote-only order is not admitted into
+  strategy/risk state; full-state reconciliation reports it as drift and keeps
+  the account blocked independently of these count limits.
+- The demo baseline is 64 active orders globally and 16 per symbol. Review the
+  limits against configured quote levels, hedge concurrency, account-wide
+  exchange limits, and shutdown cancellation capacity before credentialed use.
+
 ## Stablecoin Depeg Guard
 
 - Configure `[[risk.stablecoin_guards]]` with the OKX index symbol and maximum

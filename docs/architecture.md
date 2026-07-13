@@ -242,7 +242,8 @@ Pre-trade and post-trade risk.
 Responsibilities:
 
 - Static config sanity checks.
-- Notional, delta, live-order, turnover, and drawdown limits.
+- Notional, delta, global/per-symbol active-order count, live-order notional,
+  turnover, and drawdown limits.
 - Global kill switch and symbol isolation controls.
 - Freshness, integrity, and downside-depeg guards for configured stablecoin/USD
   references.

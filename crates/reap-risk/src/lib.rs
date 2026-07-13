@@ -28,6 +28,8 @@ pub struct RiskLimits {
     pub max_order_notional_usd: f64,
     pub max_abs_position_notional_usd: f64,
     pub max_live_order_notional_usd: f64,
+    pub max_live_order_count: usize,
+    pub max_live_order_count_per_symbol: usize,
     pub max_turnover_usd: f64,
     pub max_drawdown_usd: f64,
     pub max_feed_age_ms: TimeMs,
@@ -46,6 +48,8 @@ impl Default for RiskLimits {
             max_order_notional_usd: 25_000.0,
             max_abs_position_notional_usd: 100_000.0,
             max_live_order_notional_usd: 100_000.0,
+            max_live_order_count: 256,
+            max_live_order_count_per_symbol: 64,
             max_turnover_usd: 1_000_000.0,
             max_drawdown_usd: 10_000.0,
             max_feed_age_ms: 1_000,
@@ -90,6 +94,17 @@ impl RiskLimits {
         }
         if self.stablecoin_breach_debounce_ms == 0 {
             return Some("stablecoin_breach_debounce_ms must be positive".to_string());
+        }
+        if self.max_live_order_count == 0 {
+            return Some("max_live_order_count must be positive".to_string());
+        }
+        if self.max_live_order_count_per_symbol == 0 {
+            return Some("max_live_order_count_per_symbol must be positive".to_string());
+        }
+        if self.max_live_order_count_per_symbol > self.max_live_order_count {
+            return Some(
+                "max_live_order_count_per_symbol must not exceed max_live_order_count".to_string(),
+            );
         }
         if !(1..=5).contains(&self.forced_repayment_indicator_limit) {
             return Some("forced_repayment_indicator_limit must be between 1 and 5".to_string());
@@ -189,6 +204,15 @@ pub enum RiskRejectReason {
     LiveOrderNotional {
         value: f64,
         limit: f64,
+    },
+    LiveOrderCount {
+        value: usize,
+        limit: usize,
+    },
+    SymbolLiveOrderCount {
+        symbol: Symbol,
+        value: usize,
+        limit: usize,
     },
     Turnover {
         value: f64,
@@ -792,6 +816,27 @@ impl RiskGate {
             }
         }
 
+        let live_order_count = self.live_orders.len().saturating_add(1);
+        if live_order_count > self.limits.max_live_order_count {
+            return Some(RiskRejectReason::LiveOrderCount {
+                value: live_order_count,
+                limit: self.limits.max_live_order_count,
+            });
+        }
+        let symbol_live_order_count = self
+            .live_orders
+            .values()
+            .filter(|live| live.symbol == order.symbol)
+            .count()
+            .saturating_add(1);
+        if symbol_live_order_count > self.limits.max_live_order_count_per_symbol {
+            return Some(RiskRejectReason::SymbolLiveOrderCount {
+                symbol: order.symbol.clone(),
+                value: symbol_live_order_count,
+                limit: self.limits.max_live_order_count_per_symbol,
+            });
+        }
+
         let model = self.instrument_model(&order.symbol);
         let notional = model.notional_usd(order.qty, order.price);
         if notional > self.limits.max_order_notional_usd {
@@ -944,6 +989,30 @@ impl RiskGate {
             })
         });
         let breach = breach.or_else(|| {
+            (self.live_orders.len() > self.limits.max_live_order_count).then(|| {
+                format!(
+                    "live order count {} exceeds {}",
+                    self.live_orders.len(),
+                    self.limits.max_live_order_count
+                )
+            })
+        });
+        let breach = breach.or_else(|| {
+            symbol.and_then(|symbol| {
+                let count = self
+                    .live_orders
+                    .values()
+                    .filter(|order| order.symbol == symbol)
+                    .count();
+                (count > self.limits.max_live_order_count_per_symbol).then(|| {
+                    format!(
+                        "symbol {symbol} live order count {count} exceeds {}",
+                        self.limits.max_live_order_count_per_symbol
+                    )
+                })
+            })
+        });
+        let breach = breach.or_else(|| {
             (self.turnover_usd > self.limits.max_turnover_usd).then(|| {
                 format!(
                     "turnover {} exceeds {}",
@@ -1078,6 +1147,26 @@ mod tests {
         })
     }
 
+    fn live_order_update(order_id: &str, symbol: &str, ts_ms: TimeMs) -> OrderUpdate {
+        OrderUpdate {
+            ts_ms,
+            order_id: order_id.to_string(),
+            symbol: symbol.to_string(),
+            side: Side::Buy,
+            event: OrderEvent::New,
+            status: OrderStatus::Live,
+            price: 100.0,
+            qty: 1.0,
+            open_qty: 1.0,
+            filled_qty: 0.0,
+            avg_fill_price: 0.0,
+            last_fill_qty: 0.0,
+            last_fill_price: 0.0,
+            last_fill_liquidity: None,
+            reason: "test".to_string(),
+        }
+    }
+
     fn ready_gate() -> RiskGate {
         let mut gate = RiskGate::new(RiskLimits::default());
         gate.mark_feed_ready(Venue::Okx, "BTC-USDT", 100);
@@ -1139,6 +1228,71 @@ mod tests {
             gate.pre_trade(1, order()),
             RiskDecision::Rejected {
                 reason: RiskRejectReason::KillSwitch(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn live_order_count_limits_are_validated() {
+        for limits in [
+            RiskLimits {
+                max_live_order_count: 0,
+                ..RiskLimits::default()
+            },
+            RiskLimits {
+                max_live_order_count_per_symbol: 0,
+                ..RiskLimits::default()
+            },
+            RiskLimits {
+                max_live_order_count: 2,
+                max_live_order_count_per_symbol: 3,
+                ..RiskLimits::default()
+            },
+        ] {
+            assert!(limits.validation_error().is_some());
+        }
+    }
+
+    #[test]
+    fn pre_trade_enforces_global_and_per_symbol_live_order_counts() {
+        let mut per_symbol = RiskGate::new(RiskLimits {
+            max_live_order_count: 10,
+            max_live_order_count_per_symbol: 1,
+            require_feed_health: false,
+            require_private_health: false,
+            ..RiskLimits::default()
+        });
+        per_symbol.on_order_update(&live_order_update("btc-1", "BTC-USDT", 1));
+        assert!(matches!(
+            per_symbol.pre_trade(2, order()),
+            RiskDecision::Rejected {
+                reason: RiskRejectReason::SymbolLiveOrderCount {
+                    value: 2,
+                    limit: 1,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let mut global = RiskGate::new(RiskLimits {
+            max_live_order_count: 1,
+            max_live_order_count_per_symbol: 1,
+            require_feed_health: false,
+            require_private_health: false,
+            ..RiskLimits::default()
+        });
+        global.on_order_update(&live_order_update("btc-1", "BTC-USDT", 1));
+        let mut eth_intent = order();
+        let OrderIntent::NewOrder(eth_order) = &mut eth_intent else {
+            unreachable!()
+        };
+        eth_order.symbol = "ETH-USDT".to_string();
+        assert!(matches!(
+            global.pre_trade(2, eth_intent),
+            RiskDecision::Rejected {
+                reason: RiskRejectReason::LiveOrderCount { value: 2, limit: 1 },
                 ..
             }
         ));
@@ -1550,6 +1704,31 @@ mod tests {
 
         assert!(gate.is_killed());
         assert_eq!(outcome.events[0].kind, SystemEventKind::RiskBreach);
+    }
+
+    #[test]
+    fn post_trade_live_order_count_breach_fails_closed() {
+        let limits = RiskLimits {
+            max_live_order_count: 10,
+            max_live_order_count_per_symbol: 1,
+            ..RiskLimits::default()
+        };
+        let mut gate = RiskGate::new(limits);
+        assert!(
+            gate.on_order_update(&live_order_update("live-1", "BTC-USDT", 1))
+                .events
+                .is_empty()
+        );
+
+        let outcome = gate.on_order_update(&live_order_update("live-2", "BTC-USDT", 2));
+
+        assert!(gate.is_killed());
+        assert_eq!(outcome.events[0].kind, SystemEventKind::RiskBreach);
+        assert!(
+            outcome.events[0]
+                .reason
+                .contains("symbol BTC-USDT live order count 2 exceeds 1")
+        );
     }
 
     #[test]
