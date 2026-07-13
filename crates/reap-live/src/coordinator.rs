@@ -90,6 +90,8 @@ pub enum CoordinatorError {
         actual: String,
         expected: String,
     },
+    #[error("account {account_id} position margin mode mismatch: {message}")]
+    PositionMarginMode { account_id: String, message: String },
     #[error(transparent)]
     Startup(#[from] StartupError),
 }
@@ -268,6 +270,7 @@ impl LiveCoordinator {
             }),
             FeedOutput::PrivateAccount { account_id, update } => {
                 let account_id = self.require_account_id(account_id)?;
+                self.ensure_position_margin_modes(&account_id, &update)?;
                 let mut update = update;
                 scope_account_update(&account_id, &mut update);
                 let Some(update) = self.private_state_mut(&account_id)?.reduce_account(update)
@@ -364,6 +367,7 @@ impl LiveCoordinator {
         if !self.manages_account(account_id) {
             return Err(CoordinatorError::UnknownAccount(account_id.to_string()));
         }
+        self.ensure_position_margin_modes(account_id, &update)?;
         scope_account_update(account_id, &mut update);
         let update = self
             .private_state_mut(account_id)?
@@ -379,6 +383,22 @@ impl LiveCoordinator {
 
     pub fn process_event(&mut self, event: NormalizedEvent) -> CoordinatorOutput {
         self.process_normalized(event)
+    }
+
+    fn ensure_position_margin_modes(
+        &self,
+        account_id: &str,
+        update: &reap_core::AccountUpdate,
+    ) -> Result<(), CoordinatorError> {
+        let errors = self.config.position_margin_mode_errors(account_id, update);
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(CoordinatorError::PositionMarginMode {
+                account_id: account_id.to_string(),
+                message: errors.join(", "),
+            })
+        }
     }
 
     pub fn register_local_order(
@@ -1050,7 +1070,8 @@ mod tests {
 
     use reap_core::{
         AccountUpdate, Balance, FillLiquidity, Level, MarketEvent, NewOrder, OrderBook, OrderEvent,
-        OrderStatus, OrderUpdate, Position, Side, SystemEvent, SystemEventKind, TimeInForce, Venue,
+        OrderStatus, OrderUpdate, Position, PositionMarginMode, Side, SystemEvent, SystemEventKind,
+        TimeInForce, Venue,
     };
     use reap_feed::FeedOutput;
     use reap_order::{ReconcileIssue, reconcile, reconcile_full_state};
@@ -1425,6 +1446,64 @@ mod tests {
     }
 
     #[test]
+    fn position_margin_mode_drift_is_rejected_before_state_application() {
+        let mut coordinator = coordinator();
+        let wrong_mode = AccountUpdate {
+            ts_ms: 3,
+            balances: Vec::new(),
+            positions: vec![Position {
+                symbol: "BTC-PERP".to_string(),
+                qty: 2.0,
+                avg_price: 50_000.0,
+                margin_mode: Some(PositionMarginMode::Isolated),
+            }],
+            margins: Vec::new(),
+        };
+
+        let error = coordinator
+            .process_feed(FeedOutput::PrivateAccount {
+                account_id: Some("main".to_string()),
+                update: wrong_mode.clone(),
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CoordinatorError::PositionMarginMode { ref account_id, ref message }
+                if account_id == "main"
+                    && message.contains("BTC-PERP expected Cross, received Isolated")
+        ));
+        assert!(
+            coordinator
+                .private_state("main")
+                .unwrap()
+                .positions()
+                .is_empty()
+        );
+        assert!(matches!(
+            coordinator.apply_authoritative_account_snapshot("main", wrong_mode),
+            Err(CoordinatorError::PositionMarginMode { .. })
+        ));
+
+        coordinator
+            .process_feed(FeedOutput::PrivateAccount {
+                account_id: Some("main".to_string()),
+                update: AccountUpdate {
+                    ts_ms: 4,
+                    balances: Vec::new(),
+                    positions: vec![Position {
+                        symbol: "BTC-PERP".to_string(),
+                        qty: 0.0,
+                        avg_price: 0.0,
+                        margin_mode: Some(PositionMarginMode::Isolated),
+                    }],
+                    margins: Vec::new(),
+                },
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn post_connect_reconciliation_blocks_readiness_until_clean() {
         let mut coordinator = coordinator();
         ready(&mut coordinator);
@@ -1472,6 +1551,7 @@ mod tests {
                         symbol: "BTC-PERP".to_string(),
                         qty: 4.0,
                         avg_price: 50_000.0,
+                        margin_mode: Some(PositionMarginMode::Cross),
                     }],
                     margins: Vec::new(),
                 },
@@ -1531,6 +1611,7 @@ mod tests {
                         symbol: "BTC-PERP".to_string(),
                         qty: 8.0,
                         avg_price: 49_000.0,
+                        margin_mode: Some(PositionMarginMode::Cross),
                     }],
                     margins: Vec::new(),
                 },

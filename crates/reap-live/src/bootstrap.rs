@@ -109,10 +109,19 @@ pub fn verify_bootstrap(
                 account.id
             ));
         }
-        account_updates.insert(
-            account.id.clone(),
-            snapshot.scoped_account_update(&account.id),
+        let account_update = snapshot.scoped_account_update(&account.id);
+        errors.extend(
+            config
+                .position_margin_mode_errors(&account.id, &account_update)
+                .into_iter()
+                .map(|error| {
+                    format!(
+                        "account {} position margin mode mismatch: {error}",
+                        account.id
+                    )
+                }),
         );
+        account_updates.insert(account.id.clone(), account_update);
         baseline_fill_ids.insert(
             account.id.clone(),
             snapshot
@@ -355,7 +364,7 @@ fn compare_text(name: &str, configured: &str, exchange: &str, errors: &mut Vec<S
 
 #[cfg(test)]
 mod tests {
-    use reap_core::{Balance, MarginSnapshot};
+    use reap_core::{Balance, MarginSnapshot, Position, PositionMarginMode};
     use reap_risk::RiskLimits;
     use reap_strategy::ChaosConfig;
     use reap_venue::okx::{OkxAccountLevel, OkxPositionMode};
@@ -513,5 +522,26 @@ mod tests {
         let error = verify_bootstrap(&config, &HashMap::from([("main".to_string(), snapshot)]))
             .unwrap_err();
         assert!(error.to_string().contains("tick_size mismatch"));
+    }
+
+    #[test]
+    fn rejects_nonzero_position_with_wrong_margin_mode() {
+        let config = config();
+        let mut snapshot = snapshot();
+        snapshot.positions.positions.push(Position {
+            symbol: "BTC-USDT-SWAP".to_string(),
+            qty: 2.0,
+            avg_price: 50_000.0,
+            margin_mode: Some(PositionMarginMode::Isolated),
+        });
+
+        let error = verify_bootstrap(&config, &HashMap::from([("main".to_string(), snapshot)]))
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("BTC-USDT-SWAP expected Cross, received Isolated")
+        );
     }
 }

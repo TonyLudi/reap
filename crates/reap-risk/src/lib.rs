@@ -1605,6 +1605,7 @@ mod tests {
                 symbol: "BTC-USDT".to_string(),
                 qty: 1.0,
                 avg_price: 100.0,
+                margin_mode: None,
             }],
             margins: Vec::new(),
         });

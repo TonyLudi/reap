@@ -217,6 +217,9 @@ Responsibilities:
 - Account-scoped fill convergence: derivative fills await their position row;
   spot fills await both base and quote balance rows; expiry fails closed and
   requests full reconciliation.
+- Typed position margin mode from both websocket and REST inputs, checked
+  against each configured derivative trade mode before nonzero state is
+  accepted and included in full-state reconciliation.
 - Missed cancel and unknown-order handling.
 
 Strategy code sends intents. The order layer owns what actually happened.

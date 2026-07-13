@@ -221,6 +221,7 @@ impl PrivateStateReducer {
                 symbol,
                 qty: 0.0,
                 avg_price: 0.0,
+                margin_mode: None,
             });
         }
 
@@ -552,6 +553,7 @@ mod tests {
                 symbol: "BTC-USDT-SWAP".to_string(),
                 qty: -2.0,
                 avg_price: 100.0,
+                margin_mode: None,
             }],
             margins: Vec::new(),
         });
@@ -589,6 +591,7 @@ mod tests {
                 symbol: "BTC-USDT-SWAP".to_string(),
                 qty: -2.0,
                 avg_price: 100.0,
+                margin_mode: None,
             }],
             margins: Vec::new(),
         });
@@ -632,6 +635,7 @@ mod tests {
                 symbol: "BTC-USDT-SWAP".to_string(),
                 qty: 2.0,
                 avg_price: 100.0,
+                margin_mode: None,
             }],
             margins: Vec::new(),
         });
@@ -645,6 +649,7 @@ mod tests {
                         symbol: "BTC-USDT-SWAP".to_string(),
                         qty: 1.0,
                         avg_price: 90.0,
+                        margin_mode: None,
                     }],
                     margins: Vec::new(),
                 })
@@ -667,6 +672,7 @@ mod tests {
                         symbol: "BTC-USDT-SWAP".to_string(),
                         qty: 3.0,
                         avg_price: 110.0,
+                        margin_mode: None,
                     }],
                     margins: Vec::new(),
                 })

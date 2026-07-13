@@ -488,6 +488,15 @@ pub struct Position {
     pub symbol: Symbol,
     pub qty: Quantity,
     pub avg_price: Price,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub margin_mode: Option<PositionMarginMode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PositionMarginMode {
+    Cross,
+    Isolated,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -631,7 +640,7 @@ pub fn round_down_to_lot(qty: Quantity, lot_size: f64) -> Quantity {
 
 #[cfg(test)]
 mod tests {
-    use super::Channel;
+    use super::{Channel, Position};
 
     #[test]
     fn okx_depth_variants_are_book_channels() {
@@ -639,5 +648,19 @@ mod tests {
         assert!(Channel::Custom("books-l2-tbt".to_string()).is_book());
         assert!(Channel::Custom("books50-l2-tbt".to_string()).is_book());
         assert!(!Channel::Custom("mark-price".to_string()).is_book());
+    }
+
+    #[test]
+    fn position_margin_mode_is_backward_compatible_with_existing_jsonl() {
+        let position: Position =
+            serde_json::from_str(r#"{"symbol":"BTC-USDT-SWAP","qty":2.0,"avg_price":50000.0}"#)
+                .unwrap();
+
+        assert_eq!(position.margin_mode, None);
+        assert!(
+            !serde_json::to_string(&position)
+                .unwrap()
+                .contains("margin_mode")
+        );
     }
 }

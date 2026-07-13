@@ -1,7 +1,7 @@
 use reap_core::{
     AccountUpdate, Balance, BookAction, Channel, EventId, EventKey, FillLiquidity, Level,
-    MarginSnapshot, MarketEvent, NormalizedEvent, Position, RawEnvelope, SequencedBookUpdate, Side,
-    Subscription, Venue,
+    MarginSnapshot, MarketEvent, NormalizedEvent, Position, PositionMarginMode, RawEnvelope,
+    SequencedBookUpdate, Side, Subscription, Venue,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -422,6 +422,7 @@ impl OkxAdapter {
                             symbol,
                             qty,
                             avg_price: parse_optional_f64("avgPx", &data.average_price)?,
+                            margin_mode: Some(parse_position_margin_mode(&data.margin_mode)?),
                         }],
                         margins: Vec::new(),
                     }),
@@ -786,6 +787,8 @@ struct OkxPosition {
     average_price: String,
     #[serde(default, rename = "posSide")]
     position_side: String,
+    #[serde(rename = "mgnMode")]
+    margin_mode: String,
     #[serde(rename = "uTime")]
     update_time: String,
 }
@@ -875,6 +878,16 @@ fn parse_side(value: &str) -> Result<Side, VenueError> {
         "buy" => Ok(Side::Buy),
         "sell" => Ok(Side::Sell),
         side => Err(OkxAdapter::invalid(format!("invalid side {side}"))),
+    }
+}
+
+fn parse_position_margin_mode(value: &str) -> Result<PositionMarginMode, VenueError> {
+    match value {
+        "cross" => Ok(PositionMarginMode::Cross),
+        "isolated" => Ok(PositionMarginMode::Isolated),
+        other => Err(OkxAdapter::invalid(format!(
+            "invalid mgnMode {other:?}; expected cross or isolated"
+        ))),
     }
 }
 
@@ -1140,7 +1153,7 @@ mod tests {
         let order = r#"{"arg":{"channel":"orders","instType":"ANY"},"data":[{"ordId":"123","clOrdId":"reap1","instId":"BTC-USDT","side":"buy","state":"partially_filled","px":"100","sz":"1","accFillSz":"0.4","avgPx":"99.5","fillSz":"0.4","fillPx":"99.5","execType":"M","tradeId":"fill1","uTime":"1000","fillTime":"1000"}]}"#;
         let fills = r#"{"arg":{"channel":"fills","instId":"BTC-USDT"},"data":[{"tradeId":"fill2","ordId":"123","clOrdId":"reap1","instId":"BTC-USDT","side":"buy","fillPx":"99.4","fillSz":"0.1","execType":"T","ts":"1001"}]}"#;
         let account = r#"{"arg":{"channel":"account"},"data":[{"uTime":"1002","mgnRatio":"10","adjEq":"1000","notionalUsd":"100","details":[{"ccy":"USDT","cashBal":"1000","availBal":"900"}]}]}"#;
-        let positions = r#"{"arg":{"channel":"positions","instType":"ANY"},"data":[{"instId":"BTC-USDT-SWAP","pos":"2","posSide":"short","avgPx":"50000","uTime":"1003"}]}"#;
+        let positions = r#"{"arg":{"channel":"positions","instType":"ANY"},"data":[{"instId":"BTC-USDT-SWAP","pos":"2","posSide":"short","mgnMode":"cross","avgPx":"50000","uTime":"1003"}]}"#;
 
         let order_events = adapter.parse(&envelope(Channel::Orders, order)).unwrap();
         let fill_events = adapter.parse(&envelope(Channel::Fills, fills)).unwrap();
@@ -1181,8 +1194,28 @@ mod tests {
         assert!(matches!(
             position_events[0].event,
             VenueEvent::Account(AccountUpdate { ref positions, .. })
-                if positions[0].symbol == "BTC-USDT-SWAP" && positions[0].qty == -2.0
+                if positions[0].symbol == "BTC-USDT-SWAP"
+                    && positions[0].qty == -2.0
+                    && positions[0].margin_mode == Some(PositionMarginMode::Cross)
         ));
+    }
+
+    #[test]
+    fn rejects_positions_without_a_supported_margin_mode() {
+        let adapter = OkxAdapter::default().with_account_id("main");
+        let missing = r#"{"arg":{"channel":"positions","instType":"ANY"},"data":[{"instId":"BTC-USDT-SWAP","pos":"2","posSide":"net","uTime":"1003"}]}"#;
+        let invalid = r#"{"arg":{"channel":"positions","instType":"ANY"},"data":[{"instId":"BTC-USDT-SWAP","pos":"2","posSide":"net","mgnMode":"portfolio","uTime":"1003"}]}"#;
+
+        assert!(
+            adapter
+                .parse(&envelope(Channel::Positions, missing))
+                .is_err()
+        );
+        assert!(
+            adapter
+                .parse(&envelope(Channel::Positions, invalid))
+                .is_err()
+        );
     }
 
     #[test]

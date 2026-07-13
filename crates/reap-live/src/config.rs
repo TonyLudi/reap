@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use reap_core::{AccountUpdate, PositionMarginMode};
 use reap_order::PacingPolicy;
 use reap_risk::RiskLimits;
 use reap_strategy::{ChaosConfig, InstrumentConfig};
@@ -573,6 +574,52 @@ impl LiveConfig {
         self.strategy.instruments.iter().filter(move |instrument| {
             self.account_for_symbol_unchecked(&instrument.symbol) == Some(account_id)
         })
+    }
+
+    pub(crate) fn position_margin_mode_errors(
+        &self,
+        account_id: &str,
+        update: &AccountUpdate,
+    ) -> Vec<String> {
+        let Some(account) = self.account(account_id) else {
+            return vec![format!("unknown account {account_id}")];
+        };
+        let mut errors = update
+            .positions
+            .iter()
+            .filter(|position| position.qty != 0.0)
+            .filter_map(|position| {
+                let instrument = self
+                    .strategy
+                    .instruments
+                    .iter()
+                    .find(|instrument| instrument.symbol == position.symbol)?;
+                if !instrument.kind.is_derivative()
+                    || self.account_for_symbol_unchecked(&position.symbol) != Some(account_id)
+                {
+                    return None;
+                }
+                let expected = match account.trade_modes.get(&position.symbol)? {
+                    OkxTradeModeConfig::Cross => PositionMarginMode::Cross,
+                    OkxTradeModeConfig::Isolated => PositionMarginMode::Isolated,
+                    OkxTradeModeConfig::Cash => return None,
+                };
+                (position.margin_mode != Some(expected)).then(|| {
+                    format!(
+                        "{} expected {:?}, received {}",
+                        position.symbol,
+                        expected,
+                        position
+                            .margin_mode
+                            .map(|mode| format!("{mode:?}"))
+                            .unwrap_or_else(|| "no mgnMode".to_string())
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        errors.sort();
+        errors.dedup();
+        errors
     }
 
     fn account_for_symbol_unchecked(&self, symbol: &str) -> Option<&str> {

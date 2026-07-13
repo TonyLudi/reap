@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use chrono::{SecondsFormat, Utc};
 use reap_core::{
-    AccountUpdate, Balance, FillLiquidity, MarginSnapshot, Position, SelfTradePrevention, Side,
-    TimeInForce,
+    AccountUpdate, Balance, FillLiquidity, MarginSnapshot, Position, PositionMarginMode,
+    SelfTradePrevention, Side, TimeInForce,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -1118,6 +1118,8 @@ struct OkxPositionWire {
     average_price: String,
     #[serde(default, rename = "posSide")]
     position_side: String,
+    #[serde(rename = "mgnMode")]
+    margin_mode: String,
     #[serde(default, rename = "uTime")]
     update_time: String,
 }
@@ -1142,6 +1144,7 @@ impl OkxPositionWire {
                 symbol: self.symbol,
                 qty,
                 avg_price: parse_optional_number("avgPx", &self.average_price)?,
+                margin_mode: Some(parse_position_margin_mode(&self.margin_mode)?),
             },
         ))
     }
@@ -1307,6 +1310,18 @@ fn parse_position_mode(value: &str) -> Result<OkxPositionMode, RestError> {
             field: "posMode",
             value: value.to_string(),
             message: "expected long_short_mode or net_mode".to_string(),
+        }),
+    }
+}
+
+fn parse_position_margin_mode(value: &str) -> Result<PositionMarginMode, RestError> {
+    match value {
+        "cross" => Ok(PositionMarginMode::Cross),
+        "isolated" => Ok(PositionMarginMode::Isolated),
+        other => Err(RestError::InvalidField {
+            field: "mgnMode",
+            value: other.to_string(),
+            message: "expected cross or isolated".to_string(),
         }),
     }
 }
@@ -1663,7 +1678,7 @@ mod tests {
             r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","instType":"SWAP","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"USDT","ctType":"linear","ctVal":"0.01","ctValCcy":"BTC","tickSz":"0.1","lotSz":"1","minSz":"1","state":"live"}]}"#,
             r#"{"code":"0","msg":"","data":[{"acctLv":"2","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"7","mainUid":"6"}]}"#,
             r#"{"code":"0","msg":"","data":[{"uTime":"1000","mgnRatio":"12.5","adjEq":"10000","notionalUsd":"2000","details":[{"ccy":"USDT","cashBal":"9000","availBal":"8000","eq":"10000","liab":"0","maxLoan":"500"}]}]}"#,
-            r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","pos":"2","posSide":"net","avgPx":"50000","uTime":"1001"}]}"#,
+            r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","pos":"2","posSide":"net","mgnMode":"cross","avgPx":"50000","uTime":"1001"}]}"#,
         ]);
 
         let instruments = client
@@ -1684,6 +1699,10 @@ mod tests {
         assert_eq!(balance.balances[0].available, 8000.0);
         assert_eq!(balance.margins[0].exchange_ratio, Some(12.5));
         assert_eq!(positions.positions[0].qty, 2.0);
+        assert_eq!(
+            positions.positions[0].margin_mode,
+            Some(PositionMarginMode::Cross)
+        );
 
         let requests = requests.lock().unwrap();
         assert_eq!(
@@ -1708,6 +1727,26 @@ mod tests {
         assert!(matches!(
             parse_number("px", "NaN"),
             Err(RestError::InvalidField { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_unsupported_position_margin_mode() {
+        let (client, _) = client(vec![
+            r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","pos":"2","posSide":"net","mgnMode":"portfolio","uTime":"1001"}]}"#,
+        ]);
+
+        let error = client
+            .account_positions_at("time", Some(OkxInstrumentType::Swap), None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RestError::InvalidField {
+                field: "mgnMode",
+                ..
+            }
         ));
     }
 }

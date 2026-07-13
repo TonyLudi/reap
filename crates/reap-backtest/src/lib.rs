@@ -264,6 +264,7 @@ impl BacktestRunner {
                                 } else {
                                     update.last_fill_price
                                 },
+                                margin_mode: None,
                             }],
                             margins: Vec::new(),
                         })),

@@ -4750,6 +4750,7 @@ mod tests {
                 symbol: "BTC-USDT".to_string(),
                 qty: 0.1,
                 avg_price: 50_000.0,
+                margin_mode: None,
             }],
             margins: Vec::new(),
         }));
@@ -6128,6 +6129,7 @@ mod tests {
                 symbol: "BTC-USDT".to_string(),
                 qty: 0.1,
                 avg_price: 50_000.0,
+                margin_mode: None,
             }],
             margins: Vec::new(),
         });
@@ -6339,6 +6341,7 @@ mod tests {
                 symbol: "BTC-USDT".to_string(),
                 qty: 0.1,
                 avg_price: 50_000.0,
+                margin_mode: None,
             }],
             margins: Vec::new(),
         });

@@ -12,8 +12,8 @@ production trading process.
 | Iarb2 decision model | Covered for the documented OKX parity boundary | Not a blocker |
 | Deterministic backtest/data | Shared strategy code, depth matching, queue-ahead model, fees, credential-free redundant public capture, create-new session files, and raw/normalized replay | Needs sustained full-depth capture and venue-data calibration before capital decisions |
 | Feed components | Redundant public sockets, isolated private sockets, transport/state freshness separation, account-plus-positions health rounds, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
-| Order components | Event-loop client IDs/registration, exchange-side place-request expiry, signed submit/cancel, pacing, monotonic private reduction, ambiguity handling, and full order/fill/balance/position REST reconciliation are composed | Needs demo exchange fault evidence |
-| Runtime risk | Instrument models, authoritative startup positions, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed deadman/depeg/convergence evidence |
+| Order components | Event-loop client IDs/registration, exchange-side place-request expiry, signed submit/cancel, pacing, monotonic private reduction, typed position margin mode, ambiguity handling, and full order/fill/balance/position REST reconciliation are composed | Needs demo exchange fault evidence |
+| Runtime risk | Instrument models, authoritative startup positions, configured position margin-mode enforcement, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed deadman/depeg/convergence evidence |
 | Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, and strict bounded soak reports | Demo-capable; production entry intentionally unavailable |
 | Instrument/account bootstrap | Account instruments/config/balance/positions are typed, verified, and applied to strategy/risk before snapshot readiness | Needs target-account certification |
 | Startup/restart gate | Executable phase state, engine-consumed account-snapshot invariant, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, durable latch restore, authoritative account repair, and second-pass clean REST reconciliation | Needs process-kill demo test |
@@ -114,12 +114,17 @@ production trading process.
     every spot fill must be covered by both currency balances. A configured
     deadline emits account-scoped drift, cancels live orders, and starts full
     reconciliation independently of aggregate private-stream heartbeat.
+21. Both OKX position sources retain `mgnMode`. Bootstrap and every later
+    nonzero derivative position must match the configured `cross` or `isolated`
+    trade mode, while full-state reconciliation also compares local and remote
+    mode; mismatch fails the live lifecycle before applying the position.
 
 ## Remaining Demo Gate
 
 1. Review `examples/live-okx-demo.toml` against the actual demo account and
-   current fee tier. Enable and threshold `[host_guard]`, and route `[alerts]`
-   to a monitored test destination.
+   current fee tier. Confirm every existing nonzero derivative position has the
+   configured margin mode. Enable and threshold `[host_guard]`, and route
+   `[alerts]` to a monitored test destination.
 2. Run `observe` through reconnects and verify every account reaches `ready`
    with no reconciliation drift or critical storage backpressure. Use a bounded
    run with `--duration-secs <seconds> --require-clean-soak` so the result is

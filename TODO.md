@@ -119,6 +119,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Require every canonical derivative fill to converge to its position row
   and every spot fill to both currency balances within a configured deadline;
   fail closed and reconcile the account on timeout.
+- [x] Retain OKX position `mgnMode`, reject configured derivative margin-mode
+  mismatch at bootstrap and runtime, and compare the field during REST
+  reconciliation.
 - [x] Reject crossed books and force fresh-snapshot recovery, matching the
   reviewed Java OKX subscriber behavior with explicit sequence validation.
 - [x] Add order `expTime`, startup/periodic exchange-clock validation, and an

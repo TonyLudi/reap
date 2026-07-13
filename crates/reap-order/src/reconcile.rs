@@ -286,6 +286,16 @@ fn compare_position(issues: &mut Vec<ReconcileIssue>, local: &Position, remote: 
             remote: remote.avg_price.to_string(),
         });
     }
+    if (number_is_nonzero(local.qty) || number_is_nonzero(remote.qty))
+        && local.margin_mode != remote.margin_mode
+    {
+        issues.push(ReconcileIssue::PositionMismatch {
+            symbol: local.symbol.clone(),
+            field: "margin_mode".to_string(),
+            local: format!("{:?}", local.margin_mode).to_lowercase(),
+            remote: format!("{:?}", remote.margin_mode).to_lowercase(),
+        });
+    }
 }
 
 fn balance_is_nonzero(balance: &Balance) -> bool {
@@ -342,7 +352,7 @@ fn compare_number(
 
 #[cfg(test)]
 mod tests {
-    use reap_core::{NewOrder, Side, TimeInForce};
+    use reap_core::{NewOrder, PositionMarginMode, Side, TimeInForce};
 
     use super::*;
 
@@ -410,6 +420,7 @@ mod tests {
                 symbol: "BTC-USDT-SWAP".to_string(),
                 qty: 2.0,
                 avg_price: 50_000.0,
+                margin_mode: None,
             }],
             margins: Vec::new(),
         });
@@ -428,11 +439,47 @@ mod tests {
                 symbol: "BTC-USDT-SWAP".to_string(),
                 qty: 2.0,
                 avg_price: 50_000.0,
+                margin_mode: None,
             }],
             margins: Vec::new(),
         };
 
         assert!(reconcile_full_state(&local, &[], &[], &remote).is_clean());
+    }
+
+    #[test]
+    fn full_state_reconciliation_reports_position_margin_mode_drift() {
+        let mut local = PrivateStateReducer::new();
+        local.apply_account(AccountUpdate {
+            ts_ms: 1,
+            balances: Vec::new(),
+            positions: vec![Position {
+                symbol: "BTC-USDT-SWAP".to_string(),
+                qty: 2.0,
+                avg_price: 50_000.0,
+                margin_mode: Some(PositionMarginMode::Cross),
+            }],
+            margins: Vec::new(),
+        });
+        let remote = AccountUpdate {
+            ts_ms: 2,
+            balances: Vec::new(),
+            positions: vec![Position {
+                symbol: "BTC-USDT-SWAP".to_string(),
+                qty: 2.0,
+                avg_price: 50_000.0,
+                margin_mode: Some(PositionMarginMode::Isolated),
+            }],
+            margins: Vec::new(),
+        };
+
+        let report = reconcile_full_state(&local, &[], &[], &remote);
+
+        assert!(report.issues.iter().any(|issue| matches!(
+            issue,
+            ReconcileIssue::PositionMismatch { symbol, field, .. }
+                if symbol == "BTC-USDT-SWAP" && field == "margin_mode"
+        )));
     }
 
     #[test]
@@ -453,6 +500,7 @@ mod tests {
                 symbol: "BTC-USDT-SWAP".to_string(),
                 qty: 2.0,
                 avg_price: 50_000.0,
+                margin_mode: None,
             }],
             margins: Vec::new(),
         });
