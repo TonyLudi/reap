@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -186,6 +187,15 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
     #[error("storage serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("storage path {path} is invalid: {message}")]
+    InvalidPath { path: PathBuf, message: String },
+    #[error("storage journal {path} is already owned by another process via {lock_path}")]
+    AlreadyLocked { path: PathBuf, lock_path: PathBuf },
+    #[error("storage lease for {lease_path} does not match configured journal {config_path}")]
+    LeaseMismatch {
+        config_path: PathBuf,
+        lease_path: PathBuf,
+    },
     #[error("durable storage write failed: {0}")]
     Durability(String),
     #[error("storage recovery found an invalid record on line {line}: {message}")]
@@ -292,8 +302,9 @@ impl StorageSink {
 
 pub struct StorageRuntime {
     sink: StorageSink,
-    shutdown: oneshot::Sender<()>,
-    task: JoinHandle<Result<(), StorageError>>,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<Result<(), StorageError>>>,
+    _lease: Arc<StorageLease>,
 }
 
 impl StorageRuntime {
@@ -301,11 +312,143 @@ impl StorageRuntime {
         self.sink.clone()
     }
 
-    pub async fn shutdown(self) -> Result<(), StorageError> {
-        let _ = self.shutdown.send(());
-        self.task.await??;
+    pub async fn stop_writer(&mut self) -> Result<(), StorageError> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(task) = self.task.take() {
+            task.await??;
+        }
         Ok(())
     }
+
+    pub async fn shutdown(mut self) -> Result<(), StorageError> {
+        self.stop_writer().await?;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct StorageLease {
+    journal_path: PathBuf,
+    lock_path: PathBuf,
+    lock_file: std::fs::File,
+}
+
+impl StorageLease {
+    pub fn journal_path(&self) -> &Path {
+        &self.journal_path
+    }
+
+    pub fn lock_path(&self) -> &Path {
+        &self.lock_path
+    }
+}
+
+impl Drop for StorageLease {
+    fn drop(&mut self) {
+        let _ = self.lock_file.unlock();
+    }
+}
+
+pub fn acquire_storage_lease(path: impl AsRef<Path>) -> Result<StorageLease, StorageError> {
+    let journal_path = normalize_journal_path(path.as_ref())?;
+    let lock_path = lock_path_for(&journal_path)?;
+    validate_regular_file_if_present(&lock_path, "lock path")?;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut lock_file = options.open(&lock_path)?;
+    match lock_file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(StorageError::AlreadyLocked {
+                path: journal_path,
+                lock_path,
+            });
+        }
+        Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+    }
+    #[cfg(unix)]
+    std::fs::set_permissions(&lock_path, unix_private_permissions())?;
+    lock_file.set_len(0)?;
+    lock_file.seek(SeekFrom::Start(0))?;
+    writeln!(
+        lock_file,
+        "pid={} acquired_at_ms={}",
+        std::process::id(),
+        unix_time_ms()
+    )?;
+    lock_file.sync_data()?;
+
+    Ok(StorageLease {
+        journal_path,
+        lock_path,
+        lock_file,
+    })
+}
+
+fn normalize_journal_path(path: &Path) -> Result<PathBuf, StorageError> {
+    let file_name = path.file_name().ok_or_else(|| StorageError::InvalidPath {
+        path: path.to_path_buf(),
+        message: "journal path must name a file".to_string(),
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let canonical_parent = std::fs::canonicalize(parent)?;
+    let journal_path = canonical_parent.join(file_name);
+    validate_regular_file_if_present(&journal_path, "journal path")?;
+    Ok(journal_path)
+}
+
+fn lock_path_for(journal_path: &Path) -> Result<PathBuf, StorageError> {
+    let file_name = journal_path
+        .file_name()
+        .ok_or_else(|| StorageError::InvalidPath {
+            path: journal_path.to_path_buf(),
+            message: "journal path must name a file".to_string(),
+        })?;
+    let mut lock_name = file_name.to_os_string();
+    lock_name.push(".lock");
+    Ok(journal_path.with_file_name(lock_name))
+}
+
+fn validate_regular_file_if_present(path: &Path, label: &str) -> Result<(), StorageError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(StorageError::InvalidPath {
+            path: path.to_path_buf(),
+            message: format!("{label} must not be a symbolic link"),
+        }),
+        Ok(metadata) if !metadata.is_file() => Err(StorageError::InvalidPath {
+            path: path.to_path_buf(),
+            message: format!("{label} must be a regular file"),
+        }),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(unix)]
+fn unix_private_permissions() -> std::fs::Permissions {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::Permissions::from_mode(0o600)
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -482,26 +625,25 @@ fn storage_record_ts_ms(record: &StorageRecord) -> TimeMs {
     }
 }
 
-pub fn spawn_jsonl_storage(config: StorageConfig) -> StorageRuntime {
-    let (sender, receiver) = mpsc::channel(config.channel_capacity.max(1));
-    let (shutdown, shutdown_rx) = oneshot::channel();
-    let dropped = Arc::new(AtomicU64::new(0));
-    let queued = Arc::new(AtomicUsize::new(0));
-    let sink = StorageSink {
-        sender,
-        dropped,
-        queued: Arc::clone(&queued),
-    };
-    let task = tokio::spawn(run_writer(config, receiver, shutdown_rx, queued));
-    StorageRuntime {
-        sink,
-        shutdown,
-        task,
-    }
+pub async fn start_jsonl_storage(config: StorageConfig) -> Result<StorageRuntime, StorageError> {
+    let lease = acquire_storage_lease(&config.path)?;
+    start_jsonl_storage_with_lease(config, lease).await
 }
 
-pub async fn start_jsonl_storage(config: StorageConfig) -> Result<StorageRuntime, StorageError> {
+pub async fn start_jsonl_storage_with_lease(
+    mut config: StorageConfig,
+    lease: StorageLease,
+) -> Result<StorageRuntime, StorageError> {
+    let normalized_config_path = normalize_journal_path(&config.path)?;
+    if normalized_config_path != lease.journal_path {
+        return Err(StorageError::LeaseMismatch {
+            config_path: normalized_config_path,
+            lease_path: lease.journal_path.clone(),
+        });
+    }
+    config.path = lease.journal_path.clone();
     let file = open_storage_file(&config).await?;
+    let lease = Arc::new(lease);
     let (sender, receiver) = mpsc::channel(config.channel_capacity.max(1));
     let (shutdown, shutdown_rx) = oneshot::channel();
     let dropped = Arc::new(AtomicU64::new(0));
@@ -511,39 +653,31 @@ pub async fn start_jsonl_storage(config: StorageConfig) -> Result<StorageRuntime
         dropped,
         queued: Arc::clone(&queued),
     };
-    let task = tokio::spawn(run_writer_with_file(
-        config,
-        file,
-        receiver,
-        shutdown_rx,
-        queued,
-    ));
+    let writer_lease = Arc::clone(&lease);
+    let task = tokio::spawn(async move {
+        let _lease = writer_lease;
+        run_writer_with_file(config, file, receiver, shutdown_rx, queued).await
+    });
     Ok(StorageRuntime {
         sink,
-        shutdown,
-        task,
+        shutdown: Some(shutdown),
+        task: Some(task),
+        _lease: lease,
     })
-}
-
-async fn run_writer(
-    config: StorageConfig,
-    receiver: mpsc::Receiver<PendingRecord>,
-    shutdown: oneshot::Receiver<()>,
-    queued: Arc<AtomicUsize>,
-) -> Result<(), StorageError> {
-    let file = open_storage_file(&config).await?;
-    run_writer_with_file(config, file, receiver, shutdown, queued).await
 }
 
 async fn open_storage_file(config: &StorageConfig) -> Result<tokio::fs::File, StorageError> {
     if let Some(parent) = config.path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    Ok(tokio::fs::OpenOptions::new()
+    let file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&config.path)
-        .await?)
+        .await?;
+    #[cfg(unix)]
+    tokio::fs::set_permissions(&config.path, unix_private_permissions()).await?;
+    Ok(file)
 }
 
 async fn run_writer_with_file(
@@ -719,11 +853,13 @@ mod tests {
     async fn writer_persists_all_record_classes_as_jsonl() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.jsonl");
-        let runtime = spawn_jsonl_storage(StorageConfig {
+        let runtime = start_jsonl_storage(StorageConfig {
             path: path.clone(),
             channel_capacity: 16,
             flush_every_records: 1,
-        });
+        })
+        .await
+        .unwrap();
         let sink = runtime.sink();
         sink.record(raw()).await.unwrap();
         sink.record(StorageRecord::Normalized(NormalizedEvent::Control(
@@ -792,6 +928,101 @@ mod tests {
         assert!(text.contains("intent"));
         assert!(text.contains("order"));
         assert!(text.contains("fill"));
+    }
+
+    #[test]
+    fn storage_lease_is_exclusive_canonical_and_released_on_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let direct = directory.path().join("events.jsonl");
+        let alias = nested.join("..").join("events.jsonl");
+
+        let lease = acquire_storage_lease(&direct).unwrap();
+        assert_eq!(
+            lease.journal_path(),
+            directory
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join("events.jsonl")
+        );
+        let second = acquire_storage_lease(&alias).unwrap_err();
+        assert!(matches!(second, StorageError::AlreadyLocked { .. }));
+        let owner = std::fs::read_to_string(lease.lock_path()).unwrap();
+        assert!(owner.contains(&format!("pid={}", std::process::id())));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(lease.lock_path())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        drop(lease);
+        acquire_storage_lease(alias).unwrap();
+    }
+
+    #[tokio::test]
+    async fn storage_runtime_holds_lease_until_shutdown() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let config = StorageConfig {
+            path: path.clone(),
+            channel_capacity: 4,
+            flush_every_records: 1,
+        };
+        let mut runtime = start_jsonl_storage(config.clone()).await.unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        let second = start_jsonl_storage(config.clone()).await.err().unwrap();
+        assert!(matches!(second, StorageError::AlreadyLocked { .. }));
+
+        runtime.stop_writer().await.unwrap();
+        let second = acquire_storage_lease(&path).unwrap_err();
+        assert!(matches!(second, StorageError::AlreadyLocked { .. }));
+        drop(runtime);
+        start_jsonl_storage(config)
+            .await
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn storage_rejects_a_lease_for_a_different_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let leased_path = directory.path().join("leased.jsonl");
+        let configured_path = directory.path().join("configured.jsonl");
+        let lease = acquire_storage_lease(&leased_path).unwrap();
+
+        let error = start_jsonl_storage_with_lease(
+            StorageConfig {
+                path: configured_path,
+                channel_capacity: 4,
+                flush_every_records: 1,
+            },
+            lease,
+        )
+        .await
+        .err()
+        .unwrap();
+
+        assert!(matches!(error, StorageError::LeaseMismatch { .. }));
+        acquire_storage_lease(leased_path).unwrap();
     }
 
     #[tokio::test]

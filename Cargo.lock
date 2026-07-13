@@ -1092,6 +1092,7 @@ dependencies = [
  "async-trait",
  "base64",
  "hmac",
+ "libc",
  "reap-core",
  "reap-engine",
  "reap-feed",
@@ -1156,7 +1157,10 @@ dependencies = [
 name = "reap-telemetry"
 version = "0.1.0"
 dependencies = [
+ "reqwest",
  "serde",
+ "thiserror",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]

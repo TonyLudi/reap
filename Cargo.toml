@@ -31,6 +31,7 @@ clap = { version = "4", features = ["derive"] }
 csv = "1"
 futures-util = "0.3"
 hmac = "0.12"
+libc = "0.2"
 reap-backtest = { path = "crates/reap-backtest" }
 reap-book = { path = "crates/reap-book" }
 reap-capture = { path = "crates/reap-capture" }

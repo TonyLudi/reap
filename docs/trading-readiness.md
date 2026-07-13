@@ -18,7 +18,8 @@ production trading process.
 | Instrument/account bootstrap | Account instruments/config/balance/positions are typed and verified before readiness | Needs target-account certification |
 | Startup/restart gate | Executable phase state, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, durable latch restore, and clean REST reconciliation | Needs process-kill demo test |
 | Event-loop profile | Allocation-aware raw OKX parity benchmark covers redundant wire input through strategy/risk and storage-record construction | Needs target-host capture and exchange-latency validation |
-| Operator control and alerts | HMAC-authenticated local controls use fsynced write-ahead latches; OKX Cancel All After is maintained independently of the order queue | External alert delivery and an out-of-process supervisory kill remain production blockers |
+| Operator control and alerts | HMAC-authenticated local controls use fsynced write-ahead latches; OKX Cancel All After is maintained independently; bounded webhook delivery can fail the runtime closed | Target alert routing and an out-of-process supervisory kill remain production blockers |
+| Process/host controls | Canonical journal ownership is exclusively locked before recovery or network setup; optional Linux disk, memory, and kernel-clock checks run at preflight and periodically | Must be enabled, thresholded, and fault-tested on the target host under a process supervisor |
 | Exchange certification | No recorded OKX demo soak, fault injection, or production account-mode certification | Production blocker |
 
 ## Implemented Demo Path
@@ -64,11 +65,22 @@ production trading process.
     the account remains halted, survives restart, and exposes the latch reason
     in signed status. Global operator kills and post-trade risk breaches also
     survive restart; normal shutdown does not create a durable latch.
+11. Startup canonicalizes the journal path and acquires a sibling OS file lock
+    before reading credentials, recovery state, or network configuration. The
+    runtime retains that lease until storage teardown, so aliases cannot start
+    a second writer against the same journal.
+12. Optional host guards check journal-filesystem capacity, Linux
+    `MemAvailable`, and kernel clock synchronization before credentials or
+    network I/O, then repeat outside the strategy loop. Optional webhook alerts
+    use a bounded queue, HTTPS, bounded retry/timeouts, and report delivery
+    failures back to the coordinator; production configuration should make
+    those failures fatal.
 
 ## Remaining Demo Gate
 
 1. Review `examples/live-okx-demo.toml` against the actual demo account and
-   current fee tier.
+   current fee tier. Enable and threshold `[host_guard]`, and route `[alerts]`
+   to a monitored test destination.
 2. Run `observe` through reconnects and verify every account reaches `ready`
    with no reconciliation drift or critical storage backpressure. Use a bounded
    run with `--duration-secs <seconds> --require-clean-soak` so the result is
@@ -79,8 +91,9 @@ production trading process.
    Cancel All After from exchange/account evidence.
 4. Complete a sustained soak with zero unexplained order, fill, balance,
    position, or checkpoint drift. `clean_soak` covers runtime readiness,
-   reconciliation, storage drops, and shutdown orders; balances, positions,
-   fills, and restart checkpoint state still require log/account review.
+   reconciliation, storage drops, alert delivery, and shutdown orders;
+   balances, positions, fills, and restart checkpoint state still require
+   log/account review.
 
 ## Production Gate
 
@@ -91,10 +104,10 @@ Production enablement additionally requires:
 - Walk-forward and out-of-sample evaluation, parameter sensitivity, capacity,
   inventory-duration, and stressed-liquidity reports.
 - Stablecoin depeg and exchange-rate pause policy, strategy-group risk, master
-  liveness, external alert delivery, and an out-of-process supervisory kill.
-- Host time-service alarms, CPU/thread placement, bounded backpressure, memory
-  and disk capacity alarms, restart supervision, and an exclusive
-  process/journal ownership lock.
+  liveness, deployed external alert routing, and an out-of-process supervisory
+  kill.
+- Target-host time-service monitoring, CPU/thread placement, bounded
+  backpressure, calibrated memory/disk thresholds, and restart supervision.
 - Long-running demo soak with zero unexplained order, fill, position, or balance
   reconciliation drift.
 - Explicit operator approval of credentials, account mode, limits, symbols,

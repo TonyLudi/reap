@@ -1,3 +1,10 @@
+mod alerts;
+
+pub use alerts::{
+    AlertDeliveryFailure, AlertError, AlertEvent, AlertRuntime, AlertSeverity, AlertSink,
+    AlertStats, WebhookAlertConfig, start_webhook_alerts,
+};
+
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};

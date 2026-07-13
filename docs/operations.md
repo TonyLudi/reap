@@ -62,34 +62,85 @@ its alarm threshold. Never place capture output under source control.
    The example uses the global simulated hosts documented in the
    [OKX API guide](https://www.okx.com/docs-v5/en/); replace REST, public, and
    private domains together when the account belongs to another region.
-3. The runtime recovers the critical JSONL log and binds its checkpoint to the
+3. Before recovery, credentials, or network setup, the runtime canonicalizes
+   the journal path and exclusively locks its sibling `<journal>.lock` file.
+   When enabled, the Linux host guard then checks journal-filesystem space,
+   available memory, and kernel clock synchronization.
+4. The runtime recovers the critical JSONL log and binds its checkpoint to the
    strategy/config fingerprint. It rejects safety latches for accounts or
    symbols not owned by the current config. Do not share a storage path between
    strategy configs.
-4. It compares midpoint-adjusted local time with OKX `/api/v5/public/time` and
+5. It compares midpoint-adjusted local time with OKX `/api/v5/public/time` and
    fails bootstrap when skew exceeds `max_exchange_clock_skew_ms`.
-5. The runtime fetches account-scoped instruments, account configuration,
+6. The runtime fetches account-scoped instruments, account configuration,
    balances, positions, open orders, recent fills, and exact status for any
    restored active order.
-6. It verifies live instrument state, type, linear/inverse contract type,
+7. It verifies live instrument state, type, linear/inverse contract type,
    tick/lot/minimum size, contract value, currencies, configured trade mode,
    account level, and `net_mode` before metadata is ready.
-7. It restores canonical active orders, fill identities, and active global,
+8. It restores canonical active orders, fill identities, and active global,
    account, and symbol safety latches from JSONL. It applies missed known
    fills/terminal updates from REST and requires clean account-scoped
    reconciliation.
-8. In demo mode it arms OKX Cancel All After for every account before starting
+9. In demo mode it arms OKX Cancel All After for every account before starting
    that account's private feed or order task.
-9. It starts redundant public plans and isolated orders, account, and positions
+10. It starts redundant public plans and isolated orders, account, and positions
    sockets for every account. The dedicated fills channel is optional for
    eligible fee tiers; order-channel fills remain canonical. Every transition
    of the private socket set to ready invalidates the earlier reconciliation
    and requires a fresh REST order/fill check, closing the bootstrap-to-stream
    subscription window.
-10. It waits for a contiguous sequenced book for every instrument and a
+11. It waits for a contiguous sequenced book for every instrument and a
     complete, healthy, post-connect reconciled private stream for every account.
-11. Only phase `ready`, writable storage, healthy risk, and explicit
+12. Only phase `ready`, writable storage, healthy risk, and explicit
    `--mode demo --confirm-demo` permit a new order.
+
+## Process Ownership And Host Guard
+
+- The journal's sibling lock file contains PID and acquisition-time metadata
+  and is mode `0600` on Unix. The kernel file lock, not the file's existence or
+  metadata, is authoritative. A stale lock file after a crash is expected; do
+  not delete it while any runtime may still hold the lock.
+- Canonical parent resolution means relative paths and symlinked directory
+  aliases contend for the same lease. The lease remains owned by the runtime
+  even if the storage writer task fails and is released only during teardown or
+  failed startup cleanup.
+- Alert routing and host thresholds are deployment-only and are excluded from
+  checkpoint identity, so enabling them does not invalidate an existing
+  reconciled journal. Trading, account, runtime, storage, and operator changes
+  remain fingerprint-bound.
+- Set `[host_guard].enabled = true` for deployment. Choose disk and memory
+  thresholds above the amount needed for a full fault/reconciliation window,
+  not merely enough for the next flush. A failed preflight prevents credential
+  reads and network startup; a failed periodic check is a fatal runtime event.
+- The host clock check reads Linux kernel synchronization state. It complements,
+  rather than replaces, the independent midpoint-adjusted OKX server-time
+  checks. The deployment supervisor must still monitor the actual NTP/PTP
+  service and clock offset.
+
+## External Alerts
+
+- Set `[alerts].enabled = true` and provide the URL through
+  `alerts.endpoint_env`. The endpoint must use HTTPS; loopback HTTP is accepted
+  only for local testing. Set `bearer_token_env` only when the receiver requires
+  a bearer token. Never put the URL credential or token directly in TOML.
+- System transitions such as stale/gapped feeds, book recovery, reconciliation
+  drift, risk breaches, operator kills, and account/symbol halts map to typed
+  warning or critical JSON events. Runtime and periodic host-guard failures
+  after alert startup produce a critical event. Routine graceful-stop kill
+  records are not paged; bootstrap failures rely on the process supervisor's
+  non-zero-exit alert.
+- Alert HTTP runs in a separate bounded worker. The strategy loop only performs
+  `try_send`; queue saturation is fail-stop. Requests use bounded connect and
+  total timeouts with bounded retries; redirects are refused, event fields are
+  size-capped, and transport errors omit the secret endpoint URL. With
+  `delivery_failure_is_fatal = true`, terminal delivery failure enters the same
+  fail-closed cancellation/reconciliation lifecycle as other runtime faults.
+- Teardown drains queued events within `alerts.shutdown_timeout_ms`. Monitor the
+  report fields `alerts_delivered`, `alert_delivery_failures`,
+  `alert_failure_notifications_dropped`, and `max_alert_queue_depth`. A process
+  supervisor must page on non-zero exit as the independent fallback when the
+  alert destination itself is unavailable.
 
 ## Order Path
 
@@ -135,6 +186,9 @@ its alarm threshold. Never place capture output under source control.
 | Risk breach | Durable global kill active; live orders cancelled | Reduce exposure externally if needed, diagnose, and follow the stopped-process latch-clear procedure; restart alone does not clear it |
 | Manual account kill | Durable account route latch; its instruments are removed from pricing/hedging and its live orders are cancelled | Reconcile the account and dependent exposure; restart alone does not clear it |
 | Exchange clock/deadman failure | Runtime fatal; new entry blocked; armed Cancel All After remains effective | Verify host time and OKX reachability, then reconcile before restart |
+| Host disk/memory/clock failure | Startup refused or runtime fatal; new entry blocked | Restore capacity/time synchronization, inspect journal integrity, and reconcile before restart |
+| Alert queue/delivery failure | Runtime fail-stop when fatal delivery is configured | Verify the external route and supervisor fallback before restart |
+| Journal lease contention | Second process refuses startup before credentials/network | Identify the owning PID/process; never bypass the lock or share the journal |
 | Critical storage loss/backpressure | Runtime fail-stop; checkpoint reconciliation required on restart | Investigate disk/queue capacity; critical records are never silently dropped |
 
 ## Operator Controls
@@ -242,6 +296,10 @@ secondary teardown failure is included in the returned lifecycle error and
 must be treated as an incident. Observe mode performs no exchange mutation and
 shuts down directly.
 
+Host-guard teardown runs before feed/order task teardown. Alert teardown runs
+last so runtime teardown failures can still be queued, and is independently
+bounded by `alerts.shutdown_timeout_ms`.
+
 ## Bounded Soak Acceptance
 
 Use a bounded run for evidence that can be evaluated without an operator-timed
@@ -277,11 +335,14 @@ of these invariants hold:
 - the runtime reached `ready` and `readiness_at_stop` is still `ready`;
 - no `ReconcileDrift` event or best-effort storage drop occurred; and
 - no authenticated operator mutation occurred; and
-- demo shutdown resolved every active canonical order.
+- demo shutdown resolved every active canonical order; and
+- no external alert delivery failed.
 
 The report also records time-to-ready, recovered readiness losses and maximum
 outage, disconnects, stale-stream events, book recoveries, and the storage queue
 high-water mark. It also reports authenticated operator commands and mutations.
+When enabled, it includes host preflight/last snapshots and check count plus
+alert delivery and queue evidence.
 Recovered disconnects do not by themselves fail acceptance,
 but their counts must match the injected fault plan. In demo mode the final
 `readiness` may be degraded by the deliberate shutdown kill switch; acceptance

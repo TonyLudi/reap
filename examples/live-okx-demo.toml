@@ -119,6 +119,25 @@ request_timeout_ms = 2000
 max_request_bytes = 4096
 command_channel_capacity = 64
 
+[alerts]
+enabled = false
+endpoint_env = "REAP_ALERT_WEBHOOK_URL"
+channel_capacity = 256
+failure_channel_capacity = 64
+connect_timeout_ms = 1000
+request_timeout_ms = 2000
+max_attempts = 3
+retry_backoff_ms = 250
+shutdown_timeout_ms = 10000
+delivery_failure_is_fatal = true
+
+[host_guard]
+enabled = false
+check_interval_ms = 10000
+min_disk_available_bytes = 5368709120
+min_memory_available_bytes = 1073741824
+require_clock_synchronized = true
+
 [[accounts]]
 id = "main"
 api_key_env = "REAP_OKX_API_KEY"

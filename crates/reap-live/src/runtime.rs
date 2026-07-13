@@ -17,7 +17,12 @@ use reap_order::{
 use reap_storage::{
     BootstrapRecord, OrderOperation, OrderRequestRecord, RecoveredStorage, SafetyLatchRecord,
     SafetyLatchScope, SafetyLatchSource, StorageConfig, StorageError, StorageRecord,
-    StorageRuntime, StorageSink, recover_jsonl, start_jsonl_storage,
+    StorageRuntime, StorageSink, acquire_storage_lease, recover_jsonl,
+    start_jsonl_storage_with_lease,
+};
+use reap_telemetry::{
+    AlertDeliveryFailure, AlertError, AlertEvent, AlertRuntime, AlertSeverity, AlertSink,
+    AlertStats, start_webhook_alerts,
 };
 use reap_venue::okx::{
     HttpTransport, OkxAdapter, OkxRestClient, OkxSigner, ReqwestTransport, RestError,
@@ -29,11 +34,12 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::{
-    AccountBootstrapSnapshot, CancelAction, CoordinatorError, CoordinatorOutput, LiveAction,
-    LiveConfig, LiveConfigError, LiveCoordinator, OperatorCommand, OperatorEnvelope, OperatorError,
-    OperatorResponse, OperatorService, OperatorStatus, ReadinessSnapshot, ReconcileAction,
-    ReconciliationResult, StartupGate, SubmitAction, TradingEnvironment, VerifiedBootstrap,
-    okx_instrument_type, start_operator_service, verify_bootstrap,
+    AccountBootstrapSnapshot, CancelAction, CoordinatorError, CoordinatorOutput, HostGuardRuntime,
+    HostHealthError, HostHealthSnapshot, LiveAction, LiveConfig, LiveConfigError, LiveCoordinator,
+    OperatorCommand, OperatorEnvelope, OperatorError, OperatorResponse, OperatorService,
+    OperatorStatus, ReadinessSnapshot, ReconcileAction, ReconciliationResult, StartupGate,
+    SubmitAction, TradingEnvironment, VerifiedBootstrap, check_host_health, okx_instrument_type,
+    start_host_guard, start_operator_service, verify_bootstrap,
 };
 
 type LiveGateway = OkxOrderGateway<ReqwestTransport>;
@@ -79,6 +85,13 @@ pub struct LiveRunReport {
     pub operator_commands: u64,
     pub operator_mutations: u64,
     pub max_storage_queue_depth: usize,
+    pub alerts_delivered: u64,
+    pub alert_delivery_failures: u64,
+    pub alert_failure_notifications_dropped: u64,
+    pub max_alert_queue_depth: usize,
+    pub host_preflight: Option<HostHealthSnapshot>,
+    pub host_checks: u64,
+    pub host_last_snapshot: Option<HostHealthSnapshot>,
     pub readiness_at_stop: ReadinessSnapshot,
     pub readiness: ReadinessSnapshot,
     pub dropped_storage_records: u64,
@@ -112,6 +125,24 @@ pub enum LiveRuntimeError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Operator(#[from] OperatorError),
+    #[error(transparent)]
+    Alert(#[from] AlertError),
+    #[error(transparent)]
+    Host(#[from] HostHealthError),
+    #[error("alert delivery failed for {code} after {attempts} attempts: {reason}")]
+    AlertDelivery {
+        code: String,
+        attempts: usize,
+        reason: String,
+    },
+    #[error("alert failure monitor closed unexpectedly")]
+    AlertMonitorClosed,
+    #[error("host health monitor closed unexpectedly")]
+    HostGuardClosed,
+    #[error("alert shutdown timed out after {0}ms")]
+    AlertShutdownTimeout(u64),
+    #[error("{0} external alert deliveries failed during runtime teardown")]
+    AlertFailuresDuringShutdown(u64),
     #[error("storage remained unavailable during graceful shutdown: {0}")]
     ShutdownStorage(String),
     #[error("runtime event channel closed")]
@@ -245,6 +276,7 @@ fn qualifies_as_clean_soak(
     evidence: RuntimeEvidence,
     dropped_storage_records: u64,
     active_orders_after_shutdown: usize,
+    alert_delivery_failures: u64,
 ) -> bool {
     outcome.stop_reason == LiveStopReason::DurationElapsed
         && outcome.reached_ready
@@ -253,6 +285,7 @@ fn qualifies_as_clean_soak(
         && evidence.operator_mutations == 0
         && dropped_storage_records == 0
         && active_orders_after_shutdown == 0
+        && alert_delivery_failures == 0
 }
 
 fn is_zero_order_reconciliation(report: &ReconcileReport) -> bool {
@@ -313,6 +346,13 @@ pub async fn run_live(
             operator_commands: 0,
             operator_mutations: 0,
             max_storage_queue_depth: 0,
+            alerts_delivered: 0,
+            alert_delivery_failures: 0,
+            alert_failure_notifications_dropped: 0,
+            max_alert_queue_depth: 0,
+            host_preflight: None,
+            host_checks: 0,
+            host_last_snapshot: None,
             readiness_at_stop: readiness.clone(),
             readiness,
             dropped_storage_records: 0,
@@ -632,6 +672,58 @@ fn restore_safety_latches(
     Ok(outputs)
 }
 
+fn alert_for_storage_record(record: &StorageRecord) -> Option<AlertEvent> {
+    let StorageRecord::System(event) = record else {
+        return None;
+    };
+    let (severity, component, code) = match event.kind {
+        SystemEventKind::FeedStale => (AlertSeverity::Warning, "market_data", "feed_stale"),
+        SystemEventKind::FeedGap => (AlertSeverity::Warning, "market_data", "feed_gap"),
+        SystemEventKind::BookRecoveryStarted => (
+            AlertSeverity::Warning,
+            "market_data",
+            "book_recovery_started",
+        ),
+        SystemEventKind::PrivateStreamStale => (
+            AlertSeverity::Warning,
+            "account_data",
+            "private_stream_stale",
+        ),
+        SystemEventKind::BookRecoveryFailed => (
+            AlertSeverity::Critical,
+            "market_data",
+            "book_recovery_failed",
+        ),
+        SystemEventKind::ReconcileDrift => {
+            (AlertSeverity::Critical, "order_state", "reconcile_drift")
+        }
+        SystemEventKind::RiskBreach => (AlertSeverity::Critical, "risk", "risk_breach"),
+        SystemEventKind::KillSwitchActivated => {
+            (AlertSeverity::Critical, "risk", "kill_switch_activated")
+        }
+        SystemEventKind::AccountHalted => (AlertSeverity::Critical, "risk", "account_halted"),
+        SystemEventKind::SymbolHalted => (AlertSeverity::Critical, "risk", "symbol_halted"),
+        SystemEventKind::FeedHeartbeat
+        | SystemEventKind::FeedRecovered
+        | SystemEventKind::PrivateStreamHeartbeat
+        | SystemEventKind::PrivateStreamRecovered
+        | SystemEventKind::KillSwitchReset
+        | SystemEventKind::SymbolResumed => return None,
+    };
+    let mut alert = AlertEvent::new(severity, component, code, event.reason.clone());
+    alert.ts_ms = event.ts_ms;
+    if let Some(venue) = &event.venue {
+        alert = alert.with_attribute("venue", format!("{venue:?}").to_ascii_lowercase());
+    }
+    if let Some(account_id) = &event.account_id {
+        alert = alert.with_attribute("account_id", account_id);
+    }
+    if let Some(symbol) = &event.symbol {
+        alert = alert.with_attribute("symbol", symbol);
+    }
+    Some(alert)
+}
+
 struct LiveRuntime {
     mode: LiveMode,
     run_duration: Option<Duration>,
@@ -666,6 +758,18 @@ struct LiveRuntime {
     operator_service: Option<OperatorService>,
     operator_rx: Option<mpsc::Receiver<OperatorEnvelope>>,
     operator_shutdown_reason: Option<String>,
+    alert_runtime: Option<AlertRuntime>,
+    alert_sink: Option<AlertSink>,
+    alert_failures: Option<mpsc::Receiver<AlertDeliveryFailure>>,
+    alert_shutdown_timeout_ms: u64,
+    alert_delivery_failure_is_fatal: bool,
+    observed_alert_delivery_failures: u64,
+    alert_stats: AlertStats,
+    host_guard: Option<HostGuardRuntime>,
+    host_failures: Option<mpsc::Receiver<HostHealthError>>,
+    host_preflight: Option<HostHealthSnapshot>,
+    host_checks: u64,
+    host_last_snapshot: Option<HostHealthSnapshot>,
 }
 
 impl LiveRuntime {
@@ -674,10 +778,24 @@ impl LiveRuntime {
         mode: LiveMode,
         run_duration: Option<Duration>,
     ) -> Result<Self, LiveRuntimeError> {
+        let storage_lease = acquire_storage_lease(&config.storage.path)?;
+        let journal_path = storage_lease.journal_path().to_path_buf();
+        let host_preflight = if config.host_guard.enabled {
+            Some(check_host_health(&config.host_guard, &journal_path)?)
+        } else {
+            None
+        };
+        let mut alert_runtime = config
+            .alerts
+            .webhook_from_env()?
+            .map(start_webhook_alerts)
+            .transpose()?;
+        let alert_sink = alert_runtime.as_ref().map(AlertRuntime::sink);
+        let alert_failures = alert_runtime.as_mut().map(AlertRuntime::take_failures);
         let operator_config = config.operator.clone();
         let operator_secret = operator_config.secret_from_env()?;
         let config_fingerprint = config.fingerprint()?;
-        let recovered = recover_jsonl(&config.storage.path)?;
+        let recovered = recover_jsonl(storage_lease.journal_path())?;
         validate_recovered_safety_latches(&config, &recovered)?;
         for (account_id, (strategy_name, fingerprint)) in &recovered.bootstrap_identities {
             if config.account(account_id).is_none() {
@@ -858,17 +976,25 @@ impl LiveRuntime {
             config.runtime.max_subscriptions_per_socket,
         )
         .map_err(|error| LiveRuntimeError::Subscription(error.to_string()))?;
-        let storage = start_jsonl_storage(StorageConfig {
-            path: config.storage.path.clone(),
-            channel_capacity: config.storage.channel_capacity,
-            flush_every_records: config.storage.flush_every_records,
-        })
+        let storage = start_jsonl_storage_with_lease(
+            StorageConfig {
+                path: config.storage.path.clone(),
+                channel_capacity: config.storage.channel_capacity,
+                flush_every_records: config.storage.flush_every_records,
+            },
+            storage_lease,
+        )
         .await?;
         let storage_sink = storage.sink();
         coordinator.mark_storage_ready(true, "storage file opened");
 
         let (control_tx, control_rx) = mpsc::channel(config.runtime.event_channel_capacity);
         let (feed_tx, feed_rx) = mpsc::channel(config.runtime.event_channel_capacity);
+        let mut host_guard = config
+            .host_guard
+            .enabled
+            .then(|| start_host_guard(config.host_guard.clone(), journal_path));
+        let host_failures = host_guard.as_mut().map(HostGuardRuntime::take_failures);
         let mut feeds = Vec::new();
         let mut feed_tasks = Vec::new();
         let mut sources = Vec::new();
@@ -997,6 +1123,18 @@ impl LiveRuntime {
             operator_service: None,
             operator_rx: None,
             operator_shutdown_reason: None,
+            alert_runtime,
+            alert_sink,
+            alert_failures,
+            alert_shutdown_timeout_ms: config.alerts.shutdown_timeout_ms,
+            alert_delivery_failure_is_fatal: config.alerts.delivery_failure_is_fatal,
+            observed_alert_delivery_failures: 0,
+            alert_stats: AlertStats::default(),
+            host_guard,
+            host_failures,
+            host_checks: u64::from(host_preflight.is_some()),
+            host_last_snapshot: host_preflight.clone(),
+            host_preflight,
         };
         for output in initial_outputs {
             if let Err(primary) = runtime.commit_output(output).await {
@@ -1041,6 +1179,10 @@ impl LiveRuntime {
 
     async fn run(mut self) -> Result<LiveRunReport, LiveRuntimeError> {
         let loop_result = self.run_loop().await;
+        let runtime_alert_result = match &loop_result {
+            Ok(_) => Ok(()),
+            Err(error) => self.emit_runtime_failure_alert(error),
+        };
         let stop_context = match &loop_result {
             Ok(outcome) => match outcome.stop_reason {
                 LiveStopReason::OperatorSignal => "operator signal".to_string(),
@@ -1072,6 +1214,9 @@ impl LiveRuntime {
             },
             Err(primary) => {
                 let mut additional = Vec::new();
+                if let Err(error) = runtime_alert_result {
+                    additional.push(("runtime alert enqueue", error));
+                }
                 if let Err(error) = stop_result {
                     additional.push(("fail-closed cleanup", error));
                 }
@@ -1090,6 +1235,7 @@ impl LiveRuntime {
             evidence,
             dropped_storage_records,
             active_orders_after_shutdown,
+            self.alert_stats.failed,
         );
         Ok(LiveRunReport {
             mode: self.mode,
@@ -1106,6 +1252,13 @@ impl LiveRuntime {
             operator_commands: evidence.operator_commands,
             operator_mutations: evidence.operator_mutations,
             max_storage_queue_depth: evidence.max_storage_queue_depth,
+            alerts_delivered: self.alert_stats.delivered,
+            alert_delivery_failures: self.alert_stats.failed,
+            alert_failure_notifications_dropped: self.alert_stats.failure_notifications_dropped,
+            max_alert_queue_depth: self.alert_stats.max_queue_depth,
+            host_preflight: self.host_preflight.clone(),
+            host_checks: self.host_checks,
+            host_last_snapshot: self.host_last_snapshot.clone(),
             readiness_at_stop: outcome.readiness_at_stop,
             readiness,
             dropped_storage_records,
@@ -1156,6 +1309,30 @@ impl LiveRuntime {
                         self.coordinator.readiness(),
                     );
                     return Ok(outcome);
+                }
+                failure = receive_alert_failure(&mut self.alert_failures) => {
+                    let failure = failure.ok_or(LiveRuntimeError::AlertMonitorClosed)?;
+                    self.observed_alert_delivery_failures = self
+                        .observed_alert_delivery_failures
+                        .saturating_add(1);
+                    tracing::error!(
+                        event_id = %failure.event_id,
+                        code = %failure.code,
+                        attempts = failure.attempts,
+                        reason = %failure.reason,
+                        "external alert delivery failed"
+                    );
+                    if self.alert_delivery_failure_is_fatal {
+                        return Err(LiveRuntimeError::AlertDelivery {
+                            code: failure.code,
+                            attempts: failure.attempts,
+                            reason: failure.reason,
+                        });
+                    }
+                }
+                failure = receive_host_failure(&mut self.host_failures) => {
+                    let failure = failure.ok_or(LiveRuntimeError::HostGuardClosed)?;
+                    return Err(failure.into());
                 }
                 event = self.control_rx.recv() => {
                     let event = event.ok_or(LiveRuntimeError::EventChannelClosed)?;
@@ -1829,6 +2006,15 @@ impl LiveRuntime {
     }
 
     async fn commit_output(&mut self, output: CoordinatorOutput) -> Result<(), LiveRuntimeError> {
+        let alerts = if self.alert_sink.is_some() {
+            output
+                .records
+                .iter()
+                .filter_map(alert_for_storage_record)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         for record in output.records {
             if matches!(record, StorageRecord::SafetyLatch(_)) {
                 self.record_durable_storage(record).await?;
@@ -1836,10 +2022,58 @@ impl LiveRuntime {
                 self.record_storage(record)?;
             }
         }
+        for alert in alerts {
+            self.emit_alert(alert)?;
+        }
         for action in output.actions {
             self.dispatch_action(action)?;
         }
         Ok(())
+    }
+
+    fn emit_alert(&self, alert: AlertEvent) -> Result<(), LiveRuntimeError> {
+        if let Some(sink) = &self.alert_sink {
+            sink.try_emit(alert)?;
+        }
+        Ok(())
+    }
+
+    fn emit_runtime_failure_alert(&self, error: &LiveRuntimeError) -> Result<(), LiveRuntimeError> {
+        if matches!(
+            error,
+            LiveRuntimeError::Alert(_)
+                | LiveRuntimeError::AlertDelivery { .. }
+                | LiveRuntimeError::AlertMonitorClosed
+                | LiveRuntimeError::AlertShutdownTimeout(_)
+                | LiveRuntimeError::AlertFailuresDuringShutdown(_)
+        ) {
+            return Ok(());
+        }
+        let mut alert = AlertEvent::new(
+            AlertSeverity::Critical,
+            "runtime",
+            "runtime_failure",
+            error.to_string(),
+        );
+        if let LiveRuntimeError::Host(host_error) = error {
+            alert.code = host_error.code().to_string();
+            if let Some(snapshot) = host_error.snapshot() {
+                alert = alert
+                    .with_attribute(
+                        "disk_available_bytes",
+                        snapshot.disk_available_bytes.to_string(),
+                    )
+                    .with_attribute(
+                        "memory_available_bytes",
+                        snapshot.memory_available_bytes.to_string(),
+                    )
+                    .with_attribute(
+                        "clock_synchronized",
+                        snapshot.clock_synchronized.to_string(),
+                    );
+            }
+        }
+        self.emit_alert(alert)
     }
 
     async fn commit_shutdown_output(
@@ -2194,10 +2428,29 @@ impl LiveRuntime {
     }
 
     async fn shutdown(&mut self) -> Result<(), LiveRuntimeError> {
-        let operator_result = match self.operator_service.take() {
-            Some(service) => service.shutdown().await.map_err(LiveRuntimeError::from),
-            None => Ok(()),
-        };
+        let mut errors = Vec::new();
+        if let Some(host_guard) = self.host_guard.take() {
+            match host_guard.shutdown().await {
+                Ok(stats) => {
+                    self.host_checks = self.host_checks.saturating_add(stats.checks);
+                    if let Some(snapshot) = stats.last_snapshot {
+                        self.host_last_snapshot = Some(snapshot);
+                    }
+                }
+                Err(error) => errors.push(("host guard", LiveRuntimeError::Join(error))),
+            }
+        }
+        if let Some(failures) = &mut self.host_failures
+            && let Ok(error) = failures.try_recv()
+        {
+            errors.push(("host health", error.into()));
+        }
+        self.host_failures.take();
+        if let Some(service) = self.operator_service.take()
+            && let Err(error) = service.shutdown().await
+        {
+            errors.push(("operator service", LiveRuntimeError::Operator(error)));
+        }
         self.operator_rx.take();
         for sender in self.order_senders.values() {
             let _ = sender.try_send(OrderTaskCommand::Shutdown);
@@ -2213,19 +2466,74 @@ impl LiveRuntime {
             feed.shutdown().await;
         }
         for task in self.feed_tasks.drain(..) {
-            task.await?;
+            if let Err(error) = task.await {
+                errors.push(("feed task", LiveRuntimeError::Join(error)));
+            }
         }
         for task in self.order_tasks.drain(..) {
-            task.await?;
+            if let Err(error) = task.await {
+                errors.push(("order task", LiveRuntimeError::Join(error)));
+            }
         }
         for task in self.safety_tasks.drain(..) {
-            task.await?;
+            if let Err(error) = task.await {
+                errors.push(("safety task", LiveRuntimeError::Join(error)));
+            }
         }
-        if let Some(storage) = self.storage.take() {
-            storage.shutdown().await?;
+        if let Some(storage) = self.storage.as_mut()
+            && let Err(error) = storage.stop_writer().await
+        {
+            errors.push(("storage", LiveRuntimeError::Storage(error)));
         }
-        operator_result?;
-        Ok(())
+        if !errors.is_empty() {
+            let message = errors
+                .iter()
+                .map(|(stage, error)| format!("{stage}: {error}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            if let Err(error) = self.emit_alert(AlertEvent::new(
+                AlertSeverity::Critical,
+                "runtime",
+                "teardown_failure",
+                message,
+            )) {
+                errors.push(("teardown alert enqueue", error));
+            }
+        }
+        self.alert_sink.take();
+        if let Some(alert_runtime) = self.alert_runtime.take() {
+            match tokio::time::timeout(
+                Duration::from_millis(self.alert_shutdown_timeout_ms),
+                alert_runtime.shutdown(),
+            )
+            .await
+            {
+                Ok(Ok(stats)) => {
+                    self.alert_stats = stats;
+                    let unobserved_failures = stats
+                        .failed
+                        .saturating_sub(self.observed_alert_delivery_failures);
+                    if self.alert_delivery_failure_is_fatal && unobserved_failures > 0 {
+                        errors.push((
+                            "alert delivery",
+                            LiveRuntimeError::AlertFailuresDuringShutdown(unobserved_failures),
+                        ));
+                    }
+                }
+                Ok(Err(error)) => errors.push(("alert service", error.into())),
+                Err(_) => errors.push((
+                    "alert service",
+                    LiveRuntimeError::AlertShutdownTimeout(self.alert_shutdown_timeout_ms),
+                )),
+            }
+        }
+        self.alert_failures.take();
+        if errors.is_empty() {
+            return Ok(());
+        }
+        let (_, first) = errors.remove(0);
+        let additional = errors;
+        Err(combine_lifecycle_errors(first, additional))
     }
 }
 
@@ -2848,6 +3156,24 @@ async fn receive_operator(
     }
 }
 
+async fn receive_alert_failure(
+    receiver: &mut Option<mpsc::Receiver<AlertDeliveryFailure>>,
+) -> Option<AlertDeliveryFailure> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn receive_host_failure(
+    receiver: &mut Option<mpsc::Receiver<HostHealthError>>,
+) -> Option<HostHealthError> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 #[cfg(unix)]
 async fn shutdown_signal() -> Result<(), std::io::Error> {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -2871,11 +3197,13 @@ mod tests {
     use async_trait::async_trait;
     use reap_core::{AccountUpdate, Balance, OrderEvent, OrderUpdate, Side};
     use reap_risk::{InstrumentRiskModel, RiskLimits};
+    use reap_storage::start_jsonl_storage;
     use reap_strategy::{ChaosConfig, InstrumentKindConfig};
     use reap_venue::okx::{
         HttpResponse, OkxAccountLevel, OkxCredentials, OkxInstrumentType, OkxPositionMode,
         SignedRequest,
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use crate::{
         LiveAccountConfig, LiveStorageConfig, OkxTradeModeConfig, OkxVenueConfig, RuntimeConfig,
@@ -2953,6 +3281,37 @@ mod tests {
         }
     }
 
+    async fn serve_one_alert(listener: tokio::net::TcpListener) {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4_096];
+        loop {
+            let read = socket.read(&mut buffer).await.unwrap();
+            assert!(read > 0, "alert client closed before sending a request");
+            request.extend_from_slice(&buffer[..read]);
+            let text = String::from_utf8_lossy(&request);
+            let Some(header_end) = text.find("\r\n\r\n") else {
+                continue;
+            };
+            let content_length = text[..header_end]
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+        socket
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+    }
+
     fn config() -> LiveConfig {
         let mut strategy: ChaosConfig =
             toml::from_str(include_str!("../../../examples/iarb2-basic.toml")).unwrap();
@@ -2964,6 +3323,8 @@ mod tests {
             runtime: RuntimeConfig::default(),
             storage: LiveStorageConfig::default(),
             operator: crate::OperatorConfig::default(),
+            alerts: crate::AlertConfig::default(),
+            host_guard: crate::HostGuardConfig::default(),
             accounts: vec![LiveAccountConfig {
                 id: "main".to_string(),
                 api_key_env: "KEY".to_string(),
@@ -3279,12 +3640,14 @@ mod tests {
             RuntimeEvidence::default(),
             0,
             0,
+            0,
         ));
 
         outcome.stop_reason = LiveStopReason::OperatorSignal;
         assert!(!qualifies_as_clean_soak(
             &outcome,
             RuntimeEvidence::default(),
+            0,
             0,
             0,
         ));
@@ -3295,12 +3658,14 @@ mod tests {
             RuntimeEvidence::default(),
             0,
             0,
+            0,
         ));
         outcome.reached_ready = true;
         outcome.readiness_at_stop = readiness(crate::LivePhase::Degraded);
         assert!(!qualifies_as_clean_soak(
             &outcome,
             RuntimeEvidence::default(),
+            0,
             0,
             0,
         ));
@@ -3310,16 +3675,25 @@ mod tests {
             reconciliation_drift_events: 1,
             ..RuntimeEvidence::default()
         };
-        assert!(!qualifies_as_clean_soak(&outcome, evidence, 0, 0));
+        assert!(!qualifies_as_clean_soak(&outcome, evidence, 0, 0, 0));
         assert!(!qualifies_as_clean_soak(
             &outcome,
             RuntimeEvidence::default(),
+            1,
+            0,
+            0,
+        ));
+        assert!(!qualifies_as_clean_soak(
+            &outcome,
+            RuntimeEvidence::default(),
+            0,
             1,
             0,
         ));
         assert!(!qualifies_as_clean_soak(
             &outcome,
             RuntimeEvidence::default(),
+            0,
             0,
             1,
         ));
@@ -3358,6 +3732,33 @@ mod tests {
         assert_eq!(evidence.reconciliation_drift_events, 1);
         assert_eq!(evidence.book_recovery_events, 1);
         assert_eq!(evidence.stream_stale_events, 2);
+    }
+
+    #[test]
+    fn persisted_safety_events_map_to_stable_external_alerts() {
+        let record = |kind| {
+            StorageRecord::System(SystemEvent {
+                ts_ms: 42,
+                kind,
+                venue: Some(Venue::Okx),
+                account_id: Some("main".to_string()),
+                symbol: Some("BTC-USDT".to_string()),
+                reason: "test condition".to_string(),
+            })
+        };
+
+        let warning = alert_for_storage_record(&record(SystemEventKind::FeedGap)).unwrap();
+        assert_eq!(warning.ts_ms, 42);
+        assert_eq!(warning.severity, AlertSeverity::Warning);
+        assert_eq!(warning.code, "feed_gap");
+        assert_eq!(warning.attributes.get("venue").unwrap(), "okx");
+        assert_eq!(warning.attributes.get("account_id").unwrap(), "main");
+        assert_eq!(warning.attributes.get("symbol").unwrap(), "BTC-USDT");
+
+        let critical = alert_for_storage_record(&record(SystemEventKind::RiskBreach)).unwrap();
+        assert_eq!(critical.severity, AlertSeverity::Critical);
+        assert_eq!(critical.code, "risk_breach");
+        assert!(alert_for_storage_record(&record(SystemEventKind::FeedHeartbeat)).is_none());
     }
 
     #[tokio::test]
@@ -3412,6 +3813,21 @@ mod tests {
         .await
         .unwrap();
         let storage_sink = storage.sink();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let alert_endpoint = format!("http://{}/alerts", listener.local_addr().unwrap());
+        let alert_server = tokio::spawn(serve_one_alert(listener));
+        let mut alert_runtime =
+            start_webhook_alerts(reap_telemetry::WebhookAlertConfig::new(alert_endpoint)).unwrap();
+        let alert_sink = alert_runtime.sink();
+        let alert_failures = alert_runtime.take_failures();
+        alert_sink
+            .try_emit(AlertEvent::new(
+                AlertSeverity::Warning,
+                "test",
+                "lifecycle_test",
+                "test alert",
+            ))
+            .unwrap();
         let (control_tx, control_rx) = mpsc::channel(16);
         let (feed_tx, feed_rx) = mpsc::channel(16);
         let runtime = LiveRuntime {
@@ -3448,9 +3864,25 @@ mod tests {
             operator_service: None,
             operator_rx: None,
             operator_shutdown_reason: None,
+            alert_runtime: Some(alert_runtime),
+            alert_sink: Some(alert_sink),
+            alert_failures: Some(alert_failures),
+            alert_shutdown_timeout_ms: 1_000,
+            alert_delivery_failure_is_fatal: true,
+            observed_alert_delivery_failures: 0,
+            alert_stats: AlertStats::default(),
+            host_guard: None,
+            host_failures: None,
+            host_preflight: None,
+            host_checks: 0,
+            host_last_snapshot: None,
         };
 
         let report = runtime.run().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), alert_server)
+            .await
+            .unwrap()
+            .unwrap();
         drop(control_tx);
         drop(feed_tx);
         let _ = std::fs::remove_file(path);
@@ -3460,6 +3892,9 @@ mod tests {
         assert!(report.reached_ready);
         assert_eq!(report.time_to_ready_ms, Some(0));
         assert!(report.readiness_at_stop.is_ready());
+        assert_eq!(report.alerts_delivered, 1);
+        assert_eq!(report.alert_delivery_failures, 0);
+        assert_eq!(report.max_alert_queue_depth, 1);
         assert_eq!(report.reconciliation_drift_events, 0);
         assert_eq!(report.dropped_storage_records, 0);
         assert_eq!(report.active_orders_after_shutdown, 0);
@@ -3541,6 +3976,18 @@ mod tests {
             operator_service: Some(operator_service),
             operator_rx: Some(operator_rx),
             operator_shutdown_reason: None,
+            alert_runtime: None,
+            alert_sink: None,
+            alert_failures: None,
+            alert_shutdown_timeout_ms: 100,
+            alert_delivery_failure_is_fatal: true,
+            observed_alert_delivery_failures: 0,
+            alert_stats: AlertStats::default(),
+            host_guard: None,
+            host_failures: None,
+            host_preflight: None,
+            host_checks: 0,
+            host_last_snapshot: None,
         };
         let runtime_task = tokio::spawn(runtime.run());
 
@@ -3774,6 +4221,18 @@ mod tests {
             operator_service: None,
             operator_rx: None,
             operator_shutdown_reason: None,
+            alert_runtime: None,
+            alert_sink: None,
+            alert_failures: None,
+            alert_shutdown_timeout_ms: 100,
+            alert_delivery_failure_is_fatal: true,
+            observed_alert_delivery_failures: 0,
+            alert_stats: AlertStats::default(),
+            host_guard: None,
+            host_failures: None,
+            host_preflight: None,
+            host_checks: 0,
+            host_last_snapshot: None,
         };
 
         assert!(matches!(
@@ -3935,6 +4394,74 @@ mod tests {
         }));
         assert_eq!(private_subscriptions(false).len(), 3);
         assert_eq!(private_subscriptions(true).len(), 4);
+    }
+
+    #[tokio::test]
+    async fn journal_ownership_is_checked_before_credentials_or_network() {
+        let path = std::env::temp_dir().join(format!(
+            "reap-live-owner-{}-{}.jsonl",
+            std::process::id(),
+            unix_time_ns()
+        ));
+        let lease = acquire_storage_lease(&path).unwrap();
+        let lock_path = lease.lock_path().to_path_buf();
+        let mut config = config();
+        config.storage.path = path;
+
+        let error = run_live(
+            config,
+            LiveRunOptions {
+                mode: LiveMode::Observe,
+                demo_confirmed: false,
+                run_duration: Some(Duration::from_millis(1)),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            LiveRuntimeError::Storage(StorageError::AlreadyLocked { .. })
+        ));
+        drop(lease);
+        let _ = std::fs::remove_file(lock_path);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn host_preflight_fails_before_credentials_or_network_and_releases_lease() {
+        let path = std::env::temp_dir().join(format!(
+            "reap-live-host-preflight-{}-{}.jsonl",
+            std::process::id(),
+            unix_time_ns()
+        ));
+        let mut config = config();
+        config.storage.path = path.clone();
+        config.host_guard.enabled = true;
+        config.host_guard.min_disk_available_bytes = u64::MAX;
+        config.host_guard.min_memory_available_bytes = 1;
+        config.host_guard.require_clock_synchronized = false;
+
+        let error = run_live(
+            config,
+            LiveRunOptions {
+                mode: LiveMode::Observe,
+                demo_confirmed: false,
+                run_duration: Some(Duration::from_millis(1)),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            LiveRuntimeError::Host(HostHealthError::Unhealthy { ref code, .. })
+                if code == "disk_low"
+        ));
+        let lease = acquire_storage_lease(&path).unwrap();
+        let lock_path = lease.lock_path().to_path_buf();
+        drop(lease);
+        let _ = std::fs::remove_file(lock_path);
     }
 
     #[tokio::test]

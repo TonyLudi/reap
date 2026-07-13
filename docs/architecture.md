@@ -370,6 +370,8 @@ Responsibilities:
 - Strategy decisions and order intents.
 - Order/fill/account events.
 - Write-ahead operator/risk safety latches and restart reduction.
+- Canonical journal-path validation and a process-lifetime exclusive writer
+  lease acquired before recovery or network setup.
 - Book snapshots.
 - JSONL initially, Parquet or binary logs later.
 
@@ -389,6 +391,8 @@ Responsibilities:
 - Structured logs.
 - Health endpoints.
 - Panic and task death reporting.
+- Bounded webhook alert delivery with timeout/retry limits and delivery-failure
+  feedback to the live coordinator.
 
 Metrics should be cheap to emit and safe to drop under pressure.
 
@@ -670,8 +674,9 @@ pending-order/fill reconciliation.
 
 Status: implemented as `reap-risk`, `reap-engine`, `reap-telemetry`, and
 `reap-storage`, with configuration validation, an operations guide, and a
-measured event-loop benchmark. These are reusable components, not a completed
-production deployment.
+measured event-loop benchmark. The live composition also has exclusive journal
+ownership and optional Linux disk/memory/clock guards. These are reusable
+components, not a completed production deployment.
 
 - Add risk gates, kill switch, stale feed policy, metrics, storage.
 - Add operational runbooks and config checks.
@@ -714,6 +719,8 @@ the deployment blocker.
   live adapter/dedup/sequence/book path. Done.
 - Add exchange-side request expiry, server-clock validation, independent Cancel
   All After heartbeats, and durable restart latches. Done.
+- Add exclusive journal ownership, bounded external alerts, and host resource
+  preflight/periodic guards. Done; target-host deployment evidence remains.
 - Complete fault injection and OKX demo soak acceptance.
 
 See [trading-readiness.md](trading-readiness.md) for the detailed gate.

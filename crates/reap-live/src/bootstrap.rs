@@ -384,6 +384,8 @@ mod tests {
             runtime: RuntimeConfig::default(),
             storage: LiveStorageConfig::default(),
             operator: crate::OperatorConfig::default(),
+            alerts: crate::AlertConfig::default(),
+            host_guard: crate::HostGuardConfig::default(),
             accounts: vec![LiveAccountConfig {
                 id: "main".to_string(),
                 api_key_env: "KEY".to_string(),

@@ -5,6 +5,7 @@ use std::time::Duration;
 use reap_order::PacingPolicy;
 use reap_risk::RiskLimits;
 use reap_strategy::{ChaosConfig, InstrumentConfig};
+use reap_telemetry::WebhookAlertConfig;
 use reap_venue::okx::{OkxAccountLevel, OkxCredentials, OkxPositionMode, OkxTradeMode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -24,6 +25,10 @@ pub struct LiveConfig {
     pub storage: LiveStorageConfig,
     #[serde(default)]
     pub operator: OperatorConfig,
+    #[serde(default)]
+    pub alerts: AlertConfig,
+    #[serde(default)]
+    pub host_guard: HostGuardConfig,
     pub accounts: Vec<LiveAccountConfig>,
 }
 
@@ -249,6 +254,93 @@ impl Default for LiveStorageConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AlertConfig {
+    pub enabled: bool,
+    pub endpoint_env: String,
+    pub bearer_token_env: Option<String>,
+    pub channel_capacity: usize,
+    pub failure_channel_capacity: usize,
+    pub connect_timeout_ms: u64,
+    pub request_timeout_ms: u64,
+    pub max_attempts: usize,
+    pub retry_backoff_ms: u64,
+    pub shutdown_timeout_ms: u64,
+    pub delivery_failure_is_fatal: bool,
+}
+
+impl Default for AlertConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint_env: "REAP_ALERT_WEBHOOK_URL".to_string(),
+            bearer_token_env: None,
+            channel_capacity: 256,
+            failure_channel_capacity: 64,
+            connect_timeout_ms: 1_000,
+            request_timeout_ms: 2_000,
+            max_attempts: 3,
+            retry_backoff_ms: 250,
+            shutdown_timeout_ms: 10_000,
+            delivery_failure_is_fatal: true,
+        }
+    }
+}
+
+impl AlertConfig {
+    pub fn webhook_from_env(&self) -> Result<Option<WebhookAlertConfig>, LiveConfigError> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let endpoint = std::env::var(&self.endpoint_env).map_err(|_| {
+            LiveConfigError::MissingAlertEndpoint {
+                name: self.endpoint_env.clone(),
+            }
+        })?;
+        let bearer_token = self
+            .bearer_token_env
+            .as_ref()
+            .map(|name| {
+                std::env::var(name)
+                    .map_err(|_| LiveConfigError::MissingAlertBearerToken { name: name.clone() })
+            })
+            .transpose()?;
+        Ok(Some(WebhookAlertConfig {
+            endpoint,
+            bearer_token,
+            channel_capacity: self.channel_capacity,
+            failure_channel_capacity: self.failure_channel_capacity,
+            request_timeout: Duration::from_millis(self.request_timeout_ms),
+            connect_timeout: Duration::from_millis(self.connect_timeout_ms),
+            max_attempts: self.max_attempts,
+            retry_backoff: Duration::from_millis(self.retry_backoff_ms),
+        }))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HostGuardConfig {
+    pub enabled: bool,
+    pub check_interval_ms: u64,
+    pub min_disk_available_bytes: u64,
+    pub min_memory_available_bytes: u64,
+    pub require_clock_synchronized: bool,
+}
+
+impl Default for HostGuardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            check_interval_ms: 10_000,
+            min_disk_available_bytes: 5 * 1024 * 1024 * 1024,
+            min_memory_available_bytes: 1024 * 1024 * 1024,
+            require_clock_synchronized: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveConfigValidation {
     pub valid: bool,
     pub errors: Vec<String>,
@@ -274,6 +366,10 @@ pub enum LiveConfigError {
     MissingOperatorToken { name: String },
     #[error("operator token environment variable {name} must contain at least 32 bytes")]
     OperatorTokenTooShort { name: String },
+    #[error("alert endpoint environment variable {name} is not set")]
+    MissingAlertEndpoint { name: String },
+    #[error("alert bearer token environment variable {name} is not set")]
+    MissingAlertBearerToken { name: String },
 }
 
 impl LiveConfig {
@@ -335,6 +431,8 @@ impl LiveConfig {
             errors.push("storage.flush_every_records must be positive".to_string());
         }
         validate_operator(&self.operator, &self.storage, &mut errors);
+        validate_alerts(&self.alerts, &mut errors);
+        validate_host_guard(&self.host_guard, &mut errors);
 
         let mut account_ids = HashSet::new();
         let mut node_ids = HashSet::new();
@@ -430,7 +528,12 @@ impl LiveConfig {
     }
 
     pub fn fingerprint(&self) -> Result<String, LiveConfigError> {
-        let canonical = serde_json::to_value(self)?;
+        let mut canonical = serde_json::to_value(self)?;
+        if let Some(config) = canonical.as_object_mut() {
+            // Deployment-only controls must not invalidate order/recovery identity.
+            config.remove("alerts");
+            config.remove("host_guard");
+        }
         let digest = Sha256::digest(serde_json::to_vec(&canonical)?);
         Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
     }
@@ -650,6 +753,89 @@ fn validate_operator(
     }
 }
 
+fn validate_alerts(alerts: &AlertConfig, errors: &mut Vec<String>) {
+    if !alerts.enabled {
+        return;
+    }
+    if alerts.endpoint_env.trim().is_empty() {
+        errors.push("alerts.endpoint_env must not be empty".to_string());
+    }
+    if alerts
+        .bearer_token_env
+        .as_ref()
+        .is_some_and(|name| name.trim().is_empty())
+    {
+        errors.push("alerts.bearer_token_env must not be empty when set".to_string());
+    }
+    for (name, value) in [
+        ("channel_capacity", alerts.channel_capacity as u64),
+        (
+            "failure_channel_capacity",
+            alerts.failure_channel_capacity as u64,
+        ),
+        ("connect_timeout_ms", alerts.connect_timeout_ms),
+        ("request_timeout_ms", alerts.request_timeout_ms),
+        ("max_attempts", alerts.max_attempts as u64),
+        ("retry_backoff_ms", alerts.retry_backoff_ms),
+        ("shutdown_timeout_ms", alerts.shutdown_timeout_ms),
+    ] {
+        if value == 0 {
+            errors.push(format!("alerts.{name} must be positive"));
+        }
+    }
+    if alerts.request_timeout_ms < alerts.connect_timeout_ms {
+        errors.push("alerts.request_timeout_ms must be at least connect_timeout_ms".to_string());
+    }
+    if alerts.max_attempts > 10 {
+        errors.push("alerts.max_attempts must not exceed 10".to_string());
+    }
+    if alerts.connect_timeout_ms > 30_000 || alerts.request_timeout_ms > 60_000 {
+        errors.push("alert connect/request timeouts exceed the 30s/60s limits".to_string());
+    }
+    if alerts.retry_backoff_ms > 60_000 || alerts.shutdown_timeout_ms > 300_000 {
+        errors.push("alert retry/shutdown timeouts exceed the 60s/300s limits".to_string());
+    }
+    let mut retry_budget_ms = 0_u64;
+    let mut backoff_ms = alerts.retry_backoff_ms;
+    for _ in 1..alerts.max_attempts {
+        retry_budget_ms = retry_budget_ms.saturating_add(backoff_ms);
+        backoff_ms = backoff_ms.saturating_mul(2);
+    }
+    let delivery_budget_ms = alerts
+        .request_timeout_ms
+        .saturating_mul(alerts.max_attempts as u64)
+        .saturating_add(retry_budget_ms);
+    if alerts.shutdown_timeout_ms < delivery_budget_ms {
+        errors.push(format!(
+            "alerts.shutdown_timeout_ms must cover one worst-case delivery ({delivery_budget_ms}ms)"
+        ));
+    }
+    if alerts.channel_capacity > 65_536 || alerts.failure_channel_capacity > 65_536 {
+        errors.push("alert channel capacities must not exceed 65536".to_string());
+    }
+}
+
+fn validate_host_guard(host_guard: &HostGuardConfig, errors: &mut Vec<String>) {
+    if !host_guard.enabled {
+        return;
+    }
+    for (name, value) in [
+        ("check_interval_ms", host_guard.check_interval_ms),
+        (
+            "min_disk_available_bytes",
+            host_guard.min_disk_available_bytes,
+        ),
+        (
+            "min_memory_available_bytes",
+            host_guard.min_memory_available_bytes,
+        ),
+    ] {
+        if value == 0 {
+            errors.push(format!("host_guard.{name} must be positive"));
+        }
+    }
+}
+
 fn validate_url(name: &str, value: &str, schemes: &[&str], errors: &mut Vec<String>) {
     match Url::parse(value) {
         Ok(url) if schemes.contains(&url.scheme()) => {}
@@ -684,6 +870,8 @@ mod tests {
             runtime: RuntimeConfig::default(),
             storage: LiveStorageConfig::default(),
             operator: OperatorConfig::default(),
+            alerts: AlertConfig::default(),
+            host_guard: HostGuardConfig::default(),
             accounts: vec![LiveAccountConfig {
                 id: "main".to_string(),
                 api_key_env: "OKX_API_KEY".to_string(),
@@ -780,10 +968,66 @@ mod tests {
     }
 
     #[test]
+    fn enabled_alerts_and_host_guard_require_bounded_settings() {
+        assert!(AlertConfig::default().webhook_from_env().unwrap().is_none());
+
+        let mut config = valid_config();
+        config.alerts.enabled = true;
+        config.alerts.endpoint_env.clear();
+        config.alerts.request_timeout_ms = 10;
+        config.alerts.connect_timeout_ms = 20;
+        config.alerts.max_attempts = 11;
+        config.host_guard.enabled = true;
+        config.host_guard.check_interval_ms = 0;
+        let report = config.validate();
+
+        assert!(!report.valid);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("alerts.endpoint_env must not be empty"))
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("at least connect_timeout_ms"))
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("max_attempts must not exceed 10"))
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("host_guard.check_interval_ms must be positive"))
+        );
+    }
+
+    #[test]
     fn config_fingerprint_is_stable_across_hash_map_instances() {
         assert_eq!(
             valid_config().fingerprint().unwrap(),
             valid_config().fingerprint().unwrap()
+        );
+    }
+
+    #[test]
+    fn deployment_guards_do_not_change_checkpoint_identity() {
+        let baseline = valid_config();
+        let mut guarded = baseline.clone();
+        guarded.alerts.enabled = true;
+        guarded.alerts.endpoint_env = "DIFFERENT_ALERT_ENDPOINT".to_string();
+        guarded.host_guard.enabled = true;
+        guarded.host_guard.min_disk_available_bytes = u64::MAX;
+
+        assert_eq!(
+            baseline.fingerprint().unwrap(),
+            guarded.fingerprint().unwrap()
         );
     }
 }

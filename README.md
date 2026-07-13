@@ -21,12 +21,16 @@ Implemented:
   account, and symbol halt events, and an event-loop enforcement layer.
 - Bounded structured telemetry and JSONL storage for raw, normalized, intent,
   request, acknowledgement, order, fill, system, bootstrap, reconciliation,
-  and write-ahead safety-latch records, including restart recovery.
+  and write-ahead safety-latch records, including restart recovery and an
+  exclusive canonical journal lease.
 - A fail-closed `reap-live` composition root with account-scoped REST bootstrap,
   exchange metadata/account-mode verification, redundant public sockets,
   isolated private sockets, one strategy owner, prioritized gateway tasks, and
   graceful cancel-and-drain shutdown. Demo entry also validates exchange time
   and maintains OKX Cancel All After from an independent safety task.
+- Bounded asynchronous HTTPS webhook alerts and optional Linux journal-disk,
+  available-memory, and kernel-clock guards, with preflight evidence and
+  fail-closed periodic enforcement outside the strategy loop.
 - Backtest matching with `PostOnly`, `IOC`, current-depth fills, trade fills,
   queue-ahead tracking, and simple mark-to-market accounting.
 - CSV/normalized replay, raw-capture validation, configuration validation, and
@@ -107,7 +111,8 @@ cargo run -p reap-cli -- operator --config examples/live-okx-demo.toml shutdown 
 
 Run a bounded observe soak and return a non-zero status unless the runtime
 reaches readiness, finishes the requested window, records no reconciliation
-drift or storage drops, and shuts down with no active orders:
+drift, storage drops, or alert delivery failures, and shuts down with no active
+orders:
 
 ```bash
 cargo run -p reap-cli -- live --config examples/live-okx-demo.toml --mode observe --duration-secs 3600 --require-clean-soak --pretty

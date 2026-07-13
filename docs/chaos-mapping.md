@@ -102,15 +102,17 @@ The following differences do not change the covered quote/hedge calculations:
 | `AbstractOkxNitroL2Subscriber` TBT and 400-level modes | Explicit `books-l2-tbt`, `books50-l2-tbt`, or `books` capture subscriptions | Equivalent, entitlement remains operational |
 | Ping, disconnect, resubscribe, and stale checkers | Feed connection loop, reconnect supervisor, idle timeout, and book-age recovery | Equivalent |
 | Clear/rebuild book on resubscribe or crossed-book failure | Invalid/crossed-book detection plus sequence state and fresh websocket snapshot recovery | Equivalent with additional explicit sequence validation |
-| Separate receive and exchange latency tracking | Raw `recv_ts_ns`, exchange timestamps, and capture health counters | Equivalent data retained; external alert delivery remains pending |
+| Separate receive and exchange latency tracking | Raw `recv_ts_ns`, exchange timestamps, capture health counters, and bounded live webhook alerts | Equivalent data retained; alert routing is a deployment concern |
 | Batch subscription manager and retry limits | Bounded socket partitioning, acknowledgement timeout, exponential reconnect | Equivalent lifecycle with different batching policy |
 
 The reviewed Java OKX subscriber and `chaos-iarb2` classes do not provide the
 Rust runtime's place-request `expTime`, `/public/time` skew gate, Cancel All
-After heartbeat, or fsynced restart-latch lifecycle. Those are intentional
+After heartbeat, fsynced restart-latch lifecycle, exclusive journal lease,
+webhook alert worker, or Linux host guard. Those are intentional
 deployment-safety additions around the parity strategy, not claims of Java
-strategy equivalence. Re-check them against both the pinned Java revision and
-the current OKX API contract whenever connectivity is upgraded.
+strategy equivalence. Re-check exchange-facing controls against both the pinned
+Java revision and the current OKX API contract whenever connectivity is
+upgraded.
 
 ## Live Event Requirements
 

@@ -104,15 +104,19 @@ architecture in [docs/architecture.md](docs/architecture.md).
   independently scheduled OKX Cancel All After heartbeat for demo order entry.
 - [x] Pin the Java strategy/connectivity audit to `imm-strategy` commit
   `b6b120c7b7c466d8431bf082f3229328c5d7b2ae`.
+- [x] Acquire an exclusive canonical journal lease before recovery,
+  credentials, or network setup; retain it for the full runtime lifecycle.
+- [x] Add bounded asynchronous webhook alerts and Linux disk, memory, and
+  kernel-clock preflight/periodic guards with fail-closed runtime integration.
 - [ ] Run credentialed bounded observe and minimal-size demo fault campaigns,
   including process death, deadman expiry, clock skew, REST ambiguity, partial
   fill, reconnect, and durable-latch restart recovery.
 - [ ] Calibrate queue position, latency, fees, funding, and slippage from
   captured full-depth data; complete walk-forward, sensitivity, capacity, and
   stressed-liquidity reports.
-- [ ] Deploy external alert delivery, host clock/disk/memory alarms, exclusive
-  process/journal locking, process supervision, and an independent
-  out-of-process exchange kill procedure.
+- [ ] Deploy and exercise the webhook/host guards on the target host; add
+  process supervision and an independent out-of-process exchange kill
+  procedure.
 - [ ] Certify production credentials/account mode/limits and expose production
   order entry only after every gate in `docs/trading-readiness.md` is signed off.
 
