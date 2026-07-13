@@ -402,6 +402,7 @@ impl LiveConfig {
         if let Some(error) = self.risk.validation_error() {
             errors.push(format!("risk: {error}"));
         }
+        validate_production_stablecoin_guards(self, &mut errors);
         validate_url(
             "venue.rest_url",
             &self.venue.rest_url,
@@ -577,6 +578,35 @@ impl LiveConfig {
             .find(|group| group.name == instrument.risk_group)?
             .account_id
             .as_deref()
+    }
+}
+
+fn validate_production_stablecoin_guards(config: &LiveConfig, errors: &mut Vec<String>) {
+    if config.venue.environment != TradingEnvironment::Production {
+        return;
+    }
+    for currency in ["USDT", "USDC"] {
+        let currency_is_used = config.strategy.instruments.iter().any(|instrument| {
+            instrument.base_currency == currency
+                || instrument.quote_currency == currency
+                || instrument.settle_currency == currency
+                || instrument
+                    .symbol
+                    .split('-')
+                    .any(|component| component == currency)
+        });
+        let required_symbol = format!("{currency}-USD");
+        if currency_is_used
+            && !config
+                .risk
+                .stablecoin_guards
+                .iter()
+                .any(|guard| guard.symbol == required_symbol)
+        {
+            errors.push(format!(
+                "production risk requires stablecoin guard {required_symbol} because the strategy uses {currency}"
+            ));
+        }
     }
 }
 
@@ -911,6 +941,17 @@ mod tests {
     fn production_environment_is_explicit_in_parsed_config() {
         let mut config = valid_config();
         config.venue.environment = TradingEnvironment::Production;
+        let missing_guard = config.validate();
+        assert!(!missing_guard.valid);
+        assert!(
+            missing_guard.errors.iter().any(|error| {
+                error.contains("production risk requires stablecoin guard USDT-USD")
+            })
+        );
+        config.risk.stablecoin_guards = vec![reap_risk::StablecoinGuardConfig {
+            symbol: "USDT-USD".to_string(),
+            max_downside_deviation: 0.01,
+        }];
         assert!(config.validate().valid);
         assert!(!config.venue.environment.is_demo());
     }

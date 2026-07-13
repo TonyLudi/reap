@@ -37,6 +37,18 @@ connections = 2
 priority = "high"
 
 [[subscriptions]]
+channel = "index-tickers"
+symbol = "USDT-USD"
+connections = 2
+priority = "critical"
+
+[[subscriptions]]
+channel = "index-tickers"
+symbol = "USDC-USD"
+connections = 2
+priority = "critical"
+
+[[subscriptions]]
 channel = "books"
 symbol = "BTC-USDT-SWAP"
 connections = 2

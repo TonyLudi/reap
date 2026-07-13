@@ -46,6 +46,7 @@ control plane.
 | Derivative position and margin capacity | Position and settle-currency account state | Exact |
 | OKX exchange CMR and calculated portfolio margin checks | Separate margin fields and debouncers | Exact |
 | Balance sheet, turnover, live size, PnL, margin, index, and basis checks | `check_risk_limits` and debounced conditions | Exact |
+| `StableCoinDepegCheckerImpl`, startup stablecoin check, and 5-second runtime debounce | `StablecoinGuardConfig`, `RiskGate`, and stablecoin-aware `StartupGate` | Equivalent with stricter immediate entry blocking and durable live latch |
 | Java startup basis limit of one third | Startup basis check | Exact |
 | Java runtime basis return value being diagnostic only | `basis_breaches` without runtime halt | Exact |
 | Account/position update driven hedging | `on_account_update` | Exact |
@@ -87,9 +88,9 @@ The following differences do not change the covered quote/hedge calculations:
   optimizer-specific amend/refill mechanics are not copied.
 - Rust live protocol support currently targets OKX. Binance-specific account,
   reduce-only, fee-asset, and position freshness behavior is not claimed.
-- Stablecoin depeg checks, exchange rate-breach pauses, master-strategy
-  liveness, strategy-group PnL aggregation, Redis controls, alerts, and process
-  restart policy belong to runtime risk and operations.
+- Broader exchange rate-breach pauses, master-strategy liveness,
+  strategy-group PnL aggregation, Redis controls, alerts, and process restart
+  policy belong to runtime risk and operations.
 - Qubyte history readers are not copied. Backtests consume normalized JSONL or
   the documented CSV format, and now consume public OKX raw captures through
   the Rust adapter/reducer path.
@@ -144,12 +145,41 @@ configured account and instrument, live composition must provide:
 
 - Sequenced books and trades.
 - Funding rate, index ticker, mark price, and price-limit updates where used.
+- Redundant stablecoin/USD index tickers for every configured live risk guard.
 - Account balances, margin snapshots, positions, orders, and fills.
 - Account-scoped private stream heartbeat, stale, and recovery events.
 - Timer and system events through the same single-writer strategy loop.
 
 Private order reasons must be registered before REST submission so websocket
 acknowledgements preserve `quote` versus `hedge` identity.
+
+## Stablecoin Guard Cross-Check
+
+At the pinned Java revision, `StableCoinDepegCheckerImpl` checks
+`.USDT-USD.OK` and `.USDC-USD.OK` with a one-second cache. A missing value or
+absolute deviation first forces a fresh fetch; the final rejection is missing
+data or a downside move beyond the configured threshold. `ChaosParamService`
+defaults both thresholds to 1%. `ChaosStrategyBase` requires a passing check at
+startup, while `CalculatorBase` skips the check in backtests and stops live
+validity after a continuously failing 5-second debounce.
+
+Rust keeps the strategy/backtest boundary free of live stablecoin policy by
+default. Live `RiskLimits` can configure one or more references; the demo
+configuration requires `USDT-USD` and `USDC-USD` at the Java 1% thresholds.
+Each reference is subscribed on redundant critical `index-tickers` routes.
+Byte-identical replica frames deduplicate, while different payloads at the same
+exchange timestamp reach `RiskGate` and mark that reference conflicting until a
+newer update arrives. Missing, stale, invalid, conflicting, or downside-depegged
+data blocks new orders immediately. A continuously unhealthy reference for
+5 seconds emits `RiskBreach`, activates the durable global safety latch, and
+cancels canonical live orders; cancels remain allowed throughout.
+
+The websocket freshness default is 75 seconds because OKX documents changed
+index values at up to 100 ms and unchanged values once per minute. Redundant
+route connectivity is a separate immediate readiness condition. Production
+validation requires a corresponding `USDT-USD` or `USDC-USD` guard when those
+currencies appear in instrument metadata or symbols. See the current
+[OKX index-tickers contract](https://www.okx.com/docs-v5/en/#public-data-websocket-index-tickers-channel).
 
 ## Evidence
 

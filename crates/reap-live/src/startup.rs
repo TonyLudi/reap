@@ -26,6 +26,8 @@ pub struct ReadinessSnapshot {
     pub missing_account_snapshots: Vec<String>,
     pub missing_books: Vec<String>,
     pub missing_private_streams: Vec<String>,
+    #[serde(default)]
+    pub missing_stablecoin_rates: Vec<String>,
     pub faults: BTreeMap<String, String>,
 }
 
@@ -41,6 +43,8 @@ pub enum StartupError {
     UnknownAccount(String),
     #[error("unknown required symbol {0}")]
     UnknownSymbol(String),
+    #[error("unknown required stablecoin reference {0}")]
+    UnknownStablecoinReference(String),
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +52,7 @@ pub struct StartupGate {
     phase: LivePhase,
     required_symbols: HashSet<String>,
     required_accounts: HashSet<String>,
+    required_stablecoin_rates: HashSet<String>,
     metadata_verified: bool,
     storage_ready: bool,
     public_connectivity_ready: bool,
@@ -55,6 +60,7 @@ pub struct StartupGate {
     account_snapshots: HashSet<String>,
     ready_books: HashSet<String>,
     ready_private_streams: HashSet<String>,
+    ready_stablecoin_rates: HashSet<String>,
     faults: BTreeMap<String, String>,
     was_ready: bool,
 }
@@ -65,6 +71,12 @@ impl StartupGate {
             phase: LivePhase::Configured,
             required_symbols: config.required_symbols(),
             required_accounts: config.required_accounts(),
+            required_stablecoin_rates: config
+                .risk
+                .stablecoin_guards
+                .iter()
+                .map(|guard| guard.symbol.clone())
+                .collect(),
             metadata_verified: false,
             storage_ready: false,
             public_connectivity_ready: false,
@@ -72,6 +84,7 @@ impl StartupGate {
             account_snapshots: HashSet::new(),
             ready_books: HashSet::new(),
             ready_private_streams: HashSet::new(),
+            ready_stablecoin_rates: HashSet::new(),
             faults: BTreeMap::new(),
             was_ready: false,
         }
@@ -189,6 +202,26 @@ impl StartupGate {
         Ok(())
     }
 
+    pub fn mark_stablecoin_rate(
+        &mut self,
+        symbol: &str,
+        healthy: bool,
+        reason: impl Into<String>,
+    ) -> Result<(), StartupError> {
+        self.require_stablecoin_reference(symbol)?;
+        set_membership(&mut self.ready_stablecoin_rates, symbol, healthy);
+        let key = format!("stablecoin:{symbol}");
+        if healthy {
+            self.faults.remove(&key);
+        } else if self.was_ready {
+            self.faults.insert(key, reason.into());
+        } else {
+            self.faults.remove(&key);
+        }
+        self.refresh();
+        Ok(())
+    }
+
     pub fn mark_runtime_health(
         &mut self,
         component: &str,
@@ -218,6 +251,10 @@ impl StartupGate {
             missing_account_snapshots: missing(&self.required_accounts, &self.account_snapshots),
             missing_books: missing(&self.required_symbols, &self.ready_books),
             missing_private_streams: missing(&self.required_accounts, &self.ready_private_streams),
+            missing_stablecoin_rates: missing(
+                &self.required_stablecoin_rates,
+                &self.ready_stablecoin_rates,
+            ),
             faults: self.faults.clone(),
         }
     }
@@ -247,6 +284,10 @@ impl StartupGate {
         }
         let streams_ready = is_complete(&self.required_symbols, &self.ready_books)
             && is_complete(&self.required_accounts, &self.ready_private_streams)
+            && is_complete(
+                &self.required_stablecoin_rates,
+                &self.ready_stablecoin_rates,
+            )
             && self.public_connectivity_ready;
         if streams_ready {
             self.phase = LivePhase::Ready;
@@ -273,6 +314,14 @@ impl StartupGate {
             Ok(())
         } else {
             Err(StartupError::UnknownSymbol(symbol.to_string()))
+        }
+    }
+
+    fn require_stablecoin_reference(&self, symbol: &str) -> Result<(), StartupError> {
+        if self.required_stablecoin_rates.contains(symbol) {
+            Ok(())
+        } else {
+            Err(StartupError::UnknownStablecoinReference(symbol.to_string()))
         }
     }
 }
@@ -312,7 +361,7 @@ fn missing(required: &HashSet<String>, ready: &HashSet<String>) -> Vec<String> {
 mod tests {
     use std::collections::HashMap;
 
-    use reap_risk::RiskLimits;
+    use reap_risk::{RiskLimits, StablecoinGuardConfig};
     use reap_strategy::ChaosConfig;
     use reap_venue::okx::{OkxAccountLevel, OkxPositionMode};
 
@@ -396,5 +445,54 @@ mod tests {
         assert_eq!(gate.phase(), LivePhase::Degraded);
         gate.mark_public_connectivity(true, "redundant channel recovered");
         assert_eq!(gate.phase(), LivePhase::Ready);
+    }
+
+    #[test]
+    fn readiness_requires_and_monitors_stablecoin_references() {
+        let mut config = config();
+        config.risk.stablecoin_guards = vec![StablecoinGuardConfig {
+            symbol: "USDT-USD".to_string(),
+            max_downside_deviation: 0.01,
+        }];
+        let mut gate = StartupGate::new(&config);
+        gate.mark_metadata_verified();
+        gate.mark_storage(true, "open");
+        gate.mark_public_connectivity(true, "connected");
+        gate.mark_reconciled("main", true, "clean").unwrap();
+        gate.mark_account_snapshot("main", true, "loaded").unwrap();
+        gate.mark_book("BTC-USDT", true, "snapshot").unwrap();
+        gate.mark_book("BTC-PERP", true, "snapshot").unwrap();
+        gate.mark_private_stream("main", true, "heartbeat").unwrap();
+
+        assert_eq!(gate.phase(), LivePhase::AwaitingStreams);
+        assert_eq!(
+            gate.snapshot().missing_stablecoin_rates,
+            vec!["USDT-USD".to_string()]
+        );
+        gate.mark_stablecoin_rate("USDT-USD", true, "fresh")
+            .unwrap();
+        assert_eq!(gate.phase(), LivePhase::Ready);
+
+        gate.mark_stablecoin_rate("USDT-USD", false, "depegged")
+            .unwrap();
+        let degraded = gate.snapshot();
+        assert_eq!(degraded.phase, LivePhase::Degraded);
+        assert_eq!(
+            degraded.missing_stablecoin_rates,
+            vec!["USDT-USD".to_string()]
+        );
+        assert_eq!(
+            degraded.faults.get("stablecoin:USDT-USD"),
+            Some(&"depegged".to_string())
+        );
+        gate.mark_stablecoin_rate("USDT-USD", true, "recovered")
+            .unwrap();
+        assert_eq!(gate.phase(), LivePhase::Ready);
+        assert_eq!(
+            gate.mark_stablecoin_rate("USDC-USD", true, "unknown"),
+            Err(StartupError::UnknownStablecoinReference(
+                "USDC-USD".to_string()
+            ))
+        );
     }
 }

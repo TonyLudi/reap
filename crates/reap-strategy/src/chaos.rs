@@ -1030,6 +1030,7 @@ pub struct ChaosStrategy {
     entities: HashMap<Symbol, InstrumentState>,
     risk_groups: HashMap<String, RiskGroupState>,
     symbol_to_group: HashMap<Symbol, String>,
+    index_symbols: HashSet<Symbol>,
     index_prices: HashMap<Symbol, Price>,
     index_debouncers: HashMap<String, DebouncedCondition>,
     basis_debouncers: HashMap<String, DebouncedCondition>,
@@ -1082,6 +1083,11 @@ impl ChaosStrategy {
 
         let mut entities = HashMap::new();
         let mut symbol_to_group = HashMap::new();
+        let index_symbols = config
+            .instruments
+            .iter()
+            .filter_map(|instrument| instrument.index_symbol.clone())
+            .collect();
         for inst in &config.instruments {
             let mut state = InstrumentState::new(inst.clone());
             state.ignore_best_level = config.ignore_best_level;
@@ -1164,6 +1170,7 @@ impl ChaosStrategy {
             entities,
             risk_groups,
             symbol_to_group,
+            index_symbols,
             index_prices: HashMap::new(),
             index_debouncers,
             basis_debouncers,
@@ -2596,6 +2603,9 @@ impl ChaosStrategy {
                 price,
             } => {
                 self.now_ms = *ts_ms;
+                if !self.index_symbols.contains(symbol) {
+                    return Vec::new();
+                }
                 if price.is_finite() && *price > 0.0 {
                     self.index_prices.insert(symbol.clone(), *price);
                 }
@@ -5453,6 +5463,20 @@ mod tests {
                 .iter()
                 .all(|intent| !matches!(intent, OrderIntent::NewOrder(_)))
         );
+    }
+
+    #[test]
+    fn unrelated_index_prices_do_not_enter_strategy_pricing_state() {
+        let mut strategy = ChaosStrategy::new(config()).unwrap();
+        let intents = strategy.on_market_event(&MarketEvent::IndexPrice {
+            ts_ms: 10,
+            symbol: "USDT-USD".to_string(),
+            price: 1.0,
+        });
+
+        assert!(intents.is_empty());
+        assert!(!strategy.index_prices.contains_key("USDT-USD"));
+        assert_eq!(strategy.now_ms, 10);
     }
 
     #[test]

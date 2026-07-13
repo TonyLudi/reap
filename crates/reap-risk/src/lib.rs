@@ -6,6 +6,22 @@ use reap_core::{
 };
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StablecoinGuardConfig {
+    pub symbol: Symbol,
+    pub max_downside_deviation: f64,
+}
+
+impl Default for StablecoinGuardConfig {
+    fn default() -> Self {
+        Self {
+            symbol: String::new(),
+            max_downside_deviation: 0.01,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RiskLimits {
@@ -18,6 +34,9 @@ pub struct RiskLimits {
     pub max_private_age_ms: TimeMs,
     pub require_feed_health: bool,
     pub require_private_health: bool,
+    pub stablecoin_guards: Vec<StablecoinGuardConfig>,
+    pub stablecoin_max_age_ms: TimeMs,
+    pub stablecoin_breach_debounce_ms: TimeMs,
 }
 
 impl Default for RiskLimits {
@@ -32,6 +51,9 @@ impl Default for RiskLimits {
             max_private_age_ms: 2_000,
             require_feed_health: true,
             require_private_health: true,
+            stablecoin_guards: Vec::new(),
+            stablecoin_max_age_ms: 75_000,
+            stablecoin_breach_debounce_ms: 5_000,
         }
     }
 }
@@ -60,6 +82,33 @@ impl RiskLimits {
         }
         if self.max_private_age_ms == 0 {
             return Some("max_private_age_ms must be positive".to_string());
+        }
+        if self.stablecoin_max_age_ms == 0 {
+            return Some("stablecoin_max_age_ms must be positive".to_string());
+        }
+        if self.stablecoin_breach_debounce_ms == 0 {
+            return Some("stablecoin_breach_debounce_ms must be positive".to_string());
+        }
+        let mut symbols = HashSet::new();
+        for guard in &self.stablecoin_guards {
+            if guard.symbol.trim().is_empty() {
+                return Some("stablecoin guard symbol must not be empty".to_string());
+            }
+            if !symbols.insert(guard.symbol.as_str()) {
+                return Some(format!(
+                    "duplicate stablecoin guard symbol {}",
+                    guard.symbol
+                ));
+            }
+            if !guard.max_downside_deviation.is_finite()
+                || guard.max_downside_deviation <= 0.0
+                || guard.max_downside_deviation >= 1.0
+            {
+                return Some(format!(
+                    "stablecoin guard {} max_downside_deviation must be finite and between 0 and 1",
+                    guard.symbol
+                ));
+            }
         }
         None
     }
@@ -103,12 +152,47 @@ pub enum RiskRejectReason {
     FeedStale,
     PrivateStreamNotReady,
     PrivateStreamStale,
+    StablecoinReferenceNotReady {
+        symbol: Symbol,
+    },
+    StablecoinReferenceStale {
+        symbol: Symbol,
+        age_ms: TimeMs,
+        limit_ms: TimeMs,
+    },
+    StablecoinReferenceConflict {
+        symbol: Symbol,
+        ts_ms: TimeMs,
+    },
+    StablecoinReferenceInvalid {
+        symbol: Symbol,
+    },
+    StablecoinDepeg {
+        symbol: Symbol,
+        price: f64,
+        minimum_price: f64,
+    },
     InvalidOrder,
-    OrderNotional { value: f64, limit: f64 },
-    PositionNotional { value: f64, limit: f64 },
-    LiveOrderNotional { value: f64, limit: f64 },
-    Turnover { value: f64, limit: f64 },
-    Drawdown { value: f64, limit: f64 },
+    OrderNotional {
+        value: f64,
+        limit: f64,
+    },
+    PositionNotional {
+        value: f64,
+        limit: f64,
+    },
+    LiveOrderNotional {
+        value: f64,
+        limit: f64,
+    },
+    Turnover {
+        value: f64,
+        limit: f64,
+    },
+    Drawdown {
+        value: f64,
+        limit: f64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +219,13 @@ pub struct PostTradeOutcome {
     pub events: Vec<SystemEvent>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StablecoinGuardHealth {
+    pub symbol: Symbol,
+    pub healthy: bool,
+    pub reason: String,
+}
+
 #[derive(Debug)]
 pub struct RiskGate {
     limits: RiskLimits,
@@ -151,6 +242,8 @@ pub struct RiskGate {
     equity_by_account: HashMap<Option<String>, f64>,
     peak_equity_usd: f64,
     seen_fills: HashSet<FillKey>,
+    stablecoin_rates: HashMap<Symbol, StablecoinRateState>,
+    stablecoin_breach_since_ms: HashMap<Symbol, TimeMs>,
 }
 
 impl RiskGate {
@@ -173,6 +266,8 @@ impl RiskGate {
             equity_by_account: HashMap::new(),
             peak_equity_usd: 0.0,
             seen_fills: HashSet::new(),
+            stablecoin_rates: HashMap::new(),
+            stablecoin_breach_since_ms: HashMap::new(),
         }
     }
 
@@ -194,6 +289,25 @@ impl RiskGate {
 
     pub fn turnover_usd(&self) -> f64 {
         self.turnover_usd
+    }
+
+    pub fn stablecoin_guard_health(&self, now_ms: TimeMs) -> Vec<StablecoinGuardHealth> {
+        self.limits
+            .stablecoin_guards
+            .iter()
+            .map(|guard| match self.stablecoin_reject_reason(guard, now_ms) {
+                Some(reason) => StablecoinGuardHealth {
+                    symbol: guard.symbol.clone(),
+                    healthy: false,
+                    reason: stablecoin_reason(&reason),
+                },
+                None => StablecoinGuardHealth {
+                    symbol: guard.symbol.clone(),
+                    healthy: true,
+                    reason: "stablecoin reference is fresh and within limit".to_string(),
+                },
+            })
+            .collect()
     }
 
     pub fn position(&self, symbol: &str) -> f64 {
@@ -235,6 +349,47 @@ impl RiskGate {
             && let Some(mid) = book.mid()
         {
             self.marks.insert(book.symbol.clone(), mid);
+        }
+        let MarketEvent::IndexPrice {
+            ts_ms,
+            symbol,
+            price,
+        } = event
+        else {
+            return;
+        };
+        if !self
+            .limits
+            .stablecoin_guards
+            .iter()
+            .any(|guard| guard.symbol == *symbol)
+        {
+            return;
+        }
+        if let Some(state) = self.stablecoin_rates.get_mut(symbol) {
+            if *ts_ms < state.ts_ms {
+                return;
+            }
+            if *ts_ms == state.ts_ms {
+                if price.to_bits() != state.price.to_bits() {
+                    state.conflict = true;
+                }
+                return;
+            }
+            *state = StablecoinRateState {
+                ts_ms: *ts_ms,
+                price: *price,
+                conflict: false,
+            };
+        } else {
+            self.stablecoin_rates.insert(
+                symbol.clone(),
+                StablecoinRateState {
+                    ts_ms: *ts_ms,
+                    price: *price,
+                    conflict: false,
+                },
+            );
         }
     }
 
@@ -514,7 +669,8 @@ impl RiskGate {
     }
 
     pub fn on_normalized_event(&mut self, event: &NormalizedEvent) -> PostTradeOutcome {
-        match event {
+        let evaluate_stablecoins = self.event_updates_stablecoin_state(event);
+        let mut outcome = match event {
             NormalizedEvent::Market(market) => {
                 self.on_market(market);
                 PostTradeOutcome::default()
@@ -526,6 +682,31 @@ impl RiskGate {
             }
             NormalizedEvent::Account(update) => self.on_account_update(update),
             NormalizedEvent::Timer(_) | NormalizedEvent::Control(_) => PostTradeOutcome::default(),
+        };
+        if evaluate_stablecoins {
+            outcome
+                .events
+                .extend(self.evaluate_stablecoin_guards(event.ts_ms()).events);
+        }
+        outcome
+    }
+
+    fn event_updates_stablecoin_state(&self, event: &NormalizedEvent) -> bool {
+        match event {
+            NormalizedEvent::Timer(_) => !self.limits.stablecoin_guards.is_empty(),
+            NormalizedEvent::Market(MarketEvent::IndexPrice { symbol, .. }) => self
+                .limits
+                .stablecoin_guards
+                .iter()
+                .any(|guard| guard.symbol == *symbol),
+            NormalizedEvent::System(system) => {
+                system.kind == SystemEventKind::KillSwitchReset
+                    && !self.limits.stablecoin_guards.is_empty()
+            }
+            NormalizedEvent::Order(_)
+            | NormalizedEvent::Account(_)
+            | NormalizedEvent::Control(_)
+            | NormalizedEvent::Market(_) => false,
         }
     }
 
@@ -546,6 +727,14 @@ impl RiskGate {
             || order.price <= 0.0
         {
             return Some(RiskRejectReason::InvalidOrder);
+        }
+        if let Some(reason) = self
+            .limits
+            .stablecoin_guards
+            .iter()
+            .find_map(|guard| self.stablecoin_reject_reason(guard, now_ms))
+        {
+            return Some(reason);
         }
         if self.limits.require_feed_health {
             let mut matching_feed = false;
@@ -634,6 +823,75 @@ impl RiskGate {
         None
     }
 
+    fn stablecoin_reject_reason(
+        &self,
+        guard: &StablecoinGuardConfig,
+        now_ms: TimeMs,
+    ) -> Option<RiskRejectReason> {
+        let Some(state) = self.stablecoin_rates.get(&guard.symbol) else {
+            return Some(RiskRejectReason::StablecoinReferenceNotReady {
+                symbol: guard.symbol.clone(),
+            });
+        };
+        if state.conflict {
+            return Some(RiskRejectReason::StablecoinReferenceConflict {
+                symbol: guard.symbol.clone(),
+                ts_ms: state.ts_ms,
+            });
+        }
+        if !state.price.is_finite() || state.price <= 0.0 {
+            return Some(RiskRejectReason::StablecoinReferenceInvalid {
+                symbol: guard.symbol.clone(),
+            });
+        }
+        let age_ms = now_ms.saturating_sub(state.ts_ms);
+        if age_ms > self.limits.stablecoin_max_age_ms {
+            return Some(RiskRejectReason::StablecoinReferenceStale {
+                symbol: guard.symbol.clone(),
+                age_ms,
+                limit_ms: self.limits.stablecoin_max_age_ms,
+            });
+        }
+        let minimum_price = 1.0 - guard.max_downside_deviation;
+        if state.price < minimum_price {
+            return Some(RiskRejectReason::StablecoinDepeg {
+                symbol: guard.symbol.clone(),
+                price: state.price,
+                minimum_price,
+            });
+        }
+        None
+    }
+
+    fn evaluate_stablecoin_guards(&mut self, now_ms: TimeMs) -> PostTradeOutcome {
+        let mut breach = None;
+        for index in 0..self.limits.stablecoin_guards.len() {
+            let issue = {
+                let guard = &self.limits.stablecoin_guards[index];
+                self.stablecoin_reject_reason(guard, now_ms)
+            };
+            let symbol = &self.limits.stablecoin_guards[index].symbol;
+            let Some(issue) = issue else {
+                self.stablecoin_breach_since_ms.remove(symbol);
+                continue;
+            };
+            let since_ms = *self
+                .stablecoin_breach_since_ms
+                .entry(symbol.clone())
+                .or_insert(now_ms);
+            if self.kill_switch.is_none()
+                && breach.is_none()
+                && now_ms.saturating_sub(since_ms) >= self.limits.stablecoin_breach_debounce_ms
+            {
+                breach = Some((symbol.clone(), stablecoin_reason(&issue)));
+            }
+        }
+        let Some((symbol, reason)) = breach else {
+            return PostTradeOutcome::default();
+        };
+        self.activate_risk_breach(now_ms, Some(symbol), reason)
+    }
+
     fn evaluate_post_trade(&mut self, ts_ms: TimeMs, symbol: Option<&str>) -> PostTradeOutcome {
         if self.kill_switch.is_some() {
             return PostTradeOutcome::default();
@@ -683,6 +941,15 @@ impl RiskGate {
         let Some(reason) = breach else {
             return PostTradeOutcome::default();
         };
+        self.activate_risk_breach(ts_ms, symbol.map(str::to_string), reason)
+    }
+
+    fn activate_risk_breach(
+        &mut self,
+        ts_ms: TimeMs,
+        symbol: Option<Symbol>,
+        reason: String,
+    ) -> PostTradeOutcome {
         self.kill_switch = Some(reason.clone());
         PostTradeOutcome {
             events: vec![
@@ -691,7 +958,7 @@ impl RiskGate {
                     kind: SystemEventKind::RiskBreach,
                     venue: None,
                     account_id: None,
-                    symbol: symbol.map(str::to_string),
+                    symbol: symbol.clone(),
                     reason: reason.clone(),
                 },
                 SystemEvent {
@@ -699,7 +966,7 @@ impl RiskGate {
                     kind: SystemEventKind::KillSwitchActivated,
                     venue: None,
                     account_id: None,
-                    symbol: symbol.map(str::to_string),
+                    symbol,
                     reason,
                 },
             ],
@@ -711,6 +978,13 @@ impl RiskGate {
 struct StreamHealth {
     last_ready_ms: TimeMs,
     stale: bool,
+}
+
+#[derive(Debug, Clone)]
+struct StablecoinRateState {
+    ts_ms: TimeMs,
+    price: f64,
+    conflict: bool,
 }
 
 #[derive(Debug)]
@@ -736,9 +1010,36 @@ fn risk_price(order_price: f64, fill_price: f64) -> f64 {
     }
 }
 
+fn stablecoin_reason(reason: &RiskRejectReason) -> String {
+    match reason {
+        RiskRejectReason::StablecoinReferenceNotReady { symbol } => {
+            format!("stablecoin reference {symbol} is not ready")
+        }
+        RiskRejectReason::StablecoinReferenceStale {
+            symbol,
+            age_ms,
+            limit_ms,
+        } => format!("stablecoin reference {symbol} age {age_ms}ms exceeds {limit_ms}ms"),
+        RiskRejectReason::StablecoinReferenceConflict { symbol, ts_ms } => {
+            format!("stablecoin reference {symbol} has conflicting values at timestamp {ts_ms}")
+        }
+        RiskRejectReason::StablecoinReferenceInvalid { symbol } => {
+            format!("stablecoin reference {symbol} is invalid")
+        }
+        RiskRejectReason::StablecoinDepeg {
+            symbol,
+            price,
+            minimum_price,
+        } => {
+            format!("stablecoin reference {symbol} price {price} is below minimum {minimum_price}")
+        }
+        _ => "stablecoin reference is unhealthy".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use reap_core::{FillLiquidity, NewOrder, OrderEvent, Side, TimeInForce};
+    use reap_core::{FillLiquidity, NewOrder, OrderEvent, Side, TimeInForce, TimerEvent};
 
     use super::*;
 
@@ -760,6 +1061,28 @@ mod tests {
         gate.mark_feed_ready(Venue::Okx, "BTC-USDT", 100);
         gate.mark_private_ready(Venue::Okx, 100);
         gate
+    }
+
+    fn stablecoin_limits() -> RiskLimits {
+        RiskLimits {
+            require_feed_health: false,
+            require_private_health: false,
+            stablecoin_guards: vec![StablecoinGuardConfig {
+                symbol: "USDT-USD".to_string(),
+                max_downside_deviation: 0.01,
+            }],
+            stablecoin_max_age_ms: 10_000,
+            stablecoin_breach_debounce_ms: 5_000,
+            ..RiskLimits::default()
+        }
+    }
+
+    fn stablecoin_index(ts_ms: TimeMs, price: f64) -> MarketEvent {
+        MarketEvent::IndexPrice {
+            ts_ms,
+            symbol: "USDT-USD".to_string(),
+            price,
+        }
     }
 
     #[test]
@@ -797,6 +1120,197 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn stablecoin_guard_configuration_is_validated() {
+        let duplicate = RiskLimits {
+            stablecoin_guards: vec![
+                StablecoinGuardConfig {
+                    symbol: "USDT-USD".to_string(),
+                    max_downside_deviation: 0.01,
+                },
+                StablecoinGuardConfig {
+                    symbol: "USDT-USD".to_string(),
+                    max_downside_deviation: 0.02,
+                },
+            ],
+            ..RiskLimits::default()
+        };
+        assert!(
+            duplicate
+                .validation_error()
+                .is_some_and(|error| error.contains("duplicate stablecoin guard"))
+        );
+
+        let invalid_threshold = RiskLimits {
+            stablecoin_guards: vec![StablecoinGuardConfig {
+                symbol: "USDC-USD".to_string(),
+                max_downside_deviation: 1.0,
+            }],
+            ..RiskLimits::default()
+        };
+        assert!(invalid_threshold.validation_error().is_some());
+    }
+
+    #[test]
+    fn stablecoin_guard_blocks_until_a_fresh_safe_reference_arrives() {
+        let mut gate = RiskGate::new(stablecoin_limits());
+        assert!(matches!(
+            gate.pre_trade(100, order()),
+            RiskDecision::Rejected {
+                reason: RiskRejectReason::StablecoinReferenceNotReady { .. },
+                ..
+            }
+        ));
+
+        gate.on_market(&stablecoin_index(100, 1.0));
+        assert!(matches!(
+            gate.pre_trade(100, order()),
+            RiskDecision::Allowed(_)
+        ));
+        gate.on_market(&stablecoin_index(101, 1.02));
+        assert!(matches!(
+            gate.pre_trade(101, order()),
+            RiskDecision::Allowed(_)
+        ));
+        assert_eq!(
+            gate.stablecoin_guard_health(101),
+            vec![StablecoinGuardHealth {
+                symbol: "USDT-USD".to_string(),
+                healthy: true,
+                reason: "stablecoin reference is fresh and within limit".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn stale_or_downside_depegged_stablecoin_blocks_new_orders() {
+        let mut limits = stablecoin_limits();
+        limits.stablecoin_max_age_ms = 1_000;
+        let mut gate = RiskGate::new(limits);
+        gate.on_market(&stablecoin_index(100, 1.0));
+        assert!(matches!(
+            gate.pre_trade(1_101, order()),
+            RiskDecision::Rejected {
+                reason: RiskRejectReason::StablecoinReferenceStale { .. },
+                ..
+            }
+        ));
+
+        gate.on_market(&stablecoin_index(1_101, 0.98));
+        assert!(matches!(
+            gate.pre_trade(1_101, order()),
+            RiskDecision::Rejected {
+                reason: RiskRejectReason::StablecoinDepeg { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn stablecoin_replicas_fail_closed_on_same_timestamp_conflicts() {
+        let mut gate = RiskGate::new(stablecoin_limits());
+        gate.on_market(&stablecoin_index(100, 1.0));
+        gate.on_market(&stablecoin_index(99, 0.98));
+        assert!(matches!(
+            gate.pre_trade(100, order()),
+            RiskDecision::Allowed(_)
+        ));
+
+        gate.on_market(&stablecoin_index(100, 0.999));
+        assert!(matches!(
+            gate.pre_trade(100, order()),
+            RiskDecision::Rejected {
+                reason: RiskRejectReason::StablecoinReferenceConflict { ts_ms: 100, .. },
+                ..
+            }
+        ));
+        gate.on_market(&stablecoin_index(101, 1.0));
+        assert!(matches!(
+            gate.pre_trade(101, order()),
+            RiskDecision::Allowed(_)
+        ));
+    }
+
+    #[test]
+    fn transient_stablecoin_breach_recovers_before_durable_latch() {
+        let mut gate = RiskGate::new(stablecoin_limits());
+        assert!(
+            gate.on_normalized_event(&NormalizedEvent::Market(stablecoin_index(10, 0.98)))
+                .events
+                .is_empty()
+        );
+        assert!(
+            gate.on_normalized_event(&NormalizedEvent::Market(stablecoin_index(4_000, 1.0)))
+                .events
+                .is_empty()
+        );
+        assert!(
+            gate.on_normalized_event(&NormalizedEvent::Market(stablecoin_index(8_000, 0.98)))
+                .events
+                .is_empty()
+        );
+        assert!(
+            gate.on_normalized_event(&NormalizedEvent::Timer(TimerEvent {
+                ts_ms: 10_000,
+                name: "risk".to_string(),
+            }))
+            .events
+            .is_empty()
+        );
+        assert!(!gate.is_killed());
+    }
+
+    #[test]
+    fn sustained_stablecoin_breach_emits_one_durable_breach_pair() {
+        let mut gate = RiskGate::new(stablecoin_limits());
+        assert!(
+            gate.on_normalized_event(&NormalizedEvent::Market(stablecoin_index(10, 0.98)))
+                .events
+                .is_empty()
+        );
+        assert!(
+            gate.on_normalized_event(&NormalizedEvent::Market(stablecoin_index(4_000, 0.98)))
+                .events
+                .is_empty()
+        );
+        let outcome =
+            gate.on_normalized_event(&NormalizedEvent::Market(stablecoin_index(5_010, 0.98)));
+        assert!(gate.is_killed());
+        assert_eq!(outcome.events.len(), 2);
+        assert_eq!(outcome.events[0].kind, SystemEventKind::RiskBreach);
+        assert_eq!(outcome.events[0].symbol.as_deref(), Some("USDT-USD"));
+        assert_eq!(outcome.events[1].kind, SystemEventKind::KillSwitchActivated);
+        assert!(
+            gate.on_normalized_event(&NormalizedEvent::Timer(TimerEvent {
+                ts_ms: 6_000,
+                name: "risk".to_string(),
+            }))
+            .events
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn missing_stablecoin_reference_latches_after_debounce() {
+        let mut gate = RiskGate::new(stablecoin_limits());
+        assert!(
+            gate.on_normalized_event(&NormalizedEvent::Timer(TimerEvent {
+                ts_ms: 100,
+                name: "risk".to_string(),
+            }))
+            .events
+            .is_empty()
+        );
+        let outcome = gate.on_normalized_event(&NormalizedEvent::Timer(TimerEvent {
+            ts_ms: 5_100,
+            name: "risk".to_string(),
+        }));
+
+        assert!(gate.is_killed());
+        assert_eq!(outcome.events.len(), 2);
+        assert!(outcome.events[0].reason.contains("is not ready"));
     }
 
     #[test]

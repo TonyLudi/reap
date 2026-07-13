@@ -229,6 +229,8 @@ Responsibilities:
 - Static config sanity checks.
 - Notional, delta, live-order, turnover, and drawdown limits.
 - Global kill switch and symbol isolation controls.
+- Freshness, integrity, and downside-depeg guards for configured stablecoin/USD
+  references.
 - Per-risk-group quote permission.
 - Reject or clip unsafe order intents before they hit the gateway.
 - Post-fill exposure checks.
@@ -319,8 +321,9 @@ closed.
 Startup moves through configured, reconciling, awaiting-streams, ready, and
 degraded phases. Ready requires verified account-scoped instrument metadata,
 matching account/position modes, a writable critical log, clean checkpoint/REST
-reconciliation, every sequenced book, and all configured private channels for
-every account. Orders, account, and positions are required. The dedicated
+reconciliation, every sequenced book, every configured healthy stablecoin
+reference, and all configured private channels for every account. Orders,
+account, and positions are required. The dedicated
 fills channel is opt-in because OKX restricts it by fee tier; fills from the
 orders channel remain canonical. Any lost invariant blocks new orders while
 demo-mode cancels remain available.
@@ -357,6 +360,8 @@ Credential-free public market-data composition.
 Responsibilities:
 
 - Build explicit public-only subscription plans from TOML.
+- Capture the stablecoin/index references required to reproduce live risk
+  inputs alongside strategy market data.
 - Run redundant websocket connections through `reap-feed` supervision.
 - Persist every received raw frame through a bounded lossless writer.
 - Stamp every frame with a process-session identity so replay cannot hide

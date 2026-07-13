@@ -72,20 +72,31 @@ Run capture under a disk-capacity supervisor. JSONL is currently uncompressed
 and can grow quickly; rotate on every process start and before the filesystem
 reaches its alarm threshold. Never place capture output under source control.
 
-### Recorded Public Smoke
+### Recorded Public Acceptance
 
-On 2026-07-13, the public configuration completed a bounded 20-second run with
-all 12 redundant socket plans ready at stop. It wrote 3,443 raw frames
-(3,111,900 bytes), accepted 1,727 events, and classified 1,716 exact redundant
-images as duplicates. Capture and strict replay both reported zero gaps,
-recovery failures, parse errors, stale books, disconnects, and unrecovered
-streams. The raw file SHA-256 was
-`227acd3e3f21e84fb8c3a6fa9866c500be95bb5eeaca6925aa6d574d7c8ece30`.
+On 2026-07-13, the baseline public configuration completed a bounded 5-minute
+run with all 12 redundant socket plans ready at stop. It wrote 36,402 raw
+frames (29,497,890 bytes), accepted 18,201 events, and classified 18,201
+byte-identical replica frames as duplicates. Capture and strict replay both
+reported zero gaps, recoveries, recovery failures, parse errors, stale books,
+disconnects, and unrecovered streams. Raw-capture backtest replay completed
+with 84 simulated orders and no fills. The raw SHA-256 was
+`d47821b16b6fbbd78b6058a701678074f988a863db68110a18ada74042330c58`.
 
-Raw-capture backtest replay then completed and generated 26 simulated orders
-with no fills in the short window. This is connectivity and replay plumbing
-evidence only. It is not a sustained capture, execution-model calibration,
-profitability result, credentialed soak, or production approval.
+After adding the stablecoin risk inputs, the current public configuration ran
+for 75 seconds with all 14 socket plans ready. It wrote 7,592 frames (5,687,373
+bytes), accepted 3,803 events, and classified 3,789 as duplicates, with the
+same zero-defect capture and strict-replay result. The file contained 713
+USDT/USD and USDC/USD frames: 142 unique USDT updates and 215 unique USDC
+updates, with zero conflicting values at the same symbol/timestamp.
+Raw-capture backtest replay completed with 20 simulated orders and no fills.
+The raw SHA-256 was
+`45e666b9b633696cce739d7c4bb029247306839f4994e186c138ebf8ed2ab145`.
+
+These are connectivity, integrity, and replay-plumbing evidence only. They are
+not a sustained full-depth dataset, execution-model calibration, profitability
+result, credentialed soak, or production approval. Raw acceptance files remain
+outside source control.
 
 ## Startup Gate
 
@@ -127,8 +138,38 @@ profitability result, credentialed soak, or production approval.
    subscription window.
 11. It waits for a contiguous sequenced book for every instrument and a
     complete, healthy, post-connect reconciled private stream for every account.
-12. Only phase `ready`, writable storage, healthy risk, and explicit
+12. It also waits for every configured stablecoin guard to receive a fresh,
+    internally consistent index value within its downside threshold.
+13. Only phase `ready`, writable storage, healthy risk, and explicit
    `--mode demo --confirm-demo` permit a new order.
+
+## Stablecoin Depeg Guard
+
+- Configure `[[risk.stablecoin_guards]]` with the OKX index symbol and maximum
+  downside deviation. The demo example checks `USDT-USD` and `USDC-USD` at 1%,
+  matching the pinned Java defaults. A production config that uses either
+  currency is invalid without its corresponding guard.
+- Each guard is an `index-tickers` critical subscription with the configured
+  replica count. Exact payloads deduplicate. Two different values with the same
+  exchange timestamp are an integrity conflict and remain unhealthy until a
+  newer timestamp arrives.
+- Missing, invalid, conflicting, stale, or downside-depegged references remove
+  startup/runtime readiness and reject new orders immediately. They never block
+  cancels. A continuously unhealthy guard for
+  `stablecoin_breach_debounce_ms` emits a durable global risk latch and cancels
+  canonical live orders. Feed recovery does not clear a durable latch.
+- OKX documents [`index-tickers`](https://www.okx.com/docs-v5/en/#public-data-websocket-index-tickers-channel)
+  updates every 100 ms when changed and once per minute otherwise. The example
+  therefore uses a 75-second
+  `stablecoin_max_age_ms` websocket budget. Route connectivity is monitored
+  separately; losing every replica emits public-feed stale, degrades readiness,
+  and requests immediate fail-closed cancellation. Do not reduce the age below
+  the unchanged-value interval unless another independently supervised refresh
+  source is implemented.
+- The live guard checks downside deviation after a fresh value; an upside move
+  alone is not a depeg failure, matching the pinned Java final check. Backtests
+  have no live stablecoin guards unless explicitly configured at a live risk
+  boundary.
 
 ## Process Ownership And Host Guard
 
@@ -312,6 +353,7 @@ replacement for exchange-side account limits and operator access controls.
 | Public feed stale | Symbol blocked; live orders cancelled | Restore at least one healthy feed and verify sequence continuity |
 | Private stream stale | Account blocked; live orders cancelled | Reconnect, REST reconcile pending orders/fills, then emit recovery |
 | Reconcile drift | Account blocked; live orders cancelled | Resolve local/remote order and fill differences before recovery |
+| Stablecoin reference missing/stale/conflicting/depegged | New entry blocked immediately; durable global kill and live-order cancellation after debounce | Verify both redundant index routes and an independent venue reference; use the stopped-process latch-clear procedure after a sustained breach |
 | Risk breach | Durable global kill active; live orders cancelled | Reduce exposure externally if needed, diagnose, and follow the stopped-process latch-clear procedure; restart alone does not clear it |
 | Manual account kill | Durable account route latch; its instruments are removed from pricing/hedging and its live orders are cancelled | Reconcile the account and dependent exposure; restart alone does not clear it |
 | Exchange clock/deadman failure | Runtime fatal; new entry blocked; armed Cancel All After remains effective | Verify host time and OKX reachability, then reconcile before restart |

@@ -18,7 +18,8 @@ Implemented:
   supervised multi-websocket feeds, account-scoped channel-aware
   deduplication, sequence recovery, and REST reconciliation.
 - Deterministic pre/post-trade risk, stale-stream fail-closed behavior, global,
-  account, and symbol halt events, and an event-loop enforcement layer.
+  account, and symbol halt events, redundant USDT/USDC reference guards with
+  durable depeg latching, and an event-loop enforcement layer.
 - Bounded structured telemetry and JSONL storage for raw, normalized, intent,
   request, acknowledgement, order, fill, system, bootstrap, reconciliation,
   and write-ahead safety-latch records, including restart recovery and an
@@ -61,9 +62,10 @@ cargo run -p reap-cli -- replay-check --events fixtures/raw/okx/depth-gap.jsonl 
 cargo run -p reap-cli -- config-check --config examples/iarb2-basic.toml --pretty
 ```
 
-Capture backtest-ready OKX public data without credentials or private/account
-connections. The bounded command exits non-zero on parse, sequence, recovery,
-writer, or end-of-run connectivity defects:
+Capture backtest-ready OKX public data, including redundant USDT/USD and
+USDC/USD risk references, without credentials or private/account connections.
+The bounded command exits non-zero on parse, sequence, recovery, writer, or
+end-of-run connectivity defects:
 
 ```bash
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"

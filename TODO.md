@@ -104,6 +104,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
   fixtures.
 - [x] Give capture output create-new semantics with per-run CLI path overrides,
   then complete a real public capture, strict replay, and raw backtest smoke.
+- [x] Add Java-referenced USDT/USDC depeg protection with redundant critical
+  index feeds, conflict-aware deduplication, startup readiness, immediate entry
+  blocking, and a debounced durable global risk latch.
 - [x] Reject crossed books and force fresh-snapshot recovery, matching the
   reviewed Java OKX subscriber behavior with explicit sequence validation.
 - [x] Add order `expTime`, startup/periodic exchange-clock validation, and an

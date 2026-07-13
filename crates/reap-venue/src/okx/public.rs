@@ -484,7 +484,10 @@ fn normalized_market_event(
             key: if ts_ms == 0 {
                 EventKey::RawHash(envelope.raw_hash)
             } else {
-                EventKey::Timestamp(ts_ms)
+                EventKey::TimestampHash {
+                    ts_ms,
+                    raw_hash: envelope.raw_hash,
+                }
             },
         },
         account_id: None,
@@ -1011,6 +1014,13 @@ mod tests {
             }))
         ));
         assert!(matches!(
+            index_events[0].id.key,
+            EventKey::TimestampHash {
+                ts_ms: 1001,
+                raw_hash: 7,
+            }
+        ));
+        assert!(matches!(
             limit_events[0].event,
             VenueEvent::Normalized(NormalizedEvent::Market(MarketEvent::PriceLimits {
                 limit_down: 45_000.0,
@@ -1035,6 +1045,37 @@ mod tests {
                 ))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn same_timestamp_public_values_have_distinct_dedup_identities() {
+        let adapter = OkxAdapter::default();
+        let first = r#"{"arg":{"channel":"index-tickers","instId":"USDT-USD"},"data":[{"instId":"USDT-USD","idxPx":"1.0","ts":"1000"}]}"#;
+        let second = r#"{"arg":{"channel":"index-tickers","instId":"USDT-USD"},"data":[{"instId":"USDT-USD","idxPx":"0.98","ts":"1000"}]}"#;
+        let mut first_envelope = envelope(Channel::Custom("index-tickers".to_string()), first);
+        first_envelope.symbol = Some("USDT-USD".to_string());
+        let mut second_envelope = envelope(Channel::Custom("index-tickers".to_string()), second);
+        second_envelope.symbol = Some("USDT-USD".to_string());
+        second_envelope.raw_hash = 8;
+
+        let first_event = adapter.parse(&first_envelope).unwrap().remove(0);
+        let second_event = adapter.parse(&second_envelope).unwrap().remove(0);
+
+        assert_ne!(first_event.id.key, second_event.id.key);
+        assert!(matches!(
+            first_event.id.key,
+            EventKey::TimestampHash {
+                ts_ms: 1000,
+                raw_hash: 7,
+            }
+        ));
+        assert!(matches!(
+            second_event.id.key,
+            EventKey::TimestampHash {
+                ts_ms: 1000,
+                raw_hash: 8,
+            }
+        ));
     }
 
     #[test]

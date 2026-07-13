@@ -13,7 +13,7 @@ production trading process.
 | Deterministic backtest/data | Shared strategy code, depth matching, queue-ahead model, fees, credential-free redundant public capture, create-new session files, and raw/normalized replay | Needs sustained full-depth capture and venue-data calibration before capital decisions |
 | Feed components | Redundant public sockets, isolated private sockets, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
 | Order components | Event-loop client IDs/registration, exchange-side place-request expiry, signed submit/cancel, pacing, private reduction, ambiguity handling, and REST reconciliation are composed | Needs demo exchange fault evidence |
-| Runtime risk | Instrument models, authoritative startup positions, account-scoped health, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed deadman evidence |
+| Runtime risk | Instrument models, authoritative startup positions, account-scoped health, redundant stablecoin guards, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed deadman/depeg evidence |
 | Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, and strict bounded soak reports | Demo-capable; production entry intentionally unavailable |
 | Instrument/account bootstrap | Account instruments/config/balance/positions are typed and verified before readiness | Needs target-account certification |
 | Startup/restart gate | Executable phase state, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, durable latch restore, and clean REST reconciliation | Needs process-kill demo test |
@@ -84,12 +84,20 @@ production trading process.
 14. Hardened systemd templates permit bounded restart only for read-only observe
     mode. Demo and capture require operator-controlled restart so account
     reconciliation and capture-session rotation cannot be bypassed.
-15. A real 20-second public OKX smoke reached all 12 configured redundant socket
-    plans, wrote 3,443 raw frames, passed strict replay with no integrity defect,
-    and completed raw-capture backtest replay. Deterministic fixtures separately
-    cover maintenance sequence resets, no-change updates, redundant replicas,
-    and missed-reset recovery. This does not replace sustained capture or any
-    credentialed demo evidence.
+15. A real 5-minute public OKX capture reached all 12 baseline redundant socket
+    plans, wrote 36,402 frames, split exactly into 18,201 accepted and 18,201
+    duplicates, passed strict replay with no integrity defect, and completed
+    raw-capture backtest replay. A revised 75-second run reached all 14 plans and
+    captured redundant USDT/USD and USDC/USD references without a conflicting
+    same-timestamp value. Deterministic fixtures separately cover maintenance
+    sequence resets, no-change updates, conflicting replicas, and missed-reset
+    recovery. This does not replace sustained capture or credentialed evidence.
+16. Live risk subscribes to configured stablecoin/USD indexes on redundant
+    critical routes. Missing, stale, invalid, conflicting, or downside-depegged
+    data blocks entry immediately; a sustained 5-second failure persists a
+    global risk latch and cancels live orders. Startup readiness requires every
+    guard, and production validation requires guards for used USDT/USDC
+    currencies.
 
 ## Remaining Demo Gate
 
@@ -99,7 +107,8 @@ production trading process.
 2. Run `observe` through reconnects and verify every account reaches `ready`
    with no reconciliation drift or critical storage backpressure. Use a bounded
    run with `--duration-secs <seconds> --require-clean-soak` so the result is
-   machine-verifiable.
+   machine-verifiable. Confirm both stablecoin references remain fresh and
+   inject a transient guard failure without creating a durable latch.
 3. Run minimal-size `demo` orders, then inject socket disconnect, process kill,
    deadman expiry, exchange-clock skew, IOC miss, partial fill, and REST
    timeout/rate-limit conditions. Verify `expTime`, latch restoration, and
@@ -120,9 +129,10 @@ Production enablement additionally requires:
   slippage assumptions.
 - Walk-forward and out-of-sample evaluation, parameter sensitivity, capacity,
   inventory-duration, and stressed-liquidity reports.
-- Stablecoin depeg and exchange-rate pause policy, strategy-group risk, master
-  liveness, deployed external alert routing, and target-host exercise of the
-  out-of-process regular-order kill plus any required algo/spread kill path.
+- Target-account calibration and independent exercise of the implemented
+  stablecoin guard; broader exchange-rate pause policy, strategy-group risk,
+  master liveness, deployed external alert routing, and target-host exercise of
+  the out-of-process regular-order kill plus any required algo/spread kill path.
 - Target-host time-service monitoring, CPU/thread placement, bounded
   backpressure, calibrated memory/disk thresholds, installed restart
   supervision, and external unit-failure paging.

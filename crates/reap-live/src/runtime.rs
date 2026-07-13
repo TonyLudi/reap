@@ -3061,6 +3061,16 @@ fn spawn_feed_forwarders(
 fn public_subscriptions(config: &LiveConfig) -> Vec<Subscription> {
     let mut subscriptions = Vec::new();
     let mut seen = HashSet::new();
+    for guard in &config.risk.stablecoin_guards {
+        push_public_subscription(
+            &mut subscriptions,
+            &mut seen,
+            Channel::Custom("index-tickers".to_string()),
+            &guard.symbol,
+            FeedPriority::Critical,
+            config.runtime.public_connections_per_subscription,
+        );
+    }
     for instrument in &config.strategy.instruments {
         push_public_subscription(
             &mut subscriptions,
@@ -3196,7 +3206,7 @@ mod tests {
 
     use async_trait::async_trait;
     use reap_core::{AccountUpdate, Balance, OrderEvent, OrderUpdate, Side};
-    use reap_risk::{InstrumentRiskModel, RiskLimits};
+    use reap_risk::{InstrumentRiskModel, RiskLimits, StablecoinGuardConfig};
     use reap_storage::start_jsonl_storage;
     use reap_strategy::{ChaosConfig, InstrumentKindConfig};
     use reap_venue::okx::{
@@ -3352,6 +3362,7 @@ mod tests {
             missing_account_snapshots: Vec::new(),
             missing_books: Vec::new(),
             missing_private_streams: Vec::new(),
+            missing_stablecoin_rates: Vec::new(),
             faults: BTreeMap::new(),
         }
     }
@@ -4396,6 +4407,32 @@ mod tests {
         assert_eq!(private_subscriptions(true).len(), 4);
     }
 
+    #[test]
+    fn public_plan_replicates_stablecoin_guards_as_critical_feeds() {
+        let mut config = config();
+        config.risk.stablecoin_guards = vec![StablecoinGuardConfig {
+            symbol: "USDT-USD".to_string(),
+            max_downside_deviation: 0.01,
+        }];
+        config.strategy.instruments[0].index_symbol = Some("USDT-USD".to_string());
+
+        let subscriptions = public_subscriptions(&config);
+        let stablecoin = subscriptions
+            .iter()
+            .filter(|subscription| {
+                subscription.channel == Channel::Custom("index-tickers".to_string())
+                    && subscription.symbol.as_deref() == Some("USDT-USD")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(stablecoin.len(), 1);
+        assert_eq!(stablecoin[0].priority, FeedPriority::Critical);
+        assert_eq!(
+            stablecoin[0].connections,
+            config.runtime.public_connections_per_subscription
+        );
+    }
+
     #[tokio::test]
     async fn journal_ownership_is_checked_before_credentials_or_network() {
         let path = std::env::temp_dir().join(format!(
@@ -4480,6 +4517,10 @@ mod tests {
 
         let mut production = config();
         production.venue.environment = TradingEnvironment::Production;
+        production.risk.stablecoin_guards = vec![StablecoinGuardConfig {
+            symbol: "USDT-USD".to_string(),
+            max_downside_deviation: 0.01,
+        }];
         let error = run_live(
             production,
             LiveRunOptions {

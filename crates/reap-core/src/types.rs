@@ -150,6 +150,10 @@ pub enum EventKey {
     },
     Fill(String),
     Timestamp(TimeMs),
+    TimestampHash {
+        ts_ms: TimeMs,
+        raw_hash: u64,
+    },
     RawHash(u64),
 }
 

@@ -636,7 +636,11 @@ impl LiveCoordinator {
             NormalizedEvent::System(system) => records.push(StorageRecord::System(system.clone())),
             _ => {}
         }
+        let sync_stablecoin_readiness = self.event_updates_stablecoin_readiness(&event);
         let engine_output = self.engine.on_event(event);
+        if sync_stablecoin_readiness {
+            self.sync_stablecoin_readiness(now_ms);
+        }
         let mut output = CoordinatorOutput {
             actions: Vec::new(),
             records,
@@ -646,6 +650,42 @@ impl LiveCoordinator {
             self.ensure_account_cancels(now_ms, &account_id, &reason, &mut output);
         }
         output
+    }
+
+    fn event_updates_stablecoin_readiness(&self, event: &NormalizedEvent) -> bool {
+        match event {
+            NormalizedEvent::Timer(_) => !self.config.risk.stablecoin_guards.is_empty(),
+            NormalizedEvent::Market(reap_core::MarketEvent::IndexPrice { symbol, .. }) => self
+                .config
+                .risk
+                .stablecoin_guards
+                .iter()
+                .any(|guard| guard.symbol == *symbol),
+            NormalizedEvent::System(system) => {
+                system.kind == SystemEventKind::KillSwitchReset
+                    && !self.config.risk.stablecoin_guards.is_empty()
+            }
+            NormalizedEvent::Order(_)
+            | NormalizedEvent::Account(_)
+            | NormalizedEvent::Control(_)
+            | NormalizedEvent::Market(_) => false,
+        }
+    }
+
+    fn sync_stablecoin_readiness(&mut self, now_ms: TimeMs) {
+        let health = self.engine.risk().stablecoin_guard_health(now_ms);
+        for guard in health {
+            if let Err(error) =
+                self.startup
+                    .mark_stablecoin_rate(&guard.symbol, guard.healthy, guard.reason)
+            {
+                self.startup.mark_runtime_health(
+                    "stablecoin_guard",
+                    false,
+                    format!("stablecoin readiness configuration mismatch: {error}"),
+                );
+            }
+        }
     }
 
     fn handle_engine_output(
@@ -986,7 +1026,9 @@ mod tests {
     };
     use reap_feed::FeedOutput;
     use reap_order::reconcile;
-    use reap_risk::{InstrumentRiskModel, RiskLimits};
+    use reap_risk::{
+        InstrumentRiskModel, RiskDecision, RiskLimits, RiskRejectReason, StablecoinGuardConfig,
+    };
     use reap_strategy::ChaosConfig;
     use reap_venue::okx::{OkxAccountLevel, OkxInstrumentType, OkxPositionMode};
     use reap_venue::{PrivateOrderState, PrivateOrderUpdate, RemoteFill, RemoteOrder};
@@ -999,16 +1041,23 @@ mod tests {
     use super::*;
 
     fn coordinator_with_gateway_actions(gateway_actions_enabled: bool) -> LiveCoordinator {
+        coordinator_with_risk(
+            gateway_actions_enabled,
+            RiskLimits {
+                require_feed_health: false,
+                require_private_health: false,
+                ..RiskLimits::default()
+            },
+        )
+    }
+
+    fn coordinator_with_risk(gateway_actions_enabled: bool, risk: RiskLimits) -> LiveCoordinator {
         let mut strategy: ChaosConfig =
             toml::from_str(include_str!("../../../examples/iarb2-basic.toml")).unwrap();
         strategy.risk_groups[0].account_id = Some("main".to_string());
         let config = LiveConfig {
             strategy,
-            risk: RiskLimits {
-                require_feed_health: false,
-                require_private_health: false,
-                ..RiskLimits::default()
-            },
+            risk,
             venue: OkxVenueConfig::default(),
             runtime: RuntimeConfig::default(),
             storage: LiveStorageConfig::default(),
@@ -1172,7 +1221,7 @@ mod tests {
         }
     }
 
-    fn ready(coordinator: &mut LiveCoordinator) {
+    fn bootstrap_readiness(coordinator: &mut LiveCoordinator) {
         coordinator.mark_storage_ready(true, "open");
         coordinator.mark_public_connectivity(true, "connected");
         coordinator
@@ -1223,6 +1272,10 @@ mod tests {
             symbol: None,
             reason: "connected".to_string(),
         }));
+    }
+
+    fn ready(coordinator: &mut LiveCoordinator) {
+        bootstrap_readiness(coordinator);
         assert!(coordinator.readiness().is_ready());
     }
 
@@ -1316,6 +1369,93 @@ mod tests {
             })
             .unwrap();
         assert!(coordinator.readiness().is_ready());
+    }
+
+    #[test]
+    fn stablecoin_breach_blocks_entry_then_latches_and_cancels() {
+        let mut coordinator = coordinator_with_risk(
+            true,
+            RiskLimits {
+                require_feed_health: false,
+                require_private_health: false,
+                stablecoin_guards: vec![StablecoinGuardConfig {
+                    symbol: "USDT-USD".to_string(),
+                    max_downside_deviation: 0.01,
+                }],
+                stablecoin_max_age_ms: 10_000,
+                stablecoin_breach_debounce_ms: 5_000,
+                ..RiskLimits::default()
+            },
+        );
+        bootstrap_readiness(&mut coordinator);
+        assert_eq!(
+            coordinator.readiness().phase,
+            crate::LivePhase::AwaitingStreams
+        );
+        assert_eq!(
+            coordinator.readiness().missing_stablecoin_rates,
+            vec!["USDT-USD".to_string()]
+        );
+
+        coordinator.process_event(NormalizedEvent::Market(MarketEvent::IndexPrice {
+            ts_ms: 2,
+            symbol: "USDT-USD".to_string(),
+            price: 1.0,
+        }));
+        assert!(coordinator.readiness().is_ready());
+        coordinator
+            .register_local_order("main", "live-1", order(), 3)
+            .unwrap();
+
+        let transient =
+            coordinator.process_event(NormalizedEvent::Market(MarketEvent::IndexPrice {
+                ts_ms: 10,
+                symbol: "USDT-USD".to_string(),
+                price: 0.98,
+            }));
+        assert_eq!(coordinator.readiness().phase, crate::LivePhase::Degraded);
+        assert!(!coordinator.kill_switch_active());
+        assert!(
+            !transient
+                .records
+                .iter()
+                .any(|record| { matches!(record, StorageRecord::SafetyLatch(_)) })
+        );
+        assert!(matches!(
+            coordinator
+                .engine
+                .risk()
+                .pre_trade(10, OrderIntent::NewOrder(order())),
+            RiskDecision::Rejected {
+                reason: RiskRejectReason::StablecoinDepeg { .. },
+                ..
+            }
+        ));
+        let mut blocked = CoordinatorOutput::default();
+        coordinator.route_intent(10, OrderIntent::NewOrder(order()), &mut blocked);
+        assert!(blocked.actions.is_empty());
+
+        let latched = coordinator.process_event(NormalizedEvent::Market(MarketEvent::IndexPrice {
+            ts_ms: 5_010,
+            symbol: "USDT-USD".to_string(),
+            price: 0.98,
+        }));
+        assert!(coordinator.kill_switch_active());
+        assert!(latched.records.iter().any(|record| {
+            matches!(
+                record,
+                StorageRecord::SafetyLatch(latch)
+                    if latch.active
+                        && latch.scope == SafetyLatchScope::Global
+                        && latch.source == SafetyLatchSource::Risk
+            )
+        }));
+        assert!(latched.actions.iter().any(|action| {
+            matches!(
+                action,
+                LiveAction::Cancel(cancel) if cancel.client_order_id == "live-1"
+            )
+        }));
     }
 
     #[test]
