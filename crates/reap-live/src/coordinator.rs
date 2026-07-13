@@ -1873,6 +1873,78 @@ mod tests {
     }
 
     #[test]
+    fn repeated_submit_rejections_persist_risk_latch_and_cancel_live_orders() {
+        let mut coordinator = coordinator_with_risk(
+            true,
+            RiskLimits {
+                require_feed_health: false,
+                require_private_health: false,
+                order_reject_count_limit: 2,
+                order_reject_count_per_symbol_limit: 2,
+                order_reject_window_ms: 60_000,
+                ..RiskLimits::default()
+            },
+        );
+        ready(&mut coordinator);
+        coordinator
+            .restore_order(
+                "main",
+                OrderUpdate {
+                    ts_ms: 2,
+                    order_id: "live-order".to_string(),
+                    symbol: "BTC-USDT".to_string(),
+                    side: Side::Buy,
+                    event: OrderEvent::New,
+                    status: OrderStatus::Live,
+                    price: 100.0,
+                    qty: 1.0,
+                    open_qty: 1.0,
+                    filled_qty: 0.0,
+                    avg_fill_price: 0.0,
+                    last_fill_qty: 0.0,
+                    last_fill_price: 0.0,
+                    last_fill_liquidity: None,
+                    reason: "quote".to_string(),
+                },
+            )
+            .unwrap();
+        coordinator
+            .register_local_order("main", "reject-1", order(), 3)
+            .unwrap();
+        let first = coordinator
+            .on_submit_error("main", "reject-1", 4, false, "exchange rejected")
+            .unwrap();
+        assert!(!coordinator.kill_switch_active());
+        assert!(
+            !first
+                .records
+                .iter()
+                .any(|record| matches!(record, StorageRecord::SafetyLatch(_)))
+        );
+
+        coordinator
+            .register_local_order("main", "reject-2", order(), 5)
+            .unwrap();
+        let second = coordinator
+            .on_submit_error("main", "reject-2", 6, false, "exchange rejected")
+            .unwrap();
+
+        assert!(coordinator.kill_switch_active());
+        assert!(second.records.iter().any(|record| matches!(
+            record,
+            StorageRecord::SafetyLatch(latch)
+                if latch.active
+                    && latch.scope == SafetyLatchScope::Global
+                    && latch.source == SafetyLatchSource::Risk
+                    && latch.reason.contains("order rejection count 2 reached limit 2")
+        )));
+        assert!(second.actions.iter().any(|action| matches!(
+            action,
+            LiveAction::Cancel(cancel) if cancel.client_order_id == "live-order"
+        )));
+    }
+
+    #[test]
     fn fill_convergence_fault_cancels_live_orders_and_reconciles_account() {
         let mut coordinator = coordinator();
         ready(&mut coordinator);

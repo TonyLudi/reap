@@ -13,7 +13,7 @@ production trading process.
 | Deterministic backtest/data | Shared strategy code, depth matching, queue-ahead model, fees, credential-free redundant public capture, create-new session files, and raw/normalized replay | Needs sustained full-depth capture and venue-data calibration before capital decisions |
 | Feed components | Redundant public sockets, isolated private sockets, transport/state freshness separation, account-plus-positions health rounds, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
 | Order components | Event-loop client IDs/registration, exchange-side place-request expiry, signed submit/cancel, pacing, monotonic private reduction, submit/cancel state-convergence deadlines, typed position margin mode, ambiguity handling, and full order/fill/balance/position REST reconciliation are composed | Needs demo exchange fault evidence |
-| Runtime risk | Instrument models, authoritative startup positions, active-order count/notional ceilings, position scope/mode enforcement, forced-repayment blocking, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed deadman/depeg/convergence evidence |
+| Runtime risk | Instrument models, authoritative startup positions, active-order count/notional ceilings, rolling submit-rejection circuits, position scope/mode enforcement, forced-repayment blocking, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs IOC-cancel threshold, target-account limits review, and credentialed deadman/depeg/convergence evidence |
 | Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, and strict bounded soak reports | Demo-capable; production entry intentionally unavailable |
 | Instrument/account bootstrap | Account instruments/config/balance/positions are typed; live spot is cash-only; nonzero positions require configured account ownership and derivative mode before strategy/risk application | Needs target-account certification |
 | Startup/restart gate | Executable phase state, engine-consumed account-snapshot invariant, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, durable latch restore, authoritative account repair, and second-pass clean REST reconciliation | Needs process-kill demo test |
@@ -138,6 +138,11 @@ production trading process.
     above either ceiling triggers the durable post-trade risk kill, preventing
     low-notional order proliferation from bypassing the live-order notional
     limit; remote-only orders remain a separate reconciliation blocker.
+26. Canonical exchange submit rejections are deduplicated by order ID and
+    counted in configured rolling global/per-symbol windows. Reaching either
+    threshold persists the global risk latch and cancels active orders; cancel
+    failures already reconcile per event, while Java's rolling IOC-cancel
+    threshold remains open.
 
 ## Remaining Demo Gate
 

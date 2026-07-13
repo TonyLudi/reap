@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use reap_core::{
     AccountUpdate, MarketEvent, NormalizedEvent, OrderIntent, OrderStatus, OrderUpdate, Symbol,
@@ -30,6 +30,9 @@ pub struct RiskLimits {
     pub max_live_order_notional_usd: f64,
     pub max_live_order_count: usize,
     pub max_live_order_count_per_symbol: usize,
+    pub order_reject_count_limit: usize,
+    pub order_reject_count_per_symbol_limit: usize,
+    pub order_reject_window_ms: TimeMs,
     pub max_turnover_usd: f64,
     pub max_drawdown_usd: f64,
     pub max_feed_age_ms: TimeMs,
@@ -50,6 +53,9 @@ impl Default for RiskLimits {
             max_live_order_notional_usd: 100_000.0,
             max_live_order_count: 256,
             max_live_order_count_per_symbol: 64,
+            order_reject_count_limit: 10,
+            order_reject_count_per_symbol_limit: 5,
+            order_reject_window_ms: 60_000,
             max_turnover_usd: 1_000_000.0,
             max_drawdown_usd: 10_000.0,
             max_feed_age_ms: 1_000,
@@ -105,6 +111,21 @@ impl RiskLimits {
             return Some(
                 "max_live_order_count_per_symbol must not exceed max_live_order_count".to_string(),
             );
+        }
+        if self.order_reject_count_limit == 0 {
+            return Some("order_reject_count_limit must be positive".to_string());
+        }
+        if self.order_reject_count_per_symbol_limit == 0 {
+            return Some("order_reject_count_per_symbol_limit must be positive".to_string());
+        }
+        if self.order_reject_count_per_symbol_limit > self.order_reject_count_limit {
+            return Some(
+                "order_reject_count_per_symbol_limit must not exceed order_reject_count_limit"
+                    .to_string(),
+            );
+        }
+        if self.order_reject_window_ms == 0 {
+            return Some("order_reject_window_ms must be positive".to_string());
         }
         if !(1..=5).contains(&self.forced_repayment_indicator_limit) {
             return Some("forced_repayment_indicator_limit must be between 1 and 5".to_string());
@@ -266,6 +287,9 @@ pub struct RiskGate {
     instrument_models: HashMap<Symbol, InstrumentRiskModel>,
     positions: HashMap<Symbol, f64>,
     live_orders: HashMap<String, LiveOrderRisk>,
+    order_rejections: VecDeque<OrderRejection>,
+    rejected_order_ids: HashSet<String>,
+    last_order_rejection_ms: TimeMs,
     turnover_usd: f64,
     equity_usd: f64,
     equity_by_account: HashMap<Option<String>, f64>,
@@ -290,6 +314,9 @@ impl RiskGate {
             instrument_models: HashMap::new(),
             positions: HashMap::new(),
             live_orders: HashMap::new(),
+            order_rejections: VecDeque::new(),
+            rejected_order_ids: HashSet::new(),
+            last_order_rejection_ms: 0,
             turnover_usd: 0.0,
             equity_usd: 0.0,
             equity_by_account: HashMap::new(),
@@ -503,7 +530,71 @@ impl RiskGate {
                     .notional_usd(update.last_fill_qty, update.last_fill_price);
             }
         }
+        if self.kill_switch.is_none()
+            && update.status == OrderStatus::Rejected
+            && let Some((symbol, reason)) = self.observe_order_rejection(update)
+        {
+            return self.activate_risk_breach(update.ts_ms, symbol, reason);
+        }
         self.evaluate_post_trade(update.ts_ms, Some(&update.symbol))
+    }
+
+    fn observe_order_rejection(
+        &mut self,
+        update: &OrderUpdate,
+    ) -> Option<(Option<Symbol>, String)> {
+        let now_ms = self.last_order_rejection_ms.max(update.ts_ms);
+        self.last_order_rejection_ms = now_ms;
+        while self.order_rejections.front().is_some_and(|rejection| {
+            now_ms.saturating_sub(rejection.ts_ms) > self.limits.order_reject_window_ms
+        }) {
+            let expired = self
+                .order_rejections
+                .pop_front()
+                .expect("front rejection was present");
+            self.rejected_order_ids.remove(&expired.order_id);
+        }
+        if !self.rejected_order_ids.insert(update.order_id.clone()) {
+            return None;
+        }
+        self.order_rejections.push_back(OrderRejection {
+            ts_ms: now_ms,
+            order_id: update.order_id.clone(),
+            symbol: update.symbol.clone(),
+        });
+
+        let symbol_count = self
+            .order_rejections
+            .iter()
+            .filter(|rejection| rejection.symbol == update.symbol)
+            .count();
+        if symbol_count >= self.limits.order_reject_count_per_symbol_limit {
+            return Some((
+                Some(update.symbol.clone()),
+                format!(
+                    "symbol {} order rejection count {} reached limit {} in {}ms; latest_order={}",
+                    update.symbol,
+                    symbol_count,
+                    self.limits.order_reject_count_per_symbol_limit,
+                    self.limits.order_reject_window_ms,
+                    update.order_id
+                ),
+            ));
+        }
+        let total_count = self.order_rejections.len();
+        (total_count >= self.limits.order_reject_count_limit).then(|| {
+            (
+                None,
+                format!(
+                    "order rejection count {} reached limit {} in {}ms; latest_order={} symbol={}",
+                    total_count,
+                    self.limits.order_reject_count_limit,
+                    self.limits.order_reject_window_ms,
+                    update.order_id,
+                    update.symbol
+                ),
+            )
+        })
     }
 
     pub fn update_equity(&mut self, ts_ms: TimeMs, equity_usd: f64) -> PostTradeOutcome {
@@ -660,7 +751,12 @@ impl RiskGate {
             SystemEventKind::KillSwitchActivated | SystemEventKind::RiskBreach => {
                 self.kill_switch = Some(event.reason.clone());
             }
-            SystemEventKind::KillSwitchReset => self.kill_switch = None,
+            SystemEventKind::KillSwitchReset => {
+                self.kill_switch = None;
+                self.order_rejections.clear();
+                self.rejected_order_ids.clear();
+                self.last_order_rejection_ms = 0;
+            }
             SystemEventKind::SymbolHalted => {
                 if let Some(symbol) = &event.symbol {
                     self.halted_symbols
@@ -1085,6 +1181,13 @@ struct LiveOrderRisk {
     signed_qty: f64,
 }
 
+#[derive(Debug)]
+struct OrderRejection {
+    ts_ms: TimeMs,
+    order_id: String,
+    symbol: Symbol,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FillKey {
     order_id: String,
@@ -1165,6 +1268,15 @@ mod tests {
             last_fill_liquidity: None,
             reason: "test".to_string(),
         }
+    }
+
+    fn rejected_order_update(order_id: &str, symbol: &str, ts_ms: TimeMs) -> OrderUpdate {
+        let mut update = live_order_update(order_id, symbol, ts_ms);
+        update.event = OrderEvent::Rejected;
+        update.status = OrderStatus::Rejected;
+        update.open_qty = 0.0;
+        update.reason = "okx_private:test rejection".to_string();
+        update
     }
 
     fn ready_gate() -> RiskGate {
@@ -1252,6 +1364,107 @@ mod tests {
         ] {
             assert!(limits.validation_error().is_some());
         }
+    }
+
+    #[test]
+    fn order_rejection_limits_are_validated() {
+        for limits in [
+            RiskLimits {
+                order_reject_count_limit: 0,
+                ..RiskLimits::default()
+            },
+            RiskLimits {
+                order_reject_count_per_symbol_limit: 0,
+                ..RiskLimits::default()
+            },
+            RiskLimits {
+                order_reject_count_limit: 2,
+                order_reject_count_per_symbol_limit: 3,
+                ..RiskLimits::default()
+            },
+            RiskLimits {
+                order_reject_window_ms: 0,
+                ..RiskLimits::default()
+            },
+        ] {
+            assert!(limits.validation_error().is_some());
+        }
+    }
+
+    #[test]
+    fn duplicate_rejections_count_once_and_symbol_threshold_latches() {
+        let mut gate = RiskGate::new(RiskLimits {
+            order_reject_count_limit: 10,
+            order_reject_count_per_symbol_limit: 2,
+            order_reject_window_ms: 100,
+            ..RiskLimits::default()
+        });
+        let first = rejected_order_update("reject-1", "BTC-USDT", 1);
+        assert!(gate.on_order_update(&first).events.is_empty());
+        let mut duplicate = first;
+        duplicate.ts_ms = 2;
+        assert!(gate.on_order_update(&duplicate).events.is_empty());
+
+        let outcome = gate.on_order_update(&rejected_order_update("reject-2", "BTC-USDT", 3));
+
+        assert!(gate.is_killed());
+        assert_eq!(outcome.events[0].kind, SystemEventKind::RiskBreach);
+        assert_eq!(outcome.events[0].symbol.as_deref(), Some("BTC-USDT"));
+        assert!(
+            outcome.events[0]
+                .reason
+                .contains("symbol BTC-USDT order rejection count 2 reached limit 2")
+        );
+    }
+
+    #[test]
+    fn rejection_window_expires_and_global_threshold_spans_symbols() {
+        let limits = RiskLimits {
+            order_reject_count_limit: 2,
+            order_reject_count_per_symbol_limit: 2,
+            order_reject_window_ms: 100,
+            ..RiskLimits::default()
+        };
+        let mut expired = RiskGate::new(limits.clone());
+        assert!(
+            expired
+                .on_order_update(&rejected_order_update("reject-1", "BTC-USDT", 1))
+                .events
+                .is_empty()
+        );
+        assert!(
+            expired
+                .on_order_update(&rejected_order_update("reject-2", "ETH-USDT", 102))
+                .events
+                .is_empty()
+        );
+
+        let mut global = RiskGate::new(limits);
+        global.on_order_update(&rejected_order_update("reject-1", "BTC-USDT", 1));
+        let outcome = global.on_order_update(&rejected_order_update("reject-2", "ETH-USDT", 2));
+
+        assert!(global.is_killed());
+        assert!(
+            outcome.events[0]
+                .reason
+                .contains("order rejection count 2 reached limit 2")
+        );
+
+        global.apply_system_event(&SystemEvent {
+            ts_ms: 3,
+            kind: SystemEventKind::KillSwitchReset,
+            venue: None,
+            account_id: None,
+            symbol: None,
+            reason: "test reset".to_string(),
+        });
+        assert!(!global.is_killed());
+        assert!(
+            global
+                .on_order_update(&rejected_order_update("reject-3", "BTC-USDT", 4))
+                .events
+                .is_empty()
+        );
     }
 
     #[test]

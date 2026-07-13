@@ -93,6 +93,14 @@ Raw-capture backtest replay completed with 20 simulated orders and no fills.
 The raw SHA-256 was
 `45e666b9b633696cce739d7c4bb029247306839f4994e186c138ebf8ed2ab145`.
 
+A fresh 45-second end-to-end smoke on 2026-07-13 used the current capture-only
+configuration and again reached all 14 plans. It wrote 4,856 frames (4,133,829
+bytes), accepted 2,429 events, classified 2,427 replica duplicates, and had
+zero gaps, recoveries, parse errors, stale books, or disconnects. Strict replay
+reproduced both ready books with no errors, and raw-capture backtest replay
+completed with 16 simulated orders and no fills. The raw SHA-256 was
+`f8e4ab61946c113162263733f35c42329d6120712e2b1ee66afbb616cdbb9453`.
+
 These are connectivity, integrity, and replay-plumbing evidence only. They are
 not a sustained full-depth dataset, execution-model calibration, profitability
 result, credentialed soak, or production approval. Raw acceptance files remain
@@ -287,6 +295,29 @@ settings; accepting only their static flags would weaken live stop behavior.
 - The demo baseline is 64 active orders globally and 16 per symbol. Review the
   limits against configured quote levels, hedge concurrency, account-wide
   exchange limits, and shutdown cancellation capacity before credentialed use.
+
+## Exchange Order Rejection Circuit
+
+- `risk.order_reject_count_limit` and
+  `risk.order_reject_count_per_symbol_limit` bound canonical exchange submit
+  rejections inside `risk.order_reject_window_ms`. All settings must be
+  positive, and the symbol threshold cannot exceed the global threshold. The
+  demo baseline is five global or three same-symbol rejects in 60 seconds.
+- Canonical `Rejected` updates include explicit non-ambiguous REST submit
+  failures and private `order_failed` state. An order ID counts once within the
+  rolling window; the event loop uses monotonic observed rejection time so an
+  out-of-order exchange timestamp cannot corrupt expiry ordering.
+- Reaching either threshold persists the global risk latch and cancels every
+  canonical active order. This maps the pinned Java submit-reject controls into
+  the single-owner risk gate and is intentionally stronger than a transient
+  strategy pause.
+- Cancel request failures are not added to this submit-reject counter: one
+  cancel failure immediately degrades the account, requests full REST
+  reconciliation, and remains under the cancel-to-terminal convergence guard.
+  Amend routing is unsupported. Java's separate rolling per-symbol IOC-cancel
+  threshold is not yet implemented; chaos records missed IOC hedges, and the
+  production gate remains open until that record drives an equivalent stop or
+  a dedicated threshold is added.
 
 ## Stablecoin Depeg Guard
 
