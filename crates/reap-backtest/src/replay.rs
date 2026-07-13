@@ -184,6 +184,33 @@ mod tests {
     }
 
     #[test]
+    fn raw_capture_replay_preserves_sequence_reset_and_heartbeat() {
+        let fixture = include_str!("../../../fixtures/raw/okx/depth-reset.jsonl");
+        let mut depth_events = 0;
+        let mut recovery_events = 0;
+        replay_raw_capture(fixture.as_bytes(), |event| {
+            match event {
+                NormalizedEvent::Market(MarketEvent::Depth(_)) => depth_events += 1,
+                NormalizedEvent::System(event)
+                    if matches!(
+                        event.kind,
+                        reap_core::SystemEventKind::FeedGap
+                            | reap_core::SystemEventKind::BookRecoveryStarted
+                    ) =>
+                {
+                    recovery_events += 1;
+                }
+                _ => {}
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(depth_events, 4);
+        assert_eq!(recovery_events, 0);
+    }
+
+    #[test]
     fn raw_capture_replay_rejects_process_session_boundaries() {
         let first_line = include_str!("../../../fixtures/raw/okx/depth-gap.jsonl")
             .lines()

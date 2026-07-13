@@ -102,6 +102,8 @@ The following differences do not change the covered quote/hedge calculations:
 | `AbstractOkxNitroL2Subscriber` TBT and 400-level modes | Explicit `books-l2-tbt`, `books50-l2-tbt`, or `books` capture subscriptions | Equivalent, entitlement remains operational |
 | Ping, disconnect, resubscribe, and stale checkers | Feed connection loop, reconnect supervisor, idle timeout, and book-age recovery | Equivalent |
 | Clear/rebuild book on resubscribe or crossed-book failure | Invalid/crossed-book detection plus sequence state and fresh websocket snapshot recovery | Equivalent with additional explicit sequence validation |
+| `AbstractOkV5L2Subscriber.checkSeqNo` predecessor compare-and-set, equal-sequence no-change case, and lower-sequence maintenance case | `SequenceTracker` requires `prevSeqId == last`, accepts equal/lower `seqId`, records both cases, and recovers on mismatch | Exact continuity rule with bounded recovery buffering |
+| Nitro checksum validation block commented out; legacy V5 CRC validation active | No CRC validation after OKX checksum deprecation; WSS, sequence, snapshot, crossed-book, and stale checks remain mandatory | Current-contract adaptation |
 | Separate receive and exchange latency tracking | Raw `recv_ts_ns`, exchange timestamps, capture health counters, and bounded live webhook alerts | Equivalent data retained; alert routing is a deployment concern |
 | Batch subscription manager and retry limits | Bounded socket partitioning, acknowledgement timeout, exponential reconnect | Equivalent lifecycle with different batching policy |
 | `ChaosStrategyEngine.tryToStop`, `ChaosStrategyBase.cancelAll(entity)`, and `ExchCancelAll` | In-process canonical cancel/reconcile plus a separate account-wide regular-order emergency CLI | Equivalent normal stop with an additional process-independent safety layer |
@@ -115,6 +117,16 @@ intentional deployment-safety additions around the parity strategy, not claims
 of Java strategy equivalence. Re-check exchange-facing controls against both the
 pinned Java revision and the current OKX API contract whenever connectivity is
 upgraded.
+
+The pinned Nitro subscriber rebuilds on a crossed book, but its
+`OkxNitroUtils.validateOrderBook` call is commented out. The pinned legacy V5
+subscriber still contains an active CRC check and provides the direct sequence
+reference: it resubscribes when `prevSeqId` does not match, treats
+`seqId == prevSeqId` as valid, and identifies `seqId < prevSeqId` as possible
+maintenance. OKX subsequently deprecated the checksum field, so Rust follows
+the current [OKX API contract](https://www.okx.com/docs-v5/en/) and
+[deprecation notice](https://www.okx.com/en-us/help/okx-order-book-channels-checksum-field-deprecation)
+instead of copying obsolete CRC behavior.
 
 The pinned Java stop path changes engine state and invokes per-entity
 `cancelAll()` inside the running process, with `ExchCancelAll` providing

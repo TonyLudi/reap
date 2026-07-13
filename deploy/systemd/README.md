@@ -42,7 +42,9 @@ sudo systemctl start reap-capture@btc-public.service
 unit start limit. `demo` never restarts automatically: every abnormal exit needs
 exchange/account reconciliation and operator approval. `capture` also never
 restarts automatically because every process requires a fresh output path and
-session identity. Rotate its configured output before starting it again.
+session identity. Set `output.raw_path` (and `output.normalized_path`, when used)
+to new absolute paths before starting it again. Capture uses create-new file
+semantics and will fail before opening feed sockets if an output already exists.
 
 Configure the host monitoring system to page on unit activation failure,
 non-zero exit, start-limit exhaustion, forced `SIGKILL`, and host clock/disk/

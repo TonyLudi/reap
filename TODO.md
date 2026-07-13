@@ -98,6 +98,12 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Add credential-free redundant OKX public capture and direct raw-capture
   replay/backtest through the live adapter, deduplication, sequence, and book
   reducer path.
+- [x] Make OKX book continuity predecessor-based and reset-aware; preserve
+  no-change updates, deduplicate byte-identical images across sequence epochs,
+  fail closed on conflicting replicas, and cover reset/recovery with raw replay
+  fixtures.
+- [x] Give capture output create-new semantics with per-run CLI path overrides,
+  then complete a real public capture, strict replay, and raw backtest smoke.
 - [x] Reject crossed books and force fresh-snapshot recovery, matching the
   reviewed Java OKX subscriber behavior with explicit sequence validation.
 - [x] Add order `expTime`, startup/periodic exchange-clock validation, and an

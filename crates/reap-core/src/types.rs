@@ -133,7 +133,13 @@ pub struct EventId {
 pub enum EventKey {
     BookSequence {
         action: BookAction,
+        #[serde(default)]
+        prev_seq_id: i64,
         seq_id: i64,
+        #[serde(default)]
+        ts_ms: TimeMs,
+        #[serde(default)]
+        raw_hash: u64,
     },
     Trade(String),
     OrderVersion {

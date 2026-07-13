@@ -66,8 +66,11 @@ connections. The bounded command exits non-zero on parse, sequence, recovery,
 writer, or end-of-run connectivity defects:
 
 ```bash
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+RAW_PATH="var/reap/capture/okx-btc-${RUN_ID}.jsonl"
 cargo run -p reap-cli -- capture \
   --config examples/capture-okx-public.toml \
+  --raw-path "$RAW_PATH" \
   --duration-secs 3600 \
   --require-clean-capture \
   --pretty
@@ -76,14 +79,15 @@ cargo run -p reap-cli -- capture \
 Validate and backtest the raw capture directly. Raw replay runs the same OKX
 adapter, redundant-feed deduplicator, sequence tracker, and book reducer used
 by live trading. Use a new output path for each capture process; replay rejects
-concatenated session IDs rather than treating downtime as continuous data:
+concatenated session IDs rather than treating downtime as continuous data.
+Capture refuses an existing raw or normalized path instead of appending:
 
 ```bash
 cargo run -p reap-cli -- replay-check \
-  --events var/reap/capture/okx-btc-raw.jsonl --strict --pretty
+  --events "$RAW_PATH" --strict --pretty
 cargo run -p reap-cli -- backtest \
   --config examples/iarb2-okx-btc.toml \
-  --data var/reap/capture/okx-btc-raw.jsonl \
+  --data "$RAW_PATH" \
   --format raw-capture --pretty
 ```
 

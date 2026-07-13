@@ -152,6 +152,8 @@ pub struct CaptureBookHealth {
     pub book_status: String,
     pub last_seq_id: Option<i64>,
     pub buffered_updates: usize,
+    pub sequence_resets: u64,
+    pub same_sequence_updates: u64,
     pub best_bid: Option<f64>,
     pub best_ask: Option<f64>,
 }
@@ -176,6 +178,8 @@ pub struct CaptureRunReport {
     pub gaps: u64,
     pub recoveries: u64,
     pub recovery_failures: u64,
+    pub sequence_resets: u64,
+    pub same_sequence_updates: u64,
     pub recovery_requests: u64,
     pub missing_recovery_routes: u64,
     pub parse_errors: u64,
@@ -206,6 +210,13 @@ pub enum CaptureError {
     Venue(#[from] VenueError),
     #[error("capture IO failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error("failed to create new {name} capture output {path}: {source}")]
+    OpenOutput {
+        name: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("capture serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("{0} capture writer closed unexpectedly")]
@@ -393,11 +404,20 @@ fn is_book_channel(channel: &str) -> bool {
 
 fn validate_ws_url(value: &str, errors: &mut Vec<String>) {
     match Url::parse(value) {
-        Ok(url) if matches!(url.scheme(), "ws" | "wss") => {}
-        Ok(url) => errors.push(format!(
-            "venue.public_ws_url scheme {} is not ws or wss",
-            url.scheme()
-        )),
+        Ok(url) => {
+            let loopback_ws = url.scheme() == "ws"
+                && url.host_str().is_some_and(|host| {
+                    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+                });
+            if url.scheme() != "wss" && !loopback_ws {
+                errors.push(
+                    "venue.public_ws_url must use wss (loopback ws is test-only)".to_string(),
+                );
+            }
+            if !url.username().is_empty() || url.password().is_some() {
+                errors.push("venue.public_ws_url must not contain user information".to_string());
+            }
+        }
         Err(error) => errors.push(format!("venue.public_ws_url is invalid: {error}")),
     }
 }
@@ -431,6 +451,32 @@ pub async fn run_capture(
         .iter()
         .map(|plan| plan.conn_id.clone())
         .collect::<HashSet<_>>();
+    let raw_writer = JsonlWriter::start(
+        "raw",
+        config.output.raw_path.clone(),
+        config.runtime.writer_channel_capacity,
+        config.output.flush_every_records,
+        config.output.fsync_every_records,
+    )
+    .await?;
+    let normalized_writer = match &config.output.normalized_path {
+        Some(path) => match JsonlWriter::start(
+            "normalized",
+            path.clone(),
+            config.runtime.writer_channel_capacity,
+            config.output.flush_every_records,
+            config.output.fsync_every_records,
+        )
+        .await
+        {
+            Ok(writer) => Some(writer),
+            Err(error) => {
+                let _ = raw_writer.shutdown().await;
+                return Err(error);
+            }
+        },
+        None => None,
+    };
     let adapter: Arc<dyn VenueAdapter> = Arc::new(OkxAdapter::new(
         &config.venue.public_ws_url,
         &config.venue.public_ws_url,
@@ -444,28 +490,6 @@ pub async fn run_capture(
     );
     let mut raw_rx = feed.take_raw();
     let mut status_rx = feed.take_status();
-
-    let raw_writer = JsonlWriter::start(
-        "raw",
-        config.output.raw_path.clone(),
-        config.runtime.writer_channel_capacity,
-        config.output.flush_every_records,
-        config.output.fsync_every_records,
-    )
-    .await?;
-    let normalized_writer = match &config.output.normalized_path {
-        Some(path) => Some(
-            JsonlWriter::start(
-                "normalized",
-                path.clone(),
-                config.runtime.writer_channel_capacity,
-                config.output.flush_every_records,
-                config.output.fsync_every_records,
-            )
-            .await?,
-        ),
-        None => None,
-    };
 
     let started = Instant::now();
     let capture_session_id = format!("{:x}-{:x}", reap_feed::unix_time_ns(), std::process::id());
@@ -759,6 +783,8 @@ impl CaptureState {
                     book_status: format!("{:?}", health.book_status).to_lowercase(),
                     last_seq_id: health.last_seq_id,
                     buffered_updates: health.buffered_updates,
+                    sequence_resets: health.sequence_resets,
+                    same_sequence_updates: health.same_sequence_updates,
                     best_bid: health.best_bid,
                     best_ask: health.best_ask,
                 },
@@ -768,6 +794,8 @@ impl CaptureState {
                     book_status: "empty".to_string(),
                     last_seq_id: None,
                     buffered_updates: 0,
+                    sequence_resets: 0,
+                    same_sequence_updates: 0,
                     best_bid: None,
                     best_ask: None,
                 },
@@ -806,6 +834,8 @@ impl CaptureState {
             gaps: processor.gaps,
             recoveries: processor.recoveries,
             recovery_failures: processor.recovery_failures,
+            sequence_resets: processor.sequence_resets,
+            same_sequence_updates: processor.same_sequence_updates,
             recovery_requests: self.recovery_requests,
             missing_recovery_routes: self.missing_recovery_routes,
             parse_errors: self.parse_errors,
@@ -866,10 +896,15 @@ where
             tokio::fs::create_dir_all(parent).await?;
         }
         let file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .await?;
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .await
+            .map_err(|source| CaptureError::OpenOutput {
+                name,
+                path: path.clone(),
+                source,
+            })?;
         let (sender, receiver) = mpsc::channel(capacity.max(1));
         let queued = Arc::new(AtomicUsize::new(0));
         let max_queue_depth = Arc::new(AtomicUsize::new(0));
@@ -1087,6 +1122,21 @@ mod tests {
     }
 
     #[test]
+    fn config_requires_tls_except_for_loopback_tests() {
+        let mut config =
+            CaptureConfig::from_toml(include_str!("../../../examples/capture-okx-public.toml"))
+                .unwrap();
+        config.venue.public_ws_url = "ws://example.com/ws/v5/public".to_string();
+
+        let validation = config.validate();
+
+        assert!(!validation.valid);
+        assert!(validation.errors.iter().any(|error| error.contains("wss")));
+        config.venue.public_ws_url = "ws://127.0.0.1:8080/ws/v5/public".to_string();
+        assert!(config.validate().valid);
+    }
+
+    #[test]
     fn clean_report_requires_every_configured_book_snapshot() {
         let config = CaptureConfig {
             venue: CaptureVenueConfig::default(),
@@ -1163,6 +1213,92 @@ mod tests {
         let text = std::fs::read_to_string(path).unwrap();
         let decoded: NormalizedEvent = serde_json::from_str(text.trim()).unwrap();
         assert_eq!(decoded.ts_ms(), 1);
+    }
+
+    #[tokio::test]
+    async fn capture_refuses_to_append_a_second_process_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("existing.jsonl");
+        std::fs::write(&path, "existing-session\n").unwrap();
+        let config = CaptureConfig {
+            venue: CaptureVenueConfig::default(),
+            runtime: CaptureRuntimeConfig::default(),
+            output: CaptureOutputConfig {
+                raw_path: path.clone(),
+                ..CaptureOutputConfig::default()
+            },
+            subscriptions: vec![CaptureSubscriptionConfig {
+                channel: "books".to_string(),
+                symbol: "BTC-USDT".to_string(),
+                connections: 1,
+                priority: CapturePriority::Critical,
+            }],
+        };
+
+        let error = run_capture(
+            config,
+            CaptureRunOptions {
+                run_duration: Some(Duration::from_millis(1)),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CaptureError::OpenOutput {
+                name: "raw",
+                source,
+                ..
+            } if source.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "existing-session\n");
+    }
+
+    #[tokio::test]
+    async fn normalized_output_failure_shuts_down_the_initialized_raw_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let raw_path = directory.path().join("raw.jsonl");
+        let normalized_path = directory.path().join("existing-normalized.jsonl");
+        std::fs::write(&normalized_path, "existing-session\n").unwrap();
+        let config = CaptureConfig {
+            venue: CaptureVenueConfig::default(),
+            runtime: CaptureRuntimeConfig::default(),
+            output: CaptureOutputConfig {
+                raw_path: raw_path.clone(),
+                normalized_path: Some(normalized_path.clone()),
+                ..CaptureOutputConfig::default()
+            },
+            subscriptions: vec![CaptureSubscriptionConfig {
+                channel: "books".to_string(),
+                symbol: "BTC-USDT".to_string(),
+                connections: 1,
+                priority: CapturePriority::Critical,
+            }],
+        };
+
+        let error = run_capture(
+            config,
+            CaptureRunOptions {
+                run_duration: Some(Duration::from_millis(1)),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CaptureError::OpenOutput {
+                name: "normalized",
+                source,
+                ..
+            } if source.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(std::fs::read_to_string(raw_path).unwrap(), "");
+        assert_eq!(
+            std::fs::read_to_string(normalized_path).unwrap(),
+            "existing-session\n"
+        );
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use reap_backtest::BacktestRunner;
-use reap_capture::CaptureRunOptions;
+use reap_capture::{CaptureConfig, CaptureRunOptions, run_capture};
 use reap_live::{
     EmergencyCancelOptions, LiveConfig, LiveMode, LiveRunOptions, OperatorCommand,
     run_emergency_cancel_path, send_operator_command,
@@ -48,6 +48,16 @@ enum Command {
     Capture {
         #[arg(short, long)]
         config: PathBuf,
+        #[arg(
+            long,
+            help = "Create this raw output instead of the configured path; existing files are refused"
+        )]
+        raw_path: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Create this normalized diagnostic output instead of the configured path"
+        )]
+        normalized_path: Option<PathBuf>,
         #[arg(long, help = "Stop public data capture after this many seconds")]
         duration_secs: Option<u64>,
         #[arg(
@@ -268,6 +278,8 @@ async fn main() -> Result<()> {
         }
         Command::Capture {
             config,
+            raw_path,
+            normalized_path,
             duration_secs,
             require_clean_capture,
             pretty,
@@ -275,8 +287,16 @@ async fn main() -> Result<()> {
             reap_telemetry::init_json_tracing("info")
                 .map_err(anyhow::Error::msg)
                 .context("failed to initialize capture tracing")?;
-            let report = reap_capture::run_capture_path(
-                config,
+            let mut capture_config = CaptureConfig::load(&config)
+                .with_context(|| format!("failed to load capture config {}", config.display()))?;
+            if let Some(path) = raw_path {
+                capture_config.output.raw_path = path;
+            }
+            if let Some(path) = normalized_path {
+                capture_config.output.normalized_path = Some(path);
+            }
+            let report = run_capture(
+                capture_config,
                 CaptureRunOptions {
                     run_duration: duration_secs.map(Duration::from_secs),
                 },

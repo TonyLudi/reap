@@ -54,6 +54,8 @@ pub struct ReplayBookHealth {
     pub book_status: String,
     pub last_seq_id: Option<i64>,
     pub buffered_updates: usize,
+    pub sequence_resets: u64,
+    pub same_sequence_updates: u64,
     pub best_bid: Option<f64>,
     pub best_ask: Option<f64>,
 }
@@ -69,6 +71,8 @@ pub struct ReplayCheckReport {
     pub gaps: u64,
     pub recoveries: u64,
     pub recovery_failures: u64,
+    pub sequence_resets: u64,
+    pub same_sequence_updates: u64,
     pub unrecovered_streams: usize,
     pub errors: Vec<ReplayError>,
     pub books: Vec<ReplayBookHealth>,
@@ -148,6 +152,8 @@ pub fn replay_check<R: Read>(reader: R) -> Result<ReplayCheckReport> {
             book_status: format!("{:?}", health.book_status).to_lowercase(),
             last_seq_id: health.last_seq_id,
             buffered_updates: health.buffered_updates,
+            sequence_resets: health.sequence_resets,
+            same_sequence_updates: health.same_sequence_updates,
             best_bid: health.best_bid,
             best_ask: health.best_ask,
         })
@@ -167,6 +173,8 @@ pub fn replay_check<R: Read>(reader: R) -> Result<ReplayCheckReport> {
         gaps: stats.gaps,
         recoveries: stats.recoveries,
         recovery_failures: stats.recovery_failures,
+        sequence_resets: stats.sequence_resets,
+        same_sequence_updates: stats.same_sequence_updates,
         unrecovered_streams,
         errors,
         books,
@@ -189,6 +197,24 @@ mod tests {
         assert_eq!(report.recoveries, 1);
         assert_eq!(report.books[0].last_seq_id, Some(103));
         assert_eq!(report.books[0].best_bid, Some(100.2));
+    }
+
+    #[test]
+    fn checker_accepts_documented_okx_sequence_reset_and_heartbeat() {
+        let fixture = include_str!("../../../fixtures/raw/okx/depth-reset.jsonl");
+        let report = replay_check(fixture.as_bytes()).unwrap();
+
+        assert!(report.is_healthy(), "{report:#?}");
+        assert_eq!(report.capture_sessions, 1);
+        assert_eq!(report.duplicates, 3);
+        assert_eq!(report.gaps, 0);
+        assert_eq!(report.sequence_resets, 1);
+        assert_eq!(report.same_sequence_updates, 1);
+        assert_eq!(report.books[0].sequence_resets, 1);
+        assert_eq!(report.books[0].same_sequence_updates, 1);
+        assert_eq!(report.books[0].last_seq_id, Some(5));
+        assert_eq!(report.books[0].best_bid, Some(100.1));
+        assert_eq!(report.books[0].best_ask, Some(100.9));
     }
 
     #[test]

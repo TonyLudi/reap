@@ -11,8 +11,12 @@ public websocket URL, reads no credentials, creates no private subscription,
 and has no dependency on the order gateway or strategy coordinator.
 
 ```bash
+mkdir -p var/reap/capture
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+RAW_PATH="var/reap/capture/okx-btc-${RUN_ID}.jsonl"
 cargo run -p reap-cli -- capture \
   --config examples/capture-okx-public.toml \
+  --raw-path "$RAW_PATH" \
   --duration-secs 3600 \
   --require-clean-capture \
   --pretty
@@ -20,15 +24,31 @@ cargo run -p reap-cli -- capture \
 
 The example captures spot and swap books/trades plus index, funding, mark, and
 price-limit inputs used by iarb2. Every subscription has two independent
-connections. Raw frames are canonical and append-only. The optional
+connections. Raw frames are canonical and written sequentially within one run.
+The optional
 `output.normalized_path` is intended for short diagnostics because full
 400-level snapshots are much larger than raw deltas.
 
-Every frame and run report carries a generated `capture_session_id`. Start a
-new output path for each capture process. Strict replay and raw backtest reject
-files containing more than one session ID, because process downtime is not a
-continuous HFT market stream; split an accidentally concatenated file at the
-session boundary before use.
+Every frame and run report carries a generated `capture_session_id`. Raw and
+normalized outputs use create-new semantics: startup refuses either existing
+path and never appends a second process session. Use a unique output path for
+each process. Strict replay and raw backtest also reject files containing more
+than one session ID, because process downtime is not a continuous HFT market
+stream.
+
+Book deduplication keys exact redundant images by action, `prevSeqId`, `seqId`,
+exchange timestamp, and raw-payload hash. A replica conflict is not suppressed;
+it fails predecessor validation and forces recovery. Continuity requires
+`prevSeqId` to equal the last accepted `seqId`; the next `seqId` may be equal for
+a no-change update or lower after exchange maintenance. Those valid cases increment
+`same_sequence_updates` or `sequence_resets`. A predecessor mismatch remains a
+gap and forces fresh-snapshot recovery.
+
+OKX has deprecated the order-book checksum and documents that the field remains
+zero. Capture integrity therefore relies on WSS transport, sequence links,
+fresh snapshots, crossed-book rejection, age checks, and strict replay rather
+than the old CRC algorithm. See the current [OKX API guide](https://www.okx.com/docs-v5/en/)
+and [checksum deprecation announcement](https://www.okx.com/en-us/help/okx-order-book-channels-checksum-field-deprecation).
 
 `clean_capture` requires a bounded duration, all socket plans ready at least
 once and at stop, a ready contiguous snapshot for every configured book,
@@ -41,16 +61,31 @@ Validate and consume the output directly:
 
 ```bash
 cargo run -p reap-cli -- replay-check \
-  --events var/reap/capture/okx-btc-raw.jsonl --strict --pretty
+  --events "$RAW_PATH" --strict --pretty
 cargo run -p reap-cli -- backtest \
   --config examples/iarb2-okx-btc.toml \
-  --data var/reap/capture/okx-btc-raw.jsonl \
+  --data "$RAW_PATH" \
   --format raw-capture --pretty
 ```
 
 Run capture under a disk-capacity supervisor. JSONL is currently uncompressed
-and append-only; rotate on every process start and before the filesystem reaches
-its alarm threshold. Never place capture output under source control.
+and can grow quickly; rotate on every process start and before the filesystem
+reaches its alarm threshold. Never place capture output under source control.
+
+### Recorded Public Smoke
+
+On 2026-07-13, the public configuration completed a bounded 20-second run with
+all 12 redundant socket plans ready at stop. It wrote 3,443 raw frames
+(3,111,900 bytes), accepted 1,727 events, and classified 1,716 exact redundant
+images as duplicates. Capture and strict replay both reported zero gaps,
+recovery failures, parse errors, stale books, disconnects, and unrecovered
+streams. The raw file SHA-256 was
+`227acd3e3f21e84fb8c3a6fa9866c500be95bb5eeaca6925aa6d574d7c8ece30`.
+
+Raw-capture backtest replay then completed and generated 26 simulated orders
+with no fills in the short window. This is connectivity and replay plumbing
+evidence only. It is not a sustained capture, execution-model calibration,
+profitability result, credentialed soak, or production approval.
 
 ## Startup Gate
 

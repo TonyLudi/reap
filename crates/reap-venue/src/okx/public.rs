@@ -90,7 +90,10 @@ impl OkxAdapter {
                         symbol: Some(symbol.clone()),
                         key: EventKey::BookSequence {
                             action,
+                            prev_seq_id: update.prev_seq_id,
                             seq_id: update.seq_id,
+                            ts_ms: update.ts_ms,
+                            raw_hash: envelope.raw_hash,
                         },
                     },
                     account_id: None,
@@ -933,6 +936,16 @@ mod tests {
         assert_eq!(book.action, BookAction::Snapshot);
         assert_eq!(book.seq_id, 10);
         assert_eq!(book.bids[0], Level::new(100.0, 3.0));
+        assert!(matches!(
+            events[0].id.key,
+            EventKey::BookSequence {
+                action: BookAction::Snapshot,
+                prev_seq_id: -1,
+                seq_id: 10,
+                ts_ms: 1000,
+                raw_hash: 7,
+            }
+        ));
     }
 
     #[test]

@@ -10,8 +10,8 @@ production trading process.
 | Area | Current state | Trading impact |
 | --- | --- | --- |
 | Iarb2 decision model | Covered for the documented OKX parity boundary | Not a blocker |
-| Deterministic backtest/data | Shared strategy code, depth matching, queue-ahead model, fees, credential-free redundant public capture, and raw/normalized replay | Needs sustained full-depth capture and venue-data calibration before capital decisions |
-| Feed components | Redundant public sockets, isolated private sockets, ping/idle supervision, account-scoped deduplication, sequencing, and recovery are composed | Needs credentialed soak evidence |
+| Deterministic backtest/data | Shared strategy code, depth matching, queue-ahead model, fees, credential-free redundant public capture, create-new session files, and raw/normalized replay | Needs sustained full-depth capture and venue-data calibration before capital decisions |
+| Feed components | Redundant public sockets, isolated private sockets, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
 | Order components | Event-loop client IDs/registration, exchange-side place-request expiry, signed submit/cancel, pacing, private reduction, ambiguity handling, and REST reconciliation are composed | Needs demo exchange fault evidence |
 | Runtime risk | Instrument models, authoritative startup positions, account-scoped health, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed deadman evidence |
 | Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, and strict bounded soak reports | Demo-capable; production entry intentionally unavailable |
@@ -84,6 +84,12 @@ production trading process.
 14. Hardened systemd templates permit bounded restart only for read-only observe
     mode. Demo and capture require operator-controlled restart so account
     reconciliation and capture-session rotation cannot be bypassed.
+15. A real 20-second public OKX smoke reached all 12 configured redundant socket
+    plans, wrote 3,443 raw frames, passed strict replay with no integrity defect,
+    and completed raw-capture backtest replay. Deterministic fixtures separately
+    cover maintenance sequence resets, no-change updates, redundant replicas,
+    and missed-reset recovery. This does not replace sustained capture or any
+    credentialed demo evidence.
 
 ## Remaining Demo Gate
 

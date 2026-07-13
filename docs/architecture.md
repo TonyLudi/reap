@@ -463,31 +463,27 @@ pub struct RawEnvelope {
 ```
 
 The adapter parses raw payloads into normalized candidate events. The dedup and
-sequence layer decides whether each candidate is new, duplicate, stale, gapped,
-or requires recovery.
+sequence layer decides whether each candidate is an exact redundant image, a
+contiguous update, stale, gapped, or requires recovery.
 
 ## Deduplication
 
 Dedup must be channel-aware. There is no universal exchange id that works for
 all events.
 
-```rust
-pub struct EventId {
-    pub venue: Venue,
-    pub channel: Channel,
-    pub symbol: Option<Symbol>,
-    pub exchange_seq: Option<u64>,
-    pub exchange_event_ts: Option<i64>,
-    pub trade_id: Option<String>,
-    pub order_id: Option<String>,
-    pub fill_id: Option<String>,
-    pub raw_hash: u64,
-}
-```
+For a sequenced book, the concrete key is `(action, prev_seq_id, seq_id,
+exchange_ts_ms, raw_payload_hash)`, scoped by venue, channel, and symbol.
+Including the predecessor and timestamp is required for redundant sockets: OKX
+can reuse a sequence number after maintenance and can emit a later no-change
+update with `prevSeqId == seqId`. The payload hash prevents replicas with
+conflicting contents from being silently suppressed. A key containing only
+`seqId` would collapse valid events from different sequence epochs.
 
 Dedup rules:
 
-- Book deltas: prefer sequence or update id.
+- Book snapshots/deltas: use the complete sequence-transition key above; only
+  a byte-identical image from another socket is a duplicate. Conflicting content
+  with the same transition reaches sequencing and forces recovery.
 - Trades: prefer trade id.
 - Private fills: prefer execution id or fill id.
 - Order updates: reduce idempotently by order id plus venue update version.
@@ -509,27 +505,34 @@ counted, not treated as errors unless the rate indicates a bad subscription.
 
 ## Sequence And Gap Recovery
 
-For every channel with sequence semantics:
+For every channel with sequence semantics, continuity is defined by the
+predecessor link, not by numerical ordering of sequence IDs:
 
 ```text
-ready:
-  if next_seq == expected:
+ready update:
+  if prev_seq == last_seq:
     apply
-  if next_seq <= last_seq:
-    duplicate_or_stale
-  if next_seq > expected:
-    enter recovering
+    if seq == last: count no-change update
+    if seq < last: count maintenance reset
+  else:
+    enter recovering and request a fresh snapshot
 
 recovering:
   buffer deltas
   fetch snapshot
   apply snapshot
-  replay buffered deltas after snapshot sequence
-  if contiguous:
+  discard buffered messages older than the snapshot
+  replay buffered deltas by prev_seq links
+  if every remaining message is contiguous:
     ready
   else:
     refetch or restart socket
 ```
+
+This matches the OKX contract's no-change and maintenance-reset cases. A lower
+snapshot may replace the previous epoch while explicitly recovering; an
+unsolicited lower snapshot cannot rewind a ready book. Crossed or otherwise
+invalid books independently force the same fresh-snapshot path.
 
 Book state should expose quality:
 

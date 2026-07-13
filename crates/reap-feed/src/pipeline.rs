@@ -52,6 +52,8 @@ pub struct ProcessorStats {
     pub gaps: u64,
     pub recoveries: u64,
     pub recovery_failures: u64,
+    pub sequence_resets: u64,
+    pub same_sequence_updates: u64,
     pub normalized_events: u64,
 }
 
@@ -62,6 +64,8 @@ pub struct StreamHealth {
     pub book_status: BookStatus,
     pub last_seq_id: Option<i64>,
     pub buffered_updates: usize,
+    pub sequence_resets: u64,
+    pub same_sequence_updates: u64,
     pub best_bid: Option<f64>,
     pub best_ask: Option<f64>,
 }
@@ -132,6 +136,8 @@ impl FeedProcessor {
                 book_status: state.book.status(),
                 last_seq_id: state.sequence.last_seq_id(),
                 buffered_updates: state.sequence.buffered_len(),
+                sequence_resets: state.sequence.reset_count(),
+                same_sequence_updates: state.sequence.same_sequence_count(),
                 best_bid: state.book.best(reap_core::Side::Buy).map(|level| level.px),
                 best_ask: state.book.best(reap_core::Side::Sell).map(|level| level.px),
             })
@@ -174,7 +180,20 @@ impl FeedProcessor {
         let was_recovering = state.sequence.status() == SequenceStatus::Recovering;
         let was_ready = state.sequence.status() == SequenceStatus::Ready;
         let ts_ms = update.ts_ms;
-        match state.sequence.on_update(update) {
+        let reset_count = state.sequence.reset_count();
+        let same_sequence_count = state.sequence.same_sequence_count();
+        let outcome = state.sequence.on_update(update);
+        self.stats.sequence_resets = self
+            .stats
+            .sequence_resets
+            .saturating_add(state.sequence.reset_count().saturating_sub(reset_count));
+        self.stats.same_sequence_updates = self.stats.same_sequence_updates.saturating_add(
+            state
+                .sequence
+                .same_sequence_count()
+                .saturating_sub(same_sequence_count),
+        );
+        match outcome {
             SequenceOutcome::Apply(updates) => {
                 let received_prev = updates.last().map_or(0, |update| update.prev_seq_id);
                 let received_seq = updates.last().map_or(0, |update| update.seq_id);
@@ -356,7 +375,10 @@ mod tests {
                 symbol: Some("BTC-USDT".to_string()),
                 key: EventKey::BookSequence {
                     action,
+                    prev_seq_id: prev,
                     seq_id: seq,
+                    ts_ms: seq.max(0) as u64,
+                    raw_hash: bid.to_bits(),
                 },
             },
             account_id: None,
@@ -427,5 +449,106 @@ mod tests {
                 .any(|output| matches!(output, FeedOutput::Event(_)))
         );
         assert_eq!(processor.stats().gaps, 1);
+    }
+
+    #[test]
+    fn maintenance_reset_and_same_sequence_heartbeat_remain_ready() {
+        let mut processor = FeedProcessor::new(16, 16);
+        processor.process(parsed(BookAction::Snapshot, -1, 10, 1.0));
+        processor.process(parsed(BookAction::Update, 10, 15, 1.1));
+
+        let reset = processor.process(parsed(BookAction::Update, 15, 3, 1.2));
+        let heartbeat = processor.process(parsed(BookAction::Update, 3, 3, 1.2));
+        let following = processor.process(parsed(BookAction::Update, 3, 5, 1.3));
+
+        assert!(
+            !reset
+                .iter()
+                .any(|output| matches!(output, FeedOutput::RecoveryRequired(_)))
+        );
+        assert!(
+            heartbeat
+                .iter()
+                .any(|output| matches!(output, FeedOutput::Event(_)))
+        );
+        assert!(
+            following
+                .iter()
+                .any(|output| matches!(output, FeedOutput::Event(_)))
+        );
+        assert_eq!(processor.stats().sequence_resets, 1);
+        assert_eq!(processor.stats().same_sequence_updates, 1);
+        assert_eq!(processor.stats().gaps, 0);
+        let health = processor.stream_health();
+        assert_eq!(health[0].sequence_status, SequenceStatus::Ready);
+        assert_eq!(health[0].last_seq_id, Some(5));
+    }
+
+    #[test]
+    fn conflicting_redundant_payload_forces_recovery() {
+        let mut processor = FeedProcessor::new(16, 16);
+        processor.process(parsed(BookAction::Snapshot, -1, 10, 1.0));
+        processor.process(parsed(BookAction::Update, 10, 11, 1.1));
+
+        let outputs = processor.process(parsed(BookAction::Update, 10, 11, 2.0));
+
+        assert!(
+            outputs
+                .iter()
+                .any(|output| matches!(output, FeedOutput::RecoveryRequired(_)))
+        );
+        assert_eq!(processor.stats().duplicates, 0);
+        assert_eq!(processor.stats().gaps, 1);
+        assert_eq!(
+            processor.stream_health()[0].sequence_status,
+            SequenceStatus::Recovering
+        );
+    }
+
+    #[test]
+    fn conflicting_redundant_snapshot_forces_recovery() {
+        let mut processor = FeedProcessor::new(16, 16);
+        processor.process(parsed(BookAction::Snapshot, -1, 10, 1.0));
+
+        let outputs = processor.process(parsed(BookAction::Snapshot, -1, 10, 2.0));
+
+        assert!(
+            outputs
+                .iter()
+                .any(|output| matches!(output, FeedOutput::RecoveryRequired(_)))
+        );
+        assert_eq!(processor.stats().duplicates, 0);
+        assert_eq!(processor.stats().gaps, 1);
+        assert_eq!(
+            processor.stream_health()[0].sequence_status,
+            SequenceStatus::Recovering
+        );
+    }
+
+    #[test]
+    fn conflicting_replicas_during_gap_cannot_be_collapsed_on_snapshot() {
+        let mut processor = FeedProcessor::new(16, 16);
+        processor.process(parsed(BookAction::Snapshot, -1, 10, 1.0));
+        processor.process(parsed(BookAction::Update, 11, 12, 1.1));
+        processor.process(parsed(BookAction::Update, 11, 12, 2.0));
+
+        let outputs = processor.process(parsed(BookAction::Snapshot, -1, 11, 1.5));
+
+        assert!(
+            outputs
+                .iter()
+                .any(|output| matches!(output, FeedOutput::RecoveryRequired(_)))
+        );
+        assert!(
+            !outputs
+                .iter()
+                .any(|output| matches!(output, FeedOutput::Event(_)))
+        );
+        assert_eq!(processor.stats().duplicates, 0);
+        assert_eq!(processor.stats().gaps, 1);
+        assert_eq!(
+            processor.stream_health()[0].sequence_status,
+            SequenceStatus::Recovering
+        );
     }
 }
