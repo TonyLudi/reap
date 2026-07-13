@@ -90,6 +90,9 @@ cancel_latency_ms = 0
 order_update_latency_ms = 0
 fill_account_latency_ms = 0
 depth_fill_conservative_threshold = 0.0001
+queue_ahead_multiplier = 1.0
+historical_trade_fill_fraction = 1.0
+displayed_depth_fill_fraction = 1.0
 ```
 
 Raw replay orders the local event loop by persisted `recv_ts_ns`; CSV and
@@ -114,6 +117,17 @@ a resting sell needs bid at least `order_px * (1 + threshold)`, while a resting
 buy needs ask at most `order_px * (1 - threshold)`. A shallower cross clears
 queue-ahead without filling. Zero latency and an inherited threshold preserve
 parity scaffolding but cannot support a capital decision.
+
+The three capacity controls default to Java-parity assumptions: exact displayed
+queue, all historical trade quantity, and all displayed depth. For conservative
+sensitivity runs, increase `queue_ahead_multiplier` and reduce either fill
+fraction. These are global deterministic haircuts, not a reconstruction of
+exchange queue priority, hidden liquidity, cancellation flow, or competing
+orders. Haircutted displayed capacity is shared across matching actions; an
+unchanged depth image does not replenish it, while new levels and displayed
+size increases add capacity. Keep `calibrated = false` until representative
+private order traces and full-depth captures justify per-venue and
+per-instrument values.
 
 For every run, also inspect `fee_cost_usd`, `funding_pnl_usd`,
 `turnover_usd`, `funding_rate_events`, and `accounting_complete`. Funding uses
@@ -196,15 +210,17 @@ file reported 3,958 normalized inputs, three cross-socket writer-order clock
 regressions (maximum 148,017 ns), 14 exchange activations, 10 effective
 cancellations, four live quotes at the capture horizon, and no pending scheduled
 order actions under the explicit uncalibrated zero-delay configuration with the
-pinned Java `0.0001` depth threshold. The two funding-rate updates produced one
-scheduled funding action beyond the dataset horizon; no fee, turnover, funding
-settlement, or funding PnL was generated, and accounting was complete through
-the observed interval. An uncalibrated sensitivity pass using 2 ms market,
+pinned Java `0.0001` depth threshold and 100% capacity fractions. The two
+funding-rate updates produced one scheduled funding action beyond the dataset
+horizon; no fee, turnover, funding settlement, or funding PnL was generated,
+and accounting was complete through the observed interval. An uncalibrated
+sensitivity pass using 2 ms market,
 20 ms entry, 15 ms cancel, 25 ms order-update, and 50 ms fill/account delays
-kept the same no-fill result and exposed three delayed strategy events plus the
-future funding action beyond the capture horizon. This short, fill-free run
-validates scheduling/provenance only; it cannot calibrate any latency or fill
-assumption.
+plus 2x queue-ahead, 25% historical-trade participation, and 50% displayed-depth
+capacity kept the same no-fill result and exposed three delayed strategy events
+plus the future funding action beyond the capture horizon. This short,
+fill-free run validates scheduling/provenance and assumption propagation only;
+it cannot calibrate any latency or fill assumption.
 
 These are connectivity, integrity, and replay-plumbing evidence only. They are
 not a sustained full-depth dataset, execution-model calibration, profitability

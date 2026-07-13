@@ -8,39 +8,74 @@ use reap_core::{
 use reap_order::OrderReducer;
 use reap_strategy::InstrumentConfig;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct MatchingAssumptions {
+    pub(crate) depth_fill_conservative_threshold: f64,
+    pub(crate) queue_ahead_multiplier: f64,
+    pub(crate) historical_trade_fill_fraction: f64,
+    pub(crate) displayed_depth_fill_fraction: f64,
+}
+
+impl Default for MatchingAssumptions {
+    fn default() -> Self {
+        Self {
+            depth_fill_conservative_threshold: 0.0,
+            queue_ahead_multiplier: 1.0,
+            historical_trade_fill_fraction: 1.0,
+            displayed_depth_fill_fraction: 1.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MatchingEngine {
     symbol: Symbol,
     instrument: InstrumentConfig,
     book: BookReducer,
+    // Shared simulated liquidity budget, kept separate from observed market state.
+    matching_depth: BookReducer,
     orders: OrderReducer,
     meta: HashMap<String, MatchingMeta>,
     next_order_id: u64,
     next_seq: u64,
     px_threshold: f64,
-    depth_fill_conservative_threshold: f64,
+    assumptions: MatchingAssumptions,
     now_ms: u64,
 }
 
 impl MatchingEngine {
     pub fn new(instrument: InstrumentConfig) -> Self {
-        Self::with_depth_fill_conservative_threshold(instrument, 0.0)
+        Self::with_assumptions(instrument, MatchingAssumptions::default())
     }
 
     pub fn with_depth_fill_conservative_threshold(
         instrument: InstrumentConfig,
         depth_fill_conservative_threshold: f64,
     ) -> Self {
+        Self::with_assumptions(
+            instrument,
+            MatchingAssumptions {
+                depth_fill_conservative_threshold,
+                ..MatchingAssumptions::default()
+            },
+        )
+    }
+
+    pub(crate) fn with_assumptions(
+        instrument: InstrumentConfig,
+        assumptions: MatchingAssumptions,
+    ) -> Self {
         Self {
             symbol: instrument.symbol.clone(),
             px_threshold: instrument.tick_size * 0.1,
             book: BookReducer::new(instrument.symbol.clone()),
+            matching_depth: BookReducer::new(instrument.symbol.clone()),
             instrument,
             orders: OrderReducer::new(),
             meta: HashMap::new(),
             next_order_id: 1,
             next_seq: 1,
-            depth_fill_conservative_threshold,
+            assumptions,
             now_ms: 0,
         }
     }
@@ -202,7 +237,9 @@ impl MatchingEngine {
 
     pub fn on_depth_at(&mut self, depth: OrderBook, ts_ms: u64) -> Vec<OrderUpdate> {
         self.now_ms = ts_ms;
+        let matching_depth = self.next_matching_depth(&depth);
         self.book.apply_snapshot(depth);
+        self.matching_depth.apply_snapshot(matching_depth);
         self.match_live_orders_on_depth()
     }
 
@@ -225,7 +262,7 @@ impl MatchingEngine {
     ) -> Vec<OrderUpdate> {
         self.now_ms = simulation_ts_ms;
         let maker_side = taker_side.reverse();
-        let mut qty_remaining = qty;
+        let mut qty_remaining = qty * self.assumptions.historical_trade_fill_fraction;
         let order_ids = self.priority_order_ids(maker_side);
         let mut updates = Vec::new();
 
@@ -287,55 +324,43 @@ impl MatchingEngine {
 
     fn match_live_side_on_depth(&mut self, maker_side: Side) -> Vec<OrderUpdate> {
         let market_side = maker_side.reverse();
-        let mut market_levels = self.book.levels(market_side).to_vec();
         let mut updates = Vec::new();
 
         for order_id in self.priority_order_ids(maker_side) {
-            for level in &mut market_levels {
-                if level.qty <= 0.0 {
-                    continue;
-                }
-                let Some((order_price, open_qty)) = self
-                    .orders
-                    .get(&order_id)
-                    .map(|order| (order.price, order.open_qty))
-                else {
-                    break;
-                };
-                if !market_side.crosses(level.px, order_price) {
-                    break;
-                }
-                if let Some(meta) = self.meta.get_mut(&order_id) {
-                    meta.qty_ahead = 0.0;
-                }
-                if !crosses_with_threshold(
-                    market_side,
-                    order_price,
-                    level.px,
-                    self.depth_fill_conservative_threshold,
-                ) {
-                    break;
-                }
+            let Some((order_price, open_qty)) = self
+                .orders
+                .get(&order_id)
+                .map(|order| (order.price, order.open_qty))
+            else {
+                continue;
+            };
+            let crosses_observed_depth = self
+                .book
+                .best(market_side)
+                .is_some_and(|level| market_side.crosses(level.px, order_price));
+            if !crosses_observed_depth {
+                break;
+            }
+            if let Some(meta) = self.meta.get_mut(&order_id) {
+                meta.qty_ahead = 0.0;
+            }
 
-                let fill_qty = open_qty.min(level.qty);
-                if fill_qty <= 0.0 {
-                    break;
-                }
-                level.qty -= fill_qty;
+            let threshold = self.assumptions.depth_fill_conservative_threshold;
+            let matching_limit = match maker_side {
+                Side::Buy => order_price * (1.0 - threshold),
+                Side::Sell => order_price * (1.0 + threshold),
+            };
+            for fill in self
+                .matching_depth
+                .take_liquidity(maker_side, matching_limit, open_qty)
+            {
                 updates.extend(self.orders.fill(
                     &order_id,
                     self.now_ms,
-                    fill_qty,
+                    fill.qty,
                     order_price,
                     FillLiquidity::Maker,
                 ));
-                if self
-                    .orders
-                    .get(&order_id)
-                    .is_none_or(|order| order.open_qty <= 0.0)
-                {
-                    break;
-                }
             }
         }
         updates
@@ -345,7 +370,7 @@ impl MatchingEngine {
         let Some(order) = self.orders.get(order_id).cloned() else {
             return Vec::new();
         };
-        self.book
+        self.matching_depth
             .take_liquidity(order.side, order.price, order.open_qty)
             .into_iter()
             .filter_map(|fill| {
@@ -391,7 +416,8 @@ impl MatchingEngine {
                     None
                 }
             })
-            .unwrap_or(0.0);
+            .unwrap_or(0.0)
+            * self.assumptions.queue_ahead_multiplier;
         if let Some(meta) = self.meta.get_mut(order_id) {
             meta.qty_ahead = qty_ahead;
         }
@@ -401,6 +427,31 @@ impl MatchingEngine {
         self.book
             .best(order.side.reverse())
             .is_some_and(|level| order.side.crosses(order.price, level.px))
+    }
+
+    fn next_matching_depth(&self, depth: &OrderBook) -> OrderBook {
+        let fraction = self.assumptions.displayed_depth_fill_fraction;
+        if fraction == 1.0 {
+            return depth.clone();
+        }
+        OrderBook {
+            symbol: depth.symbol.clone(),
+            ts_ms: depth.ts_ms,
+            bids: capacity_levels(
+                &depth.bids,
+                self.book.levels(Side::Buy),
+                self.matching_depth.levels(Side::Buy),
+                fraction,
+                self.px_threshold,
+            ),
+            asks: capacity_levels(
+                &depth.asks,
+                self.book.levels(Side::Sell),
+                self.matching_depth.levels(Side::Sell),
+                fraction,
+                self.px_threshold,
+            ),
+        }
     }
 
     fn priority_order_ids(&self, side: Side) -> Vec<String> {
@@ -449,16 +500,36 @@ fn approx_eq(a: f64, b: f64, threshold: f64) -> bool {
     (a - b).abs() <= threshold
 }
 
-fn crosses_with_threshold(
-    taker_side: Side,
-    maker_px: Price,
-    taker_px: Price,
-    threshold: f64,
-) -> bool {
-    match taker_side {
-        Side::Buy => taker_px >= maker_px * (1.0 + threshold),
-        Side::Sell => taker_px <= maker_px * (1.0 - threshold),
-    }
+fn capacity_levels(
+    current: &[Level],
+    previous: &[Level],
+    remaining: &[Level],
+    fraction: f64,
+    px_threshold: f64,
+) -> Vec<Level> {
+    current
+        .iter()
+        .filter_map(|level| {
+            let previous_qty = previous
+                .iter()
+                .find(|candidate| approx_eq(candidate.px, level.px, px_threshold))
+                .map(|candidate| candidate.qty);
+            let remaining_qty = remaining
+                .iter()
+                .find(|candidate| approx_eq(candidate.px, level.px, px_threshold))
+                .map(|candidate| candidate.qty)
+                .unwrap_or(0.0);
+            let capacity = match previous_qty {
+                Some(previous_qty) if level.qty > previous_qty => {
+                    remaining_qty + (level.qty - previous_qty) * fraction
+                }
+                Some(_) => remaining_qty,
+                None => level.qty * fraction,
+            }
+            .min(level.qty * fraction);
+            (capacity > 0.0).then_some(Level::new(level.px, capacity))
+        })
+        .collect()
 }
 
 #[allow(dead_code)]
@@ -746,5 +817,193 @@ mod tests {
         assert_eq!(updates[0].event, OrderEvent::FullyFilled);
         assert_eq!(updates[0].side, Side::Sell);
         assert_eq!(updates[0].last_fill_liquidity, Some(FillLiquidity::Maker));
+    }
+
+    #[test]
+    fn queue_multiplier_requires_more_trade_volume_before_a_fill() {
+        let mut engine = MatchingEngine::with_assumptions(
+            inst(),
+            MatchingAssumptions {
+                queue_ahead_multiplier: 2.0,
+                ..MatchingAssumptions::default()
+            },
+        );
+        engine.on_depth(OrderBook::one_level(
+            "BTC-USDT",
+            1,
+            level(100.0, 1.0),
+            level(101.0, 1.0),
+        ));
+        engine.submit(NewOrder {
+            symbol: "BTC-USDT".to_string(),
+            side: Side::Buy,
+            qty: 0.5,
+            price: 100.0,
+            time_in_force: TimeInForce::PostOnly,
+            reduce_only: false,
+            self_trade_prevention: None,
+            reason: "quote".to_string(),
+        });
+
+        let updates = engine.on_trade(2, 100.0, 2.25, Side::Sell);
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].event, OrderEvent::PartialFill);
+        assert_eq!(updates[0].last_fill_qty, 0.25);
+        assert_eq!(updates[0].open_qty, 0.25);
+    }
+
+    #[test]
+    fn historical_trade_fraction_reduces_queue_consumption_and_fill() {
+        let mut engine = MatchingEngine::with_assumptions(
+            inst(),
+            MatchingAssumptions {
+                historical_trade_fill_fraction: 0.25,
+                ..MatchingAssumptions::default()
+            },
+        );
+        engine.on_depth(OrderBook::one_level(
+            "BTC-USDT",
+            1,
+            level(100.0, 1.0),
+            level(101.0, 1.0),
+        ));
+        engine.submit(NewOrder {
+            symbol: "BTC-USDT".to_string(),
+            side: Side::Buy,
+            qty: 0.5,
+            price: 99.5,
+            time_in_force: TimeInForce::PostOnly,
+            reduce_only: false,
+            self_trade_prevention: None,
+            reason: "quote".to_string(),
+        });
+
+        let updates = engine.on_trade(2, 99.5, 1.0, Side::Sell);
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].event, OrderEvent::PartialFill);
+        assert_eq!(updates[0].last_fill_qty, 0.25);
+        assert_eq!(updates[0].open_qty, 0.25);
+    }
+
+    #[test]
+    fn displayed_depth_fraction_caps_taker_fill_per_level() {
+        let mut engine = MatchingEngine::with_assumptions(
+            inst(),
+            MatchingAssumptions {
+                displayed_depth_fill_fraction: 0.5,
+                ..MatchingAssumptions::default()
+            },
+        );
+        engine.on_depth(OrderBook {
+            symbol: "BTC-USDT".to_string(),
+            ts_ms: 1,
+            bids: vec![level(100.0, 1.0)],
+            asks: vec![level(101.0, 1.0), level(102.0, 1.0)],
+        });
+
+        let updates = engine.submit(NewOrder {
+            symbol: "BTC-USDT".to_string(),
+            side: Side::Buy,
+            qty: 1.0,
+            price: 102.0,
+            time_in_force: TimeInForce::Ioc,
+            reduce_only: false,
+            self_trade_prevention: None,
+            reason: "hedge".to_string(),
+        });
+
+        assert_eq!(updates.len(), 3);
+        assert_eq!(updates[1].event, OrderEvent::PartialFill);
+        assert_eq!(updates[1].last_fill_qty, 0.5);
+        assert_eq!(updates[1].last_fill_price, 101.0);
+        assert_eq!(updates[2].event, OrderEvent::FullyFilled);
+        assert_eq!(updates[2].last_fill_qty, 0.5);
+        assert_eq!(updates[2].last_fill_price, 102.0);
+        assert_eq!(updates[2].avg_fill_price, 101.5);
+    }
+
+    #[test]
+    fn unchanged_depth_does_not_replenish_fractional_capacity() {
+        let mut engine = MatchingEngine::with_assumptions(
+            inst(),
+            MatchingAssumptions {
+                displayed_depth_fill_fraction: 0.5,
+                ..MatchingAssumptions::default()
+            },
+        );
+        let depth = OrderBook::one_level("BTC-USDT", 1, level(100.0, 1.0), level(101.0, 1.0));
+        engine.on_depth(depth.clone());
+        let ioc = NewOrder {
+            symbol: "BTC-USDT".to_string(),
+            side: Side::Buy,
+            qty: 1.0,
+            price: 101.0,
+            time_in_force: TimeInForce::Ioc,
+            reduce_only: false,
+            self_trade_prevention: None,
+            reason: "hedge".to_string(),
+        };
+
+        let first = engine.submit(ioc.clone());
+        let second = engine.submit(ioc.clone());
+        engine.on_depth_at(depth.clone(), 2);
+        let after_unchanged_snapshot = engine.submit(ioc.clone());
+        engine.on_depth_at(
+            OrderBook::one_level("BTC-USDT", 3, level(100.0, 1.0), level(101.0, 2.0)),
+            3,
+        );
+        let after_size_increase = engine.submit(ioc);
+
+        assert_eq!(first[1].event, OrderEvent::PartialFill);
+        assert_eq!(first[1].last_fill_qty, 0.5);
+        assert_eq!(second.len(), 2);
+        assert_eq!(second[1].event, OrderEvent::Cancelled);
+        assert_eq!(second[1].filled_qty, 0.0);
+        assert_eq!(after_unchanged_snapshot.len(), 2);
+        assert_eq!(after_unchanged_snapshot[1].event, OrderEvent::Cancelled);
+        assert_eq!(after_unchanged_snapshot[1].filled_qty, 0.0);
+        assert_eq!(after_size_increase[1].event, OrderEvent::PartialFill);
+        assert_eq!(after_size_increase[1].last_fill_qty, 0.5);
+    }
+
+    #[test]
+    fn displayed_depth_fraction_caps_resting_depth_fill() {
+        let mut engine = MatchingEngine::with_assumptions(
+            inst(),
+            MatchingAssumptions {
+                displayed_depth_fill_fraction: 0.25,
+                ..MatchingAssumptions::default()
+            },
+        );
+        engine.on_depth(OrderBook::one_level(
+            "BTC-USDT",
+            1,
+            level(98.0, 1.0),
+            level(101.0, 1.0),
+        ));
+        engine.submit(NewOrder {
+            symbol: "BTC-USDT".to_string(),
+            side: Side::Buy,
+            qty: 1.0,
+            price: 100.0,
+            time_in_force: TimeInForce::PostOnly,
+            reduce_only: false,
+            self_trade_prevention: None,
+            reason: "quote".to_string(),
+        });
+
+        let updates = engine.on_depth(OrderBook::one_level(
+            "BTC-USDT",
+            2,
+            level(98.0, 1.0),
+            level(99.0, 1.0),
+        ));
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].event, OrderEvent::PartialFill);
+        assert_eq!(updates[0].last_fill_qty, 0.25);
+        assert_eq!(updates[0].open_qty, 0.75);
     }
 }

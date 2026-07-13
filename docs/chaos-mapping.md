@@ -86,11 +86,12 @@ The Rust scheduler was cross-checked against the pinned Java
 | Per-instrument maker/taker fee map | Maker/taker fee fields on each Rust instrument | Equivalent |
 | Separate market depth/quote/trade delays | One global `market_data_latency_ms`, with raw replay ordered by persisted receive time | Partial; class- and instrument-specific distributions remain calibration work |
 | Conservative depth-fill threshold and queue reset on a shallow cross | `depth_fill_conservative_threshold`; basic cross clears queue-ahead and threshold cross controls displayed-depth fill | Exact formula and pinned Java application default; empirical calibration remains required |
+| Exact displayed queue and full historical trade/depth capacity | `queue_ahead_multiplier`, `historical_trade_fill_fraction`, and `displayed_depth_fill_fraction` | `1.0` preserves Java parity; conservative Rust sensitivity overlays are intentional and require empirical calibration |
 
-Zero-delay fixture compatibility is intentional, but it is optimistic evidence,
-not a calibrated execution claim. Backtest reports retain the effective delay
-configuration, local time basis, clock regressions, active orders, and scheduled
-work left at the capture horizon.
+Zero-delay and full-capacity fixture compatibility is intentional, but it is
+optimistic evidence, not a calibrated execution claim. Backtest reports retain
+the effective delay/capacity configuration, local time basis, clock regressions,
+active orders, and scheduled work left at the capture horizon.
 
 ## One-Symbol Topology
 

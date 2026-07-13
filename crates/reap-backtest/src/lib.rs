@@ -4,6 +4,7 @@ mod portfolio;
 mod replay;
 
 pub use execution::{BacktestConfig, BacktestExecutionConfig, BacktestTimeBasis};
+use matching::MatchingAssumptions;
 pub use matching::MatchingEngine;
 pub use replay::{
     ReplayRow, TimedReplayEvent, load_events_from_path, load_normalized_jsonl,
@@ -143,17 +144,19 @@ impl BacktestRunner {
         execution: BacktestExecutionConfig,
     ) -> Result<Self> {
         execution.validate()?;
-        let depth_fill_conservative_threshold = execution.depth_fill_conservative_threshold;
+        let matching_assumptions = MatchingAssumptions {
+            depth_fill_conservative_threshold: execution.depth_fill_conservative_threshold,
+            queue_ahead_multiplier: execution.queue_ahead_multiplier,
+            historical_trade_fill_fraction: execution.historical_trade_fill_fraction,
+            displayed_depth_fill_fraction: execution.displayed_depth_fill_fraction,
+        };
         let matchers = config
             .instruments
             .iter()
             .map(|inst| {
                 (
                     inst.symbol.clone(),
-                    MatchingEngine::with_depth_fill_conservative_threshold(
-                        inst.clone(),
-                        depth_fill_conservative_threshold,
-                    ),
+                    MatchingEngine::with_assumptions(inst.clone(), matching_assumptions),
                 )
             })
             .collect();

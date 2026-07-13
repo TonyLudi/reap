@@ -112,6 +112,8 @@ architecture in [docs/architecture.md](docs/architecture.md).
   `PendingNew` registration, and end-of-horizon execution provenance.
 - [x] Port Java's conservative displayed-depth fill threshold, including its
   shallow-cross queue-ahead reset semantics and application default.
+- [x] Add reportable queue-ahead, historical-trade participation, and
+  displayed-depth capacity controls for conservative execution sensitivity.
 - [x] Attribute fill fees/turnover and port signed linear/inverse swap funding
   settlement with mark fallback, late/missed coverage signals, and explicit
   end-of-horizon funding actions.

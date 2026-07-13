@@ -17,6 +17,11 @@ order_update_latency_ms = 0
 fill_account_latency_ms = 0
 # Pinned Java backtest application default; conservative, not calibrated.
 depth_fill_conservative_threshold = 0.0001
+# Java-parity capacity defaults. Stress with >1 queue and <1 fill fractions;
+# keep calibrated=false until representative order traces support the values.
+queue_ahead_multiplier = 1.0
+historical_trade_fill_fraction = 1.0
+displayed_depth_fill_fraction = 1.0
 
 [[risk_groups]]
 name = "main"
