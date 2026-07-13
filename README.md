@@ -51,7 +51,8 @@ Implemented:
 - CSV/normalized replay, raw-capture validation, configuration validation, and
   a release-mode hot-path benchmark.
 - Credential-free public OKX capture with redundant websocket plans, raw-frame
-  durability, normalized diagnostic output, and direct raw-capture backtests.
+  durability, exact SHA/config provenance, bounded-memory capture analysis,
+  normalized diagnostic output, and direct raw-capture backtests.
 
 Run the sample:
 
@@ -95,6 +96,9 @@ concatenated session IDs rather than treating downtime as continuous data.
 Capture refuses an existing raw or normalized path instead of appending:
 
 ```bash
+cargo run -p reap-cli -- analyze-capture \
+  --config examples/capture-okx-public.toml \
+  --events "$RAW_PATH" --strict --pretty
 cargo run -p reap-cli -- replay-check \
   --events "$RAW_PATH" --strict --pretty
 cargo run -p reap-cli -- backtest \

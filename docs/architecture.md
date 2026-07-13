@@ -411,9 +411,13 @@ Responsibilities:
 - Persist every received raw frame through a bounded lossless writer.
 - Stamp every frame with a process-session identity so replay cannot hide
   capture downtime.
+- Fingerprint the effective capture config and exact persisted bytes.
 - Optionally persist deduplicated normalized events for short diagnostics.
 - Report connection readiness, queue high-water marks, parser failures,
   duplicates, gaps, recoveries, and final book health.
+- Stream raw files through the live adapter/reducer path to measure configured
+  source coverage, receive/exchange timing, depth, spread, movement, and trade
+  distributions without retaining the dataset in memory.
 
 Long-running collection uses raw JSONL as the canonical format. Backtest raw
 replay reconstructs full books through the same adapter, deduplication,
@@ -470,13 +474,14 @@ reap emergency-cancel --config config/live.toml --account account-id
 reap operator --config config/live.toml status
 reap backtest --config config/backtest.toml --events data/events.jsonl
 reap replay-check --events data/events.jsonl
+reap analyze-capture --config config/capture.toml --events data/events.jsonl
 reap inspect-book --capture raw/ws.jsonl --symbol BTC-USDT
 reap config-check --config config/live.toml
 ```
 
-`live`, `capture`, `emergency-cancel`, `operator`, `backtest`, `replay-check`, and
-`config-check` are implemented. `inspect-book` remains planned; see
-[trading-readiness.md](trading-readiness.md).
+`live`, `capture`, `emergency-cancel`, `operator`, `backtest`, `replay-check`,
+`analyze-capture`, and `config-check` are implemented. `inspect-book` remains
+planned; see [trading-readiness.md](trading-readiness.md).
 
 ## Multi-Websocket Design
 

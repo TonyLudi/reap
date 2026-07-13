@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use reap_backtest::BacktestRunner;
-use reap_capture::{CaptureConfig, CaptureRunOptions, run_capture};
+use reap_capture::{CaptureConfig, CaptureRunOptions, analyze_capture_path, run_capture};
 use reap_live::{
     EmergencyCancelOptions, LiveConfig, LiveMode, LiveRunOptions, OperatorCommand,
     run_emergency_cancel_path, send_operator_command,
@@ -33,6 +33,16 @@ enum Command {
     },
     ReplayCheck {
         #[arg(short, long)]
+        events: PathBuf,
+        #[arg(long)]
+        strict: bool,
+        #[arg(long)]
+        pretty: bool,
+    },
+    AnalyzeCapture {
+        #[arg(short, long)]
+        config: PathBuf,
+        #[arg(short = 'e', long)]
         events: PathBuf,
         #[arg(long)]
         strict: bool,
@@ -259,6 +269,25 @@ async fn main() -> Result<()> {
             }
             if strict && !report.is_healthy() {
                 anyhow::bail!("raw replay check failed");
+            }
+        }
+        Command::AnalyzeCapture {
+            config,
+            events,
+            strict,
+            pretty,
+        } => {
+            let config = CaptureConfig::load(&config)
+                .with_context(|| format!("failed to load capture config {}", config.display()))?;
+            let report = analyze_capture_path(&events, &config)
+                .with_context(|| format!("failed to analyze raw capture {}", events.display()))?;
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+            if strict && !report.integrity_healthy {
+                anyhow::bail!("capture analysis failed integrity invariants");
             }
         }
         Command::ConfigCheck { config, pretty } => {

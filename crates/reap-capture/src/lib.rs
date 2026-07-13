@@ -1,3 +1,5 @@
+mod analysis;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,11 +17,14 @@ use reap_feed::{
 use reap_venue::{VenueAdapter, VenueError, okx::OkxAdapter};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use url::Url;
+
+pub use analysis::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaptureConfig {
@@ -162,6 +167,7 @@ pub struct CaptureBookHealth {
 pub struct CaptureRunReport {
     pub format_version: u16,
     pub capture_session_id: String,
+    pub config_fingerprint: String,
     pub stop_reason: CaptureStopReason,
     pub elapsed_ms: u64,
     pub raw_path: PathBuf,
@@ -170,6 +176,8 @@ pub struct CaptureRunReport {
     pub normalized_records: u64,
     pub raw_bytes: u64,
     pub normalized_bytes: u64,
+    pub raw_sha256: String,
+    pub normalized_sha256: Option<String>,
     pub max_raw_queue_depth: usize,
     pub max_normalized_queue_depth: usize,
     pub parsed_events: u64,
@@ -241,6 +249,10 @@ impl CaptureConfig {
         let config: Self = toml::from_str(text)?;
         config.ensure_valid()?;
         Ok(config)
+    }
+
+    pub fn fingerprint(&self) -> Result<String, CaptureError> {
+        Ok(sha256_hex(&serde_json::to_vec(self)?))
     }
 
     pub fn ensure_valid(&self) -> Result<(), CaptureError> {
@@ -435,6 +447,7 @@ pub async fn run_capture(
     options: CaptureRunOptions,
 ) -> Result<CaptureRunReport, CaptureError> {
     config.ensure_valid()?;
+    let config_fingerprint = config.fingerprint()?;
     if options
         .run_duration
         .is_some_and(|duration| duration.is_zero())
@@ -537,6 +550,7 @@ pub async fn run_capture(
         stop_reason,
         elapsed_ms(&started),
         &config,
+        config_fingerprint,
         raw_stats,
         normalized_stats,
     ))
@@ -752,6 +766,7 @@ impl CaptureState {
         stop_reason: CaptureStopReason,
         elapsed_ms: u64,
         config: &CaptureConfig,
+        config_fingerprint: String,
         raw: JsonlWriterStats,
         normalized: JsonlWriterStats,
     ) -> CaptureRunReport {
@@ -816,8 +831,9 @@ impl CaptureState {
             && processor.recovery_failures == 0;
 
         CaptureRunReport {
-            format_version: 1,
+            format_version: 2,
             capture_session_id: self.capture_session_id.clone(),
+            config_fingerprint,
             stop_reason,
             elapsed_ms,
             raw_path: config.output.raw_path.clone(),
@@ -826,6 +842,12 @@ impl CaptureState {
             normalized_records: normalized.records,
             raw_bytes: raw.bytes,
             normalized_bytes: normalized.bytes,
+            raw_sha256: raw.sha256,
+            normalized_sha256: config
+                .output
+                .normalized_path
+                .as_ref()
+                .map(|_| normalized.sha256),
             max_raw_queue_depth: raw.max_queue_depth,
             max_normalized_queue_depth: normalized.max_queue_depth,
             parsed_events: processor.parsed,
@@ -864,17 +886,18 @@ fn raw_capture(envelope: &RawEnvelope, capture_session_id: &str) -> RawCapture {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct JsonlWriterStats {
     records: u64,
     bytes: u64,
     max_queue_depth: usize,
+    sha256: String,
 }
 
 struct JsonlWriter<T> {
     name: &'static str,
     sender: Option<mpsc::Sender<T>>,
-    task: JoinHandle<Result<(), CaptureError>>,
+    task: JoinHandle<Result<String, CaptureError>>,
     queued: Arc<AtomicUsize>,
     max_queue_depth: Arc<AtomicUsize>,
     records: Arc<AtomicU64>,
@@ -946,11 +969,12 @@ where
 
     async fn shutdown(mut self) -> Result<JsonlWriterStats, CaptureError> {
         drop(self.sender.take());
-        self.task.await??;
+        let sha256 = self.task.await??;
         Ok(JsonlWriterStats {
             records: self.records.load(Ordering::Relaxed),
             bytes: self.bytes.load(Ordering::Relaxed),
             max_queue_depth: self.max_queue_depth.load(Ordering::Relaxed),
+            sha256,
         })
     }
 }
@@ -963,18 +987,20 @@ async fn run_jsonl_writer<T>(
     queued: Arc<AtomicUsize>,
     records: Arc<AtomicU64>,
     bytes: Arc<AtomicU64>,
-) -> Result<(), CaptureError>
+) -> Result<String, CaptureError>
 where
     T: Serialize,
 {
     let flush_every_records = flush_every_records.max(1);
     let mut writer = BufWriter::new(file);
+    let mut hasher = Sha256::new();
     let mut since_flush = 0_usize;
     let mut since_sync = 0_usize;
     while let Some(value) = receiver.recv().await {
         let mut line = serde_json::to_vec(&value)?;
         line.push(b'\n');
         writer.write_all(&line).await?;
+        hasher.update(&line);
         queued.fetch_sub(1, Ordering::Relaxed);
         records.fetch_add(1, Ordering::Relaxed);
         bytes.fetch_add(line.len() as u64, Ordering::Relaxed);
@@ -994,7 +1020,21 @@ where
     if fsync_every_records > 0 && since_sync > 0 {
         writer.get_ref().sync_data().await?;
     }
-    Ok(())
+    Ok(digest_hex(hasher.finalize()))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    digest_hex(hasher.finalize())
+}
+
+fn digest_hex(bytes: impl AsRef<[u8]>) -> String {
+    bytes
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn unix_time_ms() -> u64 {
@@ -1179,10 +1219,12 @@ mod tests {
             CaptureStopReason::DurationElapsed,
             1,
             &config,
+            config.fingerprint().unwrap(),
             JsonlWriterStats {
                 records: 1,
                 bytes: 1,
                 max_queue_depth: 1,
+                sha256: "0".repeat(64),
             },
             JsonlWriterStats::default(),
         );
@@ -1209,10 +1251,12 @@ mod tests {
         writer.send(event).await.unwrap();
         let stats = writer.shutdown().await.unwrap();
         assert_eq!(stats.records, 1);
+        assert_eq!(stats.sha256.len(), 64);
 
         let text = std::fs::read_to_string(path).unwrap();
         let decoded: NormalizedEvent = serde_json::from_str(text.trim()).unwrap();
         assert_eq!(decoded.ts_ms(), 1);
+        assert_eq!(stats.sha256, sha256_hex(text.as_bytes()));
     }
 
     #[tokio::test]

@@ -57,9 +57,18 @@ recovery-route, or recovery-failure counts. A redundant-socket disconnect can
 remain clean only when the other replica preserves sequence continuity;
 inspect disconnect, duplicate, and writer queue counts on every run.
 
+The versioned run report includes the effective config fingerprint and SHA-256
+of the exact bytes emitted by each writer. Archive that report with the capture
+manifest. `analyze-capture` independently hashes the input and fingerprints the
+provided config after applying the input path override, so both values must
+match the original run report.
+
 Validate and consume the output directly:
 
 ```bash
+cargo run -p reap-cli -- analyze-capture \
+  --config examples/capture-okx-public.toml \
+  --events "$RAW_PATH" --strict --pretty
 cargo run -p reap-cli -- replay-check \
   --events "$RAW_PATH" --strict --pretty
 cargo run -p reap-cli -- backtest \
@@ -67,6 +76,19 @@ cargo run -p reap-cli -- backtest \
   --data "$RAW_PATH" \
   --format raw-capture --pretty
 ```
+
+Strict analysis requires one capture session, every configured stream on its
+configured number of source connections, a ready book for every configured
+book stream, no unexpected data stream, monotonic per-source receive time, and
+no parse, sequence, or unrecovered-book defect. It reports
+receive and exchange cadence, signed receive-minus-exchange delay, book depth,
+spread, absolute midpoint movement, trade quantity, and price-times-quantity.
+Quantiles use a deterministic 8,192-value reservoir per metric; counts, means,
+and bounds cover every finite sample. Signed receive delay includes host clock
+skew and scheduling and is not websocket latency or order round-trip time.
+For derivatives, price-times-quantity is in contract units and is not USD
+notional without instrument metadata. Integrity success does not establish
+dataset duration, execution calibration, or strategy profitability.
 
 Run capture under a disk-capacity supervisor. JSONL is currently uncompressed
 and can grow quickly; rotate on every process start and before the filesystem
@@ -100,6 +122,19 @@ zero gaps, recoveries, parse errors, stale books, or disconnects. Strict replay
 reproduced both ready books with no errors, and raw-capture backtest replay
 completed with 16 simulated orders and no fills. The raw SHA-256 was
 `f8e4ab61946c113162263733f35c42329d6120712e2b1ee66afbb616cdbb9453`.
+
+After adding provenance and analysis, a fresh 60-second run on 2026-07-13
+reached and retained all 14 socket plans, wrote 5,633 frames (4,311,684 bytes),
+accepted 2,822 events, classified 2,811 replica duplicates, and reported a raw
+writer queue high-water mark of 22. Capture, strict analysis, and strict replay
+reported zero gaps, recoveries, recovery failures, parse errors, stale books,
+disconnects, or unrecovered books. Analysis observed both configured sources
+for every one of the ten streams and reconstructed 400 bid and ask levels for
+both books. Writer, analyzer, and independent SHA-256 values matched at
+`0054cd3daf322cecd03c08e6e5d93ce8051534d1cc8a4ed128f58801645109b8`;
+capture and analyzer config fingerprints matched at
+`48b582c00352efce667114449b8f10242ee2737a8ee2fd97a68d0db1d2acf3c8`.
+Raw-capture backtest replay produced 14 simulated orders and no fills.
 
 These are connectivity, integrity, and replay-plumbing evidence only. They are
 not a sustained full-depth dataset, execution-model calibration, profitability
