@@ -126,8 +126,9 @@ outside source control.
    account level, and `net_mode` before metadata is ready.
 8. It restores canonical active orders, fill identities, and active global,
    account, and symbol safety latches from JSONL. It applies missed known
-   fills/terminal updates from REST and requires clean account-scoped
-   reconciliation.
+   fills/terminal updates from REST, applies the authoritative account snapshot
+   to the strategy and risk engine, and marks that snapshot ready only after
+   engine application. It then requires clean account-scoped reconciliation.
 9. In demo mode it arms OKX Cancel All After for every account before starting
    that account's private feed or order task.
 10. It starts redundant public plans and isolated orders, account, and positions
@@ -142,6 +143,11 @@ outside source control.
     internally consistent index value within its downside threshold.
 13. Only phase `ready`, writable storage, healthy risk, and explicit
    `--mode demo --confirm-demo` permit a new order.
+
+Live validation rejects `strategy.master_strategy` and
+`strategy.strategy_group`. The pinned Java implementation requires external
+`StrategyUpdate` heartbeat, member-state, and aggregate-PnL inputs for those
+settings; accepting only their static flags would weaken live stop behavior.
 
 ## Stablecoin Depeg Guard
 

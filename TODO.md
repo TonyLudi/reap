@@ -107,6 +107,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Add Java-referenced USDT/USDC depeg protection with redundant critical
   index feeds, conflict-aware deduplication, startup readiness, immediate entry
   blocking, and a debounced durable global risk latch.
+- [x] Require account snapshots to pass through strategy/risk before readiness,
+  and reject live master/group topology until its external Java coordination
+  feed exists.
 - [x] Reject crossed books and force fresh-snapshot recovery, matching the
   reviewed Java OKX subscriber behavior with explicit sequence validation.
 - [x] Add order `expTime`, startup/periodic exchange-clock validation, and an

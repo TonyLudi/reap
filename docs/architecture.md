@@ -320,13 +320,20 @@ closed.
 
 Startup moves through configured, reconciling, awaiting-streams, ready, and
 degraded phases. Ready requires verified account-scoped instrument metadata,
-matching account/position modes, a writable critical log, clean checkpoint/REST
-reconciliation, every sequenced book, every configured healthy stablecoin
-reference, and all configured private channels for every account. Orders,
-account, and positions are required. The dedicated
+matching account/position modes, an authoritative account snapshot already
+applied to the strategy and risk engine, a writable critical log, clean
+checkpoint/REST reconciliation, every sequenced book, every configured healthy
+stablecoin reference, and all configured private channels for every account.
+Orders, account, and positions are required. The dedicated
 fills channel is opt-in because OKX restricts it by fee tier; fills from the
 orders channel remain canonical. Any lost invariant blocks new orders while
 demo-mode cancels remain available.
+
+The strategy core retains static `master_strategy` and `strategy_group` fields
+for parity experiments and backtests. The live configuration boundary rejects
+both because the external Java `StrategyUpdate` liveness, member-state, and
+aggregate-PnL feed is not implemented; the runtime does not silently substitute
+local-only risk semantics.
 
 The emergency composition is intentionally not part of the strategy loop. It
 uses its own REST transport, exchange-adjusted signing clock, absolute

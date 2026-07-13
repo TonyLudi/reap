@@ -15,8 +15,8 @@ production trading process.
 | Order components | Event-loop client IDs/registration, exchange-side place-request expiry, signed submit/cancel, pacing, private reduction, ambiguity handling, and REST reconciliation are composed | Needs demo exchange fault evidence |
 | Runtime risk | Instrument models, authoritative startup positions, account-scoped health, redundant stablecoin guards, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed deadman/depeg evidence |
 | Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, and strict bounded soak reports | Demo-capable; production entry intentionally unavailable |
-| Instrument/account bootstrap | Account instruments/config/balance/positions are typed and verified before readiness | Needs target-account certification |
-| Startup/restart gate | Executable phase state, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, durable latch restore, and clean REST reconciliation | Needs process-kill demo test |
+| Instrument/account bootstrap | Account instruments/config/balance/positions are typed, verified, and applied to strategy/risk before snapshot readiness | Needs target-account certification |
+| Startup/restart gate | Executable phase state, engine-consumed account-snapshot invariant, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, durable latch restore, and clean REST reconciliation | Needs process-kill demo test |
 | Event-loop profile | Allocation-aware raw OKX parity benchmark covers redundant wire input through strategy/risk and storage-record construction | Needs target-host capture and exchange-latency validation |
 | Operator control and alerts | HMAC-authenticated local controls use fsynced write-ahead latches; OKX Cancel All After is maintained independently; a separate CLI can arm the deadman, cancel all regular orders account-wide, and prove post-trigger zero | Must exercise target alert routing and the independent cancel procedure; algo/spread orders remain outside its scope |
 | Process/host controls | Canonical journal ownership is exclusively locked before recovery or network setup; optional Linux disk, memory, and kernel-clock checks run at preflight and periodically; hardened systemd templates encode mode-specific restart policy | Must be installed, enabled, thresholded, monitored, and fault-tested on the target host |
@@ -98,6 +98,10 @@ production trading process.
     global risk latch and cancels live orders. Startup readiness requires every
     guard, and production validation requires guards for used USDT/USDC
     currencies.
+17. Account-snapshot readiness is set only after the scoped REST/private update
+    has passed through the strategy and risk engine. Live validation rejects
+    master/group strategy topology until its external heartbeat, state, and PnL
+    feed exists.
 
 ## Remaining Demo Gate
 
@@ -130,9 +134,10 @@ Production enablement additionally requires:
 - Walk-forward and out-of-sample evaluation, parameter sensitivity, capacity,
   inventory-duration, and stressed-liquidity reports.
 - Target-account calibration and independent exercise of the implemented
-  stablecoin guard; broader exchange-rate pause policy, strategy-group risk,
-  master liveness, deployed external alert routing, and target-host exercise of
-  the out-of-process regular-order kill plus any required algo/spread kill path.
+  stablecoin guard; either implementation and exercise of external
+  strategy-group/master coordination or continued rejection of those settings;
+  deployed external alert routing; and target-host exercise of the
+  out-of-process regular-order kill plus any required algo/spread kill path.
 - Target-host time-service monitoring, CPU/thread placement, bounded
   backpressure, calibrated memory/disk thresholds, installed restart
   supervision, and external unit-failure paging.

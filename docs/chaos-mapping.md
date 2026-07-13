@@ -19,6 +19,10 @@ control plane.
   covered by a focused Rust test.
 - **Equivalent**: the same trading decision is produced through a different
   runtime or order-management boundary.
+- **Partial**: a local decision is represented, but a required external runtime
+  input is not.
+- **Not implemented**: the behavior is rejected at the live boundary rather
+  than accepted with weaker semantics.
 - **Delegated**: intentionally owned by another Rust module or the deployment.
 
 ## Strategy Matrix
@@ -51,7 +55,8 @@ control plane.
 | Java runtime basis return value being diagnostic only | `basis_breaches` without runtime halt | Exact |
 | Account/position update driven hedging | `on_account_update` | Exact |
 | Timer-driven strategy delta hedging | Timer event handling | Exact |
-| Master strategy suppresses automatic hedging | `master_strategy` checks | Exact |
+| Master strategy suppresses automatic hedging and requires a live `StrategyUpdate` within three seconds | Static `master_strategy` suppression remains available to strategy/backtest tests; `LiveConfig` rejects it until the external liveness feed exists | Partial; fail-closed live |
+| Strategy-group PnL aggregation and member-state transitions | `LiveConfig` rejects `strategy_group` because no external group state/PnL feed exists | Not implemented; fail-closed live |
 | Missed IOC hedge records | `MissedHedge` records from cancelled hedge orders | Exact |
 | No-hedge, all-halted, zombie-hedge, stale-depth, and anomalous-fill stops | Stateful timers and halt reason | Exact |
 | Feed/symbol halt removes an instrument from pricing and hedging | `on_system_event` | Exact |
@@ -88,9 +93,15 @@ The following differences do not change the covered quote/hedge calculations:
   optimizer-specific amend/refill mechanics are not copied.
 - Rust live protocol support currently targets OKX. Binance-specific account,
   reduce-only, fee-asset, and position freshness behavior is not claimed.
-- Broader exchange rate-breach pauses, master-strategy liveness,
-  strategy-group PnL aggregation, Redis controls, alerts, and process restart
-  policy belong to runtime risk and operations.
+- Java's `OrderRateLimitAlert` callback adds a three-second recovery margin and
+  system-halts only Binance entities; it logs non-Binance entities as
+  unexpected. The Rust OKX path instead uses bounded proactive pacing,
+  exchange-response handling, and reconciliation, and does not claim callback
+  parity.
+- Master-strategy liveness and strategy-group PnL/state aggregation require an
+  external `StrategyUpdate` control-plane feed. Live validation rejects both
+  settings until that feed and its fail-closed freshness policy are implemented.
+  Redis controls and process restart policy remain runtime/operations concerns.
 - Qubyte history readers are not copied. Backtests consume normalized JSONL or
   the documented CSV format, and now consume public OKX raw captures through
   the Rust adapter/reducer path.

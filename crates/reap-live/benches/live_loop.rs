@@ -364,13 +364,19 @@ fn benchmark_coordinator_state() -> LiveCoordinator {
     };
     let verified = VerifiedBootstrap {
         instruments,
-        account_updates: HashMap::from([(ACCOUNT_ID.to_string(), account_update)]),
+        account_updates: HashMap::from([(ACCOUNT_ID.to_string(), account_update.clone())]),
         baseline_fill_ids: HashMap::from([(ACCOUNT_ID.to_string(), HashSet::new())]),
     };
     let mut coordinator = LiveCoordinator::new(config, verified, false, "benchmark-session")
         .expect("benchmark coordinator");
     coordinator.mark_storage_ready(true, "benchmark sink ready");
     coordinator.mark_public_connectivity(true, "redundant benchmark sources ready");
+    coordinator
+        .process_feed(FeedOutput::PrivateAccount {
+            account_id: Some(ACCOUNT_ID.to_string()),
+            update: account_update,
+        })
+        .expect("benchmark account snapshot");
     coordinator
         .on_reconciliation(ReconciliationResult {
             account_id: ACCOUNT_ID.to_string(),

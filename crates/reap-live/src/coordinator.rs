@@ -146,7 +146,6 @@ impl LiveCoordinator {
                     },
                 )?,
             );
-            startup.mark_account_snapshot(&account.id, true, "initial account snapshot loaded")?;
         }
         Ok(Self {
             config,
@@ -273,7 +272,13 @@ impl LiveCoordinator {
                 scope_account_update(&account_id, &mut update);
                 self.private_state_mut(&account_id)?
                     .apply_account(update.clone());
-                Ok(self.process_normalized(NormalizedEvent::Account(update)))
+                let output = self.process_normalized(NormalizedEvent::Account(update));
+                self.startup.mark_account_snapshot(
+                    &account_id,
+                    true,
+                    "account snapshot applied to strategy and risk engine",
+                )?;
+                Ok(output)
             }
             FeedOutput::PrivateOrder { account_id, update } => {
                 let account_id = self.require_account_id(account_id)?;
@@ -1335,6 +1340,65 @@ mod tests {
             self_trade_prevention: None,
             reason: "quote".to_string(),
         }
+    }
+
+    #[test]
+    fn account_snapshot_is_ready_only_after_the_engine_consumes_it() {
+        let mut coordinator = coordinator();
+        assert_eq!(
+            coordinator.readiness().missing_account_snapshots,
+            vec!["main".to_string()]
+        );
+        assert!(
+            coordinator
+                .private_state("main")
+                .is_some_and(|state| !state.balances().is_empty())
+        );
+
+        coordinator.mark_storage_ready(true, "open");
+        coordinator.mark_public_connectivity(true, "connected");
+        coordinator
+            .on_reconciliation(ReconciliationResult {
+                account_id: "main".to_string(),
+                ts_ms: 2,
+                clean: true,
+                local_live_orders: 0,
+                remote_live_orders: 0,
+                remote_recent_fills: 0,
+                reason: "clean".to_string(),
+            })
+            .unwrap();
+        for symbol in ["BTC-USDT", "BTC-PERP"] {
+            coordinator.process_event(NormalizedEvent::System(SystemEvent {
+                ts_ms: 2,
+                kind: SystemEventKind::FeedRecovered,
+                venue: Some(Venue::Okx),
+                account_id: None,
+                symbol: Some(symbol.to_string()),
+                reason: "snapshot".to_string(),
+            }));
+        }
+        coordinator.process_event(NormalizedEvent::System(SystemEvent {
+            ts_ms: 2,
+            kind: SystemEventKind::PrivateStreamRecovered,
+            venue: Some(Venue::Okx),
+            account_id: Some("main".to_string()),
+            symbol: None,
+            reason: "connected".to_string(),
+        }));
+
+        assert!(!coordinator.readiness().is_ready());
+        assert_eq!(coordinator.readiness().phase, crate::LivePhase::Reconciling);
+
+        coordinator
+            .process_feed(FeedOutput::PrivateAccount {
+                account_id: Some("main".to_string()),
+                update: account_update("main", 3),
+            })
+            .unwrap();
+
+        assert!(coordinator.readiness().is_ready());
+        assert!(coordinator.readiness().missing_account_snapshots.is_empty());
     }
 
     #[test]

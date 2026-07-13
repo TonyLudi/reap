@@ -399,6 +399,7 @@ impl LiveConfig {
 
     pub fn validate(&self) -> LiveConfigValidation {
         let mut errors = self.strategy.effective().validate().errors;
+        validate_live_strategy_topology(self, &mut errors);
         if let Some(error) = self.risk.validation_error() {
             errors.push(format!("risk: {error}"));
         }
@@ -578,6 +579,21 @@ impl LiveConfig {
             .find(|group| group.name == instrument.risk_group)?
             .account_id
             .as_deref()
+    }
+}
+
+fn validate_live_strategy_topology(config: &LiveConfig, errors: &mut Vec<String>) {
+    if config.strategy.master_strategy.is_some() {
+        errors.push(
+            "strategy.master_strategy is not supported by the live runtime because external StrategyUpdate liveness is not implemented"
+                .to_string(),
+        );
+    }
+    if config.strategy.strategy_group.is_some() {
+        errors.push(
+            "strategy.strategy_group is not supported by the live runtime because external group PnL and state updates are not implemented"
+                .to_string(),
+        );
     }
 }
 
@@ -954,6 +970,24 @@ mod tests {
         }];
         assert!(config.validate().valid);
         assert!(!config.venue.environment.is_demo());
+    }
+
+    #[test]
+    fn live_config_rejects_external_strategy_topology_without_coordination_feeds() {
+        let mut config = valid_config();
+        config.strategy.master_strategy = Some("leader".to_string());
+        config.strategy.strategy_group = Some("portfolio".to_string());
+        assert!(config.strategy.effective().validate().valid);
+
+        let report = config.validate();
+
+        assert!(!report.valid);
+        assert!(report.errors.iter().any(|error| {
+            error.contains("master_strategy") && error.contains("StrategyUpdate liveness")
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.contains("strategy_group") && error.contains("group PnL and state updates")
+        }));
     }
 
     #[test]
