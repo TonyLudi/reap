@@ -74,7 +74,7 @@ cargo run -p reap-cli -- replay-check \
 cargo run -p reap-cli -- backtest \
   --config examples/iarb2-okx-btc.toml \
   --data "$RAW_PATH" \
-  --format raw-capture --pretty
+  --format raw-capture --require-complete-accounting --pretty
 ```
 
 ### Backtest Execution Assumptions
@@ -97,7 +97,7 @@ normalized replay use event timestamps. The runner applies market data first
 when an activation or cancel is due at the same scheduler instant. It stops at
 the last observed input instead of executing future actions against stale depth.
 Always inspect `input_clock_regressions`, `live_orders`,
-`pending_scheduled_actions`, and the four pending-action category counts.
+`pending_scheduled_actions`, and the five pending-action category counts.
 Concurrent socket tasks can reach the single raw writer in a different order
 from their receive stamps even when each source is monotonic. Replay clamps
 those global regressions, preserves file order as the tie-breaker, and reports
@@ -114,6 +114,24 @@ a resting sell needs bid at least `order_px * (1 + threshold)`, while a resting
 buy needs ask at most `order_px * (1 - threshold)`. A shallower cross clears
 queue-ahead without filling. Zero latency and an inherited threshold preserve
 parity scaffolding but cannot support a capital decision.
+
+For every run, also inspect `fee_cost_usd`, `funding_pnl_usd`,
+`turnover_usd`, `funding_rate_events`, and `accounting_complete`. Funding uses
+the latest rate for each advertised settlement time. A first rate up to 60
+seconds late is applied immediately but marks accounting incomplete; older
+first rates are counted as missed and are not applied to a potentially changed
+position. Invalid data or a missing mark for a nonzero swap position also makes
+accounting incomplete. A future funding settlement beyond the capture horizon
+is reported as `pending_funding_actions` and is not itself a defect for the
+observed interval.
+
+The portfolio starts at zero and does not model borrowing interest, liquidation,
+margin discounts, taxes, or the future USD drift of coin-denominated fees. A
+research acceptance run must span held funding boundaries, use the target fee
+tier, and reconcile fill, fee, funding, cash, and equity attribution to demo
+account statements before profitability metrics are trusted.
+Use `--require-complete-accounting` in automated research runs so any reported
+accounting defect also makes the command fail.
 
 Strict analysis requires one capture session, every configured stream on its
 configured number of source connections, a ready book for every configured
@@ -177,13 +195,16 @@ the deterministic latency scheduler was added, receive-time replay of the same
 file reported 3,958 normalized inputs, three cross-socket writer-order clock
 regressions (maximum 148,017 ns), 14 exchange activations, 10 effective
 cancellations, four live quotes at the capture horizon, and no pending scheduled
-actions under the explicit uncalibrated zero-delay configuration with the
-pinned Java `0.0001` depth threshold. An uncalibrated sensitivity pass using
-2 ms market,
+order actions under the explicit uncalibrated zero-delay configuration with the
+pinned Java `0.0001` depth threshold. The two funding-rate updates produced one
+scheduled funding action beyond the dataset horizon; no fee, turnover, funding
+settlement, or funding PnL was generated, and accounting was complete through
+the observed interval. An uncalibrated sensitivity pass using 2 ms market,
 20 ms entry, 15 ms cancel, 25 ms order-update, and 50 ms fill/account delays
-kept the same no-fill result and exposed three delayed strategy events beyond
-the capture horizon. This short, fill-free run validates scheduling/provenance only;
-it cannot calibrate any latency or fill assumption.
+kept the same no-fill result and exposed three delayed strategy events plus the
+future funding action beyond the capture horizon. This short, fill-free run
+validates scheduling/provenance only; it cannot calibrate any latency or fill
+assumption.
 
 These are connectivity, integrity, and replay-plumbing evidence only. They are
 not a sustained full-depth dataset, execution-model calibration, profitability

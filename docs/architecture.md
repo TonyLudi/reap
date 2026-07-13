@@ -443,6 +443,36 @@ past the final observed clock just to empty its scheduler because doing so would
 match future actions against a stale final book. Reports therefore expose live
 orders and every category of pending action at the dataset boundary.
 
+#### Deterministic accounting
+
+Every simulated fill records absolute turnover and maker/taker fee cost from the
+instrument configuration. Fee cost may be negative for a maker rebate. The
+portfolio applies linear and inverse position cash flows separately and reports
+fee cost, funding PnL, turnover, cash, positions, and marked final equity.
+
+Funding-rate events update the latest rate for `(symbol, funding_time_ms)` and
+schedule one settlement at the exchange funding time. Linear swap funding cost
+is `position * contract_value * rate * mark`; inverse cost is
+`position * contract_value * rate / mark` in coin. Positive signed cost is paid,
+so report `funding_pnl_usd` is its negation. Explicit exchange mark events take
+precedence over depth midpoint fallback. Duplicate forecasts update the rate
+without scheduling duplicate settlements.
+
+A first forecast up to 60 seconds late is settled immediately and reported as
+late, matching the Java tolerance window. Older first forecasts are not applied
+to a potentially different position and instead increment
+`missed_funding_settlements`. Invalid rates, missing marks for nonzero positions,
+and other settlement failures make `accounting_complete=false`. A funding time
+beyond the dataset remains a categorized pending action and is not a failure for
+the observed horizon.
+
+This is still research accounting, not an exchange statement. It assumes a zero
+initial portfolio, does not model borrowing interest, liquidation, margin
+discounts, tax, or coin-denominated fee drift, and cannot infer a missing funding
+event when the source dataset never contained one. Production evaluation must
+reconcile these outputs against demo account statements and complete funding
+coverage across every held interval.
+
 ### `reap-capture`
 
 Credential-free public market-data composition.

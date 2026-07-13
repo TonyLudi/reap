@@ -48,8 +48,8 @@ Implemented:
   policy.
 - Deterministic backtest matching with `PendingNew`, delayed entry/cancel/update
   boundaries, `PostOnly`, `IOC`, conservative displayed-depth fills, trade
-  fills, queue-ahead tracking, fees, receive-time raw replay, and mark-to-market
-  accounting.
+  fills, queue-ahead tracking, fee/turnover attribution, scheduled linear and
+  inverse funding, receive-time raw replay, and mark-to-market accounting.
 - CSV/normalized replay, raw-capture validation, configuration validation, and
   a release-mode hot-path benchmark.
 - Credential-free public OKX capture with redundant websocket plans, raw-frame
@@ -106,7 +106,7 @@ cargo run -p reap-cli -- replay-check \
 cargo run -p reap-cli -- backtest \
   --config examples/iarb2-okx-btc.toml \
   --data "$RAW_PATH" \
-  --format raw-capture --pretty
+  --format raw-capture --require-complete-accounting --pretty
 ```
 
 The optional `[backtest]` table controls market-data, order-entry, cancel,
@@ -116,6 +116,11 @@ regressions, live orders, and work still scheduled at the capture boundary.
 The delay values are zero, the threshold is the pinned Java default, and
 `calibrated = false`; do not use them as an execution-quality or profitability
 claim.
+
+Backtest reports also separate fee cost, funding PnL, and turnover. They flag
+late, missed, invalid, or failed funding accounting and retain funding
+settlements beyond the data horizon as pending actions. The model assumes a
+zero initial portfolio and is not an exchange-statement substitute.
 
 Validate the live demo configuration without reading credentials or opening a
 network connection:

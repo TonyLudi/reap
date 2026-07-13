@@ -26,6 +26,7 @@ use reap_strategy::{ChaosConfig, ChaosStrategy, Strategy};
 
 const MAX_ACTIONS_PER_DRAIN: usize = 1_000_000;
 const NS_PER_MS: u64 = 1_000_000;
+const FUNDING_LATE_TOLERANCE_NS: u64 = 60_000 * NS_PER_MS;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BacktestReport {
@@ -51,6 +52,7 @@ pub struct BacktestReport {
     pub pending_cancel_actions: usize,
     pub pending_order_update_actions: usize,
     pub pending_strategy_event_actions: usize,
+    pub pending_funding_actions: usize,
     pub pending_orders: usize,
     pub live_orders: usize,
     pub pending_cancel_requests: usize,
@@ -58,15 +60,35 @@ pub struct BacktestReport {
     pub final_pending_delta_usd: f64,
     pub final_equity_usd: f64,
     pub cash_usd: f64,
+    pub fee_cost_usd: f64,
+    pub funding_pnl_usd: f64,
+    pub turnover_usd: f64,
+    pub funding_rate_events: u64,
+    pub funding_settlements: u64,
+    pub late_funding_rate_events: u64,
+    pub invalid_funding_rate_events: u64,
+    pub missed_funding_settlements: u64,
+    pub funding_settlement_failures: u64,
+    pub accounting_complete: bool,
     pub positions: HashMap<Symbol, f64>,
 }
 
 #[derive(Debug)]
 enum ScheduledAction {
-    ActivateOrder { symbol: Symbol, order_id: String },
-    CancelOrder { order_id: String, reason: String },
+    ActivateOrder {
+        symbol: Symbol,
+        order_id: String,
+    },
+    CancelOrder {
+        order_id: String,
+        reason: String,
+    },
     DeliverOrder(OrderUpdate),
     DeliverStrategy(StrategyEvent),
+    SettleFunding {
+        symbol: Symbol,
+        funding_time_ms: u64,
+    },
 }
 
 pub struct BacktestRunner {
@@ -78,6 +100,11 @@ pub struct BacktestRunner {
     scheduled: BTreeMap<(u64, u64), ScheduledAction>,
     next_action_seq: u64,
     pending_cancels: HashSet<String>,
+    depth_marks: HashMap<Symbol, f64>,
+    exchange_marks: HashMap<Symbol, f64>,
+    funding_rates: HashMap<(Symbol, u64), f64>,
+    scheduled_funding: HashSet<(Symbol, u64)>,
+    settled_funding: HashSet<(Symbol, u64)>,
     now_ns: u64,
     first_arrival_ns: Option<u64>,
     last_arrival_ns: Option<u64>,
@@ -94,6 +121,12 @@ pub struct BacktestRunner {
     fills: usize,
     maker_fills: usize,
     taker_fills: usize,
+    funding_rate_events: u64,
+    funding_settlements: u64,
+    late_funding_rate_events: u64,
+    invalid_funding_rate_events: u64,
+    missed_funding_settlements: u64,
+    funding_settlement_failures: u64,
 }
 
 impl BacktestRunner {
@@ -133,6 +166,11 @@ impl BacktestRunner {
             scheduled: BTreeMap::new(),
             next_action_seq: 1,
             pending_cancels: HashSet::new(),
+            depth_marks: HashMap::new(),
+            exchange_marks: HashMap::new(),
+            funding_rates: HashMap::new(),
+            scheduled_funding: HashSet::new(),
+            settled_funding: HashSet::new(),
             now_ns: 0,
             first_arrival_ns: None,
             last_arrival_ns: None,
@@ -149,6 +187,12 @@ impl BacktestRunner {
             fills: 0,
             maker_fills: 0,
             taker_fills: 0,
+            funding_rate_events: 0,
+            funding_settlements: 0,
+            late_funding_rate_events: 0,
+            invalid_funding_rate_events: 0,
+            missed_funding_settlements: 0,
+            funding_settlement_failures: 0,
         })
     }
 
@@ -218,6 +262,9 @@ impl BacktestRunner {
         match &event {
             NormalizedEvent::Market(MarketEvent::Depth(book)) => {
                 let now_ns = self.now_ns;
+                if let Some(mid) = book.mid().filter(|mid| mid.is_finite() && *mid > 0.0) {
+                    self.depth_marks.insert(book.symbol.clone(), mid);
+                }
                 let updates = self
                     .matcher_mut(&book.symbol)?
                     .on_depth_at(book.clone(), time_ms(now_ns));
@@ -252,12 +299,38 @@ impl BacktestRunner {
                 self.drain_through(now_ns)?;
             }
             NormalizedEvent::Market(
-                MarketEvent::IndexPrice { .. }
-                | MarketEvent::FundingRate { .. }
-                | MarketEvent::BurstSignal { .. }
-                | MarketEvent::PriceLimits { .. },
+                MarketEvent::IndexPrice { .. } | MarketEvent::BurstSignal { .. },
             ) => {
                 let now_ns = self.now_ns;
+                self.drain_through(now_ns)?;
+                self.schedule_after(
+                    self.execution.market_data_latency_ms,
+                    ScheduledAction::DeliverStrategy(event.into_strategy_event()),
+                );
+                self.drain_through(now_ns)?;
+            }
+            NormalizedEvent::Market(MarketEvent::FundingRate {
+                symbol,
+                rate,
+                funding_time_ms,
+                ..
+            }) => {
+                let now_ns = self.now_ns;
+                self.register_funding_rate(symbol, *rate, *funding_time_ms);
+                self.drain_through(now_ns)?;
+                self.schedule_after(
+                    self.execution.market_data_latency_ms,
+                    ScheduledAction::DeliverStrategy(event.into_strategy_event()),
+                );
+                self.drain_through(now_ns)?;
+            }
+            NormalizedEvent::Market(MarketEvent::PriceLimits {
+                symbol, mark_price, ..
+            }) => {
+                let now_ns = self.now_ns;
+                if mark_price.is_finite() && *mark_price > 0.0 {
+                    self.exchange_marks.insert(symbol.clone(), *mark_price);
+                }
                 self.drain_through(now_ns)?;
                 self.schedule_after(
                     self.execution.market_data_latency_ms,
@@ -300,6 +373,68 @@ impl BacktestRunner {
         self.first_arrival_ns.get_or_insert(arrival_ns);
         self.last_arrival_ns = Some(arrival_ns);
         arrival_ns
+    }
+
+    fn register_funding_rate(&mut self, symbol: &str, rate: f64, funding_time_ms: u64) {
+        self.funding_rate_events += 1;
+        if !self.portfolio.supports_funding(symbol) || !rate.is_finite() || funding_time_ms == 0 {
+            self.invalid_funding_rate_events += 1;
+            return;
+        }
+
+        let key = (symbol.to_string(), funding_time_ms);
+        if self.settled_funding.contains(&key) {
+            return;
+        }
+        self.funding_rates.insert(key.clone(), rate);
+        if !self.scheduled_funding.insert(key.clone()) {
+            return;
+        }
+
+        let funding_time_ns = funding_time_ms.saturating_mul(NS_PER_MS);
+        if funding_time_ns.saturating_add(FUNDING_LATE_TOLERANCE_NS) < self.now_ns {
+            self.scheduled_funding.remove(&key);
+            self.funding_rates.remove(&key);
+            self.settled_funding.insert(key);
+            self.missed_funding_settlements += 1;
+            return;
+        }
+        let due_ns = if funding_time_ns < self.now_ns {
+            self.late_funding_rate_events += 1;
+            self.now_ns
+        } else {
+            funding_time_ns
+        };
+        self.schedule_at(
+            due_ns,
+            ScheduledAction::SettleFunding {
+                symbol: symbol.to_string(),
+                funding_time_ms,
+            },
+        );
+    }
+
+    fn settle_funding(&mut self, symbol: Symbol, funding_time_ms: u64) {
+        let key = (symbol.clone(), funding_time_ms);
+        self.scheduled_funding.remove(&key);
+        if !self.settled_funding.insert(key.clone()) {
+            return;
+        }
+        let Some(rate) = self.funding_rates.remove(&key) else {
+            self.funding_settlement_failures += 1;
+            return;
+        };
+        let mark = self
+            .exchange_marks
+            .get(&symbol)
+            .or_else(|| self.depth_marks.get(&symbol))
+            .copied()
+            .unwrap_or(f64::NAN);
+        if self.portfolio.apply_funding(&symbol, rate, mark).is_some() {
+            self.funding_settlements += 1;
+        } else {
+            self.funding_settlement_failures += 1;
+        }
     }
 
     fn route_exchange_updates(&mut self, updates: Vec<OrderUpdate>) -> Result<()> {
@@ -437,6 +572,10 @@ impl BacktestRunner {
                 let commands = self.strategy.on_event(&event);
                 self.accept_intents(commands)?;
             }
+            ScheduledAction::SettleFunding {
+                symbol,
+                funding_time_ms,
+            } => self.settle_funding(symbol, funding_time_ms),
         }
         Ok(())
     }
@@ -486,11 +625,13 @@ impl BacktestRunner {
     fn finish_report(&mut self) -> Result<BacktestReport> {
         let now_ns = self.now_ns;
         self.drain_through(now_ns)?;
-        let marks = self
+        let mut marks = self
             .matchers
             .iter()
             .filter_map(|(symbol, matcher)| Some((symbol.clone(), matcher.depth()?.mid()?)))
             .collect::<HashMap<_, _>>();
+        marks.extend(self.depth_marks.clone());
+        marks.extend(self.exchange_marks.clone());
         let pending_orders = self
             .matchers
             .values()
@@ -505,14 +646,20 @@ impl BacktestRunner {
         let mut pending_cancel_actions = 0;
         let mut pending_order_update_actions = 0;
         let mut pending_strategy_event_actions = 0;
+        let mut pending_funding_actions = 0;
         for action in self.scheduled.values() {
             match action {
                 ScheduledAction::ActivateOrder { .. } => pending_activation_actions += 1,
                 ScheduledAction::CancelOrder { .. } => pending_cancel_actions += 1,
                 ScheduledAction::DeliverOrder(_) => pending_order_update_actions += 1,
                 ScheduledAction::DeliverStrategy(_) => pending_strategy_event_actions += 1,
+                ScheduledAction::SettleFunding { .. } => pending_funding_actions += 1,
             }
         }
+        let accounting_complete = self.late_funding_rate_events == 0
+            && self.invalid_funding_rate_events == 0
+            && self.missed_funding_settlements == 0
+            && self.funding_settlement_failures == 0;
 
         Ok(BacktestReport {
             execution: self.execution.clone(),
@@ -537,6 +684,7 @@ impl BacktestRunner {
             pending_cancel_actions,
             pending_order_update_actions,
             pending_strategy_event_actions,
+            pending_funding_actions,
             pending_orders,
             live_orders,
             pending_cancel_requests: self.pending_cancels.len(),
@@ -544,6 +692,16 @@ impl BacktestRunner {
             final_pending_delta_usd: self.strategy.pending_delta_usd(),
             final_equity_usd: self.portfolio.equity_usd(&marks),
             cash_usd: self.portfolio.cash_usd(),
+            fee_cost_usd: self.portfolio.fee_cost_usd(),
+            funding_pnl_usd: self.portfolio.funding_pnl_usd(),
+            turnover_usd: self.portfolio.turnover_usd(),
+            funding_rate_events: self.funding_rate_events,
+            funding_settlements: self.funding_settlements,
+            late_funding_rate_events: self.late_funding_rate_events,
+            invalid_funding_rate_events: self.invalid_funding_rate_events,
+            missed_funding_settlements: self.missed_funding_settlements,
+            funding_settlement_failures: self.funding_settlement_failures,
+            accounting_complete,
             positions: self.portfolio.positions().clone(),
         })
     }
@@ -618,7 +776,7 @@ fn retime_strategy_event(mut event: StrategyEvent, ts_ms: u64) -> StrategyEvent 
 
 #[cfg(test)]
 mod tests {
-    use reap_core::{Level, NewOrder, OrderBook, Side, TimeInForce, TimerEvent};
+    use reap_core::{Level, NewOrder, OrderBook, OrderStatus, Side, TimeInForce, TimerEvent};
     use reap_strategy::{InstrumentConfig, InstrumentKindConfig, RiskGroupConfig};
 
     use super::*;
@@ -894,6 +1052,100 @@ mod tests {
         assert_eq!(report.cancelled_orders, 1);
         assert_eq!(report.fills, 0);
         assert_eq!(report.last_arrival_ns, Some(101_200_000));
+    }
+
+    #[test]
+    fn latest_funding_forecast_settles_signed_linear_swap_position() {
+        let mut cfg = config();
+        cfg.instruments[1].kind = InstrumentKindConfig::LinearSwap;
+        cfg.instruments[1].taker_fee = 0.0;
+        let mut runner = BacktestRunner::new(cfg).unwrap();
+        runner.depth_marks.insert("BTC-PERP".to_string(), 50_000.0);
+        runner.portfolio.apply_fill(&OrderUpdate {
+            ts_ms: 0,
+            order_id: "initial-fill".to_string(),
+            symbol: "BTC-PERP".to_string(),
+            side: Side::Buy,
+            event: OrderEvent::FullyFilled,
+            status: OrderStatus::Filled,
+            price: 50_000.0,
+            time_in_force: Some(TimeInForce::Ioc),
+            qty: 100.0,
+            open_qty: 0.0,
+            filled_qty: 100.0,
+            avg_fill_price: 50_000.0,
+            last_fill_qty: 100.0,
+            last_fill_price: 50_000.0,
+            last_fill_liquidity: Some(FillLiquidity::Taker),
+            reason: "initial".to_string(),
+        });
+        let events = vec![
+            NormalizedEvent::from(MarketEvent::FundingRate {
+                ts_ms: 1,
+                symbol: "BTC-PERP".to_string(),
+                rate: 0.001,
+                funding_time_ms: 10,
+            }),
+            NormalizedEvent::from(MarketEvent::FundingRate {
+                ts_ms: 5,
+                symbol: "BTC-PERP".to_string(),
+                rate: 0.002,
+                funding_time_ms: 10,
+            }),
+            NormalizedEvent::Timer(TimerEvent {
+                ts_ms: 10,
+                name: "funding".to_string(),
+            }),
+        ];
+
+        let report = runner.run(events).unwrap();
+
+        assert_eq!(report.funding_rate_events, 2);
+        assert_eq!(report.funding_settlements, 1);
+        assert_eq!(report.pending_funding_actions, 0);
+        assert_eq!(report.funding_pnl_usd, -10.0);
+        assert_eq!(report.final_equity_usd, -10.0);
+        assert!(report.accounting_complete);
+    }
+
+    #[test]
+    fn funding_beyond_the_data_horizon_remains_explicitly_pending() {
+        let mut cfg = config();
+        cfg.instruments[1].kind = InstrumentKindConfig::LinearSwap;
+        let mut runner = BacktestRunner::new(cfg).unwrap();
+
+        let report = runner
+            .run([NormalizedEvent::from(MarketEvent::FundingRate {
+                ts_ms: 1,
+                symbol: "BTC-PERP".to_string(),
+                rate: 0.001,
+                funding_time_ms: 100,
+            })])
+            .unwrap();
+
+        assert_eq!(report.funding_settlements, 0);
+        assert_eq!(report.pending_funding_actions, 1);
+        assert_eq!(report.pending_scheduled_actions, 1);
+        assert!(report.accounting_complete);
+    }
+
+    #[test]
+    fn stale_first_funding_forecast_marks_accounting_incomplete() {
+        let mut cfg = config();
+        cfg.instruments[1].kind = InstrumentKindConfig::LinearSwap;
+        let mut runner = BacktestRunner::new(cfg).unwrap();
+
+        let report = runner
+            .run([NormalizedEvent::from(MarketEvent::FundingRate {
+                ts_ms: 100_000,
+                symbol: "BTC-PERP".to_string(),
+                rate: 0.001,
+                funding_time_ms: 1,
+            })])
+            .unwrap();
+
+        assert_eq!(report.missed_funding_settlements, 1);
+        assert!(!report.accounting_complete);
     }
 
     #[test]

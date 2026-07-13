@@ -9,6 +9,9 @@ pub struct Portfolio {
     positions: HashMap<Symbol, f64>,
     inverse_cash_coin: HashMap<Symbol, f64>,
     cash_usd: f64,
+    fee_cost_usd: f64,
+    funding_pnl_usd: f64,
+    turnover_usd: f64,
 }
 
 impl Portfolio {
@@ -21,6 +24,9 @@ impl Portfolio {
             positions: HashMap::new(),
             inverse_cash_coin: HashMap::new(),
             cash_usd: 0.0,
+            fee_cost_usd: 0.0,
+            funding_pnl_usd: 0.0,
+            turnover_usd: 0.0,
         }
     }
 
@@ -58,7 +64,48 @@ impl Portfolio {
             Some(FillLiquidity::Taker) => inst.taker_fee,
             None => 0.0,
         };
-        self.cash_usd -= notional.abs() * fee_rate;
+        let absolute_notional = notional.abs();
+        let fee_cost = absolute_notional * fee_rate;
+        self.cash_usd -= fee_cost;
+        self.fee_cost_usd += fee_cost;
+        self.turnover_usd += absolute_notional;
+    }
+
+    /// Applies one swap funding settlement and returns USD PnL (positive means received).
+    pub fn apply_funding(&mut self, symbol: &str, rate: f64, mark: f64) -> Option<f64> {
+        let inst = self.instruments.get(symbol)?;
+        if !inst.kind.is_swap() || !rate.is_finite() {
+            return None;
+        }
+        let position = self.positions.get(symbol).copied().unwrap_or(0.0);
+        if position == 0.0 {
+            return Some(0.0);
+        }
+        if !mark.is_finite() || mark <= 0.0 {
+            return None;
+        }
+
+        let funding_cost_usd = if inst.kind.is_inverse() {
+            let funding_cost_coin = position * inst.contract_value * rate / mark;
+            *self
+                .inverse_cash_coin
+                .entry(symbol.to_string())
+                .or_default() -= funding_cost_coin;
+            funding_cost_coin * mark
+        } else {
+            let funding_cost = position * inst.contract_value * rate * mark;
+            self.cash_usd -= funding_cost;
+            funding_cost
+        };
+        let funding_pnl = -funding_cost_usd;
+        self.funding_pnl_usd += funding_pnl;
+        Some(funding_pnl)
+    }
+
+    pub fn supports_funding(&self, symbol: &str) -> bool {
+        self.instruments
+            .get(symbol)
+            .is_some_and(|instrument| instrument.kind.is_swap())
     }
 
     pub fn equity_usd(&self, marks: &HashMap<Symbol, f64>) -> f64 {
@@ -86,7 +133,128 @@ impl Portfolio {
         self.cash_usd
     }
 
+    pub fn fee_cost_usd(&self) -> f64 {
+        self.fee_cost_usd
+    }
+
+    pub fn funding_pnl_usd(&self) -> f64 {
+        self.funding_pnl_usd
+    }
+
+    pub fn turnover_usd(&self) -> f64 {
+        self.turnover_usd
+    }
+
     pub fn positions(&self) -> &HashMap<Symbol, f64> {
         &self.positions
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use reap_core::{OrderEvent, OrderStatus, TimeInForce};
+    use reap_strategy::InstrumentKindConfig;
+
+    use super::*;
+
+    fn fill(symbol: &str, side: Side, qty: f64, price: f64) -> OrderUpdate {
+        OrderUpdate {
+            ts_ms: 1,
+            order_id: "fill-1".to_string(),
+            symbol: symbol.to_string(),
+            side,
+            event: OrderEvent::FullyFilled,
+            status: OrderStatus::Filled,
+            price,
+            time_in_force: Some(TimeInForce::Ioc),
+            qty,
+            open_qty: 0.0,
+            filled_qty: qty,
+            avg_fill_price: price,
+            last_fill_qty: qty,
+            last_fill_price: price,
+            last_fill_liquidity: Some(FillLiquidity::Taker),
+            reason: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn attributes_fee_cost_and_turnover() {
+        let instrument = InstrumentConfig {
+            symbol: "BTC-USDT".to_string(),
+            kind: InstrumentKindConfig::Spot,
+            taker_fee: 0.001,
+            ..InstrumentConfig::default()
+        };
+        let mut portfolio = Portfolio::new(&[instrument]);
+
+        portfolio.apply_fill(&fill("BTC-USDT", Side::Buy, 2.0, 100.0));
+
+        assert_eq!(portfolio.turnover_usd(), 200.0);
+        assert_eq!(portfolio.fee_cost_usd(), 0.2);
+    }
+
+    #[test]
+    fn settles_linear_swap_funding_from_signed_notional() {
+        let instrument = InstrumentConfig {
+            symbol: "BTC-SWAP".to_string(),
+            kind: InstrumentKindConfig::LinearSwap,
+            contract_value: 0.01,
+            taker_fee: 0.0,
+            ..InstrumentConfig::default()
+        };
+        let mut portfolio = Portfolio::new(&[instrument]);
+        portfolio.apply_fill(&fill("BTC-SWAP", Side::Buy, 10.0, 50_000.0));
+
+        let funding_pnl = portfolio
+            .apply_funding("BTC-SWAP", 0.001, 50_000.0)
+            .unwrap();
+        let equity = portfolio.equity_usd(&HashMap::from([("BTC-SWAP".to_string(), 50_000.0)]));
+
+        assert_eq!(funding_pnl, -5.0);
+        assert_eq!(portfolio.funding_pnl_usd(), -5.0);
+        assert_eq!(equity, -5.0);
+    }
+
+    #[test]
+    fn settles_inverse_swap_funding_in_coin() {
+        let instrument = InstrumentConfig {
+            symbol: "BTC-USD-SWAP".to_string(),
+            kind: InstrumentKindConfig::InverseSwap,
+            contract_value: 100.0,
+            taker_fee: 0.0,
+            ..InstrumentConfig::default()
+        };
+        let mut portfolio = Portfolio::new(&[instrument]);
+        portfolio.apply_fill(&fill("BTC-USD-SWAP", Side::Buy, 10.0, 50_000.0));
+
+        let funding_pnl = portfolio
+            .apply_funding("BTC-USD-SWAP", 0.001, 50_000.0)
+            .unwrap();
+        let equity = portfolio.equity_usd(&HashMap::from([("BTC-USD-SWAP".to_string(), 50_000.0)]));
+
+        assert_eq!(funding_pnl, -1.0);
+        assert_eq!(portfolio.funding_pnl_usd(), -1.0);
+        assert!((equity + 1.0).abs() < 1e-9, "{equity}");
+    }
+
+    #[test]
+    fn short_swap_receives_positive_rate_funding() {
+        let instrument = InstrumentConfig {
+            symbol: "BTC-SWAP".to_string(),
+            kind: InstrumentKindConfig::LinearSwap,
+            contract_value: 0.01,
+            taker_fee: 0.0,
+            ..InstrumentConfig::default()
+        };
+        let mut portfolio = Portfolio::new(&[instrument]);
+        portfolio.apply_fill(&fill("BTC-SWAP", Side::Sell, 10.0, 50_000.0));
+
+        let funding_pnl = portfolio
+            .apply_funding("BTC-SWAP", 0.001, 50_000.0)
+            .unwrap();
+
+        assert_eq!(funding_pnl, 5.0);
+        assert_eq!(portfolio.funding_pnl_usd(), 5.0);
     }
 }

@@ -112,6 +112,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
   `PendingNew` registration, and end-of-horizon execution provenance.
 - [x] Port Java's conservative displayed-depth fill threshold, including its
   shallow-cross queue-ahead reset semantics and application default.
+- [x] Attribute fill fees/turnover and port signed linear/inverse swap funding
+  settlement with mark fallback, late/missed coverage signals, and explicit
+  end-of-horizon funding actions.
 - [x] Add Java-referenced USDT/USDC depeg protection with redundant critical
   index feeds, conflict-aware deduplication, startup readiness, immediate entry
   blocking, and a debounced durable global risk latch.
@@ -177,7 +180,8 @@ architecture in [docs/architecture.md](docs/architecture.md).
   captured full-depth data; complete walk-forward, sensitivity, capacity, and
   stressed-liquidity reports. The configurable delay model is implemented but
   remains explicitly uncalibrated; empirical queue and per-class/per-instrument
-  latency distributions are still required.
+  latency distributions, fee tiers, complete funding intervals, borrow costs,
+  and statement reconciliation are still required.
 - [ ] Deploy and exercise the webhook/host guards, systemd supervision, external
   unit-failure paging, and independent exchange cancel procedure on the target
   host/account; add a separate algo/spread kill path if those order classes are

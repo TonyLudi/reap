@@ -66,6 +66,8 @@ control plane.
 | Backtest and live strategy use the same event API | `StrategyEvent -> Vec<OrderIntent>` | Equivalent |
 | Local order registration precedes exchange acknowledgement | Synchronous canonical `PendingNew` in live and backtest; pending quotes/hedges count as working state | Equivalent |
 | Quote fill becomes an account/position update before hedging | Synthetic update in backtest; private account/position push in live | Equivalent |
+| Maker/taker transaction cost | Per-instrument fill fee with explicit fee-cost and turnover attribution | Equivalent; fee-tier calibration remains operational |
+| `PortfolioExchAcctCalculator.settleSwapFundingAt` linear/inverse formulas | Scheduled funding settlement using latest rate and exchange mark/depth fallback | Exact signed formulas; Rust schedules the advertised exchange timestamp instead of Java's configured time-of-day list |
 
 ## Backtest Execution Cross-Check
 

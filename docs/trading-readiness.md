@@ -10,7 +10,7 @@ production trading process.
 | Area | Current state | Trading impact |
 | --- | --- | --- |
 | Iarb2 decision model | Covered for the documented OKX parity boundary | Not a blocker |
-| Deterministic backtest/data | Shared strategy code, immediate pending-order registration, arrival-time scheduler, configurable market/entry/cancel/order/account delays, Java-referenced conservative depth-fill threshold, queue-ahead model, fees, credential-free redundant public capture, exact SHA/config provenance, streaming source/timing/market analysis, create-new session files, and raw/normalized replay | Execution assumptions remain uncalibrated; needs sustained full-depth capture and venue-data calibration before capital decisions |
+| Deterministic backtest/data | Shared strategy code, immediate pending-order registration, arrival-time scheduler, configurable market/entry/cancel/order/account delays, Java-referenced conservative depth-fill threshold, queue-ahead model, fee/turnover attribution, scheduled linear/inverse funding, accounting completeness signals, credential-free redundant public capture, exact SHA/config provenance, streaming analysis, and raw/normalized replay | Execution/accounting assumptions remain uncalibrated; needs sustained full-depth capture, complete funding intervals, borrow/fee calibration, and statement reconciliation before capital decisions |
 | Feed components | Redundant public sockets, isolated private sockets, transport/state freshness separation, account-plus-positions health rounds, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
 | Order components | Event-loop client IDs/registration, exchange/client acknowledgement binding, account-scoped immutable private identity, semantic duplicate suppression across changed exchange timestamps, exchange-side place-request expiry, signed submit/cancel, pacing, monotonic private reduction, submit/cancel state-convergence deadlines, typed position margin mode, ambiguity handling, and full order/fill/balance/position REST reconciliation are composed | Needs demo exchange fault evidence |
 | Runtime risk | Instrument models, authoritative startup positions, active-order count/notional ceilings, rolling submit-rejection and zero-fill IOC-cancel circuits, terminal strategy-halt promotion, position scope/mode enforcement, forced-repayment blocking, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed deadman/depeg/convergence evidence |
@@ -171,6 +171,13 @@ production trading process.
     Displayed-depth matching also applies Java's relative over-cross threshold
     and clears queue-ahead on a shallow cross, but its value is still an
     inherited conservative default rather than target-venue evidence.
+31. Backtest fills now attribute configured maker/taker fee cost and turnover.
+    Funding forecasts schedule one signed linear or inverse swap settlement at
+    the advertised exchange time, update to the latest rate, prefer exchange
+    mark over midpoint fallback, and expose late, missed, failed, and
+    post-horizon states. The short accepted capture had two rate updates but no
+    fill or funding boundary, so formulas are tested but not empirically
+    calibrated or reconciled to an account statement.
 
 ## Remaining Demo Gate
 

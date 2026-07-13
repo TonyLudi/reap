@@ -30,6 +30,11 @@ enum Command {
         format: ReplayFormat,
         #[arg(long)]
         pretty: bool,
+        #[arg(
+            long,
+            help = "Exit non-zero on late, invalid, missed, or failed funding accounting"
+        )]
+        require_complete_accounting: bool,
     },
     ReplayCheck {
         #[arg(short, long)]
@@ -239,6 +244,7 @@ async fn main() -> Result<()> {
             data,
             format,
             pretty,
+            require_complete_accounting,
         } => {
             let config_text = std::fs::read_to_string(&config)
                 .with_context(|| format!("failed to read config {}", config.display()))?;
@@ -254,6 +260,9 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 println!("{}", serde_json::to_string(&report)?);
+            }
+            if require_complete_accounting && !report.accounting_complete {
+                anyhow::bail!("backtest accounting is incomplete");
             }
         }
         Command::ReplayCheck {
