@@ -129,6 +129,10 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Promote every terminal chaos strategy halt into the engine-owned global
   risk path before intent dispatch, persist the latch, and make global
   cancellation scope override simultaneous symbol-only isolation.
+- [x] Bind REST submit/cancel acknowledgements into canonical exchange/client
+  order identity, recover the one-to-one bindings from the journal, resolve
+  empty/`0` private IDs consistently across live and reconciliation, and reject
+  wrong-account or immutable symbol/side changes before state mutation.
 - [x] Require every canonical derivative fill to converge to its position row
   and every spot fill to both currency balances within a configured deadline;
   fail closed and reconcile the account on timeout.

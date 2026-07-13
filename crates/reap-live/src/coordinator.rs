@@ -3,7 +3,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use reap_core::{NormalizedEvent, OrderIntent, SystemEvent, SystemEventKind, TimeMs, Venue};
 use reap_engine::{EngineOutput, TradingEngine};
 use reap_feed::{FeedOutput, RecoveryRequest};
-use reap_order::{CancelOutcome, ClientOrderIdGenerator, PrivateStateReducer, SubmitOutcome};
+use reap_order::{
+    CancelOutcome, ClientOrderIdGenerator, PrivateOrderIdentityError, PrivateStateReducer,
+    SubmitOutcome,
+};
 use reap_risk::{RiskDecision, RiskGate};
 use reap_storage::{
     FillRecord, OrderAckRecord, OrderAckStatus, OrderOperation, ReconciliationRecord,
@@ -89,6 +92,12 @@ pub enum CoordinatorError {
         symbol: String,
         actual: String,
         expected: String,
+    },
+    #[error("private order identity violation on account {account_id}: {source}")]
+    PrivateOrderIdentity {
+        account_id: String,
+        #[source]
+        source: PrivateOrderIdentityError,
     },
     #[error("account {account_id} state policy violation: {message}")]
     AccountStatePolicy { account_id: String, message: String },
@@ -254,6 +263,20 @@ impl LiveCoordinator {
         Ok(self.process_normalized(NormalizedEvent::Order(update)))
     }
 
+    pub fn restore_order_binding(
+        &mut self,
+        account_id: &str,
+        client_order_id: &str,
+        exchange_order_id: &str,
+    ) -> Result<(), CoordinatorError> {
+        self.private_state_mut(account_id)?
+            .bind_exchange_order_id(client_order_id, exchange_order_id)
+            .map_err(|source| CoordinatorError::PrivateOrderIdentity {
+                account_id: account_id.to_string(),
+                source,
+            })
+    }
+
     pub fn process_feed(
         &mut self,
         output: FeedOutput,
@@ -287,25 +310,37 @@ impl LiveCoordinator {
             }
             FeedOutput::PrivateOrder { account_id, update } => {
                 let account_id = self.require_account_id(account_id)?;
-                let canonical_id = if update.client_order_id.is_empty() {
-                    update.exchange_order_id.clone()
-                } else {
-                    update.client_order_id.clone()
+                let reported_order_id =
+                    if update.client_order_id.is_empty() || update.client_order_id == "0" {
+                        update.exchange_order_id.as_str()
+                    } else {
+                        update.client_order_id.as_str()
+                    };
+                self.ensure_private_order_account(&account_id, reported_order_id, &update.symbol)?;
+                let (canonical_id, known) = {
+                    let state = self
+                        .private_state(&account_id)
+                        .expect("validated account must have private state");
+                    let canonical_id =
+                        state.resolve_order_id(&update.client_order_id, &update.exchange_order_id);
+                    let known = state.order_reducer().contains_order(&canonical_id);
+                    (canonical_id, known)
                 };
-                let known = {
-                    let state = self.private_state_mut(&account_id)?;
-                    state.order_reducer().contains_order(&canonical_id)
-                        || state
-                            .canonical_order_id(&update.exchange_order_id)
-                            .is_some()
-                };
-                let canonical = self.private_state_mut(&account_id)?.apply_order(update);
+                let ts_ms = update.ts_ms;
+                let symbol = update.symbol.clone();
+                let canonical = self
+                    .private_state_mut(&account_id)?
+                    .apply_order(update)
+                    .map_err(|source| CoordinatorError::PrivateOrderIdentity {
+                        account_id: account_id.clone(),
+                        source,
+                    })?;
                 let mut output = CoordinatorOutput::default();
                 if !known {
                     output.extend(self.reconciliation_fault(
                         &account_id,
-                        canonical.as_ref().map(|order| order.ts_ms).unwrap_or(0),
-                        canonical.as_ref().map(|order| order.symbol.clone()),
+                        ts_ms,
+                        Some(symbol),
                         format!("private update for unknown order {canonical_id}"),
                     )?);
                 }
@@ -316,15 +351,22 @@ impl LiveCoordinator {
             }
             FeedOutput::PrivateFill { account_id, fill } => {
                 let account_id = self.require_account_id(account_id)?;
-                let canonical_id = if fill.client_order_id.is_empty() {
-                    fill.exchange_order_id.clone()
-                } else {
-                    fill.client_order_id.clone()
+                let reported_order_id =
+                    if fill.client_order_id.is_empty() || fill.client_order_id == "0" {
+                        fill.exchange_order_id.as_str()
+                    } else {
+                        fill.client_order_id.as_str()
+                    };
+                self.ensure_private_order_account(&account_id, reported_order_id, &fill.symbol)?;
+                let (canonical_id, known) = {
+                    let state = self
+                        .private_state(&account_id)
+                        .expect("validated account must have private state");
+                    let canonical_id =
+                        state.resolve_order_id(&fill.client_order_id, &fill.exchange_order_id);
+                    let known = state.order_reducer().contains_order(&canonical_id);
+                    (canonical_id, known)
                 };
-                let known = self
-                    .private_state_mut(&account_id)?
-                    .order_reducer()
-                    .contains_order(&canonical_id);
                 let fill_record = FillRecord {
                     ts_ms: fill.ts_ms,
                     account_id: Some(account_id.clone()),
@@ -338,7 +380,13 @@ impl LiveCoordinator {
                 };
                 let ts_ms = fill.ts_ms;
                 let symbol = fill.symbol.clone();
-                let canonical = self.private_state_mut(&account_id)?.apply_fill(fill);
+                let canonical = self
+                    .private_state_mut(&account_id)?
+                    .apply_fill(fill)
+                    .map_err(|source| CoordinatorError::PrivateOrderIdentity {
+                        account_id: account_id.clone(),
+                        source,
+                    })?;
                 let mut output = CoordinatorOutput {
                     actions: Vec::new(),
                     records: vec![StorageRecord::Fill(fill_record)],
@@ -399,6 +447,27 @@ impl LiveCoordinator {
                 message: errors.join(", "),
             })
         }
+    }
+
+    fn ensure_private_order_account(
+        &self,
+        account_id: &str,
+        order_id: &str,
+        symbol: &str,
+    ) -> Result<(), CoordinatorError> {
+        let expected = self
+            .config
+            .account_for_symbol(symbol)
+            .map(|account| account.id.as_str());
+        if expected == Some(account_id) {
+            return Ok(());
+        }
+        Err(CoordinatorError::WrongOrderAccount {
+            order_id: order_id.to_string(),
+            symbol: symbol.to_string(),
+            actual: account_id.to_string(),
+            expected: expected.unwrap_or("<unmapped>").to_string(),
+        })
     }
 
     pub fn register_local_order(
@@ -474,6 +543,14 @@ impl LiveCoordinator {
                 return Ok(output);
             }
         };
+        if let Some(exchange_order_id) = exchange_order_id.as_deref() {
+            self.private_state_mut(account_id)?
+                .bind_exchange_order_id(&client_order_id, exchange_order_id)
+                .map_err(|source| CoordinatorError::PrivateOrderIdentity {
+                    account_id: account_id.to_string(),
+                    source,
+                })?;
+        }
         Ok(CoordinatorOutput {
             actions: Vec::new(),
             records: vec![StorageRecord::OrderAck(OrderAckRecord {
@@ -542,14 +619,25 @@ impl LiveCoordinator {
         outcome: CancelOutcome,
         ts_ms: TimeMs,
     ) -> Result<CoordinatorOutput, CoordinatorError> {
-        self.private_state_mut(account_id)?;
+        let client_order_id = {
+            let state = self.private_state_mut(account_id)?;
+            let client_order_id =
+                state.resolve_order_id(&outcome.client_order_id, &outcome.exchange_order_id);
+            state
+                .bind_exchange_order_id(&client_order_id, &outcome.exchange_order_id)
+                .map_err(|source| CoordinatorError::PrivateOrderIdentity {
+                    account_id: account_id.to_string(),
+                    source,
+                })?;
+            client_order_id
+        };
         Ok(CoordinatorOutput {
             actions: Vec::new(),
             records: vec![StorageRecord::OrderAck(OrderAckRecord {
                 ts_ms,
                 account_id: account_id.to_string(),
                 operation: OrderOperation::Cancel,
-                client_order_id: outcome.client_order_id,
+                client_order_id,
                 exchange_order_id: Some(outcome.exchange_order_id),
                 status: OrderAckStatus::Accepted,
                 message: "cancel acknowledgement received; awaiting private stream".to_string(),
@@ -1894,6 +1982,218 @@ mod tests {
         assert!(output.actions.iter().any(
             |action| matches!(action, LiveAction::Reconcile(action) if action.account_id == "main")
         ));
+    }
+
+    #[test]
+    fn submit_ack_binding_resolves_missing_private_client_ids() {
+        let mut coordinator = coordinator();
+        ready(&mut coordinator);
+        coordinator
+            .register_local_order("main", "client-1", order(), 3)
+            .unwrap();
+        coordinator
+            .on_submit_outcome(
+                "main",
+                SubmitOutcome::Submitted {
+                    client_order_id: "client-1".to_string(),
+                    exchange_order_id: "exchange-1".to_string(),
+                },
+                4,
+            )
+            .unwrap();
+        let private_order = coordinator
+            .process_feed(FeedOutput::PrivateOrder {
+                account_id: Some("main".to_string()),
+                update: PrivateOrderUpdate {
+                    ts_ms: 5,
+                    exchange_order_id: "exchange-1".to_string(),
+                    client_order_id: String::new(),
+                    symbol: "BTC-USDT".to_string(),
+                    side: Side::Buy,
+                    state: PrivateOrderState::Live,
+                    price: 100.0,
+                    qty: 0.1,
+                    cumulative_filled_qty: 0.0,
+                    average_fill_price: 0.0,
+                    last_fill_qty: 0.0,
+                    last_fill_price: 0.0,
+                    liquidity: None,
+                    fill_id: None,
+                    reject_reason: String::new(),
+                },
+            })
+            .unwrap();
+
+        assert!(private_order.records.iter().any(|record| matches!(
+            record,
+            StorageRecord::Order { update, .. } if update.order_id == "client-1"
+        )));
+        assert!(
+            !private_order
+                .actions
+                .iter()
+                .any(|action| matches!(action, LiveAction::Reconcile(_)))
+        );
+        let fill = coordinator
+            .process_feed(FeedOutput::PrivateFill {
+                account_id: Some("main".to_string()),
+                fill: RemoteFill {
+                    fill_id: "fill-1".to_string(),
+                    exchange_order_id: "exchange-1".to_string(),
+                    client_order_id: "0".to_string(),
+                    symbol: "BTC-USDT".to_string(),
+                    side: Side::Buy,
+                    price: 100.0,
+                    qty: 0.05,
+                    liquidity: FillLiquidity::Taker,
+                    ts_ms: 6,
+                },
+            })
+            .unwrap();
+
+        assert!(fill.records.iter().any(|record| matches!(
+            record,
+            StorageRecord::Fill(fill) if fill.order_id == "client-1"
+        )));
+        assert!(
+            !fill
+                .actions
+                .iter()
+                .any(|action| matches!(action, LiveAction::Reconcile(_)))
+        );
+        let state = coordinator.private_state("main").unwrap();
+        assert_eq!(state.order_reducer().orders().count(), 1);
+        assert!(state.order_reducer().get("exchange-1").is_none());
+    }
+
+    #[test]
+    fn wrong_account_private_order_and_fill_fail_before_state_mutation() {
+        let mut coordinator = two_account_coordinator();
+        ready_two_accounts(&mut coordinator);
+        let order_error = coordinator
+            .process_feed(FeedOutput::PrivateOrder {
+                account_id: Some("hedge".to_string()),
+                update: cancelled_private_order("wrong-order", "wrong-exchange", 3),
+            })
+            .unwrap_err();
+        assert!(matches!(
+            order_error,
+            CoordinatorError::WrongOrderAccount {
+                actual,
+                expected,
+                ..
+            } if actual == "hedge" && expected == "main"
+        ));
+        assert!(
+            !coordinator
+                .private_state("hedge")
+                .unwrap()
+                .order_reducer()
+                .contains_order("wrong-order")
+        );
+
+        let fill_error = coordinator
+            .process_feed(FeedOutput::PrivateFill {
+                account_id: Some("hedge".to_string()),
+                fill: RemoteFill {
+                    fill_id: "wrong-fill".to_string(),
+                    exchange_order_id: "wrong-exchange".to_string(),
+                    client_order_id: "wrong-order".to_string(),
+                    symbol: "BTC-USDT".to_string(),
+                    side: Side::Buy,
+                    price: 100.0,
+                    qty: 0.1,
+                    liquidity: FillLiquidity::Taker,
+                    ts_ms: 4,
+                },
+            })
+            .unwrap_err();
+        assert!(matches!(
+            fill_error,
+            CoordinatorError::WrongOrderAccount { actual, .. } if actual == "hedge"
+        ));
+        assert!(
+            !coordinator
+                .private_state("hedge")
+                .unwrap()
+                .seen_fill_ids()
+                .contains("wrong-fill")
+        );
+    }
+
+    #[test]
+    fn known_order_identity_mismatch_fails_before_mapping_or_fill_mutation() {
+        let mut coordinator = coordinator();
+        coordinator
+            .register_local_order("main", "client-1", order(), 3)
+            .unwrap();
+        let order_error = coordinator
+            .process_feed(FeedOutput::PrivateOrder {
+                account_id: Some("main".to_string()),
+                update: PrivateOrderUpdate {
+                    ts_ms: 4,
+                    exchange_order_id: "exchange-1".to_string(),
+                    client_order_id: "client-1".to_string(),
+                    symbol: "BTC-PERP".to_string(),
+                    side: Side::Buy,
+                    state: PrivateOrderState::Live,
+                    price: 100.0,
+                    qty: 0.1,
+                    cumulative_filled_qty: 0.0,
+                    average_fill_price: 0.0,
+                    last_fill_qty: 0.0,
+                    last_fill_price: 0.0,
+                    liquidity: None,
+                    fill_id: None,
+                    reject_reason: String::new(),
+                },
+            })
+            .unwrap_err();
+        assert!(matches!(
+            order_error,
+            CoordinatorError::PrivateOrderIdentity {
+                source: PrivateOrderIdentityError::SymbolMismatch { .. },
+                ..
+            }
+        ));
+        assert!(
+            coordinator
+                .private_state("main")
+                .unwrap()
+                .canonical_order_id("exchange-1")
+                .is_none()
+        );
+
+        let fill_error = coordinator
+            .process_feed(FeedOutput::PrivateFill {
+                account_id: Some("main".to_string()),
+                fill: RemoteFill {
+                    fill_id: "fill-wrong-side".to_string(),
+                    exchange_order_id: String::new(),
+                    client_order_id: "client-1".to_string(),
+                    symbol: "BTC-USDT".to_string(),
+                    side: Side::Sell,
+                    price: 100.0,
+                    qty: 0.05,
+                    liquidity: FillLiquidity::Taker,
+                    ts_ms: 5,
+                },
+            })
+            .unwrap_err();
+        assert!(matches!(
+            fill_error,
+            CoordinatorError::PrivateOrderIdentity {
+                source: PrivateOrderIdentityError::SideMismatch { .. },
+                ..
+            }
+        ));
+        assert!(
+            !coordinator
+                .private_state("main")
+                .unwrap()
+                .seen_fill_ids()
+                .contains("fill-wrong-side")
+        );
     }
 
     #[test]

@@ -625,6 +625,32 @@ fn validate_recovered_safety_latches(
     Ok(())
 }
 
+fn restore_active_order_bindings(
+    coordinator: &mut LiveCoordinator,
+    recovered: &RecoveredStorage,
+) -> Result<(), LiveRuntimeError> {
+    for (account_id, bindings) in &recovered.order_bindings {
+        if !coordinator.manages_account(account_id) {
+            return Err(LiveRuntimeError::BootstrapVerification(format!(
+                "recovered order binding references unknown account {account_id}; retain the journal and reconcile before changing account identity"
+            )));
+        }
+        for (exchange_order_id, client_order_id) in bindings {
+            let active_order_is_restored = coordinator
+                .private_state(account_id)
+                .is_some_and(|state| state.order_reducer().contains_order(client_order_id));
+            if active_order_is_restored {
+                coordinator.restore_order_binding(
+                    account_id,
+                    client_order_id,
+                    exchange_order_id,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn restored_latch_reason(latch: &SafetyLatchRecord) -> String {
     let source = match latch.source {
         SafetyLatchSource::Operator => "operator",
@@ -907,6 +933,7 @@ impl LiveRuntime {
                 })?;
             initial_outputs.push(coordinator.restore_order(&account_id, update)?);
         }
+        restore_active_order_bindings(&mut coordinator, &recovered)?;
         for account in &config.accounts {
             let snapshot = snapshots.get(&account.id).ok_or_else(|| {
                 LiveRuntimeError::BootstrapVerification(format!(
@@ -915,13 +942,10 @@ impl LiveRuntime {
                 ))
             })?;
             for fill in &snapshot.recent_fills {
-                let order_id = if fill.client_order_id.is_empty() {
-                    &fill.exchange_order_id
-                } else {
-                    &fill.client_order_id
-                };
                 let should_apply = coordinator.private_state(&account.id).is_some_and(|state| {
-                    state.order_reducer().contains_order(order_id)
+                    let order_id =
+                        state.resolve_order_id(&fill.client_order_id, &fill.exchange_order_id);
+                    state.order_reducer().contains_order(&order_id)
                         && !state.seen_fill_ids().contains(&fill.fill_id)
                 });
                 if should_apply {
@@ -932,10 +956,11 @@ impl LiveRuntime {
                 }
             }
             for remote in &snapshot.open_orders {
-                let order_id = remote_order_id(remote);
-                let known = coordinator
-                    .private_state(&account.id)
-                    .is_some_and(|state| state.order_reducer().contains_order(&order_id));
+                let known = coordinator.private_state(&account.id).is_some_and(|state| {
+                    let order_id =
+                        state.resolve_order_id(&remote.client_order_id, &remote.exchange_order_id);
+                    state.order_reducer().contains_order(&order_id)
+                });
                 if known {
                     initial_outputs.push(coordinator.process_feed(FeedOutput::PrivateOrder {
                         account_id: Some(account.id.clone()),
@@ -1813,7 +1838,6 @@ impl LiveRuntime {
                             .map_err(|error| LiveRuntimeError::FeedAdapter(error.to_string()))?);
                 for event in parsed {
                     for output in self.processor.process(event) {
-                        self.observe_feed_output(&output);
                         let private_account_id = match &output {
                             FeedOutput::PrivateAccount {
                                 account_id: Some(account_id),
@@ -2045,28 +2069,6 @@ impl LiveRuntime {
         Ok(())
     }
 
-    fn observe_feed_output(&mut self, output: &FeedOutput) {
-        if let FeedOutput::PrivateOrder {
-            account_id: Some(account_id),
-            update,
-        } = output
-            && matches!(
-                update.state,
-                PrivateOrderState::Filled
-                    | PrivateOrderState::Cancelled
-                    | PrivateOrderState::Rejected
-            )
-        {
-            let order_id = if update.client_order_id.is_empty() {
-                &update.exchange_order_id
-            } else {
-                &update.client_order_id
-            };
-            self.cancel_inflight
-                .remove(&(account_id.clone(), order_id.clone()));
-        }
-    }
-
     fn observe_account_convergence(
         &mut self,
         account_id: &str,
@@ -2088,16 +2090,13 @@ impl LiveRuntime {
         remote_fills: &[RemoteFill],
     ) -> Result<(), LiveRuntimeError> {
         for fill in remote_fills {
-            let order_id = if fill.client_order_id.is_empty() {
-                &fill.exchange_order_id
-            } else {
-                &fill.client_order_id
-            };
             let should_apply = self
                 .coordinator
                 .private_state(account_id)
                 .is_some_and(|state| {
-                    state.order_reducer().contains_order(order_id)
+                    let order_id =
+                        state.resolve_order_id(&fill.client_order_id, &fill.exchange_order_id);
+                    state.order_reducer().contains_order(&order_id)
                         && !state.seen_fill_ids().contains(&fill.fill_id)
                 });
             if should_apply {
@@ -2110,11 +2109,14 @@ impl LiveRuntime {
             }
         }
         for remote in remote_orders {
-            let order_id = remote_order_id(remote);
             let known = self
                 .coordinator
                 .private_state(account_id)
-                .is_some_and(|state| state.order_reducer().contains_order(&order_id));
+                .is_some_and(|state| {
+                    let order_id =
+                        state.resolve_order_id(&remote.client_order_id, &remote.exchange_order_id);
+                    state.order_reducer().contains_order(&order_id)
+                });
             if known {
                 let output = self.coordinator.process_feed(FeedOutput::PrivateOrder {
                     account_id: Some(account_id.to_string()),
@@ -2176,6 +2178,13 @@ impl LiveRuntime {
             {
                 self.order_convergence
                     .observe_order(account_id, update, observed_ms);
+                if matches!(
+                    update.status,
+                    OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected
+                ) {
+                    self.cancel_inflight
+                        .remove(&(account_id.clone(), update.order_id.clone()));
+                }
             }
         }
     }
@@ -2858,7 +2867,10 @@ async fn run_order_task(
                     .cancel(&action.symbol, None, Some(action.client_order_id.clone()))
                     .await
                 {
-                    Ok(outcome) => {
+                    Ok(mut outcome) => {
+                        if outcome.client_order_id.is_empty() || outcome.client_order_id == "0" {
+                            outcome.client_order_id = action.client_order_id;
+                        }
                         if events
                             .send(RuntimeEvent::CancelComplete {
                                 account_id: account_id.clone(),
@@ -3781,6 +3793,65 @@ mod tests {
             ),
         );
         let error = validate_recovered_safety_latches(&config, &recovered).unwrap_err();
+        assert!(error.to_string().contains("unknown account removed"));
+    }
+
+    #[test]
+    fn restart_restores_exchange_binding_for_active_order() {
+        let config = config();
+        let mut coordinator = ready_coordinator(&config, unix_time_ms(), true);
+        coordinator
+            .restore_order(
+                "main",
+                OrderUpdate {
+                    ts_ms: 2,
+                    order_id: "restored-live".to_string(),
+                    symbol: "BTC-USDT".to_string(),
+                    side: Side::Buy,
+                    event: OrderEvent::New,
+                    status: OrderStatus::Live,
+                    price: 100.0,
+                    time_in_force: Some(reap_core::TimeInForce::PostOnly),
+                    qty: 1.0,
+                    open_qty: 1.0,
+                    filled_qty: 0.0,
+                    avg_fill_price: 0.0,
+                    last_fill_qty: 0.0,
+                    last_fill_price: 0.0,
+                    last_fill_liquidity: None,
+                    reason: "restored quote".to_string(),
+                },
+            )
+            .unwrap();
+        let mut recovered = RecoveredStorage::default();
+        recovered.order_bindings.insert(
+            "main".to_string(),
+            HashMap::from([("exchange-1".to_string(), "restored-live".to_string())]),
+        );
+
+        restore_active_order_bindings(&mut coordinator, &recovered).unwrap();
+
+        assert_eq!(
+            coordinator
+                .private_state("main")
+                .unwrap()
+                .canonical_order_id("exchange-1"),
+            Some("restored-live")
+        );
+    }
+
+    #[test]
+    fn recovered_order_binding_account_must_match_live_config() {
+        let config = config();
+        let mut coordinator = ready_coordinator(&config, unix_time_ms(), true);
+        let mut recovered = RecoveredStorage::default();
+        recovered.order_bindings.insert(
+            "removed".to_string(),
+            HashMap::from([("exchange-1".to_string(), "order-1".to_string())]),
+        );
+
+        let error = restore_active_order_bindings(&mut coordinator, &recovered).unwrap_err();
+
         assert!(error.to_string().contains("unknown account removed"));
     }
 

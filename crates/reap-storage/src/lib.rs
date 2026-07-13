@@ -139,6 +139,7 @@ pub struct BootstrapRecord {
 #[derive(Debug, Clone, Default)]
 pub struct RecoveredStorage {
     pub latest_orders: HashMap<String, OrderUpdate>,
+    pub order_bindings: HashMap<String, HashMap<String, String>>,
     pub fills: Vec<FillRecord>,
     pub seen_fill_ids: HashSet<String>,
     pub baseline_fill_ids: HashMap<String, HashSet<String>>,
@@ -514,6 +515,55 @@ pub fn recover_jsonl(path: impl AsRef<Path>) -> Result<RecoveredStorage, Storage
                 recovered
                     .latest_orders
                     .insert(update.order_id.clone(), update);
+            }
+            StorageRecord::OrderAck(ack) => {
+                let Some(exchange_order_id) = ack.exchange_order_id else {
+                    continue;
+                };
+                if ack.client_order_id.is_empty()
+                    || ack.client_order_id == "0"
+                    || exchange_order_id.is_empty()
+                    || exchange_order_id == "0"
+                {
+                    continue;
+                }
+                let bindings = recovered
+                    .order_bindings
+                    .entry(ack.account_id.clone())
+                    .or_default();
+                if let Some(existing_client_order_id) = bindings.get(&exchange_order_id)
+                    && existing_client_order_id != &ack.client_order_id
+                {
+                    return Err(StorageError::Corrupt {
+                        line: index + 1,
+                        message: format!(
+                            "account {} exchange order {} is bound to both client orders {} and {}",
+                            ack.account_id,
+                            exchange_order_id,
+                            existing_client_order_id,
+                            ack.client_order_id
+                        ),
+                    });
+                }
+                if let Some(existing_exchange_order_id) = bindings.iter().find_map(
+                    |(existing_exchange_order_id, existing_client_order_id)| {
+                        (existing_client_order_id == &ack.client_order_id
+                            && existing_exchange_order_id != &exchange_order_id)
+                            .then_some(existing_exchange_order_id)
+                    },
+                ) {
+                    return Err(StorageError::Corrupt {
+                        line: index + 1,
+                        message: format!(
+                            "account {} client order {} is bound to both exchange orders {} and {}",
+                            ack.account_id,
+                            ack.client_order_id,
+                            existing_exchange_order_id,
+                            exchange_order_id
+                        ),
+                    });
+                }
+                bindings.insert(exchange_order_id, ack.client_order_id);
             }
             StorageRecord::Fill(fill) => {
                 recovered.seen_fill_ids.insert(fill.fill_id.clone());
@@ -1077,6 +1127,17 @@ mod tests {
         }))
         .await
         .unwrap();
+        sink.record(StorageRecord::OrderAck(OrderAckRecord {
+            ts_ms: 1,
+            account_id: "main".to_string(),
+            operation: OrderOperation::Submit,
+            client_order_id: "order-1".to_string(),
+            exchange_order_id: Some("exchange-1".to_string()),
+            status: OrderAckStatus::Accepted,
+            message: "accepted".to_string(),
+        }))
+        .await
+        .unwrap();
         let mut order = OrderUpdate {
             ts_ms: 1,
             order_id: "order-1".to_string(),
@@ -1132,7 +1193,55 @@ mod tests {
         );
         assert!(recovered.seen_fill_ids.contains("fill-1"));
         assert!(recovered.baseline_fill_ids["main"].contains("historical-fill"));
+        assert_eq!(recovered.order_bindings["main"]["exchange-1"], "order-1");
         assert_eq!(recovered.last_ts_ms, 2);
+    }
+
+    #[test]
+    fn recovery_rejects_conflicting_order_ack_bindings() {
+        for (client_order_id, exchange_order_id) in
+            [("order-1", "exchange-2"), ("order-2", "exchange-1")]
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("events.jsonl");
+            let records = [
+                StorageRecord::OrderAck(OrderAckRecord {
+                    ts_ms: 1,
+                    account_id: "main".to_string(),
+                    operation: OrderOperation::Submit,
+                    client_order_id: "order-1".to_string(),
+                    exchange_order_id: Some("exchange-1".to_string()),
+                    status: OrderAckStatus::Accepted,
+                    message: "accepted".to_string(),
+                }),
+                StorageRecord::OrderAck(OrderAckRecord {
+                    ts_ms: 2,
+                    account_id: "main".to_string(),
+                    operation: OrderOperation::Submit,
+                    client_order_id: client_order_id.to_string(),
+                    exchange_order_id: Some(exchange_order_id.to_string()),
+                    status: OrderAckStatus::Duplicate,
+                    message: "duplicate".to_string(),
+                }),
+            ];
+            let journal = records
+                .into_iter()
+                .map(|record| {
+                    serde_json::to_string(&StoredEnvelope {
+                        schema_version: CURRENT_SCHEMA_VERSION,
+                        record,
+                    })
+                    .unwrap()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(&path, format!("{journal}\n")).unwrap();
+
+            let error = recover_jsonl(path).unwrap_err();
+
+            assert!(matches!(&error, StorageError::Corrupt { line: 2, .. }));
+            assert!(error.to_string().contains("bound to both"));
+        }
     }
 
     #[tokio::test]

@@ -86,6 +86,22 @@ pub fn reconcile(
     remote_orders: &[RemoteOrder],
     remote_fills: &[RemoteFill],
 ) -> ReconcileReport {
+    reconcile_with_order_ids(
+        local,
+        known_fill_ids,
+        remote_orders,
+        remote_fills,
+        reported_order_id,
+    )
+}
+
+fn reconcile_with_order_ids(
+    local: &OrderReducer,
+    known_fill_ids: &HashSet<String>,
+    remote_orders: &[RemoteOrder],
+    remote_fills: &[RemoteFill],
+    resolve_order_id: impl Fn(&str, &str) -> String,
+) -> ReconcileReport {
     let local_live = local
         .orders()
         .filter(|(_, order)| {
@@ -101,7 +117,12 @@ pub fn reconcile(
                 PrivateOrderState::Live | PrivateOrderState::PartiallyFilled
             )
         })
-        .map(|order| (remote_id(order), order))
+        .map(|order| {
+            (
+                resolve_order_id(&order.client_order_id, &order.exchange_order_id),
+                order,
+            )
+        })
         .collect::<HashMap<_, _>>();
     let mut issues = Vec::new();
 
@@ -148,15 +169,11 @@ pub fn reconcile(
         }
     }
     for fill in remote_fills {
-        let order_id = if fill.client_order_id.is_empty() {
-            &fill.exchange_order_id
-        } else {
-            &fill.client_order_id
-        };
+        let order_id = resolve_order_id(&fill.client_order_id, &fill.exchange_order_id);
         if !known_fill_ids.contains(&fill.fill_id) {
             issues.push(ReconcileIssue::UnknownFill {
                 fill_id: fill.fill_id.clone(),
-                order_id: order_id.clone(),
+                order_id,
                 symbol: fill.symbol.clone(),
             });
         }
@@ -177,11 +194,14 @@ pub fn reconcile_full_state(
     remote_fills: &[RemoteFill],
     remote_account: &AccountUpdate,
 ) -> ReconcileReport {
-    let mut report = reconcile(
+    let mut report = reconcile_with_order_ids(
         local.order_reducer(),
         local.seen_fill_ids(),
         remote_orders,
         remote_fills,
+        |client_order_id, exchange_order_id| {
+            local.resolve_order_id(client_order_id, exchange_order_id)
+        },
     );
     compare_account_state(local, remote_account, &mut report.issues);
     report
@@ -335,11 +355,11 @@ fn numbers_equal(left: f64, right: f64) -> bool {
     (left - right).abs() <= scale * 1e-9
 }
 
-fn remote_id(order: &RemoteOrder) -> String {
-    if order.client_order_id.is_empty() {
-        order.exchange_order_id.clone()
+fn reported_order_id(client_order_id: &str, exchange_order_id: &str) -> String {
+    if client_order_id.is_empty() || client_order_id == "0" {
+        exchange_order_id.to_string()
     } else {
-        order.client_order_id.clone()
+        client_order_id.to_string()
     }
 }
 
@@ -410,6 +430,48 @@ mod tests {
         let report = reconcile(&local, &HashSet::new(), &[remote], &[fill]);
         assert!(!report.is_clean());
         assert_eq!(report.issues.len(), 2);
+    }
+
+    #[test]
+    fn full_state_reconciliation_resolves_missing_client_id_from_submit_binding() {
+        let mut local = PrivateStateReducer::new();
+        local.order_reducer_mut().ack_new(
+            "client-1",
+            NewOrder {
+                symbol: "BTC-USDT".to_string(),
+                side: Side::Buy,
+                qty: 1.0,
+                price: 100.0,
+                time_in_force: TimeInForce::Gtc,
+                reduce_only: false,
+                self_trade_prevention: None,
+                reason: "test".to_string(),
+            },
+            1,
+        );
+        local
+            .bind_exchange_order_id("client-1", "exchange-1")
+            .unwrap();
+        let remote = RemoteOrder {
+            exchange_order_id: "exchange-1".to_string(),
+            client_order_id: String::new(),
+            symbol: "BTC-USDT".to_string(),
+            side: Side::Buy,
+            state: PrivateOrderState::Live,
+            price: 100.0,
+            qty: 1.0,
+            cumulative_filled_qty: 0.0,
+            average_fill_price: 0.0,
+            update_time_ms: 2,
+        };
+        let account = AccountUpdate {
+            ts_ms: 2,
+            balances: Vec::new(),
+            positions: Vec::new(),
+            margins: Vec::new(),
+        };
+
+        assert!(reconcile_full_state(&local, &[remote], &[], &account).is_clean());
     }
 
     #[test]

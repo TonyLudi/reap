@@ -260,6 +260,26 @@ settings; accepting only their static flags would weaken live stop behavior.
   close or correct the OKX position outside Reap, and start again from a clean
   bootstrap. Use a dedicated subaccount for this strategy.
 
+## Private Order Identity And Account Scope
+
+- Accepted REST submit and cancel acknowledgements bind the exchange order ID
+  to the already registered client order ID. The acknowledgements are journaled;
+  active bindings are reconstructed before startup REST reduction, and
+  contradictory journal history aborts startup. Private order/fill rows with an
+  empty client ID, and the OKX fill sentinel `"0"`, resolve through that binding
+  in live processing, restart recovery, cancel convergence, and full REST
+  reconciliation.
+- Before mutation, every private order and fill symbol must route to the account
+  that delivered it. A known order's symbol and side are immutable. Neither an
+  exchange order ID nor a client order ID can be rebound to a different peer.
+  The same checks run before fill IDs or cumulative quantities are recorded.
+- A correctly scoped but unknown private order still enters canonical state and
+  immediately requests reconciliation so fail-closed cancellation can discover
+  it. Wrong-account, conflicting-binding, symbol-change, and side-change rows
+  are fatal lifecycle errors; the raw frame is already journaled, no corrupted
+  canonical state is applied, and normal runtime failure cleanup cancels and
+  reconciles managed accounts.
+
 ## Forced Repayment Risk
 
 - OKX account websocket and REST balance rows expose `twap`, a forced-repayment

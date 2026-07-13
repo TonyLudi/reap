@@ -211,6 +211,10 @@ Responsibilities:
 - Per-venue/account order gateway.
 - Rate limiting and request pacing.
 - Canonical order state reducer.
+- Typed one-to-one exchange/client order-ID binding from REST acknowledgements,
+  with contradictory journal history rejected and active bindings restored
+  before startup REST reduction; private order/fill symbol ownership and
+  immutable symbol/side checks occur before canonical state mutation.
 - REST reconciliation for open orders, fills, balances, and positions.
 - Authoritative account-snapshot replacement with zero tombstones for balances
   and positions omitted after closure, plus per-row monotonic update guards.

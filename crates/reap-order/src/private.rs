@@ -1,9 +1,50 @@
 use std::collections::{HashMap, HashSet};
 
-use reap_core::{AccountUpdate, Balance, NewOrder, OrderEvent, OrderStatus, OrderUpdate, Position};
+use reap_core::{
+    AccountUpdate, Balance, NewOrder, OrderEvent, OrderStatus, OrderUpdate, Position, Side,
+};
 use reap_venue::{PrivateOrderState, PrivateOrderUpdate, RemoteFill};
+use thiserror::Error;
 
 use crate::OrderReducer;
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum PrivateOrderIdentityError {
+    #[error("private event has neither a client order id nor an exchange order id")]
+    MissingOrderId,
+    #[error("order acknowledgement for client order {client_order_id} has no exchange order id")]
+    MissingExchangeOrderId { client_order_id: String },
+    #[error("client order {client_order_id} is not registered in canonical private state")]
+    UnknownClientOrderId { client_order_id: String },
+    #[error(
+        "exchange order {exchange_order_id} is bound to client order {existing_client_order_id}, not {client_order_id}"
+    )]
+    ExchangeOrderBindingConflict {
+        exchange_order_id: String,
+        existing_client_order_id: String,
+        client_order_id: String,
+    },
+    #[error(
+        "client order {client_order_id} is bound to exchange order {existing_exchange_order_id}, not {exchange_order_id}"
+    )]
+    ClientOrderBindingConflict {
+        client_order_id: String,
+        existing_exchange_order_id: String,
+        exchange_order_id: String,
+    },
+    #[error("order {order_id} symbol changed from {expected} to {actual}")]
+    SymbolMismatch {
+        order_id: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("order {order_id} side changed from {expected:?} to {actual:?}")]
+    SideMismatch {
+        order_id: String,
+        expected: Side,
+        actual: Side,
+    },
+}
 
 #[derive(Debug, Default)]
 pub struct PrivateStateReducer {
@@ -11,6 +52,7 @@ pub struct PrivateStateReducer {
     balances: HashMap<String, Balance>,
     positions: HashMap<String, Position>,
     exchange_to_client: HashMap<String, String>,
+    client_to_exchange: HashMap<String, String>,
     seen_versions: HashSet<PrivateVersion>,
     seen_fill_ids: HashSet<String>,
     cumulative_fills: HashMap<String, f64>,
@@ -63,6 +105,40 @@ impl PrivateStateReducer {
             .map(String::as_str)
     }
 
+    pub fn resolve_order_id(&self, client_order_id: &str, exchange_order_id: &str) -> String {
+        if client_order_id.is_empty() || client_order_id == "0" {
+            self.exchange_to_client
+                .get(exchange_order_id)
+                .cloned()
+                .unwrap_or_else(|| exchange_order_id.to_string())
+        } else {
+            client_order_id.to_string()
+        }
+    }
+
+    pub fn bind_exchange_order_id(
+        &mut self,
+        client_order_id: &str,
+        exchange_order_id: &str,
+    ) -> Result<(), PrivateOrderIdentityError> {
+        if exchange_order_id.is_empty() {
+            return Err(PrivateOrderIdentityError::MissingExchangeOrderId {
+                client_order_id: client_order_id.to_string(),
+            });
+        }
+        if !self.orders.contains_order(client_order_id) {
+            return Err(PrivateOrderIdentityError::UnknownClientOrderId {
+                client_order_id: client_order_id.to_string(),
+            });
+        }
+        self.validate_exchange_binding(client_order_id, exchange_order_id)?;
+        self.exchange_to_client
+            .insert(exchange_order_id.to_string(), client_order_id.to_string());
+        self.client_to_exchange
+            .insert(client_order_id.to_string(), exchange_order_id.to_string());
+        Ok(())
+    }
+
     pub fn last_order_update_ms(&self, order_id: &str) -> Option<u64> {
         self.last_order_update_ms.get(order_id).copied()
     }
@@ -99,6 +175,9 @@ impl PrivateStateReducer {
     }
 
     pub fn remove_local_order(&mut self, client_order_id: &str) {
+        if let Some(exchange_order_id) = self.client_to_exchange.remove(client_order_id) {
+            self.exchange_to_client.remove(&exchange_order_id);
+        }
         self.orders.remove(client_order_id);
     }
 
@@ -243,21 +322,30 @@ impl PrivateStateReducer {
         update
     }
 
-    pub fn apply_order(&mut self, update: PrivateOrderUpdate) -> Option<OrderUpdate> {
-        let order_id = if update.client_order_id.is_empty() {
-            update.exchange_order_id.clone()
-        } else {
-            update.client_order_id.clone()
-        };
+    pub fn apply_order(
+        &mut self,
+        update: PrivateOrderUpdate,
+    ) -> Result<Option<OrderUpdate>, PrivateOrderIdentityError> {
+        let order_id = self.resolve_order_id(&update.client_order_id, &update.exchange_order_id);
+        if order_id.is_empty() {
+            return Err(PrivateOrderIdentityError::MissingOrderId);
+        }
+        self.validate_exchange_binding(&order_id, &update.exchange_order_id)?;
         let prior = self.cumulative_fills.get(&order_id).copied().unwrap_or(0.0);
         let existing = self.orders.get(&order_id).cloned();
+        validate_existing_order_identity(
+            existing.as_ref(),
+            &order_id,
+            &update.symbol,
+            update.side,
+        )?;
         let last_update_ms = self
             .last_order_update_ms
             .get(&order_id)
             .copied()
             .unwrap_or(0);
         if update.ts_ms < last_update_ms && update.cumulative_filled_qty <= prior {
-            return None;
+            return Ok(None);
         }
         let incoming_terminal = matches!(
             update.state,
@@ -267,7 +355,7 @@ impl PrivateStateReducer {
             && !incoming_terminal
             && update.cumulative_filled_qty <= prior
         {
-            return None;
+            return Ok(None);
         }
         let version = PrivateVersion {
             order_id: order_id.clone(),
@@ -278,11 +366,13 @@ impl PrivateStateReducer {
             fill_id: update.fill_id.clone(),
         };
         if !self.seen_versions.insert(version) {
-            return None;
+            return Ok(None);
         }
         if !update.exchange_order_id.is_empty() {
             self.exchange_to_client
                 .insert(update.exchange_order_id.clone(), order_id.clone());
+            self.client_to_exchange
+                .insert(order_id.clone(), update.exchange_order_id.clone());
         }
         self.last_order_update_ms
             .insert(order_id.clone(), update.ts_ms.max(last_update_ms));
@@ -375,31 +465,37 @@ impl PrivateStateReducer {
                 (None, false) => format!("okx_private:{}", update.reject_reason),
             },
         };
-        self.orders
+        Ok(self
+            .orders
             .apply_update(canonical.clone())
-            .then_some(canonical)
+            .then_some(canonical))
     }
 
-    pub fn apply_fill(&mut self, fill: RemoteFill) -> Option<OrderUpdate> {
-        let order_id = if fill.client_order_id.is_empty() || fill.client_order_id == "0" {
-            self.exchange_to_client
-                .get(&fill.exchange_order_id)
-                .cloned()
-                .unwrap_or_else(|| fill.exchange_order_id.clone())
-        } else {
-            fill.client_order_id.clone()
+    pub fn apply_fill(
+        &mut self,
+        fill: RemoteFill,
+    ) -> Result<Option<OrderUpdate>, PrivateOrderIdentityError> {
+        let order_id = self.resolve_order_id(&fill.client_order_id, &fill.exchange_order_id);
+        if order_id.is_empty() {
+            return Err(PrivateOrderIdentityError::MissingOrderId);
+        }
+        self.validate_exchange_binding(&order_id, &fill.exchange_order_id)?;
+        let Some(existing) = self.orders.get(&order_id).cloned() else {
+            return Ok(None);
         };
-        let existing = self.orders.get(&order_id)?.clone();
+        validate_existing_order_identity(Some(&existing), &order_id, &fill.symbol, fill.side)?;
         if !self.seen_fill_ids.insert(fill.fill_id.clone()) {
-            return None;
+            return Ok(None);
         }
         if !fill.exchange_order_id.is_empty() {
             self.exchange_to_client
-                .insert(fill.exchange_order_id, order_id.clone());
+                .insert(fill.exchange_order_id.clone(), order_id.clone());
+            self.client_to_exchange
+                .insert(order_id.clone(), fill.exchange_order_id);
         }
         let applied_qty = fill.qty.min(existing.open_qty);
         if applied_qty <= 0.0 {
-            return None;
+            return Ok(None);
         }
         let cumulative = existing.filled_qty + applied_qty;
         let open_qty = (existing.qty - cumulative).max(0.0);
@@ -433,10 +529,66 @@ impl PrivateStateReducer {
             last_fill_liquidity: Some(fill.liquidity),
             reason: existing.reason,
         };
-        self.orders
+        Ok(self
+            .orders
             .apply_update(canonical.clone())
-            .then_some(canonical)
+            .then_some(canonical))
     }
+
+    fn validate_exchange_binding(
+        &self,
+        order_id: &str,
+        exchange_order_id: &str,
+    ) -> Result<(), PrivateOrderIdentityError> {
+        if exchange_order_id.is_empty() {
+            return Ok(());
+        }
+        if let Some(existing_client_order_id) = self.exchange_to_client.get(exchange_order_id)
+            && existing_client_order_id != order_id
+        {
+            return Err(PrivateOrderIdentityError::ExchangeOrderBindingConflict {
+                exchange_order_id: exchange_order_id.to_string(),
+                existing_client_order_id: existing_client_order_id.clone(),
+                client_order_id: order_id.to_string(),
+            });
+        }
+        if let Some(existing_exchange_order_id) = self.client_to_exchange.get(order_id)
+            && existing_exchange_order_id != exchange_order_id
+        {
+            return Err(PrivateOrderIdentityError::ClientOrderBindingConflict {
+                client_order_id: order_id.to_string(),
+                existing_exchange_order_id: existing_exchange_order_id.clone(),
+                exchange_order_id: exchange_order_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn validate_existing_order_identity(
+    existing: Option<&crate::OrderSnapshot>,
+    order_id: &str,
+    symbol: &str,
+    side: Side,
+) -> Result<(), PrivateOrderIdentityError> {
+    let Some(existing) = existing else {
+        return Ok(());
+    };
+    if existing.symbol != symbol {
+        return Err(PrivateOrderIdentityError::SymbolMismatch {
+            order_id: order_id.to_string(),
+            expected: existing.symbol.clone(),
+            actual: symbol.to_string(),
+        });
+    }
+    if existing.side != side {
+        return Err(PrivateOrderIdentityError::SideMismatch {
+            order_id: order_id.to_string(),
+            expected: existing.side,
+            actual: side,
+        });
+    }
+    Ok(())
 }
 
 fn canonical_status(state: PrivateOrderState) -> OrderStatus {
@@ -500,11 +652,11 @@ mod tests {
     #[test]
     fn duplicate_private_fill_is_idempotent() {
         let mut reducer = PrivateStateReducer::new();
-        let first = reducer.apply_order(private_fill()).unwrap();
+        let first = reducer.apply_order(private_fill()).unwrap().unwrap();
         let second = reducer.apply_order(private_fill());
 
         assert_eq!(first.last_fill_qty, 0.4);
-        assert!(second.is_none());
+        assert!(second.unwrap().is_none());
         assert_eq!(
             reducer.order_reducer().get("client-1").unwrap().filled_qty,
             0.4
@@ -529,7 +681,7 @@ mod tests {
             },
         );
 
-        let update = reducer.apply_order(private_fill()).unwrap();
+        let update = reducer.apply_order(private_fill()).unwrap().unwrap();
 
         assert_eq!(update.reason, "quote:1");
         assert_eq!(update.time_in_force, Some(reap_core::TimeInForce::PostOnly));
@@ -537,6 +689,114 @@ mod tests {
             reducer.order_reducer().get("client-1").unwrap().reason,
             "quote:1"
         );
+    }
+
+    #[test]
+    fn submit_binding_resolves_missing_private_client_id_without_duplicate_order() {
+        let mut reducer = PrivateStateReducer::new();
+        reducer.register_local_order(
+            "client-1",
+            NewOrder {
+                symbol: "BTC-USDT".to_string(),
+                side: Side::Buy,
+                qty: 1.0,
+                price: 100.0,
+                time_in_force: reap_core::TimeInForce::Ioc,
+                reduce_only: false,
+                self_trade_prevention: None,
+                reason: "hedge".to_string(),
+            },
+        );
+        reducer
+            .bind_exchange_order_id("client-1", "exchange-1")
+            .unwrap();
+        let mut live = private_fill();
+        live.client_order_id.clear();
+        live.state = PrivateOrderState::Live;
+        live.cumulative_filled_qty = 0.0;
+        live.last_fill_qty = 0.0;
+        live.fill_id = None;
+
+        let update = reducer.apply_order(live).unwrap().unwrap();
+
+        assert_eq!(update.order_id, "client-1");
+        assert_eq!(update.time_in_force, Some(reap_core::TimeInForce::Ioc));
+        assert_eq!(reducer.order_reducer().orders().count(), 1);
+        assert!(reducer.order_reducer().get("exchange-1").is_none());
+    }
+
+    #[test]
+    fn identity_conflicts_fail_before_private_state_mutation() {
+        let mut reducer = PrivateStateReducer::new();
+        for client_order_id in ["client-1", "client-2"] {
+            reducer.register_local_order(
+                client_order_id,
+                NewOrder {
+                    symbol: "BTC-USDT".to_string(),
+                    side: Side::Buy,
+                    qty: 1.0,
+                    price: 100.0,
+                    time_in_force: reap_core::TimeInForce::Gtc,
+                    reduce_only: false,
+                    self_trade_prevention: None,
+                    reason: "test".to_string(),
+                },
+            );
+        }
+        reducer
+            .bind_exchange_order_id("client-1", "exchange-1")
+            .unwrap();
+        let mut conflicting = private_fill();
+        conflicting.client_order_id = "client-2".to_string();
+        assert!(matches!(
+            reducer.apply_order(conflicting),
+            Err(PrivateOrderIdentityError::ExchangeOrderBindingConflict { .. })
+        ));
+        assert_eq!(reducer.canonical_order_id("exchange-1"), Some("client-1"));
+        assert_eq!(
+            reducer.order_reducer().get("client-2").unwrap().status,
+            OrderStatus::PendingNew
+        );
+
+        let mut wrong_symbol = private_fill();
+        wrong_symbol.exchange_order_id.clear();
+        wrong_symbol.symbol = "ETH-USDT".to_string();
+        assert!(matches!(
+            reducer.apply_order(wrong_symbol),
+            Err(PrivateOrderIdentityError::SymbolMismatch { .. })
+        ));
+        assert_eq!(
+            reducer.order_reducer().get("client-1").unwrap().symbol,
+            "BTC-USDT"
+        );
+    }
+
+    #[test]
+    fn client_order_cannot_bind_to_multiple_exchange_orders() {
+        let mut reducer = PrivateStateReducer::new();
+        reducer.register_local_order(
+            "client-1",
+            NewOrder {
+                symbol: "BTC-USDT".to_string(),
+                side: Side::Buy,
+                qty: 1.0,
+                price: 100.0,
+                time_in_force: reap_core::TimeInForce::Gtc,
+                reduce_only: false,
+                self_trade_prevention: None,
+                reason: "test".to_string(),
+            },
+        );
+        reducer
+            .bind_exchange_order_id("client-1", "exchange-1")
+            .unwrap();
+
+        assert!(matches!(
+            reducer.bind_exchange_order_id("client-1", "exchange-2"),
+            Err(PrivateOrderIdentityError::ClientOrderBindingConflict { .. })
+        ));
+        assert_eq!(reducer.canonical_order_id("exchange-1"), Some("client-1"));
+        assert_eq!(reducer.canonical_order_id("exchange-2"), None);
     }
 
     #[test]
@@ -719,8 +979,15 @@ mod tests {
             ts_ms: 2,
         };
 
-        assert_eq!(reducer.apply_fill(fill.clone()).unwrap().filled_qty, 0.4);
-        assert!(reducer.apply_fill(fill).is_none());
+        assert_eq!(
+            reducer
+                .apply_fill(fill.clone())
+                .unwrap()
+                .unwrap()
+                .filled_qty,
+            0.4
+        );
+        assert!(reducer.apply_fill(fill).unwrap().is_none());
     }
 
     #[test]
@@ -744,7 +1011,7 @@ mod tests {
         live.cumulative_filled_qty = 0.0;
         live.last_fill_qty = 0.0;
         live.fill_id = None;
-        reducer.apply_order(live).unwrap();
+        let _ = reducer.apply_order(live).unwrap();
 
         let update = reducer
             .apply_fill(RemoteFill {
@@ -758,6 +1025,7 @@ mod tests {
                 liquidity: FillLiquidity::Maker,
                 ts_ms: 2,
             })
+            .unwrap()
             .unwrap();
 
         assert_eq!(update.order_id, "client-1");
@@ -772,7 +1040,7 @@ mod tests {
         terminal.cumulative_filled_qty = 1.0;
         terminal.last_fill_qty = 1.0;
         terminal.ts_ms = 20;
-        reducer.apply_order(terminal).unwrap();
+        let _ = reducer.apply_order(terminal).unwrap();
 
         let mut late = private_fill();
         late.state = PrivateOrderState::Live;
@@ -780,7 +1048,7 @@ mod tests {
         late.last_fill_qty = 0.0;
         late.fill_id = None;
         late.ts_ms = 10;
-        assert!(reducer.apply_order(late).is_none());
+        assert!(reducer.apply_order(late).unwrap().is_none());
         assert_eq!(
             reducer.order_reducer().get("client-1").unwrap().status,
             OrderStatus::Filled
