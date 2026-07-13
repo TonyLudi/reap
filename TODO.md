@@ -108,15 +108,21 @@ architecture in [docs/architecture.md](docs/architecture.md).
   credentials, or network setup; retain it for the full runtime lifecycle.
 - [x] Add bounded asynchronous webhook alerts and Linux disk, memory, and
   kernel-clock preflight/periodic guards with fail-closed runtime integration.
+- [x] Add a strategy-independent, explicitly confirmed OKX emergency command
+  that arms Cancel All After, cancels regular orders account-wide, and proves
+  zero after the trigger horizon; document the algo/spread exclusion.
+- [x] Add hardened systemd templates with bounded observe restart and manual
+  demo/capture restart, plus the stop/cancel/reconcile operating procedure.
 - [ ] Run credentialed bounded observe and minimal-size demo fault campaigns,
   including process death, deadman expiry, clock skew, REST ambiguity, partial
   fill, reconnect, and durable-latch restart recovery.
 - [ ] Calibrate queue position, latency, fees, funding, and slippage from
   captured full-depth data; complete walk-forward, sensitivity, capacity, and
   stressed-liquidity reports.
-- [ ] Deploy and exercise the webhook/host guards on the target host; add
-  process supervision and an independent out-of-process exchange kill
-  procedure.
+- [ ] Deploy and exercise the webhook/host guards, systemd supervision, external
+  unit-failure paging, and independent exchange cancel procedure on the target
+  host/account; add a separate algo/spread kill path if those order classes are
+  enabled.
 - [ ] Certify production credentials/account mode/limits and expose production
   order entry only after every gate in `docs/trading-readiness.md` is signed off.
 

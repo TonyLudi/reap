@@ -5,7 +5,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use reap_backtest::BacktestRunner;
 use reap_capture::CaptureRunOptions;
-use reap_live::{LiveConfig, LiveMode, LiveRunOptions, OperatorCommand, send_operator_command};
+use reap_live::{
+    EmergencyCancelOptions, LiveConfig, LiveMode, LiveRunOptions, OperatorCommand,
+    run_emergency_cancel_path, send_operator_command,
+};
 use reap_strategy::ChaosConfig;
 
 #[derive(Debug, Parser)]
@@ -80,6 +83,58 @@ enum Command {
         #[command(subcommand)]
         command: OperatorCliCommand,
         #[arg(long, global = true)]
+        pretty: bool,
+    },
+    #[command(
+        about = "Cancel and verify all regular OKX orders for selected accounts",
+        long_about = "Arm OKX Cancel All After, cancel every regular pending order account-wide, and verify zero after the trigger horizon. This independent incident path excludes algo and spread orders."
+    )]
+    EmergencyCancel {
+        #[arg(
+            short,
+            long,
+            help = "Live TOML used only for REST/account safety settings"
+        )]
+        config: PathBuf,
+        #[arg(
+            long,
+            conflicts_with = "all_configured_accounts",
+            help = "Configured account id; repeat to select multiple accounts"
+        )]
+        account: Vec<String>,
+        #[arg(
+            long,
+            conflicts_with = "account",
+            help = "Select every account in the config"
+        )]
+        all_configured_accounts: bool,
+        #[arg(long, help = "Acknowledge that cancellation is account-wide")]
+        confirm_account_wide_cancel: bool,
+        #[arg(
+            long,
+            help = "Attest that every order producer for the selected accounts is stopped"
+        )]
+        confirm_order_producers_stopped: bool,
+        #[arg(
+            long,
+            help = "Additional acknowledgement required by production configs"
+        )]
+        confirm_production: bool,
+        #[arg(
+            long,
+            default_value_t = 30,
+            help = "Absolute deadline for each account"
+        )]
+        account_timeout_secs: u64,
+        #[arg(long, default_value_t = 250, help = "Delay between zero checks")]
+        poll_interval_ms: u64,
+        #[arg(
+            long,
+            default_value_t = 10,
+            help = "OKX Cancel All After trigger delay (10-120 seconds)"
+        )]
+        deadman_timeout_secs: u64,
+        #[arg(long, help = "Pretty-print JSON evidence")]
         pretty: bool,
     },
 }
@@ -280,6 +335,52 @@ async fn main() -> Result<()> {
             }
             if !response.ok {
                 anyhow::bail!("operator command was rejected: {}", response.message);
+            }
+        }
+        Command::EmergencyCancel {
+            config,
+            account,
+            all_configured_accounts,
+            confirm_account_wide_cancel,
+            confirm_order_producers_stopped,
+            confirm_production,
+            account_timeout_secs,
+            poll_interval_ms,
+            deadman_timeout_secs,
+            pretty,
+        } => {
+            reap_telemetry::init_json_tracing("info")
+                .map_err(anyhow::Error::msg)
+                .context("failed to initialize emergency-cancel tracing")?;
+            let report = run_emergency_cancel_path(
+                &config,
+                EmergencyCancelOptions {
+                    account_ids: account,
+                    all_configured_accounts,
+                    confirm_account_wide_cancel,
+                    confirm_order_producers_stopped,
+                    confirm_production,
+                    account_timeout: Duration::from_secs(account_timeout_secs),
+                    poll_interval: Duration::from_millis(poll_interval_ms),
+                    deadman_timeout_secs,
+                },
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "emergency cancel failed before producing evidence for {}",
+                    config.display()
+                )
+            })?;
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+            if !report.all_clear {
+                anyhow::bail!(
+                    "emergency cancel did not verify every selected account's regular order book at zero"
+                );
             }
         }
     }

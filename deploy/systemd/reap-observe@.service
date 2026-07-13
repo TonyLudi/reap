@@ -1,0 +1,48 @@
+[Unit]
+Description=Reap read-only OKX observer (%i)
+Documentation=file:/usr/local/share/doc/reap/operations.md
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=reap
+Group=reap
+WorkingDirectory=/var/lib/reap/live/%i
+EnvironmentFile=/etc/reap/live/%i.env
+Environment=RUST_BACKTRACE=1
+ExecStartPre=/usr/local/bin/reap live --config /etc/reap/live/%i.toml --mode validate
+ExecStart=/usr/local/bin/reap live --config /etc/reap/live/%i.toml --mode observe
+Restart=on-failure
+RestartSec=10s
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=45s
+UMask=0077
+LimitNOFILE=65536
+TasksMax=512
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/reap/live/%i
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=reap-observe-%i
+
+[Install]
+WantedBy=multi-user.target

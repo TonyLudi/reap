@@ -281,6 +281,9 @@ Responsibilities:
   guarantee scoped canonical cancellation.
 - Validate exchange time, expire stale place requests at the venue, and own an
   independently scheduled exchange deadman lifecycle per account.
+- Expose a separate minimal-config emergency composition that bypasses strategy,
+  journal, websocket, and operator dependencies while cancelling and verifying
+  the venue's regular order book account-wide.
 
 Implemented topology:
 
@@ -321,6 +324,14 @@ every account. Orders, account, and positions are required. The dedicated
 fills channel is opt-in because OKX restricts it by fee tier; fills from the
 orders channel remain canonical. Any lost invariant blocks new orders while
 demo-mode cancels remain available.
+
+The emergency composition is intentionally not part of the strategy loop. It
+uses its own REST transport, exchange-adjusted signing clock, absolute
+per-account deadline, deadman arm, bounded request pacing, batch cancellation,
+and repeated account-wide pending-order queries. This separation keeps the kill
+path usable after live-process or strategy-state failure. OKX algo and spread
+orders are outside this regular-order scope and remain an operationally explicit
+venue procedure.
 
 Later, if the strategy loop becomes latency-critical, replace the async receive
 with a pinned OS thread and a bounded SPSC queue.
@@ -405,14 +416,17 @@ Target command surface:
 ```text
 reap live --config config/live.toml
 reap capture --config config/capture.toml
+reap emergency-cancel --config config/live.toml --account account-id
+reap operator --config config/live.toml status
 reap backtest --config config/backtest.toml --events data/events.jsonl
 reap replay-check --events data/events.jsonl
 reap inspect-book --capture raw/ws.jsonl --symbol BTC-USDT
 reap config-check --config config/live.toml
 ```
 
-`live`, `capture`, `backtest`, `replay-check`, and `config-check` are implemented.
-`inspect-book` remains planned; see [trading-readiness.md](trading-readiness.md).
+`live`, `capture`, `emergency-cancel`, `operator`, `backtest`, `replay-check`, and
+`config-check` are implemented. `inspect-book` remains planned; see
+[trading-readiness.md](trading-readiness.md).
 
 ## Multi-Websocket Design
 
@@ -721,6 +735,9 @@ the deployment blocker.
   All After heartbeats, and durable restart latches. Done.
 - Add exclusive journal ownership, bounded external alerts, and host resource
   preflight/periodic guards. Done; target-host deployment evidence remains.
+- Add strategy-independent account-wide regular-order cancellation and hardened
+  mode-specific process supervision templates. Done; target-host/account fault
+  exercise and separate algo/spread handling remain.
 - Complete fault injection and OKX demo soak acceptance.
 
 See [trading-readiness.md](trading-readiness.md) for the detailed gate.

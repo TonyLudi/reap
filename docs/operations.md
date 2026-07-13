@@ -118,6 +118,100 @@ its alarm threshold. Never place capture output under source control.
   checks. The deployment supervisor must still monitor the actual NTP/PTP
   service and clock offset.
 
+## Process Supervision
+
+Hardened baseline units and installation notes live in
+[`deploy/systemd`](../deploy/systemd/README.md). They run as an unprivileged
+`reap` user with a strict read-only filesystem view, one instance-specific
+writable directory, bounded file descriptors/tasks, and no privilege or
+namespace acquisition.
+
+- `reap-observe@.service` may restart on failure because observe mode cannot
+  submit or cancel. A start limit bounds repeated bootstrap failures.
+- `reap-demo@.service` never restarts automatically. Any abnormal exit requires
+  independent exchange reconciliation and operator approval first.
+- `reap-capture@.service` never restarts automatically. Rotate to a new raw
+  output path before every start so a file cannot contain multiple capture
+  session IDs.
+- Set `TimeoutStopSec` above the configured runtime shutdown plus alert-drain
+  deadlines. A forced kill leaves the last exchange deadman in force but must be
+  treated as an incident, followed by the emergency procedure below.
+- Monitor activation failures, non-zero exits, start-limit exhaustion, forced
+  kills, and host resource/time alarms outside this process. Validate the unit
+  files and `systemd-analyze security` on the actual target OS.
+
+Use absolute storage, operator-socket, and capture paths below the instance's
+writable directory in deployed TOML. Config and environment files must be
+readable only by root and the `reap` group; the environment file is populated by
+the deployment secret provider.
+
+## Independent Emergency Cancel
+
+`reap emergency-cancel` is a separate composition root. It does not acquire or
+trust the strategy journal, operator socket, live event loop, websocket state,
+or strategy configuration. It parses only the OKX environment/REST settings,
+request pacing/timeouts, account credential environment names, and configured
+symbol keys. This keeps the exchange cancellation path available when the live
+strategy config or process is unhealthy.
+
+The command has a deliberately narrow scope: all **regular pending orders** on
+each selected OKX account, including symbols not configured in the strategy.
+It does not enumerate or cancel algo orders or spread orders. OKX Cancel All
+After is account-wide for the regular order book but also excludes spread
+orders. Accounts that use algo or spread orders need a separate, tested venue
+procedure before this command can be considered a complete kill.
+
+Incident procedure:
+
+1. Stop the order-producing unit and every other process or operator that can
+   use the selected account. Require `systemctl is-active` to show that the unit
+   is not active and verify its main PID is zero. If the stop deadline forced a
+   kill, record that fact and continue without restarting it.
+2. Confirm the account is dedicated to this deployment. The CLI cannot prove
+   that another host, strategy, manual trader, or API key has stopped; the
+   `--confirm-order-producers-stopped` flag is an operator attestation.
+3. From a restricted operator shell populated by the same secret provider, run
+   the direct command. Prefer explicit accounts during an incident:
+
+```bash
+umask 077
+/usr/local/bin/reap emergency-cancel \
+  --config /etc/reap/live/btc-demo.toml \
+  --account main \
+  --confirm-account-wide-cancel \
+  --confirm-order-producers-stopped \
+  --confirm-production \
+  --account-timeout-secs 30 \
+  --deadman-timeout-secs 10 \
+  --pretty > /var/lib/reap/live/btc-demo/emergency-cancel.json
+```
+
+`--confirm-production` is mandatory for a production venue config and harmless
+for demo. `--all-configured-accounts` is available only when every configured
+account's producers have been stopped and replaces all `--account` arguments.
+
+4. For each account, the command samples exchange time, arms Cancel All After,
+   enumerates pending regular orders account-wide, sends batches of at most 20,
+   and re-enumerates until it observes zero after the deadman trigger horizon.
+   Every REST call and pacing delay shares one absolute account timeout. A batch
+   acknowledgement is only request acceptance; the final REST zero observation
+   is authoritative.
+5. Require process exit zero, top-level `all_clear = true`, and each account's
+   `deadman_armed = true` and `verified_zero_after_deadman = true`. Review all
+   incidents, partial/rejected/unacknowledged cancel counts, unmanaged symbols,
+   and remaining-order details even when the final zero check succeeds.
+6. Independently inspect OKX regular, algo, and spread orders plus balances and
+   positions. Archive the report with the incident journal. A non-zero command
+   exit or missing/failed account report means zero was not proven and requires
+   venue UI/API escalation.
+7. Leave demo trading stopped. Recover the immutable journal, reconcile exchange
+   orders/fills/positions, and start `observe` first. Restore demo entry only
+   after clean readiness and explicit operator approval; never auto-restart from
+   this procedure.
+
+This is an out-of-process safety layer, not a production certification or a
+replacement for exchange-side account limits and operator access controls.
+
 ## External Alerts
 
 - Set `[alerts].enabled = true` and provide the URL through

@@ -18,8 +18,8 @@ production trading process.
 | Instrument/account bootstrap | Account instruments/config/balance/positions are typed and verified before readiness | Needs target-account certification |
 | Startup/restart gate | Executable phase state, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, durable latch restore, and clean REST reconciliation | Needs process-kill demo test |
 | Event-loop profile | Allocation-aware raw OKX parity benchmark covers redundant wire input through strategy/risk and storage-record construction | Needs target-host capture and exchange-latency validation |
-| Operator control and alerts | HMAC-authenticated local controls use fsynced write-ahead latches; OKX Cancel All After is maintained independently; bounded webhook delivery can fail the runtime closed | Target alert routing and an out-of-process supervisory kill remain production blockers |
-| Process/host controls | Canonical journal ownership is exclusively locked before recovery or network setup; optional Linux disk, memory, and kernel-clock checks run at preflight and periodically | Must be enabled, thresholded, and fault-tested on the target host under a process supervisor |
+| Operator control and alerts | HMAC-authenticated local controls use fsynced write-ahead latches; OKX Cancel All After is maintained independently; a separate CLI can arm the deadman, cancel all regular orders account-wide, and prove post-trigger zero | Must exercise target alert routing and the independent cancel procedure; algo/spread orders remain outside its scope |
+| Process/host controls | Canonical journal ownership is exclusively locked before recovery or network setup; optional Linux disk, memory, and kernel-clock checks run at preflight and periodically; hardened systemd templates encode mode-specific restart policy | Must be installed, enabled, thresholded, monitored, and fault-tested on the target host |
 | Exchange certification | No recorded OKX demo soak, fault injection, or production account-mode certification | Production blocker |
 
 ## Implemented Demo Path
@@ -75,6 +75,15 @@ production trading process.
     use a bounded queue, HTTPS, bounded retry/timeouts, and report delivery
     failures back to the coordinator; production configuration should make
     those failures fatal.
+13. A strategy-independent emergency command parses only exchange/account safety
+    settings, refuses implicit account selection, requires producer-stop and
+    account-wide confirmations, arms Cancel All After, batch-cancels every
+    regular pending order across configured and unmanaged symbols, and verifies
+    account-wide zero after the trigger horizon. Its deterministic tests cover a
+    failed deadman, partial batch acknowledgement, and hung REST transport.
+14. Hardened systemd templates permit bounded restart only for read-only observe
+    mode. Demo and capture require operator-controlled restart so account
+    reconciliation and capture-session rotation cannot be bypassed.
 
 ## Remaining Demo Gate
 
@@ -88,7 +97,9 @@ production trading process.
 3. Run minimal-size `demo` orders, then inject socket disconnect, process kill,
    deadman expiry, exchange-clock skew, IOC miss, partial fill, and REST
    timeout/rate-limit conditions. Verify `expTime`, latch restoration, and
-   Cancel All After from exchange/account evidence.
+   Cancel All After from exchange/account evidence. Exercise the independent
+   emergency command after forced process death and archive its zero-order
+   report.
 4. Complete a sustained soak with zero unexplained order, fill, balance,
    position, or checkpoint drift. `clean_soak` covers runtime readiness,
    reconciliation, storage drops, alert delivery, and shutdown orders;
@@ -104,10 +115,11 @@ Production enablement additionally requires:
 - Walk-forward and out-of-sample evaluation, parameter sensitivity, capacity,
   inventory-duration, and stressed-liquidity reports.
 - Stablecoin depeg and exchange-rate pause policy, strategy-group risk, master
-  liveness, deployed external alert routing, and an out-of-process supervisory
-  kill.
+  liveness, deployed external alert routing, and target-host exercise of the
+  out-of-process regular-order kill plus any required algo/spread kill path.
 - Target-host time-service monitoring, CPU/thread placement, bounded
-  backpressure, calibrated memory/disk thresholds, and restart supervision.
+  backpressure, calibrated memory/disk thresholds, installed restart
+  supervision, and external unit-failure paging.
 - Long-running demo soak with zero unexplained order, fill, position, or balance
   reconciliation drift.
 - Explicit operator approval of credentials, account mode, limits, symbols,

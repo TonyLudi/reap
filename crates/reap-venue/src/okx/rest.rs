@@ -17,6 +17,7 @@ use super::{AuthError, HttpMethod, OkxSigner, SignedRequest};
 
 const PLACE_ORDER_PATH: &str = "/api/v5/trade/order";
 const CANCEL_ORDER_PATH: &str = "/api/v5/trade/cancel-order";
+const CANCEL_BATCH_ORDERS_PATH: &str = "/api/v5/trade/cancel-batch-orders";
 const CANCEL_ALL_AFTER_PATH: &str = "/api/v5/trade/cancel-all-after";
 const PUBLIC_TIME_PATH: &str = "/api/v5/public/time";
 const OPEN_ORDERS_PATH: &str = "/api/v5/trade/orders-pending";
@@ -87,6 +88,7 @@ impl ReqwestTransport {
         let client = reqwest::Client::builder()
             .connect_timeout(connect_timeout)
             .timeout(request_timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .tcp_nodelay(true)
             .build()
             .map_err(|error| RestError::Transport(error.to_string()))?;
@@ -260,6 +262,20 @@ pub struct OkxOrderAck {
     pub client_order_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OkxCancelOrderResult {
+    pub exchange_order_id: String,
+    pub client_order_id: String,
+    pub code: String,
+    pub message: String,
+}
+
+impl OkxCancelOrderResult {
+    pub fn accepted(&self) -> bool {
+        self.code.is_empty() || self.code == "0"
+    }
+}
+
 #[derive(Clone)]
 pub struct OkxRestClient<T> {
     transport: T,
@@ -368,9 +384,18 @@ where
             self.signer
                 .sign_request(timestamp, HttpMethod::Post, CANCEL_ALL_AFTER_PATH, body)?;
         let response: OkxResponse<OkxCancelAllAfterWire> = self.execute(request).await?;
-        if response.data.is_empty() {
-            return Err(RestError::EmptyData {
+        let acknowledgement = response
+            .data
+            .into_iter()
+            .next()
+            .ok_or(RestError::EmptyData {
                 operation: "cancel all after",
+            })?;
+        if timeout_secs != 0 && parse_integer("triggerTime", &acknowledgement.trigger_time)? == 0 {
+            return Err(RestError::InvalidField {
+                field: "triggerTime",
+                value: acknowledgement.trigger_time,
+                message: "must be nonzero when Cancel All After is armed".to_string(),
             });
         }
         Ok(())
@@ -387,6 +412,37 @@ where
     ) -> Result<OkxOrderAck, RestError> {
         let request = self.build_cancel_request(timestamp, order)?;
         self.execute_ack(request, "cancel order").await
+    }
+
+    pub async fn cancel_batch_orders(
+        &self,
+        orders: &[OkxCancelOrder],
+    ) -> Result<Vec<OkxCancelOrderResult>, RestError> {
+        self.cancel_batch_orders_at(&timestamp_now(), orders).await
+    }
+
+    pub async fn cancel_batch_orders_at(
+        &self,
+        timestamp: &str,
+        orders: &[OkxCancelOrder],
+    ) -> Result<Vec<OkxCancelOrderResult>, RestError> {
+        let request = self.build_cancel_batch_request(timestamp, orders)?;
+        let response: OkxResponse<OkxAckWire> = self.execute(request).await?;
+        if response.data.is_empty() {
+            return Err(RestError::EmptyData {
+                operation: "cancel batch orders",
+            });
+        }
+        Ok(response
+            .data
+            .into_iter()
+            .map(|ack| OkxCancelOrderResult {
+                exchange_order_id: ack.order_id,
+                client_order_id: ack.client_order_id,
+                code: ack.sub_code,
+                message: ack.sub_message,
+            })
+            .collect())
     }
 
     pub async fn open_orders(
@@ -698,6 +754,51 @@ where
             .sign_request(timestamp, HttpMethod::Post, CANCEL_ORDER_PATH, body)?)
     }
 
+    pub fn build_cancel_batch_request(
+        &self,
+        timestamp: &str,
+        orders: &[OkxCancelOrder],
+    ) -> Result<SignedRequest, RestError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            #[serde(rename = "instId")]
+            symbol: &'a str,
+            #[serde(rename = "ordId", skip_serializing_if = "Option::is_none")]
+            exchange_order_id: Option<&'a str>,
+            #[serde(rename = "clOrdId", skip_serializing_if = "Option::is_none")]
+            client_order_id: Option<&'a str>,
+        }
+
+        if orders.is_empty() || orders.len() > 20 {
+            return Err(RestError::InvalidField {
+                field: "orders",
+                value: orders.len().to_string(),
+                message: "cancel batch must contain 1-20 orders".to_string(),
+            });
+        }
+        let mut body = Vec::with_capacity(orders.len());
+        for order in orders {
+            if order.exchange_order_id.is_none() && order.client_order_id.is_none() {
+                return Err(RestError::InvalidField {
+                    field: "ordId/clOrdId",
+                    value: String::new(),
+                    message: "one identifier is required for every cancel".to_string(),
+                });
+            }
+            body.push(Body {
+                symbol: &order.symbol,
+                exchange_order_id: order.exchange_order_id.as_deref(),
+                client_order_id: order.client_order_id.as_deref(),
+            });
+        }
+        Ok(self.signer.sign_request(
+            timestamp,
+            HttpMethod::Post,
+            CANCEL_BATCH_ORDERS_PATH,
+            serde_json::to_string(&body)?,
+        )?)
+    }
+
     async fn execute_ack(
         &self,
         request: SignedRequest,
@@ -739,6 +840,23 @@ where
 
 fn timestamp_now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+pub fn format_okx_timestamp_ms(timestamp_ms: u64) -> Result<String, RestError> {
+    let timestamp_ms = i64::try_from(timestamp_ms).map_err(|error| RestError::InvalidField {
+        field: "OK-ACCESS-TIMESTAMP",
+        value: timestamp_ms.to_string(),
+        message: error.to_string(),
+    })?;
+    let timestamp =
+        chrono::DateTime::<Utc>::from_timestamp_millis(timestamp_ms).ok_or_else(|| {
+            RestError::InvalidField {
+                field: "OK-ACCESS-TIMESTAMP",
+                value: timestamp_ms.to_string(),
+                message: "timestamp is outside the supported range".to_string(),
+            }
+        })?;
+    Ok(timestamp.to_rfc3339_opts(SecondsFormat::Millis, true))
 }
 
 fn timestamp_ms(timestamp: &str) -> Result<u64, RestError> {
@@ -829,7 +947,6 @@ struct OkxTimeWire {
 
 #[derive(Debug, Deserialize)]
 struct OkxCancelAllAfterWire {
-    #[allow(dead_code)]
     #[serde(default, rename = "triggerTime")]
     trigger_time: String,
 }
@@ -1361,6 +1478,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_cancel_preserves_per_order_acceptance_results() {
+        let (client, requests) = client(vec![
+            r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"reap1","sCode":"0","sMsg":""},{"ordId":"456","clOrdId":"reap2","sCode":"51400","sMsg":"order already canceled"}]}"#,
+        ]);
+        let results = client
+            .cancel_batch_orders_at(
+                "2020-12-08T09:08:58.000Z",
+                &[
+                    OkxCancelOrder {
+                        symbol: "BTC-USDT".to_string(),
+                        exchange_order_id: Some("123".to_string()),
+                        client_order_id: None,
+                    },
+                    OkxCancelOrder {
+                        symbol: "ETH-USDT".to_string(),
+                        exchange_order_id: Some("456".to_string()),
+                        client_order_id: None,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert!(results[0].accepted());
+        assert!(!results[1].accepted());
+        assert_eq!(results[1].code, "51400");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].path, CANCEL_BATCH_ORDERS_PATH);
+        assert!(requests[0].body.contains(r#""instId":"BTC-USDT""#));
+        assert!(requests[0].body.contains(r#""ordId":"456""#));
+    }
+
+    #[test]
+    fn batch_cancel_and_exchange_timestamp_are_bounded() {
+        let (client, _) = client(Vec::new());
+        assert!(matches!(
+            client.build_cancel_batch_request("time", &[]),
+            Err(RestError::InvalidField {
+                field: "orders",
+                ..
+            })
+        ));
+        assert_eq!(
+            format_okx_timestamp_ms(1_607_418_537_715).unwrap(),
+            "2020-12-08T09:08:57.715Z"
+        );
+    }
+
+    #[tokio::test]
     async fn place_order_sets_exchange_expiry_header() {
         let (client, requests) = client(vec![
             r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"reap1","sCode":"0","sMsg":""}]}"#,
@@ -1421,13 +1587,26 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_all_after_rejects_unsafe_timeout() {
-        let (client, _) = client(Vec::new());
+        let (invalid_timeout_client, _) = client(Vec::new());
         assert!(matches!(
-            client
+            invalid_timeout_client
                 .cancel_all_after_at("2020-12-08T09:08:57.715Z", 9)
                 .await,
             Err(RestError::InvalidField {
                 field: "timeOut",
+                ..
+            })
+        ));
+
+        let (client, _) = client(vec![
+            r#"{"code":"0","msg":"","data":[{"triggerTime":"0"}]}"#,
+        ]);
+        assert!(matches!(
+            client
+                .cancel_all_after_at("2020-12-08T09:08:57.715Z", 10)
+                .await,
+            Err(RestError::InvalidField {
+                field: "triggerTime",
                 ..
             })
         ));

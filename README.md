@@ -31,6 +31,10 @@ Implemented:
 - Bounded asynchronous HTTPS webhook alerts and optional Linux journal-disk,
   available-memory, and kernel-clock guards, with preflight evidence and
   fail-closed periodic enforcement outside the strategy loop.
+- A strategy-independent OKX emergency command that arms account-wide Cancel All
+  After, batch-cancels regular orders on every symbol, and requires a post-trigger
+  zero-order proof, plus hardened systemd templates with mode-specific restart
+  policy.
 - Backtest matching with `PostOnly`, `IOC`, current-depth fills, trade fills,
   queue-ahead tracking, and simple mark-to-market accounting.
 - CSV/normalized replay, raw-capture validation, configuration validation, and
@@ -109,6 +113,19 @@ cargo run -p reap-cli -- operator --config examples/live-okx-demo.toml kill-acco
 cargo run -p reap-cli -- operator --config examples/live-okx-demo.toml shutdown --reason "planned stop"
 ```
 
+After stopping every order producer for an account, the independent emergency
+path can cancel and verify all regular pending orders without loading strategy or
+journal state. It intentionally excludes OKX algo and spread orders:
+
+```bash
+cargo run -p reap-cli -- emergency-cancel \
+  --config examples/live-okx-demo.toml \
+  --account main \
+  --confirm-account-wide-cancel \
+  --confirm-order-producers-stopped \
+  --pretty
+```
+
 Run a bounded observe soak and return a non-zero status unless the runtime
 reaches readiness, finishes the requested window, records no reconciliation
 drift, storage drops, or alert delivery failures, and shuts down with no active
@@ -151,7 +168,7 @@ Design docs:
 - [docs/chaos-mapping.md](docs/chaos-mapping.md) maps the Java `chaos` logic to
   Rust modules and lists remaining strategy-model scope limits.
 - [docs/operations.md](docs/operations.md) defines startup, fail-closed, recovery,
-  and credential procedures.
+  supervision, emergency cancellation, and credential procedures.
 - [docs/trading-readiness.md](docs/trading-readiness.md) lists the exact gap from
   the current libraries to demo and production trading.
 - [docs/performance.md](docs/performance.md) records the strategy and complete

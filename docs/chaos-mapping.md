@@ -104,15 +104,26 @@ The following differences do not change the covered quote/hedge calculations:
 | Clear/rebuild book on resubscribe or crossed-book failure | Invalid/crossed-book detection plus sequence state and fresh websocket snapshot recovery | Equivalent with additional explicit sequence validation |
 | Separate receive and exchange latency tracking | Raw `recv_ts_ns`, exchange timestamps, capture health counters, and bounded live webhook alerts | Equivalent data retained; alert routing is a deployment concern |
 | Batch subscription manager and retry limits | Bounded socket partitioning, acknowledgement timeout, exponential reconnect | Equivalent lifecycle with different batching policy |
+| `ChaosStrategyEngine.tryToStop`, `ChaosStrategyBase.cancelAll(entity)`, and `ExchCancelAll` | In-process canonical cancel/reconcile plus a separate account-wide regular-order emergency CLI | Equivalent normal stop with an additional process-independent safety layer |
 
 The reviewed Java OKX subscriber and `chaos-iarb2` classes do not provide the
 Rust runtime's place-request `expTime`, `/public/time` skew gate, Cancel All
 After heartbeat, fsynced restart-latch lifecycle, exclusive journal lease,
-webhook alert worker, or Linux host guard. Those are intentional
-deployment-safety additions around the parity strategy, not claims of Java
-strategy equivalence. Re-check exchange-facing controls against both the pinned
-Java revision and the current OKX API contract whenever connectivity is
+webhook alert worker, Linux host guard, hardened supervisor policy, or
+strategy-independent account-wide regular-order cancellation. Those are
+intentional deployment-safety additions around the parity strategy, not claims
+of Java strategy equivalence. Re-check exchange-facing controls against both the
+pinned Java revision and the current OKX API contract whenever connectivity is
 upgraded.
+
+The pinned Java stop path changes engine state and invokes per-entity
+`cancelAll()` inside the running process, with `ExchCancelAll` providing
+rate-limit debounce. Rust preserves normal in-process cancellation but does not
+depend on it for the incident path: the separate command arms the exchange
+deadman, enumerates all regular pending orders for the selected account, cancels
+configured and unmanaged symbols, and proves zero after the trigger horizon.
+This is intentionally broader than strategy-owned Java entities and explicitly
+does not claim coverage of OKX algo or spread order classes.
 
 ## Live Event Requirements
 

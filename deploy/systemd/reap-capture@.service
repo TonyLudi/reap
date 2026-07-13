@@ -1,0 +1,45 @@
+[Unit]
+Description=Reap credential-free OKX public capture (%i)
+Documentation=file:/usr/local/share/doc/reap/operations.md
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=2
+
+[Service]
+Type=simple
+User=reap
+Group=reap
+WorkingDirectory=/var/lib/reap/capture/%i
+Environment=RUST_BACKTRACE=1
+ExecStart=/usr/local/bin/reap capture --config /etc/reap/capture/%i.toml
+Restart=no
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=45s
+UMask=0077
+LimitNOFILE=65536
+TasksMax=512
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/reap/capture/%i
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=reap-capture-%i
+
+[Install]
+WantedBy=multi-user.target
