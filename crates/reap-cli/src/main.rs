@@ -181,6 +181,26 @@ enum Command {
         #[arg(long)]
         pretty: bool,
     },
+    #[command(
+        about = "Verify the complete schema-7 observe/demo live fault matrix",
+        long_about = "Independently verify one exact-config run per required live fault role, bind every run to one build/host/account identity, and hash each external injector record. Process-death, statement, and deployment certification remain separate gates."
+    )]
+    VerifyLiveFaultMatrix {
+        #[arg(short, long, help = "Exact live TOML used by every campaign run")]
+        config: PathBuf,
+        #[arg(short, long, help = "Schema-1 live fault matrix TOML manifest")]
+        manifest: PathBuf,
+        #[arg(
+            short,
+            long,
+            help = "Optionally create this owner-readable verification artifact"
+        )]
+        output: Option<PathBuf>,
+        #[arg(long, help = "Exit non-zero unless the complete live matrix passes")]
+        require_pass: bool,
+        #[arg(long)]
+        pretty: bool,
+    },
     #[command(about = "Build a Java-mapped backtest latency profile from bounded live reports")]
     CalibrateLatency {
         #[arg(short, long, help = "Live configuration used by every source report")]
@@ -684,6 +704,31 @@ async fn main() -> Result<()> {
             }
             if require_valid && !verification.evidence_valid {
                 anyhow::bail!("live report evidence is invalid");
+            }
+        }
+        Command::VerifyLiveFaultMatrix {
+            config,
+            manifest,
+            output,
+            require_pass,
+            pretty,
+        } => {
+            let mut output_file = output
+                .as_ref()
+                .map(|path| reserve_private_output(path, "live fault matrix report"))
+                .transpose()?;
+            let verification = reap_live::verify_live_fault_matrix_paths(config, manifest)?;
+            let json = if pretty {
+                serde_json::to_string_pretty(&verification)?
+            } else {
+                serde_json::to_string(&verification)?
+            };
+            if let (Some(file), Some(path)) = (&mut output_file, output.as_deref()) {
+                persist_reserved_output(file, path, &json, "live fault matrix report")?;
+            }
+            println!("{json}");
+            if require_pass && !verification.live_fault_matrix_passed {
+                anyhow::bail!("live fault matrix did not satisfy every evidence gate");
             }
         }
         Command::CalibrateLatency {

@@ -223,6 +223,10 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Bind schema-7 live reports to exact source-config bytes, reserve them
   owner-only with file/directory durability, and add offline verification that
   re-derives report, mode, host, identity, latency, and clean-soak invariants.
+- [x] Add a strict live fault-matrix manifest/verifier that requires every
+  documented schema-7 role, unique sessions and injector evidence, one exact
+  config/build/host/account identity, production-shaped demo guards, and safe
+  zero-order shutdown without claiming process-death or economic proof.
 - [ ] Run credentialed bounded observe and minimal-size demo fault campaigns,
   including process death, deadman expiry, clock skew, REST ambiguity, partial
   fill, reconnect, and durable-latch restart recovery.

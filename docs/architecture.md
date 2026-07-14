@@ -316,6 +316,11 @@ Responsibilities:
   fingerprints. Offline verification treats the report as untrusted, re-derives
   clean-soak status, and checks mode, build/Java provenance, host/account
   identities, readiness, failure/disconnect counters, and latency reservoirs.
+- Aggregate isolated live fault reports through a strict manifest that requires
+  the complete role matrix, unique sessions and injector artifacts, one
+  config/build/host/account identity, recovered reconnects, and safe zero-order
+  shutdown. Opaque injector records and external certifications remain explicit
+  limitations rather than inferred facts.
 - Start/stop/restart strategy instances.
 - Dispatch timers into strategy loops.
 - Coordinate reconciliation and recovery.

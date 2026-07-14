@@ -139,9 +139,13 @@ Failure handling was cross-checked against the same pinned connectivity tree.
 `AbstractOkxNitroL2Subscriber.onSocketDisconnected` clears the affected Java
 book and its base subscriber resubscribes after a lost session;
 `OkxNitroOrderClient` publishes `LOST` connection state and rejects new orders
-with `REQUEST_BLOCKED` while disconnected. Rust likewise invalidates feed
-readiness, blocks entry, supervises reconnect/recovery, and reconciles private
-state. Rust intentionally adds a stronger audit boundary: after a report-capable
+with `REQUEST_BLOCKED` while disconnected. Its order-session disconnect hook
+also invokes `cancelAll`. Rust likewise invalidates feed readiness, blocks
+entry, supervises reconnect/recovery, reconciles private state, and preserves
+cancellation while entry is blocked. `verify-live-fault-matrix` therefore
+requires clean recovered public/private reconnect roles and zero-order shutdown
+for disruptive order-path roles, all on one config/build/host/account identity.
+Rust intentionally adds a stronger audit boundary: after a report-capable
 runtime exists, an initialization, event-loop, or teardown error completes
 fail-closed cancellation/reconciliation, persists the schema-7 failure code plus
 pre/post-cleanup evidence, and only then returns the nonzero process error.

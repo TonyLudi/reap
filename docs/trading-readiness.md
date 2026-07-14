@@ -268,6 +268,14 @@ production trading process.
     failure, disconnect, and latency evidence, and independently re-derives
     `clean_soak`. Latency calibration schema 3 also requires the exact source
     bytes and independently verified source reports.
+40. `verify-live-fault-matrix` now requires one isolated schema-7 run for every
+    documented live role, hashes a distinct injector record for each fault,
+    rejects session/artifact reuse, and binds all runs to one exact config,
+    executable, host, and account identity. Reconnect roles must recover cleanly;
+    disruptive order-path roles must retain zero-order, no-drop shutdown
+    evidence. Its output explicitly excludes process-death causality, deadman
+    expiry, emergency cancellation, fill/fee reconciliation, and deployment
+    approval, so no credential-free fixture can satisfy the remaining demo gate.
 
 ## Remaining Demo Gate
 
@@ -295,6 +303,8 @@ production trading process.
    `verify-deadman-certification --require-pass` result. In a separate forced-
    death iteration, exercise the independent emergency command and archive its
    zero-order report; incident cancellation must never wait for certification.
+   Populate `examples/live-fault-matrix.toml` with the isolated reports and
+   injector records, then require `verify-live-fault-matrix --require-pass`.
 4. Complete a sustained soak with zero unexplained order, fill, balance,
    position, or checkpoint drift. `clean_soak` covers runtime readiness,
    full-state reconciliation, storage drops, alert delivery, and shutdown

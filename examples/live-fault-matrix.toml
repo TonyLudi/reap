@@ -1,0 +1,67 @@
+# Paths are resolved relative to this manifest. Keep every report and injector
+# record immutable; the verifier rejects duplicate sessions, paths, and injector
+# hashes. Replace these placeholders with target-host campaign artifacts.
+schema_version = 1
+
+[[runs]]
+scenario = "clean_observe"
+report = "evidence/clean-observe.json"
+
+[[runs]]
+scenario = "clean_demo"
+report = "evidence/clean-demo.json"
+
+[[runs]]
+scenario = "public_reconnect"
+report = "evidence/public-reconnect.json"
+injector_evidence = "evidence/public-reconnect-injector.log"
+
+[[runs]]
+scenario = "private_reconnect"
+report = "evidence/private-reconnect.json"
+injector_evidence = "evidence/private-reconnect-injector.log"
+
+[[runs]]
+scenario = "ambiguous_submit"
+report = "evidence/ambiguous-submit.json"
+injector_evidence = "evidence/ambiguous-submit-injector.log"
+
+[[runs]]
+scenario = "ambiguous_cancel"
+report = "evidence/ambiguous-cancel.json"
+injector_evidence = "evidence/ambiguous-cancel-injector.log"
+
+[[runs]]
+scenario = "partial_fill"
+report = "evidence/partial-fill.json"
+injector_evidence = "evidence/partial-fill-injector.log"
+
+[[runs]]
+scenario = "fill_convergence_timeout"
+report = "evidence/fill-convergence-timeout.json"
+injector_evidence = "evidence/fill-convergence-timeout-injector.log"
+
+[[runs]]
+scenario = "order_convergence_timeout"
+report = "evidence/order-convergence-timeout.json"
+injector_evidence = "evidence/order-convergence-timeout-injector.log"
+
+[[runs]]
+scenario = "restored_safety_latch"
+report = "evidence/restored-safety-latch.json"
+injector_evidence = "evidence/restored-safety-latch-injector.log"
+
+[[runs]]
+scenario = "deadman_heartbeat_failure"
+report = "evidence/deadman-heartbeat-failure.json"
+injector_evidence = "evidence/deadman-heartbeat-failure-injector.log"
+
+[[runs]]
+scenario = "exchange_clock_failure"
+report = "evidence/exchange-clock-failure.json"
+injector_evidence = "evidence/exchange-clock-failure-injector.log"
+
+[[runs]]
+scenario = "account_config_failure"
+report = "evidence/account-config-failure.json"
+injector_evidence = "evidence/account-config-failure-injector.log"

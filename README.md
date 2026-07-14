@@ -379,6 +379,28 @@ reserved file empty and must be diagnosed from the process log; an empty file
 is never evidence. `verify-live-run` independently re-hashes exact config/report
 bytes, re-derives effective fingerprints and clean-soak acceptance, and checks
 mode, identity, readiness, failure, disconnect, host, and latency invariants.
+After isolated target-host fault runs, populate
+`examples/live-fault-matrix.toml` and verify that every role used one exact
+config, binary, host, account identity, and unique session:
+
+```bash
+FAULT_MATRIX_REPORT="/tmp/reap-live-fault-matrix-$(date -u +%Y%m%dT%H%M%SZ).json"
+cargo run -p reap-cli -- verify-live-fault-matrix \
+  --config /etc/reap/live/btc-demo.toml \
+  --manifest /var/lib/reap/live/btc-demo/live-fault-matrix.toml \
+  --output "$FAULT_MATRIX_REPORT" \
+  --require-pass \
+  --pretty
+```
+
+The matrix requires enabled fatal alerts, the synchronized host guard, the
+operator service, redundant public websockets, clean observe/demo/reconnect
+runs, safe zero-order shutdown for injected ambiguity/convergence faults, and
+the documented typed runtime failures. It hashes a distinct opaque injector
+record for every fault but does not interpret that record. Process-death,
+deadman-expiry, emergency-cancel, fill/fee, target-host, and production approval
+remain separate gates.
+
 Calibration emits schema-3 artifacts and admits only independently verified,
 clean target-host reports with the same exact config and binary:
 

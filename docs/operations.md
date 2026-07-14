@@ -1198,6 +1198,30 @@ structured evidence rather than matching log text:
 | Periodic exchange-clock skew/check failure | `failure.code = "exchange_clock_skew"` or `"exchange_clock_check"` |
 | Authenticated account-config drift/check failure | `failure.code = "account_config_drift"` or `"account_config_check"` |
 
+Run each role in isolation, preserve its external injector record, populate the
+checked-in manifest template, and create a durable aggregate result:
+
+```bash
+MATRIX=/var/lib/reap/live/btc-demo/live-fault-matrix.toml
+RESULT=/var/lib/reap/live/btc-demo/live-fault-matrix-$(date -u +%Y%m%dT%H%M%SZ).json
+reap verify-live-fault-matrix \
+  --config /etc/reap/live/btc-demo.toml \
+  --manifest "$MATRIX" \
+  --output "$RESULT" \
+  --require-pass \
+  --pretty
+```
+
+The schema-1 template is `examples/live-fault-matrix.toml`; relative artifact
+paths resolve from the manifest directory. The verifier rejects missing or
+duplicate roles, report/session reuse, injector path or content reuse, config
+byte drift, invalid schema-7 evidence, and cross-run build, host, or account
+identity changes. Clean reconnect roles must recover to a clean bounded soak.
+Ambiguity and convergence roles may retain their expected drift counters but
+must finish a bounded run back at ready with no storage drops, alert failures,
+or active orders. Typed safety-task failures must start only after readiness and
+preserve the same zero-order evidence.
+
 These fields prove that Reap observed and handled the named condition. They do
 not prove the external injector was configured correctly, that Cancel All After
 expired after process death, or that exchange state is economically reconciled.
