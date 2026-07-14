@@ -1,6 +1,6 @@
 # Schema template only. Replace every path and identity with reviewed target-host
 # evidence. This file cannot pass as checked in and contains no credentials.
-schema_version = 1
+schema_version = 2
 expected_reap_version = "0.1.0"
 expected_live_executable_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 expected_host_identity_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -25,6 +25,18 @@ account_certifications = [
   "/secure/evidence/production-account-main.json",
 ]
 emergency_cancel_report = "/secure/evidence/demo-emergency-cancel.json"
+
+# These are deliberately bounded by stricter code-level maxima. Tighten them
+# further when the complete campaign can be rerun inside a smaller window.
+[freshness]
+future_tolerance_ms = 60000
+demo_soak_max_age_ms = 21600000
+fault_run_max_age_ms = 86400000
+latency_source_max_age_ms = 86400000
+production_account_certification_max_age_ms = 900000
+deadman_certification_max_age_ms = 86400000
+emergency_cancel_max_age_ms = 86400000
+fill_collection_max_age_ms = 21600000
 
 # Repeat both identity tables and every per-account evidence array entry for all
 # configured accounts. Demo and production identities are intentionally distinct.

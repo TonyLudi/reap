@@ -71,8 +71,9 @@ Implemented:
   and cross-binds exact official-demo/production configs, a deterministically
   derived routed fault config, the predeclared research candidate, the running
   release binary, target host, and separate demo and production account
-  identities. It always reports production entry as unauthorized; freshness,
-  external operations, and operator approval remain separate blockers.
+  identities. Mandatory bounded source-time checks reject invalid, future, or
+  stale operational evidence. It always reports production entry as
+  unauthorized; external operations and operator approval remain blockers.
 - Deterministic backtest matching with `PendingNew`, delayed entry/cancel/update
   boundaries, `PostOnly`, `IOC`, conservative displayed-depth fills, trade
   fills, queue-ahead tracking, fee/turnover attribution, realized linear and
@@ -316,10 +317,14 @@ It rejects missing or duplicate per-account coverage, a demo soak reused as a
 fault session, config drift during verification, and any mismatch against the
 manifest-declared build, host, candidate, or environment-specific account
 identities. Proxy-supported fault roles must carry typed records with the exact
-proxy fingerprint and unique proxy session/command IDs; only genuine
-partial-fill and restart-latch roles may use external evidence. It does not trust
-previously emitted verification JSON. The checked-in manifest is a schema
-template with deliberately invalid placeholder identities, not evidence.
+proxy fingerprint, unique proxy session/command IDs, fresh timestamps, and a
+command interval inside the corresponding verified live session; only genuine
+partial-fill and restart-latch roles may use external evidence. Schema 2 also
+enforces reviewed age limits under hard code-level maxima for the demo soak,
+every fault and latency source, production account certification, deadman,
+emergency cancel, and the reconciled fill window. It does not trust previously
+emitted verification JSON. The checked-in manifest is a schema template with
+deliberately invalid placeholder identities, not evidence.
 
 Observe OKX demo feeds and account state without permitting any submit or
 cancel request:

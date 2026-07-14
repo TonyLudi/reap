@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use reap_core::PINNED_JAVA_REVISION;
@@ -19,12 +20,33 @@ use sha2::{Digest, Sha256};
 use crate::deployment::{ResearchDeploymentVerificationReport, verify_research_deployment_paths};
 use crate::latency::{LatencyCalibrationVerificationReport, verify_latency_calibration};
 
-pub(crate) const PRODUCTION_EVIDENCE_MANIFEST_SCHEMA_VERSION: u16 = 1;
-pub(crate) const PRODUCTION_EVIDENCE_REPORT_FORMAT_VERSION: u16 = 1;
+pub(crate) const PRODUCTION_EVIDENCE_MANIFEST_SCHEMA_VERSION: u16 = 2;
+pub(crate) const PRODUCTION_EVIDENCE_REPORT_FORMAT_VERSION: u16 = 2;
 const MAX_PRODUCTION_EVIDENCE_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_PRODUCTION_EVIDENCE_ACCOUNTS: usize = 32;
 const MAX_PRODUCTION_EVIDENCE_LATENCY_REPORTS: usize = 128;
 const MAX_PRODUCTION_EVIDENCE_CANDIDATE_ID_BYTES: usize = 128;
+const MAX_FUTURE_TOLERANCE_MS: u64 = 5 * 60 * 1_000;
+const MAX_DEMO_SOAK_AGE_MS: u64 = 24 * 60 * 60 * 1_000;
+const MAX_FAULT_RUN_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+const MAX_LATENCY_SOURCE_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+const MAX_PRODUCTION_ACCOUNT_CERTIFICATION_AGE_MS: u64 = 15 * 60 * 1_000;
+const MAX_DEADMAN_CERTIFICATION_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+const MAX_EMERGENCY_CANCEL_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+const MAX_FILL_COLLECTION_AGE_MS: u64 = 24 * 60 * 60 * 1_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProductionEvidenceFreshnessPolicy {
+    pub future_tolerance_ms: u64,
+    pub demo_soak_max_age_ms: u64,
+    pub fault_run_max_age_ms: u64,
+    pub latency_source_max_age_ms: u64,
+    pub production_account_certification_max_age_ms: u64,
+    pub deadman_certification_max_age_ms: u64,
+    pub emergency_cancel_max_age_ms: u64,
+    pub fill_collection_max_age_ms: u64,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,6 +79,7 @@ pub(crate) struct ProductionEvidenceManifest {
     pub expected_deployment_candidate_id: String,
     pub expected_demo_account_identity_sha256s: BTreeMap<String, String>,
     pub expected_production_account_identity_sha256s: BTreeMap<String, String>,
+    pub freshness: ProductionEvidenceFreshnessPolicy,
     pub demo_config: PathBuf,
     pub production_config: PathBuf,
     pub fault_demo_config: PathBuf,
@@ -123,6 +146,7 @@ pub(crate) struct ProductionEvidenceConfigEvidence {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ProductionEvidenceGate {
     Verifier,
+    Freshness,
     ProductionTransition,
     ResearchDeployment,
     DemoSoak,
@@ -194,6 +218,50 @@ pub(crate) enum ProductionEvidenceFailure {
     DuplicateFaultCommand {
         command_id: String,
     },
+    EvidenceTimestampInvalid {
+        gate: ProductionEvidenceGate,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject: Option<String>,
+        started_at_ms: u64,
+        completed_at_ms: u64,
+    },
+    EvidenceTimestampInFuture {
+        gate: ProductionEvidenceGate,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject: Option<String>,
+        completed_at_ms: u64,
+        verified_at_ms: u64,
+        future_tolerance_ms: u64,
+    },
+    EvidenceStale {
+        gate: ProductionEvidenceGate,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject: Option<String>,
+        age_ms: u64,
+        maximum_age_ms: u64,
+    },
+    FaultProxyOutsideLiveSession {
+        scenario: reap_live::LiveFaultScenario,
+        proxy_armed_at_ms: u64,
+        proxy_completed_at_ms: u64,
+        live_started_at_ms: u64,
+        live_completed_at_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProductionEvidenceFreshnessObservation {
+    pub gate: ProductionEvidenceGate,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    pub source_path: PathBuf,
+    pub started_at_ms: u64,
+    pub completed_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_ms: Option<u64>,
+    pub maximum_age_ms: u64,
+    pub passed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,8 +271,11 @@ pub(crate) struct ProductionEvidenceVerificationReport {
     pub manifest_schema_version: u16,
     pub java_reference_revision: String,
     pub verifier_reap_version: String,
+    pub verified_at_ms: u64,
     pub manifest: ProductionEvidenceFileEvidence,
     pub expected: ProductionEvidenceExpectedIdentity,
+    pub freshness_policy: ProductionEvidenceFreshnessPolicy,
+    pub freshness_observations: Vec<ProductionEvidenceFreshnessObservation>,
     pub verifier: ProductionEvidenceVerifierIdentity,
     pub demo_config: ProductionEvidenceConfigEvidence,
     pub production_config: ProductionEvidenceConfigEvidence,
@@ -261,6 +332,12 @@ struct VerifiedFillInput {
     report: reap_live::FillStatementReconciliationReport,
 }
 
+struct VerifiedTimedLiveSource {
+    gate: ProductionEvidenceGate,
+    subject: Option<String>,
+    report: reap_live::LiveRunVerificationReport,
+}
+
 pub(crate) fn verify_production_evidence_manifest_path(
     manifest_path: &Path,
 ) -> Result<ProductionEvidenceVerificationReport> {
@@ -315,6 +392,10 @@ pub(crate) fn verify_production_evidence_manifest_path(
         &paths.latency_source_reports,
     )
     .context("failed to reconstruct latency calibration")?;
+    let fault_live_sources = verify_fault_live_sources(&paths.fault_demo_config, &fault_matrix)
+        .context("failed to bind fault-matrix source timestamps")?;
+    let latency_live_sources = verify_latency_live_sources(&paths.demo_config, &latency)
+        .context("failed to bind latency source timestamps")?;
 
     let mut account_artifacts = Vec::with_capacity(paths.account_certifications.len());
     for path in &paths.account_certifications {
@@ -411,6 +492,11 @@ pub(crate) fn verify_production_evidence_manifest_path(
     let (fault_proxy_config, fault_proxy_evidence) =
         FaultProxyConfig::load(&paths.fault_proxy_config)
             .context("failed to reload exact fault-proxy config after verification")?;
+    let manifest_final = load_manifest(&loaded.evidence.source_path)
+        .context("failed to reload production-evidence manifest after verification")?;
+    if manifest_final.evidence != loaded.evidence || manifest_final.value != loaded.value {
+        bail!("production-evidence manifest changed while it was being verified");
+    }
     let expected_fault_config = fault_proxy_config
         .route_live_config(&demo_config)
         .context("failed to reconstruct routed fault config from exact demo/proxy configs")?;
@@ -438,6 +524,21 @@ pub(crate) fn verify_production_evidence_manifest_path(
             )
         })
         .collect::<BTreeMap<_, _>>();
+    let verified_at_ms = unix_time_ms()?;
+    let (freshness_observations, freshness_failures) = evaluate_freshness(FreshnessInputs {
+        policy: &loaded.value.freshness,
+        verified_at_ms,
+        demo_soak_path: &paths.demo_soak_report,
+        demo_soak: &demo_soak,
+        fault_matrix: &fault_matrix,
+        fault_live_sources: &fault_live_sources,
+        latency_live_sources: &latency_live_sources,
+        account_artifacts: &account_artifacts,
+        deadman_artifacts: &deadman_artifacts,
+        emergency_path: &paths.emergency_cancel_report,
+        emergency: &emergency,
+        fill_inputs: &fill_inputs,
+    });
 
     let mut gates = vec![
         gate_report(
@@ -492,6 +593,19 @@ pub(crate) fn verify_production_evidence_manifest_path(
             fault_matrix.live_fault_matrix_passed,
         )?,
     ];
+    let freshness_paths = freshness_observations
+        .iter()
+        .map(|observation| observation.source_path.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    gates.push(gate_report(
+        ProductionEvidenceGate::Freshness,
+        None,
+        freshness_paths,
+        &freshness_observations,
+        freshness_failures.is_empty(),
+    )?);
     let mut latency_paths = vec![
         paths.demo_config.clone(),
         paths.latency_calibration_artifact.clone(),
@@ -570,7 +684,10 @@ pub(crate) fn verify_production_evidence_manifest_path(
         emergency: &emergency,
         fill_inputs: &fill_inputs,
     };
-    let failures = evaluate_bindings(bindings);
+    let mut failures = evaluate_bindings(bindings);
+    failures.extend(freshness_failures);
+    failures.sort_by_key(failure_sort_key);
+    failures.dedup();
     let evidence_bundle_passed =
         failures.is_empty() && gates.iter().all(|gate| gate.acceptance_passed);
 
@@ -579,8 +696,11 @@ pub(crate) fn verify_production_evidence_manifest_path(
         manifest_schema_version: loaded.value.schema_version,
         java_reference_revision: PINNED_JAVA_REVISION.to_string(),
         verifier_reap_version: env!("CARGO_PKG_VERSION").to_string(),
+        verified_at_ms,
         manifest: loaded.evidence,
         expected,
+        freshness_policy: loaded.value.freshness,
+        freshness_observations,
         verifier,
         demo_config: demo_evidence,
         production_config: production_evidence,
@@ -591,21 +711,346 @@ pub(crate) fn verify_production_evidence_manifest_path(
         gates,
         failures,
         limitations: vec![
-            "a passing bundle reconstructs the implemented source gates and binds exact configs, candidate, build, host, and account identities; it does not prove that the evidence is recent enough for a particular approval window"
+            "a passing bundle reconstructs the implemented source gates, binds exact configs, candidate, build, host, and account identities, and enforces the manifest freshness policy within hard upper bounds"
                 .to_string(),
-            "host and exchange-account identity hashes are provenance identifiers, not remote attestation; operators must independently control the manifest and target host"
+            "source timestamps and verifier wall time are validated artifact fields but are not remotely attested; operators must independently control clock synchronization, the manifest, and target host"
                 .to_string(),
             "account certification is point-in-time and fill reconciliation covers fills and fees only; complete economic statements, funding, transfers, tax, and profitability review remain external gates"
                 .to_string(),
             "supervision, paging, credential permissions, venue announcements, rollout/rollback review, and explicit human approval remain required"
                 .to_string(),
-            "typed fault injector records are bound, but separate fault-proxy run-report clean shutdown and supervisor timing still require archived operator review"
+            "typed fault injector records are config-, time-, and live-session-bound, but separate fault-proxy run-report clean shutdown and supervisor timing still require archived operator review"
+                .to_string(),
+            "partial-fill and restored-latch roles may use opaque external injector evidence; freshness is enforced on their verified live reports, while external causality remains an operator-reviewed gate"
                 .to_string(),
             "this verifier never authorizes or enables production order entry".to_string(),
         ],
         evidence_bundle_passed,
         production_order_entry_authorized: false,
     })
+}
+
+fn verify_fault_live_sources(
+    config_path: &Path,
+    matrix: &reap_live::LiveFaultMatrixVerificationReport,
+) -> Result<Vec<VerifiedTimedLiveSource>> {
+    let mut sources = Vec::with_capacity(matrix.runs.len());
+    for run in &matrix.runs {
+        let report = verify_live_run_paths(config_path, &run.report.source_path, None)
+            .with_context(|| {
+                format!(
+                    "failed to reverify fault source report {}",
+                    run.report.source_path.display()
+                )
+            })?;
+        if report.run_report != run.report || report.session_id != run.session_id {
+            bail!(
+                "fault source report {} changed after matrix reconstruction",
+                run.report.source_path.display()
+            );
+        }
+        sources.push(VerifiedTimedLiveSource {
+            gate: ProductionEvidenceGate::FaultMatrix,
+            subject: Some(scenario_name(run.scenario)),
+            report,
+        });
+    }
+    Ok(sources)
+}
+
+fn verify_latency_live_sources(
+    config_path: &Path,
+    latency: &LatencyCalibrationVerificationReport,
+) -> Result<Vec<VerifiedTimedLiveSource>> {
+    let mut sources = Vec::with_capacity(latency.source_reports.len());
+    for source in &latency.source_reports {
+        let report =
+            verify_live_run_paths(config_path, &source.source_path, None).with_context(|| {
+                format!(
+                    "failed to reverify latency source report {}",
+                    source.source_path.display()
+                )
+            })?;
+        if report.run_report.source_path != source.source_path
+            || report.run_report.bytes != source.bytes
+            || report.run_report.sha256 != source.sha256
+        {
+            bail!(
+                "latency source report {} changed after calibration reconstruction",
+                source.source_path.display()
+            );
+        }
+        sources.push(VerifiedTimedLiveSource {
+            gate: ProductionEvidenceGate::LatencyCalibration,
+            subject: report.session_id.clone(),
+            report,
+        });
+    }
+    Ok(sources)
+}
+
+struct FreshnessInputs<'a> {
+    policy: &'a ProductionEvidenceFreshnessPolicy,
+    verified_at_ms: u64,
+    demo_soak_path: &'a Path,
+    demo_soak: &'a reap_live::LiveRunVerificationReport,
+    fault_matrix: &'a reap_live::LiveFaultMatrixVerificationReport,
+    fault_live_sources: &'a [VerifiedTimedLiveSource],
+    latency_live_sources: &'a [VerifiedTimedLiveSource],
+    account_artifacts: &'a [(PathBuf, AccountCertificationArtifact)],
+    deadman_artifacts: &'a [(&'a ResolvedDeadmanInput, DeadmanExpiryCertificationArtifact)],
+    emergency_path: &'a Path,
+    emergency: &'a reap_live::EmergencyCancelVerificationReport,
+    fill_inputs: &'a [VerifiedFillInput],
+}
+
+fn evaluate_freshness(
+    input: FreshnessInputs<'_>,
+) -> (
+    Vec<ProductionEvidenceFreshnessObservation>,
+    Vec<ProductionEvidenceFailure>,
+) {
+    let mut observations = Vec::new();
+    let mut failures = Vec::new();
+    push_live_freshness(
+        &mut observations,
+        &mut failures,
+        input.policy,
+        input.verified_at_ms,
+        ProductionEvidenceGate::DemoSoak,
+        input.demo_soak.session_id.clone(),
+        input.demo_soak_path,
+        input.demo_soak,
+        input.policy.demo_soak_max_age_ms,
+    );
+    for (run, source) in input.fault_matrix.runs.iter().zip(input.fault_live_sources) {
+        let subject = Some(scenario_name(run.scenario));
+        push_live_freshness(
+            &mut observations,
+            &mut failures,
+            input.policy,
+            input.verified_at_ms,
+            source.gate,
+            subject.clone(),
+            &source.report.run_report.source_path,
+            &source.report,
+            input.policy.fault_run_max_age_ms,
+        );
+        if let (Some(proxy), Some(evidence)) = (
+            run.reap_fault_proxy_evidence.as_ref(),
+            run.injector_evidence.as_ref(),
+        ) {
+            push_freshness(
+                &mut observations,
+                &mut failures,
+                input.policy,
+                input.verified_at_ms,
+                ProductionEvidenceGate::FaultMatrix,
+                subject,
+                &evidence.source_path,
+                proxy.armed_at_ms,
+                Some(proxy.completed_at_ms),
+                input.policy.fault_run_max_age_ms,
+            );
+            check_fault_proxy_live_session(
+                &mut failures,
+                run.scenario,
+                proxy,
+                source.report.session_started_at_ms,
+                source.report.elapsed_ms,
+            );
+        }
+    }
+    for source in input.latency_live_sources {
+        push_live_freshness(
+            &mut observations,
+            &mut failures,
+            input.policy,
+            input.verified_at_ms,
+            source.gate,
+            source.subject.clone(),
+            &source.report.run_report.source_path,
+            &source.report,
+            input.policy.latency_source_max_age_ms,
+        );
+    }
+    for (path, artifact) in input.account_artifacts {
+        push_freshness(
+            &mut observations,
+            &mut failures,
+            input.policy,
+            input.verified_at_ms,
+            ProductionEvidenceGate::AccountCertification,
+            Some(artifact.summary.account_id.clone()),
+            path,
+            artifact.start_clock.server_ms,
+            Some(artifact.finish_clock.server_ms),
+            input.policy.production_account_certification_max_age_ms,
+        );
+    }
+    for (source, artifact) in input.deadman_artifacts {
+        push_freshness(
+            &mut observations,
+            &mut failures,
+            input.policy,
+            input.verified_at_ms,
+            ProductionEvidenceGate::DeadmanCertification,
+            Some(artifact.summary.account_id.clone()),
+            &source.artifact,
+            artifact.start_clock.server_ms,
+            Some(artifact.finish_clock.server_ms),
+            input.policy.deadman_certification_max_age_ms,
+        );
+    }
+    push_freshness(
+        &mut observations,
+        &mut failures,
+        input.policy,
+        input.verified_at_ms,
+        ProductionEvidenceGate::EmergencyCancel,
+        None,
+        input.emergency_path,
+        input.emergency.started_at_ms,
+        input
+            .emergency
+            .started_at_ms
+            .checked_add(input.emergency.elapsed_ms),
+        input.policy.emergency_cancel_max_age_ms,
+    );
+    for fill in input.fill_inputs {
+        push_freshness(
+            &mut observations,
+            &mut failures,
+            input.policy,
+            input.verified_at_ms,
+            ProductionEvidenceGate::FillReconciliation,
+            Some(fill.manifest.account_id.clone()),
+            &fill.collection_manifest,
+            fill.manifest.window.begin_ms,
+            Some(fill.manifest.window.end_ms),
+            input.policy.fill_collection_max_age_ms,
+        );
+    }
+    observations.sort_by(|left, right| {
+        left.gate
+            .cmp(&right.gate)
+            .then_with(|| left.subject.cmp(&right.subject))
+            .then_with(|| left.source_path.cmp(&right.source_path))
+    });
+    failures.sort_by_key(failure_sort_key);
+    failures.dedup();
+    (observations, failures)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_live_freshness(
+    observations: &mut Vec<ProductionEvidenceFreshnessObservation>,
+    failures: &mut Vec<ProductionEvidenceFailure>,
+    policy: &ProductionEvidenceFreshnessPolicy,
+    verified_at_ms: u64,
+    gate: ProductionEvidenceGate,
+    subject: Option<String>,
+    source_path: &Path,
+    report: &reap_live::LiveRunVerificationReport,
+    maximum_age_ms: u64,
+) {
+    push_freshness(
+        observations,
+        failures,
+        policy,
+        verified_at_ms,
+        gate,
+        subject,
+        source_path,
+        report.session_started_at_ms,
+        report.session_started_at_ms.checked_add(report.elapsed_ms),
+        maximum_age_ms,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_freshness(
+    observations: &mut Vec<ProductionEvidenceFreshnessObservation>,
+    failures: &mut Vec<ProductionEvidenceFailure>,
+    policy: &ProductionEvidenceFreshnessPolicy,
+    verified_at_ms: u64,
+    gate: ProductionEvidenceGate,
+    subject: Option<String>,
+    source_path: &Path,
+    started_at_ms: u64,
+    completed_at_ms: Option<u64>,
+    maximum_age_ms: u64,
+) {
+    let completed = completed_at_ms.unwrap_or(u64::MAX);
+    let mut age_ms = None;
+    let mut passed = false;
+    if started_at_ms == 0 || completed_at_ms.is_none() || completed < started_at_ms {
+        failures.push(ProductionEvidenceFailure::EvidenceTimestampInvalid {
+            gate,
+            subject: subject.clone(),
+            started_at_ms,
+            completed_at_ms: completed,
+        });
+    } else if completed > verified_at_ms.saturating_add(policy.future_tolerance_ms) {
+        failures.push(ProductionEvidenceFailure::EvidenceTimestampInFuture {
+            gate,
+            subject: subject.clone(),
+            completed_at_ms: completed,
+            verified_at_ms,
+            future_tolerance_ms: policy.future_tolerance_ms,
+        });
+    } else {
+        let age = verified_at_ms.saturating_sub(completed);
+        age_ms = Some(age);
+        if age > maximum_age_ms {
+            failures.push(ProductionEvidenceFailure::EvidenceStale {
+                gate,
+                subject: subject.clone(),
+                age_ms: age,
+                maximum_age_ms,
+            });
+        } else {
+            passed = true;
+        }
+    }
+    observations.push(ProductionEvidenceFreshnessObservation {
+        gate,
+        subject,
+        source_path: source_path.to_path_buf(),
+        started_at_ms,
+        completed_at_ms: completed,
+        age_ms,
+        maximum_age_ms,
+        passed,
+    });
+}
+
+fn check_fault_proxy_live_session(
+    failures: &mut Vec<ProductionEvidenceFailure>,
+    scenario: reap_live::LiveFaultScenario,
+    proxy: &reap_live::LiveFaultProxyEvidenceSummary,
+    live_started_at_ms: u64,
+    live_elapsed_ms: u64,
+) {
+    let Some(live_completed_at_ms) = live_started_at_ms.checked_add(live_elapsed_ms) else {
+        return;
+    };
+    if proxy.armed_at_ms < live_started_at_ms || proxy.completed_at_ms > live_completed_at_ms {
+        failures.push(ProductionEvidenceFailure::FaultProxyOutsideLiveSession {
+            scenario,
+            proxy_armed_at_ms: proxy.armed_at_ms,
+            proxy_completed_at_ms: proxy.completed_at_ms,
+            live_started_at_ms,
+            live_completed_at_ms,
+        });
+    }
+}
+
+fn scenario_name(scenario: reap_live::LiveFaultScenario) -> String {
+    serde_json::to_value(scenario)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{scenario:?}"))
 }
 
 struct BindingInputs<'a> {
@@ -1119,10 +1564,7 @@ fn check_fault_proxy_entries<'a>(
             }
             continue;
         };
-        let scenario_name = serde_json::to_value(scenario)
-            .ok()
-            .and_then(|value| value.as_str().map(str::to_string))
-            .unwrap_or_else(|| format!("{scenario:?}"));
+        let scenario_name = scenario_name(scenario);
         check_binding(
             failures,
             ProductionEvidenceGate::FaultConfiguration,
@@ -1406,6 +1848,7 @@ fn validate_manifest(manifest: &ProductionEvidenceManifest) -> Result<()> {
         "expected_production_account_identity_sha256s",
         &manifest.expected_production_account_identity_sha256s,
     )?;
+    validate_freshness_policy(&manifest.freshness)?;
     validate_count(
         "latency_source_reports",
         manifest.latency_source_reports.len(),
@@ -1438,6 +1881,54 @@ fn validate_manifest(manifest: &ProductionEvidenceManifest) -> Result<()> {
             if !value.is_finite() || value < 0.0 {
                 bail!("fill reconciliation {field} must be finite and non-negative");
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_freshness_policy(policy: &ProductionEvidenceFreshnessPolicy) -> Result<()> {
+    if policy.future_tolerance_ms > MAX_FUTURE_TOLERANCE_MS {
+        bail!("freshness.future_tolerance_ms must be at most {MAX_FUTURE_TOLERANCE_MS}");
+    }
+    for (field, value, maximum) in [
+        (
+            "demo_soak_max_age_ms",
+            policy.demo_soak_max_age_ms,
+            MAX_DEMO_SOAK_AGE_MS,
+        ),
+        (
+            "fault_run_max_age_ms",
+            policy.fault_run_max_age_ms,
+            MAX_FAULT_RUN_AGE_MS,
+        ),
+        (
+            "latency_source_max_age_ms",
+            policy.latency_source_max_age_ms,
+            MAX_LATENCY_SOURCE_AGE_MS,
+        ),
+        (
+            "production_account_certification_max_age_ms",
+            policy.production_account_certification_max_age_ms,
+            MAX_PRODUCTION_ACCOUNT_CERTIFICATION_AGE_MS,
+        ),
+        (
+            "deadman_certification_max_age_ms",
+            policy.deadman_certification_max_age_ms,
+            MAX_DEADMAN_CERTIFICATION_AGE_MS,
+        ),
+        (
+            "emergency_cancel_max_age_ms",
+            policy.emergency_cancel_max_age_ms,
+            MAX_EMERGENCY_CANCEL_AGE_MS,
+        ),
+        (
+            "fill_collection_max_age_ms",
+            policy.fill_collection_max_age_ms,
+            MAX_FILL_COLLECTION_AGE_MS,
+        ),
+    ] {
+        if value == 0 || value > maximum {
+            bail!("freshness.{field} must be within 1..={maximum}, got {value}");
         }
     }
     Ok(())
@@ -1649,6 +2140,16 @@ fn load_manifest(path: &Path) -> Result<LoadedManifest> {
     })
 }
 
+fn unix_time_ms() -> Result<u64> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_millis();
+    millis
+        .try_into()
+        .context("current Unix time does not fit in milliseconds")
+}
+
 fn serialized_sha256<T: Serialize>(value: &T) -> Result<String> {
     let bytes = serde_json::to_vec(value).context("failed to serialize reconstructed evidence")?;
     Ok(sha256_bytes(&bytes))
@@ -1672,7 +2173,7 @@ mod tests {
     fn manifest_toml(extra: &str) -> String {
         format!(
             r#"
-schema_version = 1
+schema_version = 2
 expected_reap_version = "0.1.0"
 expected_live_executable_sha256 = "{}"
 expected_host_identity_sha256 = "{}"
@@ -1689,6 +2190,16 @@ research_manifest = "research.toml"
 research_report = "research.json"
 account_certifications = ["account.json"]
 emergency_cancel_report = "emergency.json"
+
+[freshness]
+future_tolerance_ms = 60000
+demo_soak_max_age_ms = 3600000
+fault_run_max_age_ms = 3600000
+latency_source_max_age_ms = 3600000
+production_account_certification_max_age_ms = 600000
+deadman_certification_max_age_ms = 3600000
+emergency_cancel_max_age_ms = 3600000
+fill_collection_max_age_ms = 3600000
 
 [expected_demo_account_identity_sha256s]
 main = "{}"
@@ -1738,6 +2249,61 @@ minimum_fills = 1
         parsed.fill_reconciliations[0].minimum_fills = 1;
         parsed.expected_host_identity_sha256 = "ABC".to_string();
         assert!(validate_manifest(&parsed).is_err());
+
+        parsed.expected_host_identity_sha256 = "2".repeat(64);
+        parsed.freshness.production_account_certification_max_age_ms =
+            MAX_PRODUCTION_ACCOUNT_CERTIFICATION_AGE_MS + 1;
+        assert!(validate_manifest(&parsed).is_err());
+    }
+
+    #[test]
+    fn freshness_rejects_invalid_future_and_stale_sources() {
+        let policy = ProductionEvidenceFreshnessPolicy {
+            future_tolerance_ms: 10,
+            demo_soak_max_age_ms: 100,
+            fault_run_max_age_ms: 100,
+            latency_source_max_age_ms: 100,
+            production_account_certification_max_age_ms: 100,
+            deadman_certification_max_age_ms: 100,
+            emergency_cancel_max_age_ms: 100,
+            fill_collection_max_age_ms: 100,
+        };
+        let mut observations = Vec::new();
+        let mut failures = Vec::new();
+        for (subject, started, completed) in [
+            ("invalid", 0, Some(1)),
+            ("future", 100, Some(1_011)),
+            ("stale", 100, Some(899)),
+            ("current", 900, Some(900)),
+        ] {
+            push_freshness(
+                &mut observations,
+                &mut failures,
+                &policy,
+                1_000,
+                ProductionEvidenceGate::DemoSoak,
+                Some(subject.to_string()),
+                Path::new("source.json"),
+                started,
+                completed,
+                100,
+            );
+        }
+        assert_eq!(observations.len(), 4);
+        assert_eq!(observations.iter().filter(|entry| entry.passed).count(), 1);
+        assert!(failures.iter().any(|failure| matches!(
+            failure,
+            ProductionEvidenceFailure::EvidenceTimestampInvalid { .. }
+        )));
+        assert!(failures.iter().any(|failure| matches!(
+            failure,
+            ProductionEvidenceFailure::EvidenceTimestampInFuture { .. }
+        )));
+        assert!(
+            failures
+                .iter()
+                .any(|failure| matches!(failure, ProductionEvidenceFailure::EvidenceStale { .. }))
+        );
     }
 
     #[test]
@@ -1769,6 +2335,8 @@ minimum_fills = 1
             proxy_config_fingerprint: "a".repeat(64),
             command_id: "command-one".to_string(),
             command_kind: "disconnect_websockets".to_string(),
+            armed_at_ms: 100,
+            completed_at_ms: 101,
             effect_count: 1,
             passed: true,
         };
@@ -1809,6 +2377,29 @@ minimum_fills = 1
                 ProductionEvidenceFailure::BindingMismatch { .. }
             ))
         );
+
+        let mut timing_failures = Vec::new();
+        check_fault_proxy_live_session(
+            &mut timing_failures,
+            reap_live::LiveFaultScenario::PublicReconnect,
+            &exact,
+            100,
+            1,
+        );
+        assert!(timing_failures.is_empty());
+        let mut outside = exact;
+        outside.completed_at_ms = 102;
+        check_fault_proxy_live_session(
+            &mut timing_failures,
+            reap_live::LiveFaultScenario::PublicReconnect,
+            &outside,
+            100,
+            1,
+        );
+        assert!(matches!(
+            timing_failures.as_slice(),
+            [ProductionEvidenceFailure::FaultProxyOutsideLiveSession { .. }]
+        ));
     }
 
     #[test]

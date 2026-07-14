@@ -1698,7 +1698,7 @@ target/release/reap verify-production-evidence \
   --pretty
 ```
 
-Schema 1 requires the intended Reap version, candidate executable SHA-256,
+Schema 2 requires the intended Reap version, candidate executable SHA-256,
 target-host identity SHA-256, predeclared deployment candidate ID, and separate
 demo and production exchange-account identity maps. It also requires the exact
 fault-proxy config and the create-new routed demo config used by the fault
@@ -1710,6 +1710,33 @@ certification, demo deadman certification, and authenticated fill reconciliation
 for every account in the exact configs. The dedicated clean demo soak must be a
 different session from every fault-matrix run. A reviewed nonzero
 `minimum_fills` is mandatory for each reconciliation.
+
+The mandatory `[freshness]` table declares the accepted age for each
+operational source. The verifier records its wall time once, rejects zero age
+windows, rejects completed times beyond the configured future tolerance, and
+rejects stale sources. Configuration cannot weaken these hard maxima:
+
+| Source | Hard maximum age |
+| --- | ---: |
+| Dedicated demo soak | 24 hours |
+| Every fault live run and typed proxy command | 7 days |
+| Every latency source live run | 7 days |
+| Production account certification | 15 minutes |
+| Demo deadman certification | 7 days |
+| Emergency cancel report | 7 days |
+| Reconciled fill window end | 24 hours |
+
+`future_tolerance_ms` cannot exceed five minutes. The checked-in template uses
+stricter one-day fault/latency/deadman/emergency limits and six-hour soak/fill
+limits. Tighten them further when the complete campaign can be rerun faster; do
+not expand the code-level bounds to make old evidence pass.
+
+Soak, fault, and latency completion times are `session_started_at_ms + elapsed_ms`
+from independently reverified live reports. Account and deadman completion times
+use the validated final OKX server-clock sample. Emergency completion uses its
+validated start plus elapsed interval. Fill age uses the authenticated collection
+window's end, so collecting an old retained window again does not make the fills
+fresh.
 
 The aggregate command directly reruns, rather than consumes output from:
 
@@ -1725,26 +1752,31 @@ exact loopback config;
   reconciliation.
 
 Every proxy-supported matrix role must expose parsed Reap injector evidence with
-the exact supplied proxy-config fingerprint and a unique proxy session and command
-ID. Opaque external injector records are accepted by this production bundle only
-for genuine partial-fill and restored-latch roles, whose causality cannot be
-manufactured by the current proxy. Archive and review each proxy process run
-report separately; schema 1 does not reconstruct its clean-shutdown status.
+the exact supplied proxy-config fingerprint and a unique proxy session and
+command ID. Its validated arm/completion interval must be fresh and contained
+inside the corresponding reverified live session. Opaque external injector
+records are accepted only for genuine partial-fill and restored-latch roles,
+whose causality cannot be manufactured by the current proxy. Freshness applies
+to those roles' live reports, but their external causality remains an operator
+review. Archive and review each proxy process run report separately; schema 2
+does not reconstruct its clean-shutdown status.
 
-The official-demo, production, routed-fault, and fault-proxy configs are reopened
-after those potentially long reconstructions. The bundle fails if any changed,
-if the routed config is not the deterministic typed route transform, if a
-subordinate source gate fails, if account coverage is missing or duplicated, or
-if any config/build/host/account/candidate binding differs. The output records a
-semantic SHA-256 of each in-memory reconstruction and always sets
-`production_order_entry_authorized = false`.
+The controlling manifest plus official-demo, production, routed-fault, and
+fault-proxy configs are reopened after those potentially long reconstructions.
+The bundle fails if any changed, if the routed config is not the deterministic
+typed route transform, if a subordinate source gate fails, if account coverage
+is missing or duplicated, or if any config/build/host/account/candidate binding
+differs. The output records a semantic SHA-256 of each in-memory reconstruction
+and always sets `production_order_entry_authorized = false`.
 
-A pass is deliberately narrower than production approval. Schema 1 does not
-enforce an evidence-age policy, remotely attest the host or exchange identity,
-reconcile complete economic statements, prove external supervisor/paging state,
-or record human rollout approval. Re-run immediately before review, inspect the
-underlying timestamps and limitations, and keep production entry disabled until
-those external controls are independently signed off.
+A pass is deliberately narrower than production approval. Schema 2 enforces
+bounded age from validated session, exchange-clock, emergency-report, and fill
+window timestamps, but those clocks are not remotely attested. It does not
+remotely attest the host or exchange identity, reconcile complete economic
+statements, prove external supervisor/paging state, authenticate opaque external
+fault causality, or record human rollout approval. Re-run immediately before
+review and keep production entry disabled until those external controls are
+independently signed off.
 
 At pinned Java revision `b6b120c7b7c466d8431bf082f3229328c5d7b2ae`,
 `ChaosBackTestMultiRunService` sequences daily inputs, carries ending positions,

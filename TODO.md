@@ -294,6 +294,11 @@ architecture in [docs/architecture.md](docs/architecture.md).
   and separate demo/production account identities across transition, research,
   soak, fault, latency, account, deadman, emergency, and authenticated fill/fee
   gates. It never authorizes production entry.
+- [x] Require a bounded schema-2 freshness policy for every operational source
+  in the aggregate bundle. Reverify fault/latency live reports, preserve typed
+  proxy command times, require those commands to occur inside their live
+  sessions, and reject invalid, future, or stale timestamps under code-level
+  maximum ages.
 - [ ] Calibrate queue position, latency, fees, funding, and slippage from
   captured full-depth data, then run and archive production-candidate
   walk-forward, capacity, and stressed-liquidity reports. The orchestration and
@@ -316,8 +321,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
   enabled.
 - [ ] Certify production credentials/account mode/limits and expose production
   order entry only after every gate in `docs/trading-readiness.md` is signed off.
-  Add a bounded evidence-freshness/approval policy around the source-rebuilding
-  bundle; no passing target-host bundle or human approval artifact exists.
+  Add an independently authenticated human approval policy around the
+  source-rebuilding bundle; no passing target-host bundle or approval artifact
+  exists.
 
 Completed-step evidence is documented in [README.md](README.md),
 [docs/operations.md](docs/operations.md), and

@@ -15,7 +15,7 @@ use crate::{
     TradingEnvironment,
 };
 
-pub const EMERGENCY_CANCEL_VERIFICATION_FORMAT_VERSION: u16 = 1;
+pub const EMERGENCY_CANCEL_VERIFICATION_FORMAT_VERSION: u16 = 2;
 pub const MAX_EMERGENCY_CANCEL_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_EMERGENCY_CANCEL_REPORT_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -95,6 +95,8 @@ pub struct EmergencyCancelVerificationReport {
     pub executable_sha256: Option<String>,
     pub host_identity_sha256: Option<String>,
     pub environment: TradingEnvironment,
+    pub started_at_ms: u64,
+    pub elapsed_ms: u64,
     pub configured_accounts: Vec<String>,
     pub selected_accounts: Vec<String>,
     pub account_identity_sha256s: BTreeMap<String, String>,
@@ -390,6 +392,8 @@ pub fn verify_emergency_cancel_paths(
         executable_sha256: report.executable_sha256,
         host_identity_sha256: report.host_identity_sha256,
         environment: report.environment,
+        started_at_ms: report.started_at_ms,
+        elapsed_ms: report.elapsed_ms,
         configured_accounts,
         selected_accounts: report.selected_accounts,
         account_identity_sha256s,

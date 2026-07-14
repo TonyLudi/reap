@@ -14,7 +14,7 @@ use crate::{
 };
 
 pub const LIVE_FAULT_MATRIX_MANIFEST_SCHEMA_VERSION: u32 = 3;
-pub const LIVE_FAULT_MATRIX_REPORT_FORMAT_VERSION: u32 = 4;
+pub const LIVE_FAULT_MATRIX_REPORT_FORMAT_VERSION: u32 = 5;
 pub const MAX_LIVE_FAULT_MATRIX_MANIFEST_BYTES: u64 = 1024 * 1024;
 pub const MAX_LIVE_FAULT_INJECTOR_EVIDENCE_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_LIVE_FAULT_MATRIX_RUNS: usize = 32;
@@ -227,6 +227,8 @@ pub struct LiveFaultProxyEvidenceSummary {
     pub proxy_config_fingerprint: String,
     pub command_id: String,
     pub command_kind: String,
+    pub armed_at_ms: u64,
+    pub completed_at_ms: u64,
     pub effect_count: usize,
     pub passed: bool,
 }
@@ -1032,6 +1034,8 @@ fn reap_fault_proxy_evidence_summary(
         proxy_config_fingerprint: wire.proxy_config_fingerprint,
         command_id: wire.command_id,
         command_kind,
+        armed_at_ms: wire.armed_at_ms,
+        completed_at_ms: wire.completed_at_ms,
         effect_count: wire.effects.len(),
         passed: wire.passed,
     }))
@@ -1816,6 +1820,8 @@ mod tests {
         let proxy = public.reap_fault_proxy_evidence.as_ref().unwrap();
         assert_eq!(proxy.command_id, "public-reconnect");
         assert_eq!(proxy.command_kind, "disconnect_websockets");
+        assert_eq!(proxy.armed_at_ms, 100);
+        assert_eq!(proxy.completed_at_ms, 101);
         assert_eq!(proxy.effect_count, 1);
     }
 
@@ -1875,6 +1881,8 @@ mod tests {
         let proxy = status.reap_fault_proxy_evidence.as_ref().unwrap();
         assert_eq!(proxy.command_id, "exchange-status-failure");
         assert_eq!(proxy.command_kind, "rest_response");
+        assert_eq!(proxy.armed_at_ms, 100);
+        assert_eq!(proxy.completed_at_ms, 101);
         assert_eq!(proxy.effect_count, 1);
     }
 

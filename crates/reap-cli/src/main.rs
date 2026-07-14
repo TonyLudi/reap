@@ -188,13 +188,13 @@ enum Command {
     },
     #[command(
         about = "Reconstruct and cross-bind the complete production evidence bundle",
-        long_about = "Read a strict production-evidence manifest, rerun every underlying source verifier, and bind the exact demo/production configs, deployment candidate, release binary, target host, and demo/production account identities. This gate does not authorize or enable production order entry."
+        long_about = "Read a strict production-evidence manifest, rerun every underlying source verifier, enforce bounded operational-evidence freshness, and bind the exact demo/production configs, deployment candidate, release binary, target host, and demo/production account identities. This gate does not authorize or enable production order entry."
     )]
     VerifyProductionEvidence {
         #[arg(
             short,
             long,
-            help = "Strict schema-1 production evidence TOML manifest"
+            help = "Strict schema-2 production evidence TOML manifest"
         )]
         manifest: PathBuf,
         #[arg(
@@ -205,7 +205,7 @@ enum Command {
         output: Option<PathBuf>,
         #[arg(
             long,
-            help = "Exit non-zero unless every source gate and identity binding passes"
+            help = "Exit non-zero unless every source, freshness, and identity gate passes"
         )]
         require_pass: bool,
         #[arg(long)]
@@ -895,7 +895,7 @@ async fn main() -> Result<()> {
             println!("{json}");
             if require_pass && !report.evidence_bundle_passed {
                 anyhow::bail!(
-                    "production evidence bundle did not pass every source and binding gate"
+                    "production evidence bundle did not pass every source, freshness, and binding gate"
                 );
             }
         }

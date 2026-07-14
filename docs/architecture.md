@@ -916,12 +916,16 @@ must not depend on `reap-backtest`, while the aggregate verifier must call both
 live and research source verifiers. The strict manifest predeclares one release
 binary, target host, deployment candidate, and environment-specific account
 identities. The verifier reruns each source gate, reopens every deployment
-config, and reconstructs the loopback fault config from the exact official-demo
-and fault-proxy configs before cross-binding all returned identities. It hashes
-the typed in-memory reconstructions instead of accepting prior verification
-JSON. Even a passing bundle leaves production entry unauthorized because
-freshness, external supervision, full economics, and operator approval are
-outside this composition.
+config and the controlling manifest, and reconstructs the loopback fault config
+from the exact official-demo and fault-proxy configs before cross-binding all
+returned identities. It hashes the typed in-memory reconstructions instead of
+accepting prior verification JSON. Schema 2 re-verifies every fault/latency live
+source, derives completion
+times from validated sessions or exchange-clock samples, enforces explicit age
+limits under hard maxima, and requires each typed proxy command interval to fall
+inside its live session. Even a passing bundle leaves production entry
+unauthorized because remote attestation, external supervision, full economics,
+and operator approval are outside this composition.
 
 ## Multi-Websocket Design
 
