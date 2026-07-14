@@ -1021,6 +1021,9 @@ the deployment blocker.
   Done.
 - Emit bounded soak evidence for readiness recovery, reconciliation drift,
   storage pressure, and zero-order shutdown. Done.
+- Classify ambiguous order operations, partial fills, convergence timeouts,
+  restored durable latches, and periodic safety-task failures in versioned live
+  evidence without parsing diagnostic messages. Done.
 - Route every demo exit through submit-disabled cancellation and per-account
   post-cancel REST reconciliation, even when persistence has failed. Done.
 - Authenticate bounded local operator commands outside the strategy loop and

@@ -1046,6 +1046,28 @@ replacement for exchange-side account limits and operator access controls.
 | Journal lease contention | Second process refuses startup before credentials/network | Identify the owning PID/process; never bypass the lock or share the journal |
 | Critical storage loss/backpressure | Runtime fail-stop; checkpoint reconciliation required on restart | Investigate disk/queue capacity; critical records are never silently dropped |
 
+For a credentialed fault campaign, archive the report and require the following
+structured evidence rather than matching log text:
+
+| Injected condition | Required schema-6 evidence |
+| --- | --- |
+| Public websocket loss | `public_connection_disconnect_events > 0`; verify the expected readiness impact for the configured replica count |
+| Private websocket loss | `private_connection_disconnect_events > 0`, a readiness loss, and later ready state after REST reconciliation |
+| Ambiguous REST submit or cancel | The corresponding `ambiguous_submit_events` or `ambiguous_cancel_events` counter is nonzero |
+| Exchange partial fill | `partial_fill_events > 0`, plus canonical fill/fee statement reconciliation for the run window |
+| Suppressed fill/account state | `fill_convergence_timeout_events > 0` and a matching reconciliation-drift response |
+| Suppressed order state | `order_convergence_timeout_events > 0` and a matching reconciliation-drift response |
+| Restart with a durable halt | `restored_safety_latches > 0`; startup-replayed partial orders do not increment `partial_fill_events` |
+| Cancel All After heartbeat failure | `stop_reason = "runtime_failure"` and `failure.code = "deadman_heartbeat"` |
+| Periodic exchange-clock skew/check failure | `failure.code = "exchange_clock_skew"` or `"exchange_clock_check"` |
+| Authenticated account-config drift/check failure | `failure.code = "account_config_drift"` or `"account_config_check"` |
+
+These fields prove that Reap observed and handled the named condition. They do
+not prove the external injector was configured correctly, that Cancel All After
+expired after process death, or that exchange state is economically reconciled;
+retain injector, supervisor, emergency-cancel, and account-statement evidence
+for those claims.
+
 ## Operator Controls
 
 - The enabled operator service binds only a Unix-domain socket, refuses to
@@ -1155,7 +1177,7 @@ shuts down directly.
 With `--output`, the CLI reserves the create-new path before configuration,
 credentials, or network startup. If the report-capable runtime's initialization,
 event loop, or teardown fails, Reap completes the same fail-closed cleanup,
-writes and fsyncs a schema-4 report with `stop_reason = "runtime_failure"` plus a
+writes and fsyncs a schema-6 report with `stop_reason = "runtime_failure"` plus a
 bounded stable `failure.code` and diagnostic `failure.message`, prints it, and
 then returns the original nonzero error. Review `readiness_at_stop` separately
 from final `readiness`, and require `active_orders_after_shutdown = 0`; a failure
@@ -1210,11 +1232,16 @@ of these invariants hold:
 - demo shutdown resolved every active canonical order; and
 - no external alert delivery failed.
 
-The schema-5 report also records time-to-ready, recovered readiness losses and
+The schema-6 report also records time-to-ready, recovered readiness losses and
 maximum outage, total/public/private disconnects, stale-stream events, book
 recoveries, and the storage queue high-water mark. The total disconnect count
 must equal the public and private counts combined. It also reports authenticated
-operator commands and mutations.
+operator commands and mutations, ambiguous submit/cancel outcomes, partial-fill
+transitions, order/fill convergence timeouts, and restored durable latches.
+Restored startup order state does not increment per-session partial-fill or
+ambiguity counters. Deadman heartbeat, periodic exchange-clock skew/check, and
+authenticated account-config drift/check failures use distinct stable failure
+codes; do not classify them by matching `failure.message`.
 When enabled, it includes host preflight/last snapshots and check count plus
 alert delivery and queue evidence. A runtime/teardown failure additionally
 records its stable code and bounded message after cleanup while retaining a

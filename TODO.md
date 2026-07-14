@@ -209,7 +209,10 @@ architecture in [docs/architecture.md](docs/architecture.md).
   certification with credential-free raw-evidence verification.
 - [x] Make websocket ready/disconnect transitions lossless under bounded status
   backpressure, remove redundant per-frame status traffic, and split public and
-  private disconnect counts in schema-5 live evidence for fault campaigns.
+  private disconnect counts in schema-6 live evidence for fault campaigns.
+- [x] Add structured live fault evidence for ambiguous submit/cancel outcomes,
+  partial fills, order/fill convergence timeouts, restored durable latches, and
+  typed deadman, periodic clock, and authenticated account-config failures.
 - [ ] Run credentialed bounded observe and minimal-size demo fault campaigns,
   including process death, deadman expiry, clock skew, REST ambiguity, partial
   fill, reconnect, and durable-latch restart recovery.

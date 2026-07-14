@@ -17,9 +17,9 @@ use reap_order::{
     reconcile_full_state,
 };
 use reap_storage::{
-    BootstrapRecord, OrderOperation, OrderRequestRecord, RecoveredStorage, SafetyLatchRecord,
-    SafetyLatchScope, SafetyLatchSource, StorageConfig, StorageError, StorageRecord,
-    StorageRuntime, StorageSink, acquire_storage_lease, recover_jsonl,
+    BootstrapRecord, OrderAckStatus, OrderOperation, OrderRequestRecord, RecoveredStorage,
+    SafetyLatchRecord, SafetyLatchScope, SafetyLatchSource, StorageConfig, StorageError,
+    StorageRecord, StorageRuntime, StorageSink, acquire_storage_lease, recover_jsonl,
     start_jsonl_storage_with_lease,
 };
 use reap_telemetry::{
@@ -51,7 +51,7 @@ use crate::{
 };
 
 type LiveGateway = OkxOrderGateway<ReqwestTransport>;
-pub const LIVE_RUN_REPORT_SCHEMA_VERSION: u32 = 5;
+pub const LIVE_RUN_REPORT_SCHEMA_VERSION: u32 = 6;
 pub const MAX_LIVE_FAILURE_CODE_BYTES: usize = 64;
 pub const MAX_LIVE_FAILURE_MESSAGE_BYTES: usize = 4_096;
 
@@ -117,6 +117,12 @@ pub struct LiveRunReport {
     pub connection_disconnect_events: u64,
     pub public_connection_disconnect_events: u64,
     pub private_connection_disconnect_events: u64,
+    pub ambiguous_submit_events: u64,
+    pub ambiguous_cancel_events: u64,
+    pub partial_fill_events: u64,
+    pub fill_convergence_timeout_events: u64,
+    pub order_convergence_timeout_events: u64,
+    pub restored_safety_latches: u64,
     pub operator_commands: u64,
     pub operator_mutations: u64,
     pub max_storage_queue_depth: usize,
@@ -197,6 +203,16 @@ pub enum LiveRuntimeError {
     ReadinessTimeout(u64),
     #[error("gateway task failed: {0}")]
     GatewayTask(String),
+    #[error("Cancel All After heartbeat failed: {0}")]
+    DeadmanHeartbeat(String),
+    #[error("exchange clock skew exceeded the configured bound: {0}")]
+    ExchangeClockSkew(String),
+    #[error("exchange clock check failed: {0}")]
+    ExchangeClockCheck(String),
+    #[error("authenticated account configuration drifted: {0}")]
+    AccountConfigDrift(String),
+    #[error("authenticated account configuration check failed: {0}")]
+    AccountConfigCheck(String),
     #[error("durable safety latch sync timed out after {0}ms")]
     SafetyLatchSyncTimeout(u64),
     #[error(
@@ -257,6 +273,11 @@ impl LiveRuntimeError {
             Self::MissingRecoveryRoute(_) => "missing_recovery_route",
             Self::ReadinessTimeout(_) => "readiness_timeout",
             Self::GatewayTask(_) => "gateway_task",
+            Self::DeadmanHeartbeat(_) => "deadman_heartbeat",
+            Self::ExchangeClockSkew(_) => "exchange_clock_skew",
+            Self::ExchangeClockCheck(_) => "exchange_clock_check",
+            Self::AccountConfigDrift(_) => "account_config_drift",
+            Self::AccountConfigCheck(_) => "account_config_check",
             Self::SafetyLatchSyncTimeout(_) => "safety_latch_sync_timeout",
             Self::ShutdownUnresolved { .. } => "shutdown_unresolved",
             Self::FeedAdapter(_) => "feed_adapter",
@@ -276,12 +297,26 @@ struct RuntimeEvidence {
     connection_disconnect_events: u64,
     public_connection_disconnect_events: u64,
     private_connection_disconnect_events: u64,
+    ambiguous_submit_events: u64,
+    ambiguous_cancel_events: u64,
+    partial_fill_events: u64,
+    fill_convergence_timeout_events: u64,
+    order_convergence_timeout_events: u64,
+    restored_safety_latches: u64,
     operator_commands: u64,
     operator_mutations: u64,
     max_storage_queue_depth: usize,
 }
 
 impl RuntimeEvidence {
+    fn begin_live_session(&mut self, restored_safety_latches: u64) {
+        *self = Self {
+            restored_safety_latches,
+            max_storage_queue_depth: self.max_storage_queue_depth,
+            ..Self::default()
+        };
+    }
+
     fn observe_disconnect(&mut self, private: bool) {
         self.connection_disconnect_events = self.connection_disconnect_events.saturating_add(1);
         if private {
@@ -294,17 +329,49 @@ impl RuntimeEvidence {
     }
 
     fn observe_record(&mut self, record: &StorageRecord) {
-        let StorageRecord::System(event) = record else {
-            return;
-        };
-        match event.kind {
-            SystemEventKind::ReconcileDrift => self.reconciliation_drift_events += 1,
-            SystemEventKind::BookRecoveryStarted => self.book_recovery_events += 1,
-            SystemEventKind::FeedStale | SystemEventKind::PrivateStreamStale => {
-                self.stream_stale_events += 1;
+        match record {
+            StorageRecord::System(event) => match event.kind {
+                SystemEventKind::ReconcileDrift => {
+                    self.reconciliation_drift_events =
+                        self.reconciliation_drift_events.saturating_add(1);
+                }
+                SystemEventKind::BookRecoveryStarted => {
+                    self.book_recovery_events = self.book_recovery_events.saturating_add(1);
+                }
+                SystemEventKind::FeedStale | SystemEventKind::PrivateStreamStale => {
+                    self.stream_stale_events = self.stream_stale_events.saturating_add(1);
+                }
+                _ => {}
+            },
+            StorageRecord::OrderAck(ack) if matches!(ack.status, OrderAckStatus::Ambiguous) => {
+                match ack.operation {
+                    OrderOperation::Submit => {
+                        self.ambiguous_submit_events =
+                            self.ambiguous_submit_events.saturating_add(1);
+                    }
+                    OrderOperation::Cancel => {
+                        self.ambiguous_cancel_events =
+                            self.ambiguous_cancel_events.saturating_add(1);
+                    }
+                }
+            }
+            StorageRecord::Order { update, .. }
+                if update.status == OrderStatus::PartiallyFilled =>
+            {
+                self.partial_fill_events = self.partial_fill_events.saturating_add(1);
             }
             _ => {}
         }
+    }
+
+    fn observe_fill_convergence_timeout(&mut self) {
+        self.fill_convergence_timeout_events =
+            self.fill_convergence_timeout_events.saturating_add(1);
+    }
+
+    fn observe_order_convergence_timeout(&mut self) {
+        self.order_convergence_timeout_events =
+            self.order_convergence_timeout_events.saturating_add(1);
     }
 }
 
@@ -489,6 +556,12 @@ pub async fn run_live(
             connection_disconnect_events: 0,
             public_connection_disconnect_events: 0,
             private_connection_disconnect_events: 0,
+            ambiguous_submit_events: 0,
+            ambiguous_cancel_events: 0,
+            partial_fill_events: 0,
+            fill_convergence_timeout_events: 0,
+            order_convergence_timeout_events: 0,
+            restored_safety_latches: 0,
             operator_commands: 0,
             operator_mutations: 0,
             max_storage_queue_depth: 0,
@@ -777,6 +850,13 @@ fn validate_recovered_safety_latches(
     Ok(())
 }
 
+fn recovered_safety_latch_count(recovered: &RecoveredStorage) -> u64 {
+    let total = usize::from(recovered.global_safety_latch.is_some())
+        .saturating_add(recovered.account_safety_latches.len())
+        .saturating_add(recovered.symbol_safety_latches.len());
+    u64::try_from(total).unwrap_or(u64::MAX)
+}
+
 fn restore_active_order_bindings(
     coordinator: &mut LiveCoordinator,
     recovered: &RecoveredStorage,
@@ -998,6 +1078,7 @@ impl LiveRuntime {
             OrderStateConvergenceGuard::new(config.runtime.order_state_convergence_timeout_ms);
         let recovered = recover_jsonl(storage_lease.journal_path())?;
         validate_recovered_safety_latches(&config, &recovered)?;
+        let restored_safety_latches = recovered_safety_latch_count(&recovered);
         for (account_id, (strategy_name, fingerprint)) in &recovered.bootstrap_identities {
             if config.account(account_id).is_none() {
                 return Err(LiveRuntimeError::CheckpointIdentity {
@@ -1365,6 +1446,7 @@ impl LiveRuntime {
                 return Err(runtime.close_after_error(primary, &context).await);
             }
         }
+        runtime.evidence.begin_live_session(restored_safety_latches);
         runtime.fill_convergence = fill_convergence;
         if let Some(secret) = operator_secret {
             let (operator_tx, operator_rx) =
@@ -1526,6 +1608,12 @@ impl LiveRuntime {
             connection_disconnect_events: evidence.connection_disconnect_events,
             public_connection_disconnect_events: evidence.public_connection_disconnect_events,
             private_connection_disconnect_events: evidence.private_connection_disconnect_events,
+            ambiguous_submit_events: evidence.ambiguous_submit_events,
+            ambiguous_cancel_events: evidence.ambiguous_cancel_events,
+            partial_fill_events: evidence.partial_fill_events,
+            fill_convergence_timeout_events: evidence.fill_convergence_timeout_events,
+            order_convergence_timeout_events: evidence.order_convergence_timeout_events,
+            restored_safety_latches: evidence.restored_safety_latches,
             operator_commands: evidence.operator_commands,
             operator_mutations: evidence.operator_mutations,
             max_storage_queue_depth: evidence.max_storage_queue_depth,
@@ -1631,6 +1719,7 @@ impl LiveRuntime {
                             self.commit_output(output).await?;
                         }
                         for breach in self.fill_convergence.expire(now_ms) {
+                            self.evidence.observe_fill_convergence_timeout();
                             let output = self.coordinator.reconciliation_fault(
                                 &breach.account_id,
                                 now_ms,
@@ -1640,6 +1729,7 @@ impl LiveRuntime {
                             self.commit_output(output).await?;
                         }
                         for breach in self.order_convergence.expire(now_ms) {
+                            self.evidence.observe_order_convergence_timeout();
                             for order_id in &breach.expired_cancel_order_ids {
                                 self.cancel_inflight
                                     .remove(&(breach.account_id.clone(), order_id.clone()));
@@ -2345,7 +2435,7 @@ impl LiveRuntime {
                 })?;
                 self.commit_output(output).await?;
             }
-            RuntimeEvent::Fatal(message) => return Err(LiveRuntimeError::GatewayTask(message)),
+            RuntimeEvent::Fatal(failure) => return Err(failure.into()),
         }
         Ok(())
     }
@@ -3172,7 +3262,29 @@ enum RuntimeEvent {
         ts_ms: u64,
         reason: String,
     },
-    Fatal(String),
+    Fatal(RuntimeTaskFailure),
+}
+
+enum RuntimeTaskFailure {
+    Gateway(String),
+    DeadmanHeartbeat(String),
+    ExchangeClockSkew(String),
+    ExchangeClockCheck(String),
+    AccountConfigDrift(String),
+    AccountConfigCheck(String),
+}
+
+impl From<RuntimeTaskFailure> for LiveRuntimeError {
+    fn from(value: RuntimeTaskFailure) -> Self {
+        match value {
+            RuntimeTaskFailure::Gateway(message) => Self::GatewayTask(message),
+            RuntimeTaskFailure::DeadmanHeartbeat(message) => Self::DeadmanHeartbeat(message),
+            RuntimeTaskFailure::ExchangeClockSkew(message) => Self::ExchangeClockSkew(message),
+            RuntimeTaskFailure::ExchangeClockCheck(message) => Self::ExchangeClockCheck(message),
+            RuntimeTaskFailure::AccountConfigDrift(message) => Self::AccountConfigDrift(message),
+            RuntimeTaskFailure::AccountConfigCheck(message) => Self::AccountConfigCheck(message),
+        }
+    }
 }
 
 enum OrderTaskCommand {
@@ -3231,9 +3343,9 @@ async fn run_order_task(
                     Ok(preparation) => preparation,
                     Err(error) => {
                         if events
-                            .send(RuntimeEvent::Fatal(format!(
+                            .send(RuntimeEvent::Fatal(RuntimeTaskFailure::Gateway(format!(
                                 "account {account_id} submit preparation failed: {error}"
-                            )))
+                            ))))
                             .await
                             .is_err()
                         {
@@ -3499,9 +3611,11 @@ async fn run_account_safety_task<T>(
             _ = deadman.tick(), if deadman_timeout_secs.is_some() => {
                 let timeout_secs = deadman_timeout_secs.expect("guarded dead-man timeout");
                 if let Err(error) = client.cancel_all_after(timeout_secs).await {
-                    let _ = events.send(RuntimeEvent::Fatal(format!(
-                        "account {account_id} Cancel All After heartbeat failed: {error}"
-                    ))).await;
+                    let _ = events
+                        .send(RuntimeEvent::Fatal(RuntimeTaskFailure::DeadmanHeartbeat(
+                            format!("account {account_id}: {error}"),
+                        )))
+                        .await;
                     return;
                 }
             }
@@ -3509,30 +3623,42 @@ async fn run_account_safety_task<T>(
                 match rest_clock_skew_ms(&client).await {
                     Ok(skew_ms) if skew_ms <= max_clock_skew_ms => {}
                     Ok(skew_ms) => {
-                        let _ = events.send(RuntimeEvent::Fatal(format!(
-                            "account {account_id} exchange clock skew {skew_ms}ms exceeds {max_clock_skew_ms}ms"
-                        ))).await;
+                        let _ = events
+                            .send(RuntimeEvent::Fatal(RuntimeTaskFailure::ExchangeClockSkew(
+                                format!(
+                                    "account {account_id} observed {skew_ms}ms; maximum is {max_clock_skew_ms}ms"
+                                ),
+                            )))
+                            .await;
                         return;
                     }
                     Err(error) => {
-                        let _ = events.send(RuntimeEvent::Fatal(format!(
-                            "account {account_id} exchange clock check failed: {error}"
-                        ))).await;
+                        let _ = events
+                            .send(RuntimeEvent::Fatal(RuntimeTaskFailure::ExchangeClockCheck(
+                                format!("account {account_id}: {error}"),
+                            )))
+                            .await;
                         return;
                     }
                 }
                 match client.account_config().await {
                     Ok(current) if current == expected_account_config => {}
                     Ok(_) => {
-                        let _ = events.send(RuntimeEvent::Fatal(format!(
-                            "account {account_id} configuration or authenticated identity drifted from bootstrap"
-                        ))).await;
+                        let _ = events
+                            .send(RuntimeEvent::Fatal(RuntimeTaskFailure::AccountConfigDrift(
+                                format!(
+                                    "account {account_id} configuration or authenticated identity differs from bootstrap"
+                                ),
+                            )))
+                            .await;
                         return;
                     }
                     Err(error) => {
-                        let _ = events.send(RuntimeEvent::Fatal(format!(
-                            "account {account_id} configuration check failed: {error}"
-                        ))).await;
+                        let _ = events
+                            .send(RuntimeEvent::Fatal(RuntimeTaskFailure::AccountConfigCheck(
+                                format!("account {account_id}: {error}"),
+                            )))
+                            .await;
                         return;
                     }
                 }
@@ -3978,6 +4104,26 @@ mod tests {
         assert!(evidence.message.len() <= MAX_LIVE_FAILURE_MESSAGE_BYTES);
         assert!(evidence.message.ends_with('\u{20ac}'));
         assert_eq!(truncate_utf8("a\u{20ac}b".to_string(), 3), "a");
+        assert_eq!(
+            live_failure_evidence(&LiveRuntimeError::DeadmanHeartbeat("test".to_string())).code,
+            "deadman_heartbeat"
+        );
+        assert_eq!(
+            live_failure_evidence(&LiveRuntimeError::ExchangeClockSkew("test".to_string())).code,
+            "exchange_clock_skew"
+        );
+        assert_eq!(
+            live_failure_evidence(&LiveRuntimeError::ExchangeClockCheck("test".to_string())).code,
+            "exchange_clock_check"
+        );
+        assert_eq!(
+            live_failure_evidence(&LiveRuntimeError::AccountConfigDrift("test".to_string())).code,
+            "account_config_drift"
+        );
+        assert_eq!(
+            live_failure_evidence(&LiveRuntimeError::AccountConfigCheck("test".to_string())).code,
+            "account_config_check"
+        );
     }
 
     #[test]
@@ -4318,6 +4464,7 @@ mod tests {
             ),
         );
         validate_recovered_safety_latches(&config, &recovered).unwrap();
+        assert_eq!(recovered_safety_latch_count(&recovered), 3);
 
         let mut coordinator = ready_coordinator(&config, unix_time_ms(), true);
         let outputs = restore_safety_latches(&mut coordinator, &recovered).unwrap();
@@ -4574,7 +4721,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_evidence_classifies_persisted_system_events() {
+    fn runtime_evidence_classifies_fault_campaign_events() {
         let system = |kind| {
             StorageRecord::System(SystemEvent {
                 ts_ms: 1,
@@ -4591,6 +4738,41 @@ mod tests {
         evidence.observe_record(&system(SystemEventKind::BookRecoveryStarted));
         evidence.observe_record(&system(SystemEventKind::FeedStale));
         evidence.observe_record(&system(SystemEventKind::PrivateStreamStale));
+        for operation in [OrderOperation::Submit, OrderOperation::Cancel] {
+            evidence.observe_record(&StorageRecord::OrderAck(reap_storage::OrderAckRecord {
+                ts_ms: 1,
+                account_id: "main".to_string(),
+                operation,
+                client_order_id: "client-1".to_string(),
+                exchange_order_id: None,
+                status: OrderAckStatus::Ambiguous,
+                message: "test ambiguity".to_string(),
+            }));
+        }
+        evidence.observe_record(&StorageRecord::Order {
+            account_id: Some("main".to_string()),
+            update: OrderUpdate {
+                ts_ms: 1,
+                order_id: "client-1".to_string(),
+                symbol: "BTC-USDT".to_string(),
+                side: Side::Buy,
+                event: OrderEvent::PartialFill,
+                status: OrderStatus::PartiallyFilled,
+                price: 100.0,
+                time_in_force: Some(reap_core::TimeInForce::PostOnly),
+                qty: 1.0,
+                open_qty: 0.5,
+                filled_qty: 0.5,
+                avg_fill_price: 100.0,
+                last_fill_qty: 0.5,
+                last_fill_price: 100.0,
+                last_fill_liquidity: None,
+                last_fill_fee: None,
+                reason: "partial fill".to_string(),
+            },
+        });
+        evidence.observe_fill_convergence_timeout();
+        evidence.observe_order_convergence_timeout();
         evidence.observe_disconnect(false);
         evidence.observe_disconnect(true);
 
@@ -4600,6 +4782,30 @@ mod tests {
         assert_eq!(evidence.connection_disconnect_events, 2);
         assert_eq!(evidence.public_connection_disconnect_events, 1);
         assert_eq!(evidence.private_connection_disconnect_events, 1);
+        assert_eq!(evidence.ambiguous_submit_events, 1);
+        assert_eq!(evidence.ambiguous_cancel_events, 1);
+        assert_eq!(evidence.partial_fill_events, 1);
+        assert_eq!(evidence.fill_convergence_timeout_events, 1);
+        assert_eq!(evidence.order_convergence_timeout_events, 1);
+    }
+
+    #[test]
+    fn live_session_evidence_excludes_bootstrap_order_outcomes() {
+        let mut evidence = RuntimeEvidence {
+            ambiguous_submit_events: 1,
+            ambiguous_cancel_events: 1,
+            partial_fill_events: 1,
+            max_storage_queue_depth: 7,
+            ..RuntimeEvidence::default()
+        };
+
+        evidence.begin_live_session(3);
+
+        assert_eq!(evidence.ambiguous_submit_events, 0);
+        assert_eq!(evidence.ambiguous_cancel_events, 0);
+        assert_eq!(evidence.partial_fill_events, 0);
+        assert_eq!(evidence.restored_safety_latches, 3);
+        assert_eq!(evidence.max_storage_queue_depth, 7);
     }
 
     #[test]
@@ -5082,7 +5288,9 @@ mod tests {
             }
         });
         control_tx
-            .send(RuntimeEvent::Fatal("injected runtime failure".to_string()))
+            .send(RuntimeEvent::Fatal(RuntimeTaskFailure::Gateway(
+                "injected runtime failure".to_string(),
+            )))
             .await
             .unwrap();
         let mut runtime = LiveRuntime {
@@ -5241,11 +5449,41 @@ mod tests {
             .unwrap();
         assert!(matches!(
             event,
-            RuntimeEvent::Fatal(message)
-                if message.contains("Cancel All After heartbeat failed")
-                    && message.contains("injected heartbeat failure")
+            RuntimeEvent::Fatal(RuntimeTaskFailure::DeadmanHeartbeat(message))
+                if message.contains("injected heartbeat failure")
         ));
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn periodic_exchange_clock_skew_has_a_typed_failure() {
+        let (client, requests) =
+            safety_client(vec![Ok(r#"{"code":"0","msg":"","data":[{"ts":"0"}]}"#)]);
+        let (_command_tx, command_rx) = mpsc::channel(2);
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+        let task = tokio::spawn(run_account_safety_task(
+            "main".to_string(),
+            client,
+            safety_account_config(),
+            command_rx,
+            event_tx,
+            None,
+            60_000,
+            1,
+            1,
+        ));
+
+        let event = tokio::time::timeout(Duration::from_millis(100), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            RuntimeEvent::Fatal(RuntimeTaskFailure::ExchangeClockSkew(message))
+                if message.contains("maximum is 1ms")
+        ));
+        task.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -5276,8 +5514,8 @@ mod tests {
             .unwrap();
         assert!(matches!(
             event,
-            RuntimeEvent::Fatal(message)
-                if message.contains("configuration or authenticated identity drifted")
+            RuntimeEvent::Fatal(RuntimeTaskFailure::AccountConfigDrift(message))
+                if message.contains("configuration or authenticated identity differs")
         ));
         task.await.unwrap();
         assert_eq!(requests.lock().unwrap().len(), 2);

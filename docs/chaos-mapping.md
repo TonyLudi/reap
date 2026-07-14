@@ -143,10 +143,11 @@ with `REQUEST_BLOCKED` while disconnected. Rust likewise invalidates feed
 readiness, blocks entry, supervises reconnect/recovery, and reconciles private
 state. Rust intentionally adds a stronger audit boundary: after a report-capable
 runtime exists, an initialization, event-loop, or teardown error completes
-fail-closed cancellation/reconciliation, persists the schema-4 failure code plus
-pre/post-cleanup evidence, and only then returns the nonzero process error. This
-report does not make the fault acceptable; it makes the required demo fault
-campaign machine-reviewable.
+fail-closed cancellation/reconciliation, persists the schema-6 failure code plus
+pre/post-cleanup evidence, and only then returns the nonzero process error.
+Deadman heartbeat, periodic clock skew/check, and authenticated account-config
+drift/check failures have distinct stable codes. This report does not make the
+fault acceptable; it makes the required demo fault campaign machine-reviewable.
 
 Zero-delay and full-capacity fixture compatibility is intentional, but it is
 optimistic evidence, not a calibrated execution claim. Backtest reports retain
@@ -237,8 +238,11 @@ The pinned Java subscriber clears its socket-owned book and stale-check state in
 books rather than one book per socket, so it retains the healthy replica but now
 waits for bounded status capacity when publishing every `Ready` or
 `Disconnected` transition. Per-frame payload heartbeats are not placed on that
-queue. Schema-5 live reports retain total, public, and private disconnect counts
+queue. Schema-6 live reports retain total, public, and private disconnect counts
 so a demo reconnect campaign can prove which transport class was exercised.
+Schema 6 additionally records ambiguous submit/cancel outcomes, partial-fill
+transitions, order/fill convergence timeouts, and restored durable latches.
+Startup-replayed order state is excluded from the per-session outcome counters.
 
 The pinned Nitro subscriber rebuilds on a crossed book, but its
 `OkxNitroUtils.validateOrderBook` call is commented out. The pinned legacy V5

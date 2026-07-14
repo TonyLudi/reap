@@ -33,7 +33,9 @@ Implemented:
 - Bounded structured telemetry and JSONL storage for raw, normalized, intent,
   request, acknowledgement, order, fill, system, bootstrap, reconciliation,
   and write-ahead safety-latch records, including restart recovery and an
-  exclusive canonical journal lease.
+  exclusive canonical journal lease. Schema-6 live evidence classifies
+  ambiguous operations, partial fills, convergence timeouts, restored latches,
+  and typed safety-task failures.
 - A fail-closed `reap-live` composition root with account-scoped REST bootstrap,
   exchange metadata/account-mode and zero-liability verification, redundant public sockets,
   isolated private sockets, account/positions data-round health, one strategy
