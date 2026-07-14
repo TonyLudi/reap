@@ -497,10 +497,11 @@ The matrix requires enabled fatal alerts, the synchronized host guard, the
 operator service, redundant public websockets, clean observe/demo/reconnect
 runs, safe zero-order shutdown for injected ambiguity/convergence faults, and
 the documented typed runtime failures. It hashes every injector record; strict
-Reap proxy evidence is also structurally validated and tied to supported fault
-roles, while records from external injectors remain opaque. Process-death,
-deadman-expiry, emergency-cancel, fill/fee, target-host, and production approval
-remain separate gates.
+Reap proxy evidence is also structurally validated and tied to every
+proxy-expressible role. Proxy evidence is rejected for genuine partial fills and
+restart-latch proof, while records from external injectors remain opaque.
+Process-death, deadman-expiry, emergency-cancel, fill/fee, target-host, and
+production approval remain separate gates.
 
 Calibration emits schema-3 artifacts and admits only independently verified,
 clean target-host reports with the same exact config and binary:

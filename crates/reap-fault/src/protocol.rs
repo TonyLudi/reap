@@ -314,6 +314,37 @@ mod tests {
                 "exchange clock failure",
                 include_bytes!("../../../examples/faults/exchange-clock-failure.json").as_slice(),
             ),
+            (
+                "fill convergence timeout",
+                include_bytes!("../../../examples/faults/fill-convergence-timeout.json").as_slice(),
+            ),
+            (
+                "order convergence timeout",
+                include_bytes!("../../../examples/faults/order-convergence-timeout.json")
+                    .as_slice(),
+            ),
+            (
+                "deadman heartbeat failure",
+                include_bytes!("../../../examples/faults/deadman-heartbeat-failure.json")
+                    .as_slice(),
+            ),
+            (
+                "exchange status failure",
+                include_bytes!("../../../examples/faults/exchange-status-failure.json").as_slice(),
+            ),
+            (
+                "exchange instrument failure",
+                include_bytes!("../../../examples/faults/exchange-instrument-failure.json")
+                    .as_slice(),
+            ),
+            (
+                "exchange fee failure",
+                include_bytes!("../../../examples/faults/exchange-fee-failure.json").as_slice(),
+            ),
+            (
+                "account config failure",
+                include_bytes!("../../../examples/faults/account-config-failure.json").as_slice(),
+            ),
         ] {
             serde_json::from_slice::<FaultProxyCommand>(bytes)
                 .unwrap_or_else(|error| panic!("invalid {name} command: {error}"));

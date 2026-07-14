@@ -245,7 +245,8 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Add a loopback-only OKX demo REST/public/private/order-command fault proxy
   with strict owner-local control, independently routed order sessions,
   deterministic disconnect/frame-drop/response faults, create-new typed
-  evidence, and fault-matrix validation for supported proxy roles.
+  evidence, exact fault-matrix bindings for every proxy-expressible role, and
+  explicit rejection for genuine partial-fill and restart-latch proof.
 - [ ] Run credentialed bounded observe and minimal-size demo fault campaigns,
   including process death, deadman expiry, clock skew, websocket order
   ambiguity, partial fill, public/private/order-command reconnect, and

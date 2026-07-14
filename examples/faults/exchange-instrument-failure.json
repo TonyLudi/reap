@@ -1,0 +1,17 @@
+{
+  "command": "arm_rest_response",
+  "command_id": "exchange-instrument-failure",
+  "evidence_file": "exchange-instrument-failure-injector.json",
+  "matcher": {
+    "method": "GET",
+    "path": "/api/v5/account/instruments"
+  },
+  "response": {
+    "status": 503,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": "{\"code\":\"50000\",\"msg\":\"reap injected instrument check failure\",\"data\":[]}"
+  },
+  "times": 1
+}

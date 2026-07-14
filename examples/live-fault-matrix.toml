@@ -39,27 +39,29 @@ injector_evidence = "evidence/ambiguous-cancel-injector.json"
 [[runs]]
 scenario = "partial_fill"
 report = "evidence/partial-fill.json"
+# A genuine partial fill requires external exchange injector/account evidence.
 injector_evidence = "evidence/partial-fill-injector.log"
 
 [[runs]]
 scenario = "fill_convergence_timeout"
 report = "evidence/fill-convergence-timeout.json"
-injector_evidence = "evidence/fill-convergence-timeout-injector.log"
+injector_evidence = "evidence/fill-convergence-timeout-injector.json"
 
 [[runs]]
 scenario = "order_convergence_timeout"
 report = "evidence/order-convergence-timeout.json"
-injector_evidence = "evidence/order-convergence-timeout-injector.log"
+injector_evidence = "evidence/order-convergence-timeout-injector.json"
 
 [[runs]]
 scenario = "restored_safety_latch"
 report = "evidence/restored-safety-latch.json"
+# Restart persistence requires external stopped-process/supervisor evidence.
 injector_evidence = "evidence/restored-safety-latch-injector.log"
 
 [[runs]]
 scenario = "deadman_heartbeat_failure"
 report = "evidence/deadman-heartbeat-failure.json"
-injector_evidence = "evidence/deadman-heartbeat-failure-injector.log"
+injector_evidence = "evidence/deadman-heartbeat-failure-injector.json"
 
 [[runs]]
 scenario = "exchange_clock_failure"
@@ -69,19 +71,19 @@ injector_evidence = "evidence/exchange-clock-failure-injector.json"
 [[runs]]
 scenario = "exchange_status_failure"
 report = "evidence/exchange-status-failure.json"
-injector_evidence = "evidence/exchange-status-failure-injector.log"
+injector_evidence = "evidence/exchange-status-failure-injector.json"
 
 [[runs]]
 scenario = "exchange_instrument_failure"
 report = "evidence/exchange-instrument-failure.json"
-injector_evidence = "evidence/exchange-instrument-failure-injector.log"
+injector_evidence = "evidence/exchange-instrument-failure-injector.json"
 
 [[runs]]
 scenario = "exchange_fee_failure"
 report = "evidence/exchange-fee-failure.json"
-injector_evidence = "evidence/exchange-fee-failure-injector.log"
+injector_evidence = "evidence/exchange-fee-failure-injector.json"
 
 [[runs]]
 scenario = "account_config_failure"
 report = "evidence/account-config-failure.json"
-injector_evidence = "evidence/account-config-failure-injector.log"
+injector_evidence = "evidence/account-config-failure-injector.json"

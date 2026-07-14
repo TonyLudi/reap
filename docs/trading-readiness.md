@@ -369,9 +369,12 @@ production trading process.
     drops, and bounded REST responses through an owner-only Unix socket, then
     writes create-new typed evidence without retaining credentials or raw
     private payloads. The matrix independently validates artifact structure,
-    effects, hashes, and the supported reconnect, ambiguity, and clock role.
-    Credential-free REST and public-websocket forwarding smokes passed, but no
-    authenticated account path or strategy response has been certified.
+    effects, hashes, and the exact reconnect, ambiguity, convergence, deadman,
+    clock, status, instrument, fee, or account-configuration role. It rejects
+    proxy artifacts for genuine partial fills and restart-latch proof because
+    those require exchange and stopped-process evidence. Credential-free REST
+    and public-websocket forwarding smokes passed, but no authenticated account
+    path or strategy response has been certified.
 
 ## Remaining Demo Gate
 

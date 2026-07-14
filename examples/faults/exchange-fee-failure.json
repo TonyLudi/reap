@@ -1,0 +1,17 @@
+{
+  "command": "arm_rest_response",
+  "command_id": "exchange-fee-failure",
+  "evidence_file": "exchange-fee-failure-injector.json",
+  "matcher": {
+    "method": "GET",
+    "path": "/api/v5/account/trade-fee"
+  },
+  "response": {
+    "status": 503,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": "{\"code\":\"50000\",\"msg\":\"reap injected fee check failure\",\"data\":[]}"
+  },
+  "times": 1
+}

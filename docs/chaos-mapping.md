@@ -255,6 +255,19 @@ transport roles and lets one campaign disconnect public, private-state, or order
 traffic independently; the stronger typed injector artifact and loopback-only
 upstream policy are Rust testing controls.
 
+The proxy's scenario bindings preserve the same ownership boundaries. Dropping
+an exchange-to-client private `orders` frame exercises the convergence deadline
+mapped to Java `StaleOrderUpdateSafeguard`; dropping `positions` for derivatives
+or `account` for spot exercises the boundary mapped to
+`PositionGatewaySafeguard.OrsFillDelayToPositionUpdate`. The status-response
+template targets the endpoint polled by `OkxNitroExchStatusClient`, while the
+order route exercises `OkxNitroOrderClient` independently of private account
+state. Cancel All After, exchange-clock, authenticated instrument/fee/account
+guards, and durable restart latches remain intentional Rust safety hardening,
+not Java parity claims. A proxy frame drop cannot create a genuine partial fill,
+and a running proxy cannot prove latch persistence across process restart, so
+the matrix rejects typed proxy artifacts for those two roles.
+
 The reviewed Java OKX subscriber and `chaos-iarb2` classes do not provide the
 Rust runtime's place-request `expTime`, `/public/time` skew gate, Cancel All
 After heartbeat, fsynced restart-latch lifecycle, exclusive journal lease,

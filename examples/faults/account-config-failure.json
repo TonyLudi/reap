@@ -1,0 +1,17 @@
+{
+  "command": "arm_rest_response",
+  "command_id": "account-config-failure",
+  "evidence_file": "account-config-failure-injector.json",
+  "matcher": {
+    "method": "GET",
+    "path": "/api/v5/account/config"
+  },
+  "response": {
+    "status": 503,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": "{\"code\":\"50000\",\"msg\":\"reap injected account config failure\",\"data\":[]}"
+  },
+  "times": 1
+}

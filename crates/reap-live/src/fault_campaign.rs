@@ -639,7 +639,7 @@ pub fn verify_live_fault_matrix_paths(
         runs,
         failures,
         limitations: vec![
-            "injector files are hashed opaque evidence; causal attribution and supervisor timing still require operator review".to_string(),
+            "typed proxy evidence proves a matched transport intervention, while response meaning, strategy causality, supervisor timing, and opaque external injector evidence still require operator review".to_string(),
             "process-death Cancel All After expiry and independent emergency cancellation require their separate certification artifacts".to_string(),
             "partial-fill coverage still requires authenticated fill/fee reconciliation for the exact run window".to_string(),
             "this matrix does not certify target-host deployment, account economics, research calibration, or production approval".to_string(),
@@ -1095,6 +1095,10 @@ impl ReapFaultCommandWire {
 
     fn matches_scenario(&self, scenario: LiveFaultScenario) -> bool {
         match scenario {
+            LiveFaultScenario::CleanObserve
+            | LiveFaultScenario::CleanDemo
+            | LiveFaultScenario::PartialFill
+            | LiveFaultScenario::RestoredSafetyLatch => false,
             LiveFaultScenario::PublicReconnect => matches!(
                 self,
                 Self::DisconnectWebsockets {
@@ -1118,13 +1122,58 @@ impl ReapFaultCommandWire {
             ),
             LiveFaultScenario::AmbiguousSubmit => self.matches_order_ack_drop("order"),
             LiveFaultScenario::AmbiguousCancel => self.matches_order_ack_drop("cancel-order"),
-            LiveFaultScenario::ExchangeClockFailure => matches!(
-                self,
-                Self::RestResponse { matcher, .. }
-                    if matcher.method == "GET" && matcher.path == "/api/v5/public/time"
-            ),
-            _ => true,
+            LiveFaultScenario::FillConvergenceTimeout => {
+                self.matches_private_channel_drop(&["positions", "account"])
+            }
+            LiveFaultScenario::OrderConvergenceTimeout => {
+                self.matches_private_channel_drop(&["orders"])
+            }
+            LiveFaultScenario::DeadmanHeartbeatFailure => {
+                self.matches_rest_response("POST", "/api/v5/trade/cancel-all-after")
+            }
+            LiveFaultScenario::ExchangeClockFailure => {
+                self.matches_rest_response("GET", "/api/v5/public/time")
+            }
+            LiveFaultScenario::ExchangeStatusFailure => {
+                self.matches_rest_response("GET", "/api/v5/system/status")
+            }
+            LiveFaultScenario::ExchangeInstrumentFailure => {
+                self.matches_rest_response("GET", "/api/v5/account/instruments")
+            }
+            LiveFaultScenario::ExchangeFeeFailure => {
+                self.matches_rest_response("GET", "/api/v5/account/trade-fee")
+            }
+            LiveFaultScenario::AccountConfigFailure => {
+                self.matches_rest_response("GET", "/api/v5/account/config")
+            }
         }
+    }
+
+    fn matches_rest_response(&self, method: &str, path: &str) -> bool {
+        matches!(
+            self,
+            Self::RestResponse { matcher, .. }
+                if matcher.method == method && matcher.path == path
+        )
+    }
+
+    fn matches_private_channel_drop(&self, channels: &[&str]) -> bool {
+        matches!(
+            self,
+            Self::WebsocketDrop {
+                target: ReapFaultWebSocketTarget::Private,
+                direction: ReapFaultWebSocketDirection::ExchangeToClient,
+                matcher: ReapFaultWebSocketMatcherWire {
+                    kind: ReapFaultWebSocketFrameKind::Text
+                        | ReapFaultWebSocketFrameKind::Binary,
+                    json: Some(ReapFaultWebSocketJsonMatcherWire {
+                        channel: Some(channel),
+                        ..
+                    }),
+                },
+                ..
+            } if channels.contains(&channel.as_str())
+        )
     }
 
     fn matches_order_ack_drop(&self, operation: &str) -> bool {
@@ -1570,6 +1619,137 @@ mod tests {
     }
 
     #[test]
+    fn typed_proxy_commands_match_only_their_supported_scenario() {
+        let body_sha256 = "a".repeat(64);
+        let cases = [
+            (
+                LiveFaultScenario::PublicReconnect,
+                serde_json::json!({
+                    "kind": "disconnect_websockets",
+                    "target": "public",
+                    "connections": 1
+                }),
+            ),
+            (
+                LiveFaultScenario::PrivateReconnect,
+                serde_json::json!({
+                    "kind": "disconnect_websockets",
+                    "target": "private",
+                    "connections": 1
+                }),
+            ),
+            (
+                LiveFaultScenario::OrderTransportReconnect,
+                serde_json::json!({
+                    "kind": "disconnect_websockets",
+                    "target": "order",
+                    "connections": 1
+                }),
+            ),
+            (
+                LiveFaultScenario::AmbiguousSubmit,
+                websocket_drop_command("order", "op", "order"),
+            ),
+            (
+                LiveFaultScenario::AmbiguousCancel,
+                websocket_drop_command("order", "op", "cancel-order"),
+            ),
+            (
+                LiveFaultScenario::FillConvergenceTimeout,
+                websocket_drop_command("private", "channel", "positions"),
+            ),
+            (
+                LiveFaultScenario::OrderConvergenceTimeout,
+                websocket_drop_command("private", "channel", "orders"),
+            ),
+            (
+                LiveFaultScenario::DeadmanHeartbeatFailure,
+                rest_failure_command("POST", "/api/v5/trade/cancel-all-after", &body_sha256),
+            ),
+            (
+                LiveFaultScenario::ExchangeClockFailure,
+                rest_failure_command("GET", "/api/v5/public/time", &body_sha256),
+            ),
+            (
+                LiveFaultScenario::ExchangeStatusFailure,
+                rest_failure_command("GET", "/api/v5/system/status", &body_sha256),
+            ),
+            (
+                LiveFaultScenario::ExchangeInstrumentFailure,
+                rest_failure_command("GET", "/api/v5/account/instruments", &body_sha256),
+            ),
+            (
+                LiveFaultScenario::ExchangeFeeFailure,
+                rest_failure_command("GET", "/api/v5/account/trade-fee", &body_sha256),
+            ),
+            (
+                LiveFaultScenario::AccountConfigFailure,
+                rest_failure_command("GET", "/api/v5/account/config", &body_sha256),
+            ),
+        ];
+
+        for (scenario, value) in cases {
+            let command: ReapFaultCommandWire = serde_json::from_value(value).unwrap();
+            assert!(command.is_valid(), "invalid command for {scenario:?}");
+            for candidate in LiveFaultScenario::REQUIRED {
+                assert_eq!(
+                    command.matches_scenario(candidate),
+                    candidate == scenario,
+                    "{scenario:?} command was misclassified as {candidate:?}"
+                );
+            }
+        }
+
+        let spot_fill: ReapFaultCommandWire =
+            serde_json::from_value(websocket_drop_command("private", "channel", "account"))
+                .unwrap();
+        assert!(spot_fill.matches_scenario(LiveFaultScenario::FillConvergenceTimeout));
+
+        let drifted_clock_response: ReapFaultCommandWire =
+            serde_json::from_value(serde_json::json!({
+                "kind": "rest_response",
+                "matcher": {"method": "GET", "path": "/api/v5/public/time"},
+                "status": 200,
+                "response_headers": {},
+                "response_body_bytes": 2,
+                "response_body_sha256": body_sha256,
+                "times": 1
+            }))
+            .unwrap();
+        assert!(drifted_clock_response.matches_scenario(LiveFaultScenario::ExchangeClockFailure));
+    }
+
+    fn websocket_drop_command(target: &str, matcher_key: &str, matcher_value: &str) -> Value {
+        let json_matcher = match matcher_key {
+            "op" => serde_json::json!({"op": matcher_value}),
+            "channel" => serde_json::json!({"channel": matcher_value}),
+            _ => panic!("unsupported matcher key {matcher_key}"),
+        };
+        serde_json::json!({
+            "kind": "websocket_drop",
+            "target": target,
+            "direction": "exchange_to_client",
+            "matcher": {
+                "kind": "text",
+                "json": json_matcher
+            },
+            "frames": 1
+        })
+    }
+
+    fn rest_failure_command(method: &str, path: &str, body_sha256: &str) -> Value {
+        serde_json::json!({
+            "kind": "rest_response",
+            "matcher": {"method": method, "path": path},
+            "status": 503,
+            "response_headers": {"content-type": "application/json"},
+            "response_body_bytes": 2,
+            "response_body_sha256": body_sha256,
+            "times": 1
+        })
+    }
+
+    #[test]
     fn complete_fault_matrix_passes_with_bound_identity_and_injectors() {
         let fixture = build_fixture();
 
@@ -1636,6 +1816,65 @@ mod tests {
         let proxy = public.reap_fault_proxy_evidence.as_ref().unwrap();
         assert_eq!(proxy.command_id, "public-reconnect");
         assert_eq!(proxy.command_kind, "disconnect_websockets");
+        assert_eq!(proxy.effect_count, 1);
+    }
+
+    #[test]
+    fn fault_matrix_validates_typed_runtime_endpoint_evidence() {
+        let fixture = build_fixture();
+        let injector = fixture
+            .manifest
+            .runs
+            .iter()
+            .find(|run| run.scenario == LiveFaultScenario::ExchangeStatusFailure)
+            .unwrap()
+            .injector_evidence
+            .clone()
+            .unwrap();
+        let evidence = serde_json::json!({
+            "format_version": 1,
+            "proxy_session_id": "proxy-session",
+            "proxy_config_fingerprint": "a".repeat(64),
+            "java_reference_revision": PINNED_JAVA_REVISION,
+            "command_id": "exchange-status-failure",
+            "command": {
+                "kind": "rest_response",
+                "matcher": {
+                    "method": "GET",
+                    "path": "/api/v5/system/status"
+                },
+                "status": 503,
+                "response_headers": {"content-type": "application/json"},
+                "response_body_bytes": 2,
+                "response_body_sha256": "b".repeat(64),
+                "times": 1
+            },
+            "armed_at_ms": 100,
+            "completed_at_ms": 101,
+            "effects": [{
+                "kind": "rest_response_injected",
+                "sequence": 1,
+                "applied_at_ms": 100,
+                "method": "GET",
+                "path": "/api/v5/system/status",
+                "query_sha256": "c".repeat(64)
+            }],
+            "passed": true
+        });
+        std::fs::write(&injector, serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+
+        let report =
+            verify_live_fault_matrix_paths(&fixture.config_path, &fixture.manifest_path).unwrap();
+
+        assert!(report.live_fault_matrix_passed, "{report:#?}");
+        let status = report
+            .runs
+            .iter()
+            .find(|run| run.scenario == LiveFaultScenario::ExchangeStatusFailure)
+            .unwrap();
+        let proxy = status.reap_fault_proxy_evidence.as_ref().unwrap();
+        assert_eq!(proxy.command_id, "exchange-status-failure");
+        assert_eq!(proxy.command_kind, "rest_response");
         assert_eq!(proxy.effect_count, 1);
     }
 

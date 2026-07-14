@@ -1,0 +1,17 @@
+{
+  "command": "arm_rest_response",
+  "command_id": "deadman-heartbeat-failure",
+  "evidence_file": "deadman-heartbeat-failure-injector.json",
+  "matcher": {
+    "method": "POST",
+    "path": "/api/v5/trade/cancel-all-after"
+  },
+  "response": {
+    "status": 503,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": "{\"code\":\"50000\",\"msg\":\"reap injected deadman heartbeat failure\",\"data\":[]}"
+  },
+  "times": 1
+}

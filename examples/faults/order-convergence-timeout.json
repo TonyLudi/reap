@@ -1,0 +1,14 @@
+{
+  "command": "arm_websocket_drop",
+  "command_id": "order-convergence-timeout",
+  "evidence_file": "order-convergence-timeout-injector.json",
+  "target": "private",
+  "direction": "exchange_to_client",
+  "matcher": {
+    "kind": "text",
+    "json": {
+      "channel": "orders"
+    }
+  },
+  "frames": 1
+}

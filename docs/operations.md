@@ -1361,10 +1361,26 @@ Disconnect evidence is completed when the selected bridge acknowledges closure.
 REST-response and websocket-drop evidence appears only after every requested
 match occurs. A pending rule, failed disconnect, proxy error, active websocket,
 or stale control socket makes the proxy report unclean. Do not arm speculative
-rules in the same run. The ambiguous-submit and ambiguous-cancel templates drop
-the matching order-command acknowledgement from exchange to client; arm them
-immediately before one reviewed minimum-size action. They do not themselves
-prove the exchange accepted, rejected, filled, or cancelled the order.
+rules in the same run.
+
+Use each command at the boundary it is intended to test:
+
+| Template | Arming point and required review |
+| --- | --- |
+| `public-reconnect.json`, `private-reconnect.json`, `order-transport-reconnect.json` | Arm only after the live runtime is ready. Confirm the selected transport disconnects, readiness changes as expected for its redundancy, and recovery includes the required fresh reconciliation. |
+| `ambiguous-submit.json`, `ambiguous-cancel.json` | Arm immediately before one reviewed minimum-size order action. These drop the matching order-command acknowledgement from exchange to client; they do not prove whether the exchange accepted, rejected, filled, or cancelled the request. |
+| `order-convergence-timeout.json` | Arm immediately before one reviewed post-only submit or cancel. It drops one exchange-to-client private `orders` frame; require the live timeout, account block, cancel/retry behavior, full REST repair, and no early readiness recovery. |
+| `fill-convergence-timeout.json` | For derivatives, arm the checked-in private `positions` drop immediately before an action expected to fill. For spot, change only the matcher channel to `account`. Require the live timeout and authoritative repair; one dropped frame does not prove a fill or economic state. |
+| `deadman-heartbeat-failure.json` | Arm only after ready and after a successful Cancel All After heartbeat. It fails the next matching heartbeat. Verify the previously armed exchange timer remains effective while fail-closed cancellation/reconciliation runs. This is not process-death expiry certification. |
+| `exchange-clock-failure.json`, `exchange-status-failure.json`, `exchange-instrument-failure.json`, `exchange-fee-failure.json`, `account-config-failure.json` | Arm only after ready so the artifact covers a periodic runtime check rather than bootstrap refusal. Leave the one-shot rule pending until its exact endpoint is called, then require the corresponding typed runtime failure and zero-order shutdown. |
+
+The checked-in clock/status/instrument/fee/account-configuration commands inject
+`503`, so they prove the documented `*_check` branch only; the deadman command
+proves `deadman_heartbeat`. For skew, maintenance, instrument/fee/account drift,
+or an imminent `upcChg`, use a separately reviewed command with the exact
+endpoint and a valid changed `200` response. Archive that command and independent
+source response: typed proxy evidence stores response metadata and a body hash,
+not a claim that the injected body represents a valid exchange state.
 
 Stop the live process first and let its cancel/reconcile lifecycle complete.
 Require proxy status to show zero pending faults and zero errors, then submit
@@ -1373,13 +1389,16 @@ live report, proxy run report, completed injector artifact, executable hash,
 supervisor record, and any separate exchange/account evidence. Add only the live
 report and completed injector artifact to the schema-3 matrix. For supported
 Reap artifacts the verifier checks strict structure, effect count/timing/hash,
-and the public/private/order reconnect, submit/cancel ambiguity, or clock role.
+and binds the command to its exact reconnect, ambiguity, convergence, deadman,
+clock, status, instrument, fee, or account-configuration role. It rejects Reap
+proxy artifacts for clean runs, genuine partial fills, and restored-latch runs.
 Other injector formats are only hashed and remain operator-reviewed evidence.
 
 This proxy closes a reproducibility gap; it does not establish fault causality
-by itself. Process death, deadman expiry, emergency cancellation, partial-fill
-economics, and account-statement reconciliation still require their independent
-procedures and artifacts.
+by itself. A genuine partial fill and a durable latch restored after restart
+remain external campaign roles. Process death, deadman expiry, emergency
+cancellation, partial-fill economics, and account-statement reconciliation still
+require their independent procedures and artifacts.
 
 ## Fail-Closed Matrix
 

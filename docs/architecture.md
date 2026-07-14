@@ -541,6 +541,11 @@ Responsibilities:
   proxy-config provenance, exact command summary, effect timing, and hashed
   payload metadata. Failed disconnect completion is explicit and cannot satisfy
   the live fault matrix.
+- Bind typed artifacts to the exact matrix role: transport ownership for
+  reconnects, acknowledgement operation for ambiguity, private-state channel for
+  convergence, and method/path for periodic REST safety checks. Genuine partial
+  fills and restart-latch persistence are outside the proxy's causal boundary,
+  so typed proxy artifacts cannot satisfy those roles.
 - Track every listener and connection task through shutdown. A clean run report
   requires no proxy error, pending fault, active websocket, or stale control
   socket.
