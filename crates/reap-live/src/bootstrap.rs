@@ -250,6 +250,12 @@ fn instrument_errors(
             exchange.state
         ));
     }
+    if exchange.trade_fee_group_id.trim().is_empty() {
+        errors.push("exchange returned no trade-fee groupId".to_string());
+    }
+    if configured.kind.is_derivative() && exchange.instrument_family.trim().is_empty() {
+        errors.push("exchange returned no derivative instFamily".to_string());
+    }
     compare_number(
         "tick_size",
         configured.tick_size,
@@ -455,6 +461,7 @@ mod tests {
                         symbol: "BTC-USDT".to_string(),
                         instrument_type: OkxInstrumentType::Spot,
                         instrument_family: "".to_string(),
+                        trade_fee_group_id: "1".to_string(),
                         underlying: "".to_string(),
                         base_currency: "BTC".to_string(),
                         quote_currency: "USDT".to_string(),
@@ -474,6 +481,7 @@ mod tests {
                         symbol: "BTC-USDT-SWAP".to_string(),
                         instrument_type: OkxInstrumentType::Swap,
                         instrument_family: "BTC-USDT".to_string(),
+                        trade_fee_group_id: "2".to_string(),
                         underlying: "BTC-USDT".to_string(),
                         base_currency: "BTC".to_string(),
                         quote_currency: "USDT".to_string(),
@@ -603,6 +611,23 @@ mod tests {
         let error = verify_bootstrap(&config, &HashMap::from([("main".to_string(), snapshot)]))
             .unwrap_err();
         assert!(error.to_string().contains("tick_size mismatch"));
+    }
+
+    #[test]
+    fn rejects_missing_current_fee_group_metadata() {
+        let config = config();
+        let mut snapshot = snapshot();
+        snapshot
+            .instruments
+            .get_mut("BTC-USDT-SWAP")
+            .unwrap()
+            .trade_fee_group_id
+            .clear();
+
+        let error = verify_bootstrap(&config, &HashMap::from([("main".to_string(), snapshot)]))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("trade-fee groupId"));
     }
 
     #[test]

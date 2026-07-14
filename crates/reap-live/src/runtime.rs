@@ -31,8 +31,9 @@ use reap_telemetry::{
     AlertStats, start_webhook_alerts,
 };
 use reap_venue::okx::{
-    HttpTransport, OkxAdapter, OkxRestClient, OkxSigner, OkxSystemEnvironment,
-    OkxSystemServiceType, OkxSystemStatus, OkxSystemStatusState, ReqwestTransport, RestError,
+    HttpTransport, OKX_MIN_TRADE_FEE_REQUEST_INTERVAL_MS, OkxAdapter, OkxInstrument,
+    OkxInstrumentType, OkxRestClient, OkxSigner, OkxSystemEnvironment, OkxSystemServiceType,
+    OkxSystemStatus, OkxSystemStatusState, OkxTradeFeeRate, ReqwestTransport, RestError,
 };
 use reap_venue::{PrivateOrderState, PrivateOrderUpdate, RemoteFill, RemoteOrder, VenueAdapter};
 use serde::{Deserialize, Serialize};
@@ -225,6 +226,10 @@ pub enum LiveRuntimeError {
     ExchangeStatus(String),
     #[error("OKX exchange status check failed: {0}")]
     ExchangeStatusCheck(String),
+    #[error("configured exchange fee is unsafe: {0}")]
+    ExchangeFeeDrift(String),
+    #[error("authenticated exchange fee check failed: {0}")]
+    ExchangeFeeCheck(String),
     #[error("authenticated account configuration drifted: {0}")]
     AccountConfigDrift(String),
     #[error("authenticated account configuration check failed: {0}")]
@@ -294,6 +299,8 @@ impl LiveRuntimeError {
             Self::ExchangeClockCheck(_) => "exchange_clock_check",
             Self::ExchangeStatus(_) => "exchange_status",
             Self::ExchangeStatusCheck(_) => "exchange_status_check",
+            Self::ExchangeFeeDrift(_) => "exchange_fee_drift",
+            Self::ExchangeFeeCheck(_) => "exchange_fee_check",
             Self::AccountConfigDrift(_) => "account_config_drift",
             Self::AccountConfigCheck(_) => "account_config_check",
             Self::SafetyLatchSyncTimeout(_) => "safety_latch_sync_timeout",
@@ -639,6 +646,7 @@ struct AccountSeed {
     signer: OkxSigner,
     gateway: LiveGateway,
     safety_client: OkxRestClient<ReqwestTransport>,
+    fee_guard: ExchangeFeeGuard,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -647,6 +655,23 @@ struct ExchangeStatusGuard {
     environment: TradingEnvironment,
     check_interval_ms: u64,
     lead_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ExchangeFeeExpectation {
+    symbol: String,
+    instrument_type: OkxInstrumentType,
+    instrument_id: Option<String>,
+    instrument_family: Option<String>,
+    group_id: String,
+    configured_maker_cost: f64,
+    configured_taker_cost: f64,
+}
+
+#[derive(Debug, Clone)]
+struct ExchangeFeeGuard {
+    sweep_interval_ms: u64,
+    expectations: Vec<ExchangeFeeExpectation>,
 }
 
 async fn bootstrap_accounts(
@@ -813,6 +838,11 @@ async fn bootstrap_accounts(
                 })?;
             instruments.insert(instrument.symbol.clone(), metadata);
         }
+        let fee_guard = ExchangeFeeGuard {
+            sweep_interval_ms: config.runtime.exchange_fee_check_interval_ms,
+            expectations: exchange_fee_expectations(config, &account.id, &instruments)?,
+        };
+        verify_initial_exchange_fees(&account.id, &client, &fee_guard).await?;
         snapshots.insert(
             account.id.clone(),
             AccountBootstrapSnapshot {
@@ -831,6 +861,7 @@ async fn bootstrap_accounts(
             signer,
             gateway,
             safety_client,
+            fee_guard,
         });
     }
     let verified = verify_bootstrap(config, &snapshots)
@@ -847,6 +878,135 @@ where
     let after_ms = unix_time_ms();
     let midpoint_ms = before_ms.saturating_add(after_ms.saturating_sub(before_ms) / 2);
     Ok(midpoint_ms.abs_diff(exchange_ms))
+}
+
+fn exchange_fee_expectations(
+    config: &LiveConfig,
+    account_id: &str,
+    instruments: &HashMap<String, OkxInstrument>,
+) -> Result<Vec<ExchangeFeeExpectation>, LiveRuntimeError> {
+    config
+        .instruments_for_account(account_id)
+        .map(|configured| {
+            let metadata = instruments.get(&configured.symbol).ok_or_else(|| {
+                LiveRuntimeError::ExchangeFeeCheck(format!(
+                    "account {account_id} has no fee metadata for {}",
+                    configured.symbol
+                ))
+            })?;
+            let expected_type = okx_instrument_type(configured.kind);
+            if metadata.instrument_type != expected_type {
+                return Err(LiveRuntimeError::ExchangeFeeCheck(format!(
+                    "account {account_id} {} fee metadata type is {:?}, expected {:?}",
+                    configured.symbol, metadata.instrument_type, expected_type
+                )));
+            }
+            let group_id = metadata.trade_fee_group_id.trim();
+            if group_id.is_empty() {
+                return Err(LiveRuntimeError::ExchangeFeeCheck(format!(
+                    "account {account_id} {} has no OKX trade-fee groupId",
+                    configured.symbol
+                )));
+            }
+            let (instrument_id, instrument_family) = match expected_type {
+                OkxInstrumentType::Spot | OkxInstrumentType::Margin => {
+                    (Some(configured.symbol.clone()), None)
+                }
+                OkxInstrumentType::Swap
+                | OkxInstrumentType::Futures
+                | OkxInstrumentType::Option => {
+                    let family = metadata.instrument_family.trim();
+                    if family.is_empty() {
+                        return Err(LiveRuntimeError::ExchangeFeeCheck(format!(
+                            "account {account_id} {} has no OKX instFamily for fee lookup",
+                            configured.symbol
+                        )));
+                    }
+                    (None, Some(family.to_string()))
+                }
+            };
+            Ok(ExchangeFeeExpectation {
+                symbol: configured.symbol.clone(),
+                instrument_type: expected_type,
+                instrument_id,
+                instrument_family,
+                group_id: group_id.to_string(),
+                configured_maker_cost: configured.maker_fee,
+                configured_taker_cost: configured.taker_fee,
+            })
+        })
+        .collect()
+}
+
+async fn fetch_exchange_fee<T>(
+    client: &OkxRestClient<T>,
+    expectation: &ExchangeFeeExpectation,
+) -> Result<OkxTradeFeeRate, RestError>
+where
+    T: HttpTransport,
+{
+    client
+        .account_trade_fee(
+            expectation.instrument_type,
+            expectation.instrument_id.as_deref(),
+            expectation.instrument_family.as_deref(),
+            &expectation.group_id,
+        )
+        .await
+}
+
+fn exchange_fee_drift_reason(
+    expectation: &ExchangeFeeExpectation,
+    rate: &OkxTradeFeeRate,
+) -> Option<String> {
+    const RATE_EPSILON: f64 = 1e-12;
+
+    let maker_cost = rate.maker_cost_rate();
+    let taker_cost = rate.taker_cost_rate();
+    let maker_understated = expectation.configured_maker_cost + RATE_EPSILON < maker_cost;
+    let taker_understated = expectation.configured_taker_cost + RATE_EPSILON < taker_cost;
+    (maker_understated || taker_understated).then(|| {
+        format!(
+            "{} group {} level {} configured maker/taker costs {}/{} understate authenticated costs {}/{} at {}",
+            expectation.symbol,
+            rate.group_id,
+            rate.level,
+            expectation.configured_maker_cost,
+            expectation.configured_taker_cost,
+            maker_cost,
+            taker_cost,
+            rate.timestamp_ms
+        )
+    })
+}
+
+async fn verify_initial_exchange_fees<T>(
+    account_id: &str,
+    client: &OkxRestClient<T>,
+    guard: &ExchangeFeeGuard,
+) -> Result<(), LiveRuntimeError>
+where
+    T: HttpTransport,
+{
+    for (index, expectation) in guard.expectations.iter().enumerate() {
+        if index > 0 {
+            tokio::time::sleep(Duration::from_millis(OKX_MIN_TRADE_FEE_REQUEST_INTERVAL_MS)).await;
+        }
+        let rate = fetch_exchange_fee(client, expectation)
+            .await
+            .map_err(|error| {
+                LiveRuntimeError::ExchangeFeeCheck(format!(
+                    "account {account_id} {}: {error}",
+                    expectation.symbol
+                ))
+            })?;
+        if let Some(reason) = exchange_fee_drift_reason(expectation, &rate) {
+            return Err(LiveRuntimeError::ExchangeFeeDrift(format!(
+                "account {account_id}: {reason}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn exchange_status_block_reason(
@@ -1448,6 +1608,7 @@ impl LiveRuntime {
                 signer,
                 mut gateway,
                 safety_client,
+                fee_guard,
             } = seed;
             let deadman_timeout_secs =
                 (mode == LiveMode::Demo).then_some(config.runtime.cancel_all_after_timeout_secs);
@@ -1483,6 +1644,7 @@ impl LiveRuntime {
                     check_interval_ms: config.runtime.exchange_status_check_interval_ms,
                     lead_ms: config.runtime.exchange_status_lead_ms,
                 },
+                fee_guard,
             )));
             let private_adapter: Arc<dyn VenueAdapter> = Arc::new(
                 OkxAdapter::new(&config.venue.public_ws_url, &config.venue.private_ws_url)
@@ -3542,6 +3704,8 @@ enum RuntimeTaskFailure {
     ExchangeClockCheck(String),
     ExchangeStatus(String),
     ExchangeStatusCheck(String),
+    ExchangeFeeDrift(String),
+    ExchangeFeeCheck(String),
     AccountConfigDrift(String),
     AccountConfigCheck(String),
 }
@@ -3555,6 +3719,8 @@ impl From<RuntimeTaskFailure> for LiveRuntimeError {
             RuntimeTaskFailure::ExchangeClockCheck(message) => Self::ExchangeClockCheck(message),
             RuntimeTaskFailure::ExchangeStatus(message) => Self::ExchangeStatus(message),
             RuntimeTaskFailure::ExchangeStatusCheck(message) => Self::ExchangeStatusCheck(message),
+            RuntimeTaskFailure::ExchangeFeeDrift(message) => Self::ExchangeFeeDrift(message),
+            RuntimeTaskFailure::ExchangeFeeCheck(message) => Self::ExchangeFeeCheck(message),
             RuntimeTaskFailure::AccountConfigDrift(message) => Self::AccountConfigDrift(message),
             RuntimeTaskFailure::AccountConfigCheck(message) => Self::AccountConfigCheck(message),
         }
@@ -4029,6 +4195,48 @@ where
     Ok((remote_orders, remote_fills, remote_account))
 }
 
+async fn run_exchange_fee_guard<T>(
+    account_id: String,
+    client: OkxRestClient<T>,
+    guard: ExchangeFeeGuard,
+) -> RuntimeTaskFailure
+where
+    T: HttpTransport,
+{
+    if guard.expectations.is_empty() {
+        return std::future::pending::<RuntimeTaskFailure>().await;
+    }
+    let request_interval_ms =
+        exchange_fee_request_interval_ms(guard.sweep_interval_ms, guard.expectations.len());
+    let mut interval = tokio::time::interval(Duration::from_millis(request_interval_ms));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval.tick().await;
+    let mut next = 0;
+
+    loop {
+        interval.tick().await;
+        let expectation = &guard.expectations[next];
+        let rate = match fetch_exchange_fee(&client, expectation).await {
+            Ok(rate) => rate,
+            Err(error) => {
+                return RuntimeTaskFailure::ExchangeFeeCheck(format!(
+                    "account {account_id} {}: {error}",
+                    expectation.symbol
+                ));
+            }
+        };
+        if let Some(reason) = exchange_fee_drift_reason(expectation, &rate) {
+            return RuntimeTaskFailure::ExchangeFeeDrift(format!("account {account_id}: {reason}"));
+        }
+        next = (next + 1) % guard.expectations.len();
+    }
+}
+
+fn exchange_fee_request_interval_ms(sweep_interval_ms: u64, instrument_count: usize) -> u64 {
+    debug_assert!(instrument_count > 0);
+    (sweep_interval_ms / instrument_count as u64).max(OKX_MIN_TRADE_FEE_REQUEST_INTERVAL_MS)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_account_safety_task<T>(
     account_id: String,
@@ -4041,9 +4249,15 @@ async fn run_account_safety_task<T>(
     clock_check_interval_ms: u64,
     max_clock_skew_ms: u64,
     exchange_status_guard: ExchangeStatusGuard,
+    exchange_fee_guard: ExchangeFeeGuard,
 ) where
-    T: HttpTransport + 'static,
+    T: HttpTransport + Clone + 'static,
 {
+    let mut fee_task = tokio::spawn(run_exchange_fee_guard(
+        account_id.clone(),
+        client.clone(),
+        exchange_fee_guard,
+    ));
     let mut deadman = tokio::time::interval(Duration::from_millis(deadman_heartbeat_ms));
     deadman.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     deadman.tick().await;
@@ -4056,10 +4270,18 @@ async fn run_account_safety_task<T>(
     exchange_status.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     exchange_status.tick().await;
 
-    loop {
+    let terminal_failure = loop {
         tokio::select! {
+            fee_result = &mut fee_task => {
+                break Some(match fee_result {
+                    Ok(failure) => failure,
+                    Err(error) => RuntimeTaskFailure::ExchangeFeeCheck(format!(
+                        "account {account_id} fee guard task failed: {error}"
+                    )),
+                });
+            }
             command = commands.recv() => {
-                let Some(command) = command else { return; };
+                let Some(command) = command else { break None; };
                 match command {
                     SafetyTaskCommand::DisableDeadMan { result } => {
                         let disabled = match deadman_timeout_secs {
@@ -4071,61 +4293,42 @@ async fn run_account_safety_task<T>(
                         }
                         let _ = result.send(disabled);
                     }
-                    SafetyTaskCommand::Shutdown => return,
+                    SafetyTaskCommand::Shutdown => break None,
                 }
             }
             _ = deadman.tick(), if deadman_timeout_secs.is_some() => {
                 let timeout_secs = deadman_timeout_secs.expect("guarded dead-man timeout");
                 if let Err(error) = client.cancel_all_after(timeout_secs).await {
-                    let _ = events
-                        .send(RuntimeEvent::Fatal(RuntimeTaskFailure::DeadmanHeartbeat(
-                            format!("account {account_id}: {error}"),
-                        )))
-                        .await;
-                    return;
+                    break Some(RuntimeTaskFailure::DeadmanHeartbeat(format!(
+                        "account {account_id}: {error}"
+                    )));
                 }
             }
             _ = clock.tick() => {
                 match rest_clock_skew_ms(&client).await {
                     Ok(skew_ms) if skew_ms <= max_clock_skew_ms => {}
                     Ok(skew_ms) => {
-                        let _ = events
-                            .send(RuntimeEvent::Fatal(RuntimeTaskFailure::ExchangeClockSkew(
-                                format!(
-                                    "account {account_id} observed {skew_ms}ms; maximum is {max_clock_skew_ms}ms"
-                                ),
-                            )))
-                            .await;
-                        return;
+                        break Some(RuntimeTaskFailure::ExchangeClockSkew(format!(
+                            "account {account_id} observed {skew_ms}ms; maximum is {max_clock_skew_ms}ms"
+                        )));
                     }
                     Err(error) => {
-                        let _ = events
-                            .send(RuntimeEvent::Fatal(RuntimeTaskFailure::ExchangeClockCheck(
-                                format!("account {account_id}: {error}"),
-                            )))
-                            .await;
-                        return;
+                        break Some(RuntimeTaskFailure::ExchangeClockCheck(format!(
+                            "account {account_id}: {error}"
+                        )));
                     }
                 }
                 match client.account_config().await {
                     Ok(current) if current == expected_account_config => {}
                     Ok(_) => {
-                        let _ = events
-                            .send(RuntimeEvent::Fatal(RuntimeTaskFailure::AccountConfigDrift(
-                                format!(
-                                    "account {account_id} configuration or authenticated identity differs from bootstrap"
-                                ),
-                            )))
-                            .await;
-                        return;
+                        break Some(RuntimeTaskFailure::AccountConfigDrift(format!(
+                            "account {account_id} configuration or authenticated identity differs from bootstrap"
+                        )));
                     }
                     Err(error) => {
-                        let _ = events
-                            .send(RuntimeEvent::Fatal(RuntimeTaskFailure::AccountConfigCheck(
-                                format!("account {account_id}: {error}"),
-                            )))
-                            .await;
-                        return;
+                        break Some(RuntimeTaskFailure::AccountConfigCheck(format!(
+                            "account {account_id}: {error}"
+                        )));
                     }
                 }
             }
@@ -4138,23 +4341,23 @@ async fn run_account_safety_task<T>(
                             unix_time_ms(),
                             exchange_status_guard.lead_ms,
                         ) {
-                            let _ = events
-                                .send(RuntimeEvent::Fatal(RuntimeTaskFailure::ExchangeStatus(reason)))
-                                .await;
-                            return;
+                            break Some(RuntimeTaskFailure::ExchangeStatus(reason));
                         }
                     }
                     Err(error) => {
-                        let _ = events
-                            .send(RuntimeEvent::Fatal(RuntimeTaskFailure::ExchangeStatusCheck(
-                                error.to_string(),
-                            )))
-                            .await;
-                        return;
+                        break Some(RuntimeTaskFailure::ExchangeStatusCheck(error.to_string()));
                     }
                 }
             }
         }
+    };
+
+    if !fee_task.is_finished() {
+        fee_task.abort();
+        let _ = fee_task.await;
+    }
+    if let Some(failure) = terminal_failure {
+        let _ = events.send(RuntimeEvent::Fatal(failure)).await;
     }
 }
 
@@ -4959,6 +5162,14 @@ mod tests {
             "exchange_status_check"
         );
         assert_eq!(
+            live_failure_evidence(&LiveRuntimeError::ExchangeFeeDrift("test".to_string())).code,
+            "exchange_fee_drift"
+        );
+        assert_eq!(
+            live_failure_evidence(&LiveRuntimeError::ExchangeFeeCheck("test".to_string())).code,
+            "exchange_fee_check"
+        );
+        assert_eq!(
             live_failure_evidence(&LiveRuntimeError::AccountConfigDrift("test".to_string())).code,
             "account_config_drift"
         );
@@ -5009,6 +5220,31 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct BlockingFeeTransport {
+        fee_started: Arc<Notify>,
+        deadman_seen: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl HttpTransport for BlockingFeeTransport {
+        async fn execute(&self, request: SignedRequest) -> Result<HttpResponse, RestError> {
+            if request.path.starts_with("/api/v5/account/trade-fee?") {
+                self.fee_started.notify_one();
+                return std::future::pending().await;
+            }
+            if request.path == "/api/v5/trade/cancel-all-after" {
+                self.deadman_seen.notify_one();
+                return Ok(HttpResponse {
+                    status: 200,
+                    body: r#"{"code":"0","msg":"","data":[{"triggerTime":"1","tag":"","ts":"1"}]}"#
+                        .to_string(),
+                });
+            }
+            panic!("unexpected blocking-fee request {}", request.path);
+        }
+    }
+
     fn safety_client(
         responses: Vec<Result<&str, RestError>>,
     ) -> (
@@ -5048,6 +5284,31 @@ mod tests {
             environment: TradingEnvironment::Demo,
             check_interval_ms,
             lead_ms: 60_000,
+        }
+    }
+
+    fn exchange_fee_guard(
+        check_interval_ms: u64,
+        expectations: Vec<ExchangeFeeExpectation>,
+    ) -> ExchangeFeeGuard {
+        ExchangeFeeGuard {
+            sweep_interval_ms: check_interval_ms,
+            expectations,
+        }
+    }
+
+    fn exchange_fee_expectation(
+        configured_maker_cost: f64,
+        configured_taker_cost: f64,
+    ) -> ExchangeFeeExpectation {
+        ExchangeFeeExpectation {
+            symbol: "BTC-USDT".to_string(),
+            instrument_type: OkxInstrumentType::Spot,
+            instrument_id: Some("BTC-USDT".to_string()),
+            instrument_family: None,
+            group_id: "1".to_string(),
+            configured_maker_cost,
+            configured_taker_cost,
         }
     }
 
@@ -6312,6 +6573,7 @@ mod tests {
             60_000,
             1_000,
             exchange_status_guard(false, 60_000),
+            exchange_fee_guard(60_000, Vec::new()),
         ));
         let (result_tx, result_rx) = oneshot::channel();
         command_tx
@@ -6346,6 +6608,7 @@ mod tests {
             60_000,
             1_000,
             exchange_status_guard(false, 60_000),
+            exchange_fee_guard(60_000, Vec::new()),
         ));
 
         let event = tokio::time::timeout(Duration::from_millis(100), event_rx.recv())
@@ -6357,6 +6620,45 @@ mod tests {
             RuntimeEvent::Fatal(RuntimeTaskFailure::DeadmanHeartbeat(message))
                 if message.contains("injected heartbeat failure")
         ));
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocked_exchange_fee_check_does_not_delay_deadman_heartbeat() {
+        let fee_started = Arc::new(Notify::new());
+        let deadman_seen = Arc::new(Notify::new());
+        let client = OkxRestClient::new(
+            BlockingFeeTransport {
+                fee_started: Arc::clone(&fee_started),
+                deadman_seen: Arc::clone(&deadman_seen),
+            },
+            OkxSigner::new(OkxCredentials::new("key", "secret", "pass"), true),
+        );
+        let (command_tx, command_rx) = mpsc::channel(2);
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+        let task = tokio::spawn(run_account_safety_task(
+            "main".to_string(),
+            client,
+            safety_account_config(),
+            command_rx,
+            event_tx,
+            Some(30),
+            500,
+            60_000,
+            1_000,
+            exchange_status_guard(false, 60_000),
+            exchange_fee_guard(400, vec![exchange_fee_expectation(0.001, 0.001)]),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), fee_started.notified())
+            .await
+            .expect("fee request did not start");
+        tokio::time::timeout(Duration::from_secs(1), deadman_seen.notified())
+            .await
+            .expect("deadman heartbeat was blocked by fee request");
+        assert!(event_rx.try_recv().is_err());
+
+        command_tx.send(SafetyTaskCommand::Shutdown).await.unwrap();
         task.await.unwrap();
     }
 
@@ -6377,6 +6679,7 @@ mod tests {
             1,
             1,
             exchange_status_guard(false, 60_000),
+            exchange_fee_guard(60_000, Vec::new()),
         ));
 
         let event = tokio::time::timeout(Duration::from_millis(100), event_rx.recv())
@@ -6413,6 +6716,7 @@ mod tests {
             1,
             u64::MAX,
             exchange_status_guard(false, 60_000),
+            exchange_fee_guard(60_000, Vec::new()),
         ));
 
         let event = tokio::time::timeout(Duration::from_millis(100), event_rx.recv())
@@ -6496,6 +6800,134 @@ mod tests {
         );
     }
 
+    #[test]
+    fn exchange_fee_guard_converts_signed_rates_and_allows_conservative_config() {
+        let mut expectation = exchange_fee_expectation(0.0002, 0.0005);
+        let rate = OkxTradeFeeRate {
+            instrument_type: OkxInstrumentType::Spot,
+            group_id: "1".to_string(),
+            level: "Lv1".to_string(),
+            maker_rate: -0.0002,
+            taker_rate: -0.0005,
+            timestamp_ms: 1,
+        };
+        assert!(exchange_fee_drift_reason(&expectation, &rate).is_none());
+
+        expectation.configured_maker_cost = 0.0003;
+        expectation.configured_taker_cost = 0.0006;
+        assert!(exchange_fee_drift_reason(&expectation, &rate).is_none());
+
+        expectation.configured_maker_cost = 0.0001;
+        let reason = exchange_fee_drift_reason(&expectation, &rate).unwrap();
+        assert!(reason.contains("understate authenticated costs"));
+
+        expectation.configured_maker_cost = -0.0002;
+        let rebate = OkxTradeFeeRate {
+            maker_rate: 0.0001,
+            ..rate
+        };
+        assert!(exchange_fee_drift_reason(&expectation, &rebate).is_some());
+        expectation.configured_maker_cost = 0.0;
+        assert!(exchange_fee_drift_reason(&expectation, &rebate).is_none());
+    }
+
+    #[test]
+    fn exchange_fee_request_spacing_finishes_within_the_sweep_deadline() {
+        assert_eq!(exchange_fee_request_interval_ms(1_001, 2), 500);
+        assert_eq!(exchange_fee_request_interval_ms(800, 2), 400);
+    }
+
+    #[tokio::test]
+    async fn initial_exchange_fee_understatement_is_typed() {
+        let (client, requests) = safety_client(vec![Ok(
+            r#"{"code":"0","msg":"","data":[{"feeGroup":[{"groupId":"1","maker":"-0.0008","taker":"-0.001"}],"instType":"SPOT","level":"Lv1","ts":"1763979985847"}]}"#,
+        )]);
+        let guard = exchange_fee_guard(60_000, vec![exchange_fee_expectation(0.0002, 0.0005)]);
+
+        let error = verify_initial_exchange_fees("main", &client, &guard)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            LiveRuntimeError::ExchangeFeeDrift(message)
+                if message.contains("account main") && message.contains("BTC-USDT")
+        ));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn periodic_exchange_fee_understatement_is_fatal() {
+        let (client, requests) = safety_client(vec![Ok(
+            r#"{"code":"0","msg":"","data":[{"feeGroup":[{"groupId":"1","maker":"-0.0008","taker":"-0.001"}],"instType":"SPOT","level":"Lv1","ts":"1763979985847"}]}"#,
+        )]);
+        let (_command_tx, command_rx) = mpsc::channel(2);
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+        let task = tokio::spawn(run_account_safety_task(
+            "main".to_string(),
+            client,
+            safety_account_config(),
+            command_rx,
+            event_tx,
+            None,
+            60_000,
+            60_000,
+            1_000,
+            exchange_status_guard(false, 60_000),
+            exchange_fee_guard(400, vec![exchange_fee_expectation(0.0002, 0.0005)]),
+        ));
+
+        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            RuntimeEvent::Fatal(RuntimeTaskFailure::ExchangeFeeDrift(message))
+                if message.contains("BTC-USDT") && message.contains("0.001")
+        ));
+        task.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].path,
+            "/api/v5/account/trade-fee?instType=SPOT&instId=BTC-USDT"
+        );
+    }
+
+    #[tokio::test]
+    async fn periodic_exchange_fee_check_failure_is_typed() {
+        let (client, _) = safety_client(vec![Err(RestError::Transport(
+            "injected fee failure".to_string(),
+        ))]);
+        let (_command_tx, command_rx) = mpsc::channel(2);
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+        let task = tokio::spawn(run_account_safety_task(
+            "main".to_string(),
+            client,
+            safety_account_config(),
+            command_rx,
+            event_tx,
+            None,
+            60_000,
+            60_000,
+            1_000,
+            exchange_status_guard(false, 60_000),
+            exchange_fee_guard(400, vec![exchange_fee_expectation(0.001, 0.001)]),
+        ));
+
+        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            RuntimeEvent::Fatal(RuntimeTaskFailure::ExchangeFeeCheck(message))
+                if message.contains("injected fee failure")
+        ));
+        task.await.unwrap();
+    }
+
     #[tokio::test]
     async fn periodic_relevant_exchange_status_is_fatal() {
         let (client, requests) = safety_client(vec![Ok(
@@ -6514,6 +6946,7 @@ mod tests {
             60_000,
             1_000,
             exchange_status_guard(true, 1),
+            exchange_fee_guard(60_000, Vec::new()),
         ));
 
         let event = tokio::time::timeout(Duration::from_millis(100), event_rx.recv())
@@ -6549,6 +6982,7 @@ mod tests {
             60_000,
             1_000,
             exchange_status_guard(true, 1),
+            exchange_fee_guard(60_000, Vec::new()),
         ));
 
         let event = tokio::time::timeout(Duration::from_millis(100), event_rx.recv())

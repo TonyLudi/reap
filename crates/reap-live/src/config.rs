@@ -9,7 +9,10 @@ use reap_order::PacingPolicy;
 use reap_risk::RiskLimits;
 use reap_strategy::{ChaosConfig, InstrumentConfig};
 use reap_telemetry::WebhookAlertConfig;
-use reap_venue::okx::{OkxAccountLevel, OkxCredentials, OkxPositionMode, OkxTradeMode};
+use reap_venue::okx::{
+    OKX_MIN_TRADE_FEE_REQUEST_INTERVAL_MS, OkxAccountLevel, OkxCredentials, OkxPositionMode,
+    OkxTradeMode,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -20,6 +23,7 @@ const MAX_REPORTED_UNKNOWN_FIELDS: usize = 64;
 const MAX_CONNECTION_ATTEMPT_INTERVAL_MS: u64 = 60_000;
 const MIN_EXCHANGE_STATUS_CHECK_INTERVAL_MS: u64 = 5_000;
 const MAX_EXCHANGE_STATUS_LEAD_MS: u64 = 86_400_000;
+const MAX_EXCHANGE_FEE_CHECK_INTERVAL_MS: u64 = 300_000;
 pub const MAX_ORDER_WEBSOCKET_SESSIONS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,6 +227,8 @@ pub struct RuntimeConfig {
     pub exchange_clock_check_interval_ms: u64,
     pub exchange_status_check_interval_ms: u64,
     pub exchange_status_lead_ms: u64,
+    /// Maximum time for one complete authenticated fee check across an account.
+    pub exchange_fee_check_interval_ms: u64,
     pub cancel_all_after_timeout_secs: u64,
     pub cancel_all_after_heartbeat_ms: u64,
     pub ambiguous_submit_grace_ms: u64,
@@ -259,6 +265,7 @@ impl Default for RuntimeConfig {
             exchange_clock_check_interval_ms: 30_000,
             exchange_status_check_interval_ms: 10_000,
             exchange_status_lead_ms: 60_000,
+            exchange_fee_check_interval_ms: 60_000,
             cancel_all_after_timeout_secs: 30,
             cancel_all_after_heartbeat_ms: 1_000,
             ambiguous_submit_grace_ms: 10_000,
@@ -678,6 +685,15 @@ impl LiveConfig {
                     ));
                 }
             }
+            let instrument_count = self.instruments_for_account(&account.id).count() as u64;
+            let minimum_sweep_ms =
+                instrument_count.saturating_mul(OKX_MIN_TRADE_FEE_REQUEST_INTERVAL_MS);
+            if self.runtime.exchange_fee_check_interval_ms < minimum_sweep_ms {
+                errors.push(format!(
+                    "runtime.exchange_fee_check_interval_ms must be at least {minimum_sweep_ms} for account {} to respect the OKX trade-fee endpoint limit across {instrument_count} instruments",
+                    account.id
+                ));
+            }
         }
 
         errors.sort();
@@ -997,6 +1013,10 @@ fn validate_positive_runtime(runtime: &RuntimeConfig, errors: &mut Vec<String>) 
         ),
         ("exchange_status_lead_ms", runtime.exchange_status_lead_ms),
         (
+            "exchange_fee_check_interval_ms",
+            runtime.exchange_fee_check_interval_ms,
+        ),
+        (
             "cancel_all_after_timeout_secs",
             runtime.cancel_all_after_timeout_secs,
         ),
@@ -1115,6 +1135,11 @@ fn validate_positive_runtime(runtime: &RuntimeConfig, errors: &mut Vec<String>) 
     if runtime.exchange_status_lead_ms > MAX_EXCHANGE_STATUS_LEAD_MS {
         errors.push(format!(
             "runtime.exchange_status_lead_ms must not exceed {MAX_EXCHANGE_STATUS_LEAD_MS}"
+        ));
+    }
+    if runtime.exchange_fee_check_interval_ms > MAX_EXCHANGE_FEE_CHECK_INTERVAL_MS {
+        errors.push(format!(
+            "runtime.exchange_fee_check_interval_ms must not exceed {MAX_EXCHANGE_FEE_CHECK_INTERVAL_MS}"
         ));
     }
     if !(10..=120).contains(&runtime.cancel_all_after_timeout_secs) {
@@ -2025,6 +2050,28 @@ mod tests {
                 error.contains("exchange_status_check_interval_ms must not exceed")
             })
         );
+    }
+
+    #[test]
+    fn exchange_fee_guard_bounds_sweep_and_respects_endpoint_rate() {
+        let mut too_fast = valid_config();
+        too_fast.runtime.exchange_fee_check_interval_ms = 799;
+
+        let report = too_fast.validate();
+
+        assert!(!report.valid);
+        assert!(report.errors.iter().any(|error| {
+            error.contains("exchange_fee_check_interval_ms must be at least 800")
+                && error.contains("across 2 instruments")
+        }));
+
+        let mut too_slow = valid_config();
+        too_slow.runtime.exchange_fee_check_interval_ms = 300_001;
+        let report = too_slow.validate();
+        assert!(!report.valid);
+        assert!(report.errors.iter().any(|error| {
+            error.contains("exchange_fee_check_interval_ms must not exceed 300000")
+        }));
     }
 
     #[test]

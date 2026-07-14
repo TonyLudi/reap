@@ -613,12 +613,14 @@ outside source control.
    `exchange_status_lead_ms`.
 6. The runtime fetches account-scoped instruments, account configuration,
    full economic balances, positions including margin-loan fields, open orders,
-   recent fills, and exact status for any restored active order.
+   recent fills, exact status for any restored active order, and the
+   authenticated current fee group for every configured instrument.
 7. It verifies live instrument state, type, linear/inverse contract type,
    tick/lot/minimum size, contract value, currencies, configured trade mode,
    account level, `net_mode`, disabled mode-appropriate borrowing, complete
-   applicable zero-liability/interest evidence, and absence of margin positions
-   before metadata is ready.
+   applicable zero-liability/interest evidence, absence of margin positions,
+   and that configured maker/taker costs do not understate the applicable
+   exchange commissions or overstate rebates before metadata is ready.
 8. It restores canonical active orders, fill identities, and active global,
    account, and symbol safety latches from JSONL. It applies missed known
    fills/terminal updates from REST, applies the authoritative account snapshot
@@ -1226,6 +1228,18 @@ in `observe` only after review.
   authenticated account configuration and compares the typed identity, account
   and position modes, STP setting, and borrowing flags to bootstrap. Any drift
   or failed check is fatal and enters normal fail-closed cleanup.
+- Bootstrap and the periodic account fee guard use the official authenticated
+  [OKX fee-rates endpoint](https://www.okx.com/docs-v5/en/#trading-account-rest-api-get-fee-rates).
+  Every private instrument `groupId` is matched to a current `feeGroup` row for
+  the exact spot instrument or derivative family. OKX reports a negative rate
+  for commission and a positive rate for rebate; Reap converts this to its cost
+  convention and permits only equal or more conservative configured costs.
+  Missing groups, deprecated-only responses, request failures, understated
+  commissions, or overstated rebates are fatal. The full sweep defaults to one
+  minute and is paced for the five-requests-per-two-seconds user limit. Its
+  request runs in an isolated child task and therefore cannot delay Cancel All
+  After. OKX notes that Open API rates may not reflect temporary zero-fee pairs,
+  so this is a conservative safety gate rather than calibration evidence.
 - Validation requires the exchange deadman horizon to exceed three complete
   REST request timeouts plus one heartbeat interval, so delayed
   clock/config/status checks cannot consume the last armed Cancel All After
@@ -1259,6 +1273,7 @@ in `observe` only after review.
 | Manual account kill | Durable account route latch; its instruments are removed from pricing/hedging and its live orders are cancelled | Reconcile the account and dependent exposure; restart alone does not clear it |
 | Exchange clock/deadman failure | Runtime fatal; new entry blocked; armed Cancel All After remains effective | Verify host time and OKX reachability, then reconcile before restart |
 | Relevant or unreadable OKX system status | Startup refused or runtime fatal; new entry blocked and normal cancel/reconcile cleanup runs | Review the official maintenance notice and configured environment; require a clean status check and full bootstrap after service recovery |
+| Configured fee underprices authenticated OKX group, or fee check is unreadable | Startup refused or runtime fatal; new entry blocked and normal cancel/reconcile cleanup runs | Review the exact instrument group, account tier, configured cost sign, and current API response; recalibrate and require a clean bootstrap rather than weakening the guard |
 | Host disk/memory/clock failure | Startup refused or runtime fatal; new entry blocked | Restore capacity/time synchronization, inspect journal integrity, and reconcile before restart |
 | Alert queue/delivery failure | Runtime fail-stop when fatal delivery is configured | Verify the external route and supervisor fallback before restart |
 | Journal lease contention | Second process refuses startup before credentials/network | Identify the owning PID/process; never bypass the lock or share the journal |
@@ -1280,6 +1295,7 @@ structured evidence rather than matching log text:
 | Cancel All After heartbeat failure | `stop_reason = "runtime_failure"` and `failure.code = "deadman_heartbeat"` |
 | Periodic exchange-clock skew/check failure | `failure.code = "exchange_clock_skew"` or `"exchange_clock_check"` |
 | Relevant or failed exchange-status check | `failure.code = "exchange_status"` or `"exchange_status_check"` |
+| Authenticated fee underpricing/check failure | `failure.code = "exchange_fee_drift"` or `"exchange_fee_check"` |
 | Authenticated account-config drift/check failure | `failure.code = "account_config_drift"` or `"account_config_check"` |
 
 Run each role in isolation, preserve its external injector record, populate the
@@ -1585,9 +1601,9 @@ operator commands and mutations, ambiguous submit/cancel outcomes, partial-fill
 transitions, order/fill convergence timeouts, and restored durable latches.
 Restored startup order state does not increment per-session partial-fill or
 ambiguity counters. Deadman heartbeat, periodic exchange-clock skew/check,
-exchange-status block/check, and authenticated account-config drift/check
-failures use distinct stable failure codes; do not classify them by matching
-`failure.message`.
+exchange-status block/check, authenticated exchange-fee drift/check, and
+authenticated account-config drift/check failures use distinct stable failure
+codes; do not classify them by matching `failure.message`.
 When enabled, it includes host preflight/last snapshots and check count plus
 alert delivery and queue evidence. A runtime/teardown failure additionally
 records its stable code and bounded message after cleanup while retaining a

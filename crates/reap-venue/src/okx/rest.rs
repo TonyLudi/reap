@@ -25,10 +25,12 @@ const OPEN_ORDERS_PATH: &str = "/api/v5/trade/orders-pending";
 const FILLS_PATH: &str = "/api/v5/trade/fills";
 const ORDER_DETAILS_PATH: &str = "/api/v5/trade/order";
 const ACCOUNT_INSTRUMENTS_PATH: &str = "/api/v5/account/instruments";
+const ACCOUNT_TRADE_FEE_PATH: &str = "/api/v5/account/trade-fee";
 const ACCOUNT_CONFIG_PATH: &str = "/api/v5/account/config";
 const ACCOUNT_BALANCE_PATH: &str = "/api/v5/account/balance";
 const ACCOUNT_POSITIONS_PATH: &str = "/api/v5/account/positions";
 pub const OKX_FILLS_PAGE_LIMIT: usize = 100;
+pub const OKX_MIN_TRADE_FEE_REQUEST_INTERVAL_MS: u64 = 400;
 
 /// Parses an unmodified OKX trade-fills or fills-history response.
 ///
@@ -120,6 +122,20 @@ pub fn parse_okx_system_status_response_json(
         .into_iter()
         .map(OkxSystemStatus::try_from)
         .collect()
+}
+
+/// Parses the current OKX fee-group response without using deprecated
+/// top-level maker/taker fields.
+pub fn parse_okx_trade_fee_response_json(body: &[u8]) -> Result<Vec<OkxTradeFeeRate>, RestError> {
+    let mut response: OkxResponse<OkxTradeFeeScheduleWire> = decode_okx_response(body)?;
+    if response.data.len() != 1 {
+        return Err(RestError::InvalidField {
+            field: "data",
+            value: response.data.len().to_string(),
+            message: "trade fee response must contain exactly one schedule".to_string(),
+        });
+    }
+    parse_trade_fee_schedule(response.data.pop().expect("checked one trade-fee schedule"))
 }
 
 /// Parses one unmodified OKX order-details response while retaining the
@@ -271,6 +287,28 @@ pub struct OkxSystemStatus {
     pub system: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OkxTradeFeeRate {
+    pub instrument_type: OkxInstrumentType,
+    pub group_id: String,
+    pub level: String,
+    /// Signed exchange rate: negative is a commission and positive is a rebate.
+    pub maker_rate: f64,
+    /// Signed exchange rate: negative is a commission and positive is a rebate.
+    pub taker_rate: f64,
+    pub timestamp_ms: u64,
+}
+
+impl OkxTradeFeeRate {
+    pub fn maker_cost_rate(&self) -> f64 {
+        -self.maker_rate
+    }
+
+    pub fn taker_cost_rate(&self) -> f64 {
+        -self.taker_rate
+    }
+}
+
 #[async_trait]
 pub trait HttpTransport: Send + Sync {
     async fn execute(&self, request: SignedRequest) -> Result<HttpResponse, RestError>;
@@ -415,6 +453,7 @@ pub struct OkxInstrument {
     pub symbol: String,
     pub instrument_type: OkxInstrumentType,
     pub instrument_family: String,
+    pub trade_fee_group_id: String,
     pub underlying: String,
     pub base_currency: String,
     pub quote_currency: String,
@@ -1164,6 +1203,90 @@ where
             .collect()
     }
 
+    pub async fn account_trade_fee(
+        &self,
+        instrument_type: OkxInstrumentType,
+        instrument_id: Option<&str>,
+        instrument_family: Option<&str>,
+        group_id: &str,
+    ) -> Result<OkxTradeFeeRate, RestError> {
+        self.account_trade_fee_at(
+            &timestamp_now(),
+            instrument_type,
+            instrument_id,
+            instrument_family,
+            group_id,
+        )
+        .await
+    }
+
+    pub async fn account_trade_fee_at(
+        &self,
+        timestamp: &str,
+        instrument_type: OkxInstrumentType,
+        instrument_id: Option<&str>,
+        instrument_family: Option<&str>,
+        group_id: &str,
+    ) -> Result<OkxTradeFeeRate, RestError> {
+        let instrument_id = instrument_id.filter(|value| !value.trim().is_empty());
+        let instrument_family = instrument_family.filter(|value| !value.trim().is_empty());
+        let selector_is_valid = match instrument_type {
+            OkxInstrumentType::Spot | OkxInstrumentType::Margin => {
+                instrument_id.is_some() && instrument_family.is_none()
+            }
+            OkxInstrumentType::Swap | OkxInstrumentType::Futures | OkxInstrumentType::Option => {
+                instrument_id.is_none() && instrument_family.is_some()
+            }
+        };
+        if !selector_is_valid {
+            return Err(RestError::InvalidField {
+                field: "instId/instFamily",
+                value: format!("instId={instrument_id:?}, instFamily={instrument_family:?}"),
+                message: "spot/margin requires instId; derivatives require instFamily".to_string(),
+            });
+        }
+        validate_required_text("groupId", group_id)?;
+        let path = query_path(
+            ACCOUNT_TRADE_FEE_PATH,
+            [
+                ("instType", Some(instrument_type.as_str())),
+                ("instId", instrument_id),
+                ("instFamily", instrument_family),
+            ],
+        );
+        let request = self
+            .signer
+            .sign_request(timestamp, HttpMethod::Get, path, "")?;
+        let response: OkxResponse<OkxTradeFeeScheduleWire> = self.execute(request).await?;
+        if response.data.len() != 1 {
+            return Err(RestError::InvalidField {
+                field: "data",
+                value: response.data.len().to_string(),
+                message: "trade fee response must contain exactly one schedule".to_string(),
+            });
+        }
+        let rates = parse_trade_fee_schedule(
+            response
+                .data
+                .into_iter()
+                .next()
+                .expect("checked one trade-fee schedule"),
+        )?;
+        rates
+            .into_iter()
+            .find(|rate| {
+                rate.instrument_type == instrument_type && rate.group_id == group_id.trim()
+            })
+            .ok_or_else(|| RestError::InvalidField {
+                field: "feeGroup.groupId",
+                value: group_id.to_string(),
+                message: format!(
+                    "trade fee response contained no matching {} group",
+                    instrument_type.as_str()
+                ),
+            })
+    }
+
     pub async fn account_config(&self) -> Result<OkxAccountConfig, RestError> {
         self.account_config_at(&timestamp_now()).await
     }
@@ -1631,6 +1754,25 @@ struct OkxSystemStatusWire {
 }
 
 #[derive(Debug, Deserialize)]
+struct OkxTradeFeeScheduleWire {
+    #[serde(rename = "instType")]
+    instrument_type: String,
+    level: String,
+    #[serde(rename = "ts")]
+    timestamp: String,
+    #[serde(rename = "feeGroup")]
+    fee_groups: Vec<OkxTradeFeeGroupWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OkxTradeFeeGroupWire {
+    #[serde(rename = "groupId")]
+    group_id: String,
+    maker: String,
+    taker: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct OkxCancelAllAfterWire {
     #[serde(default, rename = "triggerTime")]
     trigger_time: String,
@@ -1733,6 +1875,50 @@ impl TryFrom<OkxSystemStatusWire> for OkxSystemStatus {
     }
 }
 
+fn parse_trade_fee_schedule(
+    value: OkxTradeFeeScheduleWire,
+) -> Result<Vec<OkxTradeFeeRate>, RestError> {
+    let instrument_type = parse_instrument_type(&value.instrument_type)?;
+    validate_required_text("level", &value.level)?;
+    let timestamp_ms = parse_integer("ts", &value.timestamp)?;
+    if timestamp_ms == 0 {
+        return Err(RestError::InvalidField {
+            field: "ts",
+            value: value.timestamp,
+            message: "trade fee timestamp must be positive".to_string(),
+        });
+    }
+    if value.fee_groups.is_empty() {
+        return Err(RestError::EmptyData {
+            operation: "trade fee groups",
+        });
+    }
+    let mut group_ids = HashSet::new();
+    value
+        .fee_groups
+        .into_iter()
+        .map(|group| {
+            validate_required_text("feeGroup.groupId", &group.group_id)?;
+            let group_id = group.group_id.trim().to_string();
+            if !group_ids.insert(group_id.clone()) {
+                return Err(RestError::InvalidField {
+                    field: "feeGroup.groupId",
+                    value: group_id,
+                    message: "trade fee response repeated a group".to_string(),
+                });
+            }
+            Ok(OkxTradeFeeRate {
+                instrument_type,
+                group_id,
+                level: value.level.trim().to_string(),
+                maker_rate: parse_number("feeGroup.maker", &group.maker)?,
+                taker_rate: parse_number("feeGroup.taker", &group.taker)?,
+                timestamp_ms,
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, Deserialize)]
 struct OkxInstrumentWire {
     #[serde(rename = "instId")]
@@ -1741,6 +1927,8 @@ struct OkxInstrumentWire {
     instrument_type: String,
     #[serde(default, rename = "instFamily")]
     instrument_family: String,
+    #[serde(default, rename = "groupId")]
+    trade_fee_group_id: String,
     #[serde(default, rename = "uly")]
     underlying: String,
     #[serde(default, rename = "baseCcy")]
@@ -1772,6 +1960,7 @@ impl TryFrom<OkxInstrumentWire> for OkxInstrument {
             symbol: value.symbol,
             instrument_type: parse_instrument_type(&value.instrument_type)?,
             instrument_family: value.instrument_family,
+            trade_fee_group_id: value.trade_fee_group_id,
             underlying: value.underlying,
             base_currency: value.base_currency,
             quote_currency: value.quote_currency,
@@ -2500,6 +2689,73 @@ mod tests {
         assert!(error.contains("must not precede"));
     }
 
+    #[tokio::test]
+    async fn account_trade_fee_selects_current_group_and_preserves_exchange_sign() {
+        let response = r#"{"code":"0","msg":"","data":[{"category":"1","feeGroup":[{"groupId":"1","maker":"-0.0002","taker":"-0.0005"},{"groupId":"2","maker":"0.0001","taker":"-0.0004"}],"instType":"SWAP","level":"Lv2","maker":"9","taker":"9","ts":"1763979985847"}]}"#;
+        let (client, requests) = client(vec![response]);
+
+        let rate = client
+            .account_trade_fee_at(
+                "2020-12-08T09:08:57.715Z",
+                OkxInstrumentType::Swap,
+                None,
+                Some("BTC-USDT"),
+                "2",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(rate.instrument_type, OkxInstrumentType::Swap);
+        assert_eq!(rate.group_id, "2");
+        assert_eq!(rate.level, "Lv2");
+        assert_eq!(rate.maker_rate, 0.0001);
+        assert_eq!(rate.maker_cost_rate(), -0.0001);
+        assert_eq!(rate.taker_cost_rate(), 0.0004);
+        assert_eq!(rate.timestamp_ms, 1_763_979_985_847);
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests[0].path,
+            "/api/v5/account/trade-fee?instType=SWAP&instFamily=BTC-USDT"
+        );
+        assert!(requests[0].headers.contains_key("OK-ACCESS-SIGN"));
+    }
+
+    #[test]
+    fn trade_fee_parser_rejects_duplicate_groups_and_legacy_only_data() {
+        let duplicate = br#"{"code":"0","msg":"","data":[{"feeGroup":[{"groupId":"1","maker":"-0.0002","taker":"-0.0005"},{"groupId":"1","maker":"-0.0001","taker":"-0.0004"}],"instType":"SPOT","level":"Lv1","ts":"1763979985847"}]}"#;
+        let error = parse_okx_trade_fee_response_json(duplicate)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("repeated a group"));
+
+        let legacy_only = br#"{"code":"0","msg":"","data":[{"feeGroup":[],"instType":"SPOT","level":"Lv1","maker":"-0.0008","taker":"-0.001","ts":"1763979985847"}]}"#;
+        assert!(matches!(
+            parse_okx_trade_fee_response_json(legacy_only),
+            Err(RestError::EmptyData {
+                operation: "trade fee groups"
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn account_trade_fee_requires_the_type_specific_selector() {
+        let (client, requests) = client(Vec::new());
+
+        let error = client
+            .account_trade_fee_at("time", OkxInstrumentType::Spot, None, Some("BTC-USDT"), "1")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RestError::InvalidField {
+                field: "instId/instFamily",
+                ..
+            }
+        ));
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn offline_fill_response_parser_preserves_exact_fee_fields() {
         let response = fill_response(7, 1);
@@ -2849,7 +3105,7 @@ mod tests {
     #[tokio::test]
     async fn parses_signed_bootstrap_metadata_and_account_state() {
         let (client, requests) = client(vec![
-            r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","instType":"SWAP","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"USDT","ctType":"linear","ctVal":"0.01","ctValCcy":"BTC","tickSz":"0.1","lotSz":"1","minSz":"1","state":"live"}]}"#,
+            r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","instType":"SWAP","instFamily":"BTC-USDT","groupId":"2","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"USDT","ctType":"linear","ctVal":"0.01","ctValCcy":"BTC","tickSz":"0.1","lotSz":"1","minSz":"1","state":"live"}]}"#,
             r#"{"code":"0","msg":"","data":[{"acctLv":"2","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"7","mainUid":"6","enableSpotBorrow":false,"autoLoan":false,"spotBorrowAutoRepay":false}]}"#,
             r#"{"code":"0","msg":"","data":[{"uTime":"1000","totalEq":"11000","mgnRatio":"12.5","adjEq":"10000","borrowFroz":"0","notionalUsdForBorrow":"0","notionalUsd":"2000","details":[{"ccy":"USDT","uTime":"999","cashBal":"9000","availBal":"8000","eq":"10000","liab":"0","crossLiab":"0","isoLiab":"0","uplLiab":"0","interest":"0","borrowFroz":"0","maxLoan":"500","twap":"2"}]}]}"#,
             r#"{"code":"0","msg":"","data":[{"instType":"SWAP","instId":"BTC-USDT-SWAP","pos":"2","posSide":"net","mgnMode":"cross","avgPx":"50000","uTime":"1001","liab":"","interest":""}]}"#,
@@ -2868,6 +3124,8 @@ mod tests {
 
         assert_eq!(instruments[0].contract_type, Some(OkxContractType::Linear));
         assert_eq!(instruments[0].contract_value, Some(0.01));
+        assert_eq!(instruments[0].instrument_family, "BTC-USDT");
+        assert_eq!(instruments[0].trade_fee_group_id, "2");
         assert_eq!(account.account_level, OkxAccountLevel::SingleCurrencyMargin);
         assert_eq!(account.position_mode, OkxPositionMode::NetMode);
         assert_eq!(account.enable_spot_borrow, Some(false));

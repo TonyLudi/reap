@@ -122,6 +122,9 @@ exchange_clock_check_interval_ms = 30000
 # unified-account maintenance fails bootstrap or starts fail-closed shutdown.
 exchange_status_check_interval_ms = 10000
 exchange_status_lead_ms = 60000
+# Sweep every configured instrument's authenticated current fee group once per
+# minute; individual requests are paced within OKX's user-level endpoint limit.
+exchange_fee_check_interval_ms = 60000
 cancel_all_after_timeout_secs = 30
 cancel_all_after_heartbeat_ms = 1000
 ambiguous_submit_grace_ms = 10000

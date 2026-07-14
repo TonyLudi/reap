@@ -351,7 +351,8 @@ Responsibilities:
   takes precedence over simultaneous symbol isolation.
 - Validate exchange time, continuously compare authenticated account config to
   its bootstrap identity/settings, poll announced OKX unified-account system
-  maintenance, expire stale place requests at the venue, and own an
+  maintenance, verify strategy fee assumptions against authenticated current
+  instrument fee groups, expire stale place requests at the venue, and own an
   independently scheduled exchange deadman lifecycle per account.
 - Expose a separate minimal-config emergency composition that bypasses strategy,
   journal, websocket, and operator dependencies while cancelling and verifying
@@ -412,6 +413,15 @@ spread, and other events are relevant; websocket, block, bot, and copy-trading
 events are not. Rust additionally filters OKX's current `env` field and turns a
 relevant status or failed poll into fail-closed cancel/reconcile shutdown rather
 than Java's recoverable strategy pause.
+Each account instrument must also provide the current OKX trading-fee
+`groupId`. Bootstrap queries `/api/v5/account/trade-fee` with the exact spot
+instrument or derivative family, selects that group from `feeGroup`, and
+converts OKX's signed balance rate into the strategy's cost-rate convention.
+Configured maker and taker costs may be more conservative, but may not
+understate a commission or assume a larger rebate. A paced periodic full sweep
+repeats this check. It runs as a child of the account safety lifecycle so a
+blocked fee request cannot delay Cancel All After heartbeats. Deprecated
+top-level fee fields are rejected as insufficient current-contract evidence.
 Tradable demo startup additionally requires every configured authenticated
 order-command websocket session for every account. The default pool has eight
 sessions, matching the pinned Java topology, and deterministically routes spot,

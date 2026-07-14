@@ -305,6 +305,12 @@ impl ChaosConfig {
                     &mut errors,
                 );
             }
+            if instrument.taker_fee < instrument.maker_fee {
+                errors.push(format!(
+                    "{}.taker_fee must not be lower than maker_fee",
+                    instrument.symbol
+                ));
+            }
             if instrument
                 .funding_override
                 .is_some_and(|funding| !funding.is_finite())
@@ -4858,6 +4864,23 @@ mod tests {
                 .errors
                 .iter()
                 .any(|error| error.contains("must be a spot instrument"))
+        );
+    }
+
+    #[test]
+    fn java_parity_rejects_taker_fee_below_maker_fee() {
+        let mut invalid = config();
+        invalid.instruments[0].maker_fee = 0.001;
+        invalid.instruments[0].taker_fee = 0.0005;
+
+        let report = invalid.validate();
+
+        assert!(!report.valid);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("taker_fee must not be lower than maker_fee"))
         );
     }
 
