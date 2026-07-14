@@ -162,10 +162,12 @@ production trading process.
     REST reduction. Empty/`0` private IDs resolve through the same map;
     wrong-account symbols, either-direction rebinding, and known-order
     symbol/side changes fail before canonical order or fill state mutates.
-29. Private order reduction suppresses an already-seen fill ID when status is
-    unchanged and cumulative fill does not advance, plus repeated unchanged
-    terminal states by canonical order ID, even when OKX sends a different
-    update timestamp.
+29. Private order reduction suppresses an already-seen `(symbol, fill_id)` when
+    status is unchanged and cumulative fill does not advance, plus repeated
+    unchanged terminal states by canonical order ID, even when OKX sends a
+    different update timestamp. The instrument scope follows OKX `tradeId`
+    uniqueness; restart journals persist scoped keys, while legacy unscoped IDs
+    migrate as conservative wildcards.
 30. Backtest order entry and cancellation are deterministic scheduled exchange
     actions rather than immediate function calls. Raw replay uses persisted
     receive time, pending quotes/hedges suppress duplicate intents, and reports

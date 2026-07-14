@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use reap_core::{
-    AccountUpdate, Balance, NewOrder, OrderEvent, OrderStatus, OrderUpdate, Position, Side,
+    AccountUpdate, Balance, FillKey, NewOrder, OrderEvent, OrderStatus, OrderUpdate, Position, Side,
 };
 use reap_venue::{PrivateOrderState, PrivateOrderUpdate, RemoteFill};
 use thiserror::Error;
@@ -54,7 +54,8 @@ pub struct PrivateStateReducer {
     exchange_to_client: HashMap<String, String>,
     client_to_exchange: HashMap<String, String>,
     seen_versions: HashSet<PrivateVersion>,
-    seen_fill_ids: HashSet<String>,
+    seen_fill_ids_by_symbol: HashMap<String, HashSet<String>>,
+    legacy_seen_fill_ids: HashSet<String>,
     cumulative_fills: HashMap<String, f64>,
     last_order_update_ms: HashMap<String, u64>,
     last_balance_update_ms: HashMap<String, u64>,
@@ -83,12 +84,25 @@ impl PrivateStateReducer {
         &self.positions
     }
 
-    pub fn seen_fill_ids(&self) -> &HashSet<String> {
-        &self.seen_fill_ids
+    pub fn has_seen_fill(&self, symbol: &str, fill_id: &str) -> bool {
+        self.legacy_seen_fill_ids.contains(fill_id)
+            || self
+                .seen_fill_ids_by_symbol
+                .get(symbol)
+                .is_some_and(|fill_ids| fill_ids.contains(fill_id))
     }
 
-    pub fn seed_fill_ids(&mut self, fill_ids: impl IntoIterator<Item = String>) {
-        self.seen_fill_ids.extend(fill_ids);
+    pub fn seed_fill_keys(&mut self, fill_keys: impl IntoIterator<Item = FillKey>) {
+        for key in fill_keys {
+            if key.symbol.is_empty() {
+                self.legacy_seen_fill_ids.insert(key.fill_id);
+            } else {
+                self.seen_fill_ids_by_symbol
+                    .entry(key.symbol)
+                    .or_default()
+                    .insert(key.fill_id);
+            }
+        }
     }
 
     pub fn restore_order_update(&mut self, update: OrderUpdate) {
@@ -343,7 +357,7 @@ impl PrivateStateReducer {
         let duplicate_fill_id = update
             .fill_id
             .as_ref()
-            .is_some_and(|fill_id| self.seen_fill_ids.contains(fill_id));
+            .is_some_and(|fill_id| self.has_seen_fill(&update.symbol, fill_id));
         if existing.as_ref().is_some_and(|order| {
             order.status == incoming_status
                 && update.cumulative_filled_qty <= prior
@@ -390,10 +404,16 @@ impl PrivateStateReducer {
             .insert(order_id.clone(), update.ts_ms.max(last_update_ms));
 
         let cumulative = update.cumulative_filled_qty.max(prior);
-        let fill_id_is_new = update
-            .fill_id
-            .as_ref()
-            .is_some_and(|fill_id| self.seen_fill_ids.insert(fill_id.clone()));
+        let fill_id_is_new = update.fill_id.as_ref().is_some_and(|fill_id| {
+            if self.has_seen_fill(&update.symbol, fill_id) {
+                false
+            } else {
+                self.seen_fill_ids_by_symbol
+                    .entry(update.symbol.clone())
+                    .or_default()
+                    .insert(fill_id.clone())
+            }
+        });
         let inferred_fill = (cumulative - prior).max(0.0);
         let last_fill_qty = if fill_id_is_new || inferred_fill > 0.0 {
             update.last_fill_qty.max(inferred_fill)
@@ -501,9 +521,13 @@ impl PrivateStateReducer {
             return Ok(None);
         };
         validate_existing_order_identity(Some(&existing), &order_id, &fill.symbol, fill.side)?;
-        if !self.seen_fill_ids.insert(fill.fill_id.clone()) {
+        if self.has_seen_fill(&fill.symbol, &fill.fill_id) {
             return Ok(None);
         }
+        self.seen_fill_ids_by_symbol
+            .entry(fill.symbol.clone())
+            .or_default()
+            .insert(fill.fill_id.clone());
         if !fill.exchange_order_id.is_empty() {
             self.exchange_to_client
                 .insert(fill.exchange_order_id.clone(), order_id.clone());
@@ -681,6 +705,32 @@ mod tests {
             0.4
         );
         assert_eq!(reducer.canonical_order_id("exchange-1"), Some("client-1"));
+    }
+
+    #[test]
+    fn identical_fill_ids_on_different_symbols_are_not_duplicates() {
+        let mut reducer = PrivateStateReducer::new();
+        let first = private_fill();
+        let mut second = private_fill();
+        second.ts_ms = 11;
+        second.exchange_order_id = "exchange-2".to_string();
+        second.client_order_id = "client-2".to_string();
+        second.symbol = "ETH-USDT".to_string();
+
+        assert!(reducer.apply_order(first).unwrap().is_some());
+        assert!(reducer.apply_order(second).unwrap().is_some());
+        assert!(reducer.has_seen_fill("BTC-USDT", "fill-1"));
+        assert!(reducer.has_seen_fill("ETH-USDT", "fill-1"));
+    }
+
+    #[test]
+    fn legacy_fill_keys_remain_conservative_restart_wildcards() {
+        let mut reducer = PrivateStateReducer::new();
+        reducer.seed_fill_keys([FillKey::legacy_unscoped("fill-1")]);
+
+        assert!(reducer.has_seen_fill("BTC-USDT", "fill-1"));
+        assert!(reducer.has_seen_fill("ETH-USDT", "fill-1"));
+        assert!(!reducer.has_seen_fill("BTC-USDT", "fill-2"));
     }
 
     #[test]

@@ -142,7 +142,7 @@ impl LiveCoordinator {
         for account in &config.accounts {
             let mut state = PrivateStateReducer::new();
             if let Some(fill_ids) = verified.baseline_fill_ids.get(&account.id) {
-                state.seed_fill_ids(fill_ids.iter().cloned());
+                state.seed_fill_keys(fill_ids.iter().cloned());
             }
             if let Some(update) = verified.account_updates.get(&account.id) {
                 state.apply_account(update.clone());
@@ -1158,9 +1158,9 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     use reap_core::{
-        AccountUpdate, Balance, FillFee, FillLiquidity, Level, MarketEvent, NewOrder, OrderBook,
-        OrderEvent, OrderStatus, OrderUpdate, Position, PositionMarginMode, Side, SystemEvent,
-        SystemEventKind, TimeInForce, Venue,
+        AccountUpdate, Balance, FillFee, FillKey, FillLiquidity, Level, MarketEvent, NewOrder,
+        OrderBook, OrderEvent, OrderStatus, OrderUpdate, Position, PositionMarginMode, Side,
+        SystemEvent, SystemEventKind, TimeInForce, Venue,
     };
     use reap_feed::FeedOutput;
     use reap_order::{ReconcileIssue, reconcile, reconcile_full_state};
@@ -2127,8 +2127,7 @@ mod tests {
             !coordinator
                 .private_state("hedge")
                 .unwrap()
-                .seen_fill_ids()
-                .contains("wrong-fill")
+                .has_seen_fill("BTC-USDT", "wrong-fill")
         );
     }
 
@@ -2204,8 +2203,7 @@ mod tests {
             !coordinator
                 .private_state("main")
                 .unwrap()
-                .seen_fill_ids()
-                .contains("fill-wrong-side")
+                .has_seen_fill("BTC-USDT", "fill-wrong-side")
         );
     }
 
@@ -2638,7 +2636,7 @@ mod tests {
         let state = coordinator.private_state("main").unwrap();
         let report = reconcile(
             state.order_reducer(),
-            state.seen_fill_ids(),
+            &HashSet::from([FillKey::new("BTC-USDT", "fill-1")]),
             &[remote],
             &[fill],
         );

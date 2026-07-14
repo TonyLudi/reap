@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use reap_core::{
-    FillFee, FillLiquidity, NormalizedEvent, OrderIntent, OrderUpdate, Price, Quantity,
+    FillFee, FillKey, FillLiquidity, NormalizedEvent, OrderIntent, OrderUpdate, Price, Quantity,
     RawEnvelope, Side, Symbol, SystemEvent, SystemEventKind, TimeMs,
 };
 use serde::{Deserialize, Serialize};
@@ -133,7 +133,7 @@ pub struct BootstrapRecord {
     pub account_id: String,
     pub strategy_name: String,
     pub config_fingerprint: String,
-    pub baseline_fill_ids: Vec<String>,
+    pub baseline_fill_ids: Vec<FillKey>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -141,8 +141,8 @@ pub struct RecoveredStorage {
     pub latest_orders: HashMap<String, OrderUpdate>,
     pub order_bindings: HashMap<String, HashMap<String, String>>,
     pub fills: Vec<FillRecord>,
-    pub seen_fill_ids: HashSet<String>,
-    pub baseline_fill_ids: HashMap<String, HashSet<String>>,
+    pub seen_fill_keys: HashSet<FillKey>,
+    pub baseline_fill_ids: HashMap<String, HashSet<FillKey>>,
     pub bootstrap_identities: HashMap<String, (String, String)>,
     pub global_safety_latch: Option<SafetyLatchRecord>,
     pub account_safety_latches: BTreeMap<String, SafetyLatchRecord>,
@@ -460,7 +460,7 @@ struct StoredEnvelope {
     record: StorageRecord,
 }
 
-const CURRENT_SCHEMA_VERSION: u16 = 3;
+const CURRENT_SCHEMA_VERSION: u16 = 4;
 
 pub fn recover_jsonl(path: impl AsRef<Path>) -> Result<RecoveredStorage, StorageError> {
     let path = path.as_ref();
@@ -492,7 +492,7 @@ pub fn recover_jsonl(path: impl AsRef<Path>) -> Result<RecoveredStorage, Storage
                 });
             }
         };
-        if !matches!(envelope.schema_version, 2 | CURRENT_SCHEMA_VERSION) {
+        if !matches!(envelope.schema_version, 2 | 3 | CURRENT_SCHEMA_VERSION) {
             return Err(StorageError::Corrupt {
                 line: index + 1,
                 message: format!("unsupported schema version {}", envelope.schema_version),
@@ -568,7 +568,9 @@ pub fn recover_jsonl(path: impl AsRef<Path>) -> Result<RecoveredStorage, Storage
                 bindings.insert(exchange_order_id, ack.client_order_id);
             }
             StorageRecord::Fill(fill) => {
-                recovered.seen_fill_ids.insert(fill.fill_id.clone());
+                recovered
+                    .seen_fill_keys
+                    .insert(FillKey::new(fill.symbol.clone(), fill.fill_id.clone()));
                 recovered.fills.push(fill);
             }
             StorageRecord::SafetyLatch(latch) => {
@@ -901,6 +903,26 @@ mod tests {
         assert_eq!(recovered.records, 1);
     }
 
+    #[test]
+    fn recovery_migrates_v3_unscoped_bootstrap_fill_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let line = r#"{"schema_version":3,"record":{"kind":"bootstrap","data":{"ts_ms":1,"account_id":"main","strategy_name":"chaos","config_fingerprint":"fingerprint","baseline_fill_ids":["legacy-fill"]}}}"#;
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+
+        let recovered = recover_jsonl(path).unwrap();
+
+        assert_eq!(recovered.records, 1);
+        assert!(
+            recovered.baseline_fill_ids["main"].contains(&FillKey::legacy_unscoped("legacy-fill"))
+        );
+        assert!(
+            recovered.baseline_fill_ids["main"]
+                .iter()
+                .any(|key| key.matches("BTC-USDT", "legacy-fill"))
+        );
+    }
+
     #[tokio::test]
     async fn writer_persists_all_record_classes_as_jsonl() {
         let directory = tempfile::tempdir().unwrap();
@@ -1127,7 +1149,7 @@ mod tests {
             account_id: "main".to_string(),
             strategy_name: "test".to_string(),
             config_fingerprint: "fingerprint".to_string(),
-            baseline_fill_ids: vec!["historical-fill".to_string()],
+            baseline_fill_ids: vec![FillKey::new("BTC-USDT", "historical-fill")],
         }))
         .await
         .unwrap();
@@ -1200,7 +1222,11 @@ mod tests {
             recovered.latest_orders["order-1"].status,
             OrderStatus::Cancelled
         );
-        assert!(recovered.seen_fill_ids.contains("fill-1"));
+        assert!(
+            recovered
+                .seen_fill_keys
+                .contains(&FillKey::new("BTC-USDT", "fill-1"))
+        );
         assert_eq!(
             recovered.fills[0].fee,
             Some(FillFee {
@@ -1208,7 +1234,10 @@ mod tests {
                 currency: "BTC".to_string(),
             })
         );
-        assert!(recovered.baseline_fill_ids["main"].contains("historical-fill"));
+        assert!(
+            recovered.baseline_fill_ids["main"]
+                .contains(&FillKey::new("BTC-USDT", "historical-fill"))
+        );
         assert_eq!(recovered.order_bindings["main"]["exchange-1"], "order-1");
         assert_eq!(recovered.last_ts_ms, 2);
     }

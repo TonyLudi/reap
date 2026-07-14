@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use reap_core::AccountUpdate;
+use reap_core::{AccountUpdate, FillKey};
 use reap_risk::InstrumentRiskModel;
 use reap_strategy::{InstrumentConfig, InstrumentKindConfig};
 use reap_venue::okx::{OkxAccountConfig, OkxContractType, OkxInstrument, OkxInstrumentType};
@@ -58,7 +58,7 @@ pub struct VerifiedInstrument {
 pub struct VerifiedBootstrap {
     pub instruments: HashMap<String, VerifiedInstrument>,
     pub account_updates: HashMap<String, AccountUpdate>,
-    pub baseline_fill_ids: HashMap<String, HashSet<String>>,
+    pub baseline_fill_ids: HashMap<String, HashSet<FillKey>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,8 +130,8 @@ pub fn verify_bootstrap(
             snapshot
                 .recent_fills
                 .iter()
-                .map(|fill| fill.fill_id.clone())
-                .filter(|fill_id| !fill_id.is_empty())
+                .filter(|fill| !fill.fill_id.is_empty())
+                .map(|fill| FillKey::new(fill.symbol.clone(), fill.fill_id.clone()))
                 .collect(),
         );
 

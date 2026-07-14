@@ -215,8 +215,10 @@ Responsibilities:
   with contradictory journal history rejected and active bindings restored
   before startup REST reduction; private order/fill symbol ownership and
   immutable symbol/side checks occur before canonical state mutation.
-- Semantic private-order deduplication treats repeated fill IDs and unchanged
-  terminal order states as duplicates independently of exchange update time.
+- Semantic private-order deduplication treats repeated instrument-scoped fill
+  IDs and unchanged terminal order states as duplicates independently of
+  exchange update time. Restart baselines persist `(symbol, fill_id)`; legacy
+  unscoped journal IDs are read as conservative wildcards.
 - REST reconciliation for open orders, fills, balances, and positions.
 - Authoritative account-snapshot replacement with zero tombstones for balances
   and positions omitted after closure, plus per-row monotonic update guards.
@@ -754,7 +756,8 @@ Dedup rules:
   a byte-identical image from another socket is a duplicate. Conflicting content
   with the same transition reaches sequencing and forces recovery.
 - Trades: prefer trade id.
-- Private fills: prefer execution id or fill id.
+- Private fills: prefer execution id or fill id, scoped by venue, account, and
+  instrument because OKX only guarantees `tradeId` uniqueness per instrument.
 - Order updates: reduce idempotently by order id plus venue update version.
 - BBO/ticker fallback: hash `(symbol, exchange_ts, bid, bid_qty, ask, ask_qty)`.
 - Final fallback: bounded `(channel, symbol, raw_hash)` cache.

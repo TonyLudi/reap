@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reap_core::{
-    AccountUpdate, BacktestLatencyClass, Channel, ConnId, FeedPriority, MarketEvent,
+    AccountUpdate, BacktestLatencyClass, Channel, ConnId, FeedPriority, FillKey, MarketEvent,
     NormalizedEvent, OrderStatus, PINNED_JAVA_REVISION, Subscription, SystemEvent, SystemEventKind,
     TimeMs, TimerEvent, Venue,
 };
@@ -1039,7 +1039,7 @@ impl LiveRuntime {
                         .map(|owner| owner.id.as_str())
                 });
                 if fill_account_id == Some(account.id.as_str()) {
-                    fill_ids.insert(fill.fill_id.clone());
+                    fill_ids.insert(FillKey::new(fill.symbol.clone(), fill.fill_id.clone()));
                 }
             }
             verified
@@ -1096,7 +1096,7 @@ impl LiveRuntime {
                     let order_id =
                         state.resolve_order_id(&fill.client_order_id, &fill.exchange_order_id);
                     state.order_reducer().contains_order(&order_id)
-                        && !state.seen_fill_ids().contains(&fill.fill_id)
+                        && !state.has_seen_fill(&fill.symbol, &fill.fill_id)
                 });
                 if should_apply {
                     initial_outputs.push(coordinator.process_feed(FeedOutput::PrivateFill {
@@ -2433,7 +2433,7 @@ impl LiveRuntime {
                     let order_id =
                         state.resolve_order_id(&fill.client_order_id, &fill.exchange_order_id);
                     state.order_reducer().contains_order(&order_id)
-                        && !state.seen_fill_ids().contains(&fill.fill_id)
+                        && !state.has_seen_fill(&fill.symbol, &fill.fill_id)
                 });
             if should_apply {
                 let output = self.coordinator.process_feed(FeedOutput::PrivateFill {

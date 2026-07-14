@@ -64,7 +64,8 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Make account/position updates authoritative for hedge triggers.
 - [x] Add funding, index, mark/limit, account, margin, and position events.
 - [x] Preserve quote/hedge identity across REST and private websocket races.
-- [x] Scope private feed health and deduplication by account.
+- [x] Scope private feed health by account and fill deduplication by
+  account/instrument, including scoped restart keys and legacy journal migration.
 - [x] Document execution-policy and platform differences without claiming
   Binance or Java control-plane parity.
 

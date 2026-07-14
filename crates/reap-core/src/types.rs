@@ -307,6 +307,53 @@ pub struct FillFee {
     pub currency: String,
 }
 
+/// Exchange fill identity scoped to the instrument that issued it.
+///
+/// An empty symbol is accepted only when reading legacy journals whose
+/// bootstrap records stored unscoped IDs. Such a key acts as a conservative
+/// wildcard during restart deduplication; newly-created keys are always scoped.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct FillKey {
+    pub symbol: Symbol,
+    pub fill_id: String,
+}
+
+impl FillKey {
+    pub fn new(symbol: impl Into<Symbol>, fill_id: impl Into<String>) -> Self {
+        Self {
+            symbol: symbol.into(),
+            fill_id: fill_id.into(),
+        }
+    }
+
+    pub fn legacy_unscoped(fill_id: impl Into<String>) -> Self {
+        Self::new(String::new(), fill_id)
+    }
+
+    pub fn matches(&self, symbol: &str, fill_id: &str) -> bool {
+        self.fill_id == fill_id && (self.symbol.is_empty() || self.symbol == symbol)
+    }
+}
+
+impl<'de> Deserialize<'de> for FillKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum FillKeyWire {
+            Legacy(String),
+            Scoped { symbol: Symbol, fill_id: String },
+        }
+
+        Ok(match FillKeyWire::deserialize(deserializer)? {
+            FillKeyWire::Legacy(fill_id) => Self::legacy_unscoped(fill_id),
+            FillKeyWire::Scoped { symbol, fill_id } => Self::new(symbol, fill_id),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Level {
     pub px: Price,
@@ -699,7 +746,7 @@ pub fn round_down_to_lot(qty: Quantity, lot_size: f64) -> Quantity {
 
 #[cfg(test)]
 mod tests {
-    use super::{Balance, Channel, OrderUpdate, Position};
+    use super::{Balance, Channel, FillKey, OrderUpdate, Position};
 
     #[test]
     fn okx_depth_variants_are_book_channels() {
@@ -751,5 +798,19 @@ mod tests {
                 .unwrap()
                 .contains("time_in_force")
         );
+    }
+
+    #[test]
+    fn fill_key_reads_legacy_ids_and_round_trips_scoped_identity() {
+        let legacy: FillKey = serde_json::from_str(r#""fill-1""#).unwrap();
+        assert!(legacy.matches("BTC-USDT", "fill-1"));
+        assert!(legacy.matches("ETH-USDT", "fill-1"));
+
+        let scoped = FillKey::new("BTC-USDT", "fill-1");
+        let decoded: FillKey =
+            serde_json::from_str(&serde_json::to_string(&scoped).unwrap()).unwrap();
+        assert_eq!(decoded, scoped);
+        assert!(decoded.matches("BTC-USDT", "fill-1"));
+        assert!(!decoded.matches("ETH-USDT", "fill-1"));
     }
 }

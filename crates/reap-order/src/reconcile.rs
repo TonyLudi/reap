@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use reap_core::{AccountUpdate, Balance, Position};
+use reap_core::{AccountUpdate, Balance, FillKey, Position};
 use reap_venue::{PrivateOrderState, RemoteFill, RemoteOrder};
 use serde::{Deserialize, Serialize};
 
@@ -82,13 +82,17 @@ pub struct ReconciliationSnapshot {
 
 pub fn reconcile(
     local: &OrderReducer,
-    known_fill_ids: &HashSet<String>,
+    known_fill_keys: &HashSet<FillKey>,
     remote_orders: &[RemoteOrder],
     remote_fills: &[RemoteFill],
 ) -> ReconcileReport {
     reconcile_with_order_ids(
         local,
-        known_fill_ids,
+        |symbol, fill_id| {
+            known_fill_keys
+                .iter()
+                .any(|key| key.matches(symbol, fill_id))
+        },
         remote_orders,
         remote_fills,
         reported_order_id,
@@ -97,7 +101,7 @@ pub fn reconcile(
 
 fn reconcile_with_order_ids(
     local: &OrderReducer,
-    known_fill_ids: &HashSet<String>,
+    is_known_fill: impl Fn(&str, &str) -> bool,
     remote_orders: &[RemoteOrder],
     remote_fills: &[RemoteFill],
     resolve_order_id: impl Fn(&str, &str) -> String,
@@ -170,7 +174,7 @@ fn reconcile_with_order_ids(
     }
     for fill in remote_fills {
         let order_id = resolve_order_id(&fill.client_order_id, &fill.exchange_order_id);
-        if !known_fill_ids.contains(&fill.fill_id) {
+        if !is_known_fill(&fill.symbol, &fill.fill_id) {
             issues.push(ReconcileIssue::UnknownFill {
                 fill_id: fill.fill_id.clone(),
                 order_id,
@@ -196,7 +200,7 @@ pub fn reconcile_full_state(
 ) -> ReconcileReport {
     let mut report = reconcile_with_order_ids(
         local.order_reducer(),
-        local.seen_fill_ids(),
+        |symbol, fill_id| local.has_seen_fill(symbol, fill_id),
         remote_orders,
         remote_fills,
         |client_order_id, exchange_order_id| {
@@ -431,6 +435,31 @@ mod tests {
         let report = reconcile(&local, &HashSet::new(), &[remote], &[fill]);
         assert!(!report.is_clean());
         assert_eq!(report.issues.len(), 2);
+    }
+
+    #[test]
+    fn reconciliation_scopes_known_fill_ids_by_symbol() {
+        let local = OrderReducer::new();
+        let fill = RemoteFill {
+            fill_id: "shared-id".to_string(),
+            exchange_order_id: "exchange-2".to_string(),
+            client_order_id: "client-2".to_string(),
+            symbol: "ETH-USDT".to_string(),
+            side: Side::Sell,
+            price: 50.0,
+            qty: 1.0,
+            liquidity: reap_core::FillLiquidity::Taker,
+            fee: None,
+            ts_ms: 3,
+        };
+        let known = HashSet::from([FillKey::new("BTC-USDT", "shared-id")]);
+
+        let report = reconcile(&local, &known, &[], &[fill]);
+
+        assert!(matches!(
+            report.issues.as_slice(),
+            [ReconcileIssue::UnknownFill { symbol, .. }] if symbol == "ETH-USDT"
+        ));
     }
 
     #[test]
