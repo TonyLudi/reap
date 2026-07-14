@@ -34,11 +34,16 @@ Implemented:
   and write-ahead safety-latch records, including restart recovery and an
   exclusive canonical journal lease.
 - A fail-closed `reap-live` composition root with account-scoped REST bootstrap,
-  exchange metadata/account-mode verification, redundant public sockets,
+  exchange metadata/account-mode and zero-liability verification, redundant public sockets,
   isolated private sockets, account/positions data-round health, one strategy
   owner, prioritized gateway tasks, and graceful cancel-and-drain shutdown.
-  Demo entry also validates exchange time and maintains OKX Cancel All After
-  from an independent safety task.
+  Demo entry also validates exchange time, continuously detects authenticated
+  account-configuration drift, and maintains OKX Cancel All After from an
+  independent safety task.
+- Authenticated read-only cash-account certification that embeds exact bounded
+  OKX config/balance/position responses in a create-new mode-`0600` artifact,
+  binds config/binary/host/Java/account provenance, and supports credential-free
+  offline re-verification without printing sensitive raw account state.
 - Bounded asynchronous HTTPS webhook alerts and optional Linux journal-disk,
   available-memory, and kernel-clock guards, with preflight evidence and
   fail-closed periodic enforcement outside the strategy loop.
@@ -177,8 +182,26 @@ export REAP_OKX_API_KEY=...
 export REAP_OKX_SECRET_KEY=...
 export REAP_OKX_PASSPHRASE=...
 export REAP_OPERATOR_TOKEN=... # at least 32 bytes from the secret provider
+cargo run -p reap-cli -- certify-account \
+  --config examples/live-okx-demo.toml \
+  --account main \
+  --output /secure/evidence/account-certification.json \
+  --pretty
+cargo run -p reap-cli -- verify-account-certification \
+  --artifact /secure/evidence/account-certification.json \
+  --require-pass \
+  --pretty
 cargo run -p reap-cli -- live --config examples/live-okx-demo.toml --mode observe
 ```
+
+The certification command has no order-entry path. It requires disabled
+mode-appropriate borrowing flags, zero applicable aggregate/per-currency
+liability, interest, and borrow-frozen fields, no OKX `MARGIN` positions, zero
+configured strategy borrow limits, stable bracketed identity/settings, and
+bounded exchange-clock evidence. The artifact contains sensitive raw account
+responses and embedded config, so keep it in restricted evidence storage. It is
+sequential point-in-time evidence, not an atomic snapshot, historical borrowing
+proof, or full statement reconciliation; quiesce account activity while it runs.
 
 From another shell with the same operator token, inspect or stop the runtime:
 
@@ -340,9 +363,10 @@ cargo bench -p reap-live --bench live_loop
 ```
 
 `demo` mode rejects a production exchange configuration. `observe` is strictly
-read-only. Production order entry is intentionally not exposed: a credentialed
-OKX demo soak, fault campaign, latency profile, and operator rollout approval
-remain required before production capital.
+read-only. Production order entry is intentionally not exposed: passing real
+account certification and fill reconciliation, a credentialed OKX demo soak,
+fault campaign, calibrated research, target-host exercises, and operator
+rollout approval remain required before production capital.
 
 Design docs:
 

@@ -203,6 +203,10 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Pin the Rust toolchain and add least-privilege GitHub CI for formatting,
   all-target lint, workspace tests, release build, and RustSec audit, with weekly
   Cargo and Actions update proposals.
+- [x] Add mode-aware OKX account economics, reject live borrowing/nonzero
+  liability at bootstrap and during account updates, continuously detect
+  authenticated account-config drift, and add create-new point-in-time account
+  certification with credential-free raw-evidence verification.
 - [ ] Run credentialed bounded observe and minimal-size demo fault campaigns,
   including process death, deadman expiry, clock skew, REST ambiguity, partial
   fill, reconnect, and durable-latch restart recovery.
@@ -212,8 +216,8 @@ architecture in [docs/architecture.md](docs/architecture.md).
   configurable execution model and latency evidence pipeline are implemented
   but have no credentialed calibration artifact; empirical queue and populated
   per-class/per-instrument latency distributions, target-tier simulated-fee
-  calibration, complete funding intervals, zero-liability cash-account
-  certification, a passing real authenticated fill/fee reconciliation artifact,
+  calibration, complete funding intervals, a passing real target-account
+  cash/zero-liability artifact, a passing authenticated fill/fee reconciliation artifact,
   and broader economic statement reconciliation are still required. Exact signed
   private-fill fee amount/currency is retained end to end; collection and
   verification are implemented but no demo evidence exists. Margin spot is

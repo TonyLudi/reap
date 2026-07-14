@@ -1734,7 +1734,21 @@ mod tests {
             })
             .unwrap();
 
-        let mut forced_repayment = account_update("main", 7);
+        let mut borrowed = account_update("main", 7);
+        borrowed.balances[0].liability = 0.01;
+        let error = coordinator
+            .process_feed(FeedOutput::PrivateAccount {
+                account_id: Some("main".to_string()),
+                update: borrowed,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CoordinatorError::AccountStatePolicy { ref message, .. }
+                if message.contains("liability 0.01 is nonzero")
+        ));
+
+        let mut forced_repayment = account_update("main", 8);
         forced_repayment.balances[0].total = 9_000.0;
         forced_repayment.balances[0].forced_repayment_indicator = Some(1);
         let error = coordinator

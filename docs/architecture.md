@@ -235,6 +235,11 @@ Responsibilities:
 - Strict position ownership at the live boundary: spot routing is cash-only,
   and a nonzero position must be a configured derivative owned by the account
   that delivered it. Unmodeled exposure is never passed into strategy/risk.
+- Separate typed OKX economic snapshots retain account borrowing flags,
+  aggregate and per-currency liabilities/interest/borrow-frozen values, and
+  margin-position loan fields. Bootstrap fails closed on missing applicable
+  evidence, enabled borrowing, any nonzero liability, or a margin position;
+  every later normalized account row rejects nonzero liability as well.
 - Typed per-currency forced-repayment indicator from account websocket and REST
   state, checked against the live risk threshold before account state is
   accepted and compared during reconciliation.
@@ -314,13 +319,20 @@ Responsibilities:
   independently replays that cursor chain, leases the canonical journal, and
   binds the collection config identity to the journal bootstrap identity.
   Economic statement reconciliation outside fills and fees remains separate.
+- Collect a self-contained point-in-time account certification from exact
+  authenticated config, balance, and positions responses. Its mode-aware policy
+  requires cash-only spot routing, zero configured borrowing, disabled venue
+  borrowing, complete applicable zero-liability/interest evidence, no margin
+  positions, stable bracketed identity/settings, and bounded exchange time.
+  Offline verification re-hashes and re-parses the embedded evidence.
 - Reduce durable global/account/symbol latches, block halted routes, and
   guarantee scoped canonical cancellation.
 - Promote terminal strategy safety halts into the global risk gate before
   dispatching intents from the triggering event; global cancellation always
   takes precedence over simultaneous symbol isolation.
-- Validate exchange time, expire stale place requests at the venue, and own an
-  independently scheduled exchange deadman lifecycle per account.
+- Validate exchange time, continuously compare authenticated account config to
+  its bootstrap identity/settings, expire stale place requests at the venue,
+  and own an independently scheduled exchange deadman lifecycle per account.
 - Expose a separate minimal-config emergency composition that bypasses strategy,
   journal, websocket, and operator dependencies while cancelling and verifying
   the venue's regular order book account-wide.

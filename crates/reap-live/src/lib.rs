@@ -1,3 +1,4 @@
+mod account_certification;
 mod bootstrap;
 mod config;
 mod convergence;
@@ -12,6 +13,7 @@ mod runtime;
 mod startup;
 mod statement;
 
+pub use account_certification::*;
 pub use bootstrap::*;
 pub use config::*;
 pub use coordinator::*;

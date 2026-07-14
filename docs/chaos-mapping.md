@@ -46,7 +46,7 @@ control plane.
 | Multi-level top/trailing quote targets and Java `Random(1)` sequence | `desired_quote_levels` and `JavaRandom` | Equivalent; optimizer churn differs |
 | Quote debounce, force refresh, and top-level refill delay | Quote target state and fill timestamps | Exact for target decisions |
 | Risk-group soft/hard/stop delta behavior | `RiskGroupState` quote and hedge permissions | Exact |
-| Spot cash, equity, liability, loan, and borrow limits | Account-scoped balance state | Exact |
+| Spot cash, equity, liability, loan, and borrow limits | Account-scoped balance state | Exact decision model; Rust live is intentionally stricter and rejects configured or observed borrowing until interest accounting exists |
 | Signed fill fee/rebate and fee currency | Per-update order `fillFee`, per-fill websocket/REST `fee`, canonical order state, and durable fill records | Equivalent current-wire handling; cumulative legacy order fee is intentionally not charged as one fill |
 | Derivative position and margin capacity | Position and settle-currency account state | Exact |
 | OKX exchange CMR and calculated portfolio margin checks | Separate margin fields and debouncers | Exact |
@@ -69,6 +69,17 @@ control plane.
 | Quote fill becomes an account/position update before hedging | Synthetic update in backtest; private account/position push in live | Equivalent |
 | Maker/taker transaction cost | Per-instrument fill fee with explicit fee-cost and turnover attribution | Equivalent; fee-tier calibration remains operational |
 | `PortfolioExchAcctCalculator.settleSwapFundingAt` linear/inverse formulas | Scheduled funding settlement using latest rate and exchange mark/depth fallback | Exact signed formulas; Rust schedules the advertised exchange timestamp instead of Java's configured time-of-day list |
+
+The borrow decision row is cross-checked specifically against pinned Java
+`ChaosEntity.isWithinBorrowLimit`, `OkEntity.getAvailCoinQty`, and
+`Iarb2Calculator.checkLiability`. Java permits positive configured borrow limits
+and stops only when observed liability exceeds them. Rust keeps that behavior
+inside the shared strategy model for parity research, while `LiveConfig` now
+requires both configured limits to be zero and the OKX bootstrap/certification
+boundary requires borrowing disabled and liabilities zero. The read-only raw
+account certification artifact and periodic authenticated config-drift check
+have no pinned Java counterpart; they are deliberate production-safety
+strengthenings, not claimed strategy parity.
 
 ## Backtest Execution Cross-Check
 

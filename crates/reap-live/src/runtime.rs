@@ -571,16 +571,18 @@ async fn bootstrap_accounts(
             .account_config()
             .await
             .map_err(|error| bootstrap_error(&account.id, "account config", error.to_string()))?;
-        let balance = client
-            .account_balance()
+        let balance_economics = client
+            .account_balance_snapshot()
             .await
             .map_err(|error| bootstrap_error(&account.id, "account balance", error.to_string()))?;
-        let positions = client
-            .account_positions(None, None)
+        let balance = balance_economics.account_update();
+        let position_risks = client
+            .account_positions_snapshot(None, None)
             .await
             .map_err(|error| {
                 bootstrap_error(&account.id, "account positions", error.to_string())
             })?;
+        let positions = position_risks.account_update();
         let (mut open_orders, recent_fills) = gateway
             .fetch_remote_state(None, None, config.runtime.max_fill_reconciliation_pages)
             .await
@@ -662,6 +664,8 @@ async fn bootstrap_accounts(
             AccountBootstrapSnapshot {
                 account_config,
                 instruments,
+                balance_economics,
+                position_risks,
                 balance,
                 positions,
                 open_orders,
@@ -1230,9 +1234,15 @@ impl LiveRuntime {
             }
             let (safety_tx, safety_rx) = mpsc::channel(8);
             safety_senders.insert(account_id.clone(), safety_tx);
+            let expected_account_config = snapshots
+                .get(&account_id)
+                .expect("bootstrap snapshot must exist for every account seed")
+                .account_config
+                .clone();
             safety_tasks.push(tokio::spawn(run_account_safety_task(
                 account_id.clone(),
                 safety_client,
+                expected_account_config,
                 safety_rx,
                 control_tx.clone(),
                 deadman_timeout_secs,
@@ -3432,6 +3442,7 @@ async fn run_order_task(
 async fn run_account_safety_task<T>(
     account_id: String,
     client: OkxRestClient<T>,
+    expected_account_config: reap_venue::okx::OkxAccountConfig,
     mut commands: mpsc::Receiver<SafetyTaskCommand>,
     events: mpsc::Sender<RuntimeEvent>,
     mut deadman_timeout_secs: Option<u64>,
@@ -3487,6 +3498,21 @@ async fn run_account_safety_task<T>(
                     Err(error) => {
                         let _ = events.send(RuntimeEvent::Fatal(format!(
                             "account {account_id} exchange clock check failed: {error}"
+                        ))).await;
+                        return;
+                    }
+                }
+                match client.account_config().await {
+                    Ok(current) if current == expected_account_config => {}
+                    Ok(_) => {
+                        let _ = events.send(RuntimeEvent::Fatal(format!(
+                            "account {account_id} configuration or authenticated identity drifted from bootstrap"
+                        ))).await;
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = events.send(RuntimeEvent::Fatal(format!(
+                            "account {account_id} configuration check failed: {error}"
                         ))).await;
                         return;
                     }
@@ -3900,8 +3926,8 @@ mod tests {
     use reap_storage::start_jsonl_storage;
     use reap_strategy::{ChaosConfig, InstrumentKindConfig};
     use reap_venue::okx::{
-        HttpResponse, OkxAccountLevel, OkxCredentials, OkxInstrumentType, OkxPositionMode,
-        SignedRequest,
+        HttpResponse, OkxAccountConfig, OkxAccountLevel, OkxCredentials, OkxInstrumentType,
+        OkxPositionMode, SignedRequest,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -3994,6 +4020,19 @@ mod tests {
         };
         let signer = OkxSigner::new(OkxCredentials::new("key", "secret", "pass"), true);
         (OkxRestClient::new(transport, signer), requests)
+    }
+
+    fn safety_account_config() -> OkxAccountConfig {
+        OkxAccountConfig {
+            account_level: OkxAccountLevel::SingleCurrencyMargin,
+            position_mode: OkxPositionMode::NetMode,
+            account_stp_mode: "cancel_maker".to_string(),
+            user_id: "7".to_string(),
+            main_user_id: "6".to_string(),
+            enable_spot_borrow: Some(false),
+            auto_loan: Some(false),
+            spot_borrow_auto_repay: Some(false),
+        }
     }
 
     fn status(conn_id: &str, kind: ConnectionStatusKind) -> ConnectionStatus {
@@ -5130,6 +5169,7 @@ mod tests {
         let task = tokio::spawn(run_account_safety_task(
             "main".to_string(),
             client,
+            safety_account_config(),
             command_rx,
             event_tx,
             Some(30),
@@ -5162,6 +5202,7 @@ mod tests {
         let task = tokio::spawn(run_account_safety_task(
             "main".to_string(),
             client,
+            safety_account_config(),
             command_rx,
             event_tx,
             Some(30),
@@ -5181,6 +5222,41 @@ mod tests {
                     && message.contains("injected heartbeat failure")
         ));
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn account_configuration_drift_is_fatal() {
+        let (client, requests) = safety_client(vec![
+            Ok(r#"{"code":"0","msg":"","data":[{"ts":"0"}]}"#),
+            Ok(
+                r#"{"code":"0","msg":"","data":[{"acctLv":"2","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"7","mainUid":"6","enableSpotBorrow":true,"autoLoan":false,"spotBorrowAutoRepay":false}]}"#,
+            ),
+        ]);
+        let (_command_tx, command_rx) = mpsc::channel(2);
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+        let task = tokio::spawn(run_account_safety_task(
+            "main".to_string(),
+            client,
+            safety_account_config(),
+            command_rx,
+            event_tx,
+            None,
+            60_000,
+            1,
+            u64::MAX,
+        ));
+
+        let event = tokio::time::timeout(Duration::from_millis(100), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            RuntimeEvent::Fatal(message)
+                if message.contains("configuration or authenticated identity drifted")
+        ));
+        task.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 2);
     }
 
     #[test]

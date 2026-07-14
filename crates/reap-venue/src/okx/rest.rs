@@ -50,6 +50,55 @@ pub fn parse_okx_fill_page_response_json(body: &[u8]) -> Result<OkxFillPage, Res
     okx_fill_page(response.data)
 }
 
+/// Parses an unmodified OKX account-configuration response.
+pub fn parse_okx_account_config_response_json(body: &[u8]) -> Result<OkxAccountConfig, RestError> {
+    let response: OkxResponse<OkxAccountConfigWire> = decode_okx_response(body)?;
+    response
+        .data
+        .into_iter()
+        .next()
+        .ok_or(RestError::EmptyData {
+            operation: "account config",
+        })?
+        .try_into()
+}
+
+/// Parses an unmodified OKX account-balance response without discarding
+/// borrowing and liability evidence.
+pub fn parse_okx_account_balance_response_json(
+    body: &[u8],
+) -> Result<OkxAccountBalanceSnapshot, RestError> {
+    let response: OkxResponse<OkxAccountBalanceWire> = decode_okx_response(body)?;
+    response
+        .data
+        .into_iter()
+        .next()
+        .ok_or(RestError::EmptyData {
+            operation: "account balance",
+        })?
+        .try_into()
+}
+
+/// Parses an unmodified OKX positions response and retains margin-loan fields.
+pub fn parse_okx_account_positions_response_json(
+    body: &[u8],
+) -> Result<OkxAccountPositionsSnapshot, RestError> {
+    let response: OkxResponse<OkxPositionWire> = decode_okx_response(body)?;
+    let positions = response
+        .data
+        .into_iter()
+        .map(OkxPositionRisk::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(OkxAccountPositionsSnapshot {
+        update_time_ms: positions
+            .iter()
+            .map(|position| position.update_time_ms)
+            .max()
+            .unwrap_or(0),
+        positions,
+    })
+}
+
 fn okx_fill_page(data: Vec<OkxFillWire>) -> Result<OkxFillPage, RestError> {
     if data.len() > OKX_FILLS_PAGE_LIMIT {
         return Err(RestError::InvalidField {
@@ -287,6 +336,135 @@ pub struct OkxAccountConfig {
     pub account_stp_mode: String,
     pub user_id: String,
     pub main_user_id: String,
+    /// OKX Spot-mode borrowing switch. `None` means the exchange omitted it.
+    pub enable_spot_borrow: Option<bool>,
+    /// OKX multi-currency/portfolio automatic borrowing switch.
+    pub auto_loan: Option<bool>,
+    /// OKX Spot-mode automatic repayment switch.
+    pub spot_borrow_auto_repay: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OkxAccountBalanceSnapshot {
+    pub update_time_ms: u64,
+    pub total_equity_usd: Option<f64>,
+    pub adjusted_equity_usd: Option<f64>,
+    pub borrow_frozen_usd: Option<f64>,
+    pub notional_usd_for_borrow: Option<f64>,
+    pub margin_ratio: Option<f64>,
+    pub notional_usd: Option<f64>,
+    pub details: Vec<OkxBalanceDetail>,
+}
+
+impl OkxAccountBalanceSnapshot {
+    pub fn account_update(&self) -> AccountUpdate {
+        let margins = if self.margin_ratio.is_none()
+            && self.adjusted_equity_usd.is_none()
+            && self.notional_usd.is_none()
+        {
+            Vec::new()
+        } else {
+            vec![MarginSnapshot {
+                account_id: None,
+                ratio: None,
+                exchange_ratio: self.margin_ratio,
+                adjusted_equity_usd: self.adjusted_equity_usd,
+                notional_usd: self.notional_usd,
+            }]
+        };
+        AccountUpdate {
+            ts_ms: self.update_time_ms,
+            balances: self
+                .details
+                .iter()
+                .map(|detail| Balance {
+                    account_id: None,
+                    currency: detail.currency.clone(),
+                    total: detail.cash_balance.unwrap_or(0.0),
+                    available: detail.available_balance.unwrap_or(0.0),
+                    equity: detail.equity.unwrap_or(0.0),
+                    liability: detail.liability.unwrap_or(0.0),
+                    max_loan: detail.max_loan.unwrap_or(0.0),
+                    forced_repayment_indicator: detail.forced_repayment_indicator,
+                })
+                .collect(),
+            positions: Vec::new(),
+            margins,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OkxBalanceDetail {
+    pub currency: String,
+    pub update_time_ms: u64,
+    pub cash_balance: Option<f64>,
+    pub available_balance: Option<f64>,
+    pub equity: Option<f64>,
+    pub liability: Option<f64>,
+    pub cross_liability: Option<f64>,
+    pub isolated_liability: Option<f64>,
+    pub unrealized_loss_liability: Option<f64>,
+    pub accrued_interest: Option<f64>,
+    pub borrow_frozen_usd: Option<f64>,
+    pub max_loan: Option<f64>,
+    pub forced_repayment_indicator: Option<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OkxAccountPositionsSnapshot {
+    pub update_time_ms: u64,
+    pub positions: Vec<OkxPositionRisk>,
+}
+
+impl OkxAccountPositionsSnapshot {
+    pub fn account_update(&self) -> AccountUpdate {
+        AccountUpdate {
+            ts_ms: self.update_time_ms,
+            balances: Vec::new(),
+            positions: self
+                .positions
+                .iter()
+                .map(|position| position.position.clone())
+                .collect(),
+            margins: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OkxPositionRisk {
+    pub instrument_type: OkxInstrumentType,
+    pub position: Position,
+    pub update_time_ms: u64,
+    pub liability: Option<f64>,
+    pub accrued_interest: Option<f64>,
+    pub pending_close_order_liability: Option<f64>,
+    pub base_borrowed: Option<f64>,
+    pub base_interest: Option<f64>,
+    pub quote_borrowed: Option<f64>,
+    pub quote_interest: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OkxRawAccountConfig {
+    pub request_path: String,
+    pub response_body: String,
+    pub config: OkxAccountConfig,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OkxRawAccountBalance {
+    pub request_path: String,
+    pub response_body: String,
+    pub snapshot: OkxAccountBalanceSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OkxRawAccountPositions {
+    pub request_path: String,
+    pub response_body: String,
+    pub snapshot: OkxAccountPositionsSnapshot,
 }
 
 impl OkxTradeMode {
@@ -809,18 +987,28 @@ where
     }
 
     pub async fn account_config_at(&self, timestamp: &str) -> Result<OkxAccountConfig, RestError> {
+        Ok(self.account_config_raw_at(timestamp).await?.config)
+    }
+
+    /// Retrieves account configuration while retaining the exact response body.
+    pub async fn account_config_raw(&self) -> Result<OkxRawAccountConfig, RestError> {
+        self.account_config_raw_at(&timestamp_now()).await
+    }
+
+    pub async fn account_config_raw_at(
+        &self,
+        timestamp: &str,
+    ) -> Result<OkxRawAccountConfig, RestError> {
         let request =
             self.signer
                 .sign_request(timestamp, HttpMethod::Get, ACCOUNT_CONFIG_PATH, "")?;
-        let response: OkxResponse<OkxAccountConfigWire> = self.execute(request).await?;
-        response
-            .data
-            .into_iter()
-            .next()
-            .ok_or(RestError::EmptyData {
-                operation: "account config",
-            })?
-            .try_into()
+        let response = self.transport.execute(request).await?;
+        let config = parse_okx_account_config_response_json(response.body.as_bytes())?;
+        Ok(OkxRawAccountConfig {
+            request_path: ACCOUNT_CONFIG_PATH.to_string(),
+            response_body: response.body,
+            config,
+        })
     }
 
     pub async fn account_balance(&self) -> Result<AccountUpdate, RestError> {
@@ -828,18 +1016,42 @@ where
     }
 
     pub async fn account_balance_at(&self, timestamp: &str) -> Result<AccountUpdate, RestError> {
+        Ok(self
+            .account_balance_snapshot_at(timestamp)
+            .await?
+            .account_update())
+    }
+
+    pub async fn account_balance_snapshot(&self) -> Result<OkxAccountBalanceSnapshot, RestError> {
+        self.account_balance_snapshot_at(&timestamp_now()).await
+    }
+
+    pub async fn account_balance_snapshot_at(
+        &self,
+        timestamp: &str,
+    ) -> Result<OkxAccountBalanceSnapshot, RestError> {
+        Ok(self.account_balance_raw_at(timestamp).await?.snapshot)
+    }
+
+    /// Retrieves account balances while retaining the exact response body.
+    pub async fn account_balance_raw(&self) -> Result<OkxRawAccountBalance, RestError> {
+        self.account_balance_raw_at(&timestamp_now()).await
+    }
+
+    pub async fn account_balance_raw_at(
+        &self,
+        timestamp: &str,
+    ) -> Result<OkxRawAccountBalance, RestError> {
         let request =
             self.signer
                 .sign_request(timestamp, HttpMethod::Get, ACCOUNT_BALANCE_PATH, "")?;
-        let response: OkxResponse<OkxAccountBalanceWire> = self.execute(request).await?;
-        response
-            .data
-            .into_iter()
-            .next()
-            .ok_or(RestError::EmptyData {
-                operation: "account balance",
-            })?
-            .try_into()
+        let response = self.transport.execute(request).await?;
+        let snapshot = parse_okx_account_balance_response_json(response.body.as_bytes())?;
+        Ok(OkxRawAccountBalance {
+            request_path: ACCOUNT_BALANCE_PATH.to_string(),
+            response_body: response.body,
+            snapshot,
+        })
     }
 
     pub async fn account_positions(
@@ -857,6 +1069,49 @@ where
         instrument_type: Option<OkxInstrumentType>,
         symbol: Option<&str>,
     ) -> Result<AccountUpdate, RestError> {
+        Ok(self
+            .account_positions_snapshot_at(timestamp, instrument_type, symbol)
+            .await?
+            .account_update())
+    }
+
+    pub async fn account_positions_snapshot(
+        &self,
+        instrument_type: Option<OkxInstrumentType>,
+        symbol: Option<&str>,
+    ) -> Result<OkxAccountPositionsSnapshot, RestError> {
+        self.account_positions_snapshot_at(&timestamp_now(), instrument_type, symbol)
+            .await
+    }
+
+    pub async fn account_positions_snapshot_at(
+        &self,
+        timestamp: &str,
+        instrument_type: Option<OkxInstrumentType>,
+        symbol: Option<&str>,
+    ) -> Result<OkxAccountPositionsSnapshot, RestError> {
+        Ok(self
+            .account_positions_raw_at(timestamp, instrument_type, symbol)
+            .await?
+            .snapshot)
+    }
+
+    /// Retrieves positions while retaining the exact response body.
+    pub async fn account_positions_raw(
+        &self,
+        instrument_type: Option<OkxInstrumentType>,
+        symbol: Option<&str>,
+    ) -> Result<OkxRawAccountPositions, RestError> {
+        self.account_positions_raw_at(&timestamp_now(), instrument_type, symbol)
+            .await
+    }
+
+    pub async fn account_positions_raw_at(
+        &self,
+        timestamp: &str,
+        instrument_type: Option<OkxInstrumentType>,
+        symbol: Option<&str>,
+    ) -> Result<OkxRawAccountPositions, RestError> {
         let path = query_path(
             ACCOUNT_POSITIONS_PATH,
             [
@@ -866,23 +1121,13 @@ where
         );
         let request = self
             .signer
-            .sign_request(timestamp, HttpMethod::Get, path, "")?;
-        let response: OkxResponse<OkxPositionWire> = self.execute(request).await?;
-        let mut ts_ms = 0;
-        let positions = response
-            .data
-            .into_iter()
-            .map(|wire| {
-                let (position_ts_ms, position) = wire.try_into_position()?;
-                ts_ms = ts_ms.max(position_ts_ms);
-                Ok(position)
-            })
-            .collect::<Result<Vec<_>, RestError>>()?;
-        Ok(AccountUpdate {
-            ts_ms,
-            balances: Vec::new(),
-            positions,
-            margins: Vec::new(),
+            .sign_request(timestamp, HttpMethod::Get, path.clone(), "")?;
+        let response = self.transport.execute(request).await?;
+        let snapshot = parse_okx_account_positions_response_json(response.body.as_bytes())?;
+        Ok(OkxRawAccountPositions {
+            request_path: path,
+            response_body: response.body,
+            snapshot,
         })
     }
 
@@ -1147,6 +1392,17 @@ struct OkxResponse<T> {
     data: Vec<T>,
 }
 
+fn decode_okx_response<T: DeserializeOwned>(body: &[u8]) -> Result<OkxResponse<T>, RestError> {
+    let decoded: OkxResponse<T> = serde_json::from_slice(body)?;
+    if decoded.code != "0" {
+        return Err(RestError::Api {
+            code: decoded.code,
+            message: decoded.message,
+        });
+    }
+    Ok(decoded)
+}
+
 #[derive(Debug, Deserialize)]
 struct OkxAckWire {
     #[serde(default, rename = "ordId")]
@@ -1237,6 +1493,12 @@ struct OkxAccountConfigWire {
     uid: String,
     #[serde(default, rename = "mainUid")]
     main_user_id: String,
+    #[serde(default, rename = "enableSpotBorrow")]
+    enable_spot_borrow: Option<bool>,
+    #[serde(default, rename = "autoLoan")]
+    auto_loan: Option<bool>,
+    #[serde(default, rename = "spotBorrowAutoRepay")]
+    spot_borrow_auto_repay: Option<bool>,
 }
 
 impl TryFrom<OkxAccountConfigWire> for OkxAccountConfig {
@@ -1249,6 +1511,9 @@ impl TryFrom<OkxAccountConfigWire> for OkxAccountConfig {
             account_stp_mode: value.account_stp_mode,
             user_id: value.uid,
             main_user_id: value.main_user_id,
+            enable_spot_borrow: value.enable_spot_borrow,
+            auto_loan: value.auto_loan,
+            spot_borrow_auto_repay: value.spot_borrow_auto_repay,
         })
     }
 }
@@ -1257,60 +1522,70 @@ impl TryFrom<OkxAccountConfigWire> for OkxAccountConfig {
 struct OkxAccountBalanceWire {
     #[serde(default, rename = "uTime")]
     update_time: String,
+    #[serde(default, rename = "totalEq")]
+    total_equity: String,
     #[serde(default, rename = "mgnRatio")]
     margin_ratio: String,
     #[serde(default, rename = "adjEq")]
     adjusted_equity: String,
+    #[serde(default, rename = "borrowFroz")]
+    borrow_frozen: String,
+    #[serde(default, rename = "notionalUsdForBorrow")]
+    notional_usd_for_borrow: String,
     #[serde(default, rename = "notionalUsd")]
     notional_usd: String,
     #[serde(default)]
     details: Vec<OkxBalanceWire>,
 }
 
-impl TryFrom<OkxAccountBalanceWire> for AccountUpdate {
+impl TryFrom<OkxAccountBalanceWire> for OkxAccountBalanceSnapshot {
     type Error = RestError;
 
     fn try_from(value: OkxAccountBalanceWire) -> Result<Self, Self::Error> {
-        let exchange_ratio = parse_nullable_number("mgnRatio", &value.margin_ratio)?;
-        let adjusted_equity_usd = parse_nullable_number("adjEq", &value.adjusted_equity)?;
-        let notional_usd = parse_nullable_number("notionalUsd", &value.notional_usd)?;
-        let margins = if exchange_ratio.is_none()
-            && adjusted_equity_usd.is_none()
-            && notional_usd.is_none()
-        {
-            Vec::new()
-        } else {
-            vec![MarginSnapshot {
-                account_id: None,
-                ratio: None,
-                exchange_ratio,
-                adjusted_equity_usd,
-                notional_usd,
-            }]
-        };
-        let balances = value
+        let details = value
             .details
             .into_iter()
             .map(|detail| {
-                Ok(Balance {
-                    account_id: None,
+                Ok(OkxBalanceDetail {
                     currency: detail.currency,
-                    total: parse_optional_number("cashBal", &detail.cash_balance)?,
-                    available: parse_optional_number("availBal", &detail.available_balance)?,
-                    equity: parse_optional_number("eq", &detail.equity)?,
-                    liability: parse_optional_number("liab", &detail.liability)?,
-                    max_loan: parse_optional_number("maxLoan", &detail.max_loan)?,
+                    update_time_ms: parse_optional_integer("uTime", &detail.update_time)?,
+                    cash_balance: parse_nullable_number("cashBal", &detail.cash_balance)?,
+                    available_balance: parse_nullable_number(
+                        "availBal",
+                        &detail.available_balance,
+                    )?,
+                    equity: parse_nullable_number("eq", &detail.equity)?,
+                    liability: parse_nullable_number("liab", &detail.liability)?,
+                    cross_liability: parse_nullable_number("crossLiab", &detail.cross_liability)?,
+                    isolated_liability: parse_nullable_number(
+                        "isoLiab",
+                        &detail.isolated_liability,
+                    )?,
+                    unrealized_loss_liability: parse_nullable_number(
+                        "uplLiab",
+                        &detail.unrealized_loss_liability,
+                    )?,
+                    accrued_interest: parse_nullable_number("interest", &detail.accrued_interest)?,
+                    borrow_frozen_usd: parse_nullable_number("borrowFroz", &detail.borrow_frozen)?,
+                    max_loan: parse_nullable_number("maxLoan", &detail.max_loan)?,
                     forced_repayment_indicator: parse_forced_repayment_indicator(
                         &detail.forced_repayment_indicator,
                     )?,
                 })
             })
             .collect::<Result<Vec<_>, RestError>>()?;
-        Ok(AccountUpdate {
-            ts_ms: parse_optional_integer("uTime", &value.update_time)?,
-            balances,
-            positions: Vec::new(),
-            margins,
+        Ok(OkxAccountBalanceSnapshot {
+            update_time_ms: parse_optional_integer("uTime", &value.update_time)?,
+            total_equity_usd: parse_nullable_number("totalEq", &value.total_equity)?,
+            adjusted_equity_usd: parse_nullable_number("adjEq", &value.adjusted_equity)?,
+            borrow_frozen_usd: parse_nullable_number("borrowFroz", &value.borrow_frozen)?,
+            notional_usd_for_borrow: parse_nullable_number(
+                "notionalUsdForBorrow",
+                &value.notional_usd_for_borrow,
+            )?,
+            margin_ratio: parse_nullable_number("mgnRatio", &value.margin_ratio)?,
+            notional_usd: parse_nullable_number("notionalUsd", &value.notional_usd)?,
+            details,
         })
     }
 }
@@ -1319,6 +1594,8 @@ impl TryFrom<OkxAccountBalanceWire> for AccountUpdate {
 struct OkxBalanceWire {
     #[serde(rename = "ccy")]
     currency: String,
+    #[serde(default, rename = "uTime")]
+    update_time: String,
     #[serde(default, rename = "cashBal")]
     cash_balance: String,
     #[serde(default, rename = "availBal")]
@@ -1327,6 +1604,16 @@ struct OkxBalanceWire {
     equity: String,
     #[serde(default, rename = "liab")]
     liability: String,
+    #[serde(default, rename = "crossLiab")]
+    cross_liability: String,
+    #[serde(default, rename = "isoLiab")]
+    isolated_liability: String,
+    #[serde(default, rename = "uplLiab")]
+    unrealized_loss_liability: String,
+    #[serde(default, rename = "interest")]
+    accrued_interest: String,
+    #[serde(default, rename = "borrowFroz")]
+    borrow_frozen: String,
     #[serde(default, rename = "maxLoan")]
     max_loan: String,
     #[serde(default, rename = "twap")]
@@ -1335,6 +1622,8 @@ struct OkxBalanceWire {
 
 #[derive(Debug, Deserialize)]
 struct OkxPositionWire {
+    #[serde(rename = "instType")]
+    instrument_type: String,
     #[serde(rename = "instId")]
     symbol: String,
     #[serde(rename = "pos")]
@@ -1347,12 +1636,44 @@ struct OkxPositionWire {
     margin_mode: String,
     #[serde(default, rename = "uTime")]
     update_time: String,
+    #[serde(default, rename = "liab")]
+    liability: String,
+    #[serde(default, rename = "interest")]
+    accrued_interest: String,
+    #[serde(default, rename = "pendingCloseOrdLiabVal")]
+    pending_close_order_liability: String,
+    #[serde(default, rename = "baseBorrowed")]
+    base_borrowed: String,
+    #[serde(default, rename = "baseInterest")]
+    base_interest: String,
+    #[serde(default, rename = "quoteBorrowed")]
+    quote_borrowed: String,
+    #[serde(default, rename = "quoteInterest")]
+    quote_interest: String,
 }
 
-impl OkxPositionWire {
-    fn try_into_position(self) -> Result<(u64, Position), RestError> {
-        let mut qty = parse_number("pos", &self.qty)?;
-        match self.position_side.as_str() {
+impl TryFrom<OkxPositionWire> for OkxPositionRisk {
+    type Error = RestError;
+
+    fn try_from(value: OkxPositionWire) -> Result<Self, Self::Error> {
+        let OkxPositionWire {
+            instrument_type,
+            symbol,
+            qty,
+            average_price,
+            position_side,
+            margin_mode,
+            update_time,
+            liability,
+            accrued_interest,
+            pending_close_order_liability,
+            base_borrowed,
+            base_interest,
+            quote_borrowed,
+            quote_interest,
+        } = value;
+        let mut qty = parse_number("pos", &qty)?;
+        match position_side.as_str() {
             "" | "net" | "long" => {}
             "short" => qty = -qty.abs(),
             other => {
@@ -1363,15 +1684,26 @@ impl OkxPositionWire {
                 });
             }
         }
-        Ok((
-            parse_optional_integer("uTime", &self.update_time)?,
-            Position {
-                symbol: self.symbol,
+        Ok(Self {
+            instrument_type: parse_instrument_type(&instrument_type)?,
+            position: Position {
+                symbol,
                 qty,
-                avg_price: parse_optional_number("avgPx", &self.average_price)?,
-                margin_mode: Some(parse_position_margin_mode(&self.margin_mode)?),
+                avg_price: parse_optional_number("avgPx", &average_price)?,
+                margin_mode: Some(parse_position_margin_mode(&margin_mode)?),
             },
-        ))
+            update_time_ms: parse_optional_integer("uTime", &update_time)?,
+            liability: parse_nullable_number("liab", &liability)?,
+            accrued_interest: parse_nullable_number("interest", &accrued_interest)?,
+            pending_close_order_liability: parse_nullable_number(
+                "pendingCloseOrdLiabVal",
+                &pending_close_order_liability,
+            )?,
+            base_borrowed: parse_nullable_number("baseBorrowed", &base_borrowed)?,
+            base_interest: parse_nullable_number("baseInterest", &base_interest)?,
+            quote_borrowed: parse_nullable_number("quoteBorrowed", &quote_borrowed)?,
+            quote_interest: parse_nullable_number("quoteInterest", &quote_interest)?,
+        })
     }
 }
 
@@ -2106,9 +2438,9 @@ mod tests {
     async fn parses_signed_bootstrap_metadata_and_account_state() {
         let (client, requests) = client(vec![
             r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","instType":"SWAP","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"USDT","ctType":"linear","ctVal":"0.01","ctValCcy":"BTC","tickSz":"0.1","lotSz":"1","minSz":"1","state":"live"}]}"#,
-            r#"{"code":"0","msg":"","data":[{"acctLv":"2","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"7","mainUid":"6"}]}"#,
-            r#"{"code":"0","msg":"","data":[{"uTime":"1000","mgnRatio":"12.5","adjEq":"10000","notionalUsd":"2000","details":[{"ccy":"USDT","cashBal":"9000","availBal":"8000","eq":"10000","liab":"0","maxLoan":"500","twap":"2"}]}]}"#,
-            r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","pos":"2","posSide":"net","mgnMode":"cross","avgPx":"50000","uTime":"1001"}]}"#,
+            r#"{"code":"0","msg":"","data":[{"acctLv":"2","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"7","mainUid":"6","enableSpotBorrow":false,"autoLoan":false,"spotBorrowAutoRepay":false}]}"#,
+            r#"{"code":"0","msg":"","data":[{"uTime":"1000","totalEq":"11000","mgnRatio":"12.5","adjEq":"10000","borrowFroz":"0","notionalUsdForBorrow":"0","notionalUsd":"2000","details":[{"ccy":"USDT","uTime":"999","cashBal":"9000","availBal":"8000","eq":"10000","liab":"0","crossLiab":"0","isoLiab":"0","uplLiab":"0","interest":"0","borrowFroz":"0","maxLoan":"500","twap":"2"}]}]}"#,
+            r#"{"code":"0","msg":"","data":[{"instType":"SWAP","instId":"BTC-USDT-SWAP","pos":"2","posSide":"net","mgnMode":"cross","avgPx":"50000","uTime":"1001","liab":"","interest":""}]}"#,
         ]);
 
         let instruments = client
@@ -2126,6 +2458,7 @@ mod tests {
         assert_eq!(instruments[0].contract_value, Some(0.01));
         assert_eq!(account.account_level, OkxAccountLevel::SingleCurrencyMargin);
         assert_eq!(account.position_mode, OkxPositionMode::NetMode);
+        assert_eq!(account.enable_spot_borrow, Some(false));
         assert_eq!(balance.balances[0].available, 8000.0);
         assert_eq!(balance.balances[0].forced_repayment_indicator, Some(2));
         assert_eq!(balance.margins[0].exchange_ratio, Some(12.5));
@@ -2165,10 +2498,41 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn offline_account_parsers_preserve_borrowing_evidence() {
+        let account = parse_okx_account_config_response_json(
+            br#"{"code":"0","msg":"","data":[{"acctLv":"1","posMode":"net_mode","uid":"7","mainUid":"6","enableSpotBorrow":false,"autoLoan":false,"spotBorrowAutoRepay":true}]}"#,
+        )
+        .unwrap();
+        assert_eq!(account.enable_spot_borrow, Some(false));
+        assert_eq!(account.auto_loan, Some(false));
+        assert_eq!(account.spot_borrow_auto_repay, Some(true));
+
+        let balance = parse_okx_account_balance_response_json(
+            br#"{"code":"0","msg":"","data":[{"uTime":"1000","totalEq":"100","adjEq":"99","borrowFroz":"2","notionalUsdForBorrow":"3","details":[{"ccy":"USDT","uTime":"999","cashBal":"100","availBal":"90","eq":"99","liab":"1","crossLiab":"0.5","isoLiab":"0.25","uplLiab":"0.1","interest":"0.01","borrowFroz":"2","maxLoan":"50","twap":"1"}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(balance.borrow_frozen_usd, Some(2.0));
+        assert_eq!(balance.notional_usd_for_borrow, Some(3.0));
+        assert_eq!(balance.details[0].liability, Some(1.0));
+        assert_eq!(balance.details[0].accrued_interest, Some(0.01));
+
+        let positions = parse_okx_account_positions_response_json(
+            br#"{"code":"0","msg":"","data":[{"instType":"MARGIN","instId":"BTC-USDT","pos":"1","posSide":"net","mgnMode":"cross","uTime":"1001","liab":"20","interest":"0.02","pendingCloseOrdLiabVal":"1","baseBorrowed":"0","baseInterest":"0","quoteBorrowed":"20","quoteInterest":"0.02"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            positions.positions[0].instrument_type,
+            OkxInstrumentType::Margin
+        );
+        assert_eq!(positions.positions[0].liability, Some(20.0));
+        assert_eq!(positions.positions[0].quote_interest, Some(0.02));
+    }
+
     #[tokio::test]
     async fn rejects_unsupported_position_margin_mode() {
         let (client, _) = client(vec![
-            r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","pos":"2","posSide":"net","mgnMode":"portfolio","uTime":"1001"}]}"#,
+            r#"{"code":"0","msg":"","data":[{"instType":"SWAP","instId":"BTC-USDT-SWAP","pos":"2","posSide":"net","mgnMode":"portfolio","uTime":"1001"}]}"#,
         ]);
 
         let error = client

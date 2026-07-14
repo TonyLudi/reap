@@ -597,6 +597,12 @@ impl LiveConfig {
         };
         let mut errors = Vec::new();
         for balance in &update.balances {
+            if balance.liability != 0.0 {
+                errors.push(format!(
+                    "currency {} liability {} is nonzero; live borrowing is unsupported",
+                    balance.currency, balance.liability
+                ));
+            }
             if let Some(indicator) = balance.forced_repayment_indicator
                 && indicator >= self.risk.forced_repayment_indicator_limit
             {
@@ -700,6 +706,16 @@ fn validate_live_strategy_topology(config: &LiveConfig, errors: &mut Vec<String>
             "strategy.strategy_group is not supported by the live runtime because external group PnL and state updates are not implemented"
                 .to_string(),
         );
+    }
+    for group in &config.strategy.risk_groups {
+        for coin in &group.coins {
+            if coin.borrow_limit_usd != 0.0 || coin.borrow_limit_coin != 0.0 {
+                errors.push(format!(
+                    "risk group {} currency {} must set borrow_limit_usd and borrow_limit_coin to zero; live borrowing and interest accounting are unsupported",
+                    group.name, coin.currency
+                ));
+            }
+        }
     }
 }
 
@@ -906,6 +922,17 @@ fn validate_positive_runtime(runtime: &RuntimeConfig, errors: &mut Vec<String>) 
     {
         errors.push(
             "runtime.cancel_all_after_heartbeat_ms must be shorter than the exchange timeout"
+                .to_string(),
+        );
+    }
+    if runtime
+        .rest_request_timeout_ms
+        .saturating_mul(2)
+        .saturating_add(runtime.cancel_all_after_heartbeat_ms)
+        >= runtime.cancel_all_after_timeout_secs.saturating_mul(1_000)
+    {
+        errors.push(
+            "runtime deadman timeout must cover two periodic safety REST timeouts plus one heartbeat interval"
                 .to_string(),
         );
     }
@@ -1166,6 +1193,24 @@ mod tests {
     }
 
     #[test]
+    fn live_config_rejects_nonzero_borrow_limits() {
+        let mut config = valid_config();
+        config.strategy.risk_groups[0].coins = vec![reap_strategy::CoinConfig {
+            currency: "USDT".to_string(),
+            borrow_limit_usd: 100.0,
+            borrow_limit_coin: 100.0,
+            ..reap_strategy::CoinConfig::default()
+        }];
+
+        let report = config.validate();
+
+        assert!(!report.valid);
+        assert!(report.errors.iter().any(|error| {
+            error.contains("must set borrow_limit_usd and borrow_limit_coin to zero")
+        }));
+    }
+
+    #[test]
     fn enabled_operator_service_requires_bounded_distinct_configuration() {
         assert!(
             OperatorConfig::default()
@@ -1215,6 +1260,21 @@ mod tests {
                 "max_exchange_clock_skew_ms must be shorter than order_request_expiry_ms"
             ))
         );
+    }
+
+    #[test]
+    fn periodic_safety_checks_must_fit_inside_deadman_horizon() {
+        let mut config = valid_config();
+        config.runtime.rest_request_timeout_ms = 15_000;
+
+        let report = config.validate();
+
+        assert!(!report.valid);
+        assert!(report.errors.iter().any(|error| {
+            error.contains(
+                "deadman timeout must cover two periodic safety REST timeouts plus one heartbeat",
+            )
+        }));
     }
 
     #[test]

@@ -559,7 +559,7 @@ mod tests {
         };
         let positions = HttpResponse {
             status: 200,
-            body: r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","pos":"2","avgPx":"50000","posSide":"net","mgnMode":"cross","uTime":"101"}]}"#.to_string(),
+            body: r#"{"code":"0","msg":"","data":[{"instType":"SWAP","instId":"BTC-USDT-SWAP","pos":"2","avgPx":"50000","posSide":"net","mgnMode":"cross","uTime":"101"}]}"#.to_string(),
         };
         let (mut gateway, calls) = gateway(vec![Ok(balance), Ok(positions)]);
 

@@ -4,7 +4,10 @@ use std::fmt;
 use reap_core::{AccountUpdate, FillKey};
 use reap_risk::InstrumentRiskModel;
 use reap_strategy::{InstrumentConfig, InstrumentKindConfig};
-use reap_venue::okx::{OkxAccountConfig, OkxContractType, OkxInstrument, OkxInstrumentType};
+use reap_venue::okx::{
+    OkxAccountBalanceSnapshot, OkxAccountConfig, OkxAccountPositionsSnapshot, OkxContractType,
+    OkxInstrument, OkxInstrumentType,
+};
 use reap_venue::{RemoteFill, RemoteOrder};
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +17,8 @@ use crate::{LiveConfig, OkxTradeModeConfig};
 pub struct AccountBootstrapSnapshot {
     pub account_config: OkxAccountConfig,
     pub instruments: HashMap<String, OkxInstrument>,
+    pub balance_economics: OkxAccountBalanceSnapshot,
+    pub position_risks: OkxAccountPositionsSnapshot,
     pub balance: AccountUpdate,
     pub positions: AccountUpdate,
     pub open_orders: Vec<RemoteOrder>,
@@ -117,6 +122,19 @@ pub fn verify_bootstrap(
                 account.id
             ));
         }
+        let cash_policy = crate::evaluate_account_cash_policy(
+            config,
+            &account.id,
+            &snapshot.account_config,
+            &snapshot.balance_economics,
+            &snapshot.position_risks,
+        );
+        errors.extend(
+            cash_policy
+                .violations
+                .into_iter()
+                .map(|error| format!("account {} cash policy violation: {error}", account.id)),
+        );
         let account_update = snapshot.scoped_account_update(&account.id);
         errors.extend(
             config
@@ -370,7 +388,10 @@ mod tests {
     use reap_core::{Balance, MarginSnapshot, Position, PositionMarginMode};
     use reap_risk::RiskLimits;
     use reap_strategy::ChaosConfig;
-    use reap_venue::okx::{OkxAccountLevel, OkxPositionMode};
+    use reap_venue::okx::{
+        OkxAccountBalanceSnapshot, OkxAccountLevel, OkxAccountPositionsSnapshot, OkxBalanceDetail,
+        OkxPositionMode,
+    };
 
     use crate::{
         LiveAccountConfig, LiveStorageConfig, OkxTradeModeConfig, OkxVenueConfig, RuntimeConfig,
@@ -423,6 +444,9 @@ mod tests {
                 account_stp_mode: "cancel_maker".to_string(),
                 user_id: "7".to_string(),
                 main_user_id: "6".to_string(),
+                enable_spot_borrow: Some(false),
+                auto_loan: Some(false),
+                spot_borrow_auto_repay: Some(false),
             },
             instruments: HashMap::from([
                 (
@@ -464,6 +488,34 @@ mod tests {
                     },
                 ),
             ]),
+            balance_economics: OkxAccountBalanceSnapshot {
+                update_time_ms: 1,
+                total_equity_usd: Some(10_000.0),
+                adjusted_equity_usd: Some(10_000.0),
+                borrow_frozen_usd: None,
+                notional_usd_for_borrow: None,
+                margin_ratio: Some(10.0),
+                notional_usd: Some(0.0),
+                details: vec![OkxBalanceDetail {
+                    currency: "USDT".to_string(),
+                    update_time_ms: 1,
+                    cash_balance: Some(10_000.0),
+                    available_balance: Some(9_000.0),
+                    equity: Some(10_000.0),
+                    liability: None,
+                    cross_liability: None,
+                    isolated_liability: None,
+                    unrealized_loss_liability: None,
+                    accrued_interest: None,
+                    borrow_frozen_usd: None,
+                    max_loan: None,
+                    forced_repayment_indicator: None,
+                }],
+            },
+            position_risks: OkxAccountPositionsSnapshot {
+                update_time_ms: 1,
+                positions: Vec::new(),
+            },
             balance: AccountUpdate {
                 ts_ms: 1,
                 balances: vec![Balance {
@@ -528,6 +580,19 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("stable OKX user identity"));
+    }
+
+    #[test]
+    fn rejects_nonzero_economic_liability_before_live_startup() {
+        let config = config();
+        let mut snapshot = snapshot();
+        snapshot.balance_economics.details[0].liability = Some(0.01);
+
+        let error = verify_bootstrap(&config, &HashMap::from([("main".to_string(), snapshot)]))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("cash policy violation"));
+        assert!(error.to_string().contains("liab is nonzero"));
     }
 
     #[test]

@@ -279,6 +279,56 @@ pages, live report, journal hash, and account export. Funding, balances,
 positions, cash/equity, liabilities, borrowing, taxes, conversion, and PnL must
 still be reconciled separately before trusting production economics.
 
+### Account Cash And Liability Certification
+
+Before the first credentialed observe/demo session, after any account-setting
+change, and immediately before a production approval review, collect and then
+independently verify current account state. Quiesce every order producer and
+account-setting change for the collection window; the authenticated GETs are
+bounded and bracketed, but they are not an atomic exchange snapshot.
+
+```bash
+ARTIFACT="var/reap/evidence/account-main-$(date -u +%Y%m%dT%H%M%SZ).json"
+cargo run -p reap-cli -- certify-account \
+  --config examples/live-okx-demo.toml \
+  --account main \
+  --output "$ARTIFACT" \
+  --pretty
+
+cargo run -p reap-cli -- verify-account-certification \
+  --artifact "$ARTIFACT" \
+  --require-pass \
+  --pretty
+```
+
+`certify-account` uses only public-time and authenticated read-only account
+configuration, balance, and positions GETs. It reserves the output before
+credentials or network access, writes it create-new with Unix mode `0600`, and
+fsyncs both file and parent directory. The CLI prints only a redacted summary;
+the artifact embeds the exact bounded responses and exact live TOML, so treat it
+as sensitive account evidence and never publish it in logs or source control.
+
+The schema-1 verifier needs no credentials. It checks the pinned Java revision,
+re-hashes the embedded config and responses, re-derives the account identity
+hash and policy, and checks endpoint/response bounds, exchange-clock skew, the
+maximum 30-second collection span, bracketed UID/main-UID and settings stability,
+configured account/position modes, cash-only spot routing, zero strategy borrow
+limits, and mode-aware OKX economics. Collector binary and host hashes are
+recorded provenance identifiers; the self-contained artifact cannot
+independently authenticate them. Spot mode requires explicit
+`enableSpotBorrow = false`; multi-currency and portfolio modes require explicit
+`autoLoan = false`. Any enabled borrowing flag, missing applicable liability
+evidence, nonzero `borrowFroz`, `notionalUsdForBorrow`, `liab`, `crossLiab`,
+`isoLiab`, `uplLiab`, or `interest`, or any returned OKX `MARGIN` position makes
+the policy fail. Documented Futures-mode inapplicable empty fields do not fail
+solely for being absent.
+
+This is deliberately point-in-time proof. It does not establish historical
+absence of loans, reconcile borrow/repay or accrued-interest history, or replace
+cash, position, funding, PnL, deposit/withdrawal, tax, and statement
+reconciliation. Archive a passing artifact as one production gate input, not as
+complete economic certification.
+
 ### Walk-Forward And Sensitivity Research
 
 Verify the manifest-to-report path without claiming profitability:
@@ -468,11 +518,13 @@ outside source control.
 5. It compares midpoint-adjusted local time with OKX `/api/v5/public/time` and
    fails bootstrap when skew exceeds `max_exchange_clock_skew_ms`.
 6. The runtime fetches account-scoped instruments, account configuration,
-   balances, positions, open orders, recent fills, and exact status for any
-   restored active order.
+   full economic balances, positions including margin-loan fields, open orders,
+   recent fills, and exact status for any restored active order.
 7. It verifies live instrument state, type, linear/inverse contract type,
    tick/lot/minimum size, contract value, currencies, configured trade mode,
-   account level, and `net_mode` before metadata is ready.
+   account level, `net_mode`, disabled mode-appropriate borrowing, complete
+   applicable zero-liability/interest evidence, and absence of margin positions
+   before metadata is ready.
 8. It restores canonical active orders, fill identities, and active global,
    account, and symbol safety latches from JSONL. It applies missed known
    fills/terminal updates from REST, applies the authoritative account snapshot
@@ -532,6 +584,14 @@ settings; accepting only their static flags would weaken live stop behavior.
   fills-channel event does not consume the canonical journal key before the
   fee-bearing orders-channel event arrives. An empty balance response is
   rejected as non-authoritative; an empty position list is a valid flat account.
+- The bootstrap economic snapshot is stricter than the normalized strategy
+  update. It retains applicable aggregate/per-currency borrowing and interest
+  fields and margin-position loan fields, then applies the same mode-aware cash
+  policy used by `certify-account`. A violation prevents live task startup.
+- Every later normalized websocket or REST balance update rejects any nonzero
+  liability before state application. This protects the running process even
+  though the hot strategy event intentionally carries fewer economic fields
+  than the certification artifact.
 - The runtime compares the websocket-derived state before applying REST. Any
   order, fill, balance-field, position-quantity, or open-position average-price
   difference emits account-scoped reconciliation drift and cancels live orders.
@@ -929,6 +989,13 @@ replacement for exchange-side account limits and operator access controls.
 
 - Bootstrap and a dedicated per-account safety task compare local time with the
   OKX public time endpoint. Excess skew or a failed periodic check is fatal.
+- After each successful periodic clock check, the safety task fetches
+  authenticated account configuration and compares the typed identity, account
+  and position modes, STP setting, and borrowing flags to bootstrap. Any drift
+  or failed check is fatal and enters normal fail-closed cleanup.
+- Validation requires the exchange deadman horizon to exceed two complete REST
+  request timeouts plus one heartbeat interval, so a delayed clock/config check
+  cannot consume the last armed Cancel All After window.
 - In demo mode the safety task refreshes Cancel All After independently of the
   order queue and strategy loop. `cancel_all_after_heartbeat_ms` must respect the
   endpoint rate limit and remain below `cancel_all_after_timeout_secs`.
