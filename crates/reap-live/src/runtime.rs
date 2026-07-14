@@ -31,7 +31,8 @@ use reap_telemetry::{
     AlertStats, start_webhook_alerts,
 };
 use reap_venue::okx::{
-    HttpTransport, OkxAdapter, OkxRestClient, OkxSigner, ReqwestTransport, RestError,
+    HttpTransport, OkxAdapter, OkxRestClient, OkxSigner, OkxSystemEnvironment,
+    OkxSystemServiceType, OkxSystemStatus, OkxSystemStatusState, ReqwestTransport, RestError,
 };
 use reap_venue::{PrivateOrderState, PrivateOrderUpdate, RemoteFill, RemoteOrder, VenueAdapter};
 use serde::{Deserialize, Serialize};
@@ -220,6 +221,10 @@ pub enum LiveRuntimeError {
     ExchangeClockSkew(String),
     #[error("exchange clock check failed: {0}")]
     ExchangeClockCheck(String),
+    #[error("OKX exchange status blocks strategy operation: {0}")]
+    ExchangeStatus(String),
+    #[error("OKX exchange status check failed: {0}")]
+    ExchangeStatusCheck(String),
     #[error("authenticated account configuration drifted: {0}")]
     AccountConfigDrift(String),
     #[error("authenticated account configuration check failed: {0}")]
@@ -287,6 +292,8 @@ impl LiveRuntimeError {
             Self::DeadmanHeartbeat(_) => "deadman_heartbeat",
             Self::ExchangeClockSkew(_) => "exchange_clock_skew",
             Self::ExchangeClockCheck(_) => "exchange_clock_check",
+            Self::ExchangeStatus(_) => "exchange_status",
+            Self::ExchangeStatusCheck(_) => "exchange_status_check",
             Self::AccountConfigDrift(_) => "account_config_drift",
             Self::AccountConfigCheck(_) => "account_config_check",
             Self::SafetyLatchSyncTimeout(_) => "safety_latch_sync_timeout",
@@ -634,6 +641,14 @@ struct AccountSeed {
     safety_client: OkxRestClient<ReqwestTransport>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ExchangeStatusGuard {
+    enabled: bool,
+    environment: TradingEnvironment,
+    check_interval_ms: u64,
+    lead_ms: u64,
+}
+
 async fn bootstrap_accounts(
     config: &LiveConfig,
     restored_orders: &HashMap<String, Vec<reap_core::OrderUpdate>>,
@@ -690,6 +705,20 @@ async fn bootstrap_accounts(
                     config.runtime.max_exchange_clock_skew_ms
                 ),
             ));
+        }
+        if seeds.is_empty() {
+            let statuses = client
+                .system_status()
+                .await
+                .map_err(|error| LiveRuntimeError::ExchangeStatusCheck(error.to_string()))?;
+            if let Some(reason) = exchange_status_block_reason(
+                &statuses,
+                config.venue.environment,
+                unix_time_ms(),
+                config.runtime.exchange_status_lead_ms,
+            ) {
+                return Err(LiveRuntimeError::ExchangeStatus(reason));
+            }
         }
         let safety_client = client.clone();
         let account_config = client
@@ -818,6 +847,51 @@ where
     let after_ms = unix_time_ms();
     let midpoint_ms = before_ms.saturating_add(after_ms.saturating_sub(before_ms) / 2);
     Ok(midpoint_ms.abs_diff(exchange_ms))
+}
+
+fn exchange_status_block_reason(
+    statuses: &[OkxSystemStatus],
+    environment: TradingEnvironment,
+    now_ms: u64,
+    lead_ms: u64,
+) -> Option<String> {
+    let expected_environment = match environment {
+        TradingEnvironment::Demo => OkxSystemEnvironment::Demo,
+        TradingEnvironment::Production => OkxSystemEnvironment::Production,
+    };
+    statuses.iter().find_map(|status| {
+        let java_relevant_service = matches!(
+            status.service_type,
+            OkxSystemServiceType::Trading
+                | OkxSystemServiceType::TradingAccounts
+                | OkxSystemServiceType::TradingProducts
+                | OkxSystemServiceType::SpreadTrading
+                | OkxSystemServiceType::Other
+        );
+        let inside_guard_window = match status.state {
+            OkxSystemStatusState::Scheduled => {
+                status.begin_time_ms <= now_ms.saturating_add(lead_ms)
+            }
+            OkxSystemStatusState::Ongoing | OkxSystemStatusState::PreOpen => true,
+            OkxSystemStatusState::Completed | OkxSystemStatusState::Canceled => false,
+        };
+        (status.system.eq_ignore_ascii_case("unified")
+            && status.environment == expected_environment
+            && java_relevant_service
+            && inside_guard_window)
+            .then(|| {
+                format!(
+                    "{:?} {:?} maintenance {:?} from {} to {} ({}ms lead): {}",
+                    status.environment,
+                    status.service_type,
+                    status.state,
+                    status.begin_time_ms,
+                    status.end_time_ms,
+                    lead_ms,
+                    status.title.trim()
+                )
+            })
+    })
 }
 
 fn bootstrap_error(account_id: &str, operation: &str, message: String) -> LiveRuntimeError {
@@ -1368,7 +1442,7 @@ impl LiveRuntime {
         let mut order_ws_status_tasks = Vec::new();
         let mut safety_senders = HashMap::new();
         let mut safety_tasks = Vec::new();
-        for seed in seeds {
+        for (seed_index, seed) in seeds.into_iter().enumerate() {
             let AccountSeed {
                 account_id,
                 signer,
@@ -1403,6 +1477,12 @@ impl LiveRuntime {
                 config.runtime.cancel_all_after_heartbeat_ms,
                 config.runtime.exchange_clock_check_interval_ms,
                 config.runtime.max_exchange_clock_skew_ms,
+                ExchangeStatusGuard {
+                    enabled: seed_index == 0,
+                    environment: config.venue.environment,
+                    check_interval_ms: config.runtime.exchange_status_check_interval_ms,
+                    lead_ms: config.runtime.exchange_status_lead_ms,
+                },
             )));
             let private_adapter: Arc<dyn VenueAdapter> = Arc::new(
                 OkxAdapter::new(&config.venue.public_ws_url, &config.venue.private_ws_url)
@@ -3460,6 +3540,8 @@ enum RuntimeTaskFailure {
     DeadmanHeartbeat(String),
     ExchangeClockSkew(String),
     ExchangeClockCheck(String),
+    ExchangeStatus(String),
+    ExchangeStatusCheck(String),
     AccountConfigDrift(String),
     AccountConfigCheck(String),
 }
@@ -3471,6 +3553,8 @@ impl From<RuntimeTaskFailure> for LiveRuntimeError {
             RuntimeTaskFailure::DeadmanHeartbeat(message) => Self::DeadmanHeartbeat(message),
             RuntimeTaskFailure::ExchangeClockSkew(message) => Self::ExchangeClockSkew(message),
             RuntimeTaskFailure::ExchangeClockCheck(message) => Self::ExchangeClockCheck(message),
+            RuntimeTaskFailure::ExchangeStatus(message) => Self::ExchangeStatus(message),
+            RuntimeTaskFailure::ExchangeStatusCheck(message) => Self::ExchangeStatusCheck(message),
             RuntimeTaskFailure::AccountConfigDrift(message) => Self::AccountConfigDrift(message),
             RuntimeTaskFailure::AccountConfigCheck(message) => Self::AccountConfigCheck(message),
         }
@@ -3956,6 +4040,7 @@ async fn run_account_safety_task<T>(
     deadman_heartbeat_ms: u64,
     clock_check_interval_ms: u64,
     max_clock_skew_ms: u64,
+    exchange_status_guard: ExchangeStatusGuard,
 ) where
     T: HttpTransport + 'static,
 {
@@ -3965,6 +4050,11 @@ async fn run_account_safety_task<T>(
     let mut clock = tokio::time::interval(Duration::from_millis(clock_check_interval_ms));
     clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     clock.tick().await;
+    let mut exchange_status = tokio::time::interval(Duration::from_millis(
+        exchange_status_guard.check_interval_ms,
+    ));
+    exchange_status.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    exchange_status.tick().await;
 
     loop {
         tokio::select! {
@@ -4033,6 +4123,31 @@ async fn run_account_safety_task<T>(
                         let _ = events
                             .send(RuntimeEvent::Fatal(RuntimeTaskFailure::AccountConfigCheck(
                                 format!("account {account_id}: {error}"),
+                            )))
+                            .await;
+                        return;
+                    }
+                }
+            }
+            _ = exchange_status.tick(), if exchange_status_guard.enabled => {
+                match client.system_status().await {
+                    Ok(statuses) => {
+                        if let Some(reason) = exchange_status_block_reason(
+                            &statuses,
+                            exchange_status_guard.environment,
+                            unix_time_ms(),
+                            exchange_status_guard.lead_ms,
+                        ) {
+                            let _ = events
+                                .send(RuntimeEvent::Fatal(RuntimeTaskFailure::ExchangeStatus(reason)))
+                                .await;
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = events
+                            .send(RuntimeEvent::Fatal(RuntimeTaskFailure::ExchangeStatusCheck(
+                                error.to_string(),
                             )))
                             .await;
                         return;
@@ -4836,6 +4951,14 @@ mod tests {
             "exchange_clock_check"
         );
         assert_eq!(
+            live_failure_evidence(&LiveRuntimeError::ExchangeStatus("test".to_string())).code,
+            "exchange_status"
+        );
+        assert_eq!(
+            live_failure_evidence(&LiveRuntimeError::ExchangeStatusCheck("test".to_string())).code,
+            "exchange_status_check"
+        );
+        assert_eq!(
             live_failure_evidence(&LiveRuntimeError::AccountConfigDrift("test".to_string())).code,
             "account_config_drift"
         );
@@ -4916,6 +5039,15 @@ mod tests {
             enable_spot_borrow: Some(false),
             auto_loan: Some(false),
             spot_borrow_auto_repay: Some(false),
+        }
+    }
+
+    fn exchange_status_guard(enabled: bool, check_interval_ms: u64) -> ExchangeStatusGuard {
+        ExchangeStatusGuard {
+            enabled,
+            environment: TradingEnvironment::Demo,
+            check_interval_ms,
+            lead_ms: 60_000,
         }
     }
 
@@ -6179,6 +6311,7 @@ mod tests {
             60_000,
             60_000,
             1_000,
+            exchange_status_guard(false, 60_000),
         ));
         let (result_tx, result_rx) = oneshot::channel();
         command_tx
@@ -6212,6 +6345,7 @@ mod tests {
             1,
             60_000,
             1_000,
+            exchange_status_guard(false, 60_000),
         ));
 
         let event = tokio::time::timeout(Duration::from_millis(100), event_rx.recv())
@@ -6242,6 +6376,7 @@ mod tests {
             60_000,
             1,
             1,
+            exchange_status_guard(false, 60_000),
         ));
 
         let event = tokio::time::timeout(Duration::from_millis(100), event_rx.recv())
@@ -6277,6 +6412,7 @@ mod tests {
             60_000,
             1,
             u64::MAX,
+            exchange_status_guard(false, 60_000),
         ));
 
         let event = tokio::time::timeout(Duration::from_millis(100), event_rx.recv())
@@ -6290,6 +6426,141 @@ mod tests {
         ));
         task.await.unwrap();
         assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn exchange_status_guard_matches_java_service_scope_and_environment() {
+        let status = |service_type, environment, state, begin_time_ms| OkxSystemStatus {
+            title: "maintenance".to_string(),
+            description: String::new(),
+            state,
+            begin_time_ms,
+            end_time_ms: begin_time_ms.saturating_add(60_000),
+            pre_open_begin_time_ms: None,
+            service_type,
+            maintenance_type: reap_venue::okx::OkxSystemMaintenanceType::Scheduled,
+            environment,
+            system: "unified".to_string(),
+        };
+        let now_ms = 1_000_000;
+        let lead_ms = 60_000;
+
+        let trading = status(
+            OkxSystemServiceType::Trading,
+            OkxSystemEnvironment::Demo,
+            OkxSystemStatusState::Scheduled,
+            now_ms + lead_ms,
+        );
+        assert!(
+            exchange_status_block_reason(&[trading], TradingEnvironment::Demo, now_ms, lead_ms)
+                .is_some()
+        );
+
+        let too_early = status(
+            OkxSystemServiceType::TradingAccounts,
+            OkxSystemEnvironment::Demo,
+            OkxSystemStatusState::Scheduled,
+            now_ms + lead_ms + 1,
+        );
+        assert!(
+            exchange_status_block_reason(&[too_early], TradingEnvironment::Demo, now_ms, lead_ms)
+                .is_none()
+        );
+
+        let copy_trading = status(
+            OkxSystemServiceType::CopyTrading,
+            OkxSystemEnvironment::Demo,
+            OkxSystemStatusState::Ongoing,
+            1,
+        );
+        let production = status(
+            OkxSystemServiceType::Trading,
+            OkxSystemEnvironment::Production,
+            OkxSystemStatusState::Ongoing,
+            1,
+        );
+        let completed = status(
+            OkxSystemServiceType::TradingProducts,
+            OkxSystemEnvironment::Demo,
+            OkxSystemStatusState::Completed,
+            1,
+        );
+        assert!(
+            exchange_status_block_reason(
+                &[copy_trading, production, completed],
+                TradingEnvironment::Demo,
+                now_ms,
+                lead_ms
+            )
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn periodic_relevant_exchange_status_is_fatal() {
+        let (client, requests) = safety_client(vec![Ok(
+            r#"{"code":"0","msg":"","data":[{"begin":"1","end":"60001","env":"2","maintType":"2","serviceType":"5","state":"ongoing","system":"unified","title":"Trading maintenance"}]}"#,
+        )]);
+        let (_command_tx, command_rx) = mpsc::channel(2);
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+        let task = tokio::spawn(run_account_safety_task(
+            "main".to_string(),
+            client,
+            safety_account_config(),
+            command_rx,
+            event_tx,
+            None,
+            60_000,
+            60_000,
+            1_000,
+            exchange_status_guard(true, 1),
+        ));
+
+        let event = tokio::time::timeout(Duration::from_millis(100), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            RuntimeEvent::Fatal(RuntimeTaskFailure::ExchangeStatus(message))
+                if message.contains("Trading maintenance")
+        ));
+        task.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, "/api/v5/system/status");
+    }
+
+    #[tokio::test]
+    async fn periodic_exchange_status_check_failure_is_typed() {
+        let (client, _) = safety_client(vec![Err(RestError::Transport(
+            "injected status failure".to_string(),
+        ))]);
+        let (_command_tx, command_rx) = mpsc::channel(2);
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+        let task = tokio::spawn(run_account_safety_task(
+            "main".to_string(),
+            client,
+            safety_account_config(),
+            command_rx,
+            event_tx,
+            None,
+            60_000,
+            60_000,
+            1_000,
+            exchange_status_guard(true, 1),
+        ));
+
+        let event = tokio::time::timeout(Duration::from_millis(100), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            RuntimeEvent::Fatal(RuntimeTaskFailure::ExchangeStatusCheck(message))
+                if message.contains("injected status failure")
+        ));
+        task.await.unwrap();
     }
 
     #[test]

@@ -607,7 +607,10 @@ outside source control.
    symbols not owned by the current config. Do not share a storage path between
    strategy configs.
 5. It compares midpoint-adjusted local time with OKX `/api/v5/public/time` and
-   fails bootstrap when skew exceeds `max_exchange_clock_skew_ms`.
+   fails bootstrap when skew exceeds `max_exchange_clock_skew_ms`. It then
+   checks `/api/v5/system/status` and refuses startup when relevant
+   unified-account maintenance is active or begins within
+   `exchange_status_lead_ms`.
 6. The runtime fetches account-scoped instruments, account configuration,
    full economic balances, positions including margin-loan fields, open orders,
    recent fills, and exact status for any restored active order.
@@ -1207,13 +1210,26 @@ in `observe` only after review.
 
 - Bootstrap and a dedicated per-account safety task compare local time with the
   OKX public time endpoint. Excess skew or a failed periodic check is fatal.
+- Bootstrap and the first account safety task poll the official
+  [OKX system-status endpoint](https://www.okx.com/docs-v5/en/#status-get-status). Defaults
+  match pinned Java: a 10-second interval and 60-second lead. Relevant
+  unified-account trading, account-batch, product-batch, spread, and `99`
+  events for the configured demo/production environment trigger normal
+  fail-closed cleanup. Websocket, block, bot, and copy-trading events retain
+  Java's non-blocking treatment. A failed or malformed status response is
+  fatal. OKX permits one status request per five seconds, which configuration
+  validation enforces. One Reap process polls once regardless of its account
+  count. Operators running multiple processes from one source IP must
+  coordinate their polling intervals so the aggregate request rate remains
+  within that limit.
 - After each successful periodic clock check, the safety task fetches
   authenticated account configuration and compares the typed identity, account
   and position modes, STP setting, and borrowing flags to bootstrap. Any drift
   or failed check is fatal and enters normal fail-closed cleanup.
-- Validation requires the exchange deadman horizon to exceed two complete REST
-  request timeouts plus one heartbeat interval, so a delayed clock/config check
-  cannot consume the last armed Cancel All After window.
+- Validation requires the exchange deadman horizon to exceed three complete
+  REST request timeouts plus one heartbeat interval, so delayed
+  clock/config/status checks cannot consume the last armed Cancel All After
+  window.
 - In demo mode the safety task refreshes Cancel All After independently of the
   order queue and strategy loop. `cancel_all_after_heartbeat_ms` must respect the
   endpoint rate limit and remain below `cancel_all_after_timeout_secs`.
@@ -1242,6 +1258,7 @@ in `observe` only after review.
 | Risk breach | Durable global kill active; live orders cancelled | Reduce exposure externally if needed, diagnose, and follow the stopped-process latch-clear procedure; restart alone does not clear it |
 | Manual account kill | Durable account route latch; its instruments are removed from pricing/hedging and its live orders are cancelled | Reconcile the account and dependent exposure; restart alone does not clear it |
 | Exchange clock/deadman failure | Runtime fatal; new entry blocked; armed Cancel All After remains effective | Verify host time and OKX reachability, then reconcile before restart |
+| Relevant or unreadable OKX system status | Startup refused or runtime fatal; new entry blocked and normal cancel/reconcile cleanup runs | Review the official maintenance notice and configured environment; require a clean status check and full bootstrap after service recovery |
 | Host disk/memory/clock failure | Startup refused or runtime fatal; new entry blocked | Restore capacity/time synchronization, inspect journal integrity, and reconcile before restart |
 | Alert queue/delivery failure | Runtime fail-stop when fatal delivery is configured | Verify the external route and supervisor fallback before restart |
 | Journal lease contention | Second process refuses startup before credentials/network | Identify the owning PID/process; never bypass the lock or share the journal |
@@ -1262,6 +1279,7 @@ structured evidence rather than matching log text:
 | Restart with a durable halt | `restored_safety_latches > 0`; startup-replayed partial orders do not increment `partial_fill_events` |
 | Cancel All After heartbeat failure | `stop_reason = "runtime_failure"` and `failure.code = "deadman_heartbeat"` |
 | Periodic exchange-clock skew/check failure | `failure.code = "exchange_clock_skew"` or `"exchange_clock_check"` |
+| Relevant or failed exchange-status check | `failure.code = "exchange_status"` or `"exchange_status_check"` |
 | Authenticated account-config drift/check failure | `failure.code = "account_config_drift"` or `"account_config_check"` |
 
 Run each role in isolation, preserve its external injector record, populate the
@@ -1566,9 +1584,10 @@ must equal the public, private, and order-transport counts combined. It also rep
 operator commands and mutations, ambiguous submit/cancel outcomes, partial-fill
 transitions, order/fill convergence timeouts, and restored durable latches.
 Restored startup order state does not increment per-session partial-fill or
-ambiguity counters. Deadman heartbeat, periodic exchange-clock skew/check, and
-authenticated account-config drift/check failures use distinct stable failure
-codes; do not classify them by matching `failure.message`.
+ambiguity counters. Deadman heartbeat, periodic exchange-clock skew/check,
+exchange-status block/check, and authenticated account-config drift/check
+failures use distinct stable failure codes; do not classify them by matching
+`failure.message`.
 When enabled, it includes host preflight/last snapshots and check count plus
 alert delivery and queue evidence. A runtime/teardown failure additionally
 records its stable code and bounded message after cleanup while retaining a

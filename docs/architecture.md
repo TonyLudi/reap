@@ -350,8 +350,9 @@ Responsibilities:
   dispatching intents from the triggering event; global cancellation always
   takes precedence over simultaneous symbol isolation.
 - Validate exchange time, continuously compare authenticated account config to
-  its bootstrap identity/settings, expire stale place requests at the venue,
-  and own an independently scheduled exchange deadman lifecycle per account.
+  its bootstrap identity/settings, poll announced OKX unified-account system
+  maintenance, expire stale place requests at the venue, and own an
+  independently scheduled exchange deadman lifecycle per account.
 - Expose a separate minimal-config emergency composition that bypasses strategy,
   journal, websocket, and operator dependencies while cancelling and verifying
   the venue's regular order book account-wide.
@@ -402,6 +403,15 @@ matching account/position modes, an authoritative account snapshot already
 applied to the strategy and risk engine, a writable critical log, clean
 checkpoint/REST reconciliation, every sequenced book, every configured healthy
 stablecoin reference, and all configured private channels for every account.
+Before network feeds start, one unsigned `/api/v5/system/status` request must
+also prove that no relevant maintenance is active or inside the configured lead
+window. The first account safety task repeats that global check every 10 seconds
+by default. Its service filter matches pinned Java
+`OkxNitroUtils.getExchStatus`: unified trading, account-batch, product-batch,
+spread, and other events are relevant; websocket, block, bot, and copy-trading
+events are not. Rust additionally filters OKX's current `env` field and turns a
+relevant status or failed poll into fail-closed cancel/reconcile shutdown rather
+than Java's recoverable strategy pause.
 Tradable demo startup additionally requires every configured authenticated
 order-command websocket session for every account. The default pool has eight
 sessions, matching the pinned Java topology, and deterministically routes spot,

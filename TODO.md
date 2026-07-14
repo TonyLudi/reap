@@ -260,6 +260,10 @@ architecture in [docs/architecture.md](docs/architecture.md).
   realized rates, settle at the original exchange timestamp without strategy
   look-ahead, and require nonzero training/test settlement evidence in schema-4
   production research.
+- [x] Match pinned Java OKX system-status monitoring with a typed current-wire
+  `/api/v5/system/status` parser, environment-aware bootstrap and 10-second
+  periodic checks, a 60-second maintenance lead, Java-equivalent service
+  filtering, and typed fail-closed live cleanup.
 - [ ] Calibrate queue position, latency, fees, funding, and slippage from
   captured full-depth data, then run and archive production-candidate
   walk-forward, capacity, and stressed-liquidity reports. The orchestration and

@@ -20,6 +20,7 @@ const CANCEL_ORDER_PATH: &str = "/api/v5/trade/cancel-order";
 const CANCEL_BATCH_ORDERS_PATH: &str = "/api/v5/trade/cancel-batch-orders";
 const CANCEL_ALL_AFTER_PATH: &str = "/api/v5/trade/cancel-all-after";
 const PUBLIC_TIME_PATH: &str = "/api/v5/public/time";
+const SYSTEM_STATUS_PATH: &str = "/api/v5/system/status";
 const OPEN_ORDERS_PATH: &str = "/api/v5/trade/orders-pending";
 const FILLS_PATH: &str = "/api/v5/trade/fills";
 const ORDER_DETAILS_PATH: &str = "/api/v5/trade/order";
@@ -106,6 +107,18 @@ pub fn parse_okx_open_orders_response_json(body: &[u8]) -> Result<Vec<RemoteOrde
         .data
         .into_iter()
         .map(RemoteOrder::try_from)
+        .collect()
+}
+
+/// Parses an unmodified OKX system-status response.
+pub fn parse_okx_system_status_response_json(
+    body: &[u8],
+) -> Result<Vec<OkxSystemStatus>, RestError> {
+    let response: OkxResponse<OkxSystemStatusWire> = decode_okx_response(body)?;
+    response
+        .data
+        .into_iter()
+        .map(OkxSystemStatus::try_from)
         .collect()
 }
 
@@ -203,6 +216,59 @@ impl RestError {
 pub struct HttpResponse {
     pub status: u16,
     pub body: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OkxSystemStatusState {
+    Scheduled,
+    Ongoing,
+    PreOpen,
+    Completed,
+    Canceled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OkxSystemServiceType {
+    WebSocket,
+    Trading,
+    BlockTrading,
+    TradingBot,
+    TradingAccounts,
+    TradingProducts,
+    SpreadTrading,
+    CopyTrading,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OkxSystemMaintenanceType {
+    Scheduled,
+    Unscheduled,
+    Disruption,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OkxSystemEnvironment {
+    Production,
+    Demo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OkxSystemStatus {
+    pub title: String,
+    pub description: String,
+    pub state: OkxSystemStatusState,
+    pub begin_time_ms: u64,
+    pub end_time_ms: u64,
+    pub pre_open_begin_time_ms: Option<u64>,
+    pub service_type: OkxSystemServiceType,
+    pub maintenance_type: OkxSystemMaintenanceType,
+    pub environment: OkxSystemEnvironment,
+    pub system: String,
 }
 
 #[async_trait]
@@ -731,6 +797,21 @@ where
                 operation: "server time",
             })?;
         parse_integer("ts", &wire.timestamp)
+    }
+
+    pub async fn system_status(&self) -> Result<Vec<OkxSystemStatus>, RestError> {
+        let request = SignedRequest {
+            method: HttpMethod::Get,
+            path: SYSTEM_STATUS_PATH.to_string(),
+            body: String::new(),
+            headers: BTreeMap::new(),
+        };
+        let response: OkxResponse<OkxSystemStatusWire> = self.execute(request).await?;
+        response
+            .data
+            .into_iter()
+            .map(OkxSystemStatus::try_from)
+            .collect()
     }
 
     pub async fn cancel_all_after(&self, timeout_secs: u64) -> Result<(), RestError> {
@@ -1531,9 +1612,125 @@ struct OkxTimeWire {
 }
 
 #[derive(Debug, Deserialize)]
+struct OkxSystemStatusWire {
+    #[serde(default)]
+    title: String,
+    state: String,
+    begin: String,
+    end: String,
+    #[serde(default, rename = "preOpenBegin")]
+    pre_open_begin: String,
+    #[serde(rename = "serviceType")]
+    service_type: String,
+    #[serde(rename = "maintType")]
+    maintenance_type: String,
+    env: String,
+    system: String,
+    #[serde(default, rename = "scheDesc")]
+    description: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct OkxCancelAllAfterWire {
     #[serde(default, rename = "triggerTime")]
     trigger_time: String,
+}
+
+impl TryFrom<OkxSystemStatusWire> for OkxSystemStatus {
+    type Error = RestError;
+
+    fn try_from(value: OkxSystemStatusWire) -> Result<Self, Self::Error> {
+        let state = match value.state.trim().to_ascii_lowercase().as_str() {
+            "scheduled" => OkxSystemStatusState::Scheduled,
+            "ongoing" => OkxSystemStatusState::Ongoing,
+            "pre_open" => OkxSystemStatusState::PreOpen,
+            "completed" => OkxSystemStatusState::Completed,
+            "canceled" => OkxSystemStatusState::Canceled,
+            _ => {
+                return Err(RestError::InvalidField {
+                    field: "state",
+                    value: value.state,
+                    message: "unknown system maintenance state".to_string(),
+                });
+            }
+        };
+        let service_type = match value.service_type.trim() {
+            "0" => OkxSystemServiceType::WebSocket,
+            "5" => OkxSystemServiceType::Trading,
+            "6" => OkxSystemServiceType::BlockTrading,
+            "7" => OkxSystemServiceType::TradingBot,
+            "8" => OkxSystemServiceType::TradingAccounts,
+            "9" => OkxSystemServiceType::TradingProducts,
+            "10" => OkxSystemServiceType::SpreadTrading,
+            "11" => OkxSystemServiceType::CopyTrading,
+            "99" => OkxSystemServiceType::Other,
+            _ => {
+                return Err(RestError::InvalidField {
+                    field: "serviceType",
+                    value: value.service_type,
+                    message: "unknown system maintenance service type".to_string(),
+                });
+            }
+        };
+        let maintenance_type = match value.maintenance_type.trim() {
+            "1" => OkxSystemMaintenanceType::Scheduled,
+            "2" => OkxSystemMaintenanceType::Unscheduled,
+            "3" => OkxSystemMaintenanceType::Disruption,
+            _ => {
+                return Err(RestError::InvalidField {
+                    field: "maintType",
+                    value: value.maintenance_type,
+                    message: "unknown system maintenance type".to_string(),
+                });
+            }
+        };
+        let environment = match value.env.trim() {
+            "1" => OkxSystemEnvironment::Production,
+            "2" => OkxSystemEnvironment::Demo,
+            _ => {
+                return Err(RestError::InvalidField {
+                    field: "env",
+                    value: value.env,
+                    message: "unknown system maintenance environment".to_string(),
+                });
+            }
+        };
+        let begin_time_ms = parse_integer("begin", &value.begin)?;
+        if begin_time_ms == 0 {
+            return Err(RestError::InvalidField {
+                field: "begin",
+                value: value.begin,
+                message: "system maintenance begin time must be positive".to_string(),
+            });
+        }
+        let end_time_ms = parse_integer("end", &value.end)?;
+        if end_time_ms < begin_time_ms {
+            return Err(RestError::InvalidField {
+                field: "end",
+                value: value.end,
+                message: "system maintenance end time must not precede begin time".to_string(),
+            });
+        }
+        let pre_open_begin_time_ms =
+            match parse_optional_integer("preOpenBegin", value.pre_open_begin.trim())? {
+                0 => None,
+                timestamp => Some(timestamp),
+            };
+        validate_required_text("system", &value.system)?;
+
+        Ok(Self {
+            title: value.title,
+            description: value.description,
+            state,
+            begin_time_ms,
+            end_time_ms,
+            pre_open_begin_time_ms,
+            service_type,
+            maintenance_type,
+            environment,
+            system: value.system.trim().to_ascii_lowercase(),
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2235,6 +2432,72 @@ mod tests {
             })
             .collect::<Vec<_>>();
         serde_json::json!({"code": "0", "msg": "", "data": data}).to_string()
+    }
+
+    #[tokio::test]
+    async fn system_status_uses_unsigned_public_contract_and_preserves_scope() {
+        let response = r#"{"code":"0","msg":"","data":[{"begin":"2000","end":"3000","env":"2","maintType":"2","preOpenBegin":"2500","scheDesc":"extended","serviceType":"8","state":"scheduled","system":"unified","title":"Trading account maintenance"}]}"#;
+        let (client, requests) = client(vec![response]);
+
+        let statuses = client.system_status().await.unwrap();
+
+        assert_eq!(
+            statuses,
+            vec![OkxSystemStatus {
+                title: "Trading account maintenance".to_string(),
+                description: "extended".to_string(),
+                state: OkxSystemStatusState::Scheduled,
+                begin_time_ms: 2_000,
+                end_time_ms: 3_000,
+                pre_open_begin_time_ms: Some(2_500),
+                service_type: OkxSystemServiceType::TradingAccounts,
+                maintenance_type: OkxSystemMaintenanceType::Unscheduled,
+                environment: OkxSystemEnvironment::Demo,
+                system: "unified".to_string(),
+            }]
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].method, HttpMethod::Get);
+        assert_eq!(requests[0].path, SYSTEM_STATUS_PATH);
+        assert!(requests[0].body.is_empty());
+        assert!(requests[0].headers.is_empty());
+    }
+
+    #[test]
+    fn offline_system_status_parser_supports_current_copy_trading_payload() {
+        let response = br#"{"code":"0","data":[{"begin":"1784016000000","end":"1784017200000","env":"1","href":"","maintType":"1","preOpenBegin":"","scheDesc":"","serviceType":"11","state":"ongoing","system":"unified","title":"Copy trading system scheduled maintenance"}],"msg":""}"#;
+
+        let statuses = parse_okx_system_status_response_json(response).unwrap();
+
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].state, OkxSystemStatusState::Ongoing);
+        assert_eq!(statuses[0].service_type, OkxSystemServiceType::CopyTrading);
+        assert_eq!(statuses[0].environment, OkxSystemEnvironment::Production);
+        assert_eq!(
+            statuses[0].maintenance_type,
+            OkxSystemMaintenanceType::Scheduled
+        );
+        assert_eq!(statuses[0].pre_open_begin_time_ms, None);
+    }
+
+    #[test]
+    fn system_status_parser_rejects_unknown_contract_values_and_invalid_window() {
+        let response = |service_type: &str, begin: &str, end: &str| {
+            format!(
+                r#"{{"code":"0","data":[{{"begin":"{begin}","end":"{end}","env":"1","maintType":"1","serviceType":"{service_type}","state":"scheduled","system":"unified","title":"maintenance"}}],"msg":""}}"#
+            )
+        };
+
+        let error =
+            parse_okx_system_status_response_json(response("12", "2000", "3000").as_bytes())
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("serviceType"));
+
+        let error = parse_okx_system_status_response_json(response("5", "3000", "2000").as_bytes())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must not precede"));
     }
 
     #[test]

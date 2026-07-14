@@ -18,6 +18,8 @@ use url::Url;
 pub const MAX_LIVE_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_REPORTED_UNKNOWN_FIELDS: usize = 64;
 const MAX_CONNECTION_ATTEMPT_INTERVAL_MS: u64 = 60_000;
+const MIN_EXCHANGE_STATUS_CHECK_INTERVAL_MS: u64 = 5_000;
+const MAX_EXCHANGE_STATUS_LEAD_MS: u64 = 86_400_000;
 pub const MAX_ORDER_WEBSOCKET_SESSIONS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,6 +221,8 @@ pub struct RuntimeConfig {
     pub safety_latch_sync_timeout_ms: u64,
     pub max_exchange_clock_skew_ms: u64,
     pub exchange_clock_check_interval_ms: u64,
+    pub exchange_status_check_interval_ms: u64,
+    pub exchange_status_lead_ms: u64,
     pub cancel_all_after_timeout_secs: u64,
     pub cancel_all_after_heartbeat_ms: u64,
     pub ambiguous_submit_grace_ms: u64,
@@ -253,6 +257,8 @@ impl Default for RuntimeConfig {
             safety_latch_sync_timeout_ms: 2_000,
             max_exchange_clock_skew_ms: 250,
             exchange_clock_check_interval_ms: 30_000,
+            exchange_status_check_interval_ms: 10_000,
+            exchange_status_lead_ms: 60_000,
             cancel_all_after_timeout_secs: 30,
             cancel_all_after_heartbeat_ms: 1_000,
             ambiguous_submit_grace_ms: 10_000,
@@ -986,6 +992,11 @@ fn validate_positive_runtime(runtime: &RuntimeConfig, errors: &mut Vec<String>) 
             runtime.exchange_clock_check_interval_ms,
         ),
         (
+            "exchange_status_check_interval_ms",
+            runtime.exchange_status_check_interval_ms,
+        ),
+        ("exchange_status_lead_ms", runtime.exchange_status_lead_ms),
+        (
             "cancel_all_after_timeout_secs",
             runtime.cancel_all_after_timeout_secs,
         ),
@@ -1090,6 +1101,22 @@ fn validate_positive_runtime(runtime: &RuntimeConfig, errors: &mut Vec<String>) 
                 .to_string(),
         );
     }
+    if runtime.exchange_status_check_interval_ms < MIN_EXCHANGE_STATUS_CHECK_INTERVAL_MS {
+        errors.push(format!(
+            "runtime.exchange_status_check_interval_ms must be at least {MIN_EXCHANGE_STATUS_CHECK_INTERVAL_MS} to respect the OKX endpoint limit"
+        ));
+    }
+    if runtime.exchange_status_check_interval_ms > runtime.exchange_status_lead_ms {
+        errors.push(
+            "runtime.exchange_status_check_interval_ms must not exceed exchange_status_lead_ms"
+                .to_string(),
+        );
+    }
+    if runtime.exchange_status_lead_ms > MAX_EXCHANGE_STATUS_LEAD_MS {
+        errors.push(format!(
+            "runtime.exchange_status_lead_ms must not exceed {MAX_EXCHANGE_STATUS_LEAD_MS}"
+        ));
+    }
     if !(10..=120).contains(&runtime.cancel_all_after_timeout_secs) {
         errors.push("runtime.cancel_all_after_timeout_secs must be between 10 and 120".to_string());
     }
@@ -1109,12 +1136,12 @@ fn validate_positive_runtime(runtime: &RuntimeConfig, errors: &mut Vec<String>) 
     }
     if runtime
         .rest_request_timeout_ms
-        .saturating_mul(2)
+        .saturating_mul(3)
         .saturating_add(runtime.cancel_all_after_heartbeat_ms)
         >= runtime.cancel_all_after_timeout_secs.saturating_mul(1_000)
     {
         errors.push(
-            "runtime deadman timeout must cover two periodic safety REST timeouts plus one heartbeat interval"
+            "runtime deadman timeout must cover three periodic safety REST timeouts plus one heartbeat interval"
                 .to_string(),
         );
     }
@@ -1976,9 +2003,28 @@ mod tests {
         assert!(!report.valid);
         assert!(report.errors.iter().any(|error| {
             error.contains(
-                "deadman timeout must cover two periodic safety REST timeouts plus one heartbeat",
+                "deadman timeout must cover three periodic safety REST timeouts plus one heartbeat",
             )
         }));
+    }
+
+    #[test]
+    fn exchange_status_guard_respects_endpoint_rate_and_lead_window() {
+        let mut config = valid_config();
+        config.runtime.exchange_status_check_interval_ms = 4_999;
+        config.runtime.exchange_status_lead_ms = 4_000;
+
+        let report = config.validate();
+
+        assert!(!report.valid);
+        assert!(report.errors.iter().any(|error| {
+            error.contains("exchange_status_check_interval_ms must be at least 5000")
+        }));
+        assert!(
+            report.errors.iter().any(|error| {
+                error.contains("exchange_status_check_interval_ms must not exceed")
+            })
+        );
     }
 
     #[test]
