@@ -1,7 +1,7 @@
 # Paths are resolved relative to this manifest. Keep every report and injector
 # record immutable; the verifier rejects duplicate sessions, paths, and injector
 # hashes. Replace these placeholders with target-host campaign artifacts.
-schema_version = 2
+schema_version = 3
 
 [[runs]]
 scenario = "clean_observe"
@@ -65,6 +65,21 @@ injector_evidence = "evidence/deadman-heartbeat-failure-injector.log"
 scenario = "exchange_clock_failure"
 report = "evidence/exchange-clock-failure.json"
 injector_evidence = "evidence/exchange-clock-failure-injector.log"
+
+[[runs]]
+scenario = "exchange_status_failure"
+report = "evidence/exchange-status-failure.json"
+injector_evidence = "evidence/exchange-status-failure-injector.log"
+
+[[runs]]
+scenario = "exchange_instrument_failure"
+report = "evidence/exchange-instrument-failure.json"
+injector_evidence = "evidence/exchange-instrument-failure-injector.log"
+
+[[runs]]
+scenario = "exchange_fee_failure"
+report = "evidence/exchange-fee-failure.json"
+injector_evidence = "evidence/exchange-fee-failure-injector.log"
 
 [[runs]]
 scenario = "account_config_failure"

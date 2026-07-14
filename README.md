@@ -42,9 +42,10 @@ Implemented:
   owner, prioritized gateway tasks, and graceful cancel-and-drain shutdown.
   Demo entry also validates exchange time, continuously detects authenticated
   account-configuration drift, polls announced OKX unified-account maintenance
-  with the pinned Java service filter and lead time, verifies configured
-  strategy fees against authenticated current OKX fee groups, and maintains
-  OKX Cancel All After from an independent safety task.
+  with the pinned Java service filter and lead time, continuously verifies
+  strategy-critical instrument rules and configured fees against authenticated
+  current OKX metadata, and maintains OKX Cancel All After from an independent
+  safety task.
 - Authenticated read-only cash-account certification that embeds exact bounded
   OKX config/balance/position responses in a create-new mode-`0600` artifact,
   binds config/binary/host/Java/account provenance, and supports credential-free

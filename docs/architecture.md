@@ -351,9 +351,9 @@ Responsibilities:
   takes precedence over simultaneous symbol isolation.
 - Validate exchange time, continuously compare authenticated account config to
   its bootstrap identity/settings, poll announced OKX unified-account system
-  maintenance, verify strategy fee assumptions against authenticated current
-  instrument fee groups, expire stale place requests at the venue, and own an
-  independently scheduled exchange deadman lifecycle per account.
+  maintenance, compare strategy-critical instrument rules and fee assumptions
+  to authenticated current metadata, expire stale place requests at the venue,
+  and own an independently scheduled exchange deadman lifecycle per account.
 - Expose a separate minimal-config emergency composition that bypasses strategy,
   journal, websocket, and operator dependencies while cancelling and verifying
   the venue's regular order book account-wide.
@@ -413,15 +413,20 @@ spread, and other events are relevant; websocket, block, bot, and copy-trading
 events are not. Rust additionally filters OKX's current `env` field and turns a
 relevant status or failed poll into fail-closed cancel/reconcile shutdown rather
 than Java's recoverable strategy pause.
-Each account instrument must also provide the current OKX trading-fee
-`groupId`. Bootstrap queries `/api/v5/account/trade-fee` with the exact spot
-instrument or derivative family, selects that group from `feeGroup`, and
-converts OKX's signed balance rate into the strategy's cost-rate convention.
-Configured maker and taker costs may be more conservative, but may not
-understate a commission or assume a larger rebate. A paced periodic full sweep
-repeats this check. It runs as a child of the account safety lifecycle so a
-blocked fee request cannot delay Cancel All After heartbeats. Deprecated
-top-level fee fields are rejected as insufficient current-contract evidence.
+Each exact account instrument must also provide current `upcChg` announcements
+and the OKX trading-fee `groupId`. Bootstrap rejects non-live instruments or an
+announced `tickSz`, `minSz` (and synchronous derivative `lotSz`), or `maxMktSz`
+change inside the configured one-hour lead. It then queries
+`/api/v5/account/trade-fee` with the exact spot instrument or derivative family,
+selects that group from `feeGroup`, and converts OKX's signed balance rate into
+the strategy's cost-rate convention. Configured maker and taker costs may be
+more conservative, but may not understate a commission or assume a larger
+rebate. A paced periodic full sweep first compares state, type, family,
+currencies, contract type/value, tick/lot/minimum size, and fee group to the
+bootstrap snapshot, checks announcements, and then rechecks fees. It runs as a
+child of the account safety lifecycle so a blocked metadata or fee request
+cannot delay Cancel All After heartbeats. Missing or unknown `upcChg` contracts
+and deprecated top-level fee fields are rejected as insufficient evidence.
 Tradable demo startup additionally requires every configured authenticated
 order-command websocket session for every account. The default pool has eight
 sessions, matching the pinned Java topology, and deterministically routes spot,
@@ -1113,7 +1118,8 @@ the deployment blocker.
 - Add the live composition process and single-writer event-loop owner. Done.
 - Implement executable startup, readiness, reconciliation, and restart gates.
   Done.
-- Verify instrument metadata, account mode, and risk valuation. Done.
+- Verify instrument metadata, account mode, and risk valuation at startup, then
+  continuously reject exact-metadata drift and imminent rule changes. Done.
 - Profile the wire-to-action parity loop and remove measured collection churn.
   Done.
 - Emit bounded soak evidence for readiness recovery, reconciliation drift,

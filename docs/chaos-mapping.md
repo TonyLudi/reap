@@ -67,6 +67,7 @@ control plane.
 | Backtest and live strategy use the same event API | `StrategyEvent -> Vec<OrderIntent>` | Equivalent |
 | Local order registration precedes exchange acknowledgement | Synchronous canonical `PendingNew` in live and backtest; pending quotes/hedges count as working state | Equivalent |
 | Quote fill becomes an account/position update before hedging | Synthetic update in backtest; private account/position push in live | Equivalent |
+| `Iarb2ChaosEntityFactory` binds the cached `Instrument`; `ChaosEntity` repeatedly uses its tick table and contract value while `OkEntity.getMinTradeSize` uses minimum/lot size | Exact authenticated OKX instrument metadata is verified at bootstrap and periodically across state, sizing, valuation, currencies, family, and fee group; typed upcoming rule changes stop inside a configured lead | Current-contract hardening around Java's instrument assumption; Rust requires a reviewed config and clean restart after drift |
 | `StrategyToolkit.getTransactionFee` maker/taker inputs plus `ChaosEntity.sanityCheck` fee ordering | Per-instrument strategy cost rates, Java-equivalent taker-at-least-maker validation, and authenticated OKX `groupId`/`feeGroup` bootstrap plus periodic underpricing guard | Stronger current-contract lifecycle; conservative configured cost is allowed, while exact target-tier calibration and statement evidence remain operational gates |
 | `PortfolioExchAcctCalculator.settleSwapFundingAt` linear/inverse formulas | Scheduled funding settlement using realized `settFundingRate`/`prevFundingTime` and exchange mark/depth fallback | Exact signed formulas with stronger accounting semantics; Rust does not book Java's forecast `curFunding` as realized cash |
 
@@ -159,9 +160,10 @@ on the strategy process or journal and enumerates unmanaged symbols. Its offline
 verifier re-derives exact-config, account-coverage, trigger-horizon, and final-zero
 invariants; it does not expand the venue scope to algo/spread orders or turn
 self-reported REST outcomes into replayable raw exchange evidence.
-Deadman heartbeat, periodic clock skew/check, and authenticated account-config
-drift/check failures have distinct stable codes. This report does not make the
-fault acceptable; it makes the required demo fault campaign machine-reviewable.
+Deadman heartbeat, periodic clock skew/check, exchange instrument/fee
+drift/check, and authenticated account-config drift/check failures have
+distinct stable codes. This report does not make the fault acceptable; it makes
+the required demo fault campaign machine-reviewable.
 
 Zero-delay and full-capacity fixture compatibility is intentional, but it is
 optimistic evidence, not a calibrated execution claim. Backtest reports retain
@@ -229,6 +231,7 @@ The following differences do not change the covered quote/hedge calculations:
 | Separate receive and exchange latency tracking | Raw `recv_ts_ns`, exchange timestamps, bounded-memory capture timing distributions, capture health counters, and bounded live webhook alerts | Equivalent data retained; receive delay includes host clock/scheduling and alert routing is a deployment concern |
 | `MetCoinGatewayMktOkxNitroBaseConfig` configurable `okx.nitro.md.connect.interval.ms` (default zero) | One `connection_attempt_interval_ms` pacer shared by every process-local public/private/order-command initial and reconnect attempt | Current-contract hardening: Rust defaults to 400 ms and official endpoints enforce at least 334 ms for OKX's documented three connection requests/second/IP; multiple processes need external coordination |
 | `OkxNitroExchStatusClient` 10-second `/api/v5/system/status` polling plus `ExchStatusSafeguard` 60-second lead and `OkxNitroUtils.getExchStatus` service filter | Typed unsigned bootstrap and periodic status checks with the same unified service scope, current `env` filtering, endpoint-rate validation, and typed failure | Stronger lifecycle: Java pauses and may resume the strategy; Rust enters fail-closed cancel/reconcile shutdown and requires a clean restart |
+| Java strategy entities retain an `Instrument` from `instrumentCache` and use its tick, lot/minimum size, currencies, and contract value throughout their lifetime | Strict exact-row `/api/v5/account/instruments` bootstrap plus paced periodic comparison and typed current `upcChg` parsing | Current-contract hardening: missing/unknown announcements, non-live state, rule drift, or an imminent announced change enter fail-closed cleanup; the poll is isolated from the deadman heartbeat |
 | Java strategy entities receive maker/taker fees from `StrategyToolkit.getTransactionFee`; `ChaosEntity.sanityCheck` rejects taker below maker | Current private-instrument `groupId` plus authenticated `/api/v5/account/trade-fee` `feeGroup` selection for each exact spot symbol or derivative family, startup verification, and paced periodic checks | Current-contract hardening: Rust rejects fee underpricing and unreadable/deprecated-only fee data; the fee poll is isolated from the deadman heartbeat |
 | Eight `OkxNitroOrderSessionKeeper` instances with `BY_UNDERLYING` dispatch and websocket order protocol | Eight authenticated command sessions by default, deterministic underlying routing, bounded request correlation, place `expTime`, aggregate readiness, and supervised reconnect | Equivalent command topology; Rust additionally classifies the pre-send/write ambiguity boundary and retains REST for reconciliation and cancel safety |
 | Batch subscription manager and retry limits | Bounded socket partitioning, acknowledgement timeout, exponential reconnect | Equivalent lifecycle with different batching policy |

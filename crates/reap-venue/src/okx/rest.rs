@@ -30,6 +30,7 @@ const ACCOUNT_CONFIG_PATH: &str = "/api/v5/account/config";
 const ACCOUNT_BALANCE_PATH: &str = "/api/v5/account/balance";
 const ACCOUNT_POSITIONS_PATH: &str = "/api/v5/account/positions";
 pub const OKX_FILLS_PAGE_LIMIT: usize = 100;
+pub const OKX_MIN_ACCOUNT_INSTRUMENT_REQUEST_INTERVAL_MS: u64 = 100;
 pub const OKX_MIN_TRADE_FEE_REQUEST_INTERVAL_MS: u64 = 400;
 
 /// Parses an unmodified OKX trade-fills or fills-history response.
@@ -465,6 +466,32 @@ pub struct OkxInstrument {
     pub lot_size: f64,
     pub min_size: f64,
     pub state: String,
+    pub upcoming_changes: Vec<OkxInstrumentChange>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OkxInstrumentChangeParameter {
+    TickSize,
+    MinimumSize,
+    MaximumMarketSize,
+}
+
+impl OkxInstrumentChangeParameter {
+    pub fn as_okx_str(self) -> &'static str {
+        match self {
+            Self::TickSize => "tickSz",
+            Self::MinimumSize => "minSz",
+            Self::MaximumMarketSize => "maxMktSz",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OkxInstrumentChange {
+    pub parameter: OkxInstrumentChangeParameter,
+    pub new_value: f64,
+    pub effective_time_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1201,6 +1228,53 @@ where
             .into_iter()
             .map(OkxInstrument::try_from)
             .collect()
+    }
+
+    pub async fn account_instrument(
+        &self,
+        instrument_type: OkxInstrumentType,
+        symbol: &str,
+    ) -> Result<OkxInstrument, RestError> {
+        self.account_instrument_at(&timestamp_now(), instrument_type, symbol)
+            .await
+    }
+
+    pub async fn account_instrument_at(
+        &self,
+        timestamp: &str,
+        instrument_type: OkxInstrumentType,
+        symbol: &str,
+    ) -> Result<OkxInstrument, RestError> {
+        validate_required_text("instId", symbol)?;
+        let mut instruments = self
+            .account_instruments_at(timestamp, instrument_type, Some(symbol))
+            .await?;
+        if instruments.len() != 1 {
+            return Err(RestError::InvalidField {
+                field: "data",
+                value: instruments.len().to_string(),
+                message: "exact account instrument response must contain one row".to_string(),
+            });
+        }
+        let instrument = instruments
+            .pop()
+            .expect("checked one exact account instrument row");
+        if instrument.symbol != symbol || instrument.instrument_type != instrument_type {
+            return Err(RestError::InvalidField {
+                field: "instId/instType",
+                value: format!(
+                    "{}/{}",
+                    instrument.symbol,
+                    instrument.instrument_type.as_str()
+                ),
+                message: format!(
+                    "expected exact {}/{} account instrument response",
+                    symbol,
+                    instrument_type.as_str()
+                ),
+            });
+        }
+        Ok(instrument)
     }
 
     pub async fn account_trade_fee(
@@ -1950,6 +2024,17 @@ struct OkxInstrumentWire {
     #[serde(rename = "minSz")]
     min_size: String,
     state: String,
+    #[serde(rename = "upcChg")]
+    upcoming_changes: Vec<OkxInstrumentChangeWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OkxInstrumentChangeWire {
+    param: String,
+    #[serde(rename = "newValue")]
+    new_value: String,
+    #[serde(rename = "effTime")]
+    effective_time: String,
 }
 
 impl TryFrom<OkxInstrumentWire> for OkxInstrument {
@@ -1972,6 +2057,43 @@ impl TryFrom<OkxInstrumentWire> for OkxInstrument {
             lot_size: parse_positive_number("lotSz", &value.lot_size)?,
             min_size: parse_positive_number("minSz", &value.min_size)?,
             state: value.state,
+            upcoming_changes: value
+                .upcoming_changes
+                .into_iter()
+                .map(OkxInstrumentChange::try_from)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+impl TryFrom<OkxInstrumentChangeWire> for OkxInstrumentChange {
+    type Error = RestError;
+
+    fn try_from(value: OkxInstrumentChangeWire) -> Result<Self, Self::Error> {
+        let parameter = match value.param.as_str() {
+            "tickSz" => OkxInstrumentChangeParameter::TickSize,
+            "minSz" => OkxInstrumentChangeParameter::MinimumSize,
+            "maxMktSz" => OkxInstrumentChangeParameter::MaximumMarketSize,
+            _ => {
+                return Err(RestError::InvalidField {
+                    field: "upcChg.param",
+                    value: value.param,
+                    message: "unsupported upcoming instrument change parameter".to_string(),
+                });
+            }
+        };
+        let effective_time_ms = parse_integer("upcChg.effTime", &value.effective_time)?;
+        if effective_time_ms == 0 {
+            return Err(RestError::InvalidField {
+                field: "upcChg.effTime",
+                value: value.effective_time,
+                message: "upcoming instrument change time must be positive".to_string(),
+            });
+        }
+        Ok(Self {
+            parameter,
+            new_value: parse_positive_number("upcChg.newValue", &value.new_value)?,
+            effective_time_ms,
         })
     }
 }
@@ -2756,6 +2878,103 @@ mod tests {
         assert!(requests.lock().unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn exact_account_instrument_retains_typed_upcoming_changes() {
+        let response = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","instType":"SWAP","instFamily":"BTC-USDT","groupId":"2","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"USDT","ctType":"linear","ctVal":"0.01","ctValCcy":"BTC","tickSz":"0.1","lotSz":"1","minSz":"1","state":"live","upcChg":[{"param":"tickSz","newValue":"0.01","effTime":"1763979985847"},{"param":"minSz","newValue":"2","effTime":"1763979986847"},{"param":"maxMktSz","newValue":"1000","effTime":"1763979987847"}]}]}"#;
+        let (client, requests) = client(vec![response]);
+
+        let instrument = client
+            .account_instrument_at(
+                "2020-12-08T09:08:57.715Z",
+                OkxInstrumentType::Swap,
+                "BTC-USDT-SWAP",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(instrument.upcoming_changes.len(), 3);
+        assert_eq!(
+            instrument.upcoming_changes[0],
+            OkxInstrumentChange {
+                parameter: OkxInstrumentChangeParameter::TickSize,
+                new_value: 0.01,
+                effective_time_ms: 1_763_979_985_847,
+            }
+        );
+        assert_eq!(
+            instrument.upcoming_changes[1].parameter,
+            OkxInstrumentChangeParameter::MinimumSize
+        );
+        assert_eq!(
+            instrument.upcoming_changes[2].parameter,
+            OkxInstrumentChangeParameter::MaximumMarketSize
+        );
+        assert_eq!(
+            requests.lock().unwrap()[0].path,
+            "/api/v5/account/instruments?instType=SWAP&instId=BTC-USDT-SWAP"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_instrument_rejects_malformed_change_and_non_exact_response() {
+        let malformed = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","state":"live","upcChg":[{"param":"futureField","newValue":"1","effTime":"1"}]}]}"#;
+        let zero_time = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","state":"live","upcChg":[{"param":"tickSz","newValue":"1","effTime":"0"}]}]}"#;
+        let zero_value = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","state":"live","upcChg":[{"param":"minSz","newValue":"0","effTime":"1"}]}]}"#;
+        let missing_changes = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","state":"live"}]}"#;
+        let duplicate = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","state":"live","upcChg":[]},{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","state":"live","upcChg":[]}]}"#;
+        let mismatched = r#"{"code":"0","msg":"","data":[{"instId":"ETH-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","state":"live","upcChg":[]}]}"#;
+        let (client, _) = client(vec![
+            malformed,
+            zero_time,
+            zero_value,
+            missing_changes,
+            duplicate,
+            mismatched,
+        ]);
+
+        let error = client
+            .account_instrument_at("time", OkxInstrumentType::Spot, "BTC-USDT")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("upcChg.param"));
+
+        let error = client
+            .account_instrument_at("time", OkxInstrumentType::Spot, "BTC-USDT")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("change time must be positive"));
+
+        let error = client
+            .account_instrument_at("time", OkxInstrumentType::Spot, "BTC-USDT")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("upcChg.newValue"));
+
+        let error = client
+            .account_instrument_at("time", OkxInstrumentType::Spot, "BTC-USDT")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("upcChg"));
+
+        let error = client
+            .account_instrument_at("time", OkxInstrumentType::Spot, "BTC-USDT")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must contain one row"));
+
+        let error = client
+            .account_instrument_at("time", OkxInstrumentType::Spot, "BTC-USDT")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("expected exact BTC-USDT/SPOT"));
+    }
+
     #[test]
     fn offline_fill_response_parser_preserves_exact_fee_fields() {
         let response = fill_response(7, 1);
@@ -3105,7 +3324,7 @@ mod tests {
     #[tokio::test]
     async fn parses_signed_bootstrap_metadata_and_account_state() {
         let (client, requests) = client(vec![
-            r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","instType":"SWAP","instFamily":"BTC-USDT","groupId":"2","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"USDT","ctType":"linear","ctVal":"0.01","ctValCcy":"BTC","tickSz":"0.1","lotSz":"1","minSz":"1","state":"live"}]}"#,
+            r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","instType":"SWAP","instFamily":"BTC-USDT","groupId":"2","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"USDT","ctType":"linear","ctVal":"0.01","ctValCcy":"BTC","tickSz":"0.1","lotSz":"1","minSz":"1","state":"live","upcChg":[]}]}"#,
             r#"{"code":"0","msg":"","data":[{"acctLv":"2","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"7","mainUid":"6","enableSpotBorrow":false,"autoLoan":false,"spotBorrowAutoRepay":false}]}"#,
             r#"{"code":"0","msg":"","data":[{"uTime":"1000","totalEq":"11000","mgnRatio":"12.5","adjEq":"10000","borrowFroz":"0","notionalUsdForBorrow":"0","notionalUsd":"2000","details":[{"ccy":"USDT","uTime":"999","cashBal":"9000","availBal":"8000","eq":"10000","liab":"0","crossLiab":"0","isoLiab":"0","uplLiab":"0","interest":"0","borrowFroz":"0","maxLoan":"500","twap":"2"}]}]}"#,
             r#"{"code":"0","msg":"","data":[{"instType":"SWAP","instId":"BTC-USDT-SWAP","pos":"2","posSide":"net","mgnMode":"cross","avgPx":"50000","uTime":"1001","liab":"","interest":""}]}"#,

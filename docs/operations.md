@@ -619,8 +619,9 @@ outside source control.
    tick/lot/minimum size, contract value, currencies, configured trade mode,
    account level, `net_mode`, disabled mode-appropriate borrowing, complete
    applicable zero-liability/interest evidence, absence of margin positions,
-   and that configured maker/taker costs do not understate the applicable
-   exchange commissions or overstate rebates before metadata is ready.
+   absence of imminent announced instrument-rule changes, and that configured
+   maker/taker costs do not understate the applicable exchange commissions or
+   overstate rebates before metadata is ready.
 8. It restores canonical active orders, fill identities, and active global,
    account, and symbol safety latches from JSONL. It applies missed known
    fills/terminal updates from REST, applies the authoritative account snapshot
@@ -1240,6 +1241,18 @@ in `observe` only after review.
   request runs in an isolated child task and therefore cannot delay Cancel All
   After. OKX notes that Open API rates may not reflect temporary zero-fee pairs,
   so this is a conservative safety gate rather than calibration evidence.
+- Before each periodic fee lookup, the same isolated child re-queries the exact
+  authenticated [OKX account instrument](https://www.okx.com/docs-v5/en/#trading-account-rest-api-get-instruments).
+  It compares live state, type, family, underlying, currencies, contract
+  type/value, tick/lot/minimum size, and fee group to the bootstrap snapshot.
+  It also strictly parses every current `upcChg` announcement: `tickSz`,
+  `minSz` (which synchronously changes derivative `lotSz`), and `maxMktSz`.
+  Unknown or missing announcement contracts fail closed. A change entering
+  `exchange_instrument_change_lead_ms` is fatal even before it takes effect;
+  the default one-hour lead leaves time to stop, review configuration, and
+  cleanly restart. Exact metadata requests are paced within OKX's documented 20
+  requests per two seconds per user and instrument type. A blocked metadata
+  request, like a blocked fee request, cannot delay Cancel All After.
 - Validation requires the exchange deadman horizon to exceed three complete
   REST request timeouts plus one heartbeat interval, so delayed
   clock/config/status checks cannot consume the last armed Cancel All After
@@ -1273,6 +1286,7 @@ in `observe` only after review.
 | Manual account kill | Durable account route latch; its instruments are removed from pricing/hedging and its live orders are cancelled | Reconcile the account and dependent exposure; restart alone does not clear it |
 | Exchange clock/deadman failure | Runtime fatal; new entry blocked; armed Cancel All After remains effective | Verify host time and OKX reachability, then reconcile before restart |
 | Relevant or unreadable OKX system status | Startup refused or runtime fatal; new entry blocked and normal cancel/reconcile cleanup runs | Review the official maintenance notice and configured environment; require a clean status check and full bootstrap after service recovery |
+| Instrument becomes non-live, metadata drifts, an announced rule change enters its lead, or the exact response is unreadable | Startup refused or runtime fatal; new entry blocked and normal cancel/reconcile cleanup runs | Stop through the effective change, review tick/lot/minimum size and valuation/account ownership, update and re-approve config if required, then require a clean exact bootstrap |
 | Configured fee underprices authenticated OKX group, or fee check is unreadable | Startup refused or runtime fatal; new entry blocked and normal cancel/reconcile cleanup runs | Review the exact instrument group, account tier, configured cost sign, and current API response; recalibrate and require a clean bootstrap rather than weakening the guard |
 | Host disk/memory/clock failure | Startup refused or runtime fatal; new entry blocked | Restore capacity/time synchronization, inspect journal integrity, and reconcile before restart |
 | Alert queue/delivery failure | Runtime fail-stop when fatal delivery is configured | Verify the external route and supervisor fallback before restart |
@@ -1295,6 +1309,7 @@ structured evidence rather than matching log text:
 | Cancel All After heartbeat failure | `stop_reason = "runtime_failure"` and `failure.code = "deadman_heartbeat"` |
 | Periodic exchange-clock skew/check failure | `failure.code = "exchange_clock_skew"` or `"exchange_clock_check"` |
 | Relevant or failed exchange-status check | `failure.code = "exchange_status"` or `"exchange_status_check"` |
+| Authenticated instrument drift/check failure | `failure.code = "exchange_instrument_drift"` or `"exchange_instrument_check"` |
 | Authenticated fee underpricing/check failure | `failure.code = "exchange_fee_drift"` or `"exchange_fee_check"` |
 | Authenticated account-config drift/check failure | `failure.code = "account_config_drift"` or `"account_config_check"` |
 
@@ -1312,11 +1327,13 @@ reap verify-live-fault-matrix \
   --pretty
 ```
 
-The schema-2 template is `examples/live-fault-matrix.toml`; relative artifact
-paths resolve from the manifest directory. The verifier rejects missing or
-duplicate roles, report/session reuse, injector path or content reuse, config
-byte drift, invalid schema-8 evidence, and cross-run build, host, or account
-identity changes. Clean reconnect roles must recover to a clean bounded soak.
+The schema-3 template is `examples/live-fault-matrix.toml`; relative artifact
+paths resolve from the manifest directory. The verifier requires distinct
+status, instrument, fee, and account-config failure roles and rejects missing
+or duplicate roles, typed-failure substitution, report/session reuse, injector
+path or content reuse, config byte drift, invalid schema-8 evidence, and
+cross-run build, host, or account identity changes. Clean reconnect roles must
+recover to a clean bounded soak.
 Ambiguity and convergence roles may retain their expected drift counters but
 must finish a bounded run back at ready with no storage drops, alert failures,
 or active orders. Typed safety-task failures must start only after readiness and
@@ -1601,9 +1618,10 @@ operator commands and mutations, ambiguous submit/cancel outcomes, partial-fill
 transitions, order/fill convergence timeouts, and restored durable latches.
 Restored startup order state does not increment per-session partial-fill or
 ambiguity counters. Deadman heartbeat, periodic exchange-clock skew/check,
-exchange-status block/check, authenticated exchange-fee drift/check, and
-authenticated account-config drift/check failures use distinct stable failure
-codes; do not classify them by matching `failure.message`.
+exchange-status block/check, authenticated instrument drift/check, authenticated
+exchange-fee drift/check, and authenticated account-config drift/check failures
+use distinct stable failure codes; do not classify them by matching
+`failure.message`.
 When enabled, it includes host preflight/last snapshots and check count plus
 alert delivery and queue evidence. A runtime/teardown failure additionally
 records its stable code and bounded message after cleanup while retaining a

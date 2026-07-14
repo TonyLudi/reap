@@ -463,6 +463,7 @@ mod tests {
         production.runtime.event_channel_capacity += 1;
         production.runtime.exchange_status_lead_ms += 1;
         production.runtime.exchange_fee_check_interval_ms += 1;
+        production.runtime.exchange_instrument_change_lead_ms += 1;
         production.accounts[0].node_id += 1;
         production.venue.enable_vip_fills_channel = true;
         production.storage.channel_capacity += 1;
@@ -472,7 +473,7 @@ mod tests {
         let report = verify(&demo, &production);
 
         assert!(!report.acceptance_passed);
-        assert_eq!(report.disallowed_change_count, 9);
+        assert_eq!(report.disallowed_change_count, 10);
         let paths = report
             .disallowed_changes
             .iter()
@@ -484,6 +485,7 @@ mod tests {
             "/runtime/event_channel_capacity",
             "/runtime/exchange_status_lead_ms",
             "/runtime/exchange_fee_check_interval_ms",
+            "/runtime/exchange_instrument_change_lead_ms",
             "/accounts/0/node_id",
             "/venue/enable_vip_fills_channel",
             "/storage/channel_capacity",

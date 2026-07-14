@@ -473,6 +473,7 @@ mod tests {
                         lot_size: 0.0001,
                         min_size: 0.0001,
                         state: "live".to_string(),
+                        upcoming_changes: Vec::new(),
                     },
                 ),
                 (
@@ -493,6 +494,7 @@ mod tests {
                         lot_size: 1.0,
                         min_size: 1.0,
                         state: "live".to_string(),
+                        upcoming_changes: Vec::new(),
                     },
                 ),
             ]),

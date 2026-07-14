@@ -24,6 +24,7 @@ const MAX_CONNECTION_ATTEMPT_INTERVAL_MS: u64 = 60_000;
 const MIN_EXCHANGE_STATUS_CHECK_INTERVAL_MS: u64 = 5_000;
 const MAX_EXCHANGE_STATUS_LEAD_MS: u64 = 86_400_000;
 const MAX_EXCHANGE_FEE_CHECK_INTERVAL_MS: u64 = 300_000;
+const MAX_EXCHANGE_INSTRUMENT_CHANGE_LEAD_MS: u64 = 604_800_000;
 pub const MAX_ORDER_WEBSOCKET_SESSIONS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,8 +228,10 @@ pub struct RuntimeConfig {
     pub exchange_clock_check_interval_ms: u64,
     pub exchange_status_check_interval_ms: u64,
     pub exchange_status_lead_ms: u64,
-    /// Maximum time for one complete authenticated fee check across an account.
+    /// Maximum time for one authenticated instrument-and-fee sweep per account.
     pub exchange_fee_check_interval_ms: u64,
+    /// Lead time for refusing announced instrument-rule changes.
+    pub exchange_instrument_change_lead_ms: u64,
     pub cancel_all_after_timeout_secs: u64,
     pub cancel_all_after_heartbeat_ms: u64,
     pub ambiguous_submit_grace_ms: u64,
@@ -266,6 +269,7 @@ impl Default for RuntimeConfig {
             exchange_status_check_interval_ms: 10_000,
             exchange_status_lead_ms: 60_000,
             exchange_fee_check_interval_ms: 60_000,
+            exchange_instrument_change_lead_ms: 3_600_000,
             cancel_all_after_timeout_secs: 30,
             cancel_all_after_heartbeat_ms: 1_000,
             ambiguous_submit_grace_ms: 10_000,
@@ -1017,6 +1021,10 @@ fn validate_positive_runtime(runtime: &RuntimeConfig, errors: &mut Vec<String>) 
             runtime.exchange_fee_check_interval_ms,
         ),
         (
+            "exchange_instrument_change_lead_ms",
+            runtime.exchange_instrument_change_lead_ms,
+        ),
+        (
             "cancel_all_after_timeout_secs",
             runtime.cancel_all_after_timeout_secs,
         ),
@@ -1140,6 +1148,17 @@ fn validate_positive_runtime(runtime: &RuntimeConfig, errors: &mut Vec<String>) 
     if runtime.exchange_fee_check_interval_ms > MAX_EXCHANGE_FEE_CHECK_INTERVAL_MS {
         errors.push(format!(
             "runtime.exchange_fee_check_interval_ms must not exceed {MAX_EXCHANGE_FEE_CHECK_INTERVAL_MS}"
+        ));
+    }
+    if runtime.exchange_instrument_change_lead_ms < runtime.exchange_fee_check_interval_ms {
+        errors.push(
+            "runtime.exchange_instrument_change_lead_ms must be at least exchange_fee_check_interval_ms"
+                .to_string(),
+        );
+    }
+    if runtime.exchange_instrument_change_lead_ms > MAX_EXCHANGE_INSTRUMENT_CHANGE_LEAD_MS {
+        errors.push(format!(
+            "runtime.exchange_instrument_change_lead_ms must not exceed {MAX_EXCHANGE_INSTRUMENT_CHANGE_LEAD_MS}"
         ));
     }
     if !(10..=120).contains(&runtime.cancel_all_after_timeout_secs) {
@@ -2071,6 +2090,25 @@ mod tests {
         assert!(!report.valid);
         assert!(report.errors.iter().any(|error| {
             error.contains("exchange_fee_check_interval_ms must not exceed 300000")
+        }));
+
+        let mut short_change_lead = valid_config();
+        short_change_lead.runtime.exchange_instrument_change_lead_ms =
+            short_change_lead.runtime.exchange_fee_check_interval_ms - 1;
+        let report = short_change_lead.validate();
+        assert!(!report.valid);
+        assert!(report.errors.iter().any(|error| {
+            error.contains(
+                "exchange_instrument_change_lead_ms must be at least exchange_fee_check_interval_ms",
+            )
+        }));
+
+        let mut long_change_lead = valid_config();
+        long_change_lead.runtime.exchange_instrument_change_lead_ms = 604_800_001;
+        let report = long_change_lead.validate();
+        assert!(!report.valid);
+        assert!(report.errors.iter().any(|error| {
+            error.contains("exchange_instrument_change_lead_ms must not exceed 604800000")
         }));
     }
 

@@ -31,9 +31,10 @@ use reap_telemetry::{
     AlertStats, start_webhook_alerts,
 };
 use reap_venue::okx::{
-    HttpTransport, OKX_MIN_TRADE_FEE_REQUEST_INTERVAL_MS, OkxAdapter, OkxInstrument,
-    OkxInstrumentType, OkxRestClient, OkxSigner, OkxSystemEnvironment, OkxSystemServiceType,
-    OkxSystemStatus, OkxSystemStatusState, OkxTradeFeeRate, ReqwestTransport, RestError,
+    HttpTransport, OKX_MIN_ACCOUNT_INSTRUMENT_REQUEST_INTERVAL_MS,
+    OKX_MIN_TRADE_FEE_REQUEST_INTERVAL_MS, OkxAdapter, OkxInstrument, OkxInstrumentType,
+    OkxRestClient, OkxSigner, OkxSystemEnvironment, OkxSystemServiceType, OkxSystemStatus,
+    OkxSystemStatusState, OkxTradeFeeRate, ReqwestTransport, RestError,
 };
 use reap_venue::{PrivateOrderState, PrivateOrderUpdate, RemoteFill, RemoteOrder, VenueAdapter};
 use serde::{Deserialize, Serialize};
@@ -230,6 +231,10 @@ pub enum LiveRuntimeError {
     ExchangeFeeDrift(String),
     #[error("authenticated exchange fee check failed: {0}")]
     ExchangeFeeCheck(String),
+    #[error("authenticated exchange instrument metadata drifted: {0}")]
+    ExchangeInstrumentDrift(String),
+    #[error("authenticated exchange instrument check failed: {0}")]
+    ExchangeInstrumentCheck(String),
     #[error("authenticated account configuration drifted: {0}")]
     AccountConfigDrift(String),
     #[error("authenticated account configuration check failed: {0}")]
@@ -301,6 +306,8 @@ impl LiveRuntimeError {
             Self::ExchangeStatusCheck(_) => "exchange_status_check",
             Self::ExchangeFeeDrift(_) => "exchange_fee_drift",
             Self::ExchangeFeeCheck(_) => "exchange_fee_check",
+            Self::ExchangeInstrumentDrift(_) => "exchange_instrument_drift",
+            Self::ExchangeInstrumentCheck(_) => "exchange_instrument_check",
             Self::AccountConfigDrift(_) => "account_config_drift",
             Self::AccountConfigCheck(_) => "account_config_check",
             Self::SafetyLatchSyncTimeout(_) => "safety_latch_sync_timeout",
@@ -646,7 +653,7 @@ struct AccountSeed {
     signer: OkxSigner,
     gateway: LiveGateway,
     safety_client: OkxRestClient<ReqwestTransport>,
-    fee_guard: ExchangeFeeGuard,
+    instrument_guard: ExchangeInstrumentGuard,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -658,7 +665,7 @@ struct ExchangeStatusGuard {
 }
 
 #[derive(Debug, Clone)]
-struct ExchangeFeeExpectation {
+struct ExchangeInstrumentExpectation {
     symbol: String,
     instrument_type: OkxInstrumentType,
     instrument_id: Option<String>,
@@ -666,12 +673,14 @@ struct ExchangeFeeExpectation {
     group_id: String,
     configured_maker_cost: f64,
     configured_taker_cost: f64,
+    expected_instrument: OkxInstrument,
 }
 
 #[derive(Debug, Clone)]
-struct ExchangeFeeGuard {
+struct ExchangeInstrumentGuard {
     sweep_interval_ms: u64,
-    expectations: Vec<ExchangeFeeExpectation>,
+    change_lead_ms: u64,
+    expectations: Vec<ExchangeInstrumentExpectation>,
 }
 
 async fn bootstrap_accounts(
@@ -816,12 +825,15 @@ async fn bootstrap_accounts(
             open_orders.push(details);
         }
         let mut instruments = HashMap::new();
-        for instrument in config.instruments_for_account(&account.id) {
+        for (index, instrument) in config.instruments_for_account(&account.id).enumerate() {
+            if index > 0 {
+                tokio::time::sleep(Duration::from_millis(
+                    OKX_MIN_ACCOUNT_INSTRUMENT_REQUEST_INTERVAL_MS,
+                ))
+                .await;
+            }
             let metadata = client
-                .account_instruments(
-                    okx_instrument_type(instrument.kind),
-                    Some(&instrument.symbol),
-                )
+                .account_instrument(okx_instrument_type(instrument.kind), &instrument.symbol)
                 .await
                 .map_err(|error| {
                     bootstrap_error(
@@ -829,20 +841,16 @@ async fn bootstrap_accounts(
                         &format!("instrument {}", instrument.symbol),
                         error.to_string(),
                     )
-                })?
-                .into_iter()
-                .find(|metadata| metadata.symbol == instrument.symbol)
-                .ok_or_else(|| LiveRuntimeError::Bootstrap {
-                    account_id: account.id.clone(),
-                    message: format!("exchange returned no metadata for {}", instrument.symbol),
                 })?;
             instruments.insert(instrument.symbol.clone(), metadata);
         }
-        let fee_guard = ExchangeFeeGuard {
+        let instrument_guard = ExchangeInstrumentGuard {
             sweep_interval_ms: config.runtime.exchange_fee_check_interval_ms,
-            expectations: exchange_fee_expectations(config, &account.id, &instruments)?,
+            change_lead_ms: config.runtime.exchange_instrument_change_lead_ms,
+            expectations: exchange_instrument_expectations(config, &account.id, &instruments)?,
         };
-        verify_initial_exchange_fees(&account.id, &client, &fee_guard).await?;
+        verify_initial_exchange_instruments(&account.id, &instrument_guard, unix_time_ms())?;
+        verify_initial_exchange_fees(&account.id, &client, &instrument_guard).await?;
         snapshots.insert(
             account.id.clone(),
             AccountBootstrapSnapshot {
@@ -861,7 +869,7 @@ async fn bootstrap_accounts(
             signer,
             gateway,
             safety_client,
-            fee_guard,
+            instrument_guard,
         });
     }
     let verified = verify_bootstrap(config, &snapshots)
@@ -880,24 +888,24 @@ where
     Ok(midpoint_ms.abs_diff(exchange_ms))
 }
 
-fn exchange_fee_expectations(
+fn exchange_instrument_expectations(
     config: &LiveConfig,
     account_id: &str,
     instruments: &HashMap<String, OkxInstrument>,
-) -> Result<Vec<ExchangeFeeExpectation>, LiveRuntimeError> {
+) -> Result<Vec<ExchangeInstrumentExpectation>, LiveRuntimeError> {
     config
         .instruments_for_account(account_id)
         .map(|configured| {
             let metadata = instruments.get(&configured.symbol).ok_or_else(|| {
-                LiveRuntimeError::ExchangeFeeCheck(format!(
-                    "account {account_id} has no fee metadata for {}",
+                LiveRuntimeError::ExchangeInstrumentCheck(format!(
+                    "account {account_id} has no instrument metadata for {}",
                     configured.symbol
                 ))
             })?;
             let expected_type = okx_instrument_type(configured.kind);
             if metadata.instrument_type != expected_type {
-                return Err(LiveRuntimeError::ExchangeFeeCheck(format!(
-                    "account {account_id} {} fee metadata type is {:?}, expected {:?}",
+                return Err(LiveRuntimeError::ExchangeInstrumentDrift(format!(
+                    "account {account_id} {} metadata type is {:?}, expected {:?}",
                     configured.symbol, metadata.instrument_type, expected_type
                 )));
             }
@@ -925,7 +933,7 @@ fn exchange_fee_expectations(
                     (None, Some(family.to_string()))
                 }
             };
-            Ok(ExchangeFeeExpectation {
+            Ok(ExchangeInstrumentExpectation {
                 symbol: configured.symbol.clone(),
                 instrument_type: expected_type,
                 instrument_id,
@@ -933,6 +941,7 @@ fn exchange_fee_expectations(
                 group_id: group_id.to_string(),
                 configured_maker_cost: configured.maker_fee,
                 configured_taker_cost: configured.taker_fee,
+                expected_instrument: metadata.clone(),
             })
         })
         .collect()
@@ -940,7 +949,7 @@ fn exchange_fee_expectations(
 
 async fn fetch_exchange_fee<T>(
     client: &OkxRestClient<T>,
-    expectation: &ExchangeFeeExpectation,
+    expectation: &ExchangeInstrumentExpectation,
 ) -> Result<OkxTradeFeeRate, RestError>
 where
     T: HttpTransport,
@@ -956,7 +965,7 @@ where
 }
 
 fn exchange_fee_drift_reason(
-    expectation: &ExchangeFeeExpectation,
+    expectation: &ExchangeInstrumentExpectation,
     rate: &OkxTradeFeeRate,
 ) -> Option<String> {
     const RATE_EPSILON: f64 = 1e-12;
@@ -980,10 +989,124 @@ fn exchange_fee_drift_reason(
     })
 }
 
+fn exchange_instrument_drift_reason(
+    expectation: &ExchangeInstrumentExpectation,
+    current: &OkxInstrument,
+    now_ms: u64,
+    change_lead_ms: u64,
+) -> Option<String> {
+    let expected = &expectation.expected_instrument;
+    if current.state != "live" {
+        return Some(format!(
+            "{} state changed from {:?} to {:?}",
+            expectation.symbol, expected.state, current.state
+        ));
+    }
+
+    macro_rules! check_field {
+        ($name:literal, $expected:expr, $current:expr) => {
+            if $expected != $current {
+                return Some(format!(
+                    "{} {} changed from {:?} to {:?}",
+                    expectation.symbol, $name, $expected, $current
+                ));
+            }
+        };
+    }
+
+    check_field!("symbol", expected.symbol, current.symbol);
+    check_field!(
+        "instrument type",
+        expected.instrument_type,
+        current.instrument_type
+    );
+    check_field!(
+        "instrument family",
+        expected.instrument_family,
+        current.instrument_family
+    );
+    check_field!(
+        "fee group",
+        expected.trade_fee_group_id,
+        current.trade_fee_group_id
+    );
+    check_field!("underlying", expected.underlying, current.underlying);
+    check_field!(
+        "base currency",
+        expected.base_currency,
+        current.base_currency
+    );
+    check_field!(
+        "quote currency",
+        expected.quote_currency,
+        current.quote_currency
+    );
+    check_field!(
+        "settle currency",
+        expected.settle_currency,
+        current.settle_currency
+    );
+    check_field!(
+        "contract type",
+        expected.contract_type,
+        current.contract_type
+    );
+    check_field!(
+        "contract value",
+        expected.contract_value,
+        current.contract_value
+    );
+    check_field!(
+        "contract value currency",
+        expected.contract_value_currency,
+        current.contract_value_currency
+    );
+    check_field!("tick size", expected.tick_size, current.tick_size);
+    check_field!("lot size", expected.lot_size, current.lot_size);
+    check_field!("minimum size", expected.min_size, current.min_size);
+
+    let cutoff_ms = now_ms.saturating_add(change_lead_ms);
+    current
+        .upcoming_changes
+        .iter()
+        .filter(|change| change.effective_time_ms <= cutoff_ms)
+        .min_by_key(|change| change.effective_time_ms)
+        .map(|change| {
+            format!(
+                "{} announced {} change to {} effective at {} inside the {}ms guard lead",
+                expectation.symbol,
+                change.parameter.as_okx_str(),
+                change.new_value,
+                change.effective_time_ms,
+                change_lead_ms
+            )
+        })
+}
+
+fn verify_initial_exchange_instruments(
+    account_id: &str,
+    guard: &ExchangeInstrumentGuard,
+    now_ms: u64,
+) -> Result<(), LiveRuntimeError> {
+    for expectation in &guard.expectations {
+        if let Some(reason) = exchange_instrument_drift_reason(
+            expectation,
+            &expectation.expected_instrument,
+            now_ms,
+            guard.change_lead_ms,
+        ) {
+            return Err(LiveRuntimeError::ExchangeInstrumentDrift(format!(
+                "account {account_id}: {reason}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 async fn verify_initial_exchange_fees<T>(
     account_id: &str,
     client: &OkxRestClient<T>,
-    guard: &ExchangeFeeGuard,
+    guard: &ExchangeInstrumentGuard,
 ) -> Result<(), LiveRuntimeError>
 where
     T: HttpTransport,
@@ -1608,7 +1731,7 @@ impl LiveRuntime {
                 signer,
                 mut gateway,
                 safety_client,
-                fee_guard,
+                instrument_guard,
             } = seed;
             let deadman_timeout_secs =
                 (mode == LiveMode::Demo).then_some(config.runtime.cancel_all_after_timeout_secs);
@@ -1644,7 +1767,7 @@ impl LiveRuntime {
                     check_interval_ms: config.runtime.exchange_status_check_interval_ms,
                     lead_ms: config.runtime.exchange_status_lead_ms,
                 },
-                fee_guard,
+                instrument_guard,
             )));
             let private_adapter: Arc<dyn VenueAdapter> = Arc::new(
                 OkxAdapter::new(&config.venue.public_ws_url, &config.venue.private_ws_url)
@@ -3706,6 +3829,8 @@ enum RuntimeTaskFailure {
     ExchangeStatusCheck(String),
     ExchangeFeeDrift(String),
     ExchangeFeeCheck(String),
+    ExchangeInstrumentDrift(String),
+    ExchangeInstrumentCheck(String),
     AccountConfigDrift(String),
     AccountConfigCheck(String),
 }
@@ -3721,6 +3846,12 @@ impl From<RuntimeTaskFailure> for LiveRuntimeError {
             RuntimeTaskFailure::ExchangeStatusCheck(message) => Self::ExchangeStatusCheck(message),
             RuntimeTaskFailure::ExchangeFeeDrift(message) => Self::ExchangeFeeDrift(message),
             RuntimeTaskFailure::ExchangeFeeCheck(message) => Self::ExchangeFeeCheck(message),
+            RuntimeTaskFailure::ExchangeInstrumentDrift(message) => {
+                Self::ExchangeInstrumentDrift(message)
+            }
+            RuntimeTaskFailure::ExchangeInstrumentCheck(message) => {
+                Self::ExchangeInstrumentCheck(message)
+            }
             RuntimeTaskFailure::AccountConfigDrift(message) => Self::AccountConfigDrift(message),
             RuntimeTaskFailure::AccountConfigCheck(message) => Self::AccountConfigCheck(message),
         }
@@ -4195,10 +4326,10 @@ where
     Ok((remote_orders, remote_fills, remote_account))
 }
 
-async fn run_exchange_fee_guard<T>(
+async fn run_exchange_instrument_guard<T>(
     account_id: String,
     client: OkxRestClient<T>,
-    guard: ExchangeFeeGuard,
+    guard: ExchangeInstrumentGuard,
 ) -> RuntimeTaskFailure
 where
     T: HttpTransport,
@@ -4216,6 +4347,28 @@ where
     loop {
         interval.tick().await;
         let expectation = &guard.expectations[next];
+        let instrument = match client
+            .account_instrument(expectation.instrument_type, &expectation.symbol)
+            .await
+        {
+            Ok(instrument) => instrument,
+            Err(error) => {
+                return RuntimeTaskFailure::ExchangeInstrumentCheck(format!(
+                    "account {account_id} {}: {error}",
+                    expectation.symbol
+                ));
+            }
+        };
+        if let Some(reason) = exchange_instrument_drift_reason(
+            expectation,
+            &instrument,
+            unix_time_ms(),
+            guard.change_lead_ms,
+        ) {
+            return RuntimeTaskFailure::ExchangeInstrumentDrift(format!(
+                "account {account_id}: {reason}"
+            ));
+        }
         let rate = match fetch_exchange_fee(&client, expectation).await {
             Ok(rate) => rate,
             Err(error) => {
@@ -4249,14 +4402,14 @@ async fn run_account_safety_task<T>(
     clock_check_interval_ms: u64,
     max_clock_skew_ms: u64,
     exchange_status_guard: ExchangeStatusGuard,
-    exchange_fee_guard: ExchangeFeeGuard,
+    exchange_instrument_guard: ExchangeInstrumentGuard,
 ) where
     T: HttpTransport + Clone + 'static,
 {
-    let mut fee_task = tokio::spawn(run_exchange_fee_guard(
+    let mut instrument_task = tokio::spawn(run_exchange_instrument_guard(
         account_id.clone(),
         client.clone(),
-        exchange_fee_guard,
+        exchange_instrument_guard,
     ));
     let mut deadman = tokio::time::interval(Duration::from_millis(deadman_heartbeat_ms));
     deadman.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -4272,11 +4425,11 @@ async fn run_account_safety_task<T>(
 
     let terminal_failure = loop {
         tokio::select! {
-            fee_result = &mut fee_task => {
-                break Some(match fee_result {
+            instrument_result = &mut instrument_task => {
+                break Some(match instrument_result {
                     Ok(failure) => failure,
-                    Err(error) => RuntimeTaskFailure::ExchangeFeeCheck(format!(
-                        "account {account_id} fee guard task failed: {error}"
+                    Err(error) => RuntimeTaskFailure::ExchangeInstrumentCheck(format!(
+                        "account {account_id} instrument/fee guard task failed: {error}"
                     )),
                 });
             }
@@ -4352,9 +4505,9 @@ async fn run_account_safety_task<T>(
         }
     };
 
-    if !fee_task.is_finished() {
-        fee_task.abort();
-        let _ = fee_task.await;
+    if !instrument_task.is_finished() {
+        instrument_task.abort();
+        let _ = instrument_task.await;
     }
     if let Some(failure) = terminal_failure {
         let _ = events.send(RuntimeEvent::Fatal(failure)).await;
@@ -4767,8 +4920,9 @@ mod tests {
     use reap_strategy::{ChaosConfig, InstrumentKindConfig};
     use reap_venue::okx::{
         HttpResponse, OkxAccountConfig, OkxAccountLevel, OkxCancelOrder, OkxCredentials,
-        OkxInstrumentType, OkxOrderAck, OkxPlaceOrder, OkxPositionMode, OkxRestClient, OkxSigner,
-        OkxTradeMode, RestError, SignedRequest,
+        OkxInstrumentChange, OkxInstrumentChangeParameter, OkxInstrumentType, OkxOrderAck,
+        OkxPlaceOrder, OkxPositionMode, OkxRestClient, OkxSigner, OkxTradeMode, RestError,
+        SignedRequest,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{Notify, Semaphore};
@@ -5170,6 +5324,20 @@ mod tests {
             "exchange_fee_check"
         );
         assert_eq!(
+            live_failure_evidence(&LiveRuntimeError::ExchangeInstrumentDrift(
+                "test".to_string()
+            ))
+            .code,
+            "exchange_instrument_drift"
+        );
+        assert_eq!(
+            live_failure_evidence(&LiveRuntimeError::ExchangeInstrumentCheck(
+                "test".to_string()
+            ))
+            .code,
+            "exchange_instrument_check"
+        );
+        assert_eq!(
             live_failure_evidence(&LiveRuntimeError::AccountConfigDrift("test".to_string())).code,
             "account_config_drift"
         );
@@ -5229,6 +5397,12 @@ mod tests {
     #[async_trait]
     impl HttpTransport for BlockingFeeTransport {
         async fn execute(&self, request: SignedRequest) -> Result<HttpResponse, RestError> {
+            if request.path.starts_with("/api/v5/account/instruments?") {
+                return Ok(HttpResponse {
+                    status: 200,
+                    body: spot_instrument_response().to_string(),
+                });
+            }
             if request.path.starts_with("/api/v5/account/trade-fee?") {
                 self.fee_started.notify_one();
                 return std::future::pending().await;
@@ -5242,6 +5416,31 @@ mod tests {
                 });
             }
             panic!("unexpected blocking-fee request {}", request.path);
+        }
+    }
+
+    #[derive(Clone)]
+    struct BlockingInstrumentTransport {
+        instrument_started: Arc<Notify>,
+        deadman_seen: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl HttpTransport for BlockingInstrumentTransport {
+        async fn execute(&self, request: SignedRequest) -> Result<HttpResponse, RestError> {
+            if request.path.starts_with("/api/v5/account/instruments?") {
+                self.instrument_started.notify_one();
+                return std::future::pending().await;
+            }
+            if request.path == "/api/v5/trade/cancel-all-after" {
+                self.deadman_seen.notify_one();
+                return Ok(HttpResponse {
+                    status: 200,
+                    body: r#"{"code":"0","msg":"","data":[{"triggerTime":"1","tag":"","ts":"1"}]}"#
+                        .to_string(),
+                });
+            }
+            panic!("unexpected blocking-instrument request {}", request.path);
         }
     }
 
@@ -5287,21 +5486,22 @@ mod tests {
         }
     }
 
-    fn exchange_fee_guard(
+    fn exchange_instrument_guard(
         check_interval_ms: u64,
-        expectations: Vec<ExchangeFeeExpectation>,
-    ) -> ExchangeFeeGuard {
-        ExchangeFeeGuard {
+        expectations: Vec<ExchangeInstrumentExpectation>,
+    ) -> ExchangeInstrumentGuard {
+        ExchangeInstrumentGuard {
             sweep_interval_ms: check_interval_ms,
+            change_lead_ms: 3_600_000,
             expectations,
         }
     }
 
-    fn exchange_fee_expectation(
+    fn exchange_instrument_expectation(
         configured_maker_cost: f64,
         configured_taker_cost: f64,
-    ) -> ExchangeFeeExpectation {
-        ExchangeFeeExpectation {
+    ) -> ExchangeInstrumentExpectation {
+        ExchangeInstrumentExpectation {
             symbol: "BTC-USDT".to_string(),
             instrument_type: OkxInstrumentType::Spot,
             instrument_id: Some("BTC-USDT".to_string()),
@@ -5309,7 +5509,33 @@ mod tests {
             group_id: "1".to_string(),
             configured_maker_cost,
             configured_taker_cost,
+            expected_instrument: spot_instrument(Vec::new()),
         }
+    }
+
+    fn spot_instrument(upcoming_changes: Vec<OkxInstrumentChange>) -> OkxInstrument {
+        OkxInstrument {
+            symbol: "BTC-USDT".to_string(),
+            instrument_type: OkxInstrumentType::Spot,
+            instrument_family: String::new(),
+            trade_fee_group_id: "1".to_string(),
+            underlying: String::new(),
+            base_currency: "BTC".to_string(),
+            quote_currency: "USDT".to_string(),
+            settle_currency: String::new(),
+            contract_type: None,
+            contract_value: None,
+            contract_value_currency: String::new(),
+            tick_size: 0.1,
+            lot_size: 0.001,
+            min_size: 0.001,
+            state: "live".to_string(),
+            upcoming_changes,
+        }
+    }
+
+    fn spot_instrument_response() -> &'static str {
+        r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","instFamily":"","groupId":"1","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"","ctType":"","ctVal":"","ctValCcy":"","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","state":"live","upcChg":[]}]}"#
     }
 
     fn status(conn_id: &str, kind: ConnectionStatusKind) -> ConnectionStatus {
@@ -6573,7 +6799,7 @@ mod tests {
             60_000,
             1_000,
             exchange_status_guard(false, 60_000),
-            exchange_fee_guard(60_000, Vec::new()),
+            exchange_instrument_guard(60_000, Vec::new()),
         ));
         let (result_tx, result_rx) = oneshot::channel();
         command_tx
@@ -6608,7 +6834,7 @@ mod tests {
             60_000,
             1_000,
             exchange_status_guard(false, 60_000),
-            exchange_fee_guard(60_000, Vec::new()),
+            exchange_instrument_guard(60_000, Vec::new()),
         ));
 
         let event = tokio::time::timeout(Duration::from_millis(100), event_rx.recv())
@@ -6647,7 +6873,7 @@ mod tests {
             60_000,
             1_000,
             exchange_status_guard(false, 60_000),
-            exchange_fee_guard(400, vec![exchange_fee_expectation(0.001, 0.001)]),
+            exchange_instrument_guard(400, vec![exchange_instrument_expectation(0.001, 0.001)]),
         ));
 
         tokio::time::timeout(Duration::from_secs(1), fee_started.notified())
@@ -6656,6 +6882,45 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), deadman_seen.notified())
             .await
             .expect("deadman heartbeat was blocked by fee request");
+        assert!(event_rx.try_recv().is_err());
+
+        command_tx.send(SafetyTaskCommand::Shutdown).await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocked_exchange_instrument_check_does_not_delay_deadman_heartbeat() {
+        let instrument_started = Arc::new(Notify::new());
+        let deadman_seen = Arc::new(Notify::new());
+        let client = OkxRestClient::new(
+            BlockingInstrumentTransport {
+                instrument_started: Arc::clone(&instrument_started),
+                deadman_seen: Arc::clone(&deadman_seen),
+            },
+            OkxSigner::new(OkxCredentials::new("key", "secret", "pass"), true),
+        );
+        let (command_tx, command_rx) = mpsc::channel(2);
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+        let task = tokio::spawn(run_account_safety_task(
+            "main".to_string(),
+            client,
+            safety_account_config(),
+            command_rx,
+            event_tx,
+            Some(30),
+            500,
+            60_000,
+            1_000,
+            exchange_status_guard(false, 60_000),
+            exchange_instrument_guard(400, vec![exchange_instrument_expectation(0.001, 0.001)]),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), instrument_started.notified())
+            .await
+            .expect("instrument request did not start");
+        tokio::time::timeout(Duration::from_secs(1), deadman_seen.notified())
+            .await
+            .expect("deadman heartbeat was blocked by instrument request");
         assert!(event_rx.try_recv().is_err());
 
         command_tx.send(SafetyTaskCommand::Shutdown).await.unwrap();
@@ -6679,7 +6944,7 @@ mod tests {
             1,
             1,
             exchange_status_guard(false, 60_000),
-            exchange_fee_guard(60_000, Vec::new()),
+            exchange_instrument_guard(60_000, Vec::new()),
         ));
 
         let event = tokio::time::timeout(Duration::from_millis(100), event_rx.recv())
@@ -6716,7 +6981,7 @@ mod tests {
             1,
             u64::MAX,
             exchange_status_guard(false, 60_000),
-            exchange_fee_guard(60_000, Vec::new()),
+            exchange_instrument_guard(60_000, Vec::new()),
         ));
 
         let event = tokio::time::timeout(Duration::from_millis(100), event_rx.recv())
@@ -6802,7 +7067,7 @@ mod tests {
 
     #[test]
     fn exchange_fee_guard_converts_signed_rates_and_allows_conservative_config() {
-        let mut expectation = exchange_fee_expectation(0.0002, 0.0005);
+        let mut expectation = exchange_instrument_expectation(0.0002, 0.0005);
         let rate = OkxTradeFeeRate {
             instrument_type: OkxInstrumentType::Spot,
             group_id: "1".to_string(),
@@ -6832,6 +7097,56 @@ mod tests {
     }
 
     #[test]
+    fn exchange_instrument_guard_detects_rule_drift_and_announced_changes() {
+        let expectation = exchange_instrument_expectation(0.001, 0.001);
+        let mut current = expectation.expected_instrument.clone();
+        assert!(exchange_instrument_drift_reason(&expectation, &current, 1_000, 100).is_none());
+
+        current.tick_size = 0.01;
+        let reason = exchange_instrument_drift_reason(&expectation, &current, 1_000, 100).unwrap();
+        assert!(reason.contains("tick size changed"));
+
+        current = expectation.expected_instrument.clone();
+        current.upcoming_changes.push(OkxInstrumentChange {
+            parameter: OkxInstrumentChangeParameter::MinimumSize,
+            new_value: 0.01,
+            effective_time_ms: 1_101,
+        });
+        assert!(exchange_instrument_drift_reason(&expectation, &current, 1_000, 100).is_none());
+        current.upcoming_changes[0].effective_time_ms = 1_100;
+        let reason = exchange_instrument_drift_reason(&expectation, &current, 1_000, 100).unwrap();
+        assert!(reason.contains("announced minSz change"));
+
+        current = expectation.expected_instrument.clone();
+        current.state = "post_only".to_string();
+        let reason = exchange_instrument_drift_reason(&expectation, &current, 1_000, 100).unwrap();
+        assert!(reason.contains("state changed"));
+    }
+
+    #[test]
+    fn initial_announced_instrument_change_is_typed() {
+        let mut expectation = exchange_instrument_expectation(0.001, 0.001);
+        expectation
+            .expected_instrument
+            .upcoming_changes
+            .push(OkxInstrumentChange {
+                parameter: OkxInstrumentChangeParameter::TickSize,
+                new_value: 0.01,
+                effective_time_ms: 1_100,
+            });
+        let mut guard = exchange_instrument_guard(400, vec![expectation]);
+        guard.change_lead_ms = 100;
+
+        let error = verify_initial_exchange_instruments("main", &guard, 1_000).unwrap_err();
+
+        assert!(matches!(
+            error,
+            LiveRuntimeError::ExchangeInstrumentDrift(message)
+                if message.contains("account main") && message.contains("tickSz")
+        ));
+    }
+
+    #[test]
     fn exchange_fee_request_spacing_finishes_within_the_sweep_deadline() {
         assert_eq!(exchange_fee_request_interval_ms(1_001, 2), 500);
         assert_eq!(exchange_fee_request_interval_ms(800, 2), 400);
@@ -6842,7 +7157,10 @@ mod tests {
         let (client, requests) = safety_client(vec![Ok(
             r#"{"code":"0","msg":"","data":[{"feeGroup":[{"groupId":"1","maker":"-0.0008","taker":"-0.001"}],"instType":"SPOT","level":"Lv1","ts":"1763979985847"}]}"#,
         )]);
-        let guard = exchange_fee_guard(60_000, vec![exchange_fee_expectation(0.0002, 0.0005)]);
+        let guard = exchange_instrument_guard(
+            60_000,
+            vec![exchange_instrument_expectation(0.0002, 0.0005)],
+        );
 
         let error = verify_initial_exchange_fees("main", &client, &guard)
             .await
@@ -6858,9 +7176,12 @@ mod tests {
 
     #[tokio::test]
     async fn periodic_exchange_fee_understatement_is_fatal() {
-        let (client, requests) = safety_client(vec![Ok(
-            r#"{"code":"0","msg":"","data":[{"feeGroup":[{"groupId":"1","maker":"-0.0008","taker":"-0.001"}],"instType":"SPOT","level":"Lv1","ts":"1763979985847"}]}"#,
-        )]);
+        let (client, requests) = safety_client(vec![
+            Ok(spot_instrument_response()),
+            Ok(
+                r#"{"code":"0","msg":"","data":[{"feeGroup":[{"groupId":"1","maker":"-0.0008","taker":"-0.001"}],"instType":"SPOT","level":"Lv1","ts":"1763979985847"}]}"#,
+            ),
+        ]);
         let (_command_tx, command_rx) = mpsc::channel(2);
         let (event_tx, mut event_rx) = mpsc::channel(2);
         let task = tokio::spawn(run_account_safety_task(
@@ -6874,7 +7195,7 @@ mod tests {
             60_000,
             1_000,
             exchange_status_guard(false, 60_000),
-            exchange_fee_guard(400, vec![exchange_fee_expectation(0.0002, 0.0005)]),
+            exchange_instrument_guard(400, vec![exchange_instrument_expectation(0.0002, 0.0005)]),
         ));
 
         let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
@@ -6888,17 +7209,88 @@ mod tests {
         ));
         task.await.unwrap();
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
+        assert_eq!(requests.len(), 2);
         assert_eq!(
             requests[0].path,
+            "/api/v5/account/instruments?instType=SPOT&instId=BTC-USDT"
+        );
+        assert_eq!(
+            requests[1].path,
             "/api/v5/account/trade-fee?instType=SPOT&instId=BTC-USDT"
         );
     }
 
     #[tokio::test]
     async fn periodic_exchange_fee_check_failure_is_typed() {
+        let (client, _) = safety_client(vec![
+            Ok(spot_instrument_response()),
+            Err(RestError::Transport("injected fee failure".to_string())),
+        ]);
+        let (_command_tx, command_rx) = mpsc::channel(2);
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+        let task = tokio::spawn(run_account_safety_task(
+            "main".to_string(),
+            client,
+            safety_account_config(),
+            command_rx,
+            event_tx,
+            None,
+            60_000,
+            60_000,
+            1_000,
+            exchange_status_guard(false, 60_000),
+            exchange_instrument_guard(400, vec![exchange_instrument_expectation(0.001, 0.001)]),
+        ));
+
+        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            RuntimeEvent::Fatal(RuntimeTaskFailure::ExchangeFeeCheck(message))
+                if message.contains("injected fee failure")
+        ));
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn periodic_exchange_instrument_drift_is_fatal() {
+        let changed = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","instFamily":"","groupId":"1","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"","ctType":"","ctVal":"","ctValCcy":"","tickSz":"0.01","lotSz":"0.001","minSz":"0.001","state":"live","upcChg":[]}]}"#;
+        let (client, requests) = safety_client(vec![Ok(changed)]);
+        let (_command_tx, command_rx) = mpsc::channel(2);
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+        let task = tokio::spawn(run_account_safety_task(
+            "main".to_string(),
+            client,
+            safety_account_config(),
+            command_rx,
+            event_tx,
+            None,
+            60_000,
+            60_000,
+            1_000,
+            exchange_status_guard(false, 60_000),
+            exchange_instrument_guard(400, vec![exchange_instrument_expectation(0.001, 0.001)]),
+        ));
+
+        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            RuntimeEvent::Fatal(RuntimeTaskFailure::ExchangeInstrumentDrift(message))
+                if message.contains("tick size changed")
+        ));
+        task.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn periodic_exchange_instrument_check_failure_is_typed() {
         let (client, _) = safety_client(vec![Err(RestError::Transport(
-            "injected fee failure".to_string(),
+            "injected instrument failure".to_string(),
         ))]);
         let (_command_tx, command_rx) = mpsc::channel(2);
         let (event_tx, mut event_rx) = mpsc::channel(2);
@@ -6913,7 +7305,7 @@ mod tests {
             60_000,
             1_000,
             exchange_status_guard(false, 60_000),
-            exchange_fee_guard(400, vec![exchange_fee_expectation(0.001, 0.001)]),
+            exchange_instrument_guard(400, vec![exchange_instrument_expectation(0.001, 0.001)]),
         ));
 
         let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
@@ -6922,8 +7314,8 @@ mod tests {
             .unwrap();
         assert!(matches!(
             event,
-            RuntimeEvent::Fatal(RuntimeTaskFailure::ExchangeFeeCheck(message))
-                if message.contains("injected fee failure")
+            RuntimeEvent::Fatal(RuntimeTaskFailure::ExchangeInstrumentCheck(message))
+                if message.contains("injected instrument failure")
         ));
         task.await.unwrap();
     }
@@ -6946,7 +7338,7 @@ mod tests {
             60_000,
             1_000,
             exchange_status_guard(true, 1),
-            exchange_fee_guard(60_000, Vec::new()),
+            exchange_instrument_guard(60_000, Vec::new()),
         ));
 
         let event = tokio::time::timeout(Duration::from_millis(100), event_rx.recv())
@@ -6982,7 +7374,7 @@ mod tests {
             60_000,
             1_000,
             exchange_status_guard(true, 1),
-            exchange_fee_guard(60_000, Vec::new()),
+            exchange_instrument_guard(60_000, Vec::new()),
         ));
 
         let event = tokio::time::timeout(Duration::from_millis(100), event_rx.recv())

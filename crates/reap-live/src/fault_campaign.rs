@@ -11,8 +11,8 @@ use crate::{
     MAX_LIVE_RUN_REPORT_BYTES, verify_live_run_paths,
 };
 
-pub const LIVE_FAULT_MATRIX_MANIFEST_SCHEMA_VERSION: u32 = 2;
-pub const LIVE_FAULT_MATRIX_REPORT_FORMAT_VERSION: u32 = 2;
+pub const LIVE_FAULT_MATRIX_MANIFEST_SCHEMA_VERSION: u32 = 3;
+pub const LIVE_FAULT_MATRIX_REPORT_FORMAT_VERSION: u32 = 3;
 pub const MAX_LIVE_FAULT_MATRIX_MANIFEST_BYTES: u64 = 1024 * 1024;
 pub const MAX_LIVE_FAULT_INJECTOR_EVIDENCE_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_LIVE_FAULT_MATRIX_RUNS: usize = 32;
@@ -33,11 +33,14 @@ pub enum LiveFaultScenario {
     RestoredSafetyLatch,
     DeadmanHeartbeatFailure,
     ExchangeClockFailure,
+    ExchangeStatusFailure,
+    ExchangeInstrumentFailure,
+    ExchangeFeeFailure,
     AccountConfigFailure,
 }
 
 impl LiveFaultScenario {
-    pub const REQUIRED: [Self; 14] = [
+    pub const REQUIRED: [Self; 17] = [
         Self::CleanObserve,
         Self::CleanDemo,
         Self::PublicReconnect,
@@ -51,6 +54,9 @@ impl LiveFaultScenario {
         Self::RestoredSafetyLatch,
         Self::DeadmanHeartbeatFailure,
         Self::ExchangeClockFailure,
+        Self::ExchangeStatusFailure,
+        Self::ExchangeInstrumentFailure,
+        Self::ExchangeFeeFailure,
         Self::AccountConfigFailure,
     ];
 
@@ -129,6 +135,9 @@ pub enum LiveFaultScenarioFailure {
     RestoredSafetyLatchMissing,
     DeadmanHeartbeatFailureMissing,
     ExchangeClockFailureMissing,
+    ExchangeStatusFailureMissing,
+    ExchangeInstrumentFailureMissing,
+    ExchangeFeeFailureMissing,
     AccountConfigFailureMissing,
 }
 
@@ -629,6 +638,42 @@ fn evaluate_scenario(
                 failures.push(LiveFaultScenarioFailure::ExchangeClockFailureMissing);
             }
         }
+        LiveFaultScenario::ExchangeStatusFailure => {
+            require_demo(report, &mut failures);
+            require_safe_runtime_failure_shutdown(report, &mut failures);
+            if !report.failure.as_ref().is_some_and(|failure| {
+                matches!(
+                    failure.code.as_str(),
+                    "exchange_status" | "exchange_status_check"
+                )
+            }) {
+                failures.push(LiveFaultScenarioFailure::ExchangeStatusFailureMissing);
+            }
+        }
+        LiveFaultScenario::ExchangeInstrumentFailure => {
+            require_demo(report, &mut failures);
+            require_safe_runtime_failure_shutdown(report, &mut failures);
+            if !report.failure.as_ref().is_some_and(|failure| {
+                matches!(
+                    failure.code.as_str(),
+                    "exchange_instrument_drift" | "exchange_instrument_check"
+                )
+            }) {
+                failures.push(LiveFaultScenarioFailure::ExchangeInstrumentFailureMissing);
+            }
+        }
+        LiveFaultScenario::ExchangeFeeFailure => {
+            require_demo(report, &mut failures);
+            require_safe_runtime_failure_shutdown(report, &mut failures);
+            if !report.failure.as_ref().is_some_and(|failure| {
+                matches!(
+                    failure.code.as_str(),
+                    "exchange_fee_drift" | "exchange_fee_check"
+                )
+            }) {
+                failures.push(LiveFaultScenarioFailure::ExchangeFeeFailureMissing);
+            }
+        }
         LiveFaultScenario::AccountConfigFailure => {
             require_demo(report, &mut failures);
             require_safe_runtime_failure_shutdown(report, &mut failures);
@@ -825,7 +870,10 @@ fn fault_failure_rank(failure: &LiveFaultScenarioFailure) -> u8 {
         LiveFaultScenarioFailure::RestoredSafetyLatchMissing => 19,
         LiveFaultScenarioFailure::DeadmanHeartbeatFailureMissing => 20,
         LiveFaultScenarioFailure::ExchangeClockFailureMissing => 21,
-        LiveFaultScenarioFailure::AccountConfigFailureMissing => 22,
+        LiveFaultScenarioFailure::ExchangeStatusFailureMissing => 22,
+        LiveFaultScenarioFailure::ExchangeInstrumentFailureMissing => 23,
+        LiveFaultScenarioFailure::ExchangeFeeFailureMissing => 24,
+        LiveFaultScenarioFailure::AccountConfigFailureMissing => 25,
     }
 }
 
@@ -1050,6 +1098,15 @@ mod tests {
             LiveFaultScenario::ExchangeClockFailure => {
                 set_runtime_failure(&mut report, "exchange_clock_skew");
             }
+            LiveFaultScenario::ExchangeStatusFailure => {
+                set_runtime_failure(&mut report, "exchange_status");
+            }
+            LiveFaultScenario::ExchangeInstrumentFailure => {
+                set_runtime_failure(&mut report, "exchange_instrument_drift");
+            }
+            LiveFaultScenario::ExchangeFeeFailure => {
+                set_runtime_failure(&mut report, "exchange_fee_drift");
+            }
             LiveFaultScenario::AccountConfigFailure => {
                 set_runtime_failure(&mut report, "account_config_drift");
             }
@@ -1111,6 +1168,42 @@ mod tests {
                 .iter()
                 .filter(|run| run.scenario.requires_injector_evidence())
                 .all(|run| run.injector_evidence.is_some())
+        );
+    }
+
+    #[test]
+    fn fault_matrix_rejects_a_different_typed_exchange_failure() {
+        let fixture = build_fixture();
+        let instrument_path = fixture
+            .manifest
+            .runs
+            .iter()
+            .find(|run| run.scenario == LiveFaultScenario::ExchangeInstrumentFailure)
+            .unwrap()
+            .report
+            .clone();
+        let mut instrument: LiveRunReport =
+            serde_json::from_slice(&std::fs::read(&instrument_path).unwrap()).unwrap();
+        instrument.failure.as_mut().unwrap().code = "exchange_fee_drift".to_string();
+        std::fs::write(
+            &instrument_path,
+            serde_json::to_vec_pretty(&instrument).unwrap(),
+        )
+        .unwrap();
+
+        let report =
+            verify_live_fault_matrix_paths(&fixture.config_path, &fixture.manifest_path).unwrap();
+
+        assert!(!report.live_fault_matrix_passed);
+        let instrument = report
+            .runs
+            .iter()
+            .find(|run| run.scenario == LiveFaultScenario::ExchangeInstrumentFailure)
+            .unwrap();
+        assert!(
+            instrument
+                .scenario_failures
+                .contains(&LiveFaultScenarioFailure::ExchangeInstrumentFailureMissing)
         );
     }
 

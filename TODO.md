@@ -268,6 +268,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
   `groupId` and `feeGroup` rate, reject configured maker/taker costs that
   understate commissions or overstate rebates, and repeat a paced full-account
   sweep without allowing a blocked fee request to delay Cancel All After.
+- [x] Revalidate each exact authenticated OKX instrument before its periodic fee
+  check, reject state, sizing, valuation, currency, family, or fee-group drift,
+  and fail before typed `upcChg` rule changes enter a one-hour review lead.
 - [ ] Calibrate queue position, latency, fees, funding, and slippage from
   captured full-depth data, then run and archive production-candidate
   walk-forward, capacity, and stressed-liquidity reports. The orchestration and

@@ -13,7 +13,7 @@ production trading process.
 | Deterministic backtest/data | Shared strategy code, immediate pending-order registration, arrival-time scheduler, Java-mapped class/symbol empirical latency profiles with sampled-usage reporting, versioned target-host/live collectors, deterministic calibration artifacts bound into production research, conservative depth/queue/trade capacity controls, event-clock drawdown/exposure/inventory metrics, per-currency depeg-sensitive valuation, exact private-fill fee currency plus explicit simulated-fee counts, fee/turnover attribution, authenticated recent-fill collection and verified offline fill/fee reconciliation, authenticated point-in-time cash/zero-liability collection and offline verification, forecast/realized funding separation with event-time linear/inverse settlement, manifest-driven chronological walk-forward selection and stress gates, credential-free redundant public capture, exact provenance, streaming analysis, and raw/normalized replay | The evidence pipeline is implemented but execution/accounting assumptions remain uncalibrated; needs sustained full-depth and currency-index capture, a passing credentialed target-host/demo latency artifact, complete funding intervals, target-tier fee calibration, a real passing target-account certification and authenticated fill/fee artifact plus broader economic statement reconciliation, and production-candidate reports before capital decisions |
 | Feed components | Redundant public sockets, isolated private sockets, transport/state freshness separation, account-plus-positions health rounds, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
 | Order components | Event-loop client IDs/registration, exchange/client acknowledgement binding, account-scoped immutable private identity, semantic duplicate suppression across changed exchange timestamps, exchange-side place-request expiry, an authenticated eight-session websocket command pool, constant-time per-underlying FIFOs, bounded cross-underlying command concurrency, shared account pacing, independent REST reconciliation, shutdown command flushing, monotonic private reduction, submit/cancel state-convergence deadlines, typed position margin mode, and ambiguity handling are composed | Needs demo exchange fault evidence |
-| Runtime risk | Instrument models, authoritative startup positions, authenticated current fee-group underpricing checks, active-order count/notional ceilings, rolling submit-rejection and zero-fill IOC-cancel circuits, terminal strategy-halt promotion, position scope/mode enforcement, zero-liability enforcement, periodic authenticated account-config drift detection, forced-repayment blocking, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock and announced-maintenance checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed fee/deadman/depeg/convergence evidence |
+| Runtime risk | Instrument models, authoritative startup positions, authenticated current instrument-rule and fee-group checks, typed upcoming-change lead, active-order count/notional ceilings, rolling submit-rejection and zero-fill IOC-cancel circuits, terminal strategy-halt promotion, position scope/mode enforcement, zero-liability enforcement, periodic authenticated account-config drift detection, forced-repayment blocking, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock and announced-maintenance checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed instrument/fee/deadman/depeg/convergence evidence |
 | Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, strict bounded soak reports, documented region/environment endpoint tuples, and an exact demo-to-production config transition verifier | Demo-capable; production entry intentionally unavailable |
 | Instrument/account bootstrap | Account instruments/config/balance/positions are typed; economic snapshots preserve borrowing flags, liabilities, interest, and margin-loan fields; live spot and borrow limits are cash-only/zero; enabled borrowing, missing applicable evidence, nonzero liabilities, margin positions, and nonzero positions outside configured ownership/mode fail before strategy/risk application | Needs a passing artifact from the real target account; tooling alone is not evidence |
 | Startup/restart gate | Executable phase state, engine-consumed account-snapshot invariant, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, durable latch restore, authoritative account repair, second-pass clean REST reconciliation, and read-only journal-bound deadman-expiry certification | Needs process-kill demo evidence; tooling alone is not evidence |
@@ -272,14 +272,16 @@ production trading process.
     failure, disconnect, and latency evidence, and independently re-derives
     `clean_soak`. Latency calibration schema 4 also requires the exact source
     bytes and independently verified source reports.
-40. `verify-live-fault-matrix` now requires one isolated schema-8 run for every
-    documented live role, hashes a distinct injector record for each fault,
-    rejects session/artifact reuse, and binds all runs to one exact config,
-    executable, host, and account identity. Reconnect roles must recover cleanly;
-    disruptive order-path roles must retain zero-order, no-drop shutdown
-    evidence. Its output explicitly excludes process-death causality, deadman
-    expiry, emergency cancellation, fill/fee reconciliation, and deployment
-    approval, so no credential-free fixture can satisfy the remaining demo gate.
+40. The schema-3 `verify-live-fault-matrix` contract requires one isolated
+    schema-8 run for every documented live role, including distinct exchange
+    status, instrument, fee, and account-config failures. It hashes a distinct
+    injector record for each fault, rejects typed-failure substitution and
+    session/artifact reuse, and binds all runs to one exact config, executable,
+    host, and account identity. Reconnect roles must recover cleanly; disruptive
+    order-path roles must retain zero-order, no-drop shutdown evidence. Its
+    output explicitly excludes process-death causality, deadman expiry,
+    emergency cancellation, fill/fee reconciliation, and deployment approval,
+    so no credential-free fixture can satisfy the remaining demo gate.
 41. `verify-emergency-cancel` independently re-hashes exact config/report bytes,
     rejects symlinks and duplicate or mismatched account coverage, re-derives
     regular-order zero only after the Cancel All After trigger horizon, and can
@@ -339,6 +341,17 @@ production trading process.
     `StrategyToolkit.getTransactionFee` and `ChaosEntity.sanityCheck` while
     adapting to OKX's post-2025 fee groups. It is a safety bound, not a real
     target-tier calibration or fill/statement reconciliation artifact.
+47. The same isolated safety child now re-fetches every exact authenticated
+    account instrument before its periodic fee check. It rejects non-live
+    state or drift in type, family, underlying, currencies, contract
+    type/value, tick/lot/minimum size, or fee group. Current `upcChg`
+    announcements are mandatory and strictly typed for `tickSz`, `minSz`
+    (including OKX's synchronous derivative `lotSz` change), and `maxMktSz`;
+    entry is refused when a change enters the default one-hour lead. This
+    protects Java's `Instrument` assumptions used by `Iarb2ChaosEntityFactory`,
+    `ChaosEntity`, and `OkEntity.getMinTradeSize`. Blocking metadata and fee
+    requests are independently tested not to delay Cancel All After. This is
+    implemented protection, not target-account fault evidence.
 
 ## Remaining Demo Gate
 
@@ -358,7 +371,9 @@ production trading process.
 3. Run minimal-size `demo` orders, then inject public, private, and order-command
    socket disconnects, process kill,
    deadman expiry, exchange-clock skew, IOC miss, partial fill, and REST
-   timeout/rate-limit conditions. Suppress submit and cancel order pushes to
+   timeout/rate-limit conditions. Inject a non-live instrument, changed tick,
+   and imminent `upcChg` response through the fault proxy. Suppress submit and
+   cancel order pushes to
    exercise order-state convergence, then suppress derivative position updates
    and each side of a spot balance update to exercise fill convergence. Verify
    cancel retry, `expTime`, and latch restoration from exchange/account
@@ -400,6 +415,11 @@ Production enablement additionally requires:
   the reviewed tier and reconciled to nonzero fills; a conservative safety
   bound alone is not profitability evidence, and OKX states that API rates may
   omit temporary zero-fee treatment.
+- Authenticated exact-instrument startup/periodic checks must pass for every
+  target symbol with no state, sizing, valuation, currency, family, or fee-group
+  drift and no change inside the configured announcement lead. Archive a demo
+  proxy fault proving both drift and announced changes produce typed fail-closed
+  cleanup while the deadman heartbeat remains active.
 - A passing target-account `certify-account` artifact, independently rechecked
   with `verify-account-certification --require-pass`, immediately before
   approval. This is point-in-time evidence and must be combined with economic
