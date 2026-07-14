@@ -33,6 +33,7 @@ pub use latency::*;
 pub use live_verification::*;
 pub use operator::*;
 pub use production_transition::*;
+pub use provenance::{current_executable_sha256, host_identity_sha256};
 pub use runtime::*;
 pub use startup::*;
 pub use statement::*;

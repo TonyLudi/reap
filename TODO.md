@@ -288,6 +288,12 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Independently bind the reconstructed deployment candidate's effective
   strategy hash to the exact proposed production live config, rejecting smoke,
   demo, invalid reconstruction, ambiguous provenance, and strategy drift.
+- [x] Add a strict source-rebuilding production evidence bundle that predeclares
+  and cross-binds the exact official-demo/production configs, deterministically
+  derived routed fault config, release binary, target host, deployment candidate,
+  and separate demo/production account identities across transition, research,
+  soak, fault, latency, account, deadman, emergency, and authenticated fill/fee
+  gates. It never authorizes production entry.
 - [ ] Calibrate queue position, latency, fees, funding, and slippage from
   captured full-depth data, then run and archive production-candidate
   walk-forward, capacity, and stressed-liquidity reports. The orchestration and
@@ -310,6 +316,8 @@ architecture in [docs/architecture.md](docs/architecture.md).
   enabled.
 - [ ] Certify production credentials/account mode/limits and expose production
   order entry only after every gate in `docs/trading-readiness.md` is signed off.
+  Add a bounded evidence-freshness/approval policy around the source-rebuilding
+  bundle; no passing target-host bundle or human approval artifact exists.
 
 Completed-step evidence is documented in [README.md](README.md),
 [docs/operations.md](docs/operations.md), and

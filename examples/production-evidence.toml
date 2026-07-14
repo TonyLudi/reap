@@ -1,0 +1,47 @@
+# Schema template only. Replace every path and identity with reviewed target-host
+# evidence. This file cannot pass as checked in and contains no credentials.
+schema_version = 1
+expected_reap_version = "0.1.0"
+expected_live_executable_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+expected_host_identity_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+expected_deployment_candidate_id = "replace-with-predeclared-candidate-id"
+
+demo_config = "/secure/config/reap-exact-demo.toml"
+production_config = "/secure/config/reap-production-candidate.toml"
+# The fault config is the create-new output of render-fault-live-config from the
+# official demo config and this exact proxy config.
+fault_demo_config = "/secure/config/reap-routed-fault-demo.toml"
+fault_proxy_config = "/secure/config/reap-demo-fault-proxy.toml"
+demo_soak_report = "/secure/evidence/demo-soak.json"
+fault_matrix_manifest = "/secure/evidence/live-fault-matrix.toml"
+latency_calibration_artifact = "/secure/evidence/latency-calibration.json"
+latency_source_reports = [
+  "/secure/evidence/latency-observe.json",
+  "/secure/evidence/latency-demo.json",
+]
+research_manifest = "/secure/research/production.toml"
+research_report = "/secure/research/production.json"
+account_certifications = [
+  "/secure/evidence/production-account-main.json",
+]
+emergency_cancel_report = "/secure/evidence/demo-emergency-cancel.json"
+
+# Repeat both identity tables and every per-account evidence array entry for all
+# configured accounts. Demo and production identities are intentionally distinct.
+[expected_demo_account_identity_sha256s]
+main = "1111111111111111111111111111111111111111111111111111111111111111"
+
+[expected_production_account_identity_sha256s]
+main = "2222222222222222222222222222222222222222222222222222222222222222"
+
+[[deadman_certifications]]
+artifact = "/secure/evidence/demo-deadman-main.json"
+journal = "/secure/evidence/demo-stopped-main.jsonl"
+
+[[fill_reconciliations]]
+collection_manifest = "/secure/evidence/demo-fills-main/manifest.json"
+journal = "/secure/evidence/demo-stopped-main.jsonl"
+minimum_fills = 100
+price_tolerance = 0.0
+quantity_tolerance = 0.0
+fee_tolerance = 0.0

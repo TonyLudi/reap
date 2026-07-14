@@ -26,6 +26,7 @@ use reap_strategy::ChaosConfig;
 
 mod deployment;
 mod latency;
+mod production_evidence;
 mod statement;
 
 use deployment::verify_research_deployment_paths;
@@ -33,6 +34,7 @@ use deployment::verify_research_deployment_paths;
 use latency::{
     LatencyCalibrationOptions, build_latency_calibration, profile_toml, verify_latency_calibration,
 };
+use production_evidence::verify_production_evidence_manifest_path;
 
 #[derive(Debug, Parser)]
 #[command(name = "reap")]
@@ -180,6 +182,31 @@ enum Command {
         )]
         output: Option<PathBuf>,
         #[arg(long, help = "Exit non-zero unless the transition policy passes")]
+        require_pass: bool,
+        #[arg(long)]
+        pretty: bool,
+    },
+    #[command(
+        about = "Reconstruct and cross-bind the complete production evidence bundle",
+        long_about = "Read a strict production-evidence manifest, rerun every underlying source verifier, and bind the exact demo/production configs, deployment candidate, release binary, target host, and demo/production account identities. This gate does not authorize or enable production order entry."
+    )]
+    VerifyProductionEvidence {
+        #[arg(
+            short,
+            long,
+            help = "Strict schema-1 production evidence TOML manifest"
+        )]
+        manifest: PathBuf,
+        #[arg(
+            short,
+            long,
+            help = "Optionally create this owner-readable bundle verification artifact"
+        )]
+        output: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Exit non-zero unless every source gate and identity binding passes"
+        )]
         require_pass: bool,
         #[arg(long)]
         pretty: bool,
@@ -838,6 +865,38 @@ async fn main() -> Result<()> {
             println!("{json}");
             if require_pass && !report.acceptance_passed {
                 anyhow::bail!("production configuration transition did not pass");
+            }
+        }
+        Command::VerifyProductionEvidence {
+            manifest,
+            output,
+            require_pass,
+            pretty,
+        } => {
+            let mut output_file = output
+                .as_ref()
+                .map(|path| reserve_private_output(path, "production evidence verification"))
+                .transpose()?;
+            let report =
+                verify_production_evidence_manifest_path(&manifest).with_context(|| {
+                    format!(
+                        "failed to verify production evidence manifest {}",
+                        manifest.display()
+                    )
+                })?;
+            let json = if pretty {
+                serde_json::to_string_pretty(&report)?
+            } else {
+                serde_json::to_string(&report)?
+            };
+            if let (Some(file), Some(path)) = (&mut output_file, output.as_deref()) {
+                persist_reserved_output(file, path, &json, "production evidence verification")?;
+            }
+            println!("{json}");
+            if require_pass && !report.evidence_bundle_passed {
+                anyhow::bail!(
+                    "production evidence bundle did not pass every source and binding gate"
+                );
             }
         }
         Command::Capture {

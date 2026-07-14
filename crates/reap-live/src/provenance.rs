@@ -9,7 +9,7 @@ pub(crate) fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-pub(crate) fn current_executable_sha256() -> Result<String, String> {
+pub fn current_executable_sha256() -> Result<String, String> {
     #[cfg(target_os = "linux")]
     let path = std::path::PathBuf::from("/proc/self/exe");
     #[cfg(not(target_os = "linux"))]
@@ -32,7 +32,7 @@ pub(crate) fn current_executable_sha256() -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-pub(crate) fn host_identity_sha256() -> Result<String, String> {
+pub fn host_identity_sha256() -> Result<String, String> {
     let machine_id = std::fs::read("/etc/machine-id")
         .map_err(|error| format!("failed to read /etc/machine-id: {error}"))?;
     let machine_id = machine_id

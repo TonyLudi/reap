@@ -67,6 +67,12 @@ Implemented:
   order-command routes, owner-local control, deterministic disconnect/frame-drop/
   REST-response faults, and create-new typed injector evidence that never records
   credentials or raw private payloads.
+- A strict production-evidence bundle verifier that reruns every source verifier
+  and cross-binds exact official-demo/production configs, a deterministically
+  derived routed fault config, the predeclared research candidate, the running
+  release binary, target host, and separate demo and production account
+  identities. It always reports production entry as unauthorized; freshness,
+  external operations, and operator approval remain separate blockers.
 - Deterministic backtest matching with `PendingNew`, delayed entry/cancel/update
   boundaries, `PostOnly`, `IOC`, conservative displayed-depth fills, trade
   fills, queue-ahead tracking, fee/turnover attribution, realized linear and
@@ -290,6 +296,30 @@ paths, and operator/alert secret bindings. Strategy, risk, runtime, account
 policy, execution, storage capacity, and safety settings must remain identical,
 and both files must use the same official endpoint region. A pass does not read
 credential values, authorize production, or enable production order entry.
+
+After every underlying credentialed and research artifact exists, replace the
+placeholders in `examples/production-evidence.toml` and run the aggregate check
+with the exact candidate binary on the declared target host:
+
+```bash
+target/release/reap verify-production-evidence \
+  --manifest /secure/evidence/production-evidence.toml \
+  --output /secure/evidence/production-evidence-verification.json \
+  --require-pass --pretty
+```
+
+The command reconstructs transition, research deployment, dedicated demo soak,
+the routed config from the exact official-demo and fault-proxy configs, fault
+matrix, latency calibration, production account certification, demo deadman,
+emergency cancel, and authenticated fill/fee reconciliation evidence.
+It rejects missing or duplicate per-account coverage, a demo soak reused as a
+fault session, config drift during verification, and any mismatch against the
+manifest-declared build, host, candidate, or environment-specific account
+identities. Proxy-supported fault roles must carry typed records with the exact
+proxy fingerprint and unique proxy session/command IDs; only genuine
+partial-fill and restart-latch roles may use external evidence. It does not trust
+previously emitted verification JSON. The checked-in manifest is a schema
+template with deliberately invalid placeholder identities, not evidence.
 
 Observe OKX demo feeds and account state without permitting any submit or
 cancel request:

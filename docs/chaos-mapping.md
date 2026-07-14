@@ -354,6 +354,19 @@ not a claimed Java behavior match. A structured demo-to-production verifier
 then requires the Java-mapped strategy/risk/account/runtime settings to remain
 unchanged while only reviewed deployment bindings move.
 
+The aggregate production-evidence bundle is also intentionally outside the Java
+parity claim. At pinned revision
+`b6b120c7b7c466d8431bf082f3229328c5d7b2ae`,
+`ChaosBackTestMultiRunService` loads day-specific strategy input, runs days in
+sequence, carries ending account positions, and rotates output filenames. It has
+no held-out candidate-selection, exact live-config binding, target-host identity,
+account certification, fault-matrix, or release-decision layer.
+`MetCoinGatewayWsClientsOkexV5Config` remains a connectivity reference for the
+separate market-data, position, and order websocket clients plus round-robin/hash
+dispatch. It likewise does not compose operational evidence. Rust continues to
+map strategy and connectivity behavior to those sources while treating
+`verify-production-evidence` as a separate fail-closed deployment control.
+
 ## Live Event Requirements
 
 Decision parity depends on delivering all required normalized events. For each

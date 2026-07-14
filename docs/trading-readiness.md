@@ -14,7 +14,7 @@ production trading process.
 | Feed components | Redundant public sockets, isolated private sockets, transport/state freshness separation, account-plus-positions health rounds, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
 | Order components | Event-loop client IDs/registration, exchange/client acknowledgement binding, account-scoped immutable private identity, semantic duplicate suppression across changed exchange timestamps, exchange-side place-request expiry, an authenticated eight-session websocket command pool, constant-time per-underlying FIFOs, bounded cross-underlying command concurrency, shared account pacing, independent REST reconciliation, shutdown command flushing, monotonic private reduction, submit/cancel state-convergence deadlines, typed position margin mode, and ambiguity handling are composed | Needs demo exchange fault evidence |
 | Runtime risk | Instrument models, authoritative startup positions, authenticated current instrument-rule, hard single-order maximum, and fee-group checks, final pre-trade exchange-limit enforcement, typed upcoming-change lead, active-order count/notional ceilings, rolling submit-rejection and zero-fill IOC-cancel circuits, terminal strategy-halt promotion, position scope/mode enforcement, zero-liability enforcement, periodic authenticated account-config drift detection, forced-repayment blocking, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock and announced-maintenance checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed instrument/fee/deadman/depeg/convergence evidence |
-| Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, strict bounded soak reports, documented region/environment endpoint tuples, and an exact demo-to-production config transition verifier | Demo-capable; production entry intentionally unavailable |
+| Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, strict bounded soak reports, documented region/environment endpoint tuples, an exact demo-to-production config transition verifier, and a source-rebuilding cross-gate production evidence bundle | Demo-capable; production entry intentionally unavailable, and no passing target-host bundle exists |
 | Instrument/account bootstrap | Account instruments/config/balance/positions are typed; economic snapshots preserve borrowing flags, liabilities, interest, and margin-loan fields; live spot and borrow limits are cash-only/zero; enabled borrowing, missing applicable evidence, nonzero liabilities, margin positions, and nonzero positions outside configured ownership/mode fail before strategy/risk application | Needs a passing artifact from the real target account; tooling alone is not evidence |
 | Startup/restart gate | Executable phase state, engine-consumed account-snapshot invariant, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, durable latch restore, authoritative account repair, second-pass clean REST reconciliation, and read-only journal-bound deadman-expiry certification | Needs process-kill demo evidence; tooling alone is not evidence |
 | Event-loop profile | Allocation-aware raw OKX parity benchmark covers redundant wire input through strategy/risk and storage-record construction | Needs target-host capture and exchange-latency validation |
@@ -400,6 +400,19 @@ production trading process.
     the pinned Java `TreeSet` traversal intent and ordered portfolio/order
     reductions. The smoke reconstruction passes; no production-candidate report
     exists.
+52. `verify-production-evidence` consumes one strict manifest but does not trust
+    subordinate verification JSON. It directly reconstructs transition,
+    production research binding, a dedicated demo soak, the full fault matrix,
+    latency calibration, production account certifications, demo deadman and
+    emergency evidence, and authenticated fill/fee reconciliation. It requires
+    exact per-account coverage and predeclared candidate/build/host plus separate
+    demo/production account identities, reconstructs the routed fault config from
+    the exact official-demo/proxy files, reopens every config after reconstruction,
+    requires unique exact-proxy typed evidence for every proxy-supported fault,
+    and rejects reuse of the dedicated soak as a fault session. The checked-in
+    schema template cannot pass, no target-host bundle exists, schema 1 does not
+    enforce freshness or human approval, and the output explicitly leaves
+    production order entry unauthorized.
 
 ## Remaining Demo Gate
 
@@ -449,6 +462,11 @@ production trading process.
 
 Production enablement additionally requires:
 
+- A passing owner-only `verify-production-evidence --require-pass` artifact made
+  by the exact candidate binary on the declared target host after every source
+  artifact below exists. Review every subordinate artifact and timestamp; the
+  aggregate cross-binding does not supply freshness, remote attestation, external
+  supervision, full economics, or human approval and never authorizes entry.
 - A passing owner-only `verify-production-transition --require-pass` artifact
   binding the exact demo config used by the accepted evidence to the exact
   production candidate. Review every allowed change, independently verify

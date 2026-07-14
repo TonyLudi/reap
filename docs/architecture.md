@@ -900,14 +900,28 @@ reap replay-check --events data/events.jsonl
 reap analyze-capture --config config/capture.toml --events data/events.jsonl
 reap verify-capture --config config/capture.toml --report capture-report.json --events data/events.jsonl
 reap calibrate-latency --config config/live.toml --report live.json --output latency.json
+reap verify-production-evidence --manifest production-evidence.toml --require-pass
 reap inspect-book --capture raw/ws.jsonl --symbol BTC-USDT
 reap config-check --config config/live.toml
 ```
 
 `live`, `capture`, both emergency-cancel commands, both deadman-certification
 commands, `operator`, `backtest`, `research`, `replay-check`, `analyze-capture`,
-`verify-capture`, `calibrate-latency`, and `config-check` are implemented.
+`verify-capture`, `calibrate-latency`, `verify-production-evidence`, and
+`config-check` are implemented.
 `inspect-book` remains planned; see [trading-readiness.md](trading-readiness.md).
+
+Cross-crate production evidence composition belongs in `reap-cli`: `reap-live`
+must not depend on `reap-backtest`, while the aggregate verifier must call both
+live and research source verifiers. The strict manifest predeclares one release
+binary, target host, deployment candidate, and environment-specific account
+identities. The verifier reruns each source gate, reopens every deployment
+config, and reconstructs the loopback fault config from the exact official-demo
+and fault-proxy configs before cross-binding all returned identities. It hashes
+the typed in-memory reconstructions instead of accepting prior verification
+JSON. Even a passing bundle leaves production entry unauthorized because
+freshness, external supervision, full economics, and operator approval are
+outside this composition.
 
 ## Multi-Websocket Design
 

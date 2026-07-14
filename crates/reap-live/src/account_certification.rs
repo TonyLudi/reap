@@ -599,6 +599,14 @@ where
 pub fn verify_account_certification_path(
     artifact_path: impl AsRef<Path>,
 ) -> Result<AccountCertificationSummary, AccountCertificationError> {
+    Ok(verify_account_certification_artifact_path(artifact_path)?.summary)
+}
+
+/// Reopens and re-derives a certification artifact without credentials,
+/// returning the exact artifact whose embedded evidence was validated.
+pub fn verify_account_certification_artifact_path(
+    artifact_path: impl AsRef<Path>,
+) -> Result<AccountCertificationArtifact, AccountCertificationError> {
     let artifact_path = artifact_path.as_ref();
     let bytes = read_artifact(artifact_path)?;
     let artifact: AccountCertificationArtifact =
@@ -661,7 +669,7 @@ pub fn verify_account_certification_path(
             "stored account-certification summary does not match raw evidence",
         );
     }
-    Ok(derived)
+    Ok(artifact)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1278,6 +1286,10 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&artifact).unwrap()).unwrap();
         let verified = verify_account_certification_path(&path).unwrap();
         assert_eq!(verified, artifact.summary);
+        assert_eq!(
+            verify_account_certification_artifact_path(&path).unwrap(),
+            artifact
+        );
 
         let mut tampered = artifact;
         tampered.account_balance.body = tampered.account_balance.body.replace("1000", "1001");

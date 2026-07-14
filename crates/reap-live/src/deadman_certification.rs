@@ -481,6 +481,15 @@ pub fn verify_deadman_expiry_certification_path(
     artifact_path: impl AsRef<Path>,
     journal_path: impl AsRef<Path>,
 ) -> Result<DeadmanExpiryCertificationSummary, DeadmanExpiryCertificationError> {
+    Ok(verify_deadman_expiry_certification_artifact_path(artifact_path, journal_path)?.summary)
+}
+
+/// Re-derives an artifact and returns the exact validated artifact so callers
+/// can bind its provenance without reopening an unchecked copy.
+pub fn verify_deadman_expiry_certification_artifact_path(
+    artifact_path: impl AsRef<Path>,
+    journal_path: impl AsRef<Path>,
+) -> Result<DeadmanExpiryCertificationArtifact, DeadmanExpiryCertificationError> {
     let artifact_path = artifact_path.as_ref();
     let bytes = read_artifact(artifact_path)?;
     let artifact: DeadmanExpiryCertificationArtifact =
@@ -609,7 +618,7 @@ pub fn verify_deadman_expiry_certification_path(
     if artifact.summary != derived {
         return invalid_evidence("stored deadman-expiry summary does not match raw evidence");
     }
-    Ok(derived)
+    Ok(artifact)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1569,6 +1578,11 @@ mod tests {
         assert_eq!(
             verify_deadman_expiry_certification_path(&artifact_path, &journal_path).unwrap(),
             artifact.summary
+        );
+        assert_eq!(
+            verify_deadman_expiry_certification_artifact_path(&artifact_path, &journal_path)
+                .unwrap(),
+            artifact
         );
 
         let lease = acquire_storage_lease(&journal_path).unwrap();

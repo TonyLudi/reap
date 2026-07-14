@@ -1681,6 +1681,80 @@ independently proves that the proposed production config's effective strategy is
 the one predeclared and training-selected in every reconstructed research fold.
 Both must pass against the same production config bytes.
 
+## Production Evidence Bundle
+
+Do not approve a collection of independent `passed` JSON files by inspection.
+After all source evidence exists, make a private copy of
+`examples/production-evidence.toml`, replace every placeholder, and run the exact
+candidate binary on the declared target host:
+
+```bash
+BUNDLE_MANIFEST="/secure/evidence/production-evidence.toml"
+BUNDLE_REPORT="/secure/evidence/production-evidence-$(date -u +%Y%m%dT%H%M%SZ).json"
+target/release/reap verify-production-evidence \
+  --manifest "$BUNDLE_MANIFEST" \
+  --output "$BUNDLE_REPORT" \
+  --require-pass \
+  --pretty
+```
+
+Schema 1 requires the intended Reap version, candidate executable SHA-256,
+target-host identity SHA-256, predeclared deployment candidate ID, and separate
+demo and production exchange-account identity maps. It also requires the exact
+fault-proxy config and the create-new routed demo config used by the fault
+campaign; the latter must be typed-value-identical to a fresh deterministic
+reconstruction from the official-endpoint demo config and proxy routes. Its
+exact file bytes remain separately bound to every fault run. Paths may be
+absolute or relative to the bundle manifest. List exactly one production account
+certification, demo deadman certification, and authenticated fill reconciliation
+for every account in the exact configs. The dedicated clean demo soak must be a
+different session from every fault-matrix run. A reviewed nonzero
+`minimum_fills` is mandatory for each reconciliation.
+
+The aggregate command directly reruns, rather than consumes output from:
+
+- `verify-production-transition`;
+- `verify-research-deployment`, including the full research reconstruction;
+- `verify-live-run --expected-mode demo` for the dedicated clean soak;
+- routed fault-config reconstruction plus `verify-live-fault-matrix` against that
+exact loopback config;
+- `verify-latency-calibration` from every raw source live report;
+- account and deadman artifact verification from their embedded raw responses;
+- `verify-emergency-cancel --require-all-configured-accounts`; and
+- fill-collection pagination verification plus journal-backed fill/fee
+  reconciliation.
+
+Every proxy-supported matrix role must expose parsed Reap injector evidence with
+the exact supplied proxy-config fingerprint and a unique proxy session and command
+ID. Opaque external injector records are accepted by this production bundle only
+for genuine partial-fill and restored-latch roles, whose causality cannot be
+manufactured by the current proxy. Archive and review each proxy process run
+report separately; schema 1 does not reconstruct its clean-shutdown status.
+
+The official-demo, production, routed-fault, and fault-proxy configs are reopened
+after those potentially long reconstructions. The bundle fails if any changed,
+if the routed config is not the deterministic typed route transform, if a
+subordinate source gate fails, if account coverage is missing or duplicated, or
+if any config/build/host/account/candidate binding differs. The output records a
+semantic SHA-256 of each in-memory reconstruction and always sets
+`production_order_entry_authorized = false`.
+
+A pass is deliberately narrower than production approval. Schema 1 does not
+enforce an evidence-age policy, remotely attest the host or exchange identity,
+reconcile complete economic statements, prove external supervisor/paging state,
+or record human rollout approval. Re-run immediately before review, inspect the
+underlying timestamps and limitations, and keep production entry disabled until
+those external controls are independently signed off.
+
+At pinned Java revision `b6b120c7b7c466d8431bf082f3229328c5d7b2ae`,
+`ChaosBackTestMultiRunService` sequences daily inputs, carries ending positions,
+and writes per-run files; it does not perform held-out deployment selection or
+compose live release evidence. `MetCoinGatewayWsClientsOkexV5Config` constructs
+separate public, position, and order websocket clients and dispatch policies, but
+does not provide a production evidence decision. The Rust bundle is therefore a
+release-safety control around the Java-referenced strategy/connectivity behavior,
+not a claim of Java parity.
+
 ## Credentials
 
 - Load API key, secret, and passphrase from the deployment secret provider, not

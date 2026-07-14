@@ -13,7 +13,7 @@ use crate::{
     MAX_LIVE_LATENCY_SERIES, MAX_LIVE_LATENCY_US, StartupGate,
 };
 
-pub const LIVE_RUN_VERIFICATION_FORMAT_VERSION: u16 = 1;
+pub const LIVE_RUN_VERIFICATION_FORMAT_VERSION: u16 = 2;
 pub const MAX_LIVE_RUN_REPORT_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,7 +82,13 @@ pub struct LiveRunVerificationReport {
     pub run_report: LiveRunFileEvidence,
     pub config: LiveRunConfigVerification,
     pub report_schema_version: u32,
+    pub reap_version: String,
+    pub executable_sha256: String,
+    pub host_identity_sha256: Option<String>,
+    pub account_identity_sha256s: std::collections::BTreeMap<String, String>,
     pub session_id: Option<String>,
+    pub session_started_at_ms: u64,
+    pub elapsed_ms: u64,
     pub mode: LiveMode,
     pub stop_reason: LiveStopReason,
     pub expected_mode: Option<LiveMode>,
@@ -209,7 +215,13 @@ pub fn verify_live_run_paths(
         run_report,
         config: config_verification,
         report_schema_version: report.schema_version,
+        reap_version: report.reap_version,
+        executable_sha256: report.executable_sha256,
+        host_identity_sha256: report.host_identity_sha256,
+        account_identity_sha256s: report.account_identity_sha256s,
         session_id: report.session_id,
+        session_started_at_ms: report.session_started_at_ms,
+        elapsed_ms: report.elapsed_ms,
         mode: report.mode,
         stop_reason: report.stop_reason,
         expected_mode,
@@ -643,6 +655,19 @@ mod tests {
         assert!(!verification.acceptance_passed);
         assert!(verification.config.matches_report);
         assert!(fixture.report.config_source.is_some());
+        assert_eq!(verification.reap_version, fixture.report.reap_version);
+        assert_eq!(
+            verification.executable_sha256,
+            fixture.report.executable_sha256
+        );
+        assert_eq!(
+            verification.host_identity_sha256,
+            fixture.report.host_identity_sha256
+        );
+        assert_eq!(
+            verification.account_identity_sha256s,
+            fixture.report.account_identity_sha256s
+        );
 
         let mismatch = verify_live_run_paths(
             &fixture.config_path,
