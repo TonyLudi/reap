@@ -218,7 +218,7 @@ async fn supervise_connection(
             return;
         }
         let error = result.expect_err("non-success result must contain an error");
-        let _ = status.try_send(ConnectionStatus {
+        let disconnected = status.send(ConnectionStatus {
             conn_id: plan.conn_id.clone(),
             venue: plan.venue,
             private: plan.private,
@@ -226,6 +226,18 @@ async fn supervise_connection(
             kind: ConnectionStatusKind::Disconnected,
             reason: error.to_string(),
         });
+        tokio::select! {
+            result = disconnected => {
+                if result.is_err() {
+                    return;
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
         if matches!(error, ConnectionError::RecoveryRequested) {
             delay = reconnect.initial_delay;
             tracing::info!(conn_id = %plan.conn_id, "feed connection restarting for snapshot recovery");

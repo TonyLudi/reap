@@ -51,7 +51,7 @@ use crate::{
 };
 
 type LiveGateway = OkxOrderGateway<ReqwestTransport>;
-pub const LIVE_RUN_REPORT_SCHEMA_VERSION: u32 = 4;
+pub const LIVE_RUN_REPORT_SCHEMA_VERSION: u32 = 5;
 pub const MAX_LIVE_FAILURE_CODE_BYTES: usize = 64;
 pub const MAX_LIVE_FAILURE_MESSAGE_BYTES: usize = 4_096;
 
@@ -115,6 +115,8 @@ pub struct LiveRunReport {
     pub book_recovery_events: u64,
     pub stream_stale_events: u64,
     pub connection_disconnect_events: u64,
+    pub public_connection_disconnect_events: u64,
+    pub private_connection_disconnect_events: u64,
     pub operator_commands: u64,
     pub operator_mutations: u64,
     pub max_storage_queue_depth: usize,
@@ -272,12 +274,25 @@ struct RuntimeEvidence {
     book_recovery_events: u64,
     stream_stale_events: u64,
     connection_disconnect_events: u64,
+    public_connection_disconnect_events: u64,
+    private_connection_disconnect_events: u64,
     operator_commands: u64,
     operator_mutations: u64,
     max_storage_queue_depth: usize,
 }
 
 impl RuntimeEvidence {
+    fn observe_disconnect(&mut self, private: bool) {
+        self.connection_disconnect_events = self.connection_disconnect_events.saturating_add(1);
+        if private {
+            self.private_connection_disconnect_events =
+                self.private_connection_disconnect_events.saturating_add(1);
+        } else {
+            self.public_connection_disconnect_events =
+                self.public_connection_disconnect_events.saturating_add(1);
+        }
+    }
+
     fn observe_record(&mut self, record: &StorageRecord) {
         let StorageRecord::System(event) = record else {
             return;
@@ -472,6 +487,8 @@ pub async fn run_live(
             book_recovery_events: 0,
             stream_stale_events: 0,
             connection_disconnect_events: 0,
+            public_connection_disconnect_events: 0,
+            private_connection_disconnect_events: 0,
             operator_commands: 0,
             operator_mutations: 0,
             max_storage_queue_depth: 0,
@@ -1507,6 +1524,8 @@ impl LiveRuntime {
             book_recovery_events: evidence.book_recovery_events,
             stream_stale_events: evidence.stream_stale_events,
             connection_disconnect_events: evidence.connection_disconnect_events,
+            public_connection_disconnect_events: evidence.public_connection_disconnect_events,
+            private_connection_disconnect_events: evidence.private_connection_disconnect_events,
             operator_commands: evidence.operator_commands,
             operator_mutations: evidence.operator_mutations,
             max_storage_queue_depth: evidence.max_storage_queue_depth,
@@ -2137,7 +2156,7 @@ impl LiveRuntime {
             }
             RuntimeEvent::Connection { source_id, status } => {
                 if status.kind == ConnectionStatusKind::Disconnected {
-                    self.evidence.connection_disconnect_events += 1;
+                    self.evidence.observe_disconnect(status.private);
                 }
                 let (events, public_connectivity) = {
                     let source = self.sources.get_mut(source_id).ok_or_else(|| {
@@ -4572,10 +4591,15 @@ mod tests {
         evidence.observe_record(&system(SystemEventKind::BookRecoveryStarted));
         evidence.observe_record(&system(SystemEventKind::FeedStale));
         evidence.observe_record(&system(SystemEventKind::PrivateStreamStale));
+        evidence.observe_disconnect(false);
+        evidence.observe_disconnect(true);
 
         assert_eq!(evidence.reconciliation_drift_events, 1);
         assert_eq!(evidence.book_recovery_events, 1);
         assert_eq!(evidence.stream_stale_events, 2);
+        assert_eq!(evidence.connection_disconnect_events, 2);
+        assert_eq!(evidence.public_connection_disconnect_events, 1);
+        assert_eq!(evidence.private_connection_disconnect_events, 1);
     }
 
     #[test]

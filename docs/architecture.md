@@ -159,6 +159,8 @@ Responsibilities:
 - Multi-websocket subscription partitioning.
 - Redundant websocket support for critical channels.
 - Ping/pong, reconnect, exponential backoff, and stale-feed detection.
+- Lossless bounded delivery for ready/disconnect transitions; payload traffic
+  does not flood or silently evict critical connection state.
 - Separate per-socket transport liveness from aggregate private-state health.
 - Raw message timestamping.
 - Deduplication.

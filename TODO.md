@@ -207,6 +207,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
   liability at bootstrap and during account updates, continuously detect
   authenticated account-config drift, and add create-new point-in-time account
   certification with credential-free raw-evidence verification.
+- [x] Make websocket ready/disconnect transitions lossless under bounded status
+  backpressure, remove redundant per-frame status traffic, and split public and
+  private disconnect counts in schema-5 live evidence for fault campaigns.
 - [ ] Run credentialed bounded observe and minimal-size demo fault campaigns,
   including process death, deadman expiry, clock skew, REST ambiguity, partial
   fill, reconnect, and durable-latch restart recovery.

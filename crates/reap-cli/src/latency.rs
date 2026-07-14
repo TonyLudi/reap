@@ -439,6 +439,16 @@ fn load_reports(
                 canonical.display()
             ));
         }
+        if report.connection_disconnect_events
+            != report
+                .public_connection_disconnect_events
+                .saturating_add(report.private_connection_disconnect_events)
+        {
+            failures.push(format!(
+                "{} has inconsistent public/private disconnect evidence",
+                canonical.display()
+            ));
+        }
         if report.mode == LiveMode::Validate {
             failures.push(format!(
                 "{} is a validation report, not a bounded live run",
@@ -896,6 +906,8 @@ mod tests {
             book_recovery_events: 0,
             stream_stale_events: 0,
             connection_disconnect_events: 0,
+            public_connection_disconnect_events: 0,
+            private_connection_disconnect_events: 0,
             operator_commands: 0,
             operator_mutations: 0,
             max_storage_queue_depth: 1,

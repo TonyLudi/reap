@@ -207,7 +207,7 @@ The following differences do not change the covered quote/hedge calculations:
 | --- | --- | --- |
 | `OkxNitroL2SubscriberGroupFactory` subscriber groups | `partition_subscriptions` replica/socket plans | Equivalent |
 | `AbstractOkxNitroL2Subscriber` TBT and 400-level modes | Explicit `books-l2-tbt`, `books50-l2-tbt`, or `books` capture subscriptions | Equivalent, entitlement remains operational |
-| Ping, disconnect, resubscribe, and stale checkers | Feed connection loop, reconnect supervisor, idle timeout, and book-age recovery | Equivalent |
+| Ping, disconnect, resubscribe, and stale checkers | Feed connection loop, reconnect supervisor, idle timeout, book-age recovery, and lossless bounded ready/disconnect delivery | Equivalent; Rust avoids redundant per-payload status messages so critical transitions cannot be displaced by heartbeat traffic |
 | Clear/rebuild book on resubscribe or crossed-book failure | Invalid/crossed-book detection plus sequence state and fresh websocket snapshot recovery | Equivalent with additional explicit sequence validation |
 | `AbstractOkV5L2Subscriber.checkSeqNo` predecessor compare-and-set, equal-sequence no-change case, and lower-sequence maintenance case | `SequenceTracker` requires `prevSeqId == last`, accepts equal/lower `seqId`, records both cases, and recovers on mismatch | Exact continuity rule with bounded recovery buffering |
 | Nitro checksum validation block commented out; legacy V5 CRC validation active | No CRC validation after OKX checksum deprecation; WSS, sequence, snapshot, crossed-book, and stale checks remain mandatory | Current-contract adaptation |
@@ -231,6 +231,14 @@ deployment-safety additions around the parity strategy, not claims of Java
 strategy equivalence. Re-check exchange-facing controls against both the pinned
 Java revision and the current OKX API contract whenever connectivity is
 upgraded.
+
+The pinned Java subscriber clears its socket-owned book and stale-check state in
+`AbstractOkxNitroL2Subscriber.onSocketDisconnected`. Rust has shared redundant
+books rather than one book per socket, so it retains the healthy replica but now
+waits for bounded status capacity when publishing every `Ready` or
+`Disconnected` transition. Per-frame payload heartbeats are not placed on that
+queue. Schema-5 live reports retain total, public, and private disconnect counts
+so a demo reconnect campaign can prove which transport class was exercised.
 
 The pinned Nitro subscriber rebuilds on a crossed book, but its
 `OkxNitroUtils.validateOrderBook` call is commented out. The pinned legacy V5

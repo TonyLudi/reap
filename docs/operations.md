@@ -492,6 +492,22 @@ artifact passed and has SHA-256
 This validates research orchestration and evidence binding only, not candidate
 quality or a production gate.
 
+After making ready/disconnect delivery lossless, a fresh 45-second run on
+2026-07-14 reached and retained all 14 socket plans. It wrote 3,496 frames
+(2,829,546 bytes), accepted 1,748 events, and classified 1,748 exact replica
+duplicates. Capture, strict analysis, and strict replay reported zero gaps,
+recoveries, failures, parse errors, stale books, disconnects, timestamp
+regressions, or unrecovered books. Analysis found both configured sources for
+all ten streams and reconstructed 400 bid and ask levels for both books. All
+three SHA-256 checks matched at
+`5317fee38e3beaad6d2ebb7eb81a9c73fac7fcbd31726fcbc1ccdd34fc572255`.
+Raw-capture backtest replay consumed 2,584 normalized inputs, submitted and
+activated eight simulated orders, cancelled four, and produced no fills. It
+reported complete accounting and valuation, two cross-socket arrival-order
+clock regressions, and one funding action beyond the capture horizon under the
+explicit uncalibrated zero-delay execution model. This is a post-change
+connectivity and replay smoke, not execution calibration or strategy evidence.
+
 These are connectivity, integrity, and replay-plumbing evidence only. They are
 not a sustained full-depth dataset, execution-model calibration, profitability
 result, credentialed soak, or production approval. Raw acceptance files remain
@@ -556,7 +572,9 @@ settings; accepting only their static flags would weaken live stop behavior.
 
 - Orders, account, positions, and optional fills use isolated sockets. Every
   socket must acknowledge its subscription; any disconnect immediately emits
-  account-scoped `PrivateStreamStale` and blocks new orders.
+  account-scoped `PrivateStreamStale` and blocks new orders. Acknowledged-ready
+  and disconnected transitions wait for bounded status capacity and are never
+  silently dropped. Raw payloads do not emit redundant status-queue heartbeats.
 - The [OKX API guide](https://www.okx.com/docs-v5/en/) documents account and
   positions as initial/regular state channels, while orders and fills are
   event-only. Reap therefore requires one valid account payload and one valid
@@ -1192,9 +1210,11 @@ of these invariants hold:
 - demo shutdown resolved every active canonical order; and
 - no external alert delivery failed.
 
-The report also records time-to-ready, recovered readiness losses and maximum
-outage, disconnects, stale-stream events, book recoveries, and the storage queue
-high-water mark. It also reports authenticated operator commands and mutations.
+The schema-5 report also records time-to-ready, recovered readiness losses and
+maximum outage, total/public/private disconnects, stale-stream events, book
+recoveries, and the storage queue high-water mark. The total disconnect count
+must equal the public and private counts combined. It also reports authenticated
+operator commands and mutations.
 When enabled, it includes host preflight/last snapshots and check count plus
 alert delivery and queue evidence. A runtime/teardown failure additionally
 records its stable code and bounded message after cleanup while retaining a

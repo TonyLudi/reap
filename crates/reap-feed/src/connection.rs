@@ -15,6 +15,8 @@ pub enum ConnectionError {
     Venue(#[from] VenueError),
     #[error("raw feed output channel is closed")]
     OutputClosed,
+    #[error("feed connection-status channel is closed")]
+    StatusClosed,
     #[error("public feed output channel is full; connection must recover")]
     Backpressure,
     #[error("websocket peer closed the connection")]
@@ -95,12 +97,19 @@ pub async fn run_connection_once(
         recovery,
     )
     .await?;
-    send_status(
-        status,
-        plan,
-        ConnectionStatusKind::Ready,
-        "subscription sent",
-    );
+    tokio::select! {
+        result = send_status(
+            status,
+            plan,
+            ConnectionStatusKind::Ready,
+            "subscriptions acknowledged",
+        ) => result?,
+        changed = shutdown.changed() => {
+            if changed.is_err() || *shutdown.borrow() {
+                return Err(ConnectionError::ShutdownRequested);
+            }
+        }
+    }
 
     let mut ping = tokio::time::interval(std::time::Duration::from_secs(15));
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -130,7 +139,6 @@ pub async fn run_connection_once(
             message = reader.next() => {
                 let message = message.ok_or(ConnectionError::PeerClosed)??;
                 last_received = tokio::time::Instant::now();
-                send_status(status, plan, ConnectionStatusKind::Heartbeat, "websocket data received");
                 match message {
                     Message::Text(payload) => {
                         if payload.as_str() != "pong" {
@@ -282,20 +290,23 @@ fn server_error(value: &serde_json::Value) -> String {
     )
 }
 
-fn send_status(
+async fn send_status(
     status: &mpsc::Sender<ConnectionStatus>,
     plan: &SocketPlan,
     kind: ConnectionStatusKind,
     reason: &str,
-) {
-    let _ = status.try_send(ConnectionStatus {
-        conn_id: plan.conn_id.clone(),
-        venue: plan.venue,
-        private: plan.private,
-        ts_ms: unix_time_ns() / 1_000_000,
-        kind,
-        reason: reason.to_string(),
-    });
+) -> Result<(), ConnectionError> {
+    status
+        .send(ConnectionStatus {
+            conn_id: plan.conn_id.clone(),
+            venue: plan.venue,
+            private: plan.private,
+            ts_ms: unix_time_ns() / 1_000_000,
+            kind,
+            reason: reason.to_string(),
+        })
+        .await
+        .map_err(|_| ConnectionError::StatusClosed)
 }
 
 async fn await_private_login<S>(
@@ -433,5 +444,48 @@ mod tests {
             ),
             Err(ConnectionError::SubscriptionFailed(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn critical_status_transition_waits_for_bounded_capacity() {
+        let (status_tx, mut status_rx) = mpsc::channel(1);
+        status_tx
+            .send(ConnectionStatus {
+                conn_id: ConnId::new("existing"),
+                venue: Venue::Okx,
+                private: false,
+                ts_ms: 1,
+                kind: ConnectionStatusKind::Ready,
+                reason: "existing".to_string(),
+            })
+            .await
+            .unwrap();
+        let plan = SocketPlan {
+            conn_id: ConnId::new("book-1"),
+            venue: Venue::Okx,
+            private: false,
+            subscriptions: Vec::new(),
+        };
+        let pending = send_status(
+            &status_tx,
+            &plan,
+            ConnectionStatusKind::Disconnected,
+            "peer closed",
+        );
+        tokio::pin!(pending);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut pending)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            status_rx.recv().await.unwrap().conn_id,
+            ConnId::new("existing")
+        );
+        pending.await.unwrap();
+        let delivered = status_rx.recv().await.unwrap();
+        assert_eq!(delivered.conn_id, ConnId::new("book-1"));
+        assert_eq!(delivered.kind, ConnectionStatusKind::Disconnected);
     }
 }

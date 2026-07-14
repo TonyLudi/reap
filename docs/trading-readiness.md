@@ -224,9 +224,11 @@ production trading process.
     yet been certified.
 36. The live CLI reserves its create-new evidence path before config,
     credentials, or network activity. Runtime and teardown failures complete
-    fail-closed cleanup, persist a schema-4 report with a stable failure code,
-    readiness and post-cleanup order state, then preserve the original nonzero
-    exit. This makes injected demo faults auditable; failures before runtime
+    fail-closed cleanup, persist a schema-5 report with a stable failure code,
+    readiness, split public/private disconnect evidence, and post-cleanup order
+    state, then preserve the original nonzero exit. Critical ready/disconnect
+    transitions wait for bounded capacity instead of being silently dropped.
+    This makes injected demo faults auditable; failures before runtime
     construction still require the reserved empty path and process log.
 37. Order-channel fills now create the same canonical exact-fee journal record
     as the optional fills channel and cross-channel duplicates are suppressed by
