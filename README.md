@@ -119,7 +119,7 @@ cargo run -p reap-cli -- capture \
 
 The one-hour command is an operational smoke, not funding-complete research
 evidence. Production datasets must be continuous across exchange funding
-boundaries. Schema-4 production research with swap candidates requires nonzero
+boundaries. Schema-5 production research with swap candidates requires nonzero
 realized funding settlements in both training and test aggregates, so short
 captures cannot pass by carrying only forecasts.
 
@@ -202,9 +202,10 @@ verified again after all runs. Production raw datasets must pass the embedded
 schema-3 run-report verifier, capture-config-bound source analysis, and an
 independent zero-gap replay-integrity check before any candidate executes. The
 smoke fixture intentionally uses permissive uncalibrated gates and is not
-trading evidence. Production-candidate manifests use schema 4, require nonzero
-training/test realized-funding-settlement gates when any candidate trades a
-swap, require a passed
+trading evidence. Production-candidate manifests use schema 5, predeclare one
+`deployment_candidate_id`, and fail unless every fold independently selects
+that candidate from training data. They also require nonzero training/test
+realized-funding-settlement gates when any candidate trades a swap and a passed
 `latency_calibration` artifact, and require the baseline's empirical latency
 profile to match that artifact exactly.
 

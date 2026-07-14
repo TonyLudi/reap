@@ -81,7 +81,7 @@ enum Command {
     VerifyResearch {
         #[arg(short, long, help = "Exact research TOML used to produce the report")]
         manifest: PathBuf,
-        #[arg(short, long, help = "Archived schema-4 research JSON report")]
+        #[arg(short, long, help = "Archived schema-5 research JSON report")]
         report: PathBuf,
         #[arg(
             short,

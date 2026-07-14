@@ -192,7 +192,7 @@ production trading process.
     `settFundingRate` plus observed `prevFundingTime`; a private preload pass
     lets accounting apply the realized rate to signed linear or inverse
     exposure at the original exchange timestamp without strategy look-ahead.
-    Missing or conflicting realized rates fail closed, and schema-4 production
+    Missing or conflicting realized rates fail closed, and schema-5 production
     research requires nonzero settled intervals in both training and test
     aggregates. The short accepted capture had rate updates but no fill or
     funding boundary, so formulas are tested but not empirically calibrated or
@@ -211,7 +211,10 @@ production trading process.
     results. Production raw inputs must also pass an embedded schema-3 capture
     report verification that binds exact config/raw/optional-normalized evidence,
     capture-config-bound multi-source/candidate-channel analysis, and an
-    independent zero-gap replay check before selection. The checked-in
+    independent zero-gap replay check before selection. Schema 5 additionally
+    requires one predeclared deployment candidate to win training-only selection
+    in every fold, preventing a passing report from representing different live
+    strategies across windows. The checked-in
     smoke fold validates plumbing with permissive uncalibrated gates and negative
     fee-adjusted PnL; it is not production evidence. Each dataset currently
     starts from zero rather than carrying Java's daily ending positions.
@@ -227,7 +230,7 @@ production trading process.
     account identities. A deterministic CLI rejects mismatched
     config/code/host/account/session/clock or failed-operation evidence, emits a
     profile only after every required series passes, and binds the exact
-    artifact/profile into schema-4 production research. An independent verifier
+    artifact/profile into schema-5 production research. An independent verifier
     now re-hashes an explicit complete source-report set, reruns live verification,
     rebuilds every series/profile with recorded options, and compares the result
     after content-hash path normalization. Matching new/cancel measurements are

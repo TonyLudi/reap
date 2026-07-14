@@ -138,10 +138,14 @@ source reports, reruns live verification, and reconstructs every class/symbol
 series and profile under the recorded options. Only source paths are normalized
 to their content hashes, preserving the mapped `BackTestDelay`,
 `OkxNitroOrderClient`, and private-state boundaries while allowing evidence to
-move into an archive. A schema-4 production research manifest must point to that
+move into an archive. A schema-5 production research manifest must point to that
 artifact, run the byte-identical Reap executable, and use its exact baseline
-profile. The machinery is complete; no credentialed target-host artifact or
-passing reconstruction has been produced yet.
+profile. It also predeclares one deployable candidate and requires every fold to
+select it from training data. This is an explicit Rust acceptance control around
+the pinned Java `ChaosBackTestMultiRunService` per-run artifact model; the Java
+service does not supply a verified held-out candidate-selection policy. The
+machinery is complete; no credentialed target-host artifact or passing
+reconstruction has been produced yet.
 
 `verify-research` then re-runs the exact manifest with the byte-identical
 executable and compares every fold, selected candidate, Java-mapped execution

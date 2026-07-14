@@ -400,11 +400,13 @@ artifact creation, and exit status.
 
 For real research, create a new manifest alongside immutable capture files:
 
-1. Set `schema_version = 4`, `mode = "production_candidate"`, retain the pinned
+1. Set `schema_version = 5`, `mode = "production_candidate"`, retain the pinned
    Java revision, and point `latency_calibration` to the passed create-new JSON
    artifact whose profile is embedded exactly in the baseline scenario.
-2. List explicit full candidate TOML files; the runner does not mutate arbitrary
-   strategy fields or generate an implicit parameter grid.
+2. List explicit full candidate TOML files and set `deployment_candidate_id` to
+   the one strategy intended for deployment before any test-window result is
+   inspected. The runner does not mutate arbitrary strategy fields or generate
+   an implicit parameter grid.
 3. Give every capture a unique dataset ID/path/content hash. Every test window
    must occur strictly after its fold's training windows, and a test dataset can
    belong to only one fold. Set each raw dataset's `capture_config` and
@@ -437,6 +439,10 @@ For real research, create a new manifest alongside immutable capture files:
 
 Candidate scores use training runs only (`net_pnl_usd` or
 `pnl_per_turnover_bps`). Only the selected candidate is evaluated on test data.
+Every production fold must training-select the predeclared deployment candidate;
+one different or missing selection fails the fold and the aggregate report. The
+manifest hash binds that declaration before the run, but operators must still
+freeze the manifest before inspecting held-out results.
 The report contains the selection rule, gate thresholds, every underlying run,
 aggregate gate failures, and SHA-256 for the manifest, executable, candidate
 files, effective strategies, and datasets. Candidates with identical effective
@@ -1880,7 +1886,8 @@ output is an owner-only create-new file synced with its parent directory. Archiv
 the exact config, calibration, every source report, and this passing verification
 artifact together; the calibration's internal `passed` flag is insufficient.
 
-A production-candidate research manifest must use schema 4, set
+A production-candidate research manifest must use schema 5, predeclare its
+`deployment_candidate_id`, set
 `latency_calibration` to the JSON artifact, set the baseline execution
 `calibrated = true`, and embed exactly the artifact's profile. Research treats
 the artifact as untrusted input: it checks source/config hashes, sessions,

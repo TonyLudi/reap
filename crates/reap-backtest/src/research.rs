@@ -17,7 +17,7 @@ use crate::{
     LatencyCalibrationArtifact, MAX_LATENCY_CALIBRATION_ARTIFACT_BYTES,
 };
 
-pub const RESEARCH_SCHEMA_VERSION: u32 = 4;
+pub const RESEARCH_SCHEMA_VERSION: u32 = 5;
 pub use reap_core::PINNED_JAVA_REVISION;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +64,8 @@ pub struct ResearchManifest {
     #[serde(default)]
     pub latency_calibration: Option<PathBuf>,
     pub selection_metric: SelectionMetric,
+    #[serde(default)]
+    pub deployment_candidate_id: Option<String>,
     pub candidates: Vec<ResearchCandidate>,
     pub datasets: Vec<ResearchDataset>,
     pub scenarios: Vec<ResearchScenario>,
@@ -150,6 +152,8 @@ pub struct ResearchReport {
     pub schema_version: u32,
     pub mode: ResearchMode,
     pub selection_metric: SelectionMetric,
+    #[serde(default)]
+    pub deployment_candidate_id: Option<String>,
     pub gates: ResearchGates,
     pub manifest_sha256: String,
     pub executable_sha256: String,
@@ -463,6 +467,12 @@ pub fn run_research_manifest_path(path: impl AsRef<Path>) -> Result<ResearchRepo
             failures.push("no candidate passed the training evidence gates".to_string());
             (None, None)
         };
+        if let Some(failure) = deployment_selection_failure(
+            manifest.deployment_candidate_id.as_deref(),
+            selected_candidate_id.as_deref(),
+        ) {
+            failures.push(failure);
+        }
 
         let evidence_complete = failures.is_empty()
             && test_scenarios
@@ -501,6 +511,7 @@ pub fn run_research_manifest_path(path: impl AsRef<Path>) -> Result<ResearchRepo
         schema_version: RESEARCH_SCHEMA_VERSION,
         mode: manifest.mode,
         selection_metric: manifest.selection_metric,
+        deployment_candidate_id: manifest.deployment_candidate_id.clone(),
         gates: manifest.gates.clone(),
         manifest_sha256,
         executable_sha256,
@@ -575,6 +586,26 @@ impl ResearchManifest {
         validate_named("fold", self.folds.iter().map(|item| &item.id), &mut errors);
         if self.candidates.is_empty() {
             errors.push("at least one candidate is required".to_string());
+        }
+        match (self.mode, self.deployment_candidate_id.as_deref()) {
+            (ResearchMode::ProductionCandidate, None) => errors.push(
+                "production_candidate requires a predeclared deployment_candidate_id".to_string(),
+            ),
+            (ResearchMode::ProductionCandidate, Some(candidate_id)) => {
+                if !self
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.id == candidate_id)
+                {
+                    errors.push(format!(
+                        "deployment_candidate_id {candidate_id:?} does not name a candidate"
+                    ));
+                }
+            }
+            (ResearchMode::Smoke, Some(_)) => {
+                errors.push("smoke research cannot declare a deployment_candidate_id".to_string())
+            }
+            (ResearchMode::Smoke, None) => {}
         }
         if self.datasets.is_empty() {
             errors.push("at least one dataset is required".to_string());
@@ -1879,6 +1910,19 @@ fn overall_failures(
             stress_count, manifest.gates.minimum_stress_scenarios
         ));
     }
+    if let Some(expected) = manifest.deployment_candidate_id.as_deref() {
+        let mismatched_folds = folds
+            .iter()
+            .filter(|fold| fold.selected_candidate_id.as_deref() != Some(expected))
+            .map(|fold| fold.id.as_str())
+            .collect::<Vec<_>>();
+        if !mismatched_folds.is_empty() {
+            failures.push(format!(
+                "predeclared deployment candidate {expected} was not training-selected in folds: {}",
+                mismatched_folds.join(", ")
+            ));
+        }
+    }
     if folds.iter().any(|fold| !fold.evidence_complete) {
         failures.push("one or more folds have incomplete evidence".to_string());
     }
@@ -2022,6 +2066,21 @@ fn no_less_conservative(
         && stress.queue_ahead_multiplier >= baseline.queue_ahead_multiplier
         && stress.historical_trade_fill_fraction <= baseline.historical_trade_fill_fraction
         && stress.displayed_depth_fill_fraction <= baseline.displayed_depth_fill_fraction
+}
+
+fn deployment_selection_failure(
+    deployment_candidate_id: Option<&str>,
+    selected_candidate_id: Option<&str>,
+) -> Option<String> {
+    let expected = deployment_candidate_id?;
+    if selected_candidate_id == Some(expected) {
+        None
+    } else {
+        Some(format!(
+            "training selected candidate {} instead of predeclared deployment candidate {expected}",
+            selected_candidate_id.unwrap_or("<none>")
+        ))
+    }
 }
 
 fn validate_named<'a>(
@@ -2334,6 +2393,7 @@ mod tests {
             java_reference_revision: PINNED_JAVA_REVISION.to_string(),
             latency_calibration: None,
             selection_metric: SelectionMetric::NetPnlUsd,
+            deployment_candidate_id: None,
             candidates: vec![ResearchCandidate {
                 id: "base".to_string(),
                 config: "candidate.toml".into(),
@@ -2433,8 +2493,25 @@ mod tests {
         assert!(error.contains("at least three folds"));
         assert!(error.contains("at least two stress scenarios"));
         assert!(error.contains("calibrated execution"));
+        assert!(error.contains("predeclared deployment_candidate_id"));
         assert!(error.contains("capture_config for every dataset"));
         assert!(error.contains("capture_report for every dataset"));
+    }
+
+    #[test]
+    fn manifest_binds_deployment_candidate_by_mode() {
+        let mut production = manifest();
+        production.mode = ResearchMode::ProductionCandidate;
+        production.deployment_candidate_id = Some("missing".to_string());
+
+        let error = production.validate().unwrap_err().to_string();
+        assert!(error.contains("deployment_candidate_id \"missing\" does not name a candidate"));
+
+        let mut smoke = manifest();
+        smoke.deployment_candidate_id = Some("base".to_string());
+
+        let error = smoke.validate().unwrap_err().to_string();
+        assert!(error.contains("smoke research cannot declare a deployment_candidate_id"));
     }
 
     #[test]
@@ -2723,6 +2800,39 @@ mod tests {
     }
 
     #[test]
+    fn production_deployment_candidate_must_win_every_training_fold() {
+        assert!(deployment_selection_failure(Some("base"), Some("base")).is_none());
+
+        let failure = deployment_selection_failure(Some("base"), Some("alternative")).unwrap();
+        assert!(failure.contains("selected candidate alternative"));
+        assert!(failure.contains("predeclared deployment candidate base"));
+
+        let failure = deployment_selection_failure(Some("base"), None).unwrap();
+        assert!(failure.contains("selected candidate <none>"));
+
+        let mut manifest = manifest();
+        manifest.mode = ResearchMode::ProductionCandidate;
+        manifest.deployment_candidate_id = Some("base".to_string());
+        let folds = [FoldReport {
+            id: "fold-1".to_string(),
+            train_dataset_ids: vec!["train".to_string()],
+            test_dataset_ids: vec!["test".to_string()],
+            selected_candidate_id: Some("alternative".to_string()),
+            selection_score: Some(1.0),
+            training: Vec::new(),
+            test_scenarios: Vec::new(),
+            evidence_complete: true,
+            passed: true,
+            failures: Vec::new(),
+        }];
+        let failures = overall_failures(&manifest, &folds, &ResearchAggregate::default());
+        assert!(failures.iter().any(|failure| {
+            failure
+                == "predeclared deployment candidate base was not training-selected in folds: fold-1"
+        }));
+    }
+
+    #[test]
     fn candidate_identity_ignores_overridden_execution_but_tracks_strategy_changes() {
         let mut config: BacktestConfig =
             toml::from_str(include_str!("../../../examples/iarb2-basic.toml")).unwrap();
@@ -2808,6 +2918,7 @@ mod tests {
         assert_eq!(report.aggregate.folds, 1);
         assert_eq!(report.aggregate.stress_scenarios, 1);
         assert_eq!(report.selection_metric, SelectionMetric::NetPnlUsd);
+        assert_eq!(report.deployment_candidate_id, None);
         assert_eq!(report.gates.minimum_folds, 1);
         assert_eq!(report.folds[0].train_dataset_ids, ["train-fixture"]);
         assert_eq!(report.folds[0].test_dataset_ids, ["test-fixture"]);

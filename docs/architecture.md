@@ -747,6 +747,8 @@ acceptance explicit in a versioned TOML manifest:
 
 - Candidate configurations are evaluated only on each fold's training data.
 - The deterministically selected candidate alone reaches the later test window.
+- Production manifests predeclare one deployment candidate and fail unless that
+  same candidate wins training-only selection in every fold.
 - Exactly one baseline and zero or more no-less-conservative execution stress
   scenarios run on test data.
 - Dataset IDs, canonical paths, and byte-identical content cannot be reused to
@@ -777,12 +779,13 @@ strategy instance, which is emitted as
 daily position carry. Use one continuous capture as an evaluation dataset when
 inventory continuity matters, and constrain terminal delta/gross exposure in
 the manifest. Cross-file position carry must not be inferred from aggregate
-PnL. A `production_candidate` manifest additionally requires at least three
-folds, two stress scenarios, nonzero event, fill, and duration gates, calibrated
-baseline execution whose latency profile exactly matches a passed source-bound
-calibration artifact, complete accounting, and explicit bounds on non-funding
-work censored by each data horizon. Stress scenarios may use explicitly
-uncalibrated deterministic haircuts.
+PnL. A schema-5 `production_candidate` manifest additionally requires one
+predeclared deployment candidate, at least three folds, two stress scenarios,
+nonzero event, fill, and duration gates, calibrated baseline execution whose
+latency profile exactly matches a passed source-bound calibration artifact,
+complete accounting, and explicit bounds on non-funding work censored by each
+data horizon. Stress scenarios may use explicitly uncalibrated deterministic
+haircuts.
 
 The CLI independently verifies a schema-4 latency artifact before release use.
 It re-hashes an explicit complete set of archived live reports, reruns each

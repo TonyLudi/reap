@@ -263,7 +263,7 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Separate OKX funding forecasts from realized settlement accounting,
   retain `settFundingRate` with observed `prevFundingTime`, reject conflicting
   realized rates, settle at the original exchange timestamp without strategy
-  look-ahead, and require nonzero training/test settlement evidence in schema-4
+  look-ahead, and require nonzero training/test settlement evidence in schema-5
   production research.
 - [x] Match pinned Java OKX system-status monitoring with a typed current-wire
   `/api/v5/system/status` parser, environment-aware bootstrap and 10-second
@@ -283,6 +283,8 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Add independent full research reconstruction bound to the exact manifest,
   executable, and archived inputs; reject unknown/stale/forged/non-passing or
   numerically drifting reports, and persist owner-only durable evidence.
+- [x] Bind schema-5 production research to one manifest-declared deployment
+  candidate and fail unless every fold selects that candidate from training data.
 - [ ] Calibrate queue position, latency, fees, funding, and slippage from
   captured full-depth data, then run and archive production-candidate
   walk-forward, capacity, and stressed-liquidity reports. The orchestration and
