@@ -211,7 +211,8 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Reject ignored fields throughout live TOML parsing so nested configuration
   typos cannot silently default or evade production-transition comparison.
 - [x] Add hardened systemd templates with bounded observe restart and manual
-  demo/capture restart, plus the stop/cancel/reconcile operating procedure.
+  demo/capture restart, hermetic syntax/mode/security verification in CI, and the
+  stop/cancel/reconcile operating procedure.
 - [x] Persist current OKX order-channel fills and exact per-fill fees once across
   private channels, paginate recent-fill recovery to a proven short page with a
   fail-closed bound, and add authenticated create-new collection plus verified

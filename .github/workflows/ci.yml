@@ -42,6 +42,9 @@ jobs:
       - name: Build release CLI
         run: cargo build --release --locked -p reap-cli
 
+      - name: Verify hardened systemd templates
+        run: deploy/systemd/verify-units.sh target/release/reap
+
   advisories:
     name: RustSec advisory audit
     runs-on: ubuntu-24.04

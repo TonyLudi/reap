@@ -298,9 +298,10 @@ the matrix rejects typed proxy artifacts for those two roles.
 The reviewed Java OKX subscriber and `chaos-iarb2` classes do not provide the
 Rust runtime's place-request `expTime`, `/public/time` skew gate, Cancel All
 After heartbeat, fsynced restart-latch lifecycle, exclusive journal lease,
-bounded authenticated fill-evidence collection and verification, webhook alert worker,
-Linux host guard, hardened supervisor policy, or strategy-independent
-account-wide regular-order cancellation. Those are intentional
+bounded authenticated fill-evidence collection and verification, webhook alert
+worker, Linux host guard, hermetically verified capability-free supervisor
+policy, or strategy-independent account-wide regular-order cancellation. Those
+are intentional
 deployment-safety additions around the parity strategy, not claims of Java
 strategy equivalence. Re-check exchange-facing controls against both the pinned
 Java revision and the current OKX API contract whenever connectivity is

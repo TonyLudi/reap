@@ -62,7 +62,8 @@ Implemented:
   After, batch-cancels regular orders on every symbol, and requires a post-trigger
   zero-order proof. Its create-new schema-versioned artifact binds the exact
   input file, binary, host, Java revision, account coverage, and task failures,
-  plus hardened systemd templates with mode-specific restart policy.
+  plus CI-verified hardened systemd templates with mode-specific restart policy,
+  no capabilities, and a bounded offline security exposure.
 - A loopback-only OKX demo fault proxy with separate REST, public, private, and
   order-command routes, owner-local control, deterministic disconnect/frame-drop/
   REST-response faults, and create-new typed injector evidence that never records

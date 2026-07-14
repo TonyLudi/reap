@@ -973,8 +973,14 @@ settings; accepting only their static flags would weaken live stop behavior.
 Hardened baseline units and installation notes live in
 [`deploy/systemd`](../deploy/systemd/README.md). They run as an unprivileged
 `reap` user with a strict read-only filesystem view, one instance-specific
-writable directory, bounded file descriptors/tasks, and no privilege or
-namespace acquisition.
+writable directory, bounded file descriptors/tasks, no capabilities, no
+realtime scheduler acquisition or clock-write authority, and isolated process
+visibility, IPC, devices, temporary files, keyrings, and namespace acquisition.
+`ProtectClock=true` is deliberately absent because it also blocks the host
+guard's read-only `adjtimex()` synchronization probe. The
+hermetic `deploy/systemd/verify-units.sh` gate validates every mode-specific
+command/restart/path invariant, runs `systemd-analyze verify`, and caps reported
+offline security exposure at `4.0`; the checked-in units currently score `2.9`.
 
 - `reap-observe@.service` may restart on failure because observe mode cannot
   submit or cancel. A start limit bounds repeated bootstrap failures.
@@ -988,7 +994,14 @@ namespace acquisition.
   treated as an incident, followed by the emergency procedure below.
 - Monitor activation failures, non-zero exits, start-limit exhaustion, forced
   kills, and host resource/time alarms outside this process. Validate the unit
-  files and `systemd-analyze security` on the actual target OS.
+  files, merged drop-ins, and `systemd-analyze security` on the actual target OS.
+  The hermetic source gate is not runtime, paging, clock, resource, or restart
+  evidence; archive those independently from the target host.
+
+The pinned Java `MetCoinGatewayWsClientsOkexV5Config` owns in-process public,
+position, and order websocket construction, but it does not define an external
+process supervisor. This policy wraps the Java-referenced connectivity and
+strategy behavior with Rust deployment controls rather than claiming parity.
 
 Use absolute storage, operator-socket, and capture paths below the instance's
 writable directory in deployed TOML. Config and environment files must be
