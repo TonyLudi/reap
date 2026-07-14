@@ -166,22 +166,43 @@ private order traces and full-depth captures justify per-venue and
 per-instrument values.
 
 For every run, also inspect `fee_cost_usd`, `funding_pnl_usd`,
-`turnover_usd`, `funding_rate_events`, and `accounting_complete`. Funding uses
-the latest rate for each advertised settlement time. A first rate up to 60
-seconds late is applied immediately but marks accounting incomplete; older
-first rates are counted as missed and are not applied to a potentially changed
-position. Invalid data or a missing mark for a nonzero swap position also makes
-accounting incomplete. A future funding settlement beyond the capture horizon
-is reported as `pending_funding_actions` and is not itself a defect for the
-observed interval.
+`turnover_usd`, `cash_by_currency`, `currency_rates`,
+`currency_conversion_failures`, `funding_rate_events`, and
+`accounting_complete`. Funding uses the latest rate for each advertised
+settlement time. A first rate up to 60 seconds late is applied immediately but
+marks accounting incomplete; older first rates are counted as missed and are
+not applied to a potentially changed position. Invalid data or a missing mark
+for a nonzero swap position also makes accounting incomplete. A future funding
+settlement beyond the capture horizon is reported as `pending_funding_actions`
+and is not itself a defect for the observed interval.
 
-The portfolio starts at zero and treats USD-equivalent quote currencies at par;
-it does not model depeg-sensitive valuation, borrowing interest, liquidation,
-margin discounts, taxes, or the future USD drift of coin-denominated fees. Live
-stablecoin guards are not a substitute for that backtest limitation. A research
-acceptance run must span held funding boundaries, use the target fee tier, and
-reconcile fill, fee, funding, cash, equity, and active-order notional attribution
-to demo account statements before profitability metrics are trusted.
+The portfolio starts at zero. Configure one direct USD-per-unit index for every
+named non-USD quote/settlement currency:
+
+```toml
+[[backtest.currency_rates]]
+currency = "USDT"
+index_symbol = "USDT-USD"
+max_age_ms = 75000
+```
+
+The raw capture configuration must contain the matching redundant
+`index-tickers` stream. The rate becomes effective after simulated reference
+data latency, while age remains measured from the retained source timestamp.
+Missing, stale, invalid, or post-fill-only observations make the run
+non-passing; the report exposes the raw currency cash, source/effective times,
+and rate age used.
+
+Walk-forward scenarios inherit routes from each candidate; leave scenario
+`currency_rates` empty or repeat the exact candidate set. A scenario cannot
+substitute a different valuation source or freshness budget.
+
+This depeg-sensitive research extension does not change the Java-parity strategy
+decision model. It still does not model borrowing interest, liquidation, margin
+discounts, taxes, or actual exchange fee currency. A research acceptance run
+must span held funding boundaries, use the target fee tier, and reconcile fill,
+fee, funding, cash, equity, currency conversion, and active-order notional
+attribution to demo account statements before profitability metrics are trusted.
 Use `--require-complete-accounting` in automated research runs so any reported
 accounting defect also makes the command fail.
 
@@ -643,8 +664,9 @@ settings; accepting only their static flags would weaken live stop behavior.
   source is implemented.
 - The live guard checks downside deviation after a fresh value; an upside move
   alone is not a depeg failure, matching the pinned Java final check. Backtests
-  have no live stablecoin guards unless explicitly configured at a live risk
-  boundary.
+  do not run this live downside guard. Their `backtest.currency_rates` routes
+  provide depeg-sensitive valuation and completeness evidence, not a simulated
+  kill switch.
 
 ## Process Ownership And Host Guard
 

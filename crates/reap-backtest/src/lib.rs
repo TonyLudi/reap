@@ -12,8 +12,8 @@ pub use calibration::{
 };
 use execution::BacktestLatencySampler;
 pub use execution::{
-    BacktestConfig, BacktestExecutionConfig, BacktestLatencyClass, BacktestLatencyProfile,
-    BacktestLatencyRule, BacktestLatencyUsage, BacktestTimeBasis,
+    BacktestConfig, BacktestCurrencyRateConfig, BacktestExecutionConfig, BacktestLatencyClass,
+    BacktestLatencyProfile, BacktestLatencyRule, BacktestLatencyUsage, BacktestTimeBasis,
 };
 use matching::MatchingAssumptions;
 pub use matching::MatchingEngine;
@@ -37,7 +37,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::portfolio::Portfolio;
+use crate::portfolio::{Portfolio, required_accounting_currencies};
 use reap_core::{
     AccountUpdate, FillLiquidity, MarketEvent, NormalizedEvent, OrderEvent, OrderIntent,
     OrderUpdate, Position, StrategyEvent, Symbol,
@@ -47,6 +47,18 @@ use reap_strategy::{ChaosConfig, ChaosStrategy, Strategy};
 const MAX_ACTIONS_PER_DRAIN: usize = 1_000_000;
 const NS_PER_MS: u64 = 1_000_000;
 const FUNDING_LATE_TOLERANCE_NS: u64 = 60_000 * NS_PER_MS;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BacktestCurrencyRateReport {
+    pub currency: String,
+    pub index_symbol: Symbol,
+    pub usd_per_unit: Option<f64>,
+    pub source_ts_ms: Option<u64>,
+    pub effective_at_ns: Option<u64>,
+    pub age_ms: Option<u64>,
+    pub max_age_ms: u64,
+    pub usable: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BacktestReport {
@@ -84,9 +96,27 @@ pub struct BacktestReport {
     pub final_valuation_complete: bool,
     pub final_gross_exposure_usd: f64,
     pub cash_usd: f64,
+    #[serde(default)]
+    pub cash_by_currency: BTreeMap<String, f64>,
+    #[serde(default)]
+    pub inverse_cash_coin_by_symbol: BTreeMap<Symbol, f64>,
     pub fee_cost_usd: f64,
     pub funding_pnl_usd: f64,
     pub turnover_usd: f64,
+    #[serde(default)]
+    pub currency_rate_events: u64,
+    #[serde(default)]
+    pub invalid_currency_rate_events: u64,
+    #[serde(default)]
+    pub currency_conversion_failures: u64,
+    #[serde(default)]
+    pub invalid_accounting_events: u64,
+    #[serde(default)]
+    pub currency_rate_coverage_complete: bool,
+    #[serde(default)]
+    pub missing_currency_rates: Vec<String>,
+    #[serde(default)]
+    pub currency_rates: Vec<BacktestCurrencyRateReport>,
     pub observed_duration_ns: u64,
     pub max_drawdown_usd: f64,
     pub max_abs_delta_usd: f64,
@@ -128,6 +158,13 @@ enum ScheduledAction {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CurrencyRateObservation {
+    usd_per_unit: f64,
+    source_ts_ms: u64,
+    effective_at_ns: u64,
+}
+
 pub struct BacktestRunner {
     strategy: ChaosStrategy,
     matchers: HashMap<Symbol, MatchingEngine>,
@@ -140,6 +177,8 @@ pub struct BacktestRunner {
     pending_cancels: HashSet<String>,
     depth_marks: HashMap<Symbol, f64>,
     exchange_marks: HashMap<Symbol, f64>,
+    currency_by_index_symbol: HashMap<Symbol, String>,
+    currency_rate_observations: HashMap<String, CurrencyRateObservation>,
     funding_rates: HashMap<(Symbol, u64), f64>,
     scheduled_funding: HashSet<(Symbol, u64)>,
     settled_funding: HashSet<(Symbol, u64)>,
@@ -165,6 +204,8 @@ pub struct BacktestRunner {
     invalid_funding_rate_events: u64,
     missed_funding_settlements: u64,
     funding_settlement_failures: u64,
+    currency_rate_events: u64,
+    invalid_currency_rate_events: u64,
     peak_equity_usd: f64,
     max_drawdown_usd: f64,
     max_abs_delta_usd: f64,
@@ -196,6 +237,7 @@ impl BacktestRunner {
     ) -> Result<Self> {
         execution.validate()?;
         validate_latency_profile_symbols(&execution, &config)?;
+        validate_currency_rate_coverage(&execution, &config)?;
         let matching_assumptions = MatchingAssumptions {
             depth_fill_conservative_threshold: execution.depth_fill_conservative_threshold,
             queue_ahead_multiplier: execution.queue_ahead_multiplier,
@@ -213,6 +255,11 @@ impl BacktestRunner {
             })
             .collect();
         let latency_sampler = BacktestLatencySampler::new(&execution);
+        let currency_by_index_symbol = execution
+            .currency_rates
+            .iter()
+            .map(|route| (route.index_symbol.clone(), route.currency.clone()))
+            .collect();
         Ok(Self {
             portfolio: Portfolio::new(&config.instruments),
             strategy: ChaosStrategy::new(config).context("invalid chaos/iarb2 configuration")?,
@@ -225,6 +272,8 @@ impl BacktestRunner {
             pending_cancels: HashSet::new(),
             depth_marks: HashMap::new(),
             exchange_marks: HashMap::new(),
+            currency_by_index_symbol,
+            currency_rate_observations: HashMap::new(),
             funding_rates: HashMap::new(),
             scheduled_funding: HashSet::new(),
             settled_funding: HashSet::new(),
@@ -250,6 +299,8 @@ impl BacktestRunner {
             invalid_funding_rate_events: 0,
             missed_funding_settlements: 0,
             funding_settlement_failures: 0,
+            currency_rate_events: 0,
+            invalid_currency_rate_events: 0,
             peak_equity_usd: 0.0,
             max_drawdown_usd: 0.0,
             max_abs_delta_usd: 0.0,
@@ -518,7 +569,12 @@ impl BacktestRunner {
             .or_else(|| self.depth_marks.get(&symbol))
             .copied()
             .unwrap_or(f64::NAN);
-        if self.portfolio.apply_funding(&symbol, rate, mark).is_some() {
+        let currency_rates = self.fresh_currency_rates();
+        if self
+            .portfolio
+            .apply_funding(&symbol, rate, mark, &currency_rates)
+            .is_some()
+        {
             self.funding_settlements += 1;
         } else {
             self.funding_settlement_failures += 1;
@@ -540,7 +596,8 @@ impl BacktestRunner {
                     Some(FillLiquidity::Taker) => self.taker_fills += 1,
                     None => {}
                 }
-                self.portfolio.apply_fill(&update);
+                let currency_rates = self.fresh_currency_rates();
+                self.portfolio.apply_fill(&update, &currency_rates);
                 self.sample_risk_metrics();
                 Some(self.account_update_after_fill(&update))
             } else {
@@ -672,7 +729,18 @@ impl BacktestRunner {
                 self.accept_intents(commands)?;
             }
             ScheduledAction::DeliverStrategy(event) => {
+                let currency_rate = match &event {
+                    StrategyEvent::Market(MarketEvent::IndexPrice {
+                        ts_ms,
+                        symbol,
+                        price,
+                    }) => Some((symbol.clone(), *price, *ts_ms)),
+                    _ => None,
+                };
                 let event = retime_strategy_event(event, time_ms(self.now_ns));
+                if let Some((symbol, price, source_ts_ms)) = currency_rate {
+                    self.register_currency_rate(&symbol, price, source_ts_ms);
+                }
                 let commands = self.strategy.on_event(&event);
                 self.accept_intents(commands)?;
             }
@@ -741,17 +809,134 @@ impl BacktestRunner {
         self.metric_clock_ns = Some(target_ns);
     }
 
+    fn register_currency_rate(&mut self, index_symbol: &str, usd_per_unit: f64, source_ts_ms: u64) {
+        let Some(currency) = self.currency_by_index_symbol.get(index_symbol).cloned() else {
+            return;
+        };
+        self.currency_rate_events = self.currency_rate_events.saturating_add(1);
+        if !usd_per_unit.is_finite() || usd_per_unit <= 0.0 {
+            self.invalid_currency_rate_events = self.invalid_currency_rate_events.saturating_add(1);
+            return;
+        }
+        self.currency_rate_observations.insert(
+            currency,
+            CurrencyRateObservation {
+                usd_per_unit,
+                source_ts_ms,
+                effective_at_ns: self.now_ns,
+            },
+        );
+    }
+
+    fn fresh_currency_rates(&self) -> HashMap<String, f64> {
+        let mut rates = HashMap::from([("USD".to_string(), 1.0)]);
+        for route in &self.execution.currency_rates {
+            let Some(observation) = self.currency_rate_observations.get(&route.currency) else {
+                continue;
+            };
+            let maximum_age_ns = route.max_age_ms.saturating_mul(NS_PER_MS);
+            let source_ns = observation.source_ts_ms.saturating_mul(NS_PER_MS);
+            if self.now_ns.saturating_sub(source_ns) <= maximum_age_ns {
+                rates.insert(route.currency.clone(), observation.usd_per_unit);
+            }
+        }
+        rates
+    }
+
+    fn fallback_currency_rates(&self) -> HashMap<String, f64> {
+        let mut rates = HashMap::from([("USD".to_string(), 1.0)]);
+        for route in &self.execution.currency_rates {
+            let rate = self
+                .currency_rate_observations
+                .get(&route.currency)
+                .map(|observation| observation.usd_per_unit)
+                .unwrap_or(1.0);
+            rates.insert(route.currency.clone(), rate);
+        }
+        rates
+    }
+
+    fn currency_rate_reports(&self) -> Vec<BacktestCurrencyRateReport> {
+        let mut reports = self
+            .execution
+            .currency_rates
+            .iter()
+            .map(|route| {
+                let observation = self.currency_rate_observations.get(&route.currency);
+                let age_ns = observation.map(|observation| {
+                    self.now_ns
+                        .saturating_sub(observation.source_ts_ms.saturating_mul(NS_PER_MS))
+                });
+                let usable = observation.is_some_and(|observation| {
+                    observation.usd_per_unit.is_finite()
+                        && observation.usd_per_unit > 0.0
+                        && age_ns.unwrap_or(u64::MAX) <= route.max_age_ms.saturating_mul(NS_PER_MS)
+                });
+                BacktestCurrencyRateReport {
+                    currency: route.currency.clone(),
+                    index_symbol: route.index_symbol.clone(),
+                    usd_per_unit: observation.map(|observation| observation.usd_per_unit),
+                    source_ts_ms: observation.map(|observation| observation.source_ts_ms),
+                    effective_at_ns: observation.map(|observation| observation.effective_at_ns),
+                    age_ms: age_ns.map(|age_ns| age_ns.div_ceil(NS_PER_MS)),
+                    max_age_ms: route.max_age_ms,
+                    usable,
+                }
+            })
+            .collect::<Vec<_>>();
+        reports.sort_by(|left, right| left.currency.cmp(&right.currency));
+        reports
+    }
+
+    fn active_order_notional_usd_checked(
+        &self,
+        currency_rates: &HashMap<String, f64>,
+    ) -> Option<f64> {
+        self.matchers
+            .iter()
+            .try_fold(0.0, |total, (symbol, matcher)| {
+                let notional = matcher.active_order_notional_checked()?;
+                if notional == 0.0 {
+                    return Some(total);
+                }
+                let rate = self
+                    .portfolio
+                    .notional_currency_rate_usd_checked(symbol, currency_rates)?;
+                let value = notional * rate;
+                value.is_finite().then_some(total + value)
+            })
+            .filter(|notional| notional.is_finite())
+    }
+
+    fn active_order_notional_usd(&self, currency_rates: &HashMap<String, f64>) -> f64 {
+        self.matchers
+            .iter()
+            .filter_map(|(symbol, matcher)| {
+                matcher.active_order_notional_checked().map(|notional| {
+                    notional
+                        * self
+                            .portfolio
+                            .notional_currency_rate_usd(symbol, currency_rates)
+                })
+            })
+            .sum()
+    }
+
     fn sample_risk_metrics(&mut self) {
         self.risk_metric_samples = self.risk_metric_samples.saturating_add(1);
         let mut valid = true;
         let marks = self.valuation_marks();
-        if let Some(equity_usd) = self.portfolio.equity_usd_checked(&marks) {
+        let currency_rates = self.fresh_currency_rates();
+        if let Some(equity_usd) = self.portfolio.equity_usd_checked(&marks, &currency_rates) {
             self.peak_equity_usd = self.peak_equity_usd.max(equity_usd);
             self.max_drawdown_usd = self.max_drawdown_usd.max(self.peak_equity_usd - equity_usd);
         } else {
             valid = false;
         }
-        if let Some(gross_exposure_usd) = self.portfolio.gross_exposure_usd_checked(&marks) {
+        if let Some(gross_exposure_usd) = self
+            .portfolio
+            .gross_exposure_usd_checked(&marks, &currency_rates)
+        {
             self.max_gross_exposure_usd = self.max_gross_exposure_usd.max(gross_exposure_usd);
         } else {
             valid = false;
@@ -777,15 +962,9 @@ impl BacktestRunner {
             .map(|matcher| matcher.pending_order_count() + matcher.live_order_count())
             .sum();
         self.max_active_orders = self.max_active_orders.max(active_orders);
-        let mut active_order_notional_usd = 0.0;
-        for matcher in self.matchers.values() {
-            let Some(notional_usd) = matcher.active_order_notional_usd_checked() else {
-                valid = false;
-                continue;
-            };
-            active_order_notional_usd += notional_usd;
-        }
-        if active_order_notional_usd.is_finite() {
+        if let Some(active_order_notional_usd) =
+            self.active_order_notional_usd_checked(&currency_rates)
+        {
             self.max_active_order_notional_usd = self
                 .max_active_order_notional_usd
                 .max(active_order_notional_usd);
@@ -819,26 +998,39 @@ impl BacktestRunner {
         self.advance_metric_clock(now_ns);
         self.sample_risk_metrics();
         let marks = self.valuation_marks();
-        let checked_final_equity = self.portfolio.equity_usd_checked(&marks);
-        let checked_final_active_order_notional = self
-            .matchers
-            .values()
-            .try_fold(0.0, |total, matcher| {
-                Some(total + matcher.active_order_notional_usd_checked()?)
-            })
-            .filter(|notional| notional.is_finite());
-        let checked_final_gross_exposure = self.portfolio.gross_exposure_usd_checked(&marks);
+        let currency_rates = self.fresh_currency_rates();
+        let fallback_currency_rates = self.fallback_currency_rates();
+        let currency_rate_reports = self.currency_rate_reports();
+        let currency_rate_coverage_complete =
+            currency_rate_reports.iter().all(|report| report.usable);
+        let missing_currency_rates = currency_rate_reports
+            .iter()
+            .filter(|report| !report.usable)
+            .map(|report| report.currency.clone())
+            .collect::<Vec<_>>();
+        let checked_final_equity = self.portfolio.equity_usd_checked(&marks, &currency_rates);
+        let checked_final_active_order_notional =
+            self.active_order_notional_usd_checked(&currency_rates);
+        let checked_final_gross_exposure = self
+            .portfolio
+            .gross_exposure_usd_checked(&marks, &currency_rates);
         let final_delta_usd = self.strategy.delta_usd();
         let final_pending_delta_usd = self.strategy.pending_delta_usd();
         let final_valuation_complete = checked_final_equity.is_some()
             && checked_final_active_order_notional.is_some()
             && checked_final_gross_exposure.is_some()
+            && currency_rate_coverage_complete
             && final_delta_usd.is_finite()
             && final_pending_delta_usd.is_finite();
-        let final_equity_usd =
-            checked_final_equity.unwrap_or_else(|| self.portfolio.equity_usd(&marks));
-        let final_active_order_notional_usd = checked_final_active_order_notional.unwrap_or(0.0);
-        let final_gross_exposure_usd = checked_final_gross_exposure.unwrap_or(0.0);
+        let final_equity_usd = checked_final_equity
+            .unwrap_or_else(|| self.portfolio.equity_usd(&marks, &fallback_currency_rates));
+        let final_active_order_notional_usd = checked_final_active_order_notional
+            .unwrap_or_else(|| self.active_order_notional_usd(&fallback_currency_rates));
+        let final_gross_exposure_usd = checked_final_gross_exposure.unwrap_or_else(|| {
+            self.portfolio
+                .gross_exposure_usd_checked(&marks, &fallback_currency_rates)
+                .unwrap_or(0.0)
+        });
         let pending_orders = self
             .matchers
             .values()
@@ -867,6 +1059,9 @@ impl BacktestRunner {
             && self.invalid_funding_rate_events == 0
             && self.missed_funding_settlements == 0
             && self.funding_settlement_failures == 0
+            && self.invalid_currency_rate_events == 0
+            && self.portfolio.currency_conversion_failures() == 0
+            && self.portfolio.invalid_accounting_events() == 0
             && self.invalid_risk_metric_samples == 0
             && final_valuation_complete;
         let observed_duration_ns = self
@@ -919,10 +1114,19 @@ impl BacktestRunner {
             final_equity_usd,
             final_valuation_complete,
             final_gross_exposure_usd,
-            cash_usd: self.portfolio.cash_usd(),
+            cash_usd: self.portfolio.cash_usd(&fallback_currency_rates),
+            cash_by_currency: self.portfolio.cash_by_currency(),
+            inverse_cash_coin_by_symbol: self.portfolio.inverse_cash_coin_by_symbol(),
             fee_cost_usd: self.portfolio.fee_cost_usd(),
             funding_pnl_usd: self.portfolio.funding_pnl_usd(),
             turnover_usd: self.portfolio.turnover_usd(),
+            currency_rate_events: self.currency_rate_events,
+            invalid_currency_rate_events: self.invalid_currency_rate_events,
+            currency_conversion_failures: self.portfolio.currency_conversion_failures(),
+            invalid_accounting_events: self.portfolio.invalid_accounting_events(),
+            currency_rate_coverage_complete,
+            missing_currency_rates,
+            currency_rates: currency_rate_reports,
             observed_duration_ns,
             max_drawdown_usd: self.max_drawdown_usd,
             max_abs_delta_usd: self.max_abs_delta_usd,
@@ -1002,6 +1206,12 @@ fn validate_latency_profile_symbols(
             .iter()
             .filter_map(|instrument| instrument.index_symbol.as_deref()),
     );
+    known_symbols.extend(
+        execution
+            .currency_rates
+            .iter()
+            .map(|route| route.index_symbol.as_str()),
+    );
     let mut unknown = execution
         .latency_profile
         .rules
@@ -1013,11 +1223,34 @@ fn validate_latency_profile_symbols(
     unknown.dedup();
     if !unknown.is_empty() {
         bail!(
-            "backtest latency profile references symbols outside the strategy instrument/reference/index universe: {}",
+            "backtest latency profile references symbols outside the strategy instrument/reference/index universe (including accounting indexes): {}",
             unknown.join(", ")
         );
     }
     Ok(())
+}
+
+fn validate_currency_rate_coverage(
+    execution: &BacktestExecutionConfig,
+    config: &ChaosConfig,
+) -> Result<()> {
+    let configured = execution
+        .currency_rates
+        .iter()
+        .map(|route| route.currency.as_str())
+        .collect::<HashSet<_>>();
+    let mut missing = required_accounting_currencies(&config.instruments)
+        .into_iter()
+        .filter(|currency| !configured.contains(currency.as_str()))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    missing.sort();
+    bail!(
+        "backtest.currency_rates lacks direct USD valuation routes for instrument accounting currencies: {}",
+        missing.join(", ")
+    )
 }
 
 fn retime_order_update(mut update: OrderUpdate, ts_ms: u64) -> OrderUpdate {
@@ -1121,6 +1354,52 @@ mod tests {
                 Level::new(50_004.0, 10_000.0),
             ))),
         ]
+    }
+
+    fn usdt_config() -> ChaosConfig {
+        let mut config = config();
+        for instrument in &mut config.instruments {
+            instrument.base_currency = "BTC".to_string();
+            instrument.quote_currency = "USDT".to_string();
+            instrument.taker_fee = 0.0;
+            if instrument.kind.is_derivative() {
+                instrument.settle_currency = "USDT".to_string();
+            }
+        }
+        config
+    }
+
+    fn usdt_execution(market_data_latency_ms: u64, max_age_ms: u64) -> BacktestExecutionConfig {
+        BacktestExecutionConfig {
+            market_data_latency_ms,
+            currency_rates: vec![BacktestCurrencyRateConfig {
+                currency: "USDT".to_string(),
+                index_symbol: "USDT-USD".to_string(),
+                max_age_ms,
+            }],
+            ..BacktestExecutionConfig::default()
+        }
+    }
+
+    fn external_spot_fill(ts_ms: u64, price: f64) -> NormalizedEvent {
+        NormalizedEvent::Order(OrderUpdate {
+            ts_ms,
+            order_id: "external-fill".to_string(),
+            symbol: "BTC-USDT".to_string(),
+            side: Side::Buy,
+            event: OrderEvent::FullyFilled,
+            status: OrderStatus::Filled,
+            price,
+            time_in_force: Some(TimeInForce::Ioc),
+            qty: 1.0,
+            open_qty: 0.0,
+            filled_qty: 1.0,
+            avg_fill_price: price,
+            last_fill_qty: 1.0,
+            last_fill_price: price,
+            last_fill_liquidity: Some(FillLiquidity::Taker),
+            reason: "external-test-fill".to_string(),
+        })
     }
 
     #[test]
@@ -1272,6 +1551,146 @@ mod tests {
     }
 
     #[test]
+    fn runner_requires_explicit_rates_for_non_usd_accounting_currencies() {
+        let error = BacktestRunner::new(usdt_config())
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert!(error.contains("lacks direct USD valuation routes"));
+        assert!(error.contains("USDT"));
+    }
+
+    #[test]
+    fn delivered_currency_index_values_portfolio_and_report_evidence() {
+        let mut runner =
+            BacktestRunner::with_execution_config(usdt_config(), usdt_execution(0, 1_000)).unwrap();
+        runner.depth_marks.insert("BTC-USDT".to_string(), 110.0);
+        let events = vec![
+            NormalizedEvent::Market(MarketEvent::IndexPrice {
+                ts_ms: 1,
+                symbol: "USDT-USD".to_string(),
+                price: 0.95,
+            }),
+            external_spot_fill(2, 100.0),
+            NormalizedEvent::Timer(TimerEvent {
+                ts_ms: 3,
+                name: "finish".to_string(),
+            }),
+        ];
+
+        let report = runner.run(events).unwrap();
+
+        assert!((report.final_equity_usd - 9.5).abs() < 1e-12);
+        assert!((report.cash_usd + 95.0).abs() < 1e-12);
+        assert_eq!(report.cash_by_currency.get("USDT"), Some(&-100.0));
+        assert_eq!(report.currency_rate_events, 1);
+        assert_eq!(report.currency_conversion_failures, 0);
+        assert!(report.currency_rate_coverage_complete);
+        assert!(report.missing_currency_rates.is_empty());
+        assert_eq!(report.currency_rates.len(), 1);
+        assert_eq!(report.currency_rates[0].usd_per_unit, Some(0.95));
+        assert_eq!(report.currency_rates[0].source_ts_ms, Some(1));
+        assert_eq!(report.currency_rates[0].effective_at_ns, Some(NS_PER_MS));
+        assert_eq!(report.currency_rates[0].age_ms, Some(2));
+        assert!(report.currency_rates[0].usable);
+        assert!(report.final_valuation_complete);
+        assert!(report.accounting_complete);
+    }
+
+    #[test]
+    fn stale_currency_index_makes_final_accounting_incomplete() {
+        let mut runner =
+            BacktestRunner::with_execution_config(usdt_config(), usdt_execution(0, 1)).unwrap();
+        runner.depth_marks.insert("BTC-USDT".to_string(), 110.0);
+        let events = vec![
+            NormalizedEvent::Market(MarketEvent::IndexPrice {
+                ts_ms: 1,
+                symbol: "USDT-USD".to_string(),
+                price: 0.95,
+            }),
+            external_spot_fill(2, 100.0),
+            NormalizedEvent::Timer(TimerEvent {
+                ts_ms: 4,
+                name: "stale".to_string(),
+            }),
+        ];
+
+        let report = runner.run(events).unwrap();
+
+        assert!(!report.currency_rate_coverage_complete);
+        assert_eq!(report.missing_currency_rates, vec!["USDT".to_string()]);
+        assert!((report.final_equity_usd - 9.5).abs() < 1e-12);
+        assert!((report.final_gross_exposure_usd - 104.5).abs() < 1e-12);
+        assert!(!report.final_valuation_complete);
+        assert!(!report.accounting_complete);
+        assert!(report.invalid_risk_metric_samples > 0);
+    }
+
+    #[test]
+    fn fill_before_delayed_currency_index_records_conversion_failure() {
+        let mut runner =
+            BacktestRunner::with_execution_config(usdt_config(), usdt_execution(10, 1_000))
+                .unwrap();
+        runner.depth_marks.insert("BTC-USDT".to_string(), 110.0);
+        let events = vec![
+            NormalizedEvent::Market(MarketEvent::IndexPrice {
+                ts_ms: 1,
+                symbol: "USDT-USD".to_string(),
+                price: 0.95,
+            }),
+            external_spot_fill(2, 100.0),
+            NormalizedEvent::Timer(TimerEvent {
+                ts_ms: 11,
+                name: "deliver-reference".to_string(),
+            }),
+        ];
+
+        let report = runner.run(events).unwrap();
+
+        assert_eq!(report.currency_rate_events, 1);
+        assert!(report.currency_rate_coverage_complete);
+        assert_eq!(report.currency_conversion_failures, 1);
+        assert_eq!(report.currency_rates[0].source_ts_ms, Some(1));
+        assert_eq!(
+            report.currency_rates[0].effective_at_ns,
+            Some(11 * NS_PER_MS)
+        );
+        assert_eq!(report.currency_rates[0].age_ms, Some(10));
+        assert_eq!(report.turnover_usd, 100.0);
+        assert!(!report.accounting_complete);
+    }
+
+    #[test]
+    fn source_age_can_make_a_currency_index_stale_at_delivery() {
+        let mut runner =
+            BacktestRunner::with_execution_config(usdt_config(), usdt_execution(10, 5)).unwrap();
+        let events = vec![
+            NormalizedEvent::Market(MarketEvent::IndexPrice {
+                ts_ms: 1,
+                symbol: "USDT-USD".to_string(),
+                price: 0.95,
+            }),
+            NormalizedEvent::Timer(TimerEvent {
+                ts_ms: 11,
+                name: "deliver-stale-reference".to_string(),
+            }),
+        ];
+
+        let report = runner.run(events).unwrap();
+
+        assert_eq!(report.currency_rate_events, 1);
+        assert_eq!(
+            report.currency_rates[0].effective_at_ns,
+            Some(11 * NS_PER_MS)
+        );
+        assert_eq!(report.currency_rates[0].age_ms, Some(10));
+        assert!(!report.currency_rates[0].usable);
+        assert!(!report.currency_rate_coverage_complete);
+        assert!(!report.accounting_complete);
+    }
+
+    #[test]
     fn input_clock_regressions_are_clamped_and_reported() {
         let mut runner = BacktestRunner::new(config()).unwrap();
         let mut events = initial_books();
@@ -1419,24 +1838,27 @@ mod tests {
         cfg.instruments[1].taker_fee = 0.0;
         let mut runner = BacktestRunner::new(cfg).unwrap();
         runner.depth_marks.insert("BTC-PERP".to_string(), 50_000.0);
-        runner.portfolio.apply_fill(&OrderUpdate {
-            ts_ms: 0,
-            order_id: "initial-fill".to_string(),
-            symbol: "BTC-PERP".to_string(),
-            side: Side::Buy,
-            event: OrderEvent::FullyFilled,
-            status: OrderStatus::Filled,
-            price: 50_000.0,
-            time_in_force: Some(TimeInForce::Ioc),
-            qty: 100.0,
-            open_qty: 0.0,
-            filled_qty: 100.0,
-            avg_fill_price: 50_000.0,
-            last_fill_qty: 100.0,
-            last_fill_price: 50_000.0,
-            last_fill_liquidity: Some(FillLiquidity::Taker),
-            reason: "initial".to_string(),
-        });
+        runner.portfolio.apply_fill(
+            &OrderUpdate {
+                ts_ms: 0,
+                order_id: "initial-fill".to_string(),
+                symbol: "BTC-PERP".to_string(),
+                side: Side::Buy,
+                event: OrderEvent::FullyFilled,
+                status: OrderStatus::Filled,
+                price: 50_000.0,
+                time_in_force: Some(TimeInForce::Ioc),
+                qty: 100.0,
+                open_qty: 0.0,
+                filled_qty: 100.0,
+                avg_fill_price: 50_000.0,
+                last_fill_qty: 100.0,
+                last_fill_price: 50_000.0,
+                last_fill_liquidity: Some(FillLiquidity::Taker),
+                reason: "initial".to_string(),
+            },
+            &HashMap::new(),
+        );
         let events = vec![
             NormalizedEvent::from(MarketEvent::FundingRate {
                 ts_ms: 1,

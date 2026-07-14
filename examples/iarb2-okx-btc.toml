@@ -23,6 +23,13 @@ queue_ahead_multiplier = 1.0
 historical_trade_fill_fraction = 1.0
 displayed_depth_fill_fraction = 1.0
 
+# Direct USD-per-currency valuation used by research accounting. This must match
+# an index-tickers stream in the capture configuration.
+[[backtest.currency_rates]]
+currency = "USDT"
+index_symbol = "USDT-USD"
+max_age_ms = 75000
+
 [[risk_groups]]
 name = "main"
 symbols = ["BTC-USDT", "BTC-USDT-SWAP"]

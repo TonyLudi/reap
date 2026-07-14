@@ -130,6 +130,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Attribute fill fees/turnover and port signed linear/inverse swap funding
   settlement with mark fallback, late/missed coverage signals, and explicit
   end-of-horizon funding actions.
+- [x] Add explicit quote/settlement currency ledgers and latency/freshness-aware
+  direct USD index valuation for fills, fees, funding, positions, and active
+  orders; fail production research on missing conversion evidence.
 - [x] Add Java-referenced USDT/USDC depeg protection with redundant critical
   index feeds, conflict-aware deduplication, startup readiness, immediate entry
   blocking, and a debounced durable global risk latch.
@@ -201,8 +204,7 @@ architecture in [docs/architecture.md](docs/architecture.md).
   configurable execution model and latency evidence pipeline are implemented
   but have no credentialed calibration artifact; empirical queue and populated
   per-class/per-instrument latency distributions, fee tiers, complete funding
-  intervals, depeg-sensitive quote valuation, borrow costs, and statement
-  reconciliation are still required.
+  intervals, borrow costs, and statement reconciliation are still required.
 - [ ] Deploy and exercise the webhook/host guards, systemd supervision, external
   unit-failure paging, and independent exchange cancel procedure on the target
   host/account; add a separate algo/spread kill path if those order classes are

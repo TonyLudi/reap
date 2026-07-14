@@ -114,8 +114,8 @@ impl MatchingEngine {
             .count()
     }
 
-    /// Gross notional of `PendingNew` and live order remainders at their limit prices.
-    pub fn active_order_notional_usd_checked(&self) -> Option<f64> {
+    /// Gross quote/settlement notional of pending and live remainders at limit price.
+    pub fn active_order_notional_checked(&self) -> Option<f64> {
         let mut total = 0.0;
         for (_, order) in self
             .orders
@@ -627,7 +627,7 @@ mod tests {
         );
 
         assert_eq!(engine.pending_order_count(), 1);
-        assert_eq!(engine.active_order_notional_usd_checked(), Some(200.0));
+        assert_eq!(engine.active_order_notional_checked(), Some(200.0));
     }
 
     #[test]

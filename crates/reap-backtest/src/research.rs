@@ -340,6 +340,7 @@ pub fn run_research_manifest_path(path: impl AsRef<Path>) -> Result<ResearchRepo
         &executable_sha256,
     )?;
     let candidates = load_candidates(&manifest.candidates, base)?;
+    validate_scenario_currency_rates(&manifest.scenarios, &candidates)?;
     let datasets = load_datasets(&manifest.datasets, base, manifest.mode, &candidates)?;
     let manifest_sha256 = sha256_bytes(&manifest_bytes);
     let mut cache = HashMap::new();
@@ -985,6 +986,7 @@ fn load_candidates(specs: &[ResearchCandidate], base: &Path) -> Result<Vec<Loade
         )
         .with_context(|| format!("failed to parse candidate config {}", canonical.display()))?;
         config.backtest.validate()?;
+        super::validate_currency_rate_coverage(&config.backtest, &config.strategy)?;
         let validation = config.strategy.effective().validate();
         if !validation.valid {
             bail!(
@@ -1244,6 +1246,16 @@ fn validate_production_capture_config(
             .any(|channel| has_stream(channel, symbol))
     };
     for candidate in candidates {
+        for route in &candidate.config.backtest.currency_rates {
+            if !has_stream("index-tickers", &route.index_symbol) {
+                bail!(
+                    "production dataset {dataset_id} lacks index-tickers for candidate {} accounting currency {} via {}",
+                    candidate.spec.id,
+                    route.currency,
+                    route.index_symbol
+                );
+            }
+        }
         for instrument in &candidate.config.strategy.instruments {
             if !has_book(&instrument.symbol) {
                 bail!(
@@ -1358,7 +1370,8 @@ fn cached_run(
         return run.clone();
     }
     let mut config = candidate.config.clone();
-    config.backtest = scenario.execution.clone();
+    config.backtest = effective_scenario_execution(&config.backtest, &scenario.execution)
+        .expect("scenario currency rates must be validated before research runs");
     let result = BacktestRunner::from_config(config).and_then(|runner| match dataset.spec.format {
         ResearchDataFormat::Csv => runner.run_csv_path(&dataset.resolved_path),
         ResearchDataFormat::NormalizedJsonl => {
@@ -1379,6 +1392,47 @@ fn cached_run(
     };
     cache.insert(key, run.clone());
     run
+}
+
+fn validate_scenario_currency_rates(
+    scenarios: &[ResearchScenario],
+    candidates: &[LoadedCandidate],
+) -> Result<()> {
+    for scenario in scenarios {
+        for candidate in candidates {
+            effective_scenario_execution(&candidate.config.backtest, &scenario.execution)
+                .with_context(|| {
+                    format!(
+                        "scenario {} currency valuation conflicts with candidate {}",
+                        scenario.id, candidate.spec.id
+                    )
+                })?;
+        }
+    }
+    Ok(())
+}
+
+fn effective_scenario_execution(
+    candidate: &BacktestExecutionConfig,
+    scenario: &BacktestExecutionConfig,
+) -> Result<BacktestExecutionConfig> {
+    let mut effective = scenario.clone();
+    if effective.currency_rates.is_empty() {
+        effective.currency_rates = candidate.currency_rates.clone();
+        return Ok(effective);
+    }
+
+    let mut candidate_rates = candidate.currency_rates.clone();
+    let mut scenario_rates = effective.currency_rates.clone();
+    candidate_rates.sort_by(|left, right| left.currency.cmp(&right.currency));
+    scenario_rates.sort_by(|left, right| left.currency.cmp(&right.currency));
+    if scenario_rates != candidate_rates {
+        bail!(
+            "scenario currency_rates must be empty to inherit the candidate or exactly match the candidate routes"
+        );
+    }
+    effective.currency_rates = candidate_rates;
+    Ok(effective)
 }
 
 fn training_failures(
@@ -1857,11 +1911,42 @@ mod tests {
             order_update_latency_ms: latency_ms,
             fill_account_latency_ms: latency_ms,
             latency_profile: Default::default(),
+            currency_rates: Vec::new(),
             depth_fill_conservative_threshold: 0.0001,
             queue_ahead_multiplier: queue,
             historical_trade_fill_fraction: trade_fraction,
             displayed_depth_fill_fraction: depth_fraction,
         }
+    }
+
+    #[test]
+    fn research_scenarios_inherit_but_cannot_replace_candidate_currency_routes() {
+        let route = crate::BacktestCurrencyRateConfig {
+            currency: "USDT".to_string(),
+            index_symbol: "USDT-USD".to_string(),
+            max_age_ms: 75_000,
+        };
+        let mut candidate = BacktestExecutionConfig {
+            currency_rates: vec![route.clone()],
+            ..BacktestExecutionConfig::default()
+        };
+        let scenario = BacktestExecutionConfig {
+            market_data_latency_ms: 10,
+            ..BacktestExecutionConfig::default()
+        };
+
+        let inherited = effective_scenario_execution(&candidate, &scenario).unwrap();
+        assert_eq!(inherited.currency_rates, vec![route.clone()]);
+        assert_eq!(inherited.market_data_latency_ms, 10);
+
+        let explicit_match = BacktestExecutionConfig {
+            currency_rates: vec![route.clone()],
+            ..scenario.clone()
+        };
+        assert!(effective_scenario_execution(&candidate, &explicit_match).is_ok());
+
+        candidate.currency_rates[0].max_age_ms = 10_000;
+        assert!(effective_scenario_execution(&candidate, &explicit_match).is_err());
     }
 
     fn gates() -> ResearchGates {
@@ -2030,6 +2115,16 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("requires at least two connections"));
+
+        let mut missing_currency_rate = config.clone();
+        missing_currency_rate
+            .subscriptions
+            .retain(|stream| !(stream.channel == "index-tickers" && stream.symbol == "USDT-USD"));
+        let error =
+            validate_production_capture_config("capture", &missing_currency_rate, &candidates)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("accounting currency USDT via USDT-USD"));
 
         let mut missing_trades = config;
         missing_trades

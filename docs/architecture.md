@@ -490,8 +490,30 @@ orders and every category of pending action at the dataset boundary.
 
 Every simulated fill records absolute turnover and maker/taker fee cost from the
 instrument configuration. Fee cost may be negative for a maker rebate. The
-portfolio applies linear and inverse position cash flows separately and reports
-fee cost, funding PnL, turnover, cash, positions, and marked final equity.
+portfolio applies spot and linear cash flows to explicit quote/settlement
+currency ledgers and keeps inverse contract cash in coin by symbol. It reports
+those raw ledgers alongside fee cost, funding PnL, turnover, positions, and
+marked final equity.
+
+Every non-USD accounting currency requires an explicit
+`[[backtest.currency_rates]]` route naming a direct index whose price is USD per
+currency unit and a maximum age. Empty legacy currency fields mean USD; no
+named non-USD currency silently receives par treatment. Index observations
+become usable when their latency-scheduled `ReferenceData` event reaches the
+strategy boundary; freshness still ages from the retained source timestamp, so
+transport and simulated processing delay consume the budget. Spot position
+value, linear and inverse notional, active orders, fees, turnover, and funding
+are then converted through the same fresh rate. Missing, invalid, or stale rates
+make valuation/accounting incomplete;
+fills or funding settled before a usable rate increment
+`currency_conversion_failures`. A non-passing report retains the latest rate,
+or par only if none was ever observed, for best-effort numeric output and marks
+that fallback explicitly through the completeness fields.
+
+Research scenarios inherit these routes from each candidate configuration.
+They may repeat an exact route set but cannot replace it, so latency/capacity
+stress never changes the valuation source or freshness policy selected for that
+candidate.
 
 Funding-rate events update the latest rate for `(symbol, funding_time_ms)` and
 schedule one settlement at the exchange funding time. Linear swap funding cost
@@ -509,12 +531,21 @@ and other settlement failures make `accounting_complete=false`. A funding time
 beyond the dataset remains a categorized pending action and is not a failure for
 the observed horizon.
 
+The pinned Java portfolio already separates spot base and quote accounts and
+settles derivative funding in the instrument settlement account, but its
+account summary treats `Currencies.isUsdEquivalent` at one. Java's separate
+`StableCoinDepegCheckerImpl` is a live safety guard. Rust preserves that
+strategy-decision parity and adds depeg-sensitive conversion only at the
+research accounting boundary.
+
 This is still research accounting, not an exchange statement. It assumes a zero
-initial portfolio, does not model borrowing interest, liquidation, margin
-discounts, tax, or coin-denominated fee drift, and cannot infer a missing funding
-event when the source dataset never contained one. Production evaluation must
-reconcile these outputs against demo account statements and complete funding
-coverage across every held interval.
+initial portfolio, estimates fees from configured rates and an accounting
+currency because normalized fills do not carry exchange `feeCcy`, and does not
+model borrowing interest, liquidation, margin discounts, or tax. It also cannot
+infer a missing funding event when the source dataset never contained one.
+Production evaluation must reconcile these outputs against demo account
+statements and complete funding and currency-index coverage across every held
+interval.
 
 #### Deterministic walk-forward research
 
@@ -539,7 +570,8 @@ acceptance explicit in a versioned TOML manifest:
   source-coverage analysis plus a one-session, parse-clean, zero-gap replay
   check with ready terminal books before any candidate runs. Every configured
   stream must have at least two sources; candidate instruments must have book
-  and trade coverage plus applicable index, mark, limit, and funding streams.
+  and trade coverage plus applicable strategy index, accounting currency index,
+  mark, limit, and funding streams.
 - Reports embed selection/gate policy, fingerprint the manifest, executable,
   candidate files, effective strategies, and data, and preserve every
   underlying `BacktestReport`.

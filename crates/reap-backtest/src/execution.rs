@@ -10,6 +10,23 @@ const MAX_BACKTEST_LATENCY_MS: u64 = 3_600_000;
 const MAX_LATENCY_PROFILE_RULES: usize = 4_096;
 const MAX_LATENCY_SAMPLES_PER_RULE: usize = 65_536;
 const MAX_TOTAL_LATENCY_SAMPLES: usize = 1_000_000;
+const MAX_CURRENCY_RATE_ROUTES: usize = 256;
+const DEFAULT_CURRENCY_RATE_MAX_AGE_MS: u64 = 75_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BacktestCurrencyRateConfig {
+    /// Currency units valued by this route, for example `USDT`.
+    pub currency: String,
+    /// Direct index whose price is USD per one currency unit, for example `USDT-USD`.
+    pub index_symbol: Symbol,
+    #[serde(default = "default_currency_rate_max_age_ms")]
+    pub max_age_ms: u64,
+}
+
+fn default_currency_rate_max_age_ms() -> u64 {
+    DEFAULT_CURRENCY_RATE_MAX_AGE_MS
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,6 +74,8 @@ pub struct BacktestExecutionConfig {
     pub fill_account_latency_ms: u64,
     /// Optional bounded empirical distributions with class/symbol precedence.
     pub latency_profile: BacktestLatencyProfile,
+    /// Explicit direct currency/USD indexes used only for portfolio accounting.
+    pub currency_rates: Vec<BacktestCurrencyRateConfig>,
     /// Extra relative price cross required for fills from displayed depth.
     pub depth_fill_conservative_threshold: f64,
     /// Multiplier applied to displayed quantity ahead of a newly resting order.
@@ -77,6 +96,7 @@ impl Default for BacktestExecutionConfig {
             order_update_latency_ms: 0,
             fill_account_latency_ms: 0,
             latency_profile: BacktestLatencyProfile::default(),
+            currency_rates: Vec::new(),
             depth_fill_conservative_threshold: 0.0,
             queue_ahead_multiplier: 1.0,
             historical_trade_fill_fraction: 1.0,
@@ -99,6 +119,7 @@ impl BacktestExecutionConfig {
             }
         }
         self.latency_profile.validate()?;
+        validate_currency_rates(&self.currency_rates)?;
         if !self.depth_fill_conservative_threshold.is_finite()
             || !(0.0..=0.1).contains(&self.depth_fill_conservative_threshold)
         {
@@ -191,6 +212,69 @@ impl BacktestExecutionConfig {
             BacktestLatencyClass::OrderFill => self.fill_account_latency_ms,
         }
     }
+}
+
+fn validate_currency_rates(routes: &[BacktestCurrencyRateConfig]) -> Result<()> {
+    if routes.len() > MAX_CURRENCY_RATE_ROUTES {
+        bail!(
+            "backtest.currency_rates has {} routes, maximum is {MAX_CURRENCY_RATE_ROUTES}",
+            routes.len()
+        );
+    }
+    let mut currencies = BTreeSet::new();
+    let mut symbols = BTreeSet::new();
+    for route in routes {
+        if route.currency.is_empty()
+            || route.currency.len() > 16
+            || route.currency.trim() != route.currency
+            || !route
+                .currency
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        {
+            bail!(
+                "backtest.currency_rates currency {:?} must be 1-16 uppercase ASCII letters or digits",
+                route.currency
+            );
+        }
+        if route.currency == "USD" {
+            bail!("backtest.currency_rates must not configure USD, which is fixed at 1");
+        }
+        if route.index_symbol.is_empty()
+            || route.index_symbol.len() > 128
+            || route.index_symbol.trim() != route.index_symbol
+            || !route
+                .index_symbol
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic())
+        {
+            bail!(
+                "backtest.currency_rates index_symbol {:?} must be 1-128 printable ASCII characters without surrounding whitespace",
+                route.index_symbol
+            );
+        }
+        if route.max_age_ms == 0 || route.max_age_ms > MAX_BACKTEST_LATENCY_MS {
+            bail!(
+                "backtest.currency_rates {}/{} max_age_ms={} must be within [1, {MAX_BACKTEST_LATENCY_MS}]",
+                route.currency,
+                route.index_symbol,
+                route.max_age_ms
+            );
+        }
+        if !currencies.insert(route.currency.as_str()) {
+            bail!(
+                "backtest.currency_rates repeats currency {}",
+                route.currency
+            );
+        }
+        if !symbols.insert(route.index_symbol.as_str()) {
+            bail!(
+                "backtest.currency_rates repeats index_symbol {}",
+                route.index_symbol
+            );
+        }
+    }
+    Ok(())
 }
 
 impl BacktestLatencyProfile {
@@ -487,6 +571,7 @@ mod tests {
                 order_update_latency_ms: 0,
                 fill_account_latency_ms: 0,
                 latency_profile: BacktestLatencyProfile::default(),
+                currency_rates: Vec::new(),
                 depth_fill_conservative_threshold: 0.0,
                 queue_ahead_multiplier: 1.0,
                 historical_trade_fill_fraction: 1.0,
@@ -508,6 +593,63 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("order_entery_latency_ms"));
+    }
+
+    #[test]
+    fn strategy_toml_accepts_explicit_currency_rate_routes() {
+        let config: BacktestConfig = toml::from_str(
+            r#"
+                ref_symbol = "BTC-USDT"
+
+                [[backtest.currency_rates]]
+                currency = "USDT"
+                index_symbol = "USDT-USD"
+
+                [[backtest.currency_rates]]
+                currency = "USDC"
+                index_symbol = "USDC-USD"
+                max_age_ms = 10000
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.backtest.currency_rates.len(), 2);
+        assert_eq!(
+            config.backtest.currency_rates[0].max_age_ms,
+            DEFAULT_CURRENCY_RATE_MAX_AGE_MS
+        );
+        assert_eq!(config.backtest.currency_rates[1].max_age_ms, 10_000);
+        config.backtest.validate().unwrap();
+    }
+
+    #[test]
+    fn currency_rate_routes_are_direct_unique_and_bounded() {
+        let route = BacktestCurrencyRateConfig {
+            currency: "USDT".to_string(),
+            index_symbol: "USDT-USD".to_string(),
+            max_age_ms: 75_000,
+        };
+        for routes in [
+            vec![route.clone(), route.clone()],
+            vec![BacktestCurrencyRateConfig {
+                currency: "USD".to_string(),
+                ..route.clone()
+            }],
+            vec![BacktestCurrencyRateConfig {
+                currency: "usdt".to_string(),
+                ..route.clone()
+            }],
+            vec![BacktestCurrencyRateConfig {
+                max_age_ms: 0,
+                ..route.clone()
+            }],
+        ] {
+            let config = BacktestExecutionConfig {
+                currency_rates: routes,
+                ..BacktestExecutionConfig::default()
+            };
+            assert!(config.validate().is_err());
+        }
     }
 
     #[test]
