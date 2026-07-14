@@ -163,6 +163,24 @@ enum Command {
         #[arg(long)]
         pretty: bool,
     },
+    #[command(about = "Verify a live report against exact config bytes and derived invariants")]
+    VerifyLiveRun {
+        #[arg(short, long, help = "Original live TOML configuration")]
+        config: PathBuf,
+        #[arg(short, long, help = "Schema-7 live JSON report")]
+        report: PathBuf,
+        #[arg(long, value_enum, help = "Require this recorded live mode")]
+        expected_mode: Option<LiveCliMode>,
+        #[arg(long, help = "Exit non-zero unless report evidence is valid")]
+        require_valid: bool,
+        #[arg(
+            long,
+            help = "Exit non-zero unless evidence is valid and the clean-soak flag re-derives"
+        )]
+        require_clean_soak: bool,
+        #[arg(long)]
+        pretty: bool,
+    },
     #[command(about = "Build a Java-mapped backtest latency profile from bounded live reports")]
     CalibrateLatency {
         #[arg(short, long, help = "Live configuration used by every source report")]
@@ -609,15 +627,7 @@ async fn main() -> Result<()> {
                 .context("failed to initialize live tracing")?;
             let mut output_file = output
                 .as_ref()
-                .map(|output| {
-                    OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(output)
-                        .with_context(|| {
-                            format!("failed to reserve live output {}", output.display())
-                        })
-                })
+                .map(|output| reserve_private_output(output, "live report"))
                 .transpose()?;
             let run_result = reap_live::run_live_path(
                 config,
@@ -640,10 +650,8 @@ async fn main() -> Result<()> {
             } else {
                 serde_json::to_string(&report)?
             };
-            if let Some(file) = &mut output_file {
-                file.write_all(json.as_bytes())?;
-                file.write_all(b"\n")?;
-                file.sync_all()?;
+            if let (Some(file), Some(path)) = (&mut output_file, output.as_deref()) {
+                persist_reserved_output(file, path, &json, "live report")?;
             }
             println!("{json}");
             if let Some(error) = runtime_failure {
@@ -651,6 +659,31 @@ async fn main() -> Result<()> {
             }
             if require_clean_soak && !report.clean_soak {
                 anyhow::bail!("bounded live soak did not satisfy clean acceptance invariants");
+            }
+        }
+        Command::VerifyLiveRun {
+            config,
+            report,
+            expected_mode,
+            require_valid,
+            require_clean_soak,
+            pretty,
+        } => {
+            let verification =
+                reap_live::verify_live_run_paths(&config, &report, expected_mode.map(Into::into))?;
+            let json = if pretty {
+                serde_json::to_string_pretty(&verification)?
+            } else {
+                serde_json::to_string(&verification)?
+            };
+            println!("{json}");
+            if require_clean_soak && !verification.acceptance_passed {
+                anyhow::bail!(
+                    "live report evidence is invalid or does not satisfy clean-soak invariants"
+                );
+            }
+            if require_valid && !verification.evidence_valid {
+                anyhow::bail!("live report evidence is invalid");
             }
         }
         Command::CalibrateLatency {

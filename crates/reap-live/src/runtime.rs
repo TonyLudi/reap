@@ -42,16 +42,16 @@ use crate::provenance::{
 };
 use crate::{
     AccountBootstrapSnapshot, CancelAction, CoordinatorError, CoordinatorOutput, HostGuardRuntime,
-    HostHealthError, HostHealthSnapshot, LiveAction, LiveConfig, LiveConfigError, LiveCoordinator,
-    LiveLatencyCollector, LiveLatencyEvidence, LiveLatencySemantics, OperatorCommand,
-    OperatorEnvelope, OperatorError, OperatorResponse, OperatorService, OperatorStatus,
-    ReadinessSnapshot, ReconcileAction, ReconciliationResult, StartupGate, SubmitAction,
-    TradingEnvironment, VerifiedBootstrap, check_host_health, okx_instrument_type,
-    start_host_guard, start_operator_service, verify_bootstrap,
+    HostHealthError, HostHealthSnapshot, LiveAction, LiveConfig, LiveConfigError,
+    LiveConfigFileEvidence, LiveCoordinator, LiveLatencyCollector, LiveLatencyEvidence,
+    LiveLatencySemantics, OperatorCommand, OperatorEnvelope, OperatorError, OperatorResponse,
+    OperatorService, OperatorStatus, ReadinessSnapshot, ReconcileAction, ReconciliationResult,
+    StartupGate, SubmitAction, TradingEnvironment, VerifiedBootstrap, check_host_health,
+    okx_instrument_type, start_host_guard, start_operator_service, verify_bootstrap,
 };
 
 type LiveGateway = OkxOrderGateway<ReqwestTransport>;
-pub const LIVE_RUN_REPORT_SCHEMA_VERSION: u32 = 6;
+pub const LIVE_RUN_REPORT_SCHEMA_VERSION: u32 = 7;
 pub const MAX_LIVE_FAILURE_CODE_BYTES: usize = 64;
 pub const MAX_LIVE_FAILURE_MESSAGE_BYTES: usize = 4_096;
 
@@ -96,6 +96,8 @@ pub struct LiveRunReport {
     pub schema_version: u32,
     pub session_id: Option<String>,
     pub session_started_at_ms: u64,
+    #[serde(default)]
+    pub config_source: Option<LiveConfigFileEvidence>,
     pub config_fingerprint: String,
     pub evidence_config_fingerprint: String,
     pub java_reference_revision: String,
@@ -506,13 +508,21 @@ pub async fn run_live_path(
     path: impl AsRef<Path>,
     options: LiveRunOptions,
 ) -> Result<LiveRunReport, LiveRuntimeError> {
-    let config = LiveConfig::load(path)?;
-    run_live(config, options).await
+    let (config, config_source) = LiveConfig::load_with_evidence(path)?;
+    run_live_with_config_source(config, options, Some(config_source)).await
 }
 
 pub async fn run_live(
     config: LiveConfig,
     options: LiveRunOptions,
+) -> Result<LiveRunReport, LiveRuntimeError> {
+    run_live_with_config_source(config, options, None).await
+}
+
+async fn run_live_with_config_source(
+    config: LiveConfig,
+    options: LiveRunOptions,
+    config_source: Option<LiveConfigFileEvidence>,
 ) -> Result<LiveRunReport, LiveRuntimeError> {
     config.ensure_valid()?;
     if options
@@ -535,6 +545,7 @@ pub async fn run_live(
             schema_version: LIVE_RUN_REPORT_SCHEMA_VERSION,
             session_id: None,
             session_started_at_ms: unix_time_ms(),
+            config_source,
             config_fingerprint,
             evidence_config_fingerprint,
             java_reference_revision: PINNED_JAVA_REVISION.to_string(),
@@ -588,7 +599,8 @@ pub async fn run_live(
             return Err(LiveRuntimeError::DemoRequiresSimulatedTrading);
         }
     }
-    let runtime = LiveRuntime::build(config, options.mode, options.run_duration).await?;
+    let runtime =
+        LiveRuntime::build(config, config_source, options.mode, options.run_duration).await?;
     runtime.run().await
 }
 
@@ -987,6 +999,7 @@ fn alert_for_storage_record(record: &StorageRecord) -> Option<AlertEvent> {
 struct LiveRuntime {
     session_id: String,
     session_started_at_ms: u64,
+    config_source: Option<LiveConfigFileEvidence>,
     config_fingerprint: String,
     evidence_config_fingerprint: String,
     executable_sha256: String,
@@ -1045,6 +1058,7 @@ struct LiveRuntime {
 impl LiveRuntime {
     async fn build(
         config: LiveConfig,
+        config_source: Option<LiveConfigFileEvidence>,
         mode: LiveMode,
         run_duration: Option<Duration>,
     ) -> Result<Self, LiveRuntimeError> {
@@ -1383,6 +1397,7 @@ impl LiveRuntime {
         let mut runtime = Self {
             session_id,
             session_started_at_ms,
+            config_source,
             config_fingerprint,
             evidence_config_fingerprint,
             executable_sha256,
@@ -1587,6 +1602,7 @@ impl LiveRuntime {
             schema_version: LIVE_RUN_REPORT_SCHEMA_VERSION,
             session_id: Some(self.session_id.clone()),
             session_started_at_ms: self.session_started_at_ms,
+            config_source: self.config_source.clone(),
             config_fingerprint: self.config_fingerprint.clone(),
             evidence_config_fingerprint: self.evidence_config_fingerprint.clone(),
             java_reference_revision: PINNED_JAVA_REVISION.to_string(),
@@ -4914,6 +4930,7 @@ mod tests {
         let runtime = LiveRuntime {
             session_id: "test-alert-session".to_string(),
             session_started_at_ms: unix_time_ms(),
+            config_source: None,
             config_fingerprint: "test-config".to_string(),
             evidence_config_fingerprint: "test-evidence-config".to_string(),
             executable_sha256: "a".repeat(64),
@@ -5036,6 +5053,7 @@ mod tests {
         let runtime = LiveRuntime {
             session_id: "test-operator-session".to_string(),
             session_started_at_ms: unix_time_ms(),
+            config_source: None,
             config_fingerprint: "test-config".to_string(),
             evidence_config_fingerprint: "test-evidence-config".to_string(),
             executable_sha256: "a".repeat(64),
@@ -5296,6 +5314,7 @@ mod tests {
         let mut runtime = LiveRuntime {
             session_id: "test-shutdown-session".to_string(),
             session_started_at_ms: unix_time_ms(),
+            config_source: None,
             config_fingerprint: "test-config".to_string(),
             evidence_config_fingerprint: "test-evidence-config".to_string(),
             executable_sha256: "a".repeat(64),

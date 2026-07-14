@@ -13,6 +13,16 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
 
+pub const MAX_LIVE_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveConfigFileEvidence {
+    pub source_path: PathBuf,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveConfig {
     pub strategy: ChaosConfig,
@@ -355,11 +365,25 @@ pub struct LiveConfigValidation {
 
 #[derive(Debug, Error)]
 pub enum LiveConfigError {
+    #[error("invalid live config path {path}: {message}")]
+    InvalidPath { path: PathBuf, message: String },
     #[error("failed to read live config {path}: {source}")]
     Read {
         path: PathBuf,
         #[source]
         source: std::io::Error,
+    },
+    #[error("live config {path} is {actual} bytes; limit is {limit}")]
+    TooLarge {
+        path: PathBuf,
+        actual: u64,
+        limit: u64,
+    },
+    #[error("live config {path} is not UTF-8: {source}")]
+    Utf8 {
+        path: PathBuf,
+        #[source]
+        source: std::str::Utf8Error,
     },
     #[error("failed to parse live config: {0}")]
     Parse(#[from] toml::de::Error),
@@ -381,12 +405,58 @@ pub enum LiveConfigError {
 
 impl LiveConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, LiveConfigError> {
+        Self::load_with_evidence(path).map(|(config, _)| config)
+    }
+
+    pub fn load_with_evidence(
+        path: impl AsRef<Path>,
+    ) -> Result<(Self, LiveConfigFileEvidence), LiveConfigError> {
         let path = path.as_ref();
-        let text = std::fs::read_to_string(path).map_err(|source| LiveConfigError::Read {
-            path: path.to_path_buf(),
+        let metadata =
+            std::fs::symlink_metadata(path).map_err(|error| LiveConfigError::InvalidPath {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(LiveConfigError::InvalidPath {
+                path: path.to_path_buf(),
+                message: "must be a regular file and not a symbolic link".to_string(),
+            });
+        }
+        let canonical =
+            std::fs::canonicalize(path).map_err(|error| LiveConfigError::InvalidPath {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })?;
+        if metadata.len() > MAX_LIVE_CONFIG_BYTES {
+            return Err(LiveConfigError::TooLarge {
+                path: canonical,
+                actual: metadata.len(),
+                limit: MAX_LIVE_CONFIG_BYTES,
+            });
+        }
+        let bytes = std::fs::read(&canonical).map_err(|source| LiveConfigError::Read {
+            path: canonical.clone(),
             source,
         })?;
-        Self::from_toml(&text)
+        if bytes.len() as u64 > MAX_LIVE_CONFIG_BYTES {
+            return Err(LiveConfigError::TooLarge {
+                path: canonical,
+                actual: bytes.len() as u64,
+                limit: MAX_LIVE_CONFIG_BYTES,
+            });
+        }
+        let text = std::str::from_utf8(&bytes).map_err(|source| LiveConfigError::Utf8 {
+            path: canonical.clone(),
+            source,
+        })?;
+        let config = Self::from_toml(text)?;
+        let evidence = LiveConfigFileEvidence {
+            source_path: canonical,
+            bytes: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+        };
+        Ok((config, evidence))
     }
 
     pub fn from_toml(text: &str) -> Result<Self, LiveConfigError> {

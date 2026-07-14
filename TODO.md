@@ -212,7 +212,7 @@ architecture in [docs/architecture.md](docs/architecture.md).
   certification with credential-free raw-evidence verification.
 - [x] Make websocket ready/disconnect transitions lossless under bounded status
   backpressure, remove redundant per-frame status traffic, and split public and
-  private disconnect counts in schema-6 live evidence for fault campaigns.
+  private disconnect counts in schema-7 live evidence for fault campaigns.
 - [x] Add structured live fault evidence for ambiguous submit/cancel outcomes,
   partial fills, order/fill convergence timeouts, restored durable latches, and
   typed deadman, periodic clock, and authenticated account-config failures.
@@ -220,6 +220,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
   the stopped journal, requires every recovered live regular order to report
   OKX Cancel All After source `20`, proves account-wide regular-order zero, and
   supports credential-free verification against the exact journal/raw evidence.
+- [x] Bind schema-7 live reports to exact source-config bytes, reserve them
+  owner-only with file/directory durability, and add offline verification that
+  re-derives report, mode, host, identity, latency, and clean-soak invariants.
 - [ ] Run credentialed bounded observe and minimal-size demo fault campaigns,
   including process death, deadman expiry, clock skew, REST ambiguity, partial
   fill, reconnect, and durable-latch restart recovery.

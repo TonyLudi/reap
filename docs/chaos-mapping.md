@@ -143,7 +143,7 @@ with `REQUEST_BLOCKED` while disconnected. Rust likewise invalidates feed
 readiness, blocks entry, supervises reconnect/recovery, and reconciles private
 state. Rust intentionally adds a stronger audit boundary: after a report-capable
 runtime exists, an initialization, event-loop, or teardown error completes
-fail-closed cancellation/reconciliation, persists the schema-6 failure code plus
+fail-closed cancellation/reconciliation, persists the schema-7 failure code plus
 pre/post-cleanup evidence, and only then returns the nonzero process error.
 Deadman heartbeat, periodic clock skew/check, and authenticated account-config
 drift/check failures have distinct stable codes. This report does not make the

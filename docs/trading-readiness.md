@@ -228,7 +228,7 @@ production trading process.
     yet been certified.
 36. The live CLI reserves its create-new evidence path before config,
     credentials, or network activity. Runtime and teardown failures complete
-    fail-closed cleanup, persist a schema-6 report with a stable failure code,
+    fail-closed cleanup, persist a schema-7 report with a stable failure code,
     readiness, split public/private disconnect evidence, and post-cleanup order
     state, then preserve the original nonzero exit. Reports separately classify
     ambiguous submit/cancel outcomes, partial fills, order/fill convergence
@@ -260,6 +260,14 @@ production trading process.
     no pending/unbound/unmapped/truncated journal state. The credential-free
     verifier takes its own lease and replays the exact external journal plus all
     embedded raw responses. No real demo artifact has yet been produced.
+39. Path-launched live reports now bind the exact source-config byte count and
+    SHA-256 in addition to both effective fingerprints. Owner-only create-new
+    output is synced with its parent directory. `verify-live-run` re-hashes the
+    supplied config/report, rejects legacy or unknown report fields, checks the
+    pinned Java/build/mode/host/account/session boundaries, validates readiness,
+    failure, disconnect, and latency evidence, and independently re-derives
+    `clean_soak`. Latency calibration schema 3 also requires the exact source
+    bytes and independently verified source reports.
 
 ## Remaining Demo Gate
 

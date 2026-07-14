@@ -1185,7 +1185,7 @@ in `observe` only after review.
 For a credentialed fault campaign, archive the report and require the following
 structured evidence rather than matching log text:
 
-| Injected condition | Required schema-6 evidence |
+| Injected condition | Required schema-7 evidence |
 | --- | --- |
 | Public websocket loss | `public_connection_disconnect_events > 0`; verify the expected readiness impact for the configured replica count |
 | Private websocket loss | `private_connection_disconnect_events > 0`, a readiness loss, and later ready state after REST reconciliation |
@@ -1314,7 +1314,7 @@ shuts down directly.
 With `--output`, the CLI reserves the create-new path before configuration,
 credentials, or network startup. If the report-capable runtime's initialization,
 event loop, or teardown fails, Reap completes the same fail-closed cleanup,
-writes and fsyncs a schema-6 report with `stop_reason = "runtime_failure"` plus a
+writes and fsyncs a schema-7 report with `stop_reason = "runtime_failure"` plus a
 bounded stable `failure.code` and diagnostic `failure.message`, prints it, and
 then returns the original nonzero error. Review `readiness_at_stop` separately
 from final `readiness`, and require `active_orders_after_shutdown = 0`; a failure
@@ -1341,6 +1341,12 @@ cargo run -p reap-cli -- live \
   --output "$OBSERVE_REPORT" \
   --require-clean-soak \
   --pretty
+cargo run -p reap-cli -- verify-live-run \
+  --config examples/live-okx-demo.toml \
+  --report "$OBSERVE_REPORT" \
+  --expected-mode observe \
+  --require-clean-soak \
+  --pretty
 ```
 
 After observe acceptance, run a deliberately short minimal-size demo window
@@ -1356,6 +1362,12 @@ cargo run -p reap-cli -- live \
   --output "$DEMO_REPORT" \
   --require-clean-soak \
   --pretty
+cargo run -p reap-cli -- verify-live-run \
+  --config examples/live-okx-demo.toml \
+  --report "$DEMO_REPORT" \
+  --expected-mode demo \
+  --require-clean-soak \
+  --pretty
 ```
 
 `--require-clean-soak` requires `--duration-secs` and exits non-zero unless all
@@ -1369,7 +1381,7 @@ of these invariants hold:
 - demo shutdown resolved every active canonical order; and
 - no external alert delivery failed.
 
-The schema-6 report also records time-to-ready, recovered readiness losses and
+The schema-7 report also records time-to-ready, recovered readiness losses and
 maximum outage, total/public/private disconnects, stale-stream events, book
 recoveries, and the storage queue high-water mark. The total disconnect count
 must equal the public and private counts combined. It also reports authenticated
@@ -1397,12 +1409,16 @@ deployed when they are disabled.
 
 ## Live Latency Evidence
 
-`--output` creates and fsyncs a versioned JSON report before enforcing
-`--require-clean-soak`; existing paths are refused. The report binds a unique
-session, start time, Reap version and executable SHA-256, pinned Java revision,
-pseudonymous machine/account identities, checkpoint identity, and a second
-fingerprint over every serialized live setting, including host and alert
-guards. Raw machine IDs and OKX user IDs are not emitted. The report also
+`--output` reserves an owner-only versioned JSON report before config,
+credentials, or network access and syncs both file and parent directory before
+enforcing `--require-clean-soak`; existing paths are refused. The report binds
+the exact source-config byte count/SHA-256, a unique session, start time, Reap
+version and executable SHA-256, pinned Java revision, pseudonymous
+machine/account identities, checkpoint identity, and a second fingerprint over
+every serialized live setting, including host and alert guards. Raw machine IDs
+and OKX user IDs are not emitted. `verify-live-run` treats both supplied files as
+untrusted, checks exact/effective config identity and structural evidence, and
+re-derives clean-soak acceptance. The report also
 retains a deterministic uniform reservoir of at most 8,192 samples for each
 class/symbol/semantics series. Archive the exact live TOML, binary, and original
 reports; the calibration artifact retains their hashes but is not a replacement

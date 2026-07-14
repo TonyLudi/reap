@@ -189,6 +189,12 @@ cargo run -p reap-cli -- live \
   --mode validate \
   --output /tmp/reap-live-validate.json \
   --pretty
+cargo run -p reap-cli -- verify-live-run \
+  --config examples/live-okx-demo.toml \
+  --report /tmp/reap-live-validate.json \
+  --expected-mode validate \
+  --require-valid \
+  --pretty
 ```
 
 Observe OKX demo feeds and account state without permitting any submit or
@@ -287,6 +293,12 @@ cargo run -p reap-cli -- live \
   --output "$OBSERVE_REPORT" \
   --require-clean-soak \
   --pretty
+cargo run -p reap-cli -- verify-live-run \
+  --config examples/live-okx-demo.toml \
+  --report "$OBSERVE_REPORT" \
+  --expected-mode observe \
+  --require-clean-soak \
+  --pretty
 ```
 
 Enable demo order entry only with the explicit confirmation flag and a bounded,
@@ -300,6 +312,12 @@ cargo run -p reap-cli -- live \
   --confirm-demo \
   --duration-secs 900 \
   --output "$DEMO_REPORT" \
+  --require-clean-soak \
+  --pretty
+cargo run -p reap-cli -- verify-live-run \
+  --config examples/live-okx-demo.toml \
+  --report "$DEMO_REPORT" \
+  --expected-mode demo \
   --require-clean-soak \
   --pretty
 ```
@@ -347,17 +365,22 @@ still be supplied manually with repeated `--statement` and the explicit
 is weaker. The report covers fills and fees only; it is not balance, position,
 funding, equity, liability, tax, or currency-conversion reconciliation.
 
-Each create-new live report contains the exact checkpoint and full evidence
-config fingerprints, Reap executable hash, pinned Java revision, pseudonymous
-host/account identity, session/readiness/host evidence, and bounded
-per-class/per-symbol latency samples. The CLI reserves `--output` before config,
-credential, or network work. Once the report-capable runtime is constructed, an
+Each create-new schema-7 live report contains the exact source-config byte
+count/SHA-256, checkpoint and full evidence config fingerprints, Reap executable
+hash, pinned Java revision, pseudonymous host/account identity,
+session/readiness/host evidence, and bounded per-class/per-symbol latency
+samples. The CLI reserves `--output` mode `0600` before config, credential, or
+network work, then syncs the report and parent directory. Once the
+report-capable runtime is constructed, an
 initialization, event-loop, or teardown failure still writes a schema-versioned
 report after fail-closed cleanup, with a bounded stable failure code/message,
 and then exits non-zero. A failure before runtime construction leaves the
 reserved file empty and must be diagnosed from the process log; an empty file
-is never evidence. Generate a profile only from clean target-host reports with
-the same exact config and binary:
+is never evidence. `verify-live-run` independently re-hashes exact config/report
+bytes, re-derives effective fingerprints and clean-soak acceptance, and checks
+mode, identity, readiness, failure, disconnect, host, and latency invariants.
+Calibration emits schema-3 artifacts and admits only independently verified,
+clean target-host reports with the same exact config and binary:
 
 ```bash
 CALIBRATION="/tmp/reap-latency-calibration-$(date -u +%Y%m%dT%H%M%SZ).json"

@@ -14,7 +14,7 @@ use reap_live::{
     LIVE_LATENCY_EVIDENCE_SCHEMA_VERSION, LIVE_LATENCY_RESERVOIR_CAPACITY,
     LIVE_RUN_REPORT_SCHEMA_VERSION, LiveConfig, LiveLatencySemantics, LiveLatencySeries, LiveMode,
     LiveRunReport, LiveStopReason, MAX_LIVE_FAILURE_CODE_BYTES, MAX_LIVE_FAILURE_MESSAGE_BYTES,
-    MAX_LIVE_LATENCY_SERIES, MAX_LIVE_LATENCY_US,
+    MAX_LIVE_LATENCY_SERIES, MAX_LIVE_LATENCY_US, verify_live_run_paths,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -54,15 +54,11 @@ pub(crate) fn build_latency_calibration(
     if options.minimum_samples_per_series == 0 {
         bail!("--minimum-samples-per-series must be positive");
     }
-    let config_bytes = fs::read(config_path)
-        .with_context(|| format!("failed to read live config {}", config_path.display()))?;
-    let config_text = std::str::from_utf8(&config_bytes)
-        .with_context(|| format!("live config {} is not UTF-8", config_path.display()))?;
-    let config = LiveConfig::from_toml(config_text)
-        .with_context(|| format!("failed to parse live config {}", config_path.display()))?;
+    let (config, config_source) = LiveConfig::load_with_evidence(config_path)
+        .with_context(|| format!("failed to load live config {}", config_path.display()))?;
     let config_fingerprint = config.fingerprint()?;
     let evidence_config_fingerprint = config.evidence_fingerprint()?;
-    let config_sha256 = sha256_bytes(&config_bytes);
+    let config_sha256 = config_source.sha256;
     let mut failures = Vec::new();
     if !config.host_guard.enabled || !config.host_guard.require_clock_synchronized {
         failures.push(
@@ -70,7 +66,10 @@ pub(crate) fn build_latency_calibration(
         );
     }
     let mut loaded = load_reports(
+        config_path,
         report_paths,
+        config_source.bytes,
+        &config_sha256,
         &config_fingerprint,
         &evidence_config_fingerprint,
         &mut failures,
@@ -289,7 +288,10 @@ pub(crate) fn profile_toml(profile: &BacktestLatencyProfile) -> Result<String> {
 }
 
 fn load_reports(
+    config_path: &Path,
     paths: &[PathBuf],
+    expected_config_bytes: u64,
+    expected_config_sha256: &str,
     expected_fingerprint: &str,
     expected_evidence_fingerprint: &str,
     failures: &mut Vec<String>,
@@ -299,6 +301,14 @@ fn load_reports(
     let mut session_ids = HashSet::new();
     let mut total_retained_input_samples = 0_usize;
     for path in paths {
+        let verification = verify_live_run_paths(config_path, path, None)
+            .with_context(|| format!("failed to verify live report {}", path.display()))?;
+        if !verification.acceptance_passed {
+            failures.push(format!(
+                "{} failed independent live-run verification",
+                path.display()
+            ));
+        }
         let canonical = fs::canonicalize(path)
             .with_context(|| format!("failed to resolve live report {}", path.display()))?;
         if !canonical_paths.insert(canonical.clone()) {
@@ -338,12 +348,29 @@ fn load_reports(
             );
         }
         let sha256 = sha256_bytes(&bytes);
+        if verification.run_report.source_path != canonical
+            || verification.run_report.bytes != bytes.len() as u64
+            || verification.run_report.sha256 != sha256
+        {
+            bail!(
+                "live report {} changed while it was being verified",
+                canonical.display()
+            );
+        }
         if report.schema_version != LIVE_RUN_REPORT_SCHEMA_VERSION {
             failures.push(format!(
                 "{} has live report schema {}, expected {}",
                 canonical.display(),
                 report.schema_version,
                 LIVE_RUN_REPORT_SCHEMA_VERSION
+            ));
+        }
+        if !report.config_source.as_ref().is_some_and(|source| {
+            source.bytes == expected_config_bytes && source.sha256 == expected_config_sha256
+        }) {
+            failures.push(format!(
+                "{} exact source config bytes do not match the supplied live config",
+                canonical.display()
             ));
         }
         if report.latency_evidence.schema_version != LIVE_LATENCY_EVIDENCE_SCHEMA_VERSION {
@@ -854,7 +881,8 @@ mod tests {
         let mut config =
             LiveConfig::from_toml(include_str!("../../../examples/live-okx-demo.toml")).unwrap();
         config.host_guard.enabled = true;
-        fs::write(&config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
+        let config_bytes = toml::to_string_pretty(&config).unwrap().into_bytes();
+        fs::write(&config_path, &config_bytes).unwrap();
         let fingerprint = config.fingerprint().unwrap();
         let evidence_fingerprint = config.evidence_fingerprint().unwrap();
         let identity = BTreeMap::from([("main".to_string(), "3".repeat(64))]);
@@ -887,6 +915,11 @@ mod tests {
             schema_version: LIVE_RUN_REPORT_SCHEMA_VERSION,
             session_id: Some("session-1".to_string()),
             session_started_at_ms: 1,
+            config_source: Some(reap_live::LiveConfigFileEvidence {
+                source_path: fs::canonicalize(&config_path).unwrap(),
+                bytes: config_bytes.len() as u64,
+                sha256: sha256_bytes(&config_bytes),
+            }),
             config_fingerprint: fingerprint,
             evidence_config_fingerprint: evidence_fingerprint,
             java_reference_revision: PINNED_JAVA_REVISION.to_string(),
@@ -938,10 +971,14 @@ mod tests {
             clean_soak: true,
         };
         fs::write(&report_path, serde_json::to_vec(&report).unwrap()).unwrap();
+        let verification =
+            reap_live::verify_live_run_paths(&config_path, &report_path, Some(LiveMode::Demo))
+                .unwrap();
+        assert!(verification.acceptance_passed, "{verification:#?}");
 
         let artifact = build_latency_calibration(
             &config_path,
-            &[report_path],
+            std::slice::from_ref(&report_path),
             LatencyCalibrationOptions {
                 seed: 42,
                 minimum_samples_per_series: 1,
@@ -961,6 +998,33 @@ mod tests {
         );
         assert_eq!(artifact.live_executable_sha256, "1".repeat(64));
         artifact.validate_integrity().unwrap();
+
+        let forged_clean_report_path = directory.join("forged-clean-live.json");
+        let mut forged_clean_report = report.clone();
+        forged_clean_report.session_id = Some("session-forged-clean".to_string());
+        forged_clean_report.operator_mutations = 1;
+        fs::write(
+            &forged_clean_report_path,
+            serde_json::to_vec(&forged_clean_report).unwrap(),
+        )
+        .unwrap();
+        let forged_clean_artifact = build_latency_calibration(
+            &config_path,
+            &[forged_clean_report_path],
+            LatencyCalibrationOptions {
+                seed: 42,
+                minimum_samples_per_series: 1,
+                accept_matching_upper_bounds: true,
+            },
+        )
+        .unwrap();
+        assert!(!forged_clean_artifact.passed);
+        assert!(
+            forged_clean_artifact
+                .failures
+                .iter()
+                .any(|failure| failure.contains("failed independent live-run verification"))
+        );
 
         let failed_report_path = directory.join("failed-live.json");
         let mut failed_report = report;
@@ -1023,6 +1087,26 @@ mod tests {
                 .failures
                 .iter()
                 .all(|failure| !failure.contains("forged"))
+        );
+
+        let mut tampered_config = fs::read(&config_path).unwrap();
+        tampered_config.extend_from_slice(b"\n# formatting-only tamper\n");
+        fs::write(&config_path, tampered_config).unwrap();
+        let config_tamper_artifact = build_latency_calibration(
+            &config_path,
+            std::slice::from_ref(&report_path),
+            LatencyCalibrationOptions {
+                seed: 42,
+                minimum_samples_per_series: 1,
+                accept_matching_upper_bounds: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            config_tamper_artifact
+                .failures
+                .iter()
+                .any(|failure| failure.contains("exact source config bytes"))
         );
         fs::remove_dir_all(directory).unwrap();
     }

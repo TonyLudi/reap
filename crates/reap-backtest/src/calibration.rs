@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{BacktestLatencyClass, BacktestLatencyProfile};
 
-pub const LATENCY_CALIBRATION_SCHEMA_VERSION: u32 = 2;
+pub const LATENCY_CALIBRATION_SCHEMA_VERSION: u32 = 3;
 pub const MAX_LATENCY_CALIBRATION_SOURCE_REPORTS: usize = 32;
 pub const MAX_LATENCY_CALIBRATION_RETAINED_INPUT_SAMPLES: usize = 4_000_000;
 pub const MAX_LATENCY_CALIBRATION_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;

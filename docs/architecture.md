@@ -312,6 +312,10 @@ Responsibilities:
 - Wire feeds, book reducers, strategy, risk, order gateway, storage, telemetry.
 - Own task topology.
 - Own bounded channels and backpressure policy.
+- Bind every path-launched live report to exact source-config bytes and effective
+  fingerprints. Offline verification treats the report as untrusted, re-derives
+  clean-soak status, and checks mode, build/Java provenance, host/account
+  identities, readiness, failure/disconnect counters, and latency reservoirs.
 - Start/stop/restart strategy instances.
 - Dispatch timers into strategy loops.
 - Coordinate reconciliation and recovery.
