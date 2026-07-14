@@ -29,7 +29,7 @@ pub use research::{
     ResearchAggregate, ResearchCandidate, ResearchDataFormat, ResearchDataset, ResearchFold,
     ResearchGates, ResearchManifest, ResearchMode, ResearchReport, ResearchRunReport,
     ResearchScenario, ResearchScenarioKind, RunAggregate, SelectionMetric, TestScenarioReport,
-    run_research_manifest_path,
+    effective_strategy_sha256, run_research_manifest_path,
 };
 pub use research_verification::{
     MAX_RESEARCH_MANIFEST_BYTES, MAX_RESEARCH_REPORT_BYTES, RESEARCH_VERIFICATION_FORMAT_VERSION,

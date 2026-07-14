@@ -285,6 +285,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
   numerically drifting reports, and persist owner-only durable evidence.
 - [x] Bind schema-5 production research to one manifest-declared deployment
   candidate and fail unless every fold selects that candidate from training data.
+- [x] Independently bind the reconstructed deployment candidate's effective
+  strategy hash to the exact proposed production live config, rejecting smoke,
+  demo, invalid reconstruction, ambiguous provenance, and strategy drift.
 - [ ] Calibrate queue position, latency, fees, funding, and slippage from
   captured full-depth data, then run and archive production-candidate
   walk-forward, capacity, and stressed-liquidity reports. The orchestration and

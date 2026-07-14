@@ -218,6 +218,24 @@ verification outputs are owner-only create-new files with file and directory
 durability. A report's internal `passed` flag is not release evidence without a
 passing reconstruction.
 
+Bind that reconstructed deployment candidate to the exact proposed production
+live configuration before promotion:
+
+```bash
+cargo run -p reap-cli -- verify-research-deployment \
+  --config /secure/config/reap-production-candidate.toml \
+  --manifest /secure/research/production.toml \
+  --report /secure/research/production.json \
+  --output /secure/evidence/research-deployment.json \
+  --require-pass --pretty
+```
+
+This command requires a production venue config, re-runs `verify-research`,
+revalidates the schema-5 candidate binding, and requires the candidate and live
+config to serialize to the same effective strategy SHA-256. It does not enable
+order entry or replace transition, account, host, fault, fee, funding, statement,
+deadman, and emergency evidence.
+
 Validate the live demo configuration without reading credentials or opening a
 network connection:
 

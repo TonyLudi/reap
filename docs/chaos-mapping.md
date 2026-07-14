@@ -156,6 +156,14 @@ artifact intent while rejecting stale or forged aggregate JSON. It does not
 remove the documented zero-initial-portfolio difference or supply missing
 target-host, queue, statement, and profitability evidence.
 
+`verify-research-deployment` carries the mapped strategy one step further: it
+requires the reconstructed deployment candidate's effective `ChaosConfig` hash
+to equal `strategy.effective()` from the exact proposed production live config.
+The hash function is shared with research candidate provenance, so this is an
+identity check rather than a second interpretation of Java strategy fields. The
+pinned Java service has no equivalent production-config binding, making this a
+documented Rust release control rather than a Java-parity claim.
+
 Failure handling was cross-checked against the same pinned connectivity tree.
 `AbstractOkxNitroL2Subscriber.onSocketDisconnected` clears the affected Java
 book and its base subscriber resubscribes after a lost session;

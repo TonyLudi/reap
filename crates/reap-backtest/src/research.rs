@@ -1098,7 +1098,7 @@ fn load_candidates(specs: &[ResearchCandidate], base: &Path) -> Result<Vec<Loade
                 validation.errors.join("; ")
             );
         }
-        let effective_strategy_sha256 = effective_strategy_sha256(&config)?;
+        let effective_strategy_sha256 = effective_strategy_sha256(&config.strategy)?;
         if !effective_strategy_hashes.insert(effective_strategy_sha256.clone()) {
             bail!(
                 "candidate {} duplicates another candidate's effective strategy",
@@ -2157,8 +2157,8 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn effective_strategy_sha256(config: &BacktestConfig) -> Result<String> {
-    let bytes = serde_json::to_vec(&config.strategy.effective())
+pub fn effective_strategy_sha256(config: &reap_strategy::ChaosConfig) -> Result<String> {
+    let bytes = serde_json::to_vec(&config.effective())
         .context("failed to serialize effective candidate strategy")?;
     Ok(sha256_bytes(&bytes))
 }
@@ -2836,13 +2836,19 @@ mod tests {
     fn candidate_identity_ignores_overridden_execution_but_tracks_strategy_changes() {
         let mut config: BacktestConfig =
             toml::from_str(include_str!("../../../examples/iarb2-basic.toml")).unwrap();
-        let original = effective_strategy_sha256(&config).unwrap();
+        let original = effective_strategy_sha256(&config.strategy).unwrap();
 
         config.backtest.order_entry_latency_ms = 999;
-        assert_eq!(effective_strategy_sha256(&config).unwrap(), original);
+        assert_eq!(
+            effective_strategy_sha256(&config.strategy).unwrap(),
+            original
+        );
 
         config.strategy.active_hedge_threshold_usd += 1.0;
-        assert_ne!(effective_strategy_sha256(&config).unwrap(), original);
+        assert_ne!(
+            effective_strategy_sha256(&config.strategy).unwrap(),
+            original
+        );
     }
 
     #[test]

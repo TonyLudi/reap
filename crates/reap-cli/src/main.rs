@@ -24,8 +24,11 @@ use reap_live::{
 };
 use reap_strategy::ChaosConfig;
 
+mod deployment;
 mod latency;
 mod statement;
+
+use deployment::verify_research_deployment_paths;
 
 use latency::{
     LatencyCalibrationOptions, build_latency_calibration, profile_toml, verify_latency_calibration,
@@ -90,6 +93,28 @@ enum Command {
         )]
         output: Option<PathBuf>,
         #[arg(long, help = "Exit non-zero unless exact reconstruction passes")]
+        require_pass: bool,
+        #[arg(long)]
+        pretty: bool,
+    },
+    #[command(
+        about = "Bind reconstructed production research to the proposed live strategy",
+        long_about = "Re-run independent research reconstruction, require its schema-5 deployment candidate to have won every training fold, load an exact production live config, and compare the two effective strategy hashes. This does not authorize production trading."
+    )]
+    VerifyResearchDeployment {
+        #[arg(short, long, help = "Exact proposed production live TOML")]
+        config: PathBuf,
+        #[arg(long, help = "Exact schema-5 production research TOML")]
+        manifest: PathBuf,
+        #[arg(long, help = "Archived schema-5 production research JSON report")]
+        report: PathBuf,
+        #[arg(
+            short,
+            long,
+            help = "Optionally create this owner-readable binding artifact"
+        )]
+        output: Option<PathBuf>,
+        #[arg(long, help = "Exit non-zero unless reconstruction and binding pass")]
         require_pass: bool,
         #[arg(long)]
         pretty: bool,
@@ -680,6 +705,32 @@ async fn main() -> Result<()> {
             println!("{json}");
             if require_pass && !verification.acceptance_passed {
                 anyhow::bail!("research reconstruction did not pass");
+            }
+        }
+        Command::VerifyResearchDeployment {
+            config,
+            manifest,
+            report,
+            output,
+            require_pass,
+            pretty,
+        } => {
+            let mut output_file = output
+                .as_ref()
+                .map(|path| reserve_private_output(path, "research deployment verification"))
+                .transpose()?;
+            let verification = verify_research_deployment_paths(&config, &manifest, &report)?;
+            let json = if pretty {
+                serde_json::to_string_pretty(&verification)?
+            } else {
+                serde_json::to_string(&verification)?
+            };
+            if let (Some(file), Some(path)) = (&mut output_file, output.as_deref()) {
+                persist_reserved_output(file, path, &json, "research deployment verification")?;
+            }
+            println!("{json}");
+            if require_pass && !verification.acceptance_passed {
+                anyhow::bail!("production research does not bind to the proposed live strategy");
             }
         }
         Command::ReplayCheck {

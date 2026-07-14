@@ -214,7 +214,10 @@ production trading process.
     independent zero-gap replay check before selection. Schema 5 additionally
     requires one predeclared deployment candidate to win training-only selection
     in every fold, preventing a passing report from representing different live
-    strategies across windows. The checked-in
+    strategies across windows. A format-2 independent reconstruction exposes
+    that candidate's effective strategy hash, and a separate production binding
+    now requires it to equal the exact proposed live config's
+    `strategy.effective()` hash. The checked-in
     smoke fold validates plumbing with permissive uncalibrated gates and negative
     fee-adjusted PnL; it is not production evidence. Each dataset currently
     starts from zero rather than carrying Java's daily ending positions.

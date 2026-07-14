@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{PINNED_JAVA_REVISION, RESEARCH_SCHEMA_VERSION, ResearchReport};
 
-pub const RESEARCH_VERIFICATION_FORMAT_VERSION: u16 = 1;
+pub const RESEARCH_VERIFICATION_FORMAT_VERSION: u16 = 2;
 pub const MAX_RESEARCH_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_RESEARCH_REPORT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_RESEARCH_VERIFICATION_DIAGNOSTIC_BYTES: usize = 2_048;
@@ -35,6 +35,7 @@ pub enum ResearchVerificationFailure {
     ArtifactJavaRevisionMismatch,
     ArtifactExecutableMismatch,
     ArtifactVersionMismatch,
+    ArtifactDeploymentBindingInvalid,
     ArtifactDidNotPass { failure_count: usize },
     RebuildFailed,
     RebuiltResearchDidNotPass { failure_count: usize },
@@ -54,6 +55,9 @@ pub struct ResearchVerificationReport {
     pub artifact_mode: crate::ResearchMode,
     pub artifact_reap_version: String,
     pub artifact_executable_sha256: String,
+    pub artifact_deployment_candidate_id: Option<String>,
+    pub artifact_deployment_effective_strategy_sha256: Option<String>,
+    pub artifact_deployment_binding_valid: bool,
     pub artifact_manifest_matches: bool,
     pub artifact_shape_valid: bool,
     pub artifact_reported_pass: bool,
@@ -119,6 +123,11 @@ pub fn verify_research_paths(
     let artifact_mode = artifact_report.mode;
     let artifact_reap_version = artifact_report.reap_version.clone();
     let artifact_executable_sha256 = artifact_report.executable_sha256.clone();
+    let (
+        artifact_deployment_candidate_id,
+        artifact_deployment_effective_strategy_sha256,
+        artifact_deployment_binding_valid,
+    ) = deployment_binding(&artifact_report);
     let artifact_reported_pass = artifact_report.passed;
     let artifact_failure_count = artifact_report.failures.len();
     let verifier_executable_sha256 =
@@ -145,6 +154,9 @@ pub fn verify_research_paths(
     }
     if artifact_reap_version != env!("CARGO_PKG_VERSION") {
         failures.push(ResearchVerificationFailure::ArtifactVersionMismatch);
+    }
+    if !artifact_deployment_binding_valid {
+        failures.push(ResearchVerificationFailure::ArtifactDeploymentBindingInvalid);
     }
     if !artifact_reported_pass {
         failures.push(ResearchVerificationFailure::ArtifactDidNotPass {
@@ -204,6 +216,7 @@ pub fn verify_research_paths(
     let acceptance_passed = failures.is_empty()
         && artifact_shape_valid
         && artifact_manifest_matches
+        && artifact_deployment_binding_valid
         && artifact_reported_pass
         && rebuild_succeeded
         && rebuilt_report_passed
@@ -219,6 +232,9 @@ pub fn verify_research_paths(
         artifact_mode,
         artifact_reap_version,
         artifact_executable_sha256,
+        artifact_deployment_candidate_id,
+        artifact_deployment_effective_strategy_sha256,
+        artifact_deployment_binding_valid,
         artifact_manifest_matches,
         artifact_shape_valid,
         artifact_reported_pass,
@@ -239,6 +255,47 @@ pub fn verify_research_paths(
         ],
         acceptance_passed,
     })
+}
+
+fn deployment_binding(report: &ResearchReport) -> (Option<String>, Option<String>, bool) {
+    let candidate_id = report.deployment_candidate_id.clone();
+    match report.mode {
+        crate::ResearchMode::Smoke => {
+            let valid = candidate_id.is_none();
+            (candidate_id, None, valid)
+        }
+        crate::ResearchMode::ProductionCandidate => {
+            let Some(candidate_id_ref) = candidate_id.as_deref() else {
+                return (None, None, false);
+            };
+            let mut matching = report
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.id == candidate_id_ref);
+            let effective_strategy_sha256 = matching
+                .next()
+                .map(|candidate| candidate.effective_strategy_sha256.clone());
+            let exactly_one_candidate =
+                effective_strategy_sha256.is_some() && matching.next().is_none();
+            let valid = exactly_one_candidate
+                && effective_strategy_sha256
+                    .as_deref()
+                    .is_some_and(is_lower_sha256)
+                && !report.folds.is_empty()
+                && report
+                    .folds
+                    .iter()
+                    .all(|fold| fold.selected_candidate_id.as_deref() == Some(candidate_id_ref));
+            (candidate_id, effective_strategy_sha256, valid)
+        }
+    }
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn validate_unique_json_keys(bytes: &[u8]) -> Result<()> {
@@ -564,6 +621,22 @@ mod tests {
         let manifest = smoke_manifest();
         let report = crate::run_research_manifest_path(&manifest).unwrap();
         assert!(report.passed, "{:#?}", report.failures);
+        let mut production_binding = report.clone();
+        production_binding.mode = crate::ResearchMode::ProductionCandidate;
+        production_binding.deployment_candidate_id = Some("base".to_string());
+        let (candidate_id, strategy_sha256, binding_valid) =
+            deployment_binding(&production_binding);
+        assert_eq!(candidate_id.as_deref(), Some("base"));
+        assert_eq!(
+            strategy_sha256.as_deref(),
+            Some(report.candidates[0].effective_strategy_sha256.as_str())
+        );
+        assert!(binding_valid);
+        production_binding
+            .candidates
+            .push(production_binding.candidates[0].clone());
+        assert!(!deployment_binding(&production_binding).2);
+
         let encoded = serde_json::to_vec_pretty(&report).unwrap();
         let decoded: ResearchReport = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(
@@ -590,8 +663,15 @@ mod tests {
 
         let verification = verify_research_paths(&manifest, &artifact_path).unwrap();
         assert!(verification.acceptance_passed, "{verification:#?}");
+        assert_eq!(verification.format_version, 2);
         assert!(verification.artifact_shape_valid);
         assert!(verification.artifact_matches_rebuild);
+        assert!(verification.artifact_deployment_binding_valid);
+        assert_eq!(verification.artifact_deployment_candidate_id, None);
+        assert_eq!(
+            verification.artifact_deployment_effective_strategy_sha256,
+            None
+        );
         assert_eq!(
             verification.normalized_rebuild_sha256.as_deref(),
             Some(verification.normalized_artifact_sha256.as_str())
@@ -626,6 +706,24 @@ mod tests {
             extended_verification
                 .failures
                 .contains(&ResearchVerificationFailure::ArtifactShapeInvalid)
+        );
+
+        let mut invalid_binding = serde_json::to_value(&report).unwrap();
+        invalid_binding["deployment_candidate_id"] = json!("base");
+        let invalid_binding_path = directory.path().join("invalid-deployment-binding.json");
+        fs::write(
+            &invalid_binding_path,
+            serde_json::to_vec_pretty(&invalid_binding).unwrap(),
+        )
+        .unwrap();
+        let invalid_binding_verification =
+            verify_research_paths(&manifest, &invalid_binding_path).unwrap();
+        assert!(!invalid_binding_verification.acceptance_passed);
+        assert!(!invalid_binding_verification.artifact_deployment_binding_valid);
+        assert!(
+            invalid_binding_verification
+                .failures
+                .contains(&ResearchVerificationFailure::ArtifactDeploymentBindingInvalid)
         );
 
         let mut duplicate = String::from_utf8(encoded).unwrap();

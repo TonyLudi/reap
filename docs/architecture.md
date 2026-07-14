@@ -805,6 +805,15 @@ verification artifact carries the exact source hashes and a bounded first
 difference diagnostic; it remains simulation evidence rather than production
 authorization.
 
+The format-2 research verifier also derives one deployment candidate ID and
+effective strategy hash from the report, requiring exactly one matching
+candidate provenance row and the same training-selected ID in every production
+fold. `verify-research-deployment` then loads an exact production `LiveConfig`,
+hashes `strategy.effective()` through the same function used by research, and
+requires equality. This closes the research-to-live strategy identity boundary;
+it deliberately does not aggregate or replace host, account, transition, fault,
+statement, deadman, or emergency evidence.
+
 ### `reap-capture`
 
 Credential-free public market-data composition.

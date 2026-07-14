@@ -436,6 +436,10 @@ For real research, create a new manifest alongside immutable capture files:
    executable. Require `acceptance_passed = true`, identical normalized hashes,
    and no failures, then archive both JSON files beside the exact capture/config
    files and demo calibration evidence.
+8. Run `verify-research-deployment` with that manifest/report and the exact
+   proposed production live config. Require the format-2 reconstruction and
+   effective strategy hashes to pass, then archive its create-new output with
+   the production-transition evidence.
 
 Candidate scores use training runs only (`net_pnl_usd` or
 `pnl_per_turnover_bps`). Only the selected candidate is evaluated on test data.
@@ -443,6 +447,11 @@ Every production fold must training-select the predeclared deployment candidate;
 one different or missing selection fails the fold and the aggregate report. The
 manifest hash binds that declaration before the run, but operators must still
 freeze the manifest before inspecting held-out results.
+`verify-research-deployment` refuses smoke research and demo configs. It uses the
+same effective `ChaosConfig` serialization used for candidate provenance, so
+backtest-only execution settings cannot hide a strategy mismatch and a live-only
+deployment wrapper cannot silently change strategy economics.
+
 The report contains the selection rule, gate thresholds, every underlying run,
 aggregate gate failures, and SHA-256 for the manifest, executable, candidate
 files, effective strategies, and datasets. Candidates with identical effective
@@ -1664,6 +1673,13 @@ binding, target account identity, deployment secret separation, or runtime
 behavior. Archive its passing artifact alongside the exact two configs, but do
 not treat it as production authorization. Production order entry remains
 unavailable until the separate readiness gates pass.
+
+The transition report and research-deployment report answer different questions.
+The transition report proves that the evidence-bearing demo config and proposed
+production config differ only at approved deployment paths. The research binding
+independently proves that the proposed production config's effective strategy is
+the one predeclared and training-selected in every reconstructed research fold.
+Both must pass against the same production config bytes.
 
 ## Credentials
 
