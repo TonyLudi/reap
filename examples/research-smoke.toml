@@ -1,4 +1,4 @@
-schema_version = 2
+schema_version = 3
 mode = "smoke"
 java_reference_revision = "b6b120c7b7c466d8431bf082f3229328c5d7b2ae"
 selection_metric = "net_pnl_usd"

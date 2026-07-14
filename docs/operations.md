@@ -370,18 +370,21 @@ artifact creation, and exit status.
 
 For real research, create a new manifest alongside immutable capture files:
 
-1. Set `schema_version = 2`, `mode = "production_candidate"`, retain the pinned
+1. Set `schema_version = 3`, `mode = "production_candidate"`, retain the pinned
    Java revision, and point `latency_calibration` to the passed create-new JSON
    artifact whose profile is embedded exactly in the baseline scenario.
 2. List explicit full candidate TOML files; the runner does not mutate arbitrary
    strategy fields or generate an implicit parameter grid.
 3. Give every capture a unique dataset ID/path/content hash. Every test window
    must occur strictly after its fold's training windows, and a test dataset can
-   belong to only one fold. Set each raw dataset's `capture_config` to the exact
-   capture-only TOML used for that session. Production mode reruns and retains
-   strict capture analysis plus a zero-gap raw replay check before candidate
-   evaluation. It also requires at least two connections per stream and the
-   book/trade/index/mark/limit/funding channels needed by every candidate.
+   belong to only one fold. Set each raw dataset's `capture_config` and
+   `capture_report` to the exact capture-only TOML and schema-3 report from that
+   session. When the report declares normalized output, also set
+   `normalized_path` to that retained artifact. Production mode verifies and
+   embeds the report, reruns and retains strict capture analysis, and performs a
+   zero-gap raw replay check before candidate evaluation. It also requires at
+   least two connections per stream and the book/trade/index/mark/limit/funding
+   channels needed by every candidate.
 4. Define exactly one baseline using empirically calibrated execution values,
    set `calibrated = true`, and add at least two stress scenarios. Profile stress
    uses the same seed and must first-order stochastically dominate baseline for
@@ -405,13 +408,16 @@ settings differ. Every file-backed input hash is checked again after all runs so
 input mutation aborts artifact creation. Existing output paths are refused so an
 acceptance artifact cannot be silently replaced.
 
-The embedded capture analysis binds the capture-config file hash, expected
-subscriptions, redundant source coverage, per-source timing, depth, session,
-and data hash to the dataset. The independent raw replay check also proves no
-sequence gap/recovery/failure and ready terminal books. File analysis cannot
-reconstruct runtime writer queue pressure, dropped-record counters, or the
-process exit path, so archive the original clean bounded-capture run report as
-separate required evidence.
+The embedded capture verification binds exact capture-config bytes and effective
+output overrides to the run report, raw bytes, and optional independently
+reconstructed normalized bytes. It cross-checks replayable counters, session,
+and terminal book health while retaining runtime-only writer queue depth,
+process stop reason, and connection-readiness evidence from the durable report.
+The retained capture analysis adds source coverage, timing, and depth; the
+independent raw replay check proves no sequence gap/recovery/failure and ready
+terminal books. Any verifier failure aborts before candidate evaluation. The
+report, config, raw file, and optional normalized file are re-hashed after all
+candidate/scenario runs before the acceptance artifact can be created.
 
 The three pending-work maxima bound delayed non-funding scheduler work,
 exchange `PendingNew` orders, and unresolved cancel requests at a data cutoff.
@@ -1455,7 +1461,7 @@ rounded up to microseconds during collection and microseconds are rounded up to
 backtest milliseconds. A failed calibration still writes its diagnostic JSON,
 but the CLI refuses to emit a TOML profile from it.
 
-A production-candidate research manifest must use schema 2, set
+A production-candidate research manifest must use schema 3, set
 `latency_calibration` to the JSON artifact, set the baseline execution
 `calibrated = true`, and embed exactly the artifact's profile. Research treats
 the artifact as untrusted input: it checks source/config hashes, sessions,

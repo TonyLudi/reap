@@ -623,12 +623,15 @@ acceptance explicit in a versioned TOML manifest:
 - Dataset IDs, canonical paths, and byte-identical content cannot be reused to
   disguise train/test leakage; event-time windows must be non-overlapping and
   strictly chronological.
-- Production raw captures must name their capture-only config and pass retained
-  source-coverage analysis plus a one-session, parse-clean, zero-gap replay
-  check with ready terminal books before any candidate runs. Every configured
-  stream must have at least two sources; candidate instruments must have book
-  and trade coverage plus applicable strategy index, accounting currency index,
-  mark, limit, and funding streams.
+- Production raw captures must name their capture-only config and schema-3 run
+  report. The report verifier binds exact config bytes and effective output
+  overrides to raw and optional reconstructed normalized bytes, cross-checks
+  replayable counters, session, and book health, and retains runtime-only stop,
+  readiness, and queue evidence. It must pass alongside a one-session,
+  parse-clean, zero-gap replay check before any candidate runs.
+  Every configured stream must have at least two sources; candidate instruments
+  must have book and trade coverage plus applicable strategy index, accounting
+  currency index, mark, limit, and funding streams.
 - Reports embed selection/gate policy, fingerprint the manifest, executable,
   candidate files, effective strategies, and data, and preserve every
   underlying `BacktestReport`.

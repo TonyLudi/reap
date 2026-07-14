@@ -130,7 +130,7 @@ SHA-256, pinned Java revision, pseudonymous machine/account identities, unique
 session, synchronized host snapshots, and deterministic bounded sample
 reservoirs. `calibrate-latency` rejects failed operations or malformed/missing
 series, rounds delays upward into backtest milliseconds, and creates an
-integrity-checked artifact. A schema-2 production research manifest must point
+integrity-checked artifact. A schema-3 production research manifest must point
 to that artifact, run the byte-identical Reap executable, and use its exact
 baseline profile. The machinery is complete; no credentialed target-host
 artifact has passed yet.

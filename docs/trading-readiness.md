@@ -203,9 +203,10 @@ production trading process.
     manifest/binary/config/effective-strategy/data fingerprints plus embedded
     selection and gate policy, accounting, drawdown, position/pending delta,
     gross position/active-order exposure, inventory-duration, and pending-work
-    results. Production raw inputs must also pass embedded capture-config-bound
-    multi-source/candidate-channel analysis and an independent zero-gap replay
-    check before selection. The checked-in
+    results. Production raw inputs must also pass an embedded schema-3 capture
+    report verification that binds exact config/raw/optional-normalized evidence,
+    capture-config-bound multi-source/candidate-channel analysis, and an
+    independent zero-gap replay check before selection. The checked-in
     smoke fold validates plumbing with permissive uncalibrated gates and negative
     fee-adjusted PnL; it is not production evidence. Each dataset currently
     starts from zero rather than carrying Java's daily ending positions.
@@ -221,7 +222,7 @@ production trading process.
     account identities. A deterministic CLI rejects mismatched
     config/code/host/account/session/clock or failed-operation evidence, emits a
     profile only after every required series passes, and binds the exact
-    artifact/profile into schema-2 production research. Matching new/cancel
+    artifact/profile into schema-3 production research. Matching new/cancel
     measurements are explicitly retained as conservative REST-ack upper bounds.
     No representative credentialed report or passing calibration artifact has
     yet been certified.

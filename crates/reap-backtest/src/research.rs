@@ -4,7 +4,10 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use reap_capture::{CaptureAnalysisReport, CaptureConfig, analyze_capture_path};
+use reap_capture::{
+    CaptureAnalysisReport, CaptureConfig, CaptureVerificationReport, analyze_capture_path,
+    verify_capture_paths,
+};
 use reap_feed::{ReplayCheckReport, replay_check_path};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -14,7 +17,7 @@ use crate::{
     LatencyCalibrationArtifact, MAX_LATENCY_CALIBRATION_ARTIFACT_BYTES,
 };
 
-pub const RESEARCH_SCHEMA_VERSION: u32 = 2;
+pub const RESEARCH_SCHEMA_VERSION: u32 = 3;
 pub use reap_core::PINNED_JAVA_REVISION;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,7 +84,12 @@ pub struct ResearchDataset {
     pub id: String,
     pub path: PathBuf,
     pub format: ResearchDataFormat,
+    #[serde(default)]
     pub capture_config: Option<PathBuf>,
+    #[serde(default)]
+    pub capture_report: Option<PathBuf>,
+    #[serde(default)]
+    pub normalized_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,7 +199,12 @@ pub struct DatasetProvenance {
     pub raw_replay_check: Option<ReplayCheckReport>,
     pub capture_config: Option<PathBuf>,
     pub capture_config_sha256: Option<String>,
+    pub capture_report: Option<PathBuf>,
+    pub capture_report_sha256: Option<String>,
+    pub normalized_path: Option<PathBuf>,
+    pub normalized_sha256: Option<String>,
     pub capture_analysis: Option<CaptureAnalysisReport>,
+    pub capture_verification: Option<CaptureVerificationReport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -308,7 +321,12 @@ struct LoadedDataset {
     raw_replay_check: Option<ReplayCheckReport>,
     resolved_capture_config: Option<PathBuf>,
     capture_config_sha256: Option<String>,
+    resolved_capture_report: Option<PathBuf>,
+    capture_report_sha256: Option<String>,
+    resolved_normalized_path: Option<PathBuf>,
+    normalized_sha256: Option<String>,
     capture_analysis: Option<CaptureAnalysisReport>,
+    capture_verification: Option<CaptureVerificationReport>,
 }
 
 #[derive(Debug, Clone)]
@@ -501,7 +519,12 @@ pub fn run_research_manifest_path(path: impl AsRef<Path>) -> Result<ResearchRepo
                 raw_replay_check: dataset.raw_replay_check.clone(),
                 capture_config: dataset.spec.capture_config.clone(),
                 capture_config_sha256: dataset.capture_config_sha256.clone(),
+                capture_report: dataset.spec.capture_report.clone(),
+                capture_report_sha256: dataset.capture_report_sha256.clone(),
+                normalized_path: dataset.spec.normalized_path.clone(),
+                normalized_sha256: dataset.normalized_sha256.clone(),
                 capture_analysis: dataset.capture_analysis.clone(),
+                capture_verification: dataset.capture_verification.clone(),
             })
             .collect(),
         scenarios: manifest.scenarios,
@@ -687,11 +710,39 @@ impl ResearchManifest {
                     "production_candidate requires a capture_config for every dataset".to_string(),
                 );
             }
+            if self
+                .datasets
+                .iter()
+                .any(|dataset| dataset.capture_report.is_none())
+            {
+                errors.push(
+                    "production_candidate requires a capture_report for every dataset".to_string(),
+                );
+            }
         }
-        if self.datasets.iter().any(|dataset| {
-            dataset.format != ResearchDataFormat::RawCapture && dataset.capture_config.is_some()
-        }) {
-            errors.push("capture_config is valid only for raw_capture datasets".to_string());
+        for dataset in &self.datasets {
+            if dataset.format != ResearchDataFormat::RawCapture
+                && (dataset.capture_config.is_some()
+                    || dataset.capture_report.is_some()
+                    || dataset.normalized_path.is_some())
+            {
+                errors.push(format!(
+                    "dataset {}: capture_config, capture_report, and normalized_path are valid only for raw_capture datasets",
+                    dataset.id
+                ));
+            }
+            if dataset.capture_report.is_some() && dataset.capture_config.is_none() {
+                errors.push(format!(
+                    "dataset {}: capture_report requires capture_config",
+                    dataset.id
+                ));
+            }
+            if dataset.normalized_path.is_some() && dataset.capture_report.is_none() {
+                errors.push(format!(
+                    "dataset {}: normalized_path requires capture_report",
+                    dataset.id
+                ));
+            }
         }
 
         if errors.is_empty() {
@@ -1154,62 +1205,137 @@ fn load_datasets(
         } else {
             None
         };
-        let capture_config_path = spec.capture_config.as_ref();
-        let (resolved_capture_config, capture_config_sha256, capture_analysis) =
-            match capture_config_path {
-                Some(config_path) => {
-                    let resolved_config = resolve(base, config_path);
-                    let canonical_config = resolved_config.canonicalize().with_context(|| {
-                        format!(
-                            "failed to resolve capture config {}",
-                            resolved_config.display()
-                        )
-                    })?;
-                    let config_bytes = std::fs::read(&canonical_config).with_context(|| {
-                        format!(
-                            "failed to read capture config {}",
-                            canonical_config.display()
-                        )
-                    })?;
-                    let config_sha256 = sha256_bytes(&config_bytes);
-                    let config = CaptureConfig::from_toml(
-                        std::str::from_utf8(&config_bytes)
-                            .context("capture config is not UTF-8")?,
+        if spec.capture_report.is_some() && spec.capture_config.is_none() {
+            bail!("dataset {} capture_report requires capture_config", spec.id);
+        }
+        if spec.normalized_path.is_some() && spec.capture_report.is_none() {
+            bail!(
+                "dataset {} normalized_path requires capture_report",
+                spec.id
+            );
+        }
+        if mode == ResearchMode::ProductionCandidate
+            && (spec.capture_config.is_none() || spec.capture_report.is_none())
+        {
+            bail!(
+                "production dataset {} requires capture_config and capture_report evidence",
+                spec.id
+            );
+        }
+        let resolved_capture_report = spec
+            .capture_report
+            .as_ref()
+            .map(|report_path| -> Result<PathBuf> {
+                let resolved = resolve(base, report_path);
+                resolved.canonicalize().with_context(|| {
+                    format!("failed to resolve capture report {}", resolved.display())
+                })
+            })
+            .transpose()?;
+        let resolved_normalized_path = spec
+            .normalized_path
+            .as_ref()
+            .map(|normalized_path| -> Result<PathBuf> {
+                let resolved = resolve(base, normalized_path);
+                resolved.canonicalize().with_context(|| {
+                    format!(
+                        "failed to resolve normalized capture {}",
+                        resolved.display()
                     )
-                    .with_context(|| {
-                        format!(
-                            "failed to parse capture config {}",
-                            canonical_config.display()
-                        )
-                    })?;
-                    if mode == ResearchMode::ProductionCandidate {
-                        validate_production_capture_config(&spec.id, &config, candidates)?;
-                    }
-                    let analysis =
-                        analyze_capture_path(&canonical, &config).with_context(|| {
-                            format!("failed to analyze research dataset {}", spec.id)
-                        })?;
-                    if !analysis.integrity_healthy {
-                        bail!(
-                            "dataset {} failed capture-analysis integrity: errors={}, gaps={}, recovery_failures={}, receive_timestamp_regressions={}, unrecovered_books={}",
-                            spec.id,
-                            analysis.error_count,
-                            analysis.gaps,
-                            analysis.recovery_failures,
-                            analysis.receive_timestamp_regressions,
-                            analysis.unrecovered_book_streams
-                        );
-                    }
-                    if analysis.sha256 != sha256 {
-                        bail!(
-                            "dataset {} analysis hash does not match input hash",
-                            spec.id
-                        );
-                    }
-                    (Some(canonical_config), Some(config_sha256), Some(analysis))
+                })
+            })
+            .transpose()?;
+
+        let mut resolved_capture_config = None;
+        let mut capture_config_sha256 = None;
+        let mut capture_report_sha256 = None;
+        let mut normalized_sha256 = None;
+        let mut capture_analysis = None;
+        let mut capture_verification = None;
+        if let Some(config_path) = &spec.capture_config {
+            let resolved_config = resolve(base, config_path);
+            let canonical_config = resolved_config.canonicalize().with_context(|| {
+                format!(
+                    "failed to resolve capture config {}",
+                    resolved_config.display()
+                )
+            })?;
+            let config_bytes = std::fs::read(&canonical_config).with_context(|| {
+                format!(
+                    "failed to read capture config {}",
+                    canonical_config.display()
+                )
+            })?;
+            let config_sha256 = sha256_bytes(&config_bytes);
+            let config = CaptureConfig::from_toml(
+                std::str::from_utf8(&config_bytes).context("capture config is not UTF-8")?,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to parse capture config {}",
+                    canonical_config.display()
+                )
+            })?;
+            if mode == ResearchMode::ProductionCandidate {
+                validate_production_capture_config(&spec.id, &config, candidates)?;
+            }
+
+            let analysis = if let Some(report_path) = &resolved_capture_report {
+                let verification = verify_capture_paths(
+                    &canonical_config,
+                    report_path,
+                    &canonical,
+                    resolved_normalized_path.as_deref(),
+                )
+                .with_context(|| {
+                    format!("failed to verify capture evidence for dataset {}", spec.id)
+                })?;
+                if verification.config.sha256 != config_sha256 {
+                    bail!(
+                        "capture config for dataset {} changed while evidence was being loaded",
+                        spec.id
+                    );
                 }
-                None => (None, None, None),
+                if !verification.passed {
+                    bail!(
+                        "dataset {} failed capture verification: {:?}",
+                        spec.id,
+                        verification.failures
+                    );
+                }
+                capture_report_sha256 = Some(verification.run_report.sha256.clone());
+                normalized_sha256 = verification
+                    .normalized
+                    .as_ref()
+                    .map(|artifact| artifact.actual_sha256.clone());
+                let analysis = verification.analysis.clone();
+                capture_verification = Some(verification);
+                analysis
+            } else {
+                analyze_capture_path(&canonical, &config)
+                    .with_context(|| format!("failed to analyze research dataset {}", spec.id))?
             };
+            if !analysis.integrity_healthy {
+                bail!(
+                    "dataset {} failed capture-analysis integrity: errors={}, gaps={}, recovery_failures={}, receive_timestamp_regressions={}, unrecovered_books={}",
+                    spec.id,
+                    analysis.error_count,
+                    analysis.gaps,
+                    analysis.recovery_failures,
+                    analysis.receive_timestamp_regressions,
+                    analysis.unrecovered_book_streams
+                );
+            }
+            if analysis.sha256 != sha256 {
+                bail!(
+                    "dataset {} analysis hash does not match input hash",
+                    spec.id
+                );
+            }
+            resolved_capture_config = Some(canonical_config);
+            capture_config_sha256 = Some(config_sha256);
+            capture_analysis = Some(analysis);
+        }
         loaded.push(LoadedDataset {
             spec: spec.clone(),
             resolved_path: canonical,
@@ -1217,7 +1343,12 @@ fn load_datasets(
             raw_replay_check,
             resolved_capture_config,
             capture_config_sha256,
+            resolved_capture_report,
+            capture_report_sha256,
+            resolved_normalized_path,
+            normalized_sha256,
             capture_analysis,
+            capture_verification,
         });
     }
     Ok(loaded)
@@ -1352,6 +1483,30 @@ fn verify_input_hashes(
             if &final_config_sha256 != expected_sha256 {
                 bail!(
                     "capture config for dataset {} changed while research was running",
+                    dataset.spec.id
+                );
+            }
+        }
+        if let (Some(report_path), Some(expected_sha256)) = (
+            &dataset.resolved_capture_report,
+            &dataset.capture_report_sha256,
+        ) {
+            let final_report_sha256 = sha256_path(report_path)?;
+            if &final_report_sha256 != expected_sha256 {
+                bail!(
+                    "capture report for dataset {} changed while research was running",
+                    dataset.spec.id
+                );
+            }
+        }
+        if let (Some(normalized_path), Some(expected_sha256)) = (
+            &dataset.resolved_normalized_path,
+            &dataset.normalized_sha256,
+        ) {
+            let final_normalized_sha256 = sha256_path(normalized_path)?;
+            if &final_normalized_sha256 != expected_sha256 {
+                bail!(
+                    "normalized capture for dataset {} changed while research was running",
                     dataset.spec.id
                 );
             }
@@ -1904,7 +2059,136 @@ fn effective_strategy_sha256(config: &BacktestConfig) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use reap_capture::{
+        CAPTURE_RUN_REPORT_FORMAT_VERSION, CaptureBookHealth, CaptureConfigFileEvidence,
+        CaptureOutputConfig, CapturePriority, CaptureRunReport, CaptureRuntimeConfig,
+        CaptureStopReason, CaptureSubscriptionConfig, CaptureVenueConfig, analyze_capture,
+    };
+    use tempfile::TempDir;
+
     use super::*;
+
+    const RAW_CAPTURE_FIXTURE: &[u8] =
+        include_bytes!("../../../fixtures/raw/okx/depth-reset.jsonl");
+
+    struct ResearchCaptureFixture {
+        _directory: TempDir,
+        config_path: PathBuf,
+        report_path: PathBuf,
+        raw_path: PathBuf,
+    }
+
+    fn research_capture_fixture() -> ResearchCaptureFixture {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("capture.toml");
+        let report_path = directory.path().join("capture-report.json");
+        let raw_path = directory.path().join("capture.jsonl");
+        std::fs::write(&raw_path, RAW_CAPTURE_FIXTURE).unwrap();
+
+        let config = CaptureConfig {
+            venue: CaptureVenueConfig::default(),
+            runtime: CaptureRuntimeConfig::default(),
+            output: CaptureOutputConfig::default(),
+            subscriptions: vec![CaptureSubscriptionConfig {
+                channel: "books".to_string(),
+                symbol: "BTC-USDT".to_string(),
+                connections: 2,
+                priority: CapturePriority::Critical,
+            }],
+        };
+        let config_bytes = toml::to_string(&config).unwrap().into_bytes();
+        std::fs::write(&config_path, &config_bytes).unwrap();
+
+        let recorded_raw_path = PathBuf::from("collector/original-capture.jsonl");
+        let mut effective_config = config.clone();
+        effective_config.output.raw_path = recorded_raw_path.clone();
+        effective_config.output.normalized_path = None;
+        let analysis = analyze_capture(RAW_CAPTURE_FIXTURE, &effective_config).unwrap();
+        let expected_connections = 2;
+        let report = CaptureRunReport {
+            format_version: CAPTURE_RUN_REPORT_FORMAT_VERSION,
+            capture_session_id: analysis.capture_sessions[0].clone(),
+            config_fingerprint: effective_config.fingerprint().unwrap(),
+            config_source: Some(CaptureConfigFileEvidence {
+                source_path: PathBuf::from("collector/capture.toml"),
+                bytes: config_bytes.len() as u64,
+                sha256: sha256_bytes(&config_bytes),
+            }),
+            stop_reason: CaptureStopReason::DurationElapsed,
+            elapsed_ms: 1_000,
+            raw_path: recorded_raw_path,
+            normalized_path: None,
+            raw_records: analysis.lines,
+            normalized_records: 0,
+            raw_bytes: RAW_CAPTURE_FIXTURE.len() as u64,
+            normalized_bytes: 0,
+            raw_sha256: sha256_bytes(RAW_CAPTURE_FIXTURE),
+            normalized_sha256: None,
+            max_raw_queue_depth: 1,
+            max_normalized_queue_depth: 0,
+            parsed_events: analysis.parsed_events,
+            accepted_events: analysis.accepted_events,
+            duplicates: analysis.duplicate_events,
+            gaps: analysis.gaps,
+            recoveries: analysis.recoveries,
+            recovery_failures: analysis.recovery_failures,
+            sequence_resets: analysis.sequence_resets,
+            same_sequence_updates: analysis.same_sequence_updates,
+            recovery_requests: 0,
+            missing_recovery_routes: 0,
+            parse_errors: analysis.error_count,
+            stale_book_events: 0,
+            connection_disconnects: 0,
+            expected_connections,
+            ready_connections_at_stop: expected_connections,
+            reached_all_connections_ready: true,
+            books: analysis
+                .books
+                .iter()
+                .map(|book| CaptureBookHealth {
+                    symbol: book.symbol.clone(),
+                    sequence_status: book.sequence_status.clone(),
+                    book_status: book.book_status.clone(),
+                    last_seq_id: book.last_seq_id,
+                    buffered_updates: book.buffered_updates,
+                    sequence_resets: book.sequence_resets,
+                    same_sequence_updates: book.same_sequence_updates,
+                    best_bid: book.best_bid,
+                    best_ask: book.best_ask,
+                })
+                .collect(),
+            clean_capture: true,
+        };
+        write_capture_report(&report_path, &report);
+
+        ResearchCaptureFixture {
+            _directory: directory,
+            config_path,
+            report_path,
+            raw_path,
+        }
+    }
+
+    fn fixture_dataset(fixture: &ResearchCaptureFixture) -> ResearchDataset {
+        ResearchDataset {
+            id: "capture".to_string(),
+            path: fixture.raw_path.clone(),
+            format: ResearchDataFormat::RawCapture,
+            capture_config: Some(fixture.config_path.clone()),
+            capture_report: Some(fixture.report_path.clone()),
+            normalized_path: None,
+        }
+    }
+
+    fn read_capture_report(path: &Path) -> CaptureRunReport {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    fn write_capture_report(path: &Path, report: &CaptureRunReport) {
+        let mut bytes = serde_json::to_vec_pretty(report).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(path, bytes).unwrap();
+    }
 
     fn execution(
         calibrated: bool,
@@ -2011,12 +2295,16 @@ mod tests {
                     path: "train.jsonl".into(),
                     format: ResearchDataFormat::NormalizedJsonl,
                     capture_config: None,
+                    capture_report: None,
+                    normalized_path: None,
                 },
                 ResearchDataset {
                     id: "test".to_string(),
                     path: "test.jsonl".into(),
                     format: ResearchDataFormat::NormalizedJsonl,
                     capture_config: None,
+                    capture_report: None,
+                    normalized_path: None,
                 },
             ],
             scenarios: vec![
@@ -2053,6 +2341,18 @@ mod tests {
     }
 
     #[test]
+    fn manifest_rejects_capture_evidence_on_non_raw_dataset() {
+        let mut manifest = manifest();
+        manifest.datasets[0].capture_config = Some("capture.toml".into());
+        manifest.datasets[0].capture_report = Some("capture-report.json".into());
+        manifest.datasets[0].normalized_path = Some("normalized.jsonl".into());
+
+        let error = manifest.validate().unwrap_err().to_string();
+
+        assert!(error.contains("valid only for raw_capture datasets"));
+    }
+
+    #[test]
     fn manifest_rejects_latency_stress_without_distribution_dominance() {
         let mut manifest = manifest();
         let rule = |samples_ms| crate::BacktestLatencyRule {
@@ -2085,6 +2385,7 @@ mod tests {
         assert!(error.contains("at least two stress scenarios"));
         assert!(error.contains("calibrated execution"));
         assert!(error.contains("capture_config for every dataset"));
+        assert!(error.contains("capture_report for every dataset"));
     }
 
     #[test]
@@ -2095,6 +2396,8 @@ mod tests {
             path: "fixtures/raw/okx/depth-gap.jsonl".into(),
             format: ResearchDataFormat::RawCapture,
             capture_config: None,
+            capture_report: None,
+            normalized_path: None,
         }];
 
         let error = load_datasets(&datasets, &base, ResearchMode::ProductionCandidate, &[])
@@ -2102,6 +2405,142 @@ mod tests {
             .to_string();
 
         assert!(error.contains("failed zero-gap replay integrity"));
+    }
+
+    #[test]
+    fn production_dataset_loads_verified_schema_three_capture_evidence() {
+        let fixture = research_capture_fixture();
+        let datasets = [fixture_dataset(&fixture)];
+
+        let loaded = load_datasets(
+            &datasets,
+            Path::new("."),
+            ResearchMode::ProductionCandidate,
+            &[],
+        )
+        .unwrap();
+        let dataset = &loaded[0];
+
+        assert!(
+            dataset
+                .capture_verification
+                .as_ref()
+                .is_some_and(|verification| verification.passed)
+        );
+        assert_eq!(
+            dataset.capture_report_sha256.as_deref(),
+            dataset
+                .capture_verification
+                .as_ref()
+                .map(|verification| verification.run_report.sha256.as_str())
+        );
+        assert_eq!(
+            dataset
+                .capture_analysis
+                .as_ref()
+                .map(|report| &report.sha256),
+            Some(&dataset.sha256)
+        );
+        verify_input_hashes(
+            &fixture.raw_path,
+            &dataset.sha256,
+            &fixture.raw_path,
+            &dataset.sha256,
+            &[],
+            &loaded,
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn research_hash_guard_detects_capture_report_mutation() {
+        let fixture = research_capture_fixture();
+        let loaded = load_datasets(
+            &[fixture_dataset(&fixture)],
+            Path::new("."),
+            ResearchMode::ProductionCandidate,
+            &[],
+        )
+        .unwrap();
+        let mut report_bytes = std::fs::read(&fixture.report_path).unwrap();
+        report_bytes.extend_from_slice(b" \n");
+        std::fs::write(&fixture.report_path, report_bytes).unwrap();
+
+        let error = verify_input_hashes(
+            &fixture.raw_path,
+            &loaded[0].sha256,
+            &fixture.raw_path,
+            &loaded[0].sha256,
+            &[],
+            &loaded,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("capture report for dataset capture changed"));
+    }
+
+    #[test]
+    fn production_dataset_rejects_legacy_capture_report() {
+        let fixture = research_capture_fixture();
+        let mut report = read_capture_report(&fixture.report_path);
+        report.format_version = 2;
+        report.config_source = None;
+        write_capture_report(&fixture.report_path, &report);
+
+        let error = load_datasets(
+            &[fixture_dataset(&fixture)],
+            Path::new("."),
+            ResearchMode::ProductionCandidate,
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("failed capture verification"));
+        assert!(error.contains("UnsupportedRunReportFormat"));
+    }
+
+    #[test]
+    fn production_dataset_rejects_capture_config_byte_tampering() {
+        let fixture = research_capture_fixture();
+        let mut bytes = std::fs::read(&fixture.config_path).unwrap();
+        bytes.extend_from_slice(b"\n# formatting-only tamper\n");
+        std::fs::write(&fixture.config_path, bytes).unwrap();
+
+        let error = load_datasets(
+            &[fixture_dataset(&fixture)],
+            Path::new("."),
+            ResearchMode::ProductionCandidate,
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("failed capture verification"));
+        assert!(error.contains("ConfigFileMismatch"));
+    }
+
+    #[test]
+    fn production_dataset_requires_declared_normalized_capture() {
+        let fixture = research_capture_fixture();
+        let mut report = read_capture_report(&fixture.report_path);
+        report.normalized_path = Some(PathBuf::from("collector/normalized.jsonl"));
+        write_capture_report(&fixture.report_path, &report);
+
+        let error = load_datasets(
+            &[fixture_dataset(&fixture)],
+            Path::new("."),
+            ResearchMode::ProductionCandidate,
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("failed capture verification"));
+        assert!(error.contains("NormalizedArtifactMissing"));
     }
 
     #[test]

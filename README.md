@@ -169,12 +169,13 @@ and conservative stress scenarios. Reports embed the selection rule and gate
 thresholds, fingerprint the manifest, binary, candidate files, effective
 strategies, and datasets, and include drawdown, position/pending delta, gross
 position and active-order exposure, inventory duration, fee/funding accounting,
-and pending-work gates. Manifest, executable, candidate, dataset, and capture
-configuration hashes are verified again after all runs;
-production raw datasets also retain and pass capture-config-bound source
-analysis and a zero-gap replay-integrity check. The smoke fixture intentionally
-uses permissive uncalibrated gates and is not trading evidence.
-Production-candidate manifests use schema 2, require a passed
+and pending-work gates. Manifest, executable, candidate, dataset, capture
+configuration, capture-report, and optional normalized-artifact hashes are
+verified again after all runs. Production raw datasets must pass the embedded
+schema-3 run-report verifier, capture-config-bound source analysis, and an
+independent zero-gap replay-integrity check before any candidate executes. The
+smoke fixture intentionally uses permissive uncalibrated gates and is not
+trading evidence. Production-candidate manifests use schema 3, require a passed
 `latency_calibration` artifact, and require the baseline's empirical latency
 profile to match that artifact exactly.
 

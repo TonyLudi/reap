@@ -235,8 +235,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
   private-fill fee amount/currency is retained end to end; collection and
   verification are implemented but no demo evidence exists. Margin spot is
   unsupported and would require a borrow-interest model before enablement.
-- [ ] Require a verified capture run report for every production-candidate raw
-  dataset instead of relying only on config-bound analysis and replay checks.
+- [x] Require a verified schema-3 capture run report for every
+  production-candidate raw dataset, bind optional normalized output, embed the
+  verification result, and recheck all artifact hashes after research runs.
 - [ ] Deploy and exercise the webhook/host guards, systemd supervision, external
   unit-failure paging, and independent exchange cancel procedure on the target
   host/account; add a separate algo/spread kill path if those order classes are
