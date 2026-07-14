@@ -9,6 +9,7 @@ mod operator;
 mod provenance;
 mod runtime;
 mod startup;
+mod statement;
 
 pub use bootstrap::*;
 pub use config::*;
@@ -19,3 +20,4 @@ pub use latency::*;
 pub use operator::*;
 pub use runtime::*;
 pub use startup::*;
+pub use statement::*;

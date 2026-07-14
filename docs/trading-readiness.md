@@ -10,9 +10,9 @@ production trading process.
 | Area | Current state | Trading impact |
 | --- | --- | --- |
 | Iarb2 decision model | Covered for the documented OKX parity boundary | Not a blocker |
-| Deterministic backtest/data | Shared strategy code, immediate pending-order registration, arrival-time scheduler, Java-mapped class/symbol empirical latency profiles with sampled-usage reporting, versioned target-host/live collectors, deterministic calibration artifacts bound into production research, conservative depth/queue/trade capacity controls, event-clock drawdown/exposure/inventory metrics, per-currency depeg-sensitive valuation, exact private-fill fee currency plus explicit simulated-fee counts, fee/turnover attribution, scheduled linear/inverse funding, manifest-driven chronological walk-forward selection and stress gates, credential-free redundant public capture, exact provenance, streaming analysis, and raw/normalized replay | The evidence pipeline is implemented but execution/accounting assumptions remain uncalibrated; needs sustained full-depth and currency-index capture, a passing credentialed target-host/demo latency artifact, complete funding intervals, target-tier fee calibration, zero-liability cash-account certification, statement reconciliation, and real production-candidate reports before capital decisions |
+| Deterministic backtest/data | Shared strategy code, immediate pending-order registration, arrival-time scheduler, Java-mapped class/symbol empirical latency profiles with sampled-usage reporting, versioned target-host/live collectors, deterministic calibration artifacts bound into production research, conservative depth/queue/trade capacity controls, event-clock drawdown/exposure/inventory metrics, per-currency depeg-sensitive valuation, exact private-fill fee currency plus explicit simulated-fee counts, fee/turnover attribution, offline raw-OKX fill/fee reconciliation, scheduled linear/inverse funding, manifest-driven chronological walk-forward selection and stress gates, credential-free redundant public capture, exact provenance, streaming analysis, and raw/normalized replay | The evidence pipeline is implemented but execution/accounting assumptions remain uncalibrated; needs sustained full-depth and currency-index capture, a passing credentialed target-host/demo latency artifact, complete funding intervals, target-tier fee calibration, zero-liability cash-account certification, a real passing fill/fee artifact plus broader economic statement reconciliation, and production-candidate reports before capital decisions |
 | Feed components | Redundant public sockets, isolated private sockets, transport/state freshness separation, account-plus-positions health rounds, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
-| Order components | Event-loop client IDs/registration, exchange/client acknowledgement binding, account-scoped immutable private identity, semantic duplicate suppression across changed exchange timestamps, exchange-side place-request expiry, signed submit/cancel, pacing, monotonic private reduction, submit/cancel state-convergence deadlines, typed position margin mode, ambiguity handling, and full order/fill/balance/position REST reconciliation are composed | Needs demo exchange fault evidence |
+| Order components | Event-loop client IDs/registration, exchange/client acknowledgement binding, account-scoped immutable private identity, semantic duplicate suppression across changed exchange timestamps, exchange-side place-request expiry, signed submit/cancel, pacing, monotonic private reduction, submit/cancel state-convergence deadlines, typed position margin mode, ambiguity handling, and bounded complete order/fill/balance/position REST reconciliation are composed | Needs demo exchange fault evidence |
 | Runtime risk | Instrument models, authoritative startup positions, active-order count/notional ceilings, rolling submit-rejection and zero-fill IOC-cancel circuits, terminal strategy-halt promotion, position scope/mode enforcement, forced-repayment blocking, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed deadman/depeg/convergence evidence |
 | Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, and strict bounded soak reports | Demo-capable; production entry intentionally unavailable |
 | Instrument/account bootstrap | Account instruments/config/balance/positions are typed; live spot is cash-only; nonzero positions require configured account ownership and derivative mode before strategy/risk application | Needs target-account certification |
@@ -227,6 +227,18 @@ production trading process.
     readiness and post-cleanup order state, then preserve the original nonzero
     exit. This makes injected demo faults auditable; failures before runtime
     construction still require the reserved empty path and process log.
+37. Order-channel fills now create the same canonical exact-fee journal record
+    as the optional fills channel and cross-channel duplicates are suppressed by
+    instrument-scoped `tradeId`; a fee-less fills-channel event arriving first
+    cannot suppress the later exact order record. REST recovery requests 100
+    rows per page and follows `billId` until a short page; duplicate fills/cursors
+    or the bounded page limit fail closed. A deterministic offline CLI leases
+    and fingerprints the exact journal and raw OKX response pages, records its
+    executable hash and the account's journal bootstrap strategy/config
+    identity, compares fill fields and signed fees, and emits a versioned
+    pass/fail artifact. No real demo artifact has yet been produced, and its
+    account/window completeness remains an explicit operator attestation because
+    the OKX response body does not echo either.
 
 ## Remaining Demo Gate
 
@@ -257,7 +269,9 @@ production trading process.
    orders; restart checkpoint state still requires log/account review. Generate
    a passing `calibrate-latency` artifact from synchronized target-host observe
    and demo reports, archive every source hash/file, and reconcile its private
-   timing populations against exchange/account records.
+   timing populations against exchange/account records. Export every raw OKX
+   fill page for the bounded demo window and require a passing
+   `reconcile-fills` artifact with a reviewed nonzero minimum-fill threshold.
 
 ## Production Gate
 

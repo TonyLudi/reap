@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use reap_core::{NormalizedEvent, OrderIntent, SystemEvent, SystemEventKind, TimeMs, Venue};
+use reap_core::{
+    FillKey, NormalizedEvent, OrderIntent, SystemEvent, SystemEventKind, TimeMs, Venue,
+};
 use reap_engine::{EngineOutput, TradingEngine};
 use reap_feed::{FeedOutput, RecoveryRequest};
 use reap_order::{
@@ -114,6 +116,7 @@ pub struct LiveCoordinator {
     gateway_actions_enabled: bool,
     order_entry_enabled: bool,
     halted_accounts: BTreeMap<String, String>,
+    journal_fill_keys_by_account: HashMap<String, HashSet<FillKey>>,
     session_id: String,
     decision_sequence: u64,
 }
@@ -139,6 +142,9 @@ impl LiveCoordinator {
         startup.mark_metadata_verified();
         let mut private_states = HashMap::new();
         let mut client_ids = HashMap::new();
+        // Baseline keys predate this session and recovered fill keys are already
+        // durable, so neither should be appended again when private streams race.
+        let journal_fill_keys_by_account = verified.baseline_fill_ids.clone();
         for account in &config.accounts {
             let mut state = PrivateStateReducer::new();
             if let Some(fill_ids) = verified.baseline_fill_ids.get(&account.id) {
@@ -167,6 +173,7 @@ impl LiveCoordinator {
             gateway_actions_enabled,
             order_entry_enabled: gateway_actions_enabled,
             halted_accounts: BTreeMap::new(),
+            journal_fill_keys_by_account,
             session_id,
             decision_sequence: 0,
         })
@@ -326,6 +333,34 @@ impl LiveCoordinator {
                     let known = state.order_reducer().contains_order(&canonical_id);
                     (canonical_id, known)
                 };
+                let fill_id = update.fill_id.clone();
+                let fill_key = fill_id
+                    .as_ref()
+                    .map(|fill_id| FillKey::new(&update.symbol, fill_id));
+                let fill_was_journaled = fill_key.as_ref().is_some_and(|fill_key| {
+                    self.journal_fill_keys_by_account
+                        .get(&account_id)
+                        .is_some_and(|fill_keys| fill_keys.contains(fill_key))
+                });
+                let raw_fill_record = if !fill_was_journaled
+                    && update.last_fill_qty > 0.0
+                    && update.last_fill_price > 0.0
+                {
+                    fill_id.clone().map(|fill_id| FillRecord {
+                        ts_ms: update.ts_ms,
+                        account_id: Some(account_id.clone()),
+                        fill_id,
+                        order_id: canonical_id.clone(),
+                        symbol: update.symbol.clone(),
+                        side: update.side,
+                        price: update.last_fill_price,
+                        qty: update.last_fill_qty,
+                        liquidity: update.liquidity,
+                        fee: update.last_fill_fee.clone(),
+                    })
+                } else {
+                    None
+                };
                 let ts_ms = update.ts_ms;
                 let symbol = update.symbol.clone();
                 let canonical = self
@@ -344,8 +379,33 @@ impl LiveCoordinator {
                         format!("private update for unknown order {canonical_id}"),
                     )?);
                 }
+                let canonical_fill_record = canonical.as_ref().and_then(|update| {
+                    if !fill_was_journaled && update.has_fill() {
+                        fill_id.map(|fill_id| FillRecord {
+                            ts_ms: update.ts_ms,
+                            account_id: Some(account_id.clone()),
+                            fill_id,
+                            order_id: update.order_id.clone(),
+                            symbol: update.symbol.clone(),
+                            side: update.side,
+                            price: update.last_fill_price,
+                            qty: update.last_fill_qty,
+                            liquidity: update.last_fill_liquidity,
+                            fee: update.last_fill_fee.clone(),
+                        })
+                    } else {
+                        None
+                    }
+                });
                 if let Some(update) = canonical {
                     output.extend(self.process_normalized(NormalizedEvent::Order(update)));
+                }
+                if let Some(fill_record) = canonical_fill_record.or(raw_fill_record) {
+                    self.journal_fill_keys_by_account
+                        .entry(account_id)
+                        .or_default()
+                        .insert(FillKey::new(&fill_record.symbol, &fill_record.fill_id));
+                    output.records.push(StorageRecord::Fill(fill_record));
                 }
                 Ok(output)
             }
@@ -367,6 +427,11 @@ impl LiveCoordinator {
                     let known = state.order_reducer().contains_order(&canonical_id);
                     (canonical_id, known)
                 };
+                let fill_key = FillKey::new(&fill.symbol, &fill.fill_id);
+                let fill_was_journaled = self
+                    .journal_fill_keys_by_account
+                    .get(&account_id)
+                    .is_some_and(|fill_keys| fill_keys.contains(&fill_key));
                 let fill_record = FillRecord {
                     ts_ms: fill.ts_ms,
                     account_id: Some(account_id.clone()),
@@ -376,7 +441,7 @@ impl LiveCoordinator {
                     side: fill.side,
                     price: fill.price,
                     qty: fill.qty,
-                    liquidity: fill.liquidity,
+                    liquidity: Some(fill.liquidity),
                     fee: fill.fee.clone(),
                 };
                 let ts_ms = fill.ts_ms;
@@ -388,9 +453,20 @@ impl LiveCoordinator {
                         account_id: account_id.clone(),
                         source,
                     })?;
+                // The VIP fills channel currently omits per-fill fees. Let its
+                // earlier state update race without consuming the journal key;
+                // the required orders channel can then persist exact evidence.
+                let journal_fill = (!fill_was_journaled && fill_record.fee.is_some())
+                    .then_some(StorageRecord::Fill(fill_record));
+                if journal_fill.is_some() {
+                    self.journal_fill_keys_by_account
+                        .entry(account_id.clone())
+                        .or_default()
+                        .insert(fill_key);
+                }
                 let mut output = CoordinatorOutput {
                     actions: Vec::new(),
-                    records: vec![StorageRecord::Fill(fill_record)],
+                    records: journal_fill.into_iter().collect(),
                 };
                 if !known {
                     output.extend(self.reconciliation_fault(
@@ -2074,6 +2150,210 @@ mod tests {
         let state = coordinator.private_state("main").unwrap();
         assert_eq!(state.order_reducer().orders().count(), 1);
         assert!(state.order_reducer().get("exchange-1").is_none());
+    }
+
+    #[test]
+    fn order_channel_fill_is_persisted_once_across_private_channels() {
+        let mut coordinator = coordinator();
+        ready(&mut coordinator);
+        coordinator
+            .register_local_order("main", "client-1", order(), 3)
+            .unwrap();
+        coordinator
+            .on_submit_outcome(
+                "main",
+                SubmitOutcome::Submitted {
+                    client_order_id: "client-1".to_string(),
+                    exchange_order_id: "exchange-1".to_string(),
+                },
+                4,
+            )
+            .unwrap();
+
+        let order_fill = coordinator
+            .process_feed(FeedOutput::PrivateOrder {
+                account_id: Some("main".to_string()),
+                update: PrivateOrderUpdate {
+                    ts_ms: 5,
+                    exchange_order_id: "exchange-1".to_string(),
+                    client_order_id: "client-1".to_string(),
+                    symbol: "BTC-USDT".to_string(),
+                    side: Side::Buy,
+                    state: PrivateOrderState::PartiallyFilled,
+                    price: 100.0,
+                    qty: 0.1,
+                    cumulative_filled_qty: 0.05,
+                    average_fill_price: 100.0,
+                    last_fill_qty: 0.05,
+                    last_fill_price: 100.0,
+                    liquidity: None,
+                    last_fill_fee: Some(FillFee {
+                        amount: -0.005,
+                        currency: "USDT".to_string(),
+                    }),
+                    fill_id: Some("fill-1".to_string()),
+                    reject_reason: String::new(),
+                },
+            })
+            .unwrap();
+
+        let persisted = order_fill
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                StorageRecord::Fill(fill) => Some(fill),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].fill_id, "fill-1");
+        assert_eq!(persisted[0].order_id, "client-1");
+        assert_eq!(persisted[0].liquidity, None);
+        assert_eq!(
+            persisted[0].fee,
+            Some(FillFee {
+                amount: -0.005,
+                currency: "USDT".to_string(),
+            })
+        );
+
+        let duplicate = coordinator
+            .process_feed(FeedOutput::PrivateFill {
+                account_id: Some("main".to_string()),
+                fill: RemoteFill {
+                    fill_id: "fill-1".to_string(),
+                    exchange_order_id: "exchange-1".to_string(),
+                    client_order_id: "client-1".to_string(),
+                    symbol: "BTC-USDT".to_string(),
+                    side: Side::Buy,
+                    price: 100.0,
+                    qty: 0.05,
+                    liquidity: FillLiquidity::Maker,
+                    fee: Some(FillFee {
+                        amount: -0.005,
+                        currency: "USDT".to_string(),
+                    }),
+                    ts_ms: 6,
+                },
+            })
+            .unwrap();
+
+        assert!(
+            duplicate
+                .records
+                .iter()
+                .all(|record| !matches!(record, StorageRecord::Fill(_)))
+        );
+        assert_eq!(
+            coordinator
+                .private_state("main")
+                .unwrap()
+                .order_reducer()
+                .get("client-1")
+                .unwrap()
+                .filled_qty,
+            0.05
+        );
+    }
+
+    #[test]
+    fn fee_less_fill_channel_does_not_hide_later_exact_order_fill() {
+        let mut coordinator = coordinator();
+        ready(&mut coordinator);
+        coordinator
+            .register_local_order("main", "client-1", order(), 3)
+            .unwrap();
+        coordinator
+            .on_submit_outcome(
+                "main",
+                SubmitOutcome::Submitted {
+                    client_order_id: "client-1".to_string(),
+                    exchange_order_id: "exchange-1".to_string(),
+                },
+                4,
+            )
+            .unwrap();
+
+        let early_fill = coordinator
+            .process_feed(FeedOutput::PrivateFill {
+                account_id: Some("main".to_string()),
+                fill: RemoteFill {
+                    fill_id: "fill-1".to_string(),
+                    exchange_order_id: "exchange-1".to_string(),
+                    client_order_id: "client-1".to_string(),
+                    symbol: "BTC-USDT".to_string(),
+                    side: Side::Buy,
+                    price: 100.0,
+                    qty: 0.05,
+                    liquidity: FillLiquidity::Maker,
+                    fee: None,
+                    ts_ms: 5,
+                },
+            })
+            .unwrap();
+        assert!(
+            early_fill
+                .records
+                .iter()
+                .all(|record| !matches!(record, StorageRecord::Fill(_)))
+        );
+
+        let exact_fill = coordinator
+            .process_feed(FeedOutput::PrivateOrder {
+                account_id: Some("main".to_string()),
+                update: PrivateOrderUpdate {
+                    ts_ms: 6,
+                    exchange_order_id: "exchange-1".to_string(),
+                    client_order_id: "client-1".to_string(),
+                    symbol: "BTC-USDT".to_string(),
+                    side: Side::Buy,
+                    state: PrivateOrderState::PartiallyFilled,
+                    price: 100.0,
+                    qty: 0.1,
+                    cumulative_filled_qty: 0.05,
+                    average_fill_price: 100.0,
+                    last_fill_qty: 0.05,
+                    last_fill_price: 100.0,
+                    liquidity: Some(FillLiquidity::Maker),
+                    last_fill_fee: Some(FillFee {
+                        amount: -0.005,
+                        currency: "USDT".to_string(),
+                    }),
+                    fill_id: Some("fill-1".to_string()),
+                    reject_reason: String::new(),
+                },
+            })
+            .unwrap();
+
+        let persisted = exact_fill
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                StorageRecord::Fill(fill) => Some(fill),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].fill_id, "fill-1");
+        assert_eq!(persisted[0].order_id, "client-1");
+        assert_eq!(persisted[0].liquidity, Some(FillLiquidity::Maker));
+        assert_eq!(
+            persisted[0].fee,
+            Some(FillFee {
+                amount: -0.005,
+                currency: "USDT".to_string(),
+            })
+        );
+        assert_eq!(
+            coordinator
+                .private_state("main")
+                .unwrap()
+                .order_reducer()
+                .get("client-1")
+                .unwrap()
+                .filled_qty,
+            0.05
+        );
     }
 
     #[test]

@@ -537,6 +537,22 @@ async fn bootstrap_accounts(
         let client = OkxRestClient::new(transport, signer.clone()).with_order_request_expiry(
             Duration::from_millis(config.runtime.order_request_expiry_ms),
         );
+        let trade_modes = account
+            .trade_modes
+            .iter()
+            .map(|(symbol, mode)| (symbol.clone(), (*mode).into()))
+            .collect();
+        let mut gateway = OkxOrderGateway::new(
+            client.clone(),
+            account.id_prefix.clone(),
+            account.node_id,
+            trade_modes,
+            config.runtime.pacing_policy(),
+        )
+        .map_err(|error| LiveRuntimeError::GatewaySetup {
+            account_id: account.id.clone(),
+            message: error.to_string(),
+        })?;
         let clock_skew_ms = rest_clock_skew_ms(&client)
             .await
             .map_err(|error| bootstrap_error(&account.id, "exchange clock", error.to_string()))?;
@@ -565,14 +581,16 @@ async fn bootstrap_accounts(
             .map_err(|error| {
                 bootstrap_error(&account.id, "account positions", error.to_string())
             })?;
-        let mut open_orders = client
-            .open_orders(None, None)
+        let (mut open_orders, recent_fills) = gateway
+            .fetch_remote_state(None, None, config.runtime.max_fill_reconciliation_pages)
             .await
-            .map_err(|error| bootstrap_error(&account.id, "open orders", error.to_string()))?;
-        let recent_fills = client
-            .fills(None, None)
-            .await
-            .map_err(|error| bootstrap_error(&account.id, "recent fills", error.to_string()))?;
+            .map_err(|error| {
+                bootstrap_error(
+                    &account.id,
+                    "open orders and recent fills",
+                    error.to_string(),
+                )
+            })?;
         let mut remote_ids = open_orders
             .iter()
             .map(remote_order_id)
@@ -650,22 +668,6 @@ async fn bootstrap_accounts(
                 recent_fills,
             },
         );
-        let trade_modes = account
-            .trade_modes
-            .iter()
-            .map(|(symbol, mode)| (symbol.clone(), (*mode).into()))
-            .collect();
-        let gateway = OkxOrderGateway::new(
-            client,
-            account.id_prefix.clone(),
-            account.node_id,
-            trade_modes,
-            config.runtime.pacing_policy(),
-        )
-        .map_err(|error| LiveRuntimeError::GatewaySetup {
-            account_id: account.id.clone(),
-            message: error.to_string(),
-        })?;
         seeds.push(AccountSeed {
             account_id: account.id.clone(),
             signer,
@@ -1266,6 +1268,7 @@ impl LiveRuntime {
                 order_rx,
                 control_tx.clone(),
                 config.runtime.ambiguous_submit_grace_ms,
+                config.runtime.max_fill_reconciliation_pages,
             )));
         }
 
@@ -3181,6 +3184,7 @@ async fn run_order_task(
     mut commands: mpsc::Receiver<OrderTaskCommand>,
     events: mpsc::Sender<RuntimeEvent>,
     ambiguous_submit_grace_ms: u64,
+    max_fill_reconciliation_pages: usize,
 ) {
     while let Some(command) = commands.recv().await {
         match command {
@@ -3308,7 +3312,10 @@ async fn run_order_task(
                 }
             }
             OrderTaskCommand::Reconcile(restored_orders) => {
-                match gateway.fetch_remote_state(None, None).await {
+                match gateway
+                    .fetch_remote_state(None, None, max_fill_reconciliation_pages)
+                    .await
+                {
                     Ok((mut remote_orders, remote_fills)) => {
                         let mut remote_ids = remote_orders
                             .iter()

@@ -3,7 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use reap_core::{AccountUpdate, NewOrder};
 use reap_venue::okx::{
-    HttpTransport, OkxCancelOrder, OkxPlaceOrder, OkxRestClient, OkxTradeMode, RestError,
+    HttpTransport, OkxCancelOrder, OkxFillPagination, OkxPlaceOrder, OkxRestClient, OkxTradeMode,
+    RestError,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -319,9 +320,11 @@ where
         state: &PrivateStateReducer,
         instrument_type: Option<&str>,
         symbol: Option<&str>,
+        max_fill_pages: usize,
     ) -> Result<ReconciliationSnapshot, GatewayError> {
-        let (remote_orders, remote_fills) =
-            self.fetch_remote_state(instrument_type, symbol).await?;
+        let (remote_orders, remote_fills) = self
+            .fetch_remote_state(instrument_type, symbol, max_fill_pages)
+            .await?;
         let remote_account = self.fetch_remote_account_state().await?;
         let report = reconcile_full_state(state, &remote_orders, &remote_fills, &remote_account);
         Ok(ReconciliationSnapshot {
@@ -336,11 +339,22 @@ where
         &mut self,
         instrument_type: Option<&str>,
         symbol: Option<&str>,
+        max_fill_pages: usize,
     ) -> Result<(Vec<reap_venue::RemoteOrder>, Vec<reap_venue::RemoteFill>), GatewayError> {
         self.pacer.pace(RequestKind::Reconcile, "account").await;
         let remote_orders = self.client.open_orders(instrument_type, symbol).await?;
-        self.pacer.pace(RequestKind::Reconcile, "account").await;
-        let remote_fills = self.client.fills(instrument_type, symbol).await?;
+        let mut pagination = OkxFillPagination::new(max_fill_pages)?;
+        loop {
+            self.pacer.pace(RequestKind::Reconcile, "account").await;
+            let page = self
+                .client
+                .fills_page(instrument_type, symbol, pagination.after())
+                .await?;
+            if pagination.accept(page)? {
+                break;
+            }
+        }
+        let remote_fills = pagination.into_fills();
         Ok((remote_orders, remote_fills))
     }
 
@@ -425,6 +439,31 @@ mod tests {
             reduce_only: false,
             self_trade_prevention: None,
             reason: "quote".to_string(),
+        }
+    }
+
+    fn fill_response(first: usize, count: usize) -> HttpResponse {
+        let data = (first..first + count)
+            .map(|index| {
+                serde_json::json!({
+                    "billId": format!("bill-{index}"),
+                    "tradeId": format!("fill-{index}"),
+                    "ordId": format!("order-{index}"),
+                    "clOrdId": format!("client-{index}"),
+                    "instId": "BTC-USDT",
+                    "side": "buy",
+                    "fillPx": "100",
+                    "fillSz": "0.01",
+                    "execType": "M",
+                    "fee": "-0.00001",
+                    "feeCcy": "BTC",
+                    "fillTime": "1000"
+                })
+            })
+            .collect::<Vec<_>>();
+        HttpResponse {
+            status: 200,
+            body: serde_json::json!({"code": "0", "msg": "", "data": data}).to_string(),
         }
     }
 
@@ -531,6 +570,25 @@ mod tests {
         assert_eq!(account.balances[0].currency, "USDT");
         assert_eq!(account.positions[0].symbol, "BTC-USDT-SWAP");
         assert_eq!(account.positions[0].qty, 2.0);
+    }
+
+    #[tokio::test]
+    async fn remote_state_reconciliation_fetches_every_fill_page_through_gateway() {
+        let open_orders = HttpResponse {
+            status: 200,
+            body: r#"{"code":"0","msg":"","data":[]}"#.to_string(),
+        };
+        let (mut gateway, calls) = gateway(vec![
+            Ok(open_orders),
+            Ok(fill_response(100, 100)),
+            Ok(fill_response(200, 2)),
+        ]);
+
+        let (orders, fills) = gateway.fetch_remote_state(None, None, 3).await.unwrap();
+
+        assert!(orders.is_empty());
+        assert_eq!(fills.len(), 102);
+        assert_eq!(*calls.lock().unwrap(), 3);
     }
 
     #[tokio::test]

@@ -162,7 +162,8 @@ pub struct FillRecord {
     pub side: Side,
     pub price: Price,
     pub qty: Quantity,
-    pub liquidity: FillLiquidity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liquidity: Option<FillLiquidity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fee: Option<FillFee>,
 }
@@ -460,17 +461,28 @@ struct StoredEnvelope {
     record: StorageRecord,
 }
 
-const CURRENT_SCHEMA_VERSION: u16 = 4;
+const CURRENT_SCHEMA_VERSION: u16 = 5;
 
 pub fn recover_jsonl(path: impl AsRef<Path>) -> Result<RecoveredStorage, StorageError> {
     let path = path.as_ref();
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(RecoveredStorage::default());
         }
         Err(error) => return Err(error.into()),
     };
+    recover_jsonl_bytes(&bytes)
+}
+
+/// Recovers exactly the supplied journal bytes.
+///
+/// Evidence tooling uses this entry point so the bytes it fingerprints are the
+/// same bytes used to reconstruct fills and checkpoints.
+pub fn recover_jsonl_bytes(bytes: &[u8]) -> Result<RecoveredStorage, StorageError> {
+    let text = std::str::from_utf8(bytes).map_err(|error| {
+        StorageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    })?;
     let trailing_newline = text.ends_with('\n');
     let lines = text.lines().collect::<Vec<_>>();
     let mut recovered = RecoveredStorage::default();
@@ -492,7 +504,7 @@ pub fn recover_jsonl(path: impl AsRef<Path>) -> Result<RecoveredStorage, Storage
                 });
             }
         };
-        if !matches!(envelope.schema_version, 2 | 3 | CURRENT_SCHEMA_VERSION) {
+        if !matches!(envelope.schema_version, 2 | 3 | 4 | CURRENT_SCHEMA_VERSION) {
             return Err(StorageError::Corrupt {
                 line: index + 1,
                 message: format!("unsupported schema version {}", envelope.schema_version),
@@ -923,6 +935,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recovery_migrates_v4_fill_liquidity_to_optional_field() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let line = r#"{"schema_version":4,"record":{"kind":"fill","data":{"ts_ms":1,"account_id":"main","fill_id":"fill-1","order_id":"order-1","symbol":"BTC-USDT","side":"buy","price":100.0,"qty":0.1,"liquidity":"maker"}}}"#;
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+
+        let recovered = recover_jsonl(path).unwrap();
+
+        assert_eq!(recovered.records, 1);
+        assert_eq!(recovered.fills.len(), 1);
+        assert_eq!(recovered.fills[0].liquidity, Some(FillLiquidity::Maker));
+    }
+
     #[tokio::test]
     async fn writer_persists_all_record_classes_as_jsonl() {
         let directory = tempfile::tempdir().unwrap();
@@ -986,7 +1012,7 @@ mod tests {
             side: Side::Buy,
             price: 100.0,
             qty: 1.0,
-            liquidity: FillLiquidity::Maker,
+            liquidity: Some(FillLiquidity::Maker),
             fee: None,
         }))
         .await
@@ -1207,7 +1233,7 @@ mod tests {
             side: Side::Buy,
             price: 100.0,
             qty: 0.5,
-            liquidity: FillLiquidity::Maker,
+            liquidity: Some(FillLiquidity::Maker),
             fee: Some(FillFee {
                 amount: -0.0005,
                 currency: "BTC".to_string(),

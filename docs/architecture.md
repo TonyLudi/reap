@@ -218,8 +218,12 @@ Responsibilities:
 - Semantic private-order deduplication treats repeated instrument-scoped fill
   IDs and unchanged terminal order states as duplicates independently of
   exchange update time. Restart baselines persist `(symbol, fill_id)`; legacy
-  unscoped journal IDs are read as conservative wildcards.
-- REST reconciliation for open orders, fills, balances, and positions.
+  unscoped journal IDs are read as conservative wildcards. If the optional
+  fills channel arrives first without fee fields, it updates private state but
+  leaves the journal key available for the fee-bearing orders-channel update.
+- REST reconciliation for open orders, fills, balances, and positions. OKX
+  fills are paced and paginated until a short page proves completion; repeated
+  cursors/fills or the configured page bound fail the reconciliation.
 - Authoritative account-snapshot replacement with zero tombstones for balances
   and positions omitted after closure, plus per-row monotonic update guards.
 - Account-scoped fill convergence: derivative fills await their position row;
@@ -304,6 +308,9 @@ Responsibilities:
 - Start/stop/restart strategy instances.
 - Dispatch timers into strategy loops.
 - Coordinate reconciliation and recovery.
+- Produce deterministic offline fill/fee evidence by leasing and hashing the
+  exact canonical journal plus raw venue response pages; economic statement
+  reconciliation outside fills and fees remains a separate accounting layer.
 - Reduce durable global/account/symbol latches, block halted routes, and
   guarantee scoped canonical cancellation.
 - Promote terminal strategy safety halts into the global risk gate before

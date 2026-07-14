@@ -13,6 +13,7 @@ use reap_live::{
 use reap_strategy::ChaosConfig;
 
 mod latency;
+mod statement;
 
 use latency::{LatencyCalibrationOptions, build_latency_calibration, profile_toml};
 
@@ -166,6 +167,8 @@ enum Command {
         #[arg(long)]
         pretty: bool,
     },
+    #[command(about = "Reconcile canonical journal fills and exact fees against raw OKX responses")]
+    ReconcileFills(statement::ReconcileFillsArgs),
     Operator {
         #[arg(short, long)]
         config: PathBuf,
@@ -572,6 +575,7 @@ async fn main() -> Result<()> {
                 anyhow::bail!("latency calibration did not satisfy evidence gates");
             }
         }
+        Command::ReconcileFills(args) => statement::run(args)?,
         Command::Operator {
             config,
             command,

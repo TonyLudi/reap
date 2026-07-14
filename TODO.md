@@ -196,6 +196,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
   failures into bounded non-passing evidence instead of losing the report.
 - [x] Add hardened systemd templates with bounded observe restart and manual
   demo/capture restart, plus the stop/cancel/reconcile operating procedure.
+- [x] Persist current OKX order-channel fills and exact per-fill fees once across
+  private channels, paginate recent-fill recovery to a proven short page with a
+  fail-closed bound, and add create-new journal-to-raw-OKX fill/fee evidence.
 - [ ] Run credentialed bounded observe and minimal-size demo fault campaigns,
   including process death, deadman expiry, clock skew, REST ambiguity, partial
   fill, reconnect, and durable-latch restart recovery.
@@ -206,10 +209,11 @@ architecture in [docs/architecture.md](docs/architecture.md).
   but have no credentialed calibration artifact; empirical queue and populated
   per-class/per-instrument latency distributions, target-tier simulated-fee
   calibration, complete funding intervals, zero-liability cash-account
-  certification, and statement reconciliation are still required. Exact signed
-  private-fill fee amount/currency is retained end to end; a statement
-  reconciliation tool and real demo evidence remain outstanding. Margin spot is
-  unsupported and would require a borrow-interest model before enablement.
+  certification, a passing real fill/fee reconciliation artifact, and broader
+  economic statement reconciliation are still required. Exact signed
+  private-fill fee amount/currency is retained end to end; the tool is
+  implemented but no demo statement evidence exists. Margin spot is unsupported
+  and would require a borrow-interest model before enablement.
 - [ ] Deploy and exercise the webhook/host guards, systemd supervision, external
   unit-failure paging, and independent exchange cancel procedure on the target
   host/account; add a separate algo/spread kill path if those order classes are

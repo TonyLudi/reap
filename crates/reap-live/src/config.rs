@@ -143,6 +143,7 @@ pub struct RuntimeConfig {
     pub ambiguous_submit_grace_ms: u64,
     pub order_state_convergence_timeout_ms: u64,
     pub fill_state_convergence_timeout_ms: u64,
+    pub max_fill_reconciliation_pages: usize,
     pub submit_requests_per_window: usize,
     pub cancel_requests_per_window: usize,
     pub reconcile_requests_per_window: usize,
@@ -173,6 +174,7 @@ impl Default for RuntimeConfig {
             ambiguous_submit_grace_ms: 5_000,
             order_state_convergence_timeout_ms: 5_000,
             fill_state_convergence_timeout_ms: 2_000,
+            max_fill_reconciliation_pages: 20,
             submit_requests_per_window: 50,
             cancel_requests_per_window: 50,
             reconcile_requests_per_window: 20,
@@ -832,6 +834,10 @@ fn validate_positive_runtime(runtime: &RuntimeConfig, errors: &mut Vec<String>) 
             runtime.fill_state_convergence_timeout_ms,
         ),
         (
+            "max_fill_reconciliation_pages",
+            runtime.max_fill_reconciliation_pages as u64,
+        ),
+        (
             "submit_requests_per_window",
             runtime.submit_requests_per_window as u64,
         ),
@@ -853,6 +859,9 @@ fn validate_positive_runtime(runtime: &RuntimeConfig, errors: &mut Vec<String>) 
         errors.push(
             "runtime.rest_request_timeout_ms must be at least rest_connect_timeout_ms".to_string(),
         );
+    }
+    if runtime.max_fill_reconciliation_pages > 1_000 {
+        errors.push("runtime.max_fill_reconciliation_pages must not exceed 1000".to_string());
     }
     if runtime.order_request_expiry_ms > runtime.rest_request_timeout_ms {
         errors.push(
@@ -1324,6 +1333,23 @@ mod tests {
             error.contains(
                 "runtime.fill_state_convergence_timeout_ms must not exceed risk.max_private_age_ms",
             )
+        }));
+    }
+
+    #[test]
+    fn fill_reconciliation_page_limit_is_bounded() {
+        let mut config = valid_config();
+        config.runtime.max_fill_reconciliation_pages = 0;
+        let report = config.validate();
+        assert!(report.errors.iter().any(|error| {
+            error.contains("runtime.max_fill_reconciliation_pages must be positive")
+        }));
+
+        let mut config = valid_config();
+        config.runtime.max_fill_reconciliation_pages = 1_001;
+        let report = config.validate();
+        assert!(report.errors.iter().any(|error| {
+            error.contains("runtime.max_fill_reconciliation_pages must not exceed 1000")
         }));
     }
 }

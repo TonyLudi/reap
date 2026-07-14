@@ -1,10 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use async_trait::async_trait;
 use chrono::{SecondsFormat, Utc};
 use reap_core::{
-    AccountUpdate, Balance, FillFee, FillLiquidity, MarginSnapshot, Position, PositionMarginMode,
-    SelfTradePrevention, Side, TimeInForce,
+    AccountUpdate, Balance, FillFee, FillKey, FillLiquidity, MarginSnapshot, Position,
+    PositionMarginMode, SelfTradePrevention, Side, TimeInForce,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,27 @@ const ACCOUNT_INSTRUMENTS_PATH: &str = "/api/v5/account/instruments";
 const ACCOUNT_CONFIG_PATH: &str = "/api/v5/account/config";
 const ACCOUNT_BALANCE_PATH: &str = "/api/v5/account/balance";
 const ACCOUNT_POSITIONS_PATH: &str = "/api/v5/account/positions";
+pub const OKX_FILLS_PAGE_LIMIT: usize = 100;
+
+/// Parses an unmodified OKX trade-fills or fills-history response.
+///
+/// Both endpoints use the same response row shape. Keeping this parser beside
+/// the signed client prevents offline evidence tooling from drifting from live
+/// reconciliation semantics.
+pub fn parse_okx_fills_response_json(body: &[u8]) -> Result<Vec<RemoteFill>, RestError> {
+    let response: OkxResponse<OkxFillWire> = serde_json::from_slice(body)?;
+    if response.code != "0" {
+        return Err(RestError::Api {
+            code: response.code,
+            message: response.message,
+        });
+    }
+    response
+        .data
+        .into_iter()
+        .map(RemoteFill::try_from)
+        .collect()
+}
 
 #[derive(Debug, Error)]
 pub enum RestError {
@@ -46,6 +67,18 @@ pub enum RestError {
         value: String,
         message: String,
     },
+    #[error(
+        "OKX fill pagination reached the configured limit after {pages} pages and {records} records; next after={next_after}"
+    )]
+    FillPaginationLimit {
+        pages: usize,
+        records: usize,
+        next_after: String,
+    },
+    #[error("OKX fill pagination repeated cursor {cursor}")]
+    FillPaginationCursor { cursor: String },
+    #[error("OKX fill pagination repeated fill {symbol}/{fill_id}")]
+    FillPaginationDuplicate { symbol: String, fill_id: String },
 }
 
 impl RestError {
@@ -270,6 +303,82 @@ pub struct OkxCancelOrderResult {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct OkxFillPage {
+    pub fills: Vec<RemoteFill>,
+    pub next_after: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct OkxFillPagination {
+    max_pages: usize,
+    pages: usize,
+    fills: Vec<RemoteFill>,
+    after: Option<String>,
+    seen_cursors: HashSet<String>,
+    seen_fills: HashSet<FillKey>,
+}
+
+impl OkxFillPagination {
+    pub fn new(max_pages: usize) -> Result<Self, RestError> {
+        if max_pages == 0 {
+            return Err(RestError::InvalidField {
+                field: "max_pages",
+                value: max_pages.to_string(),
+                message: "must be positive".to_string(),
+            });
+        }
+        Ok(Self {
+            max_pages,
+            pages: 0,
+            fills: Vec::new(),
+            after: None,
+            seen_cursors: HashSet::new(),
+            seen_fills: HashSet::new(),
+        })
+    }
+
+    pub fn after(&self) -> Option<&str> {
+        self.after.as_deref()
+    }
+
+    pub fn accept(&mut self, page: OkxFillPage) -> Result<bool, RestError> {
+        self.pages += 1;
+        for fill in page.fills {
+            if !fill.fill_id.is_empty()
+                && !self
+                    .seen_fills
+                    .insert(FillKey::new(&fill.symbol, &fill.fill_id))
+            {
+                return Err(RestError::FillPaginationDuplicate {
+                    symbol: fill.symbol,
+                    fill_id: fill.fill_id,
+                });
+            }
+            self.fills.push(fill);
+        }
+        let Some(next_after) = page.next_after else {
+            return Ok(true);
+        };
+        if !self.seen_cursors.insert(next_after.clone()) {
+            return Err(RestError::FillPaginationCursor { cursor: next_after });
+        }
+        if self.pages == self.max_pages {
+            return Err(RestError::FillPaginationLimit {
+                pages: self.pages,
+                records: self.fills.len(),
+                next_after,
+            });
+        }
+        self.after = Some(next_after);
+        Ok(false)
+    }
+
+    pub fn into_fills(self) -> Vec<RemoteFill> {
+        self.fills
+    }
+}
+
 impl OkxCancelOrderResult {
     pub fn accepted(&self) -> bool {
         self.code.is_empty() || self.code == "0"
@@ -490,19 +599,91 @@ where
         instrument_type: Option<&str>,
         symbol: Option<&str>,
     ) -> Result<Vec<RemoteFill>, RestError> {
+        Ok(self
+            .fills_page_at(timestamp, instrument_type, symbol, None)
+            .await?
+            .fills)
+    }
+
+    pub async fn fills_page(
+        &self,
+        instrument_type: Option<&str>,
+        symbol: Option<&str>,
+        after: Option<&str>,
+    ) -> Result<OkxFillPage, RestError> {
+        self.fills_page_at(&timestamp_now(), instrument_type, symbol, after)
+            .await
+    }
+
+    pub async fn fills_page_at(
+        &self,
+        timestamp: &str,
+        instrument_type: Option<&str>,
+        symbol: Option<&str>,
+        after: Option<&str>,
+    ) -> Result<OkxFillPage, RestError> {
         let path = query_path(
             FILLS_PATH,
-            [("instType", instrument_type), ("instId", symbol)],
+            [
+                ("instType", instrument_type),
+                ("instId", symbol),
+                ("after", after),
+                ("limit", Some("100")),
+            ],
         );
         let request = self
             .signer
             .sign_request(timestamp, HttpMethod::Get, path, "")?;
         let response: OkxResponse<OkxFillWire> = self.execute(request).await?;
-        response
+        if response.data.len() > OKX_FILLS_PAGE_LIMIT {
+            return Err(RestError::InvalidField {
+                field: "data",
+                value: response.data.len().to_string(),
+                message: format!("fill page exceeded the requested limit {OKX_FILLS_PAGE_LIMIT}"),
+            });
+        }
+        let next_after = if response.data.len() == OKX_FILLS_PAGE_LIMIT {
+            let bill_id = response
+                .data
+                .last()
+                .map(|fill| fill.bill_id.trim())
+                .filter(|bill_id| !bill_id.is_empty())
+                .ok_or_else(|| RestError::InvalidField {
+                    field: "billId",
+                    value: String::new(),
+                    message: "a full fill page requires a pagination cursor".to_string(),
+                })?;
+            Some(bill_id.to_string())
+        } else {
+            None
+        };
+        let fills = response
             .data
             .into_iter()
             .map(RemoteFill::try_from)
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(OkxFillPage { fills, next_after })
+    }
+
+    /// Retrieves complete recent-fill pages up to a fail-closed bound.
+    ///
+    /// This transport helper does not pace requests. Live callers use the
+    /// account gateway, which reserves one reconciliation request per page.
+    pub async fn fills_paginated(
+        &self,
+        instrument_type: Option<&str>,
+        symbol: Option<&str>,
+        max_pages: usize,
+    ) -> Result<Vec<RemoteFill>, RestError> {
+        let mut pagination = OkxFillPagination::new(max_pages)?;
+        loop {
+            let page = self
+                .fills_page(instrument_type, symbol, pagination.after())
+                .await?;
+            if pagination.accept(page)? {
+                return Ok(pagination.into_fills());
+            }
+        }
     }
 
     pub async fn order_details(
@@ -1201,6 +1382,8 @@ impl TryFrom<OkxOrderWire> for RemoteOrder {
 
 #[derive(Debug, Deserialize)]
 struct OkxFillWire {
+    #[serde(default, rename = "billId")]
+    bill_id: String,
     #[serde(default, rename = "tradeId")]
     fill_id: String,
     #[serde(default, rename = "ordId")]
@@ -1228,19 +1411,46 @@ impl TryFrom<OkxFillWire> for RemoteFill {
     type Error = RestError;
 
     fn try_from(value: OkxFillWire) -> Result<Self, Self::Error> {
+        validate_required_text("tradeId", &value.fill_id)?;
+        validate_required_text("ordId", &value.order_id)?;
+        validate_required_text("instId", &value.symbol)?;
         let client_order_id = if value.client_order_id == "0" {
             String::new()
         } else {
             value.client_order_id
         };
+        let price = parse_number("fillPx", &value.price)?;
+        if price <= 0.0 {
+            return Err(RestError::InvalidField {
+                field: "fillPx",
+                value: value.price,
+                message: "must be positive".to_string(),
+            });
+        }
+        let qty = parse_number("fillSz", &value.qty)?;
+        if qty <= 0.0 {
+            return Err(RestError::InvalidField {
+                field: "fillSz",
+                value: value.qty,
+                message: "must be positive".to_string(),
+            });
+        }
+        let ts_ms = parse_integer("fillTime", &value.fill_time)?;
+        if ts_ms == 0 {
+            return Err(RestError::InvalidField {
+                field: "fillTime",
+                value: value.fill_time,
+                message: "must be positive".to_string(),
+            });
+        }
         Ok(Self {
             fill_id: value.fill_id,
             exchange_order_id: value.order_id,
             client_order_id,
             symbol: value.symbol,
             side: parse_side(&value.side)?,
-            price: parse_number("fillPx", &value.price)?,
-            qty: parse_number("fillSz", &value.qty)?,
+            price,
+            qty,
             liquidity: match value.execution_type.as_str() {
                 "M" => FillLiquidity::Maker,
                 "T" | "" => FillLiquidity::Taker,
@@ -1253,9 +1463,20 @@ impl TryFrom<OkxFillWire> for RemoteFill {
                 }
             },
             fee: parse_fill_fee(&value.fee, &value.fee_currency)?,
-            ts_ms: parse_integer("fillTime", &value.fill_time)?,
+            ts_ms,
         })
     }
+}
+
+fn validate_required_text(field: &'static str, value: &str) -> Result<(), RestError> {
+    if value.is_empty() || value.trim() != value {
+        return Err(RestError::InvalidField {
+            field,
+            value: value.to_string(),
+            message: "must be non-empty and contain no surrounding whitespace".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn parse_side(value: &str) -> Result<Side, RestError> {
@@ -1481,15 +1702,88 @@ mod tests {
     fn client(
         responses: Vec<&str>,
     ) -> (OkxRestClient<MockTransport>, Arc<Mutex<Vec<SignedRequest>>>) {
+        client_owned(responses.into_iter().map(str::to_string).collect())
+    }
+
+    fn client_owned(
+        responses: Vec<String>,
+    ) -> (OkxRestClient<MockTransport>, Arc<Mutex<Vec<SignedRequest>>>) {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let transport = MockTransport {
-            responses: Arc::new(Mutex::new(
-                responses.into_iter().map(str::to_string).collect(),
-            )),
+            responses: Arc::new(Mutex::new(responses)),
             requests: Arc::clone(&requests),
         };
         let signer = OkxSigner::new(OkxCredentials::new("key", "secret", "pass"), false);
         (OkxRestClient::new(transport, signer), requests)
+    }
+
+    fn fill_response(first: usize, count: usize) -> String {
+        let data = (first..first + count)
+            .map(|index| {
+                serde_json::json!({
+                    "billId": format!("bill-{index}"),
+                    "tradeId": format!("fill-{index}"),
+                    "ordId": format!("order-{index}"),
+                    "clOrdId": format!("client-{index}"),
+                    "instId": "BTC-USDT",
+                    "side": "buy",
+                    "fillPx": "100",
+                    "fillSz": "0.01",
+                    "execType": "M",
+                    "fee": "-0.00001",
+                    "feeCcy": "BTC",
+                    "fillTime": "1000"
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({"code": "0", "msg": "", "data": data}).to_string()
+    }
+
+    #[test]
+    fn offline_fill_response_parser_preserves_exact_fee_fields() {
+        let response = fill_response(7, 1);
+
+        let fills = parse_okx_fills_response_json(response.as_bytes()).unwrap();
+
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].fill_id, "fill-7");
+        assert_eq!(fills[0].client_order_id, "client-7");
+        assert_eq!(
+            fills[0].fee,
+            Some(FillFee {
+                amount: -0.00001,
+                currency: "BTC".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn offline_fill_response_parser_rejects_api_errors() {
+        let error = parse_okx_fills_response_json(
+            br#"{"code":"50011","msg":"rate limit reached","data":[]}"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RestError::Api { ref code, .. } if code == "50011"
+        ));
+    }
+
+    #[test]
+    fn offline_fill_response_parser_rejects_missing_trade_identity() {
+        let error = parse_okx_fills_response_json(
+            br#"{"code":"0","msg":"","data":[{"tradeId":"","ordId":"order-1","instId":"BTC-USDT","side":"buy","fillPx":"100","fillSz":"0.01","execType":"M","fee":"-0.001","feeCcy":"BTC","fillTime":"1000"}]}"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RestError::InvalidField {
+                field: "tradeId",
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -1708,8 +2002,48 @@ mod tests {
         );
         assert_eq!(
             requests[1].path,
-            "/api/v5/trade/fills?instType=SPOT&instId=BTC-USDT"
+            "/api/v5/trade/fills?instType=SPOT&instId=BTC-USDT&limit=100"
         );
+    }
+
+    #[tokio::test]
+    async fn fill_reconciliation_paginates_until_a_short_page() {
+        let (client, requests) = client_owned(vec![fill_response(100, 100), fill_response(200, 2)]);
+
+        let fills = client
+            .fills_paginated(Some("SPOT"), Some("BTC-USDT"), 3)
+            .await
+            .unwrap();
+
+        assert_eq!(fills.len(), 102);
+        assert_eq!(fills.first().unwrap().fill_id, "fill-100");
+        assert_eq!(fills.last().unwrap().fill_id, "fill-201");
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests[0].path,
+            "/api/v5/trade/fills?instType=SPOT&instId=BTC-USDT&limit=100"
+        );
+        assert_eq!(
+            requests[1].path,
+            "/api/v5/trade/fills?instType=SPOT&instId=BTC-USDT&after=bill-199&limit=100"
+        );
+    }
+
+    #[tokio::test]
+    async fn fill_reconciliation_fails_closed_at_page_bound() {
+        let (client, requests) = client_owned(vec![fill_response(100, 100)]);
+
+        let error = client.fills_paginated(None, None, 1).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            RestError::FillPaginationLimit {
+                pages: 1,
+                records: 100,
+                ref next_after,
+            } if next_after == "bill-199"
+        ));
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

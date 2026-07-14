@@ -239,6 +239,38 @@ cargo run -p reap-cli -- live \
   --pretty
 ```
 
+After the bounded demo is stopped, export every unmodified OKX
+`/api/v5/trade/fills` or `/api/v5/trade/fills-history` response page for the
+account and time window, then reconcile the canonical journal's fills and exact
+signed fees offline:
+
+```bash
+FILL_REPORT="/tmp/reap-fill-reconciliation-$(date -u +%Y%m%dT%H%M%SZ).json"
+cargo run -p reap-cli -- reconcile-fills \
+  --journal var/reap/live-events.jsonl \
+  --statement /secure/evidence/okx-fills-page-01.json \
+  --statement /secure/evidence/okx-fills-page-02.json \
+  --account main \
+  --begin-ms 1783987200000 \
+  --end-ms 1783990800000 \
+  --minimum-fills 10 \
+  --confirm-statement-account-and-window-complete \
+  --output "$FILL_REPORT" \
+  --require-pass \
+  --pretty
+```
+
+The command opens no exchange connection. It requires the live process to be
+stopped, takes the same exclusive journal lease, hashes the exact bytes it
+parses, records the reconciliation executable hash and journal bootstrap
+strategy/config identity, compares strict `(symbol, tradeId)` identities, and
+refuses duplicate, missing, malformed, fee-less, or field-mismatched fills. A
+missing or invalid bootstrap identity for the selected account also fails the
+report. The OKX response body does not echo its account or request parameters,
+so the confirmation flag is an explicit operator attestation. This report
+covers fills and fees only; it is not balance, position, funding, equity,
+liability, tax, or currency-conversion reconciliation.
+
 Each create-new live report contains the exact checkpoint and full evidence
 config fingerprints, Reap executable hash, pinned Java revision, pseudonymous
 host/account identity, session/readiness/host evidence, and bounded

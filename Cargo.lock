@@ -1128,6 +1128,7 @@ dependencies = [
  "reap-core",
  "reap-venue",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
 ]

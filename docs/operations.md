@@ -201,16 +201,68 @@ This depeg-sensitive research extension does not change the Java-parity strategy
 decision model. Private order/fill and REST records now retain exact signed fee
 amounts and fee currency; public-data simulated fills still use the configured
 maker/taker fee tier and reports distinguish exact from estimated fee fills. The
-model does not yet import or reconcile exchange statements, and it does not
-model borrowing interest, liquidation, margin discounts, or taxes. Live spot is
-cash-only; certify zero target-account liabilities, and do not enable margin
-spot without adding and validating a borrow-interest model. A research
+offline `reconcile-fills` command now compares canonical fills and exact fees
+with raw OKX responses, but it does not reconcile balances, funding, equity,
+liabilities, borrowing interest, liquidation, margin discounts, or taxes. Live
+spot is cash-only; certify zero target-account liabilities, and do not enable
+margin spot without adding and validating a borrow-interest model. A research
 acceptance run must span held funding boundaries, use the target fee tier, and
 reconcile fill, fee, funding, cash, equity, currency conversion, and active-order
 notional attribution to demo account statements before profitability metrics
 are trusted.
 Use `--require-complete-accounting` in automated research runs so any reported
 accounting defect also makes the command fail.
+
+### Fill And Fee Statement Reconciliation
+
+Stop the live process first. Export every unmodified response page needed to
+cover the selected account and inclusive millisecond window from the OKX trade
+fills endpoints documented in the [OKX API guide](https://www.okx.com/docs-v5/en/).
+The current `/api/v5/trade/fills` endpoint covers recent fills; use the history
+endpoint when the requested window is older. Preserve each raw JSON response as
+a separate file, including empty terminal pages where applicable.
+
+```bash
+REPORT="var/reap/evidence/fills-$(date -u +%Y%m%dT%H%M%SZ).json"
+cargo run -p reap-cli -- reconcile-fills \
+  --journal var/reap/live-events.jsonl \
+  --statement /secure/evidence/okx-fills-page-01.json \
+  --statement /secure/evidence/okx-fills-page-02.json \
+  --account main \
+  --begin-ms 1783987200000 \
+  --end-ms 1783990800000 \
+  --minimum-fills 10 \
+  --confirm-statement-account-and-window-complete \
+  --output "$REPORT" \
+  --require-pass \
+  --pretty
+```
+
+The command is offline and reads no credentials. It refuses an active journal
+writer through the canonical storage lease, rejects symlinked/duplicate inputs,
+limits file/page sizes, parses each page with the live OKX fill parser, and
+hashes the exact bytes parsed. The schema-1 report also records the
+reconciliation executable SHA-256 and the selected account's journal bootstrap
+strategy/config fingerprint. It compares order id, side, price, quantity,
+liquidity when journaled, signed fee amount, and normalized fee currency by
+strict `(symbol, tradeId)`. It fails on malformed or duplicate records, either
+missing side, absent exact fees, a missing or invalid account bootstrap
+identity, a truncated journal tail, or fewer than `--minimum-fills`
+comparisons. Tolerances default to zero and should remain zero unless a
+documented serialization boundary requires otherwise.
+
+OKX response bodies do not identify the authenticated account or echo the
+request window/cursor. `--confirm-statement-account-and-window-complete` is
+therefore an operator attestation that every supplied page belongs to the named
+account and completely covers the window; without it the artifact cannot pass.
+The output is create-new, mode `0600` on Unix, and fsynced before
+`--require-pass` is enforced. A failure before report serialization can leave an
+empty reserved output, which is not evidence.
+
+This artifact closes only the fill/fee comparison. Archive it with the raw
+pages, live report, journal hash, and account export. Funding, balances,
+positions, cash/equity, liabilities, borrowing, taxes, conversion, and PnL must
+still be reconciled separately before trusting production economics.
 
 ### Walk-Forward And Sensitivity Research
 
@@ -458,8 +510,13 @@ settings; accepting only their static flags would weaken live stop behavior.
 
 - Startup, private-stream recovery, ambiguous gateway outcomes, and shutdown
   fetch open orders, recent fills, account balances, and all positions under
-  the reconciliation request pacer. An empty balance response is rejected as
-  non-authoritative; an empty position list is a valid flat account.
+  the reconciliation request pacer. Fill pages request the OKX maximum of 100
+  rows and continue by `billId` until a short page proves completion. A repeated
+  cursor/fill or a full page at `runtime.max_fill_reconciliation_pages` fails
+  closed instead of accepting a partial snapshot. A fee-less optional
+  fills-channel event does not consume the canonical journal key before the
+  fee-bearing orders-channel event arrives. An empty balance response is
+  rejected as non-authoritative; an empty position list is a valid flat account.
 - The runtime compares the websocket-derived state before applying REST. Any
   order, fill, balance-field, position-quantity, or open-position average-price
   difference emits account-scoped reconciliation drift and cancels live orders.
@@ -1067,7 +1124,10 @@ uses the pre-shutdown `readiness_at_stop` snapshot.
 
 A `clean_soak` result is evidence for this bounded runtime window only. Review
 the JSONL log, account balances, positions, fills, and checkpoint restart before
-checking off the sustained demo gate.
+checking off the sustained demo gate. After a demo fill window, run the offline
+fill/fee statement reconciliation above; `clean_soak` does not perform that
+economic comparison and does not prove optional host/alert controls were
+deployed when they are disabled.
 
 ## Live Latency Evidence
 
