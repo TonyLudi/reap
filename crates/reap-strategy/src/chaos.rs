@@ -2616,6 +2616,7 @@ impl ChaosStrategy {
                 symbol,
                 rate,
                 funding_time_ms,
+                ..
             } => {
                 self.now_ms = *ts_ms;
                 if let Some(entity) = self.entities.get_mut(symbol)

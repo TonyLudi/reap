@@ -61,8 +61,9 @@ Implemented:
   plus hardened systemd templates with mode-specific restart policy.
 - Deterministic backtest matching with `PendingNew`, delayed entry/cancel/update
   boundaries, `PostOnly`, `IOC`, conservative displayed-depth fills, trade
-  fills, queue-ahead tracking, fee/turnover attribution, scheduled linear and
-  inverse funding, receive-time raw replay, and mark-to-market accounting.
+  fills, queue-ahead tracking, fee/turnover attribution, realized linear and
+  inverse funding at exchange timestamps, receive-time raw replay, and
+  mark-to-market accounting.
 - CSV/normalized replay, raw-capture validation, configuration validation, and
   a release-mode hot-path benchmark.
 - Credential-free public OKX capture with redundant websocket plans, raw-frame
@@ -107,6 +108,12 @@ cargo run -p reap-cli -- capture \
   --require-clean-capture \
   --pretty
 ```
+
+The one-hour command is an operational smoke, not funding-complete research
+evidence. Production datasets must be continuous across exchange funding
+boundaries. Schema-4 production research with swap candidates requires nonzero
+realized funding settlements in both training and test aggregates, so short
+captures cannot pass by carrying only forecasts.
 
 Validate and backtest the raw capture directly. Raw replay runs the same OKX
 adapter, redundant-feed deduplicator, sequence tracker, and book reducer used
@@ -182,7 +189,9 @@ verified again after all runs. Production raw datasets must pass the embedded
 schema-3 run-report verifier, capture-config-bound source analysis, and an
 independent zero-gap replay-integrity check before any candidate executes. The
 smoke fixture intentionally uses permissive uncalibrated gates and is not
-trading evidence. Production-candidate manifests use schema 3, require a passed
+trading evidence. Production-candidate manifests use schema 4, require nonzero
+training/test realized-funding-settlement gates when any candidate trades a
+swap, require a passed
 `latency_calibration` artifact, and require the baseline's empirical latency
 profile to match that artifact exactly.
 

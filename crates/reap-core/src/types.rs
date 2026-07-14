@@ -521,6 +521,8 @@ pub enum MarketEvent {
         symbol: Symbol,
         rate: f64,
         funding_time_ms: TimeMs,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        settlement: Option<FundingSettlement>,
     },
     BurstSignal {
         ts_ms: TimeMs,
@@ -534,6 +536,12 @@ pub enum MarketEvent {
         limit_down: Price,
         limit_up: Price,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FundingSettlement {
+    pub funding_time_ms: TimeMs,
+    pub rate: f64,
 }
 
 impl MarketEvent {
@@ -749,7 +757,7 @@ pub fn round_down_to_lot(qty: Quantity, lot_size: f64) -> Quantity {
 
 #[cfg(test)]
 mod tests {
-    use super::{Balance, Channel, FillKey, OrderUpdate, Position};
+    use super::{Balance, Channel, FillKey, MarketEvent, NormalizedEvent, OrderUpdate, Position};
 
     #[test]
     fn okx_depth_variants_are_book_channels() {
@@ -800,6 +808,27 @@ mod tests {
             !serde_json::to_string(&update)
                 .unwrap()
                 .contains("time_in_force")
+        );
+    }
+
+    #[test]
+    fn funding_settlement_is_backward_compatible_with_existing_jsonl() {
+        let event: NormalizedEvent = serde_json::from_str(
+            r#"{"Market":{"FundingRate":{"ts_ms":1,"symbol":"BTC-USDT-SWAP","rate":0.0001,"funding_time_ms":2}}}"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            &event,
+            NormalizedEvent::Market(MarketEvent::FundingRate {
+                settlement: None,
+                ..
+            })
+        ));
+        assert!(
+            !serde_json::to_string(&event)
+                .unwrap()
+                .contains("settlement")
         );
     }
 

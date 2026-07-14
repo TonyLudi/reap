@@ -40,7 +40,7 @@ control plane.
 | Pending IOC depth exclusion | `active_hedges` and pending-level filtering | Exact |
 | Exclude own resting quotes from hedgeable depth | `active_quotes` subtraction in `hedge_levels` | Exact |
 | Fixed and step inventory skew | `CoinConfig` and derivative skew integration | Exact |
-| Exchange funding and funding overwrite precedence | `FundingRate` events and `funding_override` | Exact |
+| Exchange funding forecast and funding overwrite precedence | `FundingRate.rate` and `funding_override` | Exact; OKX `fundingRate` remains the Java-parity strategy input |
 | Earliest active funding window | `update_funding_window` | Exact |
 | Ignore-best, quote-only, burst, price limit, and UTC halt behavior | Normalized market events and instrument state | Exact |
 | Multi-level top/trailing quote targets and Java `Random(1)` sequence | `desired_quote_levels` and `JavaRandom` | Equivalent; optimizer churn differs |
@@ -68,7 +68,7 @@ control plane.
 | Local order registration precedes exchange acknowledgement | Synchronous canonical `PendingNew` in live and backtest; pending quotes/hedges count as working state | Equivalent |
 | Quote fill becomes an account/position update before hedging | Synthetic update in backtest; private account/position push in live | Equivalent |
 | Maker/taker transaction cost | Per-instrument fill fee with explicit fee-cost and turnover attribution | Equivalent; fee-tier calibration remains operational |
-| `PortfolioExchAcctCalculator.settleSwapFundingAt` linear/inverse formulas | Scheduled funding settlement using latest rate and exchange mark/depth fallback | Exact signed formulas; Rust schedules the advertised exchange timestamp instead of Java's configured time-of-day list |
+| `PortfolioExchAcctCalculator.settleSwapFundingAt` linear/inverse formulas | Scheduled funding settlement using realized `settFundingRate`/`prevFundingTime` and exchange mark/depth fallback | Exact signed formulas with stronger accounting semantics; Rust does not book Java's forecast `curFunding` as realized cash |
 
 The borrow decision row is cross-checked specifically against pinned Java
 `ChaosEntity.isWithinBorrowLimit`, `OkEntity.getAvailCoinQty`, and
@@ -130,7 +130,7 @@ SHA-256, pinned Java revision, pseudonymous machine/account identities, unique
 session, synchronized host snapshots, and deterministic bounded sample
 reservoirs. `calibrate-latency` rejects failed operations or malformed/missing
 series, rounds delays upward into backtest milliseconds, and creates an
-integrity-checked artifact. A schema-3 production research manifest must point
+integrity-checked artifact. A schema-4 production research manifest must point
 to that artifact, run the byte-identical Reap executable, and use its exact
 baseline profile. The machinery is complete; no credentialed target-host
 artifact has passed yet.

@@ -609,21 +609,29 @@ They may repeat an exact route set but cannot replace it, so latency/capacity
 stress never changes the valuation source or freshness policy selected for that
 candidate.
 
-Funding-rate events update the latest rate for `(symbol, funding_time_ms)` and
-schedule one settlement at the exchange funding time. Linear swap funding cost
-is `position * contract_value * rate * mark`; inverse cost is
-`position * contract_value * rate / mark` in coin. Positive signed cost is paid,
-so report `funding_pnl_usd` is its negation. Explicit exchange mark events take
-precedence over depth midpoint fallback. Duplicate forecasts update the rate
-without scheduling duplicate settlements.
+Funding-rate events retain two distinct values: OKX `fundingRate` is the
+forecast delivered to the shared strategy, while an optional
+`settFundingRate` plus observed `prevFundingTime` is a realized accounting
+observation. Before chronological execution, raw replay makes a read-only pass
+that builds the realized `(symbol, funding_time_ms)` map. Forecast events still
+schedule one action at the advertised exchange time, but the action can book
+only the realized map value. The map is private to the portfolio scheduler and
+cannot affect strategy decisions before the settlement observation arrives on
+the event stream. Conflicting realized values for one key reject the run.
+
+Linear swap funding cost is `position * contract_value * rate * mark`; inverse
+cost is `position * contract_value * rate / mark` in coin. Positive signed cost
+is paid, so report `funding_pnl_usd` is its negation. Explicit exchange mark
+events take precedence over depth midpoint fallback. Duplicate forecasts do not
+schedule duplicate settlements.
 
 A first forecast up to 60 seconds late is settled immediately and reported as
 late, matching the Java tolerance window. Older first forecasts are not applied
 to a potentially different position and instead increment
-`missed_funding_settlements`. Invalid rates, missing marks for nonzero positions,
-and other settlement failures make `accounting_complete=false`. A funding time
-beyond the dataset remains a categorized pending action and is not a failure for
-the observed horizon.
+`missed_funding_settlements`. A due forecast with no realized rate, invalid
+rates, missing marks for nonzero positions, and other settlement failures make
+`accounting_complete=false`. A funding time beyond the dataset remains a
+categorized pending action and is not a failure for the observed horizon.
 
 The pinned Java portfolio already separates spot base and quote accounts and
 settles derivative funding in the instrument settlement account, but its
@@ -680,7 +688,9 @@ acceptance explicit in a versioned TOML manifest:
 - Gates cover data/fill duration, accounting and valuation completeness,
   pending actions/order transitions, clock regressions, net PnL, drawdown,
   position and pending-hedge delta, gross position and active-order exposure,
-  and inventory-open duration.
+  and inventory-open duration. When any candidate trades a swap, every
+  training and test fold aggregate must also meet a nonzero realized funding
+  settlement gate.
 
 Each Rust dataset currently starts from a zero portfolio and independent
 strategy instance, which is emitted as
@@ -689,7 +699,7 @@ daily position carry. Use one continuous capture as an evaluation dataset when
 inventory continuity matters, and constrain terminal delta/gross exposure in
 the manifest. Cross-file position carry must not be inferred from aggregate
 PnL. A `production_candidate` manifest additionally requires at least three
-folds, two stress scenarios, nonzero event/fill/duration gates, calibrated
+folds, two stress scenarios, nonzero event, fill, and duration gates, calibrated
 baseline execution whose latency profile exactly matches a passed source-bound
 calibration artifact, complete accounting, and explicit bounds on non-funding
 work censored by each data horizon. Stress scenarios may use explicitly

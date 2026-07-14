@@ -1,7 +1,7 @@
 use reap_core::{
-    AccountUpdate, Balance, BookAction, Channel, EventId, EventKey, FillFee, FillLiquidity, Level,
-    MarginSnapshot, MarketEvent, NormalizedEvent, Position, PositionMarginMode, RawEnvelope,
-    SequencedBookUpdate, Side, Subscription, Venue,
+    AccountUpdate, Balance, BookAction, Channel, EventId, EventKey, FillFee, FillLiquidity,
+    FundingSettlement, Level, MarginSnapshot, MarketEvent, NormalizedEvent, Position,
+    PositionMarginMode, RawEnvelope, SequencedBookUpdate, Side, Subscription, Venue,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -163,6 +163,7 @@ impl OkxAdapter {
             .map(|value| {
                 let data: OkxFundingRate = serde_json::from_value(value)
                     .map_err(|error| Self::invalid(error.to_string()))?;
+                let settlement = data.settlement()?;
                 let symbol = if data.inst_id.is_empty() {
                     arg_symbol.clone()
                 } else {
@@ -179,6 +180,7 @@ impl OkxAdapter {
                         symbol,
                         rate: parse_f64("fundingRate", &data.funding_rate)?,
                         funding_time_ms: parse_u64("fundingTime", &data.funding_time)?,
+                        settlement,
                     },
                 ))
             })
@@ -653,7 +655,40 @@ struct OkxFundingRate {
     funding_rate: String,
     #[serde(rename = "fundingTime")]
     funding_time: String,
+    #[serde(default, rename = "prevFundingTime")]
+    previous_funding_time: String,
+    #[serde(default, rename = "settFundingRate")]
+    settled_funding_rate: String,
+    #[serde(default, rename = "settState")]
+    settlement_state: String,
     ts: String,
+}
+
+impl OkxFundingRate {
+    fn settlement(&self) -> Result<Option<FundingSettlement>, VenueError> {
+        match self.settlement_state.as_str() {
+            "" | "processing" => Ok(None),
+            "settled" => {
+                if self.previous_funding_time.is_empty() || self.settled_funding_rate.is_empty() {
+                    return Ok(None);
+                }
+                let funding_time_ms = parse_u64("prevFundingTime", &self.previous_funding_time)?;
+                let upcoming_funding_time_ms = parse_u64("fundingTime", &self.funding_time)?;
+                if funding_time_ms == 0 || funding_time_ms >= upcoming_funding_time_ms {
+                    return Err(OkxAdapter::invalid(format!(
+                        "prevFundingTime {funding_time_ms} must precede fundingTime {upcoming_funding_time_ms}"
+                    )));
+                }
+                Ok(Some(FundingSettlement {
+                    funding_time_ms,
+                    rate: parse_f64("settFundingRate", &self.settled_funding_rate)?,
+                }))
+            }
+            state => Err(OkxAdapter::invalid(format!(
+                "unknown funding settlement state {state:?}"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1053,7 +1088,7 @@ mod tests {
     #[test]
     fn parses_strategy_pricing_channels() {
         let adapter = OkxAdapter::default();
-        let funding = r#"{"arg":{"channel":"funding-rate","instId":"BTC-USDT-SWAP"},"data":[{"instId":"BTC-USDT-SWAP","fundingRate":"0.0001","fundingTime":"2000","ts":"1000"}]}"#;
+        let funding = r#"{"arg":{"channel":"funding-rate","instId":"BTC-USDT-SWAP"},"data":[{"instId":"BTC-USDT-SWAP","fundingRate":"0.0001","fundingTime":"2000","prevFundingTime":"1000","settFundingRate":"0.00008","settState":"settled","ts":"1001"}]}"#;
         let index = r#"{"arg":{"channel":"index-tickers","instId":"BTC-USDT"},"data":[{"instId":"BTC-USDT","idxPx":"50000","ts":"1001"}]}"#;
         let limits = r#"{"arg":{"channel":"price-limit","instId":"BTC-USDT-SWAP"},"data":[{"instId":"BTC-USDT-SWAP","buyLmt":"55000","sellLmt":"45000","ts":"1002"}]}"#;
         let mark = r#"{"arg":{"channel":"mark-price","instId":"BTC-USDT-SWAP"},"data":[{"instId":"BTC-USDT-SWAP","markPx":"50010","ts":"1003"}]}"#;
@@ -1085,6 +1120,10 @@ mod tests {
             VenueEvent::Normalized(NormalizedEvent::Market(MarketEvent::FundingRate {
                 rate,
                 funding_time_ms: 2000,
+                settlement: Some(FundingSettlement {
+                    funding_time_ms: 1000,
+                    rate: 0.00008,
+                }),
                 ..
             })) if rate == 0.0001
         ));
@@ -1127,6 +1166,30 @@ mod tests {
                 ))
                 .is_err()
         );
+
+        let invalid_previous_time = r#"{"arg":{"channel":"funding-rate","instId":"BTC-USDT-SWAP"},"data":[{"instId":"BTC-USDT-SWAP","fundingRate":"0.0001","fundingTime":"2000","prevFundingTime":"2000","settFundingRate":"0.00008","settState":"settled","ts":"1001"}]}"#;
+        let error = adapter
+            .parse(&envelope(
+                Channel::Custom("funding-rate".to_string()),
+                invalid_previous_time,
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("must precede fundingTime"));
+
+        let processing = r#"{"arg":{"channel":"funding-rate","instId":"BTC-USDT-SWAP"},"data":[{"instId":"BTC-USDT-SWAP","fundingRate":"0.0001","fundingTime":"2000","prevFundingTime":"1000","settFundingRate":"0.00008","settState":"processing","ts":"1001"}]}"#;
+        let processing_events = adapter
+            .parse(&envelope(
+                Channel::Custom("funding-rate".to_string()),
+                processing,
+            ))
+            .unwrap();
+        assert!(matches!(
+            processing_events[0].event,
+            VenueEvent::Normalized(NormalizedEvent::Market(MarketEvent::FundingRate {
+                settlement: None,
+                ..
+            }))
+        ));
     }
 
     #[test]

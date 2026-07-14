@@ -38,6 +38,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::portfolio::{Portfolio, required_accounting_currencies};
+#[cfg(test)]
+use reap_core::FundingSettlement;
 use reap_core::{
     AccountUpdate, FillLiquidity, MarketEvent, NormalizedEvent, OrderEvent, OrderIntent,
     OrderUpdate, Position, StrategyEvent, Symbol,
@@ -140,6 +142,8 @@ pub struct BacktestReport {
     pub risk_metric_samples: u64,
     pub invalid_risk_metric_samples: u64,
     pub funding_rate_events: u64,
+    #[serde(default)]
+    pub funding_settlement_observations: u64,
     pub funding_settlements: u64,
     pub late_funding_rate_events: u64,
     pub invalid_funding_rate_events: u64,
@@ -189,7 +193,7 @@ pub struct BacktestRunner {
     exchange_marks: HashMap<Symbol, f64>,
     currency_by_index_symbol: HashMap<Symbol, String>,
     currency_rate_observations: HashMap<String, CurrencyRateObservation>,
-    funding_rates: HashMap<(Symbol, u64), f64>,
+    realized_funding_rates: HashMap<(Symbol, u64), f64>,
     scheduled_funding: HashSet<(Symbol, u64)>,
     settled_funding: HashSet<(Symbol, u64)>,
     now_ns: u64,
@@ -286,7 +290,7 @@ impl BacktestRunner {
             exchange_marks: HashMap::new(),
             currency_by_index_symbol,
             currency_rate_observations: HashMap::new(),
-            funding_rates: HashMap::new(),
+            realized_funding_rates: HashMap::new(),
             scheduled_funding: HashSet::new(),
             settled_funding: HashSet::new(),
             now_ns: 0,
@@ -353,16 +357,16 @@ impl BacktestRunner {
     }
 
     pub fn run_raw_capture_path(mut self, path: impl AsRef<Path>) -> Result<BacktestReport> {
+        let path = path.as_ref();
         self.time_basis = BacktestTimeBasis::CaptureReceiveTimestampNs;
-        replay_raw_capture_timed_path(path.as_ref(), |timed| {
+        replay_raw_capture_timed_path(path, |timed| self.preload_funding_settlement(&timed.event))
+            .with_context(|| {
+                format!("failed to preload realized funding from {}", path.display())
+            })?;
+        replay_raw_capture_timed_path(path, |timed| {
             self.process_replay_event_at(timed.event, timed.recv_ts_ns)
         })
-        .with_context(|| {
-            format!(
-                "failed to replay raw capture from {}",
-                path.as_ref().display()
-            )
-        })?;
+        .with_context(|| format!("failed to replay raw capture from {}", path.display()))?;
         self.require_all_configured_books()?;
         self.finish_report()
     }
@@ -372,6 +376,10 @@ impl BacktestRunner {
         I: IntoIterator<Item = NormalizedEvent>,
     {
         self.time_basis = BacktestTimeBasis::EventTimestampMs;
+        let events = events.into_iter().collect::<Vec<_>>();
+        for event in &events {
+            self.preload_funding_settlement(event)?;
+        }
         for event in events {
             let arrival_ns = event.ts_ms().saturating_mul(NS_PER_MS);
             self.process_replay_event_at(event, arrival_ns)?;
@@ -540,7 +548,6 @@ impl BacktestRunner {
         if self.settled_funding.contains(&key) {
             return;
         }
-        self.funding_rates.insert(key.clone(), rate);
         if !self.scheduled_funding.insert(key.clone()) {
             return;
         }
@@ -548,7 +555,6 @@ impl BacktestRunner {
         let funding_time_ns = funding_time_ms.saturating_mul(NS_PER_MS);
         if funding_time_ns.saturating_add(FUNDING_LATE_TOLERANCE_NS) < self.now_ns {
             self.scheduled_funding.remove(&key);
-            self.funding_rates.remove(&key);
             self.settled_funding.insert(key);
             self.missed_funding_settlements += 1;
             return;
@@ -568,13 +574,46 @@ impl BacktestRunner {
         );
     }
 
+    fn preload_funding_settlement(&mut self, event: &NormalizedEvent) -> Result<()> {
+        let NormalizedEvent::Market(MarketEvent::FundingRate {
+            symbol,
+            settlement: Some(settlement),
+            ..
+        }) = event
+        else {
+            return Ok(());
+        };
+        if settlement.funding_time_ms == 0 || !settlement.rate.is_finite() {
+            bail!(
+                "invalid realized funding settlement for {symbol} at {}: {}",
+                settlement.funding_time_ms,
+                settlement.rate
+            );
+        }
+        let key = (symbol.clone(), settlement.funding_time_ms);
+        if let Some(previous) = self.realized_funding_rates.get(&key) {
+            if *previous != settlement.rate {
+                bail!(
+                    "conflicting realized funding rates for {} at {}: {} and {}",
+                    key.0,
+                    key.1,
+                    previous,
+                    settlement.rate
+                );
+            }
+        } else {
+            self.realized_funding_rates.insert(key, settlement.rate);
+        }
+        Ok(())
+    }
+
     fn settle_funding(&mut self, symbol: Symbol, funding_time_ms: u64) {
         let key = (symbol.clone(), funding_time_ms);
         self.scheduled_funding.remove(&key);
         if !self.settled_funding.insert(key.clone()) {
             return;
         }
-        let Some(rate) = self.funding_rates.remove(&key) else {
+        let Some(rate) = self.realized_funding_rates.get(&key).copied() else {
             self.funding_settlement_failures += 1;
             return;
         };
@@ -1191,6 +1230,7 @@ impl BacktestRunner {
             risk_metric_samples: self.risk_metric_samples,
             invalid_risk_metric_samples: self.invalid_risk_metric_samples,
             funding_rate_events: self.funding_rate_events,
+            funding_settlement_observations: self.realized_funding_rates.len() as u64,
             funding_settlements: self.funding_settlements,
             late_funding_rate_events: self.late_funding_rate_events,
             invalid_funding_rate_events: self.invalid_funding_rate_events,
@@ -1927,7 +1967,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_funding_forecast_settles_signed_linear_swap_position() {
+    fn realized_funding_rate_settles_signed_linear_swap_position() {
         let mut cfg = config();
         cfg.instruments[1].kind = InstrumentKindConfig::LinearSwap;
         cfg.instruments[1].taker_fee = 0.0;
@@ -1961,26 +2001,39 @@ mod tests {
                 symbol: "BTC-PERP".to_string(),
                 rate: 0.001,
                 funding_time_ms: 10,
+                settlement: None,
             }),
             NormalizedEvent::from(MarketEvent::FundingRate {
                 ts_ms: 5,
                 symbol: "BTC-PERP".to_string(),
                 rate: 0.002,
                 funding_time_ms: 10,
+                settlement: None,
+            }),
+            NormalizedEvent::from(MarketEvent::FundingRate {
+                ts_ms: 11,
+                symbol: "BTC-PERP".to_string(),
+                rate: 0.003,
+                funding_time_ms: 20,
+                settlement: Some(FundingSettlement {
+                    funding_time_ms: 10,
+                    rate: 0.0015,
+                }),
             }),
             NormalizedEvent::Timer(TimerEvent {
-                ts_ms: 10,
+                ts_ms: 12,
                 name: "funding".to_string(),
             }),
         ];
 
         let report = runner.run(events).unwrap();
 
-        assert_eq!(report.funding_rate_events, 2);
+        assert_eq!(report.funding_rate_events, 3);
+        assert_eq!(report.funding_settlement_observations, 1);
         assert_eq!(report.funding_settlements, 1);
-        assert_eq!(report.pending_funding_actions, 0);
-        assert_eq!(report.funding_pnl_usd, -10.0);
-        assert_eq!(report.final_equity_usd, -10.0);
+        assert_eq!(report.pending_funding_actions, 1);
+        assert!((report.funding_pnl_usd + 7.5).abs() < 1e-9);
+        assert!((report.final_equity_usd + 7.5).abs() < 1e-9);
         assert!(report.accounting_complete);
     }
 
@@ -1996,6 +2049,7 @@ mod tests {
                 symbol: "BTC-PERP".to_string(),
                 rate: 0.001,
                 funding_time_ms: 100,
+                settlement: None,
             })])
             .unwrap();
 
@@ -2003,6 +2057,59 @@ mod tests {
         assert_eq!(report.pending_funding_actions, 1);
         assert_eq!(report.pending_scheduled_actions, 1);
         assert!(report.accounting_complete);
+    }
+
+    #[test]
+    fn due_funding_without_a_realized_rate_marks_accounting_incomplete() {
+        let mut cfg = config();
+        cfg.instruments[1].kind = InstrumentKindConfig::LinearSwap;
+        let mut runner = BacktestRunner::new(cfg).unwrap();
+
+        let report = runner
+            .run([
+                NormalizedEvent::from(MarketEvent::FundingRate {
+                    ts_ms: 1,
+                    symbol: "BTC-PERP".to_string(),
+                    rate: 0.001,
+                    funding_time_ms: 10,
+                    settlement: None,
+                }),
+                NormalizedEvent::Timer(TimerEvent {
+                    ts_ms: 10,
+                    name: "funding".to_string(),
+                }),
+            ])
+            .unwrap();
+
+        assert_eq!(report.funding_settlements, 0);
+        assert_eq!(report.funding_settlement_failures, 1);
+        assert!(!report.accounting_complete);
+    }
+
+    #[test]
+    fn conflicting_realized_funding_rates_are_rejected() {
+        let mut cfg = config();
+        cfg.instruments[1].kind = InstrumentKindConfig::LinearSwap;
+        let mut runner = BacktestRunner::new(cfg).unwrap();
+        let event = |ts_ms, settled_rate| {
+            NormalizedEvent::from(MarketEvent::FundingRate {
+                ts_ms,
+                symbol: "BTC-PERP".to_string(),
+                rate: 0.001,
+                funding_time_ms: 20,
+                settlement: Some(FundingSettlement {
+                    funding_time_ms: 10,
+                    rate: settled_rate,
+                }),
+            })
+        };
+
+        let error = runner
+            .run([event(11, 0.001), event(12, 0.002)])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("conflicting realized funding rates"));
     }
 
     #[test]
@@ -2017,6 +2124,7 @@ mod tests {
                 symbol: "BTC-PERP".to_string(),
                 rate: 0.001,
                 funding_time_ms: 1,
+                settlement: None,
             })])
             .unwrap();
 

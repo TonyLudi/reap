@@ -255,6 +255,11 @@ architecture in [docs/architecture.md](docs/architecture.md).
   reconciliation from command dispatch and support bounded concurrent
   underlying-routed websocket operations with shared account pacing and
   deterministic canonical completion.
+- [x] Separate OKX funding forecasts from realized settlement accounting,
+  retain `settFundingRate` with observed `prevFundingTime`, reject conflicting
+  realized rates, settle at the original exchange timestamp without strategy
+  look-ahead, and require nonzero training/test settlement evidence in schema-4
+  production research.
 - [ ] Calibrate queue position, latency, fees, funding, and slippage from
   captured full-depth data, then run and archive production-candidate
   walk-forward, capacity, and stressed-liquidity reports. The orchestration and

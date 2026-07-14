@@ -201,14 +201,20 @@ per-instrument values.
 
 For every run, also inspect `fee_cost_usd`, `funding_pnl_usd`,
 `turnover_usd`, `cash_by_currency`, `currency_rates`,
-`currency_conversion_failures`, `funding_rate_events`, and
-`accounting_complete`. Funding uses the latest rate for each advertised
-settlement time. A first rate up to 60 seconds late is applied immediately but
-marks accounting incomplete; older first rates are counted as missed and are
-not applied to a potentially changed position. Invalid data or a missing mark
-for a nonzero swap position also makes accounting incomplete. A future funding
-settlement beyond the capture horizon is reported as `pending_funding_actions`
-and is not itself a defect for the observed interval.
+`currency_conversion_failures`, `funding_rate_events`,
+`funding_settlement_observations`, `funding_settlements`, and
+`accounting_complete`. OKX `fundingRate` remains the forecast delivered to the
+strategy, matching the pinned Java decision path. It is never booked as cash.
+Raw replay first extracts `settFundingRate` with its observed
+`prevFundingTime`, then replays chronologically and books that realized rate at
+the original exchange settlement time. The realized map is private to the
+accounting scheduler and is not exposed to strategy decisions. Conflicting
+realized rates are rejected. A due forecast without a realized rate, invalid
+data, or a missing mark for a nonzero swap position makes accounting
+incomplete. A first forecast up to 60 seconds late is applied on the current
+clock but marks accounting incomplete; older first forecasts are counted as
+missed. A future funding settlement beyond the capture horizon is reported as
+`pending_funding_actions` and is not itself a defect for the observed interval.
 
 The portfolio starts at zero. Configure one direct USD-per-unit index for every
 named non-USD quote/settlement currency:
@@ -389,7 +395,7 @@ artifact creation, and exit status.
 
 For real research, create a new manifest alongside immutable capture files:
 
-1. Set `schema_version = 3`, `mode = "production_candidate"`, retain the pinned
+1. Set `schema_version = 4`, `mode = "production_candidate"`, retain the pinned
    Java revision, and point `latency_calibration` to the passed create-new JSON
    artifact whose profile is embedded exactly in the baseline scenario.
 2. List explicit full candidate TOML files; the runner does not mutate arbitrary
@@ -409,11 +415,13 @@ For real research, create a new manifest alongside immutable capture files:
    uses the same seed and must first-order stochastically dominate baseline for
    every effective class/symbol distribution. Threshold and queue can only
    increase; trade/depth participation can only decrease.
-5. Set nonzero event, fill, and duration evidence minimums plus explicit PnL,
+5. Set nonzero event, fill, and duration evidence minimums for both training and
+   test windows plus explicit PnL,
    drawdown, terminal/maximum position and pending-hedge delta,
    terminal/maximum gross position and active-order exposure, active-order
    count, inventory-duration, clock-regression, accounting, and pending-work
-   gates.
+   gates. When any candidate trades a swap, also set nonzero realized funding
+   settlement minimums for both training and test folds.
 6. Run with a create-new `--output` path and `--require-pass`, then archive the
    JSON beside the exact capture/config files and demo calibration evidence.
 
@@ -1647,7 +1655,7 @@ rounded up to microseconds during collection and microseconds are rounded up to
 backtest milliseconds. A failed calibration still writes its diagnostic JSON,
 but the CLI refuses to emit a TOML profile from it.
 
-A production-candidate research manifest must use schema 3, set
+A production-candidate research manifest must use schema 4, set
 `latency_calibration` to the JSON artifact, set the baseline execution
 `calibrated = true`, and embed exactly the artifact's profile. Research treats
 the artifact as untrusted input: it checks source/config hashes, sessions,

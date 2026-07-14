@@ -1,4 +1,4 @@
-schema_version = 3
+schema_version = 4
 mode = "smoke"
 java_reference_revision = "b6b120c7b7c466d8431bf082f3229328c5d7b2ae"
 selection_metric = "net_pnl_usd"
@@ -59,8 +59,10 @@ minimum_folds = 1
 minimum_stress_scenarios = 1
 minimum_train_input_events_per_fold = 1
 minimum_train_fills_per_fold = 0
+minimum_train_funding_settlements_per_fold = 0
 minimum_test_input_events_per_fold = 1
 minimum_test_fills_per_fold = 0
+minimum_test_funding_settlements_per_fold = 0
 minimum_test_duration_ns_per_fold = 1
 minimum_test_pnl_usd_per_fold = -1000000.0
 minimum_total_baseline_test_pnl_usd = -1000000.0

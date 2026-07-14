@@ -17,7 +17,7 @@ use crate::{
     LatencyCalibrationArtifact, MAX_LATENCY_CALIBRATION_ARTIFACT_BYTES,
 };
 
-pub const RESEARCH_SCHEMA_VERSION: u32 = 3;
+pub const RESEARCH_SCHEMA_VERSION: u32 = 4;
 pub use reap_core::PINNED_JAVA_REVISION;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,8 +115,10 @@ pub struct ResearchGates {
     pub minimum_stress_scenarios: usize,
     pub minimum_train_input_events_per_fold: u64,
     pub minimum_train_fills_per_fold: usize,
+    pub minimum_train_funding_settlements_per_fold: u64,
     pub minimum_test_input_events_per_fold: u64,
     pub minimum_test_fills_per_fold: usize,
+    pub minimum_test_funding_settlements_per_fold: u64,
     pub minimum_test_duration_ns_per_fold: u64,
     pub minimum_test_pnl_usd_per_fold: f64,
     pub minimum_total_baseline_test_pnl_usd: f64,
@@ -265,6 +267,7 @@ pub struct RunAggregate {
     #[serde(default)]
     pub estimated_fee_fills: u64,
     pub funding_pnl_usd: f64,
+    pub funding_settlements: u64,
     pub turnover_usd: f64,
     pub maximum_drawdown_usd: f64,
     pub maximum_abs_delta_usd: f64,
@@ -362,6 +365,11 @@ pub fn run_research_manifest_path(path: impl AsRef<Path>) -> Result<ResearchRepo
         &executable_sha256,
     )?;
     let candidates = load_candidates(&manifest.candidates, base)?;
+    validate_candidate_funding_evidence(
+        manifest.mode,
+        &manifest.gates,
+        candidates.iter().map(|candidate| &candidate.config),
+    )?;
     validate_scenario_currency_rates(&manifest.scenarios, &candidates)?;
     let datasets = load_datasets(&manifest.datasets, base, manifest.mode, &candidates)?;
     let manifest_sha256 = sha256_bytes(&manifest_bytes);
@@ -909,6 +917,9 @@ impl RunAggregate {
                 .estimated_fee_fills
                 .saturating_add(report.estimated_fee_fills);
             aggregate.funding_pnl_usd += report.funding_pnl_usd;
+            aggregate.funding_settlements = aggregate
+                .funding_settlements
+                .saturating_add(report.funding_settlements);
             aggregate.turnover_usd += report.turnover_usd;
             aggregate.maximum_drawdown_usd =
                 aggregate.maximum_drawdown_usd.max(report.max_drawdown_usd);
@@ -1072,6 +1083,30 @@ fn load_candidates(specs: &[ResearchCandidate], base: &Path) -> Result<Vec<Loade
         });
     }
     Ok(loaded)
+}
+
+fn validate_candidate_funding_evidence<'a>(
+    mode: ResearchMode,
+    gates: &ResearchGates,
+    candidates: impl IntoIterator<Item = &'a BacktestConfig>,
+) -> Result<()> {
+    let has_swap = candidates.into_iter().any(|candidate| {
+        candidate
+            .strategy
+            .instruments
+            .iter()
+            .any(|instrument| instrument.kind.is_swap())
+    });
+    if mode == ResearchMode::ProductionCandidate
+        && has_swap
+        && (gates.minimum_train_funding_settlements_per_fold == 0
+            || gates.minimum_test_funding_settlements_per_fold == 0)
+    {
+        bail!(
+            "production_candidate with swap instruments requires non-zero training and test funding-settlement evidence gates"
+        );
+    }
+    Ok(())
 }
 
 fn load_latency_calibration(
@@ -1619,6 +1654,12 @@ fn training_failures(
             aggregate.fills, gates.minimum_train_fills_per_fold
         ));
     }
+    if aggregate.funding_settlements < gates.minimum_train_funding_settlements_per_fold {
+        failures.push(format!(
+            "training funding settlements {} below {}",
+            aggregate.funding_settlements, gates.minimum_train_funding_settlements_per_fold
+        ));
+    }
     failures
 }
 
@@ -1639,6 +1680,12 @@ fn test_failures(
         evidence.push(format!(
             "test fills {} below {}",
             aggregate.fills, gates.minimum_test_fills_per_fold
+        ));
+    }
+    if aggregate.funding_settlements < gates.minimum_test_funding_settlements_per_fold {
+        evidence.push(format!(
+            "test funding settlements {} below {}",
+            aggregate.funding_settlements, gates.minimum_test_funding_settlements_per_fold
         ));
     }
     if aggregate.observed_duration_ns < gates.minimum_test_duration_ns_per_fold {
@@ -2249,8 +2296,10 @@ mod tests {
             minimum_stress_scenarios: 1,
             minimum_train_input_events_per_fold: 1,
             minimum_train_fills_per_fold: 0,
+            minimum_train_funding_settlements_per_fold: 0,
             minimum_test_input_events_per_fold: 1,
             minimum_test_fills_per_fold: 0,
+            minimum_test_funding_settlements_per_fold: 0,
             minimum_test_duration_ns_per_fold: 1,
             minimum_test_pnl_usd_per_fold: -1_000_000.0,
             minimum_total_baseline_test_pnl_usd: -1_000_000.0,
@@ -2386,6 +2435,63 @@ mod tests {
         assert!(error.contains("calibrated execution"));
         assert!(error.contains("capture_config for every dataset"));
         assert!(error.contains("capture_report for every dataset"));
+    }
+
+    #[test]
+    fn production_swap_candidates_require_funding_settlement_evidence() {
+        let mut swap = BacktestConfig {
+            strategy: Default::default(),
+            backtest: Default::default(),
+        };
+        swap.strategy
+            .instruments
+            .push(reap_strategy::InstrumentConfig {
+                kind: reap_strategy::InstrumentKindConfig::LinearSwap,
+                ..Default::default()
+            });
+        let gates = gates();
+
+        let error =
+            validate_candidate_funding_evidence(ResearchMode::ProductionCandidate, &gates, [&swap])
+                .unwrap_err()
+                .to_string();
+
+        assert!(error.contains("swap instruments"));
+        assert!(error.contains("funding-settlement evidence gates"));
+    }
+
+    #[test]
+    fn production_non_swap_candidates_do_not_require_funding_settlement_evidence() {
+        let spot = BacktestConfig {
+            strategy: reap_strategy::ChaosConfig {
+                instruments: vec![reap_strategy::InstrumentConfig::default()],
+                ..Default::default()
+            },
+            backtest: Default::default(),
+        };
+
+        validate_candidate_funding_evidence(ResearchMode::ProductionCandidate, &gates(), [&spot])
+            .unwrap();
+    }
+
+    #[test]
+    fn production_swap_candidates_accept_positive_funding_settlement_evidence() {
+        let mut swap = BacktestConfig {
+            strategy: Default::default(),
+            backtest: Default::default(),
+        };
+        swap.strategy
+            .instruments
+            .push(reap_strategy::InstrumentConfig {
+                kind: reap_strategy::InstrumentKindConfig::InverseSwap,
+                ..Default::default()
+            });
+        let mut gates = gates();
+        gates.minimum_train_funding_settlements_per_fold = 1;
+        gates.minimum_test_funding_settlements_per_fold = 1;
+
+        validate_candidate_funding_evidence(ResearchMode::ProductionCandidate, &gates, [&swap])
+            .unwrap();
     }
 
     #[test]
@@ -2636,6 +2742,7 @@ mod tests {
         gates.maximum_pending_non_funding_actions_per_fold = 0;
         gates.maximum_terminal_pending_orders_per_run = 0;
         gates.maximum_terminal_pending_cancel_requests_per_run = 0;
+        gates.minimum_test_funding_settlements_per_fold = 1;
         gates.maximum_test_abs_pending_delta_usd = 10.0;
         gates.maximum_test_final_abs_pending_delta_usd = 10.0;
         gates.maximum_test_active_orders = 2;
@@ -2667,6 +2774,11 @@ mod tests {
             evidence
                 .iter()
                 .any(|failure| failure.contains("cancel requests remain pending"))
+        );
+        assert!(
+            evidence
+                .iter()
+                .any(|failure| failure.contains("test funding settlements 0 below 1"))
         );
         assert!(
             performance

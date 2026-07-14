@@ -64,6 +64,8 @@ connections = 2
 priority = "high"
 
 [[subscriptions]]
+# A production research capture must run continuously across funding boundaries;
+# a clean short capture only validates connectivity and replay plumbing.
 channel = "funding-rate"
 symbol = "BTC-USDT-SWAP"
 connections = 2
