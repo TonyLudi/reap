@@ -35,6 +35,11 @@ pub const OKX_FILLS_PAGE_LIMIT: usize = 100;
 /// the signed client prevents offline evidence tooling from drifting from live
 /// reconciliation semantics.
 pub fn parse_okx_fills_response_json(body: &[u8]) -> Result<Vec<RemoteFill>, RestError> {
+    Ok(parse_okx_fill_page_response_json(body)?.fills)
+}
+
+/// Parses one unmodified fill page and derives its next `after` cursor.
+pub fn parse_okx_fill_page_response_json(body: &[u8]) -> Result<OkxFillPage, RestError> {
     let response: OkxResponse<OkxFillWire> = serde_json::from_slice(body)?;
     if response.code != "0" {
         return Err(RestError::Api {
@@ -42,11 +47,36 @@ pub fn parse_okx_fills_response_json(body: &[u8]) -> Result<Vec<RemoteFill>, Res
             message: response.message,
         });
     }
-    response
-        .data
+    okx_fill_page(response.data)
+}
+
+fn okx_fill_page(data: Vec<OkxFillWire>) -> Result<OkxFillPage, RestError> {
+    if data.len() > OKX_FILLS_PAGE_LIMIT {
+        return Err(RestError::InvalidField {
+            field: "data",
+            value: data.len().to_string(),
+            message: format!("fill page exceeded the requested limit {OKX_FILLS_PAGE_LIMIT}"),
+        });
+    }
+    let next_after = if data.len() == OKX_FILLS_PAGE_LIMIT {
+        let bill_id = data
+            .last()
+            .map(|fill| fill.bill_id.trim())
+            .filter(|bill_id| !bill_id.is_empty())
+            .ok_or_else(|| RestError::InvalidField {
+                field: "billId",
+                value: String::new(),
+                message: "a full fill page requires a pagination cursor".to_string(),
+            })?;
+        Some(bill_id.to_string())
+    } else {
+        None
+    };
+    let fills = data
         .into_iter()
         .map(RemoteFill::try_from)
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(OkxFillPage { fills, next_after })
 }
 
 #[derive(Debug, Error)]
@@ -307,6 +337,13 @@ pub struct OkxCancelOrderResult {
 pub struct OkxFillPage {
     pub fills: Vec<RemoteFill>,
     pub next_after: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OkxRawFillPage {
+    pub request_path: String,
+    pub response_body: String,
+    pub page: OkxFillPage,
 }
 
 #[derive(Debug)]
@@ -622,6 +659,30 @@ where
         symbol: Option<&str>,
         after: Option<&str>,
     ) -> Result<OkxFillPage, RestError> {
+        Ok(self
+            .fills_page_raw_at(timestamp, instrument_type, symbol, after)
+            .await?
+            .page)
+    }
+
+    /// Retrieves one recent-fill page while retaining the exact response body.
+    pub async fn fills_page_raw(
+        &self,
+        instrument_type: Option<&str>,
+        symbol: Option<&str>,
+        after: Option<&str>,
+    ) -> Result<OkxRawFillPage, RestError> {
+        self.fills_page_raw_at(&timestamp_now(), instrument_type, symbol, after)
+            .await
+    }
+
+    pub async fn fills_page_raw_at(
+        &self,
+        timestamp: &str,
+        instrument_type: Option<&str>,
+        symbol: Option<&str>,
+        after: Option<&str>,
+    ) -> Result<OkxRawFillPage, RestError> {
         let path = query_path(
             FILLS_PATH,
             [
@@ -633,36 +694,14 @@ where
         );
         let request = self
             .signer
-            .sign_request(timestamp, HttpMethod::Get, path, "")?;
-        let response: OkxResponse<OkxFillWire> = self.execute(request).await?;
-        if response.data.len() > OKX_FILLS_PAGE_LIMIT {
-            return Err(RestError::InvalidField {
-                field: "data",
-                value: response.data.len().to_string(),
-                message: format!("fill page exceeded the requested limit {OKX_FILLS_PAGE_LIMIT}"),
-            });
-        }
-        let next_after = if response.data.len() == OKX_FILLS_PAGE_LIMIT {
-            let bill_id = response
-                .data
-                .last()
-                .map(|fill| fill.bill_id.trim())
-                .filter(|bill_id| !bill_id.is_empty())
-                .ok_or_else(|| RestError::InvalidField {
-                    field: "billId",
-                    value: String::new(),
-                    message: "a full fill page requires a pagination cursor".to_string(),
-                })?;
-            Some(bill_id.to_string())
-        } else {
-            None
-        };
-        let fills = response
-            .data
-            .into_iter()
-            .map(RemoteFill::try_from)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(OkxFillPage { fills, next_after })
+            .sign_request(timestamp, HttpMethod::Get, path.clone(), "")?;
+        let response = self.transport.execute(request).await?;
+        let page = parse_okx_fill_page_response_json(response.body.as_bytes())?;
+        Ok(OkxRawFillPage {
+            request_path: path,
+            response_body: response.body,
+            page,
+        })
     }
 
     /// Retrieves complete recent-fill pages up to a fail-closed bound.

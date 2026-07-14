@@ -167,6 +167,8 @@ enum Command {
         #[arg(long)]
         pretty: bool,
     },
+    #[command(about = "Collect authenticated, read-only recent OKX fill evidence")]
+    CollectFills(statement::CollectFillsArgs),
     #[command(about = "Reconcile canonical journal fills and exact fees against raw OKX responses")]
     ReconcileFills(statement::ReconcileFillsArgs),
     Operator {
@@ -575,6 +577,7 @@ async fn main() -> Result<()> {
                 anyhow::bail!("latency calibration did not satisfy evidence gates");
             }
         }
+        Command::CollectFills(args) => statement::collect(args).await?,
         Command::ReconcileFills(args) => statement::run(args)?,
         Command::Operator {
             config,

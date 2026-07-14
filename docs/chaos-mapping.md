@@ -203,6 +203,7 @@ The following differences do not change the covered quote/hedge calculations:
 | Separate receive and exchange latency tracking | Raw `recv_ts_ns`, exchange timestamps, bounded-memory capture timing distributions, capture health counters, and bounded live webhook alerts | Equivalent data retained; receive delay includes host clock/scheduling and alert routing is a deployment concern |
 | Batch subscription manager and retry limits | Bounded socket partitioning, acknowledgement timeout, exponential reconnect | Equivalent lifecycle with different batching policy |
 | `OrderDetailUpdate` `tradeId`/`fillSz`/`fillPx` and `UserTrade` `tradeId`/`fee`/`feeCcy`/`execType` | Current OKX order-channel `tradeId` plus per-fill `fillFee`/`fillFeeCcy`, optional fills channel with fee-bearing order-update precedence under either arrival order, instrument-scoped once-only journal record, and raw-statement comparison | Current-contract strengthening; the pinned Java order-session fill derivation says fee is unavailable and its separate user-trade processing is commented out |
+| `OkxNitroRestClient.getFills` 100-row pages, 200 ms pacing, descending cursor pagination, and short-page completion | Authenticated read-only `/api/v5/trade/fills` collector with the same page size/pacing/completion rule, fail-closed page bound, raw response retention, bracketed account identity, and offline cursor replay | Lifecycle mapping with a current-contract endpoint adaptation; pinned Java reads Nitro spread trades while Reap certifies regular strategy fills |
 | `StaleOrderUpdateSafeguard` and `GatewayOrderStatsSafeguard.BookTotalPendingOrder` | Per-order submit-to-private-state and cancel-to-terminal-state deadlines, cancel retry, account block, and full REST reconciliation | Equivalent fail-closed intent with explicit OKX REST/private-state convergence |
 | `PositionGatewaySafeguard.OrsFillDelayToPositionUpdate` and the fill-derived position reconciler | Per-fill derivative-position or spot-currency convergence deadline plus monotonic rows, full REST comparison, tombstone repair, and second-pass confirmation | Equivalent fail-closed intent; Rust uses an explicit post-fill deadline rather than Java's two-cycle timestamp-difference check |
 | `PositionGatewaySafeguard.PosnMgnModeMismatch` | Required OKX `mgnMode` on websocket/REST positions, configured-mode bootstrap/runtime enforcement, and reconciliation comparison | Equivalent fail-closed intent; Rust aborts the live lifecycle instead of pausing inside a separate gateway process |
@@ -212,7 +213,7 @@ The following differences do not change the covered quote/hedge calculations:
 The reviewed Java OKX subscriber and `chaos-iarb2` classes do not provide the
 Rust runtime's place-request `expTime`, `/public/time` skew gate, Cancel All
 After heartbeat, fsynced restart-latch lifecycle, exclusive journal lease,
-bounded fill-history pagination, statement evidence, webhook alert worker,
+bounded authenticated fill-evidence collection and verification, webhook alert worker,
 Linux host guard, hardened supervisor policy, or strategy-independent
 account-wide regular-order cancellation. Those are intentional
 deployment-safety additions around the parity strategy, not claims of Java

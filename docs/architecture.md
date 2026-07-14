@@ -308,9 +308,12 @@ Responsibilities:
 - Start/stop/restart strategy instances.
 - Dispatch timers into strategy loops.
 - Coordinate reconciliation and recovery.
-- Produce deterministic offline fill/fee evidence by leasing and hashing the
-  exact canonical journal plus raw venue response pages; economic statement
-  reconciliation outside fills and fees remains a separate accounting layer.
+- Collect authenticated, read-only recent-fill evidence with bracketed exchange
+  clock/account-identity samples, bounded paced pagination to a proven short
+  page, and exact create-new response/config/manifest hashes. Reconciliation
+  independently replays that cursor chain, leases the canonical journal, and
+  binds the collection config identity to the journal bootstrap identity.
+  Economic statement reconciliation outside fills and fees remains separate.
 - Reduce durable global/account/symbol latches, block halted routes, and
   guarantee scoped canonical cancellation.
 - Promote terminal strategy safety halts into the global risk gate before

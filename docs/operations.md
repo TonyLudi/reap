@@ -215,49 +215,64 @@ accounting defect also makes the command fail.
 
 ### Fill And Fee Statement Reconciliation
 
-Stop the live process first. Export every unmodified response page needed to
-cover the selected account and inclusive millisecond window from the OKX trade
-fills endpoints documented in the [OKX API guide](https://www.okx.com/docs-v5/en/).
-The current `/api/v5/trade/fills` endpoint covers recent fills; use the history
-endpoint when the requested window is older. Preserve each raw JSON response as
-a separate file, including empty terminal pages where applicable.
+Stop the live process first. For a window inside the recent-fill retention
+boundary, wait at least 60 seconds after its inclusive end and use the
+authenticated read-only collector. The endpoint contract is documented in the
+[OKX API guide](https://www.okx.com/docs-v5/en/).
 
 ```bash
+BEGIN_MS=1783987200000
+END_MS=1783990800000
+EVIDENCE="var/reap/evidence/okx-fills-$(date -u +%Y%m%dT%H%M%SZ)"
 REPORT="var/reap/evidence/fills-$(date -u +%Y%m%dT%H%M%SZ).json"
+cargo run -p reap-cli -- collect-fills \
+  --config examples/live-okx-demo.toml \
+  --account main \
+  --begin-ms "$BEGIN_MS" \
+  --end-ms "$END_MS" \
+  --output "$EVIDENCE" \
+  --pretty
+
 cargo run -p reap-cli -- reconcile-fills \
   --journal var/reap/live-events.jsonl \
-  --statement /secure/evidence/okx-fills-page-01.json \
-  --statement /secure/evidence/okx-fills-page-02.json \
+  --collection-manifest "$EVIDENCE/manifest.json" \
   --account main \
-  --begin-ms 1783987200000 \
-  --end-ms 1783990800000 \
+  --begin-ms "$BEGIN_MS" \
+  --end-ms "$END_MS" \
   --minimum-fills 10 \
-  --confirm-statement-account-and-window-complete \
   --output "$REPORT" \
   --require-pass \
   --pretty
 ```
 
-The command is offline and reads no credentials. It refuses an active journal
-writer through the canonical storage lease, rejects symlinked/duplicate inputs,
-limits file/page sizes, parses each page with the live OKX fill parser, and
-hashes the exact bytes parsed. The schema-1 report also records the
-reconciliation executable SHA-256 and the selected account's journal bootstrap
-strategy/config fingerprint. It compares order id, side, price, quantity,
-liquidity when journaled, signed fee amount, and normalized fee currency by
-strict `(symbol, tradeId)`. It fails on malformed or duplicate records, either
-missing side, absent exact fees, a missing or invalid account bootstrap
-identity, a truncated journal tail, or fewer than `--minimum-fills`
-comparisons. Tolerances default to zero and should remain zero unless a
-documented serialization boundary requires otherwise.
+`collect-fills` uses a public exchange-time GET plus the selected account
+credentials for signed account-config and recent-fill GETs; it has no order
+entry path. It reserves a mode-`0700` directory before credentials or network
+access, writes exact response pages as create-new mode-`0600` files, paces
+100-row requests at least 200 ms apart, samples pseudonymous account identity
+before and after, and requires a short terminal page. Windows are conservatively
+limited to 70 hours even though the endpoint retention is 72 hours. A failed
+collection deliberately leaves no complete manifest.
 
-OKX response bodies do not identify the authenticated account or echo the
-request window/cursor. `--confirm-statement-account-and-window-complete` is
-therefore an operator attestation that every supplied page belongs to the named
-account and completely covers the window; without it the artifact cannot pass.
-The output is create-new, mode `0600` on Unix, and fsynced before
-`--require-pass` is enforced. A failure before report serialization can leave an
-empty reserved output, which is not evidence.
+`reconcile-fills` is offline and reads no credentials. It verifies schema,
+pinned Java revision, file hashes and bounds, exact request/cursor chain,
+terminal-page completeness, exchange clock bounds, account mode, and config
+fingerprint before taking the canonical journal lease. The schema-2 report binds
+the collection manifest and pseudonymous account identity to the journal
+bootstrap config, then compares order id, side, price, quantity, liquidity when
+journaled, signed fee amount, and normalized fee currency by strict
+`(symbol, tradeId)`. It fails on malformed or duplicate records, either missing
+side, absent exact fees, config mismatch, a truncated journal tail, or fewer than
+`--minimum-fills` comparisons. Tolerances default to zero.
+
+For older windows, preserve every unmodified `/api/v5/trade/fills-history`
+response and use repeated `--statement` arguments plus
+`--confirm-statement-account-and-window-complete`. Because those bodies do not
+echo account or request parameters, this manual path remains an operator
+attestation and is weaker than the authenticated collector. Reconciliation
+output is create-new, mode `0600` on Unix, and fsynced before `--require-pass` is
+enforced. A failure before report serialization can leave an empty reserved
+output, which is not evidence.
 
 This artifact closes only the fill/fee comparison. Archive it with the raw
 pages, live report, journal hash, and account export. Funding, balances,

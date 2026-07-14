@@ -12,8 +12,11 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::provenance::current_executable_sha256;
+use crate::{
+    FillCollectionError, FillCollectionFileEvidence, verify_fill_collection_manifest_path,
+};
 
-pub const FILL_STATEMENT_REPORT_SCHEMA_VERSION: u32 = 1;
+pub const FILL_STATEMENT_REPORT_SCHEMA_VERSION: u32 = 2;
 pub const MAX_FILL_STATEMENT_JOURNAL_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_FILL_STATEMENT_PAGE_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_FILL_STATEMENT_TOTAL_PAGE_BYTES: u64 = 512 * 1024 * 1024;
@@ -78,6 +81,13 @@ pub struct FillStatementTolerances {
 #[serde(rename_all = "snake_case")]
 pub enum FillStatementScope {
     FillsAndFeesOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FillStatementCoverage {
+    ManualRawPages,
+    AuthenticatedRecentFillCollection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -174,6 +184,7 @@ pub struct FillStatementComparison {
 pub enum FillStatementFailure {
     StatementAccountAndWindowCompletenessNotAttested,
     JournalAccountBootstrapMissingOrInvalid,
+    CollectionConfigFingerprintMismatch,
     JournalTruncatedTail,
     InvalidRecords,
     DuplicateJournalFills,
@@ -189,6 +200,7 @@ pub enum FillStatementFailure {
 pub struct FillStatementReconciliationReport {
     pub schema_version: u32,
     pub scope: FillStatementScope,
+    pub coverage: FillStatementCoverage,
     pub java_reference_revision: String,
     pub reap_version: String,
     pub executable_sha256: String,
@@ -201,9 +213,14 @@ pub struct FillStatementReconciliationReport {
     pub minimum_fills: u64,
     pub tolerances: FillStatementTolerances,
     pub statement_account_and_window_completeness_attested: bool,
+    pub statement_account_and_window_completeness_established: bool,
     pub journal: FillStatementFileEvidence,
     pub journal_recovery: FillJournalRecoveryEvidence,
     pub statement_pages: Vec<FillStatementFileEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection_manifest: Option<FillStatementFileEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identity_sha256: Option<String>,
     pub comparison: FillStatementComparison,
     pub limitations: Vec<String>,
     pub failures: Vec<FillStatementFailure>,
@@ -260,6 +277,41 @@ pub enum FillStatementError {
     StatementPagesTooLarge { actual: u64, limit: u64 },
     #[error("failed to fingerprint the running executable: {0}")]
     ExecutableHash(String),
+    #[error("fill collection failed verification: {0}")]
+    Collection(#[from] FillCollectionError),
+    #[error("fill collection does not match reconciliation options: {0}")]
+    CollectionMismatch(String),
+    #[error("collected fill page changed after manifest verification: {0}")]
+    CollectionPageChanged(PathBuf),
+}
+
+#[derive(Debug)]
+enum FillEvidenceContext {
+    OperatorPages,
+    AuthenticatedCollection {
+        manifest: FillStatementFileEvidence,
+        account_identity_sha256: String,
+        config_fingerprint: String,
+        pages: Vec<FillStatementFileEvidence>,
+    },
+}
+
+impl FillEvidenceContext {
+    fn coverage(&self) -> FillStatementCoverage {
+        match self {
+            Self::OperatorPages => FillStatementCoverage::ManualRawPages,
+            Self::AuthenticatedCollection { .. } => {
+                FillStatementCoverage::AuthenticatedRecentFillCollection
+            }
+        }
+    }
+
+    fn expected_pages(&self) -> Option<&[FillStatementFileEvidence]> {
+        match self {
+            Self::OperatorPages => None,
+            Self::AuthenticatedCollection { pages, .. } => Some(pages),
+        }
+    }
 }
 
 /// Reconciles a stopped runtime's canonical journal against raw OKX fill pages.
@@ -272,7 +324,75 @@ pub fn reconcile_okx_fill_statement_paths(
     statement_paths: &[PathBuf],
     options: FillStatementReconciliationOptions,
 ) -> Result<FillStatementReconciliationReport, FillStatementError> {
+    reconcile_okx_fill_statement_paths_with_context(
+        journal_path.as_ref(),
+        statement_paths,
+        options,
+        FillEvidenceContext::OperatorPages,
+    )
+}
+
+/// Reconciles a stopped runtime against an authenticated, verified recent-fill
+/// collection. Account and window coverage come from the collection manifest,
+/// rather than an operator assertion.
+pub fn reconcile_okx_fill_collection_paths(
+    journal_path: impl AsRef<Path>,
+    collection_manifest_path: impl AsRef<Path>,
+    options: FillStatementReconciliationOptions,
+) -> Result<FillStatementReconciliationReport, FillStatementError> {
     options.validate()?;
+    let verified = verify_fill_collection_manifest_path(collection_manifest_path)?;
+    if verified.manifest.account_id != options.account_id {
+        return Err(FillStatementError::CollectionMismatch(format!(
+            "account {} does not match requested account {}",
+            verified.manifest.account_id, options.account_id
+        )));
+    }
+    if verified.manifest.window.begin_ms != options.begin_ms
+        || verified.manifest.window.end_ms != options.end_ms
+    {
+        return Err(FillStatementError::CollectionMismatch(format!(
+            "inclusive window {}..={} does not match requested {}..={}",
+            verified.manifest.window.begin_ms,
+            verified.manifest.window.end_ms,
+            options.begin_ms,
+            options.end_ms
+        )));
+    }
+    let context = FillEvidenceContext::AuthenticatedCollection {
+        manifest: statement_file_evidence(&verified.manifest_file),
+        account_identity_sha256: verified.manifest.account_identity_sha256.clone(),
+        config_fingerprint: verified.manifest.config_fingerprint.clone(),
+        pages: verified
+            .manifest
+            .pages
+            .iter()
+            .map(|page| statement_file_evidence(&page.response))
+            .collect(),
+    };
+    reconcile_okx_fill_statement_paths_with_context(
+        journal_path.as_ref(),
+        &verified.page_paths,
+        options,
+        context,
+    )
+}
+
+fn reconcile_okx_fill_statement_paths_with_context(
+    journal_path: &Path,
+    statement_paths: &[PathBuf],
+    options: FillStatementReconciliationOptions,
+    context: FillEvidenceContext,
+) -> Result<FillStatementReconciliationReport, FillStatementError> {
+    options.validate()?;
+    if context
+        .expected_pages()
+        .is_some_and(|pages| pages.len() != statement_paths.len())
+    {
+        return Err(FillStatementError::CollectionMismatch(
+            "verified page-path and page-evidence counts differ".to_string(),
+        ));
+    }
     if statement_paths.is_empty() {
         return Err(FillStatementError::MissingStatementPages);
     }
@@ -295,7 +415,7 @@ pub fn reconcile_okx_fill_statement_paths(
     let mut statement_pages = Vec::with_capacity(statement_paths.len());
     let mut statement_fills = Vec::new();
     let mut statement_bytes = 0_u64;
-    for path in statement_paths {
+    for (index, path) in statement_paths.iter().enumerate() {
         let canonical = canonical_regular_file(path, "statement page")?;
         if canonical == journal_path {
             return Err(FillStatementError::StatementIsJournal(canonical));
@@ -305,6 +425,13 @@ pub fn reconcile_okx_fill_statement_paths(
         }
         let (evidence, bytes) =
             read_input(&canonical, "statement page", MAX_FILL_STATEMENT_PAGE_BYTES)?;
+        if context
+            .expected_pages()
+            .and_then(|pages| pages.get(index))
+            .is_some_and(|expected| expected != &evidence)
+        {
+            return Err(FillStatementError::CollectionPageChanged(canonical));
+        }
         statement_bytes = statement_bytes.saturating_add(evidence.bytes);
         if statement_bytes > MAX_FILL_STATEMENT_TOTAL_PAGE_BYTES {
             return Err(FillStatementError::StatementPagesTooLarge {
@@ -336,6 +463,7 @@ pub fn reconcile_okx_fill_statement_paths(
         recovered,
         statement_pages,
         statement_fills,
+        context,
     ))
 }
 
@@ -346,8 +474,28 @@ fn build_report(
     recovered: RecoveredStorage,
     statement_pages: Vec<FillStatementFileEvidence>,
     statement_fills: Vec<RemoteFill>,
+    context: FillEvidenceContext,
 ) -> FillStatementReconciliationReport {
     let comparison = compare_fills(&recovered.fills, &statement_fills, &options);
+    let coverage = context.coverage();
+    let operator_attested = coverage == FillStatementCoverage::ManualRawPages
+        && options.statement_account_and_window_completeness_attested;
+    let completeness_established =
+        operator_attested || coverage == FillStatementCoverage::AuthenticatedRecentFillCollection;
+    let (collection_manifest, account_identity_sha256, collection_config_fingerprint) =
+        match &context {
+            FillEvidenceContext::OperatorPages => (None, None, None),
+            FillEvidenceContext::AuthenticatedCollection {
+                manifest,
+                account_identity_sha256,
+                config_fingerprint,
+                ..
+            } => (
+                Some(manifest.clone()),
+                Some(account_identity_sha256.clone()),
+                Some(config_fingerprint.as_str()),
+            ),
+        };
     let (journal_strategy_name, journal_config_fingerprint) = recovered
         .bootstrap_identities
         .get(&options.account_id)
@@ -362,11 +510,18 @@ fn build_report(
             .as_deref()
             .is_some_and(is_lower_sha256);
     let mut failures = Vec::new();
-    if !options.statement_account_and_window_completeness_attested {
+    if !completeness_established {
         failures.push(FillStatementFailure::StatementAccountAndWindowCompletenessNotAttested);
     }
     if !journal_identity_valid {
         failures.push(FillStatementFailure::JournalAccountBootstrapMissingOrInvalid);
+    }
+    if collection_config_fingerprint.is_some_and(|expected| {
+        journal_config_fingerprint
+            .as_deref()
+            .is_some_and(|actual| actual != expected)
+    }) {
+        failures.push(FillStatementFailure::CollectionConfigFingerprintMismatch);
     }
     if recovered.ignored_truncated_tail {
         failures.push(FillStatementFailure::JournalTruncatedTail);
@@ -396,9 +551,23 @@ fn build_report(
         failures.push(FillStatementFailure::MinimumFillsNotMet);
     }
 
+    let mut limitations = Vec::with_capacity(2);
+    match coverage {
+        FillStatementCoverage::ManualRawPages => limitations.push(
+            "OKX response bodies do not echo account or request-window parameters; their coverage is an explicit operator attestation".to_string(),
+        ),
+        FillStatementCoverage::AuthenticatedRecentFillCollection => limitations.push(
+            "coverage is limited to the recent /api/v5/trade/fills retention boundary recorded by the authenticated collection manifest".to_string(),
+        ),
+    }
+    limitations.push(
+        "this report does not reconcile balances, positions, funding, equity, liabilities, borrowing, taxes, or currency conversion".to_string(),
+    );
+
     FillStatementReconciliationReport {
         schema_version: FILL_STATEMENT_REPORT_SCHEMA_VERSION,
         scope: FillStatementScope::FillsAndFeesOnly,
+        coverage,
         java_reference_revision: PINNED_JAVA_REVISION.to_string(),
         reap_version: env!("CARGO_PKG_VERSION").to_string(),
         executable_sha256,
@@ -412,8 +581,8 @@ fn build_report(
         },
         minimum_fills: options.minimum_fills,
         tolerances: options.tolerances,
-        statement_account_and_window_completeness_attested: options
-            .statement_account_and_window_completeness_attested,
+        statement_account_and_window_completeness_attested: operator_attested,
+        statement_account_and_window_completeness_established: completeness_established,
         journal,
         journal_recovery: FillJournalRecoveryEvidence {
             records: recovered.records,
@@ -421,11 +590,10 @@ fn build_report(
             exclusive_lease_held_while_reading: true,
         },
         statement_pages,
+        collection_manifest,
+        account_identity_sha256,
         comparison,
-        limitations: vec![
-            "OKX response bodies do not echo account or request-window parameters; their coverage is an explicit operator attestation".to_string(),
-            "this report does not reconcile balances, positions, funding, equity, liabilities, borrowing, taxes, or currency conversion".to_string(),
-        ],
+        limitations,
         passed: failures.is_empty(),
         failures,
     }
@@ -811,6 +979,14 @@ fn in_window(ts_ms: u64, options: &FillStatementReconciliationOptions) -> bool {
     (options.begin_ms..=options.end_ms).contains(&ts_ms)
 }
 
+fn statement_file_evidence(evidence: &FillCollectionFileEvidence) -> FillStatementFileEvidence {
+    FillStatementFileEvidence {
+        path: evidence.path.clone(),
+        bytes: evidence.bytes,
+        sha256: evidence.sha256.clone(),
+    }
+}
+
 fn canonical_regular_file(path: &Path, label: &'static str) -> Result<PathBuf, FillStatementError> {
     let metadata =
         std::fs::symlink_metadata(path).map_err(|error| FillStatementError::InvalidInputPath {
@@ -893,6 +1069,13 @@ fn read_input(
 #[cfg(test)]
 mod tests {
     use reap_core::{FillFee, FillLiquidity, Side};
+
+    use crate::{
+        FILL_COLLECTION_SCHEMA_VERSION, FillCollectionClockEvidence, FillCollectionCoverage,
+        FillCollectionManifest, FillCollectionPageEvidence, FillCollectionWindow,
+        MAX_FILL_COLLECTION_WINDOW_AGE_MS, MIN_FILL_COLLECTION_PAGE_INTERVAL_MS,
+        OKX_RECENT_FILLS_RETENTION_MS,
+    };
 
     use super::*;
 
@@ -978,6 +1161,7 @@ mod tests {
             recovered,
             vec![evidence("/statement")],
             vec![statement_fill()],
+            FillEvidenceContext::OperatorPages,
         );
 
         assert!(report.passed);
@@ -1000,6 +1184,7 @@ mod tests {
             recovered,
             vec![evidence("/statement")],
             vec![statement_fill()],
+            FillEvidenceContext::OperatorPages,
         );
 
         assert!(!report.passed);
@@ -1035,6 +1220,7 @@ mod tests {
             recovered,
             vec![evidence("/statement")],
             vec![statement_fill()],
+            FillEvidenceContext::OperatorPages,
         );
 
         assert!(!report.passed);
@@ -1044,6 +1230,55 @@ mod tests {
         );
         assert!(report.journal_strategy_name.is_none());
         assert!(report.journal_config_fingerprint.is_none());
+    }
+
+    #[test]
+    fn authenticated_collection_establishes_coverage_and_binds_journal_config() {
+        let expected_account_identity = "d".repeat(64);
+        let context = |config_fingerprint: &str| FillEvidenceContext::AuthenticatedCollection {
+            manifest: evidence("/manifest"),
+            account_identity_sha256: expected_account_identity.clone(),
+            config_fingerprint: config_fingerprint.to_string(),
+            pages: vec![evidence("/statement")],
+        };
+        let report = build_report(
+            options(false),
+            "b".repeat(64),
+            evidence("/journal"),
+            recovered_with_identity(vec![journal_fill()], 1),
+            vec![evidence("/statement")],
+            vec![statement_fill()],
+            context(&"c".repeat(64)),
+        );
+
+        assert!(report.passed);
+        assert_eq!(
+            report.coverage,
+            FillStatementCoverage::AuthenticatedRecentFillCollection
+        );
+        assert!(!report.statement_account_and_window_completeness_attested);
+        assert!(report.statement_account_and_window_completeness_established);
+        assert!(report.collection_manifest.is_some());
+        assert_eq!(
+            report.account_identity_sha256.as_deref(),
+            Some(expected_account_identity.as_str())
+        );
+
+        let mismatched = build_report(
+            options(false),
+            "b".repeat(64),
+            evidence("/journal"),
+            recovered_with_identity(vec![journal_fill()], 1),
+            vec![evidence("/statement")],
+            vec![statement_fill()],
+            context(&"e".repeat(64)),
+        );
+        assert!(!mismatched.passed);
+        assert!(
+            mismatched
+                .failures
+                .contains(&FillStatementFailure::CollectionConfigFingerprintMismatch)
+        );
     }
 
     #[test]
@@ -1072,6 +1307,7 @@ mod tests {
             recovered,
             vec![evidence("/statement")],
             vec![statement_fill],
+            FillEvidenceContext::OperatorPages,
         );
 
         assert!(!report.passed);
@@ -1127,6 +1363,137 @@ mod tests {
         );
         assert!(report.journal_recovery.exclusive_lease_held_while_reading);
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn authenticated_collection_reconciles_exact_manifest_page_and_journal() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "reap-fill-collection-statement-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let config_path = root.join("live.toml");
+        let page_path = root.join("page-0001.json");
+        let manifest_path = root.join("manifest.json");
+        let journal_path = root.join("journal.jsonl");
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let begin_ms = now_ms - 120_000;
+        let fill_ms = now_ms - 90_000;
+        let end_ms = now_ms - 60_000;
+        let config_bytes = include_bytes!("../../../examples/live-okx-demo.toml");
+        std::fs::write(&config_path, config_bytes).unwrap();
+        let config =
+            crate::LiveConfig::from_toml(std::str::from_utf8(config_bytes).unwrap()).unwrap();
+        let config_fingerprint = config.fingerprint().unwrap();
+        let account = config.account("main").unwrap();
+        let page_bytes = format!(
+            r#"{{"code":"0","msg":"","data":[{{"billId":"bill-1","tradeId":"trade-1","ordId":"exchange-1","clOrdId":"client-1","instId":"BTC-USDT","side":"buy","fillPx":"50000","fillSz":"0.01","execType":"M","fee":"-0.00001","feeCcy":"BTC","fillTime":"{fill_ms}"}}]}}"#
+        );
+        std::fs::write(&page_path, page_bytes.as_bytes()).unwrap();
+        let collection_evidence = |path: &Path| {
+            let canonical = std::fs::canonicalize(path).unwrap();
+            let bytes = std::fs::read(&canonical).unwrap();
+            FillCollectionFileEvidence {
+                path: canonical.to_str().unwrap().to_string(),
+                bytes: bytes.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(&bytes)),
+            }
+        };
+        let config_file = collection_evidence(&config_path);
+        let response = collection_evidence(&page_path);
+        let manifest = FillCollectionManifest {
+            schema_version: FILL_COLLECTION_SCHEMA_VERSION,
+            coverage: FillCollectionCoverage::CompleteOkxRecentFills,
+            java_reference_revision: PINNED_JAVA_REVISION.to_string(),
+            reap_version: env!("CARGO_PKG_VERSION").to_string(),
+            executable_sha256: "a".repeat(64),
+            host_identity_sha256: "b".repeat(64),
+            config_file,
+            config_fingerprint: config_fingerprint.clone(),
+            environment: config.venue.environment,
+            account_id: "main".to_string(),
+            account_identity_sha256: "d".repeat(64),
+            account_level: account.expected_account_level,
+            position_mode: account.expected_position_mode,
+            endpoint: "/api/v5/trade/fills".to_string(),
+            retention_ms: OKX_RECENT_FILLS_RETENTION_MS,
+            maximum_window_age_ms: MAX_FILL_COLLECTION_WINDOW_AGE_MS,
+            window: FillCollectionWindow {
+                begin_ms,
+                end_ms,
+                endpoints_inclusive: true,
+                minimum_close_delay_ms: 30_000,
+            },
+            max_pages: 3,
+            page_interval_ms: MIN_FILL_COLLECTION_PAGE_INTERVAL_MS,
+            start_clock: FillCollectionClockEvidence {
+                local_midpoint_ms: now_ms,
+                server_ms: now_ms,
+                absolute_skew_ms: 0,
+            },
+            finish_clock: FillCollectionClockEvidence {
+                local_midpoint_ms: now_ms + 1,
+                server_ms: now_ms + 1,
+                absolute_skew_ms: 0,
+            },
+            pages: vec![FillCollectionPageEvidence {
+                page_index: 1,
+                request_path: "/api/v5/trade/fills?limit=100".to_string(),
+                requested_after: None,
+                next_after: None,
+                rows: 1,
+                minimum_fill_time_ms: Some(fill_ms),
+                maximum_fill_time_ms: Some(fill_ms),
+                response,
+            }],
+            total_rows: 1,
+            window_rows: 1,
+            total_response_bytes: page_bytes.len() as u64,
+            account_identity_sampled_before_and_after: true,
+            complete: true,
+        };
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let journal_bytes = format!(
+            "{{\"schema_version\":5,\"record\":{{\"kind\":\"bootstrap\",\"data\":{{\"ts_ms\":{begin_ms},\"account_id\":\"main\",\"strategy_name\":\"iarb2\",\"config_fingerprint\":\"{config_fingerprint}\",\"baseline_fill_ids\":[]}}}}}}\n{{\"schema_version\":5,\"record\":{{\"kind\":\"fill\",\"data\":{{\"ts_ms\":{fill_ms},\"account_id\":\"main\",\"fill_id\":\"trade-1\",\"order_id\":\"client-1\",\"symbol\":\"BTC-USDT\",\"side\":\"buy\",\"price\":50000.0,\"qty\":0.01,\"liquidity\":\"maker\",\"fee\":{{\"amount\":-0.00001,\"currency\":\"BTC\"}}}}}}}}\n"
+        );
+        std::fs::write(&journal_path, journal_bytes).unwrap();
+        let report = reconcile_okx_fill_collection_paths(
+            &journal_path,
+            &manifest_path,
+            FillStatementReconciliationOptions {
+                account_id: "main".to_string(),
+                begin_ms,
+                end_ms,
+                minimum_fills: 1,
+                tolerances: FillStatementTolerances {
+                    price_abs: 0.0,
+                    quantity_abs: 0.0,
+                    fee_abs: 0.0,
+                },
+                statement_account_and_window_completeness_attested: false,
+            },
+        )
+        .unwrap();
+
+        assert!(report.passed);
+        assert_eq!(
+            report.coverage,
+            FillStatementCoverage::AuthenticatedRecentFillCollection
+        );
+        assert_eq!(report.comparison.counts.compared, 1);
+        assert!(report.collection_manifest.is_some());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -239,37 +239,48 @@ cargo run -p reap-cli -- live \
   --pretty
 ```
 
-After the bounded demo is stopped, export every unmodified OKX
-`/api/v5/trade/fills` or `/api/v5/trade/fills-history` response page for the
-account and time window, then reconcile the canonical journal's fills and exact
-signed fees offline:
+After the bounded demo is stopped and the window has been closed for at least 60
+seconds, collect authenticated recent-fill evidence and reconcile the canonical
+journal's fills and exact signed fees offline:
 
 ```bash
+BEGIN_MS=1783987200000
+END_MS=1783990800000
+FILL_EVIDENCE="/secure/evidence/okx-fills-$(date -u +%Y%m%dT%H%M%SZ)"
 FILL_REPORT="/tmp/reap-fill-reconciliation-$(date -u +%Y%m%dT%H%M%SZ).json"
+cargo run -p reap-cli -- collect-fills \
+  --config examples/live-okx-demo.toml \
+  --account main \
+  --begin-ms "$BEGIN_MS" \
+  --end-ms "$END_MS" \
+  --output "$FILL_EVIDENCE" \
+  --pretty
+
 cargo run -p reap-cli -- reconcile-fills \
   --journal var/reap/live-events.jsonl \
-  --statement /secure/evidence/okx-fills-page-01.json \
-  --statement /secure/evidence/okx-fills-page-02.json \
+  --collection-manifest "$FILL_EVIDENCE/manifest.json" \
   --account main \
-  --begin-ms 1783987200000 \
-  --end-ms 1783990800000 \
+  --begin-ms "$BEGIN_MS" \
+  --end-ms "$END_MS" \
   --minimum-fills 10 \
-  --confirm-statement-account-and-window-complete \
   --output "$FILL_REPORT" \
   --require-pass \
   --pretty
 ```
 
-The command opens no exchange connection. It requires the live process to be
-stopped, takes the same exclusive journal lease, hashes the exact bytes it
-parses, records the reconciliation executable hash and journal bootstrap
-strategy/config identity, compares strict `(symbol, tradeId)` identities, and
-refuses duplicate, missing, malformed, fee-less, or field-mismatched fills. A
-missing or invalid bootstrap identity for the selected account also fails the
-report. The OKX response body does not echo its account or request parameters,
-so the confirmation flag is an explicit operator attestation. This report
-covers fills and fees only; it is not balance, position, funding, equity,
-liability, tax, or currency-conversion reconciliation.
+`collect-fills` performs authenticated read-only REST requests and cannot submit
+orders. It samples exchange time and account identity before and after paging,
+uses the current recent `/api/v5/trade/fills` endpoint, paces 100-row pages at
+least 200 ms apart, and requires a short terminal page within a fail-closed
+bound. The verifier re-hashes the exact config, manifest, and response bytes and
+replays the cursor chain. Reconciliation then takes the exclusive journal lease,
+requires the journal and collection config fingerprints to match, compares
+strict `(symbol, tradeId)` identities, and refuses duplicate, missing,
+malformed, fee-less, or field-mismatched fills. Older `fills-history` exports can
+still be supplied manually with repeated `--statement` and the explicit
+`--confirm-statement-account-and-window-complete` attestation, but that coverage
+is weaker. The report covers fills and fees only; it is not balance, position,
+funding, equity, liability, tax, or currency-conversion reconciliation.
 
 Each create-new live report contains the exact checkpoint and full evidence
 config fingerprints, Reap executable hash, pinned Java revision, pseudonymous
