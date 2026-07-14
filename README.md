@@ -247,12 +247,26 @@ cargo run -p reap-cli -- emergency-cancel \
   --confirm-order-producers-stopped \
   --output "$EMERGENCY_REPORT" \
   --pretty
+
+EMERGENCY_VERIFICATION="/tmp/reap-emergency-verification-$(date -u +%Y%m%dT%H%M%SZ).json"
+cargo run -p reap-cli -- verify-emergency-cancel \
+  --config examples/live-okx-demo.toml \
+  --report "$EMERGENCY_REPORT" \
+  --output "$EMERGENCY_VERIFICATION" \
+  --require-all-configured-accounts \
+  --require-pass \
+  --pretty
 ```
 
 The output path is reserved before parsing credentials or starting REST work.
 `all_clear = true` requires both `regular_orders_all_clear = true` and complete
 config/binary/host/exchange-account/task evidence; early configuration failures
-leave an empty reserved path, which is never a report.
+leave an empty reserved path, which is never a report. Both report paths are
+owner-only and synced with their parent directory. Offline verification hashes
+the exact config/report bytes and re-derives account coverage, trigger-horizon,
+final-zero, provenance, and completion invariants. It cannot replay raw exchange
+responses or prove the operator stopped every external order producer, and the
+regular-order scope still excludes OKX algo and spread orders.
 
 For a controlled minimal-size demo process-kill campaign, wait for the already
 armed deadman to expire without issuing another cancel, then collect and verify

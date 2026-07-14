@@ -18,7 +18,7 @@ production trading process.
 | Instrument/account bootstrap | Account instruments/config/balance/positions are typed; economic snapshots preserve borrowing flags, liabilities, interest, and margin-loan fields; live spot and borrow limits are cash-only/zero; enabled borrowing, missing applicable evidence, nonzero liabilities, margin positions, and nonzero positions outside configured ownership/mode fail before strategy/risk application | Needs a passing artifact from the real target account; tooling alone is not evidence |
 | Startup/restart gate | Executable phase state, engine-consumed account-snapshot invariant, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, durable latch restore, authoritative account repair, second-pass clean REST reconciliation, and read-only journal-bound deadman-expiry certification | Needs process-kill demo evidence; tooling alone is not evidence |
 | Event-loop profile | Allocation-aware raw OKX parity benchmark covers redundant wire input through strategy/risk and storage-record construction | Needs target-host capture and exchange-latency validation |
-| Operator control and alerts | HMAC-authenticated local controls use fsynced write-ahead latches; OKX Cancel All After is maintained independently; a separate CLI can arm the deadman, cancel all regular orders account-wide, and prove post-trigger zero; another read-only CLI can prove source `20` after controlled process death | Must exercise target alert routing, deadman expiry, and the independent cancel procedure; algo/spread orders remain outside their scope |
+| Operator control and alerts | HMAC-authenticated local controls use fsynced write-ahead latches; OKX Cancel All After is maintained independently; a separate CLI can arm the deadman, cancel all regular orders account-wide, and prove post-trigger zero with offline exact-config verification; another read-only CLI can prove source `20` after controlled process death | Must exercise target alert routing, deadman expiry, and the independent cancel procedure; algo/spread orders remain outside their scope |
 | Process/host controls | Canonical journal ownership is exclusively locked before recovery or network setup; optional Linux disk, memory, and kernel-clock checks run at preflight and periodically; hardened systemd templates encode mode-specific restart policy | Must be installed, enabled, thresholded, monitored, and fault-tested on the target host |
 | Build/supply chain | Rust `1.95.0` is pinned; least-privilege CI checks formatting, all-target lint, all workspace tests, a locked release build, and RustSec advisories; Cargo and Actions updates are proposed weekly | CI must remain green and dependency updates reviewed, but this does not replace credentialed exchange or target-host evidence |
 | Exchange certification | Point-in-time account certification and journal-bound process-death deadman collection/offline replay are implemented, but no passing target-account artifact, OKX demo soak, deadman artifact, or broader fault campaign is recorded | Production blocker |
@@ -276,6 +276,13 @@ production trading process.
     evidence. Its output explicitly excludes process-death causality, deadman
     expiry, emergency cancellation, fill/fee reconciliation, and deployment
     approval, so no credential-free fixture can satisfy the remaining demo gate.
+41. `verify-emergency-cancel` independently re-hashes exact config/report bytes,
+    rejects symlinks and duplicate or mismatched account coverage, re-derives
+    regular-order zero only after the Cancel All After trigger horizon, and can
+    require every configured account. Emergency evidence and its verification
+    artifact are owner-only and directory-durable. The report does not embed raw
+    REST bodies, prove that all external order producers stopped, or cover OKX
+    algo/spread orders.
 
 ## Remaining Demo Gate
 
@@ -302,7 +309,9 @@ production trading process.
    wait for expiry, and archive a passing `certify-deadman-expiry` artifact plus
    `verify-deadman-certification --require-pass` result. In a separate forced-
    death iteration, exercise the independent emergency command and archive its
-   zero-order report; incident cancellation must never wait for certification.
+   zero-order report plus a passing `verify-emergency-cancel --require-pass`
+   result with `--require-all-configured-accounts`; incident cancellation must
+   never wait for certification.
    Populate `examples/live-fault-matrix.toml` with the isolated reports and
    injector records, then require `verify-live-fault-matrix --require-pass`.
 4. Complete a sustained soak with zero unexplained order, fill, balance,
@@ -333,7 +342,9 @@ Production enablement additionally requires:
 - A passing target-host demo `certify-deadman-expiry` artifact, independently
   rechecked against the exact stopped journal with
   `verify-deadman-certification --require-pass`, plus separate supervisor/fault-
-  injector and emergency-cancel evidence.
+  injector and emergency-cancel evidence, including a passing exact-config
+  `verify-emergency-cancel --require-pass` result with
+  `--require-all-configured-accounts`.
 - Sustained redundant direct currency/USD index coverage for every non-USD
   accounting currency, with zero conversion failures and fee/cash/funding/equity
   reconciliation against target-tier demo statements.

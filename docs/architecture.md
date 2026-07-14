@@ -739,6 +739,7 @@ Target command surface:
 reap live --config config/live.toml
 reap capture --config config/capture.toml --output capture-report.json
 reap emergency-cancel --config config/live.toml --account account-id --output emergency.json
+reap verify-emergency-cancel --config config/live.toml --report emergency.json --require-pass
 reap certify-deadman-expiry --config config/live.toml --account account-id --output deadman.json
 reap verify-deadman-certification --artifact deadman.json --journal live-events.jsonl
 reap operator --config config/live.toml status
@@ -751,10 +752,10 @@ reap inspect-book --capture raw/ws.jsonl --symbol BTC-USDT
 reap config-check --config config/live.toml
 ```
 
-`live`, `capture`, `emergency-cancel`, both deadman-certification commands,
-`operator`, `backtest`, `research`, `replay-check`, `analyze-capture`, `verify-capture`,
-`calibrate-latency`, and `config-check` are implemented. `inspect-book` remains planned; see
-[trading-readiness.md](trading-readiness.md).
+`live`, `capture`, both emergency-cancel commands, both deadman-certification
+commands, `operator`, `backtest`, `research`, `replay-check`, `analyze-capture`,
+`verify-capture`, `calibrate-latency`, and `config-check` are implemented.
+`inspect-book` remains planned; see [trading-readiness.md](trading-readiness.md).
 
 ## Multi-Websocket Design
 
@@ -1071,8 +1072,10 @@ the deployment blocker.
 - Add exclusive journal ownership, bounded external alerts, and host resource
   preflight/periodic guards. Done; target-host deployment evidence remains.
 - Add strategy-independent account-wide regular-order cancellation and hardened
-  mode-specific process supervision templates. Done; target-host/account fault
-  exercise and separate algo/spread handling remain.
+  mode-specific process supervision templates. Done; exact config/report bytes
+  and all-configured-account zero invariants are independently verifiable.
+  Target-host/account fault exercise, raw REST-response replay, and separate
+  algo/spread handling remain.
 - Complete fault injection and OKX demo soak acceptance.
 
 See [trading-readiness.md](trading-readiness.md) for the detailed gate.

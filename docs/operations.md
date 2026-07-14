@@ -958,6 +958,7 @@ Incident procedure:
 ```bash
 umask 077
 REPORT=/var/lib/reap/live/btc-demo/emergency-cancel-$(date -u +%Y%m%dT%H%M%SZ).json
+VERIFICATION=/var/lib/reap/live/btc-demo/emergency-cancel-verification-$(date -u +%Y%m%dT%H%M%SZ).json
 /usr/local/bin/reap emergency-cancel \
   --config /etc/reap/live/btc-demo.toml \
   --account main \
@@ -967,6 +968,13 @@ REPORT=/var/lib/reap/live/btc-demo/emergency-cancel-$(date -u +%Y%m%dT%H%M%SZ).j
   --account-timeout-secs 40 \
   --deadman-timeout-secs 10 \
   --output "$REPORT" \
+  --pretty
+/usr/local/bin/reap verify-emergency-cancel \
+  --config /etc/reap/live/btc-demo.toml \
+  --report "$REPORT" \
+  --output "$VERIFICATION" \
+  --require-all-configured-accounts \
+  --require-pass \
   --pretty
 ```
 
@@ -980,14 +988,17 @@ account's producers have been stopped and replaces all `--account` arguments.
    Every REST call and pacing delay shares one absolute account timeout. A batch
    acknowledgement is only request acceptance; the final REST zero observation
    is authoritative.
-5. `--output` is create-new, reserved before config/credential/network work,
-   written and fsynced before the final exit status. Require schema 1, the
-   archived exact-config SHA-256, pinned Java revision, expected Reap binary and
-   host hashes, and each pseudonymous `account_identity_sha256` matching the
-   corresponding live report. Require `regular_orders_all_clear = true`,
-   `evidence_complete = true`, and top-level `all_clear = true`. Each account
-   must have `deadman_armed = true` and `verified_zero_after_deadman = true`.
-   Review all provenance, execution, and account incidents, plus
+5. Both output paths are owner-only create-new files, synced with their parent
+   directory before final status. `verify-emergency-cancel` rejects symlinks and
+   oversized files, hashes the exact config/report bytes, rejects unknown JSON
+   fields, re-runs the command's pure REST-origin/pacing/timing-budget checks,
+   re-derives configured/selected/report account coverage, validates the deadman
+   trigger horizon and final regular-order zero, and recomputes every top-level
+   completion flag. Use `--require-all-configured-accounts` for gate evidence.
+   Require schema 1, the pinned Java revision, expected Reap binary and host
+   hashes, each pseudonymous `account_identity_sha256` matching the corresponding
+   live report, and `acceptance_passed = true`. Review all
+   provenance, execution, and account incidents, plus
    partial/rejected/unacknowledged cancel counts, unmanaged symbols, and
    remaining-order details even when final zero succeeds. An account-task
    failure is retained as non-passing evidence.
@@ -1002,8 +1013,11 @@ account's producers have been stopped and replaces all `--account` arguments.
    after clean readiness and explicit operator approval; never auto-restart from
    this procedure.
 
-This is an out-of-process safety layer, not a production certification or a
-replacement for exchange-side account limits and operator access controls.
+The verifier can establish report/config integrity and internal consistency; it
+cannot replay raw REST bodies, authenticate the recorded executable/host hashes,
+or prove the producer-stop attestation. This is an out-of-process safety layer,
+not a production certification or a replacement for exchange-side account
+limits and operator access controls.
 
 ## Process-Death Deadman Certification
 

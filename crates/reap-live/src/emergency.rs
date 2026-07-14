@@ -20,11 +20,11 @@ use crate::provenance::{
 };
 use crate::{OkxVenueConfig, RuntimeConfig, TradingEnvironment};
 
-const MAX_INCIDENTS: usize = 64;
-const MAX_INCIDENT_MESSAGE_BYTES: usize = 4_096;
-const MAX_REMAINING_ORDER_DETAILS: usize = 100;
-const REGULAR_ORDER_SCOPE: &str = "okx_regular_orders";
-const EXCLUDED_ORDER_CLASSES: [&str; 2] = ["algo_orders", "spread_orders"];
+pub(crate) const MAX_INCIDENTS: usize = 64;
+pub(crate) const MAX_INCIDENT_MESSAGE_BYTES: usize = 4_096;
+pub(crate) const MAX_REMAINING_ORDER_DETAILS: usize = 100;
+pub(crate) const REGULAR_ORDER_SCOPE: &str = "okx_regular_orders";
+pub(crate) const EXCLUDED_ORDER_CLASSES: [&str; 2] = ["algo_orders", "spread_orders"];
 pub const EMERGENCY_CANCEL_REPORT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone)]
@@ -198,6 +198,46 @@ struct EmergencyFileConfig {
     #[serde(default)]
     runtime: EmergencyRuntimeConfig,
     accounts: Vec<EmergencyAccountConfig>,
+}
+
+pub(crate) struct EmergencyConfigReview {
+    pub environment: TradingEnvironment,
+    pub account_ids: Vec<String>,
+    pub validation_error: Option<String>,
+}
+
+pub(crate) fn review_emergency_config(
+    text: &str,
+    selected_accounts: &[String],
+    account_timeout_ms: u64,
+    poll_interval_ms: u64,
+    deadman_timeout_secs: u64,
+) -> Result<EmergencyConfigReview, toml::de::Error> {
+    let config: EmergencyFileConfig = toml::from_str(text)?;
+    let validation_error = validate_and_select_accounts(
+        &config,
+        &EmergencyCancelOptions {
+            account_ids: selected_accounts.to_vec(),
+            all_configured_accounts: false,
+            confirm_account_wide_cancel: true,
+            confirm_order_producers_stopped: true,
+            confirm_production: true,
+            account_timeout: Duration::from_millis(account_timeout_ms),
+            poll_interval: Duration::from_millis(poll_interval_ms),
+            deadman_timeout_secs,
+        },
+    )
+    .err()
+    .map(|error| error.to_string());
+    Ok(EmergencyConfigReview {
+        environment: config.venue.environment,
+        account_ids: config
+            .accounts
+            .into_iter()
+            .map(|account| account.id)
+            .collect(),
+        validation_error,
+    })
 }
 
 #[derive(Debug, Deserialize)]

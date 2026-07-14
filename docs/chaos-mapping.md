@@ -149,6 +149,16 @@ Rust intentionally adds a stronger audit boundary: after a report-capable
 runtime exists, an initialization, event-loop, or teardown error completes
 fail-closed cancellation/reconciliation, persists the schema-7 failure code plus
 pre/post-cleanup evidence, and only then returns the nonzero process error.
+
+The same pinned Java tree makes stop/cancel ordering explicit:
+`StrategyEngine.tryToStop` pauses before `cancelAll`, while
+`StrategyOrderSender.cancelAll` emits account-level cancel-all requests across
+the account's routing groups. Reap's out-of-process emergency command is a
+stronger operational boundary for regular OKX orders because it does not depend
+on the strategy process or journal and enumerates unmanaged symbols. Its offline
+verifier re-derives exact-config, account-coverage, trigger-horizon, and final-zero
+invariants; it does not expand the venue scope to algo/spread orders or turn
+self-reported REST outcomes into replayable raw exchange evidence.
 Deadman heartbeat, periodic clock skew/check, and authenticated account-config
 drift/check failures have distinct stable codes. This report does not make the
 fault acceptable; it makes the required demo fault campaign machine-reviewable.

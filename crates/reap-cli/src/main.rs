@@ -9,10 +9,11 @@ use reap_capture::{
     CaptureConfig, CaptureRunOptions, analyze_capture_path, run_capture, verify_capture_paths,
 };
 use reap_live::{
-    DeadmanExpiryCertificationOptions, EmergencyCancelOptions, LiveConfig, LiveMode,
-    LiveRunOptions, LiveRuntimeError, OperatorCommand, collect_account_certification_path,
-    collect_deadman_expiry_certification_path, run_emergency_cancel_path, send_operator_command,
-    verify_account_certification_path, verify_deadman_expiry_certification_path,
+    DeadmanExpiryCertificationOptions, EmergencyCancelOptions, EmergencyCancelVerificationOptions,
+    LiveConfig, LiveMode, LiveRunOptions, LiveRuntimeError, OperatorCommand,
+    collect_account_certification_path, collect_deadman_expiry_certification_path,
+    run_emergency_cancel_path, send_operator_command, verify_account_certification_path,
+    verify_deadman_expiry_certification_path, verify_emergency_cancel_paths,
 };
 use reap_strategy::ChaosConfig;
 
@@ -371,6 +372,31 @@ enum Command {
         )]
         output: Option<PathBuf>,
         #[arg(long, help = "Pretty-print JSON evidence")]
+        pretty: bool,
+    },
+    #[command(
+        about = "Independently verify an emergency regular-order cancellation report",
+        long_about = "Re-hash the exact emergency config and report, re-derive account coverage, deadman-horizon, provenance, and regular-order zero invariants, and optionally require every configured account. Algo and spread orders remain excluded."
+    )]
+    VerifyEmergencyCancel {
+        #[arg(short, long, help = "Exact live TOML used by emergency-cancel")]
+        config: PathBuf,
+        #[arg(short, long, help = "Schema-1 emergency-cancel JSON report")]
+        report: PathBuf,
+        #[arg(
+            short,
+            long,
+            help = "Optionally create this owner-readable verification artifact"
+        )]
+        output: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Require the report to cover every account in the supplied config"
+        )]
+        require_all_configured_accounts: bool,
+        #[arg(long, help = "Exit non-zero unless every verification gate passes")]
+        require_pass: bool,
+        #[arg(long)]
         pretty: bool,
     },
 }
@@ -935,18 +961,7 @@ async fn main() -> Result<()> {
                 .context("failed to initialize emergency-cancel tracing")?;
             let mut output_file = output
                 .as_ref()
-                .map(|output| {
-                    OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(output)
-                        .with_context(|| {
-                            format!(
-                                "failed to reserve emergency-cancel output {}",
-                                output.display()
-                            )
-                        })
-                })
+                .map(|path| reserve_private_output(path, "emergency-cancel report"))
                 .transpose()?;
             let report = run_emergency_cancel_path(
                 &config,
@@ -973,10 +988,8 @@ async fn main() -> Result<()> {
             } else {
                 serde_json::to_string(&report)?
             };
-            if let Some(file) = &mut output_file {
-                file.write_all(json.as_bytes())?;
-                file.write_all(b"\n")?;
-                file.sync_all()?;
+            if let (Some(file), Some(path)) = (&mut output_file, output.as_deref()) {
+                persist_reserved_output(file, path, &json, "emergency-cancel report")?;
             }
             println!("{json}");
             if !report.regular_orders_all_clear {
@@ -991,6 +1004,45 @@ async fn main() -> Result<()> {
             }
             if !report.all_clear {
                 anyhow::bail!("emergency cancel report violated its all-clear invariant");
+            }
+        }
+        Command::VerifyEmergencyCancel {
+            config,
+            report,
+            output,
+            require_all_configured_accounts,
+            require_pass,
+            pretty,
+        } => {
+            let mut output_file = output
+                .as_ref()
+                .map(|path| reserve_private_output(path, "emergency-cancel verification"))
+                .transpose()?;
+            let verification = verify_emergency_cancel_paths(
+                &config,
+                &report,
+                EmergencyCancelVerificationOptions {
+                    require_all_configured_accounts,
+                },
+            )
+            .with_context(|| {
+                format!(
+                    "failed to verify emergency-cancel report {} against {}",
+                    report.display(),
+                    config.display()
+                )
+            })?;
+            let json = if pretty {
+                serde_json::to_string_pretty(&verification)?
+            } else {
+                serde_json::to_string(&verification)?
+            };
+            if let (Some(file), Some(path)) = (&mut output_file, output.as_deref()) {
+                persist_reserved_output(file, path, &json, "emergency-cancel verification")?;
+            }
+            println!("{json}");
+            if require_pass && !verification.acceptance_passed {
+                anyhow::bail!("emergency-cancel verification did not pass");
             }
         }
     }

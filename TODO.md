@@ -197,6 +197,10 @@ architecture in [docs/architecture.md](docs/architecture.md).
   schema, exact config file, binary, host, Java revision, and the same
   pseudonymous exchange-account identity as live reports; turn account task
   failures into bounded non-passing evidence instead of losing the report.
+- [x] Add strict credential-free emergency-cancel verification that re-hashes
+  exact config/report bytes, re-derives selected/configured account coverage,
+  trigger-horizon and final-zero invariants, and can require every configured
+  account without claiming raw exchange-response replay or algo/spread scope.
 - [x] Add hardened systemd templates with bounded observe restart and manual
   demo/capture restart, plus the stop/cancel/reconcile operating procedure.
 - [x] Persist current OKX order-channel fills and exact per-fill fees once across
