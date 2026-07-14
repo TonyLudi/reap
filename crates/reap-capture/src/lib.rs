@@ -1012,9 +1012,11 @@ where
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options
             .open(&path)
             .await
             .map_err(|source| CaptureError::OpenOutput {
@@ -1406,6 +1408,13 @@ mod tests {
         let writer = JsonlWriter::start("test", path.clone(), 4, 1, 0)
             .await
             .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
         let event = NormalizedEvent::from(MarketEvent::Depth(OrderBook {
             symbol: "BTC-USDT".to_string(),
             ts_ms: 1,

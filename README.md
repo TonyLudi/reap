@@ -141,7 +141,8 @@ by live trading. Use a new output path for each capture process; replay rejects
 concatenated session IDs rather than treating downtime as continuous data.
 Capture refuses an existing report, raw, or normalized path instead of
 overwriting or appending. Verify the durable run report before standalone
-analysis or strategy replay:
+analysis or strategy replay. On Unix, all three artifacts are created mode
+`0600` independently of the caller's umask:
 
 ```bash
 cargo run -p reap-cli -- verify-capture \

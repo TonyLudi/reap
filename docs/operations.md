@@ -43,12 +43,13 @@ limit. The configured interval is part of capture and live config provenance;
 paced startup must fit inside the live readiness timeout.
 
 Every frame and run report carries a generated `capture_session_id`. The report,
-raw output, and normalized output use create-new semantics: startup refuses an
-existing path and never appends a second process session. The report is reserved
-mode `0600` before config parsing or network startup; a pre-report failure leaves
-an empty reserved file that verification rejects. Use unique paths for each
-process. Strict replay and raw backtest also reject files containing more than
-one session ID, because process downtime is not a continuous HFT market stream.
+raw output, and normalized output use create-new mode-`0600` semantics on Unix:
+startup refuses an existing path and never appends a second process session.
+The report is reserved before config parsing or network startup; a pre-report
+failure leaves an empty reserved file that verification rejects. Use unique
+paths for each process. Strict replay and raw backtest also reject files
+containing more than one session ID, because process downtime is not a continuous
+HFT market stream.
 
 Book deduplication keys exact redundant images by action, `prevSeqId`, `seqId`,
 exchange timestamp, and raw-payload hash. A replica conflict is not suppressed;

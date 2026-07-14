@@ -103,8 +103,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
   no-change updates, deduplicate byte-identical images across sequence epochs,
   fail closed on conflicting replicas, and cover reset/recovery with raw replay
   fixtures.
-- [x] Give capture output create-new semantics with per-run CLI path overrides,
-  then complete a real public capture, strict replay, and raw backtest smoke.
+- [x] Give capture output create-new owner-only semantics with per-run CLI path
+  overrides, then complete a real public capture, strict replay, and raw
+  backtest smoke.
 - [x] Add exact raw/config fingerprints and streaming capture analysis for
   per-subscription source coverage, timing, depth, spread, movement, and trade
   distributions; verify its strict gate against a fresh public capture.
