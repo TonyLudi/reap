@@ -66,7 +66,8 @@ Implemented:
 - CSV/normalized replay, raw-capture validation, configuration validation, and
   a release-mode hot-path benchmark.
 - Credential-free public OKX capture with redundant websocket plans, raw-frame
-  durability, exact SHA/config provenance, bounded-memory capture analysis,
+  durability, a create-new run report, exact file/config provenance,
+  report-aware raw/normalized verification, bounded-memory capture analysis,
   normalized diagnostic output, and direct raw-capture backtests.
 
 Run the sample:
@@ -96,8 +97,10 @@ end-of-run connectivity defects:
 ```bash
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
 RAW_PATH="var/reap/capture/okx-btc-${RUN_ID}.jsonl"
+REPORT_PATH="var/reap/capture/okx-btc-${RUN_ID}.report.json"
 cargo run -p reap-cli -- capture \
   --config examples/capture-okx-public.toml \
+  --output "$REPORT_PATH" \
   --raw-path "$RAW_PATH" \
   --duration-secs 3600 \
   --require-clean-capture \
@@ -108,9 +111,15 @@ Validate and backtest the raw capture directly. Raw replay runs the same OKX
 adapter, redundant-feed deduplicator, sequence tracker, and book reducer used
 by live trading. Use a new output path for each capture process; replay rejects
 concatenated session IDs rather than treating downtime as continuous data.
-Capture refuses an existing raw or normalized path instead of appending:
+Capture refuses an existing report, raw, or normalized path instead of
+overwriting or appending. Verify the durable run report before standalone
+analysis or strategy replay:
 
 ```bash
+cargo run -p reap-cli -- verify-capture \
+  --config examples/capture-okx-public.toml \
+  --report "$REPORT_PATH" \
+  --events "$RAW_PATH" --require-pass --pretty
 cargo run -p reap-cli -- analyze-capture \
   --config examples/capture-okx-public.toml \
   --events "$RAW_PATH" --strict --pretty

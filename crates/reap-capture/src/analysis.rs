@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{CaptureConfig, CaptureError, digest_hex, is_book_channel};
 
-const ANALYSIS_FORMAT_VERSION: u16 = 1;
+const ANALYSIS_FORMAT_VERSION: u16 = 3;
 const DISTRIBUTION_SAMPLE_CAPACITY: usize = 8_192;
 const MAX_REPORTED_ERRORS: usize = 100;
 
@@ -115,6 +115,7 @@ pub struct CaptureAnalysisReport {
     pub sha256: String,
     pub bytes: u64,
     pub lines: u64,
+    pub ignored_lines: u64,
     pub capture_sessions: Vec<String>,
     pub first_recv_ts_ns: Option<u64>,
     pub last_recv_ts_ns: Option<u64>,
@@ -123,6 +124,9 @@ pub struct CaptureAnalysisReport {
     pub accepted_events: u64,
     pub duplicate_events: u64,
     pub normalized_events: u64,
+    pub reconstructed_normalized_records: u64,
+    pub reconstructed_normalized_bytes: u64,
+    pub reconstructed_normalized_sha256: String,
     pub gaps: u64,
     pub recoveries: u64,
     pub recovery_failures: u64,
@@ -174,6 +178,7 @@ pub fn analyze_capture<R: Read>(
         analyzer.hasher.update(&buffer);
         let line = trim_ascii_whitespace(&buffer);
         if line.is_empty() || line.first() == Some(&b'#') {
+            analyzer.ignored_lines = analyzer.ignored_lines.saturating_add(1);
             continue;
         }
         analyzer.lines = analyzer.lines.saturating_add(1);
@@ -202,8 +207,12 @@ struct CaptureAnalyzer<'a> {
     first_recv_ts_ns: Option<u64>,
     last_recv_ts_ns: Option<u64>,
     lines: u64,
+    ignored_lines: u64,
     bytes: u64,
     hasher: Sha256,
+    reconstructed_normalized_records: u64,
+    reconstructed_normalized_bytes: u64,
+    reconstructed_normalized_hasher: Sha256,
     error_count: u64,
     errors: Vec<CaptureAnalysisError>,
 }
@@ -236,8 +245,12 @@ impl<'a> CaptureAnalyzer<'a> {
             first_recv_ts_ns: None,
             last_recv_ts_ns: None,
             lines: 0,
+            ignored_lines: 0,
             bytes: 0,
             hasher: Sha256::new(),
+            reconstructed_normalized_records: 0,
+            reconstructed_normalized_bytes: 0,
+            reconstructed_normalized_hasher: Sha256::new(),
             error_count: 0,
             errors: Vec::new(),
         })
@@ -309,14 +322,46 @@ impl<'a> CaptureAnalyzer<'a> {
                 let duplicates = after.duplicates.saturating_sub(before.duplicates);
                 stream.accepted_events = stream.accepted_events.saturating_add(accepted);
                 stream.duplicate_events = stream.duplicate_events.saturating_add(duplicates);
-                for output in outputs {
-                    if let FeedOutput::Event(event) = output {
-                        stream.normalized_events = stream.normalized_events.saturating_add(1);
-                        stream.on_canonical_event(event.ts_ms());
-                        stream.on_normalized_event(&event);
+            }
+            for output in outputs {
+                match output {
+                    FeedOutput::Event(event) => {
+                        self.record_reconstructed_normalized(line, &event);
+                        if let Some(key) = &key {
+                            let stream = self.streams.entry(key.clone()).or_default();
+                            stream.normalized_events = stream.normalized_events.saturating_add(1);
+                            stream.on_canonical_event(event.ts_ms());
+                            stream.on_normalized_event(&event);
+                        }
                     }
+                    FeedOutput::System(event) => {
+                        self.record_reconstructed_normalized(line, &NormalizedEvent::System(event))
+                    }
+                    FeedOutput::Duplicate(_)
+                    | FeedOutput::RecoveryRequired(_)
+                    | FeedOutput::PrivateOrder { .. }
+                    | FeedOutput::PrivateFill { .. }
+                    | FeedOutput::PrivateAccount { .. } => {}
                 }
             }
+        }
+    }
+
+    fn record_reconstructed_normalized(&mut self, line: usize, event: &NormalizedEvent) {
+        match serde_json::to_vec(event) {
+            Ok(mut bytes) => {
+                bytes.push(b'\n');
+                self.reconstructed_normalized_records =
+                    self.reconstructed_normalized_records.saturating_add(1);
+                self.reconstructed_normalized_bytes = self
+                    .reconstructed_normalized_bytes
+                    .saturating_add(bytes.len() as u64);
+                self.reconstructed_normalized_hasher.update(bytes);
+            }
+            Err(error) => self.record_error(
+                line,
+                format!("failed to reconstruct normalized capture output: {error}"),
+            ),
         }
     }
 
@@ -444,6 +489,7 @@ impl<'a> CaptureAnalyzer<'a> {
             _ => None,
         };
         let integrity_healthy = self.lines > 0
+            && self.ignored_lines == 0
             && sessions.len() == 1
             && self.error_count == 0
             && processor.gaps == 0
@@ -465,6 +511,7 @@ impl<'a> CaptureAnalyzer<'a> {
             sha256: digest_hex(self.hasher.finalize()),
             bytes: self.bytes,
             lines: self.lines,
+            ignored_lines: self.ignored_lines,
             capture_sessions: sessions,
             first_recv_ts_ns: self.first_recv_ts_ns,
             last_recv_ts_ns: self.last_recv_ts_ns,
@@ -473,6 +520,11 @@ impl<'a> CaptureAnalyzer<'a> {
             accepted_events: processor.accepted,
             duplicate_events: processor.duplicates,
             normalized_events: processor.normalized_events,
+            reconstructed_normalized_records: self.reconstructed_normalized_records,
+            reconstructed_normalized_bytes: self.reconstructed_normalized_bytes,
+            reconstructed_normalized_sha256: digest_hex(
+                self.reconstructed_normalized_hasher.finalize(),
+            ),
             gaps: processor.gaps,
             recoveries: processor.recoveries,
             recovery_failures: processor.recovery_failures,
@@ -897,6 +949,17 @@ mod tests {
             .unwrap();
         assert!(!trades.complete);
         assert_eq!(trades.observed_connections, 0);
+    }
+
+    #[test]
+    fn analyzer_rejects_non_writer_blank_or_comment_records() {
+        let fixture = include_str!("../../../fixtures/raw/okx/depth-reset.jsonl");
+        let input = format!("# capture artifacts do not admit comments\n{fixture}\n");
+
+        let report = analyze_capture(input.as_bytes(), &config(false)).unwrap();
+
+        assert!(!report.integrity_healthy);
+        assert_eq!(report.ignored_lines, 2);
     }
 
     #[test]

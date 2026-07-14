@@ -99,8 +99,11 @@ production trading process.
     recovery. A later 60-second run exercised the streaming analyzer: all ten
     configured streams had both expected sources, both books retained 400
     levels per side, capture/analysis config fingerprints and raw SHA-256
-    matched, and strict analysis/replay found no integrity defect. This does not
-    replace sustained capture, execution calibration, or credentialed evidence.
+    matched, and strict analysis/replay found no integrity defect. A later
+    schema-3 run durably bound the exact config file and effective CLI overrides;
+    report-aware verification matched raw and independently reconstructed
+    normalized bytes/counters/hashes with no failure. This does not replace
+    sustained capture, execution calibration, or credentialed evidence.
 16. Live risk subscribes to configured stablecoin/USD indexes on redundant
     critical routes. Missing, stale, invalid, conflicting, or downside-depegged
     data blocks entry immediately; a sustained 5-second failure persists a

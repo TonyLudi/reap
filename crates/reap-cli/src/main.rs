@@ -1,11 +1,13 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
-use std::{fs::OpenOptions, io::Write};
+use std::{fs::File, fs::OpenOptions, io::Write};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use reap_backtest::{BacktestConfig, BacktestRunner, run_research_manifest_path};
-use reap_capture::{CaptureConfig, CaptureRunOptions, analyze_capture_path, run_capture};
+use reap_capture::{
+    CaptureConfig, CaptureRunOptions, analyze_capture_path, run_capture, verify_capture_paths,
+};
 use reap_live::{
     DeadmanExpiryCertificationOptions, EmergencyCancelOptions, LiveConfig, LiveMode,
     LiveRunOptions, LiveRuntimeError, OperatorCommand, collect_account_certification_path,
@@ -80,6 +82,27 @@ enum Command {
         #[arg(long)]
         pretty: bool,
     },
+    #[command(about = "Verify a capture report against config and replayed artifact bytes")]
+    VerifyCapture {
+        #[arg(short, long, help = "Original capture TOML configuration")]
+        config: PathBuf,
+        #[arg(short, long, help = "Durable JSON report emitted by reap capture")]
+        report: PathBuf,
+        #[arg(short = 'e', long, help = "Raw capture JSONL; it may have been moved")]
+        events: PathBuf,
+        #[arg(
+            long,
+            help = "Normalized JSONL required when the run report declares normalized output"
+        )]
+        normalized_events: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Exit non-zero unless all evidence and integrity gates pass"
+        )]
+        require_pass: bool,
+        #[arg(long)]
+        pretty: bool,
+    },
     ConfigCheck {
         #[arg(short, long)]
         config: PathBuf,
@@ -89,6 +112,12 @@ enum Command {
     Capture {
         #[arg(short, long)]
         config: PathBuf,
+        #[arg(
+            short,
+            long,
+            help = "Create this owner-readable JSON run report; existing files are refused"
+        )]
+        output: Option<PathBuf>,
         #[arg(
             long,
             help = "Create this raw output instead of the configured path; existing files are refused"
@@ -474,6 +503,32 @@ async fn main() -> Result<()> {
                 anyhow::bail!("capture analysis failed integrity invariants");
             }
         }
+        Command::VerifyCapture {
+            config,
+            report,
+            events,
+            normalized_events,
+            require_pass,
+            pretty,
+        } => {
+            let verification =
+                verify_capture_paths(&config, &report, &events, normalized_events.as_deref())
+                    .with_context(|| {
+                        format!(
+                            "failed to verify capture report {} against {}",
+                            report.display(),
+                            events.display()
+                        )
+                    })?;
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&verification)?);
+            } else {
+                println!("{}", serde_json::to_string(&verification)?);
+            }
+            if require_pass && !verification.passed {
+                anyhow::bail!("capture evidence did not satisfy verification gates");
+            }
+        }
         Command::ConfigCheck { config, pretty } => {
             let config_text = std::fs::read_to_string(&config)
                 .with_context(|| format!("failed to read config {}", config.display()))?;
@@ -491,16 +546,21 @@ async fn main() -> Result<()> {
         }
         Command::Capture {
             config,
+            output,
             raw_path,
             normalized_path,
             duration_secs,
             require_clean_capture,
             pretty,
         } => {
+            let mut report_file = output
+                .as_ref()
+                .map(|path| reserve_private_output(path, "capture report"))
+                .transpose()?;
             reap_telemetry::init_json_tracing("info")
                 .map_err(anyhow::Error::msg)
                 .context("failed to initialize capture tracing")?;
-            let mut capture_config = CaptureConfig::load(&config)
+            let (mut capture_config, config_source) = CaptureConfig::load_with_evidence(&config)
                 .with_context(|| format!("failed to load capture config {}", config.display()))?;
             if let Some(path) = raw_path {
                 capture_config.output.raw_path = path;
@@ -508,18 +568,29 @@ async fn main() -> Result<()> {
             if let Some(path) = normalized_path {
                 capture_config.output.normalized_path = Some(path);
             }
+            if output.as_ref().is_some_and(|output| {
+                output == &capture_config.output.raw_path
+                    || capture_config.output.normalized_path.as_ref() == Some(output)
+            }) {
+                anyhow::bail!("capture report path must differ from raw and normalized outputs");
+            }
             let report = run_capture(
                 capture_config,
                 CaptureRunOptions {
                     run_duration: duration_secs.map(Duration::from_secs),
+                    config_source: Some(config_source),
                 },
             )
             .await?;
-            if pretty {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+            let json = if pretty {
+                serde_json::to_string_pretty(&report)?
             } else {
-                println!("{}", serde_json::to_string(&report)?);
+                serde_json::to_string(&report)?
+            };
+            if let (Some(file), Some(path)) = (&mut report_file, output.as_deref()) {
+                persist_reserved_output(file, path, &json, "capture report")?;
             }
+            println!("{json}");
             if require_clean_capture && !report.clean_capture {
                 anyhow::bail!("bounded capture did not satisfy clean integrity invariants");
             }
@@ -846,4 +917,69 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn reserve_private_output(path: &Path, label: &str) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .with_context(|| format!("failed to reserve {label} {}", path.display()))
+}
+
+fn persist_reserved_output(file: &mut File, path: &Path, json: &str, label: &str) -> Result<()> {
+    file.write_all(json.as_bytes())
+        .and_then(|()| file.write_all(b"\n"))
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("failed to persist {label} {}", path.display()))?;
+    sync_parent_directory(path)
+        .with_context(|| format!("failed to persist {label} directory for {}", path.display()))
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_output_is_create_new_and_durable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("capture-report.json");
+        let mut file = reserve_private_output(&path, "test report").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        persist_reserved_output(&mut file, &path, "{\"passed\":true}", "test report").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"passed\":true}\n"
+        );
+        assert!(reserve_private_output(&path, "test report").is_err());
+    }
 }

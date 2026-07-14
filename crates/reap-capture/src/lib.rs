@@ -1,4 +1,5 @@
 mod analysis;
+mod verification;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -25,6 +26,9 @@ use tokio::task::JoinHandle;
 use url::Url;
 
 pub use analysis::*;
+pub use verification::*;
+
+pub const CAPTURE_RUN_REPORT_FORMAT_VERSION: u16 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaptureConfig {
@@ -141,6 +145,7 @@ pub struct CaptureValidation {
 #[derive(Debug, Clone)]
 pub struct CaptureRunOptions {
     pub run_duration: Option<Duration>,
+    pub config_source: Option<CaptureConfigFileEvidence>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,7 +155,8 @@ pub enum CaptureStopReason {
     OperatorSignal,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CaptureBookHealth {
     pub symbol: String,
     pub sequence_status: String,
@@ -163,11 +169,22 @@ pub struct CaptureBookHealth {
     pub best_ask: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureConfigFileEvidence {
+    pub source_path: PathBuf,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CaptureRunReport {
     pub format_version: u16,
     pub capture_session_id: String,
     pub config_fingerprint: String,
+    #[serde(default)]
+    pub config_source: Option<CaptureConfigFileEvidence>,
     pub stop_reason: CaptureStopReason,
     pub elapsed_ms: u64,
     pub raw_path: PathBuf,
@@ -237,12 +254,27 @@ pub enum CaptureError {
 
 impl CaptureConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, CaptureError> {
+        Self::load_with_evidence(path).map(|(config, _)| config)
+    }
+
+    pub fn load_with_evidence(
+        path: impl AsRef<Path>,
+    ) -> Result<(Self, CaptureConfigFileEvidence), CaptureError> {
         let path = path.as_ref();
-        let text = std::fs::read_to_string(path).map_err(|source| CaptureError::ReadConfig {
+        let bytes = std::fs::read(path).map_err(|source| CaptureError::ReadConfig {
             path: path.to_path_buf(),
             source,
         })?;
-        Self::from_toml(&text)
+        let text = std::str::from_utf8(&bytes).map_err(|error| {
+            CaptureError::InvalidConfig(format!("capture config is not UTF-8: {error}"))
+        })?;
+        let config = Self::from_toml(text)?;
+        let evidence = CaptureConfigFileEvidence {
+            source_path: path.to_path_buf(),
+            bytes: bytes.len() as u64,
+            sha256: sha256_hex(&bytes),
+        };
+        Ok((config, evidence))
     }
 
     pub fn from_toml(text: &str) -> Result<Self, CaptureError> {
@@ -436,9 +468,10 @@ fn validate_ws_url(value: &str, errors: &mut Vec<String>) {
 
 pub async fn run_capture_path(
     path: impl AsRef<Path>,
-    options: CaptureRunOptions,
+    mut options: CaptureRunOptions,
 ) -> Result<CaptureRunReport, CaptureError> {
-    let config = CaptureConfig::load(path)?;
+    let (config, config_source) = CaptureConfig::load_with_evidence(path)?;
+    options.config_source = Some(config_source);
     run_capture(config, options).await
 }
 
@@ -448,10 +481,11 @@ pub async fn run_capture(
 ) -> Result<CaptureRunReport, CaptureError> {
     config.ensure_valid()?;
     let config_fingerprint = config.fingerprint()?;
-    if options
-        .run_duration
-        .is_some_and(|duration| duration.is_zero())
-    {
+    let CaptureRunOptions {
+        run_duration,
+        config_source,
+    } = options;
+    if run_duration.is_some_and(|duration| duration.is_zero()) {
         return Err(CaptureError::InvalidConfig(
             "capture duration must be positive".to_string(),
         ));
@@ -522,7 +556,7 @@ pub async fn run_capture(
         &raw_writer,
         normalized_writer.as_ref(),
         &config.runtime,
-        options.run_duration,
+        run_duration,
     )
     .await;
 
@@ -537,12 +571,12 @@ pub async fn run_capture(
             normalized_writer.as_ref(),
         )
     );
-    drain_result?;
     let raw_stats_result = raw_writer.shutdown().await;
     let normalized_stats_result = match normalized_writer {
         Some(writer) => writer.shutdown().await,
         None => Ok(JsonlWriterStats::default()),
     };
+    drain_result?;
     let stop_reason = loop_result?;
     let raw_stats = raw_stats_result?;
     let normalized_stats = normalized_stats_result?;
@@ -550,7 +584,10 @@ pub async fn run_capture(
         stop_reason,
         elapsed_ms(&started),
         &config,
-        config_fingerprint,
+        CaptureRunProvenance {
+            config_fingerprint,
+            config_source,
+        },
         raw_stats,
         normalized_stats,
     ))
@@ -677,6 +714,11 @@ struct CaptureState {
     missing_recovery_routes: u64,
 }
 
+struct CaptureRunProvenance {
+    config_fingerprint: String,
+    config_source: Option<CaptureConfigFileEvidence>,
+}
+
 impl CaptureState {
     fn new(
         dedup_capacity_per_stream: usize,
@@ -766,7 +808,7 @@ impl CaptureState {
         stop_reason: CaptureStopReason,
         elapsed_ms: u64,
         config: &CaptureConfig,
-        config_fingerprint: String,
+        provenance: CaptureRunProvenance,
         raw: JsonlWriterStats,
         normalized: JsonlWriterStats,
     ) -> CaptureRunReport {
@@ -831,9 +873,10 @@ impl CaptureState {
             && processor.recovery_failures == 0;
 
         CaptureRunReport {
-            format_version: 2,
+            format_version: CAPTURE_RUN_REPORT_FORMAT_VERSION,
             capture_session_id: self.capture_session_id.clone(),
-            config_fingerprint,
+            config_fingerprint: provenance.config_fingerprint,
+            config_source: provenance.config_source,
             stop_reason,
             elapsed_ms,
             raw_path: config.output.raw_path.clone(),
@@ -928,6 +971,7 @@ where
                 path: path.clone(),
                 source,
             })?;
+        sync_parent_directory(&path).await?;
         let (sender, receiver) = mpsc::channel(capacity.max(1));
         let queued = Arc::new(AtomicUsize::new(0));
         let max_queue_depth = Arc::new(AtomicUsize::new(0));
@@ -1017,10 +1061,23 @@ where
         }
     }
     writer.flush().await?;
-    if fsync_every_records > 0 && since_sync > 0 {
-        writer.get_ref().sync_data().await?;
-    }
+    writer.get_ref().sync_data().await?;
     Ok(digest_hex(hasher.finalize()))
+}
+
+#[cfg(unix)]
+async fn sync_parent_directory(path: &Path) -> Result<(), CaptureError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    tokio::fs::File::open(parent).await?.sync_all().await?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn sync_parent_directory(_path: &Path) -> Result<(), CaptureError> {
+    Ok(())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1219,7 +1276,10 @@ mod tests {
             CaptureStopReason::DurationElapsed,
             1,
             &config,
-            config.fingerprint().unwrap(),
+            CaptureRunProvenance {
+                config_fingerprint: config.fingerprint().unwrap(),
+                config_source: None,
+            },
             JsonlWriterStats {
                 records: 1,
                 bytes: 1,
@@ -1283,6 +1343,7 @@ mod tests {
             config,
             CaptureRunOptions {
                 run_duration: Some(Duration::from_millis(1)),
+                config_source: None,
             },
         )
         .await
@@ -1325,6 +1386,7 @@ mod tests {
             config,
             CaptureRunOptions {
                 run_duration: Some(Duration::from_millis(1)),
+                config_source: None,
             },
         )
         .await

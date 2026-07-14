@@ -14,8 +14,10 @@ and has no dependency on the order gateway or strategy coordinator.
 mkdir -p var/reap/capture
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
 RAW_PATH="var/reap/capture/okx-btc-${RUN_ID}.jsonl"
+REPORT_PATH="var/reap/capture/okx-btc-${RUN_ID}.report.json"
 cargo run -p reap-cli -- capture \
   --config examples/capture-okx-public.toml \
+  --output "$REPORT_PATH" \
   --raw-path "$RAW_PATH" \
   --duration-secs 3600 \
   --require-clean-capture \
@@ -29,12 +31,13 @@ The optional
 `output.normalized_path` is intended for short diagnostics because full
 400-level snapshots are much larger than raw deltas.
 
-Every frame and run report carries a generated `capture_session_id`. Raw and
-normalized outputs use create-new semantics: startup refuses either existing
-path and never appends a second process session. Use a unique output path for
-each process. Strict replay and raw backtest also reject files containing more
-than one session ID, because process downtime is not a continuous HFT market
-stream.
+Every frame and run report carries a generated `capture_session_id`. The report,
+raw output, and normalized output use create-new semantics: startup refuses an
+existing path and never appends a second process session. The report is reserved
+mode `0600` before config parsing or network startup; a pre-report failure leaves
+an empty reserved file that verification rejects. Use unique paths for each
+process. Strict replay and raw backtest also reject files containing more than
+one session ID, because process downtime is not a continuous HFT market stream.
 
 Book deduplication keys exact redundant images by action, `prevSeqId`, `seqId`,
 exchange timestamp, and raw-payload hash. A replica conflict is not suppressed;
@@ -57,15 +60,29 @@ recovery-route, or recovery-failure counts. A redundant-socket disconnect can
 remain clean only when the other replica preserves sequence continuity;
 inspect disconnect, duplicate, and writer queue counts on every run.
 
-The versioned run report includes the effective config fingerprint and SHA-256
-of the exact bytes emitted by each writer. Archive that report with the capture
-manifest. `analyze-capture` independently hashes the input and fingerprints the
-provided config after applying the input path override, so both values must
-match the original run report.
+The versioned run report includes the exact source-config byte count/SHA-256,
+effective config fingerprint after CLI output overrides, and byte count/SHA-256
+for every writer. Capture files are data-synced and their directory entries are
+synced before the report is emitted. Archive the report with the config and
+capture manifest.
+
+`verify-capture` reconstructs the report's effective path overrides while
+allowing artifacts to be relocated. It requires the supplied config's exact
+bytes and effective fingerprint, raw session/counters/bytes/hash, replay-derived
+book and integrity state, and the report's clean flag to agree. When normalized
+output was enabled, pass `--normalized-events`; verification replays the raw
+frames and requires the normalized record count, bytes, and SHA-256 to match the
+independently reconstructed JSONL exactly. `analyze-capture` remains a standalone
+quality report; its config fingerprint intentionally reflects its own input-path
+override and is not the run-provenance gate.
 
 Validate and consume the output directly:
 
 ```bash
+cargo run -p reap-cli -- verify-capture \
+  --config examples/capture-okx-public.toml \
+  --report "$REPORT_PATH" \
+  --events "$RAW_PATH" --require-pass --pretty
 cargo run -p reap-cli -- analyze-capture \
   --config examples/capture-okx-public.toml \
   --events "$RAW_PATH" --strict --pretty
@@ -139,6 +156,12 @@ from their receive stamps even when each source is monotonic. Replay clamps
 those global regressions, preserves file order as the tie-breaker, and reports
 their exact nanosecond count and maximum; investigate large values separately
 from the analyzer's per-source monotonicity gate.
+
+Normalized capture is diagnostic, not the authoritative HFT replay format.
+Exchange timestamps from independent channels are not one global arrival clock,
+so replaying the normalized file in writer order can report large cross-stream
+clock regressions and can change strategy scheduling. Production research must
+use raw capture receive time through the adapter/deduplication/reducer path.
 
 `calibrated = true` is an evidence declaration, not a behavior switch. Set it
 only when the values are derived from representative target-host processing and
@@ -407,8 +430,8 @@ PnL as though positions had been carried.
 
 Strict analysis requires one capture session, every configured stream on its
 configured number of source connections, a ready book for every configured
-book stream, no unexpected data stream, monotonic per-source receive time, and
-no parse, sequence, or unrecovered-book defect. It reports
+book stream, no blank/comment records or unexpected data stream, monotonic
+per-source receive time, and no parse, sequence, or unrecovered-book defect. It reports
 receive and exchange cadence, signed receive-minus-exchange delay, book depth,
 spread, absolute midpoint movement, trade quantity, and price-times-quantity.
 Quantiles use a deterministic 8,192-value reservoir per metric; counts, means,
@@ -507,6 +530,25 @@ reported complete accounting and valuation, two cross-socket arrival-order
 clock regressions, and one funding action beyond the capture horizon under the
 explicit uncalibrated zero-delay execution model. This is a post-change
 connectivity and replay smoke, not execution calibration or strategy evidence.
+
+After adding durable report verification, a final 30-second run on 2026-07-14
+used schema 3 and retained all 14 socket plans with no disconnect. It wrote
+2,029 raw frames (1,453,359 bytes), accepted 1,015 events, and classified 1,014
+replica duplicates. The mode-`0600` report bound the exact 1,611-byte config at
+SHA-256
+`10d812c7f9b0980cdf1bb0774310fef6415ae3a407e6ec20eed256ca11b5b2c5`.
+Report-aware verification passed with no failure and matched the effective
+config fingerprint, raw SHA-256
+`7b4e6387be9f0ee19417d627472d8079b9c7f2ed6d45cbf10de3310a04e7707e`,
+and all 1,539 reconstructed normalized records (12,208,209 bytes) at SHA-256
+`4355383aa4a06b9f6f0a5f468b31fbcab062f3e1e962f5dbbd749a6d64a13adf`.
+Strict analysis and replay found zero gap, recovery, parse, source-coverage, or
+terminal-book defect; both books retained 400 levels per side. Receive-time raw
+backtest submitted four simulated orders, retained four at the horizon, and had
+complete accounting with no input-clock regression or fill. Diagnostic
+normalized replay reported 221 global cross-stream exchange-time regressions,
+including one of 41.937 seconds, despite monotonic per-source receive time. This
+is direct evidence for keeping raw receive-time replay authoritative.
 
 These are connectivity, integrity, and replay-plumbing evidence only. They are
 not a sustained full-depth dataset, execution-model calibration, profitability

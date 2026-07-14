@@ -664,12 +664,16 @@ Responsibilities:
 - Stamp every frame with a process-session identity so replay cannot hide
   capture downtime.
 - Fingerprint the effective capture config and exact persisted bytes.
+- Reserve and fsync a versioned run report that also binds the exact source
+  config file.
 - Optionally persist deduplicated normalized events for short diagnostics.
 - Report connection readiness, queue high-water marks, parser failures,
   duplicates, gaps, recoveries, and final book health.
 - Stream raw files through the live adapter/reducer path to measure configured
   source coverage, receive/exchange timing, depth, spread, movement, and trade
   distributions without retaining the dataset in memory.
+- Verify a retained run report against relocated raw/normalized artifacts,
+  including exact normalized output reconstructed from raw replay.
 
 Long-running collection uses raw JSONL as the canonical format. Backtest raw
 replay reconstructs full books through the same adapter, deduplication,
@@ -721,7 +725,7 @@ Target command surface:
 
 ```text
 reap live --config config/live.toml
-reap capture --config config/capture.toml
+reap capture --config config/capture.toml --output capture-report.json
 reap emergency-cancel --config config/live.toml --account account-id --output emergency.json
 reap certify-deadman-expiry --config config/live.toml --account account-id --output deadman.json
 reap verify-deadman-certification --artifact deadman.json --journal live-events.jsonl
@@ -729,13 +733,14 @@ reap operator --config config/live.toml status
 reap backtest --config config/backtest.toml --events data/events.jsonl
 reap replay-check --events data/events.jsonl
 reap analyze-capture --config config/capture.toml --events data/events.jsonl
+reap verify-capture --config config/capture.toml --report capture-report.json --events data/events.jsonl
 reap calibrate-latency --config config/live.toml --report live.json --output latency.json
 reap inspect-book --capture raw/ws.jsonl --symbol BTC-USDT
 reap config-check --config config/live.toml
 ```
 
 `live`, `capture`, `emergency-cancel`, both deadman-certification commands,
-`operator`, `backtest`, `research`, `replay-check`, `analyze-capture`,
+`operator`, `backtest`, `research`, `replay-check`, `analyze-capture`, `verify-capture`,
 `calibrate-latency`, and `config-check` are implemented. `inspect-book` remains planned; see
 [trading-readiness.md](trading-readiness.md).
 
