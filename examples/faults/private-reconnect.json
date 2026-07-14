@@ -1,0 +1,7 @@
+{
+  "command": "disconnect_websockets",
+  "command_id": "private-reconnect",
+  "evidence_file": "private-reconnect-injector.json",
+  "target": "private",
+  "connections": 1
+}

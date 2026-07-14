@@ -20,6 +20,7 @@ production trading process.
 | Event-loop profile | Allocation-aware raw OKX parity benchmark covers redundant wire input through strategy/risk and storage-record construction | Needs target-host capture and exchange-latency validation |
 | Operator control and alerts | HMAC-authenticated local controls use fsynced write-ahead latches; OKX Cancel All After is maintained independently; a separate CLI can arm the deadman, cancel all regular orders account-wide, and prove post-trigger zero with offline exact-config verification; another read-only CLI can prove source `20` after controlled process death | Must exercise target alert routing, deadman expiry, and the independent cancel procedure; algo/spread orders remain outside their scope |
 | Process/host controls | Canonical journal ownership is exclusively locked before recovery or network setup; optional Linux disk, memory, and kernel-clock checks run at preflight and periodically; hardened systemd templates encode mode-specific restart policy | Must be installed, enabled, thresholded, monitored, and fault-tested on the target host |
+| Demo fault injection | A loopback-only proxy independently routes OKX demo REST, public, private-state, and order-command traffic; strict owner-local commands inject disconnects, matched frame drops, and matched REST responses; create-new injector/run artifacts bind proxy config and pinned Java provenance, and the live fault matrix validates supported typed roles | Tooling is implemented and credential-free forwarding smokes passed, but no credentialed isolated campaign or target-host acceptance evidence exists |
 | Build/supply chain | Rust `1.95.0` is pinned; least-privilege CI checks formatting, all-target lint, all workspace tests, a locked release build, and RustSec advisories; Cargo and Actions updates are proposed weekly | CI must remain green and dependency updates reviewed, but this does not replace credentialed exchange or target-host evidence |
 | Exchange certification | Point-in-time account certification and journal-bound process-death deadman collection/offline replay are implemented, but no passing target-account artifact, OKX demo soak, deadman artifact, or broader fault campaign is recorded | Production blocker |
 
@@ -272,7 +273,7 @@ production trading process.
     failure, disconnect, and latency evidence, and independently re-derives
     `clean_soak`. Latency calibration schema 4 also requires the exact source
     bytes and independently verified source reports.
-40. The schema-3 `verify-live-fault-matrix` contract requires one isolated
+40. The schema-3 `verify-live-fault-matrix` manifest requires one isolated
     schema-8 run for every documented live role, including distinct exchange
     status, instrument, fee, and account-config failures. It hashes a distinct
     injector record for each fault, rejects typed-failure substitution and
@@ -362,6 +363,15 @@ production trading process.
     This prevents an aggregated hedge from relying only on earlier strategy
     sizing, while preserving Java's target calculation. It still needs a real
     target-account response and oversized-order demo fault artifact.
+49. `reap-fault` now runs outside the trading process and accepts only an
+    official OKX demo upstream behind distinct loopback REST, public, private,
+    and order-command listeners. It injects targeted disconnects, matched frame
+    drops, and bounded REST responses through an owner-only Unix socket, then
+    writes create-new typed evidence without retaining credentials or raw
+    private payloads. The matrix independently validates artifact structure,
+    effects, hashes, and the supported reconnect, ambiguity, and clock role.
+    Credential-free REST and public-websocket forwarding smokes passed, but no
+    authenticated account path or strategy response has been certified.
 
 ## Remaining Demo Gate
 

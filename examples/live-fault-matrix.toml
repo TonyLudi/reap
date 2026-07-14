@@ -14,27 +14,27 @@ report = "evidence/clean-demo.json"
 [[runs]]
 scenario = "public_reconnect"
 report = "evidence/public-reconnect.json"
-injector_evidence = "evidence/public-reconnect-injector.log"
+injector_evidence = "evidence/public-reconnect-injector.json"
 
 [[runs]]
 scenario = "private_reconnect"
 report = "evidence/private-reconnect.json"
-injector_evidence = "evidence/private-reconnect-injector.log"
+injector_evidence = "evidence/private-reconnect-injector.json"
 
 [[runs]]
 scenario = "order_transport_reconnect"
 report = "evidence/order-transport-reconnect.json"
-injector_evidence = "evidence/order-transport-reconnect-injector.log"
+injector_evidence = "evidence/order-transport-reconnect-injector.json"
 
 [[runs]]
 scenario = "ambiguous_submit"
 report = "evidence/ambiguous-submit.json"
-injector_evidence = "evidence/ambiguous-submit-injector.log"
+injector_evidence = "evidence/ambiguous-submit-injector.json"
 
 [[runs]]
 scenario = "ambiguous_cancel"
 report = "evidence/ambiguous-cancel.json"
-injector_evidence = "evidence/ambiguous-cancel-injector.log"
+injector_evidence = "evidence/ambiguous-cancel-injector.json"
 
 [[runs]]
 scenario = "partial_fill"
@@ -64,7 +64,7 @@ injector_evidence = "evidence/deadman-heartbeat-failure-injector.log"
 [[runs]]
 scenario = "exchange_clock_failure"
 report = "evidence/exchange-clock-failure.json"
-injector_evidence = "evidence/exchange-clock-failure-injector.log"
+injector_evidence = "evidence/exchange-clock-failure-injector.json"
 
 [[runs]]
 scenario = "exchange_status_failure"

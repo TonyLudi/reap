@@ -1,0 +1,14 @@
+{
+  "command": "arm_websocket_drop",
+  "command_id": "ambiguous-cancel",
+  "evidence_file": "ambiguous-cancel-injector.json",
+  "target": "order",
+  "direction": "exchange_to_client",
+  "matcher": {
+    "kind": "text",
+    "json": {
+      "op": "cancel-order"
+    }
+  },
+  "frames": 1
+}

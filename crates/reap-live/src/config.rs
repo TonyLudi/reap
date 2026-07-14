@@ -62,6 +62,8 @@ pub struct OkxVenueConfig {
     pub rest_url: String,
     pub public_ws_url: String,
     pub private_ws_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_ws_url: Option<String>,
     pub enable_vip_fills_channel: bool,
 }
 
@@ -72,6 +74,7 @@ impl Default for OkxVenueConfig {
             rest_url: "https://openapi.okx.com".to_string(),
             public_ws_url: "wss://wspap.okx.com:8443/ws/v5/public".to_string(),
             private_ws_url: "wss://wspap.okx.com:8443/ws/v5/private".to_string(),
+            order_ws_url: None,
             enable_vip_fills_channel: false,
         }
     }
@@ -1340,6 +1343,10 @@ struct ParsedOkxEndpoint {
 }
 
 impl OkxVenueConfig {
+    pub fn order_ws_url(&self) -> &str {
+        self.order_ws_url.as_deref().unwrap_or(&self.private_ws_url)
+    }
+
     pub fn endpoint_region(&self) -> Result<OkxEndpointRegion, Vec<String>> {
         let mut errors = Vec::new();
         let region = validate_okx_venue_endpoints(self, &mut errors);
@@ -1387,21 +1394,33 @@ fn validate_okx_venue_endpoints(
         8443,
         errors,
     );
+    let order = parse_okx_endpoint(
+        "venue.order_ws_url",
+        venue.order_ws_url(),
+        venue.environment,
+        "wss",
+        "ws",
+        "/ws/v5/private",
+        8443,
+        errors,
+    );
     if venue.public_ws_url == venue.private_ws_url {
         errors.push("venue public and private websocket URLs must differ".to_string());
     }
-    let (Some(rest), Some(public), Some(private)) = (rest, public, private) else {
+    let (Some(rest), Some(public), Some(private), Some(order)) = (rest, public, private, order)
+    else {
         return None;
     };
-    if rest.loopback || public.loopback || private.loopback {
+    if rest.loopback || public.loopback || private.loopback || order.loopback {
         if venue.environment == TradingEnvironment::Demo
             && rest.loopback
             && public.loopback
             && private.loopback
+            && order.loopback
         {
             return Some(OkxEndpointRegion::DemoLoopback);
         }
-        if rest.loopback && public.loopback && private.loopback {
+        if rest.loopback && public.loopback && private.loopback && order.loopback {
             errors.push("venue loopback endpoint tuple is demo-test only".to_string());
         } else {
             errors.push(
@@ -1415,6 +1434,7 @@ fn validate_okx_venue_endpoints(
             && profile.rest_hosts.contains(&rest.host.as_str())
             && profile.websocket_host == public.host
             && profile.websocket_host == private.host
+            && profile.websocket_host == order.host
     });
     match profile {
         Some(profile) => Some(profile.region),
@@ -1566,6 +1586,7 @@ mod tests {
             rest_url: rest_url.to_string(),
             public_ws_url: public_ws_url.to_string(),
             private_ws_url: private_ws_url.to_string(),
+            order_ws_url: None,
             enable_vip_fills_channel: false,
         }
     }
@@ -1724,12 +1745,13 @@ mod tests {
 
     #[test]
     fn cleartext_loopback_endpoints_are_demo_test_only() {
-        let loopback = venue(
+        let mut loopback = venue(
             TradingEnvironment::Demo,
             "http://127.0.0.1:18080",
             "ws://localhost:18081/ws/v5/public",
             "ws://[::1]:18082/ws/v5/private",
         );
+        loopback.order_ws_url = Some("ws://127.0.0.1:18083/ws/v5/private".to_string());
         assert_eq!(
             loopback.endpoint_region(),
             Ok(OkxEndpointRegion::DemoLoopback)
@@ -1752,6 +1774,32 @@ mod tests {
             errors
                 .iter()
                 .any(|error| error.contains("loopback endpoint tuple is demo-test only"))
+        );
+    }
+
+    #[test]
+    fn dedicated_order_websocket_must_match_the_endpoint_tuple() {
+        let mut demo = OkxVenueConfig {
+            order_ws_url: Some("wss://wspap.okx.com:8443/ws/v5/private".to_string()),
+            ..OkxVenueConfig::default()
+        };
+        assert_eq!(demo.order_ws_url(), demo.private_ws_url);
+        assert_eq!(demo.endpoint_region(), Ok(OkxEndpointRegion::Global));
+
+        demo.order_ws_url = Some("wss://wsuspap.okx.com:8443/ws/v5/private".to_string());
+        let errors = demo.endpoint_region().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("region-consistent"))
+        );
+
+        demo.order_ws_url = Some("ws://127.0.0.1:18083/ws/v5/private".to_string());
+        let errors = demo.endpoint_region().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("must not mix loopback"))
         );
     }
 

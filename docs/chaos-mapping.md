@@ -244,6 +244,17 @@ The following differences do not change the covered quote/hedge calculations:
 | `PositionGatewaySafeguard.ForcedRepaymentIndicator` | Typed OKX balance `twap`, configured `1..=5` limit, bootstrap/runtime account-state rejection, tombstone clearing, and reconciliation comparison | Stronger: Java emits alert-only, while Rust fails closed at or above the configured level |
 | `ChaosStrategyEngine.tryToStop`, `ChaosStrategyBase.cancelAll(entity)`, `ExchCancelAll`, and `OkxNitroOrderClient.onOrderSessionDisconnected` | In-process canonical cancel/reconcile plus a separate account-wide regular-order emergency CLI | Equivalent normal/disconnect cancellation with an additional process-independent final-zero safety layer |
 
+`reap-fault` has no Java strategy counterpart and is not a parity claim. It is a
+separate demo test process built to exercise the mapped connectivity behavior:
+`OkxNitroL2SubscriberGroupFactory` and `AbstractOkxNitroL2Subscriber` market-data
+recovery, `OkxNitroBatchSubscribeManager` subscription lifecycle, and the eight
+`OkxNitroOrderSessionKeeper`/`OkxNitroOrderClient` command-session loss path. The
+routed Rust config gives order commands their own loopback endpoint while normal
+configs still share the private endpoint. This preserves the Java-inspired
+transport roles and lets one campaign disconnect public, private-state, or order
+traffic independently; the stronger typed injector artifact and loopback-only
+upstream policy are Rust testing controls.
+
 The reviewed Java OKX subscriber and `chaos-iarb2` classes do not provide the
 Rust runtime's place-request `expTime`, `/public/time` skew gate, Cancel All
 After heartbeat, fsynced restart-latch lifecycle, exclusive journal lease,

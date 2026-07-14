@@ -311,7 +311,7 @@ fn is_allowed_transition_path(path: &[ConfigPathSegment]) -> bool {
         ] if section == "venue" => {
             matches!(
                 field.as_str(),
-                "environment" | "rest_url" | "public_ws_url" | "private_ws_url"
+                "environment" | "rest_url" | "public_ws_url" | "private_ws_url" | "order_ws_url"
             )
         }
         [

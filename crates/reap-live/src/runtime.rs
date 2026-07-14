@@ -1820,7 +1820,7 @@ impl LiveRuntime {
                 let (transport, order_ws_runtime, mut order_ws_status) =
                     spawn_okx_order_ws(OkxOrderWsConfig {
                         account_id: account_id.clone(),
-                        websocket_url: config.venue.private_ws_url.clone(),
+                        websocket_url: config.venue.order_ws_url().to_string(),
                         signer,
                         session_count,
                         command_capacity,

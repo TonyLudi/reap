@@ -3,6 +3,7 @@ members = [
     "crates/reap-core",
     "crates/reap-venue",
     "crates/reap-feed",
+    "crates/reap-fault",
     "crates/reap-book",
     "crates/reap-order",
     "crates/reap-risk",
@@ -26,17 +27,22 @@ edition = "2024"
 anyhow = "1"
 async-trait = "0.1"
 base64 = "0.22"
+bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 csv = "1"
 futures-util = "0.3"
 hmac = "0.12"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
 reap-backtest = { path = "crates/reap-backtest" }
 reap-book = { path = "crates/reap-book" }
 reap-capture = { path = "crates/reap-capture" }
 reap-core = { path = "crates/reap-core" }
 reap-feed = { path = "crates/reap-feed" }
+reap-fault = { path = "crates/reap-fault" }
 reap-live = { path = "crates/reap-live" }
 reap-engine = { path = "crates/reap-engine" }
 reap-order = { path = "crates/reap-order" }

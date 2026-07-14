@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use reap_core::PINNED_JAVA_REVISION;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -12,7 +14,7 @@ use crate::{
 };
 
 pub const LIVE_FAULT_MATRIX_MANIFEST_SCHEMA_VERSION: u32 = 3;
-pub const LIVE_FAULT_MATRIX_REPORT_FORMAT_VERSION: u32 = 3;
+pub const LIVE_FAULT_MATRIX_REPORT_FORMAT_VERSION: u32 = 4;
 pub const MAX_LIVE_FAULT_MATRIX_MANIFEST_BYTES: u64 = 1024 * 1024;
 pub const MAX_LIVE_FAULT_INJECTOR_EVIDENCE_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_LIVE_FAULT_MATRIX_RUNS: usize = 32;
@@ -115,6 +117,7 @@ pub enum LiveFaultMatrixConfigFailure {
 pub enum LiveFaultScenarioFailure {
     LiveReportEvidenceInvalid,
     InjectorEvidenceMissing,
+    InjectorEvidenceInvalid,
     ExpectedObserveMode,
     ExpectedDemoMode,
     ExpectedObserveOrDemoMode,
@@ -202,6 +205,8 @@ pub struct LiveFaultMatrixRunVerification {
     pub scenario: LiveFaultScenario,
     pub report: LiveRunFileEvidence,
     pub injector_evidence: Option<LiveFaultFileEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reap_fault_proxy_evidence: Option<LiveFaultProxyEvidenceSummary>,
     pub session_id: Option<String>,
     pub mode: LiveMode,
     pub stop_reason: LiveStopReason,
@@ -212,6 +217,141 @@ pub struct LiveFaultMatrixRunVerification {
     pub live_verification_failures: Vec<LiveRunVerificationFailure>,
     pub scenario_failures: Vec<LiveFaultScenarioFailure>,
     pub passed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveFaultProxyEvidenceSummary {
+    pub format_version: u32,
+    pub proxy_session_id: String,
+    pub proxy_config_fingerprint: String,
+    pub command_id: String,
+    pub command_kind: String,
+    pub effect_count: usize,
+    pub passed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReapFaultProxyEvidenceWire {
+    format_version: u32,
+    proxy_session_id: String,
+    proxy_config_fingerprint: String,
+    java_reference_revision: String,
+    command_id: String,
+    command: ReapFaultCommandWire,
+    armed_at_ms: u64,
+    completed_at_ms: u64,
+    effects: Vec<ReapFaultEffectWire>,
+    passed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReapFaultWebSocketTarget {
+    Public,
+    Private,
+    Order,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReapFaultWebSocketDirection {
+    ClientToExchange,
+    ExchangeToClient,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReapFaultWebSocketFrameKind {
+    Text,
+    Binary,
+    Ping,
+    Pong,
+    Close,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReapFaultRestMatcherWire {
+    method: String,
+    path: String,
+    #[serde(default)]
+    query: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReapFaultWebSocketMatcherWire {
+    kind: ReapFaultWebSocketFrameKind,
+    #[serde(default)]
+    json: Option<ReapFaultWebSocketJsonMatcherWire>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReapFaultWebSocketJsonMatcherWire {
+    #[serde(default)]
+    op: Option<String>,
+    #[serde(default)]
+    event: Option<String>,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    instrument_type: Option<String>,
+    #[serde(default)]
+    symbol: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ReapFaultCommandWire {
+    DisconnectWebsockets {
+        target: ReapFaultWebSocketTarget,
+        connections: usize,
+    },
+    RestResponse {
+        matcher: ReapFaultRestMatcherWire,
+        status: u16,
+        response_headers: BTreeMap<String, String>,
+        response_body_bytes: u64,
+        response_body_sha256: String,
+        times: u32,
+    },
+    WebsocketDrop {
+        target: ReapFaultWebSocketTarget,
+        direction: ReapFaultWebSocketDirection,
+        matcher: ReapFaultWebSocketMatcherWire,
+        frames: u32,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ReapFaultEffectWire {
+    WebsocketDisconnected {
+        sequence: u32,
+        applied_at_ms: u64,
+        connection_id: u64,
+        target: ReapFaultWebSocketTarget,
+    },
+    RestResponseInjected {
+        sequence: u32,
+        applied_at_ms: u64,
+        method: String,
+        path: String,
+        query_sha256: String,
+    },
+    WebsocketFrameDropped {
+        sequence: u32,
+        applied_at_ms: u64,
+        connection_id: u64,
+        target: ReapFaultWebSocketTarget,
+        direction: ReapFaultWebSocketDirection,
+        frame_kind: ReapFaultWebSocketFrameKind,
+        frame_bytes: u64,
+        frame_sha256: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -380,6 +520,8 @@ pub fn verify_live_fault_matrix_paths(
             });
         }
 
+        let mut reap_fault_proxy_evidence = None;
+        let mut injector_evidence_invalid = false;
         let injector_evidence = run
             .injector_evidence
             .as_ref()
@@ -410,6 +552,10 @@ pub fn verify_live_fault_matrix_paths(
                         scenario: run.scenario,
                     });
                 }
+                match reap_fault_proxy_evidence_summary(&bytes, run.scenario) {
+                    Ok(summary) => reap_fault_proxy_evidence = summary,
+                    Err(()) => injector_evidence_invalid = true,
+                }
                 Ok(evidence)
             })
             .transpose()?;
@@ -421,12 +567,16 @@ pub fn verify_live_fault_matrix_paths(
         if run.scenario.requires_injector_evidence() && injector_evidence.is_none() {
             scenario_failures.push(LiveFaultScenarioFailure::InjectorEvidenceMissing);
         }
+        if injector_evidence_invalid {
+            scenario_failures.push(LiveFaultScenarioFailure::InjectorEvidenceInvalid);
+        }
         scenario_failures.sort_by_key(fault_failure_rank);
         scenario_failures.dedup();
         let verification = LiveFaultMatrixRunVerification {
             scenario: run.scenario,
             report: live_verification.run_report,
             injector_evidence,
+            reap_fault_proxy_evidence,
             session_id: report.session_id.clone(),
             mode: report.mode,
             stop_reason: report.stop_reason,
@@ -842,6 +992,272 @@ fn file_evidence(path: PathBuf, bytes: &[u8]) -> LiveFaultFileEvidence {
     }
 }
 
+fn reap_fault_proxy_evidence_summary(
+    bytes: &[u8],
+    scenario: LiveFaultScenario,
+) -> Result<Option<LiveFaultProxyEvidenceSummary>, ()> {
+    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+        return Ok(None);
+    };
+    let Some(object) = value.as_object() else {
+        return Ok(None);
+    };
+    let is_reap_proxy_evidence = object.contains_key("proxy_session_id")
+        && object.contains_key("proxy_config_fingerprint")
+        && object.contains_key("command_id")
+        && object.contains_key("effects");
+    if !is_reap_proxy_evidence {
+        return Ok(None);
+    }
+    let wire: ReapFaultProxyEvidenceWire = serde_json::from_value(value).map_err(|_| ())?;
+    let command_kind = wire.command.kind().to_string();
+    if wire.format_version != 1
+        || wire.java_reference_revision != PINNED_JAVA_REVISION
+        || !valid_fault_identifier(&wire.proxy_session_id)
+        || !is_sha256(&wire.proxy_config_fingerprint)
+        || !valid_fault_identifier(&wire.command_id)
+        || wire.completed_at_ms < wire.armed_at_ms
+        || !wire.passed
+        || !wire.command.is_valid()
+        || !wire.command.matches_scenario(scenario)
+        || !wire
+            .command
+            .effects_are_valid(&wire.effects, wire.armed_at_ms, wire.completed_at_ms)
+    {
+        return Err(());
+    }
+    Ok(Some(LiveFaultProxyEvidenceSummary {
+        format_version: wire.format_version,
+        proxy_session_id: wire.proxy_session_id,
+        proxy_config_fingerprint: wire.proxy_config_fingerprint,
+        command_id: wire.command_id,
+        command_kind,
+        effect_count: wire.effects.len(),
+        passed: wire.passed,
+    }))
+}
+
+impl ReapFaultCommandWire {
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::DisconnectWebsockets { .. } => "disconnect_websockets",
+            Self::RestResponse { .. } => "rest_response",
+            Self::WebsocketDrop { .. } => "websocket_drop",
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        match self {
+            Self::DisconnectWebsockets { connections, .. } => (1..=1024).contains(connections),
+            Self::RestResponse {
+                matcher,
+                status,
+                response_headers,
+                response_body_bytes,
+                response_body_sha256,
+                times,
+            } => {
+                !matcher.method.is_empty()
+                    && matcher
+                        .method
+                        .bytes()
+                        .all(|byte| byte.is_ascii_uppercase() || byte == b'-')
+                    && matcher.path.starts_with('/')
+                    && !matcher.path.contains('?')
+                    && !matcher.path.contains('#')
+                    && matcher.query.len() <= 128
+                    && response_headers.len() <= 128
+                    && response_headers.iter().all(|(name, value)| {
+                        !name.is_empty()
+                            && name.len() <= 256
+                            && !value.contains('\r')
+                            && !value.contains('\n')
+                            && value.len() <= 8 * 1024
+                    })
+                    && (200..=599).contains(status)
+                    && *response_body_bytes <= 16 * 1024 * 1024
+                    && is_sha256(response_body_sha256)
+                    && (1..=100).contains(times)
+            }
+            Self::WebsocketDrop {
+                matcher, frames, ..
+            } => {
+                (1..=100).contains(frames)
+                    && matcher.json.as_ref().is_none_or(|json| {
+                        matches!(
+                            matcher.kind,
+                            ReapFaultWebSocketFrameKind::Text | ReapFaultWebSocketFrameKind::Binary
+                        ) && !json.is_empty()
+                    })
+            }
+        }
+    }
+
+    fn matches_scenario(&self, scenario: LiveFaultScenario) -> bool {
+        match scenario {
+            LiveFaultScenario::PublicReconnect => matches!(
+                self,
+                Self::DisconnectWebsockets {
+                    target: ReapFaultWebSocketTarget::Public,
+                    ..
+                }
+            ),
+            LiveFaultScenario::PrivateReconnect => matches!(
+                self,
+                Self::DisconnectWebsockets {
+                    target: ReapFaultWebSocketTarget::Private,
+                    ..
+                }
+            ),
+            LiveFaultScenario::OrderTransportReconnect => matches!(
+                self,
+                Self::DisconnectWebsockets {
+                    target: ReapFaultWebSocketTarget::Order,
+                    ..
+                }
+            ),
+            LiveFaultScenario::AmbiguousSubmit => self.matches_order_ack_drop("order"),
+            LiveFaultScenario::AmbiguousCancel => self.matches_order_ack_drop("cancel-order"),
+            LiveFaultScenario::ExchangeClockFailure => matches!(
+                self,
+                Self::RestResponse { matcher, .. }
+                    if matcher.method == "GET" && matcher.path == "/api/v5/public/time"
+            ),
+            _ => true,
+        }
+    }
+
+    fn matches_order_ack_drop(&self, operation: &str) -> bool {
+        matches!(
+            self,
+            Self::WebsocketDrop {
+                target: ReapFaultWebSocketTarget::Order,
+                direction: ReapFaultWebSocketDirection::ExchangeToClient,
+                matcher: ReapFaultWebSocketMatcherWire {
+                    kind: ReapFaultWebSocketFrameKind::Text
+                        | ReapFaultWebSocketFrameKind::Binary,
+                    json: Some(ReapFaultWebSocketJsonMatcherWire { op: Some(op), .. }),
+                },
+                ..
+            } if op == operation
+        )
+    }
+
+    fn effects_are_valid(
+        &self,
+        effects: &[ReapFaultEffectWire],
+        armed_at_ms: u64,
+        completed_at_ms: u64,
+    ) -> bool {
+        let expected = match self {
+            Self::DisconnectWebsockets { connections, .. } => *connections,
+            Self::RestResponse { times, .. } => *times as usize,
+            Self::WebsocketDrop { frames, .. } => *frames as usize,
+        };
+        effects.len() == expected
+            && effects.iter().enumerate().all(|(index, effect)| {
+                effect.sequence() == index as u32 + 1
+                    && (armed_at_ms..=completed_at_ms).contains(&effect.applied_at_ms())
+                    && self.matches_effect(effect)
+            })
+    }
+
+    fn matches_effect(&self, effect: &ReapFaultEffectWire) -> bool {
+        match (self, effect) {
+            (
+                Self::DisconnectWebsockets { target, .. },
+                ReapFaultEffectWire::WebsocketDisconnected {
+                    target: effect_target,
+                    connection_id,
+                    ..
+                },
+            ) => target == effect_target && *connection_id > 0,
+            (
+                Self::RestResponse { matcher, .. },
+                ReapFaultEffectWire::RestResponseInjected {
+                    method,
+                    path,
+                    query_sha256,
+                    ..
+                },
+            ) => {
+                matcher.method == *method
+                    && matcher.path == *path
+                    && is_sha256(query_sha256)
+                    && matcher.query.len() <= 128
+            }
+            (
+                Self::WebsocketDrop {
+                    target,
+                    direction,
+                    matcher,
+                    ..
+                },
+                ReapFaultEffectWire::WebsocketFrameDropped {
+                    target: effect_target,
+                    direction: effect_direction,
+                    frame_kind,
+                    connection_id,
+                    frame_bytes,
+                    frame_sha256,
+                    ..
+                },
+            ) => {
+                target == effect_target
+                    && direction == effect_direction
+                    && matcher.kind == *frame_kind
+                    && *connection_id > 0
+                    && *frame_bytes <= 64 * 1024 * 1024
+                    && is_sha256(frame_sha256)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl ReapFaultWebSocketJsonMatcherWire {
+    fn is_empty(&self) -> bool {
+        self.op.is_none()
+            && self.event.is_none()
+            && self.channel.is_none()
+            && self.instrument_type.is_none()
+            && self.symbol.is_none()
+    }
+}
+
+impl ReapFaultEffectWire {
+    const fn sequence(&self) -> u32 {
+        match self {
+            Self::WebsocketDisconnected { sequence, .. }
+            | Self::RestResponseInjected { sequence, .. }
+            | Self::WebsocketFrameDropped { sequence, .. } => *sequence,
+        }
+    }
+
+    const fn applied_at_ms(&self) -> u64 {
+        match self {
+            Self::WebsocketDisconnected { applied_at_ms, .. }
+            | Self::RestResponseInjected { applied_at_ms, .. }
+            | Self::WebsocketFrameDropped { applied_at_ms, .. } => *applied_at_ms,
+        }
+    }
+}
+
+fn valid_fault_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -850,30 +1266,31 @@ fn fault_failure_rank(failure: &LiveFaultScenarioFailure) -> u8 {
     match failure {
         LiveFaultScenarioFailure::LiveReportEvidenceInvalid => 0,
         LiveFaultScenarioFailure::InjectorEvidenceMissing => 1,
-        LiveFaultScenarioFailure::ExpectedObserveMode => 2,
-        LiveFaultScenarioFailure::ExpectedDemoMode => 3,
-        LiveFaultScenarioFailure::ExpectedObserveOrDemoMode => 4,
-        LiveFaultScenarioFailure::CleanSoakRequired => 5,
-        LiveFaultScenarioFailure::SafeBoundedShutdownRequired => 6,
-        LiveFaultScenarioFailure::SafeRuntimeFailureShutdownRequired => 7,
-        LiveFaultScenarioFailure::PublicDisconnectMissing => 8,
-        LiveFaultScenarioFailure::PrivateDisconnectMissing => 9,
-        LiveFaultScenarioFailure::OrderTransportDisconnectMissing => 10,
-        LiveFaultScenarioFailure::OrderTransportStaleMissing => 11,
-        LiveFaultScenarioFailure::ReadinessLossMissing => 12,
-        LiveFaultScenarioFailure::AmbiguousSubmitMissing => 13,
-        LiveFaultScenarioFailure::AmbiguousCancelMissing => 14,
-        LiveFaultScenarioFailure::PartialFillMissing => 15,
-        LiveFaultScenarioFailure::FillConvergenceTimeoutMissing => 16,
-        LiveFaultScenarioFailure::OrderConvergenceTimeoutMissing => 17,
-        LiveFaultScenarioFailure::ReconciliationDriftResponseMissing => 18,
-        LiveFaultScenarioFailure::RestoredSafetyLatchMissing => 19,
-        LiveFaultScenarioFailure::DeadmanHeartbeatFailureMissing => 20,
-        LiveFaultScenarioFailure::ExchangeClockFailureMissing => 21,
-        LiveFaultScenarioFailure::ExchangeStatusFailureMissing => 22,
-        LiveFaultScenarioFailure::ExchangeInstrumentFailureMissing => 23,
-        LiveFaultScenarioFailure::ExchangeFeeFailureMissing => 24,
-        LiveFaultScenarioFailure::AccountConfigFailureMissing => 25,
+        LiveFaultScenarioFailure::InjectorEvidenceInvalid => 2,
+        LiveFaultScenarioFailure::ExpectedObserveMode => 3,
+        LiveFaultScenarioFailure::ExpectedDemoMode => 4,
+        LiveFaultScenarioFailure::ExpectedObserveOrDemoMode => 5,
+        LiveFaultScenarioFailure::CleanSoakRequired => 6,
+        LiveFaultScenarioFailure::SafeBoundedShutdownRequired => 7,
+        LiveFaultScenarioFailure::SafeRuntimeFailureShutdownRequired => 8,
+        LiveFaultScenarioFailure::PublicDisconnectMissing => 9,
+        LiveFaultScenarioFailure::PrivateDisconnectMissing => 10,
+        LiveFaultScenarioFailure::OrderTransportDisconnectMissing => 11,
+        LiveFaultScenarioFailure::OrderTransportStaleMissing => 12,
+        LiveFaultScenarioFailure::ReadinessLossMissing => 13,
+        LiveFaultScenarioFailure::AmbiguousSubmitMissing => 14,
+        LiveFaultScenarioFailure::AmbiguousCancelMissing => 15,
+        LiveFaultScenarioFailure::PartialFillMissing => 16,
+        LiveFaultScenarioFailure::FillConvergenceTimeoutMissing => 17,
+        LiveFaultScenarioFailure::OrderConvergenceTimeoutMissing => 18,
+        LiveFaultScenarioFailure::ReconciliationDriftResponseMissing => 19,
+        LiveFaultScenarioFailure::RestoredSafetyLatchMissing => 20,
+        LiveFaultScenarioFailure::DeadmanHeartbeatFailureMissing => 21,
+        LiveFaultScenarioFailure::ExchangeClockFailureMissing => 22,
+        LiveFaultScenarioFailure::ExchangeStatusFailureMissing => 23,
+        LiveFaultScenarioFailure::ExchangeInstrumentFailureMissing => 24,
+        LiveFaultScenarioFailure::ExchangeFeeFailureMissing => 25,
+        LiveFaultScenarioFailure::AccountConfigFailureMissing => 26,
     }
 }
 
@@ -1168,6 +1585,161 @@ mod tests {
                 .iter()
                 .filter(|run| run.scenario.requires_injector_evidence())
                 .all(|run| run.injector_evidence.is_some())
+        );
+    }
+
+    #[test]
+    fn fault_matrix_validates_typed_reap_proxy_evidence() {
+        let fixture = build_fixture();
+        let injector = fixture
+            .manifest
+            .runs
+            .iter()
+            .find(|run| run.scenario == LiveFaultScenario::PublicReconnect)
+            .unwrap()
+            .injector_evidence
+            .clone()
+            .unwrap();
+        let evidence = serde_json::json!({
+            "format_version": 1,
+            "proxy_session_id": "proxy-session",
+            "proxy_config_fingerprint": "a".repeat(64),
+            "java_reference_revision": PINNED_JAVA_REVISION,
+            "command_id": "public-reconnect",
+            "command": {
+                "kind": "disconnect_websockets",
+                "target": "public",
+                "connections": 1
+            },
+            "armed_at_ms": 100,
+            "completed_at_ms": 101,
+            "effects": [{
+                "kind": "websocket_disconnected",
+                "sequence": 1,
+                "applied_at_ms": 100,
+                "connection_id": 1,
+                "target": "public"
+            }],
+            "passed": true
+        });
+        std::fs::write(&injector, serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+
+        let report =
+            verify_live_fault_matrix_paths(&fixture.config_path, &fixture.manifest_path).unwrap();
+
+        assert!(report.live_fault_matrix_passed, "{report:#?}");
+        let public = report
+            .runs
+            .iter()
+            .find(|run| run.scenario == LiveFaultScenario::PublicReconnect)
+            .unwrap();
+        let proxy = public.reap_fault_proxy_evidence.as_ref().unwrap();
+        assert_eq!(proxy.command_id, "public-reconnect");
+        assert_eq!(proxy.command_kind, "disconnect_websockets");
+        assert_eq!(proxy.effect_count, 1);
+    }
+
+    #[test]
+    fn fault_matrix_rejects_typed_proxy_evidence_for_a_different_scenario() {
+        let fixture = build_fixture();
+        let injector = fixture
+            .manifest
+            .runs
+            .iter()
+            .find(|run| run.scenario == LiveFaultScenario::PublicReconnect)
+            .unwrap()
+            .injector_evidence
+            .clone()
+            .unwrap();
+        let evidence = serde_json::json!({
+            "format_version": 1,
+            "proxy_session_id": "proxy-session",
+            "proxy_config_fingerprint": "a".repeat(64),
+            "java_reference_revision": PINNED_JAVA_REVISION,
+            "command_id": "wrong-reconnect",
+            "command": {
+                "kind": "disconnect_websockets",
+                "target": "private",
+                "connections": 1
+            },
+            "armed_at_ms": 100,
+            "completed_at_ms": 101,
+            "effects": [{
+                "kind": "websocket_disconnected",
+                "sequence": 1,
+                "applied_at_ms": 100,
+                "connection_id": 1,
+                "target": "private"
+            }],
+            "passed": true
+        });
+        std::fs::write(&injector, serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+
+        let report =
+            verify_live_fault_matrix_paths(&fixture.config_path, &fixture.manifest_path).unwrap();
+
+        assert!(!report.live_fault_matrix_passed);
+        let public = report
+            .runs
+            .iter()
+            .find(|run| run.scenario == LiveFaultScenario::PublicReconnect)
+            .unwrap();
+        assert!(
+            public
+                .scenario_failures
+                .contains(&LiveFaultScenarioFailure::InjectorEvidenceInvalid)
+        );
+    }
+
+    #[test]
+    fn fault_matrix_rejects_failed_typed_reap_proxy_evidence() {
+        let fixture = build_fixture();
+        let injector = fixture
+            .manifest
+            .runs
+            .iter()
+            .find(|run| run.scenario == LiveFaultScenario::OrderTransportReconnect)
+            .unwrap()
+            .injector_evidence
+            .clone()
+            .unwrap();
+        let evidence = serde_json::json!({
+            "format_version": 1,
+            "proxy_session_id": "proxy-session",
+            "proxy_config_fingerprint": "a".repeat(64),
+            "java_reference_revision": PINNED_JAVA_REVISION,
+            "command_id": "order-reconnect",
+            "command": {
+                "kind": "disconnect_websockets",
+                "target": "order",
+                "connections": 1
+            },
+            "armed_at_ms": 100,
+            "completed_at_ms": 101,
+            "effects": [{
+                "kind": "websocket_disconnected",
+                "sequence": 1,
+                "applied_at_ms": 100,
+                "connection_id": 1,
+                "target": "order"
+            }],
+            "passed": false
+        });
+        std::fs::write(&injector, serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+
+        let report =
+            verify_live_fault_matrix_paths(&fixture.config_path, &fixture.manifest_path).unwrap();
+
+        assert!(!report.live_fault_matrix_passed);
+        let order = report
+            .runs
+            .iter()
+            .find(|run| run.scenario == LiveFaultScenario::OrderTransportReconnect)
+            .unwrap();
+        assert!(
+            order
+                .scenario_failures
+                .contains(&LiveFaultScenarioFailure::InjectorEvidenceInvalid)
         );
     }
 

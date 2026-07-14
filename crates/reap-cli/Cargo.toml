@@ -14,6 +14,7 @@ reap-backtest.workspace = true
 reap-capture.workspace = true
 reap-core.workspace = true
 reap-feed.workspace = true
+reap-fault.workspace = true
 reap-live.workspace = true
 reap-strategy.workspace = true
 reap-telemetry.workspace = true

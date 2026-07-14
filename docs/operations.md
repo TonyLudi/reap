@@ -1275,6 +1275,112 @@ in `observe` only after review.
   canonical active orders and every account has returned a clean zero-order
   REST reconciliation. Unsafe shutdown never disables it.
 
+## Demo Fault Proxy
+
+`reap fault-proxy` is an out-of-process campaign tool. It accepts only official
+OKX demo upstreams, exposes separate loopback REST, public, private-state, and
+order-command routes, and cannot produce a production-eligible endpoint tuple.
+The proxy forwards authenticated traffic in memory but does not log or retain
+authorization headers, login frames, raw account/order payloads, or injected
+response bodies. Run it under the same protected service account as other demo
+evidence tooling and never expose its listeners or Unix socket beyond the host.
+
+Prepare one exact routed config for the campaign. Output paths are create-new;
+do not delete or overwrite artifacts from an earlier run:
+
+```bash
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+FAULT_ROOT="var/reap/fault"
+ROUTED_CONFIG="${FAULT_ROOT}/live-${RUN_ID}.toml"
+install -d -m 700 "$FAULT_ROOT"
+reap render-fault-live-config \
+  --live-config examples/live-okx-demo.toml \
+  --proxy-config examples/okx-demo-fault-proxy.toml \
+  --output "$ROUTED_CONFIG" \
+  --pretty
+reap live --config "$ROUTED_CONFIG" --mode validate --pretty
+```
+
+The renderer requires the source live endpoints to match the proxy's official
+demo upstream exactly. It adds `venue.order_ws_url` so private account-state and
+order-command faults are attributable to different sockets. Outside a routed
+test config that field is optional and defaults to `private_ws_url`.
+
+For each matrix role, start a fresh proxy process and one fresh bounded live
+session. Keep the routed config bytes identical across roles, but use unique
+session, command, evidence, live-report, and proxy-report names:
+
+```bash
+ROLE="public-reconnect"
+PROXY_REPORT="${FAULT_ROOT}/proxy-${RUN_ID}-${ROLE}.json"
+LIVE_REPORT="${FAULT_ROOT}/live-${RUN_ID}-${ROLE}.json"
+
+# Process 1
+reap fault-proxy \
+  --config examples/okx-demo-fault-proxy.toml \
+  --output "$PROXY_REPORT" \
+  --duration-secs 1800 \
+  --require-clean-shutdown \
+  --pretty
+
+# Process 2, after the proxy listeners are ready
+reap live \
+  --config "$ROUTED_CONFIG" \
+  --mode observe \
+  --duration-secs 900 \
+  --output "$LIVE_REPORT" \
+  --pretty
+```
+
+Use `demo --confirm-demo` instead of `observe` only for the minimum-size roles
+that require order entry, after account certification and clean observe
+acceptance. Query proxy state before injection:
+
+```bash
+reap fault-proxy-control \
+  --socket var/reap/fault/control.sock \
+  --command examples/faults/status.json \
+  --require-accepted \
+  --pretty
+```
+
+The files under `examples/faults/` are protocol-checked templates. Before each
+fault, place a copy in the campaign directory and change both `command_id` and
+`evidence_file` to unique role/run values. Arm exactly one expected condition
+and require command acceptance:
+
+```bash
+reap fault-proxy-control \
+  --socket var/reap/fault/control.sock \
+  --command "${FAULT_ROOT}/${RUN_ID}-${ROLE}.command.json" \
+  --require-accepted \
+  --pretty
+```
+
+Disconnect evidence is completed when the selected bridge acknowledges closure.
+REST-response and websocket-drop evidence appears only after every requested
+match occurs. A pending rule, failed disconnect, proxy error, active websocket,
+or stale control socket makes the proxy report unclean. Do not arm speculative
+rules in the same run. The ambiguous-submit and ambiguous-cancel templates drop
+the matching order-command acknowledgement from exchange to client; arm them
+immediately before one reviewed minimum-size action. They do not themselves
+prove the exchange accepted, rejected, filled, or cancelled the order.
+
+Stop the live process first and let its cancel/reconcile lifecycle complete.
+Require proxy status to show zero pending faults and zero errors, then submit
+`examples/faults/shutdown.json`. Archive the exact source and routed configs,
+live report, proxy run report, completed injector artifact, executable hash,
+supervisor record, and any separate exchange/account evidence. Add only the live
+report and completed injector artifact to the schema-3 matrix. For supported
+Reap artifacts the verifier checks strict structure, effect count/timing/hash,
+and the public/private/order reconnect, submit/cancel ambiguity, or clock role.
+Other injector formats are only hashed and remain operator-reviewed evidence.
+
+This proxy closes a reproducibility gap; it does not establish fault causality
+by itself. Process death, deadman expiry, emergency cancellation, partial-fill
+economics, and account-statement reconciliation still require their independent
+procedures and artifacts.
+
 ## Fail-Closed Matrix
 
 | Condition | Automatic state | Required action |
@@ -1334,8 +1440,9 @@ reap verify-live-fault-matrix \
   --pretty
 ```
 
-The schema-3 template is `examples/live-fault-matrix.toml`; relative artifact
-paths resolve from the manifest directory. The verifier requires distinct
+The schema-3 manifest template is `examples/live-fault-matrix.toml`; relative
+artifact paths resolve from the manifest directory. The verifier emits a
+format-4 report with optional validated Reap proxy summaries and requires distinct
 status, instrument, fee, and account-config failure roles and rejects missing
 or duplicate roles, typed-failure substitution, report/session reuse, injector
 path or content reuse, config byte drift, invalid schema-8 evidence, and
@@ -1457,9 +1564,10 @@ Sources: [Global API guide](https://www.okx.com/docs-v5/en/),
 endpoint change requires a code review and new demo evidence, not a runtime
 configuration bypass.
 
-A tuple whose REST and both WebSocket hosts are loopback may use cleartext only
-with `environment = "demo"` for deterministic tests. Loopback cannot be mixed
-with official endpoints and is ineligible for production-transition evidence.
+A tuple whose REST and all effective WebSocket hosts are loopback may use
+cleartext only with `environment = "demo"` for deterministic tests. Loopback
+cannot be mixed with official endpoints and is ineligible for
+production-transition evidence.
 
 The live runtime shares one connection-attempt pacer across its public feed and
 all account-private feeds. It covers initial connection, reconnect, and book

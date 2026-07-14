@@ -1,0 +1,21 @@
+schema_version = 1
+
+# All listeners are loopback-only. The routed live config uses a distinct
+# order-command endpoint so private-account and order transport faults remain
+# independently attributable.
+rest_listen = "127.0.0.1:18080"
+public_ws_listen = "127.0.0.1:18081"
+private_ws_listen = "127.0.0.1:18082"
+order_ws_listen = "127.0.0.1:18083"
+control_socket = "../var/reap/fault/control.sock"
+evidence_directory = "../var/reap/fault/evidence"
+
+request_timeout_ms = 10000
+max_http_body_bytes = 1048576
+max_pending_faults = 64
+shutdown_timeout_ms = 5000
+
+[upstream]
+rest_url = "https://openapi.okx.com"
+public_ws_url = "wss://wspap.okx.com:8443/ws/v5/public"
+private_ws_url = "wss://wspap.okx.com:8443/ws/v5/private"

@@ -8,6 +8,10 @@ use reap_backtest::{BacktestConfig, BacktestRunner, run_research_manifest_path};
 use reap_capture::{
     CaptureConfig, CaptureRunOptions, analyze_capture_path, run_capture, verify_capture_paths,
 };
+use reap_fault::{
+    FaultProxyCommand, FaultProxyConfig, FaultProxyRunOptions, run_fault_proxy,
+    send_fault_proxy_command,
+};
 use reap_live::{
     DeadmanExpiryCertificationOptions, EmergencyCancelOptions, EmergencyCancelVerificationOptions,
     LiveConfig, LiveMode, LiveRunOptions, LiveRuntimeError, OperatorCommand,
@@ -158,6 +162,54 @@ enum Command {
             help = "Exit non-zero unless the bounded capture satisfies integrity invariants"
         )]
         require_clean_capture: bool,
+        #[arg(long)]
+        pretty: bool,
+    },
+    #[command(
+        about = "Run the loopback-only OKX demo REST/WebSocket fault proxy",
+        long_about = "Forward loopback HTTP and public/private/order WebSockets only to validated official OKX demo endpoints. Faults are armed over an owner-only Unix socket and produce distinct create-new evidence artifacts. This command is test tooling and cannot target production endpoints."
+    )]
+    FaultProxy {
+        #[arg(short, long, help = "Strict schema-1 fault-proxy TOML")]
+        config: PathBuf,
+        #[arg(
+            short,
+            long,
+            help = "Create this owner-readable run report; existing files are refused"
+        )]
+        output: Option<PathBuf>,
+        #[arg(long, help = "Stop the proxy after this many seconds")]
+        duration_secs: Option<u64>,
+        #[arg(
+            long,
+            help = "Exit non-zero if proxy errors or unconsumed armed faults remain"
+        )]
+        require_clean_shutdown: bool,
+        #[arg(long)]
+        pretty: bool,
+    },
+    #[command(
+        about = "Create an exact demo live config routed through a fault proxy",
+        long_about = "Require an official OKX demo live config whose endpoint tuple exactly matches the fault proxy upstream, then create a validated loopback config with separate public, private, and order-command WebSocket routes. No credentials are read."
+    )]
+    RenderFaultLiveConfig {
+        #[arg(long, help = "Official-endpoint demo live TOML")]
+        live_config: PathBuf,
+        #[arg(long, help = "Strict schema-1 fault-proxy TOML")]
+        proxy_config: PathBuf,
+        #[arg(short, long, help = "Create this owner-readable routed live TOML")]
+        output: PathBuf,
+        #[arg(long)]
+        pretty: bool,
+    },
+    #[command(about = "Submit one strict JSON command to a running fault proxy")]
+    FaultProxyControl {
+        #[arg(short, long, help = "Fault-proxy Unix control socket")]
+        socket: PathBuf,
+        #[arg(short, long, help = "Strict schema-1 fault command JSON")]
+        command: PathBuf,
+        #[arg(long, help = "Exit non-zero unless the proxy accepts the command")]
+        require_accepted: bool,
         #[arg(long)]
         pretty: bool,
     },
@@ -710,6 +762,109 @@ async fn main() -> Result<()> {
             println!("{json}");
             if require_clean_capture && !report.clean_capture {
                 anyhow::bail!("bounded capture did not satisfy clean integrity invariants");
+            }
+        }
+        Command::FaultProxy {
+            config,
+            output,
+            duration_secs,
+            require_clean_shutdown,
+            pretty,
+        } => {
+            let mut output_file = output
+                .as_ref()
+                .map(|path| reserve_private_output(path, "fault-proxy run report"))
+                .transpose()?;
+            reap_telemetry::init_json_tracing("info")
+                .map_err(anyhow::Error::msg)
+                .context("failed to initialize fault-proxy tracing")?;
+            let (config, config_evidence) = FaultProxyConfig::load(&config).with_context(|| {
+                format!("failed to load fault-proxy config {}", config.display())
+            })?;
+            let report = run_fault_proxy(
+                config,
+                config_evidence,
+                FaultProxyRunOptions {
+                    duration: duration_secs.map(Duration::from_secs),
+                },
+            )
+            .await?;
+            let json = if pretty {
+                serde_json::to_string_pretty(&report)?
+            } else {
+                serde_json::to_string(&report)?
+            };
+            if let (Some(file), Some(path)) = (&mut output_file, output.as_deref()) {
+                persist_reserved_output(file, path, &json, "fault-proxy run report")?;
+            }
+            println!("{json}");
+            if require_clean_shutdown && !report.clean_shutdown {
+                anyhow::bail!("fault proxy did not satisfy clean-shutdown invariants");
+            }
+        }
+        Command::FaultProxyControl {
+            socket,
+            command,
+            require_accepted,
+            pretty,
+        } => {
+            let metadata = std::fs::metadata(&command).with_context(|| {
+                format!("failed to inspect fault command {}", command.display())
+            })?;
+            if metadata.len() > 1024 * 1024 {
+                anyhow::bail!("fault command exceeds the 1 MiB limit");
+            }
+            let command_bytes = std::fs::read(&command)
+                .with_context(|| format!("failed to read fault command {}", command.display()))?;
+            if command_bytes.len() > 1024 * 1024 {
+                anyhow::bail!("fault command exceeds the 1 MiB limit");
+            }
+            let command: FaultProxyCommand = serde_json::from_slice(&command_bytes)
+                .with_context(|| "failed to parse strict fault command JSON")?;
+            let response = send_fault_proxy_command(&socket, &command).await?;
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                println!("{}", serde_json::to_string(&response)?);
+            }
+            if require_accepted && !response.accepted {
+                anyhow::bail!("fault proxy rejected the command: {}", response.message);
+            }
+        }
+        Command::RenderFaultLiveConfig {
+            live_config,
+            proxy_config,
+            output,
+            pretty,
+        } => {
+            let live = LiveConfig::load(&live_config).with_context(|| {
+                format!("failed to load demo live config {}", live_config.display())
+            })?;
+            let (proxy, proxy_evidence) =
+                FaultProxyConfig::load(&proxy_config).with_context(|| {
+                    format!(
+                        "failed to load fault-proxy config {}",
+                        proxy_config.display()
+                    )
+                })?;
+            let routed = proxy.route_live_config(&live)?;
+            let toml = toml::to_string_pretty(&routed)
+                .context("failed to serialize routed demo live config")?;
+            let mut file = reserve_private_output(&output, "routed demo live config")?;
+            persist_reserved_output(&mut file, &output, &toml, "routed demo live config")?;
+            let summary = serde_json::json!({
+                "output": output,
+                "proxy_config_fingerprint": proxy_evidence.effective_fingerprint,
+                "live_config_fingerprint": routed.fingerprint()?,
+                "rest_url": &routed.venue.rest_url,
+                "public_ws_url": &routed.venue.public_ws_url,
+                "private_ws_url": &routed.venue.private_ws_url,
+                "order_ws_url": routed.venue.order_ws_url(),
+            });
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                println!("{}", serde_json::to_string(&summary)?);
             }
         }
         Command::Live {

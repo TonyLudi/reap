@@ -63,6 +63,10 @@ Implemented:
   zero-order proof. Its create-new schema-versioned artifact binds the exact
   input file, binary, host, Java revision, account coverage, and task failures,
   plus hardened systemd templates with mode-specific restart policy.
+- A loopback-only OKX demo fault proxy with separate REST, public, private, and
+  order-command routes, owner-local control, deterministic disconnect/frame-drop/
+  REST-response faults, and create-new typed injector evidence that never records
+  credentials or raw private payloads.
 - Deterministic backtest matching with `PendingNew`, delayed entry/cancel/update
   boundaries, `PostOnly`, `IOC`, conservative displayed-depth fills, trade
   fills, queue-ahead tracking, fee/turnover attribution, realized linear and
@@ -450,6 +454,31 @@ reserved file empty and must be diagnosed from the process log; an empty file
 is never evidence. `verify-live-run` independently re-hashes exact config/report
 bytes, re-derives effective fingerprints and clean-soak acceptance, and checks
 mode, identity, readiness, failure, disconnect, host, and latency invariants.
+The demo-only fault proxy can produce a validated loopback live config and run
+outside the strategy process:
+
+```bash
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+install -d -m 700 var/reap/fault
+cargo run -p reap-cli -- render-fault-live-config \
+  --live-config examples/live-okx-demo.toml \
+  --proxy-config examples/okx-demo-fault-proxy.toml \
+  --output "var/reap/fault/live-${RUN_ID}.toml" \
+  --pretty
+cargo run -p reap-cli -- fault-proxy \
+  --config examples/okx-demo-fault-proxy.toml \
+  --output "var/reap/fault/proxy-${RUN_ID}.json" \
+  --duration-secs 3600 \
+  --require-clean-shutdown \
+  --pretty
+```
+
+Use `fault-proxy-control` from a separate process with one checked-in
+`examples/faults/*.json` command at a time. Copy each fault template to the
+campaign directory and give it a unique `command_id` and `evidence_file`; the
+proxy refuses reused IDs, existing evidence, non-loopback listeners, and any
+non-demo upstream. See `docs/operations.md` for the isolated campaign sequence.
+
 After isolated target-host fault runs, populate
 `examples/live-fault-matrix.toml` and verify that every role used one exact
 config, binary, host, account identity, and unique session:
@@ -467,8 +496,9 @@ cargo run -p reap-cli -- verify-live-fault-matrix \
 The matrix requires enabled fatal alerts, the synchronized host guard, the
 operator service, redundant public websockets, clean observe/demo/reconnect
 runs, safe zero-order shutdown for injected ambiguity/convergence faults, and
-the documented typed runtime failures. It hashes a distinct opaque injector
-record for every fault but does not interpret that record. Process-death,
+the documented typed runtime failures. It hashes every injector record; strict
+Reap proxy evidence is also structurally validated and tied to supported fault
+roles, while records from external injectors remain opaque. Process-death,
 deadman-expiry, emergency-cancel, fill/fee, target-host, and production approval
 remain separate gates.
 

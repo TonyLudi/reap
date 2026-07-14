@@ -81,6 +81,7 @@ reap/
     reap-storage/
     reap-telemetry/
     reap-live/
+    reap-fault/
     reap-cli/
 ```
 
@@ -321,7 +322,8 @@ Responsibilities:
 - Aggregate isolated live fault reports through a strict manifest that requires
   the complete role matrix, unique sessions and injector artifacts, one
   config/build/host/account identity, recovered reconnects, and safe zero-order
-  shutdown. Opaque injector records and external certifications remain explicit
+  shutdown. Reap proxy evidence is parsed and validated for supported roles;
+  opaque external injector records and certifications remain explicit
   limitations rather than inferred facts.
 - Start/stop/restart strategy instances.
 - Dispatch timers into strategy loops.
@@ -514,6 +516,40 @@ timer and must never delay incident cancellation.
 
 Later, if the strategy loop becomes latency-critical, replace the async receive
 with a pinned OS thread and a bounded SPSC queue.
+
+### `reap-fault`
+
+Deterministic OKX demo fault-injection infrastructure, launched as a separate
+process from `reap-live` and excluded from the strategy event loop.
+
+Responsibilities:
+
+- Accept only an official, region-consistent OKX demo REST/public/private
+  upstream tuple and bind four distinct loopback listeners: REST, public market
+  data, private account state, and authenticated order commands.
+- Render an exact validated loopback live config. `venue.order_ws_url` is
+  optional for ordinary deployments and falls back to `private_ws_url`; the
+  routed test config sets it explicitly so private-state and order-transport
+  faults remain independently attributable.
+- Forward REST and websocket traffic without logging authorization headers,
+  login frames, raw account/order payloads, or injected response bodies. Evidence
+  retains only bounded metadata, byte counts, and SHA-256 digests.
+- Accept strict bounded commands over a mode-`0600` Unix socket. Supported
+  primitives are targeted websocket disconnects, matched one-shot or bounded
+  frame drops, and matched REST responses.
+- Create each completed injector artifact once with mode `0600`, pinned Java and
+  proxy-config provenance, exact command summary, effect timing, and hashed
+  payload metadata. Failed disconnect completion is explicit and cannot satisfy
+  the live fault matrix.
+- Track every listener and connection task through shutdown. A clean run report
+  requires no proxy error, pending fault, active websocket, or stale control
+  socket.
+
+This crate is test infrastructure, not an exchange gateway abstraction and not
+a production sidecar. Configuration validation rejects production upstreams,
+non-loopback listeners, mixed endpoint tuples, and reused evidence. Runtime
+fault switches are deliberately absent from `reap-live`; the process boundary
+keeps campaign authority out of normal trading state.
 
 ### `reap-backtest`
 
@@ -1150,7 +1186,9 @@ the deployment blocker.
   and all-configured-account zero invariants are independently verifiable.
   Target-host/account fault exercise, raw REST-response replay, and separate
   algo/spread handling remain.
-- Complete fault injection and OKX demo soak acceptance.
+- Add independently routed demo fault injection with durable typed evidence.
+  Done. Execute and accept the credentialed target-host campaign and OKX demo
+  soak; tooling alone does not close that gate.
 
 See [trading-readiness.md](trading-readiness.md) for the detailed gate.
 

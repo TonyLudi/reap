@@ -1,0 +1,4 @@
+{
+  "command": "shutdown",
+  "reason": "operator requested campaign shutdown"
+}
