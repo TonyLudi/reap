@@ -3,6 +3,7 @@ mod control;
 mod protocol;
 mod proxy;
 mod state;
+mod verification;
 
 pub use config::{
     FaultProxyConfig, FaultProxyConfigError, FaultProxyConfigEvidence, FaultProxyUpstream,
@@ -15,3 +16,4 @@ pub use protocol::{
     WebSocketJsonMatcher, WebSocketTarget,
 };
 pub use proxy::{FaultProxyRunOptions, FaultProxyRuntimeError, run_fault_proxy};
+pub use verification::*;

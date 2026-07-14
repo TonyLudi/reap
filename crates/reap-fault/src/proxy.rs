@@ -16,6 +16,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use reap_core::PINNED_JAVA_REVISION;
+use reap_live::{current_executable_sha256, host_identity_sha256};
 use tokio::net::{TcpListener, TcpStream, UnixListener};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -53,6 +54,10 @@ pub async fn run_fault_proxy(
             config.control_socket.clone(),
         ));
     }
+    let executable_sha256 =
+        current_executable_sha256().map_err(FaultProxyRuntimeError::Provenance)?;
+    let host_identity_sha256 =
+        host_identity_sha256().map_err(FaultProxyRuntimeError::Provenance)?;
 
     let rest_listener = TcpListener::bind(config.rest_listen)
         .await
@@ -207,11 +212,16 @@ pub async fn run_fault_proxy(
         proxy_session_id: state.session_id.clone(),
         config: config_evidence,
         java_reference_revision: PINNED_JAVA_REVISION.to_string(),
+        reap_version: env!("CARGO_PKG_VERSION").to_string(),
+        executable_sha256,
+        host_identity_sha256,
         started_at_ms,
         stopped_at_ms: now_ms(),
         elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
         stop_reason,
         status,
+        listener_tasks_joined_cleanly: joined_cleanly,
+        control_socket_removed: socket_removed,
         clean_shutdown,
     })
 }
@@ -807,6 +817,8 @@ pub enum FaultProxyRuntimeError {
     HttpClient(reqwest::Error),
     #[error("failed to install fault-proxy signal handler: {0}")]
     Signal(std::io::Error),
+    #[error("failed to fingerprint fault-proxy provenance: {0}")]
+    Provenance(String),
 }
 
 #[derive(Debug, thiserror::Error)]

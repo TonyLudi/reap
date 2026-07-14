@@ -1417,15 +1417,36 @@ not a claim that the injected body represents a valid exchange state.
 
 Stop the live process first and let its cancel/reconcile lifecycle complete.
 Require proxy status to show zero pending faults and zero errors, then submit
-`examples/faults/shutdown.json`. Archive the exact source and routed configs,
-live report, proxy run report, completed injector artifact, executable hash,
-supervisor record, and any separate exchange/account evidence. Add only the live
-report and completed injector artifact to the schema-3 matrix. For supported
-Reap artifacts the verifier checks strict structure, effect count/timing/hash,
-and binds the command to its exact reconnect, ambiguity, convergence, deadman,
-clock, status, instrument, fee, or account-configuration role. It rejects Reap
-proxy artifacts for clean runs, genuine partial fills, and restored-latch runs.
-Other injector formats are only hashed and remain operator-reviewed evidence.
+`examples/faults/shutdown.json`. After the proxy exits, independently reconstruct
+its schema-2 process report:
+
+```bash
+PROXY_VERIFICATION="${FAULT_ROOT}/proxy-${RUN_ID}-${ROLE}-verification.json"
+reap verify-fault-proxy-run \
+  --config examples/okx-demo-fault-proxy.toml \
+  --report "$PROXY_REPORT" \
+  --output "$PROXY_VERIFICATION" \
+  --require-pass \
+  --pretty
+```
+
+The verifier rejects legacy/unknown fields, config drift, invalid build/host/
+session provenance, inconsistent wall/monotonic timing, listener or control
+socket cleanup failure, pending faults, active connections, retained proxy
+errors, and a forged clean flag. Archive the exact source and routed configs,
+live report, raw proxy run report, its verification, completed injector artifact,
+executable hash, supervisor record, and any separate exchange/account evidence.
+Add only the live report and completed injector artifact to the schema-3 fault
+matrix; add the raw proxy report to the scenario-matched `fault_proxy_runs` entry
+in the production-evidence manifest. The aggregate reruns this verifier and does
+not trust the standalone verification JSON.
+
+For supported Reap artifacts the matrix verifier checks strict structure, effect
+count/timing/hash, and binds the command to its exact reconnect, ambiguity,
+convergence, deadman, clock, status, instrument, fee, or account-configuration
+role. It rejects Reap proxy artifacts for clean runs, genuine partial fills, and
+restored-latch runs. Other injector formats are only hashed and remain
+operator-reviewed evidence.
 
 This proxy closes a reproducibility gap; it does not establish fault causality
 by itself. A genuine partial fill and a durable latch restored after restart
@@ -1698,7 +1719,7 @@ target/release/reap verify-production-evidence \
   --pretty
 ```
 
-Schema 2 requires the intended Reap version, candidate executable SHA-256,
+Schema 3 requires the intended Reap version, candidate executable SHA-256,
 target-host identity SHA-256, predeclared deployment candidate ID, and separate
 demo and production exchange-account identity maps. It also requires the exact
 fault-proxy config and the create-new routed demo config used by the fault
@@ -1710,6 +1731,11 @@ certification, demo deadman certification, and authenticated fill reconciliation
 for every account in the exact configs. The dedicated clean demo soak must be a
 different session from every fault-matrix run. A reviewed nonzero
 `minimum_fills` is mandatory for each reconciliation.
+It also requires exactly one raw schema-2 fault-proxy process report for every
+matrix scenario. Each must independently pass, use the exact proxy config/build/
+host, have a unique proxy session, enclose exactly its assigned live session and
+no other matrix session, and report one completed command only when that role has
+typed injector evidence.
 
 The mandatory `[freshness]` table declares the accepted age for each
 operational source. The verifier records its wall time once, rejects zero age
@@ -1719,7 +1745,7 @@ rejects stale sources. Configuration cannot weaken these hard maxima:
 | Source | Hard maximum age |
 | --- | ---: |
 | Dedicated demo soak | 24 hours |
-| Every fault live run and typed proxy command | 7 days |
+| Every fault live run, typed proxy command, and proxy process report | 7 days |
 | Every latency source live run | 7 days |
 | Production account certification | 15 minutes |
 | Demo deadman certification | 7 days |
@@ -1745,6 +1771,8 @@ The aggregate command directly reruns, rather than consumes output from:
 - `verify-live-run --expected-mode demo` for the dedicated clean soak;
 - routed fault-config reconstruction plus `verify-live-fault-matrix` against that
 exact loopback config;
+- `verify-fault-proxy-run` for one scenario-matched raw proxy process report per
+  matrix role;
 - `verify-latency-calibration` from every raw source live report;
 - account and deadman artifact verification from their embedded raw responses;
 - `verify-emergency-cancel --require-all-configured-accounts`; and
@@ -1758,8 +1786,10 @@ inside the corresponding reverified live session. Opaque external injector
 records are accepted only for genuine partial-fill and restored-latch roles,
 whose causality cannot be manufactured by the current proxy. Freshness applies
 to those roles' live reports, but their external causality remains an operator
-review. Archive and review each proxy process run report separately; schema 2
-does not reconstruct its clean-shutdown status.
+review. Schema 3 directly reconstructs every raw proxy process report and derives
+clean shutdown from listener joins, control-socket removal, pending rules, active
+connections, and proxy errors. External supervisor lifecycle evidence remains a
+separate review.
 
 The controlling manifest plus official-demo, production, routed-fault, and
 fault-proxy configs are reopened after those potentially long reconstructions.
@@ -1769,7 +1799,7 @@ is missing or duplicated, or if any config/build/host/account/candidate binding
 differs. The output records a semantic SHA-256 of each in-memory reconstruction
 and always sets `production_order_entry_authorized = false`.
 
-A pass is deliberately narrower than production approval. Schema 2 enforces
+A pass is deliberately narrower than production approval. Schema 3 enforces
 bounded age from validated session, exchange-clock, emergency-report, and fill
 window timestamps, but those clocks are not remotely attested. It does not
 remotely attest the host or exchange identity, reconcile complete economic

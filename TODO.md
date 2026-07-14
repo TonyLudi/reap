@@ -299,6 +299,10 @@ architecture in [docs/architecture.md](docs/architecture.md).
   proxy command times, require those commands to occur inside their live
   sessions, and reject invalid, future, or stale timestamps under code-level
   maximum ages.
+- [x] Add binary/host provenance and independently re-derived clean-shutdown
+  fields to schema-2 fault-proxy process reports, expose an offline source
+  verifier, and require schema-3 production bundles to provide one unique proxy
+  session enclosing exactly each fault-matrix live run.
 - [ ] Calibrate queue position, latency, fees, funding, and slippage from
   captured full-depth data, then run and archive production-candidate
   walk-forward, capacity, and stressed-liquidity reports. The orchestration and

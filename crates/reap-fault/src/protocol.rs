@@ -8,7 +8,7 @@ use crate::config::FaultProxyConfigEvidence;
 
 pub const CONTROL_FORMAT_VERSION: u32 = 1;
 pub const INJECTOR_EVIDENCE_FORMAT_VERSION: u32 = 1;
-pub const RUN_REPORT_FORMAT_VERSION: u32 = 1;
+pub const RUN_REPORT_FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
@@ -260,11 +260,16 @@ pub struct FaultProxyRunReport {
     pub proxy_session_id: String,
     pub config: FaultProxyConfigEvidence,
     pub java_reference_revision: String,
+    pub reap_version: String,
+    pub executable_sha256: String,
+    pub host_identity_sha256: String,
     pub started_at_ms: u64,
     pub stopped_at_ms: u64,
     pub elapsed_ms: u64,
     pub stop_reason: String,
     pub status: FaultProxyStatus,
+    pub listener_tasks_joined_cleanly: bool,
+    pub control_socket_removed: bool,
     pub clean_shutdown: bool,
 }
 

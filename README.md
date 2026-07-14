@@ -66,7 +66,9 @@ Implemented:
 - A loopback-only OKX demo fault proxy with separate REST, public, private, and
   order-command routes, owner-local control, deterministic disconnect/frame-drop/
   REST-response faults, and create-new typed injector evidence that never records
-  credentials or raw private payloads.
+  credentials or raw private payloads. Schema-2 process reports bind the exact
+  config, binary, host, session, timing, listener cleanup, and final proxy state;
+  an offline verifier independently re-derives clean shutdown.
 - A strict production-evidence bundle verifier that reruns every source verifier
   and cross-binds exact official-demo/production configs, a deterministically
   derived routed fault config, the predeclared research candidate, the running
@@ -319,12 +321,14 @@ manifest-declared build, host, candidate, or environment-specific account
 identities. Proxy-supported fault roles must carry typed records with the exact
 proxy fingerprint, unique proxy session/command IDs, fresh timestamps, and a
 command interval inside the corresponding verified live session; only genuine
-partial-fill and restart-latch roles may use external evidence. Schema 2 also
+partial-fill and restart-latch roles may use external evidence. Schema 3 also
 enforces reviewed age limits under hard code-level maxima for the demo soak,
 every fault and latency source, production account certification, deadman,
-emergency cancel, and the reconciled fill window. It does not trust previously
-emitted verification JSON. The checked-in manifest is a schema template with
-deliberately invalid placeholder identities, not evidence.
+emergency cancel, and the reconciled fill window. It requires one independently
+verified clean proxy-process report per fault role, with a unique session that
+encloses exactly that live run and the expected completed-command count. It does
+not trust previously emitted verification JSON. The checked-in manifest is a
+schema template with deliberately invalid placeholder identities, not evidence.
 
 Observe OKX demo feeds and account state without permitting any submit or
 cancel request:

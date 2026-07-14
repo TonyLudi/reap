@@ -900,6 +900,7 @@ reap replay-check --events data/events.jsonl
 reap analyze-capture --config config/capture.toml --events data/events.jsonl
 reap verify-capture --config config/capture.toml --report capture-report.json --events data/events.jsonl
 reap calibrate-latency --config config/live.toml --report live.json --output latency.json
+reap verify-fault-proxy-run --config fault-proxy.toml --report proxy-run.json --require-pass
 reap verify-production-evidence --manifest production-evidence.toml --require-pass
 reap inspect-book --capture raw/ws.jsonl --symbol BTC-USDT
 reap config-check --config config/live.toml
@@ -907,8 +908,8 @@ reap config-check --config config/live.toml
 
 `live`, `capture`, both emergency-cancel commands, both deadman-certification
 commands, `operator`, `backtest`, `research`, `replay-check`, `analyze-capture`,
-`verify-capture`, `calibrate-latency`, `verify-production-evidence`, and
-`config-check` are implemented.
+`verify-capture`, `calibrate-latency`, `verify-fault-proxy-run`,
+`verify-production-evidence`, and `config-check` are implemented.
 `inspect-book` remains planned; see [trading-readiness.md](trading-readiness.md).
 
 Cross-crate production evidence composition belongs in `reap-cli`: `reap-live`
@@ -919,13 +920,15 @@ identities. The verifier reruns each source gate, reopens every deployment
 config and the controlling manifest, and reconstructs the loopback fault config
 from the exact official-demo and fault-proxy configs before cross-binding all
 returned identities. It hashes the typed in-memory reconstructions instead of
-accepting prior verification JSON. Schema 2 re-verifies every fault/latency live
-source, derives completion
-times from validated sessions or exchange-clock samples, enforces explicit age
-limits under hard maxima, and requires each typed proxy command interval to fall
-inside its live session. Even a passing bundle leaves production entry
-unauthorized because remote attestation, external supervision, full economics,
-and operator approval are outside this composition.
+accepting prior verification JSON. Schema 3 re-verifies every fault/latency live
+source, derives completion times from validated sessions or exchange-clock
+samples, enforces explicit age limits under hard maxima, and requires each typed
+proxy command interval to fall inside its live session. It also reconstructs one
+schema-2 proxy process report per scenario, requiring exact config/build/host,
+unique sessions, independently derived clean shutdown, and unambiguous live-run
+enclosure. Even a passing bundle leaves production entry unauthorized because
+remote attestation, external supervision, full economics, and operator approval
+are outside this composition.
 
 ## Multi-Websocket Design
 

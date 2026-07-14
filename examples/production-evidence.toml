@@ -1,6 +1,6 @@
 # Schema template only. Replace every path and identity with reviewed target-host
 # evidence. This file cannot pass as checked in and contains no credentials.
-schema_version = 2
+schema_version = 3
 expected_reap_version = "0.1.0"
 expected_live_executable_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 expected_host_identity_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -45,6 +45,59 @@ main = "1111111111111111111111111111111111111111111111111111111111111111"
 
 [expected_production_account_identity_sha256s]
 main = "2222222222222222222222222222222222222222222222222222222222222222"
+
+# One fresh proxy process and create-new run report per matrix role.
+[[fault_proxy_runs]]
+scenario = "clean_observe"
+report = "/secure/evidence/proxy-clean-observe.json"
+[[fault_proxy_runs]]
+scenario = "clean_demo"
+report = "/secure/evidence/proxy-clean-demo.json"
+[[fault_proxy_runs]]
+scenario = "public_reconnect"
+report = "/secure/evidence/proxy-public-reconnect.json"
+[[fault_proxy_runs]]
+scenario = "private_reconnect"
+report = "/secure/evidence/proxy-private-reconnect.json"
+[[fault_proxy_runs]]
+scenario = "order_transport_reconnect"
+report = "/secure/evidence/proxy-order-transport-reconnect.json"
+[[fault_proxy_runs]]
+scenario = "ambiguous_submit"
+report = "/secure/evidence/proxy-ambiguous-submit.json"
+[[fault_proxy_runs]]
+scenario = "ambiguous_cancel"
+report = "/secure/evidence/proxy-ambiguous-cancel.json"
+[[fault_proxy_runs]]
+scenario = "partial_fill"
+report = "/secure/evidence/proxy-partial-fill.json"
+[[fault_proxy_runs]]
+scenario = "fill_convergence_timeout"
+report = "/secure/evidence/proxy-fill-convergence-timeout.json"
+[[fault_proxy_runs]]
+scenario = "order_convergence_timeout"
+report = "/secure/evidence/proxy-order-convergence-timeout.json"
+[[fault_proxy_runs]]
+scenario = "restored_safety_latch"
+report = "/secure/evidence/proxy-restored-safety-latch.json"
+[[fault_proxy_runs]]
+scenario = "deadman_heartbeat_failure"
+report = "/secure/evidence/proxy-deadman-heartbeat-failure.json"
+[[fault_proxy_runs]]
+scenario = "exchange_clock_failure"
+report = "/secure/evidence/proxy-exchange-clock-failure.json"
+[[fault_proxy_runs]]
+scenario = "exchange_status_failure"
+report = "/secure/evidence/proxy-exchange-status-failure.json"
+[[fault_proxy_runs]]
+scenario = "exchange_instrument_failure"
+report = "/secure/evidence/proxy-exchange-instrument-failure.json"
+[[fault_proxy_runs]]
+scenario = "exchange_fee_failure"
+report = "/secure/evidence/proxy-exchange-fee-failure.json"
+[[fault_proxy_runs]]
+scenario = "account_config_failure"
+report = "/secure/evidence/proxy-account-config-failure.json"
 
 [[deadman_certifications]]
 artifact = "/secure/evidence/demo-deadman-main.json"

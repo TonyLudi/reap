@@ -12,7 +12,7 @@ use reap_capture::{
 };
 use reap_fault::{
     FaultProxyCommand, FaultProxyConfig, FaultProxyRunOptions, run_fault_proxy,
-    send_fault_proxy_command,
+    send_fault_proxy_command, verify_fault_proxy_run_paths,
 };
 use reap_live::{
     DeadmanExpiryCertificationOptions, EmergencyCancelOptions, EmergencyCancelVerificationOptions,
@@ -194,7 +194,7 @@ enum Command {
         #[arg(
             short,
             long,
-            help = "Strict schema-2 production evidence TOML manifest"
+            help = "Strict schema-3 production evidence TOML manifest"
         )]
         manifest: PathBuf,
         #[arg(
@@ -261,6 +261,26 @@ enum Command {
             help = "Exit non-zero if proxy errors or unconsumed armed faults remain"
         )]
         require_clean_shutdown: bool,
+        #[arg(long)]
+        pretty: bool,
+    },
+    #[command(
+        about = "Independently verify one fault-proxy process run report",
+        long_about = "Reopen a strict schema-2 fault-proxy run report and its exact proxy config, rederive clean-shutdown invariants, and expose build, host, session, and timing provenance. This does not bind the proxy process to a live fault scenario."
+    )]
+    VerifyFaultProxyRun {
+        #[arg(short, long, help = "Exact fault-proxy TOML used by the run")]
+        config: PathBuf,
+        #[arg(short, long, help = "Strict schema-2 fault-proxy run report JSON")]
+        report: PathBuf,
+        #[arg(
+            short,
+            long,
+            help = "Optionally create this owner-readable verification artifact"
+        )]
+        output: Option<PathBuf>,
+        #[arg(long, help = "Exit non-zero unless independent verification passes")]
+        require_pass: bool,
         #[arg(long)]
         pretty: bool,
     },
@@ -986,6 +1006,38 @@ async fn main() -> Result<()> {
             println!("{json}");
             if require_clean_shutdown && !report.clean_shutdown {
                 anyhow::bail!("fault proxy did not satisfy clean-shutdown invariants");
+            }
+        }
+        Command::VerifyFaultProxyRun {
+            config,
+            report,
+            output,
+            require_pass,
+            pretty,
+        } => {
+            let mut output_file = output
+                .as_ref()
+                .map(|path| reserve_private_output(path, "fault-proxy run verification"))
+                .transpose()?;
+            let verification =
+                verify_fault_proxy_run_paths(&config, &report).with_context(|| {
+                    format!(
+                        "failed to verify fault-proxy run report {} against {}",
+                        report.display(),
+                        config.display()
+                    )
+                })?;
+            let json = if pretty {
+                serde_json::to_string_pretty(&verification)?
+            } else {
+                serde_json::to_string(&verification)?
+            };
+            if let (Some(file), Some(path)) = (&mut output_file, output.as_deref()) {
+                persist_reserved_output(file, path, &json, "fault-proxy run verification")?;
+            }
+            println!("{json}");
+            if require_pass && !verification.acceptance_passed {
+                anyhow::bail!("fault-proxy run report did not pass independent verification");
             }
         }
         Command::FaultProxyControl {

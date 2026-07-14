@@ -4,7 +4,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use reap_core::PINNED_JAVA_REVISION;
-use reap_fault::{FaultProxyConfig, FaultProxyConfigEvidence};
+use reap_fault::{
+    FaultProxyConfig, FaultProxyConfigEvidence, FaultProxyRunVerificationReport,
+    verify_fault_proxy_run_paths,
+};
 use reap_live::{
     AccountCertificationArtifact, DeadmanExpiryCertificationArtifact,
     EmergencyCancelVerificationOptions, FillStatementCoverage, FillStatementReconciliationOptions,
@@ -20,8 +23,8 @@ use sha2::{Digest, Sha256};
 use crate::deployment::{ResearchDeploymentVerificationReport, verify_research_deployment_paths};
 use crate::latency::{LatencyCalibrationVerificationReport, verify_latency_calibration};
 
-pub(crate) const PRODUCTION_EVIDENCE_MANIFEST_SCHEMA_VERSION: u16 = 2;
-pub(crate) const PRODUCTION_EVIDENCE_REPORT_FORMAT_VERSION: u16 = 2;
+pub(crate) const PRODUCTION_EVIDENCE_MANIFEST_SCHEMA_VERSION: u16 = 3;
+pub(crate) const PRODUCTION_EVIDENCE_REPORT_FORMAT_VERSION: u16 = 3;
 const MAX_PRODUCTION_EVIDENCE_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_PRODUCTION_EVIDENCE_ACCOUNTS: usize = 32;
 const MAX_PRODUCTION_EVIDENCE_LATENCY_REPORTS: usize = 128;
@@ -69,6 +72,13 @@ pub(crate) struct ProductionEvidenceDeadmanInput {
     pub journal: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProductionEvidenceFaultProxyRunInput {
+    pub scenario: reap_live::LiveFaultScenario,
+    pub report: PathBuf,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProductionEvidenceManifest {
@@ -86,6 +96,7 @@ pub(crate) struct ProductionEvidenceManifest {
     pub fault_proxy_config: PathBuf,
     pub demo_soak_report: PathBuf,
     pub fault_matrix_manifest: PathBuf,
+    pub fault_proxy_runs: Vec<ProductionEvidenceFaultProxyRunInput>,
     pub latency_calibration_artifact: PathBuf,
     pub latency_source_reports: Vec<PathBuf>,
     pub research_manifest: PathBuf,
@@ -147,6 +158,7 @@ pub(crate) struct ProductionEvidenceConfigEvidence {
 pub(crate) enum ProductionEvidenceGate {
     Verifier,
     Freshness,
+    FaultProxyRun,
     ProductionTransition,
     ResearchDeployment,
     DemoSoak,
@@ -247,6 +259,29 @@ pub(crate) enum ProductionEvidenceFailure {
         live_started_at_ms: u64,
         live_completed_at_ms: u64,
     },
+    FaultProxyRunCoverageMismatch {
+        expected: Vec<reap_live::LiveFaultScenario>,
+        actual: Vec<reap_live::LiveFaultScenario>,
+    },
+    DuplicateFaultProxyRunSession {
+        proxy_session_id: String,
+    },
+    FaultProxyRunDoesNotEncloseLiveSession {
+        scenario: reap_live::LiveFaultScenario,
+        proxy_started_at_ms: u64,
+        proxy_stopped_at_ms: u64,
+        live_started_at_ms: u64,
+        live_completed_at_ms: u64,
+    },
+    FaultProxyRunAmbiguousLiveCoverage {
+        scenario: reap_live::LiveFaultScenario,
+        enclosed_scenarios: Vec<reap_live::LiveFaultScenario>,
+    },
+    FaultProxyCompletedFaultCountMismatch {
+        scenario: reap_live::LiveFaultScenario,
+        expected: u64,
+        actual: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +299,18 @@ pub(crate) struct ProductionEvidenceFreshnessObservation {
     pub passed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProductionEvidenceFaultProxyRunSummary {
+    pub scenario: reap_live::LiveFaultScenario,
+    pub run_report: reap_fault::FaultProxyRunFileEvidence,
+    pub proxy_session_id: String,
+    pub started_at_ms: u64,
+    pub stopped_at_ms: u64,
+    pub completed_faults: u64,
+    pub acceptance_passed: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProductionEvidenceVerificationReport {
@@ -276,6 +323,7 @@ pub(crate) struct ProductionEvidenceVerificationReport {
     pub expected: ProductionEvidenceExpectedIdentity,
     pub freshness_policy: ProductionEvidenceFreshnessPolicy,
     pub freshness_observations: Vec<ProductionEvidenceFreshnessObservation>,
+    pub fault_proxy_runs: Vec<ProductionEvidenceFaultProxyRunSummary>,
     pub verifier: ProductionEvidenceVerifierIdentity,
     pub demo_config: ProductionEvidenceConfigEvidence,
     pub production_config: ProductionEvidenceConfigEvidence,
@@ -303,6 +351,7 @@ struct ResolvedManifest {
     fault_proxy_config: PathBuf,
     demo_soak_report: PathBuf,
     fault_matrix_manifest: PathBuf,
+    fault_proxy_runs: Vec<ResolvedFaultProxyRunInput>,
     latency_calibration_artifact: PathBuf,
     latency_source_reports: Vec<PathBuf>,
     research_manifest: PathBuf,
@@ -316,6 +365,11 @@ struct ResolvedManifest {
 struct ResolvedDeadmanInput {
     artifact: PathBuf,
     journal: PathBuf,
+}
+
+struct ResolvedFaultProxyRunInput {
+    scenario: reap_live::LiveFaultScenario,
+    report: PathBuf,
 }
 
 struct ResolvedFillInput {
@@ -336,6 +390,11 @@ struct VerifiedTimedLiveSource {
     gate: ProductionEvidenceGate,
     subject: Option<String>,
     report: reap_live::LiveRunVerificationReport,
+}
+
+struct VerifiedFaultProxyRun {
+    scenario: reap_live::LiveFaultScenario,
+    report: FaultProxyRunVerificationReport,
 }
 
 pub(crate) fn verify_production_evidence_manifest_path(
@@ -394,6 +453,20 @@ pub(crate) fn verify_production_evidence_manifest_path(
     .context("failed to reconstruct latency calibration")?;
     let fault_live_sources = verify_fault_live_sources(&paths.fault_demo_config, &fault_matrix)
         .context("failed to bind fault-matrix source timestamps")?;
+    let mut fault_proxy_runs = Vec::with_capacity(paths.fault_proxy_runs.len());
+    for input in &paths.fault_proxy_runs {
+        let report = verify_fault_proxy_run_paths(&paths.fault_proxy_config, &input.report)
+            .with_context(|| {
+                format!(
+                    "failed to reconstruct fault-proxy run evidence for {}",
+                    scenario_name(input.scenario)
+                )
+            })?;
+        fault_proxy_runs.push(VerifiedFaultProxyRun {
+            scenario: input.scenario,
+            report,
+        });
+    }
     let latency_live_sources = verify_latency_live_sources(&paths.demo_config, &latency)
         .context("failed to bind latency source timestamps")?;
 
@@ -524,6 +597,19 @@ pub(crate) fn verify_production_evidence_manifest_path(
             )
         })
         .collect::<BTreeMap<_, _>>();
+    let mut observed_fault_proxy_runs = fault_proxy_runs
+        .iter()
+        .map(|proxy| ProductionEvidenceFaultProxyRunSummary {
+            scenario: proxy.scenario,
+            run_report: proxy.report.run_report.clone(),
+            proxy_session_id: proxy.report.proxy_session_id.clone(),
+            started_at_ms: proxy.report.started_at_ms,
+            stopped_at_ms: proxy.report.stopped_at_ms,
+            completed_faults: proxy.report.completed_faults,
+            acceptance_passed: proxy.report.acceptance_passed,
+        })
+        .collect::<Vec<_>>();
+    observed_fault_proxy_runs.sort_by_key(|proxy| proxy.scenario);
     let verified_at_ms = unix_time_ms()?;
     let (freshness_observations, freshness_failures) = evaluate_freshness(FreshnessInputs {
         policy: &loaded.value.freshness,
@@ -532,6 +618,7 @@ pub(crate) fn verify_production_evidence_manifest_path(
         demo_soak: &demo_soak,
         fault_matrix: &fault_matrix,
         fault_live_sources: &fault_live_sources,
+        fault_proxy_runs: &fault_proxy_runs,
         latency_live_sources: &latency_live_sources,
         account_artifacts: &account_artifacts,
         deadman_artifacts: &deadman_artifacts,
@@ -593,6 +680,18 @@ pub(crate) fn verify_production_evidence_manifest_path(
             fault_matrix.live_fault_matrix_passed,
         )?,
     ];
+    for proxy in &fault_proxy_runs {
+        gates.push(gate_report(
+            ProductionEvidenceGate::FaultProxyRun,
+            Some(scenario_name(proxy.scenario)),
+            vec![
+                paths.fault_proxy_config.clone(),
+                proxy.report.run_report.source_path.clone(),
+            ],
+            &proxy.report,
+            proxy.report.acceptance_passed,
+        )?);
+    }
     let freshness_paths = freshness_observations
         .iter()
         .map(|observation| observation.source_path.clone())
@@ -678,6 +777,8 @@ pub(crate) fn verify_production_evidence_manifest_path(
         research: &research,
         demo_soak: &demo_soak,
         fault_matrix: &fault_matrix,
+        fault_live_sources: &fault_live_sources,
+        fault_proxy_runs: &fault_proxy_runs,
         latency: &latency,
         account_artifacts: &account_artifacts,
         deadman_artifacts: &deadman_artifacts,
@@ -701,6 +802,7 @@ pub(crate) fn verify_production_evidence_manifest_path(
         expected,
         freshness_policy: loaded.value.freshness,
         freshness_observations,
+        fault_proxy_runs: observed_fault_proxy_runs,
         verifier,
         demo_config: demo_evidence,
         production_config: production_evidence,
@@ -718,8 +820,6 @@ pub(crate) fn verify_production_evidence_manifest_path(
             "account certification is point-in-time and fill reconciliation covers fills and fees only; complete economic statements, funding, transfers, tax, and profitability review remain external gates"
                 .to_string(),
             "supervision, paging, credential permissions, venue announcements, rollout/rollback review, and explicit human approval remain required"
-                .to_string(),
-            "typed fault injector records are config-, time-, and live-session-bound, but separate fault-proxy run-report clean shutdown and supervisor timing still require archived operator review"
                 .to_string(),
             "partial-fill and restored-latch roles may use opaque external injector evidence; freshness is enforced on their verified live reports, while external causality remains an operator-reviewed gate"
                 .to_string(),
@@ -796,6 +896,7 @@ struct FreshnessInputs<'a> {
     demo_soak: &'a reap_live::LiveRunVerificationReport,
     fault_matrix: &'a reap_live::LiveFaultMatrixVerificationReport,
     fault_live_sources: &'a [VerifiedTimedLiveSource],
+    fault_proxy_runs: &'a [VerifiedFaultProxyRun],
     latency_live_sources: &'a [VerifiedTimedLiveSource],
     account_artifacts: &'a [(PathBuf, AccountCertificationArtifact)],
     deadman_artifacts: &'a [(&'a ResolvedDeadmanInput, DeadmanExpiryCertificationArtifact)],
@@ -860,6 +961,20 @@ fn evaluate_freshness(
                 source.report.elapsed_ms,
             );
         }
+    }
+    for proxy in input.fault_proxy_runs {
+        push_freshness(
+            &mut observations,
+            &mut failures,
+            input.policy,
+            input.verified_at_ms,
+            ProductionEvidenceGate::FaultProxyRun,
+            Some(scenario_name(proxy.scenario)),
+            &proxy.report.run_report.source_path,
+            proxy.report.started_at_ms,
+            Some(proxy.report.stopped_at_ms),
+            input.policy.fault_run_max_age_ms,
+        );
     }
     for source in input.latency_live_sources {
         push_live_freshness(
@@ -1070,6 +1185,8 @@ struct BindingInputs<'a> {
     research: &'a ResearchDeploymentVerificationReport,
     demo_soak: &'a reap_live::LiveRunVerificationReport,
     fault_matrix: &'a reap_live::LiveFaultMatrixVerificationReport,
+    fault_live_sources: &'a [VerifiedTimedLiveSource],
+    fault_proxy_runs: &'a [VerifiedFaultProxyRun],
     latency: &'a LatencyCalibrationVerificationReport,
     account_artifacts: &'a [(PathBuf, AccountCertificationArtifact)],
     deadman_artifacts: &'a [(&'a ResolvedDeadmanInput, DeadmanExpiryCertificationArtifact)],
@@ -1319,6 +1436,14 @@ fn evaluate_bindings(input: BindingInputs<'_>) -> Vec<ProductionEvidenceFailure>
             .iter()
             .map(|run| (run.scenario, run.reap_fault_proxy_evidence.as_ref())),
     );
+    check_fault_proxy_runs(
+        &mut failures,
+        input.expected,
+        input.fault_proxy,
+        input.fault_matrix,
+        input.fault_live_sources,
+        input.fault_proxy_runs,
+    );
     if let Some(session_id) = &input.demo_soak.session_id
         && input
             .fault_matrix
@@ -1534,6 +1659,162 @@ fn evaluate_bindings(input: BindingInputs<'_>) -> Vec<ProductionEvidenceFailure>
     failures.sort_by_key(failure_sort_key);
     failures.dedup();
     failures
+}
+
+fn check_fault_proxy_runs(
+    failures: &mut Vec<ProductionEvidenceFailure>,
+    expected: &ProductionEvidenceExpectedIdentity,
+    expected_config: &FaultProxyConfigEvidence,
+    matrix: &reap_live::LiveFaultMatrixVerificationReport,
+    live_sources: &[VerifiedTimedLiveSource],
+    proxy_runs: &[VerifiedFaultProxyRun],
+) {
+    let expected_scenarios = reap_live::LiveFaultScenario::REQUIRED
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let actual_scenarios = proxy_runs
+        .iter()
+        .map(|run| run.scenario)
+        .collect::<BTreeSet<_>>();
+    if expected_scenarios != actual_scenarios || proxy_runs.len() != expected_scenarios.len() {
+        failures.push(ProductionEvidenceFailure::FaultProxyRunCoverageMismatch {
+            expected: expected_scenarios.iter().copied().collect(),
+            actual: actual_scenarios.iter().copied().collect(),
+        });
+    }
+
+    let mut sessions = BTreeSet::new();
+    for proxy in proxy_runs {
+        let scenario = proxy.scenario;
+        let subject = scenario_name(scenario);
+        reject_gate(
+            failures,
+            ProductionEvidenceGate::FaultProxyRun,
+            Some(&subject),
+            proxy.report.acceptance_passed,
+        );
+        for (field, expected_value, actual) in [
+            (
+                "proxy_config_sha256",
+                expected_config.sha256.as_str(),
+                proxy.report.config.sha256.as_str(),
+            ),
+            (
+                "proxy_config_fingerprint",
+                expected_config.effective_fingerprint.as_str(),
+                proxy.report.config.effective_fingerprint.as_str(),
+            ),
+            (
+                "reap_version",
+                expected.reap_version.as_str(),
+                proxy.report.reap_version.as_str(),
+            ),
+            (
+                "executable_sha256",
+                expected.live_executable_sha256.as_str(),
+                proxy.report.executable_sha256.as_str(),
+            ),
+            (
+                "host_identity_sha256",
+                expected.host_identity_sha256.as_str(),
+                proxy.report.host_identity_sha256.as_str(),
+            ),
+        ] {
+            check_binding(
+                failures,
+                ProductionEvidenceGate::FaultProxyRun,
+                Some(&subject),
+                field,
+                expected_value,
+                actual,
+            );
+        }
+        if !sessions.insert(proxy.report.proxy_session_id.clone()) {
+            failures.push(ProductionEvidenceFailure::DuplicateFaultProxyRunSession {
+                proxy_session_id: proxy.report.proxy_session_id.clone(),
+            });
+        }
+
+        let Some((matrix_run, live)) = matrix
+            .runs
+            .iter()
+            .zip(live_sources)
+            .find(|(run, _)| run.scenario == scenario)
+        else {
+            continue;
+        };
+        if let Some(live_completed_at_ms) = live
+            .report
+            .session_started_at_ms
+            .checked_add(live.report.elapsed_ms)
+            && (proxy.report.started_at_ms > live.report.session_started_at_ms
+                || proxy.report.stopped_at_ms < live_completed_at_ms)
+        {
+            failures.push(
+                ProductionEvidenceFailure::FaultProxyRunDoesNotEncloseLiveSession {
+                    scenario,
+                    proxy_started_at_ms: proxy.report.started_at_ms,
+                    proxy_stopped_at_ms: proxy.report.stopped_at_ms,
+                    live_started_at_ms: live.report.session_started_at_ms,
+                    live_completed_at_ms,
+                },
+            );
+        }
+        let enclosed_scenarios = enclosed_fault_scenarios(
+            proxy.report.started_at_ms,
+            proxy.report.stopped_at_ms,
+            matrix.runs.iter().zip(live_sources).map(|(run, live)| {
+                (
+                    run.scenario,
+                    live.report.session_started_at_ms,
+                    live.report.elapsed_ms,
+                )
+            }),
+        );
+        if enclosed_scenarios.as_slice() != [scenario] {
+            failures.push(
+                ProductionEvidenceFailure::FaultProxyRunAmbiguousLiveCoverage {
+                    scenario,
+                    enclosed_scenarios,
+                },
+            );
+        }
+        let expected_completed_faults = u64::from(matrix_run.reap_fault_proxy_evidence.is_some());
+        if proxy.report.completed_faults != expected_completed_faults {
+            failures.push(
+                ProductionEvidenceFailure::FaultProxyCompletedFaultCountMismatch {
+                    scenario,
+                    expected: expected_completed_faults,
+                    actual: proxy.report.completed_faults,
+                },
+            );
+        }
+        if let Some(injector) = &matrix_run.reap_fault_proxy_evidence {
+            check_binding(
+                failures,
+                ProductionEvidenceGate::FaultProxyRun,
+                Some(&subject),
+                "proxy_session_id",
+                &injector.proxy_session_id,
+                &proxy.report.proxy_session_id,
+            );
+        }
+    }
+}
+
+fn enclosed_fault_scenarios(
+    proxy_started_at_ms: u64,
+    proxy_stopped_at_ms: u64,
+    sessions: impl IntoIterator<Item = (reap_live::LiveFaultScenario, u64, u64)>,
+) -> Vec<reap_live::LiveFaultScenario> {
+    sessions
+        .into_iter()
+        .filter_map(|(scenario, started_at_ms, elapsed_ms)| {
+            let completed_at_ms = started_at_ms.checked_add(elapsed_ms)?;
+            (proxy_started_at_ms <= started_at_ms && proxy_stopped_at_ms >= completed_at_ms)
+                .then_some(scenario)
+        })
+        .collect()
 }
 
 fn check_fault_proxy_entries<'a>(
@@ -1849,6 +2130,7 @@ fn validate_manifest(manifest: &ProductionEvidenceManifest) -> Result<()> {
         &manifest.expected_production_account_identity_sha256s,
     )?;
     validate_freshness_policy(&manifest.freshness)?;
+    validate_fault_proxy_run_inputs(&manifest.fault_proxy_runs)?;
     validate_count(
         "latency_source_reports",
         manifest.latency_source_reports.len(),
@@ -1882,6 +2164,25 @@ fn validate_manifest(manifest: &ProductionEvidenceManifest) -> Result<()> {
                 bail!("fill reconciliation {field} must be finite and non-negative");
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_fault_proxy_run_inputs(inputs: &[ProductionEvidenceFaultProxyRunInput]) -> Result<()> {
+    let expected = reap_live::LiveFaultScenario::REQUIRED
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let actual = inputs
+        .iter()
+        .map(|input| input.scenario)
+        .collect::<BTreeSet<_>>();
+    if inputs.len() != expected.len() || actual != expected {
+        bail!(
+            "fault_proxy_runs must cover each required fault scenario exactly once; expected {}, got {} unique across {} entries",
+            expected.len(),
+            actual.len(),
+            inputs.len()
+        );
     }
     Ok(())
 }
@@ -1978,6 +2279,18 @@ fn resolve_manifest(loaded: &LoadedManifest) -> Result<ResolvedManifest> {
     let demo_soak_report = resolve_regular_file(base, &value.demo_soak_report, "demo soak report")?;
     let fault_matrix_manifest =
         resolve_regular_file(base, &value.fault_matrix_manifest, "fault matrix manifest")?;
+    let mut fault_proxy_runs = Vec::with_capacity(value.fault_proxy_runs.len());
+    let mut fault_proxy_run_paths = HashSet::new();
+    for input in &value.fault_proxy_runs {
+        let report = resolve_regular_file(base, &input.report, "fault-proxy run report")?;
+        if !fault_proxy_run_paths.insert(report.clone()) {
+            bail!("duplicate fault-proxy run report {}", report.display());
+        }
+        fault_proxy_runs.push(ResolvedFaultProxyRunInput {
+            scenario: input.scenario,
+            report,
+        });
+    }
     let latency_calibration_artifact = resolve_regular_file(
         base,
         &value.latency_calibration_artifact,
@@ -2041,6 +2354,7 @@ fn resolve_manifest(loaded: &LoadedManifest) -> Result<ResolvedManifest> {
         fault_proxy_config,
         demo_soak_report,
         fault_matrix_manifest,
+        fault_proxy_runs,
         latency_calibration_artifact,
         latency_source_reports,
         research_manifest,
@@ -2173,7 +2487,7 @@ mod tests {
     fn manifest_toml(extra: &str) -> String {
         format!(
             r#"
-schema_version = 2
+schema_version = 3
 expected_reap_version = "0.1.0"
 expected_live_executable_sha256 = "{}"
 expected_host_identity_sha256 = "{}"
@@ -2190,6 +2504,58 @@ research_manifest = "research.toml"
 research_report = "research.json"
 account_certifications = ["account.json"]
 emergency_cancel_report = "emergency.json"
+
+[[fault_proxy_runs]]
+scenario = "clean_observe"
+report = "proxy-clean-observe.json"
+[[fault_proxy_runs]]
+scenario = "clean_demo"
+report = "proxy-clean-demo.json"
+[[fault_proxy_runs]]
+scenario = "public_reconnect"
+report = "proxy-public-reconnect.json"
+[[fault_proxy_runs]]
+scenario = "private_reconnect"
+report = "proxy-private-reconnect.json"
+[[fault_proxy_runs]]
+scenario = "order_transport_reconnect"
+report = "proxy-order-transport-reconnect.json"
+[[fault_proxy_runs]]
+scenario = "ambiguous_submit"
+report = "proxy-ambiguous-submit.json"
+[[fault_proxy_runs]]
+scenario = "ambiguous_cancel"
+report = "proxy-ambiguous-cancel.json"
+[[fault_proxy_runs]]
+scenario = "partial_fill"
+report = "proxy-partial-fill.json"
+[[fault_proxy_runs]]
+scenario = "fill_convergence_timeout"
+report = "proxy-fill-convergence-timeout.json"
+[[fault_proxy_runs]]
+scenario = "order_convergence_timeout"
+report = "proxy-order-convergence-timeout.json"
+[[fault_proxy_runs]]
+scenario = "restored_safety_latch"
+report = "proxy-restored-safety-latch.json"
+[[fault_proxy_runs]]
+scenario = "deadman_heartbeat_failure"
+report = "proxy-deadman-heartbeat-failure.json"
+[[fault_proxy_runs]]
+scenario = "exchange_clock_failure"
+report = "proxy-exchange-clock-failure.json"
+[[fault_proxy_runs]]
+scenario = "exchange_status_failure"
+report = "proxy-exchange-status-failure.json"
+[[fault_proxy_runs]]
+scenario = "exchange_instrument_failure"
+report = "proxy-exchange-instrument-failure.json"
+[[fault_proxy_runs]]
+scenario = "exchange_fee_failure"
+report = "proxy-exchange-fee-failure.json"
+[[fault_proxy_runs]]
+scenario = "account_config_failure"
+report = "proxy-account-config-failure.json"
 
 [freshness]
 future_tolerance_ms = 60000
@@ -2254,6 +2620,11 @@ minimum_fills = 1
         parsed.freshness.production_account_certification_max_age_ms =
             MAX_PRODUCTION_ACCOUNT_CERTIFICATION_AGE_MS + 1;
         assert!(validate_manifest(&parsed).is_err());
+
+        let mut missing_proxy: ProductionEvidenceManifest =
+            toml::from_str(&manifest_toml("")).unwrap();
+        missing_proxy.fault_proxy_runs.pop();
+        assert!(validate_manifest(&missing_proxy).is_err());
     }
 
     #[test]
@@ -2400,6 +2771,23 @@ minimum_fills = 1
             timing_failures.as_slice(),
             [ProductionEvidenceFailure::FaultProxyOutsideLiveSession { .. }]
         ));
+    }
+
+    #[test]
+    fn fault_proxy_run_interval_must_enclose_exactly_one_assigned_session() {
+        use reap_live::LiveFaultScenario::{PrivateReconnect, PublicReconnect};
+
+        let sessions = [(PublicReconnect, 100, 10), (PrivateReconnect, 200, 10)];
+        assert_eq!(
+            enclosed_fault_scenarios(90, 150, sessions),
+            [PublicReconnect]
+        );
+        assert!(enclosed_fault_scenarios(101, 150, sessions).is_empty());
+        assert_eq!(
+            enclosed_fault_scenarios(90, 250, sessions),
+            [PublicReconnect, PrivateReconnect]
+        );
+        assert!(enclosed_fault_scenarios(0, u64::MAX, [(PublicReconnect, u64::MAX, 1)]).is_empty());
     }
 
     #[test]

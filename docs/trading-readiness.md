@@ -411,12 +411,15 @@ production trading process.
     after reconstruction, requires unique exact-proxy typed evidence for every
     proxy-supported fault, requires each typed command interval inside its
     reverified live session, and rejects reuse of the dedicated soak as a fault
-    session. Mandatory schema-2
-    age windows have hard maxima of 15 minutes for production account state, 24
-    hours for soak/fills, seven days for fault/latency/deadman/emergency evidence,
-    and five minutes of future tolerance. The checked-in schema template cannot
-    pass, no target-host bundle or human approval exists, and the output
-    explicitly leaves production order entry unauthorized.
+    session. It also reconstructs one raw schema-2 proxy process report per role,
+    requiring exact config/build/host, unique sessions, independently derived
+    clean shutdown, exact completed-command counts, and unambiguous live-session
+    enclosure. Mandatory schema-3 age windows have hard maxima of 15 minutes for
+    production account state, 24 hours for soak/fills, seven days for
+    fault/latency/deadman/emergency evidence, and five minutes of future
+    tolerance. The checked-in schema template cannot pass, no target-host bundle
+    or human approval exists, and the output explicitly leaves production order
+    entry unauthorized.
 
 ## Remaining Demo Gate
 
@@ -468,7 +471,7 @@ Production enablement additionally requires:
 
 - A passing owner-only `verify-production-evidence --require-pass` artifact made
   by the exact candidate binary on the declared target host after every source
-  artifact below exists. Review every subordinate artifact and schema-2
+  artifact below exists. Review every subordinate artifact and schema-3
   freshness observation; the aggregate does not supply remote attestation,
   external supervision, full economics, authenticated external partial-fill/
   restart causality, or human approval and never authorizes entry.
