@@ -1,9 +1,10 @@
 # Schema template only. Replace every path and identity with reviewed target-host
 # evidence. This file cannot pass as checked in and contains no credentials.
-schema_version = 3
+schema_version = 4
 expected_reap_version = "0.1.0"
 expected_live_executable_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 expected_host_identity_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+expected_approval_policy_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 expected_deployment_candidate_id = "replace-with-predeclared-candidate-id"
 
 demo_config = "/secure/config/reap-exact-demo.toml"

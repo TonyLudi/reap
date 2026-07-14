@@ -301,7 +301,7 @@ architecture in [docs/architecture.md](docs/architecture.md).
   maximum ages.
 - [x] Add binary/host provenance and independently re-derived clean-shutdown
   fields to schema-2 fault-proxy process reports, expose an offline source
-  verifier, and require schema-3 production bundles to provide one unique proxy
+  verifier, and require schema-4 production bundles to provide one unique proxy
   session enclosing exactly each fault-matrix live run.
 - [ ] Calibrate queue position, latency, fees, funding, and slippage from
   captured full-depth data, then run and archive production-candidate
@@ -325,9 +325,10 @@ architecture in [docs/architecture.md](docs/architecture.md).
   enabled.
 - [ ] Certify production credentials/account mode/limits and expose production
   order entry only after every gate in `docs/trading-readiness.md` is signed off.
-  Add an independently authenticated human approval policy around the
-  source-rebuilding bundle; no passing target-host bundle or approval artifact
-  exists.
+  The source-rebuilding bundle now has a short-lived Ed25519 approval request,
+  offline signer, strict two-role policy, and final source-rerunning verifier.
+  No passing target-host bundle or real independently signed approval artifact
+  exists, so production entry remains unavailable.
 
 Completed-step evidence is documented in [README.md](README.md),
 [docs/operations.md](docs/operations.md), and

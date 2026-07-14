@@ -414,12 +414,21 @@ production trading process.
     session. It also reconstructs one raw schema-2 proxy process report per role,
     requiring exact config/build/host, unique sessions, independently derived
     clean shutdown, exact completed-command counts, and unambiguous live-session
-    enclosure. Mandatory schema-3 age windows have hard maxima of 15 minutes for
+    enclosure. Mandatory schema-4 age windows have hard maxima of 15 minutes for
     production account state, 24 hours for soak/fills, seven days for
     fault/latency/deadman/emergency evidence, and five minutes of future
-    tolerance. The checked-in schema template cannot pass, no target-host bundle
+    tolerance. Schema 4 also predeclares the exact approval-policy SHA-256. The
+    checked-in schema template cannot pass, no target-host bundle
     or human approval exists, and the output explicitly leaves production order
     entry unauthorized.
+53. Production approval is now a separate asymmetric gate. The strict policy
+    requires at least two sorted roles and distinct Ed25519 keys; request
+    preparation accepts only a fresh passing schema-4 bundle, offline signatures
+    bind exact request/policy/role/time, and final verification reruns all sources
+    before requiring role coverage. Requests have a hard 15-minute lifetime,
+    private keys require owner-only files, every input is reopened, and all output
+    still reports production entry unauthorized. No real approver policy, signed
+    target-host request, or passing approval verification exists.
 
 ## Remaining Demo Gate
 
@@ -471,7 +480,7 @@ Production enablement additionally requires:
 
 - A passing owner-only `verify-production-evidence --require-pass` artifact made
   by the exact candidate binary on the declared target host after every source
-  artifact below exists. Review every subordinate artifact and schema-3
+  artifact below exists. Review every subordinate artifact and schema-4
   freshness observation; the aggregate does not supply remote attestation,
   external supervision, full economics, authenticated external partial-fill/
   restart causality, or human approval and never authorizes entry.
@@ -528,7 +537,10 @@ Production enablement additionally requires:
 - Long-running demo soak with zero unexplained order, fill, position, or balance
   reconciliation drift.
 - Explicit operator approval of credentials, account mode, limits, symbols,
-  and the production rollout/rollback procedure.
+  and the production rollout/rollback procedure, represented by a fresh passing
+  `verify-production-approval --require-pass` artifact with separate operations
+  and risk key custody. Cryptographic role coverage does not replace review of
+  approver identity or actual rollback readiness.
 
 The first safe milestone is demo-tradable, not production-tradable. Production
 capital should remain disabled until every startup, recovery, and reconciliation

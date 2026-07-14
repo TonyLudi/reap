@@ -73,9 +73,12 @@ Implemented:
   and cross-binds exact official-demo/production configs, a deterministically
   derived routed fault config, the predeclared research candidate, the running
   release binary, target host, and separate demo and production account
-  identities. Mandatory bounded source-time checks reject invalid, future, or
-  stale operational evidence. It always reports production entry as
-  unauthorized; external operations and operator approval remain blockers.
+  identities plus the predeclared approval-policy hash. Mandatory bounded
+  source-time checks reject invalid, future, or
+  stale operational evidence. A separate Ed25519 release-approval flow requires
+  short-lived signatures from at least two distinct policy roles and reruns the
+  complete bundle before accepting them. Both reports always leave production
+  entry unauthorized; external target-host operations remain blockers.
 - Deterministic backtest matching with `PendingNew`, delayed entry/cancel/update
   boundaries, `PostOnly`, `IOC`, conservative displayed-depth fills, trade
   fills, queue-ahead tracking, fee/turnover attribution, realized linear and
@@ -321,7 +324,7 @@ manifest-declared build, host, candidate, or environment-specific account
 identities. Proxy-supported fault roles must carry typed records with the exact
 proxy fingerprint, unique proxy session/command IDs, fresh timestamps, and a
 command interval inside the corresponding verified live session; only genuine
-partial-fill and restart-latch roles may use external evidence. Schema 3 also
+partial-fill and restart-latch roles may use external evidence. Schema 4 also
 enforces reviewed age limits under hard code-level maxima for the demo soak,
 every fault and latency source, production account certification, deadman,
 emergency cancel, and the reconciled fill window. It requires one independently
@@ -329,6 +332,50 @@ verified clean proxy-process report per fault role, with a unique session that
 encloses exactly that live run and the expected completed-command count. It does
 not trust previously emitted verification JSON. The checked-in manifest is a
 schema template with deliberately invalid placeholder identities, not evidence.
+
+After a passing bundle exists, use independent approval workstations and the
+fail-closed policy shape in `examples/production-approval-policy.toml`:
+
+```bash
+reap generate-production-approval-key \
+  --private-key /secure/approver/private.json \
+  --public-key /secure/approver/public.json --pretty
+
+reap verify-production-approval-policy \
+  --policy /secure/policy/production-approval.toml \
+  --output /secure/evidence/approval-policy-verification.json --pretty
+
+reap prepare-production-approval \
+  --manifest /secure/evidence/production-evidence.toml \
+  --policy /secure/policy/production-approval.toml \
+  --request-id CHANGE-1234 --ttl-secs 600 \
+  --output /secure/evidence/approval-request.json --pretty
+
+reap sign-production-approval \
+  --request /secure/evidence/approval-request.json \
+  --policy /secure/policy/production-approval.toml \
+  --private-key /secure/approver/private.json \
+  --approver operations-approver \
+  --output /secure/evidence/approval-operations.json --pretty
+
+reap verify-production-approval \
+  --manifest /secure/evidence/production-evidence.toml \
+  --policy /secure/policy/production-approval.toml \
+  --request /secure/evidence/approval-request.json \
+  --approval /secure/evidence/approval-operations.json \
+  --approval /secure/evidence/approval-risk.json \
+  --output /secure/evidence/approval-verification.json \
+  --require-pass --pretty
+```
+
+The policy requires sorted, unique approvers, distinct Ed25519 public keys, and
+at least two required roles. A request is valid for at most 15 minutes and binds
+the exact policy predeclared by SHA-256 in the schema-4 evidence manifest plus
+stable source/config/build/host/account/candidate and gate evidence. Verification
+rejects stale requests, missing roles, duplicate keys or approvers, signature or
+binding changes, and any newly failing or changed source.
+Key custody and proof that named approvers are independent humans remain external
+governance controls. A pass still does not expose production order entry.
 
 Observe OKX demo feeds and account state without permitting any submit or
 cancel request:

@@ -1719,9 +1719,10 @@ target/release/reap verify-production-evidence \
   --pretty
 ```
 
-Schema 3 requires the intended Reap version, candidate executable SHA-256,
-target-host identity SHA-256, predeclared deployment candidate ID, and separate
-demo and production exchange-account identity maps. It also requires the exact
+Schema 4 requires the intended Reap version, candidate executable SHA-256,
+target-host identity SHA-256, predeclared deployment candidate ID, exact
+approval-policy SHA-256, and separate demo and production exchange-account
+identity maps. It also requires the exact
 fault-proxy config and the create-new routed demo config used by the fault
 campaign; the latter must be typed-value-identical to a fresh deterministic
 reconstruction from the official-endpoint demo config and proxy routes. Its
@@ -1786,7 +1787,7 @@ inside the corresponding reverified live session. Opaque external injector
 records are accepted only for genuine partial-fill and restored-latch roles,
 whose causality cannot be manufactured by the current proxy. Freshness applies
 to those roles' live reports, but their external causality remains an operator
-review. Schema 3 directly reconstructs every raw proxy process report and derives
+review. Schema 4 directly reconstructs every raw proxy process report and derives
 clean shutdown from listener joins, control-socket removal, pending rules, active
 connections, and proxy errors. External supervisor lifecycle evidence remains a
 separate review.
@@ -1799,14 +1800,117 @@ is missing or duplicated, or if any config/build/host/account/candidate binding
 differs. The output records a semantic SHA-256 of each in-memory reconstruction
 and always sets `production_order_entry_authorized = false`.
 
-A pass is deliberately narrower than production approval. Schema 3 enforces
+A pass is deliberately narrower than production approval. Schema 4 enforces
 bounded age from validated session, exchange-clock, emergency-report, and fill
 window timestamps, but those clocks are not remotely attested. It does not
 remotely attest the host or exchange identity, reconcile complete economic
 statements, prove external supervisor/paging state, authenticate opaque external
-fault causality, or record human rollout approval. Re-run immediately before
-review and keep production entry disabled until those external controls are
-independently signed off.
+fault causality, or by itself record human rollout approval. Re-run immediately
+before review and keep production entry disabled until those external controls
+are independently signed off.
+
+## Production Approval
+
+Use `examples/production-approval-policy.toml` only as a fail-closed schema
+template. The checked-in public-key placeholders are deliberately invalid. The
+reviewed deployment policy must contain sorted unique approver IDs, at least two
+sorted required roles, one or more approvers for every role, distinct Ed25519
+public keys, and a request lifetime no greater than 15 minutes.
+Its exact file SHA-256 must be placed in
+`expected_approval_policy_sha256` before collecting the passing schema-4 bundle;
+request preparation and final verification reject any substituted policy.
+
+Validate the populated policy and archive its exact hash before updating the
+production-evidence manifest:
+
+```bash
+POLICY_VERIFICATION="/secure/evidence/approval-policy-verification-$(date -u +%Y%m%dT%H%M%SZ).json"
+reap verify-production-approval-policy \
+  --policy /secure/policy/production-approval.toml \
+  --output "$POLICY_VERIFICATION" \
+  --pretty
+```
+
+Use the report's `policy.sha256` as `expected_approval_policy_sha256`; do not hash
+an unvalidated policy or normalize/reformat it after predeclaration.
+
+1. On each independent approval workstation, generate a separate key:
+
+```bash
+reap generate-production-approval-key \
+  --private-key /secure/approver/private.json \
+  --public-key /secure/approver/public.json \
+  --pretty
+```
+
+Both files are create-new mode `0600`; only the public-key value belongs in the
+deployment policy. Do not place approval private keys on the trading host, in a
+shared secret manager role used by that host, or in source control. Key identity,
+role assignment, revocation, and proof of separate human control remain external
+governance responsibilities.
+
+2. On the exact candidate host, after the schema-4 bundle passes, prepare the
+short-lived review request:
+
+```bash
+APPROVAL_REQUEST="/secure/evidence/approval-request-$(date -u +%Y%m%dT%H%M%SZ).json"
+reap prepare-production-approval \
+  --manifest /secure/evidence/production-evidence.toml \
+  --policy /secure/policy/production-approval.toml \
+  --request-id CHANGE-1234 \
+  --ttl-secs 600 \
+  --output "$APPROVAL_REQUEST" \
+  --pretty
+```
+
+Preparation reruns every source verifier and refuses a non-passing bundle. The
+request binds the exact policy and a typed stable subject containing source
+timestamps, freshness decisions and limits, gate hashes, configs, candidate,
+binary, host, account identities, and proxy runs. Only verifier wall time and
+derived age are omitted so a later rerun can match without weakening freshness.
+
+3. Each approver reviews that exact request and policy on their independent
+workstation, then emits one role-bound signature:
+
+```bash
+reap sign-production-approval \
+  --request "$APPROVAL_REQUEST" \
+  --policy /secure/policy/production-approval.toml \
+  --private-key /secure/approver/private.json \
+  --approver operations-approver \
+  --output /secure/evidence/approval-operations.json \
+  --pretty
+```
+
+The signer rejects an expired or far-future request, a policy mismatch, an
+unknown approver, insecure private-key permissions, or a private key that does
+not match the policy. Its Ed25519 payload domain-binds the exact request bytes,
+policy hash, approver, role, public key, and signing time.
+
+4. Back on the candidate host, run final verification before the request expires:
+
+```bash
+APPROVAL_VERIFICATION="/secure/evidence/approval-verification-$(date -u +%Y%m%dT%H%M%SZ).json"
+reap verify-production-approval \
+  --manifest /secure/evidence/production-evidence.toml \
+  --policy /secure/policy/production-approval.toml \
+  --request "$APPROVAL_REQUEST" \
+  --approval /secure/evidence/approval-operations.json \
+  --approval /secure/evidence/approval-risk.json \
+  --output "$APPROVAL_VERIFICATION" \
+  --require-pass \
+  --pretty
+```
+
+Final verification reruns the complete production bundle, requires exact stable
+subject equality, reopens policy/request/signatures after the expensive work,
+verifies every Ed25519 signature, rejects duplicate approvers or keys, and
+requires every policy role. It always emits
+`production_order_entry_authorized = false`; a pass is an auditable approval gate,
+not an order-entry switch. Expiration, source freshness, target-host controls,
+venue status, and rollback readiness must all still be valid at actual rollout.
+The verifier does not keep a replay ledger; the deployment coordinator must
+enforce globally unique change IDs and one-time use of each request.
 
 At pinned Java revision `b6b120c7b7c466d8431bf082f3229328c5d7b2ae`,
 `ChaosBackTestMultiRunService` sequences daily inputs, carries ending positions,

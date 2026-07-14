@@ -23,8 +23,9 @@ use sha2::{Digest, Sha256};
 use crate::deployment::{ResearchDeploymentVerificationReport, verify_research_deployment_paths};
 use crate::latency::{LatencyCalibrationVerificationReport, verify_latency_calibration};
 
-pub(crate) const PRODUCTION_EVIDENCE_MANIFEST_SCHEMA_VERSION: u16 = 3;
-pub(crate) const PRODUCTION_EVIDENCE_REPORT_FORMAT_VERSION: u16 = 3;
+pub(crate) const PRODUCTION_EVIDENCE_MANIFEST_SCHEMA_VERSION: u16 = 4;
+pub(crate) const PRODUCTION_EVIDENCE_REPORT_FORMAT_VERSION: u16 = 4;
+pub(crate) const PRODUCTION_EVIDENCE_APPROVAL_SUBJECT_FORMAT_VERSION: u16 = 1;
 const MAX_PRODUCTION_EVIDENCE_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_PRODUCTION_EVIDENCE_ACCOUNTS: usize = 32;
 const MAX_PRODUCTION_EVIDENCE_LATENCY_REPORTS: usize = 128;
@@ -86,6 +87,7 @@ pub(crate) struct ProductionEvidenceManifest {
     pub expected_reap_version: String,
     pub expected_live_executable_sha256: String,
     pub expected_host_identity_sha256: String,
+    pub expected_approval_policy_sha256: String,
     pub expected_deployment_candidate_id: String,
     pub expected_demo_account_identity_sha256s: BTreeMap<String, String>,
     pub expected_production_account_identity_sha256s: BTreeMap<String, String>,
@@ -121,6 +123,7 @@ pub(crate) struct ProductionEvidenceExpectedIdentity {
     pub reap_version: String,
     pub live_executable_sha256: String,
     pub host_identity_sha256: String,
+    pub approval_policy_sha256: String,
     pub deployment_candidate_id: String,
     pub demo_account_identity_sha256s: BTreeMap<String, String>,
     pub production_account_identity_sha256s: BTreeMap<String, String>,
@@ -336,6 +339,131 @@ pub(crate) struct ProductionEvidenceVerificationReport {
     pub limitations: Vec<String>,
     pub evidence_bundle_passed: bool,
     pub production_order_entry_authorized: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProductionEvidenceApprovalFreshnessObservation {
+    pub gate: ProductionEvidenceGate,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    pub source_path: PathBuf,
+    pub started_at_ms: u64,
+    pub completed_at_ms: u64,
+    pub maximum_age_ms: u64,
+    pub passed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProductionEvidenceApprovalGate {
+    pub gate: ProductionEvidenceGate,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    pub source_paths: Vec<PathBuf>,
+    pub reconstructed_sha256: String,
+    pub acceptance_passed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProductionEvidenceApprovalSubject {
+    pub format_version: u16,
+    pub production_evidence_report_format_version: u16,
+    pub manifest_schema_version: u16,
+    pub java_reference_revision: String,
+    pub manifest: ProductionEvidenceFileEvidence,
+    pub expected: ProductionEvidenceExpectedIdentity,
+    pub freshness_policy: ProductionEvidenceFreshnessPolicy,
+    pub freshness_observations: Vec<ProductionEvidenceApprovalFreshnessObservation>,
+    pub fault_proxy_runs: Vec<ProductionEvidenceFaultProxyRunSummary>,
+    pub verifier: ProductionEvidenceVerifierIdentity,
+    pub demo_config: ProductionEvidenceConfigEvidence,
+    pub production_config: ProductionEvidenceConfigEvidence,
+    pub fault_demo_config: ProductionEvidenceConfigEvidence,
+    pub observed_demo_identity: ProductionEvidenceLiveIdentity,
+    pub observed_production_account_identity_sha256s: BTreeMap<String, String>,
+    pub observed_deployment_candidate_id: Option<String>,
+    pub gates: Vec<ProductionEvidenceApprovalGate>,
+    pub limitations: Vec<String>,
+    pub evidence_bundle_passed: bool,
+    pub production_order_entry_authorized: bool,
+}
+
+impl ProductionEvidenceApprovalSubject {
+    pub(crate) fn from_report(report: &ProductionEvidenceVerificationReport) -> Result<Self> {
+        if report.format_version != PRODUCTION_EVIDENCE_REPORT_FORMAT_VERSION
+            || report.manifest_schema_version != PRODUCTION_EVIDENCE_MANIFEST_SCHEMA_VERSION
+            || report.java_reference_revision != PINNED_JAVA_REVISION
+            || !report.evidence_bundle_passed
+            || !report.failures.is_empty()
+            || report.gates.iter().any(|gate| !gate.acceptance_passed)
+            || report.production_order_entry_authorized
+        {
+            bail!(
+                "only a passing, unauthorized current-format production bundle can become an approval subject"
+            );
+        }
+        let freshness_observations = report
+            .freshness_observations
+            .iter()
+            .map(
+                |observation| ProductionEvidenceApprovalFreshnessObservation {
+                    gate: observation.gate,
+                    subject: observation.subject.clone(),
+                    source_path: observation.source_path.clone(),
+                    started_at_ms: observation.started_at_ms,
+                    completed_at_ms: observation.completed_at_ms,
+                    maximum_age_ms: observation.maximum_age_ms,
+                    passed: observation.passed,
+                },
+            )
+            .collect::<Vec<_>>();
+        let stable_freshness_sha256 = serialized_sha256(&freshness_observations)?;
+        let gates = report
+            .gates
+            .iter()
+            .map(|gate| ProductionEvidenceApprovalGate {
+                gate: gate.gate,
+                subject: gate.subject.clone(),
+                source_paths: gate.source_paths.clone(),
+                reconstructed_sha256: if gate.gate == ProductionEvidenceGate::Freshness {
+                    stable_freshness_sha256.clone()
+                } else {
+                    gate.reconstructed_sha256.clone()
+                },
+                acceptance_passed: gate.acceptance_passed,
+            })
+            .collect();
+        Ok(Self {
+            format_version: PRODUCTION_EVIDENCE_APPROVAL_SUBJECT_FORMAT_VERSION,
+            production_evidence_report_format_version: report.format_version,
+            manifest_schema_version: report.manifest_schema_version,
+            java_reference_revision: report.java_reference_revision.clone(),
+            manifest: report.manifest.clone(),
+            expected: report.expected.clone(),
+            freshness_policy: report.freshness_policy.clone(),
+            freshness_observations,
+            fault_proxy_runs: report.fault_proxy_runs.clone(),
+            verifier: report.verifier.clone(),
+            demo_config: report.demo_config.clone(),
+            production_config: report.production_config.clone(),
+            fault_demo_config: report.fault_demo_config.clone(),
+            observed_demo_identity: report.observed_demo_identity.clone(),
+            observed_production_account_identity_sha256s: report
+                .observed_production_account_identity_sha256s
+                .clone(),
+            observed_deployment_candidate_id: report.observed_deployment_candidate_id.clone(),
+            gates,
+            limitations: report.limitations.clone(),
+            evidence_bundle_passed: report.evidence_bundle_passed,
+            production_order_entry_authorized: report.production_order_entry_authorized,
+        })
+    }
+
+    pub(crate) fn sha256(&self) -> Result<String> {
+        serialized_sha256(self)
+    }
 }
 
 struct LoadedManifest {
@@ -2078,6 +2206,7 @@ fn expected_identity(manifest: &ProductionEvidenceManifest) -> ProductionEvidenc
         reap_version: manifest.expected_reap_version.clone(),
         live_executable_sha256: manifest.expected_live_executable_sha256.clone(),
         host_identity_sha256: manifest.expected_host_identity_sha256.clone(),
+        approval_policy_sha256: manifest.expected_approval_policy_sha256.clone(),
         deployment_candidate_id: manifest.expected_deployment_candidate_id.clone(),
         demo_account_identity_sha256s: manifest.expected_demo_account_identity_sha256s.clone(),
         production_account_identity_sha256s: manifest
@@ -2107,6 +2236,10 @@ fn validate_manifest(manifest: &ProductionEvidenceManifest) -> Result<()> {
         (
             "expected_host_identity_sha256",
             manifest.expected_host_identity_sha256.as_str(),
+        ),
+        (
+            "expected_approval_policy_sha256",
+            manifest.expected_approval_policy_sha256.as_str(),
         ),
     ] {
         if !is_lower_sha256(value) {
@@ -2487,10 +2620,11 @@ mod tests {
     fn manifest_toml(extra: &str) -> String {
         format!(
             r#"
-schema_version = 3
+schema_version = 4
 expected_reap_version = "0.1.0"
 expected_live_executable_sha256 = "{}"
 expected_host_identity_sha256 = "{}"
+expected_approval_policy_sha256 = "{}"
 expected_deployment_candidate_id = "candidate-a"
 demo_config = "demo.toml"
 production_config = "production.toml"
@@ -2587,6 +2721,7 @@ minimum_fills = 1
             "2".repeat(64),
             "3".repeat(64),
             "4".repeat(64),
+            "5".repeat(64),
         )
     }
 
@@ -2617,6 +2752,10 @@ minimum_fills = 1
         assert!(validate_manifest(&parsed).is_err());
 
         parsed.expected_host_identity_sha256 = "2".repeat(64);
+        parsed.expected_approval_policy_sha256 = "invalid".to_string();
+        assert!(validate_manifest(&parsed).is_err());
+
+        parsed.expected_approval_policy_sha256 = "3".repeat(64);
         parsed.freshness.production_account_certification_max_age_ms =
             MAX_PRODUCTION_ACCOUNT_CERTIFICATION_AGE_MS + 1;
         assert!(validate_manifest(&parsed).is_err());
@@ -2625,6 +2764,10 @@ minimum_fills = 1
             toml::from_str(&manifest_toml("")).unwrap();
         missing_proxy.fault_proxy_runs.pop();
         assert!(validate_manifest(&missing_proxy).is_err());
+
+        let mut legacy: ProductionEvidenceManifest = toml::from_str(&manifest_toml("")).unwrap();
+        legacy.schema_version = 3;
+        assert!(validate_manifest(&legacy).is_err());
     }
 
     #[test]

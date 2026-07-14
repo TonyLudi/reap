@@ -1,0 +1,17 @@
+# Schema template only. Generate keys on separate approval workstations and
+# replace both deliberately invalid public-key placeholders. This file cannot
+# pass validation as checked in and contains no private key material.
+schema_version = 1
+policy_id = "reap-production-v1"
+maximum_request_ttl_ms = 600000
+required_roles = ["operations", "risk"]
+
+[[approvers]]
+id = "operations-approver"
+role = "operations"
+public_key_base64 = "REPLACE_WITH_GENERATED_ED25519_PUBLIC_KEY"
+
+[[approvers]]
+id = "risk-approver"
+role = "risk"
+public_key_base64 = "REPLACE_WITH_GENERATED_ED25519_PUBLIC_KEY"

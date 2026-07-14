@@ -902,6 +902,10 @@ reap verify-capture --config config/capture.toml --report capture-report.json --
 reap calibrate-latency --config config/live.toml --report live.json --output latency.json
 reap verify-fault-proxy-run --config fault-proxy.toml --report proxy-run.json --require-pass
 reap verify-production-evidence --manifest production-evidence.toml --require-pass
+reap verify-production-approval-policy --policy approval.toml
+reap prepare-production-approval --manifest production-evidence.toml --policy approval.toml --request-id CHANGE-123 --output request.json
+reap sign-production-approval --request request.json --policy approval.toml --private-key private.json --approver operations --output approval.json
+reap verify-production-approval --manifest production-evidence.toml --policy approval.toml --request request.json --approval operations.json --approval risk.json --require-pass
 reap inspect-book --capture raw/ws.jsonl --symbol BTC-USDT
 reap config-check --config config/live.toml
 ```
@@ -909,26 +913,40 @@ reap config-check --config config/live.toml
 `live`, `capture`, both emergency-cancel commands, both deadman-certification
 commands, `operator`, `backtest`, `research`, `replay-check`, `analyze-capture`,
 `verify-capture`, `calibrate-latency`, `verify-fault-proxy-run`,
-`verify-production-evidence`, and `config-check` are implemented.
+`verify-production-evidence`, all production-approval commands, and
+`config-check` are implemented.
 `inspect-book` remains planned; see [trading-readiness.md](trading-readiness.md).
 
 Cross-crate production evidence composition belongs in `reap-cli`: `reap-live`
 must not depend on `reap-backtest`, while the aggregate verifier must call both
 live and research source verifiers. The strict manifest predeclares one release
-binary, target host, deployment candidate, and environment-specific account
-identities. The verifier reruns each source gate, reopens every deployment
-config and the controlling manifest, and reconstructs the loopback fault config
-from the exact official-demo and fault-proxy configs before cross-binding all
-returned identities. It hashes the typed in-memory reconstructions instead of
-accepting prior verification JSON. Schema 3 re-verifies every fault/latency live
+binary, target host, deployment candidate, approval-policy SHA-256, and
+environment-specific account identities. The verifier reruns each source gate,
+reopens every deployment config and the controlling manifest, and reconstructs
+the loopback fault config from the exact official-demo and fault-proxy configs
+before cross-binding all returned identities. It hashes the typed in-memory
+reconstructions instead of accepting prior verification JSON. Schema 4
+re-verifies every fault/latency live
 source, derives completion times from validated sessions or exchange-clock
 samples, enforces explicit age limits under hard maxima, and requires each typed
 proxy command interval to fall inside its live session. It also reconstructs one
 schema-2 proxy process report per scenario, requiring exact config/build/host,
 unique sessions, independently derived clean shutdown, and unambiguous live-run
-enclosure. Even a passing bundle leaves production entry unauthorized because
-remote attestation, external supervision, full economics, and operator approval
-are outside this composition.
+enclosure.
+
+Release approval remains a separate `reap-cli` composition layer. A stable typed
+subject removes only verifier wall time and derived age while preserving every
+source timestamp, freshness limit/result, gate hash, config, candidate, build,
+host, account identity, and proxy run. A strict policy requires at least two
+sorted roles and distinct Ed25519 keys. Offline signatures bind the exact policy,
+request bytes, role, approver, and signing time; final verification reruns the
+entire bundle, requires its predeclared policy hash, and requires exact subject
+equality inside a hard 15-minute window.
+This is deliberately asymmetric rather than reusing the runtime operator HMAC:
+the target host can verify approvals without gaining signing capability. Even a
+passing approval leaves production entry unauthorized because remote attestation,
+external supervision, full economics, and actual rollout governance remain
+outside this composition.
 
 ## Multi-Websocket Design
 

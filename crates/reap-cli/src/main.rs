@@ -26,6 +26,7 @@ use reap_strategy::ChaosConfig;
 
 mod deployment;
 mod latency;
+mod production_approval;
 mod production_evidence;
 mod statement;
 
@@ -33,6 +34,11 @@ use deployment::verify_research_deployment_paths;
 
 use latency::{
     LatencyCalibrationOptions, build_latency_calibration, profile_toml, verify_latency_calibration,
+};
+use production_approval::{
+    generate_production_approval_key_pair, prepare_production_approval_request,
+    sign_production_approval_request, verify_production_approval_paths,
+    verify_production_approval_policy_path,
 };
 use production_evidence::verify_production_evidence_manifest_path;
 
@@ -188,13 +194,13 @@ enum Command {
     },
     #[command(
         about = "Reconstruct and cross-bind the complete production evidence bundle",
-        long_about = "Read a strict production-evidence manifest, rerun every underlying source verifier, enforce bounded operational-evidence freshness, and bind the exact demo/production configs, deployment candidate, release binary, target host, and demo/production account identities. This gate does not authorize or enable production order entry."
+        long_about = "Read a strict production-evidence manifest, rerun every underlying source verifier, enforce bounded operational-evidence freshness, and bind the exact demo/production configs, deployment candidate, release binary, target host, demo/production account identities, and predeclared approval-policy SHA-256. This gate does not authorize or enable production order entry."
     )]
     VerifyProductionEvidence {
         #[arg(
             short,
             long,
-            help = "Strict schema-3 production evidence TOML manifest"
+            help = "Strict schema-4 production evidence TOML manifest"
         )]
         manifest: PathBuf,
         #[arg(
@@ -207,6 +213,107 @@ enum Command {
             long,
             help = "Exit non-zero unless every source, freshness, and identity gate passes"
         )]
+        require_pass: bool,
+        #[arg(long)]
+        pretty: bool,
+    },
+    #[command(
+        about = "Generate one offline Ed25519 production-approval key",
+        long_about = "Generate an Ed25519 key on an independent approval workstation. The private PKCS#8 artifact and public-key artifact are created owner-only and never overwrite existing files. The private key is never printed."
+    )]
+    GenerateProductionApprovalKey {
+        #[arg(long, help = "Create this owner-only private PKCS#8 JSON artifact")]
+        private_key: PathBuf,
+        #[arg(long, help = "Create this public-key JSON artifact")]
+        public_key: PathBuf,
+        #[arg(long)]
+        pretty: bool,
+    },
+    #[command(
+        about = "Validate and fingerprint a production approval policy",
+        long_about = "Strictly parse the two-role Ed25519 approval policy, reject unknown fields, duplicate identities or keys, missing role coverage, and unsafe lifetimes, then report the exact file SHA-256 to predeclare in the schema-4 production evidence manifest."
+    )]
+    VerifyProductionApprovalPolicy {
+        #[arg(short, long, help = "Strict production approval policy TOML")]
+        policy: PathBuf,
+        #[arg(
+            short,
+            long,
+            help = "Optionally create this owner-readable policy verification"
+        )]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        pretty: bool,
+    },
+    #[command(
+        about = "Prepare a short-lived production approval request",
+        long_about = "Rerun the complete schema-4 production evidence bundle, require it to pass, bind its stable review subject to the predeclared exact two-role approval policy, and create a short-lived request. This does not authorize or enable production order entry."
+    )]
+    PrepareProductionApproval {
+        #[arg(short, long, help = "Strict schema-4 production evidence manifest")]
+        manifest: PathBuf,
+        #[arg(long, help = "Strict production approval policy TOML")]
+        policy: PathBuf,
+        #[arg(long, help = "Unique reviewed change or release identifier")]
+        request_id: String,
+        #[arg(
+            long,
+            default_value_t = 600,
+            help = "Request lifetime in seconds; policy and code cap it at 15 minutes"
+        )]
+        ttl_secs: u64,
+        #[arg(short, long, help = "Create this owner-readable approval request")]
+        output: PathBuf,
+        #[arg(long)]
+        pretty: bool,
+    },
+    #[command(
+        about = "Sign a reviewed production approval request offline",
+        long_about = "Validate the strict request and exact policy, require the private Ed25519 key to match the named policy approver, and create one role-bound signature. Run this on the approver's independent workstation."
+    )]
+    SignProductionApproval {
+        #[arg(
+            short,
+            long,
+            help = "Strict short-lived production approval request JSON"
+        )]
+        request: PathBuf,
+        #[arg(long, help = "Exact production approval policy TOML")]
+        policy: PathBuf,
+        #[arg(long, help = "Owner-only Ed25519 private-key JSON artifact")]
+        private_key: PathBuf,
+        #[arg(long, help = "Policy approver identifier represented by this key")]
+        approver: String,
+        #[arg(short, long, help = "Create this owner-readable signature artifact")]
+        output: PathBuf,
+        #[arg(long)]
+        pretty: bool,
+    },
+    #[command(
+        about = "Verify fresh production evidence and independent approvals",
+        long_about = "Rerun every schema-4 production evidence source, require the stable subject to equal the short-lived request, verify each Ed25519 signature against the predeclared exact policy, and require coverage of every distinct policy role. A pass remains evidence only and never authorizes order entry."
+    )]
+    VerifyProductionApproval {
+        #[arg(short, long, help = "Strict schema-4 production evidence manifest")]
+        manifest: PathBuf,
+        #[arg(long, help = "Exact production approval policy TOML")]
+        policy: PathBuf,
+        #[arg(long, help = "Strict short-lived production approval request JSON")]
+        request: PathBuf,
+        #[arg(
+            long = "approval",
+            required = true,
+            num_args = 1..,
+            help = "Role-bound Ed25519 signature artifact; repeat for each required role"
+        )]
+        approvals: Vec<PathBuf>,
+        #[arg(
+            short,
+            long,
+            help = "Optionally create this owner-readable approval verification"
+        )]
+        output: Option<PathBuf>,
+        #[arg(long, help = "Exit non-zero unless evidence and role quorum pass")]
         require_pass: bool,
         #[arg(long)]
         pretty: bool,
@@ -917,6 +1024,171 @@ async fn main() -> Result<()> {
                 anyhow::bail!(
                     "production evidence bundle did not pass every source, freshness, and binding gate"
                 );
+            }
+        }
+        Command::GenerateProductionApprovalKey {
+            private_key,
+            public_key,
+            pretty,
+        } => {
+            if private_key == public_key {
+                anyhow::bail!("approval private and public key paths must differ");
+            }
+            let mut private_file =
+                reserve_private_output(&private_key, "production approval private key")?;
+            let mut public_file =
+                reserve_private_output(&public_key, "production approval public key")?;
+            let (private, public) = generate_production_approval_key_pair()?;
+            let private_json = zeroize::Zeroizing::new(if pretty {
+                serde_json::to_string_pretty(&private)?
+            } else {
+                serde_json::to_string(&private)?
+            });
+            let public_json = if pretty {
+                serde_json::to_string_pretty(&public)?
+            } else {
+                serde_json::to_string(&public)?
+            };
+            persist_reserved_output(
+                &mut private_file,
+                &private_key,
+                &private_json,
+                "production approval private key",
+            )?;
+            persist_reserved_output(
+                &mut public_file,
+                &public_key,
+                &public_json,
+                "production approval public key",
+            )?;
+            println!("{public_json}");
+        }
+        Command::VerifyProductionApprovalPolicy {
+            policy,
+            output,
+            pretty,
+        } => {
+            let mut output_file = output
+                .as_ref()
+                .map(|path| reserve_private_output(path, "production approval policy verification"))
+                .transpose()?;
+            let verification =
+                verify_production_approval_policy_path(&policy).with_context(|| {
+                    format!(
+                        "failed to verify production approval policy {}",
+                        policy.display()
+                    )
+                })?;
+            let json = if pretty {
+                serde_json::to_string_pretty(&verification)?
+            } else {
+                serde_json::to_string(&verification)?
+            };
+            if let (Some(file), Some(path)) = (&mut output_file, output.as_deref()) {
+                persist_reserved_output(
+                    file,
+                    path,
+                    &json,
+                    "production approval policy verification",
+                )?;
+            }
+            println!("{json}");
+        }
+        Command::PrepareProductionApproval {
+            manifest,
+            policy,
+            request_id,
+            ttl_secs,
+            output,
+            pretty,
+        } => {
+            let ttl_ms = ttl_secs
+                .checked_mul(1_000)
+                .context("production approval TTL overflowed milliseconds")?;
+            let mut output_file = reserve_private_output(&output, "production approval request")?;
+            let request =
+                prepare_production_approval_request(&manifest, &policy, &request_id, ttl_ms)
+                    .with_context(|| {
+                        format!(
+                            "failed to prepare production approval request from {}",
+                            manifest.display()
+                        )
+                    })?;
+            let json = if pretty {
+                serde_json::to_string_pretty(&request)?
+            } else {
+                serde_json::to_string(&request)?
+            };
+            persist_reserved_output(
+                &mut output_file,
+                &output,
+                &json,
+                "production approval request",
+            )?;
+            println!("{json}");
+        }
+        Command::SignProductionApproval {
+            request,
+            policy,
+            private_key,
+            approver,
+            output,
+            pretty,
+        } => {
+            let mut output_file = reserve_private_output(&output, "production approval signature")?;
+            let approval =
+                sign_production_approval_request(&request, &policy, &private_key, &approver)
+                    .with_context(|| {
+                        format!(
+                            "failed to sign production approval request {} as {}",
+                            request.display(),
+                            approver
+                        )
+                    })?;
+            let json = if pretty {
+                serde_json::to_string_pretty(&approval)?
+            } else {
+                serde_json::to_string(&approval)?
+            };
+            persist_reserved_output(
+                &mut output_file,
+                &output,
+                &json,
+                "production approval signature",
+            )?;
+            println!("{json}");
+        }
+        Command::VerifyProductionApproval {
+            manifest,
+            policy,
+            request,
+            approvals,
+            output,
+            require_pass,
+            pretty,
+        } => {
+            let mut output_file = output
+                .as_ref()
+                .map(|path| reserve_private_output(path, "production approval verification"))
+                .transpose()?;
+            let report = verify_production_approval_paths(&manifest, &policy, &request, &approvals)
+                .with_context(|| {
+                    format!(
+                        "failed to verify production approval request {}",
+                        request.display()
+                    )
+                })?;
+            let json = if pretty {
+                serde_json::to_string_pretty(&report)?
+            } else {
+                serde_json::to_string(&report)?
+            };
+            if let (Some(file), Some(path)) = (&mut output_file, output.as_deref()) {
+                persist_reserved_output(file, path, &json, "production approval verification")?;
+            }
+            println!("{json}");
+            if require_pass && !report.approval_gate_passed {
+                anyhow::bail!("production approval did not pass evidence and role-quorum gates");
             }
         }
         Command::Capture {

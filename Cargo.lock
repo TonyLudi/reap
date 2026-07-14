@@ -1051,6 +1051,7 @@ name = "reap-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "reap-backtest",
  "reap-capture",
@@ -1060,12 +1061,14 @@ dependencies = [
  "reap-live",
  "reap-strategy",
  "reap-telemetry",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "tokio",
  "toml",
+ "zeroize",
 ]
 
 [[package]]
