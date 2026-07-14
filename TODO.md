@@ -225,6 +225,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Make websocket ready/disconnect transitions lossless under bounded status
   backpressure, remove redundant per-frame status traffic, and split public and
   private disconnect counts in schema-7 live evidence for fault campaigns.
+- [x] Pace process-local public/private initial and reconnect handshakes under
+  the documented OKX per-IP limit, reject unknown capture fields, and gate
+  backtest order entry on complete books plus fresh accounting routes.
 - [x] Add structured live fault evidence for ambiguous submit/cancel outcomes,
   partial fills, order/fill convergence timeouts, restored durable latches, and
   typed deadman, periodic clock, and authenticated account-config failures.

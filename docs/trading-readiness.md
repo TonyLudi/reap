@@ -295,6 +295,24 @@ production trading process.
     and preserves all strategy, risk, account-policy, runtime, execution,
     storage-capacity, and safety settings. It does not inspect secrets or
     authorize production.
+44. WebSocket connection attempts are now serialized across every public and
+    private supervisor in one process, for initial startup and recovery. A
+    pre-change 30-second public run encountered one `alb-qps-limited` HTTP 503,
+    recovered, and ended with 14/14 sockets ready, one disconnect, 1,728 raw
+    records, 867 accepted events, and 861 duplicates. With the shared 400 ms
+    pacer, a fresh 2026-07-14 run reached and retained 14/14 sockets with zero
+    disconnect, gap, recovery, parse, stale-book, or terminal-book defect. It
+    wrote 1,998 raw records, accepted 1,012 events, and deduplicated 986; exact
+    report verification, strict multi-source analysis, and strict replay all
+    passed at raw SHA-256
+    `e66f2d74e369c6904e5a68ab1259316e9d318d83a2dc88ec6f81b8c8109bde78`.
+    Receive-time backtest reconstruction processed 1,517 normalized records,
+    blocked 184 pre-ready new-order intents until both books and USDT/USD
+    valuation were available, then modeled four orders with zero invalid risk
+    samples out of 3,043 and complete accounting. This 30-second public-only
+    smoke validates startup pacing, capture integrity, and replay readiness; it
+    is not sustained data, execution calibration, credentialed demo evidence,
+    or production approval.
 
 ## Remaining Demo Gate
 

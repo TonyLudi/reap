@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use reap_core::{AccountUpdate, PositionMarginMode};
+use reap_feed::OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS;
 use reap_order::PacingPolicy;
 use reap_risk::RiskLimits;
 use reap_strategy::{ChaosConfig, InstrumentConfig};
@@ -16,6 +17,7 @@ use url::Url;
 
 pub const MAX_LIVE_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_REPORTED_UNKNOWN_FIELDS: usize = 64;
+const MAX_CONNECTION_ATTEMPT_INTERVAL_MS: u64 = 60_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -204,6 +206,7 @@ pub struct RuntimeConfig {
     pub max_sequence_buffer: usize,
     pub max_subscriptions_per_socket: usize,
     pub public_connections_per_subscription: usize,
+    pub connection_attempt_interval_ms: u64,
     pub timer_interval_ms: u64,
     pub readiness_timeout_ms: u64,
     pub shutdown_timeout_ms: u64,
@@ -235,6 +238,7 @@ impl Default for RuntimeConfig {
             max_sequence_buffer: 4_096,
             max_subscriptions_per_socket: 100,
             public_connections_per_subscription: 2,
+            connection_attempt_interval_ms: 400,
             timer_interval_ms: 100,
             readiness_timeout_ms: 30_000,
             shutdown_timeout_ms: 15_000,
@@ -566,8 +570,9 @@ impl LiveConfig {
             errors.push(format!("risk: {error}"));
         }
         validate_production_stablecoin_guards(self, &mut errors);
-        validate_okx_venue_endpoints(&self.venue, &mut errors);
+        let endpoint_region = validate_okx_venue_endpoints(&self.venue, &mut errors);
         validate_positive_runtime(&self.runtime, &mut errors);
+        validate_connection_attempt_interval(&self.runtime, endpoint_region, &mut errors);
         if self.runtime.fill_state_convergence_timeout_ms > self.risk.max_private_age_ms {
             errors.push(
                 "runtime.fill_state_convergence_timeout_ms must not exceed risk.max_private_age_ms"
@@ -1073,6 +1078,25 @@ fn validate_positive_runtime(runtime: &RuntimeConfig, errors: &mut Vec<String>) 
             "runtime deadman timeout must cover two periodic safety REST timeouts plus one heartbeat interval"
                 .to_string(),
         );
+    }
+}
+
+fn validate_connection_attempt_interval(
+    runtime: &RuntimeConfig,
+    endpoint_region: Option<OkxEndpointRegion>,
+    errors: &mut Vec<String>,
+) {
+    if endpoint_region != Some(OkxEndpointRegion::DemoLoopback)
+        && runtime.connection_attempt_interval_ms < OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS
+    {
+        errors.push(format!(
+            "runtime.connection_attempt_interval_ms must be at least {OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS} for official OKX endpoints"
+        ));
+    }
+    if runtime.connection_attempt_interval_ms > MAX_CONNECTION_ATTEMPT_INTERVAL_MS {
+        errors.push(format!(
+            "runtime.connection_attempt_interval_ms must not exceed {MAX_CONNECTION_ATTEMPT_INTERVAL_MS}"
+        ));
     }
 }
 
@@ -1618,6 +1642,39 @@ mod tests {
             errors
                 .iter()
                 .any(|error| error.contains("loopback endpoint tuple is demo-test only"))
+        );
+    }
+
+    #[test]
+    fn official_websocket_connection_attempts_require_exchange_safe_pacing() {
+        let mut config = valid_config();
+        config.runtime.connection_attempt_interval_ms = OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS - 1;
+        let validation = config.validate();
+        assert!(!validation.valid);
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("must be at least 334"))
+        );
+
+        config.venue = venue(
+            TradingEnvironment::Demo,
+            "http://127.0.0.1:18080",
+            "ws://127.0.0.1:18081/ws/v5/public",
+            "ws://127.0.0.1:18082/ws/v5/private",
+        );
+        config.runtime.connection_attempt_interval_ms = 0;
+        assert!(config.validate().valid);
+
+        config.runtime.connection_attempt_interval_ms = MAX_CONNECTION_ATTEMPT_INTERVAL_MS + 1;
+        let validation = config.validate();
+        assert!(!validation.valid);
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("must not exceed 60000"))
         );
     }
 

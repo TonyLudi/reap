@@ -31,6 +31,16 @@ The optional
 `output.normalized_path` is intended for short diagnostics because full
 400-level snapshots are much larger than raw deltas.
 
+`runtime.connection_attempt_interval_ms` defaults to 400 ms and is shared by
+all socket supervisors in the process, including reconnect and recovery
+attempts. Official OKX endpoints require at least 334 ms because OKX documents
+a maximum of three WebSocket connection requests per second per IP in the
+[API guide](https://www.okx.com/docs-v5/en/). Zero is accepted only for
+loopback tests. This is process-local: coordinate separate capture/live
+processes that share an egress IP, or they can still exceed the aggregate
+limit. The configured interval is part of capture and live config provenance;
+paced startup must fit inside the live readiness timeout.
+
 Every frame and run report carries a generated `capture_session_id`. The report,
 raw output, and normalized output use create-new semantics: startup refuses an
 existing path and never appends a second process session. The report is reserved
@@ -215,6 +225,14 @@ data latency, while age remains measured from the retained source timestamp.
 Missing, stale, invalid, or post-fill-only observations make the run
 non-passing; the report exposes the raw currency cash, source/effective times,
 and rate age used.
+
+As in the live coordinator, the backtest processes warmup events but rejects
+new order intents until every strategy matcher has a book and every configured
+accounting route has a fresh positive observation. Cancels are never blocked by
+this startup gate. Inspect `order_entry_ready_at_ns`,
+`order_entry_ready_at_end`, and `new_orders_blocked_not_ready`; this prevents
+startup ordering between independent sockets from creating positions or active
+notional before valuation is available.
 
 Walk-forward scenarios inherit routes from each candidate; leave scenario
 `currency_rates` empty or repeat the exact candidate set. A scenario cannot
@@ -1350,6 +1368,13 @@ configuration bypass.
 A tuple whose REST and both WebSocket hosts are loopback may use cleartext only
 with `environment = "demo"` for deterministic tests. Loopback cannot be mixed
 with official endpoints and is ineligible for production-transition evidence.
+
+The live runtime shares one connection-attempt pacer across its public feed and
+all account-private feeds. It covers initial connection, reconnect, and book
+recovery handshakes. The default 400 ms interval is intentionally stricter than
+the documented three-requests-per-second/IP boundary; official profiles reject
+less than 334 ms. The readiness timeout includes this serialized startup time.
+Multiple processes sharing an IP still require deployment-level coordination.
 
 ## Production Configuration Transition
 

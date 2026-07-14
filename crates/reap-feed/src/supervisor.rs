@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use reap_core::{RawEnvelope, Symbol, Venue};
 use reap_venue::{VenueAdapter, okx::OkxSigner};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -12,11 +13,84 @@ use crate::{
     run_connection_once,
 };
 
+/// OKX documents at most three WebSocket connection requests per second per IP.
+pub const OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS: u64 = 334;
+
 #[derive(Debug, Clone)]
 pub struct ReconnectPolicy {
     pub initial_delay: Duration,
     pub max_delay: Duration,
     pub multiplier: u32,
+}
+
+/// Process-local pacing for connection handshakes across independent feed groups.
+#[derive(Debug, Clone)]
+pub struct ConnectionAttemptPacer {
+    interval: Duration,
+    state: Arc<Mutex<ConnectionAttemptPacerState>>,
+}
+
+#[derive(Debug, Default)]
+struct ConnectionAttemptPacerState {
+    next_attempt: Option<Instant>,
+}
+
+impl ConnectionAttemptPacer {
+    pub fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            state: Arc::new(Mutex::new(ConnectionAttemptPacerState::default())),
+        }
+    }
+
+    async fn wait_for_turn(&self, shutdown: &mut watch::Receiver<bool>) -> bool {
+        if self.interval.is_zero() {
+            return !*shutdown.borrow();
+        }
+        'wait: loop {
+            let mut state = tokio::select! {
+                state = self.state.lock() => state,
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return false;
+                    }
+                    continue 'wait;
+                }
+            };
+            if *shutdown.borrow() {
+                return false;
+            }
+            let delay = state.delay_at(Instant::now());
+            if !delay.is_zero() {
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            return false;
+                        }
+                        continue 'wait;
+                    }
+                }
+            }
+            if *shutdown.borrow() {
+                return false;
+            }
+            state.record_attempt_at(Instant::now(), self.interval);
+            return true;
+        }
+    }
+}
+
+impl ConnectionAttemptPacerState {
+    fn delay_at(&self, now: Instant) -> Duration {
+        self.next_attempt
+            .map(|next| next.saturating_duration_since(now))
+            .unwrap_or_default()
+    }
+
+    fn record_attempt_at(&mut self, now: Instant, interval: Duration) {
+        self.next_attempt = Some(now.checked_add(interval).unwrap_or(now));
+    }
 }
 
 pub type BootstrapFactory =
@@ -109,6 +183,7 @@ pub fn spawn_supervised_feed(
     plans: Vec<SocketPlan>,
     bootstrap: BootstrapFactory,
     channel_capacity: usize,
+    connection_attempt_pacer: ConnectionAttemptPacer,
     reconnect: ReconnectPolicy,
 ) -> SupervisedFeed {
     let (raw_tx, raw_rx) = mpsc::channel(channel_capacity.max(1));
@@ -135,6 +210,7 @@ pub fn spawn_supervised_feed(
         let status = status_tx.clone();
         let bootstrap = Arc::clone(&bootstrap);
         let shutdown = shutdown_rx.clone();
+        let connection_attempt_pacer = connection_attempt_pacer.clone();
         let reconnect = reconnect.clone();
         tasks.push(tokio::spawn(async move {
             supervise_connection(
@@ -147,6 +223,7 @@ pub fn spawn_supervised_feed(
                     shutdown,
                     recovery: recovery_rx,
                 },
+                connection_attempt_pacer,
                 reconnect,
             )
             .await;
@@ -175,6 +252,7 @@ async fn supervise_connection(
     plan: SocketPlan,
     bootstrap: BootstrapFactory,
     channels: ConnectionChannels,
+    connection_attempt_pacer: ConnectionAttemptPacer,
     reconnect: ReconnectPolicy,
 ) {
     let ConnectionChannels {
@@ -186,6 +264,9 @@ async fn supervise_connection(
     let mut delay = reconnect.initial_delay;
     loop {
         if *shutdown.borrow() {
+            return;
+        }
+        if !connection_attempt_pacer.wait_for_turn(&mut shutdown).await {
             return;
         }
         let bootstrap_messages = match bootstrap(&plan) {
@@ -280,6 +361,26 @@ mod tests {
         assert_eq!(
             policy.next_delay(Duration::from_millis(20)),
             Duration::from_millis(25)
+        );
+    }
+
+    #[test]
+    fn connection_attempt_pacer_state_spaces_attempts_and_recovers_after_idle_time() {
+        let interval = Duration::from_millis(400);
+        let mut state = ConnectionAttemptPacerState::default();
+        let start = Instant::now();
+
+        assert_eq!(state.delay_at(start), Duration::ZERO);
+        state.record_attempt_at(start, interval);
+        assert_eq!(state.delay_at(start), interval);
+        assert_eq!(
+            state.delay_at(start + Duration::from_millis(100)),
+            Duration::from_millis(300)
+        );
+        state.record_attempt_at(start + interval, interval);
+        assert_eq!(
+            state.delay_at(start + Duration::from_secs(2)),
+            Duration::ZERO
         );
     }
 

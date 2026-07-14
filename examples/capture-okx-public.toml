@@ -7,6 +7,9 @@ writer_channel_capacity = 65536
 dedup_capacity_per_stream = 100000
 max_sequence_buffer = 4096
 max_subscriptions_per_socket = 100
+# OKX permits three WebSocket connection requests per second per IP. This
+# process-wide interval also paces reconnect storms across every socket.
+connection_attempt_interval_ms = 400
 health_interval_ms = 1000
 max_book_age_ms = 5000
 

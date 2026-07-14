@@ -2,6 +2,7 @@ mod analysis;
 mod verification;
 
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -12,8 +13,9 @@ use reap_core::{
     Channel, FeedPriority, NormalizedEvent, RawEnvelope, Subscription, SystemEventKind, Venue,
 };
 use reap_feed::{
-    ConnectionStatus, ConnectionStatusKind, FeedOutput, FeedProcessor, RawCapture, ReconnectPolicy,
-    RecoveryRequest, SequenceStatus, no_bootstrap, partition_subscriptions, spawn_supervised_feed,
+    ConnectionAttemptPacer, ConnectionStatus, ConnectionStatusKind, FeedOutput, FeedProcessor,
+    OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS, RawCapture, ReconnectPolicy, RecoveryRequest,
+    SequenceStatus, no_bootstrap, partition_subscriptions, spawn_supervised_feed,
 };
 use reap_venue::{VenueAdapter, VenueError, okx::OkxAdapter};
 use serde::{Deserialize, Serialize};
@@ -29,6 +31,8 @@ pub use analysis::*;
 pub use verification::*;
 
 pub const CAPTURE_RUN_REPORT_FORMAT_VERSION: u16 = 3;
+const MAX_CONNECTION_ATTEMPT_INTERVAL_MS: u64 = 60_000;
+const MAX_REPORTED_UNKNOWN_FIELDS: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaptureConfig {
@@ -63,6 +67,7 @@ pub struct CaptureRuntimeConfig {
     pub dedup_capacity_per_stream: usize,
     pub max_sequence_buffer: usize,
     pub max_subscriptions_per_socket: usize,
+    pub connection_attempt_interval_ms: u64,
     pub health_interval_ms: u64,
     pub max_book_age_ms: u64,
 }
@@ -75,6 +80,7 @@ impl Default for CaptureRuntimeConfig {
             dedup_capacity_per_stream: 100_000,
             max_sequence_buffer: 4_096,
             max_subscriptions_per_socket: 100,
+            connection_attempt_interval_ms: 400,
             health_interval_ms: 1_000,
             max_book_age_ms: 5_000,
         }
@@ -227,6 +233,8 @@ pub enum CaptureError {
     },
     #[error("failed to parse capture config: {0}")]
     ParseConfig(#[from] toml::de::Error),
+    #[error("capture configuration contains unknown fields: {0}")]
+    UnknownFields(String),
     #[error("capture configuration is invalid: {0}")]
     InvalidConfig(String),
     #[error("failed to partition capture subscriptions: {0}")]
@@ -278,7 +286,25 @@ impl CaptureConfig {
     }
 
     pub fn from_toml(text: &str) -> Result<Self, CaptureError> {
-        let config: Self = toml::from_str(text)?;
+        let mut ignored_count = 0_u64;
+        let mut ignored_paths = Vec::new();
+        let deserializer = toml::Deserializer::parse(text)?;
+        let config: Self = serde_ignored::deserialize(deserializer, |path| {
+            ignored_count = ignored_count.saturating_add(1);
+            if ignored_paths.len() < MAX_REPORTED_UNKNOWN_FIELDS {
+                ignored_paths.push(path.to_string());
+            }
+        })?;
+        if ignored_count > 0 {
+            ignored_paths.sort();
+            ignored_paths.dedup();
+            let omitted = ignored_count.saturating_sub(ignored_paths.len() as u64);
+            let mut message = ignored_paths.join(", ");
+            if omitted > 0 {
+                message.push_str(&format!(", and {omitted} additional field(s)"));
+            }
+            return Err(CaptureError::UnknownFields(message));
+        }
         config.ensure_valid()?;
         Ok(config)
     }
@@ -298,7 +324,7 @@ impl CaptureConfig {
 
     pub fn validate(&self) -> CaptureValidation {
         let mut errors = Vec::new();
-        validate_ws_url(&self.venue.public_ws_url, &mut errors);
+        let loopback = validate_ws_url(&self.venue.public_ws_url, &mut errors);
         for (name, value) in [
             (
                 "runtime.feed_channel_capacity",
@@ -330,6 +356,18 @@ impl CaptureConfig {
         }
         if self.runtime.max_book_age_ms == 0 {
             errors.push("runtime.max_book_age_ms must be positive".to_string());
+        }
+        if !loopback
+            && self.runtime.connection_attempt_interval_ms < OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS
+        {
+            errors.push(format!(
+                "runtime.connection_attempt_interval_ms must be at least {OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS} for non-loopback OKX endpoints"
+            ));
+        }
+        if self.runtime.connection_attempt_interval_ms > MAX_CONNECTION_ATTEMPT_INTERVAL_MS {
+            errors.push(format!(
+                "runtime.connection_attempt_interval_ms must not exceed {MAX_CONNECTION_ATTEMPT_INTERVAL_MS}"
+            ));
         }
         if self.output.raw_path.as_os_str().is_empty() {
             errors.push("output.raw_path must not be empty".to_string());
@@ -446,13 +484,11 @@ fn is_book_channel(channel: &str) -> bool {
     matches!(channel, "books" | "books-l2-tbt" | "books50-l2-tbt")
 }
 
-fn validate_ws_url(value: &str, errors: &mut Vec<String>) {
+fn validate_ws_url(value: &str, errors: &mut Vec<String>) -> bool {
     match Url::parse(value) {
         Ok(url) => {
-            let loopback_ws = url.scheme() == "ws"
-                && url.host_str().is_some_and(|host| {
-                    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
-                });
+            let loopback = url.host_str().is_some_and(is_loopback_host);
+            let loopback_ws = url.scheme() == "ws" && loopback;
             if url.scheme() != "wss" && !loopback_ws {
                 errors.push(
                     "venue.public_ws_url must use wss (loopback ws is test-only)".to_string(),
@@ -461,9 +497,21 @@ fn validate_ws_url(value: &str, errors: &mut Vec<String>) {
             if !url.username().is_empty() || url.password().is_some() {
                 errors.push("venue.public_ws_url must not contain user information".to_string());
             }
+            loopback
         }
-        Err(error) => errors.push(format!("venue.public_ws_url is invalid: {error}")),
+        Err(error) => {
+            errors.push(format!("venue.public_ws_url is invalid: {error}"));
+            false
+        }
     }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 pub async fn run_capture_path(
@@ -533,6 +581,9 @@ pub async fn run_capture(
         plans,
         no_bootstrap(),
         config.runtime.feed_channel_capacity,
+        ConnectionAttemptPacer::new(Duration::from_millis(
+            config.runtime.connection_attempt_interval_ms,
+        )),
         ReconnectPolicy::default(),
     );
     let mut raw_rx = feed.take_raw();
@@ -1230,7 +1281,60 @@ mod tests {
         assert!(!validation.valid);
         assert!(validation.errors.iter().any(|error| error.contains("wss")));
         config.venue.public_ws_url = "ws://127.0.0.1:8080/ws/v5/public".to_string();
+        config.runtime.connection_attempt_interval_ms = 0;
         assert!(config.validate().valid);
+
+        config.venue.public_ws_url = "wss://ws.okx.com:8443/ws/v5/public".to_string();
+        let validation = config.validate();
+        assert!(!validation.valid);
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("must be at least 334"))
+        );
+    }
+
+    #[test]
+    fn capture_parser_rejects_unknown_fields_at_every_config_layer() {
+        let config =
+            CaptureConfig::from_toml(include_str!("../../../examples/capture-okx-public.toml"))
+                .unwrap();
+        let mut document = toml::Value::try_from(config).unwrap();
+        document
+            .as_table_mut()
+            .unwrap()
+            .insert("top_level_typo".to_string(), toml::Value::Boolean(true));
+        document["venue"]
+            .as_table_mut()
+            .unwrap()
+            .insert("websocket_typo".to_string(), toml::Value::Boolean(true));
+        document["runtime"]
+            .as_table_mut()
+            .unwrap()
+            .insert("pacing_typo".to_string(), toml::Value::Boolean(true));
+        document["output"]
+            .as_table_mut()
+            .unwrap()
+            .insert("fsync_typo".to_string(), toml::Value::Boolean(true));
+        document["subscriptions"].as_array_mut().unwrap()[0]
+            .as_table_mut()
+            .unwrap()
+            .insert("channel_typo".to_string(), toml::Value::Boolean(true));
+
+        let error = CaptureConfig::from_toml(&toml::to_string(&document).unwrap())
+            .unwrap_err()
+            .to_string();
+
+        for field in [
+            "top_level_typo",
+            "websocket_typo",
+            "pacing_typo",
+            "fsync_typo",
+            "channel_typo",
+        ] {
+            assert!(error.contains(field), "missing {field:?} in {error}");
+        }
     }
 
     #[test]

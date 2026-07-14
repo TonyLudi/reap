@@ -70,6 +70,12 @@ pub struct BacktestReport {
     pub last_arrival_ns: Option<u64>,
     pub input_clock_regressions: u64,
     pub max_input_clock_regression_ns: u64,
+    #[serde(default)]
+    pub order_entry_ready_at_ns: Option<u64>,
+    #[serde(default)]
+    pub order_entry_ready_at_end: bool,
+    #[serde(default)]
+    pub new_orders_blocked_not_ready: usize,
     pub orders_sent: usize,
     pub cancel_requests: usize,
     pub deduplicated_cancel_requests: usize,
@@ -192,6 +198,8 @@ pub struct BacktestRunner {
     input_events: u64,
     input_clock_regressions: u64,
     max_input_clock_regression_ns: u64,
+    order_entry_ready_at_ns: Option<u64>,
+    new_orders_blocked_not_ready: usize,
     orders_sent: usize,
     cancel_requests: usize,
     deduplicated_cancel_requests: usize,
@@ -287,6 +295,8 @@ impl BacktestRunner {
             input_events: 0,
             input_clock_regressions: 0,
             max_input_clock_regression_ns: 0,
+            order_entry_ready_at_ns: None,
+            new_orders_blocked_not_ready: 0,
             orders_sent: 0,
             cancel_requests: 0,
             deduplicated_cancel_requests: 0,
@@ -497,6 +507,7 @@ impl BacktestRunner {
                 self.drain_through(now_ns)?;
             }
         }
+        self.observe_order_entry_readiness();
         self.sample_risk_metrics();
         Ok(())
     }
@@ -655,6 +666,12 @@ impl BacktestRunner {
         while let Some(command) = queue.pop_front() {
             match command {
                 OrderIntent::NewOrder(order) => {
+                    self.observe_order_entry_readiness();
+                    if !self.order_entry_ready() {
+                        self.new_orders_blocked_not_ready =
+                            self.new_orders_blocked_not_ready.saturating_add(1);
+                        continue;
+                    }
                     self.orders_sent += 1;
                     let symbol = order.symbol.clone();
                     let now_ms = time_ms(self.now_ns);
@@ -985,6 +1002,29 @@ impl BacktestRunner {
         }
     }
 
+    fn order_entry_ready(&self) -> bool {
+        self.matchers
+            .values()
+            .all(|matcher| matcher.depth().is_some())
+            && self.execution.currency_rates.iter().all(|route| {
+                let Some(observation) = self.currency_rate_observations.get(&route.currency) else {
+                    return false;
+                };
+                observation.usd_per_unit.is_finite()
+                    && observation.usd_per_unit > 0.0
+                    && self
+                        .now_ns
+                        .saturating_sub(observation.source_ts_ms.saturating_mul(NS_PER_MS))
+                        <= route.max_age_ms.saturating_mul(NS_PER_MS)
+            })
+    }
+
+    fn observe_order_entry_readiness(&mut self) {
+        if self.order_entry_ready_at_ns.is_none() && self.order_entry_ready() {
+            self.order_entry_ready_at_ns = Some(self.now_ns);
+        }
+    }
+
     fn valuation_marks(&self) -> HashMap<Symbol, f64> {
         let mut marks = self
             .matchers
@@ -999,6 +1039,7 @@ impl BacktestRunner {
     fn finish_report(&mut self) -> Result<BacktestReport> {
         let now_ns = self.now_ns;
         self.drain_through(now_ns)?;
+        self.observe_order_entry_readiness();
         self.advance_metric_clock(now_ns);
         self.sample_risk_metrics();
         let marks = self.valuation_marks();
@@ -1068,6 +1109,7 @@ impl BacktestRunner {
             && self.portfolio.invalid_accounting_events() == 0
             && self.invalid_risk_metric_samples == 0
             && final_valuation_complete;
+        let order_entry_ready_at_end = self.order_entry_ready();
         let observed_duration_ns = self
             .first_arrival_ns
             .zip(self.last_arrival_ns)
@@ -1093,6 +1135,9 @@ impl BacktestRunner {
             last_arrival_ns: self.last_arrival_ns,
             input_clock_regressions: self.input_clock_regressions,
             max_input_clock_regression_ns: self.max_input_clock_regression_ns,
+            order_entry_ready_at_ns: self.order_entry_ready_at_ns,
+            order_entry_ready_at_end,
+            new_orders_blocked_not_ready: self.new_orders_blocked_not_ready,
             orders_sent: self.orders_sent,
             cancel_requests: self.cancel_requests,
             deduplicated_cancel_requests: self.deduplicated_cancel_requests,
@@ -1409,6 +1454,18 @@ mod tests {
         })
     }
 
+    fn seed_perp_matcher(runner: &mut BacktestRunner, ts_ms: u64) {
+        runner.matcher_mut("BTC-PERP").unwrap().on_depth_at(
+            OrderBook::one_level(
+                "BTC-PERP",
+                ts_ms,
+                Level::new(100.0, 10_000.0),
+                Level::new(101.0, 10_000.0),
+            ),
+            ts_ms,
+        );
+    }
+
     #[test]
     fn replayed_quote_fill_triggers_hedge_order() {
         let mut runner = BacktestRunner::new(config()).unwrap();
@@ -1606,6 +1663,35 @@ mod tests {
     }
 
     #[test]
+    fn order_entry_waits_for_books_and_fresh_accounting_rates() {
+        let mut runner =
+            BacktestRunner::with_execution_config(usdt_config(), usdt_execution(0, 1_000)).unwrap();
+        let mut events = initial_books();
+        events.push(NormalizedEvent::Market(MarketEvent::IndexPrice {
+            ts_ms: 2,
+            symbol: "USDT-USD".to_string(),
+            price: 1.0,
+        }));
+        events.push(NormalizedEvent::from(MarketEvent::Depth(
+            OrderBook::one_level(
+                "BTC-USDT",
+                3,
+                Level::new(50_001.0, 2.0),
+                Level::new(50_002.0, 2.0),
+            ),
+        )));
+
+        let report = runner.run(events).unwrap();
+
+        assert!(report.new_orders_blocked_not_ready > 0);
+        assert_eq!(report.order_entry_ready_at_ns, Some(2 * NS_PER_MS));
+        assert!(report.order_entry_ready_at_end);
+        assert!(report.orders_sent > 0);
+        assert_eq!(report.invalid_risk_metric_samples, 0);
+        assert!(report.accounting_complete);
+    }
+
+    #[test]
     fn stale_currency_index_makes_final_accounting_incomplete() {
         let mut runner =
             BacktestRunner::with_execution_config(usdt_config(), usdt_execution(0, 1)).unwrap();
@@ -1732,6 +1818,7 @@ mod tests {
             ),
             1,
         );
+        seed_perp_matcher(&mut runner, 1);
         runner
             .accept_intents(vec![OrderIntent::NewOrder(NewOrder {
                 symbol: "BTC-USDT".to_string(),
@@ -1799,6 +1886,7 @@ mod tests {
             ),
             100,
         );
+        seed_perp_matcher(&mut runner, 100);
         runner
             .accept_intents(vec![OrderIntent::NewOrder(NewOrder {
                 symbol: "BTC-USDT".to_string(),

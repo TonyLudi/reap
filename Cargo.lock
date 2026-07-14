@@ -1028,6 +1028,7 @@ dependencies = [
  "reap-feed",
  "reap-venue",
  "serde",
+ "serde_ignored",
  "serde_json",
  "sha2",
  "tempfile",

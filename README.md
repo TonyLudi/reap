@@ -92,7 +92,8 @@ cargo run -p reap-cli -- config-check --config examples/iarb2-basic.toml --prett
 Capture backtest-ready OKX public data, including redundant USDT/USD and
 USDC/USD risk references, without credentials or private/account connections.
 The bounded command exits non-zero on parse, sequence, recovery, writer, or
-end-of-run connectivity defects:
+end-of-run connectivity defects. Capture configuration rejects unknown fields
+instead of silently defaulting a typo:
 
 ```bash
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -144,6 +145,12 @@ still scheduled at the capture boundary. The example delay values are zero,
 the threshold is the pinned Java default, capacity fractions are 100%, and
 `calibrated = false`; these parity defaults are not an execution-quality or
 profitability claim.
+
+Backtest order entry follows the live startup boundary: new orders remain
+blocked until every configured matching book and direct accounting-currency
+rate is available and fresh. Cancels remain permitted. Reports retain the
+first ready timestamp, terminal readiness, and the number of pre-ready new
+orders suppressed.
 
 Backtest reports also separate fee cost, funding PnL, turnover, and raw currency
 cash. Exact private-fill fees retain their signed exchange amount and currency;
@@ -204,6 +211,14 @@ unexpected ports, mixed regions, and arbitrary TLS hosts are rejected. A full
 loopback tuple is accepted only in the demo environment for deterministic local
 tests. Unknown live TOML fields are rejected, including nested strategy and
 risk typos, rather than being silently dropped before validation.
+
+`runtime.connection_attempt_interval_ms = 400` serializes initial and
+reconnecting WebSocket handshakes across every public and private feed in one
+process. Official endpoint configurations reject values below 334 ms because
+OKX documents a limit of three WebSocket connection requests per second per IP
+in the [API guide](https://www.okx.com/docs-v5/en/). Only complete demo
+loopback configurations may use zero. Deployments running multiple Reap
+processes behind one egress IP must coordinate that limit outside the process.
 
 Before promoting an exact demo configuration to a production candidate, create
 an owner-only transition artifact:

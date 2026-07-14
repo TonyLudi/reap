@@ -9,8 +9,9 @@ use reap_core::{
     TimeMs, TimerEvent, Venue,
 };
 use reap_feed::{
-    ConnectionStatus, ConnectionStatusKind, FeedOutput, FeedProcessor, ReconnectPolicy, SocketPlan,
-    SupervisedFeed, okx_login_bootstrap, partition_subscriptions, spawn_supervised_feed,
+    ConnectionAttemptPacer, ConnectionStatus, ConnectionStatusKind, FeedOutput, FeedProcessor,
+    ReconnectPolicy, SocketPlan, SupervisedFeed, okx_login_bootstrap, partition_subscriptions,
+    spawn_supervised_feed,
 };
 use reap_order::{
     CancelOutcome, OkxOrderGateway, ReconcileReport, SubmitOutcome, SubmitPreparation,
@@ -1300,6 +1301,9 @@ impl LiveRuntime {
         let mut feed_tasks = Vec::new();
         let mut sources = Vec::new();
 
+        let connection_attempt_pacer = ConnectionAttemptPacer::new(Duration::from_millis(
+            config.runtime.connection_attempt_interval_ms,
+        ));
         let public_adapter: Arc<dyn VenueAdapter> = Arc::new(OkxAdapter::new(
             &config.venue.public_ws_url,
             &config.venue.private_ws_url,
@@ -1309,6 +1313,7 @@ impl LiveRuntime {
             public_plans.clone(),
             reap_feed::no_bootstrap(),
             config.runtime.feed_channel_capacity,
+            connection_attempt_pacer.clone(),
             ReconnectPolicy::default(),
         );
         let public_source_id = sources.len();
@@ -1371,6 +1376,7 @@ impl LiveRuntime {
                 private_plans.clone(),
                 okx_login_bootstrap(signer),
                 config.runtime.feed_channel_capacity,
+                connection_attempt_pacer.clone(),
                 ReconnectPolicy::default(),
             );
             let source_id = sources.len();
