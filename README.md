@@ -213,8 +213,9 @@ tests. Unknown live TOML fields are rejected, including nested strategy and
 risk typos, rather than being silently dropped before validation.
 
 `runtime.connection_attempt_interval_ms = 400` serializes initial and
-reconnecting WebSocket handshakes across every public and private feed in one
-process. Official endpoint configurations reject values below 334 ms because
+reconnecting WebSocket handshakes across every public/private feed and
+authenticated order-command session in one process. Official endpoint
+configurations reject values below 334 ms because
 OKX documents a limit of three WebSocket connection requests per second per IP
 in the [API guide](https://www.okx.com/docs-v5/en/). Only complete demo
 loopback configurations may use zero. Deployments running multiple Reap
@@ -422,7 +423,7 @@ still be supplied manually with repeated `--statement` and the explicit
 is weaker. The report covers fills and fees only; it is not balance, position,
 funding, equity, liability, tax, or currency-conversion reconciliation.
 
-Each create-new schema-7 live report contains the exact source-config byte
+Each create-new schema-8 live report contains the exact source-config byte
 count/SHA-256, checkpoint and full evidence config fingerprints, Reap executable
 hash, pinned Java revision, pseudonymous host/account identity,
 session/readiness/host evidence, and bounded per-class/per-symbol latency

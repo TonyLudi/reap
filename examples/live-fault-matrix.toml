@@ -1,7 +1,7 @@
 # Paths are resolved relative to this manifest. Keep every report and injector
 # record immutable; the verifier rejects duplicate sessions, paths, and injector
 # hashes. Replace these placeholders with target-host campaign artifacts.
-schema_version = 1
+schema_version = 2
 
 [[runs]]
 scenario = "clean_observe"
@@ -20,6 +20,11 @@ injector_evidence = "evidence/public-reconnect-injector.log"
 scenario = "private_reconnect"
 report = "evidence/private-reconnect.json"
 injector_evidence = "evidence/private-reconnect-injector.log"
+
+[[runs]]
+scenario = "order_transport_reconnect"
+report = "evidence/order-transport-reconnect.json"
+injector_evidence = "evidence/order-transport-reconnect-injector.log"
 
 [[runs]]
 scenario = "ambiguous_submit"

@@ -125,7 +125,7 @@ architecture in [docs/architecture.md](docs/architecture.md).
   message class and instrument, actual sampled-usage reporting, and
   stochastic-dominance validation for coupled baseline/stress runs.
 - [x] Collect bounded live latency evidence at the normalized strategy boundary,
-  REST acknowledgement boundary, and fill-to-account convergence boundary;
+  exchange order-acknowledgement boundary, and fill-to-account convergence boundary;
   generate config/code/source-bound calibration artifacts and require an exact
   artifact/profile match for production-candidate research.
 - [x] Reserve bounded-live evidence output before network startup and persist a
@@ -224,9 +224,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
   certification with credential-free raw-evidence verification.
 - [x] Make websocket ready/disconnect transitions lossless under bounded status
   backpressure, remove redundant per-frame status traffic, and split public and
-  private disconnect counts in schema-7 live evidence for fault campaigns.
-- [x] Pace process-local public/private initial and reconnect handshakes under
-  the documented OKX per-IP limit, reject unknown capture fields, and gate
+  private disconnect counts in schema-8 live evidence for fault campaigns.
+- [x] Pace process-local public/private/order-command initial and reconnect
+  handshakes under the documented OKX per-IP limit, reject unknown capture fields, and gate
   backtest order entry on complete books plus fresh accounting routes.
 - [x] Add structured live fault evidence for ambiguous submit/cancel outcomes,
   partial fills, order/fill convergence timeouts, restored durable latches, and
@@ -235,16 +235,26 @@ architecture in [docs/architecture.md](docs/architecture.md).
   the stopped journal, requires every recovered live regular order to report
   OKX Cancel All After source `20`, proves account-wide regular-order zero, and
   supports credential-free verification against the exact journal/raw evidence.
-- [x] Bind schema-7 live reports to exact source-config bytes, reserve them
+- [x] Bind schema-8 live reports to exact source-config bytes, reserve them
   owner-only with file/directory durability, and add offline verification that
   re-derives report, mode, host, identity, latency, and clean-soak invariants.
 - [x] Add a strict live fault-matrix manifest/verifier that requires every
-  documented schema-7 role, unique sessions and injector evidence, one exact
+  documented schema-8 role, unique sessions and injector evidence, one exact
   config/build/host/account identity, production-shaped demo guards, and safe
   zero-order shutdown without claiming process-death or economic proof.
 - [ ] Run credentialed bounded observe and minimal-size demo fault campaigns,
-  including process death, deadman expiry, clock skew, REST ambiguity, partial
-  fill, reconnect, and durable-latch restart recovery.
+  including process death, deadman expiry, clock skew, websocket order
+  ambiguity, partial fill, public/private/order-command reconnect, and
+  durable-latch restart recovery.
+- [x] Add an authenticated OKX websocket order-command pool with the pinned
+  Java default of eight sessions, stable underlying dispatch, bounded request
+  correlation, exchange expiry, aggregate readiness, supervised reconnect,
+  explicit pre-send versus ambiguous-write classification, REST cancel
+  fallback, and a required clean reconciliation after transport loss.
+- [ ] Remove account order-path head-of-line blocking: isolate REST
+  reconciliation from command dispatch and support bounded concurrent
+  underlying-routed websocket operations with shared account pacing and
+  deterministic canonical completion.
 - [ ] Calibrate queue position, latency, fees, funding, and slippage from
   captured full-depth data, then run and archive production-candidate
   walk-forward, capacity, and stressed-liquidity reports. The orchestration and

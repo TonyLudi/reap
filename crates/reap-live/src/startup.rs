@@ -27,6 +27,8 @@ pub struct ReadinessSnapshot {
     pub missing_books: Vec<String>,
     pub missing_private_streams: Vec<String>,
     #[serde(default)]
+    pub missing_order_transports: Vec<String>,
+    #[serde(default)]
     pub missing_stablecoin_rates: Vec<String>,
     pub faults: BTreeMap<String, String>,
 }
@@ -52,6 +54,7 @@ pub struct StartupGate {
     phase: LivePhase,
     required_symbols: HashSet<String>,
     required_accounts: HashSet<String>,
+    required_order_transports: HashSet<String>,
     required_stablecoin_rates: HashSet<String>,
     metadata_verified: bool,
     storage_ready: bool,
@@ -60,6 +63,7 @@ pub struct StartupGate {
     account_snapshots: HashSet<String>,
     ready_books: HashSet<String>,
     ready_private_streams: HashSet<String>,
+    ready_order_transports: HashSet<String>,
     ready_stablecoin_rates: HashSet<String>,
     faults: BTreeMap<String, String>,
     was_ready: bool,
@@ -67,10 +71,20 @@ pub struct StartupGate {
 
 impl StartupGate {
     pub fn new(config: &LiveConfig) -> Self {
+        Self::new_with_order_transport(config, false)
+    }
+
+    pub fn new_with_order_transport(config: &LiveConfig, required: bool) -> Self {
+        let required_accounts = config.required_accounts();
         Self {
             phase: LivePhase::Configured,
             required_symbols: config.required_symbols(),
-            required_accounts: config.required_accounts(),
+            required_accounts: required_accounts.clone(),
+            required_order_transports: if required {
+                required_accounts
+            } else {
+                HashSet::new()
+            },
             required_stablecoin_rates: config
                 .risk
                 .stablecoin_guards
@@ -84,6 +98,7 @@ impl StartupGate {
             account_snapshots: HashSet::new(),
             ready_books: HashSet::new(),
             ready_private_streams: HashSet::new(),
+            ready_order_transports: HashSet::new(),
             ready_stablecoin_rates: HashSet::new(),
             faults: BTreeMap::new(),
             was_ready: false,
@@ -202,6 +217,27 @@ impl StartupGate {
         Ok(())
     }
 
+    pub fn mark_order_transport(
+        &mut self,
+        account_id: &str,
+        ready: bool,
+        reason: impl Into<String>,
+    ) -> Result<(), StartupError> {
+        self.require_account(account_id)?;
+        if !self.required_order_transports.contains(account_id) {
+            return Ok(());
+        }
+        set_membership(&mut self.ready_order_transports, account_id, ready);
+        set_fault(
+            &mut self.faults,
+            &format!("order_transport:{account_id}"),
+            ready,
+            reason,
+        );
+        self.refresh();
+        Ok(())
+    }
+
     pub fn mark_stablecoin_rate(
         &mut self,
         symbol: &str,
@@ -251,6 +287,10 @@ impl StartupGate {
             missing_account_snapshots: missing(&self.required_accounts, &self.account_snapshots),
             missing_books: missing(&self.required_symbols, &self.ready_books),
             missing_private_streams: missing(&self.required_accounts, &self.ready_private_streams),
+            missing_order_transports: missing(
+                &self.required_order_transports,
+                &self.ready_order_transports,
+            ),
             missing_stablecoin_rates: missing(
                 &self.required_stablecoin_rates,
                 &self.ready_stablecoin_rates,
@@ -284,6 +324,10 @@ impl StartupGate {
         }
         let streams_ready = is_complete(&self.required_symbols, &self.ready_books)
             && is_complete(&self.required_accounts, &self.ready_private_streams)
+            && is_complete(
+                &self.required_order_transports,
+                &self.ready_order_transports,
+            )
             && is_complete(
                 &self.required_stablecoin_rates,
                 &self.ready_stablecoin_rates,
@@ -445,6 +489,35 @@ mod tests {
         assert_eq!(gate.phase(), LivePhase::Degraded);
         gate.mark_public_connectivity(true, "redundant channel recovered");
         assert_eq!(gate.phase(), LivePhase::Ready);
+    }
+
+    #[test]
+    fn tradable_gate_requires_every_account_order_transport() {
+        let config = config();
+        let mut gate = StartupGate::new_with_order_transport(&config, true);
+        gate.mark_metadata_verified();
+        gate.mark_storage(true, "open");
+        gate.mark_public_connectivity(true, "connected");
+        gate.mark_reconciled("main", true, "clean").unwrap();
+        gate.mark_account_snapshot("main", true, "loaded").unwrap();
+        gate.mark_book("BTC-USDT", true, "snapshot").unwrap();
+        gate.mark_book("BTC-PERP", true, "snapshot").unwrap();
+        gate.mark_private_stream("main", true, "heartbeat").unwrap();
+
+        assert_eq!(gate.phase(), LivePhase::AwaitingStreams);
+        assert_eq!(
+            gate.snapshot().missing_order_transports,
+            vec!["main".to_string()]
+        );
+        gate.mark_order_transport("main", true, "all sessions authenticated")
+            .unwrap();
+        assert_eq!(gate.phase(), LivePhase::Ready);
+
+        gate.mark_order_transport("main", false, "one session disconnected")
+            .unwrap();
+        assert_eq!(gate.phase(), LivePhase::Degraded);
+        assert!(!gate.can_submit_new(true));
+        assert!(gate.can_cancel());
     }
 
     #[test]

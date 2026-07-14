@@ -189,7 +189,7 @@ enum Command {
     VerifyLiveRun {
         #[arg(short, long, help = "Original live TOML configuration")]
         config: PathBuf,
-        #[arg(short, long, help = "Schema-7 live JSON report")]
+        #[arg(short, long, help = "Schema-8 live JSON report")]
         report: PathBuf,
         #[arg(long, value_enum, help = "Require this recorded live mode")]
         expected_mode: Option<LiveCliMode>,
@@ -204,7 +204,7 @@ enum Command {
         pretty: bool,
     },
     #[command(
-        about = "Verify the complete schema-7 observe/demo live fault matrix",
+        about = "Verify the complete schema-8 observe/demo live fault matrix",
         long_about = "Independently verify one exact-config run per required live fault role, bind every run to one build/host/account identity, and hash each external injector record. Process-death, statement, and deployment certification remain separate gates."
     )]
     VerifyLiveFaultMatrix {

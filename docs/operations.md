@@ -33,7 +33,8 @@ The optional
 
 `runtime.connection_attempt_interval_ms` defaults to 400 ms and is shared by
 all socket supervisors in the process, including reconnect and recovery
-attempts. Official OKX endpoints require at least 334 ms because OKX documents
+attempts; live processes include authenticated order-command sessions in the
+same pacer. Official OKX endpoints require at least 334 ms because OKX documents
 a maximum of three WebSocket connection requests per second per IP in the
 [API guide](https://www.okx.com/docs-v5/en/). Zero is accepted only for
 loopback tests. This is process-local: coordinate separate capture/live
@@ -1154,10 +1155,24 @@ in `observe` only after review.
 - The coordinator generates the client order ID and synchronously records a
   canonical `PendingNew` before dispatching to the account gateway task. The
   intent, pending state, and request are enqueued to critical storage before
-  REST IO begins.
-- Route explicit REST rejections back through the gateway state. Treat timeout
-  and transport ambiguity as pending until REST/private reconciliation resolves
-  it; do not blindly resubmit.
+  authenticated websocket write begins.
+- Demo order entry requires every session in the account's authenticated
+  websocket command pool. `order_websocket_sessions` defaults to eight and
+  stable underlying hashing keeps related spot/swap/future commands on one
+  session, matching the pinned Java dispatch shape.
+- Route explicit exchange rejections back through gateway state. A session
+  unavailable before send is an explicit non-submit. Treat write, timeout,
+  disconnect, and correlation ambiguity as pending until REST/private
+  reconciliation resolves it; never blindly resubmit.
+- `order_websocket_ack_timeout_ms` bounds post-write acknowledgement waiting.
+  The ambiguous-submit grace must cover both `order_request_expiry_ms` and this
+  acknowledgement window; the order-state convergence budget must also cover
+  the acknowledgement window. A command-session loss blocks entry, initiates
+  canonical account cancels, invalidates the last clean reconciliation, and
+  requires both session recovery and a fresh clean REST pass.
+- Normal cancellation uses websocket first and falls back to authenticated REST
+  only when the routed session is known unavailable before send. An ambiguous
+  websocket cancel is reconciled instead of being silently retried.
 - Every place-order request carries an OKX `expTime` derived from
   `order_request_expiry_ms`; the exchange must discard a request that reaches
   its matching engine after that deadline.
@@ -1200,6 +1215,7 @@ in `observe` only after review.
 | Public sequence gap | Book recovering; new orders blocked | Obtain a fresh snapshot and replay contiguous buffered deltas |
 | Public feed stale | Symbol blocked; live orders cancelled | Restore at least one healthy feed and verify sequence continuity |
 | Private stream stale | Account blocked; live orders cancelled | Reconnect, REST reconcile orders/fills/balances/positions, then emit recovery |
+| Order-command websocket stale | Account blocked; live orders cancelled; prior reconciliation invalidated | Reconnect every command session and require a new clean REST reconciliation before entry |
 | Submit/cancel order-state convergence timeout | Account blocked; active orders cancelled; expired cancel retried; full reconciliation requested | Suppress each orders-channel transition independently, then verify REST repair and no early readiness recovery |
 | Fill/account-state convergence timeout | Account blocked; live orders cancelled; full reconciliation requested | Inspect the missing symbol/currency target and private-channel latency, then require authoritative repair and a clean pass |
 | Position scope or margin-mode violation | Bootstrap/runtime abort; demo cleanup attempts cancel/reconcile and retains the deadman unless safe | Keep entry disabled; close/correct the unmodeled position or mode outside Reap, then require a clean bootstrap |
@@ -1217,11 +1233,12 @@ in `observe` only after review.
 For a credentialed fault campaign, archive the report and require the following
 structured evidence rather than matching log text:
 
-| Injected condition | Required schema-7 evidence |
+| Injected condition | Required schema-8 evidence |
 | --- | --- |
 | Public websocket loss | `public_connection_disconnect_events > 0`; verify the expected readiness impact for the configured replica count |
 | Private websocket loss | `private_connection_disconnect_events > 0`, a readiness loss, and later ready state after REST reconciliation |
-| Ambiguous REST submit or cancel | The corresponding `ambiguous_submit_events` or `ambiguous_cancel_events` counter is nonzero |
+| Order-command websocket loss | `order_transport_disconnect_events > 0`, `order_transport_stale_events > 0`, a readiness loss, and later ready state after session recovery plus REST reconciliation |
+| Ambiguous websocket submit or cancel | The corresponding `ambiguous_submit_events` or `ambiguous_cancel_events` counter is nonzero |
 | Exchange partial fill | `partial_fill_events > 0`, plus canonical fill/fee statement reconciliation for the run window |
 | Suppressed fill/account state | `fill_convergence_timeout_events > 0` and a matching reconciliation-drift response |
 | Suppressed order state | `order_convergence_timeout_events > 0` and a matching reconciliation-drift response |
@@ -1244,10 +1261,10 @@ reap verify-live-fault-matrix \
   --pretty
 ```
 
-The schema-1 template is `examples/live-fault-matrix.toml`; relative artifact
+The schema-2 template is `examples/live-fault-matrix.toml`; relative artifact
 paths resolve from the manifest directory. The verifier rejects missing or
 duplicate roles, report/session reuse, injector path or content reuse, config
-byte drift, invalid schema-7 evidence, and cross-run build, host, or account
+byte drift, invalid schema-8 evidence, and cross-run build, host, or account
 identity changes. Clean reconnect roles must recover to a clean bounded soak.
 Ambiguity and convergence roles may retain their expected drift counters but
 must finish a bounded run back at ready with no storage drops, alert failures,
@@ -1457,7 +1474,7 @@ shuts down directly.
 With `--output`, the CLI reserves the create-new path before configuration,
 credentials, or network startup. If the report-capable runtime's initialization,
 event loop, or teardown fails, Reap completes the same fail-closed cleanup,
-writes and fsyncs a schema-7 report with `stop_reason = "runtime_failure"` plus a
+writes and fsyncs a schema-8 report with `stop_reason = "runtime_failure"` plus a
 bounded stable `failure.code` and diagnostic `failure.message`, prints it, and
 then returns the original nonzero error. Review `readiness_at_stop` separately
 from final `readiness`, and require `active_orders_after_shutdown = 0`; a failure
@@ -1524,10 +1541,11 @@ of these invariants hold:
 - demo shutdown resolved every active canonical order; and
 - no external alert delivery failed.
 
-The schema-7 report also records time-to-ready, recovered readiness losses and
-maximum outage, total/public/private disconnects, stale-stream events, book
+The schema-8 report also records time-to-ready, recovered readiness losses and
+maximum outage, total/public/private/order-transport disconnects,
+order-transport stale events, stale-stream events, book
 recoveries, and the storage queue high-water mark. The total disconnect count
-must equal the public and private counts combined. It also reports authenticated
+must equal the public, private, and order-transport counts combined. It also reports authenticated
 operator commands and mutations, ambiguous submit/cancel outcomes, partial-fill
 transitions, order/fill convergence timeouts, and restored durable latches.
 Restored startup order state does not increment per-session partial-fill or
@@ -1574,8 +1592,8 @@ The measurements map to the backtest scheduler as follows:
 | `market_depth` | accepted websocket host receive to entry into the strategy coordinator | Raw replay already starts at host receive, so exchange-to-host time is deliberately excluded |
 | `historical_trade` | accepted websocket host receive to strategy visibility | Same local visibility boundary as depth |
 | `reference_data` | accepted index/funding/mark/limit input at host receive to strategy visibility | Rust class with no direct Java `BackTestDelay` member |
-| `matching_new` | event-loop dispatch through storage, account queue, pacing, REST, and successful place acknowledgement | Demo only; conservative upper bound for Java `MatchingNew`, requiring explicit acceptance |
-| `matching_cancel` | event-loop dispatch through storage, account queue, pacing, REST, and successful cancel acknowledgement | Demo only; acknowledgement does not prove terminal cancellation and is an upper bound for Java `MatchingCancel` |
+| `matching_new` | event-loop dispatch through storage, account queue, pacing, websocket write, and successful place acknowledgement | Demo only; conservative upper bound for Java `MatchingNew`, requiring explicit acceptance |
+| `matching_cancel` | event-loop dispatch through storage, account queue, pacing, websocket write, and successful cancel acknowledgement | Demo only; acknowledgement does not prove terminal cancellation and is an upper bound for Java `MatchingCancel` |
 | `order_update` | OKX exchange event timestamp to canonical strategy visibility | Demo only; cross-clock measurement requires synchronized host-guard snapshots |
 | `order_fill` | canonical fill visibility to the covering derivative position or both spot balances | Demo only; zero is valid when covering state arrived first |
 

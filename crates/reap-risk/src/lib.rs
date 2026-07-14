@@ -837,6 +837,9 @@ impl RiskGate {
                     self.mark_private_account_ready(venue, event.account_id.clone(), event.ts_ms);
                 }
             }
+            SystemEventKind::OrderTransportStale
+            | SystemEventKind::OrderTransportHeartbeat
+            | SystemEventKind::OrderTransportRecovered => {}
             SystemEventKind::KillSwitchActivated | SystemEventKind::RiskBreach => {
                 self.kill_switch = Some(event.reason.clone());
             }

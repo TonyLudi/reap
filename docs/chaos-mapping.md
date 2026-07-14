@@ -112,7 +112,7 @@ were also checked against these concrete Java paths:
 | Java reference | Rust live evidence | Qualification |
 | --- | --- | --- |
 | `AbstractOkxNitroL2Subscriber.createOrderBookPayloadHandler` records `StartProcessMarketDepth` before JSON parsing | accepted raw `recv_ts_ns` through parse, deduplication, sequencing/book reduction, and entry into the coordinator | Measures the additional target-host path needed after raw replay's receive-time boundary |
-| `OkxNitroOrderClient` records websocket send/sent and order-message process stages | dispatch through the account task, pacing, HTTP request, and successful REST acknowledgement | Current Rust gateway uses REST; this is a conservative `MatchingNew`/`MatchingCancel` upper bound, not exchange matching-engine time |
+| `OkxNitroOrderClient` records websocket send/sent and order-message process stages | dispatch through the account task, pacing, authenticated websocket write, and correlated OKX acknowledgement | Same transport class and a conservative `MatchingNew`/`MatchingCancel` upper bound, not exchange matching-engine time |
 | `MatchingOrderUpdatePublisher` schedules both `OrderUpdate` and `BackTestOrderUpdate` with `OrderUpdate` delay | exchange order/fill timestamp to canonical strategy visibility | Requires synchronized host and exchange clocks; the REST reconciliation path is excluded |
 | `MatchingOrderFillPublisher` schedules `OrderFill` with `OrderFill` delay; `BackTestDelay` notes account/position publication is coupled to order update | canonical fill visibility until the derivative position or both spot balances are visible | Matches the Rust strategy's authoritative account-state hedge boundary; it is not a claim that Java's internal publisher topology is identical |
 
@@ -143,11 +143,11 @@ with `REQUEST_BLOCKED` while disconnected. Its order-session disconnect hook
 also invokes `cancelAll`. Rust likewise invalidates feed readiness, blocks
 entry, supervises reconnect/recovery, reconciles private state, and preserves
 cancellation while entry is blocked. `verify-live-fault-matrix` therefore
-requires clean recovered public/private reconnect roles and zero-order shutdown
+requires clean recovered public/private/order-command reconnect roles and zero-order shutdown
 for disruptive order-path roles, all on one config/build/host/account identity.
 Rust intentionally adds a stronger audit boundary: after a report-capable
 runtime exists, an initialization, event-loop, or teardown error completes
-fail-closed cancellation/reconciliation, persists the schema-7 failure code plus
+fail-closed cancellation/reconciliation, persists the schema-8 failure code plus
 pre/post-cleanup evidence, and only then returns the nonzero process error.
 
 The same pinned Java tree makes stop/cancel ordering explicit:
@@ -227,7 +227,8 @@ The following differences do not change the covered quote/hedge calculations:
 | `AbstractOkV5L2Subscriber.checkSeqNo` predecessor compare-and-set, equal-sequence no-change case, and lower-sequence maintenance case | `SequenceTracker` requires `prevSeqId == last`, accepts equal/lower `seqId`, records both cases, and recovers on mismatch | Exact continuity rule with bounded recovery buffering |
 | Nitro checksum validation block commented out; legacy V5 CRC validation active | No CRC validation after OKX checksum deprecation; WSS, sequence, snapshot, crossed-book, and stale checks remain mandatory | Current-contract adaptation |
 | Separate receive and exchange latency tracking | Raw `recv_ts_ns`, exchange timestamps, bounded-memory capture timing distributions, capture health counters, and bounded live webhook alerts | Equivalent data retained; receive delay includes host clock/scheduling and alert routing is a deployment concern |
-| `MetCoinGatewayMktOkxNitroBaseConfig` configurable `okx.nitro.md.connect.interval.ms` (default zero) | One `connection_attempt_interval_ms` pacer shared by every process-local public/private initial and reconnect attempt | Current-contract hardening: Rust defaults to 400 ms and official endpoints enforce at least 334 ms for OKX's documented three connection requests/second/IP; multiple processes need external coordination |
+| `MetCoinGatewayMktOkxNitroBaseConfig` configurable `okx.nitro.md.connect.interval.ms` (default zero) | One `connection_attempt_interval_ms` pacer shared by every process-local public/private/order-command initial and reconnect attempt | Current-contract hardening: Rust defaults to 400 ms and official endpoints enforce at least 334 ms for OKX's documented three connection requests/second/IP; multiple processes need external coordination |
+| Eight `OkxNitroOrderSessionKeeper` instances with `BY_UNDERLYING` dispatch and websocket order protocol | Eight authenticated command sessions by default, deterministic underlying routing, bounded request correlation, place `expTime`, aggregate readiness, and supervised reconnect | Equivalent command topology; Rust additionally classifies the pre-send/write ambiguity boundary and retains REST for reconciliation and cancel safety |
 | Batch subscription manager and retry limits | Bounded socket partitioning, acknowledgement timeout, exponential reconnect | Equivalent lifecycle with different batching policy |
 | `OrderDetailUpdate` `tradeId`/`fillSz`/`fillPx` and `UserTrade` `tradeId`/`fee`/`feeCcy`/`execType` | Current OKX order-channel `tradeId` plus per-fill `fillFee`/`fillFeeCcy`, optional fills channel with fee-bearing order-update precedence under either arrival order, instrument-scoped once-only journal record, and raw-statement comparison | Current-contract strengthening; the pinned Java order-session fill derivation says fee is unavailable and its separate user-trade processing is commented out |
 | `OkxNitroRestClient.getFills` 100-row pages, 200 ms pacing, descending cursor pagination, and short-page completion | Authenticated read-only `/api/v5/trade/fills` collector with the same page size/pacing/completion rule, fail-closed page bound, raw response retention, bracketed account identity, and offline cursor replay | Lifecycle mapping with a current-contract endpoint adaptation; pinned Java reads Nitro spread trades while Reap certifies regular strategy fills |

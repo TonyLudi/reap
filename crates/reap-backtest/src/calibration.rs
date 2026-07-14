@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{BacktestLatencyClass, BacktestLatencyProfile};
 
-pub const LATENCY_CALIBRATION_SCHEMA_VERSION: u32 = 3;
+pub const LATENCY_CALIBRATION_SCHEMA_VERSION: u32 = 4;
 pub const MAX_LATENCY_CALIBRATION_SOURCE_REPORTS: usize = 32;
 pub const MAX_LATENCY_CALIBRATION_RETAINED_INPUT_SAMPLES: usize = 4_000_000;
 pub const MAX_LATENCY_CALIBRATION_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
@@ -233,7 +233,7 @@ fn expected_semantics(class: BacktestLatencyClass) -> &'static str {
         | BacktestLatencyClass::HistoricalTrade
         | BacktestLatencyClass::ReferenceData => "host_receive_to_strategy_visibility",
         BacktestLatencyClass::MatchingNew | BacktestLatencyClass::MatchingCancel => {
-            "strategy_dispatch_to_rest_ack_upper_bound"
+            "strategy_dispatch_to_order_ack_upper_bound"
         }
         BacktestLatencyClass::OrderUpdate => "exchange_timestamp_to_strategy_visibility",
         BacktestLatencyClass::OrderFill => "fill_to_account_state_visibility",
@@ -324,8 +324,7 @@ mod tests {
         artifact().validate_integrity().unwrap();
 
         let mut wrong_semantics = artifact();
-        wrong_semantics.series[0].semantics =
-            "strategy_dispatch_to_rest_ack_upper_bound".to_string();
+        wrong_semantics.series[0].semantics = "wrong_latency_semantics".to_string();
         assert!(
             wrong_semantics
                 .validate_integrity()

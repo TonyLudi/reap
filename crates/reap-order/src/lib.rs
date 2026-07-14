@@ -3,12 +3,14 @@ mod gateway;
 mod pacing;
 mod private;
 mod reconcile;
+mod transport;
 
 pub use client_id::*;
 pub use gateway::*;
 pub use pacing::*;
 pub use private::*;
 pub use reconcile::*;
+pub use transport::*;
 
 use std::collections::{HashMap, HashSet};
 

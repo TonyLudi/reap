@@ -276,6 +276,7 @@ fn validate_run_shape(
                 || !snapshot.missing_account_snapshots.is_empty()
                 || !snapshot.missing_books.is_empty()
                 || !snapshot.missing_private_streams.is_empty()
+                || !snapshot.missing_order_transports.is_empty()
                 || !snapshot.missing_stablecoin_rates.is_empty()
                 || !snapshot.faults.is_empty())
         {
@@ -375,6 +376,7 @@ fn validate_run_shape(
         != report
             .public_connection_disconnect_events
             .saturating_add(report.private_connection_disconnect_events)
+            .saturating_add(report.order_transport_disconnect_events)
     {
         failures.push(LiveRunVerificationFailure::DisconnectCounterMismatch);
     }
@@ -407,6 +409,8 @@ fn has_runtime_evidence(report: &LiveRunReport) -> bool {
         || report.connection_disconnect_events != 0
         || report.public_connection_disconnect_events != 0
         || report.private_connection_disconnect_events != 0
+        || report.order_transport_disconnect_events != 0
+        || report.order_transport_stale_events != 0
         || report.ambiguous_submit_events != 0
         || report.ambiguous_cancel_events != 0
         || report.partial_fill_events != 0

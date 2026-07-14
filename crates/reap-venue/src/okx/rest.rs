@@ -1246,37 +1246,7 @@ where
         expiry_ms: Option<u64>,
         order: &OkxPlaceOrder,
     ) -> Result<SignedRequest, RestError> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Body<'a> {
-            #[serde(rename = "instId")]
-            symbol: &'a str,
-            #[serde(rename = "tdMode")]
-            trade_mode: &'static str,
-            side: &'static str,
-            #[serde(rename = "ordType")]
-            order_type: &'static str,
-            px: String,
-            sz: String,
-            #[serde(rename = "clOrdId")]
-            client_order_id: &'a str,
-            #[serde(rename = "reduceOnly", skip_serializing_if = "Option::is_none")]
-            reduce_only: Option<bool>,
-            #[serde(rename = "stpMode", skip_serializing_if = "Option::is_none")]
-            self_trade_prevention: Option<&'static str>,
-        }
-
-        let body = serde_json::to_string(&Body {
-            symbol: &order.symbol,
-            trade_mode: order.trade_mode.as_str(),
-            side: side_string(order.side),
-            order_type: time_in_force_string(order.time_in_force),
-            px: decimal_string(order.price),
-            sz: decimal_string(order.qty),
-            client_order_id: &order.client_order_id,
-            reduce_only: order.reduce_only.then_some(true),
-            self_trade_prevention: order.self_trade_prevention.map(stp_mode_string),
-        })?;
+        let body = serialize_place_order(order)?;
         let mut request =
             self.signer
                 .sign_request(timestamp, HttpMethod::Post, PLACE_ORDER_PATH, body)?;
@@ -1293,28 +1263,7 @@ where
         timestamp: &str,
         order: &OkxCancelOrder,
     ) -> Result<SignedRequest, RestError> {
-        #[derive(Serialize)]
-        struct Body<'a> {
-            #[serde(rename = "instId")]
-            symbol: &'a str,
-            #[serde(rename = "ordId", skip_serializing_if = "Option::is_none")]
-            exchange_order_id: Option<&'a str>,
-            #[serde(rename = "clOrdId", skip_serializing_if = "Option::is_none")]
-            client_order_id: Option<&'a str>,
-        }
-
-        if order.exchange_order_id.is_none() && order.client_order_id.is_none() {
-            return Err(RestError::InvalidField {
-                field: "ordId/clOrdId",
-                value: String::new(),
-                message: "one identifier is required".to_string(),
-            });
-        }
-        let body = serde_json::to_string(&Body {
-            symbol: &order.symbol,
-            exchange_order_id: order.exchange_order_id.as_deref(),
-            client_order_id: order.client_order_id.as_deref(),
-        })?;
+        let body = serialize_cancel_order(order)?;
         Ok(self
             .signer
             .sign_request(timestamp, HttpMethod::Post, CANCEL_ORDER_PATH, body)?)
@@ -1460,6 +1409,65 @@ fn query_path<'a>(
 
 fn decimal_string(value: f64) -> String {
     value.to_string()
+}
+
+pub(super) fn serialize_place_order(order: &OkxPlaceOrder) -> Result<String, RestError> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Body<'a> {
+        #[serde(rename = "instId")]
+        symbol: &'a str,
+        #[serde(rename = "tdMode")]
+        trade_mode: &'static str,
+        side: &'static str,
+        #[serde(rename = "ordType")]
+        order_type: &'static str,
+        px: String,
+        sz: String,
+        #[serde(rename = "clOrdId")]
+        client_order_id: &'a str,
+        #[serde(rename = "reduceOnly", skip_serializing_if = "Option::is_none")]
+        reduce_only: Option<bool>,
+        #[serde(rename = "stpMode", skip_serializing_if = "Option::is_none")]
+        self_trade_prevention: Option<&'static str>,
+    }
+
+    Ok(serde_json::to_string(&Body {
+        symbol: &order.symbol,
+        trade_mode: order.trade_mode.as_str(),
+        side: side_string(order.side),
+        order_type: time_in_force_string(order.time_in_force),
+        px: decimal_string(order.price),
+        sz: decimal_string(order.qty),
+        client_order_id: &order.client_order_id,
+        reduce_only: order.reduce_only.then_some(true),
+        self_trade_prevention: order.self_trade_prevention.map(stp_mode_string),
+    })?)
+}
+
+pub(super) fn serialize_cancel_order(order: &OkxCancelOrder) -> Result<String, RestError> {
+    #[derive(Serialize)]
+    struct Body<'a> {
+        #[serde(rename = "instId")]
+        symbol: &'a str,
+        #[serde(rename = "ordId", skip_serializing_if = "Option::is_none")]
+        exchange_order_id: Option<&'a str>,
+        #[serde(rename = "clOrdId", skip_serializing_if = "Option::is_none")]
+        client_order_id: Option<&'a str>,
+    }
+
+    if order.exchange_order_id.is_none() && order.client_order_id.is_none() {
+        return Err(RestError::InvalidField {
+            field: "ordId/clOrdId",
+            value: String::new(),
+            message: "one identifier is required".to_string(),
+        });
+    }
+    Ok(serde_json::to_string(&Body {
+        symbol: &order.symbol,
+        exchange_order_id: order.exchange_order_id.as_deref(),
+        client_order_id: order.client_order_id.as_deref(),
+    })?)
 }
 
 fn side_string(side: Side) -> &'static str {

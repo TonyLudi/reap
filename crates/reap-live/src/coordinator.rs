@@ -138,7 +138,7 @@ impl LiveCoordinator {
         for instrument in verified.instruments.values() {
             risk.set_instrument_model(instrument.symbol.clone(), instrument.risk_model);
         }
-        let mut startup = StartupGate::new(&config);
+        let mut startup = StartupGate::new_with_order_transport(&config, gateway_actions_enabled);
         startup.mark_metadata_verified();
         let mut private_states = HashMap::new();
         let mut client_ids = HashMap::new();
@@ -637,7 +637,8 @@ impl LiveCoordinator {
                 client_order_id,
                 exchange_order_id,
                 status,
-                message: "REST acknowledgement received; awaiting private stream".to_string(),
+                message: "exchange order acknowledgement received; awaiting private stream"
+                    .to_string(),
             })],
         })
     }
@@ -833,6 +834,24 @@ impl LiveCoordinator {
             }
             _ => None,
         };
+        let order_transport_stale = match &event {
+            NormalizedEvent::System(system)
+                if system.kind == SystemEventKind::OrderTransportStale
+                    && system
+                        .account_id
+                        .as_deref()
+                        .is_some_and(|account_id| self.private_states.contains_key(account_id)) =>
+            {
+                Some((
+                    system
+                        .account_id
+                        .clone()
+                        .expect("checked order transport event must have an account id"),
+                    system.reason.clone(),
+                ))
+            }
+            _ => None,
+        };
         if let NormalizedEvent::System(system) = &event {
             self.apply_system_to_startup(system);
         }
@@ -860,7 +879,25 @@ impl LiveCoordinator {
         };
         self.handle_engine_output(now_ms, engine_output, &mut output);
         if let Some((account_id, reason)) = account_halt {
-            self.ensure_account_cancels(now_ms, &account_id, &reason, &mut output);
+            self.ensure_account_cancels(
+                now_ms,
+                &account_id,
+                &format!("account {account_id} halted: {reason}"),
+                &mut output,
+            );
+        }
+        if let Some((account_id, reason)) = order_transport_stale {
+            self.ensure_account_cancels(
+                now_ms,
+                &account_id,
+                &format!("order transport stale for account {account_id}: {reason}"),
+                &mut output,
+            );
+            output.actions.push(LiveAction::Reconcile(ReconcileAction {
+                ts_ms: now_ms,
+                account_id,
+                reason: format!("order transport disconnected: {reason}"),
+            }));
         }
         output
     }
@@ -1062,7 +1099,7 @@ impl LiveCoordinator {
         &mut self,
         now_ms: TimeMs,
         account_id: &str,
-        halt_reason: &str,
+        cancel_reason: &str,
         output: &mut CoordinatorOutput,
     ) {
         let existing = output
@@ -1095,7 +1132,7 @@ impl LiveCoordinator {
         for order_id in active_orders {
             let intent = OrderIntent::CancelOrder {
                 order_id,
-                reason: format!("account {account_id} halted: {halt_reason}"),
+                reason: cancel_reason.to_string(),
             };
             output.records.push(StorageRecord::Intent {
                 ts_ms: now_ms,
@@ -1178,6 +1215,23 @@ impl LiveCoordinator {
                     let _ = self
                         .startup
                         .mark_private_stream(account_id, false, &event.reason);
+                }
+            }
+            SystemEventKind::OrderTransportHeartbeat | SystemEventKind::OrderTransportRecovered => {
+                if let Some(account_id) = event.account_id.as_deref() {
+                    let _ = self
+                        .startup
+                        .mark_order_transport(account_id, true, &event.reason);
+                }
+            }
+            SystemEventKind::OrderTransportStale => {
+                if let Some(account_id) = event.account_id.as_deref() {
+                    let _ = self
+                        .startup
+                        .mark_order_transport(account_id, false, &event.reason);
+                    let _ = self
+                        .startup
+                        .mark_reconciled(account_id, false, &event.reason);
                 }
             }
             SystemEventKind::ReconcileDrift => {
@@ -1489,6 +1543,14 @@ mod tests {
             symbol: None,
             reason: "connected".to_string(),
         }));
+        coordinator.process_event(NormalizedEvent::System(SystemEvent {
+            ts_ms: 2,
+            kind: SystemEventKind::OrderTransportRecovered,
+            venue: Some(Venue::Okx),
+            account_id: Some("main".to_string()),
+            symbol: None,
+            reason: "all sessions authenticated".to_string(),
+        }));
     }
 
     fn ready(coordinator: &mut LiveCoordinator) {
@@ -1536,6 +1598,14 @@ mod tests {
                 account_id: Some(account_id.to_string()),
                 symbol: None,
                 reason: "connected".to_string(),
+            }));
+            coordinator.process_event(NormalizedEvent::System(SystemEvent {
+                ts_ms: 2,
+                kind: SystemEventKind::OrderTransportRecovered,
+                venue: Some(Venue::Okx),
+                account_id: Some(account_id.to_string()),
+                symbol: None,
+                reason: "all sessions authenticated".to_string(),
             }));
         }
         assert!(coordinator.readiness().is_ready());
@@ -1622,6 +1692,14 @@ mod tests {
             account_id: Some("main".to_string()),
             symbol: None,
             reason: "connected".to_string(),
+        }));
+        coordinator.process_event(NormalizedEvent::System(SystemEvent {
+            ts_ms: 2,
+            kind: SystemEventKind::OrderTransportRecovered,
+            venue: Some(Venue::Okx),
+            account_id: Some("main".to_string()),
+            symbol: None,
+            reason: "all sessions authenticated".to_string(),
         }));
 
         assert!(!coordinator.readiness().is_ready());
@@ -1802,6 +1880,41 @@ mod tests {
             })
             .unwrap();
         assert!(coordinator.readiness().is_ready());
+    }
+
+    #[test]
+    fn order_transport_loss_blocks_entry_cancels_and_requires_reconciliation() {
+        let mut coordinator = coordinator();
+        ready(&mut coordinator);
+        coordinator
+            .register_local_order("main", "client-1", order(), 3)
+            .unwrap();
+
+        let output = coordinator.process_event(NormalizedEvent::System(SystemEvent {
+            ts_ms: 4,
+            kind: SystemEventKind::OrderTransportStale,
+            venue: Some(Venue::Okx),
+            account_id: Some("main".to_string()),
+            symbol: None,
+            reason: "session 3 disconnected".to_string(),
+        }));
+
+        let readiness = coordinator.readiness();
+        assert_eq!(readiness.phase, crate::LivePhase::Degraded);
+        assert_eq!(readiness.missing_order_transports, vec!["main"]);
+        assert_eq!(readiness.missing_reconciliation, vec!["main"]);
+        assert!(output.actions.iter().any(|action| matches!(
+            action,
+            LiveAction::Cancel(cancel) if cancel.client_order_id == "client-1"
+        )));
+        assert!(output.actions.iter().any(|action| matches!(
+            action,
+            LiveAction::Reconcile(reconcile) if reconcile.account_id == "main"
+        )));
+
+        let mut blocked = CoordinatorOutput::default();
+        coordinator.route_intent(5, OrderIntent::NewOrder(order()), &mut blocked);
+        assert!(blocked.actions.is_empty());
     }
 
     #[test]

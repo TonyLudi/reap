@@ -10,15 +10,17 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    ClientIdError, ClientOrderIdGenerator, IdempotencyError, IdempotencyRegistry, PacingPolicy,
-    PrivateStateReducer, ReconciliationSnapshot, RequestKind, RequestPacer, Reservation,
-    reconcile_full_state,
+    ClientIdError, ClientOrderIdGenerator, IdempotencyError, IdempotencyRegistry,
+    OkxOrderTransport, OrderTransportError, PacingPolicy, PrivateStateReducer,
+    ReconciliationSnapshot, RequestKind, RequestPacer, Reservation, reconcile_full_state,
 };
 
 #[derive(Debug, Error)]
 pub enum GatewayError {
     #[error("OKX gateway request failed: {0}")]
     Rest(#[from] RestError),
+    #[error("OKX order transport failed: {0}")]
+    OrderTransport(#[from] OrderTransportError),
     #[error("client order id configuration is invalid: {0}")]
     ClientId(#[from] ClientIdError),
     #[error("idempotency check failed: {0}")]
@@ -32,6 +34,7 @@ pub enum GatewayError {
 impl GatewayError {
     pub fn is_ambiguous(&self) -> bool {
         matches!(self, Self::Rest(RestError::Transport(_)))
+            || matches!(self, Self::OrderTransport(error) if error.is_ambiguous())
     }
 
     pub fn is_order_not_found(&self) -> bool {
@@ -87,6 +90,7 @@ pub struct CancelOutcome {
 
 pub struct OkxOrderGateway<T> {
     client: OkxRestClient<T>,
+    order_transport: Option<Box<dyn OkxOrderTransport>>,
     ids: ClientOrderIdGenerator,
     idempotency: IdempotencyRegistry,
     pacer: RequestPacer,
@@ -107,12 +111,17 @@ where
     ) -> Result<Self, GatewayError> {
         Ok(Self {
             client,
+            order_transport: None,
             ids: ClientOrderIdGenerator::new(id_prefix, node_id)?,
             idempotency: IdempotencyRegistry::default(),
             pacer: RequestPacer::new(pacing),
             trade_modes,
             local_orders: HashMap::new(),
         })
+    }
+
+    pub fn set_order_transport(&mut self, transport: Box<dyn OkxOrderTransport>) {
+        self.order_transport = Some(transport);
     }
 
     pub fn register_local_order(
@@ -252,28 +261,36 @@ where
         } = prepared;
         self.pacer.pace(RequestKind::Submit, "account").await;
         self.pacer.pace(RequestKind::Submit, &order.symbol).await;
-        let result = self
-            .client
-            .place_order(&OkxPlaceOrder {
-                symbol: order.symbol,
-                trade_mode,
-                side: order.side,
-                time_in_force: order.time_in_force,
-                price: order.price,
-                qty: order.qty,
-                client_order_id: client_order_id.clone(),
-                reduce_only: order.reduce_only,
-                self_trade_prevention: order.self_trade_prevention,
-            })
-            .await;
+        let request = OkxPlaceOrder {
+            symbol: order.symbol,
+            trade_mode,
+            side: order.side,
+            time_in_force: order.time_in_force,
+            price: order.price,
+            qty: order.qty,
+            client_order_id: client_order_id.clone(),
+            reduce_only: order.reduce_only,
+            self_trade_prevention: order.self_trade_prevention,
+        };
+        let result = match self.order_transport.as_mut() {
+            Some(transport) => transport
+                .place_order(&request)
+                .await
+                .map_err(GatewayError::from),
+            None => self
+                .client
+                .place_order(&request)
+                .await
+                .map_err(GatewayError::from),
+        };
         let ack = match result {
             Ok(ack) => ack,
             Err(error) => {
-                if !matches!(error, RestError::Transport(_)) {
+                if !error.is_ambiguous() {
                     self.idempotency.release_pending(&idempotency_key)?;
                     self.local_orders.remove(&client_order_id);
                 }
-                return Err(error.into());
+                return Err(error);
             }
         };
         self.idempotency
@@ -301,14 +318,19 @@ where
         client_order_id: Option<String>,
     ) -> Result<CancelOutcome, GatewayError> {
         self.pacer.pace(RequestKind::Cancel, symbol).await;
-        let ack = self
-            .client
-            .cancel_order(&OkxCancelOrder {
-                symbol: symbol.to_string(),
-                exchange_order_id,
-                client_order_id,
-            })
-            .await?;
+        let request = OkxCancelOrder {
+            symbol: symbol.to_string(),
+            exchange_order_id,
+            client_order_id,
+        };
+        let ack = match self.order_transport.as_mut() {
+            Some(transport) => match transport.cancel_order(&request).await {
+                Ok(ack) => ack,
+                Err(error) if error.is_unavailable() => self.client.cancel_order(&request).await?,
+                Err(error) => return Err(error.into()),
+            },
+            None => self.client.cancel_order(&request).await?,
+        };
         Ok(CancelOutcome {
             client_order_id: ack.client_order_id,
             exchange_order_id: ack.exchange_order_id,
@@ -417,6 +439,39 @@ mod tests {
         calls: Arc<Mutex<usize>>,
     }
 
+    struct MockOrderTransport {
+        responses: Arc<Mutex<VecDeque<Result<reap_venue::okx::OkxOrderAck, OrderTransportError>>>>,
+        calls: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl OkxOrderTransport for MockOrderTransport {
+        async fn place_order(
+            &mut self,
+            _order: &OkxPlaceOrder,
+        ) -> Result<reap_venue::okx::OkxOrderAck, OrderTransportError> {
+            self.next()
+        }
+
+        async fn cancel_order(
+            &mut self,
+            _order: &OkxCancelOrder,
+        ) -> Result<reap_venue::okx::OkxOrderAck, OrderTransportError> {
+            self.next()
+        }
+    }
+
+    impl MockOrderTransport {
+        fn next(&self) -> Result<reap_venue::okx::OkxOrderAck, OrderTransportError> {
+            *self.calls.lock().unwrap() += 1;
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("mock order response")
+        }
+    }
+
     #[async_trait]
     impl HttpTransport for MockTransport {
         async fn execute(&self, _request: SignedRequest) -> Result<HttpResponse, RestError> {
@@ -488,6 +543,18 @@ mod tests {
         )
         .unwrap();
         (gateway, calls)
+    }
+
+    fn install_order_transport(
+        gateway: &mut OkxOrderGateway<MockTransport>,
+        responses: Vec<Result<reap_venue::okx::OkxOrderAck, OrderTransportError>>,
+    ) -> Arc<Mutex<usize>> {
+        let calls = Arc::new(Mutex::new(0));
+        gateway.set_order_transport(Box::new(MockOrderTransport {
+            responses: Arc::new(Mutex::new(responses.into())),
+            calls: Arc::clone(&calls),
+        }));
+        calls
     }
 
     #[tokio::test]
@@ -635,5 +702,97 @@ mod tests {
             SubmitOutcome::Submitted { .. }
         ));
         assert_eq!(*calls.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn websocket_ambiguity_retains_pending_identity_without_rest_fallback() {
+        let (mut gateway, rest_calls) = gateway(Vec::new());
+        let order_calls = install_order_transport(
+            &mut gateway,
+            vec![Err(OrderTransportError::Ambiguous(
+                "disconnect after write".to_string(),
+            ))],
+        );
+
+        let error = gateway.submit("decision-1", order()).await.unwrap_err();
+        assert!(error.is_ambiguous());
+        assert!(matches!(
+            gateway.submit("decision-1", order()).await.unwrap(),
+            SubmitOutcome::PendingReconciliation { .. }
+        ));
+        assert_eq!(*order_calls.lock().unwrap(), 1);
+        assert_eq!(*rest_calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn websocket_rejection_releases_identity_for_a_later_decision_retry() {
+        let (mut gateway, rest_calls) = gateway(Vec::new());
+        let order_calls = install_order_transport(
+            &mut gateway,
+            vec![
+                Err(OrderTransportError::Rejected {
+                    code: "51000".to_string(),
+                    message: "bad parameter".to_string(),
+                }),
+                Ok(reap_venue::okx::OkxOrderAck {
+                    exchange_order_id: "42".to_string(),
+                    client_order_id: "ignored".to_string(),
+                }),
+            ],
+        );
+
+        assert!(gateway.submit("decision-1", order()).await.is_err());
+        assert!(matches!(
+            gateway.submit("decision-1", order()).await.unwrap(),
+            SubmitOutcome::Submitted { ref exchange_order_id, .. } if exchange_order_id == "42"
+        ));
+        assert_eq!(*order_calls.lock().unwrap(), 2);
+        assert_eq!(*rest_calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_falls_back_to_rest_only_when_websocket_is_unavailable_before_send() {
+        let response = HttpResponse {
+            status: 200,
+            body: r#"{"code":"0","msg":"","data":[{"ordId":"42","clOrdId":"reap1","sCode":"0","sMsg":""}]}"#.to_string(),
+        };
+        let (mut gateway, rest_calls) = gateway(vec![Ok(response)]);
+        let order_calls = install_order_transport(
+            &mut gateway,
+            vec![Err(OrderTransportError::Unavailable(
+                "session disconnected".to_string(),
+            ))],
+        );
+
+        let outcome = gateway
+            .cancel("BTC-USDT", None, Some("reap1".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(outcome.exchange_order_id, "42");
+        assert_eq!(*order_calls.lock().unwrap(), 1);
+        assert_eq!(*rest_calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_websocket_cancel_does_not_retry_over_rest() {
+        let response = HttpResponse {
+            status: 200,
+            body: r#"{"code":"0","msg":"","data":[{"ordId":"42","clOrdId":"reap1","sCode":"0","sMsg":""}]}"#.to_string(),
+        };
+        let (mut gateway, rest_calls) = gateway(vec![Ok(response)]);
+        let order_calls = install_order_transport(
+            &mut gateway,
+            vec![Err(OrderTransportError::Ambiguous(
+                "disconnect after write".to_string(),
+            ))],
+        );
+
+        let error = gateway
+            .cancel("BTC-USDT", None, Some("reap1".to_string()))
+            .await
+            .unwrap_err();
+        assert!(error.is_ambiguous());
+        assert_eq!(*order_calls.lock().unwrap(), 1);
+        assert_eq!(*rest_calls.lock().unwrap(), 0);
     }
 }

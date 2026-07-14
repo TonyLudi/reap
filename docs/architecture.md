@@ -212,8 +212,10 @@ Responsibilities:
 - Idempotent new/cancel/replace handling.
 - Per-venue/account order gateway.
 - Rate limiting and request pacing.
+- A command-transport boundary that keeps canonical identity independent from
+  REST or authenticated websocket IO.
 - Canonical order state reducer.
-- Typed one-to-one exchange/client order-ID binding from REST acknowledgements,
+- Typed one-to-one exchange/client order-ID binding from exchange acknowledgements,
   with contradictory journal history rejected and active bindings restored
   before startup REST reduction; private order/fill symbol ownership and
   immutable symbol/side checks occur before canonical state mutation.
@@ -400,6 +402,10 @@ matching account/position modes, an authoritative account snapshot already
 applied to the strategy and risk engine, a writable critical log, clean
 checkpoint/REST reconciliation, every sequenced book, every configured healthy
 stablecoin reference, and all configured private channels for every account.
+Tradable demo startup additionally requires every configured authenticated
+order-command websocket session for every account. The default pool has eight
+sessions, matching the pinned Java topology, and deterministically routes spot,
+swap, and dated-future symbols with the same underlying to one session.
 Orders, account, and positions transports are required, and account plus
 positions must each deliver a real data payload before private recovery. A
 completed pair of fresh state-channel payloads, rather than a socket pong or an
@@ -407,6 +413,23 @@ event-only order/fill message, refreshes account-scoped private health. The
 dedicated fills channel is opt-in because OKX restricts it by fee tier; fills
 from the orders channel remain canonical. Any lost invariant blocks new orders
 while demo-mode cancels remain available.
+
+The websocket command tasks correlate bounded request IDs, attach exchange
+`expTime` to place requests, and classify failures at the write boundary.
+Unavailable before send is explicit; a write followed by timeout, disconnect,
+or malformed correlation remains pending for private/REST reconciliation. A
+command-session loss invalidates both transport and reconciliation readiness,
+emits canonical account cancels, and requests full reconciliation. REST remains
+independent for snapshots, reconciliation, Cancel All After, pre-send cancel
+fallback, and emergency cancellation.
+
+The current account order worker still executes one command or REST
+reconciliation operation at a time. This preserves deterministic ownership for
+the first websocket milestone, but it also creates head-of-line blocking and
+does not yet exploit the pool's per-underlying concurrency. The production HFT
+shape must move REST reconciliation onto an independent account task and permit
+bounded concurrent command futures while returning every completion through the
+single-writer coordinator.
 
 Private fill fees use one normalized contract: the amount is the signed balance
 delta, so a charge is negative and a rebate is positive, and the currency names

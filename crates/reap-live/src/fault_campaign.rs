@@ -11,8 +11,8 @@ use crate::{
     MAX_LIVE_RUN_REPORT_BYTES, verify_live_run_paths,
 };
 
-pub const LIVE_FAULT_MATRIX_MANIFEST_SCHEMA_VERSION: u32 = 1;
-pub const LIVE_FAULT_MATRIX_REPORT_FORMAT_VERSION: u32 = 1;
+pub const LIVE_FAULT_MATRIX_MANIFEST_SCHEMA_VERSION: u32 = 2;
+pub const LIVE_FAULT_MATRIX_REPORT_FORMAT_VERSION: u32 = 2;
 pub const MAX_LIVE_FAULT_MATRIX_MANIFEST_BYTES: u64 = 1024 * 1024;
 pub const MAX_LIVE_FAULT_INJECTOR_EVIDENCE_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_LIVE_FAULT_MATRIX_RUNS: usize = 32;
@@ -24,6 +24,7 @@ pub enum LiveFaultScenario {
     CleanDemo,
     PublicReconnect,
     PrivateReconnect,
+    OrderTransportReconnect,
     AmbiguousSubmit,
     AmbiguousCancel,
     PartialFill,
@@ -36,11 +37,12 @@ pub enum LiveFaultScenario {
 }
 
 impl LiveFaultScenario {
-    pub const REQUIRED: [Self; 13] = [
+    pub const REQUIRED: [Self; 14] = [
         Self::CleanObserve,
         Self::CleanDemo,
         Self::PublicReconnect,
         Self::PrivateReconnect,
+        Self::OrderTransportReconnect,
         Self::AmbiguousSubmit,
         Self::AmbiguousCancel,
         Self::PartialFill,
@@ -115,6 +117,8 @@ pub enum LiveFaultScenarioFailure {
     SafeRuntimeFailureShutdownRequired,
     PublicDisconnectMissing,
     PrivateDisconnectMissing,
+    OrderTransportDisconnectMissing,
+    OrderTransportStaleMissing,
     ReadinessLossMissing,
     AmbiguousSubmitMissing,
     AmbiguousCancelMissing,
@@ -170,6 +174,8 @@ pub struct LiveFaultObservedEvidence {
     pub reconciliation_drift_events: u64,
     pub public_connection_disconnect_events: u64,
     pub private_connection_disconnect_events: u64,
+    pub order_transport_disconnect_events: u64,
+    pub order_transport_stale_events: u64,
     pub ambiguous_submit_events: u64,
     pub ambiguous_cancel_events: u64,
     pub partial_fill_events: u64,
@@ -541,6 +547,19 @@ fn evaluate_scenario(
                 failures.push(LiveFaultScenarioFailure::ReadinessLossMissing);
             }
         }
+        LiveFaultScenario::OrderTransportReconnect => {
+            require_demo(report, &mut failures);
+            require_clean(acceptance_passed, &mut failures);
+            if report.order_transport_disconnect_events == 0 {
+                failures.push(LiveFaultScenarioFailure::OrderTransportDisconnectMissing);
+            }
+            if report.order_transport_stale_events == 0 {
+                failures.push(LiveFaultScenarioFailure::OrderTransportStaleMissing);
+            }
+            if report.readiness_loss_count == 0 {
+                failures.push(LiveFaultScenarioFailure::ReadinessLossMissing);
+            }
+        }
         LiveFaultScenario::AmbiguousSubmit => {
             require_demo(report, &mut failures);
             require_safe_bounded_shutdown(report, &mut failures);
@@ -700,6 +719,8 @@ fn observed_evidence(report: &LiveRunReport) -> LiveFaultObservedEvidence {
         reconciliation_drift_events: report.reconciliation_drift_events,
         public_connection_disconnect_events: report.public_connection_disconnect_events,
         private_connection_disconnect_events: report.private_connection_disconnect_events,
+        order_transport_disconnect_events: report.order_transport_disconnect_events,
+        order_transport_stale_events: report.order_transport_stale_events,
         ambiguous_submit_events: report.ambiguous_submit_events,
         ambiguous_cancel_events: report.ambiguous_cancel_events,
         partial_fill_events: report.partial_fill_events,
@@ -792,17 +813,19 @@ fn fault_failure_rank(failure: &LiveFaultScenarioFailure) -> u8 {
         LiveFaultScenarioFailure::SafeRuntimeFailureShutdownRequired => 7,
         LiveFaultScenarioFailure::PublicDisconnectMissing => 8,
         LiveFaultScenarioFailure::PrivateDisconnectMissing => 9,
-        LiveFaultScenarioFailure::ReadinessLossMissing => 10,
-        LiveFaultScenarioFailure::AmbiguousSubmitMissing => 11,
-        LiveFaultScenarioFailure::AmbiguousCancelMissing => 12,
-        LiveFaultScenarioFailure::PartialFillMissing => 13,
-        LiveFaultScenarioFailure::FillConvergenceTimeoutMissing => 14,
-        LiveFaultScenarioFailure::OrderConvergenceTimeoutMissing => 15,
-        LiveFaultScenarioFailure::ReconciliationDriftResponseMissing => 16,
-        LiveFaultScenarioFailure::RestoredSafetyLatchMissing => 17,
-        LiveFaultScenarioFailure::DeadmanHeartbeatFailureMissing => 18,
-        LiveFaultScenarioFailure::ExchangeClockFailureMissing => 19,
-        LiveFaultScenarioFailure::AccountConfigFailureMissing => 20,
+        LiveFaultScenarioFailure::OrderTransportDisconnectMissing => 10,
+        LiveFaultScenarioFailure::OrderTransportStaleMissing => 11,
+        LiveFaultScenarioFailure::ReadinessLossMissing => 12,
+        LiveFaultScenarioFailure::AmbiguousSubmitMissing => 13,
+        LiveFaultScenarioFailure::AmbiguousCancelMissing => 14,
+        LiveFaultScenarioFailure::PartialFillMissing => 15,
+        LiveFaultScenarioFailure::FillConvergenceTimeoutMissing => 16,
+        LiveFaultScenarioFailure::OrderConvergenceTimeoutMissing => 17,
+        LiveFaultScenarioFailure::ReconciliationDriftResponseMissing => 18,
+        LiveFaultScenarioFailure::RestoredSafetyLatchMissing => 19,
+        LiveFaultScenarioFailure::DeadmanHeartbeatFailureMissing => 20,
+        LiveFaultScenarioFailure::ExchangeClockFailureMissing => 21,
+        LiveFaultScenarioFailure::AccountConfigFailureMissing => 22,
     }
 }
 
@@ -851,6 +874,7 @@ mod tests {
             missing_account_snapshots: Vec::new(),
             missing_books: Vec::new(),
             missing_private_streams: Vec::new(),
+            missing_order_transports: Vec::new(),
             missing_stablecoin_rates: Vec::new(),
             faults: BTreeMap::new(),
         }
@@ -952,6 +976,8 @@ mod tests {
             connection_disconnect_events: 0,
             public_connection_disconnect_events: 0,
             private_connection_disconnect_events: 0,
+            order_transport_disconnect_events: 0,
+            order_transport_stale_events: 0,
             ambiguous_submit_events: 0,
             ambiguous_cancel_events: 0,
             partial_fill_events: 0,
@@ -991,6 +1017,12 @@ mod tests {
                 report.readiness_loss_count = 1;
                 report.max_readiness_outage_ms = 250;
             }
+            LiveFaultScenario::OrderTransportReconnect => {
+                report.order_transport_disconnect_events = 1;
+                report.order_transport_stale_events = 1;
+                report.readiness_loss_count = 1;
+                report.max_readiness_outage_ms = 250;
+            }
             LiveFaultScenario::AmbiguousSubmit => {
                 report.ambiguous_submit_events = 1;
                 report.reconciliation_drift_events = 1;
@@ -1024,7 +1056,8 @@ mod tests {
         }
         report.connection_disconnect_events = report
             .public_connection_disconnect_events
-            .saturating_add(report.private_connection_disconnect_events);
+            .saturating_add(report.private_connection_disconnect_events)
+            .saturating_add(report.order_transport_disconnect_events);
         report.clean_soak = report.stop_reason == LiveStopReason::DurationElapsed
             && report.reached_ready
             && report.readiness_at_stop.is_ready()

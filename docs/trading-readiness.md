@@ -217,19 +217,19 @@ production trading process.
     reproducible and reported by class/symbol. Baseline/stress profiles require
     the same seed and stochastic dominance.
 35. Versioned live reports now collect bounded per-class/per-symbol target-host
-    visibility, REST-acknowledgement, private-update, and fill-to-account-state
+    visibility, websocket-order-acknowledgement, private-update, and fill-to-account-state
     samples, binding the Rust executable plus pseudonymous host and exchange
     account identities. A deterministic CLI rejects mismatched
     config/code/host/account/session/clock or failed-operation evidence, emits a
     profile only after every required series passes, and binds the exact
     artifact/profile into schema-3 production research. Matching new/cancel
-    measurements are explicitly retained as conservative REST-ack upper bounds.
+    measurements are explicitly retained as conservative order-ack upper bounds.
     No representative credentialed report or passing calibration artifact has
     yet been certified.
 36. The live CLI reserves its create-new evidence path before config,
     credentials, or network activity. Runtime and teardown failures complete
-    fail-closed cleanup, persist a schema-7 report with a stable failure code,
-    readiness, split public/private disconnect evidence, and post-cleanup order
+    fail-closed cleanup, persist a schema-8 report with a stable failure code,
+    readiness, split public/private/order-transport disconnect evidence, and post-cleanup order
     state, then preserve the original nonzero exit. Reports separately classify
     ambiguous submit/cancel outcomes, partial fills, order/fill convergence
     timeouts, restored latches, and periodic safety-task failures. Critical
@@ -266,9 +266,9 @@ production trading process.
     supplied config/report, rejects legacy or unknown report fields, checks the
     pinned Java/build/mode/host/account/session boundaries, validates readiness,
     failure, disconnect, and latency evidence, and independently re-derives
-    `clean_soak`. Latency calibration schema 3 also requires the exact source
+    `clean_soak`. Latency calibration schema 4 also requires the exact source
     bytes and independently verified source reports.
-40. `verify-live-fault-matrix` now requires one isolated schema-7 run for every
+40. `verify-live-fault-matrix` now requires one isolated schema-8 run for every
     documented live role, hashes a distinct injector record for each fault,
     rejects session/artifact reuse, and binds all runs to one exact config,
     executable, host, and account identity. Reconnect roles must recover cleanly;
@@ -329,7 +329,8 @@ production trading process.
    --require-clean-soak` so the result is machine-verifiable. Confirm both
    stablecoin references remain fresh and inject a transient guard failure
    without creating a durable latch.
-3. Run minimal-size `demo` orders, then inject socket disconnect, process kill,
+3. Run minimal-size `demo` orders, then inject public, private, and order-command
+   socket disconnects, process kill,
    deadman expiry, exchange-clock skew, IOC miss, partial fill, and REST
    timeout/rate-limit conditions. Suppress submit and cancel order pushes to
    exercise order-state convergence, then suppress derivative position updates
@@ -366,8 +367,12 @@ Production enablement additionally requires:
   slippage assumptions, including empirical per-message/per-instrument delay
   distributions and empirical validation of the displayed-depth fill threshold.
   Latency requires a passed source-bound calibration artifact; the implemented
-  REST-ack matching measurements must remain labeled and approved as upper
+  websocket-order-ack matching measurements must remain labeled and approved as upper
   bounds unless a closer exchange boundary is added.
+- Remove the current account-worker head-of-line limit before calling the path
+  HFT-ready: REST reconciliation must not share the serial command worker, and
+  bounded concurrent commands must actually use the underlying-routed session
+  pool while preserving account-wide pacing and canonical completion ordering.
 - A passing target-account `certify-account` artifact, independently rechecked
   with `verify-account-certification --require-pass`, immediately before
   approval. This is point-in-time evidence and must be combined with economic

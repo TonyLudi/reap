@@ -37,6 +37,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::convergence::{FillConvergenceGuard, OrderStateConvergenceGuard};
+use crate::order_ws::{
+    OkxOrderWsConfig, OkxOrderWsRuntime, OkxOrderWsStatus, OkxOrderWsStatusKind, spawn_okx_order_ws,
+};
 use crate::provenance::{
     current_executable_sha256 as hash_current_executable,
     host_identity_sha256 as hash_host_identity, okx_account_identity_sha256,
@@ -52,7 +55,7 @@ use crate::{
 };
 
 type LiveGateway = OkxOrderGateway<ReqwestTransport>;
-pub const LIVE_RUN_REPORT_SCHEMA_VERSION: u32 = 7;
+pub const LIVE_RUN_REPORT_SCHEMA_VERSION: u32 = 8;
 pub const MAX_LIVE_FAILURE_CODE_BYTES: usize = 64;
 pub const MAX_LIVE_FAILURE_MESSAGE_BYTES: usize = 4_096;
 
@@ -120,6 +123,8 @@ pub struct LiveRunReport {
     pub connection_disconnect_events: u64,
     pub public_connection_disconnect_events: u64,
     pub private_connection_disconnect_events: u64,
+    pub order_transport_disconnect_events: u64,
+    pub order_transport_stale_events: u64,
     pub ambiguous_submit_events: u64,
     pub ambiguous_cancel_events: u64,
     pub partial_fill_events: u64,
@@ -300,6 +305,8 @@ struct RuntimeEvidence {
     connection_disconnect_events: u64,
     public_connection_disconnect_events: u64,
     private_connection_disconnect_events: u64,
+    order_transport_disconnect_events: u64,
+    order_transport_stale_events: u64,
     ambiguous_submit_events: u64,
     ambiguous_cancel_events: u64,
     partial_fill_events: u64,
@@ -331,6 +338,12 @@ impl RuntimeEvidence {
         }
     }
 
+    fn observe_order_transport_disconnect(&mut self) {
+        self.connection_disconnect_events = self.connection_disconnect_events.saturating_add(1);
+        self.order_transport_disconnect_events =
+            self.order_transport_disconnect_events.saturating_add(1);
+    }
+
     fn observe_record(&mut self, record: &StorageRecord) {
         match record {
             StorageRecord::System(event) => match event.kind {
@@ -343,6 +356,10 @@ impl RuntimeEvidence {
                 }
                 SystemEventKind::FeedStale | SystemEventKind::PrivateStreamStale => {
                     self.stream_stale_events = self.stream_stale_events.saturating_add(1);
+                }
+                SystemEventKind::OrderTransportStale => {
+                    self.order_transport_stale_events =
+                        self.order_transport_stale_events.saturating_add(1);
                 }
                 _ => {}
             },
@@ -568,6 +585,8 @@ async fn run_live_with_config_source(
             connection_disconnect_events: 0,
             public_connection_disconnect_events: 0,
             private_connection_disconnect_events: 0,
+            order_transport_disconnect_events: 0,
+            order_transport_stale_events: 0,
             ambiguous_submit_events: 0,
             ambiguous_cancel_events: 0,
             partial_fill_events: 0,
@@ -962,6 +981,11 @@ fn alert_for_storage_record(record: &StorageRecord) -> Option<AlertEvent> {
             "account_data",
             "private_stream_stale",
         ),
+        SystemEventKind::OrderTransportStale => (
+            AlertSeverity::Critical,
+            "order_gateway",
+            "order_transport_stale",
+        ),
         SystemEventKind::BookRecoveryFailed => (
             AlertSeverity::Critical,
             "market_data",
@@ -980,6 +1004,8 @@ fn alert_for_storage_record(record: &StorageRecord) -> Option<AlertEvent> {
         | SystemEventKind::FeedRecovered
         | SystemEventKind::PrivateStreamHeartbeat
         | SystemEventKind::PrivateStreamRecovered
+        | SystemEventKind::OrderTransportHeartbeat
+        | SystemEventKind::OrderTransportRecovered
         | SystemEventKind::KillSwitchReset
         | SystemEventKind::SymbolResumed => return None,
     };
@@ -1016,6 +1042,8 @@ struct LiveRuntime {
     feed_rx: mpsc::Receiver<RuntimeEvent>,
     order_senders: HashMap<String, mpsc::Sender<OrderTaskCommand>>,
     order_tasks: Vec<JoinHandle<()>>,
+    order_ws_runtimes: Vec<OkxOrderWsRuntime>,
+    order_ws_status_tasks: Vec<JoinHandle<()>>,
     safety_senders: HashMap<String, mpsc::Sender<SafetyTaskCommand>>,
     safety_tasks: Vec<JoinHandle<()>>,
     feeds: Vec<SupervisedFeed>,
@@ -1329,13 +1357,15 @@ impl LiveRuntime {
 
         let mut order_senders = HashMap::new();
         let mut order_tasks = Vec::new();
+        let mut order_ws_runtimes = Vec::new();
+        let mut order_ws_status_tasks = Vec::new();
         let mut safety_senders = HashMap::new();
         let mut safety_tasks = Vec::new();
         for seed in seeds {
             let AccountSeed {
                 account_id,
                 signer,
-                gateway,
+                mut gateway,
                 safety_client,
             } = seed;
             let deadman_timeout_secs =
@@ -1374,7 +1404,7 @@ impl LiveRuntime {
             let mut private_feed = spawn_supervised_feed(
                 Arc::clone(&private_adapter),
                 private_plans.clone(),
-                okx_login_bootstrap(signer),
+                okx_login_bootstrap(signer.clone()),
                 config.runtime.feed_channel_capacity,
                 connection_attempt_pacer.clone(),
                 ReconnectPolicy::default(),
@@ -1387,6 +1417,45 @@ impl LiveRuntime {
             ));
             spawn_feed_forwarders(source_id, &mut private_feed, &feed_tx, &mut feed_tasks);
             feeds.push(private_feed);
+
+            if mode == LiveMode::Demo {
+                let session_count = config.runtime.order_websocket_sessions;
+                let command_capacity = config
+                    .runtime
+                    .order_channel_capacity
+                    .div_ceil(session_count)
+                    .max(1);
+                let (transport, order_ws_runtime, mut order_ws_status) =
+                    spawn_okx_order_ws(OkxOrderWsConfig {
+                        account_id: account_id.clone(),
+                        websocket_url: config.venue.private_ws_url.clone(),
+                        signer,
+                        session_count,
+                        command_capacity,
+                        request_expiry: Duration::from_millis(
+                            config.runtime.order_request_expiry_ms,
+                        ),
+                        acknowledgement_timeout: Duration::from_millis(
+                            config.runtime.order_websocket_ack_timeout_ms,
+                        ),
+                        connection_attempt_pacer: connection_attempt_pacer.clone(),
+                        reconnect: ReconnectPolicy::default(),
+                    });
+                gateway.set_order_transport(Box::new(transport));
+                let order_status_events = control_tx.clone();
+                order_ws_status_tasks.push(tokio::spawn(async move {
+                    while let Some(status) = order_ws_status.recv().await {
+                        if order_status_events
+                            .send(RuntimeEvent::OrderTransport(status))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }));
+                order_ws_runtimes.push(order_ws_runtime);
+            }
 
             let (order_tx, order_rx) = mpsc::channel(config.runtime.order_channel_capacity);
             order_senders.insert(account_id.clone(), order_tx);
@@ -1422,6 +1491,8 @@ impl LiveRuntime {
             feed_rx,
             order_senders,
             order_tasks,
+            order_ws_runtimes,
+            order_ws_status_tasks,
             safety_senders,
             safety_tasks,
             feeds,
@@ -1630,6 +1701,8 @@ impl LiveRuntime {
             connection_disconnect_events: evidence.connection_disconnect_events,
             public_connection_disconnect_events: evidence.public_connection_disconnect_events,
             private_connection_disconnect_events: evidence.private_connection_disconnect_events,
+            order_transport_disconnect_events: evidence.order_transport_disconnect_events,
+            order_transport_stale_events: evidence.order_transport_stale_events,
             ambiguous_submit_events: evidence.ambiguous_submit_events,
             ambiguous_cancel_events: evidence.ambiguous_cancel_events,
             partial_fill_events: evidence.partial_fill_events,
@@ -2289,6 +2362,30 @@ impl LiveRuntime {
                 }
                 self.handle_feed_source_events(events).await?;
             }
+            RuntimeEvent::OrderTransport(status) => {
+                let kind = match status.kind {
+                    OkxOrderWsStatusKind::Ready => SystemEventKind::OrderTransportRecovered,
+                    OkxOrderWsStatusKind::Heartbeat => SystemEventKind::OrderTransportHeartbeat,
+                    OkxOrderWsStatusKind::Disconnected => {
+                        self.evidence.observe_order_transport_disconnect();
+                        SystemEventKind::OrderTransportStale
+                    }
+                };
+                let output = self
+                    .coordinator
+                    .process_event(NormalizedEvent::System(SystemEvent {
+                        ts_ms: status.ts_ms,
+                        kind,
+                        venue: Some(Venue::Okx),
+                        account_id: Some(status.account_id),
+                        symbol: None,
+                        reason: format!(
+                            "{} ({}/{} sessions ready)",
+                            status.reason, status.ready_sessions, status.total_sessions
+                        ),
+                    }));
+                self.commit_output(output).await?;
+            }
             RuntimeEvent::SubmitComplete {
                 account_id,
                 symbol,
@@ -2300,7 +2397,7 @@ impl LiveRuntime {
                     self.latency.observe_us(
                         BacktestLatencyClass::MatchingNew,
                         &symbol,
-                        LiveLatencySemantics::StrategyDispatchToRestAckUpperBound,
+                        LiveLatencySemantics::StrategyDispatchToOrderAckUpperBound,
                         latency_us,
                     );
                 }
@@ -2320,7 +2417,7 @@ impl LiveRuntime {
                 self.latency.observe_operation_failure(
                     BacktestLatencyClass::MatchingNew,
                     &symbol,
-                    LiveLatencySemantics::StrategyDispatchToRestAckUpperBound,
+                    LiveLatencySemantics::StrategyDispatchToOrderAckUpperBound,
                 );
                 let output = self.coordinator.on_submit_error(
                     &account_id,
@@ -2341,7 +2438,7 @@ impl LiveRuntime {
                 self.latency.observe_us(
                     BacktestLatencyClass::MatchingCancel,
                     &symbol,
-                    LiveLatencySemantics::StrategyDispatchToRestAckUpperBound,
+                    LiveLatencySemantics::StrategyDispatchToOrderAckUpperBound,
                     latency_us,
                 );
                 let output = self
@@ -2360,7 +2457,7 @@ impl LiveRuntime {
                 self.latency.observe_operation_failure(
                     BacktestLatencyClass::MatchingCancel,
                     &symbol,
-                    LiveLatencySemantics::StrategyDispatchToRestAckUpperBound,
+                    LiveLatencySemantics::StrategyDispatchToOrderAckUpperBound,
                 );
                 let output = self.coordinator.on_cancel_error(
                     &account_id,
@@ -3171,6 +3268,16 @@ impl LiveRuntime {
                 errors.push(("order task", LiveRuntimeError::Join(error)));
             }
         }
+        for runtime in self.order_ws_runtimes.drain(..) {
+            if let Err(error) = runtime.shutdown().await {
+                errors.push(("order websocket", LiveRuntimeError::Join(error)));
+            }
+        }
+        for task in self.order_ws_status_tasks.drain(..) {
+            if let Err(error) = task.await {
+                errors.push(("order websocket status", LiveRuntimeError::Join(error)));
+            }
+        }
         for task in self.safety_tasks.drain(..) {
             if let Err(error) = task.await {
                 errors.push(("safety task", LiveRuntimeError::Join(error)));
@@ -3242,6 +3349,7 @@ enum RuntimeEvent {
         source_id: usize,
         status: ConnectionStatus,
     },
+    OrderTransport(OkxOrderWsStatus),
     SubmitComplete {
         account_id: String,
         symbol: String,
@@ -4319,6 +4427,7 @@ mod tests {
             missing_account_snapshots: Vec::new(),
             missing_books: Vec::new(),
             missing_private_streams: Vec::new(),
+            missing_order_transports: Vec::new(),
             missing_stablecoin_rates: Vec::new(),
             faults: BTreeMap::new(),
         }
@@ -4444,6 +4553,14 @@ mod tests {
             account_id: Some("main".to_string()),
             symbol: None,
             reason: "test private sockets".to_string(),
+        }));
+        coordinator.process_event(NormalizedEvent::System(SystemEvent {
+            ts_ms: now_ms,
+            kind: SystemEventKind::OrderTransportRecovered,
+            venue: Some(Venue::Okx),
+            account_id: Some("main".to_string()),
+            symbol: None,
+            reason: "test order sockets".to_string(),
         }));
         assert!(coordinator.readiness().is_ready());
         coordinator
@@ -4760,6 +4877,7 @@ mod tests {
         evidence.observe_record(&system(SystemEventKind::BookRecoveryStarted));
         evidence.observe_record(&system(SystemEventKind::FeedStale));
         evidence.observe_record(&system(SystemEventKind::PrivateStreamStale));
+        evidence.observe_record(&system(SystemEventKind::OrderTransportStale));
         for operation in [OrderOperation::Submit, OrderOperation::Cancel] {
             evidence.observe_record(&StorageRecord::OrderAck(reap_storage::OrderAckRecord {
                 ts_ms: 1,
@@ -4797,13 +4915,16 @@ mod tests {
         evidence.observe_order_convergence_timeout();
         evidence.observe_disconnect(false);
         evidence.observe_disconnect(true);
+        evidence.observe_order_transport_disconnect();
 
         assert_eq!(evidence.reconciliation_drift_events, 1);
         assert_eq!(evidence.book_recovery_events, 1);
         assert_eq!(evidence.stream_stale_events, 2);
-        assert_eq!(evidence.connection_disconnect_events, 2);
+        assert_eq!(evidence.order_transport_stale_events, 1);
+        assert_eq!(evidence.connection_disconnect_events, 3);
         assert_eq!(evidence.public_connection_disconnect_events, 1);
         assert_eq!(evidence.private_connection_disconnect_events, 1);
+        assert_eq!(evidence.order_transport_disconnect_events, 1);
         assert_eq!(evidence.ambiguous_submit_events, 1);
         assert_eq!(evidence.ambiguous_cancel_events, 1);
         assert_eq!(evidence.partial_fill_events, 1);
@@ -4952,6 +5073,8 @@ mod tests {
             feed_rx,
             order_senders: HashMap::new(),
             order_tasks: Vec::new(),
+            order_ws_runtimes: Vec::new(),
+            order_ws_status_tasks: Vec::new(),
             safety_senders: HashMap::new(),
             safety_tasks: Vec::new(),
             feeds: Vec::new(),
@@ -5075,6 +5198,8 @@ mod tests {
             feed_rx,
             order_senders: HashMap::new(),
             order_tasks: Vec::new(),
+            order_ws_runtimes: Vec::new(),
+            order_ws_status_tasks: Vec::new(),
             safety_senders: HashMap::new(),
             safety_tasks: Vec::new(),
             feeds: Vec::new(),
@@ -5336,6 +5461,8 @@ mod tests {
             feed_rx,
             order_senders: HashMap::from([("main".to_string(), order_tx)]),
             order_tasks: vec![order_task],
+            order_ws_runtimes: Vec::new(),
+            order_ws_status_tasks: Vec::new(),
             safety_senders: HashMap::new(),
             safety_tasks: Vec::new(),
             feeds: Vec::new(),

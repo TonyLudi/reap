@@ -104,8 +104,9 @@ dedup_capacity_per_stream = 100000
 max_sequence_buffer = 4096
 max_subscriptions_per_socket = 100
 public_connections_per_subscription = 2
+order_websocket_sessions = 8
 # Shared by public and all private supervisors for initial and reconnecting
-# handshakes; 400 ms remains below OKX's three requests/second/IP ceiling.
+# feed/order handshakes; 400 ms remains below OKX's three requests/second/IP ceiling.
 connection_attempt_interval_ms = 400
 timer_interval_ms = 100
 readiness_timeout_ms = 30000
@@ -113,12 +114,13 @@ shutdown_timeout_ms = 15000
 rest_connect_timeout_ms = 2000
 rest_request_timeout_ms = 5000
 order_request_expiry_ms = 1000
+order_websocket_ack_timeout_ms = 5000
 safety_latch_sync_timeout_ms = 2000
 max_exchange_clock_skew_ms = 250
 exchange_clock_check_interval_ms = 30000
 cancel_all_after_timeout_secs = 30
 cancel_all_after_heartbeat_ms = 1000
-ambiguous_submit_grace_ms = 5000
+ambiguous_submit_grace_ms = 10000
 order_state_convergence_timeout_ms = 5000
 fill_state_convergence_timeout_ms = 5000
 max_fill_reconciliation_pages = 20

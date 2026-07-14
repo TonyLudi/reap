@@ -172,7 +172,7 @@ pub(crate) fn build_latency_calibration(
         }
         if key.semantics.is_matching_upper_bound() && !options.accept_matching_upper_bounds {
             series_failures.push(
-                "REST acknowledgement is only an upper bound; rerun with --accept-matching-upper-bounds after reviewing that limitation"
+                "exchange order acknowledgement is only an upper bound; rerun with --accept-matching-upper-bounds after reviewing that limitation"
                     .to_string(),
             );
         }
@@ -470,9 +470,10 @@ fn load_reports(
             != report
                 .public_connection_disconnect_events
                 .saturating_add(report.private_connection_disconnect_events)
+                .saturating_add(report.order_transport_disconnect_events)
         {
             failures.push(format!(
-                "{} has inconsistent public/private disconnect evidence",
+                "{} has inconsistent public/private/order-transport disconnect evidence",
                 canonical.display()
             ));
         }
@@ -560,11 +561,11 @@ fn expected_series(config: &LiveConfig) -> BTreeSet<SeriesKey> {
             ),
             (
                 BacktestLatencyClass::MatchingNew,
-                LiveLatencySemantics::StrategyDispatchToRestAckUpperBound,
+                LiveLatencySemantics::StrategyDispatchToOrderAckUpperBound,
             ),
             (
                 BacktestLatencyClass::MatchingCancel,
-                LiveLatencySemantics::StrategyDispatchToRestAckUpperBound,
+                LiveLatencySemantics::StrategyDispatchToOrderAckUpperBound,
             ),
             (
                 BacktestLatencyClass::OrderUpdate,
@@ -778,8 +779,8 @@ fn semantics_name(semantics: LiveLatencySemantics) -> &'static str {
         LiveLatencySemantics::ExchangeTimestampToStrategyVisibility => {
             "exchange_timestamp_to_strategy_visibility"
         }
-        LiveLatencySemantics::StrategyDispatchToRestAckUpperBound => {
-            "strategy_dispatch_to_rest_ack_upper_bound"
+        LiveLatencySemantics::StrategyDispatchToOrderAckUpperBound => {
+            "strategy_dispatch_to_order_ack_upper_bound"
         }
         LiveLatencySemantics::FillToAccountStateVisibility => "fill_to_account_state_visibility",
     }
@@ -810,6 +811,7 @@ mod tests {
             missing_account_snapshots: Vec::new(),
             missing_books: Vec::new(),
             missing_private_streams: Vec::new(),
+            missing_order_transports: Vec::new(),
             missing_stablecoin_rates: Vec::new(),
             faults: BTreeMap::new(),
         }
@@ -941,6 +943,8 @@ mod tests {
             connection_disconnect_events: 0,
             public_connection_disconnect_events: 0,
             private_connection_disconnect_events: 0,
+            order_transport_disconnect_events: 0,
+            order_transport_stale_events: 0,
             ambiguous_submit_events: 0,
             ambiguous_cancel_events: 0,
             partial_fill_events: 0,

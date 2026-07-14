@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use reap_core::{BacktestLatencyClass, Symbol};
 use serde::{Deserialize, Serialize};
 
-pub const LIVE_LATENCY_EVIDENCE_SCHEMA_VERSION: u32 = 1;
+pub const LIVE_LATENCY_EVIDENCE_SCHEMA_VERSION: u32 = 2;
 pub const LIVE_LATENCY_RESERVOIR_CAPACITY: usize = 8_192;
 pub const MAX_LIVE_LATENCY_SERIES: usize = 4_096;
 pub const MAX_LIVE_LATENCY_US: u64 = 3_600_000_000;
@@ -15,8 +15,8 @@ pub enum LiveLatencySemantics {
     HostReceiveToStrategyVisibility,
     /// Exchange event timestamp to entry into the strategy coordinator.
     ExchangeTimestampToStrategyVisibility,
-    /// Strategy dispatch through local queue, pacing, REST, and successful acknowledgement.
-    StrategyDispatchToRestAckUpperBound,
+    /// Strategy dispatch through local queue, pacing, and successful exchange acknowledgement.
+    StrategyDispatchToOrderAckUpperBound,
     /// Canonical fill visibility to the covering account/position update visibility.
     FillToAccountStateVisibility,
 }
@@ -26,13 +26,13 @@ impl LiveLatencySemantics {
         match self {
             Self::HostReceiveToStrategyVisibility => 1,
             Self::ExchangeTimestampToStrategyVisibility => 2,
-            Self::StrategyDispatchToRestAckUpperBound => 3,
+            Self::StrategyDispatchToOrderAckUpperBound => 3,
             Self::FillToAccountStateVisibility => 4,
         }
     }
 
     pub const fn is_matching_upper_bound(self) -> bool {
-        matches!(self, Self::StrategyDispatchToRestAckUpperBound)
+        matches!(self, Self::StrategyDispatchToOrderAckUpperBound)
     }
 
     pub const fn depends_on_exchange_clock(self) -> bool {
@@ -362,7 +362,7 @@ mod tests {
         collector.observe_operation_failure(
             BacktestLatencyClass::MatchingNew,
             "BTC-USDT",
-            LiveLatencySemantics::StrategyDispatchToRestAckUpperBound,
+            LiveLatencySemantics::StrategyDispatchToOrderAckUpperBound,
         );
         collector.observe_dropped_observation();
 

@@ -43,7 +43,7 @@ impl ConnectionAttemptPacer {
         }
     }
 
-    async fn wait_for_turn(&self, shutdown: &mut watch::Receiver<bool>) -> bool {
+    pub async fn wait_for_turn(&self, shutdown: &mut watch::Receiver<bool>) -> bool {
         if self.interval.is_zero() {
             return !*shutdown.borrow();
         }

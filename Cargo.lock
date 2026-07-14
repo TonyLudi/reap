@@ -1102,6 +1102,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
+ "futures-util",
  "hmac",
  "libc",
  "reap-core",
@@ -1120,6 +1121,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-tungstenite",
  "toml",
  "tracing",
  "url",

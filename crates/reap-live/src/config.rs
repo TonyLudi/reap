@@ -18,6 +18,7 @@ use url::Url;
 pub const MAX_LIVE_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_REPORTED_UNKNOWN_FIELDS: usize = 64;
 const MAX_CONNECTION_ATTEMPT_INTERVAL_MS: u64 = 60_000;
+pub const MAX_ORDER_WEBSOCKET_SESSIONS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -206,6 +207,7 @@ pub struct RuntimeConfig {
     pub max_sequence_buffer: usize,
     pub max_subscriptions_per_socket: usize,
     pub public_connections_per_subscription: usize,
+    pub order_websocket_sessions: usize,
     pub connection_attempt_interval_ms: u64,
     pub timer_interval_ms: u64,
     pub readiness_timeout_ms: u64,
@@ -213,6 +215,7 @@ pub struct RuntimeConfig {
     pub rest_connect_timeout_ms: u64,
     pub rest_request_timeout_ms: u64,
     pub order_request_expiry_ms: u64,
+    pub order_websocket_ack_timeout_ms: u64,
     pub safety_latch_sync_timeout_ms: u64,
     pub max_exchange_clock_skew_ms: u64,
     pub exchange_clock_check_interval_ms: u64,
@@ -238,6 +241,7 @@ impl Default for RuntimeConfig {
             max_sequence_buffer: 4_096,
             max_subscriptions_per_socket: 100,
             public_connections_per_subscription: 2,
+            order_websocket_sessions: 8,
             connection_attempt_interval_ms: 400,
             timer_interval_ms: 100,
             readiness_timeout_ms: 30_000,
@@ -245,12 +249,13 @@ impl Default for RuntimeConfig {
             rest_connect_timeout_ms: 2_000,
             rest_request_timeout_ms: 5_000,
             order_request_expiry_ms: 1_000,
+            order_websocket_ack_timeout_ms: 5_000,
             safety_latch_sync_timeout_ms: 2_000,
             max_exchange_clock_skew_ms: 250,
             exchange_clock_check_interval_ms: 30_000,
             cancel_all_after_timeout_secs: 30,
             cancel_all_after_heartbeat_ms: 1_000,
-            ambiguous_submit_grace_ms: 5_000,
+            ambiguous_submit_grace_ms: 10_000,
             order_state_convergence_timeout_ms: 5_000,
             fill_state_convergence_timeout_ms: 2_000,
             max_fill_reconciliation_pages: 20,
@@ -954,12 +959,20 @@ fn validate_positive_runtime(runtime: &RuntimeConfig, errors: &mut Vec<String>) 
             "public_connections_per_subscription",
             runtime.public_connections_per_subscription as u64,
         ),
+        (
+            "order_websocket_sessions",
+            runtime.order_websocket_sessions as u64,
+        ),
         ("timer_interval_ms", runtime.timer_interval_ms),
         ("readiness_timeout_ms", runtime.readiness_timeout_ms),
         ("shutdown_timeout_ms", runtime.shutdown_timeout_ms),
         ("rest_connect_timeout_ms", runtime.rest_connect_timeout_ms),
         ("rest_request_timeout_ms", runtime.rest_request_timeout_ms),
         ("order_request_expiry_ms", runtime.order_request_expiry_ms),
+        (
+            "order_websocket_ack_timeout_ms",
+            runtime.order_websocket_ack_timeout_ms,
+        ),
         (
             "safety_latch_sync_timeout_ms",
             runtime.safety_latch_sync_timeout_ms,
@@ -1022,9 +1035,29 @@ fn validate_positive_runtime(runtime: &RuntimeConfig, errors: &mut Vec<String>) 
     if runtime.max_fill_reconciliation_pages > 1_000 {
         errors.push("runtime.max_fill_reconciliation_pages must not exceed 1000".to_string());
     }
+    if runtime.order_websocket_sessions > MAX_ORDER_WEBSOCKET_SESSIONS {
+        errors.push(format!(
+            "runtime.order_websocket_sessions must not exceed {MAX_ORDER_WEBSOCKET_SESSIONS}"
+        ));
+    }
     if runtime.order_request_expiry_ms > runtime.rest_request_timeout_ms {
         errors.push(
             "runtime.order_request_expiry_ms must not exceed rest_request_timeout_ms".to_string(),
+        );
+    }
+    if runtime.order_request_expiry_ms > runtime.order_websocket_ack_timeout_ms {
+        errors.push(
+            "runtime.order_request_expiry_ms must not exceed order_websocket_ack_timeout_ms"
+                .to_string(),
+        );
+    }
+    let websocket_ambiguity_window_ms = runtime
+        .order_request_expiry_ms
+        .saturating_add(runtime.order_websocket_ack_timeout_ms);
+    if runtime.ambiguous_submit_grace_ms < websocket_ambiguity_window_ms {
+        errors.push(
+            "runtime.ambiguous_submit_grace_ms must cover order_request_expiry_ms plus order_websocket_ack_timeout_ms"
+                .to_string(),
         );
     }
     if runtime.fill_state_convergence_timeout_ms <= runtime.timer_interval_ms {
@@ -1042,6 +1075,12 @@ fn validate_positive_runtime(runtime: &RuntimeConfig, errors: &mut Vec<String>) 
     if runtime.order_state_convergence_timeout_ms < runtime.rest_request_timeout_ms {
         errors.push(
             "runtime.order_state_convergence_timeout_ms must be at least rest_request_timeout_ms"
+                .to_string(),
+        );
+    }
+    if runtime.order_state_convergence_timeout_ms < runtime.order_websocket_ack_timeout_ms {
+        errors.push(
+            "runtime.order_state_convergence_timeout_ms must be at least order_websocket_ack_timeout_ms"
                 .to_string(),
         );
     }
@@ -1676,6 +1715,67 @@ mod tests {
                 .iter()
                 .any(|error| error.contains("must not exceed 60000"))
         );
+    }
+
+    #[test]
+    fn order_websocket_pool_size_is_positive_and_bounded() {
+        let mut config = valid_config();
+        config.runtime.order_websocket_sessions = 0;
+        let validation = config.validate();
+        assert!(!validation.valid);
+        assert!(
+            validation.errors.iter().any(|error| {
+                error.contains("runtime.order_websocket_sessions must be positive")
+            })
+        );
+
+        config.runtime.order_websocket_sessions = MAX_ORDER_WEBSOCKET_SESSIONS + 1;
+        let validation = config.validate();
+        assert!(!validation.valid);
+        assert!(validation.errors.iter().any(|error| {
+            error.contains("runtime.order_websocket_sessions must not exceed 16")
+        }));
+    }
+
+    #[test]
+    fn order_websocket_timeouts_preserve_expiry_and_reconciliation_windows() {
+        let mut config = valid_config();
+        config.runtime.order_websocket_ack_timeout_ms =
+            config.runtime.order_request_expiry_ms.saturating_sub(1);
+        let validation = config.validate();
+        assert!(!validation.valid);
+        assert!(validation.errors.iter().any(|error| {
+            error.contains(
+                "runtime.order_request_expiry_ms must not exceed order_websocket_ack_timeout_ms",
+            )
+        }));
+
+        let mut config = valid_config();
+        config.runtime.ambiguous_submit_grace_ms = config
+            .runtime
+            .order_request_expiry_ms
+            .saturating_add(config.runtime.order_websocket_ack_timeout_ms)
+            .saturating_sub(1);
+        let validation = config.validate();
+        assert!(!validation.valid);
+        assert!(validation.errors.iter().any(|error| {
+            error.contains(
+                "runtime.ambiguous_submit_grace_ms must cover order_request_expiry_ms plus order_websocket_ack_timeout_ms",
+            )
+        }));
+
+        config.runtime.ambiguous_submit_grace_ms = 10_000;
+        config.runtime.order_websocket_ack_timeout_ms = config
+            .runtime
+            .order_state_convergence_timeout_ms
+            .saturating_add(1);
+        let validation = config.validate();
+        assert!(!validation.valid);
+        assert!(validation.errors.iter().any(|error| {
+            error.contains(
+                "runtime.order_state_convergence_timeout_ms must be at least order_websocket_ack_timeout_ms",
+            )
+        }));
     }
 
     #[test]
