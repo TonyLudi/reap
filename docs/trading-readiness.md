@@ -16,12 +16,12 @@ production trading process.
 | Runtime risk | Instrument models, authoritative startup positions, active-order count/notional ceilings, rolling submit-rejection and zero-fill IOC-cancel circuits, terminal strategy-halt promotion, position scope/mode enforcement, zero-liability enforcement, periodic authenticated account-config drift detection, forced-repayment blocking, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed deadman/depeg/convergence evidence |
 | Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, and strict bounded soak reports | Demo-capable; production entry intentionally unavailable |
 | Instrument/account bootstrap | Account instruments/config/balance/positions are typed; economic snapshots preserve borrowing flags, liabilities, interest, and margin-loan fields; live spot and borrow limits are cash-only/zero; enabled borrowing, missing applicable evidence, nonzero liabilities, margin positions, and nonzero positions outside configured ownership/mode fail before strategy/risk application | Needs a passing artifact from the real target account; tooling alone is not evidence |
-| Startup/restart gate | Executable phase state, engine-consumed account-snapshot invariant, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, durable latch restore, authoritative account repair, and second-pass clean REST reconciliation | Needs process-kill demo test |
+| Startup/restart gate | Executable phase state, engine-consumed account-snapshot invariant, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, durable latch restore, authoritative account repair, second-pass clean REST reconciliation, and read-only journal-bound deadman-expiry certification | Needs process-kill demo evidence; tooling alone is not evidence |
 | Event-loop profile | Allocation-aware raw OKX parity benchmark covers redundant wire input through strategy/risk and storage-record construction | Needs target-host capture and exchange-latency validation |
-| Operator control and alerts | HMAC-authenticated local controls use fsynced write-ahead latches; OKX Cancel All After is maintained independently; a separate CLI can arm the deadman, cancel all regular orders account-wide, and prove post-trigger zero | Must exercise target alert routing and the independent cancel procedure; algo/spread orders remain outside its scope |
+| Operator control and alerts | HMAC-authenticated local controls use fsynced write-ahead latches; OKX Cancel All After is maintained independently; a separate CLI can arm the deadman, cancel all regular orders account-wide, and prove post-trigger zero; another read-only CLI can prove source `20` after controlled process death | Must exercise target alert routing, deadman expiry, and the independent cancel procedure; algo/spread orders remain outside their scope |
 | Process/host controls | Canonical journal ownership is exclusively locked before recovery or network setup; optional Linux disk, memory, and kernel-clock checks run at preflight and periodically; hardened systemd templates encode mode-specific restart policy | Must be installed, enabled, thresholded, monitored, and fault-tested on the target host |
 | Build/supply chain | Rust `1.95.0` is pinned; least-privilege CI checks formatting, all-target lint, all workspace tests, a locked release build, and RustSec advisories; Cargo and Actions updates are proposed weekly | CI must remain green and dependency updates reviewed, but this does not replace credentialed exchange or target-host evidence |
-| Exchange certification | Point-in-time account certification collection and offline replay are implemented, but no passing target-account artifact, OKX demo soak, or fault campaign is recorded | Production blocker |
+| Exchange certification | Point-in-time account certification and journal-bound process-death deadman collection/offline replay are implemented, but no passing target-account artifact, OKX demo soak, deadman artifact, or broader fault campaign is recorded | Production blocker |
 
 ## Implemented Demo Path
 
@@ -247,6 +247,15 @@ production trading process.
     and emits a schema-2 pass/fail artifact. No real demo artifact has yet been
     produced; manual older-history exports still require explicit account/window
     attestation.
+38. A process-death certification composition acquires the stopped journal's
+    exclusive lease before credentials/network work, recovers durable live
+    exchange/client bindings, and performs only public-time and authenticated
+    GET requests. A pass requires at least one recovered live/partial regular
+    order, terminal `canceled` details with OKX source `20` for every order,
+    account-wide regular pending-order zero, stable account/settings/time, and
+    no pending/unbound/unmapped/truncated journal state. The credential-free
+    verifier takes its own lease and replays the exact external journal plus all
+    embedded raw responses. No real demo artifact has yet been produced.
 
 ## Remaining Demo Gate
 
@@ -268,9 +277,12 @@ production trading process.
    timeout/rate-limit conditions. Suppress submit and cancel order pushes to
    exercise order-state convergence, then suppress derivative position updates
    and each side of a spot balance update to exercise fill convergence. Verify
-   cancel retry, `expTime`, latch restoration, and Cancel All After from
-   exchange/account evidence. Exercise the independent emergency command after
-   forced process death and archive its zero-order report.
+   cancel retry, `expTime`, and latch restoration from exchange/account
+   evidence. In one controlled process-death iteration, do not issue a cancel,
+   wait for expiry, and archive a passing `certify-deadman-expiry` artifact plus
+   `verify-deadman-certification --require-pass` result. In a separate forced-
+   death iteration, exercise the independent emergency command and archive its
+   zero-order report; incident cancellation must never wait for certification.
 4. Complete a sustained soak with zero unexplained order, fill, balance,
    position, or checkpoint drift. `clean_soak` covers runtime readiness,
    full-state reconciliation, storage drops, alert delivery, and shutdown
@@ -296,6 +308,10 @@ Production enablement additionally requires:
   approval. This is point-in-time evidence and must be combined with economic
   statement reconciliation. Margin spot remains unsupported; enabling it
   requires an explicit borrow-rate/interest model and demo reconciliation first.
+- A passing target-host demo `certify-deadman-expiry` artifact, independently
+  rechecked against the exact stopped journal with
+  `verify-deadman-certification --require-pass`, plus separate supervisor/fault-
+  injector and emergency-cancel evidence.
 - Sustained redundant direct currency/USD index coverage for every non-USD
   accounting currency, with zero conversion failures and fee/cash/funding/equity
   reconciliation against target-tier demo statements.

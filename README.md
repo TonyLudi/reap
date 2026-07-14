@@ -47,6 +47,10 @@ Implemented:
   OKX config/balance/position responses in a create-new mode-`0600` artifact,
   binds config/binary/host/Java/account provenance, and supports credential-free
   offline re-verification without printing sensitive raw account state.
+- Read-only process-death certification that exclusively leases the stopped
+  journal, binds recovered exchange/client order identities to exact OKX order
+  details, requires Cancel All After source `20` and account-wide regular-order
+  zero, and supports credential-free verification against the exact journal.
 - Bounded asynchronous HTTPS webhook alerts and optional Linux journal-disk,
   available-memory, and kernel-clock guards, with preflight evidence and
   fail-closed periodic enforcement outside the strategy loop.
@@ -233,6 +237,31 @@ The output path is reserved before parsing credentials or starting REST work.
 `all_clear = true` requires both `regular_orders_all_clear = true` and complete
 config/binary/host/exchange-account/task evidence; early configuration failures
 leave an empty reserved path, which is never a report.
+
+For a controlled minimal-size demo process-kill campaign, wait for the already
+armed deadman to expire without issuing another cancel, then collect and verify
+the stronger causal evidence before restarting against the journal:
+
+```bash
+DEADMAN_REPORT="/tmp/reap-deadman-$(date -u +%Y%m%dT%H%M%SZ).json"
+cargo run -p reap-cli -- certify-deadman-expiry \
+  --config examples/live-okx-demo.toml \
+  --account main \
+  --confirm-order-producers-stopped \
+  --output "$DEADMAN_REPORT" \
+  --pretty
+cargo run -p reap-cli -- verify-deadman-certification \
+  --artifact "$DEADMAN_REPORT" \
+  --journal var/reap/live-events.jsonl \
+  --require-pass \
+  --pretty
+```
+
+This path sends only GET requests and requires every durably recovered live
+regular order to be `canceled` with OKX `cancelSource = "20"`. It is for a
+planned demo test, not a reason to postpone emergency cancellation during an
+incident. See [docs/operations.md](docs/operations.md) for the complete
+procedure and evidence limitations.
 
 Run a bounded observe soak and return a non-zero status unless the runtime
 reaches readiness, finishes the requested window, records no reconciliation

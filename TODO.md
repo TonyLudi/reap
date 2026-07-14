@@ -213,6 +213,10 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Add structured live fault evidence for ambiguous submit/cancel outcomes,
   partial fills, order/fill convergence timeouts, restored durable latches, and
   typed deadman, periodic clock, and authenticated account-config failures.
+- [x] Add read-only process-death certification that leases and fingerprints
+  the stopped journal, requires every recovered live regular order to report
+  OKX Cancel All After source `20`, proves account-wide regular-order zero, and
+  supports credential-free verification against the exact journal/raw evidence.
 - [ ] Run credentialed bounded observe and minimal-size demo fault campaigns,
   including process death, deadman expiry, clock skew, REST ambiguity, partial
   fill, reconnect, and durable-latch restart recovery.

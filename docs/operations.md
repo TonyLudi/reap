@@ -957,6 +957,94 @@ account's producers have been stopped and replaces all `--account` arguments.
 This is an out-of-process safety layer, not a production certification or a
 replacement for exchange-side account limits and operator access controls.
 
+## Process-Death Deadman Certification
+
+`reap certify-deadman-expiry` is a read-only evidence path for one controlled,
+minimal-size demo fault campaign. It proves a narrower and stronger claim than
+the live report or emergency command: orders that were durably `live` or
+`partially_filled` immediately before process death were later cancelled by OKX
+Cancel All After itself. OKX documents cancellation source `20` as Cancel All
+After, and the pinned Java repository contains the same
+`cancelSource = "20"` / `Cancel all after triggered` order-detail fixture.
+
+Do not delay cancellation during a real incident to collect this proof. Run the
+independent emergency command immediately whenever exposure is uncertain. Do
+not run emergency cancellation before a planned deadman-expiry certification;
+an explicit cancel changes the causal evidence and should make the campaign
+fail.
+
+Controlled demo procedure:
+
+1. Use a dedicated demo account with no algo or spread orders and the smallest
+   configured order size. Start `live --mode demo` under the target supervisor,
+   wait until at least one order has a durable exchange acknowledgement and is
+   live, and archive the PID, supervisor status, config, binary hash, and fault
+   injector record.
+2. Send `SIGKILL` to the Reap main PID. Confirm the unit is inactive, its main
+   PID is zero, restart is disabled, and every other API/manual order producer
+   for the account is stopped. Preserve the canonical journal without editing,
+   truncating, rotating, or restarting against it.
+3. Wait at least `runtime.cancel_all_after_timeout_secs` plus the exchange
+   cancellation-processing allowance used by the campaign. Ten additional
+   seconds is the baseline; record the actual timestamps. Inspecting exchange
+   state is allowed, but do not issue a cancel or refresh Cancel All After.
+4. From the restricted credential shell, collect create-new evidence:
+
+```bash
+umask 077
+REPORT=/var/lib/reap/live/btc-demo/deadman-expiry-$(date -u +%Y%m%dT%H%M%SZ).json
+/usr/local/bin/reap certify-deadman-expiry \
+  --config /etc/reap/live/btc-demo.toml \
+  --account main \
+  --confirm-order-producers-stopped \
+  --output "$REPORT" \
+  --pretty
+```
+
+5. Before any restart or journal rotation, independently re-derive the result.
+   The verifier needs no credentials and takes its own exclusive journal lease:
+
+```bash
+/usr/local/bin/reap verify-deadman-certification \
+  --artifact "$REPORT" \
+  --journal /var/lib/reap/live/btc-demo/live-events.jsonl \
+  --require-pass \
+  --pretty
+```
+
+The collector acquires the canonical journal lease before reading credentials
+or starting network work. It then uses only public time and authenticated GETs
+for bracketed account configuration, each recovered order detail, and the
+unfiltered regular `orders-pending` endpoint. It never arms, refreshes, or
+disables Cancel All After and never sends an order or cancel request. The
+create-new owner-only artifact embeds the exact config and raw bounded OKX
+responses and fingerprints, but does not embed the potentially large journal.
+
+A pass requires all of the following:
+
+- The exact journal has a complete tail and matching account/strategy/config
+  bootstrap identity, and the collector held its exclusive lease.
+- At least one recovered order was `live` or `partially_filled`; no selected
+  order was only `pending_new`, and every recovered live order had a durable
+  exchange/client binding.
+- Every bound order-detail response matches client/exchange IDs, symbol, side,
+  price, and size; its update/fill state does not regress behind the journal;
+  it is `canceled`; and it has `cancelSource = "20"`. The human-readable reason
+  is retained but is not used as the invariant.
+- The account-wide regular pending-order response is empty, bracketed account
+  identity/settings are stable and configured as expected, exchange-clock
+  evidence is valid, and the stopped-producer attestation is present.
+- Offline verification reproduces the journal hash/recovery, response hashes,
+  parsers, query identities, failure list, summary, and pass result.
+
+This evidence covers regular orders only. The producer attestation cannot prove
+that unrelated hosts, keys, or manual traders were stopped, and the lease only
+excludes cooperating Reap processes that use the same journal. Archive target
+supervisor/injector records and separate algo/spread, fill/fee, balance,
+position, and account-statement evidence. After collection, run emergency
+cancel if any regular order remains, reconcile the stopped journal, and restart
+in `observe` only after review.
+
 ## External Alerts
 
 - Set `[alerts].enabled = true` and provide the URL through
@@ -1064,9 +1152,10 @@ structured evidence rather than matching log text:
 
 These fields prove that Reap observed and handled the named condition. They do
 not prove the external injector was configured correctly, that Cancel All After
-expired after process death, or that exchange state is economically reconciled;
-retain injector, supervisor, emergency-cancel, and account-statement evidence
-for those claims.
+expired after process death, or that exchange state is economically reconciled.
+Use the process-death certification above for deadman source `20`, and retain
+injector, supervisor, emergency-cancel, and account-statement evidence for the
+remaining claims.
 
 ## Operator Controls
 

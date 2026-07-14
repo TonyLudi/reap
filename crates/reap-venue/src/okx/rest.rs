@@ -99,6 +99,39 @@ pub fn parse_okx_account_positions_response_json(
     })
 }
 
+/// Parses an unmodified OKX pending-orders response.
+pub fn parse_okx_open_orders_response_json(body: &[u8]) -> Result<Vec<RemoteOrder>, RestError> {
+    let response: OkxResponse<OkxOrderWire> = decode_okx_response(body)?;
+    response
+        .data
+        .into_iter()
+        .map(RemoteOrder::try_from)
+        .collect()
+}
+
+/// Parses one unmodified OKX order-details response while retaining the
+/// exchange cancellation attribution needed by deadman certification.
+pub fn parse_okx_order_details_response_json(body: &[u8]) -> Result<OkxOrderDetails, RestError> {
+    let mut response: OkxResponse<OkxOrderWire> = decode_okx_response(body)?;
+    if response.data.is_empty() {
+        return Err(RestError::EmptyData {
+            operation: "order details",
+        });
+    }
+    if response.data.len() != 1 {
+        return Err(RestError::InvalidField {
+            field: "data",
+            value: response.data.len().to_string(),
+            message: "order details must contain exactly one row".to_string(),
+        });
+    }
+    response
+        .data
+        .pop()
+        .expect("checked one order-detail row")
+        .try_into()
+}
+
 fn okx_fill_page(data: Vec<OkxFillWire>) -> Result<OkxFillPage, RestError> {
     if data.len() > OKX_FILLS_PAGE_LIMIT {
         return Err(RestError::InvalidField {
@@ -467,6 +500,27 @@ pub struct OkxRawAccountPositions {
     pub snapshot: OkxAccountPositionsSnapshot,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OkxOrderDetails {
+    pub order: RemoteOrder,
+    pub cancel_source: String,
+    pub cancel_source_reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OkxRawOpenOrders {
+    pub request_path: String,
+    pub response_body: String,
+    pub orders: Vec<RemoteOrder>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OkxRawOrderDetails {
+    pub request_path: String,
+    pub response_body: String,
+    pub details: OkxOrderDetails,
+}
+
 impl OkxTradeMode {
     fn as_str(self) -> &'static str {
         match self {
@@ -784,19 +838,42 @@ where
         instrument_type: Option<&str>,
         symbol: Option<&str>,
     ) -> Result<Vec<RemoteOrder>, RestError> {
+        Ok(self
+            .open_orders_raw_at(timestamp, instrument_type, symbol)
+            .await?
+            .orders)
+    }
+
+    /// Retrieves regular pending orders while retaining the exact response.
+    pub async fn open_orders_raw(
+        &self,
+        instrument_type: Option<&str>,
+        symbol: Option<&str>,
+    ) -> Result<OkxRawOpenOrders, RestError> {
+        self.open_orders_raw_at(&timestamp_now(), instrument_type, symbol)
+            .await
+    }
+
+    pub async fn open_orders_raw_at(
+        &self,
+        timestamp: &str,
+        instrument_type: Option<&str>,
+        symbol: Option<&str>,
+    ) -> Result<OkxRawOpenOrders, RestError> {
         let path = query_path(
             OPEN_ORDERS_PATH,
             [("instType", instrument_type), ("instId", symbol)],
         );
         let request = self
             .signer
-            .sign_request(timestamp, HttpMethod::Get, path, "")?;
-        let response: OkxResponse<OkxOrderWire> = self.execute(request).await?;
-        response
-            .data
-            .into_iter()
-            .map(RemoteOrder::try_from)
-            .collect()
+            .sign_request(timestamp, HttpMethod::Get, path.clone(), "")?;
+        let response = self.transport.execute(request).await?;
+        let orders = parse_okx_open_orders_response_json(response.body.as_bytes())?;
+        Ok(OkxRawOpenOrders {
+            request_path: path,
+            response_body: response.body,
+            orders,
+        })
     }
 
     pub async fn fills(
@@ -920,6 +997,32 @@ where
         exchange_order_id: Option<&str>,
         client_order_id: Option<&str>,
     ) -> Result<RemoteOrder, RestError> {
+        Ok(self
+            .order_details_raw_at(timestamp, symbol, exchange_order_id, client_order_id)
+            .await?
+            .details
+            .order)
+    }
+
+    /// Retrieves one order while retaining cancellation attribution and the
+    /// exact response body.
+    pub async fn order_details_raw(
+        &self,
+        symbol: &str,
+        exchange_order_id: Option<&str>,
+        client_order_id: Option<&str>,
+    ) -> Result<OkxRawOrderDetails, RestError> {
+        self.order_details_raw_at(&timestamp_now(), symbol, exchange_order_id, client_order_id)
+            .await
+    }
+
+    pub async fn order_details_raw_at(
+        &self,
+        timestamp: &str,
+        symbol: &str,
+        exchange_order_id: Option<&str>,
+        client_order_id: Option<&str>,
+    ) -> Result<OkxRawOrderDetails, RestError> {
         if exchange_order_id.is_none() && client_order_id.is_none() {
             return Err(RestError::InvalidField {
                 field: "ordId/clOrdId",
@@ -937,16 +1040,14 @@ where
         );
         let request = self
             .signer
-            .sign_request(timestamp, HttpMethod::Get, path, "")?;
-        let response: OkxResponse<OkxOrderWire> = self.execute(request).await?;
-        response
-            .data
-            .into_iter()
-            .next()
-            .ok_or(RestError::EmptyData {
-                operation: "order details",
-            })?
-            .try_into()
+            .sign_request(timestamp, HttpMethod::Get, path.clone(), "")?;
+        let response = self.transport.execute(request).await?;
+        let details = parse_okx_order_details_response_json(response.body.as_bytes())?;
+        Ok(OkxRawOrderDetails {
+            request_path: path,
+            response_body: response.body,
+            details,
+        })
     }
 
     pub async fn account_instruments(
@@ -1727,6 +1828,10 @@ struct OkxOrderWire {
     average_fill_price: String,
     #[serde(default, rename = "uTime")]
     update_time: String,
+    #[serde(default, rename = "cancelSource")]
+    cancel_source: String,
+    #[serde(default, rename = "cancelSourceReason")]
+    cancel_source_reason: String,
 }
 
 impl TryFrom<OkxOrderWire> for RemoteOrder {
@@ -1747,6 +1852,20 @@ impl TryFrom<OkxOrderWire> for RemoteOrder {
             )?,
             average_fill_price: parse_optional_number("avgPx", &value.average_fill_price)?,
             update_time_ms: parse_optional_integer("uTime", &value.update_time)?,
+        })
+    }
+}
+
+impl TryFrom<OkxOrderWire> for OkxOrderDetails {
+    type Error = RestError;
+
+    fn try_from(value: OkxOrderWire) -> Result<Self, Self::Error> {
+        let cancel_source = value.cancel_source.clone();
+        let cancel_source_reason = value.cancel_source_reason.clone();
+        Ok(Self {
+            order: value.try_into()?,
+            cancel_source,
+            cancel_source_reason,
         })
     }
 }
@@ -2420,18 +2539,40 @@ mod tests {
     #[tokio::test]
     async fn queries_terminal_order_details_by_client_id() {
         let (client, requests) = client(vec![
-            r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"reap1","instId":"BTC-USDT","side":"buy","state":"canceled","px":"100","sz":"1","accFillSz":"0","avgPx":"","uTime":"1000"}]}"#,
+            r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"reap1","instId":"BTC-USDT","side":"buy","state":"canceled","px":"100","sz":"1","accFillSz":"0","avgPx":"","uTime":"1000","cancelSource":"20","cancelSourceReason":"Cancel all after triggered"}]}"#,
         ]);
-        let order = client
-            .order_details_at("time", "BTC-USDT", None, Some("reap1"))
+        let raw = client
+            .order_details_raw_at("time", "BTC-USDT", None, Some("reap1"))
             .await
             .unwrap();
 
-        assert_eq!(order.state, PrivateOrderState::Cancelled);
+        assert_eq!(raw.details.order.state, PrivateOrderState::Cancelled);
+        assert_eq!(raw.details.cancel_source, "20");
+        assert_eq!(
+            raw.details.cancel_source_reason,
+            "Cancel all after triggered"
+        );
+        assert_eq!(
+            raw.request_path,
+            "/api/v5/trade/order?instId=BTC-USDT&clOrdId=reap1"
+        );
+        assert_eq!(
+            parse_okx_order_details_response_json(raw.response_body.as_bytes()).unwrap(),
+            raw.details
+        );
         assert_eq!(
             requests.lock().unwrap()[0].path,
             "/api/v5/trade/order?instId=BTC-USDT&clOrdId=reap1"
         );
+    }
+
+    #[test]
+    fn order_details_rejects_multiple_rows() {
+        let body = br#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"reap1","instId":"BTC-USDT","side":"buy","state":"canceled"},{"ordId":"456","clOrdId":"reap2","instId":"BTC-USDT","side":"buy","state":"canceled"}]}"#;
+        assert!(matches!(
+            parse_okx_order_details_response_json(body),
+            Err(RestError::InvalidField { field: "data", .. })
+        ));
     }
 
     #[tokio::test]

@@ -7,9 +7,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use reap_backtest::{BacktestConfig, BacktestRunner, run_research_manifest_path};
 use reap_capture::{CaptureConfig, CaptureRunOptions, analyze_capture_path, run_capture};
 use reap_live::{
-    EmergencyCancelOptions, LiveConfig, LiveMode, LiveRunOptions, LiveRuntimeError,
-    OperatorCommand, collect_account_certification_path, run_emergency_cancel_path,
-    send_operator_command, verify_account_certification_path,
+    DeadmanExpiryCertificationOptions, EmergencyCancelOptions, LiveConfig, LiveMode,
+    LiveRunOptions, LiveRuntimeError, OperatorCommand, collect_account_certification_path,
+    collect_deadman_expiry_certification_path, run_emergency_cancel_path, send_operator_command,
+    verify_account_certification_path, verify_deadman_expiry_certification_path,
 };
 use reap_strategy::ChaosConfig;
 
@@ -192,6 +193,49 @@ enum Command {
         #[arg(short, long, help = "Account-certification evidence artifact")]
         artifact: PathBuf,
         #[arg(long, help = "Exit non-zero unless the account policy passed")]
+        require_pass: bool,
+        #[arg(long)]
+        pretty: bool,
+    },
+    #[command(
+        about = "Certify that OKX Cancel All After expired after a stopped Reap runtime",
+        long_about = "Lease the stopped runtime's journal, recover its live regular orders, and use authenticated read-only OKX requests to require cancellation source 20 plus account-wide zero pending regular orders. No cancel request is sent."
+    )]
+    CertifyDeadmanExpiry {
+        #[arg(short, long, help = "Validated live TOML configuration")]
+        config: PathBuf,
+        #[arg(long, help = "Configured account id")]
+        account: String,
+        #[arg(
+            short,
+            long,
+            help = "Create this owner-readable evidence artifact; existing files are refused"
+        )]
+        output: PathBuf,
+        #[arg(
+            long,
+            help = "Attest that every order producer for this exchange account is stopped"
+        )]
+        confirm_order_producers_stopped: bool,
+        #[arg(long)]
+        pretty: bool,
+    },
+    #[command(
+        name = "verify-deadman-certification",
+        about = "Re-derive deadman-expiry proof from raw OKX evidence and the exact journal"
+    )]
+    VerifyDeadmanExpiryCertification {
+        #[arg(short, long, help = "Deadman-expiry evidence artifact")]
+        artifact: PathBuf,
+        #[arg(
+            long,
+            help = "Exact stopped-runtime journal fingerprinted by the collector"
+        )]
+        journal: PathBuf,
+        #[arg(
+            long,
+            help = "Exit non-zero unless deadman-expiry certification passed"
+        )]
         require_pass: bool,
         #[arg(long)]
         pretty: bool,
@@ -648,6 +692,63 @@ async fn main() -> Result<()> {
             }
             if require_pass && !summary.passed {
                 anyhow::bail!("account certification policy did not pass");
+            }
+        }
+        Command::CertifyDeadmanExpiry {
+            config,
+            account,
+            output,
+            confirm_order_producers_stopped,
+            pretty,
+        } => {
+            let summary = collect_deadman_expiry_certification_path(
+                &config,
+                &output,
+                DeadmanExpiryCertificationOptions {
+                    account_id: account.clone(),
+                    order_producers_stopped_attested: confirm_order_producers_stopped,
+                },
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to collect deadman-expiry certification for {} into {}",
+                    account,
+                    output.display()
+                )
+            })?;
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                println!("{}", serde_json::to_string(&summary)?);
+            }
+            if !summary.passed {
+                anyhow::bail!(
+                    "deadman-expiry evidence was collected but did not prove exchange cancellation source 20 and regular-order zero"
+                );
+            }
+        }
+        Command::VerifyDeadmanExpiryCertification {
+            artifact,
+            journal,
+            require_pass,
+            pretty,
+        } => {
+            let summary = verify_deadman_expiry_certification_path(&artifact, &journal)
+                .with_context(|| {
+                    format!(
+                        "failed to verify deadman-expiry certification {} against {}",
+                        artifact.display(),
+                        journal.display()
+                    )
+                })?;
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                println!("{}", serde_json::to_string(&summary)?);
+            }
+            if require_pass && !summary.passed {
+                anyhow::bail!("deadman-expiry certification did not pass");
             }
         }
         Command::Operator {

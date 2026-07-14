@@ -327,6 +327,12 @@ Responsibilities:
   borrowing, complete applicable zero-liability/interest evidence, no margin
   positions, stable bracketed identity/settings, and bounded exchange time.
   Offline verification re-hashes and re-parses the embedded evidence.
+- Certify controlled process-death deadman expiry through a separate read-only
+  composition. It leases and fingerprints the stopped journal, recovers durable
+  live exchange/client bindings, retains exact order-detail and account-wide
+  pending-order responses, and requires OKX cancellation source `20`. Its
+  credential-free verifier independently leases and replays the exact journal
+  alongside every embedded response.
 - Reduce durable global/account/symbol latches, block halted routes, and
   guarantee scoped canonical cancellation.
 - Promote terminal strategy safety halts into the global risk gate before
@@ -425,6 +431,14 @@ UID/main-UID account identity only after zero is proven, records the pinned Java
 revision, and converts account-task join failures into bounded evidence.
 `all_clear` requires both account-complete regular-order zero proof and complete
 provenance; an early parse/validation failure leaves only an empty reserved path.
+
+The deadman-certification composition is also outside the strategy loop but has
+the opposite authority boundary from emergency cancellation: it uses only
+public time and authenticated GET operations. The canonical journal lease is
+acquired before credentials or network setup, and any `pending_new`, unbound,
+unmapped, or truncated recovered state fails closed. This path provides causal
+demo evidence for already-armed Cancel All After; it cannot arm or refresh the
+timer and must never delay incident cancellation.
 
 Later, if the strategy loop becomes latency-critical, replace the async receive
 with a pinned OS thread and a bounded SPSC queue.
@@ -709,6 +723,8 @@ Target command surface:
 reap live --config config/live.toml
 reap capture --config config/capture.toml
 reap emergency-cancel --config config/live.toml --account account-id --output emergency.json
+reap certify-deadman-expiry --config config/live.toml --account account-id --output deadman.json
+reap verify-deadman-certification --artifact deadman.json --journal live-events.jsonl
 reap operator --config config/live.toml status
 reap backtest --config config/backtest.toml --events data/events.jsonl
 reap replay-check --events data/events.jsonl
@@ -718,9 +734,9 @@ reap inspect-book --capture raw/ws.jsonl --symbol BTC-USDT
 reap config-check --config config/live.toml
 ```
 
-`live`, `capture`, `emergency-cancel`, `operator`, `backtest`, `research`,
-`replay-check`, `analyze-capture`, `calibrate-latency`, and `config-check` are
-implemented. `inspect-book` remains planned; see
+`live`, `capture`, `emergency-cancel`, both deadman-certification commands,
+`operator`, `backtest`, `research`, `replay-check`, `analyze-capture`,
+`calibrate-latency`, and `config-check` are implemented. `inspect-book` remains planned; see
 [trading-readiness.md](trading-readiness.md).
 
 ## Multi-Websocket Design
