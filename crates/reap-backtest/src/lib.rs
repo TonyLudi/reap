@@ -4,6 +4,7 @@ mod matching;
 mod portfolio;
 mod replay;
 mod research;
+mod research_verification;
 
 pub use calibration::{
     LATENCY_CALIBRATION_SCHEMA_VERSION, LatencyCalibrationArtifact, LatencyCalibrationSeries,
@@ -29,6 +30,11 @@ pub use research::{
     ResearchGates, ResearchManifest, ResearchMode, ResearchReport, ResearchRunReport,
     ResearchScenario, ResearchScenarioKind, RunAggregate, SelectionMetric, TestScenarioReport,
     run_research_manifest_path,
+};
+pub use research_verification::{
+    MAX_RESEARCH_MANIFEST_BYTES, MAX_RESEARCH_REPORT_BYTES, RESEARCH_VERIFICATION_FORMAT_VERSION,
+    ResearchFileEvidence, ResearchVerificationFailure, ResearchVerificationReport,
+    verify_research_paths,
 };
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -181,7 +187,7 @@ struct CurrencyRateObservation {
 
 pub struct BacktestRunner {
     strategy: ChaosStrategy,
-    matchers: HashMap<Symbol, MatchingEngine>,
+    matchers: BTreeMap<Symbol, MatchingEngine>,
     portfolio: Portfolio,
     execution: BacktestExecutionConfig,
     latency_sampler: BacktestLatencySampler,

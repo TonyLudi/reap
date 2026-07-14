@@ -4,7 +4,9 @@ use std::{fs::File, fs::OpenOptions, io::Write};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use reap_backtest::{BacktestConfig, BacktestRunner, run_research_manifest_path};
+use reap_backtest::{
+    BacktestConfig, BacktestRunner, run_research_manifest_path, verify_research_paths,
+};
 use reap_capture::{
     CaptureConfig, CaptureRunOptions, analyze_capture_path, run_capture, verify_capture_paths,
 };
@@ -68,6 +70,26 @@ enum Command {
             long,
             help = "Exit non-zero unless every configured research gate passes"
         )]
+        require_pass: bool,
+        #[arg(long)]
+        pretty: bool,
+    },
+    #[command(
+        about = "Re-run and independently verify an archived research report",
+        long_about = "Strictly bind an archived research report to the exact manifest and this executable, re-run all candidate/dataset/scenario/fold work, and compare the complete path-normalized result. This can be expensive and does not authorize production trading."
+    )]
+    VerifyResearch {
+        #[arg(short, long, help = "Exact research TOML used to produce the report")]
+        manifest: PathBuf,
+        #[arg(short, long, help = "Archived schema-4 research JSON report")]
+        report: PathBuf,
+        #[arg(
+            short,
+            long,
+            help = "Optionally create this owner-readable verification artifact"
+        )]
+        output: Option<PathBuf>,
+        #[arg(long, help = "Exit non-zero unless exact reconstruction passes")]
         require_pass: bool,
         #[arg(long)]
         pretty: bool,
@@ -609,6 +631,10 @@ async fn main() -> Result<()> {
             require_pass,
             pretty,
         } => {
+            let mut output_file = output
+                .as_ref()
+                .map(|path| reserve_private_output(path, "research output"))
+                .transpose()?;
             let report = run_research_manifest_path(&manifest).with_context(|| {
                 format!("failed to run research manifest {}", manifest.display())
             })?;
@@ -617,21 +643,43 @@ async fn main() -> Result<()> {
             } else {
                 serde_json::to_string(&report)?
             };
-            if let Some(output) = output {
-                let mut file = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&output)
-                    .with_context(|| {
-                        format!("failed to create research output {}", output.display())
-                    })?;
-                file.write_all(json.as_bytes())?;
-                file.write_all(b"\n")?;
-                file.sync_all()?;
+            if let (Some(file), Some(path)) = (&mut output_file, output.as_deref()) {
+                persist_reserved_output(file, path, &json, "research output")?;
             }
             println!("{json}");
             if require_pass && !report.passed {
                 anyhow::bail!("research report did not satisfy configured gates");
+            }
+        }
+        Command::VerifyResearch {
+            manifest,
+            report,
+            output,
+            require_pass,
+            pretty,
+        } => {
+            let mut output_file = output
+                .as_ref()
+                .map(|path| reserve_private_output(path, "research verification"))
+                .transpose()?;
+            let verification = verify_research_paths(&manifest, &report).with_context(|| {
+                format!(
+                    "failed to verify research report {} from manifest {}",
+                    report.display(),
+                    manifest.display()
+                )
+            })?;
+            let json = if pretty {
+                serde_json::to_string_pretty(&verification)?
+            } else {
+                serde_json::to_string(&verification)?
+            };
+            if let (Some(file), Some(path)) = (&mut output_file, output.as_deref()) {
+                persist_reserved_output(file, path, &json, "research verification")?;
+            }
+            println!("{json}");
+            if require_pass && !verification.acceptance_passed {
+                anyhow::bail!("research reconstruction did not pass");
             }
         }
         Command::ReplayCheck {

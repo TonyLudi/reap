@@ -280,18 +280,22 @@ architecture in [docs/architecture.md](docs/architecture.md).
   `maxLmtAmt`, and `maxMktAmt`; reject incompatible configured quote sizes at
   bootstrap and enforce current limit-order quantity/amount before every live
   post-only or IOC dispatch.
+- [x] Add independent full research reconstruction bound to the exact manifest,
+  executable, and archived inputs; reject unknown/stale/forged/non-passing or
+  numerically drifting reports, and persist owner-only durable evidence.
 - [ ] Calibrate queue position, latency, fees, funding, and slippage from
   captured full-depth data, then run and archive production-candidate
   walk-forward, capacity, and stressed-liquidity reports. The orchestration and
-  configurable execution model and source-rebuilding latency evidence verifier
-  are implemented but have no credentialed calibration artifact; empirical queue
-  and populated per-class/per-instrument latency distributions, target-tier simulated-fee
-  calibration, complete funding intervals, a passing real target-account
-  cash/zero-liability artifact, a passing authenticated fill/fee reconciliation artifact,
-  and broader economic statement reconciliation are still required. Exact signed
-  private-fill fee amount/currency is retained end to end; collection and
-  verification are implemented but no demo evidence exists. Margin spot is
-  unsupported and would require a borrow-interest model before enablement.
+  configurable execution model, source-rebuilding latency verifier, and exact
+  research reconstruction verifier are implemented but have no credentialed
+  calibration artifact; empirical queue and populated per-class/per-instrument
+  latency distributions, target-tier simulated-fee calibration, complete
+  funding intervals, a passing real target-account cash/zero-liability artifact,
+  a passing authenticated fill/fee reconciliation artifact, and broader
+  economic statement reconciliation are still required. Exact signed private-fill
+  fee amount/currency is retained end to end; collection and verification are
+  implemented but no demo evidence exists. Margin spot is unsupported and would
+  require a borrow-interest model before enablement.
 - [x] Require a verified schema-3 capture run report for every
   production-candidate raw dataset, bind optional normalized output, embed the
   verification result, and recheck all artifact hashes after research runs.

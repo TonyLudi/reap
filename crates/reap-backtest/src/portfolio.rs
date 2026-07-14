@@ -5,10 +5,10 @@ use reap_strategy::InstrumentConfig;
 
 #[derive(Debug, Clone)]
 pub struct Portfolio {
-    instruments: HashMap<Symbol, InstrumentConfig>,
-    positions: HashMap<Symbol, f64>,
-    inverse_cash_coin: HashMap<Symbol, f64>,
-    cash_by_currency: HashMap<String, f64>,
+    instruments: BTreeMap<Symbol, InstrumentConfig>,
+    positions: BTreeMap<Symbol, f64>,
+    inverse_cash_coin: BTreeMap<Symbol, f64>,
+    cash_by_currency: BTreeMap<String, f64>,
     fee_cost_usd: f64,
     exact_fee_fills: u64,
     estimated_fee_fills: u64,
@@ -25,9 +25,9 @@ impl Portfolio {
                 .iter()
                 .map(|inst| (inst.symbol.clone(), inst.clone()))
                 .collect(),
-            positions: HashMap::new(),
-            inverse_cash_coin: HashMap::new(),
-            cash_by_currency: HashMap::new(),
+            positions: BTreeMap::new(),
+            inverse_cash_coin: BTreeMap::new(),
+            cash_by_currency: BTreeMap::new(),
             fee_cost_usd: 0.0,
             exact_fee_fills: 0,
             estimated_fee_fills: 0,
@@ -422,7 +422,7 @@ impl Portfolio {
             .unwrap_or(1.0)
     }
 
-    pub fn positions(&self) -> &HashMap<Symbol, f64> {
+    pub fn positions(&self) -> &BTreeMap<Symbol, f64> {
         &self.positions
     }
 }

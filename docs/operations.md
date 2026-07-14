@@ -382,10 +382,15 @@ complete economic certification.
 Verify the manifest-to-report path without claiming profitability:
 
 ```bash
-rm -f /tmp/reap-research-smoke.json
+rm -f /tmp/reap-research-smoke.json /tmp/reap-research-smoke-verification.json
 cargo run -p reap-cli -- research \
   --manifest examples/research-smoke.toml \
   --output /tmp/reap-research-smoke.json --require-pass --pretty
+cargo run -p reap-cli -- verify-research \
+  --manifest examples/research-smoke.toml \
+  --report /tmp/reap-research-smoke.json \
+  --output /tmp/reap-research-smoke-verification.json \
+  --require-pass --pretty
 ```
 
 The smoke manifest has one tiny fold, one candidate, uncalibrated execution,
@@ -422,8 +427,13 @@ For real research, create a new manifest alongside immutable capture files:
    count, inventory-duration, clock-regression, accounting, and pending-work
    gates. When any candidate trades a swap, also set nonzero realized funding
    settlement minimums for both training and test folds.
-6. Run with a create-new `--output` path and `--require-pass`, then archive the
-   JSON beside the exact capture/config files and demo calibration evidence.
+6. Run with a create-new `--output` path and `--require-pass`. The output is
+   reserved before research, written owner-only, synced, and followed by a
+   parent-directory sync.
+7. Run `verify-research` with the exact manifest, report, and byte-identical
+   executable. Require `acceptance_passed = true`, identical normalized hashes,
+   and no failures, then archive both JSON files beside the exact capture/config
+   files and demo calibration evidence.
 
 Candidate scores use training runs only (`net_pnl_usd` or
 `pnl_per_turnover_bps`). Only the selected candidate is evaluated on test data.
@@ -434,6 +444,14 @@ strategy configuration are rejected even when file comments or `[backtest]`
 settings differ. Every file-backed input hash is checked again after all runs so
 input mutation aborts artifact creation. Existing output paths are refused so an
 acceptance artifact cannot be silently replaced.
+
+The independent verifier accepts JSON whitespace/key-order changes and archive
+relocation of verifier-observed capture paths, but it preserves the manifest's
+declared paths and every result. It uses exact JSON `f64` round trips, re-runs
+the entire manifest, and emits the first mismatching JSON pointer if a stale or
+forged report differs. It deliberately does not infer profitability, venue
+representativeness, target-account identity, or production authorization from a
+successful deterministic reconstruction.
 
 The embedded capture verification binds exact capture-config bytes and effective
 output overrides to the run report, raw bytes, and optional independently

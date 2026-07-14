@@ -10,7 +10,7 @@ production trading process.
 | Area | Current state | Trading impact |
 | --- | --- | --- |
 | Iarb2 decision model | Covered for the documented OKX parity boundary | Not a blocker |
-| Deterministic backtest/data | Shared strategy code, immediate pending-order registration, arrival-time scheduler, Java-mapped class/symbol empirical latency profiles with sampled-usage reporting, versioned target-host/live collectors, deterministic calibration artifacts bound into production research, conservative depth/queue/trade capacity controls, event-clock drawdown/exposure/inventory metrics, per-currency depeg-sensitive valuation, exact private-fill fee currency plus explicit simulated-fee counts, fee/turnover attribution, authenticated recent-fill collection and verified offline fill/fee reconciliation, authenticated point-in-time cash/zero-liability collection and offline verification, forecast/realized funding separation with event-time linear/inverse settlement, manifest-driven chronological walk-forward selection and stress gates, credential-free redundant public capture, exact provenance, streaming analysis, and raw/normalized replay | The evidence pipeline is implemented but execution/accounting assumptions remain uncalibrated; needs sustained full-depth and currency-index capture, a passing credentialed target-host/demo latency artifact, complete funding intervals, target-tier fee calibration, a real passing target-account certification and authenticated fill/fee artifact plus broader economic statement reconciliation, and production-candidate reports before capital decisions |
+| Deterministic backtest/data | Shared strategy code, immediate pending-order registration, arrival-time scheduler, Java-mapped class/symbol empirical latency profiles with sampled-usage reporting, versioned target-host/live collectors, deterministic calibration artifacts bound into production research, conservative depth/queue/trade capacity controls, event-clock drawdown/exposure/inventory metrics, per-currency depeg-sensitive valuation, exact private-fill fee currency plus explicit simulated-fee counts, fee/turnover attribution, authenticated recent-fill collection and verified offline fill/fee reconciliation, authenticated point-in-time cash/zero-liability collection and offline verification, forecast/realized funding separation with event-time linear/inverse settlement, manifest-driven chronological walk-forward selection and stress gates with exact independent report reconstruction, credential-free redundant public capture, exact provenance, streaming analysis, and raw/normalized replay | The evidence pipeline is implemented but execution/accounting assumptions remain uncalibrated; needs sustained full-depth and currency-index capture, a passing credentialed target-host/demo latency artifact, complete funding intervals, target-tier fee calibration, a real passing target-account certification and authenticated fill/fee artifact plus broader economic statement reconciliation, and production-candidate reports before capital decisions |
 | Feed components | Redundant public sockets, isolated private sockets, transport/state freshness separation, account-plus-positions health rounds, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
 | Order components | Event-loop client IDs/registration, exchange/client acknowledgement binding, account-scoped immutable private identity, semantic duplicate suppression across changed exchange timestamps, exchange-side place-request expiry, an authenticated eight-session websocket command pool, constant-time per-underlying FIFOs, bounded cross-underlying command concurrency, shared account pacing, independent REST reconciliation, shutdown command flushing, monotonic private reduction, submit/cancel state-convergence deadlines, typed position margin mode, and ambiguity handling are composed | Needs demo exchange fault evidence |
 | Runtime risk | Instrument models, authoritative startup positions, authenticated current instrument-rule, hard single-order maximum, and fee-group checks, final pre-trade exchange-limit enforcement, typed upcoming-change lead, active-order count/notional ceilings, rolling submit-rejection and zero-fill IOC-cancel circuits, terminal strategy-halt promotion, position scope/mode enforcement, zero-liability enforcement, periodic authenticated account-config drift detection, forced-repayment blocking, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock and announced-maintenance checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed instrument/fee/deadman/depeg/convergence evidence |
@@ -385,6 +385,15 @@ production trading process.
     relocation, and emits an owner-only source-bound verification artifact. The
     implementation and forged-profile tests pass; target-host evidence does not
     yet exist.
+51. `verify-research` independently binds a bounded archived report to the exact
+    manifest and byte-identical executable, re-runs every fold and scenario,
+    permits only content-hash normalization of verifier-observed capture paths,
+    and rejects unknown or duplicate fields, stale inputs, forged metrics, non-passing runs,
+    and even one-ULP numeric drift. Research generation and verification outputs
+    are owner-only and directory-durable. The determinism audit also restored
+    the pinned Java `TreeSet` traversal intent and ordered portfolio/order
+    reductions. The smoke reconstruction passes; no production-candidate report
+    exists.
 
 ## Remaining Demo Gate
 
@@ -472,8 +481,10 @@ Production enablement additionally requires:
   reconciliation against target-tier demo statements.
 - Completed `production_candidate` walk-forward and out-of-sample manifests
   using calibrated assumptions, sustained captures, parameter sensitivity,
-  capacity, inventory-duration, and stressed-liquidity reports. The runner is
-  implemented; no qualifying report has been produced.
+  capacity, inventory-duration, and stressed-liquidity reports. Re-run each
+  archived report with `verify-research --require-pass` and retain its passing
+  source-bound verification. The runner and verifier are implemented; no
+  qualifying report has been produced.
 - Target-account calibration and independent exercise of the implemented
   stablecoin guard; either implementation and exercise of external
   strategy-group/master coordination or continued rejection of those settings;

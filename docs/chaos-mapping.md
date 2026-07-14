@@ -103,6 +103,7 @@ The Rust scheduler was cross-checked against the pinned Java
 | Exact displayed queue and full historical trade/depth capacity | `queue_ahead_multiplier`, `historical_trade_fill_fraction`, and `displayed_depth_fill_fraction` | `1.0` preserves Java parity; conservative Rust sensitivity overlays are intentional and require empirical calibration |
 | Date-partitioned multi-run service and per-run result files | Manifest folds, immutable input fingerprints, candidate training selection, and test scenario reports | Rust extends the Java artifact boundary with explicit leakage and acceptance gates |
 | Carry ending positions into the following daily run | Every Rust research dataset starts from a zero portfolio and reports that semantic | Intentional current difference; use a continuous dataset and terminal exposure gates rather than assuming cross-file carry |
+| `ChaosContext.tradeSymbols` uses `TreeSet` for cross-run consistency | Stable symbol/risk-group quote and hedge traversal plus ordered portfolio/order reductions | Equivalent determinism intent; exact JSON float round trips and `verify-research` add an independent Rust evidence boundary |
 
 ### Live Latency Evidence Cross-Check
 
@@ -141,6 +142,15 @@ move into an archive. A schema-4 production research manifest must point to that
 artifact, run the byte-identical Reap executable, and use its exact baseline
 profile. The machinery is complete; no credentialed target-host artifact or
 passing reconstruction has been produced yet.
+
+`verify-research` then re-runs the exact manifest with the byte-identical
+executable and compares every fold, selected candidate, Java-mapped execution
+scenario, fill, fee, funding, exposure, and gate result. Only canonical paths
+introduced while independently re-verifying capture files are normalized to
+content hashes. This preserves Java `ChaosBackTestMultiRunService`'s per-run
+artifact intent while rejecting stale or forged aggregate JSON. It does not
+remove the documented zero-initial-portfolio difference or supply missing
+target-host, queue, statement, and profitability evidence.
 
 Failure handling was cross-checked against the same pinned connectivity tree.
 `AbstractOkxNitroL2Subscriber.onSocketDisconnected` clears the affected Java

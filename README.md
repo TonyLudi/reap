@@ -183,6 +183,11 @@ Run the checked-in walk-forward plumbing fixture:
 cargo run -p reap-cli -- research \
   --manifest examples/research-smoke.toml \
   --output /tmp/reap-research-smoke.json --require-pass --pretty
+cargo run -p reap-cli -- verify-research \
+  --manifest examples/research-smoke.toml \
+  --report /tmp/reap-research-smoke.json \
+  --output /tmp/reap-research-smoke-verification.json \
+  --require-pass --pretty
 ```
 
 `research` selects candidate configuration only from each fold's training
@@ -202,6 +207,15 @@ training/test realized-funding-settlement gates when any candidate trades a
 swap, require a passed
 `latency_calibration` artifact, and require the baseline's empirical latency
 profile to match that artifact exactly.
+
+`verify-research` treats the archived JSON as untrusted, binds it to the exact
+manifest and byte-identical executable, re-runs every candidate/dataset/scenario
+and fold, and compares the complete semantic report. JSON formatting and
+verifier-observed archive paths may differ; fields, floating-point results,
+manifest-declared paths, and all content hashes may not. Both generator and
+verification outputs are owner-only create-new files with file and directory
+durability. A report's internal `passed` flag is not release evidence without a
+passing reconstruction.
 
 Validate the live demo configuration without reading credentials or opening a
 network connection:

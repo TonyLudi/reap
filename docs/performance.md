@@ -83,7 +83,7 @@ strategy, and risk gate as `reap-live`:
   and mark-price frame, exercising account-scoped/channel-aware deduplication.
 - 5,000 logical trades, 80 logical pricing updates, and 40 private account
   updates.
-- 70,248 feed outputs and 65,258 coordinator storage records.
+- 70,208 feed outputs and 65,153 coordinator storage records.
 
 The coordinator runs in observe mode. Strategy and pre-trade risk decisions are
 executed, but order entry is disabled so a synthetic benchmark cannot create an
@@ -174,3 +174,23 @@ benchmark with recorded target-market captures on the deployment host and add
 end-to-end timestamping around the actual sockets and gateway. The immediate
 trading-readiness blocker remains the credentialed OKX demo soak, not a queue or
 runtime rewrite.
+
+## Determinism Regression Gate
+
+The research-verification determinism audit was profiled on 2026-07-14 against
+pre-change commit `bacd132`. Stable quote and hedge traversal is precomputed at
+strategy construction; the event loop retains hash lookups and does not sort or
+allocate a risk-group symbol list on each book update.
+
+An initial implementation allocated that temporary list on every recalculation.
+The live benchmark exposed exactly 40,204 extra coordinator allocations, raising
+the complete path from `76.56` to `77.36` allocation calls per raw frame. That
+implementation was discarded. The final implementation matched the pre-change
+`76.56` calls per raw frame and reduced requested bytes from `21,482.9` to
+`21,444.5` per raw frame by retaining references in temporary quote state.
+
+Three consecutive final live-path runs measured `11,627.2`, `11,620.2`, and
+`11,684.7 ns/raw frame`; the median was `11.63 us`. Three warm strategy-only
+runs measured `10,893.0`, `10,921.7`, and `10,882.6 ns/event`, each producing
+999,996 intents. This is evidence against a local regression, not a target-host
+latency or throughput certification.

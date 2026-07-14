@@ -12,7 +12,7 @@ pub use private::*;
 pub use reconcile::*;
 pub use transport::*;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -151,7 +151,7 @@ impl OrderSnapshot {
 
 #[derive(Debug, Clone, Default)]
 pub struct OrderReducer {
-    orders: HashMap<String, OrderSnapshot>,
+    orders: BTreeMap<String, OrderSnapshot>,
     seen_updates: HashSet<UpdateKey>,
 }
 

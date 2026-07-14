@@ -614,6 +614,14 @@ and selected by a stable seed/class/symbol/event-ordinal quantile, so runs are
 reproducible regardless of rule order. Reports include actual per-class/symbol
 sample count, total, minimum, maximum, and mean latency.
 
+Strategy quote and hedge command assembly traverses symbols and risk groups in
+stable order. This follows the pinned Java `ChaosContext`, whose `tradeSymbols`
+is explicitly a `TreeSet` to keep results consistent between runs. Portfolio
+currency/position reductions, matching-engine order reductions, and matcher
+aggregation are likewise ordered. Workspace JSON parsing enables exact `f64`
+round trips so writing and re-reading evidence cannot move a PnL or risk value
+by one ULP.
+
 The live composition collects corresponding measurements only after an input
 survives parsing, deduplication, sequencing, and reduction. Reports use a
 bounded deterministic reservoir per class/symbol/semantics and bind the full
@@ -783,6 +791,16 @@ with the artifact's recorded options, and compares the complete result after
 normalizing source paths to content hashes. This separates generator output from
 acceptance evidence and permits archive relocation without permitting byte or
 profile drift.
+
+The CLI also independently verifies a research report. It reads bounded regular
+manifest/report files, rejects symlinks and path collision, requires the pinned
+Java revision plus the current executable/version, re-runs the complete
+manifest, and compares the full report after normalizing only canonical paths
+introduced by capture verification to their content hashes. Unknown, duplicate,
+omitted, stale, forged, non-passing, or numerically different results fail closed. The
+verification artifact carries the exact source hashes and a bounded first
+difference diagnostic; it remains simulation evidence rather than production
+authorization.
 
 ### `reap-capture`
 

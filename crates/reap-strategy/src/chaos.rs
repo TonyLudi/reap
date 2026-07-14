@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, DefaultHasher};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,8 @@ const ORDER_CHECK_DELTA_THRESHOLD_USD: f64 = 51.0;
 const ZOMBIE_HEDGE_THRESHOLD_MS: TimeMs = 30_000;
 const EXCHANGE_MARGIN_RATIO_THRESHOLD: f64 = 5.0;
 const EPS: f64 = 1e-9;
+
+type StableMap<K, V> = HashMap<K, V, BuildHasherDefault<DefaultHasher>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1033,8 +1036,8 @@ impl InstrumentKindConfig {
 #[derive(Debug, Clone)]
 pub struct ChaosStrategy {
     config: ChaosConfig,
-    entities: HashMap<Symbol, InstrumentState>,
-    risk_groups: HashMap<String, RiskGroupState>,
+    entities: StableMap<Symbol, InstrumentState>,
+    risk_groups: StableMap<String, RiskGroupState>,
     symbol_to_group: HashMap<Symbol, String>,
     index_symbols: HashSet<Symbol>,
     index_prices: HashMap<Symbol, Price>,
@@ -1047,8 +1050,8 @@ pub struct ChaosStrategy {
     burst_symbol: Option<Symbol>,
     best_hedges: HashMap<Side, Vec<HedgeLevel>>,
     hedge_candidate_scratch: Vec<HedgeCandidate>,
-    active_quotes: HashMap<(Symbol, Side, usize), ActiveQuote>,
-    active_hedges: HashMap<String, ActiveHedge>,
+    active_quotes: StableMap<(Symbol, Side, usize), ActiveQuote>,
+    active_hedges: StableMap<String, ActiveHedge>,
     quote_targets: HashMap<(Symbol, Side), QuoteTargetState>,
     last_quote_fill_ms: HashMap<(Symbol, Side), TimeMs>,
     random: JavaRandom,
@@ -1076,7 +1079,7 @@ impl ChaosStrategy {
             return Err(validation);
         }
 
-        let mut risk_groups = HashMap::new();
+        let mut risk_groups = StableMap::default();
         for rg in &config.risk_groups {
             risk_groups.insert(rg.name.clone(), RiskGroupState::new(rg.clone()));
         }
@@ -1087,7 +1090,7 @@ impl ChaosStrategy {
             );
         }
 
-        let mut entities = HashMap::new();
+        let mut entities = StableMap::default();
         let mut symbol_to_group = HashMap::new();
         let index_symbols = config
             .instruments
@@ -1139,8 +1142,11 @@ impl ChaosStrategy {
             if rg.symbols.is_empty() {
                 rg.symbols.extend(rg.config.symbols.iter().cloned());
             }
+            rg.ordered_symbols.clear();
+            rg.ordered_symbols.extend(rg.symbols.iter().cloned());
+            rg.ordered_symbols.sort();
             rg.max_quote_size_usd = rg
-                .symbols
+                .ordered_symbols
                 .iter()
                 .filter_map(|symbol| entities.get(symbol))
                 .map(|entity| entity.config.max_order_size_usd)
@@ -1187,8 +1193,8 @@ impl ChaosStrategy {
             burst_symbol: None,
             best_hedges,
             hedge_candidate_scratch: Vec::new(),
-            active_quotes: HashMap::new(),
-            active_hedges: HashMap::new(),
+            active_quotes: StableMap::default(),
+            active_hedges: StableMap::default(),
             quote_targets: HashMap::new(),
             last_quote_fill_ms: HashMap::new(),
             random: JavaRandom::new(1),
@@ -1295,7 +1301,9 @@ impl ChaosStrategy {
             && self.delta_usd >= -0.5 * self.config.delta_limit_usd;
 
         let mut commands = Vec::new();
-        let symbols: Vec<_> = self.entities.keys().cloned().collect();
+        // Java ChaosContext uses a TreeSet here so backtest command order is stable.
+        let mut symbols = self.entities.keys().cloned().collect::<Vec<_>>();
+        symbols.sort();
         for symbol in symbols {
             for side in [Side::Buy, Side::Sell] {
                 let can_side = match side {
@@ -1632,7 +1640,7 @@ impl ChaosStrategy {
         for group_name in group_names {
             let mut worst: Option<(Symbol, Symbol, f64)> = None;
             if let Some(group) = self.risk_groups.get(&group_name) {
-                for symbol in &group.symbols {
+                for symbol in &group.ordered_symbols {
                     let Some(entity) = self.entities.get(symbol) else {
                         continue;
                     };
@@ -1794,14 +1802,15 @@ impl ChaosStrategy {
             })
             .collect::<Vec<_>>();
 
-        let active_levels = self
+        let mut active_levels = self
             .active_quotes
             .iter()
             .filter(|((active_symbol, active_side, _), _)| {
                 active_symbol == symbol && *active_side == side
             })
-            .map(|((_, _, level), quote)| (*level, quote.clone()))
-            .collect::<HashMap<_, _>>();
+            .map(|((_, _, level), quote)| (*level, quote))
+            .collect::<Vec<_>>();
+        active_levels.sort_unstable_by_key(|(level, _)| *level);
 
         for (level, active) in &active_levels {
             let matches = desired.get(*level).is_some_and(|(price, qty)| {
@@ -1822,7 +1831,11 @@ impl ChaosStrategy {
         }
 
         for (level, (price, qty)) in desired.into_iter().enumerate() {
-            let current_matches = active_levels.get(&level).is_some_and(|active| {
+            let active = active_levels
+                .binary_search_by_key(&level, |(active_level, _)| *active_level)
+                .ok()
+                .map(|index| active_levels[index].1);
+            let current_matches = active.is_some_and(|active| {
                 approx_eq(active.price, price)
                     && (approx_eq(active.qty, qty)
                         || (level == 0 && refill_blocked && active.qty < qty))
@@ -1830,7 +1843,7 @@ impl ChaosStrategy {
             if current_matches {
                 continue;
             }
-            if level == 0 && refill_blocked && !active_levels.contains_key(&level) {
+            if level == 0 && refill_blocked && active.is_none() {
                 continue;
             }
             commands.push(OrderIntent::NewOrder(NewOrder {
@@ -1912,7 +1925,7 @@ impl ChaosStrategy {
             let mut spot_delta_coin = 0.0;
             let mut derivative_delta_coin = 0.0;
             let mut seen_spot_balances = HashSet::new();
-            for symbol in &rg.symbols {
+            for symbol in &rg.ordered_symbols {
                 if let Some(entity) = self.entities.get(symbol) {
                     if entity.config.kind.is_spot() {
                         let balance_key = if entity.config.base_currency.is_empty() {
@@ -1988,7 +2001,8 @@ impl ChaosStrategy {
         self.best_hedges.entry(Side::Sell).or_default().clear();
 
         let mut levels = std::mem::take(&mut self.hedge_candidate_scratch);
-        let group_names: Vec<_> = self.risk_groups.keys().cloned().collect();
+        let mut group_names = self.risk_groups.keys().cloned().collect::<Vec<_>>();
+        group_names.sort();
         for group_name in group_names {
             let candidate_notional_limit = self
                 .hedge_selection_target(&group_name)
@@ -1996,7 +2010,7 @@ impl ChaosStrategy {
             for side in [Side::Buy, Side::Sell] {
                 levels.clear();
                 if let Some(rg) = self.risk_groups.get(&group_name) {
-                    for symbol in &rg.symbols {
+                    for symbol in &rg.ordered_symbols {
                         let Some(entity) = self.entities.get(symbol) else {
                             continue;
                         };
@@ -2069,7 +2083,7 @@ impl ChaosStrategy {
             };
             let mut max_basis = 0.0;
             let mut max_symbol = String::new();
-            for symbol in &group.symbols {
+            for symbol in &group.ordered_symbols {
                 let Some(entity) = self.entities.get(symbol) else {
                     continue;
                 };
@@ -2188,7 +2202,7 @@ impl ChaosStrategy {
     fn hedge_selection_target(&self, group_name: &str) -> Option<f64> {
         let rg = self.risk_groups.get(group_name)?;
         let hedge_required_for_quote = rg
-            .symbols
+            .ordered_symbols
             .iter()
             .filter_map(|symbol| self.entities.get(symbol))
             .map(|entity| entity.config.max_order_size_usd)
@@ -2201,13 +2215,14 @@ impl ChaosStrategy {
     }
 
     fn update_theo_quotes(&mut self) {
-        let group_names: Vec<_> = self.risk_groups.keys().cloned().collect();
+        let mut group_names = self.risk_groups.keys().cloned().collect::<Vec<_>>();
+        group_names.sort();
         for group_name in group_names {
             for side in [Side::Buy, Side::Sell] {
                 let Some(rg) = self.risk_groups.get(&group_name) else {
                     continue;
                 };
-                let symbols: Vec<_> = rg.symbols.iter().cloned().collect();
+                let symbols = rg.ordered_symbols.clone();
                 if !rg.can_quote_side(side)
                     || rg.live_order_size_usd
                         > LIVE_ORDER_STOP_QUOTE_THRESHOLD * rg.config.live_order_limit_usd
@@ -2585,7 +2600,9 @@ impl ChaosStrategy {
             total += use_notional;
         }
 
-        out.into_values().collect()
+        let mut targets = out.into_values().collect::<Vec<_>>();
+        targets.sort_by(|left, right| left.symbol.cmp(&right.symbol));
+        targets
     }
 
     fn ref_mid(&self) -> Option<f64> {
@@ -4065,6 +4082,7 @@ impl DebouncedCondition {
 pub struct RiskGroupState {
     pub config: RiskGroupConfig,
     pub symbols: HashSet<Symbol>,
+    ordered_symbols: Vec<Symbol>,
     pub max_quote_size_usd: f64,
     pub delta_usd: f64,
     pub pending_delta_usd: f64,
@@ -4074,18 +4092,22 @@ pub struct RiskGroupState {
     margin_adjusted_equity_usd: Option<f64>,
     margin_notional_usd: Option<f64>,
     pub best_hedges: HashMap<Side, Vec<HedgeLevel>>,
-    account_balances: HashMap<String, AccountBalanceState>,
+    account_balances: StableMap<String, AccountBalanceState>,
 }
 
 impl RiskGroupState {
     fn new(config: RiskGroupConfig) -> Self {
-        let symbols = config.symbols.iter().cloned().collect();
+        let mut ordered_symbols = config.symbols.clone();
+        ordered_symbols.sort();
+        ordered_symbols.dedup();
+        let symbols = ordered_symbols.iter().cloned().collect();
         let mut best_hedges = HashMap::new();
         best_hedges.insert(Side::Buy, Vec::new());
         best_hedges.insert(Side::Sell, Vec::new());
         Self {
             config,
             symbols,
+            ordered_symbols,
             max_quote_size_usd: 0.0,
             delta_usd: 0.0,
             pending_delta_usd: 0.0,
@@ -4095,7 +4117,7 @@ impl RiskGroupState {
             margin_adjusted_equity_usd: None,
             margin_notional_usd: None,
             best_hedges,
-            account_balances: HashMap::new(),
+            account_balances: StableMap::default(),
         }
     }
 
