@@ -211,7 +211,7 @@ enum Command {
         confirm_production: bool,
         #[arg(
             long,
-            default_value_t = 30,
+            default_value_t = 40,
             help = "Absolute deadline for each account"
         )]
         account_timeout_secs: u64,
@@ -223,6 +223,12 @@ enum Command {
             help = "OKX Cancel All After trigger delay (10-120 seconds)"
         )]
         deadman_timeout_secs: u64,
+        #[arg(
+            short,
+            long,
+            help = "Create a JSON evidence artifact; an existing path is refused"
+        )]
+        output: Option<PathBuf>,
         #[arg(long, help = "Pretty-print JSON evidence")]
         pretty: bool,
     },
@@ -593,11 +599,27 @@ async fn main() -> Result<()> {
             account_timeout_secs,
             poll_interval_ms,
             deadman_timeout_secs,
+            output,
             pretty,
         } => {
             reap_telemetry::init_json_tracing("info")
                 .map_err(anyhow::Error::msg)
                 .context("failed to initialize emergency-cancel tracing")?;
+            let mut output_file = output
+                .as_ref()
+                .map(|output| {
+                    OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(output)
+                        .with_context(|| {
+                            format!(
+                                "failed to reserve emergency-cancel output {}",
+                                output.display()
+                            )
+                        })
+                })
+                .transpose()?;
             let report = run_emergency_cancel_path(
                 &config,
                 EmergencyCancelOptions {
@@ -618,15 +640,29 @@ async fn main() -> Result<()> {
                     config.display()
                 )
             })?;
-            if pretty {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+            let json = if pretty {
+                serde_json::to_string_pretty(&report)?
             } else {
-                println!("{}", serde_json::to_string(&report)?);
+                serde_json::to_string(&report)?
+            };
+            if let Some(file) = &mut output_file {
+                file.write_all(json.as_bytes())?;
+                file.write_all(b"\n")?;
+                file.sync_all()?;
             }
-            if !report.all_clear {
+            println!("{json}");
+            if !report.regular_orders_all_clear {
                 anyhow::bail!(
                     "emergency cancel did not verify every selected account's regular order book at zero"
                 );
+            }
+            if !report.evidence_complete {
+                anyhow::bail!(
+                    "emergency cancel reached regular-order zero but its provenance evidence is incomplete"
+                );
+            }
+            if !report.all_clear {
+                anyhow::bail!("emergency cancel report violated its all-clear invariant");
             }
         }
     }

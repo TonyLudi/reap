@@ -186,6 +186,10 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Add a strategy-independent, explicitly confirmed OKX emergency command
   that arms Cancel All After, cancels regular orders account-wide, and proves
   zero after the trigger horizon; document the algo/spread exclusion.
+- [x] Make emergency-cancel evidence create-new and fsynced, bind it to a
+  schema, exact config file, binary, host, Java revision, and the same
+  pseudonymous exchange-account identity as live reports; turn account task
+  failures into bounded non-passing evidence instead of losing the report.
 - [x] Add hardened systemd templates with bounded observe restart and manual
   demo/capture restart, plus the stop/cancel/reconcile operating procedure.
 - [ ] Run credentialed bounded observe and minimal-size demo fault campaigns,

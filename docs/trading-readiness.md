@@ -79,8 +79,12 @@ production trading process.
     settings, refuses implicit account selection, requires producer-stop and
     account-wide confirmations, arms Cancel All After, batch-cancels every
     regular pending order across configured and unmanaged symbols, and verifies
-    account-wide zero after the trigger horizon. Its deterministic tests cover a
-    failed deadman, partial batch acknowledgement, and hung REST transport.
+    account-wide zero after the trigger horizon. Its create-new schema-1 report
+    binds the exact config file, executable, host, Java revision, matching
+    pseudonymous exchange-account identity, selected-account coverage, and
+    bounded task failures before returning its final exit status. Its
+    deterministic tests cover a failed deadman, partial batch acknowledgement,
+    hung REST transport, missing credentials, identity failure, and task loss.
 14. Hardened systemd templates permit bounded restart only for read-only observe
     mode. Demo and capture require operator-controlled restart so account
     reconciliation and capture-session rotation cannot be bypassed.

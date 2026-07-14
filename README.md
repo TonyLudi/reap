@@ -44,8 +44,9 @@ Implemented:
   fail-closed periodic enforcement outside the strategy loop.
 - A strategy-independent OKX emergency command that arms account-wide Cancel All
   After, batch-cancels regular orders on every symbol, and requires a post-trigger
-  zero-order proof, plus hardened systemd templates with mode-specific restart
-  policy.
+  zero-order proof. Its create-new schema-versioned artifact binds the exact
+  input file, binary, host, Java revision, account coverage, and task failures,
+  plus hardened systemd templates with mode-specific restart policy.
 - Deterministic backtest matching with `PendingNew`, delayed entry/cancel/update
   boundaries, `PostOnly`, `IOC`, conservative displayed-depth fills, trade
   fills, queue-ahead tracking, fee/turnover attribution, scheduled linear and
@@ -184,13 +185,20 @@ path can cancel and verify all regular pending orders without loading strategy o
 journal state. It intentionally excludes OKX algo and spread orders:
 
 ```bash
+EMERGENCY_REPORT="/tmp/reap-emergency-$(date -u +%Y%m%dT%H%M%SZ).json"
 cargo run -p reap-cli -- emergency-cancel \
   --config examples/live-okx-demo.toml \
   --account main \
   --confirm-account-wide-cancel \
   --confirm-order-producers-stopped \
+  --output "$EMERGENCY_REPORT" \
   --pretty
 ```
+
+The output path is reserved before parsing credentials or starting REST work.
+`all_clear = true` requires both `regular_orders_all_clear = true` and complete
+config/binary/host/exchange-account/task evidence; early configuration failures
+leave an empty reserved path, which is never a report.
 
 Run a bounded observe soak and return a non-zero status unless the runtime
 reaches readiness, finishes the requested window, records no reconciliation

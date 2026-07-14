@@ -379,7 +379,14 @@ per-account deadline, deadman arm, bounded request pacing, batch cancellation,
 and repeated account-wide pending-order queries. This separation keeps the kill
 path usable after live-process or strategy-state failure. OKX algo and spread
 orders are outside this regular-order scope and remain an operationally explicit
-venue procedure.
+venue procedure. Its optional CLI evidence path is reserved before config or
+network work and fsynced before exit. The schema-versioned report hashes the
+exact input file without invoking the live parser, uses the same executable and
+host identity hashes as live evidence, samples the same pseudonymous OKX
+UID/main-UID account identity only after zero is proven, records the pinned Java
+revision, and converts account-task join failures into bounded evidence.
+`all_clear` requires both account-complete regular-order zero proof and complete
+provenance; an early parse/validation failure leaves only an empty reserved path.
 
 Later, if the strategy loop becomes latency-critical, replace the async receive
 with a pinned OS thread and a bounded SPSC queue.
@@ -626,7 +633,7 @@ Target command surface:
 ```text
 reap live --config config/live.toml
 reap capture --config config/capture.toml
-reap emergency-cancel --config config/live.toml --account account-id
+reap emergency-cancel --config config/live.toml --account account-id --output emergency.json
 reap operator --config config/live.toml status
 reap backtest --config config/backtest.toml --events data/events.jsonl
 reap replay-check --events data/events.jsonl

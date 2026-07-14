@@ -1,6 +1,4 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::File;
-use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -33,12 +31,15 @@ use reap_venue::okx::{
 };
 use reap_venue::{PrivateOrderState, PrivateOrderUpdate, RemoteFill, RemoteOrder, VenueAdapter};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::convergence::{FillConvergenceGuard, OrderStateConvergenceGuard};
+use crate::provenance::{
+    current_executable_sha256 as hash_current_executable,
+    host_identity_sha256 as hash_host_identity, okx_account_identity_sha256,
+};
 use crate::{
     AccountBootstrapSnapshot, CancelAction, CoordinatorError, CoordinatorOutput, HostGuardRuntime,
     HostHealthError, HostHealthSnapshot, LiveAction, LiveConfig, LiveConfigError, LiveCoordinator,
@@ -3769,57 +3770,17 @@ fn push_public_subscription(
 }
 
 fn current_executable_sha256() -> Result<String, LiveRuntimeError> {
-    #[cfg(target_os = "linux")]
-    let path = std::path::PathBuf::from("/proc/self/exe");
-    #[cfg(not(target_os = "linux"))]
-    let path =
-        std::env::current_exe().map_err(|error| LiveRuntimeError::Provenance(error.to_string()))?;
-    let mut file = File::open(&path).map_err(|error| {
-        LiveRuntimeError::Provenance(format!(
-            "failed to open executable {}: {error}",
-            path.display()
-        ))
-    })?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer).map_err(|error| {
-            LiveRuntimeError::Provenance(format!(
-                "failed to hash executable {}: {error}",
-                path.display()
-            ))
-        })?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
+    hash_current_executable().map_err(LiveRuntimeError::Provenance)
 }
 
 fn host_identity_sha256() -> Result<String, LiveRuntimeError> {
-    let machine_id = std::fs::read("/etc/machine-id").map_err(|error| {
-        LiveRuntimeError::Provenance(format!("failed to read /etc/machine-id: {error}"))
-    })?;
-    let machine_id = machine_id
-        .strip_suffix(b"\n")
-        .unwrap_or(machine_id.as_slice());
-    if machine_id.is_empty() {
-        return Err(LiveRuntimeError::Provenance(
-            "/etc/machine-id is empty".to_string(),
-        ));
-    }
-    Ok(identity_sha256(b"reap-host-v1", &[machine_id]))
+    hash_host_identity().map_err(LiveRuntimeError::Provenance)
 }
 
 fn account_identity_sha256s(
     config: &LiveConfig,
     snapshots: &HashMap<String, AccountBootstrapSnapshot>,
 ) -> Result<BTreeMap<String, String>, LiveRuntimeError> {
-    let environment = match config.venue.environment {
-        TradingEnvironment::Demo => b"demo".as_slice(),
-        TradingEnvironment::Production => b"production".as_slice(),
-    };
     config
         .accounts
         .iter()
@@ -3832,29 +3793,15 @@ fn account_identity_sha256s(
             })?;
             Ok((
                 account.id.clone(),
-                identity_sha256(
-                    b"reap-okx-account-v1",
-                    &[
-                        environment,
-                        account.id.as_bytes(),
-                        snapshot.account_config.user_id.trim().as_bytes(),
-                        snapshot.account_config.main_user_id.trim().as_bytes(),
-                    ],
+                okx_account_identity_sha256(
+                    config.venue.environment,
+                    &account.id,
+                    &snapshot.account_config.user_id,
+                    &snapshot.account_config.main_user_id,
                 ),
             ))
         })
         .collect()
-}
-
-fn identity_sha256(domain: &[u8], fields: &[&[u8]]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update((domain.len() as u64).to_le_bytes());
-    hasher.update(domain);
-    for field in fields {
-        hasher.update((field.len() as u64).to_le_bytes());
-        hasher.update(field);
-    }
-    format!("{:x}", hasher.finalize())
 }
 
 fn private_subscriptions(enable_vip_fills_channel: bool) -> Vec<Subscription> {
@@ -3982,10 +3929,19 @@ mod tests {
 
     #[test]
     fn pseudonymous_identity_hash_is_stable_and_field_delimited() {
-        let first = identity_sha256(b"account", &[b"ab", b"c"]);
-        assert_eq!(first, identity_sha256(b"account", &[b"ab", b"c"]));
-        assert_ne!(first, identity_sha256(b"account", &[b"a", b"bc"]));
-        assert_ne!(first, identity_sha256(b"host", &[b"ab", b"c"]));
+        let first = crate::provenance::identity_sha256(b"account", &[b"ab", b"c"]);
+        assert_eq!(
+            first,
+            crate::provenance::identity_sha256(b"account", &[b"ab", b"c"])
+        );
+        assert_ne!(
+            first,
+            crate::provenance::identity_sha256(b"account", &[b"a", b"bc"])
+        );
+        assert_ne!(
+            first,
+            crate::provenance::identity_sha256(b"host", &[b"ab", b"c"])
+        );
         assert_eq!(first.len(), 64);
     }
 

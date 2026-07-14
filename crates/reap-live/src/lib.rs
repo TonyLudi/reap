@@ -6,6 +6,7 @@ mod emergency;
 mod host;
 mod latency;
 mod operator;
+mod provenance;
 mod runtime;
 mod startup;
 

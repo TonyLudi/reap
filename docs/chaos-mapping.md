@@ -205,7 +205,7 @@ The following differences do not change the covered quote/hedge calculations:
 | `PositionGatewaySafeguard.OrsFillDelayToPositionUpdate` and the fill-derived position reconciler | Per-fill derivative-position or spot-currency convergence deadline plus monotonic rows, full REST comparison, tombstone repair, and second-pass confirmation | Equivalent fail-closed intent; Rust uses an explicit post-fill deadline rather than Java's two-cycle timestamp-difference check |
 | `PositionGatewaySafeguard.PosnMgnModeMismatch` | Required OKX `mgnMode` on websocket/REST positions, configured-mode bootstrap/runtime enforcement, and reconciliation comparison | Equivalent fail-closed intent; Rust aborts the live lifecycle instead of pausing inside a separate gateway process |
 | `PositionGatewaySafeguard.ForcedRepaymentIndicator` | Typed OKX balance `twap`, configured `1..=5` limit, bootstrap/runtime account-state rejection, tombstone clearing, and reconciliation comparison | Stronger: Java emits alert-only, while Rust fails closed at or above the configured level |
-| `ChaosStrategyEngine.tryToStop`, `ChaosStrategyBase.cancelAll(entity)`, and `ExchCancelAll` | In-process canonical cancel/reconcile plus a separate account-wide regular-order emergency CLI | Equivalent normal stop with an additional process-independent safety layer |
+| `ChaosStrategyEngine.tryToStop`, `ChaosStrategyBase.cancelAll(entity)`, `ExchCancelAll`, and `OkxNitroOrderClient.onOrderSessionDisconnected` | In-process canonical cancel/reconcile plus a separate account-wide regular-order emergency CLI | Equivalent normal/disconnect cancellation with an additional process-independent final-zero safety layer |
 
 The reviewed Java OKX subscriber and `chaos-iarb2` classes do not provide the
 Rust runtime's place-request `expTime`, `/public/time` skew gate, Cancel All
@@ -234,7 +234,14 @@ depend on it for the incident path: the separate command arms the exchange
 deadman, enumerates all regular pending orders for the selected account, cancels
 configured and unmanaged symbols, and proves zero after the trigger horizon.
 This is intentionally broader than strategy-owned Java entities and explicitly
-does not claim coverage of OKX algo or spread order classes.
+does not claim coverage of OKX algo or spread order classes. At the pinned
+revision, `OkxNitroOrderClient` also rejects new sends with `REQUEST_BLOCKED`
+while its websocket state is not `CONNECTED`; on order-session disconnect it
+calls `cancelAll()`, whose implementation combines maker mass-cancel, local
+open-order-cache cancellation, and exchange open-order polling. The independent
+Rust command strengthens the audit boundary with an exact-config, binary, host,
+Java-revision, exchange-account-identity, account-coverage, and
+task-failure-bound artifact written before its final exit status.
 
 ## Live Event Requirements
 

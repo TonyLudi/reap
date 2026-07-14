@@ -728,15 +728,17 @@ Incident procedure:
 
 ```bash
 umask 077
+REPORT=/var/lib/reap/live/btc-demo/emergency-cancel-$(date -u +%Y%m%dT%H%M%SZ).json
 /usr/local/bin/reap emergency-cancel \
   --config /etc/reap/live/btc-demo.toml \
   --account main \
   --confirm-account-wide-cancel \
   --confirm-order-producers-stopped \
   --confirm-production \
-  --account-timeout-secs 30 \
+  --account-timeout-secs 40 \
   --deadman-timeout-secs 10 \
-  --pretty > /var/lib/reap/live/btc-demo/emergency-cancel.json
+  --output "$REPORT" \
+  --pretty
 ```
 
 `--confirm-production` is mandatory for a production venue config and harmless
@@ -749,14 +751,23 @@ account's producers have been stopped and replaces all `--account` arguments.
    Every REST call and pacing delay shares one absolute account timeout. A batch
    acknowledgement is only request acceptance; the final REST zero observation
    is authoritative.
-5. Require process exit zero, top-level `all_clear = true`, and each account's
-   `deadman_armed = true` and `verified_zero_after_deadman = true`. Review all
-   incidents, partial/rejected/unacknowledged cancel counts, unmanaged symbols,
-   and remaining-order details even when the final zero check succeeds.
-6. Independently inspect OKX regular, algo, and spread orders plus balances and
-   positions. Archive the report with the incident journal. A non-zero command
-   exit or missing/failed account report means zero was not proven and requires
-   venue UI/API escalation.
+5. `--output` is create-new, reserved before config/credential/network work,
+   written and fsynced before the final exit status. Require schema 1, the
+   archived exact-config SHA-256, pinned Java revision, expected Reap binary and
+   host hashes, and each pseudonymous `account_identity_sha256` matching the
+   corresponding live report. Require `regular_orders_all_clear = true`,
+   `evidence_complete = true`, and top-level `all_clear = true`. Each account
+   must have `deadman_armed = true` and `verified_zero_after_deadman = true`.
+   Review all provenance, execution, and account incidents, plus
+   partial/rejected/unacknowledged cancel counts, unmanaged symbols, and
+   remaining-order details even when final zero succeeds. An account-task
+   failure is retained as non-passing evidence.
+6. A failure before report construction leaves the reserved file empty; archive
+   it with process logs but never treat it as JSON evidence. Independently
+   inspect OKX regular, algo, and spread orders plus balances and positions.
+   Archive the report with the incident journal. A non-zero command exit or
+   missing/failed account report means zero was not proven and requires venue
+   UI/API escalation.
 7. Leave demo trading stopped. Recover the immutable journal, reconcile exchange
    orders/fills/positions, and start `observe` first. Restore demo entry only
    after clean readiness and explicit operator approval; never auto-restart from

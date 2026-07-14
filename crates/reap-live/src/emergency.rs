@@ -3,6 +3,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use reap_core::PINNED_JAVA_REVISION;
 use reap_order::{PacingPolicy, RequestKind, RequestPacer};
 use reap_venue::RemoteOrder;
 use reap_venue::okx::{
@@ -14,12 +15,17 @@ use thiserror::Error;
 use tokio::task::JoinSet;
 use url::Url;
 
+use crate::provenance::{
+    current_executable_sha256, host_identity_sha256, okx_account_identity_sha256, sha256_bytes,
+};
 use crate::{OkxVenueConfig, RuntimeConfig, TradingEnvironment};
 
 const MAX_INCIDENTS: usize = 64;
+const MAX_INCIDENT_MESSAGE_BYTES: usize = 4_096;
 const MAX_REMAINING_ORDER_DETAILS: usize = 100;
 const REGULAR_ORDER_SCOPE: &str = "okx_regular_orders";
 const EXCLUDED_ORDER_CLASSES: [&str; 2] = ["algo_orders", "spread_orders"];
+pub const EMERGENCY_CANCEL_REPORT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct EmergencyCancelOptions {
@@ -41,7 +47,7 @@ impl Default for EmergencyCancelOptions {
             confirm_account_wide_cancel: false,
             confirm_order_producers_stopped: false,
             confirm_production: false,
-            account_timeout: Duration::from_secs(30),
+            account_timeout: Duration::from_secs(40),
             poll_interval: Duration::from_millis(250),
             deadman_timeout_secs: 10,
         }
@@ -49,6 +55,7 @@ impl Default for EmergencyCancelOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EmergencyOrderRef {
     pub symbol: String,
     pub exchange_order_id: String,
@@ -56,8 +63,10 @@ pub struct EmergencyOrderRef {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EmergencyAccountReport {
     pub account_id: String,
+    pub account_identity_sha256: Option<String>,
     pub exchange_clock_sampled: bool,
     pub exchange_clock_skew_ms: Option<u64>,
     pub deadman_armed: bool,
@@ -84,6 +93,7 @@ impl EmergencyAccountReport {
     fn new(account_id: String) -> Self {
         Self {
             account_id,
+            account_identity_sha256: None,
             exchange_clock_sampled: false,
             exchange_clock_skew_ms: None,
             deadman_armed: false,
@@ -116,13 +126,25 @@ impl EmergencyAccountReport {
     fn push_incident(&mut self, message: impl Into<String>) {
         self.incident_count = self.incident_count.saturating_add(1);
         if self.incidents.len() < MAX_INCIDENTS {
-            self.incidents.push(message.into());
+            self.incidents
+                .push(truncate_utf8(message.into(), MAX_INCIDENT_MESSAGE_BYTES));
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EmergencyCancelReport {
+    pub schema_version: u32,
+    pub report_id: String,
+    /// SHA-256 of the exact emergency input file, without invoking the live parser.
+    pub config_file_sha256: String,
+    pub java_reference_revision: String,
+    pub reap_version: String,
+    pub executable_sha256: Option<String>,
+    pub host_identity_sha256: Option<String>,
+    pub provenance_incident_count: u64,
+    pub provenance_incidents: Vec<String>,
     pub environment: TradingEnvironment,
     pub scope: String,
     pub excluded_order_classes: Vec<String>,
@@ -133,6 +155,10 @@ pub struct EmergencyCancelReport {
     pub deadman_timeout_secs: u64,
     pub selected_accounts: Vec<String>,
     pub accounts: Vec<EmergencyAccountReport>,
+    pub execution_incident_count: u64,
+    pub execution_incidents: Vec<String>,
+    pub regular_orders_all_clear: bool,
+    pub evidence_complete: bool,
     pub all_clear: bool,
 }
 
@@ -148,8 +174,21 @@ pub enum EmergencyCancelError {
     Parse(#[from] toml::de::Error),
     #[error("emergency cancel configuration is invalid: {0}")]
     Invalid(String),
-    #[error("emergency cancel task failed: {0}")]
-    Join(#[from] tokio::task::JoinError),
+}
+
+#[derive(Debug)]
+struct EmergencyProvenance {
+    config_file_sha256: String,
+    executable_sha256: Option<String>,
+    host_identity_sha256: Option<String>,
+    incidents: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EmergencyCompletion {
+    regular_orders_all_clear: bool,
+    evidence_complete: bool,
+    all_clear: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,6 +287,7 @@ impl EmergencyAccountConfig {
 
 #[derive(Debug, Clone)]
 struct AccountCancelSettings {
+    environment: TradingEnvironment,
     account_timeout: Duration,
     poll_interval: Duration,
     verification_delay: Duration,
@@ -285,20 +325,24 @@ pub async fn run_emergency_cancel_path(
         path: path.to_path_buf(),
         source,
     })?;
+    let provenance = collect_emergency_provenance(sha256_bytes(text.as_bytes()));
     let config: EmergencyFileConfig = toml::from_str(&text)?;
-    run_emergency_cancel(config, options).await
+    run_emergency_cancel(config, options, provenance).await
 }
 
 async fn run_emergency_cancel(
     config: EmergencyFileConfig,
     options: EmergencyCancelOptions,
+    provenance: EmergencyProvenance,
 ) -> Result<EmergencyCancelReport, EmergencyCancelError> {
     let selected = validate_and_select_accounts(&config, &options)?;
     let started_at_ms = unix_time_ms();
+    let report_id = format!("{:x}", unix_time_ns());
     let started = Instant::now();
     let verification_delay =
         Duration::from_secs(options.deadman_timeout_secs).saturating_add(Duration::from_secs(2));
     let settings = AccountCancelSettings {
+        environment: config.venue.environment,
         account_timeout: options.account_timeout,
         poll_interval: options.poll_interval,
         verification_delay,
@@ -306,6 +350,11 @@ async fn run_emergency_cancel(
         max_exchange_clock_skew_ms: config.runtime.max_exchange_clock_skew_ms,
         deadman_timeout_secs: options.deadman_timeout_secs,
     };
+    let mut selected_accounts = selected
+        .iter()
+        .map(|account| account.id.clone())
+        .collect::<Vec<_>>();
+    selected_accounts.sort();
     let mut reports = Vec::new();
     let mut tasks = JoinSet::new();
 
@@ -343,17 +392,33 @@ async fn run_emergency_cancel(
             run_account_cancel(client, account_id, managed_symbols, account_settings).await
         });
     }
-    while let Some(result) = tasks.join_next().await {
-        reports.push(result?);
-    }
+    let mut execution_incident_count = 0;
+    let mut execution_incidents = Vec::new();
+    collect_account_reports(
+        &mut tasks,
+        &mut reports,
+        &mut execution_incident_count,
+        &mut execution_incidents,
+    )
+    .await;
     reports.sort_by(|left, right| left.account_id.cmp(&right.account_id));
-    let mut selected_accounts = reports
-        .iter()
-        .map(|report| report.account_id.clone())
-        .collect::<Vec<_>>();
-    selected_accounts.sort();
-    let all_clear = !reports.is_empty() && reports.iter().all(|report| report.all_clear);
+    let provenance_incident_count = provenance.incidents.len() as u64;
+    let completion = emergency_completion(
+        &selected_accounts,
+        &reports,
+        &provenance,
+        execution_incident_count,
+    );
     Ok(EmergencyCancelReport {
+        schema_version: EMERGENCY_CANCEL_REPORT_SCHEMA_VERSION,
+        report_id,
+        config_file_sha256: provenance.config_file_sha256,
+        java_reference_revision: PINNED_JAVA_REVISION.to_string(),
+        reap_version: env!("CARGO_PKG_VERSION").to_string(),
+        executable_sha256: provenance.executable_sha256,
+        host_identity_sha256: provenance.host_identity_sha256,
+        provenance_incident_count,
+        provenance_incidents: provenance.incidents,
         environment: config.venue.environment,
         scope: REGULAR_ORDER_SCOPE.to_string(),
         excluded_order_classes: EXCLUDED_ORDER_CLASSES
@@ -367,8 +432,115 @@ async fn run_emergency_cancel(
         deadman_timeout_secs: options.deadman_timeout_secs,
         selected_accounts,
         accounts: reports,
-        all_clear,
+        execution_incident_count,
+        execution_incidents,
+        regular_orders_all_clear: completion.regular_orders_all_clear,
+        evidence_complete: completion.evidence_complete,
+        all_clear: completion.all_clear,
     })
+}
+
+fn emergency_completion(
+    selected_accounts: &[String],
+    reports: &[EmergencyAccountReport],
+    provenance: &EmergencyProvenance,
+    execution_incident_count: u64,
+) -> EmergencyCompletion {
+    let reported_accounts = reports
+        .iter()
+        .map(|report| report.account_id.as_str())
+        .collect::<Vec<_>>();
+    let selected_accounts = selected_accounts
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let account_coverage_complete = reported_accounts == selected_accounts;
+    let regular_orders_all_clear = account_coverage_complete
+        && !reports.is_empty()
+        && reports.iter().all(|report| report.all_clear);
+    let evidence_complete = provenance.incidents.is_empty()
+        && is_lower_sha256(&provenance.config_file_sha256)
+        && provenance
+            .executable_sha256
+            .as_deref()
+            .is_some_and(is_lower_sha256)
+        && provenance
+            .host_identity_sha256
+            .as_deref()
+            .is_some_and(is_lower_sha256)
+        && execution_incident_count == 0
+        && account_coverage_complete
+        && reports.iter().all(|report| {
+            report
+                .account_identity_sha256
+                .as_deref()
+                .is_some_and(is_lower_sha256)
+        });
+    EmergencyCompletion {
+        regular_orders_all_clear,
+        evidence_complete,
+        all_clear: regular_orders_all_clear && evidence_complete,
+    }
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn collect_emergency_provenance(config_file_sha256: String) -> EmergencyProvenance {
+    let mut incidents = Vec::new();
+    let executable_sha256 = current_executable_sha256()
+        .map_err(|error| incidents.push(format!("executable provenance failed: {error}")))
+        .ok();
+    let host_identity_sha256 = host_identity_sha256()
+        .map_err(|error| incidents.push(format!("host provenance failed: {error}")))
+        .ok();
+    EmergencyProvenance {
+        config_file_sha256,
+        executable_sha256,
+        host_identity_sha256,
+        incidents,
+    }
+}
+
+async fn collect_account_reports(
+    tasks: &mut JoinSet<EmergencyAccountReport>,
+    reports: &mut Vec<EmergencyAccountReport>,
+    incident_count: &mut u64,
+    incidents: &mut Vec<String>,
+) {
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(report) => reports.push(report),
+            Err(error) => push_incident(
+                incident_count,
+                incidents,
+                format!("emergency account task failed: {error}"),
+            ),
+        }
+    }
+}
+
+fn push_incident(count: &mut u64, incidents: &mut Vec<String>, message: String) {
+    *count = count.saturating_add(1);
+    if incidents.len() < MAX_INCIDENTS {
+        incidents.push(truncate_utf8(message, MAX_INCIDENT_MESSAGE_BYTES));
+    }
+}
+
+fn truncate_utf8(mut value: String, maximum_bytes: usize) -> String {
+    if value.len() <= maximum_bytes {
+        return value;
+    }
+    let mut boundary = maximum_bytes;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
+    value
 }
 
 fn validate_and_select_accounts(
@@ -416,7 +588,7 @@ fn validate_and_select_accounts(
     let evidence_budget = Duration::from_secs(options.deadman_timeout_secs)
         .saturating_add(Duration::from_secs(2))
         .saturating_add(
-            Duration::from_millis(config.runtime.rest_request_timeout_ms).saturating_mul(3),
+            Duration::from_millis(config.runtime.rest_request_timeout_ms).saturating_mul(4),
         )
         .saturating_add(Duration::from_millis(config.runtime.request_window_ms))
         .saturating_add(options.poll_interval);
@@ -662,12 +834,79 @@ where
         .take(MAX_REMAINING_ORDER_DETAILS)
         .map(order_ref)
         .collect();
-    report.elapsed_ms = elapsed_ms(&started);
     if !report.verified_zero_after_deadman && started.elapsed() >= settings.account_timeout {
         report.push_incident("account timeout expired before regular orders were proven zero");
     }
     report.all_clear = report.deadman_armed && report.verified_zero_after_deadman;
+    if report.all_clear {
+        let account_identity_sha256 = sample_account_identity(
+            &client,
+            &clock,
+            &account_id,
+            settings.environment,
+            started,
+            settings.account_timeout,
+            &mut report,
+        )
+        .await;
+        report.account_identity_sha256 = account_identity_sha256;
+    }
+    report.elapsed_ms = elapsed_ms(&started);
     report
+}
+
+async fn sample_account_identity<T>(
+    client: &OkxRestClient<T>,
+    clock: &ExchangeClock,
+    account_id: &str,
+    environment: TradingEnvironment,
+    started: Instant,
+    account_timeout: Duration,
+    report: &mut EmergencyAccountReport,
+) -> Option<String>
+where
+    T: HttpTransport,
+{
+    let timestamp = match clock.timestamp() {
+        Ok(timestamp) => timestamp,
+        Err(error) => {
+            report.push_incident(format!(
+                "failed to format account-identity timestamp: {error}"
+            ));
+            return None;
+        }
+    };
+    match run_bounded(
+        started,
+        account_timeout,
+        client.account_config_at(&timestamp),
+    )
+    .await
+    {
+        Some(Ok(config))
+            if !config.user_id.trim().is_empty() && !config.main_user_id.trim().is_empty() =>
+        {
+            Some(okx_account_identity_sha256(
+                environment,
+                account_id,
+                &config.user_id,
+                &config.main_user_id,
+            ))
+        }
+        Some(Ok(_)) => {
+            report.push_incident("exchange account identity response was empty");
+            None
+        }
+        Some(Err(error)) => {
+            report.push_incident(format!("exchange account identity query failed: {error}"));
+            None
+        }
+        None => {
+            report
+                .push_incident("account timeout expired while querying exchange account identity");
+            None
+        }
+    }
 }
 
 fn observe_orders(
@@ -886,6 +1125,13 @@ fn unix_time_ms() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
+fn unix_time_ns() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
 fn elapsed_ms(started: &Instant) -> u64 {
     duration_ms(started.elapsed())
 }
@@ -953,6 +1199,7 @@ mod tests {
 
     fn settings() -> AccountCancelSettings {
         AccountCancelSettings {
+            environment: TradingEnvironment::Demo,
             account_timeout: Duration::from_secs(1),
             poll_interval: Duration::from_millis(1),
             verification_delay: Duration::ZERO,
@@ -965,6 +1212,139 @@ mod tests {
             max_exchange_clock_skew_ms: 250,
             deadman_timeout_secs: 10,
         }
+    }
+
+    fn complete_provenance() -> EmergencyProvenance {
+        EmergencyProvenance {
+            config_file_sha256: "1".repeat(64),
+            executable_sha256: Some("2".repeat(64)),
+            host_identity_sha256: Some("3".repeat(64)),
+            incidents: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn emergency_completion_requires_account_coverage_and_provenance() {
+        let selected = vec!["main".to_string()];
+        let mut account = EmergencyAccountReport::new("main".to_string());
+        account.all_clear = true;
+        account.account_identity_sha256 = Some("4".repeat(64));
+        let complete = emergency_completion(
+            &selected,
+            std::slice::from_ref(&account),
+            &complete_provenance(),
+            0,
+        );
+        assert_eq!(
+            complete,
+            EmergencyCompletion {
+                regular_orders_all_clear: true,
+                evidence_complete: true,
+                all_clear: true,
+            }
+        );
+
+        let mut missing_host = complete_provenance();
+        missing_host.host_identity_sha256 = None;
+        let incomplete =
+            emergency_completion(&selected, std::slice::from_ref(&account), &missing_host, 0);
+        assert!(incomplete.regular_orders_all_clear);
+        assert!(!incomplete.evidence_complete);
+        assert!(!incomplete.all_clear);
+
+        let mut missing_identity = account.clone();
+        missing_identity.account_identity_sha256 = None;
+        let incomplete =
+            emergency_completion(&selected, &[missing_identity], &complete_provenance(), 0);
+        assert!(incomplete.regular_orders_all_clear);
+        assert!(!incomplete.evidence_complete);
+        assert!(!incomplete.all_clear);
+
+        let missing_account = emergency_completion(&selected, &[], &complete_provenance(), 1);
+        assert!(!missing_account.regular_orders_all_clear);
+        assert!(!missing_account.evidence_complete);
+        assert!(!missing_account.all_clear);
+    }
+
+    #[test]
+    fn emergency_incident_messages_are_utf8_safe_and_bounded() {
+        let message = "\u{20ac}".repeat(2_000);
+        let mut account = EmergencyAccountReport::new("main".to_string());
+        account.push_incident(message.clone());
+        assert!(account.incidents[0].len() <= MAX_INCIDENT_MESSAGE_BYTES);
+        assert!(account.incidents[0].ends_with('\u{20ac}'));
+
+        let mut count = 0;
+        let mut incidents = Vec::new();
+        push_incident(&mut count, &mut incidents, message);
+        assert_eq!(count, 1);
+        assert!(incidents[0].len() <= MAX_INCIDENT_MESSAGE_BYTES);
+        assert!(incidents[0].ends_with('\u{20ac}'));
+    }
+
+    #[tokio::test]
+    async fn account_task_join_failure_becomes_bounded_evidence() {
+        let mut tasks = JoinSet::new();
+        let task = tasks.spawn(std::future::pending::<EmergencyAccountReport>());
+        task.abort();
+        let mut reports = Vec::new();
+        let mut incident_count = 0;
+        let mut incidents = Vec::new();
+
+        collect_account_reports(
+            &mut tasks,
+            &mut reports,
+            &mut incident_count,
+            &mut incidents,
+        )
+        .await;
+
+        assert!(reports.is_empty());
+        assert_eq!(incident_count, 1);
+        assert_eq!(incidents.len(), 1);
+        assert!(incidents[0].contains("emergency account task failed"));
+    }
+
+    #[tokio::test]
+    async fn credential_setup_failure_still_produces_schema_bound_evidence() {
+        const MISSING_ENV: &str = "REAP_EMERGENCY_TEST_MISSING_CREDENTIAL_4F67A6E9";
+        assert!(std::env::var_os(MISSING_ENV).is_none());
+        let config = EmergencyFileConfig {
+            venue: EmergencyVenueConfig::default(),
+            runtime: EmergencyRuntimeConfig::default(),
+            accounts: vec![EmergencyAccountConfig {
+                id: "main".to_string(),
+                api_key_env: MISSING_ENV.to_string(),
+                secret_key_env: MISSING_ENV.to_string(),
+                passphrase_env: MISSING_ENV.to_string(),
+                trade_modes: HashMap::new(),
+            }],
+        };
+        let options = EmergencyCancelOptions {
+            account_ids: vec!["main".to_string()],
+            confirm_account_wide_cancel: true,
+            confirm_order_producers_stopped: true,
+            ..EmergencyCancelOptions::default()
+        };
+
+        let report = run_emergency_cancel(config, options, complete_provenance())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            report.schema_version,
+            EMERGENCY_CANCEL_REPORT_SCHEMA_VERSION
+        );
+        assert_eq!(report.java_reference_revision, PINNED_JAVA_REVISION);
+        assert_eq!(report.selected_accounts, ["main"]);
+        assert_eq!(report.accounts.len(), 1);
+        assert!(report.accounts[0].incidents[0].contains("credential setup failed"));
+        assert!(!report.regular_orders_all_clear);
+        assert!(!report.evidence_complete);
+        assert!(!report.all_clear);
+        let encoded = serde_json::to_vec(&report).unwrap();
+        let decoded: EmergencyCancelReport = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.config_file_sha256, "1".repeat(64));
     }
 
     #[tokio::test]
@@ -981,6 +1361,9 @@ mod tests {
                 r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"reap1","sCode":"0","sMsg":""},{"ordId":"456","clOrdId":"manual1","sCode":"0","sMsg":""}]}"#,
             ),
             response(r#"{"code":"0","msg":"","data":[]}"#),
+            response(
+                r#"{"code":"0","msg":"","data":[{"acctLv":"2","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"7","mainUid":"6"}]}"#,
+            ),
         ]);
 
         let report = run_account_cancel(
@@ -999,12 +1382,19 @@ mod tests {
         assert_eq!(report.accepted_cancel_requests, 2);
         assert_eq!(report.final_open_orders, Some(0));
         assert_eq!(report.unmanaged_symbols, vec!["ETH-USDT"]);
+        assert!(
+            report
+                .account_identity_sha256
+                .as_deref()
+                .is_some_and(is_lower_sha256)
+        );
         let requests = requests.lock().unwrap();
         assert_eq!(requests[0].path, "/api/v5/public/time");
         assert_eq!(requests[1].path, "/api/v5/trade/cancel-all-after");
         assert_eq!(requests[2].path, "/api/v5/trade/orders-pending");
         assert_eq!(requests[3].path, "/api/v5/trade/cancel-batch-orders");
         assert_eq!(requests[4].path, "/api/v5/trade/orders-pending");
+        assert_eq!(requests[5].path, "/api/v5/account/config");
     }
 
     #[tokio::test]
@@ -1030,6 +1420,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn account_identity_failure_preserves_zero_proof_but_not_identity_evidence() {
+        let (client, _) = client(vec![
+            response(r#"{"code":"0","msg":"","data":[{"ts":"1607418537715"}]}"#),
+            response(
+                r#"{"code":"0","msg":"","data":[{"triggerTime":"1607418547715","tag":"","ts":"1607418537715"}]}"#,
+            ),
+            response(r#"{"code":"0","msg":"","data":[]}"#),
+            response(r#"{"code":"50000","msg":"identity unavailable","data":[]}"#),
+        ]);
+
+        let report =
+            run_account_cancel(client, "main".to_string(), HashSet::new(), settings()).await;
+
+        assert!(report.all_clear);
+        assert!(report.account_identity_sha256.is_none());
+        assert!(
+            report
+                .incidents
+                .iter()
+                .any(|incident| incident.contains("account identity query failed"))
+        );
+    }
+
+    #[tokio::test]
     async fn partial_batch_ack_is_reported_but_final_zero_is_authoritative() {
         let (client, _) = client(vec![
             response(r#"{"code":"0","msg":"","data":[{"ts":"1607418537715"}]}"#),
@@ -1043,12 +1457,16 @@ mod tests {
                 r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"reap1","sCode":"51000","sMsg":"rejected"}]}"#,
             ),
             response(r#"{"code":"0","msg":"","data":[]}"#),
+            response(
+                r#"{"code":"0","msg":"","data":[{"acctLv":"2","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"7","mainUid":"6"}]}"#,
+            ),
         ]);
 
         let report =
             run_account_cancel(client, "main".to_string(), HashSet::new(), settings()).await;
 
         assert!(report.all_clear);
+        assert!(report.account_identity_sha256.is_some());
         assert_eq!(report.rejected_cancel_requests, 1);
         assert_eq!(report.unacknowledged_cancel_requests, 1);
         assert_eq!(report.cancel_batch_failures, 0);
