@@ -12,7 +12,7 @@ use reap_feed::{FeedOutput, FeedProcessor, payload_hash};
 use reap_live::{
     LiveConfig, LiveCoordinator, ReconciliationResult, VerifiedBootstrap, VerifiedInstrument,
 };
-use reap_risk::InstrumentRiskModel;
+use reap_risk::{InstrumentOrderLimits, InstrumentRiskModel};
 use reap_storage::StorageRecord;
 use reap_strategy::InstrumentKindConfig;
 use reap_venue::okx::{OkxAdapter, OkxInstrumentType};
@@ -337,6 +337,10 @@ fn benchmark_coordinator_state() -> LiveCoordinator {
                     instrument_type,
                     trade_mode: account.trade_modes[&instrument.symbol],
                     risk_model,
+                    order_limits: InstrumentOrderLimits {
+                        max_limit_quantity: 1_000_000.0,
+                        max_limit_notional_usd: instrument.kind.is_spot().then_some(1_000_000.0),
+                    },
                     tick_size: instrument.tick_size,
                     lot_size: instrument.lot_size,
                     min_size: instrument.min_trade_size,

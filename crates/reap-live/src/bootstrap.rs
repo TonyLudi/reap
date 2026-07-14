@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use reap_core::{AccountUpdate, FillKey};
-use reap_risk::InstrumentRiskModel;
+use reap_risk::{InstrumentOrderLimits, InstrumentRiskModel};
 use reap_strategy::{InstrumentConfig, InstrumentKindConfig};
 use reap_venue::okx::{
     OkxAccountBalanceSnapshot, OkxAccountConfig, OkxAccountPositionsSnapshot, OkxContractType,
@@ -53,6 +53,7 @@ pub struct VerifiedInstrument {
     pub instrument_type: OkxInstrumentType,
     pub trade_mode: OkxTradeModeConfig,
     pub risk_model: InstrumentRiskModel,
+    pub order_limits: InstrumentOrderLimits,
     pub tick_size: f64,
     pub lot_size: f64,
     pub min_size: f64,
@@ -174,6 +175,10 @@ pub fn verify_bootstrap(
                         instrument_type: metadata.instrument_type,
                         trade_mode,
                         risk_model: risk_model(instrument),
+                        order_limits: InstrumentOrderLimits {
+                            max_limit_quantity: metadata.max_limit_size,
+                            max_limit_notional_usd: metadata.max_limit_amount_usd,
+                        },
                         tick_size: metadata.tick_size,
                         lot_size: metadata.lot_size,
                         min_size: metadata.min_size,
@@ -280,6 +285,24 @@ fn instrument_errors(
             "min_trade_size {} is not aligned to exchange lot size {}",
             configured.min_trade_size, exchange.lot_size
         ));
+    }
+    if configured.max_order_size > exchange.max_limit_size + exchange.lot_size * 1e-9 {
+        errors.push(format!(
+            "max_order_size {} exceeds exchange limit-order maximum {}",
+            configured.max_order_size, exchange.max_limit_size
+        ));
+    }
+    if configured.kind.is_spot() {
+        match exchange.max_limit_amount_usd {
+            Some(limit) if configured.max_order_size_usd > limit + limit.abs().max(1.0) * 1e-12 => {
+                errors.push(format!(
+                    "max_order_size_usd {} exceeds exchange limit-order amount maximum {}",
+                    configured.max_order_size_usd, limit
+                ));
+            }
+            Some(_) => {}
+            None => errors.push("exchange omitted spot maxLmtAmt".to_string()),
+        }
     }
     if configured.kind.is_derivative() {
         match exchange.contract_value {
@@ -472,6 +495,10 @@ mod tests {
                         tick_size: 0.1,
                         lot_size: 0.0001,
                         min_size: 0.0001,
+                        max_limit_size: 100.0,
+                        max_market_size: 1_000_000.0,
+                        max_limit_amount_usd: Some(1_000_000.0),
+                        max_market_amount_usd: Some(1_000_000.0),
                         state: "live".to_string(),
                         upcoming_changes: Vec::new(),
                     },
@@ -493,6 +520,10 @@ mod tests {
                         tick_size: 0.1,
                         lot_size: 1.0,
                         min_size: 1.0,
+                        max_limit_size: 1_000_000.0,
+                        max_market_size: 1_000_000.0,
+                        max_limit_amount_usd: None,
+                        max_market_amount_usd: None,
                         state: "live".to_string(),
                         upcoming_changes: Vec::new(),
                     },
@@ -573,6 +604,13 @@ mod tests {
             }
         ));
         assert_eq!(
+            verified.instruments["BTC-USDT"].order_limits,
+            InstrumentOrderLimits {
+                max_limit_quantity: 100.0,
+                max_limit_notional_usd: Some(1_000_000.0),
+            }
+        );
+        assert_eq!(
             verified.account_updates["main"].balances[0]
                 .account_id
                 .as_deref(),
@@ -613,6 +651,26 @@ mod tests {
         let error = verify_bootstrap(&config, &HashMap::from([("main".to_string(), snapshot)]))
             .unwrap_err();
         assert!(error.to_string().contains("tick_size mismatch"));
+    }
+
+    #[test]
+    fn rejects_strategy_order_sizes_above_exchange_maxima() {
+        let config = config();
+        let mut snapshot = snapshot();
+        let spot = snapshot.instruments.get_mut("BTC-USDT").unwrap();
+        spot.max_limit_size = 0.5;
+        spot.max_limit_amount_usd = Some(4_000.0);
+
+        let error = verify_bootstrap(&config, &HashMap::from([("main".to_string(), snapshot)]))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("max_order_size 1 exceeds exchange limit-order maximum 0.5"));
+        assert!(
+            error.contains(
+                "max_order_size_usd 5000 exceeds exchange limit-order amount maximum 4000"
+            )
+        );
     }
 
     #[test]

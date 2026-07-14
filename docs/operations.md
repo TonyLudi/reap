@@ -616,7 +616,8 @@ outside source control.
    recent fills, exact status for any restored active order, and the
    authenticated current fee group for every configured instrument.
 7. It verifies live instrument state, type, linear/inverse contract type,
-   tick/lot/minimum size, contract value, currencies, configured trade mode,
+   tick/lot/minimum and maximum single-order sizes, applicable spot maximum
+   order amounts, contract value, currencies, configured trade mode,
    account level, `net_mode`, disabled mode-appropriate borrowing, complete
    applicable zero-liability/interest evidence, absence of margin positions,
    absence of imminent announced instrument-rule changes, and that configured
@@ -1244,7 +1245,8 @@ in `observe` only after review.
 - Before each periodic fee lookup, the same isolated child re-queries the exact
   authenticated [OKX account instrument](https://www.okx.com/docs-v5/en/#trading-account-rest-api-get-instruments).
   It compares live state, type, family, underlying, currencies, contract
-  type/value, tick/lot/minimum size, and fee group to the bootstrap snapshot.
+  type/value, tick/lot/minimum size, `maxLmtSz`, `maxMktSz`, applicable spot
+  `maxLmtAmt`/`maxMktAmt`, and fee group to the bootstrap snapshot.
   It also strictly parses every current `upcChg` announcement: `tickSz`,
   `minSz` (which synchronously changes derivative `lotSz`), and `maxMktSz`.
   Unknown or missing announcement contracts fail closed. A change entering
@@ -1253,6 +1255,11 @@ in `observe` only after review.
   cleanly restart. Exact metadata requests are paced within OKX's documented 20
   requests per two seconds per user and instrument type. A blocked metadata
   request, like a blocked fee request, cannot delay Cancel All After.
+- Every outgoing order is a limit-family order (`post_only`, `ioc`, or plain
+  `limit`). Bootstrap rejects configured quote quantity/amount maxima above the
+  authenticated `maxLmtSz`/`maxLmtAmt`, and the live pre-trade gate rechecks the
+  final emitted quantity and spot USD amount. This final check also covers
+  Java-equivalent IOC hedge summaries that aggregate multiple depth levels.
 - Validation requires the exchange deadman horizon to exceed three complete
   REST request timeouts plus one heartbeat interval, so delayed
   clock/config/status checks cannot consume the last armed Cancel All After
@@ -1286,7 +1293,7 @@ in `observe` only after review.
 | Manual account kill | Durable account route latch; its instruments are removed from pricing/hedging and its live orders are cancelled | Reconcile the account and dependent exposure; restart alone does not clear it |
 | Exchange clock/deadman failure | Runtime fatal; new entry blocked; armed Cancel All After remains effective | Verify host time and OKX reachability, then reconcile before restart |
 | Relevant or unreadable OKX system status | Startup refused or runtime fatal; new entry blocked and normal cancel/reconcile cleanup runs | Review the official maintenance notice and configured environment; require a clean status check and full bootstrap after service recovery |
-| Instrument becomes non-live, metadata drifts, an announced rule change enters its lead, or the exact response is unreadable | Startup refused or runtime fatal; new entry blocked and normal cancel/reconcile cleanup runs | Stop through the effective change, review tick/lot/minimum size and valuation/account ownership, update and re-approve config if required, then require a clean exact bootstrap |
+| Instrument becomes non-live, metadata or hard order maxima drift, an announced rule change enters its lead, the exact response is unreadable, or a final order exceeds current maxima | Startup refused, runtime fatal, or pre-trade order rejection; new entry remains guarded and normal cancel/reconcile cleanup applies to runtime drift | Stop through the effective change, review tick/lot/minimum/maximum size, spot amount limits, valuation, and account ownership; update and re-approve config if required, then require a clean exact bootstrap |
 | Configured fee underprices authenticated OKX group, or fee check is unreadable | Startup refused or runtime fatal; new entry blocked and normal cancel/reconcile cleanup runs | Review the exact instrument group, account tier, configured cost sign, and current API response; recalibrate and require a clean bootstrap rather than weakening the guard |
 | Host disk/memory/clock failure | Startup refused or runtime fatal; new entry blocked | Restore capacity/time synchronization, inspect journal integrity, and reconcile before restart |
 | Alert queue/delivery failure | Runtime fail-stop when fatal delivery is configured | Verify the external route and supervisor fallback before restart |

@@ -422,11 +422,16 @@ selects that group from `feeGroup`, and converts OKX's signed balance rate into
 the strategy's cost-rate convention. Configured maker and taker costs may be
 more conservative, but may not understate a commission or assume a larger
 rebate. A paced periodic full sweep first compares state, type, family,
-currencies, contract type/value, tick/lot/minimum size, and fee group to the
-bootstrap snapshot, checks announcements, and then rechecks fees. It runs as a
-child of the account safety lifecycle so a blocked metadata or fee request
-cannot delay Cancel All After heartbeats. Missing or unknown `upcChg` contracts
-and deprecated top-level fee fields are rejected as insufficient evidence.
+currencies, contract type/value, tick/lot/minimum size, hard limit/market order
+quantity maxima, applicable spot order-amount maxima, and fee group to the
+bootstrap snapshot, checks announcements, and then rechecks fees. Bootstrap
+rejects strategy quote maxima above the authenticated limit-order bounds. The
+live risk gate also checks every post-only or IOC order against current
+`maxLmtSz` and applicable `maxLmtAmt` before dispatch, covering Java-equivalent
+hedges aggregated across depth levels. The metadata sweep runs as a child of
+the account safety lifecycle so a blocked metadata or fee request cannot delay
+Cancel All After heartbeats. Missing or unknown `upcChg` contracts and
+deprecated top-level fee fields are rejected as insufficient evidence.
 Tradable demo startup additionally requires every configured authenticated
 order-command websocket session for every account. The default pool has eight
 sessions, matching the pinned Java topology, and deterministically routes spot,

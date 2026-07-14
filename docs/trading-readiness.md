@@ -13,7 +13,7 @@ production trading process.
 | Deterministic backtest/data | Shared strategy code, immediate pending-order registration, arrival-time scheduler, Java-mapped class/symbol empirical latency profiles with sampled-usage reporting, versioned target-host/live collectors, deterministic calibration artifacts bound into production research, conservative depth/queue/trade capacity controls, event-clock drawdown/exposure/inventory metrics, per-currency depeg-sensitive valuation, exact private-fill fee currency plus explicit simulated-fee counts, fee/turnover attribution, authenticated recent-fill collection and verified offline fill/fee reconciliation, authenticated point-in-time cash/zero-liability collection and offline verification, forecast/realized funding separation with event-time linear/inverse settlement, manifest-driven chronological walk-forward selection and stress gates, credential-free redundant public capture, exact provenance, streaming analysis, and raw/normalized replay | The evidence pipeline is implemented but execution/accounting assumptions remain uncalibrated; needs sustained full-depth and currency-index capture, a passing credentialed target-host/demo latency artifact, complete funding intervals, target-tier fee calibration, a real passing target-account certification and authenticated fill/fee artifact plus broader economic statement reconciliation, and production-candidate reports before capital decisions |
 | Feed components | Redundant public sockets, isolated private sockets, transport/state freshness separation, account-plus-positions health rounds, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
 | Order components | Event-loop client IDs/registration, exchange/client acknowledgement binding, account-scoped immutable private identity, semantic duplicate suppression across changed exchange timestamps, exchange-side place-request expiry, an authenticated eight-session websocket command pool, constant-time per-underlying FIFOs, bounded cross-underlying command concurrency, shared account pacing, independent REST reconciliation, shutdown command flushing, monotonic private reduction, submit/cancel state-convergence deadlines, typed position margin mode, and ambiguity handling are composed | Needs demo exchange fault evidence |
-| Runtime risk | Instrument models, authoritative startup positions, authenticated current instrument-rule and fee-group checks, typed upcoming-change lead, active-order count/notional ceilings, rolling submit-rejection and zero-fill IOC-cancel circuits, terminal strategy-halt promotion, position scope/mode enforcement, zero-liability enforcement, periodic authenticated account-config drift detection, forced-repayment blocking, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock and announced-maintenance checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed instrument/fee/deadman/depeg/convergence evidence |
+| Runtime risk | Instrument models, authoritative startup positions, authenticated current instrument-rule, hard single-order maximum, and fee-group checks, final pre-trade exchange-limit enforcement, typed upcoming-change lead, active-order count/notional ceilings, rolling submit-rejection and zero-fill IOC-cancel circuits, terminal strategy-halt promotion, position scope/mode enforcement, zero-liability enforcement, periodic authenticated account-config drift detection, forced-repayment blocking, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock and announced-maintenance checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed instrument/fee/deadman/depeg/convergence evidence |
 | Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, strict bounded soak reports, documented region/environment endpoint tuples, and an exact demo-to-production config transition verifier | Demo-capable; production entry intentionally unavailable |
 | Instrument/account bootstrap | Account instruments/config/balance/positions are typed; economic snapshots preserve borrowing flags, liabilities, interest, and margin-loan fields; live spot and borrow limits are cash-only/zero; enabled borrowing, missing applicable evidence, nonzero liabilities, margin positions, and nonzero positions outside configured ownership/mode fail before strategy/risk application | Needs a passing artifact from the real target account; tooling alone is not evidence |
 | Startup/restart gate | Executable phase state, engine-consumed account-snapshot invariant, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, durable latch restore, authoritative account repair, second-pass clean REST reconciliation, and read-only journal-bound deadman-expiry certification | Needs process-kill demo evidence; tooling alone is not evidence |
@@ -352,6 +352,16 @@ production trading process.
     `ChaosEntity`, and `OkEntity.getMinTradeSize`. Blocking metadata and fee
     requests are independently tested not to delay Cancel All After. This is
     implemented protection, not target-account fault evidence.
+48. Current authenticated `maxLmtSz`, `maxMktSz`, and applicable spot
+    `maxLmtAmt`/`maxMktAmt` are now mandatory typed metadata and part of the
+    periodic drift snapshot. Bootstrap rejects configured quote maxima above
+    the limit-order bounds. Because pinned Java's
+    `Iarb2Calculator.summarizeHedges` may combine several depth levels into one
+    `Iarb2Strategy.doHedge` IOC, Rust additionally checks each final post-only
+    or IOC quantity and applicable spot USD amount immediately before dispatch.
+    This prevents an aggregated hedge from relying only on earlier strategy
+    sizing, while preserving Java's target calculation. It still needs a real
+    target-account response and oversized-order demo fault artifact.
 
 ## Remaining Demo Gate
 
@@ -416,10 +426,12 @@ Production enablement additionally requires:
   bound alone is not profitability evidence, and OKX states that API rates may
   omit temporary zero-fee treatment.
 - Authenticated exact-instrument startup/periodic checks must pass for every
-  target symbol with no state, sizing, valuation, currency, family, or fee-group
-  drift and no change inside the configured announcement lead. Archive a demo
-  proxy fault proving both drift and announced changes produce typed fail-closed
-  cleanup while the deadman heartbeat remains active.
+  target symbol with no state, sizing, single-order maximum, valuation,
+  currency, family, or fee-group drift and no change inside the configured
+  announcement lead. Demonstrate that a final post-only and aggregated IOC over
+  `maxLmtSz` or applicable `maxLmtAmt` is rejected before transport. Archive a
+  demo proxy fault proving both drift and announced changes produce typed
+  fail-closed cleanup while the deadman heartbeat remains active.
 - A passing target-account `certify-account` artifact, independently rechecked
   with `verify-account-certification --require-pass`, immediately before
   approval. This is point-in-time evidence and must be combined with economic

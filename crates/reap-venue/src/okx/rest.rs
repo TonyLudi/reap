@@ -465,6 +465,10 @@ pub struct OkxInstrument {
     pub tick_size: f64,
     pub lot_size: f64,
     pub min_size: f64,
+    pub max_limit_size: f64,
+    pub max_market_size: f64,
+    pub max_limit_amount_usd: Option<f64>,
+    pub max_market_amount_usd: Option<f64>,
     pub state: String,
     pub upcoming_changes: Vec<OkxInstrumentChange>,
 }
@@ -2023,6 +2027,14 @@ struct OkxInstrumentWire {
     lot_size: String,
     #[serde(rename = "minSz")]
     min_size: String,
+    #[serde(rename = "maxLmtSz")]
+    max_limit_size: String,
+    #[serde(rename = "maxMktSz")]
+    max_market_size: String,
+    #[serde(rename = "maxLmtAmt")]
+    max_limit_amount_usd: String,
+    #[serde(rename = "maxMktAmt")]
+    max_market_amount_usd: String,
     state: String,
     #[serde(rename = "upcChg")]
     upcoming_changes: Vec<OkxInstrumentChangeWire>,
@@ -2041,6 +2053,17 @@ impl TryFrom<OkxInstrumentWire> for OkxInstrument {
     type Error = RestError;
 
     fn try_from(value: OkxInstrumentWire) -> Result<Self, Self::Error> {
+        let min_size = parse_positive_number("minSz", &value.min_size)?;
+        let max_limit_size = parse_positive_number("maxLmtSz", &value.max_limit_size)?;
+        if max_limit_size < min_size {
+            return Err(RestError::InvalidField {
+                field: "maxLmtSz",
+                value: value.max_limit_size,
+                message: format!(
+                    "maximum limit-order size must be at least minimum size {min_size}"
+                ),
+            });
+        }
         Ok(Self {
             symbol: value.symbol,
             instrument_type: parse_instrument_type(&value.instrument_type)?,
@@ -2055,7 +2078,17 @@ impl TryFrom<OkxInstrumentWire> for OkxInstrument {
             contract_value_currency: value.contract_value_currency,
             tick_size: parse_positive_number("tickSz", &value.tick_size)?,
             lot_size: parse_positive_number("lotSz", &value.lot_size)?,
-            min_size: parse_positive_number("minSz", &value.min_size)?,
+            min_size,
+            max_limit_size,
+            max_market_size: parse_positive_number("maxMktSz", &value.max_market_size)?,
+            max_limit_amount_usd: parse_nullable_positive_number(
+                "maxLmtAmt",
+                &value.max_limit_amount_usd,
+            )?,
+            max_market_amount_usd: parse_nullable_positive_number(
+                "maxMktAmt",
+                &value.max_market_amount_usd,
+            )?,
             state: value.state,
             upcoming_changes: value
                 .upcoming_changes
@@ -2638,6 +2671,17 @@ fn parse_nullable_number(field: &'static str, value: &str) -> Result<Option<f64>
     }
 }
 
+fn parse_nullable_positive_number(
+    field: &'static str,
+    value: &str,
+) -> Result<Option<f64>, RestError> {
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        parse_positive_number(field, value).map(Some)
+    }
+}
+
 fn parse_optional_number(field: &'static str, value: &str) -> Result<f64, RestError> {
     if value.is_empty() {
         Ok(0.0)
@@ -2880,7 +2924,7 @@ mod tests {
 
     #[tokio::test]
     async fn exact_account_instrument_retains_typed_upcoming_changes() {
-        let response = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","instType":"SWAP","instFamily":"BTC-USDT","groupId":"2","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"USDT","ctType":"linear","ctVal":"0.01","ctValCcy":"BTC","tickSz":"0.1","lotSz":"1","minSz":"1","state":"live","upcChg":[{"param":"tickSz","newValue":"0.01","effTime":"1763979985847"},{"param":"minSz","newValue":"2","effTime":"1763979986847"},{"param":"maxMktSz","newValue":"1000","effTime":"1763979987847"}]}]}"#;
+        let response = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","instType":"SWAP","instFamily":"BTC-USDT","groupId":"2","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"USDT","ctType":"linear","ctVal":"0.01","ctValCcy":"BTC","tickSz":"0.1","lotSz":"1","minSz":"1","maxLmtSz":"1000000","maxMktSz":"1000000","maxLmtAmt":"","maxMktAmt":"","state":"live","upcChg":[{"param":"tickSz","newValue":"0.01","effTime":"1763979985847"},{"param":"minSz","newValue":"2","effTime":"1763979986847"},{"param":"maxMktSz","newValue":"1000","effTime":"1763979987847"}]}]}"#;
         let (client, requests) = client(vec![response]);
 
         let instrument = client
@@ -2893,6 +2937,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(instrument.upcoming_changes.len(), 3);
+        assert_eq!(instrument.max_limit_size, 1_000_000.0);
+        assert_eq!(instrument.max_market_size, 1_000_000.0);
+        assert_eq!(instrument.max_limit_amount_usd, None);
         assert_eq!(
             instrument.upcoming_changes[0],
             OkxInstrumentChange {
@@ -2917,16 +2964,22 @@ mod tests {
 
     #[tokio::test]
     async fn account_instrument_rejects_malformed_change_and_non_exact_response() {
-        let malformed = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","state":"live","upcChg":[{"param":"futureField","newValue":"1","effTime":"1"}]}]}"#;
-        let zero_time = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","state":"live","upcChg":[{"param":"tickSz","newValue":"1","effTime":"0"}]}]}"#;
-        let zero_value = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","state":"live","upcChg":[{"param":"minSz","newValue":"0","effTime":"1"}]}]}"#;
-        let missing_changes = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","state":"live"}]}"#;
-        let duplicate = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","state":"live","upcChg":[]},{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","state":"live","upcChg":[]}]}"#;
-        let mismatched = r#"{"code":"0","msg":"","data":[{"instId":"ETH-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","state":"live","upcChg":[]}]}"#;
+        let malformed = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","maxLmtSz":"100","maxMktSz":"1000000","maxLmtAmt":"1000000","maxMktAmt":"1000000","state":"live","upcChg":[{"param":"futureField","newValue":"1","effTime":"1"}]}]}"#;
+        let zero_time = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","maxLmtSz":"100","maxMktSz":"1000000","maxLmtAmt":"1000000","maxMktAmt":"1000000","state":"live","upcChg":[{"param":"tickSz","newValue":"1","effTime":"0"}]}]}"#;
+        let zero_value = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","maxLmtSz":"100","maxMktSz":"1000000","maxLmtAmt":"1000000","maxMktAmt":"1000000","state":"live","upcChg":[{"param":"minSz","newValue":"0","effTime":"1"}]}]}"#;
+        let zero_limit = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","maxLmtSz":"0","maxMktSz":"1000000","maxLmtAmt":"1000000","maxMktAmt":"1000000","state":"live","upcChg":[]}]}"#;
+        let limit_below_minimum = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","maxLmtSz":"0.0001","maxMktSz":"1000000","maxLmtAmt":"1000000","maxMktAmt":"1000000","state":"live","upcChg":[]}]}"#;
+        let missing_limits = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","state":"live","upcChg":[]}]}"#;
+        let missing_changes = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","maxLmtSz":"100","maxMktSz":"1000000","maxLmtAmt":"1000000","maxMktAmt":"1000000","state":"live"}]}"#;
+        let duplicate = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","maxLmtSz":"100","maxMktSz":"1000000","maxLmtAmt":"1000000","maxMktAmt":"1000000","state":"live","upcChg":[]},{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","maxLmtSz":"100","maxMktSz":"1000000","maxLmtAmt":"1000000","maxMktAmt":"1000000","state":"live","upcChg":[]}]}"#;
+        let mismatched = r#"{"code":"0","msg":"","data":[{"instId":"ETH-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","maxLmtSz":"100","maxMktSz":"1000000","maxLmtAmt":"1000000","maxMktAmt":"1000000","state":"live","upcChg":[]}]}"#;
         let (client, _) = client(vec![
             malformed,
             zero_time,
             zero_value,
+            zero_limit,
+            limit_below_minimum,
+            missing_limits,
             missing_changes,
             duplicate,
             mismatched,
@@ -2952,6 +3005,27 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("upcChg.newValue"));
+
+        let error = client
+            .account_instrument_at("time", OkxInstrumentType::Spot, "BTC-USDT")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("maxLmtSz"));
+
+        let error = client
+            .account_instrument_at("time", OkxInstrumentType::Spot, "BTC-USDT")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("maximum limit-order size"));
+
+        let error = client
+            .account_instrument_at("time", OkxInstrumentType::Spot, "BTC-USDT")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("maxLmtSz"));
 
         let error = client
             .account_instrument_at("time", OkxInstrumentType::Spot, "BTC-USDT")
@@ -3324,7 +3398,7 @@ mod tests {
     #[tokio::test]
     async fn parses_signed_bootstrap_metadata_and_account_state() {
         let (client, requests) = client(vec![
-            r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","instType":"SWAP","instFamily":"BTC-USDT","groupId":"2","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"USDT","ctType":"linear","ctVal":"0.01","ctValCcy":"BTC","tickSz":"0.1","lotSz":"1","minSz":"1","state":"live","upcChg":[]}]}"#,
+            r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","instType":"SWAP","instFamily":"BTC-USDT","groupId":"2","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"USDT","ctType":"linear","ctVal":"0.01","ctValCcy":"BTC","tickSz":"0.1","lotSz":"1","minSz":"1","maxLmtSz":"1000000","maxMktSz":"1000000","maxLmtAmt":"","maxMktAmt":"","state":"live","upcChg":[]}]}"#,
             r#"{"code":"0","msg":"","data":[{"acctLv":"2","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"7","mainUid":"6","enableSpotBorrow":false,"autoLoan":false,"spotBorrowAutoRepay":false}]}"#,
             r#"{"code":"0","msg":"","data":[{"uTime":"1000","totalEq":"11000","mgnRatio":"12.5","adjEq":"10000","borrowFroz":"0","notionalUsdForBorrow":"0","notionalUsd":"2000","details":[{"ccy":"USDT","uTime":"999","cashBal":"9000","availBal":"8000","eq":"10000","liab":"0","crossLiab":"0","isoLiab":"0","uplLiab":"0","interest":"0","borrowFroz":"0","maxLoan":"500","twap":"2"}]}]}"#,
             r#"{"code":"0","msg":"","data":[{"instType":"SWAP","instId":"BTC-USDT-SWAP","pos":"2","posSide":"net","mgnMode":"cross","avgPx":"50000","uTime":"1001","liab":"","interest":""}]}"#,

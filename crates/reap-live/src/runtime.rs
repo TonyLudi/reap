@@ -1064,6 +1064,26 @@ fn exchange_instrument_drift_reason(
     check_field!("tick size", expected.tick_size, current.tick_size);
     check_field!("lot size", expected.lot_size, current.lot_size);
     check_field!("minimum size", expected.min_size, current.min_size);
+    check_field!(
+        "maximum limit-order size",
+        expected.max_limit_size,
+        current.max_limit_size
+    );
+    check_field!(
+        "maximum market-order size",
+        expected.max_market_size,
+        current.max_market_size
+    );
+    check_field!(
+        "maximum limit-order amount",
+        expected.max_limit_amount_usd,
+        current.max_limit_amount_usd
+    );
+    check_field!(
+        "maximum market-order amount",
+        expected.max_market_amount_usd,
+        current.max_market_amount_usd
+    );
 
     let cutoff_ms = now_ms.saturating_add(change_lead_ms);
     current
@@ -4915,7 +4935,9 @@ mod tests {
     use async_trait::async_trait;
     use reap_core::{AccountUpdate, Balance, NewOrder, OrderEvent, OrderUpdate, Side, TimeInForce};
     use reap_order::{OkxOrderTransport, OrderTransportError, PacingPolicy};
-    use reap_risk::{InstrumentRiskModel, RiskLimits, StablecoinGuardConfig};
+    use reap_risk::{
+        InstrumentOrderLimits, InstrumentRiskModel, RiskLimits, StablecoinGuardConfig,
+    };
     use reap_storage::start_jsonl_storage;
     use reap_strategy::{ChaosConfig, InstrumentKindConfig};
     use reap_venue::okx::{
@@ -5529,13 +5551,17 @@ mod tests {
             tick_size: 0.1,
             lot_size: 0.001,
             min_size: 0.001,
+            max_limit_size: 100.0,
+            max_market_size: 1_000_000.0,
+            max_limit_amount_usd: Some(1_000_000.0),
+            max_market_amount_usd: Some(1_000_000.0),
             state: "live".to_string(),
             upcoming_changes,
         }
     }
 
     fn spot_instrument_response() -> &'static str {
-        r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","instFamily":"","groupId":"1","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"","ctType":"","ctVal":"","ctValCcy":"","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","state":"live","upcChg":[]}]}"#
+        r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","instFamily":"","groupId":"1","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"","ctType":"","ctVal":"","ctValCcy":"","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","maxLmtSz":"100","maxMktSz":"1000000","maxLmtAmt":"1000000","maxMktAmt":"1000000","state":"live","upcChg":[]}]}"#
     }
 
     fn status(conn_id: &str, kind: ConnectionStatusKind) -> ConnectionStatus {
@@ -5694,6 +5720,13 @@ mod tests {
                         instrument_type,
                         trade_mode: account.trade_modes[&instrument.symbol],
                         risk_model,
+                        order_limits: InstrumentOrderLimits {
+                            max_limit_quantity: 1_000_000.0,
+                            max_limit_notional_usd: instrument
+                                .kind
+                                .is_spot()
+                                .then_some(1_000_000.0),
+                        },
                         tick_size: instrument.tick_size,
                         lot_size: instrument.lot_size,
                         min_size: instrument.min_trade_size,
@@ -7107,6 +7140,11 @@ mod tests {
         assert!(reason.contains("tick size changed"));
 
         current = expectation.expected_instrument.clone();
+        current.max_limit_size = 0.5;
+        let reason = exchange_instrument_drift_reason(&expectation, &current, 1_000, 100).unwrap();
+        assert!(reason.contains("maximum limit-order size changed"));
+
+        current = expectation.expected_instrument.clone();
         current.upcoming_changes.push(OkxInstrumentChange {
             parameter: OkxInstrumentChangeParameter::MinimumSize,
             new_value: 0.01,
@@ -7255,8 +7293,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn periodic_exchange_instrument_drift_is_fatal() {
-        let changed = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","instFamily":"","groupId":"1","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"","ctType":"","ctVal":"","ctValCcy":"","tickSz":"0.01","lotSz":"0.001","minSz":"0.001","state":"live","upcChg":[]}]}"#;
+    async fn periodic_exchange_instrument_maximum_drift_is_fatal() {
+        let changed = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","instFamily":"","groupId":"1","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"","ctType":"","ctVal":"","ctValCcy":"","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","maxLmtSz":"99","maxMktSz":"1000000","maxLmtAmt":"1000000","maxMktAmt":"1000000","state":"live","upcChg":[]}]}"#;
         let (client, requests) = safety_client(vec![Ok(changed)]);
         let (_command_tx, command_rx) = mpsc::channel(2);
         let (event_tx, mut event_rx) = mpsc::channel(2);
@@ -7281,7 +7319,7 @@ mod tests {
         assert!(matches!(
             event,
             RuntimeEvent::Fatal(RuntimeTaskFailure::ExchangeInstrumentDrift(message))
-                if message.contains("tick size changed")
+                if message.contains("maximum limit-order size changed")
         ));
         task.await.unwrap();
         assert_eq!(requests.lock().unwrap().len(), 1);

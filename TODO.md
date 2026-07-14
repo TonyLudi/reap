@@ -271,6 +271,10 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Revalidate each exact authenticated OKX instrument before its periodic fee
   check, reject state, sizing, valuation, currency, family, or fee-group drift,
   and fail before typed `upcChg` rule changes enter a one-hour review lead.
+- [x] Retain and continuously compare authenticated `maxLmtSz`, `maxMktSz`,
+  `maxLmtAmt`, and `maxMktAmt`; reject incompatible configured quote sizes at
+  bootstrap and enforce current limit-order quantity/amount before every live
+  post-only or IOC dispatch.
 - [ ] Calibrate queue position, latency, fees, funding, and slippage from
   captured full-depth data, then run and archive production-candidate
   walk-forward, capacity, and stressed-liquidity reports. The orchestration and

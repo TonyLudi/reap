@@ -137,6 +137,7 @@ impl LiveCoordinator {
         let mut risk = RiskGate::new(config.risk.clone());
         for instrument in verified.instruments.values() {
             risk.set_instrument_model(instrument.symbol.clone(), instrument.risk_model);
+            risk.set_instrument_order_limits(instrument.symbol.clone(), instrument.order_limits);
         }
         let mut startup = StartupGate::new_with_order_transport(&config, gateway_actions_enabled);
         startup.mark_metadata_verified();
@@ -1295,7 +1296,8 @@ mod tests {
     use reap_feed::FeedOutput;
     use reap_order::{ReconcileIssue, reconcile, reconcile_full_state};
     use reap_risk::{
-        InstrumentRiskModel, RiskDecision, RiskLimits, RiskRejectReason, StablecoinGuardConfig,
+        InstrumentOrderLimits, InstrumentRiskModel, RiskDecision, RiskLimits, RiskRejectReason,
+        StablecoinGuardConfig,
     };
     use reap_strategy::ChaosConfig;
     use reap_venue::okx::{OkxAccountLevel, OkxInstrumentType, OkxPositionMode};
@@ -1357,6 +1359,10 @@ mod tests {
                         instrument_type: OkxInstrumentType::Spot,
                         trade_mode: OkxTradeModeConfig::Cash,
                         risk_model: InstrumentRiskModel::Spot,
+                        order_limits: InstrumentOrderLimits {
+                            max_limit_quantity: 100.0,
+                            max_limit_notional_usd: Some(1_000_000.0),
+                        },
                         tick_size: 0.1,
                         lot_size: 0.0001,
                         min_size: 0.0001,
@@ -1372,6 +1378,10 @@ mod tests {
                         trade_mode: OkxTradeModeConfig::Cross,
                         risk_model: InstrumentRiskModel::LinearDerivative {
                             contract_value: 0.001,
+                        },
+                        order_limits: InstrumentOrderLimits {
+                            max_limit_quantity: 1_000_000.0,
+                            max_limit_notional_usd: None,
                         },
                         tick_size: 0.1,
                         lot_size: 1.0,
@@ -1438,6 +1448,10 @@ mod tests {
                         instrument_type: OkxInstrumentType::Spot,
                         trade_mode: OkxTradeModeConfig::Cash,
                         risk_model: InstrumentRiskModel::Spot,
+                        order_limits: InstrumentOrderLimits {
+                            max_limit_quantity: 100.0,
+                            max_limit_notional_usd: Some(1_000_000.0),
+                        },
                         tick_size: 0.1,
                         lot_size: 0.0001,
                         min_size: 0.0001,
@@ -1453,6 +1467,10 @@ mod tests {
                         trade_mode: OkxTradeModeConfig::Cross,
                         risk_model: InstrumentRiskModel::LinearDerivative {
                             contract_value: 0.001,
+                        },
+                        order_limits: InstrumentOrderLimits {
+                            max_limit_quantity: 1_000_000.0,
+                            max_limit_notional_usd: None,
                         },
                         tick_size: 0.1,
                         lot_size: 1.0,
@@ -2042,6 +2060,46 @@ mod tests {
             })
             .unwrap();
         assert!(coordinator.readiness().missing_reconciliation.is_empty());
+    }
+
+    #[test]
+    fn authenticated_instrument_order_limits_seed_live_pre_trade_risk() {
+        let coordinator = coordinator();
+        let mut oversized = order();
+        oversized.qty = 101.0;
+
+        assert!(matches!(
+            coordinator
+                .engine
+                .risk()
+                .pre_trade(1, OrderIntent::NewOrder(oversized)),
+            RiskDecision::Rejected {
+                reason: RiskRejectReason::InstrumentOrderQuantity {
+                    symbol,
+                    value: 101.0,
+                    limit: 100.0,
+                },
+                ..
+            } if symbol == "BTC-USDT"
+        ));
+
+        let mut oversized_amount = order();
+        oversized_amount.qty = 1.0;
+        oversized_amount.price = 1_000_001.0;
+        assert!(matches!(
+            coordinator
+                .engine
+                .risk()
+                .pre_trade(2, OrderIntent::NewOrder(oversized_amount)),
+            RiskDecision::Rejected {
+                reason: RiskRejectReason::InstrumentOrderNotional {
+                    value: 1_000_001.0,
+                    limit: 1_000_000.0,
+                    ..
+                },
+                ..
+            }
+        ));
     }
 
     #[test]

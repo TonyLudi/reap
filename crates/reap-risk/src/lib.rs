@@ -173,6 +173,22 @@ pub enum InstrumentRiskModel {
     InverseDerivative { contract_value: f64 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct InstrumentOrderLimits {
+    pub max_limit_quantity: f64,
+    pub max_limit_notional_usd: Option<f64>,
+}
+
+impl InstrumentOrderLimits {
+    pub fn is_valid(self) -> bool {
+        self.max_limit_quantity.is_finite()
+            && self.max_limit_quantity > 0.0
+            && self
+                .max_limit_notional_usd
+                .is_none_or(|limit| limit.is_finite() && limit > 0.0)
+    }
+}
+
 impl InstrumentRiskModel {
     pub fn is_valid(self) -> bool {
         match self {
@@ -224,6 +240,16 @@ pub enum RiskRejectReason {
         minimum_price: f64,
     },
     InvalidOrder,
+    InstrumentOrderQuantity {
+        symbol: Symbol,
+        value: f64,
+        limit: f64,
+    },
+    InstrumentOrderNotional {
+        symbol: Symbol,
+        value: f64,
+        limit: f64,
+    },
     OrderNotional {
         value: f64,
         limit: f64,
@@ -295,6 +321,7 @@ pub struct RiskGate {
     private_health: HashMap<(Venue, Option<String>), StreamHealth>,
     marks: HashMap<Symbol, f64>,
     instrument_models: HashMap<Symbol, InstrumentRiskModel>,
+    instrument_order_limits: HashMap<Symbol, InstrumentOrderLimits>,
     positions: HashMap<Symbol, f64>,
     live_orders: HashMap<String, LiveOrderRisk>,
     order_rejections: VecDeque<OrderRejection>,
@@ -325,6 +352,7 @@ impl RiskGate {
             private_health: HashMap::new(),
             marks: HashMap::new(),
             instrument_models: HashMap::new(),
+            instrument_order_limits: HashMap::new(),
             positions: HashMap::new(),
             live_orders: HashMap::new(),
             order_rejections: VecDeque::new(),
@@ -395,6 +423,18 @@ impl RiskGate {
             return false;
         }
         self.instrument_models.insert(symbol.into(), model);
+        true
+    }
+
+    pub fn set_instrument_order_limits(
+        &mut self,
+        symbol: impl Into<Symbol>,
+        limits: InstrumentOrderLimits,
+    ) -> bool {
+        if !limits.is_valid() {
+            return false;
+        }
+        self.instrument_order_limits.insert(symbol.into(), limits);
         true
     }
 
@@ -1030,6 +1070,26 @@ impl RiskGate {
 
         let model = self.instrument_model(&order.symbol);
         let notional = model.notional_usd(order.qty, order.price);
+        if let Some(limits) = self.instrument_order_limits.get(&order.symbol) {
+            let quantity_tolerance = limits.max_limit_quantity.abs().max(1.0) * 1e-12;
+            if order.qty > limits.max_limit_quantity + quantity_tolerance {
+                return Some(RiskRejectReason::InstrumentOrderQuantity {
+                    symbol: order.symbol.clone(),
+                    value: order.qty,
+                    limit: limits.max_limit_quantity,
+                });
+            }
+            if let Some(limit) = limits.max_limit_notional_usd {
+                let notional_tolerance = limit.abs().max(1.0) * 1e-12;
+                if notional > limit + notional_tolerance {
+                    return Some(RiskRejectReason::InstrumentOrderNotional {
+                        symbol: order.symbol.clone(),
+                        value: notional,
+                        limit,
+                    });
+                }
+            }
+        }
         if notional > self.limits.max_order_notional_usd {
             return Some(RiskRejectReason::OrderNotional {
                 value: notional,
@@ -1693,6 +1753,68 @@ mod tests {
                 reason: RiskRejectReason::LiveOrderCount { value: 2, limit: 1 },
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn pre_trade_enforces_authenticated_instrument_order_limits() {
+        let mut gate = RiskGate::new(RiskLimits {
+            require_feed_health: false,
+            require_private_health: false,
+            ..RiskLimits::default()
+        });
+        assert!(gate.set_instrument_order_limits(
+            "BTC-USDT",
+            InstrumentOrderLimits {
+                max_limit_quantity: 0.5,
+                max_limit_notional_usd: Some(40.0),
+            },
+        ));
+
+        assert!(matches!(
+            gate.pre_trade(1, order()),
+            RiskDecision::Rejected {
+                reason: RiskRejectReason::InstrumentOrderQuantity {
+                    symbol,
+                    value: 1.0,
+                    limit: 0.5,
+                },
+                ..
+            } if symbol == "BTC-USDT"
+        ));
+
+        let mut notional_order = order();
+        let OrderIntent::NewOrder(new_order) = &mut notional_order else {
+            unreachable!()
+        };
+        new_order.qty = 0.5;
+        assert!(matches!(
+            gate.pre_trade(2, notional_order),
+            RiskDecision::Rejected {
+                reason: RiskRejectReason::InstrumentOrderNotional {
+                    value: 50.0,
+                    limit: 40.0,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let mut allowed = order();
+        let OrderIntent::NewOrder(new_order) = &mut allowed else {
+            unreachable!()
+        };
+        new_order.qty = 0.4;
+        assert!(matches!(
+            gate.pre_trade(3, allowed),
+            RiskDecision::Allowed(_)
+        ));
+        assert!(!gate.set_instrument_order_limits(
+            "BROKEN",
+            InstrumentOrderLimits {
+                max_limit_quantity: 0.0,
+                max_limit_notional_usd: None,
+            },
         ));
     }
 

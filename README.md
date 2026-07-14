@@ -43,9 +43,10 @@ Implemented:
   Demo entry also validates exchange time, continuously detects authenticated
   account-configuration drift, polls announced OKX unified-account maintenance
   with the pinned Java service filter and lead time, continuously verifies
-  strategy-critical instrument rules and configured fees against authenticated
-  current OKX metadata, and maintains OKX Cancel All After from an independent
-  safety task.
+  strategy-critical instrument rules, hard single-order maxima, and configured
+  fees against authenticated current OKX metadata, enforces the authenticated
+  limit-order quantity/amount again before dispatch, and maintains OKX Cancel
+  All After from an independent safety task.
 - Authenticated read-only cash-account certification that embeds exact bounded
   OKX config/balance/position responses in a create-new mode-`0600` artifact,
   binds config/binary/host/Java/account provenance, and supports credential-free
