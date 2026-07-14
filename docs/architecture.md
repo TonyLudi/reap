@@ -423,13 +423,23 @@ emits canonical account cancels, and requests full reconciliation. REST remains
 independent for snapshots, reconciliation, Cancel All After, pre-send cancel
 fallback, and emergency cancellation.
 
-The current account order worker still executes one command or REST
-reconciliation operation at a time. This preserves deterministic ownership for
-the first websocket milestone, but it also creates head-of-line blocking and
-does not yet exploit the pool's per-underlying concurrency. The production HFT
-shape must move REST reconciliation onto an independent account task and permit
-bounded concurrent command futures while returning every completion through the
-single-writer coordinator.
+Each account has separate command and REST-reconciliation tasks. The command
+owner keeps idempotency and submit finalization single-threaded, but dispatches
+IO through constant-time per-underlying FIFOs. One operation per underlying may
+be in flight, while different underlying families run concurrently up to the
+configured websocket-session count. This preserves submit/cancel order within a
+family, matches the pinned Java family routing, and prevents one acknowledgement
+from blocking unrelated families. Every completion returns to the command owner
+and then to the single-writer coordinator; IO futures never mutate strategy
+state.
+
+The reconciliation task uses a cloned authenticated REST client and cannot be
+blocked by websocket acknowledgement latency. Command and reconciliation
+clients share account pacing reservations without holding a lock across an
+await. During fail-closed shutdown, an explicit command flush waits for all
+earlier cancels and command completions before zero-order REST reconciliation is
+queued. The command channel, per-family pending queues, total in-flight work,
+and reconciliation channel are all bounded.
 
 Private fill fees use one normalized contract: the amount is the signed balance
 delta, so a charge is negative and a rebate is positive, and the currency names

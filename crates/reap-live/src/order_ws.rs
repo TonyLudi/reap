@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use reap_feed::{ConnectionAttemptPacer, ReconnectPolicy};
-use reap_order::{OkxOrderTransport, OrderTransportError};
+use reap_order::{OkxOrderTransport, OrderTransportError, okx_order_dispatch_key};
 use reap_venue::okx::{
     OkxCancelOrder, OkxOrderAck, OkxPlaceOrder, OkxSigner, OkxWsOrderOperation, OkxWsOrderResult,
     build_okx_ws_cancel_order_request, build_okx_ws_place_order_request,
@@ -161,10 +161,7 @@ pub(crate) fn spawn_okx_order_ws(
 
 #[async_trait]
 impl OkxOrderTransport for OkxOrderWsTransport {
-    async fn place_order(
-        &mut self,
-        order: &OkxPlaceOrder,
-    ) -> Result<OkxOrderAck, OrderTransportError> {
+    async fn place_order(&self, order: &OkxPlaceOrder) -> Result<OkxOrderAck, OrderTransportError> {
         let session_index = route_session(&order.symbol, self.sessions.len());
         let request_id = self.next_request_id(session_index);
         let expiry_ms = unix_time_ms().saturating_add(duration_ms(self.request_expiry));
@@ -180,7 +177,7 @@ impl OkxOrderTransport for OkxOrderWsTransport {
     }
 
     async fn cancel_order(
-        &mut self,
+        &self,
         order: &OkxCancelOrder,
     ) -> Result<OkxOrderAck, OrderTransportError> {
         let session_index = route_session(&order.symbol, self.sessions.len());
@@ -756,15 +753,8 @@ async fn aggregate_status(
 }
 
 fn route_session(symbol: &str, session_count: usize) -> usize {
-    let mut components = symbol.split('-');
-    let base = components.next().unwrap_or(symbol);
-    let quote = components.next().unwrap_or("");
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in base
-        .bytes()
-        .chain(std::iter::once(b'-'))
-        .chain(quote.bytes())
-    {
+    for byte in okx_order_dispatch_key(symbol).bytes() {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
@@ -930,7 +920,7 @@ mod tests {
                 .unwrap();
         });
 
-        let (mut transport, runtime, mut status) = spawn_okx_order_ws(config(url, 1));
+        let (transport, runtime, mut status) = spawn_okx_order_ws(config(url, 1));
         let ready = ready(&mut status).await;
         assert_eq!(ready.ready_sessions, 1);
         let acknowledgement = transport.place_order(&place_order()).await.unwrap();
@@ -961,7 +951,7 @@ mod tests {
             socket.close(None).await.unwrap();
         });
 
-        let (mut transport, runtime, mut status) = spawn_okx_order_ws(config(url, 1));
+        let (transport, runtime, mut status) = spawn_okx_order_ws(config(url, 1));
         ready(&mut status).await;
         let error = transport.place_order(&place_order()).await.unwrap_err();
         assert!(error.is_ambiguous(), "{error}");
@@ -974,7 +964,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         drop(listener);
-        let (mut transport, runtime, _status) = spawn_okx_order_ws(config(url, 1));
+        let (transport, runtime, _status) = spawn_okx_order_ws(config(url, 1));
 
         let error = transport.place_order(&place_order()).await.unwrap_err();
         assert!(error.is_unavailable(), "{error}");

@@ -27,14 +27,35 @@ impl OrderTransportError {
 /// Low-latency command transport only. REST snapshots and reconciliation stay
 /// on the gateway's independent authenticated client.
 #[async_trait]
-pub trait OkxOrderTransport: Send {
-    async fn place_order(
-        &mut self,
-        order: &OkxPlaceOrder,
-    ) -> Result<OkxOrderAck, OrderTransportError>;
+pub trait OkxOrderTransport: Send + Sync {
+    async fn place_order(&self, order: &OkxPlaceOrder) -> Result<OkxOrderAck, OrderTransportError>;
 
     async fn cancel_order(
-        &mut self,
+        &self,
         order: &OkxCancelOrder,
     ) -> Result<OkxOrderAck, OrderTransportError>;
+}
+
+pub fn okx_order_dispatch_key(symbol: &str) -> String {
+    let mut components = symbol.split('-');
+    let Some(base) = components.next().filter(|component| !component.is_empty()) else {
+        return symbol.to_string();
+    };
+    let Some(quote) = components.next().filter(|component| !component.is_empty()) else {
+        return symbol.to_string();
+    };
+    format!("{base}-{quote}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn okx_dispatch_key_groups_spot_swap_and_dated_futures() {
+        assert_eq!(okx_order_dispatch_key("BTC-USDT"), "BTC-USDT");
+        assert_eq!(okx_order_dispatch_key("BTC-USDT-SWAP"), "BTC-USDT");
+        assert_eq!(okx_order_dispatch_key("BTC-USDT-260925"), "BTC-USDT");
+        assert_eq!(okx_order_dispatch_key("ETH-USDT-SWAP"), "ETH-USDT");
+    }
 }

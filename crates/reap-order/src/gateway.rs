@@ -1,10 +1,11 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use reap_core::{AccountUpdate, NewOrder};
 use reap_venue::okx::{
-    HttpTransport, OkxCancelOrder, OkxFillPagination, OkxPlaceOrder, OkxRestClient, OkxTradeMode,
-    RestError,
+    HttpTransport, OkxCancelOrder, OkxFillPagination, OkxOrderAck, OkxPlaceOrder, OkxRestClient,
+    OkxTradeMode, RestError,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -89,13 +90,18 @@ pub struct CancelOutcome {
 }
 
 pub struct OkxOrderGateway<T> {
-    client: OkxRestClient<T>,
-    order_transport: Option<Box<dyn OkxOrderTransport>>,
+    io: OkxGatewayIo<T>,
     ids: ClientOrderIdGenerator,
     idempotency: IdempotencyRegistry,
-    pacer: RequestPacer,
     trade_modes: HashMap<String, OkxTradeMode>,
     local_orders: HashMap<String, NewOrder>,
+}
+
+#[derive(Clone)]
+pub struct OkxGatewayIo<T> {
+    client: OkxRestClient<T>,
+    order_transport: Option<Arc<dyn OkxOrderTransport>>,
+    pacer: RequestPacer,
 }
 
 impl<T> OkxOrderGateway<T>
@@ -110,18 +116,27 @@ where
         pacing: PacingPolicy,
     ) -> Result<Self, GatewayError> {
         Ok(Self {
-            client,
-            order_transport: None,
+            io: OkxGatewayIo {
+                client,
+                order_transport: None,
+                pacer: RequestPacer::new(pacing),
+            },
             ids: ClientOrderIdGenerator::new(id_prefix, node_id)?,
             idempotency: IdempotencyRegistry::default(),
-            pacer: RequestPacer::new(pacing),
             trade_modes,
             local_orders: HashMap::new(),
         })
     }
 
     pub fn set_order_transport(&mut self, transport: Box<dyn OkxOrderTransport>) {
-        self.order_transport = Some(transport);
+        self.io.order_transport = Some(Arc::from(transport));
+    }
+
+    pub fn io_client(&self) -> OkxGatewayIo<T>
+    where
+        T: Clone,
+    {
+        self.io.clone()
     }
 
     pub fn register_local_order(
@@ -253,36 +268,21 @@ where
         &mut self,
         prepared: PreparedOrder,
     ) -> Result<SubmitOutcome, GatewayError> {
+        let result = self.io.place_prepared(&prepared).await;
+        self.finish_submit(prepared, result)
+    }
+
+    pub fn finish_submit(
+        &mut self,
+        prepared: PreparedOrder,
+        result: Result<OkxOrderAck, GatewayError>,
+    ) -> Result<SubmitOutcome, GatewayError> {
         let PreparedOrder {
             idempotency_key,
             client_order_id,
-            order,
-            trade_mode,
+            order: _,
+            trade_mode: _,
         } = prepared;
-        self.pacer.pace(RequestKind::Submit, "account").await;
-        self.pacer.pace(RequestKind::Submit, &order.symbol).await;
-        let request = OkxPlaceOrder {
-            symbol: order.symbol,
-            trade_mode,
-            side: order.side,
-            time_in_force: order.time_in_force,
-            price: order.price,
-            qty: order.qty,
-            client_order_id: client_order_id.clone(),
-            reduce_only: order.reduce_only,
-            self_trade_prevention: order.self_trade_prevention,
-        };
-        let result = match self.order_transport.as_mut() {
-            Some(transport) => transport
-                .place_order(&request)
-                .await
-                .map_err(GatewayError::from),
-            None => self
-                .client
-                .place_order(&request)
-                .await
-                .map_err(GatewayError::from),
-        };
         let ack = match result {
             Ok(ack) => ack,
             Err(error) => {
@@ -312,33 +312,18 @@ where
     }
 
     pub async fn cancel(
-        &mut self,
+        &self,
         symbol: &str,
         exchange_order_id: Option<String>,
         client_order_id: Option<String>,
     ) -> Result<CancelOutcome, GatewayError> {
-        self.pacer.pace(RequestKind::Cancel, symbol).await;
-        let request = OkxCancelOrder {
-            symbol: symbol.to_string(),
-            exchange_order_id,
-            client_order_id,
-        };
-        let ack = match self.order_transport.as_mut() {
-            Some(transport) => match transport.cancel_order(&request).await {
-                Ok(ack) => ack,
-                Err(error) if error.is_unavailable() => self.client.cancel_order(&request).await?,
-                Err(error) => return Err(error.into()),
-            },
-            None => self.client.cancel_order(&request).await?,
-        };
-        Ok(CancelOutcome {
-            client_order_id: ack.client_order_id,
-            exchange_order_id: ack.exchange_order_id,
-        })
+        self.io
+            .cancel(symbol, exchange_order_id, client_order_id)
+            .await
     }
 
     pub async fn reconcile_state(
-        &mut self,
+        &self,
         state: &PrivateStateReducer,
         instrument_type: Option<&str>,
         symbol: Option<&str>,
@@ -358,7 +343,101 @@ where
     }
 
     pub async fn fetch_remote_state(
-        &mut self,
+        &self,
+        instrument_type: Option<&str>,
+        symbol: Option<&str>,
+        max_fill_pages: usize,
+    ) -> Result<(Vec<reap_venue::RemoteOrder>, Vec<reap_venue::RemoteFill>), GatewayError> {
+        self.io
+            .fetch_remote_state(instrument_type, symbol, max_fill_pages)
+            .await
+    }
+
+    pub async fn fetch_remote_account_state(&self) -> Result<AccountUpdate, GatewayError> {
+        self.io.fetch_remote_account_state().await
+    }
+
+    pub async fn fetch_order_details(
+        &self,
+        symbol: &str,
+        client_order_id: &str,
+    ) -> Result<reap_venue::RemoteOrder, GatewayError> {
+        self.io.fetch_order_details(symbol, client_order_id).await
+    }
+
+    pub async fn exchange_time_ms(&self) -> Result<u64, GatewayError> {
+        self.io.exchange_time_ms().await
+    }
+
+    pub async fn cancel_all_after(&self, timeout_secs: u64) -> Result<(), GatewayError> {
+        self.io.cancel_all_after(timeout_secs).await
+    }
+}
+
+impl<T> OkxGatewayIo<T>
+where
+    T: HttpTransport,
+{
+    pub async fn place_prepared(
+        &self,
+        prepared: &PreparedOrder,
+    ) -> Result<OkxOrderAck, GatewayError> {
+        self.pacer.pace(RequestKind::Submit, "account").await;
+        self.pacer
+            .pace(RequestKind::Submit, &prepared.order.symbol)
+            .await;
+        let request = OkxPlaceOrder {
+            symbol: prepared.order.symbol.clone(),
+            trade_mode: prepared.trade_mode,
+            side: prepared.order.side,
+            time_in_force: prepared.order.time_in_force,
+            price: prepared.order.price,
+            qty: prepared.order.qty,
+            client_order_id: prepared.client_order_id.clone(),
+            reduce_only: prepared.order.reduce_only,
+            self_trade_prevention: prepared.order.self_trade_prevention,
+        };
+        match self.order_transport.as_ref() {
+            Some(transport) => transport
+                .place_order(&request)
+                .await
+                .map_err(GatewayError::from),
+            None => self
+                .client
+                .place_order(&request)
+                .await
+                .map_err(GatewayError::from),
+        }
+    }
+
+    pub async fn cancel(
+        &self,
+        symbol: &str,
+        exchange_order_id: Option<String>,
+        client_order_id: Option<String>,
+    ) -> Result<CancelOutcome, GatewayError> {
+        self.pacer.pace(RequestKind::Cancel, symbol).await;
+        let request = OkxCancelOrder {
+            symbol: symbol.to_string(),
+            exchange_order_id,
+            client_order_id,
+        };
+        let ack = match self.order_transport.as_ref() {
+            Some(transport) => match transport.cancel_order(&request).await {
+                Ok(ack) => ack,
+                Err(error) if error.is_unavailable() => self.client.cancel_order(&request).await?,
+                Err(error) => return Err(error.into()),
+            },
+            None => self.client.cancel_order(&request).await?,
+        };
+        Ok(CancelOutcome {
+            client_order_id: ack.client_order_id,
+            exchange_order_id: ack.exchange_order_id,
+        })
+    }
+
+    pub async fn fetch_remote_state(
+        &self,
         instrument_type: Option<&str>,
         symbol: Option<&str>,
         max_fill_pages: usize,
@@ -376,11 +455,10 @@ where
                 break;
             }
         }
-        let remote_fills = pagination.into_fills();
-        Ok((remote_orders, remote_fills))
+        Ok((remote_orders, pagination.into_fills()))
     }
 
-    pub async fn fetch_remote_account_state(&mut self) -> Result<AccountUpdate, GatewayError> {
+    pub async fn fetch_remote_account_state(&self) -> Result<AccountUpdate, GatewayError> {
         self.pacer.pace(RequestKind::Reconcile, "account").await;
         let mut account = self.client.account_balance().await?;
         if account.balances.is_empty() {
@@ -394,7 +472,7 @@ where
     }
 
     pub async fn fetch_order_details(
-        &mut self,
+        &self,
         symbol: &str,
         client_order_id: &str,
     ) -> Result<reap_venue::RemoteOrder, GatewayError> {
@@ -447,14 +525,14 @@ mod tests {
     #[async_trait]
     impl OkxOrderTransport for MockOrderTransport {
         async fn place_order(
-            &mut self,
+            &self,
             _order: &OkxPlaceOrder,
         ) -> Result<reap_venue::okx::OkxOrderAck, OrderTransportError> {
             self.next()
         }
 
         async fn cancel_order(
-            &mut self,
+            &self,
             _order: &OkxCancelOrder,
         ) -> Result<reap_venue::okx::OkxOrderAck, OrderTransportError> {
             self.next()
@@ -628,7 +706,7 @@ mod tests {
             status: 200,
             body: r#"{"code":"0","msg":"","data":[{"instType":"SWAP","instId":"BTC-USDT-SWAP","pos":"2","avgPx":"50000","posSide":"net","mgnMode":"cross","uTime":"101"}]}"#.to_string(),
         };
-        let (mut gateway, calls) = gateway(vec![Ok(balance), Ok(positions)]);
+        let (gateway, calls) = gateway(vec![Ok(balance), Ok(positions)]);
 
         let account = gateway.fetch_remote_account_state().await.unwrap();
 
@@ -645,7 +723,7 @@ mod tests {
             status: 200,
             body: r#"{"code":"0","msg":"","data":[]}"#.to_string(),
         };
-        let (mut gateway, calls) = gateway(vec![
+        let (gateway, calls) = gateway(vec![
             Ok(open_orders),
             Ok(fill_response(100, 100)),
             Ok(fill_response(200, 2)),
@@ -664,7 +742,7 @@ mod tests {
             status: 200,
             body: r#"{"code":"0","msg":"","data":[{"uTime":"100","details":[] }]}"#.to_string(),
         };
-        let (mut gateway, calls) = gateway(vec![Ok(balance)]);
+        let (gateway, calls) = gateway(vec![Ok(balance)]);
 
         let error = gateway.fetch_remote_account_state().await.unwrap_err();
 

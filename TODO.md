@@ -251,7 +251,7 @@ architecture in [docs/architecture.md](docs/architecture.md).
   correlation, exchange expiry, aggregate readiness, supervised reconnect,
   explicit pre-send versus ambiguous-write classification, REST cancel
   fallback, and a required clean reconciliation after transport loss.
-- [ ] Remove account order-path head-of-line blocking: isolate REST
+- [x] Remove account order-path head-of-line blocking: isolate REST
   reconciliation from command dispatch and support bounded concurrent
   underlying-routed websocket operations with shared account pacing and
   deterministic canonical completion.

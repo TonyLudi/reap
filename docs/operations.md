@@ -1160,6 +1160,15 @@ in `observe` only after review.
   websocket command pool. `order_websocket_sessions` defaults to eight and
   stable underlying hashing keeps related spot/swap/future commands on one
   session, matching the pinned Java dispatch shape.
+- Each account command owner keeps a FIFO per underlying and permits one
+  operation per family, with total concurrent operations bounded by
+  `order_websocket_sessions`. Unrelated families therefore do not wait for one
+  another's acknowledgements, while same-family submit/cancel order remains
+  stable and all idempotency completion stays single-owner.
+- Full REST reconciliation runs on an independent bounded account task. It
+  shares account pacing reservations with command IO but cannot sit behind a
+  websocket acknowledgement. Fail-closed shutdown flushes every earlier
+  command before requesting the authoritative zero-order snapshot.
 - Route explicit exchange rejections back through gateway state. A session
   unavailable before send is an explicit non-submit. Treat write, timeout,
   disconnect, and correlation ambiguity as pending until REST/private

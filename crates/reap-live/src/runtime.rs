@@ -1,8 +1,11 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use futures_util::FutureExt;
+use futures_util::future::BoxFuture;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use reap_core::{
     AccountUpdate, BacktestLatencyClass, Channel, ConnId, FeedPriority, FillKey, MarketEvent,
     NormalizedEvent, OrderStatus, PINNED_JAVA_REVISION, Subscription, SystemEvent, SystemEventKind,
@@ -14,8 +17,8 @@ use reap_feed::{
     spawn_supervised_feed,
 };
 use reap_order::{
-    CancelOutcome, OkxOrderGateway, ReconcileReport, SubmitOutcome, SubmitPreparation,
-    reconcile_full_state,
+    CancelOutcome, GatewayError, OkxGatewayIo, OkxOrderGateway, PreparedOrder, ReconcileReport,
+    SubmitOutcome, SubmitPreparation, okx_order_dispatch_key, reconcile_full_state,
 };
 use reap_storage::{
     BootstrapRecord, OrderAckStatus, OrderOperation, OrderRequestRecord, RecoveredStorage,
@@ -664,7 +667,7 @@ async fn bootstrap_accounts(
             .iter()
             .map(|(symbol, mode)| (symbol.clone(), (*mode).into()))
             .collect();
-        let mut gateway = OkxOrderGateway::new(
+        let gateway = OkxOrderGateway::new(
             client.clone(),
             account.id_prefix.clone(),
             account.node_id,
@@ -1042,6 +1045,8 @@ struct LiveRuntime {
     feed_rx: mpsc::Receiver<RuntimeEvent>,
     order_senders: HashMap<String, mpsc::Sender<OrderTaskCommand>>,
     order_tasks: Vec<JoinHandle<()>>,
+    reconcile_senders: HashMap<String, mpsc::Sender<ReconcileTaskCommand>>,
+    reconcile_tasks: Vec<JoinHandle<()>>,
     order_ws_runtimes: Vec<OkxOrderWsRuntime>,
     order_ws_status_tasks: Vec<JoinHandle<()>>,
     safety_senders: HashMap<String, mpsc::Sender<SafetyTaskCommand>>,
@@ -1357,6 +1362,8 @@ impl LiveRuntime {
 
         let mut order_senders = HashMap::new();
         let mut order_tasks = Vec::new();
+        let mut reconcile_senders = HashMap::new();
+        let mut reconcile_tasks = Vec::new();
         let mut order_ws_runtimes = Vec::new();
         let mut order_ws_status_tasks = Vec::new();
         let mut safety_senders = HashMap::new();
@@ -1457,12 +1464,23 @@ impl LiveRuntime {
                 order_ws_runtimes.push(order_ws_runtime);
             }
 
+            let io = gateway.io_client();
             let (order_tx, order_rx) = mpsc::channel(config.runtime.order_channel_capacity);
             order_senders.insert(account_id.clone(), order_tx);
             order_tasks.push(tokio::spawn(run_order_task(
-                account_id,
+                account_id.clone(),
                 gateway,
                 order_rx,
+                control_tx.clone(),
+                config.runtime.order_websocket_sessions,
+                config.runtime.order_channel_capacity,
+            )));
+            let (reconcile_tx, reconcile_rx) = mpsc::channel(8);
+            reconcile_senders.insert(account_id.clone(), reconcile_tx);
+            reconcile_tasks.push(tokio::spawn(run_reconcile_task(
+                account_id,
+                io,
+                reconcile_rx,
                 control_tx.clone(),
                 config.runtime.ambiguous_submit_grace_ms,
                 config.runtime.max_fill_reconciliation_pages,
@@ -1491,6 +1509,8 @@ impl LiveRuntime {
             feed_rx,
             order_senders,
             order_tasks,
+            reconcile_senders,
+            reconcile_tasks,
             order_ws_runtimes,
             order_ws_status_tasks,
             safety_senders,
@@ -3049,7 +3069,7 @@ impl LiveRuntime {
                 return Err(error);
             }
         };
-        let sender = match self.order_sender(&action.account_id) {
+        let sender = match self.reconcile_sender(&action.account_id) {
             Ok(sender) => sender.clone(),
             Err(error) => {
                 self.reconcile_inflight.remove(&action.account_id);
@@ -3057,7 +3077,10 @@ impl LiveRuntime {
             }
         };
         sender
-            .try_send(OrderTaskCommand::Reconcile(orders))
+            .try_send(ReconcileTaskCommand::Reconcile {
+                restored_orders: orders,
+                command_flush: None,
+            })
             .map_err(|_| {
                 self.reconcile_inflight.remove(&action.account_id);
                 LiveRuntimeError::OrderQueueUnavailable(action.account_id)
@@ -3073,6 +3096,22 @@ impl LiveRuntime {
         }
         self.last_reconcile_attempt
             .insert(action.account_id.clone(), Instant::now());
+        let order_sender = match self.order_sender(&action.account_id) {
+            Ok(sender) => sender.clone(),
+            Err(error) => {
+                self.reconcile_inflight.remove(&action.account_id);
+                return Err(error);
+            }
+        };
+        let (flushed_tx, flushed_rx) = oneshot::channel();
+        if order_sender
+            .send(OrderTaskCommand::Flush(flushed_tx))
+            .await
+            .is_err()
+        {
+            self.reconcile_inflight.remove(&action.account_id);
+            return Err(LiveRuntimeError::OrderQueueUnavailable(action.account_id));
+        }
         let orders = match self.reconciliation_order_refs(&action.account_id) {
             Ok(orders) => orders,
             Err(error) => {
@@ -3080,7 +3119,7 @@ impl LiveRuntime {
                 return Err(error);
             }
         };
-        let sender = match self.order_sender(&action.account_id) {
+        let sender = match self.reconcile_sender(&action.account_id) {
             Ok(sender) => sender.clone(),
             Err(error) => {
                 self.reconcile_inflight.remove(&action.account_id);
@@ -3088,7 +3127,10 @@ impl LiveRuntime {
             }
         };
         if sender
-            .send(OrderTaskCommand::Reconcile(orders))
+            .send(ReconcileTaskCommand::Reconcile {
+                restored_orders: orders,
+                command_flush: Some(flushed_rx),
+            })
             .await
             .is_err()
         {
@@ -3191,6 +3233,15 @@ impl LiveRuntime {
             .ok_or_else(|| LiveRuntimeError::OrderQueueUnavailable(account_id.to_string()))
     }
 
+    fn reconcile_sender(
+        &self,
+        account_id: &str,
+    ) -> Result<&mpsc::Sender<ReconcileTaskCommand>, LiveRuntimeError> {
+        self.reconcile_senders
+            .get(account_id)
+            .ok_or_else(|| LiveRuntimeError::OrderQueueUnavailable(account_id.to_string()))
+    }
+
     async fn disable_deadman_all(&mut self) -> Result<(), LiveRuntimeError> {
         let mut acknowledgements = Vec::new();
         for (account_id, sender) in &self.safety_senders {
@@ -3249,6 +3300,10 @@ impl LiveRuntime {
             let _ = sender.try_send(OrderTaskCommand::Shutdown);
         }
         self.order_senders.clear();
+        for sender in self.reconcile_senders.values() {
+            let _ = sender.try_send(ReconcileTaskCommand::Shutdown);
+        }
+        self.reconcile_senders.clear();
         for sender in self.safety_senders.values() {
             let _ = sender.try_send(SafetyTaskCommand::Shutdown);
         }
@@ -3266,6 +3321,11 @@ impl LiveRuntime {
         for task in self.order_tasks.drain(..) {
             if let Err(error) = task.await {
                 errors.push(("order task", LiveRuntimeError::Join(error)));
+            }
+        }
+        for task in self.reconcile_tasks.drain(..) {
+            if let Err(error) = task.await {
+                errors.push(("reconciliation task", LiveRuntimeError::Join(error)));
             }
         }
         for runtime in self.order_ws_runtimes.drain(..) {
@@ -3426,7 +3486,15 @@ enum OrderTaskCommand {
         action: CancelAction,
         enqueued_at: Instant,
     },
-    Reconcile(Vec<ReconcileOrderRef>),
+    Flush(oneshot::Sender<()>),
+    Shutdown,
+}
+
+enum ReconcileTaskCommand {
+    Reconcile {
+        restored_orders: Vec<ReconcileOrderRef>,
+        command_flush: Option<oneshot::Receiver<()>>,
+    },
     Shutdown,
 }
 
@@ -3449,254 +3517,432 @@ struct ReconcileOrderRef {
     last_update_ms: u64,
 }
 
-async fn run_order_task(
+enum OrderTaskCompletion {
+    Submit {
+        dispatch_key: String,
+        symbol: String,
+        client_order_id: String,
+        prepared: PreparedOrder,
+        result: Result<reap_venue::okx::OkxOrderAck, GatewayError>,
+        enqueued_at: Instant,
+    },
+    Cancel {
+        dispatch_key: String,
+        symbol: String,
+        client_order_id: String,
+        result: Result<CancelOutcome, GatewayError>,
+        enqueued_at: Instant,
+    },
+}
+
+impl OrderTaskCompletion {
+    fn dispatch_key(&self) -> &str {
+        match self {
+            Self::Submit { dispatch_key, .. } | Self::Cancel { dispatch_key, .. } => dispatch_key,
+        }
+    }
+}
+
+async fn run_order_task<T>(
     account_id: String,
-    mut gateway: LiveGateway,
+    mut gateway: OkxOrderGateway<T>,
     mut commands: mpsc::Receiver<OrderTaskCommand>,
     events: mpsc::Sender<RuntimeEvent>,
-    ambiguous_submit_grace_ms: u64,
-    max_fill_reconciliation_pages: usize,
-) {
-    while let Some(command) = commands.recv().await {
-        match command {
-            OrderTaskCommand::Submit {
-                action,
-                enqueued_at,
-            } => {
-                let symbol = action.order.symbol.clone();
-                let client_order_id = action.client_order_id;
-                let preparation = match gateway.prepare_registered_submit(
-                    action.idempotency_key,
-                    action.order,
-                    client_order_id.clone(),
-                ) {
-                    Ok(preparation) => preparation,
-                    Err(error) => {
-                        if events
-                            .send(RuntimeEvent::Fatal(RuntimeTaskFailure::Gateway(format!(
-                                "account {account_id} submit preparation failed: {error}"
-                            ))))
-                            .await
-                            .is_err()
-                        {
-                            return;
+    max_inflight: usize,
+    max_pending: usize,
+) where
+    T: HttpTransport + Clone + 'static,
+{
+    let io = gateway.io_client();
+    let max_inflight = max_inflight.max(1);
+    let max_pending = max_pending.max(1);
+    let mut pending = HashMap::<String, VecDeque<OrderTaskCommand>>::new();
+    let mut pending_count = 0_usize;
+    let mut ready_dispatch_keys = VecDeque::<String>::new();
+    let mut busy_dispatch_keys = HashSet::<String>::new();
+    let mut inflight = FuturesUnordered::<BoxFuture<'static, OrderTaskCompletion>>::new();
+    let mut flush_waiter: Option<oneshot::Sender<()>> = None;
+    let mut shutting_down = false;
+
+    loop {
+        while inflight.len() < max_inflight {
+            let Some(dispatch_key) = ready_dispatch_keys.pop_front() else {
+                break;
+            };
+            debug_assert!(!busy_dispatch_keys.contains(&dispatch_key));
+            let (command, remove_queue) = {
+                let queue = pending
+                    .get_mut(&dispatch_key)
+                    .expect("ready dispatch key must have a pending queue");
+                let command = queue
+                    .pop_front()
+                    .expect("ready dispatch queue must have a command");
+                (command, queue.is_empty())
+            };
+            if remove_queue {
+                pending.remove(&dispatch_key);
+            }
+            pending_count -= 1;
+            match command {
+                OrderTaskCommand::Submit {
+                    action,
+                    enqueued_at,
+                } => {
+                    let symbol = action.order.symbol.clone();
+                    let client_order_id = action.client_order_id;
+                    let preparation = match gateway.prepare_registered_submit(
+                        action.idempotency_key,
+                        action.order,
+                        client_order_id.clone(),
+                    ) {
+                        Ok(preparation) => preparation,
+                        Err(error) => {
+                            if events
+                                .send(RuntimeEvent::Fatal(RuntimeTaskFailure::Gateway(format!(
+                                    "account {account_id} submit preparation failed: {error}"
+                                ))))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            make_dispatch_key_ready(
+                                &dispatch_key,
+                                &pending,
+                                &busy_dispatch_keys,
+                                &mut ready_dispatch_keys,
+                            );
+                            continue;
                         }
-                        continue;
-                    }
-                };
-                let SubmitPreparation::Ready(prepared) = preparation else {
-                    let SubmitPreparation::Complete(outcome) = preparation else {
-                        unreachable!()
                     };
-                    if events
-                        .send(RuntimeEvent::SubmitComplete {
-                            account_id: account_id.clone(),
-                            symbol,
-                            outcome,
-                            ts_ms: unix_time_ms(),
-                            latency_us: None,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                    continue;
-                };
-                match gateway.execute_submit(prepared).await {
-                    Ok(outcome) => {
+                    let SubmitPreparation::Ready(prepared) = preparation else {
+                        let SubmitPreparation::Complete(outcome) = preparation else {
+                            unreachable!()
+                        };
                         if events
                             .send(RuntimeEvent::SubmitComplete {
                                 account_id: account_id.clone(),
                                 symbol,
                                 outcome,
                                 ts_ms: unix_time_ms(),
-                                latency_us: Some(elapsed_us(enqueued_at)),
+                                latency_us: None,
                             })
                             .await
                             .is_err()
                         {
                             return;
                         }
-                    }
-                    Err(error) => {
-                        if events
-                            .send(RuntimeEvent::SubmitFailed {
-                                account_id: account_id.clone(),
+                        make_dispatch_key_ready(
+                            &dispatch_key,
+                            &pending,
+                            &busy_dispatch_keys,
+                            &mut ready_dispatch_keys,
+                        );
+                        continue;
+                    };
+                    busy_dispatch_keys.insert(dispatch_key.clone());
+                    let io = io.clone();
+                    inflight.push(
+                        async move {
+                            let result = io.place_prepared(&prepared).await;
+                            OrderTaskCompletion::Submit {
+                                dispatch_key,
+                                symbol,
                                 client_order_id,
-                                symbol,
-                                ts_ms: unix_time_ms(),
-                                ambiguous: error.is_ambiguous(),
-                                reason: error.to_string(),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return;
+                                prepared,
+                                result,
+                                enqueued_at,
+                            }
                         }
-                    }
+                        .boxed(),
+                    );
+                }
+                OrderTaskCommand::Cancel {
+                    action,
+                    enqueued_at,
+                } => {
+                    let symbol = action.symbol.clone();
+                    let client_order_id = action.client_order_id;
+                    busy_dispatch_keys.insert(dispatch_key.clone());
+                    let io = io.clone();
+                    inflight.push(
+                        async move {
+                            let result = io
+                                .cancel(&symbol, None, Some(client_order_id.clone()))
+                                .await;
+                            OrderTaskCompletion::Cancel {
+                                dispatch_key,
+                                symbol,
+                                client_order_id,
+                                result,
+                                enqueued_at,
+                            }
+                        }
+                        .boxed(),
+                    );
+                }
+                OrderTaskCommand::Flush(_) | OrderTaskCommand::Shutdown => {
+                    unreachable!("control commands are not queued for execution")
                 }
             }
-            OrderTaskCommand::Cancel {
-                action,
-                enqueued_at,
-            } => {
-                let symbol = action.symbol.clone();
-                match gateway
-                    .cancel(&action.symbol, None, Some(action.client_order_id.clone()))
-                    .await
-                {
-                    Ok(mut outcome) => {
-                        if outcome.client_order_id.is_empty() || outcome.client_order_id == "0" {
-                            outcome.client_order_id = action.client_order_id;
-                        }
-                        if events
-                            .send(RuntimeEvent::CancelComplete {
-                                account_id: account_id.clone(),
-                                symbol,
-                                outcome,
-                                ts_ms: unix_time_ms(),
-                                latency_us: elapsed_us(enqueued_at),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    Err(error) => {
-                        if events
-                            .send(RuntimeEvent::CancelFailed {
-                                account_id: account_id.clone(),
-                                client_order_id: action.client_order_id,
-                                symbol,
-                                ts_ms: unix_time_ms(),
-                                ambiguous: error.is_ambiguous(),
-                                reason: error.to_string(),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                }
+        }
+
+        if flush_waiter.is_some() && pending_count == 0 && inflight.is_empty() {
+            if let Some(waiter) = flush_waiter.take() {
+                let _ = waiter.send(());
             }
-            OrderTaskCommand::Reconcile(restored_orders) => {
-                match gateway
-                    .fetch_remote_state(None, None, max_fill_reconciliation_pages)
-                    .await
-                {
-                    Ok((mut remote_orders, remote_fills)) => {
-                        let mut remote_ids = remote_orders
-                            .iter()
-                            .map(remote_order_id)
-                            .collect::<HashSet<_>>();
-                        let mut failed = None;
-                        for restored in restored_orders {
-                            if remote_ids.contains(&restored.order_id) {
-                                continue;
-                            }
-                            let details = match gateway
-                                .fetch_order_details(&restored.symbol, &restored.order_id)
-                                .await
-                            {
-                                Ok(details) => details,
-                                Err(error)
-                                    if error.is_order_not_found()
-                                        && unix_time_ms()
-                                            .saturating_sub(restored.last_update_ms)
-                                            < ambiguous_submit_grace_ms =>
-                                {
-                                    failed = Some(format!(
-                                        "order {} is not visible within the ambiguous-submit grace period",
-                                        restored.order_id
-                                    ));
-                                    break;
-                                }
-                                Err(error) if error.is_order_not_found() => RemoteOrder {
-                                    exchange_order_id: String::new(),
-                                    client_order_id: restored.order_id.clone(),
-                                    symbol: restored.symbol,
-                                    side: restored.side,
-                                    state: PrivateOrderState::Rejected,
-                                    price: restored.price,
-                                    qty: restored.qty,
-                                    cumulative_filled_qty: restored.filled_qty,
-                                    average_fill_price: restored.average_fill_price,
-                                    update_time_ms: unix_time_ms(),
-                                },
-                                Err(error) => {
-                                    failed = Some(error.to_string());
-                                    break;
-                                }
-                            };
-                            remote_ids.insert(remote_order_id(&details));
-                            remote_orders.push(details);
-                        }
-                        if let Some(reason) = failed {
-                            if events
-                                .send(RuntimeEvent::ReconcileFailed {
-                                    account_id: account_id.clone(),
-                                    ts_ms: unix_time_ms(),
-                                    reason,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                            continue;
-                        }
-                        let remote_account = match gateway.fetch_remote_account_state().await {
-                            Ok(account) => account,
-                            Err(error) => {
-                                if events
-                                    .send(RuntimeEvent::ReconcileFailed {
-                                        account_id: account_id.clone(),
-                                        ts_ms: unix_time_ms(),
-                                        reason: error.to_string(),
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                                continue;
-                            }
+            continue;
+        }
+        if shutting_down && pending_count == 0 && inflight.is_empty() {
+            return;
+        }
+
+        tokio::select! {
+            completion = inflight.next(), if !inflight.is_empty() => {
+                let completion = completion.expect("non-empty command future set");
+                let dispatch_key = completion.dispatch_key().to_string();
+                busy_dispatch_keys.remove(&dispatch_key);
+                if !emit_order_task_completion(
+                    &account_id,
+                    &mut gateway,
+                    &events,
+                    completion,
+                ).await {
+                    return;
+                }
+                make_dispatch_key_ready(
+                    &dispatch_key,
+                    &pending,
+                    &busy_dispatch_keys,
+                    &mut ready_dispatch_keys,
+                );
+            }
+            command = commands.recv(), if !shutting_down && flush_waiter.is_none() && pending_count < max_pending => {
+                match command {
+                    Some(command @ OrderTaskCommand::Submit { .. })
+                    | Some(command @ OrderTaskCommand::Cancel { .. }) => {
+                        let symbol = match &command {
+                            OrderTaskCommand::Submit { action, .. } => &action.order.symbol,
+                            OrderTaskCommand::Cancel { action, .. } => &action.symbol,
+                            OrderTaskCommand::Flush(_) | OrderTaskCommand::Shutdown => unreachable!(),
                         };
-                        if events
-                            .send(RuntimeEvent::RemoteState {
-                                account_id: account_id.clone(),
-                                remote_orders,
-                                remote_fills,
-                                remote_account,
-                                ts_ms: unix_time_ms(),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return;
+                        let dispatch_key = okx_order_dispatch_key(symbol);
+                        let queue = pending.entry(dispatch_key.clone()).or_default();
+                        let queue_was_empty = queue.is_empty();
+                        queue.push_back(command);
+                        pending_count += 1;
+                        if queue_was_empty && !busy_dispatch_keys.contains(&dispatch_key) {
+                            ready_dispatch_keys.push_back(dispatch_key);
                         }
                     }
-                    Err(error) => {
-                        if events
-                            .send(RuntimeEvent::ReconcileFailed {
-                                account_id: account_id.clone(),
-                                ts_ms: unix_time_ms(),
-                                reason: error.to_string(),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
+                    Some(OrderTaskCommand::Flush(waiter)) => flush_waiter = Some(waiter),
+                    Some(OrderTaskCommand::Shutdown) | None => shutting_down = true,
                 }
             }
-            OrderTaskCommand::Shutdown => return,
         }
     }
+}
+
+fn make_dispatch_key_ready(
+    dispatch_key: &str,
+    pending: &HashMap<String, VecDeque<OrderTaskCommand>>,
+    busy_dispatch_keys: &HashSet<String>,
+    ready_dispatch_keys: &mut VecDeque<String>,
+) {
+    if !busy_dispatch_keys.contains(dispatch_key)
+        && pending
+            .get(dispatch_key)
+            .is_some_and(|queue| !queue.is_empty())
+    {
+        ready_dispatch_keys.push_back(dispatch_key.to_string());
+    }
+}
+
+async fn emit_order_task_completion<T>(
+    account_id: &str,
+    gateway: &mut OkxOrderGateway<T>,
+    events: &mpsc::Sender<RuntimeEvent>,
+    completion: OrderTaskCompletion,
+) -> bool
+where
+    T: HttpTransport,
+{
+    let event = match completion {
+        OrderTaskCompletion::Submit {
+            symbol,
+            client_order_id,
+            prepared,
+            result,
+            enqueued_at,
+            ..
+        } => match gateway.finish_submit(prepared, result) {
+            Ok(outcome) => RuntimeEvent::SubmitComplete {
+                account_id: account_id.to_string(),
+                symbol,
+                outcome,
+                ts_ms: unix_time_ms(),
+                latency_us: Some(elapsed_us(enqueued_at)),
+            },
+            Err(error) => RuntimeEvent::SubmitFailed {
+                account_id: account_id.to_string(),
+                client_order_id,
+                symbol,
+                ts_ms: unix_time_ms(),
+                ambiguous: error.is_ambiguous(),
+                reason: error.to_string(),
+            },
+        },
+        OrderTaskCompletion::Cancel {
+            symbol,
+            client_order_id,
+            result,
+            enqueued_at,
+            ..
+        } => match result {
+            Ok(mut outcome) => {
+                if outcome.client_order_id.is_empty() || outcome.client_order_id == "0" {
+                    outcome.client_order_id = client_order_id;
+                }
+                RuntimeEvent::CancelComplete {
+                    account_id: account_id.to_string(),
+                    symbol,
+                    outcome,
+                    ts_ms: unix_time_ms(),
+                    latency_us: elapsed_us(enqueued_at),
+                }
+            }
+            Err(error) => RuntimeEvent::CancelFailed {
+                account_id: account_id.to_string(),
+                client_order_id,
+                symbol,
+                ts_ms: unix_time_ms(),
+                ambiguous: error.is_ambiguous(),
+                reason: error.to_string(),
+            },
+        },
+    };
+    events.send(event).await.is_ok()
+}
+
+async fn run_reconcile_task<T>(
+    account_id: String,
+    io: OkxGatewayIo<T>,
+    mut commands: mpsc::Receiver<ReconcileTaskCommand>,
+    events: mpsc::Sender<RuntimeEvent>,
+    ambiguous_submit_grace_ms: u64,
+    max_fill_reconciliation_pages: usize,
+) where
+    T: HttpTransport + 'static,
+{
+    while let Some(command) = commands.recv().await {
+        let ReconcileTaskCommand::Reconcile {
+            restored_orders,
+            command_flush,
+        } = command
+        else {
+            return;
+        };
+        if let Some(command_flush) = command_flush
+            && command_flush.await.is_err()
+        {
+            if events
+                .send(RuntimeEvent::ReconcileFailed {
+                    account_id: account_id.clone(),
+                    ts_ms: unix_time_ms(),
+                    reason: "order command task closed before its shutdown flush".to_string(),
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+            continue;
+        }
+        let result = reconcile_remote_account(
+            &io,
+            restored_orders,
+            ambiguous_submit_grace_ms,
+            max_fill_reconciliation_pages,
+        )
+        .await;
+        let event = match result {
+            Ok((remote_orders, remote_fills, remote_account)) => RuntimeEvent::RemoteState {
+                account_id: account_id.clone(),
+                remote_orders,
+                remote_fills,
+                remote_account,
+                ts_ms: unix_time_ms(),
+            },
+            Err(reason) => RuntimeEvent::ReconcileFailed {
+                account_id: account_id.clone(),
+                ts_ms: unix_time_ms(),
+                reason,
+            },
+        };
+        if events.send(event).await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn reconcile_remote_account<T>(
+    io: &OkxGatewayIo<T>,
+    restored_orders: Vec<ReconcileOrderRef>,
+    ambiguous_submit_grace_ms: u64,
+    max_fill_reconciliation_pages: usize,
+) -> Result<(Vec<RemoteOrder>, Vec<RemoteFill>, AccountUpdate), String>
+where
+    T: HttpTransport,
+{
+    let (mut remote_orders, remote_fills) = io
+        .fetch_remote_state(None, None, max_fill_reconciliation_pages)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut remote_ids = remote_orders
+        .iter()
+        .map(remote_order_id)
+        .collect::<HashSet<_>>();
+    for restored in restored_orders {
+        if remote_ids.contains(&restored.order_id) {
+            continue;
+        }
+        let details = match io
+            .fetch_order_details(&restored.symbol, &restored.order_id)
+            .await
+        {
+            Ok(details) => details,
+            Err(error)
+                if error.is_order_not_found()
+                    && unix_time_ms().saturating_sub(restored.last_update_ms)
+                        < ambiguous_submit_grace_ms =>
+            {
+                return Err(format!(
+                    "order {} is not visible within the ambiguous-submit grace period",
+                    restored.order_id
+                ));
+            }
+            Err(error) if error.is_order_not_found() => RemoteOrder {
+                exchange_order_id: String::new(),
+                client_order_id: restored.order_id.clone(),
+                symbol: restored.symbol,
+                side: restored.side,
+                state: PrivateOrderState::Rejected,
+                price: restored.price,
+                qty: restored.qty,
+                cumulative_filled_qty: restored.filled_qty,
+                average_fill_price: restored.average_fill_price,
+                update_time_ms: unix_time_ms(),
+            },
+            Err(error) => return Err(error.to_string()),
+        };
+        remote_ids.insert(remote_order_id(&details));
+        remote_orders.push(details);
+    }
+    let remote_account = io
+        .fetch_remote_account_state()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok((remote_orders, remote_fills, remote_account))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4192,19 +4438,22 @@ async fn shutdown_signal() -> Result<(), std::io::Error> {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
-    use reap_core::{AccountUpdate, Balance, OrderEvent, OrderUpdate, Side};
+    use reap_core::{AccountUpdate, Balance, NewOrder, OrderEvent, OrderUpdate, Side, TimeInForce};
+    use reap_order::{OkxOrderTransport, OrderTransportError, PacingPolicy};
     use reap_risk::{InstrumentRiskModel, RiskLimits, StablecoinGuardConfig};
     use reap_storage::start_jsonl_storage;
     use reap_strategy::{ChaosConfig, InstrumentKindConfig};
     use reap_venue::okx::{
-        HttpResponse, OkxAccountConfig, OkxAccountLevel, OkxCredentials, OkxInstrumentType,
-        OkxPositionMode, SignedRequest,
+        HttpResponse, OkxAccountConfig, OkxAccountLevel, OkxCancelOrder, OkxCredentials,
+        OkxInstrumentType, OkxOrderAck, OkxPlaceOrder, OkxPositionMode, OkxRestClient, OkxSigner,
+        OkxTradeMode, RestError, SignedRequest,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::{Notify, Semaphore};
 
     use crate::{
         LiveAccountConfig, LiveStorageConfig, OkxTradeModeConfig, OkxVenueConfig, RuntimeConfig,
@@ -4212,6 +4461,346 @@ mod tests {
     };
 
     use super::*;
+
+    #[derive(Clone)]
+    struct RuntimeMockHttp {
+        responses: Arc<Mutex<VecDeque<Result<HttpResponse, RestError>>>>,
+    }
+
+    #[async_trait]
+    impl HttpTransport for RuntimeMockHttp {
+        async fn execute(&self, _request: SignedRequest) -> Result<HttpResponse, RestError> {
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected runtime mock HTTP request")
+        }
+    }
+
+    struct GatedOrderTransport {
+        started: mpsc::UnboundedSender<String>,
+        gates: OrderGates,
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+    }
+
+    type OrderGates = Arc<Mutex<HashMap<String, Arc<Semaphore>>>>;
+    type GatedOrderHarness = (
+        GatedOrderTransport,
+        mpsc::UnboundedReceiver<String>,
+        OrderGates,
+        Arc<AtomicUsize>,
+    );
+
+    #[async_trait]
+    impl OkxOrderTransport for GatedOrderTransport {
+        async fn place_order(
+            &self,
+            order: &OkxPlaceOrder,
+        ) -> Result<OkxOrderAck, OrderTransportError> {
+            self.execute(&order.symbol, &order.client_order_id).await
+        }
+
+        async fn cancel_order(
+            &self,
+            order: &OkxCancelOrder,
+        ) -> Result<OkxOrderAck, OrderTransportError> {
+            self.execute(
+                &order.symbol,
+                order.client_order_id.as_deref().unwrap_or_default(),
+            )
+            .await
+        }
+    }
+
+    impl GatedOrderTransport {
+        async fn execute(
+            &self,
+            symbol: &str,
+            client_order_id: &str,
+        ) -> Result<OkxOrderAck, OrderTransportError> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            self.started.send(symbol.to_string()).unwrap();
+            let gate = self
+                .gates
+                .lock()
+                .unwrap()
+                .get(symbol)
+                .unwrap_or_else(|| panic!("missing gate for {symbol}"))
+                .clone();
+            gate.acquire().await.unwrap().forget();
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(OkxOrderAck {
+                exchange_order_id: format!("exchange-{client_order_id}"),
+                client_order_id: client_order_id.to_string(),
+            })
+        }
+    }
+
+    fn runtime_order_gateway(
+        symbols: &[&str],
+        responses: Vec<Result<HttpResponse, RestError>>,
+    ) -> OkxOrderGateway<RuntimeMockHttp> {
+        let client = OkxRestClient::new(
+            RuntimeMockHttp {
+                responses: Arc::new(Mutex::new(responses.into())),
+            },
+            OkxSigner::new(OkxCredentials::new("key", "secret", "pass"), true),
+        );
+        OkxOrderGateway::new(
+            client,
+            "reap",
+            1,
+            symbols
+                .iter()
+                .map(|symbol| ((*symbol).to_string(), OkxTradeMode::Cash))
+                .collect(),
+            PacingPolicy::default(),
+        )
+        .unwrap()
+    }
+
+    fn gated_order_transport(symbols: &[&str]) -> GatedOrderHarness {
+        let (started_tx, started_rx) = mpsc::unbounded_channel();
+        let gates = Arc::new(Mutex::new(
+            symbols
+                .iter()
+                .map(|symbol| ((*symbol).to_string(), Arc::new(Semaphore::new(0))))
+                .collect(),
+        ));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        (
+            GatedOrderTransport {
+                started: started_tx,
+                gates: Arc::clone(&gates),
+                active: Arc::new(AtomicUsize::new(0)),
+                max_active: Arc::clone(&max_active),
+            },
+            started_rx,
+            gates,
+            max_active,
+        )
+    }
+
+    fn submit_action(symbol: &str, id: &str) -> SubmitAction {
+        SubmitAction {
+            ts_ms: unix_time_ms(),
+            account_id: "main".to_string(),
+            idempotency_key: format!("decision-{id}"),
+            client_order_id: format!("client-{id}"),
+            order: NewOrder {
+                symbol: symbol.to_string(),
+                side: Side::Buy,
+                qty: 1.0,
+                price: 100.0,
+                time_in_force: TimeInForce::PostOnly,
+                reduce_only: false,
+                self_trade_prevention: None,
+                reason: "runtime worker test".to_string(),
+            },
+        }
+    }
+
+    fn release_order(gates: &OrderGates, symbol: &str) {
+        gates.lock().unwrap().get(symbol).unwrap().add_permits(1);
+    }
+
+    async fn receive_started(receiver: &mut mpsc::UnboundedReceiver<String>) -> String {
+        tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("order operation did not start")
+            .expect("order start channel closed")
+    }
+
+    #[tokio::test]
+    async fn order_task_is_bounded_and_serializes_each_underlying() {
+        let symbols = [
+            "BTC-USDT-SWAP",
+            "BTC-USDT-260925",
+            "ETH-USDT-SWAP",
+            "SOL-USDT-SWAP",
+        ];
+        let mut gateway = runtime_order_gateway(&symbols, Vec::new());
+        let (transport, mut started, gates, max_active) = gated_order_transport(&symbols);
+        gateway.set_order_transport(Box::new(transport));
+        let (command_tx, command_rx) = mpsc::channel(16);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let task = tokio::spawn(run_order_task(
+            "main".to_string(),
+            gateway,
+            command_rx,
+            event_tx,
+            2,
+            16,
+        ));
+
+        for (symbol, id) in [
+            (symbols[0], "btc-swap"),
+            (symbols[1], "btc-future"),
+            (symbols[2], "eth"),
+        ] {
+            command_tx
+                .send(OrderTaskCommand::Submit {
+                    action: submit_action(symbol, id),
+                    enqueued_at: Instant::now(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let first = receive_started(&mut started).await;
+        let second = receive_started(&mut started).await;
+        assert_eq!(
+            HashSet::from([first, second]),
+            HashSet::from([symbols[0].to_string(), symbols[2].to_string()])
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), started.recv())
+                .await
+                .is_err(),
+            "the worker exceeded its in-flight bound"
+        );
+
+        release_order(&gates, symbols[0]);
+        assert_eq!(receive_started(&mut started).await, symbols[1]);
+        command_tx
+            .send(OrderTaskCommand::Submit {
+                action: submit_action(symbols[3], "sol"),
+                enqueued_at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), started.recv())
+                .await
+                .is_err(),
+            "a later underlying started before a bounded slot was free"
+        );
+
+        release_order(&gates, symbols[2]);
+        assert_eq!(receive_started(&mut started).await, symbols[3]);
+        release_order(&gates, symbols[1]);
+        release_order(&gates, symbols[3]);
+
+        let (flushed_tx, flushed_rx) = oneshot::channel();
+        command_tx
+            .send(OrderTaskCommand::Flush(flushed_tx))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), flushed_rx)
+            .await
+            .expect("command flush timed out")
+            .unwrap();
+        for _ in 0..4 {
+            assert!(matches!(
+                event_rx.recv().await,
+                Some(RuntimeEvent::SubmitComplete { .. })
+            ));
+        }
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+
+        command_tx.send(OrderTaskCommand::Shutdown).await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconciliation_completes_while_an_order_command_is_blocked() {
+        let symbol = "BTC-USDT-SWAP";
+        let responses = vec![
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"code":"0","msg":"","data":[]}"#.to_string(),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"code":"0","msg":"","data":[]}"#.to_string(),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"code":"0","msg":"","data":[{"uTime":"100","details":[{"ccy":"USDT","cashBal":"100","availBal":"90","eq":"100","liab":"0","maxLoan":"0"}]}]}"#.to_string(),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"code":"0","msg":"","data":[]}"#.to_string(),
+            }),
+        ];
+        let mut gateway = runtime_order_gateway(&[symbol], responses);
+        let (transport, mut started, gates, _) = gated_order_transport(&[symbol]);
+        gateway.set_order_transport(Box::new(transport));
+        let io = gateway.io_client();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (reconcile_tx, reconcile_rx) = mpsc::channel(2);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let order_task = tokio::spawn(run_order_task(
+            "main".to_string(),
+            gateway,
+            command_rx,
+            event_tx.clone(),
+            1,
+            8,
+        ));
+        let reconcile_task = tokio::spawn(run_reconcile_task(
+            "main".to_string(),
+            io,
+            reconcile_rx,
+            event_tx,
+            10_000,
+            2,
+        ));
+
+        command_tx
+            .send(OrderTaskCommand::Submit {
+                action: submit_action(symbol, "blocked"),
+                enqueued_at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(receive_started(&mut started).await, symbol);
+        reconcile_tx
+            .send(ReconcileTaskCommand::Reconcile {
+                restored_orders: Vec::new(),
+                command_flush: None,
+            })
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("reconciliation was blocked behind order acknowledgement")
+            .expect("runtime event channel closed");
+        let RuntimeEvent::RemoteState {
+            remote_orders,
+            remote_account,
+            ..
+        } = event
+        else {
+            panic!("blocked command completed before independent reconciliation");
+        };
+        assert!(remote_orders.is_empty());
+        assert_eq!(remote_account.balances.len(), 1);
+
+        release_order(&gates, symbol);
+        let (flushed_tx, flushed_rx) = oneshot::channel();
+        command_tx
+            .send(OrderTaskCommand::Flush(flushed_tx))
+            .await
+            .unwrap();
+        flushed_rx.await.unwrap();
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(RuntimeEvent::SubmitComplete { .. })
+        ));
+
+        command_tx.send(OrderTaskCommand::Shutdown).await.unwrap();
+        reconcile_tx
+            .send(ReconcileTaskCommand::Shutdown)
+            .await
+            .unwrap();
+        order_task.await.unwrap();
+        reconcile_task.await.unwrap();
+    }
 
     #[test]
     fn latency_duration_rounds_up_to_microseconds() {
@@ -5073,6 +5662,8 @@ mod tests {
             feed_rx,
             order_senders: HashMap::new(),
             order_tasks: Vec::new(),
+            reconcile_senders: HashMap::new(),
+            reconcile_tasks: Vec::new(),
             order_ws_runtimes: Vec::new(),
             order_ws_status_tasks: Vec::new(),
             safety_senders: HashMap::new(),
@@ -5198,6 +5789,8 @@ mod tests {
             feed_rx,
             order_senders: HashMap::new(),
             order_tasks: Vec::new(),
+            reconcile_senders: HashMap::new(),
+            reconcile_tasks: Vec::new(),
             order_ws_runtimes: Vec::new(),
             order_ws_status_tasks: Vec::new(),
             safety_senders: HashMap::new(),
@@ -5396,9 +5989,11 @@ mod tests {
         let (control_tx, control_rx) = mpsc::channel(16);
         let (feed_tx, feed_rx) = mpsc::channel(16);
         let (order_tx, mut order_rx) = mpsc::channel(16);
+        let (reconcile_tx, mut reconcile_rx) = mpsc::channel(16);
         let cancel_observed = Arc::new(AtomicBool::new(false));
+        let reconcile_received = Arc::new(Notify::new());
         let task_cancel_observed = Arc::clone(&cancel_observed);
-        let task_events = control_tx.clone();
+        let task_reconcile_received = Arc::clone(&reconcile_received);
         let order_task = tokio::spawn(async move {
             while let Some(command) = order_rx.recv().await {
                 match command {
@@ -5406,8 +6001,31 @@ mod tests {
                         assert_eq!(action.client_order_id, "client-live");
                         task_cancel_observed.store(true, Ordering::SeqCst);
                     }
-                    OrderTaskCommand::Reconcile(orders) => {
+                    OrderTaskCommand::Flush(waiter) => {
                         assert!(task_cancel_observed.load(Ordering::SeqCst));
+                        task_reconcile_received.notified().await;
+                        waiter.send(()).unwrap();
+                    }
+                    OrderTaskCommand::Submit { .. } => panic!("shutdown dispatched a submit"),
+                    OrderTaskCommand::Shutdown => return,
+                }
+            }
+        });
+        let reconcile_cancel_observed = Arc::clone(&cancel_observed);
+        let task_reconcile_received = Arc::clone(&reconcile_received);
+        let task_events = control_tx.clone();
+        let reconcile_task = tokio::spawn(async move {
+            while let Some(command) = reconcile_rx.recv().await {
+                match command {
+                    ReconcileTaskCommand::Reconcile {
+                        restored_orders: orders,
+                        command_flush,
+                    } => {
+                        task_reconcile_received.notify_one();
+                        if let Some(command_flush) = command_flush {
+                            command_flush.await.unwrap();
+                        }
+                        assert!(reconcile_cancel_observed.load(Ordering::SeqCst));
                         assert_eq!(orders.len(), 1);
                         task_events
                             .send(RuntimeEvent::RemoteState {
@@ -5431,8 +6049,7 @@ mod tests {
                             .await
                             .unwrap();
                     }
-                    OrderTaskCommand::Submit { .. } => panic!("shutdown dispatched a submit"),
-                    OrderTaskCommand::Shutdown => return,
+                    ReconcileTaskCommand::Shutdown => return,
                 }
             }
         });
@@ -5461,6 +6078,8 @@ mod tests {
             feed_rx,
             order_senders: HashMap::from([("main".to_string(), order_tx)]),
             order_tasks: vec![order_task],
+            reconcile_senders: HashMap::from([("main".to_string(), reconcile_tx)]),
+            reconcile_tasks: vec![reconcile_task],
             order_ws_runtimes: Vec::new(),
             order_ws_status_tasks: Vec::new(),
             safety_senders: HashMap::new(),
