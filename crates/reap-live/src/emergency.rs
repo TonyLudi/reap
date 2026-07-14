@@ -3,6 +3,11 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::config::validate_okx_rest_origin;
+use crate::provenance::{
+    current_executable_sha256, host_identity_sha256, okx_account_identity_sha256, sha256_bytes,
+};
+use crate::{OkxVenueConfig, RuntimeConfig, TradingEnvironment};
 use reap_core::PINNED_JAVA_REVISION;
 use reap_order::{PacingPolicy, RequestKind, RequestPacer};
 use reap_venue::RemoteOrder;
@@ -13,12 +18,6 @@ use reap_venue::okx::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::task::JoinSet;
-use url::Url;
-
-use crate::provenance::{
-    current_executable_sha256, host_identity_sha256, okx_account_identity_sha256, sha256_bytes,
-};
-use crate::{OkxVenueConfig, RuntimeConfig, TradingEnvironment};
 
 pub(crate) const MAX_INCIDENTS: usize = 64;
 pub(crate) const MAX_INCIDENT_MESSAGE_BYTES: usize = 4_096;
@@ -695,34 +694,12 @@ fn validate_and_select_accounts(
 }
 
 fn validate_rest_url(venue: &EmergencyVenueConfig, errors: &mut Vec<String>) {
-    match Url::parse(&venue.rest_url) {
-        Ok(url) => {
-            let loopback_http = url.scheme() == "http"
-                && venue.environment == TradingEnvironment::Demo
-                && url.host_str().is_some_and(|host| {
-                    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
-                });
-            if url.scheme() != "https" && !loopback_http {
-                errors.push(
-                    "emergency REST URL must use HTTPS (loopback HTTP is demo-test only)"
-                        .to_string(),
-                );
-            }
-            if !url.username().is_empty() || url.password().is_some() {
-                errors.push("emergency REST URL must not contain user information".to_string());
-            }
-            if url.host_str().is_none() {
-                errors.push("emergency REST URL must contain a host".to_string());
-            }
-            if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some()
-            {
-                errors.push(
-                    "emergency REST URL must be an origin without path/query/fragment".to_string(),
-                );
-            }
-        }
-        Err(error) => errors.push(format!("emergency REST URL is invalid: {error}")),
-    }
+    validate_okx_rest_origin(
+        venue.environment,
+        "emergency REST URL",
+        &venue.rest_url,
+        errors,
+    );
 }
 
 async fn run_account_cancel<T>(
@@ -1576,6 +1553,53 @@ BTC-USDT = { deliberately = "invalid for the live parser" }
 
         assert_eq!(selected.len(), 1);
         assert!(selected[0].trade_modes.contains_key("BTC-USDT"));
+    }
+
+    #[test]
+    fn emergency_cancel_reuses_the_authenticated_rest_origin_allowlist() {
+        let mut errors = Vec::new();
+        validate_rest_url(
+            &EmergencyVenueConfig {
+                environment: TradingEnvironment::Demo,
+                rest_url: "http://127.0.0.1:18080".to_string(),
+            },
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let mut errors = Vec::new();
+        validate_rest_url(
+            &EmergencyVenueConfig {
+                environment: TradingEnvironment::Demo,
+                rest_url: "https://credentials.example".to_string(),
+            },
+            &mut errors,
+        );
+        assert!(errors.iter().any(|error| error.contains("documented OKX")));
+
+        let mut errors = Vec::new();
+        validate_rest_url(
+            &EmergencyVenueConfig {
+                environment: TradingEnvironment::Production,
+                rest_url: "http://127.0.0.1:18080".to_string(),
+            },
+            &mut errors,
+        );
+        assert!(errors.iter().any(|error| error.contains("must use https")));
+
+        let mut errors = Vec::new();
+        validate_rest_url(
+            &EmergencyVenueConfig {
+                environment: TradingEnvironment::Production,
+                rest_url: "https://127.0.0.1".to_string(),
+            },
+            &mut errors,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("loopback origin is demo-test only"))
+        );
     }
 
     #[test]

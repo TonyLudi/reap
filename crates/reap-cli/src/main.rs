@@ -14,6 +14,7 @@ use reap_live::{
     collect_account_certification_path, collect_deadman_expiry_certification_path,
     run_emergency_cancel_path, send_operator_command, verify_account_certification_path,
     verify_deadman_expiry_certification_path, verify_emergency_cancel_paths,
+    verify_production_transition_paths,
 };
 use reap_strategy::ChaosConfig;
 
@@ -107,6 +108,26 @@ enum Command {
     ConfigCheck {
         #[arg(short, long)]
         config: PathBuf,
+        #[arg(long)]
+        pretty: bool,
+    },
+    #[command(
+        about = "Verify that a production config changes only deployment bindings",
+        long_about = "Hash and structurally compare exact validated demo and production live configs. Strategy, risk, runtime, account policy, execution behavior, and safety controls must remain identical; only documented endpoints and deployment/credential bindings may change. This check does not authorize production order entry."
+    )]
+    VerifyProductionTransition {
+        #[arg(long, help = "Exact validated demo live TOML")]
+        demo_config: PathBuf,
+        #[arg(long, help = "Exact validated production-candidate live TOML")]
+        production_config: PathBuf,
+        #[arg(
+            short,
+            long,
+            help = "Optionally create this owner-readable transition artifact"
+        )]
+        output: Option<PathBuf>,
+        #[arg(long, help = "Exit non-zero unless the transition policy passes")]
+        require_pass: bool,
         #[arg(long)]
         pretty: bool,
     },
@@ -606,6 +627,38 @@ async fn main() -> Result<()> {
             }
             if !report.valid {
                 anyhow::bail!("configuration validation failed");
+            }
+        }
+        Command::VerifyProductionTransition {
+            demo_config,
+            production_config,
+            output,
+            require_pass,
+            pretty,
+        } => {
+            let mut output_file = output
+                .as_ref()
+                .map(|path| reserve_private_output(path, "production-transition report"))
+                .transpose()?;
+            let report = verify_production_transition_paths(&demo_config, &production_config)
+                .with_context(|| {
+                    format!(
+                        "failed to verify production transition from {} to {}",
+                        demo_config.display(),
+                        production_config.display()
+                    )
+                })?;
+            let json = if pretty {
+                serde_json::to_string_pretty(&report)?
+            } else {
+                serde_json::to_string(&report)?
+            };
+            if let (Some(file), Some(path)) = (&mut output_file, output.as_deref()) {
+                persist_reserved_output(file, path, &json, "production-transition report")?;
+            }
+            println!("{json}");
+            if require_pass && !report.acceptance_passed {
+                anyhow::bail!("production configuration transition did not pass");
             }
         }
         Command::Capture {

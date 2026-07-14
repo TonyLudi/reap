@@ -201,6 +201,14 @@ architecture in [docs/architecture.md](docs/architecture.md).
   exact config/report bytes, re-derives selected/configured account coverage,
   trigger-horizon and final-zero invariants, and can require every configured
   account without claiming raw exchange-response replay or algo/spread scope.
+- [x] Restrict authenticated live and emergency endpoints to exact documented
+  OKX Global, US/AU, EEA, or Turkey environment tuples; reject arbitrary TLS
+  hosts and permit cleartext loopback only for complete demo-test tuples.
+- [x] Add an exact-file demo-to-production configuration transition verifier
+  that permits only reviewed endpoint/deployment bindings and rejects strategy,
+  risk, runtime, account-policy, execution, storage-capacity, or safety drift.
+- [x] Reject ignored fields throughout live TOML parsing so nested configuration
+  typos cannot silently default or evade production-transition comparison.
 - [x] Add hardened systemd templates with bounded observe restart and manual
   demo/capture restart, plus the stop/cancel/reconcile operating procedure.
 - [x] Persist current OKX order-channel fills and exact per-fill fees once across

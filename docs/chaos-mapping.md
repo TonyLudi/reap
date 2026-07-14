@@ -284,6 +284,17 @@ Rust command strengthens the audit boundary with an exact-config, binary, host,
 Java-revision, exchange-account-identity, account-coverage, and
 task-failure-bound artifact written before its final exit status.
 
+The pinned Java `MetCoinGatewayUrlOkxNitroConfig` and
+`MetCoinGatewayUrlOkxNitroSimConfig` accept Spring-provided host, port, TLS, and
+base-path values; simulation adds `x-simulated-trading: 1`. They do not enforce
+an exchange-host allowlist in those configuration classes. Rust intentionally
+strengthens this deployment boundary: authenticated REST/public/private URLs
+must form one documented OKX region/environment tuple, and the emergency parser
+reuses the same REST-origin policy. This is a credential-exfiltration guard,
+not a claimed Java behavior match. A structured demo-to-production verifier
+then requires the Java-mapped strategy/risk/account/runtime settings to remain
+unchanged while only reviewed deployment bindings move.
+
 ## Live Event Requirements
 
 Decision parity depends on delivering all required normalized events. For each

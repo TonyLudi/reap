@@ -1317,6 +1317,86 @@ For multi-account strategies, a private stale or reconciliation drift event
 must carry `account_id`. A venue-wide event without an account scope is treated
 as affecting every tracked account on that venue.
 
+## Authenticated Endpoint Trust
+
+Live configuration validates the complete REST/public-WebSocket/private-
+WebSocket tuple before credentials or network access. The emergency cancel
+parser applies the same REST-origin trust policy independently. Every official
+endpoint must use HTTPS/WSS, REST must be an origin, WebSockets must use port
+8443 and the exact `/ws/v5/public` or `/ws/v5/private` path, and no endpoint may
+contain user information, a query, or a fragment. Arbitrary TLS hosts and mixed
+regional tuples are rejected to prevent authenticated requests from being sent
+outside the reviewed exchange boundary.
+
+The accepted profiles follow the current official OKX guides:
+
+| Registration region | REST origin | Demo WebSocket host | Production WebSocket host |
+| --- | --- | --- | --- |
+| Global | `openapi.okx.com` or continuing legacy `www.okx.com` | `wspap.okx.com` | `ws.okx.com` |
+| US/AU | `us.okx.com` | `wsuspap.okx.com` | `wsus.okx.com` |
+| EEA | `eea.okx.com` | `wseeapap.okx.com` | `wseea.okx.com` |
+| Turkey | `tr.okx.com` | Not accepted; no demo tuple is documented | `ws.okx.com` |
+
+Sources: [Global API guide](https://www.okx.com/docs-v5/en/),
+[US/AU API guide](https://app.okx.com/docs-v5/en/),
+[EEA API guide](https://my.okx.com/docs-v5/en/), and
+[Turkey API guide](https://tr.okx.com/docs-v5/en/). The
+[OKX changelog](https://www.okx.com/docs-v5/log_en/) records
+`openapi.okx.com` as the recommended Global REST origin while retaining
+`www.okx.com`. Re-review these primary sources before production promotion; an
+endpoint change requires a code review and new demo evidence, not a runtime
+configuration bypass.
+
+A tuple whose REST and both WebSocket hosts are loopback may use cleartext only
+with `environment = "demo"` for deterministic tests. Loopback cannot be mixed
+with official endpoints and is ineligible for production-transition evidence.
+
+## Production Configuration Transition
+
+Run the structured transition verifier against the exact demo file used for
+evidence and the proposed production file:
+
+```bash
+TRANSITION_REPORT="/secure/evidence/production-transition-$(date -u +%Y%m%dT%H%M%SZ).json"
+cargo run -p reap-cli -- verify-production-transition \
+  --demo-config /secure/evidence/exact-demo.toml \
+  --production-config /secure/config/reap-production-candidate.toml \
+  --output "$TRANSITION_REPORT" \
+  --require-pass \
+  --pretty
+```
+
+Both inputs must be bounded regular non-symlink files and individually valid.
+Live parsing rejects every ignored TOML field, including unknown nested
+strategy/risk settings, before comparison so a typo cannot disappear from the
+effective values.
+
+The report records their canonical paths, byte counts, SHA-256 hashes, effective
+fingerprints, environments, endpoint regions, every changed JSON Pointer, the
+pinned Java revision, and the policy result. Output is create-new, mode `0600`
+on Unix, and file/directory durable.
+
+Allowed changes are limited to:
+
+- `venue.environment` and the three region-matched endpoint URLs;
+- each account's API-key, secret-key, and passphrase environment-variable names;
+- `storage.path`;
+- `operator.socket_path` and `operator.token_env`; and
+- `alerts.endpoint_env` and `alerts.bearer_token_env`.
+
+All strategy economics, risk limits, runtime timing/capacity, account IDs and
+mode/routing policy, client-ID policy, VIP-fill behavior, storage durability,
+operator/alert behavior, and host guards must be value-identical after typed
+parsing. Account array order remains significant. Demo and production endpoint
+regions must match; a Global demo file cannot certify an EEA, US/AU, or Turkey
+candidate.
+
+The verifier never reads credential values and cannot prove API-key scope, IP
+binding, target account identity, deployment secret separation, or runtime
+behavior. Archive its passing artifact alongside the exact two configs, but do
+not treat it as production authorization. Production order entry remains
+unavailable until the separate readiness gates pass.
+
 ## Credentials
 
 - Load API key, secret, and passphrase from the deployment secret provider, not

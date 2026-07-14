@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ use thiserror::Error;
 use url::Url;
 
 pub const MAX_LIVE_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_REPORTED_UNKNOWN_FIELDS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -78,6 +80,69 @@ impl TradingEnvironment {
         self == Self::Demo
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OkxEndpointRegion {
+    Global,
+    UsAu,
+    Eea,
+    Turkey,
+    DemoLoopback,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OkxEndpointProfile {
+    region: OkxEndpointRegion,
+    environment: TradingEnvironment,
+    rest_hosts: &'static [&'static str],
+    websocket_host: &'static str,
+}
+
+const OKX_ENDPOINT_PROFILES: &[OkxEndpointProfile] = &[
+    OkxEndpointProfile {
+        region: OkxEndpointRegion::Global,
+        environment: TradingEnvironment::Demo,
+        rest_hosts: &["openapi.okx.com", "www.okx.com"],
+        websocket_host: "wspap.okx.com",
+    },
+    OkxEndpointProfile {
+        region: OkxEndpointRegion::Global,
+        environment: TradingEnvironment::Production,
+        rest_hosts: &["openapi.okx.com", "www.okx.com"],
+        websocket_host: "ws.okx.com",
+    },
+    OkxEndpointProfile {
+        region: OkxEndpointRegion::UsAu,
+        environment: TradingEnvironment::Demo,
+        rest_hosts: &["us.okx.com"],
+        websocket_host: "wsuspap.okx.com",
+    },
+    OkxEndpointProfile {
+        region: OkxEndpointRegion::UsAu,
+        environment: TradingEnvironment::Production,
+        rest_hosts: &["us.okx.com"],
+        websocket_host: "wsus.okx.com",
+    },
+    OkxEndpointProfile {
+        region: OkxEndpointRegion::Eea,
+        environment: TradingEnvironment::Demo,
+        rest_hosts: &["eea.okx.com"],
+        websocket_host: "wseeapap.okx.com",
+    },
+    OkxEndpointProfile {
+        region: OkxEndpointRegion::Eea,
+        environment: TradingEnvironment::Production,
+        rest_hosts: &["eea.okx.com"],
+        websocket_host: "wseea.okx.com",
+    },
+    OkxEndpointProfile {
+        region: OkxEndpointRegion::Turkey,
+        environment: TradingEnvironment::Production,
+        rest_hosts: &["tr.okx.com"],
+        websocket_host: "ws.okx.com",
+    },
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveAccountConfig {
@@ -387,6 +452,8 @@ pub enum LiveConfigError {
     },
     #[error("failed to parse live config: {0}")]
     Parse(#[from] toml::de::Error),
+    #[error("live configuration contains unknown fields: {0}")]
+    UnknownFields(String),
     #[error("failed to fingerprint live config: {0}")]
     Fingerprint(#[from] serde_json::Error),
     #[error("live configuration is invalid: {0}")]
@@ -460,7 +527,25 @@ impl LiveConfig {
     }
 
     pub fn from_toml(text: &str) -> Result<Self, LiveConfigError> {
-        let config: Self = toml::from_str(text)?;
+        let mut ignored_count = 0_u64;
+        let mut ignored_paths = Vec::new();
+        let deserializer = toml::Deserializer::parse(text)?;
+        let config: Self = serde_ignored::deserialize(deserializer, |path| {
+            ignored_count = ignored_count.saturating_add(1);
+            if ignored_paths.len() < MAX_REPORTED_UNKNOWN_FIELDS {
+                ignored_paths.push(path.to_string());
+            }
+        })?;
+        if ignored_count > 0 {
+            ignored_paths.sort();
+            ignored_paths.dedup();
+            let omitted = ignored_count.saturating_sub(ignored_paths.len() as u64);
+            let mut message = ignored_paths.join(", ");
+            if omitted > 0 {
+                message.push_str(&format!(", and {omitted} additional field(s)"));
+            }
+            return Err(LiveConfigError::UnknownFields(message));
+        }
         config.ensure_valid()?;
         Ok(config)
     }
@@ -481,24 +566,7 @@ impl LiveConfig {
             errors.push(format!("risk: {error}"));
         }
         validate_production_stablecoin_guards(self, &mut errors);
-        validate_url(
-            "venue.rest_url",
-            &self.venue.rest_url,
-            &["http", "https"],
-            &mut errors,
-        );
-        validate_url(
-            "venue.public_ws_url",
-            &self.venue.public_ws_url,
-            &["ws", "wss"],
-            &mut errors,
-        );
-        validate_url(
-            "venue.private_ws_url",
-            &self.venue.private_ws_url,
-            &["ws", "wss"],
-            &mut errors,
-        );
+        validate_okx_venue_endpoints(&self.venue, &mut errors);
         validate_positive_runtime(&self.runtime, &mut errors);
         if self.runtime.fill_state_convergence_timeout_ms > self.risk.max_private_age_ms {
             errors.push(
@@ -1131,16 +1199,185 @@ fn validate_host_guard(host_guard: &HostGuardConfig, errors: &mut Vec<String>) {
     }
 }
 
-fn validate_url(name: &str, value: &str, schemes: &[&str], errors: &mut Vec<String>) {
-    match Url::parse(value) {
-        Ok(url) if schemes.contains(&url.scheme()) => {}
-        Ok(url) => errors.push(format!(
-            "{name} has unsupported scheme {}; expected {}",
-            url.scheme(),
-            schemes.join(" or ")
-        )),
-        Err(error) => errors.push(format!("{name} is invalid: {error}")),
+#[derive(Debug)]
+struct ParsedOkxEndpoint {
+    host: String,
+    loopback: bool,
+}
+
+impl OkxVenueConfig {
+    pub fn endpoint_region(&self) -> Result<OkxEndpointRegion, Vec<String>> {
+        let mut errors = Vec::new();
+        let region = validate_okx_venue_endpoints(self, &mut errors);
+        if errors.is_empty() {
+            Ok(region.expect("valid OKX endpoint tuple has a region"))
+        } else {
+            errors.sort();
+            errors.dedup();
+            Err(errors)
+        }
     }
+}
+
+fn validate_okx_venue_endpoints(
+    venue: &OkxVenueConfig,
+    errors: &mut Vec<String>,
+) -> Option<OkxEndpointRegion> {
+    let rest = parse_okx_endpoint(
+        "venue.rest_url",
+        &venue.rest_url,
+        venue.environment,
+        "https",
+        "http",
+        "/",
+        443,
+        errors,
+    );
+    let public = parse_okx_endpoint(
+        "venue.public_ws_url",
+        &venue.public_ws_url,
+        venue.environment,
+        "wss",
+        "ws",
+        "/ws/v5/public",
+        8443,
+        errors,
+    );
+    let private = parse_okx_endpoint(
+        "venue.private_ws_url",
+        &venue.private_ws_url,
+        venue.environment,
+        "wss",
+        "ws",
+        "/ws/v5/private",
+        8443,
+        errors,
+    );
+    if venue.public_ws_url == venue.private_ws_url {
+        errors.push("venue public and private websocket URLs must differ".to_string());
+    }
+    let (Some(rest), Some(public), Some(private)) = (rest, public, private) else {
+        return None;
+    };
+    if rest.loopback || public.loopback || private.loopback {
+        if venue.environment == TradingEnvironment::Demo
+            && rest.loopback
+            && public.loopback
+            && private.loopback
+        {
+            return Some(OkxEndpointRegion::DemoLoopback);
+        }
+        if rest.loopback && public.loopback && private.loopback {
+            errors.push("venue loopback endpoint tuple is demo-test only".to_string());
+        } else {
+            errors.push(
+                "venue endpoint tuple must not mix loopback and official OKX endpoints".to_string(),
+            );
+        }
+        return None;
+    }
+    let profile = OKX_ENDPOINT_PROFILES.iter().find(|profile| {
+        profile.environment == venue.environment
+            && profile.rest_hosts.contains(&rest.host.as_str())
+            && profile.websocket_host == public.host
+            && profile.websocket_host == private.host
+    });
+    match profile {
+        Some(profile) => Some(profile.region),
+        None => {
+            errors.push(format!(
+                "venue endpoints are not a documented, region-consistent OKX {:?} tuple",
+                venue.environment
+            ));
+            None
+        }
+    }
+}
+
+pub(crate) fn validate_okx_rest_origin(
+    environment: TradingEnvironment,
+    name: &str,
+    value: &str,
+    errors: &mut Vec<String>,
+) -> Option<OkxEndpointRegion> {
+    let endpoint = parse_okx_endpoint(name, value, environment, "https", "http", "/", 443, errors)?;
+    if endpoint.loopback {
+        if environment == TradingEnvironment::Demo {
+            return Some(OkxEndpointRegion::DemoLoopback);
+        }
+        errors.push(format!("{name} loopback origin is demo-test only"));
+        return None;
+    }
+    let profile = OKX_ENDPOINT_PROFILES.iter().find(|profile| {
+        profile.environment == environment && profile.rest_hosts.contains(&endpoint.host.as_str())
+    });
+    match profile {
+        Some(profile) => Some(profile.region),
+        None => {
+            errors.push(format!(
+                "{name} host is not a documented OKX REST origin for {environment:?}"
+            ));
+            None
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_okx_endpoint(
+    name: &str,
+    value: &str,
+    environment: TradingEnvironment,
+    secure_scheme: &str,
+    loopback_scheme: &str,
+    expected_path: &str,
+    official_port: u16,
+    errors: &mut Vec<String>,
+) -> Option<ParsedOkxEndpoint> {
+    let initial_errors = errors.len();
+    let url = match Url::parse(value) {
+        Ok(url) => url,
+        Err(error) => {
+            errors.push(format!("{name} is invalid: {error}"));
+            return None;
+        }
+    };
+    let Some(host) = url.host_str() else {
+        errors.push(format!("{name} must contain a host"));
+        return None;
+    };
+    let loopback = is_loopback_host(host);
+    let demo_loopback = environment == TradingEnvironment::Demo && loopback;
+    if url.scheme() != secure_scheme && !(demo_loopback && url.scheme() == loopback_scheme) {
+        errors.push(format!(
+            "{name} must use {secure_scheme} (loopback {loopback_scheme} is demo-test only)"
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        errors.push(format!("{name} must not contain user information"));
+    }
+    if url.path() != expected_path || url.query().is_some() || url.fragment().is_some() {
+        errors.push(format!(
+            "{name} must use exact path {expected_path} without query or fragment"
+        ));
+    }
+    if !demo_loopback && url.port_or_known_default() != Some(official_port) {
+        errors.push(format!("{name} must use port {official_port}"));
+    }
+    if errors.len() != initial_errors {
+        return None;
+    }
+    Some(ParsedOkxEndpoint {
+        host: host.to_ascii_lowercase(),
+        loopback,
+    })
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 fn required_env(account_id: &str, name: &str) -> Result<String, LiveConfigError> {
@@ -1182,6 +1419,246 @@ mod tests {
                 ]),
             }],
         }
+    }
+
+    fn venue(
+        environment: TradingEnvironment,
+        rest_url: &str,
+        public_ws_url: &str,
+        private_ws_url: &str,
+    ) -> OkxVenueConfig {
+        OkxVenueConfig {
+            environment,
+            rest_url: rest_url.to_string(),
+            public_ws_url: public_ws_url.to_string(),
+            private_ws_url: private_ws_url.to_string(),
+            enable_vip_fills_channel: false,
+        }
+    }
+
+    fn global_production_venue() -> OkxVenueConfig {
+        venue(
+            TradingEnvironment::Production,
+            "https://openapi.okx.com",
+            "wss://ws.okx.com:8443/ws/v5/public",
+            "wss://ws.okx.com:8443/ws/v5/private",
+        )
+    }
+
+    #[test]
+    fn documented_okx_endpoint_profiles_are_accepted() {
+        let cases = [
+            (OkxVenueConfig::default(), OkxEndpointRegion::Global),
+            (global_production_venue(), OkxEndpointRegion::Global),
+            (
+                venue(
+                    TradingEnvironment::Demo,
+                    "https://us.okx.com",
+                    "wss://wsuspap.okx.com:8443/ws/v5/public",
+                    "wss://wsuspap.okx.com:8443/ws/v5/private",
+                ),
+                OkxEndpointRegion::UsAu,
+            ),
+            (
+                venue(
+                    TradingEnvironment::Production,
+                    "https://us.okx.com",
+                    "wss://wsus.okx.com:8443/ws/v5/public",
+                    "wss://wsus.okx.com:8443/ws/v5/private",
+                ),
+                OkxEndpointRegion::UsAu,
+            ),
+            (
+                venue(
+                    TradingEnvironment::Demo,
+                    "https://eea.okx.com",
+                    "wss://wseeapap.okx.com:8443/ws/v5/public",
+                    "wss://wseeapap.okx.com:8443/ws/v5/private",
+                ),
+                OkxEndpointRegion::Eea,
+            ),
+            (
+                venue(
+                    TradingEnvironment::Production,
+                    "https://eea.okx.com",
+                    "wss://wseea.okx.com:8443/ws/v5/public",
+                    "wss://wseea.okx.com:8443/ws/v5/private",
+                ),
+                OkxEndpointRegion::Eea,
+            ),
+            (
+                venue(
+                    TradingEnvironment::Production,
+                    "https://tr.okx.com",
+                    "wss://ws.okx.com:8443/ws/v5/public",
+                    "wss://ws.okx.com:8443/ws/v5/private",
+                ),
+                OkxEndpointRegion::Turkey,
+            ),
+        ];
+        for (venue, expected) in cases {
+            assert_eq!(venue.endpoint_region(), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn authenticated_endpoints_reject_untrusted_or_incoherent_hosts() {
+        let arbitrary = OkxVenueConfig {
+            rest_url: "https://credentials.example".to_string(),
+            ..OkxVenueConfig::default()
+        };
+        let errors = arbitrary.endpoint_region().unwrap_err();
+        assert!(errors.iter().any(|error| error.contains("documented")));
+
+        let mixed_region = OkxVenueConfig {
+            rest_url: "https://us.okx.com".to_string(),
+            ..OkxVenueConfig::default()
+        };
+        let errors = mixed_region.endpoint_region().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("region-consistent"))
+        );
+
+        let mut production_with_demo_ws = global_production_venue();
+        production_with_demo_ws.public_ws_url = "wss://wspap.okx.com:8443/ws/v5/public".to_string();
+        let errors = production_with_demo_ws.endpoint_region().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("region-consistent"))
+        );
+    }
+
+    #[test]
+    fn authenticated_endpoints_require_tls_exact_ports_paths_and_no_userinfo() {
+        let mutations = [
+            (
+                "http://openapi.okx.com",
+                "wss://wspap.okx.com:8443/ws/v5/public",
+                "wss://wspap.okx.com:8443/ws/v5/private",
+                "must use https",
+            ),
+            (
+                "https://user@openapi.okx.com",
+                "wss://wspap.okx.com:8443/ws/v5/public",
+                "wss://wspap.okx.com:8443/ws/v5/private",
+                "user information",
+            ),
+            (
+                "https://openapi.okx.com/api/v5",
+                "wss://wspap.okx.com:8443/ws/v5/public",
+                "wss://wspap.okx.com:8443/ws/v5/private",
+                "exact path /",
+            ),
+            (
+                "https://openapi.okx.com?redirect=1",
+                "wss://wspap.okx.com:8443/ws/v5/public",
+                "wss://wspap.okx.com:8443/ws/v5/private",
+                "without query",
+            ),
+            (
+                "https://openapi.okx.com",
+                "wss://wspap.okx.com/ws/v5/public",
+                "wss://wspap.okx.com:8443/ws/v5/private",
+                "port 8443",
+            ),
+            (
+                "https://openapi.okx.com",
+                "wss://wspap.okx.com:8443/ws/v5/private",
+                "wss://wspap.okx.com:8443/ws/v5/public",
+                "exact path",
+            ),
+            (
+                "https://openapi.okx.com",
+                "wss://wspap.okx.com:8443/ws/v5/public#fragment",
+                "wss://wspap.okx.com:8443/ws/v5/private",
+                "fragment",
+            ),
+        ];
+        for (rest, public, private, expected) in mutations {
+            let errors = venue(TradingEnvironment::Demo, rest, public, private)
+                .endpoint_region()
+                .unwrap_err();
+            assert!(
+                errors.iter().any(|error| error.contains(expected)),
+                "expected {expected:?} in {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cleartext_loopback_endpoints_are_demo_test_only() {
+        let loopback = venue(
+            TradingEnvironment::Demo,
+            "http://127.0.0.1:18080",
+            "ws://localhost:18081/ws/v5/public",
+            "ws://[::1]:18082/ws/v5/private",
+        );
+        assert_eq!(
+            loopback.endpoint_region(),
+            Ok(OkxEndpointRegion::DemoLoopback)
+        );
+
+        let mut production = loopback;
+        production.environment = TradingEnvironment::Production;
+        let errors = production.endpoint_region().unwrap_err();
+        assert!(errors.iter().any(|error| error.contains("must use https")));
+        assert!(errors.iter().any(|error| error.contains("must use wss")));
+
+        let tls_loopback = venue(
+            TradingEnvironment::Production,
+            "https://127.0.0.1",
+            "wss://127.0.0.1:8443/ws/v5/public",
+            "wss://127.0.0.1:8443/ws/v5/private",
+        );
+        let errors = tls_loopback.endpoint_region().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("loopback endpoint tuple is demo-test only"))
+        );
+    }
+
+    #[test]
+    fn live_parser_rejects_unknown_fields_at_every_config_layer() {
+        let mut document = toml::Value::try_from(valid_config()).unwrap();
+        document
+            .as_table_mut()
+            .unwrap()
+            .insert("top_level_typo".to_string(), toml::Value::Boolean(true));
+        document["venue"]
+            .as_table_mut()
+            .unwrap()
+            .insert("rest_url_typo".to_string(), toml::Value::Boolean(true));
+        document["risk"]
+            .as_table_mut()
+            .unwrap()
+            .insert("max_drawdown_typo".to_string(), toml::Value::Boolean(true));
+        document["runtime"].as_table_mut().unwrap().insert(
+            "timer_interval_typo".to_string(),
+            toml::Value::Boolean(true),
+        );
+        document["strategy"]["instruments"].as_array_mut().unwrap()[0]
+            .as_table_mut()
+            .unwrap()
+            .insert("tick_size_typo".to_string(), toml::Value::Boolean(true));
+        document["accounts"].as_array_mut().unwrap()[0]
+            .as_table_mut()
+            .unwrap()
+            .insert("node_id_typo".to_string(), toml::Value::Boolean(true));
+
+        let error = LiveConfig::from_toml(&toml::to_string(&document).unwrap())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("top_level_typo"), "{error}");
+        assert!(error.contains("rest_url_typo"), "{error}");
+        assert!(error.contains("max_drawdown_typo"), "{error}");
+        assert!(error.contains("timer_interval_typo"), "{error}");
+        assert!(error.contains("tick_size_typo"), "{error}");
+        assert!(error.contains("node_id_typo"), "{error}");
     }
 
     #[test]
@@ -1228,7 +1705,7 @@ mod tests {
     #[test]
     fn production_environment_is_explicit_in_parsed_config() {
         let mut config = valid_config();
-        config.venue.environment = TradingEnvironment::Production;
+        config.venue = global_production_venue();
         let missing_guard = config.validate();
         assert!(!missing_guard.valid);
         assert!(

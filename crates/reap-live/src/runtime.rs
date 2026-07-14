@@ -5770,6 +5770,8 @@ mod tests {
 
         let mut production = config();
         production.venue.environment = TradingEnvironment::Production;
+        production.venue.public_ws_url = "wss://ws.okx.com:8443/ws/v5/public".to_string();
+        production.venue.private_ws_url = "wss://ws.okx.com:8443/ws/v5/private".to_string();
         production.risk.stablecoin_guards = vec![StablecoinGuardConfig {
             symbol: "USDT-USD".to_string(),
             max_downside_deviation: 0.01,

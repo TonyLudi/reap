@@ -197,6 +197,34 @@ cargo run -p reap-cli -- verify-live-run \
   --pretty
 ```
 
+Authenticated live and emergency configuration accepts only documented,
+region-consistent OKX REST and WebSocket endpoint tuples. Production requires
+HTTPS/WSS; URL user information, alternate paths, query strings, fragments,
+unexpected ports, mixed regions, and arbitrary TLS hosts are rejected. A full
+loopback tuple is accepted only in the demo environment for deterministic local
+tests. Unknown live TOML fields are rejected, including nested strategy and
+risk typos, rather than being silently dropped before validation.
+
+Before promoting an exact demo configuration to a production candidate, create
+an owner-only transition artifact:
+
+```bash
+TRANSITION_REPORT="/secure/evidence/production-transition-$(date -u +%Y%m%dT%H%M%SZ).json"
+cargo run -p reap-cli -- verify-production-transition \
+  --demo-config /secure/evidence/exact-demo.toml \
+  --production-config /secure/config/reap-production-candidate.toml \
+  --output "$TRANSITION_REPORT" \
+  --require-pass \
+  --pretty
+```
+
+The verifier hashes both exact files and permits changes only to the documented
+environment/endpoints, credential environment-variable names, journal/socket
+paths, and operator/alert secret bindings. Strategy, risk, runtime, account
+policy, execution, storage capacity, and safety settings must remain identical,
+and both files must use the same official endpoint region. A pass does not read
+credential values, authorize production, or enable production order entry.
+
 Observe OKX demo feeds and account state without permitting any submit or
 cancel request:
 
