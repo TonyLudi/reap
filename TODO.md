@@ -124,6 +124,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
   REST acknowledgement boundary, and fill-to-account convergence boundary;
   generate config/code/source-bound calibration artifacts and require an exact
   artifact/profile match for production-candidate research.
+- [x] Reserve bounded-live evidence output before network startup and persist a
+  schema-versioned failure report after fail-closed runtime/teardown cleanup,
+  while preserving the original nonzero process exit.
 - [x] Attribute fill fees/turnover and port signed linear/inverse swap funding
   settlement with mark fallback, late/missed coverage signals, and explicit
   end-of-horizon funding actions.

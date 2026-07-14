@@ -7,8 +7,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use reap_backtest::{BacktestConfig, BacktestRunner, run_research_manifest_path};
 use reap_capture::{CaptureConfig, CaptureRunOptions, analyze_capture_path, run_capture};
 use reap_live::{
-    EmergencyCancelOptions, LiveConfig, LiveMode, LiveRunOptions, OperatorCommand,
-    run_emergency_cancel_path, send_operator_command,
+    EmergencyCancelOptions, LiveConfig, LiveMode, LiveRunOptions, LiveRuntimeError,
+    OperatorCommand, run_emergency_cancel_path, send_operator_command,
 };
 use reap_strategy::ChaosConfig;
 
@@ -456,7 +456,19 @@ async fn main() -> Result<()> {
             reap_telemetry::init_json_tracing("info")
                 .map_err(anyhow::Error::msg)
                 .context("failed to initialize live tracing")?;
-            let report = reap_live::run_live_path(
+            let mut output_file = output
+                .as_ref()
+                .map(|output| {
+                    OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(output)
+                        .with_context(|| {
+                            format!("failed to reserve live output {}", output.display())
+                        })
+                })
+                .transpose()?;
+            let run_result = reap_live::run_live_path(
                 config,
                 LiveRunOptions {
                     mode: mode.into(),
@@ -464,25 +476,28 @@ async fn main() -> Result<()> {
                     run_duration: duration_secs.map(Duration::from_secs),
                 },
             )
-            .await?;
+            .await;
+            let (report, runtime_failure) = match run_result {
+                Ok(report) => (report, None),
+                Err(LiveRuntimeError::ReportedFailure { source, report }) => {
+                    (*report, Some(*source))
+                }
+                Err(error) => return Err(error.into()),
+            };
             let json = if pretty {
                 serde_json::to_string_pretty(&report)?
             } else {
                 serde_json::to_string(&report)?
             };
-            if let Some(output) = output {
-                let mut file = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&output)
-                    .with_context(|| {
-                        format!("failed to create live output {}", output.display())
-                    })?;
+            if let Some(file) = &mut output_file {
                 file.write_all(json.as_bytes())?;
                 file.write_all(b"\n")?;
                 file.sync_all()?;
             }
             println!("{json}");
+            if let Some(error) = runtime_failure {
+                return Err(error.into());
+            }
             if require_clean_soak && !report.clean_soak {
                 anyhow::bail!("bounded live soak did not satisfy clean acceptance invariants");
             }

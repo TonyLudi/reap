@@ -13,7 +13,8 @@ use reap_core::PINNED_JAVA_REVISION;
 use reap_live::{
     LIVE_LATENCY_EVIDENCE_SCHEMA_VERSION, LIVE_LATENCY_RESERVOIR_CAPACITY,
     LIVE_RUN_REPORT_SCHEMA_VERSION, LiveConfig, LiveLatencySemantics, LiveLatencySeries, LiveMode,
-    LiveRunReport, MAX_LIVE_LATENCY_SERIES, MAX_LIVE_LATENCY_US,
+    LiveRunReport, LiveStopReason, MAX_LIVE_FAILURE_CODE_BYTES, MAX_LIVE_FAILURE_MESSAGE_BYTES,
+    MAX_LIVE_LATENCY_SERIES, MAX_LIVE_LATENCY_US,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -401,6 +402,40 @@ fn load_reports(
         if !report.clean_soak || !report.reached_ready {
             failures.push(format!(
                 "{} is not a clean ready bounded soak",
+                canonical.display()
+            ));
+        }
+        if report.stop_reason != LiveStopReason::DurationElapsed {
+            failures.push(format!(
+                "{} did not stop after its configured bounded duration",
+                canonical.display()
+            ));
+        }
+        if let Some(failure) = &report.failure {
+            let well_formed = !failure.code.is_empty()
+                && failure.code.len() <= MAX_LIVE_FAILURE_CODE_BYTES
+                && failure
+                    .code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+                && !failure.message.is_empty()
+                && failure.message.len() <= MAX_LIVE_FAILURE_MESSAGE_BYTES;
+            if well_formed {
+                failures.push(format!(
+                    "{} records runtime failure {}",
+                    canonical.display(),
+                    failure.code
+                ));
+            } else {
+                failures.push(format!(
+                    "{} has malformed runtime failure evidence",
+                    canonical.display()
+                ));
+            }
+        }
+        if (report.stop_reason == LiveStopReason::RuntimeFailure) != report.failure.is_some() {
+            failures.push(format!(
+                "{} has inconsistent runtime failure evidence",
                 canonical.display()
             ));
         }
@@ -851,6 +886,7 @@ mod tests {
             account_identity_sha256s: identity,
             mode: LiveMode::Demo,
             stop_reason: reap_live::LiveStopReason::DurationElapsed,
+            failure: None,
             elapsed_ms: 1_000,
             reached_ready: true,
             time_to_ready_ms: Some(1),
@@ -907,6 +943,69 @@ mod tests {
         );
         assert_eq!(artifact.live_executable_sha256, "1".repeat(64));
         artifact.validate_integrity().unwrap();
+
+        let failed_report_path = directory.join("failed-live.json");
+        let mut failed_report = report;
+        failed_report.session_id = Some("session-2".to_string());
+        failed_report.stop_reason = LiveStopReason::RuntimeFailure;
+        failed_report.failure = Some(reap_live::LiveFailureEvidence {
+            code: "gateway_task".to_string(),
+            message: "injected failure".to_string(),
+        });
+        failed_report.clean_soak = false;
+        fs::write(
+            &failed_report_path,
+            serde_json::to_vec(&failed_report).unwrap(),
+        )
+        .unwrap();
+        let failed_artifact = build_latency_calibration(
+            &config_path,
+            &[failed_report_path],
+            LatencyCalibrationOptions {
+                seed: 42,
+                minimum_samples_per_series: 1,
+                accept_matching_upper_bounds: true,
+            },
+        )
+        .unwrap();
+        assert!(!failed_artifact.passed);
+        assert!(
+            failed_artifact
+                .failures
+                .iter()
+                .any(|failure| failure.contains("records runtime failure gateway_task"))
+        );
+
+        let malformed_report_path = directory.join("malformed-failure-live.json");
+        failed_report.session_id = Some("session-3".to_string());
+        failed_report.failure.as_mut().unwrap().code = "gateway_task\nforged".to_string();
+        fs::write(
+            &malformed_report_path,
+            serde_json::to_vec(&failed_report).unwrap(),
+        )
+        .unwrap();
+        let malformed_artifact = build_latency_calibration(
+            &config_path,
+            &[malformed_report_path],
+            LatencyCalibrationOptions {
+                seed: 42,
+                minimum_samples_per_series: 1,
+                accept_matching_upper_bounds: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            malformed_artifact
+                .failures
+                .iter()
+                .any(|failure| failure.contains("malformed runtime failure evidence"))
+        );
+        assert!(
+            malformed_artifact
+                .failures
+                .iter()
+                .all(|failure| !failure.contains("forged"))
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 }

@@ -453,6 +453,16 @@ producing a profile. Production research treats that JSON as untrusted
 evidence, requires the byte-identical executable and an exact baseline-profile
 match, and rechecks its content hash after execution.
 
+The CLI reserves a create-new live evidence path before configuration,
+credential, or network work. After the report-capable runtime exists, every
+initialization, event-loop, or teardown error follows the same
+cancel/reconcile/shutdown path and then returns a schema-versioned report
+containing the primary stable failure code, bounded diagnostic, pre-cleanup
+readiness snapshot, post-cleanup active-order count, and all accumulated
+evidence. The report is persisted before the original error produces a nonzero
+exit. Failures before runtime construction cannot claim runtime state and leave
+only an empty reserved path plus process logs.
+
 Baseline and stress profiles must share a seed. Research accepts a stress
 distribution only when it first-order stochastically dominates the effective
 baseline distribution for every class and every configured symbol override;

@@ -123,6 +123,19 @@ to that artifact, run the byte-identical Reap executable, and use its exact
 baseline profile. The machinery is complete; no credentialed target-host
 artifact has passed yet.
 
+Failure handling was cross-checked against the same pinned connectivity tree.
+`AbstractOkxNitroL2Subscriber.onSocketDisconnected` clears the affected Java
+book and its base subscriber resubscribes after a lost session;
+`OkxNitroOrderClient` publishes `LOST` connection state and rejects new orders
+with `REQUEST_BLOCKED` while disconnected. Rust likewise invalidates feed
+readiness, blocks entry, supervises reconnect/recovery, and reconciles private
+state. Rust intentionally adds a stronger audit boundary: after a report-capable
+runtime exists, an initialization, event-loop, or teardown error completes
+fail-closed cancellation/reconciliation, persists the schema-4 failure code plus
+pre/post-cleanup evidence, and only then returns the nonzero process error. This
+report does not make the fault acceptable; it makes the required demo fault
+campaign machine-reviewable.
+
 Zero-delay and full-capacity fixture compatibility is intentional, but it is
 optimistic evidence, not a calibrated execution claim. Backtest reports retain
 the effective delay/capacity configuration, local time basis, clock regressions,

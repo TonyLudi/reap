@@ -211,6 +211,12 @@ production trading process.
     measurements are explicitly retained as conservative REST-ack upper bounds.
     No representative credentialed report or passing calibration artifact has
     yet been certified.
+36. The live CLI reserves its create-new evidence path before config,
+    credentials, or network activity. Runtime and teardown failures complete
+    fail-closed cleanup, persist a schema-4 report with a stable failure code,
+    readiness and post-cleanup order state, then preserve the original nonzero
+    exit. This makes injected demo faults auditable; failures before runtime
+    construction still require the reserved empty path and process log.
 
 ## Remaining Demo Gate
 

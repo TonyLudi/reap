@@ -50,7 +50,9 @@ use crate::{
 };
 
 type LiveGateway = OkxOrderGateway<ReqwestTransport>;
-pub const LIVE_RUN_REPORT_SCHEMA_VERSION: u32 = 3;
+pub const LIVE_RUN_REPORT_SCHEMA_VERSION: u32 = 4;
+pub const MAX_LIVE_FAILURE_CODE_BYTES: usize = 64;
+pub const MAX_LIVE_FAILURE_MESSAGE_BYTES: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -75,6 +77,16 @@ pub enum LiveStopReason {
     OperatorCommand,
     DurationElapsed,
     ReadinessTimeout,
+    RuntimeFailure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveFailureEvidence {
+    /// Stable machine-readable classification of the primary failure.
+    pub code: String,
+    /// Bounded diagnostic text. This is evidence, not a stable API contract.
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +104,7 @@ pub struct LiveRunReport {
     pub account_identity_sha256s: BTreeMap<String, String>,
     pub mode: LiveMode,
     pub stop_reason: LiveStopReason,
+    pub failure: Option<LiveFailureEvidence>,
     pub elapsed_ms: u64,
     pub reached_ready: bool,
     pub time_to_ready_ms: Option<u64>,
@@ -202,6 +215,54 @@ pub enum LiveRuntimeError {
         primary: Box<LiveRuntimeError>,
         secondary: String,
     },
+    #[error("{source}")]
+    ReportedFailure {
+        #[source]
+        source: Box<LiveRuntimeError>,
+        report: Box<LiveRunReport>,
+    },
+}
+
+impl LiveRuntimeError {
+    fn stable_code(&self) -> &'static str {
+        match self {
+            Self::Config(_) => "config",
+            Self::DemoConfirmationRequired => "demo_confirmation_required",
+            Self::DemoRequiresSimulatedTrading => "demo_requires_simulated_trading",
+            Self::InvalidRunDuration => "invalid_run_duration",
+            Self::Provenance(_) => "provenance",
+            Self::Bootstrap { .. } => "bootstrap",
+            Self::BootstrapVerification(_) => "bootstrap_verification",
+            Self::CheckpointIdentity { .. } => "checkpoint_identity",
+            Self::Subscription(_) => "subscription",
+            Self::GatewaySetup { .. } => "gateway_setup",
+            Self::Coordinator(_) => "coordinator",
+            Self::Storage(_) => "storage",
+            Self::Operator(_) => "operator",
+            Self::Alert(_) => "alert",
+            Self::Host(_) => "host_guard",
+            Self::AlertDelivery { .. } => "alert_delivery",
+            Self::AlertMonitorClosed => "alert_monitor_closed",
+            Self::HostGuardClosed => "host_guard_closed",
+            Self::AlertShutdownTimeout(_) => "alert_shutdown_timeout",
+            Self::AlertFailuresDuringShutdown(_) => "alert_failures_during_shutdown",
+            Self::ShutdownStorage(_) => "shutdown_storage",
+            Self::EventChannelClosed => "event_channel_closed",
+            Self::OperatorChannelClosed => "operator_channel_closed",
+            Self::OrderQueueUnavailable(_) => "order_queue_unavailable",
+            Self::UnsafeShutdownSubmit => "unsafe_shutdown_submit",
+            Self::MissingRecoveryRoute(_) => "missing_recovery_route",
+            Self::ReadinessTimeout(_) => "readiness_timeout",
+            Self::GatewayTask(_) => "gateway_task",
+            Self::SafetyLatchSyncTimeout(_) => "safety_latch_sync_timeout",
+            Self::ShutdownUnresolved { .. } => "shutdown_unresolved",
+            Self::FeedAdapter(_) => "feed_adapter",
+            Self::Join(_) => "task_join",
+            Self::Signal(_) => "signal",
+            Self::LifecycleFailure { primary, .. } => primary.stable_code(),
+            Self::ReportedFailure { source, .. } => source.stable_code(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -242,7 +303,13 @@ struct RunLoopOutcome {
     readiness_at_stop: ReadinessSnapshot,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
+struct RunLoopFailure {
+    error: LiveRuntimeError,
+    outcome: RunLoopOutcome,
+}
+
+#[derive(Debug, Clone, Default)]
 struct ReadinessTracker {
     reached_ready: bool,
     time_to_ready_ms: Option<u64>,
@@ -270,24 +337,25 @@ impl ReadinessTracker {
     }
 
     fn finish(
-        mut self,
+        &self,
         stop_reason: LiveStopReason,
         elapsed_ms: u64,
         readiness: ReadinessSnapshot,
     ) -> RunLoopOutcome {
-        self.observe(elapsed_ms, &readiness);
-        if let Some(started_ms) = self.outage_started_ms {
-            self.max_readiness_outage_ms = self
+        let mut tracker = self.clone();
+        tracker.observe(elapsed_ms, &readiness);
+        if let Some(started_ms) = tracker.outage_started_ms {
+            tracker.max_readiness_outage_ms = tracker
                 .max_readiness_outage_ms
                 .max(elapsed_ms.saturating_sub(started_ms));
         }
         RunLoopOutcome {
             stop_reason,
             elapsed_ms,
-            reached_ready: self.reached_ready,
-            time_to_ready_ms: self.time_to_ready_ms,
-            readiness_loss_count: self.readiness_loss_count,
-            max_readiness_outage_ms: self.max_readiness_outage_ms,
+            reached_ready: tracker.reached_ready,
+            time_to_ready_ms: tracker.time_to_ready_ms,
+            readiness_loss_count: tracker.readiness_loss_count,
+            max_readiness_outage_ms: tracker.max_readiness_outage_ms,
             readiness_at_stop: readiness,
         }
     }
@@ -332,6 +400,25 @@ fn combine_lifecycle_errors(
     }
 }
 
+fn live_failure_evidence(error: &LiveRuntimeError) -> LiveFailureEvidence {
+    LiveFailureEvidence {
+        code: error.stable_code().to_string(),
+        message: truncate_utf8(error.to_string(), MAX_LIVE_FAILURE_MESSAGE_BYTES),
+    }
+}
+
+fn truncate_utf8(mut value: String, maximum_bytes: usize) -> String {
+    if value.len() <= maximum_bytes {
+        return value;
+    }
+    let mut boundary = maximum_bytes;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
+    value
+}
+
 pub async fn run_live_path(
     path: impl AsRef<Path>,
     options: LiveRunOptions,
@@ -374,6 +461,7 @@ pub async fn run_live(
             account_identity_sha256s: BTreeMap::new(),
             mode: options.mode,
             stop_reason: LiveStopReason::Validation,
+            failure: None,
             elapsed_ms: 0,
             reached_ready: false,
             time_to_ready_ms: None,
@@ -1269,6 +1357,8 @@ impl LiveRuntime {
         primary: LiveRuntimeError,
         context: &str,
     ) -> LiveRuntimeError {
+        let readiness_at_stop = self.coordinator.readiness();
+        let elapsed_ms = unix_time_ms().saturating_sub(self.session_started_at_ms);
         let stop_result = self.graceful_stop(context).await;
         let shutdown_result = self.shutdown().await;
         let mut additional = Vec::new();
@@ -1278,14 +1368,29 @@ impl LiveRuntime {
         if let Err(error) = shutdown_result {
             additional.push(("runtime teardown", error));
         }
-        combine_lifecycle_errors(primary, additional)
+        let error = combine_lifecycle_errors(primary, additional);
+        let reached_ready = readiness_at_stop.is_ready();
+        let outcome = RunLoopOutcome {
+            stop_reason: LiveStopReason::RuntimeFailure,
+            elapsed_ms,
+            reached_ready,
+            time_to_ready_ms: reached_ready.then_some(elapsed_ms),
+            readiness_loss_count: 0,
+            max_readiness_outage_ms: 0,
+            readiness_at_stop,
+        };
+        let report = self.build_report(outcome, Some(live_failure_evidence(&error)));
+        LiveRuntimeError::ReportedFailure {
+            source: Box::new(error),
+            report: Box::new(report),
+        }
     }
 
     async fn run(mut self) -> Result<LiveRunReport, LiveRuntimeError> {
         let loop_result = self.run_loop().await;
         let runtime_alert_result = match &loop_result {
             Ok(_) => Ok(()),
-            Err(error) => self.emit_runtime_failure_alert(error),
+            Err(failure) => self.emit_runtime_failure_alert(&failure.error),
         };
         let stop_context = match &loop_result {
             Ok(outcome) => match outcome.stop_reason {
@@ -1297,26 +1402,30 @@ impl LiveRuntime {
                 LiveStopReason::DurationElapsed => "bounded duration elapsed".to_string(),
                 LiveStopReason::ReadinessTimeout => "bounded readiness timeout".to_string(),
                 LiveStopReason::Validation => "validation".to_string(),
+                LiveStopReason::RuntimeFailure => "runtime failure".to_string(),
             },
-            Err(error) => format!("runtime failure: {error}"),
+            Err(failure) => format!("runtime failure: {}", failure.error),
         };
         let stop_result = self.graceful_stop(&stop_context).await;
         let shutdown_result = self.shutdown().await;
-        let outcome = match loop_result {
-            Ok(outcome) => match stop_result {
-                Ok(()) => {
-                    shutdown_result?;
-                    outcome
-                }
-                Err(primary) => {
-                    let additional = shutdown_result
-                        .err()
-                        .map(|error| vec![("runtime teardown", error)])
-                        .unwrap_or_default();
-                    return Err(combine_lifecycle_errors(primary, additional));
-                }
-            },
-            Err(primary) => {
+        let (mut outcome, failure) = match loop_result {
+            Ok(outcome) => {
+                let failure = match stop_result {
+                    Ok(()) => shutdown_result.err(),
+                    Err(primary) => {
+                        let additional = shutdown_result
+                            .err()
+                            .map(|error| vec![("runtime teardown", error)])
+                            .unwrap_or_default();
+                        Some(combine_lifecycle_errors(primary, additional))
+                    }
+                };
+                (outcome, failure)
+            }
+            Err(RunLoopFailure {
+                error: primary,
+                outcome,
+            }) => {
                 let mut additional = Vec::new();
                 if let Err(error) = runtime_alert_result {
                     additional.push(("runtime alert enqueue", error));
@@ -1327,9 +1436,28 @@ impl LiveRuntime {
                 if let Err(error) = shutdown_result {
                     additional.push(("runtime teardown", error));
                 }
-                return Err(combine_lifecycle_errors(primary, additional));
+                (outcome, Some(combine_lifecycle_errors(primary, additional)))
             }
         };
+        if failure.is_some() {
+            outcome.stop_reason = LiveStopReason::RuntimeFailure;
+        }
+        let failure_evidence = failure.as_ref().map(live_failure_evidence);
+        let report = self.build_report(outcome, failure_evidence);
+        match failure {
+            Some(source) => Err(LiveRuntimeError::ReportedFailure {
+                source: Box::new(source),
+                report: Box::new(report),
+            }),
+            None => Ok(report),
+        }
+    }
+
+    fn build_report(
+        &self,
+        outcome: RunLoopOutcome,
+        failure: Option<LiveFailureEvidence>,
+    ) -> LiveRunReport {
         let readiness = self.coordinator.readiness();
         let dropped_storage_records = self.storage_sink.dropped_records();
         let active_orders_after_shutdown = self.coordinator.active_order_count();
@@ -1341,7 +1469,7 @@ impl LiveRuntime {
             active_orders_after_shutdown,
             self.alert_stats.failed,
         );
-        Ok(LiveRunReport {
+        LiveRunReport {
             schema_version: LIVE_RUN_REPORT_SCHEMA_VERSION,
             session_id: Some(self.session_id.clone()),
             session_started_at_ms: self.session_started_at_ms,
@@ -1354,6 +1482,7 @@ impl LiveRuntime {
             account_identity_sha256s: self.account_identity_sha256s.clone(),
             mode: self.mode,
             stop_reason: outcome.stop_reason,
+            failure,
             elapsed_ms: outcome.elapsed_ms,
             reached_ready: outcome.reached_ready,
             time_to_ready_ms: outcome.time_to_ready_ms,
@@ -1379,10 +1508,10 @@ impl LiveRuntime {
             active_orders_after_shutdown,
             latency_evidence: self.latency.report(),
             clean_soak,
-        })
+        }
     }
 
-    async fn run_loop(&mut self) -> Result<RunLoopOutcome, LiveRuntimeError> {
+    async fn run_loop(&mut self) -> Result<RunLoopOutcome, RunLoopFailure> {
         let started = Instant::now();
         let mut readiness_tracker = ReadinessTracker::default();
         let initial_readiness = self.coordinator.readiness();
@@ -1402,102 +1531,122 @@ impl LiveRuntime {
         tokio::pin!(duration_elapsed);
 
         loop {
-            tokio::select! {
-                biased;
-                signal = &mut shutdown => {
-                    signal?;
-                    self.drain_queued_events().await?;
-                    let elapsed_ms = elapsed_ms(&started);
-                    let outcome = readiness_tracker.finish(
-                        LiveStopReason::OperatorSignal,
-                        elapsed_ms,
-                        self.coordinator.readiness(),
-                    );
-                    return Ok(outcome);
-                }
-                _ = &mut duration_elapsed => {
-                    self.drain_queued_events().await?;
-                    let elapsed_ms = elapsed_ms(&started);
-                    let outcome = readiness_tracker.finish(
-                        LiveStopReason::DurationElapsed,
-                        elapsed_ms,
-                        self.coordinator.readiness(),
-                    );
-                    return Ok(outcome);
-                }
-                failure = receive_alert_failure(&mut self.alert_failures) => {
-                    let failure = failure.ok_or(LiveRuntimeError::AlertMonitorClosed)?;
-                    self.observed_alert_delivery_failures = self
-                        .observed_alert_delivery_failures
-                        .saturating_add(1);
-                    tracing::error!(
-                        event_id = %failure.event_id,
-                        code = %failure.code,
-                        attempts = failure.attempts,
-                        reason = %failure.reason,
-                        "external alert delivery failed"
-                    );
-                    if self.alert_delivery_failure_is_fatal {
-                        return Err(LiveRuntimeError::AlertDelivery {
-                            code: failure.code,
-                            attempts: failure.attempts,
-                            reason: failure.reason,
-                        });
+            let iteration: Result<Option<RunLoopOutcome>, LiveRuntimeError> = async {
+                tokio::select! {
+                    biased;
+                    signal = &mut shutdown => {
+                        signal?;
+                        self.drain_queued_events().await?;
+                        Ok(Some(readiness_tracker.finish(
+                            LiveStopReason::OperatorSignal,
+                            elapsed_ms(&started),
+                            self.coordinator.readiness(),
+                        )))
                     }
-                }
-                failure = receive_host_failure(&mut self.host_failures) => {
-                    let failure = failure.ok_or(LiveRuntimeError::HostGuardClosed)?;
-                    return Err(failure.into());
-                }
-                event = self.control_rx.recv() => {
-                    let event = event.ok_or(LiveRuntimeError::EventChannelClosed)?;
-                    self.handle_runtime_event(event).await?;
-                }
-                operator = receive_operator(&mut self.operator_rx) => {
-                    let operator = operator.ok_or(LiveRuntimeError::OperatorChannelClosed)?;
-                    self.handle_operator_envelope(operator).await?;
-                }
-                _ = timer.tick() => {
-                    let now_ms = unix_time_ms();
-                    for event in self.processor.mark_stale(
-                        now_ms,
-                        self.coordinator_risk_max_feed_age(),
-                    ) {
-                        let output = self.coordinator.process_event(NormalizedEvent::System(event));
-                        self.commit_output(output).await?;
+                    _ = &mut duration_elapsed => {
+                        self.drain_queued_events().await?;
+                        Ok(Some(readiness_tracker.finish(
+                            LiveStopReason::DurationElapsed,
+                            elapsed_ms(&started),
+                            self.coordinator.readiness(),
+                        )))
                     }
-                    for breach in self.fill_convergence.expire(now_ms) {
-                        let output = self.coordinator.reconciliation_fault(
-                            &breach.account_id,
-                            now_ms,
-                            breach.symbol,
-                            breach.reason,
-                        )?;
-                        self.commit_output(output).await?;
-                    }
-                    for breach in self.order_convergence.expire(now_ms) {
-                        for order_id in &breach.expired_cancel_order_ids {
-                            self.cancel_inflight
-                                .remove(&(breach.account_id.clone(), order_id.clone()));
+                    failure = receive_alert_failure(&mut self.alert_failures) => {
+                        let failure = failure.ok_or(LiveRuntimeError::AlertMonitorClosed)?;
+                        self.observed_alert_delivery_failures = self
+                            .observed_alert_delivery_failures
+                            .saturating_add(1);
+                        tracing::error!(
+                            event_id = %failure.event_id,
+                            code = %failure.code,
+                            attempts = failure.attempts,
+                            reason = %failure.reason,
+                            "external alert delivery failed"
+                        );
+                        if self.alert_delivery_failure_is_fatal {
+                            Err(LiveRuntimeError::AlertDelivery {
+                                code: failure.code,
+                                attempts: failure.attempts,
+                                reason: failure.reason,
+                            })
+                        } else {
+                            Ok(None)
                         }
-                        let output = self.coordinator.reconciliation_fault(
-                            &breach.account_id,
-                            now_ms,
-                            breach.symbol,
-                            breach.reason,
-                        )?;
-                        self.commit_output(output).await?;
                     }
-                    let output = self.coordinator.process_event(NormalizedEvent::Timer(TimerEvent {
-                        ts_ms: now_ms,
-                        name: "live_tick".to_string(),
-                    }));
-                    self.commit_output(output).await?;
-                    self.retry_reconciliation(now_ms)?;
+                    failure = receive_host_failure(&mut self.host_failures) => {
+                        let failure = failure.ok_or(LiveRuntimeError::HostGuardClosed)?;
+                        Err(failure.into())
+                    }
+                    event = self.control_rx.recv() => {
+                        let event = event.ok_or(LiveRuntimeError::EventChannelClosed)?;
+                        self.handle_runtime_event(event).await?;
+                        Ok(None)
+                    }
+                    operator = receive_operator(&mut self.operator_rx) => {
+                        let operator = operator.ok_or(LiveRuntimeError::OperatorChannelClosed)?;
+                        self.handle_operator_envelope(operator).await?;
+                        Ok(None)
+                    }
+                    _ = timer.tick() => {
+                        let now_ms = unix_time_ms();
+                        for event in self.processor.mark_stale(
+                            now_ms,
+                            self.coordinator_risk_max_feed_age(),
+                        ) {
+                            let output = self.coordinator.process_event(NormalizedEvent::System(event));
+                            self.commit_output(output).await?;
+                        }
+                        for breach in self.fill_convergence.expire(now_ms) {
+                            let output = self.coordinator.reconciliation_fault(
+                                &breach.account_id,
+                                now_ms,
+                                breach.symbol,
+                                breach.reason,
+                            )?;
+                            self.commit_output(output).await?;
+                        }
+                        for breach in self.order_convergence.expire(now_ms) {
+                            for order_id in &breach.expired_cancel_order_ids {
+                                self.cancel_inflight
+                                    .remove(&(breach.account_id.clone(), order_id.clone()));
+                            }
+                            let output = self.coordinator.reconciliation_fault(
+                                &breach.account_id,
+                                now_ms,
+                                breach.symbol,
+                                breach.reason,
+                            )?;
+                            self.commit_output(output).await?;
+                        }
+                        let output = self.coordinator.process_event(NormalizedEvent::Timer(TimerEvent {
+                            ts_ms: now_ms,
+                            name: "live_tick".to_string(),
+                        }));
+                        self.commit_output(output).await?;
+                        self.retry_reconciliation(now_ms)?;
+                        Ok(None)
+                    }
+                    event = self.feed_rx.recv() => {
+                        let event = event.ok_or(LiveRuntimeError::EventChannelClosed)?;
+                        self.handle_runtime_event(event).await?;
+                        Ok(None)
+                    }
                 }
-                event = self.feed_rx.recv() => {
-                    let event = event.ok_or(LiveRuntimeError::EventChannelClosed)?;
-                    self.handle_runtime_event(event).await?;
+            }
+            .await;
+
+            match iteration {
+                Ok(Some(outcome)) => return Ok(outcome),
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(RunLoopFailure {
+                        error,
+                        outcome: readiness_tracker.finish(
+                            LiveStopReason::RuntimeFailure,
+                            elapsed_ms(&started),
+                            self.coordinator.readiness(),
+                        ),
+                    });
                 }
             }
 
@@ -1526,9 +1675,14 @@ impl LiveRuntime {
                     );
                     return Ok(outcome);
                 }
-                return Err(LiveRuntimeError::ReadinessTimeout(
-                    self.readiness_timeout_ms,
-                ));
+                return Err(RunLoopFailure {
+                    error: LiveRuntimeError::ReadinessTimeout(self.readiness_timeout_ms),
+                    outcome: readiness_tracker.finish(
+                        LiveStopReason::RuntimeFailure,
+                        elapsed_ms,
+                        readiness,
+                    ),
+                });
             }
         }
     }
@@ -3812,6 +3966,21 @@ mod tests {
     }
 
     #[test]
+    fn runtime_failure_evidence_has_a_stable_code_and_utf8_bound() {
+        let error = combine_lifecycle_errors(
+            LiveRuntimeError::GatewayTask("\u{20ac}".repeat(2_000)),
+            vec![("runtime teardown", LiveRuntimeError::EventChannelClosed)],
+        );
+
+        let evidence = live_failure_evidence(&error);
+
+        assert_eq!(evidence.code, "gateway_task");
+        assert!(evidence.message.len() <= MAX_LIVE_FAILURE_MESSAGE_BYTES);
+        assert!(evidence.message.ends_with('\u{20ac}'));
+        assert_eq!(truncate_utf8("a\u{20ac}b".to_string(), 3), "a");
+    }
+
+    #[test]
     fn pseudonymous_identity_hash_is_stable_and_field_delimited() {
         let first = identity_sha256(b"account", &[b"ab", b"c"]);
         assert_eq!(first, identity_sha256(b"account", &[b"ab", b"c"]));
@@ -4461,6 +4630,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.stop_reason, LiveStopReason::Validation);
+        assert!(report.failure.is_none());
         assert!(!report.reached_ready);
         assert!(!report.clean_soak);
         assert_eq!(report.schema_version, LIVE_RUN_REPORT_SCHEMA_VERSION);
@@ -4960,6 +5130,17 @@ mod tests {
         drop(feed_tx);
         let _ = std::fs::remove_file(path);
 
+        let LiveRuntimeError::ReportedFailure { source, report } = error else {
+            panic!("runtime failure must retain its post-cleanup evidence report");
+        };
+        assert_eq!(report.stop_reason, LiveStopReason::RuntimeFailure);
+        assert!(!report.clean_soak);
+        assert_eq!(report.active_orders_after_shutdown, 0);
+        let failure = report.failure.as_ref().expect("failure evidence");
+        assert_eq!(failure.code, "gateway_task");
+        assert!(failure.message.contains("injected runtime failure"));
+
+        let error = *source;
         let LiveRuntimeError::LifecycleFailure { primary, secondary } = error else {
             panic!("expected combined runtime and shutdown-storage failure");
         };

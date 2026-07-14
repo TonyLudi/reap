@@ -226,8 +226,14 @@ cargo run -p reap-cli -- live \
 Each create-new live report contains the exact checkpoint and full evidence
 config fingerprints, Reap executable hash, pinned Java revision, pseudonymous
 host/account identity, session/readiness/host evidence, and bounded
-per-class/per-symbol latency samples. Generate a profile only from clean
-target-host reports with the same exact config and binary:
+per-class/per-symbol latency samples. The CLI reserves `--output` before config,
+credential, or network work. Once the report-capable runtime is constructed, an
+initialization, event-loop, or teardown failure still writes a schema-versioned
+report after fail-closed cleanup, with a bounded stable failure code/message,
+and then exits non-zero. A failure before runtime construction leaves the
+reserved file empty and must be diagnosed from the process log; an empty file
+is never evidence. Generate a profile only from clean target-host reports with
+the same exact config and binary:
 
 ```bash
 CALIBRATION="/tmp/reap-latency-calibration-$(date -u +%Y%m%dT%H%M%SZ).json"

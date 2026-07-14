@@ -953,6 +953,17 @@ secondary teardown failure is included in the returned lifecycle error and
 must be treated as an incident. Observe mode performs no exchange mutation and
 shuts down directly.
 
+With `--output`, the CLI reserves the create-new path before configuration,
+credentials, or network startup. If the report-capable runtime's initialization,
+event loop, or teardown fails, Reap completes the same fail-closed cleanup,
+writes and fsyncs a schema-4 report with `stop_reason = "runtime_failure"` plus a
+bounded stable `failure.code` and diagnostic `failure.message`, prints it, and
+then returns the original nonzero error. Review `readiness_at_stop` separately
+from final `readiness`, and require `active_orders_after_shutdown = 0`; a failure
+report is incident evidence and can never be a clean soak. A failure before
+runtime construction leaves the reserved path empty. Archive it with the
+process log, but never parse or present an empty file as a run report.
+
 Host-guard teardown runs before feed/order task teardown. Alert teardown runs
 last so runtime teardown failures can still be queued, and is independently
 bounded by `alerts.shutdown_timeout_ms`.
@@ -1004,7 +1015,9 @@ The report also records time-to-ready, recovered readiness losses and maximum
 outage, disconnects, stale-stream events, book recoveries, and the storage queue
 high-water mark. It also reports authenticated operator commands and mutations.
 When enabled, it includes host preflight/last snapshots and check count plus
-alert delivery and queue evidence.
+alert delivery and queue evidence. A runtime/teardown failure additionally
+records its stable code and bounded message after cleanup while retaining a
+nonzero command exit.
 Recovered disconnects do not by themselves fail acceptance,
 but their counts must match the injected fault plan. In demo mode the final
 `readiness` may be degraded by the deliberate shutdown kill switch; acceptance
@@ -1043,8 +1056,9 @@ Enable `[host_guard]` on the target host before collecting calibration reports.
 Calibration rejects a validation report, a non-clean or non-ready bounded run,
 different full config fingerprints, duplicate sessions/series, wrong schemas or
 Java revision, mixed binaries/hosts/accounts, unsynchronized preflight/final
-clocks, dropped evidence, rejected clock samples, over-limit samples, malformed
-reservoirs, or any failed measured exchange operation. Every configured
+clocks, runtime failure evidence, dropped evidence, rejected clock samples,
+over-limit samples, malformed reservoirs, or any failed measured exchange
+operation. Every configured
 instrument needs depth, trade, new,
 cancel, order-update, and fill series; derivative/index/stablecoin reference
 symbols also need reference-data series. Private classes are accepted only from
