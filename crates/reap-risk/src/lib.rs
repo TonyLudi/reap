@@ -1366,6 +1366,7 @@ mod tests {
             last_fill_qty: 0.0,
             last_fill_price: 0.0,
             last_fill_liquidity: None,
+            last_fill_fee: None,
             reason: "test".to_string(),
         }
     }
@@ -2024,6 +2025,7 @@ mod tests {
             last_fill_qty: 1.0,
             last_fill_price: 100.0,
             last_fill_liquidity: Some(FillLiquidity::Taker),
+            last_fill_fee: None,
             reason: "test".to_string(),
         });
 
@@ -2061,6 +2063,7 @@ mod tests {
             last_fill_qty: 0.0,
             last_fill_price: 0.0,
             last_fill_liquidity: None,
+            last_fill_fee: None,
             reason: "test".to_string(),
         });
 
@@ -2096,6 +2099,7 @@ mod tests {
             last_fill_qty: 0.0,
             last_fill_price: 0.0,
             last_fill_liquidity: None,
+            last_fill_fee: None,
             reason: "test".to_string(),
         });
 
@@ -2199,6 +2203,7 @@ mod tests {
             last_fill_qty: 20.0,
             last_fill_price: 50_000.0,
             last_fill_liquidity: Some(FillLiquidity::Taker),
+            last_fill_fee: None,
             reason: "hedge".to_string(),
         });
         assert!(outcome.events.is_empty());

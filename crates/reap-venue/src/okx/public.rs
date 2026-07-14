@@ -1,5 +1,5 @@
 use reap_core::{
-    AccountUpdate, Balance, BookAction, Channel, EventId, EventKey, FillLiquidity, Level,
+    AccountUpdate, Balance, BookAction, Channel, EventId, EventKey, FillFee, FillLiquidity, Level,
     MarginSnapshot, MarketEvent, NormalizedEvent, Position, PositionMarginMode, RawEnvelope,
     SequencedBookUpdate, Side, Subscription, Venue,
 };
@@ -709,6 +709,11 @@ struct OkxOrder {
     last_fill_price: String,
     #[serde(default, rename = "execType")]
     execution_type: String,
+    // Unlike order-level `fee`/`rebate`, these fields describe this update's fill.
+    #[serde(default, rename = "fillFee")]
+    fill_fee: String,
+    #[serde(default, rename = "fillFeeCcy")]
+    fill_fee_currency: String,
     #[serde(default, rename = "tradeId")]
     trade_id: String,
     #[serde(default, rename = "uTime")]
@@ -760,6 +765,12 @@ impl OkxOrder {
                 "T" => Some(FillLiquidity::Taker),
                 _ => None,
             },
+            last_fill_fee: parse_fill_fee(
+                "fillFee",
+                &self.fill_fee,
+                "fillFeeCcy",
+                &self.fill_fee_currency,
+            )?,
             fill_id: (!self.trade_id.is_empty()).then_some(self.trade_id),
             reject_reason,
         })
@@ -831,6 +842,10 @@ struct OkxFill {
     qty: String,
     #[serde(default, rename = "execType")]
     execution_type: String,
+    #[serde(default)]
+    fee: String,
+    #[serde(default, rename = "feeCcy")]
+    fee_currency: String,
     ts: String,
 }
 
@@ -856,6 +871,7 @@ impl OkxFill {
                     return Err(OkxAdapter::invalid(format!("invalid execType {value}")));
                 }
             },
+            fee: parse_fill_fee("fee", &self.fee, "feeCcy", &self.fee_currency)?,
             ts_ms: parse_u64("ts", &self.ts)?,
         })
     }
@@ -935,6 +951,28 @@ fn parse_optional_f64_value(name: &str, value: &str) -> Result<Option<f64>, Venu
     } else {
         parse_f64(name, value).map(Some)
     }
+}
+
+fn parse_fill_fee(
+    amount_name: &str,
+    amount: &str,
+    currency_name: &str,
+    currency: &str,
+) -> Result<Option<FillFee>, VenueError> {
+    let amount = amount.trim();
+    let currency = currency.trim();
+    if amount.is_empty() && currency.is_empty() {
+        return Ok(None);
+    }
+    if amount.is_empty() || currency.is_empty() {
+        return Err(OkxAdapter::invalid(format!(
+            "{amount_name} and {currency_name} must either both be present or both be absent"
+        )));
+    }
+    Ok(Some(FillFee {
+        amount: parse_f64(amount_name, amount)?,
+        currency: currency.to_ascii_uppercase(),
+    }))
 }
 
 fn parse_u64(name: &str, value: &str) -> Result<u64, VenueError> {
@@ -1170,8 +1208,8 @@ mod tests {
     #[test]
     fn parses_private_order_fill_and_account_updates() {
         let adapter = OkxAdapter::default().with_account_id("main");
-        let order = r#"{"arg":{"channel":"orders","instType":"ANY"},"data":[{"ordId":"123","clOrdId":"reap1","instId":"BTC-USDT","side":"buy","state":"partially_filled","px":"100","sz":"1","accFillSz":"0.4","avgPx":"99.5","fillSz":"0.4","fillPx":"99.5","execType":"M","tradeId":"fill1","uTime":"1000","fillTime":"1000"}]}"#;
-        let fills = r#"{"arg":{"channel":"fills","instId":"BTC-USDT"},"data":[{"tradeId":"fill2","ordId":"123","clOrdId":"reap1","instId":"BTC-USDT","side":"buy","fillPx":"99.4","fillSz":"0.1","execType":"T","ts":"1001"}]}"#;
+        let order = r#"{"arg":{"channel":"orders","instType":"ANY"},"data":[{"ordId":"123","clOrdId":"reap1","instId":"BTC-USDT","side":"buy","state":"partially_filled","px":"100","sz":"1","accFillSz":"0.4","avgPx":"99.5","fillSz":"0.4","fillPx":"99.5","execType":"M","fillFee":"-0.0004","fillFeeCcy":"btc","fee":"-9","feeCcy":"USDT","tradeId":"fill1","uTime":"1000","fillTime":"1000"}]}"#;
+        let fills = r#"{"arg":{"channel":"fills","instId":"BTC-USDT"},"data":[{"tradeId":"fill2","ordId":"123","clOrdId":"reap1","instId":"BTC-USDT","side":"buy","fillPx":"99.4","fillSz":"0.1","execType":"T","fee":"0.01","feeCcy":"usdt","ts":"1001"}]}"#;
         let account = r#"{"arg":{"channel":"account"},"data":[{"uTime":"1002","mgnRatio":"10","adjEq":"1000","notionalUsd":"100","details":[{"ccy":"USDT","cashBal":"1000","availBal":"900","twap":"2"}]}]}"#;
         let positions = r#"{"arg":{"channel":"positions","instType":"ANY"},"data":[{"instId":"BTC-USDT-SWAP","pos":"2","posSide":"short","mgnMode":"cross","avgPx":"50000","uTime":"1003"}]}"#;
 
@@ -1190,6 +1228,16 @@ mod tests {
                 ..
             })
         ));
+        let VenueEvent::PrivateOrder(order_update) = &order_events[0].event else {
+            panic!("expected private order update");
+        };
+        assert_eq!(
+            order_update.last_fill_fee,
+            Some(FillFee {
+                amount: -0.0004,
+                currency: "BTC".to_string(),
+            })
+        );
         assert!(matches!(
             fill_events[0].event,
             VenueEvent::PrivateFill(RemoteFill {
@@ -1198,6 +1246,16 @@ mod tests {
                 ..
             })
         ));
+        let VenueEvent::PrivateFill(fill) = &fill_events[0].event else {
+            panic!("expected private fill");
+        };
+        assert_eq!(
+            fill.fee,
+            Some(FillFee {
+                amount: 0.01,
+                currency: "USDT".to_string(),
+            })
+        );
         assert!(matches!(
             account_events[0].event,
             VenueEvent::Account(AccountUpdate { ref balances, .. })
@@ -1219,6 +1277,19 @@ mod tests {
                     && positions[0].qty == -2.0
                     && positions[0].margin_mode == Some(PositionMarginMode::Cross)
         ));
+    }
+
+    #[test]
+    fn rejects_partial_fill_fee_pairs() {
+        assert!(parse_fill_fee("fillFee", "-0.1", "fillFeeCcy", "").is_err());
+        assert!(parse_fill_fee("fee", "", "feeCcy", "USDT").is_err());
+        assert_eq!(
+            parse_fill_fee("fee", "0", "feeCcy", "usd").unwrap(),
+            Some(FillFee {
+                amount: 0.0,
+                currency: "USD".to_string(),
+            })
+        );
     }
 
     #[test]

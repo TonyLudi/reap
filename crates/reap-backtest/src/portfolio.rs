@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use reap_core::{FillLiquidity, OrderUpdate, Symbol};
+use reap_core::{FillFee, FillLiquidity, OrderUpdate, Symbol};
 use reap_strategy::InstrumentConfig;
 
 #[derive(Debug, Clone)]
@@ -10,6 +10,8 @@ pub struct Portfolio {
     inverse_cash_coin: HashMap<Symbol, f64>,
     cash_by_currency: HashMap<String, f64>,
     fee_cost_usd: f64,
+    exact_fee_fills: u64,
+    estimated_fee_fills: u64,
     funding_pnl_usd: f64,
     turnover_usd: f64,
     currency_conversion_failures: u64,
@@ -27,6 +29,8 @@ impl Portfolio {
             inverse_cash_coin: HashMap::new(),
             cash_by_currency: HashMap::new(),
             fee_cost_usd: 0.0,
+            exact_fee_fills: 0,
+            estimated_fee_fills: 0,
             funding_pnl_usd: 0.0,
             turnover_usd: 0.0,
             currency_conversion_failures: 0,
@@ -38,7 +42,7 @@ impl Portfolio {
         if !update.has_fill() {
             return;
         }
-        let Some(inst) = self.instruments.get(&update.symbol) else {
+        let Some(inst) = self.instruments.get(&update.symbol).cloned() else {
             self.invalid_accounting_events = self.invalid_accounting_events.saturating_add(1);
             return;
         };
@@ -46,10 +50,18 @@ impl Portfolio {
         let contract_value = inst.contract_value;
         let maker_fee = inst.maker_fee;
         let taker_fee = inst.taker_fee;
-        let accounting_currency = instrument_accounting_currency(inst);
+        let accounting_currency = instrument_accounting_currency(&inst);
         if !update.last_fill_qty.is_finite()
             || !update.last_fill_price.is_finite()
             || update.last_fill_price <= 0.0
+        {
+            self.invalid_accounting_events = self.invalid_accounting_events.saturating_add(1);
+            return;
+        }
+        if update
+            .last_fill_fee
+            .as_ref()
+            .is_some_and(|fee| !fee.amount.is_finite() || fee.currency.trim().is_empty())
         {
             self.invalid_accounting_events = self.invalid_accounting_events.saturating_add(1);
             return;
@@ -77,33 +89,77 @@ impl Portfolio {
             *cash -= update.side.factor() * notional;
         }
 
-        let fee_rate = match update.last_fill_liquidity {
-            Some(FillLiquidity::Maker) => maker_fee,
-            Some(FillLiquidity::Taker) => taker_fee,
-            None => 0.0,
-        };
         let absolute_notional = notional.abs();
-        let fee_cost = absolute_notional * fee_rate;
-        if kind.is_inverse() {
-            let fee_coin = fee_cost / update.last_fill_price;
-            *self
-                .inverse_cash_coin
-                .entry(update.symbol.clone())
-                .or_default() -= fee_coin;
+        let (currency_rate, accounting_conversion_complete) =
+            currency_rate_or_par(&accounting_currency, currency_rates_usd);
+        let mut conversion_failed = !accounting_conversion_complete;
+        if let Some(fee) = &update.last_fill_fee {
+            self.exact_fee_fills = self.exact_fee_fills.saturating_add(1);
+            self.apply_exact_fee(&inst, &update.symbol, fee);
+            let (fee_rate_usd, complete) = if fee.amount == 0.0 {
+                (1.0, true)
+            } else {
+                fee_currency_rate_usd(
+                    &inst,
+                    &fee.currency,
+                    update.last_fill_price,
+                    currency_rates_usd,
+                )
+            };
+            if !complete {
+                conversion_failed = true;
+            }
+            self.fee_cost_usd += -fee.amount * fee_rate_usd;
         } else {
-            *self
-                .cash_by_currency
-                .entry(accounting_currency.clone())
-                .or_default() -= fee_cost;
+            self.estimated_fee_fills = self.estimated_fee_fills.saturating_add(1);
+            let fee_rate = match update.last_fill_liquidity {
+                Some(FillLiquidity::Maker) => maker_fee,
+                Some(FillLiquidity::Taker) => taker_fee,
+                None => 0.0,
+            };
+            let fee_cost = absolute_notional * fee_rate;
+            if kind.is_inverse() {
+                let fee_coin = fee_cost / update.last_fill_price;
+                *self
+                    .inverse_cash_coin
+                    .entry(update.symbol.clone())
+                    .or_default() -= fee_coin;
+            } else {
+                *self
+                    .cash_by_currency
+                    .entry(accounting_currency.clone())
+                    .or_default() -= fee_cost;
+            }
+
+            self.fee_cost_usd += fee_cost * currency_rate;
         }
 
-        let (currency_rate, complete) =
-            currency_rate_or_par(&accounting_currency, currency_rates_usd);
-        if !complete {
+        if conversion_failed {
             self.currency_conversion_failures = self.currency_conversion_failures.saturating_add(1);
         }
-        self.fee_cost_usd += fee_cost * currency_rate;
         self.turnover_usd += absolute_notional * currency_rate;
+    }
+
+    fn apply_exact_fee(&mut self, instrument: &InstrumentConfig, symbol: &str, fee: &FillFee) {
+        let currency = normalize_currency(&fee.currency);
+        let base_currency = normalize_currency(&instrument.base_currency);
+        let settle_currency = normalize_currency(&instrument.settle_currency);
+        if instrument.kind.is_spot()
+            && !instrument.base_currency.trim().is_empty()
+            && currency == base_currency
+        {
+            *self.positions.entry(symbol.to_string()).or_default() += fee.amount;
+        } else if instrument.kind.is_inverse()
+            && ((!instrument.settle_currency.trim().is_empty() && currency == settle_currency)
+                || (!instrument.base_currency.trim().is_empty() && currency == base_currency))
+        {
+            *self
+                .inverse_cash_coin
+                .entry(symbol.to_string())
+                .or_default() += fee.amount;
+        } else {
+            *self.cash_by_currency.entry(currency).or_default() += fee.amount;
+        }
     }
 
     /// Applies one swap funding settlement and returns USD PnL (positive means received).
@@ -276,6 +332,14 @@ impl Portfolio {
         self.fee_cost_usd
     }
 
+    pub fn exact_fee_fills(&self) -> u64 {
+        self.exact_fee_fills
+    }
+
+    pub fn estimated_fee_fills(&self) -> u64 {
+        self.estimated_fee_fills
+    }
+
     pub fn funding_pnl_usd(&self) -> f64 {
         self.funding_pnl_usd
     }
@@ -402,6 +466,23 @@ fn currency_rate_checked(currency: &str, currency_rates_usd: &HashMap<String, f6
         .filter(|rate| rate.is_finite() && *rate > 0.0)
 }
 
+fn fee_currency_rate_usd(
+    instrument: &InstrumentConfig,
+    fee_currency: &str,
+    fill_price: f64,
+    currency_rates_usd: &HashMap<String, f64>,
+) -> (f64, bool) {
+    let fee_currency = normalize_currency(fee_currency);
+    if !instrument.base_currency.trim().is_empty()
+        && fee_currency == normalize_currency(&instrument.base_currency)
+    {
+        let quote_currency = normalize_currency(&instrument.quote_currency);
+        let (quote_rate, complete) = currency_rate_or_par(&quote_currency, currency_rates_usd);
+        return (fill_price * quote_rate, complete);
+    }
+    currency_rate_or_par(&fee_currency, currency_rates_usd)
+}
+
 fn currency_rate_or_par(currency: &str, currency_rates_usd: &HashMap<String, f64>) -> (f64, bool) {
     currency_rate_checked(currency, currency_rates_usd)
         .map(|rate| (rate, true))
@@ -432,6 +513,7 @@ mod tests {
             last_fill_qty: qty,
             last_fill_price: price,
             last_fill_liquidity: Some(FillLiquidity::Taker),
+            last_fill_fee: None,
             reason: "test".to_string(),
         }
     }
@@ -450,6 +532,74 @@ mod tests {
 
         assert_eq!(portfolio.turnover_usd(), 200.0);
         assert_eq!(portfolio.fee_cost_usd(), 0.2);
+        assert_eq!(portfolio.exact_fee_fills(), 0);
+        assert_eq!(portfolio.estimated_fee_fills(), 1);
+    }
+
+    #[test]
+    fn exact_spot_base_fee_overrides_rate_and_reduces_inventory() {
+        let instrument = InstrumentConfig {
+            symbol: "BTC-USDT".to_string(),
+            kind: InstrumentKindConfig::Spot,
+            base_currency: "BTC".to_string(),
+            quote_currency: "USDT".to_string(),
+            taker_fee: 0.5,
+            ..InstrumentConfig::default()
+        };
+        let rates = HashMap::from([("USDT".to_string(), 0.95)]);
+        let marks = HashMap::from([("BTC-USDT".to_string(), 100.0)]);
+        let mut update = fill("BTC-USDT", Side::Buy, 2.0, 100.0);
+        update.last_fill_fee = Some(FillFee {
+            amount: -0.002,
+            currency: "BTC".to_string(),
+        });
+        let mut portfolio = Portfolio::new(&[instrument]);
+
+        portfolio.apply_fill(&update, &rates);
+
+        assert!((portfolio.positions()["BTC-USDT"] - 1.998).abs() < 1e-12);
+        assert_eq!(portfolio.cash_by_currency().get("USDT"), Some(&-200.0));
+        assert!((portfolio.fee_cost_usd() - 0.19).abs() < 1e-12);
+        assert!((portfolio.equity_usd_checked(&marks, &rates).unwrap() + 0.19).abs() < 1e-12);
+        assert_eq!(portfolio.exact_fee_fills(), 1);
+        assert_eq!(portfolio.estimated_fee_fills(), 0);
+        assert_eq!(portfolio.currency_conversion_failures(), 0);
+    }
+
+    #[test]
+    fn exact_inverse_fee_is_booked_in_settlement_coin() {
+        let instrument = InstrumentConfig {
+            symbol: "BTC-USD-SWAP".to_string(),
+            kind: InstrumentKindConfig::InverseSwap,
+            base_currency: "BTC".to_string(),
+            quote_currency: "USD".to_string(),
+            settle_currency: "BTC".to_string(),
+            contract_value: 100.0,
+            taker_fee: 0.5,
+            ..InstrumentConfig::default()
+        };
+        let marks = HashMap::from([("BTC-USD-SWAP".to_string(), 50_000.0)]);
+        let mut update = fill("BTC-USD-SWAP", Side::Buy, 10.0, 50_000.0);
+        update.last_fill_fee = Some(FillFee {
+            amount: -0.00001,
+            currency: "BTC".to_string(),
+        });
+        let mut portfolio = Portfolio::new(&[instrument]);
+
+        portfolio.apply_fill(&update, &HashMap::new());
+
+        assert!((portfolio.inverse_cash_coin_by_symbol()["BTC-USD-SWAP"] - 0.01999).abs() < 1e-12);
+        assert!((portfolio.fee_cost_usd() - 0.5).abs() < 1e-12);
+        assert!(
+            (portfolio
+                .equity_usd_checked(&marks, &HashMap::new())
+                .unwrap()
+                + 0.5)
+                .abs()
+                < 1e-9
+        );
+        assert_eq!(portfolio.exact_fee_fills(), 1);
+        assert_eq!(portfolio.estimated_fee_fills(), 0);
     }
 
     #[test]

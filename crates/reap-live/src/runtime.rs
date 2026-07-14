@@ -723,6 +723,7 @@ fn private_update_from_remote(order: RemoteOrder) -> PrivateOrderUpdate {
         last_fill_qty: 0.0,
         last_fill_price: 0.0,
         liquidity: None,
+        last_fill_fee: None,
         fill_id: None,
         reject_reason: if order.state == PrivateOrderState::Rejected {
             "order not present during restart reconciliation".to_string()
@@ -4309,6 +4310,7 @@ mod tests {
                     last_fill_qty: 0.0,
                     last_fill_price: 0.0,
                     last_fill_liquidity: None,
+                    last_fill_fee: None,
                     reason: "restored quote".to_string(),
                 },
             )
@@ -4379,6 +4381,7 @@ mod tests {
                     last_fill_qty: 0.0,
                     last_fill_price: 0.0,
                     last_fill_liquidity: None,
+                    last_fill_fee: None,
                     reason: "restored quote".to_string(),
                 },
             )
@@ -4943,6 +4946,7 @@ mod tests {
                     last_fill_qty: 0.0,
                     last_fill_price: 0.0,
                     last_fill_liquidity: None,
+                    last_fill_fee: None,
                     reason: "test live order".to_string(),
                 },
             )

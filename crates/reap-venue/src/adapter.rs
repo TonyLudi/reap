@@ -1,5 +1,5 @@
 use reap_core::{
-    AccountUpdate, EventId, FillLiquidity, NormalizedEvent, Price, Quantity, RawEnvelope,
+    AccountUpdate, EventId, FillFee, FillLiquidity, NormalizedEvent, Price, Quantity, RawEnvelope,
     SequencedBookUpdate, Side, Subscription, Symbol, TimeMs, Venue,
 };
 use serde::{Deserialize, Serialize};
@@ -59,6 +59,8 @@ pub struct PrivateOrderUpdate {
     pub last_fill_qty: Quantity,
     pub last_fill_price: Price,
     pub liquidity: Option<FillLiquidity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fill_fee: Option<FillFee>,
     pub fill_id: Option<String>,
     pub reject_reason: String,
 }
@@ -87,6 +89,8 @@ pub struct RemoteFill {
     pub price: Price,
     pub qty: Quantity,
     pub liquidity: FillLiquidity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee: Option<FillFee>,
     pub ts_ms: TimeMs,
 }
 

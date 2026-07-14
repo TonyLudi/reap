@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use chrono::{SecondsFormat, Utc};
 use reap_core::{
-    AccountUpdate, Balance, FillLiquidity, MarginSnapshot, Position, PositionMarginMode,
+    AccountUpdate, Balance, FillFee, FillLiquidity, MarginSnapshot, Position, PositionMarginMode,
     SelfTradePrevention, Side, TimeInForce,
 };
 use serde::de::DeserializeOwned;
@@ -1216,6 +1216,10 @@ struct OkxFillWire {
     qty: String,
     #[serde(default, rename = "execType")]
     execution_type: String,
+    #[serde(default)]
+    fee: String,
+    #[serde(default, rename = "feeCcy")]
+    fee_currency: String,
     #[serde(rename = "fillTime")]
     fill_time: String,
 }
@@ -1248,6 +1252,7 @@ impl TryFrom<OkxFillWire> for RemoteFill {
                     });
                 }
             },
+            fee: parse_fill_fee(&value.fee, &value.fee_currency)?,
             ts_ms: parse_integer("fillTime", &value.fill_time)?,
         })
     }
@@ -1412,6 +1417,25 @@ fn parse_optional_number(field: &'static str, value: &str) -> Result<f64, RestEr
     } else {
         parse_number(field, value)
     }
+}
+
+fn parse_fill_fee(amount: &str, currency: &str) -> Result<Option<FillFee>, RestError> {
+    let amount = amount.trim();
+    let currency = currency.trim();
+    if amount.is_empty() && currency.is_empty() {
+        return Ok(None);
+    }
+    if amount.is_empty() || currency.is_empty() {
+        return Err(RestError::InvalidField {
+            field: "fee",
+            value: format!("fee={amount:?}, feeCcy={currency:?}"),
+            message: "fee and feeCcy must either both be present or both be absent".to_string(),
+        });
+    }
+    Ok(Some(FillFee {
+        amount: parse_number("fee", amount)?,
+        currency: currency.to_ascii_uppercase(),
+    }))
 }
 
 fn parse_integer(field: &'static str, value: &str) -> Result<u64, RestError> {
@@ -1657,7 +1681,7 @@ mod tests {
     async fn parses_open_orders_and_fills_for_reconciliation() {
         let (client, requests) = client(vec![
             r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"reap1","instId":"BTC-USDT","side":"buy","state":"partially_filled","px":"100","sz":"1","accFillSz":"0.4","avgPx":"99.5","uTime":"1000"}]}"#,
-            r#"{"code":"0","msg":"","data":[{"tradeId":"fill1","ordId":"123","clOrdId":"reap1","instId":"BTC-USDT","side":"buy","fillPx":"99.5","fillSz":"0.4","execType":"M","fillTime":"1000"}]}"#,
+            r#"{"code":"0","msg":"","data":[{"tradeId":"fill1","ordId":"123","clOrdId":"reap1","instId":"BTC-USDT","side":"buy","fillPx":"99.5","fillSz":"0.4","execType":"M","fee":"-0.0004","feeCcy":"btc","fillTime":"1000"}]}"#,
         ]);
         let orders = client
             .open_orders_at("time", Some("SPOT"), Some("BTC-USDT"))
@@ -1670,6 +1694,13 @@ mod tests {
 
         assert_eq!(orders[0].state, PrivateOrderState::PartiallyFilled);
         assert_eq!(fills[0].liquidity, FillLiquidity::Maker);
+        assert_eq!(
+            fills[0].fee,
+            Some(FillFee {
+                amount: -0.0004,
+                currency: "BTC".to_string(),
+            })
+        );
         let requests = requests.lock().unwrap();
         assert_eq!(
             requests[0].path,

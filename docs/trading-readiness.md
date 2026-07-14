@@ -10,7 +10,7 @@ production trading process.
 | Area | Current state | Trading impact |
 | --- | --- | --- |
 | Iarb2 decision model | Covered for the documented OKX parity boundary | Not a blocker |
-| Deterministic backtest/data | Shared strategy code, immediate pending-order registration, arrival-time scheduler, Java-mapped class/symbol empirical latency profiles with sampled-usage reporting, versioned target-host/live collectors, deterministic calibration artifacts bound into production research, conservative depth/queue/trade capacity controls, event-clock drawdown/exposure/inventory metrics, per-currency depeg-sensitive valuation, fee/turnover attribution, scheduled linear/inverse funding, manifest-driven chronological walk-forward selection and stress gates, credential-free redundant public capture, exact provenance, streaming analysis, and raw/normalized replay | The evidence pipeline is implemented but execution/accounting assumptions remain uncalibrated; needs sustained full-depth and currency-index capture, a passing credentialed target-host/demo latency artifact, complete funding intervals, borrow/fee calibration, statement reconciliation, and real production-candidate reports before capital decisions |
+| Deterministic backtest/data | Shared strategy code, immediate pending-order registration, arrival-time scheduler, Java-mapped class/symbol empirical latency profiles with sampled-usage reporting, versioned target-host/live collectors, deterministic calibration artifacts bound into production research, conservative depth/queue/trade capacity controls, event-clock drawdown/exposure/inventory metrics, per-currency depeg-sensitive valuation, exact private-fill fee currency plus explicit simulated-fee counts, fee/turnover attribution, scheduled linear/inverse funding, manifest-driven chronological walk-forward selection and stress gates, credential-free redundant public capture, exact provenance, streaming analysis, and raw/normalized replay | The evidence pipeline is implemented but execution/accounting assumptions remain uncalibrated; needs sustained full-depth and currency-index capture, a passing credentialed target-host/demo latency artifact, complete funding intervals, target-tier fee calibration, zero-liability cash-account certification, statement reconciliation, and real production-candidate reports before capital decisions |
 | Feed components | Redundant public sockets, isolated private sockets, transport/state freshness separation, account-plus-positions health rounds, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
 | Order components | Event-loop client IDs/registration, exchange/client acknowledgement binding, account-scoped immutable private identity, semantic duplicate suppression across changed exchange timestamps, exchange-side place-request expiry, signed submit/cancel, pacing, monotonic private reduction, submit/cancel state-convergence deadlines, typed position margin mode, ambiguity handling, and full order/fill/balance/position REST reconciliation are composed | Needs demo exchange fault evidence |
 | Runtime risk | Instrument models, authoritative startup positions, active-order count/notional ceilings, rolling submit-rejection and zero-fill IOC-cancel circuits, terminal strategy-halt promotion, position scope/mode enforcement, forced-repayment blocking, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed deadman/depeg/convergence evidence |
@@ -176,6 +176,10 @@ production trading process.
     and clears queue-ahead on a shallow cross, but its value is still an
     inherited conservative default rather than target-venue evidence.
 31. Backtest fills now attribute configured maker/taker fee cost and turnover.
+    Private order/fill and REST paths additionally preserve the exact signed fee
+    and currency, book it in the balance that changed, and report exact versus
+    estimated fee-fill counts. Order-channel `fillFee` is per update; cumulative
+    order-level `fee` is deliberately not treated as a last-fill charge.
     Funding forecasts schedule one signed linear or inverse swap settlement at
     the advertised exchange time, update to the latest rate, prefer exchange
     mark over midpoint fallback, and expose late, missed, failed, and
@@ -263,6 +267,9 @@ Production enablement additionally requires:
   Latency requires a passed source-bound calibration artifact; the implemented
   REST-ack matching measurements must remain labeled and approved as upper
   bounds unless a closer exchange boundary is added.
+- Target-account cash-mode and zero-liability certification. Margin spot remains
+  unsupported; enabling it requires an explicit borrow-rate/interest model and
+  demo statement reconciliation first.
 - Sustained redundant direct currency/USD index coverage for every non-USD
   accounting currency, with zero conversion failures and fee/cash/funding/equity
   reconciliation against target-tier demo statements.

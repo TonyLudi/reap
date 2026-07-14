@@ -15,8 +15,8 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use reap_core::{
-    FillLiquidity, NewOrder, OrderEvent, OrderStatus, OrderUpdate, Price, Quantity, Side, Symbol,
-    TimeInForce, TimeMs,
+    FillFee, FillLiquidity, NewOrder, OrderEvent, OrderStatus, OrderUpdate, Price, Quantity, Side,
+    Symbol, TimeInForce, TimeMs,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +34,8 @@ pub struct OrderSnapshot {
     pub last_fill_qty: Quantity,
     pub last_fill_price: Price,
     pub last_fill_liquidity: Option<FillLiquidity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fill_fee: Option<FillFee>,
     pub reason: String,
 }
 
@@ -68,6 +70,7 @@ impl OrderSnapshot {
             last_fill_qty: 0.0,
             last_fill_price: 0.0,
             last_fill_liquidity: None,
+            last_fill_fee: None,
             reason: order.reason,
         }
     }
@@ -87,6 +90,7 @@ impl OrderSnapshot {
             last_fill_qty: update.last_fill_qty,
             last_fill_price: update.last_fill_price,
             last_fill_liquidity: update.last_fill_liquidity,
+            last_fill_fee: update.last_fill_fee.clone(),
             reason: update.reason.clone(),
         }
     }
@@ -106,6 +110,7 @@ impl OrderSnapshot {
         self.last_fill_qty = update.last_fill_qty;
         self.last_fill_price = update.last_fill_price;
         self.last_fill_liquidity = update.last_fill_liquidity;
+        self.last_fill_fee = update.last_fill_fee.clone();
         self.reason = update.reason.clone();
     }
 
@@ -126,6 +131,7 @@ impl OrderSnapshot {
             last_fill_qty: self.last_fill_qty,
             last_fill_price: self.last_fill_price,
             last_fill_liquidity: self.last_fill_liquidity,
+            last_fill_fee: self.last_fill_fee.clone(),
             reason: self.event_reason(reason),
         }
     }
@@ -299,6 +305,7 @@ impl OrderReducer {
         snapshot.last_fill_qty = qty;
         snapshot.last_fill_price = fill_px;
         snapshot.last_fill_liquidity = Some(liquidity);
+        snapshot.last_fill_fee = None;
         snapshot.status = if snapshot.open_qty <= 0.0 {
             OrderStatus::Filled
         } else {
@@ -347,6 +354,8 @@ struct UpdateKey {
     last_fill_qty: u64,
     last_fill_price: u64,
     last_fill_liquidity: u8,
+    last_fill_fee_amount: Option<u64>,
+    last_fill_fee_currency: Option<String>,
     reason: String,
 }
 
@@ -367,6 +376,14 @@ impl From<&OrderUpdate> for UpdateKey {
             last_fill_qty: update.last_fill_qty.to_bits(),
             last_fill_price: update.last_fill_price.to_bits(),
             last_fill_liquidity: liquidity_code(update.last_fill_liquidity),
+            last_fill_fee_amount: update
+                .last_fill_fee
+                .as_ref()
+                .map(|fee| fee.amount.to_bits()),
+            last_fill_fee_currency: update
+                .last_fill_fee
+                .as_ref()
+                .map(|fee| fee.currency.clone()),
             reason: update.reason.clone(),
         }
     }
@@ -454,6 +471,7 @@ mod tests {
             last_fill_qty: 0.4,
             last_fill_price: 99.5,
             last_fill_liquidity: Some(FillLiquidity::Maker),
+            last_fill_fee: None,
             reason: "quote".to_string(),
         };
 

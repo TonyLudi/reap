@@ -424,6 +424,7 @@ mod tests {
             price: 50.0,
             qty: 1.0,
             liquidity: reap_core::FillLiquidity::Taker,
+            fee: None,
             ts_ms: 3,
         };
 

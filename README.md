@@ -125,12 +125,14 @@ the threshold is the pinned Java default, capacity fractions are 100%, and
 profitability claim.
 
 Backtest reports also separate fee cost, funding PnL, turnover, and raw currency
-cash. They value spot, derivative, funding, and active-order exposure through
-fresh latency-delivered currency indexes; missing/stale rates or conversions
-attempted before a rate is usable make accounting incomplete. Reports also flag
-late, missed, invalid, or failed funding accounting and retain funding
-settlements beyond the data horizon as pending actions. The model assumes a zero
-initial portfolio and is not an exchange-statement substitute.
+cash. Exact private-fill fees retain their signed exchange amount and currency;
+public-data simulated fills remain explicitly counted rate estimates. Spot,
+derivative, funding, fee, and active-order exposure use fresh latency-delivered
+currency indexes; missing/stale rates or conversions attempted before a rate is
+usable make accounting incomplete. Reports also flag late, missed, invalid, or
+failed funding accounting and retain funding settlements beyond the data
+horizon as pending actions. The model assumes a zero initial portfolio and is
+not an exchange-statement substitute.
 
 Run the checked-in walk-forward plumbing fixture:
 

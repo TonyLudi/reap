@@ -4747,6 +4747,7 @@ mod tests {
             last_fill_qty: 0.1,
             last_fill_price: 50_000.0,
             last_fill_liquidity: None,
+            last_fill_fee: None,
             reason: "quote".to_string(),
         }));
         assert!(fill_intents.is_empty());
@@ -5390,6 +5391,7 @@ mod tests {
             last_fill_qty: 0.0,
             last_fill_price: 0.0,
             last_fill_liquidity: None,
+            last_fill_fee: None,
             reason: "quote:pending_new".to_string(),
         });
 
@@ -5424,6 +5426,7 @@ mod tests {
             last_fill_qty: 0.0,
             last_fill_price: 0.0,
             last_fill_liquidity: None,
+            last_fill_fee: None,
             reason: "hedge:BTC-USDT:50000".to_string(),
         });
         strategy.update_risk();
@@ -5844,6 +5847,7 @@ mod tests {
             last_fill_qty: 1.0,
             last_fill_price: 100.0,
             last_fill_liquidity: None,
+            last_fill_fee: None,
             reason: "quote".to_string(),
         });
 
@@ -5934,6 +5938,7 @@ mod tests {
             last_fill_qty: 0.0,
             last_fill_price: 0.0,
             last_fill_liquidity: None,
+            last_fill_fee: None,
             reason: "quote".to_string(),
         });
         strategy.on_order_update(&OrderUpdate {
@@ -5952,6 +5957,7 @@ mod tests {
             last_fill_qty: 1.0,
             last_fill_price: 100.0,
             last_fill_liquidity: Some(FillLiquidity::Maker),
+            last_fill_fee: None,
             reason: "quote".to_string(),
         });
 
@@ -6298,6 +6304,7 @@ mod tests {
                 last_fill_qty: 0.01,
                 last_fill_price: 98.0,
                 last_fill_liquidity: Some(FillLiquidity::Maker),
+                last_fill_fee: None,
                 reason: "quote".to_string(),
             });
             if index < 5 {
@@ -6435,6 +6442,7 @@ mod tests {
             last_fill_qty: 0.0,
             last_fill_price: 0.0,
             last_fill_liquidity: None,
+            last_fill_fee: None,
             reason: "hedge:BTC-USDT:100".to_string(),
         });
 
@@ -6670,6 +6678,7 @@ mod tests {
             last_fill_qty: 0.0,
             last_fill_price: 0.0,
             last_fill_liquidity: None,
+            last_fill_fee: None,
             reason: "hedge:BTC-USDT:100".to_string(),
         });
 

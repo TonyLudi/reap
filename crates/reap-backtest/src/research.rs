@@ -247,6 +247,10 @@ pub struct RunAggregate {
     pub fills: usize,
     pub net_pnl_usd: f64,
     pub fee_cost_usd: f64,
+    #[serde(default)]
+    pub exact_fee_fills: u64,
+    #[serde(default)]
+    pub estimated_fee_fills: u64,
     pub funding_pnl_usd: f64,
     pub turnover_usd: f64,
     pub maximum_drawdown_usd: f64,
@@ -847,6 +851,12 @@ impl RunAggregate {
             aggregate.fills = aggregate.fills.saturating_add(report.fills);
             aggregate.net_pnl_usd += report.final_equity_usd;
             aggregate.fee_cost_usd += report.fee_cost_usd;
+            aggregate.exact_fee_fills = aggregate
+                .exact_fee_fills
+                .saturating_add(report.exact_fee_fills);
+            aggregate.estimated_fee_fills = aggregate
+                .estimated_fee_fills
+                .saturating_add(report.estimated_fee_fills);
             aggregate.funding_pnl_usd += report.funding_pnl_usd;
             aggregate.turnover_usd += report.turnover_usd;
             aggregate.maximum_drawdown_usd =

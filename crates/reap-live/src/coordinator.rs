@@ -377,6 +377,7 @@ impl LiveCoordinator {
                     price: fill.price,
                     qty: fill.qty,
                     liquidity: fill.liquidity,
+                    fee: fill.fee.clone(),
                 };
                 let ts_ms = fill.ts_ms;
                 let symbol = fill.symbol.clone();
@@ -1157,9 +1158,9 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     use reap_core::{
-        AccountUpdate, Balance, FillLiquidity, Level, MarketEvent, NewOrder, OrderBook, OrderEvent,
-        OrderStatus, OrderUpdate, Position, PositionMarginMode, Side, SystemEvent, SystemEventKind,
-        TimeInForce, Venue,
+        AccountUpdate, Balance, FillFee, FillLiquidity, Level, MarketEvent, NewOrder, OrderBook,
+        OrderEvent, OrderStatus, OrderUpdate, Position, PositionMarginMode, Side, SystemEvent,
+        SystemEventKind, TimeInForce, Venue,
     };
     use reap_feed::FeedOutput;
     use reap_order::{ReconcileIssue, reconcile, reconcile_full_state};
@@ -1496,6 +1497,7 @@ mod tests {
             last_fill_qty: 0.0,
             last_fill_price: 0.0,
             liquidity: None,
+            last_fill_fee: None,
             fill_id: None,
             reject_reason: String::new(),
         }
@@ -2018,6 +2020,7 @@ mod tests {
                     last_fill_qty: 0.0,
                     last_fill_price: 0.0,
                     liquidity: None,
+                    last_fill_fee: None,
                     fill_id: None,
                     reject_reason: String::new(),
                 },
@@ -2046,6 +2049,10 @@ mod tests {
                     price: 100.0,
                     qty: 0.05,
                     liquidity: FillLiquidity::Taker,
+                    fee: Some(FillFee {
+                        amount: -0.005,
+                        currency: "USDT".to_string(),
+                    }),
                     ts_ms: 6,
                 },
             })
@@ -2053,7 +2060,10 @@ mod tests {
 
         assert!(fill.records.iter().any(|record| matches!(
             record,
-            StorageRecord::Fill(fill) if fill.order_id == "client-1"
+            StorageRecord::Fill(fill)
+                if fill.order_id == "client-1"
+                    && fill.fee.as_ref().is_some_and(|fee|
+                        fee.amount == -0.005 && fee.currency == "USDT")
         )));
         assert!(
             !fill
@@ -2104,6 +2114,7 @@ mod tests {
                     price: 100.0,
                     qty: 0.1,
                     liquidity: FillLiquidity::Taker,
+                    fee: None,
                     ts_ms: 4,
                 },
             })
@@ -2144,6 +2155,7 @@ mod tests {
                     last_fill_qty: 0.0,
                     last_fill_price: 0.0,
                     liquidity: None,
+                    last_fill_fee: None,
                     fill_id: None,
                     reject_reason: String::new(),
                 },
@@ -2176,6 +2188,7 @@ mod tests {
                     price: 100.0,
                     qty: 0.05,
                     liquidity: FillLiquidity::Taker,
+                    fee: None,
                     ts_ms: 5,
                 },
             })
@@ -2229,6 +2242,7 @@ mod tests {
                     last_fill_qty: 0.0,
                     last_fill_price: 0.0,
                     last_fill_liquidity: None,
+                    last_fill_fee: None,
                     reason: "quote".to_string(),
                 },
             )
@@ -2301,6 +2315,7 @@ mod tests {
                     last_fill_qty: 0.0,
                     last_fill_price: 0.0,
                     last_fill_liquidity: None,
+                    last_fill_fee: None,
                     reason: "quote".to_string(),
                 },
             )
@@ -2400,6 +2415,7 @@ mod tests {
                     last_fill_qty: 0.0,
                     last_fill_price: 0.0,
                     last_fill_liquidity: None,
+                    last_fill_fee: None,
                     reason: "quote".to_string(),
                 },
             )
@@ -2467,6 +2483,7 @@ mod tests {
                     last_fill_qty: 0.0,
                     last_fill_price: 0.0,
                     liquidity: None,
+                    last_fill_fee: None,
                     fill_id: None,
                     reject_reason: String::new(),
                 },
@@ -2559,6 +2576,7 @@ mod tests {
             last_fill_qty: 0.0,
             last_fill_price: 0.0,
             last_fill_liquidity: None,
+            last_fill_fee: None,
             reason: "quote".to_string(),
         };
         coordinator
@@ -2573,6 +2591,7 @@ mod tests {
             price: 99.9,
             qty: 1.0,
             liquidity: FillLiquidity::Taker,
+            fee: None,
             ts_ms: 11,
         };
         coordinator
@@ -2598,6 +2617,7 @@ mod tests {
                     last_fill_qty: 0.0,
                     last_fill_price: 0.0,
                     liquidity: None,
+                    last_fill_fee: None,
                     fill_id: None,
                     reject_reason: String::new(),
                 },

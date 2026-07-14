@@ -367,6 +367,18 @@ dedicated fills channel is opt-in because OKX restricts it by fee tier; fills
 from the orders channel remain canonical. Any lost invariant blocks new orders
 while demo-mode cancels remain available.
 
+Private fill fees use one normalized contract: the amount is the signed balance
+delta, so a charge is negative and a rebate is positive, and the currency names
+the balance that changed. The orders channel maps current per-update `fillFee`
+and `fillFeeCcy`; it intentionally ignores order-level `fee` and `rebate`
+because those are cumulative. The fills channel and REST reconciliation map the
+per-fill `fee` and `feeCcy`. This follows the pinned Java distinction between
+the cumulative `OrderDetailUpdate` fields (differenced by `ExchFillUtils`) and
+the per-fill REST `UserTrade` fields, while using the newer OKX per-update order
+fields directly. Canonical fill deduplication prevents a fills-channel copy from
+charging the same trade again, and both canonical order records and REST/fills
+journal records retain the exact fee evidence.
+
 The strategy core retains static `master_strategy` and `strategy_group` fields
 for parity experiments and backtests. The live configuration boundary rejects
 both because the external Java `StrategyUpdate` liveness, member-state, and
@@ -539,13 +551,18 @@ strategy-decision parity and adds depeg-sensitive conversion only at the
 research accounting boundary.
 
 This is still research accounting, not an exchange statement. It assumes a zero
-initial portfolio, estimates fees from configured rates and an accounting
-currency because normalized fills do not carry exchange `feeCcy`, and does not
-model borrowing interest, liquidation, margin discounts, or tax. It also cannot
-infer a missing funding event when the source dataset never contained one.
-Production evaluation must reconcile these outputs against demo account
-statements and complete funding and currency-index coverage across every held
-interval.
+initial portfolio. Private normalized fills can carry exact signed fee and
+currency evidence; those fees are booked in spot base/quote balances, inverse
+settlement coin, or the reported third currency as applicable. Public-data
+matching has no account fee event, so it estimates fees from configured
+maker/taker rates. Reports expose exact and estimated fee-fill counts. The model
+does not implement a statement importer, borrowing interest, liquidation,
+margin discounts, or tax, and it cannot infer a missing funding event when the
+source dataset never contained one. The supported live spot boundary is cash
+mode; production certification must prove zero liabilities. Enabling margin
+spot later requires a separate borrow-rate and interest model first. Production
+evaluation must reconcile these outputs against demo account statements and
+complete funding and currency-index coverage across every held interval.
 
 #### Deterministic walk-forward research
 

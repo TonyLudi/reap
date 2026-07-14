@@ -47,6 +47,7 @@ control plane.
 | Quote debounce, force refresh, and top-level refill delay | Quote target state and fill timestamps | Exact for target decisions |
 | Risk-group soft/hard/stop delta behavior | `RiskGroupState` quote and hedge permissions | Exact |
 | Spot cash, equity, liability, loan, and borrow limits | Account-scoped balance state | Exact |
+| Signed fill fee/rebate and fee currency | Per-update order `fillFee`, per-fill websocket/REST `fee`, canonical order state, and durable fill records | Equivalent current-wire handling; cumulative legacy order fee is intentionally not charged as one fill |
 | Derivative position and margin capacity | Position and settle-currency account state | Exact |
 | OKX exchange CMR and calculated portfolio margin checks | Separate margin fields and debouncers | Exact |
 | Balance sheet, turnover, live size, PnL, margin, index, and basis checks | `check_risk_limits`, debounced conditions, and generic engine safety-halt promotion | Exact thresholds with a stricter durable global latch and all-order cancellation on terminal halt |

@@ -470,6 +470,11 @@ impl PrivateStateReducer {
             } else {
                 None
             },
+            last_fill_fee: if last_fill_qty > 0.0 {
+                update.last_fill_fee
+            } else {
+                None
+            },
             reason: match (local_reason, update.reject_reason.is_empty()) {
                 (Some(reason), true) => reason,
                 (Some(reason), false) => format!("{reason}:{}", update.reject_reason),
@@ -539,6 +544,7 @@ impl PrivateStateReducer {
             last_fill_qty: applied_qty,
             last_fill_price: fill.price,
             last_fill_liquidity: Some(fill.liquidity),
+            last_fill_fee: fill.fee,
             reason: existing.reason,
         };
         Ok(self
@@ -637,7 +643,7 @@ struct PrivateVersion {
 
 #[cfg(test)]
 mod tests {
-    use reap_core::{FillLiquidity, Side};
+    use reap_core::{FillFee, FillLiquidity, Side};
 
     use super::*;
 
@@ -656,6 +662,7 @@ mod tests {
             last_fill_qty: 0.4,
             last_fill_price: 99.5,
             liquidity: Some(FillLiquidity::Maker),
+            last_fill_fee: None,
             fill_id: Some("fill-1".to_string()),
             reject_reason: String::new(),
         }
@@ -674,6 +681,21 @@ mod tests {
             0.4
         );
         assert_eq!(reducer.canonical_order_id("exchange-1"), Some("client-1"));
+    }
+
+    #[test]
+    fn private_order_fill_propagates_exact_fee_once() {
+        let mut reducer = PrivateStateReducer::new();
+        let mut fill = private_fill();
+        fill.last_fill_fee = Some(FillFee {
+            amount: -0.0004,
+            currency: "BTC".to_string(),
+        });
+
+        let canonical = reducer.apply_order(fill.clone()).unwrap().unwrap();
+
+        assert_eq!(canonical.last_fill_fee, fill.last_fill_fee);
+        assert!(reducer.apply_order(fill).unwrap().is_none());
     }
 
     #[test]
@@ -1011,6 +1033,7 @@ mod tests {
             price: 99.5,
             qty: 0.4,
             liquidity: FillLiquidity::Maker,
+            fee: None,
             ts_ms: 2,
         };
 
@@ -1058,6 +1081,7 @@ mod tests {
                 price: 99.5,
                 qty: 0.4,
                 liquidity: FillLiquidity::Maker,
+                fee: None,
                 ts_ms: 2,
             })
             .unwrap()

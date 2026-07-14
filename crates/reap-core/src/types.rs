@@ -297,6 +297,16 @@ pub enum FillLiquidity {
     Taker,
 }
 
+/// The exchange-reported balance delta caused by one fill.
+///
+/// Charges are negative and rebates are positive. `currency` names the balance
+/// that changed; it is not assumed to be the instrument's settlement currency.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FillFee {
+    pub amount: f64,
+    pub currency: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Level {
     pub px: Price,
@@ -429,6 +439,8 @@ pub struct OrderUpdate {
     pub last_fill_qty: Quantity,
     pub last_fill_price: Price,
     pub last_fill_liquidity: Option<FillLiquidity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fill_fee: Option<FillFee>,
     pub reason: String,
 }
 

@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use reap_core::{
-    FillLiquidity, NormalizedEvent, OrderIntent, OrderUpdate, Price, Quantity, RawEnvelope, Side,
-    Symbol, SystemEvent, SystemEventKind, TimeMs,
+    FillFee, FillLiquidity, NormalizedEvent, OrderIntent, OrderUpdate, Price, Quantity,
+    RawEnvelope, Side, Symbol, SystemEvent, SystemEventKind, TimeMs,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -163,6 +163,8 @@ pub struct FillRecord {
     pub price: Price,
     pub qty: Quantity,
     pub liquidity: FillLiquidity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee: Option<FillFee>,
 }
 
 #[derive(Debug, Clone)]
@@ -947,6 +949,7 @@ mod tests {
                 last_fill_qty: 0.0,
                 last_fill_price: 0.0,
                 last_fill_liquidity: None,
+                last_fill_fee: None,
                 reason: "test".to_string(),
             },
         })
@@ -962,6 +965,7 @@ mod tests {
             price: 100.0,
             qty: 1.0,
             liquidity: FillLiquidity::Maker,
+            fee: None,
         }))
         .await
         .unwrap();
@@ -1154,6 +1158,7 @@ mod tests {
             last_fill_qty: 0.0,
             last_fill_price: 0.0,
             last_fill_liquidity: None,
+            last_fill_fee: None,
             reason: "test".to_string(),
         };
         sink.record(StorageRecord::Order {
@@ -1181,6 +1186,10 @@ mod tests {
             price: 100.0,
             qty: 0.5,
             liquidity: FillLiquidity::Maker,
+            fee: Some(FillFee {
+                amount: -0.0005,
+                currency: "BTC".to_string(),
+            }),
         }))
         .await
         .unwrap();
@@ -1192,6 +1201,13 @@ mod tests {
             OrderStatus::Cancelled
         );
         assert!(recovered.seen_fill_ids.contains("fill-1"));
+        assert_eq!(
+            recovered.fills[0].fee,
+            Some(FillFee {
+                amount: -0.0005,
+                currency: "BTC".to_string(),
+            })
+        );
         assert!(recovered.baseline_fill_ids["main"].contains("historical-fill"));
         assert_eq!(recovered.order_bindings["main"]["exchange-1"], "order-1");
         assert_eq!(recovered.last_ts_ms, 2);

@@ -101,6 +101,10 @@ pub struct BacktestReport {
     #[serde(default)]
     pub inverse_cash_coin_by_symbol: BTreeMap<Symbol, f64>,
     pub fee_cost_usd: f64,
+    #[serde(default)]
+    pub exact_fee_fills: u64,
+    #[serde(default)]
+    pub estimated_fee_fills: u64,
     pub funding_pnl_usd: f64,
     pub turnover_usd: f64,
     #[serde(default)]
@@ -1118,6 +1122,8 @@ impl BacktestRunner {
             cash_by_currency: self.portfolio.cash_by_currency(),
             inverse_cash_coin_by_symbol: self.portfolio.inverse_cash_coin_by_symbol(),
             fee_cost_usd: self.portfolio.fee_cost_usd(),
+            exact_fee_fills: self.portfolio.exact_fee_fills(),
+            estimated_fee_fills: self.portfolio.estimated_fee_fills(),
             funding_pnl_usd: self.portfolio.funding_pnl_usd(),
             turnover_usd: self.portfolio.turnover_usd(),
             currency_rate_events: self.currency_rate_events,
@@ -1398,6 +1404,7 @@ mod tests {
             last_fill_qty: 1.0,
             last_fill_price: price,
             last_fill_liquidity: Some(FillLiquidity::Taker),
+            last_fill_fee: None,
             reason: "external-test-fill".to_string(),
         })
     }
@@ -1855,6 +1862,7 @@ mod tests {
                 last_fill_qty: 100.0,
                 last_fill_price: 50_000.0,
                 last_fill_liquidity: Some(FillLiquidity::Taker),
+                last_fill_fee: None,
                 reason: "initial".to_string(),
             },
             &HashMap::new(),
@@ -1968,6 +1976,7 @@ mod tests {
                 last_fill_qty: 1.0,
                 last_fill_price: 50_000.0,
                 last_fill_liquidity: Some(FillLiquidity::Taker),
+                last_fill_fee: None,
                 reason: "fixture".to_string(),
             }),
             NormalizedEvent::from(MarketEvent::Depth(OrderBook::one_level(

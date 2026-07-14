@@ -198,11 +198,17 @@ Walk-forward scenarios inherit routes from each candidate; leave scenario
 substitute a different valuation source or freshness budget.
 
 This depeg-sensitive research extension does not change the Java-parity strategy
-decision model. It still does not model borrowing interest, liquidation, margin
-discounts, taxes, or actual exchange fee currency. A research acceptance run
-must span held funding boundaries, use the target fee tier, and reconcile fill,
-fee, funding, cash, equity, currency conversion, and active-order notional
-attribution to demo account statements before profitability metrics are trusted.
+decision model. Private order/fill and REST records now retain exact signed fee
+amounts and fee currency; public-data simulated fills still use the configured
+maker/taker fee tier and reports distinguish exact from estimated fee fills. The
+model does not yet import or reconcile exchange statements, and it does not
+model borrowing interest, liquidation, margin discounts, or taxes. Live spot is
+cash-only; certify zero target-account liabilities, and do not enable margin
+spot without adding and validating a borrow-interest model. A research
+acceptance run must span held funding boundaries, use the target fee tier, and
+reconcile fill, fee, funding, cash, equity, currency conversion, and active-order
+notional attribution to demo account statements before profitability metrics
+are trusted.
 Use `--require-complete-accounting` in automated research runs so any reported
 accounting defect also makes the command fail.
 

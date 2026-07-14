@@ -203,8 +203,12 @@ architecture in [docs/architecture.md](docs/architecture.md).
   walk-forward, capacity, and stressed-liquidity reports. The orchestration and
   configurable execution model and latency evidence pipeline are implemented
   but have no credentialed calibration artifact; empirical queue and populated
-  per-class/per-instrument latency distributions, fee tiers, complete funding
-  intervals, borrow costs, and statement reconciliation are still required.
+  per-class/per-instrument latency distributions, target-tier simulated-fee
+  calibration, complete funding intervals, zero-liability cash-account
+  certification, and statement reconciliation are still required. Exact signed
+  private-fill fee amount/currency is retained end to end; a statement
+  reconciliation tool and real demo evidence remain outstanding. Margin spot is
+  unsupported and would require a borrow-interest model before enablement.
 - [ ] Deploy and exercise the webhook/host guards, systemd supervision, external
   unit-failure paging, and independent exchange cancel procedure on the target
   host/account; add a separate algo/spread kill path if those order classes are

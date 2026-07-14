@@ -696,6 +696,7 @@ mod tests {
             last_fill_qty: 1.0,
             last_fill_price: 100.0,
             last_fill_liquidity: Some(FillLiquidity::Maker),
+            last_fill_fee: None,
             reason: "quote".to_string(),
         }
     }
@@ -729,6 +730,7 @@ mod tests {
             last_fill_qty: 0.0,
             last_fill_price: 0.0,
             last_fill_liquidity: None,
+            last_fill_fee: None,
             reason: "quote".to_string(),
         }
     }
