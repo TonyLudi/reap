@@ -227,10 +227,13 @@ production trading process.
     account identities. A deterministic CLI rejects mismatched
     config/code/host/account/session/clock or failed-operation evidence, emits a
     profile only after every required series passes, and binds the exact
-    artifact/profile into schema-4 production research. Matching new/cancel
-    measurements are explicitly retained as conservative order-ack upper bounds.
-    No representative credentialed report or passing calibration artifact has
-    yet been certified.
+    artifact/profile into schema-4 production research. An independent verifier
+    now re-hashes an explicit complete source-report set, reruns live verification,
+    rebuilds every series/profile with recorded options, and compares the result
+    after content-hash path normalization. Matching new/cancel measurements are
+    explicitly retained as conservative order-ack upper bounds. No representative
+    credentialed report, passing calibration, or passing reconstruction artifact
+    has yet been certified.
 36. The live CLI reserves its create-new evidence path before config,
     credentials, or network activity. Runtime and teardown failures complete
     fail-closed cleanup, persist a schema-8 report with a stable failure code,
@@ -375,6 +378,13 @@ production trading process.
     those require exchange and stopped-process evidence. Credential-free REST
     and public-websocket forwarding smokes passed, but no authenticated account
     path or strategy response has been certified.
+50. `verify-latency-calibration` no longer relies on a calibration artifact's
+    internal consistency or `passed` flag. It binds exact config and source bytes,
+    independently re-verifies each source live report, reconstructs all
+    Java-mapped class/symbol series and the final profile, permits only source-path
+    relocation, and emits an owner-only source-bound verification artifact. The
+    implementation and forged-profile tests pass; target-host evidence does not
+    yet exist.
 
 ## Remaining Demo Gate
 
@@ -414,8 +424,9 @@ production trading process.
    full-state reconciliation, storage drops, alert delivery, and shutdown
    orders; restart checkpoint state still requires log/account review. Generate
    a passing `calibrate-latency` artifact from synchronized target-host observe
-   and demo reports, archive every source hash/file, and reconcile its private
-   timing populations against exchange/account records. Run `collect-fills` for
+   and demo reports, archive every source hash/file, require a passing
+   `verify-latency-calibration` reconstruction, and reconcile its private timing
+   populations against exchange/account records. Run `collect-fills` for
    the closed bounded-demo window and require a passing manifest-backed
    `reconcile-fills` artifact with a reviewed nonzero minimum-fill threshold.
 

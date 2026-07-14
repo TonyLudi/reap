@@ -1824,6 +1824,7 @@ After multiple representative bounded runs using the same exact config:
 ```bash
 CALIBRATION="var/reap/evidence/latency-$(date -u +%Y%m%dT%H%M%SZ).json"
 PROFILE="var/reap/evidence/latency-profile-$(date -u +%Y%m%dT%H%M%SZ).toml"
+VERIFICATION="var/reap/evidence/latency-verification-$(date -u +%Y%m%dT%H%M%SZ).json"
 cargo run -p reap-cli -- calibrate-latency \
   --config examples/live-okx-demo.toml \
   --report "$OBSERVE_REPORT" \
@@ -1834,6 +1835,14 @@ cargo run -p reap-cli -- calibrate-latency \
   --accept-matching-upper-bounds \
   --require-pass \
   --pretty
+cargo run -p reap-cli -- verify-latency-calibration \
+  --config examples/live-okx-demo.toml \
+  --artifact "$CALIBRATION" \
+  --report "$OBSERVE_REPORT" \
+  --report "$DEMO_REPORT" \
+  --output "$VERIFICATION" \
+  --require-pass \
+  --pretty
 ```
 
 The generator merges complete samples exactly and otherwise produces a bounded,
@@ -1841,6 +1850,17 @@ population-weighted deterministic quantile approximation. Nanoseconds are
 rounded up to microseconds during collection and microseconds are rounded up to
 backtest milliseconds. A failed calibration still writes its diagnostic JSON,
 but the CLI refuses to emit a TOML profile from it.
+
+`verify-latency-calibration` treats the schema-4 artifact and source reports as
+untrusted bounded regular files, rejects symlinks, path/content reuse, missing or
+unexpected report hashes, and config drift, then reruns independent live-report
+verification and reconstructs the calibration using its recorded seed, sample
+minimum, and acknowledgement-upper-bound decision. It compares the complete
+rebuild after replacing only source paths with their SHA-256 identities, so an
+archived report may move but its bytes cannot change. The optional verification
+output is an owner-only create-new file synced with its parent directory. Archive
+the exact config, calibration, every source report, and this passing verification
+artifact together; the calibration's internal `passed` flag is insufficient.
 
 A production-candidate research manifest must use schema 4, set
 `latency_calibration` to the JSON artifact, set the baseline execution
@@ -1850,6 +1870,7 @@ binary/host/account identity, class semantics, demo provenance for private
 classes, sample counts, matching upper-bound acceptance, and exact
 series-to-profile equality. The research executable must be byte-identical to
 the one that collected the live evidence, and the artifact hash is rechecked
-after all runs. Stress profiles must still conservatively dominate that
-baseline. No credentialed latency report or passing calibration artifact has
-been recorded yet.
+after all runs. Require a separate passing reconstruction artifact before
+approving the research manifest. Stress profiles must still conservatively
+dominate that baseline. No credentialed latency report, passing calibration, or
+passing reconstruction artifact has been recorded yet.

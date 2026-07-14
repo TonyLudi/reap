@@ -283,9 +283,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [ ] Calibrate queue position, latency, fees, funding, and slippage from
   captured full-depth data, then run and archive production-candidate
   walk-forward, capacity, and stressed-liquidity reports. The orchestration and
-  configurable execution model and latency evidence pipeline are implemented
-  but have no credentialed calibration artifact; empirical queue and populated
-  per-class/per-instrument latency distributions, target-tier simulated-fee
+  configurable execution model and source-rebuilding latency evidence verifier
+  are implemented but have no credentialed calibration artifact; empirical queue
+  and populated per-class/per-instrument latency distributions, target-tier simulated-fee
   calibration, complete funding intervals, a passing real target-account
   cash/zero-liability artifact, a passing authenticated fill/fee reconciliation artifact,
   and broader economic statement reconciliation are still required. Exact signed

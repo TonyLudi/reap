@@ -776,6 +776,14 @@ calibration artifact, complete accounting, and explicit bounds on non-funding
 work censored by each data horizon. Stress scenarios may use explicitly
 uncalibrated deterministic haircuts.
 
+The CLI independently verifies a schema-4 latency artifact before release use.
+It re-hashes an explicit complete set of archived live reports, reruns each
+live-report verifier against the exact config, rebuilds all Java-mapped series
+with the artifact's recorded options, and compares the complete result after
+normalizing source paths to content hashes. This separates generator output from
+acceptance evidence and permits archive relocation without permitting byte or
+profile drift.
+
 ### `reap-capture`
 
 Credential-free public market-data composition.

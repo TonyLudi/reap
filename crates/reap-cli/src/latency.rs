@@ -16,16 +16,76 @@ use reap_live::{
     LiveRunReport, LiveStopReason, MAX_LIVE_FAILURE_CODE_BYTES, MAX_LIVE_FAILURE_MESSAGE_BYTES,
     MAX_LIVE_LATENCY_SERIES, MAX_LIVE_LATENCY_US, verify_live_run_paths,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const MERGED_PROFILE_SAMPLE_CAPACITY: usize = 8_192;
+pub(crate) const LATENCY_CALIBRATION_VERIFICATION_FORMAT_VERSION: u16 = 1;
+const MAX_LATENCY_VERIFICATION_DIAGNOSTIC_BYTES: usize = 1_024;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LatencyCalibrationOptions {
     pub seed: u64,
     pub minimum_samples_per_series: u64,
     pub accept_matching_upper_bounds: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LatencyCalibrationFileEvidence {
+    pub source_path: PathBuf,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub(crate) enum LatencyCalibrationVerificationFailure {
+    ArtifactIntegrityInvalid,
+    ConfigMismatch,
+    InputPathCollision,
+    DuplicateSourcePath,
+    DuplicateSourceHash,
+    SourceSetMismatch {
+        missing_count: usize,
+        missing_sha256s: Vec<String>,
+        unexpected_count: usize,
+        unexpected_sha256s: Vec<String>,
+    },
+    RebuildFailed,
+    RebuiltCalibrationDidNotPass {
+        failure_count: usize,
+    },
+    ArtifactDoesNotMatchRebuild,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LatencyCalibrationVerificationReport {
+    pub format_version: u16,
+    pub java_reference_revision: String,
+    pub verifier_reap_version: String,
+    pub config: reap_live::LiveConfigFileEvidence,
+    pub artifact: LatencyCalibrationFileEvidence,
+    pub source_reports: Vec<LatencyCalibrationFileEvidence>,
+    pub artifact_schema_version: u32,
+    pub artifact_reap_version: String,
+    pub live_executable_sha256: String,
+    pub host_identity_sha256: String,
+    pub account_identity_sha256s: BTreeMap<String, String>,
+    pub config_matches: bool,
+    pub artifact_integrity_valid: bool,
+    pub source_set_matches: bool,
+    pub rebuild_succeeded: bool,
+    pub rebuilt_calibration_passed: bool,
+    pub artifact_matches_rebuild: bool,
+    pub normalized_artifact_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized_rebuild_sha256: Option<String>,
+    pub failures: Vec<LatencyCalibrationVerificationFailure>,
+    pub diagnostics: Vec<String>,
+    pub limitations: Vec<String>,
+    pub acceptance_passed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -268,6 +328,298 @@ pub(crate) fn build_latency_calibration(
             .context("generated latency calibration failed its integrity check")?;
     }
     Ok(artifact)
+}
+
+pub(crate) fn verify_latency_calibration(
+    config_path: &Path,
+    artifact_path: &Path,
+    report_paths: &[PathBuf],
+) -> Result<LatencyCalibrationVerificationReport> {
+    if report_paths.is_empty() {
+        bail!("at least one --report is required");
+    }
+    if report_paths.len() > MAX_LATENCY_CALIBRATION_SOURCE_REPORTS {
+        bail!("at most {MAX_LATENCY_CALIBRATION_SOURCE_REPORTS} --report inputs are supported");
+    }
+
+    let (config, config_source) = LiveConfig::load_with_evidence(config_path)
+        .with_context(|| format!("failed to load live config {}", config_path.display()))?;
+    let (artifact_evidence, artifact_bytes) = read_verification_file(
+        artifact_path,
+        "latency calibration artifact",
+        MAX_LATENCY_CALIBRATION_ARTIFACT_BYTES,
+    )?;
+    let artifact: LatencyCalibrationArtifact = serde_json::from_slice(&artifact_bytes)
+        .with_context(|| {
+            format!(
+                "failed to parse strict latency calibration artifact {}",
+                artifact_path.display()
+            )
+        })?;
+
+    let mut failures = Vec::new();
+    let mut diagnostics = Vec::new();
+    let artifact_integrity_valid = match artifact.validate_integrity() {
+        Ok(()) => true,
+        Err(error) => {
+            failures.push(LatencyCalibrationVerificationFailure::ArtifactIntegrityInvalid);
+            diagnostics.push(bounded_verification_diagnostic(format!(
+                "artifact integrity: {error}"
+            )));
+            false
+        }
+    };
+    let config_matches = artifact.live_config_sha256 == config_source.sha256
+        && artifact.live_config_fingerprint == config.fingerprint()?
+        && artifact.live_config_evidence_fingerprint == config.evidence_fingerprint()?;
+    if !config_matches {
+        failures.push(LatencyCalibrationVerificationFailure::ConfigMismatch);
+    }
+
+    let mut occupied_paths = HashSet::from([
+        config_source.source_path.clone(),
+        artifact_evidence.source_path.clone(),
+    ]);
+    let mut input_path_collision = occupied_paths.len() != 2;
+    let mut unique_source_paths = HashSet::new();
+    let mut source_reports = Vec::with_capacity(report_paths.len());
+    let mut source_hashes = HashSet::new();
+    let mut duplicate_source_path = false;
+    let mut duplicate_source_hash = false;
+    for path in report_paths {
+        let (evidence, _) = read_verification_file(
+            path,
+            "live source report",
+            reap_live::MAX_LIVE_RUN_REPORT_BYTES,
+        )?;
+        if !unique_source_paths.insert(evidence.source_path.clone()) {
+            duplicate_source_path = true;
+        }
+        if occupied_paths.contains(&evidence.source_path) {
+            input_path_collision = true;
+        }
+        occupied_paths.insert(evidence.source_path.clone());
+        if !source_hashes.insert(evidence.sha256.clone()) {
+            duplicate_source_hash = true;
+        }
+        source_reports.push(evidence);
+    }
+    source_reports.sort_by(|left, right| {
+        left.sha256
+            .cmp(&right.sha256)
+            .then_with(|| left.source_path.cmp(&right.source_path))
+    });
+    if duplicate_source_path {
+        failures.push(LatencyCalibrationVerificationFailure::DuplicateSourcePath);
+    }
+    if duplicate_source_hash {
+        failures.push(LatencyCalibrationVerificationFailure::DuplicateSourceHash);
+    }
+    if input_path_collision {
+        failures.push(LatencyCalibrationVerificationFailure::InputPathCollision);
+    }
+
+    let expected_hashes = artifact
+        .source_reports
+        .iter()
+        .map(|source| source.sha256.clone())
+        .collect::<BTreeSet<_>>();
+    let supplied_hashes = source_reports
+        .iter()
+        .map(|source| source.sha256.clone())
+        .collect::<BTreeSet<_>>();
+    let missing_count = expected_hashes.difference(&supplied_hashes).count();
+    let missing_sha256s = expected_hashes
+        .difference(&supplied_hashes)
+        .take(MAX_LATENCY_CALIBRATION_SOURCE_REPORTS)
+        .cloned()
+        .collect::<Vec<_>>();
+    let unexpected_count = supplied_hashes.difference(&expected_hashes).count();
+    let unexpected_sha256s = supplied_hashes
+        .difference(&expected_hashes)
+        .take(MAX_LATENCY_CALIBRATION_SOURCE_REPORTS)
+        .cloned()
+        .collect::<Vec<_>>();
+    let source_set_matches = missing_count == 0
+        && unexpected_count == 0
+        && artifact.source_reports.len() == report_paths.len()
+        && !input_path_collision
+        && !duplicate_source_path
+        && !duplicate_source_hash;
+    if !source_set_matches {
+        failures.push(LatencyCalibrationVerificationFailure::SourceSetMismatch {
+            missing_count,
+            missing_sha256s,
+            unexpected_count,
+            unexpected_sha256s,
+        });
+    }
+
+    let normalized_artifact_sha256 = normalized_calibration_sha256(&artifact)?;
+    let mut rebuild_succeeded = false;
+    let mut rebuilt_calibration_passed = false;
+    let mut artifact_matches_rebuild = false;
+    let mut normalized_rebuild_sha256 = None;
+    if artifact_integrity_valid && config_matches && source_set_matches {
+        match build_latency_calibration(
+            config_path,
+            report_paths,
+            LatencyCalibrationOptions {
+                seed: artifact.profile_seed,
+                minimum_samples_per_series: artifact.minimum_samples_per_series,
+                accept_matching_upper_bounds: artifact.matching_upper_bounds_accepted,
+            },
+        ) {
+            Ok(rebuilt) => {
+                rebuild_succeeded = true;
+                rebuilt_calibration_passed = rebuilt.passed;
+                let rebuilt_sha256 = normalized_calibration_sha256(&rebuilt)?;
+                normalized_rebuild_sha256 = Some(rebuilt_sha256);
+                if !rebuilt.passed {
+                    failures.push(
+                        LatencyCalibrationVerificationFailure::RebuiltCalibrationDidNotPass {
+                            failure_count: rebuilt.failures.len(),
+                        },
+                    );
+                    diagnostics.extend(rebuilt.failures.iter().take(16).map(|failure| {
+                        bounded_verification_diagnostic(format!("rebuild: {failure}"))
+                    }));
+                } else {
+                    artifact_matches_rebuild =
+                        normalize_calibration(artifact.clone()) == normalize_calibration(rebuilt);
+                    if !artifact_matches_rebuild {
+                        failures.push(
+                            LatencyCalibrationVerificationFailure::ArtifactDoesNotMatchRebuild,
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                failures.push(LatencyCalibrationVerificationFailure::RebuildFailed);
+                diagnostics.push(bounded_verification_diagnostic(format!(
+                    "calibration rebuild: {error:#}"
+                )));
+            }
+        }
+    }
+
+    let acceptance_passed = failures.is_empty()
+        && artifact_integrity_valid
+        && config_matches
+        && source_set_matches
+        && rebuild_succeeded
+        && rebuilt_calibration_passed
+        && artifact_matches_rebuild;
+    Ok(LatencyCalibrationVerificationReport {
+        format_version: LATENCY_CALIBRATION_VERIFICATION_FORMAT_VERSION,
+        java_reference_revision: PINNED_JAVA_REVISION.to_string(),
+        verifier_reap_version: env!("CARGO_PKG_VERSION").to_string(),
+        config: config_source,
+        artifact: artifact_evidence,
+        source_reports,
+        artifact_schema_version: artifact.schema_version,
+        artifact_reap_version: artifact.reap_version.clone(),
+        live_executable_sha256: artifact.live_executable_sha256.clone(),
+        host_identity_sha256: artifact.host_identity_sha256.clone(),
+        account_identity_sha256s: artifact.account_identity_sha256s.clone(),
+        config_matches,
+        artifact_integrity_valid,
+        source_set_matches,
+        rebuild_succeeded,
+        rebuilt_calibration_passed,
+        artifact_matches_rebuild,
+        normalized_artifact_sha256,
+        normalized_rebuild_sha256,
+        failures,
+        diagnostics,
+        limitations: vec![
+            "source report, host, executable, and exchange-account identity hashes are provenance identifiers; this verifier does not independently authenticate the represented machine or account"
+                .to_string(),
+            "matching-new and matching-cancel samples remain reviewed acknowledgement upper bounds rather than exchange matching-engine latency"
+                .to_string(),
+            "a passing calibration verifies profile derivation only; it does not establish fill realism, profitability, deployment readiness, or production approval"
+                .to_string(),
+        ],
+        acceptance_passed,
+    })
+}
+
+fn read_verification_file(
+    path: &Path,
+    label: &'static str,
+    limit: u64,
+) -> Result<(LatencyCalibrationFileEvidence, Vec<u8>)> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {label} {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "{label} {} must be a regular file and not a symbolic link",
+            path.display()
+        );
+    }
+    if metadata.len() > limit {
+        bail!(
+            "{label} {} is {} bytes; maximum is {limit}",
+            path.display(),
+            metadata.len()
+        );
+    }
+    let canonical = fs::canonicalize(path)
+        .with_context(|| format!("failed to resolve {label} {}", path.display()))?;
+    let bytes = fs::read(&canonical)
+        .with_context(|| format!("failed to read {label} {}", canonical.display()))?;
+    if bytes.len() as u64 > limit {
+        bail!(
+            "{label} {} is {} bytes; maximum is {limit}",
+            canonical.display(),
+            bytes.len()
+        );
+    }
+    Ok((
+        LatencyCalibrationFileEvidence {
+            source_path: canonical,
+            bytes: bytes.len() as u64,
+            sha256: sha256_bytes(&bytes),
+        },
+        bytes,
+    ))
+}
+
+fn normalize_calibration(mut artifact: LatencyCalibrationArtifact) -> LatencyCalibrationArtifact {
+    for source in &mut artifact.source_reports {
+        source.path = PathBuf::from(format!("sha256:{}", source.sha256));
+    }
+    artifact
+        .source_reports
+        .sort_by(|left, right| left.sha256.cmp(&right.sha256));
+    artifact
+}
+
+fn normalized_calibration_sha256(artifact: &LatencyCalibrationArtifact) -> Result<String> {
+    let bytes = serde_json::to_vec(&normalize_calibration(artifact.clone()))
+        .context("failed to serialize path-normalized latency calibration")?;
+    Ok(sha256_bytes(&bytes))
+}
+
+fn bounded_verification_diagnostic(value: String) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    if sanitized.len() <= MAX_LATENCY_VERIFICATION_DIAGNOSTIC_BYTES {
+        return sanitized;
+    }
+    let mut end = MAX_LATENCY_VERIFICATION_DIAGNOSTIC_BYTES;
+    while !sanitized.is_char_boundary(end) {
+        end -= 1;
+    }
+    sanitized[..end].to_string()
 }
 
 pub(crate) fn profile_toml(profile: &BacktestLatencyProfile) -> Result<String> {
@@ -1003,6 +1355,58 @@ mod tests {
         assert_eq!(artifact.live_executable_sha256, "1".repeat(64));
         artifact.validate_integrity().unwrap();
 
+        let artifact_path = directory.join("latency-calibration.json");
+        fs::write(
+            &artifact_path,
+            serde_json::to_vec_pretty(&artifact).unwrap(),
+        )
+        .unwrap();
+        let moved_report_path = directory.join("archived-live.json");
+        fs::copy(&report_path, &moved_report_path).unwrap();
+        let verification = verify_latency_calibration(
+            &config_path,
+            &artifact_path,
+            std::slice::from_ref(&moved_report_path),
+        )
+        .unwrap();
+        assert!(verification.acceptance_passed, "{verification:#?}");
+        assert!(verification.artifact_integrity_valid);
+        assert!(verification.source_set_matches);
+        assert!(verification.artifact_matches_rebuild);
+        assert_eq!(
+            verification.normalized_rebuild_sha256.as_deref(),
+            Some(verification.normalized_artifact_sha256.as_str())
+        );
+
+        let mut forged_artifact = artifact.clone();
+        for series in &mut forged_artifact.series {
+            series.profile_samples_ms = vec![2];
+        }
+        for rule in &mut forged_artifact.profile.rules {
+            rule.samples_ms = vec![2];
+        }
+        forged_artifact.validate_integrity().unwrap();
+        let forged_artifact_path = directory.join("forged-latency-calibration.json");
+        fs::write(
+            &forged_artifact_path,
+            serde_json::to_vec_pretty(&forged_artifact).unwrap(),
+        )
+        .unwrap();
+        let forged_verification = verify_latency_calibration(
+            &config_path,
+            &forged_artifact_path,
+            std::slice::from_ref(&moved_report_path),
+        )
+        .unwrap();
+        assert!(forged_verification.artifact_integrity_valid);
+        assert!(!forged_verification.acceptance_passed);
+        assert!(!forged_verification.artifact_matches_rebuild);
+        assert!(
+            forged_verification
+                .failures
+                .contains(&LatencyCalibrationVerificationFailure::ArtifactDoesNotMatchRebuild)
+        );
+
         let forged_clean_report_path = directory.join("forged-clean-live.json");
         let mut forged_clean_report = report.clone();
         forged_clean_report.session_id = Some("session-forged-clean".to_string());
@@ -1044,6 +1448,20 @@ mod tests {
             serde_json::to_vec(&failed_report).unwrap(),
         )
         .unwrap();
+        let wrong_source_verification = verify_latency_calibration(
+            &config_path,
+            &artifact_path,
+            std::slice::from_ref(&failed_report_path),
+        )
+        .unwrap();
+        assert!(!wrong_source_verification.acceptance_passed);
+        assert!(!wrong_source_verification.source_set_matches);
+        assert!(wrong_source_verification.failures.iter().any(|failure| {
+            matches!(
+                failure,
+                LatencyCalibrationVerificationFailure::SourceSetMismatch { .. }
+            )
+        }));
         let failed_artifact = build_latency_calibration(
             &config_path,
             &[failed_report_path],

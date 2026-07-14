@@ -132,10 +132,15 @@ SHA-256, pinned Java revision, pseudonymous machine/account identities, unique
 session, synchronized host snapshots, and deterministic bounded sample
 reservoirs. `calibrate-latency` rejects failed operations or malformed/missing
 series, rounds delays upward into backtest milliseconds, and creates an
-integrity-checked artifact. A schema-4 production research manifest must point
-to that artifact, run the byte-identical Reap executable, and use its exact
-baseline profile. The machinery is complete; no credentialed target-host
-artifact has passed yet.
+integrity-checked artifact. `verify-latency-calibration` then re-hashes the exact
+source reports, reruns live verification, and reconstructs every class/symbol
+series and profile under the recorded options. Only source paths are normalized
+to their content hashes, preserving the mapped `BackTestDelay`,
+`OkxNitroOrderClient`, and private-state boundaries while allowing evidence to
+move into an archive. A schema-4 production research manifest must point to that
+artifact, run the byte-identical Reap executable, and use its exact baseline
+profile. The machinery is complete; no credentialed target-host artifact or
+passing reconstruction has been produced yet.
 
 Failure handling was cross-checked against the same pinned connectivity tree.
 `AbstractOkxNitroL2Subscriber.onSocketDisconnected` clears the affected Java

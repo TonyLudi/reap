@@ -503,7 +503,7 @@ restart-latch proof, while records from external injectors remain opaque.
 Process-death, deadman-expiry, emergency-cancel, fill/fee, target-host, and
 production approval remain separate gates.
 
-Calibration emits schema-3 artifacts and admits only independently verified,
+Calibration emits schema-4 artifacts and admits only independently verified,
 clean target-host reports with the same exact config and binary:
 
 ```bash
@@ -516,6 +516,22 @@ cargo run -p reap-cli -- calibrate-latency \
   --output "$CALIBRATION" \
   --profile-output "$PROFILE" \
   --accept-matching-upper-bounds \
+  --require-pass \
+  --pretty
+```
+
+Independently rebuild the archived calibration before using it in production
+research. Supply every source report; files may move after archival because the
+verifier binds their bytes and normalizes provenance paths before comparison:
+
+```bash
+CALIBRATION_VERIFICATION="/tmp/reap-latency-verification-$(date -u +%Y%m%dT%H%M%SZ).json"
+cargo run -p reap-cli -- verify-latency-calibration \
+  --config examples/live-okx-demo.toml \
+  --artifact "$CALIBRATION" \
+  --report "$OBSERVE_REPORT" \
+  --report "$DEMO_REPORT" \
+  --output "$CALIBRATION_VERIFICATION" \
   --require-pass \
   --pretty
 ```

@@ -25,7 +25,9 @@ use reap_strategy::ChaosConfig;
 mod latency;
 mod statement;
 
-use latency::{LatencyCalibrationOptions, build_latency_calibration, profile_toml};
+use latency::{
+    LatencyCalibrationOptions, build_latency_calibration, profile_toml, verify_latency_calibration,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "reap")]
@@ -306,6 +308,32 @@ enum Command {
         )]
         accept_matching_upper_bounds: bool,
         #[arg(long, help = "Exit non-zero unless every required series passes")]
+        require_pass: bool,
+        #[arg(long)]
+        pretty: bool,
+    },
+    #[command(
+        about = "Rebuild and verify a latency calibration from exact source reports",
+        long_about = "Strictly parse a calibration artifact, bind it to the exact live config and supplied source-report hashes, independently verify every live report, rebuild every Java-mapped latency series with the recorded options, and compare path-normalized results. This does not authorize production trading."
+    )]
+    VerifyLatencyCalibration {
+        #[arg(short, long, help = "Exact live TOML used by every source report")]
+        config: PathBuf,
+        #[arg(short, long, help = "Schema-4 latency calibration JSON artifact")]
+        artifact: PathBuf,
+        #[arg(
+            long = "report",
+            required = true,
+            help = "Exact source live report; repeat for every artifact source"
+        )]
+        reports: Vec<PathBuf>,
+        #[arg(
+            short,
+            long,
+            help = "Optionally create this owner-readable verification artifact"
+        )]
+        output: Option<PathBuf>,
+        #[arg(long, help = "Exit non-zero unless independent reconstruction passes")]
         require_pass: bool,
         #[arg(long)]
         pretty: bool,
@@ -1027,6 +1055,32 @@ async fn main() -> Result<()> {
             println!("{json}");
             if require_pass && !artifact.passed {
                 anyhow::bail!("latency calibration did not satisfy evidence gates");
+            }
+        }
+        Command::VerifyLatencyCalibration {
+            config,
+            artifact,
+            reports,
+            output,
+            require_pass,
+            pretty,
+        } => {
+            let mut output_file = output
+                .as_ref()
+                .map(|path| reserve_private_output(path, "latency calibration verification"))
+                .transpose()?;
+            let verification = verify_latency_calibration(&config, &artifact, &reports)?;
+            let json = if pretty {
+                serde_json::to_string_pretty(&verification)?
+            } else {
+                serde_json::to_string(&verification)?
+            };
+            if let (Some(file), Some(path)) = (&mut output_file, output.as_deref()) {
+                persist_reserved_output(file, path, &json, "latency calibration verification")?;
+            }
+            println!("{json}");
+            if require_pass && !verification.acceptance_passed {
+                anyhow::bail!("latency calibration reconstruction did not pass");
             }
         }
         Command::CollectFills(args) => statement::collect(args).await?,
