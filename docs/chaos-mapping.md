@@ -315,9 +315,16 @@ tests live in their owning crates.
 Run all Rust acceptance tests with:
 
 ```bash
-cargo test --workspace --no-fail-fast
-cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked --no-fail-fast
+cargo build --release --locked -p reap-cli
+cargo audit --deny warnings
 ```
+
+These commands run in least-privilege GitHub CI under the repository's exact
+Rust toolchain. This verifies the Rust implementation and dependency lockfile;
+it does not execute the private Java build or establish exchange certification.
 
 The local Java source was cross-checked directly. Running its tests additionally
 requires the private Java build environment and dependencies; this workspace

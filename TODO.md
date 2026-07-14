@@ -200,6 +200,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
   private channels, paginate recent-fill recovery to a proven short page with a
   fail-closed bound, and add authenticated create-new collection plus verified
   journal-to-raw-OKX fill/fee evidence.
+- [x] Pin the Rust toolchain and add least-privilege GitHub CI for formatting,
+  all-target lint, workspace tests, release build, and RustSec audit, with weekly
+  Cargo and Actions update proposals.
 - [ ] Run credentialed bounded observe and minimal-size demo fault campaigns,
   including process death, deadman expiry, clock skew, REST ambiguity, partial
   fill, reconnect, and durable-latch restart recovery.

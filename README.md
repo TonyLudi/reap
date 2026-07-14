@@ -319,9 +319,18 @@ than 1,000 valid samples per required series prevent profile output.
 Run tests:
 
 ```bash
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked --no-fail-fast
+cargo build --release --locked -p reap-cli
+cargo audit --deny warnings
 ```
+
+The repository pins Rust `1.95.0`. GitHub CI runs every command above with a
+read-only token and a full-SHA-pinned checkout action; `cargo-audit` is pinned to
+`0.22.2`. Dependabot proposes weekly Cargo and Actions updates for review. A
+green repository gate is required but does not replace the credentialed demo,
+target-host, or exchange/account evidence below.
 
 Profile the deterministic event loop:
 
