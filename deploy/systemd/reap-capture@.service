@@ -11,6 +11,8 @@ Type=simple
 User=reap
 Group=reap
 WorkingDirectory=/var/lib/reap/capture/%i
+StateDirectory=reap/connectivity
+StateDirectoryMode=0750
 Environment=RUST_BACKTRACE=1
 EnvironmentFile=/etc/reap/capture/%i.env
 ExecStart=/usr/local/bin/reap capture --config /etc/reap/capture/%i.toml --output /var/lib/reap/capture/%i/run-report.json --duration-secs ${REAP_CAPTURE_DURATION_SECS} --require-clean-capture
@@ -43,7 +45,7 @@ LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-ReadWritePaths=/var/lib/reap/capture/%i
+ReadWritePaths=/var/lib/reap/capture/%i /var/lib/reap/connectivity
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=reap-capture-%i

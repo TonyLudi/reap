@@ -19,7 +19,7 @@ production trading process.
 | Startup/restart gate | Executable phase state, engine-consumed account-snapshot invariant, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, durable latch restore, authoritative account repair, second-pass clean REST reconciliation, and read-only journal-bound deadman-expiry certification | Needs process-kill demo evidence; tooling alone is not evidence |
 | Event-loop profile | Allocation-aware raw OKX parity benchmark covers redundant wire input through strategy/risk and storage-record construction | Needs target-host capture and exchange-latency validation |
 | Operator control and alerts | HMAC-authenticated local controls use fsynced write-ahead latches; OKX Cancel All After is maintained independently; a separate CLI can arm the deadman, cancel all regular orders account-wide, and prove post-trigger zero with offline exact-config verification; another read-only CLI can prove source `20` after controlled process death | Must exercise target alert routing, deadman expiry, and the independent cancel procedure; algo/spread orders remain outside their scope |
-| Process/host controls | Canonical journal ownership is exclusively locked before recovery or network setup; live and public capture share Linux disk, memory, and kernel-clock preflight/periodic checks; capture schema 4 binds binary/host evidence; hardened systemd templates encode mode-specific restart policy and bounded evidence capture | Must be installed, enabled, thresholded, monitored, and fault-tested on the target host |
+| Process/host controls | Canonical journal ownership is exclusively locked before recovery or network setup; live and public capture share Linux disk, memory, and kernel-clock preflight/periodic checks; all official WebSocket handshakes on one host reserve through one owner-only process-shared pacer; capture schema 4 binds binary/host evidence; hardened systemd templates encode mode-specific restart policy and bounded evidence capture | Must be installed, enabled, thresholded, monitored, and fault-tested on the target host; hosts sharing a NAT need isolated egress or an external IP-wide pacer |
 | Demo fault injection | A loopback-only proxy independently routes OKX demo REST, public, private-state, and order-command traffic; strict owner-local commands inject disconnects, matched frame drops, and matched REST responses; create-new injector/run artifacts bind proxy config and pinned Java provenance, and the live fault matrix validates supported typed roles | Tooling is implemented and credential-free forwarding smokes passed, but no credentialed isolated campaign or target-host acceptance evidence exists |
 | Build/supply chain | Rust `1.95.0` is pinned; least-privilege CI checks formatting, all-target lint, all workspace tests, a locked release build, and RustSec advisories; Cargo and Actions updates are proposed weekly | CI must remain green and dependency updates reviewed, but this does not replace credentialed exchange or target-host evidence |
 | Exchange certification | Point-in-time account certification, journal-bound process-death deadman replay, exact fill/bill collection, and offline normal-trade/funding economics are implemented, but no passing target-account artifact, OKX demo soak, economic artifact, deadman artifact, or broader fault campaign is recorded | Production blocker |
@@ -314,27 +314,34 @@ production trading process.
     and preserves all strategy, risk, account-policy, runtime, execution,
     storage-capacity, and safety settings. It does not inspect secrets or
     authorize production.
-44. WebSocket connection attempts are now serialized across every public and
-    private supervisor in one process, for initial startup and recovery. A
+44. WebSocket connection attempts are serialized across public, private,
+    order-command, capture, and fault-proxy-upstream supervisors for initial
+    startup and recovery. An owner-only advisory-lock file reserves one schedule
+    across Reap processes on the target host using the kernel boot ID and
+    `CLOCK_BOOTTIME`; production research requires an absolute path and the
+    aggregate bundle requires the same path in demo and
+    production configs. Unsafe or malformed state fails closed. This strengthens
+    pinned Java's in-process `connectIntervalMs` creation context but cannot
+    coordinate another host sharing the same NAT. A
     pre-change 30-second public run encountered one `alb-qps-limited` HTTP 503,
     recovered, and ended with 14/14 sockets ready, one disconnect, 1,728 raw
-    records, 867 accepted events, and 861 duplicates. With the shared 400 ms
-    pacer, a fresh 2026-07-14 run reached and retained 14/14 sockets with zero
-    disconnect, gap, recovery, parse, stale-book, or terminal-book defect. It
-    wrote 1,998 raw records, accepted 1,012 events, and deduplicated 986; exact
-    report verification, strict multi-source analysis, and strict replay all
-    passed at raw SHA-256
-    `e66f2d74e369c6904e5a68ab1259316e9d318d83a2dc88ec6f81b8c8109bde78`.
-    Receive-time backtest reconstruction processed 1,517 normalized records,
-    blocked 184 pre-ready new-order intents until both books and USDT/USD
-    valuation were available, then modeled four orders with zero invalid risk
-    samples out of 3,043 and complete accounting. The realized-funding preload
-    observed one settlement before the capture horizon, applied no settlement
-    inside the horizon, and retained the upcoming boundary as one pending
-    funding action. This 30-second public-only smoke validates startup pacing,
-    capture integrity, replay readiness, and forecast/settlement parsing; it is
-    not a complete funding interval, sustained data, execution calibration,
-    credentialed demo evidence, or production approval.
+    records, 867 accepted events, and 861 duplicates. On 2026-07-15, two
+    simultaneous 40-second captures sharing one state file each reached and
+    retained 14/14 sockets, exercising 28 supervised sockets across two
+    processes. Both had zero disconnect, gap, recovery, parse, stale-book, or
+    terminal-book defect. They wrote 3,524 and 4,209 raw records, accepted 1,786
+    and 2,158 events, and deduplicated 1,738 and 2,051. Independent exact-report
+    verification and strict replay passed at raw SHA-256
+    `3013f304ee707726e589dc473ec7bebd8566f007a6e963e2a6d55b17adf5df54` and
+    `1c6790bdce95945acd4f5e3d01d4c103d3b865344cfbde1eaafa3253698cc182`;
+    the state file remained mode `0600`, single-linked, and fixed at 103 bytes.
+    Receive-time backtests reconstructed 2,447 and 2,928 inputs, modeled 18
+    orders in each run with no fills, and ended order-entry-ready with complete
+    accounting, valuation, and currency-rate coverage. This same-host,
+    public-only smoke validates cross-process startup pacing, capture integrity,
+    replay readiness, and accounting plumbing; it is not a complete funding
+    interval, sustained data, execution calibration, credentialed demo evidence,
+    multi-host NAT coordination, or production approval.
 45. Live bootstrap and one periodic safety task now parse and poll the current
     unsigned OKX system-status contract. The 10-second poll, 60-second lead, and
     unified service filter follow pinned Java `OkxNitroExchStatusClient`,

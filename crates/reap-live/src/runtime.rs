@@ -175,6 +175,10 @@ pub enum LiveRuntimeError {
     CheckpointIdentity { account_id: String, message: String },
     #[error("feed subscription planning failed: {0}")]
     Subscription(String),
+    #[error("live connection pacer failed: {0}")]
+    ConnectionPacer(#[from] reap_feed::ConnectionAttemptPacerError),
+    #[error("live connection pacer failed during runtime: {0}")]
+    ConnectionPacerRuntime(String),
     #[error("order gateway setup failed for account {account_id}: {message}")]
     GatewaySetup { account_id: String, message: String },
     #[error(transparent)]
@@ -280,6 +284,7 @@ impl LiveRuntimeError {
             Self::BootstrapVerification(_) => "bootstrap_verification",
             Self::CheckpointIdentity { .. } => "checkpoint_identity",
             Self::Subscription(_) => "subscription",
+            Self::ConnectionPacer(_) | Self::ConnectionPacerRuntime(_) => "connection_pacer",
             Self::GatewaySetup { .. } => "gateway_setup",
             Self::Coordinator(_) => "coordinator",
             Self::Storage(_) => "storage",
@@ -1487,6 +1492,17 @@ impl LiveRuntime {
             .enabled
             .then(host_identity_sha256)
             .transpose()?;
+        let connection_attempt_interval =
+            Duration::from_millis(config.runtime.connection_attempt_interval_ms);
+        let connection_attempt_pacer = match (
+            &config.runtime.connection_attempt_pacer_path,
+            connection_attempt_interval.is_zero(),
+        ) {
+            (Some(path), false) => {
+                ConnectionAttemptPacer::process_shared(connection_attempt_interval, path)?
+            }
+            _ => ConnectionAttemptPacer::new(connection_attempt_interval),
+        };
         let mut alert_runtime = config
             .alerts
             .webhook_from_env()?
@@ -1728,9 +1744,6 @@ impl LiveRuntime {
         let mut feed_tasks = Vec::new();
         let mut sources = Vec::new();
 
-        let connection_attempt_pacer = ConnectionAttemptPacer::new(Duration::from_millis(
-            config.runtime.connection_attempt_interval_ms,
-        ));
         let public_adapter: Arc<dyn VenueAdapter> = Arc::new(OkxAdapter::new(
             &config.venue.public_ws_url,
             &config.venue.private_ws_url,
@@ -2762,6 +2775,12 @@ impl LiveRuntime {
                 }
             }
             RuntimeEvent::Connection { source_id, status } => {
+                if status.kind == ConnectionStatusKind::Fatal {
+                    return Err(LiveRuntimeError::ConnectionPacerRuntime(format!(
+                        "{}: {}",
+                        status.conn_id, status.reason
+                    )));
+                }
                 if status.kind == ConnectionStatusKind::Disconnected {
                     self.evidence.observe_disconnect(status.private);
                 }
@@ -2791,6 +2810,9 @@ impl LiveRuntime {
                     OkxOrderWsStatusKind::Disconnected => {
                         self.evidence.observe_order_transport_disconnect();
                         SystemEventKind::OrderTransportStale
+                    }
+                    OkxOrderWsStatusKind::Fatal => {
+                        return Err(LiveRuntimeError::ConnectionPacerRuntime(status.reason));
                     }
                 };
                 let output = self
@@ -4623,18 +4645,22 @@ impl FeedSourceState {
     }
 
     fn on_status(&mut self, status: ConnectionStatus) -> Vec<SystemEvent> {
+        let disconnected = matches!(
+            status.kind,
+            ConnectionStatusKind::Disconnected | ConnectionStatusKind::Fatal
+        );
         match status.kind {
             ConnectionStatusKind::Ready | ConnectionStatusKind::Heartbeat => {
                 self.ready_connections.insert(status.conn_id.clone());
             }
-            ConnectionStatusKind::Disconnected => {
+            ConnectionStatusKind::Disconnected | ConnectionStatusKind::Fatal => {
                 self.ready_connections.remove(&status.conn_id);
                 self.private_ready = false;
                 self.private_data_round.clear();
             }
         }
         if let Some(account_id) = &self.account_id {
-            if status.kind == ConnectionStatusKind::Disconnected {
+            if disconnected {
                 return vec![SystemEvent {
                     ts_ms: status.ts_ms,
                     kind: SystemEventKind::PrivateStreamStale,
@@ -4658,7 +4684,7 @@ impl FeedSourceState {
             return Vec::new();
         }
 
-        if status.kind != ConnectionStatusKind::Disconnected {
+        if !disconnected {
             return Vec::new();
         }
         self.public_subscriptions
@@ -7652,6 +7678,33 @@ mod tests {
             LiveRuntimeError::Host(HostHealthError::Unhealthy { ref code, .. })
                 if code == "disk_low"
         ));
+        let lease = acquire_storage_lease(&path).unwrap();
+        let lock_path = lease.lock_path().to_path_buf();
+        drop(lease);
+        let _ = std::fs::remove_file(lock_path);
+    }
+
+    #[tokio::test]
+    async fn connection_pacer_preflight_fails_before_credentials_or_network_and_releases_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("live.jsonl");
+        let mut config = config();
+        config.storage.path = path.clone();
+        config.runtime.connection_attempt_pacer_path =
+            Some(directory.path().join("missing").join("connect.pacer"));
+
+        let error = run_live(
+            config,
+            LiveRunOptions {
+                mode: LiveMode::Observe,
+                demo_confirmed: false,
+                run_duration: Some(Duration::from_millis(1)),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, LiveRuntimeError::ConnectionPacer(_)));
         let lease = acquire_storage_lease(&path).unwrap();
         let lock_path = lease.lock_path().to_path_buf();
         drop(lease);

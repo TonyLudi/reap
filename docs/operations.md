@@ -48,16 +48,36 @@ collector does not provide this Rust run-report, executable/host provenance, or
 host guard. Those controls harden the Java-referenced connectivity boundary;
 they are not a parity claim.
 
-`runtime.connection_attempt_interval_ms` defaults to 400 ms and is shared by
-all socket supervisors in the process, including reconnect and recovery
-attempts; live processes include authenticated order-command sessions in the
-same pacer. Official OKX endpoints require at least 334 ms because OKX documents
-a maximum of three WebSocket connection requests per second per IP in the
-[API guide](https://www.okx.com/docs-v5/en/). Zero is accepted only for
-loopback tests. This is process-local: coordinate separate capture/live
-processes that share an egress IP, or they can still exceed the aggregate
-limit. The configured interval is part of capture and live config provenance;
-paced startup must fit inside the live readiness timeout.
+`runtime.connection_attempt_interval_ms` defaults to 400 ms. Official endpoint
+configs also require `runtime.connection_attempt_pacer_path`. Every public,
+private, authenticated order-command, capture, and fault-proxy-upstream initial
+or reconnect attempt reserves through the owner-only advisory-locked file, so
+separate Reap processes on one host share a single schedule. State is a bounded,
+fixed-format Linux boot ID plus `CLOCK_BOOTTIME` next-slot timestamp, so a
+wall-clock step cannot compress attempts and stale state resets after reboot. A
+symlink, non-regular or multiply linked file, foreign owner, group/other access,
+malformed content, I/O failure, lock contention lasting one second, or a
+reservation more than 15 minutes ahead fails closed. The parent directory must
+already exist. Official endpoint runtimes fail preflight outside Linux rather
+than substitute a wall clock. Official OKX endpoints require at least 334 ms
+because OKX documents a maximum of three WebSocket connection requests per
+second per IP in the [API guide](https://www.okx.com/docs-v5/en/). Zero without a
+file is accepted only for loopback tests. The generated fault-routed live config
+uses zero for its local proxy handshakes because the proxy reserves each
+official upstream connection through the source config's exact interval and
+path. A pacer failure discovered during reconnect is terminal for capture and
+live runtimes; it is not downgraded to a redundancy-tolerated disconnect.
+
+The checked-in capture/live/proxy examples share
+`var/reap/okx-connection-attempt.pacer` when run from the repository root.
+Production capture research requires an absolute path, and production evidence
+requires the exact demo and production configs to use the same absolute path.
+Set all deployed modes to
+`/var/lib/reap/connectivity/okx-global.pacer`; the systemd templates create and
+expose only that shared directory. This file coordinates processes on one host,
+not multiple hosts behind one egress IP. Use isolated egress or an external
+IP-wide coordinator for that topology. The interval and path are part of exact
+config provenance, and the total paced startup must fit inside live readiness.
 
 Every frame and run report carries a generated `capture_session_id`. The report,
 raw output, and normalized output use create-new mode-`0600` semantics on Unix:
@@ -1201,6 +1221,10 @@ guard's read-only `adjtimex()` synchronization probe. The
 hermetic `deploy/systemd/verify-units.sh` gate validates every mode-specific
 command/restart/path invariant, runs `systemd-analyze verify`, and caps reported
 offline security exposure at `4.0`; the checked-in units currently score `2.9`.
+All three units additionally share the persistent owner-only
+`/var/lib/reap/connectivity` state directory. Deployed capture and live configs
+must set `connection_attempt_pacer_path =
+"/var/lib/reap/connectivity/okx-global.pacer"`.
 
 - `reap-observe@.service` may restart on failure because observe mode cannot
   submit or cancel. A start limit bounds repeated bootstrap failures.
@@ -1226,7 +1250,8 @@ process supervisor. This policy wraps the Java-referenced connectivity and
 strategy behavior with Rust deployment controls rather than claiming parity.
 
 Use absolute storage, operator-socket, and capture paths below the instance's
-writable directory in deployed TOML. Config and environment files must be
+writable directory in deployed TOML, plus the exact shared pacer path above.
+Config and environment files must be
 readable only by root and the `reap` group; the environment file is populated by
 the deployment secret provider.
 
@@ -1572,8 +1597,12 @@ reap live --config "$ROUTED_CONFIG" --mode validate --pretty
 
 The renderer requires the source live endpoints to match the proxy's official
 demo upstream exactly. It adds `venue.order_ws_url` so private account-state and
-order-command faults are attributable to different sockets. Outside a routed
-test config that field is optional and defaults to `private_ws_url`.
+order-command faults are attributable to different sockets. It also requires
+the proxy and source live config to declare the same connection-attempt interval
+and pacer path, then clears both from the generated loopback config. Local live
+handshakes therefore do not consume a slot twice; each proxy bridge reserves one
+slot immediately before its official OKX upstream handshake. Outside a routed
+test config `venue.order_ws_url` is optional and defaults to `private_ws_url`.
 
 For each matrix role, start a fresh proxy process and one fresh bounded live
 session. Keep the routed config bytes identical across roles, but use unique

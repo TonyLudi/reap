@@ -8,8 +8,11 @@ dedup_capacity_per_stream = 100000
 max_sequence_buffer = 4096
 max_subscriptions_per_socket = 100
 # OKX permits three WebSocket connection requests per second per IP. This
-# process-wide interval also paces reconnect storms across every socket.
+# host-wide interval also paces reconnect storms across every Reap process.
 connection_attempt_interval_ms = 400
+# Every Reap process using this path shares one owner-only handshake schedule.
+# Use one absolute host path in deployed capture/live/fault configurations.
+connection_attempt_pacer_path = "var/reap/okx-connection-attempt.pacer"
 health_interval_ms = 1000
 max_book_age_ms = 5000
 

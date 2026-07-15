@@ -53,6 +53,8 @@ common_lines=(
   'Type=simple'
   'User=reap'
   'Group=reap'
+  'StateDirectory=reap/connectivity'
+  'StateDirectoryMode=0750'
   'Environment=RUST_BACKTRACE=1'
   'KillMode=control-group'
   'KillSignal=SIGTERM'
@@ -114,7 +116,7 @@ require_single_key deploy/systemd/reap-observe@.service \
 require_single_key deploy/systemd/reap-observe@.service RestartSec 10s
 require_single_key deploy/systemd/reap-observe@.service StartLimitBurst 3
 require_single_key deploy/systemd/reap-observe@.service \
-  ReadWritePaths '/var/lib/reap/live/%i'
+  ReadWritePaths '/var/lib/reap/live/%i /var/lib/reap/connectivity'
 
 require_single_key deploy/systemd/reap-demo@.service \
   WorkingDirectory '/var/lib/reap/live/%i'
@@ -126,7 +128,7 @@ require_single_key deploy/systemd/reap-demo@.service \
   ExecStart '/usr/local/bin/reap live --config /etc/reap/live/%i.toml --mode demo --confirm-demo'
 require_single_key deploy/systemd/reap-demo@.service StartLimitBurst 2
 require_single_key deploy/systemd/reap-demo@.service \
-  ReadWritePaths '/var/lib/reap/live/%i'
+  ReadWritePaths '/var/lib/reap/live/%i /var/lib/reap/connectivity'
 
 require_single_key deploy/systemd/reap-capture@.service \
   WorkingDirectory '/var/lib/reap/capture/%i'
@@ -136,7 +138,7 @@ require_single_key deploy/systemd/reap-capture@.service \
   ExecStart '/usr/local/bin/reap capture --config /etc/reap/capture/%i.toml --output /var/lib/reap/capture/%i/run-report.json --duration-secs ${REAP_CAPTURE_DURATION_SECS} --require-clean-capture'
 require_single_key deploy/systemd/reap-capture@.service StartLimitBurst 2
 require_single_key deploy/systemd/reap-capture@.service \
-  ReadWritePaths '/var/lib/reap/capture/%i'
+  ReadWritePaths '/var/lib/reap/capture/%i /var/lib/reap/connectivity'
 
 root="$(mktemp -d)"
 trap 'rm -rf "$root"' EXIT
@@ -149,7 +151,8 @@ install -d \
   "$root/usr/local/bin" \
   "$root/usr/local/share/doc/reap" \
   "$root/var/lib/reap/live/$INSTANCE" \
-  "$root/var/lib/reap/capture/$INSTANCE"
+  "$root/var/lib/reap/capture/$INSTANCE" \
+  "$root/var/lib/reap/connectivity"
 cp -a "$SYSTEMD_TREE" "$root/usr/lib/"
 install -m 0755 "$binary" "$root/usr/local/bin/reap"
 install -m 0644 docs/operations.md "$root/usr/local/share/doc/reap/operations.md"

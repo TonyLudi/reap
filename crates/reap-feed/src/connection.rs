@@ -46,6 +46,7 @@ pub enum ConnectionStatusKind {
     Ready,
     Heartbeat,
     Disconnected,
+    Fatal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

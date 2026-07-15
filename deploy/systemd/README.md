@@ -15,6 +15,7 @@ Expected instance layout for an instance named `btc-demo`:
 /etc/reap/live/btc-demo.toml       root:reap 0640
 /etc/reap/live/btc-demo.env        root:reap 0640
 /var/lib/reap/live/btc-demo/       reap:reap 0750
+/var/lib/reap/connectivity/        reap:reap 0750
 ```
 
 Capture run instance `btc-public-20260715T000000Z` uses
@@ -24,6 +25,13 @@ only `REAP_CAPTURE_DURATION_SECS=<positive integer>`, and
 the capture environment file. Use absolute storage, operator-socket, and
 capture-output paths inside deployed TOML; each must remain under that
 instance's writable directory.
+Every deployed live and capture TOML must set
+`connection_attempt_pacer_path =
+"/var/lib/reap/connectivity/okx-global.pacer"`. `StateDirectory` creates that
+shared persistent directory, and each template exposes it through the otherwise
+read-only filesystem policy. The pacer file is created owner-only by Reap. It
+coordinates service processes on this host only; hosts sharing one NAT require
+isolated egress or an external IP-wide coordinator.
 
 Install and validate the units:
 

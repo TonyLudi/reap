@@ -296,12 +296,24 @@ risk typos, rather than being silently dropped before validation.
 
 `runtime.connection_attempt_interval_ms = 400` serializes initial and
 reconnecting WebSocket handshakes across every public/private feed and
-authenticated order-command session in one process. Official endpoint
-configurations reject values below 334 ms because
+authenticated order-command session. Official endpoint configurations also
+require `runtime.connection_attempt_pacer_path`; owner-only advisory locking and
+a fixed-format Linux boot-ID/`CLOCK_BOOTTIME` next-slot record make every Reap
+process using that file reserve from one host-wide monotonic schedule. Unsafe
+permissions, malformed state, or a
+reservation more than 15 minutes ahead fails closed. Values below 334 ms are
+rejected because
 OKX documents a limit of three WebSocket connection requests per second per IP
 in the [API guide](https://www.okx.com/docs-v5/en/). Only complete demo
-loopback configurations may use zero. Deployments running multiple Reap
-processes behind one egress IP must coordinate that limit outside the process.
+loopback configurations may use zero without a state file; official endpoint
+runtimes fail preflight outside Linux rather than weakening the monotonic-clock
+guarantee. The checked-in examples use a relative development path; production
+research and the aggregate production gate require an absolute path, and the
+systemd baseline uses
+`/var/lib/reap/connectivity/okx-global.pacer`. Fault-proxy upstream handshakes
+reserve through that same file while its generated loopback live config does
+not double-reserve. This coordinates one host only; multiple hosts sharing an
+egress IP still require an external IP-wide coordinator or isolated egress.
 
 Before promoting an exact demo configuration to a production candidate, create
 an owner-only transition artifact:
@@ -342,10 +354,12 @@ trade/funding economic reconciliation evidence.
 It rejects missing or duplicate per-account coverage, a demo soak reused as a
 fault session, config drift during verification, and any mismatch against the
 manifest-declared build, host, candidate, or environment-specific account
-identities. Proxy-supported fault roles must carry typed records with the exact
-proxy fingerprint, unique proxy session/command IDs, fresh timestamps, and a
-command interval inside the corresponding verified live session; only genuine
-  partial-fill and restart-latch roles may use external evidence. Schema 8 also
+identities. The demo and production configs must also name the same absolute
+process-shared connection-pacer path. Proxy-supported fault roles must carry
+typed records with the exact proxy fingerprint, unique proxy session/command
+IDs, fresh timestamps, and a command interval inside the corresponding verified
+live session; only genuine partial-fill and restart-latch roles may use external
+evidence. Schema 8 also
 enforces reviewed age limits under hard code-level maxima for the demo soak,
 every fault and latency source, production account certification, deadman,
 emergency cancel, and the reconciled fill and bill windows. It requires one

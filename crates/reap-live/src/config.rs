@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use reap_core::{AccountUpdate, PositionMarginMode};
-use reap_feed::OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS;
+use reap_feed::{
+    DEFAULT_OKX_CONNECTION_ATTEMPT_PACER_PATH, OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS,
+};
 use reap_order::PacingPolicy;
 use reap_risk::RiskLimits;
 use reap_strategy::{ChaosConfig, InstrumentConfig};
@@ -220,6 +222,7 @@ pub struct RuntimeConfig {
     pub public_connections_per_subscription: usize,
     pub order_websocket_sessions: usize,
     pub connection_attempt_interval_ms: u64,
+    pub connection_attempt_pacer_path: Option<PathBuf>,
     pub timer_interval_ms: u64,
     pub readiness_timeout_ms: u64,
     pub shutdown_timeout_ms: u64,
@@ -260,6 +263,9 @@ impl Default for RuntimeConfig {
             public_connections_per_subscription: 2,
             order_websocket_sessions: 8,
             connection_attempt_interval_ms: 400,
+            connection_attempt_pacer_path: Some(PathBuf::from(
+                DEFAULT_OKX_CONNECTION_ATTEMPT_PACER_PATH,
+            )),
             timer_interval_ms: 100,
             readiness_timeout_ms: 30_000,
             shutdown_timeout_ms: 15_000,
@@ -592,7 +598,23 @@ impl LiveConfig {
         if self.storage.flush_every_records == 0 {
             errors.push("storage.flush_every_records must be positive".to_string());
         }
+        if let Some(path) = self.runtime.connection_attempt_pacer_path.as_ref()
+            && path == &self.storage.path
+        {
+            errors.push(
+                "runtime.connection_attempt_pacer_path must differ from storage.path".to_string(),
+            );
+        }
         validate_operator(&self.operator, &self.storage, &mut errors);
+        if let Some(path) = self.runtime.connection_attempt_pacer_path.as_ref()
+            && self.operator.enabled
+            && path == &self.operator.socket_path
+        {
+            errors.push(
+                "runtime.connection_attempt_pacer_path must differ from operator.socket_path"
+                    .to_string(),
+            );
+        }
         validate_alerts(&self.alerts, &mut errors);
         validate_host_guard(&self.host_guard, &mut errors);
 
@@ -1178,9 +1200,8 @@ fn validate_connection_attempt_interval(
     endpoint_region: Option<OkxEndpointRegion>,
     errors: &mut Vec<String>,
 ) {
-    if endpoint_region != Some(OkxEndpointRegion::DemoLoopback)
-        && runtime.connection_attempt_interval_ms < OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS
-    {
+    let official = endpoint_region != Some(OkxEndpointRegion::DemoLoopback);
+    if official && runtime.connection_attempt_interval_ms < OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS {
         errors.push(format!(
             "runtime.connection_attempt_interval_ms must be at least {OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS} for official OKX endpoints"
         ));
@@ -1189,6 +1210,15 @@ fn validate_connection_attempt_interval(
         errors.push(format!(
             "runtime.connection_attempt_interval_ms must not exceed {MAX_CONNECTION_ATTEMPT_INTERVAL_MS}"
         ));
+    }
+    match runtime.connection_attempt_pacer_path.as_ref() {
+        Some(path) if path.as_os_str().is_empty() => errors
+            .push("runtime.connection_attempt_pacer_path must not be empty when set".to_string()),
+        None if official => errors.push(
+            "runtime.connection_attempt_pacer_path is required for official OKX endpoints"
+                .to_string(),
+        ),
+        _ => {}
     }
 }
 
@@ -1778,6 +1808,16 @@ mod tests {
                 .any(|error| error.contains("must be at least 334"))
         );
 
+        config.runtime.connection_attempt_interval_ms = 400;
+        config.runtime.connection_attempt_pacer_path = None;
+        let validation = config.validate();
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("pacer_path is required"))
+        );
+
         config.venue = venue(
             TradingEnvironment::Demo,
             "http://127.0.0.1:18080",
@@ -1816,6 +1856,29 @@ mod tests {
         assert!(validation.errors.iter().any(|error| {
             error.contains("runtime.order_websocket_sessions must not exceed 16")
         }));
+    }
+
+    #[test]
+    fn connection_pacer_cannot_alias_runtime_state_paths() {
+        let mut config = valid_config();
+        config.runtime.connection_attempt_pacer_path = Some(config.storage.path.clone());
+        let validation = config.validate();
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("must differ from storage.path"))
+        );
+
+        config.runtime.connection_attempt_pacer_path = Some(config.operator.socket_path.clone());
+        config.operator.enabled = true;
+        let validation = config.validate();
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("must differ from operator.socket_path"))
+        );
     }
 
     #[test]

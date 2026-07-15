@@ -244,9 +244,12 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Make websocket ready/disconnect transitions lossless under bounded status
   backpressure, remove redundant per-frame status traffic, and split public and
   private disconnect counts in schema-8 live evidence for fault campaigns.
-- [x] Pace process-local public/private/order-command initial and reconnect
-  handshakes under the documented OKX per-IP limit, reject unknown capture fields, and gate
-  backtest order entry on complete books plus fresh accounting routes.
+- [x] Pace public/private/order-command and fault-proxy-upstream initial and
+  reconnect handshakes through one owner-only, process-shared host file under
+  the documented OKX per-IP limit; production evidence requires one absolute
+  demo/production path. Reject unknown capture fields and gate backtest order
+  entry on complete books plus fresh accounting routes. Hosts sharing one NAT
+  still require external IP-wide coordination or isolated egress.
 - [x] Add structured live fault evidence for ambiguous submit/cancel outcomes,
   partial fills, order/fill convergence timeouts, restored durable latches, and
   typed deadman, periodic clock, and authenticated account-config failures.

@@ -1169,6 +1169,8 @@ pub(crate) fn verify_production_evidence_manifest_path(
                 .to_string(),
             "supervision, paging, credential permissions, venue announcements, rollout/rollback review, and explicit human approval remain required"
                 .to_string(),
+            "the bound absolute connection pacer coordinates Reap processes on the declared host only; another host sharing the same egress IP requires isolated egress or an external IP-wide coordinator"
+                .to_string(),
             "partial-fill and restored-latch roles may use opaque external injector evidence; freshness is enforced on their verified live reports, while external causality remains an operator-reviewed gate"
                 .to_string(),
             "this verifier never authorizes or enables production order entry".to_string(),
@@ -1643,6 +1645,47 @@ fn evaluate_bindings(input: BindingInputs<'_>) -> Vec<ProductionEvidenceFailure>
         input.fault.0.venue.environment,
         TradingEnvironment::Demo,
     );
+    let demo_connection_pacer = input
+        .demo
+        .0
+        .runtime
+        .connection_attempt_pacer_path
+        .as_deref()
+        .unwrap_or_else(|| Path::new(""));
+    let production_connection_pacer = input
+        .production
+        .0
+        .runtime
+        .connection_attempt_pacer_path
+        .as_deref()
+        .unwrap_or_else(|| Path::new(""));
+    check_binding(
+        &mut failures,
+        ProductionEvidenceGate::Verifier,
+        None,
+        "connection_attempt_pacer_path",
+        &demo_connection_pacer.to_string_lossy(),
+        &production_connection_pacer.to_string_lossy(),
+    );
+    for (role, path) in [
+        (
+            "demo_connection_attempt_pacer_path_absolute",
+            demo_connection_pacer,
+        ),
+        (
+            "production_connection_attempt_pacer_path_absolute",
+            production_connection_pacer,
+        ),
+    ] {
+        check_binding(
+            &mut failures,
+            ProductionEvidenceGate::Verifier,
+            None,
+            role,
+            "true",
+            if path.is_absolute() { "true" } else { "false" },
+        );
+    }
 
     let demo_accounts = account_ids(input.demo.0);
     let production_accounts = account_ids(input.production.0);

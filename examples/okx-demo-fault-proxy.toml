@@ -14,6 +14,10 @@ request_timeout_ms = 10000
 max_http_body_bytes = 1048576
 max_pending_faults = 64
 shutdown_timeout_ms = 5000
+# The proxy reserves official-upstream handshakes in the same schedule as the
+# source live config; the generated loopback live config disables local pacing.
+connection_attempt_interval_ms = 400
+connection_attempt_pacer_path = "var/reap/okx-connection-attempt.pacer"
 
 [upstream]
 rest_url = "https://openapi.okx.com"

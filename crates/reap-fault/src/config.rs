@@ -2,6 +2,9 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use reap_feed::{
+    DEFAULT_OKX_CONNECTION_ATTEMPT_PACER_PATH, OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS,
+};
 use reap_live::{LiveConfig, OkxEndpointRegion, OkxVenueConfig, TradingEnvironment};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -22,6 +25,10 @@ pub struct FaultProxyConfig {
     pub control_socket: PathBuf,
     pub evidence_directory: PathBuf,
     pub upstream: FaultProxyUpstream,
+    #[serde(default = "default_connection_attempt_interval_ms")]
+    pub connection_attempt_interval_ms: u64,
+    #[serde(default = "default_connection_attempt_pacer_path")]
+    pub connection_attempt_pacer_path: PathBuf,
     #[serde(default = "default_request_timeout_ms")]
     pub request_timeout_ms: u64,
     #[serde(default = "default_max_http_body_bytes")]
@@ -180,6 +187,25 @@ impl FaultProxyConfig {
         if self.shutdown_timeout_ms == 0 || self.shutdown_timeout_ms > 60_000 {
             errors.push("shutdown_timeout_ms must be in 1..=60000".to_string());
         }
+        if self.connection_attempt_interval_ms < OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS
+            || self.connection_attempt_interval_ms > 60_000
+        {
+            errors.push(format!(
+                "connection_attempt_interval_ms must be in {OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS}..=60000"
+            ));
+        }
+        if self.connection_attempt_pacer_path.as_os_str().is_empty() {
+            errors.push("connection_attempt_pacer_path must not be empty".to_string());
+        }
+        if self.connection_attempt_pacer_path == self.control_socket {
+            errors
+                .push("connection_attempt_pacer_path must differ from control_socket".to_string());
+        }
+        if self.connection_attempt_pacer_path == self.evidence_directory {
+            errors.push(
+                "connection_attempt_pacer_path must differ from evidence_directory".to_string(),
+            );
+        }
 
         let venue = OkxVenueConfig {
             environment: TradingEnvironment::Demo,
@@ -236,6 +262,15 @@ impl FaultProxyConfig {
                     .to_string(),
             ));
         }
+        if live.runtime.connection_attempt_interval_ms != self.connection_attempt_interval_ms
+            || live.runtime.connection_attempt_pacer_path.as_ref()
+                != Some(&self.connection_attempt_pacer_path)
+        {
+            return Err(FaultProxyConfigError::Invalid(
+                "source live config and fault proxy must use the same connection-attempt interval and pacer path"
+                    .to_string(),
+            ));
+        }
         let mut routed = live.clone();
         routed.venue.rest_url = format!("http://{}", self.rest_listen);
         routed.venue.public_ws_url = format!(
@@ -253,6 +288,8 @@ impl FaultProxyConfig {
             self.order_ws_listen,
             WebSocketEndpointPath::Private.as_str()
         ));
+        routed.runtime.connection_attempt_interval_ms = 0;
+        routed.runtime.connection_attempt_pacer_path = None;
         routed
             .ensure_valid()
             .map_err(|error| FaultProxyConfigError::Invalid(error.to_string()))?;
@@ -280,6 +317,14 @@ fn resolve_path(base: &Path, path: &Path) -> PathBuf {
     } else {
         base.join(path)
     }
+}
+
+const fn default_connection_attempt_interval_ms() -> u64 {
+    400
+}
+
+fn default_connection_attempt_pacer_path() -> PathBuf {
+    PathBuf::from(DEFAULT_OKX_CONNECTION_ATTEMPT_PACER_PATH)
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -320,6 +365,8 @@ mod tests {
                 public_ws_url: "wss://wspap.okx.com:8443/ws/v5/public".to_string(),
                 private_ws_url: "wss://wspap.okx.com:8443/ws/v5/private".to_string(),
             },
+            connection_attempt_interval_ms: 400,
+            connection_attempt_pacer_path: PathBuf::from(DEFAULT_OKX_CONNECTION_ATTEMPT_PACER_PATH),
             request_timeout_ms: 10_000,
             max_http_body_bytes: 1024 * 1024,
             max_pending_faults: 64,
@@ -398,5 +445,21 @@ private_ws_url = "wss://wspap.okx.com:8443/ws/v5/private"
             routed.venue.endpoint_region(),
             Ok(OkxEndpointRegion::DemoLoopback)
         );
+        assert_eq!(routed.runtime.connection_attempt_interval_ms, 0);
+        assert_eq!(routed.runtime.connection_attempt_pacer_path, None);
+    }
+
+    #[test]
+    fn proxy_rejects_pacer_drift_and_control_path_collision() {
+        let live =
+            LiveConfig::from_toml(include_str!("../../../examples/live-okx-demo.toml")).unwrap();
+        let mut proxy = config();
+        proxy.connection_attempt_pacer_path = PathBuf::from("var/reap/another.pacer");
+        let error = proxy.route_live_config(&live).unwrap_err().to_string();
+        assert!(error.contains("same connection-attempt interval and pacer path"));
+
+        proxy.connection_attempt_pacer_path = proxy.control_socket.clone();
+        let error = proxy.validate().unwrap_err().to_string();
+        assert!(error.contains("must differ from control_socket"));
     }
 }

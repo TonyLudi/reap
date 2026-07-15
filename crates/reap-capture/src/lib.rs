@@ -14,7 +14,8 @@ use reap_core::{
     SystemEventKind, Venue,
 };
 use reap_feed::{
-    ConnectionAttemptPacer, ConnectionStatus, ConnectionStatusKind, FeedOutput, FeedProcessor,
+    ConnectionAttemptPacer, ConnectionStatus, ConnectionStatusKind,
+    DEFAULT_OKX_CONNECTION_ATTEMPT_PACER_PATH, FeedOutput, FeedProcessor,
     OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS, RawCapture, ReconnectPolicy, RecoveryRequest,
     SequenceStatus, no_bootstrap, partition_subscriptions, spawn_supervised_feed,
 };
@@ -76,6 +77,7 @@ pub struct CaptureRuntimeConfig {
     pub max_sequence_buffer: usize,
     pub max_subscriptions_per_socket: usize,
     pub connection_attempt_interval_ms: u64,
+    pub connection_attempt_pacer_path: Option<PathBuf>,
     pub health_interval_ms: u64,
     pub max_book_age_ms: u64,
 }
@@ -89,6 +91,9 @@ impl Default for CaptureRuntimeConfig {
             max_sequence_buffer: 4_096,
             max_subscriptions_per_socket: 100,
             connection_attempt_interval_ms: 400,
+            connection_attempt_pacer_path: Some(PathBuf::from(
+                DEFAULT_OKX_CONNECTION_ATTEMPT_PACER_PATH,
+            )),
             health_interval_ms: 1_000,
             max_book_age_ms: 5_000,
         }
@@ -275,6 +280,10 @@ pub enum CaptureError {
     WriterJoin(#[from] tokio::task::JoinError),
     #[error("capture feed channel closed unexpectedly")]
     FeedClosed,
+    #[error("capture connection pacer failed: {0}")]
+    ConnectionPacer(#[from] reap_feed::ConnectionAttemptPacerError),
+    #[error("capture connection pacer failed during runtime: {0}")]
+    ConnectionPacerRuntime(String),
     #[error("capture provenance failed: {0}")]
     Provenance(String),
     #[error(transparent)]
@@ -394,6 +403,30 @@ impl CaptureConfig {
             errors.push(format!(
                 "runtime.connection_attempt_interval_ms must not exceed {MAX_CONNECTION_ATTEMPT_INTERVAL_MS}"
             ));
+        }
+        match self.runtime.connection_attempt_pacer_path.as_ref() {
+            Some(path) if path.as_os_str().is_empty() => errors.push(
+                "runtime.connection_attempt_pacer_path must not be empty when set".to_string(),
+            ),
+            None if !loopback => errors.push(
+                "runtime.connection_attempt_pacer_path is required for official OKX endpoints"
+                    .to_string(),
+            ),
+            _ => {}
+        }
+        if let Some(path) = self.runtime.connection_attempt_pacer_path.as_ref() {
+            if path == &self.output.raw_path {
+                errors.push(
+                    "runtime.connection_attempt_pacer_path must differ from output.raw_path"
+                        .to_string(),
+                );
+            }
+            if self.output.normalized_path.as_ref() == Some(path) {
+                errors.push(
+                    "runtime.connection_attempt_pacer_path must differ from output.normalized_path"
+                        .to_string(),
+                );
+            }
         }
         if self.output.raw_path.as_os_str().is_empty() {
             errors.push("output.raw_path must not be empty".to_string());
@@ -585,6 +618,17 @@ pub async fn run_capture(
     } else {
         (None, None)
     };
+    let connection_attempt_interval =
+        Duration::from_millis(config.runtime.connection_attempt_interval_ms);
+    let connection_attempt_pacer = match (
+        &config.runtime.connection_attempt_pacer_path,
+        connection_attempt_interval.is_zero(),
+    ) {
+        (Some(path), false) => {
+            ConnectionAttemptPacer::process_shared(connection_attempt_interval, path)?
+        }
+        _ => ConnectionAttemptPacer::new(connection_attempt_interval),
+    };
 
     let subscriptions = config.subscriptions();
     let plans =
@@ -633,9 +677,7 @@ pub async fn run_capture(
         plans,
         no_bootstrap(),
         config.runtime.feed_channel_capacity,
-        ConnectionAttemptPacer::new(Duration::from_millis(
-            config.runtime.connection_attempt_interval_ms,
-        )),
+        connection_attempt_pacer,
         ReconnectPolicy::default(),
     );
     let mut raw_rx = feed.take_raw();
@@ -799,6 +841,12 @@ async fn run_capture_loop(
             }
             status = status_rx.recv() => {
                 let status = status.ok_or(CaptureError::FeedClosed)?;
+                if status.kind == ConnectionStatusKind::Fatal {
+                    return Err(CaptureError::ConnectionPacerRuntime(format!(
+                        "{}: {}",
+                        status.conn_id, status.reason
+                    )));
+                }
                 state.on_status(status);
             }
             envelope = raw_rx.recv() => {
@@ -917,7 +965,7 @@ impl CaptureState {
                 self.reached_all_connections_ready |=
                     self.expected_connections.is_subset(&self.ready_connections);
             }
-            ConnectionStatusKind::Disconnected => {
+            ConnectionStatusKind::Disconnected | ConnectionStatusKind::Fatal => {
                 self.connection_disconnects += 1;
                 self.ready_connections.remove(&status.conn_id);
             }
@@ -1482,6 +1530,25 @@ mod tests {
                 .iter()
                 .any(|error| error.contains("must be at least 334"))
         );
+
+        config.runtime.connection_attempt_interval_ms = 400;
+        config.runtime.connection_attempt_pacer_path = None;
+        let validation = config.validate();
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("pacer_path is required"))
+        );
+
+        config.runtime.connection_attempt_pacer_path = Some(config.output.raw_path.clone());
+        let validation = config.validate();
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("must differ from output.raw_path"))
+        );
     }
 
     #[test]
@@ -1730,7 +1797,10 @@ mod tests {
         std::fs::write(&path, "existing-session\n").unwrap();
         let config = CaptureConfig {
             venue: CaptureVenueConfig::default(),
-            runtime: CaptureRuntimeConfig::default(),
+            runtime: CaptureRuntimeConfig {
+                connection_attempt_pacer_path: Some(directory.path().join("connect.pacer")),
+                ..CaptureRuntimeConfig::default()
+            },
             output: CaptureOutputConfig {
                 raw_path: path.clone(),
                 ..CaptureOutputConfig::default()
@@ -1773,7 +1843,10 @@ mod tests {
         std::fs::write(&normalized_path, "existing-session\n").unwrap();
         let config = CaptureConfig {
             venue: CaptureVenueConfig::default(),
-            runtime: CaptureRuntimeConfig::default(),
+            runtime: CaptureRuntimeConfig {
+                connection_attempt_pacer_path: Some(directory.path().join("connect.pacer")),
+                ..CaptureRuntimeConfig::default()
+            },
             output: CaptureOutputConfig {
                 raw_path: raw_path.clone(),
                 normalized_path: Some(normalized_path.clone()),
@@ -1811,6 +1884,33 @@ mod tests {
             std::fs::read_to_string(normalized_path).unwrap(),
             "existing-session\n"
         );
+    }
+
+    #[tokio::test]
+    async fn connection_pacer_preflight_fails_before_capture_output_or_network_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let raw_path = directory.path().join("raw.jsonl");
+        let mut config =
+            CaptureConfig::from_toml(include_str!("../../../examples/capture-okx-public.toml"))
+                .unwrap();
+        config.venue.public_ws_url = "ws://127.0.0.1:18081/ws/v5/public".to_string();
+        config.output.raw_path = raw_path.clone();
+        config.host_guard.enabled = false;
+        config.runtime.connection_attempt_pacer_path =
+            Some(directory.path().join("missing").join("connect.pacer"));
+
+        let error = run_capture(
+            config,
+            CaptureRunOptions {
+                run_duration: Some(Duration::from_millis(1)),
+                config_source: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, CaptureError::ConnectionPacer(_)));
+        assert!(!raw_path.exists());
     }
 
     #[tokio::test]

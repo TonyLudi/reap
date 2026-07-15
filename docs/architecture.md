@@ -160,6 +160,11 @@ Responsibilities:
 - Multi-websocket subscription partitioning.
 - Redundant websocket support for critical channels.
 - Ping/pong, reconnect, exponential backoff, and stale-feed detection.
+- Fail-closed connection-attempt pacing shared by public, private, order-command,
+  capture, and fault-proxy upstream sockets across processes on one host. The
+  owner-only advisory-lock file reserves Linux `CLOCK_BOOTTIME` slots under the
+  current kernel boot ID before sleeping, so a reconnect storm cannot race
+  independent process-local timers or a wall-clock correction.
 - Lossless bounded delivery for ready/disconnect transitions; payload traffic
   does not flood or silently evict critical connection state.
 - Separate per-socket transport liveness from aggregate private-state health.
@@ -1236,8 +1241,8 @@ state transitions.
 ### Phase 4: Live Feed Skeleton
 
 Status: implemented as `reap-venue` and `reap-feed`, with OKX books/trades,
-supervised socket plans, bounded deduplication, sequence recovery, and the raw
-capture checker.
+supervised socket plans, process-shared handshake pacing, bounded deduplication,
+sequence recovery, and the raw capture checker.
 
 - Add `reap-venue` and `reap-feed`.
 - Implement one venue public depth/trade adapter.

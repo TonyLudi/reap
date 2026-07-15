@@ -16,6 +16,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use reap_core::PINNED_JAVA_REVISION;
+use reap_feed::ConnectionAttemptPacer;
 use reap_live::{current_executable_sha256, host_identity_sha256};
 use tokio::net::{TcpListener, TcpStream, UnixListener};
 use tokio::sync::mpsc;
@@ -58,6 +59,10 @@ pub async fn run_fault_proxy(
         current_executable_sha256().map_err(FaultProxyRuntimeError::Provenance)?;
     let host_identity_sha256 =
         host_identity_sha256().map_err(FaultProxyRuntimeError::Provenance)?;
+    let connection_attempt_pacer = ConnectionAttemptPacer::process_shared(
+        Duration::from_millis(config.connection_attempt_interval_ms),
+        &config.connection_attempt_pacer_path,
+    )?;
 
     let rest_listener = TcpListener::bind(config.rest_listen)
         .await
@@ -103,18 +108,21 @@ pub async fn run_fault_proxy(
         Arc::clone(&state),
         WebSocketTarget::Public,
         config.upstream.public_ws_url.clone(),
+        connection_attempt_pacer.clone(),
     ));
     tasks.spawn(run_websocket_listener(
         private_listener,
         Arc::clone(&state),
         WebSocketTarget::Private,
         config.upstream.private_ws_url.clone(),
+        connection_attempt_pacer.clone(),
     ));
     tasks.spawn(run_websocket_listener(
         order_listener,
         Arc::clone(&state),
         WebSocketTarget::Order,
         config.upstream.private_ws_url.clone(),
+        connection_attempt_pacer,
     ));
     tasks.spawn(run_control_listener(
         control_listener,
@@ -536,6 +544,7 @@ async fn run_websocket_listener(
     state: Arc<ProxyState>,
     target: WebSocketTarget,
     upstream_url: String,
+    connection_attempt_pacer: ConnectionAttemptPacer,
 ) {
     let mut shutdown = state.shutdown.subscribe();
     let mut connections = JoinSet::new();
@@ -546,8 +555,17 @@ async fn run_websocket_listener(
                     Ok((stream, _)) => {
                         let state = Arc::clone(&state);
                         let upstream_url = upstream_url.clone();
+                        let connection_attempt_pacer = connection_attempt_pacer.clone();
                         connections.spawn(async move {
-                            if let Err(error) = bridge_websocket(stream, state.clone(), target, &upstream_url).await {
+                            if let Err(error) = bridge_websocket(
+                                stream,
+                                state.clone(),
+                                target,
+                                &upstream_url,
+                                connection_attempt_pacer,
+                            )
+                            .await
+                            {
                                 state.record_error(format!("{target:?} websocket bridge failed: {error}"));
                             }
                         });
@@ -584,6 +602,7 @@ async fn bridge_websocket(
     state: Arc<ProxyState>,
     target: WebSocketTarget,
     upstream_url: &str,
+    connection_attempt_pacer: ConnectionAttemptPacer,
 ) -> Result<(), WebSocketBridgeError> {
     let client = accept_hdr_async(
         stream,
@@ -592,6 +611,20 @@ async fn bridge_websocket(
         },
     )
     .await?;
+    let mut proxy_shutdown = state.shutdown.subscribe();
+    let (_pacer_shutdown_tx, mut pacer_shutdown) = tokio::sync::watch::channel(false);
+    tokio::select! {
+        turn = connection_attempt_pacer.wait_for_turn(&mut pacer_shutdown) => {
+            if !turn? {
+                return Err(WebSocketBridgeError::ShuttingDown);
+            }
+        }
+        changed = proxy_shutdown.changed() => {
+            if changed.is_err() || proxy_shutdown.borrow().is_some() {
+                return Err(WebSocketBridgeError::ShuttingDown);
+            }
+        }
+    }
     let (upstream, _) = connect_async(upstream_url).await?;
     bridge_websocket_streams(client, upstream, state, target).await
 }
@@ -789,6 +822,8 @@ fn remove_control_socket(path: &Path) -> Result<(), std::io::Error> {
 pub enum FaultProxyRuntimeError {
     #[error(transparent)]
     Config(#[from] crate::config::FaultProxyConfigError),
+    #[error("fault-proxy connection pacer failed: {0}")]
+    ConnectionPacer(#[from] reap_feed::ConnectionAttemptPacerError),
     #[error("failed to prepare private path {path}: {source}")]
     PreparePath {
         path: std::path::PathBuf,
@@ -825,6 +860,10 @@ pub enum FaultProxyRuntimeError {
 enum WebSocketBridgeError {
     #[error("websocket protocol failed: {0}")]
     Protocol(#[from] tokio_tungstenite::tungstenite::Error),
+    #[error("connection pacer failed: {0}")]
+    ConnectionPacer(#[from] reap_feed::ConnectionAttemptPacerError),
+    #[error("fault proxy is shutting down")]
+    ShuttingDown,
 }
 
 #[cfg(test)]
@@ -1094,6 +1133,7 @@ mod tests {
             Arc::clone(&state),
             WebSocketTarget::Order,
             format!("ws://{upstream_address}/ws/v5/private"),
+            ConnectionAttemptPacer::new(Duration::ZERO),
         ));
         let (mut client, _) = connect_async(format!(
             "ws://{proxy_address}{}",

@@ -1467,6 +1467,16 @@ fn validate_production_capture_config(
     if !config.host_guard.enabled {
         bail!("production dataset {dataset_id} requires an enabled capture host guard");
     }
+    let connection_pacer_path = config
+        .runtime
+        .connection_attempt_pacer_path
+        .as_ref()
+        .context("production capture requires a process-shared connection pacer")?;
+    if !connection_pacer_path.is_absolute() {
+        bail!(
+            "production dataset {dataset_id} requires an absolute process-shared connection pacer path"
+        );
+    }
     let streams = config
         .subscriptions
         .iter()
@@ -2234,9 +2244,15 @@ mod tests {
         let raw_path = directory.path().join("capture.jsonl");
         std::fs::write(&raw_path, RAW_CAPTURE_FIXTURE).unwrap();
 
+        let runtime = CaptureRuntimeConfig {
+            connection_attempt_pacer_path: Some(
+                directory.path().join("okx-connection-attempt.pacer"),
+            ),
+            ..CaptureRuntimeConfig::default()
+        };
         let config = CaptureConfig {
             venue: CaptureVenueConfig::default(),
-            runtime: CaptureRuntimeConfig::default(),
+            runtime,
             output: CaptureOutputConfig::default(),
             host_guard: HostGuardConfig {
                 enabled: true,
@@ -2856,7 +2872,15 @@ mod tests {
             &base,
         )
         .unwrap();
-        let config = CaptureConfig::load(base.join("examples/capture-okx-public.toml")).unwrap();
+        let mut config =
+            CaptureConfig::load(base.join("examples/capture-okx-public.toml")).unwrap();
+
+        let error = validate_production_capture_config("capture", &config, &candidates)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("absolute process-shared connection pacer path"));
+        config.runtime.connection_attempt_pacer_path =
+            Some(base.join("var/reap/okx-connection-attempt.pacer"));
 
         validate_production_capture_config("capture", &config, &candidates).unwrap();
 

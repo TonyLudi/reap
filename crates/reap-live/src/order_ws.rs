@@ -41,6 +41,7 @@ pub(crate) enum OkxOrderWsStatusKind {
     Ready,
     Heartbeat,
     Disconnected,
+    Fatal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,9 +257,30 @@ async fn supervise_session(
     let mut delay = reconnect.initial_delay;
     loop {
         reject_queued(&mut commands, "order websocket is reconnecting");
-        if *shutdown.borrow() || !connection_attempt_pacer.wait_for_turn(&mut shutdown).await {
+        if *shutdown.borrow() {
             reject_queued(&mut commands, "order websocket is shutting down");
             return;
+        }
+        match connection_attempt_pacer.wait_for_turn(&mut shutdown).await {
+            Ok(true) => {}
+            Ok(false) => {
+                reject_queued(&mut commands, "order websocket is shutting down");
+                return;
+            }
+            Err(error) => {
+                let reason = format!("order websocket connection pacer failed: {error}");
+                let _ = ready.send(false);
+                let _ = status
+                    .send(SessionStatus {
+                        index,
+                        kind: OkxOrderWsStatusKind::Fatal,
+                        reason: reason.clone(),
+                    })
+                    .await;
+                reject_queued(&mut commands, &reason);
+                tracing::error!(session = index, %error, "order websocket connection pacer failed");
+                return;
+            }
         }
         let mut authenticated = false;
         let result = run_authenticated_session(
@@ -698,7 +720,7 @@ async fn aggregate_status(
                     OkxOrderWsStatusKind::Ready | OkxOrderWsStatusKind::Heartbeat => {
                         ready_sessions.insert(status.index);
                     }
-                    OkxOrderWsStatusKind::Disconnected => {
+                    OkxOrderWsStatusKind::Disconnected | OkxOrderWsStatusKind::Fatal => {
                         ready_sessions.remove(&status.index);
                     }
                 }
@@ -717,10 +739,12 @@ async fn aggregate_status(
                     OkxOrderWsStatusKind::Heartbeat if all_ready => {
                         Some(OkxOrderWsStatusKind::Heartbeat)
                     }
+                    OkxOrderWsStatusKind::Fatal => Some(OkxOrderWsStatusKind::Fatal),
                     _ => None,
                 };
                 aggregate_ready = all_ready;
                 let Some(kind) = aggregate_kind else { continue; };
+                let terminal = kind == OkxOrderWsStatusKind::Fatal;
                 let reason = match kind {
                     OkxOrderWsStatusKind::Ready => {
                         "every order websocket session is authenticated".to_string()
@@ -730,6 +754,10 @@ async fn aggregate_status(
                     }
                     OkxOrderWsStatusKind::Disconnected => format!(
                         "order websocket session {} disconnected: {}",
+                        status.index, status.reason
+                    ),
+                    OkxOrderWsStatusKind::Fatal => format!(
+                        "order websocket session {} failed permanently: {}",
                         status.index, status.reason
                     ),
                 };
@@ -745,6 +773,9 @@ async fn aggregate_status(
                     .await
                     .is_err()
                 {
+                    return;
+                }
+                if terminal {
                     return;
                 }
             }
@@ -870,6 +901,35 @@ mod tests {
         })
         .await
         .expect("order websocket should become ready")
+    }
+
+    #[tokio::test]
+    async fn aggregate_status_propagates_a_fatal_session_failure_and_stops() {
+        let (session_tx, session_rx) = mpsc::channel(1);
+        let (output_tx, mut output_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(aggregate_status(
+            "account-a".to_string(),
+            2,
+            session_rx,
+            output_tx,
+            shutdown_rx,
+        ));
+
+        session_tx
+            .send(SessionStatus {
+                index: 1,
+                kind: OkxOrderWsStatusKind::Fatal,
+                reason: "connection pacer failed".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let status = output_rx.recv().await.unwrap();
+        assert_eq!(status.kind, OkxOrderWsStatusKind::Fatal);
+        assert_eq!(status.ready_sessions, 0);
+        assert!(status.reason.contains("connection pacer failed"));
+        task.await.unwrap();
     }
 
     #[tokio::test]

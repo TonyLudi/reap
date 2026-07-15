@@ -11,6 +11,8 @@ Type=simple
 User=reap
 Group=reap
 WorkingDirectory=/var/lib/reap/live/%i
+StateDirectory=reap/connectivity
+StateDirectoryMode=0750
 EnvironmentFile=/etc/reap/live/%i.env
 Environment=RUST_BACKTRACE=1
 ExecStartPre=/usr/local/bin/reap live --config /etc/reap/live/%i.toml --mode validate
@@ -44,7 +46,7 @@ LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-ReadWritePaths=/var/lib/reap/live/%i
+ReadWritePaths=/var/lib/reap/live/%i /var/lib/reap/connectivity
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=reap-demo-%i
