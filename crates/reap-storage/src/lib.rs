@@ -480,6 +480,22 @@ pub fn recover_jsonl(path: impl AsRef<Path>) -> Result<RecoveredStorage, Storage
 /// Evidence tooling uses this entry point so the bytes it fingerprints are the
 /// same bytes used to reconstruct fills and checkpoints.
 pub fn recover_jsonl_bytes(bytes: &[u8]) -> Result<RecoveredStorage, StorageError> {
+    recover_jsonl_bytes_with_visitor(bytes, |_, _| {})
+}
+
+/// Recovers exactly the supplied journal bytes while streaming each validated
+/// record to an evidence visitor before normal recovery consumes it.
+///
+/// The visitor receives borrowed records, so callers can retain only the small
+/// subset needed for offline evidence without adding normalized market traffic
+/// to [`RecoveredStorage`] or live startup memory.
+pub fn recover_jsonl_bytes_with_visitor<F>(
+    bytes: &[u8],
+    mut visitor: F,
+) -> Result<RecoveredStorage, StorageError>
+where
+    F: FnMut(u64, &StorageRecord),
+{
     let text = std::str::from_utf8(bytes).map_err(|error| {
         StorageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     })?;
@@ -510,6 +526,7 @@ pub fn recover_jsonl_bytes(bytes: &[u8]) -> Result<RecoveredStorage, StorageErro
                 message: format!("unsupported schema version {}", envelope.schema_version),
             });
         }
+        visitor((index + 1) as u64, &envelope.record);
         recovered.records += 1;
         recovered.last_ts_ms = recovered
             .last_ts_ms
@@ -832,7 +849,10 @@ async fn write_record(
 
 #[cfg(test)]
 mod tests {
-    use reap_core::{ConnId, ControlEvent, OrderEvent, OrderStatus, OrderUpdate, Venue};
+    use reap_core::{
+        ConnId, ControlEvent, FundingSettlement, MarketEvent, OrderEvent, OrderStatus, OrderUpdate,
+        Venue,
+    };
 
     use super::*;
 
@@ -947,6 +967,48 @@ mod tests {
         assert_eq!(recovered.records, 1);
         assert_eq!(recovered.fills.len(), 1);
         assert_eq!(recovered.fills[0].liquidity, Some(FillLiquidity::Maker));
+    }
+
+    #[test]
+    fn recovery_visitor_streams_funding_without_retaining_normalized_traffic() {
+        let funding =
+            StorageRecord::Normalized(NormalizedEvent::Market(MarketEvent::FundingRate {
+                ts_ms: 1_001,
+                symbol: "BTC-USDT-SWAP".to_string(),
+                rate: 0.0001,
+                funding_time_ms: 2_000,
+                settlement: Some(FundingSettlement {
+                    funding_time_ms: 2_000,
+                    rate: 0.0002,
+                }),
+            }));
+        let line = serde_json::to_string(&StoredEnvelope {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            record: funding,
+        })
+        .unwrap();
+        let bytes = format!("{line}\n");
+        let mut settlements = Vec::new();
+
+        let recovered = recover_jsonl_bytes_with_visitor(bytes.as_bytes(), |line, record| {
+            if let StorageRecord::Normalized(NormalizedEvent::Market(MarketEvent::FundingRate {
+                symbol,
+                settlement: Some(settlement),
+                ..
+            })) = record
+            {
+                settlements.push((line, symbol.clone(), *settlement));
+            }
+        })
+        .unwrap();
+
+        assert_eq!(recovered.records, 1);
+        assert!(recovered.fills.is_empty());
+        assert_eq!(settlements.len(), 1);
+        assert_eq!(settlements[0].0, 1);
+        assert_eq!(settlements[0].1, "BTC-USDT-SWAP");
+        assert_eq!(settlements[0].2.funding_time_ms, 2_000);
+        assert_eq!(settlements[0].2.rate, 0.0002);
     }
 
     #[tokio::test]

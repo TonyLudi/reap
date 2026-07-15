@@ -10,10 +10,12 @@ use reap_fault::{
 };
 use reap_live::{
     AccountCertificationArtifact, DeadmanExpiryCertificationArtifact,
+    EconomicReconciliationOptions, EconomicReconciliationTolerances,
     EmergencyCancelVerificationOptions, FillStatementCoverage, FillStatementReconciliationOptions,
     FillStatementTolerances, LiveConfig, LiveConfigFileEvidence, LiveMode, TradingEnvironment,
-    current_executable_sha256, host_identity_sha256, reconcile_okx_fill_collection_paths,
-    verify_account_certification_artifact_path, verify_deadman_expiry_certification_artifact_path,
+    current_executable_sha256, host_identity_sha256, reconcile_okx_economics_paths,
+    reconcile_okx_fill_collection_paths, verify_account_certification_artifact_path,
+    verify_bill_collection_manifest_path, verify_deadman_expiry_certification_artifact_path,
     verify_emergency_cancel_paths, verify_fill_collection_manifest_path,
     verify_live_fault_matrix_paths, verify_live_run_paths, verify_production_transition_paths,
 };
@@ -23,8 +25,8 @@ use sha2::{Digest, Sha256};
 use crate::deployment::{ResearchDeploymentVerificationReport, verify_research_deployment_paths};
 use crate::latency::{LatencyCalibrationVerificationReport, verify_latency_calibration};
 
-pub(crate) const PRODUCTION_EVIDENCE_MANIFEST_SCHEMA_VERSION: u16 = 4;
-pub(crate) const PRODUCTION_EVIDENCE_REPORT_FORMAT_VERSION: u16 = 4;
+pub(crate) const PRODUCTION_EVIDENCE_MANIFEST_SCHEMA_VERSION: u16 = 5;
+pub(crate) const PRODUCTION_EVIDENCE_REPORT_FORMAT_VERSION: u16 = 5;
 pub(crate) const PRODUCTION_EVIDENCE_APPROVAL_SUBJECT_FORMAT_VERSION: u16 = 1;
 const MAX_PRODUCTION_EVIDENCE_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_PRODUCTION_EVIDENCE_ACCOUNTS: usize = 32;
@@ -38,6 +40,12 @@ const MAX_PRODUCTION_ACCOUNT_CERTIFICATION_AGE_MS: u64 = 15 * 60 * 1_000;
 const MAX_DEADMAN_CERTIFICATION_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 const MAX_EMERGENCY_CANCEL_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 const MAX_FILL_COLLECTION_AGE_MS: u64 = 24 * 60 * 60 * 1_000;
+const MAX_BILL_COLLECTION_AGE_MS: u64 = 24 * 60 * 60 * 1_000;
+const MAX_PRODUCTION_ECONOMIC_QUANTITY_TOLERANCE: f64 = 1e-8;
+const MAX_PRODUCTION_ECONOMIC_FEE_TOLERANCE: f64 = 1e-10;
+const MAX_PRODUCTION_ECONOMIC_BALANCE_TOLERANCE: f64 = 1e-8;
+const MAX_PRODUCTION_ECONOMIC_FUNDING_ABSOLUTE_TOLERANCE: f64 = 1e-8;
+const MAX_PRODUCTION_ECONOMIC_FUNDING_RELATIVE_TOLERANCE: f64 = 1e-6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -50,6 +58,7 @@ pub(crate) struct ProductionEvidenceFreshnessPolicy {
     pub deadman_certification_max_age_ms: u64,
     pub emergency_cancel_max_age_ms: u64,
     pub fill_collection_max_age_ms: u64,
+    pub bill_collection_max_age_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -64,6 +73,30 @@ pub(crate) struct ProductionEvidenceFillInput {
     pub quantity_tolerance: f64,
     #[serde(default)]
     pub fee_tolerance: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProductionEvidenceEconomicInput {
+    pub fill_collection_manifest: PathBuf,
+    pub bill_collection_manifest: PathBuf,
+    pub journal: PathBuf,
+    pub minimum_trade_bills: u64,
+    pub minimum_funding_bills: u64,
+    pub maximum_trade_bill_delay_ms: u64,
+    pub maximum_funding_bill_delay_ms: u64,
+    #[serde(default)]
+    pub price_tolerance: f64,
+    #[serde(default)]
+    pub quantity_tolerance: f64,
+    #[serde(default)]
+    pub fee_tolerance: f64,
+    #[serde(default)]
+    pub balance_tolerance: f64,
+    #[serde(default)]
+    pub funding_pnl_absolute_tolerance: f64,
+    #[serde(default)]
+    pub funding_pnl_relative_tolerance: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +140,7 @@ pub(crate) struct ProductionEvidenceManifest {
     pub deadman_certifications: Vec<ProductionEvidenceDeadmanInput>,
     pub emergency_cancel_report: PathBuf,
     pub fill_reconciliations: Vec<ProductionEvidenceFillInput>,
+    pub economic_reconciliations: Vec<ProductionEvidenceEconomicInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,6 +206,7 @@ pub(crate) enum ProductionEvidenceGate {
     DeadmanCertification,
     EmergencyCancel,
     FillReconciliation,
+    EconomicReconciliation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -488,6 +523,7 @@ struct ResolvedManifest {
     deadman_certifications: Vec<ResolvedDeadmanInput>,
     emergency_cancel_report: PathBuf,
     fill_reconciliations: Vec<ResolvedFillInput>,
+    economic_reconciliations: Vec<ResolvedEconomicInput>,
 }
 
 struct ResolvedDeadmanInput {
@@ -507,11 +543,31 @@ struct ResolvedFillInput {
     tolerances: FillStatementTolerances,
 }
 
+struct ResolvedEconomicInput {
+    fill_collection_manifest: PathBuf,
+    bill_collection_manifest: PathBuf,
+    journal: PathBuf,
+    minimum_trade_bills: u64,
+    minimum_funding_bills: u64,
+    maximum_trade_bill_delay_ms: u64,
+    maximum_funding_bill_delay_ms: u64,
+    tolerances: EconomicReconciliationTolerances,
+}
+
 struct VerifiedFillInput {
     collection_manifest: PathBuf,
     journal: PathBuf,
     manifest: reap_live::FillCollectionManifest,
     report: reap_live::FillStatementReconciliationReport,
+}
+
+struct VerifiedEconomicInput {
+    fill_collection_manifest: PathBuf,
+    bill_collection_manifest: PathBuf,
+    journal: PathBuf,
+    fill_manifest: reap_live::FillCollectionManifest,
+    bill_manifest: reap_live::BillCollectionManifest,
+    report: reap_live::EconomicReconciliationReport,
 }
 
 struct VerifiedTimedLiveSource {
@@ -680,6 +736,73 @@ pub(crate) fn verify_production_evidence_manifest_path(
         });
     }
 
+    let mut economic_inputs = Vec::with_capacity(paths.economic_reconciliations.len());
+    for input in &paths.economic_reconciliations {
+        let fills_before = verify_fill_collection_manifest_path(&input.fill_collection_manifest)
+            .with_context(|| {
+                format!(
+                    "failed to reconstruct economic fill collection {}",
+                    input.fill_collection_manifest.display()
+                )
+            })?;
+        let bills_before = verify_bill_collection_manifest_path(&input.bill_collection_manifest)
+            .with_context(|| {
+                format!(
+                    "failed to reconstruct economic bill collection {}",
+                    input.bill_collection_manifest.display()
+                )
+            })?;
+        let report = reconcile_okx_economics_paths(
+            &input.journal,
+            &input.fill_collection_manifest,
+            &input.bill_collection_manifest,
+            EconomicReconciliationOptions {
+                account_id: bills_before.manifest.account_id.clone(),
+                begin_ms: bills_before.manifest.window.begin_ms,
+                end_ms: bills_before.manifest.window.end_ms,
+                minimum_trade_bills: input.minimum_trade_bills,
+                minimum_funding_bills: input.minimum_funding_bills,
+                maximum_trade_bill_delay_ms: input.maximum_trade_bill_delay_ms,
+                maximum_funding_bill_delay_ms: input.maximum_funding_bill_delay_ms,
+                tolerances: input.tolerances,
+            },
+        )
+        .with_context(|| {
+            format!(
+                "failed to reconstruct economic reconciliation for {}",
+                bills_before.manifest.account_id
+            )
+        })?;
+        let fills_after = verify_fill_collection_manifest_path(&input.fill_collection_manifest)
+            .with_context(|| {
+                format!(
+                    "failed to recheck economic fill collection {}",
+                    input.fill_collection_manifest.display()
+                )
+            })?;
+        let bills_after = verify_bill_collection_manifest_path(&input.bill_collection_manifest)
+            .with_context(|| {
+                format!(
+                    "failed to recheck economic bill collection {}",
+                    input.bill_collection_manifest.display()
+                )
+            })?;
+        if fills_before != fills_after || bills_before != bills_after {
+            bail!(
+                "economic source collections changed while {} was being reconciled",
+                bills_before.manifest.account_id
+            );
+        }
+        economic_inputs.push(VerifiedEconomicInput {
+            fill_collection_manifest: input.fill_collection_manifest.clone(),
+            bill_collection_manifest: input.bill_collection_manifest.clone(),
+            journal: input.journal.clone(),
+            fill_manifest: fills_before.manifest,
+            bill_manifest: bills_before.manifest,
+            report,
+        });
+    }
+
     // Reopen all configs after the expensive source reconstructions. Every
     // subordinate report is compared to this final exact-file observation.
     let (demo_config, demo_file) = LiveConfig::load_with_evidence(&paths.demo_config)
@@ -753,6 +876,7 @@ pub(crate) fn verify_production_evidence_manifest_path(
         emergency_path: &paths.emergency_cancel_report,
         emergency: &emergency,
         fill_inputs: &fill_inputs,
+        economic_inputs: &economic_inputs,
     });
 
     let mut gates = vec![
@@ -882,6 +1006,19 @@ pub(crate) fn verify_production_evidence_manifest_path(
             input.report.passed,
         )?);
     }
+    for input in &economic_inputs {
+        gates.push(gate_report(
+            ProductionEvidenceGate::EconomicReconciliation,
+            Some(input.bill_manifest.account_id.clone()),
+            vec![
+                input.fill_collection_manifest.clone(),
+                input.bill_collection_manifest.clone(),
+                input.journal.clone(),
+            ],
+            &(&input.fill_manifest, &input.bill_manifest, &input.report),
+            input.report.passed,
+        )?);
+    }
     gates.sort_by(|left, right| {
         left.gate
             .cmp(&right.gate)
@@ -912,6 +1049,7 @@ pub(crate) fn verify_production_evidence_manifest_path(
         deadman_artifacts: &deadman_artifacts,
         emergency: &emergency,
         fill_inputs: &fill_inputs,
+        economic_inputs: &economic_inputs,
     };
     let mut failures = evaluate_bindings(bindings);
     failures.extend(freshness_failures);
@@ -945,7 +1083,7 @@ pub(crate) fn verify_production_evidence_manifest_path(
                 .to_string(),
             "source timestamps and verifier wall time are validated artifact fields but are not remotely attested; operators must independently control clock synchronization, the manifest, and target host"
                 .to_string(),
-            "account certification is point-in-time and fill reconciliation covers fills and fees only; complete economic statements, funding, transfers, tax, and profitability review remain external gates"
+            "trade/funding reconciliation rejects unexplained account bills and binds funding to the journaled signed position, but opening cost basis, the exact bill-sourced settlement mark, taxes, currency conversion, and profitability review remain external gates"
                 .to_string(),
             "supervision, paging, credential permissions, venue announcements, rollout/rollback review, and explicit human approval remain required"
                 .to_string(),
@@ -1031,6 +1169,7 @@ struct FreshnessInputs<'a> {
     emergency_path: &'a Path,
     emergency: &'a reap_live::EmergencyCancelVerificationReport,
     fill_inputs: &'a [VerifiedFillInput],
+    economic_inputs: &'a [VerifiedEconomicInput],
 }
 
 fn evaluate_freshness(
@@ -1172,6 +1311,20 @@ fn evaluate_freshness(
             fill.manifest.window.begin_ms,
             Some(fill.manifest.window.end_ms),
             input.policy.fill_collection_max_age_ms,
+        );
+    }
+    for economic in input.economic_inputs {
+        push_freshness(
+            &mut observations,
+            &mut failures,
+            input.policy,
+            input.verified_at_ms,
+            ProductionEvidenceGate::EconomicReconciliation,
+            Some(economic.bill_manifest.account_id.clone()),
+            &economic.bill_collection_manifest,
+            economic.bill_manifest.window.begin_ms,
+            Some(economic.bill_manifest.window.end_ms),
+            input.policy.bill_collection_max_age_ms,
         );
     }
     observations.sort_by(|left, right| {
@@ -1320,6 +1473,7 @@ struct BindingInputs<'a> {
     deadman_artifacts: &'a [(&'a ResolvedDeadmanInput, DeadmanExpiryCertificationArtifact)],
     emergency: &'a reap_live::EmergencyCancelVerificationReport,
     fill_inputs: &'a [VerifiedFillInput],
+    economic_inputs: &'a [VerifiedEconomicInput],
 }
 
 fn evaluate_bindings(input: BindingInputs<'_>) -> Vec<ProductionEvidenceFailure> {
@@ -1782,6 +1936,166 @@ fn evaluate_bindings(input: BindingInputs<'_>) -> Vec<ProductionEvidenceFailure>
         ProductionEvidenceGate::FillReconciliation,
         &demo_accounts,
         &fill_accounts,
+    );
+
+    let mut economic_accounts = BTreeSet::new();
+    for economic in input.economic_inputs {
+        let account_id = economic.bill_manifest.account_id.as_str();
+        reject_gate(
+            &mut failures,
+            ProductionEvidenceGate::EconomicReconciliation,
+            Some(account_id),
+            economic.report.passed,
+        );
+        if !economic_accounts.insert(account_id.to_string()) {
+            failures.push(ProductionEvidenceFailure::DuplicateAccountEvidence {
+                gate: ProductionEvidenceGate::EconomicReconciliation,
+                account_id: account_id.to_string(),
+            });
+        }
+        check_demo_artifact_identity(
+            &mut failures,
+            ProductionEvidenceGate::EconomicReconciliation,
+            account_id,
+            &economic.fill_manifest.config_file.sha256,
+            &economic.fill_manifest.reap_version,
+            &economic.fill_manifest.executable_sha256,
+            &economic.fill_manifest.host_identity_sha256,
+            &economic.fill_manifest.account_identity_sha256,
+            &input,
+        );
+        check_demo_artifact_identity(
+            &mut failures,
+            ProductionEvidenceGate::EconomicReconciliation,
+            account_id,
+            &economic.bill_manifest.config_file.sha256,
+            &economic.bill_manifest.reap_version,
+            &economic.bill_manifest.executable_sha256,
+            &economic.bill_manifest.host_identity_sha256,
+            &economic.bill_manifest.account_identity_sha256,
+            &input,
+        );
+        check_binding(
+            &mut failures,
+            ProductionEvidenceGate::EconomicReconciliation,
+            Some(account_id),
+            "report_account_id",
+            account_id,
+            &economic.report.account_id,
+        );
+        check_binding(
+            &mut failures,
+            ProductionEvidenceGate::EconomicReconciliation,
+            Some(account_id),
+            "report_config_sha256",
+            &input.demo.1.file.sha256,
+            &economic.report.config_file.sha256,
+        );
+        check_binding(
+            &mut failures,
+            ProductionEvidenceGate::EconomicReconciliation,
+            Some(account_id),
+            "report_account_identity_sha256",
+            input
+                .expected
+                .demo_account_identity_sha256s
+                .get(account_id)
+                .map(String::as_str)
+                .unwrap_or(""),
+            &economic.report.account_identity_sha256,
+        );
+        let matching_fill = input
+            .fill_inputs
+            .iter()
+            .find(|fill| fill.manifest.account_id == account_id);
+        if let Some(fill) = matching_fill {
+            check_binding(
+                &mut failures,
+                ProductionEvidenceGate::EconomicReconciliation,
+                Some(account_id),
+                "fill_collection_manifest",
+                &fill.collection_manifest.to_string_lossy(),
+                &economic.fill_collection_manifest.to_string_lossy(),
+            );
+            if let Some(fill_manifest_evidence) = fill.report.collection_manifest.as_ref() {
+                check_binding(
+                    &mut failures,
+                    ProductionEvidenceGate::EconomicReconciliation,
+                    Some(account_id),
+                    "fill_manifest_evidence_path",
+                    &fill_manifest_evidence.path,
+                    &economic.report.fill_collection_manifest.path,
+                );
+                check_binding(
+                    &mut failures,
+                    ProductionEvidenceGate::EconomicReconciliation,
+                    Some(account_id),
+                    "fill_manifest_evidence_bytes",
+                    &fill_manifest_evidence.bytes.to_string(),
+                    &economic.report.fill_collection_manifest.bytes.to_string(),
+                );
+                check_binding(
+                    &mut failures,
+                    ProductionEvidenceGate::EconomicReconciliation,
+                    Some(account_id),
+                    "fill_manifest_evidence_sha256",
+                    &fill_manifest_evidence.sha256,
+                    &economic.report.fill_collection_manifest.sha256,
+                );
+            } else {
+                reject_gate(
+                    &mut failures,
+                    ProductionEvidenceGate::EconomicReconciliation,
+                    Some(account_id),
+                    false,
+                );
+            }
+            check_binding(
+                &mut failures,
+                ProductionEvidenceGate::EconomicReconciliation,
+                Some(account_id),
+                "journal",
+                &fill.journal.to_string_lossy(),
+                &economic.journal.to_string_lossy(),
+            );
+            check_binding(
+                &mut failures,
+                ProductionEvidenceGate::EconomicReconciliation,
+                Some(account_id),
+                "journal_evidence_path",
+                &fill.report.journal.path,
+                &economic.report.journal.path,
+            );
+            check_binding(
+                &mut failures,
+                ProductionEvidenceGate::EconomicReconciliation,
+                Some(account_id),
+                "journal_evidence_bytes",
+                &fill.report.journal.bytes.to_string(),
+                &economic.report.journal.bytes.to_string(),
+            );
+            check_binding(
+                &mut failures,
+                ProductionEvidenceGate::EconomicReconciliation,
+                Some(account_id),
+                "journal_evidence_sha256",
+                &fill.report.journal.sha256,
+                &economic.report.journal.sha256,
+            );
+        } else {
+            reject_gate(
+                &mut failures,
+                ProductionEvidenceGate::EconomicReconciliation,
+                Some(account_id),
+                false,
+            );
+        }
+    }
+    check_account_coverage(
+        &mut failures,
+        ProductionEvidenceGate::EconomicReconciliation,
+        &demo_accounts,
+        &economic_accounts,
     );
 
     failures.sort_by_key(failure_sort_key);
@@ -2297,6 +2611,81 @@ fn validate_manifest(manifest: &ProductionEvidenceManifest) -> Result<()> {
                 bail!("fill reconciliation {field} must be finite and non-negative");
             }
         }
+        if fill.price_tolerance != 0.0
+            || fill.quantity_tolerance != 0.0
+            || fill.fee_tolerance != 0.0
+        {
+            bail!("production fill reconciliation requires exact zero tolerances");
+        }
+    }
+    validate_count(
+        "economic_reconciliations",
+        manifest.economic_reconciliations.len(),
+        MAX_PRODUCTION_EVIDENCE_ACCOUNTS,
+    )?;
+    for economic in &manifest.economic_reconciliations {
+        if economic.minimum_trade_bills == 0 || economic.minimum_funding_bills == 0 {
+            bail!("every economic reconciliation must require trade and funding evidence");
+        }
+        if economic.maximum_trade_bill_delay_ms == 0
+            || economic.maximum_trade_bill_delay_ms > reap_live::MAX_TRADE_BILL_DELAY_MS
+            || economic.maximum_funding_bill_delay_ms == 0
+            || economic.maximum_funding_bill_delay_ms > reap_live::MAX_FUNDING_BILL_DELAY_MS
+        {
+            bail!("economic reconciliation bill delays are outside supported bounds");
+        }
+        for (field, value) in [
+            ("price_tolerance", economic.price_tolerance),
+            ("quantity_tolerance", economic.quantity_tolerance),
+            ("fee_tolerance", economic.fee_tolerance),
+            ("balance_tolerance", economic.balance_tolerance),
+            (
+                "funding_pnl_absolute_tolerance",
+                economic.funding_pnl_absolute_tolerance,
+            ),
+            (
+                "funding_pnl_relative_tolerance",
+                economic.funding_pnl_relative_tolerance,
+            ),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                bail!("economic reconciliation {field} must be finite and non-negative");
+            }
+        }
+        if economic.price_tolerance != 0.0 {
+            bail!("production economic trade-price tolerance must be zero");
+        }
+        for (field, value, maximum) in [
+            (
+                "quantity_tolerance",
+                economic.quantity_tolerance,
+                MAX_PRODUCTION_ECONOMIC_QUANTITY_TOLERANCE,
+            ),
+            (
+                "fee_tolerance",
+                economic.fee_tolerance,
+                MAX_PRODUCTION_ECONOMIC_FEE_TOLERANCE,
+            ),
+            (
+                "balance_tolerance",
+                economic.balance_tolerance,
+                MAX_PRODUCTION_ECONOMIC_BALANCE_TOLERANCE,
+            ),
+            (
+                "funding_pnl_absolute_tolerance",
+                economic.funding_pnl_absolute_tolerance,
+                MAX_PRODUCTION_ECONOMIC_FUNDING_ABSOLUTE_TOLERANCE,
+            ),
+            (
+                "funding_pnl_relative_tolerance",
+                economic.funding_pnl_relative_tolerance,
+                MAX_PRODUCTION_ECONOMIC_FUNDING_RELATIVE_TOLERANCE,
+            ),
+        ] {
+            if value > maximum {
+                bail!("production economic {field} must be at most {maximum}, got {value}");
+            }
+        }
     }
     Ok(())
 }
@@ -2359,6 +2748,11 @@ fn validate_freshness_policy(policy: &ProductionEvidenceFreshnessPolicy) -> Resu
             "fill_collection_max_age_ms",
             policy.fill_collection_max_age_ms,
             MAX_FILL_COLLECTION_AGE_MS,
+        ),
+        (
+            "bill_collection_max_age_ms",
+            policy.bill_collection_max_age_ms,
+            MAX_BILL_COLLECTION_AGE_MS,
         ),
     ] {
         if value == 0 || value > maximum {
@@ -2480,6 +2874,57 @@ fn resolve_manifest(loaded: &LoadedManifest) -> Result<ResolvedManifest> {
             },
         });
     }
+    let mut economic_reconciliations = Vec::with_capacity(value.economic_reconciliations.len());
+    let mut economic_bill_manifests = HashSet::new();
+    let mut economic_fill_manifests = HashSet::new();
+    for input in &value.economic_reconciliations {
+        let fill_collection_manifest = resolve_regular_file(
+            base,
+            &input.fill_collection_manifest,
+            "economic fill collection manifest",
+        )?;
+        let bill_collection_manifest = resolve_regular_file(
+            base,
+            &input.bill_collection_manifest,
+            "economic bill collection manifest",
+        )?;
+        let journal = resolve_regular_file(base, &input.journal, "economic journal")?;
+        if fill_collection_manifest == bill_collection_manifest
+            || fill_collection_manifest == journal
+            || bill_collection_manifest == journal
+        {
+            bail!("economic fill manifest, bill manifest, and journal must be distinct files");
+        }
+        if !economic_fill_manifests.insert(fill_collection_manifest.clone()) {
+            bail!(
+                "duplicate economic fill collection manifest {}",
+                fill_collection_manifest.display()
+            );
+        }
+        if !economic_bill_manifests.insert(bill_collection_manifest.clone()) {
+            bail!(
+                "duplicate economic bill collection manifest {}",
+                bill_collection_manifest.display()
+            );
+        }
+        economic_reconciliations.push(ResolvedEconomicInput {
+            fill_collection_manifest,
+            bill_collection_manifest,
+            journal,
+            minimum_trade_bills: input.minimum_trade_bills,
+            minimum_funding_bills: input.minimum_funding_bills,
+            maximum_trade_bill_delay_ms: input.maximum_trade_bill_delay_ms,
+            maximum_funding_bill_delay_ms: input.maximum_funding_bill_delay_ms,
+            tolerances: EconomicReconciliationTolerances {
+                price_abs: input.price_tolerance,
+                quantity_abs: input.quantity_tolerance,
+                fee_abs: input.fee_tolerance,
+                balance_abs: input.balance_tolerance,
+                funding_pnl_abs: input.funding_pnl_absolute_tolerance,
+                funding_pnl_relative: input.funding_pnl_relative_tolerance,
+            },
+        });
+    }
     Ok(ResolvedManifest {
         demo_config,
         production_config,
@@ -2496,6 +2941,7 @@ fn resolve_manifest(loaded: &LoadedManifest) -> Result<ResolvedManifest> {
         deadman_certifications,
         emergency_cancel_report,
         fill_reconciliations,
+        economic_reconciliations,
     })
 }
 
@@ -2620,7 +3066,7 @@ mod tests {
     fn manifest_toml(extra: &str) -> String {
         format!(
             r#"
-schema_version = 4
+schema_version = 5
 expected_reap_version = "0.1.0"
 expected_live_executable_sha256 = "{}"
 expected_host_identity_sha256 = "{}"
@@ -2700,6 +3146,7 @@ production_account_certification_max_age_ms = 600000
 deadman_certification_max_age_ms = 3600000
 emergency_cancel_max_age_ms = 3600000
 fill_collection_max_age_ms = 3600000
+bill_collection_max_age_ms = 3600000
 
 [expected_demo_account_identity_sha256s]
 main = "{}"
@@ -2715,6 +3162,15 @@ journal = "journal.jsonl"
 collection_manifest = "fills/manifest.json"
 journal = "journal.jsonl"
 minimum_fills = 1
+
+[[economic_reconciliations]]
+fill_collection_manifest = "fills/manifest.json"
+bill_collection_manifest = "bills/manifest.json"
+journal = "journal.jsonl"
+minimum_trade_bills = 1
+minimum_funding_bills = 1
+maximum_trade_bill_delay_ms = 60000
+maximum_funding_bill_delay_ms = 60000
 {extra}
 "#,
             "1".repeat(64),
@@ -2742,12 +3198,34 @@ minimum_fills = 1
     }
 
     #[test]
-    fn manifest_rejects_zero_fill_threshold_and_invalid_identity() {
+    fn manifest_rejects_weak_reconciliation_and_invalid_identity() {
         let mut parsed: ProductionEvidenceManifest = toml::from_str(&manifest_toml("")).unwrap();
         parsed.fill_reconciliations[0].minimum_fills = 0;
         assert!(validate_manifest(&parsed).is_err());
 
         parsed.fill_reconciliations[0].minimum_fills = 1;
+        parsed.economic_reconciliations[0].minimum_funding_bills = 0;
+        assert!(validate_manifest(&parsed).is_err());
+
+        parsed.economic_reconciliations[0].minimum_funding_bills = 1;
+        parsed.economic_reconciliations[0].maximum_funding_bill_delay_ms =
+            reap_live::MAX_FUNDING_BILL_DELAY_MS + 1;
+        assert!(validate_manifest(&parsed).is_err());
+
+        parsed.economic_reconciliations[0].maximum_funding_bill_delay_ms = 60_000;
+        parsed.fill_reconciliations[0].fee_tolerance = f64::EPSILON;
+        assert!(validate_manifest(&parsed).is_err());
+
+        parsed.fill_reconciliations[0].fee_tolerance = 0.0;
+        parsed.economic_reconciliations[0].price_tolerance = f64::EPSILON;
+        assert!(validate_manifest(&parsed).is_err());
+
+        parsed.economic_reconciliations[0].price_tolerance = 0.0;
+        parsed.economic_reconciliations[0].balance_tolerance =
+            MAX_PRODUCTION_ECONOMIC_BALANCE_TOLERANCE * 2.0;
+        assert!(validate_manifest(&parsed).is_err());
+
+        parsed.economic_reconciliations[0].balance_tolerance = 0.0;
         parsed.expected_host_identity_sha256 = "ABC".to_string();
         assert!(validate_manifest(&parsed).is_err());
 
@@ -2781,6 +3259,7 @@ minimum_fills = 1
             deadman_certification_max_age_ms: 100,
             emergency_cancel_max_age_ms: 100,
             fill_collection_max_age_ms: 100,
+            bill_collection_max_age_ms: 100,
         };
         let mut observations = Vec::new();
         let mut failures = Vec::new();

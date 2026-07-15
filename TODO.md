@@ -217,6 +217,11 @@ architecture in [docs/architecture.md](docs/architecture.md).
   private channels, paginate recent-fill recovery to a proven short page with a
   fail-closed bound, and add authenticated create-new collection plus verified
   journal-to-raw-OKX fill/fee evidence.
+- [x] Add authenticated account-wide OKX bill collection with exact raw-page and
+  cursor reconstruction, then reconcile normal trade and realized funding bills
+  against verified fills and a streaming pass over the stopped journal. Bind one
+  passing economic gate per demo account into production evidence schema 5 and
+  preserve the pinned Java bill field/type mapping.
 - [x] Pin the Rust toolchain and add least-privilege GitHub CI for formatting,
   all-target lint, workspace tests, release build, and RustSec audit, with weekly
   Cargo and Actions update proposals.
@@ -294,8 +299,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
   and cross-binds the exact official-demo/production configs, deterministically
   derived routed fault config, release binary, target host, deployment candidate,
   and separate demo/production account identities across transition, research,
-  soak, fault, latency, account, deadman, emergency, and authenticated fill/fee
-  gates. It never authorizes production entry.
+  soak, fault, latency, account, deadman, emergency, authenticated fill/fee, and
+  account-wide trade/funding economic gates. It never authorizes production
+  entry.
 - [x] Require a bounded schema-2 freshness policy for every operational source
   in the aggregate bundle. Reverify fault/latency live reports, preserve typed
   proxy command times, require those commands to occur inside their live
@@ -303,7 +309,7 @@ architecture in [docs/architecture.md](docs/architecture.md).
   maximum ages.
 - [x] Add binary/host provenance and independently re-derived clean-shutdown
   fields to schema-2 fault-proxy process reports, expose an offline source
-  verifier, and require schema-4 production bundles to provide one unique proxy
+  verifier, and require schema-5 production bundles to provide one unique proxy
   session enclosing exactly each fault-matrix live run.
 - [ ] Calibrate queue position, latency, fees, funding, and slippage from
   captured full-depth data, then run and archive production-candidate
@@ -313,11 +319,15 @@ architecture in [docs/architecture.md](docs/architecture.md).
   calibration artifact; empirical queue and populated per-class/per-instrument
   latency distributions, target-tier simulated-fee calibration, complete
   funding intervals, a passing real target-account cash/zero-liability artifact,
-  a passing authenticated fill/fee reconciliation artifact, and broader
-  economic statement reconciliation are still required. Exact signed private-fill
-  fee amount/currency is retained end to end; collection and verification are
-  implemented but no demo evidence exists. Margin spot is unsupported and would
-  require a borrow-interest model before enablement.
+  and passing authenticated fill/bill economic artifacts are still required.
+  Exact signed private-fill fee amount/currency is retained end to end and
+  normal trade/funding bill reconstruction is implemented, but no demo evidence
+  exists. Cash-spot bill units need empirical target-account proof, derivative
+  close PnL needs independently attested opening cost basis, the exact funding
+  settlement mark needs an independent source, and complete
+  balance/equity/currency-conversion reconciliation remains outstanding. Margin
+  spot is unsupported and would require a borrow-interest model before
+  enablement.
 - [x] Require a verified schema-3 capture run report for every
   production-candidate raw dataset, bind optional normalized output, embed the
   verification result, and recheck all artifact hashes after research runs.

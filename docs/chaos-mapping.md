@@ -83,6 +83,29 @@ account certification artifact and periodic authenticated config-drift check
 have no pinned Java counterpart; they are deliberate production-safety
 strengthenings, not claimed strategy parity.
 
+## Account Bill Evidence Cross-Check
+
+The offline economic evidence path is cross-checked against these pinned OKX
+Java sources:
+
+| Java reference | Rust implementation | Qualification |
+| --- | --- | --- |
+| `BillDetails` | Strict `OkxBill` parser for balance, position, price, quantity, PnL, fee, account, instrument, margin, execution, order, bill type/subtype, and timestamp fields, plus current trade/client identities | Rust rejects malformed numeric and enum fields instead of applying Java's zero/NaN defaults |
+| `OkexV5BillFetchTaskImpl` | Authenticated account-wide closed-window collector with exact raw pages, bounded pacing, cursor reconstruction, and a required short terminal page | Java fetches one configured type, reverses each response into oldest-first publication, and advances `lastFetchedId`; Rust proves bounded historical completeness for evidence instead of publishing into the strategy loop |
+| `OkexV5BillTypes` | Funding type `8`, subtypes `173` and `174` | Exact pinned mapping; Rust additionally validates normal trade type `2` for statement reconciliation and rejects every other bill in the controlled window |
+| `OkexV5ExchBillConverter` | Bill identity and economic fields retained in the reconciliation report | Equivalent field boundary, with stricter source/config/account binding and no pooled live message |
+
+The Java samples `BillDetailsSwap.json` and `BillDetailsSwap2.json` also establish
+that funding bills can arrive shortly after the scheduled settlement. Rust
+therefore uses a bounded causal delay, matches the bill to the session-local
+journaled realized rate and signed position, and recomputes the linear or inverse
+contract formula. It does not reuse the forecast funding rate. The exact
+settlement mark remains bill-sourced and must be independently attested in the
+production review. Cash-spot quantity/currency semantics are a
+current API evidence boundary not established by these Java samples; a passing
+credentialed demo collection for the exact target account is required before
+that path can support production approval.
+
 ## Backtest Execution Cross-Check
 
 The Rust scheduler was cross-checked against the pinned Java

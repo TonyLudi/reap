@@ -834,6 +834,7 @@ fn validate_request(
         crate::production_evidence::ProductionEvidenceGate::DeadmanCertification,
         crate::production_evidence::ProductionEvidenceGate::EmergencyCancel,
         crate::production_evidence::ProductionEvidenceGate::FillReconciliation,
+        crate::production_evidence::ProductionEvidenceGate::EconomicReconciliation,
     ] {
         if !observed_gates.contains(&gate) {
             bail!("production approval request is missing required evidence gate {gate:?}");
@@ -1142,6 +1143,7 @@ mod tests {
             ProductionEvidenceGate::DeadmanCertification,
             ProductionEvidenceGate::EmergencyCancel,
             ProductionEvidenceGate::FillReconciliation,
+            ProductionEvidenceGate::EconomicReconciliation,
         ]
         .into_iter()
         .map(|gate| ProductionEvidenceApprovalGate {
@@ -1180,6 +1182,7 @@ mod tests {
                 deadman_certification_max_age_ms: 1,
                 emergency_cancel_max_age_ms: 1,
                 fill_collection_max_age_ms: 1,
+                bill_collection_max_age_ms: 1,
             },
             freshness_observations: vec![ProductionEvidenceApprovalFreshnessObservation {
                 gate: ProductionEvidenceGate::DemoSoak,

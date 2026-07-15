@@ -29,7 +29,9 @@ const ACCOUNT_TRADE_FEE_PATH: &str = "/api/v5/account/trade-fee";
 const ACCOUNT_CONFIG_PATH: &str = "/api/v5/account/config";
 const ACCOUNT_BALANCE_PATH: &str = "/api/v5/account/balance";
 const ACCOUNT_POSITIONS_PATH: &str = "/api/v5/account/positions";
+const ACCOUNT_BILLS_PATH: &str = "/api/v5/account/bills";
 pub const OKX_FILLS_PAGE_LIMIT: usize = 100;
+pub const OKX_BILLS_PAGE_LIMIT: usize = 100;
 pub const OKX_MIN_ACCOUNT_INSTRUMENT_REQUEST_INTERVAL_MS: u64 = 100;
 pub const OKX_MIN_TRADE_FEE_REQUEST_INTERVAL_MS: u64 = 400;
 
@@ -52,6 +54,20 @@ pub fn parse_okx_fill_page_response_json(body: &[u8]) -> Result<OkxFillPage, Res
         });
     }
     okx_fill_page(response.data)
+}
+
+/// Parses one unmodified account-bills page and derives its next `after`
+/// cursor. The account-wide endpoint is the economic statement source used by
+/// the pinned Java `BillDetails`/`OkexV5BillFetchTask` path.
+pub fn parse_okx_bill_page_response_json(body: &[u8]) -> Result<OkxBillPage, RestError> {
+    let response: OkxResponse<OkxBillWire> = serde_json::from_slice(body)?;
+    if response.code != "0" {
+        return Err(RestError::Api {
+            code: response.code,
+            message: response.message,
+        });
+    }
+    okx_bill_page(response.data)
 }
 
 /// Parses an unmodified OKX account-configuration response.
@@ -191,6 +207,35 @@ fn okx_fill_page(data: Vec<OkxFillWire>) -> Result<OkxFillPage, RestError> {
     Ok(OkxFillPage { fills, next_after })
 }
 
+fn okx_bill_page(data: Vec<OkxBillWire>) -> Result<OkxBillPage, RestError> {
+    if data.len() > OKX_BILLS_PAGE_LIMIT {
+        return Err(RestError::InvalidField {
+            field: "data",
+            value: data.len().to_string(),
+            message: format!("bill page exceeded the requested limit {OKX_BILLS_PAGE_LIMIT}"),
+        });
+    }
+    let next_after = if data.len() == OKX_BILLS_PAGE_LIMIT {
+        let bill_id = data
+            .last()
+            .map(|bill| bill.bill_id.trim())
+            .filter(|bill_id| !bill_id.is_empty())
+            .ok_or_else(|| RestError::InvalidField {
+                field: "billId",
+                value: String::new(),
+                message: "a full bill page requires a pagination cursor".to_string(),
+            })?;
+        Some(bill_id.to_string())
+    } else {
+        None
+    };
+    let bills = data
+        .into_iter()
+        .map(OkxBill::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(OkxBillPage { bills, next_after })
+}
+
 #[derive(Debug, Error)]
 pub enum RestError {
     #[error("request authentication failed: {0}")]
@@ -221,6 +266,18 @@ pub enum RestError {
     FillPaginationCursor { cursor: String },
     #[error("OKX fill pagination repeated fill {symbol}/{fill_id}")]
     FillPaginationDuplicate { symbol: String, fill_id: String },
+    #[error(
+        "OKX bill pagination reached the configured limit after {pages} pages and {records} records; next after={next_after}"
+    )]
+    BillPaginationLimit {
+        pages: usize,
+        records: usize,
+        next_after: String,
+    },
+    #[error("OKX bill pagination repeated cursor {cursor}")]
+    BillPaginationCursor { cursor: String },
+    #[error("OKX bill pagination repeated bill {bill_id}")]
+    BillPaginationDuplicate { bill_id: String },
 }
 
 impl RestError {
@@ -714,6 +771,74 @@ pub struct OkxRawFillPage {
     pub page: OkxFillPage,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OkxBillExecutionType {
+    Maker,
+    Taker,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OkxBillMarginMode {
+    Cash,
+    Cross,
+    Isolated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OkxBillAccountType {
+    Funding,
+    Trading,
+}
+
+/// One balance-changing OKX account bill.
+///
+/// This retains the pinned Java `BillDetails` fields and the current trade
+/// identity fields required to bind trade bills back to exact fills.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OkxBill {
+    pub bill_id: String,
+    pub bill_type: String,
+    pub sub_type: String,
+    pub timestamp_ms: u64,
+    pub currency: String,
+    pub balance_change: f64,
+    pub balance: Option<f64>,
+    pub position_balance_change: Option<f64>,
+    pub position_balance: Option<f64>,
+    pub quantity: Option<f64>,
+    pub price: Option<f64>,
+    pub pnl: Option<f64>,
+    pub fee: Option<f64>,
+    pub interest: Option<f64>,
+    pub instrument_type: Option<OkxInstrumentType>,
+    pub symbol: String,
+    pub margin_mode: Option<OkxBillMarginMode>,
+    pub order_id: String,
+    pub client_order_id: String,
+    pub trade_id: String,
+    pub fill_time_ms: Option<u64>,
+    pub execution_type: Option<OkxBillExecutionType>,
+    pub from_account: Option<OkxBillAccountType>,
+    pub to_account: Option<OkxBillAccountType>,
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OkxBillPage {
+    pub bills: Vec<OkxBill>,
+    pub next_after: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OkxRawBillPage {
+    pub request_path: String,
+    pub response_body: String,
+    pub page: OkxBillPage,
+}
+
 #[derive(Debug)]
 pub struct OkxFillPagination {
     max_pages: usize,
@@ -781,6 +906,71 @@ impl OkxFillPagination {
 
     pub fn into_fills(self) -> Vec<RemoteFill> {
         self.fills
+    }
+}
+
+#[derive(Debug)]
+pub struct OkxBillPagination {
+    max_pages: usize,
+    pages: usize,
+    bills: Vec<OkxBill>,
+    after: Option<String>,
+    seen_cursors: HashSet<String>,
+    seen_bills: HashSet<String>,
+}
+
+impl OkxBillPagination {
+    pub fn new(max_pages: usize) -> Result<Self, RestError> {
+        if max_pages == 0 {
+            return Err(RestError::InvalidField {
+                field: "max_pages",
+                value: max_pages.to_string(),
+                message: "must be positive".to_string(),
+            });
+        }
+        Ok(Self {
+            max_pages,
+            pages: 0,
+            bills: Vec::new(),
+            after: None,
+            seen_cursors: HashSet::new(),
+            seen_bills: HashSet::new(),
+        })
+    }
+
+    pub fn after(&self) -> Option<&str> {
+        self.after.as_deref()
+    }
+
+    pub fn accept(&mut self, page: OkxBillPage) -> Result<bool, RestError> {
+        self.pages += 1;
+        for bill in page.bills {
+            if !self.seen_bills.insert(bill.bill_id.clone()) {
+                return Err(RestError::BillPaginationDuplicate {
+                    bill_id: bill.bill_id,
+                });
+            }
+            self.bills.push(bill);
+        }
+        let Some(next_after) = page.next_after else {
+            return Ok(true);
+        };
+        if !self.seen_cursors.insert(next_after.clone()) {
+            return Err(RestError::BillPaginationCursor { cursor: next_after });
+        }
+        if self.pages == self.max_pages {
+            return Err(RestError::BillPaginationLimit {
+                pages: self.pages,
+                records: self.bills.len(),
+                next_after,
+            });
+        }
+        self.after = Some(next_after);
+        Ok(false)
+    }
+
+    pub fn into_bills(self) -> Vec<OkxBill> {
+        self.bills
     }
 }
 
@@ -1127,6 +1317,76 @@ where
                 .await?;
             if pagination.accept(page)? {
                 return Ok(pagination.into_fills());
+            }
+        }
+    }
+
+    /// Retrieves one account-wide bill page for an inclusive closed window
+    /// while retaining the exact response body.
+    pub async fn account_bills_page_raw(
+        &self,
+        begin_ms: u64,
+        end_ms: u64,
+        after: Option<&str>,
+    ) -> Result<OkxRawBillPage, RestError> {
+        self.account_bills_page_raw_at(&timestamp_now(), begin_ms, end_ms, after)
+            .await
+    }
+
+    pub async fn account_bills_page_raw_at(
+        &self,
+        timestamp: &str,
+        begin_ms: u64,
+        end_ms: u64,
+        after: Option<&str>,
+    ) -> Result<OkxRawBillPage, RestError> {
+        if begin_ms == 0 || end_ms == 0 || begin_ms > end_ms {
+            return Err(RestError::InvalidField {
+                field: "begin/end",
+                value: format!("{begin_ms}/{end_ms}"),
+                message: "must be a positive inclusive window".to_string(),
+            });
+        }
+        let begin = begin_ms.to_string();
+        let end = end_ms.to_string();
+        let path = query_path(
+            ACCOUNT_BILLS_PATH,
+            [
+                ("begin", Some(begin.as_str())),
+                ("end", Some(end.as_str())),
+                ("after", after),
+                ("limit", Some("100")),
+            ],
+        );
+        let request = self
+            .signer
+            .sign_request(timestamp, HttpMethod::Get, path.clone(), "")?;
+        let response = self.transport.execute(request).await?;
+        let page = parse_okx_bill_page_response_json(response.body.as_bytes())?;
+        Ok(OkxRawBillPage {
+            request_path: path,
+            response_body: response.body,
+            page,
+        })
+    }
+
+    /// Retrieves complete account-wide bill pages up to a fail-closed bound.
+    /// Callers are responsible for pacing the five-requests-per-two-seconds
+    /// account endpoint.
+    pub async fn account_bills_paginated(
+        &self,
+        begin_ms: u64,
+        end_ms: u64,
+        max_pages: usize,
+    ) -> Result<Vec<OkxBill>, RestError> {
+        let mut pagination = OkxBillPagination::new(max_pages)?;
+        loop {
+            let page = self
+                .account_bills_page_raw(begin_ms, end_ms, pagination.after())
+                .await?
+                .page;
+            if pagination.accept(page)? {
+                return Ok(pagination.into_bills());
             }
         }
     }
@@ -2420,6 +2680,119 @@ impl TryFrom<OkxOrderWire> for OkxOrderDetails {
 }
 
 #[derive(Debug, Deserialize)]
+struct OkxBillWire {
+    #[serde(default, rename = "billId")]
+    bill_id: String,
+    #[serde(default, rename = "type")]
+    bill_type: String,
+    #[serde(default, rename = "subType")]
+    sub_type: String,
+    #[serde(default, rename = "ts")]
+    timestamp: String,
+    #[serde(default, rename = "ccy")]
+    currency: String,
+    #[serde(default, rename = "balChg")]
+    balance_change: String,
+    #[serde(default, rename = "bal")]
+    balance: String,
+    #[serde(default, rename = "posBalChg")]
+    position_balance_change: String,
+    #[serde(default, rename = "posBal")]
+    position_balance: String,
+    #[serde(default, rename = "sz")]
+    quantity: String,
+    #[serde(default, rename = "px")]
+    price: String,
+    #[serde(default, rename = "pnl")]
+    pnl: String,
+    #[serde(default, rename = "fee")]
+    fee: String,
+    #[serde(default, rename = "interest")]
+    interest: String,
+    #[serde(default, rename = "instType")]
+    instrument_type: String,
+    #[serde(default, rename = "instId")]
+    symbol: String,
+    #[serde(default, rename = "mgnMode")]
+    margin_mode: String,
+    #[serde(default, rename = "ordId")]
+    order_id: String,
+    #[serde(default, rename = "clOrdId")]
+    client_order_id: String,
+    #[serde(default, rename = "tradeId")]
+    trade_id: String,
+    #[serde(default, rename = "fillTime")]
+    fill_time: String,
+    #[serde(default, rename = "execType")]
+    execution_type: String,
+    #[serde(default, rename = "from")]
+    from_account: String,
+    #[serde(default, rename = "to")]
+    to_account: String,
+    #[serde(default, rename = "notes")]
+    notes: String,
+}
+
+impl TryFrom<OkxBillWire> for OkxBill {
+    type Error = RestError;
+
+    fn try_from(value: OkxBillWire) -> Result<Self, Self::Error> {
+        validate_required_text("billId", &value.bill_id)?;
+        validate_ascii_digits("type", &value.bill_type)?;
+        validate_ascii_digits("subType", &value.sub_type)?;
+        validate_required_text("ccy", &value.currency)?;
+        let timestamp_ms = parse_integer("ts", &value.timestamp)?;
+        if timestamp_ms == 0 {
+            return Err(RestError::InvalidField {
+                field: "ts",
+                value: value.timestamp,
+                message: "must be positive".to_string(),
+            });
+        }
+        let symbol = validate_optional_text("instId", value.symbol)?;
+        let order_id = validate_optional_text("ordId", value.order_id)?;
+        let client_order_id = match validate_optional_text("clOrdId", value.client_order_id)? {
+            value if value == "0" => String::new(),
+            value => value,
+        };
+        let trade_id = match validate_optional_text("tradeId", value.trade_id)? {
+            value if value == "0" => String::new(),
+            value => value,
+        };
+        Ok(Self {
+            bill_id: value.bill_id,
+            bill_type: value.bill_type,
+            sub_type: value.sub_type,
+            timestamp_ms,
+            currency: value.currency.to_ascii_uppercase(),
+            balance_change: parse_number("balChg", &value.balance_change)?,
+            balance: parse_nullable_number("bal", &value.balance)?,
+            position_balance_change: parse_nullable_number(
+                "posBalChg",
+                &value.position_balance_change,
+            )?,
+            position_balance: parse_nullable_number("posBal", &value.position_balance)?,
+            quantity: parse_nullable_number("sz", &value.quantity)?,
+            price: parse_nullable_number("px", &value.price)?,
+            pnl: parse_nullable_number("pnl", &value.pnl)?,
+            fee: parse_nullable_number("fee", &value.fee)?,
+            interest: parse_nullable_number("interest", &value.interest)?,
+            instrument_type: parse_optional_instrument_type(&value.instrument_type)?,
+            symbol,
+            margin_mode: parse_bill_margin_mode(&value.margin_mode)?,
+            order_id,
+            client_order_id,
+            trade_id,
+            fill_time_ms: parse_nullable_integer("fillTime", &value.fill_time)?,
+            execution_type: parse_bill_execution_type(&value.execution_type)?,
+            from_account: parse_bill_account_type("from", &value.from_account)?,
+            to_account: parse_bill_account_type("to", &value.to_account)?,
+            notes: value.notes,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct OkxFillWire {
     #[serde(default, rename = "billId")]
     bill_id: String,
@@ -2518,6 +2891,29 @@ fn validate_required_text(field: &'static str, value: &str) -> Result<(), RestEr
     Ok(())
 }
 
+fn validate_ascii_digits(field: &'static str, value: &str) -> Result<(), RestError> {
+    validate_required_text(field, value)?;
+    if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(RestError::InvalidField {
+            field,
+            value: value.to_string(),
+            message: "must contain only ASCII digits".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_optional_text(field: &'static str, value: String) -> Result<String, RestError> {
+    if value.trim() != value {
+        return Err(RestError::InvalidField {
+            field,
+            value,
+            message: "must contain no surrounding whitespace".to_string(),
+        });
+    }
+    Ok(value)
+}
+
 fn parse_side(value: &str) -> Result<Side, RestError> {
     match value {
         "buy" => Ok(Side::Buy),
@@ -2541,6 +2937,57 @@ fn parse_instrument_type(value: &str) -> Result<OkxInstrumentType, RestError> {
             field: "instType",
             value: value.to_string(),
             message: "unsupported instrument type".to_string(),
+        }),
+    }
+}
+
+fn parse_optional_instrument_type(value: &str) -> Result<Option<OkxInstrumentType>, RestError> {
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        parse_instrument_type(value).map(Some)
+    }
+}
+
+fn parse_bill_execution_type(value: &str) -> Result<Option<OkxBillExecutionType>, RestError> {
+    match value {
+        "" => Ok(None),
+        "M" => Ok(Some(OkxBillExecutionType::Maker)),
+        "T" => Ok(Some(OkxBillExecutionType::Taker)),
+        other => Err(RestError::InvalidField {
+            field: "execType",
+            value: other.to_string(),
+            message: "expected M or T".to_string(),
+        }),
+    }
+}
+
+fn parse_bill_margin_mode(value: &str) -> Result<Option<OkxBillMarginMode>, RestError> {
+    match value {
+        "" => Ok(None),
+        "cash" => Ok(Some(OkxBillMarginMode::Cash)),
+        "cross" => Ok(Some(OkxBillMarginMode::Cross)),
+        "isolated" => Ok(Some(OkxBillMarginMode::Isolated)),
+        other => Err(RestError::InvalidField {
+            field: "mgnMode",
+            value: other.to_string(),
+            message: "expected cash, cross, or isolated".to_string(),
+        }),
+    }
+}
+
+fn parse_bill_account_type(
+    field: &'static str,
+    value: &str,
+) -> Result<Option<OkxBillAccountType>, RestError> {
+    match value {
+        "" => Ok(None),
+        "6" => Ok(Some(OkxBillAccountType::Funding)),
+        "18" => Ok(Some(OkxBillAccountType::Trading)),
+        other => Err(RestError::InvalidField {
+            field,
+            value: other.to_string(),
+            message: "expected account type 6 or 18".to_string(),
         }),
     }
 }
@@ -2727,6 +3174,22 @@ fn parse_optional_integer(field: &'static str, value: &str) -> Result<u64, RestE
     }
 }
 
+fn parse_nullable_integer(field: &'static str, value: &str) -> Result<Option<u64>, RestError> {
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        let parsed = parse_integer(field, value)?;
+        if parsed == 0 {
+            return Err(RestError::InvalidField {
+                field,
+                value: value.to_string(),
+                message: "must be positive when present".to_string(),
+            });
+        }
+        Ok(Some(parsed))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -2783,6 +3246,41 @@ mod tests {
                     "fee": "-0.00001",
                     "feeCcy": "BTC",
                     "fillTime": "1000"
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({"code": "0", "msg": "", "data": data}).to_string()
+    }
+
+    fn bill_response(first: usize, count: usize) -> String {
+        let data = (first..first + count)
+            .map(|index| {
+                serde_json::json!({
+                    "bal": "1000.01",
+                    "balChg": "0.01",
+                    "billId": format!("bill-{index}"),
+                    "ccy": "USDT",
+                    "clOrdId": format!("client-{index}"),
+                    "execType": "M",
+                    "fee": "-0.01",
+                    "fillTime": "1000",
+                    "from": "",
+                    "instId": "BTC-USDT-SWAP",
+                    "instType": "SWAP",
+                    "interest": "0",
+                    "mgnMode": "cross",
+                    "notes": "",
+                    "ordId": format!("order-{index}"),
+                    "pnl": "0.02",
+                    "posBal": "2",
+                    "posBalChg": "1",
+                    "px": "50000",
+                    "subType": "3",
+                    "sz": "1",
+                    "to": "",
+                    "tradeId": format!("trade-{index}"),
+                    "ts": "1001",
+                    "type": "2"
                 })
             })
             .collect::<Vec<_>>();
@@ -3348,6 +3846,113 @@ mod tests {
         assert!(matches!(
             error,
             RestError::FillPaginationLimit {
+                pages: 1,
+                records: 100,
+                ref next_after,
+            } if next_after == "bill-199"
+        ));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn account_bill_parser_preserves_java_and_current_trade_fields() {
+        let response = br#"{"code":"0","msg":"","data":[{"bal":"0.125","balChg":"-0.00025","billId":"123","ccy":"btc","clOrdId":"reap-1","execType":"T","fee":"0","fillTime":"2001","from":"6","instId":"BTC-USD-SWAP","instType":"SWAP","interest":"0","mgnMode":"cross","notes":"funding","ordId":"456","pnl":"-0.00025","posBal":"10","posBalChg":"0","px":"50000","subType":"173","sz":"10","to":"18","tradeId":"789","ts":"2000","type":"8"}]}"#;
+
+        let page = parse_okx_bill_page_response_json(response).unwrap();
+
+        assert_eq!(page.next_after, None);
+        assert_eq!(page.bills.len(), 1);
+        assert_eq!(
+            page.bills[0],
+            OkxBill {
+                bill_id: "123".to_string(),
+                bill_type: "8".to_string(),
+                sub_type: "173".to_string(),
+                timestamp_ms: 2_000,
+                currency: "BTC".to_string(),
+                balance_change: -0.00025,
+                balance: Some(0.125),
+                position_balance_change: Some(0.0),
+                position_balance: Some(10.0),
+                quantity: Some(10.0),
+                price: Some(50_000.0),
+                pnl: Some(-0.00025),
+                fee: Some(0.0),
+                interest: Some(0.0),
+                instrument_type: Some(OkxInstrumentType::Swap),
+                symbol: "BTC-USD-SWAP".to_string(),
+                margin_mode: Some(OkxBillMarginMode::Cross),
+                order_id: "456".to_string(),
+                client_order_id: "reap-1".to_string(),
+                trade_id: "789".to_string(),
+                fill_time_ms: Some(2_001),
+                execution_type: Some(OkxBillExecutionType::Taker),
+                from_account: Some(OkxBillAccountType::Funding),
+                to_account: Some(OkxBillAccountType::Trading),
+                notes: "funding".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn account_bill_parser_rejects_malformed_economic_identity() {
+        let response = |bill_type: &str, from: &str, balance_change: &str| {
+            format!(
+                r#"{{"code":"0","msg":"","data":[{{"billId":"1","type":"{bill_type}","subType":"173","ts":"1000","ccy":"USDT","balChg":"{balance_change}","from":"{from}"}}]}}"#
+            )
+        };
+
+        let error = parse_okx_bill_page_response_json(response("funding", "", "1").as_bytes())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("type"));
+
+        let error = parse_okx_bill_page_response_json(response("8", "7", "1").as_bytes())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("from"));
+
+        let error = parse_okx_bill_page_response_json(response("8", "", "NaN").as_bytes())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("balChg"));
+    }
+
+    #[tokio::test]
+    async fn account_bill_collection_paginates_complete_closed_window() {
+        let (client, requests) = client_owned(vec![bill_response(100, 100), bill_response(200, 2)]);
+
+        let bills = client
+            .account_bills_paginated(1_000, 2_000, 3)
+            .await
+            .unwrap();
+
+        assert_eq!(bills.len(), 102);
+        assert_eq!(bills.first().unwrap().bill_id, "bill-100");
+        assert_eq!(bills.last().unwrap().bill_id, "bill-201");
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests[0].path,
+            "/api/v5/account/bills?begin=1000&end=2000&limit=100"
+        );
+        assert_eq!(
+            requests[1].path,
+            "/api/v5/account/bills?begin=1000&end=2000&after=bill-199&limit=100"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_bill_collection_fails_closed_at_page_bound() {
+        let (client, requests) = client_owned(vec![bill_response(100, 100)]);
+
+        let error = client
+            .account_bills_paginated(1_000, 2_000, 1)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RestError::BillPaginationLimit {
                 pages: 1,
                 records: 100,
                 ref next_after,

@@ -200,7 +200,7 @@ enum Command {
         #[arg(
             short,
             long,
-            help = "Strict schema-4 production evidence TOML manifest"
+            help = "Strict schema-5 production evidence TOML manifest"
         )]
         manifest: PathBuf,
         #[arg(
@@ -231,7 +231,7 @@ enum Command {
     },
     #[command(
         about = "Validate and fingerprint a production approval policy",
-        long_about = "Strictly parse the two-role Ed25519 approval policy, reject unknown fields, duplicate identities or keys, missing role coverage, and unsafe lifetimes, then report the exact file SHA-256 to predeclare in the schema-4 production evidence manifest."
+        long_about = "Strictly parse the two-role Ed25519 approval policy, reject unknown fields, duplicate identities or keys, missing role coverage, and unsafe lifetimes, then report the exact file SHA-256 to predeclare in the schema-5 production evidence manifest."
     )]
     VerifyProductionApprovalPolicy {
         #[arg(short, long, help = "Strict production approval policy TOML")]
@@ -247,10 +247,10 @@ enum Command {
     },
     #[command(
         about = "Prepare a short-lived production approval request",
-        long_about = "Rerun the complete schema-4 production evidence bundle, require it to pass, bind its stable review subject to the predeclared exact two-role approval policy, and create a short-lived request. This does not authorize or enable production order entry."
+        long_about = "Rerun the complete schema-5 production evidence bundle, require it to pass, bind its stable review subject to the predeclared exact two-role approval policy, and create a short-lived request. This does not authorize or enable production order entry."
     )]
     PrepareProductionApproval {
-        #[arg(short, long, help = "Strict schema-4 production evidence manifest")]
+        #[arg(short, long, help = "Strict schema-5 production evidence manifest")]
         manifest: PathBuf,
         #[arg(long, help = "Strict production approval policy TOML")]
         policy: PathBuf,
@@ -291,10 +291,10 @@ enum Command {
     },
     #[command(
         about = "Verify fresh production evidence and independent approvals",
-        long_about = "Rerun every schema-4 production evidence source, require the stable subject to equal the short-lived request, verify each Ed25519 signature against the predeclared exact policy, and require coverage of every distinct policy role. A pass remains evidence only and never authorizes order entry."
+        long_about = "Rerun every schema-5 production evidence source, require the stable subject to equal the short-lived request, verify each Ed25519 signature against the predeclared exact policy, and require coverage of every distinct policy role. A pass remains evidence only and never authorizes order entry."
     )]
     VerifyProductionApproval {
-        #[arg(short, long, help = "Strict schema-4 production evidence manifest")]
+        #[arg(short, long, help = "Strict schema-5 production evidence manifest")]
         manifest: PathBuf,
         #[arg(long, help = "Exact production approval policy TOML")]
         policy: PathBuf,
@@ -541,6 +541,12 @@ enum Command {
     },
     #[command(about = "Collect authenticated, read-only recent OKX fill evidence")]
     CollectFills(statement::CollectFillsArgs),
+    #[command(about = "Collect authenticated, read-only account-wide OKX bill evidence")]
+    CollectBills(statement::CollectBillsArgs),
+    #[command(about = "Independently reconstruct and verify an exact OKX bill collection offline")]
+    VerifyBillCollection(statement::VerifyBillCollectionArgs),
+    #[command(about = "Reconcile normal trade and funding economics from verified OKX collections")]
+    ReconcileEconomics(statement::ReconcileEconomicsArgs),
     #[command(about = "Reconcile canonical journal fills and exact fees against raw OKX responses")]
     ReconcileFills(statement::ReconcileFillsArgs),
     #[command(about = "Certify current OKX cash-only and zero-liability account state")]
@@ -1566,6 +1572,9 @@ async fn main() -> Result<()> {
             }
         }
         Command::CollectFills(args) => statement::collect(args).await?,
+        Command::CollectBills(args) => statement::collect_bills(args).await?,
+        Command::VerifyBillCollection(args) => statement::verify_bills(args)?,
+        Command::ReconcileEconomics(args) => statement::reconcile_economics(args)?,
         Command::ReconcileFills(args) => statement::run(args)?,
         Command::CertifyAccount {
             config,

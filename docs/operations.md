@@ -324,9 +324,109 @@ enforced. A failure before report serialization can leave an empty reserved
 output, which is not evidence.
 
 This artifact closes only the fill/fee comparison. Archive it with the raw
-pages, live report, journal hash, and account export. Funding, balances,
-positions, cash/equity, liabilities, borrowing, taxes, conversion, and PnL must
-still be reconciled separately before trusting production economics.
+pages, live report, journal hash, and account export. Use the account-wide bill
+workflow below for trade/funding economics; balances, positions, complete
+cash/equity continuity, liabilities, borrowing, taxes, conversion, and
+independently derived close PnL remain separate review boundaries.
+
+### Trade And Funding Economic Reconciliation
+
+Run this only after stopping every process that can append to the canonical
+journal. Use a controlled demo-account window with no deposits, withdrawals,
+transfers, conversions, liquidation, borrowing, interest, or unrelated trading.
+The account-bills endpoint is deliberately queried without a type filter, and
+the verifier rejects every bill other than normal trades and swap funding. That
+fail-closed scope is what makes an unexplained balance change visible.
+
+The fill collection must begin at least `maximum_trade_bill_delay_ms` before the
+bill window. Both collections must use the same exact live config and resolve to
+the same environment, account settings, and pseudonymous account identity.
+
+```bash
+BEGIN_MS=1783987200000
+END_MS=1784016000000
+MAX_TRADE_BILL_DELAY_MS=60000
+FILL_BEGIN_MS=$((BEGIN_MS - MAX_TRADE_BILL_DELAY_MS))
+FILL_EVIDENCE="var/reap/evidence/okx-fills-economic-$(date -u +%Y%m%dT%H%M%SZ)"
+BILL_EVIDENCE="var/reap/evidence/okx-bills-$(date -u +%Y%m%dT%H%M%SZ)"
+BILL_VERIFICATION="var/reap/evidence/okx-bills-verification-$(date -u +%Y%m%dT%H%M%SZ).json"
+ECONOMIC_REPORT="var/reap/evidence/okx-economics-$(date -u +%Y%m%dT%H%M%SZ).json"
+
+cargo run -p reap-cli -- collect-fills \
+  --config examples/live-okx-demo.toml \
+  --account main \
+  --begin-ms "$FILL_BEGIN_MS" \
+  --end-ms "$END_MS" \
+  --output "$FILL_EVIDENCE" \
+  --pretty
+
+cargo run -p reap-cli -- collect-bills \
+  --config examples/live-okx-demo.toml \
+  --account main \
+  --begin-ms "$BEGIN_MS" \
+  --end-ms "$END_MS" \
+  --output "$BILL_EVIDENCE" \
+  --pretty
+
+cargo run -p reap-cli -- verify-bill-collection \
+  --manifest "$BILL_EVIDENCE/manifest.json" \
+  --output "$BILL_VERIFICATION" \
+  --pretty
+
+cargo run -p reap-cli -- reconcile-economics \
+  --journal var/reap/live-events.jsonl \
+  --fill-collection-manifest "$FILL_EVIDENCE/manifest.json" \
+  --bill-collection-manifest "$BILL_EVIDENCE/manifest.json" \
+  --account main \
+  --begin-ms "$BEGIN_MS" \
+  --end-ms "$END_MS" \
+  --minimum-trade-bills 10 \
+  --minimum-funding-bills 1 \
+  --maximum-trade-bill-delay-ms "$MAX_TRADE_BILL_DELAY_MS" \
+  --maximum-funding-bill-delay-ms 60000 \
+  --output "$ECONOMIC_REPORT" \
+  --require-pass \
+  --pretty
+```
+
+`collect-bills` uses public exchange time plus signed read-only account-config
+and `/api/v5/account/bills` GETs. It reserves a mode-`0700` directory before
+credentials or network access, writes exact create-new mode-`0600` responses,
+paces 100-row pages at least 500 ms apart, samples account identity before and
+after, and requires a short terminal page. The endpoint retains seven days; the
+collector uses a conservative 166-hour maximum age so verification and close
+delay do not race retention. A failed collection leaves no complete manifest.
+
+`verify-bill-collection` reads no credentials. It reopens and bounds every
+source, re-hashes exact config/page/manifest bytes, reconstructs every request
+path and `after=billId` cursor, rejects duplicate IDs/cursors and out-of-window
+rows, and refuses a full final page or a changed source. The optional summary
+and the economic report use create-new mode-`0600` files with file and parent
+directory durability.
+
+`reconcile-economics` independently reruns both collection verifiers, leases and
+streams the stopped journal, and checks exact config/account identity. Normal
+trade bills bind to fills by `(symbol, tradeId)` and validate side, order IDs,
+instrument/margin/execution mode, price, size, liquidity, signed fee/currency,
+causal delay, and the bill balance equation. Funding type `8` subtypes `173` and
+`174` follow pinned Java `OkexV5BillTypes`; the verifier binds each bill to a
+unique session-local journaled realized rate and signed position and recomputes linear
+`qty * ctVal * abs(rate) * mark` or inverse
+`qty * ctVal * abs(rate) / mark` magnitude and sign.
+
+Require nonzero thresholds for both trades and funding. A settlement with a zero
+position can legitimately have no bill, so completeness is demonstrated by
+matched nonzero funding bills rather than by requiring one bill per scheduled
+timestamp. The final trade-delay guard is excluded from fill-to-bill
+completeness because a valid bill can arrive just after `END_MS`.
+
+The report does not independently recompute realized derivative close PnL: the
+journal does not yet retain an attested opening cost basis. The exact settlement
+mark remains bill-sourced. It also does not prove complete balance/equity
+continuity, taxes, or currency conversion. The
+current OKX documentation is not sufficient evidence for every cash-spot bill
+unit combination, so archive a credentialed minimal cash buy and sell demo
+sample and require this verifier to pass before admitting spot production data.
 
 ### Account Cash And Liability Certification
 
@@ -1733,7 +1833,7 @@ target/release/reap verify-production-evidence \
   --pretty
 ```
 
-Schema 4 requires the intended Reap version, candidate executable SHA-256,
+Schema 5 requires the intended Reap version, candidate executable SHA-256,
 target-host identity SHA-256, predeclared deployment candidate ID, exact
 approval-policy SHA-256, and separate demo and production exchange-account
 identity maps. It also requires the exact
@@ -1742,10 +1842,18 @@ campaign; the latter must be typed-value-identical to a fresh deterministic
 reconstruction from the official-endpoint demo config and proxy routes. Its
 exact file bytes remain separately bound to every fault run. Paths may be
 absolute or relative to the bundle manifest. List exactly one production account
-certification, demo deadman certification, and authenticated fill reconciliation
-for every account in the exact configs. The dedicated clean demo soak must be a
-different session from every fault-matrix run. A reviewed nonzero
-`minimum_fills` is mandatory for each reconciliation.
+certification, demo deadman certification, authenticated fill reconciliation,
+and account-wide economic reconciliation for every account in the exact configs.
+Each economic input must reuse that account's exact fill collection and stopped
+journal while adding one independently verified bill collection. The dedicated
+clean demo soak must be a different session from every fault-matrix run.
+Reviewed nonzero `minimum_fills`, `minimum_trade_bills`, and
+`minimum_funding_bills` thresholds are mandatory. Production fill comparisons
+must use zero price/quantity/fee tolerances. Economic price tolerance must also
+be zero; quantity is capped at `1e-8`, fee at `1e-10`, balance and absolute
+funding PnL at `1e-8`, and relative funding PnL at `1e-6`. These hard limits are
+ceilings, not recommended defaults; justify every nonzero value from the
+instrument's published precision and credentialed samples.
 It also requires exactly one raw schema-2 fault-proxy process report for every
 matrix scenario. Each must independently pass, use the exact proxy config/build/
 host, have a unique proxy session, enclose exactly its assigned live session and
@@ -1766,18 +1874,19 @@ rejects stale sources. Configuration cannot weaken these hard maxima:
 | Demo deadman certification | 7 days |
 | Emergency cancel report | 7 days |
 | Reconciled fill window end | 24 hours |
+| Reconciled account-bill window end | 24 hours |
 
 `future_tolerance_ms` cannot exceed five minutes. The checked-in template uses
-stricter one-day fault/latency/deadman/emergency limits and six-hour soak/fill
-limits. Tighten them further when the complete campaign can be rerun faster; do
-not expand the code-level bounds to make old evidence pass.
+stricter one-day fault/latency/deadman/emergency limits and six-hour soak/fill/
+bill limits. Tighten them further when the complete campaign can be rerun faster;
+do not expand the code-level bounds to make old evidence pass.
 
 Soak, fault, and latency completion times are `session_started_at_ms + elapsed_ms`
 from independently reverified live reports. Account and deadman completion times
 use the validated final OKX server-clock sample. Emergency completion uses its
-validated start plus elapsed interval. Fill age uses the authenticated collection
-window's end, so collecting an old retained window again does not make the fills
-fresh.
+validated start plus elapsed interval. Fill and bill age use their authenticated
+collection windows' ends, so collecting old retained windows again does not make
+them fresh.
 
 The aggregate command directly reruns, rather than consumes output from:
 
@@ -1792,7 +1901,9 @@ exact loopback config;
 - account and deadman artifact verification from their embedded raw responses;
 - `verify-emergency-cancel --require-all-configured-accounts`; and
 - fill-collection pagination verification plus journal-backed fill/fee
-  reconciliation.
+  reconciliation; and
+- independent fill and account-bill collection reconstruction plus
+  journal-backed normal-trade and realized-funding economic reconciliation.
 
 Every proxy-supported matrix role must expose parsed Reap injector evidence with
 the exact supplied proxy-config fingerprint and a unique proxy session and
@@ -1801,7 +1912,7 @@ inside the corresponding reverified live session. Opaque external injector
 records are accepted only for genuine partial-fill and restored-latch roles,
 whose causality cannot be manufactured by the current proxy. Freshness applies
 to those roles' live reports, but their external causality remains an operator
-review. Schema 4 directly reconstructs every raw proxy process report and derives
+review. Schema 5 directly reconstructs every raw proxy process report and derives
 clean shutdown from listener joins, control-socket removal, pending rules, active
 connections, and proxy errors. External supervisor lifecycle evidence remains a
 separate review.
@@ -1814,11 +1925,12 @@ is missing or duplicated, or if any config/build/host/account/candidate binding
 differs. The output records a semantic SHA-256 of each in-memory reconstruction
 and always sets `production_order_entry_authorized = false`.
 
-A pass is deliberately narrower than production approval. Schema 4 enforces
-bounded age from validated session, exchange-clock, emergency-report, and fill
-window timestamps, but those clocks are not remotely attested. It does not
-remotely attest the host or exchange identity, reconcile complete economic
-statements, prove external supervisor/paging state, authenticate opaque external
+A pass is deliberately narrower than production approval. Schema 5 enforces
+bounded age from validated session, exchange-clock, emergency-report, fill, and
+bill window timestamps, but those clocks are not remotely attested. It does not
+remotely attest the host or exchange identity, independently derive derivative
+opening cost basis, prove complete balance/equity or currency-conversion
+accounting, prove external supervisor/paging state, authenticate opaque external
 fault causality, or by itself record human rollout approval. Re-run immediately
 before review and keep production entry disabled until those external controls
 are independently signed off.
@@ -1831,7 +1943,7 @@ reviewed deployment policy must contain sorted unique approver IDs, at least two
 sorted required roles, one or more approvers for every role, distinct Ed25519
 public keys, and a request lifetime no greater than 15 minutes.
 Its exact file SHA-256 must be placed in
-`expected_approval_policy_sha256` before collecting the passing schema-4 bundle;
+`expected_approval_policy_sha256` before collecting the passing schema-5 bundle;
 request preparation and final verification reject any substituted policy.
 
 Validate the populated policy and archive its exact hash before updating the
@@ -1863,7 +1975,7 @@ shared secret manager role used by that host, or in source control. Key identity
 role assignment, revocation, and proof of separate human control remain external
 governance responsibilities.
 
-2. On the exact candidate host, after the schema-4 bundle passes, prepare the
+2. On the exact candidate host, after the schema-5 bundle passes, prepare the
 short-lived review request:
 
 ```bash

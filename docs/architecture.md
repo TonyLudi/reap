@@ -333,7 +333,16 @@ Responsibilities:
   page, and exact create-new response/config/manifest hashes. Reconciliation
   independently replays that cursor chain, leases the canonical journal, and
   binds the collection config identity to the journal bootstrap identity.
-  Economic statement reconciliation outside fills and fees remains separate.
+- Collect account-wide OKX bills for an exact closed window through the same
+  read-only provenance boundary. Offline reconstruction reopens every raw page,
+  rebuilds the request cursor chain, and rejects duplicate IDs, out-of-window
+  rows, a full terminal page, or any changed source.
+- Reconcile normal trade and funding bills against the verified fill collection
+  and a streaming pass over the stopped journal. Unknown bill types fail closed;
+  trades bind on `(symbol, tradeId)` and exact fee currency, while funding binds
+  to a session-local journaled realized rate and signed position and recomputes
+  linear/inverse contract formulas. This is intentionally outside the hot event
+  loop.
 - Collect a self-contained point-in-time account certification from exact
   authenticated config, balance, and positions responses. Its mode-aware policy
   requires cash-only spot routing, zero configured borrowing, disabled venue
@@ -724,14 +733,17 @@ initial portfolio. Private normalized fills can carry exact signed fee and
 currency evidence; those fees are booked in spot base/quote balances, inverse
 settlement coin, or the reported third currency as applicable. Public-data
 matching has no account fee event, so it estimates fees from configured
-maker/taker rates. Reports expose exact and estimated fee-fill counts. The model
-does not implement a statement importer, borrowing interest, liquidation,
+maker/taker rates. Reports expose exact and estimated fee-fill counts. The
+backtest model does not import statements, borrowing interest, liquidation,
 margin discounts, or tax, and it cannot infer a missing funding event when the
-source dataset never contained one. The supported live spot boundary is cash
+source dataset never contained one. A separate offline production-evidence path
+now reconstructs normal trade and funding bills, but it cannot independently
+recompute derivative close PnL until the journal retains an attested opening
+cost basis. The supported live spot boundary is cash
 mode; production certification must prove zero liabilities. Enabling margin
 spot later requires a separate borrow-rate and interest model first. Production
-evaluation must reconcile these outputs against demo account statements and
-complete funding and currency-index coverage across every held interval.
+evaluation must still reconcile complete balance/equity and currency-index
+coverage across every held interval.
 
 #### Deterministic walk-forward research
 
@@ -857,6 +869,8 @@ Responsibilities:
 - Write-ahead operator/risk safety latches and restart reduction.
 - Canonical journal-path validation and a process-lifetime exclusive writer
   lease acquired before recovery or network setup.
+- Streaming recovery with a validated-record visitor so offline evidence tools
+  can retain only the needed event class instead of materializing a long journal.
 - Book snapshots.
 - JSONL initially, Parquet or binary logs later.
 
@@ -925,14 +939,17 @@ environment-specific account identities. The verifier reruns each source gate,
 reopens every deployment config and the controlling manifest, and reconstructs
 the loopback fault config from the exact official-demo and fault-proxy configs
 before cross-binding all returned identities. It hashes the typed in-memory
-reconstructions instead of accepting prior verification JSON. Schema 4
+reconstructions instead of accepting prior verification JSON. Schema 5
 re-verifies every fault/latency live
 source, derives completion times from validated sessions or exchange-clock
 samples, enforces explicit age limits under hard maxima, and requires each typed
 proxy command interval to fall inside its live session. It also reconstructs one
 schema-2 proxy process report per scenario, requiring exact config/build/host,
 unique sessions, independently derived clean shutdown, and unambiguous live-run
-enclosure.
+enclosure. One fill/fee and one account-wide trade/funding economic
+reconciliation are required per demo account, with exact collection, journal,
+config, executable, host, and pseudonymous account bindings. Bill freshness is
+independently bounded to 24 hours.
 
 Release approval remains a separate `reap-cli` composition layer. A stable typed
 subject removes only verifier wall time and derived age while preserving every
@@ -945,8 +962,9 @@ equality inside a hard 15-minute window.
 This is deliberately asymmetric rather than reusing the runtime operator HMAC:
 the target host can verify approvals without gaining signing capability. Even a
 passing approval leaves production entry unauthorized because remote attestation,
-external supervision, full economics, and actual rollout governance remain
-outside this composition.
+external supervision, independently attested derivative opening cost basis and
+funding settlement mark, complete balance/equity and currency-conversion
+accounting, and actual rollout governance remain outside this composition.
 
 ## Multi-Websocket Design
 

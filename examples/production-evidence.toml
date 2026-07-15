@@ -1,6 +1,6 @@
 # Schema template only. Replace every path and identity with reviewed target-host
 # evidence. This file cannot pass as checked in and contains no credentials.
-schema_version = 4
+schema_version = 5
 expected_reap_version = "0.1.0"
 expected_live_executable_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 expected_host_identity_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -38,6 +38,7 @@ production_account_certification_max_age_ms = 900000
 deadman_certification_max_age_ms = 86400000
 emergency_cancel_max_age_ms = 86400000
 fill_collection_max_age_ms = 21600000
+bill_collection_max_age_ms = 21600000
 
 # Repeat both identity tables and every per-account evidence array entry for all
 # configured accounts. Demo and production identities are intentionally distinct.
@@ -111,3 +112,22 @@ minimum_fills = 100
 price_tolerance = 0.0
 quantity_tolerance = 0.0
 fee_tolerance = 0.0
+
+[[economic_reconciliations]]
+# Reuse the exact fill collection and stopped journal above. The fill window must
+# begin at least maximum_trade_bill_delay_ms before the bill manifest's window.
+# Collect account-wide bills during a controlled window with no unrelated
+# transfers or other balance-changing activity.
+fill_collection_manifest = "/secure/evidence/demo-fills-main/manifest.json"
+bill_collection_manifest = "/secure/evidence/demo-bills-main/manifest.json"
+journal = "/secure/evidence/demo-stopped-main.jsonl"
+minimum_trade_bills = 100
+minimum_funding_bills = 3
+maximum_trade_bill_delay_ms = 60000
+maximum_funding_bill_delay_ms = 60000
+price_tolerance = 0.0
+quantity_tolerance = 0.000000001
+fee_tolerance = 0.000000000001
+balance_tolerance = 0.0000000001
+funding_pnl_absolute_tolerance = 0.000000000001
+funding_pnl_relative_tolerance = 0.00000001

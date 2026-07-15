@@ -33,7 +33,7 @@ Implemented:
 - Bounded structured telemetry and JSONL storage for raw, normalized, intent,
   request, acknowledgement, order, fill, system, bootstrap, reconciliation,
   and write-ahead safety-latch records, including restart recovery and an
-  exclusive canonical journal lease. Schema-6 live evidence classifies
+  exclusive canonical journal lease. Schema-8 live evidence classifies
   ambiguous operations, partial fills, convergence timeouts, restored latches,
   and typed safety-task failures.
 - A fail-closed `reap-live` composition root with account-scoped REST bootstrap,
@@ -51,6 +51,11 @@ Implemented:
   OKX config/balance/position responses in a create-new mode-`0600` artifact,
   binds config/binary/host/Java/account provenance, and supports credential-free
   offline re-verification without printing sensitive raw account state.
+- Authenticated account-wide OKX bill collection with exact raw-page retention,
+  independent cursor/window reconstruction, and stopped-journal reconciliation
+  of normal trades and realized linear/inverse funding. Unknown account bills
+  fail closed; realized derivative close PnL still lacks an independently
+  attested opening cost basis.
 - Read-only process-death certification that exclusively leases the stopped
   journal, binds recovered exchange/client order identities to exact OKX order
   details, requires Cancel All After source `20` and account-wide regular-order
@@ -319,17 +324,18 @@ target/release/reap verify-production-evidence \
 The command reconstructs transition, research deployment, dedicated demo soak,
 the routed config from the exact official-demo and fault-proxy configs, fault
 matrix, latency calibration, production account certification, demo deadman,
-emergency cancel, and authenticated fill/fee reconciliation evidence.
+emergency cancel, authenticated fill/fee reconciliation, and account-wide
+trade/funding economic reconciliation evidence.
 It rejects missing or duplicate per-account coverage, a demo soak reused as a
 fault session, config drift during verification, and any mismatch against the
 manifest-declared build, host, candidate, or environment-specific account
 identities. Proxy-supported fault roles must carry typed records with the exact
 proxy fingerprint, unique proxy session/command IDs, fresh timestamps, and a
 command interval inside the corresponding verified live session; only genuine
-partial-fill and restart-latch roles may use external evidence. Schema 4 also
+partial-fill and restart-latch roles may use external evidence. Schema 5 also
 enforces reviewed age limits under hard code-level maxima for the demo soak,
 every fault and latency source, production account certification, deadman,
-emergency cancel, and the reconciled fill window. It requires one independently
+emergency cancel, and the reconciled fill and bill windows. It requires one independently
 verified clean proxy-process report per fault role, with a unique session that
 encloses exactly that live run and the expected completed-command count. It does
 not trust previously emitted verification JSON. The checked-in manifest is a
@@ -372,7 +378,7 @@ reap verify-production-approval \
 
 The policy requires sorted, unique approvers, distinct Ed25519 public keys, and
 at least two required roles. A request is valid for at most 15 minutes and binds
-the exact policy predeclared by SHA-256 in the schema-4 evidence manifest plus
+the exact policy predeclared by SHA-256 in the schema-5 evidence manifest plus
 stable source/config/build/host/account/candidate and gate evidence. Verification
 rejects stale requests, missing roles, duplicate keys or approvers, signature or
 binding changes, and any newly failing or changed source.
@@ -518,19 +524,24 @@ cargo run -p reap-cli -- verify-live-run \
   --pretty
 ```
 
-After the bounded demo is stopped and the window has been closed for at least 60
-seconds, collect authenticated recent-fill evidence and reconcile the canonical
-journal's fills and exact signed fees offline:
+After the bounded demo is stopped and the account-bill window has been closed
+for at least 60 seconds, collect authenticated fills and account-wide bills.
+The fill window starts one maximum trade-bill delay earlier so a bill at the
+left boundary can still be matched causally:
 
 ```bash
 BEGIN_MS=1783987200000
 END_MS=1783990800000
+MAX_TRADE_BILL_DELAY_MS=60000
+FILL_BEGIN_MS=$((BEGIN_MS - MAX_TRADE_BILL_DELAY_MS))
 FILL_EVIDENCE="/secure/evidence/okx-fills-$(date -u +%Y%m%dT%H%M%SZ)"
+BILL_EVIDENCE="/secure/evidence/okx-bills-$(date -u +%Y%m%dT%H%M%SZ)"
 FILL_REPORT="/tmp/reap-fill-reconciliation-$(date -u +%Y%m%dT%H%M%SZ).json"
+ECONOMIC_REPORT="/secure/evidence/economics-$(date -u +%Y%m%dT%H%M%SZ).json"
 cargo run -p reap-cli -- collect-fills \
   --config examples/live-okx-demo.toml \
   --account main \
-  --begin-ms "$BEGIN_MS" \
+  --begin-ms "$FILL_BEGIN_MS" \
   --end-ms "$END_MS" \
   --output "$FILL_EVIDENCE" \
   --pretty
@@ -539,10 +550,37 @@ cargo run -p reap-cli -- reconcile-fills \
   --journal var/reap/live-events.jsonl \
   --collection-manifest "$FILL_EVIDENCE/manifest.json" \
   --account main \
-  --begin-ms "$BEGIN_MS" \
+  --begin-ms "$FILL_BEGIN_MS" \
   --end-ms "$END_MS" \
   --minimum-fills 10 \
   --output "$FILL_REPORT" \
+  --require-pass \
+  --pretty
+
+cargo run -p reap-cli -- collect-bills \
+  --config examples/live-okx-demo.toml \
+  --account main \
+  --begin-ms "$BEGIN_MS" \
+  --end-ms "$END_MS" \
+  --output "$BILL_EVIDENCE" \
+  --pretty
+
+cargo run -p reap-cli -- verify-bill-collection \
+  --manifest "$BILL_EVIDENCE/manifest.json" \
+  --pretty
+
+cargo run -p reap-cli -- reconcile-economics \
+  --journal var/reap/live-events.jsonl \
+  --fill-collection-manifest "$FILL_EVIDENCE/manifest.json" \
+  --bill-collection-manifest "$BILL_EVIDENCE/manifest.json" \
+  --account main \
+  --begin-ms "$BEGIN_MS" \
+  --end-ms "$END_MS" \
+  --minimum-trade-bills 10 \
+  --minimum-funding-bills 1 \
+  --maximum-trade-bill-delay-ms "$MAX_TRADE_BILL_DELAY_MS" \
+  --maximum-funding-bill-delay-ms 60000 \
+  --output "$ECONOMIC_REPORT" \
   --require-pass \
   --pretty
 ```
@@ -558,8 +596,22 @@ strict `(symbol, tradeId)` identities, and refuses duplicate, missing,
 malformed, fee-less, or field-mismatched fills. Older `fills-history` exports can
 still be supplied manually with repeated `--statement` and the explicit
 `--confirm-statement-account-and-window-complete` attestation, but that coverage
-is weaker. The report covers fills and fees only; it is not balance, position,
-funding, equity, liability, tax, or currency-conversion reconciliation.
+is weaker. The fill report covers fills and fees only.
+
+`collect-bills` is also authenticated and read-only. It captures the account-wide
+`/api/v5/account/bills` result for the exact closed window, paces requests at
+least 500 ms apart, and requires a short terminal page within the conservative
+166-hour age bound. `reconcile-economics` rebuilds both collections, leases and
+streams the stopped journal, rejects every unexplained bill type, validates
+trade identities/fees/balance equations, and recomputes realized linear or
+inverse funding from the journaled settled rate and signed position, configured
+contract value, and bill settlement mark. Run a controlled demo window
+containing nonzero trades and at least one
+nonzero funding settlement. This still does not independently prove derivative
+opening cost basis, an independently attested settlement mark, full
+balance/equity continuity, currency conversion, taxes, or profitability.
+Cash-spot bill units must be confirmed with credentialed demo
+evidence for the exact target account before production review.
 
 Each create-new schema-8 live report contains the exact source-config byte
 count/SHA-256, checkpoint and full evidence config fingerprints, Reap executable

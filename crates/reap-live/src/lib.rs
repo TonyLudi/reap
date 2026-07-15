@@ -1,9 +1,11 @@
 mod account_certification;
+mod bill_collection;
 mod bootstrap;
 mod config;
 mod convergence;
 mod coordinator;
 mod deadman_certification;
+mod economic_statement;
 mod emergency;
 mod emergency_verification;
 mod fault_campaign;
@@ -20,10 +22,12 @@ mod startup;
 mod statement;
 
 pub use account_certification::*;
+pub use bill_collection::*;
 pub use bootstrap::*;
 pub use config::*;
 pub use coordinator::*;
 pub use deadman_certification::*;
+pub use economic_statement::*;
 pub use emergency::*;
 pub use emergency_verification::*;
 pub use fault_campaign::*;
