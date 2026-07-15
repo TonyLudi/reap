@@ -2,13 +2,14 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use reap_backtest::{
-    ResearchMode, ResearchVerificationReport, effective_strategy_sha256, verify_research_paths,
+    ResearchMode, ResearchOpeningAccountEvidence, ResearchVerificationReport,
+    effective_strategy_sha256, verify_research_paths,
 };
 use reap_core::PINNED_JAVA_REVISION;
 use reap_live::{LiveConfig, LiveConfigFileEvidence, TradingEnvironment};
 use serde::{Deserialize, Serialize};
 
-pub(crate) const RESEARCH_DEPLOYMENT_VERIFICATION_FORMAT_VERSION: u16 = 1;
+pub(crate) const RESEARCH_DEPLOYMENT_VERIFICATION_FORMAT_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,6 +37,12 @@ pub(crate) enum ResearchDeploymentVerificationFailure {
     EffectiveStrategyMismatch {
         research_sha256: String,
         live_sha256: String,
+    },
+    OpeningAccountEvidenceMissing,
+    OpeningAccountConfigMismatch {
+        dataset_id: String,
+        expected_live_config_sha256: String,
+        actual_opening_config_sha256: String,
     },
 }
 
@@ -80,7 +87,7 @@ pub(crate) fn verify_research_deployment_paths(
     let live_effective_strategy_sha256 = effective_strategy_sha256(&config.strategy)?;
     let input_path_collision = config_file.source_path == research.manifest.source_path
         || config_file.source_path == research.artifact.source_path;
-    let failures = binding_failures(
+    let mut failures = binding_failures(
         config.venue.environment,
         research.artifact_mode,
         research.acceptance_passed,
@@ -91,6 +98,10 @@ pub(crate) fn verify_research_deployment_paths(
         &live_effective_strategy_sha256,
         input_path_collision,
     );
+    failures.extend(opening_account_config_failures(
+        &research.artifact_opening_accounts,
+        &config_file.sha256,
+    ));
     let effective_strategy_matches = research
         .artifact_deployment_effective_strategy_sha256
         .as_deref()
@@ -115,7 +126,7 @@ pub(crate) fn verify_research_deployment_paths(
         research,
         failures,
         limitations: vec![
-            "a passing binding proves that one reconstructed production-research candidate has the same effective strategy as the exact proposed production config; it does not prove profitability or evidence freshness"
+            "a passing binding proves that one reconstructed production-research candidate has the same effective strategy as the exact proposed production config and that every dataset opening was certified from those exact config bytes; it does not prove profitability or evidence freshness"
                 .to_string(),
             "credential permissions, target-account state, target-host operation, fault campaigns, statement reconciliation, and emergency procedures remain separate production gates"
                 .to_string(),
@@ -123,6 +134,26 @@ pub(crate) fn verify_research_deployment_paths(
         ],
         acceptance_passed,
     })
+}
+
+fn opening_account_config_failures(
+    openings: &[ResearchOpeningAccountEvidence],
+    production_config_sha256: &str,
+) -> Vec<ResearchDeploymentVerificationFailure> {
+    if openings.is_empty() {
+        return vec![ResearchDeploymentVerificationFailure::OpeningAccountEvidenceMissing];
+    }
+    openings
+        .iter()
+        .filter(|opening| opening.live_config_sha256 != production_config_sha256)
+        .map(
+            |opening| ResearchDeploymentVerificationFailure::OpeningAccountConfigMismatch {
+                dataset_id: opening.dataset_id.clone(),
+                expected_live_config_sha256: production_config_sha256.to_string(),
+                actual_opening_config_sha256: opening.live_config_sha256.clone(),
+            },
+        )
+        .collect()
 }
 
 fn binding_failures(
@@ -174,6 +205,7 @@ fn binding_failures(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn production_binding_requires_every_independent_gate_and_exact_strategy() {
@@ -236,5 +268,38 @@ mod tests {
             failures,
             [ResearchDeploymentVerificationFailure::DeploymentStrategyHashMissing]
         );
+    }
+
+    #[test]
+    fn production_binding_requires_exact_opening_account_config_bytes() {
+        let config_sha256 = "a".repeat(64);
+        let opening = ResearchOpeningAccountEvidence {
+            dataset_id: "train".to_string(),
+            source_path: PathBuf::from("opening.json"),
+            source_sha256: "b".repeat(64),
+            evidence_sha256: "c".repeat(64),
+            executable_sha256: "d".repeat(64),
+            host_identity_sha256: "e".repeat(64),
+            live_config_sha256: config_sha256.clone(),
+            live_config_fingerprint: "f".repeat(64),
+            account_id: "main".to_string(),
+            account_identity_sha256: "1".repeat(64),
+            certification_finish_server_ms: 100,
+            capture_started_at_ms: 101,
+            capture_gap_ms: 1,
+        };
+
+        assert!(
+            opening_account_config_failures(std::slice::from_ref(&opening), &config_sha256)
+                .is_empty()
+        );
+        assert_eq!(
+            opening_account_config_failures(&[], &config_sha256),
+            [ResearchDeploymentVerificationFailure::OpeningAccountEvidenceMissing]
+        );
+        assert!(matches!(
+            opening_account_config_failures(&[opening], &"2".repeat(64)).as_slice(),
+            [ResearchDeploymentVerificationFailure::OpeningAccountConfigMismatch { .. }]
+        ));
     }
 }

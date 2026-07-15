@@ -141,9 +141,16 @@ cargo run -p reap-cli -- capture \
 
 The one-hour command is an operational smoke, not funding-complete research
 evidence. Production datasets must be continuous across exchange funding
-boundaries. Schema-5 production research with swap candidates requires nonzero
+boundaries. Schema-7 production research with swap candidates requires nonzero
 realized funding settlements in both training and test aggregates, so short
 captures cannot pass by carrying only forecasts.
+
+For a production-candidate dataset, quiesce the target account and run
+`certify-account` with the exact production live config and Reap executable
+immediately before starting the credential-free capture. Retain the unique
+certification beside that capture. Research re-derives its raw OKX evidence and
+requires the certification, capture, latency calibration, executable, host,
+account, and instrument accounting contracts to agree.
 
 The example enables the Linux host guard. It fails before opening outputs or
 websockets when disk, available memory, or kernel clock synchronization is
@@ -188,9 +195,10 @@ opening snapshot. Balances carry spot inventory through an explicit
 `valuation_symbol`; nonzero derivative positions require average cost and
 margin mode. The runner seeds the same snapshot into strategy risk state and
 the accounting ledger, blocks order entry until the first complete book/rate
-valuation, and reports both opening/final equity and net PnL. Production
-research requires positive opening capital and identical snapshots across
-candidates. The report embeds those assumptions, actual sampled-latency usage,
+valuation, and reports both opening/final equity and net PnL. Schema-7
+production research rejects candidate-file capital and derives one positive
+opening portfolio per dataset from its independently verified account
+certification. The report embeds those assumptions, actual sampled-latency usage,
 the replay time basis, clock regressions, currency ledgers/rates, strategy halt
 reason, live orders, and work still scheduled at the capture boundary. The
 example delay values are zero,
@@ -211,8 +219,8 @@ derivative, funding, fee, and active-order exposure use fresh latency-delivered
 currency indexes; missing/stale rates or conversions attempted before a rate is
 usable make accounting incomplete. Reports also flag late, missed, invalid, or
 failed funding accounting and retain funding settlements beyond the data
-horizon as pending actions. The model assumes a zero initial portfolio and is
-not an exchange-statement substitute.
+horizon as pending actions. A manual run defaults to zero unless configured;
+neither manual nor certified opening state is an exchange-statement substitute.
 
 Run the checked-in walk-forward plumbing fixture:
 
@@ -242,11 +250,15 @@ capture report must identify the same executable as research and the same host
 as the bound latency calibration, with at least one completed periodic host
 check. The smoke fixture intentionally uses
 permissive uncalibrated gates and is not
-trading evidence. Production-candidate manifests use schema 6, predeclare one
+trading evidence. Production-candidate manifests use schema 7, predeclare one
 `deployment_candidate_id`, and fail unless every fold independently selects
-that candidate from training data. Every candidate must use the same explicit
-positive opening account snapshot; run PnL is final equity minus opening equity,
-not final account capital. They also require nonzero training/test
+that candidate from training data. Candidate files must omit
+`initial_portfolio`; every raw dataset names a unique, passing account
+certification collected on the same build and calibrated host before capture.
+The manifest supplies explicit spot valuation-symbol mappings, and research
+derives identical candidate state from certified balances, derivative average
+costs, and margin fields. Run PnL is final equity minus opening equity, not final
+account capital. They also require nonzero training/test
 realized-funding-settlement gates when any candidate trades a swap and a passed
 `latency_calibration` artifact, and require the baseline's empirical latency
 profile to match that artifact exactly.
@@ -273,10 +285,11 @@ cargo run -p reap-cli -- verify-research-deployment \
 ```
 
 This command requires a production venue config, re-runs `verify-research`,
-revalidates the schema-6 candidate binding, and requires the candidate and live
-config to serialize to the same effective strategy SHA-256. It does not enable
-order entry or replace transition, account, host, fault, fee, funding, statement,
-deadman, and emergency evidence.
+revalidates the schema-7 candidate binding, and requires the candidate and live
+config to serialize to the same effective strategy SHA-256. It also requires
+every dataset opening certification to embed those exact production-config
+bytes. It does not enable order entry or replace transition, account, host,
+fault, fee, funding, statement, deadman, and emergency evidence.
 
 Validate the live demo configuration without reading credentials or opening a
 network connection:
@@ -365,7 +378,9 @@ It rejects missing or duplicate per-account coverage, a demo soak reused as a
 fault session, config drift during verification, and any mismatch against the
 manifest-declared build, host, candidate, or environment-specific account
 identities. The demo and production configs must also name the same absolute
-process-shared connection-pacer path. Proxy-supported fault roles must carry
+process-shared connection-pacer path. Schema-7 research opening certifications
+must identify that same production account, build, and host; their verified raw
+evidence fingerprints are carried through the format-3 reconstruction. Proxy-supported fault roles must carry
 typed records with the exact proxy fingerprint, unique proxy session/command
 IDs, fresh timestamps, and a command interval inside the corresponding verified
 live session; only genuine partial-fill and restart-latch roles may use external

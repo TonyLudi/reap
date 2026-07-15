@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use reap_backtest::ResearchOpeningAccountEvidence;
 use reap_core::PINNED_JAVA_REVISION;
 use reap_fault::{
     FaultProxyConfig, FaultProxyConfigEvidence, FaultProxyRunVerificationReport,
@@ -26,7 +27,7 @@ use crate::deployment::{ResearchDeploymentVerificationReport, verify_research_de
 use crate::latency::{LatencyCalibrationVerificationReport, verify_latency_calibration};
 
 pub(crate) const PRODUCTION_EVIDENCE_MANIFEST_SCHEMA_VERSION: u16 = 8;
-pub(crate) const PRODUCTION_EVIDENCE_REPORT_FORMAT_VERSION: u16 = 8;
+pub(crate) const PRODUCTION_EVIDENCE_REPORT_FORMAT_VERSION: u16 = 9;
 pub(crate) const PRODUCTION_EVIDENCE_APPROVAL_SUBJECT_FORMAT_VERSION: u16 = 1;
 const MAX_PRODUCTION_EVIDENCE_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_PRODUCTION_EVIDENCE_ACCOUNTS: usize = 32;
@@ -1788,6 +1789,15 @@ fn evaluate_bindings(input: BindingInputs<'_>) -> Vec<ProductionEvidenceFailure>
             .as_deref()
             .unwrap_or(""),
     );
+    check_research_opening_accounts(
+        &mut failures,
+        &input.research.research.artifact_opening_accounts,
+        &production_accounts,
+        &input.production.1.file.sha256,
+        &input.expected.live_executable_sha256,
+        &input.expected.host_identity_sha256,
+        &input.expected.production_account_identity_sha256s,
+    );
 
     reject_gate(
         &mut failures,
@@ -2663,6 +2673,69 @@ fn check_account_coverage(
             actual: actual.iter().cloned().collect(),
         });
     }
+}
+
+fn check_research_opening_accounts(
+    failures: &mut Vec<ProductionEvidenceFailure>,
+    openings: &[ResearchOpeningAccountEvidence],
+    expected_accounts: &BTreeSet<String>,
+    expected_live_config_sha256: &str,
+    expected_executable_sha256: &str,
+    expected_host_identity_sha256: &str,
+    expected_account_identity_sha256s: &BTreeMap<String, String>,
+) {
+    reject_gate(
+        failures,
+        ProductionEvidenceGate::ResearchDeployment,
+        None,
+        !openings.is_empty(),
+    );
+    let mut observed_accounts = BTreeSet::new();
+    for opening in openings {
+        let account_id = opening.account_id.as_str();
+        observed_accounts.insert(opening.account_id.clone());
+        check_binding(
+            failures,
+            ProductionEvidenceGate::ResearchDeployment,
+            Some(account_id),
+            "opening_live_config_sha256",
+            expected_live_config_sha256,
+            &opening.live_config_sha256,
+        );
+        check_binding(
+            failures,
+            ProductionEvidenceGate::ResearchDeployment,
+            Some(account_id),
+            "opening_executable_sha256",
+            expected_executable_sha256,
+            &opening.executable_sha256,
+        );
+        check_binding(
+            failures,
+            ProductionEvidenceGate::ResearchDeployment,
+            Some(account_id),
+            "opening_host_identity_sha256",
+            expected_host_identity_sha256,
+            &opening.host_identity_sha256,
+        );
+        check_binding(
+            failures,
+            ProductionEvidenceGate::ResearchDeployment,
+            Some(account_id),
+            "opening_account_identity_sha256",
+            expected_account_identity_sha256s
+                .get(account_id)
+                .map(String::as_str)
+                .unwrap_or(""),
+            &opening.account_identity_sha256,
+        );
+    }
+    check_account_coverage(
+        failures,
+        ProductionEvidenceGate::ResearchDeployment,
+        expected_accounts,
+        &observed_accounts,
+    );
 }
 
 fn reject_gate(
@@ -3645,6 +3718,54 @@ maximum_account_boundary_gap_ms = 60000
             &expected_accounts,
         );
         assert_eq!(failures.len(), 4);
+    }
+
+    #[test]
+    fn research_opening_accounts_bind_target_build_host_and_account() {
+        let expected_accounts = BTreeSet::from(["main".to_string()]);
+        let expected_identities = BTreeMap::from([("main".to_string(), "c".repeat(64))]);
+        let opening = ResearchOpeningAccountEvidence {
+            dataset_id: "train".to_string(),
+            source_path: PathBuf::from("account.json"),
+            source_sha256: "a".repeat(64),
+            evidence_sha256: "b".repeat(64),
+            executable_sha256: "d".repeat(64),
+            host_identity_sha256: "e".repeat(64),
+            live_config_sha256: "f".repeat(64),
+            live_config_fingerprint: "0".repeat(64),
+            account_id: "main".to_string(),
+            account_identity_sha256: "c".repeat(64),
+            certification_finish_server_ms: 100,
+            capture_started_at_ms: 101,
+            capture_gap_ms: 1,
+        };
+        let mut failures = Vec::new();
+        check_research_opening_accounts(
+            &mut failures,
+            std::slice::from_ref(&opening),
+            &expected_accounts,
+            &"f".repeat(64),
+            &"d".repeat(64),
+            &"e".repeat(64),
+            &expected_identities,
+        );
+        assert!(failures.is_empty());
+
+        let mut wrong = opening;
+        wrong.executable_sha256 = "1".repeat(64);
+        wrong.host_identity_sha256 = "2".repeat(64);
+        wrong.account_identity_sha256 = "3".repeat(64);
+        wrong.live_config_sha256 = "4".repeat(64);
+        check_research_opening_accounts(
+            &mut failures,
+            &[wrong],
+            &expected_accounts,
+            &"f".repeat(64),
+            &"d".repeat(64),
+            &"e".repeat(64),
+            &expected_identities,
+        );
+        assert_eq!(failures.len(), 4, "{failures:#?}");
     }
 
     #[test]

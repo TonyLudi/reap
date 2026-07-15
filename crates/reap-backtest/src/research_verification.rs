@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{PINNED_JAVA_REVISION, RESEARCH_SCHEMA_VERSION, ResearchReport};
 
-pub const RESEARCH_VERIFICATION_FORMAT_VERSION: u16 = 2;
+pub const RESEARCH_VERIFICATION_FORMAT_VERSION: u16 = 3;
 pub const MAX_RESEARCH_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_RESEARCH_REPORT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_RESEARCH_VERIFICATION_DIAGNOSTIC_BYTES: usize = 2_048;
@@ -24,6 +24,24 @@ pub struct ResearchFileEvidence {
     pub source_path: PathBuf,
     pub bytes: u64,
     pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResearchOpeningAccountEvidence {
+    pub dataset_id: String,
+    pub source_path: PathBuf,
+    pub source_sha256: String,
+    pub evidence_sha256: String,
+    pub executable_sha256: String,
+    pub host_identity_sha256: String,
+    pub live_config_sha256: String,
+    pub live_config_fingerprint: String,
+    pub account_id: String,
+    pub account_identity_sha256: String,
+    pub certification_finish_server_ms: u64,
+    pub capture_started_at_ms: u64,
+    pub capture_gap_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,6 +76,7 @@ pub struct ResearchVerificationReport {
     pub artifact_deployment_candidate_id: Option<String>,
     pub artifact_deployment_effective_strategy_sha256: Option<String>,
     pub artifact_deployment_binding_valid: bool,
+    pub artifact_opening_accounts: Vec<ResearchOpeningAccountEvidence>,
     pub artifact_manifest_matches: bool,
     pub artifact_shape_valid: bool,
     pub artifact_reported_pass: bool,
@@ -130,6 +149,30 @@ pub fn verify_research_paths(
     ) = deployment_binding(&artifact_report);
     let artifact_reported_pass = artifact_report.passed;
     let artifact_failure_count = artifact_report.failures.len();
+    let artifact_opening_accounts = artifact_report
+        .datasets
+        .iter()
+        .filter_map(|dataset| {
+            dataset
+                .opening_account
+                .as_ref()
+                .map(|account| ResearchOpeningAccountEvidence {
+                    dataset_id: dataset.id.clone(),
+                    source_path: account.source_path.clone(),
+                    source_sha256: account.sha256.clone(),
+                    evidence_sha256: account.evidence_sha256.clone(),
+                    executable_sha256: account.executable_sha256.clone(),
+                    host_identity_sha256: account.host_identity_sha256.clone(),
+                    live_config_sha256: account.live_config_sha256.clone(),
+                    live_config_fingerprint: account.live_config_fingerprint.clone(),
+                    account_id: account.account_id.clone(),
+                    account_identity_sha256: account.account_identity_sha256.clone(),
+                    certification_finish_server_ms: account.certification_finish_server_ms,
+                    capture_started_at_ms: account.capture_started_at_ms,
+                    capture_gap_ms: account.capture_gap_ms,
+                })
+        })
+        .collect::<Vec<_>>();
     let verifier_executable_sha256 =
         sha256_path(&std::env::current_exe().context("failed to resolve verifier executable")?)?;
 
@@ -235,6 +278,7 @@ pub fn verify_research_paths(
         artifact_deployment_candidate_id,
         artifact_deployment_effective_strategy_sha256,
         artifact_deployment_binding_valid,
+        artifact_opening_accounts,
         artifact_manifest_matches,
         artifact_shape_valid,
         artifact_reported_pass,
@@ -246,7 +290,7 @@ pub fn verify_research_paths(
         failures,
         diagnostics,
         limitations: vec![
-            "a passing reconstruction proves deterministic derivation from the supplied manifest and current archived inputs; it does not prove those inputs represent the target venue, host, or account"
+            "a passing reconstruction proves deterministic derivation from the supplied manifest and current archived inputs; embedded source verifiers bind declared venue, host, and account identities but do not provide external host/process attestation"
                 .to_string(),
             "research acceptance remains conditional on independently verified capture, latency, fee, funding, account, statement, fault, and deployment evidence"
                 .to_string(),
@@ -407,6 +451,9 @@ fn normalized_value_sha256(report: &Value) -> Result<String> {
 
 fn normalized_report_value(mut report: ResearchReport) -> Result<Value> {
     for dataset in &mut report.datasets {
+        if let Some(opening_account) = &mut dataset.opening_account {
+            opening_account.source_path = content_path(&opening_account.sha256);
+        }
         if let Some(analysis) = &mut dataset.capture_analysis {
             analysis.source_path = Some(content_path(&analysis.sha256));
         }
@@ -663,11 +710,15 @@ mod tests {
 
         let verification = verify_research_paths(&manifest, &artifact_path).unwrap();
         assert!(verification.acceptance_passed, "{verification:#?}");
-        assert_eq!(verification.format_version, 2);
+        assert_eq!(
+            verification.format_version,
+            RESEARCH_VERIFICATION_FORMAT_VERSION
+        );
         assert!(verification.artifact_shape_valid);
         assert!(verification.artifact_matches_rebuild);
         assert!(verification.artifact_deployment_binding_valid);
         assert_eq!(verification.artifact_deployment_candidate_id, None);
+        assert!(verification.artifact_opening_accounts.is_empty());
         assert_eq!(
             verification.artifact_deployment_effective_strategy_sha256,
             None

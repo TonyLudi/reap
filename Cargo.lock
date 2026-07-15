@@ -1008,6 +1008,7 @@ dependencies = [
  "reap-capture",
  "reap-core",
  "reap-feed",
+ "reap-live",
  "reap-order",
  "reap-strategy",
  "reap-venue",

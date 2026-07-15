@@ -679,11 +679,13 @@ mod tests {
                     currency: "BTC".to_string(),
                     total: 2.0,
                     valuation_symbol: Some("BTC-USDT".to_string()),
+                    ..Default::default()
                 },
                 BacktestInitialBalanceConfig {
                     currency: "USDT".to_string(),
                     total: 10_000.0,
                     valuation_symbol: None,
+                    ..Default::default()
                 },
             ],
             positions: vec![BacktestInitialPositionConfig {

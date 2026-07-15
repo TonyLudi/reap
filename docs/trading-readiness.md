@@ -193,7 +193,7 @@ production trading process.
     `settFundingRate` plus observed `prevFundingTime`; a private preload pass
     lets accounting apply the realized rate to signed linear or inverse
     exposure at the original exchange timestamp without strategy look-ahead.
-    Missing or conflicting realized rates fail closed, and schema-6 production
+    Missing or conflicting realized rates fail closed, and schema-7 production
     research requires nonzero settled intervals in both training and test
     aggregates. The short accepted capture had rate updates but no fill or
     funding boundary, so formulas are tested but not empirically calibrated or
@@ -214,23 +214,28 @@ production trading process.
     capture binary, latency-calibrated target host, pinned Java revision, and
     healthy host-guard evidence, plus capture-config-bound multi-source and
     candidate-channel analysis and an independent zero-gap replay check before
-    selection. Schema 6 additionally
+    selection. Schema 7 additionally
     requires one predeclared deployment candidate to win training-only selection
-    in every fold and requires all candidates to use the same explicit positive
-    opening account snapshot. Backtest strategy and accounting state now share
-    that snapshot, order entry waits for its first complete valuation, reports
-    distinguish opening/final equity from net PnL, and terminal strategy halts
-    fail research evidence. This prevents final capital or candidate-specific
-    inventory from being scored as strategy profit. A format-2 independent reconstruction exposes
-    that candidate's effective strategy hash, and a separate production binding
+    in every fold. Candidate files omit opening capital; each raw dataset instead
+    binds a unique, passing production account certification collected before
+    capture on the exact research build and latency-calibrated host. Research
+    re-derives raw OKX evidence, enforces account/instrument scope and a bounded
+    handoff, rejects nonzero unmodeled state, and supplies the same certified
+    balances, average costs, available/equity/loan, and margin fields to every
+    candidate's strategy and accounting state. Order entry waits for its first
+    complete valuation, reports distinguish opening/final equity from net PnL,
+    and terminal strategy halts fail research evidence. This prevents final
+    capital or candidate-specific inventory from being scored as strategy
+    profit. A format-3 independent reconstruction exposes dataset opening-account
+    identities and that candidate's effective strategy hash, and a separate production binding
     now requires it to equal the exact proposed live config's
     `strategy.effective()` hash. The checked-in
     smoke fold validates plumbing with permissive uncalibrated gates and negative
     fee-adjusted PnL; it is not production evidence. Each dataset still resets
     independently to zero or its configured snapshot rather than carrying
-    Java's daily ending positions. The configured snapshot is fingerprinted but
-    not yet derived from an authenticated account certification at the dataset
-    boundary, so opening-state provenance remains a production blocker.
+    Java's daily ending positions. No passing target-account certification has
+    been collected, and cross-file balance/average-cost/settlement carry remains
+    a production blocker.
 34. Backtest latency can now use bounded empirical samples for Java-mapped
     `market_depth`, `historical_trade`, `matching_new`, `matching_cancel`,
     `order_update`, and `order_fill` classes plus Rust `reference_data`, with
@@ -243,7 +248,7 @@ production trading process.
     account identities. A deterministic CLI rejects mismatched
     config/code/host/account/session/clock or failed-operation evidence, emits a
     profile only after every required series passes, and binds the exact
-    artifact/profile into schema-6 production research. An independent verifier
+    artifact/profile into schema-7 production research. An independent verifier
     now re-hashes an explicit complete source-report set, reruns live verification,
     rebuilds every series/profile with recorded options, and compares the result
     after content-hash path normalization. Matching new/cancel measurements are

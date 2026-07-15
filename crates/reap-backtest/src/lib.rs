@@ -14,9 +14,9 @@ pub use calibration::{
 use execution::BacktestLatencySampler;
 pub use execution::{
     BacktestConfig, BacktestCurrencyRateConfig, BacktestExecutionConfig,
-    BacktestInitialBalanceConfig, BacktestInitialPortfolioConfig, BacktestInitialPositionConfig,
-    BacktestLatencyClass, BacktestLatencyProfile, BacktestLatencyRule, BacktestLatencyUsage,
-    BacktestTimeBasis,
+    BacktestInitialBalanceConfig, BacktestInitialMarginConfig, BacktestInitialPortfolioConfig,
+    BacktestInitialPositionConfig, BacktestLatencyClass, BacktestLatencyProfile,
+    BacktestLatencyRule, BacktestLatencyUsage, BacktestTimeBasis,
 };
 use matching::MatchingAssumptions;
 pub use matching::MatchingEngine;
@@ -27,16 +27,17 @@ pub use replay::{
 };
 pub use research::{
     CandidateProvenance, CandidateTrainingReport, DatasetPortfolioSemantics, DatasetProvenance,
-    FoldReport, LatencyCalibrationProvenance, PINNED_JAVA_REVISION, RESEARCH_SCHEMA_VERSION,
-    ResearchAggregate, ResearchCandidate, ResearchDataFormat, ResearchDataset, ResearchFold,
-    ResearchGates, ResearchManifest, ResearchMode, ResearchReport, ResearchRunReport,
-    ResearchScenario, ResearchScenarioKind, RunAggregate, SelectionMetric, TestScenarioReport,
+    FoldReport, LatencyCalibrationProvenance, OpeningAccountProvenance, PINNED_JAVA_REVISION,
+    RESEARCH_SCHEMA_VERSION, ResearchAggregate, ResearchCandidate, ResearchDataFormat,
+    ResearchDataset, ResearchFold, ResearchGates, ResearchManifest, ResearchMode,
+    ResearchOpeningAccount, ResearchReport, ResearchRunReport, ResearchScenario,
+    ResearchScenarioKind, RunAggregate, SelectionMetric, TestScenarioReport,
     effective_strategy_sha256, run_research_manifest_path,
 };
 pub use research_verification::{
     MAX_RESEARCH_MANIFEST_BYTES, MAX_RESEARCH_REPORT_BYTES, RESEARCH_VERIFICATION_FORMAT_VERSION,
-    ResearchFileEvidence, ResearchVerificationFailure, ResearchVerificationReport,
-    verify_research_paths,
+    ResearchFileEvidence, ResearchOpeningAccountEvidence, ResearchVerificationFailure,
+    ResearchVerificationReport, verify_research_paths,
 };
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -775,15 +776,16 @@ impl BacktestRunner {
                     .iter()
                     .map(|balance| {
                         let total = self.portfolio.account_balance(&balance.currency);
+                        let change = total - balance.total;
                         Balance {
                             account_id: self.initial_portfolio.account_id.clone(),
                             currency: balance.currency.clone(),
                             total,
-                            available: total,
-                            equity: total,
-                            liability: 0.0,
-                            max_loan: 0.0,
-                            forced_repayment_indicator: None,
+                            available: balance.available() + change,
+                            equity: balance.equity() + change,
+                            liability: balance.liability(),
+                            max_loan: balance.max_loan(),
+                            forced_repayment_indicator: balance.forced_repayment_indicator,
                         }
                     })
                     .collect()
@@ -1893,11 +1895,13 @@ mod tests {
                     currency: "BTC".to_string(),
                     total: 0.002,
                     valuation_symbol: Some("BTC-USDT".to_string()),
+                    ..Default::default()
                 },
                 BacktestInitialBalanceConfig {
                     currency: "USDT".to_string(),
                     total: 1_000.0,
                     valuation_symbol: None,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -1947,11 +1951,13 @@ mod tests {
                     currency: "BTC".to_string(),
                     total: 0.01,
                     valuation_symbol: Some("BTC-USDT".to_string()),
+                    ..Default::default()
                 },
                 BacktestInitialBalanceConfig {
                     currency: "USDT".to_string(),
                     total: 1_000.0,
                     valuation_symbol: None,
+                    ..Default::default()
                 },
             ],
             ..Default::default()

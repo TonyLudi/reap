@@ -285,7 +285,7 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Separate OKX funding forecasts from realized settlement accounting,
   retain `settFundingRate` with observed `prevFundingTime`, reject conflicting
   realized rates, settle at the original exchange timestamp without strategy
-  look-ahead, and require nonzero training/test settlement evidence in schema-6
+  look-ahead, and require nonzero training/test settlement evidence in schema-7
   production research.
 - [x] Match pinned Java OKX system-status monitoring with a typed current-wire
   `/api/v5/system/status` parser, environment-aware bootstrap and 10-second
@@ -305,19 +305,23 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Add independent full research reconstruction bound to the exact manifest,
   executable, and archived inputs; reject unknown/stale/forged/non-passing or
   numerically drifting reports, and persist owner-only durable evidence.
-- [x] Bind schema-6 production research to one manifest-declared deployment
+- [x] Bind schema-7 production research to one manifest-declared deployment
   candidate and fail unless every fold selects that candidate from training data.
 - [x] Mirror Java first-run account/position input with a strict single-account
   backtest opening snapshot, seed strategy and portfolio from the same balances
   and derivative average costs, block entry until opening valuation, report true
   opening-adjusted PnL and ending state, reject terminal strategy halts, and
-  require identical positive opening capital in production research. Dataset
-  sequences still reset independently; explicit cross-file carry remains future
-  work.
-- [ ] Derive and independently bind each production research segment's opening
-  portfolio to exact account-certification/economic evidence at the dataset
-  boundary; for split continuous sessions, carry and verify ending balances,
-  derivative quantity, average cost, and settlement ledger into the next file.
+  require identical positive opening capital in production research.
+- [x] Derive each schema-7 production dataset's opening portfolio from a unique,
+  independently rebuilt account certification; bind exact build, calibrated
+  host, proposed production-config bytes, production environment, account
+  identity, instrument accounting scope, spot valuation mapping, and bounded
+  pre-capture timing, while retaining certified available/equity/loan/margin
+  fields in strategy state.
+- [ ] For split continuous sessions, carry and verify ending balances,
+  derivative quantity, average cost, and settlement ledger into the next file,
+  matching Java `updateInputForNextRun`. Dataset sequences currently reset to
+  their independently certified opening snapshots.
 - [x] Independently bind the reconstructed deployment candidate's effective
   strategy hash to the exact proposed production live config, rejecting smoke,
   demo, invalid reconstruction, ambiguous provenance, and strategy drift.

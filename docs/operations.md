@@ -31,6 +31,24 @@ The optional
 `output.normalized_path` is intended for short diagnostics because full
 400-level snapshots are much larger than raw deltas.
 
+For a production-candidate dataset, collect the opening boundary first while
+the account is quiescent, then start the public capture immediately:
+
+```bash
+ACCOUNT_PATH="var/reap/capture/okx-btc-${RUN_ID}.opening-account.json"
+cargo run -p reap-cli -- certify-account \
+  --config /secure/config/reap-production-candidate.toml \
+  --account main \
+  --output "$ACCOUNT_PATH" \
+  --pretty
+# Run the capture command above without allowing account activity in between.
+```
+
+The certification command is authenticated and read-only; `capture` remains
+credential-free. Use a unique certification for each process session. Schema-7
+research requires the certification to finish before capture and within the
+manifest's `maximum_opening_account_gap_ms` budget.
+
 The checked-in config enables the Linux host guard. Capture creates the raw
 parent directory, then checks that filesystem capacity, `MemAvailable`, and
 kernel clock synchronization before opening an output file or websocket. It
@@ -291,7 +309,11 @@ Negative balances, duplicate currencies/symbols, spot rows in `positions`,
 multi-account strategy mappings, missing balance rows, unknown valuation
 symbols, and opening quantities outside configured position limits fail before
 replay. This scope intentionally excludes borrowing, account holds, and a
-dynamic margin engine; simulated available/equity balance fields equal total.
+dynamic margin engine. Manual snapshots default omitted available/equity fields
+to total. Certified research snapshots preserve exchange `availBal`, `eq`,
+`maxLoan`, forced-repayment indicator, `mgnRatio`, `adjEq`, and `notionalUsd`;
+liability must remain zero. Synthetic post-fill account updates preserve the
+opening available/equity offsets as cash changes.
 The snapshot is delivered to strategy state at the first replay timestamp. The
 runner then blocks order entry until every book and currency conversion needed
 for an exact opening valuation is ready. A pre-baseline fill aborts. Reports
@@ -669,16 +691,15 @@ artifact creation, and exit status.
 
 For real research, create a new manifest alongside immutable capture files:
 
-1. Set `schema_version = 6`, `mode = "production_candidate"`, retain the pinned
+1. Set `schema_version = 7`, `mode = "production_candidate"`, retain the pinned
    Java revision, and point `latency_calibration` to the passed create-new JSON
    artifact whose profile is embedded exactly in the baseline scenario.
 2. List explicit full candidate TOML files and set `deployment_candidate_id` to
    the one strategy intended for deployment before any test-window result is
    inspected. The runner does not mutate arbitrary strategy fields or generate
    an implicit parameter grid.
-   Every candidate must carry an identical parsed
-   `[initial_portfolio]`, and production mode requires at least one positive
-   opening balance so final capital cannot masquerade as PnL.
+   Candidate files must omit `[initial_portfolio]`; production opening capital
+   belongs to dataset evidence, not a tunable candidate.
 3. Give every capture a unique dataset ID/path/content hash. Every test window
    must occur strictly after its fold's training windows, and a test dataset can
    belong to only one fold. Set each raw dataset's `capture_config` and
@@ -691,6 +712,29 @@ For real research, create a new manifest alongside immutable capture files:
    completed periodic check, the same executable as research, the same target
    host as latency calibration, and the
    book/trade/index/mark/limit/funding channels needed by every candidate.
+   Quiesce the exact production account and collect one unique, passing
+   `certify-account` artifact immediately before each capture. Add the nested
+   dataset binding, for example:
+
+   ```toml
+   [[datasets]]
+   id = "train-20260715"
+   path = "capture-20260715.jsonl"
+   format = "raw_capture"
+   capture_config = "capture-okx-public.toml"
+   capture_report = "capture-20260715.report.json"
+
+   [datasets.opening_account]
+   certification = "account-20260715.json"
+   spot_valuation_symbols = { BTC = "BTC-USDT" }
+   ```
+
+   Set `gates.maximum_opening_account_gap_ms` to the reviewed quiescent handoff
+   budget, never above 15 minutes. Research re-verifies raw account evidence and
+   requires the certification to finish before capture on the same exact build,
+   calibrated host, production account, and instrument accounting scope. It
+   rejects reused certifications, nonzero unmodeled currencies/positions, and
+   candidate-dependent derived state.
 4. Define exactly one baseline using empirically calibrated execution values,
    set `calibrated = true`, and add at least two stress scenarios. Profile stress
    uses the same seed and must first-order stochastically dominate baseline for
@@ -711,9 +755,10 @@ For real research, create a new manifest alongside immutable capture files:
    and no failures, then archive both JSON files beside the exact capture/config
    files and demo calibration evidence.
 8. Run `verify-research-deployment` with that manifest/report and the exact
-   proposed production live config. Require the format-2 reconstruction and
-   effective strategy hashes to pass, then archive its create-new output with
-   the production-transition evidence.
+   proposed production live config. Require the format-3 research
+   reconstruction, format-2 deployment binding, exact opening-config hashes,
+   and effective strategy hashes to pass, then archive its create-new output
+   with the production-transition evidence.
 
 Candidate scores use training runs only (`net_pnl_usd` or
 `pnl_per_turnover_bps`). Only the selected candidate is evaluated on test data.
@@ -735,7 +780,7 @@ input mutation aborts artifact creation. Existing output paths are refused so an
 acceptance artifact cannot be silently replaced.
 
 The independent verifier accepts JSON whitespace/key-order changes and archive
-relocation of verifier-observed capture paths, but it preserves the manifest's
+relocation of verifier-observed capture and opening-account source paths, but it preserves the manifest's
 declared paths and every result. It uses exact JSON `f64` round trips, re-runs
 the entire manifest, and emits the first mismatching JSON pointer if a stale or
 forged report differs. It deliberately does not infer profitability, venue
@@ -763,7 +808,9 @@ pending-delta gates instead of treating them as completed work.
 
 Each dataset is an independent run. It resets either to zero and reports
 `independent_zero_initial_portfolio`, or resets to the exact candidate snapshot
-and reports `independent_configured_initial_portfolio`. Unlike Java
+and reports `independent_configured_initial_portfolio`. Schema-7 production
+datasets instead report `independent_certified_dataset_portfolio` and reset to
+their source-rebuilt account certification. Unlike Java
 `ChaosBackTestMultiRunService`, Rust still does not carry ending positions
 between files. Use a single continuous capture for an evaluation segment when
 position continuity matters and gate terminal delta/gross exposure. Research
@@ -2472,7 +2519,7 @@ output is an owner-only create-new file synced with its parent directory. Archiv
 the exact config, calibration, every source report, and this passing verification
 artifact together; the calibration's internal `passed` flag is insufficient.
 
-A production-candidate research manifest must use schema 6, predeclare its
+A production-candidate research manifest must use schema 7, predeclare its
 `deployment_candidate_id`, set
 `latency_calibration` to the JSON artifact, set the baseline execution
 `calibrated = true`, and embed exactly the artifact's profile. Research treats

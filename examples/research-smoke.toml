@@ -1,4 +1,4 @@
-schema_version = 6
+schema_version = 7
 mode = "smoke"
 java_reference_revision = "b6b120c7b7c466d8431bf082f3229328c5d7b2ae"
 selection_metric = "net_pnl_usd"
@@ -82,6 +82,7 @@ maximum_pending_non_funding_actions_per_fold = 10
 maximum_terminal_pending_orders_per_run = 10
 maximum_terminal_pending_cancel_requests_per_run = 10
 maximum_clock_regressions_per_run = 0
+maximum_opening_account_gap_ms = 60000
 minimum_profitable_fold_fraction = 0.0
 minimum_stress_pass_fraction = 1.0
 minimum_passing_fold_fraction = 1.0

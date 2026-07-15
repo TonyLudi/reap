@@ -130,7 +130,7 @@ The Rust scheduler was cross-checked against the pinned Java
 | Conservative depth-fill threshold and queue reset on a shallow cross | `depth_fill_conservative_threshold`; basic cross clears queue-ahead and threshold cross controls displayed-depth fill | Exact formula and pinned Java application default; empirical calibration remains required |
 | Exact displayed queue and full historical trade/depth capacity | `queue_ahead_multiplier`, `historical_trade_fill_fraction`, and `displayed_depth_fill_fraction` | `1.0` preserves Java parity; conservative Rust sensitivity overlays are intentional and require empirical calibration |
 | Date-partitioned multi-run service and per-run result files | Manifest folds, immutable input fingerprints, candidate training selection, and test scenario reports | Rust extends the Java artifact boundary with explicit leakage and acceptance gates |
-| `loadFirstRunInput` loads `inputPositionFileName`; `updateInputForNextRun` installs `lastResult.getEndingPositions()` | Strict single-account `[initial_portfolio]` seeds balances and derivative average-cost positions into strategy and accounting; reports expose opening/final state and opening-adjusted PnL | First-run parity is implemented. Rust datasets still reset independently instead of carrying between files; use a continuous dataset and terminal exposure gates |
+| `loadFirstRunInput` loads `inputPositionFileName`; `updateInputForNextRun` installs `lastResult.getEndingPositions()` | Strict single-account opening state seeds balances, available/equity/loan/margin fields, and derivative average-cost positions into strategy and accounting; schema-7 production derives it from dataset-bound account certification | First-run source parity is implemented. Rust datasets still reset independently instead of carrying between files; use a continuous dataset and terminal exposure gates |
 | `ChaosContext.tradeSymbols` uses `TreeSet` for cross-run consistency | Stable symbol/risk-group quote and hedge traversal plus ordered portfolio/order reductions | Equivalent determinism intent; exact JSON float round trips and `verify-research` add an independent Rust evidence boundary |
 
 ### Live Latency Evidence Cross-Check
@@ -166,24 +166,27 @@ source reports, reruns live verification, and reconstructs every class/symbol
 series and profile under the recorded options. Only source paths are normalized
 to their content hashes, preserving the mapped `BackTestDelay`,
 `OkxNitroOrderClient`, and private-state boundaries while allowing evidence to
-move into an archive. A schema-6 production research manifest must point to that
+move into an archive. A schema-7 production research manifest must point to that
 artifact, run the byte-identical Reap executable, and use its exact baseline
 profile. It also predeclares one deployable candidate and requires every fold to
 select it from training data. This is an explicit Rust acceptance control around
 the pinned Java `ChaosBackTestMultiRunService` per-run artifact model; the Java
 service does not supply a verified held-out candidate-selection policy. The
-schema also requires identical positive opening capital across candidates so
-selection cannot compare final account balances as profit. The machinery is
+schema also removes capital from candidate files and derives each dataset's
+common opening state from a unique source-rebuilt OKX account certification on
+the same build, calibrated host, production account, and pre-capture boundary.
+Selection therefore cannot compare final account balances as profit. The machinery is
 complete; no credentialed target-host artifact or passing
 reconstruction has been produced yet.
 
 `verify-research` then re-runs the exact manifest with the byte-identical
 executable and compares every fold, selected candidate, Java-mapped execution
-scenario, fill, fee, funding, exposure, and gate result. Only canonical paths
-introduced while independently re-verifying capture files are normalized to
+scenario, fill, fee, funding, exposure, and gate result. Only source paths
+introduced while independently re-verifying capture and opening-account files are normalized to
 content hashes. This preserves Java `ChaosBackTestMultiRunService`'s per-run
 artifact intent while rejecting stale or forged aggregate JSON. It preserves
-the documented independent-dataset reset (zero or configured snapshot) and does
+the documented independent-dataset reset (zero, configured, or certified
+snapshot) and does
 not supply missing target-host, queue, statement, and profitability evidence.
 
 `verify-research-deployment` carries the mapped strategy one step further: it

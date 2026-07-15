@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -9,15 +9,26 @@ use reap_capture::{
     verify_capture_paths,
 };
 use reap_feed::{ReplayCheckReport, replay_check_path};
+use reap_live::{
+    AccountCertificationArtifact, LiveConfig, TradingEnvironment,
+    verify_account_certification_artifact_path,
+};
+use reap_venue::okx::{
+    OkxAccountBalanceSnapshot, OkxAccountPositionsSnapshot,
+    parse_okx_account_balance_response_json, parse_okx_account_positions_response_json,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    BacktestConfig, BacktestExecutionConfig, BacktestReport, BacktestRunner,
-    LatencyCalibrationArtifact, MAX_LATENCY_CALIBRATION_ARTIFACT_BYTES,
+    BacktestConfig, BacktestExecutionConfig, BacktestInitialBalanceConfig,
+    BacktestInitialMarginConfig, BacktestInitialPortfolioConfig, BacktestInitialPositionConfig,
+    BacktestReport, BacktestRunner, LatencyCalibrationArtifact,
+    MAX_LATENCY_CALIBRATION_ARTIFACT_BYTES,
 };
 
-pub const RESEARCH_SCHEMA_VERSION: u32 = 6;
+pub const RESEARCH_SCHEMA_VERSION: u32 = 7;
+const MAX_PRODUCTION_OPENING_ACCOUNT_GAP_MS: u64 = 15 * 60 * 1_000;
 pub use reap_core::PINNED_JAVA_REVISION;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +65,7 @@ pub enum SelectionMetric {
 pub enum DatasetPortfolioSemantics {
     IndependentZeroInitialPortfolio,
     IndependentConfiguredInitialPortfolio,
+    IndependentCertifiedDatasetPortfolio,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +105,17 @@ pub struct ResearchDataset {
     pub capture_report: Option<PathBuf>,
     #[serde(default)]
     pub normalized_path: Option<PathBuf>,
+    #[serde(default)]
+    pub opening_account: Option<ResearchOpeningAccount>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResearchOpeningAccount {
+    pub certification: PathBuf,
+    /// Currency to configured spot instrument used to value account inventory.
+    #[serde(default)]
+    pub spot_valuation_symbols: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +164,7 @@ pub struct ResearchGates {
     pub maximum_terminal_pending_orders_per_run: usize,
     pub maximum_terminal_pending_cancel_requests_per_run: usize,
     pub maximum_clock_regressions_per_run: u64,
+    pub maximum_opening_account_gap_ms: u64,
     pub minimum_profitable_fold_fraction: f64,
     pub minimum_stress_pass_fraction: f64,
     pub minimum_passing_fold_fraction: f64,
@@ -212,6 +236,29 @@ pub struct DatasetProvenance {
     pub normalized_sha256: Option<String>,
     pub capture_analysis: Option<CaptureAnalysisReport>,
     pub capture_verification: Option<CaptureVerificationReport>,
+    pub opening_account: Option<OpeningAccountProvenance>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpeningAccountProvenance {
+    pub source_path: PathBuf,
+    pub sha256: String,
+    pub evidence_sha256: String,
+    pub schema_version: u32,
+    pub reap_version: String,
+    pub executable_sha256: String,
+    pub host_identity_sha256: String,
+    pub live_config_sha256: String,
+    pub live_config_fingerprint: String,
+    pub environment: TradingEnvironment,
+    pub account_id: String,
+    pub account_identity_sha256: String,
+    pub certification_finish_local_midpoint_ms: u64,
+    pub certification_finish_server_ms: u64,
+    pub capture_started_at_ms: u64,
+    pub capture_gap_ms: u64,
+    pub spot_valuation_symbols: BTreeMap<String, String>,
+    pub portfolio: BacktestInitialPortfolioConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -337,6 +384,8 @@ struct LoadedDataset {
     normalized_sha256: Option<String>,
     capture_analysis: Option<CaptureAnalysisReport>,
     capture_verification: Option<CaptureVerificationReport>,
+    resolved_opening_account: Option<PathBuf>,
+    opening_account: Option<OpeningAccountProvenance>,
 }
 
 #[derive(Debug, Clone)]
@@ -372,7 +421,15 @@ pub fn run_research_manifest_path(path: impl AsRef<Path>) -> Result<ResearchRepo
         &executable_sha256,
     )?;
     let candidates = load_candidates(&manifest.candidates, base)?;
-    validate_candidate_initial_portfolios(manifest.mode, &candidates)?;
+    let uses_certified_opening_accounts = manifest
+        .datasets
+        .first()
+        .is_some_and(|dataset| dataset.opening_account.is_some());
+    validate_candidate_initial_portfolios(
+        manifest.mode,
+        uses_certified_opening_accounts,
+        &candidates,
+    )?;
     validate_candidate_funding_evidence(
         manifest.mode,
         &manifest.gates,
@@ -388,6 +445,7 @@ pub fn run_research_manifest_path(path: impl AsRef<Path>) -> Result<ResearchRepo
         latency_calibration
             .as_ref()
             .map(|calibration| calibration.provenance.host_identity_sha256.as_str()),
+        manifest.gates.maximum_opening_account_gap_ms,
     )?;
     let manifest_sha256 = sha256_bytes(&manifest_bytes);
     let mut cache = HashMap::new();
@@ -531,7 +589,12 @@ pub fn run_research_manifest_path(path: impl AsRef<Path>) -> Result<ResearchRepo
         reap_version: env!("CARGO_PKG_VERSION").to_string(),
         java_reference_revision: manifest.java_reference_revision,
         latency_calibration: latency_calibration.map(|loaded| loaded.provenance),
-        dataset_portfolio_semantics: if candidates
+        dataset_portfolio_semantics: if datasets
+            .iter()
+            .any(|dataset| dataset.opening_account.is_some())
+        {
+            DatasetPortfolioSemantics::IndependentCertifiedDatasetPortfolio
+        } else if candidates
             .first()
             .is_some_and(|candidate| !candidate.config.initial_portfolio.is_empty())
         {
@@ -564,6 +627,7 @@ pub fn run_research_manifest_path(path: impl AsRef<Path>) -> Result<ResearchRepo
                 normalized_sha256: dataset.normalized_sha256.clone(),
                 capture_analysis: dataset.capture_analysis.clone(),
                 capture_verification: dataset.capture_verification.clone(),
+                opening_account: dataset.opening_account.clone(),
             })
             .collect(),
         scenarios: manifest.scenarios,
@@ -675,6 +739,17 @@ impl ResearchManifest {
             .iter()
             .map(|dataset| dataset.id.as_str())
             .collect::<HashSet<_>>();
+        let opening_account_count = self
+            .datasets
+            .iter()
+            .filter(|dataset| dataset.opening_account.is_some())
+            .count();
+        if opening_account_count != 0 && opening_account_count != self.datasets.len() {
+            errors.push(
+                "research datasets must either all provide opening_account evidence or all omit it"
+                    .to_string(),
+            );
+        }
         let mut referenced = HashSet::new();
         let mut test_owners = HashMap::new();
         for fold in &self.folds {
@@ -778,15 +853,26 @@ impl ResearchManifest {
                     "production_candidate requires a capture_report for every dataset".to_string(),
                 );
             }
+            if self
+                .datasets
+                .iter()
+                .any(|dataset| dataset.opening_account.is_none())
+            {
+                errors.push(
+                    "production_candidate requires opening_account evidence for every dataset"
+                        .to_string(),
+                );
+            }
         }
         for dataset in &self.datasets {
             if dataset.format != ResearchDataFormat::RawCapture
                 && (dataset.capture_config.is_some()
                     || dataset.capture_report.is_some()
-                    || dataset.normalized_path.is_some())
+                    || dataset.normalized_path.is_some()
+                    || dataset.opening_account.is_some())
             {
                 errors.push(format!(
-                    "dataset {}: capture_config, capture_report, and normalized_path are valid only for raw_capture datasets",
+                    "dataset {}: capture_config, capture_report, normalized_path, and opening_account are valid only for raw_capture datasets",
                     dataset.id
                 ));
             }
@@ -799,6 +885,12 @@ impl ResearchManifest {
             if dataset.normalized_path.is_some() && dataset.capture_report.is_none() {
                 errors.push(format!(
                     "dataset {}: normalized_path requires capture_report",
+                    dataset.id
+                ));
+            }
+            if dataset.opening_account.is_some() && dataset.capture_report.is_none() {
+                errors.push(format!(
+                    "dataset {}: opening_account requires capture_report",
                     dataset.id
                 ));
             }
@@ -896,7 +988,15 @@ impl ResearchGates {
         if self.minimum_folds == 0 {
             errors.push("gates.minimum_folds must be positive".to_string());
         }
+        if self.maximum_opening_account_gap_ms == 0 {
+            errors.push("gates.maximum_opening_account_gap_ms must be positive".to_string());
+        }
         if mode == ResearchMode::ProductionCandidate {
+            if self.maximum_opening_account_gap_ms > MAX_PRODUCTION_OPENING_ACCOUNT_GAP_MS {
+                errors.push(format!(
+                    "production_candidate maximum_opening_account_gap_ms must not exceed {MAX_PRODUCTION_OPENING_ACCOUNT_GAP_MS}"
+                ));
+            }
             if self.minimum_folds < 3 {
                 errors.push("production_candidate requires at least three folds".to_string());
             }
@@ -1148,8 +1248,21 @@ fn load_candidates(specs: &[ResearchCandidate], base: &Path) -> Result<Vec<Loade
 
 fn validate_candidate_initial_portfolios(
     mode: ResearchMode,
+    uses_certified_opening_accounts: bool,
     candidates: &[LoadedCandidate],
 ) -> Result<()> {
+    if uses_certified_opening_accounts || mode == ResearchMode::ProductionCandidate {
+        if let Some(candidate) = candidates
+            .iter()
+            .find(|candidate| !candidate.config.initial_portfolio.is_empty())
+        {
+            bail!(
+                "candidate {} must omit initial_portfolio when datasets derive opening state from account certification",
+                candidate.spec.id
+            );
+        }
+        return Ok(());
+    }
     let Some(first) = candidates.first() else {
         return Ok(());
     };
@@ -1161,13 +1274,6 @@ fn validate_candidate_initial_portfolios(
                 first.spec.id
             );
         }
-    }
-    if mode == ResearchMode::ProductionCandidate
-        && !first.config.initial_portfolio.has_positive_balance()
-    {
-        bail!(
-            "production_candidate requires an explicit initial_portfolio with positive account balance"
-        );
     }
     Ok(())
 }
@@ -1290,10 +1396,14 @@ fn load_datasets(
     candidates: &[LoadedCandidate],
     expected_executable_sha256: &str,
     expected_host_identity_sha256: Option<&str>,
+    maximum_opening_account_gap_ms: u64,
 ) -> Result<Vec<LoadedDataset>> {
     let mut loaded = Vec::with_capacity(specs.len());
     let mut canonical_paths = HashSet::new();
     let mut hashes = HashSet::new();
+    let mut opening_account_paths = HashSet::new();
+    let mut opening_account_hashes = HashSet::new();
+    let mut opening_account_evidence_hashes = HashSet::new();
     for spec in specs {
         let resolved = resolve(base, &spec.path);
         let canonical = resolved
@@ -1488,6 +1598,36 @@ fn load_datasets(
             capture_config_sha256 = Some(config_sha256);
             capture_analysis = Some(analysis);
         }
+        let (resolved_opening_account, opening_account) = load_dataset_opening_account(
+            spec,
+            base,
+            mode,
+            candidates,
+            expected_executable_sha256,
+            expected_host_identity_sha256,
+            maximum_opening_account_gap_ms,
+            capture_verification.as_ref(),
+        )?;
+        if let (Some(path), Some(provenance)) = (&resolved_opening_account, &opening_account) {
+            if !opening_account_paths.insert(path.clone()) {
+                bail!(
+                    "opening account certification {} is referenced by more than one dataset",
+                    provenance.source_path.display()
+                );
+            }
+            if !opening_account_hashes.insert(provenance.sha256.clone()) {
+                bail!(
+                    "dataset {} opening account certification duplicates another dataset's bytes",
+                    spec.id
+                );
+            }
+            if !opening_account_evidence_hashes.insert(provenance.evidence_sha256.clone()) {
+                bail!(
+                    "dataset {} reuses another dataset's opening account evidence",
+                    spec.id
+                );
+            }
+        }
         loaded.push(LoadedDataset {
             spec: spec.clone(),
             resolved_path: canonical,
@@ -1501,9 +1641,491 @@ fn load_datasets(
             normalized_sha256,
             capture_analysis,
             capture_verification,
+            resolved_opening_account,
+            opening_account,
         });
     }
     Ok(loaded)
+}
+
+fn opening_account_evidence_sha256(artifact: &AccountCertificationArtifact) -> Result<String> {
+    let index_responses = artifact
+        .index_tickers
+        .iter()
+        .map(|ticker| {
+            (
+                ticker.currency.as_str(),
+                ticker.symbol.as_str(),
+                ticker.response.sha256.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let material = serde_json::to_vec(&(
+        artifact.schema_version,
+        artifact.config.sha256.as_str(),
+        artifact.config_fingerprint.as_str(),
+        artifact.summary.account_identity_sha256.as_str(),
+        artifact.start_clock.local_midpoint_ms,
+        artifact.start_clock.server_ms,
+        artifact.finish_clock.local_midpoint_ms,
+        artifact.finish_clock.server_ms,
+        artifact.account_config_before.sha256.as_str(),
+        artifact.account_balance.sha256.as_str(),
+        index_responses,
+        artifact.account_positions.sha256.as_str(),
+        artifact.account_config_after.sha256.as_str(),
+    ))
+    .context("failed to fingerprint opening account evidence")?;
+    Ok(sha256_bytes(&material))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_dataset_opening_account(
+    dataset: &ResearchDataset,
+    base: &Path,
+    mode: ResearchMode,
+    candidates: &[LoadedCandidate],
+    expected_executable_sha256: &str,
+    expected_host_identity_sha256: Option<&str>,
+    maximum_gap_ms: u64,
+    capture_verification: Option<&CaptureVerificationReport>,
+) -> Result<(Option<PathBuf>, Option<OpeningAccountProvenance>)> {
+    let Some(spec) = &dataset.opening_account else {
+        return Ok((None, None));
+    };
+    let resolved = resolve(base, &spec.certification);
+    let canonical = resolved.canonicalize().with_context(|| {
+        format!(
+            "failed to resolve opening account certification {}",
+            resolved.display()
+        )
+    })?;
+    let sha256 = sha256_path(&canonical)?;
+    let artifact = verify_account_certification_artifact_path(&canonical).with_context(|| {
+        format!(
+            "failed to reconstruct opening account certification for dataset {}",
+            dataset.id
+        )
+    })?;
+    let evidence_sha256 = opening_account_evidence_sha256(&artifact)?;
+    if !artifact.summary.passed || !artifact.summary.evidence_complete {
+        bail!(
+            "dataset {} opening account certification did not pass complete cash-account policy",
+            dataset.id
+        );
+    }
+    let capture = capture_verification.context(format!(
+        "dataset {} opening account requires verified capture timing",
+        dataset.id
+    ))?;
+    if artifact.reap_version != capture.reap_version
+        || artifact.java_reference_revision != capture.java_reference_revision
+        || artifact.executable_sha256 != capture.executable_sha256
+    {
+        bail!(
+            "dataset {} opening account and capture were produced by different Reap builds or Java references",
+            dataset.id
+        );
+    }
+    if capture.host_identity_sha256.as_deref() != Some(artifact.host_identity_sha256.as_str()) {
+        bail!(
+            "dataset {} opening account and capture do not identify one host",
+            dataset.id
+        );
+    }
+    if artifact.finish_clock.local_midpoint_ms > capture.session_started_at_ms {
+        bail!(
+            "dataset {} opening account certification finished at {}, after capture started at {}",
+            dataset.id,
+            artifact.finish_clock.local_midpoint_ms,
+            capture.session_started_at_ms
+        );
+    }
+    let capture_gap_ms = capture
+        .session_started_at_ms
+        .saturating_sub(artifact.finish_clock.local_midpoint_ms);
+    if capture_gap_ms > maximum_gap_ms {
+        bail!(
+            "dataset {} opening account gap {} ms exceeds configured maximum {} ms",
+            dataset.id,
+            capture_gap_ms,
+            maximum_gap_ms
+        );
+    }
+
+    let live_config = LiveConfig::from_toml(&artifact.config.toml).with_context(|| {
+        format!(
+            "dataset {} opening account embeds an invalid live config",
+            dataset.id
+        )
+    })?;
+    if mode == ResearchMode::ProductionCandidate {
+        let expected_host = expected_host_identity_sha256
+            .context("production opening account requires a latency-calibrated target host")?;
+        if artifact.schema_version != reap_live::ACCOUNT_CERTIFICATION_SCHEMA_VERSION
+            || artifact.java_reference_revision != PINNED_JAVA_REVISION
+            || artifact.reap_version != env!("CARGO_PKG_VERSION")
+            || artifact.executable_sha256 != expected_executable_sha256
+        {
+            bail!(
+                "production dataset {} opening account was certified by a different Reap build or Java reference",
+                dataset.id
+            );
+        }
+        if artifact.host_identity_sha256 != expected_host {
+            bail!(
+                "production dataset {} opening account, capture, and latency calibration do not identify one host",
+                dataset.id
+            );
+        }
+        if artifact.summary.environment != TradingEnvironment::Production {
+            bail!(
+                "production dataset {} opening account is not from the production environment",
+                dataset.id
+            );
+        }
+    }
+
+    let balance = parse_okx_account_balance_response_json(artifact.account_balance.body.as_bytes())
+        .with_context(|| {
+            format!(
+                "failed to parse verified opening balances for dataset {}",
+                dataset.id
+            )
+        })?;
+    let positions =
+        parse_okx_account_positions_response_json(artifact.account_positions.body.as_bytes())
+            .with_context(|| {
+                format!(
+                    "failed to parse verified opening positions for dataset {}",
+                    dataset.id
+                )
+            })?;
+    let mut portfolio = None;
+    for candidate in candidates {
+        let derived = derive_certified_opening_portfolio(
+            dataset,
+            spec,
+            candidate,
+            &live_config,
+            &artifact.summary.account_id,
+            &balance,
+            &positions,
+        )?;
+        if let Some(expected) = &portfolio {
+            if expected != &derived {
+                bail!(
+                    "dataset {} certified opening portfolio differs for candidate {}; candidates must share one account and instrument universe",
+                    dataset.id,
+                    candidate.spec.id
+                );
+            }
+        } else {
+            portfolio = Some(derived);
+        }
+    }
+    let portfolio = portfolio.context("research requires at least one candidate")?;
+    if mode == ResearchMode::ProductionCandidate && !portfolio.has_positive_balance() {
+        bail!(
+            "production dataset {} certified opening account has no positive modeled balance",
+            dataset.id
+        );
+    }
+    Ok((
+        Some(canonical),
+        Some(OpeningAccountProvenance {
+            source_path: spec.certification.clone(),
+            sha256,
+            evidence_sha256,
+            schema_version: artifact.schema_version,
+            reap_version: artifact.reap_version,
+            executable_sha256: artifact.executable_sha256,
+            host_identity_sha256: artifact.host_identity_sha256,
+            live_config_sha256: artifact.config.sha256,
+            live_config_fingerprint: artifact.config_fingerprint,
+            environment: artifact.summary.environment,
+            account_id: artifact.summary.account_id,
+            account_identity_sha256: artifact.summary.account_identity_sha256,
+            certification_finish_local_midpoint_ms: artifact.finish_clock.local_midpoint_ms,
+            certification_finish_server_ms: artifact.finish_clock.server_ms,
+            capture_started_at_ms: capture.session_started_at_ms,
+            capture_gap_ms,
+            spot_valuation_symbols: spec.spot_valuation_symbols.clone(),
+            portfolio,
+        }),
+    ))
+}
+
+fn derive_certified_opening_portfolio(
+    dataset: &ResearchDataset,
+    opening: &ResearchOpeningAccount,
+    candidate: &LoadedCandidate,
+    live_config: &LiveConfig,
+    account_id: &str,
+    balance: &OkxAccountBalanceSnapshot,
+    positions: &OkxAccountPositionsSnapshot,
+) -> Result<BacktestInitialPortfolioConfig> {
+    let candidate_account_ids = candidate
+        .config
+        .strategy
+        .risk_groups
+        .iter()
+        .map(|group| group.account_id.as_deref())
+        .collect::<BTreeSet<_>>();
+    if candidate_account_ids != BTreeSet::from([Some(account_id)]) {
+        bail!(
+            "dataset {} candidate {} must bind every risk group to certified account {:?}",
+            dataset.id,
+            candidate.spec.id,
+            account_id
+        );
+    }
+    if let Some(group) = candidate.config.strategy.risk_groups.iter().find(|group| {
+        group
+            .coins
+            .iter()
+            .any(|coin| coin.borrow_limit_usd != 0.0 || coin.borrow_limit_coin != 0.0)
+    }) {
+        bail!(
+            "dataset {} candidate {} risk group {} enables borrowing, which certified opening accounting does not model",
+            dataset.id,
+            candidate.spec.id,
+            group.name
+        );
+    }
+    validate_certified_instrument_scope(dataset, candidate, live_config, account_id)?;
+
+    let mut required_currencies = BTreeSet::new();
+    let mut spot_base_currencies = BTreeSet::new();
+    for instrument in &candidate.config.strategy.instruments {
+        if instrument.kind.is_spot() {
+            required_currencies.insert(instrument.base_currency.clone());
+            required_currencies.insert(instrument.quote_currency.clone());
+            spot_base_currencies.insert(instrument.base_currency.clone());
+        } else {
+            required_currencies.insert(instrument.settle_currency.clone());
+        }
+    }
+    let mapped_currencies = opening
+        .spot_valuation_symbols
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if mapped_currencies != spot_base_currencies {
+        bail!(
+            "dataset {} opening spot valuation currencies {:?} do not exactly match candidate {} spot bases {:?}",
+            dataset.id,
+            mapped_currencies,
+            candidate.spec.id,
+            spot_base_currencies
+        );
+    }
+
+    let mut details = BTreeMap::new();
+    for detail in &balance.details {
+        if details.insert(detail.currency.as_str(), detail).is_some() {
+            bail!(
+                "dataset {} opening account repeats balance currency {}",
+                dataset.id,
+                detail.currency
+            );
+        }
+        if detail.forced_repayment_indicator.unwrap_or(0) != 0 {
+            bail!(
+                "dataset {} opening account currency {} has an active forced repayment indicator",
+                dataset.id,
+                detail.currency
+            );
+        }
+        let has_unmodeled_value = [
+            detail.cash_balance,
+            detail.available_balance,
+            detail.equity,
+            detail.equity_usd,
+            detail.discounted_equity_usd,
+            detail.unrealized_pnl,
+            detail.liability,
+            detail.cross_liability,
+            detail.isolated_liability,
+            detail.unrealized_loss_liability,
+            detail.accrued_interest,
+            detail.borrow_frozen_usd,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| value != 0.0);
+        if !required_currencies.contains(&detail.currency) && has_unmodeled_value {
+            bail!(
+                "dataset {} opening account has nonzero unmodeled balance or equity in currency {}",
+                dataset.id,
+                detail.currency
+            );
+        }
+    }
+
+    let mut initial_balances = Vec::with_capacity(required_currencies.len());
+    for currency in required_currencies {
+        let detail = details.get(currency.as_str()).copied();
+        let total = detail.and_then(|item| item.cash_balance).unwrap_or(0.0);
+        let available = detail
+            .map(|item| {
+                item.available_balance.with_context(|| {
+                    format!(
+                        "dataset {} opening balance {} omits availBal",
+                        dataset.id, currency
+                    )
+                })
+            })
+            .transpose()?
+            .unwrap_or(0.0);
+        let equity = detail
+            .map(|item| {
+                item.equity.with_context(|| {
+                    format!(
+                        "dataset {} opening balance {} omits eq",
+                        dataset.id, currency
+                    )
+                })
+            })
+            .transpose()?
+            .unwrap_or(0.0);
+        initial_balances.push(BacktestInitialBalanceConfig {
+            currency: currency.clone(),
+            total,
+            available: Some(available),
+            equity: Some(equity),
+            liability: Some(detail.and_then(|item| item.liability).unwrap_or(0.0)),
+            max_loan: Some(detail.and_then(|item| item.max_loan).unwrap_or(0.0)),
+            forced_repayment_indicator: detail.and_then(|item| item.forced_repayment_indicator),
+            valuation_symbol: opening.spot_valuation_symbols.get(&currency).cloned(),
+        });
+    }
+
+    let instruments = candidate
+        .config
+        .strategy
+        .instruments
+        .iter()
+        .map(|instrument| (instrument.symbol.as_str(), instrument))
+        .collect::<HashMap<_, _>>();
+    let mut initial_positions = Vec::new();
+    let mut seen_positions = BTreeSet::new();
+    for risk in &positions.positions {
+        let position = &risk.position;
+        if !seen_positions.insert(position.symbol.as_str()) {
+            bail!(
+                "dataset {} opening account repeats position {}",
+                dataset.id,
+                position.symbol
+            );
+        }
+        if position.qty == 0.0 {
+            continue;
+        }
+        let instrument = instruments.get(position.symbol.as_str()).with_context(|| {
+            format!(
+                "dataset {} opening account has nonzero unmodeled position {}",
+                dataset.id, position.symbol
+            )
+        })?;
+        if instrument.kind.is_spot() {
+            bail!(
+                "dataset {} opening account reported spot position {} instead of cash balance",
+                dataset.id,
+                position.symbol
+            );
+        }
+        initial_positions.push(BacktestInitialPositionConfig {
+            symbol: position.symbol.clone(),
+            qty: position.qty,
+            avg_price: position.avg_price,
+            margin_mode: position.margin_mode,
+        });
+    }
+    initial_positions.sort_by(|left, right| left.symbol.cmp(&right.symbol));
+    let initial = BacktestInitialPortfolioConfig {
+        account_id: Some(account_id.to_string()),
+        balances: initial_balances,
+        positions: initial_positions,
+        margin: BacktestInitialMarginConfig {
+            ratio: None,
+            exchange_ratio: balance.margin_ratio,
+            adjusted_equity_usd: balance.adjusted_equity_usd,
+            notional_usd: balance.notional_usd,
+        },
+    };
+    initial
+        .validate(
+            &candidate.config.strategy.effective(),
+            &candidate.config.backtest,
+        )
+        .with_context(|| {
+            format!(
+                "dataset {} certified opening state is incompatible with candidate {}",
+                dataset.id, candidate.spec.id
+            )
+        })?;
+    Ok(initial)
+}
+
+fn validate_certified_instrument_scope(
+    dataset: &ResearchDataset,
+    candidate: &LoadedCandidate,
+    live_config: &LiveConfig,
+    account_id: &str,
+) -> Result<()> {
+    let source_instruments = live_config
+        .strategy
+        .instruments
+        .iter()
+        .map(|instrument| (instrument.symbol.as_str(), instrument))
+        .collect::<HashMap<_, _>>();
+    let source_groups = live_config
+        .strategy
+        .risk_groups
+        .iter()
+        .map(|group| (group.name.as_str(), group))
+        .collect::<HashMap<_, _>>();
+    for instrument in &candidate.config.strategy.instruments {
+        let source = source_instruments
+            .get(instrument.symbol.as_str())
+            .with_context(|| {
+                format!(
+                    "dataset {} certified live config does not contain candidate {} instrument {}",
+                    dataset.id, candidate.spec.id, instrument.symbol
+                )
+            })?;
+        if source.kind != instrument.kind
+            || source.base_currency != instrument.base_currency
+            || source.quote_currency != instrument.quote_currency
+            || source.settle_currency != instrument.settle_currency
+            || source.contract_value.to_bits() != instrument.contract_value.to_bits()
+        {
+            bail!(
+                "dataset {} certified live instrument {} accounting contract differs from candidate {}",
+                dataset.id,
+                instrument.symbol,
+                candidate.spec.id
+            );
+        }
+        let source_group = source_groups
+            .get(source.risk_group.as_str())
+            .with_context(|| {
+                format!(
+                    "dataset {} certified live instrument {} references unknown risk group {}",
+                    dataset.id, source.symbol, source.risk_group
+                )
+            })?;
+        if source_group.account_id.as_deref() != Some(account_id) {
+            bail!(
+                "dataset {} certified live instrument {} is not routed to account {:?}",
+                dataset.id,
+                source.symbol,
+                account_id
+            );
+        }
+    }
+    Ok(())
 }
 
 fn validate_production_capture_config(
@@ -1676,6 +2298,15 @@ fn verify_input_hashes(
                 );
             }
         }
+        if let (Some(account_path), Some(opening_account)) =
+            (&dataset.resolved_opening_account, &dataset.opening_account)
+            && sha256_path(account_path)? != opening_account.sha256
+        {
+            bail!(
+                "opening account certification for dataset {} changed while research was running",
+                dataset.spec.id
+            );
+        }
     }
     if let Some(calibration) = latency_calibration
         && sha256_path(&calibration.resolved_path)? != calibration.provenance.sha256
@@ -1700,6 +2331,9 @@ fn cached_run(
         return run.clone();
     }
     let mut config = candidate.config.clone();
+    if let Some(opening_account) = &dataset.opening_account {
+        config.initial_portfolio = opening_account.portfolio.clone();
+    }
     config.backtest = effective_scenario_execution(&config.backtest, &scenario.execution)
         .expect("scenario currency rates must be validated before research runs");
     let result = BacktestRunner::from_config(config).and_then(|runner| match dataset.spec.format {
@@ -2421,6 +3055,7 @@ mod tests {
             capture_config: Some(fixture.config_path.clone()),
             capture_report: Some(fixture.report_path.clone()),
             normalized_path: None,
+            opening_account: None,
         }
     }
 
@@ -2438,6 +3073,7 @@ mod tests {
             candidates,
             &executable_sha256,
             Some(&host_identity_sha256),
+            60_000,
         )
     }
 
@@ -2533,6 +3169,7 @@ mod tests {
             maximum_terminal_pending_orders_per_run: 10,
             maximum_terminal_pending_cancel_requests_per_run: 10,
             maximum_clock_regressions_per_run: 0,
+            maximum_opening_account_gap_ms: 60_000,
             minimum_profitable_fold_fraction: 0.0,
             minimum_stress_pass_fraction: 1.0,
             minimum_passing_fold_fraction: 1.0,
@@ -2561,6 +3198,7 @@ mod tests {
                     capture_config: None,
                     capture_report: None,
                     normalized_path: None,
+                    opening_account: None,
                 },
                 ResearchDataset {
                     id: "test".to_string(),
@@ -2569,6 +3207,7 @@ mod tests {
                     capture_config: None,
                     capture_report: None,
                     normalized_path: None,
+                    opening_account: None,
                 },
             ],
             scenarios: vec![
@@ -2617,6 +3256,19 @@ mod tests {
     }
 
     #[test]
+    fn manifest_rejects_mixed_dataset_opening_semantics() {
+        let mut manifest = manifest();
+        manifest.datasets[0].opening_account = Some(ResearchOpeningAccount {
+            certification: PathBuf::from("account.json"),
+            spot_valuation_symbols: BTreeMap::new(),
+        });
+
+        let error = manifest.validate().unwrap_err().to_string();
+
+        assert!(error.contains("must either all provide opening_account"));
+    }
+
+    #[test]
     fn manifest_rejects_latency_stress_without_distribution_dominance() {
         let mut manifest = manifest();
         let rule = |samples_ms| crate::BacktestLatencyRule {
@@ -2642,6 +3294,7 @@ mod tests {
     fn production_manifest_requires_strict_evidence_gates() {
         let mut manifest = manifest();
         manifest.mode = ResearchMode::ProductionCandidate;
+        manifest.gates.maximum_opening_account_gap_ms = MAX_PRODUCTION_OPENING_ACCOUNT_GAP_MS + 1;
 
         let error = manifest.validate().unwrap_err().to_string();
 
@@ -2651,6 +3304,8 @@ mod tests {
         assert!(error.contains("predeclared deployment_candidate_id"));
         assert!(error.contains("capture_config for every dataset"));
         assert!(error.contains("capture_report for every dataset"));
+        assert!(error.contains("opening_account evidence for every dataset"));
+        assert!(error.contains("maximum_opening_account_gap_ms"));
     }
 
     #[test]
@@ -2694,7 +3349,7 @@ mod tests {
     }
 
     #[test]
-    fn production_research_requires_identical_explicit_opening_capital() {
+    fn production_research_reserves_opening_capital_for_certified_datasets() {
         let candidate = |id: &str, total: Option<f64>| LoadedCandidate {
             spec: ResearchCandidate {
                 id: id.to_string(),
@@ -2710,6 +3365,7 @@ mod tests {
                             currency: "USD".to_string(),
                             total,
                             valuation_symbol: None,
+                            ..Default::default()
                         }],
                         ..Default::default()
                     }
@@ -2720,25 +3376,144 @@ mod tests {
         };
 
         let missing = candidate("missing", None);
-        let error =
-            validate_candidate_initial_portfolios(ResearchMode::ProductionCandidate, &[missing])
-                .unwrap_err()
-                .to_string();
-        assert!(error.contains("positive account balance"));
+        validate_candidate_initial_portfolios(ResearchMode::ProductionCandidate, true, &[missing])
+            .unwrap();
 
         let first = candidate("first", Some(10_000.0));
         let different = candidate("different", Some(20_000.0));
-        let error =
-            validate_candidate_initial_portfolios(ResearchMode::Smoke, &[first.clone(), different])
-                .unwrap_err()
-                .to_string();
+        let error = validate_candidate_initial_portfolios(
+            ResearchMode::Smoke,
+            false,
+            &[first.clone(), different],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("identical opening capital and inventory"));
 
-        validate_candidate_initial_portfolios(
+        let error = validate_candidate_initial_portfolios(
             ResearchMode::ProductionCandidate,
+            true,
             &[first.clone(), candidate("same", Some(10_000.0))],
         )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("must omit initial_portfolio"));
+    }
+
+    #[test]
+    fn certified_dataset_derives_exact_strategy_and_accounting_opening_state() {
+        let live_config =
+            LiveConfig::from_toml(include_str!("../../../examples/live-okx-demo.toml")).unwrap();
+        let candidate = LoadedCandidate {
+            spec: ResearchCandidate {
+                id: "base".to_string(),
+                config: PathBuf::from("candidate.toml"),
+            },
+            resolved_path: PathBuf::from("/candidate.toml"),
+            config: BacktestConfig {
+                strategy: live_config.strategy.clone(),
+                backtest: BacktestExecutionConfig {
+                    currency_rates: vec![crate::BacktestCurrencyRateConfig {
+                        currency: "USDT".to_string(),
+                        index_symbol: "USDT-USD".to_string(),
+                        max_age_ms: 75_000,
+                    }],
+                    ..Default::default()
+                },
+                initial_portfolio: Default::default(),
+            },
+            sha256: "a".repeat(64),
+            effective_strategy_sha256: "b".repeat(64),
+        };
+        let dataset = ResearchDataset {
+            id: "capture".to_string(),
+            path: PathBuf::from("capture.jsonl"),
+            format: ResearchDataFormat::RawCapture,
+            capture_config: None,
+            capture_report: None,
+            normalized_path: None,
+            opening_account: Some(ResearchOpeningAccount {
+                certification: PathBuf::from("account.json"),
+                spot_valuation_symbols: BTreeMap::from([(
+                    "BTC".to_string(),
+                    "BTC-USDT".to_string(),
+                )]),
+            }),
+        };
+        let balance = parse_okx_account_balance_response_json(
+            br#"{"code":"0","msg":"","data":[{"uTime":"1000","totalEq":"10100","mgnRatio":"12.5","adjEq":"10000","borrowFroz":"0","notionalUsdForBorrow":"0","notionalUsd":"2000","details":[{"ccy":"BTC","uTime":"999","cashBal":"0.002","availBal":"0.0015","eq":"0.002","eqUsd":"100","disEq":"100","upl":"0","liab":"0","crossLiab":"0","isoLiab":"0","uplLiab":"0","interest":"0","borrowFroz":"0","maxLoan":"0","twap":"0"},{"ccy":"USDT","uTime":"999","cashBal":"9000","availBal":"8000","eq":"10000","eqUsd":"10000","disEq":"10000","upl":"1000","liab":"0","crossLiab":"0","isoLiab":"0","uplLiab":"0","interest":"0","borrowFroz":"0","maxLoan":"500","twap":"0"}]}]}"#,
+        )
         .unwrap();
+        let positions = parse_okx_account_positions_response_json(
+            br#"{"code":"0","msg":"","data":[{"instType":"SWAP","instId":"BTC-USDT-SWAP","pos":"2","posSide":"net","mgnMode":"cross","avgPx":"50000","uTime":"1001","liab":"","interest":""}]}"#,
+        )
+        .unwrap();
+
+        let initial = derive_certified_opening_portfolio(
+            &dataset,
+            dataset.opening_account.as_ref().unwrap(),
+            &candidate,
+            &live_config,
+            "main",
+            &balance,
+            &positions,
+        )
+        .unwrap();
+
+        assert_eq!(initial.account_id.as_deref(), Some("main"));
+        assert_eq!(initial.balances.len(), 2);
+        let btc = initial
+            .balances
+            .iter()
+            .find(|balance| balance.currency == "BTC")
+            .unwrap();
+        assert_eq!(btc.total, 0.002);
+        assert_eq!(btc.available, Some(0.0015));
+        assert_eq!(btc.valuation_symbol.as_deref(), Some("BTC-USDT"));
+        let usdt = initial
+            .balances
+            .iter()
+            .find(|balance| balance.currency == "USDT")
+            .unwrap();
+        assert_eq!(usdt.total, 9_000.0);
+        assert_eq!(usdt.available, Some(8_000.0));
+        assert_eq!(usdt.equity, Some(10_000.0));
+        assert_eq!(usdt.max_loan, Some(500.0));
+        assert_eq!(initial.positions.len(), 1);
+        assert_eq!(initial.positions[0].qty, 2.0);
+        assert_eq!(initial.positions[0].avg_price, 50_000.0);
+        assert_eq!(
+            initial.positions[0].margin_mode,
+            Some(reap_core::PositionMarginMode::Cross)
+        );
+        assert_eq!(initial.margin.exchange_ratio, Some(12.5));
+        assert_eq!(initial.margin.adjusted_equity_usd, Some(10_000.0));
+        assert_eq!(initial.margin.notional_usd, Some(2_000.0));
+
+        let mut unsafe_balance = balance.clone();
+        let mut unmodeled = unsafe_balance.details[0].clone();
+        unmodeled.currency = "ETH".to_string();
+        unmodeled.cash_balance = Some(0.0);
+        unmodeled.available_balance = Some(0.0);
+        unmodeled.equity = Some(0.0);
+        unmodeled.equity_usd = Some(0.0);
+        unmodeled.discounted_equity_usd = Some(0.0);
+        unmodeled.unrealized_pnl = Some(0.0);
+        unmodeled.liability = Some(0.0);
+        unmodeled.forced_repayment_indicator = Some(1);
+        unsafe_balance.details.push(unmodeled);
+        let error = derive_certified_opening_portfolio(
+            &dataset,
+            dataset.opening_account.as_ref().unwrap(),
+            &candidate,
+            &live_config,
+            "main",
+            &unsafe_balance,
+            &positions,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("active forced repayment indicator"));
     }
 
     #[test]
@@ -2787,6 +3562,7 @@ mod tests {
             capture_config: None,
             capture_report: None,
             normalized_path: None,
+            opening_account: None,
         }];
 
         let error = load_test_production_datasets(&datasets, &base, &[])
@@ -2848,6 +3624,7 @@ mod tests {
             &[],
             &"d".repeat(64),
             Some(&expected_host),
+            60_000,
         )
         .unwrap_err()
         .to_string();
@@ -2868,6 +3645,7 @@ mod tests {
             &[],
             &expected_executable,
             Some(&expected_host),
+            60_000,
         )
         .unwrap_err()
         .to_string();

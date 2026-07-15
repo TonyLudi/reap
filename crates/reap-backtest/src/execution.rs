@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::{Result, bail};
 pub use reap_core::BacktestLatencyClass;
-use reap_core::{AccountUpdate, Balance, Position, PositionMarginMode, Symbol};
+use reap_core::{AccountUpdate, Balance, MarginSnapshot, Position, PositionMarginMode, Symbol};
 use reap_strategy::ChaosConfig;
 use serde::{Deserialize, Serialize};
 
@@ -16,16 +16,48 @@ const MAX_INITIAL_POSITIONS: usize = 4_096;
 const MAX_INITIAL_VALUE: f64 = 1.0e18;
 const DEFAULT_CURRENCY_RATE_MAX_AGE_MS: u64 = 75_000;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct BacktestInitialBalanceConfig {
     /// Exchange account currency, for example `BTC` or `USDT`.
     pub currency: String,
     /// Authoritative opening cash balance. Borrowing is not modeled, so this is non-negative.
     pub total: f64,
+    /// Exchange available balance. Omission preserves the legacy `total` fallback.
+    #[serde(default)]
+    pub available: Option<f64>,
+    /// Exchange currency equity. Omission preserves the legacy `total` fallback.
+    #[serde(default)]
+    pub equity: Option<f64>,
+    /// Opening liability. The cash-only backtest model requires zero.
+    #[serde(default)]
+    pub liability: Option<f64>,
+    /// Exchange-reported maximum loan, retained for Java strategy parity.
+    #[serde(default)]
+    pub max_loan: Option<f64>,
+    #[serde(default)]
+    pub forced_repayment_indicator: Option<u8>,
     /// Spot instrument used to value this currency as inventory instead of generic cash.
     #[serde(default)]
     pub valuation_symbol: Option<Symbol>,
+}
+
+impl BacktestInitialBalanceConfig {
+    pub fn available(&self) -> f64 {
+        self.available.unwrap_or(self.total)
+    }
+
+    pub fn equity(&self) -> f64 {
+        self.equity.unwrap_or(self.total)
+    }
+
+    pub fn liability(&self) -> f64 {
+        self.liability.unwrap_or(0.0)
+    }
+
+    pub fn max_loan(&self) -> f64 {
+        self.max_loan.unwrap_or(0.0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -40,17 +72,36 @@ pub struct BacktestInitialPositionConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
+pub struct BacktestInitialMarginConfig {
+    pub ratio: Option<f64>,
+    pub exchange_ratio: Option<f64>,
+    pub adjusted_equity_usd: Option<f64>,
+    pub notional_usd: Option<f64>,
+}
+
+impl BacktestInitialMarginConfig {
+    pub fn is_empty(&self) -> bool {
+        self.ratio.is_none()
+            && self.exchange_ratio.is_none()
+            && self.adjusted_equity_usd.is_none()
+            && self.notional_usd.is_none()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BacktestInitialPortfolioConfig {
     /// One account snapshot per runner. Omit only when strategy risk groups omit account IDs.
     pub account_id: Option<String>,
     pub balances: Vec<BacktestInitialBalanceConfig>,
     /// Derivative positions only. Spot inventory is supplied through `balances`.
     pub positions: Vec<BacktestInitialPositionConfig>,
+    pub margin: BacktestInitialMarginConfig,
 }
 
 impl BacktestInitialPortfolioConfig {
     pub fn is_empty(&self) -> bool {
-        self.balances.is_empty() && self.positions.is_empty()
+        self.balances.is_empty() && self.positions.is_empty() && self.margin.is_empty()
     }
 
     pub fn has_positive_balance(&self) -> bool {
@@ -146,6 +197,37 @@ impl BacktestInitialPortfolioConfig {
             {
                 bail!(
                     "initial_portfolio balance {} total must be finite and within [0, {MAX_INITIAL_VALUE}]",
+                    balance.currency
+                );
+            }
+            for (field, value) in [
+                ("available", balance.available()),
+                ("equity", balance.equity()),
+                ("liability", balance.liability()),
+                ("max_loan", balance.max_loan()),
+            ] {
+                if !value.is_finite() || value.abs() > MAX_INITIAL_VALUE {
+                    bail!(
+                        "initial_portfolio balance {} {field} must be finite and within [-{MAX_INITIAL_VALUE}, {MAX_INITIAL_VALUE}]",
+                        balance.currency
+                    );
+                }
+            }
+            if balance.liability() != 0.0 {
+                bail!(
+                    "initial_portfolio balance {} liability must be zero because borrowing is not modeled",
+                    balance.currency
+                );
+            }
+            if balance.max_loan() < 0.0 {
+                bail!(
+                    "initial_portfolio balance {} max_loan must be non-negative",
+                    balance.currency
+                );
+            }
+            if balance.forced_repayment_indicator.unwrap_or(0) != 0 {
+                bail!(
+                    "initial_portfolio balance {} has an active forced repayment indicator",
                     balance.currency
                 );
             }
@@ -263,6 +345,20 @@ impl BacktestInitialPortfolioConfig {
                 );
             }
         }
+        for (field, value) in [
+            ("ratio", self.margin.ratio),
+            ("exchange_ratio", self.margin.exchange_ratio),
+            ("adjusted_equity_usd", self.margin.adjusted_equity_usd),
+            ("notional_usd", self.margin.notional_usd),
+        ] {
+            if let Some(value) = value
+                && (!value.is_finite() || !(0.0..=MAX_INITIAL_VALUE).contains(&value))
+            {
+                bail!(
+                    "initial_portfolio margin {field} must be finite and within [0, {MAX_INITIAL_VALUE}]"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -276,11 +372,11 @@ impl BacktestInitialPortfolioConfig {
                     account_id: self.account_id.clone(),
                     currency: balance.currency.clone(),
                     total: balance.total,
-                    available: balance.total,
-                    equity: balance.total,
-                    liability: 0.0,
-                    max_loan: 0.0,
-                    forced_repayment_indicator: None,
+                    available: balance.available(),
+                    equity: balance.equity(),
+                    liability: balance.liability(),
+                    max_loan: balance.max_loan(),
+                    forced_repayment_indicator: balance.forced_repayment_indicator,
                 })
                 .collect(),
             positions: self
@@ -293,7 +389,17 @@ impl BacktestInitialPortfolioConfig {
                     margin_mode: position.margin_mode,
                 })
                 .collect(),
-            margins: Vec::new(),
+            margins: if self.margin.is_empty() {
+                Vec::new()
+            } else {
+                vec![MarginSnapshot {
+                    account_id: self.account_id.clone(),
+                    ratio: self.margin.ratio,
+                    exchange_ratio: self.margin.exchange_ratio,
+                    adjusted_equity_usd: self.margin.adjusted_equity_usd,
+                    notional_usd: self.margin.notional_usd,
+                }]
+            },
         }
     }
 }
@@ -929,6 +1035,7 @@ mod tests {
                 currency: "BTC".to_string(),
                 total: 0.1,
                 valuation_symbol: None,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -944,6 +1051,7 @@ mod tests {
                 currency: "BTC".to_string(),
                 total: 0.0,
                 valuation_symbol: Some("BTC-USDT".to_string()),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -952,6 +1060,41 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("missing currencies: USDT"));
+    }
+
+    #[test]
+    fn initial_account_event_preserves_certified_balance_and_margin_fields() {
+        let initial = BacktestInitialPortfolioConfig {
+            account_id: Some("main".to_string()),
+            balances: vec![BacktestInitialBalanceConfig {
+                currency: "USDT".to_string(),
+                total: 9_000.0,
+                available: Some(8_000.0),
+                equity: Some(10_000.0),
+                liability: Some(0.0),
+                max_loan: Some(500.0),
+                forced_repayment_indicator: Some(0),
+                valuation_symbol: None,
+            }],
+            margin: BacktestInitialMarginConfig {
+                ratio: None,
+                exchange_ratio: Some(12.5),
+                adjusted_equity_usd: Some(10_000.0),
+                notional_usd: Some(2_000.0),
+            },
+            ..Default::default()
+        };
+
+        let update = initial.account_update(1_000);
+
+        assert_eq!(update.ts_ms, 1_000);
+        assert_eq!(update.balances[0].available, 8_000.0);
+        assert_eq!(update.balances[0].equity, 10_000.0);
+        assert_eq!(update.balances[0].max_loan, 500.0);
+        assert_eq!(update.balances[0].forced_repayment_indicator, Some(0));
+        assert_eq!(update.margins[0].exchange_ratio, Some(12.5));
+        assert_eq!(update.margins[0].adjusted_equity_usd, Some(10_000.0));
+        assert_eq!(update.margins[0].notional_usd, Some(2_000.0));
     }
 
     #[test]

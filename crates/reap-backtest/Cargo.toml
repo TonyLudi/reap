@@ -10,6 +10,7 @@ reap-book.workspace = true
 reap-capture.workspace = true
 reap-core.workspace = true
 reap-feed.workspace = true
+reap-live.workspace = true
 reap-order.workspace = true
 reap-strategy.workspace = true
 reap-venue.workspace = true

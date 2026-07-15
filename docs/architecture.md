@@ -766,9 +766,13 @@ evidence; those fees are booked in spot base/quote balances, inverse settlement
 coin, or the reported third currency as applicable. Public-data
 matching has no account fee event, so it estimates fees from configured
 maker/taker rates. Reports expose exact and estimated fee-fill counts. The
-opening model intentionally supports one account, treats available balance as
-total balance, and rejects negative balances because it does not model account
-holds, borrowing interest, liquidation, margin discounts, or tax. It cannot
+opening model intentionally supports one account. Manual snapshots default
+available/equity to cash total, while certified snapshots retain OKX
+`availBal`, `eq`, `maxLoan`, forced-repayment indicator, `mgnRatio`, `adjEq`, and
+`notionalUsd`. Post-fill synthetic updates preserve opening available/equity
+offsets as cash changes; they are not a dynamic exchange margin engine. Cash
+total remains non-negative and liability must be zero because the model does
+not support borrowing interest, liquidation, margin discounts, or tax. It cannot
 infer a missing funding event when the source dataset never contained one. A
 separate offline production-evidence path
 now reconstructs normal trade/funding bills and derivative close PnL from
@@ -825,15 +829,23 @@ acceptance explicit in a versioned TOML manifest:
   settlement gate.
 
 Each Rust dataset starts from an independent strategy instance and either zero
-state (`independent_zero_initial_portfolio`) or the candidate's exact configured
-snapshot (`independent_configured_initial_portfolio`). Every candidate in one
-research run must use the same snapshot, and schema-6 production research
-requires positive opening capital. This still differs from Java's daily ending
-position carry: use one continuous capture as an evaluation dataset when
+state (`independent_zero_initial_portfolio`), a candidate's exact configured
+snapshot (`independent_configured_initial_portfolio`), or a dataset-specific
+account certification (`independent_certified_dataset_portfolio`). Schema-7
+production candidate files must omit opening capital. Every raw dataset instead
+references one unique certification collected before its capture and supplies
+an explicit currency-to-spot valuation mapping. Research invokes the existing
+offline verifier against embedded raw OKX responses, then requires a passing
+cash/zero-liability policy, production environment, identical Reap executable
+and pinned Java revision, the latency-calibrated capture host, one account-bound
+candidate instrument universe, a bounded certification-to-capture gap, and no
+nonzero unmodeled currency or position. It derives one exact portfolio and
+requires that derivation to be identical for every candidate. This still differs
+from Java's daily ending position carry: use one continuous capture as an evaluation dataset when
 inventory continuity matters, and constrain terminal delta/gross exposure in
 the manifest. Cross-file position carry must not be inferred. Aggregation now
 sums each run's opening-adjusted `net_pnl_usd`, never final account equity, and
-terminal strategy safety halts are explicit evidence failures. A schema-6
+terminal strategy safety halts are explicit evidence failures. A schema-7
 `production_candidate` manifest additionally requires one
 predeclared deployment candidate, at least three folds, two stress scenarios,
 nonzero event, fill, and duration gates, calibrated baseline execution whose
@@ -842,13 +854,14 @@ complete accounting, and explicit bounds on non-funding work censored by each
 data horizon. Stress scenarios may use explicitly uncalibrated deterministic
 haircuts.
 
-The configured opening snapshot is fingerprinted research input, not an
-authenticated exchange statement. Schema 6 prevents candidate-specific capital
-and zero-start accounting, but it does not yet prove that a historical or live
-account certification had those exact balances and average costs at the dataset
-boundary. Production approval must retain that as an open provenance gate until
-the snapshot is derived from and independently bound to account evidence, or
-the evaluation uses one continuous capture whose opening state is so bound.
+The certified opening snapshot remains point-in-time evidence, not an exchange
+statement or an atomic venue tick. The account must remain quiescent between
+certification and capture, and no passing target-account artifact exists yet.
+Schema 7 closes candidate-specific capital and source-binding gaps, but separate
+capture files still do not carry simulated ending balances, derivative average
+cost, or settlement state into the next file as Java
+`updateInputForNextRun()` does. Use one continuous evaluation capture until that
+carry contract is implemented and verified.
 
 The CLI independently verifies a schema-4 latency artifact before release use.
 It re-hashes an explicit complete set of archived live reports, reruns each
@@ -861,19 +874,22 @@ profile drift.
 The CLI also independently verifies a research report. It reads bounded regular
 manifest/report files, rejects symlinks and path collision, requires the pinned
 Java revision plus the current executable/version, re-runs the complete
-manifest, and compares the full report after normalizing only canonical paths
-introduced by capture verification to their content hashes. Unknown, duplicate,
+manifest, and compares the full report after normalizing only source paths
+introduced by capture and opening-account verification to their content hashes. Unknown, duplicate,
 omitted, stale, forged, non-passing, or numerically different results fail closed. The
 verification artifact carries the exact source hashes and a bounded first
 difference diagnostic; it remains simulation evidence rather than production
 authorization.
 
-The format-2 research verifier also derives one deployment candidate ID and
+The format-3 research verifier also derives one deployment candidate ID,
+the dataset opening-account identity/build/host summaries, and
 effective strategy hash from the report, requiring exactly one matching
 candidate provenance row and the same training-selected ID in every production
 fold. `verify-research-deployment` then loads an exact production `LiveConfig`,
-hashes `strategy.effective()` through the same function used by research, and
-requires equality. This closes the research-to-live strategy identity boundary;
+requires every opening certification's embedded config SHA-256 to match those
+exact bytes, hashes `strategy.effective()` through the same function used by
+research, and requires equality. This closes the research-to-live strategy
+identity boundary;
 it deliberately does not aggregate or replace host, account, transition, fault,
 statement, deadman, or emergency evidence.
 
