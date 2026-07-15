@@ -976,6 +976,8 @@ Credential-free public market-data composition.
 Responsibilities:
 
 - Build explicit public-only subscription plans from TOML.
+- Load at most 16 MiB from one canonical regular config file, reject symbolic
+  links, and retain that canonical source path with the exact byte evidence.
 - Provide one reviewed production-shaped public config with an absolute shared
   connection pacer; systemd reuses its exact bytes and supplies unique
   create-new raw/report paths for each capture instance.
@@ -996,6 +998,10 @@ Responsibilities:
 - Optionally persist deduplicated normalized events for short diagnostics.
 - Report connection readiness, queue high-water marks, parser failures,
   duplicates, gaps, recoveries, and final book health.
+- Classify stream identity once for runtime and offline analysis. A clean run
+  requires every configured logical stream to produce data from exactly its
+  configured number of source connections and at least one accepted event;
+  unclassified or unexpected data streams fail the same contract.
 - Stream raw files through the live adapter/reducer path to measure configured
   source coverage, receive/exchange timing, depth, spread, movement, and trade
   distributions without retaining the dataset in memory.

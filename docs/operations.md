@@ -28,6 +28,9 @@ The example captures spot and swap books/trades plus index, swap funding, swap
 mark, and separate spot/swap price-limit inputs used by iarb2. Every
 subscription has two independent connections. Raw frames are canonical and
 written sequentially within one run.
+The capture config loader accepts at most 16 MiB from one regular non-symlink
+file, canonicalizes its source path, and records that path with the exact bytes
+and SHA-256 in run evidence.
 The capture event loop assigns each frame a process-global `capture_record_seq`
 before the bounded writer, independent of OKX's channel-specific book sequence.
 The optional
@@ -175,11 +178,16 @@ than the old CRC algorithm. See the current [OKX API guide](https://www.okx.com/
 and [checksum deprecation announcement](https://www.okx.com/en-us/help/okx-order-book-channels-checksum-field-deprecation).
 
 `clean_capture` requires a bounded duration, all socket plans ready at least
-once and at stop, a ready contiguous snapshot for every configured book,
-non-empty raw output, and zero parse, gap, stale-book, recovery-request,
-recovery-route, or recovery-failure counts. It also requires host evidence to
-match the configured guard, including a healthy preflight and every completed
-periodic check. A redundant-socket disconnect can
+once and at stop, a ready contiguous snapshot for every configured book, and
+data from exactly the configured replica count plus at least one accepted event
+for every configured book, trade, index, funding, mark, and price-limit stream.
+Unclassified or unexpected data streams fail the contract. It also requires
+non-empty raw output; zero parse, gap, stale-book, recovery-request,
+recovery-route, or recovery-failure counts; and host evidence matching the
+configured guard, including a healthy preflight and every completed periodic
+check. `--require-clean-capture` applies this full contract at runtime, and
+`verify-capture` independently reconstructs it from raw frames. A
+redundant-socket disconnect can
 remain clean only when the other replica preserves sequence continuity;
 inspect disconnect, duplicate, and writer queue counts on every run.
 

@@ -1,7 +1,7 @@
 mod analysis;
 mod verification;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -38,6 +38,7 @@ pub use analysis::*;
 pub use verification::*;
 
 pub const CAPTURE_RUN_REPORT_FORMAT_VERSION: u16 = 5;
+pub const MAX_CAPTURE_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CONNECTION_ATTEMPT_INTERVAL_MS: u64 = 60_000;
 const MAX_REPORTED_UNKNOWN_FIELDS: usize = 64;
 
@@ -247,11 +248,19 @@ pub struct CaptureRunReport {
 
 #[derive(Debug, Error)]
 pub enum CaptureError {
+    #[error("invalid capture config path {path}: {message}")]
+    InvalidConfigPath { path: PathBuf, message: String },
     #[error("failed to read capture config {path}: {source}")]
     ReadConfig {
         path: PathBuf,
         #[source]
         source: std::io::Error,
+    },
+    #[error("capture config {path} is {actual} bytes; maximum is {limit}")]
+    ConfigTooLarge {
+        path: PathBuf,
+        actual: u64,
+        limit: u64,
     },
     #[error("failed to parse capture config: {0}")]
     ParseConfig(#[from] toml::de::Error),
@@ -304,17 +313,48 @@ impl CaptureConfig {
     pub fn load_with_evidence(
         path: impl AsRef<Path>,
     ) -> Result<(Self, CaptureConfigFileEvidence), CaptureError> {
-        let path = path.as_ref();
-        let bytes = std::fs::read(path).map_err(|source| CaptureError::ReadConfig {
-            path: path.to_path_buf(),
+        let requested_path = path.as_ref();
+        let metadata = std::fs::symlink_metadata(requested_path).map_err(|source| {
+            CaptureError::ReadConfig {
+                path: requested_path.to_path_buf(),
+                source,
+            }
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(CaptureError::InvalidConfigPath {
+                path: requested_path.to_path_buf(),
+                message: "must be a regular file and not a symbolic link".to_string(),
+            });
+        }
+        let path =
+            std::fs::canonicalize(requested_path).map_err(|source| CaptureError::ReadConfig {
+                path: requested_path.to_path_buf(),
+                source,
+            })?;
+        if metadata.len() > MAX_CAPTURE_CONFIG_BYTES {
+            return Err(CaptureError::ConfigTooLarge {
+                path,
+                actual: metadata.len(),
+                limit: MAX_CAPTURE_CONFIG_BYTES,
+            });
+        }
+        let bytes = std::fs::read(&path).map_err(|source| CaptureError::ReadConfig {
+            path: path.clone(),
             source,
         })?;
+        if bytes.len() as u64 > MAX_CAPTURE_CONFIG_BYTES {
+            return Err(CaptureError::ConfigTooLarge {
+                path,
+                actual: bytes.len() as u64,
+                limit: MAX_CAPTURE_CONFIG_BYTES,
+            });
+        }
         let text = std::str::from_utf8(&bytes).map_err(|error| {
             CaptureError::InvalidConfig(format!("capture config is not UTF-8: {error}"))
         })?;
         let config = Self::from_toml(text)?;
         let evidence = CaptureConfigFileEvidence {
-            source_path: path.to_path_buf(),
+            source_path: path,
             bytes: bytes.len() as u64,
             sha256: sha256_hex(&bytes),
         };
@@ -639,6 +679,7 @@ pub async fn run_capture(
         .iter()
         .map(|plan| plan.conn_id.clone())
         .collect::<HashSet<_>>();
+    let stream_coverage = CaptureStreamCoverageState::new(&config.subscriptions);
     let raw_writer = JsonlWriter::start(
         "raw",
         config.output.raw_path.clone(),
@@ -692,6 +733,7 @@ pub async fn run_capture(
         config.runtime.max_sequence_buffer,
         expected_connections,
         config.expected_book_symbols(),
+        stream_coverage,
         capture_session_id,
     );
     let loop_result = run_capture_loop(
@@ -905,6 +947,7 @@ struct CaptureState {
     next_raw_record_seq: u64,
     expected_connections: HashSet<reap_core::ConnId>,
     expected_book_symbols: HashSet<String>,
+    stream_coverage: CaptureStreamCoverageState,
     ready_connections: HashSet<reap_core::ConnId>,
     reached_all_connections_ready: bool,
     parse_errors: u64,
@@ -912,6 +955,78 @@ struct CaptureState {
     connection_disconnects: u64,
     recovery_requests: u64,
     missing_recovery_routes: u64,
+}
+
+#[derive(Default)]
+struct CaptureStreamObservation {
+    data_sources: BTreeSet<String>,
+    data_frames: u64,
+    accepted_events: u64,
+}
+
+#[derive(Default)]
+struct CaptureStreamCoverageState {
+    expected_connections: BTreeMap<analysis::StreamKey, usize>,
+    observed: BTreeMap<analysis::StreamKey, CaptureStreamObservation>,
+    unclassified_data_frames: u64,
+}
+
+impl CaptureStreamCoverageState {
+    fn new(subscriptions: &[CaptureSubscriptionConfig]) -> Self {
+        Self {
+            expected_connections: subscriptions
+                .iter()
+                .map(|subscription| {
+                    (
+                        analysis::StreamKey {
+                            channel: subscription.channel.trim().to_string(),
+                            symbol: subscription.symbol.trim().to_string(),
+                        },
+                        subscription.connections,
+                    )
+                })
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    fn observe_frame(&mut self, capture: &RawCapture) {
+        if !analysis::is_data_frame(capture) {
+            return;
+        }
+        let Some(key) = analysis::capture_stream_key(capture) else {
+            self.unclassified_data_frames = self.unclassified_data_frames.saturating_add(1);
+            return;
+        };
+        let observation = self.observed.entry(key).or_default();
+        observation.data_frames = observation.data_frames.saturating_add(1);
+        observation.data_sources.insert(capture.conn_id.0.clone());
+    }
+
+    fn observe_accepted(&mut self, key: Option<&analysis::StreamKey>, accepted: u64) {
+        if accepted == 0 {
+            return;
+        }
+        let Some(key) = key else {
+            return;
+        };
+        let observation = self.observed.entry(key.clone()).or_default();
+        observation.accepted_events = observation.accepted_events.saturating_add(accepted);
+    }
+
+    fn complete(&self) -> bool {
+        self.unclassified_data_frames == 0
+            && self.observed.iter().all(|(key, observation)| {
+                observation.data_frames == 0 || self.expected_connections.contains_key(key)
+            })
+            && self.expected_connections.iter().all(|(key, expected)| {
+                self.observed.get(key).is_some_and(|observation| {
+                    observation.data_sources.len() == *expected
+                        && observation.data_frames > 0
+                        && observation.accepted_events > 0
+                })
+            })
+    }
 }
 
 struct CaptureRunProvenance {
@@ -945,6 +1060,7 @@ impl CaptureState {
         max_sequence_buffer: usize,
         expected_connections: HashSet<reap_core::ConnId>,
         expected_book_symbols: HashSet<String>,
+        stream_coverage: CaptureStreamCoverageState,
         capture_session_id: String,
     ) -> Self {
         Self {
@@ -953,6 +1069,7 @@ impl CaptureState {
             next_raw_record_seq: 1,
             expected_connections,
             expected_book_symbols,
+            stream_coverage,
             ready_connections: HashSet::new(),
             reached_all_connections_ready: false,
             parse_errors: 0,
@@ -988,13 +1105,10 @@ impl CaptureState {
         let next_raw_record_seq = capture_record_seq
             .checked_add(1)
             .ok_or(CaptureError::RawRecordSequenceExhausted)?;
-        raw_writer
-            .send(raw_capture(
-                &envelope,
-                &self.capture_session_id,
-                capture_record_seq,
-            ))
-            .await?;
+        let capture = raw_capture(&envelope, &self.capture_session_id, capture_record_seq);
+        let frame_stream = analysis::capture_stream_key(&capture);
+        self.stream_coverage.observe_frame(&capture);
+        raw_writer.send(capture).await?;
         self.next_raw_record_seq = next_raw_record_seq;
         let parsed = match adapter.parse(&envelope) {
             Ok(parsed) => parsed,
@@ -1007,7 +1121,19 @@ impl CaptureState {
 
         let mut recoveries = Vec::new();
         for parsed in parsed {
-            for output in self.processor.process_from(&envelope.conn_id, parsed) {
+            let stream = frame_stream
+                .clone()
+                .or_else(|| analysis::parsed_stream_key(&parsed));
+            let accepted_before = self.processor.stats().accepted;
+            let outputs = self.processor.process_from(&envelope.conn_id, parsed);
+            let accepted = self
+                .processor
+                .stats()
+                .accepted
+                .saturating_sub(accepted_before);
+            self.stream_coverage
+                .observe_accepted(stream.as_ref(), accepted);
+            for output in outputs {
                 match output {
                     FeedOutput::Event(event) => {
                         if let Some(writer) = normalized_writer {
@@ -1094,6 +1220,7 @@ impl CaptureState {
             && self.reached_all_connections_ready
             && all_connections_ready
             && all_books_ready
+            && self.stream_coverage.complete()
             && raw.records > 0
             && raw.records == self.next_raw_record_seq.saturating_sub(1)
             && (config.output.normalized_path.is_none() || normalized.records > 0)
@@ -1424,7 +1551,7 @@ async fn shutdown_signal() -> Result<(), std::io::Error> {
 
 #[cfg(test)]
 mod tests {
-    use reap_core::{Level, MarketEvent, OrderBook};
+    use reap_core::{Channel, ConnId, Level, MarketEvent, OrderBook, Venue};
 
     use super::*;
 
@@ -1482,6 +1609,68 @@ mod tests {
             deployment.fingerprint().unwrap(),
             local.fingerprint().unwrap()
         );
+    }
+
+    #[test]
+    fn config_loader_records_one_canonical_source_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("capture.toml");
+        let alias_directory = directory.path().join("alias");
+        std::fs::create_dir(&alias_directory).unwrap();
+        std::fs::write(
+            &config_path,
+            include_str!("../../../examples/capture-okx-public.toml"),
+        )
+        .unwrap();
+
+        let (_, direct) = CaptureConfig::load_with_evidence(&config_path).unwrap();
+        let (_, aliased) =
+            CaptureConfig::load_with_evidence(alias_directory.join("..").join("capture.toml"))
+                .unwrap();
+
+        assert_eq!(direct, aliased);
+        assert_eq!(
+            direct.source_path,
+            std::fs::canonicalize(config_path).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_loader_rejects_symbolic_link() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("capture.toml");
+        let symlink_path = directory.path().join("capture-link.toml");
+        std::fs::write(
+            &config_path,
+            include_str!("../../../examples/capture-okx-public.toml"),
+        )
+        .unwrap();
+        symlink(&config_path, &symlink_path).unwrap();
+
+        assert!(matches!(
+            CaptureConfig::load_with_evidence(&symlink_path),
+            Err(CaptureError::InvalidConfigPath { path, .. }) if path == symlink_path
+        ));
+    }
+
+    #[test]
+    fn config_loader_rejects_oversized_regular_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("capture.toml");
+        let file = std::fs::File::create(&config_path).unwrap();
+        file.set_len(MAX_CAPTURE_CONFIG_BYTES + 1).unwrap();
+
+        assert!(matches!(
+            CaptureConfig::load_with_evidence(&config_path),
+            Err(CaptureError::ConfigTooLarge {
+                actual,
+                limit: MAX_CAPTURE_CONFIG_BYTES,
+                ..
+            }) if actual == MAX_CAPTURE_CONFIG_BYTES + 1
+        ));
     }
 
     #[test]
@@ -1735,6 +1924,7 @@ mod tests {
             16,
             HashSet::new(),
             config.expected_book_symbols(),
+            CaptureStreamCoverageState::new(&config.subscriptions),
             "test-session".to_string(),
         );
         state.reached_all_connections_ready = true;
@@ -1783,6 +1973,48 @@ mod tests {
         assert_eq!(report.books.len(), 2);
         assert_eq!(report.books[1].symbol, "ETH-USDT");
         assert_eq!(report.books[1].sequence_status, "awaiting_snapshot");
+    }
+
+    #[test]
+    fn stream_coverage_requires_every_stream_replica_and_accepted_event() {
+        let subscriptions = vec![
+            CaptureSubscriptionConfig {
+                channel: "books".to_string(),
+                symbol: "BTC-USDT".to_string(),
+                connections: 2,
+                priority: CapturePriority::Critical,
+            },
+            CaptureSubscriptionConfig {
+                channel: "trades".to_string(),
+                symbol: "BTC-USDT".to_string(),
+                connections: 2,
+                priority: CapturePriority::High,
+            },
+        ];
+        let book = analysis::StreamKey {
+            channel: "books".to_string(),
+            symbol: "BTC-USDT".to_string(),
+        };
+        let trade = analysis::StreamKey {
+            channel: "trades".to_string(),
+            symbol: "BTC-USDT".to_string(),
+        };
+        let mut coverage = CaptureStreamCoverageState::new(&subscriptions);
+
+        coverage.observe_frame(&stream_capture("books", "BTC-USDT", "book-1"));
+        coverage.observe_frame(&stream_capture("books", "BTC-USDT", "book-2"));
+        coverage.observe_accepted(Some(&book), 1);
+        assert!(!coverage.complete());
+
+        coverage.observe_frame(&stream_capture("trades", "BTC-USDT", "trade-1"));
+        coverage.observe_accepted(Some(&trade), 1);
+        assert!(!coverage.complete());
+
+        coverage.observe_frame(&stream_capture("trades", "BTC-USDT", "trade-2"));
+        assert!(coverage.complete());
+
+        coverage.observe_frame(&stream_capture("index-tickers", "BTC-USDT", "unexpected"));
+        assert!(!coverage.complete());
     }
 
     #[tokio::test]
@@ -1992,6 +2224,7 @@ mod tests {
             16,
             HashSet::new(),
             HashSet::new(),
+            CaptureStreamCoverageState::default(),
             "test-session".to_string(),
         );
 
@@ -2016,5 +2249,26 @@ mod tests {
             Some("test-session")
         );
         assert_eq!(persisted.capture_record_seq, Some(1));
+    }
+
+    fn stream_capture(channel: &str, symbol: &str, conn_id: &str) -> RawCapture {
+        RawCapture {
+            capture_session_id: Some("test-session".to_string()),
+            capture_record_seq: Some(1),
+            venue: Venue::Okx,
+            conn_id: ConnId::new(conn_id),
+            channel: match channel {
+                "books" => Channel::Books,
+                "trades" => Channel::Trades,
+                channel => Channel::Custom(channel.to_string()),
+            },
+            symbol: Some(symbol.to_string()),
+            recv_ts_ns: 1,
+            raw_hash: None,
+            payload: serde_json::json!({
+                "arg": {"channel": channel, "instId": symbol},
+                "data": [{"instId": symbol}],
+            }),
+        }
     }
 }

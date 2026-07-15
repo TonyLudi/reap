@@ -197,9 +197,9 @@ pub fn analyze_capture<R: Read>(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct StreamKey {
-    channel: String,
-    symbol: String,
+pub(crate) struct StreamKey {
+    pub(crate) channel: String,
+    pub(crate) symbol: String,
 }
 
 struct CaptureAnalyzer<'a> {
@@ -844,7 +844,7 @@ fn quantile(sorted: &[f64], probability: f64) -> Option<f64> {
     sorted.get(index).copied()
 }
 
-fn capture_stream_key(capture: &RawCapture) -> Option<StreamKey> {
+pub(crate) fn capture_stream_key(capture: &RawCapture) -> Option<StreamKey> {
     let arg = capture.payload.get("arg").and_then(|arg| arg.as_object());
     let channel = arg
         .and_then(|arg| arg.get("channel"))
@@ -864,7 +864,7 @@ fn capture_stream_key(capture: &RawCapture) -> Option<StreamKey> {
     })
 }
 
-fn parsed_stream_key(parsed: &reap_venue::ParsedEvent) -> Option<StreamKey> {
+pub(crate) fn parsed_stream_key(parsed: &reap_venue::ParsedEvent) -> Option<StreamKey> {
     Some(StreamKey {
         channel: channel_name(&parsed.id.channel)?,
         symbol: parsed.id.symbol.clone()?,
@@ -895,7 +895,7 @@ fn payload_symbol(payload: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn is_data_frame(capture: &RawCapture) -> bool {
+pub(crate) fn is_data_frame(capture: &RawCapture) -> bool {
     capture.payload.get("event").is_none()
         && capture
             .payload

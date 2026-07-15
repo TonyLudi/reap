@@ -31,6 +31,8 @@ require_clock_synchronized = true
 # The Java OKX subscriber supports TBT and 400-level depth modes. Public capture
 # defaults to the broadly available 400-level `books` channel; use
 # `books-l2-tbt` only for an account/environment entitled to that channel.
+# A clean run requires data from both configured connections and at least one
+# accepted event for every subscription below.
 [[subscriptions]]
 channel = "books"
 symbol = "BTC-USDT"

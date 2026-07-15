@@ -281,6 +281,17 @@ The following differences do not change the covered quote/hedge calculations:
 
 ## Connectivity Cross-Check
 
+Pinned Java `ChaosLiveSub` subscribes separately to `MarketData` and
+`MarketDepth`; the checked-in Rust capture records spot/swap trades and full
+books before the common adapter/reducer boundary. `Iarb2Calculator` reads its
+index map in `checkSpotIndexDeviation` and selects configured/managed/exchange
+funding in `getFundingRate`, while `StrategyChaosService` initializes
+`StableCoinDepegCheckerImpl`. The capture therefore also records BTC/USDT,
+USDT/USD, and USDC/USD indexes plus swap funding. Mark-price and spot/swap
+price-limit streams are explicit Rust accounting and live-risk hardening, not a
+claim that those exact capture gates exist in `ChaosLiveSub`. Runtime and
+offline verification require every listed stream from both configured sources.
+
 | Java reference | Rust implementation | Result |
 | --- | --- | --- |
 | `OkxNitroL2SubscriberGroupFactory` subscriber groups | `partition_subscriptions` replica/socket plans | Equivalent |

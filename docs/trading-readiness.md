@@ -664,6 +664,41 @@ production trading process.
     No configured demo credential, operator-token, or alert-endpoint environment
     binding is present on this host, so this is implementation evidence rather
     than the still required credentialed observe/fault campaign.
+61. Runtime capture status previously required socket and book readiness but
+    did not require non-book subscriptions to appear, even though strict
+    offline analysis rejected an absent trade, index, stablecoin, funding,
+    mark, or price-limit stream. Runtime and verifier clean derivation now share
+    one stream identity rule and require every configured logical stream to
+    contain data from exactly its configured source count plus at least one
+    accepted event. Unclassified and unexpected data also fail closed. Capture
+    config loading now rejects symlinks/non-files and files over 16 MiB,
+    canonicalizes the source, and binds that canonical path to exact byte
+    evidence. Focused runtime, analyzer, verifier, path-alias, symlink, and size
+    tests pass.
+
+    A fresh optimized-release 60-second public diagnostic exercised all 11
+    configured logical streams from two sources each. The runtime
+    `--require-clean-capture` gate passed with all 12 socket plans ready, both
+    books ready, six host checks, and 5,229 exact raw ordinals containing 2,625
+    accepted plus 2,604 duplicate events. There were zero disconnects, gaps,
+    recoveries, recovery failures, stale books, parse errors, timestamp
+    regressions, unexpected streams, or missing recovery routes. Every stream
+    had two observed source connections; even the low-frequency funding stream
+    had four data frames and two accepted events. Independent verification,
+    strict analysis, and strict replay passed. Raw-capture backtest reconstructed
+    3,776 inputs, reached order-entry readiness, modeled eight orders and four
+    cancels, and passed accounting and currency-rate checks with no fills.
+    Report, raw, config, and executable SHA-256 values are respectively
+    `c64b8405b17a97f90b82d61eb5eb251cded0f56648f589fedc5ddbc8cfd44bce`,
+    `f91aca6164366ebe3edc205648a4e587663974f23bab0df0d89513f42124981d`,
+    `20d98819819877c9fa4725f990e37189deb9508c81fcaf776742b7ede764ac47`,
+    and `7df01637d84e3ee31235732535ecca43f5b9bc2ca06c6579099d73be0449f024`.
+    This shared host had only about 5.20 GB free disk and therefore used a
+    diagnostic 4 GiB disk floor plus 700 MiB memory floor; the checked-in 5 GiB
+    and 1 GiB production floors remain unchanged. The uncalibrated no-fill run
+    is implementation/connectivity evidence, not production authorization.
+    Workspace formatting, warnings-denied Clippy, all 731 tests, the optimized
+    release build, systemd unit verification, and RustSec audit pass.
 
 ## Remaining Demo Gate
 

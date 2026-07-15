@@ -126,6 +126,10 @@ architecture in [docs/architecture.md](docs/architecture.md).
   checks no slower than 10 seconds, at least 5 GiB available disk and 1 GiB
   available memory, and mandatory synchronized-clock enforcement. A lowered
   diagnostic threshold can no longer qualify solely because capture was clean.
+- [x] Canonicalize and bound capture-config provenance, and require every
+  configured logical stream to deliver data on its configured replica count
+  plus at least one accepted event before runtime or offline verification can
+  classify the capture as clean.
 - [x] Add a deterministic Java-referenced backtest scheduler with receive-time
   raw replay, explicit market/new/cancel/order/account delays, immediate
   `PendingNew` registration, and end-of-horizon execution provenance.

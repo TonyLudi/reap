@@ -10,12 +10,11 @@ use thiserror::Error;
 
 use crate::{
     CAPTURE_RUN_REPORT_FORMAT_VERSION, CaptureAnalysisBookHealth, CaptureAnalysisReport,
-    CaptureConfig, CaptureError, CaptureRunReport, CaptureStopReason, analyze_capture, digest_hex,
-    is_book_channel, sha256_hex,
+    CaptureConfig, CaptureError, CaptureRunReport, CaptureStopReason, MAX_CAPTURE_CONFIG_BYTES,
+    analyze_capture, digest_hex, is_book_channel, sha256_hex,
 };
 
 pub const CAPTURE_VERIFICATION_FORMAT_VERSION: u16 = 3;
-pub const MAX_CAPTURE_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_CAPTURE_RUN_REPORT_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -442,7 +441,13 @@ pub fn verify_capture_paths(
     for message in run_report_invariant_failures(&run_report, &effective_config) {
         failures.push(CaptureVerificationFailure::RunReportInvariant { message });
     }
-    let derived_clean = derive_clean_capture(&run_report, &effective_config, expected_connections);
+    let stream_coverage_complete = capture_stream_coverage_complete(&analysis);
+    let derived_clean = derive_clean_capture(
+        &run_report,
+        &effective_config,
+        expected_connections,
+        stream_coverage_complete,
+    );
     if run_report.clean_capture != derived_clean {
         failures.push(CaptureVerificationFailure::CleanFlagMismatch {
             reported: run_report.clean_capture,
@@ -477,6 +482,15 @@ pub fn verify_capture_paths(
         failures,
         passed,
     })
+}
+
+fn capture_stream_coverage_complete(analysis: &CaptureAnalysisReport) -> bool {
+    analysis.error_count == 0
+        && analysis
+            .expected_streams
+            .iter()
+            .all(|stream| stream.complete)
+        && analysis.unexpected_data_streams.is_empty()
 }
 
 fn compare_counter(
@@ -620,6 +634,7 @@ fn derive_clean_capture(
     report: &CaptureRunReport,
     config: &CaptureConfig,
     expected_connections: usize,
+    stream_coverage_complete: bool,
 ) -> bool {
     let expected_books = config
         .subscriptions
@@ -640,6 +655,7 @@ fn derive_clean_capture(
         && !expected_books.is_empty()
         && report.books.len() == expected_books.len()
         && ready_books == expected_books
+        && stream_coverage_complete
         && report.raw_records > 0
         && (report.normalized_path.is_none() || report.normalized_records > 0)
         && report.parse_errors == 0
@@ -1145,6 +1161,89 @@ mod tests {
                 derived: false,
             }
         )));
+    }
+
+    #[test]
+    fn verifier_rejects_clean_claim_when_configured_stream_is_absent() {
+        let fixture = setup(false);
+        let mut config = capture_config();
+        config.subscriptions.push(CaptureSubscriptionConfig {
+            channel: "trades".to_string(),
+            symbol: "BTC-USDT".to_string(),
+            connections: 2,
+            priority: CapturePriority::High,
+        });
+        let config_bytes = toml::to_string(&config).unwrap().into_bytes();
+        std::fs::write(&fixture.config_path, &config_bytes).unwrap();
+
+        let mut run_report: CaptureRunReport =
+            serde_json::from_slice(&std::fs::read(&fixture.report_path).unwrap()).unwrap();
+        let mut effective = config;
+        effective.output.raw_path = run_report.raw_path.clone();
+        effective.output.normalized_path = run_report.normalized_path.clone();
+        run_report.config_fingerprint = effective.fingerprint().unwrap();
+        let expected_connections = reap_feed::partition_subscriptions(
+            &effective.subscriptions(),
+            effective.runtime.max_subscriptions_per_socket,
+        )
+        .unwrap()
+        .len();
+        run_report.expected_connections = expected_connections;
+        run_report.ready_connections_at_stop = expected_connections;
+        let config_source = run_report.config_source.as_mut().unwrap();
+        config_source.bytes = config_bytes.len() as u64;
+        config_source.sha256 = sha256_hex(&config_bytes);
+        write_report(&fixture.report_path, &run_report);
+
+        let report = verify(&fixture);
+
+        assert!(!report.passed);
+        assert!(report.failures.iter().any(|failure| matches!(
+            failure,
+            CaptureVerificationFailure::CleanFlagMismatch {
+                reported: true,
+                derived: false,
+            }
+        )));
+        assert!(
+            report
+                .failures
+                .contains(&CaptureVerificationFailure::AnalysisIntegrityUnhealthy)
+        );
+        assert!(
+            report
+                .analysis
+                .expected_streams
+                .iter()
+                .any(|stream| stream.channel == "trades" && !stream.complete)
+        );
+    }
+
+    #[test]
+    fn clean_coverage_rejects_an_unclassified_data_frame() {
+        let fixture = std::str::from_utf8(RAW_FIXTURE).unwrap();
+        let mut unclassified: RawCapture =
+            serde_json::from_str(fixture.lines().next().unwrap()).unwrap();
+        unclassified.capture_record_seq = Some(8);
+        unclassified.symbol = None;
+        unclassified.payload["arg"] = serde_json::json!({"channel": "books"});
+        if let Some(data) = unclassified.payload["data"].as_array_mut() {
+            for row in data {
+                if let Some(row) = row.as_object_mut() {
+                    row.remove("instId");
+                }
+            }
+        }
+        let input = format!(
+            "{fixture}{}\n",
+            serde_json::to_string(&unclassified).unwrap()
+        );
+
+        let analysis = analyze_capture(input.as_bytes(), &capture_config()).unwrap();
+
+        assert!(analysis.expected_streams[0].complete);
+        assert!(analysis.error_count > 0);
+        assert!(!capture_stream_coverage_complete(&analysis));
     }
 
     #[test]
