@@ -751,12 +751,17 @@ async fn supervise_connection(
             return;
         }
         let error = result.expect_err("non-success result must contain an error");
+        let fatal = matches!(&error, ConnectionError::InvalidSubscriptionPlan(_));
         let disconnected = status.send(ConnectionStatus {
             conn_id: plan.conn_id.clone(),
             venue: plan.venue,
             private: plan.private,
             ts_ms: crate::unix_time_ns() / 1_000_000,
-            kind: ConnectionStatusKind::Disconnected,
+            kind: if fatal {
+                ConnectionStatusKind::Fatal
+            } else {
+                ConnectionStatusKind::Disconnected
+            },
             reason: error.to_string(),
         });
         tokio::select! {
@@ -770,6 +775,10 @@ async fn supervise_connection(
                     return;
                 }
             }
+        }
+        if fatal {
+            tracing::error!(conn_id = %plan.conn_id, ?error, "feed connection plan is invalid");
+            return;
         }
         if matches!(error, ConnectionError::RecoveryRequested) {
             delay = reconnect.initial_delay;
@@ -795,7 +804,7 @@ async fn supervise_connection(
 #[cfg(test)]
 mod tests {
     use reap_core::{Channel, FeedPriority, Subscription};
-    use reap_venue::okx::OkxCredentials;
+    use reap_venue::okx::{OkxAdapter, OkxCredentials};
 
     use super::*;
 
@@ -814,6 +823,46 @@ mod tests {
             policy.next_delay(Duration::from_millis(20)),
             Duration::from_millis(25)
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_subscription_plan_is_fatal_without_reconnect() {
+        let subscription = Subscription::public(
+            Venue::Okx,
+            Channel::Books,
+            "BTC-USDT",
+            FeedPriority::Critical,
+        );
+        let plan = SocketPlan {
+            conn_id: reap_core::ConnId::new("duplicate-plan"),
+            venue: Venue::Okx,
+            private: false,
+            subscriptions: vec![subscription.clone(), subscription],
+        };
+        let (output, _output_rx) = mpsc::channel(1);
+        let (status, mut status_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let (_recovery_tx, recovery) = watch::channel(0_u64);
+
+        supervise_connection(
+            Arc::new(OkxAdapter::new("ws://127.0.0.1:9", "ws://127.0.0.1:9")),
+            plan,
+            no_bootstrap(),
+            ConnectionChannels {
+                output,
+                status,
+                shutdown,
+                recovery,
+            },
+            ConnectionAttemptPacer::new(Duration::ZERO),
+            ReconnectPolicy::default(),
+        )
+        .await;
+
+        let fatal = status_rx.recv().await.unwrap();
+        assert_eq!(fatal.kind, ConnectionStatusKind::Fatal);
+        assert!(fatal.reason.contains("repeats subscription books/BTC-USDT"));
+        assert!(status_rx.recv().await.is_none());
     }
 
     #[test]

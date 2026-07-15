@@ -1088,7 +1088,9 @@ settings; accepting only their static flags would weaken live stop behavior.
 ## Private Stream Health
 
 - Orders, account, positions, and optional fills use isolated sockets. Every
-  socket must acknowledge its subscription; any disconnect immediately emits
+  socket must acknowledge its exact unique serialized argument plan; duplicate
+  acknowledgements do not advance readiness, and malformed or unexpected
+  acknowledgements force reconnect. Any disconnect immediately emits
   account-scoped `PrivateStreamStale` and blocks new orders. Acknowledged-ready
   and disconnected transitions wait for bounded status capacity and are never
   silently dropped. Raw payloads do not emit redundant status-queue heartbeats.

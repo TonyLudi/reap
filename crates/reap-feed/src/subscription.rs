@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use reap_core::{Channel, ConnId, FeedPriority, Subscription, Venue};
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,8 @@ pub enum PartitionError {
     ZeroCapacity,
     #[error("subscription connection count must be positive")]
     ZeroConnections,
+    #[error("duplicate subscription {channel}/{symbol}")]
+    DuplicateSubscription { channel: String, symbol: String },
 }
 
 pub fn partition_subscriptions(
@@ -29,9 +31,23 @@ pub fn partition_subscriptions(
     }
 
     let mut groups: BTreeMap<GroupKey, Vec<Subscription>> = BTreeMap::new();
+    let mut seen = HashSet::new();
     for subscription in subscriptions {
         if subscription.connections == 0 {
             return Err(PartitionError::ZeroConnections);
+        }
+        if !seen.insert((
+            subscription.venue,
+            wire_channel_name(&subscription.channel).to_string(),
+            subscription.symbol.clone(),
+        )) {
+            return Err(PartitionError::DuplicateSubscription {
+                channel: wire_channel_name(&subscription.channel).to_string(),
+                symbol: subscription
+                    .symbol
+                    .clone()
+                    .unwrap_or_else(|| "<all>".to_string()),
+            });
         }
         for replica in 0..subscription.connections {
             let key = GroupKey {
@@ -112,16 +128,18 @@ fn priority_label(priority: FeedPriority) -> &'static str {
 }
 
 fn channel_label(channel: &Channel) -> String {
+    wire_channel_name(channel).replace(|character: char| !character.is_ascii_alphanumeric(), "_")
+}
+
+fn wire_channel_name(channel: &Channel) -> &str {
     match channel {
-        Channel::Books => "books".to_string(),
-        Channel::Trades => "trades".to_string(),
-        Channel::Orders => "orders".to_string(),
-        Channel::Fills => "fills".to_string(),
-        Channel::Account => "account".to_string(),
-        Channel::Positions => "positions".to_string(),
-        Channel::Custom(value) => {
-            value.replace(|character: char| !character.is_ascii_alphanumeric(), "_")
-        }
+        Channel::Books => "books",
+        Channel::Trades => "trades",
+        Channel::Orders => "orders",
+        Channel::Fills => "fills",
+        Channel::Account => "account",
+        Channel::Positions => "positions",
+        Channel::Custom(value) => value,
     }
 }
 
@@ -161,5 +179,23 @@ mod tests {
 
         assert_eq!(plans.len(), 2);
         assert!(plans.iter().all(|plan| plan.private));
+    }
+
+    #[test]
+    fn duplicate_subscription_is_rejected_before_partitioning() {
+        let duplicate = book("BTC-USDT");
+        let alias = Subscription::public(
+            Venue::Okx,
+            Channel::Custom("books".to_string()),
+            "BTC-USDT",
+            FeedPriority::Low,
+        );
+        assert_eq!(
+            partition_subscriptions(&[duplicate, alias], 10),
+            Err(PartitionError::DuplicateSubscription {
+                channel: "books".to_string(),
+                symbol: "BTC-USDT".to_string(),
+            })
+        );
     }
 }

@@ -16,9 +16,10 @@ Implemented:
   idempotent order-state transitions.
 - OKX public/private parsers, expiring HMAC-signed REST order requests,
   supervised multi-websocket feeds, account-scoped channel-aware
-  deduplication, lossless bounded ready/disconnect transitions, sequence
-  recovery, and full order/fill/balance/position REST reconciliation with
-  authoritative stale-state repair.
+  deduplication, exact subscription-argument acknowledgement readiness,
+  lossless bounded ready/disconnect transitions, sequence recovery, and full
+  order/fill/balance/position REST reconciliation with authoritative stale-state
+  repair.
 - Deterministic pre/post-trade risk, stale-stream fail-closed behavior, global,
   account, and symbol halt events, redundant USDT/USDC reference guards with
   durable depeg latching, submit/cancel order-state and per-fill account-state

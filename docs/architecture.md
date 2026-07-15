@@ -167,6 +167,11 @@ Responsibilities:
   independent process-local timers or a wall-clock correction.
 - Lossless bounded delivery for ready/disconnect transitions; payload traffic
   does not flood or silently evict critical connection state.
+- Exact per-socket subscription readiness: the acknowledged argument set,
+  including channel and instrument selectors, must equal the unique serialized
+  request set. Duplicate acknowledgements are idempotent, unknown or malformed
+  success frames fail the connection, and a duplicate local plan is fatal before
+  network startup.
 - Separate per-socket transport liveness from aggregate private-state health.
 - Raw message timestamping.
 - Deduplication.
@@ -1097,6 +1102,16 @@ The feed supervisor partitions subscriptions into socket groups:
 - Public trades possibly separated from depth if trade bursts cause delays.
 - Private order/account sockets isolated from public data.
 - Redundant sockets for critical symbols where the venue allows it.
+
+Each socket builds a unique expected subscription-argument set from the exact
+serialized request before opening the connection. It publishes `Ready` only
+after OKX has acknowledged every channel and selector, including `instId` or
+`instType`. Counting acknowledgement frames is insufficient because a
+retransmitted acknowledgement for one instrument must not conceal a missing
+acknowledgement for another instrument. This follows pinned Java
+`OkxNitroSubscriberBase.tryParseNonData`, where `EVENT_SUB` updates the context
+selected by the returned `WsSubArg`, while making malformed and unexpected
+success frames explicitly fail closed.
 
 Every raw message gets an envelope:
 

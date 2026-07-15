@@ -246,6 +246,11 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Make websocket ready/disconnect transitions lossless under bounded status
   backpressure, remove redundant per-frame status traffic, and split public and
   private disconnect counts in schema-8 live evidence for fault campaigns.
+- [x] Bind websocket readiness to the exact unique subscription-argument
+  acknowledgement set in each socket plan, matching Java's `WsSubArg` context
+  transition. Duplicate acknowledgements cannot hide a missing subscription,
+  malformed or unexpected acknowledgements reconnect, and duplicate local plans
+  fail fatally before network startup.
 - [x] Pace public/private/order-command and fault-proxy-upstream initial and
   reconnect handshakes through one owner-only, process-shared host file under
   the documented OKX per-IP limit; production evidence requires one absolute
