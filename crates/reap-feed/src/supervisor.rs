@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 
 use crate::{
     ConnectionError, ConnectionStatus, ConnectionStatusKind, RecoveryRequest, SocketPlan,
-    run_connection_once,
+    run_connection_once_with_readiness,
 };
 
 /// OKX documents at most three WebSocket connection requests per second per IP.
@@ -576,6 +576,31 @@ impl ReconnectPolicy {
     }
 }
 
+struct ReconnectBackoff {
+    policy: ReconnectPolicy,
+    next_delay: Duration,
+}
+
+impl ReconnectBackoff {
+    fn new(policy: ReconnectPolicy) -> Self {
+        let next_delay = policy.initial_delay;
+        Self { policy, next_delay }
+    }
+
+    fn reset(&mut self) {
+        self.next_delay = self.policy.initial_delay;
+    }
+
+    fn after_failure(&mut self, reached_ready: bool) -> Duration {
+        if reached_ready {
+            self.reset();
+        }
+        let delay = self.next_delay;
+        self.next_delay = self.policy.next_delay(delay);
+        delay
+    }
+}
+
 pub struct SupervisedFeed {
     pub raw: mpsc::Receiver<RawEnvelope>,
     pub status: mpsc::Receiver<ConnectionStatus>,
@@ -722,7 +747,7 @@ async fn supervise_connection(
         mut shutdown,
         mut recovery,
     } = channels;
-    let mut delay = reconnect.initial_delay;
+    let mut backoff = ReconnectBackoff::new(reconnect);
     loop {
         if *shutdown.borrow() {
             return;
@@ -748,6 +773,7 @@ async fn supervise_connection(
         let bootstrap_messages = match bootstrap(&plan) {
             Ok(messages) => messages,
             Err(error) => {
+                let delay = backoff.after_failure(false);
                 tracing::warn!(conn_id = %plan.conn_id, ?error, ?delay, "feed bootstrap generation failed");
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
@@ -757,11 +783,10 @@ async fn supervise_connection(
                         }
                     }
                 }
-                delay = reconnect.next_delay(delay);
                 continue;
             }
         };
-        let result = run_connection_once(
+        let outcome = run_connection_once_with_readiness(
             adapter.as_ref(),
             &plan,
             &bootstrap_messages,
@@ -771,6 +796,8 @@ async fn supervise_connection(
             &mut recovery,
         )
         .await;
+        let reached_ready = outcome.reached_ready;
+        let result = outcome.result;
         if *shutdown.borrow() || matches!(result, Ok(())) {
             return;
         }
@@ -805,10 +832,11 @@ async fn supervise_connection(
             return;
         }
         if matches!(error, ConnectionError::RecoveryRequested) {
-            delay = reconnect.initial_delay;
+            backoff.reset();
             tracing::info!(conn_id = %plan.conn_id, "feed connection restarting for snapshot recovery");
             continue;
         }
+        let delay = backoff.after_failure(reached_ready);
         tracing::warn!(conn_id = %plan.conn_id, ?error, ?delay, "feed connection restarting");
         if matches!(error, ConnectionError::OutputClosed) {
             return;
@@ -821,7 +849,6 @@ async fn supervise_connection(
                 }
             }
         }
-        delay = reconnect.next_delay(delay);
     }
 }
 
@@ -847,6 +874,19 @@ mod tests {
             policy.next_delay(Duration::from_millis(20)),
             Duration::from_millis(25)
         );
+
+        let mut backoff = ReconnectBackoff::new(policy);
+        assert_eq!(backoff.after_failure(false), Duration::from_millis(10));
+        assert_eq!(backoff.after_failure(false), Duration::from_millis(20));
+        assert_eq!(backoff.after_failure(false), Duration::from_millis(25));
+        assert_eq!(
+            backoff.after_failure(true),
+            Duration::from_millis(10),
+            "a successfully subscribed session must reset historical startup backoff"
+        );
+        assert_eq!(backoff.after_failure(false), Duration::from_millis(20));
+        backoff.reset();
+        assert_eq!(backoff.after_failure(false), Duration::from_millis(10));
     }
 
     #[test]
@@ -859,6 +899,9 @@ mod tests {
         ));
         assert!(!is_fatal_connection_error(
             &ConnectionError::ConnectionTimeout
+        ));
+        assert!(!is_fatal_connection_error(
+            &ConnectionError::PrivateBackpressureTimeout { timeout_ms: 1 }
         ));
     }
 

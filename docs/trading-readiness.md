@@ -735,6 +735,47 @@ production trading process.
     evidence-pipeline validation, not production authorization.
     Workspace formatting, warnings-denied Clippy, all 735 tests, the optimized
     release build, systemd unit verification, and RustSec audit pass.
+63. Feed reconnect backoff previously increased after every failed socket run
+    but never reset after the exact subscription acknowledgement set had made a
+    session ready. Historical startup failures could therefore leave a later
+    healthy-session disconnect waiting the 30-second maximum. The supervisor
+    now receives an explicit run outcome, keeps exponential backoff for repeated
+    pre-readiness failures, resets to 250 ms after exact readiness, and still
+    reserves every attempt through the process-shared OKX pacer. This preserves
+    the fixed per-disconnect lifecycle in pinned Java
+    `SharedSessionSubscriberBase` while retaining Rust's stricter storm control.
+
+    Private socket payload forwarding also previously awaited bounded channel
+    capacity without a deadline. A stalled event loop could therefore trap the
+    websocket reader indefinitely, preventing ping/pong, reconnect, and prompt
+    shutdown. Private delivery now waits at most one second, then emits a typed
+    non-fatal disconnect. The live coordinator revokes private readiness,
+    cancels active orders, and requires clean REST reconciliation after
+    recovery. The exact transport error is retained in the journaled stale
+    event instead of being reduced to a generic cause. Focused tests cover
+    bounded no-silent-drop behavior, non-fatal supervisor classification,
+    readiness-reset backoff, exact-ready provenance, and public/private journal
+    reason propagation.
+
+    A fresh optimized-release 45-second public diagnostic exercised the exact
+    ready path with all 12 socket plans ready and both books healthy. It
+    persisted 3,553 exact ordinals containing 1,788 accepted and 1,765 duplicate
+    events, with a maximum raw queue depth of 23 and zero disconnects, gaps,
+    recoveries, recovery failures, stale books, parse errors, or missing
+    recovery routes. Independent capture verification and strict replay passed;
+    all 11 streams had their exact two planned sources. Raw backtest rebuilt
+    2,624 inputs, reached entry readiness, modeled 12 orders and eight cancels,
+    and passed complete accounting/currency coverage with no fills. Report,
+    raw, config, and executable SHA-256 values are respectively
+    `08d9dbbc3b42d8009c5d3417c79a576ea01d16695b5572d6b51fe0cdedb0e5e4`,
+    `a2cff3abc86642ea8b01b098c09014cefcc6c78c9d9b7801162507d3cdf18aad`,
+    `20d98819819877c9fa4725f990e37189deb9508c81fcaf776742b7ede764ac47`,
+    and `bed4d0d501d794d259b7b11279b50d6c2d2d7d809a283920369e5cb1f20e82b9`.
+    This shared host again used diagnostic 4 GiB disk and 700 MiB memory floors;
+    production floors remain unchanged. Formatting, warnings-denied Clippy, all
+    736 tests, optimized release build, hardened systemd verification, and
+    RustSec audit pass. The private-overload path is deterministic local
+    evidence and still requires a credentialed target-host demo campaign.
 
 ## Remaining Demo Gate
 

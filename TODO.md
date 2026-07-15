@@ -287,6 +287,10 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Bound feed websocket handshakes and control writes, make establishment
   shutdown/recovery cancellable, retain a recovery-channel owner for every
   socket including non-book plans, and treat unexpected owner loss as fatal.
+- [x] Reset exponential feed reconnect backoff after exact subscription
+  readiness, and bound lossless private-feed queue delivery so a stalled event
+  loop forces typed disconnect/reconciliation instead of blocking websocket
+  heartbeat and shutdown indefinitely.
 - [x] Keep order-command heartbeat telemetry best-effort under bounded queue
   saturation while preserving lossless disconnect/fatal transitions; bound its
   shutdown close and the fault proxy's client/upstream handshakes and writes,

@@ -159,7 +159,10 @@ Responsibilities:
 - Websocket connection lifecycle.
 - Multi-websocket subscription partitioning.
 - Redundant websocket support for critical channels.
-- Ping/pong, reconnect, exponential backoff, and stale-feed detection.
+- Ping/pong, reconnect, readiness-aware exponential backoff, and stale-feed
+  detection. Repeated failures before subscription readiness back off, while a
+  successfully acknowledged session resets historical delay before its next
+  disconnect.
 - Fail-closed connection-attempt pacing shared by public, private, order-command,
   capture, and fault-proxy upstream sockets across processes on one host. The
   owner-only advisory-lock file reserves Linux `CLOCK_BOOTTIME` slots under the
@@ -176,6 +179,11 @@ Responsibilities:
   and limited to 10 seconds, while bootstrap, subscription, heartbeat, and close
   writes are limited to 5 seconds. Every socket keeps its recovery channel
   owned for the full supervisor lifetime; an unexpected owner loss is fatal.
+- Private payload delivery is lossless while capacity is available, but waiting
+  on the bounded event queue is limited to one second. Saturation then produces
+  a typed disconnect so private readiness is revoked, active orders are
+  cancelled, and REST reconciliation is required after recovery; the socket
+  reader cannot remain trapped behind a stalled event loop.
 - Separate per-socket transport liveness from aggregate private-state health.
 - Raw message timestamping.
 - Cross-socket deduplication without suppressing per-socket sequence advancement.

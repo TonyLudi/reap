@@ -4652,6 +4652,7 @@ impl FeedSourceState {
             status.kind,
             ConnectionStatusKind::Disconnected | ConnectionStatusKind::Fatal
         );
+        let status_reason = status.reason.clone();
         match status.kind {
             ConnectionStatusKind::Ready | ConnectionStatusKind::Heartbeat => {
                 self.ready_connections.insert(status.conn_id.clone());
@@ -4671,7 +4672,7 @@ impl FeedSourceState {
                     account_id: Some(account_id.clone()),
                     symbol: None,
                     reason: format!(
-                        "private websocket set is incomplete ({}/{})",
+                        "private websocket set is incomplete ({}/{}): {status_reason}",
                         self.ready_connections.len(),
                         self.expected_connections.len()
                     ),
@@ -4700,8 +4701,8 @@ impl FeedSourceState {
                 account_id: None,
                 symbol: route.symbol.clone(),
                 reason: format!(
-                    "all redundant {:?} websocket connections are down",
-                    route.channel
+                    "all redundant {:?} websocket connections are down: {status_reason}",
+                    route.channel,
                 ),
             })
             .collect()
@@ -7560,6 +7561,7 @@ mod tests {
 
         let stale = source.on_status(status("fills", ConnectionStatusKind::Disconnected));
         assert_eq!(stale[0].kind, SystemEventKind::PrivateStreamStale);
+        assert!(stale[0].reason.ends_with(": test"));
         assert!(
             source
                 .on_status(status("fills", ConnectionStatusKind::Ready))
@@ -7592,6 +7594,7 @@ mod tests {
         assert_eq!(source.public_connectivity_ready(), Some(false));
         assert_eq!(stale[0].kind, SystemEventKind::FeedStale);
         assert_eq!(stale[0].symbol.as_deref(), Some("BTC-USDT"));
+        assert!(stale[0].reason.ends_with(": test"));
     }
 
     #[test]

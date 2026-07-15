@@ -17,6 +17,7 @@ const LOGIN_TIMEOUT: Duration = Duration::from_secs(10);
 const SUBSCRIPTION_TIMEOUT: Duration = Duration::from_secs(10);
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const PRIVATE_OUTPUT_BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Error)]
 pub enum ConnectionError {
@@ -30,6 +31,10 @@ pub enum ConnectionError {
     StatusClosed,
     #[error("public feed output channel is full; connection must recover")]
     Backpressure,
+    #[error(
+        "private feed output channel remained full for {timeout_ms}ms; connection must recover"
+    )]
+    PrivateBackpressureTimeout { timeout_ms: u128 },
     #[error("websocket peer closed the connection")]
     PeerClosed,
     #[error("websocket connection attempt timed out")]
@@ -143,6 +148,11 @@ where
     await_control_write(writer.send(message), operation, CONTROL_WRITE_TIMEOUT).await
 }
 
+pub(crate) struct ConnectionRunOutcome {
+    pub(crate) result: Result<(), ConnectionError>,
+    pub(crate) reached_ready: bool,
+}
+
 pub async fn run_connection_once(
     adapter: &dyn VenueAdapter,
     plan: &SocketPlan,
@@ -152,115 +162,146 @@ pub async fn run_connection_once(
     shutdown: &mut watch::Receiver<bool>,
     recovery: &mut watch::Receiver<u64>,
 ) -> Result<(), ConnectionError> {
-    if plan.private && bootstrap_messages.is_empty() {
-        return Err(ConnectionError::MissingPrivateLogin);
-    }
-    let subscription = adapter.subscription_message(&plan.subscriptions)?;
-    let subscription_readiness =
-        SubscriptionReadiness::from_request(&subscription, plan.subscriptions.len())?;
-    let (socket, _) = await_websocket_connection(
-        connect_async(adapter.websocket_url(plan.private)),
-        shutdown,
-        recovery,
-        CONNECTION_TIMEOUT,
-    )
-    .await?;
-    let (mut writer, mut reader) = socket.split();
-
-    if plan.private {
-        for message in bootstrap_messages {
-            send_message(
-                &mut writer,
-                Message::Text(message.clone().into()),
-                "private bootstrap",
-            )
-            .await?;
-        }
-        await_private_login(&mut writer, &mut reader, shutdown, recovery).await?;
-    }
-    send_message(
-        &mut writer,
-        Message::Text(subscription.into()),
-        "subscription",
-    )
-    .await?;
-    await_subscriptions(
-        &mut writer,
-        &mut reader,
-        subscription_readiness,
+    run_connection_once_with_readiness(
+        adapter,
         plan,
+        bootstrap_messages,
         output,
+        status,
         shutdown,
         recovery,
     )
-    .await?;
-    tokio::select! {
-        result = send_status(
-            status,
-            plan,
-            ConnectionStatusKind::Ready,
-            "subscriptions acknowledged",
-        ) => result?,
-        changed = shutdown.changed() => {
-            if changed.is_err() || *shutdown.borrow() {
-                return Err(ConnectionError::ShutdownRequested);
-            }
+    .await
+    .result
+}
+
+pub(crate) async fn run_connection_once_with_readiness(
+    adapter: &dyn VenueAdapter,
+    plan: &SocketPlan,
+    bootstrap_messages: &[String],
+    output: &mpsc::Sender<RawEnvelope>,
+    status: &mpsc::Sender<ConnectionStatus>,
+    shutdown: &mut watch::Receiver<bool>,
+    recovery: &mut watch::Receiver<u64>,
+) -> ConnectionRunOutcome {
+    let mut reached_ready = false;
+    let result = async {
+        if plan.private && bootstrap_messages.is_empty() {
+            return Err(ConnectionError::MissingPrivateLogin);
         }
-    }
+        let subscription = adapter.subscription_message(&plan.subscriptions)?;
+        let subscription_readiness =
+            SubscriptionReadiness::from_request(&subscription, plan.subscriptions.len())?;
+        let (socket, _) = await_websocket_connection(
+            connect_async(adapter.websocket_url(plan.private)),
+            shutdown,
+            recovery,
+            CONNECTION_TIMEOUT,
+        )
+        .await?;
+        let (mut writer, mut reader) = socket.split();
 
-    let mut ping = tokio::time::interval(PING_INTERVAL);
-    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ping.tick().await;
-    let mut last_received = tokio::time::Instant::now();
-
-    loop {
-        tokio::select! {
-            _ = ping.tick() => {
-                if last_received.elapsed() > IDLE_TIMEOUT {
-                    return Err(ConnectionError::IdleTimeout);
-                }
-                send_message(&mut writer, Message::Text("ping".into()), "ping").await?;
+        if plan.private {
+            for message in bootstrap_messages {
+                send_message(
+                    &mut writer,
+                    Message::Text(message.clone().into()),
+                    "private bootstrap",
+                )
+                .await?;
             }
+            await_private_login(&mut writer, &mut reader, shutdown, recovery).await?;
+        }
+        send_message(
+            &mut writer,
+            Message::Text(subscription.into()),
+            "subscription",
+        )
+        .await?;
+        await_subscriptions(
+            &mut writer,
+            &mut reader,
+            subscription_readiness,
+            plan,
+            output,
+            shutdown,
+            recovery,
+        )
+        .await?;
+        tokio::select! {
+            result = send_status(
+                status,
+                plan,
+                ConnectionStatusKind::Ready,
+                "subscriptions acknowledged",
+            ) => result?,
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    let _ = send_message(&mut writer, Message::Close(None), "close").await;
-                    return Ok(());
-                }
-            }
-            changed = recovery.changed() => {
-                match changed {
-                    Ok(()) => {
-                        let _ = send_message(&mut writer, Message::Close(None), "recovery close").await;
-                        return Err(ConnectionError::RecoveryRequested);
-                    }
-                    Err(_) => return Err(ConnectionError::RecoveryChannelClosed),
-                }
-            }
-            message = reader.next() => {
-                let message = message.ok_or(ConnectionError::PeerClosed)??;
-                last_received = tokio::time::Instant::now();
-                match message {
-                    Message::Text(payload) => {
-                        if payload.as_str() != "pong" {
-                            reject_server_error(payload.as_str())?;
-                            forward_payload(payload.as_str(), plan, output).await?;
-                        }
-                    }
-                    Message::Binary(payload) => {
-                        let payload = std::str::from_utf8(payload.as_ref())
-                            .map_err(|_| ConnectionError::NonUtf8Payload)?;
-                        reject_server_error(payload)?;
-                        forward_payload(payload, plan, output).await?;
-                    }
-                    Message::Ping(payload) => {
-                        send_message(&mut writer, Message::Pong(payload), "pong").await?
-                    }
-                    Message::Pong(_) => {}
-                    Message::Close(_) => return Err(ConnectionError::PeerClosed),
-                    Message::Frame(_) => {}
+                    return Err(ConnectionError::ShutdownRequested);
                 }
             }
         }
+        reached_ready = true;
+
+        let mut ping = tokio::time::interval(PING_INTERVAL);
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ping.tick().await;
+        let mut last_received = tokio::time::Instant::now();
+
+        loop {
+            tokio::select! {
+                _ = ping.tick() => {
+                    if last_received.elapsed() > IDLE_TIMEOUT {
+                        return Err(ConnectionError::IdleTimeout);
+                    }
+                    send_message(&mut writer, Message::Text("ping".into()), "ping").await?;
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        let _ = send_message(&mut writer, Message::Close(None), "close").await;
+                        return Ok(());
+                    }
+                }
+                changed = recovery.changed() => {
+                    match changed {
+                        Ok(()) => {
+                            let _ = send_message(&mut writer, Message::Close(None), "recovery close").await;
+                            return Err(ConnectionError::RecoveryRequested);
+                        }
+                        Err(_) => return Err(ConnectionError::RecoveryChannelClosed),
+                    }
+                }
+                message = reader.next() => {
+                    let message = message.ok_or(ConnectionError::PeerClosed)??;
+                    last_received = tokio::time::Instant::now();
+                    match message {
+                        Message::Text(payload) => {
+                            if payload.as_str() != "pong" {
+                                reject_server_error(payload.as_str())?;
+                                forward_payload(payload.as_str(), plan, output).await?;
+                            }
+                        }
+                        Message::Binary(payload) => {
+                            let payload = std::str::from_utf8(payload.as_ref())
+                                .map_err(|_| ConnectionError::NonUtf8Payload)?;
+                            reject_server_error(payload)?;
+                            forward_payload(payload, plan, output).await?;
+                        }
+                        Message::Ping(payload) => {
+                            send_message(&mut writer, Message::Pong(payload), "pong").await?
+                        }
+                        Message::Pong(_) => {}
+                        Message::Close(_) => return Err(ConnectionError::PeerClosed),
+                        Message::Frame(_) => {}
+                    }
+                }
+            }
+        }
+    }
+    .await;
+    ConnectionRunOutcome {
+        result,
+        reached_ready,
     }
 }
 
@@ -628,6 +669,15 @@ async fn forward_payload(
     plan: &SocketPlan,
     output: &mpsc::Sender<RawEnvelope>,
 ) -> Result<(), ConnectionError> {
+    forward_payload_with_timeout(payload, plan, output, PRIVATE_OUTPUT_BACKPRESSURE_TIMEOUT).await
+}
+
+async fn forward_payload_with_timeout(
+    payload: &str,
+    plan: &SocketPlan,
+    output: &mpsc::Sender<RawEnvelope>,
+    private_output_timeout: Duration,
+) -> Result<(), ConnectionError> {
     let channel = plan
         .subscriptions
         .first()
@@ -647,10 +697,13 @@ async fn forward_payload(
     };
 
     if plan.private {
-        output
-            .send(envelope)
-            .await
-            .map_err(|_| ConnectionError::OutputClosed)
+        match tokio::time::timeout(private_output_timeout, output.send(envelope)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(ConnectionError::OutputClosed),
+            Err(_) => Err(ConnectionError::PrivateBackpressureTimeout {
+                timeout_ms: private_output_timeout.as_millis(),
+            }),
+        }
     } else {
         output.try_send(envelope).map_err(|error| match error {
             mpsc::error::TrySendError::Full(_) => ConnectionError::Backpressure,
@@ -930,7 +983,7 @@ mod tests {
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let (_recovery_tx, mut recovery_rx) = watch::channel(0_u64);
         let client = tokio::spawn(async move {
-            run_connection_once(
+            run_connection_once_with_readiness(
                 &adapter,
                 &plan,
                 &[],
@@ -957,12 +1010,57 @@ mod tests {
         assert_eq!(ready.reason, "subscriptions acknowledged");
 
         shutdown_tx.send(true).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(1), client)
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), client)
             .await
             .unwrap()
-            .unwrap()
             .unwrap();
+        outcome.result.unwrap();
+        assert!(outcome.reached_ready);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn private_payload_backpressure_is_bounded_and_lossless() {
+        let (output, mut output_rx) = mpsc::channel(1);
+        output
+            .send(RawEnvelope {
+                venue: Venue::Okx,
+                conn_id: ConnId::new("existing"),
+                channel: Channel::Orders,
+                symbol: None,
+                recv_ts_ns: 1,
+                raw_hash: 1,
+                payload: "existing".to_string(),
+            })
+            .await
+            .unwrap();
+        let plan = SocketPlan {
+            conn_id: ConnId::new("private-orders"),
+            venue: Venue::Okx,
+            private: true,
+            subscriptions: vec![Subscription::private(
+                Venue::Okx,
+                Channel::Orders,
+                FeedPriority::Critical,
+            )],
+        };
+
+        let error = forward_payload_with_timeout(
+            r#"{"arg":{"channel":"orders"},"data":[]}"#,
+            &plan,
+            &output,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConnectionError::PrivateBackpressureTimeout { timeout_ms: 1 }
+        ));
+        let existing = output_rx.recv().await.unwrap();
+        assert_eq!(existing.payload, "existing");
+        assert!(output_rx.try_recv().is_err());
     }
 
     #[tokio::test]

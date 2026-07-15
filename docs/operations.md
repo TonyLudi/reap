@@ -129,6 +129,17 @@ were cross-checked against pinned Java `OkxNitroSubscriberBase`,
 `SharedSessionSubscriberBase`, `WsConnectOption`, and the Netty/Vtx websocket
 clients' stalled-INIT and ping/pong/data checks.
 
+Failures before exact subscription readiness use exponential reconnect delays
+from 250 ms through 30 seconds. Once a socket has delivered the complete
+acknowledgement set, that historical delay resets, so a later healthy-session
+disconnect starts again at 250 ms subject to the shared connection-attempt
+pacer. Public payload saturation disconnects immediately. Private account/order
+payload saturation is never silent: delivery may wait up to one second for
+bounded downstream capacity, after which the socket emits a typed disconnect,
+private readiness is revoked, active orders are cancelled, and recovery requires
+a clean REST reconciliation. Treat this as event-loop overload evidence;
+increasing queue capacity without profiling only postpones the same failure.
+
 The checked-in capture/live/proxy examples share
 `var/reap/okx-connection-attempt.pacer` when run from the repository root.
 Production capture research requires an absolute path, and production evidence
