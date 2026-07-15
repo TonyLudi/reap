@@ -31,11 +31,11 @@ Implemented:
   layer that promotes terminal strategy safety halts into durable global risk
   latches.
 - Bounded structured telemetry and JSONL storage for raw, normalized, intent,
-  request, acknowledgement, order, fill, system, bootstrap, reconciliation,
-  and write-ahead safety-latch records, including restart recovery and an
-  exclusive canonical journal lease. Schema-8 live evidence classifies
-  ambiguous operations, partial fills, convergence timeouts, restored latches,
-  and typed safety-task failures.
+  request, acknowledgement, order, fill, system, bootstrap, runtime-session,
+  reconciliation, and write-ahead safety-latch records, including restart
+  recovery and an exclusive canonical journal lease. Schema-8 live evidence
+  classifies ambiguous operations, partial fills, convergence timeouts, restored
+  latches, and typed safety-task failures.
 - A fail-closed `reap-live` composition root with account-scoped REST bootstrap,
   exchange metadata/account-mode and zero-liability verification, redundant public sockets,
   isolated private sockets, account/positions data-round health, one strategy
@@ -332,11 +332,11 @@ manifest-declared build, host, candidate, or environment-specific account
 identities. Proxy-supported fault roles must carry typed records with the exact
 proxy fingerprint, unique proxy session/command IDs, fresh timestamps, and a
 command interval inside the corresponding verified live session; only genuine
-partial-fill and restart-latch roles may use external evidence. Schema 5 also
+partial-fill and restart-latch roles may use external evidence. Schema 6 also
 enforces reviewed age limits under hard code-level maxima for the demo soak,
 every fault and latency source, production account certification, deadman,
-emergency cancel, and the reconciled fill and bill windows. It requires one independently
-verified clean proxy-process report per fault role, with a unique session that
+emergency cancel, and the reconciled fill and bill windows. It requires one
+independently verified clean proxy-process report per fault role, with a unique session that
 encloses exactly that live run and the expected completed-command count. It does
 not trust previously emitted verification JSON. The checked-in manifest is a
 schema template with deliberately invalid placeholder identities, not evidence.
@@ -378,7 +378,7 @@ reap verify-production-approval \
 
 The policy requires sorted, unique approvers, distinct Ed25519 public keys, and
 at least two required roles. A request is valid for at most 15 minutes and binds
-the exact policy predeclared by SHA-256 in the schema-5 evidence manifest plus
+the exact policy predeclared by SHA-256 in the schema-6 evidence manifest plus
 stable source/config/build/host/account/candidate and gate evidence. Verification
 rejects stale requests, missing roles, duplicate keys or approvers, signature or
 binding changes, and any newly failing or changed source.
@@ -580,6 +580,7 @@ cargo run -p reap-cli -- reconcile-economics \
   --minimum-funding-bills 1 \
   --maximum-trade-bill-delay-ms "$MAX_TRADE_BILL_DELAY_MS" \
   --maximum-funding-bill-delay-ms 60000 \
+  --maximum-funding-mark-bracket-distance-ms 1000 \
   --output "$ECONOMIC_REPORT" \
   --require-pass \
   --pretty
@@ -604,12 +605,16 @@ least 500 ms apart, and requires a short terminal page within the conservative
 166-hour age bound. `reconcile-economics` rebuilds both collections, leases and
 streams the stopped journal, rejects every unexplained bill type, validates
 trade identities/fees/balance equations, and recomputes realized linear or
-inverse funding from the journaled settled rate and signed position, configured
-contract value, and bill settlement mark. Run a controlled demo window
-containing nonzero trades and at least one
-nonzero funding settlement. This still does not independently prove derivative
-opening cost basis, an independently attested settlement mark, full
-balance/equity continuity, currency conversion, taxes, or profitability.
+inverse funding from the journaled settled rate, assessment-time signed
+position, configured contract value, and two same-session mark-price samples
+bracketing the bill's `fillTime`. The bill mark must lie inside that independent
+exchange-time bracket. A schema-6 `session_start` journal record emitted on
+every runtime start binds those observations to one session, account, config,
+and hashed OKX account identity, so evidence cannot cross a restart. Run a
+controlled demo window containing nonzero trades
+and at least one nonzero funding settlement. This still does not independently
+prove derivative opening cost basis, the venue's exact internal assessment tick,
+full balance/equity continuity, currency conversion, taxes, or profitability.
 Cash-spot bill units must be confirmed with credentialed demo
 evidence for the exact target account before production review.
 

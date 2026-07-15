@@ -22,8 +22,8 @@ use reap_order::{
 };
 use reap_storage::{
     BootstrapRecord, OrderAckStatus, OrderOperation, OrderRequestRecord, RecoveredStorage,
-    SafetyLatchRecord, SafetyLatchScope, SafetyLatchSource, StorageConfig, StorageError,
-    StorageRecord, StorageRuntime, StorageSink, acquire_storage_lease, recover_jsonl,
+    SafetyLatchRecord, SafetyLatchScope, SafetyLatchSource, SessionStartRecord, StorageConfig,
+    StorageError, StorageRecord, StorageRuntime, StorageSink, acquire_storage_lease, recover_jsonl,
     start_jsonl_storage_with_lease,
 };
 use reap_telemetry::{
@@ -1549,7 +1549,8 @@ impl LiveRuntime {
         let (mut verified, seeds, snapshots) =
             bootstrap_accounts(&config, &restored_by_account).await?;
         let account_identity_sha256s = account_identity_sha256s(&config, &snapshots)?;
-        let mut bootstrap_records = Vec::new();
+        let session_id = format!("{:x}", unix_time_ns());
+        let mut startup_records = Vec::new();
         for account in &config.accounts {
             let exchange_baseline = verified
                 .baseline_fill_ids
@@ -1577,7 +1578,7 @@ impl LiveRuntime {
             if !recovered.baseline_fill_ids.contains_key(&account.id) {
                 let mut baseline_fill_ids = exchange_baseline.into_iter().collect::<Vec<_>>();
                 baseline_fill_ids.sort();
-                bootstrap_records.push(StorageRecord::Bootstrap(BootstrapRecord {
+                startup_records.push(StorageRecord::Bootstrap(BootstrapRecord {
                     ts_ms: unix_time_ms(),
                     account_id: account.id.clone(),
                     strategy_name: config.strategy.strategy_name.clone(),
@@ -1585,8 +1586,24 @@ impl LiveRuntime {
                     baseline_fill_ids,
                 }));
             }
+            let account_identity_sha256 = account_identity_sha256s
+                .get(&account.id)
+                .cloned()
+                .ok_or_else(|| {
+                    LiveRuntimeError::Provenance(format!(
+                        "missing account identity for runtime session account {}",
+                        account.id
+                    ))
+                })?;
+            startup_records.push(StorageRecord::SessionStart(SessionStartRecord {
+                ts_ms: session_started_at_ms,
+                session_id: session_id.clone(),
+                account_id: account.id.clone(),
+                strategy_name: config.strategy.strategy_name.clone(),
+                config_fingerprint: config_fingerprint.clone(),
+                account_identity_sha256,
+            }));
         }
-        let session_id = format!("{:x}", unix_time_ns());
         let mut coordinator = LiveCoordinator::new(
             config.clone(),
             verified,
@@ -1598,7 +1615,7 @@ impl LiveRuntime {
         let _ = restore_safety_latches(&mut coordinator, &recovered)?;
         let mut initial_outputs = vec![CoordinatorOutput {
             actions: Vec::new(),
-            records: bootstrap_records,
+            records: startup_records,
         }];
         for update in recovered_orders {
             let account_id = config

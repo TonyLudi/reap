@@ -384,6 +384,9 @@ cargo run -p reap-cli -- reconcile-economics \
   --minimum-funding-bills 1 \
   --maximum-trade-bill-delay-ms "$MAX_TRADE_BILL_DELAY_MS" \
   --maximum-funding-bill-delay-ms 60000 \
+  --maximum-funding-mark-bracket-distance-ms 1000 \
+  --funding-mark-absolute-tolerance 0.00000001 \
+  --funding-mark-relative-tolerance 0.00001 \
   --output "$ECONOMIC_REPORT" \
   --require-pass \
   --pretty
@@ -410,23 +413,35 @@ trade bills bind to fills by `(symbol, tradeId)` and validate side, order IDs,
 instrument/margin/execution mode, price, size, liquidity, signed fee/currency,
 causal delay, and the bill balance equation. Funding type `8` subtypes `173` and
 `174` follow pinned Java `OkexV5BillTypes`; the verifier binds each bill to a
-unique session-local journaled realized rate and signed position and recomputes linear
-`qty * ctVal * abs(rate) * mark` or inverse
-`qty * ctVal * abs(rate) / mark` magnitude and sign.
+unique session-local journaled realized rate and the latest signed position at
+the bill's `fillTime`. It also requires valid same-session `mark-price`
+observations immediately before and after that assessment timestamp. The bill
+mark must lie inside the bracket, and linear `position * ctVal * rate * mark` or
+inverse `position * ctVal * rate / mark` PnL must lie inside the independently
+derived funding range with the configured sign. The session is not inferred
+from the one-time bootstrap record: every runtime start emits a schema-6
+`session_start` for each account, binding the session ID, strategy/config, and
+hashed OKX account identity. Reconciliation uses journal line boundaries and
+refuses to combine positions, settlements, or marks across the next start.
 
 Require nonzero thresholds for both trades and funding. A settlement with a zero
 position can legitimately have no bill, so completeness is demonstrated by
 matched nonzero funding bills rather than by requiring one bill per scheduled
 timestamp. The final trade-delay guard is excluded from fill-to-bill
 completeness because a valid bill can arrive just after `END_MS`.
+Keep the mark-price subscription healthy until a post-assessment observation is
+journaled; a one-sided bracket, duplicate exchange timestamp within one session,
+cross-session mark, or bracket outside the configured distance fails closed.
 
 The report does not independently recompute realized derivative close PnL: the
-journal does not yet retain an attested opening cost basis. The exact settlement
-mark remains bill-sourced. It also does not prove complete balance/equity
-continuity, taxes, or currency conversion. The
-current OKX documentation is not sufficient evidence for every cash-spot bill
-unit combination, so archive a credentialed minimal cash buy and sell demo
-sample and require this verifier to pass before admitting spot production data.
+journal does not yet retain an attested opening cost basis. The venue's exact
+internal funding assessment tick cannot be reproduced; instead, the
+bill-reported mark must agree with a narrow two-sided public exchange-time
+bracket. The report also does not prove complete balance/equity continuity,
+taxes, or currency conversion. The current OKX documentation is not sufficient
+evidence for every cash-spot bill unit combination, so archive a credentialed
+minimal cash buy and sell demo sample and require this verifier to pass before
+admitting spot production data.
 
 ### Account Cash And Liability Certification
 
@@ -761,7 +776,10 @@ outside source control.
    account, and symbol safety latches from JSONL. It applies missed known
    fills/terminal updates from REST, applies the authoritative account snapshot
    to the strategy and risk engine, and marks that snapshot ready only after
-   engine application. It then requires clean account-scoped reconciliation.
+   engine application. Before writing any of those restored/runtime events, it
+   appends one schema-6 `session_start` per account with the generated session
+   ID, config fingerprint, and hashed OKX account identity. It then requires
+   clean account-scoped reconciliation.
 9. In demo mode it arms OKX Cancel All After for every account before starting
    that account's private feed or order task.
 10. It starts redundant public plans and isolated orders, account, and positions
@@ -1833,7 +1851,7 @@ target/release/reap verify-production-evidence \
   --pretty
 ```
 
-Schema 5 requires the intended Reap version, candidate executable SHA-256,
+Schema 6 requires the intended Reap version, candidate executable SHA-256,
 target-host identity SHA-256, predeclared deployment candidate ID, exact
 approval-policy SHA-256, and separate demo and production exchange-account
 identity maps. It also requires the exact
@@ -1852,8 +1870,10 @@ Reviewed nonzero `minimum_fills`, `minimum_trade_bills`, and
 must use zero price/quantity/fee tolerances. Economic price tolerance must also
 be zero; quantity is capped at `1e-8`, fee at `1e-10`, balance and absolute
 funding PnL at `1e-8`, and relative funding PnL at `1e-6`. These hard limits are
-ceilings, not recommended defaults; justify every nonzero value from the
-instrument's published precision and credentialed samples.
+ceilings. Funding mark brackets are capped at 2,000 ms per side, with absolute
+mark tolerance capped at `1e-8` and relative tolerance at `1e-4`. These are not
+recommended defaults; justify every nonzero value from the instrument's
+published precision, observed mark cadence, and credentialed samples.
 It also requires exactly one raw schema-2 fault-proxy process report for every
 matrix scenario. Each must independently pass, use the exact proxy config/build/
 host, have a unique proxy session, enclose exactly its assigned live session and
@@ -1912,7 +1932,7 @@ inside the corresponding reverified live session. Opaque external injector
 records are accepted only for genuine partial-fill and restored-latch roles,
 whose causality cannot be manufactured by the current proxy. Freshness applies
 to those roles' live reports, but their external causality remains an operator
-review. Schema 5 directly reconstructs every raw proxy process report and derives
+review. Schema 6 directly reconstructs every raw proxy process report and derives
 clean shutdown from listener joins, control-socket removal, pending rules, active
 connections, and proxy errors. External supervisor lifecycle evidence remains a
 separate review.
@@ -1925,7 +1945,7 @@ is missing or duplicated, or if any config/build/host/account/candidate binding
 differs. The output records a semantic SHA-256 of each in-memory reconstruction
 and always sets `production_order_entry_authorized = false`.
 
-A pass is deliberately narrower than production approval. Schema 5 enforces
+A pass is deliberately narrower than production approval. Schema 6 enforces
 bounded age from validated session, exchange-clock, emergency-report, fill, and
 bill window timestamps, but those clocks are not remotely attested. It does not
 remotely attest the host or exchange identity, independently derive derivative
@@ -1943,7 +1963,7 @@ reviewed deployment policy must contain sorted unique approver IDs, at least two
 sorted required roles, one or more approvers for every role, distinct Ed25519
 public keys, and a request lifetime no greater than 15 minutes.
 Its exact file SHA-256 must be placed in
-`expected_approval_policy_sha256` before collecting the passing schema-5 bundle;
+`expected_approval_policy_sha256` before collecting the passing schema-6 bundle;
 request preparation and final verification reject any substituted policy.
 
 Validate the populated policy and archive its exact hash before updating the
@@ -1975,7 +1995,7 @@ shared secret manager role used by that host, or in source control. Key identity
 role assignment, revocation, and proof of separate human control remain external
 governance responsibilities.
 
-2. On the exact candidate host, after the schema-5 bundle passes, prepare the
+2. On the exact candidate host, after the schema-6 bundle passes, prepare the
 short-lived review request:
 
 ```bash

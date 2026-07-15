@@ -236,6 +236,12 @@ pub(crate) struct ReconcileEconomicsArgs {
         help = "Maximum causal delay from scheduled settlement to funding-bill ts"
     )]
     maximum_funding_bill_delay_ms: u64,
+    #[arg(
+        long,
+        default_value_t = 1_000,
+        help = "Maximum exchange-time distance on each side of the funding assessment mark bracket"
+    )]
+    maximum_funding_mark_bracket_distance_ms: u64,
     #[arg(long, default_value_t = 0.0, help = "Absolute trade-price tolerance")]
     price_tolerance: f64,
     #[arg(
@@ -265,6 +271,18 @@ pub(crate) struct ReconcileEconomicsArgs {
     )]
     funding_pnl_relative_tolerance: f64,
     #[arg(
+        long,
+        default_value_t = 1e-8,
+        help = "Absolute tolerance around the journaled funding mark bracket"
+    )]
+    funding_mark_absolute_tolerance: f64,
+    #[arg(
+        long,
+        default_value_t = 1e-5,
+        help = "Relative tolerance around the journaled funding mark bracket"
+    )]
+    funding_mark_relative_tolerance: f64,
+    #[arg(
         short,
         long,
         help = "Create this owner-readable reconciliation artifact; existing files are refused"
@@ -290,6 +308,7 @@ pub(crate) fn reconcile_economics(args: ReconcileEconomicsArgs) -> Result<()> {
             minimum_funding_bills: args.minimum_funding_bills,
             maximum_trade_bill_delay_ms: args.maximum_trade_bill_delay_ms,
             maximum_funding_bill_delay_ms: args.maximum_funding_bill_delay_ms,
+            maximum_funding_mark_bracket_distance_ms: args.maximum_funding_mark_bracket_distance_ms,
             tolerances: EconomicReconciliationTolerances {
                 price_abs: args.price_tolerance,
                 quantity_abs: args.quantity_tolerance,
@@ -297,6 +316,8 @@ pub(crate) fn reconcile_economics(args: ReconcileEconomicsArgs) -> Result<()> {
                 balance_abs: args.balance_tolerance,
                 funding_pnl_abs: args.funding_pnl_absolute_tolerance,
                 funding_pnl_relative: args.funding_pnl_relative_tolerance,
+                funding_mark_abs: args.funding_mark_absolute_tolerance,
+                funding_mark_relative: args.funding_mark_relative_tolerance,
             },
         },
     )?;

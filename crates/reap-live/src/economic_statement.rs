@@ -22,13 +22,14 @@ use crate::{
     verify_fill_collection_manifest_path,
 };
 
-pub const ECONOMIC_RECONCILIATION_SCHEMA_VERSION: u32 = 2;
+pub const ECONOMIC_RECONCILIATION_SCHEMA_VERSION: u32 = 3;
 pub const MAX_ECONOMIC_JOURNAL_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_ECONOMIC_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_ECONOMIC_REPORTED_ISSUES: usize = 1_024;
 pub const MAX_ECONOMIC_FUNDING_SAMPLES: usize = 1_024;
 pub const MAX_TRADE_BILL_DELAY_MS: u64 = 10 * 60 * 1_000;
 pub const MAX_FUNDING_BILL_DELAY_MS: u64 = 10 * 60 * 1_000;
+pub const MAX_FUNDING_MARK_BRACKET_DISTANCE_MS: u64 = 10_000;
 
 #[derive(Debug, Clone)]
 pub struct EconomicReconciliationOptions {
@@ -39,6 +40,7 @@ pub struct EconomicReconciliationOptions {
     pub minimum_funding_bills: u64,
     pub maximum_trade_bill_delay_ms: u64,
     pub maximum_funding_bill_delay_ms: u64,
+    pub maximum_funding_mark_bracket_distance_ms: u64,
     pub tolerances: EconomicReconciliationTolerances,
 }
 
@@ -78,6 +80,13 @@ impl EconomicReconciliationOptions {
                 "maximum-funding-bill-delay-ms must be in 1..={MAX_FUNDING_BILL_DELAY_MS}"
             )));
         }
+        if self.maximum_funding_mark_bracket_distance_ms == 0
+            || self.maximum_funding_mark_bracket_distance_ms > MAX_FUNDING_MARK_BRACKET_DISTANCE_MS
+        {
+            return Err(EconomicReconciliationError::InvalidOptions(format!(
+                "maximum-funding-mark-bracket-distance-ms must be in 1..={MAX_FUNDING_MARK_BRACKET_DISTANCE_MS}"
+            )));
+        }
         for (name, value) in [
             ("price-abs", self.tolerances.price_abs),
             ("quantity-abs", self.tolerances.quantity_abs),
@@ -85,6 +94,11 @@ impl EconomicReconciliationOptions {
             ("balance-abs", self.tolerances.balance_abs),
             ("funding-pnl-abs", self.tolerances.funding_pnl_abs),
             ("funding-pnl-relative", self.tolerances.funding_pnl_relative),
+            ("funding-mark-abs", self.tolerances.funding_mark_abs),
+            (
+                "funding-mark-relative",
+                self.tolerances.funding_mark_relative,
+            ),
         ] {
             if !value.is_finite() || value < 0.0 {
                 return Err(EconomicReconciliationError::InvalidOptions(format!(
@@ -105,6 +119,8 @@ pub struct EconomicReconciliationTolerances {
     pub balance_abs: f64,
     pub funding_pnl_abs: f64,
     pub funding_pnl_relative: f64,
+    pub funding_mark_abs: f64,
+    pub funding_mark_relative: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,8 +144,10 @@ pub struct EconomicJournalRecoveryEvidence {
     pub records: u64,
     pub ignored_truncated_tail: bool,
     pub account_bootstrap_records: u64,
+    pub runtime_session_records: u64,
     pub funding_settlement_records: u64,
     pub position_observation_records: u64,
+    pub mark_price_observation_records: u64,
     pub exclusive_lease_held_while_reading: bool,
 }
 
@@ -150,6 +168,7 @@ pub struct EconomicReconciliationCounts {
     pub funding_settlements_total: u64,
     pub funding_settlements_relevant: u64,
     pub funding_bills_matched: u64,
+    pub funding_mark_brackets_validated: u64,
     pub funding_bills_validated: u64,
     pub issues_total: u64,
     pub issues_reported: u64,
@@ -176,9 +195,14 @@ pub struct EconomicIssue {
 pub struct FundingFormulaSample {
     pub bill_id: String,
     pub symbol: String,
+    pub runtime_session_id: String,
+    pub runtime_session_start_line: u64,
+    pub runtime_session_started_at_ms: u64,
     pub bill_timestamp_ms: u64,
     pub settlement_time_ms: u64,
     pub settlement_delay_ms: u64,
+    pub assessment_time_ms: u64,
+    pub assessment_delay_ms: u64,
     pub rate: f64,
     pub inverse: bool,
     pub currency: String,
@@ -187,8 +211,20 @@ pub struct FundingFormulaSample {
     pub position_observation_line: u64,
     pub position_observation_time_ms: u64,
     pub contract_value: f64,
-    pub mark_price: f64,
-    pub expected_pnl: f64,
+    pub bill_mark_price: f64,
+    pub mark_before_line: u64,
+    pub mark_before_time_ms: u64,
+    pub mark_before_price: f64,
+    pub mark_after_line: u64,
+    pub mark_after_time_ms: u64,
+    pub mark_after_price: f64,
+    pub mark_lower_bound: f64,
+    pub mark_upper_bound: f64,
+    pub mark_effective_tolerance: f64,
+    pub mark_validated: bool,
+    pub expected_pnl_at_bill_mark: f64,
+    pub expected_pnl_lower_bound: f64,
+    pub expected_pnl_upper_bound: f64,
     pub expected_pnl_absolute: f64,
     pub observed_pnl: f64,
     pub absolute_difference: f64,
@@ -204,7 +240,9 @@ pub enum EconomicReconciliationFailure {
     JournalConfigFingerprintMismatch,
     JournalStrategyMismatch,
     JournalTruncatedTail,
+    InvalidOrDuplicateRuntimeSessions,
     InvalidOrDuplicateFundingSettlements,
+    InvalidOrDuplicateFundingMarks,
     DuplicateFills,
     DuplicateTradeBills,
     UnsupportedBills,
@@ -213,7 +251,10 @@ pub enum EconomicReconciliationFailure {
     EligibleFillsMissingBills,
     InvalidFundingBills,
     FundingBillsMissingSettlements,
+    FundingSessionBoundaryMissing,
     FundingPositionMismatches,
+    FundingMarkBracketsMissing,
+    FundingMarkMismatches,
     FundingFormulaMismatches,
     MinimumTradeBillsNotMet,
     MinimumFundingBillsNotMet,
@@ -237,6 +278,7 @@ pub struct EconomicReconciliationReport {
     pub minimum_funding_bills: u64,
     pub maximum_trade_bill_delay_ms: u64,
     pub maximum_funding_bill_delay_ms: u64,
+    pub maximum_funding_mark_bracket_distance_ms: u64,
     pub tolerances: EconomicReconciliationTolerances,
     pub config_file: FillCollectionFileEvidence,
     pub journal: FillCollectionFileEvidence,
@@ -309,11 +351,22 @@ struct JournalPositionObservation {
 }
 
 #[derive(Debug, Clone)]
-struct JournalBootstrapObservation {
+struct JournalMarkPriceObservation {
     line: u64,
-    timestamp_ms: u64,
+    event_ts_ms: u64,
+    symbol: String,
+    price: f64,
+}
+
+#[derive(Debug, Clone)]
+struct JournalRuntimeSession {
+    line: u64,
+    started_at_ms: u64,
+    session_id: String,
     account_id: String,
+    strategy_name: String,
     config_fingerprint: String,
+    account_identity_sha256: String,
 }
 
 #[derive(Debug, Default)]
@@ -343,9 +396,11 @@ struct BoundEconomicSources {
     config_file: FillCollectionFileEvidence,
     journal: FillCollectionFileEvidence,
     recovered: RecoveredStorage,
-    bootstraps: Vec<JournalBootstrapObservation>,
+    account_bootstrap_records: u64,
+    runtime_sessions: Vec<JournalRuntimeSession>,
     settlements: Vec<JournalFundingSettlement>,
     position_observations: Vec<JournalPositionObservation>,
+    mark_price_observations: Vec<JournalMarkPriceObservation>,
     fill_manifest_file: FillCollectionFileEvidence,
     bill_manifest_file: FillCollectionFileEvidence,
     fills: Vec<RemoteFill>,
@@ -396,15 +451,23 @@ pub fn reconcile_okx_economics_paths(
         acquire_storage_lease(journal_path).map_err(EconomicReconciliationError::Journal)?;
     let (journal, journal_bytes) =
         read_input(lease.journal_path(), "journal", MAX_ECONOMIC_JOURNAL_BYTES)?;
-    let mut bootstraps = Vec::new();
+    let mut account_bootstrap_records = 0_u64;
+    let mut runtime_sessions = Vec::new();
     let mut settlements = Vec::new();
     let mut position_observations = Vec::new();
+    let mut mark_price_observations = Vec::new();
     let recovered = recover_jsonl_bytes_with_visitor(&journal_bytes, |line, record| match record {
-        StorageRecord::Bootstrap(bootstrap) => bootstraps.push(JournalBootstrapObservation {
+        StorageRecord::Bootstrap(_) => {
+            account_bootstrap_records = account_bootstrap_records.saturating_add(1);
+        }
+        StorageRecord::SessionStart(session) => runtime_sessions.push(JournalRuntimeSession {
             line,
-            timestamp_ms: bootstrap.ts_ms,
-            account_id: bootstrap.account_id.clone(),
-            config_fingerprint: bootstrap.config_fingerprint.clone(),
+            started_at_ms: session.ts_ms,
+            session_id: session.session_id.clone(),
+            account_id: session.account_id.clone(),
+            strategy_name: session.strategy_name.clone(),
+            config_fingerprint: session.config_fingerprint.clone(),
+            account_identity_sha256: session.account_identity_sha256.clone(),
         }),
         StorageRecord::Normalized(NormalizedEvent::Market(MarketEvent::FundingRate {
             ts_ms,
@@ -418,6 +481,19 @@ pub fn reconcile_okx_economics_paths(
             funding_time_ms: settlement.funding_time_ms,
             rate: settlement.rate,
         }),
+        StorageRecord::Normalized(NormalizedEvent::Market(MarketEvent::PriceLimits {
+            ts_ms,
+            symbol,
+            mark_price,
+            ..
+        })) if *mark_price != 0.0 => {
+            mark_price_observations.push(JournalMarkPriceObservation {
+                line,
+                event_ts_ms: *ts_ms,
+                symbol: symbol.clone(),
+                price: *mark_price,
+            });
+        }
         StorageRecord::Normalized(NormalizedEvent::Account(update)) => {
             position_observations.extend(update.positions.iter().map(|position| {
                 JournalPositionObservation {
@@ -438,9 +514,11 @@ pub fn reconcile_okx_economics_paths(
         config_file,
         journal,
         recovered,
-        bootstraps,
+        account_bootstrap_records,
+        runtime_sessions,
         settlements,
         position_observations,
+        mark_price_observations,
         fill_manifest_file: fills.manifest_file,
         bill_manifest_file: bills.manifest_file,
         fills: fills.fills,
@@ -553,8 +631,21 @@ fn build_report(
         }
     }
 
-    let valid_settlements =
-        validate_funding_settlements(&sources, &options, &mut counts, &mut failures, &mut issues);
+    let valid_runtime_sessions = validate_runtime_sessions(&sources, &mut failures, &mut issues);
+    let valid_settlements = validate_funding_settlements(
+        &sources,
+        &valid_runtime_sessions,
+        &options,
+        &mut counts,
+        &mut failures,
+        &mut issues,
+    );
+    let valid_mark_prices = validate_funding_mark_prices(
+        &sources,
+        &valid_runtime_sessions,
+        &mut failures,
+        &mut issues,
+    );
     let mut trade_bill_keys = BTreeSet::new();
     let mut matched_fill_keys = BTreeSet::new();
     let mut funding_samples = Vec::new();
@@ -614,10 +705,12 @@ fn build_report(
                 let sample = validate_funding_bill(
                     bill,
                     &valid_settlements,
-                    &sources.bootstraps,
+                    &valid_runtime_sessions,
                     &sources.position_observations,
+                    &valid_mark_prices,
                     &sources.config,
                     &sources.config_fingerprint,
+                    &sources.account_identity_sha256,
                     &sources.account_id,
                     &options,
                     &mut counts,
@@ -702,15 +795,19 @@ fn build_report(
         minimum_funding_bills: options.minimum_funding_bills,
         maximum_trade_bill_delay_ms: options.maximum_trade_bill_delay_ms,
         maximum_funding_bill_delay_ms: options.maximum_funding_bill_delay_ms,
+        maximum_funding_mark_bracket_distance_ms: options
+            .maximum_funding_mark_bracket_distance_ms,
         tolerances: options.tolerances,
         config_file: sources.config_file,
         journal: sources.journal,
         journal_recovery: EconomicJournalRecoveryEvidence {
             records: sources.recovered.records,
             ignored_truncated_tail: sources.recovered.ignored_truncated_tail,
-            account_bootstrap_records: sources.bootstraps.len() as u64,
+            account_bootstrap_records: sources.account_bootstrap_records,
+            runtime_session_records: sources.runtime_sessions.len() as u64,
             funding_settlement_records: sources.settlements.len() as u64,
             position_observation_records: sources.position_observations.len() as u64,
+            mark_price_observation_records: sources.mark_price_observations.len() as u64,
             exclusive_lease_held_while_reading: true,
         },
         fill_collection_manifest: sources.fill_manifest_file,
@@ -722,7 +819,8 @@ fn build_report(
         issues_truncated,
         limitations: vec![
             "realized trade PnL is checked against each derivative bill's balance equation but is not independently recomputed because the journal does not yet retain an attested opening cost basis".to_string(),
-            "funding quantity and sign are bound to the journaled position, but the exact settlement mark remains sourced from the exchange bill rather than an independently attested boundary mark".to_string(),
+            "funding checks the bill-reported mark against journaled observations bracketing the exchange-reported assessment time; the exact internal venue assessment tick is not reproduced".to_string(),
+            "runtime-session boundaries are locally journaled provenance that prevents cross-restart evidence composition; they are not remote process attestation".to_string(),
             "settlements with no funding bill are not failures because a zero position legitimately produces no balance change; minimum matched funding evidence is required instead".to_string(),
             "the final trade-delay guard is excluded from fill-to-bill completeness because its bills may fall after the closed account-bill window".to_string(),
         ],
@@ -813,8 +911,89 @@ fn validate_journal_identity(
     }
 }
 
+fn validate_runtime_sessions<'a>(
+    sources: &'a BoundEconomicSources,
+    failures: &mut BTreeSet<EconomicReconciliationFailure>,
+    issues: &mut IssueSink,
+) -> Vec<&'a JournalRuntimeSession> {
+    let mut seen = BTreeSet::new();
+    let mut valid = Vec::new();
+    for session in &sources.runtime_sessions {
+        let identity_valid = session.started_at_ms > 0
+            && is_runtime_session_id(&session.session_id)
+            && !session.account_id.is_empty()
+            && session.account_id.trim() == session.account_id
+            && sources.config.account(&session.account_id).is_some()
+            && !session.strategy_name.is_empty()
+            && session.strategy_name == sources.config.strategy.strategy_name
+            && session.config_fingerprint == sources.config_fingerprint
+            && is_lower_sha256(&session.config_fingerprint)
+            && is_lower_sha256(&session.account_identity_sha256);
+        if !identity_valid {
+            issues.push(
+                EconomicReconciliationFailure::InvalidOrDuplicateRuntimeSessions,
+                issue(
+                    EconomicIssueSource::Journal,
+                    None,
+                    None,
+                    None,
+                    "runtime_session",
+                    "configured account/strategy and valid session/config/account identities",
+                    &format!(
+                        "line {}, started_at={}, session_id={}, account={}",
+                        session.line, session.started_at_ms, session.session_id, session.account_id
+                    ),
+                    "journal contains a malformed or foreign runtime-session boundary",
+                ),
+                failures,
+            );
+            continue;
+        }
+        if !seen.insert((session.account_id.clone(), session.session_id.clone())) {
+            issues.push(
+                EconomicReconciliationFailure::InvalidOrDuplicateRuntimeSessions,
+                issue(
+                    EconomicIssueSource::Journal,
+                    None,
+                    None,
+                    None,
+                    "runtime_session",
+                    "one session-start record per account/session id",
+                    &format!("duplicate at line {}", session.line),
+                    "journal contains a duplicate runtime-session boundary",
+                ),
+                failures,
+            );
+            continue;
+        }
+        valid.push(session);
+    }
+    valid
+}
+
+fn is_runtime_session_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn runtime_session_for_line<'a>(
+    sessions: &[&'a JournalRuntimeSession],
+    account_id: &str,
+    line: u64,
+) -> Option<&'a JournalRuntimeSession> {
+    sessions
+        .iter()
+        .copied()
+        .filter(|session| session.account_id == account_id && session.line < line)
+        .max_by_key(|session| session.line)
+}
+
 fn validate_funding_settlements<'a>(
     sources: &'a BoundEconomicSources,
+    runtime_sessions: &[&JournalRuntimeSession],
     options: &EconomicReconciliationOptions,
     counts: &mut EconomicReconciliationCounts,
     failures: &mut BTreeSet<EconomicReconciliationFailure>,
@@ -863,7 +1042,14 @@ fn validate_funding_settlements<'a>(
             );
             continue;
         }
-        let key = (settlement.symbol.clone(), settlement.funding_time_ms);
+        let session_id =
+            runtime_session_for_line(runtime_sessions, &sources.account_id, settlement.line)
+                .map_or("legacy", |session| session.session_id.as_str());
+        let key = (
+            session_id.to_string(),
+            settlement.symbol.clone(),
+            settlement.funding_time_ms,
+        );
         if !seen.insert(key) {
             issues.push(
                 EconomicReconciliationFailure::InvalidOrDuplicateFundingSettlements,
@@ -873,7 +1059,7 @@ fn validate_funding_settlements<'a>(
                     Some(&settlement.symbol),
                     None,
                     "funding_settlement",
-                    "one normalized settlement per symbol/time",
+                    "one normalized settlement per runtime session/symbol/time",
                     &format!("duplicate at line {}", settlement.line),
                     "journal funding deduplication did not produce a unique settlement",
                 ),
@@ -882,6 +1068,69 @@ fn validate_funding_settlements<'a>(
             continue;
         }
         valid.push(settlement);
+    }
+    valid
+}
+
+fn validate_funding_mark_prices<'a>(
+    sources: &'a BoundEconomicSources,
+    runtime_sessions: &[&JournalRuntimeSession],
+    failures: &mut BTreeSet<EconomicReconciliationFailure>,
+    issues: &mut IssueSink,
+) -> Vec<&'a JournalMarkPriceObservation> {
+    let mut seen = BTreeSet::new();
+    let mut valid = Vec::new();
+    for observation in &sources.mark_price_observations {
+        if observation.symbol.is_empty()
+            || observation.event_ts_ms == 0
+            || !observation.price.is_finite()
+            || observation.price <= 0.0
+        {
+            issues.push(
+                EconomicReconciliationFailure::InvalidOrDuplicateFundingMarks,
+                issue(
+                    EconomicIssueSource::Journal,
+                    None,
+                    Some(&observation.symbol),
+                    None,
+                    "mark_price",
+                    "non-empty symbol and positive finite exchange-time mark",
+                    &format!(
+                        "line {}, event_ts={}, price={}",
+                        observation.line, observation.event_ts_ms, observation.price
+                    ),
+                    "journal contains an invalid mark-price observation",
+                ),
+                failures,
+            );
+            continue;
+        }
+        let session_id =
+            runtime_session_for_line(runtime_sessions, &sources.account_id, observation.line)
+                .map_or("legacy", |session| session.session_id.as_str());
+        let key = (
+            session_id.to_string(),
+            observation.symbol.clone(),
+            observation.event_ts_ms,
+        );
+        if !seen.insert(key) {
+            issues.push(
+                EconomicReconciliationFailure::InvalidOrDuplicateFundingMarks,
+                issue(
+                    EconomicIssueSource::Journal,
+                    None,
+                    Some(&observation.symbol),
+                    None,
+                    "mark_price",
+                    "one normalized mark per runtime session/symbol/exchange timestamp",
+                    &format!("duplicate at line {}", observation.line),
+                    "journal mark-price deduplication did not produce a unique observation",
+                ),
+                failures,
+            );
+            continue;
+        }
+        valid.push(observation);
     }
     valid
 }
@@ -1244,10 +1493,12 @@ fn validate_trade_bill(
 fn validate_funding_bill(
     bill: &OkxBill,
     settlements: &[&JournalFundingSettlement],
-    bootstraps: &[JournalBootstrapObservation],
+    runtime_sessions: &[&JournalRuntimeSession],
     position_observations: &[JournalPositionObservation],
+    mark_price_observations: &[&JournalMarkPriceObservation],
     config: &LiveConfig,
     config_fingerprint: &str,
+    account_identity_sha256: &str,
     account_id: &str,
     options: &EconomicReconciliationOptions,
     counts: &mut EconomicReconciliationCounts,
@@ -1353,17 +1604,29 @@ fn validate_funding_bill(
             "funding bill unexpectedly identifies an account transfer",
         );
     }
-    match bill.fill_time_ms {
-        Some(fill_time_ms)
-            if fill_time_ms
-                >= bill
-                    .timestamp_ms
-                    .saturating_sub(options.maximum_funding_bill_delay_ms)
-                && fill_time_ms
-                    <= bill
-                        .timestamp_ms
-                        .saturating_add(options.maximum_funding_bill_delay_ms) => {}
-        Some(fill_time_ms) => push_bill_issue(
+    let Some(assessment_time_ms) = bill.fill_time_ms else {
+        push_bill_issue(
+            failures,
+            issues,
+            EconomicReconciliationFailure::InvalidFundingBills,
+            bill,
+            "fillTime",
+            "funding assessment timestamp",
+            "missing",
+            "funding bill omits the timestamp needed to bind position and mark evidence",
+        );
+        return None;
+    };
+    if assessment_time_ms
+        < bill
+            .timestamp_ms
+            .saturating_sub(options.maximum_funding_bill_delay_ms)
+        || assessment_time_ms
+            > bill
+                .timestamp_ms
+                .saturating_add(options.maximum_funding_bill_delay_ms)
+    {
+        push_bill_issue(
             failures,
             issues,
             EconomicReconciliationFailure::InvalidFundingBills,
@@ -1373,19 +1636,9 @@ fn validate_funding_bill(
                 "within {} ms of bill ts",
                 options.maximum_funding_bill_delay_ms
             ),
-            &fill_time_ms.to_string(),
-            "funding completion and balance-update timestamps are not causally close",
-        ),
-        None => push_bill_issue(
-            failures,
-            issues,
-            EconomicReconciliationFailure::InvalidFundingBills,
-            bill,
-            "fillTime",
-            "funding completion timestamp",
-            "missing",
-            "funding bill omits its completion timestamp",
-        ),
+            &assessment_time_ms.to_string(),
+            "funding assessment and balance-update timestamps are not causally close",
+        );
     }
     if bill
         .fee
@@ -1416,26 +1669,44 @@ fn validate_funding_bill(
                     <= options.maximum_funding_bill_delay_ms
         })
         .collect::<Vec<_>>();
-    if candidates.len() != 1 {
-        issues.push(
-            EconomicReconciliationFailure::FundingBillsMissingSettlements,
-            issue_for_bill(
-                EconomicIssueSource::Journal,
-                bill,
-                "funding_settlement",
-                "exactly one journaled settled rate within the causal delay",
-                &candidates.len().to_string(),
-                "funding bill cannot be bound to one normalized settled-rate source",
-            ),
-            failures,
-        );
-        return None;
-    }
+    let session_bound_candidates = candidates
+        .iter()
+        .copied()
+        .filter(|settlement| {
+            runtime_session_for_line(runtime_sessions, account_id, settlement.line).is_some_and(
+                |session| {
+                    session.config_fingerprint == config_fingerprint
+                        && session.account_identity_sha256 == account_identity_sha256
+                        && session.started_at_ms <= assessment_time_ms
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let settlement = match (candidates.as_slice(), session_bound_candidates.as_slice()) {
+        ([settlement], _) | (_, [settlement]) => *settlement,
+        _ => {
+            issues.push(
+                EconomicReconciliationFailure::FundingBillsMissingSettlements,
+                issue_for_bill(
+                    EconomicIssueSource::Journal,
+                    bill,
+                    "funding_settlement",
+                    "exactly one session-bound journaled settled rate within the causal delay",
+                    &format!(
+                        "causal={}, session_bound={}",
+                        candidates.len(),
+                        session_bound_candidates.len()
+                    ),
+                    "funding bill cannot be bound to one normalized settled-rate source",
+                ),
+                failures,
+            );
+            return None;
+        }
+    };
     counts.funding_bills_matched += 1;
-    let settlement = candidates[0];
-    if let Some(fill_time_ms) = bill.fill_time_ms
-        && (fill_time_ms < settlement.funding_time_ms
-            || fill_time_ms - settlement.funding_time_ms > options.maximum_funding_bill_delay_ms)
+    if assessment_time_ms < settlement.funding_time_ms
+        || assessment_time_ms - settlement.funding_time_ms > options.maximum_funding_bill_delay_ms
     {
         push_bill_issue(
             failures,
@@ -1447,41 +1718,44 @@ fn validate_funding_bill(
                 "settlement..=settlement+{}",
                 options.maximum_funding_bill_delay_ms
             ),
-            &fill_time_ms.to_string(),
-            "funding completion timestamp is outside the settlement delay",
+            &assessment_time_ms.to_string(),
+            "funding assessment timestamp is outside the scheduled settlement delay",
         );
     }
-    let session_bootstrap = bootstraps
-        .iter()
-        .filter(|bootstrap| {
-            bootstrap.account_id == account_id
-                && bootstrap.config_fingerprint == config_fingerprint
-                && bootstrap.timestamp_ms <= settlement.funding_time_ms
-                && bootstrap.line < settlement.line
-        })
-        .max_by_key(|bootstrap| bootstrap.line);
-    let Some(session_bootstrap) = session_bootstrap else {
+    let runtime_session = runtime_session_for_line(runtime_sessions, account_id, settlement.line);
+    let Some(runtime_session) = runtime_session.filter(|session| {
+        session.config_fingerprint == config_fingerprint
+            && session.account_identity_sha256 == account_identity_sha256
+            && session.started_at_ms <= assessment_time_ms
+    }) else {
         issues.push(
-            EconomicReconciliationFailure::FundingPositionMismatches,
+            EconomicReconciliationFailure::FundingSessionBoundaryMissing,
             issue_for_bill(
                 EconomicIssueSource::Journal,
                 bill,
-                "session_bootstrap",
-                "matching account/config bootstrap before settlement",
+                "runtime_session",
+                "matching account/config/account-identity session start before assessment",
                 "missing",
-                "funding position cannot be tied to the evidence-bearing runtime session",
+                "funding evidence cannot be tied to one explicitly journaled runtime session",
             ),
             failures,
         );
         return None;
     };
+    let next_session_line = runtime_sessions
+        .iter()
+        .copied()
+        .filter(|session| session.account_id == account_id && session.line > runtime_session.line)
+        .map(|session| session.line)
+        .min()
+        .unwrap_or(u64::MAX);
     let position = position_observations
         .iter()
         .filter(|position| {
             position.symbol == bill.symbol
-                && position.line > session_bootstrap.line
-                && position.line < settlement.line
-                && position.event_ts_ms <= settlement.funding_time_ms
+                && position.line > runtime_session.line
+                && position.line < next_session_line
+                && position.event_ts_ms <= assessment_time_ms
         })
         .max_by_key(|position| (position.event_ts_ms, position.line));
     let Some(position) = position else {
@@ -1491,7 +1765,7 @@ fn validate_funding_bill(
                 EconomicIssueSource::Journal,
                 bill,
                 "position",
-                "latest journaled position at or before settlement",
+                "latest same-session journaled position at or before funding assessment",
                 "missing",
                 "funding payment cannot be bound to an independently journaled position",
             ),
@@ -1547,7 +1821,7 @@ fn validate_funding_bill(
             failures,
         );
     }
-    let Some(mark_price) = bill.price.filter(|value| value.is_finite() && *value > 0.0) else {
+    let Some(bill_mark_price) = bill.price.filter(|value| value.is_finite() && *value > 0.0) else {
         push_bill_issue(
             failures,
             issues,
@@ -1556,10 +1830,86 @@ fn validate_funding_bill(
             "px",
             "positive settlement mark price",
             &format!("{:?}", bill.price),
-            "funding formula requires the exchange settlement mark",
+            "funding formula requires the exchange-reported assessment mark for independent comparison",
         );
         return None;
     };
+    let mark_before = mark_price_observations
+        .iter()
+        .copied()
+        .filter(|observation| {
+            observation.symbol == bill.symbol
+                && observation.line > runtime_session.line
+                && observation.line < next_session_line
+                && observation.event_ts_ms <= assessment_time_ms
+                && assessment_time_ms - observation.event_ts_ms
+                    <= options.maximum_funding_mark_bracket_distance_ms
+        })
+        .max_by_key(|observation| (observation.event_ts_ms, observation.line));
+    let mark_after = mark_price_observations
+        .iter()
+        .copied()
+        .filter(|observation| {
+            observation.symbol == bill.symbol
+                && observation.line > runtime_session.line
+                && observation.line < next_session_line
+                && observation.event_ts_ms >= assessment_time_ms
+                && observation.event_ts_ms - assessment_time_ms
+                    <= options.maximum_funding_mark_bracket_distance_ms
+        })
+        .min_by_key(|observation| (observation.event_ts_ms, observation.line));
+    let (Some(mark_before), Some(mark_after)) = (mark_before, mark_after) else {
+        issues.push(
+            EconomicReconciliationFailure::FundingMarkBracketsMissing,
+            issue_for_bill(
+                EconomicIssueSource::Journal,
+                bill,
+                "mark_price_bracket",
+                &format!(
+                    "same-session marks on both sides of fillTime within {} ms",
+                    options.maximum_funding_mark_bracket_distance_ms
+                ),
+                &format!(
+                    "before={}, after={}",
+                    mark_before.is_some(),
+                    mark_after.is_some()
+                ),
+                "funding assessment cannot be compared with a two-sided journaled mark bracket",
+            ),
+            failures,
+        );
+        return None;
+    };
+    let mark_lower_bound = mark_before.price.min(mark_after.price);
+    let mark_upper_bound = mark_before.price.max(mark_after.price);
+    let mark_scale = bill_mark_price
+        .abs()
+        .max(mark_lower_bound.abs())
+        .max(mark_upper_bound.abs());
+    let mark_effective_tolerance = options
+        .tolerances
+        .funding_mark_abs
+        .max(options.tolerances.funding_mark_relative * mark_scale);
+    let mark_valid = mark_effective_tolerance.is_finite()
+        && bill_mark_price >= mark_lower_bound - mark_effective_tolerance
+        && bill_mark_price <= mark_upper_bound + mark_effective_tolerance;
+    if mark_valid {
+        counts.funding_mark_brackets_validated += 1;
+    } else {
+        push_bill_issue(
+            failures,
+            issues,
+            EconomicReconciliationFailure::FundingMarkMismatches,
+            bill,
+            "px",
+            &format!(
+                "{}..={} +/- {} from journaled mark bracket",
+                mark_lower_bound, mark_upper_bound, mark_effective_tolerance
+            ),
+            &bill_mark_price.to_string(),
+            "funding bill mark lies outside the independently journaled assessment bracket",
+        );
+    }
     let Some(pnl) = bill.pnl.filter(|value| value.is_finite() && *value != 0.0) else {
         push_bill_issue(
             failures,
@@ -1602,20 +1952,48 @@ fn validate_funding_bill(
         );
     }
 
-    let expected_pnl = if instrument.kind.is_inverse() {
-        -(position.quantity * instrument.contract_value * settlement.rate / mark_price)
+    let expected_pnl_at_bill_mark = funding_pnl_at_mark(
+        position.quantity,
+        instrument.contract_value,
+        settlement.rate,
+        bill_mark_price,
+        instrument.kind.is_inverse(),
+    );
+    let expected_pnl_at_mark_before = funding_pnl_at_mark(
+        position.quantity,
+        instrument.contract_value,
+        settlement.rate,
+        mark_before.price,
+        instrument.kind.is_inverse(),
+    );
+    let expected_pnl_at_mark_after = funding_pnl_at_mark(
+        position.quantity,
+        instrument.contract_value,
+        settlement.rate,
+        mark_after.price,
+        instrument.kind.is_inverse(),
+    );
+    let expected_pnl_lower_bound = expected_pnl_at_mark_before.min(expected_pnl_at_mark_after);
+    let expected_pnl_upper_bound = expected_pnl_at_mark_before.max(expected_pnl_at_mark_after);
+    let expected_pnl_absolute = expected_pnl_lower_bound
+        .abs()
+        .max(expected_pnl_upper_bound.abs());
+    let absolute_difference = if pnl < expected_pnl_lower_bound {
+        expected_pnl_lower_bound - pnl
+    } else if pnl > expected_pnl_upper_bound {
+        pnl - expected_pnl_upper_bound
     } else {
-        -(position.quantity * instrument.contract_value * settlement.rate * mark_price)
+        0.0
     };
-    let expected_pnl_absolute = expected_pnl.abs();
-    let absolute_difference = (pnl - expected_pnl).abs();
     let relative_difference =
         absolute_difference / expected_pnl_absolute.max(pnl.abs()).max(f64::MIN_POSITIVE);
     let effective_tolerance = options
         .tolerances
         .funding_pnl_abs
         .max(options.tolerances.funding_pnl_relative * expected_pnl_absolute);
-    let formula_valid = expected_pnl.is_finite()
+    let formula_valid = expected_pnl_at_bill_mark.is_finite()
+        && expected_pnl_lower_bound.is_finite()
+        && expected_pnl_upper_bound.is_finite()
         && absolute_difference.is_finite()
         && absolute_difference <= effective_tolerance;
     if !formula_valid {
@@ -1625,21 +2003,29 @@ fn validate_funding_bill(
             EconomicReconciliationFailure::FundingFormulaMismatches,
             bill,
             "pnl_formula",
-            &expected_pnl.to_string(),
+            &format!(
+                "{}..={} +/- {}",
+                expected_pnl_lower_bound, expected_pnl_upper_bound, effective_tolerance
+            ),
             &pnl.to_string(),
-            "funding payment does not match the configured contract formula, journaled signed position, and settled rate",
+            "funding payment does not match the configured contract formula, journaled signed position/rate, and independent mark bracket",
         );
     }
-    let validated = before == issues.total && formula_valid;
+    let validated = before == issues.total && mark_valid && formula_valid;
     if validated {
         counts.funding_bills_validated += 1;
     }
     Some(FundingFormulaSample {
         bill_id: bill.bill_id.clone(),
         symbol: bill.symbol.clone(),
+        runtime_session_id: runtime_session.session_id.clone(),
+        runtime_session_start_line: runtime_session.line,
+        runtime_session_started_at_ms: runtime_session.started_at_ms,
         bill_timestamp_ms: bill.timestamp_ms,
         settlement_time_ms: settlement.funding_time_ms,
         settlement_delay_ms: bill.timestamp_ms - settlement.funding_time_ms,
+        assessment_time_ms,
+        assessment_delay_ms: assessment_time_ms.saturating_sub(settlement.funding_time_ms),
         rate: settlement.rate,
         inverse: instrument.kind.is_inverse(),
         currency: bill.currency.clone(),
@@ -1648,8 +2034,20 @@ fn validate_funding_bill(
         position_observation_line: position.line,
         position_observation_time_ms: position.event_ts_ms,
         contract_value: instrument.contract_value,
-        mark_price,
-        expected_pnl,
+        bill_mark_price,
+        mark_before_line: mark_before.line,
+        mark_before_time_ms: mark_before.event_ts_ms,
+        mark_before_price: mark_before.price,
+        mark_after_line: mark_after.line,
+        mark_after_time_ms: mark_after.event_ts_ms,
+        mark_after_price: mark_after.price,
+        mark_lower_bound,
+        mark_upper_bound,
+        mark_effective_tolerance,
+        mark_validated: mark_valid,
+        expected_pnl_at_bill_mark,
+        expected_pnl_lower_bound,
+        expected_pnl_upper_bound,
         expected_pnl_absolute,
         observed_pnl: pnl,
         absolute_difference,
@@ -1657,6 +2055,20 @@ fn validate_funding_bill(
         effective_tolerance,
         validated,
     })
+}
+
+fn funding_pnl_at_mark(
+    signed_position: f64,
+    contract_value: f64,
+    rate: f64,
+    mark_price: f64,
+    inverse: bool,
+) -> f64 {
+    if inverse {
+        -(signed_position * contract_value * rate / mark_price)
+    } else {
+        -(signed_position * contract_value * rate * mark_price)
+    }
 }
 
 fn instrument<'a>(config: &'a LiveConfig, symbol: &str) -> Option<&'a InstrumentConfig> {
@@ -1972,6 +2384,7 @@ mod tests {
             minimum_funding_bills: 1,
             maximum_trade_bill_delay_ms: 10_000,
             maximum_funding_bill_delay_ms: 10_000,
+            maximum_funding_mark_bracket_distance_ms: 1_000,
             tolerances: EconomicReconciliationTolerances {
                 price_abs: 0.0,
                 quantity_abs: 1e-9,
@@ -1979,6 +2392,8 @@ mod tests {
                 balance_abs: 1e-12,
                 funding_pnl_abs: 1e-12,
                 funding_pnl_relative: 1e-12,
+                funding_mark_abs: 0.0,
+                funding_mark_relative: 0.0,
             },
         }
     }
@@ -2072,8 +2487,9 @@ mod tests {
     fn sources() -> BoundEconomicSources {
         let config = config();
         let fingerprint = config.fingerprint().unwrap();
+        let strategy_name = config.strategy.strategy_name.clone();
         let mut recovered = RecoveredStorage {
-            records: 4,
+            records: 7,
             ..RecoveredStorage::default()
         };
         recovered.bootstrap_identities.insert(
@@ -2086,25 +2502,51 @@ mod tests {
             config_file: evidence("/config"),
             journal: evidence("/journal"),
             recovered,
-            bootstraps: vec![JournalBootstrapObservation {
-                line: 1,
-                timestamp_ms: BEGIN_MS - 1_000,
+            account_bootstrap_records: 1,
+            runtime_sessions: vec![JournalRuntimeSession {
+                line: 2,
+                started_at_ms: BEGIN_MS - 1_000,
+                session_id: "1a2b3c".to_string(),
                 account_id: "main".to_string(),
+                strategy_name,
                 config_fingerprint: fingerprint.clone(),
+                account_identity_sha256: "b".repeat(64),
             }],
             settlements: vec![JournalFundingSettlement {
-                line: 3,
+                line: 4,
                 event_ts_ms: FUNDING_MS + 50,
                 symbol: "BTC-USDT-SWAP".to_string(),
                 funding_time_ms: FUNDING_MS,
                 rate: 0.001,
             }],
-            position_observations: vec![JournalPositionObservation {
-                line: 2,
-                event_ts_ms: FUNDING_MS - 100,
-                symbol: "BTC-USDT-SWAP".to_string(),
-                quantity: 10.0,
-            }],
+            position_observations: vec![
+                JournalPositionObservation {
+                    line: 3,
+                    event_ts_ms: FUNDING_MS - 100,
+                    symbol: "BTC-USDT-SWAP".to_string(),
+                    quantity: 9.0,
+                },
+                JournalPositionObservation {
+                    line: 5,
+                    event_ts_ms: FUNDING_MS + 75,
+                    symbol: "BTC-USDT-SWAP".to_string(),
+                    quantity: 10.0,
+                },
+            ],
+            mark_price_observations: vec![
+                JournalMarkPriceObservation {
+                    line: 6,
+                    event_ts_ms: FUNDING_MS + 90,
+                    symbol: "BTC-USDT-SWAP".to_string(),
+                    price: 50_000.0,
+                },
+                JournalMarkPriceObservation {
+                    line: 7,
+                    event_ts_ms: FUNDING_MS + 110,
+                    symbol: "BTC-USDT-SWAP".to_string(),
+                    price: 50_000.0,
+                },
+            ],
             fill_manifest_file: evidence("/fills"),
             bill_manifest_file: evidence("/bills"),
             fills: vec![swap_fill()],
@@ -2131,13 +2573,32 @@ mod tests {
         assert_eq!(report.counts.funding_bills_validated, 1);
         assert_eq!(report.counts.eligible_fills_missing_bill, 0);
         assert_eq!(report.funding_formula_samples.len(), 1);
-        assert_eq!(report.journal_recovery.position_observation_records, 1);
-        assert_eq!(report.funding_formula_samples[0].expected_pnl, -5.0);
+        assert_eq!(report.journal_recovery.position_observation_records, 2);
+        assert_eq!(report.journal_recovery.mark_price_observation_records, 2);
+        assert_eq!(report.journal_recovery.runtime_session_records, 1);
+        assert_eq!(report.counts.funding_mark_brackets_validated, 1);
+        assert_eq!(
+            report.funding_formula_samples[0].expected_pnl_at_bill_mark,
+            -5.0
+        );
         assert_eq!(report.funding_formula_samples[0].expected_pnl_absolute, 5.0);
         assert_eq!(
             report.funding_formula_samples[0].journal_position_quantity,
             10.0
         );
+        assert_eq!(
+            report.funding_formula_samples[0].position_observation_line,
+            5
+        );
+        assert_eq!(
+            report.funding_formula_samples[0].runtime_session_id,
+            "1a2b3c"
+        );
+        assert_eq!(
+            report.funding_formula_samples[0].runtime_session_start_line,
+            2
+        );
+        assert!(report.funding_formula_samples[0].mark_validated);
         assert!(report.funding_formula_samples[0].validated);
     }
 
@@ -2268,9 +2729,36 @@ mod tests {
     }
 
     #[test]
+    fn settled_rate_replay_after_restart_does_not_duplicate_prior_session() {
+        let mut sources = sources();
+        sources.runtime_sessions.push(JournalRuntimeSession {
+            line: 8,
+            started_at_ms: FUNDING_MS + 110,
+            session_id: "4d5e6f".to_string(),
+            account_id: "main".to_string(),
+            strategy_name: sources.config.strategy.strategy_name.clone(),
+            config_fingerprint: sources.config_fingerprint.clone(),
+            account_identity_sha256: sources.account_identity_sha256.clone(),
+        });
+        let mut replay = sources.settlements[0].clone();
+        replay.line = 9;
+        replay.event_ts_ms = FUNDING_MS + 150;
+        sources.settlements.push(replay);
+
+        let report = build_report(sources, options(), "c".repeat(64));
+
+        assert!(report.passed, "{:?}", report.issues);
+        assert_eq!(report.counts.funding_bills_validated, 1);
+        assert_eq!(
+            report.funding_formula_samples[0].runtime_session_id,
+            "1a2b3c"
+        );
+    }
+
+    #[test]
     fn funding_sign_is_recomputed_from_the_journaled_position() {
         let mut sources = sources();
-        sources.position_observations[0].quantity = -10.0;
+        sources.position_observations[1].quantity = -10.0;
 
         let report = build_report(sources, options(), "c".repeat(64));
 
@@ -2280,12 +2768,15 @@ mod tests {
                 .failures
                 .contains(&EconomicReconciliationFailure::FundingFormulaMismatches)
         );
-        assert_eq!(report.funding_formula_samples[0].expected_pnl, 5.0);
+        assert_eq!(
+            report.funding_formula_samples[0].expected_pnl_at_bill_mark,
+            5.0
+        );
         assert_eq!(report.funding_formula_samples[0].observed_pnl, -5.0);
     }
 
     #[test]
-    fn funding_requires_a_matching_pre_settlement_journal_position() {
+    fn funding_requires_a_matching_pre_assessment_journal_position() {
         let mut sources = sources();
         sources.position_observations.clear();
 
@@ -2296,6 +2787,131 @@ mod tests {
             report
                 .failures
                 .contains(&EconomicReconciliationFailure::FundingPositionMismatches)
+        );
+        assert!(report.funding_formula_samples.is_empty());
+    }
+
+    #[test]
+    fn funding_requires_marks_on_both_sides_of_the_assessment() {
+        let mut sources = sources();
+        sources.mark_price_observations.pop();
+
+        let report = build_report(sources, options(), "c".repeat(64));
+
+        assert!(!report.passed);
+        assert!(
+            report
+                .failures
+                .contains(&EconomicReconciliationFailure::FundingMarkBracketsMissing)
+        );
+        assert!(report.funding_formula_samples.is_empty());
+    }
+
+    #[test]
+    fn funding_bill_mark_must_lie_inside_the_journaled_bracket() {
+        let mut sources = sources();
+        sources.bills[1].price = Some(51_000.0);
+
+        let report = build_report(sources, options(), "c".repeat(64));
+
+        assert!(!report.passed);
+        assert!(
+            report
+                .failures
+                .contains(&EconomicReconciliationFailure::FundingMarkMismatches)
+        );
+        assert!(!report.funding_formula_samples[0].mark_validated);
+        assert_eq!(report.funding_formula_samples[0].absolute_difference, 0.0);
+    }
+
+    #[test]
+    fn duplicate_journal_mark_timestamp_fails_closed() {
+        let mut sources = sources();
+        let mut duplicate = sources.mark_price_observations[0].clone();
+        duplicate.line = 8;
+        sources.mark_price_observations.push(duplicate);
+
+        let report = build_report(sources, options(), "c".repeat(64));
+
+        assert!(!report.passed);
+        assert!(
+            report
+                .failures
+                .contains(&EconomicReconciliationFailure::InvalidOrDuplicateFundingMarks)
+        );
+    }
+
+    #[test]
+    fn mark_replay_after_restart_does_not_duplicate_prior_session() {
+        let mut sources = sources();
+        sources.runtime_sessions.push(JournalRuntimeSession {
+            line: 8,
+            started_at_ms: FUNDING_MS + 110,
+            session_id: "4d5e6f".to_string(),
+            account_id: "main".to_string(),
+            strategy_name: sources.config.strategy.strategy_name.clone(),
+            config_fingerprint: sources.config_fingerprint.clone(),
+            account_identity_sha256: sources.account_identity_sha256.clone(),
+        });
+        let mut replay = sources.mark_price_observations[1].clone();
+        replay.line = 9;
+        sources.mark_price_observations.push(replay);
+
+        let report = build_report(sources, options(), "c".repeat(64));
+
+        assert!(report.passed, "{:?}", report.issues);
+        assert_eq!(report.counts.funding_bills_validated, 1);
+        assert_eq!(
+            report.funding_formula_samples[0].runtime_session_id,
+            "1a2b3c"
+        );
+    }
+
+    #[test]
+    fn funding_requires_an_explicit_matching_runtime_session() {
+        let mut sources = sources();
+        sources.runtime_sessions.clear();
+
+        let report = build_report(sources, options(), "c".repeat(64));
+
+        assert!(!report.passed);
+        assert!(
+            report
+                .failures
+                .contains(&EconomicReconciliationFailure::FundingSessionBoundaryMissing)
+        );
+        assert!(report.funding_formula_samples.is_empty());
+    }
+
+    #[test]
+    fn funding_mark_bracket_cannot_cross_a_runtime_restart() {
+        let mut sources = sources();
+        sources.mark_price_observations.pop();
+        sources.runtime_sessions.push(JournalRuntimeSession {
+            line: 7,
+            started_at_ms: FUNDING_MS + 105,
+            session_id: "4d5e6f".to_string(),
+            account_id: "main".to_string(),
+            strategy_name: sources.config.strategy.strategy_name.clone(),
+            config_fingerprint: sources.config_fingerprint.clone(),
+            account_identity_sha256: sources.account_identity_sha256.clone(),
+        });
+        sources
+            .mark_price_observations
+            .push(JournalMarkPriceObservation {
+                line: 8,
+                event_ts_ms: FUNDING_MS + 110,
+                symbol: "BTC-USDT-SWAP".to_string(),
+                price: 50_000.0,
+            });
+
+        let report = build_report(sources, options(), "c".repeat(64));
+
+        assert!(!report.passed);
+        assert!(
+            report
+                .failures
+                .contains(&EconomicReconciliationFailure::FundingMarkBracketsMissing)
         );
         assert!(report.funding_formula_samples.is_empty());
     }

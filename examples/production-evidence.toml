@@ -1,6 +1,6 @@
 # Schema template only. Replace every path and identity with reviewed target-host
 # evidence. This file cannot pass as checked in and contains no credentials.
-schema_version = 5
+schema_version = 6
 expected_reap_version = "0.1.0"
 expected_live_executable_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 expected_host_identity_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -117,7 +117,8 @@ fee_tolerance = 0.0
 # Reuse the exact fill collection and stopped journal above. The fill window must
 # begin at least maximum_trade_bill_delay_ms before the bill manifest's window.
 # Collect account-wide bills during a controlled window with no unrelated
-# transfers or other balance-changing activity.
+# transfers or other balance-changing activity. Keep the live mark-price stream
+# healthy through one observation after every funding bill fillTime.
 fill_collection_manifest = "/secure/evidence/demo-fills-main/manifest.json"
 bill_collection_manifest = "/secure/evidence/demo-bills-main/manifest.json"
 journal = "/secure/evidence/demo-stopped-main.jsonl"
@@ -125,9 +126,12 @@ minimum_trade_bills = 100
 minimum_funding_bills = 3
 maximum_trade_bill_delay_ms = 60000
 maximum_funding_bill_delay_ms = 60000
+maximum_funding_mark_bracket_distance_ms = 1000
 price_tolerance = 0.0
 quantity_tolerance = 0.000000001
 fee_tolerance = 0.000000000001
 balance_tolerance = 0.0000000001
 funding_pnl_absolute_tolerance = 0.000000000001
 funding_pnl_relative_tolerance = 0.00000001
+funding_mark_absolute_tolerance = 0.00000001
+funding_mark_relative_tolerance = 0.00001

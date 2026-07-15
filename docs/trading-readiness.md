@@ -415,16 +415,16 @@ production trading process.
     session. It also reconstructs one raw schema-2 proxy process report per role,
     requiring exact config/build/host, unique sessions, independently derived
     clean shutdown, exact completed-command counts, and unambiguous live-session
-    enclosure. Mandatory schema-5 age windows have hard maxima of 15 minutes for
+    enclosure. Mandatory schema-6 age windows have hard maxima of 15 minutes for
     production account state, 24 hours for soak/fills/bills, seven days for
     fault/latency/deadman/emergency evidence, and five minutes of future
-    tolerance. Schema 5 also predeclares the exact approval-policy SHA-256. The
+    tolerance. Schema 6 also predeclares the exact approval-policy SHA-256. The
     checked-in schema template cannot pass, no target-host bundle
     or human approval exists, and the output explicitly leaves production order
     entry unauthorized.
 53. Production approval is now a separate asymmetric gate. The strict policy
     requires at least two sorted roles and distinct Ed25519 keys; request
-    preparation accepts only a fresh passing schema-5 bundle, offline signatures
+    preparation accepts only a fresh passing schema-6 bundle, offline signatures
     bind exact request/policy/role/time, and final verification reruns all sources
     before requiring role coverage. Requests have a hard 15-minute lifetime,
     private keys require owner-only files, every input is reopened, and all output
@@ -438,14 +438,19 @@ production trading process.
     fill collection and exact bill collection, leases and streams the stopped
     journal, rejects every unexplained bill, validates normal trade identities,
     fees, currencies, and balance equations, and recomputes linear/inverse
-    funding from a session-local journaled realized rate and signed position.
+    funding from a session-local journaled realized rate, the latest signed
+    position at bill `fillTime`, and public marks on both sides of that assessment.
+    A schema-6 runtime-session record emitted per account on every start binds
+    the settlement, position, and mark lines to one config and hashed OKX account
+    identity, preventing evidence from crossing a restart.
     Funding type `8` subtypes
     `173`/`174` and source fields are mapped to pinned Java `BillDetails`,
     `OkexV5BillFetchTaskImpl`, `OkexV5BillTypes`, and
-    `OkexV5ExchBillConverter`. Production evidence schema 5 requires one passing
-    economic gate per demo account. No credentialed artifact exists, cash-spot
-    bill units remain an empirical gate, and derivative close PnL plus the exact
-    funding settlement mark still lack independent attestation.
+    `OkexV5ExchBillConverter`, plus Java's dedicated `MarkPrice` session/parser.
+    Production evidence schema 6 requires one passing economic gate per demo
+    account and caps mark-bracket distance/tolerance. No credentialed artifact
+    exists, cash-spot bill units remain an empirical gate, and derivative close
+    PnL still lacks independently attested opening cost basis.
 
 ## Remaining Demo Gate
 
@@ -492,7 +497,8 @@ production trading process.
    bounded-demo window. Require passing manifest-backed `reconcile-fills`,
    `verify-bill-collection`, and `reconcile-economics` artifacts with reviewed
    nonzero trade, fill, and funding thresholds. The controlled window must span
-   a real nonzero funding settlement and contain no unrelated account bills.
+   a real nonzero funding settlement, retain same-session `mark-price` samples
+   before and after the bill `fillTime`, and contain no unrelated account bills.
 
 ## Production Gate
 
@@ -500,10 +506,9 @@ Production enablement additionally requires:
 
 - A passing owner-only `verify-production-evidence --require-pass` artifact made
   by the exact candidate binary on the declared target host after every source
-  artifact below exists. Review every subordinate artifact and schema-5
+  artifact below exists. Review every subordinate artifact and schema-6
   freshness observation; the aggregate does not supply remote attestation,
-  external supervision, independently attested derivative opening cost basis and
-  funding settlement mark,
+  external supervision, independently attested derivative opening cost basis,
   complete balance/equity and currency-conversion accounting, authenticated
   external partial-fill/restart causality, or human approval and never
   authorizes entry.
@@ -532,14 +537,16 @@ Production enablement additionally requires:
 - A passing target-account `certify-account` artifact, independently rechecked
   with `verify-account-certification --require-pass`, immediately before
   approval. This is point-in-time evidence and must be combined with a passing
-  per-account schema-5 economic reconciliation. Margin spot remains unsupported; enabling it
-  requires an explicit borrow-rate/interest model and demo reconciliation first.
+  per-account schema-3 economic reconciliation included in the schema-6
+  production bundle. Margin spot remains unsupported; enabling it requires an
+  explicit borrow-rate/interest model and demo reconciliation first.
 - A passing per-account `reconcile-economics --require-pass` reconstruction from
   exact guarded fills, account-wide bills, and the stopped canonical journal.
   Independently review a credentialed cash buy/sell sample before admitting spot
-  semantics, and provide a separate attested opening-cost-basis/close-PnL,
-  funding settlement mark, and full balance/equity continuity check; the
-  implemented bill gate does not prove those boundaries.
+  semantics, and provide a separate attested opening-cost-basis/close-PnL and
+  full balance/equity continuity check. Review the funding mark bracket width;
+  it constrains accepted bill marks but cannot reproduce the venue's internal
+  assessment tick.
 - A passing target-host demo `certify-deadman-expiry` artifact, independently
   rechecked against the exact stopped journal with
   `verify-deadman-certification --require-pass`, plus separate supervisor/fault-

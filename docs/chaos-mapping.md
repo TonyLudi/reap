@@ -94,14 +94,19 @@ Java sources:
 | `OkexV5BillFetchTaskImpl` | Authenticated account-wide closed-window collector with exact raw pages, bounded pacing, cursor reconstruction, and a required short terminal page | Java fetches one configured type, reverses each response into oldest-first publication, and advances `lastFetchedId`; Rust proves bounded historical completeness for evidence instead of publishing into the strategy loop |
 | `OkexV5BillTypes` | Funding type `8`, subtypes `173` and `174` | Exact pinned mapping; Rust additionally validates normal trade type `2` for statement reconciliation and rejects every other bill in the controlled window |
 | `OkexV5ExchBillConverter` | Bill identity and economic fields retained in the reconciliation report | Equivalent field boundary, with stricter source/config/account binding and no pooled live message |
+| `OkexV5L1Subscriber.tryParseMarkPx` and `MarkPrice` | Normalized `mark-price` frames retain exchange timestamp and price in the canonical journal; funding evidence requires observations on both sides of bill `fillTime` | Java uses a dedicated mark-price session for futures/swaps and publishes exchange/server timestamps; Rust additionally deduplicates redundant sockets and proves a bounded same-session assessment bracket |
 
 The Java samples `BillDetailsSwap.json` and `BillDetailsSwap2.json` also establish
 that funding bills can arrive shortly after the scheduled settlement. Rust
-therefore uses a bounded causal delay, matches the bill to the session-local
-journaled realized rate and signed position, and recomputes the linear or inverse
-contract formula. It does not reuse the forecast funding rate. The exact
-settlement mark remains bill-sourced and must be independently attested in the
-production review. Cash-spot quantity/currency semantics are a
+therefore uses a bounded causal delay, treats `fillTime` as the assessment
+boundary, matches the bill to the session-local journaled realized rate and
+latest signed position, and recomputes the linear or inverse contract formula
+over two public marks bracketing that boundary. The bill mark must also lie in
+that independent range. Reap writes an account/config/account-identity-bound
+`session_start` on every runtime start and rejects brackets that cross the next
+such boundary. It does not reuse the forecast funding rate or assume
+the scheduled funding timestamp is the exact assessment tick. Cash-spot
+quantity/currency semantics are a
 current API evidence boundary not established by these Java samples; a passing
 credentialed demo collection for the exact target account is required before
 that path can support production approval.

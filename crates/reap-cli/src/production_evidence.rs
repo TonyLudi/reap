@@ -25,8 +25,8 @@ use sha2::{Digest, Sha256};
 use crate::deployment::{ResearchDeploymentVerificationReport, verify_research_deployment_paths};
 use crate::latency::{LatencyCalibrationVerificationReport, verify_latency_calibration};
 
-pub(crate) const PRODUCTION_EVIDENCE_MANIFEST_SCHEMA_VERSION: u16 = 5;
-pub(crate) const PRODUCTION_EVIDENCE_REPORT_FORMAT_VERSION: u16 = 5;
+pub(crate) const PRODUCTION_EVIDENCE_MANIFEST_SCHEMA_VERSION: u16 = 6;
+pub(crate) const PRODUCTION_EVIDENCE_REPORT_FORMAT_VERSION: u16 = 6;
 pub(crate) const PRODUCTION_EVIDENCE_APPROVAL_SUBJECT_FORMAT_VERSION: u16 = 1;
 const MAX_PRODUCTION_EVIDENCE_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_PRODUCTION_EVIDENCE_ACCOUNTS: usize = 32;
@@ -46,6 +46,9 @@ const MAX_PRODUCTION_ECONOMIC_FEE_TOLERANCE: f64 = 1e-10;
 const MAX_PRODUCTION_ECONOMIC_BALANCE_TOLERANCE: f64 = 1e-8;
 const MAX_PRODUCTION_ECONOMIC_FUNDING_ABSOLUTE_TOLERANCE: f64 = 1e-8;
 const MAX_PRODUCTION_ECONOMIC_FUNDING_RELATIVE_TOLERANCE: f64 = 1e-6;
+const MAX_PRODUCTION_FUNDING_MARK_BRACKET_DISTANCE_MS: u64 = 2_000;
+const MAX_PRODUCTION_ECONOMIC_FUNDING_MARK_ABSOLUTE_TOLERANCE: f64 = 1e-8;
+const MAX_PRODUCTION_ECONOMIC_FUNDING_MARK_RELATIVE_TOLERANCE: f64 = 1e-4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -85,6 +88,7 @@ pub(crate) struct ProductionEvidenceEconomicInput {
     pub minimum_funding_bills: u64,
     pub maximum_trade_bill_delay_ms: u64,
     pub maximum_funding_bill_delay_ms: u64,
+    pub maximum_funding_mark_bracket_distance_ms: u64,
     #[serde(default)]
     pub price_tolerance: f64,
     #[serde(default)]
@@ -97,6 +101,10 @@ pub(crate) struct ProductionEvidenceEconomicInput {
     pub funding_pnl_absolute_tolerance: f64,
     #[serde(default)]
     pub funding_pnl_relative_tolerance: f64,
+    #[serde(default)]
+    pub funding_mark_absolute_tolerance: f64,
+    #[serde(default)]
+    pub funding_mark_relative_tolerance: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -551,6 +559,7 @@ struct ResolvedEconomicInput {
     minimum_funding_bills: u64,
     maximum_trade_bill_delay_ms: u64,
     maximum_funding_bill_delay_ms: u64,
+    maximum_funding_mark_bracket_distance_ms: u64,
     tolerances: EconomicReconciliationTolerances,
 }
 
@@ -764,6 +773,8 @@ pub(crate) fn verify_production_evidence_manifest_path(
                 minimum_funding_bills: input.minimum_funding_bills,
                 maximum_trade_bill_delay_ms: input.maximum_trade_bill_delay_ms,
                 maximum_funding_bill_delay_ms: input.maximum_funding_bill_delay_ms,
+                maximum_funding_mark_bracket_distance_ms: input
+                    .maximum_funding_mark_bracket_distance_ms,
                 tolerances: input.tolerances,
             },
         )
@@ -1083,7 +1094,7 @@ pub(crate) fn verify_production_evidence_manifest_path(
                 .to_string(),
             "source timestamps and verifier wall time are validated artifact fields but are not remotely attested; operators must independently control clock synchronization, the manifest, and target host"
                 .to_string(),
-            "trade/funding reconciliation rejects unexplained account bills and binds funding to the journaled signed position, but opening cost basis, the exact bill-sourced settlement mark, taxes, currency conversion, and profitability review remain external gates"
+            "trade/funding reconciliation rejects unexplained account bills and binds funding to the journaled signed position plus two-sided mark bracket, but opening cost basis, complete balance/equity continuity, taxes, currency conversion, and profitability review remain external gates"
                 .to_string(),
             "supervision, paging, credential permissions, venue announcements, rollout/rollback review, and explicit human approval remain required"
                 .to_string(),
@@ -2634,6 +2645,14 @@ fn validate_manifest(manifest: &ProductionEvidenceManifest) -> Result<()> {
         {
             bail!("economic reconciliation bill delays are outside supported bounds");
         }
+        if economic.maximum_funding_mark_bracket_distance_ms == 0
+            || economic.maximum_funding_mark_bracket_distance_ms
+                > MAX_PRODUCTION_FUNDING_MARK_BRACKET_DISTANCE_MS
+        {
+            bail!(
+                "economic funding mark bracket distance must be in 1..={MAX_PRODUCTION_FUNDING_MARK_BRACKET_DISTANCE_MS} ms"
+            );
+        }
         for (field, value) in [
             ("price_tolerance", economic.price_tolerance),
             ("quantity_tolerance", economic.quantity_tolerance),
@@ -2646,6 +2665,14 @@ fn validate_manifest(manifest: &ProductionEvidenceManifest) -> Result<()> {
             (
                 "funding_pnl_relative_tolerance",
                 economic.funding_pnl_relative_tolerance,
+            ),
+            (
+                "funding_mark_absolute_tolerance",
+                economic.funding_mark_absolute_tolerance,
+            ),
+            (
+                "funding_mark_relative_tolerance",
+                economic.funding_mark_relative_tolerance,
             ),
         ] {
             if !value.is_finite() || value < 0.0 {
@@ -2680,6 +2707,16 @@ fn validate_manifest(manifest: &ProductionEvidenceManifest) -> Result<()> {
                 "funding_pnl_relative_tolerance",
                 economic.funding_pnl_relative_tolerance,
                 MAX_PRODUCTION_ECONOMIC_FUNDING_RELATIVE_TOLERANCE,
+            ),
+            (
+                "funding_mark_absolute_tolerance",
+                economic.funding_mark_absolute_tolerance,
+                MAX_PRODUCTION_ECONOMIC_FUNDING_MARK_ABSOLUTE_TOLERANCE,
+            ),
+            (
+                "funding_mark_relative_tolerance",
+                economic.funding_mark_relative_tolerance,
+                MAX_PRODUCTION_ECONOMIC_FUNDING_MARK_RELATIVE_TOLERANCE,
             ),
         ] {
             if value > maximum {
@@ -2915,6 +2952,8 @@ fn resolve_manifest(loaded: &LoadedManifest) -> Result<ResolvedManifest> {
             minimum_funding_bills: input.minimum_funding_bills,
             maximum_trade_bill_delay_ms: input.maximum_trade_bill_delay_ms,
             maximum_funding_bill_delay_ms: input.maximum_funding_bill_delay_ms,
+            maximum_funding_mark_bracket_distance_ms: input
+                .maximum_funding_mark_bracket_distance_ms,
             tolerances: EconomicReconciliationTolerances {
                 price_abs: input.price_tolerance,
                 quantity_abs: input.quantity_tolerance,
@@ -2922,6 +2961,8 @@ fn resolve_manifest(loaded: &LoadedManifest) -> Result<ResolvedManifest> {
                 balance_abs: input.balance_tolerance,
                 funding_pnl_abs: input.funding_pnl_absolute_tolerance,
                 funding_pnl_relative: input.funding_pnl_relative_tolerance,
+                funding_mark_abs: input.funding_mark_absolute_tolerance,
+                funding_mark_relative: input.funding_mark_relative_tolerance,
             },
         });
     }
@@ -3066,7 +3107,7 @@ mod tests {
     fn manifest_toml(extra: &str) -> String {
         format!(
             r#"
-schema_version = 5
+schema_version = 6
 expected_reap_version = "0.1.0"
 expected_live_executable_sha256 = "{}"
 expected_host_identity_sha256 = "{}"
@@ -3171,6 +3212,7 @@ minimum_trade_bills = 1
 minimum_funding_bills = 1
 maximum_trade_bill_delay_ms = 60000
 maximum_funding_bill_delay_ms = 60000
+maximum_funding_mark_bracket_distance_ms = 1000
 {extra}
 "#,
             "1".repeat(64),
@@ -3226,6 +3268,16 @@ maximum_funding_bill_delay_ms = 60000
         assert!(validate_manifest(&parsed).is_err());
 
         parsed.economic_reconciliations[0].balance_tolerance = 0.0;
+        parsed.economic_reconciliations[0].maximum_funding_mark_bracket_distance_ms =
+            MAX_PRODUCTION_FUNDING_MARK_BRACKET_DISTANCE_MS + 1;
+        assert!(validate_manifest(&parsed).is_err());
+
+        parsed.economic_reconciliations[0].maximum_funding_mark_bracket_distance_ms = 1_000;
+        parsed.economic_reconciliations[0].funding_mark_relative_tolerance =
+            MAX_PRODUCTION_ECONOMIC_FUNDING_MARK_RELATIVE_TOLERANCE * 2.0;
+        assert!(validate_manifest(&parsed).is_err());
+
+        parsed.economic_reconciliations[0].funding_mark_relative_tolerance = 0.0;
         parsed.expected_host_identity_sha256 = "ABC".to_string();
         assert!(validate_manifest(&parsed).is_err());
 

@@ -32,6 +32,7 @@ pub enum StorageRecord {
         reason: String,
     },
     Bootstrap(BootstrapRecord),
+    SessionStart(SessionStartRecord),
     OrderRequest(OrderRequestRecord),
     OrderAck(OrderAckRecord),
     Order {
@@ -134,6 +135,16 @@ pub struct BootstrapRecord {
     pub strategy_name: String,
     pub config_fingerprint: String,
     pub baseline_fill_ids: Vec<FillKey>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionStartRecord {
+    pub ts_ms: TimeMs,
+    pub session_id: String,
+    pub account_id: String,
+    pub strategy_name: String,
+    pub config_fingerprint: String,
+    pub account_identity_sha256: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -461,7 +472,7 @@ struct StoredEnvelope {
     record: StorageRecord,
 }
 
-const CURRENT_SCHEMA_VERSION: u16 = 5;
+const CURRENT_SCHEMA_VERSION: u16 = 6;
 
 pub fn recover_jsonl(path: impl AsRef<Path>) -> Result<RecoveredStorage, StorageError> {
     let path = path.as_ref();
@@ -520,7 +531,10 @@ where
                 });
             }
         };
-        if !matches!(envelope.schema_version, 2 | 3 | 4 | CURRENT_SCHEMA_VERSION) {
+        if !matches!(
+            envelope.schema_version,
+            2 | 3 | 4 | 5 | CURRENT_SCHEMA_VERSION
+        ) {
             return Err(StorageError::Corrupt {
                 line: index + 1,
                 message: format!("unsupported schema version {}", envelope.schema_version),
@@ -698,6 +712,7 @@ fn storage_record_ts_ms(record: &StorageRecord) -> TimeMs {
         StorageRecord::Normalized(event) => event.ts_ms(),
         StorageRecord::Intent { ts_ms, .. } | StorageRecord::IntentRejected { ts_ms, .. } => *ts_ms,
         StorageRecord::Bootstrap(bootstrap) => bootstrap.ts_ms,
+        StorageRecord::SessionStart(session) => session.ts_ms,
         StorageRecord::OrderRequest(request) => request.ts_ms,
         StorageRecord::OrderAck(ack) => ack.ts_ms,
         StorageRecord::Order { update, .. } => update.ts_ms,
@@ -967,6 +982,52 @@ mod tests {
         assert_eq!(recovered.records, 1);
         assert_eq!(recovered.fills.len(), 1);
         assert_eq!(recovered.fills[0].liquidity, Some(FillLiquidity::Maker));
+    }
+
+    #[test]
+    fn recovery_remains_compatible_with_v5_journals() {
+        let line = serde_json::to_string(&StoredEnvelope {
+            schema_version: 5,
+            record: raw(),
+        })
+        .unwrap();
+
+        let recovered = recover_jsonl_bytes(format!("{line}\n").as_bytes()).unwrap();
+
+        assert_eq!(recovered.records, 1);
+    }
+
+    #[test]
+    fn recovery_visitor_streams_v6_runtime_session_boundaries() {
+        let session = StorageRecord::SessionStart(SessionStartRecord {
+            ts_ms: 1_000,
+            session_id: "1a2b3c".to_string(),
+            account_id: "main".to_string(),
+            strategy_name: "iarb2".to_string(),
+            config_fingerprint: "a".repeat(64),
+            account_identity_sha256: "b".repeat(64),
+        });
+        let line = serde_json::to_string(&StoredEnvelope {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            record: session,
+        })
+        .unwrap();
+        let mut observed = None;
+
+        let recovered =
+            recover_jsonl_bytes_with_visitor(format!("{line}\n").as_bytes(), |line, record| {
+                if let StorageRecord::SessionStart(session) = record {
+                    observed = Some((line, session.clone()));
+                }
+            })
+            .unwrap();
+
+        assert_eq!(recovered.records, 1);
+        let (line, session) = observed.unwrap();
+        assert_eq!(line, 1);
+        assert_eq!(session.session_id, "1a2b3c");
+        assert_eq!(session.account_id, "main");
+        assert_eq!(session.account_identity_sha256, "b".repeat(64));
     }
 
     #[test]

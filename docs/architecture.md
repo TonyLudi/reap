@@ -340,9 +340,13 @@ Responsibilities:
 - Reconcile normal trade and funding bills against the verified fill collection
   and a streaming pass over the stopped journal. Unknown bill types fail closed;
   trades bind on `(symbol, tradeId)` and exact fee currency, while funding binds
-  to a session-local journaled realized rate and signed position and recomputes
-  linear/inverse contract formulas. This is intentionally outside the hot event
-  loop.
+  to a session-local journaled realized rate and assessment-time signed position.
+  Two journaled `mark-price` observations must bracket the bill `fillTime`; the
+  bill mark and linear/inverse funding PnL are then checked against the resulting
+  independent ranges. Each runtime start writes a schema-6 `session_start` per
+  account with session, strategy, config, and hashed OKX account identity; line
+  boundaries prevent settlement, position, or mark evidence from crossing a
+  restart. This is intentionally outside the hot event loop.
 - Collect a self-contained point-in-time account certification from exact
   authenticated config, balance, and positions responses. Its mode-aware policy
   requires cash-only spot routing, zero configured borrowing, disabled venue
@@ -866,6 +870,7 @@ Responsibilities:
 - Normalized event logs.
 - Strategy decisions and order intents.
 - Order/fill/account events.
+- Per-account runtime-session boundaries with config and account provenance.
 - Write-ahead operator/risk safety latches and restart reduction.
 - Canonical journal-path validation and a process-lifetime exclusive writer
   lease acquired before recovery or network setup.
@@ -939,7 +944,7 @@ environment-specific account identities. The verifier reruns each source gate,
 reopens every deployment config and the controlling manifest, and reconstructs
 the loopback fault config from the exact official-demo and fault-proxy configs
 before cross-binding all returned identities. It hashes the typed in-memory
-reconstructions instead of accepting prior verification JSON. Schema 5
+reconstructions instead of accepting prior verification JSON. Schema 6
 re-verifies every fault/latency live
 source, derives completion times from validated sessions or exchange-clock
 samples, enforces explicit age limits under hard maxima, and requires each typed
@@ -962,9 +967,11 @@ equality inside a hard 15-minute window.
 This is deliberately asymmetric rather than reusing the runtime operator HMAC:
 the target host can verify approvals without gaining signing capability. Even a
 passing approval leaves production entry unauthorized because remote attestation,
-external supervision, independently attested derivative opening cost basis and
-funding settlement mark, complete balance/equity and currency-conversion
-accounting, and actual rollout governance remain outside this composition.
+external supervision, independently attested derivative opening cost basis,
+complete balance/equity and currency-conversion accounting, and actual rollout
+governance remain outside this composition. Funding's bill-reported mark is
+checked against same-session public observations, but the exact internal
+assessment tick cannot be reproduced externally.
 
 ## Multi-Websocket Design
 
