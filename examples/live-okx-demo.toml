@@ -5,6 +5,9 @@ ref_symbol = "BTC-USDT"
 delta_limit_usd = 1000.0
 active_hedge_threshold_usd = 25.0
 min_hedge_interval_ms = 100
+# OKX funding updates may arrive at 30-90 second intervals. Every required
+# index/funding/mark/price-limit source is aged independently.
+reference_data_stale_threshold_ms = 120000
 quote_only = false
 
 [[strategy.risk_groups]]
@@ -35,6 +38,7 @@ max_order_size = 0.01
 min_trade_size = 0.00001
 tick_size = 0.1
 lot_size = 0.00000001
+index_symbol = "BTC-USDT"
 min_position = -0.05
 max_position = 0.05
 

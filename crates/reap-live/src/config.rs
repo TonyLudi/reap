@@ -575,6 +575,12 @@ impl LiveConfig {
 
     pub fn validate(&self) -> LiveConfigValidation {
         let mut errors = self.strategy.effective().validate().errors;
+        if self.strategy.reference_data_stale_threshold_ms.is_none() {
+            errors.push(
+                "strategy.reference_data_stale_threshold_ms must be configured for live startup"
+                    .to_string(),
+            );
+        }
         validate_live_strategy_topology(self, &mut errors);
         if let Some(error) = self.risk.validation_error() {
             errors.push(format!("risk: {error}"));
@@ -1540,6 +1546,7 @@ mod tests {
     fn valid_config() -> LiveConfig {
         let mut strategy: ChaosConfig =
             toml::from_str(include_str!("../../../examples/iarb2-basic.toml")).unwrap();
+        strategy.reference_data_stale_threshold_ms = Some(120_000);
         strategy.risk_groups[0].account_id = Some("main".to_string());
         LiveConfig {
             strategy,
@@ -1960,6 +1967,19 @@ mod tests {
         assert!(error.contains("timer_interval_typo"), "{error}");
         assert!(error.contains("tick_size_typo"), "{error}");
         assert!(error.contains("node_id_typo"), "{error}");
+    }
+
+    #[test]
+    fn live_config_requires_explicit_strategy_reference_freshness() {
+        let mut config = valid_config();
+        config.strategy.reference_data_stale_threshold_ms = None;
+
+        let validation = config.validate();
+
+        assert!(!validation.valid);
+        assert!(validation.errors.iter().any(|error| {
+            error.contains("strategy.reference_data_stale_threshold_ms must be configured")
+        }));
     }
 
     #[test]

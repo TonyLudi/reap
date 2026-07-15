@@ -290,6 +290,7 @@ fn validate_run_shape(
                 || !snapshot.missing_private_streams.is_empty()
                 || !snapshot.missing_order_transports.is_empty()
                 || !snapshot.missing_stablecoin_rates.is_empty()
+                || !snapshot.missing_strategy_references.is_empty()
                 || !snapshot.faults.is_empty())
         {
             failures.push(LiveRunVerificationFailure::RunInvariant {

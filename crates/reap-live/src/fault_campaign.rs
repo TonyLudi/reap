@@ -1394,6 +1394,7 @@ mod tests {
             missing_private_streams: Vec::new(),
             missing_order_transports: Vec::new(),
             missing_stablecoin_rates: Vec::new(),
+            missing_strategy_references: Vec::new(),
             faults: BTreeMap::new(),
         }
     }

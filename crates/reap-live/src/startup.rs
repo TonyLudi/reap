@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 
+use reap_core::{MarketEvent, TimeMs};
+use reap_strategy::ReferenceDataKind;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -30,6 +32,8 @@ pub struct ReadinessSnapshot {
     pub missing_order_transports: Vec<String>,
     #[serde(default)]
     pub missing_stablecoin_rates: Vec<String>,
+    #[serde(default)]
+    pub missing_strategy_references: Vec<String>,
     pub faults: BTreeMap<String, String>,
 }
 
@@ -56,6 +60,7 @@ pub struct StartupGate {
     required_accounts: HashSet<String>,
     required_order_transports: HashSet<String>,
     required_stablecoin_rates: HashSet<String>,
+    required_strategy_references: BTreeMap<String, StrategyReferenceReadiness>,
     metadata_verified: bool,
     storage_ready: bool,
     public_connectivity_ready: bool,
@@ -65,8 +70,15 @@ pub struct StartupGate {
     ready_private_streams: HashSet<String>,
     ready_order_transports: HashSet<String>,
     ready_stablecoin_rates: HashSet<String>,
+    ready_strategy_references: HashSet<String>,
     faults: BTreeMap<String, String>,
     was_ready: bool,
+}
+
+#[derive(Debug, Clone)]
+struct StrategyReferenceReadiness {
+    max_age_ms: TimeMs,
+    source_ts_ms: Option<TimeMs>,
 }
 
 impl StartupGate {
@@ -76,6 +88,20 @@ impl StartupGate {
 
     pub fn new_with_order_transport(config: &LiveConfig, required: bool) -> Self {
         let required_accounts = config.required_accounts();
+        let required_strategy_references = config
+            .strategy
+            .reference_data_requirements()
+            .into_iter()
+            .map(|requirement| {
+                (
+                    strategy_reference_key(requirement.kind, &requirement.symbol),
+                    StrategyReferenceReadiness {
+                        max_age_ms: requirement.max_age_ms,
+                        source_ts_ms: None,
+                    },
+                )
+            })
+            .collect();
         Self {
             phase: LivePhase::Configured,
             required_symbols: config.required_symbols(),
@@ -91,6 +117,7 @@ impl StartupGate {
                 .iter()
                 .map(|guard| guard.symbol.clone())
                 .collect(),
+            required_strategy_references,
             metadata_verified: false,
             storage_ready: false,
             public_connectivity_ready: false,
@@ -100,6 +127,7 @@ impl StartupGate {
             ready_private_streams: HashSet::new(),
             ready_order_transports: HashSet::new(),
             ready_stablecoin_rates: HashSet::new(),
+            ready_strategy_references: HashSet::new(),
             faults: BTreeMap::new(),
             was_ready: false,
         }
@@ -115,6 +143,12 @@ impl StartupGate {
 
     pub fn can_cancel(&self) -> bool {
         self.phase != LivePhase::Stopping
+    }
+
+    pub fn strategy_references_ready(&self) -> bool {
+        self.required_strategy_references
+            .keys()
+            .all(|key| self.ready_strategy_references.contains(key))
     }
 
     pub fn mark_metadata_verified(&mut self) {
@@ -258,6 +292,95 @@ impl StartupGate {
         Ok(())
     }
 
+    pub fn observe_strategy_market(&mut self, event: &MarketEvent, observed_now_ms: TimeMs) {
+        match event {
+            MarketEvent::IndexPrice {
+                ts_ms,
+                symbol,
+                price,
+            } if price.is_finite() && *price > 0.0 => {
+                self.observe_strategy_reference(ReferenceDataKind::IndexPrice, symbol, *ts_ms);
+            }
+            MarketEvent::FundingRate {
+                ts_ms,
+                symbol,
+                rate,
+                funding_time_ms,
+                ..
+            } if rate.is_finite() && *funding_time_ms > 0 => {
+                self.observe_strategy_reference(ReferenceDataKind::FundingRate, symbol, *ts_ms);
+            }
+            MarketEvent::PriceLimits {
+                ts_ms,
+                symbol,
+                mark_price,
+                limit_down,
+                limit_up,
+            } => {
+                if mark_price.is_finite() && *mark_price > 0.0 {
+                    self.observe_strategy_reference(ReferenceDataKind::MarkPrice, symbol, *ts_ms);
+                }
+                if limit_down.is_finite()
+                    && *limit_down > 0.0
+                    && limit_up.is_finite()
+                    && *limit_up > 0.0
+                {
+                    self.observe_strategy_reference(ReferenceDataKind::PriceLimits, symbol, *ts_ms);
+                }
+            }
+            MarketEvent::Depth(_)
+            | MarketEvent::Trade { .. }
+            | MarketEvent::BurstSignal { .. }
+            | MarketEvent::IndexPrice { .. }
+            | MarketEvent::FundingRate { .. } => {}
+        }
+        self.refresh_strategy_references(observed_now_ms);
+    }
+
+    pub fn refresh_strategy_references(&mut self, now_ms: TimeMs) {
+        for (key, state) in &self.required_strategy_references {
+            let healthy = state.source_ts_ms.is_some_and(|source_ts_ms| {
+                now_ms.saturating_sub(source_ts_ms) <= state.max_age_ms
+            });
+            set_membership(&mut self.ready_strategy_references, key, healthy);
+            let fault_key = format!("strategy_reference:{key}");
+            if healthy {
+                self.faults.remove(&fault_key);
+            } else if self.was_ready {
+                let reason = state.source_ts_ms.map_or_else(
+                    || format!("required strategy reference {key} has no valid observation"),
+                    |source_ts_ms| {
+                        format!(
+                            "required strategy reference {key} is {}ms old (limit {}ms)",
+                            now_ms.saturating_sub(source_ts_ms),
+                            state.max_age_ms
+                        )
+                    },
+                );
+                self.faults.insert(fault_key, reason);
+            } else {
+                self.faults.remove(&fault_key);
+            }
+        }
+        self.refresh();
+    }
+
+    fn observe_strategy_reference(
+        &mut self,
+        kind: ReferenceDataKind,
+        symbol: &str,
+        source_ts_ms: TimeMs,
+    ) {
+        let key = strategy_reference_key(kind, symbol);
+        if let Some(state) = self.required_strategy_references.get_mut(&key) {
+            state.source_ts_ms = Some(
+                state
+                    .source_ts_ms
+                    .map_or(source_ts_ms, |current| current.max(source_ts_ms)),
+            );
+        }
+    }
+
     pub fn mark_runtime_health(
         &mut self,
         component: &str,
@@ -294,6 +417,10 @@ impl StartupGate {
             missing_stablecoin_rates: missing(
                 &self.required_stablecoin_rates,
                 &self.ready_stablecoin_rates,
+            ),
+            missing_strategy_references: missing_map_keys(
+                &self.required_strategy_references,
+                &self.ready_strategy_references,
             ),
             faults: self.faults.clone(),
         }
@@ -332,6 +459,7 @@ impl StartupGate {
                 &self.required_stablecoin_rates,
                 &self.ready_stablecoin_rates,
             )
+            && self.strategy_references_ready()
             && self.public_connectivity_ready;
         if streams_ready {
             self.phase = LivePhase::Ready;
@@ -368,6 +496,18 @@ impl StartupGate {
             Err(StartupError::UnknownStablecoinReference(symbol.to_string()))
         }
     }
+}
+
+fn strategy_reference_key(kind: ReferenceDataKind, symbol: &str) -> String {
+    format!("{}:{symbol}", kind.as_str())
+}
+
+fn missing_map_keys<T>(required: &BTreeMap<String, T>, ready: &HashSet<String>) -> Vec<String> {
+    required
+        .keys()
+        .filter(|value| !ready.contains(*value))
+        .cloned()
+        .collect()
 }
 
 fn set_membership(values: &mut HashSet<String>, value: &str, present: bool) {
@@ -566,6 +706,114 @@ mod tests {
             Err(StartupError::UnknownStablecoinReference(
                 "USDC-USD".to_string()
             ))
+        );
+    }
+
+    #[test]
+    fn strategy_references_require_fresh_independent_source_observations() {
+        let mut config = config();
+        config.strategy.reference_data_stale_threshold_ms = Some(1_000);
+        config.strategy.instruments[0].index_symbol = Some("BTC-USDT-INDEX".to_string());
+        config.strategy.instruments[1].kind = reap_strategy::InstrumentKindConfig::LinearSwap;
+        let mut gate = StartupGate::new(&config);
+        gate.mark_metadata_verified();
+        gate.mark_storage(true, "open");
+        gate.mark_public_connectivity(true, "connected");
+        gate.mark_reconciled("main", true, "clean").unwrap();
+        gate.mark_account_snapshot("main", true, "loaded").unwrap();
+        gate.mark_book("BTC-USDT", true, "snapshot").unwrap();
+        gate.mark_book("BTC-PERP", true, "snapshot").unwrap();
+        gate.mark_private_stream("main", true, "heartbeat").unwrap();
+
+        assert_eq!(
+            gate.snapshot().missing_strategy_references,
+            vec![
+                "funding_rate:BTC-PERP".to_string(),
+                "index_price:BTC-USDT-INDEX".to_string(),
+                "mark_price:BTC-PERP".to_string(),
+                "price_limits:BTC-PERP".to_string(),
+                "price_limits:BTC-USDT".to_string(),
+            ]
+        );
+        gate.observe_strategy_market(
+            &MarketEvent::IndexPrice {
+                ts_ms: 1_000,
+                symbol: "BTC-USDT-INDEX".to_string(),
+                price: 50_000.0,
+            },
+            2_001,
+        );
+        assert!(
+            gate.snapshot()
+                .missing_strategy_references
+                .contains(&"index_price:BTC-USDT-INDEX".to_string())
+        );
+
+        for event in [
+            MarketEvent::IndexPrice {
+                ts_ms: 2_000,
+                symbol: "BTC-USDT-INDEX".to_string(),
+                price: 50_000.0,
+            },
+            MarketEvent::FundingRate {
+                ts_ms: 2_000,
+                symbol: "BTC-PERP".to_string(),
+                rate: 0.0001,
+                funding_time_ms: 30_000,
+                settlement: None,
+            },
+            MarketEvent::PriceLimits {
+                ts_ms: 2_000,
+                symbol: "BTC-PERP".to_string(),
+                mark_price: 50_000.0,
+                limit_down: 0.0,
+                limit_up: 0.0,
+            },
+            MarketEvent::PriceLimits {
+                ts_ms: 2_000,
+                symbol: "BTC-PERP".to_string(),
+                mark_price: 0.0,
+                limit_down: 40_000.0,
+                limit_up: 60_000.0,
+            },
+            MarketEvent::PriceLimits {
+                ts_ms: 2_000,
+                symbol: "BTC-USDT".to_string(),
+                mark_price: 0.0,
+                limit_down: 40_000.0,
+                limit_up: 60_000.0,
+            },
+        ] {
+            gate.observe_strategy_market(&event, 2_000);
+        }
+        assert!(gate.snapshot().is_ready());
+
+        gate.observe_strategy_market(
+            &MarketEvent::PriceLimits {
+                ts_ms: 3_001,
+                symbol: "BTC-PERP".to_string(),
+                mark_price: 50_001.0,
+                limit_down: 0.0,
+                limit_up: 0.0,
+            },
+            3_001,
+        );
+        let stale = gate.snapshot();
+        assert_eq!(stale.phase, LivePhase::Degraded);
+        assert!(
+            !stale
+                .missing_strategy_references
+                .contains(&"mark_price:BTC-PERP".to_string())
+        );
+        assert!(
+            stale
+                .missing_strategy_references
+                .contains(&"funding_rate:BTC-PERP".to_string())
+        );
+        assert!(
+            stale
+                .faults
+                .contains_key("strategy_reference:funding_rate:BTC-PERP")
         );
     }
 }

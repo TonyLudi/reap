@@ -298,6 +298,8 @@ Responsibilities:
 - Theo price and quote quantity calculation.
 - Quote replacement decisions.
 - Delta hedge target selection.
+- A venue-neutral reference-data contract for configured index prices, swap
+  funding, derivative marks, and price limits, with independent source clocks.
 - Strategy state snapshots for replay debugging.
 
 The strategy API should stay small:
@@ -440,7 +442,21 @@ degraded phases. Ready requires verified account-scoped instrument metadata,
 matching account/position modes, an authoritative account snapshot already
 applied to the strategy and risk engine, a writable critical log, clean
 checkpoint/REST reconciliation, every sequenced book, every configured healthy
-stablecoin reference, and all configured private channels for every account.
+stablecoin reference, every required strategy reference, and all configured
+private channels for every account. Live validation requires an explicit
+`strategy.reference_data_stale_threshold_ms`. The strategy derives one typed
+requirement set from that policy: price limits for every OKX instrument, mark
+price for derivatives, funding rate for swaps, and every configured index.
+`reap-live` maps those venue-neutral requirements to separate critical OKX
+subscriptions, matching the pinned Java subscriber's separate PriceRange,
+MarkPrice, FundingRate, and index sessions. Unlike Java's shared mutable
+`Ticker.timeMs`, each Rust component retains its own non-regressing source
+timestamp, so activity on one channel cannot mask another channel's silence.
+Startup evaluates source age against host receive time; an old retained frame
+cannot open readiness. Missing or stale input degrades readiness, blocks entry,
+and immediately synthesizes canonical account-wide cancels. The pure strategy
+also removes stale instruments and withdraws quotes on its timer, so live and
+backtest decisions share the same freshness behavior.
 Before network feeds start, one unsigned `/api/v5/system/status` request must
 also prove that no relevant maintenance is active or inside the configured lead
 window. The first account safety task repeats that global check every 10 seconds

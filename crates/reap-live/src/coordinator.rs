@@ -485,6 +485,17 @@ impl LiveCoordinator {
         }
     }
 
+    pub fn process_feed_at(
+        &mut self,
+        output: FeedOutput,
+        observed_now_ms: TimeMs,
+    ) -> Result<CoordinatorOutput, CoordinatorError> {
+        match output {
+            FeedOutput::Event(event) => Ok(self.process_normalized_at(event, observed_now_ms)),
+            output => self.process_feed(output),
+        }
+    }
+
     pub fn apply_authoritative_account_snapshot(
         &mut self,
         account_id: &str,
@@ -825,6 +836,16 @@ impl LiveCoordinator {
     }
 
     fn process_normalized(&mut self, event: NormalizedEvent) -> CoordinatorOutput {
+        let observed_now_ms = event.ts_ms();
+        self.process_normalized_at(event, observed_now_ms)
+    }
+
+    fn process_normalized_at(
+        &mut self,
+        event: NormalizedEvent,
+        observed_now_ms: TimeMs,
+    ) -> CoordinatorOutput {
+        let strategy_references_were_ready = self.startup.strategy_references_ready();
         let account_halt = match &event {
             NormalizedEvent::System(system)
                 if system.kind == SystemEventKind::AccountHalted
@@ -864,6 +885,18 @@ impl LiveCoordinator {
         if let NormalizedEvent::System(system) = &event {
             self.apply_system_to_startup(system);
         }
+        match &event {
+            NormalizedEvent::Market(market) => self
+                .startup
+                .observe_strategy_market(market, observed_now_ms),
+            NormalizedEvent::Timer(_) => self.startup.refresh_strategy_references(observed_now_ms),
+            NormalizedEvent::Order(_)
+            | NormalizedEvent::Account(_)
+            | NormalizedEvent::Control(_)
+            | NormalizedEvent::System(_) => {}
+        }
+        let strategy_reference_readiness_lost =
+            strategy_references_were_ready && !self.startup.strategy_references_ready();
         let now_ms = event.ts_ms();
         let mut records = vec![StorageRecord::Normalized(event.clone())];
         match &event {
@@ -907,6 +940,27 @@ impl LiveCoordinator {
                 account_id,
                 reason: format!("order transport disconnected: {reason}"),
             }));
+        }
+        if strategy_reference_readiness_lost {
+            let missing = self
+                .startup
+                .snapshot()
+                .missing_strategy_references
+                .join(", ");
+            let account_ids = self
+                .config
+                .accounts
+                .iter()
+                .map(|account| account.id.clone())
+                .collect::<Vec<_>>();
+            for account_id in account_ids {
+                self.ensure_account_cancels(
+                    observed_now_ms,
+                    &account_id,
+                    &format!("strategy reference data stale: {missing}"),
+                    &mut output,
+                );
+            }
         }
         output
     }
@@ -1299,7 +1353,7 @@ mod tests {
     use reap_core::{
         AccountUpdate, Balance, FillFee, FillKey, FillLiquidity, Level, MarketEvent, NewOrder,
         OrderBook, OrderEvent, OrderStatus, OrderUpdate, Position, PositionMarginMode, Side,
-        SystemEvent, SystemEventKind, TimeInForce, Venue,
+        SystemEvent, SystemEventKind, TimeInForce, TimeMs, Venue,
     };
     use reap_feed::FeedOutput;
     use reap_order::{ReconcileIssue, reconcile, reconcile_full_state};
@@ -1307,7 +1361,7 @@ mod tests {
         InstrumentOrderLimits, InstrumentRiskModel, RiskDecision, RiskLimits, RiskRejectReason,
         StablecoinGuardConfig,
     };
-    use reap_strategy::ChaosConfig;
+    use reap_strategy::{ChaosConfig, ReferenceDataKind};
     use reap_venue::okx::{OkxAccountLevel, OkxInstrumentType, OkxPositionMode};
     use reap_venue::{PrivateOrderState, PrivateOrderUpdate, RemoteFill, RemoteOrder};
 
@@ -1332,6 +1386,7 @@ mod tests {
     fn coordinator_with_risk(gateway_actions_enabled: bool, risk: RiskLimits) -> LiveCoordinator {
         let mut strategy: ChaosConfig =
             toml::from_str(include_str!("../../../examples/iarb2-basic.toml")).unwrap();
+        strategy.reference_data_stale_threshold_ms = Some(120_000);
         strategy.risk_groups[0].account_id = Some("main".to_string());
         let config = LiveConfig {
             strategy,
@@ -1577,6 +1632,42 @@ mod tests {
             symbol: None,
             reason: "all sessions authenticated".to_string(),
         }));
+        seed_strategy_references(coordinator, 2);
+    }
+
+    fn seed_strategy_references(coordinator: &mut LiveCoordinator, ts_ms: TimeMs) {
+        let requirements = coordinator.config.strategy.reference_data_requirements();
+        for requirement in requirements {
+            let event = match requirement.kind {
+                ReferenceDataKind::IndexPrice => MarketEvent::IndexPrice {
+                    ts_ms,
+                    symbol: requirement.symbol,
+                    price: 100.0,
+                },
+                ReferenceDataKind::FundingRate => MarketEvent::FundingRate {
+                    ts_ms,
+                    symbol: requirement.symbol,
+                    rate: 0.0001,
+                    funding_time_ms: ts_ms + 28_800_000,
+                    settlement: None,
+                },
+                ReferenceDataKind::MarkPrice => MarketEvent::PriceLimits {
+                    ts_ms,
+                    symbol: requirement.symbol,
+                    mark_price: 100.0,
+                    limit_down: 0.0,
+                    limit_up: 0.0,
+                },
+                ReferenceDataKind::PriceLimits => MarketEvent::PriceLimits {
+                    ts_ms,
+                    symbol: requirement.symbol,
+                    mark_price: 0.0,
+                    limit_down: 50.0,
+                    limit_up: 150.0,
+                },
+            };
+            coordinator.process_event(NormalizedEvent::Market(event));
+        }
     }
 
     fn ready(coordinator: &mut LiveCoordinator) {
@@ -1634,6 +1725,7 @@ mod tests {
                 reason: "all sessions authenticated".to_string(),
             }));
         }
+        seed_strategy_references(coordinator, 2);
         assert!(coordinator.readiness().is_ready());
     }
 
@@ -1727,6 +1819,7 @@ mod tests {
             symbol: None,
             reason: "all sessions authenticated".to_string(),
         }));
+        seed_strategy_references(&mut coordinator, 2);
 
         assert!(!coordinator.readiness().is_ready());
         assert_eq!(coordinator.readiness().phase, crate::LivePhase::Reconciling);
@@ -1906,6 +1999,49 @@ mod tests {
             })
             .unwrap();
         assert!(coordinator.readiness().is_ready());
+    }
+
+    #[test]
+    fn retained_reference_frame_is_aged_and_cancelled_while_already_degraded() {
+        let mut coordinator = coordinator();
+        ready(&mut coordinator);
+        coordinator
+            .register_local_order("main", "reference-q1", order(), 3)
+            .unwrap();
+        coordinator
+            .startup
+            .mark_runtime_health("test_fault", false, "already degraded");
+        assert_eq!(coordinator.readiness().phase, crate::LivePhase::Degraded);
+        assert!(coordinator.startup.strategy_references_ready());
+
+        let output = coordinator
+            .process_feed_at(
+                FeedOutput::Event(NormalizedEvent::Market(MarketEvent::PriceLimits {
+                    ts_ms: 3,
+                    symbol: "BTC-USDT".to_string(),
+                    mark_price: 0.0,
+                    limit_down: 50.0,
+                    limit_up: 150.0,
+                })),
+                120_004,
+            )
+            .unwrap();
+
+        let readiness = coordinator.readiness();
+        assert_eq!(readiness.phase, crate::LivePhase::Degraded);
+        assert!(
+            readiness
+                .missing_strategy_references
+                .contains(&"price_limits:BTC-USDT".to_string())
+        );
+        assert!(
+            readiness
+                .faults
+                .contains_key("strategy_reference:price_limits:BTC-USDT")
+        );
+        assert!(output.actions.iter().any(|action| {
+            matches!(action, LiveAction::Cancel(cancel) if cancel.client_order_id == "reference-q1")
+        }));
     }
 
     #[test]

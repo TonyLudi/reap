@@ -431,6 +431,7 @@ mod tests {
     fn config() -> LiveConfig {
         let mut strategy: ChaosConfig =
             toml::from_str(include_str!("../../../examples/iarb2-basic.toml")).unwrap();
+        strategy.reference_data_stale_threshold_ms = Some(120_000);
         strategy.risk_groups[0].account_id = Some("main".to_string());
         strategy.instruments[1].kind = InstrumentKindConfig::LinearSwap;
         strategy.instruments[1].symbol = "BTC-USDT-SWAP".to_string();

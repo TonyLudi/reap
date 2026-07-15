@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{BuildHasherDefault, DefaultHasher};
 use std::sync::Arc;
 
@@ -23,6 +23,32 @@ const EPS: f64 = 1e-9;
 
 type StableMap<K, V> = HashMap<K, V, BuildHasherDefault<DefaultHasher>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ReferenceDataKind {
+    IndexPrice,
+    FundingRate,
+    MarkPrice,
+    PriceLimits,
+}
+
+impl ReferenceDataKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::IndexPrice => "index_price",
+            Self::FundingRate => "funding_rate",
+            Self::MarkPrice => "mark_price",
+            Self::PriceLimits => "price_limits",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReferenceDataRequirement {
+    pub kind: ReferenceDataKind,
+    pub symbol: Symbol,
+    pub max_age_ms: TimeMs,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChaosConfig {
@@ -44,6 +70,9 @@ pub struct ChaosConfig {
     pub insufficient_valid_stop_ms: TimeMs,
     pub index_deviation_limit: f64,
     pub index_deviation_debounce_ms: TimeMs,
+    /// Enables fail-closed freshness checks for every derived pricing input.
+    /// Live configurations must set this explicitly; legacy backtests may omit it.
+    pub reference_data_stale_threshold_ms: Option<TimeMs>,
     pub margin_breach_debounce_ms: TimeMs,
     pub ignore_best_level: bool,
     pub act_on_burst: bool,
@@ -76,6 +105,7 @@ impl Default for ChaosConfig {
             insufficient_valid_stop_ms: 60_000,
             index_deviation_limit: 0.05,
             index_deviation_debounce_ms: 120_000,
+            reference_data_stale_threshold_ms: None,
             margin_breach_debounce_ms: 5_000,
             ignore_best_level: false,
             act_on_burst: false,
@@ -104,6 +134,33 @@ impl std::fmt::Display for ConfigValidation {
 impl std::error::Error for ConfigValidation {}
 
 impl ChaosConfig {
+    pub fn reference_data_requirements(&self) -> Vec<ReferenceDataRequirement> {
+        let Some(max_age_ms) = self.reference_data_stale_threshold_ms else {
+            return Vec::new();
+        };
+        let mut requirements = BTreeSet::new();
+        for instrument in &self.instruments {
+            requirements.insert((ReferenceDataKind::PriceLimits, instrument.symbol.clone()));
+            if instrument.kind.is_derivative() {
+                requirements.insert((ReferenceDataKind::MarkPrice, instrument.symbol.clone()));
+            }
+            if instrument.kind.is_swap() {
+                requirements.insert((ReferenceDataKind::FundingRate, instrument.symbol.clone()));
+            }
+            if let Some(index_symbol) = &instrument.index_symbol {
+                requirements.insert((ReferenceDataKind::IndexPrice, index_symbol.clone()));
+            }
+        }
+        requirements
+            .into_iter()
+            .map(|(kind, symbol)| ReferenceDataRequirement {
+                kind,
+                symbol,
+                max_age_ms,
+            })
+            .collect()
+    }
+
     pub fn effective(&self) -> Self {
         let mut config = self.clone();
         let multiplier = if config.risk_multiplier > 0.0 {
@@ -187,6 +244,11 @@ impl ChaosConfig {
             self.index_deviation_limit,
             &mut errors,
         );
+        if self.reference_data_stale_threshold_ms == Some(0) {
+            errors.push(
+                "reference_data_stale_threshold_ms must be positive when configured".to_string(),
+            );
+        }
 
         let mut symbols = HashSet::new();
         for instrument in &self.instruments {
@@ -1033,6 +1095,12 @@ impl InstrumentKindConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TimedPrice {
+    price: Price,
+    updated_ms: TimeMs,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChaosStrategy {
     config: ChaosConfig,
@@ -1040,7 +1108,7 @@ pub struct ChaosStrategy {
     risk_groups: StableMap<String, RiskGroupState>,
     symbol_to_group: HashMap<Symbol, String>,
     index_symbols: HashSet<Symbol>,
-    index_prices: HashMap<Symbol, Price>,
+    index_prices: HashMap<Symbol, TimedPrice>,
     index_debouncers: HashMap<String, DebouncedCondition>,
     basis_debouncers: HashMap<String, DebouncedCondition>,
     basis_breaches: HashMap<String, (Symbol, f64)>,
@@ -1100,6 +1168,7 @@ impl ChaosStrategy {
         for inst in &config.instruments {
             let mut state = InstrumentState::new(inst.clone());
             state.ignore_best_level = config.ignore_best_level;
+            state.reference_data_stale_threshold_ms = config.reference_data_stale_threshold_ms;
             if let Some(group) = risk_groups.get(&inst.risk_group) {
                 if group.config.kind == RiskGroupKindConfig::RefOnly {
                     state.config.halted = true;
@@ -1253,8 +1322,12 @@ impl ChaosStrategy {
         &self.basis_breaches
     }
 
+    fn advance_time(&mut self, ts_ms: TimeMs) {
+        self.now_ms = self.now_ms.max(ts_ms);
+    }
+
     fn on_depth(&mut self, book: &OrderBook) -> Vec<OrderIntent> {
-        self.now_ms = book.ts_ms;
+        self.advance_time(book.ts_ms);
         if let Some(entity) = self.entities.get_mut(&book.symbol) {
             entity.book = Some(book.clone());
         }
@@ -1262,7 +1335,7 @@ impl ChaosStrategy {
     }
 
     fn on_owned_depth(&mut self, book: OrderBook) -> Vec<OrderIntent> {
-        self.now_ms = book.ts_ms;
+        self.advance_time(book.ts_ms);
         if let Some(entity) = self.entities.get_mut(book.symbol.as_str()) {
             entity.book = Some(book);
         }
@@ -1292,8 +1365,12 @@ impl ChaosStrategy {
             true
         };
         self.update_theo_quotes();
-        let pricing_healthy =
-            risk_healthy && hedge_healthy && startup_basis_healthy && self.check_index_deviation();
+        let reference_healthy = self.configured_indexes_ready_at(self.now_ms);
+        let pricing_healthy = risk_healthy
+            && hedge_healthy
+            && startup_basis_healthy
+            && reference_healthy
+            && self.check_index_deviation();
 
         let strat_can_buy = self.pending_delta_usd <= 0.5 * self.config.delta_limit_usd
             && self.delta_usd <= 0.5 * self.config.delta_limit_usd;
@@ -1348,7 +1425,7 @@ impl ChaosStrategy {
         let valid_count = self
             .entities
             .values()
-            .filter(|entity| entity.book_is_valid_at(self.now_ms) && !entity.feed_stale)
+            .filter(|entity| entity.market_data_is_valid_at(self.now_ms) && !entity.feed_stale)
             .count();
         if valid_count < 2 {
             let since = self.insufficient_valid_since.get_or_insert(self.now_ms);
@@ -1635,6 +1712,9 @@ impl ChaosStrategy {
         if self.halt_reason.is_some() {
             return false;
         }
+        if !self.configured_indexes_ready_at(self.now_ms) {
+            return false;
+        }
         let mut group_names = self.risk_groups.keys().cloned().collect::<Vec<_>>();
         group_names.sort();
         for group_name in group_names {
@@ -1650,9 +1730,10 @@ impl ChaosStrategy {
                     let Some(index_symbol) = entity.config.index_symbol.as_ref() else {
                         continue;
                     };
-                    let (Some(spot_mid), Some(index_price)) =
-                        (entity.mid(), self.index_prices.get(index_symbol).copied())
-                    else {
+                    let (Some(spot_mid), Some(index_price)) = (
+                        entity.mid(),
+                        self.index_prices.get(index_symbol).map(|value| value.price),
+                    ) else {
                         continue;
                     };
                     let deviation =
@@ -1680,6 +1761,17 @@ impl ChaosStrategy {
             }
         }
         true
+    }
+
+    fn configured_indexes_ready_at(&self, now_ms: TimeMs) -> bool {
+        let Some(max_age_ms) = self.config.reference_data_stale_threshold_ms else {
+            return true;
+        };
+        self.index_symbols.iter().all(|symbol| {
+            self.index_prices
+                .get(symbol)
+                .is_some_and(|value| timestamp_is_fresh(value.updated_ms, now_ms, max_age_ms))
+        })
     }
 
     fn desired_quote_levels(
@@ -2069,9 +2161,11 @@ impl ChaosStrategy {
     }
 
     fn pricing_ready(&self) -> bool {
-        self.entities
-            .values()
-            .all(|entity| entity.book_is_valid_at(self.now_ms) && !entity.feed_stale)
+        self.configured_indexes_ready_at(self.now_ms)
+            && self
+                .entities
+                .values()
+                .all(|entity| entity.market_data_is_valid_at(self.now_ms) && !entity.feed_stale)
     }
 
     fn check_basis(&mut self, first_run: bool) -> bool {
@@ -2618,7 +2712,7 @@ impl ChaosStrategy {
         match event {
             MarketEvent::Depth(book) => self.on_depth(book),
             MarketEvent::Trade { ts_ms, .. } => {
-                self.now_ms = *ts_ms;
+                self.advance_time(*ts_ms);
                 Vec::new()
             }
             MarketEvent::IndexPrice {
@@ -2626,12 +2720,23 @@ impl ChaosStrategy {
                 symbol,
                 price,
             } => {
-                self.now_ms = *ts_ms;
+                self.advance_time(*ts_ms);
                 if !self.index_symbols.contains(symbol) {
                     return Vec::new();
                 }
                 if price.is_finite() && *price > 0.0 {
-                    self.index_prices.insert(symbol.clone(), *price);
+                    self.index_prices
+                        .entry(symbol.clone())
+                        .and_modify(|value| {
+                            if *ts_ms >= value.updated_ms {
+                                value.price = *price;
+                                value.updated_ms = *ts_ms;
+                            }
+                        })
+                        .or_insert(TimedPrice {
+                            price: *price,
+                            updated_ms: *ts_ms,
+                        });
                 }
                 self.refresh_quotes()
             }
@@ -2642,12 +2747,14 @@ impl ChaosStrategy {
                 funding_time_ms,
                 ..
             } => {
-                self.now_ms = *ts_ms;
+                self.advance_time(*ts_ms);
                 if let Some(entity) = self.entities.get_mut(symbol)
                     && rate.is_finite()
+                    && should_accept_timestamp(entity.funding_rate_updated_ms, *ts_ms)
                 {
                     entity.funding_rate = *rate;
                     entity.funding_time_ms = *funding_time_ms;
+                    entity.funding_rate_updated_ms = Some(*ts_ms);
                 }
                 self.refresh_quotes()
             }
@@ -2656,7 +2763,7 @@ impl ChaosStrategy {
                 symbol,
                 value,
             } => {
-                self.now_ms = *ts_ms;
+                self.advance_time(*ts_ms);
                 let mut should_reprice = false;
                 if *value == 0.0 {
                     if self.burst_symbol.as_deref() == Some(symbol) {
@@ -2689,16 +2796,27 @@ impl ChaosStrategy {
                 limit_down,
                 limit_up,
             } => {
-                self.now_ms = *ts_ms;
+                self.advance_time(*ts_ms);
                 if let Some(entity) = self.entities.get_mut(symbol) {
-                    if mark_price.is_finite() && *mark_price > 0.0 {
+                    let valid_mark = mark_price.is_finite() && *mark_price > 0.0;
+                    let valid_limits = limit_down.is_finite()
+                        && *limit_down > 0.0
+                        && limit_up.is_finite()
+                        && *limit_up > 0.0;
+                    if valid_mark && should_accept_timestamp(entity.mark_price_updated_ms, *ts_ms) {
                         entity.mark_price = Some(*mark_price);
+                        entity.mark_price_updated_ms = Some(*ts_ms);
                     }
-                    if limit_down.is_finite() && *limit_down > 0.0 {
-                        entity.limit_down = Some(*limit_down);
-                    }
-                    if limit_up.is_finite() && *limit_up > 0.0 {
-                        entity.limit_up = Some(*limit_up);
+                    if should_accept_timestamp(entity.price_limits_updated_ms, *ts_ms) {
+                        if limit_down.is_finite() && *limit_down > 0.0 {
+                            entity.limit_down = Some(*limit_down);
+                        }
+                        if limit_up.is_finite() && *limit_up > 0.0 {
+                            entity.limit_up = Some(*limit_up);
+                        }
+                        if valid_limits {
+                            entity.price_limits_updated_ms = Some(*ts_ms);
+                        }
                     }
                 }
                 self.refresh_quotes()
@@ -2707,7 +2825,7 @@ impl ChaosStrategy {
     }
 
     fn on_order_update(&mut self, update: &OrderUpdate) -> Vec<OrderIntent> {
-        self.now_ms = update.ts_ms;
+        self.advance_time(update.ts_ms);
         if update.event == OrderEvent::Cancelled && update.reason.starts_with("hedge") {
             let missed_qty = (update.qty - update.filled_qty).max(0.0);
             if missed_qty > 0.0
@@ -2832,7 +2950,7 @@ impl ChaosStrategy {
     }
 
     fn on_account_update(&mut self, update: &AccountUpdate) -> Vec<OrderIntent> {
-        self.now_ms = update.ts_ms;
+        self.advance_time(update.ts_ms);
         self.update_risk();
         let old_delta = self.delta_usd;
         let mut source_symbol = None;
@@ -2966,7 +3084,7 @@ impl ChaosStrategy {
     }
 
     fn on_system_event(&mut self, event: &SystemEvent) -> Vec<OrderIntent> {
-        self.now_ms = event.ts_ms;
+        self.advance_time(event.ts_ms);
         if event.kind == SystemEventKind::AccountHalted {
             let Some(account_id) = event.account_id.as_deref() else {
                 return Vec::new();
@@ -3021,7 +3139,7 @@ impl Strategy for ChaosStrategy {
             StrategyEvent::Market(market) => self.on_market_event(market),
             StrategyEvent::Order(update) => self.on_order_update(update),
             StrategyEvent::Timer(timer) => {
-                self.now_ms = timer.ts_ms;
+                self.advance_time(timer.ts_ms);
                 let mut intents = self.refresh_quotes();
                 if self.halt_reason.is_none() && self.should_hedge_strategy_delta() {
                     intents.extend(self.hedge_delta(self.delta_to_hedge(), None, true));
@@ -3059,10 +3177,13 @@ pub struct InstrumentState {
     sell_fill_notional: f64,
     pub funding_rate: f64,
     pub funding_time_ms: TimeMs,
+    pub funding_rate_updated_ms: Option<TimeMs>,
     funding_rate_active: bool,
     pub mark_price: Option<Price>,
+    pub mark_price_updated_ms: Option<TimeMs>,
     pub limit_down: Option<Price>,
     pub limit_up: Option<Price>,
+    pub price_limits_updated_ms: Option<TimeMs>,
     pub base_balance: Quantity,
     pub base_available: Quantity,
     pub base_equity: Quantity,
@@ -3081,6 +3202,7 @@ pub struct InstrumentState {
     pub margin_max_loan: Quantity,
     pub margin_initialized: bool,
     ignore_best_level: bool,
+    reference_data_stale_threshold_ms: Option<TimeMs>,
     interval_halted: bool,
     system_halted: bool,
     feed_stale: bool,
@@ -3116,10 +3238,13 @@ impl InstrumentState {
             sell_fill_notional: 0.0,
             funding_rate,
             funding_time_ms: 0,
+            funding_rate_updated_ms: None,
             funding_rate_active: true,
             mark_price: None,
+            mark_price_updated_ms: None,
             limit_down: None,
             limit_up: None,
+            price_limits_updated_ms: None,
             base_balance: 0.0,
             base_available: 0.0,
             base_equity: 0.0,
@@ -3138,6 +3263,7 @@ impl InstrumentState {
             margin_max_loan: 0.0,
             margin_initialized: false,
             ignore_best_level: false,
+            reference_data_stale_threshold_ms: None,
             interval_halted: false,
             system_halted: false,
             feed_stale: false,
@@ -3227,7 +3353,7 @@ impl InstrumentState {
             && !self.interval_halted
             && !self.system_halted
             && !self.feed_stale
-            && self.book_is_valid_at(now_ms)
+            && self.market_data_is_valid_at(now_ms)
     }
 
     fn book_is_valid(&self) -> bool {
@@ -3252,6 +3378,36 @@ impl InstrumentState {
             && self.book.as_ref().is_some_and(|book| {
                 now_ms.saturating_sub(book.ts_ms) <= self.config.depth_stale_threshold_ms
             })
+    }
+
+    fn market_data_is_valid_at(&self, now_ms: TimeMs) -> bool {
+        self.book_is_valid_at(now_ms) && self.reference_data_is_valid_at(now_ms)
+    }
+
+    fn reference_data_is_valid_at(&self, now_ms: TimeMs) -> bool {
+        let Some(max_age_ms) = self.reference_data_stale_threshold_ms else {
+            return true;
+        };
+        let limits_fresh = self.limit_down.is_some()
+            && self.limit_up.is_some()
+            && self
+                .price_limits_updated_ms
+                .is_some_and(|updated_ms| timestamp_is_fresh(updated_ms, now_ms, max_age_ms));
+        if !limits_fresh {
+            return false;
+        }
+        if self.config.kind.is_derivative()
+            && (self.mark_price.is_none()
+                || !self
+                    .mark_price_updated_ms
+                    .is_some_and(|updated_ms| timestamp_is_fresh(updated_ms, now_ms, max_age_ms)))
+        {
+            return false;
+        }
+        !self.config.kind.is_swap()
+            || self
+                .funding_rate_updated_ms
+                .is_some_and(|updated_ms| timestamp_is_fresh(updated_ms, now_ms, max_age_ms))
     }
 
     fn spot_can_trade_raw(&mut self, side: Side, now_ms: TimeMs) -> bool {
@@ -4373,6 +4529,14 @@ fn update_flag(value: &mut bool, next: bool) -> bool {
     changed
 }
 
+fn timestamp_is_fresh(updated_ms: TimeMs, now_ms: TimeMs, max_age_ms: TimeMs) -> bool {
+    now_ms.saturating_sub(updated_ms) <= max_age_ms
+}
+
+fn should_accept_timestamp(current_ms: Option<TimeMs>, next_ms: TimeMs) -> bool {
+    current_ms.is_none_or(|current_ms| next_ms >= current_ms)
+}
+
 fn update_weighted_px(map: &mut HashMap<Symbol, (f64, f64)>, symbol: &str, px: f64, qty: f64) {
     map.entry(symbol.to_string())
         .and_modify(|(cur_px, cur_qty)| {
@@ -4710,6 +4874,153 @@ mod tests {
             sell_skew: 0.0000001,
             ..CoinConfig::default()
         }
+    }
+
+    fn seed_strict_reference_data(strategy: &mut ChaosStrategy, ts_ms: TimeMs) {
+        let events = [
+            MarketEvent::IndexPrice {
+                ts_ms,
+                symbol: "BTC-USDT-INDEX".to_string(),
+                price: 50_000.5,
+            },
+            MarketEvent::PriceLimits {
+                ts_ms,
+                symbol: "BTC-USDT".to_string(),
+                mark_price: 0.0,
+                limit_down: 40_000.0,
+                limit_up: 60_000.0,
+            },
+            MarketEvent::PriceLimits {
+                ts_ms,
+                symbol: "BTC-PERP".to_string(),
+                mark_price: 0.0,
+                limit_down: 40_000.0,
+                limit_up: 60_000.0,
+            },
+            MarketEvent::PriceLimits {
+                ts_ms,
+                symbol: "BTC-PERP".to_string(),
+                mark_price: 50_003.5,
+                limit_down: 0.0,
+                limit_up: 0.0,
+            },
+            MarketEvent::FundingRate {
+                ts_ms,
+                symbol: "BTC-PERP".to_string(),
+                rate: 0.0001,
+                funding_time_ms: ts_ms + 28_800_000,
+                settlement: None,
+            },
+        ];
+        for event in events {
+            strategy.on_event(&StrategyEvent::Market(event));
+        }
+    }
+
+    #[test]
+    fn strict_reference_contract_is_derived_once_for_strategy_and_live() {
+        let mut config = config();
+        config.reference_data_stale_threshold_ms = Some(1_000);
+        config.instruments[0].index_symbol = Some("BTC-USDT-INDEX".to_string());
+        config.instruments[1].kind = InstrumentKindConfig::LinearSwap;
+
+        let requirements = config.reference_data_requirements();
+        assert_eq!(requirements.len(), 5);
+        assert!(requirements.iter().all(|item| item.max_age_ms == 1_000));
+        assert!(requirements.iter().any(|item| {
+            item.kind == ReferenceDataKind::IndexPrice && item.symbol == "BTC-USDT-INDEX"
+        }));
+        assert!(requirements.iter().any(|item| {
+            item.kind == ReferenceDataKind::FundingRate && item.symbol == "BTC-PERP"
+        }));
+        assert_eq!(
+            requirements
+                .iter()
+                .filter(|item| item.kind == ReferenceDataKind::PriceLimits)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn strict_reference_staleness_withdraws_quotes_without_cross_channel_masking() {
+        let mut config = config();
+        config.reference_data_stale_threshold_ms = Some(1_000);
+        config.instruments[0].index_symbol = Some("BTC-USDT-INDEX".to_string());
+        config.instruments[1].kind = InstrumentKindConfig::LinearSwap;
+        let mut strategy = ChaosStrategy::new(config).unwrap();
+        seed_strict_reference_data(&mut strategy, 1_000);
+
+        strategy.on_event(&StrategyEvent::Market(MarketEvent::Depth(
+            OrderBook::one_level(
+                "BTC-USDT",
+                1_000,
+                Level::new(50_000.0, 1.0),
+                Level::new(50_001.0, 1.0),
+            ),
+        )));
+        let quotes = strategy.on_event(&StrategyEvent::Market(MarketEvent::Depth(
+            OrderBook::one_level(
+                "BTC-PERP",
+                1_000,
+                Level::new(50_003.0, 200.0),
+                Level::new(50_004.0, 200.0),
+            ),
+        )));
+        let quote = quotes
+            .iter()
+            .find_map(|intent| match intent {
+                OrderIntent::NewOrder(order) if order.reason == "quote" => Some(order.clone()),
+                _ => None,
+            })
+            .expect("fresh strict references should permit quoting");
+        strategy.on_event(&StrategyEvent::Order(OrderUpdate {
+            ts_ms: 1_001,
+            order_id: "strict-q1".to_string(),
+            symbol: quote.symbol,
+            side: quote.side,
+            event: OrderEvent::PendingNew,
+            status: OrderStatus::PendingNew,
+            price: quote.price,
+            time_in_force: Some(quote.time_in_force),
+            qty: quote.qty,
+            open_qty: quote.qty,
+            filled_qty: 0.0,
+            avg_fill_price: 0.0,
+            last_fill_qty: 0.0,
+            last_fill_price: 0.0,
+            last_fill_liquidity: None,
+            last_fill_fee: None,
+            reason: quote.reason,
+        }));
+
+        let intents = strategy.on_event(&StrategyEvent::Market(MarketEvent::PriceLimits {
+            ts_ms: 2_001,
+            symbol: "BTC-PERP".to_string(),
+            mark_price: 50_003.5,
+            limit_down: 0.0,
+            limit_up: 0.0,
+        }));
+
+        let swap = strategy.entity("BTC-PERP").unwrap();
+        assert_eq!(swap.mark_price_updated_ms, Some(2_001));
+        assert_eq!(swap.price_limits_updated_ms, Some(1_000));
+        assert_eq!(swap.funding_rate_updated_ms, Some(1_000));
+        assert!(intents.iter().any(|intent| {
+            matches!(intent, OrderIntent::CancelOrder { order_id, .. } if order_id == "strict-q1")
+        }));
+
+        strategy.on_event(&StrategyEvent::Market(MarketEvent::PriceLimits {
+            ts_ms: 1_500,
+            symbol: "BTC-PERP".to_string(),
+            mark_price: 49_000.0,
+            limit_down: 0.0,
+            limit_up: 0.0,
+        }));
+        let swap = strategy.entity("BTC-PERP").unwrap();
+        assert_eq!(swap.mark_price, Some(50_003.5));
+        assert_eq!(swap.mark_price_updated_ms, Some(2_001));
+        assert_eq!(strategy.now_ms, 2_001);
     }
 
     #[test]

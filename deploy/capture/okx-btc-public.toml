@@ -43,7 +43,13 @@ priority = "high"
 channel = "index-tickers"
 symbol = "BTC-USDT"
 connections = 2
-priority = "high"
+priority = "critical"
+
+[[subscriptions]]
+channel = "price-limit"
+symbol = "BTC-USDT"
+connections = 2
+priority = "critical"
 
 [[subscriptions]]
 channel = "index-tickers"
@@ -73,16 +79,16 @@ priority = "high"
 channel = "funding-rate"
 symbol = "BTC-USDT-SWAP"
 connections = 2
-priority = "high"
+priority = "critical"
 
 [[subscriptions]]
 channel = "mark-price"
 symbol = "BTC-USDT-SWAP"
 connections = 2
-priority = "high"
+priority = "critical"
 
 [[subscriptions]]
 channel = "price-limit"
 symbol = "BTC-USDT-SWAP"
 connections = 2
-priority = "high"
+priority = "critical"

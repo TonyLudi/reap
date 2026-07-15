@@ -26,6 +26,7 @@ use reap_storage::{
     StorageError, StorageRecord, StorageRuntime, StorageSink, acquire_storage_lease, recover_jsonl,
     start_jsonl_storage_with_lease,
 };
+use reap_strategy::ReferenceDataKind;
 use reap_telemetry::{
     AlertDeliveryFailure, AlertError, AlertEvent, AlertRuntime, AlertSeverity, AlertSink,
     AlertStats, start_webhook_alerts,
@@ -2748,7 +2749,9 @@ impl LiveRuntime {
                                 ..
                             }
                         );
-                        let output = self.coordinator.process_feed(output)?;
+                        let output = self
+                            .coordinator
+                            .process_feed_at(output, envelope.recv_ts_ns / 1_000_000)?;
                         let convergence_visible_ns = unix_time_ns();
                         if let Some(account_id) = private_account_id {
                             self.observe_account_convergence(
@@ -4816,30 +4819,27 @@ fn public_subscriptions(config: &LiveConfig) -> Vec<Subscription> {
             FeedPriority::High,
             config.runtime.public_connections_per_subscription,
         );
-        if instrument.kind.is_derivative() {
-            for channel in ["funding-rate", "mark-price", "price-limit"] {
-                push_public_subscription(
-                    &mut subscriptions,
-                    &mut seen,
-                    Channel::Custom(channel.to_string()),
-                    &instrument.symbol,
-                    FeedPriority::High,
-                    config.runtime.public_connections_per_subscription,
-                );
-            }
-        }
-        if let Some(index_symbol) = &instrument.index_symbol {
-            push_public_subscription(
-                &mut subscriptions,
-                &mut seen,
-                Channel::Custom("index-tickers".to_string()),
-                index_symbol,
-                FeedPriority::High,
-                config.runtime.public_connections_per_subscription,
-            );
-        }
+    }
+    for requirement in config.strategy.reference_data_requirements() {
+        push_public_subscription(
+            &mut subscriptions,
+            &mut seen,
+            Channel::Custom(okx_reference_channel(requirement.kind).to_string()),
+            &requirement.symbol,
+            FeedPriority::Critical,
+            config.runtime.public_connections_per_subscription,
+        );
     }
     subscriptions
+}
+
+fn okx_reference_channel(kind: ReferenceDataKind) -> &'static str {
+    match kind {
+        ReferenceDataKind::IndexPrice => "index-tickers",
+        ReferenceDataKind::FundingRate => "funding-rate",
+        ReferenceDataKind::MarkPrice => "mark-price",
+        ReferenceDataKind::PriceLimits => "price-limit",
+    }
 }
 
 fn push_public_subscription(
@@ -5667,6 +5667,7 @@ mod tests {
     fn config() -> LiveConfig {
         let mut strategy: ChaosConfig =
             toml::from_str(include_str!("../../../examples/iarb2-basic.toml")).unwrap();
+        strategy.reference_data_stale_threshold_ms = Some(120_000);
         strategy.risk_groups[0].account_id = Some("main".to_string());
         LiveConfig {
             strategy,
@@ -5706,6 +5707,7 @@ mod tests {
             missing_private_streams: Vec::new(),
             missing_order_transports: Vec::new(),
             missing_stablecoin_rates: Vec::new(),
+            missing_strategy_references: Vec::new(),
             faults: BTreeMap::new(),
         }
     }
@@ -5846,6 +5848,37 @@ mod tests {
             symbol: None,
             reason: "test order sockets".to_string(),
         }));
+        for requirement in config.strategy.reference_data_requirements() {
+            let event = match requirement.kind {
+                ReferenceDataKind::IndexPrice => MarketEvent::IndexPrice {
+                    ts_ms: now_ms,
+                    symbol: requirement.symbol,
+                    price: 100.0,
+                },
+                ReferenceDataKind::FundingRate => MarketEvent::FundingRate {
+                    ts_ms: now_ms,
+                    symbol: requirement.symbol,
+                    rate: 0.0001,
+                    funding_time_ms: now_ms + 28_800_000,
+                    settlement: None,
+                },
+                ReferenceDataKind::MarkPrice => MarketEvent::PriceLimits {
+                    ts_ms: now_ms,
+                    symbol: requirement.symbol,
+                    mark_price: 100.0,
+                    limit_down: 0.0,
+                    limit_up: 0.0,
+                },
+                ReferenceDataKind::PriceLimits => MarketEvent::PriceLimits {
+                    ts_ms: now_ms,
+                    symbol: requirement.symbol,
+                    mark_price: 0.0,
+                    limit_down: 50.0,
+                    limit_up: 150.0,
+                },
+            };
+            coordinator.process_event(NormalizedEvent::Market(event));
+        }
         assert!(coordinator.readiness().is_ready());
         coordinator
     }
@@ -7563,11 +7596,30 @@ mod tests {
 
     #[test]
     fn public_plan_replicates_every_required_subscription() {
-        let config = config();
+        let mut config = config();
         let subscriptions = public_subscriptions(&config);
 
         assert!(subscriptions.iter().all(|subscription| {
             subscription.connections == config.runtime.public_connections_per_subscription
+        }));
+        assert!(subscriptions.iter().any(|subscription| {
+            subscription.channel == Channel::Custom("price-limit".to_string())
+                && subscription.symbol.as_deref() == Some("BTC-USDT")
+                && subscription.priority == FeedPriority::Critical
+        }));
+        assert!(subscriptions.iter().any(|subscription| {
+            subscription.channel == Channel::Custom("mark-price".to_string())
+                && subscription.symbol.as_deref() == Some("BTC-PERP")
+        }));
+        assert!(!subscriptions.iter().any(|subscription| {
+            subscription.channel == Channel::Custom("funding-rate".to_string())
+        }));
+
+        config.strategy.instruments[1].kind = InstrumentKindConfig::LinearSwap;
+        assert!(public_subscriptions(&config).iter().any(|subscription| {
+            subscription.channel == Channel::Custom("funding-rate".to_string())
+                && subscription.symbol.as_deref() == Some("BTC-PERP")
+                && subscription.priority == FeedPriority::Critical
         }));
         assert_eq!(
             private_subscriptions(false)

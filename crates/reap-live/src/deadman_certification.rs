@@ -1365,6 +1365,7 @@ mod tests {
     fn live_config(journal_path: PathBuf) -> LiveConfig {
         let mut strategy: ChaosConfig =
             toml::from_str(include_str!("../../../examples/iarb2-basic.toml")).unwrap();
+        strategy.reference_data_stale_threshold_ms = Some(120_000);
         strategy.risk_groups[0].account_id = Some("main".to_string());
         let config = LiveConfig {
             strategy,

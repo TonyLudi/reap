@@ -123,7 +123,8 @@ cargo run -p reap-cli -- config-check --config examples/iarb2-basic.toml --prett
 ```
 
 Capture backtest-ready OKX public data, including redundant USDT/USD and
-USDC/USD risk references, without credentials or private/account connections.
+USDC/USD risk references and independent spot/swap price-limit, swap funding,
+and swap mark streams, without credentials or private/account connections.
 The bounded command exits non-zero on parse, sequence, recovery, writer, or
 end-of-run connectivity defects. Capture configuration rejects unknown fields
 instead of silently defaulting a typo:
@@ -332,6 +333,14 @@ unexpected ports, mixed regions, and arbitrary TLS hosts are rejected. A full
 loopback tuple is accepted only in the demo environment for deterministic local
 tests. Unknown live TOML fields are rejected, including nested strategy and
 risk typos, rather than being silently dropped before validation.
+
+Every live strategy must set `reference_data_stale_threshold_ms`. That one
+policy derives the exact critical websocket reference plan and gates both
+startup and ongoing strategy validity. Index, funding, mark, and price-limit
+timestamps are aged independently; a missing or stale source blocks entry and
+triggers immediate cancellation of canonical working orders. The checked-in
+120-second value accommodates OKX's variable funding update cadence and must be
+reviewed against captured target-region behavior before promotion.
 
 `runtime.connection_attempt_interval_ms = 400` serializes initial and
 reconnecting WebSocket handshakes across every public/private feed and

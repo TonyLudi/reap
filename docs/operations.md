@@ -24,9 +24,10 @@ cargo run -p reap-cli -- capture \
   --pretty
 ```
 
-The example captures spot and swap books/trades plus index, funding, mark, and
-price-limit inputs used by iarb2. Every subscription has two independent
-connections. Raw frames are canonical and written sequentially within one run.
+The example captures spot and swap books/trades plus index, swap funding, swap
+mark, and separate spot/swap price-limit inputs used by iarb2. Every
+subscription has two independent connections. Raw frames are canonical and
+written sequentially within one run.
 The capture event loop assigns each frame a process-global `capture_record_seq`
 before the bounded writer, independent of OKX's channel-specific book sequence.
 The optional
@@ -1077,8 +1078,15 @@ outside source control.
     complete, healthy, post-connect reconciled private stream for every account.
 12. It also waits for every configured stablecoin guard to receive a fresh,
     internally consistent index value within its downside threshold.
-13. Only phase `ready`, writable storage, healthy risk, and explicit
-   `--mode demo --confirm-demo` permit a new order.
+13. Live configuration must set
+    `strategy.reference_data_stale_threshold_ms`. Startup waits independently
+    for every derived index, swap-funding, derivative-mark, and instrument
+    price-limit observation, checking exchange source time against host receive
+    time. Activity on one reference socket cannot refresh another. A stale
+    source degrades readiness, blocks entry, and immediately cancels canonical
+    working orders; strategy timers independently withdraw stale quotes.
+14. Only phase `ready`, writable storage, healthy risk, and explicit
+    `--mode demo --confirm-demo` permit a new order.
 
 Live validation rejects `strategy.master_strategy` and
 `strategy.strategy_group`. The pinned Java implementation requires external

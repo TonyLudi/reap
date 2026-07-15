@@ -148,6 +148,12 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Add Java-referenced USDT/USDC depeg protection with redundant critical
   index feeds, conflict-aware deduplication, startup readiness, immediate entry
   blocking, and a debounced durable global risk latch.
+- [x] Derive one venue-neutral strategy reference contract for index, swap
+  funding, derivative mark, and per-instrument price limits; map it to separate
+  critical OKX sockets, require source-time freshness against live receive time,
+  keep component clocks independent and non-regressing, and cancel canonical
+  orders immediately when readiness loses a required source. This follows the
+  pinned Java session topology while removing its shared `Ticker.timeMs` masking.
 - [x] Require account snapshots to pass through strategy/risk before readiness,
   and reject live master/group topology until its external Java coordination
   feed exists.
