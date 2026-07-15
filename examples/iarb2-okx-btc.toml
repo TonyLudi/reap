@@ -30,6 +30,21 @@ currency = "USDT"
 index_symbol = "USDT-USD"
 max_age_ms = 75000
 
+# Exchange-style opening account snapshot. Spot inventory is a balance tied to
+# one valuation instrument; derivative positions, when nonzero, also require
+# avg_price and margin_mode. Production research rejects an omitted/zero-capital
+# snapshot and reports PnL relative to its first complete valuation.
+[initial_portfolio]
+
+[[initial_portfolio.balances]]
+currency = "BTC"
+total = 0.002
+valuation_symbol = "BTC-USDT"
+
+[[initial_portfolio.balances]]
+currency = "USDT"
+total = 10000.0
+
 [[risk_groups]]
 name = "main"
 symbols = ["BTC-USDT", "BTC-USDT-SWAP"]

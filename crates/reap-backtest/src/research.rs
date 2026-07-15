@@ -17,7 +17,7 @@ use crate::{
     LatencyCalibrationArtifact, MAX_LATENCY_CALIBRATION_ARTIFACT_BYTES,
 };
 
-pub const RESEARCH_SCHEMA_VERSION: u32 = 5;
+pub const RESEARCH_SCHEMA_VERSION: u32 = 6;
 pub use reap_core::PINNED_JAVA_REVISION;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +53,7 @@ pub enum SelectionMetric {
 #[serde(rename_all = "snake_case")]
 pub enum DatasetPortfolioSemantics {
     IndependentZeroInitialPortfolio,
+    IndependentConfiguredInitialPortfolio,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -287,6 +288,8 @@ pub struct RunAggregate {
     pub inventory_open_duration_ns: u64,
     pub inventory_open_fraction: f64,
     pub clock_regressions: u64,
+    #[serde(default)]
+    pub strategy_halts: usize,
     pub pending_non_funding_actions: usize,
     pub maximum_terminal_pending_orders: usize,
     pub maximum_terminal_pending_cancel_requests: usize,
@@ -369,6 +372,7 @@ pub fn run_research_manifest_path(path: impl AsRef<Path>) -> Result<ResearchRepo
         &executable_sha256,
     )?;
     let candidates = load_candidates(&manifest.candidates, base)?;
+    validate_candidate_initial_portfolios(manifest.mode, &candidates)?;
     validate_candidate_funding_evidence(
         manifest.mode,
         &manifest.gates,
@@ -527,7 +531,14 @@ pub fn run_research_manifest_path(path: impl AsRef<Path>) -> Result<ResearchRepo
         reap_version: env!("CARGO_PKG_VERSION").to_string(),
         java_reference_revision: manifest.java_reference_revision,
         latency_calibration: latency_calibration.map(|loaded| loaded.provenance),
-        dataset_portfolio_semantics: DatasetPortfolioSemantics::IndependentZeroInitialPortfolio,
+        dataset_portfolio_semantics: if candidates
+            .first()
+            .is_some_and(|candidate| !candidate.config.initial_portfolio.is_empty())
+        {
+            DatasetPortfolioSemantics::IndependentConfiguredInitialPortfolio
+        } else {
+            DatasetPortfolioSemantics::IndependentZeroInitialPortfolio
+        },
         candidates: candidates
             .iter()
             .map(|candidate| CandidateProvenance {
@@ -948,7 +959,11 @@ impl RunAggregate {
                 .observed_duration_ns
                 .saturating_add(report.observed_duration_ns);
             aggregate.fills = aggregate.fills.saturating_add(report.fills);
-            aggregate.net_pnl_usd += report.final_equity_usd;
+            if let Some(net_pnl_usd) = report.net_pnl_usd {
+                aggregate.net_pnl_usd += net_pnl_usd;
+            } else {
+                aggregate.accounting_complete = false;
+            }
             aggregate.fee_cost_usd += report.fee_cost_usd;
             aggregate.exact_fee_fills = aggregate
                 .exact_fee_fills
@@ -997,6 +1012,9 @@ impl RunAggregate {
             aggregate.clock_regressions = aggregate
                 .clock_regressions
                 .saturating_add(report.input_clock_regressions);
+            aggregate.strategy_halts = aggregate
+                .strategy_halts
+                .saturating_add(usize::from(report.strategy_halt_reason.is_some()));
             aggregate.pending_non_funding_actions = aggregate
                 .pending_non_funding_actions
                 .saturating_add(report.pending_activation_actions)
@@ -1099,6 +1117,9 @@ fn load_candidates(specs: &[ResearchCandidate], base: &Path) -> Result<Vec<Loade
         .with_context(|| format!("failed to parse candidate config {}", canonical.display()))?;
         config.backtest.validate()?;
         super::validate_currency_rate_coverage(&config.backtest, &config.strategy)?;
+        config
+            .initial_portfolio
+            .validate(&config.strategy.effective(), &config.backtest)?;
         let validation = config.strategy.effective().validate();
         if !validation.valid {
             bail!(
@@ -1123,6 +1144,32 @@ fn load_candidates(specs: &[ResearchCandidate], base: &Path) -> Result<Vec<Loade
         });
     }
     Ok(loaded)
+}
+
+fn validate_candidate_initial_portfolios(
+    mode: ResearchMode,
+    candidates: &[LoadedCandidate],
+) -> Result<()> {
+    let Some(first) = candidates.first() else {
+        return Ok(());
+    };
+    for candidate in &candidates[1..] {
+        if candidate.config.initial_portfolio != first.config.initial_portfolio {
+            bail!(
+                "candidate {} initial_portfolio differs from candidate {}; research candidates must use identical opening capital and inventory",
+                candidate.spec.id,
+                first.spec.id
+            );
+        }
+    }
+    if mode == ResearchMode::ProductionCandidate
+        && !first.config.initial_portfolio.has_positive_balance()
+    {
+        bail!(
+            "production_candidate requires an explicit initial_portfolio with positive account balance"
+        );
+    }
+    Ok(())
 }
 
 fn validate_candidate_funding_evidence<'a>(
@@ -1893,6 +1940,12 @@ fn evidence_failures(
     if !aggregate.final_valuation_complete {
         failures.push("one or more final portfolio/order valuations are incomplete".to_string());
     }
+    if aggregate.strategy_halts > 0 {
+        failures.push(format!(
+            "{} backtest runs ended with a terminal strategy safety halt",
+            aggregate.strategy_halts
+        ));
+    }
     if gates.require_calibrated_execution
         && scenario.kind == ResearchScenarioKind::Baseline
         && (!scenario.execution.calibrated || !aggregate.execution_calibrated)
@@ -2621,6 +2674,7 @@ mod tests {
         let mut swap = BacktestConfig {
             strategy: Default::default(),
             backtest: Default::default(),
+            initial_portfolio: Default::default(),
         };
         swap.strategy
             .instruments
@@ -2640,6 +2694,54 @@ mod tests {
     }
 
     #[test]
+    fn production_research_requires_identical_explicit_opening_capital() {
+        let candidate = |id: &str, total: Option<f64>| LoadedCandidate {
+            spec: ResearchCandidate {
+                id: id.to_string(),
+                config: PathBuf::from(format!("{id}.toml")),
+            },
+            resolved_path: PathBuf::from(format!("/{id}.toml")),
+            config: BacktestConfig {
+                strategy: Default::default(),
+                backtest: Default::default(),
+                initial_portfolio: total.map_or_else(Default::default, |total| {
+                    crate::BacktestInitialPortfolioConfig {
+                        balances: vec![crate::BacktestInitialBalanceConfig {
+                            currency: "USD".to_string(),
+                            total,
+                            valuation_symbol: None,
+                        }],
+                        ..Default::default()
+                    }
+                }),
+            },
+            sha256: id.repeat(64),
+            effective_strategy_sha256: id.repeat(64),
+        };
+
+        let missing = candidate("missing", None);
+        let error =
+            validate_candidate_initial_portfolios(ResearchMode::ProductionCandidate, &[missing])
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("positive account balance"));
+
+        let first = candidate("first", Some(10_000.0));
+        let different = candidate("different", Some(20_000.0));
+        let error =
+            validate_candidate_initial_portfolios(ResearchMode::Smoke, &[first.clone(), different])
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("identical opening capital and inventory"));
+
+        validate_candidate_initial_portfolios(
+            ResearchMode::ProductionCandidate,
+            &[first.clone(), candidate("same", Some(10_000.0))],
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn production_non_swap_candidates_do_not_require_funding_settlement_evidence() {
         let spot = BacktestConfig {
             strategy: reap_strategy::ChaosConfig {
@@ -2647,6 +2749,7 @@ mod tests {
                 ..Default::default()
             },
             backtest: Default::default(),
+            initial_portfolio: Default::default(),
         };
 
         validate_candidate_funding_evidence(ResearchMode::ProductionCandidate, &gates(), [&spot])
@@ -2658,6 +2761,7 @@ mod tests {
         let mut swap = BacktestConfig {
             strategy: Default::default(),
             backtest: Default::default(),
+            initial_portfolio: Default::default(),
         };
         swap.strategy
             .instruments

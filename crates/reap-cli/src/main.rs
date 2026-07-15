@@ -92,7 +92,7 @@ enum Command {
     VerifyResearch {
         #[arg(short, long, help = "Exact research TOML used to produce the report")]
         manifest: PathBuf,
-        #[arg(short, long, help = "Archived schema-5 research JSON report")]
+        #[arg(short, long, help = "Archived schema-6 research JSON report")]
         report: PathBuf,
         #[arg(
             short,
@@ -107,14 +107,14 @@ enum Command {
     },
     #[command(
         about = "Bind reconstructed production research to the proposed live strategy",
-        long_about = "Re-run independent research reconstruction, require its schema-5 deployment candidate to have won every training fold, load an exact production live config, and compare the two effective strategy hashes. This does not authorize production trading."
+        long_about = "Re-run independent research reconstruction, require its schema-6 deployment candidate to have won every training fold, load an exact production live config, and compare the two effective strategy hashes. This does not authorize production trading."
     )]
     VerifyResearchDeployment {
         #[arg(short, long, help = "Exact proposed production live TOML")]
         config: PathBuf,
-        #[arg(long, help = "Exact schema-5 production research TOML")]
+        #[arg(long, help = "Exact schema-6 production research TOML")]
         manifest: PathBuf,
-        #[arg(long, help = "Archived schema-5 production research JSON report")]
+        #[arg(long, help = "Archived schema-6 production research JSON report")]
         report: PathBuf,
         #[arg(
             short,

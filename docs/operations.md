@@ -261,8 +261,46 @@ clock but marks accounting incomplete; older first forecasts are counted as
 missed. A future funding settlement beyond the capture horizon is reported as
 `pending_funding_actions` and is not itself a defect for the observed interval.
 
-The portfolio starts at zero. Configure one direct USD-per-unit index for every
-named non-USD quote/settlement currency:
+By default the portfolio starts at zero. For a realistic run, add one complete,
+single-account opening snapshot. Every configured spot base/quote and derivative
+settlement currency must have a balance row. Positive spot base inventory names
+one spot valuation symbol; derivative rows are optional when flat and otherwise
+require exchange average cost and margin mode:
+
+```toml
+[initial_portfolio]
+account_id = "strategy-subaccount" # omit when risk groups omit account_id
+
+[[initial_portfolio.balances]]
+currency = "BTC"
+total = 0.002
+valuation_symbol = "BTC-USDT"
+
+[[initial_portfolio.balances]]
+currency = "USDT"
+total = 10000.0
+
+[[initial_portfolio.positions]]
+symbol = "BTC-USDT-SWAP"
+qty = -1.0
+avg_price = 65000.0
+margin_mode = "cross"
+```
+
+Negative balances, duplicate currencies/symbols, spot rows in `positions`,
+multi-account strategy mappings, missing balance rows, unknown valuation
+symbols, and opening quantities outside configured position limits fail before
+replay. This scope intentionally excludes borrowing, account holds, and a
+dynamic margin engine; simulated available/equity balance fields equal total.
+The snapshot is delivered to strategy state at the first replay timestamp. The
+runner then blocks order entry until every book and currency conversion needed
+for an exact opening valuation is ready. A pre-baseline fill aborts. Reports
+retain the opening snapshot, opening valuation timestamp/equity, final account
+balances and position average prices, final equity, and opening-adjusted
+`net_pnl_usd`; a terminal strategy safety halt also fails research evidence.
+
+Configure one direct USD-per-unit index for every named non-USD
+quote/settlement or unvalued cash currency:
 
 ```toml
 [[backtest.currency_rates]]
@@ -631,13 +669,16 @@ artifact creation, and exit status.
 
 For real research, create a new manifest alongside immutable capture files:
 
-1. Set `schema_version = 5`, `mode = "production_candidate"`, retain the pinned
+1. Set `schema_version = 6`, `mode = "production_candidate"`, retain the pinned
    Java revision, and point `latency_calibration` to the passed create-new JSON
    artifact whose profile is embedded exactly in the baseline scenario.
 2. List explicit full candidate TOML files and set `deployment_candidate_id` to
    the one strategy intended for deployment before any test-window result is
    inspected. The runner does not mutate arbitrary strategy fields or generate
    an implicit parameter grid.
+   Every candidate must carry an identical parsed
+   `[initial_portfolio]`, and production mode requires at least one positive
+   opening balance so final capital cannot masquerade as PnL.
 3. Give every capture a unique dataset ID/path/content hash. Every test window
    must occur strictly after its fold's training windows, and a test dataset can
    belong to only one fold. Set each raw dataset's `capture_config` and
@@ -720,12 +761,14 @@ depth. Resting live quotes are also valid at an arbitrary dataset boundary;
 bound them with `maximum_test_active_orders`, active-order notional gates, and
 pending-delta gates instead of treating them as completed work.
 
-Each dataset is an independent zero-initial-portfolio run. The report states
-`independent_zero_initial_portfolio`; unlike Java
-`ChaosBackTestMultiRunService`, Rust does not carry ending positions between
-files. Use a single continuous capture for an evaluation segment when position
-continuity matters and gate terminal delta/gross exposure. Never sum cross-file
-PnL as though positions had been carried.
+Each dataset is an independent run. It resets either to zero and reports
+`independent_zero_initial_portfolio`, or resets to the exact candidate snapshot
+and reports `independent_configured_initial_portfolio`. Unlike Java
+`ChaosBackTestMultiRunService`, Rust still does not carry ending positions
+between files. Use a single continuous capture for an evaluation segment when
+position continuity matters and gate terminal delta/gross exposure. Research
+aggregation sums each run's `net_pnl_usd`, not final equity, but must not be
+interpreted as cross-file position carry.
 
 Strict analysis requires one capture session, every configured stream on its
 configured number of source connections, a ready book for every configured
@@ -2429,7 +2472,7 @@ output is an owner-only create-new file synced with its parent directory. Archiv
 the exact config, calibration, every source report, and this passing verification
 artifact together; the calibration's internal `passed` flag is insufficient.
 
-A production-candidate research manifest must use schema 5, predeclare its
+A production-candidate research manifest must use schema 6, predeclare its
 `deployment_candidate_id`, set
 `latency_calibration` to the JSON artifact, set the baseline execution
 `calibrated = true`, and embed exactly the artifact's profile. Research treats

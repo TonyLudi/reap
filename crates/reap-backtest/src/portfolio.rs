@@ -3,10 +3,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use reap_core::{FillFee, FillLiquidity, OrderUpdate, Symbol};
 use reap_strategy::InstrumentConfig;
 
+use crate::execution::BacktestInitialPortfolioConfig;
+
 #[derive(Debug, Clone)]
 pub struct Portfolio {
     instruments: BTreeMap<Symbol, InstrumentConfig>,
     positions: BTreeMap<Symbol, f64>,
+    position_avg_prices: BTreeMap<Symbol, f64>,
     inverse_cash_coin: BTreeMap<Symbol, f64>,
     cash_by_currency: BTreeMap<String, f64>,
     fee_cost_usd: f64,
@@ -26,6 +29,7 @@ impl Portfolio {
                 .map(|inst| (inst.symbol.clone(), inst.clone()))
                 .collect(),
             positions: BTreeMap::new(),
+            position_avg_prices: BTreeMap::new(),
             inverse_cash_coin: BTreeMap::new(),
             cash_by_currency: BTreeMap::new(),
             fee_cost_usd: 0.0,
@@ -36,6 +40,50 @@ impl Portfolio {
             currency_conversion_failures: 0,
             invalid_accounting_events: 0,
         }
+    }
+
+    pub fn with_initial(
+        instruments: &[InstrumentConfig],
+        initial: &BacktestInitialPortfolioConfig,
+    ) -> Self {
+        let mut portfolio = Self::new(instruments);
+        for balance in &initial.balances {
+            if let Some(symbol) = &balance.valuation_symbol {
+                portfolio.positions.insert(symbol.clone(), balance.total);
+                portfolio.position_avg_prices.insert(symbol.clone(), 0.0);
+            } else {
+                *portfolio
+                    .cash_by_currency
+                    .entry(balance.currency.clone())
+                    .or_default() += balance.total;
+            }
+        }
+        for position in &initial.positions {
+            let Some(instrument) = portfolio.instruments.get(&position.symbol) else {
+                continue;
+            };
+            portfolio
+                .positions
+                .insert(position.symbol.clone(), position.qty);
+            portfolio
+                .position_avg_prices
+                .insert(position.symbol.clone(), position.avg_price);
+            if position.qty == 0.0 {
+                continue;
+            }
+            if instrument.kind.is_inverse() {
+                portfolio.inverse_cash_coin.insert(
+                    position.symbol.clone(),
+                    position.qty * instrument.contract_value / position.avg_price,
+                );
+            } else {
+                *portfolio
+                    .cash_by_currency
+                    .entry(instrument_accounting_currency(instrument))
+                    .or_default() -= position.qty * instrument.contract_value * position.avg_price;
+            }
+        }
+        portfolio
     }
 
     pub fn apply_fill(&mut self, update: &OrderUpdate, currency_rates_usd: &HashMap<String, f64>) {
@@ -67,7 +115,7 @@ impl Portfolio {
             return;
         }
         let signed_qty = update.side.factor() * update.last_fill_qty;
-        *self.positions.entry(update.symbol.clone()).or_default() += signed_qty;
+        self.apply_position_fill(&update.symbol, signed_qty, update.last_fill_price);
 
         let notional = if kind.is_spot() {
             update.last_fill_qty * update.last_fill_price
@@ -138,6 +186,33 @@ impl Portfolio {
             self.currency_conversion_failures = self.currency_conversion_failures.saturating_add(1);
         }
         self.turnover_usd += absolute_notional * currency_rate;
+    }
+
+    fn apply_position_fill(&mut self, symbol: &str, signed_qty: f64, price: f64) {
+        let inverse = self
+            .instruments
+            .get(symbol)
+            .is_some_and(|instrument| instrument.kind.is_inverse());
+        let old_qty = self.positions.get(symbol).copied().unwrap_or(0.0);
+        let old_avg = self.position_avg_prices.get(symbol).copied().unwrap_or(0.0);
+        let new_qty = old_qty + signed_qty;
+        let new_avg = if new_qty.abs() <= f64::EPSILON {
+            0.0
+        } else if old_qty == 0.0 || old_qty.signum() == signed_qty.signum() {
+            if inverse && old_qty != 0.0 {
+                new_qty.abs() / (old_qty.abs() / old_avg + signed_qty.abs() / price)
+            } else {
+                let old_notional = old_qty.abs() * old_avg;
+                let added_notional = signed_qty.abs() * price;
+                (old_notional + added_notional) / new_qty.abs()
+            }
+        } else if signed_qty.abs() < old_qty.abs() {
+            old_avg
+        } else {
+            price
+        };
+        self.positions.insert(symbol.to_string(), new_qty);
+        self.position_avg_prices.insert(symbol.to_string(), new_avg);
     }
 
     fn apply_exact_fee(&mut self, instrument: &InstrumentConfig, symbol: &str, fee: &FillFee) {
@@ -370,6 +445,45 @@ impl Portfolio {
             .collect()
     }
 
+    pub fn position_avg_price(&self, symbol: &str) -> f64 {
+        self.position_avg_prices.get(symbol).copied().unwrap_or(0.0)
+    }
+
+    /// Reconstructs the exchange-style cash balance from the internal cost-basis ledger.
+    pub fn account_balance(&self, currency: &str) -> f64 {
+        let currency = normalize_currency(currency);
+        let mut balance = self.cash_by_currency.get(&currency).copied().unwrap_or(0.0);
+        for (symbol, qty) in &self.positions {
+            let Some(instrument) = self.instruments.get(symbol) else {
+                continue;
+            };
+            let avg_price = self.position_avg_price(symbol);
+            if instrument.kind.is_spot() {
+                if normalize_currency(&instrument.base_currency) == currency {
+                    balance += qty;
+                }
+            } else if instrument.kind.is_inverse() {
+                let settle_currency = if instrument.settle_currency.is_empty() {
+                    normalize_currency(&instrument.base_currency)
+                } else {
+                    normalize_currency(&instrument.settle_currency)
+                };
+                if settle_currency == currency {
+                    let inverse_cash = self.inverse_cash_coin.get(symbol).copied().unwrap_or(0.0);
+                    let open_basis = if *qty == 0.0 || avg_price <= 0.0 {
+                        0.0
+                    } else {
+                        qty * instrument.contract_value / avg_price
+                    };
+                    balance += inverse_cash - open_basis;
+                }
+            } else if instrument_accounting_currency(instrument) == currency {
+                balance += qty * instrument.contract_value * avg_price;
+            }
+        }
+        balance
+    }
+
     #[cfg(test)]
     pub fn missing_currency_rates(&self, currency_rates_usd: &HashMap<String, f64>) -> Vec<String> {
         let mut required = BTreeSet::new();
@@ -495,6 +609,7 @@ mod tests {
     use reap_strategy::InstrumentKindConfig;
 
     use super::*;
+    use crate::{BacktestInitialBalanceConfig, BacktestInitialPositionConfig};
 
     fn fill(symbol: &str, side: Side, qty: f64, price: f64) -> OrderUpdate {
         OrderUpdate {
@@ -534,6 +649,124 @@ mod tests {
         assert_eq!(portfolio.fee_cost_usd(), 0.2);
         assert_eq!(portfolio.exact_fee_fills(), 0);
         assert_eq!(portfolio.estimated_fee_fills(), 1);
+    }
+
+    #[test]
+    fn initial_account_snapshot_separates_capital_from_linear_and_spot_pnl() {
+        let instruments = vec![
+            InstrumentConfig {
+                symbol: "BTC-USDT".to_string(),
+                kind: InstrumentKindConfig::Spot,
+                base_currency: "BTC".to_string(),
+                quote_currency: "USDT".to_string(),
+                taker_fee: 0.0,
+                ..InstrumentConfig::default()
+            },
+            InstrumentConfig {
+                symbol: "BTC-USDT-SWAP".to_string(),
+                kind: InstrumentKindConfig::LinearSwap,
+                base_currency: "BTC".to_string(),
+                quote_currency: "USDT".to_string(),
+                settle_currency: "USDT".to_string(),
+                contract_value: 0.1,
+                taker_fee: 0.0,
+                ..InstrumentConfig::default()
+            },
+        ];
+        let initial = BacktestInitialPortfolioConfig {
+            balances: vec![
+                BacktestInitialBalanceConfig {
+                    currency: "BTC".to_string(),
+                    total: 2.0,
+                    valuation_symbol: Some("BTC-USDT".to_string()),
+                },
+                BacktestInitialBalanceConfig {
+                    currency: "USDT".to_string(),
+                    total: 10_000.0,
+                    valuation_symbol: None,
+                },
+            ],
+            positions: vec![BacktestInitialPositionConfig {
+                symbol: "BTC-USDT-SWAP".to_string(),
+                qty: 10.0,
+                avg_price: 100.0,
+                margin_mode: Some(reap_core::PositionMarginMode::Cross),
+            }],
+            ..Default::default()
+        };
+        let rates = HashMap::from([("USDT".to_string(), 1.0)]);
+        let opening_marks = HashMap::from([
+            ("BTC-USDT".to_string(), 100.0),
+            ("BTC-USDT-SWAP".to_string(), 100.0),
+        ]);
+        let final_marks = HashMap::from([
+            ("BTC-USDT".to_string(), 110.0),
+            ("BTC-USDT-SWAP".to_string(), 110.0),
+        ]);
+        let mut portfolio = Portfolio::with_initial(&instruments, &initial);
+
+        assert_eq!(portfolio.account_balance("BTC"), 2.0);
+        assert_eq!(portfolio.account_balance("USDT"), 10_000.0);
+        assert_eq!(
+            portfolio.equity_usd_checked(&opening_marks, &rates),
+            Some(10_200.0)
+        );
+        assert_eq!(
+            portfolio.equity_usd_checked(&final_marks, &rates),
+            Some(10_230.0)
+        );
+
+        portfolio.apply_fill(&fill("BTC-USDT-SWAP", Side::Sell, 10.0, 110.0), &rates);
+        assert_eq!(portfolio.positions()["BTC-USDT-SWAP"], 0.0);
+        assert_eq!(portfolio.position_avg_price("BTC-USDT-SWAP"), 0.0);
+        assert_eq!(portfolio.account_balance("USDT"), 10_010.0);
+    }
+
+    #[test]
+    fn derivative_position_average_survives_reductions_and_resets_on_flip() {
+        let instrument = InstrumentConfig {
+            symbol: "BTC-SWAP".to_string(),
+            kind: InstrumentKindConfig::LinearSwap,
+            contract_value: 1.0,
+            taker_fee: 0.0,
+            ..InstrumentConfig::default()
+        };
+        let mut portfolio = Portfolio::new(&[instrument]);
+
+        portfolio.apply_fill(&fill("BTC-SWAP", Side::Buy, 2.0, 100.0), &HashMap::new());
+        portfolio.apply_fill(&fill("BTC-SWAP", Side::Buy, 1.0, 130.0), &HashMap::new());
+        assert_eq!(portfolio.position_avg_price("BTC-SWAP"), 110.0);
+
+        portfolio.apply_fill(&fill("BTC-SWAP", Side::Sell, 1.0, 140.0), &HashMap::new());
+        assert_eq!(portfolio.position_avg_price("BTC-SWAP"), 110.0);
+
+        portfolio.apply_fill(&fill("BTC-SWAP", Side::Sell, 3.0, 150.0), &HashMap::new());
+        assert_eq!(portfolio.positions()["BTC-SWAP"], -1.0);
+        assert_eq!(portfolio.position_avg_price("BTC-SWAP"), 150.0);
+    }
+
+    #[test]
+    fn inverse_position_additions_use_harmonic_average_cost() {
+        let instrument = InstrumentConfig {
+            symbol: "BTC-USD-SWAP".to_string(),
+            kind: InstrumentKindConfig::InverseSwap,
+            contract_value: 100.0,
+            taker_fee: 0.0,
+            ..InstrumentConfig::default()
+        };
+        let mut portfolio = Portfolio::new(&[instrument]);
+
+        portfolio.apply_fill(
+            &fill("BTC-USD-SWAP", Side::Buy, 1.0, 40_000.0),
+            &HashMap::new(),
+        );
+        portfolio.apply_fill(
+            &fill("BTC-USD-SWAP", Side::Buy, 1.0, 60_000.0),
+            &HashMap::new(),
+        );
+
+        assert!((portfolio.position_avg_price("BTC-USD-SWAP") - 48_000.0).abs() < 1e-9);
+        assert!(portfolio.account_balance("USD").abs() < 1e-12);
     }
 
     #[test]

@@ -183,9 +183,17 @@ displayed-depth capacity. Explicit `[[backtest.currency_rates]]` entries map
 every named non-USD accounting currency to a direct currency/USD index and
 freshness budget. A bounded `latency_profile` can replace each scalar fallback
 with deterministic empirical samples by Java-mapped message class and symbol.
-The report embeds those assumptions, actual sampled-latency usage, the replay
-time basis, clock regressions, currency ledgers/rates, live orders, and work
-still scheduled at the capture boundary. The example delay values are zero,
+An optional `[initial_portfolio]` section supplies one complete account-style
+opening snapshot. Balances carry spot inventory through an explicit
+`valuation_symbol`; nonzero derivative positions require average cost and
+margin mode. The runner seeds the same snapshot into strategy risk state and
+the accounting ledger, blocks order entry until the first complete book/rate
+valuation, and reports both opening/final equity and net PnL. Production
+research requires positive opening capital and identical snapshots across
+candidates. The report embeds those assumptions, actual sampled-latency usage,
+the replay time basis, clock regressions, currency ledgers/rates, strategy halt
+reason, live orders, and work still scheduled at the capture boundary. The
+example delay values are zero,
 the threshold is the pinned Java default, capacity fractions are 100%, and
 `calibrated = false`; these parity defaults are not an execution-quality or
 profitability claim.
@@ -234,9 +242,11 @@ capture report must identify the same executable as research and the same host
 as the bound latency calibration, with at least one completed periodic host
 check. The smoke fixture intentionally uses
 permissive uncalibrated gates and is not
-trading evidence. Production-candidate manifests use schema 5, predeclare one
+trading evidence. Production-candidate manifests use schema 6, predeclare one
 `deployment_candidate_id`, and fail unless every fold independently selects
-that candidate from training data. They also require nonzero training/test
+that candidate from training data. Every candidate must use the same explicit
+positive opening account snapshot; run PnL is final equity minus opening equity,
+not final account capital. They also require nonzero training/test
 realized-funding-settlement gates when any candidate trades a swap and a passed
 `latency_calibration` artifact, and require the baseline's empirical latency
 profile to match that artifact exactly.
@@ -263,7 +273,7 @@ cargo run -p reap-cli -- verify-research-deployment \
 ```
 
 This command requires a production venue config, re-runs `verify-research`,
-revalidates the schema-5 candidate binding, and requires the candidate and live
+revalidates the schema-6 candidate binding, and requires the candidate and live
 config to serialize to the same effective strategy SHA-256. It does not enable
 order entry or replace transition, account, host, fault, fee, funding, statement,
 deadman, and emergency evidence.

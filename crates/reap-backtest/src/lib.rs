@@ -13,8 +13,10 @@ pub use calibration::{
 };
 use execution::BacktestLatencySampler;
 pub use execution::{
-    BacktestConfig, BacktestCurrencyRateConfig, BacktestExecutionConfig, BacktestLatencyClass,
-    BacktestLatencyProfile, BacktestLatencyRule, BacktestLatencyUsage, BacktestTimeBasis,
+    BacktestConfig, BacktestCurrencyRateConfig, BacktestExecutionConfig,
+    BacktestInitialBalanceConfig, BacktestInitialPortfolioConfig, BacktestInitialPositionConfig,
+    BacktestLatencyClass, BacktestLatencyProfile, BacktestLatencyRule, BacktestLatencyUsage,
+    BacktestTimeBasis,
 };
 use matching::MatchingAssumptions;
 pub use matching::MatchingEngine;
@@ -47,7 +49,7 @@ use crate::portfolio::{Portfolio, required_accounting_currencies};
 #[cfg(test)]
 use reap_core::FundingSettlement;
 use reap_core::{
-    AccountUpdate, FillLiquidity, MarketEvent, NormalizedEvent, OrderEvent, OrderIntent,
+    AccountUpdate, Balance, FillLiquidity, MarketEvent, NormalizedEvent, OrderEvent, OrderIntent,
     OrderUpdate, Position, StrategyEvent, Symbol,
 };
 use reap_strategy::{ChaosConfig, ChaosStrategy, Strategy};
@@ -71,6 +73,8 @@ pub struct BacktestCurrencyRateReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BacktestReport {
     pub execution: BacktestExecutionConfig,
+    #[serde(default)]
+    pub initial_portfolio: BacktestInitialPortfolioConfig,
     pub latency_usage: Vec<BacktestLatencyUsage>,
     pub time_basis: BacktestTimeBasis,
     pub input_events: u64,
@@ -84,6 +88,8 @@ pub struct BacktestReport {
     pub order_entry_ready_at_end: bool,
     #[serde(default)]
     pub new_orders_blocked_not_ready: usize,
+    #[serde(default)]
+    pub strategy_halt_reason: Option<String>,
     pub orders_sent: usize,
     pub cancel_requests: usize,
     pub deduplicated_cancel_requests: usize,
@@ -106,7 +112,15 @@ pub struct BacktestReport {
     pub final_delta_usd: f64,
     pub final_pending_delta_usd: f64,
     pub final_active_order_notional_usd: f64,
+    #[serde(default)]
+    pub opening_equity_usd: Option<f64>,
+    #[serde(default)]
+    pub opening_valuation_at_ns: Option<u64>,
+    #[serde(default)]
+    pub opening_valuation_complete: bool,
     pub final_equity_usd: f64,
+    #[serde(default)]
+    pub net_pnl_usd: Option<f64>,
     pub final_valuation_complete: bool,
     pub final_gross_exposure_usd: f64,
     pub cash_usd: f64,
@@ -114,6 +128,8 @@ pub struct BacktestReport {
     pub cash_by_currency: BTreeMap<String, f64>,
     #[serde(default)]
     pub inverse_cash_coin_by_symbol: BTreeMap<Symbol, f64>,
+    #[serde(default)]
+    pub account_balances: BTreeMap<String, f64>,
     pub fee_cost_usd: f64,
     #[serde(default)]
     pub exact_fee_fills: u64,
@@ -157,6 +173,8 @@ pub struct BacktestReport {
     pub funding_settlement_failures: u64,
     pub accounting_complete: bool,
     pub positions: BTreeMap<Symbol, f64>,
+    #[serde(default)]
+    pub position_avg_prices: BTreeMap<Symbol, f64>,
 }
 
 #[derive(Debug)]
@@ -189,6 +207,8 @@ pub struct BacktestRunner {
     strategy: ChaosStrategy,
     matchers: BTreeMap<Symbol, MatchingEngine>,
     portfolio: Portfolio,
+    initial_portfolio: BacktestInitialPortfolioConfig,
+    initial_account_snapshot_delivered: bool,
     execution: BacktestExecutionConfig,
     latency_sampler: BacktestLatencySampler,
     time_basis: BacktestTimeBasis,
@@ -228,6 +248,8 @@ pub struct BacktestRunner {
     funding_settlement_failures: u64,
     currency_rate_events: u64,
     invalid_currency_rate_events: u64,
+    opening_equity_usd: Option<f64>,
+    opening_valuation_at_ns: Option<u64>,
     peak_equity_usd: f64,
     max_drawdown_usd: f64,
     max_abs_delta_usd: f64,
@@ -250,16 +272,33 @@ impl BacktestRunner {
     }
 
     pub fn from_config(config: BacktestConfig) -> Result<Self> {
-        Self::with_execution_config(config.strategy, config.backtest)
+        Self::with_initial_portfolio_config(
+            config.strategy,
+            config.backtest,
+            config.initial_portfolio,
+        )
     }
 
     pub fn with_execution_config(
         config: ChaosConfig,
         execution: BacktestExecutionConfig,
     ) -> Result<Self> {
+        Self::with_initial_portfolio_config(
+            config,
+            execution,
+            BacktestInitialPortfolioConfig::default(),
+        )
+    }
+
+    pub fn with_initial_portfolio_config(
+        config: ChaosConfig,
+        execution: BacktestExecutionConfig,
+        initial_portfolio: BacktestInitialPortfolioConfig,
+    ) -> Result<Self> {
         execution.validate()?;
         validate_latency_profile_symbols(&execution, &config)?;
         validate_currency_rate_coverage(&execution, &config)?;
+        initial_portfolio.validate(&config.effective(), &execution)?;
         let matching_assumptions = MatchingAssumptions {
             depth_fill_conservative_threshold: execution.depth_fill_conservative_threshold,
             queue_ahead_multiplier: execution.queue_ahead_multiplier,
@@ -282,9 +321,19 @@ impl BacktestRunner {
             .iter()
             .map(|route| (route.index_symbol.clone(), route.currency.clone()))
             .collect();
+        let portfolio = Portfolio::with_initial(&config.instruments, &initial_portfolio);
+        let initial_inventory_open = portfolio
+            .positions()
+            .values()
+            .any(|quantity| *quantity != 0.0);
+        let opening_equity_usd = initial_portfolio.is_empty().then_some(0.0);
+        let opening_valuation_at_ns = initial_portfolio.is_empty().then_some(0);
+        let strategy = ChaosStrategy::new(config).context("invalid chaos/iarb2 configuration")?;
         Ok(Self {
-            portfolio: Portfolio::new(&config.instruments),
-            strategy: ChaosStrategy::new(config).context("invalid chaos/iarb2 configuration")?,
+            portfolio,
+            initial_account_snapshot_delivered: initial_portfolio.is_empty(),
+            initial_portfolio,
+            strategy,
             matchers,
             execution,
             latency_sampler,
@@ -325,6 +374,8 @@ impl BacktestRunner {
             funding_settlement_failures: 0,
             currency_rate_events: 0,
             invalid_currency_rate_events: 0,
+            opening_equity_usd,
+            opening_valuation_at_ns,
             peak_equity_usd: 0.0,
             max_drawdown_usd: 0.0,
             max_abs_delta_usd: 0.0,
@@ -336,7 +387,7 @@ impl BacktestRunner {
             inventory_open_duration_ns: 0,
             metric_clock_ns: None,
             current_abs_delta_usd: 0.0,
-            current_inventory_open: false,
+            current_inventory_open: initial_inventory_open,
             risk_metric_samples: 0,
             invalid_risk_metric_samples: 0,
         })
@@ -409,6 +460,7 @@ impl BacktestRunner {
         self.drain_before(arrival_ns)?;
         self.advance_metric_clock(arrival_ns);
         self.now_ns = arrival_ns;
+        self.deliver_initial_account_snapshot()?;
 
         match &event {
             NormalizedEvent::Market(MarketEvent::Depth(book)) => {
@@ -526,6 +578,20 @@ impl BacktestRunner {
         Ok(())
     }
 
+    fn deliver_initial_account_snapshot(&mut self) -> Result<()> {
+        if self.initial_account_snapshot_delivered {
+            return Ok(());
+        }
+        let commands = self.strategy.on_event(&StrategyEvent::Account(
+            self.initial_portfolio.account_update(time_ms(self.now_ns)),
+        ));
+        if !commands.is_empty() {
+            bail!("initial portfolio unexpectedly produced strategy order intents");
+        }
+        self.initial_account_snapshot_delivered = true;
+        Ok(())
+    }
+
     fn register_input_arrival(&mut self, candidate_ns: u64) -> u64 {
         self.input_events += 1;
         let arrival_ns = match self.last_arrival_ns {
@@ -623,6 +689,10 @@ impl BacktestRunner {
             self.funding_settlement_failures += 1;
             return;
         };
+        if self.opening_equity_usd.is_none() {
+            self.funding_settlement_failures += 1;
+            return;
+        }
         let mark = self
             .exchange_marks
             .get(&symbol)
@@ -650,6 +720,12 @@ impl BacktestRunner {
             }
 
             let account_update = if update.has_fill() {
+                if self.opening_equity_usd.is_none() {
+                    bail!(
+                        "fill for {} arrived before the configured opening portfolio could be valued",
+                        update.symbol
+                    );
+                }
                 self.fills += 1;
                 match update.last_fill_liquidity {
                     Some(FillLiquidity::Maker) => self.maker_fills += 1,
@@ -691,16 +767,37 @@ impl BacktestRunner {
             .unwrap_or(0.0);
         AccountUpdate {
             ts_ms: time_ms(self.now_ns),
-            balances: Vec::new(),
+            balances: if self.initial_portfolio.is_empty() {
+                Vec::new()
+            } else {
+                self.initial_portfolio
+                    .balances
+                    .iter()
+                    .map(|balance| {
+                        let total = self.portfolio.account_balance(&balance.currency);
+                        Balance {
+                            account_id: self.initial_portfolio.account_id.clone(),
+                            currency: balance.currency.clone(),
+                            total,
+                            available: total,
+                            equity: total,
+                            liability: 0.0,
+                            max_loan: 0.0,
+                            forced_repayment_indicator: None,
+                        }
+                    })
+                    .collect()
+            },
             positions: vec![Position {
                 symbol: update.symbol.clone(),
                 qty,
-                avg_price: if update.avg_fill_price > 0.0 {
-                    update.avg_fill_price
-                } else {
-                    update.last_fill_price
-                },
-                margin_mode: None,
+                avg_price: self.portfolio.position_avg_price(&update.symbol),
+                margin_mode: self
+                    .initial_portfolio
+                    .positions
+                    .iter()
+                    .find(|position| position.symbol == update.symbol)
+                    .and_then(|position| position.margin_mode),
             }],
             margins: Vec::new(),
         }
@@ -989,6 +1086,14 @@ impl BacktestRunner {
     }
 
     fn sample_risk_metrics(&mut self) {
+        self.current_inventory_open = self
+            .portfolio
+            .positions()
+            .values()
+            .any(|quantity| *quantity != 0.0);
+        if self.opening_equity_usd.is_none() {
+            return;
+        }
         self.risk_metric_samples = self.risk_metric_samples.saturating_add(1);
         let mut valid = true;
         let marks = self.valuation_marks();
@@ -1037,17 +1142,16 @@ impl BacktestRunner {
         } else {
             valid = false;
         }
-        self.current_inventory_open = self
-            .portfolio
-            .positions()
-            .values()
-            .any(|quantity| *quantity != 0.0);
         if !valid {
             self.invalid_risk_metric_samples = self.invalid_risk_metric_samples.saturating_add(1);
         }
     }
 
     fn order_entry_ready(&self) -> bool {
+        self.valuation_inputs_ready() && self.opening_equity_usd.is_some()
+    }
+
+    fn valuation_inputs_ready(&self) -> bool {
         self.matchers
             .values()
             .all(|matcher| matcher.depth().is_some())
@@ -1065,6 +1169,17 @@ impl BacktestRunner {
     }
 
     fn observe_order_entry_readiness(&mut self) {
+        if self.opening_equity_usd.is_none() && self.valuation_inputs_ready() {
+            let marks = self.valuation_marks();
+            let currency_rates = self.fresh_currency_rates();
+            if let Some(opening_equity_usd) =
+                self.portfolio.equity_usd_checked(&marks, &currency_rates)
+            {
+                self.opening_equity_usd = Some(opening_equity_usd);
+                self.opening_valuation_at_ns = Some(self.now_ns);
+                self.peak_equity_usd = opening_equity_usd;
+            }
+        }
         if self.order_entry_ready_at_ns.is_none() && self.order_entry_ready() {
             self.order_entry_ready_at_ns = Some(self.now_ns);
         }
@@ -1114,6 +1229,14 @@ impl BacktestRunner {
             && final_pending_delta_usd.is_finite();
         let final_equity_usd = checked_final_equity
             .unwrap_or_else(|| self.portfolio.equity_usd(&marks, &fallback_currency_rates));
+        let opening_valuation_complete = self.opening_equity_usd.is_some();
+        let net_pnl_usd = if final_valuation_complete {
+            self.opening_equity_usd
+                .zip(checked_final_equity)
+                .map(|(opening, final_equity)| final_equity - opening)
+        } else {
+            None
+        };
         let final_active_order_notional_usd = checked_final_active_order_notional
             .unwrap_or_else(|| self.active_order_notional_usd(&fallback_currency_rates));
         let final_gross_exposure_usd = checked_final_gross_exposure.unwrap_or_else(|| {
@@ -1153,6 +1276,8 @@ impl BacktestRunner {
             && self.portfolio.currency_conversion_failures() == 0
             && self.portfolio.invalid_accounting_events() == 0
             && self.invalid_risk_metric_samples == 0
+            && opening_valuation_complete
+            && net_pnl_usd.is_some()
             && final_valuation_complete;
         let order_entry_ready_at_end = self.order_entry_ready();
         let observed_duration_ns = self
@@ -1173,6 +1298,7 @@ impl BacktestRunner {
 
         Ok(BacktestReport {
             execution: self.execution.clone(),
+            initial_portfolio: self.initial_portfolio.clone(),
             latency_usage: self.latency_sampler.usage(),
             time_basis: self.time_basis,
             input_events: self.input_events,
@@ -1183,6 +1309,7 @@ impl BacktestRunner {
             order_entry_ready_at_ns: self.order_entry_ready_at_ns,
             order_entry_ready_at_end,
             new_orders_blocked_not_ready: self.new_orders_blocked_not_ready,
+            strategy_halt_reason: self.strategy.halt_reason().map(str::to_string),
             orders_sent: self.orders_sent,
             cancel_requests: self.cancel_requests,
             deduplicated_cancel_requests: self.deduplicated_cancel_requests,
@@ -1205,12 +1332,27 @@ impl BacktestRunner {
             final_delta_usd,
             final_pending_delta_usd,
             final_active_order_notional_usd,
+            opening_equity_usd: self.opening_equity_usd,
+            opening_valuation_at_ns: self.opening_valuation_at_ns,
+            opening_valuation_complete,
             final_equity_usd,
+            net_pnl_usd,
             final_valuation_complete,
             final_gross_exposure_usd,
             cash_usd: self.portfolio.cash_usd(&fallback_currency_rates),
             cash_by_currency: self.portfolio.cash_by_currency(),
             inverse_cash_coin_by_symbol: self.portfolio.inverse_cash_coin_by_symbol(),
+            account_balances: self
+                .initial_portfolio
+                .balances
+                .iter()
+                .map(|balance| {
+                    (
+                        balance.currency.clone(),
+                        self.portfolio.account_balance(&balance.currency),
+                    )
+                })
+                .collect(),
             fee_cost_usd: self.portfolio.fee_cost_usd(),
             exact_fee_fills: self.portfolio.exact_fee_fills(),
             estimated_fee_fills: self.portfolio.estimated_fee_fills(),
@@ -1248,6 +1390,12 @@ impl BacktestRunner {
                 .positions()
                 .iter()
                 .map(|(symbol, quantity)| (symbol.clone(), *quantity))
+                .collect(),
+            position_avg_prices: self
+                .portfolio
+                .positions()
+                .keys()
+                .map(|symbol| (symbol.clone(), self.portfolio.position_avg_price(symbol)))
                 .collect(),
         })
     }
@@ -1735,6 +1883,94 @@ mod tests {
         assert!(report.orders_sent > 0);
         assert_eq!(report.invalid_risk_metric_samples, 0);
         assert!(report.accounting_complete);
+    }
+
+    #[test]
+    fn configured_opening_portfolio_reports_true_net_pnl_and_strategy_balances() {
+        let initial = BacktestInitialPortfolioConfig {
+            balances: vec![
+                BacktestInitialBalanceConfig {
+                    currency: "BTC".to_string(),
+                    total: 0.002,
+                    valuation_symbol: Some("BTC-USDT".to_string()),
+                },
+                BacktestInitialBalanceConfig {
+                    currency: "USDT".to_string(),
+                    total: 1_000.0,
+                    valuation_symbol: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut runner = BacktestRunner::with_initial_portfolio_config(
+            usdt_config(),
+            usdt_execution(0, 1_000),
+            initial.clone(),
+        )
+        .unwrap();
+        let mut events = initial_books();
+        events.push(NormalizedEvent::Market(MarketEvent::IndexPrice {
+            ts_ms: 2,
+            symbol: "USDT-USD".to_string(),
+            price: 1.0,
+        }));
+        events.push(NormalizedEvent::from(MarketEvent::Depth(
+            OrderBook::one_level(
+                "BTC-USDT",
+                3,
+                Level::new(50_000.0, 2.0),
+                Level::new(50_001.0, 2.0),
+            ),
+        )));
+
+        let report = runner.run(events).unwrap();
+
+        let expected_opening = 1_000.0 + 0.002 * 50_000.5;
+        assert_eq!(report.initial_portfolio, initial);
+        assert_eq!(report.opening_valuation_at_ns, Some(2 * NS_PER_MS));
+        assert!(report.opening_valuation_complete);
+        assert!((report.opening_equity_usd.unwrap() - expected_opening).abs() < 1e-9);
+        assert!((report.final_equity_usd - expected_opening).abs() < 1e-9);
+        assert!(report.net_pnl_usd.unwrap().abs() < 1e-9);
+        assert_eq!(report.account_balances.get("BTC"), Some(&0.002));
+        assert_eq!(report.account_balances.get("USDT"), Some(&1_000.0));
+        assert_eq!(report.positions.get("BTC-USDT"), Some(&0.002));
+        assert!(report.orders_sent > 0);
+        assert!(report.accounting_complete);
+    }
+
+    #[test]
+    fn configured_opening_portfolio_keeps_order_entry_blocked_without_valuation() {
+        let initial = BacktestInitialPortfolioConfig {
+            balances: vec![
+                BacktestInitialBalanceConfig {
+                    currency: "BTC".to_string(),
+                    total: 0.01,
+                    valuation_symbol: Some("BTC-USDT".to_string()),
+                },
+                BacktestInitialBalanceConfig {
+                    currency: "USDT".to_string(),
+                    total: 1_000.0,
+                    valuation_symbol: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut runner = BacktestRunner::with_initial_portfolio_config(
+            usdt_config(),
+            usdt_execution(0, 1_000),
+            initial,
+        )
+        .unwrap();
+
+        let report = runner.run(initial_books()).unwrap();
+
+        assert_eq!(report.opening_equity_usd, None);
+        assert_eq!(report.net_pnl_usd, None);
+        assert!(!report.opening_valuation_complete);
+        assert!(!report.order_entry_ready_at_end);
+        assert_eq!(report.orders_sent, 0);
+        assert!(!report.accounting_complete);
     }
 
     #[test]

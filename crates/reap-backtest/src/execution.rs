@@ -1,8 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::{Result, bail};
 pub use reap_core::BacktestLatencyClass;
-use reap_core::Symbol;
+use reap_core::{AccountUpdate, Balance, Position, PositionMarginMode, Symbol};
 use reap_strategy::ChaosConfig;
 use serde::{Deserialize, Serialize};
 
@@ -11,7 +11,308 @@ const MAX_LATENCY_PROFILE_RULES: usize = 4_096;
 const MAX_LATENCY_SAMPLES_PER_RULE: usize = 65_536;
 const MAX_TOTAL_LATENCY_SAMPLES: usize = 1_000_000;
 const MAX_CURRENCY_RATE_ROUTES: usize = 256;
+const MAX_INITIAL_BALANCES: usize = 256;
+const MAX_INITIAL_POSITIONS: usize = 4_096;
+const MAX_INITIAL_VALUE: f64 = 1.0e18;
 const DEFAULT_CURRENCY_RATE_MAX_AGE_MS: u64 = 75_000;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BacktestInitialBalanceConfig {
+    /// Exchange account currency, for example `BTC` or `USDT`.
+    pub currency: String,
+    /// Authoritative opening cash balance. Borrowing is not modeled, so this is non-negative.
+    pub total: f64,
+    /// Spot instrument used to value this currency as inventory instead of generic cash.
+    #[serde(default)]
+    pub valuation_symbol: Option<Symbol>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BacktestInitialPositionConfig {
+    pub symbol: Symbol,
+    pub qty: f64,
+    pub avg_price: f64,
+    #[serde(default)]
+    pub margin_mode: Option<PositionMarginMode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct BacktestInitialPortfolioConfig {
+    /// One account snapshot per runner. Omit only when strategy risk groups omit account IDs.
+    pub account_id: Option<String>,
+    pub balances: Vec<BacktestInitialBalanceConfig>,
+    /// Derivative positions only. Spot inventory is supplied through `balances`.
+    pub positions: Vec<BacktestInitialPositionConfig>,
+}
+
+impl BacktestInitialPortfolioConfig {
+    pub fn is_empty(&self) -> bool {
+        self.balances.is_empty() && self.positions.is_empty()
+    }
+
+    pub fn has_positive_balance(&self) -> bool {
+        self.balances.iter().any(|balance| balance.total > 0.0)
+    }
+
+    pub fn validate(
+        &self,
+        strategy: &ChaosConfig,
+        execution: &BacktestExecutionConfig,
+    ) -> Result<()> {
+        if self.is_empty() {
+            if self.account_id.is_some() {
+                bail!("initial_portfolio.account_id requires balances or positions");
+            }
+            return Ok(());
+        }
+        validate_optional_account_id(self.account_id.as_deref())?;
+        if self.balances.len() > MAX_INITIAL_BALANCES {
+            bail!(
+                "initial_portfolio.balances has {} rows, maximum is {MAX_INITIAL_BALANCES}",
+                self.balances.len()
+            );
+        }
+        if self.positions.len() > MAX_INITIAL_POSITIONS {
+            bail!(
+                "initial_portfolio.positions has {} rows, maximum is {MAX_INITIAL_POSITIONS}",
+                self.positions.len()
+            );
+        }
+
+        let configured_account_ids = strategy
+            .risk_groups
+            .iter()
+            .filter_map(|group| group.account_id.as_deref())
+            .collect::<BTreeSet<_>>();
+        if configured_account_ids.len() > 1 {
+            bail!(
+                "initial_portfolio supports one account, but strategy risk groups reference multiple account IDs"
+            );
+        }
+        if let Some(expected) = configured_account_ids.first()
+            && self.account_id.as_deref() != Some(*expected)
+        {
+            bail!(
+                "initial_portfolio.account_id must match strategy risk-group account ID {expected:?}"
+            );
+        }
+
+        let instruments = strategy
+            .instruments
+            .iter()
+            .map(|instrument| (instrument.symbol.as_str(), instrument))
+            .collect::<HashMap<_, _>>();
+        let configured_rates = execution
+            .currency_rates
+            .iter()
+            .map(|route| route.currency.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut required_balances = BTreeSet::new();
+        for instrument in &strategy.instruments {
+            if instrument.kind.is_spot() {
+                if instrument.base_currency.is_empty() || instrument.quote_currency.is_empty() {
+                    bail!(
+                        "initial_portfolio requires non-empty base_currency and quote_currency for spot instrument {}",
+                        instrument.symbol
+                    );
+                }
+                required_balances.insert(instrument.base_currency.as_str());
+                required_balances.insert(instrument.quote_currency.as_str());
+            } else {
+                if instrument.settle_currency.is_empty() {
+                    bail!(
+                        "initial_portfolio requires non-empty settle_currency for derivative instrument {}",
+                        instrument.symbol
+                    );
+                }
+                required_balances.insert(instrument.settle_currency.as_str());
+            }
+        }
+        let mut balances = BTreeSet::new();
+        for balance in &self.balances {
+            validate_currency_name("initial_portfolio.balances currency", &balance.currency)?;
+            if !required_balances.contains(balance.currency.as_str()) {
+                bail!(
+                    "initial_portfolio balance {} is outside the configured instrument account universe",
+                    balance.currency
+                );
+            }
+            if !balance.total.is_finite()
+                || balance.total < 0.0
+                || balance.total > MAX_INITIAL_VALUE
+            {
+                bail!(
+                    "initial_portfolio balance {} total must be finite and within [0, {MAX_INITIAL_VALUE}]",
+                    balance.currency
+                );
+            }
+            if !balances.insert(balance.currency.as_str()) {
+                bail!(
+                    "initial_portfolio has duplicate balance currency {}",
+                    balance.currency
+                );
+            }
+            if let Some(symbol) = &balance.valuation_symbol {
+                let instrument = instruments.get(symbol.as_str()).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "initial_portfolio balance {} valuation_symbol {} is not a configured instrument",
+                        balance.currency,
+                        symbol
+                    )
+                })?;
+                if !instrument.kind.is_spot() || instrument.base_currency != balance.currency {
+                    bail!(
+                        "initial_portfolio balance {} valuation_symbol {} must be a spot instrument with that base currency",
+                        balance.currency,
+                        symbol
+                    );
+                }
+                if balance.total < instrument.min_position
+                    || balance.total > instrument.max_position
+                {
+                    bail!(
+                        "initial_portfolio balance {} total {} is outside {} position bounds [{}, {}]",
+                        balance.currency,
+                        balance.total,
+                        symbol,
+                        instrument.min_position,
+                        instrument.max_position
+                    );
+                }
+            } else if balance.total > 0.0 {
+                let is_spot_base = strategy.instruments.iter().any(|instrument| {
+                    instrument.kind.is_spot() && instrument.base_currency == balance.currency
+                });
+                if is_spot_base {
+                    bail!(
+                        "positive initial spot-base balance {} requires valuation_symbol to prevent inventory double counting",
+                        balance.currency
+                    );
+                }
+                if balance.currency != "USD"
+                    && !configured_rates.contains(balance.currency.as_str())
+                {
+                    bail!(
+                        "positive initial cash balance {} requires a backtest.currency_rates route",
+                        balance.currency
+                    );
+                }
+            }
+        }
+
+        let missing_balances = required_balances
+            .difference(&balances)
+            .copied()
+            .collect::<Vec<_>>();
+        if !missing_balances.is_empty() {
+            bail!(
+                "initial_portfolio requires a complete account balance snapshot; missing currencies: {}",
+                missing_balances.join(", ")
+            );
+        }
+
+        let mut position_symbols = BTreeSet::new();
+        for position in &self.positions {
+            let instrument = instruments.get(position.symbol.as_str()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "initial_portfolio position {} is not a configured instrument",
+                    position.symbol
+                )
+            })?;
+            if instrument.kind.is_spot() {
+                bail!(
+                    "initial_portfolio position {} is spot; provide spot inventory through balances",
+                    position.symbol
+                );
+            }
+            if !position_symbols.insert(position.symbol.as_str()) {
+                bail!(
+                    "initial_portfolio has duplicate position symbol {}",
+                    position.symbol
+                );
+            }
+            if !position.qty.is_finite()
+                || position.qty < instrument.min_position
+                || position.qty > instrument.max_position
+            {
+                bail!(
+                    "initial_portfolio position {} qty {} must be finite and within [{}, {}]",
+                    position.symbol,
+                    position.qty,
+                    instrument.min_position,
+                    instrument.max_position
+                );
+            }
+            if !position.avg_price.is_finite()
+                || position.avg_price < 0.0
+                || position.avg_price > MAX_INITIAL_VALUE
+                || (position.qty != 0.0 && position.avg_price == 0.0)
+            {
+                bail!(
+                    "initial_portfolio position {} avg_price must be finite, non-negative, and positive for nonzero qty",
+                    position.symbol
+                );
+            }
+            if position.qty != 0.0 && position.margin_mode.is_none() {
+                bail!(
+                    "initial_portfolio nonzero derivative position {} requires margin_mode",
+                    position.symbol
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn account_update(&self, ts_ms: u64) -> AccountUpdate {
+        AccountUpdate {
+            ts_ms,
+            balances: self
+                .balances
+                .iter()
+                .map(|balance| Balance {
+                    account_id: self.account_id.clone(),
+                    currency: balance.currency.clone(),
+                    total: balance.total,
+                    available: balance.total,
+                    equity: balance.total,
+                    liability: 0.0,
+                    max_loan: 0.0,
+                    forced_repayment_indicator: None,
+                })
+                .collect(),
+            positions: self
+                .positions
+                .iter()
+                .map(|position| Position {
+                    symbol: position.symbol.clone(),
+                    qty: position.qty,
+                    avg_price: position.avg_price,
+                    margin_mode: position.margin_mode,
+                })
+                .collect(),
+            margins: Vec::new(),
+        }
+    }
+}
+
+fn validate_optional_account_id(account_id: Option<&str>) -> Result<()> {
+    let Some(account_id) = account_id else {
+        return Ok(());
+    };
+    if account_id.is_empty()
+        || account_id.len() > 128
+        || account_id.trim() != account_id
+        || !account_id.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        bail!(
+            "initial_portfolio.account_id must be 1-128 printable ASCII characters without surrounding whitespace"
+        );
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -224,19 +525,7 @@ fn validate_currency_rates(routes: &[BacktestCurrencyRateConfig]) -> Result<()> 
     let mut currencies = BTreeSet::new();
     let mut symbols = BTreeSet::new();
     for route in routes {
-        if route.currency.is_empty()
-            || route.currency.len() > 16
-            || route.currency.trim() != route.currency
-            || !route
-                .currency
-                .bytes()
-                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
-        {
-            bail!(
-                "backtest.currency_rates currency {:?} must be 1-16 uppercase ASCII letters or digits",
-                route.currency
-            );
-        }
+        validate_currency_name("backtest.currency_rates currency", &route.currency)?;
         if route.currency == "USD" {
             bail!("backtest.currency_rates must not configure USD, which is fixed at 1");
         }
@@ -273,6 +562,19 @@ fn validate_currency_rates(routes: &[BacktestCurrencyRateConfig]) -> Result<()> 
                 route.index_symbol
             );
         }
+    }
+    Ok(())
+}
+
+fn validate_currency_name(field: &str, currency: &str) -> Result<()> {
+    if currency.is_empty()
+        || currency.len() > 16
+        || currency.trim() != currency
+        || !currency
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        bail!("{field} {currency:?} must be 1-16 uppercase ASCII letters or digits");
     }
     Ok(())
 }
@@ -484,6 +786,8 @@ pub struct BacktestConfig {
     pub strategy: ChaosConfig,
     #[serde(default)]
     pub backtest: BacktestExecutionConfig,
+    #[serde(default)]
+    pub initial_portfolio: BacktestInitialPortfolioConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -525,6 +829,129 @@ mod tests {
         assert_eq!(config.backtest.historical_trade_fill_fraction, 0.25);
         assert_eq!(config.backtest.displayed_depth_fill_fraction, 0.5);
         assert!(!config.backtest.calibrated);
+        assert!(config.initial_portfolio.is_empty());
+    }
+
+    #[test]
+    fn strategy_toml_accepts_and_validates_complete_initial_portfolio() {
+        let config: BacktestConfig = toml::from_str(
+            r#"
+                ref_symbol = "BTC-USDT"
+
+                [backtest]
+                [[backtest.currency_rates]]
+                currency = "USDT"
+                index_symbol = "USDT-USD"
+
+                [[risk_groups]]
+                name = "main"
+                account_id = "acct-1"
+                symbols = ["BTC-USDT", "BTC-USDT-SWAP"]
+
+                [[instruments]]
+                symbol = "BTC-USDT"
+                kind = "spot"
+                risk_group = "main"
+                base_currency = "BTC"
+                quote_currency = "USDT"
+                min_position = 0.0
+                max_position = 10.0
+
+                [[instruments]]
+                symbol = "BTC-USDT-SWAP"
+                kind = "linear_swap"
+                risk_group = "main"
+                base_currency = "BTC"
+                quote_currency = "USDT"
+                settle_currency = "USDT"
+                contract_value = 0.01
+                min_position = -100.0
+                max_position = 100.0
+
+                [initial_portfolio]
+                account_id = "acct-1"
+
+                [[initial_portfolio.balances]]
+                currency = "BTC"
+                total = 0.25
+                valuation_symbol = "BTC-USDT"
+
+                [[initial_portfolio.balances]]
+                currency = "USDT"
+                total = 10000.0
+
+                [[initial_portfolio.positions]]
+                symbol = "BTC-USDT-SWAP"
+                qty = -2.0
+                avg_price = 50000.0
+                margin_mode = "cross"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.initial_portfolio.account_id.as_deref(),
+            Some("acct-1")
+        );
+        assert_eq!(config.initial_portfolio.balances.len(), 2);
+        assert_eq!(config.initial_portfolio.positions.len(), 1);
+        config
+            .initial_portfolio
+            .validate(&config.strategy, &config.backtest)
+            .unwrap();
+    }
+
+    #[test]
+    fn initial_portfolio_rejects_ambiguous_or_incomplete_account_state() {
+        let mut strategy = ChaosConfig {
+            instruments: vec![reap_strategy::InstrumentConfig {
+                symbol: "BTC-USDT".to_string(),
+                kind: reap_strategy::InstrumentKindConfig::Spot,
+                base_currency: "BTC".to_string(),
+                quote_currency: "USDT".to_string(),
+                min_position: 0.0,
+                max_position: 1.0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        strategy.ref_symbol = "BTC-USDT".to_string();
+        let execution = BacktestExecutionConfig {
+            currency_rates: vec![BacktestCurrencyRateConfig {
+                currency: "USDT".to_string(),
+                index_symbol: "USDT-USD".to_string(),
+                max_age_ms: 1_000,
+            }],
+            ..Default::default()
+        };
+        let initial = BacktestInitialPortfolioConfig {
+            balances: vec![BacktestInitialBalanceConfig {
+                currency: "BTC".to_string(),
+                total: 0.1,
+                valuation_symbol: None,
+            }],
+            ..Default::default()
+        };
+
+        let error = initial
+            .validate(&strategy, &execution)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires valuation_symbol"));
+
+        let initial = BacktestInitialPortfolioConfig {
+            balances: vec![BacktestInitialBalanceConfig {
+                currency: "BTC".to_string(),
+                total: 0.0,
+                valuation_symbol: Some("BTC-USDT".to_string()),
+            }],
+            ..Default::default()
+        };
+        let error = initial
+            .validate(&strategy, &execution)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing currencies: USDT"));
     }
 
     #[test]

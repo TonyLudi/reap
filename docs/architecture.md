@@ -749,15 +749,28 @@ account summary treats `Currencies.isUsdEquivalent` at one. Java's separate
 strategy-decision parity and adds depeg-sensitive conversion only at the
 research accounting boundary.
 
-This is still research accounting, not an exchange statement. It assumes a zero
-initial portfolio. Private normalized fills can carry exact signed fee and
-currency evidence; those fees are booked in spot base/quote balances, inverse
-settlement coin, or the reported third currency as applicable. Public-data
+This is still research accounting, not an exchange statement. A candidate may
+provide one strict account-style `[initial_portfolio]`: a complete set of
+non-negative balances plus derivative quantity, average cost, and margin mode.
+Spot base balances name one valuation instrument so the ledger cannot count the
+same asset as both cash and inventory. The runner seeds that snapshot into both
+the portfolio and `ChaosStrategy` at the first replay timestamp. It blocks order
+entry until every configured book and direct currency rate can establish an
+opening valuation; a fill before that baseline aborts replay. Reports retain the
+exact snapshot, opening valuation time/equity, reconstructed ending account
+balances, arithmetic linear and harmonic inverse position averages, final
+equity, and `net_pnl_usd = final - opening`. Post-fill account events update both
+spot balances and derivative positions rather than leaving opening balances
+stale. Private normalized fills can carry exact signed fee and currency
+evidence; those fees are booked in spot base/quote balances, inverse settlement
+coin, or the reported third currency as applicable. Public-data
 matching has no account fee event, so it estimates fees from configured
 maker/taker rates. Reports expose exact and estimated fee-fill counts. The
-backtest model does not import statements, borrowing interest, liquidation,
-margin discounts, or tax, and it cannot infer a missing funding event when the
-source dataset never contained one. A separate offline production-evidence path
+opening model intentionally supports one account, treats available balance as
+total balance, and rejects negative balances because it does not model account
+holds, borrowing interest, liquidation, margin discounts, or tax. It cannot
+infer a missing funding event when the source dataset never contained one. A
+separate offline production-evidence path
 now reconstructs normal trade/funding bills and derivative close PnL from
 same-session authenticated REST position basis plus critical fills. That is
 local journal provenance, not remote process attestation. The supported live
@@ -811,19 +824,31 @@ acceptance explicit in a versioned TOML manifest:
   training and test fold aggregate must also meet a nonzero realized funding
   settlement gate.
 
-Each Rust dataset currently starts from a zero portfolio and independent
-strategy instance, which is emitted as
-`independent_zero_initial_portfolio` in the report. This differs from Java's
-daily position carry. Use one continuous capture as an evaluation dataset when
+Each Rust dataset starts from an independent strategy instance and either zero
+state (`independent_zero_initial_portfolio`) or the candidate's exact configured
+snapshot (`independent_configured_initial_portfolio`). Every candidate in one
+research run must use the same snapshot, and schema-6 production research
+requires positive opening capital. This still differs from Java's daily ending
+position carry: use one continuous capture as an evaluation dataset when
 inventory continuity matters, and constrain terminal delta/gross exposure in
-the manifest. Cross-file position carry must not be inferred from aggregate
-PnL. A schema-5 `production_candidate` manifest additionally requires one
+the manifest. Cross-file position carry must not be inferred. Aggregation now
+sums each run's opening-adjusted `net_pnl_usd`, never final account equity, and
+terminal strategy safety halts are explicit evidence failures. A schema-6
+`production_candidate` manifest additionally requires one
 predeclared deployment candidate, at least three folds, two stress scenarios,
 nonzero event, fill, and duration gates, calibrated baseline execution whose
 latency profile exactly matches a passed source-bound calibration artifact,
 complete accounting, and explicit bounds on non-funding work censored by each
 data horizon. Stress scenarios may use explicitly uncalibrated deterministic
 haircuts.
+
+The configured opening snapshot is fingerprinted research input, not an
+authenticated exchange statement. Schema 6 prevents candidate-specific capital
+and zero-start accounting, but it does not yet prove that a historical or live
+account certification had those exact balances and average costs at the dataset
+boundary. Production approval must retain that as an open provenance gate until
+the snapshot is derived from and independently bound to account evidence, or
+the evaluation uses one continuous capture whose opening state is so bound.
 
 The CLI independently verifies a schema-4 latency artifact before release use.
 It re-hashes an explicit complete set of archived live reports, reruns each
