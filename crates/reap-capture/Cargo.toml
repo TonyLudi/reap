@@ -7,6 +7,7 @@ edition.workspace = true
 reap-book.workspace = true
 reap-core.workspace = true
 reap-feed.workspace = true
+reap-telemetry.workspace = true
 reap-venue.workspace = true
 serde.workspace = true
 serde_ignored.workspace = true

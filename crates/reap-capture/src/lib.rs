@@ -10,12 +10,18 @@ use std::time::{Duration, Instant};
 
 use reap_book::BookStatus;
 use reap_core::{
-    Channel, FeedPriority, NormalizedEvent, RawEnvelope, Subscription, SystemEventKind, Venue,
+    Channel, FeedPriority, NormalizedEvent, PINNED_JAVA_REVISION, RawEnvelope, Subscription,
+    SystemEventKind, Venue,
 };
 use reap_feed::{
     ConnectionAttemptPacer, ConnectionStatus, ConnectionStatusKind, FeedOutput, FeedProcessor,
     OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS, RawCapture, ReconnectPolicy, RecoveryRequest,
     SequenceStatus, no_bootstrap, partition_subscriptions, spawn_supervised_feed,
+};
+pub use reap_telemetry::{HostGuardConfig, HostHealthSnapshot};
+use reap_telemetry::{
+    HostGuardRuntime, HostGuardStats, HostHealthError, check_host_health,
+    current_executable_sha256, host_identity_sha256, start_host_guard,
 };
 use reap_venue::{VenueAdapter, VenueError, okx::OkxAdapter};
 use serde::{Deserialize, Serialize};
@@ -30,7 +36,7 @@ use url::Url;
 pub use analysis::*;
 pub use verification::*;
 
-pub const CAPTURE_RUN_REPORT_FORMAT_VERSION: u16 = 3;
+pub const CAPTURE_RUN_REPORT_FORMAT_VERSION: u16 = 4;
 const MAX_CONNECTION_ATTEMPT_INTERVAL_MS: u64 = 60_000;
 const MAX_REPORTED_UNKNOWN_FIELDS: usize = 64;
 
@@ -42,6 +48,8 @@ pub struct CaptureConfig {
     pub runtime: CaptureRuntimeConfig,
     #[serde(default)]
     pub output: CaptureOutputConfig,
+    #[serde(default)]
+    pub host_guard: HostGuardConfig,
     pub subscriptions: Vec<CaptureSubscriptionConfig>,
 }
 
@@ -187,6 +195,15 @@ pub struct CaptureConfigFileEvidence {
 #[serde(deny_unknown_fields)]
 pub struct CaptureRunReport {
     pub format_version: u16,
+    pub reap_version: String,
+    pub java_reference_revision: String,
+    pub executable_sha256: String,
+    pub host_identity_sha256: Option<String>,
+    pub host_preflight: Option<HostHealthSnapshot>,
+    pub host_periodic_checks: u64,
+    pub host_last_snapshot: Option<HostHealthSnapshot>,
+    pub session_started_at_ms: u64,
+    pub session_completed_at_ms: u64,
     pub capture_session_id: String,
     pub config_fingerprint: String,
     #[serde(default)]
@@ -258,6 +275,14 @@ pub enum CaptureError {
     WriterJoin(#[from] tokio::task::JoinError),
     #[error("capture feed channel closed unexpectedly")]
     FeedClosed,
+    #[error("capture provenance failed: {0}")]
+    Provenance(String),
+    #[error(transparent)]
+    Host(#[from] HostHealthError),
+    #[error("capture host guard closed unexpectedly")]
+    HostGuardClosed,
+    #[error("capture host guard task failed: {0}")]
+    HostGuardJoin(tokio::task::JoinError),
 }
 
 impl CaptureConfig {
@@ -325,6 +350,7 @@ impl CaptureConfig {
     pub fn validate(&self) -> CaptureValidation {
         let mut errors = Vec::new();
         let loopback = validate_ws_url(&self.venue.public_ws_url, &mut errors);
+        errors.extend(self.host_guard.validation_errors("host_guard"));
         for (name, value) in [
             (
                 "runtime.feed_channel_capacity",
@@ -538,6 +564,27 @@ pub async fn run_capture(
             "capture duration must be positive".to_string(),
         ));
     }
+    let session_started_at_ms = unix_time_ms();
+    let executable_sha256 = current_executable_sha256().map_err(CaptureError::Provenance)?;
+    let (host_identity_sha256, host_preflight) = if config.host_guard.enabled {
+        if let Some(parent) = config
+            .output
+            .raw_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        (
+            Some(host_identity_sha256().map_err(CaptureError::Provenance)?),
+            Some(check_host_health(
+                &config.host_guard,
+                &config.output.raw_path,
+            )?),
+        )
+    } else {
+        (None, None)
+    };
 
     let subscriptions = config.subscriptions();
     let plans =
@@ -572,6 +619,11 @@ pub async fn run_capture(
         },
         None => None,
     };
+    let mut host_guard = config
+        .host_guard
+        .enabled
+        .then(|| start_host_guard(config.host_guard.clone(), config.output.raw_path.clone()));
+    let mut host_failures = host_guard.as_mut().map(HostGuardRuntime::take_failures);
     let adapter: Arc<dyn VenueAdapter> = Arc::new(OkxAdapter::new(
         &config.venue.public_ws_url,
         &config.venue.public_ws_url,
@@ -608,6 +660,7 @@ pub async fn run_capture(
         normalized_writer.as_ref(),
         &config.runtime,
         run_duration,
+        &mut host_failures,
     )
     .await;
 
@@ -627,20 +680,50 @@ pub async fn run_capture(
         Some(writer) => writer.shutdown().await,
         None => Ok(JsonlWriterStats::default()),
     };
+    let host_stats_result = match host_guard {
+        Some(host_guard) => host_guard
+            .shutdown()
+            .await
+            .map_err(CaptureError::HostGuardJoin),
+        None => Ok(HostGuardStats::default()),
+    };
+    let pending_host_failure = host_failures
+        .as_mut()
+        .and_then(|failures| failures.try_recv().ok());
+    host_failures.take();
     drain_result?;
     let stop_reason = loop_result?;
     let raw_stats = raw_stats_result?;
     let normalized_stats = normalized_stats_result?;
+    let host_stats = host_stats_result?;
+    if let Some(error) = pending_host_failure {
+        return Err(error.into());
+    }
+    let run_elapsed_ms = elapsed_ms(&started);
+    let session_completed_at_ms = unix_time_ms();
     Ok(state.report(
-        stop_reason,
-        elapsed_ms(&started),
+        CaptureRunTiming {
+            stop_reason,
+            elapsed_ms: run_elapsed_ms,
+            completed_at_ms: session_completed_at_ms,
+        },
         &config,
         CaptureRunProvenance {
             config_fingerprint,
             config_source,
+            executable_sha256,
+            host_identity_sha256,
+            host_preflight,
+            session_started_at_ms,
         },
-        raw_stats,
-        normalized_stats,
+        CaptureHostEvidence {
+            periodic_checks: host_stats.checks,
+            last_snapshot: host_stats.last_snapshot,
+        },
+        CaptureWriterEvidence {
+            raw: raw_stats,
+            normalized: normalized_stats,
+        },
     ))
 }
 
@@ -687,6 +770,7 @@ async fn run_capture_loop(
     normalized_writer: Option<&JsonlWriter<NormalizedEvent>>,
     runtime: &CaptureRuntimeConfig,
     run_duration: Option<Duration>,
+    host_failures: &mut Option<mpsc::Receiver<HostHealthError>>,
 ) -> Result<CaptureStopReason, CaptureError> {
     let mut health = tokio::time::interval(Duration::from_millis(runtime.health_interval_ms));
     health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -708,6 +792,10 @@ async fn run_capture_loop(
             }
             _ = &mut duration_elapsed => {
                 return Ok(CaptureStopReason::DurationElapsed);
+            }
+            failure = receive_host_failure(host_failures) => {
+                let failure = failure.ok_or(CaptureError::HostGuardClosed)?;
+                return Err(failure.into());
             }
             status = status_rx.recv() => {
                 let status = status.ok_or(CaptureError::FeedClosed)?;
@@ -751,6 +839,15 @@ async fn run_capture_loop(
     }
 }
 
+async fn receive_host_failure(
+    failures: &mut Option<mpsc::Receiver<HostHealthError>>,
+) -> Option<HostHealthError> {
+    match failures {
+        Some(failures) => failures.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 struct CaptureState {
     processor: FeedProcessor,
     capture_session_id: String,
@@ -768,6 +865,26 @@ struct CaptureState {
 struct CaptureRunProvenance {
     config_fingerprint: String,
     config_source: Option<CaptureConfigFileEvidence>,
+    executable_sha256: String,
+    host_identity_sha256: Option<String>,
+    host_preflight: Option<HostHealthSnapshot>,
+    session_started_at_ms: u64,
+}
+
+struct CaptureHostEvidence {
+    periodic_checks: u64,
+    last_snapshot: Option<HostHealthSnapshot>,
+}
+
+struct CaptureRunTiming {
+    stop_reason: CaptureStopReason,
+    elapsed_ms: u64,
+    completed_at_ms: u64,
+}
+
+struct CaptureWriterEvidence {
+    raw: JsonlWriterStats,
+    normalized: JsonlWriterStats,
 }
 
 impl CaptureState {
@@ -856,13 +973,14 @@ impl CaptureState {
 
     fn report(
         &self,
-        stop_reason: CaptureStopReason,
-        elapsed_ms: u64,
+        timing: CaptureRunTiming,
         config: &CaptureConfig,
         provenance: CaptureRunProvenance,
-        raw: JsonlWriterStats,
-        normalized: JsonlWriterStats,
+        host: CaptureHostEvidence,
+        writers: CaptureWriterEvidence,
     ) -> CaptureRunReport {
+        let raw = writers.raw;
+        let normalized = writers.normalized;
         let processor = self.processor.stats();
         let stream_health = self.processor.stream_health();
         let stream_health = stream_health
@@ -910,7 +1028,7 @@ impl CaptureState {
             })
             .collect::<Vec<_>>();
         let all_connections_ready = self.expected_connections.is_subset(&self.ready_connections);
-        let clean_capture = stop_reason == CaptureStopReason::DurationElapsed
+        let clean_capture = timing.stop_reason == CaptureStopReason::DurationElapsed
             && self.reached_all_connections_ready
             && all_connections_ready
             && all_books_ready
@@ -921,15 +1039,25 @@ impl CaptureState {
             && self.recovery_requests == 0
             && self.missing_recovery_routes == 0
             && processor.gaps == 0
-            && processor.recovery_failures == 0;
+            && processor.recovery_failures == 0
+            && capture_host_evidence_is_healthy(config, &provenance, &host, timing.completed_at_ms);
 
         CaptureRunReport {
             format_version: CAPTURE_RUN_REPORT_FORMAT_VERSION,
+            reap_version: env!("CARGO_PKG_VERSION").to_string(),
+            java_reference_revision: PINNED_JAVA_REVISION.to_string(),
+            executable_sha256: provenance.executable_sha256,
+            host_identity_sha256: provenance.host_identity_sha256,
+            host_preflight: provenance.host_preflight,
+            host_periodic_checks: host.periodic_checks,
+            host_last_snapshot: host.last_snapshot,
+            session_started_at_ms: provenance.session_started_at_ms,
+            session_completed_at_ms: timing.completed_at_ms,
             capture_session_id: self.capture_session_id.clone(),
             config_fingerprint: provenance.config_fingerprint,
             config_source: provenance.config_source,
-            stop_reason,
-            elapsed_ms,
+            stop_reason: timing.stop_reason,
+            elapsed_ms: timing.elapsed_ms,
             raw_path: config.output.raw_path.clone(),
             normalized_path: config.output.normalized_path.clone(),
             raw_records: raw.records,
@@ -964,6 +1092,63 @@ impl CaptureState {
             clean_capture,
         }
     }
+}
+
+fn capture_host_evidence_is_healthy(
+    config: &CaptureConfig,
+    provenance: &CaptureRunProvenance,
+    host: &CaptureHostEvidence,
+    session_completed_at_ms: u64,
+) -> bool {
+    if !is_lower_sha256(&provenance.executable_sha256)
+        || provenance.session_started_at_ms == 0
+        || provenance.session_started_at_ms > session_completed_at_ms
+    {
+        return false;
+    }
+    if !config.host_guard.enabled {
+        return provenance.host_identity_sha256.is_none()
+            && provenance.host_preflight.is_none()
+            && host.periodic_checks == 0
+            && host.last_snapshot.is_none();
+    }
+
+    let Some(identity) = provenance.host_identity_sha256.as_deref() else {
+        return false;
+    };
+    let Some(preflight) = provenance.host_preflight.as_ref() else {
+        return false;
+    };
+    if !is_lower_sha256(identity)
+        || preflight.checked_at_ms < provenance.session_started_at_ms
+        || preflight.checked_at_ms > session_completed_at_ms
+        || !host_snapshot_is_healthy(preflight, &config.host_guard)
+    {
+        return false;
+    }
+    match (host.periodic_checks, host.last_snapshot.as_ref()) {
+        (0, None) => true,
+        (0, Some(_)) | (1.., None) => false,
+        (_, Some(last)) => {
+            last.checked_at_ms >= preflight.checked_at_ms
+                && last.checked_at_ms <= session_completed_at_ms
+                && host_snapshot_is_healthy(last, &config.host_guard)
+        }
+    }
+}
+
+fn host_snapshot_is_healthy(snapshot: &HostHealthSnapshot, config: &HostGuardConfig) -> bool {
+    snapshot.checked_at_ms > 0
+        && snapshot.disk_available_bytes >= config.min_disk_available_bytes
+        && snapshot.memory_available_bytes >= config.min_memory_available_bytes
+        && (!config.require_clock_synchronized || snapshot.clock_synchronized)
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn raw_capture(envelope: &RawEnvelope, capture_session_id: &str) -> RawCapture {
@@ -1201,6 +1386,7 @@ mod tests {
             venue: CaptureVenueConfig::default(),
             runtime: CaptureRuntimeConfig::default(),
             output: CaptureOutputConfig::default(),
+            host_guard: HostGuardConfig::default(),
             subscriptions: vec![
                 CaptureSubscriptionConfig {
                     channel: "orders".to_string(),
@@ -1244,6 +1430,7 @@ mod tests {
             venue: CaptureVenueConfig::default(),
             runtime: CaptureRuntimeConfig::default(),
             output: CaptureOutputConfig::default(),
+            host_guard: HostGuardConfig::default(),
             subscriptions: vec![
                 CaptureSubscriptionConfig {
                     channel: "books".to_string(),
@@ -1298,6 +1485,60 @@ mod tests {
     }
 
     #[test]
+    fn guarded_capture_evidence_is_bound_to_session_time_and_thresholds() {
+        let mut config =
+            CaptureConfig::from_toml(include_str!("../../../examples/capture-okx-public.toml"))
+                .unwrap();
+        config.host_guard.min_disk_available_bytes = 10;
+        config.host_guard.min_memory_available_bytes = 20;
+        let provenance = CaptureRunProvenance {
+            config_fingerprint: "f".repeat(64),
+            config_source: None,
+            executable_sha256: "e".repeat(64),
+            host_identity_sha256: Some("9".repeat(64)),
+            host_preflight: Some(HostHealthSnapshot {
+                checked_at_ms: 10,
+                disk_available_bytes: 10,
+                memory_available_bytes: 20,
+                clock_synchronized: true,
+            }),
+            session_started_at_ms: 9,
+        };
+        let healthy = CaptureHostEvidence {
+            periodic_checks: 1,
+            last_snapshot: Some(HostHealthSnapshot {
+                checked_at_ms: 11,
+                disk_available_bytes: 10,
+                memory_available_bytes: 20,
+                clock_synchronized: true,
+            }),
+        };
+
+        assert!(capture_host_evidence_is_healthy(
+            &config,
+            &provenance,
+            &healthy,
+            12,
+        ));
+
+        let late = CaptureHostEvidence {
+            periodic_checks: 1,
+            last_snapshot: Some(HostHealthSnapshot {
+                checked_at_ms: 13,
+                disk_available_bytes: 10,
+                memory_available_bytes: 20,
+                clock_synchronized: true,
+            }),
+        };
+        assert!(!capture_host_evidence_is_healthy(
+            &config,
+            &provenance,
+            &late,
+            12,
+        ));
+    }
+
+    #[test]
     fn capture_parser_rejects_unknown_fields_at_every_config_layer() {
         let config =
             CaptureConfig::from_toml(include_str!("../../../examples/capture-okx-public.toml"))
@@ -1319,6 +1560,10 @@ mod tests {
             .as_table_mut()
             .unwrap()
             .insert("fsync_typo".to_string(), toml::Value::Boolean(true));
+        document["host_guard"]
+            .as_table_mut()
+            .unwrap()
+            .insert("guard_typo".to_string(), toml::Value::Boolean(true));
         document["subscriptions"].as_array_mut().unwrap()[0]
             .as_table_mut()
             .unwrap()
@@ -1333,6 +1578,7 @@ mod tests {
             "websocket_typo",
             "pacing_typo",
             "fsync_typo",
+            "guard_typo",
             "channel_typo",
         ] {
             assert!(error.contains(field), "missing {field:?} in {error}");
@@ -1345,6 +1591,7 @@ mod tests {
             venue: CaptureVenueConfig::default(),
             runtime: CaptureRuntimeConfig::default(),
             output: CaptureOutputConfig::default(),
+            host_guard: HostGuardConfig::default(),
             subscriptions: vec![
                 CaptureSubscriptionConfig {
                     channel: "books".to_string(),
@@ -1379,20 +1626,33 @@ mod tests {
         }
 
         let report = state.report(
-            CaptureStopReason::DurationElapsed,
-            1,
+            CaptureRunTiming {
+                stop_reason: CaptureStopReason::DurationElapsed,
+                elapsed_ms: 1,
+                completed_at_ms: 2,
+            },
             &config,
             CaptureRunProvenance {
                 config_fingerprint: config.fingerprint().unwrap(),
                 config_source: None,
+                executable_sha256: "0".repeat(64),
+                host_identity_sha256: None,
+                host_preflight: None,
+                session_started_at_ms: 1,
             },
-            JsonlWriterStats {
-                records: 1,
-                bytes: 1,
-                max_queue_depth: 1,
-                sha256: "0".repeat(64),
+            CaptureHostEvidence {
+                periodic_checks: 0,
+                last_snapshot: None,
             },
-            JsonlWriterStats::default(),
+            CaptureWriterEvidence {
+                raw: JsonlWriterStats {
+                    records: 1,
+                    bytes: 1,
+                    max_queue_depth: 1,
+                    sha256: "0".repeat(64),
+                },
+                normalized: JsonlWriterStats::default(),
+            },
         );
 
         assert!(!report.clean_capture);
@@ -1432,6 +1692,37 @@ mod tests {
         assert_eq!(stats.sha256, sha256_hex(text.as_bytes()));
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn host_preflight_fails_before_capture_output_or_network_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let raw_path = directory.path().join("new").join("raw.jsonl");
+        let mut config =
+            CaptureConfig::from_toml(include_str!("../../../examples/capture-okx-public.toml"))
+                .unwrap();
+        config.output.raw_path = raw_path.clone();
+        config.host_guard.min_disk_available_bytes = u64::MAX;
+        config.host_guard.min_memory_available_bytes = u64::MAX;
+        config.host_guard.require_clock_synchronized = false;
+
+        let error = run_capture(
+            config,
+            CaptureRunOptions {
+                run_duration: Some(Duration::from_millis(1)),
+                config_source: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CaptureError::Host(HostHealthError::Unhealthy { code, .. })
+                if code.contains("disk_low") && code.contains("memory_low")
+        ));
+        assert!(!raw_path.exists());
+    }
+
     #[tokio::test]
     async fn capture_refuses_to_append_a_second_process_session() {
         let directory = tempfile::tempdir().unwrap();
@@ -1444,6 +1735,7 @@ mod tests {
                 raw_path: path.clone(),
                 ..CaptureOutputConfig::default()
             },
+            host_guard: HostGuardConfig::default(),
             subscriptions: vec![CaptureSubscriptionConfig {
                 channel: "books".to_string(),
                 symbol: "BTC-USDT".to_string(),
@@ -1487,6 +1779,7 @@ mod tests {
                 normalized_path: Some(normalized_path.clone()),
                 ..CaptureOutputConfig::default()
             },
+            host_guard: HostGuardConfig::default(),
             subscriptions: vec![CaptureSubscriptionConfig {
                 channel: "books".to_string(),
                 symbol: "BTC-USDT".to_string(),

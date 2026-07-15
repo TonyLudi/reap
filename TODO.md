@@ -112,6 +112,11 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Reserve and fsync a versioned capture run report, bind exact config bytes
   plus effective CLI overrides, and independently verify raw and reconstructed
   normalized artifacts; exercise the gate on a fresh public capture.
+- [x] Upgrade capture evidence to schema 4 with exact Reap build, pinned Java
+  revision, pseudonymous host identity, and Linux disk/memory/clock preflight and
+  periodic enforcement. Bind production research to the same binary and
+  latency-calibrated host, and make the systemd collector bounded and
+  create-new-report strict.
 - [x] Add a deterministic Java-referenced backtest scheduler with receive-time
   raw replay, explicit market/new/cancel/order/account delays, immediate
   `PendingNew` registration, and end-of-horizon execution provenance.
@@ -338,7 +343,7 @@ architecture in [docs/architecture.md](docs/architecture.md).
   unobservable. Margin
   spot is unsupported and would require a borrow-interest model before
   enablement.
-- [x] Require a verified schema-3 capture run report for every
+- [x] Require a verified schema-4 capture run report for every
   production-candidate raw dataset, bind optional normalized output, embed the
   verification result, and recheck all artifact hashes after research runs.
 - [ ] Deploy and exercise the webhook/host guards, systemd supervision, external

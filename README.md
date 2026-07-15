@@ -93,7 +93,8 @@ Implemented:
 - CSV/normalized replay, raw-capture validation, configuration validation, and
   a release-mode hot-path benchmark.
 - Credential-free public OKX capture with redundant websocket plans, raw-frame
-  durability, a create-new run report, exact file/config provenance,
+  durability, fail-closed Linux disk/memory/clock checks, a create-new run
+  report bound to the exact binary, host, pinned Java revision, and config,
   report-aware raw/normalized verification, bounded-memory capture analysis,
   normalized diagnostic output, and direct raw-capture backtests.
 
@@ -140,6 +141,12 @@ evidence. Production datasets must be continuous across exchange funding
 boundaries. Schema-5 production research with swap candidates requires nonzero
 realized funding settlements in both training and test aggregates, so short
 captures cannot pass by carrying only forecasts.
+
+The example enables the Linux host guard. It fails before opening outputs or
+websockets when disk, available memory, or kernel clock synchronization is
+unhealthy, and stops on a failed periodic check. Disable it only in a copied
+non-production diagnostic config; production-candidate research rejects
+unguarded captures.
 
 Validate and backtest the raw capture directly. Raw replay runs the same OKX
 adapter, redundant-feed deduplicator, sequence tracker, and book reducer used
@@ -218,9 +225,12 @@ position and active-order exposure, inventory duration, fee/funding accounting,
 and pending-work gates. Manifest, executable, candidate, dataset, capture
 configuration, capture-report, and optional normalized-artifact hashes are
 verified again after all runs. Production raw datasets must pass the embedded
-schema-3 run-report verifier, capture-config-bound source analysis, and an
+schema-4 run-report verifier, capture-config-bound source analysis, and an
 independent zero-gap replay-integrity check before any candidate executes. The
-smoke fixture intentionally uses permissive uncalibrated gates and is not
+capture report must identify the same executable as research and the same host
+as the bound latency calibration, with at least one completed periodic host
+check. The smoke fixture intentionally uses
+permissive uncalibrated gates and is not
 trading evidence. Production-candidate manifests use schema 5, predeclare one
 `deployment_candidate_id`, and fail unless every fold independently selects
 that candidate from training data. They also require nonzero training/test

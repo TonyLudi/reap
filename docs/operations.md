@@ -31,6 +31,23 @@ The optional
 `output.normalized_path` is intended for short diagnostics because full
 400-level snapshots are much larger than raw deltas.
 
+The checked-in config enables the Linux host guard. Capture creates the raw
+parent directory, then checks that filesystem capacity, `MemAvailable`, and
+kernel clock synchronization before opening an output file or websocket. It
+repeats the check outside the feed loop and exits non-zero on any breach. The
+configured thresholds must leave room for the full bounded run and shutdown,
+not only the next flush; enabled check intervals are capped at 60 seconds. A
+copied local diagnostic config may disable the guard; production-candidate
+research rejects that evidence.
+
+At pinned `imm-strategy` revision
+`b6b120c7b7c466d8431bf082f3229328c5d7b2ae`,
+`AbstractOkxNitroL2Subscriber` owns the Java order-book websocket lifecycle and
+its `onSocketDisconnected` path participates in reconnect handling. The Java
+collector does not provide this Rust run-report, executable/host provenance, or
+host guard. Those controls harden the Java-referenced connectivity boundary;
+they are not a parity claim.
+
 `runtime.connection_attempt_interval_ms` defaults to 400 ms and is shared by
 all socket supervisors in the process, including reconnect and recovery
 attempts; live processes include authenticated order-command sessions in the
@@ -68,20 +85,27 @@ and [checksum deprecation announcement](https://www.okx.com/en-us/help/okx-order
 `clean_capture` requires a bounded duration, all socket plans ready at least
 once and at stop, a ready contiguous snapshot for every configured book,
 non-empty raw output, and zero parse, gap, stale-book, recovery-request,
-recovery-route, or recovery-failure counts. A redundant-socket disconnect can
+recovery-route, or recovery-failure counts. It also requires host evidence to
+match the configured guard, including a healthy preflight and every completed
+periodic check. A redundant-socket disconnect can
 remain clean only when the other replica preserves sequence continuity;
 inspect disconnect, duplicate, and writer queue counts on every run.
 
-The versioned run report includes the exact source-config byte count/SHA-256,
-effective config fingerprint after CLI output overrides, and byte count/SHA-256
-for every writer. Capture files are data-synced and their directory entries are
-synced before the report is emitted. Archive the report with the config and
-capture manifest.
+The schema-4 run report includes the Reap version, pinned Java revision, exact
+capture-executable SHA-256, pseudonymous host identity when guarded, host
+preflight/periodic evidence within explicit session wall-clock bounds, exact
+source-config byte count/SHA-256, effective
+config fingerprint after CLI output overrides, and byte count/SHA-256 for every
+writer. Capture files are data-synced and their directory entries are synced
+before the report is emitted. Archive the report with the config and capture
+manifest.
 
 `verify-capture` reconstructs the report's effective path overrides while
 allowing artifacts to be relocated. It requires the supplied config's exact
 bytes and effective fingerprint, raw session/counters/bytes/hash, replay-derived
-book and integrity state, and the report's clean flag to agree. When normalized
+book and integrity state, build/Java/host evidence shape, and the report's clean
+flag to agree. Production research additionally binds the reported executable
+to its own binary and the reported host to latency calibration. When normalized
 output was enabled, pass `--normalized-events`; verification replays the raw
 frames and requires the normalized record count, bytes, and SHA-256 to match the
 independently reconstructed JSONL exactly. `analyze-capture` remains a standalone
@@ -552,13 +576,15 @@ For real research, create a new manifest alongside immutable capture files:
 3. Give every capture a unique dataset ID/path/content hash. Every test window
    must occur strictly after its fold's training windows, and a test dataset can
    belong to only one fold. Set each raw dataset's `capture_config` and
-   `capture_report` to the exact capture-only TOML and schema-3 report from that
+   `capture_report` to the exact capture-only TOML and schema-4 report from that
    session. When the report declares normalized output, also set
    `normalized_path` to that retained artifact. Production mode verifies and
    embeds the report, reruns and retains strict capture analysis, and performs a
    zero-gap raw replay check before candidate evaluation. It also requires at
-   least two connections per stream and the book/trade/index/mark/limit/funding
-   channels needed by every candidate.
+   least two connections per stream, an enabled host guard with at least one
+   completed periodic check, the same executable as research, the same target
+   host as latency calibration, and the
+   book/trade/index/mark/limit/funding channels needed by every candidate.
 4. Define exactly one baseline using empirically calibrated execution values,
    set `calibrated = true`, and add at least two stress scenarios. Profile stress
    uses the same seed and must first-order stochastically dominate baseline for
@@ -757,6 +783,8 @@ complete accounting with no input-clock regression or fill. Diagnostic
 normalized replay reported 221 global cross-stream exchange-time regressions,
 including one of 41.937 seconds, despite monotonic per-source receive time. This
 is direct evidence for keeping raw receive-time replay authoritative.
+That historical schema-3 smoke predates binary/host guard provenance and is not
+admissible to the current schema-4 production-candidate gate.
 
 These are connectivity, integrity, and replay-plumbing evidence only. They are
 not a sustained full-depth dataset, execution-model calibration, profitability
@@ -1107,8 +1135,9 @@ settings; accepting only their static flags would weaken live stop behavior.
   compatibility even though checkpoint recovery remains valid.
 - Set `[host_guard].enabled = true` for deployment. Choose disk and memory
   thresholds above the amount needed for a full fault/reconciliation window,
-  not merely enough for the next flush. A failed preflight prevents credential
-  reads and network startup; a failed periodic check is a fatal runtime event.
+  not merely enough for the next flush. Enabled intervals are capped at 60
+  seconds. A failed preflight prevents credential reads and network startup; a
+  failed periodic check is a fatal runtime event.
 - The host clock check reads Linux kernel synchronization state. It complements,
   rather than replaces, the independent midpoint-adjusted OKX server-time
   checks. The deployment supervisor must still monitor the actual NTP/PTP
@@ -1132,9 +1161,11 @@ offline security exposure at `4.0`; the checked-in units currently score `2.9`.
   submit or cancel. A start limit bounds repeated bootstrap failures.
 - `reap-demo@.service` never restarts automatically. Any abnormal exit requires
   independent exchange reconciliation and operator approval first.
-- `reap-capture@.service` never restarts automatically. Rotate to a new raw
-  output path before every start so a file cannot contain multiple capture
-  session IDs.
+- `reap-capture@.service` never restarts automatically. Its instance environment
+  contains only `REAP_CAPTURE_DURATION_SECS`; the command always requests a
+  bounded clean capture and create-new `run-report.json`. Use a new instance
+  directory, config, raw path, and report path for every run so no artifact can
+  contain multiple capture session IDs or overwrite prior evidence.
 - Set `TimeoutStopSec` above the configured runtime shutdown plus alert-drain
   deadlines. A forced kill leaves the last exchange deadman in force but must be
   treated as an incident, followed by the emergency procedure below.

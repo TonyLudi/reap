@@ -19,7 +19,7 @@ production trading process.
 | Startup/restart gate | Executable phase state, engine-consumed account-snapshot invariant, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, durable latch restore, authoritative account repair, second-pass clean REST reconciliation, and read-only journal-bound deadman-expiry certification | Needs process-kill demo evidence; tooling alone is not evidence |
 | Event-loop profile | Allocation-aware raw OKX parity benchmark covers redundant wire input through strategy/risk and storage-record construction | Needs target-host capture and exchange-latency validation |
 | Operator control and alerts | HMAC-authenticated local controls use fsynced write-ahead latches; OKX Cancel All After is maintained independently; a separate CLI can arm the deadman, cancel all regular orders account-wide, and prove post-trigger zero with offline exact-config verification; another read-only CLI can prove source `20` after controlled process death | Must exercise target alert routing, deadman expiry, and the independent cancel procedure; algo/spread orders remain outside their scope |
-| Process/host controls | Canonical journal ownership is exclusively locked before recovery or network setup; optional Linux disk, memory, and kernel-clock checks run at preflight and periodically; hardened systemd templates encode mode-specific restart policy | Must be installed, enabled, thresholded, monitored, and fault-tested on the target host |
+| Process/host controls | Canonical journal ownership is exclusively locked before recovery or network setup; live and public capture share Linux disk, memory, and kernel-clock preflight/periodic checks; capture schema 4 binds binary/host evidence; hardened systemd templates encode mode-specific restart policy and bounded evidence capture | Must be installed, enabled, thresholded, monitored, and fault-tested on the target host |
 | Demo fault injection | A loopback-only proxy independently routes OKX demo REST, public, private-state, and order-command traffic; strict owner-local commands inject disconnects, matched frame drops, and matched REST responses; create-new injector/run artifacts bind proxy config and pinned Java provenance, and the live fault matrix validates supported typed roles | Tooling is implemented and credential-free forwarding smokes passed, but no credentialed isolated campaign or target-host acceptance evidence exists |
 | Build/supply chain | Rust `1.95.0` is pinned; least-privilege CI checks formatting, all-target lint, all workspace tests, a locked release build, and RustSec advisories; Cargo and Actions updates are proposed weekly | CI must remain green and dependency updates reviewed, but this does not replace credentialed exchange or target-host evidence |
 | Exchange certification | Point-in-time account certification, journal-bound process-death deadman replay, exact fill/bill collection, and offline normal-trade/funding economics are implemented, but no passing target-account artifact, OKX demo soak, economic artifact, deadman artifact, or broader fault campaign is recorded | Production blocker |
@@ -104,7 +104,8 @@ production trading process.
     schema-3 run durably bound the exact config file and effective CLI overrides;
     report-aware verification matched raw and independently reconstructed
     normalized bytes/counters/hashes with no failure. This does not replace
-    sustained capture, execution calibration, or credentialed evidence.
+    sustained capture, execution calibration, or credentialed evidence, and the
+    historical schema-3 artifact is not accepted by the current schema-4 gate.
 16. Live risk subscribes to configured stablecoin/USD indexes on redundant
     critical routes. Missing, stale, invalid, conflicting, or downside-depegged
     data blocks entry immediately; a sustained 5-second failure persists a
@@ -208,10 +209,12 @@ production trading process.
     manifest/binary/config/effective-strategy/data fingerprints plus embedded
     selection and gate policy, accounting, drawdown, position/pending delta,
     gross position/active-order exposure, inventory-duration, and pending-work
-    results. Production raw inputs must also pass an embedded schema-3 capture
+    results. Production raw inputs must also pass an embedded schema-4 capture
     report verification that binds exact config/raw/optional-normalized evidence,
-    capture-config-bound multi-source/candidate-channel analysis, and an
-    independent zero-gap replay check before selection. Schema 5 additionally
+    capture binary, latency-calibrated target host, pinned Java revision, and
+    healthy host-guard evidence, plus capture-config-bound multi-source and
+    candidate-channel analysis and an independent zero-gap replay check before
+    selection. Schema 5 additionally
     requires one predeclared deployment candidate to win training-only selection
     in every fold, preventing a passing report from representing different live
     strategies across windows. A format-2 independent reconstruction exposes

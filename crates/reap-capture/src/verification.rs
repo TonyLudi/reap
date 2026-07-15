@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use reap_core::NormalizedEvent;
+use reap_core::{NormalizedEvent, PINNED_JAVA_REVISION};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -14,7 +14,7 @@ use crate::{
     is_book_channel, sha256_hex,
 };
 
-pub const CAPTURE_VERIFICATION_FORMAT_VERSION: u16 = 1;
+pub const CAPTURE_VERIFICATION_FORMAT_VERSION: u16 = 2;
 pub const MAX_CAPTURE_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_CAPTURE_RUN_REPORT_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -110,6 +110,13 @@ pub enum CaptureVerificationFailure {
 #[serde(deny_unknown_fields)]
 pub struct CaptureVerificationReport {
     pub format_version: u16,
+    pub reap_version: String,
+    pub java_reference_revision: String,
+    pub executable_sha256: String,
+    pub host_identity_sha256: Option<String>,
+    pub host_periodic_checks: u64,
+    pub session_started_at_ms: u64,
+    pub session_completed_at_ms: u64,
     pub capture_session_id: String,
     pub run_report: CaptureRunReportEvidence,
     pub config: CaptureConfigEvidence,
@@ -435,6 +442,13 @@ pub fn verify_capture_paths(
         && normalized.as_ref().is_none_or(|evidence| evidence.passed);
     Ok(CaptureVerificationReport {
         format_version: CAPTURE_VERIFICATION_FORMAT_VERSION,
+        reap_version: run_report.reap_version.clone(),
+        java_reference_revision: run_report.java_reference_revision.clone(),
+        executable_sha256: run_report.executable_sha256.clone(),
+        host_identity_sha256: run_report.host_identity_sha256.clone(),
+        host_periodic_checks: run_report.host_periodic_checks,
+        session_started_at_ms: run_report.session_started_at_ms,
+        session_completed_at_ms: run_report.session_completed_at_ms,
         capture_session_id: run_report.capture_session_id,
         run_report: run_report_evidence,
         config: config_evidence,
@@ -507,6 +521,27 @@ fn book_health_matches(
 
 fn run_report_invariant_failures(report: &CaptureRunReport, config: &CaptureConfig) -> Vec<String> {
     let mut failures = Vec::new();
+    if report.reap_version != env!("CARGO_PKG_VERSION") {
+        failures.push(format!(
+            "reap_version {} does not match verifier version {}",
+            report.reap_version,
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+    if report.java_reference_revision != PINNED_JAVA_REVISION {
+        failures.push(format!(
+            "java_reference_revision does not match pinned revision {PINNED_JAVA_REVISION}"
+        ));
+    }
+    if !is_sha256(&report.executable_sha256) {
+        failures.push("executable_sha256 is not lowercase SHA-256".to_string());
+    }
+    if !session_bounds_are_valid(report) {
+        failures.push("capture session wall-clock bounds are invalid".to_string());
+    }
+    if !host_evidence_is_healthy(report, config) {
+        failures.push("host evidence does not match the configured host guard".to_string());
+    }
     if report.capture_session_id.trim().is_empty() {
         failures.push("capture_session_id is empty".to_string());
     }
@@ -594,6 +629,57 @@ fn derive_clean_capture(
         && report.missing_recovery_routes == 0
         && report.gaps == 0
         && report.recovery_failures == 0
+        && session_bounds_are_valid(report)
+        && host_evidence_is_healthy(report, config)
+}
+
+fn session_bounds_are_valid(report: &CaptureRunReport) -> bool {
+    report.session_started_at_ms > 0
+        && report.session_completed_at_ms >= report.session_started_at_ms
+}
+
+fn host_evidence_is_healthy(report: &CaptureRunReport, config: &CaptureConfig) -> bool {
+    if !config.host_guard.enabled {
+        return report.host_identity_sha256.is_none()
+            && report.host_preflight.is_none()
+            && report.host_periodic_checks == 0
+            && report.host_last_snapshot.is_none();
+    }
+    let Some(identity) = report.host_identity_sha256.as_deref() else {
+        return false;
+    };
+    let Some(preflight) = report.host_preflight.as_ref() else {
+        return false;
+    };
+    if !is_sha256(identity)
+        || preflight.checked_at_ms < report.session_started_at_ms
+        || preflight.checked_at_ms > report.session_completed_at_ms
+        || !host_snapshot_is_healthy(preflight, config)
+    {
+        return false;
+    }
+    match (
+        report.host_periodic_checks,
+        report.host_last_snapshot.as_ref(),
+    ) {
+        (0, None) => true,
+        (0, Some(_)) | (1.., None) => false,
+        (_, Some(last)) => {
+            last.checked_at_ms >= preflight.checked_at_ms
+                && last.checked_at_ms <= report.session_completed_at_ms
+                && host_snapshot_is_healthy(last, config)
+        }
+    }
+}
+
+fn host_snapshot_is_healthy(
+    snapshot: &reap_telemetry::HostHealthSnapshot,
+    config: &CaptureConfig,
+) -> bool {
+    snapshot.checked_at_ms > 0
+        && snapshot.disk_available_bytes >= config.host_guard.min_disk_available_bytes
+        && snapshot.memory_available_bytes >= config.host_guard.min_memory_available_bytes
+        && (!config.host_guard.require_clock_synchronized || snapshot.clock_synchronized)
 }
 
 struct NormalizedScan {
@@ -772,6 +858,7 @@ mod tests {
             venue: CaptureVenueConfig::default(),
             runtime: CaptureRuntimeConfig::default(),
             output: CaptureOutputConfig::default(),
+            host_guard: Default::default(),
             subscriptions: vec![CaptureSubscriptionConfig {
                 channel: "books".to_string(),
                 symbol: "BTC-USDT".to_string(),
@@ -817,6 +904,15 @@ mod tests {
         .len();
         let report = CaptureRunReport {
             format_version: CAPTURE_RUN_REPORT_FORMAT_VERSION,
+            reap_version: env!("CARGO_PKG_VERSION").to_string(),
+            java_reference_revision: PINNED_JAVA_REVISION.to_string(),
+            executable_sha256: "e".repeat(64),
+            host_identity_sha256: None,
+            host_preflight: None,
+            host_periodic_checks: 0,
+            host_last_snapshot: None,
+            session_started_at_ms: 1,
+            session_completed_at_ms: 2,
             capture_session_id: analysis.capture_sessions[0].clone(),
             config_fingerprint: effective.fingerprint().unwrap(),
             config_source: Some(crate::CaptureConfigFileEvidence {
@@ -945,8 +1041,91 @@ mod tests {
         let report = verify(&fixture);
 
         assert!(report.passed, "{report:#?}");
+        assert_eq!(report.reap_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(report.java_reference_revision, PINNED_JAVA_REVISION);
+        assert_eq!(report.executable_sha256, "e".repeat(64));
+        assert!(report.host_identity_sha256.is_none());
+        assert_eq!(report.session_started_at_ms, 1);
+        assert_eq!(report.session_completed_at_ms, 2);
         assert_ne!(report.raw.source_path, report.raw.recorded_path);
         assert!(report.normalized.as_ref().unwrap().matches_reconstruction == Some(true));
+    }
+
+    #[test]
+    fn verifier_rejects_build_java_and_host_identity_tampering() {
+        let fixture = setup(false);
+        let mut run_report: CaptureRunReport =
+            serde_json::from_slice(&std::fs::read(&fixture.report_path).unwrap()).unwrap();
+        run_report.reap_version = "tampered".to_string();
+        run_report.java_reference_revision = "0".repeat(40);
+        run_report.executable_sha256 = "E".repeat(64);
+        run_report.host_identity_sha256 = Some("9".repeat(64));
+        run_report.session_completed_at_ms = 0;
+        write_report(&fixture.report_path, &run_report);
+
+        let report = verify(&fixture);
+        let invariant_messages = report
+            .failures
+            .iter()
+            .filter_map(|failure| match failure {
+                CaptureVerificationFailure::RunReportInvariant { message } => {
+                    Some(message.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(!report.passed);
+        for expected in [
+            "reap_version",
+            "java_reference_revision",
+            "executable_sha256",
+            "wall-clock",
+            "host evidence",
+        ] {
+            assert!(
+                invariant_messages
+                    .iter()
+                    .any(|message| message.contains(expected)),
+                "missing {expected:?} in {invariant_messages:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn verifier_rejects_enabled_guard_without_host_evidence() {
+        let fixture = setup(false);
+        let mut config = capture_config();
+        config.host_guard.enabled = true;
+        let config_bytes = toml::to_string(&config).unwrap().into_bytes();
+        std::fs::write(&fixture.config_path, &config_bytes).unwrap();
+
+        let mut run_report: CaptureRunReport =
+            serde_json::from_slice(&std::fs::read(&fixture.report_path).unwrap()).unwrap();
+        let mut effective = config;
+        effective.output.raw_path = run_report.raw_path.clone();
+        effective.output.normalized_path = run_report.normalized_path.clone();
+        run_report.config_fingerprint = effective.fingerprint().unwrap();
+        let config_source = run_report.config_source.as_mut().unwrap();
+        config_source.bytes = config_bytes.len() as u64;
+        config_source.sha256 = sha256_hex(&config_bytes);
+        write_report(&fixture.report_path, &run_report);
+
+        let report = verify(&fixture);
+
+        assert!(!report.passed);
+        assert!(report.failures.iter().any(|failure| matches!(
+            failure,
+            CaptureVerificationFailure::RunReportInvariant { message }
+                if message.contains("host evidence")
+        )));
+        assert!(report.failures.iter().any(|failure| matches!(
+            failure,
+            CaptureVerificationFailure::CleanFlagMismatch {
+                reported: true,
+                derived: false,
+            }
+        )));
     }
 
     #[test]

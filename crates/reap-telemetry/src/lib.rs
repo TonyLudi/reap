@@ -1,8 +1,17 @@
 mod alerts;
+mod host;
+mod provenance;
 
 pub use alerts::{
     AlertDeliveryFailure, AlertError, AlertEvent, AlertRuntime, AlertSeverity, AlertSink,
     AlertStats, WebhookAlertConfig, start_webhook_alerts,
+};
+pub use host::{
+    HostGuardConfig, HostGuardRuntime, HostGuardStats, HostHealthError, HostHealthSnapshot,
+    MAX_HOST_GUARD_CHECK_INTERVAL_MS, check_host_health, start_host_guard,
+};
+pub use provenance::{
+    current_executable_sha256, host_identity_sha256, identity_sha256, sha256_bytes,
 };
 
 use std::collections::{BTreeMap, HashMap};

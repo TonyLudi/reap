@@ -778,11 +778,14 @@ acceptance explicit in a versioned TOML manifest:
 - Dataset IDs, canonical paths, and byte-identical content cannot be reused to
   disguise train/test leakage; event-time windows must be non-overlapping and
   strictly chronological.
-- Production raw captures must name their capture-only config and schema-3 run
-  report. The report verifier binds exact config bytes and effective output
-  overrides to raw and optional reconstructed normalized bytes, cross-checks
-  replayable counters, session, and book health, and retains runtime-only stop,
-  readiness, and queue evidence. It must pass alongside a one-session,
+- Production raw captures must name their capture-only config and schema-4 run
+  report. The report verifier binds exact config bytes, capture executable,
+  host, pinned Java revision, host-guard evidence, and effective output overrides
+  to raw and optional reconstructed normalized bytes. It cross-checks replayable
+  counters, session, and book health, and retains runtime-only stop, readiness,
+  and queue evidence. Production research requires the same executable and the
+  latency-calibrated target host plus at least one completed periodic host
+  check. It must pass alongside a one-session,
   parse-clean, zero-gap replay check before any candidate runs.
   Every configured stream must have at least two sources; candidate instruments
   must have book and trade coverage plus applicable strategy index, accounting
@@ -849,11 +852,13 @@ Responsibilities:
   inputs alongside strategy market data.
 - Run redundant websocket connections through `reap-feed` supervision.
 - Persist every received raw frame through a bounded lossless writer.
+- Fail before network startup and during collection when Linux disk, available
+  memory, or kernel clock state breaches configured thresholds.
 - Stamp every frame with a process-session identity so replay cannot hide
   capture downtime.
 - Fingerprint the effective capture config and exact persisted bytes.
 - Reserve and fsync a versioned run report that also binds the exact source
-  config file.
+  config file, executable, host, pinned Java revision, and host-health evidence.
 - Optionally persist deduplicated normalized events for short diagnostics.
 - Report connection readiness, queue high-water marks, parser failures,
   duplicates, gaps, recoveries, and final book health.

@@ -18,6 +18,13 @@ raw_path = "var/reap/capture/okx-btc-raw.jsonl"
 flush_every_records = 1024
 fsync_every_records = 10000
 
+[host_guard]
+enabled = true
+check_interval_ms = 10000
+min_disk_available_bytes = 5368709120
+min_memory_available_bytes = 1073741824
+require_clock_synchronized = true
+
 # The Java OKX subscriber supports TBT and 400-level depth modes. Public capture
 # defaults to the broadly available 400-level `books` channel; use
 # `books-l2-tbt` only for an account/environment entitled to that channel.

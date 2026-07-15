@@ -1033,6 +1033,7 @@ dependencies = [
  "reap-book",
  "reap-core",
  "reap-feed",
+ "reap-telemetry",
  "reap-venue",
  "serde",
  "serde_ignored",
@@ -1207,8 +1208,10 @@ dependencies = [
 name = "reap-telemetry"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "reqwest",
  "serde",
+ "sha2",
  "thiserror",
  "tokio",
  "tracing",

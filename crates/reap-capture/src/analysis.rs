@@ -911,6 +911,7 @@ mod tests {
             venue: CaptureVenueConfig::default(),
             runtime: CaptureRuntimeConfig::default(),
             output: CaptureOutputConfig::default(),
+            host_guard: Default::default(),
             subscriptions,
         }
     }

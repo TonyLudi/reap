@@ -375,7 +375,16 @@ pub fn run_research_manifest_path(path: impl AsRef<Path>) -> Result<ResearchRepo
         candidates.iter().map(|candidate| &candidate.config),
     )?;
     validate_scenario_currency_rates(&manifest.scenarios, &candidates)?;
-    let datasets = load_datasets(&manifest.datasets, base, manifest.mode, &candidates)?;
+    let datasets = load_datasets(
+        &manifest.datasets,
+        base,
+        manifest.mode,
+        &candidates,
+        &executable_sha256,
+        latency_calibration
+            .as_ref()
+            .map(|calibration| calibration.provenance.host_identity_sha256.as_str()),
+    )?;
     let manifest_sha256 = sha256_bytes(&manifest_bytes);
     let mut cache = HashMap::new();
     let mut folds = Vec::with_capacity(manifest.folds.len());
@@ -1232,6 +1241,8 @@ fn load_datasets(
     base: &Path,
     mode: ResearchMode,
     candidates: &[LoadedCandidate],
+    expected_executable_sha256: &str,
+    expected_host_identity_sha256: Option<&str>,
 ) -> Result<Vec<LoadedDataset>> {
     let mut loaded = Vec::with_capacity(specs.len());
     let mut canonical_paths = HashSet::new();
@@ -1369,6 +1380,34 @@ fn load_datasets(
                         verification.failures
                     );
                 }
+                if mode == ResearchMode::ProductionCandidate {
+                    if verification.reap_version != env!("CARGO_PKG_VERSION")
+                        || verification.java_reference_revision != PINNED_JAVA_REVISION
+                        || verification.executable_sha256 != expected_executable_sha256
+                    {
+                        bail!(
+                            "production dataset {} was captured by a different Reap build or Java reference than this research run",
+                            spec.id
+                        );
+                    }
+                    let expected_host_identity_sha256 = expected_host_identity_sha256.context(
+                        "production capture evidence requires a latency-calibrated target host",
+                    )?;
+                    if verification.host_identity_sha256.as_deref()
+                        != Some(expected_host_identity_sha256)
+                    {
+                        bail!(
+                            "production dataset {} was captured on a different host than the latency calibration",
+                            spec.id
+                        );
+                    }
+                    if verification.host_periodic_checks == 0 {
+                        bail!(
+                            "production dataset {} has no completed periodic host check",
+                            spec.id
+                        );
+                    }
+                }
                 capture_report_sha256 = Some(verification.run_report.sha256.clone());
                 normalized_sha256 = verification
                     .normalized
@@ -1425,6 +1464,9 @@ fn validate_production_capture_config(
     config: &CaptureConfig,
     candidates: &[LoadedCandidate],
 ) -> Result<()> {
+    if !config.host_guard.enabled {
+        bail!("production dataset {dataset_id} requires an enabled capture host guard");
+    }
     let streams = config
         .subscriptions
         .iter()
@@ -2168,7 +2210,8 @@ mod tests {
     use reap_capture::{
         CAPTURE_RUN_REPORT_FORMAT_VERSION, CaptureBookHealth, CaptureConfigFileEvidence,
         CaptureOutputConfig, CapturePriority, CaptureRunReport, CaptureRuntimeConfig,
-        CaptureStopReason, CaptureSubscriptionConfig, CaptureVenueConfig, analyze_capture,
+        CaptureStopReason, CaptureSubscriptionConfig, CaptureVenueConfig, HostGuardConfig,
+        HostHealthSnapshot, analyze_capture,
     };
     use tempfile::TempDir;
 
@@ -2195,6 +2238,13 @@ mod tests {
             venue: CaptureVenueConfig::default(),
             runtime: CaptureRuntimeConfig::default(),
             output: CaptureOutputConfig::default(),
+            host_guard: HostGuardConfig {
+                enabled: true,
+                check_interval_ms: 10,
+                min_disk_available_bytes: 1,
+                min_memory_available_bytes: 1,
+                require_clock_synchronized: true,
+            },
             subscriptions: vec![CaptureSubscriptionConfig {
                 channel: "books".to_string(),
                 symbol: "BTC-USDT".to_string(),
@@ -2213,6 +2263,25 @@ mod tests {
         let expected_connections = 2;
         let report = CaptureRunReport {
             format_version: CAPTURE_RUN_REPORT_FORMAT_VERSION,
+            reap_version: env!("CARGO_PKG_VERSION").to_string(),
+            java_reference_revision: PINNED_JAVA_REVISION.to_string(),
+            executable_sha256: "e".repeat(64),
+            host_identity_sha256: Some("9".repeat(64)),
+            host_preflight: Some(HostHealthSnapshot {
+                checked_at_ms: 1,
+                disk_available_bytes: 10,
+                memory_available_bytes: 10,
+                clock_synchronized: true,
+            }),
+            host_periodic_checks: 1,
+            host_last_snapshot: Some(HostHealthSnapshot {
+                checked_at_ms: 2,
+                disk_available_bytes: 10,
+                memory_available_bytes: 10,
+                clock_synchronized: true,
+            }),
+            session_started_at_ms: 1,
+            session_completed_at_ms: 3,
             capture_session_id: analysis.capture_sessions[0].clone(),
             config_fingerprint: effective_config.fingerprint().unwrap(),
             config_source: Some(CaptureConfigFileEvidence {
@@ -2284,6 +2353,23 @@ mod tests {
             capture_report: Some(fixture.report_path.clone()),
             normalized_path: None,
         }
+    }
+
+    fn load_test_production_datasets(
+        datasets: &[ResearchDataset],
+        base: &Path,
+        candidates: &[LoadedCandidate],
+    ) -> Result<Vec<LoadedDataset>> {
+        let executable_sha256 = "e".repeat(64);
+        let host_identity_sha256 = "9".repeat(64);
+        load_datasets(
+            datasets,
+            base,
+            ResearchMode::ProductionCandidate,
+            candidates,
+            &executable_sha256,
+            Some(&host_identity_sha256),
+        )
     }
 
     fn read_capture_report(path: &Path) -> CaptureRunReport {
@@ -2583,7 +2669,7 @@ mod tests {
             normalized_path: None,
         }];
 
-        let error = load_datasets(&datasets, &base, ResearchMode::ProductionCandidate, &[])
+        let error = load_test_production_datasets(&datasets, &base, &[])
             .unwrap_err()
             .to_string();
 
@@ -2591,17 +2677,11 @@ mod tests {
     }
 
     #[test]
-    fn production_dataset_loads_verified_schema_three_capture_evidence() {
+    fn production_dataset_loads_verified_schema_four_capture_evidence() {
         let fixture = research_capture_fixture();
         let datasets = [fixture_dataset(&fixture)];
 
-        let loaded = load_datasets(
-            &datasets,
-            Path::new("."),
-            ResearchMode::ProductionCandidate,
-            &[],
-        )
-        .unwrap();
+        let loaded = load_test_production_datasets(&datasets, Path::new("."), &[]).unwrap();
         let dataset = &loaded[0];
 
         assert!(
@@ -2637,15 +2717,66 @@ mod tests {
     }
 
     #[test]
-    fn research_hash_guard_detects_capture_report_mutation() {
+    fn production_dataset_rejects_capture_from_a_different_build() {
         let fixture = research_capture_fixture();
-        let loaded = load_datasets(
+        let expected_host = "9".repeat(64);
+
+        let error = load_datasets(
             &[fixture_dataset(&fixture)],
             Path::new("."),
             ResearchMode::ProductionCandidate,
             &[],
+            &"d".repeat(64),
+            Some(&expected_host),
         )
-        .unwrap();
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("different Reap build or Java reference"));
+    }
+
+    #[test]
+    fn production_dataset_rejects_capture_from_a_different_host() {
+        let fixture = research_capture_fixture();
+        let expected_executable = "e".repeat(64);
+        let expected_host = "8".repeat(64);
+
+        let error = load_datasets(
+            &[fixture_dataset(&fixture)],
+            Path::new("."),
+            ResearchMode::ProductionCandidate,
+            &[],
+            &expected_executable,
+            Some(&expected_host),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("different host than the latency calibration"));
+    }
+
+    #[test]
+    fn production_dataset_requires_a_completed_periodic_host_check() {
+        let fixture = research_capture_fixture();
+        let mut report = read_capture_report(&fixture.report_path);
+        report.host_periodic_checks = 0;
+        report.host_last_snapshot = None;
+        write_capture_report(&fixture.report_path, &report);
+
+        let error =
+            load_test_production_datasets(&[fixture_dataset(&fixture)], Path::new("."), &[])
+                .unwrap_err()
+                .to_string();
+
+        assert!(error.contains("no completed periodic host check"));
+    }
+
+    #[test]
+    fn research_hash_guard_detects_capture_report_mutation() {
+        let fixture = research_capture_fixture();
+        let loaded =
+            load_test_production_datasets(&[fixture_dataset(&fixture)], Path::new("."), &[])
+                .unwrap();
         let mut report_bytes = std::fs::read(&fixture.report_path).unwrap();
         report_bytes.extend_from_slice(b" \n");
         std::fs::write(&fixture.report_path, report_bytes).unwrap();
@@ -2673,14 +2804,10 @@ mod tests {
         report.config_source = None;
         write_capture_report(&fixture.report_path, &report);
 
-        let error = load_datasets(
-            &[fixture_dataset(&fixture)],
-            Path::new("."),
-            ResearchMode::ProductionCandidate,
-            &[],
-        )
-        .unwrap_err()
-        .to_string();
+        let error =
+            load_test_production_datasets(&[fixture_dataset(&fixture)], Path::new("."), &[])
+                .unwrap_err()
+                .to_string();
 
         assert!(error.contains("failed capture verification"));
         assert!(error.contains("UnsupportedRunReportFormat"));
@@ -2693,14 +2820,10 @@ mod tests {
         bytes.extend_from_slice(b"\n# formatting-only tamper\n");
         std::fs::write(&fixture.config_path, bytes).unwrap();
 
-        let error = load_datasets(
-            &[fixture_dataset(&fixture)],
-            Path::new("."),
-            ResearchMode::ProductionCandidate,
-            &[],
-        )
-        .unwrap_err()
-        .to_string();
+        let error =
+            load_test_production_datasets(&[fixture_dataset(&fixture)], Path::new("."), &[])
+                .unwrap_err()
+                .to_string();
 
         assert!(error.contains("failed capture verification"));
         assert!(error.contains("ConfigFileMismatch"));
@@ -2713,14 +2836,10 @@ mod tests {
         report.normalized_path = Some(PathBuf::from("collector/normalized.jsonl"));
         write_capture_report(&fixture.report_path, &report);
 
-        let error = load_datasets(
-            &[fixture_dataset(&fixture)],
-            Path::new("."),
-            ResearchMode::ProductionCandidate,
-            &[],
-        )
-        .unwrap_err()
-        .to_string();
+        let error =
+            load_test_production_datasets(&[fixture_dataset(&fixture)], Path::new("."), &[])
+                .unwrap_err()
+                .to_string();
 
         assert!(error.contains("failed capture verification"));
         assert!(error.contains("NormalizedArtifactMissing"));
@@ -2740,6 +2859,13 @@ mod tests {
         let config = CaptureConfig::load(base.join("examples/capture-okx-public.toml")).unwrap();
 
         validate_production_capture_config("capture", &config, &candidates).unwrap();
+
+        let mut unguarded = config.clone();
+        unguarded.host_guard.enabled = false;
+        let error = validate_production_capture_config("capture", &unguarded, &candidates)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires an enabled capture host guard"));
 
         let mut single_source = config.clone();
         single_source.subscriptions[0].connections = 1;

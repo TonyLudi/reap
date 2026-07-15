@@ -131,12 +131,12 @@ require_single_key deploy/systemd/reap-demo@.service \
 require_single_key deploy/systemd/reap-capture@.service \
   WorkingDirectory '/var/lib/reap/capture/%i'
 require_single_key deploy/systemd/reap-capture@.service \
-  ExecStart '/usr/local/bin/reap capture --config /etc/reap/capture/%i.toml'
+  EnvironmentFile '/etc/reap/capture/%i.env'
+require_single_key deploy/systemd/reap-capture@.service \
+  ExecStart '/usr/local/bin/reap capture --config /etc/reap/capture/%i.toml --output /var/lib/reap/capture/%i/run-report.json --duration-secs ${REAP_CAPTURE_DURATION_SECS} --require-clean-capture'
 require_single_key deploy/systemd/reap-capture@.service StartLimitBurst 2
 require_single_key deploy/systemd/reap-capture@.service \
   ReadWritePaths '/var/lib/reap/capture/%i'
-grep -Eq '^EnvironmentFile=' deploy/systemd/reap-capture@.service \
-  && fail 'capture unit must not read a credential environment file'
 
 root="$(mktemp -d)"
 trap 'rm -rf "$root"' EXIT
@@ -160,6 +160,8 @@ printf '%s\n' 'REAP_OKX_API_KEY=verification-placeholder' \
   >"$root/etc/reap/live/$INSTANCE.env"
 printf '%s\n' '[[subscriptions]]' 'channel = "books"' 'symbol = "BTC-USDT"' \
   >"$root/etc/reap/capture/$INSTANCE.toml"
+printf '%s\n' 'REAP_CAPTURE_DURATION_SECS=86400' \
+  >"$root/etc/reap/capture/$INSTANCE.env"
 
 instantiated_units=(
   "reap-observe@$INSTANCE.service"

@@ -17,8 +17,11 @@ Expected instance layout for an instance named `btc-demo`:
 /var/lib/reap/live/btc-demo/       reap:reap 0750
 ```
 
-Capture instance `btc-public` uses `/etc/reap/capture/btc-public.toml` and
-`/var/lib/reap/capture/btc-public/`. Use absolute storage, operator-socket, and
+Capture run instance `btc-public-20260715T000000Z` uses
+`/etc/reap/capture/btc-public-20260715T000000Z.toml`, a matching `.env` containing
+only `REAP_CAPTURE_DURATION_SECS=<positive integer>`, and
+`/var/lib/reap/capture/btc-public-20260715T000000Z/`. Never put credentials in
+the capture environment file. Use absolute storage, operator-socket, and
 capture-output paths inside deployed TOML; each must remain under that
 instance's writable directory.
 
@@ -50,16 +53,18 @@ Start one mode only for a live instance:
 ```bash
 sudo systemctl start reap-observe@btc-demo.service
 sudo systemctl start reap-demo@btc-demo.service
-sudo systemctl start reap-capture@btc-public.service
+sudo systemctl start reap-capture@btc-public-20260715T000000Z.service
 ```
 
 `observe` is exchange-read-only and may restart after failure, capped by the
 unit start limit. `demo` never restarts automatically: every abnormal exit needs
 exchange/account reconciliation and operator approval. `capture` also never
-restarts automatically because every process requires a fresh output path and
-session identity. Set `output.raw_path` (and `output.normalized_path`, when used)
-to new absolute paths before starting it again. Capture uses create-new file
-semantics and will fail before opening feed sockets if an output already exists.
+restarts automatically. Its unit requires a positive duration, requests
+`--require-clean-capture`, and reserves `run-report.json` in the instance
+directory. Every process requires a fresh instance directory, config, raw path,
+report path, and session identity. Capture uses create-new file semantics and
+will fail before opening feed sockets if an output already exists; an early CLI
+failure can leave an empty reserved report that must not be reused.
 
 Configure the host monitoring system to page on unit activation failure,
 non-zero exit, start-limit exhaustion, forced `SIGKILL`, and host clock/disk/

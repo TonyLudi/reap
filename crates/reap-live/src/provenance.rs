@@ -1,59 +1,7 @@
-use std::fs::File;
-use std::io::Read;
-
-use sha2::{Digest, Sha256};
+pub use reap_telemetry::{current_executable_sha256, host_identity_sha256};
+pub(crate) use reap_telemetry::{identity_sha256, sha256_bytes};
 
 use crate::config::TradingEnvironment;
-
-pub(crate) fn sha256_bytes(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
-
-pub fn current_executable_sha256() -> Result<String, String> {
-    #[cfg(target_os = "linux")]
-    let path = std::path::PathBuf::from("/proc/self/exe");
-    #[cfg(not(target_os = "linux"))]
-    let path = std::env::current_exe()
-        .map_err(|error| format!("failed to resolve current executable: {error}"))?;
-
-    let mut file = File::open(&path)
-        .map_err(|error| format!("failed to open executable {}: {error}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| format!("failed to hash executable {}: {error}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-pub fn host_identity_sha256() -> Result<String, String> {
-    let machine_id = std::fs::read("/etc/machine-id")
-        .map_err(|error| format!("failed to read /etc/machine-id: {error}"))?;
-    let machine_id = machine_id
-        .strip_suffix(b"\n")
-        .unwrap_or(machine_id.as_slice());
-    if machine_id.is_empty() {
-        return Err("/etc/machine-id is empty".to_string());
-    }
-    Ok(identity_sha256(b"reap-host-v1", &[machine_id]))
-}
-
-pub(crate) fn identity_sha256(domain: &[u8], fields: &[&[u8]]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update((domain.len() as u64).to_le_bytes());
-    hasher.update(domain);
-    for field in fields {
-        hasher.update((field.len() as u64).to_le_bytes());
-        hasher.update(field);
-    }
-    format!("{:x}", hasher.finalize())
-}
 
 pub(crate) fn okx_account_identity_sha256(
     environment: TradingEnvironment,

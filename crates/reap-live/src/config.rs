@@ -8,6 +8,7 @@ use reap_feed::OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS;
 use reap_order::PacingPolicy;
 use reap_risk::RiskLimits;
 use reap_strategy::{ChaosConfig, InstrumentConfig};
+pub use reap_telemetry::HostGuardConfig;
 use reap_telemetry::WebhookAlertConfig;
 use reap_venue::okx::{
     OKX_MIN_TRADE_FEE_REQUEST_INTERVAL_MS, OkxAccountLevel, OkxCredentials, OkxPositionMode,
@@ -426,28 +427,6 @@ impl AlertConfig {
             max_attempts: self.max_attempts,
             retry_backoff: Duration::from_millis(self.retry_backoff_ms),
         }))
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct HostGuardConfig {
-    pub enabled: bool,
-    pub check_interval_ms: u64,
-    pub min_disk_available_bytes: u64,
-    pub min_memory_available_bytes: u64,
-    pub require_clock_synchronized: bool,
-}
-
-impl Default for HostGuardConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            check_interval_ms: 10_000,
-            min_disk_available_bytes: 5 * 1024 * 1024 * 1024,
-            min_memory_available_bytes: 1024 * 1024 * 1024,
-            require_clock_synchronized: true,
-        }
     }
 }
 
@@ -1316,24 +1295,7 @@ fn validate_alerts(alerts: &AlertConfig, errors: &mut Vec<String>) {
 }
 
 fn validate_host_guard(host_guard: &HostGuardConfig, errors: &mut Vec<String>) {
-    if !host_guard.enabled {
-        return;
-    }
-    for (name, value) in [
-        ("check_interval_ms", host_guard.check_interval_ms),
-        (
-            "min_disk_available_bytes",
-            host_guard.min_disk_available_bytes,
-        ),
-        (
-            "min_memory_available_bytes",
-            host_guard.min_memory_available_bytes,
-        ),
-    ] {
-        if value == 0 {
-            errors.push(format!("host_guard.{name} must be positive"));
-        }
-    }
+    errors.extend(host_guard.validation_errors("host_guard"));
 }
 
 #[derive(Debug)]
