@@ -98,8 +98,9 @@ Implemented:
 - Credential-free public OKX capture with redundant websocket plans, raw-frame
   durability, fail-closed Linux disk/memory/clock checks, a create-new run
   report bound to the exact binary, host, pinned Java revision, and config,
-  report-aware raw/normalized verification, bounded-memory capture analysis,
-  normalized diagnostic output, and direct raw-capture backtests.
+  report-aware raw/normalized verification, a process-global persisted-frame
+  ordinal, bounded-memory capture analysis, normalized diagnostic output, and
+  direct raw-capture backtests.
 
 Run the sample:
 
@@ -170,7 +171,10 @@ by live trading. Use a new output path for each capture process; replay rejects
 concatenated session IDs rather than treating downtime as continuous data.
 Capture refuses an existing report, raw, or normalized path instead of
 overwriting or appending. Verify the durable run report before standalone
-analysis or strategy replay. On Unix, all three artifacts are created mode
+analysis or strategy replay. Current captures also require an exact
+`capture_record_seq` sequence from `1` through the report's raw record count;
+missing, duplicate, skipped, or reordered writer records fail verification.
+On Unix, all three artifacts are created mode
 `0600` independently of the caller's umask:
 
 ```bash
@@ -250,7 +254,7 @@ position and active-order exposure, inventory duration, fee/funding accounting,
 and pending-work gates. Manifest, executable, candidate, dataset, capture
 configuration, capture-report, and optional normalized-artifact hashes are
 verified again after all runs. Production raw datasets must pass the embedded
-schema-4 run-report verifier, capture-config-bound source analysis, and an
+schema-5 run-report verifier, capture-config-bound source analysis, and an
 independent zero-gap replay-integrity check before any candidate executes. The
 capture report must identify the same executable as research and the same host
 as the bound latency calibration, with at least one completed periodic host

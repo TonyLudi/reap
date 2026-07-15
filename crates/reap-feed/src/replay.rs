@@ -14,6 +14,8 @@ use crate::{FeedOutput, FeedProcessor, payload_hash};
 pub struct RawCapture {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_record_seq: Option<u64>,
     pub venue: Venue,
     pub conn_id: ConnId,
     pub channel: Channel,
@@ -64,6 +66,11 @@ pub struct ReplayBookHealth {
 pub struct ReplayCheckReport {
     pub lines: u64,
     pub capture_sessions: usize,
+    pub sequenced_records: u64,
+    pub first_capture_record_seq: Option<u64>,
+    pub last_capture_record_seq: Option<u64>,
+    pub capture_record_sequence_errors: u64,
+    pub capture_record_sequence_complete: bool,
     pub parsed_events: u64,
     pub accepted_events: u64,
     pub normalized_events: u64,
@@ -82,6 +89,7 @@ impl ReplayCheckReport {
     pub fn is_healthy(&self) -> bool {
         self.lines > 0
             && self.capture_sessions == 1
+            && (self.sequenced_records == 0 || self.capture_record_sequence_complete)
             && !self.books.is_empty()
             && self.errors.is_empty()
             && self.recovery_failures == 0
@@ -102,6 +110,11 @@ pub fn replay_check<R: Read>(reader: R) -> Result<ReplayCheckReport> {
     let mut errors = Vec::new();
     let mut lines = 0_u64;
     let mut capture_sessions = std::collections::HashSet::new();
+    let mut sequenced_records = 0_u64;
+    let mut first_capture_record_seq = None;
+    let mut last_capture_record_seq = None;
+    let mut capture_record_sequence_errors = 0_u64;
+    let mut saw_unsequenced_record = false;
 
     for (index, line) in BufReader::new(reader).lines().enumerate() {
         let line_number = index + 1;
@@ -119,6 +132,31 @@ pub fn replay_check<R: Read>(reader: R) -> Result<ReplayCheckReport> {
                 .map_or_else(|| "legacy:unspecified".to_string(), |id| format!("id:{id}"));
             if capture_sessions.insert(session) && capture_sessions.len() > 1 {
                 anyhow::bail!("capture contains more than one process session");
+            }
+            match capture.capture_record_seq {
+                Some(sequence) => {
+                    sequenced_records = sequenced_records.saturating_add(1);
+                    first_capture_record_seq.get_or_insert(sequence);
+                    let expected = last_capture_record_seq
+                        .and_then(|previous: u64| previous.checked_add(1))
+                        .unwrap_or(1);
+                    last_capture_record_seq = Some(sequence);
+                    if saw_unsequenced_record || sequence != expected {
+                        capture_record_sequence_errors =
+                            capture_record_sequence_errors.saturating_add(1);
+                        anyhow::bail!(
+                            "capture record sequence expected {expected}, received {sequence}"
+                        );
+                    }
+                }
+                None => {
+                    saw_unsequenced_record = true;
+                    if sequenced_records > 0 {
+                        capture_record_sequence_errors =
+                            capture_record_sequence_errors.saturating_add(1);
+                        anyhow::bail!("capture mixes sequenced and legacy unsequenced records");
+                    }
+                }
             }
             let envelope = capture.into_envelope()?;
             let adapter = adapters
@@ -162,10 +200,20 @@ pub fn replay_check<R: Read>(reader: R) -> Result<ReplayCheckReport> {
         .iter()
         .filter(|book| book.sequence_status != "ready")
         .count();
+    let capture_record_sequence_complete = lines > 0
+        && sequenced_records == lines
+        && first_capture_record_seq == Some(1)
+        && last_capture_record_seq == Some(lines)
+        && capture_record_sequence_errors == 0;
 
     Ok(ReplayCheckReport {
         lines,
         capture_sessions: capture_sessions.len(),
+        sequenced_records,
+        first_capture_record_seq,
+        last_capture_record_seq,
+        capture_record_sequence_errors,
+        capture_record_sequence_complete,
         parsed_events: stats.parsed,
         accepted_events: stats.accepted,
         normalized_events: stats.normalized_events,
@@ -193,6 +241,8 @@ mod tests {
         assert!(report.is_healthy(), "{report:#?}");
         assert_eq!(report.duplicates, 3);
         assert_eq!(report.capture_sessions, 1);
+        assert_eq!(report.sequenced_records, 0);
+        assert!(!report.capture_record_sequence_complete);
         assert_eq!(report.gaps, 1);
         assert_eq!(report.recoveries, 1);
         assert_eq!(report.books[0].last_seq_id, Some(103));
@@ -206,6 +256,10 @@ mod tests {
 
         assert!(report.is_healthy(), "{report:#?}");
         assert_eq!(report.capture_sessions, 1);
+        assert_eq!(report.sequenced_records, 7);
+        assert_eq!(report.first_capture_record_seq, Some(1));
+        assert_eq!(report.last_capture_record_seq, Some(7));
+        assert!(report.capture_record_sequence_complete);
         assert_eq!(report.duplicates, 3);
         assert_eq!(report.gaps, 0);
         assert_eq!(report.sequence_resets, 1);
@@ -242,6 +296,33 @@ mod tests {
             report.errors[0]
                 .message
                 .contains("more than one process session")
+        );
+    }
+
+    #[test]
+    fn checker_rejects_a_broken_capture_record_sequence() {
+        let mut records = include_str!("../../../fixtures/raw/okx/depth-reset.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<RawCapture>(line).unwrap())
+            .collect::<Vec<_>>();
+        records[3].capture_record_seq = Some(9);
+        let input = records
+            .iter()
+            .map(|record| serde_json::to_string(record).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+
+        let report = replay_check(input.as_bytes()).unwrap();
+
+        assert!(!report.is_healthy());
+        assert!(!report.capture_record_sequence_complete);
+        assert!(report.capture_record_sequence_errors > 0);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.message.contains("record sequence expected"))
         );
     }
 

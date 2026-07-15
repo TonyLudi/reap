@@ -14,7 +14,7 @@ use crate::{
     is_book_channel, sha256_hex,
 };
 
-pub const CAPTURE_VERIFICATION_FORMAT_VERSION: u16 = 2;
+pub const CAPTURE_VERIFICATION_FORMAT_VERSION: u16 = 3;
 pub const MAX_CAPTURE_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_CAPTURE_RUN_REPORT_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -74,6 +74,13 @@ pub enum CaptureVerificationFailure {
     EffectiveConfigFingerprintMismatch,
     RawArtifactMismatch,
     RawArtifactChangedWhileReading,
+    RawRecordSequenceIncomplete {
+        expected_records: u64,
+        sequenced_records: u64,
+        first_sequence: Option<u64>,
+        last_sequence: Option<u64>,
+        sequence_errors: u64,
+    },
     NormalizedArtifactMissing,
     NormalizedArtifactUnexpected,
     NormalizedArtifactMismatch,
@@ -254,6 +261,8 @@ pub fn verify_capture_paths(
     let raw_matches = run_report.raw_records == analysis.lines
         && run_report.raw_bytes == analysis.bytes
         && run_report.raw_sha256 == analysis.sha256;
+    let raw_record_sequence_complete = analysis.capture_record_sequence_complete
+        && analysis.sequenced_records == run_report.raw_records;
     let raw = CaptureFileVerification {
         source_path: raw_source,
         recorded_path: run_report.raw_path.clone(),
@@ -273,6 +282,7 @@ pub fn verify_capture_paths(
         matches_reconstruction: None,
         passed: raw_matches
             && raw_stable
+            && raw_record_sequence_complete
             && analysis.error_count == 0
             && analysis.ignored_lines == 0,
     };
@@ -297,6 +307,15 @@ pub fn verify_capture_paths(
     }
     if !raw_stable {
         failures.push(CaptureVerificationFailure::RawArtifactChangedWhileReading);
+    }
+    if !raw_record_sequence_complete {
+        failures.push(CaptureVerificationFailure::RawRecordSequenceIncomplete {
+            expected_records: run_report.raw_records,
+            sequenced_records: analysis.sequenced_records,
+            first_sequence: analysis.first_capture_record_seq,
+            last_sequence: analysis.last_capture_record_seq,
+            sequence_errors: analysis.capture_record_sequence_errors,
+        });
     }
 
     let normalized = match (&run_report.normalized_path, normalized_path) {
@@ -1146,6 +1165,41 @@ mod tests {
                 .failures
                 .contains(&CaptureVerificationFailure::RawArtifactMismatch)
         );
+    }
+
+    #[test]
+    fn verifier_rejects_record_sequence_tampering_with_matching_hashes() {
+        let fixture = setup(false);
+        let mut records = std::fs::read_to_string(&fixture.raw_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<RawCapture>(line).unwrap())
+            .collect::<Vec<_>>();
+        records[2].capture_record_seq = None;
+        let mut raw_bytes = Vec::new();
+        for record in records {
+            serde_json::to_writer(&mut raw_bytes, &record).unwrap();
+            raw_bytes.push(b'\n');
+        }
+        std::fs::write(&fixture.raw_path, &raw_bytes).unwrap();
+
+        let mut run_report: CaptureRunReport =
+            serde_json::from_slice(&std::fs::read(&fixture.report_path).unwrap()).unwrap();
+        run_report.raw_bytes = raw_bytes.len() as u64;
+        run_report.raw_sha256 = sha256_hex(&raw_bytes);
+        write_report(&fixture.report_path, &run_report);
+
+        let report = verify(&fixture);
+
+        assert!(!report.passed);
+        assert!(report.failures.iter().any(|failure| matches!(
+            failure,
+            CaptureVerificationFailure::RawRecordSequenceIncomplete {
+                expected_records: 7,
+                sequenced_records: 6,
+                ..
+            }
+        )));
     }
 
     #[test]

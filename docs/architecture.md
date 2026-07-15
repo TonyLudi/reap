@@ -806,7 +806,7 @@ acceptance explicit in a versioned TOML manifest:
 - Dataset IDs, canonical paths, and byte-identical content cannot be reused to
   disguise train/test leakage; event-time windows must be non-overlapping and
   strictly chronological.
-- Production raw captures must name their capture-only config and schema-4 run
+- Production raw captures must name their capture-only config and schema-5 run
   report. The report verifier binds exact config bytes, capture executable,
   host, pinned Java revision, host-guard evidence, and effective output overrides
   to raw and optional reconstructed normalized bytes. It cross-checks replayable
@@ -907,6 +907,9 @@ Responsibilities:
   inputs alongside strategy market data.
 - Run redundant websocket connections through `reap-feed` supervision.
 - Persist every received raw frame through a bounded lossless writer.
+- Assign a process-global record ordinal before that writer and independently
+  require the persisted artifact to contain exactly `1..raw_records`; this
+  proves writer-boundary completeness separately from venue book sequences.
 - Fail before network startup and during collection when Linux disk, available
   memory, or kernel clock state breaches configured thresholds.
 - Stamp every frame with a process-session identity so replay cannot hide

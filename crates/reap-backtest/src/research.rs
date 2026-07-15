@@ -3573,7 +3573,7 @@ mod tests {
     }
 
     #[test]
-    fn production_dataset_loads_verified_schema_four_capture_evidence() {
+    fn production_dataset_loads_verified_schema_five_capture_evidence() {
         let fixture = research_capture_fixture();
         let datasets = [fixture_dataset(&fixture)];
 

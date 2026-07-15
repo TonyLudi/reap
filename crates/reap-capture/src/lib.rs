@@ -37,7 +37,7 @@ use url::Url;
 pub use analysis::*;
 pub use verification::*;
 
-pub const CAPTURE_RUN_REPORT_FORMAT_VERSION: u16 = 4;
+pub const CAPTURE_RUN_REPORT_FORMAT_VERSION: u16 = 5;
 const MAX_CONNECTION_ATTEMPT_INTERVAL_MS: u64 = 60_000;
 const MAX_REPORTED_UNKNOWN_FIELDS: usize = 64;
 
@@ -280,6 +280,8 @@ pub enum CaptureError {
     WriterJoin(#[from] tokio::task::JoinError),
     #[error("capture feed channel closed unexpectedly")]
     FeedClosed,
+    #[error("capture raw record sequence exhausted")]
+    RawRecordSequenceExhausted,
     #[error("capture connection pacer failed: {0}")]
     ConnectionPacer(#[from] reap_feed::ConnectionAttemptPacerError),
     #[error("capture connection pacer failed during runtime: {0}")]
@@ -899,6 +901,7 @@ async fn receive_host_failure(
 struct CaptureState {
     processor: FeedProcessor,
     capture_session_id: String,
+    next_raw_record_seq: u64,
     expected_connections: HashSet<reap_core::ConnId>,
     expected_book_symbols: HashSet<String>,
     ready_connections: HashSet<reap_core::ConnId>,
@@ -946,6 +949,7 @@ impl CaptureState {
         Self {
             processor: FeedProcessor::new(dedup_capacity_per_stream, max_sequence_buffer),
             capture_session_id,
+            next_raw_record_seq: 1,
             expected_connections,
             expected_book_symbols,
             ready_connections: HashSet::new(),
@@ -979,9 +983,18 @@ impl CaptureState {
         raw_writer: &JsonlWriter<RawCapture>,
         normalized_writer: Option<&JsonlWriter<NormalizedEvent>>,
     ) -> Result<Vec<RecoveryRequest>, CaptureError> {
+        let capture_record_seq = self.next_raw_record_seq;
+        let next_raw_record_seq = capture_record_seq
+            .checked_add(1)
+            .ok_or(CaptureError::RawRecordSequenceExhausted)?;
         raw_writer
-            .send(raw_capture(&envelope, &self.capture_session_id))
+            .send(raw_capture(
+                &envelope,
+                &self.capture_session_id,
+                capture_record_seq,
+            ))
             .await?;
+        self.next_raw_record_seq = next_raw_record_seq;
         let parsed = match adapter.parse(&envelope) {
             Ok(parsed) => parsed,
             Err(error) => {
@@ -1081,6 +1094,7 @@ impl CaptureState {
             && all_connections_ready
             && all_books_ready
             && raw.records > 0
+            && raw.records == self.next_raw_record_seq.saturating_sub(1)
             && (config.output.normalized_path.is_none() || normalized.records > 0)
             && self.parse_errors == 0
             && self.stale_book_events == 0
@@ -1199,9 +1213,14 @@ fn is_lower_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn raw_capture(envelope: &RawEnvelope, capture_session_id: &str) -> RawCapture {
+fn raw_capture(
+    envelope: &RawEnvelope,
+    capture_session_id: &str,
+    capture_record_seq: u64,
+) -> RawCapture {
     RawCapture {
         capture_session_id: Some(capture_session_id.to_string()),
+        capture_record_seq: Some(capture_record_seq),
         venue: envelope.venue,
         conn_id: envelope.conn_id.clone(),
         channel: envelope.channel.clone(),
@@ -1953,7 +1972,7 @@ mod tests {
     async fn shutdown_drain_persists_queued_feed_frames() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("raw.jsonl");
-        let writer = JsonlWriter::start("raw", path, 4, 1_000, 1_000)
+        let writer = JsonlWriter::start("raw", path.clone(), 4, 1_000, 1_000)
             .await
             .unwrap();
         let first_line = include_str!("../../../fixtures/raw/okx/depth-gap.jsonl")
@@ -1988,5 +2007,12 @@ mod tests {
 
         assert_eq!(stats.records, 1);
         assert_eq!(state.processor.stats().accepted, 1);
+        let persisted: RawCapture =
+            serde_json::from_str(std::fs::read_to_string(path).unwrap().trim()).unwrap();
+        assert_eq!(
+            persisted.capture_session_id.as_deref(),
+            Some("test-session")
+        );
+        assert_eq!(persisted.capture_record_seq, Some(1));
     }
 }

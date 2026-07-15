@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{CaptureConfig, CaptureError, digest_hex, is_book_channel};
 
-const ANALYSIS_FORMAT_VERSION: u16 = 3;
+const ANALYSIS_FORMAT_VERSION: u16 = 4;
 const DISTRIBUTION_SAMPLE_CAPACITY: usize = 8_192;
 const MAX_REPORTED_ERRORS: usize = 100;
 
@@ -117,6 +117,11 @@ pub struct CaptureAnalysisReport {
     pub lines: u64,
     pub ignored_lines: u64,
     pub capture_sessions: Vec<String>,
+    pub sequenced_records: u64,
+    pub first_capture_record_seq: Option<u64>,
+    pub last_capture_record_seq: Option<u64>,
+    pub capture_record_sequence_errors: u64,
+    pub capture_record_sequence_complete: bool,
     pub first_recv_ts_ns: Option<u64>,
     pub last_recv_ts_ns: Option<u64>,
     pub duration_ms: Option<f64>,
@@ -204,6 +209,10 @@ struct CaptureAnalyzer<'a> {
     processor: FeedProcessor,
     streams: BTreeMap<StreamKey, StreamAccumulator>,
     sessions: BTreeSet<String>,
+    sequenced_records: u64,
+    first_capture_record_seq: Option<u64>,
+    last_capture_record_seq: Option<u64>,
+    capture_record_sequence_errors: u64,
     first_recv_ts_ns: Option<u64>,
     last_recv_ts_ns: Option<u64>,
     lines: u64,
@@ -242,6 +251,10 @@ impl<'a> CaptureAnalyzer<'a> {
             ),
             streams,
             sessions: BTreeSet::new(),
+            sequenced_records: 0,
+            first_capture_record_seq: None,
+            last_capture_record_seq: None,
+            capture_record_sequence_errors: 0,
             first_recv_ts_ns: None,
             last_recv_ts_ns: None,
             lines: 0,
@@ -257,6 +270,7 @@ impl<'a> CaptureAnalyzer<'a> {
     }
 
     fn on_capture(&mut self, line: usize, capture: RawCapture) {
+        self.observe_record_sequence(line, capture.capture_record_seq);
         let session = capture
             .capture_session_id
             .as_deref()
@@ -344,6 +358,30 @@ impl<'a> CaptureAnalyzer<'a> {
                     | FeedOutput::PrivateAccount { .. } => {}
                 }
             }
+        }
+    }
+
+    fn observe_record_sequence(&mut self, line: usize, sequence: Option<u64>) {
+        let Some(sequence) = sequence else {
+            self.capture_record_sequence_errors =
+                self.capture_record_sequence_errors.saturating_add(1);
+            self.record_error(line, "capture record omits capture_record_seq");
+            return;
+        };
+        self.sequenced_records = self.sequenced_records.saturating_add(1);
+        self.first_capture_record_seq.get_or_insert(sequence);
+        let expected = self
+            .last_capture_record_seq
+            .and_then(|previous| previous.checked_add(1))
+            .unwrap_or(1);
+        self.last_capture_record_seq = Some(sequence);
+        if sequence != expected {
+            self.capture_record_sequence_errors =
+                self.capture_record_sequence_errors.saturating_add(1);
+            self.record_error(
+                line,
+                format!("capture record sequence expected {expected}, received {sequence}"),
+            );
         }
     }
 
@@ -484,6 +522,11 @@ impl<'a> CaptureAnalyzer<'a> {
             .map(|stream| stream.exchange_timestamp_regressions)
             .sum();
         let sessions = self.sessions.into_iter().collect::<Vec<_>>();
+        let capture_record_sequence_complete = self.lines > 0
+            && self.sequenced_records == self.lines
+            && self.first_capture_record_seq == Some(1)
+            && self.last_capture_record_seq == Some(self.lines)
+            && self.capture_record_sequence_errors == 0;
         let duration_ms = match (self.first_recv_ts_ns, self.last_recv_ts_ns) {
             (Some(first), Some(last)) => Some(last.saturating_sub(first) as f64 / 1_000_000.0),
             _ => None,
@@ -491,6 +534,7 @@ impl<'a> CaptureAnalyzer<'a> {
         let integrity_healthy = self.lines > 0
             && self.ignored_lines == 0
             && sessions.len() == 1
+            && capture_record_sequence_complete
             && self.error_count == 0
             && processor.gaps == 0
             && processor.recovery_failures == 0
@@ -513,6 +557,11 @@ impl<'a> CaptureAnalyzer<'a> {
             lines: self.lines,
             ignored_lines: self.ignored_lines,
             capture_sessions: sessions,
+            sequenced_records: self.sequenced_records,
+            first_capture_record_seq: self.first_capture_record_seq,
+            last_capture_record_seq: self.last_capture_record_seq,
+            capture_record_sequence_errors: self.capture_record_sequence_errors,
+            capture_record_sequence_complete,
             first_recv_ts_ns: self.first_recv_ts_ns,
             last_recv_ts_ns: self.last_recv_ts_ns,
             duration_ms,
@@ -924,6 +973,10 @@ mod tests {
         assert!(report.integrity_healthy, "{report:#?}");
         assert_eq!(report.lines, 7);
         assert_eq!(report.capture_sessions, ["reset-session"]);
+        assert_eq!(report.sequenced_records, 7);
+        assert_eq!(report.first_capture_record_seq, Some(1));
+        assert_eq!(report.last_capture_record_seq, Some(7));
+        assert!(report.capture_record_sequence_complete);
         assert_eq!(report.duplicate_events, 3);
         assert_eq!(report.expected_streams.len(), 1);
         assert_eq!(report.expected_streams[0].observed_connections, 2);
@@ -961,6 +1014,42 @@ mod tests {
 
         assert!(!report.integrity_healthy);
         assert_eq!(report.ignored_lines, 2);
+    }
+
+    #[test]
+    fn analyzer_rejects_missing_and_non_contiguous_record_sequences() {
+        let fixture = include_str!("../../../fixtures/raw/okx/depth-reset.jsonl");
+        let mut records = fixture
+            .lines()
+            .map(|line| serde_json::from_str::<RawCapture>(line).unwrap())
+            .collect::<Vec<_>>();
+        records[1].capture_record_seq = None;
+        records[4].capture_record_seq = Some(11);
+        let input = records
+            .iter()
+            .map(|record| serde_json::to_string(record).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+
+        let report = analyze_capture(input.as_bytes(), &config(false)).unwrap();
+
+        assert!(!report.integrity_healthy);
+        assert!(!report.capture_record_sequence_complete);
+        assert_eq!(report.sequenced_records, 6);
+        assert!(report.capture_record_sequence_errors >= 2);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.message.contains("omits capture_record_seq"))
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.message.contains("record sequence expected"))
+        );
     }
 
     #[test]

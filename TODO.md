@@ -113,11 +113,12 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Reserve and fsync a versioned capture run report, bind exact config bytes
   plus effective CLI overrides, and independently verify raw and reconstructed
   normalized artifacts; exercise the gate on a fresh public capture.
-- [x] Upgrade capture evidence to schema 4 with exact Reap build, pinned Java
-  revision, pseudonymous host identity, and Linux disk/memory/clock preflight and
-  periodic enforcement. Bind production research to the same binary and
-  latency-calibrated host, and make the systemd collector bounded and
-  create-new-report strict.
+- [x] Upgrade capture evidence to schema 5 with exact Reap build, pinned Java
+  revision, pseudonymous host identity, Linux disk/memory/clock preflight and
+  periodic enforcement, and a process-global persisted-frame ordinal that
+  rejects missing, duplicated, skipped, or reordered writer records. Bind
+  production research to the same binary and latency-calibrated host, and make
+  the systemd collector bounded and create-new-report strict.
 - [x] Add a deterministic Java-referenced backtest scheduler with receive-time
   raw replay, explicit market/new/cancel/order/account delays, immediate
   `PendingNew` registration, and end-of-horizon execution provenance.
@@ -323,8 +324,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
   derivative quantity, average cost, and settlement ledger into the next file,
   matching Java `updateInputForNextRun` after its terminal mark-to-market,
   balance/margin reset, derivative average-cost reset, and hold release. Dataset
-  sequences currently reset to independently certified opening snapshots, and
-  separate capture processes cannot yet prove a no-event-gap handoff.
+  sequences currently reset to independently certified opening snapshots. Raw
+  frames now have a verified process-global ordinal, but capture segmentation
+  and settled backtest carry still need one same-session handoff contract.
 - [x] Independently bind the reconstructed deployment candidate's effective
   strategy hash to the exact proposed production live config, rejecting smoke,
   demo, invalid reconstruction, ambiguous provenance, and strategy drift.
@@ -366,7 +368,7 @@ architecture in [docs/architecture.md](docs/architecture.md).
   unobservable. Margin
   spot is unsupported and would require a borrow-interest model before
   enablement.
-- [x] Require a verified schema-4 capture run report for every
+- [x] Require a verified schema-5 capture run report for every
   production-candidate raw dataset, bind optional normalized output, embed the
   verification result, and recheck all artifact hashes after research runs.
 - [ ] Deploy and exercise the webhook/host guards, systemd supervision, external

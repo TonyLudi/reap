@@ -27,6 +27,8 @@ cargo run -p reap-cli -- capture \
 The example captures spot and swap books/trades plus index, funding, mark, and
 price-limit inputs used by iarb2. Every subscription has two independent
 connections. Raw frames are canonical and written sequentially within one run.
+The capture event loop assigns each frame a process-global `capture_record_seq`
+before the bounded writer, independent of OKX's channel-specific book sequence.
 The optional
 `output.normalized_path` is intended for short diagnostics because full
 400-level snapshots are much larger than raw deltas.
@@ -85,8 +87,9 @@ At pinned `imm-strategy` revision
 `AbstractOkxNitroL2Subscriber` owns the Java order-book websocket lifecycle and
 its `onSocketDisconnected` path participates in reconnect handling. The Java
 collector does not provide this Rust run-report, executable/host provenance, or
-host guard. Those controls harden the Java-referenced connectivity boundary;
-they are not a parity claim.
+host guard, and the pinned collector has no versioned persisted-frame ordinal.
+Those controls harden the Java-referenced connectivity boundary; they are not a
+parity claim.
 
 `runtime.connection_attempt_interval_ms` defaults to 400 ms. Official endpoint
 configs also require `runtime.connection_attempt_pacer_path`. Every public,
@@ -119,14 +122,25 @@ not multiple hosts behind one egress IP. Use isolated egress or an external
 IP-wide coordinator for that topology. The interval and path are part of exact
 config provenance, and the total paced startup must fit inside live readiness.
 
-Every frame and run report carries a generated `capture_session_id`. The report,
-raw output, and normalized output use create-new mode-`0600` semantics on Unix:
+Every frame and run report carries a generated `capture_session_id`; every raw
+frame also carries a process-global `capture_record_seq` assigned from `1` at
+the single capture event-loop/writer boundary. The report, raw output, and
+normalized output use create-new mode-`0600` semantics on Unix:
 startup refuses an existing path and never appends a second process session.
 The report is reserved before config parsing or network startup; a pre-report
 failure leaves an empty reserved file that verification rejects. Use unique
 paths for each process. Strict replay and raw backtest also reject files
 containing more than one session ID, because process downtime is not a continuous
 HFT market stream.
+
+The schema-current verifier requires exactly one ordinal for every persisted
+raw record, with first `1`, last equal to `raw_records`, and no missing,
+duplicate, skipped, regressed, or reordered value. This detects writer-boundary
+loss across all channels. It complements rather than replaces OKX book
+`prevSeqId` continuity, because non-book channels do not share one exchange
+sequence and frames can arrive concurrently from redundant sockets. Legacy raw
+files without ordinals remain readable for diagnostics but cannot pass current
+capture or production-research evidence gates.
 
 Book deduplication keys exact redundant images by action, `prevSeqId`, `seqId`,
 exchange timestamp, and raw-payload hash. A replica conflict is not suppressed;
@@ -151,7 +165,7 @@ periodic check. A redundant-socket disconnect can
 remain clean only when the other replica preserves sequence continuity;
 inspect disconnect, duplicate, and writer queue counts on every run.
 
-The schema-4 run report includes the Reap version, pinned Java revision, exact
+The schema-5 run report includes the Reap version, pinned Java revision, exact
 capture-executable SHA-256, pseudonymous host identity when guarded, host
 preflight/periodic evidence within explicit session wall-clock bounds, exact
 source-config byte count/SHA-256, effective
@@ -725,7 +739,7 @@ For real research, create a new manifest alongside immutable capture files:
 3. Give every capture a unique dataset ID/path/content hash. Every test window
    must occur strictly after its fold's training windows, and a test dataset can
    belong to only one fold. Set each raw dataset's `capture_config` and
-   `capture_report` to the exact capture-only TOML and schema-4 report from that
+   `capture_report` to the exact capture-only TOML and schema-5 report from that
    session. When the report declares normalized output, also set
    `normalized_path` to that retained artifact. Production mode verifies and
    embeds the report, reruns and retains strict capture analysis, and performs a
@@ -961,7 +975,7 @@ normalized replay reported 221 global cross-stream exchange-time regressions,
 including one of 41.937 seconds, despite monotonic per-source receive time. This
 is direct evidence for keeping raw receive-time replay authoritative.
 That historical schema-3 smoke predates binary/host guard provenance and is not
-admissible to the current schema-4 production-candidate gate.
+admissible to the current schema-5 production-candidate gate.
 
 These are connectivity, integrity, and replay-plumbing evidence only. They are
 not a sustained full-depth dataset, execution-model calibration, profitability
