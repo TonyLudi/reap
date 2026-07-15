@@ -727,7 +727,7 @@ artifact creation, and exit status.
 
 For real research, create a new manifest alongside immutable capture files:
 
-1. Set `schema_version = 7`, `mode = "production_candidate"`, retain the pinned
+1. Set `schema_version = 8`, `mode = "production_candidate"`, retain the pinned
    Java revision, and point `latency_calibration` to the passed create-new JSON
    artifact whose profile is embedded exactly in the baseline scenario.
 2. List explicit full candidate TOML files and set `deployment_candidate_id` to
@@ -736,9 +736,13 @@ For real research, create a new manifest alongside immutable capture files:
    an implicit parameter grid.
    Candidate files must omit `[initial_portfolio]`; production opening capital
    belongs to dataset evidence, not a tunable candidate.
-3. Give every capture a unique dataset ID/path/content hash. Every test window
-   must occur strictly after its fold's training windows, and a test dataset can
-   belong to only one fold. Set each raw dataset's `capture_config` and
+3. Give every logical window a unique dataset ID. Normally, give every capture
+   session a unique immutable source path and content hash. One verified raw
+   capture may instead be partitioned into disjoint inclusive
+   `capture_record_range` windows. Link every later adjacent window with
+   `continuation_of`; production chain roots must start at record `1`, and chains
+   cannot branch. Every test window must occur strictly after its fold's training
+   windows, and a test dataset can belong to only one fold. Set each raw dataset's `capture_config` and
    `capture_report` to the exact capture-only TOML and schema-5 report from that
    session. When the report declares normalized output, also set
    `normalized_path` to that retained artifact. Production mode verifies and
@@ -749,20 +753,32 @@ For real research, create a new manifest alongside immutable capture files:
    host as latency calibration, and the
    book/trade/index/mark/limit/funding channels needed by every candidate.
    Quiesce the exact production account and collect one unique, passing
-   `certify-account` artifact immediately before each capture. Add the nested
-   dataset binding, for example:
+   `certify-account` artifact immediately before each capture session. Bind it
+   only to that session's chain root; continuations derive their opening state
+   from the settled parent. For example, a held-out window in one continuous
+   capture can be declared as:
 
    ```toml
    [[datasets]]
    id = "train-20260715"
    path = "capture-20260715.jsonl"
    format = "raw_capture"
+   capture_record_range = { first = 1, last = 500000 }
    capture_config = "capture-okx-public.toml"
    capture_report = "capture-20260715.report.json"
 
    [datasets.opening_account]
    certification = "account-20260715.json"
    spot_valuation_symbols = { BTC = "BTC-USDT" }
+
+   [[datasets]]
+   id = "test-20260715"
+   path = "capture-20260715.jsonl"
+   format = "raw_capture"
+   capture_record_range = { first = 500001, last = 750000 }
+   continuation_of = "train-20260715"
+   capture_config = "capture-okx-public.toml"
+   capture_report = "capture-20260715.report.json"
    ```
 
    Set `gates.maximum_opening_account_gap_ms` to the reviewed quiescent handoff
@@ -770,7 +786,12 @@ For real research, create a new manifest alongside immutable capture files:
    requires the certification to finish before capture on the same exact build,
    calibrated host, production account, and instrument accounting scope. It
    rejects reused certifications, nonzero unmodeled currencies/positions, and
-   candidate-dependent derived state.
+   candidate-dependent derived state. Every member of a range chain must resolve
+   to the same raw/config/report/optional-normalized paths. Replay independently
+   verifies the full parent file's session and process-global record sequence,
+   warms parser/deduplication/book state plus the latest index, funding, mark, and
+   price-limit state from the prefix, and otherwise emits only events in the
+   selected range.
 4. Define exactly one baseline using empirically calibrated execution values,
    set `calibrated = true`, and add at least two stress scenarios. Profile stress
    uses the same seed and must first-order stochastically dominate baseline for
@@ -840,18 +861,33 @@ They need not be zero: positive calibrated latency naturally censors the last
 captured event, and the runner does not execute future actions against stale
 depth. Resting live quotes are also valid at an arbitrary dataset boundary;
 bound them with `maximum_test_active_orders`, active-order notional gates, and
-pending-delta gates instead of treating them as completed work.
+pending-delta gates instead of treating them as completed work. A nonempty
+portfolio run also leaves the next deterministic 10-second full-account refresh
+scheduled beyond the cutoff. That refresh is counted as pending strategy work,
+so calibrate `maximum_pending_non_funding_actions_per_fold` for at least those
+per-run refreshes plus legitimate latency-censored tail actions.
 
-Each dataset is an independent run. It resets either to zero and reports
-`independent_zero_initial_portfolio`, or resets to the exact candidate snapshot
-and reports `independent_configured_initial_portfolio`. Schema-7 production
-datasets instead report `independent_certified_dataset_portfolio` and reset to
-their source-rebuilt account certification. Unlike Java
-`ChaosBackTestMultiRunService`, Rust still does not carry ending positions
-between files. Use a single continuous capture for an evaluation segment when
-position continuity matters and gate terminal delta/gross exposure. Research
-aggregation sums each run's `net_pnl_usd`, not final equity, but must not be
-interpreted as cross-file position carry.
+Unchained datasets remain independent runs. They reset to zero, the exact
+candidate snapshot, or a source-rebuilt certified chain-root snapshot and report
+the corresponding independent portfolio semantics. Schema-8 adjacent raw ranges
+instead report `sequential_settled_carry`. At every range boundary Reap mirrors
+Java `ChaosBackTestMultiRunService.finishUp()`: it excludes live/pending orders
+and delayed non-funding actions from carry, marks balances and derivative
+positions at terminal prices, resets derivative average cost to that mark,
+recomputes available/equity/margin fields, releases holds, and preserves pending
+funding plus its settlement watermark. A terminal strategy halt or incomplete
+accounting invalidates the carry. The child must have the same nonempty capture session, the exact next
+process-global record ordinal, and a receive-time boundary no earlier than the
+settled parent. The selected candidate's final training carry may seed the first
+held-out test range when it is the immediate continuation; every stress scenario
+starts from that same baseline economic state with its configured margin
+assumptions rebound and revalidated.
+
+This continuity applies only to explicit ranges of one verified capture file.
+Rotated files and separate capture processes are still independent because the
+writer does not yet preserve a verifiable session and process-global ordinal
+across rotation. Research aggregation sums each run's `net_pnl_usd`, not final
+equity; continuity does not turn final capital into profit.
 
 Strict analysis requires one capture session, every configured stream on its
 configured number of source connections, a ready book for every configured
@@ -2558,7 +2594,7 @@ output is an owner-only create-new file synced with its parent directory. Archiv
 the exact config, calibration, every source report, and this passing verification
 artifact together; the calibration's internal `passed` flag is insufficient.
 
-A production-candidate research manifest must use schema 7, predeclare its
+A production-candidate research manifest must use schema 8, predeclare its
 `deployment_candidate_id`, set
 `latency_calibration` to the JSON artifact, set the baseline execution
 `calibrated = true`, and embed exactly the artifact's profile. Research treats

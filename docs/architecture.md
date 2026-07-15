@@ -769,10 +769,20 @@ maker/taker rates. Reports expose exact and estimated fee-fill counts. The
 opening model intentionally supports one account. Manual snapshots default
 available/equity to cash total, while certified snapshots retain OKX
 `availBal`, `eq`, `maxLoan`, forced-repayment indicator, `mgnRatio`, `adjEq`, and
-`notionalUsd`. Post-fill synthetic updates preserve opening available/equity
-offsets as cash changes; they are not a dynamic exchange margin engine. Cash
-total remains non-negative and liability must be zero because the model does
-not support borrowing interest, liquidation, margin discounts, or tax. It cannot
+`notionalUsd`. Post-fill updates and a deterministic 10-second publisher send
+full balances, derivative positions, native-currency mark-to-market equity, and
+recalculated margin state to the strategy. The periodic path waits behind any
+latency-delayed fill-account update, so it cannot reveal a fill early. The
+calculated margin ratio is equity divided by derivative notional. The simulated
+exchange ratio follows pinned Java `PortfolioExchAcctCalculator`: equity divided
+by notional-over-leverage, multiplied by its unusually named
+`EXCH_CMR_RATIO_DISCOUNT` value `50`; the Rust configuration therefore calls it
+`exchange_cmr_multiplier`. Zero notional and zero liability omit the ratio rather
+than creating an unsafe infinity. This remains a research margin model, not OKX
+tier, collateral-discount, liquidation, or interest accounting. Cash total
+remains non-negative at accepted carry boundaries and liability must be zero
+because the model does not support borrowing interest, liquidation, venue
+margin discounts, or tax. It cannot
 infer a missing funding event when the source dataset never contained one. A
 separate offline production-evidence path
 now reconstructs normal trade/funding bills and derivative close PnL from
@@ -803,9 +813,10 @@ acceptance explicit in a versioned TOML manifest:
   same candidate wins training-only selection in every fold.
 - Exactly one baseline and zero or more no-less-conservative execution stress
   scenarios run on test data.
-- Dataset IDs, canonical paths, and byte-identical content cannot be reused to
-  disguise train/test leakage; event-time windows must be non-overlapping and
-  strictly chronological.
+- Dataset IDs and copied byte-identical content cannot be reused to disguise
+  train/test leakage; event-time windows must be non-overlapping and strictly
+  chronological. One canonical raw file may appear more than once only through
+  disjoint explicit process-global record ranges.
 - Production raw captures must name their capture-only config and schema-5 run
   report. The report verifier binds exact config bytes, capture executable,
   host, pinned Java revision, host-guard evidence, and effective output overrides
@@ -828,40 +839,61 @@ acceptance explicit in a versioned TOML manifest:
   training and test fold aggregate must also meet a nonzero realized funding
   settlement gate.
 
-Each Rust dataset starts from an independent strategy instance and either zero
-state (`independent_zero_initial_portfolio`), a candidate's exact configured
-snapshot (`independent_configured_initial_portfolio`), or a dataset-specific
-account certification (`independent_certified_dataset_portfolio`). Schema-7
-production candidate files must omit opening capital. Every raw dataset instead
-references one unique certification collected before its capture and supplies
-an explicit currency-to-spot valuation mapping. Research invokes the existing
-offline verifier against embedded raw OKX responses, then requires a passing
-cash/zero-liability policy, production environment, identical Reap executable
-and pinned Java revision, the latency-calibrated capture host, one account-bound
-candidate instrument universe, a bounded certification-to-capture gap, and no
-nonzero unmodeled currency or position. It derives one exact portfolio and
-requires that derivation to be identical for every candidate. This still differs
-from Java's daily ending position carry: use one continuous capture as an evaluation dataset when
-inventory continuity matters, and constrain terminal delta/gross exposure in
-the manifest. Cross-file position carry must not be inferred. Aggregation now
-sums each run's opening-adjusted `net_pnl_usd`, never final account equity, and
-terminal strategy safety halts are explicit evidence failures. A schema-7
-`production_candidate` manifest additionally requires one
-predeclared deployment candidate, at least three folds, two stress scenarios,
-nonzero event, fill, and duration gates, calibrated baseline execution whose
-latency profile exactly matches a passed source-bound calibration artifact,
-complete accounting, and explicit bounds on non-funding work censored by each
-data horizon. Stress scenarios may use explicitly uncalibrated deterministic
-haircuts.
+Schema 8 retains independent runs from zero state
+(`independent_zero_initial_portfolio`), a candidate snapshot
+(`independent_configured_initial_portfolio`), or a dataset certification
+(`independent_certified_dataset_portfolio`). It also supports
+`sequential_settled_carry` for explicit ranges of one raw capture. A continuation
+names `continuation_of`, uses the same canonical raw/config/report/normalized
+evidence as its parent, begins at exactly the next `capture_record_seq`, stays in
+the same non-empty capture session, and cannot regress receive time. Ranges must
+be disjoint and each parent has at most one child. Replay warms deduplication and
+book reducers from the immutable parent prefix, restores the latest index,
+funding, mark, and price-limit state, then emits ready boundary books before
+selected deltas. Burst and trade events are not replayed as snapshots. This lets
+the fresh strategy instance receive stateful subscription equivalents before it
+can quote without inventing historical executions.
+
+Each chain range starts a fresh strategy and matcher, as Java starts a new run.
+At the boundary Rust marks the portfolio to terminal depth/exchange marks, sets
+account balances and availability to equity, resets nonzero derivative average
+costs to those marks, recomputes margin, and carries current currency
+observations plus pending and settled funding watermarks. Java `tryToStop()`
+cancels orders before `finishUp()`; correspondingly, delayed non-funding actions
+and resting orders remain visible in the source report but are not installed in
+the next runner. A terminal strategy safety halt or incomplete accounting
+prevents carry.
+
+Training sequences must begin from a declared root. A test sequence may begin
+independently or immediately continue the selected candidate's final training
+range; non-selected candidate state never enters held-out evaluation. Every test
+stress scenario starts from that same selected baseline economic state and
+rebinds only validated execution-dependent margin fields. Aggregation sums each
+range's opening-adjusted `net_pnl_usd`, never final account equity.
+
+Schema-8 production candidate files omit opening capital. Every independent
+dataset or chain root references one unique certification collected before the
+capture and supplies an explicit currency-to-spot valuation mapping;
+continuations omit opening certification. Research independently rebuilds the
+embedded raw OKX responses and requires a passing cash/zero-liability policy,
+production environment, identical Reap executable and pinned Java revision, the
+latency-calibrated capture host, one account-bound candidate instrument universe,
+a bounded certification-to-capture gap, and no nonzero unmodeled currency or
+position. The derived root portfolio must be identical for every candidate. A
+schema-8 `production_candidate` manifest additionally requires one predeclared
+deployment candidate, at least three folds, two stress scenarios, nonzero event,
+fill, and duration gates, calibrated baseline execution whose latency profile
+exactly matches a passed source-bound calibration artifact, complete accounting,
+and explicit bounds on non-funding work censored by each data horizon. Stress
+scenarios may use explicitly uncalibrated deterministic haircuts.
 
 The certified opening snapshot remains point-in-time evidence, not an exchange
 statement or an atomic venue tick. The account must remain quiescent between
 certification and capture, and no passing target-account artifact exists yet.
-Schema 7 closes candidate-specific capital and source-binding gaps, but separate
-capture files still do not carry simulated ending balances, derivative average
-cost, or settlement state into the next file as Java
-`updateInputForNextRun()` does. Use one continuous evaluation capture until that
-carry contract is implemented and verified.
+Carry is permitted only inside one verified process session and canonical raw
+file. Restarted collectors reset session identity and the process-global ordinal;
+cross-process or independently rotated files remain separate until rotation can
+preserve both values without an event gap.
 
 The CLI independently verifies a schema-4 latency artifact before release use.
 It re-hashes an explicit complete set of archived live reports, reruns each

@@ -1,9 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use anyhow::{Result, bail};
 use reap_core::{FillFee, FillLiquidity, OrderUpdate, Symbol};
 use reap_strategy::InstrumentConfig;
 
-use crate::execution::BacktestInitialPortfolioConfig;
+use crate::execution::{
+    BacktestInitialMarginConfig, BacktestInitialPortfolioConfig, BacktestInitialPositionConfig,
+};
 
 #[derive(Debug, Clone)]
 pub struct Portfolio {
@@ -484,6 +487,181 @@ impl Portfolio {
         balance
     }
 
+    /// Reconstructs native-currency account equity at current marks.
+    pub fn account_equity(&self, currency: &str, marks: &HashMap<Symbol, f64>) -> Option<f64> {
+        let currency = normalize_currency(currency);
+        let mut equity = self.cash_by_currency.get(&currency).copied().unwrap_or(0.0);
+        for (symbol, qty) in &self.positions {
+            let instrument = self.instruments.get(symbol)?;
+            if instrument.kind.is_spot() {
+                if normalize_currency(&instrument.base_currency) == currency {
+                    equity += qty;
+                }
+                continue;
+            }
+
+            if instrument.kind.is_inverse() {
+                let settle_currency = if instrument.settle_currency.is_empty() {
+                    normalize_currency(&instrument.base_currency)
+                } else {
+                    normalize_currency(&instrument.settle_currency)
+                };
+                if settle_currency != currency {
+                    continue;
+                }
+                let inverse_cash = self.inverse_cash_coin.get(symbol).copied().unwrap_or(0.0);
+                if *qty == 0.0 && inverse_cash == 0.0 {
+                    continue;
+                }
+                let mark = valid_mark(marks, symbol)?;
+                equity += inverse_cash - qty * instrument.contract_value / mark;
+            } else if instrument_accounting_currency(instrument) == currency {
+                if *qty == 0.0 {
+                    continue;
+                }
+                equity += qty * instrument.contract_value * valid_mark(marks, symbol)?;
+            }
+        }
+        equity.is_finite().then_some(equity)
+    }
+
+    pub fn derivative_notional_usd_checked(
+        &self,
+        marks: &HashMap<Symbol, f64>,
+        currency_rates_usd: &HashMap<String, f64>,
+    ) -> Option<f64> {
+        let mut notional_usd = 0.0;
+        for (symbol, qty) in &self.positions {
+            let instrument = self.instruments.get(symbol)?;
+            if instrument.kind.is_spot() || *qty == 0.0 {
+                continue;
+            }
+            let notional = if instrument.kind.is_inverse() {
+                qty * instrument.contract_value
+            } else {
+                qty * instrument.contract_value * valid_mark(marks, symbol)?
+            };
+            let converted = notional.abs()
+                * currency_rate_checked(
+                    &instrument_accounting_currency(instrument),
+                    currency_rates_usd,
+                )?;
+            if !converted.is_finite() {
+                return None;
+            }
+            notional_usd += converted;
+        }
+        notional_usd.is_finite().then_some(notional_usd)
+    }
+
+    pub(crate) fn settled_initial_portfolio(
+        &self,
+        initial: &BacktestInitialPortfolioConfig,
+        marks: &HashMap<Symbol, f64>,
+        currency_rates_usd: &HashMap<String, f64>,
+        derivative_leverage: f64,
+        exchange_cmr_multiplier: f64,
+    ) -> Result<BacktestInitialPortfolioConfig> {
+        let terminal_equity_usd = self
+            .equity_usd_checked(marks, currency_rates_usd)
+            .ok_or_else(|| anyhow::anyhow!("terminal portfolio cannot be valued exactly"))?;
+        if terminal_equity_usd < 0.0 {
+            bail!("terminal portfolio equity is negative: {terminal_equity_usd}");
+        }
+        let derivative_notional_usd = self
+            .derivative_notional_usd_checked(marks, currency_rates_usd)
+            .ok_or_else(|| {
+                anyhow::anyhow!("terminal derivative notional cannot be valued exactly")
+            })?;
+
+        let mut balances = Vec::with_capacity(initial.balances.len());
+        for opening in &initial.balances {
+            let total = self
+                .account_equity(&opening.currency, marks)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "terminal account equity for {} cannot be valued exactly",
+                        opening.currency
+                    )
+                })?;
+            if total < 0.0 {
+                bail!(
+                    "terminal account equity for {} is negative: {total}",
+                    opening.currency
+                );
+            }
+            let mut settled = opening.clone();
+            settled.total = total;
+            settled.available = Some(total);
+            settled.equity = Some(total);
+            settled.liability = Some(0.0);
+            balances.push(settled);
+        }
+
+        let opening_modes = initial
+            .positions
+            .iter()
+            .map(|position| (position.symbol.as_str(), position.margin_mode))
+            .collect::<HashMap<_, _>>();
+        let mut positions = Vec::new();
+        for instrument in self
+            .instruments
+            .values()
+            .filter(|instrument| instrument.kind.is_derivative())
+        {
+            let qty = self
+                .positions
+                .get(&instrument.symbol)
+                .copied()
+                .unwrap_or(0.0);
+            let margin_mode = opening_modes
+                .get(instrument.symbol.as_str())
+                .copied()
+                .flatten();
+            if qty != 0.0 && margin_mode.is_none() {
+                bail!(
+                    "terminal derivative position {} has no configured margin mode",
+                    instrument.symbol
+                );
+            }
+            if qty == 0.0 && !opening_modes.contains_key(instrument.symbol.as_str()) {
+                continue;
+            }
+            positions.push(BacktestInitialPositionConfig {
+                symbol: instrument.symbol.clone(),
+                qty,
+                avg_price: if qty == 0.0 {
+                    0.0
+                } else {
+                    valid_mark(marks, &instrument.symbol).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "terminal derivative position {} has no valid mark",
+                            instrument.symbol
+                        )
+                    })?
+                },
+                margin_mode,
+            });
+        }
+
+        let ratio = (derivative_notional_usd > 0.0)
+            .then_some(terminal_equity_usd / derivative_notional_usd);
+        let exchange_ratio = ratio
+            .map(|ratio| ratio * derivative_leverage * exchange_cmr_multiplier)
+            .filter(|ratio| ratio.is_finite());
+        Ok(BacktestInitialPortfolioConfig {
+            account_id: initial.account_id.clone(),
+            balances,
+            positions,
+            margin: BacktestInitialMarginConfig {
+                ratio,
+                exchange_ratio,
+                adjusted_equity_usd: Some(terminal_equity_usd),
+                notional_usd: Some(derivative_notional_usd),
+            },
+        })
+    }
+
     #[cfg(test)]
     pub fn missing_currency_rates(&self, currency_rates_usd: &HashMap<String, f64>) -> Vec<String> {
         let mut required = BTreeSet::new();
@@ -568,6 +746,13 @@ fn normalize_currency(currency: &str) -> String {
     } else {
         currency.to_ascii_uppercase()
     }
+}
+
+fn valid_mark(marks: &HashMap<Symbol, f64>, symbol: &str) -> Option<f64> {
+    marks
+        .get(symbol)
+        .copied()
+        .filter(|mark| mark.is_finite() && *mark > 0.0)
 }
 
 fn currency_rate_checked(currency: &str, currency_rates_usd: &HashMap<String, f64>) -> Option<f64> {
@@ -715,6 +900,33 @@ mod tests {
         );
         assert_eq!(
             portfolio.equity_usd_checked(&final_marks, &rates),
+            Some(10_230.0)
+        );
+
+        let settled = portfolio
+            .settled_initial_portfolio(&initial, &final_marks, &rates, 1.0, 50.0)
+            .unwrap();
+        let settled_btc = settled
+            .balances
+            .iter()
+            .find(|balance| balance.currency == "BTC")
+            .unwrap();
+        let settled_usdt = settled
+            .balances
+            .iter()
+            .find(|balance| balance.currency == "USDT")
+            .unwrap();
+        assert_eq!(settled_btc.total, 2.0);
+        assert_eq!(settled_btc.available(), 2.0);
+        assert_eq!(settled_usdt.total, 10_010.0);
+        assert_eq!(settled_usdt.available(), 10_010.0);
+        assert_eq!(settled.positions[0].qty, 10.0);
+        assert_eq!(settled.positions[0].avg_price, 110.0);
+        assert_eq!(settled.margin.adjusted_equity_usd, Some(10_230.0));
+        assert_eq!(settled.margin.notional_usd, Some(110.0));
+        let reconstructed = Portfolio::with_initial(&instruments, &settled);
+        assert_eq!(
+            reconstructed.equity_usd_checked(&final_marks, &rates),
             Some(10_230.0)
         );
 

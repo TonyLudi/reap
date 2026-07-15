@@ -21,9 +21,11 @@ pub use execution::{
 use matching::MatchingAssumptions;
 pub use matching::MatchingEngine;
 pub use replay::{
-    ReplayRow, TimedReplayEvent, load_events_from_path, load_normalized_jsonl,
-    load_normalized_jsonl_from_path, replay_raw_capture, replay_raw_capture_path,
-    replay_raw_capture_timed, replay_raw_capture_timed_path,
+    RawCaptureRecordRange, RawReplayBoundary, ReplayRow, TimedReplayEvent, load_events_from_path,
+    load_normalized_jsonl, load_normalized_jsonl_from_path, replay_raw_capture,
+    replay_raw_capture_path, replay_raw_capture_timed, replay_raw_capture_timed_path,
+    replay_raw_capture_timed_path_with_boundary, replay_raw_capture_timed_range,
+    replay_raw_capture_timed_range_path,
 };
 pub use research::{
     CandidateProvenance, CandidateTrainingReport, DatasetPortfolioSemantics, DatasetProvenance,
@@ -50,14 +52,16 @@ use crate::portfolio::{Portfolio, required_accounting_currencies};
 #[cfg(test)]
 use reap_core::FundingSettlement;
 use reap_core::{
-    AccountUpdate, Balance, FillLiquidity, MarketEvent, NormalizedEvent, OrderEvent, OrderIntent,
-    OrderUpdate, Position, StrategyEvent, Symbol,
+    AccountUpdate, Balance, FillLiquidity, MarginSnapshot, MarketEvent, NormalizedEvent,
+    OrderEvent, OrderIntent, OrderUpdate, Position, StrategyEvent, Symbol,
 };
 use reap_strategy::{ChaosConfig, ChaosStrategy, Strategy};
 
 const MAX_ACTIONS_PER_DRAIN: usize = 1_000_000;
 const NS_PER_MS: u64 = 1_000_000;
 const FUNDING_LATE_TOLERANCE_NS: u64 = 60_000 * NS_PER_MS;
+const ACCOUNT_REFRESH_INTERVAL_NS: u64 = 10_000 * NS_PER_MS;
+pub const BACKTEST_CARRY_STATE_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BacktestCurrencyRateReport {
@@ -71,6 +75,40 @@ pub struct BacktestCurrencyRateReport {
     pub usable: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BacktestCarryCurrencyRate {
+    pub currency: String,
+    pub index_symbol: Symbol,
+    pub usd_per_unit: f64,
+    pub source_ts_ms: u64,
+    pub effective_at_ns: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BacktestPendingFundingCarry {
+    pub symbol: Symbol,
+    pub funding_time_ms: u64,
+    pub due_at_ns: u64,
+    pub realized_rate: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BacktestCarryState {
+    pub schema_version: u16,
+    pub settled_at_ns: u64,
+    pub terminal_equity_usd: f64,
+    pub source_raw_boundary: Option<RawReplayBoundary>,
+    pub portfolio: BacktestInitialPortfolioConfig,
+    pub terminal_depth_marks: BTreeMap<Symbol, f64>,
+    pub terminal_exchange_marks: BTreeMap<Symbol, f64>,
+    pub currency_rates: Vec<BacktestCarryCurrencyRate>,
+    pub pending_funding: Vec<BacktestPendingFundingCarry>,
+    pub last_settled_funding_time_ms: BTreeMap<Symbol, u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BacktestReport {
     pub execution: BacktestExecutionConfig,
@@ -78,6 +116,8 @@ pub struct BacktestReport {
     pub initial_portfolio: BacktestInitialPortfolioConfig,
     pub latency_usage: Vec<BacktestLatencyUsage>,
     pub time_basis: BacktestTimeBasis,
+    #[serde(default)]
+    pub raw_replay_boundary: Option<RawReplayBoundary>,
     pub input_events: u64,
     pub first_arrival_ns: Option<u64>,
     pub last_arrival_ns: Option<u64>,
@@ -107,6 +147,7 @@ pub struct BacktestReport {
     pub pending_order_update_actions: usize,
     pub pending_strategy_event_actions: usize,
     pub pending_funding_actions: usize,
+    pub periodic_account_refreshes: u64,
     pub pending_orders: usize,
     pub live_orders: usize,
     pub pending_cancel_requests: usize,
@@ -173,6 +214,10 @@ pub struct BacktestReport {
     pub missed_funding_settlements: u64,
     pub funding_settlement_failures: u64,
     pub accounting_complete: bool,
+    #[serde(default)]
+    pub settled_carry_state: Option<BacktestCarryState>,
+    #[serde(default)]
+    pub carry_state_failures: Vec<String>,
     pub positions: BTreeMap<Symbol, f64>,
     #[serde(default)]
     pub position_avg_prices: BTreeMap<Symbol, f64>,
@@ -190,7 +235,9 @@ enum ScheduledAction {
         reason: String,
     },
     DeliverOrder(OrderUpdate),
+    DeliverAccount(AccountUpdate),
     DeliverStrategy(StrategyEvent),
+    RefreshAccount,
     SettleFunding {
         symbol: Symbol,
         funding_time_ms: u64,
@@ -205,6 +252,7 @@ struct CurrencyRateObservation {
 }
 
 pub struct BacktestRunner {
+    strategy_config: ChaosConfig,
     strategy: ChaosStrategy,
     matchers: BTreeMap<Symbol, MatchingEngine>,
     portfolio: Portfolio,
@@ -213,9 +261,14 @@ pub struct BacktestRunner {
     execution: BacktestExecutionConfig,
     latency_sampler: BacktestLatencySampler,
     time_basis: BacktestTimeBasis,
+    raw_replay_boundary: Option<RawReplayBoundary>,
+    carry_source_boundary: Option<RawReplayBoundary>,
     scheduled: BTreeMap<(u64, u64), ScheduledAction>,
     next_action_seq: u64,
     pending_cancels: HashSet<String>,
+    pending_fill_account_updates: usize,
+    last_account_publish_ns: Option<u64>,
+    periodic_account_refreshes: u64,
     depth_marks: HashMap<Symbol, f64>,
     exchange_marks: HashMap<Symbol, f64>,
     currency_by_index_symbol: HashMap<Symbol, String>,
@@ -223,6 +276,7 @@ pub struct BacktestRunner {
     realized_funding_rates: HashMap<(Symbol, u64), f64>,
     scheduled_funding: HashSet<(Symbol, u64)>,
     settled_funding: HashSet<(Symbol, u64)>,
+    last_settled_funding_time_ms: BTreeMap<Symbol, u64>,
     now_ns: u64,
     first_arrival_ns: Option<u64>,
     last_arrival_ns: Option<u64>,
@@ -267,6 +321,288 @@ pub struct BacktestRunner {
     invalid_risk_metric_samples: u64,
 }
 
+impl BacktestCarryState {
+    pub fn validate_for(
+        &self,
+        config: &ChaosConfig,
+        execution: &BacktestExecutionConfig,
+    ) -> Result<()> {
+        if self.schema_version != BACKTEST_CARRY_STATE_SCHEMA_VERSION {
+            bail!(
+                "unsupported backtest carry-state schema {}, expected {}",
+                self.schema_version,
+                BACKTEST_CARRY_STATE_SCHEMA_VERSION
+            );
+        }
+        if !self.terminal_equity_usd.is_finite() || self.terminal_equity_usd < 0.0 {
+            bail!("backtest carry terminal_equity_usd must be finite and non-negative");
+        }
+        execution.validate()?;
+        self.portfolio
+            .validate(&config.effective(), execution)
+            .context("invalid settled carry portfolio")?;
+        if self.portfolio.is_empty() {
+            bail!("settled carry requires a non-empty account portfolio");
+        }
+
+        let instruments = config
+            .instruments
+            .iter()
+            .map(|instrument| (instrument.symbol.as_str(), instrument))
+            .collect::<HashMap<_, _>>();
+        for marks in [&self.terminal_depth_marks, &self.terminal_exchange_marks] {
+            for (symbol, mark) in marks {
+                if !instruments.contains_key(symbol.as_str()) {
+                    bail!("settled carry contains a mark for unknown symbol {symbol}");
+                }
+                if !mark.is_finite() || *mark <= 0.0 {
+                    bail!("settled carry mark for {symbol} must be finite and positive");
+                }
+            }
+        }
+
+        let expected_rates = execution
+            .currency_rates
+            .iter()
+            .map(|route| (route.currency.as_str(), route.index_symbol.as_str()))
+            .collect::<HashMap<_, _>>();
+        if self.currency_rates.len() != expected_rates.len() {
+            bail!(
+                "settled carry has {} currency rates, expected {}",
+                self.currency_rates.len(),
+                expected_rates.len()
+            );
+        }
+        let mut rates = HashMap::new();
+        for rate in &self.currency_rates {
+            if expected_rates.get(rate.currency.as_str()).copied()
+                != Some(rate.index_symbol.as_str())
+            {
+                bail!(
+                    "settled carry currency route {}/{} does not match execution config",
+                    rate.currency,
+                    rate.index_symbol
+                );
+            }
+            if !rate.usd_per_unit.is_finite() || rate.usd_per_unit <= 0.0 {
+                bail!(
+                    "settled carry currency rate for {} must be finite and positive",
+                    rate.currency
+                );
+            }
+            if rate.effective_at_ns > self.settled_at_ns {
+                bail!(
+                    "settled carry currency rate for {} is effective after settlement",
+                    rate.currency
+                );
+            }
+            if rates
+                .insert(rate.currency.clone(), rate.usd_per_unit)
+                .is_some()
+            {
+                bail!("settled carry repeats currency rate {}", rate.currency);
+            }
+        }
+
+        let mut marks = self
+            .terminal_depth_marks
+            .iter()
+            .map(|(symbol, mark)| (symbol.clone(), *mark))
+            .collect::<HashMap<_, _>>();
+        marks.extend(
+            self.terminal_exchange_marks
+                .iter()
+                .map(|(symbol, mark)| (symbol.clone(), *mark)),
+        );
+        let reconstructed = Portfolio::with_initial(&config.instruments, &self.portfolio);
+        let reconstructed_equity = reconstructed
+            .equity_usd_checked(&marks, &rates)
+            .context("settled carry portfolio cannot be independently valued")?;
+        require_close(
+            "settled carry terminal equity",
+            reconstructed_equity,
+            self.terminal_equity_usd,
+        )?;
+        let derivative_notional = reconstructed
+            .derivative_notional_usd_checked(&marks, &rates)
+            .context("settled carry derivative notional cannot be independently valued")?;
+        require_optional_close(
+            "settled carry adjusted equity",
+            self.portfolio.margin.adjusted_equity_usd,
+            Some(self.terminal_equity_usd),
+        )?;
+        require_optional_close(
+            "settled carry derivative notional",
+            self.portfolio.margin.notional_usd,
+            Some(derivative_notional),
+        )?;
+        let expected_ratio =
+            (derivative_notional > 0.0).then_some(self.terminal_equity_usd / derivative_notional);
+        require_optional_close(
+            "settled carry margin ratio",
+            self.portfolio.margin.ratio,
+            expected_ratio,
+        )?;
+        require_optional_close(
+            "settled carry exchange margin ratio",
+            self.portfolio.margin.exchange_ratio,
+            expected_ratio.map(|ratio| {
+                ratio * execution.derivative_leverage * execution.exchange_cmr_multiplier
+            }),
+        )?;
+
+        for balance in &self.portfolio.balances {
+            require_close(
+                &format!("settled carry available balance for {}", balance.currency),
+                balance.available(),
+                balance.total,
+            )?;
+            require_close(
+                &format!("settled carry equity for {}", balance.currency),
+                balance.equity(),
+                balance.total,
+            )?;
+            if balance.liability() != 0.0 {
+                bail!(
+                    "settled carry liability for {} must be zero",
+                    balance.currency
+                );
+            }
+        }
+        for position in &self.portfolio.positions {
+            if position.qty == 0.0 {
+                if position.avg_price != 0.0 {
+                    bail!(
+                        "settled carry flat position {} must have zero average price",
+                        position.symbol
+                    );
+                }
+                continue;
+            }
+            let mark = marks.get(&position.symbol).with_context(|| {
+                format!(
+                    "settled carry nonzero position {} has no terminal mark",
+                    position.symbol
+                )
+            })?;
+            require_close(
+                &format!("settled carry average price for {}", position.symbol),
+                position.avg_price,
+                *mark,
+            )?;
+        }
+
+        let mut pending_keys = HashSet::new();
+        for pending in &self.pending_funding {
+            let instrument = instruments.get(pending.symbol.as_str()).with_context(|| {
+                format!(
+                    "settled carry funding uses unknown symbol {}",
+                    pending.symbol
+                )
+            })?;
+            if !instrument.kind.is_swap() {
+                bail!(
+                    "settled carry funding symbol {} is not a swap",
+                    pending.symbol
+                );
+            }
+            let expected_due = pending
+                .funding_time_ms
+                .checked_mul(NS_PER_MS)
+                .context("settled carry funding timestamp overflows nanoseconds")?;
+            if pending.funding_time_ms == 0
+                || pending.due_at_ns != expected_due
+                || pending.due_at_ns <= self.settled_at_ns
+            {
+                bail!(
+                    "settled carry pending funding {}/{} has an invalid due time",
+                    pending.symbol,
+                    pending.funding_time_ms
+                );
+            }
+            if pending.realized_rate.is_some_and(|rate| !rate.is_finite()) {
+                bail!(
+                    "settled carry pending funding {}/{} has a non-finite realized rate",
+                    pending.symbol,
+                    pending.funding_time_ms
+                );
+            }
+            if self
+                .last_settled_funding_time_ms
+                .get(&pending.symbol)
+                .is_some_and(|settled| *settled >= pending.funding_time_ms)
+            {
+                bail!(
+                    "settled carry pending funding {}/{} overlaps its settlement watermark",
+                    pending.symbol,
+                    pending.funding_time_ms
+                );
+            }
+            if !pending_keys.insert((pending.symbol.as_str(), pending.funding_time_ms)) {
+                bail!(
+                    "settled carry repeats pending funding {}/{}",
+                    pending.symbol,
+                    pending.funding_time_ms
+                );
+            }
+        }
+        for (symbol, funding_time_ms) in &self.last_settled_funding_time_ms {
+            let instrument = instruments.get(symbol.as_str()).with_context(|| {
+                format!("settled carry funding watermark uses unknown symbol {symbol}")
+            })?;
+            let funding_time_ns = funding_time_ms
+                .checked_mul(NS_PER_MS)
+                .context("settled carry funding watermark overflows nanoseconds")?;
+            if !instrument.kind.is_swap()
+                || *funding_time_ms == 0
+                || funding_time_ns > self.settled_at_ns
+            {
+                bail!("settled carry funding watermark for {symbol} is invalid");
+            }
+        }
+
+        if let Some(boundary) = &self.source_raw_boundary
+            && (boundary.validate().is_err() || self.settled_at_ns < boundary.maximum_recv_ts_ns)
+        {
+            bail!("settled carry source raw boundary is invalid");
+        }
+        Ok(())
+    }
+
+    pub fn rebind_execution(
+        mut self,
+        config: &ChaosConfig,
+        source: &BacktestExecutionConfig,
+        target: &BacktestExecutionConfig,
+    ) -> Result<Self> {
+        self.validate_for(config, source)
+            .context("source carry state is invalid")?;
+        target.validate()?;
+        let ratio = self.portfolio.margin.ratio;
+        self.portfolio.margin.exchange_ratio =
+            ratio.map(|ratio| ratio * target.derivative_leverage * target.exchange_cmr_multiplier);
+        self.validate_for(config, target)
+            .context("carry state is incompatible with target execution")?;
+        Ok(self)
+    }
+}
+
+fn require_close(name: &str, actual: f64, expected: f64) -> Result<()> {
+    let tolerance = 1.0e-9 * actual.abs().max(expected.abs()).max(1.0);
+    if !actual.is_finite() || !expected.is_finite() || (actual - expected).abs() > tolerance {
+        bail!("{name} mismatch: actual={actual}, expected={expected}");
+    }
+    Ok(())
+}
+
+fn require_optional_close(name: &str, actual: Option<f64>, expected: Option<f64>) -> Result<()> {
+    match (actual, expected) {
+        (Some(actual), Some(expected)) => require_close(name, actual, expected),
+        (None, None) => Ok(()),
+        _ => bail!("{name} presence mismatch: actual={actual:?}, expected={expected:?}"),
+    }
+}
+
 impl BacktestRunner {
     pub fn new(config: ChaosConfig) -> Result<Self> {
         Self::with_execution_config(config, BacktestExecutionConfig::default())
@@ -280,6 +616,13 @@ impl BacktestRunner {
         )
     }
 
+    pub fn from_config_with_carry(
+        config: BacktestConfig,
+        carry: BacktestCarryState,
+    ) -> Result<Self> {
+        Self::with_carry_state(config.strategy, config.backtest, carry)
+    }
+
     pub fn with_execution_config(
         config: ChaosConfig,
         execution: BacktestExecutionConfig,
@@ -289,6 +632,54 @@ impl BacktestRunner {
             execution,
             BacktestInitialPortfolioConfig::default(),
         )
+    }
+
+    pub fn with_carry_state(
+        config: ChaosConfig,
+        execution: BacktestExecutionConfig,
+        carry: BacktestCarryState,
+    ) -> Result<Self> {
+        carry.validate_for(&config, &execution)?;
+        let mut runner =
+            Self::with_initial_portfolio_config(config, execution, carry.portfolio.clone())?;
+        runner.now_ns = carry.settled_at_ns;
+        runner.opening_equity_usd = Some(carry.terminal_equity_usd);
+        runner.opening_valuation_at_ns = Some(carry.settled_at_ns);
+        runner.peak_equity_usd = carry.terminal_equity_usd;
+        runner.depth_marks = carry.terminal_depth_marks.into_iter().collect();
+        runner.exchange_marks = carry.terminal_exchange_marks.into_iter().collect();
+        runner.currency_rate_observations = carry
+            .currency_rates
+            .into_iter()
+            .map(|rate| {
+                (
+                    rate.currency,
+                    CurrencyRateObservation {
+                        usd_per_unit: rate.usd_per_unit,
+                        source_ts_ms: rate.source_ts_ms,
+                        effective_at_ns: rate.effective_at_ns,
+                    },
+                )
+            })
+            .collect();
+        for pending in carry.pending_funding {
+            let key = (pending.symbol.clone(), pending.funding_time_ms);
+            if let Some(rate) = pending.realized_rate {
+                runner.realized_funding_rates.insert(key.clone(), rate);
+            }
+            runner.scheduled_funding.insert(key);
+            runner.schedule_at(
+                pending.due_at_ns,
+                ScheduledAction::SettleFunding {
+                    symbol: pending.symbol,
+                    funding_time_ms: pending.funding_time_ms,
+                },
+            );
+        }
+        runner.last_settled_funding_time_ms = carry.last_settled_funding_time_ms;
+        runner.carry_source_boundary = carry.source_raw_boundary;
+        runner.deliver_initial_account_snapshot()?;
+        Ok(runner)
     }
 
     pub fn with_initial_portfolio_config(
@@ -329,8 +720,10 @@ impl BacktestRunner {
             .any(|quantity| *quantity != 0.0);
         let opening_equity_usd = initial_portfolio.is_empty().then_some(0.0);
         let opening_valuation_at_ns = initial_portfolio.is_empty().then_some(0);
-        let strategy = ChaosStrategy::new(config).context("invalid chaos/iarb2 configuration")?;
+        let strategy =
+            ChaosStrategy::new(config.clone()).context("invalid chaos/iarb2 configuration")?;
         Ok(Self {
+            strategy_config: config,
             portfolio,
             initial_account_snapshot_delivered: initial_portfolio.is_empty(),
             initial_portfolio,
@@ -339,9 +732,14 @@ impl BacktestRunner {
             execution,
             latency_sampler,
             time_basis: BacktestTimeBasis::EventTimestampMs,
+            raw_replay_boundary: None,
+            carry_source_boundary: None,
             scheduled: BTreeMap::new(),
             next_action_seq: 1,
             pending_cancels: HashSet::new(),
+            pending_fill_account_updates: 0,
+            last_account_publish_ns: None,
+            periodic_account_refreshes: 0,
             depth_marks: HashMap::new(),
             exchange_marks: HashMap::new(),
             currency_by_index_symbol,
@@ -349,6 +747,7 @@ impl BacktestRunner {
             realized_funding_rates: HashMap::new(),
             scheduled_funding: HashSet::new(),
             settled_funding: HashSet::new(),
+            last_settled_funding_time_ms: BTreeMap::new(),
             now_ns: 0,
             first_arrival_ns: None,
             last_arrival_ns: None,
@@ -417,14 +816,65 @@ impl BacktestRunner {
     pub fn run_raw_capture_path(mut self, path: impl AsRef<Path>) -> Result<BacktestReport> {
         let path = path.as_ref();
         self.time_basis = BacktestTimeBasis::CaptureReceiveTimestampNs;
-        replay_raw_capture_timed_path(path, |timed| self.preload_funding_settlement(&timed.event))
-            .with_context(|| {
-                format!("failed to preload realized funding from {}", path.display())
-            })?;
-        replay_raw_capture_timed_path(path, |timed| {
+        let preload_boundary = replay_raw_capture_timed_path_with_boundary(path, |timed| {
+            self.preload_funding_settlement(&timed.event)
+        })
+        .with_context(|| format!("failed to preload realized funding from {}", path.display()))?;
+        if let Some(boundary) = &preload_boundary {
+            self.validate_carry_handoff(boundary)?;
+        } else if self.carry_source_boundary.is_some() {
+            bail!("settled raw carry requires sequenced raw replay input");
+        }
+        let boundary = replay_raw_capture_timed_path_with_boundary(path, |timed| {
             self.process_replay_event_at(timed.event, timed.recv_ts_ns)
         })
         .with_context(|| format!("failed to replay raw capture from {}", path.display()))?;
+        if preload_boundary != boundary {
+            bail!("raw capture boundary changed between preload and replay passes");
+        }
+        if let Some(boundary) = &boundary {
+            self.advance_raw_horizon(boundary.maximum_recv_ts_ns)?;
+        }
+        self.raw_replay_boundary = boundary;
+        self.require_all_configured_books()?;
+        self.finish_report()
+    }
+
+    pub fn run_raw_capture_range_path(
+        mut self,
+        path: impl AsRef<Path>,
+        range: RawCaptureRecordRange,
+    ) -> Result<BacktestReport> {
+        let path = path.as_ref();
+        self.time_basis = BacktestTimeBasis::CaptureReceiveTimestampNs;
+        let preload_boundary = replay_raw_capture_timed_range_path(path, range, |timed| {
+            self.preload_funding_settlement(&timed.event)
+        })
+        .with_context(|| {
+            format!(
+                "failed to preload realized funding from raw capture range {}..={} in {}",
+                range.first,
+                range.last,
+                path.display()
+            )
+        })?;
+        self.validate_carry_handoff(&preload_boundary)?;
+        let replay_boundary = replay_raw_capture_timed_range_path(path, range, |timed| {
+            self.process_replay_event_at(timed.event, timed.recv_ts_ns)
+        })
+        .with_context(|| {
+            format!(
+                "failed to replay raw capture range {}..={} from {}",
+                range.first,
+                range.last,
+                path.display()
+            )
+        })?;
+        if preload_boundary != replay_boundary {
+            bail!("raw capture range boundary changed between preload and replay passes");
+        }
+        self.advance_raw_horizon(replay_boundary.maximum_recv_ts_ns)?;
+        self.raw_replay_boundary = Some(replay_boundary);
         self.require_all_configured_books()?;
         self.finish_report()
     }
@@ -590,6 +1040,8 @@ impl BacktestRunner {
             bail!("initial portfolio unexpectedly produced strategy order intents");
         }
         self.initial_account_snapshot_delivered = true;
+        self.last_account_publish_ns = Some(self.now_ns);
+        self.schedule_next_account_refresh();
         Ok(())
     }
 
@@ -610,6 +1062,51 @@ impl BacktestRunner {
         arrival_ns
     }
 
+    fn advance_raw_horizon(&mut self, horizon_ns: u64) -> Result<()> {
+        if horizon_ns <= self.now_ns {
+            return Ok(());
+        }
+        self.drain_through(horizon_ns)?;
+        self.advance_metric_clock(horizon_ns);
+        self.now_ns = horizon_ns;
+        self.observe_order_entry_readiness();
+        self.sample_risk_metrics();
+        Ok(())
+    }
+
+    fn validate_carry_handoff(&self, current: &RawReplayBoundary) -> Result<()> {
+        current.validate()?;
+        let Some(previous) = &self.carry_source_boundary else {
+            return Ok(());
+        };
+        previous.validate()?;
+        if previous.capture_session_id != current.capture_session_id {
+            bail!(
+                "settled carry crosses capture sessions: previous={}, current={}",
+                previous.capture_session_id,
+                current.capture_session_id
+            );
+        }
+        let expected = previous
+            .last_capture_record_seq
+            .checked_add(1)
+            .context("previous capture record sequence exhausted")?;
+        if current.first_capture_record_seq != expected {
+            bail!(
+                "settled carry requires the next capture record sequence {expected}, received {}",
+                current.first_capture_record_seq
+            );
+        }
+        if current.first_recv_ts_ns < self.now_ns {
+            bail!(
+                "settled carry receive time regresses: settled_at_ns={}, current_first_recv_ts_ns={}",
+                self.now_ns,
+                current.first_recv_ts_ns
+            );
+        }
+        Ok(())
+    }
+
     fn register_funding_rate(&mut self, symbol: &str, rate: f64, funding_time_ms: u64) {
         self.funding_rate_events += 1;
         if !self.portfolio.supports_funding(symbol) || !rate.is_finite() || funding_time_ms == 0 {
@@ -618,7 +1115,12 @@ impl BacktestRunner {
         }
 
         let key = (symbol.to_string(), funding_time_ms);
-        if self.settled_funding.contains(&key) {
+        if self.settled_funding.contains(&key)
+            || self
+                .last_settled_funding_time_ms
+                .get(symbol)
+                .is_some_and(|settled| *settled >= funding_time_ms)
+        {
             return;
         }
         if !self.scheduled_funding.insert(key.clone()) {
@@ -628,7 +1130,8 @@ impl BacktestRunner {
         let funding_time_ns = funding_time_ms.saturating_mul(NS_PER_MS);
         if funding_time_ns.saturating_add(FUNDING_LATE_TOLERANCE_NS) < self.now_ns {
             self.scheduled_funding.remove(&key);
-            self.settled_funding.insert(key);
+            self.settled_funding.insert(key.clone());
+            self.record_settled_funding(&key.0, key.1);
             self.missed_funding_settlements += 1;
             return;
         }
@@ -686,6 +1189,7 @@ impl BacktestRunner {
         if !self.settled_funding.insert(key.clone()) {
             return;
         }
+        self.record_settled_funding(&symbol, funding_time_ms);
         let Some(rate) = self.realized_funding_rates.get(&key).copied() else {
             self.funding_settlement_failures += 1;
             return;
@@ -712,6 +1216,13 @@ impl BacktestRunner {
         }
     }
 
+    fn record_settled_funding(&mut self, symbol: &str, funding_time_ms: u64) {
+        self.last_settled_funding_time_ms
+            .entry(symbol.to_string())
+            .and_modify(|current| *current = (*current).max(funding_time_ms))
+            .or_insert(funding_time_ms);
+    }
+
     fn route_exchange_updates(&mut self, updates: Vec<OrderUpdate>) -> Result<()> {
         for update in updates {
             if update.event == OrderEvent::Cancelled {
@@ -736,7 +1247,7 @@ impl BacktestRunner {
                 let currency_rates = self.fresh_currency_rates();
                 self.portfolio.apply_fill(&update, &currency_rates);
                 self.sample_risk_metrics();
-                Some(self.account_update_after_fill(&update))
+                Some(self.current_account_update(Some(&update.symbol)))
             } else {
                 None
             };
@@ -750,22 +1261,41 @@ impl BacktestRunner {
                 let fill_account_delay_ms = self
                     .latency_sampler
                     .sample(BacktestLatencyClass::OrderFill, &fill_symbol);
+                self.pending_fill_account_updates =
+                    self.pending_fill_account_updates.saturating_add(1);
                 self.schedule_after(
                     fill_account_delay_ms,
-                    ScheduledAction::DeliverStrategy(StrategyEvent::Account(account_update)),
+                    ScheduledAction::DeliverAccount(account_update),
                 );
             }
         }
         Ok(())
     }
 
-    fn account_update_after_fill(&self, update: &OrderUpdate) -> AccountUpdate {
-        let qty = self
-            .portfolio
-            .positions()
-            .get(&update.symbol)
-            .copied()
-            .unwrap_or(0.0);
+    fn current_account_update(&self, source_symbol: Option<&str>) -> AccountUpdate {
+        let marks = self.valuation_marks();
+        let mut position_symbols = self
+            .strategy_config
+            .instruments
+            .iter()
+            .filter(|instrument| instrument.kind.is_derivative())
+            .map(|instrument| instrument.symbol.clone())
+            .collect::<Vec<_>>();
+        if let Some(source_symbol) = source_symbol
+            && !position_symbols
+                .iter()
+                .any(|symbol| symbol == source_symbol)
+        {
+            position_symbols.push(source_symbol.to_string());
+        }
+        if let Some(source_symbol) = source_symbol
+            && let Some(index) = position_symbols
+                .iter()
+                .position(|symbol| symbol == source_symbol)
+        {
+            let source = position_symbols.remove(index);
+            position_symbols.push(source);
+        }
         AccountUpdate {
             ts_ms: time_ms(self.now_ns),
             balances: if self.initial_portfolio.is_empty() {
@@ -782,7 +1312,10 @@ impl BacktestRunner {
                             currency: balance.currency.clone(),
                             total,
                             available: balance.available() + change,
-                            equity: balance.equity() + change,
+                            equity: self
+                                .portfolio
+                                .account_equity(&balance.currency, &marks)
+                                .unwrap_or_else(|| balance.equity() + change),
                             liability: balance.liability(),
                             max_loan: balance.max_loan(),
                             forced_repayment_indicator: balance.forced_repayment_indicator,
@@ -790,19 +1323,64 @@ impl BacktestRunner {
                     })
                     .collect()
             },
-            positions: vec![Position {
-                symbol: update.symbol.clone(),
-                qty,
-                avg_price: self.portfolio.position_avg_price(&update.symbol),
-                margin_mode: self
-                    .initial_portfolio
-                    .positions
-                    .iter()
-                    .find(|position| position.symbol == update.symbol)
-                    .and_then(|position| position.margin_mode),
-            }],
-            margins: Vec::new(),
+            positions: position_symbols
+                .into_iter()
+                .map(|symbol| Position {
+                    qty: self
+                        .portfolio
+                        .positions()
+                        .get(&symbol)
+                        .copied()
+                        .unwrap_or(0.0),
+                    avg_price: self.portfolio.position_avg_price(&symbol),
+                    margin_mode: self
+                        .initial_portfolio
+                        .positions
+                        .iter()
+                        .find(|position| position.symbol == symbol)
+                        .and_then(|position| position.margin_mode),
+                    symbol,
+                })
+                .collect(),
+            margins: self.current_margin_snapshots(&marks),
         }
+    }
+
+    fn schedule_next_account_refresh(&mut self) {
+        if self.initial_portfolio.is_empty() {
+            return;
+        }
+        let due_ns = self.now_ns.saturating_add(ACCOUNT_REFRESH_INTERVAL_NS);
+        if due_ns > self.now_ns {
+            self.schedule_at(due_ns, ScheduledAction::RefreshAccount);
+        }
+    }
+
+    fn current_margin_snapshots(&self, marks: &HashMap<Symbol, f64>) -> Vec<MarginSnapshot> {
+        if self.initial_portfolio.is_empty() {
+            return Vec::new();
+        }
+        let currency_rates = self.fresh_currency_rates();
+        let Some(adjusted_equity_usd) = self.portfolio.equity_usd_checked(marks, &currency_rates)
+        else {
+            return Vec::new();
+        };
+        let Some(notional_usd) = self
+            .portfolio
+            .derivative_notional_usd_checked(marks, &currency_rates)
+        else {
+            return Vec::new();
+        };
+        let ratio = (notional_usd > 0.0).then_some(adjusted_equity_usd / notional_usd);
+        vec![MarginSnapshot {
+            account_id: self.initial_portfolio.account_id.clone(),
+            ratio,
+            exchange_ratio: ratio.map(|ratio| {
+                ratio * self.execution.derivative_leverage * self.execution.exchange_cmr_multiplier
+            }),
+            adjusted_equity_usd: Some(adjusted_equity_usd),
+            notional_usd: Some(notional_usd),
+        }]
     }
 
     fn accept_intents(&mut self, commands: Vec<OrderIntent>) -> Result<()> {
@@ -893,6 +1471,15 @@ impl BacktestRunner {
                 let commands = self.strategy.on_event(&StrategyEvent::Order(update));
                 self.accept_intents(commands)?;
             }
+            ScheduledAction::DeliverAccount(update) => {
+                self.pending_fill_account_updates =
+                    self.pending_fill_account_updates.saturating_sub(1);
+                let event =
+                    retime_strategy_event(StrategyEvent::Account(update), time_ms(self.now_ns));
+                let commands = self.strategy.on_event(&event);
+                self.last_account_publish_ns = Some(self.now_ns);
+                self.accept_intents(commands)?;
+            }
             ScheduledAction::DeliverStrategy(event) => {
                 let currency_rate = match &event {
                     StrategyEvent::Market(MarketEvent::IndexPrice {
@@ -906,8 +1493,25 @@ impl BacktestRunner {
                 if let Some((symbol, price, source_ts_ms)) = currency_rate {
                     self.register_currency_rate(&symbol, price, source_ts_ms);
                 }
+                if matches!(event, StrategyEvent::Account(_)) {
+                    self.last_account_publish_ns = Some(self.now_ns);
+                }
                 let commands = self.strategy.on_event(&event);
                 self.accept_intents(commands)?;
+            }
+            ScheduledAction::RefreshAccount => {
+                let due = self.last_account_publish_ns.is_some_and(|last| {
+                    self.now_ns.saturating_sub(last) >= ACCOUNT_REFRESH_INTERVAL_NS
+                });
+                if due && self.pending_fill_account_updates == 0 {
+                    let update = self.current_account_update(None);
+                    let commands = self.strategy.on_event(&StrategyEvent::Account(update));
+                    self.last_account_publish_ns = Some(self.now_ns);
+                    self.periodic_account_refreshes =
+                        self.periodic_account_refreshes.saturating_add(1);
+                    self.accept_intents(commands)?;
+                }
+                self.schedule_next_account_refresh();
             }
             ScheduledAction::SettleFunding {
                 symbol,
@@ -1198,6 +1802,131 @@ impl BacktestRunner {
         marks
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn build_settled_carry_state(
+        &self,
+        marks: &HashMap<Symbol, f64>,
+        currency_rates: &HashMap<String, f64>,
+        terminal_equity_usd: Option<f64>,
+        final_valuation_complete: bool,
+        accounting_complete: bool,
+    ) -> (Option<BacktestCarryState>, Vec<String>) {
+        let mut failures = Vec::new();
+        if self.initial_portfolio.is_empty() {
+            failures.push("settled carry requires a non-empty opening portfolio".to_string());
+        }
+        if !final_valuation_complete || terminal_equity_usd.is_none() {
+            failures.push("settled carry requires complete terminal valuation".to_string());
+        }
+        if !accounting_complete {
+            failures.push("settled carry requires complete accounting".to_string());
+        }
+        if let Some(reason) = self.strategy.halt_reason() {
+            failures.push(format!(
+                "settled carry is unavailable after terminal strategy halt: {reason}"
+            ));
+        }
+        if !failures.is_empty() {
+            return (None, failures);
+        }
+
+        let build = (|| -> Result<BacktestCarryState> {
+            let portfolio = self.portfolio.settled_initial_portfolio(
+                &self.initial_portfolio,
+                marks,
+                currency_rates,
+                self.execution.derivative_leverage,
+                self.execution.exchange_cmr_multiplier,
+            )?;
+            portfolio
+                .validate(&self.strategy_config.effective(), &self.execution)
+                .context("terminal settled portfolio failed opening-state validation")?;
+            let mut carry_rates = Vec::with_capacity(self.execution.currency_rates.len());
+            for route in &self.execution.currency_rates {
+                let observation = self
+                    .currency_rate_observations
+                    .get(&route.currency)
+                    .with_context(|| {
+                        format!(
+                            "terminal settled carry has no observation for currency {}",
+                            route.currency
+                        )
+                    })?;
+                if currency_rates.get(&route.currency).copied() != Some(observation.usd_per_unit) {
+                    bail!(
+                        "terminal settled carry currency observation for {} is stale",
+                        route.currency
+                    );
+                }
+                carry_rates.push(BacktestCarryCurrencyRate {
+                    currency: route.currency.clone(),
+                    index_symbol: route.index_symbol.clone(),
+                    usd_per_unit: observation.usd_per_unit,
+                    source_ts_ms: observation.source_ts_ms,
+                    effective_at_ns: observation.effective_at_ns,
+                });
+            }
+            carry_rates.sort_by(|left, right| left.currency.cmp(&right.currency));
+
+            let mut pending_funding = self
+                .scheduled
+                .iter()
+                .filter_map(|(&(due_at_ns, _), action)| {
+                    let ScheduledAction::SettleFunding {
+                        symbol,
+                        funding_time_ms,
+                    } = action
+                    else {
+                        return None;
+                    };
+                    let key = (symbol.clone(), *funding_time_ms);
+                    Some(BacktestPendingFundingCarry {
+                        symbol: symbol.clone(),
+                        funding_time_ms: *funding_time_ms,
+                        due_at_ns,
+                        realized_rate: self.realized_funding_rates.get(&key).copied(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            pending_funding.sort_by(|left, right| {
+                (&left.symbol, left.funding_time_ms).cmp(&(&right.symbol, right.funding_time_ms))
+            });
+
+            let state = BacktestCarryState {
+                schema_version: BACKTEST_CARRY_STATE_SCHEMA_VERSION,
+                settled_at_ns: self.now_ns,
+                terminal_equity_usd: terminal_equity_usd
+                    .context("terminal equity disappeared while building settled carry")?,
+                source_raw_boundary: self.raw_replay_boundary.clone(),
+                portfolio,
+                terminal_depth_marks: self
+                    .depth_marks
+                    .iter()
+                    .filter(|(_, mark)| mark.is_finite() && **mark > 0.0)
+                    .map(|(symbol, mark)| (symbol.clone(), *mark))
+                    .collect(),
+                terminal_exchange_marks: self
+                    .exchange_marks
+                    .iter()
+                    .filter(|(_, mark)| mark.is_finite() && **mark > 0.0)
+                    .map(|(symbol, mark)| (symbol.clone(), *mark))
+                    .collect(),
+                currency_rates: carry_rates,
+                pending_funding,
+                last_settled_funding_time_ms: self.last_settled_funding_time_ms.clone(),
+            };
+            state.validate_for(&self.strategy_config, &self.execution)?;
+            Ok(state)
+        })();
+        match build {
+            Ok(state) => (Some(state), failures),
+            Err(error) => {
+                failures.push(format!("failed to build settled carry: {error:#}"));
+                (None, failures)
+            }
+        }
+    }
+
     fn finish_report(&mut self) -> Result<BacktestReport> {
         let now_ns = self.now_ns;
         self.drain_through(now_ns)?;
@@ -1266,7 +1995,9 @@ impl BacktestRunner {
                 ScheduledAction::ActivateOrder { .. } => pending_activation_actions += 1,
                 ScheduledAction::CancelOrder { .. } => pending_cancel_actions += 1,
                 ScheduledAction::DeliverOrder(_) => pending_order_update_actions += 1,
-                ScheduledAction::DeliverStrategy(_) => pending_strategy_event_actions += 1,
+                ScheduledAction::DeliverAccount(_)
+                | ScheduledAction::DeliverStrategy(_)
+                | ScheduledAction::RefreshAccount => pending_strategy_event_actions += 1,
                 ScheduledAction::SettleFunding { .. } => pending_funding_actions += 1,
             }
         }
@@ -1281,6 +2012,13 @@ impl BacktestRunner {
             && opening_valuation_complete
             && net_pnl_usd.is_some()
             && final_valuation_complete;
+        let (settled_carry_state, carry_state_failures) = self.build_settled_carry_state(
+            &marks,
+            &currency_rates,
+            checked_final_equity,
+            final_valuation_complete,
+            accounting_complete,
+        );
         let order_entry_ready_at_end = self.order_entry_ready();
         let observed_duration_ns = self
             .first_arrival_ns
@@ -1303,6 +2041,7 @@ impl BacktestRunner {
             initial_portfolio: self.initial_portfolio.clone(),
             latency_usage: self.latency_sampler.usage(),
             time_basis: self.time_basis,
+            raw_replay_boundary: self.raw_replay_boundary.clone(),
             input_events: self.input_events,
             first_arrival_ns: self.first_arrival_ns,
             last_arrival_ns: self.last_arrival_ns,
@@ -1328,6 +2067,7 @@ impl BacktestRunner {
             pending_order_update_actions,
             pending_strategy_event_actions,
             pending_funding_actions,
+            periodic_account_refreshes: self.periodic_account_refreshes,
             pending_orders,
             live_orders,
             pending_cancel_requests: self.pending_cancels.len(),
@@ -1387,6 +2127,8 @@ impl BacktestRunner {
             missed_funding_settlements: self.missed_funding_settlements,
             funding_settlement_failures: self.funding_settlement_failures,
             accounting_complete,
+            settled_carry_state,
+            carry_state_failures,
             positions: self
                 .portfolio
                 .positions()
@@ -1944,6 +2686,310 @@ mod tests {
     }
 
     #[test]
+    fn periodic_account_refreshes_do_not_bypass_pending_fill_latency() {
+        let mut strategy = usdt_config();
+        for instrument in &mut strategy.instruments {
+            instrument.quote_profit_margin = 1.0;
+            instrument.halted = true;
+        }
+        let initial = BacktestInitialPortfolioConfig {
+            balances: vec![
+                BacktestInitialBalanceConfig {
+                    currency: "BTC".to_string(),
+                    total: 0.0,
+                    valuation_symbol: Some("BTC-USDT".to_string()),
+                    ..Default::default()
+                },
+                BacktestInitialBalanceConfig {
+                    currency: "USDT".to_string(),
+                    total: 100_000.0,
+                    ..Default::default()
+                },
+            ],
+            positions: vec![BacktestInitialPositionConfig {
+                symbol: "BTC-PERP".to_string(),
+                qty: 0.0,
+                avg_price: 0.0,
+                margin_mode: Some(reap_core::PositionMarginMode::Cross),
+            }],
+            ..Default::default()
+        };
+        let mut execution = usdt_execution(0, 30_000);
+        let mut refresh_runner = BacktestRunner::with_initial_portfolio_config(
+            strategy.clone(),
+            execution.clone(),
+            initial.clone(),
+        )
+        .unwrap();
+        let mut refresh_events = initial_books();
+        refresh_events.push(NormalizedEvent::Market(MarketEvent::IndexPrice {
+            ts_ms: 2,
+            symbol: "USDT-USD".to_string(),
+            price: 1.0,
+        }));
+        refresh_events.push(NormalizedEvent::Timer(TimerEvent {
+            ts_ms: 10_002,
+            name: "refresh".to_string(),
+        }));
+        let refreshed = refresh_runner.run(refresh_events).unwrap();
+        assert_eq!(refreshed.periodic_account_refreshes, 1);
+
+        execution.fill_account_latency_ms = 20_000;
+        let mut delayed_runner =
+            BacktestRunner::with_initial_portfolio_config(strategy, execution, initial).unwrap();
+        let mut delayed_events = initial_books();
+        delayed_events.push(NormalizedEvent::Market(MarketEvent::IndexPrice {
+            ts_ms: 2,
+            symbol: "USDT-USD".to_string(),
+            price: 1.0,
+        }));
+        delayed_events.push(external_spot_fill(3, 50_000.0));
+        delayed_events.push(NormalizedEvent::Timer(TimerEvent {
+            ts_ms: 12_000,
+            name: "refresh".to_string(),
+        }));
+        let delayed = delayed_runner.run(delayed_events).unwrap();
+        assert_eq!(delayed.periodic_account_refreshes, 0);
+        assert!(delayed.pending_strategy_event_actions >= 2);
+    }
+
+    #[test]
+    fn settled_carry_round_trips_portfolio_margin_and_raw_handoff() {
+        let mut strategy = usdt_config();
+        for instrument in &mut strategy.instruments {
+            instrument.quote_profit_margin = 1.0;
+            instrument.halted = true;
+        }
+        let execution = usdt_execution(0, 1_000);
+        let initial = BacktestInitialPortfolioConfig {
+            account_id: None,
+            balances: vec![
+                BacktestInitialBalanceConfig {
+                    currency: "BTC".to_string(),
+                    total: 0.002,
+                    valuation_symbol: Some("BTC-USDT".to_string()),
+                    ..Default::default()
+                },
+                BacktestInitialBalanceConfig {
+                    currency: "USDT".to_string(),
+                    total: 1_000.0,
+                    valuation_symbol: None,
+                    ..Default::default()
+                },
+            ],
+            positions: vec![BacktestInitialPositionConfig {
+                symbol: "BTC-PERP".to_string(),
+                qty: 2.0,
+                avg_price: 49_000.0,
+                margin_mode: Some(reap_core::PositionMarginMode::Cross),
+            }],
+            margin: BacktestInitialMarginConfig::default(),
+        };
+        let mut runner = BacktestRunner::with_initial_portfolio_config(
+            strategy.clone(),
+            execution.clone(),
+            initial,
+        )
+        .unwrap();
+        let mut events = initial_books();
+        events.push(NormalizedEvent::Market(MarketEvent::IndexPrice {
+            ts_ms: 2,
+            symbol: "USDT-USD".to_string(),
+            price: 1.0,
+        }));
+        events.push(NormalizedEvent::Timer(TimerEvent {
+            ts_ms: 3,
+            name: "finish".to_string(),
+        }));
+
+        let report = runner.run(events).unwrap();
+        assert!(report.carry_state_failures.is_empty());
+        let mut carry = report.settled_carry_state.unwrap();
+        assert_eq!(carry.settled_at_ns, 3 * NS_PER_MS);
+        assert_eq!(carry.portfolio.balances[0].available, Some(0.002));
+        assert_eq!(carry.portfolio.positions[0].qty, 2.0);
+        assert_eq!(carry.portfolio.positions[0].avg_price, 50_003.5);
+        assert_eq!(
+            carry.portfolio.positions[0].margin_mode,
+            Some(reap_core::PositionMarginMode::Cross)
+        );
+        assert!(carry.terminal_exchange_marks.is_empty());
+        assert_eq!(carry.terminal_depth_marks.get("BTC-PERP"), Some(&50_003.5));
+
+        let mut bad_balance = carry.clone();
+        bad_balance.portfolio.balances[1].total += 1.0;
+        assert!(
+            bad_balance
+                .validate_for(&strategy, &execution)
+                .unwrap_err()
+                .to_string()
+                .contains("settled carry")
+        );
+        let mut bad_average = carry.clone();
+        bad_average.portfolio.positions[0].avg_price += 1.0;
+        assert!(bad_average.validate_for(&strategy, &execution).is_err());
+        let mut bad_margin = carry.clone();
+        bad_margin.portfolio.margin.exchange_ratio = bad_margin
+            .portfolio
+            .margin
+            .exchange_ratio
+            .map(|ratio| ratio + 1.0);
+        assert!(bad_margin.validate_for(&strategy, &execution).is_err());
+
+        carry.source_raw_boundary = Some(RawReplayBoundary {
+            capture_session_id: "session-a".to_string(),
+            first_capture_record_seq: 1,
+            last_capture_record_seq: 10,
+            raw_records: 10,
+            first_recv_ts_ns: 1,
+            last_recv_ts_ns: 3 * NS_PER_MS,
+            maximum_recv_ts_ns: 3 * NS_PER_MS,
+        });
+        let carried =
+            BacktestRunner::with_carry_state(strategy.clone(), execution.clone(), carry).unwrap();
+        assert_eq!(carried.opening_equity_usd, report.opening_equity_usd);
+        carried
+            .validate_carry_handoff(&RawReplayBoundary {
+                capture_session_id: "session-a".to_string(),
+                first_capture_record_seq: 11,
+                last_capture_record_seq: 20,
+                raw_records: 10,
+                first_recv_ts_ns: 3 * NS_PER_MS + 1,
+                last_recv_ts_ns: 4 * NS_PER_MS,
+                maximum_recv_ts_ns: 4 * NS_PER_MS,
+            })
+            .unwrap();
+        let error = carried
+            .validate_carry_handoff(&RawReplayBoundary {
+                capture_session_id: "session-a".to_string(),
+                first_capture_record_seq: 12,
+                last_capture_record_seq: 20,
+                raw_records: 9,
+                first_recv_ts_ns: 3 * NS_PER_MS + 1,
+                last_recv_ts_ns: 4 * NS_PER_MS,
+                maximum_recv_ts_ns: 4 * NS_PER_MS,
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("next capture record sequence 11")
+        );
+        let error = carried
+            .validate_carry_handoff(&RawReplayBoundary {
+                capture_session_id: "session-a".to_string(),
+                first_capture_record_seq: 11,
+                last_capture_record_seq: 20,
+                raw_records: 10,
+                first_recv_ts_ns: 3 * NS_PER_MS - 1,
+                last_recv_ts_ns: 4 * NS_PER_MS,
+                maximum_recv_ts_ns: 4 * NS_PER_MS,
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("receive time regresses"));
+    }
+
+    #[test]
+    fn settled_carry_preserves_pending_funding_and_settlement_watermark() {
+        let mut strategy = config();
+        strategy.instruments[1].kind = InstrumentKindConfig::LinearSwap;
+        for instrument in &mut strategy.instruments {
+            instrument.base_currency = "BTC".to_string();
+            instrument.quote_currency = "USD".to_string();
+            if instrument.kind.is_derivative() {
+                instrument.settle_currency = "USD".to_string();
+            }
+            instrument.quote_profit_margin = 1.0;
+            instrument.halted = true;
+        }
+        let execution = BacktestExecutionConfig::default();
+        let initial = BacktestInitialPortfolioConfig {
+            balances: vec![
+                BacktestInitialBalanceConfig {
+                    currency: "BTC".to_string(),
+                    total: 0.0,
+                    valuation_symbol: Some("BTC-USDT".to_string()),
+                    ..Default::default()
+                },
+                BacktestInitialBalanceConfig {
+                    currency: "USD".to_string(),
+                    total: 10_000.0,
+                    ..Default::default()
+                },
+            ],
+            positions: vec![BacktestInitialPositionConfig {
+                symbol: "BTC-PERP".to_string(),
+                qty: 10.0,
+                avg_price: 50_000.0,
+                margin_mode: Some(reap_core::PositionMarginMode::Cross),
+            }],
+            ..Default::default()
+        };
+        let mut first = BacktestRunner::with_initial_portfolio_config(
+            strategy.clone(),
+            execution.clone(),
+            initial,
+        )
+        .unwrap();
+        let mut first_events = initial_books();
+        first_events.push(NormalizedEvent::from(MarketEvent::FundingRate {
+            ts_ms: 2,
+            symbol: "BTC-PERP".to_string(),
+            rate: 0.001,
+            funding_time_ms: 100,
+            settlement: None,
+        }));
+        let first_report = first.run(first_events).unwrap();
+        let carry = first_report.settled_carry_state.unwrap();
+        assert_eq!(carry.pending_funding.len(), 1);
+        assert_eq!(carry.pending_funding[0].funding_time_ms, 100);
+        assert_eq!(carry.pending_funding[0].realized_rate, None);
+        let mut overlapping = carry.clone();
+        overlapping
+            .last_settled_funding_time_ms
+            .insert("BTC-PERP".to_string(), 100);
+        assert!(
+            overlapping
+                .validate_for(&strategy, &execution)
+                .unwrap_err()
+                .to_string()
+                .contains("overlaps its settlement watermark")
+        );
+
+        let carry_settled_at_ns = carry.settled_at_ns;
+        let mut second = BacktestRunner::with_carry_state(strategy, execution, carry).unwrap();
+        assert!(second.initial_account_snapshot_delivered);
+        assert_eq!(second.last_account_publish_ns, Some(carry_settled_at_ns));
+        let second_report = second
+            .run([NormalizedEvent::from(MarketEvent::FundingRate {
+                ts_ms: 101,
+                symbol: "BTC-PERP".to_string(),
+                rate: 0.002,
+                funding_time_ms: 200,
+                settlement: Some(FundingSettlement {
+                    funding_time_ms: 100,
+                    rate: 0.001,
+                }),
+            })])
+            .unwrap();
+
+        assert_eq!(second_report.funding_settlements, 1);
+        assert!((second_report.funding_pnl_usd + 0.500_035).abs() < 1e-9);
+        assert!(
+            second_report.settled_carry_state.is_some(),
+            "{:?}",
+            second_report.carry_state_failures
+        );
+        let second_carry = second_report.settled_carry_state.unwrap();
+        assert_eq!(
+            second_carry.last_settled_funding_time_ms.get("BTC-PERP"),
+            Some(&100)
+        );
+        assert_eq!(second_carry.pending_funding.len(), 1);
+        assert_eq!(second_carry.pending_funding[0].funding_time_ms, 200);
+    }
+
+    #[test]
     fn configured_opening_portfolio_keeps_order_entry_blocked_without_valuation() {
         let initial = BacktestInitialPortfolioConfig {
             balances: vec![
@@ -2332,6 +3378,12 @@ mod tests {
         assert_eq!(report.funding_settlements, 0);
         assert_eq!(report.funding_settlement_failures, 1);
         assert!(!report.accounting_complete);
+        assert!(
+            report
+                .carry_state_failures
+                .iter()
+                .any(|failure| failure.contains("requires complete accounting"))
+        );
     }
 
     #[test]

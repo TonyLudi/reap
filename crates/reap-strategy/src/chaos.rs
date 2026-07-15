@@ -1920,7 +1920,8 @@ impl ChaosStrategy {
                         })
                     })
                     .sum::<f64>();
-                rg.margin_ratio = Some(equity / (notional + liability_usd));
+                let denominator = notional + liability_usd;
+                rg.margin_ratio = (denominator > 0.0).then_some(equity / denominator);
             }
             let mut spot_delta_coin = 0.0;
             let mut derivative_delta_coin = 0.0;
@@ -5951,6 +5952,40 @@ mod tests {
         }));
 
         assert!(strategy.halt_reason().unwrap().contains("margin ratio"));
+    }
+
+    #[test]
+    fn zero_notional_account_does_not_create_infinite_margin_breach() {
+        let mut strategy = ChaosStrategy::new(config()).unwrap();
+        strategy.on_account_update(&AccountUpdate {
+            ts_ms: 10,
+            balances: Vec::new(),
+            positions: Vec::new(),
+            margins: vec![MarginSnapshot {
+                account_id: None,
+                ratio: None,
+                exchange_ratio: None,
+                adjusted_equity_usd: Some(10_000.0),
+                notional_usd: Some(0.0),
+            }],
+        });
+        strategy.entities.get_mut("BTC-USDT").unwrap().book = Some(OrderBook::one_level(
+            "BTC-USDT",
+            10,
+            Level::new(99.0, 10.0),
+            Level::new(101.0, 10.0),
+        ));
+        strategy.entities.get_mut("BTC-PERP").unwrap().book = Some(OrderBook::one_level(
+            "BTC-PERP",
+            10,
+            Level::new(99.0, 10_000.0),
+            Level::new(101.0, 10_000.0),
+        ));
+
+        strategy.refresh_quotes();
+
+        assert!(strategy.halt_reason().is_none());
+        assert!(strategy.risk_groups["main"].margin_ratio.is_none());
     }
 
     #[test]

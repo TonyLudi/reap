@@ -1,4 +1,4 @@
-schema_version = 7
+schema_version = 8
 mode = "smoke"
 java_reference_revision = "b6b120c7b7c466d8431bf082f3229328c5d7b2ae"
 selection_metric = "net_pnl_usd"
@@ -32,6 +32,8 @@ depth_fill_conservative_threshold = 0.0
 queue_ahead_multiplier = 1.0
 historical_trade_fill_fraction = 1.0
 displayed_depth_fill_fraction = 1.0
+derivative_leverage = 1.0
+exchange_cmr_multiplier = 50.0
 
 [[scenarios]]
 id = "latency-capacity-stress"
@@ -48,6 +50,8 @@ depth_fill_conservative_threshold = 0.0001
 queue_ahead_multiplier = 2.0
 historical_trade_fill_fraction = 0.25
 displayed_depth_fill_fraction = 0.5
+derivative_leverage = 1.0
+exchange_cmr_multiplier = 50.0
 
 [[folds]]
 id = "fixture-fold"

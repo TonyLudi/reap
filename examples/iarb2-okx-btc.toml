@@ -33,8 +33,8 @@ max_age_ms = 75000
 # Exchange-style opening account snapshot. Spot inventory is a balance tied to
 # one valuation instrument; derivative positions, when nonzero, also require
 # avg_price and margin_mode. This section is for direct/manual backtests.
-# Schema-7 production candidate files omit it because each dataset derives the
-# opening state from a source-rebuilt account certification.
+# Schema-8 production candidate files omit it because each capture chain root
+# derives opening state from a source-rebuilt account certification.
 [initial_portfolio]
 
 [[initial_portfolio.balances]]

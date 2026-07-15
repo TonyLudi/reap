@@ -139,6 +139,19 @@ impl FeedProcessor {
         health
     }
 
+    pub fn ready_books(&self) -> Vec<reap_core::OrderBook> {
+        let mut books = self
+            .streams
+            .values()
+            .filter(|state| {
+                state.sequence.status() == SequenceStatus::Ready && state.book.is_ready()
+            })
+            .filter_map(|state| state.book.book().cloned())
+            .collect::<Vec<_>>();
+        books.sort_by(|left, right| left.symbol.cmp(&right.symbol));
+        books
+    }
+
     pub fn mark_stale(&mut self, now_ms: TimeMs, max_age_ms: TimeMs) -> Vec<SystemEvent> {
         self.streams
             .iter_mut()

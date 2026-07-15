@@ -287,7 +287,7 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Separate OKX funding forecasts from realized settlement accounting,
   retain `settFundingRate` with observed `prevFundingTime`, reject conflicting
   realized rates, settle at the original exchange timestamp without strategy
-  look-ahead, and require nonzero training/test settlement evidence in schema-7
+  look-ahead, and require nonzero training/test settlement evidence in schema-8
   production research.
 - [x] Match pinned Java OKX system-status monitoring with a typed current-wire
   `/api/v5/system/status` parser, environment-aware bootstrap and 10-second
@@ -307,26 +307,34 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Add independent full research reconstruction bound to the exact manifest,
   executable, and archived inputs; reject unknown/stale/forged/non-passing or
   numerically drifting reports, and persist owner-only durable evidence.
-- [x] Bind schema-7 production research to one manifest-declared deployment
+- [x] Bind schema-8 production research to one manifest-declared deployment
   candidate and fail unless every fold selects that candidate from training data.
 - [x] Mirror Java first-run account/position input with a strict single-account
   backtest opening snapshot, seed strategy and portfolio from the same balances
   and derivative average costs, block entry until opening valuation, report true
   opening-adjusted PnL and ending state, reject terminal strategy halts, and
   require identical positive opening capital in production research.
-- [x] Derive each schema-7 production dataset's opening portfolio from a unique,
+- [x] Derive each schema-8 production chain root's opening portfolio from a unique,
   independently rebuilt account certification; bind exact build, calibrated
   host, proposed production-config bytes, production environment, account
   identity, instrument accounting scope, spot valuation mapping, and bounded
   pre-capture timing, while retaining certified available/equity/loan/margin
   fields in strategy state.
-- [ ] For split continuous sessions, carry and verify ending balances,
-  derivative quantity, average cost, and settlement ledger into the next file,
-  matching Java `updateInputForNextRun` after its terminal mark-to-market,
-  balance/margin reset, derivative average-cost reset, and hold release. Dataset
-  sequences currently reset to independently certified opening snapshots. Raw
-  frames now have a verified process-global ordinal, but capture segmentation
-  and settled backtest carry still need one same-session handoff contract.
+- [x] For explicit ordinal ranges of one verified capture session, carry ending
+  balances, derivative quantity, terminal average cost, current valuation state,
+  pending/settled funding state, recalculated margin, and latest stateful
+  index/funding/mark/price-limit inputs into the next range.
+  Match Java `updateInputForNextRun` after terminal mark-to-market,
+  balance/margin reset, derivative average-cost reset, strategy stop/cancel, and
+  hold release. Schema-8 research requires a linear `continuation_of` contract,
+  exact next process-global ordinal, non-regressing receive time, the same
+  canonical raw/config/report evidence, and a source-rebuilt certified root.
+- [x] Recalculate and publish full simulated account/position/margin state on a
+  deterministic 10-second schedule, matching the Java portfolio service, while
+  preventing that path from bypassing delayed fill-to-account visibility.
+- [ ] If capture file rotation is introduced, preserve one session ID and
+  process-global ordinal across rotated files before allowing cross-file carry.
+  Separate capture processes and restarted sessions remain independent.
 - [x] Independently bind the reconstructed deployment candidate's effective
   strategy hash to the exact proposed production live config, rejecting smoke,
   demo, invalid reconstruction, ambiguous provenance, and strategy drift.

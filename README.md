@@ -148,7 +148,7 @@ instance name; see `deploy/systemd/README.md`.
 
 The one-hour command is an operational smoke, not funding-complete research
 evidence. Production datasets must be continuous across exchange funding
-boundaries. Schema-7 production research with swap candidates requires nonzero
+boundaries. Schema-8 production research with swap candidates requires nonzero
 realized funding settlements in both training and test aggregates, so short
 captures cannot pass by carrying only forecasts.
 
@@ -205,10 +205,11 @@ opening snapshot. Balances carry spot inventory through an explicit
 `valuation_symbol`; nonzero derivative positions require average cost and
 margin mode. The runner seeds the same snapshot into strategy risk state and
 the accounting ledger, blocks order entry until the first complete book/rate
-valuation, and reports both opening/final equity and net PnL. Schema-7
+valuation, and reports both opening/final equity and net PnL. Schema-8
 production research rejects candidate-file capital and derives one positive
-opening portfolio per dataset from its independently verified account
-certification. The report embeds those assumptions, actual sampled-latency usage,
+opening portfolio per capture chain root from its independently verified account
+certification. Adjacent ordinal ranges of one verified capture can continue from
+the parent's settled portfolio and funding state. The report embeds those assumptions, actual sampled-latency usage,
 the replay time basis, clock regressions, currency ledgers/rates, strategy halt
 reason, live orders, and work still scheduled at the capture boundary. The
 example delay values are zero,
@@ -260,11 +261,15 @@ capture report must identify the same executable as research and the same host
 as the bound latency calibration, with at least one completed periodic host
 check. The smoke fixture intentionally uses
 permissive uncalibrated gates and is not
-trading evidence. Production-candidate manifests use schema 7, predeclare one
+trading evidence. Production-candidate manifests use schema 8, predeclare one
 `deployment_candidate_id`, and fail unless every fold independently selects
 that candidate from training data. Candidate files must omit
-`initial_portfolio`; every raw dataset names a unique, passing account
-certification collected on the same build and calibrated host before capture.
+`initial_portfolio`; every independent dataset or carry-chain root names a
+unique, passing account certification collected on the same build and
+calibrated host before capture. Explicit `capture_record_range` and
+`continuation_of` fields may split one verified capture session into a linear
+settled-carry chain; exact session, ordinal, receive-time, and source identity
+are enforced.
 The manifest supplies explicit spot valuation-symbol mappings, and research
 derives identical candidate state from certified balances, derivative average
 costs, and margin fields. Run PnL is final equity minus opening equity, not final
@@ -295,9 +300,9 @@ cargo run -p reap-cli -- verify-research-deployment \
 ```
 
 This command requires a production venue config, re-runs `verify-research`,
-revalidates the schema-7 candidate binding, and requires the candidate and live
+revalidates the schema-8 candidate binding, and requires the candidate and live
 config to serialize to the same effective strategy SHA-256. It also requires
-every dataset opening certification to embed those exact production-config
+every chain-root opening certification to embed those exact production-config
 bytes. It does not enable order entry or replace transition, account, host,
 fault, fee, funding, statement, deadman, and emergency evidence.
 
@@ -388,7 +393,7 @@ It rejects missing or duplicate per-account coverage, a demo soak reused as a
 fault session, config drift during verification, and any mismatch against the
 manifest-declared build, host, candidate, or environment-specific account
 identities. The demo and production configs must also name the same absolute
-process-shared connection-pacer path. Schema-7 research opening certifications
+process-shared connection-pacer path. Schema-8 research opening certifications
 must identify that same production account, build, and host; their verified raw
 evidence fingerprints are carried through the format-3 reconstruction. Proxy-supported fault roles must carry
 typed records with the exact proxy fingerprint, unique proxy session/command

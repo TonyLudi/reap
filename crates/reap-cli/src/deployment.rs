@@ -126,7 +126,7 @@ pub(crate) fn verify_research_deployment_paths(
         research,
         failures,
         limitations: vec![
-            "a passing binding proves that one reconstructed production-research candidate has the same effective strategy as the exact proposed production config and that every dataset opening was certified from those exact config bytes; it does not prove profitability or evidence freshness"
+            "a passing binding proves that one reconstructed production-research candidate has the same effective strategy as the exact proposed production config and that every independent dataset or carry-chain root was certified from those exact config bytes; it does not prove profitability or evidence freshness"
                 .to_string(),
             "credential permissions, target-account state, target-host operation, fault campaigns, statement reconciliation, and emergency procedures remain separate production gates"
                 .to_string(),

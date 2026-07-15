@@ -8,9 +8,10 @@ use reap_capture::{
     CaptureAnalysisReport, CaptureConfig, CaptureVerificationReport, analyze_capture_path,
     verify_capture_paths,
 };
+use reap_core::PositionMarginMode;
 use reap_feed::{ReplayCheckReport, replay_check_path};
 use reap_live::{
-    AccountCertificationArtifact, LiveConfig, TradingEnvironment,
+    AccountCertificationArtifact, LiveConfig, OkxTradeModeConfig, TradingEnvironment,
     verify_account_certification_artifact_path,
 };
 use reap_venue::okx::{
@@ -21,13 +22,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    BacktestConfig, BacktestExecutionConfig, BacktestInitialBalanceConfig,
+    BacktestCarryState, BacktestConfig, BacktestExecutionConfig, BacktestInitialBalanceConfig,
     BacktestInitialMarginConfig, BacktestInitialPortfolioConfig, BacktestInitialPositionConfig,
     BacktestReport, BacktestRunner, LatencyCalibrationArtifact,
-    MAX_LATENCY_CALIBRATION_ARTIFACT_BYTES,
+    MAX_LATENCY_CALIBRATION_ARTIFACT_BYTES, RawCaptureRecordRange,
 };
 
-pub const RESEARCH_SCHEMA_VERSION: u32 = 7;
+pub const RESEARCH_SCHEMA_VERSION: u32 = 8;
 const MAX_PRODUCTION_OPENING_ACCOUNT_GAP_MS: u64 = 15 * 60 * 1_000;
 pub use reap_core::PINNED_JAVA_REVISION;
 
@@ -66,6 +67,7 @@ pub enum DatasetPortfolioSemantics {
     IndependentZeroInitialPortfolio,
     IndependentConfiguredInitialPortfolio,
     IndependentCertifiedDatasetPortfolio,
+    SequentialSettledCarry,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +101,10 @@ pub struct ResearchDataset {
     pub id: String,
     pub path: PathBuf,
     pub format: ResearchDataFormat,
+    #[serde(default)]
+    pub capture_record_range: Option<RawCaptureRecordRange>,
+    #[serde(default)]
+    pub continuation_of: Option<String>,
     #[serde(default)]
     pub capture_config: Option<PathBuf>,
     #[serde(default)]
@@ -226,6 +232,10 @@ pub struct DatasetProvenance {
     pub id: String,
     pub path: PathBuf,
     pub format: ResearchDataFormat,
+    #[serde(default)]
+    pub capture_record_range: Option<RawCaptureRecordRange>,
+    #[serde(default)]
+    pub continuation_of: Option<String>,
     pub data_sha256: String,
     pub raw_replay_check: Option<ReplayCheckReport>,
     pub capture_config: Option<PathBuf>,
@@ -423,8 +433,8 @@ pub fn run_research_manifest_path(path: impl AsRef<Path>) -> Result<ResearchRepo
     let candidates = load_candidates(&manifest.candidates, base)?;
     let uses_certified_opening_accounts = manifest
         .datasets
-        .first()
-        .is_some_and(|dataset| dataset.opening_account.is_some());
+        .iter()
+        .any(|dataset| dataset.opening_account.is_some());
     validate_candidate_initial_portfolios(
         manifest.mode,
         uses_certified_opening_accounts,
@@ -454,14 +464,14 @@ pub fn run_research_manifest_path(path: impl AsRef<Path>) -> Result<ResearchRepo
     for fold in &manifest.folds {
         let mut training = Vec::with_capacity(candidates.len());
         for candidate in &candidates {
-            let runs = fold
-                .train
-                .iter()
-                .map(|dataset_id| {
-                    let dataset = find_dataset(&datasets, dataset_id);
-                    cached_run(&mut cache, candidate, dataset, baseline)
-                })
-                .collect::<Vec<_>>();
+            let runs = run_sequence(
+                &mut cache,
+                candidate,
+                &datasets,
+                &fold.train,
+                baseline,
+                None,
+            );
             let aggregate = RunAggregate::from_runs(&runs);
             let mut failures = training_failures(&runs, &aggregate, baseline, &manifest.gates);
             let selection_score = if failures.is_empty() {
@@ -495,15 +505,37 @@ pub fn run_research_manifest_path(path: impl AsRef<Path>) -> Result<ResearchRepo
                 .iter()
                 .find(|candidate| candidate.spec.id == selected_candidate_id)
                 .expect("selected candidate must be loaded");
+            let selected_train = training
+                .iter()
+                .find(|candidate| candidate.candidate_id == selected_candidate_id)
+                .expect("selected training report must exist");
+            let test_initial_carry = fold
+                .test
+                .first()
+                .and_then(|dataset_id| {
+                    find_dataset(&datasets, dataset_id)
+                        .spec
+                        .continuation_of
+                        .as_deref()
+                })
+                .filter(|parent_id| fold.train.last().is_some_and(|last| last == parent_id))
+                .and_then(|_| selected_train.runs.last())
+                .and_then(|run| run.report.as_ref())
+                .and_then(|report| {
+                    report
+                        .settled_carry_state
+                        .clone()
+                        .map(|carry| (carry, report.execution.clone()))
+                });
             for scenario in &manifest.scenarios {
-                let runs = fold
-                    .test
-                    .iter()
-                    .map(|dataset_id| {
-                        let dataset = find_dataset(&datasets, dataset_id);
-                        cached_run(&mut cache, candidate, dataset, scenario)
-                    })
-                    .collect::<Vec<_>>();
+                let runs = run_sequence(
+                    &mut cache,
+                    candidate,
+                    &datasets,
+                    &fold.test,
+                    scenario,
+                    test_initial_carry.clone(),
+                );
                 let aggregate = RunAggregate::from_runs(&runs);
                 let (evidence_failures, performance_failures) =
                     test_failures(&runs, &aggregate, scenario, &manifest.gates);
@@ -521,10 +553,6 @@ pub fn run_research_manifest_path(path: impl AsRef<Path>) -> Result<ResearchRepo
                 });
             }
 
-            let selected_train = training
-                .iter()
-                .find(|candidate| candidate.candidate_id == selected_candidate_id)
-                .expect("selected training report must exist");
             let baseline_test = test_scenarios
                 .iter()
                 .find(|scenario| scenario.kind == ResearchScenarioKind::Baseline)
@@ -591,6 +619,11 @@ pub fn run_research_manifest_path(path: impl AsRef<Path>) -> Result<ResearchRepo
         latency_calibration: latency_calibration.map(|loaded| loaded.provenance),
         dataset_portfolio_semantics: if datasets
             .iter()
+            .any(|dataset| dataset.spec.continuation_of.is_some())
+        {
+            DatasetPortfolioSemantics::SequentialSettledCarry
+        } else if datasets
+            .iter()
             .any(|dataset| dataset.opening_account.is_some())
         {
             DatasetPortfolioSemantics::IndependentCertifiedDatasetPortfolio
@@ -617,6 +650,8 @@ pub fn run_research_manifest_path(path: impl AsRef<Path>) -> Result<ResearchRepo
                 id: dataset.spec.id.clone(),
                 path: dataset.spec.path.clone(),
                 format: dataset.spec.format,
+                capture_record_range: dataset.spec.capture_record_range,
+                continuation_of: dataset.spec.continuation_of.clone(),
                 data_sha256: dataset.sha256.clone(),
                 raw_replay_check: dataset.raw_replay_check.clone(),
                 capture_config: dataset.spec.capture_config.clone(),
@@ -739,14 +774,91 @@ impl ResearchManifest {
             .iter()
             .map(|dataset| dataset.id.as_str())
             .collect::<HashSet<_>>();
-        let opening_account_count = self
+        let datasets_by_id = self
             .datasets
             .iter()
-            .filter(|dataset| dataset.opening_account.is_some())
-            .count();
-        if opening_account_count != 0 && opening_account_count != self.datasets.len() {
+            .map(|dataset| (dataset.id.as_str(), dataset))
+            .collect::<HashMap<_, _>>();
+        let mut continuation_children = HashMap::new();
+        let mut chain_roots = 0_usize;
+        let mut certified_chain_roots = 0_usize;
+        for dataset in &self.datasets {
+            if let Some(range) = dataset.capture_record_range
+                && let Err(error) = range.validate()
+            {
+                errors.push(format!("dataset {}: {error}", dataset.id));
+            }
+            if dataset.format != ResearchDataFormat::RawCapture
+                && (dataset.capture_record_range.is_some() || dataset.continuation_of.is_some())
+            {
+                errors.push(format!(
+                    "dataset {}: capture_record_range and continuation_of are valid only for raw_capture datasets",
+                    dataset.id
+                ));
+            }
+            let Some(parent_id) = dataset.continuation_of.as_deref() else {
+                chain_roots += 1;
+                certified_chain_roots += usize::from(dataset.opening_account.is_some());
+                if self.mode == ResearchMode::ProductionCandidate
+                    && dataset
+                        .capture_record_range
+                        .is_some_and(|range| range.first != 1)
+                {
+                    errors.push(format!(
+                        "production chain root {} must begin at capture record 1; later ranges require continuation_of",
+                        dataset.id
+                    ));
+                }
+                if self.mode == ResearchMode::ProductionCandidate
+                    && dataset.opening_account.is_none()
+                {
+                    errors.push(format!(
+                        "production chain root {} requires opening_account evidence",
+                        dataset.id
+                    ));
+                }
+                continue;
+            };
+            if dataset.opening_account.is_some() {
+                errors.push(format!(
+                    "continuation dataset {} must derive opening state and cannot declare opening_account",
+                    dataset.id
+                ));
+            }
+            let Some(parent) = datasets_by_id.get(parent_id).copied() else {
+                errors.push(format!(
+                    "dataset {} continues unknown dataset {}",
+                    dataset.id, parent_id
+                ));
+                continue;
+            };
+            let (Some(parent_range), Some(range)) =
+                (parent.capture_record_range, dataset.capture_record_range)
+            else {
+                errors.push(format!(
+                    "continuation {} and parent {} must both declare capture_record_range",
+                    dataset.id, parent.id
+                ));
+                continue;
+            };
+            if parent_range.last.checked_add(1) != Some(range.first) {
+                errors.push(format!(
+                    "continuation {} must begin at capture record {} immediately after parent {}",
+                    dataset.id,
+                    parent_range.last.saturating_add(1),
+                    parent.id
+                ));
+            }
+            if let Some(existing) = continuation_children.insert(parent_id, dataset.id.as_str()) {
+                errors.push(format!(
+                    "dataset {} has multiple continuation children {} and {}",
+                    parent_id, existing, dataset.id
+                ));
+            }
+        }
+        if certified_chain_roots != 0 && certified_chain_roots != chain_roots {
             errors.push(
-                "research datasets must either all provide opening_account evidence or all omit it"
+                "research chain roots must either all provide opening_account evidence or all omit it"
                     .to_string(),
             );
         }
@@ -792,6 +904,29 @@ impl ResearchManifest {
                         "dataset {} is a test set in both folds {} and {}",
                         dataset_id, owner, fold.id
                     ));
+                }
+            }
+            for (label, sequence) in [("train", &fold.train), ("test", &fold.test)] {
+                for (index, dataset_id) in sequence.iter().enumerate() {
+                    let Some(dataset) = datasets_by_id.get(dataset_id.as_str()).copied() else {
+                        continue;
+                    };
+                    let Some(parent_id) = dataset.continuation_of.as_deref() else {
+                        continue;
+                    };
+                    let expected_parent = if index > 0 {
+                        sequence.get(index - 1).map(String::as_str)
+                    } else if label == "test" {
+                        fold.train.last().map(String::as_str)
+                    } else {
+                        None
+                    };
+                    if expected_parent != Some(parent_id) {
+                        errors.push(format!(
+                            "fold {} {} dataset {} must immediately follow continuation parent {}",
+                            fold.id, label, dataset.id, parent_id
+                        ));
+                    }
                 }
             }
         }
@@ -853,26 +988,18 @@ impl ResearchManifest {
                     "production_candidate requires a capture_report for every dataset".to_string(),
                 );
             }
-            if self
-                .datasets
-                .iter()
-                .any(|dataset| dataset.opening_account.is_none())
-            {
-                errors.push(
-                    "production_candidate requires opening_account evidence for every dataset"
-                        .to_string(),
-                );
-            }
         }
         for dataset in &self.datasets {
             if dataset.format != ResearchDataFormat::RawCapture
                 && (dataset.capture_config.is_some()
                     || dataset.capture_report.is_some()
                     || dataset.normalized_path.is_some()
-                    || dataset.opening_account.is_some())
+                    || dataset.opening_account.is_some()
+                    || dataset.capture_record_range.is_some()
+                    || dataset.continuation_of.is_some())
             {
                 errors.push(format!(
-                    "dataset {}: capture_config, capture_report, normalized_path, and opening_account are valid only for raw_capture datasets",
+                    "dataset {}: capture evidence, opening_account, record ranges, and continuations are valid only for raw_capture datasets",
                     dataset.id
                 ));
             }
@@ -1399,8 +1526,9 @@ fn load_datasets(
     maximum_opening_account_gap_ms: u64,
 ) -> Result<Vec<LoadedDataset>> {
     let mut loaded = Vec::with_capacity(specs.len());
-    let mut canonical_paths = HashSet::new();
-    let mut hashes = HashSet::new();
+    let mut canonical_ranges = HashMap::<PathBuf, Vec<(String, RawCaptureRecordRange)>>::new();
+    let mut whole_canonical_paths = HashSet::new();
+    let mut hashes = HashMap::<String, PathBuf>::new();
     let mut opening_account_paths = HashSet::new();
     let mut opening_account_hashes = HashSet::new();
     let mut opening_account_evidence_hashes = HashSet::new();
@@ -1409,15 +1537,51 @@ fn load_datasets(
         let canonical = resolved
             .canonicalize()
             .with_context(|| format!("failed to resolve dataset {}", resolved.display()))?;
-        if !canonical_paths.insert(canonical.clone()) {
-            bail!(
-                "dataset path {} is referenced more than once",
-                spec.path.display()
-            );
+        if let Some(existing) = canonical_ranges.get_mut(&canonical) {
+            if whole_canonical_paths.contains(&canonical) {
+                bail!(
+                    "dataset path {} is referenced both as a whole file and a record range",
+                    spec.path.display()
+                );
+            }
+            let range = spec.capture_record_range.with_context(|| {
+                format!(
+                    "dataset path {} is referenced more than once without a capture_record_range",
+                    spec.path.display()
+                )
+            })?;
+            if let Some((other_id, other_range)) = existing
+                .iter()
+                .find(|(_, other)| range.first <= other.last && other.first <= range.last)
+            {
+                bail!(
+                    "dataset {} range {}..={} overlaps dataset {} range {}..={} in one raw capture",
+                    spec.id,
+                    range.first,
+                    range.last,
+                    other_id,
+                    other_range.first,
+                    other_range.last
+                );
+            }
+            existing.push((spec.id.clone(), range));
+        } else {
+            if spec.capture_record_range.is_none() {
+                whole_canonical_paths.insert(canonical.clone());
+            }
+            let ranges = spec
+                .capture_record_range
+                .map(|range| vec![(spec.id.clone(), range)])
+                .unwrap_or_default();
+            canonical_ranges.insert(canonical.clone(), ranges);
         }
         let sha256 = sha256_path(&canonical)?;
-        if !hashes.insert(sha256.clone()) {
-            bail!("dataset {} duplicates another dataset's bytes", spec.id);
+        if let Some(existing_path) = hashes.get(&sha256) {
+            if existing_path != &canonical {
+                bail!("dataset {} duplicates another dataset's bytes", spec.id);
+            }
+        } else {
+            hashes.insert(sha256.clone(), canonical.clone());
         }
         let raw_replay_check = if spec.format == ResearchDataFormat::RawCapture {
             let report = replay_check_path(&canonical)
@@ -1644,6 +1808,32 @@ fn load_datasets(
             resolved_opening_account,
             opening_account,
         });
+    }
+    let loaded_by_id = loaded
+        .iter()
+        .map(|dataset| (dataset.spec.id.as_str(), dataset))
+        .collect::<HashMap<_, _>>();
+    for dataset in &loaded {
+        let Some(parent_id) = dataset.spec.continuation_of.as_deref() else {
+            continue;
+        };
+        let parent = loaded_by_id.get(parent_id).copied().with_context(|| {
+            format!(
+                "dataset {} has no loaded parent {parent_id}",
+                dataset.spec.id
+            )
+        })?;
+        if dataset.resolved_path != parent.resolved_path
+            || dataset.resolved_capture_config != parent.resolved_capture_config
+            || dataset.resolved_capture_report != parent.resolved_capture_report
+            || dataset.resolved_normalized_path != parent.resolved_normalized_path
+        {
+            bail!(
+                "continuation dataset {} must use the exact raw/config/report/normalized sources of parent {}",
+                dataset.spec.id,
+                parent.spec.id
+            );
+        }
     }
     Ok(loaded)
 }
@@ -2008,11 +2198,13 @@ fn derive_certified_opening_portfolio(
         .iter()
         .map(|instrument| (instrument.symbol.as_str(), instrument))
         .collect::<HashMap<_, _>>();
-    let mut initial_positions = Vec::new();
-    let mut seen_positions = BTreeSet::new();
+    let mut certified_positions = HashMap::new();
     for risk in &positions.positions {
         let position = &risk.position;
-        if !seen_positions.insert(position.symbol.as_str()) {
+        if certified_positions
+            .insert(position.symbol.as_str(), position)
+            .is_some()
+        {
             bail!(
                 "dataset {} opening account repeats position {}",
                 dataset.id,
@@ -2035,11 +2227,53 @@ fn derive_certified_opening_portfolio(
                 position.symbol
             );
         }
+    }
+    let live_account = live_config
+        .accounts
+        .iter()
+        .find(|account| account.id == account_id)
+        .with_context(|| {
+            format!(
+                "dataset {} certified live config omits account {}",
+                dataset.id, account_id
+            )
+        })?;
+    let mut initial_positions = Vec::new();
+    for instrument in candidate
+        .config
+        .strategy
+        .instruments
+        .iter()
+        .filter(|instrument| instrument.kind.is_derivative())
+    {
+        let expected_margin_mode = match live_account.trade_modes.get(&instrument.symbol) {
+            Some(OkxTradeModeConfig::Cross) => PositionMarginMode::Cross,
+            Some(OkxTradeModeConfig::Isolated) => PositionMarginMode::Isolated,
+            Some(OkxTradeModeConfig::Cash) | None => {
+                bail!(
+                    "dataset {} derivative {} has no supported configured margin mode",
+                    dataset.id,
+                    instrument.symbol
+                )
+            }
+        };
+        let certified = certified_positions.get(instrument.symbol.as_str()).copied();
+        if certified.is_some_and(|position| {
+            position.qty != 0.0 && position.margin_mode != Some(expected_margin_mode)
+        }) {
+            bail!(
+                "dataset {} opening position {} margin mode differs from certified live config",
+                dataset.id,
+                instrument.symbol
+            );
+        }
         initial_positions.push(BacktestInitialPositionConfig {
-            symbol: position.symbol.clone(),
-            qty: position.qty,
-            avg_price: position.avg_price,
-            margin_mode: position.margin_mode,
+            symbol: instrument.symbol.clone(),
+            qty: certified.map_or(0.0, |position| position.qty),
+            avg_price: certified
+                .filter(|position| position.qty != 0.0)
+                .map_or(0.0, |position| position.avg_price),
+            margin_mode: Some(expected_margin_mode),
         });
     }
     initial_positions.sort_by(|left, right| left.symbol.cmp(&right.symbol));
@@ -2316,11 +2550,59 @@ fn verify_input_hashes(
     Ok(())
 }
 
+fn run_sequence(
+    cache: &mut HashMap<(String, String, String), ResearchRunReport>,
+    candidate: &LoadedCandidate,
+    datasets: &[LoadedDataset],
+    dataset_ids: &[String],
+    scenario: &ResearchScenario,
+    mut opening_carry: Option<(BacktestCarryState, BacktestExecutionConfig)>,
+) -> Vec<ResearchRunReport> {
+    let mut runs = Vec::with_capacity(dataset_ids.len());
+    for (index, dataset_id) in dataset_ids.iter().enumerate() {
+        let dataset = find_dataset(datasets, dataset_id);
+        let continuation = dataset.spec.continuation_of.is_some();
+        let carry = if continuation {
+            if index == 0 {
+                opening_carry.take()
+            } else {
+                runs.last()
+                    .and_then(|run: &ResearchRunReport| run.report.as_ref())
+                    .and_then(|report| {
+                        report
+                            .settled_carry_state
+                            .clone()
+                            .map(|carry| (carry, report.execution.clone()))
+                    })
+            }
+        } else {
+            None
+        };
+        if continuation && carry.is_none() {
+            runs.push(ResearchRunReport {
+                candidate_id: candidate.spec.id.clone(),
+                dataset_id: dataset.spec.id.clone(),
+                scenario_id: scenario.id.clone(),
+                report: None,
+                error: Some(format!(
+                    "dataset {} requires settled carry from continuation parent {}",
+                    dataset.spec.id,
+                    dataset.spec.continuation_of.as_deref().unwrap_or_default()
+                )),
+            });
+            continue;
+        }
+        runs.push(cached_run(cache, candidate, dataset, scenario, carry));
+    }
+    runs
+}
+
 fn cached_run(
     cache: &mut HashMap<(String, String, String), ResearchRunReport>,
     candidate: &LoadedCandidate,
     dataset: &LoadedDataset,
     scenario: &ResearchScenario,
+    carry: Option<(BacktestCarryState, BacktestExecutionConfig)>,
 ) -> ResearchRunReport {
     let key = (
         candidate.spec.id.clone(),
@@ -2336,13 +2618,28 @@ fn cached_run(
     }
     config.backtest = effective_scenario_execution(&config.backtest, &scenario.execution)
         .expect("scenario currency rates must be validated before research runs");
-    let result = BacktestRunner::from_config(config).and_then(|runner| match dataset.spec.format {
-        ResearchDataFormat::Csv => runner.run_csv_path(&dataset.resolved_path),
-        ResearchDataFormat::NormalizedJsonl => {
-            runner.run_normalized_jsonl_path(&dataset.resolved_path)
+    let result = (|| -> Result<BacktestReport> {
+        let runner = if let Some((carry, source_execution)) = carry {
+            let carry =
+                carry.rebind_execution(&config.strategy, &source_execution, &config.backtest)?;
+            BacktestRunner::from_config_with_carry(config, carry)?
+        } else {
+            BacktestRunner::from_config(config)?
+        };
+        match dataset.spec.format {
+            ResearchDataFormat::Csv => runner.run_csv_path(&dataset.resolved_path),
+            ResearchDataFormat::NormalizedJsonl => {
+                runner.run_normalized_jsonl_path(&dataset.resolved_path)
+            }
+            ResearchDataFormat::RawCapture => {
+                if let Some(range) = dataset.spec.capture_record_range {
+                    runner.run_raw_capture_range_path(&dataset.resolved_path, range)
+                } else {
+                    runner.run_raw_capture_path(&dataset.resolved_path)
+                }
+            }
         }
-        ResearchDataFormat::RawCapture => runner.run_raw_capture_path(&dataset.resolved_path),
-    });
+    })();
     let (report, error) = match result {
         Ok(report) => (Some(report), None),
         Err(error) => (None, Some(format!("{error:#}"))),
@@ -2805,6 +3102,8 @@ fn no_less_conservative(
         && stress.queue_ahead_multiplier >= baseline.queue_ahead_multiplier
         && stress.historical_trade_fill_fraction <= baseline.historical_trade_fill_fraction
         && stress.displayed_depth_fill_fraction <= baseline.displayed_depth_fill_fraction
+        && stress.derivative_leverage <= baseline.derivative_leverage
+        && stress.exchange_cmr_multiplier <= baseline.exchange_cmr_multiplier
 }
 
 fn deployment_selection_failure(
@@ -2910,6 +3209,7 @@ mod tests {
         CaptureStopReason, CaptureSubscriptionConfig, CaptureVenueConfig, HostGuardConfig,
         HostHealthSnapshot, analyze_capture,
     };
+    use reap_strategy::{ChaosConfig, InstrumentConfig, InstrumentKindConfig, RiskGroupConfig};
     use tempfile::TempDir;
 
     use super::*;
@@ -3047,11 +3347,142 @@ mod tests {
         }
     }
 
+    fn two_symbol_raw_capture(directory: &Path) -> PathBuf {
+        let mut output = Vec::new();
+        let mut capture_record_seq = 1_u64;
+        for line in std::str::from_utf8(RAW_CAPTURE_FIXTURE).unwrap().lines() {
+            let source = serde_json::from_str::<serde_json::Value>(line).unwrap();
+            for (offset, symbol) in ["BTC-USDT", "BTC-PERP"].into_iter().enumerate() {
+                let mut record = source.clone();
+                record["capture_record_seq"] = capture_record_seq.into();
+                record["recv_ts_ns"] =
+                    (source["recv_ts_ns"].as_u64().unwrap() * 10 + offset as u64).into();
+                record["symbol"] = symbol.into();
+                record["payload"]["arg"]["instId"] = symbol.into();
+                serde_json::to_writer(&mut output, &record).unwrap();
+                output.push(b'\n');
+                capture_record_seq += 1;
+            }
+        }
+        let path = directory.join("two-symbol-capture.jsonl");
+        std::fs::write(&path, output).unwrap();
+        path
+    }
+
+    fn carry_candidate(directory: &Path) -> LoadedCandidate {
+        let strategy = ChaosConfig {
+            ref_symbol: "BTC-USDT".to_string(),
+            risk_groups: vec![RiskGroupConfig {
+                name: "main".to_string(),
+                symbols: vec!["BTC-USDT".to_string(), "BTC-PERP".to_string()],
+                ..RiskGroupConfig::default()
+            }],
+            instruments: vec![
+                InstrumentConfig {
+                    symbol: "BTC-USDT".to_string(),
+                    risk_group: "main".to_string(),
+                    base_currency: "BTC".to_string(),
+                    quote_currency: "USD".to_string(),
+                    quote_profit_margin: 1.0,
+                    halted: true,
+                    ..InstrumentConfig::default()
+                },
+                InstrumentConfig {
+                    symbol: "BTC-PERP".to_string(),
+                    risk_group: "main".to_string(),
+                    kind: InstrumentKindConfig::Future,
+                    base_currency: "BTC".to_string(),
+                    quote_currency: "USD".to_string(),
+                    settle_currency: "USD".to_string(),
+                    quote_profit_margin: 1.0,
+                    contract_value: 0.001,
+                    min_trade_size: 1.0,
+                    lot_size: 1.0,
+                    halted: true,
+                    ..InstrumentConfig::default()
+                },
+            ],
+            ..ChaosConfig::default()
+        };
+        let config = BacktestConfig {
+            strategy: strategy.clone(),
+            backtest: BacktestExecutionConfig::default(),
+            initial_portfolio: BacktestInitialPortfolioConfig {
+                balances: vec![
+                    BacktestInitialBalanceConfig {
+                        currency: "BTC".to_string(),
+                        total: 0.0,
+                        valuation_symbol: Some("BTC-USDT".to_string()),
+                        ..Default::default()
+                    },
+                    BacktestInitialBalanceConfig {
+                        currency: "USD".to_string(),
+                        total: 10_000.0,
+                        ..Default::default()
+                    },
+                ],
+                positions: vec![BacktestInitialPositionConfig {
+                    symbol: "BTC-PERP".to_string(),
+                    qty: 0.0,
+                    avg_price: 0.0,
+                    margin_mode: Some(PositionMarginMode::Cross),
+                }],
+                ..Default::default()
+            },
+        };
+        LoadedCandidate {
+            spec: ResearchCandidate {
+                id: "carry-candidate".to_string(),
+                config: PathBuf::from("candidate.toml"),
+            },
+            resolved_path: directory.join("candidate.toml"),
+            sha256: "c".repeat(64),
+            effective_strategy_sha256: effective_strategy_sha256(&strategy).unwrap(),
+            config,
+        }
+    }
+
+    fn loaded_raw_segment(
+        id: &str,
+        path: &Path,
+        range: RawCaptureRecordRange,
+        continuation_of: Option<&str>,
+    ) -> LoadedDataset {
+        LoadedDataset {
+            spec: ResearchDataset {
+                id: id.to_string(),
+                path: path.to_path_buf(),
+                format: ResearchDataFormat::RawCapture,
+                capture_record_range: Some(range),
+                continuation_of: continuation_of.map(str::to_string),
+                capture_config: None,
+                capture_report: None,
+                normalized_path: None,
+                opening_account: None,
+            },
+            resolved_path: path.to_path_buf(),
+            sha256: sha256_path(path).unwrap(),
+            raw_replay_check: None,
+            resolved_capture_config: None,
+            capture_config_sha256: None,
+            resolved_capture_report: None,
+            capture_report_sha256: None,
+            resolved_normalized_path: None,
+            normalized_sha256: None,
+            capture_analysis: None,
+            capture_verification: None,
+            resolved_opening_account: None,
+            opening_account: None,
+        }
+    }
+
     fn fixture_dataset(fixture: &ResearchCaptureFixture) -> ResearchDataset {
         ResearchDataset {
             id: "capture".to_string(),
             path: fixture.raw_path.clone(),
             format: ResearchDataFormat::RawCapture,
+            capture_record_range: None,
+            continuation_of: None,
             capture_config: Some(fixture.config_path.clone()),
             capture_report: Some(fixture.report_path.clone()),
             normalized_path: None,
@@ -3107,6 +3538,8 @@ mod tests {
             queue_ahead_multiplier: queue,
             historical_trade_fill_fraction: trade_fraction,
             displayed_depth_fill_fraction: depth_fraction,
+            derivative_leverage: 1.0,
+            exchange_cmr_multiplier: 50.0,
         }
     }
 
@@ -3195,6 +3628,8 @@ mod tests {
                     id: "train".to_string(),
                     path: "train.jsonl".into(),
                     format: ResearchDataFormat::NormalizedJsonl,
+                    capture_record_range: None,
+                    continuation_of: None,
                     capture_config: None,
                     capture_report: None,
                     normalized_path: None,
@@ -3204,6 +3639,8 @@ mod tests {
                     id: "test".to_string(),
                     path: "test.jsonl".into(),
                     format: ResearchDataFormat::NormalizedJsonl,
+                    capture_record_range: None,
+                    continuation_of: None,
                     capture_config: None,
                     capture_report: None,
                     normalized_path: None,
@@ -3256,6 +3693,170 @@ mod tests {
     }
 
     #[test]
+    fn manifest_accepts_only_explicit_adjacent_continuation_order() {
+        let mut manifest = manifest();
+        for dataset in &mut manifest.datasets {
+            dataset.format = ResearchDataFormat::RawCapture;
+            dataset.path = PathBuf::from("capture.jsonl");
+        }
+        manifest.datasets[0].capture_record_range =
+            Some(RawCaptureRecordRange { first: 1, last: 5 });
+        manifest.datasets[1].capture_record_range =
+            Some(RawCaptureRecordRange { first: 6, last: 10 });
+        manifest.datasets[1].continuation_of = Some("train".to_string());
+
+        manifest.validate().unwrap();
+
+        manifest.datasets[1].capture_record_range =
+            Some(RawCaptureRecordRange { first: 7, last: 10 });
+        let error = manifest.validate().unwrap_err().to_string();
+        assert!(error.contains("must begin at capture record 6"));
+
+        manifest.datasets[1].capture_record_range =
+            Some(RawCaptureRecordRange { first: 6, last: 10 });
+        manifest.folds[0].train = vec!["test".to_string()];
+        manifest.folds[0].test = vec!["train".to_string()];
+        let error = manifest.validate().unwrap_err().to_string();
+        assert!(error.contains("must immediately follow continuation parent train"));
+    }
+
+    #[test]
+    fn production_chain_root_cannot_start_mid_capture() {
+        let mut manifest = manifest();
+        manifest.mode = ResearchMode::ProductionCandidate;
+        manifest.datasets[0].format = ResearchDataFormat::RawCapture;
+        manifest.datasets[0].capture_record_range =
+            Some(RawCaptureRecordRange { first: 2, last: 5 });
+
+        let error = manifest.validate().unwrap_err().to_string();
+
+        assert!(error.contains(
+            "production chain root train must begin at capture record 1; later ranges require continuation_of"
+        ));
+    }
+
+    #[test]
+    fn raw_continuation_consumes_selected_training_carry() {
+        let directory = tempfile::tempdir().unwrap();
+        let raw_path = two_symbol_raw_capture(directory.path());
+        let candidate = carry_candidate(directory.path());
+        let datasets = vec![
+            loaded_raw_segment(
+                "train",
+                &raw_path,
+                RawCaptureRecordRange { first: 1, last: 12 },
+                None,
+            ),
+            loaded_raw_segment(
+                "test",
+                &raw_path,
+                RawCaptureRecordRange {
+                    first: 13,
+                    last: 14,
+                },
+                Some("train"),
+            ),
+        ];
+        let scenario = ResearchScenario {
+            id: "baseline".to_string(),
+            kind: ResearchScenarioKind::Baseline,
+            execution: BacktestExecutionConfig::default(),
+        };
+        let mut cache = HashMap::new();
+
+        let training = run_sequence(
+            &mut cache,
+            &candidate,
+            &datasets,
+            &["train".to_string()],
+            &scenario,
+            None,
+        );
+        let training_report = training[0].report.as_ref().unwrap();
+        let carry = training_report.settled_carry_state.clone().unwrap();
+        assert_eq!(
+            training_report
+                .raw_replay_boundary
+                .as_ref()
+                .unwrap()
+                .last_capture_record_seq,
+            12
+        );
+
+        let testing = run_sequence(
+            &mut cache,
+            &candidate,
+            &datasets,
+            &["test".to_string()],
+            &scenario,
+            Some((carry, training_report.execution.clone())),
+        );
+        assert!(
+            testing[0].report.is_some(),
+            "{:?}",
+            testing[0].error.as_deref()
+        );
+        let testing_report = testing[0].report.as_ref().unwrap();
+
+        assert_eq!(
+            testing_report.opening_equity_usd,
+            Some(training_report.final_equity_usd)
+        );
+        assert_eq!(
+            testing_report
+                .raw_replay_boundary
+                .as_ref()
+                .unwrap()
+                .first_capture_record_seq,
+            13
+        );
+        assert!(
+            testing_report.settled_carry_state.is_some(),
+            "{:?}",
+            testing_report.carry_state_failures
+        );
+        assert!(testing[0].error.is_none());
+    }
+
+    #[test]
+    fn dataset_loader_allows_disjoint_ranges_and_rejects_overlap() {
+        let fixture = research_capture_fixture();
+        let mut root = fixture_dataset(&fixture);
+        root.id = "root".to_string();
+        root.capture_record_range = Some(RawCaptureRecordRange { first: 1, last: 6 });
+        let mut continuation = fixture_dataset(&fixture);
+        continuation.id = "continuation".to_string();
+        continuation.capture_record_range = Some(RawCaptureRecordRange { first: 7, last: 7 });
+        continuation.continuation_of = Some("root".to_string());
+
+        let loaded = load_datasets(
+            &[root.clone(), continuation.clone()],
+            Path::new("."),
+            ResearchMode::Smoke,
+            &[],
+            &"e".repeat(64),
+            None,
+            60_000,
+        )
+        .unwrap();
+        assert_eq!(loaded.len(), 2);
+
+        continuation.capture_record_range = Some(RawCaptureRecordRange { first: 6, last: 7 });
+        let error = load_datasets(
+            &[root, continuation],
+            Path::new("."),
+            ResearchMode::Smoke,
+            &[],
+            &"e".repeat(64),
+            None,
+            60_000,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("overlaps dataset root"));
+    }
+
+    #[test]
     fn manifest_rejects_mixed_dataset_opening_semantics() {
         let mut manifest = manifest();
         manifest.datasets[0].opening_account = Some(ResearchOpeningAccount {
@@ -3265,7 +3866,7 @@ mod tests {
 
         let error = manifest.validate().unwrap_err().to_string();
 
-        assert!(error.contains("must either all provide opening_account"));
+        assert!(error.contains("chain roots must either all provide opening_account"));
     }
 
     #[test]
@@ -3304,7 +3905,7 @@ mod tests {
         assert!(error.contains("predeclared deployment_candidate_id"));
         assert!(error.contains("capture_config for every dataset"));
         assert!(error.contains("capture_report for every dataset"));
-        assert!(error.contains("opening_account evidence for every dataset"));
+        assert!(error.contains("chain root train requires opening_account evidence"));
         assert!(error.contains("maximum_opening_account_gap_ms"));
     }
 
@@ -3429,6 +4030,8 @@ mod tests {
             id: "capture".to_string(),
             path: PathBuf::from("capture.jsonl"),
             format: ResearchDataFormat::RawCapture,
+            capture_record_range: None,
+            continuation_of: None,
             capture_config: None,
             capture_report: None,
             normalized_path: None,
@@ -3559,6 +4162,8 @@ mod tests {
             id: "gap".to_string(),
             path: "fixtures/raw/okx/depth-gap.jsonl".into(),
             format: ResearchDataFormat::RawCapture,
+            capture_record_range: None,
+            continuation_of: None,
             capture_config: None,
             capture_report: None,
             normalized_path: None,

@@ -15,6 +15,8 @@ const MAX_INITIAL_BALANCES: usize = 256;
 const MAX_INITIAL_POSITIONS: usize = 4_096;
 const MAX_INITIAL_VALUE: f64 = 1.0e18;
 const DEFAULT_CURRENCY_RATE_MAX_AGE_MS: u64 = 75_000;
+const DEFAULT_DERIVATIVE_LEVERAGE: f64 = 1.0;
+const DEFAULT_EXCHANGE_CMR_MULTIPLIER: f64 = 50.0;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -491,6 +493,10 @@ pub struct BacktestExecutionConfig {
     pub historical_trade_fill_fraction: f64,
     /// Fraction of each displayed level available to simulated depth matching.
     pub displayed_depth_fill_fraction: f64,
+    /// Leverage used by the Java-referenced derivative margin simulation.
+    pub derivative_leverage: f64,
+    /// Java `EXCH_CMR_RATIO_DISCOUNT` multiplier applied to exchange margin ratio.
+    pub exchange_cmr_multiplier: f64,
 }
 
 impl Default for BacktestExecutionConfig {
@@ -508,6 +514,8 @@ impl Default for BacktestExecutionConfig {
             queue_ahead_multiplier: 1.0,
             historical_trade_fill_fraction: 1.0,
             displayed_depth_fill_fraction: 1.0,
+            derivative_leverage: DEFAULT_DERIVATIVE_LEVERAGE,
+            exchange_cmr_multiplier: DEFAULT_EXCHANGE_CMR_MULTIPLIER,
         }
     }
 }
@@ -550,6 +558,17 @@ impl BacktestExecutionConfig {
             if !value.is_finite() || !(0.0..=1.0).contains(&value) {
                 bail!("backtest.{name} must be finite and within [0, 1]");
             }
+        }
+        if !self.derivative_leverage.is_finite()
+            || !(1.0..=125.0).contains(&self.derivative_leverage)
+        {
+            bail!("backtest.derivative_leverage must be finite and within [1, 125]");
+        }
+        if !self.exchange_cmr_multiplier.is_finite()
+            || self.exchange_cmr_multiplier <= 0.0
+            || self.exchange_cmr_multiplier > 1_000.0
+        {
+            bail!("backtest.exchange_cmr_multiplier must be finite and within (0, 1000]");
         }
         Ok(())
     }
@@ -1146,6 +1165,8 @@ mod tests {
                 queue_ahead_multiplier: 1.0,
                 historical_trade_fill_fraction: 1.0,
                 displayed_depth_fill_fraction: 1.0,
+                derivative_leverage: 1.0,
+                exchange_cmr_multiplier: 50.0,
             }
         );
     }
@@ -1422,6 +1443,40 @@ mod tests {
                 queue_ahead_multiplier: 2.0,
                 historical_trade_fill_fraction: 0.25,
                 displayed_depth_fill_fraction: 0.5,
+                ..BacktestExecutionConfig::default()
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn derivative_margin_assumptions_are_bounded_and_finite() {
+        for config in [
+            BacktestExecutionConfig {
+                derivative_leverage: 0.99,
+                ..BacktestExecutionConfig::default()
+            },
+            BacktestExecutionConfig {
+                derivative_leverage: 125.01,
+                ..BacktestExecutionConfig::default()
+            },
+            BacktestExecutionConfig {
+                exchange_cmr_multiplier: 0.0,
+                ..BacktestExecutionConfig::default()
+            },
+            BacktestExecutionConfig {
+                exchange_cmr_multiplier: f64::INFINITY,
+                ..BacktestExecutionConfig::default()
+            },
+        ] {
+            assert!(config.validate().is_err());
+        }
+
+        assert!(
+            BacktestExecutionConfig {
+                derivative_leverage: 3.0,
+                exchange_cmr_multiplier: 50.0,
                 ..BacktestExecutionConfig::default()
             }
             .validate()
