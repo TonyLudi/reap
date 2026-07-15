@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use url::Url;
@@ -41,6 +41,13 @@ pub const CAPTURE_RUN_REPORT_FORMAT_VERSION: u16 = 5;
 pub const MAX_CAPTURE_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CONNECTION_ATTEMPT_INTERVAL_MS: u64 = 60_000;
 const MAX_REPORTED_UNKNOWN_FIELDS: usize = 64;
+const WRITER_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(1);
+const WRITER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+const WRITER_ABORT_TIMEOUT: Duration = Duration::from_secs(1);
+const WRITER_EVIDENCE_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
+const FEED_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const HOST_GUARD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const MAX_CAPTURE_FAILURE_MESSAGE_BYTES: usize = 2_048;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaptureConfig {
@@ -173,6 +180,14 @@ pub struct CaptureRunOptions {
 pub enum CaptureStopReason {
     DurationElapsed,
     OperatorSignal,
+    RuntimeFailure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureFailureEvidence {
+    pub code: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -243,6 +258,8 @@ pub struct CaptureRunReport {
     pub ready_connections_at_stop: usize,
     pub reached_all_connections_ready: bool,
     pub books: Vec<CaptureBookHealth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<CaptureFailureEvidence>,
     pub clean_capture: bool,
 }
 
@@ -287,8 +304,30 @@ pub enum CaptureError {
     WriterClosed(&'static str),
     #[error("capture writer task failed: {0}")]
     WriterJoin(#[from] tokio::task::JoinError),
+    #[error("{name} capture writer queue remained full for {timeout_ms}ms")]
+    WriterBackpressure {
+        name: &'static str,
+        timeout_ms: u128,
+    },
+    #[error("{name} capture writer did not shut down within {timeout_ms}ms")]
+    WriterShutdownTimeout {
+        name: &'static str,
+        timeout_ms: u128,
+    },
+    #[error("{name} capture writer did not abort within {timeout_ms}ms")]
+    WriterAbortTimeout {
+        name: &'static str,
+        timeout_ms: u128,
+    },
+    #[error("{name} capture writer evidence scan exceeded {timeout_ms}ms")]
+    WriterEvidenceTimeout {
+        name: &'static str,
+        timeout_ms: u128,
+    },
     #[error("capture feed channel closed unexpectedly")]
     FeedClosed,
+    #[error("capture feed shutdown and drain exceeded {timeout_ms}ms")]
+    FeedShutdownTimeout { timeout_ms: u128 },
     #[error("capture raw record sequence exhausted")]
     RawRecordSequenceExhausted,
     #[error("capture connection pacer failed: {0}")]
@@ -303,6 +342,54 @@ pub enum CaptureError {
     HostGuardClosed,
     #[error("capture host guard task failed: {0}")]
     HostGuardJoin(tokio::task::JoinError),
+    #[error("capture host guard shutdown exceeded {timeout_ms}ms")]
+    HostGuardShutdownTimeout { timeout_ms: u128 },
+    #[error("{primary}; additional capture lifecycle failures: {secondary}")]
+    LifecycleFailure {
+        #[source]
+        primary: Box<CaptureError>,
+        secondary: String,
+    },
+    #[error("{source}")]
+    ReportedFailure {
+        #[source]
+        source: Box<CaptureError>,
+        report: Box<CaptureRunReport>,
+    },
+}
+
+impl CaptureError {
+    pub fn stable_code(&self) -> &'static str {
+        match self {
+            Self::InvalidConfigPath { .. }
+            | Self::ReadConfig { .. }
+            | Self::ConfigTooLarge { .. }
+            | Self::ParseConfig(_)
+            | Self::UnknownFields(_)
+            | Self::InvalidConfig(_) => "config",
+            Self::Partition(_) => "subscription_partition",
+            Self::Venue(_) => "venue_adapter",
+            Self::Io(_) | Self::OpenOutput { .. } => "capture_io",
+            Self::Serialization(_) => "serialization",
+            Self::WriterClosed(_) => "writer_closed",
+            Self::WriterJoin(_) => "writer_task",
+            Self::WriterBackpressure { .. } => "writer_backpressure",
+            Self::WriterShutdownTimeout { .. } => "writer_shutdown_timeout",
+            Self::WriterAbortTimeout { .. } => "writer_abort_timeout",
+            Self::WriterEvidenceTimeout { .. } => "writer_evidence_timeout",
+            Self::FeedClosed => "feed_closed",
+            Self::FeedShutdownTimeout { .. } => "feed_shutdown_timeout",
+            Self::RawRecordSequenceExhausted => "raw_record_sequence",
+            Self::ConnectionPacer(_) | Self::ConnectionPacerRuntime(_) => "connection_pacer",
+            Self::Provenance(_) => "provenance",
+            Self::Host(_)
+            | Self::HostGuardClosed
+            | Self::HostGuardJoin(_)
+            | Self::HostGuardShutdownTimeout { .. } => "host_guard",
+            Self::LifecycleFailure { primary, .. } => primary.stable_code(),
+            Self::ReportedFailure { source, .. } => source.stable_code(),
+        }
+    }
 }
 
 impl CaptureConfig {
@@ -631,6 +718,89 @@ pub async fn run_capture_path(
     run_capture(config, options).await
 }
 
+pub fn capture_startup_failure_report(
+    config: &CaptureConfig,
+    config_source: Option<CaptureConfigFileEvidence>,
+    error: &CaptureError,
+) -> CaptureRunReport {
+    let completed_at_ms = unix_time_ms();
+    // Setup failures happen before feed startup. Empty evidence avoids binding a
+    // pre-existing output that this process never successfully created.
+    let raw = JsonlWriterStats::empty();
+    let normalized = JsonlWriterStats::empty();
+    let mut books = config
+        .expected_book_symbols()
+        .into_iter()
+        .map(|symbol| CaptureBookHealth {
+            symbol,
+            sequence_status: "awaiting_snapshot".to_string(),
+            book_status: "empty".to_string(),
+            last_seq_id: None,
+            buffered_updates: 0,
+            sequence_resets: 0,
+            same_sequence_updates: 0,
+            best_bid: None,
+            best_ask: None,
+        })
+        .collect::<Vec<_>>();
+    books.sort_by(|left, right| left.symbol.cmp(&right.symbol));
+    let expected_connections = config.socket_plans().map_or(0, |plans| plans.len());
+    CaptureRunReport {
+        format_version: CAPTURE_RUN_REPORT_FORMAT_VERSION,
+        reap_version: env!("CARGO_PKG_VERSION").to_string(),
+        java_reference_revision: PINNED_JAVA_REVISION.to_string(),
+        executable_sha256: current_executable_sha256().unwrap_or_default(),
+        host_identity_sha256: None,
+        host_preflight: None,
+        host_periodic_checks: 0,
+        host_last_snapshot: None,
+        session_started_at_ms: completed_at_ms,
+        session_completed_at_ms: completed_at_ms,
+        capture_session_id: format!(
+            "failed-startup-{:x}-{:x}",
+            reap_feed::unix_time_ns(),
+            std::process::id()
+        ),
+        config_fingerprint: config.fingerprint().unwrap_or_default(),
+        config_source,
+        stop_reason: CaptureStopReason::RuntimeFailure,
+        elapsed_ms: 0,
+        raw_path: config.output.raw_path.clone(),
+        normalized_path: config.output.normalized_path.clone(),
+        raw_records: raw.records,
+        normalized_records: normalized.records,
+        raw_bytes: raw.bytes,
+        normalized_bytes: normalized.bytes,
+        raw_sha256: raw.sha256,
+        normalized_sha256: config
+            .output
+            .normalized_path
+            .as_ref()
+            .map(|_| normalized.sha256),
+        max_raw_queue_depth: raw.max_queue_depth,
+        max_normalized_queue_depth: normalized.max_queue_depth,
+        parsed_events: 0,
+        accepted_events: 0,
+        duplicates: 0,
+        gaps: 0,
+        recoveries: 0,
+        recovery_failures: 0,
+        sequence_resets: 0,
+        same_sequence_updates: 0,
+        recovery_requests: 0,
+        missing_recovery_routes: 0,
+        parse_errors: 0,
+        stale_book_events: 0,
+        connection_disconnects: 0,
+        expected_connections,
+        ready_connections_at_stop: 0,
+        reached_all_connections_ready: false,
+        books,
+        failure: Some(capture_failure_evidence(error)),
+        clean_capture: false,
+    }
+}
+
 pub async fn run_capture(
     config: CaptureConfig,
     options: CaptureRunOptions,
@@ -705,7 +875,21 @@ pub async fn run_capture(
         {
             Ok(writer) => Some(writer),
             Err(error) => {
-                let _ = raw_writer.shutdown().await;
+                let raw_shutdown = raw_writer.shutdown_with_evidence().await;
+                let error = match raw_shutdown {
+                    Ok(JsonlWriterShutdown {
+                        failure: Some(shutdown_error),
+                        ..
+                    }) => combine_capture_lifecycle_errors(
+                        error,
+                        vec![("raw writer shutdown", shutdown_error)],
+                    ),
+                    Ok(JsonlWriterShutdown { failure: None, .. }) => error,
+                    Err(shutdown_error) => combine_capture_lifecycle_errors(
+                        error,
+                        vec![("raw writer evidence", shutdown_error)],
+                    ),
+                };
                 return Err(error);
             }
         },
@@ -755,44 +939,113 @@ pub async fn run_capture(
     )
     .await;
 
-    let (_, drain_result) = tokio::join!(
-        feed.shutdown(),
-        drain_capture_channels(
-            &mut state,
-            adapter.as_ref(),
-            &mut raw_rx,
-            &mut status_rx,
-            &raw_writer,
-            normalized_writer.as_ref(),
-        )
+    let drain_result = match tokio::time::timeout(FEED_SHUTDOWN_TIMEOUT, async {
+        let (_, drain_result) = tokio::join!(
+            feed.shutdown(),
+            drain_capture_channels(
+                &mut state,
+                adapter.as_ref(),
+                &mut raw_rx,
+                &mut status_rx,
+                &raw_writer,
+                normalized_writer.as_ref(),
+            )
+        );
+        drain_result
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(CaptureError::FeedShutdownTimeout {
+            timeout_ms: FEED_SHUTDOWN_TIMEOUT.as_millis(),
+        }),
+    };
+    let (raw_shutdown_result, normalized_shutdown_result, host_stats_result) = tokio::join!(
+        raw_writer.shutdown_with_evidence(),
+        async move {
+            match normalized_writer {
+                Some(writer) => writer.shutdown_with_evidence().await,
+                None => Ok(JsonlWriterShutdown {
+                    stats: JsonlWriterStats::default(),
+                    failure: None,
+                }),
+            }
+        },
+        async move {
+            match host_guard {
+                Some(host_guard) => {
+                    match tokio::time::timeout(HOST_GUARD_SHUTDOWN_TIMEOUT, host_guard.shutdown())
+                        .await
+                    {
+                        Ok(result) => result.map_err(CaptureError::HostGuardJoin),
+                        Err(_) => Err(CaptureError::HostGuardShutdownTimeout {
+                            timeout_ms: HOST_GUARD_SHUTDOWN_TIMEOUT.as_millis(),
+                        }),
+                    }
+                }
+                None => Ok(HostGuardStats::default()),
+            }
+        }
     );
-    let raw_stats_result = raw_writer.shutdown().await;
-    let normalized_stats_result = match normalized_writer {
-        Some(writer) => writer.shutdown().await,
-        None => Ok(JsonlWriterStats::default()),
-    };
-    let host_stats_result = match host_guard {
-        Some(host_guard) => host_guard
-            .shutdown()
-            .await
-            .map_err(CaptureError::HostGuardJoin),
-        None => Ok(HostGuardStats::default()),
-    };
     let pending_host_failure = host_failures
         .as_mut()
         .and_then(|failures| failures.try_recv().ok());
     host_failures.take();
-    drain_result?;
-    let stop_reason = loop_result?;
-    let raw_stats = raw_stats_result?;
-    let normalized_stats = normalized_stats_result?;
-    let host_stats = host_stats_result?;
-    if let Some(error) = pending_host_failure {
-        return Err(error.into());
+    let mut lifecycle_failures = Vec::<(&'static str, CaptureError)>::new();
+    let mut stop_reason = match loop_result {
+        Ok(reason) => reason,
+        Err(error) => {
+            lifecycle_failures.push(("capture loop", error));
+            CaptureStopReason::RuntimeFailure
+        }
+    };
+    if let Err(error) = drain_result {
+        lifecycle_failures.push(("feed drain", error));
     }
+    let raw_shutdown = match raw_shutdown_result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            lifecycle_failures.push(("raw writer evidence", error));
+            JsonlWriterShutdown {
+                stats: JsonlWriterStats::empty(),
+                failure: None,
+            }
+        }
+    };
+    if let Some(error) = raw_shutdown.failure {
+        lifecycle_failures.push(("raw writer", error));
+    }
+    let normalized_shutdown = match normalized_shutdown_result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            lifecycle_failures.push(("normalized writer evidence", error));
+            JsonlWriterShutdown {
+                stats: JsonlWriterStats::empty(),
+                failure: None,
+            }
+        }
+    };
+    if let Some(error) = normalized_shutdown.failure {
+        lifecycle_failures.push(("normalized writer", error));
+    }
+    let host_stats = match host_stats_result {
+        Ok(stats) => stats,
+        Err(error) => {
+            lifecycle_failures.push(("host guard shutdown", error));
+            HostGuardStats::default()
+        }
+    };
+    if let Some(error) = pending_host_failure {
+        lifecycle_failures.push(("host guard pending failure", error.into()));
+    }
+    let failure = (!lifecycle_failures.is_empty()).then(|| {
+        stop_reason = CaptureStopReason::RuntimeFailure;
+        combine_capture_failures(lifecycle_failures)
+    });
     let run_elapsed_ms = elapsed_ms(&started);
     let session_completed_at_ms = unix_time_ms();
-    Ok(state.report(
+    let failure_evidence = failure.as_ref().map(capture_failure_evidence);
+    let report = state.report(
         CaptureRunTiming {
             stop_reason,
             elapsed_ms: run_elapsed_ms,
@@ -812,10 +1065,18 @@ pub async fn run_capture(
             last_snapshot: host_stats.last_snapshot,
         },
         CaptureWriterEvidence {
-            raw: raw_stats,
-            normalized: normalized_stats,
+            raw: raw_shutdown.stats,
+            normalized: normalized_shutdown.stats,
         },
-    ))
+        failure_evidence,
+    );
+    match failure {
+        Some(source) => Err(CaptureError::ReportedFailure {
+            source: Box::new(source),
+            report: Box::new(report),
+        }),
+        None => Ok(report),
+    }
 }
 
 async fn drain_capture_channels(
@@ -1160,6 +1421,7 @@ impl CaptureState {
         provenance: CaptureRunProvenance,
         host: CaptureHostEvidence,
         writers: CaptureWriterEvidence,
+        failure: Option<CaptureFailureEvidence>,
     ) -> CaptureRunReport {
         let raw = writers.raw;
         let normalized = writers.normalized;
@@ -1211,6 +1473,7 @@ impl CaptureState {
             .collect::<Vec<_>>();
         let all_connections_ready = self.expected_connections.is_subset(&self.ready_connections);
         let clean_capture = timing.stop_reason == CaptureStopReason::DurationElapsed
+            && failure.is_none()
             && self.reached_all_connections_ready
             && all_connections_ready
             && all_books_ready
@@ -1273,6 +1536,7 @@ impl CaptureState {
             ready_connections_at_stop: self.ready_connections.len(),
             reached_all_connections_ready: self.reached_all_connections_ready,
             books,
+            failure,
             clean_capture,
         }
     }
@@ -1362,14 +1626,29 @@ struct JsonlWriterStats {
     sha256: String,
 }
 
+impl JsonlWriterStats {
+    fn empty() -> Self {
+        Self {
+            sha256: sha256_hex(&[]),
+            ..Self::default()
+        }
+    }
+}
+
 struct JsonlWriter<T> {
     name: &'static str,
+    path: PathBuf,
     sender: Option<mpsc::Sender<T>>,
     task: JoinHandle<Result<String, CaptureError>>,
     queued: Arc<AtomicUsize>,
     max_queue_depth: Arc<AtomicUsize>,
     records: Arc<AtomicU64>,
     bytes: Arc<AtomicU64>,
+}
+
+struct JsonlWriterShutdown {
+    stats: JsonlWriterStats,
+    failure: Option<CaptureError>,
 }
 
 impl<T> JsonlWriter<T>
@@ -1415,6 +1694,7 @@ where
         ));
         Ok(Self {
             name,
+            path,
             sender: Some(sender),
             task,
             queued,
@@ -1425,29 +1705,155 @@ where
     }
 
     async fn send(&self, value: T) -> Result<(), CaptureError> {
+        self.send_with_timeout(value, WRITER_ENQUEUE_TIMEOUT).await
+    }
+
+    async fn send_with_timeout(
+        &self,
+        value: T,
+        enqueue_timeout: Duration,
+    ) -> Result<(), CaptureError> {
         let depth = self.queued.fetch_add(1, Ordering::Relaxed) + 1;
         self.max_queue_depth.fetch_max(depth, Ordering::Relaxed);
         let Some(sender) = &self.sender else {
             self.queued.fetch_sub(1, Ordering::Relaxed);
             return Err(CaptureError::WriterClosed(self.name));
         };
-        if sender.send(value).await.is_err() {
-            self.queued.fetch_sub(1, Ordering::Relaxed);
-            return Err(CaptureError::WriterClosed(self.name));
+        match tokio::time::timeout(enqueue_timeout, sender.send(value)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => {
+                self.queued.fetch_sub(1, Ordering::Relaxed);
+                Err(CaptureError::WriterClosed(self.name))
+            }
+            Err(_) => {
+                self.queued.fetch_sub(1, Ordering::Relaxed);
+                Err(CaptureError::WriterBackpressure {
+                    name: self.name,
+                    timeout_ms: enqueue_timeout.as_millis(),
+                })
+            }
         }
-        Ok(())
     }
 
-    async fn shutdown(mut self) -> Result<JsonlWriterStats, CaptureError> {
-        drop(self.sender.take());
-        let sha256 = self.task.await??;
-        Ok(JsonlWriterStats {
-            records: self.records.load(Ordering::Relaxed),
-            bytes: self.bytes.load(Ordering::Relaxed),
-            max_queue_depth: self.max_queue_depth.load(Ordering::Relaxed),
-            sha256,
-        })
+    async fn shutdown_with_evidence(self) -> Result<JsonlWriterShutdown, CaptureError> {
+        self.shutdown_with_evidence_timeout(WRITER_SHUTDOWN_TIMEOUT)
+            .await
     }
+
+    async fn shutdown_with_evidence_timeout(
+        mut self,
+        shutdown_timeout: Duration,
+    ) -> Result<JsonlWriterShutdown, CaptureError> {
+        drop(self.sender.take());
+        let task_result = tokio::time::timeout(shutdown_timeout, &mut self.task).await;
+        match task_result {
+            Ok(Ok(Ok(sha256))) => Ok(JsonlWriterShutdown {
+                stats: JsonlWriterStats {
+                    records: self.records.load(Ordering::Relaxed),
+                    bytes: self.bytes.load(Ordering::Relaxed),
+                    max_queue_depth: self.max_queue_depth.load(Ordering::Relaxed),
+                    sha256,
+                },
+                failure: None,
+            }),
+            result => {
+                let failure = match result {
+                    Ok(Ok(Ok(_))) => unreachable!("successful writer outcome handled above"),
+                    Ok(Ok(Err(error))) => error,
+                    Ok(Err(error)) => CaptureError::WriterJoin(error),
+                    Err(_) => {
+                        self.task.abort();
+                        let failure = CaptureError::WriterShutdownTimeout {
+                            name: self.name,
+                            timeout_ms: shutdown_timeout.as_millis(),
+                        };
+                        if tokio::time::timeout(WRITER_ABORT_TIMEOUT, &mut self.task)
+                            .await
+                            .is_err()
+                        {
+                            return Err(combine_capture_lifecycle_errors(
+                                failure,
+                                vec![(
+                                    "abort stalled writer task",
+                                    CaptureError::WriterAbortTimeout {
+                                        name: self.name,
+                                        timeout_ms: WRITER_ABORT_TIMEOUT.as_millis(),
+                                    },
+                                )],
+                            ));
+                        }
+                        failure
+                    }
+                };
+                let scan = tokio::time::timeout(
+                    WRITER_EVIDENCE_SCAN_TIMEOUT,
+                    scan_jsonl_writer_stats(
+                        &self.path,
+                        self.max_queue_depth.load(Ordering::Relaxed),
+                    ),
+                )
+                .await;
+                let stats = match scan {
+                    Ok(Ok(stats)) => stats,
+                    Ok(Err(scan_error)) => {
+                        return Err(combine_capture_lifecycle_errors(
+                            failure,
+                            vec![("scan failed writer output", scan_error)],
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(combine_capture_lifecycle_errors(
+                            failure,
+                            vec![(
+                                "scan failed writer output",
+                                CaptureError::WriterEvidenceTimeout {
+                                    name: self.name,
+                                    timeout_ms: WRITER_EVIDENCE_SCAN_TIMEOUT.as_millis(),
+                                },
+                            )],
+                        ));
+                    }
+                };
+                Ok(JsonlWriterShutdown {
+                    stats,
+                    failure: Some(failure),
+                })
+            }
+        }
+    }
+}
+
+async fn scan_jsonl_writer_stats(
+    path: &Path,
+    max_queue_depth: usize,
+) -> Result<JsonlWriterStats, CaptureError> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut bytes = 0_u64;
+    let mut records = 0_u64;
+    let mut last_byte = None;
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let chunk = &buffer[..read];
+        bytes = bytes.saturating_add(read as u64);
+        records =
+            records.saturating_add(chunk.iter().filter(|byte| **byte == b'\n').count() as u64);
+        last_byte = chunk.last().copied();
+        hasher.update(chunk);
+    }
+    if bytes > 0 && last_byte != Some(b'\n') {
+        records = records.saturating_add(1);
+    }
+    Ok(JsonlWriterStats {
+        records,
+        bytes,
+        max_queue_depth,
+        sha256: digest_hex(hasher.finalize()),
+    })
 }
 
 async fn run_jsonl_writer<T>(
@@ -1519,6 +1925,52 @@ fn digest_hex(bytes: impl AsRef<[u8]>) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn combine_capture_failures(failures: Vec<(&'static str, CaptureError)>) -> CaptureError {
+    let mut failures = failures.into_iter();
+    let Some((_, primary)) = failures.next() else {
+        return CaptureError::InvalidConfig(
+            "capture lifecycle failure aggregation received no failures".to_string(),
+        );
+    };
+    combine_capture_lifecycle_errors(primary, failures.collect())
+}
+
+fn combine_capture_lifecycle_errors(
+    primary: CaptureError,
+    additional: Vec<(&'static str, CaptureError)>,
+) -> CaptureError {
+    if additional.is_empty() {
+        return primary;
+    }
+    let secondary = additional
+        .into_iter()
+        .map(|(label, error)| format!("{label}: {error}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    CaptureError::LifecycleFailure {
+        primary: Box::new(primary),
+        secondary: truncate_utf8(&secondary, MAX_CAPTURE_FAILURE_MESSAGE_BYTES),
+    }
+}
+
+fn capture_failure_evidence(error: &CaptureError) -> CaptureFailureEvidence {
+    CaptureFailureEvidence {
+        code: error.stable_code().to_string(),
+        message: truncate_utf8(&error.to_string(), MAX_CAPTURE_FAILURE_MESSAGE_BYTES),
+    }
+}
+
+fn truncate_utf8(value: &str, maximum_bytes: usize) -> String {
+    if value.len() <= maximum_bytes {
+        return value.to_string();
+    }
+    let mut boundary = maximum_bytes;
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value[..boundary].to_string()
 }
 
 fn unix_time_ms() -> u64 {
@@ -1961,6 +2413,7 @@ mod tests {
                 },
                 normalized: JsonlWriterStats::default(),
             },
+            None,
         );
 
         assert!(!report.clean_capture);
@@ -2107,7 +2560,9 @@ mod tests {
             asks: vec![Level::new(101.0, 1.0)],
         }));
         writer.send(event).await.unwrap();
-        let stats = writer.shutdown().await.unwrap();
+        let outcome = writer.shutdown_with_evidence().await.unwrap();
+        assert!(outcome.failure.is_none());
+        let stats = outcome.stats;
         assert_eq!(stats.records, 1);
         assert_eq!(stats.sha256.len(), 64);
 
@@ -2271,6 +2726,156 @@ mod tests {
         assert!(!raw_path.exists());
     }
 
+    #[test]
+    fn startup_failure_report_does_not_adopt_preexisting_capture_outputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let raw_path = directory.path().join("raw.jsonl");
+        let normalized_path = directory.path().join("normalized.jsonl");
+        std::fs::write(&raw_path, b"prior raw session\n").unwrap();
+        std::fs::write(&normalized_path, b"prior normalized session\n").unwrap();
+        let mut config =
+            CaptureConfig::from_toml(include_str!("../../../examples/capture-okx-public.toml"))
+                .unwrap();
+        config.output.raw_path = raw_path.clone();
+        config.output.normalized_path = Some(normalized_path.clone());
+        let error = CaptureError::Host(HostHealthError::Probe("probe unavailable".to_string()));
+
+        let report = capture_startup_failure_report(&config, None, &error);
+
+        assert_eq!(report.stop_reason, CaptureStopReason::RuntimeFailure);
+        assert!(!report.clean_capture);
+        assert_eq!(report.raw_records, 0);
+        assert_eq!(report.raw_bytes, 0);
+        assert_eq!(report.raw_sha256, sha256_hex(&[]));
+        assert_eq!(report.normalized_records, 0);
+        assert_eq!(report.normalized_bytes, 0);
+        assert_eq!(report.normalized_sha256, Some(sha256_hex(&[])));
+        assert_eq!(
+            report.expected_connections,
+            config.socket_plans().unwrap().len()
+        );
+        assert_eq!(
+            report.failure,
+            Some(CaptureFailureEvidence {
+                code: "host_guard".to_string(),
+                message: error.to_string(),
+            })
+        );
+        assert_eq!(std::fs::read(&raw_path).unwrap(), b"prior raw session\n");
+        assert_eq!(
+            std::fs::read(&normalized_path).unwrap(),
+            b"prior normalized session\n"
+        );
+    }
+
+    #[test]
+    fn failure_evidence_has_a_stable_code_and_utf8_byte_bound() {
+        let error = CaptureError::InvalidConfig("e\u{301}".repeat(4_096));
+
+        let evidence = capture_failure_evidence(&error);
+
+        assert_eq!(evidence.code, "config");
+        assert!(!evidence.message.is_empty());
+        assert!(evidence.message.len() <= MAX_CAPTURE_FAILURE_MESSAGE_BYTES);
+        assert!(evidence.message.is_char_boundary(evidence.message.len()));
+    }
+
+    #[tokio::test]
+    async fn writer_enqueue_fails_with_bounded_backpressure_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stalled.jsonl");
+        std::fs::write(&path, []).unwrap();
+        let (sender, _receiver) = mpsc::channel::<u64>(1);
+        sender.send(1).await.unwrap();
+        let queued = Arc::new(AtomicUsize::new(1));
+        let max_queue_depth = Arc::new(AtomicUsize::new(1));
+        let task: JoinHandle<Result<String, CaptureError>> = tokio::spawn(std::future::pending());
+        let writer = JsonlWriter {
+            name: "test",
+            path,
+            sender: Some(sender),
+            task,
+            queued: Arc::clone(&queued),
+            max_queue_depth: Arc::clone(&max_queue_depth),
+            records: Arc::new(AtomicU64::new(0)),
+            bytes: Arc::new(AtomicU64::new(0)),
+        };
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            writer.send_with_timeout(2, Duration::from_millis(10)),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CaptureError::WriterBackpressure {
+                name: "test",
+                timeout_ms: 10,
+            }
+        ));
+        assert_eq!(queued.load(Ordering::Relaxed), 1);
+        assert_eq!(max_queue_depth.load(Ordering::Relaxed), 2);
+        writer.task.abort();
+    }
+
+    #[tokio::test]
+    async fn writer_shutdown_timeout_aborts_task_and_recovers_partial_file_stats() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("partial.jsonl");
+        let partial = b"{\"record\":1}\n{\"record\":2}";
+        std::fs::write(&path, partial).unwrap();
+        let (sender, _receiver) = mpsc::channel::<u64>(1);
+        let task: JoinHandle<Result<String, CaptureError>> = tokio::spawn(std::future::pending());
+        let writer = JsonlWriter {
+            name: "test",
+            path,
+            sender: Some(sender),
+            task,
+            queued: Arc::new(AtomicUsize::new(0)),
+            max_queue_depth: Arc::new(AtomicUsize::new(3)),
+            records: Arc::new(AtomicU64::new(0)),
+            bytes: Arc::new(AtomicU64::new(0)),
+        };
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            writer.shutdown_with_evidence_timeout(Duration::from_millis(10)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(matches!(
+            outcome.failure,
+            Some(CaptureError::WriterShutdownTimeout {
+                name: "test",
+                timeout_ms: 10,
+            })
+        ));
+        assert_eq!(outcome.stats.records, 2);
+        assert_eq!(outcome.stats.bytes, partial.len() as u64);
+        assert_eq!(outcome.stats.max_queue_depth, 3);
+        assert_eq!(outcome.stats.sha256, sha256_hex(partial));
+    }
+
+    #[tokio::test]
+    async fn writer_stats_scan_counts_a_trailing_partial_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("partial.jsonl");
+        let partial = b"first\nsecond";
+        std::fs::write(&path, partial).unwrap();
+
+        let stats = scan_jsonl_writer_stats(&path, 7).await.unwrap();
+
+        assert_eq!(stats.records, 2);
+        assert_eq!(stats.bytes, partial.len() as u64);
+        assert_eq!(stats.max_queue_depth, 7);
+        assert_eq!(stats.sha256, sha256_hex(partial));
+    }
+
     #[tokio::test]
     async fn shutdown_drain_persists_queued_feed_frames() {
         let directory = tempfile::tempdir().unwrap();
@@ -2307,7 +2912,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let stats = writer.shutdown().await.unwrap();
+        let outcome = writer.shutdown_with_evidence().await.unwrap();
+        assert!(outcome.failure.is_none());
+        let stats = outcome.stats;
 
         assert_eq!(stats.records, 1);
         assert_eq!(state.processor.stats().accepted, 1);

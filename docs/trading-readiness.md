@@ -776,6 +776,54 @@ production trading process.
     736 tests, optimized release build, hardened systemd verification, and
     RustSec audit pass. The private-overload path is deterministic local
     evidence and still requires a credentialed target-host demo campaign.
+64. Capture persistence now has explicit application-level lifecycle deadlines.
+    Raw and optional normalized enqueue waits fail after one second instead of
+    dropping a frame or blocking the event loop. Supervised feed shutdown/drain
+    and host-guard shutdown are capped at five seconds, writer flush/sync at 30
+    seconds, post-timeout abort wait at one second, and best-effort partial-file
+    evidence scanning at five seconds. Writer and host shutdown run concurrently;
+    the hardened collector unit retains its 45-second external hard stop.
+
+    Effective config, duration, and canonicalized prospective report/raw/
+    normalized path identities now validate before report reservation. Handled
+    setup or runtime failures produce runtime_failure, bounded stable code and
+    message, and clean_capture = false; pre-existing output bytes are never
+    adopted as this run's evidence. Independent capture verification and
+    production research reject a reported failure even if the clean flag is
+    forged. This strengthens pinned Java ChaosWriter/AsyncBufferedWriter:
+    Java owns append/flush/close on ioInbox but only logs IO exceptions and
+    delays production close by three seconds, whereas Rust makes capture storage
+    failure typed, bounded, durable, and inadmissible.
+
+    Release failure smokes proved invalid config creates neither report nor raw
+    output, while an impossible host floor produced a mode-0600 non-clean
+    host_guard report before nonzero exit and left an older raw file byte
+    identical. The failure report and preserved raw SHA-256 values were
+    769fa5f0ff203f7fa63ba9f7d001e5e1478a84a1d36469a3490cea7b8e641151
+    and
+    effd5be4724920be6970ab5a76a733314ac3c591458c0e8effd2aa87605e1793.
+
+    A fresh optimized-release 45-second public run then proved the success path.
+    All 12 socket plans and both books ended ready; 3,096 exact ordinals contained
+    1,599 accepted and 1,497 duplicate events with raw queue high-water 23 and
+    zero disconnects, gaps, recoveries, recovery failures, stale books, parse
+    errors, missing routes, or timestamp regressions. Independent verification,
+    strict format-5 analysis, and strict replay passed with all 11 streams
+    complete from both exact sources. Raw backtest rebuilt 2,431 inputs, reached
+    entry readiness, emitted six orders and two cancels, and passed complete
+    accounting with no fills. Report, raw, diagnostic config, analysis, and
+    executable SHA-256 values are respectively
+    6b827391d1e0458fb9dd847fa199c5f3096ec62bd7f87357f64d7953cd6aea43,
+    55c3ee51d841c0cb770d9438b218382a1b49604acc56aa49854b247774155013,
+    9a46596af8f6e88c915ef886209b8100f7fabffb12b3f1ae95ebd1a16c2e0242,
+    38c6b51e1f3d5133eddb748129d9b2d2a2ecf984807ec0819ee7ddd6b9558ae4,
+    and
+    10ee4903b059c6c27b16431fc150b992732ab340b12c219a86f85b3cbf0d6fad.
+    The shared host required diagnostic 256 MiB disk and 512 MiB memory floors,
+    so this is pipeline evidence, not production qualification. Formatting,
+    workspace warnings-denied Clippy, all 748 tests, optimized release build,
+    hardened systemd verification, and RustSec audit pass. Credentialed
+    target-host demo, economic, calibration, and approval gates remain open.
 
 ## Remaining Demo Gate
 

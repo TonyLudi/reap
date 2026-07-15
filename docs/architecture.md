@@ -992,7 +992,9 @@ Responsibilities:
 - Capture the stablecoin/index references required to reproduce live risk
   inputs alongside strategy market data.
 - Run redundant websocket connections through `reap-feed` supervision.
-- Persist every received raw frame through a bounded lossless writer.
+- Persist every received raw frame through a bounded lossless writer. A full
+  writer queue has a one-second deadline and fails the run instead of dropping a
+  frame or blocking the event loop indefinitely.
 - Assign a process-global record ordinal before that writer and independently
   require the persisted artifact to contain exactly `1..raw_records`; this
   proves writer-boundary completeness separately from venue book sequences.
@@ -1001,6 +1003,14 @@ Responsibilities:
 - Stamp every frame with a process-session identity so replay cannot hide
   capture downtime.
 - Fingerprint the effective capture config and exact persisted bytes.
+- Validate the effective configuration before reserving the create-new report.
+  After reservation, convert handled setup/runtime/teardown failures into a
+  typed non-clean report; never adopt bytes from a pre-existing capture output.
+- Bound writer flush/sync shutdown at 30 seconds, cancellation wait at one
+  second, and best-effort failure-evidence scanning at five seconds. Bound feed
+  shutdown/drain and host-guard shutdown at five seconds each; the host and
+  writer phases run concurrently. Retain systemd's 45-second stop deadline as
+  the out-of-process hard boundary.
 - Reserve and fsync a versioned run report that also binds the exact source
   config file, executable, host, pinned Java revision, and host-health evidence.
 - Optionally persist deduplicated normalized events for short diagnostics.
@@ -1016,6 +1026,8 @@ Responsibilities:
   distributions without retaining the dataset in memory.
 - Verify a retained run report against relocated raw/normalized artifacts,
   including exact normalized output reconstructed from raw replay.
+- Reject every report carrying typed runtime failure evidence from independent
+  verification and production research, regardless of its reported clean flag.
 
 Long-running collection uses raw JSONL as the canonical format. Backtest raw
 replay reconstructs full books through the same adapter, deduplication,

@@ -104,6 +104,10 @@ pub enum CaptureVerificationFailure {
     RunReportInvariant {
         message: String,
     },
+    RunReportedFailure {
+        failure_code: String,
+        message: String,
+    },
     CleanFlagMismatch {
         reported: bool,
         derived: bool,
@@ -441,6 +445,12 @@ pub fn verify_capture_paths(
     for message in run_report_invariant_failures(&run_report, &effective_config) {
         failures.push(CaptureVerificationFailure::RunReportInvariant { message });
     }
+    if let Some(failure) = &run_report.failure {
+        failures.push(CaptureVerificationFailure::RunReportedFailure {
+            failure_code: failure.code.clone(),
+            message: failure.message.clone(),
+        });
+    }
     let stream_coverage_complete = capture_stream_coverage_complete(&analysis);
     let derived_clean = derive_clean_capture(
         &run_report,
@@ -578,6 +588,31 @@ fn run_report_invariant_failures(report: &CaptureRunReport, config: &CaptureConf
     if report.capture_session_id.trim().is_empty() {
         failures.push("capture_session_id is empty".to_string());
     }
+    match (&report.stop_reason, &report.failure) {
+        (CaptureStopReason::RuntimeFailure, None) => {
+            failures.push("runtime_failure stop reason has no failure evidence".to_string());
+        }
+        (CaptureStopReason::DurationElapsed | CaptureStopReason::OperatorSignal, Some(_)) => {
+            failures.push("failure evidence requires runtime_failure stop reason".to_string());
+        }
+        _ => {}
+    }
+    if let Some(failure) = &report.failure {
+        if failure.code.trim().is_empty() || failure.message.trim().is_empty() {
+            failures.push("capture failure evidence contains an empty code or message".to_string());
+        }
+        if failure.code.len() > 64
+            || !failure
+                .code
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            failures.push("capture failure code is not a bounded stable identifier".to_string());
+        }
+        if failure.message.len() > crate::MAX_CAPTURE_FAILURE_MESSAGE_BYTES {
+            failures.push("capture failure message exceeds its evidence bound".to_string());
+        }
+    }
     if !is_sha256(&report.config_fingerprint) {
         failures.push("config_fingerprint is not lowercase SHA-256".to_string());
     }
@@ -649,6 +684,7 @@ fn derive_clean_capture(
         .map(|book| book.symbol.as_str())
         .collect::<BTreeSet<_>>();
     report.stop_reason == CaptureStopReason::DurationElapsed
+        && report.failure.is_none()
         && report.reached_all_connections_ready
         && report.expected_connections == expected_connections
         && report.ready_connections_at_stop == expected_connections
@@ -1002,6 +1038,7 @@ mod tests {
                     best_ask: book.best_ask,
                 })
                 .collect(),
+            failure: None,
             clean_capture: true,
         };
         write_report(&report_path, &report);
@@ -1391,6 +1428,38 @@ mod tests {
                 field,
                 ..
             } if field == "parsed_events"
+        )));
+    }
+
+    #[test]
+    fn verifier_rejects_reported_runtime_failure_even_with_a_forged_clean_flag() {
+        let fixture = setup(false);
+        let mut run_report: CaptureRunReport =
+            serde_json::from_slice(&std::fs::read(&fixture.report_path).unwrap()).unwrap();
+        run_report.stop_reason = CaptureStopReason::RuntimeFailure;
+        run_report.failure = Some(crate::CaptureFailureEvidence {
+            code: "writer_backpressure".to_string(),
+            message: "raw capture writer queue remained full for 1000ms".to_string(),
+        });
+        run_report.clean_capture = true;
+        write_report(&fixture.report_path, &run_report);
+
+        let report = verify(&fixture);
+
+        assert!(!report.passed);
+        assert!(report.failures.iter().any(|failure| matches!(
+            failure,
+            CaptureVerificationFailure::RunReportedFailure {
+                failure_code,
+                ..
+            } if failure_code == "writer_backpressure"
+        )));
+        assert!(report.failures.iter().any(|failure| matches!(
+            failure,
+            CaptureVerificationFailure::CleanFlagMismatch {
+                reported: true,
+                derived: false,
+            }
         )));
     }
 

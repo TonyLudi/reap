@@ -133,6 +133,10 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Bind each capture stream to the exact deterministic websocket plan IDs
   produced by subscription partitioning; count-equivalent data from a wrong
   replica/chunk now fails runtime clean status and offline verification.
+- [x] Bound capture-writer enqueue, feed/host/writer teardown, cancellation, and
+  failure-evidence scanning; validate before reserving the report, persist typed
+  non-clean reports for handled failures, avoid adopting older output bytes, and
+  reject failure reports from verification and production research.
 - [x] Add a deterministic Java-referenced backtest scheduler with receive-time
   raw replay, explicit market/new/cancel/order/account delays, immediate
   `PendingNew` registration, and end-of-horizon execution provenance.

@@ -293,6 +293,16 @@ claim that those exact capture gates exist in `ChaosLiveSub`. Runtime and
 offline verification require every listed stream from both exact configured
 replica/chunk socket plans.
 
+Pinned Java `ChaosWriter` creates strategy CSV writers and sends append, flush,
+and close work to one `ioInbox` through `AsyncBufferedWriter`; `Iarb2Writer`
+primarily emits model rows, with order CSV output disabled by its checked-in
+constant. The Java writer logs create/append/flush/close failures and schedules a
+three-second production close, but it does not propagate those failures into a
+versioned run result. It also ignores `File.createNewFile()`'s boolean before
+opening `FileWriter(..., false)`. Reap's raw market-data collector is a different
+evidence boundary, so the table below treats the Java code as an asynchronous IO
+ownership reference rather than claiming file-format parity.
+
 | Java reference | Rust implementation | Result |
 | --- | --- | --- |
 | `OkxNitroL2SubscriberGroupFactory` subscriber groups and connection-index ownership | Deterministic `partition_subscriptions` replica/chunk socket plans; runtime and format-5 capture analysis require each logical stream's exact planned `conn_id` set rather than only the configured count | Equivalent topology with stronger retained source-ownership evidence |
@@ -302,6 +312,7 @@ replica/chunk socket plans.
 | `AbstractOkV5L2Subscriber` owns `FullOrderBook` and `lastChangeId` by session type, connection index, and symbol; `checkSeqNo` applies predecessor compare-and-set, equal-sequence no-change, and lower-sequence maintenance cases | Each Rust `conn_id` owns a `SequenceTracker` and `BookReducer`; global duplicates still advance source state, valid full books arbitrate canonically, and a mismatch restarts only the failed socket while a ready replica remains available | Exact per-connection continuity rule with bounded recovery buffering and explicit cross-replica conflict handling |
 | Nitro checksum validation block commented out; legacy V5 CRC validation active | No CRC validation after OKX checksum deprecation; WSS, sequence, snapshot, crossed-book, and stale checks remain mandatory | Current-contract adaptation |
 | Pinned Java subscribers deliver socket payloads to handlers but do not emit a versioned process-global raw-writer ordinal | `capture_record_seq` is assigned before Reap's bounded single writer and verified as exact `1..raw_records` | Rust evidence hardening: proves persisted multi-channel writer completeness separately from OKX book-channel sequencing and is a prerequisite for same-session segmentation |
+| `ChaosWriter`/`AsyncBufferedWriter` enqueue strategy CSV append/flush/close work on `ioInbox`, delay production close by three seconds, and log IO failures | Create-new owner-only raw/normalized writers; one-second enqueue deadline; bounded flush/sync, abort, and partial-file evidence phases; typed non-clean failure report persisted before nonzero exit | Rust evidence hardening, not CSV parity: storage backpressure cannot silently drop data or remain only in logs, and any reported writer failure is inadmissible for research |
 | Separate receive and exchange latency tracking | Raw `recv_ts_ns`, exchange timestamps, bounded-memory capture timing distributions, capture health counters, and bounded live webhook alerts | Equivalent data retained; receive delay includes host clock/scheduling and alert routing is a deployment concern |
 | `MetCoinGatewayMktOkxNitroBaseConfig` configurable `okx.nitro.md.connect.interval.ms` (default zero) | One `connection_attempt_interval_ms` schedule shared through an owner-only advisory-lock file by public/private/order-command, capture, and fault-proxy-upstream initial and reconnect attempts | Current-contract hardening: Rust defaults to 400 ms and official endpoints enforce at least 334 ms for OKX's documented three connection requests/second/IP; the Java creation context remains an in-process reference. Rust coordinates processes on one host, while multiple hosts behind one NAT still require an external coordinator or isolated egress. |
 | `OkxNitroExchStatusClient` 10-second `/api/v5/system/status` polling plus `ExchStatusSafeguard` 60-second lead and `OkxNitroUtils.getExchStatus` service filter | Typed unsigned bootstrap and periodic status checks with the same unified service scope, current `env` filtering, endpoint-rate validation, and typed failure | Stronger lifecycle: Java pauses and may resume the strategy; Rust enters fail-closed cancel/reconcile shutdown and requires a clean restart |

@@ -8,7 +8,8 @@ use reap_backtest::{
     BacktestConfig, BacktestRunner, run_research_manifest_path, verify_research_paths,
 };
 use reap_capture::{
-    CaptureConfig, CaptureRunOptions, analyze_capture_path, run_capture, verify_capture_paths,
+    CaptureConfig, CaptureError, CaptureRunOptions, analyze_capture_path,
+    capture_startup_failure_report, run_capture, verify_capture_paths,
 };
 use reap_fault::{
     FaultProxyCommand, FaultProxyConfig, FaultProxyRunOptions, run_fault_proxy,
@@ -1206,10 +1207,6 @@ async fn main() -> Result<()> {
             require_clean_capture,
             pretty,
         } => {
-            let mut report_file = output
-                .as_ref()
-                .map(|path| reserve_private_output(path, "capture report"))
-                .transpose()?;
             reap_telemetry::init_json_tracing("info")
                 .map_err(anyhow::Error::msg)
                 .context("failed to initialize capture tracing")?;
@@ -1221,29 +1218,64 @@ async fn main() -> Result<()> {
             if let Some(path) = normalized_path {
                 capture_config.output.normalized_path = Some(path);
             }
-            if output.as_ref().is_some_and(|output| {
-                output == &capture_config.output.raw_path
-                    || capture_config.output.normalized_path.as_ref() == Some(output)
-            }) {
-                anyhow::bail!("capture report path must differ from raw and normalized outputs");
+            if duration_secs == Some(0) {
+                anyhow::bail!("capture duration must be positive");
             }
-            let report = run_capture(
-                capture_config,
+            capture_config.ensure_valid().with_context(|| {
+                format!(
+                    "capture config {} did not pass validation",
+                    config.display()
+                )
+            })?;
+            ensure_capture_output_paths_distinct(
+                output.as_deref(),
+                &capture_config.output.raw_path,
+                capture_config.output.normalized_path.as_deref(),
+            )?;
+            let mut report_file = output
+                .as_ref()
+                .map(|path| reserve_private_output(path, "capture report"))
+                .transpose()?;
+            let run_result = run_capture(
+                capture_config.clone(),
                 CaptureRunOptions {
                     run_duration: duration_secs.map(Duration::from_secs),
-                    config_source: Some(config_source),
+                    config_source: Some(config_source.clone()),
                 },
             )
-            .await?;
+            .await;
+            let (report, runtime_failure) = match run_result {
+                Ok(report) => (report, None),
+                Err(CaptureError::ReportedFailure { source, report }) => (*report, Some(*source)),
+                Err(error) => {
+                    let report = capture_startup_failure_report(
+                        &capture_config,
+                        Some(config_source),
+                        &error,
+                    );
+                    (report, Some(error))
+                }
+            };
             let json = if pretty {
                 serde_json::to_string_pretty(&report)?
             } else {
                 serde_json::to_string(&report)?
             };
-            if let (Some(file), Some(path)) = (&mut report_file, output.as_deref()) {
-                persist_reserved_output(file, path, &json, "capture report")?;
+            if let (Some(file), Some(path)) = (&mut report_file, output.as_deref())
+                && let Err(persistence_error) =
+                    persist_reserved_output(file, path, &json, "capture report")
+            {
+                return match runtime_failure.as_ref() {
+                    Some(error) => Err(persistence_error.context(format!(
+                        "capture also failed before its report could be persisted: {error}"
+                    ))),
+                    None => Err(persistence_error),
+                };
             }
             println!("{json}");
+            if let Some(error) = runtime_failure {
+                return Err(error.into());
+            }
             if require_clean_capture && !report.clean_capture {
                 anyhow::bail!("bounded capture did not satisfy clean integrity invariants");
             }
@@ -1815,6 +1847,80 @@ fn reserve_private_output(path: &Path, label: &str) -> Result<File> {
         .with_context(|| format!("failed to reserve {label} {}", path.display()))
 }
 
+fn ensure_capture_output_paths_distinct(
+    report: Option<&Path>,
+    raw: &Path,
+    normalized: Option<&Path>,
+) -> Result<()> {
+    let raw = prospective_path_identity(raw).context("failed to resolve raw capture output")?;
+    let normalized = normalized
+        .map(prospective_path_identity)
+        .transpose()
+        .context("failed to resolve normalized capture output")?;
+    if normalized.as_ref() == Some(&raw) {
+        anyhow::bail!("raw and normalized capture output paths must differ");
+    }
+    if let Some(report) = report {
+        let report =
+            prospective_path_identity(report).context("failed to resolve capture report output")?;
+        if report == raw || normalized.as_ref() == Some(&report) {
+            anyhow::bail!("capture report path must differ from raw and normalized outputs");
+        }
+    }
+    Ok(())
+}
+
+fn prospective_path_identity(path: &Path) -> Result<PathBuf> {
+    if path.as_os_str().is_empty() {
+        anyhow::bail!("output path must not be empty");
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("failed to resolve current directory")?
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Normal(part) => normalized.push(part),
+        }
+    }
+
+    let mut existing = normalized.clone();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(&existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = existing.file_name().with_context(|| {
+                    format!("path {} has no existing ancestor", normalized.display())
+                })?;
+                missing.push(name.to_os_string());
+                existing.pop();
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect output path {}", existing.display())
+                });
+            }
+        }
+    }
+    let mut identity = std::fs::canonicalize(&existing)
+        .with_context(|| format!("failed to canonicalize {}", existing.display()))?;
+    for component in missing.into_iter().rev() {
+        identity.push(component);
+    }
+    Ok(identity)
+}
+
 fn persist_reserved_output(file: &mut File, path: &Path, json: &str, label: &str) -> Result<()> {
     file.write_all(json.as_bytes())
         .and_then(|()| file.write_all(b"\n"))
@@ -1864,5 +1970,42 @@ mod tests {
             "{\"passed\":true}\n"
         );
         assert!(reserve_private_output(&path, "test report").is_err());
+    }
+
+    #[test]
+    fn capture_output_collision_check_resolves_dot_segments() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let report = nested.join("..").join("raw.jsonl");
+        let raw = directory.path().join("raw.jsonl");
+
+        let error = ensure_capture_output_paths_distinct(Some(&report), &raw, None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("report path must differ"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_output_collision_check_resolves_symlinked_parents() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("real");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&real).unwrap();
+        symlink(&real, &alias).unwrap();
+
+        let error = ensure_capture_output_paths_distinct(
+            Some(&alias.join("raw.jsonl")),
+            &real.join("raw.jsonl"),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("report path must differ"));
     }
 }

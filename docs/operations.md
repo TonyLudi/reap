@@ -156,11 +156,19 @@ frame also carries a process-global `capture_record_seq` assigned from `1` at
 the single capture event-loop/writer boundary. The report, raw output, and
 normalized output use create-new mode-`0600` semantics on Unix:
 startup refuses an existing path and never appends a second process session.
-The report is reserved before config parsing or network startup; a pre-report
-failure leaves an empty reserved file that verification rejects. Use unique
-paths for each process. Strict replay and raw backtest also reject files
-containing more than one session ID, because process downtime is not a continuous
-HFT market stream.
+Capture config parsing, CLI path overrides, path-collision checks, and effective
+config validation complete before the report path is reserved. An invalid
+configuration therefore creates no report. After reservation, a handled setup,
+event-loop, drain, host-guard, or writer failure emits a schema-5 report with
+`stop_reason = "runtime_failure"`, a bounded stable `failure.code` and diagnostic
+`failure.message`, and `clean_capture = false` before the command exits nonzero.
+Startup failure reports use zero-record empty-hash output evidence and never hash
+an older raw or normalized file that this process did not create. If report
+serialization or its filesystem durability fails, or the process is killed,
+the reserved report can still be empty or incomplete; page on that condition and
+never reuse the instance path. Use unique paths for each process. Strict replay
+and raw backtest also reject files containing more than one session ID, because
+process downtime is not a continuous HFT market stream.
 
 The schema-current verifier requires exactly one ordinal for every persisted
 raw record, with first `1`, last equal to `raw_records`, and no missing,
@@ -203,6 +211,19 @@ redundant-socket disconnect can
 remain clean only when the other replica preserves sequence continuity;
 inspect disconnect, duplicate, and writer queue counts on every run.
 
+Raw and optional normalized writers use bounded channels. Event-loop enqueue
+waits at most one second; saturation stops capture instead of dropping a frame or
+waiting forever. Teardown allows five seconds for supervised-feed shutdown plus
+channel drain. It then closes the writer queues and, concurrently with a
+five-second host-guard shutdown bound, allows 30 seconds for writer flush and
+`sync_data`, one additional second for task cancellation after a timeout, and
+five seconds for a best-effort partial-file count/hash scan. Any such failure is
+retained in the non-clean report. The collector unit's
+`TimeoutStopSec=45s` remains the external hard stop for a kernel or filesystem
+operation that cannot be cancelled in process. A `failure` report is diagnostic:
+`verify-capture --require-pass` and production research reject it even if someone
+forges `clean_capture = true`.
+
 Production-candidate research applies a code-level host-guard policy in
 addition to checking the report: the guard must be enabled, run at least every
 10 seconds, require at least 5 GiB available disk and 1 GiB available memory,
@@ -215,9 +236,10 @@ capture-executable SHA-256, pseudonymous host identity when guarded, host
 preflight/periodic evidence within explicit session wall-clock bounds, exact
 source-config byte count/SHA-256, effective
 config fingerprint after CLI output overrides, and byte count/SHA-256 for every
-writer. Capture files are data-synced and their directory entries are synced
-before the report is emitted. Archive the report with the config and capture
-manifest.
+writer. Successful capture files are data-synced and their directory entries are
+synced before the report is emitted. Handled failures add the optional typed
+`failure` object described above; absence of that object does not by itself make
+a run clean. Archive the report with the config and capture manifest.
 
 `verify-capture` reconstructs the report's effective path overrides while
 allowing artifacts to be relocated. It requires the supplied config's exact

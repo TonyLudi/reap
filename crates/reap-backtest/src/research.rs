@@ -3212,9 +3212,9 @@ pub fn effective_strategy_sha256(config: &reap_strategy::ChaosConfig) -> Result<
 mod tests {
     use reap_capture::{
         CAPTURE_RUN_REPORT_FORMAT_VERSION, CaptureBookHealth, CaptureConfigFileEvidence,
-        CaptureOutputConfig, CapturePriority, CaptureRunReport, CaptureRuntimeConfig,
-        CaptureStopReason, CaptureSubscriptionConfig, CaptureVenueConfig, HostGuardConfig,
-        HostHealthSnapshot, analyze_capture,
+        CaptureFailureEvidence, CaptureOutputConfig, CapturePriority, CaptureRunReport,
+        CaptureRuntimeConfig, CaptureStopReason, CaptureSubscriptionConfig, CaptureVenueConfig,
+        HostGuardConfig, HostHealthSnapshot, analyze_capture,
     };
     use reap_strategy::{ChaosConfig, InstrumentConfig, InstrumentKindConfig, RiskGroupConfig};
     use tempfile::TempDir;
@@ -3342,6 +3342,7 @@ mod tests {
                     best_ask: book.best_ask,
                 })
                 .collect(),
+            failure: None,
             clean_capture: true,
         };
         write_capture_report(&report_path, &report);
@@ -4321,6 +4322,27 @@ mod tests {
 
         assert!(error.contains("failed capture verification"));
         assert!(error.contains("UnsupportedRunReportFormat"));
+    }
+
+    #[test]
+    fn production_dataset_rejects_a_reported_capture_runtime_failure() {
+        let fixture = research_capture_fixture();
+        let mut report = read_capture_report(&fixture.report_path);
+        report.stop_reason = CaptureStopReason::RuntimeFailure;
+        report.failure = Some(CaptureFailureEvidence {
+            code: "writer_backpressure".to_string(),
+            message: "raw capture writer queue remained full for 1000ms".to_string(),
+        });
+        report.clean_capture = false;
+        write_capture_report(&fixture.report_path, &report);
+
+        let error =
+            load_test_production_datasets(&[fixture_dataset(&fixture)], Path::new("."), &[])
+                .unwrap_err()
+                .to_string();
+
+        assert!(error.contains("failed capture verification"));
+        assert!(error.contains("RunReportedFailure"));
     }
 
     #[test]

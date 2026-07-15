@@ -85,8 +85,14 @@ restarts automatically. Its unit requires a positive duration, requests
 directory. Every process requires a fresh instance name and directory, raw path,
 report path, and session identity, but reuses the exact reviewed capture config.
 Capture uses create-new file semantics and will fail before opening feed sockets
-if an output already exists; an early CLI failure can leave an empty reserved
-report that must not be reused.
+if an output already exists. Invalid config and CLI path combinations are rejected
+before report reservation. Once reserved, handled setup/runtime/writer failures
+are persisted as typed non-clean reports before a nonzero exit. An empty,
+incomplete, or unparsable report therefore indicates report-filesystem failure,
+forced process death, or a defect; page on it and never reuse that instance.
+Feed drain, host shutdown, writer enqueue/shutdown, abort wait, and best-effort
+failure scan are bounded in process, while the unit's 45-second stop timeout is
+the final hard boundary.
 
 Configure the host monitoring system to page on unit activation failure,
 non-zero exit, start-limit exhaustion, forced `SIGKILL`, and host clock/disk/

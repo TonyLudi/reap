@@ -148,6 +148,12 @@ For deployment, install the reusable
 and assigns create-new `raw.jsonl` and `run-report.json` paths from each unique
 instance name; see `deploy/systemd/README.md`.
 
+Capture validates the effective configuration before reserving the report. Once
+reserved, handled setup, runtime, host, or writer failures produce a typed
+schema-5 non-clean report before the command exits nonzero. Writer saturation and
+shutdown are deadline-bound and never treated as clean; independent verification
+and production research reject every report carrying failure evidence.
+
 The one-hour command is an operational smoke, not funding-complete research
 evidence. Production datasets must be continuous across exchange funding
 boundaries. Schema-8 production research with swap candidates requires nonzero
