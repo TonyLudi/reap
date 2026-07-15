@@ -122,6 +122,10 @@ architecture in [docs/architecture.md](docs/architecture.md).
   rejects missing, duplicated, skipped, or reordered writer records. Bind
   production research to the same binary and latency-calibrated host, and make
   the systemd collector bounded and create-new-report strict.
+- [x] Enforce production-candidate capture host-guard floors in code: enabled,
+  checks no slower than 10 seconds, at least 5 GiB available disk and 1 GiB
+  available memory, and mandatory synchronized-clock enforcement. A lowered
+  diagnostic threshold can no longer qualify solely because capture was clean.
 - [x] Add a deterministic Java-referenced backtest scheduler with receive-time
   raw replay, explicit market/new/cancel/order/account delays, immediate
   `PendingNew` registration, and end-of-horizon execution provenance.
@@ -227,6 +231,10 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Add an exact-file demo-to-production configuration transition verifier
   that permits only reviewed endpoint/deployment bindings and rejects strategy,
   risk, runtime, account-policy, execution, storage-capacity, or safety drift.
+- [x] Make production transition policy explicitly reject disabled/non-fatal
+  alerts, a disabled operator service, weak host-guard resource/clock floors,
+  fewer than two public or order-command sessions, and a non-absolute shared
+  connection pacer in either exact config.
 - [x] Reject ignored fields throughout live TOML parsing so nested configuration
   typos cannot silently default or evade production-transition comparison.
 - [x] Add hardened systemd templates with bounded observe restart and manual

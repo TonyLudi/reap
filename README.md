@@ -164,8 +164,10 @@ account, and instrument accounting contracts to agree.
 The example enables the Linux host guard. It fails before opening outputs or
 websockets when disk, available memory, or kernel clock synchronization is
 unhealthy, and stops on a failed periodic check. Disable it only in a copied
-non-production diagnostic config; production-candidate research rejects
-unguarded captures.
+non-production diagnostic config. Production-candidate research requires the
+guard, checks at least every 10 seconds, at least 5 GiB of available disk and
+1 GiB of available memory, and synchronized kernel-clock enforcement; weaker
+or disabled guards are rejected even when the capture itself completed cleanly.
 
 Validate and backtest the raw capture directly. Raw replay runs the same OKX
 adapter, redundant-feed deduplicator, sequence tracker, and book reducer used
@@ -380,8 +382,12 @@ The verifier hashes both exact files and permits changes only to the documented
 environment/endpoints, credential environment-variable names, journal/socket
 paths, and operator/alert secret bindings. Strategy, risk, runtime, account
 policy, execution, storage capacity, and safety settings must remain identical,
-and both files must use the same official endpoint region. A pass does not read
-credential values, authorize production, or enable production order entry.
+and both files must use the same official endpoint region. Both configs must
+also enable fatal alert delivery, the operator service, and the production host
+guard floors; use at least two public replicas and two order-command sessions,
+and name an absolute process-shared connection pacer. A pass does not read
+credential values, prove those controls were exercised, authorize production,
+or enable production order entry.
 
 After every underlying credentialed and research artifact exists, replace the
 placeholders in `examples/production-evidence.toml` and run the aggregate check

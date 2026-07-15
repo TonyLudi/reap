@@ -332,8 +332,11 @@ production trading process.
     endpoint and deployment/secret-binding changes, requires one official
     endpoint region, reports bounded digest-backed JSON-Pointer differences,
     and preserves all strategy, risk, account-policy, runtime, execution,
-    storage-capacity, and safety settings. It does not inspect secrets or
-    authorize production.
+    storage-capacity, and safety settings. Format 2 now also rejects either
+    config unless fatal alerts, the operator service, production host-guard
+    floors, at least two public and order-command sessions, and an absolute
+    shared connection pacer are configured. It does not inspect secrets, prove
+    the controls were exercised, or authorize production.
 44. WebSocket connection attempts are serialized across public, private,
     order-command, capture, and fault-proxy-upstream supervisors for initial
     startup and recovery. An owner-only advisory-lock file reserves one schedule
@@ -556,6 +559,38 @@ production trading process.
     checked-in config remains at 1 GiB. The short public run does not cover a
     funding settlement, calibrated execution, credentials, target-host latency,
     or production authorization.
+58. A subsequent optimized-release 300-second public run on 2026-07-15 covered
+    the same 11 logical streams from two sources each. All 12 socket plans and
+    both books were ready at stop; 29 periodic host checks passed. Its 42,968
+    exact raw ordinals contained 21,522 accepted and 21,446 duplicate events,
+    with zero disconnects, gaps, recoveries, recovery failures, parse errors,
+    stale books, or missing recovery routes. Strict report verification,
+    replay, capture analysis, and complete-accounting raw backtest all passed.
+    The report, raw, normalized, and executable SHA-256 values are respectively
+    `d1b635897ca2e79cce163b7883af85a0977a2f522e4ab09aabcc11fa14955e37`,
+    `77184d0cc436dfa5d5e5952026a18111d0a6a219f0960773a61a2f69f15991a3`,
+    `5ddb3d134058366cd1304cf95b662f95c461d63486525bc68853953c838e60fa`,
+    and `c0c213afb28294282c1564f8489b443125161a3bd49c438ae65bda77bbc745ee`.
+    The last hash identifies the capture binary before the policy-enforcing
+    rebuild and is retained only as provenance for this diagnostic run.
+    Backtest reconstructed 27,420 inputs over `298,885,567,638` ns, modeled
+    112 orders and 108 cancels, observed seven funding messages and one funding
+    settlement, and closed observed and inventory-open duration at the same raw
+    horizon. It still produced zero fills and ended at the data boundary with
+    four live orders and two scheduled actions, so it does not validate fills,
+    fees, queue assumptions, or shutdown behavior.
+
+    This diagnostic again used a 700 MiB memory floor because the shared host
+    had less than 1 GiB available. Production research now rejects such a
+    configuration in code: capture host guards must be enabled, check no slower
+    than 10 seconds, retain at least 5 GiB disk and 1 GiB memory floors, and
+    require synchronized-clock enforcement. The run strengthens public
+    connectivity and deterministic replay evidence but remains deliberately
+    inadmissible for production-candidate research. The exact demo-to-production
+    transition now applies the same host floors and additionally requires fatal
+    alerts, the operator service, redundant public and order-command sessions,
+    and an absolute shared pacer in both configs, so the aggregate bundle cannot
+    admit the checked-in development defaults.
 
 ## Remaining Demo Gate
 

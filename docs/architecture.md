@@ -846,7 +846,11 @@ acceptance explicit in a versioned TOML manifest:
   counters, session, and book health, and retains runtime-only stop, readiness,
   and queue evidence. Production research requires the same executable and the
   latency-calibrated target host plus at least one completed periodic host
-  check. It must pass alongside a one-session,
+  check. Its capture guard is also constrained by code-level policy: enabled,
+  no slower than 10 seconds, at least 5 GiB available disk, at least 1 GiB
+  available memory, and mandatory synchronized-clock enforcement. A clean
+  diagnostic capture with weaker thresholds is not production evidence. The
+  report must pass alongside a one-session,
   parse-clean, zero-gap replay check before any candidate runs.
   Every configured stream must have at least two sources; candidate instruments
   must have book and trade coverage plus applicable strategy index, accounting
@@ -1391,6 +1395,12 @@ Status: implemented as `reap-risk`, `reap-engine`, `reap-telemetry`, and
 measured event-loop benchmark. The live composition also has exclusive journal
 ownership and optional Linux disk/memory/clock guards. These are reusable
 components, not a completed production deployment.
+
+Production-transition evidence makes the operational baseline non-optional:
+both exact demo and production configs require fatal alerts, the operator
+service, production host-guard floors, redundant public and order-command
+sessions, and an absolute process-shared connection pacer. Runtime exercise and
+external delivery remain deployment evidence rather than config claims.
 
 - Add risk gates, kill switch, stale feed policy, metrics, storage.
 - Add operational runbooks and config checks.

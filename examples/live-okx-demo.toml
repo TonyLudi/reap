@@ -164,6 +164,8 @@ max_request_bytes = 4096
 command_channel_capacity = 64
 
 [alerts]
+# Enable in the exact deployed demo config; disabled development defaults cannot
+# pass production-transition or aggregate production evidence.
 enabled = false
 endpoint_env = "REAP_ALERT_WEBHOOK_URL"
 channel_capacity = 256
@@ -176,6 +178,8 @@ shutdown_timeout_ms = 10000
 delivery_failure_is_fatal = true
 
 [host_guard]
+# Enable in the exact deployed demo config; the production policy also enforces
+# the thresholds below and synchronized-clock checking.
 enabled = false
 check_interval_ms = 10000
 min_disk_available_bytes = 5368709120

@@ -2370,6 +2370,13 @@ fn validate_production_capture_config(
     if !config.host_guard.enabled {
         bail!("production dataset {dataset_id} requires an enabled capture host guard");
     }
+    let host_guard_policy_errors = config.host_guard.production_policy_errors("host_guard");
+    if !host_guard_policy_errors.is_empty() {
+        bail!(
+            "production dataset {dataset_id} capture host guard policy failed: {}",
+            host_guard_policy_errors.join("; ")
+        );
+    }
     let connection_pacer_path = config
         .runtime
         .connection_attempt_pacer_path
@@ -3244,8 +3251,8 @@ mod tests {
             host_guard: HostGuardConfig {
                 enabled: true,
                 check_interval_ms: 10,
-                min_disk_available_bytes: 1,
-                min_memory_available_bytes: 1,
+                min_disk_available_bytes: 5 * 1024 * 1024 * 1024,
+                min_memory_available_bytes: 1024 * 1024 * 1024,
                 require_clock_synchronized: true,
             },
             subscriptions: vec![CaptureSubscriptionConfig {
@@ -3272,15 +3279,15 @@ mod tests {
             host_identity_sha256: Some("9".repeat(64)),
             host_preflight: Some(HostHealthSnapshot {
                 checked_at_ms: 1,
-                disk_available_bytes: 10,
-                memory_available_bytes: 10,
+                disk_available_bytes: 5 * 1024 * 1024 * 1024,
+                memory_available_bytes: 1024 * 1024 * 1024,
                 clock_synchronized: true,
             }),
             host_periodic_checks: 1,
             host_last_snapshot: Some(HostHealthSnapshot {
                 checked_at_ms: 2,
-                disk_available_bytes: 10,
-                memory_available_bytes: 10,
+                disk_available_bytes: 5 * 1024 * 1024 * 1024,
+                memory_available_bytes: 1024 * 1024 * 1024,
                 clock_synchronized: true,
             }),
             session_started_at_ms: 1,
@@ -4377,6 +4384,20 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("requires an enabled capture host guard"));
+
+        let mut weak_guard = config.clone();
+        weak_guard.host_guard.check_interval_ms = 10_001;
+        weak_guard.host_guard.min_disk_available_bytes = 5 * 1024 * 1024 * 1024 - 1;
+        weak_guard.host_guard.min_memory_available_bytes = 1024 * 1024 * 1024 - 1;
+        weak_guard.host_guard.require_clock_synchronized = false;
+        let error = validate_production_capture_config("capture", &weak_guard, &candidates)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("capture host guard policy failed"));
+        assert!(error.contains("must not exceed 10000"));
+        assert!(error.contains("at least 5368709120"));
+        assert!(error.contains("at least 1073741824"));
+        assert!(error.contains("require_clock_synchronized must be true"));
 
         let mut single_source = config.clone();
         single_source.subscriptions[0].connections = 1;

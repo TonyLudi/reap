@@ -8,7 +8,9 @@ pub use alerts::{
 };
 pub use host::{
     HostGuardConfig, HostGuardRuntime, HostGuardStats, HostHealthError, HostHealthSnapshot,
-    MAX_HOST_GUARD_CHECK_INTERVAL_MS, check_host_health, start_host_guard,
+    MAX_HOST_GUARD_CHECK_INTERVAL_MS, PRODUCTION_HOST_GUARD_MAX_CHECK_INTERVAL_MS,
+    PRODUCTION_HOST_GUARD_MIN_DISK_AVAILABLE_BYTES,
+    PRODUCTION_HOST_GUARD_MIN_MEMORY_AVAILABLE_BYTES, check_host_health, start_host_guard,
 };
 pub use provenance::{
     current_executable_sha256, host_identity_sha256, identity_sha256, sha256_bytes,

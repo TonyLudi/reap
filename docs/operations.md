@@ -169,6 +169,13 @@ periodic check. A redundant-socket disconnect can
 remain clean only when the other replica preserves sequence continuity;
 inspect disconnect, duplicate, and writer queue counts on every run.
 
+Production-candidate research applies a code-level host-guard policy in
+addition to checking the report: the guard must be enabled, run at least every
+10 seconds, require at least 5 GiB available disk and 1 GiB available memory,
+and require synchronized kernel-clock status. Lower thresholds may be useful
+for an explicitly diagnostic run on a constrained workstation, but that run is
+not admissible as production research evidence even if `clean_capture` is true.
+
 The schema-5 run report includes the Reap version, pinned Java revision, exact
 capture-executable SHA-256, pseudonymous host identity when guarded, host
 preflight/periodic evidence within explicit session wall-clock bounds, exact
@@ -2134,6 +2141,14 @@ operator/alert behavior, and host guards must be value-identical after typed
 parsing. Account array order remains significant. Demo and production endpoint
 regions must match; a Global demo file cannot certify an EEA, US/AU, or Turkey
 candidate.
+
+Format-2 transition policy also requires both files to enable the operator
+service, fatal external alerts, and the production host-guard floors; configure
+at least two redundant public connections per subscription and two independent
+order-command sessions, and use an absolute connection-attempt pacer path. The
+checked-in demo example intentionally leaves external alerts and host guarding
+disabled and uses a repository-relative pacer, so it must be copied, deployed,
+and exercised before it can be the exact evidence-bearing demo config.
 
 The verifier never reads credential values and cannot prove API-key scope, IP
 binding, target account identity, deployment secret separation, or runtime

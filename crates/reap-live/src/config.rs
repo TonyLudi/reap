@@ -573,6 +573,44 @@ impl LiveConfig {
         }
     }
 
+    pub fn production_evidence_policy_errors(&self, prefix: &str) -> Vec<String> {
+        let mut errors = self
+            .host_guard
+            .production_policy_errors(&format!("{prefix}.host_guard"));
+        if !self.alerts.enabled {
+            errors.push(format!(
+                "{prefix}.alerts must be enabled for production evidence"
+            ));
+        }
+        if !self.alerts.delivery_failure_is_fatal {
+            errors.push(format!(
+                "{prefix}.alerts.delivery_failure_is_fatal must be true for production evidence"
+            ));
+        }
+        if !self.operator.enabled {
+            errors.push(format!(
+                "{prefix}.operator must be enabled for production evidence"
+            ));
+        }
+        if self.runtime.public_connections_per_subscription < 2 {
+            errors.push(format!(
+                "{prefix}.runtime.public_connections_per_subscription must be at least 2 for production evidence"
+            ));
+        }
+        if self.runtime.order_websocket_sessions < 2 {
+            errors.push(format!(
+                "{prefix}.runtime.order_websocket_sessions must be at least 2 for production evidence"
+            ));
+        }
+        match self.runtime.connection_attempt_pacer_path.as_deref() {
+            Some(path) if path.is_absolute() => {}
+            _ => errors.push(format!(
+                "{prefix}.runtime.connection_attempt_pacer_path must be absolute for production evidence"
+            )),
+        }
+        errors
+    }
+
     pub fn validate(&self) -> LiveConfigValidation {
         let mut errors = self.strategy.effective().validate().errors;
         if self.strategy.reference_data_stale_threshold_ms.is_none() {
@@ -2258,6 +2296,46 @@ mod tests {
                 .iter()
                 .any(|error| error.contains("host_guard.check_interval_ms must be positive"))
         );
+    }
+
+    #[test]
+    fn production_evidence_policy_requires_operational_controls_and_redundancy() {
+        let mut config = valid_config();
+        config.host_guard.enabled = true;
+        config.alerts.enabled = true;
+        config.operator.enabled = true;
+        config.runtime.connection_attempt_pacer_path =
+            Some(PathBuf::from("/var/lib/reap/connectivity/okx-global.pacer"));
+        assert!(config.production_evidence_policy_errors("demo").is_empty());
+
+        config.host_guard.check_interval_ms = 10_001;
+        config.host_guard.min_disk_available_bytes = 5 * 1024 * 1024 * 1024 - 1;
+        config.host_guard.min_memory_available_bytes = 1024 * 1024 * 1024 - 1;
+        config.host_guard.require_clock_synchronized = false;
+        config.alerts.enabled = false;
+        config.alerts.delivery_failure_is_fatal = false;
+        config.operator.enabled = false;
+        config.runtime.public_connections_per_subscription = 1;
+        config.runtime.order_websocket_sessions = 1;
+        config.runtime.connection_attempt_pacer_path = Some(PathBuf::from("relative.pacer"));
+        let errors = config.production_evidence_policy_errors("production");
+        for expected in [
+            "check_interval_ms must not exceed 10000",
+            "min_disk_available_bytes must be at least 5368709120",
+            "min_memory_available_bytes must be at least 1073741824",
+            "require_clock_synchronized must be true",
+            "production.alerts must be enabled",
+            "delivery_failure_is_fatal must be true",
+            "production.operator must be enabled",
+            "public_connections_per_subscription must be at least 2",
+            "order_websocket_sessions must be at least 2",
+            "connection_attempt_pacer_path must be absolute",
+        ] {
+            assert!(
+                errors.iter().any(|error| error.contains(expected)),
+                "missing {expected} in {errors:?}"
+            );
+        }
     }
 
     #[test]

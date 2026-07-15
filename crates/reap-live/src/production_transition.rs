@@ -11,7 +11,7 @@ use crate::{
     LiveConfig, LiveConfigError, LiveConfigFileEvidence, OkxEndpointRegion, TradingEnvironment,
 };
 
-pub const PRODUCTION_TRANSITION_FORMAT_VERSION: u16 = 1;
+pub const PRODUCTION_TRANSITION_FORMAT_VERSION: u16 = 2;
 pub const MAX_REPORTED_TRANSITION_CHANGES: usize = 256;
 const MAX_DISPLAY_STRING_BYTES: usize = 256;
 
@@ -68,6 +68,12 @@ pub enum ProductionTransitionFailure {
     EndpointRegionMismatch {
         demo: OkxEndpointRegion,
         production: OkxEndpointRegion,
+    },
+    DemoOperationalPolicyFailed {
+        errors: Vec<String>,
+    },
+    ProductionOperationalPolicyFailed {
+        errors: Vec<String>,
     },
     DisallowedConfigurationDrift {
         count: u64,
@@ -170,6 +176,21 @@ pub fn verify_production_transition_paths(
             production: production.endpoint_region,
         });
     }
+    let demo_policy_errors = demo_config.production_evidence_policy_errors("demo");
+    if !demo_policy_errors.is_empty() {
+        failures.push(ProductionTransitionFailure::DemoOperationalPolicyFailed {
+            errors: demo_policy_errors,
+        });
+    }
+    let production_policy_errors =
+        production_config.production_evidence_policy_errors("production");
+    if !production_policy_errors.is_empty() {
+        failures.push(
+            ProductionTransitionFailure::ProductionOperationalPolicyFailed {
+                errors: production_policy_errors,
+            },
+        );
+    }
     if differences.disallowed_count > 0 {
         failures.push(ProductionTransitionFailure::DisallowedConfigurationDrift {
             count: differences.disallowed_count,
@@ -196,7 +217,7 @@ pub fn verify_production_transition_paths(
                 .to_string(),
             "Credential environment-variable values, API-key permissions, IP restrictions, and exchange account identities are not read or verified."
                 .to_string(),
-            "Passing demo, fault, reconciliation, emergency, target-host, and operator rollout evidence remain separate production gates."
+            "Enabled controls are configuration evidence only; passing demo, fault, reconciliation, emergency, target-host, alert-delivery, and operator rollout evidence remain separate production gates."
                 .to_string(),
         ],
         acceptance_passed,
@@ -398,7 +419,13 @@ mod tests {
     use super::*;
 
     fn demo_config() -> LiveConfig {
-        LiveConfig::from_toml(include_str!("../../../examples/live-okx-demo.toml")).unwrap()
+        let mut config =
+            LiveConfig::from_toml(include_str!("../../../examples/live-okx-demo.toml")).unwrap();
+        config.host_guard.enabled = true;
+        config.alerts.enabled = true;
+        config.runtime.connection_attempt_pacer_path =
+            Some(PathBuf::from("/var/lib/reap/connectivity/okx-global.pacer"));
+        config
     }
 
     fn production_config() -> LiveConfig {
@@ -452,6 +479,55 @@ mod tests {
                 .iter()
                 .any(|change| change.path == "/accounts/0/api_key_env")
         );
+    }
+
+    #[test]
+    fn weak_operational_controls_fail_the_transition_policy() {
+        let mut demo = demo_config();
+        demo.host_guard.min_memory_available_bytes = 1;
+        demo.alerts.enabled = false;
+        let mut production = production_config();
+        production.host_guard.min_memory_available_bytes = 1;
+        production.alerts.enabled = false;
+
+        let report = verify(&demo, &production);
+
+        assert!(!report.acceptance_passed);
+        for failure in [
+            report.failures.iter().find(|failure| {
+                matches!(
+                    failure,
+                    ProductionTransitionFailure::DemoOperationalPolicyFailed { .. }
+                )
+            }),
+            report.failures.iter().find(|failure| {
+                matches!(
+                    failure,
+                    ProductionTransitionFailure::ProductionOperationalPolicyFailed { .. }
+                )
+            }),
+        ] {
+            let Some(
+                ProductionTransitionFailure::DemoOperationalPolicyFailed { errors }
+                | ProductionTransitionFailure::ProductionOperationalPolicyFailed { errors },
+            ) = failure
+            else {
+                panic!(
+                    "missing operational-policy failure in {:?}",
+                    report.failures
+                );
+            };
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("min_memory_available_bytes"))
+            );
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("alerts must be enabled"))
+            );
+        }
     }
 
     #[test]
