@@ -15,7 +15,7 @@ production trading process.
 | Order components | Event-loop client IDs/registration, exchange/client acknowledgement binding, account-scoped immutable private identity, semantic duplicate suppression across changed exchange timestamps, exchange-side place-request expiry, an authenticated eight-session websocket command pool, constant-time per-underlying FIFOs, bounded cross-underlying command concurrency, shared account pacing, independent REST reconciliation, shutdown command flushing, monotonic private reduction, submit/cancel state-convergence deadlines, typed position margin mode, and ambiguity handling are composed | Needs demo exchange fault evidence |
 | Runtime risk | Instrument models, authoritative startup positions, authenticated current instrument-rule, hard single-order maximum, and fee-group checks, final pre-trade exchange-limit enforcement, typed upcoming-change lead, active-order count/notional ceilings, rolling submit-rejection and zero-fill IOC-cancel circuits, terminal strategy-halt promotion, position scope/mode enforcement, zero-liability enforcement, periodic authenticated account-config drift detection, forced-repayment blocking, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock and announced-maintenance checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed instrument/fee/deadman/depeg/convergence evidence |
 | Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, strict bounded soak reports, documented region/environment endpoint tuples, an exact demo-to-production config transition verifier, and a source-rebuilding cross-gate production evidence bundle | Demo-capable; production entry intentionally unavailable, and no passing target-host bundle exists |
-| Instrument/account bootstrap | Account instruments/config/balance/positions are typed; economic snapshots preserve borrowing flags, liabilities, interest, and margin-loan fields; live spot and borrow limits are cash-only/zero; enabled borrowing, missing applicable evidence, nonzero liabilities, margin positions, and nonzero positions outside configured ownership/mode fail before strategy/risk application | Needs a passing artifact from the real target account; tooling alone is not evidence |
+| Instrument/account bootstrap | Account instruments/config/balance/positions are typed; authenticating API-key permissions and IP bindings are retained; exact configured scope is enforced with `withdraw` forbidden and production trade keys IP-bound; economic snapshots preserve borrowing flags, liabilities, interest, and margin-loan fields; live spot and borrow limits are cash-only/zero; enabled borrowing, missing applicable evidence, nonzero liabilities, margin positions, and nonzero positions outside configured ownership/mode fail before strategy/risk application | Needs a passing artifact from the real target account and host; tooling alone is not evidence |
 | Startup/restart gate | Executable phase state, engine-consumed account-snapshot invariant, mandatory independently fresh strategy references, immediate canonical cancellation on reference-readiness loss, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, durable latch restore, authoritative account repair, second-pass clean REST reconciliation, and read-only journal-bound deadman-expiry certification | Needs process-kill demo evidence; tooling alone is not evidence |
 | Event-loop profile | Allocation-aware raw OKX parity benchmark covers redundant wire input through strategy/risk and storage-record construction | Needs target-host capture and exchange-latency validation |
 | Operator control and alerts | HMAC-authenticated local controls use fsynced write-ahead latches; OKX Cancel All After is maintained independently; a separate CLI can arm the deadman, cancel all regular orders account-wide, and prove post-trigger zero with offline exact-config verification; another read-only CLI can prove source `20` after controlled process death | Must exercise target alert routing, deadman expiry, and the independent cancel procedure; algo/spread orders remain outside their scope |
@@ -887,6 +887,28 @@ production trading process.
     `1cef2b7e423a58dc36b3a823dc37c817e12a46a62fd0f11f51e38cf8c72dda83`.
     Credentialed target-host demo, process-death, economic, calibration, and
     approval gates remain open; this does not make the strategy tradable now.
+67. Authenticated account configuration now retains the requesting API key's
+    label, normalized `perm` set, and normalized `ip` bindings. Each account
+    declares an exact permission policy; configuration always rejects
+    `withdraw`, production trade configuration requires IP binding, bootstrap
+    rejects permission or binding mismatch before task startup, and the
+    periodic account-config comparison makes later key-security drift fatal.
+    Production-qualified demo and production configs must declare exactly
+    `read_only` plus `trade` and require a binding.
+
+    Account certification is schema 3 and independently re-parses the exact raw
+    before/after responses, re-derives permission equality and binding presence,
+    and rejects a re-hashed permission tamper. The aggregate production bundle
+    already re-verifies that artifact against the exact production config. This
+    strengthens pinned Java `AccountConfig`/`OkUtils.loadAccountConfig`, which
+    retain account/position mode but not current `perm`/`ip` fields.
+
+    Formatting, warnings-denied Clippy, all 761 workspace tests, optimized CLI
+    build, hardened systemd verification at exposure 2.9, and RustSec audit
+    pass. The release executable SHA-256 is
+    `708f299f4b9ca3a21bec14d5eba9ef5b395d184d62e0f714be2d4aa37064b62b`.
+    No target-host credential artifact exists, and production order entry is
+    still unavailable.
 
 ## Remaining Demo Gate
 
@@ -936,7 +958,7 @@ production trading process.
    controlled trade window only after the first schema-7 authoritative account
    snapshot, span a real nonzero funding settlement, retain same-session
    `mark-price` samples before and after the bill `fillTime`, and contain no
-   unrelated account bills. Collect passing schema-2 account certifications no
+   unrelated account bills. Collect passing schema-3 account certifications no
    more than 60 seconds before and after the exact bill window, then inspect every
    per-currency bill-balance link and endpoint equity conversion.
 
@@ -976,7 +998,9 @@ Production enablement additionally requires:
   fail-closed cleanup while the deadman heartbeat remains active.
 - A passing target-account `certify-account` artifact, independently rechecked
   with `verify-account-certification --require-pass`, immediately before
-  approval. This is point-in-time evidence and must be combined with a passing
+  approval. Require exact `read_only` plus `trade`, no `withdraw`, and a
+  non-empty exchange-reported IP binding for the key accepted from the target
+  host. This is point-in-time evidence and must be combined with a passing
   per-account schema-5 economic reconciliation included in the schema-8
   production bundle. Margin spot remains unsupported; enabling it requires an
   explicit borrow-rate/interest model and demo reconciliation first.

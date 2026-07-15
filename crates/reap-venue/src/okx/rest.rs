@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use async_trait::async_trait;
 use chrono::{SecondsFormat, Utc};
@@ -585,12 +585,36 @@ pub struct OkxAccountConfig {
     pub account_stp_mode: String,
     pub user_id: String,
     pub main_user_id: String,
+    /// Note assigned to the API key that authenticated this request.
+    pub api_key_label: String,
+    /// Permissions attached to the API key that authenticated this request.
+    pub api_key_permissions: BTreeSet<OkxApiKeyPermission>,
+    /// IP addresses or network segments bound to the authenticating API key.
+    pub api_key_ip_bindings: BTreeSet<String>,
     /// OKX Spot-mode borrowing switch. `None` means the exchange omitted it.
     pub enable_spot_borrow: Option<bool>,
     /// OKX multi-currency/portfolio automatic borrowing switch.
     pub auto_loan: Option<bool>,
     /// OKX Spot-mode automatic repayment switch.
     pub spot_borrow_auto_repay: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OkxApiKeyPermission {
+    ReadOnly,
+    Trade,
+    Withdraw,
+}
+
+impl OkxApiKeyPermission {
+    pub fn as_okx_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::Trade => "trade",
+            Self::Withdraw => "withdraw",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2528,6 +2552,12 @@ struct OkxAccountConfigWire {
     uid: String,
     #[serde(default, rename = "mainUid")]
     main_user_id: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    perm: String,
+    #[serde(default)]
+    ip: String,
     #[serde(default, rename = "enableSpotBorrow")]
     enable_spot_borrow: Option<bool>,
     #[serde(default, rename = "autoLoan")]
@@ -2546,6 +2576,9 @@ impl TryFrom<OkxAccountConfigWire> for OkxAccountConfig {
             account_stp_mode: value.account_stp_mode,
             user_id: value.uid,
             main_user_id: value.main_user_id,
+            api_key_label: value.label,
+            api_key_permissions: parse_api_key_permissions(&value.perm)?,
+            api_key_ip_bindings: parse_api_key_ip_bindings(&value.ip)?,
             enable_spot_borrow: value.enable_spot_borrow,
             auto_loan: value.auto_loan,
             spot_borrow_auto_repay: value.spot_borrow_auto_repay,
@@ -3166,6 +3199,46 @@ fn parse_position_mode(value: &str) -> Result<OkxPositionMode, RestError> {
             message: "expected long_short_mode or net_mode".to_string(),
         }),
     }
+}
+
+fn parse_api_key_permissions(value: &str) -> Result<BTreeSet<OkxApiKeyPermission>, RestError> {
+    if value.trim().is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    value
+        .split(',')
+        .map(|permission| match permission.trim() {
+            "read_only" => Ok(OkxApiKeyPermission::ReadOnly),
+            "trade" => Ok(OkxApiKeyPermission::Trade),
+            "withdraw" => Ok(OkxApiKeyPermission::Withdraw),
+            other => Err(RestError::InvalidField {
+                field: "perm",
+                value: other.to_string(),
+                message: "expected read_only, trade, or withdraw".to_string(),
+            }),
+        })
+        .collect()
+}
+
+fn parse_api_key_ip_bindings(value: &str) -> Result<BTreeSet<String>, RestError> {
+    if value.trim().is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    value
+        .split(',')
+        .map(|binding| {
+            let binding = binding.trim();
+            if binding.is_empty() {
+                Err(RestError::InvalidField {
+                    field: "ip",
+                    value: value.to_string(),
+                    message: "IP bindings must be non-empty comma-separated values".to_string(),
+                })
+            } else {
+                Ok(binding.to_string())
+            }
+        })
+        .collect()
 }
 
 fn parse_position_margin_mode(value: &str) -> Result<PositionMarginMode, RestError> {
@@ -4173,7 +4246,7 @@ mod tests {
     async fn parses_signed_bootstrap_metadata_and_account_state() {
         let (client, requests) = client(vec![
             r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","instType":"SWAP","instFamily":"BTC-USDT","groupId":"2","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"USDT","ctType":"linear","ctVal":"0.01","ctValCcy":"BTC","tickSz":"0.1","lotSz":"1","minSz":"1","maxLmtSz":"1000000","maxMktSz":"1000000","maxLmtAmt":"","maxMktAmt":"","state":"live","upcChg":[]}]}"#,
-            r#"{"code":"0","msg":"","data":[{"acctLv":"2","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"7","mainUid":"6","enableSpotBorrow":false,"autoLoan":false,"spotBorrowAutoRepay":false}]}"#,
+            r#"{"code":"0","msg":"","data":[{"acctLv":"2","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"7","mainUid":"6","label":"reap-demo","perm":"trade,read_only","ip":"203.0.113.5,2001:db8::/48","enableSpotBorrow":false,"autoLoan":false,"spotBorrowAutoRepay":false}]}"#,
             r#"{"code":"0","msg":"","data":[{"uTime":"1000","totalEq":"11000","mgnRatio":"12.5","adjEq":"10000","borrowFroz":"0","notionalUsdForBorrow":"0","notionalUsd":"2000","details":[{"ccy":"USDT","uTime":"999","cashBal":"9000","availBal":"8000","eq":"10000","liab":"0","crossLiab":"0","isoLiab":"0","uplLiab":"0","interest":"0","borrowFroz":"0","maxLoan":"500","twap":"2"}]}]}"#,
             r#"{"code":"0","msg":"","data":[{"instType":"SWAP","instId":"BTC-USDT-SWAP","pos":"2","posSide":"net","mgnMode":"cross","avgPx":"50000","uTime":"1001","liab":"","interest":""}]}"#,
         ]);
@@ -4195,6 +4268,15 @@ mod tests {
         assert_eq!(instruments[0].trade_fee_group_id, "2");
         assert_eq!(account.account_level, OkxAccountLevel::SingleCurrencyMargin);
         assert_eq!(account.position_mode, OkxPositionMode::NetMode);
+        assert_eq!(account.api_key_label, "reap-demo");
+        assert_eq!(
+            account.api_key_permissions,
+            BTreeSet::from([OkxApiKeyPermission::ReadOnly, OkxApiKeyPermission::Trade])
+        );
+        assert_eq!(
+            account.api_key_ip_bindings,
+            BTreeSet::from(["2001:db8::/48".to_string(), "203.0.113.5".to_string()])
+        );
         assert_eq!(account.enable_spot_borrow, Some(false));
         assert_eq!(balance.balances[0].available, 8000.0);
         assert_eq!(balance.balances[0].forced_repayment_indicator, Some(2));
@@ -4267,6 +4349,25 @@ mod tests {
         );
         assert_eq!(positions.positions[0].liability, Some(20.0));
         assert_eq!(positions.positions[0].quote_interest, Some(0.02));
+    }
+
+    #[test]
+    fn account_config_rejects_unknown_api_key_permissions_and_empty_bindings() {
+        let unknown_permission = parse_okx_account_config_response_json(
+            br#"{"code":"0","msg":"","data":[{"acctLv":"1","posMode":"net_mode","perm":"read_only,transfer"}]}"#,
+        );
+        assert!(matches!(
+            unknown_permission,
+            Err(RestError::InvalidField { field: "perm", .. })
+        ));
+
+        let empty_binding = parse_okx_account_config_response_json(
+            br#"{"code":"0","msg":"","data":[{"acctLv":"1","posMode":"net_mode","perm":"read_only","ip":"203.0.113.5,"}]}"#,
+        );
+        assert!(matches!(
+            empty_binding,
+            Err(RestError::InvalidField { field: "ip", .. })
+        ));
     }
 
     #[tokio::test]

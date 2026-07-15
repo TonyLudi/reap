@@ -5157,7 +5157,7 @@ async fn shutdown_signal() -> Result<(), std::io::Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -5170,10 +5170,10 @@ mod tests {
     use reap_storage::{acquire_storage_lease, start_jsonl_storage};
     use reap_strategy::{ChaosConfig, InstrumentKindConfig};
     use reap_venue::okx::{
-        HttpResponse, OkxAccountConfig, OkxAccountLevel, OkxCancelOrder, OkxCredentials,
-        OkxInstrumentChange, OkxInstrumentChangeParameter, OkxInstrumentType, OkxOrderAck,
-        OkxPlaceOrder, OkxPositionMode, OkxRestClient, OkxSigner, OkxTradeMode, RestError,
-        SignedRequest,
+        HttpResponse, OkxAccountConfig, OkxAccountLevel, OkxApiKeyPermission, OkxCancelOrder,
+        OkxCredentials, OkxInstrumentChange, OkxInstrumentChangeParameter, OkxInstrumentType,
+        OkxOrderAck, OkxPlaceOrder, OkxPositionMode, OkxRestClient, OkxSigner, OkxTradeMode,
+        RestError, SignedRequest,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{Notify, Semaphore, oneshot};
@@ -5751,6 +5751,12 @@ mod tests {
             account_stp_mode: "cancel_maker".to_string(),
             user_id: "7".to_string(),
             main_user_id: "6".to_string(),
+            api_key_label: "reap-demo".to_string(),
+            api_key_permissions: BTreeSet::from([
+                OkxApiKeyPermission::ReadOnly,
+                OkxApiKeyPermission::Trade,
+            ]),
+            api_key_ip_bindings: BTreeSet::from(["203.0.113.5".to_string()]),
             enable_spot_borrow: Some(false),
             auto_loan: Some(false),
             spot_borrow_auto_repay: Some(false),
@@ -5900,6 +5906,7 @@ mod tests {
                 passphrase_env: "PASS".to_string(),
                 expected_account_level: OkxAccountLevel::SingleCurrencyMargin,
                 expected_position_mode: OkxPositionMode::NetMode,
+                api_key_policy: crate::OkxApiKeyPolicyConfig::default(),
                 id_prefix: "reap".to_string(),
                 node_id: 1,
                 trade_modes: HashMap::from([
@@ -7436,7 +7443,7 @@ mod tests {
         let (client, requests) = safety_client(vec![
             Ok(r#"{"code":"0","msg":"","data":[{"ts":"0"}]}"#),
             Ok(
-                r#"{"code":"0","msg":"","data":[{"acctLv":"2","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"7","mainUid":"6","enableSpotBorrow":true,"autoLoan":false,"spotBorrowAutoRepay":false}]}"#,
+                r#"{"code":"0","msg":"","data":[{"acctLv":"2","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"7","mainUid":"6","label":"reap-demo","perm":"read_only,trade","ip":"203.0.113.5","enableSpotBorrow":true,"autoLoan":false,"spotBorrowAutoRepay":false}]}"#,
             ),
         ]);
         let (_command_tx, command_rx) = mpsc::channel(2);
@@ -8152,6 +8159,7 @@ mod tests {
             symbol: "USDT-USD".to_string(),
             max_downside_deviation: 0.01,
         }];
+        production.accounts[0].api_key_policy.require_ip_binding = true;
         let error = run_live(
             production,
             LiveRunOptions {

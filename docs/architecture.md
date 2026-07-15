@@ -416,8 +416,10 @@ Responsibilities:
 - Promote terminal strategy safety halts into the global risk gate before
   dispatching intents from the triggering event; global cancellation always
   takes precedence over simultaneous symbol isolation.
-- Validate exchange time, continuously compare authenticated account config to
-  its bootstrap identity/settings, poll announced OKX unified-account system
+- Validate exchange time, enforce exact API-key permissions and required
+  exchange-reported IP binding, continuously compare authenticated account
+  config to its bootstrap identity/key-security/settings, poll announced OKX
+  unified-account system
   maintenance, compare strategy-critical instrument rules and fee assumptions
   to authenticated current metadata, expire stale place requests at the venue,
   and own an independently scheduled exchange deadman lifecycle per account.

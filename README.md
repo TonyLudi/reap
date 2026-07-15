@@ -497,7 +497,8 @@ cargo run -p reap-cli -- live --config examples/live-okx-demo.toml --mode observ
 The certification command has no order-entry path. It requires disabled
 mode-appropriate borrowing flags, zero applicable aggregate/per-currency
 liability, interest, and borrow-frozen fields, no OKX `MARGIN` positions, zero
-configured strategy borrow limits, stable bracketed identity/settings, and
+configured strategy borrow limits, exact configured API-key permissions, any
+required exchange-reported IP binding, stable bracketed identity/settings, and
 bounded exchange-clock evidence. For every non-USD balance currency it retains a
 direct `CCY-USD` index ticker, rechecks `eqUsd` against `eq * idxPx`, and proves
 that currency `eqUsd` values sum to `totalEq` within strict tolerances. The
@@ -728,7 +729,7 @@ bracketing the bill's `fillTime`. The bill mark must lie inside that independent
 exchange-time bracket. Schema-7 `session_start` and critical `account_snapshot`
 journal records bind those observations to one session, account, config,
 and hashed OKX account identity, so evidence cannot cross a restart. The schema-5
-economic report also reverifies the opening/closing schema-2 account artifacts,
+economic report also reverifies the opening/closing schema-3 account artifacts,
 requires every numeric bill ID and post-bill `bal`, checks every adjacent balance
 edge, and proves `opening cashBal + sum(balChg) = closing cashBal` per currency.
 It reports native/USD equity at both boundaries and the total-equity delta. Run a

@@ -664,7 +664,7 @@ from the one-time bootstrap record: every runtime start emits a schema-7
 hashed OKX account identity. Reconciliation uses journal line boundaries and
 refuses to combine positions, settlements, or marks across the next start.
 
-Schema-5 reconciliation also reopens and independently verifies both schema-2
+Schema-5 reconciliation also reopens and independently verifies both schema-3
 account certifications. It requires exact config/environment/account identity,
 an opening finish before `BEGIN_MS`, a closing start after `END_MS`, and each gap
 within `maximum_account_boundary_gap_ms`. For every currency it orders bills by
@@ -714,7 +714,7 @@ The current OKX documentation is not sufficient evidence for every cash-spot
 bill unit combination, so archive a credentialed minimal cash buy and sell demo
 sample and require this verifier to pass before admitting spot production data.
 
-### Account Cash And Liability Certification
+### API Key, Account Cash, And Liability Certification
 
 Before the first credentialed observe/demo session, after any account-setting
 change, and immediately before a production approval review, collect and then
@@ -737,18 +737,21 @@ cargo run -p reap-cli -- verify-account-certification \
 ```
 
 `certify-account` uses public-time/direct-index and authenticated read-only
-account configuration, balance, and positions GETs. It reserves the output before
-credentials or network access, writes it create-new with Unix mode `0600`, and
+account configuration, balance, and positions GETs. The current
+[OKX account-configuration contract](https://www.okx.com/docs-v5/en/#trading-account-rest-api-get-account-configuration)
+reports the requesting key's `perm` and bound `ip` values. It reserves the
+output before credentials or network access, writes it create-new with Unix mode `0600`, and
 fsyncs both file and parent directory. The CLI prints only a redacted summary;
 the artifact embeds the exact bounded responses and exact live TOML, so treat it
 as sensitive account evidence and never publish it in logs or source control.
 
-The schema-2 verifier needs no credentials. It checks the pinned Java revision,
+The schema-3 verifier needs no credentials. It checks the pinned Java revision,
 re-hashes the embedded config and responses, re-derives the account identity
-hash and policy, and checks endpoint/response bounds, exchange-clock skew, the
+hash and policies, and checks endpoint/response bounds, exchange-clock skew, the
 maximum 30-second collection span, bracketed UID/main-UID and settings stability,
-configured account/position modes, cash-only spot routing, zero strategy borrow
-limits, and mode-aware OKX economics. It derives the exact expected direct
+the API-key label, exact permission-set equality, required exchange-reported IP
+binding, configured account/position modes, cash-only spot routing, zero
+strategy borrow limits, and mode-aware OKX economics. It derives the exact expected direct
 `CCY-USD` index set from balance details, rejects missing/duplicate/stale ticker
 evidence, checks each reported `eqUsd` against `eq * idxPx`, and checks the strict
 sum of `eqUsd` against `totalEq`. Collector binary and host hashes are
@@ -1113,14 +1116,17 @@ outside source control.
    checks `/api/v5/system/status` and refuses startup when relevant
    unified-account maintenance is active or begins within
    `exchange_status_lead_ms`.
-6. The runtime fetches account-scoped instruments, account configuration,
+6. The runtime fetches account-scoped instruments, account configuration
+   including the authenticating API key's label, permission set, and IP bindings,
    full economic balances, positions including margin-loan fields, open orders,
    recent fills, exact status for any restored active order, and the
    authenticated current fee group for every configured instrument.
 7. It verifies live instrument state, type, linear/inverse contract type,
    tick/lot/minimum and maximum single-order sizes, applicable spot maximum
    order amounts, contract value, currencies, configured trade mode,
-   account level, `net_mode`, disabled mode-appropriate borrowing, complete
+   account level, `net_mode`, the exact configured API-key permissions, any
+   required exchange-reported IP binding, disabled mode-appropriate borrowing,
+   complete
    applicable zero-liability/interest evidence, absence of margin positions,
    absence of imminent announced instrument-rule changes, and that configured
    maker/taker costs do not understate the applicable exchange commissions or
@@ -1204,6 +1210,12 @@ settings; accepting only their static flags would weaken live stop behavior.
   update. It retains applicable aggregate/per-currency borrowing and interest
   fields and margin-position loan fields, then applies the same mode-aware cash
   policy used by `certify-account`. A violation prevents live task startup.
+- Bootstrap also applies the configured API-key policy before task startup.
+  Production evidence requires exactly `read_only` plus `trade`, rejects
+  `withdraw`, and requires at least one exchange-reported IP binding. A
+  successful authenticated request with a non-empty binding proves this egress
+  was accepted by OKX under a bound key; secret custody and network ownership
+  remain external controls.
 - Every later normalized websocket or REST balance update rejects any nonzero
   liability before state application. This protects the running process even
   though the hot strategy event intentionally carries fewer economic fields
@@ -1780,8 +1792,9 @@ in `observe` only after review.
   coordinate their polling intervals so the aggregate request rate remains
   within that limit.
 - After each successful periodic clock check, the safety task fetches
-  authenticated account configuration and compares the typed identity, account
-  and position modes, STP setting, and borrowing flags to bootstrap. Any drift
+  authenticated account configuration and compares the typed identity, API-key
+  label/permissions/IP bindings, account and position modes, STP setting, and
+  borrowing flags to bootstrap. Any drift
   or failed check is fatal and enters normal fail-closed cleanup.
 - Bootstrap and the periodic account fee guard use the official authenticated
   [OKX fee-rates endpoint](https://www.okx.com/docs-v5/en/#trading-account-rest-api-get-fee-rates).
@@ -2225,19 +2238,23 @@ parsing. Account array order remains significant. Demo and production endpoint
 regions must match; a Global demo file cannot certify an EEA, US/AU, or Turkey
 candidate.
 
-Format-2 transition policy also requires both files to enable the operator
+Format-3 transition policy also requires both files to enable the operator
 service, fatal external alerts, and the production host-guard floors; configure
 at least two redundant public connections per subscription and two independent
-order-command sessions, and use an absolute connection-attempt pacer path. The
+order-command sessions, use an absolute connection-attempt pacer path, and
+declare exact `read_only` plus `trade` API-key permissions with required IP
+binding for every account. The
 checked-in demo example intentionally leaves external alerts and host guarding
 disabled and uses a repository-relative pacer, so it must be copied, deployed,
 and exercised before it can be the exact evidence-bearing demo config.
 
-The verifier never reads credential values and cannot prove API-key scope, IP
-binding, target account identity, deployment secret separation, or runtime
-behavior. Archive its passing artifact alongside the exact two configs, but do
-not treat it as production authorization. Production order entry remains
-unavailable until the separate readiness gates pass.
+The transition verifier never reads credential values; it proves only the
+declared credential policy. The separately required schema-3 account
+certification replays the authenticated `perm`, `ip`, UID, and main-UID evidence
+for the exact production config. Neither artifact proves deployment-secret
+separation, human custody, or runtime behavior. Archive both, but do not treat
+them as production authorization. Production order entry remains unavailable
+until the separate readiness gates pass.
 
 The transition report and research-deployment report answer different questions.
 The transition report proves that the evidence-bearing demo config and proposed
@@ -2492,6 +2509,10 @@ not a claim of Java parity.
 - Load API key, secret, and passphrase from the deployment secret provider, not
   TOML or source control.
 - Credential debug output is redacted. Do not add raw request-header logging.
+- Configure `accounts.api_key_policy.expected_permissions` as exactly
+  `read_only` and `trade`; never grant `withdraw`. Set
+  `require_ip_binding = true`, bind the key to the reviewed target egress, and
+  require a passing schema-3 account certification from that host.
 - Synchronize UTC time before signing. Treat authentication timestamp failures
   as unhealthy private connectivity.
 - Use OKX demo trading first. Production enablement requires exchange/account

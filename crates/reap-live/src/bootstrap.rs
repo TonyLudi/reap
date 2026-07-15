@@ -117,6 +117,14 @@ pub fn verify_bootstrap(
                 account.id
             ));
         }
+        let api_key_policy =
+            crate::evaluate_okx_api_key_policy(&account.api_key_policy, &snapshot.account_config);
+        errors.extend(
+            api_key_policy
+                .violations
+                .into_iter()
+                .map(|error| format!("account {} API-key policy violation: {error}", account.id)),
+        );
         if snapshot.balance.balances.is_empty() {
             errors.push(format!(
                 "account {} returned no balances during bootstrap",
@@ -414,12 +422,14 @@ fn compare_text(name: &str, configured: &str, exchange: &str, errors: &mut Vec<S
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use reap_core::{Balance, MarginSnapshot, Position, PositionMarginMode};
     use reap_risk::RiskLimits;
     use reap_strategy::ChaosConfig;
     use reap_venue::okx::{
-        OkxAccountBalanceSnapshot, OkxAccountLevel, OkxAccountPositionsSnapshot, OkxBalanceDetail,
-        OkxPositionMode,
+        OkxAccountBalanceSnapshot, OkxAccountLevel, OkxAccountPositionsSnapshot,
+        OkxApiKeyPermission, OkxBalanceDetail, OkxPositionMode,
     };
 
     use crate::{
@@ -456,6 +466,7 @@ mod tests {
                 passphrase_env: "PASS".to_string(),
                 expected_account_level: OkxAccountLevel::SingleCurrencyMargin,
                 expected_position_mode: OkxPositionMode::NetMode,
+                api_key_policy: crate::OkxApiKeyPolicyConfig::default(),
                 id_prefix: "reap".to_string(),
                 node_id: 1,
                 trade_modes: HashMap::from([
@@ -474,6 +485,12 @@ mod tests {
                 account_stp_mode: "cancel_maker".to_string(),
                 user_id: "7".to_string(),
                 main_user_id: "6".to_string(),
+                api_key_label: "reap-demo".to_string(),
+                api_key_permissions: BTreeSet::from([
+                    OkxApiKeyPermission::ReadOnly,
+                    OkxApiKeyPermission::Trade,
+                ]),
+                api_key_ip_bindings: BTreeSet::from(["203.0.113.5".to_string()]),
                 enable_spot_borrow: Some(false),
                 auto_loan: Some(false),
                 spot_borrow_auto_repay: Some(false),
@@ -632,6 +649,39 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("stable OKX user identity"));
+    }
+
+    #[test]
+    fn rejects_api_key_permission_drift() {
+        let config = config();
+        let mut snapshot = snapshot();
+        snapshot
+            .account_config
+            .api_key_permissions
+            .insert(OkxApiKeyPermission::Withdraw);
+
+        let error = verify_bootstrap(&config, &HashMap::from([("main".to_string(), snapshot)]))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("API-key policy violation"));
+        assert!(error.to_string().contains("Withdraw"));
+    }
+
+    #[test]
+    fn rejects_missing_required_api_key_ip_binding() {
+        let mut config = config();
+        config.accounts[0].api_key_policy.require_ip_binding = true;
+        let mut snapshot = snapshot();
+        snapshot.account_config.api_key_ip_bindings.clear();
+
+        let error = verify_bootstrap(&config, &HashMap::from([("main".to_string(), snapshot)]))
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("no exchange-reported IP binding")
+        );
     }
 
     #[test]

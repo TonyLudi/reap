@@ -18,10 +18,13 @@ use thiserror::Error;
 use crate::provenance::{
     current_executable_sha256, host_identity_sha256, okx_account_identity_sha256, sha256_bytes,
 };
-use crate::{LiveConfig, LiveConfigError, OkxTradeModeConfig, TradingEnvironment};
+use crate::{
+    LiveConfig, LiveConfigError, OkxApiKeyPolicyEvaluation, OkxTradeModeConfig, TradingEnvironment,
+    evaluate_okx_api_key_policy,
+};
 
 pub const ACCOUNT_CASH_POLICY_VERSION: u32 = 1;
-pub const ACCOUNT_CERTIFICATION_SCHEMA_VERSION: u32 = 2;
+pub const ACCOUNT_CERTIFICATION_SCHEMA_VERSION: u32 = 3;
 pub const MAX_ACCOUNT_CERTIFICATION_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_ACCOUNT_CERTIFICATION_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_ACCOUNT_CERTIFICATION_ARTIFACT_BYTES: u64 = 48 * 1024 * 1024;
@@ -122,6 +125,7 @@ pub struct AccountCertificationSummary {
     pub account_identity_stable: bool,
     pub account_settings_stable: bool,
     pub clock_evidence_valid: bool,
+    pub api_key_policy: OkxApiKeyPolicyEvaluation,
     pub policy: AccountCashPolicyEvaluation,
     pub equity: AccountEquityEvaluation,
     pub evidence_complete: bool,
@@ -780,11 +784,18 @@ fn derive_summary(
     );
     let policy =
         evaluate_account_cash_policy(config, account_id, config_before, balance, positions);
+    let account = config.account(account_id).ok_or_else(|| {
+        AccountCertificationError::InvalidEvidence(format!(
+            "configured account {account_id} does not exist"
+        ))
+    })?;
+    let api_key_policy = evaluate_okx_api_key_policy(&account.api_key_policy, config_before);
     let equity = evaluate_account_equity(balance, index_tickers, start_clock, finish_clock)?;
-    let evidence_complete = equity.evidence_complete;
+    let evidence_complete = api_key_policy.evidence_complete && equity.evidence_complete;
     let passed = account_identity_stable
         && account_settings_stable
         && clock_evidence_valid
+        && api_key_policy.passed
         && policy.passed
         && equity.passed
         && evidence_complete;
@@ -796,6 +807,7 @@ fn derive_summary(
         account_identity_stable,
         account_settings_stable,
         clock_evidence_valid,
+        api_key_policy,
         policy,
         equity,
         evidence_complete,
@@ -1430,7 +1442,8 @@ mod tests {
     use reap_risk::RiskLimits;
     use reap_strategy::ChaosConfig;
     use reap_venue::okx::{
-        HttpResponse, OkxBalanceDetail, OkxCredentials, OkxPositionMode, SignedRequest,
+        HttpResponse, OkxApiKeyPermission, OkxBalanceDetail, OkxCredentials, OkxPositionMode,
+        SignedRequest,
     };
 
     use crate::{
@@ -1481,6 +1494,7 @@ mod tests {
                 passphrase_env: "PASS".to_string(),
                 expected_account_level: level,
                 expected_position_mode: OkxPositionMode::NetMode,
+                api_key_policy: crate::OkxApiKeyPolicyConfig::default(),
                 id_prefix: "reap".to_string(),
                 node_id: 1,
                 trade_modes: HashMap::from([
@@ -1500,6 +1514,12 @@ mod tests {
             account_stp_mode: "cancel_maker".to_string(),
             user_id: "7".to_string(),
             main_user_id: "6".to_string(),
+            api_key_label: "reap-demo".to_string(),
+            api_key_permissions: BTreeSet::from([
+                OkxApiKeyPermission::ReadOnly,
+                OkxApiKeyPermission::Trade,
+            ]),
+            api_key_ip_bindings: BTreeSet::from(["203.0.113.5".to_string()]),
             enable_spot_borrow: Some(false),
             auto_loan: Some(false),
             spot_borrow_auto_repay: Some(false),
@@ -1693,7 +1713,7 @@ mod tests {
         let config = live_config(OkxAccountLevel::Simple);
         let config_toml = toml::to_string(&config).unwrap();
         let now = unix_time_ms().unwrap();
-        let account_json = r#"{"code":"0","msg":"","data":[{"acctLv":"1","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"7","mainUid":"6","enableSpotBorrow":false,"autoLoan":false,"spotBorrowAutoRepay":false}]}"#;
+        let account_json = r#"{"code":"0","msg":"","data":[{"acctLv":"1","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"7","mainUid":"6","label":"reap-demo","perm":"read_only,trade","ip":"203.0.113.5","enableSpotBorrow":false,"autoLoan":false,"spotBorrowAutoRepay":false}]}"#;
         let balance_json = r#"{"code":"0","msg":"","data":[{"uTime":"1000","totalEq":"1000","adjEq":"1000","borrowFroz":"0","notionalUsdForBorrow":"0","notionalUsd":"0","details":[{"ccy":"USDT","uTime":"1000","cashBal":"1000","availBal":"1000","eq":"1000","eqUsd":"1000","disEq":"1000","upl":"0","liab":"0","crossLiab":"0","interest":"0","borrowFroz":"0","maxLoan":"100","twap":"0"}]}]}"#;
         let index_json = format!(
             r#"{{"code":"0","msg":"","data":[{{"instId":"USDT-USD","idxPx":"1","ts":"{now}"}}]}}"#
@@ -1732,6 +1752,13 @@ mod tests {
         .await
         .unwrap();
         assert!(artifact.summary.passed, "{:?}", artifact.summary);
+        assert!(artifact.summary.api_key_policy.passed);
+        assert!(artifact.summary.api_key_policy.evidence_complete);
+        assert_eq!(artifact.summary.api_key_policy.ip_binding_count, 1);
+        assert_eq!(
+            artifact.summary.api_key_policy.observed_permissions,
+            BTreeSet::from([OkxApiKeyPermission::ReadOnly, OkxApiKeyPermission::Trade])
+        );
         let paths = requests
             .lock()
             .unwrap()
@@ -1777,6 +1804,23 @@ mod tests {
             .replace(r#""eqUsd":"1000""#, r#""eqUsd":"900""#);
         refresh_response_hash(&mut rehashed_balance_tamper.account_balance);
         std::fs::write(&path, serde_json::to_vec(&rehashed_balance_tamper).unwrap()).unwrap();
+        let error = verify_account_certification_path(&path).unwrap_err();
+        assert!(error.to_string().contains("summary does not match"));
+
+        let mut rehashed_permission_tamper = artifact.clone();
+        rehashed_permission_tamper.account_config_before.body = rehashed_permission_tamper
+            .account_config_before
+            .body
+            .replace(
+                r#""perm":"read_only,trade""#,
+                r#""perm":"read_only,trade,withdraw""#,
+            );
+        refresh_response_hash(&mut rehashed_permission_tamper.account_config_before);
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&rehashed_permission_tamper).unwrap(),
+        )
+        .unwrap();
         let error = verify_account_certification_path(&path).unwrap_err();
         assert!(error.to_string().contains("summary does not match"));
 

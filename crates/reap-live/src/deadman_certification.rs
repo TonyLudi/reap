@@ -1332,7 +1332,8 @@ mod tests {
     };
     use reap_strategy::ChaosConfig;
     use reap_venue::okx::{
-        HttpMethod, HttpResponse, OkxAccountLevel, OkxCredentials, OkxPositionMode, SignedRequest,
+        HttpMethod, HttpResponse, OkxAccountLevel, OkxApiKeyPermission, OkxCredentials,
+        OkxPositionMode, SignedRequest,
     };
 
     use crate::{
@@ -1386,6 +1387,7 @@ mod tests {
                 passphrase_env: "PASS".to_string(),
                 expected_account_level: OkxAccountLevel::Simple,
                 expected_position_mode: OkxPositionMode::NetMode,
+                api_key_policy: crate::OkxApiKeyPolicyConfig::default(),
                 id_prefix: "reap".to_string(),
                 node_id: 1,
                 trade_modes: HashMap::from([
@@ -1455,7 +1457,7 @@ mod tests {
     }
 
     fn account_config_json() -> String {
-        r#"{"code":"0","msg":"","data":[{"acctLv":"1","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"7","mainUid":"6","enableSpotBorrow":false,"autoLoan":false,"spotBorrowAutoRepay":false}]}"#.to_string()
+        r#"{"code":"0","msg":"","data":[{"acctLv":"1","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"7","mainUid":"6","label":"reap-demo","perm":"read_only,trade","ip":"203.0.113.5","enableSpotBorrow":false,"autoLoan":false,"spotBorrowAutoRepay":false}]}"#.to_string()
     }
 
     fn order_detail_json(cancel_source: &str) -> String {
@@ -1652,6 +1654,12 @@ mod tests {
                 account_stp_mode: "cancel_maker".to_string(),
                 user_id: "7".to_string(),
                 main_user_id: "6".to_string(),
+                api_key_label: "reap-demo".to_string(),
+                api_key_permissions: BTreeSet::from([
+                    OkxApiKeyPermission::ReadOnly,
+                    OkxApiKeyPermission::Trade,
+                ]),
+                api_key_ip_bindings: BTreeSet::from(["203.0.113.5".to_string()]),
                 enable_spot_borrow: Some(false),
                 auto_loan: Some(false),
                 spot_borrow_auto_repay: Some(false),
@@ -1664,6 +1672,12 @@ mod tests {
                 account_stp_mode: "cancel_maker".to_string(),
                 user_id: "7".to_string(),
                 main_user_id: "6".to_string(),
+                api_key_label: "reap-demo".to_string(),
+                api_key_permissions: BTreeSet::from([
+                    OkxApiKeyPermission::ReadOnly,
+                    OkxApiKeyPermission::Trade,
+                ]),
+                api_key_ip_bindings: BTreeSet::from(["203.0.113.5".to_string()]),
                 enable_spot_borrow: Some(false),
                 auto_loan: Some(false),
                 spot_borrow_auto_repay: Some(false),

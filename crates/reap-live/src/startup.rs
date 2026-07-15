@@ -575,6 +575,7 @@ mod tests {
                 passphrase_env: "PASS".to_string(),
                 expected_account_level: OkxAccountLevel::SingleCurrencyMargin,
                 expected_position_mode: OkxPositionMode::NetMode,
+                api_key_policy: crate::OkxApiKeyPolicyConfig::default(),
                 id_prefix: "reap".to_string(),
                 node_id: 1,
                 trade_modes: HashMap::from([

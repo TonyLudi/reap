@@ -197,6 +197,10 @@ expected_position_mode = "net_mode"
 id_prefix = "reap"
 node_id = 1
 
+[accounts.api_key_policy]
+expected_permissions = ["read_only", "trade"]
+require_ip_binding = true
+
 [accounts.trade_modes]
 BTC-USDT = "cash"
 BTC-USDT-SWAP = "cross"

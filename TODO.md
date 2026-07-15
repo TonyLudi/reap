@@ -274,6 +274,10 @@ architecture in [docs/architecture.md](docs/architecture.md).
   liability at bootstrap and during account updates, continuously detect
   authenticated account-config drift, and add create-new point-in-time account
   certification with credential-free raw-evidence verification.
+- [x] Retain current OKX API-key label, permissions, and IP bindings; enforce an
+  exact per-account scope at bootstrap, forbid `withdraw`, require IP-bound trade
+  keys for production, detect periodic drift, and independently re-derive the
+  policy in schema-3 account certification and aggregate production evidence.
 - [x] Make websocket ready/disconnect transitions lossless under bounded status
   backpressure, remove redundant per-frame status traffic, and split public and
   private disconnect counts in schema-8 live evidence for fault campaigns.
@@ -443,6 +447,8 @@ architecture in [docs/architecture.md](docs/architecture.md).
   enabled.
 - [ ] Certify production credentials/account mode/limits and expose production
   order entry only after every gate in `docs/trading-readiness.md` is signed off.
+  Permission/IP policy and source-verifiable account evidence are implemented,
+  but no passing target-host credential artifact exists.
   The source-rebuilding bundle now has a short-lived Ed25519 approval request,
   offline signer, strict two-role policy, and final source-rerunning verifier.
   No passing target-host bundle or real independently signed approval artifact

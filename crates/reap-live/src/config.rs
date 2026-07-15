@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -13,8 +13,8 @@ use reap_strategy::{ChaosConfig, InstrumentConfig};
 pub use reap_telemetry::HostGuardConfig;
 use reap_telemetry::WebhookAlertConfig;
 use reap_venue::okx::{
-    OKX_MIN_TRADE_FEE_REQUEST_INTERVAL_MS, OkxAccountLevel, OkxCredentials, OkxPositionMode,
-    OkxTradeMode,
+    OKX_MIN_TRADE_FEE_REQUEST_INTERVAL_MS, OkxAccountConfig, OkxAccountLevel, OkxApiKeyPermission,
+    OkxCredentials, OkxPositionMode, OkxTradeMode,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -171,10 +171,83 @@ pub struct LiveAccountConfig {
     pub passphrase_env: String,
     pub expected_account_level: OkxAccountLevel,
     pub expected_position_mode: OkxPositionMode,
+    #[serde(default)]
+    pub api_key_policy: OkxApiKeyPolicyConfig,
     #[serde(default = "default_id_prefix")]
     pub id_prefix: String,
     pub node_id: u16,
     pub trade_modes: HashMap<String, OkxTradeModeConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OkxApiKeyPolicyConfig {
+    /// Exact OKX permission set expected on the authenticating key.
+    pub expected_permissions: BTreeSet<OkxApiKeyPermission>,
+    /// Require OKX to report at least one IP address or network binding.
+    pub require_ip_binding: bool,
+}
+
+impl Default for OkxApiKeyPolicyConfig {
+    fn default() -> Self {
+        Self {
+            expected_permissions: BTreeSet::from([
+                OkxApiKeyPermission::ReadOnly,
+                OkxApiKeyPermission::Trade,
+            ]),
+            require_ip_binding: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OkxApiKeyPolicyEvaluation {
+    pub api_key_label: String,
+    pub expected_permissions: BTreeSet<OkxApiKeyPermission>,
+    pub observed_permissions: BTreeSet<OkxApiKeyPermission>,
+    pub permissions_match: bool,
+    pub ip_binding_required: bool,
+    pub ip_binding_count: u64,
+    pub ip_binding_present: bool,
+    pub evidence_complete: bool,
+    pub passed: bool,
+    pub violations: Vec<String>,
+}
+
+pub fn evaluate_okx_api_key_policy(
+    policy: &OkxApiKeyPolicyConfig,
+    observed: &OkxAccountConfig,
+) -> OkxApiKeyPolicyEvaluation {
+    let mut violations = BTreeSet::new();
+    let evidence_complete = !observed.api_key_permissions.is_empty();
+    if !evidence_complete {
+        violations.insert("API-key permission evidence is absent".to_string());
+    }
+    let permissions_match = policy.expected_permissions == observed.api_key_permissions;
+    if !permissions_match {
+        violations.insert(format!(
+            "API-key permissions {:?} do not exactly match configured {:?}",
+            observed.api_key_permissions, policy.expected_permissions
+        ));
+    }
+    let ip_binding_present = !observed.api_key_ip_bindings.is_empty();
+    if policy.require_ip_binding && !ip_binding_present {
+        violations.insert("API key has no exchange-reported IP binding".to_string());
+    }
+    let passed = violations.is_empty();
+    OkxApiKeyPolicyEvaluation {
+        api_key_label: observed.api_key_label.clone(),
+        expected_permissions: policy.expected_permissions.clone(),
+        observed_permissions: observed.api_key_permissions.clone(),
+        permissions_match,
+        ip_binding_required: policy.require_ip_binding,
+        ip_binding_count: observed.api_key_ip_bindings.len().min(u64::MAX as usize) as u64,
+        ip_binding_present,
+        evidence_complete,
+        passed,
+        violations: violations.into_iter().collect(),
+    }
 }
 
 impl LiveAccountConfig {
@@ -624,6 +697,20 @@ impl LiveConfig {
                 "{prefix}.runtime shutdown_timeout_ms plus teardown_timeout_ms must not exceed {maximum_in_process_budget_ms} for the hardened 45-second stop budget"
             ));
         }
+        let trading_permissions =
+            BTreeSet::from([OkxApiKeyPermission::ReadOnly, OkxApiKeyPermission::Trade]);
+        for (index, account) in self.accounts.iter().enumerate() {
+            if account.api_key_policy.expected_permissions != trading_permissions {
+                errors.push(format!(
+                    "{prefix}.accounts[{index}].api_key_policy.expected_permissions must be exactly [read_only, trade] for production evidence"
+                ));
+            }
+            if !account.api_key_policy.require_ip_binding {
+                errors.push(format!(
+                    "{prefix}.accounts[{index}].api_key_policy.require_ip_binding must be true for production evidence"
+                ));
+            }
+        }
         errors
     }
 
@@ -719,6 +806,44 @@ impl LiveConfig {
             if account.expected_position_mode != OkxPositionMode::NetMode {
                 errors.push(format!(
                     "account {} must use net_mode; long/short position aggregation is not supported",
+                    account.id
+                ));
+            }
+            if account.api_key_policy.expected_permissions.is_empty() {
+                errors.push(format!(
+                    "account {} API-key expected_permissions must not be empty",
+                    account.id
+                ));
+            }
+            if !account
+                .api_key_policy
+                .expected_permissions
+                .contains(&OkxApiKeyPermission::ReadOnly)
+            {
+                errors.push(format!(
+                    "account {} API-key expected_permissions must include read_only",
+                    account.id
+                ));
+            }
+            if account
+                .api_key_policy
+                .expected_permissions
+                .contains(&OkxApiKeyPermission::Withdraw)
+            {
+                errors.push(format!(
+                    "account {} API-key expected_permissions must not include withdraw",
+                    account.id
+                ));
+            }
+            if self.venue.environment == TradingEnvironment::Production
+                && account
+                    .api_key_policy
+                    .expected_permissions
+                    .contains(&OkxApiKeyPermission::Trade)
+                && !account.api_key_policy.require_ip_binding
+            {
+                errors.push(format!(
+                    "account {} production trade API key must require an IP binding",
                     account.id
                 ));
             }
@@ -1630,6 +1755,7 @@ mod tests {
                 passphrase_env: "OKX_PASSPHRASE".to_string(),
                 expected_account_level: OkxAccountLevel::SingleCurrencyMargin,
                 expected_position_mode: OkxPositionMode::NetMode,
+                api_key_policy: OkxApiKeyPolicyConfig::default(),
                 id_prefix: "reap".to_string(),
                 node_id: 1,
                 trade_modes: HashMap::from([
@@ -2104,6 +2230,7 @@ mod tests {
             symbol: "USDT-USD".to_string(),
             max_downside_deviation: 0.01,
         }];
+        config.accounts[0].api_key_policy.require_ip_binding = true;
         assert!(config.validate().valid);
         assert!(!config.venue.environment.is_demo());
     }
@@ -2361,6 +2488,7 @@ mod tests {
         config.host_guard.enabled = true;
         config.alerts.enabled = true;
         config.operator.enabled = true;
+        config.accounts[0].api_key_policy.require_ip_binding = true;
         config.runtime.connection_attempt_pacer_path =
             Some(PathBuf::from("/var/lib/reap/connectivity/okx-global.pacer"));
         assert!(config.production_evidence_policy_errors("demo").is_empty());
@@ -2375,6 +2503,9 @@ mod tests {
         config.runtime.public_connections_per_subscription = 1;
         config.runtime.order_websocket_sessions = 1;
         config.runtime.connection_attempt_pacer_path = Some(PathBuf::from("relative.pacer"));
+        config.accounts[0].api_key_policy.require_ip_binding = false;
+        config.accounts[0].api_key_policy.expected_permissions =
+            BTreeSet::from([OkxApiKeyPermission::ReadOnly]);
         let errors = config.production_evidence_policy_errors("production");
         for expected in [
             "check_interval_ms must not exceed 10000",
@@ -2387,12 +2518,36 @@ mod tests {
             "public_connections_per_subscription must be at least 2",
             "order_websocket_sessions must be at least 2",
             "connection_attempt_pacer_path must be absolute",
+            "expected_permissions must be exactly [read_only, trade]",
+            "require_ip_binding must be true",
         ] {
             assert!(
                 errors.iter().any(|error| error.contains(expected)),
                 "missing {expected} in {errors:?}"
             );
         }
+    }
+
+    #[test]
+    fn api_key_policy_rejects_withdraw_and_requires_binding_for_production_trade() {
+        let mut config = valid_config();
+        config.accounts[0]
+            .api_key_policy
+            .expected_permissions
+            .insert(OkxApiKeyPermission::Withdraw);
+        let errors = config.validate().errors;
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("must not include withdraw"))
+        );
+
+        let mut config = valid_config();
+        config.venue.environment = TradingEnvironment::Production;
+        let errors = config.validate().errors;
+        assert!(errors.iter().any(|error| {
+            error.contains("production trade API key must require an IP binding")
+        }));
     }
 
     #[test]

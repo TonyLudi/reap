@@ -11,7 +11,7 @@ use crate::{
     LiveConfig, LiveConfigError, LiveConfigFileEvidence, OkxEndpointRegion, TradingEnvironment,
 };
 
-pub const PRODUCTION_TRANSITION_FORMAT_VERSION: u16 = 2;
+pub const PRODUCTION_TRANSITION_FORMAT_VERSION: u16 = 3;
 pub const MAX_REPORTED_TRANSITION_CHANGES: usize = 256;
 const MAX_DISPLAY_STRING_BYTES: usize = 256;
 
@@ -215,7 +215,7 @@ pub fn verify_production_transition_paths(
         limitations: vec![
             "This verifier compares configuration only; it does not authorize or enable production order entry."
                 .to_string(),
-            "Credential environment-variable values, API-key permissions, IP restrictions, and exchange account identities are not read or verified."
+            "Credential environment-variable values are not read by this config-only verifier; authenticated account certification separately verifies exact API-key permissions, exchange-reported IP binding, and exchange account identity."
                 .to_string(),
             "Enabled controls are configuration evidence only; passing demo, fault, reconciliation, emergency, target-host, alert-delivery, and operator rollout evidence remain separate production gates."
                 .to_string(),
@@ -423,6 +423,7 @@ mod tests {
             LiveConfig::from_toml(include_str!("../../../examples/live-okx-demo.toml")).unwrap();
         config.host_guard.enabled = true;
         config.alerts.enabled = true;
+        config.accounts[0].api_key_policy.require_ip_binding = true;
         config.runtime.connection_attempt_pacer_path =
             Some(PathBuf::from("/var/lib/reap/connectivity/okx-global.pacer"));
         config
