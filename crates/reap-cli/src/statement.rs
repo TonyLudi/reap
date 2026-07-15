@@ -221,6 +221,12 @@ pub(crate) struct ReconcileEconomicsArgs {
     #[arg(
         long,
         default_value_t = 1,
+        help = "Minimum derivative close bills with independently recomputed PnL"
+    )]
+    minimum_derivative_close_bills: u64,
+    #[arg(
+        long,
+        default_value_t = 1,
         help = "Minimum fully recomputed funding bills"
     )]
     minimum_funding_bills: u64,
@@ -258,6 +264,18 @@ pub(crate) struct ReconcileEconomicsArgs {
         help = "Absolute balance-equation tolerance"
     )]
     balance_tolerance: f64,
+    #[arg(
+        long,
+        default_value_t = 1e-10,
+        help = "Absolute derivative trade-PnL formula tolerance"
+    )]
+    trade_pnl_absolute_tolerance: f64,
+    #[arg(
+        long,
+        default_value_t = 1e-10,
+        help = "Relative derivative trade-PnL formula tolerance"
+    )]
+    trade_pnl_relative_tolerance: f64,
     #[arg(
         long,
         default_value_t = 1e-12,
@@ -305,6 +323,7 @@ pub(crate) fn reconcile_economics(args: ReconcileEconomicsArgs) -> Result<()> {
             begin_ms: args.begin_ms,
             end_ms: args.end_ms,
             minimum_trade_bills: args.minimum_trade_bills,
+            minimum_derivative_close_bills: args.minimum_derivative_close_bills,
             minimum_funding_bills: args.minimum_funding_bills,
             maximum_trade_bill_delay_ms: args.maximum_trade_bill_delay_ms,
             maximum_funding_bill_delay_ms: args.maximum_funding_bill_delay_ms,
@@ -314,6 +333,8 @@ pub(crate) fn reconcile_economics(args: ReconcileEconomicsArgs) -> Result<()> {
                 quantity_abs: args.quantity_tolerance,
                 fee_abs: args.fee_tolerance,
                 balance_abs: args.balance_tolerance,
+                trade_pnl_abs: args.trade_pnl_absolute_tolerance,
+                trade_pnl_relative: args.trade_pnl_relative_tolerance,
                 funding_pnl_abs: args.funding_pnl_absolute_tolerance,
                 funding_pnl_relative: args.funding_pnl_relative_tolerance,
                 funding_mark_abs: args.funding_mark_absolute_tolerance,

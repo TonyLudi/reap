@@ -1,6 +1,6 @@
 # Schema template only. Replace every path and identity with reviewed target-host
 # evidence. This file cannot pass as checked in and contains no credentials.
-schema_version = 6
+schema_version = 7
 expected_reap_version = "0.1.0"
 expected_live_executable_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 expected_host_identity_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -123,6 +123,7 @@ fill_collection_manifest = "/secure/evidence/demo-fills-main/manifest.json"
 bill_collection_manifest = "/secure/evidence/demo-bills-main/manifest.json"
 journal = "/secure/evidence/demo-stopped-main.jsonl"
 minimum_trade_bills = 100
+minimum_derivative_close_bills = 25
 minimum_funding_bills = 3
 maximum_trade_bill_delay_ms = 60000
 maximum_funding_bill_delay_ms = 60000
@@ -131,6 +132,8 @@ price_tolerance = 0.0
 quantity_tolerance = 0.000000001
 fee_tolerance = 0.000000000001
 balance_tolerance = 0.0000000001
+trade_pnl_absolute_tolerance = 0.0000000001
+trade_pnl_relative_tolerance = 0.00000001
 funding_pnl_absolute_tolerance = 0.000000000001
 funding_pnl_relative_tolerance = 0.00000001
 funding_mark_absolute_tolerance = 0.00000001

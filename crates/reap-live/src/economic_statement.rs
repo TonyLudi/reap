@@ -1,9 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use reap_core::{FillLiquidity, MarketEvent, NormalizedEvent, PINNED_JAVA_REVISION, Side};
+use reap_core::{
+    FillLiquidity, MarketEvent, NormalizedEvent, PINNED_JAVA_REVISION, Position,
+    PositionMarginMode, Side,
+};
 use reap_storage::{
-    RecoveredStorage, StorageError, StorageRecord, acquire_storage_lease,
+    FillRecord, RecoveredStorage, StorageError, StorageRecord, acquire_storage_lease,
     recover_jsonl_bytes_with_visitor,
 };
 use reap_strategy::{InstrumentConfig, InstrumentKindConfig};
@@ -22,11 +25,12 @@ use crate::{
     verify_fill_collection_manifest_path,
 };
 
-pub const ECONOMIC_RECONCILIATION_SCHEMA_VERSION: u32 = 3;
+pub const ECONOMIC_RECONCILIATION_SCHEMA_VERSION: u32 = 4;
 pub const MAX_ECONOMIC_JOURNAL_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_ECONOMIC_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_ECONOMIC_REPORTED_ISSUES: usize = 1_024;
 pub const MAX_ECONOMIC_FUNDING_SAMPLES: usize = 1_024;
+pub const MAX_ECONOMIC_DERIVATIVE_PNL_SAMPLES: usize = 4_096;
 pub const MAX_TRADE_BILL_DELAY_MS: u64 = 10 * 60 * 1_000;
 pub const MAX_FUNDING_BILL_DELAY_MS: u64 = 10 * 60 * 1_000;
 pub const MAX_FUNDING_MARK_BRACKET_DISTANCE_MS: u64 = 10_000;
@@ -37,6 +41,7 @@ pub struct EconomicReconciliationOptions {
     pub begin_ms: u64,
     pub end_ms: u64,
     pub minimum_trade_bills: u64,
+    pub minimum_derivative_close_bills: u64,
     pub minimum_funding_bills: u64,
     pub maximum_trade_bill_delay_ms: u64,
     pub maximum_funding_bill_delay_ms: u64,
@@ -61,9 +66,13 @@ impl EconomicReconciliationOptions {
                 "begin-ms and end-ms must form a positive inclusive window".to_string(),
             ));
         }
-        if self.minimum_trade_bills == 0 || self.minimum_funding_bills == 0 {
+        if self.minimum_trade_bills == 0
+            || self.minimum_derivative_close_bills == 0
+            || self.minimum_funding_bills == 0
+        {
             return Err(EconomicReconciliationError::InvalidOptions(
-                "minimum trade and funding bill counts must both be positive".to_string(),
+                "minimum trade, derivative-close, and funding bill counts must all be positive"
+                    .to_string(),
             ));
         }
         if self.maximum_trade_bill_delay_ms == 0
@@ -92,6 +101,8 @@ impl EconomicReconciliationOptions {
             ("quantity-abs", self.tolerances.quantity_abs),
             ("fee-abs", self.tolerances.fee_abs),
             ("balance-abs", self.tolerances.balance_abs),
+            ("trade-pnl-abs", self.tolerances.trade_pnl_abs),
+            ("trade-pnl-relative", self.tolerances.trade_pnl_relative),
             ("funding-pnl-abs", self.tolerances.funding_pnl_abs),
             ("funding-pnl-relative", self.tolerances.funding_pnl_relative),
             ("funding-mark-abs", self.tolerances.funding_mark_abs),
@@ -117,6 +128,8 @@ pub struct EconomicReconciliationTolerances {
     pub quantity_abs: f64,
     pub fee_abs: f64,
     pub balance_abs: f64,
+    pub trade_pnl_abs: f64,
+    pub trade_pnl_relative: f64,
     pub funding_pnl_abs: f64,
     pub funding_pnl_relative: f64,
     pub funding_mark_abs: f64,
@@ -145,6 +158,8 @@ pub struct EconomicJournalRecoveryEvidence {
     pub ignored_truncated_tail: bool,
     pub account_bootstrap_records: u64,
     pub runtime_session_records: u64,
+    pub authoritative_account_snapshot_records: u64,
+    pub journal_fill_records: u64,
     pub funding_settlement_records: u64,
     pub position_observation_records: u64,
     pub mark_price_observation_records: u64,
@@ -164,6 +179,8 @@ pub struct EconomicReconciliationCounts {
     pub fills_in_end_guard: u64,
     pub trade_bills_matched: u64,
     pub trade_bills_validated: u64,
+    pub derivative_close_bills: u64,
+    pub derivative_close_bills_recomputed: u64,
     pub eligible_fills_missing_bill: u64,
     pub funding_settlements_total: u64,
     pub funding_settlements_relevant: u64,
@@ -233,6 +250,39 @@ pub struct FundingFormulaSample {
     pub validated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DerivativePnlFormulaSample {
+    pub bill_id: String,
+    pub symbol: String,
+    pub trade_id: String,
+    pub runtime_session_id: String,
+    pub runtime_session_start_line: u64,
+    pub snapshot_line: u64,
+    pub snapshot_time_ms: u64,
+    pub fill_line: u64,
+    pub fill_time_ms: u64,
+    pub inverse: bool,
+    pub currency: String,
+    pub pre_quantity: f64,
+    pub pre_avg_price: f64,
+    pub fill_side: Side,
+    pub fill_price: f64,
+    pub fill_quantity: f64,
+    pub close_quantity: f64,
+    pub contract_value: f64,
+    pub post_quantity: f64,
+    pub post_avg_price: f64,
+    pub expected_sub_type: String,
+    pub observed_sub_type: String,
+    pub expected_pnl: f64,
+    pub observed_pnl: f64,
+    pub absolute_difference: f64,
+    pub relative_difference: f64,
+    pub effective_tolerance: f64,
+    pub validated: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EconomicReconciliationFailure {
@@ -241,6 +291,10 @@ pub enum EconomicReconciliationFailure {
     JournalStrategyMismatch,
     JournalTruncatedTail,
     InvalidOrDuplicateRuntimeSessions,
+    InvalidAuthoritativeAccountSnapshots,
+    TradeJournalFillMismatches,
+    DerivativeOpeningBasisMissingOrInvalid,
+    DerivativePnlFormulaMismatches,
     InvalidOrDuplicateFundingSettlements,
     InvalidOrDuplicateFundingMarks,
     DuplicateFills,
@@ -257,6 +311,7 @@ pub enum EconomicReconciliationFailure {
     FundingMarkMismatches,
     FundingFormulaMismatches,
     MinimumTradeBillsNotMet,
+    MinimumDerivativeCloseBillsNotMet,
     MinimumFundingBillsNotMet,
 }
 
@@ -275,6 +330,7 @@ pub struct EconomicReconciliationReport {
     pub config_fingerprint: String,
     pub window: BillCollectionWindow,
     pub minimum_trade_bills: u64,
+    pub minimum_derivative_close_bills: u64,
     pub minimum_funding_bills: u64,
     pub maximum_trade_bill_delay_ms: u64,
     pub maximum_funding_bill_delay_ms: u64,
@@ -286,6 +342,8 @@ pub struct EconomicReconciliationReport {
     pub fill_collection_manifest: FillCollectionFileEvidence,
     pub bill_collection_manifest: FillCollectionFileEvidence,
     pub counts: EconomicReconciliationCounts,
+    pub derivative_pnl_formula_samples: Vec<DerivativePnlFormulaSample>,
+    pub derivative_pnl_formula_samples_omitted: u64,
     pub funding_formula_samples: Vec<FundingFormulaSample>,
     pub funding_formula_samples_omitted: u64,
     pub issues: Vec<EconomicIssue>,
@@ -369,6 +427,54 @@ struct JournalRuntimeSession {
     account_identity_sha256: String,
 }
 
+#[derive(Debug, Clone)]
+struct JournalAuthoritativeAccountSnapshot {
+    line: u64,
+    event_ts_ms: u64,
+    update_ts_ms: u64,
+    account_id: String,
+    positions: Vec<Position>,
+}
+
+#[derive(Debug, Clone)]
+struct JournalFillObservation {
+    line: u64,
+    fill: FillRecord,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PositionBasis {
+    quantity: f64,
+    avg_price: f64,
+    snapshot_line: u64,
+    snapshot_time_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct JournalDerivativePnlEvidence {
+    fill_line: u64,
+    runtime_session_id: String,
+    runtime_session_start_line: u64,
+    basis: PositionBasis,
+    close_quantity: f64,
+    post_quantity: f64,
+    post_avg_price: f64,
+    expected_sub_type: String,
+    expected_pnl: f64,
+}
+
+#[derive(Debug, Clone)]
+struct JournalTradeEvidence {
+    observation: JournalFillObservation,
+    derivative: Option<JournalDerivativePnlEvidence>,
+}
+
+#[derive(Debug)]
+struct TradeBillValidation {
+    valid: bool,
+    derivative_sample: Option<DerivativePnlFormulaSample>,
+}
+
 #[derive(Debug, Default)]
 struct IssueSink {
     total: u64,
@@ -398,6 +504,8 @@ struct BoundEconomicSources {
     recovered: RecoveredStorage,
     account_bootstrap_records: u64,
     runtime_sessions: Vec<JournalRuntimeSession>,
+    authoritative_account_snapshots: Vec<JournalAuthoritativeAccountSnapshot>,
+    journal_fills: Vec<JournalFillObservation>,
     settlements: Vec<JournalFundingSettlement>,
     position_observations: Vec<JournalPositionObservation>,
     mark_price_observations: Vec<JournalMarkPriceObservation>,
@@ -453,6 +561,8 @@ pub fn reconcile_okx_economics_paths(
         read_input(lease.journal_path(), "journal", MAX_ECONOMIC_JOURNAL_BYTES)?;
     let mut account_bootstrap_records = 0_u64;
     let mut runtime_sessions = Vec::new();
+    let mut authoritative_account_snapshots = Vec::new();
+    let mut journal_fills = Vec::new();
     let mut settlements = Vec::new();
     let mut position_observations = Vec::new();
     let mut mark_price_observations = Vec::new();
@@ -468,6 +578,19 @@ pub fn reconcile_okx_economics_paths(
             strategy_name: session.strategy_name.clone(),
             config_fingerprint: session.config_fingerprint.clone(),
             account_identity_sha256: session.account_identity_sha256.clone(),
+        }),
+        StorageRecord::AccountSnapshot(snapshot) => {
+            authoritative_account_snapshots.push(JournalAuthoritativeAccountSnapshot {
+                line,
+                event_ts_ms: snapshot.ts_ms,
+                update_ts_ms: snapshot.update.ts_ms,
+                account_id: snapshot.account_id.clone(),
+                positions: snapshot.update.positions.clone(),
+            });
+        }
+        StorageRecord::Fill(fill) => journal_fills.push(JournalFillObservation {
+            line,
+            fill: fill.clone(),
         }),
         StorageRecord::Normalized(NormalizedEvent::Market(MarketEvent::FundingRate {
             ts_ms,
@@ -516,6 +639,8 @@ pub fn reconcile_okx_economics_paths(
         recovered,
         account_bootstrap_records,
         runtime_sessions,
+        authoritative_account_snapshots,
+        journal_fills,
         settlements,
         position_observations,
         mark_price_observations,
@@ -632,6 +757,13 @@ fn build_report(
     }
 
     let valid_runtime_sessions = validate_runtime_sessions(&sources, &mut failures, &mut issues);
+    let journal_trade_evidence = build_journal_trade_evidence(
+        &sources,
+        &valid_runtime_sessions,
+        &options,
+        &mut failures,
+        &mut issues,
+    );
     let valid_settlements = validate_funding_settlements(
         &sources,
         &valid_runtime_sessions,
@@ -648,6 +780,8 @@ fn build_report(
     );
     let mut trade_bill_keys = BTreeSet::new();
     let mut matched_fill_keys = BTreeSet::new();
+    let mut derivative_pnl_samples = Vec::new();
+    let mut derivative_pnl_samples_omitted = 0_u64;
     let mut funding_samples = Vec::new();
     let mut funding_samples_omitted = 0_u64;
 
@@ -687,17 +821,41 @@ fn build_report(
                     continue;
                 };
                 counts.trade_bills_matched += 1;
-                matched_fill_keys.insert(key);
-                if validate_trade_bill(
+                matched_fill_keys.insert(key.clone());
+                if instrument(&sources.config, &bill.symbol).is_some_and(|instrument| {
+                    instrument.kind.is_derivative() && matches!(bill.sub_type.as_str(), "5" | "6")
+                }) {
+                    counts.derivative_close_bills += 1;
+                }
+                let validation = validate_trade_bill(
                     bill,
                     fill,
+                    journal_trade_evidence
+                        .get(&key)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
                     &sources.config,
                     &sources.account_id,
                     &options,
                     &mut failures,
                     &mut issues,
-                ) {
+                );
+                if validation.valid {
                     counts.trade_bills_validated += 1;
+                }
+                if let Some(sample) = validation.derivative_sample {
+                    if validation.valid
+                        && sample.close_quantity > options.tolerances.quantity_abs
+                        && sample.validated
+                    {
+                        counts.derivative_close_bills_recomputed += 1;
+                    }
+                    if derivative_pnl_samples.len() < MAX_ECONOMIC_DERIVATIVE_PNL_SAMPLES {
+                        derivative_pnl_samples.push(sample);
+                    } else {
+                        derivative_pnl_samples_omitted =
+                            derivative_pnl_samples_omitted.saturating_add(1);
+                    }
                 }
             }
             "8" => {
@@ -770,6 +928,9 @@ fn build_report(
     if counts.trade_bills_validated < options.minimum_trade_bills {
         failures.insert(EconomicReconciliationFailure::MinimumTradeBillsNotMet);
     }
+    if counts.derivative_close_bills_recomputed < options.minimum_derivative_close_bills {
+        failures.insert(EconomicReconciliationFailure::MinimumDerivativeCloseBillsNotMet);
+    }
     if counts.funding_bills_validated < options.minimum_funding_bills {
         failures.insert(EconomicReconciliationFailure::MinimumFundingBillsNotMet);
     }
@@ -792,6 +953,7 @@ fn build_report(
         config_fingerprint: sources.config_fingerprint,
         window: sources.window,
         minimum_trade_bills: options.minimum_trade_bills,
+        minimum_derivative_close_bills: options.minimum_derivative_close_bills,
         minimum_funding_bills: options.minimum_funding_bills,
         maximum_trade_bill_delay_ms: options.maximum_trade_bill_delay_ms,
         maximum_funding_bill_delay_ms: options.maximum_funding_bill_delay_ms,
@@ -805,6 +967,10 @@ fn build_report(
             ignored_truncated_tail: sources.recovered.ignored_truncated_tail,
             account_bootstrap_records: sources.account_bootstrap_records,
             runtime_session_records: sources.runtime_sessions.len() as u64,
+            authoritative_account_snapshot_records: sources
+                .authoritative_account_snapshots
+                .len() as u64,
+            journal_fill_records: sources.journal_fills.len() as u64,
             funding_settlement_records: sources.settlements.len() as u64,
             position_observation_records: sources.position_observations.len() as u64,
             mark_price_observation_records: sources.mark_price_observations.len() as u64,
@@ -813,12 +979,15 @@ fn build_report(
         fill_collection_manifest: sources.fill_manifest_file,
         bill_collection_manifest: sources.bill_manifest_file,
         counts,
+        derivative_pnl_formula_samples: derivative_pnl_samples,
+        derivative_pnl_formula_samples_omitted: derivative_pnl_samples_omitted,
         funding_formula_samples: funding_samples,
         funding_formula_samples_omitted: funding_samples_omitted,
         issues: issues.issues,
         issues_truncated,
         limitations: vec![
-            "realized trade PnL is checked against each derivative bill's balance equation but is not independently recomputed because the journal does not yet retain an attested opening cost basis".to_string(),
+            "derivative close PnL is reconstructed from same-session authoritative REST avgPx snapshots and every intervening critical journal fill; the snapshot exchange timestamp must strictly precede every replayed fill".to_string(),
+            "expiry-futures avgPx can reset at settlement; controlled evidence windows containing unsupported settlement bills fail, but dedicated settlement-PnL reconstruction remains out of scope".to_string(),
             "funding checks the bill-reported mark against journaled observations bracketing the exchange-reported assessment time; the exact internal venue assessment tick is not reproduced".to_string(),
             "runtime-session boundaries are locally journaled provenance that prevents cross-restart evidence composition; they are not remote process attestation".to_string(),
             "settlements with no funding bill are not failures because a zero position legitimately produces no balance change; minimum matched funding evidence is required instead".to_string(),
@@ -991,6 +1160,419 @@ fn runtime_session_for_line<'a>(
         .max_by_key(|session| session.line)
 }
 
+fn build_journal_trade_evidence(
+    sources: &BoundEconomicSources,
+    runtime_sessions: &[&JournalRuntimeSession],
+    options: &EconomicReconciliationOptions,
+    failures: &mut BTreeSet<EconomicReconciliationFailure>,
+    issues: &mut IssueSink,
+) -> BTreeMap<(String, String), Vec<JournalTradeEvidence>> {
+    enum TimelineEvent<'a> {
+        Snapshot(&'a JournalAuthoritativeAccountSnapshot),
+        Fill(&'a JournalFillObservation),
+    }
+
+    impl TimelineEvent<'_> {
+        fn line(&self) -> u64 {
+            match self {
+                Self::Snapshot(snapshot) => snapshot.line,
+                Self::Fill(fill) => fill.line,
+            }
+        }
+    }
+
+    let mut timeline = sources
+        .authoritative_account_snapshots
+        .iter()
+        .map(TimelineEvent::Snapshot)
+        .chain(sources.journal_fills.iter().map(TimelineEvent::Fill))
+        .collect::<Vec<_>>();
+    timeline.sort_by_key(TimelineEvent::line);
+    let mut verified_fills = BTreeMap::<(String, String), Vec<&RemoteFill>>::new();
+    for fill in &sources.fills {
+        verified_fills
+            .entry((fill.symbol.clone(), fill.fill_id.clone()))
+            .or_default()
+            .push(fill);
+    }
+
+    let mut state_session_id = None::<String>;
+    let mut positions = BTreeMap::<String, PositionBasis>::new();
+    let mut by_key = BTreeMap::<(String, String), Vec<JournalTradeEvidence>>::new();
+    let mut seen_fill_keys = BTreeSet::new();
+
+    for event in timeline {
+        match event {
+            TimelineEvent::Snapshot(snapshot) => {
+                if snapshot.account_id != sources.account_id {
+                    continue;
+                }
+                let Some(session) =
+                    runtime_session_for_line(runtime_sessions, &sources.account_id, snapshot.line)
+                else {
+                    push_invalid_snapshot_issue(
+                        snapshot,
+                        "same-account runtime session before the snapshot",
+                        "missing",
+                        failures,
+                        issues,
+                    );
+                    state_session_id = None;
+                    positions.clear();
+                    continue;
+                };
+                if session.account_identity_sha256 != sources.account_identity_sha256 {
+                    push_invalid_snapshot_issue(
+                        snapshot,
+                        "runtime session with the exact collected account identity",
+                        &session.account_identity_sha256,
+                        failures,
+                        issues,
+                    );
+                    state_session_id = None;
+                    positions.clear();
+                    continue;
+                }
+                if snapshot.event_ts_ms == 0 || snapshot.event_ts_ms != snapshot.update_ts_ms {
+                    push_invalid_snapshot_issue(
+                        snapshot,
+                        "matching positive record/update timestamps",
+                        &format!(
+                            "record={}, update={}",
+                            snapshot.event_ts_ms, snapshot.update_ts_ms
+                        ),
+                        failures,
+                        issues,
+                    );
+                    state_session_id = None;
+                    positions.clear();
+                    continue;
+                }
+
+                let mut snapshot_positions = BTreeMap::new();
+                let mut invalid = None;
+                for position in &snapshot.positions {
+                    let configured = instrument(&sources.config, &position.symbol);
+                    let owned = sources
+                        .config
+                        .account_for_symbol(&position.symbol)
+                        .is_some_and(|account| account.id == sources.account_id);
+                    let margin_mode_valid = if position.qty == 0.0 {
+                        true
+                    } else {
+                        matches!(
+                            (
+                                expected_bill_margin_mode(
+                                    &sources.config,
+                                    &sources.account_id,
+                                    &position.symbol,
+                                ),
+                                position.margin_mode,
+                            ),
+                            (
+                                Some(OkxBillMarginMode::Cross),
+                                Some(PositionMarginMode::Cross)
+                            ) | (
+                                Some(OkxBillMarginMode::Isolated),
+                                Some(PositionMarginMode::Isolated)
+                            )
+                        )
+                    };
+                    if position.symbol.is_empty()
+                        || !position.qty.is_finite()
+                        || !position.avg_price.is_finite()
+                        || (position.qty != 0.0
+                            && (!owned
+                                || !margin_mode_valid
+                                || !configured.is_some_and(|instrument| {
+                                    instrument.kind.is_derivative() && position.avg_price > 0.0
+                                })))
+                    {
+                        invalid = Some(format!(
+                            "invalid position {} qty={} avgPx={}",
+                            position.symbol, position.qty, position.avg_price
+                        ));
+                        break;
+                    }
+                    if snapshot_positions
+                        .insert(position.symbol.clone(), position)
+                        .is_some()
+                    {
+                        invalid = Some(format!("duplicate position {}", position.symbol));
+                        break;
+                    }
+                }
+                if let Some(invalid) = invalid {
+                    push_invalid_snapshot_issue(
+                        snapshot,
+                        "unique finite configured derivative positions with positive avgPx when non-zero",
+                        &invalid,
+                        failures,
+                        issues,
+                    );
+                    state_session_id = None;
+                    positions.clear();
+                    continue;
+                }
+
+                positions.clear();
+                for configured in sources.config.instruments_for_account(&sources.account_id) {
+                    if !configured.kind.is_derivative() {
+                        continue;
+                    }
+                    let (quantity, avg_price) =
+                        snapshot_positions
+                            .get(&configured.symbol)
+                            .map_or((0.0, 0.0), |position| {
+                                if position.qty == 0.0 {
+                                    (0.0, 0.0)
+                                } else {
+                                    (position.qty, position.avg_price)
+                                }
+                            });
+                    positions.insert(
+                        configured.symbol.clone(),
+                        PositionBasis {
+                            quantity,
+                            avg_price,
+                            snapshot_line: snapshot.line,
+                            snapshot_time_ms: snapshot.event_ts_ms,
+                        },
+                    );
+                }
+                state_session_id = Some(session.session_id.clone());
+            }
+            TimelineEvent::Fill(observation) => {
+                if observation.fill.account_id.as_deref() != Some(sources.account_id.as_str()) {
+                    continue;
+                }
+                let fill_key = (
+                    observation.fill.symbol.clone(),
+                    observation.fill.fill_id.clone(),
+                );
+                if observation.fill.fill_id.is_empty() || !seen_fill_keys.insert(fill_key.clone()) {
+                    issues.push(
+                        EconomicReconciliationFailure::TradeJournalFillMismatches,
+                        issue(
+                            EconomicIssueSource::Journal,
+                            None,
+                            Some(&observation.fill.symbol),
+                            (!observation.fill.fill_id.is_empty())
+                                .then_some(observation.fill.fill_id.as_str()),
+                            "journal_fill_identity",
+                            "unique non-empty (symbol, fill_id) for the account",
+                            &format!("duplicate or empty at line {}", observation.line),
+                            "critical fill journal contains an ambiguous trade identity",
+                        ),
+                        failures,
+                    );
+                    positions.remove(&observation.fill.symbol);
+                    by_key
+                        .entry(fill_key)
+                        .or_default()
+                        .push(JournalTradeEvidence {
+                            observation: observation.clone(),
+                            derivative: None,
+                        });
+                    continue;
+                }
+                let session = runtime_session_for_line(
+                    runtime_sessions,
+                    &sources.account_id,
+                    observation.line,
+                );
+                if state_session_id.as_deref() != session.map(|session| session.session_id.as_str())
+                {
+                    state_session_id = None;
+                    positions.clear();
+                }
+                let derivative_instrument = instrument(&sources.config, &observation.fill.symbol)
+                    .filter(|instrument| instrument.kind.is_derivative());
+                let derivative = derivative_instrument.and_then(|instrument| {
+                    let session = session?;
+                    let basis = *positions.get(&observation.fill.symbol)?;
+                    let [exchange_fill] = verified_fills.get(&fill_key)?.as_slice() else {
+                        return None;
+                    };
+                    if basis.snapshot_time_ms >= observation.fill.ts_ms
+                        || exchange_fill.ts_ms != observation.fill.ts_ms
+                        || exchange_fill.side != observation.fill.side
+                        || !close_abs(
+                            exchange_fill.price,
+                            observation.fill.price,
+                            options.tolerances.price_abs,
+                        )
+                        || !close_abs(
+                            exchange_fill.qty,
+                            observation.fill.qty,
+                            options.tolerances.quantity_abs,
+                        )
+                    {
+                        return None;
+                    }
+                    let calculation = apply_derivative_fill(
+                        basis,
+                        &observation.fill,
+                        instrument,
+                        options.tolerances.quantity_abs,
+                    )?;
+                    positions.insert(
+                        observation.fill.symbol.clone(),
+                        PositionBasis {
+                            quantity: calculation.post_quantity,
+                            avg_price: calculation.post_avg_price,
+                            ..basis
+                        },
+                    );
+                    Some(JournalDerivativePnlEvidence {
+                        fill_line: observation.line,
+                        runtime_session_id: session.session_id.clone(),
+                        runtime_session_start_line: session.line,
+                        basis,
+                        close_quantity: calculation.close_quantity,
+                        post_quantity: calculation.post_quantity,
+                        post_avg_price: calculation.post_avg_price,
+                        expected_sub_type: calculation.expected_sub_type,
+                        expected_pnl: calculation.expected_pnl,
+                    })
+                });
+                if derivative_instrument.is_some() && derivative.is_none() {
+                    positions.remove(&observation.fill.symbol);
+                }
+                by_key
+                    .entry(fill_key)
+                    .or_default()
+                    .push(JournalTradeEvidence {
+                        observation: observation.clone(),
+                        derivative,
+                    });
+            }
+        }
+    }
+    by_key
+}
+
+struct DerivativeFillCalculation {
+    close_quantity: f64,
+    post_quantity: f64,
+    post_avg_price: f64,
+    expected_sub_type: String,
+    expected_pnl: f64,
+}
+
+fn apply_derivative_fill(
+    basis: PositionBasis,
+    fill: &FillRecord,
+    instrument: &InstrumentConfig,
+    quantity_tolerance: f64,
+) -> Option<DerivativeFillCalculation> {
+    if !basis.quantity.is_finite()
+        || !basis.avg_price.is_finite()
+        || !fill.price.is_finite()
+        || fill.price <= 0.0
+        || !fill.qty.is_finite()
+        || fill.qty <= 0.0
+        || !instrument.contract_value.is_finite()
+        || instrument.contract_value <= 0.0
+    {
+        return None;
+    }
+    let pre_quantity = if basis.quantity.abs() <= quantity_tolerance {
+        0.0
+    } else {
+        basis.quantity
+    };
+    if pre_quantity != 0.0 && basis.avg_price <= 0.0 {
+        return None;
+    }
+    let delta = match fill.side {
+        Side::Buy => fill.qty,
+        Side::Sell => -fill.qty,
+    };
+    let closes_position = pre_quantity != 0.0 && pre_quantity.signum() != delta.signum();
+    let close_quantity = if closes_position {
+        pre_quantity.abs().min(fill.qty)
+    } else {
+        0.0
+    };
+    let expected_sub_type = match (closes_position, pre_quantity.is_sign_positive(), fill.side) {
+        (true, true, Side::Sell) => "5",
+        (true, false, Side::Buy) => "6",
+        (false, _, Side::Buy) => "3",
+        (false, _, Side::Sell) => "4",
+        _ => return None,
+    }
+    .to_string();
+    let expected_pnl = if close_quantity == 0.0 {
+        0.0
+    } else if instrument.kind.is_inverse() {
+        pre_quantity.signum()
+            * (1.0 / basis.avg_price - 1.0 / fill.price)
+            * close_quantity
+            * instrument.contract_value
+    } else {
+        pre_quantity.signum()
+            * (fill.price - basis.avg_price)
+            * close_quantity
+            * instrument.contract_value
+    };
+
+    let raw_post_quantity = pre_quantity + delta;
+    let post_quantity = if raw_post_quantity.abs() <= quantity_tolerance {
+        0.0
+    } else {
+        raw_post_quantity
+    };
+    let post_avg_price = if post_quantity == 0.0 {
+        0.0
+    } else if pre_quantity == 0.0 || pre_quantity.signum() != post_quantity.signum() {
+        fill.price
+    } else if post_quantity.abs() < pre_quantity.abs() {
+        basis.avg_price
+    } else if instrument.kind.is_inverse() {
+        let base_value = pre_quantity.abs() / basis.avg_price + fill.qty / fill.price;
+        if base_value <= 0.0 || !base_value.is_finite() {
+            return None;
+        }
+        post_quantity.abs() / base_value
+    } else {
+        (basis.avg_price * pre_quantity.abs() + fill.price * fill.qty) / post_quantity.abs()
+    };
+    if !expected_pnl.is_finite() || !post_avg_price.is_finite() || post_avg_price < 0.0 {
+        return None;
+    }
+    Some(DerivativeFillCalculation {
+        close_quantity,
+        post_quantity,
+        post_avg_price,
+        expected_sub_type,
+        expected_pnl,
+    })
+}
+
+fn push_invalid_snapshot_issue(
+    snapshot: &JournalAuthoritativeAccountSnapshot,
+    expected: &str,
+    observed: &str,
+    failures: &mut BTreeSet<EconomicReconciliationFailure>,
+    issues: &mut IssueSink,
+) {
+    issues.push(
+        EconomicReconciliationFailure::InvalidAuthoritativeAccountSnapshots,
+        issue(
+            EconomicIssueSource::Journal,
+            None,
+            None,
+            None,
+            "authoritative_account_snapshot",
+            expected,
+            &format!("line {}: {observed}", snapshot.line),
+            "journaled REST account snapshot cannot establish an opening-cost basis",
+        ),
+        failures,
+    );
+}
+
 fn validate_funding_settlements<'a>(
     sources: &'a BoundEconomicSources,
     runtime_sessions: &[&JournalRuntimeSession],
@@ -1139,12 +1721,13 @@ fn validate_funding_mark_prices<'a>(
 fn validate_trade_bill(
     bill: &OkxBill,
     fill: &RemoteFill,
+    journal_candidates: &[JournalTradeEvidence],
     config: &LiveConfig,
     account_id: &str,
     options: &EconomicReconciliationOptions,
     failures: &mut BTreeSet<EconomicReconciliationFailure>,
     issues: &mut IssueSink,
-) -> bool {
+) -> TradeBillValidation {
     let before = issues.total;
     let Some(instrument) = instrument(config, &bill.symbol) else {
         push_bill_issue(
@@ -1157,8 +1740,13 @@ fn validate_trade_bill(
             &bill.symbol,
             "trade bill references an instrument outside the exact live config",
         );
-        return false;
+        return TradeBillValidation {
+            valid: false,
+            derivative_sample: None,
+        };
     };
+    let journal_trade =
+        validate_journal_trade_fill(bill, fill, journal_candidates, options, failures, issues);
     let expected_side = trade_subtype_side(&bill.sub_type);
     if expected_side.is_none()
         || (instrument.kind.is_spot() && !matches!(bill.sub_type.as_str(), "1" | "2"))
@@ -1486,7 +2074,273 @@ fn validate_trade_bill(
             "trade bill balance change cannot be checked for internal consistency",
         );
     }
-    before == issues.total
+    let derivative_sample = if instrument.kind.is_derivative() {
+        validate_derivative_trade_pnl(
+            bill,
+            fill,
+            journal_trade,
+            instrument,
+            options,
+            failures,
+            issues,
+        )
+    } else {
+        None
+    };
+    TradeBillValidation {
+        valid: before == issues.total,
+        derivative_sample,
+    }
+}
+
+fn validate_journal_trade_fill<'a>(
+    bill: &OkxBill,
+    fill: &RemoteFill,
+    candidates: &'a [JournalTradeEvidence],
+    options: &EconomicReconciliationOptions,
+    failures: &mut BTreeSet<EconomicReconciliationFailure>,
+    issues: &mut IssueSink,
+) -> Option<&'a JournalTradeEvidence> {
+    let [candidate] = candidates else {
+        issues.push(
+            EconomicReconciliationFailure::TradeJournalFillMismatches,
+            issue_for_bill(
+                EconomicIssueSource::Journal,
+                bill,
+                "journal_fill",
+                "exactly one same-account critical fill record",
+                &format!("{} candidates", candidates.len()),
+                "verified exchange fill cannot be bound to one durable runtime fill",
+            ),
+            failures,
+        );
+        return None;
+    };
+    let journal = &candidate.observation.fill;
+    let mut valid = true;
+    let mut compare = |field: &str, matches: bool, expected: String, observed: String| {
+        if !matches {
+            valid = false;
+            issues.push(
+                EconomicReconciliationFailure::TradeJournalFillMismatches,
+                issue_for_bill(
+                    EconomicIssueSource::Journal,
+                    bill,
+                    field,
+                    &expected,
+                    &observed,
+                    "critical journal fill does not match the independently collected exchange fill",
+                ),
+                failures,
+            );
+        }
+    };
+    compare(
+        "journal_fill_time",
+        journal.ts_ms == fill.ts_ms,
+        fill.ts_ms.to_string(),
+        journal.ts_ms.to_string(),
+    );
+    compare(
+        "journal_order_id",
+        journal.order_id == fill.exchange_order_id
+            || (!fill.client_order_id.is_empty() && journal.order_id == fill.client_order_id),
+        format!("{} or {}", fill.exchange_order_id, fill.client_order_id),
+        journal.order_id.clone(),
+    );
+    compare(
+        "journal_side",
+        journal.side == fill.side,
+        side_name(fill.side).to_string(),
+        side_name(journal.side).to_string(),
+    );
+    compare(
+        "journal_price",
+        close_abs(journal.price, fill.price, options.tolerances.price_abs),
+        fill.price.to_string(),
+        journal.price.to_string(),
+    );
+    compare(
+        "journal_quantity",
+        close_abs(journal.qty, fill.qty, options.tolerances.quantity_abs),
+        fill.qty.to_string(),
+        journal.qty.to_string(),
+    );
+    compare(
+        "journal_liquidity",
+        journal.liquidity == Some(fill.liquidity),
+        execution_name(match fill.liquidity {
+            FillLiquidity::Maker => OkxBillExecutionType::Maker,
+            FillLiquidity::Taker => OkxBillExecutionType::Taker,
+        })
+        .to_string(),
+        journal
+            .liquidity
+            .map(|liquidity| match liquidity {
+                FillLiquidity::Maker => "maker",
+                FillLiquidity::Taker => "taker",
+            })
+            .unwrap_or("missing")
+            .to_string(),
+    );
+    match (&fill.fee, &journal.fee) {
+        (Some(expected), Some(observed)) => {
+            compare(
+                "journal_fee_currency",
+                expected
+                    .currency
+                    .trim()
+                    .eq_ignore_ascii_case(observed.currency.trim()),
+                expected.currency.trim().to_ascii_uppercase(),
+                observed.currency.trim().to_ascii_uppercase(),
+            );
+            compare(
+                "journal_fee",
+                close_abs(expected.amount, observed.amount, options.tolerances.fee_abs),
+                expected.amount.to_string(),
+                observed.amount.to_string(),
+            );
+        }
+        _ => compare(
+            "journal_fee",
+            false,
+            "exact signed fee on collection and journal".to_string(),
+            "missing".to_string(),
+        ),
+    }
+    valid.then_some(candidate)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_derivative_trade_pnl(
+    bill: &OkxBill,
+    fill: &RemoteFill,
+    journal_trade: Option<&JournalTradeEvidence>,
+    instrument: &InstrumentConfig,
+    options: &EconomicReconciliationOptions,
+    failures: &mut BTreeSet<EconomicReconciliationFailure>,
+    issues: &mut IssueSink,
+) -> Option<DerivativePnlFormulaSample> {
+    let journal_trade = journal_trade?;
+    let Some(evidence) = journal_trade.derivative.as_ref() else {
+        issues.push(
+            EconomicReconciliationFailure::DerivativeOpeningBasisMissingOrInvalid,
+            issue_for_bill(
+                EconomicIssueSource::Journal,
+                bill,
+                "opening_basis",
+                "same-session authoritative REST avgPx snapshot before the critical fill",
+                "missing or invalid",
+                "derivative PnL cannot be independently reconstructed from the stopped journal",
+            ),
+            failures,
+        );
+        return None;
+    };
+    if evidence.basis.snapshot_line <= evidence.runtime_session_start_line
+        || evidence.basis.snapshot_line >= evidence.fill_line
+        || evidence.basis.snapshot_time_ms >= fill.ts_ms
+    {
+        issues.push(
+            EconomicReconciliationFailure::DerivativeOpeningBasisMissingOrInvalid,
+            issue_for_bill(
+                EconomicIssueSource::Journal,
+                bill,
+                "opening_basis_order",
+                "same-session snapshot line/time before fill line/time",
+                &format!(
+                    "session_line={}, snapshot_line={}, snapshot_ts={}, fill_line={}, fill_ts={}",
+                    evidence.runtime_session_start_line,
+                    evidence.basis.snapshot_line,
+                    evidence.basis.snapshot_time_ms,
+                    evidence.fill_line,
+                    fill.ts_ms
+                ),
+                "authoritative position basis is not causally ordered before the target fill",
+            ),
+            failures,
+        );
+        return None;
+    }
+    let Some(observed_pnl) = bill.pnl.filter(|pnl| pnl.is_finite()) else {
+        push_bill_issue(
+            failures,
+            issues,
+            EconomicReconciliationFailure::InvalidTradeBills,
+            bill,
+            "pnl",
+            "finite derivative trade PnL",
+            &format!("{:?}", bill.pnl),
+            "derivative trade bill does not expose a finite realized-PnL value",
+        );
+        return None;
+    };
+    let subtype_valid = bill.sub_type == evidence.expected_sub_type;
+    if !subtype_valid {
+        push_bill_issue(
+            failures,
+            issues,
+            EconomicReconciliationFailure::DerivativePnlFormulaMismatches,
+            bill,
+            "subType",
+            &evidence.expected_sub_type,
+            &bill.sub_type,
+            "bill open/close direction contradicts the journal-reconstructed pre-fill position",
+        );
+    }
+    let absolute_difference = (evidence.expected_pnl - observed_pnl).abs();
+    let scale = evidence.expected_pnl.abs().max(observed_pnl.abs());
+    let relative_difference = absolute_difference / scale.max(f64::MIN_POSITIVE);
+    let effective_tolerance = options
+        .tolerances
+        .trade_pnl_abs
+        .max(options.tolerances.trade_pnl_relative * evidence.expected_pnl.abs());
+    let formula_valid = evidence.expected_pnl.is_finite()
+        && absolute_difference.is_finite()
+        && effective_tolerance.is_finite()
+        && absolute_difference <= effective_tolerance;
+    if !formula_valid {
+        push_bill_issue(
+            failures,
+            issues,
+            EconomicReconciliationFailure::DerivativePnlFormulaMismatches,
+            bill,
+            "pnl_formula",
+            &format!("{} +/- {}", evidence.expected_pnl, effective_tolerance),
+            &observed_pnl.to_string(),
+            "derivative trade PnL does not match the attested opening basis and configured contract formula",
+        );
+    }
+    Some(DerivativePnlFormulaSample {
+        bill_id: bill.bill_id.clone(),
+        symbol: bill.symbol.clone(),
+        trade_id: bill.trade_id.clone(),
+        runtime_session_id: evidence.runtime_session_id.clone(),
+        runtime_session_start_line: evidence.runtime_session_start_line,
+        snapshot_line: evidence.basis.snapshot_line,
+        snapshot_time_ms: evidence.basis.snapshot_time_ms,
+        fill_line: evidence.fill_line,
+        fill_time_ms: fill.ts_ms,
+        inverse: instrument.kind.is_inverse(),
+        currency: instrument.settle_currency.trim().to_ascii_uppercase(),
+        pre_quantity: evidence.basis.quantity,
+        pre_avg_price: evidence.basis.avg_price,
+        fill_side: fill.side,
+        fill_price: fill.price,
+        fill_quantity: fill.qty,
+        close_quantity: evidence.close_quantity,
+        contract_value: instrument.contract_value,
+        post_quantity: evidence.post_quantity,
+        post_avg_price: evidence.post_avg_price,
+        expected_sub_type: evidence.expected_sub_type.clone(),
+        observed_sub_type: bill.sub_type.clone(),
+        expected_pnl: evidence.expected_pnl,
+        observed_pnl,
+        absolute_difference,
+        relative_difference,
+        effective_tolerance,
+        validated: subtype_valid && formula_valid,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2381,6 +3235,7 @@ mod tests {
             begin_ms: BEGIN_MS,
             end_ms: END_MS,
             minimum_trade_bills: 1,
+            minimum_derivative_close_bills: 1,
             minimum_funding_bills: 1,
             maximum_trade_bill_delay_ms: 10_000,
             maximum_funding_bill_delay_ms: 10_000,
@@ -2390,6 +3245,8 @@ mod tests {
                 quantity_abs: 1e-9,
                 fee_abs: 1e-12,
                 balance_abs: 1e-12,
+                trade_pnl_abs: 1e-12,
+                trade_pnl_relative: 1e-12,
                 funding_pnl_abs: 1e-12,
                 funding_pnl_relative: 1e-12,
                 funding_mark_abs: 0.0,
@@ -2412,12 +3269,12 @@ mod tests {
             exchange_order_id: "exchange-1".to_string(),
             client_order_id: "reap-1".to_string(),
             symbol: "BTC-USDT-SWAP".to_string(),
-            side: Side::Buy,
+            side: Side::Sell,
             price: 50_000.0,
-            qty: 10.0,
+            qty: 2.0,
             liquidity: FillLiquidity::Taker,
             fee: Some(FillFee {
-                amount: -2.5,
+                amount: -0.5,
                 currency: "USDT".to_string(),
             }),
             ts_ms: TRADE_MS,
@@ -2428,17 +3285,17 @@ mod tests {
         OkxBill {
             bill_id: "bill-trade".to_string(),
             bill_type: "2".to_string(),
-            sub_type: "3".to_string(),
+            sub_type: "5".to_string(),
             timestamp_ms: TRADE_MS + 1,
             currency: "USDT".to_string(),
-            balance_change: -2.5,
+            balance_change: 19.5,
             balance: Some(1_000.0),
             position_balance_change: Some(0.0),
             position_balance: Some(0.0),
-            quantity: Some(10.0),
+            quantity: Some(2.0),
             price: Some(50_000.0),
-            pnl: Some(0.0),
-            fee: Some(-2.5),
+            pnl: Some(20.0),
+            fee: Some(-0.5),
             interest: Some(0.0),
             instrument_type: Some(OkxInstrumentType::Swap),
             symbol: "BTC-USDT-SWAP".to_string(),
@@ -2461,13 +3318,13 @@ mod tests {
             sub_type: "173".to_string(),
             timestamp_ms: FUNDING_MS + 100,
             currency: "USDT".to_string(),
-            balance_change: -5.0,
+            balance_change: -4.0,
             balance: Some(995.0),
             position_balance_change: Some(0.0),
             position_balance: Some(0.0),
-            quantity: Some(10.0),
+            quantity: Some(8.0),
             price: Some(50_000.0),
-            pnl: Some(-5.0),
+            pnl: Some(-4.0),
             fee: Some(0.0),
             interest: Some(0.0),
             instrument_type: Some(OkxInstrumentType::Swap),
@@ -2489,7 +3346,7 @@ mod tests {
         let fingerprint = config.fingerprint().unwrap();
         let strategy_name = config.strategy.strategy_name.clone();
         let mut recovered = RecoveredStorage {
-            records: 7,
+            records: 9,
             ..RecoveredStorage::default()
         };
         recovered.bootstrap_identities.insert(
@@ -2512,8 +3369,38 @@ mod tests {
                 config_fingerprint: fingerprint.clone(),
                 account_identity_sha256: "b".repeat(64),
             }],
-            settlements: vec![JournalFundingSettlement {
+            authoritative_account_snapshots: vec![JournalAuthoritativeAccountSnapshot {
+                line: 3,
+                event_ts_ms: TRADE_MS - 100,
+                update_ts_ms: TRADE_MS - 100,
+                account_id: "main".to_string(),
+                positions: vec![Position {
+                    symbol: "BTC-USDT-SWAP".to_string(),
+                    qty: 10.0,
+                    avg_price: 49_000.0,
+                    margin_mode: Some(reap_core::PositionMarginMode::Cross),
+                }],
+            }],
+            journal_fills: vec![JournalFillObservation {
                 line: 4,
+                fill: FillRecord {
+                    ts_ms: TRADE_MS,
+                    account_id: Some("main".to_string()),
+                    fill_id: "trade-1".to_string(),
+                    order_id: "reap-1".to_string(),
+                    symbol: "BTC-USDT-SWAP".to_string(),
+                    side: Side::Sell,
+                    price: 50_000.0,
+                    qty: 2.0,
+                    liquidity: Some(FillLiquidity::Taker),
+                    fee: Some(FillFee {
+                        amount: -0.5,
+                        currency: "USDT".to_string(),
+                    }),
+                },
+            }],
+            settlements: vec![JournalFundingSettlement {
+                line: 6,
                 event_ts_ms: FUNDING_MS + 50,
                 symbol: "BTC-USDT-SWAP".to_string(),
                 funding_time_ms: FUNDING_MS,
@@ -2521,27 +3408,27 @@ mod tests {
             }],
             position_observations: vec![
                 JournalPositionObservation {
-                    line: 3,
+                    line: 5,
                     event_ts_ms: FUNDING_MS - 100,
                     symbol: "BTC-USDT-SWAP".to_string(),
                     quantity: 9.0,
                 },
                 JournalPositionObservation {
-                    line: 5,
+                    line: 7,
                     event_ts_ms: FUNDING_MS + 75,
                     symbol: "BTC-USDT-SWAP".to_string(),
-                    quantity: 10.0,
+                    quantity: 8.0,
                 },
             ],
             mark_price_observations: vec![
                 JournalMarkPriceObservation {
-                    line: 6,
+                    line: 8,
                     event_ts_ms: FUNDING_MS + 90,
                     symbol: "BTC-USDT-SWAP".to_string(),
                     price: 50_000.0,
                 },
                 JournalMarkPriceObservation {
-                    line: 7,
+                    line: 9,
                     event_ts_ms: FUNDING_MS + 110,
                     symbol: "BTC-USDT-SWAP".to_string(),
                     price: 50_000.0,
@@ -2570,25 +3457,34 @@ mod tests {
         assert!(report.passed, "{:?}", report.issues);
         assert!(report.failures.is_empty());
         assert_eq!(report.counts.trade_bills_validated, 1);
+        assert_eq!(report.counts.derivative_close_bills_recomputed, 1);
         assert_eq!(report.counts.funding_bills_validated, 1);
         assert_eq!(report.counts.eligible_fills_missing_bill, 0);
         assert_eq!(report.funding_formula_samples.len(), 1);
+        assert_eq!(report.derivative_pnl_formula_samples.len(), 1);
+        assert_eq!(
+            report
+                .journal_recovery
+                .authoritative_account_snapshot_records,
+            1
+        );
+        assert_eq!(report.journal_recovery.journal_fill_records, 1);
         assert_eq!(report.journal_recovery.position_observation_records, 2);
         assert_eq!(report.journal_recovery.mark_price_observation_records, 2);
         assert_eq!(report.journal_recovery.runtime_session_records, 1);
         assert_eq!(report.counts.funding_mark_brackets_validated, 1);
         assert_eq!(
             report.funding_formula_samples[0].expected_pnl_at_bill_mark,
-            -5.0
+            -4.0
         );
-        assert_eq!(report.funding_formula_samples[0].expected_pnl_absolute, 5.0);
+        assert_eq!(report.funding_formula_samples[0].expected_pnl_absolute, 4.0);
         assert_eq!(
             report.funding_formula_samples[0].journal_position_quantity,
-            10.0
+            8.0
         );
         assert_eq!(
             report.funding_formula_samples[0].position_observation_line,
-            5
+            7
         );
         assert_eq!(
             report.funding_formula_samples[0].runtime_session_id,
@@ -2600,13 +3496,247 @@ mod tests {
         );
         assert!(report.funding_formula_samples[0].mark_validated);
         assert!(report.funding_formula_samples[0].validated);
+        assert_eq!(report.derivative_pnl_formula_samples[0].pre_quantity, 10.0);
+        assert_eq!(
+            report.derivative_pnl_formula_samples[0].pre_avg_price,
+            49_000.0
+        );
+        assert_eq!(report.derivative_pnl_formula_samples[0].close_quantity, 2.0);
+        assert_eq!(report.derivative_pnl_formula_samples[0].expected_pnl, 20.0);
+        assert_eq!(report.derivative_pnl_formula_samples[0].post_quantity, 8.0);
+        assert!(report.derivative_pnl_formula_samples[0].validated);
+    }
+
+    #[test]
+    fn derivative_pnl_tamper_fails_even_when_balance_equation_is_self_consistent() {
+        let mut sources = sources();
+        sources.bills[0].pnl = Some(19.0);
+        sources.bills[0].balance_change = 18.5;
+
+        let report = build_report(sources, options(), "c".repeat(64));
+
+        assert!(!report.passed);
+        assert!(
+            report
+                .failures
+                .contains(&EconomicReconciliationFailure::DerivativePnlFormulaMismatches)
+        );
+        assert!(
+            report
+                .failures
+                .contains(&EconomicReconciliationFailure::MinimumDerivativeCloseBillsNotMet)
+        );
+        assert_eq!(report.derivative_pnl_formula_samples[0].expected_pnl, 20.0);
+        assert_eq!(report.derivative_pnl_formula_samples[0].observed_pnl, 19.0);
+        assert!(!report.derivative_pnl_formula_samples[0].validated);
+    }
+
+    #[test]
+    fn derivative_close_requires_a_same_session_authoritative_basis() {
+        let mut sources = sources();
+        sources.authoritative_account_snapshots.clear();
+
+        let report = build_report(sources, options(), "c".repeat(64));
+
+        assert!(!report.passed);
+        assert!(
+            report
+                .failures
+                .contains(&EconomicReconciliationFailure::DerivativeOpeningBasisMissingOrInvalid)
+        );
+        assert!(report.derivative_pnl_formula_samples.is_empty());
+        assert_eq!(report.counts.derivative_close_bills_recomputed, 0);
+    }
+
+    #[test]
+    fn derivative_basis_must_strictly_precede_the_fill_exchange_time() {
+        let mut sources = sources();
+        sources.authoritative_account_snapshots[0].event_ts_ms = TRADE_MS;
+        sources.authoritative_account_snapshots[0].update_ts_ms = TRADE_MS;
+
+        let report = build_report(sources, options(), "c".repeat(64));
+
+        assert!(!report.passed);
+        assert!(
+            report
+                .failures
+                .contains(&EconomicReconciliationFailure::DerivativeOpeningBasisMissingOrInvalid)
+        );
+        assert!(report.derivative_pnl_formula_samples.is_empty());
+        assert_eq!(report.counts.derivative_close_bills_recomputed, 0);
+    }
+
+    #[test]
+    fn derivative_basis_margin_mode_must_match_the_account_configuration() {
+        let mut sources = sources();
+        sources.authoritative_account_snapshots[0].positions[0].margin_mode =
+            Some(PositionMarginMode::Isolated);
+
+        let report = build_report(sources, options(), "c".repeat(64));
+
+        assert!(!report.passed);
+        assert!(
+            report
+                .failures
+                .contains(&EconomicReconciliationFailure::InvalidAuthoritativeAccountSnapshots)
+        );
+        assert!(report.derivative_pnl_formula_samples.is_empty());
+    }
+
+    #[test]
+    fn derivative_basis_session_must_match_the_collected_account_identity() {
+        let mut sources = sources();
+        sources.runtime_sessions[0].account_identity_sha256 = "d".repeat(64);
+
+        let report = build_report(sources, options(), "c".repeat(64));
+
+        assert!(!report.passed);
+        assert!(
+            report
+                .failures
+                .contains(&EconomicReconciliationFailure::InvalidAuthoritativeAccountSnapshots)
+        );
+        assert!(report.derivative_pnl_formula_samples.is_empty());
+    }
+
+    #[test]
+    fn derivative_close_requires_the_exact_critical_journal_fill() {
+        let mut sources = sources();
+        sources.journal_fills[0].fill.qty = 1.0;
+
+        let report = build_report(sources, options(), "c".repeat(64));
+
+        assert!(!report.passed);
+        assert!(
+            report
+                .failures
+                .contains(&EconomicReconciliationFailure::TradeJournalFillMismatches)
+        );
+        assert!(report.derivative_pnl_formula_samples.is_empty());
+    }
+
+    #[test]
+    fn derivative_basis_rejects_an_uncollected_intervening_fill() {
+        let mut sources = sources();
+        sources.journal_fills[0].line = 5;
+        sources.journal_fills.insert(
+            0,
+            JournalFillObservation {
+                line: 4,
+                fill: FillRecord {
+                    ts_ms: TRADE_MS - 50,
+                    account_id: Some("main".to_string()),
+                    fill_id: "uncollected".to_string(),
+                    order_id: "reap-uncollected".to_string(),
+                    symbol: "BTC-USDT-SWAP".to_string(),
+                    side: Side::Buy,
+                    price: 49_500.0,
+                    qty: 1.0,
+                    liquidity: Some(FillLiquidity::Maker),
+                    fee: None,
+                },
+            },
+        );
+
+        let report = build_report(sources, options(), "c".repeat(64));
+
+        assert!(!report.passed);
+        assert!(
+            report
+                .failures
+                .contains(&EconomicReconciliationFailure::DerivativeOpeningBasisMissingOrInvalid)
+        );
+        assert!(report.derivative_pnl_formula_samples.is_empty());
+        assert_eq!(report.counts.derivative_close_bills_recomputed, 0);
+    }
+
+    #[test]
+    fn duplicate_critical_journal_fill_identity_fails_closed() {
+        let mut sources = sources();
+        let mut duplicate = sources.journal_fills[0].clone();
+        duplicate.line = 5;
+        sources.journal_fills.push(duplicate);
+
+        let report = build_report(sources, options(), "c".repeat(64));
+
+        assert!(!report.passed);
+        assert!(
+            report
+                .failures
+                .contains(&EconomicReconciliationFailure::TradeJournalFillMismatches)
+        );
+        assert!(report.derivative_pnl_formula_samples.is_empty());
+    }
+
+    #[test]
+    fn inverse_position_basis_uses_pinned_java_harmonic_average() {
+        let mut inverse = config()
+            .strategy
+            .instruments
+            .into_iter()
+            .find(|instrument| instrument.symbol == "BTC-USDT-SWAP")
+            .unwrap();
+        inverse.kind = InstrumentKindConfig::InverseSwap;
+        inverse.contract_value = 100.0;
+        let increase = FillRecord {
+            ts_ms: 2,
+            account_id: Some("main".to_string()),
+            fill_id: "increase".to_string(),
+            order_id: "reap-increase".to_string(),
+            symbol: inverse.symbol.clone(),
+            side: Side::Buy,
+            price: 20_000.0,
+            qty: 1.0,
+            liquidity: Some(FillLiquidity::Maker),
+            fee: None,
+        };
+        let increased = apply_derivative_fill(
+            PositionBasis {
+                quantity: 2.0,
+                avg_price: 10_000.0,
+                snapshot_line: 1,
+                snapshot_time_ms: 1,
+            },
+            &increase,
+            &inverse,
+            1e-12,
+        )
+        .unwrap();
+        assert!((increased.post_avg_price - 12_000.0).abs() < 1e-9);
+
+        let close = FillRecord {
+            ts_ms: 3,
+            fill_id: "close".to_string(),
+            order_id: "reap-close".to_string(),
+            side: Side::Sell,
+            price: 15_000.0,
+            qty: 1.0,
+            ..increase
+        };
+        let closed = apply_derivative_fill(
+            PositionBasis {
+                quantity: increased.post_quantity,
+                avg_price: increased.post_avg_price,
+                snapshot_line: 1,
+                snapshot_time_ms: 1,
+            },
+            &close,
+            &inverse,
+            1e-12,
+        )
+        .unwrap();
+        let expected = 100.0 * (1.0 / 12_000.0 - 1.0 / 15_000.0);
+        assert!((closed.expected_pnl - expected).abs() < 1e-15);
+        assert_eq!(closed.expected_sub_type, "5");
+        assert_eq!(closed.post_quantity, 2.0);
+        assert!((closed.post_avg_price - 12_000.0).abs() < 1e-9);
     }
 
     #[test]
     fn funding_formula_tamper_fails_even_when_balance_equation_is_self_consistent() {
         let mut sources = sources();
-        sources.bills[1].pnl = Some(-4.0);
-        sources.bills[1].balance_change = -4.0;
+        sources.bills[1].pnl = Some(-3.0);
+        sources.bills[1].balance_change = -3.0;
 
         let report = build_report(sources, options(), "c".repeat(64));
 
@@ -2621,8 +3751,8 @@ mod tests {
                 .failures
                 .contains(&EconomicReconciliationFailure::MinimumFundingBillsNotMet)
         );
-        assert_eq!(report.funding_formula_samples[0].expected_pnl_absolute, 5.0);
-        assert_eq!(report.funding_formula_samples[0].observed_pnl, -4.0);
+        assert_eq!(report.funding_formula_samples[0].expected_pnl_absolute, 4.0);
+        assert_eq!(report.funding_formula_samples[0].observed_pnl, -3.0);
     }
 
     #[test]
@@ -2706,8 +3836,28 @@ mod tests {
             to_account: None,
             notes: String::new(),
         };
+        sources.journal_fills[0] = JournalFillObservation {
+            line: 4,
+            fill: FillRecord {
+                ts_ms: TRADE_MS,
+                account_id: Some("main".to_string()),
+                fill_id: "trade-spot".to_string(),
+                order_id: "reap-spot".to_string(),
+                symbol: "BTC-USDT".to_string(),
+                side: Side::Sell,
+                price: 50_000.0,
+                qty: 0.01,
+                liquidity: Some(FillLiquidity::Maker),
+                fee: Some(FillFee {
+                    amount: -0.05,
+                    currency: "USDT".to_string(),
+                }),
+            },
+        };
+        let mut options = options();
+        options.minimum_derivative_close_bills = 0;
 
-        let report = build_report(sources, options(), "c".repeat(64));
+        let report = build_report(sources, options, "c".repeat(64));
 
         assert!(report.passed, "{:?}", report.issues);
         assert_eq!(report.counts.trade_bills_validated, 1);
@@ -2732,7 +3882,7 @@ mod tests {
     fn settled_rate_replay_after_restart_does_not_duplicate_prior_session() {
         let mut sources = sources();
         sources.runtime_sessions.push(JournalRuntimeSession {
-            line: 8,
+            line: 10,
             started_at_ms: FUNDING_MS + 110,
             session_id: "4d5e6f".to_string(),
             account_id: "main".to_string(),
@@ -2741,7 +3891,7 @@ mod tests {
             account_identity_sha256: sources.account_identity_sha256.clone(),
         });
         let mut replay = sources.settlements[0].clone();
-        replay.line = 9;
+        replay.line = 11;
         replay.event_ts_ms = FUNDING_MS + 150;
         sources.settlements.push(replay);
 
@@ -2758,7 +3908,7 @@ mod tests {
     #[test]
     fn funding_sign_is_recomputed_from_the_journaled_position() {
         let mut sources = sources();
-        sources.position_observations[1].quantity = -10.0;
+        sources.position_observations[1].quantity = -8.0;
 
         let report = build_report(sources, options(), "c".repeat(64));
 
@@ -2770,9 +3920,9 @@ mod tests {
         );
         assert_eq!(
             report.funding_formula_samples[0].expected_pnl_at_bill_mark,
-            5.0
+            4.0
         );
-        assert_eq!(report.funding_formula_samples[0].observed_pnl, -5.0);
+        assert_eq!(report.funding_formula_samples[0].observed_pnl, -4.0);
     }
 
     #[test]
@@ -2828,7 +3978,7 @@ mod tests {
     fn duplicate_journal_mark_timestamp_fails_closed() {
         let mut sources = sources();
         let mut duplicate = sources.mark_price_observations[0].clone();
-        duplicate.line = 8;
+        duplicate.line = 10;
         sources.mark_price_observations.push(duplicate);
 
         let report = build_report(sources, options(), "c".repeat(64));
@@ -2845,7 +3995,7 @@ mod tests {
     fn mark_replay_after_restart_does_not_duplicate_prior_session() {
         let mut sources = sources();
         sources.runtime_sessions.push(JournalRuntimeSession {
-            line: 8,
+            line: 10,
             started_at_ms: FUNDING_MS + 110,
             session_id: "4d5e6f".to_string(),
             account_id: "main".to_string(),
@@ -2854,7 +4004,7 @@ mod tests {
             account_identity_sha256: sources.account_identity_sha256.clone(),
         });
         let mut replay = sources.mark_price_observations[1].clone();
-        replay.line = 9;
+        replay.line = 11;
         sources.mark_price_observations.push(replay);
 
         let report = build_report(sources, options(), "c".repeat(64));
@@ -2888,7 +4038,7 @@ mod tests {
         let mut sources = sources();
         sources.mark_price_observations.pop();
         sources.runtime_sessions.push(JournalRuntimeSession {
-            line: 7,
+            line: 9,
             started_at_ms: FUNDING_MS + 105,
             session_id: "4d5e6f".to_string(),
             account_id: "main".to_string(),
@@ -2899,7 +4049,7 @@ mod tests {
         sources
             .mark_price_observations
             .push(JournalMarkPriceObservation {
-                line: 8,
+                line: 10,
                 event_ts_ms: FUNDING_MS + 110,
                 symbol: "BTC-USDT-SWAP".to_string(),
                 price: 50_000.0,

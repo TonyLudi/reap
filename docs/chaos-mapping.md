@@ -340,9 +340,9 @@ The pinned Java subscriber clears its socket-owned book and stale-check state in
 books rather than one book per socket, so it retains the healthy replica but now
 waits for bounded status capacity when publishing every `Ready` or
 `Disconnected` transition. Per-frame payload heartbeats are not placed on that
-queue. Schema-6 live reports retain total, public, and private disconnect counts
+queue. Schema-8 live reports retain total, public, and private disconnect counts
 so a demo reconnect campaign can prove which transport class was exercised.
-Schema 6 additionally records ambiguous submit/cancel outcomes, partial-fill
+Schema 8 additionally records ambiguous submit/cancel outcomes, partial-fill
 transitions, order/fill convergence timeouts, and restored durable latches.
 Startup-replayed order state is excluded from the per-session outcome counters.
 

@@ -220,10 +220,15 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Add authenticated account-wide OKX bill collection with exact raw-page and
   cursor reconstruction, then reconcile normal trade and realized funding bills
   against verified fills and a streaming pass over the stopped journal. Bind one
-  passing economic gate per demo account into production evidence schema 6,
+  passing economic gate per demo account into production evidence schema 7,
   preserve the pinned Java bill field/type mapping, and independently bracket
   each funding assessment with journaled mark-price observations bounded by an
   explicit per-account runtime-session start record on every restart.
+- [x] Persist every authoritative REST account replacement as a critical
+  account-scoped schema-7 journal record, bind derivative bills to exact
+  critical fills, reconstruct linear/inverse average entry using the pinned
+  Java arithmetic/harmonic rules, and independently verify realized close PnL.
+  Production evidence requires a nonzero reviewed derivative-close count.
 - [x] Pin the Rust toolchain and add least-privilege GitHub CI for formatting,
   all-target lint, workspace tests, release build, and RustSec audit, with weekly
   Cargo and Actions update proposals.
@@ -311,7 +316,7 @@ architecture in [docs/architecture.md](docs/architecture.md).
   maximum ages.
 - [x] Add binary/host provenance and independently re-derived clean-shutdown
   fields to schema-2 fault-proxy process reports, expose an offline source
-  verifier, and require schema-6 production bundles to provide one unique proxy
+  verifier, and require schema-7 production bundles to provide one unique proxy
   session enclosing exactly each fault-matrix live run.
 - [ ] Calibrate queue position, latency, fees, funding, and slippage from
   captured full-depth data, then run and archive production-candidate
@@ -323,10 +328,11 @@ architecture in [docs/architecture.md](docs/architecture.md).
   funding intervals, a passing real target-account cash/zero-liability artifact,
   and passing authenticated fill/bill economic artifacts are still required.
   Exact signed private-fill fee amount/currency is retained end to end and
-  normal trade/funding bill reconstruction is implemented, but no demo evidence
-  exists. Cash-spot bill units need empirical target-account proof, derivative
-  close PnL needs independently attested opening cost basis, and complete
-  balance/equity/currency-conversion reconciliation remains outstanding. The
+  normal trade/funding bill reconstruction and journal-backed derivative close
+  PnL recomputation are implemented, but no demo evidence exists. Cash-spot bill
+  units and authoritative position-basis behavior need empirical target-account
+  proof, and complete balance/equity/currency-conversion reconciliation remains
+  outstanding. The
   bill-reported funding mark is now checked against a narrow two-sided public
   journal bracket rather than accepted alone; the exact internal tick remains
   unobservable. Margin

@@ -11,8 +11,8 @@ use reap_order::{
 };
 use reap_risk::{RiskDecision, RiskGate};
 use reap_storage::{
-    FillRecord, OrderAckRecord, OrderAckStatus, OrderOperation, ReconciliationRecord,
-    SafetyLatchRecord, SafetyLatchScope, SafetyLatchSource, StorageRecord,
+    AccountSnapshotRecord, FillRecord, OrderAckRecord, OrderAckStatus, OrderOperation,
+    ReconciliationRecord, SafetyLatchRecord, SafetyLatchScope, SafetyLatchSource, StorageRecord,
 };
 use reap_strategy::ChaosStrategy;
 use thiserror::Error;
@@ -498,7 +498,15 @@ impl LiveCoordinator {
         let update = self
             .private_state_mut(account_id)?
             .replace_account_snapshot(update);
-        let output = self.process_normalized(NormalizedEvent::Account(update));
+        let snapshot = AccountSnapshotRecord {
+            ts_ms: update.ts_ms,
+            account_id: account_id.to_string(),
+            update: update.clone(),
+        };
+        let mut output = self.process_normalized(NormalizedEvent::Account(update));
+        output
+            .records
+            .insert(0, StorageRecord::AccountSnapshot(snapshot));
         self.startup.mark_account_snapshot(
             account_id,
             true,
@@ -1980,9 +1988,17 @@ mod tests {
             ReconcileIssue::PositionMissingRemote { symbol, .. } if symbol == "BTC-PERP"
         )));
 
-        coordinator
+        let snapshot_output = coordinator
             .apply_authoritative_account_snapshot("main", remote_account.clone())
             .unwrap();
+        assert!(matches!(
+            snapshot_output.records.first(),
+            Some(StorageRecord::AccountSnapshot(snapshot))
+                if snapshot.account_id == "main"
+                    && snapshot.ts_ms == 5
+                    && snapshot.update.positions.iter().any(|position|
+                        position.symbol == "BTC-PERP" && position.qty == 0.0)
+        ));
         assert!(
             coordinator
                 .private_state("main")

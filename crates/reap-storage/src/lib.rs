@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use reap_core::{
-    FillFee, FillKey, FillLiquidity, NormalizedEvent, OrderIntent, OrderUpdate, Price, Quantity,
-    RawEnvelope, Side, Symbol, SystemEvent, SystemEventKind, TimeMs,
+    AccountUpdate, FillFee, FillKey, FillLiquidity, NormalizedEvent, OrderIntent, OrderUpdate,
+    Price, Quantity, RawEnvelope, Side, Symbol, SystemEvent, SystemEventKind, TimeMs,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -33,6 +33,7 @@ pub enum StorageRecord {
     },
     Bootstrap(BootstrapRecord),
     SessionStart(SessionStartRecord),
+    AccountSnapshot(AccountSnapshotRecord),
     OrderRequest(OrderRequestRecord),
     OrderAck(OrderAckRecord),
     Order {
@@ -145,6 +146,13 @@ pub struct SessionStartRecord {
     pub strategy_name: String,
     pub config_fingerprint: String,
     pub account_identity_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountSnapshotRecord {
+    pub ts_ms: TimeMs,
+    pub account_id: String,
+    pub update: AccountUpdate,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -472,7 +480,7 @@ struct StoredEnvelope {
     record: StorageRecord,
 }
 
-const CURRENT_SCHEMA_VERSION: u16 = 6;
+const CURRENT_SCHEMA_VERSION: u16 = 7;
 
 pub fn recover_jsonl(path: impl AsRef<Path>) -> Result<RecoveredStorage, StorageError> {
     let path = path.as_ref();
@@ -533,7 +541,7 @@ where
         };
         if !matches!(
             envelope.schema_version,
-            2 | 3 | 4 | 5 | CURRENT_SCHEMA_VERSION
+            2 | 3 | 4 | 5 | 6 | CURRENT_SCHEMA_VERSION
         ) {
             return Err(StorageError::Corrupt {
                 line: index + 1,
@@ -713,6 +721,7 @@ fn storage_record_ts_ms(record: &StorageRecord) -> TimeMs {
         StorageRecord::Intent { ts_ms, .. } | StorageRecord::IntentRejected { ts_ms, .. } => *ts_ms,
         StorageRecord::Bootstrap(bootstrap) => bootstrap.ts_ms,
         StorageRecord::SessionStart(session) => session.ts_ms,
+        StorageRecord::AccountSnapshot(snapshot) => snapshot.ts_ms,
         StorageRecord::OrderRequest(request) => request.ts_ms,
         StorageRecord::OrderAck(ack) => ack.ts_ms,
         StorageRecord::Order { update, .. } => update.ts_ms,
@@ -1028,6 +1037,47 @@ mod tests {
         assert_eq!(session.session_id, "1a2b3c");
         assert_eq!(session.account_id, "main");
         assert_eq!(session.account_identity_sha256, "b".repeat(64));
+    }
+
+    #[test]
+    fn recovery_visitor_streams_v7_authoritative_account_snapshots() {
+        let snapshot = StorageRecord::AccountSnapshot(AccountSnapshotRecord {
+            ts_ms: 1_001,
+            account_id: "main".to_string(),
+            update: AccountUpdate {
+                ts_ms: 1_001,
+                balances: Vec::new(),
+                positions: vec![reap_core::Position {
+                    symbol: "BTC-USDT-SWAP".to_string(),
+                    qty: -2.0,
+                    avg_price: 50_000.0,
+                    margin_mode: Some(reap_core::PositionMarginMode::Cross),
+                }],
+                margins: Vec::new(),
+            },
+        });
+        assert!(snapshot.is_critical());
+        let line = serde_json::to_string(&StoredEnvelope {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            record: snapshot,
+        })
+        .unwrap();
+        let mut observed = None;
+
+        let recovered =
+            recover_jsonl_bytes_with_visitor(format!("{line}\n").as_bytes(), |line, record| {
+                if let StorageRecord::AccountSnapshot(snapshot) = record {
+                    observed = Some((line, snapshot.clone()));
+                }
+            })
+            .unwrap();
+
+        assert_eq!(recovered.records, 1);
+        let (line, snapshot) = observed.unwrap();
+        assert_eq!(line, 1);
+        assert_eq!(snapshot.account_id, "main");
+        assert_eq!(snapshot.update.positions[0].qty, -2.0);
+        assert_eq!(snapshot.update.positions[0].avg_price, 50_000.0);
     }
 
     #[test]

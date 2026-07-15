@@ -53,9 +53,9 @@ Implemented:
   offline re-verification without printing sensitive raw account state.
 - Authenticated account-wide OKX bill collection with exact raw-page retention,
   independent cursor/window reconstruction, and stopped-journal reconciliation
-  of normal trades and realized linear/inverse funding. Unknown account bills
-  fail closed; realized derivative close PnL still lacks an independently
-  attested opening cost basis.
+  of normal trades, derivative close PnL, and realized linear/inverse funding.
+  Authoritative REST `avgPx` snapshots and exact critical fills reconstruct the
+  pinned Java linear/inverse position basis; unknown account bills fail closed.
 - Read-only process-death certification that exclusively leases the stopped
   journal, binds recovered exchange/client order identities to exact OKX order
   details, requires Cancel All After source `20` and account-wide regular-order
@@ -332,7 +332,7 @@ manifest-declared build, host, candidate, or environment-specific account
 identities. Proxy-supported fault roles must carry typed records with the exact
 proxy fingerprint, unique proxy session/command IDs, fresh timestamps, and a
 command interval inside the corresponding verified live session; only genuine
-partial-fill and restart-latch roles may use external evidence. Schema 6 also
+partial-fill and restart-latch roles may use external evidence. Schema 7 also
 enforces reviewed age limits under hard code-level maxima for the demo soak,
 every fault and latency source, production account certification, deadman,
 emergency cancel, and the reconciled fill and bill windows. It requires one
@@ -378,7 +378,7 @@ reap verify-production-approval \
 
 The policy requires sorted, unique approvers, distinct Ed25519 public keys, and
 at least two required roles. A request is valid for at most 15 minutes and binds
-the exact policy predeclared by SHA-256 in the schema-6 evidence manifest plus
+the exact policy predeclared by SHA-256 in the schema-7 evidence manifest plus
 stable source/config/build/host/account/candidate and gate evidence. Verification
 rejects stale requests, missing roles, duplicate keys or approvers, signature or
 binding changes, and any newly failing or changed source.
@@ -577,6 +577,7 @@ cargo run -p reap-cli -- reconcile-economics \
   --begin-ms "$BEGIN_MS" \
   --end-ms "$END_MS" \
   --minimum-trade-bills 10 \
+  --minimum-derivative-close-bills 5 \
   --minimum-funding-bills 1 \
   --maximum-trade-bill-delay-ms "$MAX_TRADE_BILL_DELAY_MS" \
   --maximum-funding-bill-delay-ms 60000 \
@@ -604,17 +605,23 @@ is weaker. The fill report covers fills and fees only.
 least 500 ms apart, and requires a short terminal page within the conservative
 166-hour age bound. `reconcile-economics` rebuilds both collections, leases and
 streams the stopped journal, rejects every unexplained bill type, validates
-trade identities/fees/balance equations, and recomputes realized linear or
-inverse funding from the journaled settled rate, assessment-time signed
+trade identities/fees/balance equations, binds each trade to one account-scoped
+critical fill, and recomputes derivative close PnL from the latest same-session
+authoritative REST `avgPx` snapshot whose exchange timestamp strictly precedes
+the fill. Linear basis uses arithmetic weighting and
+inverse basis uses harmonic weighting, matching pinned Java `RiskCalculator`.
+It also recomputes realized linear or inverse funding from the journaled settled
+rate, assessment-time signed
 position, configured contract value, and two same-session mark-price samples
 bracketing the bill's `fillTime`. The bill mark must lie inside that independent
-exchange-time bracket. A schema-6 `session_start` journal record emitted on
-every runtime start binds those observations to one session, account, config,
+exchange-time bracket. Schema-7 `session_start` and critical `account_snapshot`
+journal records bind those observations to one session, account, config,
 and hashed OKX account identity, so evidence cannot cross a restart. Run a
 controlled demo window containing nonzero trades
-and at least one nonzero funding settlement. This still does not independently
-prove derivative opening cost basis, the venue's exact internal assessment tick,
-full balance/equity continuity, currency conversion, taxes, or profitability.
+and at least one nonzero derivative close and funding settlement. The basis is
+authenticated local runtime evidence, not remote attestation. This still does
+not prove the venue's exact internal assessment tick, full balance/equity
+continuity, currency conversion, taxes, or profitability.
 Cash-spot bill units must be confirmed with credentialed demo
 evidence for the exact target account before production review.
 

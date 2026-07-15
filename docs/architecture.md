@@ -339,11 +339,18 @@ Responsibilities:
   rows, a full terminal page, or any changed source.
 - Reconcile normal trade and funding bills against the verified fill collection
   and a streaming pass over the stopped journal. Unknown bill types fail closed;
-  trades bind on `(symbol, tradeId)` and exact fee currency, while funding binds
-  to a session-local journaled realized rate and assessment-time signed position.
+  trades bind on `(symbol, tradeId)`, one account-scoped critical journal fill,
+  and exact fee currency. Every authoritative REST account replacement first
+  writes a critical `account_snapshot` carrying the exchange `avgPx`. Derivative
+  fills replay from the latest same-session snapshot using the pinned Java
+  arithmetic average for linear contracts and harmonic average for inverse
+  contracts. The snapshot exchange timestamp must strictly precede every
+  replayed fill; close PnL and open/close subtype are then recomputed independently
+  of the bill balance equation. Funding binds to a session-local journaled
+  realized rate and assessment-time signed position.
   Two journaled `mark-price` observations must bracket the bill `fillTime`; the
   bill mark and linear/inverse funding PnL are then checked against the resulting
-  independent ranges. Each runtime start writes a schema-6 `session_start` per
+  independent ranges. Each runtime start writes a schema-7 `session_start` per
   account with session, strategy, config, and hashed OKX account identity; line
   boundaries prevent settlement, position, or mark evidence from crossing a
   restart. This is intentionally outside the hot event loop.
@@ -741,10 +748,11 @@ maker/taker rates. Reports expose exact and estimated fee-fill counts. The
 backtest model does not import statements, borrowing interest, liquidation,
 margin discounts, or tax, and it cannot infer a missing funding event when the
 source dataset never contained one. A separate offline production-evidence path
-now reconstructs normal trade and funding bills, but it cannot independently
-recompute derivative close PnL until the journal retains an attested opening
-cost basis. The supported live spot boundary is cash
-mode; production certification must prove zero liabilities. Enabling margin
+now reconstructs normal trade/funding bills and derivative close PnL from
+same-session authenticated REST position basis plus critical fills. That is
+local journal provenance, not remote process attestation. The supported live
+spot boundary is cash mode; production certification must prove zero
+liabilities. Enabling margin
 spot later requires a separate borrow-rate and interest model first. Production
 evaluation must still reconcile complete balance/equity and currency-index
 coverage across every held interval.
@@ -944,7 +952,7 @@ environment-specific account identities. The verifier reruns each source gate,
 reopens every deployment config and the controlling manifest, and reconstructs
 the loopback fault config from the exact official-demo and fault-proxy configs
 before cross-binding all returned identities. It hashes the typed in-memory
-reconstructions instead of accepting prior verification JSON. Schema 6
+reconstructions instead of accepting prior verification JSON. Schema 7
 re-verifies every fault/latency live
 source, derives completion times from validated sessions or exchange-clock
 samples, enforces explicit age limits under hard maxima, and requires each typed
@@ -959,7 +967,8 @@ independently bounded to 24 hours.
 Release approval remains a separate `reap-cli` composition layer. A stable typed
 subject removes only verifier wall time and derived age while preserving every
 source timestamp, freshness limit/result, gate hash, config, candidate, build,
-host, account identity, and proxy run. A strict policy requires at least two
+host, account identity, and proxy run. Schema 7 also requires a reviewed nonzero
+count of independently recomputed derivative closes. A strict policy requires at least two
 sorted roles and distinct Ed25519 keys. Offline signatures bind the exact policy,
 request bytes, role, approver, and signing time; final verification reruns the
 entire bundle, requires its predeclared policy hash, and requires exact subject
@@ -967,9 +976,9 @@ equality inside a hard 15-minute window.
 This is deliberately asymmetric rather than reusing the runtime operator HMAC:
 the target host can verify approvals without gaining signing capability. Even a
 passing approval leaves production entry unauthorized because remote attestation,
-external supervision, independently attested derivative opening cost basis,
-complete balance/equity and currency-conversion accounting, and actual rollout
-governance remain outside this composition. Funding's bill-reported mark is
+external supervision, remote attestation of the locally journaled position
+basis, complete balance/equity and currency-conversion accounting, and actual
+rollout governance remain outside this composition. Funding's bill-reported mark is
 checked against same-session public observations, but the exact internal
 assessment tick cannot be reproduced externally.
 

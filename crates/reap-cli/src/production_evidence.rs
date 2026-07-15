@@ -25,8 +25,8 @@ use sha2::{Digest, Sha256};
 use crate::deployment::{ResearchDeploymentVerificationReport, verify_research_deployment_paths};
 use crate::latency::{LatencyCalibrationVerificationReport, verify_latency_calibration};
 
-pub(crate) const PRODUCTION_EVIDENCE_MANIFEST_SCHEMA_VERSION: u16 = 6;
-pub(crate) const PRODUCTION_EVIDENCE_REPORT_FORMAT_VERSION: u16 = 6;
+pub(crate) const PRODUCTION_EVIDENCE_MANIFEST_SCHEMA_VERSION: u16 = 7;
+pub(crate) const PRODUCTION_EVIDENCE_REPORT_FORMAT_VERSION: u16 = 7;
 pub(crate) const PRODUCTION_EVIDENCE_APPROVAL_SUBJECT_FORMAT_VERSION: u16 = 1;
 const MAX_PRODUCTION_EVIDENCE_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_PRODUCTION_EVIDENCE_ACCOUNTS: usize = 32;
@@ -44,6 +44,8 @@ const MAX_BILL_COLLECTION_AGE_MS: u64 = 24 * 60 * 60 * 1_000;
 const MAX_PRODUCTION_ECONOMIC_QUANTITY_TOLERANCE: f64 = 1e-8;
 const MAX_PRODUCTION_ECONOMIC_FEE_TOLERANCE: f64 = 1e-10;
 const MAX_PRODUCTION_ECONOMIC_BALANCE_TOLERANCE: f64 = 1e-8;
+const MAX_PRODUCTION_ECONOMIC_TRADE_PNL_ABSOLUTE_TOLERANCE: f64 = 1e-8;
+const MAX_PRODUCTION_ECONOMIC_TRADE_PNL_RELATIVE_TOLERANCE: f64 = 1e-6;
 const MAX_PRODUCTION_ECONOMIC_FUNDING_ABSOLUTE_TOLERANCE: f64 = 1e-8;
 const MAX_PRODUCTION_ECONOMIC_FUNDING_RELATIVE_TOLERANCE: f64 = 1e-6;
 const MAX_PRODUCTION_FUNDING_MARK_BRACKET_DISTANCE_MS: u64 = 2_000;
@@ -85,6 +87,7 @@ pub(crate) struct ProductionEvidenceEconomicInput {
     pub bill_collection_manifest: PathBuf,
     pub journal: PathBuf,
     pub minimum_trade_bills: u64,
+    pub minimum_derivative_close_bills: u64,
     pub minimum_funding_bills: u64,
     pub maximum_trade_bill_delay_ms: u64,
     pub maximum_funding_bill_delay_ms: u64,
@@ -97,6 +100,10 @@ pub(crate) struct ProductionEvidenceEconomicInput {
     pub fee_tolerance: f64,
     #[serde(default)]
     pub balance_tolerance: f64,
+    #[serde(default)]
+    pub trade_pnl_absolute_tolerance: f64,
+    #[serde(default)]
+    pub trade_pnl_relative_tolerance: f64,
     #[serde(default)]
     pub funding_pnl_absolute_tolerance: f64,
     #[serde(default)]
@@ -556,6 +563,7 @@ struct ResolvedEconomicInput {
     bill_collection_manifest: PathBuf,
     journal: PathBuf,
     minimum_trade_bills: u64,
+    minimum_derivative_close_bills: u64,
     minimum_funding_bills: u64,
     maximum_trade_bill_delay_ms: u64,
     maximum_funding_bill_delay_ms: u64,
@@ -770,6 +778,7 @@ pub(crate) fn verify_production_evidence_manifest_path(
                 begin_ms: bills_before.manifest.window.begin_ms,
                 end_ms: bills_before.manifest.window.end_ms,
                 minimum_trade_bills: input.minimum_trade_bills,
+                minimum_derivative_close_bills: input.minimum_derivative_close_bills,
                 minimum_funding_bills: input.minimum_funding_bills,
                 maximum_trade_bill_delay_ms: input.maximum_trade_bill_delay_ms,
                 maximum_funding_bill_delay_ms: input.maximum_funding_bill_delay_ms,
@@ -2635,8 +2644,13 @@ fn validate_manifest(manifest: &ProductionEvidenceManifest) -> Result<()> {
         MAX_PRODUCTION_EVIDENCE_ACCOUNTS,
     )?;
     for economic in &manifest.economic_reconciliations {
-        if economic.minimum_trade_bills == 0 || economic.minimum_funding_bills == 0 {
-            bail!("every economic reconciliation must require trade and funding evidence");
+        if economic.minimum_trade_bills == 0
+            || economic.minimum_derivative_close_bills == 0
+            || economic.minimum_funding_bills == 0
+        {
+            bail!(
+                "every economic reconciliation must require trade, derivative-close, and funding evidence"
+            );
         }
         if economic.maximum_trade_bill_delay_ms == 0
             || economic.maximum_trade_bill_delay_ms > reap_live::MAX_TRADE_BILL_DELAY_MS
@@ -2658,6 +2672,14 @@ fn validate_manifest(manifest: &ProductionEvidenceManifest) -> Result<()> {
             ("quantity_tolerance", economic.quantity_tolerance),
             ("fee_tolerance", economic.fee_tolerance),
             ("balance_tolerance", economic.balance_tolerance),
+            (
+                "trade_pnl_absolute_tolerance",
+                economic.trade_pnl_absolute_tolerance,
+            ),
+            (
+                "trade_pnl_relative_tolerance",
+                economic.trade_pnl_relative_tolerance,
+            ),
             (
                 "funding_pnl_absolute_tolerance",
                 economic.funding_pnl_absolute_tolerance,
@@ -2697,6 +2719,16 @@ fn validate_manifest(manifest: &ProductionEvidenceManifest) -> Result<()> {
                 "balance_tolerance",
                 economic.balance_tolerance,
                 MAX_PRODUCTION_ECONOMIC_BALANCE_TOLERANCE,
+            ),
+            (
+                "trade_pnl_absolute_tolerance",
+                economic.trade_pnl_absolute_tolerance,
+                MAX_PRODUCTION_ECONOMIC_TRADE_PNL_ABSOLUTE_TOLERANCE,
+            ),
+            (
+                "trade_pnl_relative_tolerance",
+                economic.trade_pnl_relative_tolerance,
+                MAX_PRODUCTION_ECONOMIC_TRADE_PNL_RELATIVE_TOLERANCE,
             ),
             (
                 "funding_pnl_absolute_tolerance",
@@ -2949,6 +2981,7 @@ fn resolve_manifest(loaded: &LoadedManifest) -> Result<ResolvedManifest> {
             bill_collection_manifest,
             journal,
             minimum_trade_bills: input.minimum_trade_bills,
+            minimum_derivative_close_bills: input.minimum_derivative_close_bills,
             minimum_funding_bills: input.minimum_funding_bills,
             maximum_trade_bill_delay_ms: input.maximum_trade_bill_delay_ms,
             maximum_funding_bill_delay_ms: input.maximum_funding_bill_delay_ms,
@@ -2959,6 +2992,8 @@ fn resolve_manifest(loaded: &LoadedManifest) -> Result<ResolvedManifest> {
                 quantity_abs: input.quantity_tolerance,
                 fee_abs: input.fee_tolerance,
                 balance_abs: input.balance_tolerance,
+                trade_pnl_abs: input.trade_pnl_absolute_tolerance,
+                trade_pnl_relative: input.trade_pnl_relative_tolerance,
                 funding_pnl_abs: input.funding_pnl_absolute_tolerance,
                 funding_pnl_relative: input.funding_pnl_relative_tolerance,
                 funding_mark_abs: input.funding_mark_absolute_tolerance,
@@ -3107,7 +3142,7 @@ mod tests {
     fn manifest_toml(extra: &str) -> String {
         format!(
             r#"
-schema_version = 6
+schema_version = 7
 expected_reap_version = "0.1.0"
 expected_live_executable_sha256 = "{}"
 expected_host_identity_sha256 = "{}"
@@ -3209,6 +3244,7 @@ fill_collection_manifest = "fills/manifest.json"
 bill_collection_manifest = "bills/manifest.json"
 journal = "journal.jsonl"
 minimum_trade_bills = 1
+minimum_derivative_close_bills = 1
 minimum_funding_bills = 1
 maximum_trade_bill_delay_ms = 60000
 maximum_funding_bill_delay_ms = 60000
@@ -3250,6 +3286,10 @@ maximum_funding_mark_bracket_distance_ms = 1000
         assert!(validate_manifest(&parsed).is_err());
 
         parsed.economic_reconciliations[0].minimum_funding_bills = 1;
+        parsed.economic_reconciliations[0].minimum_derivative_close_bills = 0;
+        assert!(validate_manifest(&parsed).is_err());
+
+        parsed.economic_reconciliations[0].minimum_derivative_close_bills = 1;
         parsed.economic_reconciliations[0].maximum_funding_bill_delay_ms =
             reap_live::MAX_FUNDING_BILL_DELAY_MS + 1;
         assert!(validate_manifest(&parsed).is_err());
@@ -3268,6 +3308,11 @@ maximum_funding_mark_bracket_distance_ms = 1000
         assert!(validate_manifest(&parsed).is_err());
 
         parsed.economic_reconciliations[0].balance_tolerance = 0.0;
+        parsed.economic_reconciliations[0].trade_pnl_relative_tolerance =
+            MAX_PRODUCTION_ECONOMIC_TRADE_PNL_RELATIVE_TOLERANCE * 2.0;
+        assert!(validate_manifest(&parsed).is_err());
+
+        parsed.economic_reconciliations[0].trade_pnl_relative_tolerance = 0.0;
         parsed.economic_reconciliations[0].maximum_funding_mark_bracket_distance_ms =
             MAX_PRODUCTION_FUNDING_MARK_BRACKET_DISTANCE_MS + 1;
         assert!(validate_manifest(&parsed).is_err());

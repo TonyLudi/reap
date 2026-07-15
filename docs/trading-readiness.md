@@ -10,7 +10,7 @@ production trading process.
 | Area | Current state | Trading impact |
 | --- | --- | --- |
 | Iarb2 decision model | Covered for the documented OKX parity boundary | Not a blocker |
-| Deterministic backtest/data | Shared strategy code, immediate pending-order registration, arrival-time scheduler, Java-mapped class/symbol empirical latency profiles with sampled-usage reporting, versioned target-host/live collectors, deterministic calibration artifacts bound into production research, conservative depth/queue/trade capacity controls, event-clock drawdown/exposure/inventory metrics, per-currency depeg-sensitive valuation, exact private-fill fee currency plus explicit simulated-fee counts, fee/turnover attribution, authenticated recent-fill and account-wide bill collection with verified offline trade/fee/funding reconciliation, authenticated point-in-time cash/zero-liability collection and offline verification, forecast/realized funding separation with event-time linear/inverse settlement, manifest-driven chronological walk-forward selection and stress gates with exact independent report reconstruction, credential-free redundant public capture, exact provenance, streaming analysis, and raw/normalized replay | The evidence pipeline is implemented but execution/accounting assumptions remain uncalibrated; needs sustained full-depth and currency-index capture, a passing credentialed target-host/demo latency artifact, complete funding intervals, target-tier fee calibration, real passing target-account and fill/bill economic artifacts, empirical cash-spot bill semantics, independently attested derivative opening cost basis, complete balance/equity reconciliation, and production-candidate reports before capital decisions |
+| Deterministic backtest/data | Shared strategy code, immediate pending-order registration, arrival-time scheduler, Java-mapped class/symbol empirical latency profiles with sampled-usage reporting, versioned target-host/live collectors, deterministic calibration artifacts bound into production research, conservative depth/queue/trade capacity controls, event-clock drawdown/exposure/inventory metrics, per-currency depeg-sensitive valuation, exact private-fill fee currency plus explicit simulated-fee counts, fee/turnover attribution, authenticated recent-fill and account-wide bill collection with verified offline trade/fee/funding reconciliation and journal-backed derivative close-PnL reconstruction, authenticated point-in-time cash/zero-liability collection and offline verification, forecast/realized funding separation with event-time linear/inverse settlement, manifest-driven chronological walk-forward selection and stress gates with exact independent report reconstruction, credential-free redundant public capture, exact provenance, streaming analysis, and raw/normalized replay | The evidence pipeline is implemented but execution/accounting assumptions remain uncalibrated; needs sustained full-depth and currency-index capture, a passing credentialed target-host/demo latency artifact, complete funding intervals, target-tier fee calibration, real passing target-account and fill/bill economic artifacts including authoritative position-basis/close samples, empirical cash-spot bill semantics, complete balance/equity reconciliation, and production-candidate reports before capital decisions |
 | Feed components | Redundant public sockets, isolated private sockets, transport/state freshness separation, account-plus-positions health rounds, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
 | Order components | Event-loop client IDs/registration, exchange/client acknowledgement binding, account-scoped immutable private identity, semantic duplicate suppression across changed exchange timestamps, exchange-side place-request expiry, an authenticated eight-session websocket command pool, constant-time per-underlying FIFOs, bounded cross-underlying command concurrency, shared account pacing, independent REST reconciliation, shutdown command flushing, monotonic private reduction, submit/cancel state-convergence deadlines, typed position margin mode, and ambiguity handling are composed | Needs demo exchange fault evidence |
 | Runtime risk | Instrument models, authoritative startup positions, authenticated current instrument-rule, hard single-order maximum, and fee-group checks, final pre-trade exchange-limit enforcement, typed upcoming-change lead, active-order count/notional ceilings, rolling submit-rejection and zero-fill IOC-cancel circuits, terminal strategy-halt promotion, position scope/mode enforcement, zero-liability enforcement, periodic authenticated account-config drift detection, forced-repayment blocking, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock and announced-maintenance checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed instrument/fee/deadman/depeg/convergence evidence |
@@ -415,16 +415,16 @@ production trading process.
     session. It also reconstructs one raw schema-2 proxy process report per role,
     requiring exact config/build/host, unique sessions, independently derived
     clean shutdown, exact completed-command counts, and unambiguous live-session
-    enclosure. Mandatory schema-6 age windows have hard maxima of 15 minutes for
+    enclosure. Mandatory schema-7 age windows have hard maxima of 15 minutes for
     production account state, 24 hours for soak/fills/bills, seven days for
     fault/latency/deadman/emergency evidence, and five minutes of future
-    tolerance. Schema 6 also predeclares the exact approval-policy SHA-256. The
+    tolerance. Schema 7 also predeclares the exact approval-policy SHA-256. The
     checked-in schema template cannot pass, no target-host bundle
     or human approval exists, and the output explicitly leaves production order
     entry unauthorized.
 53. Production approval is now a separate asymmetric gate. The strict policy
     requires at least two sorted roles and distinct Ed25519 keys; request
-    preparation accepts only a fresh passing schema-6 bundle, offline signatures
+    preparation accepts only a fresh passing schema-7 bundle, offline signatures
     bind exact request/policy/role/time, and final verification reruns all sources
     before requiring role coverage. Requests have a hard 15-minute lifetime,
     private keys require owner-only files, every input is reopened, and all output
@@ -440,17 +440,20 @@ production trading process.
     fees, currencies, and balance equations, and recomputes linear/inverse
     funding from a session-local journaled realized rate, the latest signed
     position at bill `fillTime`, and public marks on both sides of that assessment.
-    A schema-6 runtime-session record emitted per account on every start binds
+    A schema-7 runtime-session record emitted per account on every start binds
     the settlement, position, and mark lines to one config and hashed OKX account
     identity, preventing evidence from crossing a restart.
     Funding type `8` subtypes
     `173`/`174` and source fields are mapped to pinned Java `BillDetails`,
     `OkexV5BillFetchTaskImpl`, `OkexV5BillTypes`, and
     `OkexV5ExchBillConverter`, plus Java's dedicated `MarkPrice` session/parser.
-    Production evidence schema 6 requires one passing economic gate per demo
-    account and caps mark-bracket distance/tolerance. No credentialed artifact
-    exists, cash-spot bill units remain an empirical gate, and derivative close
-    PnL still lacks independently attested opening cost basis.
+    Every authoritative REST replacement also writes a critical account-scoped
+    `account_snapshot`; strictly later exact critical fills replay from its `avgPx` under the
+    pinned Java linear/inverse basis rules, and derivative bill close PnL is
+    independently recomputed. Production evidence schema 7 requires one passing
+    economic gate and a nonzero derivative-close count per demo account, and caps
+    PnL/mark tolerances. No credentialed artifact exists, and cash-spot bill units
+    plus target-account position-basis behavior remain empirical gates.
 
 ## Remaining Demo Gate
 
@@ -496,9 +499,11 @@ production trading process.
    leading trade-bill delay guard and `collect-bills` for the exact closed
    bounded-demo window. Require passing manifest-backed `reconcile-fills`,
    `verify-bill-collection`, and `reconcile-economics` artifacts with reviewed
-   nonzero trade, fill, and funding thresholds. The controlled window must span
-   a real nonzero funding settlement, retain same-session `mark-price` samples
-   before and after the bill `fillTime`, and contain no unrelated account bills.
+   nonzero trade, derivative-close, fill, and funding thresholds. Start the
+   controlled trade window only after the first schema-7 authoritative account
+   snapshot, span a real nonzero funding settlement, retain same-session
+   `mark-price` samples before and after the bill `fillTime`, and contain no
+   unrelated account bills.
 
 ## Production Gate
 
@@ -506,9 +511,9 @@ Production enablement additionally requires:
 
 - A passing owner-only `verify-production-evidence --require-pass` artifact made
   by the exact candidate binary on the declared target host after every source
-  artifact below exists. Review every subordinate artifact and schema-6
+  artifact below exists. Review every subordinate artifact and schema-7
   freshness observation; the aggregate does not supply remote attestation,
-  external supervision, independently attested derivative opening cost basis,
+  external supervision, remote attestation of local position-basis evidence,
   complete balance/equity and currency-conversion accounting, authenticated
   external partial-fill/restart causality, or human approval and never
   authorizes entry.
@@ -537,13 +542,14 @@ Production enablement additionally requires:
 - A passing target-account `certify-account` artifact, independently rechecked
   with `verify-account-certification --require-pass`, immediately before
   approval. This is point-in-time evidence and must be combined with a passing
-  per-account schema-3 economic reconciliation included in the schema-6
+  per-account schema-4 economic reconciliation included in the schema-7
   production bundle. Margin spot remains unsupported; enabling it requires an
   explicit borrow-rate/interest model and demo reconciliation first.
 - A passing per-account `reconcile-economics --require-pass` reconstruction from
   exact guarded fills, account-wide bills, and the stopped canonical journal.
-  Independently review a credentialed cash buy/sell sample before admitting spot
-  semantics, and provide a separate attested opening-cost-basis/close-PnL and
+  Require the reviewed nonzero derivative-close threshold and inspect the
+  same-session REST snapshot/fill/PnL samples. Independently review a credentialed
+  cash buy/sell sample before admitting spot semantics, and provide a separate
   full balance/equity continuity check. Review the funding mark bracket width;
   it constrains accepted bill marks but cannot reproduce the venue's internal
   assessment tick.
