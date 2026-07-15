@@ -543,6 +543,18 @@ fn live_failure_evidence(error: &LiveRuntimeError) -> LiveFailureEvidence {
     }
 }
 
+fn live_startup_failure_evidence(error: &LiveRuntimeError) -> LiveFailureEvidence {
+    LiveFailureEvidence {
+        code: error.stable_code().to_string(),
+        message: truncate_utf8(
+            format!(
+                "startup failed before a reportable runtime session was established; zero-valued runtime counters are not exchange-zero proof: {error}"
+            ),
+            MAX_LIVE_FAILURE_MESSAGE_BYTES,
+        ),
+    }
+}
+
 fn truncate_utf8(mut value: String, maximum_bytes: usize) -> String {
     if value.len() <= maximum_bytes {
         return value;
@@ -555,26 +567,43 @@ fn truncate_utf8(mut value: String, maximum_bytes: usize) -> String {
     value
 }
 
-pub async fn run_live_path(
-    path: impl AsRef<Path>,
-    options: LiveRunOptions,
-) -> Result<LiveRunReport, LiveRuntimeError> {
-    let (config, config_source) = LiveConfig::load_with_evidence(path)?;
-    run_live_with_config_source(config, options, Some(config_source)).await
+#[derive(Debug, Clone)]
+struct LiveRunAttemptEvidence {
+    session_started_at_ms: u64,
+    config_source: Option<LiveConfigFileEvidence>,
+    config_fingerprint: String,
+    evidence_config_fingerprint: String,
+    executable_sha256: String,
+    host_identity_sha256: Option<String>,
 }
 
-pub async fn run_live(
+#[derive(Debug)]
+pub struct PreparedLiveRun {
     config: LiveConfig,
     options: LiveRunOptions,
-) -> Result<LiveRunReport, LiveRuntimeError> {
-    run_live_with_config_source(config, options, None).await
+    evidence: LiveRunAttemptEvidence,
 }
 
-async fn run_live_with_config_source(
+pub fn prepare_live_path(
+    path: impl AsRef<Path>,
+    options: LiveRunOptions,
+) -> Result<PreparedLiveRun, LiveRuntimeError> {
+    let (config, config_source) = LiveConfig::load_with_evidence(path)?;
+    prepare_live_with_config_source(config, options, Some(config_source))
+}
+
+pub fn prepare_live(
+    config: LiveConfig,
+    options: LiveRunOptions,
+) -> Result<PreparedLiveRun, LiveRuntimeError> {
+    prepare_live_with_config_source(config, options, None)
+}
+
+fn prepare_live_with_config_source(
     config: LiveConfig,
     options: LiveRunOptions,
     config_source: Option<LiveConfigFileEvidence>,
-) -> Result<LiveRunReport, LiveRuntimeError> {
+) -> Result<PreparedLiveRun, LiveRuntimeError> {
     config.ensure_valid()?;
     if options
         .run_duration
@@ -582,32 +611,85 @@ async fn run_live_with_config_source(
     {
         return Err(LiveRuntimeError::InvalidRunDuration);
     }
-    if options.mode == LiveMode::Validate {
-        let config_fingerprint = config.fingerprint()?;
-        let evidence_config_fingerprint = config.evidence_fingerprint()?;
-        let executable_sha256 = current_executable_sha256()?;
-        let host_identity_sha256 = config
+    if options.mode == LiveMode::Demo {
+        if !options.demo_confirmed {
+            return Err(LiveRuntimeError::DemoConfirmationRequired);
+        }
+        if config.venue.environment != TradingEnvironment::Demo {
+            return Err(LiveRuntimeError::DemoRequiresSimulatedTrading);
+        }
+    }
+    let evidence = LiveRunAttemptEvidence {
+        session_started_at_ms: unix_time_ms(),
+        config_source,
+        config_fingerprint: config.fingerprint()?,
+        evidence_config_fingerprint: config.evidence_fingerprint()?,
+        executable_sha256: current_executable_sha256()?,
+        host_identity_sha256: config
             .host_guard
             .enabled
             .then(host_identity_sha256)
-            .transpose()?;
-        let readiness = StartupGate::new(&config).snapshot();
-        return Ok(LiveRunReport {
+            .transpose()?,
+    };
+    Ok(PreparedLiveRun {
+        config,
+        options,
+        evidence,
+    })
+}
+
+impl PreparedLiveRun {
+    pub async fn run(self) -> Result<LiveRunReport, LiveRuntimeError> {
+        if self.options.mode == LiveMode::Validate {
+            return Ok(self.pre_runtime_report(LiveStopReason::Validation, None, 0));
+        }
+        let build = LiveRuntime::build(
+            self.config.clone(),
+            self.evidence.clone(),
+            self.options.mode,
+            self.options.run_duration,
+        )
+        .await;
+        match build {
+            Ok(runtime) => runtime.run().await,
+            Err(error @ LiveRuntimeError::ReportedFailure { .. }) => Err(error),
+            Err(error) => {
+                let report = self.pre_runtime_report(
+                    LiveStopReason::RuntimeFailure,
+                    Some(live_startup_failure_evidence(&error)),
+                    unix_time_ms().saturating_sub(self.evidence.session_started_at_ms),
+                );
+                Err(LiveRuntimeError::ReportedFailure {
+                    source: Box::new(error),
+                    report: Box::new(report),
+                })
+            }
+        }
+    }
+
+    fn pre_runtime_report(
+        &self,
+        stop_reason: LiveStopReason,
+        failure: Option<LiveFailureEvidence>,
+        elapsed_ms: u64,
+    ) -> LiveRunReport {
+        let readiness = StartupGate::new(&self.config).snapshot();
+        LiveRunReport {
             schema_version: LIVE_RUN_REPORT_SCHEMA_VERSION,
             session_id: None,
-            session_started_at_ms: unix_time_ms(),
-            config_source,
-            config_fingerprint,
-            evidence_config_fingerprint,
+            session_started_at_ms: self.evidence.session_started_at_ms,
+            config_source: self.evidence.config_source.clone(),
+            config_fingerprint: self.evidence.config_fingerprint.clone(),
+            evidence_config_fingerprint: self.evidence.evidence_config_fingerprint.clone(),
             java_reference_revision: PINNED_JAVA_REVISION.to_string(),
             reap_version: env!("CARGO_PKG_VERSION").to_string(),
-            executable_sha256,
-            host_identity_sha256,
+            executable_sha256: self.evidence.executable_sha256.clone(),
+            host_identity_sha256: self.evidence.host_identity_sha256.clone(),
             account_identity_sha256s: BTreeMap::new(),
-            mode: options.mode,
-            stop_reason: LiveStopReason::Validation,
-            failure: None,
-            elapsed_ms: 0,
+            mode: self.options.mode,
+            stop_reason,
+            failure,
+            elapsed_ms,
             reached_ready: false,
             time_to_ready_ms: None,
             readiness_loss_count: 0,
@@ -642,19 +724,22 @@ async fn run_live_with_config_source(
             active_orders_after_shutdown: 0,
             latency_evidence: LiveLatencyEvidence::default(),
             clean_soak: false,
-        });
-    }
-    if options.mode == LiveMode::Demo {
-        if !options.demo_confirmed {
-            return Err(LiveRuntimeError::DemoConfirmationRequired);
-        }
-        if config.venue.environment != TradingEnvironment::Demo {
-            return Err(LiveRuntimeError::DemoRequiresSimulatedTrading);
         }
     }
-    let runtime =
-        LiveRuntime::build(config, config_source, options.mode, options.run_duration).await?;
-    runtime.run().await
+}
+
+pub async fn run_live_path(
+    path: impl AsRef<Path>,
+    options: LiveRunOptions,
+) -> Result<LiveRunReport, LiveRuntimeError> {
+    prepare_live_path(path, options)?.run().await
+}
+
+pub async fn run_live(
+    config: LiveConfig,
+    options: LiveRunOptions,
+) -> Result<LiveRunReport, LiveRuntimeError> {
+    prepare_live(config, options)?.run().await
 }
 
 struct AccountSeed {
@@ -1476,15 +1561,52 @@ struct LiveRuntime {
     host_last_snapshot: Option<HostHealthSnapshot>,
 }
 
+#[derive(Default)]
+struct StartupTaskGroup(Vec<JoinHandle<()>>);
+
+impl StartupTaskGroup {
+    fn take(&mut self) -> Vec<JoinHandle<()>> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl std::ops::Deref for StartupTaskGroup {
+    type Target = Vec<JoinHandle<()>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for StartupTaskGroup {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for StartupTaskGroup {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
 impl LiveRuntime {
     async fn build(
         config: LiveConfig,
-        config_source: Option<LiveConfigFileEvidence>,
+        attempt: LiveRunAttemptEvidence,
         mode: LiveMode,
         run_duration: Option<Duration>,
     ) -> Result<Self, LiveRuntimeError> {
-        let session_started_at_ms = unix_time_ms();
-        let executable_sha256 = current_executable_sha256()?;
+        let LiveRunAttemptEvidence {
+            session_started_at_ms,
+            config_source,
+            config_fingerprint,
+            evidence_config_fingerprint,
+            executable_sha256,
+            host_identity_sha256,
+        } = attempt;
         let storage_lease = acquire_storage_lease(&config.storage.path)?;
         let journal_path = storage_lease.journal_path().to_path_buf();
         let host_preflight = if config.host_guard.enabled {
@@ -1492,11 +1614,6 @@ impl LiveRuntime {
         } else {
             None
         };
-        let host_identity_sha256 = config
-            .host_guard
-            .enabled
-            .then(host_identity_sha256)
-            .transpose()?;
         let connection_attempt_interval =
             Duration::from_millis(config.runtime.connection_attempt_interval_ms);
         let connection_attempt_pacer = match (
@@ -1517,8 +1634,6 @@ impl LiveRuntime {
         let alert_failures = alert_runtime.as_mut().map(AlertRuntime::take_failures);
         let operator_config = config.operator.clone();
         let operator_secret = operator_config.secret_from_env()?;
-        let config_fingerprint = config.fingerprint()?;
-        let evidence_config_fingerprint = config.evidence_fingerprint()?;
         let fill_convergence = FillConvergenceGuard::new(&config);
         let order_convergence =
             OrderStateConvergenceGuard::new(config.runtime.order_state_convergence_timeout_ms);
@@ -1746,7 +1861,7 @@ impl LiveRuntime {
             .then(|| start_host_guard(config.host_guard.clone(), journal_path));
         let host_failures = host_guard.as_mut().map(HostGuardRuntime::take_failures);
         let mut feeds = Vec::new();
-        let mut feed_tasks = Vec::new();
+        let mut feed_tasks = StartupTaskGroup::default();
         let mut sources = Vec::new();
 
         let public_adapter: Arc<dyn VenueAdapter> = Arc::new(OkxAdapter::new(
@@ -1773,13 +1888,13 @@ impl LiveRuntime {
         let public_feed_index = 0;
 
         let mut order_senders = HashMap::new();
-        let mut order_tasks = Vec::new();
+        let mut order_tasks = StartupTaskGroup::default();
         let mut reconcile_senders = HashMap::new();
-        let mut reconcile_tasks = Vec::new();
+        let mut reconcile_tasks = StartupTaskGroup::default();
         let mut order_ws_runtimes = Vec::new();
-        let mut order_ws_status_tasks = Vec::new();
+        let mut order_ws_status_tasks = StartupTaskGroup::default();
         let mut safety_senders = HashMap::new();
-        let mut safety_tasks = Vec::new();
+        let mut safety_tasks = StartupTaskGroup::default();
         for (seed_index, seed) in seeds.into_iter().enumerate() {
             let AccountSeed {
                 account_id,
@@ -1928,15 +2043,15 @@ impl LiveRuntime {
             control_rx,
             feed_rx,
             order_senders,
-            order_tasks,
+            order_tasks: order_tasks.take(),
             reconcile_senders,
-            reconcile_tasks,
+            reconcile_tasks: reconcile_tasks.take(),
             order_ws_runtimes,
-            order_ws_status_tasks,
+            order_ws_status_tasks: order_ws_status_tasks.take(),
             safety_senders,
-            safety_tasks,
+            safety_tasks: safety_tasks.take(),
             feeds,
-            feed_tasks,
+            feed_tasks: feed_tasks.take(),
             sources,
             public_feed_index,
             reconcile_inflight: HashSet::new(),
@@ -5070,6 +5185,35 @@ mod tests {
 
     use super::*;
 
+    struct TaskDropSignal(Option<oneshot::Sender<()>>);
+
+    impl Drop for TaskDropSignal {
+        fn drop(&mut self) {
+            if let Some(signal) = self.0.take() {
+                let _ = signal.send(());
+            }
+        }
+    }
+
+    fn unwrap_startup_failure(error: LiveRuntimeError) -> (LiveRuntimeError, LiveRunReport) {
+        let (source, report) = match error {
+            LiveRuntimeError::ReportedFailure { source, report } => (source, report),
+            other => panic!("expected reported startup failure, got {other}"),
+        };
+        assert!(report.session_id.is_none());
+        assert_eq!(report.stop_reason, LiveStopReason::RuntimeFailure);
+        assert!(report.account_identity_sha256s.is_empty());
+        assert!(!report.reached_ready);
+        assert!(!report.clean_soak);
+        assert!(
+            report
+                .failure
+                .as_ref()
+                .is_some_and(|failure| failure.message.contains("not exchange-zero proof"))
+        );
+        (*source, *report)
+    }
+
     #[derive(Clone)]
     struct RuntimeMockHttp {
         responses: Arc<Mutex<VecDeque<Result<HttpResponse, RestError>>>>,
@@ -6380,6 +6524,26 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, LiveRuntimeError::InvalidRunDuration));
+    }
+
+    #[tokio::test]
+    async fn startup_task_group_aborts_owned_tasks_on_early_exit() {
+        let (started_tx, started_rx) = oneshot::channel();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let mut tasks = StartupTaskGroup::default();
+        tasks.push(tokio::spawn(async move {
+            let _drop_signal = TaskDropSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        started_rx.await.unwrap();
+
+        drop(tasks);
+
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("startup task was not aborted")
+            .unwrap();
     }
 
     #[tokio::test]
@@ -7891,8 +8055,9 @@ mod tests {
         .await
         .unwrap_err();
 
+        let (source, _) = unwrap_startup_failure(error);
         assert!(matches!(
-            error,
+            source,
             LiveRuntimeError::Storage(StorageError::AlreadyLocked { .. })
         ));
         drop(lease);
@@ -7925,8 +8090,9 @@ mod tests {
         .await
         .unwrap_err();
 
+        let (source, _) = unwrap_startup_failure(error);
         assert!(matches!(
-            error,
+            source,
             LiveRuntimeError::Host(HostHealthError::Unhealthy { ref code, .. })
                 if code == "disk_low"
         ));
@@ -7956,7 +8122,8 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert!(matches!(error, LiveRuntimeError::ConnectionPacer(_)));
+        let (source, _) = unwrap_startup_failure(error);
+        assert!(matches!(source, LiveRuntimeError::ConnectionPacer(_)));
         let lease = acquire_storage_lease(&path).unwrap();
         let lock_path = lease.lock_path().to_path_buf();
         drop(lease);

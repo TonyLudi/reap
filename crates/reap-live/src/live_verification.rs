@@ -265,6 +265,7 @@ fn validate_run_shape(
     config: &LiveConfig,
     failures: &mut Vec<LiveRunVerificationFailure>,
 ) {
+    let startup_failure = is_pre_session_startup_failure(report);
     if report.reached_ready != report.time_to_ready_ms.is_some()
         || report
             .time_to_ready_ms
@@ -318,39 +319,54 @@ fn validate_run_shape(
             }
         }
         LiveMode::Observe | LiveMode::Demo => {
-            if report
-                .session_id
-                .as_deref()
-                .is_none_or(|session| session.trim().is_empty())
-                || report.stop_reason == LiveStopReason::Validation
-            {
-                failures.push(LiveRunVerificationFailure::RunInvariant {
-                    message: "live report has no session or uses validation stop reason"
-                        .to_string(),
-                });
-            }
             if report.mode == LiveMode::Demo && !config.venue.environment.is_demo() {
                 failures.push(LiveRunVerificationFailure::RunInvariant {
                     message: "demo report is bound to a production exchange config".to_string(),
                 });
             }
-            let expected_accounts = config
-                .accounts
-                .iter()
-                .map(|account| account.id.as_str())
-                .collect::<BTreeSet<_>>();
-            let reported_accounts = report
-                .account_identity_sha256s
-                .keys()
-                .map(String::as_str)
-                .collect::<BTreeSet<_>>();
-            if reported_accounts != expected_accounts
-                || report
+            if startup_failure {
+                let expected_readiness = StartupGate::new(config).snapshot();
+                if report.reached_ready
+                    || report.clean_soak
+                    || !report.account_identity_sha256s.is_empty()
+                    || report.readiness_at_stop != expected_readiness
+                    || report.readiness != expected_readiness
+                    || has_runtime_evidence(report)
+                {
+                    failures.push(LiveRunVerificationFailure::RunInvariant {
+                        message: "startup failure report has live-session state".to_string(),
+                    });
+                }
+            } else {
+                if report
+                    .session_id
+                    .as_deref()
+                    .is_none_or(|session| session.trim().is_empty())
+                    || report.stop_reason == LiveStopReason::Validation
+                {
+                    failures.push(LiveRunVerificationFailure::RunInvariant {
+                        message: "live report has no session or uses validation stop reason"
+                            .to_string(),
+                    });
+                }
+                let expected_accounts = config
+                    .accounts
+                    .iter()
+                    .map(|account| account.id.as_str())
+                    .collect::<BTreeSet<_>>();
+                let reported_accounts = report
                     .account_identity_sha256s
-                    .values()
-                    .any(|identity| !is_lower_sha256(identity))
-            {
-                failures.push(LiveRunVerificationFailure::AccountIdentityMismatch);
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>();
+                if reported_accounts != expected_accounts
+                    || report
+                        .account_identity_sha256s
+                        .values()
+                        .any(|identity| !is_lower_sha256(identity))
+                {
+                    failures.push(LiveRunVerificationFailure::AccountIdentityMismatch);
+                }
             }
         }
     }
@@ -360,7 +376,7 @@ fn validate_run_shape(
             .host_identity_sha256
             .as_deref()
             .is_some_and(is_lower_sha256)
-            && if report.mode == LiveMode::Validate {
+            && if report.mode == LiveMode::Validate || startup_failure {
                 report.host_preflight.is_none()
                     && report.host_checks == 0
                     && report.host_last_snapshot.is_none()
@@ -412,6 +428,13 @@ fn validate_run_shape(
     if !failure_matches {
         failures.push(LiveRunVerificationFailure::RuntimeFailureEvidenceMismatch);
     }
+}
+
+fn is_pre_session_startup_failure(report: &LiveRunReport) -> bool {
+    matches!(report.mode, LiveMode::Observe | LiveMode::Demo)
+        && report.session_id.is_none()
+        && report.stop_reason == LiveStopReason::RuntimeFailure
+        && report.failure.is_some()
 }
 
 fn has_runtime_evidence(report: &LiveRunReport) -> bool {
@@ -743,6 +766,66 @@ mod tests {
             LiveRunVerificationFailure::RunInvariant { message }
                 if message == "validation report has live-session state"
         )));
+    }
+
+    #[tokio::test]
+    async fn verifier_accepts_startup_failure_as_diagnostic_evidence_only() {
+        let fixture = fixture().await;
+        let mut report = fixture.report;
+        report.mode = LiveMode::Observe;
+        report.stop_reason = LiveStopReason::RuntimeFailure;
+        report.failure = Some(crate::LiveFailureEvidence {
+            code: "host_guard".to_string(),
+            message: "startup failed before a reportable runtime session".to_string(),
+        });
+        report.elapsed_ms = 7;
+        write_report(&fixture.report_path, &report);
+
+        let verification = verify_live_run_paths(
+            &fixture.config_path,
+            &fixture.report_path,
+            Some(LiveMode::Observe),
+        )
+        .unwrap();
+
+        assert!(verification.evidence_valid, "{verification:#?}");
+        assert!(!verification.acceptance_passed);
+        assert!(!verification.derived_clean_soak);
+    }
+
+    #[tokio::test]
+    async fn verifier_rejects_forged_startup_runtime_state_and_session() {
+        let fixture = fixture().await;
+        let mut report = fixture.report.clone();
+        report.mode = LiveMode::Observe;
+        report.stop_reason = LiveStopReason::RuntimeFailure;
+        report.failure = Some(crate::LiveFailureEvidence {
+            code: "host_guard".to_string(),
+            message: "startup failed before a reportable runtime session".to_string(),
+        });
+        report.operator_commands = 1;
+        write_report(&fixture.report_path, &report);
+
+        let runtime_state =
+            verify_live_run_paths(&fixture.config_path, &fixture.report_path, None).unwrap();
+        assert!(!runtime_state.evidence_valid);
+        assert!(runtime_state.failures.iter().any(|failure| matches!(
+            failure,
+            LiveRunVerificationFailure::RunInvariant { message }
+                if message == "startup failure report has live-session state"
+        )));
+
+        report.operator_commands = 0;
+        report.session_id = Some("forged-session".to_string());
+        write_report(&fixture.report_path, &report);
+        let session =
+            verify_live_run_paths(&fixture.config_path, &fixture.report_path, None).unwrap();
+        assert!(!session.evidence_valid);
+        assert!(
+            session
+                .failures
+                .contains(&LiveRunVerificationFailure::AccountIdentityMismatch)
+        );
     }
 
     #[tokio::test]

@@ -316,6 +316,10 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Bind schema-8 live reports to exact source-config bytes, reserve them
   owner-only with file/directory durability, and add offline verification that
   re-derives report, mode, host, identity, latency, and clean-soak invariants.
+- [x] Validate live config/run options and bind source/build/host provenance
+  before report reservation; persist handled runtime-build failures as typed
+  pre-session diagnostic reports without account/runtime claims, keep them
+  ineligible for acceptance, and abort untransferred startup task owners.
 - [x] Add a strict live fault-matrix manifest/verifier that requires every
   documented schema-8 role, unique sessions and injector evidence, one exact
   config/build/host/account identity, production-shaped demo guards, and safe

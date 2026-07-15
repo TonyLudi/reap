@@ -744,18 +744,24 @@ evidence for the exact target account before production review.
 
 Each create-new schema-8 live report contains the exact source-config byte
 count/SHA-256, checkpoint and full evidence config fingerprints, Reap executable
-hash, pinned Java revision, pseudonymous host/account identity,
+hash, pinned Java revision, and optional pseudonymous host identity. Established
+sessions additionally contain pseudonymous account identity,
 session/readiness/host evidence, and bounded per-class/per-symbol latency
-samples. The CLI reserves `--output` mode `0600` before config, credential, or
-network work, then syncs the report and parent directory. Once the
-report-capable runtime is constructed, an
-initialization, event-loop, or teardown failure still writes a schema-versioned
-report after fail-closed cleanup, with a bounded stable failure code/message,
-and then exits non-zero. A failure before runtime construction leaves the
-reserved file empty and must be diagnosed from the process log; an empty file
-is never evidence. `verify-live-run` independently re-hashes exact config/report
-bytes, re-derives effective fingerprints and clean-soak acceptance, and checks
-mode, identity, readiness, failure, disconnect, host, and latency invariants.
+samples. The CLI validates config/run options and captures exact source,
+executable, and host provenance before reserving `--output` mode `0600`, then
+syncs the report and parent directory. A handled runtime-construction failure
+after reservation writes a source-bound pre-session report with
+`session_id = null`, no account-identity or runtime-state claims, baseline
+readiness, `clean_soak = false`, and a bounded stable failure code/message.
+Its zero counters are not proof that the exchange has zero orders. Once the
+report-capable runtime is constructed, initialization, event-loop, or teardown
+failure still writes a full schema-versioned report after fail-closed cleanup
+and exits non-zero. `verify-live-run` accepts a well-formed pre-session report as
+diagnostic evidence but never as clean-soak acceptance; it independently
+re-hashes exact config/report bytes, re-derives effective fingerprints and
+acceptance, and checks mode, identity, readiness, failure, disconnect, host,
+and latency invariants. An empty or incomplete reserved file means report
+persistence failed or the process was forcibly terminated and is never evidence.
 
 Live shutdown uses separate safety and ownership deadlines. The first bounds
 cancel/reconcile; `runtime.teardown_timeout_ms` then bounds every host,

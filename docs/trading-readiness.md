@@ -854,6 +854,39 @@ production trading process.
     completion deadline; the Rust deadline and failure report are explicit
     lifecycle hardening rather than claimed parity. Credentialed target-host
     process-death and supervisor evidence remains required.
+66. Live process preparation now validates the exact config and run options and
+    captures source-file, executable, and optional host provenance before the
+    CLI reserves a report path. Invalid configuration and zero duration create
+    no report. A handled failure after reservation but before a reportable
+    runtime session writes a schema-8 diagnostic report with no session ID,
+    account identities, host-health observations, or runtime counters, baseline
+    readiness, typed failure evidence, and `clean_soak = false`. Its message
+    explicitly states that zero counters are not exchange-zero proof. Offline
+    verification accepts this shape only as diagnostic evidence and can never
+    derive clean-soak acceptance; forged runtime state or session promotion is
+    rejected.
+
+    Raw feed, order, reconciliation, order-status, and safety task handles remain
+    in abort-on-drop startup groups until ownership transfers into
+    `LiveRuntime`. This closes the detached-worker path when a later account
+    setup step fails. The lifecycle maps to pinned Java
+    `ChaosStrategyEngine.init/checkReadiness/start`,
+    `ChaosStrategyBase.onReady`, and `ChaosStrategyEngine.clear`, while the
+    versioned pre-session artifact and explicit task ownership are Rust
+    hardening rather than parity claims.
+
+    Process tests prove invalid config and zero duration leave no output and an
+    impossible Linux host floor writes a mode-0600, source-bound, independently
+    verifiable non-acceptance report. An optimized release smoke with missing
+    operator credentials produced the same contract and preserved the original
+    nonzero error; its report SHA-256 was
+    `365a8bc63bd952704de08b92694e35f3e04c5487720e343043bbdfe165d1c947`.
+    Formatting, warnings-denied Clippy, all 757 workspace tests, optimized CLI
+    build, release validation/startup smokes, hardened systemd verification at
+    exposure 2.9, and RustSec audit pass. The release executable SHA-256 is
+    `1cef2b7e423a58dc36b3a823dc37c817e12a46a62fd0f11f51e38cf8c72dda83`.
+    Credentialed target-host demo, process-death, economic, calibration, and
+    approval gates remain open; this does not make the strategy tradable now.
 
 ## Remaining Demo Gate
 

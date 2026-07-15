@@ -1427,19 +1427,19 @@ async fn main() -> Result<()> {
             reap_telemetry::init_json_tracing("info")
                 .map_err(anyhow::Error::msg)
                 .context("failed to initialize live tracing")?;
-            let mut output_file = output
-                .as_ref()
-                .map(|output| reserve_private_output(output, "live report"))
-                .transpose()?;
-            let run_result = reap_live::run_live_path(
+            let prepared = reap_live::prepare_live_path(
                 config,
                 LiveRunOptions {
                     mode: mode.into(),
                     demo_confirmed: confirm_demo,
                     run_duration: duration_secs.map(Duration::from_secs),
                 },
-            )
-            .await;
+            )?;
+            let mut output_file = output
+                .as_ref()
+                .map(|output| reserve_private_output(output, "live report"))
+                .transpose()?;
+            let run_result = prepared.run().await;
             let (report, runtime_failure) = match run_result {
                 Ok(report) => (report, None),
                 Err(LiveRuntimeError::ReportedFailure { source, report }) => {

@@ -1435,6 +1435,10 @@ settings; accepting only their static flags would weaken live stop behavior.
   aliases contend for the same lease. The lease remains owned by the runtime
   even if the storage writer task fails and is released only during teardown or
   failed startup cleanup.
+- Live config/run-option validation and exact source/build/host provenance are
+  completed before `--output` reservation. After reservation, raw startup task
+  handles remain abort-on-drop until ownership transfers into `LiveRuntime`, so
+  a later account/bootstrap setup failure cannot detach those workers.
 - Alert routing and host thresholds are deployment-only and are excluded from
   checkpoint identity, so enabling them does not invalidate an existing
   reconciled journal. Trading, account, runtime, storage, and operator changes
@@ -2529,16 +2533,25 @@ pass. The production evidence policy limits
 45-second systemd stop boundary, leaving five seconds for report serialization,
 file/directory sync, and process exit.
 
-With `--output`, the CLI reserves the create-new path before configuration,
-credentials, or network startup. If the report-capable runtime's initialization,
-event loop, or teardown fails, Reap completes the same fail-closed cleanup,
-writes and fsyncs a schema-8 report with `stop_reason = "runtime_failure"` plus a
-bounded stable `failure.code` and diagnostic `failure.message`, prints it, and
-then returns the original nonzero error. Review `readiness_at_stop` separately
-from final `readiness`, and require `active_orders_after_shutdown = 0`; a failure
-report is incident evidence and can never be a clean soak. A failure before
-runtime construction leaves the reserved path empty. Archive it with the
-process log, but never parse or present an empty file as a run report.
+With `--output`, the CLI first validates the exact config and run options and
+captures source/build/host provenance. Invalid input creates no report. It then
+reserves the create-new path before credentials or network startup. A handled
+failure while constructing the report-capable runtime writes and fsyncs a
+schema-8 pre-session report with `session_id = null`, empty account identities,
+baseline readiness, zero runtime evidence, `clean_soak = false`, and
+`stop_reason = "runtime_failure"`. Its bounded `failure` explains that zero
+counters are not exchange-zero proof. `verify-live-run` can validate this as
+diagnostic evidence, but `acceptance_passed` is always false; reconcile exchange
+orders/account state before retrying.
+
+If initialization after runtime construction, the event loop, or teardown
+fails, Reap completes fail-closed cleanup, writes and fsyncs the full report,
+prints it, and returns the original nonzero error. Review
+`readiness_at_stop` separately from final `readiness`, and require
+`active_orders_after_shutdown = 0`; a failure report is incident evidence and
+can never be a clean soak. An empty or incomplete reserved path indicates
+report-filesystem failure, forced process death, or a defect. Archive it with
+the process log, but never parse or present it as run evidence.
 
 Host, operator, feed, and order owners are signalled together; joins still
 collect host/operator evidence before feed/order task evidence. Alert teardown

@@ -366,6 +366,19 @@ not Java parity claims. A proxy frame drop cannot create a genuine partial fill,
 and a running proxy cannot prove latch persistence across process restart, so
 the matrix rejects typed proxy artifacts for those two roles.
 
+Pinned Java `ChaosStrategyEngine.init` starts safeguards, runs strategy
+initialization, and schedules bounded readiness checks on the strategy
+dispatcher. `ChaosStrategyBase.onReady` then initializes the writer, runs the
+sanity check, and starts the strategy; `clear` recycles engine subscriptions and
+dispatches `doStop`. Rust keeps the same principle that entry follows complete
+initialization/readiness, but adds an explicit prepared-run boundary before
+credential/network work. Config, run options, exact source bytes, executable,
+and host identity are fixed before report reservation. A build failure after
+reservation produces a pre-session diagnostic report with no account/runtime
+claims, while untransferred Tokio task owners are aborted. Java does not emit an
+equivalent versioned pre-session artifact, so this is lifecycle hardening rather
+than parity.
+
 The reviewed Java OKX subscriber and `chaos-iarb2` classes do not provide the
 Rust runtime's place-request `expTime`, `/public/time` skew gate, Cancel All
 After heartbeat, fsynced restart-latch lifecycle, exclusive journal lease,

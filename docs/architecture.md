@@ -352,9 +352,13 @@ Responsibilities:
   journal ownership, and becomes typed non-clean report evidence. Successful
   journal close flushes and data-syncs before the runtime report is built.
 - Bind every path-launched live report to exact source-config bytes and effective
-  fingerprints. Offline verification treats the report as untrusted, re-derives
-  clean-soak status, and checks mode, build/Java provenance, host/account
-  identities, readiness, failure/disconnect counters, and latency reservoirs.
+  fingerprints. Validate config/run options and capture build/host provenance
+  before report reservation. After reservation, represent a handled pre-session
+  failure without claiming account identity or runtime state, and abort any
+  startup-owned tasks that have not transferred into `LiveRuntime`. Offline
+  verification treats every report as untrusted, re-derives clean-soak status,
+  and checks mode, build/Java provenance, host/account identities, readiness,
+  failure/disconnect counters, and latency reservoirs.
 - Aggregate isolated live fault reports through a strict manifest that requires
   the complete role matrix, unique sessions and injector artifacts, one
   config/build/host/account identity, recovered reconnects, and safe zero-order
@@ -717,15 +721,22 @@ producing a profile. Production research treats that JSON as untrusted
 evidence, requires the byte-identical executable and an exact baseline-profile
 match, and rechecks its content hash after execution.
 
-The CLI reserves a create-new live evidence path before configuration,
-credential, or network work. After the report-capable runtime exists, every
-initialization, event-loop, or teardown error follows the same
-cancel/reconcile/shutdown path and then returns a schema-versioned report
+The CLI first validates the exact config and run options and captures source,
+executable, and optional host provenance. It then reserves a create-new live
+evidence path before credential or network work. A handled build failure after
+reservation becomes a source-bound pre-session report: no session ID, account
+identity, host-health observation, or runtime counters are claimed, baseline
+readiness is retained, and clean-soak acceptance is impossible. Zero-valued
+startup counters are explicitly not exchange-zero proof. Startup task guards
+abort raw feed, order, reconciliation, safety, and order-status workers unless
+their ownership transfers into the completed runtime. After the report-capable
+runtime exists, every initialization, event-loop, or teardown error follows the
+same cancel/reconcile/shutdown path and then returns a schema-versioned report
 containing the primary stable failure code, bounded diagnostic, pre-cleanup
 readiness snapshot, post-cleanup active-order count, and all accumulated
 evidence. The report is persisted before the original error produces a nonzero
-exit. Failures before runtime construction cannot claim runtime state and leave
-only an empty reserved path plus process logs.
+exit. An empty or incomplete reserved path therefore indicates persistence
+failure or forced process termination, not a valid startup report.
 
 `runtime.shutdown_timeout_ms` bounds canonical cancellation and authoritative
 REST reconciliation. The separate `runtime.teardown_timeout_ms` bounds all task
