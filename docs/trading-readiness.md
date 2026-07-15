@@ -514,6 +514,48 @@ production trading process.
     targeted run and the host guard was disabled, so this confirms current
     compatibility of the newly required channels only and is not production
     evidence.
+57. Redundant books now keep sequence and full-book state per websocket
+    `conn_id`, matching pinned Java `AbstractOkV5L2Subscriber` ownership by
+    session type, connection index, and symbol. Global duplicates still advance
+    each source; only valid reconstructed books reach canonical arbitration. An
+    equivalent same-version replica is ignored, a different full book fails
+    closed, and a source-local predecessor gap restarts only that socket while a
+    ready replica remains available. The change was prompted by a guarded
+    60-second diagnostic in which one replica's newer startup snapshot arrived
+    milliseconds before the other replica's delta ending at the same sequence;
+    shared sequence state incorrectly classified the lagging valid delta as a
+    gap. Replaying all 9,435 persisted frames with per-source state reduced that
+    run from one gap/recovery to zero without changing its 4,757 accepted and
+    4,678 duplicate classifications.
+
+    A fresh optimized-release 60-second run on 2026-07-15 covered all 11
+    configured logical spot/swap book, trade, index, stablecoin, price-limit,
+    funding, and mark streams from two sources each. All 12 socket plans were
+    ready at stop, both 400-level books were ready, six periodic
+    disk/memory/clock checks passed, and 6,749 exact ordinals contained 3,397
+    accepted plus 3,352 duplicate events with zero disconnects, gaps,
+    recoveries, stale books, parse errors, or missing recovery routes.
+    Independent strict verification and replay passed at raw SHA-256
+    `a0d5513af66cb8b82aa811fbf6358d7b7f1a5a0187c7adcf6ae49fb7770f1de2`,
+    report SHA-256
+    `34c41c04c01e4596ad93c658b11defd6f398592f129891f13eef6ef95be9c17c`,
+    and executable SHA-256
+    `e0d912477aea711ae77e9e2026e99107925a6f387a96f2a27746f216e5d8c265`.
+    That executable hash identifies the diagnostic capture; it is not the later
+    rebuilt candidate after the report-only backtest horizon correction.
+    Raw backtest reconstructed 4,555 inputs, reached terminal order-entry
+    readiness, modeled 22 orders, and passed complete accounting with no fills.
+    That replay also exposed a 2.77 ms trailing duplicate/control-frame horizon:
+    risk integrals already closed at the final raw receive timestamp while the
+    reported duration stopped at the last normalized event. The denominator now
+    uses the same raw horizon and fails closed if inventory-open time exceeds it;
+    rerun inventory duration and observed duration both equal
+    `58,463,130,332` ns and the fraction is exactly `1.0`.
+    The diagnostic copy retained the 5 GiB disk and synchronized-clock guards
+    but used a 700 MiB memory floor for this 1.8 GiB shared workspace host; the
+    checked-in config remains at 1 GiB. The short public run does not cover a
+    funding settlement, calibrated execution, credentials, target-host latency,
+    or production authorization.
 
 ## Remaining Demo Gate
 

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use reap_core::{Channel, EventId, EventKey, Symbol, Venue};
+use reap_core::{Channel, ConnId, EventId, EventKey, Symbol, Venue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DedupDecision {
@@ -32,7 +32,15 @@ impl Deduplicator {
     }
 
     pub fn check(&mut self, event_id: &EventId) -> DedupDecision {
-        let stream = StreamKey::from(event_id);
+        self.check_scoped(event_id, None)
+    }
+
+    pub fn check_source(&mut self, event_id: &EventId, source: &ConnId) -> DedupDecision {
+        self.check_scoped(event_id, Some(source))
+    }
+
+    fn check_scoped(&mut self, event_id: &EventId, source: Option<&ConnId>) -> DedupDecision {
+        let stream = StreamKey::new(event_id, source);
         let recent = self.streams.entry(stream).or_default();
         if recent.set.contains(&event_id.key) {
             self.stats.duplicates += 1;
@@ -60,14 +68,16 @@ struct StreamKey {
     venue: Venue,
     channel: Channel,
     symbol: Option<Symbol>,
+    source: Option<ConnId>,
 }
 
-impl From<&EventId> for StreamKey {
-    fn from(value: &EventId) -> Self {
+impl StreamKey {
+    fn new(value: &EventId, source: Option<&ConnId>) -> Self {
         Self {
             venue: value.venue,
             channel: value.channel.clone(),
             symbol: value.symbol.clone(),
+            source: source.cloned(),
         }
     }
 }
@@ -105,6 +115,18 @@ mod tests {
         assert_eq!(dedup.check(&id(0, 1, 100, 7)), DedupDecision::Accepted);
         assert_eq!(dedup.check(&id(0, 1, 100, 7)), DedupDecision::Duplicate);
         assert_eq!(dedup.stats().duplicates, 1);
+    }
+
+    #[test]
+    fn source_scope_advances_each_replica_independently() {
+        let mut dedup = Deduplicator::new(4);
+        let first = ConnId::new("book-r0");
+        let second = ConnId::new("book-r1");
+        let event = id(0, 1, 100, 7);
+
+        assert_eq!(dedup.check_source(&event, &first), DedupDecision::Accepted);
+        assert_eq!(dedup.check_source(&event, &second), DedupDecision::Accepted);
+        assert_eq!(dedup.check_source(&event, &first), DedupDecision::Duplicate);
     }
 
     #[test]

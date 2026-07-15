@@ -1013,7 +1013,7 @@ mod tests {
             let capture: RawCapture = serde_json::from_slice(line).unwrap();
             let envelope = capture.into_envelope().unwrap();
             for parsed in adapter.parse(&envelope).unwrap() {
-                for output in processor.process(parsed) {
+                for output in processor.process_from(&envelope.conn_id, parsed) {
                     let event = match output {
                         FeedOutput::Event(event) => Some(event),
                         FeedOutput::System(event) => Some(NormalizedEvent::System(event)),

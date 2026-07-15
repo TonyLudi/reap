@@ -201,10 +201,10 @@ fn benchmark_feed(workload: &[CaptureFrame]) -> Measurement<WorkCounters> {
     let mut processor = FeedProcessor::new(100_000, 4_096);
     measure(|| {
         let mut counters = WorkCounters::default();
-        for events in parsed {
+        for (source, events) in parsed {
             counters.parsed += events.len() as u64;
             for event in events {
-                let outputs = processor.process(event);
+                let outputs = processor.process_from(&source, event);
                 counters.feed_outputs += outputs.len() as u64;
                 black_box(outputs);
             }
@@ -244,7 +244,7 @@ fn benchmark_parity(workload: &[CaptureFrame]) -> Measurement<WorkCounters> {
             black_box(raw_storage_record(frame));
             for event in adapters.parse(frame) {
                 counters.parsed += 1;
-                for output in processor.process(event) {
+                for output in processor.process_from(&frame.envelope.conn_id, event) {
                     counters.feed_outputs += 1;
                     let output = coordinator
                         .process_feed(output)
@@ -277,18 +277,23 @@ fn print_measurement(name: &str, units: usize, measurement: &Measurement<WorkCou
     );
 }
 
-fn preparse(workload: &[CaptureFrame]) -> Vec<Vec<ParsedEvent>> {
+fn preparse(workload: &[CaptureFrame]) -> Vec<(ConnId, Vec<ParsedEvent>)> {
     let adapters = Adapters::new();
-    workload.iter().map(|frame| adapters.parse(frame)).collect()
+    workload
+        .iter()
+        .map(|frame| (frame.envelope.conn_id.clone(), adapters.parse(frame)))
+        .collect()
 }
 
 fn precompute_feed_outputs(workload: &[CaptureFrame]) -> Vec<FeedOutput> {
     let mut processor = FeedProcessor::new(100_000, 4_096);
-    preparse(workload)
-        .into_iter()
-        .flatten()
-        .flat_map(|event| processor.process(event))
-        .collect()
+    let mut outputs = Vec::new();
+    for (source, events) in preparse(workload) {
+        for event in events {
+            outputs.extend(processor.process_from(&source, event));
+        }
+    }
+    outputs
 }
 
 fn raw_storage_record(frame: &CaptureFrame) -> StorageRecord {

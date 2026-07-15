@@ -1568,7 +1568,9 @@ impl BacktestRunner {
 
     fn advance_metric_clock(&mut self, target_ns: u64) {
         if let Some(previous_ns) = self.metric_clock_ns {
-            let elapsed_ns = target_ns.saturating_sub(previous_ns);
+            // Carry actions may run before the first input in the next replay segment.
+            let observation_start_ns = self.first_arrival_ns.unwrap_or(target_ns);
+            let elapsed_ns = target_ns.saturating_sub(previous_ns.max(observation_start_ns));
             self.abs_delta_time_integral += self.current_abs_delta_usd * elapsed_ns as f64;
             if self.current_inventory_open {
                 self.inventory_open_duration_ns =
@@ -2022,9 +2024,16 @@ impl BacktestRunner {
         let order_entry_ready_at_end = self.order_entry_ready();
         let observed_duration_ns = self
             .first_arrival_ns
-            .zip(self.last_arrival_ns)
-            .map(|(first, last)| last.saturating_sub(first))
+            .zip(self.metric_clock_ns)
+            .map(|(first, metric_horizon)| metric_horizon.saturating_sub(first))
             .unwrap_or(0);
+        if self.inventory_open_duration_ns > observed_duration_ns {
+            bail!(
+                "inventory-open duration {}ns exceeds observed metric horizon {}ns",
+                self.inventory_open_duration_ns,
+                observed_duration_ns
+            );
+        }
         let average_abs_delta_usd = if observed_duration_ns == 0 {
             0.0
         } else {
@@ -2975,6 +2984,9 @@ mod tests {
 
         assert_eq!(second_report.funding_settlements, 1);
         assert!((second_report.funding_pnl_usd + 0.500_035).abs() < 1e-9);
+        assert_eq!(second_report.observed_duration_ns, 0);
+        assert_eq!(second_report.inventory_open_duration_ns, 0);
+        assert_eq!(second_report.inventory_open_fraction, 0.0);
         assert!(
             second_report.settled_carry_state.is_some(),
             "{:?}",
@@ -3494,6 +3506,26 @@ mod tests {
         assert!(report.final_valuation_complete);
         assert_eq!(report.invalid_risk_metric_samples, 0);
         assert!(report.accounting_complete);
+    }
+
+    #[test]
+    fn raw_horizon_extends_metric_duration_past_the_last_normalized_event() {
+        let mut runner = BacktestRunner::new(config()).unwrap();
+        for event in initial_books() {
+            runner.process_replay_event(event).unwrap();
+        }
+        runner
+            .process_replay_event(external_spot_fill(2, 50_000.0))
+            .unwrap();
+        runner.advance_raw_horizon(3 * NS_PER_MS).unwrap();
+
+        let report = runner.finish_report().unwrap();
+
+        assert_eq!(report.first_arrival_ns, Some(NS_PER_MS));
+        assert_eq!(report.last_arrival_ns, Some(2 * NS_PER_MS));
+        assert_eq!(report.observed_duration_ns, 2 * NS_PER_MS);
+        assert_eq!(report.inventory_open_duration_ns, NS_PER_MS);
+        assert_eq!(report.inventory_open_fraction, 0.5);
     }
 
     #[test]

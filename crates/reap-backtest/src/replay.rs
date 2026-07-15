@@ -368,7 +368,7 @@ fn replay_raw_capture_timed_selected<R: std::io::Read>(
             .parse(&envelope)
             .with_context(|| format!("failed to parse raw capture line {line_number}"))?;
         for parsed in parsed {
-            for output in processor.process(parsed) {
+            for output in processor.process_from(&envelope.conn_id, parsed) {
                 match output {
                     FeedOutput::Event(event) => {
                         if selected {

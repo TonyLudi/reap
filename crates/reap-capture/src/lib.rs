@@ -874,6 +874,7 @@ async fn run_capture_loop(
                                 channel: Channel::Books,
                                 symbol,
                             },
+                            source_conn_id: None,
                             expected_prev: None,
                             received_prev: 0,
                             received_seq: 0,
@@ -1006,7 +1007,7 @@ impl CaptureState {
 
         let mut recoveries = Vec::new();
         for parsed in parsed {
-            for output in self.processor.process(parsed) {
+            for output in self.processor.process_from(&envelope.conn_id, parsed) {
                 match output {
                     FeedOutput::Event(event) => {
                         if let Some(writer) = normalized_writer {
@@ -1743,8 +1744,9 @@ mod tests {
             .unwrap();
         let capture: RawCapture = serde_json::from_str(first_line).unwrap();
         let adapter = OkxAdapter::default();
-        for parsed in adapter.parse(&capture.into_envelope().unwrap()).unwrap() {
-            let _ = state.processor.process(parsed);
+        let envelope = capture.into_envelope().unwrap();
+        for parsed in adapter.parse(&envelope).unwrap() {
+            let _ = state.processor.process_from(&envelope.conn_id, parsed);
         }
 
         let report = state.report(

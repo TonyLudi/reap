@@ -28,6 +28,7 @@ pub enum SequenceOutcome {
 pub struct SequenceTracker {
     status: SequenceStatus,
     last_seq_id: Option<i64>,
+    last_ts_ms: Option<u64>,
     buffered: VecDeque<SequencedBookUpdate>,
     max_buffered: usize,
     reset_count: u64,
@@ -39,6 +40,7 @@ impl SequenceTracker {
         Self {
             status: SequenceStatus::Empty,
             last_seq_id: None,
+            last_ts_ms: None,
             buffered: VecDeque::new(),
             max_buffered: max_buffered.max(1),
             reset_count: 0,
@@ -93,7 +95,7 @@ impl SequenceTracker {
             SequenceStatus::Ready => {
                 let last = self.last_seq_id.expect("ready sequence must have last id");
                 if update.prev_seq_id == last {
-                    self.record_contiguous_transition(last, update.seq_id);
+                    self.record_contiguous_transition(last, update.seq_id, update.ts_ms);
                     return SequenceOutcome::Apply(vec![update]);
                 }
                 let received_prev = update.prev_seq_id;
@@ -117,28 +119,19 @@ impl SequenceTracker {
 
     fn on_snapshot(&mut self, snapshot: SequencedBookUpdate) -> SequenceOutcome {
         let previous_seq_id = self.last_seq_id;
-        if self.status == SequenceStatus::Ready {
-            let last = previous_seq_id.expect("ready sequence must have last id");
-            if snapshot.seq_id < last {
-                return SequenceOutcome::Duplicate;
-            }
-            if snapshot.seq_id == last {
-                self.status = SequenceStatus::Recovering;
-                self.buffered.clear();
-                return SequenceOutcome::RecoveryRequired {
-                    expected_prev: Some(last),
-                    received_prev: snapshot.prev_seq_id,
-                    received_seq: snapshot.seq_id,
-                };
-            }
-        }
-        if self.status != SequenceStatus::Ready
-            && previous_seq_id.is_some_and(|last| snapshot.seq_id < last)
+        if self.status == SequenceStatus::Ready
+            && self
+                .last_ts_ms
+                .is_some_and(|last_ts_ms| snapshot.ts_ms < last_ts_ms)
         {
+            return SequenceOutcome::Duplicate;
+        }
+        if previous_seq_id.is_some_and(|last| snapshot.seq_id < last) {
             self.reset_count = self.reset_count.saturating_add(1);
         }
         let snapshot_ts_ms = snapshot.ts_ms;
         self.last_seq_id = Some(snapshot.seq_id);
+        self.last_ts_ms = Some(snapshot.ts_ms);
         let mut apply = vec![snapshot];
         let mut pending = self.buffered.drain(..).collect::<Vec<_>>();
         pending.retain(|update| update.ts_ms >= snapshot_ts_ms);
@@ -170,7 +163,7 @@ impl SequenceTracker {
                 break;
             };
             let update = pending.remove(index);
-            self.record_contiguous_transition(last, update.seq_id);
+            self.record_contiguous_transition(last, update.seq_id, update.ts_ms);
             apply.push(update);
         }
         let last = self.last_seq_id.expect("snapshot set last id");
@@ -189,13 +182,14 @@ impl SequenceTracker {
         SequenceOutcome::Apply(apply)
     }
 
-    fn record_contiguous_transition(&mut self, previous: i64, next: i64) {
+    fn record_contiguous_transition(&mut self, previous: i64, next: i64, ts_ms: u64) {
         if next < previous {
             self.reset_count = self.reset_count.saturating_add(1);
         } else if next == previous {
             self.same_sequence_count = self.same_sequence_count.saturating_add(1);
         }
         self.last_seq_id = Some(next);
+        self.last_ts_ms = Some(ts_ms);
     }
 
     fn buffer(&mut self, update: SequencedBookUpdate) -> Result<(), String> {
@@ -357,19 +351,15 @@ mod tests {
     }
 
     #[test]
-    fn non_deduplicated_equal_snapshot_requires_recovery() {
+    fn equal_timestamp_snapshot_can_reinitialize_one_source() {
         let mut tracker = SequenceTracker::new(8);
         tracker.on_update(update(BookAction::Snapshot, -1, 10));
 
         assert!(matches!(
             tracker.on_update(update(BookAction::Snapshot, -1, 10)),
-            SequenceOutcome::RecoveryRequired {
-                expected_prev: Some(10),
-                received_prev: -1,
-                received_seq: 10,
-            }
+            SequenceOutcome::Apply(_)
         ));
-        assert_eq!(tracker.status(), SequenceStatus::Recovering);
+        assert_eq!(tracker.status(), SequenceStatus::Ready);
     }
 
     #[test]

@@ -328,7 +328,7 @@ impl<'a> CaptureAnalyzer<'a> {
             }
 
             let before = self.processor.stats().clone();
-            let outputs = self.processor.process(parsed);
+            let outputs = self.processor.process_from(&envelope.conn_id, parsed);
             let after = self.processor.stats().clone();
             if let Some(key) = &key {
                 let stream = self.streams.entry(key.clone()).or_default();

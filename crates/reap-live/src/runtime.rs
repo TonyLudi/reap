@@ -2725,7 +2725,7 @@ impl LiveRuntime {
                             .is_data_frame(&envelope)
                             .map_err(|error| LiveRuntimeError::FeedAdapter(error.to_string()))?);
                 for event in parsed {
-                    for output in self.processor.process(event) {
+                    for output in self.processor.process_from(&envelope.conn_id, event) {
                         let strategy_visible_ns = unix_time_ns();
                         self.observe_feed_latency(
                             &output,

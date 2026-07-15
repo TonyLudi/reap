@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
-use reap_core::{RawEnvelope, Symbol, Venue};
+use reap_core::{ConnId, RawEnvelope, Symbol, Venue};
 use reap_venue::{VenueAdapter, okx::OkxSigner};
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc, watch};
@@ -22,6 +22,10 @@ use crate::{
 /// OKX documents at most three WebSocket connection requests per second per IP.
 pub const OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS: u64 = 334;
 pub const DEFAULT_OKX_CONNECTION_ATTEMPT_PACER_PATH: &str = "var/reap/okx-connection-attempt.pacer";
+
+type RecoveryStreamKey = (Venue, Symbol);
+type RecoveryRoute = (ConnId, watch::Sender<u64>);
+type RecoveryRoutes = HashMap<RecoveryStreamKey, Vec<RecoveryRoute>>;
 
 const SHARED_PACER_STATE_MAGIC: &str = "reap-okx-connect-pacer-v1";
 const MAX_SHARED_PACER_STATE_BYTES: u64 = 128;
@@ -576,7 +580,7 @@ pub struct SupervisedFeed {
     pub raw: mpsc::Receiver<RawEnvelope>,
     pub status: mpsc::Receiver<ConnectionStatus>,
     shutdown: watch::Sender<bool>,
-    recovery_routes: HashMap<(Venue, Symbol), Vec<watch::Sender<u64>>>,
+    recovery_routes: RecoveryRoutes,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -600,7 +604,14 @@ impl SupervisedFeed {
         };
         routes
             .iter()
-            .filter(|route| {
+            .filter(|(conn_id, route)| {
+                if request
+                    .source_conn_id
+                    .as_ref()
+                    .is_some_and(|source| source != conn_id)
+                {
+                    return false;
+                }
                 let next = route.borrow().wrapping_add(1);
                 route.send(next).is_ok()
             })
@@ -627,7 +638,7 @@ pub fn spawn_supervised_feed(
     let (status_tx, status_rx) = mpsc::channel(channel_capacity.max(1));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut tasks = Vec::new();
-    let mut recovery_routes: HashMap<(Venue, Symbol), Vec<watch::Sender<u64>>> = HashMap::new();
+    let mut recovery_routes = RecoveryRoutes::new();
     for plan in plans {
         let (recovery_tx, recovery_rx) = watch::channel(0_u64);
         let mut routed_symbols = HashSet::new();
@@ -639,7 +650,7 @@ pub fn spawn_supervised_feed(
                 recovery_routes
                     .entry((plan.venue, symbol.clone()))
                     .or_default()
-                    .push(recovery_tx.clone());
+                    .push((plan.conn_id.clone(), recovery_tx.clone()));
             }
         }
         let adapter = Arc::clone(&adapter);
@@ -1059,8 +1070,9 @@ mod tests {
     }
 
     #[test]
-    fn recovery_request_notifies_registered_socket() {
-        let (route, mut route_rx) = watch::channel(0_u64);
+    fn unscoped_recovery_notifies_every_registered_socket() {
+        let (first_route, mut first_rx) = watch::channel(0_u64);
+        let (second_route, mut second_rx) = watch::channel(0_u64);
         let (_raw_tx, raw_rx) = mpsc::channel(1);
         let (_status_tx, status_rx) = mpsc::channel(1);
         let (shutdown, _shutdown_rx) = watch::channel(false);
@@ -1068,7 +1080,13 @@ mod tests {
             raw: raw_rx,
             status: status_rx,
             shutdown,
-            recovery_routes: HashMap::from([((Venue::Okx, "BTC-USDT".to_string()), vec![route])]),
+            recovery_routes: HashMap::from([(
+                (Venue::Okx, "BTC-USDT".to_string()),
+                vec![
+                    (ConnId::new("book-0"), first_route),
+                    (ConnId::new("book-1"), second_route),
+                ],
+            )]),
             tasks: Vec::new(),
         };
         let request = RecoveryRequest {
@@ -1077,14 +1095,56 @@ mod tests {
                 channel: Channel::Books,
                 symbol: "BTC-USDT".to_string(),
             },
+            source_conn_id: None,
+            expected_prev: Some(10),
+            received_prev: 11,
+            received_seq: 12,
+        };
+
+        assert_eq!(feed.request_recovery(&request), 2);
+        assert!(first_rx.has_changed().unwrap());
+        assert!(second_rx.has_changed().unwrap());
+        assert_eq!(*first_rx.borrow_and_update(), 1);
+        assert_eq!(*second_rx.borrow_and_update(), 1);
+    }
+
+    #[test]
+    fn source_scoped_recovery_only_notifies_failed_socket() {
+        let (first_route, first_rx) = watch::channel(0_u64);
+        let (second_route, mut second_rx) = watch::channel(0_u64);
+        let (_raw_tx, raw_rx) = mpsc::channel(1);
+        let (_status_tx, status_rx) = mpsc::channel(1);
+        let (shutdown, _shutdown_rx) = watch::channel(false);
+        let failed_source = ConnId::new("book-1");
+        let feed = SupervisedFeed {
+            raw: raw_rx,
+            status: status_rx,
+            shutdown,
+            recovery_routes: HashMap::from([(
+                (Venue::Okx, "BTC-USDT".to_string()),
+                vec![
+                    (ConnId::new("book-0"), first_route),
+                    (failed_source.clone(), second_route),
+                ],
+            )]),
+            tasks: Vec::new(),
+        };
+        let request = RecoveryRequest {
+            stream: crate::FeedStreamId {
+                venue: Venue::Okx,
+                channel: Channel::Books,
+                symbol: "BTC-USDT".to_string(),
+            },
+            source_conn_id: Some(failed_source),
             expected_prev: Some(10),
             received_prev: 11,
             received_seq: 12,
         };
 
         assert_eq!(feed.request_recovery(&request), 1);
-        assert!(route_rx.has_changed().unwrap());
-        assert_eq!(*route_rx.borrow_and_update(), 1);
+        assert!(!first_rx.has_changed().unwrap());
+        assert!(second_rx.has_changed().unwrap());
+        assert_eq!(*second_rx.borrow_and_update(), 1);
     }
 
     #[test]

@@ -164,7 +164,7 @@ pub fn replay_check<R: Read>(reader: R) -> Result<ReplayCheckReport> {
                 .find(|adapter| adapter.venue() == envelope.venue)
                 .context("no adapter registered for capture venue")?;
             for parsed in adapter.parse(&envelope)? {
-                for output in processor.process(parsed) {
+                for output in processor.process_from(&envelope.conn_id, parsed) {
                     if let FeedOutput::System(event) = output {
                         tracing::debug!(?event, "raw replay system event");
                     }
@@ -243,7 +243,7 @@ mod tests {
         assert_eq!(report.capture_sessions, 1);
         assert_eq!(report.sequenced_records, 0);
         assert!(!report.capture_record_sequence_complete);
-        assert_eq!(report.gaps, 1);
+        assert_eq!(report.gaps, 2);
         assert_eq!(report.recoveries, 1);
         assert_eq!(report.books[0].last_seq_id, Some(103));
         assert_eq!(report.books[0].best_bid, Some(100.2));
@@ -262,10 +262,10 @@ mod tests {
         assert!(report.capture_record_sequence_complete);
         assert_eq!(report.duplicates, 3);
         assert_eq!(report.gaps, 0);
-        assert_eq!(report.sequence_resets, 1);
-        assert_eq!(report.same_sequence_updates, 1);
-        assert_eq!(report.books[0].sequence_resets, 1);
-        assert_eq!(report.books[0].same_sequence_updates, 1);
+        assert_eq!(report.sequence_resets, 2);
+        assert_eq!(report.same_sequence_updates, 2);
+        assert_eq!(report.books[0].sequence_resets, 2);
+        assert_eq!(report.books[0].same_sequence_updates, 2);
         assert_eq!(report.books[0].last_seq_id, Some(5));
         assert_eq!(report.books[0].best_bid, Some(100.1));
         assert_eq!(report.books[0].best_ask, Some(100.9));

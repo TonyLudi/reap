@@ -104,6 +104,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
   no-change updates, deduplicate byte-identical images across sequence epochs,
   fail closed on conflicting replicas, and cover reset/recovery with raw replay
   fixtures.
+- [x] Scope OKX sequence trackers and full-book reducers by websocket `conn_id`,
+  let global duplicates advance every source independently, arbitrate canonical
+  reconstructed books, and route a source-local gap only to its failed socket.
 - [x] Give capture output create-new owner-only semantics with per-run CLI path
   overrides, then complete a real public capture, strict replay, and raw
   backtest smoke.
@@ -126,6 +129,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
   shallow-cross queue-ahead reset semantics and application default.
 - [x] Add reportable queue-ahead, historical-trade participation, and
   displayed-depth capacity controls for conservative execution sensitivity.
+- [x] Close raw-replay risk integrals at the persisted raw-record horizon, use
+  that same horizon for observed duration, and fail if inventory-open time can
+  exceed the denominator used by research gates.
 - [x] Add manifest-driven walk-forward candidate selection, chronological
   train/test isolation, conservative sensitivity scenarios, deterministic
   provenance, and machine-verifiable accounting/risk/performance gates.

@@ -174,14 +174,15 @@ Responsibilities:
   network startup.
 - Separate per-socket transport liveness from aggregate private-state health.
 - Raw message timestamping.
-- Deduplication.
-- Sequence checking and gap detection.
-- Snapshot fetch and buffered delta replay.
+- Cross-socket deduplication without suppressing per-socket sequence advancement.
+- Per-socket sequence checking, full-book reduction, and gap detection.
+- Source-scoped snapshot recovery and canonical cross-replica book arbitration.
 - Channel-level health metrics.
 
-Key design point: `reap-feed` emits normalized events only after dedup and
-sequence handling. The strategy should not know which websocket produced an
-event.
+Key design point: each websocket advances its own sequence tracker and full-book
+reducer before a canonical book is selected. `reap-feed` emits normalized events
+only after that arbitration. The strategy should not know which websocket
+produced an event.
 
 Suggested modules:
 
@@ -1143,9 +1144,21 @@ pub struct RawEnvelope {
 }
 ```
 
-The adapter parses raw payloads into normalized candidate events. The dedup and
-sequence layer decides whether each candidate is an exact redundant image, a
-contiguous update, stale, gapped, or requires recovery.
+The adapter parses raw payloads into normalized candidate events. Global dedup
+classifies exact redundant images for reporting, but every book image also passes
+through deduplication scoped by `conn_id` and then that socket's sequence tracker
+and full-book reducer. This mirrors the pinned Java subscriber's
+`sessionType/connectionIdx/symbol` ownership and prevents asynchronous snapshots
+from one replica from advancing another replica's predecessor state.
+
+Canonical arbitration sees only valid reconstructed books. A newer exchange
+timestamp becomes canonical. At the same timestamp and sequence, an equivalent
+full book is an ignored replica and a different full book is an integrity
+conflict. Same-timestamp forward predecessor continuity can advance the
+canonical book; a lagging reverse transition is ignored. A source-local gap
+requests a fresh snapshot from only that `conn_id`; another ready source keeps
+the canonical book available. An aggregate stale state or replica conflict
+fails closed and recovers all relevant book sockets.
 
 ## Deduplication
 
@@ -1163,8 +1176,10 @@ conflicting contents from being silently suppressed. A key containing only
 Dedup rules:
 
 - Book snapshots/deltas: use the complete sequence-transition key above; only
-  a byte-identical image from another socket is a duplicate. Conflicting content
-  with the same transition reaches sequencing and forces recovery.
+  a byte-identical image from another socket is a global duplicate. It still
+  initializes or advances that socket's independent sequence/book state.
+  Conflicting content reaches canonical full-book arbitration and forces
+  recovery of every conflicting source.
 - Trades: prefer trade id.
 - Private fills: prefer execution id or fill id, scoped by venue, account, and
   instrument because OKX only guarantees `tradeId` uniqueness per instrument.

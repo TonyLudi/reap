@@ -144,12 +144,15 @@ files without ordinals remain readable for diagnostics but cannot pass current
 capture or production-research evidence gates.
 
 Book deduplication keys exact redundant images by action, `prevSeqId`, `seqId`,
-exchange timestamp, and raw-payload hash. A replica conflict is not suppressed;
-it fails predecessor validation and forces recovery. Continuity requires
-`prevSeqId` to equal the last accepted `seqId`; the next `seqId` may be equal for
-a no-change update or lower after exchange maintenance. Those valid cases increment
-`same_sequence_updates` or `sequence_resets`. A predecessor mismatch remains a
-gap and forces fresh-snapshot recovery.
+exchange timestamp, and raw-payload hash. Global duplicates remain visible to
+each socket's independent sequence tracker and full-book reducer. Continuity on
+each `conn_id` requires `prevSeqId` to equal that source's last `seqId`; the next
+`seqId` may be equal for a no-change update or lower after exchange maintenance.
+Those per-source observations increment `same_sequence_updates` or
+`sequence_resets`. A predecessor mismatch requests a fresh snapshot from only
+that source while another ready replica preserves the canonical book. Different
+reconstructed books at the same exchange timestamp and sequence fail closed and
+restart every conflicting source.
 
 OKX has deprecated the order-book checksum and documents that the field remains
 zero. Capture integrity therefore relies on WSS transport, sequence links,
@@ -259,6 +262,9 @@ Raw replay orders the local event loop by persisted `recv_ts_ns`; CSV and
 normalized replay use event timestamps. The runner applies market data first
 when an activation or cancel is due at the same scheduler instant. It stops at
 the last observed input instead of executing future actions against stale depth.
+For raw captures, risk integrals and `observed_duration_ns` both close at the
+selected range's maximum persisted receive timestamp, even when the final raw
+record is a duplicate or control frame that emits no normalized event.
 Always inspect `input_clock_regressions`, `live_orders`, `max_active_orders`,
 maximum/final active-order notional, maximum/final position and pending delta,
 `pending_scheduled_actions`, and the five pending-action category counts.
