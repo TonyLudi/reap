@@ -345,6 +345,12 @@ Responsibilities:
 - Wire feeds, book reducers, strategy, risk, order gateway, storage, telemetry.
 - Own task topology.
 - Own bounded channels and backpressure policy.
+- Separate the order-safety deadline from the runtime-owner teardown deadline.
+  Signal host, operator, feed, order-command, command, reconciliation, and
+  safety owners before awaiting any one owner. A teardown timeout aborts every
+  remaining owned task, retains Cancel All After, releases local sockets and
+  journal ownership, and becomes typed non-clean report evidence. Successful
+  journal close flushes and data-syncs before the runtime report is built.
 - Bind every path-launched live report to exact source-config bytes and effective
   fingerprints. Offline verification treats the report as untrusted, re-derives
   clean-soak status, and checks mode, build/Java provenance, host/account
@@ -720,6 +726,14 @@ readiness snapshot, post-cleanup active-order count, and all accumulated
 evidence. The report is persisted before the original error produces a nonzero
 exit. Failures before runtime construction cannot claim runtime state and leave
 only an empty reserved path plus process logs.
+
+`runtime.shutdown_timeout_ms` bounds canonical cancellation and authoritative
+REST reconciliation. The separate `runtime.teardown_timeout_ms` bounds all task
+joins, websocket owners, host/operator services, journal flush plus `sync_data`,
+and the nested alert drain. Cancellation-safe owner destructors signal and abort
+their child tasks if that future is dropped. Production evidence requires both
+runtime deadlines to total at most 40 seconds under the hardened 45-second
+systemd stop boundary, reserving five seconds for report durability and exit.
 
 Baseline and stress profiles must share a seed. Research accepts a stress
 distribution only when it first-order stochastically dominates the effective

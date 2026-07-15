@@ -119,6 +119,7 @@ connection_attempt_pacer_path = "var/reap/okx-connection-attempt.pacer"
 timer_interval_ms = 100
 readiness_timeout_ms = 30000
 shutdown_timeout_ms = 15000
+teardown_timeout_ms = 15000
 rest_connect_timeout_ms = 2000
 rest_request_timeout_ms = 5000
 order_request_expiry_ms = 1000

@@ -94,6 +94,13 @@ Feed drain, host shutdown, writer enqueue/shutdown, abort wait, and best-effort
 failure scan are bounded in process, while the unit's 45-second stop timeout is
 the final hard boundary.
 
+Live configs use `runtime.shutdown_timeout_ms = 15000` for cancel/reconcile and
+`runtime.teardown_timeout_ms = 15000` for all task, websocket, journal, and
+alert owners. Production evidence rejects a combined in-process budget above 40
+seconds, leaving at least five seconds under `TimeoutStopSec=45s` to fsync the
+schema-8 report and exit. A `teardown_timeout` report is an incident: remaining
+tasks were aborted and Cancel All After was deliberately left armed.
+
 Configure the host monitoring system to page on unit activation failure,
 non-zero exit, start-limit exhaustion, forced `SIGKILL`, and host clock/disk/
 memory alerts. Review `systemd-analyze security`, resource limits, CPU affinity,

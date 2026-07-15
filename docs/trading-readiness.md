@@ -824,6 +824,36 @@ production trading process.
     workspace warnings-denied Clippy, all 748 tests, optimized release build,
     hardened systemd verification, and RustSec audit pass. Credentialed
     target-host demo, economic, calibration, and approval gates remain open.
+65. Live process teardown is now application-deadline-bound separately from
+    order safety. `runtime.shutdown_timeout_ms` retains 15 seconds for canonical
+    cancel plus authoritative reconciliation; the new
+    `runtime.teardown_timeout_ms` gives all host, operator, feed,
+    order-command, command/reconciliation/safety, storage, and alert owners one
+    additional 15-second budget. Every owner is signalled before joins. If the
+    budget expires, cancellation-safe owner drops abort remaining tasks, remove
+    the operator socket, release the journal lease, preserve Cancel All After,
+    and produce stable `teardown_timeout` non-clean schema-8 evidence. A normal
+    journal close now flushes and calls `sync_data`.
+
+    Production-evidence config policy limits the two in-process deadlines to 40
+    seconds under the checked-in 45-second systemd stop boundary, preserving at
+    least five seconds for report serialization, file/directory sync, and exit;
+    enabled alert drain must fit inside the teardown deadline. A deterministic
+    stalled-task regression returned the typed report inside 25 ms, observed
+    cancellation, and reacquired the aborted writer's journal lease. Targeted
+    warnings-denied Clippy and 339 feed/live/storage/telemetry tests pass.
+    Workspace formatting, warnings-denied Clippy, all 751 tests, optimized CLI
+    build, release config-validation smoke, hardened systemd verification, and
+    RustSec audit also pass. The release executable SHA-256 is
+    `1b4b3e7ed3647c05c8870b45136ba2332b94abbb61ec50e799bb91ca4bfa3cf3`.
+
+    This follows pinned Java `ChaosStrategyBase.doStop` ordering across quoter,
+    writer, timer/subscription, context, and calculator release, and
+    `ChaosStrategyEngine.clear` dispatcher ownership. Java schedules delayed
+    `ChaosWriter.close` work on `ioInbox` without a versioned whole-runtime
+    completion deadline; the Rust deadline and failure report are explicit
+    lifecycle hardening rather than claimed parity. Credentialed target-host
+    process-death and supervisor evidence remains required.
 
 ## Remaining Demo Gate
 

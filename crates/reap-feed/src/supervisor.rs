@@ -646,10 +646,24 @@ impl SupervisedFeed {
             .count()
     }
 
-    pub async fn shutdown(self) {
+    pub fn request_shutdown(&self) {
         let _ = self.shutdown.send(true);
-        for task in self.tasks {
+    }
+
+    pub async fn shutdown(mut self) {
+        self.request_shutdown();
+        for task in &mut self.tasks {
             let _ = task.await;
+        }
+        self.tasks.clear();
+    }
+}
+
+impl Drop for SupervisedFeed {
+    fn drop(&mut self) {
+        self.request_shutdown();
+        for task in &self.tasks {
+            task.abort();
         }
     }
 }

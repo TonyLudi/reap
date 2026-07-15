@@ -212,6 +212,20 @@ runtime exists, an initialization, event-loop, or teardown error completes
 fail-closed cancellation/reconciliation, persists the schema-8 failure code plus
 pre/post-cleanup evidence, and only then returns the nonzero process error.
 
+Pinned Java `ChaosStrategyBase.doStop` stops quoters, dumps the model, clears
+readiness, schedules `ChaosWriter.close`, stops timers/subscriptions, clears
+entities/context, and stops its calculator. `ChaosStrategyEngine.clear`
+dispatches that stop onto the strategy dispatcher, recycles engine handlers,
+stops the safeguard, and marks the engine stopped without a versioned
+completion deadline; the writer close is itself delayed work on `ioInbox`.
+Reap preserves the same stop-before-resource-release ordering but adds two
+explicit boundaries: bounded cancel/reconcile first, then one bounded teardown
+covering every owned task and durable journal close. All owners are signalled
+before joins begin; expiry aborts remaining Rust tasks, leaves Cancel All After
+armed, and returns stable `teardown_timeout` evidence instead of reporting a
+clean stop or waiting indefinitely. This is lifecycle hardening, not a claim
+that Java exposes equivalent completion evidence.
+
 The same pinned Java tree makes stop/cancel ordering explicit:
 `StrategyEngine.tryToStop` pauses before `cancelAll`, while
 `StrategyOrderSender.cancelAll` emits account-level cancel-all requests across

@@ -1479,9 +1479,11 @@ must set `connection_attempt_pacer_path =
   instance reuses `/etc/reap/capture/okx-btc-public.toml`; use a new instance
   name, environment file, and output directory for every run so no artifact can
   contain multiple capture session IDs or overwrite prior evidence.
-- Set `TimeoutStopSec` above the configured runtime shutdown plus alert-drain
-  deadlines. A forced kill leaves the last exchange deadman in force but must be
-  treated as an incident, followed by the emergency procedure below.
+- Set `TimeoutStopSec` above the configured runtime cancel/reconcile plus
+  whole-runtime teardown deadlines; alert drain is nested inside teardown. The
+  checked-in policy uses 15 + 15 seconds under a 45-second unit boundary. A
+  forced kill leaves the last exchange deadman in force but must be treated as
+  an incident, followed by the emergency procedure below.
 - Monitor activation failures, non-zero exits, start-limit exhaustion, forced
   kills, and host resource/time alarms outside this process. Validate the unit
   files, merged drop-ins, and `systemd-analyze security` on the actual target OS.
@@ -1699,8 +1701,9 @@ in `observe` only after review.
   size-capped, and transport errors omit the secret endpoint URL. With
   `delivery_failure_is_fatal = true`, terminal delivery failure enters the same
   fail-closed cancellation/reconciliation lifecycle as other runtime faults.
-- Teardown drains queued events within `alerts.shutdown_timeout_ms`. Monitor the
-  report fields `alerts_delivered`, `alert_delivery_failures`,
+- Teardown drains queued events within `alerts.shutdown_timeout_ms`, itself
+  bounded by `runtime.teardown_timeout_ms`. Monitor the report fields
+  `alerts_delivered`, `alert_delivery_failures`,
   `alert_failure_notifications_dropped`, and `max_alert_queue_depth`. A process
   supervisor must page on non-zero exit as the independent fallback when the
   alert destination itself is unavailable.
@@ -2505,12 +2508,26 @@ durability failed. If any part of shutdown is unresolved or latch durability is
 uncertain, it leaves the exchange timer armed and terminates the safety task so
 the last timeout can expire.
 
-The `shutdown_timeout_ms` deadline covers cancel queueing, reconciliation, and
-event processing. A persistence failure is retained as an error but does not
-suppress cancel or reconciliation commands. Any unresolved order/account or
-secondary teardown failure is included in the returned lifecycle error and
-must be treated as an incident. Observe mode performs no exchange mutation and
-shuts down directly.
+The `runtime.shutdown_timeout_ms` deadline covers cancel queueing,
+reconciliation, and event processing. The separate
+`runtime.teardown_timeout_ms` deadline covers the complete host/operator/feed,
+order-command, command/reconciliation/safety task, journal, and alert-owner
+teardown after that safety phase. Every owner receives shutdown before the
+runtime awaits any one owner. A persistence failure is retained as an error but
+does not suppress cancel or reconciliation commands. Any unresolved
+order/account or secondary teardown failure is included in the returned
+lifecycle error and must be treated as an incident. Observe mode performs no
+exchange mutation and shuts down directly.
+
+If the teardown deadline expires, cancellation-safe owner destructors abort all
+remaining tasks rather than detaching them, remove the local operator socket,
+release journal ownership, leave Cancel All After armed, and return stable
+`teardown_timeout` failure evidence for the schema-8 report. A normal storage
+close drains queued records, flushes, and calls `sync_data` before teardown can
+pass. The production evidence policy limits
+`shutdown_timeout_ms + teardown_timeout_ms` to 40 seconds under the hardened
+45-second systemd stop boundary, leaving five seconds for report serialization,
+file/directory sync, and process exit.
 
 With `--output`, the CLI reserves the create-new path before configuration,
 credentials, or network startup. If the report-capable runtime's initialization,
@@ -2523,9 +2540,11 @@ report is incident evidence and can never be a clean soak. A failure before
 runtime construction leaves the reserved path empty. Archive it with the
 process log, but never parse or present an empty file as a run report.
 
-Host-guard teardown runs before feed/order task teardown. Alert teardown runs
-last so runtime teardown failures can still be queued, and is independently
-bounded by `alerts.shutdown_timeout_ms`.
+Host, operator, feed, and order owners are signalled together; joins still
+collect host/operator evidence before feed/order task evidence. Alert teardown
+runs last so runtime teardown failures can still be queued, is independently
+bounded by `alerts.shutdown_timeout_ms`, and must fit inside
+`runtime.teardown_timeout_ms` when alerts are enabled.
 
 ## Bounded Soak Acceptance
 

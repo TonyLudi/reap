@@ -295,6 +295,11 @@ architecture in [docs/architecture.md](docs/architecture.md).
   readiness, and bound lossless private-feed queue delivery so a stalled event
   loop forces typed disconnect/reconciliation instead of blocking websocket
   heartbeat and shutdown indefinitely.
+- [x] Add a separately configured whole-runtime teardown deadline after bounded
+  cancel/reconcile, signal every task owner before awaiting it, abort rather than
+  detach remaining tasks, retain typed failure evidence, preserve the exchange
+  deadman, sync the stopped journal, and reserve report/exit time inside the
+  hardened systemd stop budget.
 - [x] Keep order-command heartbeat telemetry best-effort under bounded queue
   saturation while preserving lossless disconnect/fatal transitions; bound its
   shutdown close and the fault proxy's client/upstream handshakes and writes,

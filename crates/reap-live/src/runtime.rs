@@ -253,6 +253,8 @@ pub enum LiveRuntimeError {
         active_orders: usize,
         unreconciled_accounts: usize,
     },
+    #[error("runtime task teardown timed out after {0}ms; remaining owners were aborted")]
+    TeardownTimeout(u64),
     #[error("feed adapter failed: {0}")]
     FeedAdapter(String),
     #[error("runtime task failed: {0}")]
@@ -318,6 +320,7 @@ impl LiveRuntimeError {
             Self::AccountConfigCheck(_) => "account_config_check",
             Self::SafetyLatchSyncTimeout(_) => "safety_latch_sync_timeout",
             Self::ShutdownUnresolved { .. } => "shutdown_unresolved",
+            Self::TeardownTimeout(_) => "teardown_timeout",
             Self::FeedAdapter(_) => "feed_adapter",
             Self::Join(_) => "task_join",
             Self::Signal(_) => "signal",
@@ -1447,6 +1450,7 @@ struct LiveRuntime {
     timer_interval_ms: u64,
     max_feed_age_ms: u64,
     shutdown_timeout_ms: u64,
+    teardown_timeout_ms: u64,
     safety_latch_sync_timeout_ms: u64,
     evidence: RuntimeEvidence,
     latency: LiveLatencyCollector,
@@ -1944,6 +1948,7 @@ impl LiveRuntime {
             timer_interval_ms: config.runtime.timer_interval_ms,
             max_feed_age_ms: config.risk.max_feed_age_ms,
             shutdown_timeout_ms: config.runtime.shutdown_timeout_ms,
+            teardown_timeout_ms: config.runtime.teardown_timeout_ms,
             safety_latch_sync_timeout_ms: config.runtime.safety_latch_sync_timeout_ms,
             evidence: RuntimeEvidence::default(),
             latency: LiveLatencyCollector::default(),
@@ -3699,7 +3704,45 @@ impl LiveRuntime {
     }
 
     async fn shutdown(&mut self) -> Result<(), LiveRuntimeError> {
+        let timeout_ms = self.teardown_timeout_ms;
+        match tokio::time::timeout(Duration::from_millis(timeout_ms), self.shutdown_inner()).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.abort_remaining_teardown();
+                tokio::task::yield_now().await;
+                Err(LiveRuntimeError::TeardownTimeout(timeout_ms))
+            }
+        }
+    }
+
+    async fn shutdown_inner(&mut self) -> Result<(), LiveRuntimeError> {
         let mut errors = Vec::new();
+        if let Some(host_guard) = self.host_guard.as_mut() {
+            host_guard.request_shutdown();
+        }
+        if let Some(service) = self.operator_service.as_mut() {
+            service.request_shutdown();
+        }
+        for feed in &self.feeds {
+            feed.request_shutdown();
+        }
+        for runtime in &self.order_ws_runtimes {
+            runtime.request_shutdown();
+        }
+        for sender in self.order_senders.values() {
+            let _ = sender.try_send(OrderTaskCommand::Shutdown);
+        }
+        self.order_senders.clear();
+        for sender in self.reconcile_senders.values() {
+            let _ = sender.try_send(ReconcileTaskCommand::Shutdown);
+        }
+        self.reconcile_senders.clear();
+        for sender in self.safety_senders.values() {
+            let _ = sender.try_send(SafetyTaskCommand::Shutdown);
+        }
+        self.safety_senders.clear();
+        self.control_rx.close();
+        self.feed_rx.close();
         if let Some(host_guard) = self.host_guard.take() {
             match host_guard.shutdown().await {
                 Ok(stats) => {
@@ -3723,53 +3766,44 @@ impl LiveRuntime {
             errors.push(("operator service", LiveRuntimeError::Operator(error)));
         }
         self.operator_rx.take();
-        for sender in self.order_senders.values() {
-            let _ = sender.try_send(OrderTaskCommand::Shutdown);
-        }
-        self.order_senders.clear();
-        for sender in self.reconcile_senders.values() {
-            let _ = sender.try_send(ReconcileTaskCommand::Shutdown);
-        }
-        self.reconcile_senders.clear();
-        for sender in self.safety_senders.values() {
-            let _ = sender.try_send(SafetyTaskCommand::Shutdown);
-        }
-        self.safety_senders.clear();
-        self.control_rx.close();
-        self.feed_rx.close();
         for feed in self.feeds.drain(..) {
             feed.shutdown().await;
         }
-        for task in self.feed_tasks.drain(..) {
+        for task in &mut self.feed_tasks {
             if let Err(error) = task.await {
                 errors.push(("feed task", LiveRuntimeError::Join(error)));
             }
         }
-        for task in self.order_tasks.drain(..) {
+        self.feed_tasks.clear();
+        for task in &mut self.order_tasks {
             if let Err(error) = task.await {
                 errors.push(("order task", LiveRuntimeError::Join(error)));
             }
         }
-        for task in self.reconcile_tasks.drain(..) {
+        self.order_tasks.clear();
+        for task in &mut self.reconcile_tasks {
             if let Err(error) = task.await {
                 errors.push(("reconciliation task", LiveRuntimeError::Join(error)));
             }
         }
+        self.reconcile_tasks.clear();
         for runtime in self.order_ws_runtimes.drain(..) {
             if let Err(error) = runtime.shutdown().await {
                 errors.push(("order websocket", LiveRuntimeError::Join(error)));
             }
         }
-        for task in self.order_ws_status_tasks.drain(..) {
+        for task in &mut self.order_ws_status_tasks {
             if let Err(error) = task.await {
                 errors.push(("order websocket status", LiveRuntimeError::Join(error)));
             }
         }
-        for task in self.safety_tasks.drain(..) {
+        self.order_ws_status_tasks.clear();
+        for task in &mut self.safety_tasks {
             if let Err(error) = task.await {
                 errors.push(("safety task", LiveRuntimeError::Join(error)));
             }
         }
+        self.safety_tasks.clear();
         if let Some(storage) = self.storage.as_mut()
             && let Err(error) = storage.stop_writer().await
         {
@@ -3824,6 +3858,42 @@ impl LiveRuntime {
         let (_, first) = errors.remove(0);
         let additional = errors;
         Err(combine_lifecycle_errors(first, additional))
+    }
+
+    fn abort_remaining_teardown(&mut self) {
+        self.preserve_deadman_on_shutdown = true;
+        self.order_senders.clear();
+        self.reconcile_senders.clear();
+        self.safety_senders.clear();
+        self.control_rx.close();
+        self.feed_rx.close();
+
+        for task in self
+            .feed_tasks
+            .iter()
+            .chain(self.order_tasks.iter())
+            .chain(self.reconcile_tasks.iter())
+            .chain(self.order_ws_status_tasks.iter())
+            .chain(self.safety_tasks.iter())
+        {
+            task.abort();
+        }
+        self.feed_tasks.clear();
+        self.order_tasks.clear();
+        self.reconcile_tasks.clear();
+        self.order_ws_status_tasks.clear();
+        self.safety_tasks.clear();
+
+        self.feeds.clear();
+        self.order_ws_runtimes.clear();
+        self.operator_service.take();
+        self.operator_rx.take();
+        self.host_guard.take();
+        self.host_failures.take();
+        self.storage.take();
+        self.alert_sink.take();
+        self.alert_runtime.take();
+        self.alert_failures.take();
     }
 }
 
@@ -4982,7 +5052,7 @@ mod tests {
     use reap_risk::{
         InstrumentOrderLimits, InstrumentRiskModel, RiskLimits, StablecoinGuardConfig,
     };
-    use reap_storage::start_jsonl_storage;
+    use reap_storage::{acquire_storage_lease, start_jsonl_storage};
     use reap_strategy::{ChaosConfig, InstrumentKindConfig};
     use reap_venue::okx::{
         HttpResponse, OkxAccountConfig, OkxAccountLevel, OkxCancelOrder, OkxCredentials,
@@ -4991,7 +5061,7 @@ mod tests {
         SignedRequest,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::sync::{Notify, Semaphore};
+    use tokio::sync::{Notify, Semaphore, oneshot};
 
     use crate::{
         LiveAccountConfig, LiveStorageConfig, OkxTradeModeConfig, OkxVenueConfig, RuntimeConfig,
@@ -6410,6 +6480,7 @@ mod tests {
             timer_interval_ms: 100,
             max_feed_age_ms: 60_000,
             shutdown_timeout_ms: 100,
+            teardown_timeout_ms: 1_000,
             safety_latch_sync_timeout_ms: 1_000,
             evidence: RuntimeEvidence::default(),
             latency: LiveLatencyCollector::default(),
@@ -6456,6 +6527,130 @@ mod tests {
         assert_eq!(report.dropped_storage_records, 0);
         assert_eq!(report.active_orders_after_shutdown, 0);
         assert!(report.clean_soak);
+    }
+
+    #[tokio::test]
+    async fn stalled_teardown_is_aborted_and_reported_within_the_deadline() {
+        struct AbortNotice(Option<oneshot::Sender<()>>);
+
+        impl Drop for AbortNotice {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let config = config();
+        let coordinator = ready_coordinator(&config, unix_time_ms(), false);
+        let path = std::env::temp_dir().join(format!(
+            "reap-teardown-timeout-{}-{}.jsonl",
+            std::process::id(),
+            unix_time_ns()
+        ));
+        let storage = start_jsonl_storage(StorageConfig {
+            path: path.clone(),
+            channel_capacity: 1_024,
+            flush_every_records: 1,
+        })
+        .await
+        .unwrap();
+        let storage_sink = storage.sink();
+        let (control_tx, control_rx) = mpsc::channel(16);
+        let (feed_tx, feed_rx) = mpsc::channel(16);
+        let (aborted_tx, aborted_rx) = oneshot::channel();
+        let stalled_task = tokio::spawn(async move {
+            let _notice = AbortNotice(Some(aborted_tx));
+            std::future::pending::<()>().await;
+        });
+        let runtime = LiveRuntime {
+            session_id: "test-teardown-timeout".to_string(),
+            session_started_at_ms: unix_time_ms(),
+            config_source: None,
+            config_fingerprint: "test-config".to_string(),
+            evidence_config_fingerprint: "test-evidence-config".to_string(),
+            executable_sha256: "a".repeat(64),
+            host_identity_sha256: None,
+            account_identity_sha256s: BTreeMap::new(),
+            mode: LiveMode::Observe,
+            run_duration: Some(Duration::from_millis(5)),
+            coordinator,
+            processor: FeedProcessor::new(16, 16),
+            storage: Some(storage),
+            storage_sink,
+            control_rx,
+            feed_rx,
+            order_senders: HashMap::new(),
+            order_tasks: Vec::new(),
+            reconcile_senders: HashMap::new(),
+            reconcile_tasks: Vec::new(),
+            order_ws_runtimes: Vec::new(),
+            order_ws_status_tasks: Vec::new(),
+            safety_senders: HashMap::new(),
+            safety_tasks: Vec::new(),
+            feeds: Vec::new(),
+            feed_tasks: vec![stalled_task],
+            sources: Vec::new(),
+            public_feed_index: 0,
+            reconcile_inflight: HashSet::new(),
+            cancel_inflight: HashSet::new(),
+            last_reconcile_attempt: HashMap::new(),
+            fill_convergence: FillConvergenceGuard::default(),
+            order_convergence: OrderStateConvergenceGuard::new(5_000),
+            readiness_timeout_ms: 1_000,
+            timer_interval_ms: 100,
+            max_feed_age_ms: 60_000,
+            shutdown_timeout_ms: 100,
+            teardown_timeout_ms: 25,
+            safety_latch_sync_timeout_ms: 1_000,
+            evidence: RuntimeEvidence::default(),
+            latency: LiveLatencyCollector::default(),
+            shutdown_in_progress: false,
+            shutdown_storage_error: None,
+            preserve_deadman_on_shutdown: false,
+            shutdown_reconciliation_requested: HashSet::new(),
+            shutdown_reconciled_accounts: HashSet::new(),
+            operator_service: None,
+            operator_rx: None,
+            operator_shutdown_reason: None,
+            alert_runtime: None,
+            alert_sink: None,
+            alert_failures: None,
+            alert_shutdown_timeout_ms: 100,
+            alert_delivery_failure_is_fatal: true,
+            observed_alert_delivery_failures: 0,
+            alert_stats: AlertStats::default(),
+            host_guard: None,
+            host_failures: None,
+            host_preflight: None,
+            host_checks: 0,
+            host_last_snapshot: None,
+        };
+
+        let error = tokio::time::timeout(Duration::from_secs(1), runtime.run())
+            .await
+            .expect("teardown must honor its application deadline")
+            .unwrap_err();
+        drop(control_tx);
+        drop(feed_tx);
+        tokio::time::timeout(Duration::from_secs(1), aborted_rx)
+            .await
+            .expect("stalled task must be aborted")
+            .expect("abort notice sender must remain live until cancellation");
+
+        let LiveRuntimeError::ReportedFailure { source, report } = error else {
+            panic!("teardown timeout must retain a typed run report");
+        };
+        assert!(matches!(*source, LiveRuntimeError::TeardownTimeout(25)));
+        assert_eq!(report.stop_reason, LiveStopReason::RuntimeFailure);
+        assert_eq!(report.failure.as_ref().unwrap().code, "teardown_timeout");
+        assert!(!report.clean_soak);
+
+        let lease =
+            acquire_storage_lease(&path).expect("aborted writer must release journal lease");
+        drop(lease);
+        let _ = std::fs::remove_file(path.with_extension("jsonl.lock"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[cfg(unix)]
@@ -6537,6 +6732,7 @@ mod tests {
             timer_interval_ms: 100,
             max_feed_age_ms: 60_000,
             shutdown_timeout_ms: 1_000,
+            teardown_timeout_ms: 1_000,
             safety_latch_sync_timeout_ms: 1_000,
             evidence: RuntimeEvidence::default(),
             latency: LiveLatencyCollector::default(),
@@ -6826,6 +7022,7 @@ mod tests {
             timer_interval_ms: 100,
             max_feed_age_ms: 60_000,
             shutdown_timeout_ms: 1_000,
+            teardown_timeout_ms: 1_000,
             safety_latch_sync_timeout_ms: 1_000,
             evidence: RuntimeEvidence::default(),
             latency: LiveLatencyCollector::default(),

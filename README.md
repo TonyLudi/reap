@@ -756,6 +756,15 @@ reserved file empty and must be diagnosed from the process log; an empty file
 is never evidence. `verify-live-run` independently re-hashes exact config/report
 bytes, re-derives effective fingerprints and clean-soak acceptance, and checks
 mode, identity, readiness, failure, disconnect, host, and latency invariants.
+
+Live shutdown uses separate safety and ownership deadlines. The first bounds
+cancel/reconcile; `runtime.teardown_timeout_ms` then bounds every host,
+operator, websocket, command, storage, and alert owner. All owners are signalled
+before joins, successful journal close flushes and data-syncs, and timeout
+aborts remaining tasks while retaining Cancel All After and emitting typed
+`teardown_timeout` evidence. Production evidence reserves five seconds of the
+hardened 45-second systemd stop budget for report durability and exit.
+
 The demo-only fault proxy can produce a validated loopback live config and run
 outside the strategy process:
 

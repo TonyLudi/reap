@@ -192,7 +192,7 @@ impl AlertSink {
 pub struct AlertRuntime {
     sink: AlertSink,
     failures: Option<mpsc::Receiver<AlertDeliveryFailure>>,
-    task: JoinHandle<Result<(), AlertError>>,
+    task: Option<JoinHandle<Result<(), AlertError>>>,
     delivered: Arc<AtomicU64>,
     failed: Arc<AtomicU64>,
     failure_notifications_dropped: Arc<AtomicU64>,
@@ -209,13 +209,20 @@ impl AlertRuntime {
             .expect("alert failure receiver can only be taken once")
     }
 
-    pub async fn shutdown(self) -> Result<AlertStats, AlertError> {
+    pub async fn shutdown(mut self) -> Result<AlertStats, AlertError> {
         self.sink
             .sender
             .send(AlertCommand::Shutdown)
             .await
             .map_err(|_| AlertError::Closed)?;
-        self.task.await??;
+        let result = match self.task.as_mut() {
+            Some(task) => Some(task.await),
+            None => None,
+        };
+        self.task.take();
+        if let Some(result) = result {
+            result??;
+        }
         Ok(AlertStats {
             delivered: self.delivered.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
@@ -224,6 +231,15 @@ impl AlertRuntime {
                 .load(Ordering::Relaxed),
             max_queue_depth: self.sink.max_queue_depth.load(Ordering::Relaxed),
         })
+    }
+}
+
+impl Drop for AlertRuntime {
+    fn drop(&mut self) {
+        let _ = self.sink.sender.try_send(AlertCommand::Shutdown);
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
 }
 
@@ -270,7 +286,7 @@ pub fn start_webhook_alerts(config: WebhookAlertConfig) -> Result<AlertRuntime, 
             max_queue_depth,
         },
         failures: Some(failures),
-        task,
+        task: Some(task),
         delivered,
         failed,
         failure_notifications_dropped,

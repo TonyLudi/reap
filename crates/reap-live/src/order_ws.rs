@@ -67,12 +67,26 @@ pub(crate) struct OkxOrderWsRuntime {
 }
 
 impl OkxOrderWsRuntime {
-    pub async fn shutdown(self) -> Result<(), JoinError> {
+    pub fn request_shutdown(&self) {
         let _ = self.shutdown.send(true);
-        for task in self.tasks {
+    }
+
+    pub async fn shutdown(mut self) -> Result<(), JoinError> {
+        self.request_shutdown();
+        for task in &mut self.tasks {
             task.await?;
         }
+        self.tasks.clear();
         Ok(())
+    }
+}
+
+impl Drop for OkxOrderWsRuntime {
+    fn drop(&mut self) {
+        self.request_shutdown();
+        for task in &self.tasks {
+            task.abort();
+        }
     }
 }
 

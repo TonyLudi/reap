@@ -425,17 +425,22 @@ mod unix {
     }
 
     impl OperatorService {
-        pub(crate) async fn shutdown(mut self) -> Result<(), OperatorError> {
+        pub(crate) fn request_shutdown(&mut self) {
             if let Some(shutdown) = self.shutdown.take() {
                 let _ = shutdown.send(());
             }
-            let task_result = match self.task.take() {
+        }
+
+        pub(crate) async fn shutdown(mut self) -> Result<(), OperatorError> {
+            self.request_shutdown();
+            let task_result = match self.task.as_mut() {
                 Some(task) => match task.await {
                     Ok(result) => result,
                     Err(error) => Err(error.into()),
                 },
                 None => Ok(()),
             };
+            self.task.take();
             let remove_result = remove_socket_if_present(&self.socket_path);
             task_result?;
             remove_result
@@ -444,9 +449,11 @@ mod unix {
 
     impl Drop for OperatorService {
         fn drop(&mut self) {
-            if let Some(shutdown) = self.shutdown.take() {
-                let _ = shutdown.send(());
+            self.request_shutdown();
+            if let Some(task) = &self.task {
+                task.abort();
             }
+            let _ = remove_socket_if_present(&self.socket_path);
         }
     }
 
@@ -715,6 +722,8 @@ pub(crate) struct OperatorService;
 
 #[cfg(not(unix))]
 impl OperatorService {
+    pub(crate) fn request_shutdown(&mut self) {}
+
     pub(crate) async fn shutdown(self) -> Result<(), OperatorError> {
         Err(OperatorError::UnsupportedPlatform)
     }

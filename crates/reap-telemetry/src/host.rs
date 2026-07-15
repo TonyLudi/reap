@@ -134,7 +134,7 @@ pub struct HostGuardStats {
 pub struct HostGuardRuntime {
     failures: Option<mpsc::Receiver<HostHealthError>>,
     shutdown_tx: Option<oneshot::Sender<()>>,
-    task: JoinHandle<HostGuardStats>,
+    task: Option<JoinHandle<HostGuardStats>>,
 }
 
 impl HostGuardRuntime {
@@ -144,11 +144,29 @@ impl HostGuardRuntime {
             .expect("host guard failure receiver can only be taken once")
     }
 
-    pub async fn shutdown(mut self) -> Result<HostGuardStats, tokio::task::JoinError> {
+    pub fn request_shutdown(&mut self) {
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
         }
-        self.task.await
+    }
+
+    pub async fn shutdown(mut self) -> Result<HostGuardStats, tokio::task::JoinError> {
+        self.request_shutdown();
+        let result = match self.task.as_mut() {
+            Some(task) => task.await,
+            None => Ok(HostGuardStats::default()),
+        };
+        self.task.take();
+        result
+    }
+}
+
+impl Drop for HostGuardRuntime {
+    fn drop(&mut self) {
+        self.request_shutdown();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
 }
 
@@ -196,7 +214,7 @@ pub fn start_host_guard(config: HostGuardConfig, storage_path: PathBuf) -> HostG
     HostGuardRuntime {
         failures: Some(failures),
         shutdown_tx: Some(shutdown_tx),
-        task,
+        task: Some(task),
     }
 }
 

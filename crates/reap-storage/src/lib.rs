@@ -335,12 +335,21 @@ impl StorageRuntime {
         self.sink.clone()
     }
 
-    pub async fn stop_writer(&mut self) -> Result<(), StorageError> {
+    pub fn request_shutdown(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        if let Some(task) = self.task.take() {
-            task.await??;
+    }
+
+    pub async fn stop_writer(&mut self) -> Result<(), StorageError> {
+        self.request_shutdown();
+        let result = match self.task.as_mut() {
+            Some(task) => Some(task.await),
+            None => None,
+        };
+        self.task.take();
+        if let Some(result) = result {
+            result??;
         }
         Ok(())
     }
@@ -348,6 +357,15 @@ impl StorageRuntime {
     pub async fn shutdown(mut self) -> Result<(), StorageError> {
         self.stop_writer().await?;
         Ok(())
+    }
+}
+
+impl Drop for StorageRuntime {
+    fn drop(&mut self) {
+        self.request_shutdown();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
 }
 
@@ -827,6 +845,7 @@ async fn run_writer_with_file(
         }
     }
     file.flush().await?;
+    file.sync_data().await?;
     Ok(())
 }
 

@@ -28,6 +28,9 @@ const MIN_EXCHANGE_STATUS_CHECK_INTERVAL_MS: u64 = 5_000;
 const MAX_EXCHANGE_STATUS_LEAD_MS: u64 = 86_400_000;
 const MAX_EXCHANGE_FEE_CHECK_INTERVAL_MS: u64 = 300_000;
 const MAX_EXCHANGE_INSTRUMENT_CHANGE_LEAD_MS: u64 = 604_800_000;
+const MAX_RUNTIME_TEARDOWN_TIMEOUT_MS: u64 = 300_000;
+const PRODUCTION_STOP_BUDGET_MS: u64 = 45_000;
+const PRODUCTION_REPORT_EXIT_MARGIN_MS: u64 = 5_000;
 pub const MAX_ORDER_WEBSOCKET_SESSIONS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,6 +229,7 @@ pub struct RuntimeConfig {
     pub timer_interval_ms: u64,
     pub readiness_timeout_ms: u64,
     pub shutdown_timeout_ms: u64,
+    pub teardown_timeout_ms: u64,
     pub rest_connect_timeout_ms: u64,
     pub rest_request_timeout_ms: u64,
     pub order_request_expiry_ms: u64,
@@ -269,6 +273,7 @@ impl Default for RuntimeConfig {
             timer_interval_ms: 100,
             readiness_timeout_ms: 30_000,
             shutdown_timeout_ms: 15_000,
+            teardown_timeout_ms: 15_000,
             rest_connect_timeout_ms: 2_000,
             rest_request_timeout_ms: 5_000,
             order_request_expiry_ms: 1_000,
@@ -608,6 +613,17 @@ impl LiveConfig {
                 "{prefix}.runtime.connection_attempt_pacer_path must be absolute for production evidence"
             )),
         }
+        let in_process_stop_budget_ms = self
+            .runtime
+            .shutdown_timeout_ms
+            .saturating_add(self.runtime.teardown_timeout_ms);
+        let maximum_in_process_budget_ms =
+            PRODUCTION_STOP_BUDGET_MS - PRODUCTION_REPORT_EXIT_MARGIN_MS;
+        if in_process_stop_budget_ms > maximum_in_process_budget_ms {
+            errors.push(format!(
+                "{prefix}.runtime shutdown_timeout_ms plus teardown_timeout_ms must not exceed {maximum_in_process_budget_ms} for the hardened 45-second stop budget"
+            ));
+        }
         errors
     }
 
@@ -660,6 +676,12 @@ impl LiveConfig {
             );
         }
         validate_alerts(&self.alerts, &mut errors);
+        if self.alerts.enabled && self.runtime.teardown_timeout_ms < self.alerts.shutdown_timeout_ms
+        {
+            errors.push(
+                "runtime.teardown_timeout_ms must cover alerts.shutdown_timeout_ms".to_string(),
+            );
+        }
         validate_host_guard(&self.host_guard, &mut errors);
 
         let mut account_ids = HashSet::new();
@@ -1040,6 +1062,7 @@ fn validate_positive_runtime(runtime: &RuntimeConfig, errors: &mut Vec<String>) 
         ("timer_interval_ms", runtime.timer_interval_ms),
         ("readiness_timeout_ms", runtime.readiness_timeout_ms),
         ("shutdown_timeout_ms", runtime.shutdown_timeout_ms),
+        ("teardown_timeout_ms", runtime.teardown_timeout_ms),
         ("rest_connect_timeout_ms", runtime.rest_connect_timeout_ms),
         ("rest_request_timeout_ms", runtime.rest_request_timeout_ms),
         ("order_request_expiry_ms", runtime.order_request_expiry_ms),
@@ -1118,6 +1141,11 @@ fn validate_positive_runtime(runtime: &RuntimeConfig, errors: &mut Vec<String>) 
         errors.push(
             "runtime.rest_request_timeout_ms must be at least rest_connect_timeout_ms".to_string(),
         );
+    }
+    if runtime.teardown_timeout_ms > MAX_RUNTIME_TEARDOWN_TIMEOUT_MS {
+        errors.push(format!(
+            "runtime.teardown_timeout_ms must not exceed {MAX_RUNTIME_TEARDOWN_TIMEOUT_MS}"
+        ));
     }
     if runtime.max_fill_reconciliation_pages > 1_000 {
         errors.push("runtime.max_fill_reconciliation_pages must not exceed 1000".to_string());
@@ -2299,6 +2327,35 @@ mod tests {
     }
 
     #[test]
+    fn runtime_teardown_deadline_is_positive_bounded_and_covers_alert_drain() {
+        let mut config = valid_config();
+        config.runtime.teardown_timeout_ms = 0;
+        let errors = config.validate().errors;
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("runtime.teardown_timeout_ms must be positive"))
+        );
+
+        let mut config = valid_config();
+        config.runtime.teardown_timeout_ms = MAX_RUNTIME_TEARDOWN_TIMEOUT_MS + 1;
+        let errors = config.validate().errors;
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("runtime.teardown_timeout_ms must not exceed 300000")
+            })
+        );
+
+        let mut config = valid_config();
+        config.alerts.enabled = true;
+        config.alerts.shutdown_timeout_ms = config.runtime.teardown_timeout_ms + 1;
+        let errors = config.validate().errors;
+        assert!(errors.iter().any(|error| {
+            error.contains("runtime.teardown_timeout_ms must cover alerts.shutdown_timeout_ms")
+        }));
+    }
+
+    #[test]
     fn production_evidence_policy_requires_operational_controls_and_redundancy() {
         let mut config = valid_config();
         config.host_guard.enabled = true;
@@ -2336,6 +2393,18 @@ mod tests {
                 "missing {expected} in {errors:?}"
             );
         }
+    }
+
+    #[test]
+    fn production_evidence_reserves_time_for_report_durability_and_exit() {
+        let mut config = valid_config();
+        config.runtime.shutdown_timeout_ms = 25_001;
+        config.runtime.teardown_timeout_ms = 15_000;
+
+        let errors = config.production_evidence_policy_errors("production");
+        assert!(errors.iter().any(|error| {
+            error.contains("shutdown_timeout_ms plus teardown_timeout_ms must not exceed 40000")
+        }));
     }
 
     #[test]
