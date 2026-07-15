@@ -591,6 +591,42 @@ production trading process.
     alerts, the operator service, redundant public and order-command sessions,
     and an absolute shared pacer in both configs, so the aggregate bundle cannot
     admit the checked-in development defaults.
+59. A source-level connectivity audit against pinned Java
+    `OkxNitroSubscriberBase`, `SharedSessionSubscriberBase`, `WsConnectOption`,
+    and the Netty/Vtx websocket clients found that Rust created one recovery
+    watch channel per socket but retained its sender only for book routes. A
+    non-book receiver could therefore be closed from startup and leave an
+    always-ready branch in its connection loop. Every socket now retains an
+    owner for the supervised-feed lifetime, and unexpected route closure is a
+    fatal invariant violation. Feed connection establishment is also bounded to
+    10 seconds and cancellable by shutdown/recovery; bootstrap, subscription,
+    heartbeat, and close writes are bounded to 5 seconds. The existing
+    15-second OKX application ping and independently aged strategy/account
+    components remain separate transport and data-health contracts. Focused
+    connection deadline, route-ownership, and fatal-classification tests plus
+    all 63 `reap-feed` tests pass.
+
+    A fresh optimized-release 60-second diagnostic then exercised all 11
+    configured logical streams from two sources across 12 socket plans. All 12
+    were ready at stop, both books were ready, and six host checks passed. Its
+    5,647 exact raw ordinals contained 2,835 accepted and 2,812 duplicate events
+    with zero disconnects, gaps, recoveries, recovery failures, route misses,
+    parse errors, or stale books. Strict report verification, replay, and
+    capture analysis passed. Raw backtest reconstructed 3,991 inputs, modeled
+    18 orders and 14 cancels with no fills, and passed accounting, currency-rate,
+    and final-valuation checks. It retained four live orders and two scheduled
+    actions at the data boundary and reported one clamped 1,330 ns global
+    cross-task receive-stamp regression; per-source timestamps remained
+    monotonic. Report, raw, normalized, and executable SHA-256 values are
+    respectively
+    `09ceb119d787f3cd1bca81261c45f94361007e6fe9cbc6fe806392bdb6911f5b`,
+    `782f518e0edf7a4f996eb6aa14e21118672091dbf5fbf11449209a4c286285a7`,
+    `f68359e35795226b1f7a294b8c69be74bc4290c5e2571a9e94e8a2a8ca2ac1dd`,
+    and `58cc2e5bb1bd942965cd4d221c591a0f3ce88710fb3478f5a951d0addc34fa0e`.
+    The diagnostic used a 700 MiB memory floor because this shared host cannot
+    reliably retain the checked-in 1 GiB production floor. It closes a real
+    local lifecycle defect but is not production evidence and does not replace
+    credentialed demo fault campaigns.
 
 ## Remaining Demo Gate
 

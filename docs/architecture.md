@@ -172,6 +172,10 @@ Responsibilities:
   request set. Duplicate acknowledgements are idempotent, unknown or malformed
   success frames fail the connection, and a duplicate local plan is fatal before
   network startup.
+- Bounded socket lifecycle: a feed handshake is shutdown/recovery cancellable
+  and limited to 10 seconds, while bootstrap, subscription, heartbeat, and close
+  writes are limited to 5 seconds. Every socket keeps its recovery channel
+  owned for the full supervisor lifetime; an unexpected owner loss is fatal.
 - Separate per-socket transport liveness from aggregate private-state health.
 - Raw message timestamping.
 - Cross-socket deduplication without suppressing per-socket sequence advancement.

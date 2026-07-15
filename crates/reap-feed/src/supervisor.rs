@@ -581,6 +581,9 @@ pub struct SupervisedFeed {
     pub status: mpsc::Receiver<ConnectionStatus>,
     shutdown: watch::Sender<bool>,
     recovery_routes: RecoveryRoutes,
+    // Non-book plans have no entry in `recovery_routes`, but their receiver
+    // still needs an owner for the entire supervised-feed lifetime.
+    _recovery_guards: Vec<watch::Sender<u64>>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -639,6 +642,7 @@ pub fn spawn_supervised_feed(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut tasks = Vec::new();
     let mut recovery_routes = RecoveryRoutes::new();
+    let mut recovery_guards = Vec::new();
     for plan in plans {
         let (recovery_tx, recovery_rx) = watch::channel(0_u64);
         let mut routed_symbols = HashSet::new();
@@ -653,6 +657,7 @@ pub fn spawn_supervised_feed(
                     .push((plan.conn_id.clone(), recovery_tx.clone()));
             }
         }
+        recovery_guards.push(recovery_tx);
         let adapter = Arc::clone(&adapter);
         let output = raw_tx.clone();
         let status = status_tx.clone();
@@ -684,6 +689,7 @@ pub fn spawn_supervised_feed(
         status: status_rx,
         shutdown: shutdown_tx,
         recovery_routes,
+        _recovery_guards: recovery_guards,
         tasks,
     }
 }
@@ -693,6 +699,13 @@ struct ConnectionChannels {
     status: mpsc::Sender<ConnectionStatus>,
     shutdown: watch::Receiver<bool>,
     recovery: watch::Receiver<u64>,
+}
+
+fn is_fatal_connection_error(error: &ConnectionError) -> bool {
+    matches!(
+        error,
+        ConnectionError::InvalidSubscriptionPlan(_) | ConnectionError::RecoveryChannelClosed
+    )
 }
 
 async fn supervise_connection(
@@ -762,7 +775,7 @@ async fn supervise_connection(
             return;
         }
         let error = result.expect_err("non-success result must contain an error");
-        let fatal = matches!(&error, ConnectionError::InvalidSubscriptionPlan(_));
+        let fatal = is_fatal_connection_error(&error);
         let disconnected = status.send(ConnectionStatus {
             conn_id: plan.conn_id.clone(),
             venue: plan.venue,
@@ -788,7 +801,7 @@ async fn supervise_connection(
             }
         }
         if fatal {
-            tracing::error!(conn_id = %plan.conn_id, ?error, "feed connection plan is invalid");
+            tracing::error!(conn_id = %plan.conn_id, ?error, "feed connection cannot recover");
             return;
         }
         if matches!(error, ConnectionError::RecoveryRequested) {
@@ -836,6 +849,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn invalid_plan_and_closed_recovery_route_are_fatal() {
+        assert!(is_fatal_connection_error(
+            &ConnectionError::InvalidSubscriptionPlan("duplicate".to_string())
+        ));
+        assert!(is_fatal_connection_error(
+            &ConnectionError::RecoveryChannelClosed
+        ));
+        assert!(!is_fatal_connection_error(
+            &ConnectionError::ConnectionTimeout
+        ));
+    }
+
     #[tokio::test]
     async fn invalid_subscription_plan_is_fatal_without_reconnect() {
         let subscription = Subscription::public(
@@ -874,6 +900,33 @@ mod tests {
         assert_eq!(fatal.kind, ConnectionStatusKind::Fatal);
         assert!(fatal.reason.contains("repeats subscription books/BTC-USDT"));
         assert!(status_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn supervised_non_book_socket_retains_its_recovery_channel_owner() {
+        let plan = SocketPlan {
+            conn_id: reap_core::ConnId::new("trades"),
+            venue: Venue::Okx,
+            private: false,
+            subscriptions: vec![Subscription::public(
+                Venue::Okx,
+                Channel::Trades,
+                "BTC-USDT",
+                FeedPriority::High,
+            )],
+        };
+        let feed = spawn_supervised_feed(
+            Arc::new(OkxAdapter::new("ws://127.0.0.1:9", "ws://127.0.0.1:9")),
+            vec![plan],
+            no_bootstrap(),
+            4,
+            ConnectionAttemptPacer::new(Duration::ZERO),
+            ReconnectPolicy::default(),
+        );
+
+        assert_eq!(feed._recovery_guards.len(), 1);
+        assert!(!feed._recovery_guards[0].is_closed());
+        feed.shutdown().await;
     }
 
     #[test]
@@ -1087,6 +1140,7 @@ mod tests {
                     (ConnId::new("book-1"), second_route),
                 ],
             )]),
+            _recovery_guards: Vec::new(),
             tasks: Vec::new(),
         };
         let request = RecoveryRequest {
@@ -1127,6 +1181,7 @@ mod tests {
                     (failed_source.clone(), second_route),
                 ],
             )]),
+            _recovery_guards: Vec::new(),
             tasks: Vec::new(),
         };
         let request = RecoveryRequest {

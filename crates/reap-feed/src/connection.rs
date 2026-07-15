@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use reap_core::{Channel, ConnId, RawEnvelope, Venue};
@@ -8,6 +10,13 @@ use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{SocketPlan, payload_hash, unix_time_ns};
+
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
+const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(10);
+const SUBSCRIPTION_TIMEOUT: Duration = Duration::from_secs(10);
+const PING_INTERVAL: Duration = Duration::from_secs(15);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error)]
 pub enum ConnectionError {
@@ -23,6 +32,12 @@ pub enum ConnectionError {
     Backpressure,
     #[error("websocket peer closed the connection")]
     PeerClosed,
+    #[error("websocket connection attempt timed out")]
+    ConnectionTimeout,
+    #[error("websocket recovery channel closed unexpectedly")]
+    RecoveryChannelClosed,
+    #[error("websocket {operation} write timed out")]
+    ControlWriteTimeout { operation: &'static str },
     #[error("received non-UTF8 websocket payload")]
     NonUtf8Payload,
     #[error("private websocket requires a login bootstrap message")]
@@ -69,6 +84,65 @@ impl From<tokio_tungstenite::tungstenite::Error> for ConnectionError {
     }
 }
 
+async fn await_websocket_connection<F, T>(
+    connection: F,
+    shutdown: &mut watch::Receiver<bool>,
+    recovery: &mut watch::Receiver<u64>,
+    timeout: Duration,
+) -> Result<T, ConnectionError>
+where
+    F: Future<Output = Result<T, tokio_tungstenite::tungstenite::Error>>,
+{
+    if *shutdown.borrow() {
+        return Err(ConnectionError::ShutdownRequested);
+    }
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(connection);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            result = &mut connection => return result.map_err(ConnectionError::from),
+            _ = &mut deadline => return Err(ConnectionError::ConnectionTimeout),
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Err(ConnectionError::ShutdownRequested);
+                }
+            }
+            changed = recovery.changed() => {
+                return match changed {
+                    Ok(()) => Err(ConnectionError::RecoveryRequested),
+                    Err(_) => Err(ConnectionError::RecoveryChannelClosed),
+                };
+            }
+        }
+    }
+}
+
+async fn await_control_write<F>(
+    write: F,
+    operation: &'static str,
+    timeout: Duration,
+) -> Result<(), ConnectionError>
+where
+    F: Future<Output = Result<(), tokio_tungstenite::tungstenite::Error>>,
+{
+    match tokio::time::timeout(timeout, write).await {
+        Ok(result) => result.map_err(ConnectionError::from),
+        Err(_) => Err(ConnectionError::ControlWriteTimeout { operation }),
+    }
+}
+
+async fn send_message<W>(
+    writer: &mut W,
+    message: Message,
+    operation: &'static str,
+) -> Result<(), ConnectionError>
+where
+    W: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    await_control_write(writer.send(message), operation, CONTROL_WRITE_TIMEOUT).await
+}
+
 pub async fn run_connection_once(
     adapter: &dyn VenueAdapter,
     plan: &SocketPlan,
@@ -84,16 +158,32 @@ pub async fn run_connection_once(
     let subscription = adapter.subscription_message(&plan.subscriptions)?;
     let subscription_readiness =
         SubscriptionReadiness::from_request(&subscription, plan.subscriptions.len())?;
-    let (socket, _) = connect_async(adapter.websocket_url(plan.private)).await?;
+    let (socket, _) = await_websocket_connection(
+        connect_async(adapter.websocket_url(plan.private)),
+        shutdown,
+        recovery,
+        CONNECTION_TIMEOUT,
+    )
+    .await?;
     let (mut writer, mut reader) = socket.split();
 
     if plan.private {
         for message in bootstrap_messages {
-            writer.send(Message::Text(message.clone().into())).await?;
+            send_message(
+                &mut writer,
+                Message::Text(message.clone().into()),
+                "private bootstrap",
+            )
+            .await?;
         }
         await_private_login(&mut writer, &mut reader, shutdown, recovery).await?;
     }
-    writer.send(Message::Text(subscription.into())).await?;
+    send_message(
+        &mut writer,
+        Message::Text(subscription.into()),
+        "subscription",
+    )
+    .await?;
     await_subscriptions(
         &mut writer,
         &mut reader,
@@ -118,7 +208,7 @@ pub async fn run_connection_once(
         }
     }
 
-    let mut ping = tokio::time::interval(std::time::Duration::from_secs(15));
+    let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping.tick().await;
     let mut last_received = tokio::time::Instant::now();
@@ -126,21 +216,24 @@ pub async fn run_connection_once(
     loop {
         tokio::select! {
             _ = ping.tick() => {
-                if last_received.elapsed() > std::time::Duration::from_secs(30) {
+                if last_received.elapsed() > IDLE_TIMEOUT {
                     return Err(ConnectionError::IdleTimeout);
                 }
-                writer.send(Message::Text("ping".into())).await?;
+                send_message(&mut writer, Message::Text("ping".into()), "ping").await?;
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    let _ = writer.send(Message::Close(None)).await;
+                    let _ = send_message(&mut writer, Message::Close(None), "close").await;
                     return Ok(());
                 }
             }
             changed = recovery.changed() => {
-                if changed.is_ok() {
-                    let _ = writer.send(Message::Close(None)).await;
-                    return Err(ConnectionError::RecoveryRequested);
+                match changed {
+                    Ok(()) => {
+                        let _ = send_message(&mut writer, Message::Close(None), "recovery close").await;
+                        return Err(ConnectionError::RecoveryRequested);
+                    }
+                    Err(_) => return Err(ConnectionError::RecoveryChannelClosed),
                 }
             }
             message = reader.next() => {
@@ -159,7 +252,9 @@ pub async fn run_connection_once(
                         reject_server_error(payload)?;
                         forward_payload(payload, plan, output).await?;
                     }
-                    Message::Ping(payload) => writer.send(Message::Pong(payload)).await?,
+                    Message::Ping(payload) => {
+                        send_message(&mut writer, Message::Pong(payload), "pong").await?
+                    }
                     Message::Pong(_) => {}
                     Message::Close(_) => return Err(ConnectionError::PeerClosed),
                     Message::Frame(_) => {}
@@ -184,7 +279,7 @@ where
     if readiness.is_complete() {
         return Ok(());
     }
-    let deadline = tokio::time::sleep(std::time::Duration::from_secs(10));
+    let deadline = tokio::time::sleep(SUBSCRIPTION_TIMEOUT);
     tokio::pin!(deadline);
     loop {
         tokio::select! {
@@ -195,8 +290,9 @@ where
                 }
             }
             changed = recovery.changed() => {
-                if changed.is_ok() {
-                    return Err(ConnectionError::RecoveryRequested);
+                match changed {
+                    Ok(()) => return Err(ConnectionError::RecoveryRequested),
+                    Err(_) => return Err(ConnectionError::RecoveryChannelClosed),
                 }
             }
             message = reader.next() => {
@@ -224,7 +320,9 @@ where
                             SubscriptionMessage::Ignore => {}
                         }
                     }
-                    Message::Ping(payload) => writer.send(Message::Pong(payload)).await?,
+                    Message::Ping(payload) => {
+                        send_message(writer, Message::Pong(payload), "subscription pong").await?
+                    }
                     Message::Pong(_) => {}
                     Message::Close(_) => return Err(ConnectionError::PeerClosed),
                     Message::Frame(_) => {}
@@ -460,7 +558,7 @@ async fn await_private_login<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let deadline = tokio::time::sleep(std::time::Duration::from_secs(10));
+    let deadline = tokio::time::sleep(LOGIN_TIMEOUT);
     tokio::pin!(deadline);
     loop {
         tokio::select! {
@@ -471,8 +569,9 @@ where
                 }
             }
             changed = recovery.changed() => {
-                if changed.is_ok() {
-                    return Err(ConnectionError::RecoveryRequested);
+                match changed {
+                    Ok(()) => return Err(ConnectionError::RecoveryRequested),
+                    Err(_) => return Err(ConnectionError::RecoveryChannelClosed),
                 }
             }
             message = reader.next() => {
@@ -490,7 +589,9 @@ where
                             return Ok(());
                         }
                     }
-                    Message::Ping(payload) => writer.send(Message::Pong(payload)).await?,
+                    Message::Ping(payload) => {
+                        send_message(writer, Message::Pong(payload), "login pong").await?
+                    }
                     Message::Pong(_) => {}
                     Message::Close(_) => return Err(ConnectionError::PeerClosed),
                     Message::Frame(_) => {}
@@ -581,6 +682,69 @@ mod tests {
         assert!(matches!(
             login_response(r#"{"event":"error","code":"60009","msg":"Login failed"}"#),
             Err(ConnectionError::LoginFailed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn connection_establishment_is_bounded_cancellable_and_rejects_closed_recovery() {
+        let (_shutdown_tx, mut shutdown) = watch::channel(false);
+        let (_recovery_tx, mut recovery) = watch::channel(0_u64);
+        let timeout = await_websocket_connection(
+            std::future::pending::<Result<(), tokio_tungstenite::tungstenite::Error>>(),
+            &mut shutdown,
+            &mut recovery,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(timeout, ConnectionError::ConnectionTimeout));
+
+        let (shutdown_tx, mut shutdown) = watch::channel(false);
+        let (_recovery_tx, mut recovery) = watch::channel(0_u64);
+        let connecting = tokio::spawn(async move {
+            await_websocket_connection(
+                std::future::pending::<Result<(), tokio_tungstenite::tungstenite::Error>>(),
+                &mut shutdown,
+                &mut recovery,
+                Duration::from_secs(1),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        shutdown_tx.send(true).unwrap();
+        let stopped = tokio::time::timeout(Duration::from_millis(100), connecting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(stopped, ConnectionError::ShutdownRequested));
+
+        let (_shutdown_tx, mut shutdown) = watch::channel(false);
+        let (recovery_tx, mut recovery) = watch::channel(0_u64);
+        drop(recovery_tx);
+        let closed = await_websocket_connection(
+            std::future::pending::<Result<(), tokio_tungstenite::tungstenite::Error>>(),
+            &mut shutdown,
+            &mut recovery,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(closed, ConnectionError::RecoveryChannelClosed));
+    }
+
+    #[tokio::test]
+    async fn control_writes_have_a_deadline() {
+        let error = await_control_write(
+            std::future::pending::<Result<(), tokio_tungstenite::tungstenite::Error>>(),
+            "ping",
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConnectionError::ControlWriteTimeout { operation: "ping" }
         ));
     }
 

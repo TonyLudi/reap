@@ -277,6 +277,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
   demo/production path. Reject unknown capture fields and gate backtest order
   entry on complete books plus fresh accounting routes. Hosts sharing one NAT
   still require external IP-wide coordination or isolated egress.
+- [x] Bound feed websocket handshakes and control writes, make establishment
+  shutdown/recovery cancellable, retain a recovery-channel owner for every
+  socket including non-book plans, and treat unexpected owner loss as fatal.
 - [x] Add structured live fault evidence for ambiguous submit/cancel outcomes,
   partial fills, order/fill convergence timeouts, restored durable latches, and
   typed deadman, periodic clock, and authenticated account-config failures.

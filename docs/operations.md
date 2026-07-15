@@ -112,6 +112,20 @@ official upstream connection through the source config's exact interval and
 path. A pacer failure discovered during reconnect is terminal for capture and
 live runtimes; it is not downgraded to a redundancy-tolerated disconnect.
 
+After a paced slot is reserved, each feed handshake must complete within 10
+seconds and remains interruptible by shutdown or source recovery. Private
+bootstrap, subscription, ping/pong, and close writes each have a 5-second
+deadline. Every socket plan retains its recovery-channel owner for the complete
+supervisor lifetime; unexpected owner loss is a fatal invariant breach, not a
+reconnect loop. Once ready, the feed sends the OKX application ping every 15
+seconds and reconnects after observing that no frame has arrived beyond the
+30-second threshold. This is transport liveness. Required book, index, funding,
+mark, price-limit, account, and position freshness remains independently aged,
+so heartbeat traffic cannot make stale strategy state tradable. These controls
+were cross-checked against pinned Java `OkxNitroSubscriberBase`,
+`SharedSessionSubscriberBase`, `WsConnectOption`, and the Netty/Vtx websocket
+clients' stalled-INIT and ping/pong/data checks.
+
 The checked-in capture/live/proxy examples share
 `var/reap/okx-connection-attempt.pacer` when run from the repository root.
 Production capture research requires an absolute path, and production evidence
