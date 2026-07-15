@@ -48,14 +48,17 @@ Implemented:
   limit-order quantity/amount again before dispatch, and maintains OKX Cancel
   All After from an independent safety task.
 - Authenticated read-only cash-account certification that embeds exact bounded
-  OKX config/balance/position responses in a create-new mode-`0600` artifact,
-  binds config/binary/host/Java/account provenance, and supports credential-free
-  offline re-verification without printing sensitive raw account state.
+  OKX config/balance/position and direct public currency-index responses in a
+  create-new mode-`0600` artifact, binds config/binary/host/Java/account
+  provenance, independently rebuilds per-currency USD equity, and supports
+  credential-free offline re-verification without printing sensitive raw state.
 - Authenticated account-wide OKX bill collection with exact raw-page retention,
   independent cursor/window reconstruction, and stopped-journal reconciliation
   of normal trades, derivative close PnL, and realized linear/inverse funding.
   Authoritative REST `avgPx` snapshots and exact critical fills reconstruct the
-  pinned Java linear/inverse position basis; unknown account bills fail closed.
+  pinned Java linear/inverse position basis. Tightly bracketed account
+  certifications prove bill-by-bill cash continuity; unknown account bills fail
+  closed.
 - Read-only process-death certification that exclusively leases the stopped
   journal, binds recovered exchange/client order identities to exact OKX order
   details, requires Cancel All After source `20` and account-wide regular-order
@@ -342,7 +345,7 @@ manifest-declared build, host, candidate, or environment-specific account
 identities. Proxy-supported fault roles must carry typed records with the exact
 proxy fingerprint, unique proxy session/command IDs, fresh timestamps, and a
 command interval inside the corresponding verified live session; only genuine
-partial-fill and restart-latch roles may use external evidence. Schema 7 also
+  partial-fill and restart-latch roles may use external evidence. Schema 8 also
 enforces reviewed age limits under hard code-level maxima for the demo soak,
 every fault and latency source, production account certification, deadman,
 emergency cancel, and the reconciled fill and bill windows. It requires one
@@ -388,7 +391,7 @@ reap verify-production-approval \
 
 The policy requires sorted, unique approvers, distinct Ed25519 public keys, and
 at least two required roles. A request is valid for at most 15 minutes and binds
-the exact policy predeclared by SHA-256 in the schema-7 evidence manifest plus
+the exact policy predeclared by SHA-256 in the schema-8 evidence manifest plus
 stable source/config/build/host/account/candidate and gate evidence. Verification
 rejects stale requests, missing roles, duplicate keys or approvers, signature or
 binding changes, and any newly failing or changed source.
@@ -419,10 +422,13 @@ The certification command has no order-entry path. It requires disabled
 mode-appropriate borrowing flags, zero applicable aggregate/per-currency
 liability, interest, and borrow-frozen fields, no OKX `MARGIN` positions, zero
 configured strategy borrow limits, stable bracketed identity/settings, and
-bounded exchange-clock evidence. The artifact contains sensitive raw account
-responses and embedded config, so keep it in restricted evidence storage. It is
-sequential point-in-time evidence, not an atomic snapshot, historical borrowing
-proof, or full statement reconciliation; quiesce account activity while it runs.
+bounded exchange-clock evidence. For every non-USD balance currency it retains a
+direct `CCY-USD` index ticker, rechecks `eqUsd` against `eq * idxPx`, and proves
+that currency `eqUsd` values sum to `totalEq` within strict tolerances. The
+artifact contains sensitive raw account responses and embedded config, so keep it
+in restricted evidence storage. It is sequential point-in-time evidence, not an
+atomic snapshot, historical borrowing proof, or full statement reconciliation;
+quiesce account activity while it runs.
 
 From another shell with the same operator token, inspect or stop the runtime:
 
@@ -534,10 +540,13 @@ cargo run -p reap-cli -- verify-live-run \
   --pretty
 ```
 
-After the bounded demo is stopped and the account-bill window has been closed
-for at least 60 seconds, collect authenticated fills and account-wide bills.
-The fill window starts one maximum trade-bill delay earlier so a bill at the
-left boundary can still be matched causally:
+For an economic-evidence run, quiesce the account and collect a passing opening
+account certification immediately before `BEGIN_MS`. After stopping the demo at
+`END_MS`, keep every producer stopped and collect the closing certification
+immediately. Each certification must be within 60 seconds of its boundary. Once
+the bill window has been closed for at least 60 seconds, collect authenticated
+fills and account-wide bills. The fill window starts one maximum trade-bill delay
+earlier so a bill at the left boundary can still be matched causally:
 
 ```bash
 BEGIN_MS=1783987200000
@@ -548,6 +557,19 @@ FILL_EVIDENCE="/secure/evidence/okx-fills-$(date -u +%Y%m%dT%H%M%SZ)"
 BILL_EVIDENCE="/secure/evidence/okx-bills-$(date -u +%Y%m%dT%H%M%SZ)"
 FILL_REPORT="/tmp/reap-fill-reconciliation-$(date -u +%Y%m%dT%H%M%SZ).json"
 ECONOMIC_REPORT="/secure/evidence/economics-$(date -u +%Y%m%dT%H%M%SZ).json"
+OPENING_ACCOUNT="/secure/evidence/opening-account-$(date -u +%Y%m%dT%H%M%SZ).json"
+CLOSING_ACCOUNT="/secure/evidence/closing-account-$(date -u +%Y%m%dT%H%M%SZ).json"
+
+# Run while quiesced immediately before BEGIN_MS, then start the bounded demo.
+cargo run -p reap-cli -- certify-account \
+  --config examples/live-okx-demo.toml --account main \
+  --output "$OPENING_ACCOUNT" --pretty
+
+# Stop the demo at END_MS, keep the account quiesced, and run immediately.
+cargo run -p reap-cli -- certify-account \
+  --config examples/live-okx-demo.toml --account main \
+  --output "$CLOSING_ACCOUNT" --pretty
+
 cargo run -p reap-cli -- collect-fills \
   --config examples/live-okx-demo.toml \
   --account main \
@@ -583,6 +605,8 @@ cargo run -p reap-cli -- reconcile-economics \
   --journal var/reap/live-events.jsonl \
   --fill-collection-manifest "$FILL_EVIDENCE/manifest.json" \
   --bill-collection-manifest "$BILL_EVIDENCE/manifest.json" \
+  --opening-account-certification "$OPENING_ACCOUNT" \
+  --closing-account-certification "$CLOSING_ACCOUNT" \
   --account main \
   --begin-ms "$BEGIN_MS" \
   --end-ms "$END_MS" \
@@ -592,6 +616,7 @@ cargo run -p reap-cli -- reconcile-economics \
   --maximum-trade-bill-delay-ms "$MAX_TRADE_BILL_DELAY_MS" \
   --maximum-funding-bill-delay-ms 60000 \
   --maximum-funding-mark-bracket-distance-ms 1000 \
+  --maximum-account-boundary-gap-ms 60000 \
   --output "$ECONOMIC_REPORT" \
   --require-pass \
   --pretty
@@ -626,12 +651,18 @@ position, configured contract value, and two same-session mark-price samples
 bracketing the bill's `fillTime`. The bill mark must lie inside that independent
 exchange-time bracket. Schema-7 `session_start` and critical `account_snapshot`
 journal records bind those observations to one session, account, config,
-and hashed OKX account identity, so evidence cannot cross a restart. Run a
+and hashed OKX account identity, so evidence cannot cross a restart. The schema-5
+economic report also reverifies the opening/closing schema-2 account artifacts,
+requires every numeric bill ID and post-bill `bal`, checks every adjacent balance
+edge, and proves `opening cashBal + sum(balChg) = closing cashBal` per currency.
+It reports native/USD equity at both boundaries and the total-equity delta. Run a
 controlled demo window containing nonzero trades
 and at least one nonzero derivative close and funding settlement. The basis is
-authenticated local runtime evidence, not remote attestation. This still does
-not prove the venue's exact internal assessment tick, full balance/equity
-continuity, currency conversion, taxes, or profitability.
+authenticated local runtime evidence, not remote attestation. Direct public
+currency indexes constrain each point-in-time conversion but do not expose the
+venue's exact internal valuation or funding-assessment tick. The report does not
+attribute total-equity movement to mark-to-market PnL, taxes, deposits,
+withdrawals, unsupported bill classes, or profitability.
 Cash-spot bill units must be confirmed with credentialed demo
 evidence for the exact target account before production review.
 

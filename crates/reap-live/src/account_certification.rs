@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -7,9 +7,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use reap_core::PINNED_JAVA_REVISION;
 use reap_venue::okx::{
     HttpTransport, OkxAccountBalanceSnapshot, OkxAccountConfig, OkxAccountLevel,
-    OkxAccountPositionsSnapshot, OkxInstrumentType, OkxRestClient, OkxSigner, ReqwestTransport,
-    RestError, parse_okx_account_balance_response_json, parse_okx_account_config_response_json,
-    parse_okx_account_positions_response_json,
+    OkxAccountPositionsSnapshot, OkxIndexTickerSnapshot, OkxInstrumentType, OkxRestClient,
+    OkxSigner, ReqwestTransport, RestError, parse_okx_account_balance_response_json,
+    parse_okx_account_config_response_json, parse_okx_account_positions_response_json,
+    parse_okx_index_ticker_response_json,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -20,15 +21,22 @@ use crate::provenance::{
 use crate::{LiveConfig, LiveConfigError, OkxTradeModeConfig, TradingEnvironment};
 
 pub const ACCOUNT_CASH_POLICY_VERSION: u32 = 1;
-pub const ACCOUNT_CERTIFICATION_SCHEMA_VERSION: u32 = 1;
+pub const ACCOUNT_CERTIFICATION_SCHEMA_VERSION: u32 = 2;
 pub const MAX_ACCOUNT_CERTIFICATION_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_ACCOUNT_CERTIFICATION_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_ACCOUNT_CERTIFICATION_ARTIFACT_BYTES: u64 = 48 * 1024 * 1024;
 pub const MAX_ACCOUNT_CERTIFICATION_SPAN_MS: u64 = 30_000;
+pub const MAX_ACCOUNT_CERTIFICATION_INDEX_STALENESS_MS: u64 = 10_000;
+pub const MIN_ACCOUNT_CERTIFICATION_INDEX_INTERVAL_MS: u64 = 100;
+pub const ACCOUNT_EQUITY_AGGREGATE_ABS_TOLERANCE_USD: f64 = 1e-8;
+pub const ACCOUNT_EQUITY_AGGREGATE_REL_TOLERANCE: f64 = 1e-12;
+pub const ACCOUNT_EQUITY_INDEX_ABS_TOLERANCE_USD: f64 = 0.01;
+pub const ACCOUNT_EQUITY_INDEX_REL_TOLERANCE: f64 = 0.001;
 
 const ACCOUNT_CONFIG_ENDPOINT: &str = "/api/v5/account/config";
 const ACCOUNT_BALANCE_ENDPOINT: &str = "/api/v5/account/balance";
 const ACCOUNT_POSITIONS_ENDPOINT: &str = "/api/v5/account/positions";
+const MARKET_INDEX_TICKERS_ENDPOINT: &str = "/api/v5/market/index-tickers";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,6 +72,48 @@ pub struct AccountCertificationResponseEvidence {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct AccountCertificationIndexEvidence {
+    pub currency: String,
+    pub symbol: String,
+    pub response: AccountCertificationResponseEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountEquityConversionSample {
+    pub currency: String,
+    pub native_equity: f64,
+    pub reported_equity_usd: f64,
+    pub index_symbol: Option<String>,
+    pub index_price: f64,
+    pub index_timestamp_ms: Option<u64>,
+    pub independently_converted_equity_usd: f64,
+    pub absolute_difference: f64,
+    pub relative_difference: f64,
+    pub effective_tolerance_usd: f64,
+    pub validated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountEquityEvaluation {
+    pub total_equity_usd: Option<f64>,
+    pub reported_currency_equity_usd: f64,
+    pub independently_converted_equity_usd: f64,
+    pub aggregate_reported_difference_usd: Option<f64>,
+    pub aggregate_independent_difference_usd: Option<f64>,
+    pub aggregate_reported_tolerance_usd: Option<f64>,
+    pub aggregate_independent_tolerance_usd: Option<f64>,
+    pub currencies: u64,
+    pub direct_index_tickers: u64,
+    pub conversion_samples: Vec<AccountEquityConversionSample>,
+    pub evidence_complete: bool,
+    pub passed: bool,
+    pub violations: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AccountCertificationSummary {
     pub coverage: AccountCertificationCoverage,
     pub environment: TradingEnvironment,
@@ -73,6 +123,7 @@ pub struct AccountCertificationSummary {
     pub account_settings_stable: bool,
     pub clock_evidence_valid: bool,
     pub policy: AccountCashPolicyEvaluation,
+    pub equity: AccountEquityEvaluation,
     pub evidence_complete: bool,
     pub passed: bool,
     pub limitations: Vec<String>,
@@ -92,6 +143,7 @@ pub struct AccountCertificationArtifact {
     pub finish_clock: AccountCertificationClockEvidence,
     pub account_config_before: AccountCertificationResponseEvidence,
     pub account_balance: AccountCertificationResponseEvidence,
+    pub index_tickers: Vec<AccountCertificationIndexEvidence>,
     pub account_positions: AccountCertificationResponseEvidence,
     pub account_config_after: AccountCertificationResponseEvidence,
     pub summary: AccountCertificationSummary,
@@ -542,6 +594,28 @@ where
     let start_clock = sample_clock(client, config.runtime.max_exchange_clock_skew_ms).await?;
     let config_before = client.account_config_raw().await?;
     let balance = client.account_balance_raw().await?;
+    let mut index_tickers = Vec::new();
+    let mut parsed_index_tickers = BTreeMap::new();
+    for (offset, (currency, symbol)) in required_index_symbols(&balance.snapshot)?
+        .into_iter()
+        .enumerate()
+    {
+        if offset > 0 {
+            tokio::time::sleep(Duration::from_millis(
+                MIN_ACCOUNT_CERTIFICATION_INDEX_INTERVAL_MS,
+            ))
+            .await;
+        }
+        let raw = client.index_ticker_raw(&symbol).await?;
+        let endpoint = index_ticker_endpoint(&symbol);
+        let response = response_evidence(&endpoint, &raw.request_path, raw.response_body)?;
+        parsed_index_tickers.insert(currency.clone(), raw.ticker);
+        index_tickers.push(AccountCertificationIndexEvidence {
+            currency,
+            symbol,
+            response,
+        });
+    }
     let positions = client.account_positions_raw(None, None).await?;
     let config_after = client.account_config_raw().await?;
     let finish_clock = sample_clock(client, config.runtime.max_exchange_clock_skew_ms).await?;
@@ -571,11 +645,12 @@ where
         account_id,
         &config_before.config,
         &balance.snapshot,
+        &parsed_index_tickers,
         &positions.snapshot,
         &config_after.config,
         &start_clock,
         &finish_clock,
-    );
+    )?;
 
     Ok(AccountCertificationArtifact {
         schema_version: ACCOUNT_CERTIFICATION_SCHEMA_VERSION,
@@ -589,6 +664,7 @@ where
         finish_clock,
         account_config_before,
         account_balance,
+        index_tickers,
         account_positions,
         account_config_after,
         summary,
@@ -650,6 +726,7 @@ pub fn verify_account_certification_artifact_path(
         parse_okx_account_config_response_json(artifact.account_config_before.body.as_bytes())?;
     let balance =
         parse_okx_account_balance_response_json(artifact.account_balance.body.as_bytes())?;
+    let index_tickers = verify_index_ticker_evidence(&balance, &artifact.index_tickers)?;
     let positions =
         parse_okx_account_positions_response_json(artifact.account_positions.body.as_bytes())?;
     let config_after =
@@ -659,11 +736,12 @@ pub fn verify_account_certification_artifact_path(
         &artifact.summary.account_id,
         &config_before,
         &balance,
+        &index_tickers,
         &positions,
         &config_after,
         &artifact.start_clock,
         &artifact.finish_clock,
-    );
+    )?;
     if artifact.summary != derived {
         return invalid_evidence(
             "stored account-certification summary does not match raw evidence",
@@ -678,11 +756,12 @@ fn derive_summary(
     account_id: &str,
     config_before: &OkxAccountConfig,
     balance: &OkxAccountBalanceSnapshot,
+    index_tickers: &BTreeMap<String, OkxIndexTickerSnapshot>,
     positions: &OkxAccountPositionsSnapshot,
     config_after: &OkxAccountConfig,
     start_clock: &AccountCertificationClockEvidence,
     finish_clock: &AccountCertificationClockEvidence,
-) -> AccountCertificationSummary {
+) -> Result<AccountCertificationSummary, AccountCertificationError> {
     let account_identity_stable = !config_before.user_id.trim().is_empty()
         && !config_before.main_user_id.trim().is_empty()
         && config_before.user_id == config_after.user_id
@@ -701,13 +780,15 @@ fn derive_summary(
     );
     let policy =
         evaluate_account_cash_policy(config, account_id, config_before, balance, positions);
-    let evidence_complete = true;
+    let equity = evaluate_account_equity(balance, index_tickers, start_clock, finish_clock)?;
+    let evidence_complete = equity.evidence_complete;
     let passed = account_identity_stable
         && account_settings_stable
         && clock_evidence_valid
         && policy.passed
+        && equity.passed
         && evidence_complete;
-    AccountCertificationSummary {
+    Ok(AccountCertificationSummary {
         coverage: AccountCertificationCoverage::PointInTimeCashAndZeroLiability,
         environment: config.venue.environment,
         account_id: account_id.to_string(),
@@ -716,19 +797,334 @@ fn derive_summary(
         account_settings_stable,
         clock_evidence_valid,
         policy,
+        equity,
         evidence_complete,
         passed,
         limitations: vec![
             "point-in-time evidence only; it does not prove historical absence of borrowing"
                 .to_string(),
-            "authenticated GETs are sequential, not an atomic exchange snapshot; quiesce account activity during collection"
+            "authenticated account GETs and public index GETs are sequential, not an atomic exchange snapshot; quiesce account activity during collection"
+                .to_string(),
+            "direct public CCY-USD index prices independently check conversion within tolerance but do not expose the exact internal OKX valuation tick"
                 .to_string(),
             "collector host and executable hashes are provenance identifiers, not independently authenticated by offline verification"
                 .to_string(),
             "it does not reconcile deposits, withdrawals, funding, PnL, taxes, or complete exchange statements"
                 .to_string(),
         ],
+    })
+}
+
+fn required_index_symbols(
+    balance: &OkxAccountBalanceSnapshot,
+) -> Result<BTreeMap<String, String>, AccountCertificationError> {
+    let mut currencies = BTreeSet::new();
+    let mut indexes = BTreeMap::new();
+    for detail in &balance.details {
+        let currency = detail.currency.as_str();
+        let symbol = currency_index_symbol(currency)?;
+        if !currencies.insert(currency.to_string()) {
+            return invalid_evidence(format!(
+                "account balance contains duplicate currency {currency:?}"
+            ));
+        }
+        if let Some(symbol) = symbol {
+            indexes.insert(currency.to_string(), symbol);
+        }
     }
+    Ok(indexes)
+}
+
+fn currency_index_symbol(currency: &str) -> Result<Option<String>, AccountCertificationError> {
+    if currency.is_empty()
+        || currency.len() > 32
+        || !currency
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        return invalid_evidence(format!(
+            "balance currency {currency:?} must be 1-32 uppercase ASCII letters or digits"
+        ));
+    }
+    Ok((currency != "USD").then(|| format!("{currency}-USD")))
+}
+
+fn index_ticker_endpoint(symbol: &str) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.append_pair("instId", symbol);
+    format!("{MARKET_INDEX_TICKERS_ENDPOINT}?{}", query.finish())
+}
+
+fn verify_index_ticker_evidence(
+    balance: &OkxAccountBalanceSnapshot,
+    evidence: &[AccountCertificationIndexEvidence],
+) -> Result<BTreeMap<String, OkxIndexTickerSnapshot>, AccountCertificationError> {
+    let expected = required_index_symbols(balance)?;
+    let mut parsed = BTreeMap::new();
+    for item in evidence {
+        let Some(expected_symbol) = expected.get(&item.currency) else {
+            return invalid_evidence(format!(
+                "unexpected index-ticker evidence for currency {:?}",
+                item.currency
+            ));
+        };
+        if &item.symbol != expected_symbol {
+            return invalid_evidence(format!(
+                "index symbol {:?} for currency {} does not match expected {:?}",
+                item.symbol, item.currency, expected_symbol
+            ));
+        }
+        let endpoint = index_ticker_endpoint(expected_symbol);
+        validate_response_evidence(&item.response, &endpoint)?;
+        let ticker = parse_okx_index_ticker_response_json(item.response.body.as_bytes())?;
+        if ticker.symbol != *expected_symbol {
+            return invalid_evidence(format!(
+                "index response symbol {:?} does not match expected {:?}",
+                ticker.symbol, expected_symbol
+            ));
+        }
+        if parsed.insert(item.currency.clone(), ticker).is_some() {
+            return invalid_evidence(format!(
+                "duplicate index-ticker evidence for currency {}",
+                item.currency
+            ));
+        }
+    }
+    if parsed.len() != expected.len() {
+        let missing = expected
+            .keys()
+            .filter(|currency| !parsed.contains_key(*currency))
+            .cloned()
+            .collect::<Vec<_>>();
+        return invalid_evidence(format!(
+            "index-ticker evidence set is incomplete; missing currencies {missing:?}"
+        ));
+    }
+    Ok(parsed)
+}
+
+fn evaluate_account_equity(
+    balance: &OkxAccountBalanceSnapshot,
+    index_tickers: &BTreeMap<String, OkxIndexTickerSnapshot>,
+    start_clock: &AccountCertificationClockEvidence,
+    finish_clock: &AccountCertificationClockEvidence,
+) -> Result<AccountEquityEvaluation, AccountCertificationError> {
+    let expected_indexes = required_index_symbols(balance)?;
+    let mut violations = BTreeSet::new();
+    let mut evidence_complete = true;
+    if balance.details.is_empty() {
+        evidence_complete = false;
+        violations.insert("account balance contains no currency equity details".to_string());
+    }
+    let actual_index_currencies = index_tickers.keys().cloned().collect::<BTreeSet<_>>();
+    let expected_index_currencies = expected_indexes.keys().cloned().collect::<BTreeSet<_>>();
+    if actual_index_currencies != expected_index_currencies {
+        evidence_complete = false;
+        violations.insert(format!(
+            "direct index evidence currencies {actual_index_currencies:?} do not match expected {expected_index_currencies:?}"
+        ));
+    }
+
+    let total_equity_usd = match balance.total_equity_usd {
+        Some(value) if value.is_finite() => Some(value),
+        Some(_) => {
+            evidence_complete = false;
+            violations.insert("account totalEq is not finite".to_string());
+            None
+        }
+        None => {
+            evidence_complete = false;
+            violations.insert("account totalEq is absent".to_string());
+            None
+        }
+    };
+    let maximum_future_ms = start_clock
+        .absolute_skew_ms
+        .max(finish_clock.absolute_skew_ms);
+    let oldest_index_ms = start_clock
+        .server_ms
+        .saturating_sub(MAX_ACCOUNT_CERTIFICATION_INDEX_STALENESS_MS);
+    let newest_index_ms = finish_clock.server_ms.saturating_add(maximum_future_ms);
+    let mut reported_currency_equity_usd = 0.0;
+    let mut independently_converted_equity_usd = 0.0;
+    let mut conversion_samples = Vec::new();
+
+    for detail in &balance.details {
+        let currency = detail.currency.as_str();
+        let mut sample_valid = true;
+        let native_equity = match detail.equity {
+            Some(value) if value.is_finite() => value,
+            Some(_) => {
+                evidence_complete = false;
+                violations.insert(format!("balance[{currency}].eq is not finite"));
+                continue;
+            }
+            None => {
+                evidence_complete = false;
+                violations.insert(format!("balance[{currency}].eq is absent"));
+                continue;
+            }
+        };
+        let reported_equity_usd = match detail.equity_usd {
+            Some(value) if value.is_finite() => value,
+            Some(_) => {
+                evidence_complete = false;
+                violations.insert(format!("balance[{currency}].eqUsd is not finite"));
+                continue;
+            }
+            None => {
+                evidence_complete = false;
+                violations.insert(format!("balance[{currency}].eqUsd is absent"));
+                continue;
+            }
+        };
+        match detail.cash_balance {
+            Some(value) if value.is_finite() => {}
+            Some(_) => {
+                evidence_complete = false;
+                sample_valid = false;
+                violations.insert(format!("balance[{currency}].cashBal is not finite"));
+            }
+            None => {
+                evidence_complete = false;
+                sample_valid = false;
+                violations.insert(format!("balance[{currency}].cashBal is absent"));
+            }
+        }
+
+        let (index_symbol, index_price, index_timestamp_ms) = if currency == "USD" {
+            (None, 1.0, None)
+        } else if let Some(ticker) = index_tickers.get(currency) {
+            let expected_symbol = expected_indexes
+                .get(currency)
+                .expect("required index was derived from the same currency set");
+            if ticker.symbol != *expected_symbol {
+                evidence_complete = false;
+                sample_valid = false;
+                violations.insert(format!(
+                    "index ticker for {currency} has symbol {:?}; expected {:?}",
+                    ticker.symbol, expected_symbol
+                ));
+            }
+            if !ticker.index_price.is_finite() || ticker.index_price <= 0.0 {
+                evidence_complete = false;
+                sample_valid = false;
+                violations.insert(format!(
+                    "index ticker for {currency} has invalid price {}",
+                    ticker.index_price
+                ));
+            }
+            if ticker.timestamp_ms < oldest_index_ms || ticker.timestamp_ms > newest_index_ms {
+                evidence_complete = false;
+                sample_valid = false;
+                violations.insert(format!(
+                    "index ticker for {currency} has timestamp {}; accepted range is {}..={}",
+                    ticker.timestamp_ms, oldest_index_ms, newest_index_ms
+                ));
+            }
+            (
+                Some(expected_symbol.clone()),
+                ticker.index_price,
+                Some(ticker.timestamp_ms),
+            )
+        } else {
+            evidence_complete = false;
+            violations.insert(format!("direct index ticker for {currency} is absent"));
+            continue;
+        };
+
+        let independent = native_equity * index_price;
+        if !independent.is_finite() {
+            evidence_complete = false;
+            violations.insert(format!(
+                "independent USD equity conversion for {currency} is not finite"
+            ));
+            continue;
+        }
+        let absolute_difference = (reported_equity_usd - independent).abs();
+        let scale = reported_equity_usd.abs().max(independent.abs());
+        let relative_difference = if scale == 0.0 {
+            0.0
+        } else {
+            absolute_difference / scale
+        };
+        let effective_tolerance_usd =
+            ACCOUNT_EQUITY_INDEX_ABS_TOLERANCE_USD.max(scale * ACCOUNT_EQUITY_INDEX_REL_TOLERANCE);
+        if absolute_difference > effective_tolerance_usd {
+            sample_valid = false;
+            violations.insert(format!(
+                "balance[{currency}].eqUsd differs from eq * index by {absolute_difference} USD; tolerance is {effective_tolerance_usd} USD"
+            ));
+        }
+        reported_currency_equity_usd += reported_equity_usd;
+        independently_converted_equity_usd += independent;
+        conversion_samples.push(AccountEquityConversionSample {
+            currency: currency.to_string(),
+            native_equity,
+            reported_equity_usd,
+            index_symbol,
+            index_price,
+            index_timestamp_ms,
+            independently_converted_equity_usd: independent,
+            absolute_difference,
+            relative_difference,
+            effective_tolerance_usd,
+            validated: sample_valid && absolute_difference <= effective_tolerance_usd,
+        });
+    }
+    conversion_samples.sort_by(|left, right| left.currency.cmp(&right.currency));
+
+    let mut aggregate_reported_difference_usd = None;
+    let mut aggregate_independent_difference_usd = None;
+    let mut aggregate_reported_tolerance_usd = None;
+    let mut aggregate_independent_tolerance_usd = None;
+    if let Some(total) = total_equity_usd {
+        let reported_scale = total.abs().max(reported_currency_equity_usd.abs());
+        let reported_tolerance = ACCOUNT_EQUITY_AGGREGATE_ABS_TOLERANCE_USD
+            .max(reported_scale * ACCOUNT_EQUITY_AGGREGATE_REL_TOLERANCE);
+        let reported_difference = (total - reported_currency_equity_usd).abs();
+        aggregate_reported_difference_usd = Some(reported_difference);
+        aggregate_reported_tolerance_usd = Some(reported_tolerance);
+        if reported_difference > reported_tolerance {
+            violations.insert(format!(
+                "totalEq differs from the sum of eqUsd by {reported_difference} USD; tolerance is {reported_tolerance} USD"
+            ));
+        }
+
+        let independent_scale = total.abs().max(independently_converted_equity_usd.abs());
+        let independent_tolerance = ACCOUNT_EQUITY_INDEX_ABS_TOLERANCE_USD
+            .max(independent_scale * ACCOUNT_EQUITY_INDEX_REL_TOLERANCE);
+        let independent_difference = (total - independently_converted_equity_usd).abs();
+        aggregate_independent_difference_usd = Some(independent_difference);
+        aggregate_independent_tolerance_usd = Some(independent_tolerance);
+        if independent_difference > independent_tolerance {
+            violations.insert(format!(
+                "totalEq differs from independently converted currency equity by {independent_difference} USD; tolerance is {independent_tolerance} USD"
+            ));
+        }
+    }
+
+    if conversion_samples.len() != balance.details.len() {
+        evidence_complete = false;
+    }
+    let passed = evidence_complete
+        && conversion_samples.iter().all(|sample| sample.validated)
+        && violations.is_empty();
+    Ok(AccountEquityEvaluation {
+        total_equity_usd,
+        reported_currency_equity_usd,
+        independently_converted_equity_usd,
+        aggregate_reported_difference_usd,
+        aggregate_independent_difference_usd,
+        aggregate_reported_tolerance_usd,
+        aggregate_independent_tolerance_usd,
+        currencies: balance.details.len() as u64,
+        direct_index_tickers: index_tickers.len() as u64,
+        conversion_samples,
+        evidence_complete,
+        passed,
+        violations: violations.into_iter().collect(),
+    })
 }
 
 async fn sample_clock<T>(
@@ -1129,6 +1525,9 @@ mod tests {
                 cash_balance: Some(1_000.0),
                 available_balance: Some(1_000.0),
                 equity: Some(1_000.0),
+                equity_usd: Some(1_000.0),
+                discounted_equity_usd: Some(1_000.0),
+                unrealized_pnl: Some(0.0),
                 liability: borrowing_fields_apply.then_some(0.0),
                 cross_liability: borrowing_fields_apply.then_some(0.0),
                 isolated_liability: multi.then_some(0.0),
@@ -1146,6 +1545,19 @@ mod tests {
             update_time_ms: 0,
             positions: Vec::new(),
         }
+    }
+
+    fn clock(server_ms: u64) -> AccountCertificationClockEvidence {
+        AccountCertificationClockEvidence {
+            local_midpoint_ms: server_ms,
+            server_ms,
+            absolute_skew_ms: 0,
+        }
+    }
+
+    fn refresh_response_hash(response: &mut AccountCertificationResponseEvidence) {
+        response.bytes = response.body.len() as u64;
+        response.sha256 = sha256_bytes(response.body.as_bytes());
     }
 
     #[test]
@@ -1197,6 +1609,61 @@ mod tests {
         assert!(evaluation.passed, "{:?}", evaluation.violations);
     }
 
+    #[test]
+    fn equity_conversion_rejects_missing_stale_and_inconsistent_evidence() {
+        let balance = balance(OkxAccountLevel::Simple);
+        let start = clock(20_000);
+        let finish = clock(20_100);
+        let indexes = BTreeMap::from([(
+            "USDT".to_string(),
+            OkxIndexTickerSnapshot {
+                symbol: "USDT-USD".to_string(),
+                index_price: 1.0,
+                timestamp_ms: 20_050,
+            },
+        )]);
+        let clean = evaluate_account_equity(&balance, &indexes, &start, &finish).unwrap();
+        assert!(clean.passed, "{:?}", clean.violations);
+
+        let missing = evaluate_account_equity(&balance, &BTreeMap::new(), &start, &finish).unwrap();
+        assert!(!missing.evidence_complete);
+        assert!(!missing.passed);
+
+        let mut stale_indexes = indexes.clone();
+        stale_indexes.get_mut("USDT").unwrap().timestamp_ms = 1;
+        let stale = evaluate_account_equity(&balance, &stale_indexes, &start, &finish).unwrap();
+        assert!(!stale.evidence_complete);
+        assert!(
+            stale
+                .violations
+                .iter()
+                .any(|violation| violation.contains("timestamp"))
+        );
+
+        let mut inconsistent = balance.clone();
+        inconsistent.details[0].equity_usd = Some(900.0);
+        let inconsistent =
+            evaluate_account_equity(&inconsistent, &indexes, &start, &finish).unwrap();
+        assert!(!inconsistent.passed);
+        assert!(
+            inconsistent
+                .violations
+                .iter()
+                .any(|violation| violation.contains("eqUsd differs"))
+        );
+
+        let mut aggregate = balance;
+        aggregate.total_equity_usd = Some(900.0);
+        let aggregate = evaluate_account_equity(&aggregate, &indexes, &start, &finish).unwrap();
+        assert!(!aggregate.passed);
+        assert!(
+            aggregate
+                .violations
+                .iter()
+                .any(|violation| violation.contains("sum of eqUsd"))
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn certification_output_is_create_new_and_owner_only() {
@@ -1226,12 +1693,16 @@ mod tests {
         let config_toml = toml::to_string(&config).unwrap();
         let now = unix_time_ms().unwrap();
         let account_json = r#"{"code":"0","msg":"","data":[{"acctLv":"1","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"7","mainUid":"6","enableSpotBorrow":false,"autoLoan":false,"spotBorrowAutoRepay":false}]}"#;
-        let balance_json = r#"{"code":"0","msg":"","data":[{"uTime":"1000","totalEq":"1000","adjEq":"1000","borrowFroz":"0","notionalUsdForBorrow":"0","notionalUsd":"0","details":[{"ccy":"USDT","uTime":"1000","cashBal":"1000","availBal":"1000","eq":"1000","liab":"0","crossLiab":"0","interest":"0","borrowFroz":"0","maxLoan":"100","twap":"0"}]}]}"#;
+        let balance_json = r#"{"code":"0","msg":"","data":[{"uTime":"1000","totalEq":"1000","adjEq":"1000","borrowFroz":"0","notionalUsdForBorrow":"0","notionalUsd":"0","details":[{"ccy":"USDT","uTime":"1000","cashBal":"1000","availBal":"1000","eq":"1000","eqUsd":"1000","disEq":"1000","upl":"0","liab":"0","crossLiab":"0","interest":"0","borrowFroz":"0","maxLoan":"100","twap":"0"}]}]}"#;
+        let index_json = format!(
+            r#"{{"code":"0","msg":"","data":[{{"instId":"USDT-USD","idxPx":"1","ts":"{now}"}}]}}"#
+        );
         let positions_json = r#"{"code":"0","msg":"","data":[]}"#;
         let responses = VecDeque::from([
             format!(r#"{{"code":"0","msg":"","data":[{{"ts":"{now}"}}]}}"#),
             account_json.to_string(),
             balance_json.to_string(),
+            index_json,
             positions_json.to_string(),
             account_json.to_string(),
             format!(r#"{{"code":"0","msg":"","data":[{{"ts":"{}"}}]}}"#, now + 1),
@@ -1272,6 +1743,7 @@ mod tests {
                 "/api/v5/public/time",
                 ACCOUNT_CONFIG_ENDPOINT,
                 ACCOUNT_BALANCE_ENDPOINT,
+                "/api/v5/market/index-tickers?instId=USDT-USD",
                 ACCOUNT_POSITIONS_ENDPOINT,
                 ACCOUNT_CONFIG_ENDPOINT,
                 "/api/v5/public/time",
@@ -1290,6 +1762,32 @@ mod tests {
             verify_account_certification_artifact_path(&path).unwrap(),
             artifact
         );
+
+        let mut missing_index = artifact.clone();
+        missing_index.index_tickers.clear();
+        std::fs::write(&path, serde_json::to_vec(&missing_index).unwrap()).unwrap();
+        let error = verify_account_certification_path(&path).unwrap_err();
+        assert!(error.to_string().contains("incomplete"));
+
+        let mut rehashed_balance_tamper = artifact.clone();
+        rehashed_balance_tamper.account_balance.body = rehashed_balance_tamper
+            .account_balance
+            .body
+            .replace(r#""eqUsd":"1000""#, r#""eqUsd":"900""#);
+        refresh_response_hash(&mut rehashed_balance_tamper.account_balance);
+        std::fs::write(&path, serde_json::to_vec(&rehashed_balance_tamper).unwrap()).unwrap();
+        let error = verify_account_certification_path(&path).unwrap_err();
+        assert!(error.to_string().contains("summary does not match"));
+
+        let mut rehashed_stale_index = artifact.clone();
+        rehashed_stale_index.index_tickers[0].response.body = rehashed_stale_index.index_tickers[0]
+            .response
+            .body
+            .replace(&format!(r#""ts":"{now}""#), r#""ts":"1""#);
+        refresh_response_hash(&mut rehashed_stale_index.index_tickers[0].response);
+        std::fs::write(&path, serde_json::to_vec(&rehashed_stale_index).unwrap()).unwrap();
+        let error = verify_account_certification_path(&path).unwrap_err();
+        assert!(error.to_string().contains("summary does not match"));
 
         let mut tampered = artifact;
         tampered.account_balance.body = tampered.account_balance.body.replace("1000", "1001");

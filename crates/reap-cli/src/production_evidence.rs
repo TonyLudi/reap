@@ -25,8 +25,8 @@ use sha2::{Digest, Sha256};
 use crate::deployment::{ResearchDeploymentVerificationReport, verify_research_deployment_paths};
 use crate::latency::{LatencyCalibrationVerificationReport, verify_latency_calibration};
 
-pub(crate) const PRODUCTION_EVIDENCE_MANIFEST_SCHEMA_VERSION: u16 = 7;
-pub(crate) const PRODUCTION_EVIDENCE_REPORT_FORMAT_VERSION: u16 = 7;
+pub(crate) const PRODUCTION_EVIDENCE_MANIFEST_SCHEMA_VERSION: u16 = 8;
+pub(crate) const PRODUCTION_EVIDENCE_REPORT_FORMAT_VERSION: u16 = 8;
 pub(crate) const PRODUCTION_EVIDENCE_APPROVAL_SUBJECT_FORMAT_VERSION: u16 = 1;
 const MAX_PRODUCTION_EVIDENCE_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_PRODUCTION_EVIDENCE_ACCOUNTS: usize = 32;
@@ -49,6 +49,7 @@ const MAX_PRODUCTION_ECONOMIC_TRADE_PNL_RELATIVE_TOLERANCE: f64 = 1e-6;
 const MAX_PRODUCTION_ECONOMIC_FUNDING_ABSOLUTE_TOLERANCE: f64 = 1e-8;
 const MAX_PRODUCTION_ECONOMIC_FUNDING_RELATIVE_TOLERANCE: f64 = 1e-6;
 const MAX_PRODUCTION_FUNDING_MARK_BRACKET_DISTANCE_MS: u64 = 2_000;
+const MAX_PRODUCTION_ACCOUNT_BOUNDARY_GAP_MS: u64 = 60_000;
 const MAX_PRODUCTION_ECONOMIC_FUNDING_MARK_ABSOLUTE_TOLERANCE: f64 = 1e-8;
 const MAX_PRODUCTION_ECONOMIC_FUNDING_MARK_RELATIVE_TOLERANCE: f64 = 1e-4;
 
@@ -85,6 +86,8 @@ pub(crate) struct ProductionEvidenceFillInput {
 pub(crate) struct ProductionEvidenceEconomicInput {
     pub fill_collection_manifest: PathBuf,
     pub bill_collection_manifest: PathBuf,
+    pub opening_account_certification: PathBuf,
+    pub closing_account_certification: PathBuf,
     pub journal: PathBuf,
     pub minimum_trade_bills: u64,
     pub minimum_derivative_close_bills: u64,
@@ -92,6 +95,7 @@ pub(crate) struct ProductionEvidenceEconomicInput {
     pub maximum_trade_bill_delay_ms: u64,
     pub maximum_funding_bill_delay_ms: u64,
     pub maximum_funding_mark_bracket_distance_ms: u64,
+    pub maximum_account_boundary_gap_ms: u64,
     #[serde(default)]
     pub price_tolerance: f64,
     #[serde(default)]
@@ -561,6 +565,8 @@ struct ResolvedFillInput {
 struct ResolvedEconomicInput {
     fill_collection_manifest: PathBuf,
     bill_collection_manifest: PathBuf,
+    opening_account_certification: PathBuf,
+    closing_account_certification: PathBuf,
     journal: PathBuf,
     minimum_trade_bills: u64,
     minimum_derivative_close_bills: u64,
@@ -568,6 +574,7 @@ struct ResolvedEconomicInput {
     maximum_trade_bill_delay_ms: u64,
     maximum_funding_bill_delay_ms: u64,
     maximum_funding_mark_bracket_distance_ms: u64,
+    maximum_account_boundary_gap_ms: u64,
     tolerances: EconomicReconciliationTolerances,
 }
 
@@ -581,9 +588,13 @@ struct VerifiedFillInput {
 struct VerifiedEconomicInput {
     fill_collection_manifest: PathBuf,
     bill_collection_manifest: PathBuf,
+    opening_account_certification: PathBuf,
+    closing_account_certification: PathBuf,
     journal: PathBuf,
     fill_manifest: reap_live::FillCollectionManifest,
     bill_manifest: reap_live::BillCollectionManifest,
+    opening_account: AccountCertificationArtifact,
+    closing_account: AccountCertificationArtifact,
     report: reap_live::EconomicReconciliationReport,
 }
 
@@ -769,10 +780,28 @@ pub(crate) fn verify_production_evidence_manifest_path(
                     input.bill_collection_manifest.display()
                 )
             })?;
+        let opening_before =
+            verify_account_certification_artifact_path(&input.opening_account_certification)
+                .with_context(|| {
+                    format!(
+                        "failed to reconstruct opening economic account certification {}",
+                        input.opening_account_certification.display()
+                    )
+                })?;
+        let closing_before =
+            verify_account_certification_artifact_path(&input.closing_account_certification)
+                .with_context(|| {
+                    format!(
+                        "failed to reconstruct closing economic account certification {}",
+                        input.closing_account_certification.display()
+                    )
+                })?;
         let report = reconcile_okx_economics_paths(
             &input.journal,
             &input.fill_collection_manifest,
             &input.bill_collection_manifest,
+            &input.opening_account_certification,
+            &input.closing_account_certification,
             EconomicReconciliationOptions {
                 account_id: bills_before.manifest.account_id.clone(),
                 begin_ms: bills_before.manifest.window.begin_ms,
@@ -784,6 +813,7 @@ pub(crate) fn verify_production_evidence_manifest_path(
                 maximum_funding_bill_delay_ms: input.maximum_funding_bill_delay_ms,
                 maximum_funding_mark_bracket_distance_ms: input
                     .maximum_funding_mark_bracket_distance_ms,
+                maximum_account_boundary_gap_ms: input.maximum_account_boundary_gap_ms,
                 tolerances: input.tolerances,
             },
         )
@@ -807,7 +837,27 @@ pub(crate) fn verify_production_evidence_manifest_path(
                     input.bill_collection_manifest.display()
                 )
             })?;
-        if fills_before != fills_after || bills_before != bills_after {
+        let opening_after =
+            verify_account_certification_artifact_path(&input.opening_account_certification)
+                .with_context(|| {
+                    format!(
+                        "failed to recheck opening economic account certification {}",
+                        input.opening_account_certification.display()
+                    )
+                })?;
+        let closing_after =
+            verify_account_certification_artifact_path(&input.closing_account_certification)
+                .with_context(|| {
+                    format!(
+                        "failed to recheck closing economic account certification {}",
+                        input.closing_account_certification.display()
+                    )
+                })?;
+        if fills_before != fills_after
+            || bills_before != bills_after
+            || opening_before != opening_after
+            || closing_before != closing_after
+        {
             bail!(
                 "economic source collections changed while {} was being reconciled",
                 bills_before.manifest.account_id
@@ -816,9 +866,13 @@ pub(crate) fn verify_production_evidence_manifest_path(
         economic_inputs.push(VerifiedEconomicInput {
             fill_collection_manifest: input.fill_collection_manifest.clone(),
             bill_collection_manifest: input.bill_collection_manifest.clone(),
+            opening_account_certification: input.opening_account_certification.clone(),
+            closing_account_certification: input.closing_account_certification.clone(),
             journal: input.journal.clone(),
             fill_manifest: fills_before.manifest,
             bill_manifest: bills_before.manifest,
+            opening_account: opening_before,
+            closing_account: closing_before,
             report,
         });
     }
@@ -1033,9 +1087,17 @@ pub(crate) fn verify_production_evidence_manifest_path(
             vec![
                 input.fill_collection_manifest.clone(),
                 input.bill_collection_manifest.clone(),
+                input.opening_account_certification.clone(),
+                input.closing_account_certification.clone(),
                 input.journal.clone(),
             ],
-            &(&input.fill_manifest, &input.bill_manifest, &input.report),
+            &(
+                &input.fill_manifest,
+                &input.bill_manifest,
+                &input.opening_account,
+                &input.closing_account,
+                &input.report,
+            ),
             input.report.passed,
         )?);
     }
@@ -1103,7 +1165,7 @@ pub(crate) fn verify_production_evidence_manifest_path(
                 .to_string(),
             "source timestamps and verifier wall time are validated artifact fields but are not remotely attested; operators must independently control clock synchronization, the manifest, and target host"
                 .to_string(),
-            "trade/funding reconciliation rejects unexplained account bills and binds funding to the journaled signed position plus two-sided mark bracket, but opening cost basis, complete balance/equity continuity, taxes, currency conversion, and profitability review remain external gates"
+            "trade/funding reconciliation rejects unexplained account bills, proves controlled-window cash continuity, checks endpoint equity conversion, and binds funding to the journaled signed position plus two-sided mark bracket; exact internal valuation ticks, total-equity attribution, taxes, and profitability review remain external gates"
                 .to_string(),
             "supervision, paging, credential permissions, venue announcements, rollout/rollback review, and explicit human approval remain required"
                 .to_string(),
@@ -1346,6 +1408,29 @@ fn evaluate_freshness(
             Some(economic.bill_manifest.window.end_ms),
             input.policy.bill_collection_max_age_ms,
         );
+        for (path, artifact) in [
+            (
+                &economic.opening_account_certification,
+                &economic.opening_account,
+            ),
+            (
+                &economic.closing_account_certification,
+                &economic.closing_account,
+            ),
+        ] {
+            push_freshness(
+                &mut observations,
+                &mut failures,
+                input.policy,
+                input.verified_at_ms,
+                ProductionEvidenceGate::EconomicReconciliation,
+                Some(economic.bill_manifest.account_id.clone()),
+                path,
+                artifact.start_clock.server_ms,
+                Some(artifact.finish_clock.server_ms),
+                input.policy.bill_collection_max_age_ms,
+            );
+        }
     }
     observations.sort_by(|left, right| {
         left.gate
@@ -1961,11 +2046,23 @@ fn evaluate_bindings(input: BindingInputs<'_>) -> Vec<ProductionEvidenceFailure>
     let mut economic_accounts = BTreeSet::new();
     for economic in input.economic_inputs {
         let account_id = economic.bill_manifest.account_id.as_str();
+        let cash_continuity_passed = economic.report.counts.cash_balance_currencies > 0
+            && economic.report.counts.cash_balance_currencies
+                == economic.report.counts.cash_balance_currencies_validated
+            && economic.report.counts.cash_balance_chain_links > 0
+            && economic.report.counts.cash_balance_chain_links
+                == economic.report.counts.cash_balance_chain_links_validated
+            && !economic.report.currency_balance_continuity.is_empty()
+            && economic
+                .report
+                .currency_balance_continuity
+                .iter()
+                .all(|sample| sample.validated);
         reject_gate(
             &mut failures,
             ProductionEvidenceGate::EconomicReconciliation,
             Some(account_id),
-            economic.report.passed,
+            economic.report.passed && cash_continuity_passed,
         );
         if !economic_accounts.insert(account_id.to_string()) {
             failures.push(ProductionEvidenceFailure::DuplicateAccountEvidence {
@@ -1984,6 +2081,27 @@ fn evaluate_bindings(input: BindingInputs<'_>) -> Vec<ProductionEvidenceFailure>
             &economic.fill_manifest.account_identity_sha256,
             &input,
         );
+        for artifact in [&economic.opening_account, &economic.closing_account] {
+            check_demo_artifact_identity(
+                &mut failures,
+                ProductionEvidenceGate::EconomicReconciliation,
+                account_id,
+                &artifact.config.sha256,
+                &artifact.reap_version,
+                &artifact.executable_sha256,
+                &artifact.host_identity_sha256,
+                &artifact.summary.account_identity_sha256,
+                &input,
+            );
+            check_binding(
+                &mut failures,
+                ProductionEvidenceGate::EconomicReconciliation,
+                Some(account_id),
+                "boundary_account_id",
+                account_id,
+                &artifact.summary.account_id,
+            );
+        }
         check_demo_artifact_identity(
             &mut failures,
             ProductionEvidenceGate::EconomicReconciliation,
@@ -2023,6 +2141,30 @@ fn evaluate_bindings(input: BindingInputs<'_>) -> Vec<ProductionEvidenceFailure>
                 .map(String::as_str)
                 .unwrap_or(""),
             &economic.report.account_identity_sha256,
+        );
+        check_binding(
+            &mut failures,
+            ProductionEvidenceGate::EconomicReconciliation,
+            Some(account_id),
+            "opening_account_certification_path",
+            &economic.opening_account_certification.to_string_lossy(),
+            &economic
+                .report
+                .opening_account_boundary
+                .certification_file
+                .path,
+        );
+        check_binding(
+            &mut failures,
+            ProductionEvidenceGate::EconomicReconciliation,
+            Some(account_id),
+            "closing_account_certification_path",
+            &economic.closing_account_certification.to_string_lossy(),
+            &economic
+                .report
+                .closing_account_boundary
+                .certification_file
+                .path,
         );
         let matching_fill = input
             .fill_inputs
@@ -2667,6 +2809,13 @@ fn validate_manifest(manifest: &ProductionEvidenceManifest) -> Result<()> {
                 "economic funding mark bracket distance must be in 1..={MAX_PRODUCTION_FUNDING_MARK_BRACKET_DISTANCE_MS} ms"
             );
         }
+        if economic.maximum_account_boundary_gap_ms == 0
+            || economic.maximum_account_boundary_gap_ms > MAX_PRODUCTION_ACCOUNT_BOUNDARY_GAP_MS
+        {
+            bail!(
+                "economic account boundary gap must be in 1..={MAX_PRODUCTION_ACCOUNT_BOUNDARY_GAP_MS} ms"
+            );
+        }
         for (field, value) in [
             ("price_tolerance", economic.price_tolerance),
             ("quantity_tolerance", economic.quantity_tolerance),
@@ -2946,6 +3095,7 @@ fn resolve_manifest(loaded: &LoadedManifest) -> Result<ResolvedManifest> {
     let mut economic_reconciliations = Vec::with_capacity(value.economic_reconciliations.len());
     let mut economic_bill_manifests = HashSet::new();
     let mut economic_fill_manifests = HashSet::new();
+    let mut economic_account_boundaries = HashSet::new();
     for input in &value.economic_reconciliations {
         let fill_collection_manifest = resolve_regular_file(
             base,
@@ -2957,12 +3107,30 @@ fn resolve_manifest(loaded: &LoadedManifest) -> Result<ResolvedManifest> {
             &input.bill_collection_manifest,
             "economic bill collection manifest",
         )?;
+        let opening_account_certification = resolve_regular_file(
+            base,
+            &input.opening_account_certification,
+            "opening economic account certification",
+        )?;
+        let closing_account_certification = resolve_regular_file(
+            base,
+            &input.closing_account_certification,
+            "closing economic account certification",
+        )?;
         let journal = resolve_regular_file(base, &input.journal, "economic journal")?;
-        if fill_collection_manifest == bill_collection_manifest
-            || fill_collection_manifest == journal
-            || bill_collection_manifest == journal
-        {
-            bail!("economic fill manifest, bill manifest, and journal must be distinct files");
+        let distinct_paths = [
+            &fill_collection_manifest,
+            &bill_collection_manifest,
+            &opening_account_certification,
+            &closing_account_certification,
+            &journal,
+        ]
+        .into_iter()
+        .collect::<HashSet<_>>();
+        if distinct_paths.len() != 5 {
+            bail!(
+                "economic fill manifest, bill manifest, account boundaries, and journal must be distinct files"
+            );
         }
         if !economic_fill_manifests.insert(fill_collection_manifest.clone()) {
             bail!(
@@ -2976,9 +3144,19 @@ fn resolve_manifest(loaded: &LoadedManifest) -> Result<ResolvedManifest> {
                 bill_collection_manifest.display()
             );
         }
+        for boundary in [
+            opening_account_certification.clone(),
+            closing_account_certification.clone(),
+        ] {
+            if !economic_account_boundaries.insert(boundary.clone()) {
+                bail!("duplicate economic account boundary {}", boundary.display());
+            }
+        }
         economic_reconciliations.push(ResolvedEconomicInput {
             fill_collection_manifest,
             bill_collection_manifest,
+            opening_account_certification,
+            closing_account_certification,
             journal,
             minimum_trade_bills: input.minimum_trade_bills,
             minimum_derivative_close_bills: input.minimum_derivative_close_bills,
@@ -2987,6 +3165,7 @@ fn resolve_manifest(loaded: &LoadedManifest) -> Result<ResolvedManifest> {
             maximum_funding_bill_delay_ms: input.maximum_funding_bill_delay_ms,
             maximum_funding_mark_bracket_distance_ms: input
                 .maximum_funding_mark_bracket_distance_ms,
+            maximum_account_boundary_gap_ms: input.maximum_account_boundary_gap_ms,
             tolerances: EconomicReconciliationTolerances {
                 price_abs: input.price_tolerance,
                 quantity_abs: input.quantity_tolerance,
@@ -3142,7 +3321,7 @@ mod tests {
     fn manifest_toml(extra: &str) -> String {
         format!(
             r#"
-schema_version = 7
+schema_version = 8
 expected_reap_version = "0.1.0"
 expected_live_executable_sha256 = "{}"
 expected_host_identity_sha256 = "{}"
@@ -3242,6 +3421,8 @@ minimum_fills = 1
 [[economic_reconciliations]]
 fill_collection_manifest = "fills/manifest.json"
 bill_collection_manifest = "bills/manifest.json"
+opening_account_certification = "opening-account.json"
+closing_account_certification = "closing-account.json"
 journal = "journal.jsonl"
 minimum_trade_bills = 1
 minimum_derivative_close_bills = 1
@@ -3249,6 +3430,7 @@ minimum_funding_bills = 1
 maximum_trade_bill_delay_ms = 60000
 maximum_funding_bill_delay_ms = 60000
 maximum_funding_mark_bracket_distance_ms = 1000
+maximum_account_boundary_gap_ms = 60000
 {extra}
 "#,
             "1".repeat(64),
@@ -3318,6 +3500,11 @@ maximum_funding_mark_bracket_distance_ms = 1000
         assert!(validate_manifest(&parsed).is_err());
 
         parsed.economic_reconciliations[0].maximum_funding_mark_bracket_distance_ms = 1_000;
+        parsed.economic_reconciliations[0].maximum_account_boundary_gap_ms =
+            MAX_PRODUCTION_ACCOUNT_BOUNDARY_GAP_MS + 1;
+        assert!(validate_manifest(&parsed).is_err());
+
+        parsed.economic_reconciliations[0].maximum_account_boundary_gap_ms = 60_000;
         parsed.economic_reconciliations[0].funding_mark_relative_tolerance =
             MAX_PRODUCTION_ECONOMIC_FUNDING_MARK_RELATIVE_TOLERANCE * 2.0;
         assert!(validate_manifest(&parsed).is_err());

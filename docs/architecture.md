@@ -353,13 +353,18 @@ Responsibilities:
   independent ranges. Each runtime start writes a schema-7 `session_start` per
   account with session, strategy, config, and hashed OKX account identity; line
   boundaries prevent settlement, position, or mark evidence from crossing a
-  restart. This is intentionally outside the hot event loop.
+  restart. Separately verified account certifications must tightly bracket the
+  bill window. Numeric bill IDs and post-bill balances form a per-currency chain
+  from opening `cashBal` through every `balChg` to closing `cashBal`. This is
+  intentionally outside the hot event loop.
 - Collect a self-contained point-in-time account certification from exact
-  authenticated config, balance, and positions responses. Its mode-aware policy
+  authenticated config, balance, and positions responses plus a public direct
+  index response for every non-USD balance currency. Its mode-aware policy
   requires cash-only spot routing, zero configured borrowing, disabled venue
   borrowing, complete applicable zero-liability/interest evidence, no margin
-  positions, stable bracketed identity/settings, and bounded exchange time.
-  Offline verification re-hashes and re-parses the embedded evidence.
+  positions, stable bracketed identity/settings, bounded exchange time, strict
+  `sum(eqUsd) = totalEq`, and independently bounded `eq * index = eqUsd`.
+  Offline verification re-hashes and re-parses every embedded response.
 - Certify controlled process-death deadman expiry through a separate read-only
   composition. It leases and fingerprints the stopped journal, recovers durable
   live exchange/client bindings, retains exact order-detail and account-wide
@@ -753,9 +758,10 @@ same-session authenticated REST position basis plus critical fills. That is
 local journal provenance, not remote process attestation. The supported live
 spot boundary is cash mode; production certification must prove zero
 liabilities. Enabling margin
-spot later requires a separate borrow-rate and interest model first. Production
-evaluation must still reconcile complete balance/equity and currency-index
-coverage across every held interval.
+spot later requires a separate borrow-rate and interest model first. The
+operational gate now proves tightly bracketed bill/cash continuity and endpoint
+currency conversion; production evaluation must still review total-equity
+attribution and sustained index coverage across every held interval.
 
 #### Deterministic walk-forward research
 
@@ -957,7 +963,7 @@ environment-specific account identities. The verifier reruns each source gate,
 reopens every deployment config and the controlling manifest, and reconstructs
 the loopback fault config from the exact official-demo and fault-proxy configs
 before cross-binding all returned identities. It hashes the typed in-memory
-reconstructions instead of accepting prior verification JSON. Schema 7
+reconstructions instead of accepting prior verification JSON. Schema 8
 re-verifies every fault/latency live
 source, derives completion times from validated sessions or exchange-clock
 samples, enforces explicit age limits under hard maxima, and requires each typed
@@ -966,13 +972,14 @@ schema-2 proxy process report per scenario, requiring exact config/build/host,
 unique sessions, independently derived clean shutdown, and unambiguous live-run
 enclosure. One fill/fee and one account-wide trade/funding economic
 reconciliation are required per demo account, with exact collection, journal,
-config, executable, host, and pseudonymous account bindings. Bill freshness is
+opening/closing account boundaries, config, executable, host, and pseudonymous
+account bindings. Boundary gaps are capped at 60 seconds and bill freshness is
 independently bounded to 24 hours.
 
 Release approval remains a separate `reap-cli` composition layer. A stable typed
 subject removes only verifier wall time and derived age while preserving every
 source timestamp, freshness limit/result, gate hash, config, candidate, build,
-host, account identity, and proxy run. Schema 7 also requires a reviewed nonzero
+host, account identity, and proxy run. Schema 8 also requires a reviewed nonzero
 count of independently recomputed derivative closes. A strict policy requires at least two
 sorted roles and distinct Ed25519 keys. Offline signatures bind the exact policy,
 request bytes, role, approver, and signing time; final verification reruns the
@@ -982,8 +989,8 @@ This is deliberately asymmetric rather than reusing the runtime operator HMAC:
 the target host can verify approvals without gaining signing capability. Even a
 passing approval leaves production entry unauthorized because remote attestation,
 external supervision, remote attestation of the locally journaled position
-basis, complete balance/equity and currency-conversion accounting, and actual
-rollout governance remain outside this composition. Funding's bill-reported mark is
+basis, total-equity attribution outside the controlled bill/cash window, and
+actual rollout governance remain outside this composition. Funding's bill-reported mark is
 checked against same-session public observations, but the exact internal
 assessment tick cannot be reproduced externally.
 

@@ -203,6 +203,16 @@ pub(crate) struct ReconcileEconomicsArgs {
         help = "Verified account-wide manifest from collect-bills for the exact reconciliation window"
     )]
     bill_collection_manifest: PathBuf,
+    #[arg(
+        long,
+        help = "Passing account-certification artifact collected before begin-ms"
+    )]
+    opening_account_certification: PathBuf,
+    #[arg(
+        long,
+        help = "Passing account-certification artifact collected after end-ms"
+    )]
+    closing_account_certification: PathBuf,
     #[arg(long, help = "Configured Reap account id represented by all sources")]
     account: String,
     #[arg(
@@ -248,6 +258,12 @@ pub(crate) struct ReconcileEconomicsArgs {
         help = "Maximum exchange-time distance on each side of the funding assessment mark bracket"
     )]
     maximum_funding_mark_bracket_distance_ms: u64,
+    #[arg(
+        long,
+        default_value_t = 60_000,
+        help = "Maximum gap from each account certification to its reconciliation-window boundary"
+    )]
+    maximum_account_boundary_gap_ms: u64,
     #[arg(long, default_value_t = 0.0, help = "Absolute trade-price tolerance")]
     price_tolerance: f64,
     #[arg(
@@ -318,6 +334,8 @@ pub(crate) fn reconcile_economics(args: ReconcileEconomicsArgs) -> Result<()> {
         &args.journal,
         &args.fill_collection_manifest,
         &args.bill_collection_manifest,
+        &args.opening_account_certification,
+        &args.closing_account_certification,
         EconomicReconciliationOptions {
             account_id: args.account,
             begin_ms: args.begin_ms,
@@ -328,6 +346,7 @@ pub(crate) fn reconcile_economics(args: ReconcileEconomicsArgs) -> Result<()> {
             maximum_trade_bill_delay_ms: args.maximum_trade_bill_delay_ms,
             maximum_funding_bill_delay_ms: args.maximum_funding_bill_delay_ms,
             maximum_funding_mark_bracket_distance_ms: args.maximum_funding_mark_bracket_distance_ms,
+            maximum_account_boundary_gap_ms: args.maximum_account_boundary_gap_ms,
             tolerances: EconomicReconciliationTolerances {
                 price_abs: args.price_tolerance,
                 quantity_abs: args.quantity_tolerance,

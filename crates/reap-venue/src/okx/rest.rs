@@ -20,6 +20,7 @@ const CANCEL_ORDER_PATH: &str = "/api/v5/trade/cancel-order";
 const CANCEL_BATCH_ORDERS_PATH: &str = "/api/v5/trade/cancel-batch-orders";
 const CANCEL_ALL_AFTER_PATH: &str = "/api/v5/trade/cancel-all-after";
 const PUBLIC_TIME_PATH: &str = "/api/v5/public/time";
+const MARKET_INDEX_TICKERS_PATH: &str = "/api/v5/market/index-tickers";
 const SYSTEM_STATUS_PATH: &str = "/api/v5/system/status";
 const OPEN_ORDERS_PATH: &str = "/api/v5/trade/orders-pending";
 const FILLS_PATH: &str = "/api/v5/trade/fills";
@@ -96,6 +97,28 @@ pub fn parse_okx_account_balance_response_json(
         .ok_or(RestError::EmptyData {
             operation: "account balance",
         })?
+        .try_into()
+}
+
+/// Parses one unmodified public OKX index-ticker response.
+///
+/// The pinned Java `OkexV5RestClient.getIndex` uses the same endpoint and
+/// retains `instId`, `idxPx`, and `ts` for account and strategy valuation.
+pub fn parse_okx_index_ticker_response_json(
+    body: &[u8],
+) -> Result<OkxIndexTickerSnapshot, RestError> {
+    let mut response: OkxResponse<OkxIndexTickerWire> = decode_okx_response(body)?;
+    if response.data.len() != 1 {
+        return Err(RestError::InvalidField {
+            field: "data",
+            value: response.data.len().to_string(),
+            message: "index ticker response must contain exactly one row".to_string(),
+        });
+    }
+    response
+        .data
+        .pop()
+        .expect("checked one index ticker row")
         .try_into()
 }
 
@@ -627,6 +650,12 @@ pub struct OkxBalanceDetail {
     pub cash_balance: Option<f64>,
     pub available_balance: Option<f64>,
     pub equity: Option<f64>,
+    /// Exchange-converted currency equity in USD (`eqUsd`).
+    pub equity_usd: Option<f64>,
+    /// Haircut-adjusted currency equity in USD (`disEq`).
+    pub discounted_equity_usd: Option<f64>,
+    /// Currency-level unrealized PnL (`upl`).
+    pub unrealized_pnl: Option<f64>,
     pub liability: Option<f64>,
     pub cross_liability: Option<f64>,
     pub isolated_liability: Option<f64>,
@@ -635,6 +664,20 @@ pub struct OkxBalanceDetail {
     pub borrow_frozen_usd: Option<f64>,
     pub max_loan: Option<f64>,
     pub forced_repayment_indicator: Option<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OkxIndexTickerSnapshot {
+    pub symbol: String,
+    pub index_price: f64,
+    pub timestamp_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OkxRawIndexTicker {
+    pub request_path: String,
+    pub response_body: String,
+    pub ticker: OkxIndexTickerSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1057,6 +1100,43 @@ where
                 operation: "server time",
             })?;
         parse_integer("ts", &wire.timestamp)
+    }
+
+    pub async fn index_ticker(&self, symbol: &str) -> Result<OkxIndexTickerSnapshot, RestError> {
+        Ok(self.index_ticker_raw(symbol).await?.ticker)
+    }
+
+    /// Retrieves one public index ticker while retaining the exact response.
+    pub async fn index_ticker_raw(&self, symbol: &str) -> Result<OkxRawIndexTicker, RestError> {
+        let symbol = symbol.trim();
+        if symbol.is_empty() {
+            return Err(RestError::InvalidField {
+                field: "instId",
+                value: symbol.to_string(),
+                message: "must be non-empty".to_string(),
+            });
+        }
+        let path = query_path(MARKET_INDEX_TICKERS_PATH, [("instId", Some(symbol))]);
+        let request = SignedRequest {
+            method: HttpMethod::Get,
+            path: path.clone(),
+            body: String::new(),
+            headers: BTreeMap::new(),
+        };
+        let response = self.transport.execute(request).await?;
+        let ticker = parse_okx_index_ticker_response_json(response.body.as_bytes())?;
+        if ticker.symbol != symbol {
+            return Err(RestError::InvalidField {
+                field: "instId",
+                value: ticker.symbol,
+                message: format!("does not match requested {symbol}"),
+            });
+        }
+        Ok(OkxRawIndexTicker {
+            request_path: path,
+            response_body: response.body,
+            ticker,
+        })
     }
 
     pub async fn system_status(&self) -> Result<Vec<OkxSystemStatus>, RestError> {
@@ -2073,6 +2153,51 @@ struct OkxTimeWire {
 }
 
 #[derive(Debug, Deserialize)]
+struct OkxIndexTickerWire {
+    #[serde(rename = "instId")]
+    symbol: String,
+    #[serde(rename = "idxPx")]
+    index_price: String,
+    #[serde(rename = "ts")]
+    timestamp: String,
+}
+
+impl TryFrom<OkxIndexTickerWire> for OkxIndexTickerSnapshot {
+    type Error = RestError;
+
+    fn try_from(value: OkxIndexTickerWire) -> Result<Self, Self::Error> {
+        if value.symbol.trim().is_empty() || value.symbol.trim() != value.symbol {
+            return Err(RestError::InvalidField {
+                field: "instId",
+                value: value.symbol,
+                message: "must be non-empty and contain no surrounding whitespace".to_string(),
+            });
+        }
+        let index_price = parse_number("idxPx", &value.index_price)?;
+        if index_price <= 0.0 {
+            return Err(RestError::InvalidField {
+                field: "idxPx",
+                value: value.index_price,
+                message: "must be positive".to_string(),
+            });
+        }
+        let timestamp_ms = parse_integer("ts", &value.timestamp)?;
+        if timestamp_ms == 0 {
+            return Err(RestError::InvalidField {
+                field: "ts",
+                value: value.timestamp,
+                message: "must be positive".to_string(),
+            });
+        }
+        Ok(Self {
+            symbol: value.symbol,
+            index_price,
+            timestamp_ms,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct OkxSystemStatusWire {
     #[serde(default)]
     title: String,
@@ -2465,6 +2590,12 @@ impl TryFrom<OkxAccountBalanceWire> for OkxAccountBalanceSnapshot {
                         &detail.available_balance,
                     )?,
                     equity: parse_nullable_number("eq", &detail.equity)?,
+                    equity_usd: parse_nullable_number("eqUsd", &detail.equity_usd)?,
+                    discounted_equity_usd: parse_nullable_number(
+                        "disEq",
+                        &detail.discounted_equity_usd,
+                    )?,
+                    unrealized_pnl: parse_nullable_number("upl", &detail.unrealized_pnl)?,
                     liability: parse_nullable_number("liab", &detail.liability)?,
                     cross_liability: parse_nullable_number("crossLiab", &detail.cross_liability)?,
                     isolated_liability: parse_nullable_number(
@@ -2512,6 +2643,12 @@ struct OkxBalanceWire {
     available_balance: String,
     #[serde(default, rename = "eq")]
     equity: String,
+    #[serde(default, rename = "eqUsd")]
+    equity_usd: String,
+    #[serde(default, rename = "disEq")]
+    discounted_equity_usd: String,
+    #[serde(default, rename = "upl")]
+    unrealized_pnl: String,
     #[serde(default, rename = "liab")]
     liability: String,
     #[serde(default, rename = "crossLiab")]
@@ -3753,6 +3890,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_index_ticker_retains_exact_java_mapped_wire_contract() {
+        let response = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USD","idxPx":"50000.25","ts":"1597026383085"}]}"#;
+        let (client, requests) = client(vec![response]);
+
+        let raw = client.index_ticker_raw("BTC-USD").await.unwrap();
+        assert_eq!(
+            raw.request_path,
+            "/api/v5/market/index-tickers?instId=BTC-USD"
+        );
+        assert_eq!(raw.response_body, response);
+        assert_eq!(raw.ticker.symbol, "BTC-USD");
+        assert_eq!(raw.ticker.index_price, 50_000.25);
+        assert_eq!(raw.ticker.timestamp_ms, 1_597_026_383_085);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].path, raw.request_path);
+        assert!(requests[0].headers.is_empty());
+
+        assert!(matches!(
+            parse_okx_index_ticker_response_json(
+                br#"{"code":"0","msg":"","data":[{"instId":"BTC-USD","idxPx":"0","ts":"1"}]}"#
+            ),
+            Err(RestError::InvalidField { field: "idxPx", .. })
+        ));
+        assert!(matches!(
+            parse_okx_index_ticker_response_json(
+                br#"{"code":"0","msg":"","data":[{"instId":"BTC-USD","idxPx":"1","ts":"0"}]}"#
+            ),
+            Err(RestError::InvalidField { field: "ts", .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn cancel_all_after_rejects_unsafe_timeout() {
         let (invalid_timeout_client, _) = client(Vec::new());
         assert!(matches!(
@@ -4077,13 +4246,16 @@ mod tests {
         assert_eq!(account.spot_borrow_auto_repay, Some(true));
 
         let balance = parse_okx_account_balance_response_json(
-            br#"{"code":"0","msg":"","data":[{"uTime":"1000","totalEq":"100","adjEq":"99","borrowFroz":"2","notionalUsdForBorrow":"3","details":[{"ccy":"USDT","uTime":"999","cashBal":"100","availBal":"90","eq":"99","liab":"1","crossLiab":"0.5","isoLiab":"0.25","uplLiab":"0.1","interest":"0.01","borrowFroz":"2","maxLoan":"50","twap":"1"}]}]}"#,
+            br#"{"code":"0","msg":"","data":[{"uTime":"1000","totalEq":"100","adjEq":"99","borrowFroz":"2","notionalUsdForBorrow":"3","details":[{"ccy":"USDT","uTime":"999","cashBal":"100","availBal":"90","eq":"99","eqUsd":"98.5","disEq":"97","upl":"-1","liab":"1","crossLiab":"0.5","isoLiab":"0.25","uplLiab":"0.1","interest":"0.01","borrowFroz":"2","maxLoan":"50","twap":"1"}]}]}"#,
         )
         .unwrap();
         assert_eq!(balance.borrow_frozen_usd, Some(2.0));
         assert_eq!(balance.notional_usd_for_borrow, Some(3.0));
         assert_eq!(balance.details[0].liability, Some(1.0));
         assert_eq!(balance.details[0].accrued_interest, Some(0.01));
+        assert_eq!(balance.details[0].equity_usd, Some(98.5));
+        assert_eq!(balance.details[0].discounted_equity_usd, Some(97.0));
+        assert_eq!(balance.details[0].unrealized_pnl, Some(-1.0));
 
         let positions = parse_okx_account_positions_response_json(
             br#"{"code":"0","msg":"","data":[{"instType":"MARGIN","instId":"BTC-USDT","pos":"1","posSide":"net","mgnMode":"cross","uTime":"1001","liab":"20","interest":"0.02","pendingCloseOrdLiabVal":"1","baseBorrowed":"0","baseInterest":"0","quoteBorrowed":"20","quoteInterest":"0.02"}]}"#,

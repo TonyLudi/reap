@@ -12,7 +12,8 @@ use reap_storage::{
 use reap_strategy::{InstrumentConfig, InstrumentKindConfig};
 use reap_venue::RemoteFill;
 use reap_venue::okx::{
-    OkxBill, OkxBillExecutionType, OkxBillMarginMode, OkxInstrumentType, OkxTradeMode,
+    OkxAccountBalanceSnapshot, OkxBalanceDetail, OkxBill, OkxBillExecutionType, OkxBillMarginMode,
+    OkxInstrumentType, OkxTradeMode, parse_okx_account_balance_response_json,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,12 +21,14 @@ use thiserror::Error;
 
 use crate::provenance::current_executable_sha256;
 use crate::{
-    BillCollectionError, BillCollectionWindow, FillCollectionError, FillCollectionFileEvidence,
-    LiveConfig, LiveConfigError, TradingEnvironment, verify_bill_collection_manifest_path,
+    AccountCertificationError, BillCollectionError, BillCollectionWindow, FillCollectionError,
+    FillCollectionFileEvidence, LiveConfig, LiveConfigError,
+    MAX_ACCOUNT_CERTIFICATION_ARTIFACT_BYTES, TradingEnvironment,
+    verify_account_certification_artifact_path, verify_bill_collection_manifest_path,
     verify_fill_collection_manifest_path,
 };
 
-pub const ECONOMIC_RECONCILIATION_SCHEMA_VERSION: u32 = 4;
+pub const ECONOMIC_RECONCILIATION_SCHEMA_VERSION: u32 = 5;
 pub const MAX_ECONOMIC_JOURNAL_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_ECONOMIC_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_ECONOMIC_REPORTED_ISSUES: usize = 1_024;
@@ -34,6 +37,7 @@ pub const MAX_ECONOMIC_DERIVATIVE_PNL_SAMPLES: usize = 4_096;
 pub const MAX_TRADE_BILL_DELAY_MS: u64 = 10 * 60 * 1_000;
 pub const MAX_FUNDING_BILL_DELAY_MS: u64 = 10 * 60 * 1_000;
 pub const MAX_FUNDING_MARK_BRACKET_DISTANCE_MS: u64 = 10_000;
+pub const MAX_ACCOUNT_BOUNDARY_GAP_MS: u64 = 10 * 60 * 1_000;
 
 #[derive(Debug, Clone)]
 pub struct EconomicReconciliationOptions {
@@ -46,6 +50,7 @@ pub struct EconomicReconciliationOptions {
     pub maximum_trade_bill_delay_ms: u64,
     pub maximum_funding_bill_delay_ms: u64,
     pub maximum_funding_mark_bracket_distance_ms: u64,
+    pub maximum_account_boundary_gap_ms: u64,
     pub tolerances: EconomicReconciliationTolerances,
 }
 
@@ -94,6 +99,13 @@ impl EconomicReconciliationOptions {
         {
             return Err(EconomicReconciliationError::InvalidOptions(format!(
                 "maximum-funding-mark-bracket-distance-ms must be in 1..={MAX_FUNDING_MARK_BRACKET_DISTANCE_MS}"
+            )));
+        }
+        if self.maximum_account_boundary_gap_ms == 0
+            || self.maximum_account_boundary_gap_ms > MAX_ACCOUNT_BOUNDARY_GAP_MS
+        {
+            return Err(EconomicReconciliationError::InvalidOptions(format!(
+                "maximum-account-boundary-gap-ms must be in 1..={MAX_ACCOUNT_BOUNDARY_GAP_MS}"
             )));
         }
         for (name, value) in [
@@ -149,6 +161,7 @@ pub enum EconomicIssueSource {
     Journal,
     FillCollection,
     BillCollection,
+    AccountBoundary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,6 +200,10 @@ pub struct EconomicReconciliationCounts {
     pub funding_bills_matched: u64,
     pub funding_mark_brackets_validated: u64,
     pub funding_bills_validated: u64,
+    pub cash_balance_currencies: u64,
+    pub cash_balance_currencies_validated: u64,
+    pub cash_balance_chain_links: u64,
+    pub cash_balance_chain_links_validated: u64,
     pub issues_total: u64,
     pub issues_reported: u64,
 }
@@ -283,9 +300,50 @@ pub struct DerivativePnlFormulaSample {
     pub validated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EconomicAccountBoundaryEvidence {
+    pub certification_file: FillCollectionFileEvidence,
+    pub certification_schema_version: u32,
+    pub collector_reap_version: String,
+    pub collector_executable_sha256: String,
+    pub collector_host_identity_sha256: String,
+    pub start_server_ms: u64,
+    pub finish_server_ms: u64,
+    pub window_gap_ms: u64,
+    pub total_equity_usd: f64,
+    pub balance_currencies: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CurrencyBalanceContinuitySample {
+    pub currency: String,
+    pub opening_cash_balance: f64,
+    pub closing_cash_balance: f64,
+    pub opening_equity: f64,
+    pub closing_equity: f64,
+    pub opening_equity_usd: f64,
+    pub closing_equity_usd: f64,
+    pub bill_count: u64,
+    pub first_bill_id: Option<String>,
+    pub last_bill_id: Option<String>,
+    pub summed_balance_change: f64,
+    pub expected_closing_cash_balance: f64,
+    pub aggregate_absolute_difference: f64,
+    pub effective_tolerance: f64,
+    pub balance_chain_links: u64,
+    pub balance_chain_links_validated: u64,
+    pub validated: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EconomicReconciliationFailure {
+    InvalidAccountBoundaries,
+    InvalidOrDuplicateBalanceCurrencies,
+    InvalidBillBalanceChain,
+    CashBalanceContinuityMismatches,
     JournalAccountBootstrapMissingOrInvalid,
     JournalConfigFingerprintMismatch,
     JournalStrategyMismatch,
@@ -335,12 +393,17 @@ pub struct EconomicReconciliationReport {
     pub maximum_trade_bill_delay_ms: u64,
     pub maximum_funding_bill_delay_ms: u64,
     pub maximum_funding_mark_bracket_distance_ms: u64,
+    pub maximum_account_boundary_gap_ms: u64,
     pub tolerances: EconomicReconciliationTolerances,
     pub config_file: FillCollectionFileEvidence,
     pub journal: FillCollectionFileEvidence,
     pub journal_recovery: EconomicJournalRecoveryEvidence,
     pub fill_collection_manifest: FillCollectionFileEvidence,
     pub bill_collection_manifest: FillCollectionFileEvidence,
+    pub opening_account_boundary: EconomicAccountBoundaryEvidence,
+    pub closing_account_boundary: EconomicAccountBoundaryEvidence,
+    pub total_equity_change_usd: f64,
+    pub currency_balance_continuity: Vec<CurrencyBalanceContinuitySample>,
     pub counts: EconomicReconciliationCounts,
     pub derivative_pnl_formula_samples: Vec<DerivativePnlFormulaSample>,
     pub derivative_pnl_formula_samples_omitted: u64,
@@ -361,6 +424,8 @@ pub enum EconomicReconciliationError {
     FillCollection(#[from] FillCollectionError),
     #[error("bill collection failed verification: {0}")]
     BillCollection(#[from] BillCollectionError),
+    #[error("account certification failed verification: {0}")]
+    AccountCertification(#[from] AccountCertificationError),
     #[error("verified economic sources do not bind: {0}")]
     SourceMismatch(String),
     #[error("invalid {label} path {path}: {message}")]
@@ -517,6 +582,21 @@ struct BoundEconomicSources {
     account_identity_sha256: String,
     config_fingerprint: String,
     window: BillCollectionWindow,
+    opening_account_boundary: BoundAccountBoundary,
+    closing_account_boundary: BoundAccountBoundary,
+}
+
+#[derive(Debug, Clone)]
+struct BoundAccountBoundary {
+    evidence: EconomicAccountBoundaryEvidence,
+    account_id: String,
+    environment: TradingEnvironment,
+    account_identity_sha256: String,
+    config_fingerprint: String,
+    config_source_path: String,
+    config_sha256: String,
+    passed: bool,
+    balance: OkxAccountBalanceSnapshot,
 }
 
 /// Rebuilds normal-trade and funding economics from exact verified collections
@@ -525,12 +605,28 @@ pub fn reconcile_okx_economics_paths(
     journal_path: impl AsRef<Path>,
     fill_collection_manifest_path: impl AsRef<Path>,
     bill_collection_manifest_path: impl AsRef<Path>,
+    opening_account_certification_path: impl AsRef<Path>,
+    closing_account_certification_path: impl AsRef<Path>,
     options: EconomicReconciliationOptions,
 ) -> Result<EconomicReconciliationReport, EconomicReconciliationError> {
     options.validate()?;
     let fills = verify_fill_collection_manifest_path(fill_collection_manifest_path)?;
     let bills = verify_bill_collection_manifest_path(bill_collection_manifest_path)?;
     bind_collection_manifests(&fills.manifest, &bills.manifest, &options)?;
+    let mut opening_account_boundary = read_account_boundary(
+        opening_account_certification_path.as_ref(),
+        "opening account certification",
+    )?;
+    let mut closing_account_boundary = read_account_boundary(
+        closing_account_certification_path.as_ref(),
+        "closing account certification",
+    )?;
+    bind_account_boundaries(
+        &mut opening_account_boundary,
+        &mut closing_account_boundary,
+        &bills.manifest,
+        &options,
+    )?;
 
     let config_path = PathBuf::from(&bills.manifest.config_file.path);
     let (config_file, config_bytes) = read_input(
@@ -652,10 +748,137 @@ pub fn reconcile_okx_economics_paths(
         account_identity_sha256: bills.manifest.account_identity_sha256,
         config_fingerprint: bills.manifest.config_fingerprint,
         window: bills.manifest.window,
+        opening_account_boundary,
+        closing_account_boundary,
     };
     let executable_sha256 =
         current_executable_sha256().map_err(EconomicReconciliationError::ExecutableHash)?;
     Ok(build_report(sources, options, executable_sha256))
+}
+
+fn read_account_boundary(
+    path: &Path,
+    label: &'static str,
+) -> Result<BoundAccountBoundary, EconomicReconciliationError> {
+    let (file_before, bytes_before) =
+        read_input(path, label, MAX_ACCOUNT_CERTIFICATION_ARTIFACT_BYTES)?;
+    let parsed_before: crate::AccountCertificationArtifact = serde_json::from_slice(&bytes_before)
+        .map_err(|error| {
+            EconomicReconciliationError::SourceMismatch(format!(
+                "{label} is not a valid account-certification artifact: {error}"
+            ))
+        })?;
+    let verified = verify_account_certification_artifact_path(path)?;
+    let (file_after, bytes_after) =
+        read_input(path, label, MAX_ACCOUNT_CERTIFICATION_ARTIFACT_BYTES)?;
+    if file_before != file_after || bytes_before != bytes_after || parsed_before != verified {
+        return Err(EconomicReconciliationError::SourceMismatch(format!(
+            "{label} changed while it was being verified"
+        )));
+    }
+    let balance = parse_okx_account_balance_response_json(verified.account_balance.body.as_bytes())
+        .map_err(|error| {
+            EconomicReconciliationError::SourceMismatch(format!(
+                "{label} balance cannot be reparsed: {error}"
+            ))
+        })?;
+    let total_equity_usd = verified.summary.equity.total_equity_usd.ok_or_else(|| {
+        EconomicReconciliationError::SourceMismatch(format!(
+            "{label} has no verified total account equity"
+        ))
+    })?;
+    Ok(BoundAccountBoundary {
+        evidence: EconomicAccountBoundaryEvidence {
+            certification_file: file_before,
+            certification_schema_version: verified.schema_version,
+            collector_reap_version: verified.reap_version,
+            collector_executable_sha256: verified.executable_sha256,
+            collector_host_identity_sha256: verified.host_identity_sha256,
+            start_server_ms: verified.start_clock.server_ms,
+            finish_server_ms: verified.finish_clock.server_ms,
+            window_gap_ms: 0,
+            total_equity_usd,
+            balance_currencies: balance.details.len() as u64,
+        },
+        account_id: verified.summary.account_id,
+        environment: verified.summary.environment,
+        account_identity_sha256: verified.summary.account_identity_sha256,
+        config_fingerprint: verified.config_fingerprint,
+        config_source_path: verified.config.source_path,
+        config_sha256: verified.config.sha256,
+        passed: verified.summary.passed,
+        balance,
+    })
+}
+
+fn bind_account_boundaries(
+    opening: &mut BoundAccountBoundary,
+    closing: &mut BoundAccountBoundary,
+    bills: &crate::BillCollectionManifest,
+    options: &EconomicReconciliationOptions,
+) -> Result<(), EconomicReconciliationError> {
+    for (label, boundary) in [("opening", &*opening), ("closing", &*closing)] {
+        if !boundary.passed {
+            return Err(EconomicReconciliationError::SourceMismatch(format!(
+                "{label} account certification did not pass"
+            )));
+        }
+        if boundary.account_id != options.account_id
+            || boundary.environment != bills.environment
+            || boundary.account_identity_sha256 != bills.account_identity_sha256
+        {
+            return Err(EconomicReconciliationError::SourceMismatch(format!(
+                "{label} account certification does not identify the collected exchange account"
+            )));
+        }
+        if boundary.config_fingerprint != bills.config_fingerprint
+            || boundary.config_source_path != bills.config_file.path
+            || boundary.config_sha256 != bills.config_file.sha256
+        {
+            return Err(EconomicReconciliationError::SourceMismatch(format!(
+                "{label} account certification does not bind the exact collection config"
+            )));
+        }
+    }
+    if opening.account_identity_sha256 != closing.account_identity_sha256
+        || opening.config_fingerprint != closing.config_fingerprint
+    {
+        return Err(EconomicReconciliationError::SourceMismatch(
+            "opening and closing account certifications do not bind each other".to_string(),
+        ));
+    }
+    if opening.evidence.finish_server_ms > options.begin_ms {
+        return Err(EconomicReconciliationError::SourceMismatch(format!(
+            "opening account certification finished at {}, after begin-ms {}",
+            opening.evidence.finish_server_ms, options.begin_ms
+        )));
+    }
+    opening.evidence.window_gap_ms = options
+        .begin_ms
+        .saturating_sub(opening.evidence.finish_server_ms);
+    if opening.evidence.window_gap_ms > options.maximum_account_boundary_gap_ms {
+        return Err(EconomicReconciliationError::SourceMismatch(format!(
+            "opening account boundary gap {} ms exceeds {} ms",
+            opening.evidence.window_gap_ms, options.maximum_account_boundary_gap_ms
+        )));
+    }
+    if closing.evidence.start_server_ms < options.end_ms {
+        return Err(EconomicReconciliationError::SourceMismatch(format!(
+            "closing account certification started at {}, before end-ms {}",
+            closing.evidence.start_server_ms, options.end_ms
+        )));
+    }
+    closing.evidence.window_gap_ms = closing
+        .evidence
+        .start_server_ms
+        .saturating_sub(options.end_ms);
+    if closing.evidence.window_gap_ms > options.maximum_account_boundary_gap_ms {
+        return Err(EconomicReconciliationError::SourceMismatch(format!(
+            "closing account boundary gap {} ms exceeds {} ms",
+            closing.evidence.window_gap_ms, options.maximum_account_boundary_gap_ms
+        )));
+    }
+    Ok(())
 }
 
 fn bind_collection_manifests(
@@ -716,6 +939,13 @@ fn build_report(
     };
     let mut failures = BTreeSet::new();
     let mut issues = IssueSink::default();
+    let currency_balance_continuity = validate_account_balance_continuity(
+        &sources,
+        &options,
+        &mut counts,
+        &mut failures,
+        &mut issues,
+    );
     validate_journal_identity(&sources, &mut failures, &mut issues);
 
     let required_fill_begin = options
@@ -959,6 +1189,7 @@ fn build_report(
         maximum_funding_bill_delay_ms: options.maximum_funding_bill_delay_ms,
         maximum_funding_mark_bracket_distance_ms: options
             .maximum_funding_mark_bracket_distance_ms,
+        maximum_account_boundary_gap_ms: options.maximum_account_boundary_gap_ms,
         tolerances: options.tolerances,
         config_file: sources.config_file,
         journal: sources.journal,
@@ -978,6 +1209,17 @@ fn build_report(
         },
         fill_collection_manifest: sources.fill_manifest_file,
         bill_collection_manifest: sources.bill_manifest_file,
+        total_equity_change_usd: sources
+            .closing_account_boundary
+            .evidence
+            .total_equity_usd
+            - sources
+                .opening_account_boundary
+                .evidence
+                .total_equity_usd,
+        opening_account_boundary: sources.opening_account_boundary.evidence,
+        closing_account_boundary: sources.closing_account_boundary.evidence,
+        currency_balance_continuity,
         counts,
         derivative_pnl_formula_samples: derivative_pnl_samples,
         derivative_pnl_formula_samples_omitted: derivative_pnl_samples_omitted,
@@ -992,10 +1234,553 @@ fn build_report(
             "runtime-session boundaries are locally journaled provenance that prevents cross-restart evidence composition; they are not remote process attestation".to_string(),
             "settlements with no funding bill are not failures because a zero position legitimately produces no balance change; minimum matched funding evidence is required instead".to_string(),
             "the final trade-delay guard is excluded from fill-to-bill completeness because its bills may fall after the closed account-bill window".to_string(),
+            "opening and closing account snapshots are sequential authenticated/public REST certifications rather than atomic venue valuation ticks".to_string(),
+            "a currency absent from an unfiltered OKX balance response is treated as zero at that boundary; every intervening balance-changing bill must still be present".to_string(),
+            "total-equity delta is reported but is not equated to cash bill changes because mark-to-market unrealized PnL can change between boundaries".to_string(),
         ],
         failures,
         passed,
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BoundaryCurrencyValue {
+    cash_balance: f64,
+    equity: f64,
+    equity_usd: f64,
+}
+
+fn validate_account_balance_continuity(
+    sources: &BoundEconomicSources,
+    options: &EconomicReconciliationOptions,
+    counts: &mut EconomicReconciliationCounts,
+    failures: &mut BTreeSet<EconomicReconciliationFailure>,
+    issues: &mut IssueSink,
+) -> Vec<CurrencyBalanceContinuitySample> {
+    validate_bound_account_identity(
+        "opening",
+        &sources.opening_account_boundary,
+        sources,
+        options,
+        failures,
+        issues,
+    );
+    validate_bound_account_identity(
+        "closing",
+        &sources.closing_account_boundary,
+        sources,
+        options,
+        failures,
+        issues,
+    );
+    let opening = boundary_currency_values(
+        "opening",
+        &sources.opening_account_boundary.balance,
+        failures,
+        issues,
+    );
+    let closing = boundary_currency_values(
+        "closing",
+        &sources.closing_account_boundary.balance,
+        failures,
+        issues,
+    );
+    let mut bills_by_currency = BTreeMap::<String, Vec<(&OkxBill, u128)>>::new();
+    let mut seen_bill_ids = BTreeSet::new();
+    for bill in &sources.bills {
+        if !valid_currency(&bill.currency) {
+            issues.push(
+                EconomicReconciliationFailure::InvalidOrDuplicateBalanceCurrencies,
+                issue_for_bill(
+                    EconomicIssueSource::BillCollection,
+                    bill,
+                    "ccy",
+                    "1-32 uppercase ASCII letters or digits",
+                    &bill.currency,
+                    "bill currency cannot be joined to certified account balances",
+                ),
+                failures,
+            );
+            continue;
+        }
+        let numeric_id = match parse_numeric_bill_id(&bill.bill_id) {
+            Some(value) => value,
+            None => {
+                issues.push(
+                    EconomicReconciliationFailure::InvalidBillBalanceChain,
+                    issue_for_bill(
+                        EconomicIssueSource::BillCollection,
+                        bill,
+                        "billId",
+                        "positive base-10 integer",
+                        &bill.bill_id,
+                        "bill balance ordering requires a numeric OKX bill id",
+                    ),
+                    failures,
+                );
+                0
+            }
+        };
+        if !seen_bill_ids.insert(bill.bill_id.clone()) {
+            issues.push(
+                EconomicReconciliationFailure::InvalidBillBalanceChain,
+                issue_for_bill(
+                    EconomicIssueSource::BillCollection,
+                    bill,
+                    "billId",
+                    "globally unique bill id",
+                    &bill.bill_id,
+                    "bill balance chain contains a duplicate bill id",
+                ),
+                failures,
+            );
+        }
+        bills_by_currency
+            .entry(bill.currency.clone())
+            .or_default()
+            .push((bill, numeric_id));
+    }
+    for bills in bills_by_currency.values_mut() {
+        bills.sort_by(|(left, left_id), (right, right_id)| {
+            (left.timestamp_ms, *left_id, left.bill_id.as_str()).cmp(&(
+                right.timestamp_ms,
+                *right_id,
+                right.bill_id.as_str(),
+            ))
+        });
+    }
+
+    let currencies = opening
+        .keys()
+        .chain(closing.keys())
+        .chain(bills_by_currency.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut samples = Vec::new();
+    for currency in currencies {
+        let opening_value = opening.get(&currency).copied().unwrap_or_default();
+        let closing_value = closing.get(&currency).copied().unwrap_or_default();
+        let bills = bills_by_currency
+            .get(&currency)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let mut summed_balance_change = 0.0;
+        let links = (bills.len() as u64).saturating_add(1);
+        let mut links_validated = 0_u64;
+        let mut valid = true;
+        let mut previous_post_balance = None::<f64>;
+
+        if bills.is_empty() {
+            if close_abs(
+                opening_value.cash_balance,
+                closing_value.cash_balance,
+                options.tolerances.balance_abs,
+            ) {
+                links_validated = 1;
+            } else {
+                valid = false;
+                push_cash_continuity_issue(
+                    &currency,
+                    "boundary_cash_balance",
+                    opening_value.cash_balance,
+                    closing_value.cash_balance,
+                    "currency cash balance changed without an account bill",
+                    failures,
+                    issues,
+                );
+            }
+        } else {
+            for (offset, (bill, numeric_id)) in bills.iter().enumerate() {
+                if *numeric_id == 0 {
+                    valid = false;
+                }
+                if !bill.balance_change.is_finite() {
+                    valid = false;
+                    issues.push(
+                        EconomicReconciliationFailure::InvalidBillBalanceChain,
+                        issue_for_bill(
+                            EconomicIssueSource::BillCollection,
+                            bill,
+                            "balChg",
+                            "finite balance change",
+                            &bill.balance_change.to_string(),
+                            "bill balance change is not finite",
+                        ),
+                        failures,
+                    );
+                    continue;
+                }
+                summed_balance_change += bill.balance_change;
+                let Some(post_balance) = bill.balance.filter(|value| value.is_finite()) else {
+                    valid = false;
+                    issues.push(
+                        EconomicReconciliationFailure::InvalidBillBalanceChain,
+                        issue_for_bill(
+                            EconomicIssueSource::BillCollection,
+                            bill,
+                            "bal",
+                            "finite post-bill cash balance",
+                            "missing or non-finite",
+                            "bill does not expose the post-change balance needed for continuity",
+                        ),
+                        failures,
+                    );
+                    previous_post_balance = None;
+                    continue;
+                };
+                let pre_balance = post_balance - bill.balance_change;
+                let (expected, field, message, failure) = if offset == 0 {
+                    (
+                        opening_value.cash_balance,
+                        "opening_cash_balance",
+                        "first bill pre-balance does not match the opening account snapshot",
+                        EconomicReconciliationFailure::CashBalanceContinuityMismatches,
+                    )
+                } else if let Some(previous) = previous_post_balance {
+                    (
+                        previous,
+                        "bill_balance_chain",
+                        "adjacent bill post/pre balances are discontinuous",
+                        EconomicReconciliationFailure::InvalidBillBalanceChain,
+                    )
+                } else {
+                    valid = false;
+                    previous_post_balance = Some(post_balance);
+                    continue;
+                };
+                if close_abs(expected, pre_balance, options.tolerances.balance_abs) {
+                    links_validated = links_validated.saturating_add(1);
+                } else {
+                    valid = false;
+                    issues.push(
+                        failure,
+                        issue_for_bill(
+                            EconomicIssueSource::BillCollection,
+                            bill,
+                            field,
+                            &expected.to_string(),
+                            &pre_balance.to_string(),
+                            message,
+                        ),
+                        failures,
+                    );
+                }
+                previous_post_balance = Some(post_balance);
+            }
+            if let Some(last_post_balance) = previous_post_balance {
+                if close_abs(
+                    last_post_balance,
+                    closing_value.cash_balance,
+                    options.tolerances.balance_abs,
+                ) {
+                    links_validated = links_validated.saturating_add(1);
+                } else {
+                    valid = false;
+                    push_cash_continuity_issue(
+                        &currency,
+                        "closing_cash_balance",
+                        last_post_balance,
+                        closing_value.cash_balance,
+                        "last bill post-balance does not match the closing account snapshot",
+                        failures,
+                        issues,
+                    );
+                }
+            } else {
+                valid = false;
+            }
+        }
+
+        let expected_closing_cash_balance = opening_value.cash_balance + summed_balance_change;
+        let aggregate_absolute_difference =
+            (expected_closing_cash_balance - closing_value.cash_balance).abs();
+        if !expected_closing_cash_balance.is_finite()
+            || aggregate_absolute_difference > options.tolerances.balance_abs
+        {
+            valid = false;
+            push_cash_continuity_issue(
+                &currency,
+                "aggregate_cash_balance",
+                expected_closing_cash_balance,
+                closing_value.cash_balance,
+                "opening cash plus all bill balance changes does not equal closing cash",
+                failures,
+                issues,
+            );
+        }
+        if links_validated != links {
+            valid = false;
+        }
+        counts.cash_balance_chain_links = counts.cash_balance_chain_links.saturating_add(links);
+        counts.cash_balance_chain_links_validated = counts
+            .cash_balance_chain_links_validated
+            .saturating_add(links_validated);
+        counts.cash_balance_currencies = counts.cash_balance_currencies.saturating_add(1);
+        if valid {
+            counts.cash_balance_currencies_validated =
+                counts.cash_balance_currencies_validated.saturating_add(1);
+        }
+        samples.push(CurrencyBalanceContinuitySample {
+            currency,
+            opening_cash_balance: opening_value.cash_balance,
+            closing_cash_balance: closing_value.cash_balance,
+            opening_equity: opening_value.equity,
+            closing_equity: closing_value.equity,
+            opening_equity_usd: opening_value.equity_usd,
+            closing_equity_usd: closing_value.equity_usd,
+            bill_count: bills.len() as u64,
+            first_bill_id: bills.first().map(|(bill, _)| bill.bill_id.clone()),
+            last_bill_id: bills.last().map(|(bill, _)| bill.bill_id.clone()),
+            summed_balance_change,
+            expected_closing_cash_balance,
+            aggregate_absolute_difference,
+            effective_tolerance: options.tolerances.balance_abs,
+            balance_chain_links: links,
+            balance_chain_links_validated: links_validated,
+            validated: valid,
+        });
+    }
+    samples
+}
+
+fn validate_bound_account_identity(
+    label: &str,
+    boundary: &BoundAccountBoundary,
+    sources: &BoundEconomicSources,
+    options: &EconomicReconciliationOptions,
+    failures: &mut BTreeSet<EconomicReconciliationFailure>,
+    issues: &mut IssueSink,
+) {
+    let identity_valid = boundary.passed
+        && boundary.account_id == sources.account_id
+        && boundary.environment == sources.environment
+        && boundary.account_identity_sha256 == sources.account_identity_sha256
+        && boundary.config_fingerprint == sources.config_fingerprint
+        && boundary.config_source_path == sources.config_file.path
+        && boundary.config_sha256 == sources.config_file.sha256
+        && boundary.evidence.start_server_ms <= boundary.evidence.finish_server_ms
+        && boundary.evidence.balance_currencies == boundary.balance.details.len() as u64
+        && boundary.evidence.total_equity_usd.is_finite()
+        && boundary.balance.total_equity_usd.is_some_and(|value| {
+            close_abs(
+                value,
+                boundary.evidence.total_equity_usd,
+                options.tolerances.balance_abs,
+            )
+        });
+    let expected_gap = if label == "opening" {
+        options
+            .begin_ms
+            .checked_sub(boundary.evidence.finish_server_ms)
+    } else {
+        boundary
+            .evidence
+            .start_server_ms
+            .checked_sub(options.end_ms)
+    };
+    let timing_valid = expected_gap.is_some_and(|gap| {
+        gap == boundary.evidence.window_gap_ms && gap <= options.maximum_account_boundary_gap_ms
+    });
+    if !identity_valid || !timing_valid {
+        issues.push(
+            EconomicReconciliationFailure::InvalidAccountBoundaries,
+            issue(
+                EconomicIssueSource::AccountBoundary,
+                None,
+                None,
+                None,
+                &format!("{label}_account_boundary"),
+                "passing, bound certification on the correct side of the window within the configured gap",
+                &format!(
+                    "account={}, environment={:?}, passed={}, start={}, finish={}, gap={}",
+                    boundary.account_id,
+                    boundary.environment,
+                    boundary.passed,
+                    boundary.evidence.start_server_ms,
+                    boundary.evidence.finish_server_ms,
+                    boundary.evidence.window_gap_ms
+                ),
+                "account boundary identity, timing, or certified total equity is invalid",
+            ),
+            failures,
+        );
+    }
+}
+
+fn boundary_currency_values(
+    label: &str,
+    balance: &OkxAccountBalanceSnapshot,
+    failures: &mut BTreeSet<EconomicReconciliationFailure>,
+    issues: &mut IssueSink,
+) -> BTreeMap<String, BoundaryCurrencyValue> {
+    let mut values = BTreeMap::new();
+    if balance.details.is_empty() {
+        issues.push(
+            EconomicReconciliationFailure::InvalidOrDuplicateBalanceCurrencies,
+            issue(
+                EconomicIssueSource::AccountBoundary,
+                None,
+                None,
+                None,
+                &format!("{label}_balance_details"),
+                "at least one certified currency",
+                "empty",
+                "account boundary has no currency balances",
+            ),
+            failures,
+        );
+    }
+    for detail in &balance.details {
+        if !valid_currency(&detail.currency) {
+            issues.push(
+                EconomicReconciliationFailure::InvalidOrDuplicateBalanceCurrencies,
+                boundary_currency_issue(
+                    label,
+                    detail,
+                    "ccy",
+                    "1-32 uppercase ASCII letters or digits",
+                    &detail.currency,
+                    "account boundary contains an invalid currency",
+                ),
+                failures,
+            );
+            continue;
+        }
+        let Some(cash_balance) = finite_optional(detail.cash_balance) else {
+            issues.push(
+                EconomicReconciliationFailure::InvalidOrDuplicateBalanceCurrencies,
+                boundary_currency_issue(
+                    label,
+                    detail,
+                    "cashBal",
+                    "finite value",
+                    "missing or non-finite",
+                    "account boundary cash balance is unavailable",
+                ),
+                failures,
+            );
+            continue;
+        };
+        let Some(equity) = finite_optional(detail.equity) else {
+            issues.push(
+                EconomicReconciliationFailure::InvalidOrDuplicateBalanceCurrencies,
+                boundary_currency_issue(
+                    label,
+                    detail,
+                    "eq",
+                    "finite value",
+                    "missing or non-finite",
+                    "account boundary native equity is unavailable",
+                ),
+                failures,
+            );
+            continue;
+        };
+        let Some(equity_usd) = finite_optional(detail.equity_usd) else {
+            issues.push(
+                EconomicReconciliationFailure::InvalidOrDuplicateBalanceCurrencies,
+                boundary_currency_issue(
+                    label,
+                    detail,
+                    "eqUsd",
+                    "finite value",
+                    "missing or non-finite",
+                    "account boundary converted equity is unavailable",
+                ),
+                failures,
+            );
+            continue;
+        };
+        if values
+            .insert(
+                detail.currency.clone(),
+                BoundaryCurrencyValue {
+                    cash_balance,
+                    equity,
+                    equity_usd,
+                },
+            )
+            .is_some()
+        {
+            issues.push(
+                EconomicReconciliationFailure::InvalidOrDuplicateBalanceCurrencies,
+                boundary_currency_issue(
+                    label,
+                    detail,
+                    "ccy",
+                    "unique currency",
+                    &detail.currency,
+                    "account boundary contains duplicate currency balances",
+                ),
+                failures,
+            );
+        }
+    }
+    values
+}
+
+fn boundary_currency_issue(
+    label: &str,
+    detail: &OkxBalanceDetail,
+    field: &str,
+    expected: &str,
+    observed: &str,
+    message: &str,
+) -> EconomicIssue {
+    issue(
+        EconomicIssueSource::AccountBoundary,
+        None,
+        None,
+        None,
+        &format!("{label}.{}.{}", detail.currency, field),
+        expected,
+        observed,
+        message,
+    )
+}
+
+fn push_cash_continuity_issue(
+    currency: &str,
+    field: &str,
+    expected: f64,
+    observed: f64,
+    message: &str,
+    failures: &mut BTreeSet<EconomicReconciliationFailure>,
+    issues: &mut IssueSink,
+) {
+    issues.push(
+        EconomicReconciliationFailure::CashBalanceContinuityMismatches,
+        issue(
+            EconomicIssueSource::AccountBoundary,
+            None,
+            None,
+            None,
+            &format!("{currency}.{field}"),
+            &expected.to_string(),
+            &observed.to_string(),
+            message,
+        ),
+        failures,
+    );
+}
+
+fn valid_currency(currency: &str) -> bool {
+    !currency.is_empty()
+        && currency.len() <= 32
+        && currency
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
+fn parse_numeric_bill_id(value: &str) -> Option<u128> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse::<u128>().ok().filter(|value| *value > 0)
+}
+
+fn finite_optional(value: Option<f64>) -> Option<f64> {
+    value.filter(|value| value.is_finite())
 }
 
 fn validate_journal_identity(
@@ -3240,6 +4025,7 @@ mod tests {
             maximum_trade_bill_delay_ms: 10_000,
             maximum_funding_bill_delay_ms: 10_000,
             maximum_funding_mark_bracket_distance_ms: 1_000,
+            maximum_account_boundary_gap_ms: 10_000,
             tolerances: EconomicReconciliationTolerances {
                 price_abs: 0.0,
                 quantity_abs: 1e-9,
@@ -3263,6 +4049,76 @@ mod tests {
         }
     }
 
+    fn account_boundary(
+        path: &str,
+        fingerprint: &str,
+        start_server_ms: u64,
+        finish_server_ms: u64,
+        window_gap_ms: u64,
+        cash_balance: f64,
+    ) -> BoundAccountBoundary {
+        let detail = OkxBalanceDetail {
+            currency: "USDT".to_string(),
+            update_time_ms: finish_server_ms,
+            cash_balance: Some(cash_balance),
+            available_balance: Some(cash_balance),
+            equity: Some(cash_balance),
+            equity_usd: Some(cash_balance),
+            discounted_equity_usd: Some(cash_balance),
+            unrealized_pnl: Some(0.0),
+            liability: Some(0.0),
+            cross_liability: Some(0.0),
+            isolated_liability: None,
+            unrealized_loss_liability: None,
+            accrued_interest: Some(0.0),
+            borrow_frozen_usd: Some(0.0),
+            max_loan: Some(0.0),
+            forced_repayment_indicator: Some(0),
+        };
+        BoundAccountBoundary {
+            evidence: EconomicAccountBoundaryEvidence {
+                certification_file: evidence(path),
+                certification_schema_version: crate::ACCOUNT_CERTIFICATION_SCHEMA_VERSION,
+                collector_reap_version: env!("CARGO_PKG_VERSION").to_string(),
+                collector_executable_sha256: "c".repeat(64),
+                collector_host_identity_sha256: "d".repeat(64),
+                start_server_ms,
+                finish_server_ms,
+                window_gap_ms,
+                total_equity_usd: cash_balance,
+                balance_currencies: 1,
+            },
+            account_id: "main".to_string(),
+            environment: TradingEnvironment::Demo,
+            account_identity_sha256: "b".repeat(64),
+            config_fingerprint: fingerprint.to_string(),
+            config_source_path: "/config".to_string(),
+            config_sha256: "a".repeat(64),
+            passed: true,
+            balance: OkxAccountBalanceSnapshot {
+                update_time_ms: finish_server_ms,
+                total_equity_usd: Some(cash_balance),
+                adjusted_equity_usd: Some(cash_balance),
+                borrow_frozen_usd: Some(0.0),
+                notional_usd_for_borrow: Some(0.0),
+                margin_ratio: None,
+                notional_usd: Some(0.0),
+                details: vec![detail],
+            },
+        }
+    }
+
+    fn set_boundary_cash(boundary: &mut BoundAccountBoundary, value: f64) {
+        boundary.evidence.total_equity_usd = value;
+        boundary.balance.total_equity_usd = Some(value);
+        boundary.balance.adjusted_equity_usd = Some(value);
+        boundary.balance.details[0].cash_balance = Some(value);
+        boundary.balance.details[0].available_balance = Some(value);
+        boundary.balance.details[0].equity = Some(value);
+        boundary.balance.details[0].equity_usd = Some(value);
+        boundary.balance.details[0].discounted_equity_usd = Some(value);
+    }
+
     fn swap_fill() -> RemoteFill {
         RemoteFill {
             fill_id: "trade-1".to_string(),
@@ -3283,7 +4139,7 @@ mod tests {
 
     fn trade_bill() -> OkxBill {
         OkxBill {
-            bill_id: "bill-trade".to_string(),
+            bill_id: "100".to_string(),
             bill_type: "2".to_string(),
             sub_type: "5".to_string(),
             timestamp_ms: TRADE_MS + 1,
@@ -3313,13 +4169,13 @@ mod tests {
 
     fn funding_bill() -> OkxBill {
         OkxBill {
-            bill_id: "bill-funding".to_string(),
+            bill_id: "200".to_string(),
             bill_type: "8".to_string(),
             sub_type: "173".to_string(),
             timestamp_ms: FUNDING_MS + 100,
             currency: "USDT".to_string(),
             balance_change: -4.0,
-            balance: Some(995.0),
+            balance: Some(996.0),
             position_balance_change: Some(0.0),
             position_balance: Some(0.0),
             quantity: Some(8.0),
@@ -3440,13 +4296,29 @@ mod tests {
             bills: vec![trade_bill(), funding_bill()],
             environment: TradingEnvironment::Demo,
             account_identity_sha256: "b".repeat(64),
-            config_fingerprint: fingerprint,
+            config_fingerprint: fingerprint.clone(),
             window: BillCollectionWindow {
                 begin_ms: BEGIN_MS,
                 end_ms: END_MS,
                 endpoints_inclusive: true,
                 minimum_close_delay_ms: 1,
             },
+            opening_account_boundary: account_boundary(
+                "/opening-account",
+                &fingerprint,
+                BEGIN_MS - 2_000,
+                BEGIN_MS - 1_000,
+                1_000,
+                980.5,
+            ),
+            closing_account_boundary: account_boundary(
+                "/closing-account",
+                &fingerprint,
+                END_MS + 1_000,
+                END_MS + 2_000,
+                1_000,
+                996.0,
+            ),
         }
     }
 
@@ -3473,6 +4345,18 @@ mod tests {
         assert_eq!(report.journal_recovery.mark_price_observation_records, 2);
         assert_eq!(report.journal_recovery.runtime_session_records, 1);
         assert_eq!(report.counts.funding_mark_brackets_validated, 1);
+        assert_eq!(report.counts.cash_balance_currencies, 1);
+        assert_eq!(report.counts.cash_balance_currencies_validated, 1);
+        assert_eq!(report.counts.cash_balance_chain_links, 3);
+        assert_eq!(report.counts.cash_balance_chain_links_validated, 3);
+        assert_eq!(report.currency_balance_continuity.len(), 1);
+        assert!(report.currency_balance_continuity[0].validated);
+        assert_eq!(report.currency_balance_continuity[0].bill_count, 2);
+        assert_eq!(
+            report.currency_balance_continuity[0].summed_balance_change,
+            15.5
+        );
+        assert_eq!(report.total_equity_change_usd, 15.5);
         assert_eq!(
             report.funding_formula_samples[0].expected_pnl_at_bill_mark,
             -4.0
@@ -3505,6 +4389,87 @@ mod tests {
         assert_eq!(report.derivative_pnl_formula_samples[0].expected_pnl, 20.0);
         assert_eq!(report.derivative_pnl_formula_samples[0].post_quantity, 8.0);
         assert!(report.derivative_pnl_formula_samples[0].validated);
+    }
+
+    #[test]
+    fn cash_continuity_requires_every_bill_post_balance() {
+        let mut sources = sources();
+        sources.bills[0].balance = None;
+
+        let report = build_report(sources, options(), "c".repeat(64));
+
+        assert!(!report.passed);
+        assert!(
+            report
+                .failures
+                .contains(&EconomicReconciliationFailure::InvalidBillBalanceChain)
+        );
+        assert!(report.issues.iter().any(|issue| issue.field == "bal"));
+        assert_eq!(report.counts.cash_balance_chain_links, 3);
+        assert!(report.counts.cash_balance_chain_links_validated < 3);
+    }
+
+    #[test]
+    fn cash_continuity_rejects_a_broken_intermediate_bill_link() {
+        let mut sources = sources();
+        sources.bills[1].balance = Some(995.0);
+
+        let report = build_report(sources, options(), "c".repeat(64));
+
+        assert!(!report.passed);
+        assert!(
+            report
+                .failures
+                .contains(&EconomicReconciliationFailure::InvalidBillBalanceChain)
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.field == "bill_balance_chain")
+        );
+    }
+
+    #[test]
+    fn cash_continuity_rejects_a_certified_endpoint_delta_mismatch() {
+        let mut sources = sources();
+        set_boundary_cash(&mut sources.closing_account_boundary, 997.0);
+
+        let report = build_report(sources, options(), "c".repeat(64));
+
+        assert!(!report.passed);
+        assert!(
+            report
+                .failures
+                .contains(&EconomicReconciliationFailure::CashBalanceContinuityMismatches)
+        );
+        assert!(!report.currency_balance_continuity[0].validated);
+        assert_eq!(
+            report.currency_balance_continuity[0].expected_closing_cash_balance,
+            996.0
+        );
+    }
+
+    #[test]
+    fn account_boundary_timing_and_numeric_bill_ids_fail_closed() {
+        let mut timing = sources();
+        timing.opening_account_boundary.evidence.finish_server_ms = BEGIN_MS + 1;
+        timing.opening_account_boundary.evidence.window_gap_ms = 0;
+        let report = build_report(timing, options(), "c".repeat(64));
+        assert!(
+            report
+                .failures
+                .contains(&EconomicReconciliationFailure::InvalidAccountBoundaries)
+        );
+
+        let mut nonnumeric = sources();
+        nonnumeric.bills[0].bill_id = "not-numeric".to_string();
+        let report = build_report(nonnumeric, options(), "c".repeat(64));
+        assert!(
+            report
+                .failures
+                .contains(&EconomicReconciliationFailure::InvalidBillBalanceChain)
+        );
     }
 
     #[test]
@@ -3775,7 +4740,7 @@ mod tests {
     fn unexplained_balance_changing_bill_fails_closed() {
         let mut sources = sources();
         let mut transfer = funding_bill();
-        transfer.bill_id = "bill-transfer".to_string();
+        transfer.bill_id = "300".to_string();
         transfer.bill_type = "1".to_string();
         transfer.sub_type = "11".to_string();
         sources.bills.push(transfer);
@@ -3810,13 +4775,13 @@ mod tests {
             ts_ms: TRADE_MS,
         };
         sources.bills[0] = OkxBill {
-            bill_id: "bill-spot".to_string(),
+            bill_id: "100".to_string(),
             bill_type: "2".to_string(),
             sub_type: "2".to_string(),
             timestamp_ms: TRADE_MS + 1,
             currency: "USDT".to_string(),
             balance_change: 499.95,
-            balance: Some(2_000.0),
+            balance: Some(1_000.0),
             position_balance_change: Some(0.0),
             position_balance: Some(0.0),
             quantity: Some(500.0),
@@ -3856,6 +4821,7 @@ mod tests {
         };
         let mut options = options();
         options.minimum_derivative_close_bills = 0;
+        set_boundary_cash(&mut sources.opening_account_boundary, 500.05);
 
         let report = build_report(sources, options, "c".repeat(64));
 
