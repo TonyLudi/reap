@@ -4,14 +4,14 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use reap_core::{Channel, MarketEvent, NormalizedEvent, OrderBook};
-use reap_feed::{FeedOutput, FeedProcessor, RawCapture};
+use reap_feed::{FeedOutput, FeedProcessor, RawCapture, SocketPlan};
 use reap_venue::{VenueAdapter, VenueEvent, okx::OkxAdapter};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{CaptureConfig, CaptureError, digest_hex, is_book_channel};
 
-const ANALYSIS_FORMAT_VERSION: u16 = 4;
+const ANALYSIS_FORMAT_VERSION: u16 = 5;
 const DISTRIBUTION_SAMPLE_CAPACITY: usize = 8_192;
 const MAX_REPORTED_ERRORS: usize = 100;
 
@@ -75,6 +75,12 @@ pub struct CaptureStreamCoverage {
     pub symbol: String,
     pub expected_connections: usize,
     pub observed_connections: usize,
+    #[serde(default)]
+    pub expected_source_connections: Vec<String>,
+    #[serde(default)]
+    pub missing_source_connections: Vec<String>,
+    #[serde(default)]
+    pub unexpected_source_connections: Vec<String>,
     pub raw_frames: u64,
     pub data_frames: u64,
     pub accepted_events: u64,
@@ -202,9 +208,67 @@ pub(crate) struct StreamKey {
     pub(crate) symbol: String,
 }
 
+pub(crate) fn expected_stream_sources(
+    plans: &[SocketPlan],
+) -> Result<BTreeMap<StreamKey, BTreeSet<String>>, CaptureError> {
+    let mut expected = BTreeMap::<StreamKey, BTreeSet<String>>::new();
+    let mut declared_counts = BTreeMap::<StreamKey, usize>::new();
+    for plan in plans {
+        for subscription in &plan.subscriptions {
+            let channel = channel_name(&subscription.channel).ok_or_else(|| {
+                CaptureError::InvalidConfig(format!(
+                    "capture socket plan {} contains an unnamed channel",
+                    plan.conn_id
+                ))
+            })?;
+            let symbol = subscription
+                .symbol
+                .as_deref()
+                .filter(|symbol| !symbol.is_empty())
+                .ok_or_else(|| {
+                    CaptureError::InvalidConfig(format!(
+                        "capture socket plan {} contains a subscription without a symbol",
+                        plan.conn_id
+                    ))
+                })?;
+            let key = StreamKey {
+                channel,
+                symbol: symbol.to_string(),
+            };
+            match declared_counts.get(&key) {
+                Some(declared) if *declared != subscription.connections => {
+                    return Err(CaptureError::InvalidConfig(format!(
+                        "capture socket plans disagree on the connection count for {}/{}",
+                        key.channel, key.symbol
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    declared_counts.insert(key.clone(), subscription.connections);
+                }
+            }
+            expected
+                .entry(key)
+                .or_default()
+                .insert(plan.conn_id.0.clone());
+        }
+    }
+    for (key, declared) in declared_counts {
+        let planned = expected.get(&key).map_or(0, BTreeSet::len);
+        if planned != declared {
+            return Err(CaptureError::InvalidConfig(format!(
+                "capture socket plans provide {planned} of {declared} declared connections for {}/{}",
+                key.channel, key.symbol
+            )));
+        }
+    }
+    Ok(expected)
+}
+
 struct CaptureAnalyzer<'a> {
     config: &'a CaptureConfig,
     config_fingerprint: String,
+    expected_sources: BTreeMap<StreamKey, BTreeSet<String>>,
     adapter: OkxAdapter,
     processor: FeedProcessor,
     streams: BTreeMap<StreamKey, StreamAccumulator>,
@@ -228,6 +292,8 @@ struct CaptureAnalyzer<'a> {
 
 impl<'a> CaptureAnalyzer<'a> {
     fn new(config: &'a CaptureConfig) -> Result<Self, CaptureError> {
+        let plans = config.socket_plans()?;
+        let expected_sources = expected_stream_sources(&plans)?;
         let streams = config
             .subscriptions
             .iter()
@@ -244,6 +310,7 @@ impl<'a> CaptureAnalyzer<'a> {
         Ok(Self {
             config,
             config_fingerprint: config.fingerprint()?,
+            expected_sources,
             adapter: OkxAdapter::new(&config.venue.public_ws_url, &config.venue.public_ws_url),
             processor: FeedProcessor::new(
                 config.runtime.dedup_capacity_per_stream,
@@ -432,7 +499,18 @@ impl<'a> CaptureAnalyzer<'a> {
                     symbol: expected.symbol.trim().to_string(),
                 };
                 let stream = self.streams.get(&key);
-                let observed_connections = stream.map_or(0, |stream| stream.sources.len());
+                let expected_sources = self.expected_sources.get(&key).cloned().unwrap_or_default();
+                let observed_sources = stream
+                    .map(|stream| stream.sources.clone())
+                    .unwrap_or_default();
+                let missing_sources = expected_sources
+                    .difference(&observed_sources)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let unexpected_sources = observed_sources
+                    .difference(&expected_sources)
+                    .cloned()
+                    .collect::<Vec<_>>();
                 let raw_frames = stream.map_or(0, |stream| stream.raw_frames);
                 let data_frames = stream.map_or(0, |stream| stream.data_frames);
                 let accepted_events = stream.map_or(0, |stream| stream.accepted_events);
@@ -440,11 +518,14 @@ impl<'a> CaptureAnalyzer<'a> {
                     channel: key.channel,
                     symbol: key.symbol,
                     expected_connections: expected.connections,
-                    observed_connections,
+                    observed_connections: observed_sources.len(),
+                    expected_source_connections: expected_sources.iter().cloned().collect(),
+                    missing_source_connections: missing_sources,
+                    unexpected_source_connections: unexpected_sources,
                     raw_frames,
                     data_frames,
                     accepted_events,
-                    complete: observed_connections == expected.connections
+                    complete: observed_sources == expected_sources
                         && data_frames > 0
                         && accepted_events > 0,
                 }
@@ -971,6 +1052,7 @@ mod tests {
         let report = analyze_capture(fixture.as_slice(), &config(false)).unwrap();
 
         assert!(report.integrity_healthy, "{report:#?}");
+        assert_eq!(report.format_version, ANALYSIS_FORMAT_VERSION);
         assert_eq!(report.lines, 7);
         assert_eq!(report.capture_sessions, ["reset-session"]);
         assert_eq!(report.sequenced_records, 7);
@@ -980,6 +1062,23 @@ mod tests {
         assert_eq!(report.duplicate_events, 3);
         assert_eq!(report.expected_streams.len(), 1);
         assert_eq!(report.expected_streams[0].observed_connections, 2);
+        assert_eq!(
+            report.expected_streams[0].expected_source_connections,
+            [
+                "okx-books-critical-r0-0".to_string(),
+                "okx-books-critical-r1-0".to_string(),
+            ]
+        );
+        assert!(
+            report.expected_streams[0]
+                .missing_source_connections
+                .is_empty()
+        );
+        assert!(
+            report.expected_streams[0]
+                .unexpected_source_connections
+                .is_empty()
+        );
         assert!(report.expected_streams[0].complete);
         assert_eq!(report.sha256, sha256_hex(fixture));
         assert_eq!(report.sha256.len(), 64);
@@ -988,6 +1087,17 @@ mod tests {
         assert!(book.spread_bps.count > 0);
         assert_eq!(report.books[0].sequence_status, "ready");
         assert_eq!(report.books[0].book_status, "ready");
+    }
+
+    #[test]
+    fn expected_sources_reject_an_incomplete_partition_result() {
+        let mut plans = config(false).socket_plans().unwrap();
+        plans.retain(|plan| plan.conn_id.0 == "okx-books-critical-r0-0");
+
+        let error = expected_stream_sources(&plans).unwrap_err().to_string();
+
+        assert!(error.contains("provide 1 of 2 declared connections"));
+        assert!(error.contains("books/BTC-USDT"));
     }
 
     #[test]
@@ -1070,6 +1180,41 @@ mod tests {
         assert!(!extra_report.integrity_healthy);
         assert_eq!(extra_report.unexpected_data_streams.len(), 1);
         assert_eq!(extra_report.unexpected_data_streams[0].symbol, "ETH-USDT");
+    }
+
+    #[test]
+    fn analyzer_rejects_the_right_replica_count_on_the_wrong_socket_plan() {
+        let fixture = include_str!("../../../fixtures/raw/okx/depth-reset.jsonl");
+        let mut records = fixture
+            .lines()
+            .map(|line| serde_json::from_str::<RawCapture>(line).unwrap())
+            .collect::<Vec<_>>();
+        for record in &mut records {
+            if record.conn_id.0 == "okx-books-critical-r1-0" {
+                record.conn_id.0 = "okx-books-critical-r9-0".to_string();
+            }
+        }
+        let input = records
+            .iter()
+            .map(|record| serde_json::to_string(record).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+
+        let report = analyze_capture(input.as_bytes(), &config(false)).unwrap();
+        let coverage = &report.expected_streams[0];
+
+        assert!(!report.integrity_healthy);
+        assert_eq!(coverage.observed_connections, 2);
+        assert_eq!(
+            coverage.missing_source_connections,
+            ["okx-books-critical-r1-0"]
+        );
+        assert_eq!(
+            coverage.unexpected_source_connections,
+            ["okx-books-critical-r9-0"]
+        );
+        assert!(!coverage.complete);
     }
 
     #[test]

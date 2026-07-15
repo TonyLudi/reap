@@ -17,7 +17,7 @@ use reap_feed::{
     ConnectionAttemptPacer, ConnectionStatus, ConnectionStatusKind,
     DEFAULT_OKX_CONNECTION_ATTEMPT_PACER_PATH, FeedOutput, FeedProcessor,
     OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS, RawCapture, ReconnectPolicy, RecoveryRequest,
-    SequenceStatus, no_bootstrap, partition_subscriptions, spawn_supervised_feed,
+    SequenceStatus, SocketPlan, no_bootstrap, partition_subscriptions, spawn_supervised_feed,
 };
 pub use reap_telemetry::{HostGuardConfig, HostHealthSnapshot};
 use reap_telemetry::{
@@ -539,6 +539,13 @@ impl CaptureConfig {
             .collect()
     }
 
+    fn socket_plans(&self) -> Result<Vec<SocketPlan>, CaptureError> {
+        Ok(partition_subscriptions(
+            &self.subscriptions(),
+            self.runtime.max_subscriptions_per_socket,
+        )?)
+    }
+
     fn expected_book_symbols(&self) -> HashSet<String> {
         self.subscriptions
             .iter()
@@ -672,14 +679,12 @@ pub async fn run_capture(
         _ => ConnectionAttemptPacer::new(connection_attempt_interval),
     };
 
-    let subscriptions = config.subscriptions();
-    let plans =
-        partition_subscriptions(&subscriptions, config.runtime.max_subscriptions_per_socket)?;
+    let plans = config.socket_plans()?;
     let expected_connections = plans
         .iter()
         .map(|plan| plan.conn_id.clone())
         .collect::<HashSet<_>>();
-    let stream_coverage = CaptureStreamCoverageState::new(&config.subscriptions);
+    let stream_coverage = CaptureStreamCoverageState::from_plans(&plans)?;
     let raw_writer = JsonlWriter::start(
         "raw",
         config.output.raw_path.clone(),
@@ -966,28 +971,17 @@ struct CaptureStreamObservation {
 
 #[derive(Default)]
 struct CaptureStreamCoverageState {
-    expected_connections: BTreeMap<analysis::StreamKey, usize>,
+    expected_sources: BTreeMap<analysis::StreamKey, BTreeSet<String>>,
     observed: BTreeMap<analysis::StreamKey, CaptureStreamObservation>,
     unclassified_data_frames: u64,
 }
 
 impl CaptureStreamCoverageState {
-    fn new(subscriptions: &[CaptureSubscriptionConfig]) -> Self {
-        Self {
-            expected_connections: subscriptions
-                .iter()
-                .map(|subscription| {
-                    (
-                        analysis::StreamKey {
-                            channel: subscription.channel.trim().to_string(),
-                            symbol: subscription.symbol.trim().to_string(),
-                        },
-                        subscription.connections,
-                    )
-                })
-                .collect(),
+    fn from_plans(plans: &[SocketPlan]) -> Result<Self, CaptureError> {
+        Ok(Self {
+            expected_sources: analysis::expected_stream_sources(plans)?,
             ..Self::default()
-        }
+        })
     }
 
     fn observe_frame(&mut self, capture: &RawCapture) {
@@ -1017,11 +1011,11 @@ impl CaptureStreamCoverageState {
     fn complete(&self) -> bool {
         self.unclassified_data_frames == 0
             && self.observed.iter().all(|(key, observation)| {
-                observation.data_frames == 0 || self.expected_connections.contains_key(key)
+                observation.data_frames == 0 || self.expected_sources.contains_key(key)
             })
-            && self.expected_connections.iter().all(|(key, expected)| {
+            && self.expected_sources.iter().all(|(key, expected)| {
                 self.observed.get(key).is_some_and(|observation| {
-                    observation.data_sources.len() == *expected
+                    observation.data_sources == *expected
                         && observation.data_frames > 0
                         && observation.accepted_events > 0
                 })
@@ -1924,7 +1918,7 @@ mod tests {
             16,
             HashSet::new(),
             config.expected_book_symbols(),
-            CaptureStreamCoverageState::new(&config.subscriptions),
+            CaptureStreamCoverageState::from_plans(&config.socket_plans().unwrap()).unwrap(),
             "test-session".to_string(),
         );
         state.reached_all_connections_ready = true;
@@ -1976,21 +1970,27 @@ mod tests {
     }
 
     #[test]
-    fn stream_coverage_requires_every_stream_replica_and_accepted_event() {
-        let subscriptions = vec![
-            CaptureSubscriptionConfig {
-                channel: "books".to_string(),
-                symbol: "BTC-USDT".to_string(),
-                connections: 2,
-                priority: CapturePriority::Critical,
-            },
-            CaptureSubscriptionConfig {
-                channel: "trades".to_string(),
-                symbol: "BTC-USDT".to_string(),
-                connections: 2,
-                priority: CapturePriority::High,
-            },
-        ];
+    fn stream_coverage_requires_exact_planned_sources_and_an_accepted_event() {
+        let config = CaptureConfig {
+            venue: CaptureVenueConfig::default(),
+            runtime: CaptureRuntimeConfig::default(),
+            output: CaptureOutputConfig::default(),
+            host_guard: HostGuardConfig::default(),
+            subscriptions: vec![
+                CaptureSubscriptionConfig {
+                    channel: "books".to_string(),
+                    symbol: "BTC-USDT".to_string(),
+                    connections: 2,
+                    priority: CapturePriority::Critical,
+                },
+                CaptureSubscriptionConfig {
+                    channel: "trades".to_string(),
+                    symbol: "BTC-USDT".to_string(),
+                    connections: 2,
+                    priority: CapturePriority::High,
+                },
+            ],
+        };
         let book = analysis::StreamKey {
             channel: "books".to_string(),
             symbol: "BTC-USDT".to_string(),
@@ -1999,22 +1999,91 @@ mod tests {
             channel: "trades".to_string(),
             symbol: "BTC-USDT".to_string(),
         };
-        let mut coverage = CaptureStreamCoverageState::new(&subscriptions);
+        let mut coverage =
+            CaptureStreamCoverageState::from_plans(&config.socket_plans().unwrap()).unwrap();
 
-        coverage.observe_frame(&stream_capture("books", "BTC-USDT", "book-1"));
-        coverage.observe_frame(&stream_capture("books", "BTC-USDT", "book-2"));
+        coverage.observe_frame(&stream_capture(
+            "books",
+            "BTC-USDT",
+            "okx-books-critical-r0-0",
+        ));
+        coverage.observe_frame(&stream_capture(
+            "books",
+            "BTC-USDT",
+            "okx-books-critical-r1-0",
+        ));
         coverage.observe_accepted(Some(&book), 1);
         assert!(!coverage.complete());
 
-        coverage.observe_frame(&stream_capture("trades", "BTC-USDT", "trade-1"));
+        coverage.observe_frame(&stream_capture(
+            "trades",
+            "BTC-USDT",
+            "okx-trades-high-r0-0",
+        ));
         coverage.observe_accepted(Some(&trade), 1);
         assert!(!coverage.complete());
 
-        coverage.observe_frame(&stream_capture("trades", "BTC-USDT", "trade-2"));
+        coverage.observe_frame(&stream_capture(
+            "trades",
+            "BTC-USDT",
+            "okx-trades-high-r1-0",
+        ));
         assert!(coverage.complete());
 
-        coverage.observe_frame(&stream_capture("index-tickers", "BTC-USDT", "unexpected"));
+        coverage.observe_frame(&stream_capture(
+            "books",
+            "BTC-USDT",
+            "okx-books-critical-r9-0",
+        ));
         assert!(!coverage.complete());
+    }
+
+    #[test]
+    fn expected_stream_sources_preserve_socket_partition_chunks() {
+        let mut config = CaptureConfig {
+            venue: CaptureVenueConfig::default(),
+            runtime: CaptureRuntimeConfig::default(),
+            output: CaptureOutputConfig::default(),
+            host_guard: HostGuardConfig::default(),
+            subscriptions: vec![
+                CaptureSubscriptionConfig {
+                    channel: "books".to_string(),
+                    symbol: "BTC-USDT".to_string(),
+                    connections: 2,
+                    priority: CapturePriority::Critical,
+                },
+                CaptureSubscriptionConfig {
+                    channel: "books".to_string(),
+                    symbol: "ETH-USDT".to_string(),
+                    connections: 2,
+                    priority: CapturePriority::Critical,
+                },
+            ],
+        };
+        config.runtime.max_subscriptions_per_socket = 1;
+
+        let sources = analysis::expected_stream_sources(&config.socket_plans().unwrap()).unwrap();
+
+        assert_eq!(
+            sources[&analysis::StreamKey {
+                channel: "books".to_string(),
+                symbol: "BTC-USDT".to_string(),
+            }],
+            BTreeSet::from([
+                "okx-books-critical-r0-0".to_string(),
+                "okx-books-critical-r1-0".to_string(),
+            ])
+        );
+        assert_eq!(
+            sources[&analysis::StreamKey {
+                channel: "books".to_string(),
+                symbol: "ETH-USDT".to_string(),
+            }],
+            BTreeSet::from([
+                "okx-books-critical-r0-1".to_string(),
+                "okx-books-critical-r1-1".to_string(),
+            ])
+        );
     }
 
     #[tokio::test]

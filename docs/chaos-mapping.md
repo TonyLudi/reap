@@ -290,11 +290,12 @@ funding in `getFundingRate`, while `StrategyChaosService` initializes
 USDT/USD, and USDC/USD indexes plus swap funding. Mark-price and spot/swap
 price-limit streams are explicit Rust accounting and live-risk hardening, not a
 claim that those exact capture gates exist in `ChaosLiveSub`. Runtime and
-offline verification require every listed stream from both configured sources.
+offline verification require every listed stream from both exact configured
+replica/chunk socket plans.
 
 | Java reference | Rust implementation | Result |
 | --- | --- | --- |
-| `OkxNitroL2SubscriberGroupFactory` subscriber groups | `partition_subscriptions` replica/socket plans | Equivalent |
+| `OkxNitroL2SubscriberGroupFactory` subscriber groups and connection-index ownership | Deterministic `partition_subscriptions` replica/chunk socket plans; runtime and format-5 capture analysis require each logical stream's exact planned `conn_id` set rather than only the configured count | Equivalent topology with stronger retained source-ownership evidence |
 | `AbstractOkxNitroL2Subscriber` TBT and 400-level modes | Explicit `books-l2-tbt`, `books50-l2-tbt`, or `books` capture subscriptions | Equivalent, entitlement remains operational |
 | `OkxNitroSubscriberBase` 15-second application ping, `SharedSessionSubscriberBase` session ownership, `WsConnectOption` three-miss default, and low-level INIT/ping/pong/data liveness checks | Shutdown/recovery-cancellable 10-second feed handshake, 5-second bounded control writes, 15-second application ping, 30-second no-frame threshold, retained per-socket recovery ownership, reconnect supervision, book/reference freshness, and lossless bounded ready/disconnect delivery | Current-contract hardening: Rust prevents an unbounded handshake/write or closed recovery receiver from stalling/spinning the supervisor. Transport frames establish socket liveness; independently aged strategy and account components prevent pongs from masking stale required data. Low-frequency funding channels are not assigned an invalid global payload cadence. |
 | Clear/rebuild book on resubscribe or crossed-book failure | Invalid/crossed-book detection plus sequence state and fresh websocket snapshot recovery | Equivalent with additional explicit sequence validation |

@@ -699,6 +699,42 @@ production trading process.
     is implementation/connectivity evidence, not production authorization.
     Workspace formatting, warnings-denied Clippy, all 731 tests, the optimized
     release build, systemd unit verification, and RustSec audit pass.
+62. Capture redundancy previously compared only the number of distinct
+    `conn_id` values observed for each stream. Two wrong internal sources could
+    therefore satisfy a two-replica count even though they were not the socket
+    plans generated for that channel, priority, replica, symbol chunk, and
+    exact config. Runtime and offline analysis now derive the same expected
+    source set directly from deterministic `partition_subscriptions` plans and
+    require exact set equality. Format-5 analysis records each stream's
+    expected, missing, and unexpected plan IDs. This strengthens the mapping to
+    Java `OkxNitroL2SubscriberGroupFactory` groups and
+    `AbstractOkV5L2Subscriber` connection-index ownership while adding explicit
+    retained evidence that Java does not emit. Focused tests prove correct
+    plans, capacity-forced symbol chunks, incomplete partition rejection,
+    count-equivalent wrong plans, and independent verifier rejection.
+
+    A fresh optimized-release 60-second public diagnostic passed the runtime
+    exact-plan gate across all 11 logical streams and 12 socket plans. Its 5,674
+    exact raw ordinals contained 2,859 accepted and 2,815 duplicate events;
+    both books were ready after six host checks, with zero disconnects, gaps,
+    recoveries, recovery failures, stale books, parse errors, or missing
+    recovery routes. Independent verification, strict replay, and strict
+    format-5 analysis passed. Every stream listed both exact expected plan IDs
+    with empty missing/unexpected source lists. Raw backtest reconstructed 3,975
+    inputs, reached order-entry readiness, modeled eight orders and four
+    cancels, and passed accounting/currency-rate checks with no fills. It
+    reported two globally clamped cross-task receive-order regressions with a
+    maximum of 1,058 ns; per-stream capture timestamps remained monotonic.
+    Report, raw, config, and executable SHA-256 values are respectively
+    `48c98fe75d11eccc5db17cd5aff934bc887dbfa5f8118e77dbd3ad578d36e5c0`,
+    `cdc3f98dd33632d0c4578f3cb0e9ea7aa9b6c8d3ba96e975befe61b1e83b475c`,
+    `20d98819819877c9fa4725f990e37189deb9508c81fcaf776742b7ede764ac47`,
+    and `38cd09c4b8ffccc1310203df10c9e5a8d19398964e3568c3c973ddd4444cd083`.
+    The run reused the diagnostic 4 GiB disk and 700 MiB memory floors because
+    this shared host remains below production policy. It is connectivity and
+    evidence-pipeline validation, not production authorization.
+    Workspace formatting, warnings-denied Clippy, all 735 tests, the optimized
+    release build, systemd unit verification, and RustSec audit pass.
 
 ## Remaining Demo Gate
 

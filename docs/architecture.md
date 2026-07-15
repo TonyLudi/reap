@@ -999,9 +999,10 @@ Responsibilities:
 - Report connection readiness, queue high-water marks, parser failures,
   duplicates, gaps, recoveries, and final book health.
 - Classify stream identity once for runtime and offline analysis. A clean run
-  requires every configured logical stream to produce data from exactly its
-  configured number of source connections and at least one accepted event;
-  unclassified or unexpected data streams fail the same contract.
+  requires every configured logical stream to produce data from its exact
+  deterministic replica/chunk socket-plan IDs and at least one accepted event;
+  a count-equivalent wrong source, unclassified frame, or unexpected data
+  stream fails the same contract.
 - Stream raw files through the live adapter/reducer path to measure configured
   source coverage, receive/exchange timing, depth, spread, movement, and trade
   distributions without retaining the dataset in memory.

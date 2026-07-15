@@ -27,8 +27,8 @@ require_clock_synchronized = true
 
 # This is the credential-free input surface required by the checked-in iarb2
 # spot/swap strategy and accounting routes. Every stream is redundant.
-# A clean run requires data from both configured connections and at least one
-# accepted event for every subscription below.
+# A clean run requires data from both exact generated socket-plan IDs and at
+# least one accepted event for every subscription below.
 [[subscriptions]]
 channel = "books"
 symbol = "BTC-USDT"

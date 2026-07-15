@@ -179,9 +179,10 @@ and [checksum deprecation announcement](https://www.okx.com/en-us/help/okx-order
 
 `clean_capture` requires a bounded duration, all socket plans ready at least
 once and at stop, a ready contiguous snapshot for every configured book, and
-data from exactly the configured replica count plus at least one accepted event
-for every configured book, trade, index, funding, mark, and price-limit stream.
-Unclassified or unexpected data streams fail the contract. It also requires
+data from every exact deterministic replica/chunk socket-plan ID plus at least
+one accepted event for every configured book, trade, index, funding, mark, and
+price-limit stream. A count-equivalent frame from the wrong plan, unclassified
+data, or an unexpected stream fails the contract. It also requires
 non-empty raw output; zero parse, gap, stale-book, recovery-request,
 recovery-route, or recovery-failure counts; and host evidence matching the
 configured guard, including a healthy preflight and every completed periodic
@@ -926,9 +927,11 @@ across rotation. Research aggregation sums each run's `net_pnl_usd`, not final
 equity; continuity does not turn final capital into profit.
 
 Strict analysis requires one capture session, every configured stream on its
-configured number of source connections, a ready book for every configured
-book stream, no blank/comment records or unexpected data stream, monotonic
-per-source receive time, and no parse, sequence, or unrecovered-book defect. It reports
+exact deterministic replica/chunk source connections, a ready book for every
+configured book stream, no blank/comment records or unexpected data stream,
+monotonic per-source receive time, and no parse, sequence, or unrecovered-book
+defect. Analysis format 5 reports each stream's expected, missing, and
+unexpected plan IDs in addition to source counts. It reports
 receive and exchange cadence, signed receive-minus-exchange delay, book depth,
 spread, absolute midpoint movement, trade quantity, and price-times-quantity.
 Quantiles use a deterministic 8,192-value reservoir per metric; counts, means,

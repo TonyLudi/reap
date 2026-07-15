@@ -130,6 +130,9 @@ architecture in [docs/architecture.md](docs/architecture.md).
   configured logical stream to deliver data on its configured replica count
   plus at least one accepted event before runtime or offline verification can
   classify the capture as clean.
+- [x] Bind each capture stream to the exact deterministic websocket plan IDs
+  produced by subscription partitioning; count-equivalent data from a wrong
+  replica/chunk now fails runtime clean status and offline verification.
 - [x] Add a deterministic Java-referenced backtest scheduler with receive-time
   raw replay, explicit market/new/cancel/order/account delays, immediate
   `PendingNew` registration, and end-of-horizon execution provenance.

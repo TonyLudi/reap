@@ -1220,6 +1220,47 @@ mod tests {
     }
 
     #[test]
+    fn verifier_rejects_the_right_replica_count_on_the_wrong_socket_plan() {
+        let fixture = setup(false);
+        let raw = std::fs::read_to_string(&fixture.raw_path)
+            .unwrap()
+            .replace("okx-books-critical-r1-0", "okx-books-critical-r9-0");
+        std::fs::write(&fixture.raw_path, raw.as_bytes()).unwrap();
+
+        let mut run_report: CaptureRunReport =
+            serde_json::from_slice(&std::fs::read(&fixture.report_path).unwrap()).unwrap();
+        run_report.raw_bytes = raw.len() as u64;
+        run_report.raw_sha256 = sha256_hex(raw.as_bytes());
+        write_report(&fixture.report_path, &run_report);
+
+        let report = verify(&fixture);
+        let coverage = &report.analysis.expected_streams[0];
+
+        assert!(!report.passed);
+        assert_eq!(coverage.observed_connections, 2);
+        assert_eq!(
+            coverage.missing_source_connections,
+            ["okx-books-critical-r1-0"]
+        );
+        assert_eq!(
+            coverage.unexpected_source_connections,
+            ["okx-books-critical-r9-0"]
+        );
+        assert!(report.failures.iter().any(|failure| matches!(
+            failure,
+            CaptureVerificationFailure::CleanFlagMismatch {
+                reported: true,
+                derived: false,
+            }
+        )));
+        assert!(
+            report
+                .failures
+                .contains(&CaptureVerificationFailure::AnalysisIntegrityUnhealthy)
+        );
+    }
+
+    #[test]
     fn clean_coverage_rejects_an_unclassified_data_frame() {
         let fixture = std::str::from_utf8(RAW_FIXTURE).unwrap();
         let mut unclassified: RawCapture =
