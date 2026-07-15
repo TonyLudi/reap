@@ -280,6 +280,12 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Bound feed websocket handshakes and control writes, make establishment
   shutdown/recovery cancellable, retain a recovery-channel owner for every
   socket including non-book plans, and treat unexpected owner loss as fatal.
+- [x] Keep order-command heartbeat telemetry best-effort under bounded queue
+  saturation while preserving lossless disconnect/fatal transitions; bound its
+  shutdown close and the fault proxy's client/upstream handshakes and writes,
+  with connection unregister guaranteed on every bridge exit. Canonicalize and
+  regular-file-check the proxy config so relative runbook invocations retain an
+  independently verifiable effective fingerprint.
 - [x] Add structured live fault evidence for ambiguous submit/cancel outcomes,
   partial fills, order/fill convergence timeouts, restored durable latches, and
   typed deadman, periodic clock, and authenticated account-config failures.

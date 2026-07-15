@@ -627,6 +627,43 @@ production trading process.
     reliably retain the checked-in 1 GiB production floor. It closes a real
     local lifecycle defect but is not production evidence and does not replace
     credentialed demo fault campaigns.
+60. The next source audit followed pinned Java
+    `OkxNitroOrderClient.onOrderSessionDisconnected`, which immediately invokes
+    `cancelAll()`, through Rust's eight-session command transport and demo fault
+    proxy. Rust heartbeat status previously used awaited sends at both bounded
+    telemetry queues, so a stalled observer could stop a command session before
+    it processed shutdown or delivered the disconnect that triggers canonical
+    cancellation. Heartbeats are now best-effort at both boundaries, while
+    ready, disconnect, and fatal transitions remain lossless; the order-session
+    close uses the existing 5-second control-write deadline.
+
+    The fault proxy also had unbounded local/upstream websocket handshakes and
+    forwarding writes, and protocol `?` returns could bypass active-connection
+    unregister. Both handshakes and every write now use the configured request
+    deadline and observe shutdown, paired close writes are capped at one second,
+    and every registered bridge exits through unregister. Shutdown cancellation
+    is clean rather than counted as an injector error. Focused order-session
+    saturation/lifecycle tests, stalled-proxy-handshake tests, the existing
+    disconnect/drop integration test, and focused lint all pass.
+
+    An optimized-release smoke held a raw TCP client established on the public
+    websocket listener without completing its handshake through a bounded proxy
+    run. The first independent verification exposed that relative and canonical
+    proxy-config paths produced different effective fingerprints. The loader now
+    rejects symlinks/non-files and canonicalizes the source before resolving
+    artifact paths. Regression tests cover aliased paths and symlinks. Repeating
+    the smoke with the documented relative config path produced session
+    `fault-1665842-25ea16f8ad4155d3`: it stopped after 20,001 ms with clean task
+    joins and control-socket removal, zero active bridges, and zero proxy errors.
+    Independent verification passed; report and executable SHA-256 values are
+    `c82854c4ce6952ecf1e066c986dcb3b1411eae326f92743178797edb60ae9f05`
+    and `39ecc4be4e10b73673b17b82c3b7dc9bf73df99fc63ef4145c3aa586ea71d65b`.
+    The routed three-websocket demo config also passed `live --mode validate`.
+    Workspace formatting, warnings-denied Clippy, all 725 tests, the optimized
+    release build, systemd unit verification, and RustSec audit pass.
+    No configured demo credential, operator-token, or alert-endpoint environment
+    binding is present on this host, so this is implementation evidence rather
+    than the still required credentialed observe/fault campaign.
 
 ## Remaining Demo Gate
 

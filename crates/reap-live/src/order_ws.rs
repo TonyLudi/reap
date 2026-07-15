@@ -427,7 +427,7 @@ where
             biased;
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    let _ = writer.send(Message::Close(None)).await;
+                    let _ = send_control_message(writer, Message::Close(None), "close").await;
                     fail_pending(pending, "order websocket shut down before acknowledgement");
                     return Ok(());
                 }
@@ -440,7 +440,7 @@ where
                 match message {
                     Message::Text(payload) => {
                         if payload.as_str() == "pong" {
-                            send_heartbeat(index, status).await?;
+                            try_send_heartbeat(index, status)?;
                         } else {
                             process_order_response(payload.as_str(), pending)?;
                         }
@@ -449,7 +449,7 @@ where
                         let payload = std::str::from_utf8(payload.as_ref())
                             .map_err(|_| "order websocket returned non-UTF8 data".to_string())?;
                         if payload == "pong" {
-                            send_heartbeat(index, status).await?;
+                            try_send_heartbeat(index, status)?;
                         } else {
                             process_order_response(payload, pending)?;
                         }
@@ -457,7 +457,7 @@ where
                     Message::Ping(payload) => {
                         send_control_message(writer, Message::Pong(payload), "pong").await?
                     }
-                    Message::Pong(_) => send_heartbeat(index, status).await?,
+                    Message::Pong(_) => try_send_heartbeat(index, status)?,
                     Message::Close(_) => return Err("peer closed the order websocket".to_string()),
                     Message::Frame(_) => {}
                 }
@@ -668,15 +668,17 @@ fn process_order_response(
     Ok(())
 }
 
-async fn send_heartbeat(index: usize, status: &mpsc::Sender<SessionStatus>) -> Result<(), String> {
-    status
-        .send(SessionStatus {
-            index,
-            kind: OkxOrderWsStatusKind::Heartbeat,
-            reason: "pong received".to_string(),
-        })
-        .await
-        .map_err(|_| "order websocket status monitor closed".to_string())
+fn try_send_heartbeat(index: usize, status: &mpsc::Sender<SessionStatus>) -> Result<(), String> {
+    match status.try_send(SessionStatus {
+        index,
+        kind: OkxOrderWsStatusKind::Heartbeat,
+        reason: "pong received".to_string(),
+    }) {
+        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            Err("order websocket status monitor closed".to_string())
+        }
+    }
 }
 
 fn reject_queued(commands: &mut mpsc::Receiver<SessionCommand>, reason: &str) {
@@ -761,18 +763,23 @@ async fn aggregate_status(
                         status.index, status.reason
                     ),
                 };
-                if output
-                    .send(OkxOrderWsStatus {
-                        account_id: account_id.clone(),
-                        ts_ms: unix_time_ms(),
-                        kind,
-                        ready_sessions: ready_sessions.len(),
-                        total_sessions,
-                        reason,
-                    })
-                    .await
-                    .is_err()
-                {
+                let aggregate = OkxOrderWsStatus {
+                    account_id: account_id.clone(),
+                    ts_ms: unix_time_ms(),
+                    kind,
+                    ready_sessions: ready_sessions.len(),
+                    total_sessions,
+                    reason,
+                };
+                let output_closed = if kind == OkxOrderWsStatusKind::Heartbeat {
+                    matches!(
+                        output.try_send(aggregate),
+                        Err(mpsc::error::TrySendError::Closed(_))
+                    )
+                } else {
+                    output.send(aggregate).await.is_err()
+                };
+                if output_closed {
                     return;
                 }
                 if terminal {
@@ -901,6 +908,100 @@ mod tests {
         })
         .await
         .expect("order websocket should become ready")
+    }
+
+    #[test]
+    fn session_heartbeat_is_best_effort_under_status_backpressure() {
+        let (status, mut receiver) = mpsc::channel(1);
+        status
+            .try_send(SessionStatus {
+                index: 0,
+                kind: OkxOrderWsStatusKind::Ready,
+                reason: "authenticated".to_string(),
+            })
+            .unwrap();
+
+        try_send_heartbeat(0, &status).unwrap();
+        assert_eq!(
+            receiver.try_recv().unwrap().kind,
+            OkxOrderWsStatusKind::Ready
+        );
+        drop(receiver);
+        assert_eq!(
+            try_send_heartbeat(0, &status).unwrap_err(),
+            "order websocket status monitor closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_heartbeat_cannot_displace_a_disconnect_transition() {
+        let (session_tx, session_rx) = mpsc::channel(4);
+        let (output_tx, mut output_rx) = mpsc::channel(1);
+        let output_probe = output_tx.clone();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(aggregate_status(
+            "account-a".to_string(),
+            1,
+            session_rx,
+            output_tx,
+            shutdown_rx,
+        ));
+
+        session_tx
+            .send(SessionStatus {
+                index: 0,
+                kind: OkxOrderWsStatusKind::Ready,
+                reason: "authenticated".to_string(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while output_probe.capacity() != 0 || session_tx.capacity() != 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(output_probe.capacity(), 0);
+
+        session_tx
+            .send(SessionStatus {
+                index: 0,
+                kind: OkxOrderWsStatusKind::Heartbeat,
+                reason: "pong received".to_string(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while session_tx.capacity() != 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(session_tx.capacity(), 4);
+        assert_eq!(output_probe.capacity(), 0);
+
+        session_tx
+            .send(SessionStatus {
+                index: 0,
+                kind: OkxOrderWsStatusKind::Disconnected,
+                reason: "transport lost".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            output_rx.recv().await.unwrap().kind,
+            OkxOrderWsStatusKind::Ready
+        );
+        let disconnected = tokio::time::timeout(Duration::from_secs(1), output_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(disconnected.kind, OkxOrderWsStatusKind::Disconnected);
+        shutdown_tx.send(true).unwrap();
+        task.await.unwrap();
     }
 
     #[tokio::test]

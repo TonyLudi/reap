@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::fs;
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -19,7 +20,7 @@ use reap_core::PINNED_JAVA_REVISION;
 use reap_feed::ConnectionAttemptPacer;
 use reap_live::{current_executable_sha256, host_identity_sha256};
 use tokio::net::{TcpListener, TcpStream, UnixListener};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{
@@ -36,6 +37,8 @@ use crate::protocol::{
     WebSocketTarget,
 };
 use crate::state::{DisconnectSignal, ProxyState, now_ms};
+
+const WEBSOCKET_CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Default)]
 pub struct FaultProxyRunOptions {
@@ -95,6 +98,7 @@ pub async fn run_fault_proxy(
         .map_err(FaultProxyRuntimeError::HttpClient)?;
     let started_at_ms = now_ms();
     let started = Instant::now();
+    let websocket_io_timeout = Duration::from_millis(config.request_timeout_ms);
     let mut tasks = JoinSet::new();
     tasks.spawn(run_rest_listener(
         rest_listener,
@@ -109,6 +113,7 @@ pub async fn run_fault_proxy(
         WebSocketTarget::Public,
         config.upstream.public_ws_url.clone(),
         connection_attempt_pacer.clone(),
+        websocket_io_timeout,
     ));
     tasks.spawn(run_websocket_listener(
         private_listener,
@@ -116,6 +121,7 @@ pub async fn run_fault_proxy(
         WebSocketTarget::Private,
         config.upstream.private_ws_url.clone(),
         connection_attempt_pacer.clone(),
+        websocket_io_timeout,
     ));
     tasks.spawn(run_websocket_listener(
         order_listener,
@@ -123,6 +129,7 @@ pub async fn run_fault_proxy(
         WebSocketTarget::Order,
         config.upstream.private_ws_url.clone(),
         connection_attempt_pacer,
+        websocket_io_timeout,
     ));
     tasks.spawn(run_control_listener(
         control_listener,
@@ -545,6 +552,7 @@ async fn run_websocket_listener(
     target: WebSocketTarget,
     upstream_url: String,
     connection_attempt_pacer: ConnectionAttemptPacer,
+    io_timeout: Duration,
 ) {
     let mut shutdown = state.shutdown.subscribe();
     let mut connections = JoinSet::new();
@@ -563,8 +571,10 @@ async fn run_websocket_listener(
                                 target,
                                 &upstream_url,
                                 connection_attempt_pacer,
+                                io_timeout,
                             )
                             .await
+                                && !matches!(error, WebSocketBridgeError::ShuttingDown)
                             {
                                 state.record_error(format!("{target:?} websocket bridge failed: {error}"));
                             }
@@ -603,15 +613,21 @@ async fn bridge_websocket(
     target: WebSocketTarget,
     upstream_url: &str,
     connection_attempt_pacer: ConnectionAttemptPacer,
+    io_timeout: Duration,
 ) -> Result<(), WebSocketBridgeError> {
-    let client = accept_hdr_async(
-        stream,
-        ExpectedPathCallback {
-            expected_path: target.expected_path(),
-        },
+    let mut proxy_shutdown = state.shutdown.subscribe();
+    let client = await_websocket_handshake(
+        accept_hdr_async(
+            stream,
+            ExpectedPathCallback {
+                expected_path: target.expected_path(),
+            },
+        ),
+        &mut proxy_shutdown,
+        io_timeout,
+        "client",
     )
     .await?;
-    let mut proxy_shutdown = state.shutdown.subscribe();
     let (_pacer_shutdown_tx, mut pacer_shutdown) = tokio::sync::watch::channel(false);
     tokio::select! {
         turn = connection_attempt_pacer.wait_for_turn(&mut pacer_shutdown) => {
@@ -625,8 +641,45 @@ async fn bridge_websocket(
             }
         }
     }
-    let (upstream, _) = connect_async(upstream_url).await?;
-    bridge_websocket_streams(client, upstream, state, target).await
+    let (upstream, _) = await_websocket_handshake(
+        connect_async(upstream_url),
+        &mut proxy_shutdown,
+        io_timeout,
+        "upstream",
+    )
+    .await?;
+    bridge_websocket_streams(client, upstream, state, target, io_timeout).await
+}
+
+async fn await_websocket_handshake<F, T>(
+    handshake: F,
+    shutdown: &mut watch::Receiver<Option<String>>,
+    timeout: Duration,
+    stage: &'static str,
+) -> Result<T, WebSocketBridgeError>
+where
+    F: Future<Output = Result<T, tokio_tungstenite::tungstenite::Error>>,
+{
+    if shutdown.borrow().is_some() {
+        return Err(WebSocketBridgeError::ShuttingDown);
+    }
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(handshake);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || shutdown.borrow().is_some() {
+                    return Err(WebSocketBridgeError::ShuttingDown);
+                }
+            }
+            result = &mut handshake => return result.map_err(WebSocketBridgeError::Protocol),
+            _ = &mut deadline => {
+                return Err(WebSocketBridgeError::HandshakeTimeout { stage });
+            }
+        }
+    }
 }
 
 struct ExpectedPathCallback {
@@ -658,6 +711,7 @@ async fn bridge_websocket_streams<S1, S2>(
     upstream: WebSocketStream<S2>,
     state: Arc<ProxyState>,
     target: WebSocketTarget,
+    io_timeout: Duration,
 ) -> Result<(), WebSocketBridgeError>
 where
     S1: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -668,11 +722,41 @@ where
     let (disconnect_tx, mut disconnect_rx) = mpsc::channel::<DisconnectSignal>(1);
     let connection_id = state.register_connection(target, disconnect_tx).await;
     let mut shutdown = state.shutdown.subscribe();
-    let result = loop {
-        tokio::select! {
+    let result = if shutdown.borrow().is_some() {
+        Err(WebSocketBridgeError::ShuttingDown)
+    } else {
+        loop {
+            tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || shutdown.borrow().is_some() {
+                    close_websocket_pair(
+                        &mut client_sink,
+                        &mut upstream_sink,
+                        "reap fault proxy shutdown",
+                    ).await;
+                    break Ok(());
+                }
+            }
+            signal = disconnect_rx.recv() => {
+                let Some(signal) = signal else { break Ok(()); };
+                let _command_id = signal.command_id;
+                close_websocket_pair(
+                    &mut client_sink,
+                    &mut upstream_sink,
+                    "reap fault proxy injected disconnect",
+                ).await;
+                let applied_at_ms = now_ms();
+                let _ = signal.acknowledgement.send(applied_at_ms);
+                state.counters.websocket_disconnects_injected.fetch_add(1, Ordering::Relaxed);
+                break Ok(());
+            }
             message = client_stream.next() => {
                 let Some(message) = message else { break Ok(()); };
-                let message = message?;
+                let message = match message {
+                    Ok(message) => message,
+                    Err(error) => break Err(WebSocketBridgeError::Protocol(error)),
+                };
                 if let Some(drop) = state.consume_websocket(
                     connection_id,
                     target,
@@ -687,12 +771,25 @@ where
                     }
                     continue;
                 }
-                upstream_sink.send(message).await?;
+                match send_websocket_message(
+                    &mut upstream_sink,
+                    message,
+                    &mut shutdown,
+                    io_timeout,
+                    "client-to-upstream write",
+                ).await {
+                    Ok(()) => {}
+                    Err(WebSocketBridgeError::ShuttingDown) => break Ok(()),
+                    Err(error) => break Err(error),
+                }
                 state.counters.websocket_frames_forwarded.fetch_add(1, Ordering::Relaxed);
             }
             message = upstream_stream.next() => {
                 let Some(message) = message else { break Ok(()); };
-                let message = message?;
+                let message = match message {
+                    Ok(message) => message,
+                    Err(error) => break Err(WebSocketBridgeError::Protocol(error)),
+                };
                 if let Some(drop) = state.consume_websocket(
                     connection_id,
                     target,
@@ -707,38 +804,84 @@ where
                     }
                     continue;
                 }
-                client_sink.send(message).await?;
+                match send_websocket_message(
+                    &mut client_sink,
+                    message,
+                    &mut shutdown,
+                    io_timeout,
+                    "upstream-to-client write",
+                ).await {
+                    Ok(()) => {}
+                    Err(WebSocketBridgeError::ShuttingDown) => break Ok(()),
+                    Err(error) => break Err(error),
+                }
                 state.counters.websocket_frames_forwarded.fetch_add(1, Ordering::Relaxed);
             }
-            signal = disconnect_rx.recv() => {
-                let Some(signal) = signal else { break Ok(()); };
-                let _command_id = signal.command_id;
-                let close = Message::Close(Some(CloseFrame {
-                    code: CloseCode::Away,
-                    reason: "reap fault proxy injected disconnect".into(),
-                }));
-                let _ = client_sink.send(close.clone()).await;
-                let _ = upstream_sink.send(close).await;
-                let applied_at_ms = now_ms();
-                let _ = signal.acknowledgement.send(applied_at_ms);
-                state.counters.websocket_disconnects_injected.fetch_add(1, Ordering::Relaxed);
-                break Ok(());
-            }
-            changed = shutdown.changed() => {
-                if changed.is_err() || shutdown.borrow().is_some() {
-                    let close = Message::Close(Some(CloseFrame {
-                        code: CloseCode::Away,
-                        reason: "reap fault proxy shutdown".into(),
-                    }));
-                    let _ = client_sink.send(close.clone()).await;
-                    let _ = upstream_sink.send(close).await;
-                    break Ok(());
-                }
             }
         }
     };
     state.unregister_connection(connection_id).await;
     result
+}
+
+async fn send_websocket_message<W>(
+    writer: &mut W,
+    message: Message,
+    shutdown: &mut watch::Receiver<Option<String>>,
+    timeout: Duration,
+    operation: &'static str,
+) -> Result<(), WebSocketBridgeError>
+where
+    W: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    await_websocket_write(writer.send(message), shutdown, timeout, operation).await
+}
+
+async fn await_websocket_write<F>(
+    write: F,
+    shutdown: &mut watch::Receiver<Option<String>>,
+    timeout: Duration,
+    operation: &'static str,
+) -> Result<(), WebSocketBridgeError>
+where
+    F: Future<Output = Result<(), tokio_tungstenite::tungstenite::Error>>,
+{
+    if shutdown.borrow().is_some() {
+        return Err(WebSocketBridgeError::ShuttingDown);
+    }
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(write);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || shutdown.borrow().is_some() {
+                    return Err(WebSocketBridgeError::ShuttingDown);
+                }
+            }
+            result = &mut write => return result.map_err(WebSocketBridgeError::Protocol),
+            _ = &mut deadline => {
+                return Err(WebSocketBridgeError::WriteTimeout { operation });
+            }
+        }
+    }
+}
+
+async fn close_websocket_pair<W1, W2>(client: &mut W1, upstream: &mut W2, reason: &'static str)
+where
+    W1: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    W2: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    let close = Message::Close(Some(CloseFrame {
+        code: CloseCode::Away,
+        reason: reason.into(),
+    }));
+    let client_close =
+        tokio::time::timeout(WEBSOCKET_CONTROL_WRITE_TIMEOUT, client.send(close.clone()));
+    let upstream_close =
+        tokio::time::timeout(WEBSOCKET_CONTROL_WRITE_TIMEOUT, upstream.send(close));
+    let _ = tokio::join!(client_close, upstream_close);
 }
 
 fn prepare_private_directory(path: &Path) -> Result<(), FaultProxyRuntimeError> {
@@ -860,6 +1003,10 @@ pub enum FaultProxyRuntimeError {
 enum WebSocketBridgeError {
     #[error("websocket protocol failed: {0}")]
     Protocol(#[from] tokio_tungstenite::tungstenite::Error),
+    #[error("{stage} websocket handshake timed out")]
+    HandshakeTimeout { stage: &'static str },
+    #[error("websocket {operation} timed out")]
+    WriteTimeout { operation: &'static str },
     #[error("connection pacer failed: {0}")]
     ConnectionPacer(#[from] reap_feed::ConnectionAttemptPacerError),
     #[error("fault proxy is shutting down")]
@@ -873,6 +1020,7 @@ mod tests {
     use http_body_util::StreamBody;
     use hyper::body::Frame;
     use hyper::header::HeaderValue;
+    use tokio::io::AsyncWriteExt;
     use tokio_tungstenite::{accept_async, connect_async};
 
     use super::*;
@@ -938,6 +1086,147 @@ mod tests {
             "control: test"
         );
         assert_eq!(state.counters.proxy_errors.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn websocket_handshake_and_write_are_bounded_and_shutdown_cancellable() {
+        let (_shutdown_tx, mut shutdown) = watch::channel(None::<String>);
+        let handshake = await_websocket_handshake(
+            std::future::pending::<Result<(), tokio_tungstenite::tungstenite::Error>>(),
+            &mut shutdown,
+            Duration::from_millis(1),
+            "upstream",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            handshake,
+            WebSocketBridgeError::HandshakeTimeout { stage: "upstream" }
+        ));
+
+        let (_shutdown_tx, mut shutdown) = watch::channel(None::<String>);
+        let write = await_websocket_write(
+            std::future::pending::<Result<(), tokio_tungstenite::tungstenite::Error>>(),
+            &mut shutdown,
+            Duration::from_millis(1),
+            "upstream-to-client write",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            write,
+            WebSocketBridgeError::WriteTimeout {
+                operation: "upstream-to-client write"
+            }
+        ));
+
+        let (shutdown_tx, mut shutdown) = watch::channel(None::<String>);
+        let connecting = tokio::spawn(async move {
+            await_websocket_handshake(
+                std::future::pending::<Result<(), tokio_tungstenite::tungstenite::Error>>(),
+                &mut shutdown,
+                Duration::from_secs(1),
+                "client",
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        shutdown_tx.send(Some("test".to_string())).unwrap();
+        let stopped = tokio::time::timeout(Duration::from_millis(100), connecting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(stopped, WebSocketBridgeError::ShuttingDown));
+    }
+
+    #[tokio::test]
+    async fn stalled_client_handshake_does_not_dirty_proxy_shutdown() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = ProxyState::new(
+            "fingerprint".to_string(),
+            private_evidence_directory(directory.path()),
+            8,
+            1024,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let proxy = tokio::spawn(run_websocket_listener(
+            listener,
+            Arc::clone(&state),
+            WebSocketTarget::Public,
+            "ws://127.0.0.1:9/ws/v5/public".to_string(),
+            ConnectionAttemptPacer::new(Duration::ZERO),
+            Duration::from_secs(1),
+        ));
+        let _stalled_client = TcpStream::connect(address).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        state.shutdown.send(Some("test".to_string())).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), proxy)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.counters.proxy_errors.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn websocket_protocol_error_unregisters_the_active_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = ProxyState::new(
+            "fingerprint".to_string(),
+            private_evidence_directory(directory.path()),
+            8,
+            1024,
+        );
+        let (client_io, mut client_peer) = tokio::io::duplex(1024);
+        let client = WebSocketStream::from_raw_socket(
+            client_io,
+            tokio_tungstenite::tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
+        let (upstream_io, _upstream_peer) = tokio::io::duplex(1024);
+        let upstream = WebSocketStream::from_raw_socket(
+            upstream_io,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let bridge_state = Arc::clone(&state);
+        let bridge = tokio::spawn(async move {
+            bridge_websocket_streams(
+                client,
+                upstream,
+                bridge_state,
+                WebSocketTarget::Public,
+                Duration::from_secs(1),
+            )
+            .await
+        });
+        for _ in 0..100 {
+            if state.status().await.websocket_connections_active["public"] == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            state.status().await.websocket_connections_active["public"],
+            1
+        );
+
+        // A client frame sent to a server endpoint must be masked.
+        client_peer.write_all(&[0x81, 0x01, b'x']).await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(1), bridge)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(error, WebSocketBridgeError::Protocol(_)));
+        assert_eq!(
+            state.status().await.websocket_connections_active["public"],
+            0
+        );
     }
 
     async fn upstream_http() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
@@ -1134,6 +1423,7 @@ mod tests {
             WebSocketTarget::Order,
             format!("ws://{upstream_address}/ws/v5/private"),
             ConnectionAttemptPacer::new(Duration::ZERO),
+            Duration::from_secs(1),
         ));
         let (mut client, _) = connect_async(format!(
             "ws://{proxy_address}{}",

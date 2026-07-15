@@ -10,6 +10,7 @@ order_ws_listen = "127.0.0.1:18083"
 control_socket = "../var/reap/fault/control.sock"
 evidence_directory = "../var/reap/fault/evidence"
 
+# Bounds REST/control requests, both websocket handshakes, and forwarding writes.
 request_timeout_ms = 10000
 max_http_body_bytes = 1048576
 max_pending_faults = 64

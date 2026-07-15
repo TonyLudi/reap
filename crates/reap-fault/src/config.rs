@@ -58,6 +58,8 @@ pub struct FaultProxyConfigEvidence {
 
 #[derive(Debug, Error)]
 pub enum FaultProxyConfigError {
+    #[error("invalid fault-proxy config path {path}: {message}")]
+    InvalidPath { path: PathBuf, message: String },
     #[error("failed to inspect fault-proxy config {path}: {source}")]
     Inspect {
         path: PathBuf,
@@ -86,36 +88,49 @@ impl FaultProxyConfig {
     pub fn load(
         path: impl AsRef<Path>,
     ) -> Result<(Self, FaultProxyConfigEvidence), FaultProxyConfigError> {
-        let path = path.as_ref();
-        let metadata = fs::metadata(path).map_err(|source| FaultProxyConfigError::Inspect {
-            path: path.to_path_buf(),
-            source,
+        let requested_path = path.as_ref();
+        let metadata = fs::symlink_metadata(requested_path).map_err(|source| {
+            FaultProxyConfigError::Inspect {
+                path: requested_path.to_path_buf(),
+                source,
+            }
         })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(FaultProxyConfigError::InvalidPath {
+                path: requested_path.to_path_buf(),
+                message: "must be a regular file and not a symbolic link".to_string(),
+            });
+        }
+        let path =
+            fs::canonicalize(requested_path).map_err(|source| FaultProxyConfigError::Inspect {
+                path: requested_path.to_path_buf(),
+                source,
+            })?;
         if metadata.len() > MAX_CONFIG_BYTES {
             return Err(FaultProxyConfigError::TooLarge {
-                path: path.to_path_buf(),
+                path,
                 bytes: metadata.len(),
                 maximum: MAX_CONFIG_BYTES,
             });
         }
-        let bytes = fs::read(path).map_err(|source| FaultProxyConfigError::Read {
-            path: path.to_path_buf(),
+        let bytes = fs::read(&path).map_err(|source| FaultProxyConfigError::Read {
+            path: path.clone(),
             source,
         })?;
         if bytes.len() as u64 > MAX_CONFIG_BYTES {
             return Err(FaultProxyConfigError::TooLarge {
-                path: path.to_path_buf(),
+                path,
                 bytes: bytes.len() as u64,
                 maximum: MAX_CONFIG_BYTES,
             });
         }
         let text = std::str::from_utf8(&bytes).map_err(|error| FaultProxyConfigError::Parse {
-            path: path.to_path_buf(),
+            path: path.clone(),
             message: error.to_string(),
         })?;
         let mut config: Self =
             toml::from_str(text).map_err(|error| FaultProxyConfigError::Parse {
-                path: path.to_path_buf(),
+                path: path.clone(),
                 message: error.to_string(),
             })?;
         let base = path.parent().unwrap_or_else(|| Path::new("."));
@@ -127,7 +142,7 @@ impl FaultProxyConfig {
         Ok((
             config,
             FaultProxyConfigEvidence {
-                source_path: path.to_path_buf(),
+                source_path: path,
                 bytes: bytes.len() as u64,
                 sha256: hex_sha256(&bytes),
                 effective_fingerprint: hex_sha256(&effective),
@@ -419,6 +434,51 @@ private_ws_url = "wss://wspap.okx.com:8443/ws/v5/private"
         );
         assert_eq!(config.evidence_directory, directory.path().join("evidence"));
         assert_eq!(evidence.bytes, fs::metadata(path).unwrap().len());
+    }
+
+    #[test]
+    fn load_canonicalizes_source_before_resolving_artifact_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("proxy.toml");
+        fs::write(
+            &path,
+            include_bytes!("../../../examples/okx-demo-fault-proxy.toml"),
+        )
+        .unwrap();
+        let alias_directory = directory.path().join("alias");
+        fs::create_dir(&alias_directory).unwrap();
+        let alias = alias_directory.join("../proxy.toml");
+
+        let (exact_config, exact_evidence) = FaultProxyConfig::load(&path).unwrap();
+        let (alias_config, alias_evidence) = FaultProxyConfig::load(&alias).unwrap();
+
+        assert_eq!(alias_evidence, exact_evidence);
+        assert_eq!(alias_config.control_socket, exact_config.control_socket);
+        assert_eq!(
+            alias_config.evidence_directory,
+            exact_config.evidence_directory
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_symbolic_link_input() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("proxy.toml");
+        fs::write(
+            &path,
+            include_bytes!("../../../examples/okx-demo-fault-proxy.toml"),
+        )
+        .unwrap();
+        let linked = directory.path().join("linked.toml");
+        symlink(&path, &linked).unwrap();
+
+        assert!(matches!(
+            FaultProxyConfig::load(&linked),
+            Err(FaultProxyConfigError::InvalidPath { .. })
+        ));
     }
 
     #[test]

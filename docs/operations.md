@@ -1671,6 +1671,12 @@ in `observe` only after review.
   websocket command pool. `order_websocket_sessions` defaults to eight and
   stable underlying hashing keeps related spot/swap/future commands on one
   session, matching the pinned Java dispatch shape.
+- Connection/login and control writes are bounded, including the shutdown close.
+  Pong-derived heartbeat status uses non-blocking delivery at both bounded
+  telemetry queues; saturation drops only that redundant heartbeat. Ready,
+  disconnect, and fatal transitions remain lossless, so telemetry backpressure
+  cannot stall order commands or delay the Java-mapped disconnect cancellation
+  and reconciliation path.
 - Each account command owner keeps a FIFO per underlying and permits one
   operation per family, with total concurrent operations bounded by
   `order_websocket_sessions`. Unrelated families therefore do not wait for one
@@ -1780,6 +1786,18 @@ The proxy forwards authenticated traffic in memory but does not log or retain
 authorization headers, login frames, raw account/order payloads, or injected
 response bodies. Run it under the same protected service account as other demo
 evidence tooling and never expose its listeners or Unix socket beyond the host.
+`request_timeout_ms` bounds REST requests, local and official-upstream websocket
+handshakes, and every websocket forwarding write. Handshakes and writes are
+shutdown-cancellable; paired close writes are independently capped at one
+second. Clean, peer-close, protocol-error, timeout, and shutdown exits all remove
+the bridge from the active-connection registry. Shutdown cancellation itself is
+not recorded as a proxy error, while a genuine timeout remains a non-passing
+campaign result.
+
+The proxy config must be a non-symlink regular file. Its source is canonicalized
+before artifact paths and the effective fingerprint are derived, so running the
+checked-in relative-path commands and later verifying with an absolute path does
+not create false config drift.
 
 Prepare one exact routed config for the campaign. Output paths are create-new;
 do not delete or overwrite artifacts from an earlier run:

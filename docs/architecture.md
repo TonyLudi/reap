@@ -230,6 +230,11 @@ Responsibilities:
 - Rate limiting and request pacing.
 - A command-transport boundary that keeps canonical identity independent from
   REST or authenticated websocket IO.
+- Authenticated websocket command sessions with bounded handshakes, login,
+  control writes, request expiry, and acknowledgements. Heartbeat telemetry is
+  best-effort at both bounded status queues so it cannot stall command IO;
+  ready/disconnected/fatal transitions remain lossless and drive fail-closed
+  cancellation plus reconciliation.
 - Canonical order state reducer.
 - Typed one-to-one exchange/client order-ID binding from exchange acknowledgements,
   with contradictory journal history rejected and active bindings restored
@@ -590,6 +595,15 @@ Responsibilities:
 - Forward REST and websocket traffic without logging authorization headers,
   login frames, raw account/order payloads, or injected response bodies. Evidence
   retains only bounded metadata, byte counts, and SHA-256 digests.
+- Bound local/upstream websocket handshakes and each forwarding write by the
+  configured request timeout, make them shutdown-cancellable, and bound paired
+  close writes. Every registered bridge is removed on clean, protocol-error,
+  timeout, and shutdown exits so process evidence cannot retain a phantom
+  active connection.
+- Accept the proxy configuration only as a non-symlink regular file and
+  canonicalize its source before resolving artifact paths or deriving the
+  effective fingerprint. Relative and absolute invocations of the same config
+  therefore produce independently comparable run evidence.
 - Accept strict bounded commands over a mode-`0600` Unix socket. Supported
   primitives are targeted websocket disconnects, matched one-shot or bounded
   frame drops, and matched REST responses.
