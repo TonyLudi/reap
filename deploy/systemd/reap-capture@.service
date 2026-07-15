@@ -15,7 +15,7 @@ StateDirectory=reap/connectivity
 StateDirectoryMode=0750
 Environment=RUST_BACKTRACE=1
 EnvironmentFile=/etc/reap/capture/%i.env
-ExecStart=/usr/local/bin/reap capture --config /etc/reap/capture/%i.toml --output /var/lib/reap/capture/%i/run-report.json --duration-secs ${REAP_CAPTURE_DURATION_SECS} --require-clean-capture
+ExecStart=/usr/local/bin/reap capture --config /etc/reap/capture/okx-btc-public.toml --output /var/lib/reap/capture/%i/run-report.json --raw-path /var/lib/reap/capture/%i/raw.jsonl --duration-secs ${REAP_CAPTURE_DURATION_SECS} --require-clean-capture
 Restart=no
 KillMode=control-group
 KillSignal=SIGTERM

@@ -900,6 +900,9 @@ Credential-free public market-data composition.
 Responsibilities:
 
 - Build explicit public-only subscription plans from TOML.
+- Provide one reviewed production-shaped public config with an absolute shared
+  connection pacer; systemd reuses its exact bytes and supplies unique
+  create-new raw/report paths for each capture instance.
 - Capture the stablecoin/index references required to reproduce live risk
   inputs alongside strategy market data.
 - Run redundant websocket connections through `reap-feed` supervision.

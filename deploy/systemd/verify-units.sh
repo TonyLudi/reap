@@ -7,6 +7,7 @@ export LC_ALL=C
 readonly MAXIMUM_EXPOSURE_THRESHOLD=40
 readonly INSTANCE=test_instance
 readonly SYSTEMD_TREE=/usr/lib/systemd
+readonly CAPTURE_CONFIG=deploy/capture/okx-btc-public.toml
 
 binary="${1:-target/release/reap}"
 
@@ -39,6 +40,7 @@ require_single_key() {
 command -v systemd-analyze >/dev/null || fail "systemd-analyze is unavailable"
 [[ -d "$SYSTEMD_TREE" ]] || fail "$SYSTEMD_TREE is unavailable"
 [[ -x "$binary" ]] || fail "release CLI is not executable at $binary"
+[[ -f "$CAPTURE_CONFIG" ]] || fail "missing $CAPTURE_CONFIG"
 
 units=(
   deploy/systemd/reap-observe@.service
@@ -135,7 +137,7 @@ require_single_key deploy/systemd/reap-capture@.service \
 require_single_key deploy/systemd/reap-capture@.service \
   EnvironmentFile '/etc/reap/capture/%i.env'
 require_single_key deploy/systemd/reap-capture@.service \
-  ExecStart '/usr/local/bin/reap capture --config /etc/reap/capture/%i.toml --output /var/lib/reap/capture/%i/run-report.json --duration-secs ${REAP_CAPTURE_DURATION_SECS} --require-clean-capture'
+  ExecStart '/usr/local/bin/reap capture --config /etc/reap/capture/okx-btc-public.toml --output /var/lib/reap/capture/%i/run-report.json --raw-path /var/lib/reap/capture/%i/raw.jsonl --duration-secs ${REAP_CAPTURE_DURATION_SECS} --require-clean-capture'
 require_single_key deploy/systemd/reap-capture@.service StartLimitBurst 2
 require_single_key deploy/systemd/reap-capture@.service \
   ReadWritePaths '/var/lib/reap/capture/%i /var/lib/reap/connectivity'
@@ -157,12 +159,11 @@ cp -a "$SYSTEMD_TREE" "$root/usr/lib/"
 install -m 0755 "$binary" "$root/usr/local/bin/reap"
 install -m 0644 docs/operations.md "$root/usr/local/share/doc/reap/operations.md"
 install -m 0644 "${units[@]}" "$root/etc/systemd/system/"
+install -m 0640 "$CAPTURE_CONFIG" "$root/etc/reap/capture/okx-btc-public.toml"
 printf '%s\n' '[venue]' 'environment = "demo"' \
   >"$root/etc/reap/live/$INSTANCE.toml"
 printf '%s\n' 'REAP_OKX_API_KEY=verification-placeholder' \
   >"$root/etc/reap/live/$INSTANCE.env"
-printf '%s\n' '[[subscriptions]]' 'channel = "books"' 'symbol = "BTC-USDT"' \
-  >"$root/etc/reap/capture/$INSTANCE.toml"
 printf '%s\n' 'REAP_CAPTURE_DURATION_SECS=86400' \
   >"$root/etc/reap/capture/$INSTANCE.env"
 

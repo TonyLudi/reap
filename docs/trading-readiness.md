@@ -233,9 +233,11 @@ production trading process.
     smoke fold validates plumbing with permissive uncalibrated gates and negative
     fee-adjusted PnL; it is not production evidence. Each dataset still resets
     independently to zero or its configured snapshot rather than carrying
-    Java's daily ending positions. No passing target-account certification has
-    been collected, and cross-file balance/average-cost/settlement carry remains
-    a production blocker.
+    Java's daily ending positions after Java's terminal mark-to-market,
+    balance/margin and derivative average-cost reset, and hold release. No
+    passing target-account certification has been collected, and cross-file
+    balance/average-cost/settlement carry plus no-event-gap capture handoff
+    remain production blockers.
 34. Backtest latency can now use bounded empirical samples for Java-mapped
     `market_depth`, `historical_trade`, `matching_new`, `matching_cancel`,
     `order_update`, and `order_fill` classes plus Rust `reference_data`, with

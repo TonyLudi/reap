@@ -96,9 +96,10 @@ architecture in [docs/architecture.md](docs/architecture.md).
 
 ## Step 9: Production Confidence
 
-- [x] Add credential-free redundant OKX public capture and direct raw-capture
-  replay/backtest through the live adapter, deduplication, sequence, and book
-  reducer path.
+- [x] Add credential-free redundant OKX public capture, a reusable
+  production-shaped absolute-path config with per-instance systemd outputs, and
+  direct raw-capture replay/backtest through the live adapter, deduplication,
+  sequence, and book reducer path.
 - [x] Make OKX book continuity predecessor-based and reset-aware; preserve
   no-change updates, deduplicate byte-identical images across sequence epochs,
   fail closed on conflicting replicas, and cover reset/recovery with raw replay
@@ -320,8 +321,10 @@ architecture in [docs/architecture.md](docs/architecture.md).
   fields in strategy state.
 - [ ] For split continuous sessions, carry and verify ending balances,
   derivative quantity, average cost, and settlement ledger into the next file,
-  matching Java `updateInputForNextRun`. Dataset sequences currently reset to
-  their independently certified opening snapshots.
+  matching Java `updateInputForNextRun` after its terminal mark-to-market,
+  balance/margin reset, derivative average-cost reset, and hold release. Dataset
+  sequences currently reset to independently certified opening snapshots, and
+  separate capture processes cannot yet prove a no-event-gap handoff.
 - [x] Independently bind the reconstructed deployment candidate's effective
   strategy hash to the exact proposed production live config, rejecting smoke,
   demo, invalid reconstruction, ambiguous provenance, and strategy drift.

@@ -139,6 +139,12 @@ cargo run -p reap-cli -- capture \
   --pretty
 ```
 
+For deployment, install the reusable
+`deploy/capture/okx-btc-public.toml` and use
+`deploy/systemd/reap-capture@.service`. The unit keeps those config bytes fixed
+and assigns create-new `raw.jsonl` and `run-report.json` paths from each unique
+instance name; see `deploy/systemd/README.md`.
+
 The one-hour command is an operational smoke, not funding-complete research
 evidence. Production datasets must be continuous across exchange funding
 boundaries. Schema-7 production research with swap candidates requires nonzero

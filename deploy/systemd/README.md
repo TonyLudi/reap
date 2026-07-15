@@ -18,14 +18,25 @@ Expected instance layout for an instance named `btc-demo`:
 /var/lib/reap/connectivity/        reap:reap 0750
 ```
 
-Capture run instance `btc-public-20260715T000000Z` uses
-`/etc/reap/capture/btc-public-20260715T000000Z.toml`, a matching `.env` containing
-only `REAP_CAPTURE_DURATION_SECS=<positive integer>`, and
-`/var/lib/reap/capture/btc-public-20260715T000000Z/`. Never put credentials in
-the capture environment file. Use absolute storage, operator-socket, and
-capture-output paths inside deployed TOML; each must remain under that
-instance's writable directory.
-Every deployed live and capture TOML must set
+Capture run instance `btc-public-20260715T000000Z` reuses the reviewed
+`/etc/reap/capture/okx-btc-public.toml`, has a matching `.env` containing only
+`REAP_CAPTURE_DURATION_SECS=<positive integer>`, and writes to a unique instance
+directory:
+
+```text
+/etc/reap/capture/okx-btc-public.toml                         root:reap 0640
+/etc/reap/capture/btc-public-20260715T000000Z.env             root:reap 0640
+/var/lib/reap/capture/btc-public-20260715T000000Z/raw.jsonl   reap:reap 0600
+/var/lib/reap/capture/btc-public-20260715T000000Z/run-report.json
+```
+
+Never put credentials in the capture environment file. Do not copy or edit the
+capture TOML per run: the unit overrides its placeholder raw path with the
+instance path and reserves both outputs with create-new semantics. This keeps
+the exact source-config bytes stable across datasets while each process receives
+a unique session and artifact boundary.
+
+Every deployed live TOML and the shared capture TOML must set
 `connection_attempt_pacer_path =
 "/var/lib/reap/connectivity/okx-global.pacer"`. `StateDirectory` creates that
 shared persistent directory, and each template exposes it through the otherwise
@@ -41,6 +52,8 @@ deploy/systemd/verify-units.sh target/release/reap
 sudo install -o root -g root -m 0755 target/release/reap /usr/local/bin/reap
 sudo install -d -o root -g root -m 0755 /usr/local/share/doc/reap
 sudo install -o root -g root -m 0644 docs/*.md /usr/local/share/doc/reap/
+sudo install -d -o root -g reap -m 0750 /etc/reap/capture
+sudo install -o root -g reap -m 0640 deploy/capture/okx-btc-public.toml /etc/reap/capture/
 sudo install -o root -g root -m 0644 deploy/systemd/*.service /etc/systemd/system/
 sudo systemd-analyze verify /etc/systemd/system/reap-*.service
 sudo systemctl daemon-reload
@@ -69,10 +82,11 @@ unit start limit. `demo` never restarts automatically: every abnormal exit needs
 exchange/account reconciliation and operator approval. `capture` also never
 restarts automatically. Its unit requires a positive duration, requests
 `--require-clean-capture`, and reserves `run-report.json` in the instance
-directory. Every process requires a fresh instance directory, config, raw path,
-report path, and session identity. Capture uses create-new file semantics and
-will fail before opening feed sockets if an output already exists; an early CLI
-failure can leave an empty reserved report that must not be reused.
+directory. Every process requires a fresh instance name and directory, raw path,
+report path, and session identity, but reuses the exact reviewed capture config.
+Capture uses create-new file semantics and will fail before opening feed sockets
+if an output already exists; an early CLI failure can leave an empty reserved
+report that must not be reused.
 
 Configure the host monitoring system to page on unit activation failure,
 non-zero exit, start-limit exhaustion, forced `SIGKILL`, and host clock/disk/

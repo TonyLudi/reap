@@ -31,6 +31,28 @@ The optional
 `output.normalized_path` is intended for short diagnostics because full
 400-level snapshots are much larger than raw deltas.
 
+`examples/capture-okx-public.toml` is runnable from the repository root.
+`deploy/capture/okx-btc-public.toml` is the production-shaped equivalent: it
+uses the absolute shared connection pacer and an absolute placeholder raw path.
+The systemd unit always overrides that placeholder with a unique instance path.
+For a direct deployment-host run, use the same reviewed file and explicit
+create-new outputs:
+
+```bash
+RUN_ID="btc-public-$(date -u +%Y%m%dT%H%M%SZ)"
+sudo install -d -o reap -g reap -m 0750 \
+  /var/lib/reap/connectivity "/var/lib/reap/capture/${RUN_ID}"
+sudo -u reap /usr/local/bin/reap capture \
+  --config /etc/reap/capture/okx-btc-public.toml \
+  --output "/var/lib/reap/capture/${RUN_ID}/run-report.json" \
+  --raw-path "/var/lib/reap/capture/${RUN_ID}/raw.jsonl" \
+  --duration-secs 86400 \
+  --require-clean-capture
+```
+
+This command remains credential-free. A new `RUN_ID` is mandatory for every
+attempt, including attempts that fail before websocket startup.
+
 For a production-candidate dataset, collect the opening boundary first while
 the account is quiescent, then start the public capture immediately:
 
@@ -1322,8 +1344,9 @@ must set `connection_attempt_pacer_path =
   independent exchange reconciliation and operator approval first.
 - `reap-capture@.service` never restarts automatically. Its instance environment
   contains only `REAP_CAPTURE_DURATION_SECS`; the command always requests a
-  bounded clean capture and create-new `run-report.json`. Use a new instance
-  directory, config, raw path, and report path for every run so no artifact can
+  bounded clean capture and create-new `raw.jsonl` and `run-report.json`. Every
+  instance reuses `/etc/reap/capture/okx-btc-public.toml`; use a new instance
+  name, environment file, and output directory for every run so no artifact can
   contain multiple capture session IDs or overwrite prior evidence.
 - Set `TimeoutStopSec` above the configured runtime shutdown plus alert-drain
   deadlines. A forced kill leaves the last exchange deadman in force but must be
@@ -1339,9 +1362,11 @@ position, and order websocket construction, but it does not define an external
 process supervisor. This policy wraps the Java-referenced connectivity and
 strategy behavior with Rust deployment controls rather than claiming parity.
 
-Use absolute storage, operator-socket, and capture paths below the instance's
+Use absolute live storage and operator-socket paths below the instance's
 writable directory in deployed TOML, plus the exact shared pacer path above.
-Config and environment files must be
+The capture unit supplies its absolute instance output paths on the command
+line; its checked-in TOML remains byte-identical between runs. Config and
+environment files must be
 readable only by root and the `reap` group; the environment file is populated by
 the deployment secret provider.
 

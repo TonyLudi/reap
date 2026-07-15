@@ -1429,6 +1429,42 @@ mod tests {
     }
 
     #[test]
+    fn deployment_config_is_absolute_redundant_and_matches_example() {
+        let mut deployment =
+            CaptureConfig::from_toml(include_str!("../../../deploy/capture/okx-btc-public.toml"))
+                .unwrap();
+        let local =
+            CaptureConfig::from_toml(include_str!("../../../examples/capture-okx-public.toml"))
+                .unwrap();
+
+        assert_eq!(
+            deployment.runtime.connection_attempt_pacer_path.as_deref(),
+            Some(Path::new("/var/lib/reap/connectivity/okx-global.pacer"))
+        );
+        assert!(deployment.output.raw_path.is_absolute());
+        assert!(
+            deployment
+                .subscriptions()
+                .iter()
+                .all(|subscription| !subscription.channel.is_private())
+        );
+        assert!(
+            deployment
+                .subscriptions()
+                .iter()
+                .all(|subscription| subscription.connections == 2)
+        );
+
+        deployment.runtime.connection_attempt_pacer_path =
+            local.runtime.connection_attempt_pacer_path.clone();
+        deployment.output.raw_path = local.output.raw_path.clone();
+        assert_eq!(
+            deployment.fingerprint().unwrap(),
+            local.fingerprint().unwrap()
+        );
+    }
+
+    #[test]
     fn config_rejects_private_duplicate_and_missing_book_subscriptions() {
         let config = CaptureConfig {
             venue: CaptureVenueConfig::default(),
