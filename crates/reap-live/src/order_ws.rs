@@ -10,7 +10,7 @@ use reap_order::{OkxOrderTransport, OrderTransportError, okx_order_dispatch_key}
 use reap_venue::okx::{
     OkxCancelOrder, OkxOrderAck, OkxPlaceOrder, OkxSigner, OkxWsOrderOperation, OkxWsOrderResult,
     build_okx_ws_cancel_order_request, build_okx_ws_place_order_request,
-    parse_okx_ws_order_response,
+    okx_capability_registration, parse_okx_ws_order_response,
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -124,6 +124,8 @@ pub(crate) fn spawn_okx_order_ws(
     OkxOrderWsRuntime,
     mpsc::Receiver<OkxOrderWsStatus>,
 ) {
+    let _connection_capability = okx_capability_registration("OKX-CONNECTION-ORDER-COMMAND")
+        .expect("order command connection must remain in the OKX capability registry");
     assert!(config.session_count > 0, "validated session count");
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (session_status_tx, session_status_rx) = mpsc::channel(config.session_count.max(1) * 4);

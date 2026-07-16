@@ -5130,6 +5130,12 @@ mod tests {
             all_intents.push(intents);
         }
 
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/normalized/chaos_quote_hedge_intents.json"
+        ))
+        .unwrap();
+        assert_eq!(serde_json::to_value(&all_intents).unwrap(), expected);
+
         assert!(all_intents[1].iter().any(
             |intent| matches!(intent, OrderIntent::NewOrder(order) if order.reason == "quote")
         ));

@@ -8,6 +8,8 @@ use serde::Serialize;
 use sha2::Sha256;
 use thiserror::Error;
 
+use super::capabilities::WS_LOGIN;
+
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone)]
@@ -186,7 +188,7 @@ impl OkxSigner {
 
         let sign = self.signature(timestamp_seconds, HttpMethod::Get, "/users/self/verify", "")?;
         Ok(serde_json::to_string(&Login {
-            op: "login",
+            op: WS_LOGIN.endpoint_or_channel,
             args: [LoginArg {
                 api_key: self.credentials.api_key(),
                 passphrase: self.credentials.passphrase(),

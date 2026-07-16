@@ -24,7 +24,10 @@ use reap_telemetry::{
     HostGuardRuntime, HostGuardStats, HostHealthError, check_host_health,
     current_executable_sha256, host_identity_sha256, start_host_guard,
 };
-use reap_venue::{VenueAdapter, VenueError, okx::OkxAdapter};
+use reap_venue::{
+    VenueAdapter, VenueError,
+    okx::{OkxAdapter, okx_capability_registration, okx_public_channel_registration},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -627,6 +630,8 @@ impl CaptureConfig {
     }
 
     fn socket_plans(&self) -> Result<Vec<SocketPlan>, CaptureError> {
+        let _connection_capability = okx_capability_registration("OKX-CONNECTION-CAPTURE-PUBLIC")
+            .expect("capture public connection must remain in the OKX capability registry");
         Ok(partition_subscriptions(
             &self.subscriptions(),
             self.runtime.max_subscriptions_per_socket,
@@ -644,7 +649,9 @@ impl CaptureConfig {
 
 impl CaptureSubscriptionConfig {
     fn subscription(&self) -> Subscription {
-        let channel = match self.channel.trim() {
+        let registration = okx_public_channel_registration(self.channel.trim())
+            .expect("validated capture channel must remain registered");
+        let channel = match registration.endpoint_or_channel {
             "books" => Channel::Books,
             "trades" => Channel::Trades,
             channel => Channel::Custom(channel.to_string()),
@@ -661,18 +668,11 @@ impl CaptureSubscriptionConfig {
 }
 
 fn supported_public_channel(channel: &str) -> bool {
-    matches!(
-        channel,
-        "books"
-            | "books-l2-tbt"
-            | "books50-l2-tbt"
-            | "trades"
-            | "trades-all"
-            | "funding-rate"
-            | "index-tickers"
-            | "price-limit"
-            | "mark-price"
-    )
+    okx_public_channel_registration(channel).is_some_and(|capability| {
+        capability
+            .requirement_ids
+            .contains(&"CAPTURE-PUBLIC-MARKET")
+    })
 }
 
 fn is_book_channel(channel: &str) -> bool {

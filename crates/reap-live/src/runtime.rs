@@ -36,6 +36,7 @@ use reap_venue::okx::{
     OKX_MIN_TRADE_FEE_REQUEST_INTERVAL_MS, OkxAdapter, OkxInstrument, OkxInstrumentType,
     OkxRestClient, OkxSigner, OkxSystemEnvironment, OkxSystemServiceType, OkxSystemStatus,
     OkxSystemStatusState, OkxTradeFeeRate, ReqwestTransport, RestError,
+    okx_capability_registration,
 };
 use reap_venue::{PrivateOrderState, PrivateOrderUpdate, RemoteFill, RemoteOrder, VenueAdapter};
 use serde::{Deserialize, Serialize};
@@ -1257,6 +1258,8 @@ fn exchange_status_block_reason(
     now_ms: u64,
     lead_ms: u64,
 ) -> Option<String> {
+    let _maintenance_capability = okx_capability_registration("OKX-MAINTENANCE-FILTER")
+        .expect("maintenance filter must remain in the OKX capability registry");
     let expected_environment = match environment {
         TradingEnvironment::Demo => OkxSystemEnvironment::Demo,
         TradingEnvironment::Production => OkxSystemEnvironment::Production,
@@ -1873,6 +1876,8 @@ impl LiveRuntime {
             &config.venue.public_ws_url,
             &config.venue.private_ws_url,
         ));
+        let _public_connection_capability = okx_capability_registration("OKX-CONNECTION-PUBLIC")
+            .expect("live public connection must remain in the OKX capability registry");
         let mut public_feed = spawn_supervised_feed(
             Arc::clone(&public_adapter),
             public_plans.clone(),
@@ -1948,6 +1953,9 @@ impl LiveRuntime {
                 OkxAdapter::new(&config.venue.public_ws_url, &config.venue.private_ws_url)
                     .with_account_id(&account_id),
             );
+            let _private_connection_capability =
+                okx_capability_registration("OKX-CONNECTION-PRIVATE-STATE")
+                    .expect("private state connection must remain in the OKX capability registry");
             let mut private_feed = spawn_supervised_feed(
                 Arc::clone(&private_adapter),
                 private_plans.clone(),
@@ -4996,7 +5004,7 @@ fn public_subscriptions(config: &LiveConfig) -> Vec<Subscription> {
         push_public_subscription(
             &mut subscriptions,
             &mut seen,
-            Channel::Custom("index-tickers".to_string()),
+            Channel::Custom(okx_reference_channel(ReferenceDataKind::IndexPrice).to_string()),
             &guard.symbol,
             FeedPriority::Critical,
             config.runtime.public_connections_per_subscription,
@@ -5034,12 +5042,15 @@ fn public_subscriptions(config: &LiveConfig) -> Vec<Subscription> {
 }
 
 fn okx_reference_channel(kind: ReferenceDataKind) -> &'static str {
-    match kind {
-        ReferenceDataKind::IndexPrice => "index-tickers",
-        ReferenceDataKind::FundingRate => "funding-rate",
-        ReferenceDataKind::MarkPrice => "mark-price",
-        ReferenceDataKind::PriceLimits => "price-limit",
-    }
+    let capability_id = match kind {
+        ReferenceDataKind::IndexPrice => "OKX-WS-INDEX-TICKERS",
+        ReferenceDataKind::FundingRate => "OKX-WS-FUNDING-RATE",
+        ReferenceDataKind::MarkPrice => "OKX-WS-MARK-PRICE",
+        ReferenceDataKind::PriceLimits => "OKX-WS-PRICE-LIMIT",
+    };
+    okx_capability_registration(capability_id)
+        .expect("strategy reference channel must remain in the OKX capability registry")
+        .endpoint_or_channel
 }
 
 fn push_public_subscription(

@@ -1,11 +1,12 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::capabilities::{WS_CANCEL_REGULAR, WS_PLACE_REGULAR};
 use super::rest::{serialize_cancel_order, serialize_place_order};
 use super::{OkxCancelOrder, OkxOrderAck, OkxPlaceOrder};
 
-pub const OKX_WS_PLACE_ORDER_OP: &str = "order";
-pub const OKX_WS_CANCEL_ORDER_OP: &str = "cancel-order";
+pub const OKX_WS_PLACE_ORDER_OP: &str = WS_PLACE_REGULAR.endpoint_or_channel;
+pub const OKX_WS_CANCEL_ORDER_OP: &str = WS_CANCEL_REGULAR.endpoint_or_channel;
 const MAX_REQUEST_ID_BYTES: usize = 32;
 
 #[derive(Debug, Error)]

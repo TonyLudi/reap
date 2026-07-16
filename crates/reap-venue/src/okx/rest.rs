@@ -13,27 +13,33 @@ use url::form_urlencoded;
 
 use crate::{PrivateOrderState, RemoteFill, RemoteOrder};
 
+use super::capabilities::{
+    REST_ACCOUNT_BALANCE, REST_ACCOUNT_BILLS, REST_ACCOUNT_CONFIG, REST_ACCOUNT_INSTRUMENTS,
+    REST_ACCOUNT_POSITIONS, REST_ACCOUNT_TRADE_FEE, REST_CANCEL_BATCH_REGULAR, REST_CANCEL_REGULAR,
+    REST_FILLS, REST_INDEX_TICKER, REST_ORDER_DETAILS, REST_PLACE_REGULAR, REST_PUBLIC_TIME,
+    REST_REGULAR_CAA, REST_REGULAR_PENDING, REST_SYSTEM_STATUS,
+};
 use super::{AuthError, HttpMethod, OkxSigner, SignedRequest};
 
 mod pending_orders;
 pub use pending_orders::*;
 
-const PLACE_ORDER_PATH: &str = "/api/v5/trade/order";
-const CANCEL_ORDER_PATH: &str = "/api/v5/trade/cancel-order";
-const CANCEL_BATCH_ORDERS_PATH: &str = "/api/v5/trade/cancel-batch-orders";
-const CANCEL_ALL_AFTER_PATH: &str = "/api/v5/trade/cancel-all-after";
-const PUBLIC_TIME_PATH: &str = "/api/v5/public/time";
-const MARKET_INDEX_TICKERS_PATH: &str = "/api/v5/market/index-tickers";
-const SYSTEM_STATUS_PATH: &str = "/api/v5/system/status";
-const OPEN_ORDERS_PATH: &str = "/api/v5/trade/orders-pending";
-const FILLS_PATH: &str = "/api/v5/trade/fills";
-const ORDER_DETAILS_PATH: &str = "/api/v5/trade/order";
-const ACCOUNT_INSTRUMENTS_PATH: &str = "/api/v5/account/instruments";
-const ACCOUNT_TRADE_FEE_PATH: &str = "/api/v5/account/trade-fee";
-const ACCOUNT_CONFIG_PATH: &str = "/api/v5/account/config";
-const ACCOUNT_BALANCE_PATH: &str = "/api/v5/account/balance";
-const ACCOUNT_POSITIONS_PATH: &str = "/api/v5/account/positions";
-const ACCOUNT_BILLS_PATH: &str = "/api/v5/account/bills";
+const PLACE_ORDER_PATH: &str = REST_PLACE_REGULAR.endpoint_or_channel;
+const CANCEL_ORDER_PATH: &str = REST_CANCEL_REGULAR.endpoint_or_channel;
+const CANCEL_BATCH_ORDERS_PATH: &str = REST_CANCEL_BATCH_REGULAR.endpoint_or_channel;
+const CANCEL_ALL_AFTER_PATH: &str = REST_REGULAR_CAA.endpoint_or_channel;
+const PUBLIC_TIME_PATH: &str = REST_PUBLIC_TIME.endpoint_or_channel;
+const MARKET_INDEX_TICKERS_PATH: &str = REST_INDEX_TICKER.endpoint_or_channel;
+const SYSTEM_STATUS_PATH: &str = REST_SYSTEM_STATUS.endpoint_or_channel;
+const OPEN_ORDERS_PATH: &str = REST_REGULAR_PENDING.endpoint_or_channel;
+const FILLS_PATH: &str = REST_FILLS.endpoint_or_channel;
+const ORDER_DETAILS_PATH: &str = REST_ORDER_DETAILS.endpoint_or_channel;
+const ACCOUNT_INSTRUMENTS_PATH: &str = REST_ACCOUNT_INSTRUMENTS.endpoint_or_channel;
+const ACCOUNT_TRADE_FEE_PATH: &str = REST_ACCOUNT_TRADE_FEE.endpoint_or_channel;
+const ACCOUNT_CONFIG_PATH: &str = REST_ACCOUNT_CONFIG.endpoint_or_channel;
+const ACCOUNT_BALANCE_PATH: &str = REST_ACCOUNT_BALANCE.endpoint_or_channel;
+const ACCOUNT_POSITIONS_PATH: &str = REST_ACCOUNT_POSITIONS.endpoint_or_channel;
+const ACCOUNT_BILLS_PATH: &str = REST_ACCOUNT_BILLS.endpoint_or_channel;
 pub const OKX_FILLS_PAGE_LIMIT: usize = 100;
 pub const OKX_BILLS_PAGE_LIMIT: usize = 100;
 pub const OKX_MIN_ACCOUNT_INSTRUMENT_REQUEST_INTERVAL_MS: u64 = 100;

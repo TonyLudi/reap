@@ -10,11 +10,16 @@ use super::{
     validate_optional_text, validate_required_text,
 };
 
-const ALGO_ORDERS_PATH: &str = "/api/v5/trade/orders-algo-pending";
-const CANCEL_ALGO_ORDERS_PATH: &str = "/api/v5/trade/cancel-algos";
-const SPREAD_ORDERS_PATH: &str = "/api/v5/sprd/orders-pending";
-const SPREAD_MASS_CANCEL_PATH: &str = "/api/v5/sprd/mass-cancel";
-const SPREAD_CANCEL_ALL_AFTER_PATH: &str = "/api/v5/sprd/cancel-all-after";
+use super::super::capabilities::{
+    REST_ALGO_PENDING, REST_CANCEL_ALGO, REST_SPREAD_CAA, REST_SPREAD_MASS_CANCEL,
+    REST_SPREAD_PENDING,
+};
+
+const ALGO_ORDERS_PATH: &str = REST_ALGO_PENDING.endpoint_or_channel;
+const CANCEL_ALGO_ORDERS_PATH: &str = REST_CANCEL_ALGO.endpoint_or_channel;
+const SPREAD_ORDERS_PATH: &str = REST_SPREAD_PENDING.endpoint_or_channel;
+const SPREAD_MASS_CANCEL_PATH: &str = REST_SPREAD_MASS_CANCEL.endpoint_or_channel;
+const SPREAD_CANCEL_ALL_AFTER_PATH: &str = REST_SPREAD_CAA.endpoint_or_channel;
 
 pub const OKX_PENDING_ORDER_PAGE_LIMIT: usize = 100;
 pub const OKX_ALGO_CANCEL_BATCH_LIMIT: usize = 10;

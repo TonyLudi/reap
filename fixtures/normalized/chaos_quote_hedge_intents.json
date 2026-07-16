@@ -1,0 +1,104 @@
+[
+  [],
+  [
+    {
+      "NewOrder": {
+        "symbol": "BTC-PERP",
+        "side": "buy",
+        "qty": 99.0,
+        "price": 49949.9,
+        "time_in_force": "post_only",
+        "reduce_only": false,
+        "self_trade_prevention": null,
+        "reason": "quote"
+      }
+    },
+    {
+      "NewOrder": {
+        "symbol": "BTC-PERP",
+        "side": "sell",
+        "qty": 99.0,
+        "price": 50051.200000000004,
+        "time_in_force": "post_only",
+        "reduce_only": false,
+        "self_trade_prevention": null,
+        "reason": "quote"
+      }
+    },
+    {
+      "NewOrder": {
+        "symbol": "BTC-USDT",
+        "side": "buy",
+        "qty": 0.0999,
+        "price": 49952.9,
+        "time_in_force": "post_only",
+        "reduce_only": false,
+        "self_trade_prevention": null,
+        "reason": "quote"
+      }
+    },
+    {
+      "NewOrder": {
+        "symbol": "BTC-USDT",
+        "side": "sell",
+        "qty": 0.0999,
+        "price": 50054.200000000004,
+        "time_in_force": "post_only",
+        "reduce_only": false,
+        "self_trade_prevention": null,
+        "reason": "quote"
+      }
+    }
+  ],
+  [],
+  [
+    {
+      "NewOrder": {
+        "symbol": "BTC-PERP",
+        "side": "buy",
+        "qty": 99.0,
+        "price": 49949.9,
+        "time_in_force": "post_only",
+        "reduce_only": false,
+        "self_trade_prevention": null,
+        "reason": "quote"
+      }
+    },
+    {
+      "NewOrder": {
+        "symbol": "BTC-PERP",
+        "side": "sell",
+        "qty": 99.0,
+        "price": 50051.200000000004,
+        "time_in_force": "post_only",
+        "reduce_only": false,
+        "self_trade_prevention": null,
+        "reason": "quote"
+      }
+    },
+    {
+      "NewOrder": {
+        "symbol": "BTC-USDT",
+        "side": "sell",
+        "qty": 0.0999,
+        "price": 50054.200000000004,
+        "time_in_force": "post_only",
+        "reduce_only": false,
+        "self_trade_prevention": null,
+        "reason": "quote"
+      }
+    },
+    {
+      "NewOrder": {
+        "symbol": "BTC-PERP",
+        "side": "sell",
+        "qty": 100.0,
+        "price": 49993.0,
+        "time_in_force": "ioc",
+        "reduce_only": false,
+        "self_trade_prevention": "cancel_maker",
+        "reason": "hedge:BTC-USDT:50003"
+      }
+    }
+  ]
+]

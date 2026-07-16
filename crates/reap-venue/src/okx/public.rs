@@ -6,6 +6,11 @@ use reap_core::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::capabilities::{
+    WS_ACCOUNT, WS_BOOKS, WS_FILLS, WS_FUNDING_RATE, WS_INDEX_TICKERS, WS_MARK_PRICE, WS_ORDERS,
+    WS_POSITIONS, WS_PRICE_LIMIT, WS_SUBSCRIBE, WS_TRADES,
+};
+
 use crate::{
     ParsedEvent, PrivateOrderState, PrivateOrderUpdate, RemoteFill, VenueAdapter, VenueError,
     VenueEvent,
@@ -540,18 +545,35 @@ impl VenueAdapter for OkxAdapter {
         }
         let arg = arg.ok_or_else(|| Self::invalid("push message has no arg"))?;
         match arg.channel.as_str() {
-            "books" | "books-l2-tbt" | "books50-l2-tbt" => {
+            channel if channel == WS_BOOKS.endpoint_or_channel => {
                 self.parse_book(envelope, action.as_deref(), data, &arg)
             }
-            "trades" | "trades-all" => self.parse_trades(envelope, data, &arg),
-            "funding-rate" => self.parse_funding_rates(envelope, data, &arg),
-            "index-tickers" => self.parse_index_tickers(envelope, data, &arg),
-            "price-limit" => self.parse_price_limits(envelope, data, &arg),
-            "mark-price" => self.parse_mark_prices(envelope, data, &arg),
-            "orders" => self.parse_orders(envelope, data),
-            "fills" => self.parse_fills(envelope, data),
-            "account" => self.parse_account(envelope, data),
-            "positions" => self.parse_positions(data),
+            "books-l2-tbt" | "books50-l2-tbt" => {
+                self.parse_book(envelope, action.as_deref(), data, &arg)
+            }
+            channel if channel == WS_TRADES.endpoint_or_channel || channel == "trades-all" => {
+                self.parse_trades(envelope, data, &arg)
+            }
+            channel if channel == WS_FUNDING_RATE.endpoint_or_channel => {
+                self.parse_funding_rates(envelope, data, &arg)
+            }
+            channel if channel == WS_INDEX_TICKERS.endpoint_or_channel => {
+                self.parse_index_tickers(envelope, data, &arg)
+            }
+            channel if channel == WS_PRICE_LIMIT.endpoint_or_channel => {
+                self.parse_price_limits(envelope, data, &arg)
+            }
+            channel if channel == WS_MARK_PRICE.endpoint_or_channel => {
+                self.parse_mark_prices(envelope, data, &arg)
+            }
+            channel if channel == WS_ORDERS.endpoint_or_channel => {
+                self.parse_orders(envelope, data)
+            }
+            channel if channel == WS_FILLS.endpoint_or_channel => self.parse_fills(envelope, data),
+            channel if channel == WS_ACCOUNT.endpoint_or_channel => {
+                self.parse_account(envelope, data)
+            }
+            channel if channel == WS_POSITIONS.endpoint_or_channel => self.parse_positions(data),
             channel => Err(VenueError::UnsupportedChannel {
                 venue: Venue::Okx,
                 channel: channel.to_string(),
@@ -578,12 +600,12 @@ impl VenueAdapter for OkxAdapter {
                     return Err(Self::invalid("non-OKX subscription passed to OKX adapter"));
                 }
                 let channel = match subscription.channel {
-                    Channel::Books => "books",
-                    Channel::Trades => "trades",
-                    Channel::Orders => "orders",
-                    Channel::Fills => "fills",
-                    Channel::Account => "account",
-                    Channel::Positions => "positions",
+                    Channel::Books => WS_BOOKS.endpoint_or_channel,
+                    Channel::Trades => WS_TRADES.endpoint_or_channel,
+                    Channel::Orders => WS_ORDERS.endpoint_or_channel,
+                    Channel::Fills => WS_FILLS.endpoint_or_channel,
+                    Channel::Account => WS_ACCOUNT.endpoint_or_channel,
+                    Channel::Positions => WS_POSITIONS.endpoint_or_channel,
                     Channel::Custom(ref channel) => channel,
                 };
                 let mut arg = json!({ "channel": channel });
@@ -596,7 +618,7 @@ impl VenueAdapter for OkxAdapter {
             })
             .collect::<Result<Vec<_>, VenueError>>()?;
         Ok(serde_json::to_string(
-            &json!({ "op": "subscribe", "args": args }),
+            &json!({ "op": WS_SUBSCRIBE.endpoint_or_channel, "args": args }),
         )?)
     }
 }
