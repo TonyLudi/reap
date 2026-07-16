@@ -425,7 +425,7 @@ Responsibilities:
   and own an independently scheduled exchange deadman lifecycle per account.
 - Expose a separate minimal-config emergency composition that bypasses strategy,
   journal, websocket, and operator dependencies while cancelling and verifying
-  the venue's regular order book account-wide.
+  the regular, algo, and spread pending-order domains account-wide.
 
 Implemented topology:
 
@@ -574,18 +574,20 @@ local-only risk semantics.
 
 The emergency composition is intentionally not part of the strategy loop. It
 uses its own REST transport, exchange-adjusted signing clock, absolute
-per-account deadline, deadman arm, bounded request pacing, batch cancellation,
-and repeated account-wide pending-order queries. This separation keeps the kill
-path usable after live-process or strategy-state failure. OKX algo and spread
-orders are outside this regular-order scope and remain an operationally explicit
-venue procedure. Its optional CLI evidence path is reserved before config or
-network work and fsynced before exit. The schema-versioned report hashes the
+per-account deadline, separate regular/spread deadman arms, bounded request
+pacing, regular/algo batch cancellation, spread mass cancel, and strict repeated
+pagination of all three pending-order domains. This separation keeps the kill
+path usable after live-process or strategy-state failure. Its optional CLI
+evidence path is reserved before config or network work and fsynced before exit.
+The schema-versioned report hashes the
 exact input file without invoking the live parser, uses the same executable and
 host identity hashes as live evidence, samples the same pseudonymous OKX
 UID/main-UID account identity only after zero is proven, records the pinned Java
 revision, and converts account-task join failures into bounded evidence.
-`all_clear` requires both account-complete regular-order zero proof and complete
-provenance; an early parse/validation failure leaves only an empty reserved path.
+`all_clear` requires regular, algo, spread, and aggregate account-wide zero plus
+complete provenance; an early parse/validation failure leaves only an empty
+reserved path. OKX documents no algo-order CAA, so this boundary requires the
+explicit producer-stop confirmation before it cancels and polls algo orders.
 
 The deadman-certification composition is also outside the strategy loop but has
 the opposite authority boundary from emergency cancellation: it uses only
@@ -1521,11 +1523,12 @@ the deployment blocker.
   All After heartbeats, and durable restart latches. Done.
 - Add exclusive journal ownership, bounded external alerts, and host resource
   preflight/periodic guards. Done; target-host deployment evidence remains.
-- Add strategy-independent account-wide regular-order cancellation and hardened
-  mode-specific process supervision templates. Done; exact config/report bytes
-  and all-configured-account zero invariants are independently verifiable.
-  Target-host/account fault exercise, raw REST-response replay, and separate
-  algo/spread handling remain.
+- Add strategy-independent account-wide regular/algo/spread cancellation and
+  hardened mode-specific process supervision templates. Done; exact
+  config/report bytes and all-configured-account, per-domain zero invariants are
+  independently verifiable. Target-host/account fault exercise and raw
+  REST-response replay remain; algo safety has no documented venue deadman and
+  therefore also requires the external producer-stop attestation.
 - Add independently routed demo fault injection with durable typed evidence.
   Done. Execute and accept the credentialed target-host campaign and OKX demo
   soak; tooling alone does not close that gate.

@@ -12,8 +12,10 @@ use reap_core::PINNED_JAVA_REVISION;
 use reap_order::{PacingPolicy, RequestKind, RequestPacer};
 use reap_venue::RemoteOrder;
 use reap_venue::okx::{
-    HttpTransport, OkxCancelOrder, OkxCancelOrderResult, OkxCredentials, OkxRestClient, OkxSigner,
-    ReqwestTransport, RestError, format_okx_timestamp_ms,
+    HttpTransport, OKX_ALGO_CANCEL_BATCH_LIMIT, OkxAlgoCancelResult, OkxAlgoOrder,
+    OkxAlgoOrderPagination, OkxAlgoOrderQuery, OkxCancelAlgoOrder, OkxCancelOrder,
+    OkxCancelOrderResult, OkxCredentials, OkxRegularOrderPagination, OkxRestClient, OkxSigner,
+    OkxSpreadOrder, OkxSpreadOrderPagination, ReqwestTransport, RestError, format_okx_timestamp_ms,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -22,9 +24,9 @@ use tokio::task::JoinSet;
 pub(crate) const MAX_INCIDENTS: usize = 64;
 pub(crate) const MAX_INCIDENT_MESSAGE_BYTES: usize = 4_096;
 pub(crate) const MAX_REMAINING_ORDER_DETAILS: usize = 100;
-pub(crate) const REGULAR_ORDER_SCOPE: &str = "okx_regular_orders";
-pub(crate) const EXCLUDED_ORDER_CLASSES: [&str; 2] = ["algo_orders", "spread_orders"];
-pub const EMERGENCY_CANCEL_REPORT_SCHEMA_VERSION: u32 = 1;
+pub(crate) const ACCOUNT_WIDE_ORDER_SCOPE: &str = "okx_regular_algo_spread_orders";
+pub(crate) const EXCLUDED_ORDER_CLASSES: [&str; 0] = [];
+pub const EMERGENCY_CANCEL_REPORT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct EmergencyCancelOptions {
@@ -61,6 +63,22 @@ pub struct EmergencyOrderRef {
     pub client_order_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmergencyAlgoOrderRef {
+    pub symbol: String,
+    pub algo_id: String,
+    pub client_order_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmergencySpreadOrderRef {
+    pub spread_id: String,
+    pub exchange_order_id: String,
+    pub client_order_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmergencyAccountReport {
@@ -69,19 +87,37 @@ pub struct EmergencyAccountReport {
     pub exchange_clock_sampled: bool,
     pub exchange_clock_skew_ms: Option<u64>,
     pub deadman_armed: bool,
+    pub spread_deadman_armed: bool,
     pub enumeration_attempts: u64,
     pub enumeration_failures: u64,
     pub initial_open_orders: Option<usize>,
+    pub initial_algo_orders: Option<usize>,
+    pub initial_spread_orders: Option<usize>,
     pub unique_orders_seen: usize,
+    pub unique_algo_orders_seen: usize,
+    pub unique_spread_orders_seen: usize,
     pub cancel_batches: u64,
     pub cancel_batch_failures: u64,
     pub accepted_cancel_requests: u64,
     pub rejected_cancel_requests: u64,
     pub unacknowledged_cancel_requests: u64,
+    pub algo_cancel_batches: u64,
+    pub algo_cancel_batch_failures: u64,
+    pub accepted_algo_cancel_requests: u64,
+    pub rejected_algo_cancel_requests: u64,
+    pub unacknowledged_algo_cancel_requests: u64,
+    pub spread_mass_cancel_attempts: u64,
+    pub spread_mass_cancel_failures: u64,
     pub verified_zero_after_deadman: bool,
+    pub verified_algo_zero_after_deadman: bool,
+    pub verified_spread_zero_after_deadman: bool,
     pub final_open_orders: Option<usize>,
+    pub final_algo_orders: Option<usize>,
+    pub final_spread_orders: Option<usize>,
     pub unmanaged_symbols: Vec<String>,
     pub remaining_orders: Vec<EmergencyOrderRef>,
+    pub remaining_algo_orders: Vec<EmergencyAlgoOrderRef>,
+    pub remaining_spread_orders: Vec<EmergencySpreadOrderRef>,
     pub incident_count: u64,
     pub incidents: Vec<String>,
     pub elapsed_ms: u64,
@@ -96,19 +132,37 @@ impl EmergencyAccountReport {
             exchange_clock_sampled: false,
             exchange_clock_skew_ms: None,
             deadman_armed: false,
+            spread_deadman_armed: false,
             enumeration_attempts: 0,
             enumeration_failures: 0,
             initial_open_orders: None,
+            initial_algo_orders: None,
+            initial_spread_orders: None,
             unique_orders_seen: 0,
+            unique_algo_orders_seen: 0,
+            unique_spread_orders_seen: 0,
             cancel_batches: 0,
             cancel_batch_failures: 0,
             accepted_cancel_requests: 0,
             rejected_cancel_requests: 0,
             unacknowledged_cancel_requests: 0,
+            algo_cancel_batches: 0,
+            algo_cancel_batch_failures: 0,
+            accepted_algo_cancel_requests: 0,
+            rejected_algo_cancel_requests: 0,
+            unacknowledged_algo_cancel_requests: 0,
+            spread_mass_cancel_attempts: 0,
+            spread_mass_cancel_failures: 0,
             verified_zero_after_deadman: false,
+            verified_algo_zero_after_deadman: false,
+            verified_spread_zero_after_deadman: false,
             final_open_orders: None,
+            final_algo_orders: None,
+            final_spread_orders: None,
             unmanaged_symbols: Vec::new(),
             remaining_orders: Vec::new(),
+            remaining_algo_orders: Vec::new(),
+            remaining_spread_orders: Vec::new(),
             incident_count: 0,
             incidents: Vec::new(),
             elapsed_ms: 0,
@@ -157,6 +211,9 @@ pub struct EmergencyCancelReport {
     pub execution_incident_count: u64,
     pub execution_incidents: Vec<String>,
     pub regular_orders_all_clear: bool,
+    pub algo_orders_all_clear: bool,
+    pub spread_orders_all_clear: bool,
+    pub account_wide_orders_all_clear: bool,
     pub evidence_complete: bool,
     pub all_clear: bool,
 }
@@ -186,6 +243,9 @@ struct EmergencyProvenance {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EmergencyCompletion {
     regular_orders_all_clear: bool,
+    algo_orders_all_clear: bool,
+    spread_orders_all_clear: bool,
+    account_wide_orders_all_clear: bool,
     evidence_complete: bool,
     all_clear: bool,
 }
@@ -262,6 +322,7 @@ struct EmergencyRuntimeConfig {
     rest_connect_timeout_ms: u64,
     rest_request_timeout_ms: u64,
     max_exchange_clock_skew_ms: u64,
+    max_order_reconciliation_pages: usize,
     cancel_requests_per_window: usize,
     reconcile_requests_per_window: usize,
     request_window_ms: u64,
@@ -274,6 +335,7 @@ impl Default for EmergencyRuntimeConfig {
             rest_connect_timeout_ms: runtime.rest_connect_timeout_ms,
             rest_request_timeout_ms: runtime.rest_request_timeout_ms,
             max_exchange_clock_skew_ms: runtime.max_exchange_clock_skew_ms,
+            max_order_reconciliation_pages: runtime.max_order_reconciliation_pages,
             cancel_requests_per_window: runtime.cancel_requests_per_window,
             reconcile_requests_per_window: runtime.reconcile_requests_per_window,
             request_window_ms: runtime.request_window_ms,
@@ -285,9 +347,12 @@ impl EmergencyRuntimeConfig {
     fn pacing_policy(&self) -> PacingPolicy {
         PacingPolicy {
             submit_requests: 1,
-            cancel_requests: self.cancel_requests_per_window,
-            reconcile_requests: self.reconcile_requests_per_window,
-            window: Duration::from_millis(self.request_window_ms),
+            // Algo cancellation is limited by order count, and spread reads
+            // have the strictest pending-order endpoint rate. Keep OKX's
+            // two-second rate window even if the general runtime is looser.
+            cancel_requests: self.cancel_requests_per_window.min(20),
+            reconcile_requests: self.reconcile_requests_per_window.min(10),
+            window: Duration::from_millis(self.request_window_ms.max(2_000)),
         }
     }
 }
@@ -333,6 +398,20 @@ struct AccountCancelSettings {
     pacing_policy: PacingPolicy,
     max_exchange_clock_skew_ms: u64,
     deadman_timeout_secs: u64,
+    max_order_reconciliation_pages: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AccountPendingOrders {
+    regular: Vec<RemoteOrder>,
+    algo: Vec<OkxAlgoOrder>,
+    spread: Vec<OkxSpreadOrder>,
+}
+
+impl AccountPendingOrders {
+    fn is_empty(&self) -> bool {
+        self.regular.is_empty() && self.algo.is_empty() && self.spread.is_empty()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -388,6 +467,7 @@ async fn run_emergency_cancel(
         pacing_policy: config.runtime.pacing_policy(),
         max_exchange_clock_skew_ms: config.runtime.max_exchange_clock_skew_ms,
         deadman_timeout_secs: options.deadman_timeout_secs,
+        max_order_reconciliation_pages: config.runtime.max_order_reconciliation_pages,
     };
     let mut selected_accounts = selected
         .iter()
@@ -459,7 +539,7 @@ async fn run_emergency_cancel(
         provenance_incident_count,
         provenance_incidents: provenance.incidents,
         environment: config.venue.environment,
-        scope: REGULAR_ORDER_SCOPE.to_string(),
+        scope: ACCOUNT_WIDE_ORDER_SCOPE.to_string(),
         excluded_order_classes: EXCLUDED_ORDER_CLASSES
             .into_iter()
             .map(str::to_string)
@@ -474,6 +554,9 @@ async fn run_emergency_cancel(
         execution_incident_count,
         execution_incidents,
         regular_orders_all_clear: completion.regular_orders_all_clear,
+        algo_orders_all_clear: completion.algo_orders_all_clear,
+        spread_orders_all_clear: completion.spread_orders_all_clear,
+        account_wide_orders_all_clear: completion.account_wide_orders_all_clear,
         evidence_complete: completion.evidence_complete,
         all_clear: completion.all_clear,
     })
@@ -496,6 +579,22 @@ fn emergency_completion(
     let account_coverage_complete = reported_accounts == selected_accounts;
     let regular_orders_all_clear = account_coverage_complete
         && !reports.is_empty()
+        && reports
+            .iter()
+            .all(|report| report.deadman_armed && report.verified_zero_after_deadman);
+    let algo_orders_all_clear = account_coverage_complete
+        && !reports.is_empty()
+        && reports
+            .iter()
+            .all(|report| report.verified_algo_zero_after_deadman);
+    let spread_orders_all_clear = account_coverage_complete
+        && !reports.is_empty()
+        && reports
+            .iter()
+            .all(|report| report.spread_deadman_armed && report.verified_spread_zero_after_deadman);
+    let account_wide_orders_all_clear = regular_orders_all_clear
+        && algo_orders_all_clear
+        && spread_orders_all_clear
         && reports.iter().all(|report| report.all_clear);
     let evidence_complete = provenance.incidents.is_empty()
         && is_lower_sha256(&provenance.config_file_sha256)
@@ -517,8 +616,11 @@ fn emergency_completion(
         });
     EmergencyCompletion {
         regular_orders_all_clear,
+        algo_orders_all_clear,
+        spread_orders_all_clear,
+        account_wide_orders_all_clear,
         evidence_complete,
-        all_clear: regular_orders_all_clear && evidence_complete,
+        all_clear: account_wide_orders_all_clear && evidence_complete,
     }
 }
 
@@ -624,12 +726,17 @@ fn validate_and_select_accounts(
     {
         errors.push("emergency request pacing configuration is invalid".to_string());
     }
+    if config.runtime.max_order_reconciliation_pages == 0
+        || config.runtime.max_order_reconciliation_pages > 1_000
+    {
+        errors.push("emergency pending-order page bound is invalid".to_string());
+    }
     let evidence_budget = Duration::from_secs(options.deadman_timeout_secs)
         .saturating_add(Duration::from_secs(2))
         .saturating_add(
             Duration::from_millis(config.runtime.rest_request_timeout_ms).saturating_mul(4),
         )
-        .saturating_add(Duration::from_millis(config.runtime.request_window_ms))
+        .saturating_add(config.runtime.pacing_policy().window)
         .saturating_add(options.poll_interval);
     if options.account_timeout < evidence_budget {
         errors.push(format!(
@@ -760,81 +867,122 @@ where
         },
         Err(error) => report.push_incident(format!("failed to format deadman timestamp: {error}")),
     }
+    match clock.timestamp() {
+        Ok(timestamp) => match run_bounded(
+            started,
+            settings.account_timeout,
+            client.spread_cancel_all_after_at(&timestamp, settings.deadman_timeout_secs),
+        )
+        .await
+        {
+            Some(Ok(())) => report.spread_deadman_armed = true,
+            Some(Err(error)) => {
+                report.push_incident(format!("failed to arm spread Cancel All After: {error}"));
+            }
+            None => {
+                report.push_incident("account timeout expired while arming spread Cancel All After")
+            }
+        },
+        Err(error) => report.push_incident(format!(
+            "failed to format spread deadman timestamp: {error}"
+        )),
+    }
     let verify_after = Instant::now() + settings.verification_delay;
     let mut pacer = RequestPacer::new(settings.pacing_policy.clone());
-    let mut seen_orders = BTreeSet::new();
+    let mut seen_regular_orders = BTreeSet::new();
+    let mut seen_algo_orders = BTreeSet::new();
+    let mut seen_spread_orders = BTreeSet::new();
     let mut unmanaged_symbols = BTreeSet::new();
-    let mut last_orders: Option<Vec<RemoteOrder>> = None;
+    let mut last_orders: Option<AccountPendingOrders> = None;
 
     while started.elapsed() < settings.account_timeout {
-        report.enumeration_attempts = report.enumeration_attempts.saturating_add(1);
-        if run_bounded(
+        let orders = match enumerate_pending_orders(
+            &client,
+            &clock,
+            &account_id,
+            &mut pacer,
+            &mut report,
             started,
-            settings.account_timeout,
-            pacer.pace(RequestKind::Reconcile, &account_id),
+            &settings,
         )
         .await
-        .is_none()
         {
-            report.push_incident("account timeout expired while pacing pending-order enumeration");
-            break;
-        }
-        let timestamp = match clock.timestamp() {
-            Ok(timestamp) => timestamp,
+            Ok(orders) => orders,
             Err(error) => {
-                report.push_incident(format!("failed to format enumeration timestamp: {error}"));
-                break;
-            }
-        };
-        let orders = match run_bounded(
-            started,
-            settings.account_timeout,
-            client.open_orders_at(&timestamp, None, None),
-        )
-        .await
-        {
-            Some(Ok(orders)) => orders,
-            Some(Err(error)) => {
-                report.enumeration_failures = report.enumeration_failures.saturating_add(1);
-                report.push_incident(format!("pending-order enumeration failed: {error}"));
+                report.push_incident(error);
+                if started.elapsed() >= settings.account_timeout {
+                    break;
+                }
                 sleep_bounded(settings.poll_interval, started, settings.account_timeout).await;
                 continue;
             }
-            None => {
-                report.enumeration_failures = report.enumeration_failures.saturating_add(1);
-                report.push_incident(
-                    "account timeout expired during pending-order enumeration; zero was not proven",
-                );
-                break;
-            }
         };
         if report.initial_open_orders.is_none() {
-            report.initial_open_orders = Some(orders.len());
+            report.initial_open_orders = Some(orders.regular.len());
+            report.initial_algo_orders = Some(orders.algo.len());
+            report.initial_spread_orders = Some(orders.spread.len());
         }
         observe_orders(
-            &orders,
+            &orders.regular,
             &managed_symbols,
-            &mut seen_orders,
+            &mut seen_regular_orders,
             &mut unmanaged_symbols,
             &mut report,
         );
+        observe_algo_orders(
+            &orders.algo,
+            &managed_symbols,
+            &mut seen_algo_orders,
+            &mut unmanaged_symbols,
+        );
+        observe_spread_orders(&orders.spread, &mut seen_spread_orders);
         last_orders = Some(orders.clone());
         if orders.is_empty() {
             if Instant::now() >= verify_after {
                 report.verified_zero_after_deadman = true;
+                report.verified_algo_zero_after_deadman = true;
+                report.verified_spread_zero_after_deadman = true;
                 break;
             }
         } else {
-            if !cancel_pending_orders(
-                &client,
-                &clock,
-                &orders,
-                &mut pacer,
-                &mut report,
-                started,
-                &settings,
-            )
-            .await
+            if !orders.regular.is_empty()
+                && !cancel_pending_orders(
+                    &client,
+                    &clock,
+                    &orders.regular,
+                    &mut pacer,
+                    &mut report,
+                    started,
+                    &settings,
+                )
+                .await
+            {
+                break;
+            }
+            if !orders.algo.is_empty()
+                && !cancel_pending_algo_orders(
+                    &client,
+                    &clock,
+                    &orders.algo,
+                    &mut pacer,
+                    &mut report,
+                    started,
+                    &settings,
+                )
+                .await
+            {
+                break;
+            }
+            if !orders.spread.is_empty()
+                && !cancel_pending_spread_orders(
+                    &client,
+                    &clock,
+                    &mut pacer,
+                    &mut report,
+                    started,
+                    &settings,
+                )
+                .await
             {
                 break;
             }
@@ -842,19 +990,44 @@ where
         sleep_bounded(settings.poll_interval, started, settings.account_timeout).await;
     }
 
-    report.unique_orders_seen = seen_orders.len();
+    report.unique_orders_seen = seen_regular_orders.len();
+    report.unique_algo_orders_seen = seen_algo_orders.len();
+    report.unique_spread_orders_seen = seen_spread_orders.len();
     report.unmanaged_symbols = unmanaged_symbols.into_iter().collect();
-    report.final_open_orders = last_orders.as_ref().map(Vec::len);
+    report.final_open_orders = last_orders.as_ref().map(|orders| orders.regular.len());
+    report.final_algo_orders = last_orders.as_ref().map(|orders| orders.algo.len());
+    report.final_spread_orders = last_orders.as_ref().map(|orders| orders.spread.len());
     report.remaining_orders = last_orders
+        .as_ref()
+        .map(|orders| orders.regular.clone())
         .unwrap_or_default()
         .into_iter()
         .take(MAX_REMAINING_ORDER_DETAILS)
         .map(order_ref)
         .collect();
+    report.remaining_algo_orders = last_orders
+        .as_ref()
+        .map(|orders| orders.algo.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .take(MAX_REMAINING_ORDER_DETAILS)
+        .map(algo_order_ref)
+        .collect();
+    report.remaining_spread_orders = last_orders
+        .unwrap_or_default()
+        .spread
+        .into_iter()
+        .take(MAX_REMAINING_ORDER_DETAILS)
+        .map(spread_order_ref)
+        .collect();
     if !report.verified_zero_after_deadman && started.elapsed() >= settings.account_timeout {
-        report.push_incident("account timeout expired before regular orders were proven zero");
+        report.push_incident("account timeout expired before every order domain was proven zero");
     }
-    report.all_clear = report.deadman_armed && report.verified_zero_after_deadman;
+    report.all_clear = report.deadman_armed
+        && report.spread_deadman_armed
+        && report.verified_zero_after_deadman
+        && report.verified_algo_zero_after_deadman
+        && report.verified_spread_zero_after_deadman;
     if report.all_clear {
         let account_identity_sha256 = sample_account_identity(
             &client,
@@ -870,6 +1043,204 @@ where
     }
     report.elapsed_ms = elapsed_ms(&started);
     report
+}
+
+async fn enumerate_pending_orders<T>(
+    client: &OkxRestClient<T>,
+    clock: &ExchangeClock,
+    account_id: &str,
+    pacer: &mut RequestPacer,
+    report: &mut EmergencyAccountReport,
+    started: Instant,
+    settings: &AccountCancelSettings,
+) -> Result<AccountPendingOrders, String>
+where
+    T: HttpTransport,
+{
+    let mut regular = OkxRegularOrderPagination::new(settings.max_order_reconciliation_pages)
+        .map_err(|error| enumeration_failure(report, "regular", error.to_string()))?;
+    loop {
+        let timestamp = prepare_enumeration_request(
+            clock, account_id, pacer, report, started, settings, "regular",
+        )
+        .await?;
+        let page = match run_bounded(
+            started,
+            settings.account_timeout,
+            client.regular_pending_orders_page_at(&timestamp, None, None, regular.after()),
+        )
+        .await
+        {
+            Some(Ok(page)) => page,
+            Some(Err(error)) => {
+                return Err(enumeration_failure(report, "regular", error.to_string()));
+            }
+            None => {
+                return Err(enumeration_failure(
+                    report,
+                    "regular",
+                    "account timeout expired during request".to_string(),
+                ));
+            }
+        };
+        match regular.accept(page) {
+            Ok(true) => break,
+            Ok(false) => {}
+            Err(error) => {
+                return Err(enumeration_failure(report, "regular", error.to_string()));
+            }
+        }
+    }
+
+    let mut algo_orders = Vec::new();
+    let mut algo_ids = BTreeSet::new();
+    for query in OkxAlgoOrderQuery::ALL {
+        let mut algo = OkxAlgoOrderPagination::new(settings.max_order_reconciliation_pages)
+            .map_err(|error| enumeration_failure(report, "algo", error.to_string()))?;
+        loop {
+            let timestamp = prepare_enumeration_request(
+                clock, account_id, pacer, report, started, settings, "algo",
+            )
+            .await?;
+            let page = match run_bounded(
+                started,
+                settings.account_timeout,
+                client.algo_pending_orders_page_at(&timestamp, query, algo.after()),
+            )
+            .await
+            {
+                Some(Ok(page)) => page,
+                Some(Err(error)) => {
+                    return Err(enumeration_failure(report, "algo", error.to_string()));
+                }
+                None => {
+                    return Err(enumeration_failure(
+                        report,
+                        "algo",
+                        "account timeout expired during request".to_string(),
+                    ));
+                }
+            };
+            match algo.accept(page) {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(error) => {
+                    return Err(enumeration_failure(report, "algo", error.to_string()));
+                }
+            }
+        }
+        for order in algo.into_orders() {
+            if !algo_ids.insert(order.algo_id.clone()) {
+                return Err(enumeration_failure(
+                    report,
+                    "algo",
+                    format!(
+                        "duplicate algo order {} across order-type queries",
+                        order.algo_id
+                    ),
+                ));
+            }
+            algo_orders.push(order);
+        }
+    }
+
+    let mut spread = OkxSpreadOrderPagination::new(settings.max_order_reconciliation_pages)
+        .map_err(|error| enumeration_failure(report, "spread", error.to_string()))?;
+    loop {
+        let timestamp = prepare_enumeration_request(
+            clock, account_id, pacer, report, started, settings, "spread",
+        )
+        .await?;
+        let page = match run_bounded(
+            started,
+            settings.account_timeout,
+            client.spread_pending_orders_page_at(&timestamp, spread.end_id()),
+        )
+        .await
+        {
+            Some(Ok(page)) => page,
+            Some(Err(error)) => {
+                return Err(enumeration_failure(report, "spread", error.to_string()));
+            }
+            None => {
+                return Err(enumeration_failure(
+                    report,
+                    "spread",
+                    "account timeout expired during request".to_string(),
+                ));
+            }
+        };
+        match spread.accept(page) {
+            Ok(true) => break,
+            Ok(false) => {}
+            Err(error) => {
+                return Err(enumeration_failure(report, "spread", error.to_string()));
+            }
+        }
+    }
+
+    Ok(AccountPendingOrders {
+        regular: regular.into_orders(),
+        algo: algo_orders,
+        spread: spread.into_orders(),
+    })
+}
+
+async fn prepare_enumeration_request(
+    clock: &ExchangeClock,
+    account_id: &str,
+    pacer: &mut RequestPacer,
+    report: &mut EmergencyAccountReport,
+    started: Instant,
+    settings: &AccountCancelSettings,
+    domain: &'static str,
+) -> Result<String, String> {
+    report.enumeration_attempts = report.enumeration_attempts.saturating_add(1);
+    if run_bounded(
+        started,
+        settings.account_timeout,
+        pacer.pace(RequestKind::Reconcile, account_id),
+    )
+    .await
+    .is_none()
+    {
+        return Err(enumeration_failure(
+            report,
+            domain,
+            "account timeout expired while pacing request".to_string(),
+        ));
+    }
+    let timestamp = clock
+        .timestamp()
+        .map_err(|error| enumeration_failure(report, domain, error.to_string()))?;
+    Ok(timestamp)
+}
+
+fn enumeration_failure(
+    report: &mut EmergencyAccountReport,
+    domain: &'static str,
+    message: String,
+) -> String {
+    report.enumeration_failures = report.enumeration_failures.saturating_add(1);
+    format!("{domain} pending-order enumeration failed: {message}")
+}
+
+fn observe_algo_orders(
+    orders: &[OkxAlgoOrder],
+    managed_symbols: &HashSet<String>,
+    seen_orders: &mut BTreeSet<String>,
+    unmanaged_symbols: &mut BTreeSet<String>,
+) {
+    for order in orders {
+        if !managed_symbols.contains(&order.symbol) {
+            unmanaged_symbols.insert(order.symbol.clone());
+        }
+        seen_orders.insert(order.algo_id.clone());
+    }
+}
+
+fn observe_spread_orders(orders: &[OkxSpreadOrder], seen_orders: &mut BTreeSet<String>) {
+    seen_orders.extend(orders.iter().map(|order| order.exchange_order_id.clone()));
 }
 
 async fn sample_account_identity<T>(
@@ -1078,6 +1449,174 @@ where
     true
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn cancel_pending_algo_orders<T>(
+    client: &OkxRestClient<T>,
+    clock: &ExchangeClock,
+    orders: &[OkxAlgoOrder],
+    pacer: &mut RequestPacer,
+    report: &mut EmergencyAccountReport,
+    started: Instant,
+    settings: &AccountCancelSettings,
+) -> bool
+where
+    T: HttpTransport,
+{
+    let cancels = orders
+        .iter()
+        .map(|order| OkxCancelAlgoOrder {
+            symbol: order.symbol.clone(),
+            algo_id: order.algo_id.clone(),
+        })
+        .collect::<Vec<_>>();
+    for batch in cancels.chunks(OKX_ALGO_CANCEL_BATCH_LIMIT) {
+        for cancel in batch {
+            if run_bounded(
+                started,
+                settings.account_timeout,
+                pacer.pace(RequestKind::Cancel, &cancel.symbol),
+            )
+            .await
+            .is_none()
+            {
+                report.push_incident("account timeout expired while pacing algo cancel requests");
+                return false;
+            }
+        }
+        let timestamp = match clock.timestamp() {
+            Ok(timestamp) => timestamp,
+            Err(error) => {
+                report.push_incident(format!("failed to format algo cancel timestamp: {error}"));
+                return false;
+            }
+        };
+        report.algo_cancel_batches = report.algo_cancel_batches.saturating_add(1);
+        match run_bounded(
+            started,
+            settings.account_timeout,
+            client.cancel_algo_orders_at(&timestamp, batch),
+        )
+        .await
+        {
+            Some(Ok(results)) => {
+                if results.len() != batch.len() {
+                    report.push_incident(format!(
+                        "algo cancel returned {} results for {} orders",
+                        results.len(),
+                        batch.len()
+                    ));
+                }
+                let mut matched = HashSet::new();
+                for result in results {
+                    match matching_algo_cancel_index(batch, &result) {
+                        Some(index) if matched.insert(index) => {}
+                        Some(_) => report.push_incident(format!(
+                            "algo cancel returned a duplicate result for {}",
+                            result.algo_id
+                        )),
+                        None => report.push_incident(format!(
+                            "algo cancel returned an unknown result for {}",
+                            result.algo_id
+                        )),
+                    }
+                    if result.accepted() {
+                        report.accepted_algo_cancel_requests =
+                            report.accepted_algo_cancel_requests.saturating_add(1);
+                    } else {
+                        report.rejected_algo_cancel_requests =
+                            report.rejected_algo_cancel_requests.saturating_add(1);
+                        report.push_incident(format!(
+                            "algo cancel rejected for {}: {} {}",
+                            result.algo_id, result.code, result.message
+                        ));
+                    }
+                }
+                let unacknowledged = batch.len().saturating_sub(matched.len()) as u64;
+                report.unacknowledged_algo_cancel_requests = report
+                    .unacknowledged_algo_cancel_requests
+                    .saturating_add(unacknowledged);
+                if unacknowledged > 0 {
+                    report.push_incident(format!(
+                        "algo cancel left {unacknowledged} request(s) without a matching acknowledgement"
+                    ));
+                }
+            }
+            Some(Err(error)) => {
+                report.algo_cancel_batch_failures =
+                    report.algo_cancel_batch_failures.saturating_add(1);
+                report.unacknowledged_algo_cancel_requests = report
+                    .unacknowledged_algo_cancel_requests
+                    .saturating_add(batch.len() as u64);
+                report.push_incident(format!("algo cancel request failed: {error}"));
+            }
+            None => {
+                report.algo_cancel_batch_failures =
+                    report.algo_cancel_batch_failures.saturating_add(1);
+                report.unacknowledged_algo_cancel_requests = report
+                    .unacknowledged_algo_cancel_requests
+                    .saturating_add(batch.len() as u64);
+                report.push_incident("account timeout expired during an algo cancel request");
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cancel_pending_spread_orders<T>(
+    client: &OkxRestClient<T>,
+    clock: &ExchangeClock,
+    pacer: &mut RequestPacer,
+    report: &mut EmergencyAccountReport,
+    started: Instant,
+    settings: &AccountCancelSettings,
+) -> bool
+where
+    T: HttpTransport,
+{
+    if run_bounded(
+        started,
+        settings.account_timeout,
+        pacer.pace(RequestKind::Cancel, &report.account_id),
+    )
+    .await
+    .is_none()
+    {
+        report.push_incident("account timeout expired while pacing spread mass cancel");
+        return false;
+    }
+    let timestamp = match clock.timestamp() {
+        Ok(timestamp) => timestamp,
+        Err(error) => {
+            report.push_incident(format!("failed to format spread cancel timestamp: {error}"));
+            return false;
+        }
+    };
+    report.spread_mass_cancel_attempts = report.spread_mass_cancel_attempts.saturating_add(1);
+    match run_bounded(
+        started,
+        settings.account_timeout,
+        client.spread_mass_cancel_at(&timestamp),
+    )
+    .await
+    {
+        Some(Ok(())) => true,
+        Some(Err(error)) => {
+            report.spread_mass_cancel_failures =
+                report.spread_mass_cancel_failures.saturating_add(1);
+            report.push_incident(format!("spread mass cancel request failed: {error}"));
+            true
+        }
+        None => {
+            report.spread_mass_cancel_failures =
+                report.spread_mass_cancel_failures.saturating_add(1);
+            report.push_incident("account timeout expired during spread mass cancel");
+            false
+        }
+    }
+}
+
 fn matching_cancel_index(batch: &[OkxCancelOrder], result: &OkxCancelOrderResult) -> Option<usize> {
     batch.iter().position(|cancel| {
         (!result.exchange_order_id.is_empty()
@@ -1085,6 +1624,15 @@ fn matching_cancel_index(batch: &[OkxCancelOrder], result: &OkxCancelOrderResult
             || (!result.client_order_id.is_empty()
                 && cancel.client_order_id.as_deref() == Some(result.client_order_id.as_str()))
     })
+}
+
+fn matching_algo_cancel_index(
+    batch: &[OkxCancelAlgoOrder],
+    result: &OkxAlgoCancelResult,
+) -> Option<usize> {
+    batch
+        .iter()
+        .position(|cancel| cancel.algo_id == result.algo_id)
 }
 
 async fn sample_exchange_clock<T>(
@@ -1129,6 +1677,22 @@ where
 fn order_ref(order: RemoteOrder) -> EmergencyOrderRef {
     EmergencyOrderRef {
         symbol: order.symbol,
+        exchange_order_id: order.exchange_order_id,
+        client_order_id: order.client_order_id,
+    }
+}
+
+fn algo_order_ref(order: OkxAlgoOrder) -> EmergencyAlgoOrderRef {
+    EmergencyAlgoOrderRef {
+        symbol: order.symbol,
+        algo_id: order.algo_id,
+        client_order_id: order.client_order_id,
+    }
+}
+
+fn spread_order_ref(order: OkxSpreadOrder) -> EmergencySpreadOrderRef {
+    EmergencySpreadOrderRef {
+        spread_id: order.spread_id,
         exchange_order_id: order.exchange_order_id,
         client_order_id: order.client_order_id,
     }
@@ -1202,6 +1766,25 @@ mod tests {
         })
     }
 
+    fn empty_response() -> Result<HttpResponse, RestError> {
+        response(r#"{"code":"0","msg":"","data":[]}"#)
+    }
+
+    fn deadman_response() -> Result<HttpResponse, RestError> {
+        response(
+            r#"{"code":"0","msg":"","data":[{"triggerTime":"1607418547715","tag":"","ts":"1607418537715"}]}"#,
+        )
+    }
+
+    fn append_pending_snapshot(
+        responses: &mut Vec<Result<HttpResponse, RestError>>,
+        regular: Result<HttpResponse, RestError>,
+    ) {
+        responses.push(regular);
+        responses.extend((0..OkxAlgoOrderQuery::ALL.len()).map(|_| empty_response()));
+        responses.push(empty_response());
+    }
+
     fn client(
         responses: Vec<Result<HttpResponse, RestError>>,
     ) -> (OkxRestClient<MockTransport>, Arc<Mutex<Vec<SignedRequest>>>) {
@@ -1228,6 +1811,7 @@ mod tests {
             },
             max_exchange_clock_skew_ms: 250,
             deadman_timeout_secs: 10,
+            max_order_reconciliation_pages: 2,
         }
     }
 
@@ -1241,9 +1825,30 @@ mod tests {
     }
 
     #[test]
+    fn emergency_pacing_preserves_okx_two_second_limits() {
+        let runtime = EmergencyRuntimeConfig {
+            request_window_ms: 1,
+            cancel_requests_per_window: 50,
+            reconcile_requests_per_window: 50,
+            ..EmergencyRuntimeConfig::default()
+        };
+
+        let policy = runtime.pacing_policy();
+
+        assert_eq!(policy.window, Duration::from_secs(2));
+        assert_eq!(policy.cancel_requests, 20);
+        assert_eq!(policy.reconcile_requests, 10);
+    }
+
+    #[test]
     fn emergency_completion_requires_account_coverage_and_provenance() {
         let selected = vec!["main".to_string()];
         let mut account = EmergencyAccountReport::new("main".to_string());
+        account.deadman_armed = true;
+        account.spread_deadman_armed = true;
+        account.verified_zero_after_deadman = true;
+        account.verified_algo_zero_after_deadman = true;
+        account.verified_spread_zero_after_deadman = true;
         account.all_clear = true;
         account.account_identity_sha256 = Some("4".repeat(64));
         let complete = emergency_completion(
@@ -1256,6 +1861,9 @@ mod tests {
             complete,
             EmergencyCompletion {
                 regular_orders_all_clear: true,
+                algo_orders_all_clear: true,
+                spread_orders_all_clear: true,
+                account_wide_orders_all_clear: true,
                 evidence_complete: true,
                 all_clear: true,
             }
@@ -1366,22 +1974,25 @@ mod tests {
 
     #[tokio::test]
     async fn emergency_cancel_arms_deadman_cancels_every_symbol_and_requeries_zero() {
-        let (client, requests) = client(vec![
+        let mut responses = vec![
             response(r#"{"code":"0","msg":"","data":[{"ts":"1607418537715"}]}"#),
-            response(
-                r#"{"code":"0","msg":"","data":[{"triggerTime":"1607418547715","tag":"","ts":"1607418537715"}]}"#,
-            ),
+            deadman_response(),
+            deadman_response(),
+        ];
+        append_pending_snapshot(
+            &mut responses,
             response(
                 r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"reap1","instId":"BTC-USDT","side":"buy","state":"live","px":"100","sz":"1","accFillSz":"0","avgPx":"","uTime":"1000"},{"ordId":"456","clOrdId":"manual1","instId":"ETH-USDT","side":"sell","state":"partially_filled","px":"200","sz":"2","accFillSz":"1","avgPx":"201","uTime":"1001"}]}"#,
             ),
-            response(
-                r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"reap1","sCode":"0","sMsg":""},{"ordId":"456","clOrdId":"manual1","sCode":"0","sMsg":""}]}"#,
-            ),
-            response(r#"{"code":"0","msg":"","data":[]}"#),
-            response(
-                r#"{"code":"0","msg":"","data":[{"acctLv":"2","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"7","mainUid":"6"}]}"#,
-            ),
-        ]);
+        );
+        responses.push(response(
+            r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"reap1","sCode":"0","sMsg":""},{"ordId":"456","clOrdId":"manual1","sCode":"0","sMsg":""}]}"#,
+        ));
+        append_pending_snapshot(&mut responses, empty_response());
+        responses.push(response(
+            r#"{"code":"0","msg":"","data":[{"acctLv":"2","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"7","mainUid":"6"}]}"#,
+        ));
+        let (client, requests) = client(responses);
 
         let report = run_account_cancel(
             client,
@@ -1393,7 +2004,10 @@ mod tests {
 
         assert!(report.all_clear, "{:?}", report.incidents);
         assert!(report.deadman_armed);
+        assert!(report.spread_deadman_armed);
         assert!(report.verified_zero_after_deadman);
+        assert!(report.verified_algo_zero_after_deadman);
+        assert!(report.verified_spread_zero_after_deadman);
         assert_eq!(report.initial_open_orders, Some(2));
         assert_eq!(report.unique_orders_seen, 2);
         assert_eq!(report.accepted_cancel_requests, 2);
@@ -1408,19 +2022,77 @@ mod tests {
         let requests = requests.lock().unwrap();
         assert_eq!(requests[0].path, "/api/v5/public/time");
         assert_eq!(requests[1].path, "/api/v5/trade/cancel-all-after");
-        assert_eq!(requests[2].path, "/api/v5/trade/orders-pending");
-        assert_eq!(requests[3].path, "/api/v5/trade/cancel-batch-orders");
-        assert_eq!(requests[4].path, "/api/v5/trade/orders-pending");
-        assert_eq!(requests[5].path, "/api/v5/account/config");
+        assert_eq!(requests[2].path, "/api/v5/sprd/cancel-all-after");
+        assert_eq!(requests[3].path, "/api/v5/trade/orders-pending?limit=100");
+        assert!(
+            requests[4]
+                .path
+                .starts_with("/api/v5/trade/orders-algo-pending?")
+        );
+        assert_eq!(requests[11].path, "/api/v5/sprd/orders-pending?limit=100");
+        assert_eq!(requests[12].path, "/api/v5/trade/cancel-batch-orders");
+        assert_eq!(requests[13].path, "/api/v5/trade/orders-pending?limit=100");
+        assert_eq!(requests[22].path, "/api/v5/account/config");
+    }
+
+    #[tokio::test]
+    async fn emergency_cancel_cancels_algo_and_spread_then_proves_account_wide_zero() {
+        let mut responses = vec![
+            response(r#"{"code":"0","msg":"","data":[{"ts":"1607418537715"}]}"#),
+            deadman_response(),
+            deadman_response(),
+            empty_response(),
+            response(
+                r#"{"code":"0","msg":"","data":[{"algoId":"algo-1","algoClOrdId":"strategy-1","instId":"BTC-USDT","ordType":"conditional","state":"live"}]}"#,
+            ),
+        ];
+        responses.extend((1..OkxAlgoOrderQuery::ALL.len()).map(|_| empty_response()));
+        responses.push(response(
+            r#"{"code":"0","msg":"","data":[{"sprdId":"BTC-USDT_BTC-USDT-SWAP","ordId":"spread-1","clOrdId":"maker-1","state":"live"}]}"#,
+        ));
+        responses.push(response(
+            r#"{"code":"0","msg":"","data":[{"algoId":"algo-1","algoClOrdId":"strategy-1","sCode":"0","sMsg":""}]}"#,
+        ));
+        responses.push(response(
+            r#"{"code":"0","msg":"","data":[{"result":true}]}"#,
+        ));
+        append_pending_snapshot(&mut responses, empty_response());
+        responses.push(response(
+            r#"{"code":"0","msg":"","data":[{"acctLv":"2","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"7","mainUid":"6"}]}"#,
+        ));
+        let (client, requests) = client(responses);
+
+        let report = run_account_cancel(
+            client,
+            "main".to_string(),
+            HashSet::from(["BTC-USDT".to_string()]),
+            settings(),
+        )
+        .await;
+
+        assert!(report.all_clear, "{:?}", report.incidents);
+        assert_eq!(report.initial_open_orders, Some(0));
+        assert_eq!(report.initial_algo_orders, Some(1));
+        assert_eq!(report.initial_spread_orders, Some(1));
+        assert_eq!(report.accepted_algo_cancel_requests, 1);
+        assert_eq!(report.spread_mass_cancel_attempts, 1);
+        assert_eq!(report.final_algo_orders, Some(0));
+        assert_eq!(report.final_spread_orders, Some(0));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[12].path, "/api/v5/trade/cancel-algos");
+        assert_eq!(requests[13].path, "/api/v5/sprd/mass-cancel");
+        assert_eq!(requests[23].path, "/api/v5/account/config");
     }
 
     #[tokio::test]
     async fn emergency_cancel_reports_deadman_failure_even_when_account_is_zero() {
-        let (client, _) = client(vec![
+        let mut responses = vec![
             response(r#"{"code":"0","msg":"","data":[{"ts":"1607418537715"}]}"#),
             response(r#"{"code":"50000","msg":"deadman unavailable","data":[]}"#),
-            response(r#"{"code":"0","msg":"","data":[]}"#),
-        ]);
+            deadman_response(),
+        ];
+        append_pending_snapshot(&mut responses, empty_response());
+        let (client, _) = client(responses);
 
         let report =
             run_account_cancel(client, "main".to_string(), HashSet::new(), settings()).await;
@@ -1438,14 +2110,16 @@ mod tests {
 
     #[tokio::test]
     async fn account_identity_failure_preserves_zero_proof_but_not_identity_evidence() {
-        let (client, _) = client(vec![
+        let mut responses = vec![
             response(r#"{"code":"0","msg":"","data":[{"ts":"1607418537715"}]}"#),
-            response(
-                r#"{"code":"0","msg":"","data":[{"triggerTime":"1607418547715","tag":"","ts":"1607418537715"}]}"#,
-            ),
-            response(r#"{"code":"0","msg":"","data":[]}"#),
-            response(r#"{"code":"50000","msg":"identity unavailable","data":[]}"#),
-        ]);
+            deadman_response(),
+            deadman_response(),
+        ];
+        append_pending_snapshot(&mut responses, empty_response());
+        responses.push(response(
+            r#"{"code":"50000","msg":"identity unavailable","data":[]}"#,
+        ));
+        let (client, _) = client(responses);
 
         let report =
             run_account_cancel(client, "main".to_string(), HashSet::new(), settings()).await;
@@ -1462,22 +2136,25 @@ mod tests {
 
     #[tokio::test]
     async fn partial_batch_ack_is_reported_but_final_zero_is_authoritative() {
-        let (client, _) = client(vec![
+        let mut responses = vec![
             response(r#"{"code":"0","msg":"","data":[{"ts":"1607418537715"}]}"#),
-            response(
-                r#"{"code":"0","msg":"","data":[{"triggerTime":"1607418547715","tag":"","ts":"1607418537715"}]}"#,
-            ),
+            deadman_response(),
+            deadman_response(),
+        ];
+        append_pending_snapshot(
+            &mut responses,
             response(
                 r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"reap1","instId":"BTC-USDT","side":"buy","state":"live","px":"100","sz":"1","accFillSz":"0","avgPx":"","uTime":"1000"},{"ordId":"456","clOrdId":"reap2","instId":"BTC-USDT","side":"sell","state":"live","px":"101","sz":"1","accFillSz":"0","avgPx":"","uTime":"1001"}]}"#,
             ),
-            response(
-                r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"reap1","sCode":"51000","sMsg":"rejected"}]}"#,
-            ),
-            response(r#"{"code":"0","msg":"","data":[]}"#),
-            response(
-                r#"{"code":"0","msg":"","data":[{"acctLv":"2","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"7","mainUid":"6"}]}"#,
-            ),
-        ]);
+        );
+        responses.push(response(
+            r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"reap1","sCode":"51000","sMsg":"rejected"}]}"#,
+        ));
+        append_pending_snapshot(&mut responses, empty_response());
+        responses.push(response(
+            r#"{"code":"0","msg":"","data":[{"acctLv":"2","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"7","mainUid":"6"}]}"#,
+        ));
+        let (client, _) = client(responses);
 
         let report =
             run_account_cancel(client, "main".to_string(), HashSet::new(), settings()).await;

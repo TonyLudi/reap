@@ -866,7 +866,12 @@ async fn bootstrap_accounts(
             })?;
         let positions = position_risks.account_update();
         let (mut open_orders, recent_fills) = gateway
-            .fetch_remote_state(None, None, config.runtime.max_fill_reconciliation_pages)
+            .fetch_remote_state(
+                None,
+                None,
+                config.runtime.max_order_reconciliation_pages,
+                config.runtime.max_fill_reconciliation_pages,
+            )
             .await
             .map_err(|error| {
                 bootstrap_error(
@@ -2018,6 +2023,7 @@ impl LiveRuntime {
                 reconcile_rx,
                 control_tx.clone(),
                 config.runtime.ambiguous_submit_grace_ms,
+                config.runtime.max_order_reconciliation_pages,
                 config.runtime.max_fill_reconciliation_pages,
             )));
         }
@@ -4458,6 +4464,7 @@ async fn run_reconcile_task<T>(
     mut commands: mpsc::Receiver<ReconcileTaskCommand>,
     events: mpsc::Sender<RuntimeEvent>,
     ambiguous_submit_grace_ms: u64,
+    max_order_reconciliation_pages: usize,
     max_fill_reconciliation_pages: usize,
 ) where
     T: HttpTransport + 'static,
@@ -4490,6 +4497,7 @@ async fn run_reconcile_task<T>(
             &io,
             restored_orders,
             ambiguous_submit_grace_ms,
+            max_order_reconciliation_pages,
             max_fill_reconciliation_pages,
         )
         .await;
@@ -4517,13 +4525,19 @@ async fn reconcile_remote_account<T>(
     io: &OkxGatewayIo<T>,
     restored_orders: Vec<ReconcileOrderRef>,
     ambiguous_submit_grace_ms: u64,
+    max_order_reconciliation_pages: usize,
     max_fill_reconciliation_pages: usize,
 ) -> Result<(Vec<RemoteOrder>, Vec<RemoteFill>, AccountUpdate), String>
 where
     T: HttpTransport,
 {
     let (mut remote_orders, remote_fills) = io
-        .fetch_remote_state(None, None, max_fill_reconciliation_pages)
+        .fetch_remote_state(
+            None,
+            None,
+            max_order_reconciliation_pages,
+            max_fill_reconciliation_pages,
+        )
         .await
         .map_err(|error| error.to_string())?;
     let mut remote_ids = remote_orders
@@ -5499,6 +5513,7 @@ mod tests {
             reconcile_rx,
             event_tx,
             10_000,
+            2,
             2,
         ));
 

@@ -626,8 +626,8 @@ enum Command {
         pretty: bool,
     },
     #[command(
-        about = "Cancel and verify all regular OKX orders for selected accounts",
-        long_about = "Arm OKX Cancel All After, cancel every regular pending order account-wide, and verify zero after the trigger horizon. This independent incident path excludes algo and spread orders."
+        about = "Cancel and verify regular, algo, and spread OKX orders",
+        long_about = "Arm regular and spread OKX Cancel All After, exhaustively cancel regular, algo, and spread pending orders account-wide, and verify every domain at zero after the trigger horizon."
     )]
     EmergencyCancel {
         #[arg(
@@ -684,13 +684,13 @@ enum Command {
         pretty: bool,
     },
     #[command(
-        about = "Independently verify an emergency regular-order cancellation report",
-        long_about = "Re-hash the exact emergency config and report, re-derive account coverage, deadman-horizon, provenance, and regular-order zero invariants, and optionally require every configured account. Algo and spread orders remain excluded."
+        about = "Independently verify an emergency account-wide cancellation report",
+        long_about = "Re-hash the exact emergency config and report, re-derive account coverage, per-domain deadman-horizon, provenance, and regular/algo/spread zero invariants, and optionally require every configured account."
     )]
     VerifyEmergencyCancel {
         #[arg(short, long, help = "Exact live TOML used by emergency-cancel")]
         config: PathBuf,
-        #[arg(short, long, help = "Schema-1 emergency-cancel JSON report")]
+        #[arg(short, long, help = "Schema-2 emergency-cancel JSON report")]
         report: PathBuf,
         #[arg(
             short,
@@ -1777,14 +1777,14 @@ async fn main() -> Result<()> {
                 persist_reserved_output(file, path, &json, "emergency-cancel report")?;
             }
             println!("{json}");
-            if !report.regular_orders_all_clear {
+            if !report.account_wide_orders_all_clear {
                 anyhow::bail!(
-                    "emergency cancel did not verify every selected account's regular order book at zero"
+                    "emergency cancel did not verify every selected account's regular, algo, and spread orders at zero"
                 );
             }
             if !report.evidence_complete {
                 anyhow::bail!(
-                    "emergency cancel reached regular-order zero but its provenance evidence is incomplete"
+                    "emergency cancel reached account-wide zero but its provenance evidence is incomplete"
                 );
             }
             if !report.all_clear {

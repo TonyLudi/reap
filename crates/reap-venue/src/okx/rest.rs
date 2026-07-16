@@ -15,6 +15,9 @@ use crate::{PrivateOrderState, RemoteFill, RemoteOrder};
 
 use super::{AuthError, HttpMethod, OkxSigner, SignedRequest};
 
+mod pending_orders;
+pub use pending_orders::*;
+
 const PLACE_ORDER_PATH: &str = "/api/v5/trade/order";
 const CANCEL_ORDER_PATH: &str = "/api/v5/trade/cancel-order";
 const CANCEL_BATCH_ORDERS_PATH: &str = "/api/v5/trade/cancel-batch-orders";
@@ -301,6 +304,25 @@ pub enum RestError {
     BillPaginationCursor { cursor: String },
     #[error("OKX bill pagination repeated bill {bill_id}")]
     BillPaginationDuplicate { bill_id: String },
+    #[error(
+        "OKX {domain} pending-order pagination reached the configured limit after {pages} pages and {records} records; next cursor={next_cursor}"
+    )]
+    PendingOrderPaginationLimit {
+        domain: &'static str,
+        pages: usize,
+        records: usize,
+        next_cursor: String,
+    },
+    #[error("OKX {domain} pending-order pagination repeated cursor {cursor}")]
+    PendingOrderPaginationCursor {
+        domain: &'static str,
+        cursor: String,
+    },
+    #[error("OKX {domain} pending-order pagination repeated order {order_id}")]
+    PendingOrderPaginationDuplicate {
+        domain: &'static str,
+        order_id: String,
+    },
 }
 
 impl RestError {

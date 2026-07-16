@@ -67,9 +67,10 @@ Implemented:
 - Bounded asynchronous HTTPS webhook alerts and optional Linux journal-disk,
   available-memory, and kernel-clock guards, with preflight evidence and
   fail-closed periodic enforcement outside the strategy loop.
-- A strategy-independent OKX emergency command that arms account-wide Cancel All
-  After, batch-cancels regular orders on every symbol, and requires a post-trigger
-  zero-order proof. Its create-new schema-versioned artifact binds the exact
+- A strategy-independent OKX emergency command that arms regular and spread
+  Cancel All After, exhaustively paginates and cancels regular, algo, and spread
+  orders, and requires a post-trigger account-wide zero proof. Its create-new
+  schema-versioned artifact binds the exact
   input file, binary, host, Java revision, account coverage, and task failures,
   plus CI-verified hardened systemd templates with mode-specific restart policy,
   no capabilities, and a bounded offline security exposure.
@@ -516,8 +517,8 @@ cargo run -p reap-cli -- operator --config examples/live-okx-demo.toml shutdown 
 ```
 
 After stopping every order producer for an account, the independent emergency
-path can cancel and verify all regular pending orders without loading strategy or
-journal state. It intentionally excludes OKX algo and spread orders:
+path can cancel and verify all regular, algo, and spread pending orders without
+loading strategy or journal state:
 
 ```bash
 EMERGENCY_REPORT="/tmp/reap-emergency-$(date -u +%Y%m%dT%H%M%SZ).json"
@@ -540,14 +541,16 @@ cargo run -p reap-cli -- verify-emergency-cancel \
 ```
 
 The output path is reserved before parsing credentials or starting REST work.
-`all_clear = true` requires both `regular_orders_all_clear = true` and complete
-config/binary/host/exchange-account/task evidence; early configuration failures
-leave an empty reserved path, which is never a report. Both report paths are
-owner-only and synced with their parent directory. Offline verification hashes
-the exact config/report bytes and re-derives account coverage, trigger-horizon,
-final-zero, provenance, and completion invariants. It cannot replay raw exchange
-responses or prove the operator stopped every external order producer, and the
-regular-order scope still excludes OKX algo and spread orders.
+`all_clear = true` requires regular, algo, spread, and aggregate account-wide
+all-clear flags plus complete config/binary/host/exchange-account/task evidence;
+early configuration failures leave an empty reserved path, which is never a
+report. Both report paths are owner-only and synced with their parent directory.
+Offline verification hashes the exact config/report bytes and re-derives account
+coverage, per-domain trigger-horizon/final-zero, provenance, and completion
+invariants. It cannot replay raw exchange responses or prove the operator stopped
+every external order producer. OKX documents no algo-order Cancel All After, so
+algo safety relies on that producer-stop confirmation, explicit cancellation,
+and authoritative polling.
 
 For a controlled minimal-size demo process-kill campaign, wait for the already
 armed deadman to expire without issuing another cancel, then collect and verify

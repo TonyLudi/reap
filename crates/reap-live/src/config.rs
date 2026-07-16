@@ -321,6 +321,7 @@ pub struct RuntimeConfig {
     pub ambiguous_submit_grace_ms: u64,
     pub order_state_convergence_timeout_ms: u64,
     pub fill_state_convergence_timeout_ms: u64,
+    pub max_order_reconciliation_pages: usize,
     pub max_fill_reconciliation_pages: usize,
     pub submit_requests_per_window: usize,
     pub cancel_requests_per_window: usize,
@@ -363,6 +364,7 @@ impl Default for RuntimeConfig {
             ambiguous_submit_grace_ms: 10_000,
             order_state_convergence_timeout_ms: 5_000,
             fill_state_convergence_timeout_ms: 2_000,
+            max_order_reconciliation_pages: 64,
             max_fill_reconciliation_pages: 20,
             submit_requests_per_window: 50,
             cancel_requests_per_window: 50,
@@ -1241,6 +1243,10 @@ fn validate_positive_runtime(runtime: &RuntimeConfig, errors: &mut Vec<String>) 
             runtime.fill_state_convergence_timeout_ms,
         ),
         (
+            "max_order_reconciliation_pages",
+            runtime.max_order_reconciliation_pages as u64,
+        ),
+        (
             "max_fill_reconciliation_pages",
             runtime.max_fill_reconciliation_pages as u64,
         ),
@@ -1271,6 +1277,9 @@ fn validate_positive_runtime(runtime: &RuntimeConfig, errors: &mut Vec<String>) 
         errors.push(format!(
             "runtime.teardown_timeout_ms must not exceed {MAX_RUNTIME_TEARDOWN_TIMEOUT_MS}"
         ));
+    }
+    if runtime.max_order_reconciliation_pages > 1_000 {
+        errors.push("runtime.max_order_reconciliation_pages must not exceed 1000".to_string());
     }
     if runtime.max_fill_reconciliation_pages > 1_000 {
         errors.push("runtime.max_fill_reconciliation_pages must not exceed 1000".to_string());
@@ -2627,7 +2636,21 @@ mod tests {
     }
 
     #[test]
-    fn fill_reconciliation_page_limit_is_bounded() {
+    fn order_and_fill_reconciliation_page_limits_are_bounded() {
+        let mut config = valid_config();
+        config.runtime.max_order_reconciliation_pages = 0;
+        let report = config.validate();
+        assert!(report.errors.iter().any(|error| {
+            error.contains("runtime.max_order_reconciliation_pages must be positive")
+        }));
+
+        let mut config = valid_config();
+        config.runtime.max_order_reconciliation_pages = 1_001;
+        let report = config.validate();
+        assert!(report.errors.iter().any(|error| {
+            error.contains("runtime.max_order_reconciliation_pages must not exceed 1000")
+        }));
+
         let mut config = valid_config();
         config.runtime.max_fill_reconciliation_pages = 0;
         let report = config.validate();

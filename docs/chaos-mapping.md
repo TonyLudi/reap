@@ -229,12 +229,16 @@ that Java exposes equivalent completion evidence.
 The same pinned Java tree makes stop/cancel ordering explicit:
 `StrategyEngine.tryToStop` pauses before `cancelAll`, while
 `StrategyOrderSender.cancelAll` emits account-level cancel-all requests across
-the account's routing groups. Reap's out-of-process emergency command is a
-stronger operational boundary for regular OKX orders because it does not depend
-on the strategy process or journal and enumerates unmanaged symbols. Its offline
-verifier re-derives exact-config, account-coverage, trigger-horizon, and final-zero
-invariants; it does not expand the venue scope to algo/spread orders or turn
-self-reported REST outcomes into replayable raw exchange evidence.
+the account's routing groups. The pinned Nitro path separately calls
+`OkxNitroOrderClient.makerMassCancel`; `OkxNitroRestClient.massCancel` invokes
+`/api/v5/sprd/mass-cancel`, while `getAllOpenOrders` follows 100-row spread pages
+with `endId`. Reap's out-of-process emergency command is a stronger operational
+boundary because it does not depend on the strategy process or journal: it
+strictly pages regular, algo, and spread domains, arms regular and spread CAA,
+cancels all three domains, and polls all three to zero. Its offline verifier
+re-derives exact-config, account-coverage, trigger-horizon, and per-domain
+final-zero invariants; it does not turn self-reported REST outcomes into
+replayable raw exchange evidence.
 Deadman heartbeat, periodic clock skew/check, exchange instrument/fee
 drift/check, and authenticated account-config drift/check failures have
 distinct stable codes. This report does not make the fault acceptable; it makes
@@ -337,11 +341,12 @@ ownership reference rather than claiming file-format parity.
 | Batch subscription manager, per-`WsSubArg` `EVENT_SUB` context updates, and retry limits | Bounded socket partitioning, exact unique serialized subscription-argument acknowledgement-set readiness, acknowledgement timeout, and exponential reconnect | Equivalent identity-bound lifecycle with different batching policy; duplicate acknowledgements are idempotent, while malformed or unexpected acknowledgements fail closed |
 | `OrderDetailUpdate` `tradeId`/`fillSz`/`fillPx` and `UserTrade` `tradeId`/`fee`/`feeCcy`/`execType` | Current OKX order-channel `tradeId` plus per-fill `fillFee`/`fillFeeCcy`, optional fills channel with fee-bearing order-update precedence under either arrival order, instrument-scoped once-only journal record, and raw-statement comparison | Current-contract strengthening; the pinned Java order-session fill derivation says fee is unavailable and its separate user-trade processing is commented out |
 | `OkxNitroRestClient.getFills` 100-row pages, 200 ms pacing, descending cursor pagination, and short-page completion | Authenticated read-only `/api/v5/trade/fills` collector with the same page size/pacing/completion rule, fail-closed page bound, raw response retention, bracketed account identity, and offline cursor replay | Lifecycle mapping with a current-contract endpoint adaptation; pinned Java reads Nitro spread trades while Reap certifies regular strategy fills |
+| `OkxNitroRestClient.getAllOpenOrders` follows 100-row Nitro spread pages by `endId`; `massCancel` accepts the spread endpoint result | Typed regular/algo/spread pending-order pages with strict cursor and duplicate-ID checks, bounded terminal-page proof, typed per-item algo cancellation, spread mass cancel, and authoritative post-cancel polling | Current-contract hardening: Rust fails closed at a page bound and never treats cancel acceptance as final zero |
 | `StaleOrderUpdateSafeguard` and `GatewayOrderStatsSafeguard.BookTotalPendingOrder` | Per-order submit-to-private-state and cancel-to-terminal-state deadlines, cancel retry, account block, and full REST reconciliation | Equivalent fail-closed intent with explicit OKX REST/private-state convergence |
 | `PositionGatewaySafeguard.OrsFillDelayToPositionUpdate` and the fill-derived position reconciler | Per-fill derivative-position or spot-currency convergence deadline plus monotonic rows, full REST comparison, tombstone repair, and second-pass confirmation | Equivalent fail-closed intent; Rust uses an explicit post-fill deadline rather than Java's two-cycle timestamp-difference check |
 | `PositionGatewaySafeguard.PosnMgnModeMismatch` | Required OKX `mgnMode` on websocket/REST positions, configured-mode bootstrap/runtime enforcement, and reconciliation comparison | Equivalent fail-closed intent; Rust aborts the live lifecycle instead of pausing inside a separate gateway process |
 | `PositionGatewaySafeguard.ForcedRepaymentIndicator` | Typed OKX balance `twap`, configured `1..=5` limit, bootstrap/runtime account-state rejection, tombstone clearing, and reconciliation comparison | Stronger: Java emits alert-only, while Rust fails closed at or above the configured level |
-| `ChaosStrategyEngine.tryToStop`, `ChaosStrategyBase.cancelAll(entity)`, `ExchCancelAll`, and `OkxNitroOrderClient.onOrderSessionDisconnected` | In-process canonical cancel/reconcile plus a separate account-wide regular-order emergency CLI | Equivalent normal/disconnect cancellation with an additional process-independent final-zero safety layer |
+| `ChaosStrategyEngine.tryToStop`, `ChaosStrategyBase.cancelAll(entity)`, `ExchCancelAll`, `OkxNitroOrderClient.onOrderSessionDisconnected`, and Nitro `makerMassCancel` | In-process canonical cancel/reconcile plus a separate account-wide regular/algo/spread emergency CLI | Equivalent normal/disconnect cancellation with an additional process-independent, per-domain final-zero safety layer |
 
 `reap-fault` has no Java strategy counterpart and is not a parity claim. It is a
 separate demo test process built to exercise the mapped connectivity behavior:
@@ -385,7 +390,7 @@ Rust runtime's place-request `expTime`, `/public/time` skew gate, Cancel All
 After heartbeat, fsynced restart-latch lifecycle, exclusive journal lease,
 bounded authenticated fill-evidence collection and verification, webhook alert
 worker, Linux host guard, hermetically verified capability-free supervisor
-policy, or strategy-independent account-wide regular-order cancellation. Those
+policy, or strategy-independent account-wide regular/algo/spread cancellation. Those
 are intentional
 deployment-safety additions around the parity strategy, not claims of Java
 strategy equivalence. Re-check exchange-facing controls against both the pinned
@@ -417,10 +422,10 @@ The pinned Java stop path changes engine state and invokes per-entity
 `cancelAll()` inside the running process, with `ExchCancelAll` providing
 rate-limit debounce. Rust preserves normal in-process cancellation but does not
 depend on it for the incident path: the separate command arms the exchange
-deadman, enumerates all regular pending orders for the selected account, cancels
-configured and unmanaged symbols, and proves zero after the trigger horizon.
-This is intentionally broader than strategy-owned Java entities and explicitly
-does not claim coverage of OKX algo or spread order classes. At the pinned
+regular and spread deadmen, strictly enumerates regular, algo, and spread orders
+for the selected account, cancels every domain, and proves all three zero after
+the trigger horizon. This is intentionally broader than strategy-owned Java
+entities. At the pinned
 revision, `OkxNitroOrderClient` also rejects new sends with `REQUEST_BLOCKED`
 while its websocket state is not `CONNECTED`; on order-session disconnect it
 calls `cancelAll()`, whose implementation combines maker mass-cancel, local

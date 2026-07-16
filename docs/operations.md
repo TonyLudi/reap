@@ -1199,10 +1199,12 @@ settings; accepting only their static flags would weaken live stop behavior.
 
 - Startup, private-stream recovery, ambiguous gateway outcomes, and shutdown
   fetch open orders, recent fills, account balances, and all positions under
-  the reconciliation request pacer. Fill pages request the OKX maximum of 100
-  rows and continue by `billId` until a short page proves completion. A repeated
-  cursor/fill or a full page at `runtime.max_fill_reconciliation_pages` fails
-  closed instead of accepting a partial snapshot. A fee-less optional
+  the reconciliation request pacer. Regular pending-order pages request the OKX
+  maximum of 100 rows and continue by `ordId`; fill pages continue by `billId`.
+  Each requires a short terminal page. A repeated cursor/order/fill or a full
+  page at `runtime.max_order_reconciliation_pages` or
+  `runtime.max_fill_reconciliation_pages` fails closed instead of accepting a
+  partial snapshot. A fee-less optional
   fills-channel event does not consume the canonical journal key before the
   fee-bearing orders-channel event arrives. An empty balance response is
   rejected as non-authoritative; an empty position list is a valid flat account.
@@ -1528,12 +1530,14 @@ request pacing/timeouts, account credential environment names, and configured
 symbol keys. This keeps the exchange cancellation path available when the live
 strategy config or process is unhealthy.
 
-The command has a deliberately narrow scope: all **regular pending orders** on
-each selected OKX account, including symbols not configured in the strategy.
-It does not enumerate or cancel algo orders or spread orders. OKX Cancel All
-After is account-wide for the regular order book but also excludes spread
-orders. Accounts that use algo or spread orders need a separate, tested venue
-procedure before this command can be considered a complete kill.
+The command covers all documented pending-order domains on each selected OKX
+account, including regular symbols not configured in the strategy: regular
+order-book orders, untriggered algo orders, and Nitro spread orders. It pages
+each endpoint to a short terminal page under a strict bound and rejects repeated
+cursors or order IDs. OKX regular Cancel All After excludes spread, so the
+command arms both the regular and spread CAA endpoints. OKX documents no algo
+CAA; the required producer-stop confirmation, explicit algo cancellation, and
+authoritative post-cancel polling form that domain's safety boundary.
 
 Incident procedure:
 
@@ -1574,29 +1578,34 @@ VERIFICATION=/var/lib/reap/live/btc-demo/emergency-cancel-verification-$(date -u
 for demo. `--all-configured-accounts` is available only when every configured
 account's producers have been stopped and replaces all `--account` arguments.
 
-4. For each account, the command samples exchange time, arms Cancel All After,
-   enumerates pending regular orders account-wide, sends batches of at most 20,
-   and re-enumerates until it observes zero after the deadman trigger horizon.
-   Every REST call and pacing delay shares one absolute account timeout. A batch
-   acknowledgement is only request acceptance; the final REST zero observation
-   is authoritative.
+4. For each account, the command samples exchange time, arms regular and spread
+   Cancel All After, then exhaustively enumerates regular, algo, and spread
+   orders. It cancels regular orders in batches of at most 20, algo orders in
+   batches of at most 10, invokes spread mass cancel, and re-enumerates every
+   domain until all are zero after the deadman trigger horizon. Every page,
+   cancel, pacing delay, and final query shares one absolute account timeout.
+   Cancel acknowledgements are only request acceptance; the final REST zero
+   snapshot is authoritative.
 5. Both output paths are owner-only create-new files, synced with their parent
    directory before final status. `verify-emergency-cancel` rejects symlinks and
    oversized files, hashes the exact config/report bytes, rejects unknown JSON
    fields, re-runs the command's pure REST-origin/pacing/timing-budget checks,
-   re-derives configured/selected/report account coverage, validates the deadman
-   trigger horizon and final regular-order zero, and recomputes every top-level
+   re-derives configured/selected/report account coverage, validates both
+   deadmen, the trigger horizon, and final zero in every order domain, and
+   recomputes every top-level
    completion flag. Use `--require-all-configured-accounts` for gate evidence.
-   Require schema 1, the pinned Java revision, expected Reap binary and host
+   Require schema 2, the pinned Java revision, expected Reap binary and host
    hashes, each pseudonymous `account_identity_sha256` matching the corresponding
    live report, and `acceptance_passed = true`. Review all
    provenance, execution, and account incidents, plus
-   partial/rejected/unacknowledged cancel counts, unmanaged symbols, and
-   remaining-order details even when final zero succeeds. An account-task
+   regular/algo partial, rejected, and unacknowledged cancel counts, spread
+   mass-cancel attempts, unmanaged symbols, and per-domain remaining-order
+   details even when final zero succeeds. An account-task
    failure is retained as non-passing evidence.
 6. A failure before report construction leaves the reserved file empty; archive
    it with process logs but never treat it as JSON evidence. Independently
-   inspect OKX regular, algo, and spread orders plus balances and positions.
+   independently inspect OKX regular, algo, and spread orders plus balances and
+   positions.
    Archive the report with the incident journal. A non-zero command exit or
    missing/failed account report means zero was not proven and requires venue
    UI/API escalation.
@@ -1691,13 +1700,13 @@ A pass requires all of the following:
 - Offline verification reproduces the journal hash/recovery, response hashes,
   parsers, query identities, failure list, summary, and pass result.
 
-This evidence covers regular orders only. The producer attestation cannot prove
+This process-death evidence covers regular orders only. The producer attestation cannot prove
 that unrelated hosts, keys, or manual traders were stopped, and the lease only
 excludes cooperating Reap processes that use the same journal. Archive target
-supervisor/injector records and separate algo/spread, fill/fee, balance,
-position, and account-statement evidence. After collection, run emergency
-cancel if any regular order remains, reconcile the stopped journal, and restart
-in `observe` only after review.
+supervisor/injector records plus fill/fee, balance, position, and account-statement
+evidence. After collection, run the account-wide emergency cancel to prove
+regular/algo/spread zero, reconcile the stopped journal, and restart in `observe`
+only after review.
 
 ## External Alerts
 

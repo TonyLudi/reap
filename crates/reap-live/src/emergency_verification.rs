@@ -7,15 +7,15 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::emergency::{
-    EXCLUDED_ORDER_CLASSES, MAX_INCIDENT_MESSAGE_BYTES, MAX_INCIDENTS, MAX_REMAINING_ORDER_DETAILS,
-    REGULAR_ORDER_SCOPE, review_emergency_config,
+    ACCOUNT_WIDE_ORDER_SCOPE, EXCLUDED_ORDER_CLASSES, MAX_INCIDENT_MESSAGE_BYTES, MAX_INCIDENTS,
+    MAX_REMAINING_ORDER_DETAILS, review_emergency_config,
 };
 use crate::{
     EMERGENCY_CANCEL_REPORT_SCHEMA_VERSION, EmergencyAccountReport, EmergencyCancelReport,
     TradingEnvironment,
 };
 
-pub const EMERGENCY_CANCEL_VERIFICATION_FORMAT_VERSION: u16 = 2;
+pub const EMERGENCY_CANCEL_VERIFICATION_FORMAT_VERSION: u16 = 3;
 pub const MAX_EMERGENCY_CANCEL_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_EMERGENCY_CANCEL_REPORT_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -71,6 +71,18 @@ pub enum EmergencyCancelVerificationFailure {
         reported: bool,
         derived: bool,
     },
+    AlgoOrdersAllClearMismatch {
+        reported: bool,
+        derived: bool,
+    },
+    SpreadOrdersAllClearMismatch {
+        reported: bool,
+        derived: bool,
+    },
+    AccountWideOrdersAllClearMismatch {
+        reported: bool,
+        derived: bool,
+    },
     EvidenceCompleteMismatch {
         reported: bool,
         derived: bool,
@@ -104,6 +116,12 @@ pub struct EmergencyCancelVerificationReport {
     pub all_configured_accounts_selected: bool,
     pub reported_regular_orders_all_clear: bool,
     pub derived_regular_orders_all_clear: bool,
+    pub reported_algo_orders_all_clear: bool,
+    pub derived_algo_orders_all_clear: bool,
+    pub reported_spread_orders_all_clear: bool,
+    pub derived_spread_orders_all_clear: bool,
+    pub reported_account_wide_orders_all_clear: bool,
+    pub derived_account_wide_orders_all_clear: bool,
     pub reported_evidence_complete: bool,
     pub derived_evidence_complete: bool,
     pub reported_all_clear: bool,
@@ -238,7 +256,7 @@ pub fn verify_emergency_cancel_paths(
             },
         );
     }
-    let scope_matches = report.scope == REGULAR_ORDER_SCOPE;
+    let scope_matches = report.scope == ACCOUNT_WIDE_ORDER_SCOPE;
     if !scope_matches {
         failures.push(EmergencyCancelVerificationFailure::ScopeMismatch);
     }
@@ -320,6 +338,25 @@ pub fn verify_emergency_cancel_paths(
         && report
             .accounts
             .iter()
+            .all(|account| derived_regular_all_clear(account, report.deadman_timeout_secs));
+    let derived_algo_orders_all_clear = account_coverage_complete
+        && !report.accounts.is_empty()
+        && report
+            .accounts
+            .iter()
+            .all(|account| derived_algo_all_clear(account, report.deadman_timeout_secs));
+    let derived_spread_orders_all_clear = account_coverage_complete
+        && !report.accounts.is_empty()
+        && report
+            .accounts
+            .iter()
+            .all(|account| derived_spread_all_clear(account, report.deadman_timeout_secs));
+    let derived_account_wide_orders_all_clear = derived_regular_orders_all_clear
+        && derived_algo_orders_all_clear
+        && derived_spread_orders_all_clear
+        && report
+            .accounts
+            .iter()
             .all(|account| derived_account_all_clear(account, report.deadman_timeout_secs));
     let derived_evidence_complete = schema_matches
         && config_file_matches
@@ -348,12 +385,36 @@ pub fn verify_emergency_cancel_paths(
                 .as_deref()
                 .is_some_and(is_lower_sha256)
         });
-    let derived_all_clear = derived_regular_orders_all_clear && derived_evidence_complete;
+    let derived_all_clear = derived_account_wide_orders_all_clear && derived_evidence_complete;
     if report.regular_orders_all_clear != derived_regular_orders_all_clear {
         failures.push(
             EmergencyCancelVerificationFailure::RegularOrdersAllClearMismatch {
                 reported: report.regular_orders_all_clear,
                 derived: derived_regular_orders_all_clear,
+            },
+        );
+    }
+    if report.algo_orders_all_clear != derived_algo_orders_all_clear {
+        failures.push(
+            EmergencyCancelVerificationFailure::AlgoOrdersAllClearMismatch {
+                reported: report.algo_orders_all_clear,
+                derived: derived_algo_orders_all_clear,
+            },
+        );
+    }
+    if report.spread_orders_all_clear != derived_spread_orders_all_clear {
+        failures.push(
+            EmergencyCancelVerificationFailure::SpreadOrdersAllClearMismatch {
+                reported: report.spread_orders_all_clear,
+                derived: derived_spread_orders_all_clear,
+            },
+        );
+    }
+    if report.account_wide_orders_all_clear != derived_account_wide_orders_all_clear {
+        failures.push(
+            EmergencyCancelVerificationFailure::AccountWideOrdersAllClearMismatch {
+                reported: report.account_wide_orders_all_clear,
+                derived: derived_account_wide_orders_all_clear,
             },
         );
     }
@@ -401,6 +462,12 @@ pub fn verify_emergency_cancel_paths(
         all_configured_accounts_selected,
         reported_regular_orders_all_clear: report.regular_orders_all_clear,
         derived_regular_orders_all_clear,
+        reported_algo_orders_all_clear: report.algo_orders_all_clear,
+        derived_algo_orders_all_clear,
+        reported_spread_orders_all_clear: report.spread_orders_all_clear,
+        derived_spread_orders_all_clear,
+        reported_account_wide_orders_all_clear: report.account_wide_orders_all_clear,
+        derived_account_wide_orders_all_clear,
         reported_evidence_complete: report.evidence_complete,
         derived_evidence_complete,
         reported_all_clear: report.all_clear,
@@ -408,7 +475,7 @@ pub fn verify_emergency_cancel_paths(
         failures,
         limitations: vec![
             "the report records Reap's authenticated REST outcomes but does not embed raw exchange responses for independent replay".to_string(),
-            "regular-order zero excludes OKX algo and spread order classes; certify separate cancellation paths before enabling either class".to_string(),
+            "OKX has no documented algo-order Cancel All After endpoint; algo zero therefore relies on explicit cancellation, authoritative polling, and the operator's producer-stop confirmation".to_string(),
             "config, executable, host, and account hashes are provenance identifiers, not externally signed attestations".to_string(),
             "this verifier does not prove every external order producer was stopped or replace operator review of incident timing".to_string(),
         ],
@@ -527,8 +594,19 @@ fn validate_account_shape(
     if account.enumeration_failures > account.enumeration_attempts {
         account_failures.push("enumeration failures exceed attempts".to_string());
     }
-    if account.initial_open_orders.is_some() != account.final_open_orders.is_some() {
-        account_failures.push("initial/final enumeration evidence coverage disagrees".to_string());
+    let enumeration_coverage = [
+        account.initial_open_orders.is_some(),
+        account.initial_algo_orders.is_some(),
+        account.initial_spread_orders.is_some(),
+        account.final_open_orders.is_some(),
+        account.final_algo_orders.is_some(),
+        account.final_spread_orders.is_some(),
+    ];
+    if enumeration_coverage
+        .iter()
+        .any(|covered| *covered != enumeration_coverage[0])
+    {
+        account_failures.push("initial/final order-domain evidence coverage disagrees".to_string());
     }
     if account.initial_open_orders.is_some()
         && account.enumeration_attempts <= account.enumeration_failures
@@ -547,27 +625,87 @@ fn validate_account_shape(
     {
         account_failures.push("final open orders exceed unique orders seen".to_string());
     }
+    if account
+        .initial_algo_orders
+        .is_some_and(|count| count > account.unique_algo_orders_seen)
+        || account
+            .final_algo_orders
+            .is_some_and(|count| count > account.unique_algo_orders_seen)
+    {
+        account_failures.push("algo order counts exceed unique orders seen".to_string());
+    }
+    if account
+        .initial_spread_orders
+        .is_some_and(|count| count > account.unique_spread_orders_seen)
+        || account
+            .final_spread_orders
+            .is_some_and(|count| count > account.unique_spread_orders_seen)
+    {
+        account_failures.push("spread order counts exceed unique orders seen".to_string());
+    }
     if account.cancel_batch_failures > account.cancel_batches {
         account_failures.push("cancel batch failures exceed attempts".to_string());
     }
-    let expected_remaining = account
-        .final_open_orders
-        .unwrap_or_default()
-        .min(MAX_REMAINING_ORDER_DETAILS);
-    if account.remaining_orders.len() != expected_remaining {
-        account_failures.push("remaining-order details do not match the final count".to_string());
+    if account.algo_cancel_batch_failures > account.algo_cancel_batches {
+        account_failures.push("algo cancel batch failures exceed attempts".to_string());
     }
-    if account.final_open_orders.is_none() && !account.remaining_orders.is_empty() {
-        account_failures.push("remaining orders exist without a final enumeration".to_string());
+    if account.spread_mass_cancel_failures > account.spread_mass_cancel_attempts {
+        account_failures.push("spread mass-cancel failures exceed attempts".to_string());
     }
-    if account.verified_zero_after_deadman {
-        if account.final_open_orders != Some(0) {
-            account_failures.push("deadman zero is claimed with a nonzero final book".to_string());
+    for (label, final_count, remaining_count) in [
+        (
+            "regular",
+            account.final_open_orders,
+            account.remaining_orders.len(),
+        ),
+        (
+            "algo",
+            account.final_algo_orders,
+            account.remaining_algo_orders.len(),
+        ),
+        (
+            "spread",
+            account.final_spread_orders,
+            account.remaining_spread_orders.len(),
+        ),
+    ] {
+        let expected_remaining = final_count
+            .unwrap_or_default()
+            .min(MAX_REMAINING_ORDER_DETAILS);
+        if remaining_count != expected_remaining {
+            account_failures.push(format!(
+                "{label} remaining-order details do not match the final count"
+            ));
+        }
+        if final_count.is_none() && remaining_count != 0 {
+            account_failures.push(format!(
+                "{label} remaining orders exist without a final enumeration"
+            ));
+        }
+    }
+    let verified_domains = [
+        account.verified_zero_after_deadman,
+        account.verified_algo_zero_after_deadman,
+        account.verified_spread_zero_after_deadman,
+    ];
+    if verified_domains
+        .iter()
+        .any(|verified| *verified != verified_domains[0])
+    {
+        account_failures.push("order-domain zero claims disagree".to_string());
+    }
+    if verified_domains[0] {
+        if account.final_open_orders != Some(0)
+            || account.final_algo_orders != Some(0)
+            || account.final_spread_orders != Some(0)
+        {
+            account_failures
+                .push("account-wide zero is claimed with a nonzero final order domain".to_string());
         }
         let minimum_elapsed_ms = deadman_timeout_secs.saturating_add(2).saturating_mul(1_000);
         if account.elapsed_ms < minimum_elapsed_ms {
             account_failures
-                .push("deadman zero was recorded before the trigger horizon".to_string());
+                .push("account-wide zero was recorded before the deadman horizon".to_string());
         }
     }
     if account.elapsed_ms > report_elapsed_ms
@@ -612,13 +750,45 @@ fn validate_account_shape(
 }
 
 fn derived_account_all_clear(account: &EmergencyAccountReport, deadman_timeout_secs: u64) -> bool {
+    derived_regular_all_clear(account, deadman_timeout_secs)
+        && derived_algo_all_clear(account, deadman_timeout_secs)
+        && derived_spread_all_clear(account, deadman_timeout_secs)
+}
+
+fn derived_regular_all_clear(account: &EmergencyAccountReport, deadman_timeout_secs: u64) -> bool {
     account.deadman_armed
         && account.verified_zero_after_deadman
-        && account.enumeration_attempts > account.enumeration_failures
-        && account.initial_open_orders.is_some()
+        && complete_enumeration_coverage(account)
         && account.final_open_orders == Some(0)
         && account.remaining_orders.is_empty()
         && account.elapsed_ms >= deadman_timeout_secs.saturating_add(2).saturating_mul(1_000)
+}
+
+fn derived_algo_all_clear(account: &EmergencyAccountReport, deadman_timeout_secs: u64) -> bool {
+    account.verified_algo_zero_after_deadman
+        && complete_enumeration_coverage(account)
+        && account.final_algo_orders == Some(0)
+        && account.remaining_algo_orders.is_empty()
+        && account.elapsed_ms >= deadman_timeout_secs.saturating_add(2).saturating_mul(1_000)
+}
+
+fn derived_spread_all_clear(account: &EmergencyAccountReport, deadman_timeout_secs: u64) -> bool {
+    account.spread_deadman_armed
+        && account.verified_spread_zero_after_deadman
+        && complete_enumeration_coverage(account)
+        && account.final_spread_orders == Some(0)
+        && account.remaining_spread_orders.is_empty()
+        && account.elapsed_ms >= deadman_timeout_secs.saturating_add(2).saturating_mul(1_000)
+}
+
+fn complete_enumeration_coverage(account: &EmergencyAccountReport) -> bool {
+    account.enumeration_attempts > account.enumeration_failures
+        && account.initial_open_orders.is_some()
+        && account.initial_algo_orders.is_some()
+        && account.initial_spread_orders.is_some()
+        && account.final_open_orders.is_some()
+        && account.final_algo_orders.is_some()
+        && account.final_spread_orders.is_some()
 }
 
 fn normalized_account_ids(account_ids: &[String]) -> (Vec<String>, bool) {
@@ -743,19 +913,37 @@ mod tests {
                 exchange_clock_sampled: true,
                 exchange_clock_skew_ms: Some(1),
                 deadman_armed: true,
-                enumeration_attempts: 2,
+                spread_deadman_armed: true,
+                enumeration_attempts: 18,
                 enumeration_failures: 0,
                 initial_open_orders: Some(1),
+                initial_algo_orders: Some(1),
+                initial_spread_orders: Some(1),
                 unique_orders_seen: 1,
+                unique_algo_orders_seen: 1,
+                unique_spread_orders_seen: 1,
                 cancel_batches: 1,
                 cancel_batch_failures: 0,
                 accepted_cancel_requests: 1,
                 rejected_cancel_requests: 0,
                 unacknowledged_cancel_requests: 0,
+                algo_cancel_batches: 1,
+                algo_cancel_batch_failures: 0,
+                accepted_algo_cancel_requests: 1,
+                rejected_algo_cancel_requests: 0,
+                unacknowledged_algo_cancel_requests: 0,
+                spread_mass_cancel_attempts: 1,
+                spread_mass_cancel_failures: 0,
                 verified_zero_after_deadman: true,
+                verified_algo_zero_after_deadman: true,
+                verified_spread_zero_after_deadman: true,
                 final_open_orders: Some(0),
+                final_algo_orders: Some(0),
+                final_spread_orders: Some(0),
                 unmanaged_symbols: Vec::new(),
                 remaining_orders: Vec::new(),
+                remaining_algo_orders: Vec::new(),
+                remaining_spread_orders: Vec::new(),
                 incident_count: 0,
                 incidents: Vec::new(),
                 elapsed_ms: 13_000,
@@ -773,7 +961,7 @@ mod tests {
             provenance_incident_count: 0,
             provenance_incidents: Vec::new(),
             environment: TradingEnvironment::Demo,
-            scope: REGULAR_ORDER_SCOPE.to_string(),
+            scope: ACCOUNT_WIDE_ORDER_SCOPE.to_string(),
             excluded_order_classes: EXCLUDED_ORDER_CLASSES
                 .into_iter()
                 .map(str::to_string)
@@ -788,6 +976,9 @@ mod tests {
             execution_incident_count: 0,
             execution_incidents: Vec::new(),
             regular_orders_all_clear: true,
+            algo_orders_all_clear: true,
+            spread_orders_all_clear: true,
+            account_wide_orders_all_clear: true,
             evidence_complete: true,
             all_clear: true,
         };
@@ -985,7 +1176,7 @@ mod tests {
         assert!(verification.failures.iter().any(|failure| matches!(
             failure,
             EmergencyCancelVerificationFailure::AccountInvariant { message, .. }
-                if message.contains("nonzero final book")
+                if message.contains("nonzero final order domain")
         )));
     }
 

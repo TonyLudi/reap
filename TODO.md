@@ -226,16 +226,20 @@ architecture in [docs/architecture.md](docs/architecture.md).
 - [x] Add bounded asynchronous webhook alerts and Linux disk, memory, and
   kernel-clock preflight/periodic guards with fail-closed runtime integration.
 - [x] Add a strategy-independent, explicitly confirmed OKX emergency command
-  that arms Cancel All After, cancels regular orders account-wide, and proves
-  zero after the trigger horizon; document the algo/spread exclusion.
+  that arms regular and spread Cancel All After, exhaustively enumerates and
+  cancels regular, algo, and spread orders account-wide, and proves every
+  domain zero after the trigger horizon.
 - [x] Make emergency-cancel evidence create-new and fsynced, bind it to a
   schema, exact config file, binary, host, Java revision, and the same
   pseudonymous exchange-account identity as live reports; turn account task
   failures into bounded non-passing evidence instead of losing the report.
 - [x] Add strict credential-free emergency-cancel verification that re-hashes
   exact config/report bytes, re-derives selected/configured account coverage,
-  trigger-horizon and final-zero invariants, and can require every configured
-  account without claiming raw exchange-response replay or algo/spread scope.
+  per-domain deadman/trigger-horizon and final-zero invariants, and can require
+  every configured account without claiming raw exchange-response replay.
+- [x] Paginate regular OKX pending orders during normal reconciliation and all
+  three pending-order domains during emergency cancellation with strict page,
+  cursor, duplicate-ID, and terminal-short-page bounds.
 - [x] Restrict authenticated live and emergency endpoints to exact documented
   OKX Global, US/AU, EEA, or Turkey environment tuples; reject arbitrary TLS
   hosts and permit cleartext loopback only for complete demo-test tuples.
@@ -443,8 +447,7 @@ architecture in [docs/architecture.md](docs/architecture.md).
   verification result, and recheck all artifact hashes after research runs.
 - [ ] Deploy and exercise the webhook/host guards, systemd supervision, external
   unit-failure paging, and independent exchange cancel procedure on the target
-  host/account; add a separate algo/spread kill path if those order classes are
-  enabled.
+  host/account, including regular, algo, and spread final-zero evidence.
 - [ ] Certify production credentials/account mode/limits and expose production
   order entry only after every gate in `docs/trading-readiness.md` is signed off.
   Permission/IP policy and source-verifiable account evidence are implemented,

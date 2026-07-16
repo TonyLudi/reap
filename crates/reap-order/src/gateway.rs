@@ -4,8 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use reap_core::{AccountUpdate, NewOrder};
 use reap_venue::okx::{
-    HttpTransport, OkxCancelOrder, OkxFillPagination, OkxOrderAck, OkxPlaceOrder, OkxRestClient,
-    OkxTradeMode, RestError,
+    HttpTransport, OkxCancelOrder, OkxFillPagination, OkxOrderAck, OkxPlaceOrder,
+    OkxRegularOrderPagination, OkxRestClient, OkxTradeMode, RestError,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -327,10 +327,11 @@ where
         state: &PrivateStateReducer,
         instrument_type: Option<&str>,
         symbol: Option<&str>,
+        max_order_pages: usize,
         max_fill_pages: usize,
     ) -> Result<ReconciliationSnapshot, GatewayError> {
         let (remote_orders, remote_fills) = self
-            .fetch_remote_state(instrument_type, symbol, max_fill_pages)
+            .fetch_remote_state(instrument_type, symbol, max_order_pages, max_fill_pages)
             .await?;
         let remote_account = self.fetch_remote_account_state().await?;
         let report = reconcile_full_state(state, &remote_orders, &remote_fills, &remote_account);
@@ -346,10 +347,11 @@ where
         &self,
         instrument_type: Option<&str>,
         symbol: Option<&str>,
+        max_order_pages: usize,
         max_fill_pages: usize,
     ) -> Result<(Vec<reap_venue::RemoteOrder>, Vec<reap_venue::RemoteFill>), GatewayError> {
         self.io
-            .fetch_remote_state(instrument_type, symbol, max_fill_pages)
+            .fetch_remote_state(instrument_type, symbol, max_order_pages, max_fill_pages)
             .await
     }
 
@@ -440,10 +442,21 @@ where
         &self,
         instrument_type: Option<&str>,
         symbol: Option<&str>,
+        max_order_pages: usize,
         max_fill_pages: usize,
     ) -> Result<(Vec<reap_venue::RemoteOrder>, Vec<reap_venue::RemoteFill>), GatewayError> {
-        self.pacer.pace(RequestKind::Reconcile, "account").await;
-        let remote_orders = self.client.open_orders(instrument_type, symbol).await?;
+        let mut order_pagination = OkxRegularOrderPagination::new(max_order_pages)?;
+        loop {
+            self.pacer.pace(RequestKind::Reconcile, "account").await;
+            let page = self
+                .client
+                .regular_pending_orders_page(instrument_type, symbol, order_pagination.after())
+                .await?;
+            if order_pagination.accept(page)? {
+                break;
+            }
+        }
+        let remote_orders = order_pagination.into_orders();
         let mut pagination = OkxFillPagination::new(max_fill_pages)?;
         loop {
             self.pacer.pace(RequestKind::Reconcile, "account").await;
@@ -600,6 +613,29 @@ mod tests {
         }
     }
 
+    fn regular_order_response(first: usize, count: usize) -> HttpResponse {
+        let data = (first..first + count)
+            .map(|index| {
+                serde_json::json!({
+                    "ordId": format!("order-{index}"),
+                    "clOrdId": format!("client-{index}"),
+                    "instId": "BTC-USDT",
+                    "side": "buy",
+                    "state": "live",
+                    "px": "100",
+                    "sz": "0.01",
+                    "accFillSz": "0",
+                    "avgPx": "",
+                    "uTime": "1000"
+                })
+            })
+            .collect::<Vec<_>>();
+        HttpResponse {
+            status: 200,
+            body: serde_json::json!({"code": "0", "msg": "", "data": data}).to_string(),
+        }
+    }
+
     fn gateway(
         responses: Vec<Result<HttpResponse, RestError>>,
     ) -> (OkxOrderGateway<MockTransport>, Arc<Mutex<usize>>) {
@@ -729,10 +765,25 @@ mod tests {
             Ok(fill_response(200, 2)),
         ]);
 
-        let (orders, fills) = gateway.fetch_remote_state(None, None, 3).await.unwrap();
+        let (orders, fills) = gateway.fetch_remote_state(None, None, 3, 3).await.unwrap();
 
         assert!(orders.is_empty());
         assert_eq!(fills.len(), 102);
+        assert_eq!(*calls.lock().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn remote_state_reconciliation_fetches_every_regular_order_page() {
+        let (gateway, calls) = gateway(vec![
+            Ok(regular_order_response(100, 100)),
+            Ok(regular_order_response(200, 1)),
+            Ok(fill_response(1, 0)),
+        ]);
+
+        let (orders, fills) = gateway.fetch_remote_state(None, None, 3, 3).await.unwrap();
+
+        assert_eq!(orders.len(), 101);
+        assert!(fills.is_empty());
         assert_eq!(*calls.lock().unwrap(), 3);
     }
 

@@ -18,7 +18,7 @@ production trading process.
 | Instrument/account bootstrap | Account instruments/config/balance/positions are typed; authenticating API-key permissions and IP bindings are retained; exact configured scope is enforced with `withdraw` forbidden and production trade keys IP-bound; economic snapshots preserve borrowing flags, liabilities, interest, and margin-loan fields; live spot and borrow limits are cash-only/zero; enabled borrowing, missing applicable evidence, nonzero liabilities, margin positions, and nonzero positions outside configured ownership/mode fail before strategy/risk application | Needs a passing artifact from the real target account and host; tooling alone is not evidence |
 | Startup/restart gate | Executable phase state, engine-consumed account-snapshot invariant, mandatory independently fresh strategy references, immediate canonical cancellation on reference-readiness loss, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, durable latch restore, authoritative account repair, second-pass clean REST reconciliation, and read-only journal-bound deadman-expiry certification | Needs process-kill demo evidence; tooling alone is not evidence |
 | Event-loop profile | Allocation-aware raw OKX parity benchmark covers redundant wire input through strategy/risk and storage-record construction | Needs target-host capture and exchange-latency validation |
-| Operator control and alerts | HMAC-authenticated local controls use fsynced write-ahead latches; OKX Cancel All After is maintained independently; a separate CLI can arm the deadman, cancel all regular orders account-wide, and prove post-trigger zero with offline exact-config verification; another read-only CLI can prove source `20` after controlled process death | Must exercise target alert routing, deadman expiry, and the independent cancel procedure; algo/spread orders remain outside their scope |
+| Operator control and alerts | HMAC-authenticated local controls use fsynced write-ahead latches; OKX Cancel All After is maintained independently; a separate CLI can arm regular and spread deadmen, exhaustively cancel regular/algo/spread orders account-wide, and prove every domain zero with offline exact-config verification; another read-only CLI can prove regular-order source `20` after controlled process death | Must exercise target alert routing, regular-order deadman expiry, and the account-wide independent cancel procedure on the target account |
 | Process/host controls | Canonical journal ownership is exclusively locked before recovery or network setup; live and public capture share Linux disk, memory, and kernel-clock preflight/periodic checks; all official WebSocket handshakes on one host reserve through one owner-only process-shared pacer; capture schema 5 binds binary/host evidence and an exact process-global persisted-frame ordinal; hardened systemd templates encode mode-specific restart policy and bounded evidence capture | Must be installed, enabled, thresholded, monitored, and fault-tested on the target host; hosts sharing a NAT need isolated egress or an external IP-wide pacer |
 | Demo fault injection | A loopback-only proxy independently routes OKX demo REST, public, private-state, and order-command traffic; strict owner-local commands inject disconnects, matched frame drops, and matched REST responses; create-new injector/run artifacts bind proxy config and pinned Java provenance, and the live fault matrix validates supported typed roles | Tooling is implemented and credential-free forwarding smokes passed, but no credentialed isolated campaign or target-host acceptance evidence exists |
 | Build/supply chain | Rust `1.95.0` is pinned; least-privilege CI checks formatting, all-target lint, all workspace tests, a locked release build, and RustSec advisories; Cargo and Actions updates are proposed weekly | CI must remain green and dependency updates reviewed, but this does not replace credentialed exchange or target-host evidence |
@@ -79,14 +79,16 @@ production trading process.
     those failures fatal.
 13. A strategy-independent emergency command parses only exchange/account safety
     settings, refuses implicit account selection, requires producer-stop and
-    account-wide confirmations, arms Cancel All After, batch-cancels every
-    regular pending order across configured and unmanaged symbols, and verifies
-    account-wide zero after the trigger horizon. Its create-new schema-1 report
+    account-wide confirmations, arms regular and spread Cancel All After,
+    exhaustively pages and cancels every regular, algo, and spread pending order,
+    and verifies all domains zero after the trigger horizon. Its create-new
+    schema-2 report
     binds the exact config file, executable, host, Java revision, matching
     pseudonymous exchange-account identity, selected-account coverage, and
     bounded task failures before returning its final exit status. Its
-    deterministic tests cover a failed deadman, partial batch acknowledgement,
-    hung REST transport, missing credentials, identity failure, and task loss.
+    deterministic tests cover regular/algo/spread cancellation, a failed deadman,
+    partial batch acknowledgement, hung REST transport, missing credentials,
+    identity failure, and task loss.
 14. Hardened systemd templates permit bounded restart only for read-only observe
     mode. Demo and capture require operator-controlled restart so account
     reconciliation and capture-session rotation cannot be bypassed.
@@ -317,11 +319,12 @@ production trading process.
     so no credential-free fixture can satisfy the remaining demo gate.
 41. `verify-emergency-cancel` independently re-hashes exact config/report bytes,
     rejects symlinks and duplicate or mismatched account coverage, re-derives
-    regular-order zero only after the Cancel All After trigger horizon, and can
-    require every configured account. Emergency evidence and its verification
+    regular/algo/spread zero only after the Cancel All After trigger horizon, and
+    can require every configured account. Emergency evidence and its verification
     artifact are owner-only and directory-durable. The report does not embed raw
-    REST bodies, prove that all external order producers stopped, or cover OKX
-    algo/spread orders.
+    REST bodies or prove that all external order producers stopped. OKX documents
+    no algo CAA, so algo proof requires explicit cancellation and authoritative
+    zero polling under the producer-stop attestation.
 42. Authenticated live and emergency REST configuration now rejects arbitrary
     TLS hosts, cleartext production, URL credentials, alternate paths/ports,
     query/fragment data, environment mismatches, and mixed Global, US/AU, EEA,
@@ -1031,7 +1034,7 @@ Production enablement additionally requires:
   stablecoin guard; either implementation and exercise of external
   strategy-group/master coordination or continued rejection of those settings;
   deployed external alert routing; and target-host exercise of the
-  out-of-process regular-order kill plus any required algo/spread kill path.
+  out-of-process account-wide regular/algo/spread kill path.
 - Target-host time-service monitoring, CPU/thread placement, bounded
   backpressure, calibrated memory/disk thresholds, installed restart
   supervision, and external unit-failure paging.
