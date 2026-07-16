@@ -1530,6 +1530,14 @@ request pacing/timeouts, account credential environment names, and configured
 symbol keys. This keeps the exchange cancellation path available when the live
 strategy config or process is unhealthy.
 
+This command belongs to the isolated emergency plane defined by
+[chaos-connectivity-boundary.md](chaos-connectivity-boundary.md). Its
+regular/algo/spread authority is deliberately broader than live Chaos and MUST
+NOT be used as evidence that the strategy needs those mutation APIs. The
+[refactor plan](chaos-connectivity-refactor-plan.md) moves that authority out
+of the live dependency surface and makes the three domain workflows progress
+independently.
+
 The command covers all documented pending-order domains on each selected OKX
 account, including regular symbols not configured in the strategy: regular
 order-book orders, untriggered algo orders, and Nitro spread orders. It pages

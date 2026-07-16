@@ -9,11 +9,19 @@ deterministic risk, executable readiness/restart state, telemetry, and durable
 capture. Exchange certification and production deployment controls remain
 operational gates rather than strategy code.
 
+The current Chaos exchange-authority contract is
+[chaos-connectivity-boundary.md](chaos-connectivity-boundary.md). It controls
+which of the generic venue/runtime capabilities described here may be composed
+for Chaos. The staged enforcement and responsibility split are tracked in
+[chaos-connectivity-refactor-plan.md](chaos-connectivity-refactor-plan.md).
+
 ## Goals
 
 - Replicate the important `imm-strategy/chaos` decision logic in Rust.
 - Keep strategy behavior deterministic and replayable.
-- Support live exchange connectivity with multiple websocket connections.
+- Support only plan-derived live exchange connections, with multiple websocket
+  connections only for explicit sharding, isolation, capacity, or tested
+  redundancy requirements.
 - Handle duplicated, out-of-order, stale, and gapped exchange streams.
 - Keep the hot path lock-free or single-writer wherever practical.
 - Preserve backtest/live parity by using the same normalized events.
@@ -1532,6 +1540,12 @@ the deployment blocker.
 - Add independently routed demo fault injection with durable typed evidence.
   Done. Execute and accept the credentialed target-host campaign and OKX demo
   soak; tooling alone does not close that gate.
+
+The implemented Phase 8 surface is a record of current capability, not a grant
+of permanent authority to the Chaos process. In particular, broad emergency
+coverage, generic endpoint support, and Java-inspired connection pool size are
+being separated from normal strategy connectivity by the
+[Chaos connectivity refactor](chaos-connectivity-refactor-plan.md).
 
 See [trading-readiness.md](trading-readiness.md) for the detailed gate.
 

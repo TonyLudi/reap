@@ -10,6 +10,12 @@ The current source cross-check is pinned to `imm-strategy` commit
 `b6b120c7b7c466d8431bf082f3229328c5d7b2ae`. Re-audit this document and the
 fixture-derived Rust tests whenever that reference revision changes.
 
+The normative connectivity scope is
+[chaos-connectivity-boundary.md](chaos-connectivity-boundary.md). References to
+generic Java gateway machinery in this mapping are evidence and design context,
+not grants of strategy authority. The enforcement work is sequenced in
+[chaos-connectivity-refactor-plan.md](chaos-connectivity-refactor-plan.md).
+
 It is not a byte-for-byte port of the Java runtime, exchange abstractions, or
 control plane.
 
@@ -43,6 +49,7 @@ control plane.
 | Exchange funding forecast and funding overwrite precedence | `FundingRate.rate` and `funding_override` | Exact; OKX `fundingRate` remains the Java-parity strategy input |
 | Earliest active funding window | `update_funding_window` | Exact |
 | Ignore-best, quote-only, burst, price limit, and UTC halt behavior | Normalized market events and instrument state | Exact |
+| OKX public trades invalidate implied depth levels and can schedule repricing | `MarketEvent::Trade` currently advances time only | Partial; live trade input is retained, but trade-driven implied depth is a documented behavior gap |
 | Multi-level top/trailing quote targets and Java `Random(1)` sequence | `desired_quote_levels` and `JavaRandom` | Equivalent; optimizer churn differs |
 | Quote debounce, force refresh, and top-level refill delay | Quote target state and fill timestamps | Exact for target decisions |
 | Risk-group soft/hard/stop delta behavior | `RiskGroupState` quote and hedge permissions | Exact |
@@ -275,6 +282,11 @@ The following differences do not change the covered quote/hedge calculations:
   orders, and allow two physical orders per target level. Rust emits canonical
   target levels and currently realizes changes with cancel/new intents. Exact
   exchange order churn is an execution-policy difference.
+- Java quote optimizers choose GTC for targets at or inside their computed mid,
+  PostOnly otherwise, and send explicit `CancelMaker` STP. Rust currently
+  always sends PostOnly with no per-order quote STP. The connectivity boundary
+  preserves that profile while requiring the OKX account default
+  `acctStpMode = cancel_maker`; changing TIF/STP is a separate parity decision.
 - `useL1Quoter` is represented by configuring one quote level. The Java quoter's
   optimizer-specific amend/refill mechanics are not copied.
 - Rust live protocol support currently targets OKX. Binance-specific account,
@@ -299,17 +311,24 @@ The following differences do not change the covered quote/hedge calculations:
 
 ## Connectivity Cross-Check
 
-Pinned Java `ChaosLiveSub` subscribes separately to `MarketData` and
-`MarketDepth`; the checked-in Rust capture records spot/swap trades and full
-books before the common adapter/reducer boundary. `Iarb2Calculator` reads its
+Pinned Java `ChaosStrategyBase.doInit` subscribes to configured index data,
+per-symbol depth/trade/BBO/ticker inputs, and private order/position/account
+state. `ChaosLiveSub` is a separate diagnostic subscriber, not the
+authoritative iarb2 subscription graph. The checked-in Rust capture records
+spot/swap trades and full books before the common adapter/reducer boundary;
+capture breadth does not require the live Chaos process to open every one of
+those streams, but public trades remain an explicit live requirement because
+`OkEntity` can invalidate implied depth and `Iarb2Strategy` can schedule
+repricing from them. `Iarb2Calculator` reads its
 index map in `checkSpotIndexDeviation` and selects configured/managed/exchange
 funding in `getFundingRate`, while `StrategyChaosService` initializes
 `StableCoinDepegCheckerImpl`. The capture therefore also records BTC/USDT,
 USDT/USD, and USDC/USD indexes plus swap funding. Mark-price and spot/swap
 price-limit streams are explicit Rust accounting and live-risk hardening, not a
-claim that those exact capture gates exist in `ChaosLiveSub`. Runtime and
-offline verification require every listed stream from both exact configured
-replica/chunk socket plans.
+claim of identical Java channel composition. The boundary-refactor target
+requires runtime streams to resolve from the Chaos connectivity plan; offline
+capture verification may require every listed stream from both exact
+configured replica/chunk plans.
 
 Pinned Java `ChaosWriter` creates strategy CSV writers and sends append, flush,
 and close work to one `ioInbox` through `AsyncBufferedWriter`; `Iarb2Writer`
@@ -333,15 +352,15 @@ ownership reference rather than claiming file-format parity.
 | `ChaosWriter`/`AsyncBufferedWriter` enqueue strategy CSV append/flush/close work on `ioInbox`, delay production close by three seconds, and log IO failures | Create-new owner-only raw/normalized writers; one-second enqueue deadline; bounded flush/sync, abort, and partial-file evidence phases; typed non-clean failure report persisted before nonzero exit | Rust evidence hardening, not CSV parity: storage backpressure cannot silently drop data or remain only in logs, and any reported writer failure is inadmissible for research |
 | Separate receive and exchange latency tracking | Raw `recv_ts_ns`, exchange timestamps, bounded-memory capture timing distributions, capture health counters, and bounded live webhook alerts | Equivalent data retained; receive delay includes host clock/scheduling and alert routing is a deployment concern |
 | `MetCoinGatewayMktOkxNitroBaseConfig` configurable `okx.nitro.md.connect.interval.ms` (default zero) | One `connection_attempt_interval_ms` schedule shared through an owner-only advisory-lock file by public/private/order-command, capture, and fault-proxy-upstream initial and reconnect attempts | Current-contract hardening: Rust defaults to 400 ms and official endpoints enforce at least 334 ms for OKX's documented three connection requests/second/IP; the Java creation context remains an in-process reference. Rust coordinates processes on one host, while multiple hosts behind one NAT still require an external coordinator or isolated egress. |
-| `OkxNitroExchStatusClient` 10-second `/api/v5/system/status` polling plus `ExchStatusSafeguard` 60-second lead and `OkxNitroUtils.getExchStatus` service filter | Typed unsigned bootstrap and periodic status checks with the same unified service scope, current `env` filtering, endpoint-rate validation, and typed failure | Stronger lifecycle: Java pauses and may resume the strategy; Rust enters fail-closed cancel/reconcile shutdown and requires a clean restart |
+| `OkxNitroExchStatusClient` 10-second `/api/v5/system/status` polling plus `ExchStatusSafeguard` 60-second lead and `OkxNitroUtils.getExchStatus` service filter | Current typed bootstrap and periodic checks use a broad unified service scope, `env` filtering, endpoint-rate validation, and typed failure; the target derives relevant service/product scope from the Chaos connectivity plan | Stronger lifecycle with a required narrowing: Java pauses and may resume the strategy; Rust enters fail-closed cancel/reconcile shutdown and requires a clean restart, but spread-only maintenance must not halt regular Chaos |
 | Java `AccountConfig` plus `OkUtils.loadAccountConfig` retain UID, account/position mode, and borrowing-related settings but do not model current `perm` or `ip` response fields | Rust retains API-key label, normalized permission set, and normalized IP bindings from the same authenticated `/api/v5/account/config`; bootstrap enforces exact configured scope, production evidence forbids `withdraw` and requires a binding, periodic checks detect drift, and schema-3 account certification re-derives the decision from raw responses | Intentional Rust credential hardening around the Java account-mode boundary, not strategy parity |
 | Java strategy entities retain an `Instrument` from `instrumentCache` and use its tick, lot/minimum size, currencies, and contract value throughout their lifetime | Strict exact-row `/api/v5/account/instruments` bootstrap plus paced periodic comparison of those fields and current hard order maxima, typed current `upcChg` parsing, and final limit-order maximum enforcement | Current-contract hardening: missing/unknown rules, non-live state, rule drift, an imminent announced change, or an oversized final order fails closed; the poll is isolated from the deadman heartbeat |
 | Java strategy entities receive maker/taker fees from `StrategyToolkit.getTransactionFee`; `ChaosEntity.sanityCheck` rejects taker below maker | Current private-instrument `groupId` plus authenticated `/api/v5/account/trade-fee` `feeGroup` selection for each exact spot symbol or derivative family, startup verification, and paced periodic checks | Current-contract hardening: Rust rejects fee underpricing and unreadable/deprecated-only fee data; the fee poll is isolated from the deadman heartbeat |
-| Eight `OkxNitroOrderSessionKeeper` instances with `BY_UNDERLYING` dispatch, websocket order protocol, and `OkxNitroOrderClient.onOrderSessionDisconnected` immediate `cancelAll()` | Eight authenticated command sessions by default, deterministic underlying routing, bounded handshake/login/control/request/acknowledgement lifecycle, aggregate readiness, supervised reconnect, best-effort heartbeat telemetry, and lossless disconnect/fatal delivery | Equivalent command topology and fail-closed disconnect intent; Rust additionally prevents heartbeat backpressure from stalling command IO, classifies the pre-send/write ambiguity boundary, and retains REST for reconciliation and cancel safety |
+| Eight `OkxNitroOrderSessionKeeper` instances with `BY_UNDERLYING` dispatch, websocket order protocol, and `OkxNitroOrderClient.onOrderSessionDisconnected` immediate `cancelAll()` | Current Rust defaults to eight authenticated command sessions, hashes each underlying to one session without failover, and requires all sessions ready; the target creates only plan-assigned dispatch shards and models actual replicas separately | Java pool topology remains a connectivity reference, not strategy parity; fail-closed disconnect intent, bounded command lifecycle, ambiguity classification, and independent REST reconciliation remain required |
 | Batch subscription manager, per-`WsSubArg` `EVENT_SUB` context updates, and retry limits | Bounded socket partitioning, exact unique serialized subscription-argument acknowledgement-set readiness, acknowledgement timeout, and exponential reconnect | Equivalent identity-bound lifecycle with different batching policy; duplicate acknowledgements are idempotent, while malformed or unexpected acknowledgements fail closed |
 | `OrderDetailUpdate` `tradeId`/`fillSz`/`fillPx` and `UserTrade` `tradeId`/`fee`/`feeCcy`/`execType` | Current OKX order-channel `tradeId` plus per-fill `fillFee`/`fillFeeCcy`, optional fills channel with fee-bearing order-update precedence under either arrival order, instrument-scoped once-only journal record, and raw-statement comparison | Current-contract strengthening; the pinned Java order-session fill derivation says fee is unavailable and its separate user-trade processing is commented out |
 | `OkxNitroRestClient.getFills` 100-row pages, 200 ms pacing, descending cursor pagination, and short-page completion | Authenticated read-only `/api/v5/trade/fills` collector with the same page size/pacing/completion rule, fail-closed page bound, raw response retention, bracketed account identity, and offline cursor replay | Lifecycle mapping with a current-contract endpoint adaptation; pinned Java reads Nitro spread trades while Reap certifies regular strategy fills |
-| `OkxNitroRestClient.getAllOpenOrders` follows 100-row Nitro spread pages by `endId`; `massCancel` accepts the spread endpoint result | Typed regular/algo/spread pending-order pages with strict cursor and duplicate-ID checks, bounded terminal-page proof, typed per-item algo cancellation, spread mass cancel, and authoritative post-cancel polling | Current-contract hardening: Rust fails closed at a page bound and never treats cancel acceptance as final zero |
+| `OkxNitroRestClient.getAllOpenOrders` follows 100-row Nitro spread pages by `endId`; `massCancel` accepts the spread endpoint result | Typed regular/algo/spread pending-order pages with strict cursor and duplicate-ID checks, bounded terminal-page proof, typed per-item algo cancellation, spread mass cancel, and authoritative post-cancel polling | Emergency-only current-contract hardening: Rust fails closed at a page bound and never treats cancel acceptance as final zero; this does not grant algo/spread mutation to live Chaos |
 | `StaleOrderUpdateSafeguard` and `GatewayOrderStatsSafeguard.BookTotalPendingOrder` | Per-order submit-to-private-state and cancel-to-terminal-state deadlines, cancel retry, account block, and full REST reconciliation | Equivalent fail-closed intent with explicit OKX REST/private-state convergence |
 | `PositionGatewaySafeguard.OrsFillDelayToPositionUpdate` and the fill-derived position reconciler | Per-fill derivative-position or spot-currency convergence deadline plus monotonic rows, full REST comparison, tombstone repair, and second-pass confirmation | Equivalent fail-closed intent; Rust uses an explicit post-fill deadline rather than Java's two-cycle timestamp-difference check |
 | `PositionGatewaySafeguard.PosnMgnModeMismatch` | Required OKX `mgnMode` on websocket/REST positions, configured-mode bootstrap/runtime enforcement, and reconciliation comparison | Equivalent fail-closed intent; Rust aborts the live lifecycle instead of pausing inside a separate gateway process |
@@ -463,7 +482,9 @@ map strategy and connectivity behavior to those sources while treating
 Decision parity depends on delivering all required normalized events. For each
 configured account and instrument, live composition must provide:
 
-- Sequenced books and trades.
+- Sequenced books and public trades. Pinned Java consumes trades for OKX
+  implied-depth invalidation and repricing; current Rust only advances time, so
+  the subscription is retained while that behavior remains explicitly partial.
 - Funding rate, index ticker, mark price, and price-limit updates where used.
 - Redundant stablecoin/USD index tickers for every configured live risk guard.
 - Account balances, margin snapshots, positions, orders, and fills.
@@ -471,6 +492,9 @@ configured account and instrument, live composition must provide:
   from complete account/positions payload rounds, separately from per-socket
   ping/pong transport liveness.
 - Timer and system events through the same single-writer strategy loop.
+
+The connectivity boundary requires `act_on_burst = true` to have an explicit
+live `BurstSignal` provider; raw public trades do not satisfy that contract.
 
 Private order reasons must be registered before REST submission so websocket
 acknowledgements preserve `quote` versus `hedge` identity.

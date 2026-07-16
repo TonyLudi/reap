@@ -896,6 +896,12 @@ rollout approval remain required before production capital.
 
 Design docs:
 
+- [docs/chaos-connectivity-boundary.md](docs/chaos-connectivity-boundary.md)
+  defines the normative exchange capability allowlist for the current
+  Chaos/iarb2 strategy, live safety, emergency recovery, and offline evidence.
+- [docs/chaos-connectivity-refactor-plan.md](docs/chaos-connectivity-refactor-plan.md)
+  is the phased, goal-ready plan for enforcing that boundary and reducing
+  repository coupling without changing strategy behavior.
 - [docs/architecture.md](docs/architecture.md) describes the target HFT-style
   event-loop architecture, module split, websocket/dedup design, and migration
   plan.

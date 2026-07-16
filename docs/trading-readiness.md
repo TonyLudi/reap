@@ -5,6 +5,12 @@ decision model and a fail-closed OKX demo composition are implemented. The
 runtime has not completed a credentialed demo soak and must not be treated as a
 production trading process.
 
+The current broad connectivity implementation is being narrowed under the
+[Chaos connectivity boundary](chaos-connectivity-boundary.md) and its
+[refactor plan](chaos-connectivity-refactor-plan.md). Completing that refactor
+is a design prerequisite, not proof of exchange certification or production
+approval.
+
 ## Current Gap
 
 | Area | Current state | Trading impact |
