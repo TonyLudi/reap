@@ -376,6 +376,7 @@ fn benchmark_coordinator_state() -> LiveCoordinator {
         instruments,
         account_updates: HashMap::from([(ACCOUNT_ID.to_string(), account_update.clone())]),
         baseline_fill_ids: HashMap::from([(ACCOUNT_ID.to_string(), HashSet::new())]),
+        quote_stp_verified_accounts: HashSet::from([ACCOUNT_ID.to_string()]),
     };
     let mut coordinator = LiveCoordinator::new(config, verified, false, "benchmark-session")
         .expect("benchmark coordinator");

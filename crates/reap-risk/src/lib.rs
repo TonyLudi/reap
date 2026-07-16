@@ -200,7 +200,9 @@ impl InstrumentRiskModel {
         }
     }
 
-    fn notional_usd(self, qty: f64, price: f64) -> f64 {
+    /// Computes the absolute USD notional using the authenticated instrument
+    /// model shared by risk and the final live execution policy.
+    pub fn notional_usd(self, qty: f64, price: f64) -> f64 {
         match self {
             Self::Spot => qty * price,
             Self::LinearDerivative { contract_value } => qty * contract_value * price,

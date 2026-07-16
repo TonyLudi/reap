@@ -1,5 +1,6 @@
 mod chaos;
 mod connectivity;
+mod execution;
 
 pub use chaos::{
     ChaosConfig, ChaosStrategy, CoinConfig, ConfigValidation, HaltIntervalConfig, InstrumentConfig,
@@ -9,6 +10,9 @@ pub use chaos::{
 pub use connectivity::{
     ChaosDecisionConsumer, ChaosDecisionInput, ChaosDecisionInputRequirement,
     ChaosDecisionRequirementId, ChaosDecisionRequirements,
+};
+pub use execution::{
+    ChaosCancelOwned, ChaosExecutionIntent, ChaosExecutionPurpose, ChaosHedge, ChaosQuote,
 };
 
 use reap_core::{OrderIntent, StrategyEvent};

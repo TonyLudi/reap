@@ -155,10 +155,124 @@ pub struct AccountSnapshotRecord {
     pub update: AccountUpdate,
 }
 
+/// Account-scoped client identity for a regular order whose submit request was
+/// proven from the durable journal.
+///
+/// Construction remains private to recovery so a caller cannot turn an
+/// arbitrary client-order ID into ownership authority.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProvenRegularClientOrderKey {
+    account_id: String,
+    client_order_id: String,
+}
+
+impl ProvenRegularClientOrderKey {
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    pub fn client_order_id(&self) -> &str {
+        &self.client_order_id
+    }
+}
+
+/// Account-scoped exchange identity bound to a proven regular submit request.
+///
+/// Construction remains private to recovery for the same reason as
+/// [`ProvenRegularClientOrderKey`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProvenRegularExchangeOrderKey {
+    account_id: String,
+    exchange_order_id: String,
+}
+
+impl ProvenRegularExchangeOrderKey {
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    pub fn exchange_order_id(&self) -> &str {
+        &self.exchange_order_id
+    }
+}
+
+/// A well-formed regular submit request recovered before any matching
+/// acknowledgement.
+///
+/// This is an in-memory ownership proof only. It deliberately is not
+/// serializable and does not change the journal schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenRegularSubmitRequest {
+    account_id: String,
+    symbol: Symbol,
+    client_order_id: String,
+    idempotency_key: String,
+}
+
+impl ProvenRegularSubmitRequest {
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    pub fn symbol(&self) -> &str {
+        &self.symbol
+    }
+
+    pub fn client_order_id(&self) -> &str {
+        &self.client_order_id
+    }
+
+    pub fn idempotency_key(&self) -> &str {
+        &self.idempotency_key
+    }
+}
+
+/// An accepted or duplicate regular submit acknowledgement bound to its prior
+/// proven request.
+///
+/// This type is also recovery-only, non-serialized ownership state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenRegularOrderBinding {
+    request: ProvenRegularSubmitRequest,
+    exchange_order_id: String,
+}
+
+impl ProvenRegularOrderBinding {
+    pub fn account_id(&self) -> &str {
+        self.request.account_id()
+    }
+
+    pub fn symbol(&self) -> &str {
+        self.request.symbol()
+    }
+
+    pub fn client_order_id(&self) -> &str {
+        self.request.client_order_id()
+    }
+
+    pub fn idempotency_key(&self) -> &str {
+        self.request.idempotency_key()
+    }
+
+    pub fn exchange_order_id(&self) -> &str {
+        &self.exchange_order_id
+    }
+
+    pub fn request(&self) -> &ProvenRegularSubmitRequest {
+        &self.request
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RecoveredStorage {
     pub latest_orders: HashMap<String, OrderUpdate>,
+    /// Legacy acknowledgement-derived bindings retained for compatibility.
+    /// New live ownership decisions must use the proven regular indexes below.
     pub order_bindings: HashMap<String, HashMap<String, String>>,
+    pub proven_regular_submit_requests:
+        BTreeMap<ProvenRegularClientOrderKey, ProvenRegularSubmitRequest>,
+    pub proven_regular_order_bindings:
+        BTreeMap<ProvenRegularExchangeOrderKey, ProvenRegularOrderBinding>,
     pub fills: Vec<FillRecord>,
     pub seen_fill_keys: HashSet<FillKey>,
     pub baseline_fill_ids: HashMap<String, HashSet<FillKey>>,
@@ -587,54 +701,12 @@ where
                     .latest_orders
                     .insert(update.order_id.clone(), update);
             }
+            StorageRecord::OrderRequest(request) => {
+                apply_proven_regular_submit_request(&mut recovered, &request, index + 1)?;
+            }
             StorageRecord::OrderAck(ack) => {
-                let Some(exchange_order_id) = ack.exchange_order_id else {
-                    continue;
-                };
-                if ack.client_order_id.is_empty()
-                    || ack.client_order_id == "0"
-                    || exchange_order_id.is_empty()
-                    || exchange_order_id == "0"
-                {
-                    continue;
-                }
-                let bindings = recovered
-                    .order_bindings
-                    .entry(ack.account_id.clone())
-                    .or_default();
-                if let Some(existing_client_order_id) = bindings.get(&exchange_order_id)
-                    && existing_client_order_id != &ack.client_order_id
-                {
-                    return Err(StorageError::Corrupt {
-                        line: index + 1,
-                        message: format!(
-                            "account {} exchange order {} is bound to both client orders {} and {}",
-                            ack.account_id,
-                            exchange_order_id,
-                            existing_client_order_id,
-                            ack.client_order_id
-                        ),
-                    });
-                }
-                if let Some(existing_exchange_order_id) = bindings.iter().find_map(
-                    |(existing_exchange_order_id, existing_client_order_id)| {
-                        (existing_client_order_id == &ack.client_order_id
-                            && existing_exchange_order_id != &exchange_order_id)
-                            .then_some(existing_exchange_order_id)
-                    },
-                ) {
-                    return Err(StorageError::Corrupt {
-                        line: index + 1,
-                        message: format!(
-                            "account {} client order {} is bound to both exchange orders {} and {}",
-                            ack.account_id,
-                            ack.client_order_id,
-                            existing_exchange_order_id,
-                            exchange_order_id
-                        ),
-                    });
-                }
-                bindings.insert(exchange_order_id, ack.client_order_id);
+                apply_legacy_order_binding(&mut recovered, &ack, index + 1)?;
+                apply_proven_regular_submit_ack(&mut recovered, &ack, index + 1)?;
             }
             StorageRecord::Fill(fill) => {
                 recovered
@@ -657,6 +729,201 @@ where
         }
     }
     Ok(recovered)
+}
+
+fn nonempty_recovered_field(value: &str) -> bool {
+    !value.trim().is_empty()
+}
+
+fn valid_recovered_order_id(value: &str) -> bool {
+    nonempty_recovered_field(value) && value != "0"
+}
+
+fn apply_proven_regular_submit_request(
+    recovered: &mut RecoveredStorage,
+    request: &OrderRequestRecord,
+    line: usize,
+) -> Result<(), StorageError> {
+    let (Some(idempotency_key), Some(client_order_id)) =
+        (&request.idempotency_key, &request.client_order_id)
+    else {
+        return Ok(());
+    };
+    if !matches!(request.operation, OrderOperation::Submit)
+        || !nonempty_recovered_field(&request.account_id)
+        || !nonempty_recovered_field(&request.symbol)
+        || !valid_recovered_order_id(client_order_id)
+        || !nonempty_recovered_field(idempotency_key)
+        || request.exchange_order_id.is_some()
+    {
+        return Ok(());
+    }
+
+    let key = ProvenRegularClientOrderKey {
+        account_id: request.account_id.clone(),
+        client_order_id: client_order_id.clone(),
+    };
+    let proof = ProvenRegularSubmitRequest {
+        account_id: request.account_id.clone(),
+        symbol: request.symbol.clone(),
+        client_order_id: client_order_id.clone(),
+        idempotency_key: idempotency_key.clone(),
+    };
+    if let Some(existing) = recovered.proven_regular_submit_requests.get(&key) {
+        if existing != &proof {
+            return Err(StorageError::Corrupt {
+                line,
+                message: format!(
+                    "account {} client order {} has conflicting proven regular submit requests",
+                    request.account_id, client_order_id
+                ),
+            });
+        }
+        return Ok(());
+    }
+    recovered.proven_regular_submit_requests.insert(key, proof);
+    Ok(())
+}
+
+fn apply_legacy_order_binding(
+    recovered: &mut RecoveredStorage,
+    ack: &OrderAckRecord,
+    line: usize,
+) -> Result<(), StorageError> {
+    let Some(exchange_order_id) = &ack.exchange_order_id else {
+        return Ok(());
+    };
+    if ack.client_order_id.is_empty()
+        || ack.client_order_id == "0"
+        || exchange_order_id.is_empty()
+        || exchange_order_id == "0"
+    {
+        return Ok(());
+    }
+    let bindings = recovered
+        .order_bindings
+        .entry(ack.account_id.clone())
+        .or_default();
+    if let Some(existing_client_order_id) = bindings.get(exchange_order_id)
+        && existing_client_order_id != &ack.client_order_id
+    {
+        return Err(StorageError::Corrupt {
+            line,
+            message: format!(
+                "account {} exchange order {} is bound to both client orders {} and {}",
+                ack.account_id, exchange_order_id, existing_client_order_id, ack.client_order_id
+            ),
+        });
+    }
+    if let Some(existing_exchange_order_id) =
+        bindings
+            .iter()
+            .find_map(|(existing_exchange_order_id, existing_client_order_id)| {
+                (existing_client_order_id == &ack.client_order_id
+                    && existing_exchange_order_id != exchange_order_id)
+                    .then_some(existing_exchange_order_id)
+            })
+    {
+        return Err(StorageError::Corrupt {
+            line,
+            message: format!(
+                "account {} client order {} is bound to both exchange orders {} and {}",
+                ack.account_id, ack.client_order_id, existing_exchange_order_id, exchange_order_id
+            ),
+        });
+    }
+    bindings.insert(exchange_order_id.clone(), ack.client_order_id.clone());
+    Ok(())
+}
+
+fn apply_proven_regular_submit_ack(
+    recovered: &mut RecoveredStorage,
+    ack: &OrderAckRecord,
+    line: usize,
+) -> Result<(), StorageError> {
+    if !matches!(ack.operation, OrderOperation::Submit)
+        || !nonempty_recovered_field(&ack.account_id)
+        || !valid_recovered_order_id(&ack.client_order_id)
+    {
+        return Ok(());
+    }
+    let client_key = ProvenRegularClientOrderKey {
+        account_id: ack.account_id.clone(),
+        client_order_id: ack.client_order_id.clone(),
+    };
+    if matches!(ack.status, OrderAckStatus::Rejected) {
+        recovered.proven_regular_submit_requests.remove(&client_key);
+        recovered
+            .proven_regular_order_bindings
+            .retain(|_, binding| {
+                binding.account_id() != ack.account_id
+                    || binding.client_order_id() != ack.client_order_id
+            });
+        return Ok(());
+    }
+    if !matches!(
+        ack.status,
+        OrderAckStatus::Accepted | OrderAckStatus::Duplicate
+    ) {
+        return Ok(());
+    }
+    let Some(exchange_order_id) = &ack.exchange_order_id else {
+        return Ok(());
+    };
+    if !valid_recovered_order_id(exchange_order_id) {
+        return Ok(());
+    }
+    let Some(request) = recovered
+        .proven_regular_submit_requests
+        .get(&client_key)
+        .cloned()
+    else {
+        return Ok(());
+    };
+    let exchange_key = ProvenRegularExchangeOrderKey {
+        account_id: ack.account_id.clone(),
+        exchange_order_id: exchange_order_id.clone(),
+    };
+    let binding = ProvenRegularOrderBinding {
+        request,
+        exchange_order_id: exchange_order_id.clone(),
+    };
+    if let Some(existing) = recovered.proven_regular_order_bindings.get(&exchange_key) {
+        if existing != &binding {
+            return Err(StorageError::Corrupt {
+                line,
+                message: format!(
+                    "account {} exchange order {} has conflicting proven regular bindings",
+                    ack.account_id, exchange_order_id
+                ),
+            });
+        }
+        return Ok(());
+    }
+    if let Some(existing) = recovered
+        .proven_regular_order_bindings
+        .values()
+        .find(|existing| {
+            existing.account_id() == ack.account_id
+                && existing.client_order_id() == ack.client_order_id
+                && existing.exchange_order_id() != exchange_order_id
+        })
+    {
+        return Err(StorageError::Corrupt {
+            line,
+            message: format!(
+                "account {} proven client order {} is bound to both exchange orders {} and {}",
+                ack.account_id,
+                ack.client_order_id,
+                existing.exchange_order_id(),
+                exchange_order_id
+            ),
+        });
+    }
+    recovered
+        .proven_regular_order_bindings
+        .insert(exchange_key, binding);
+    Ok(())
 }
 
 fn apply_recovered_latch(recovered: &mut RecoveredStorage, latch: SafetyLatchRecord) {
@@ -910,6 +1177,82 @@ mod tests {
                 recv_ts_ns: 1,
                 raw_hash: 2,
                 payload: "{}".to_string(),
+            },
+        }
+    }
+
+    fn recover_records(
+        records: impl IntoIterator<Item = StorageRecord>,
+    ) -> Result<RecoveredStorage, StorageError> {
+        let journal = records
+            .into_iter()
+            .map(|record| {
+                serde_json::to_string(&StoredEnvelope {
+                    schema_version: CURRENT_SCHEMA_VERSION,
+                    record,
+                })
+                .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        recover_jsonl_bytes(format!("{journal}\n").as_bytes())
+    }
+
+    fn regular_submit_request(
+        account_id: &str,
+        symbol: &str,
+        client_order_id: &str,
+        idempotency_key: &str,
+    ) -> StorageRecord {
+        StorageRecord::OrderRequest(OrderRequestRecord {
+            ts_ms: 1,
+            account_id: account_id.to_string(),
+            operation: OrderOperation::Submit,
+            idempotency_key: Some(idempotency_key.to_string()),
+            client_order_id: Some(client_order_id.to_string()),
+            exchange_order_id: None,
+            symbol: symbol.to_string(),
+        })
+    }
+
+    fn regular_submit_ack(
+        account_id: &str,
+        client_order_id: &str,
+        exchange_order_id: Option<&str>,
+        status: OrderAckStatus,
+    ) -> StorageRecord {
+        StorageRecord::OrderAck(OrderAckRecord {
+            ts_ms: 2,
+            account_id: account_id.to_string(),
+            operation: OrderOperation::Submit,
+            client_order_id: client_order_id.to_string(),
+            exchange_order_id: exchange_order_id.map(str::to_string),
+            status,
+            message: "test acknowledgement".to_string(),
+        })
+    }
+
+    fn private_order(account_id: &str, client_order_id: &str, symbol: &str) -> StorageRecord {
+        StorageRecord::Order {
+            account_id: Some(account_id.to_string()),
+            update: OrderUpdate {
+                ts_ms: 2,
+                order_id: client_order_id.to_string(),
+                symbol: symbol.to_string(),
+                side: Side::Buy,
+                event: OrderEvent::New,
+                status: OrderStatus::Live,
+                price: 100.0,
+                time_in_force: None,
+                qty: 1.0,
+                open_qty: 1.0,
+                filled_qty: 0.0,
+                avg_fill_price: 0.0,
+                last_fill_qty: 0.0,
+                last_fill_price: 0.0,
+                last_fill_liquidity: None,
+                last_fill_fee: None,
+                reason: "private order update".to_string(),
             },
         }
     }
@@ -1458,6 +1801,295 @@ mod tests {
         );
         assert_eq!(recovered.order_bindings["main"]["exchange-1"], "order-1");
         assert_eq!(recovered.last_ts_ms, 2);
+    }
+
+    #[test]
+    fn recovery_proves_regular_requests_before_selected_submit_acknowledgements() {
+        let recovered = recover_records([
+            regular_submit_request("pending", "BTC-USDT", "client-p", "idem-p"),
+            regular_submit_ack(
+                "pending",
+                "client-p",
+                None,
+                OrderAckStatus::PendingReconciliation,
+            ),
+            regular_submit_request("ambiguous", "ETH-USDT", "client-a", "idem-a"),
+            regular_submit_ack("ambiguous", "client-a", None, OrderAckStatus::Ambiguous),
+            regular_submit_request("accepted", "SOL-USDT", "client-ok", "idem-ok"),
+            regular_submit_ack(
+                "accepted",
+                "client-ok",
+                Some("exchange-ok"),
+                OrderAckStatus::Accepted,
+            ),
+            regular_submit_request("duplicate", "XRP-USDT", "client-dup", "idem-dup"),
+            regular_submit_ack(
+                "duplicate",
+                "client-dup",
+                Some("exchange-dup"),
+                OrderAckStatus::Duplicate,
+            ),
+        ])
+        .unwrap();
+
+        assert_eq!(recovered.proven_regular_submit_requests.len(), 4);
+        assert_eq!(recovered.proven_regular_order_bindings.len(), 2);
+        let requests = recovered
+            .proven_regular_submit_requests
+            .iter()
+            .map(|(key, request)| {
+                (
+                    key.account_id(),
+                    key.client_order_id(),
+                    request.account_id(),
+                    request.symbol(),
+                    request.client_order_id(),
+                    request.idempotency_key(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(requests.contains(&(
+            "pending", "client-p", "pending", "BTC-USDT", "client-p", "idem-p"
+        )));
+        let bindings = recovered
+            .proven_regular_order_bindings
+            .iter()
+            .map(|(key, binding)| {
+                (
+                    key.account_id(),
+                    key.exchange_order_id(),
+                    binding.account_id(),
+                    binding.symbol(),
+                    binding.client_order_id(),
+                    binding.idempotency_key(),
+                    binding.exchange_order_id(),
+                    binding.request().client_order_id(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(bindings.contains(&(
+            "accepted",
+            "exchange-ok",
+            "accepted",
+            "SOL-USDT",
+            "client-ok",
+            "idem-ok",
+            "exchange-ok",
+            "client-ok"
+        )));
+        assert!(bindings.contains(&(
+            "duplicate",
+            "exchange-dup",
+            "duplicate",
+            "XRP-USDT",
+            "client-dup",
+            "idem-dup",
+            "exchange-dup",
+            "client-dup"
+        )));
+    }
+
+    #[test]
+    fn recovery_does_not_backfill_binding_from_ack_before_request() {
+        let recovered = recover_records([
+            regular_submit_ack(
+                "main",
+                "client-1",
+                Some("exchange-1"),
+                OrderAckStatus::Accepted,
+            ),
+            regular_submit_request("main", "BTC-USDT", "client-1", "idem-1"),
+        ])
+        .unwrap();
+
+        assert_eq!(recovered.proven_regular_submit_requests.len(), 1);
+        assert!(recovered.proven_regular_order_bindings.is_empty());
+        assert_eq!(recovered.order_bindings["main"]["exchange-1"], "client-1");
+    }
+
+    #[test]
+    fn recovery_rejected_submit_revokes_proven_regular_ownership() {
+        let recovered = recover_records([
+            regular_submit_request("main", "BTC-USDT", "client-1", "idem-1"),
+            regular_submit_ack(
+                "main",
+                "client-1",
+                Some("exchange-1"),
+                OrderAckStatus::Accepted,
+            ),
+            regular_submit_ack("main", "client-1", None, OrderAckStatus::Rejected),
+        ])
+        .unwrap();
+
+        assert!(recovered.proven_regular_submit_requests.is_empty());
+        assert!(recovered.proven_regular_order_bindings.is_empty());
+        assert_eq!(recovered.order_bindings["main"]["exchange-1"], "client-1");
+    }
+
+    #[test]
+    fn recovery_does_not_infer_regular_ownership_from_untrusted_records() {
+        let malformed_requests = [
+            OrderRequestRecord {
+                ts_ms: 1,
+                account_id: String::new(),
+                operation: OrderOperation::Submit,
+                idempotency_key: Some("idem-empty-account".to_string()),
+                client_order_id: Some("client-empty-account".to_string()),
+                exchange_order_id: None,
+                symbol: "BTC-USDT".to_string(),
+            },
+            OrderRequestRecord {
+                ts_ms: 1,
+                account_id: "main".to_string(),
+                operation: OrderOperation::Submit,
+                idempotency_key: Some("idem-empty-symbol".to_string()),
+                client_order_id: Some("client-empty-symbol".to_string()),
+                exchange_order_id: None,
+                symbol: "  ".to_string(),
+            },
+            OrderRequestRecord {
+                ts_ms: 1,
+                account_id: "main".to_string(),
+                operation: OrderOperation::Submit,
+                idempotency_key: Some("idem-empty-client".to_string()),
+                client_order_id: Some(String::new()),
+                exchange_order_id: None,
+                symbol: "BTC-USDT".to_string(),
+            },
+            OrderRequestRecord {
+                ts_ms: 1,
+                account_id: "main".to_string(),
+                operation: OrderOperation::Submit,
+                idempotency_key: Some(String::new()),
+                client_order_id: Some("client-empty-idempotency".to_string()),
+                exchange_order_id: None,
+                symbol: "BTC-USDT".to_string(),
+            },
+            OrderRequestRecord {
+                ts_ms: 1,
+                account_id: "main".to_string(),
+                operation: OrderOperation::Submit,
+                idempotency_key: Some("idem-prebound".to_string()),
+                client_order_id: Some("client-prebound".to_string()),
+                exchange_order_id: Some("exchange-prebound".to_string()),
+                symbol: "BTC-USDT".to_string(),
+            },
+        ];
+        let mut records = malformed_requests.map(StorageRecord::OrderRequest).to_vec();
+        records.extend([
+            regular_submit_ack(
+                "ack-only",
+                "client-ack-only",
+                Some("exchange-ack-only"),
+                OrderAckStatus::Accepted,
+            ),
+            StorageRecord::OrderRequest(OrderRequestRecord {
+                ts_ms: 1,
+                account_id: "cancel".to_string(),
+                operation: OrderOperation::Cancel,
+                idempotency_key: Some("idem-cancel".to_string()),
+                client_order_id: Some("client-cancel".to_string()),
+                exchange_order_id: None,
+                symbol: "BTC-USDT".to_string(),
+            }),
+            StorageRecord::OrderAck(OrderAckRecord {
+                ts_ms: 2,
+                account_id: "cancel".to_string(),
+                operation: OrderOperation::Cancel,
+                client_order_id: "client-cancel".to_string(),
+                exchange_order_id: Some("exchange-cancel".to_string()),
+                status: OrderAckStatus::Accepted,
+                message: "cancel accepted".to_string(),
+            }),
+            private_order("private", "client-private", "BTC-USDT"),
+            regular_submit_ack(
+                "private",
+                "client-private",
+                Some("exchange-private"),
+                OrderAckStatus::Accepted,
+            ),
+            regular_submit_request("rejected", "BTC-USDT", "client-r", "idem-r"),
+            regular_submit_ack(
+                "rejected",
+                "client-r",
+                Some("exchange-r"),
+                OrderAckStatus::Rejected,
+            ),
+        ]);
+
+        let recovered = recover_records(records).unwrap();
+
+        assert!(recovered.proven_regular_submit_requests.is_empty());
+        assert!(recovered.proven_regular_order_bindings.is_empty());
+        assert!(recovered.order_bindings.contains_key("ack-only"));
+        assert!(recovered.order_bindings.contains_key("cancel"));
+        assert!(recovered.order_bindings.contains_key("private"));
+        assert!(recovered.order_bindings.contains_key("rejected"));
+        assert!(recovered.latest_orders.contains_key("client-private"));
+    }
+
+    #[test]
+    fn recovery_rejects_conflicting_proven_regular_submit_requests() {
+        for conflicting in [
+            regular_submit_request("main", "ETH-USDT", "client-1", "idem-1"),
+            regular_submit_request("main", "BTC-USDT", "client-1", "idem-2"),
+        ] {
+            let error = recover_records([
+                regular_submit_request("main", "BTC-USDT", "client-1", "idem-1"),
+                conflicting,
+            ])
+            .unwrap_err();
+
+            assert!(matches!(&error, StorageError::Corrupt { line: 2, .. }));
+            assert!(error.to_string().contains("conflict") || error.to_string().contains("both"));
+        }
+    }
+
+    #[test]
+    fn proven_regular_indexes_have_deterministic_key_order() {
+        let account_a = [
+            regular_submit_request("account-a", "BTC-USDT", "client-a", "idem-a"),
+            regular_submit_ack(
+                "account-a",
+                "client-a",
+                Some("exchange-z"),
+                OrderAckStatus::Accepted,
+            ),
+        ];
+        let account_z = [
+            regular_submit_request("account-z", "ETH-USDT", "client-z", "idem-z"),
+            regular_submit_ack(
+                "account-z",
+                "client-z",
+                Some("exchange-a"),
+                OrderAckStatus::Duplicate,
+            ),
+        ];
+        let left = recover_records(account_z.clone().into_iter().chain(account_a.clone())).unwrap();
+        let right = recover_records(account_a.into_iter().chain(account_z)).unwrap();
+
+        assert_eq!(
+            left.proven_regular_submit_requests,
+            right.proven_regular_submit_requests
+        );
+        assert_eq!(
+            left.proven_regular_order_bindings,
+            right.proven_regular_order_bindings
+        );
+        assert_eq!(
+            left.proven_regular_submit_requests
+                .keys()
+                .map(ProvenRegularClientOrderKey::account_id)
+                .collect::<Vec<_>>(),
+            ["account-a", "account-z"]
+        );
+        assert_eq!(
+            left.proven_regular_order_bindings
+                .keys()
+                .map(ProvenRegularExchangeOrderKey::account_id)
+                .collect::<Vec<_>>(),
+            ["account-a", "account-z"]
+        );
     }
 
     #[test]

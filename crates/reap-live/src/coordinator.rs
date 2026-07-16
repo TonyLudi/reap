@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use reap_core::{
-    FillKey, NormalizedEvent, OrderIntent, SystemEvent, SystemEventKind, TimeMs, Venue,
+    FillKey, NormalizedEvent, OrderIntent, OrderStatus, SystemEvent, SystemEventKind, TimeMs, Venue,
 };
-use reap_engine::{EngineOutput, TradingEngine};
+use reap_engine::{ChaosEngineOutput, SafetyCancelCandidate, TradingEngine};
 use reap_feed::{FeedOutput, RecoveryRequest};
 use reap_order::{
     CancelOutcome, ClientOrderIdGenerator, PrivateOrderIdentityError, PrivateStateReducer,
@@ -14,9 +14,12 @@ use reap_storage::{
     AccountSnapshotRecord, FillRecord, OrderAckRecord, OrderAckStatus, OrderOperation,
     ReconciliationRecord, SafetyLatchRecord, SafetyLatchScope, SafetyLatchSource, StorageRecord,
 };
-use reap_strategy::ChaosStrategy;
+use reap_strategy::{ChaosExecutionIntent, ChaosStrategy};
 use thiserror::Error;
 
+use crate::regular_execution::{
+    OwnedRegularOrders, RegularExecutionPolicy, RegularExecutionPolicyError,
+};
 use crate::{LiveConfig, ReadinessSnapshot, StartupError, StartupGate, VerifiedBootstrap};
 
 #[derive(Debug, Clone)]
@@ -103,8 +106,16 @@ pub enum CoordinatorError {
     },
     #[error("account {account_id} state policy violation: {message}")]
     AccountStatePolicy { account_id: String, message: String },
+    #[error("regular execution policy failed: {0}")]
+    RegularExecutionPolicy(String),
     #[error(transparent)]
     Startup(#[from] StartupError),
+}
+
+impl From<RegularExecutionPolicyError> for CoordinatorError {
+    fn from(error: RegularExecutionPolicyError) -> Self {
+        Self::RegularExecutionPolicy(error.to_string())
+    }
 }
 
 pub struct LiveCoordinator {
@@ -112,6 +123,8 @@ pub struct LiveCoordinator {
     engine: TradingEngine<ChaosStrategy>,
     startup: StartupGate,
     private_states: HashMap<String, PrivateStateReducer>,
+    regular_execution: RegularExecutionPolicy,
+    owned_regular_orders: OwnedRegularOrders,
     client_ids: HashMap<String, ClientOrderIdGenerator>,
     gateway_actions_enabled: bool,
     order_entry_enabled: bool,
@@ -134,6 +147,7 @@ impl LiveCoordinator {
         }
         let strategy = ChaosStrategy::new(config.strategy.clone())
             .map_err(|error| CoordinatorError::Strategy(error.to_string()))?;
+        let regular_execution = RegularExecutionPolicy::from_verified(&config, &verified)?;
         let mut risk = RiskGate::new(config.risk.clone());
         for instrument in verified.instruments.values() {
             risk.set_instrument_model(instrument.symbol.clone(), instrument.risk_model);
@@ -170,6 +184,8 @@ impl LiveCoordinator {
             engine: TradingEngine::new(strategy, risk),
             startup,
             private_states,
+            regular_execution,
+            owned_regular_orders: OwnedRegularOrders::default(),
             client_ids,
             gateway_actions_enabled,
             order_entry_enabled: gateway_actions_enabled,
@@ -248,7 +264,7 @@ impl LiveCoordinator {
         self.private_states.get(account_id)
     }
 
-    pub fn restore_order(
+    pub(crate) fn restore_owned_order(
         &mut self,
         account_id: &str,
         update: reap_core::OrderUpdate,
@@ -266,6 +282,14 @@ impl LiveCoordinator {
                 expected,
             });
         }
+        self.regular_execution
+            .validate_recovered_identity(account_id, &update.symbol)?;
+        self.owned_regular_orders.register_recovered(
+            account_id,
+            &update.symbol,
+            &update.order_id,
+            None,
+        )?;
         self.private_state_mut(account_id)?
             .restore_order_update(update.clone());
         Ok(self.process_normalized(NormalizedEvent::Order(update)))
@@ -277,6 +301,11 @@ impl LiveCoordinator {
         client_order_id: &str,
         exchange_order_id: &str,
     ) -> Result<(), CoordinatorError> {
+        self.owned_regular_orders.bind_exchange_order_id(
+            account_id,
+            client_order_id,
+            exchange_order_id,
+        )?;
         self.private_state_mut(account_id)?
             .bind_exchange_order_id(client_order_id, exchange_order_id)
             .map_err(|source| CoordinatorError::PrivateOrderIdentity {
@@ -371,6 +400,40 @@ impl LiveCoordinator {
                         account_id: account_id.clone(),
                         source,
                     })?;
+                let canonical_identity = self
+                    .private_state(&account_id)
+                    .and_then(|state| state.order_reducer().get(&canonical_id))
+                    .map(|order| (order.symbol.clone(), order.status));
+                let proven_owned = canonical_identity.as_ref().is_some_and(|(symbol, _)| {
+                    self.owned_regular_orders
+                        .get(&canonical_id)
+                        .is_some_and(|owned| {
+                            owned.account_id() == account_id && owned.symbol() == symbol
+                        })
+                });
+                if !proven_owned {
+                    let active = canonical_identity.as_ref().is_some_and(|(_, status)| {
+                        matches!(
+                            status,
+                            OrderStatus::PendingNew
+                                | OrderStatus::Live
+                                | OrderStatus::PartiallyFilled
+                        )
+                    });
+                    self.startup.mark_runtime_health(
+                        &format!("foreign_regular_order:{account_id}:{canonical_id}"),
+                        !active,
+                        if active {
+                            format!(
+                                "unproven regular order {canonical_id} is live on account {account_id}; operator handling is required"
+                            )
+                        } else {
+                            format!(
+                                "unproven regular order {canonical_id} is terminal on account {account_id}"
+                            )
+                        },
+                    );
+                }
                 let mut output = CoordinatorOutput::default();
                 if !known {
                     output.extend(self.reconciliation_fault(
@@ -567,6 +630,7 @@ impl LiveCoordinator {
         })
     }
 
+    #[cfg(test)]
     pub fn register_local_order(
         &mut self,
         account_id: &str,
@@ -587,6 +651,14 @@ impl LiveCoordinator {
                 expected,
             });
         }
+        self.regular_execution
+            .validate_recovered_identity(account_id, &order.symbol)?;
+        self.owned_regular_orders.register_recovered(
+            account_id,
+            &order.symbol,
+            client_order_id,
+            None,
+        )?;
         let update = self.private_state_mut(account_id)?.register_local_order_at(
             client_order_id,
             order,
@@ -641,6 +713,11 @@ impl LiveCoordinator {
             }
         };
         if let Some(exchange_order_id) = exchange_order_id.as_deref() {
+            self.owned_regular_orders.bind_exchange_order_id(
+                account_id,
+                &client_order_id,
+                exchange_order_id,
+            )?;
             self.private_state_mut(account_id)?
                 .bind_exchange_order_id(&client_order_id, exchange_order_id)
                 .map_err(|source| CoordinatorError::PrivateOrderIdentity {
@@ -729,6 +806,11 @@ impl LiveCoordinator {
                 })?;
             client_order_id
         };
+        self.owned_regular_orders.bind_exchange_order_id(
+            account_id,
+            &client_order_id,
+            &outcome.exchange_order_id,
+        )?;
         Ok(CoordinatorOutput {
             actions: Vec::new(),
             records: vec![StorageRecord::OrderAck(OrderAckRecord {
@@ -911,7 +993,7 @@ impl LiveCoordinator {
             _ => {}
         }
         let sync_stablecoin_readiness = self.event_updates_stablecoin_readiness(&event);
-        let engine_output = self.engine.on_event(event);
+        let engine_output = self.engine.on_chaos_event(event);
         if sync_stablecoin_readiness {
             self.sync_stablecoin_readiness(now_ms);
         }
@@ -1004,7 +1086,7 @@ impl LiveCoordinator {
     fn handle_engine_output(
         &mut self,
         now_ms: TimeMs,
-        engine_output: EngineOutput,
+        engine_output: ChaosEngineOutput,
         output: &mut CoordinatorOutput,
     ) {
         for system in engine_output.system_events {
@@ -1034,31 +1116,46 @@ impl LiveCoordinator {
             });
         }
         for intent in engine_output.intents {
+            let legacy = intent.to_order_intent();
             output.records.push(StorageRecord::Intent {
                 ts_ms: now_ms,
-                intent: intent.clone(),
+                intent: legacy.clone(),
             });
-            self.route_intent(now_ms, intent, output);
+            self.route_chaos_intent(now_ms, intent, legacy, output);
+        }
+        for candidate in engine_output.safety_cancel_candidates {
+            let legacy = candidate.to_order_intent();
+            output.records.push(StorageRecord::Intent {
+                ts_ms: now_ms,
+                intent: legacy.clone(),
+            });
+            self.route_safety_cancel(now_ms, candidate, legacy, output);
         }
     }
 
-    fn route_intent(
+    fn route_chaos_intent(
         &mut self,
         now_ms: TimeMs,
-        intent: OrderIntent,
+        intent: ChaosExecutionIntent,
+        legacy: OrderIntent,
         output: &mut CoordinatorOutput,
     ) {
         match intent {
-            OrderIntent::NewOrder(order) => {
+            intent @ (ChaosExecutionIntent::Quote(_) | ChaosExecutionIntent::Hedge(_)) => {
+                let symbol = match &intent {
+                    ChaosExecutionIntent::Quote(quote) => quote.symbol(),
+                    ChaosExecutionIntent::Hedge(hedge) => hedge.symbol(),
+                    ChaosExecutionIntent::CancelOwned(_) => unreachable!(),
+                };
                 let submit_enabled = self.gateway_actions_enabled && self.order_entry_enabled;
                 let Some(account_id) = self
                     .config
-                    .account_for_symbol(&order.symbol)
+                    .account_for_symbol(symbol)
                     .map(|account| account.id.clone())
                 else {
                     output.records.push(StorageRecord::IntentRejected {
                         ts_ms: now_ms,
-                        intent: OrderIntent::NewOrder(order),
+                        intent: legacy,
                         reason: "symbol has no account route".to_string(),
                     });
                     self.startup.mark_runtime_health(
@@ -1071,7 +1168,7 @@ impl LiveCoordinator {
                 if let Some(reason) = self.halted_accounts.get(&account_id) {
                     output.records.push(StorageRecord::IntentRejected {
                         ts_ms: now_ms,
-                        intent: OrderIntent::NewOrder(order),
+                        intent: legacy,
                         reason: format!("account {account_id} is halted: {reason}"),
                     });
                     return;
@@ -1079,7 +1176,7 @@ impl LiveCoordinator {
                 if !self.startup.can_submit_new(submit_enabled) {
                     output.records.push(StorageRecord::IntentRejected {
                         ts_ms: now_ms,
-                        intent: OrderIntent::NewOrder(order),
+                        intent: legacy,
                         reason: format!(
                             "live gate is {:?}; gateway actions enabled={}; new order entry enabled={}",
                             self.startup.phase(),
@@ -1087,6 +1184,26 @@ impl LiveCoordinator {
                             self.order_entry_enabled
                         ),
                     });
+                    return;
+                }
+                let approved = match self.regular_execution.authorize_submit(intent) {
+                    Ok(approved) => approved,
+                    Err(error) => {
+                        self.reject_execution_policy(now_ms, legacy, error, output);
+                        return;
+                    }
+                };
+                if approved.account_id() != account_id {
+                    self.reject_execution_policy(
+                        now_ms,
+                        legacy,
+                        RegularExecutionPolicyError::OwnerMismatch {
+                            symbol: approved.order().symbol.clone(),
+                            actual: approved.account_id().to_string(),
+                            expected: account_id,
+                        },
+                        output,
+                    );
                     return;
                 }
                 self.decision_sequence = self.decision_sequence.wrapping_add(1);
@@ -1099,63 +1216,132 @@ impl LiveCoordinator {
                     .get(&account_id)
                     .expect("validated account must have a client id generator")
                     .next(now_ms);
+                let pending = match self.owned_regular_orders.reserve_local(
+                    &approved,
+                    &client_order_id,
+                    self.private_states
+                        .get_mut(&account_id)
+                        .expect("validated account must have private state"),
+                    now_ms,
+                ) {
+                    Ok(pending) => pending,
+                    Err(error) => {
+                        self.reject_execution_policy(now_ms, legacy, error, output);
+                        return;
+                    }
+                };
+                let (approved_account_id, order) = approved.into_parts();
                 output.actions.push(LiveAction::Submit(SubmitAction {
                     ts_ms: now_ms,
-                    account_id: account_id.clone(),
+                    account_id: approved_account_id,
                     idempotency_key,
                     client_order_id: client_order_id.clone(),
                     order: order.clone(),
                 }));
-                let pending = self
-                    .private_states
-                    .get_mut(&account_id)
-                    .expect("validated account must have private state")
-                    .register_local_order_at(&client_order_id, order, now_ms);
-                if let Some(update) = pending {
-                    output.extend(self.process_normalized(NormalizedEvent::Order(update)));
-                }
+                output.extend(self.process_normalized(NormalizedEvent::Order(pending)));
             }
-            OrderIntent::CancelOrder { order_id, reason } => {
-                if !self.gateway_actions_enabled || !self.startup.can_cancel() {
-                    let rejection_reason = if self.gateway_actions_enabled {
-                        format!(
-                            "live gate is {:?}; cancellation is unavailable",
-                            self.startup.phase()
-                        )
-                    } else {
-                        "live gateway actions are disabled in observe mode".to_string()
-                    };
-                    output.records.push(StorageRecord::IntentRejected {
-                        ts_ms: now_ms,
-                        intent: OrderIntent::CancelOrder { order_id, reason },
-                        reason: rejection_reason,
-                    });
-                    return;
-                }
-                let route = self.private_states.iter().find_map(|(account_id, state)| {
-                    state
-                        .order_reducer()
-                        .get(&order_id)
-                        .map(|order| (account_id.clone(), order.symbol.clone()))
-                });
-                if let Some((account_id, symbol)) = route {
-                    output.actions.push(LiveAction::Cancel(CancelAction {
-                        ts_ms: now_ms,
-                        account_id,
-                        symbol,
-                        client_order_id: order_id,
-                        reason,
-                    }));
-                } else {
-                    output.records.push(StorageRecord::IntentRejected {
-                        ts_ms: now_ms,
-                        intent: OrderIntent::CancelOrder { order_id, reason },
-                        reason: "cancel target is not present in canonical private state"
-                            .to_string(),
-                    });
-                }
+            ChaosExecutionIntent::CancelOwned(cancel) => {
+                let order_id = cancel.order_id().to_string();
+                let reason = cancel.reason().to_string();
+                self.route_cancel_owned(now_ms, &order_id, &reason, legacy, output);
             }
         }
+    }
+
+    fn route_safety_cancel(
+        &mut self,
+        now_ms: TimeMs,
+        candidate: SafetyCancelCandidate,
+        legacy: OrderIntent,
+        output: &mut CoordinatorOutput,
+    ) {
+        self.route_cancel_owned(
+            now_ms,
+            candidate.order_id(),
+            candidate.reason(),
+            legacy,
+            output,
+        );
+    }
+
+    fn route_cancel_owned(
+        &mut self,
+        now_ms: TimeMs,
+        order_id: &str,
+        reason: &str,
+        legacy: OrderIntent,
+        output: &mut CoordinatorOutput,
+    ) {
+        if !self.gateway_actions_enabled || !self.startup.can_cancel() {
+            let rejection_reason = if self.gateway_actions_enabled {
+                format!(
+                    "live gate is {:?}; cancellation is unavailable",
+                    self.startup.phase()
+                )
+            } else {
+                "live gateway actions are disabled in observe mode".to_string()
+            };
+            output.records.push(StorageRecord::IntentRejected {
+                ts_ms: now_ms,
+                intent: legacy,
+                reason: rejection_reason,
+            });
+            return;
+        }
+        let approved = match self.regular_execution.authorize_cancel(
+            order_id,
+            reason,
+            &self.owned_regular_orders,
+            &self.private_states,
+        ) {
+            Ok(approved) => approved,
+            Err(error) => {
+                self.reject_execution_policy(now_ms, legacy, error, output);
+                return;
+            }
+        };
+        let (account_id, symbol, client_order_id, reason) = approved.into_parts();
+        output.actions.push(LiveAction::Cancel(CancelAction {
+            ts_ms: now_ms,
+            account_id,
+            symbol,
+            client_order_id,
+            reason,
+        }));
+    }
+
+    fn reject_execution_policy(
+        &mut self,
+        now_ms: TimeMs,
+        intent: OrderIntent,
+        error: RegularExecutionPolicyError,
+        output: &mut CoordinatorOutput,
+    ) {
+        let reason = error.to_string();
+        self.startup
+            .mark_runtime_health("regular_execution_policy", false, reason.clone());
+        output.records.push(StorageRecord::IntentRejected {
+            ts_ms: now_ms,
+            intent,
+            reason,
+        });
+    }
+
+    /// Raw serialized intents are evidence/backtest records, never live
+    /// authority. This test-only seam proves that direct legacy injection is
+    /// rejected instead of being promoted by field or reason inference.
+    #[cfg(test)]
+    fn route_intent(
+        &mut self,
+        now_ms: TimeMs,
+        intent: OrderIntent,
+        output: &mut CoordinatorOutput,
+    ) {
+        output.records.push(StorageRecord::IntentRejected {
+            ts_ms: now_ms,
+            intent,
+            reason: "legacy serialized OrderIntent has no live execution authority".to_string(),
+        });
     }
 
     fn ensure_account_cancels(
@@ -1189,19 +1375,24 @@ impl LiveCoordinator {
                         | reap_core::OrderStatus::PartiallyFilled
                 )
             })
+            .filter(|(order_id, _)| {
+                self.owned_regular_orders
+                    .get(order_id)
+                    .is_some_and(|owned| owned.account_id() == account_id)
+            })
             .map(|(order_id, _)| order_id.to_string())
             .filter(|order_id| !existing.contains(order_id))
             .collect::<Vec<_>>();
         for order_id in active_orders {
             let intent = OrderIntent::CancelOrder {
-                order_id,
+                order_id: order_id.clone(),
                 reason: cancel_reason.to_string(),
             };
             output.records.push(StorageRecord::Intent {
                 ts_ms: now_ms,
                 intent: intent.clone(),
             });
-            self.route_intent(now_ms, intent, output);
+            self.route_cancel_owned(now_ms, &order_id, cancel_reason, intent, output);
         }
     }
 
@@ -1473,6 +1664,7 @@ mod tests {
                 },
             )]),
             baseline_fill_ids: HashMap::from([("main".to_string(), HashSet::new())]),
+            quote_stp_verified_accounts: HashSet::from(["main".to_string()]),
         };
         LiveCoordinator::new(config, verified, gateway_actions_enabled, "test-session").unwrap()
     }
@@ -1552,6 +1744,7 @@ mod tests {
                 ("main".to_string(), HashSet::new()),
                 ("hedge".to_string(), HashSet::new()),
             ]),
+            quote_stp_verified_accounts: HashSet::from(["main".to_string(), "hedge".to_string()]),
         };
         LiveCoordinator::new(config, verified, true, "two-account-test").unwrap()
     }
@@ -2751,6 +2944,111 @@ mod tests {
     }
 
     #[test]
+    fn unproven_private_orders_are_observed_but_never_become_cancel_authority() {
+        for foreign_id in ["reap-prefix-foreign", "algo-order-7", "spread-order-9"] {
+            let mut coordinator = coordinator();
+            ready(&mut coordinator);
+
+            let output = coordinator
+                .process_feed(FeedOutput::PrivateOrder {
+                    account_id: Some("main".to_string()),
+                    update: PrivateOrderUpdate {
+                        ts_ms: 4,
+                        exchange_order_id: format!("exchange-{foreign_id}"),
+                        client_order_id: foreign_id.to_string(),
+                        symbol: "BTC-USDT".to_string(),
+                        side: Side::Buy,
+                        state: PrivateOrderState::Live,
+                        price: 100.0,
+                        qty: 0.1,
+                        cumulative_filled_qty: 0.0,
+                        average_fill_price: 0.0,
+                        last_fill_qty: 0.0,
+                        last_fill_price: 0.0,
+                        liquidity: None,
+                        last_fill_fee: None,
+                        fill_id: None,
+                        reject_reason: String::new(),
+                    },
+                })
+                .unwrap();
+
+            assert!(
+                coordinator
+                    .private_state("main")
+                    .unwrap()
+                    .order_reducer()
+                    .contains_order(foreign_id),
+                "foreign exposure must remain observable"
+            );
+            assert!(!coordinator.readiness().is_ready());
+            assert!(output.actions.iter().all(|action| {
+                !matches!(action, LiveAction::Cancel(cancel) if cancel.client_order_id == foreign_id)
+            }));
+            assert!(output.actions.iter().any(|action| {
+                matches!(action, LiveAction::Reconcile(reconcile) if reconcile.account_id == "main")
+            }));
+            assert!(coordinator.readiness().faults.keys().any(|fault| {
+                fault == &format!("runtime:foreign_regular_order:main:{foreign_id}")
+            }));
+
+            let stale_terminal = coordinator
+                .process_feed(FeedOutput::PrivateOrder {
+                    account_id: Some("main".to_string()),
+                    update: cancelled_private_order(
+                        foreign_id,
+                        &format!("exchange-{foreign_id}"),
+                        3,
+                    ),
+                })
+                .unwrap();
+            assert!(stale_terminal.actions.is_empty());
+            assert_eq!(
+                coordinator
+                    .private_state("main")
+                    .unwrap()
+                    .order_reducer()
+                    .get(foreign_id)
+                    .unwrap()
+                    .status,
+                OrderStatus::Live
+            );
+            coordinator
+                .on_reconciliation(ReconciliationResult {
+                    account_id: "main".to_string(),
+                    ts_ms: 5,
+                    clean: true,
+                    local_live_orders: 1,
+                    remote_live_orders: 1,
+                    remote_recent_fills: 0,
+                    reason: "foreign order still requires operator handling".to_string(),
+                })
+                .unwrap();
+            assert!(!coordinator.readiness().is_ready());
+            assert!(coordinator.readiness().faults.keys().any(|fault| {
+                fault == &format!("runtime:foreign_regular_order:main:{foreign_id}")
+            }));
+
+            let safety = coordinator.process_event(NormalizedEvent::System(SystemEvent {
+                ts_ms: 6,
+                kind: SystemEventKind::KillSwitchActivated,
+                venue: None,
+                account_id: None,
+                symbol: None,
+                reason: "test fail-closed cancellation".to_string(),
+            }));
+            assert!(safety.actions.iter().all(|action| {
+                !matches!(action, LiveAction::Cancel(cancel) if cancel.client_order_id == foreign_id)
+            }));
+            assert!(safety.records.iter().any(|record| matches!(
+                record,
+                StorageRecord::IntentRejected { reason, .. }
+                    if reason.contains("not a proven owned regular order")
+            )));
+        }
+    }
+
+    #[test]
     fn known_order_identity_mismatch_fails_before_mapping_or_fill_mutation() {
         let mut coordinator = coordinator();
         coordinator
@@ -2841,7 +3139,7 @@ mod tests {
         );
         ready(&mut coordinator);
         coordinator
-            .restore_order(
+            .restore_owned_order(
                 "main",
                 OrderUpdate {
                     ts_ms: 2,
@@ -2914,7 +3212,7 @@ mod tests {
         );
         ready(&mut coordinator);
         coordinator
-            .restore_order(
+            .restore_owned_order(
                 "main",
                 OrderUpdate {
                     ts_ms: 2,
@@ -3014,7 +3312,7 @@ mod tests {
         ready(&mut coordinator);
         coordinator.set_order_entry_enabled(false);
         coordinator
-            .restore_order(
+            .restore_owned_order(
                 "main",
                 OrderUpdate {
                     ts_ms: 2,
@@ -3197,7 +3495,7 @@ mod tests {
             reason: "quote".to_string(),
         };
         coordinator
-            .restore_order("main", restored)
+            .restore_owned_order("main", restored)
             .expect("checkpoint order should restore");
         let fill = RemoteFill {
             fill_id: "fill-1".to_string(),
@@ -3321,14 +3619,16 @@ mod tests {
         assert!(blocked.records.iter().any(|record| matches!(
             record,
             StorageRecord::IntentRejected { reason, .. }
-                if reason.contains("account main is halted")
+                if reason.contains("legacy serialized OrderIntent has no live execution authority")
         )));
 
         let mut healthy = CoordinatorOutput::default();
         coordinator.route_intent(5, OrderIntent::NewOrder(hedge_order), &mut healthy);
-        assert!(healthy.actions.iter().any(|action| matches!(
-            action,
-            LiveAction::Submit(submit) if submit.account_id == "hedge"
+        assert!(healthy.actions.is_empty());
+        assert!(healthy.records.iter().any(|record| matches!(
+            record,
+            StorageRecord::IntentRejected { reason, .. }
+                if reason.contains("legacy serialized OrderIntent has no live execution authority")
         )));
     }
 

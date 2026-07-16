@@ -1384,27 +1384,63 @@ fn recovered_safety_latch_count(recovered: &RecoveredStorage) -> u64 {
     u64::try_from(total).unwrap_or(u64::MAX)
 }
 
+fn proven_active_recovered_orders(
+    config: &LiveConfig,
+    recovered: &RecoveredStorage,
+) -> Vec<reap_core::OrderUpdate> {
+    let mut orders = recovered
+        .latest_orders
+        .values()
+        .filter(|update| {
+            matches!(
+                update.status,
+                OrderStatus::PendingNew | OrderStatus::Live | OrderStatus::PartiallyFilled
+            )
+        })
+        .filter(|update| {
+            let Some(account_id) = config
+                .account_for_symbol(&update.symbol)
+                .map(|account| account.id.as_str())
+            else {
+                return false;
+            };
+            recovered
+                .proven_regular_submit_requests
+                .values()
+                .any(|request| {
+                    request.account_id() == account_id
+                        && request.symbol() == update.symbol
+                        && request.client_order_id() == update.order_id
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    orders.sort_by(|left, right| left.order_id.cmp(&right.order_id));
+    orders
+}
+
 fn restore_active_order_bindings(
     coordinator: &mut LiveCoordinator,
     recovered: &RecoveredStorage,
 ) -> Result<(), LiveRuntimeError> {
-    for (account_id, bindings) in &recovered.order_bindings {
+    for binding in recovered.proven_regular_order_bindings.values() {
+        let account_id = binding.account_id();
         if !coordinator.manages_account(account_id) {
             return Err(LiveRuntimeError::BootstrapVerification(format!(
                 "recovered order binding references unknown account {account_id}; retain the journal and reconcile before changing account identity"
             )));
         }
-        for (exchange_order_id, client_order_id) in bindings {
-            let active_order_is_restored = coordinator
-                .private_state(account_id)
-                .is_some_and(|state| state.order_reducer().contains_order(client_order_id));
-            if active_order_is_restored {
-                coordinator.restore_order_binding(
-                    account_id,
-                    client_order_id,
-                    exchange_order_id,
-                )?;
-            }
+        let active_order_is_restored = coordinator.private_state(account_id).is_some_and(|state| {
+            state
+                .order_reducer()
+                .contains_order(binding.client_order_id())
+        });
+        if active_order_is_restored {
+            coordinator.restore_order_binding(
+                account_id,
+                binding.client_order_id(),
+                binding.exchange_order_id(),
+            )?;
         }
     }
     Ok(())
@@ -1676,17 +1712,7 @@ impl LiveRuntime {
                 });
             }
         }
-        let recovered_orders = recovered
-            .latest_orders
-            .values()
-            .filter(|update| {
-                matches!(
-                    update.status,
-                    OrderStatus::PendingNew | OrderStatus::Live | OrderStatus::PartiallyFilled
-                )
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let recovered_orders = proven_active_recovered_orders(&config, &recovered);
         let mut restored_by_account: HashMap<String, Vec<reap_core::OrderUpdate>> = HashMap::new();
         for update in &recovered_orders {
             let account_id = config
@@ -1784,7 +1810,7 @@ impl LiveRuntime {
                         update.order_id, update.symbol
                     ))
                 })?;
-            initial_outputs.push(coordinator.restore_order(&account_id, update)?);
+            initial_outputs.push(coordinator.restore_owned_order(&account_id, update)?);
         }
         restore_active_order_bindings(&mut coordinator, &recovered)?;
         for account in &config.accounts {
@@ -5233,6 +5259,23 @@ mod tests {
         }
     }
 
+    fn recover_storage_records(
+        records: impl IntoIterator<Item = StorageRecord>,
+    ) -> RecoveredStorage {
+        let journal = records
+            .into_iter()
+            .map(|record| {
+                serde_json::to_string(&serde_json::json!({
+                    "schema_version": 7,
+                    "record": record,
+                }))
+                .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        reap_storage::recover_jsonl_bytes(format!("{journal}\n").as_bytes()).unwrap()
+    }
+
     fn unwrap_startup_failure(error: LiveRuntimeError) -> (LiveRuntimeError, LiveRunReport) {
         let (source, report) = match error {
             LiveRuntimeError::ReportedFailure { source, report } => (source, report),
@@ -6048,6 +6091,11 @@ mod tests {
             instruments,
             account_updates: HashMap::from([("main".to_string(), update)]),
             baseline_fill_ids: HashMap::from([("main".to_string(), HashSet::new())]),
+            quote_stp_verified_accounts: config
+                .accounts
+                .iter()
+                .map(|account| account.id.clone())
+                .collect(),
         }
     }
 
@@ -6221,7 +6269,7 @@ mod tests {
         let config = config();
         let mut coordinator = ready_coordinator(&config, unix_time_ms(), true);
         coordinator
-            .restore_order(
+            .restore_owned_order(
                 "main",
                 OrderUpdate {
                     ts_ms: 2,
@@ -6244,11 +6292,26 @@ mod tests {
                 },
             )
             .unwrap();
-        let mut recovered = RecoveredStorage::default();
-        recovered.order_bindings.insert(
-            "main".to_string(),
-            HashMap::from([("exchange-1".to_string(), "restored-live".to_string())]),
-        );
+        let recovered = recover_storage_records([
+            StorageRecord::OrderRequest(OrderRequestRecord {
+                ts_ms: 1,
+                account_id: "main".to_string(),
+                operation: OrderOperation::Submit,
+                idempotency_key: Some("decision-1".to_string()),
+                client_order_id: Some("restored-live".to_string()),
+                exchange_order_id: None,
+                symbol: "BTC-USDT".to_string(),
+            }),
+            StorageRecord::OrderAck(reap_storage::OrderAckRecord {
+                ts_ms: 2,
+                account_id: "main".to_string(),
+                operation: OrderOperation::Submit,
+                client_order_id: "restored-live".to_string(),
+                exchange_order_id: Some("exchange-1".to_string()),
+                status: OrderAckStatus::Accepted,
+                message: "accepted".to_string(),
+            }),
+        ]);
 
         restore_active_order_bindings(&mut coordinator, &recovered).unwrap();
 
@@ -6265,15 +6328,80 @@ mod tests {
     fn recovered_order_binding_account_must_match_live_config() {
         let config = config();
         let mut coordinator = ready_coordinator(&config, unix_time_ms(), true);
-        let mut recovered = RecoveredStorage::default();
-        recovered.order_bindings.insert(
-            "removed".to_string(),
-            HashMap::from([("exchange-1".to_string(), "order-1".to_string())]),
-        );
+        let recovered = recover_storage_records([
+            StorageRecord::OrderRequest(OrderRequestRecord {
+                ts_ms: 1,
+                account_id: "removed".to_string(),
+                operation: OrderOperation::Submit,
+                idempotency_key: Some("decision-1".to_string()),
+                client_order_id: Some("order-1".to_string()),
+                exchange_order_id: None,
+                symbol: "BTC-USDT".to_string(),
+            }),
+            StorageRecord::OrderAck(reap_storage::OrderAckRecord {
+                ts_ms: 2,
+                account_id: "removed".to_string(),
+                operation: OrderOperation::Submit,
+                client_order_id: "order-1".to_string(),
+                exchange_order_id: Some("exchange-1".to_string()),
+                status: OrderAckStatus::Accepted,
+                message: "accepted".to_string(),
+            }),
+        ]);
 
         let error = restore_active_order_bindings(&mut coordinator, &recovered).unwrap_err();
 
         assert!(error.to_string().contains("unknown account removed"));
+    }
+
+    #[test]
+    fn restart_restores_only_orders_with_durable_regular_submit_proof() {
+        let config = config();
+        let update = OrderUpdate {
+            ts_ms: 2,
+            order_id: "foreign-or-legacy".to_string(),
+            symbol: "BTC-USDT".to_string(),
+            side: Side::Buy,
+            event: OrderEvent::New,
+            status: OrderStatus::Live,
+            price: 100.0,
+            time_in_force: Some(TimeInForce::PostOnly),
+            qty: 1.0,
+            open_qty: 1.0,
+            filled_qty: 0.0,
+            avg_fill_price: 0.0,
+            last_fill_qty: 0.0,
+            last_fill_price: 0.0,
+            last_fill_liquidity: None,
+            last_fill_fee: None,
+            reason: "private observation".to_string(),
+        };
+        let unproven = recover_storage_records([StorageRecord::Order {
+            account_id: Some("main".to_string()),
+            update: update.clone(),
+        }]);
+        assert!(proven_active_recovered_orders(&config, &unproven).is_empty());
+
+        let proven = recover_storage_records([
+            StorageRecord::OrderRequest(OrderRequestRecord {
+                ts_ms: 1,
+                account_id: "main".to_string(),
+                operation: OrderOperation::Submit,
+                idempotency_key: Some("decision-owned".to_string()),
+                client_order_id: Some(update.order_id.clone()),
+                exchange_order_id: None,
+                symbol: update.symbol.clone(),
+            }),
+            StorageRecord::Order {
+                account_id: Some("main".to_string()),
+                update: update.clone(),
+            },
+        ]);
+        let restored = proven_active_recovered_orders(&config, &proven);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].order_id, update.order_id);
+        assert_eq!(restored[0].symbol, update.symbol);
+        assert_eq!(restored[0].status, update.status);
     }
 
     #[test]
@@ -6292,7 +6420,7 @@ mod tests {
         let mut coordinator = ready_coordinator(&config, unix_time_ms(), true);
         let _ = restore_safety_latches(&mut coordinator, &recovered).unwrap();
         let replay = coordinator
-            .restore_order(
+            .restore_owned_order(
                 "main",
                 OrderUpdate {
                     ts_ms: 2,
@@ -7137,7 +7265,7 @@ mod tests {
         let now_ms = unix_time_ms();
         let mut coordinator = ready_coordinator(&config, now_ms, true);
         coordinator
-            .restore_order(
+            .restore_owned_order(
                 "main",
                 OrderUpdate {
                     ts_ms: now_ms,
@@ -7539,6 +7667,43 @@ mod tests {
             Ok(r#"{"code":"0","msg":"","data":[{"ts":"0"}]}"#),
             Ok(
                 r#"{"code":"0","msg":"","data":[{"acctLv":"2","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"7","mainUid":"6","label":"reap-demo","perm":"read_only,trade","ip":"203.0.113.5","enableSpotBorrow":true,"autoLoan":false,"spotBorrowAutoRepay":false}]}"#,
+            ),
+        ]);
+        let (_command_tx, command_rx) = mpsc::channel(2);
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+        let task = tokio::spawn(run_account_safety_task(
+            "main".to_string(),
+            client,
+            safety_account_config(),
+            command_rx,
+            event_tx,
+            None,
+            60_000,
+            1,
+            u64::MAX,
+            exchange_status_guard(false, 60_000),
+            exchange_instrument_guard(60_000, Vec::new()),
+        ));
+
+        let event = tokio::time::timeout(Duration::from_millis(100), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            RuntimeEvent::Fatal(RuntimeTaskFailure::AccountConfigDrift(message))
+                if message.contains("configuration or authenticated identity differs")
+        ));
+        task.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn account_stp_mode_drift_is_fatal() {
+        let (client, requests) = safety_client(vec![
+            Ok(r#"{"code":"0","msg":"","data":[{"ts":"0"}]}"#),
+            Ok(
+                r#"{"code":"0","msg":"","data":[{"acctLv":"2","posMode":"net_mode","acctStpMode":"cancel_taker","uid":"7","mainUid":"6","label":"reap-demo","perm":"read_only,trade","ip":"203.0.113.5","enableSpotBorrow":false,"autoLoan":false,"spotBorrowAutoRepay":false}]}"#,
             ),
         ]);
         let (_command_tx, command_rx) = mpsc::channel(2);

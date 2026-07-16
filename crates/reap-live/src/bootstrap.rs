@@ -11,7 +11,7 @@ use reap_venue::okx::{
 use reap_venue::{RemoteFill, RemoteOrder};
 use serde::{Deserialize, Serialize};
 
-use crate::{LiveConfig, OkxTradeModeConfig};
+use crate::{ChaosConnectivityRequirements, LiveConfig, OkxTradeModeConfig};
 
 #[derive(Debug, Clone)]
 pub struct AccountBootstrapSnapshot {
@@ -65,6 +65,11 @@ pub struct VerifiedBootstrap {
     pub instruments: HashMap<String, VerifiedInstrument>,
     pub account_updates: HashMap<String, AccountUpdate>,
     pub baseline_fill_ids: HashMap<String, HashSet<FillKey>>,
+    /// Quote-capable accounts whose authenticated bootstrap configuration
+    /// proved `acctStpMode = cancel_maker`.
+    ///
+    /// This is an in-memory execution-policy marker, not serialized evidence.
+    pub quote_stp_verified_accounts: HashSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +93,20 @@ pub fn verify_bootstrap(
     let mut verified = HashMap::new();
     let mut account_updates = HashMap::new();
     let mut baseline_fill_ids = HashMap::new();
+    let quote_capable_accounts = match ChaosConnectivityRequirements::from_config(config) {
+        Ok(requirements) => requirements
+            .accounts()
+            .iter()
+            .filter(|account| account.quote_enabled())
+            .map(|account| account.account_id().to_string())
+            .collect::<HashSet<_>>(),
+        Err(error) => {
+            errors.push(format!(
+                "Chaos connectivity requirements could not be resolved: {error}"
+            ));
+            HashSet::new()
+        }
+    };
 
     for account in &config.accounts {
         let Some(snapshot) = snapshots.get(&account.id) else {
@@ -107,6 +126,14 @@ pub fn verify_bootstrap(
             errors.push(format!(
                 "account {} position mode mismatch: configured {:?}, exchange {:?}",
                 account.id, account.expected_position_mode, snapshot.account_config.position_mode
+            ));
+        }
+        if quote_capable_accounts.contains(&account.id)
+            && snapshot.account_config.account_stp_mode != "cancel_maker"
+        {
+            errors.push(format!(
+                "account {} is quote-capable but acctStpMode is {:?}, expected \"cancel_maker\"",
+                account.id, snapshot.account_config.account_stp_mode
             ));
         }
         if snapshot.account_config.user_id.trim().is_empty()
@@ -211,6 +238,7 @@ pub fn verify_bootstrap(
             instruments: verified,
             account_updates,
             baseline_fill_ids,
+            quote_stp_verified_accounts: quote_capable_accounts,
         })
     } else {
         Err(BootstrapValidation { errors })
@@ -637,6 +665,39 @@ mod tests {
                 .as_deref(),
             Some("main")
         );
+        assert_eq!(
+            verified.quote_stp_verified_accounts,
+            HashSet::from(["main".to_string()])
+        );
+    }
+
+    #[test]
+    fn quote_capable_account_requires_cancel_maker_stp() {
+        let config = config();
+        let mut snapshot = snapshot();
+        snapshot.account_config.account_stp_mode = "cancel_taker".to_string();
+
+        let error = verify_bootstrap(&config, &HashMap::from([("main".to_string(), snapshot)]))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("account main is quote-capable"), "{error}");
+        assert!(error.contains("cancel_maker"), "{error}");
+    }
+
+    #[test]
+    fn hedge_only_account_does_not_inherit_quote_default_stp_requirement() {
+        let mut config = config();
+        for instrument in &mut config.strategy.instruments {
+            instrument.quote_profit_margin = 1.0;
+        }
+        let mut snapshot = snapshot();
+        snapshot.account_config.account_stp_mode = "cancel_taker".to_string();
+
+        let verified =
+            verify_bootstrap(&config, &HashMap::from([("main".to_string(), snapshot)])).unwrap();
+
+        assert!(verified.quote_stp_verified_accounts.is_empty());
     }
 
     #[test]

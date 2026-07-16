@@ -18,6 +18,7 @@ mod operator;
 mod order_ws;
 mod production_transition;
 mod provenance;
+mod regular_execution;
 mod runtime;
 mod startup;
 mod statement;

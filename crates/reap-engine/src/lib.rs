@@ -2,13 +2,52 @@ use std::collections::HashSet;
 
 use reap_core::{NormalizedEvent, OrderIntent, SystemEvent, SystemEventKind, TimeMs};
 use reap_risk::{RiskDecision, RiskGate};
-use reap_strategy::Strategy;
+use reap_strategy::{ChaosExecutionIntent, ChaosStrategy, Strategy};
 
 #[derive(Debug, Default)]
 pub struct EngineOutput {
     pub intents: Vec<OrderIntent>,
     pub rejected: Vec<RiskDecision>,
     pub system_events: Vec<SystemEvent>,
+}
+
+/// Typed output used by the live Chaos composition.
+///
+/// Strategy-created purposes remain opaque instead of being lowered to a
+/// serializable `OrderIntent`. Risk-created fail-closed cancellation
+/// candidates are kept separate because ownership is proven later by the live
+/// regular-execution policy.
+#[derive(Debug, Default)]
+pub struct ChaosEngineOutput {
+    pub intents: Vec<ChaosExecutionIntent>,
+    pub safety_cancel_candidates: Vec<SafetyCancelCandidate>,
+    pub rejected: Vec<RiskDecision>,
+    pub system_events: Vec<SystemEvent>,
+}
+
+/// A risk-generated request to cancel an order if live policy proves that the
+/// canonical identity is an owned regular order.
+#[derive(Debug)]
+pub struct SafetyCancelCandidate {
+    order_id: String,
+    reason: String,
+}
+
+impl SafetyCancelCandidate {
+    pub fn order_id(&self) -> &str {
+        &self.order_id
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    pub fn to_order_intent(&self) -> OrderIntent {
+        OrderIntent::CancelOrder {
+            order_id: self.order_id.clone(),
+            reason: self.reason.clone(),
+        }
+    }
 }
 
 pub struct TradingEngine<S> {
@@ -105,6 +144,95 @@ where
     }
 }
 
+impl TradingEngine<ChaosStrategy> {
+    /// Processes one event without erasing the authority provenance of Chaos
+    /// Quote, Hedge, and CancelOwned purposes.
+    pub fn on_chaos_event(&mut self, event: NormalizedEvent) -> ChaosEngineOutput {
+        let now_ms = event.ts_ms();
+        let mut output = ChaosEngineOutput::default();
+        let post_trade = self.risk.on_normalized_event(&event);
+        output.system_events.extend(post_trade.events);
+        output
+            .system_events
+            .extend(self.risk.check_staleness(now_ms));
+
+        let input_requires_cancel = event_requires_cancel(&event);
+        let halted_symbol = match &event {
+            NormalizedEvent::System(system) if system.kind == SystemEventKind::SymbolHalted => {
+                system.symbol.clone()
+            }
+            _ => None,
+        };
+        let strategy_event = event.into_strategy_event();
+        let strategy_intents = self.strategy.on_owned_execution_event(strategy_event);
+        if !self.risk.is_killed()
+            && let Some(reason) = self.strategy.safety_halt_reason()
+        {
+            output
+                .system_events
+                .extend(self.risk.on_strategy_halt(now_ms, reason).events);
+        }
+        self.apply_chaos_risk(now_ms, strategy_intents, &mut output);
+        let fail_closed = self.risk.is_killed()
+            || input_requires_cancel
+            || output.system_events.iter().any(system_requires_cancel);
+        if fail_closed {
+            let existing_cancels = output
+                .intents
+                .iter()
+                .filter_map(|intent| {
+                    intent
+                        .as_cancel_owned()
+                        .map(|cancel| cancel.order_id().to_string())
+                })
+                .collect::<HashSet<_>>();
+            let order_ids = if self.risk.is_killed() {
+                self.risk.live_order_ids().collect::<Vec<_>>()
+            } else {
+                match halted_symbol.as_deref() {
+                    Some(symbol) => self.risk.live_order_ids_for(symbol).collect::<Vec<_>>(),
+                    None => self.risk.live_order_ids().collect::<Vec<_>>(),
+                }
+            };
+            for order_id in order_ids
+                .into_iter()
+                .filter(|order_id| !existing_cancels.contains(*order_id))
+            {
+                let intent = OrderIntent::CancelOrder {
+                    order_id: order_id.to_string(),
+                    reason: "fail_closed".to_string(),
+                };
+                match self.risk.pre_trade(now_ms, intent) {
+                    RiskDecision::Allowed(OrderIntent::CancelOrder { order_id, reason }) => {
+                        output
+                            .safety_cancel_candidates
+                            .push(SafetyCancelCandidate { order_id, reason });
+                    }
+                    RiskDecision::Allowed(OrderIntent::NewOrder(_)) => {
+                        unreachable!("risk cannot change a cancellation into a new order")
+                    }
+                    rejected @ RiskDecision::Rejected { .. } => output.rejected.push(rejected),
+                }
+            }
+        }
+        output
+    }
+
+    fn apply_chaos_risk(
+        &self,
+        now_ms: TimeMs,
+        intents: Vec<ChaosExecutionIntent>,
+        output: &mut ChaosEngineOutput,
+    ) {
+        for intent in intents {
+            match self.risk.pre_trade(now_ms, intent.to_order_intent()) {
+                RiskDecision::Allowed(_) => output.intents.push(intent),
+                rejected @ RiskDecision::Rejected { .. } => output.rejected.push(rejected),
+            }
+        }
+    }
+}
+
 fn event_requires_cancel(event: &NormalizedEvent) -> bool {
     matches!(event, NormalizedEvent::System(system) if system_requires_cancel(system))
 }
@@ -127,10 +255,12 @@ fn system_requires_cancel(event: &SystemEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use reap_core::{
-        FillLiquidity, NewOrder, OrderEvent, OrderStatus, OrderUpdate, Side, StrategyEvent,
-        SystemEvent, TimeInForce, TimerEvent, Venue,
+        AccountUpdate, FillLiquidity, Level, MarketEvent, NewOrder, NormalizedEvent, OrderBook,
+        OrderEvent, OrderStatus, OrderUpdate, Position, Side, StrategyEvent, SystemEvent,
+        TimeInForce, TimerEvent, Venue,
     };
     use reap_risk::RiskLimits;
+    use reap_strategy::ChaosConfig;
 
     use super::*;
 
@@ -362,5 +492,132 @@ mod tests {
             intent,
             OrderIntent::CancelOrder { order_id, .. } if order_id == "eth-live"
         )));
+    }
+
+    #[test]
+    fn chaos_typed_loop_matches_generic_intents_risk_and_fail_closed_ordering() {
+        let config: ChaosConfig =
+            toml::from_str(include_str!("../../../examples/iarb2-basic.toml")).unwrap();
+        let limits = RiskLimits {
+            require_feed_health: false,
+            require_private_health: false,
+            ..RiskLimits::default()
+        };
+        let mut generic = TradingEngine::new(
+            ChaosStrategy::new(config.clone()).unwrap(),
+            RiskGate::new(limits.clone()),
+        );
+        let mut typed =
+            TradingEngine::new(ChaosStrategy::new(config).unwrap(), RiskGate::new(limits));
+        let fixture = vec![
+            NormalizedEvent::Market(MarketEvent::Depth(OrderBook::one_level(
+                "BTC-USDT",
+                1,
+                Level::new(50_000.0, 2.0),
+                Level::new(50_001.0, 2.0),
+            ))),
+            NormalizedEvent::Market(MarketEvent::Depth(OrderBook::one_level(
+                "BTC-PERP",
+                1,
+                Level::new(50_003.0, 10_000.0),
+                Level::new(50_004.0, 10_000.0),
+            ))),
+            NormalizedEvent::Order(OrderUpdate {
+                ts_ms: 2,
+                order_id: "fixture-quote-fill".to_string(),
+                symbol: "BTC-USDT".to_string(),
+                side: Side::Buy,
+                event: OrderEvent::FullyFilled,
+                status: OrderStatus::Filled,
+                price: 50_000.0,
+                time_in_force: None,
+                qty: 0.1,
+                open_qty: 0.0,
+                filled_qty: 0.1,
+                avg_fill_price: 50_000.0,
+                last_fill_qty: 0.1,
+                last_fill_price: 50_000.0,
+                last_fill_liquidity: Some(FillLiquidity::Maker),
+                last_fill_fee: None,
+                reason: "quote".to_string(),
+            }),
+            NormalizedEvent::Account(AccountUpdate {
+                ts_ms: 2,
+                balances: Vec::new(),
+                positions: vec![Position {
+                    symbol: "BTC-USDT".to_string(),
+                    qty: 0.1,
+                    avg_price: 50_000.0,
+                    margin_mode: None,
+                }],
+                margins: Vec::new(),
+            }),
+        ];
+
+        for event in fixture {
+            assert_chaos_outputs_match(
+                generic.on_event(event.clone()),
+                typed.on_chaos_event(event),
+            );
+        }
+
+        let live_order = NormalizedEvent::Order(OrderUpdate {
+            ts_ms: 5,
+            order_id: "owned-live-1".to_string(),
+            symbol: "BTC-USDT".to_string(),
+            side: Side::Buy,
+            event: OrderEvent::New,
+            status: OrderStatus::Live,
+            price: 100.0,
+            time_in_force: Some(TimeInForce::PostOnly),
+            qty: 0.1,
+            open_qty: 0.1,
+            filled_qty: 0.0,
+            avg_fill_price: 0.0,
+            last_fill_qty: 0.0,
+            last_fill_price: 0.0,
+            last_fill_liquidity: None,
+            last_fill_fee: None,
+            reason: "quote".to_string(),
+        });
+        assert_chaos_outputs_match(
+            generic.on_event(live_order.clone()),
+            typed.on_chaos_event(live_order),
+        );
+        let kill = NormalizedEvent::System(SystemEvent {
+            ts_ms: 6,
+            kind: SystemEventKind::KillSwitchActivated,
+            venue: None,
+            account_id: None,
+            symbol: None,
+            reason: "differential fail-closed check".to_string(),
+        });
+        assert_chaos_outputs_match(generic.on_event(kill.clone()), typed.on_chaos_event(kill));
+    }
+
+    fn assert_chaos_outputs_match(generic: EngineOutput, typed: ChaosEngineOutput) {
+        let typed_intents = typed
+            .intents
+            .iter()
+            .map(ChaosExecutionIntent::to_order_intent)
+            .chain(
+                typed
+                    .safety_cancel_candidates
+                    .iter()
+                    .map(SafetyCancelCandidate::to_order_intent),
+            )
+            .collect::<Vec<_>>();
+        assert_eq!(
+            format!("{:?}", generic.intents),
+            format!("{typed_intents:?}")
+        );
+        assert_eq!(
+            format!("{:?}", generic.rejected),
+            format!("{:?}", typed.rejected)
+        );
+        assert_eq!(
+            format!("{:?}", generic.system_events),
+            format!("{:?}", typed.system_events)
+        );
     }
 }
