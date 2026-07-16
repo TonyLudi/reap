@@ -1,9 +1,14 @@
 mod chaos;
+mod connectivity;
 
 pub use chaos::{
     ChaosConfig, ChaosStrategy, CoinConfig, ConfigValidation, HaltIntervalConfig, InstrumentConfig,
     InstrumentKindConfig, MissedHedge, ReferenceDataKind, ReferenceDataRequirement,
     RiskGroupConfig, RiskGroupKindConfig, SkewTypeConfig,
+};
+pub use connectivity::{
+    ChaosDecisionConsumer, ChaosDecisionInput, ChaosDecisionInputRequirement,
+    ChaosDecisionRequirementId, ChaosDecisionRequirements,
 };
 
 use reap_core::{OrderIntent, StrategyEvent};

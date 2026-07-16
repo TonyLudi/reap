@@ -53,13 +53,14 @@ use crate::provenance::{
     host_identity_sha256 as hash_host_identity, okx_account_identity_sha256,
 };
 use crate::{
-    AccountBootstrapSnapshot, CancelAction, CoordinatorError, CoordinatorOutput, HostGuardRuntime,
-    HostHealthError, HostHealthSnapshot, LiveAction, LiveConfig, LiveConfigError,
-    LiveConfigFileEvidence, LiveCoordinator, LiveLatencyCollector, LiveLatencyEvidence,
-    LiveLatencySemantics, OperatorCommand, OperatorEnvelope, OperatorError, OperatorResponse,
-    OperatorService, OperatorStatus, ReadinessSnapshot, ReconcileAction, ReconciliationResult,
-    StartupGate, SubmitAction, TradingEnvironment, VerifiedBootstrap, check_host_health,
-    okx_instrument_type, start_host_guard, start_operator_service, verify_bootstrap,
+    AccountBootstrapSnapshot, CancelAction, ChaosConnectivityPlan, ChaosConnectivityPlanError,
+    CoordinatorError, CoordinatorOutput, HostGuardRuntime, HostHealthError, HostHealthSnapshot,
+    LiveAction, LiveConfig, LiveConfigError, LiveConfigFileEvidence, LiveCoordinator,
+    LiveLatencyCollector, LiveLatencyEvidence, LiveLatencySemantics, OperatorCommand,
+    OperatorEnvelope, OperatorError, OperatorResponse, OperatorService, OperatorStatus,
+    ReadinessSnapshot, ReconcileAction, ReconciliationResult, StartupGate, SubmitAction,
+    TradingEnvironment, VerifiedBootstrap, check_host_health, okx_instrument_type,
+    start_host_guard, start_operator_service, verify_bootstrap,
 };
 
 type LiveGateway = OkxOrderGateway<ReqwestTransport>;
@@ -161,6 +162,8 @@ pub struct LiveRunReport {
 pub enum LiveRuntimeError {
     #[error(transparent)]
     Config(#[from] LiveConfigError),
+    #[error(transparent)]
+    ConnectivityPlan(#[from] ChaosConnectivityPlanError),
     #[error("demo order entry requires explicit confirmation")]
     DemoConfirmationRequired,
     #[error("demo mode refuses production exchange configuration")]
@@ -280,6 +283,7 @@ impl LiveRuntimeError {
     fn stable_code(&self) -> &'static str {
         match self {
             Self::Config(_) => "config",
+            Self::ConnectivityPlan(_) => "connectivity_plan",
             Self::DemoConfirmationRequired => "demo_confirmation_required",
             Self::DemoRequiresSimulatedTrading => "demo_requires_simulated_trading",
             Self::InvalidRunDuration => "invalid_run_duration",
@@ -583,6 +587,7 @@ pub struct PreparedLiveRun {
     config: LiveConfig,
     options: LiveRunOptions,
     evidence: LiveRunAttemptEvidence,
+    connectivity_plan: ChaosConnectivityPlan,
 }
 
 pub fn prepare_live_path(
@@ -620,6 +625,9 @@ fn prepare_live_with_config_source(
             return Err(LiveRuntimeError::DemoRequiresSimulatedTrading);
         }
     }
+    // Resolve the complete secret-free boundary before evidence collection,
+    // credential lookup, signer construction, or any network-capable role.
+    let connectivity_plan = ChaosConnectivityPlan::resolve(&config, options.mode)?;
     let evidence = LiveRunAttemptEvidence {
         session_started_at_ms: unix_time_ms(),
         config_source,
@@ -636,10 +644,15 @@ fn prepare_live_with_config_source(
         config,
         options,
         evidence,
+        connectivity_plan,
     })
 }
 
 impl PreparedLiveRun {
+    pub fn connectivity_plan(&self) -> &ChaosConnectivityPlan {
+        &self.connectivity_plan
+    }
+
     pub async fn run(self) -> Result<LiveRunReport, LiveRuntimeError> {
         if self.options.mode == LiveMode::Validate {
             return Ok(self.pre_runtime_report(LiveStopReason::Validation, None, 0));
@@ -6557,6 +6570,62 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, LiveRuntimeError::InvalidRunDuration));
+    }
+
+    #[test]
+    fn preparation_resolves_the_secret_free_plan_without_credentials() {
+        let mut config = config();
+        let missing_prefix = format!("REAP_PHASE1_MISSING_{}", std::process::id());
+        config.accounts[0].api_key_env = format!("{missing_prefix}_KEY");
+        config.accounts[0].secret_key_env = format!("{missing_prefix}_SECRET");
+        config.accounts[0].passphrase_env = format!("{missing_prefix}_PASSPHRASE");
+        for name in [
+            &config.accounts[0].api_key_env,
+            &config.accounts[0].secret_key_env,
+            &config.accounts[0].passphrase_env,
+        ] {
+            assert!(std::env::var_os(name).is_none());
+        }
+
+        let prepared = prepare_live(
+            config,
+            LiveRunOptions {
+                mode: LiveMode::Observe,
+                demo_confirmed: false,
+                run_duration: Some(Duration::from_millis(1)),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(prepared.connectivity_plan().mode(), LiveMode::Observe);
+        assert_eq!(prepared.connectivity_plan().sha256().len(), 64);
+        assert!(prepared.connectivity_plan().regular_mutations().is_empty());
+    }
+
+    #[test]
+    fn unsupported_burst_input_fails_preparation_before_credentials() {
+        let mut config = config();
+        let missing_prefix = format!("REAP_PHASE1_BURST_MISSING_{}", std::process::id());
+        config.accounts[0].api_key_env = format!("{missing_prefix}_KEY");
+        config.accounts[0].secret_key_env = format!("{missing_prefix}_SECRET");
+        config.accounts[0].passphrase_env = format!("{missing_prefix}_PASSPHRASE");
+        config.strategy.act_on_burst = true;
+
+        let error = prepare_live(
+            config,
+            LiveRunOptions {
+                mode: LiveMode::Observe,
+                demo_confirmed: false,
+                run_duration: None,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            LiveRuntimeError::Config(LiveConfigError::Invalid(ref message))
+                if message.contains("strategy.act_on_burst is unsupported by live modes")
+        ));
     }
 
     #[tokio::test]

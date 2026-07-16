@@ -717,7 +717,14 @@ impl LiveConfig {
     }
 
     pub fn validate(&self) -> LiveConfigValidation {
-        let mut errors = self.strategy.effective().validate().errors;
+        let effective_strategy = self.strategy.effective();
+        let mut errors = effective_strategy.validate().errors;
+        if effective_strategy.act_on_burst {
+            errors.push(
+                "strategy.act_on_burst is unsupported by live modes until a typed BurstSignal provider and freshness contract are implemented"
+                    .to_string(),
+            );
+        }
         if self.strategy.reference_data_stale_threshold_ms.is_none() {
             errors.push(
                 "strategy.reference_data_stale_threshold_ms must be configured for live startup"
@@ -2064,6 +2071,22 @@ mod tests {
         assert!(validation.errors.iter().any(|error| {
             error.contains("runtime.order_websocket_sessions must not exceed 16")
         }));
+    }
+
+    #[test]
+    fn live_config_rejects_act_on_burst_without_a_typed_provider() {
+        let mut config = valid_config();
+        config.strategy.act_on_burst = true;
+
+        let validation = config.validate();
+
+        assert!(!validation.valid);
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("strategy.act_on_burst is unsupported by live modes"))
+        );
     }
 
     #[test]

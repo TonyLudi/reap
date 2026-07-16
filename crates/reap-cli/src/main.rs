@@ -1427,14 +1427,24 @@ async fn main() -> Result<()> {
             reap_telemetry::init_json_tracing("info")
                 .map_err(anyhow::Error::msg)
                 .context("failed to initialize live tracing")?;
+            let live_mode: LiveMode = mode.into();
             let prepared = reap_live::prepare_live_path(
                 config,
                 LiveRunOptions {
-                    mode: mode.into(),
+                    mode: live_mode,
                     demo_confirmed: confirm_demo,
                     run_duration: duration_secs.map(Duration::from_secs),
                 },
             )?;
+            if live_mode == LiveMode::Validate {
+                // Keep the schema-8 run report on stdout unchanged. The
+                // secret-free plan and its exact-byte hash are validation
+                // diagnostics on stderr, before any credential/network role.
+                eprintln!(
+                    "{}",
+                    live_connectivity_plan_diagnostic(prepared.connectivity_plan())?
+                );
+            }
             let mut output_file = output
                 .as_ref()
                 .map(|output| reserve_private_output(output, "live report"))
@@ -1834,6 +1844,21 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+struct LiveConnectivityPlanDiagnostic<'a> {
+    kind: &'static str,
+    sha256: String,
+    plan: &'a reap_live::ChaosConnectivityPlan,
+}
+
+fn live_connectivity_plan_diagnostic(plan: &reap_live::ChaosConnectivityPlan) -> Result<String> {
+    Ok(serde_json::to_string(&LiveConnectivityPlanDiagnostic {
+        kind: "chaos_connectivity_plan",
+        sha256: plan.sha256(),
+        plan,
+    })?)
+}
+
 fn reserve_private_output(path: &Path, label: &str) -> Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -1948,6 +1973,25 @@ fn sync_parent_directory(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_diagnostic_contains_the_exact_secret_free_plan_hash() {
+        let config =
+            LiveConfig::from_toml(include_str!("../../../examples/live-okx-demo.toml")).unwrap();
+        let plan = reap_live::ChaosConnectivityPlan::resolve(&config, LiveMode::Validate).unwrap();
+        let diagnostic = live_connectivity_plan_diagnostic(&plan).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&diagnostic).unwrap();
+
+        assert_eq!(value["kind"], "chaos_connectivity_plan");
+        assert_eq!(value["sha256"], plan.sha256());
+        assert_eq!(value["plan"]["schema_version"], 1);
+        assert_eq!(value["plan"]["mode"], "validate");
+        let plan_start = diagnostic.find("\"plan\":").unwrap() + "\"plan\":".len();
+        assert_eq!(
+            &diagnostic[plan_start..diagnostic.len() - 1],
+            plan.canonical_json()
+        );
+    }
 
     #[test]
     fn private_output_is_create_new_and_durable() {
