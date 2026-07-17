@@ -174,7 +174,7 @@ pub fn verify_bootstrap(
         let account_update = snapshot.scoped_account_update(&account.id);
         errors.extend(
             config
-                .account_state_policy_errors(&account.id, &account_update)
+                .evaluate_account_state_policy(&account.id, &account_update)
                 .into_iter()
                 .map(|error| format!("account {} state policy violation: {error}", account.id)),
         );

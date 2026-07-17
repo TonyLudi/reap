@@ -653,7 +653,9 @@ impl LiveCoordinator {
         account_id: &str,
         update: &reap_core::AccountUpdate,
     ) -> Result<(), CoordinatorError> {
-        let errors = self.config.account_state_policy_errors(account_id, update);
+        let errors = self
+            .config
+            .evaluate_account_state_policy(account_id, update);
         if errors.is_empty() {
             Ok(())
         } else {

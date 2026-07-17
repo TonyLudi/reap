@@ -6,7 +6,7 @@ use reap_backtest::{
     effective_strategy_sha256, verify_research_paths,
 };
 use reap_core::PINNED_JAVA_REVISION;
-use reap_live::{LiveConfig, LiveConfigFileEvidence, TradingEnvironment};
+use reap_live::{LiveConfigFileEvidence, TradingEnvironment, load_live_config_with_evidence};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const RESEARCH_DEPLOYMENT_VERIFICATION_FORMAT_VERSION: u16 = 2;
@@ -77,7 +77,7 @@ pub(crate) fn verify_research_deployment_paths(
         })?;
     // Research reconstruction can be expensive; bind the production config bytes
     // only after it completes so a long-running verification cannot retain stale input.
-    let (config, config_file) = LiveConfig::load_with_evidence(production_config_path)
+    let (config, config_file) = load_live_config_with_evidence(production_config_path)
         .with_context(|| {
             format!(
                 "failed to load production live config {}",

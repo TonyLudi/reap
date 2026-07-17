@@ -17,6 +17,7 @@ reap-core.workspace = true
 reap-evidence-core.workspace = true
 reap-engine.workspace = true
 reap-feed.workspace = true
+reap-live-contracts.workspace = true
 reap-order.workspace = true
 reap-okx-live-adapter.workspace = true
 reap-risk.workspace = true

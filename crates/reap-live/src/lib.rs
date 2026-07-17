@@ -1,8 +1,6 @@
 mod account_certification;
 mod bill_collection;
 mod bootstrap;
-mod config;
-mod connectivity_plan;
 mod convergence;
 mod coordinator;
 mod deadman_certification;
@@ -19,6 +17,7 @@ mod production_transition;
 mod provenance;
 mod regular_execution;
 mod runtime;
+mod runtime_config;
 mod startup;
 mod statement;
 
@@ -49,25 +48,6 @@ pub use bill_collection::{
 pub use bootstrap::{
     AccountBootstrapSnapshot, BootstrapValidation, VerifiedBootstrap, VerifiedInstrument,
     okx_instrument_type, verify_bootstrap,
-};
-pub use config::{
-    AlertConfig, HostGuardConfig, LiveAccountConfig, LiveConfig, LiveConfigError,
-    LiveConfigFileEvidence, LiveConfigValidation, LiveStorageConfig, MAX_LIVE_CONFIG_BYTES,
-    MAX_ORDER_WEBSOCKET_SESSIONS, OkxApiKeyPolicyConfig, OkxApiKeyPolicyEvaluation,
-    OkxEndpointRegion, OkxTradeModeConfig, OkxVenueConfig, OperatorConfig, RuntimeConfig,
-    TradingEnvironment, evaluate_okx_api_key_policy,
-};
-pub use connectivity_plan::{
-    AuthenticatedReadOperation, AuthenticatedReadPlan, CHAOS_CONNECTIVITY_PLAN_SCHEMA_VERSION,
-    CapabilitySurface, ChaosAccountRequirements, ChaosConnectivityPlan, ChaosConnectivityPlanError,
-    ChaosConnectivityRequirements, ConnectivityConsumer, ConnectivityRequirementId,
-    FORBIDDEN_PROOF_DEFAULT_MAX_AGE_MS, FORBIDDEN_PROOF_DEFAULT_SCAN_INTERVAL_MS,
-    FORBIDDEN_PROOF_HARD_MAX_AGE_MS, ForbiddenOrderCheckPlan, ForbiddenOrderQuery,
-    ForbiddenProofPolicy, LiveConnectivityRole, LiveConnectivityRolePlan, LocalTimerPlan,
-    MaintenanceProductPlan, MaintenanceRelevancePlan, MaintenanceServicePlan, OrderCommandLanePlan,
-    PrivateChannelBinding, PrivateChannelPlan, PrivateStateSessionPlan, PublicChannelPlan,
-    PublicRedundancyConsumer, PublicSafetyReadOperation, PublicSafetyReadPlan,
-    PublicSubscriptionPlan, RegularMutationOperation, RegularMutationPlan, RequirementUse,
 };
 pub use coordinator::{
     CancelAction, CoordinatorError, CoordinatorOutput, LiveAction, LiveCoordinator,
@@ -141,11 +121,34 @@ pub use production_transition::{
     TransitionValueKind, verify_production_transition_paths,
 };
 pub use provenance::{current_executable_sha256, host_identity_sha256};
+pub use reap_live_contracts::{
+    AlertConfig, AuthenticatedReadOperation, AuthenticatedReadPlan,
+    CHAOS_CONNECTIVITY_PLAN_SCHEMA_VERSION, CapabilitySurface, ChaosAccountRequirements,
+    ChaosConnectivityPlan, ChaosConnectivityPlanError, ChaosConnectivityRequirements,
+    ConnectivityConsumer, ConnectivityRequirementId, FORBIDDEN_PROOF_DEFAULT_MAX_AGE_MS,
+    FORBIDDEN_PROOF_DEFAULT_SCAN_INTERVAL_MS, FORBIDDEN_PROOF_HARD_MAX_AGE_MS,
+    ForbiddenOrderCheckPlan, ForbiddenOrderQuery, ForbiddenProofPolicy, HostGuardConfig,
+    LiveAccountConfig, LiveConfig, LiveConfigError, LiveConfigFileEvidence, LiveConfigValidation,
+    LiveConnectivityRole, LiveConnectivityRolePlan, LiveMode, LiveStorageConfig, LocalTimerPlan,
+    MAX_LIVE_CONFIG_BYTES, MAX_ORDER_WEBSOCKET_SESSIONS, MaintenanceProductPlan,
+    MaintenanceRelevancePlan, MaintenanceServicePlan, OkxApiKeyPolicyConfig,
+    OkxApiKeyPolicyEvaluation, OkxEndpointRegion, OkxTradeModeConfig, OkxVenueConfig,
+    OperatorConfig, OrderCommandLanePlan, PrivateChannelBinding, PrivateChannelPlan,
+    PrivateStateSessionPlan, PublicChannelPlan, PublicRedundancyConsumer,
+    PublicSafetyReadOperation, PublicSafetyReadPlan, PublicSubscriptionPlan,
+    RegularMutationOperation, RegularMutationPlan, RequirementUse, RuntimeConfig,
+    TradingEnvironment, evaluate_okx_api_key_policy,
+};
 pub use runtime::{
-    LIVE_RUN_REPORT_SCHEMA_VERSION, LiveFailureEvidence, LiveMode, LiveRunOptions, LiveRunReport,
+    LIVE_RUN_REPORT_SCHEMA_VERSION, LiveFailureEvidence, LiveRunOptions, LiveRunReport,
     LiveRuntimeError, LiveStopReason, MAX_LIVE_FAILURE_CODE_BYTES, MAX_LIVE_FAILURE_MESSAGE_BYTES,
     PreparedLiveRun, prepare_live, prepare_live_path, run_live, run_live_path,
 };
+pub use runtime_config::{
+    AlertConfigRuntimeExt, LiveConfigRuntimeExt, OperatorConfigRuntimeExt, load_live_config,
+    load_live_config_with_evidence,
+};
+pub(crate) use runtime_config::{alert_webhook_from_env, operator_secret_from_env};
 pub use startup::{LivePhase, ReadinessSnapshot, StartupError, StartupGate};
 pub use statement::{
     FILL_STATEMENT_REPORT_SCHEMA_VERSION, FillEvidenceGap, FillFieldMismatch,

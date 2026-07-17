@@ -9,6 +9,7 @@ use thiserror::Error;
 use crate::provenance::sha256_bytes;
 use crate::{
     LiveConfig, LiveConfigError, LiveConfigFileEvidence, OkxEndpointRegion, TradingEnvironment,
+    load_live_config_with_evidence,
 };
 
 pub const PRODUCTION_TRANSITION_FORMAT_VERSION: u16 = 3;
@@ -122,14 +123,14 @@ pub fn verify_production_transition_paths(
     production_config_path: impl AsRef<Path>,
 ) -> Result<ProductionTransitionReport, ProductionTransitionError> {
     let (demo_config, demo_file) =
-        LiveConfig::load_with_evidence(demo_config_path).map_err(|source| {
+        load_live_config_with_evidence(demo_config_path).map_err(|source| {
             ProductionTransitionError::Config {
                 label: "demo",
                 source,
             }
         })?;
     let (production_config, production_file) =
-        LiveConfig::load_with_evidence(production_config_path).map_err(|source| {
+        load_live_config_with_evidence(production_config_path).map_err(|source| {
             ProductionTransitionError::Config {
                 label: "production",
                 source,

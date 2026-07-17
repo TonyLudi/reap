@@ -62,12 +62,13 @@ use crate::{
     AccountBootstrapSnapshot, CancelAction, ChaosConnectivityPlan, ChaosConnectivityPlanError,
     CoordinatorError, CoordinatorOutput, HostGuardRuntime, HostHealthError, HostHealthSnapshot,
     LiveAction, LiveConfig, LiveConfigError, LiveConfigFileEvidence, LiveCoordinator,
-    LiveLatencyCollector, LiveLatencyEvidence, LiveLatencySemantics, MaintenanceRelevancePlan,
-    MaintenanceServicePlan, OperatorCommand, OperatorEnvelope, OperatorError, OperatorResponse,
-    OperatorService, OperatorStatus, PrivateChannelPlan, PublicChannelPlan,
-    PublicRedundancyConsumer, ReadinessSnapshot, ReconcileAction, ReconciliationResult,
-    RequirementUse, StartupGate, SubmitAction, TradingEnvironment, VerifiedBootstrap,
-    check_host_health, okx_instrument_type, start_host_guard, start_operator_service,
+    LiveLatencyCollector, LiveLatencyEvidence, LiveLatencySemantics, LiveMode,
+    MaintenanceRelevancePlan, MaintenanceServicePlan, OperatorCommand, OperatorEnvelope,
+    OperatorError, OperatorResponse, OperatorService, OperatorStatus, PrivateChannelPlan,
+    PublicChannelPlan, PublicRedundancyConsumer, ReadinessSnapshot, ReconcileAction,
+    ReconciliationResult, RequirementUse, StartupGate, SubmitAction, TradingEnvironment,
+    VerifiedBootstrap, alert_webhook_from_env, check_host_health, load_live_config_with_evidence,
+    okx_instrument_type, operator_secret_from_env, start_host_guard, start_operator_service,
     verify_bootstrap,
 };
 
@@ -75,14 +76,6 @@ type LiveGateway = OkxOrderGateway;
 pub const LIVE_RUN_REPORT_SCHEMA_VERSION: u32 = 8;
 pub const MAX_LIVE_FAILURE_CODE_BYTES: usize = 64;
 pub const MAX_LIVE_FAILURE_MESSAGE_BYTES: usize = 4_096;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LiveMode {
-    Validate,
-    Observe,
-    Demo,
-}
 
 #[derive(Debug, Clone)]
 pub struct LiveRunOptions {
@@ -602,7 +595,7 @@ pub fn prepare_live_path(
     path: impl AsRef<Path>,
     options: LiveRunOptions,
 ) -> Result<PreparedLiveRun, LiveRuntimeError> {
-    let (config, config_source) = LiveConfig::load_with_evidence(path)?;
+    let (config, config_source) = load_live_config_with_evidence(path)?;
     prepare_live_with_config_source(config, options, Some(config_source))
 }
 
@@ -1908,15 +1901,13 @@ impl LiveRuntime {
             }
             _ => ConnectionAttemptPacer::new(connection_attempt_interval),
         };
-        let mut alert_runtime = config
-            .alerts
-            .webhook_from_env()?
+        let mut alert_runtime = alert_webhook_from_env(&config.alerts)?
             .map(start_webhook_alerts)
             .transpose()?;
         let alert_sink = alert_runtime.as_ref().map(AlertRuntime::sink);
         let alert_failures = alert_runtime.as_mut().map(AlertRuntime::take_failures);
         let operator_config = config.operator.clone();
-        let operator_secret = operator_config.secret_from_env()?;
+        let operator_secret = operator_secret_from_env(&operator_config)?;
         let fill_convergence = FillConvergenceGuard::new(&config);
         let order_convergence =
             OrderStateConvergenceGuard::new(config.runtime.order_state_convergence_timeout_ms);

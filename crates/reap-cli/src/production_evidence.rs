@@ -18,10 +18,11 @@ use reap_live::{
     EconomicReconciliationOptions, EconomicReconciliationTolerances, FillStatementCoverage,
     FillStatementReconciliationOptions, FillStatementTolerances, LiveConfig,
     LiveConfigFileEvidence, LiveMode, TradingEnvironment, current_executable_sha256,
-    host_identity_sha256, reconcile_okx_economics_paths, reconcile_okx_fill_collection_paths,
-    verify_account_certification_artifact_path, verify_bill_collection_manifest_path,
-    verify_deadman_expiry_certification_artifact_path, verify_fill_collection_manifest_path,
-    verify_live_fault_matrix_paths, verify_live_run_paths, verify_production_transition_paths,
+    host_identity_sha256, load_live_config_with_evidence, reconcile_okx_economics_paths,
+    reconcile_okx_fill_collection_paths, verify_account_certification_artifact_path,
+    verify_bill_collection_manifest_path, verify_deadman_expiry_certification_artifact_path,
+    verify_fill_collection_manifest_path, verify_live_fault_matrix_paths, verify_live_run_paths,
+    verify_production_transition_paths,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -632,13 +633,13 @@ pub(crate) fn verify_production_evidence_manifest_path(
     };
 
     let (demo_config_start, demo_file_start) =
-        LiveConfig::load_with_evidence(&paths.demo_config)
+        load_live_config_with_evidence(&paths.demo_config)
             .context("failed to load exact demo config for production evidence")?;
     let (production_config_start, production_file_start) =
-        LiveConfig::load_with_evidence(&paths.production_config)
+        load_live_config_with_evidence(&paths.production_config)
             .context("failed to load exact production config for production evidence")?;
     let (_fault_config_start, fault_file_start) =
-        LiveConfig::load_with_evidence(&paths.fault_demo_config)
+        load_live_config_with_evidence(&paths.fault_demo_config)
             .context("failed to load exact routed fault config for production evidence")?;
     let (_, fault_proxy_evidence_start) = FaultProxyConfig::load(&paths.fault_proxy_config)
         .context("failed to load exact fault-proxy config for production evidence")?;
@@ -883,13 +884,13 @@ pub(crate) fn verify_production_evidence_manifest_path(
 
     // Reopen all configs after the expensive source reconstructions. Every
     // subordinate report is compared to this final exact-file observation.
-    let (demo_config, demo_file) = LiveConfig::load_with_evidence(&paths.demo_config)
+    let (demo_config, demo_file) = load_live_config_with_evidence(&paths.demo_config)
         .context("failed to reload exact demo config after production-evidence verification")?;
-    let (production_config, production_file) = LiveConfig::load_with_evidence(
+    let (production_config, production_file) = load_live_config_with_evidence(
         &paths.production_config,
     )
     .context("failed to reload exact production config after production-evidence verification")?;
-    let (fault_config, fault_file) = LiveConfig::load_with_evidence(&paths.fault_demo_config)
+    let (fault_config, fault_file) = load_live_config_with_evidence(&paths.fault_demo_config)
         .context("failed to reload exact routed fault config after verification")?;
     let (fault_proxy_config, fault_proxy_evidence) =
         FaultProxyConfig::load(&paths.fault_proxy_config)

@@ -1197,6 +1197,7 @@ dependencies = [
  "reap-engine",
  "reap-evidence-core",
  "reap-feed",
+ "reap-live-contracts",
  "reap-okx-live-adapter",
  "reap-order",
  "reap-risk",
@@ -1215,6 +1216,23 @@ dependencies = [
  "toml 0.9.12+spec-1.1.0",
  "tracing",
  "trybuild",
+ "url",
+]
+
+[[package]]
+name = "reap-live-contracts"
+version = "0.1.0"
+dependencies = [
+ "reap-core",
+ "reap-risk",
+ "reap-strategy",
+ "reap-venue",
+ "serde",
+ "serde_ignored",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "toml 0.9.12+spec-1.1.0",
  "url",
 ]
 

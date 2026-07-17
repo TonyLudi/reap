@@ -16,10 +16,12 @@ use reap_fault::{
     FaultProxyCommand, FaultProxyConfig, FaultProxyRunOptions, run_fault_proxy,
     send_fault_proxy_command, verify_fault_proxy_run_paths,
 };
+#[cfg(test)]
+use reap_live::LiveConfig;
 use reap_live::{
-    DeadmanExpiryCertificationOptions, LiveConfig, LiveMode, LiveRunOptions, LiveRuntimeError,
-    OperatorCommand, collect_account_certification_path, collect_deadman_expiry_certification_path,
-    send_operator_command, verify_account_certification_path,
+    DeadmanExpiryCertificationOptions, LiveMode, LiveRunOptions, LiveRuntimeError, OperatorCommand,
+    collect_account_certification_path, collect_deadman_expiry_certification_path,
+    load_live_config, send_operator_command, verify_account_certification_path,
     verify_deadman_expiry_certification_path, verify_production_transition_paths,
 };
 use reap_okx_evidence_adapter::OkxEvidenceClientFactory;
@@ -1327,7 +1329,7 @@ async fn main() -> Result<()> {
             output,
             pretty,
         } => {
-            let live = LiveConfig::load(&live_config).with_context(|| {
+            let live = load_live_config(&live_config).with_context(|| {
                 format!("failed to load demo live config {}", live_config.display())
             })?;
             let (proxy, proxy_evidence) =
@@ -1675,7 +1677,7 @@ async fn main() -> Result<()> {
             command,
             pretty,
         } => {
-            let config = LiveConfig::load(&config)
+            let config = load_live_config(&config)
                 .with_context(|| format!("failed to load live config {}", config.display()))?;
             let response = send_operator_command(&config.operator, command.into()).await?;
             if pretty {

@@ -20,6 +20,7 @@ members = [
     "crates/reap-capture",
     "crates/reap-storage",
     "crates/reap-telemetry",
+    "crates/reap-live-contracts",
     "crates/reap-live",
     "crates/reap-cli",
 ]
@@ -53,6 +54,7 @@ reap-fault = { path = "crates/reap-fault" }
 reap-emergency-core = { path = "crates/reap-emergency-core" }
 reap-emergency-runner = { path = "crates/reap-emergency-runner" }
 reap-live = { path = "crates/reap-live" }
+reap-live-contracts = { path = "crates/reap-live-contracts" }
 reap-engine = { path = "crates/reap-engine" }
 reap-order = { path = "crates/reap-order" }
 reap-okx-wire = { path = "crates/reap-okx-wire" }

@@ -10,7 +10,7 @@ use thiserror::Error;
 use crate::{
     LiveConfig, LiveConfigError, LiveConfigFileEvidence, LiveMode, LiveRunFileEvidence,
     LiveRunReport, LiveRunVerificationError, LiveRunVerificationFailure, LiveStopReason,
-    MAX_LIVE_RUN_REPORT_BYTES, verify_live_run_paths,
+    MAX_LIVE_RUN_REPORT_BYTES, load_live_config_with_evidence, verify_live_run_paths,
 };
 
 pub const LIVE_FAULT_MATRIX_MANIFEST_SCHEMA_VERSION: u32 = 3;
@@ -430,7 +430,7 @@ pub fn verify_live_fault_matrix_paths(
     manifest_path: impl AsRef<Path>,
 ) -> Result<LiveFaultMatrixVerificationReport, LiveFaultMatrixError> {
     let config_path = config_path.as_ref();
-    let (config, config_source) = LiveConfig::load_with_evidence(config_path)?;
+    let (config, config_source) = load_live_config_with_evidence(config_path)?;
     let config_fingerprint = config.fingerprint()?;
     let evidence_config_fingerprint = config.evidence_fingerprint()?;
     let (manifest_path, manifest_bytes) = read_bounded_regular_file(
@@ -670,21 +670,10 @@ fn campaign_config_failures(config: &LiveConfig) -> Vec<LiveFaultMatrixConfigFai
     if !config.operator.enabled {
         failures.push(LiveFaultMatrixConfigFailure::OperatorServiceDisabled);
     }
-    if let Some(plan) = config.connectivity_plan_ignoring_legacy_caps(LiveMode::Demo) {
-        let planned_public_redundancy_is_satisfied =
-            plan.public_subscriptions().iter().all(|subscription| {
-                config
-                    .runtime
-                    .resolve_public_replica_count(usize::from(subscription.replica_count()))
-                    .is_some()
-                    && (subscription.replica_count() <= 1
-                        || subscription.redundancy_consumer().is_some())
-            });
-        if !planned_public_redundancy_is_satisfied {
-            // Keep the serialized one-window failure code stable while the
-            // predicate now follows the resolved per-requirement plan.
-            failures.push(LiveFaultMatrixConfigFailure::PublicWebsocketRedundancyBelowTwo);
-        }
+    if config.planned_public_redundancy_is_satisfied(LiveMode::Demo) == Some(false) {
+        // Keep the serialized one-window failure code stable while the
+        // predicate now follows the resolved per-requirement plan.
+        failures.push(LiveFaultMatrixConfigFailure::PublicWebsocketRedundancyBelowTwo);
     }
     failures
 }

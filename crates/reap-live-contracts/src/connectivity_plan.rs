@@ -1,11 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use reap_core::PINNED_JAVA_REVISION;
-use reap_order::okx_order_dispatch_key;
 use reap_strategy::{
     ChaosDecisionInput, ChaosDecisionRequirementId, ChaosDecisionRequirements, ReferenceDataKind,
 };
-use reap_venue::okx::okx_capability_registration;
+use reap_venue::okx::{okx_capability_registration, okx_order_dispatch_key};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;

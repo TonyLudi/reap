@@ -1,7 +1,7 @@
 pub use reap_telemetry::{current_executable_sha256, host_identity_sha256};
 pub(crate) use reap_telemetry::{identity_sha256, sha256_bytes};
 
-use crate::config::TradingEnvironment;
+use crate::TradingEnvironment;
 
 pub(crate) fn okx_account_identity_sha256(
     environment: TradingEnvironment,

@@ -11,7 +11,7 @@ use sha2::Sha256;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{LiveConfigError, OperatorConfig, ReadinessSnapshot};
+use crate::{LiveConfigError, OperatorConfig, ReadinessSnapshot, operator_secret_from_env};
 
 const PROTOCOL_VERSION: u16 = 2;
 const MIN_SECRET_BYTES: usize = 32;
@@ -743,7 +743,7 @@ pub async fn send_operator_command(
     config: &OperatorConfig,
     command: OperatorCommand,
 ) -> Result<OperatorResponse, OperatorError> {
-    let secret = config.secret_from_env()?.ok_or(OperatorError::Disabled)?;
+    let secret = operator_secret_from_env(config)?.ok_or(OperatorError::Disabled)?;
     unix::send_operator_command_with_secret(config, &secret, command).await
 }
 

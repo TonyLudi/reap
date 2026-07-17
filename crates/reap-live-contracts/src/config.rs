@@ -1,18 +1,13 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
-use reap_core::{AccountUpdate, PositionMarginMode};
-use reap_feed::{
-    DEFAULT_OKX_CONNECTION_ATTEMPT_PACER_PATH, OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS,
-};
-use reap_order::PacingPolicy;
+use reap_core::{AccountUpdate, PacingPolicy, PositionMarginMode};
 use reap_risk::RiskLimits;
 use reap_strategy::{ChaosConfig, ChaosDecisionInput, InstrumentConfig};
-pub use reap_telemetry::HostGuardConfig;
-use reap_telemetry::WebhookAlertConfig;
 use reap_venue::okx::{
+    DEFAULT_OKX_CONNECTION_ATTEMPT_PACER_PATH, OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS,
     OKX_MIN_TRADE_FEE_REQUEST_INTERVAL_MS, OkxAccountConfig, OkxAccountLevel, OkxApiKeyPermission,
     OkxPositionMode, OkxTradeMode,
 };
@@ -22,7 +17,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::connectivity_plan::ChaosConnectivityPlan;
-use crate::runtime::LiveMode;
+use crate::{HostGuardConfig, LiveMode};
 
 pub const MAX_LIVE_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_REPORTED_UNKNOWN_FIELDS: usize = 64;
@@ -455,24 +450,6 @@ impl Default for OperatorConfig {
     }
 }
 
-impl OperatorConfig {
-    pub fn secret_from_env(&self) -> Result<Option<Vec<u8>>, LiveConfigError> {
-        if !self.enabled {
-            return Ok(None);
-        }
-        let secret =
-            std::env::var(&self.token_env).map_err(|_| LiveConfigError::MissingOperatorToken {
-                name: self.token_env.clone(),
-            })?;
-        if secret.len() < 32 {
-            return Err(LiveConfigError::OperatorTokenTooShort {
-                name: self.token_env.clone(),
-            });
-        }
-        Ok(Some(secret.into_bytes()))
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LiveStorageConfig {
@@ -522,37 +499,6 @@ impl Default for AlertConfig {
             shutdown_timeout_ms: 10_000,
             delivery_failure_is_fatal: true,
         }
-    }
-}
-
-impl AlertConfig {
-    pub fn webhook_from_env(&self) -> Result<Option<WebhookAlertConfig>, LiveConfigError> {
-        if !self.enabled {
-            return Ok(None);
-        }
-        let endpoint = std::env::var(&self.endpoint_env).map_err(|_| {
-            LiveConfigError::MissingAlertEndpoint {
-                name: self.endpoint_env.clone(),
-            }
-        })?;
-        let bearer_token = self
-            .bearer_token_env
-            .as_ref()
-            .map(|name| {
-                std::env::var(name)
-                    .map_err(|_| LiveConfigError::MissingAlertBearerToken { name: name.clone() })
-            })
-            .transpose()?;
-        Ok(Some(WebhookAlertConfig {
-            endpoint,
-            bearer_token,
-            channel_capacity: self.channel_capacity,
-            failure_channel_capacity: self.failure_channel_capacity,
-            request_timeout: Duration::from_millis(self.request_timeout_ms),
-            connect_timeout: Duration::from_millis(self.connect_timeout_ms),
-            max_attempts: self.max_attempts,
-            retry_backoff: Duration::from_millis(self.retry_backoff_ms),
-        }))
     }
 }
 
@@ -607,61 +553,6 @@ pub enum LiveConfigError {
 }
 
 impl LiveConfig {
-    pub fn load(path: impl AsRef<Path>) -> Result<Self, LiveConfigError> {
-        Self::load_with_evidence(path).map(|(config, _)| config)
-    }
-
-    pub fn load_with_evidence(
-        path: impl AsRef<Path>,
-    ) -> Result<(Self, LiveConfigFileEvidence), LiveConfigError> {
-        let path = path.as_ref();
-        let metadata =
-            std::fs::symlink_metadata(path).map_err(|error| LiveConfigError::InvalidPath {
-                path: path.to_path_buf(),
-                message: error.to_string(),
-            })?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(LiveConfigError::InvalidPath {
-                path: path.to_path_buf(),
-                message: "must be a regular file and not a symbolic link".to_string(),
-            });
-        }
-        let canonical =
-            std::fs::canonicalize(path).map_err(|error| LiveConfigError::InvalidPath {
-                path: path.to_path_buf(),
-                message: error.to_string(),
-            })?;
-        if metadata.len() > MAX_LIVE_CONFIG_BYTES {
-            return Err(LiveConfigError::TooLarge {
-                path: canonical,
-                actual: metadata.len(),
-                limit: MAX_LIVE_CONFIG_BYTES,
-            });
-        }
-        let bytes = std::fs::read(&canonical).map_err(|source| LiveConfigError::Read {
-            path: canonical.clone(),
-            source,
-        })?;
-        if bytes.len() as u64 > MAX_LIVE_CONFIG_BYTES {
-            return Err(LiveConfigError::TooLarge {
-                path: canonical,
-                actual: bytes.len() as u64,
-                limit: MAX_LIVE_CONFIG_BYTES,
-            });
-        }
-        let text = std::str::from_utf8(&bytes).map_err(|source| LiveConfigError::Utf8 {
-            path: canonical.clone(),
-            source,
-        })?;
-        let config = Self::from_toml(text)?;
-        let evidence = LiveConfigFileEvidence {
-            source_path: canonical,
-            bytes: bytes.len() as u64,
-            sha256: format!("{:x}", Sha256::digest(&bytes)),
-        };
-        Ok((config, evidence))
-    }
-
     pub fn from_toml(text: &str) -> Result<Self, LiveConfigError> {
         let mut ignored_count = 0_u64;
         let mut ignored_paths = Vec::new();
@@ -761,7 +652,7 @@ impl LiveConfig {
         errors
     }
 
-    pub(crate) fn connectivity_plan_ignoring_legacy_caps(
+    fn connectivity_plan_ignoring_legacy_caps(
         &self,
         mode: LiveMode,
     ) -> Option<ChaosConnectivityPlan> {
@@ -769,6 +660,24 @@ impl LiveConfig {
         uncapped.runtime.public_connections_per_subscription = usize::from(u16::MAX);
         uncapped.runtime.order_websocket_sessions = MAX_ORDER_WEBSOCKET_SESSIONS;
         ChaosConnectivityPlan::resolve(&uncapped, mode).ok()
+    }
+
+    /// Evaluates the plan-derived public redundancy requirement without
+    /// treating the two migration-only legacy fields as topology selectors.
+    ///
+    /// The returned decision is diagnostic-only: it does not expose a
+    /// connectivity plan and cannot create a connection or session.
+    pub fn planned_public_redundancy_is_satisfied(&self, mode: LiveMode) -> Option<bool> {
+        self.connectivity_plan_ignoring_legacy_caps(mode)
+            .map(|plan| {
+                plan.public_subscriptions().iter().all(|subscription| {
+                    self.runtime
+                        .resolve_public_replica_count(usize::from(subscription.replica_count()))
+                        .is_some()
+                        && (subscription.replica_count() <= 1
+                            || subscription.redundancy_consumer().is_some())
+                })
+            })
     }
 
     pub fn production_evidence_policy_errors(&self, prefix: &str) -> Vec<String> {
@@ -1086,7 +995,11 @@ impl LiveConfig {
         })
     }
 
-    pub(crate) fn account_state_policy_errors(
+    /// Pure fail-closed account-state policy evaluation.
+    ///
+    /// This reports violations only; it does not own transport, credentials,
+    /// order mutation, or runtime state.
+    pub fn evaluate_account_state_policy(
         &self,
         account_id: &str,
         update: &AccountUpdate,
@@ -2550,13 +2463,6 @@ mod tests {
 
     #[test]
     fn enabled_operator_service_requires_bounded_distinct_configuration() {
-        assert!(
-            OperatorConfig::default()
-                .secret_from_env()
-                .unwrap()
-                .is_none()
-        );
-
         let mut config = valid_config();
         config.operator.enabled = true;
         config.operator.socket_path = config.storage.path.clone();
@@ -2691,8 +2597,6 @@ mod tests {
 
     #[test]
     fn enabled_alerts_and_host_guard_require_bounded_settings() {
-        assert!(AlertConfig::default().webhook_from_env().unwrap().is_none());
-
         let mut config = valid_config();
         config.alerts.enabled = true;
         config.alerts.endpoint_env.clear();

@@ -14,7 +14,8 @@ use reap_live::{
     LIVE_LATENCY_EVIDENCE_SCHEMA_VERSION, LIVE_LATENCY_RESERVOIR_CAPACITY,
     LIVE_RUN_REPORT_SCHEMA_VERSION, LiveConfig, LiveLatencySemantics, LiveLatencySeries, LiveMode,
     LiveRunReport, LiveStopReason, MAX_LIVE_FAILURE_CODE_BYTES, MAX_LIVE_FAILURE_MESSAGE_BYTES,
-    MAX_LIVE_LATENCY_SERIES, MAX_LIVE_LATENCY_US, verify_live_run_paths,
+    MAX_LIVE_LATENCY_SERIES, MAX_LIVE_LATENCY_US, load_live_config_with_evidence,
+    verify_live_run_paths,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -114,7 +115,7 @@ pub(crate) fn build_latency_calibration(
     if options.minimum_samples_per_series == 0 {
         bail!("--minimum-samples-per-series must be positive");
     }
-    let (config, config_source) = LiveConfig::load_with_evidence(config_path)
+    let (config, config_source) = load_live_config_with_evidence(config_path)
         .with_context(|| format!("failed to load live config {}", config_path.display()))?;
     let config_fingerprint = config.fingerprint()?;
     let evidence_config_fingerprint = config.evidence_fingerprint()?;
@@ -342,7 +343,7 @@ pub(crate) fn verify_latency_calibration(
         bail!("at most {MAX_LATENCY_CALIBRATION_SOURCE_REPORTS} --report inputs are supported");
     }
 
-    let (config, config_source) = LiveConfig::load_with_evidence(config_path)
+    let (config, config_source) = load_live_config_with_evidence(config_path)
         .with_context(|| format!("failed to load live config {}", config_path.display()))?;
     let (artifact_evidence, artifact_bytes) = read_verification_file(
         artifact_path,

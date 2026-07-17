@@ -10,7 +10,7 @@ use crate::{
     LIVE_LATENCY_EVIDENCE_SCHEMA_VERSION, LIVE_LATENCY_RESERVOIR_CAPACITY,
     LIVE_RUN_REPORT_SCHEMA_VERSION, LiveConfig, LiveConfigError, LiveMode, LiveRunReport,
     LiveStopReason, MAX_LIVE_FAILURE_CODE_BYTES, MAX_LIVE_FAILURE_MESSAGE_BYTES,
-    MAX_LIVE_LATENCY_SERIES, MAX_LIVE_LATENCY_US, StartupGate,
+    MAX_LIVE_LATENCY_SERIES, MAX_LIVE_LATENCY_US, StartupGate, load_live_config_with_evidence,
 };
 
 pub const LIVE_RUN_VERIFICATION_FORMAT_VERSION: u16 = 2;
@@ -130,7 +130,7 @@ pub fn verify_live_run_paths(
     report_path: impl AsRef<Path>,
     expected_mode: Option<LiveMode>,
 ) -> Result<LiveRunVerificationReport, LiveRunVerificationError> {
-    let (config, config_file) = LiveConfig::load_with_evidence(config_path)?;
+    let (config, config_file) = load_live_config_with_evidence(config_path)?;
     let (report_source, report_bytes) = read_report(report_path.as_ref())?;
     let report: LiveRunReport = serde_json::from_slice(&report_bytes).map_err(|source| {
         LiveRunVerificationError::ParseReport {
