@@ -17,8 +17,8 @@ approval.
 | --- | --- | --- |
 | Iarb2 decision model | Covered for the documented OKX parity boundary | Not a blocker |
 | Deterministic backtest/data | Shared strategy code, immediate pending-order registration, arrival-time scheduler, Java-mapped class/symbol empirical latency profiles with sampled-usage reporting, versioned target-host/live collectors, deterministic calibration artifacts bound into production research, conservative depth/queue/trade capacity controls, event-clock drawdown/exposure/inventory metrics, per-currency depeg-sensitive valuation, exact private-fill fee currency plus explicit simulated-fee counts, fee/turnover attribution, authenticated recent-fill and account-wide bill collection with verified offline trade/fee/funding reconciliation, journal-backed derivative close-PnL reconstruction, bracketed bill-to-cash continuity, authenticated point-in-time cash/zero-liability/equity-conversion collection and offline verification, forecast/realized funding separation with event-time linear/inverse settlement, manifest-driven chronological walk-forward selection and stress gates with exact independent report reconstruction, credential-free redundant public capture, exact provenance, streaming analysis, and raw/normalized replay | The evidence pipeline is implemented but execution/accounting assumptions remain uncalibrated; needs sustained full-depth and currency-index capture, a passing credentialed target-host/demo latency artifact, complete funding intervals, target-tier fee calibration, real passing target-account and fill/bill economic artifacts including authoritative position-basis/close and opening/closing cash samples, empirical cash-spot bill semantics, reviewed total-equity attribution, and production-candidate reports before capital decisions |
-| Feed components | Redundant public sockets, isolated private sockets, transport/state freshness separation, independently aged index/funding/mark/price-limit sources, account-plus-positions health rounds, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
-| Order components | Event-loop client IDs/registration, exchange/client acknowledgement binding, account-scoped immutable private identity, semantic duplicate suppression across changed exchange timestamps, exchange-side place-request expiry, an authenticated eight-session websocket command pool, constant-time per-underlying FIFOs, bounded cross-underlying command concurrency, shared account pacing, independent REST reconciliation, shutdown command flushing, monotonic private reduction, submit/cancel state-convergence deadlines, typed position margin mode, and ambiguity handling are composed | Needs demo exchange fault evidence |
+| Feed components | Plan-derived redundant books and single-replica trade/reference feeds, one packed private-state socket per account, transport/state freshness separation, independently aged index/funding/mark/price-limit sources, account-plus-positions health rounds, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
+| Order components | Event-loop client IDs/registration, exchange/client acknowledgement binding, account-scoped immutable private identity, semantic duplicate suppression across changed exchange timestamps, exchange-side place-request expiry, one nonempty plan-derived command lane per executing account, constant-time per-underlying FIFOs, shared account pacing, independent REST reconciliation, shutdown command flushing, monotonic private reduction, submit/cancel state-convergence deadlines, typed position margin mode, and ambiguity handling are composed | Needs demo exchange fault evidence |
 | Runtime risk | Instrument models, authoritative startup positions, authenticated current instrument-rule, hard single-order maximum, and fee-group checks, final pre-trade exchange-limit enforcement, typed upcoming-change lead, active-order count/notional ceilings, rolling submit-rejection and zero-fill IOC-cancel circuits, terminal strategy-halt promotion, position scope/mode enforcement, zero-liability enforcement, periodic authenticated account-config drift detection, forced-repayment blocking, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock and announced-maintenance checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed instrument/fee/deadman/depeg/convergence evidence |
 | Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, strict bounded soak reports, documented region/environment endpoint tuples, an exact demo-to-production config transition verifier, and a source-rebuilding cross-gate production evidence bundle | Demo-capable; production entry intentionally unavailable, and no passing target-host bundle exists |
 | Instrument/account bootstrap | Account instruments/config/balance/positions are typed; authenticating API-key permissions and IP bindings are retained; exact configured scope is enforced with `withdraw` forbidden and production trade keys IP-bound; economic snapshots preserve borrowing flags, liabilities, interest, and margin-loan fields; live spot and borrow limits are cash-only/zero; enabled borrowing, missing applicable evidence, nonzero liabilities, margin positions, and nonzero positions outside configured ownership/mode fail before strategy/risk application | Needs a passing artifact from the real target account and host; tooling alone is not evidence |
@@ -343,8 +343,8 @@ approval.
     and preserves all strategy, risk, account-policy, runtime, execution,
     storage-capacity, and safety settings. Format 2 now also rejects either
     config unless fatal alerts, the operator service, production host-guard
-    floors, at least two public and order-command sessions, and an absolute
-    shared connection pacer are configured. It does not inspect secrets, prove
+    floors, exact plan-derived public redundancy and nonempty command lanes, and
+    an absolute shared connection pacer are configured. It does not inspect secrets, prove
     the controls were exercised, or authorize production.
 44. WebSocket connection attempts are serialized across public, private,
     order-command, capture, and fault-proxy-upstream supervisors for initial
@@ -597,7 +597,7 @@ approval.
     connectivity and deterministic replay evidence but remains deliberately
     inadmissible for production-candidate research. The exact demo-to-production
     transition now applies the same host floors and additionally requires fatal
-    alerts, the operator service, redundant public and order-command sessions,
+    alerts, the operator service, resolved public redundancy and command lanes,
     and an absolute shared pacer in both configs, so the aggregate bundle cannot
     admit the checked-in development defaults.
 59. A source-level connectivity audit against pinned Java
@@ -638,7 +638,7 @@ approval.
     credentialed demo fault campaigns.
 60. The next source audit followed pinned Java
     `OkxNitroOrderClient.onOrderSessionDisconnected`, which immediately invokes
-    `cancelAll()`, through Rust's eight-session command transport and demo fault
+    `cancelAll()`, through Rust's then-eight-session command transport and demo fault
     proxy. Rust heartbeat status previously used awaited sends at both bounded
     telemetry queues, so a stalled observer could stop a command session before
     it processed shutdown or delivered the disconnect that triggers canonical

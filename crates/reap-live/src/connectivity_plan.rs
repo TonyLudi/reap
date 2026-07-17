@@ -1754,6 +1754,94 @@ mod tests {
     }
 
     #[test]
+    fn spot_and_swap_duplicate_family_owns_exactly_one_nonempty_lane() {
+        let config = sample_config();
+        let plan = ChaosConnectivityPlan::resolve(&config, LiveMode::Demo).unwrap();
+
+        assert_eq!(
+            config
+                .strategy
+                .instruments
+                .iter()
+                .map(|instrument| instrument.symbol.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["BTC-USDT", "BTC-USDT-SWAP"])
+        );
+        assert_eq!(plan.command_lanes().len(), 1);
+        let lane = &plan.command_lanes()[0];
+        assert_eq!(lane.account_id(), "main");
+        assert_eq!(lane.lane_index(), 0);
+        assert_eq!(lane.dispatch_families(), &["BTC-USDT"]);
+        assert!(!lane.dispatch_families().is_empty());
+
+        let assigned = plan
+            .command_lanes()
+            .iter()
+            .flat_map(|lane| lane.dispatch_families())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            assigned.len(),
+            assigned.iter().copied().collect::<BTreeSet<_>>().len()
+        );
+    }
+
+    #[test]
+    fn multiple_underlyings_share_the_single_account_lane() {
+        let mut requirements =
+            ChaosConnectivityRequirements::from_config(&sample_config()).unwrap();
+        requirements.accounts[0]
+            .symbols
+            .push("ETH-USDT".to_string());
+
+        let command_lanes = resolve_command_lanes(LiveMode::Demo, &requirements);
+
+        assert_eq!(command_lanes.len(), 1);
+        assert_eq!(command_lanes[0].account_id(), "main");
+        assert_eq!(command_lanes[0].lane_index(), 0);
+        assert_eq!(
+            command_lanes[0].dispatch_families(),
+            &["BTC-USDT", "ETH-USDT"]
+        );
+    }
+
+    #[test]
+    fn single_lane_queue_has_four_ack_horizons_of_credential_free_capacity() {
+        // This is the explicit Phase-4 capacity threshold: the one planned
+        // command lane must hold at least four complete worst-case
+        // acknowledgement horizons at the configured submit+cancel rates.
+        // The proof is deliberately pure arithmetic: it reads no credentials,
+        // opens no socket, and cannot be made green by exchange latency.
+        const REQUIRED_ACK_HORIZON_HEADROOM: usize = 4;
+
+        let config = sample_config();
+        let plan = ChaosConnectivityPlan::resolve(&config, LiveMode::Demo).unwrap();
+        let configured_instruments = config.strategy.instruments.len();
+        let commands_per_instrument_window =
+            config.runtime.submit_requests_per_window + config.runtime.cancel_requests_per_window;
+        let acknowledgement_windows = config
+            .runtime
+            .order_websocket_ack_timeout_ms
+            .div_ceil(config.runtime.request_window_ms)
+            as usize;
+        let worst_case_ack_horizon_commands =
+            configured_instruments * commands_per_instrument_window * acknowledgement_windows;
+        let required_capacity = worst_case_ack_horizon_commands * REQUIRED_ACK_HORIZON_HEADROOM;
+
+        assert_eq!(plan.command_lanes().len(), 1);
+        assert_eq!(configured_instruments, 2);
+        assert_eq!(commands_per_instrument_window, 100);
+        assert_eq!(acknowledgement_windows, 3);
+        assert_eq!(worst_case_ack_horizon_commands, 600);
+        assert_eq!(required_capacity, 2_400);
+        assert_eq!(config.runtime.order_channel_capacity, 4_096);
+        assert!(
+            config.runtime.order_channel_capacity >= required_capacity,
+            "single command lane queue {} is below the documented {REQUIRED_ACK_HORIZON_HEADROOM}x acknowledgement-horizon threshold {required_capacity}",
+            config.runtime.order_channel_capacity
+        );
+    }
+
+    #[test]
     fn sample_plan_is_secret_free_and_has_one_nonidle_family_lane() {
         let mut config = sample_config();
         config.accounts[0].api_key_env = "PHASE1_POISON_API_KEY".to_string();
@@ -1772,6 +1860,14 @@ mod tests {
         assert_eq!(plan.command_lanes().len(), 1);
         assert_eq!(plan.command_lanes()[0].dispatch_families(), &["BTC-USDT"]);
         for forbidden in [
+            "api_key_env",
+            "secret_key_env",
+            "passphrase_env",
+            "token_env",
+            "rest_url",
+            "public_ws_url",
+            "private_ws_url",
+            "order_ws_url",
             "PHASE1_POISON_API_KEY",
             "PHASE1_POISON_SECRET_KEY",
             "PHASE1_POISON_PASSPHRASE",
@@ -1856,7 +1952,7 @@ mod tests {
     }
 
     #[test]
-    fn books_are_redundant_and_trades_are_exactly_once_per_instrument() {
+    fn book_replicas_name_the_recovery_consumer_and_trades_are_exact_per_instrument() {
         let config = sample_config();
         let plan = ChaosConnectivityPlan::resolve(&config, LiveMode::Demo).unwrap();
         let configured_symbols = config
@@ -1878,14 +1974,47 @@ mod tests {
 
         assert_eq!(books.len(), configured_symbols.len());
         assert_eq!(trades.len(), configured_symbols.len());
-        assert!(books.iter().all(|subscription| {
-            subscription.replica_count() == 2 && subscription.redundancy_consumer().is_some()
-        }));
-        assert!(
-            trades
-                .iter()
-                .all(|subscription| subscription.replica_count() == 1)
+        for subscription in &books {
+            assert_eq!(subscription.replica_count(), 2);
+            assert_eq!(subscription.replica_count() - 1, 1);
+            assert_eq!(
+                subscription.redundancy_consumer(),
+                Some(PublicRedundancyConsumer::IndependentBookSequenceArbitrationAndRecovery)
+            );
+        }
+        for subscription in plan
+            .public_subscriptions()
+            .iter()
+            .filter(|subscription| subscription.channel() != PublicChannelPlan::Books)
+        {
+            assert_eq!(subscription.replica_count(), 1);
+            assert_eq!(subscription.redundancy_consumer(), None);
+        }
+        let trade_counts = trades.iter().fold(
+            BTreeMap::<&str, usize>::new(),
+            |mut counts, subscription| {
+                *counts.entry(subscription.symbol()).or_default() += 1;
+                counts
+            },
         );
+        assert_eq!(
+            trade_counts,
+            configured_symbols
+                .iter()
+                .map(|symbol| (*symbol, 1))
+                .collect::<BTreeMap<_, _>>()
+        );
+        for subscription in &trades {
+            assert_eq!(subscription.requirements().len(), 1);
+            assert_eq!(
+                subscription.requirements()[0].requirement_id(),
+                ConnectivityRequirementId::ChaosMdTrade
+            );
+            assert_eq!(
+                subscription.requirements()[0].consumer(),
+                ConnectivityConsumer::ImpliedDepthAndRepricing
+            );
+        }
         assert_eq!(
             trades
                 .iter()
@@ -1893,6 +2022,29 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             configured_symbols
         );
+    }
+
+    #[test]
+    fn maintenance_relevance_is_regular_product_only_and_excludes_spread() {
+        let plan = ChaosConnectivityPlan::resolve(&sample_config(), LiveMode::Observe).unwrap();
+        let relevance = plan.maintenance_relevance();
+
+        assert!(relevance.unified_system());
+        assert_eq!(
+            relevance.services(),
+            &[
+                MaintenanceServicePlan::OtherAmbiguous,
+                MaintenanceServicePlan::Trading,
+                MaintenanceServicePlan::TradingAccounts,
+                MaintenanceServicePlan::TradingProducts,
+                MaintenanceServicePlan::Websocket,
+            ]
+        );
+        assert_eq!(
+            relevance.products(),
+            &[MaintenanceProductPlan::Spot, MaintenanceProductPlan::Swap]
+        );
+        assert!(!serde_json::to_string(relevance).unwrap().contains("spread"));
     }
 
     #[test]

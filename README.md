@@ -38,12 +38,14 @@ Implemented:
   classifies ambiguous operations, partial fills, convergence timeouts, restored
   latches, and typed safety-task failures.
 - A fail-closed `reap-live` composition root with account-scoped REST bootstrap,
-  exchange metadata/account-mode and zero-liability verification, redundant public sockets,
-  isolated private sockets, account/positions data-round health, one strategy
-  owner, prioritized gateway tasks, and graceful cancel-and-drain shutdown.
+  exchange metadata/account-mode and zero-liability verification, exact
+  plan-derived public replicas, one packed private-state socket per account,
+  account/positions data-round health, one nonempty command lane per executing
+  account, one strategy owner, prioritized gateway tasks, and graceful
+  cancel-and-drain shutdown.
   Demo entry also validates exchange time, continuously detects authenticated
-  account-configuration drift, polls announced OKX unified-account maintenance
-  with the pinned Java service filter and lead time, continuously verifies
+  account-configuration drift, polls only plan-relevant OKX unified-account
+  maintenance with the configured lead time, continuously verifies
   strategy-critical instrument rules, hard single-order maxima, and configured
   fees against authenticated current OKX metadata, enforces the authenticated
   limit-order quantity/amount again before dispatch, and maintains OKX Cancel

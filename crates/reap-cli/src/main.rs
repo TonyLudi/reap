@@ -1384,7 +1384,10 @@ async fn main() -> Result<()> {
                 // diagnostics on stderr, before any credential/network role.
                 eprintln!(
                     "{}",
-                    live_connectivity_plan_diagnostic(prepared.connectivity_plan())?
+                    live_connectivity_plan_diagnostic(
+                        prepared.connectivity_plan(),
+                        &prepared.connectivity_migration_diagnostics(),
+                    )?
                 );
             }
             let mut output_file = output
@@ -1731,13 +1734,18 @@ async fn main() -> Result<()> {
 struct LiveConnectivityPlanDiagnostic<'a> {
     kind: &'static str,
     sha256: String,
+    connectivity_migration_diagnostics: &'a [String],
     plan: &'a reap_live::ChaosConnectivityPlan,
 }
 
-fn live_connectivity_plan_diagnostic(plan: &reap_live::ChaosConnectivityPlan) -> Result<String> {
+fn live_connectivity_plan_diagnostic(
+    plan: &reap_live::ChaosConnectivityPlan,
+    connectivity_migration_diagnostics: &[String],
+) -> Result<String> {
     Ok(serde_json::to_string(&LiveConnectivityPlanDiagnostic {
         kind: "chaos_connectivity_plan",
         sha256: plan.sha256(),
+        connectivity_migration_diagnostics,
         plan,
     })?)
 }
@@ -1862,11 +1870,19 @@ mod tests {
         let config =
             LiveConfig::from_toml(include_str!("../../../examples/live-okx-demo.toml")).unwrap();
         let plan = reap_live::ChaosConnectivityPlan::resolve(&config, LiveMode::Validate).unwrap();
-        let diagnostic = live_connectivity_plan_diagnostic(&plan).unwrap();
+        let migration_diagnostics = config.connectivity_migration_diagnostics();
+        let diagnostic = live_connectivity_plan_diagnostic(&plan, &migration_diagnostics).unwrap();
         let value: serde_json::Value = serde_json::from_str(&diagnostic).unwrap();
 
         assert_eq!(value["kind"], "chaos_connectivity_plan");
         assert_eq!(value["sha256"], plan.sha256());
+        assert_eq!(
+            value["connectivity_migration_diagnostics"],
+            serde_json::to_value(&migration_diagnostics).unwrap()
+        );
+        assert!(migration_diagnostics.iter().all(|diagnostic| {
+            diagnostic.contains("deprecated") && diagnostic.contains("cannot create")
+        }));
         assert_eq!(value["plan"]["schema_version"], 1);
         assert_eq!(value["plan"]["mode"], "validate");
         let plan_start = diagnostic.find("\"plan\":").unwrap() + "\"plan\":".len();

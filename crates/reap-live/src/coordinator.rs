@@ -126,7 +126,7 @@ pub struct LiveCoordinator {
     regular_execution: RegularExecutionPolicy,
     owned_regular_orders: OwnedRegularOrders,
     client_ids: HashMap<String, ClientOrderIdGenerator>,
-    gateway_actions_enabled: bool,
+    gateway_action_accounts: HashSet<String>,
     order_entry_enabled: bool,
     halted_accounts: BTreeMap<String, String>,
     journal_fill_keys_by_account: HashMap<String, HashSet<FillKey>>,
@@ -141,6 +141,20 @@ impl LiveCoordinator {
         gateway_actions_enabled: bool,
         session_id: impl Into<String>,
     ) -> Result<Self, CoordinatorError> {
+        let gateway_action_accounts = if gateway_actions_enabled {
+            config.required_accounts()
+        } else {
+            HashSet::new()
+        };
+        Self::new_with_order_transports(config, verified, gateway_action_accounts, session_id)
+    }
+
+    pub fn new_with_order_transports(
+        config: LiveConfig,
+        verified: VerifiedBootstrap,
+        gateway_action_accounts: HashSet<String>,
+        session_id: impl Into<String>,
+    ) -> Result<Self, CoordinatorError> {
         let session_id = session_id.into();
         if session_id.trim().is_empty() {
             return Err(CoordinatorError::EmptySessionId);
@@ -153,8 +167,10 @@ impl LiveCoordinator {
             risk.set_instrument_model(instrument.symbol.clone(), instrument.risk_model);
             risk.set_instrument_order_limits(instrument.symbol.clone(), instrument.order_limits);
         }
-        let mut startup = StartupGate::new_with_order_transport(&config, gateway_actions_enabled);
+        let mut startup =
+            StartupGate::new_with_order_transports(&config, gateway_action_accounts.clone())?;
         startup.mark_metadata_verified();
+        let order_entry_enabled = !gateway_action_accounts.is_empty();
         let mut private_states = HashMap::new();
         let mut client_ids = HashMap::new();
         // Baseline keys predate this session and recovered fill keys are already
@@ -187,8 +203,8 @@ impl LiveCoordinator {
             regular_execution,
             owned_regular_orders: OwnedRegularOrders::default(),
             client_ids,
-            gateway_actions_enabled,
-            order_entry_enabled: gateway_actions_enabled,
+            gateway_action_accounts,
+            order_entry_enabled,
             halted_accounts: BTreeMap::new(),
             journal_fill_keys_by_account,
             session_id,
@@ -1147,7 +1163,6 @@ impl LiveCoordinator {
                     ChaosExecutionIntent::Hedge(hedge) => hedge.symbol(),
                     ChaosExecutionIntent::CancelOwned(_) => unreachable!(),
                 };
-                let submit_enabled = self.gateway_actions_enabled && self.order_entry_enabled;
                 let Some(account_id) = self
                     .config
                     .account_for_symbol(symbol)
@@ -1165,6 +1180,8 @@ impl LiveCoordinator {
                     );
                     return;
                 };
+                let gateway_actions_enabled = self.gateway_action_accounts.contains(&account_id);
+                let submit_enabled = gateway_actions_enabled && self.order_entry_enabled;
                 if let Some(reason) = self.halted_accounts.get(&account_id) {
                     output.records.push(StorageRecord::IntentRejected {
                         ts_ms: now_ms,
@@ -1180,7 +1197,7 @@ impl LiveCoordinator {
                         reason: format!(
                             "live gate is {:?}; gateway actions enabled={}; new order entry enabled={}",
                             self.startup.phase(),
-                            self.gateway_actions_enabled,
+                            gateway_actions_enabled,
                             self.order_entry_enabled
                         ),
                     });
@@ -1272,14 +1289,14 @@ impl LiveCoordinator {
         legacy: OrderIntent,
         output: &mut CoordinatorOutput,
     ) {
-        if !self.gateway_actions_enabled || !self.startup.can_cancel() {
-            let rejection_reason = if self.gateway_actions_enabled {
+        if self.gateway_action_accounts.is_empty() || !self.startup.can_cancel() {
+            let rejection_reason = if self.gateway_action_accounts.is_empty() {
+                "live gateway actions are disabled in observe mode".to_string()
+            } else {
                 format!(
                     "live gate is {:?}; cancellation is unavailable",
                     self.startup.phase()
                 )
-            } else {
-                "live gateway actions are disabled in observe mode".to_string()
             };
             output.records.push(StorageRecord::IntentRejected {
                 ts_ms: now_ms,
@@ -1301,6 +1318,14 @@ impl LiveCoordinator {
             }
         };
         let (account_id, symbol, client_order_id, reason) = approved.into_parts();
+        if !self.gateway_action_accounts.contains(&account_id) {
+            output.records.push(StorageRecord::IntentRejected {
+                ts_ms: now_ms,
+                intent: legacy,
+                reason: format!("account {account_id} has no planned regular order transport"),
+            });
+            return;
+        }
         output.actions.push(LiveAction::Cancel(CancelAction {
             ts_ms: now_ms,
             account_id,

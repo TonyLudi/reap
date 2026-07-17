@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -31,7 +31,6 @@ use reap_storage::{
     StorageError, StorageRecord, StorageRuntime, StorageSink, acquire_storage_lease, recover_jsonl,
     start_jsonl_storage_with_lease,
 };
-use reap_strategy::ReferenceDataKind;
 use reap_telemetry::{
     AlertDeliveryFailure, AlertError, AlertEvent, AlertRuntime, AlertSeverity, AlertSink,
     AlertStats, start_webhook_alerts,
@@ -59,11 +58,13 @@ use crate::{
     AccountBootstrapSnapshot, CancelAction, ChaosConnectivityPlan, ChaosConnectivityPlanError,
     CoordinatorError, CoordinatorOutput, HostGuardRuntime, HostHealthError, HostHealthSnapshot,
     LiveAction, LiveConfig, LiveConfigError, LiveConfigFileEvidence, LiveCoordinator,
-    LiveLatencyCollector, LiveLatencyEvidence, LiveLatencySemantics, OperatorCommand,
-    OperatorEnvelope, OperatorError, OperatorResponse, OperatorService, OperatorStatus,
-    ReadinessSnapshot, ReconcileAction, ReconciliationResult, StartupGate, SubmitAction,
-    TradingEnvironment, VerifiedBootstrap, check_host_health, okx_instrument_type,
-    start_host_guard, start_operator_service, verify_bootstrap,
+    LiveLatencyCollector, LiveLatencyEvidence, LiveLatencySemantics, MaintenanceRelevancePlan,
+    MaintenanceServicePlan, OperatorCommand, OperatorEnvelope, OperatorError, OperatorResponse,
+    OperatorService, OperatorStatus, PrivateChannelPlan, PublicChannelPlan,
+    PublicRedundancyConsumer, ReadinessSnapshot, ReconcileAction, ReconciliationResult,
+    RequirementUse, StartupGate, SubmitAction, TradingEnvironment, VerifiedBootstrap,
+    check_host_health, okx_instrument_type, start_host_guard, start_operator_service,
+    verify_bootstrap,
 };
 
 type LiveGateway = OkxOrderGateway;
@@ -656,6 +657,10 @@ impl PreparedLiveRun {
         &self.connectivity_plan
     }
 
+    pub fn connectivity_migration_diagnostics(&self) -> Vec<String> {
+        self.config.connectivity_migration_diagnostics()
+    }
+
     pub async fn run(self) -> Result<LiveRunReport, LiveRuntimeError> {
         if self.options.mode == LiveMode::Validate {
             return Ok(self.pre_runtime_report(LiveStopReason::Validation, None, 0));
@@ -663,6 +668,7 @@ impl PreparedLiveRun {
         let build = LiveRuntime::build(
             self.config.clone(),
             self.evidence.clone(),
+            self.connectivity_plan.clone(),
             self.options.mode,
             self.options.run_duration,
         )
@@ -885,10 +891,10 @@ impl SafetyPort for LiveSafety {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ExchangeStatusGuard {
     enabled: bool,
-    environment: TradingEnvironment,
+    relevance: MaintenanceRelevancePlan,
     check_interval_ms: u64,
     lead_ms: u64,
 }
@@ -916,6 +922,8 @@ async fn bootstrap_accounts(
     config: &LiveConfig,
     restored_orders: &HashMap<String, Vec<reap_core::OrderUpdate>>,
     mode: LiveMode,
+    planned_order_accounts: &HashSet<String>,
+    maintenance_relevance: &MaintenanceRelevancePlan,
 ) -> Result<
     (
         VerifiedBootstrap,
@@ -959,8 +967,8 @@ async fn bootstrap_accounts(
             gateway,
             safety,
             regular_order_sessions,
-        ) = match mode {
-            LiveMode::Observe => {
+        ) = match (mode, planned_order_accounts.contains(&account.id)) {
+            (LiveMode::Observe, _) | (LiveMode::Demo, false) => {
                 let roles = observe_from_env(
                     connection,
                     credential_env,
@@ -980,7 +988,7 @@ async fn bootstrap_accounts(
                     None,
                 )
             }
-            LiveMode::Demo => {
+            (LiveMode::Demo, true) => {
                 let roles = demo_from_env(
                     connection,
                     credential_env,
@@ -1013,7 +1021,7 @@ async fn bootstrap_accounts(
                     Some(roles.regular_order_sessions()),
                 )
             }
-            LiveMode::Validate => {
+            (LiveMode::Validate, _) => {
                 return Err(LiveRuntimeError::Bootstrap {
                     account_id: account.id.clone(),
                     message: "validate mode cannot construct network authority".to_string(),
@@ -1044,7 +1052,7 @@ async fn bootstrap_accounts(
                 .map_err(|error| LiveRuntimeError::ExchangeStatusCheck(error.to_string()))?;
             if let Some(reason) = exchange_status_block_reason(
                 &statuses,
-                config.venue.environment,
+                maintenance_relevance,
                 unix_time_ms(),
                 config.runtime.exchange_status_lead_ms,
             ) {
@@ -1450,25 +1458,30 @@ async fn verify_initial_exchange_fees(
 
 fn exchange_status_block_reason(
     statuses: &[OkxSystemStatus],
-    environment: TradingEnvironment,
+    relevance: &MaintenanceRelevancePlan,
     now_ms: u64,
     lead_ms: u64,
 ) -> Option<String> {
     let _maintenance_capability = okx_capability_registration("OKX-MAINTENANCE-FILTER")
         .expect("maintenance filter must remain in the OKX capability registry");
-    let expected_environment = match environment {
+    let expected_environment = match relevance.environment() {
         TradingEnvironment::Demo => OkxSystemEnvironment::Demo,
         TradingEnvironment::Production => OkxSystemEnvironment::Production,
     };
     statuses.iter().find_map(|status| {
-        let java_relevant_service = matches!(
-            status.service_type,
-            OkxSystemServiceType::Trading
-                | OkxSystemServiceType::TradingAccounts
-                | OkxSystemServiceType::TradingProducts
-                | OkxSystemServiceType::SpreadTrading
-                | OkxSystemServiceType::Other
-        );
+        let planned_service = match status.service_type {
+            OkxSystemServiceType::WebSocket => Some(MaintenanceServicePlan::Websocket),
+            OkxSystemServiceType::Trading => Some(MaintenanceServicePlan::Trading),
+            OkxSystemServiceType::TradingAccounts => Some(MaintenanceServicePlan::TradingAccounts),
+            OkxSystemServiceType::TradingProducts => Some(MaintenanceServicePlan::TradingProducts),
+            OkxSystemServiceType::Other => Some(MaintenanceServicePlan::OtherAmbiguous),
+            OkxSystemServiceType::BlockTrading
+            | OkxSystemServiceType::TradingBot
+            | OkxSystemServiceType::SpreadTrading
+            | OkxSystemServiceType::CopyTrading => None,
+        };
+        let plan_relevant_service =
+            planned_service.is_some_and(|service| relevance.services().contains(&service));
         let inside_guard_window = match status.state {
             OkxSystemStatusState::Scheduled => {
                 status.begin_time_ms <= now_ms.saturating_add(lead_ms)
@@ -1476,9 +1489,10 @@ fn exchange_status_block_reason(
             OkxSystemStatusState::Ongoing | OkxSystemStatusState::PreOpen => true,
             OkxSystemStatusState::Completed | OkxSystemStatusState::Canceled => false,
         };
-        (status.system.eq_ignore_ascii_case("unified")
+        (relevance.unified_system()
+            && status.system.eq_ignore_ascii_case("unified")
             && status.environment == expected_environment
-            && java_relevant_service
+            && plan_relevant_service
             && inside_guard_window)
             .then(|| {
                 format!(
@@ -1836,9 +1850,26 @@ impl LiveRuntime {
     async fn build(
         config: LiveConfig,
         attempt: LiveRunAttemptEvidence,
+        connectivity_plan: ChaosConnectivityPlan,
         mode: LiveMode,
         run_duration: Option<Duration>,
     ) -> Result<Self, LiveRuntimeError> {
+        validate_runtime_connectivity_plan(&config, &connectivity_plan, mode)?;
+        let maintenance_relevance = connectivity_plan.maintenance_relevance().clone();
+        let planned_public_subscriptions = runtime_public_subscriptions(&connectivity_plan)?;
+        let public_subscriptions = planned_public_subscriptions
+            .iter()
+            .map(|planned| planned.subscription.clone())
+            .collect::<Vec<_>>();
+        let public_plans = partition_subscriptions(
+            &public_subscriptions,
+            config.runtime.max_subscriptions_per_socket,
+        )
+        .map_err(|error| LiveRuntimeError::Subscription(error.to_string()))?;
+        validate_public_socket_plans(&planned_public_subscriptions, &public_plans)?;
+        let mut private_plans_by_account = private_socket_plans_by_account(&connectivity_plan)?;
+        let mut order_session_counts = planned_order_session_counts(&connectivity_plan)?;
+        let planned_order_accounts = order_session_counts.keys().cloned().collect::<HashSet<_>>();
         let LiveRunAttemptEvidence {
             session_started_at_ms,
             config_source,
@@ -1912,8 +1943,14 @@ impl LiveRuntime {
                 .or_default()
                 .push(update.clone());
         }
-        let (mut verified, seeds, snapshots) =
-            bootstrap_accounts(&config, &restored_by_account, mode).await?;
+        let (mut verified, seeds, snapshots) = bootstrap_accounts(
+            &config,
+            &restored_by_account,
+            mode,
+            &planned_order_accounts,
+            &maintenance_relevance,
+        )
+        .await?;
         let account_identity_sha256s = account_identity_sha256s(&config, &snapshots)?;
         let session_id = format!("{:x}", unix_time_ns());
         let mut startup_records = Vec::new();
@@ -1970,10 +2007,10 @@ impl LiveRuntime {
                 account_identity_sha256,
             }));
         }
-        let mut coordinator = LiveCoordinator::new(
+        let mut coordinator = LiveCoordinator::new_with_order_transports(
             config.clone(),
             verified,
-            mode == LiveMode::Demo,
+            planned_order_accounts,
             session_id.clone(),
         )?;
         // Apply recovered halt state before replaying anything that can produce an intent.
@@ -2059,18 +2096,6 @@ impl LiveRuntime {
             })?);
         }
         initial_outputs.extend(restore_safety_latches(&mut coordinator, &recovered)?);
-        let public_subscriptions = public_subscriptions(&config);
-        let public_plans = partition_subscriptions(
-            &public_subscriptions,
-            config.runtime.max_subscriptions_per_socket,
-        )
-        .map_err(|error| LiveRuntimeError::Subscription(error.to_string()))?;
-        let private_subscriptions = private_subscriptions(config.venue.enable_vip_fills_channel);
-        let private_plans = partition_subscriptions(
-            &private_subscriptions,
-            config.runtime.max_subscriptions_per_socket,
-        )
-        .map_err(|error| LiveRuntimeError::Subscription(error.to_string()))?;
         let storage = start_jsonl_storage_with_lease(
             StorageConfig {
                 path: config.storage.path.clone(),
@@ -2139,11 +2164,37 @@ impl LiveRuntime {
                 regular_order_sessions,
                 instrument_guard,
             } = seed;
+            let private_plans = private_plans_by_account
+                .remove(&account_id)
+                .ok_or_else(|| {
+                    LiveRuntimeError::Subscription(format!(
+                        "connectivity plan has no private state session for account {account_id}"
+                    ))
+                })?;
+            let planned_session_count = order_session_counts.remove(&account_id);
+            let mutation_role_count = usize::from(gateway.is_some())
+                + usize::from(safety.is_some())
+                + usize::from(regular_order_sessions.is_some());
+            let expected_mutation_role_count = if planned_session_count.is_some() {
+                3
+            } else {
+                0
+            };
+            if mutation_role_count != expected_mutation_role_count {
+                return Err(LiveRuntimeError::GatewaySetup {
+                    account_id,
+                    message: format!(
+                        "planned order-lane authority requires exactly {expected_mutation_role_count} mutation roles, bootstrap produced {mutation_role_count}"
+                    ),
+                });
+            }
             // Phase 4 wires the already-narrow observer into its recurring scan.
             let _forbidden_order_observer = forbidden_observer;
-            let deadman_timeout_secs = safety
-                .as_ref()
-                .map(|_| config.runtime.cancel_all_after_timeout_secs);
+            let deadman_timeout_secs = planned_session_count.and(
+                safety
+                    .as_ref()
+                    .map(|_| config.runtime.cancel_all_after_timeout_secs),
+            );
             if let (Some(timeout_secs), Some(safety)) = (deadman_timeout_secs, safety.as_ref()) {
                 safety
                     .cancel_all_after(timeout_secs)
@@ -2173,7 +2224,7 @@ impl LiveRuntime {
                 config.runtime.max_exchange_clock_skew_ms,
                 ExchangeStatusGuard {
                     enabled: seed_index == 0,
-                    environment: config.venue.environment,
+                    relevance: maintenance_relevance.clone(),
                     check_interval_ms: config.runtime.exchange_status_check_interval_ms,
                     lead_ms: config.runtime.exchange_status_lead_ms,
                 },
@@ -2203,55 +2254,63 @@ impl LiveRuntime {
             spawn_feed_forwarders(source_id, &mut private_feed, &feed_tx, &mut feed_tasks);
             feeds.push(private_feed);
 
-            if let (Some(mut gateway), Some(order_session_factory)) =
-                (gateway, regular_order_sessions)
-            {
-                let session_count = config.runtime.order_websocket_sessions;
-                let command_capacity = config
-                    .runtime
-                    .order_channel_capacity
-                    .div_ceil(session_count)
-                    .max(1);
-                let (transport, order_ws_runtime, mut order_ws_status) =
-                    spawn_okx_order_ws(OkxOrderWsConfig {
-                        account_id: account_id.clone(),
-                        websocket_url: config.venue.order_ws_url().to_string(),
-                        session_factory: Arc::new(order_session_factory),
-                        session_count,
-                        command_capacity,
-                        request_expiry: Duration::from_millis(
-                            config.runtime.order_request_expiry_ms,
-                        ),
-                        acknowledgement_timeout: Duration::from_millis(
-                            config.runtime.order_websocket_ack_timeout_ms,
-                        ),
-                        connection_attempt_pacer: connection_attempt_pacer.clone(),
-                        reconnect: ReconnectPolicy::default(),
-                    });
-                gateway.set_order_transport(Box::new(transport));
-                let order_status_events = control_tx.clone();
-                order_ws_status_tasks.push(tokio::spawn(async move {
-                    while let Some(status) = order_ws_status.recv().await {
-                        if order_status_events
-                            .send(RuntimeEvent::OrderTransport(status))
-                            .await
-                            .is_err()
-                        {
-                            return;
+            match (planned_session_count, gateway, regular_order_sessions) {
+                (Some(session_count), Some(mut gateway), Some(order_session_factory)) => {
+                    let command_capacity = config
+                        .runtime
+                        .order_channel_capacity
+                        .div_ceil(session_count)
+                        .max(1);
+                    let (transport, order_ws_runtime, mut order_ws_status) =
+                        spawn_okx_order_ws(OkxOrderWsConfig {
+                            account_id: account_id.clone(),
+                            websocket_url: config.venue.order_ws_url().to_string(),
+                            session_factory: Arc::new(order_session_factory),
+                            session_count,
+                            command_capacity,
+                            request_expiry: Duration::from_millis(
+                                config.runtime.order_request_expiry_ms,
+                            ),
+                            acknowledgement_timeout: Duration::from_millis(
+                                config.runtime.order_websocket_ack_timeout_ms,
+                            ),
+                            connection_attempt_pacer: connection_attempt_pacer.clone(),
+                            reconnect: ReconnectPolicy::default(),
+                        });
+                    gateway.set_order_transport(Box::new(transport));
+                    let order_status_events = control_tx.clone();
+                    order_ws_status_tasks.push(tokio::spawn(async move {
+                        while let Some(status) = order_ws_status.recv().await {
+                            if order_status_events
+                                .send(RuntimeEvent::OrderTransport(status))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
                         }
-                    }
-                }));
-                order_ws_runtimes.push(order_ws_runtime);
-                let (order_tx, order_rx) = mpsc::channel(config.runtime.order_channel_capacity);
-                order_senders.insert(account_id.clone(), order_tx);
-                order_tasks.push(tokio::spawn(run_order_task(
-                    account_id.clone(),
-                    gateway,
-                    order_rx,
-                    control_tx.clone(),
-                    config.runtime.order_websocket_sessions,
-                    config.runtime.order_channel_capacity,
-                )));
+                    }));
+                    order_ws_runtimes.push(order_ws_runtime);
+                    let (order_tx, order_rx) = mpsc::channel(config.runtime.order_channel_capacity);
+                    order_senders.insert(account_id.clone(), order_tx);
+                    order_tasks.push(tokio::spawn(run_order_task(
+                        account_id.clone(),
+                        gateway,
+                        order_rx,
+                        control_tx.clone(),
+                        session_count,
+                        config.runtime.order_channel_capacity,
+                    )));
+                }
+                (Some(_), _, _) => {
+                    return Err(LiveRuntimeError::GatewaySetup {
+                        account_id,
+                        message:
+                            "planned regular order lane has no gateway or authenticated session factory"
+                                .to_string(),
+                    });
+                }
+                (None, _, _) => {}
             }
 
             let (reconcile_tx, reconcile_rx) = mpsc::channel(8);
@@ -2264,6 +2323,16 @@ impl LiveRuntime {
                 config.runtime.ambiguous_submit_grace_ms,
                 config.runtime.max_order_reconciliation_pages,
                 config.runtime.max_fill_reconciliation_pages,
+            )));
+        }
+        if let Some(account_id) = private_plans_by_account.keys().next() {
+            return Err(LiveRuntimeError::Subscription(format!(
+                "connectivity plan private state session has no runtime account seed: {account_id}"
+            )));
+        }
+        if let Some(account_id) = order_session_counts.keys().next() {
+            return Err(LiveRuntimeError::Subscription(format!(
+                "connectivity plan order command lane has no runtime account seed: {account_id}"
             )));
         }
 
@@ -4982,7 +5051,7 @@ async fn run_account_safety_task(
                     Ok(statuses) => {
                         if let Some(reason) = exchange_status_block_reason(
                             &statuses,
-                            exchange_status_guard.environment,
+                            &exchange_status_guard.relevance,
                             unix_time_ms(),
                             exchange_status_guard.lead_ms,
                         ) {
@@ -5055,13 +5124,21 @@ impl FeedSourceState {
     }
 
     fn private(adapter: Arc<dyn VenueAdapter>, account_id: String, plans: &[SocketPlan]) -> Self {
+        let required_private_data_channels = plans
+            .iter()
+            .flat_map(|plan| &plan.subscriptions)
+            .filter(|subscription| {
+                matches!(subscription.channel, Channel::Account | Channel::Positions)
+            })
+            .map(|subscription| subscription.channel.clone())
+            .collect();
         Self {
             adapter,
             account_id: Some(account_id),
             expected_connections: plans.iter().map(|plan| plan.conn_id.clone()).collect(),
             ready_connections: HashSet::new(),
             public_subscriptions: Vec::new(),
-            required_private_data_channels: HashSet::from([Channel::Account, Channel::Positions]),
+            required_private_data_channels,
             private_data_round: HashSet::new(),
             private_ready: false,
         }
@@ -5220,76 +5297,387 @@ fn spawn_feed_forwarders(
     }));
 }
 
-fn public_subscriptions(config: &LiveConfig) -> Vec<Subscription> {
-    let mut subscriptions = Vec::new();
+#[derive(Debug, Clone)]
+struct PlannedPublicSubscription {
+    subscription: Subscription,
+    redundancy_consumer: Option<PublicRedundancyConsumer>,
+    requirements: Vec<RequirementUse>,
+}
+
+fn validate_runtime_connectivity_plan(
+    config: &LiveConfig,
+    plan: &ChaosConnectivityPlan,
+    mode: LiveMode,
+) -> Result<(), LiveRuntimeError> {
+    if plan.mode() != mode {
+        return Err(LiveRuntimeError::Subscription(format!(
+            "connectivity plan mode {:?} does not match runtime mode {mode:?}",
+            plan.mode()
+        )));
+    }
+    if plan.environment() != config.venue.environment {
+        return Err(LiveRuntimeError::Subscription(format!(
+            "connectivity plan environment {:?} does not match config environment {:?}",
+            plan.environment(),
+            config.venue.environment
+        )));
+    }
+    let config_accounts = config
+        .accounts
+        .iter()
+        .map(|account| account.id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if plan.account_ids() != config_accounts {
+        return Err(LiveRuntimeError::Subscription(
+            "connectivity plan account boundary does not match the live config".to_string(),
+        ));
+    }
+    let config_symbols = config
+        .strategy
+        .instruments
+        .iter()
+        .map(|instrument| instrument.symbol.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if plan.symbols() != config_symbols {
+        return Err(LiveRuntimeError::Subscription(
+            "connectivity plan symbol boundary does not match the live config".to_string(),
+        ));
+    }
+    let maximum_public_replicas = plan
+        .public_subscriptions()
+        .iter()
+        .map(|subscription| usize::from(subscription.replica_count()))
+        .max()
+        .unwrap_or_default();
+    if maximum_public_replicas > config.runtime.public_connection_replica_cap() {
+        return Err(LiveRuntimeError::Subscription(format!(
+            "connectivity plan requires {maximum_public_replicas} public replicas, exceeding the configured safety ceiling {}",
+            config.runtime.public_connection_replica_cap()
+        )));
+    }
+    let mut command_shards_by_account = HashMap::<&str, usize>::new();
+    for lane in plan.command_lanes() {
+        *command_shards_by_account
+            .entry(lane.account_id())
+            .or_default() += 1;
+    }
+    let maximum_order_shards = command_shards_by_account
+        .into_values()
+        .max()
+        .unwrap_or_default();
+    if maximum_order_shards > config.runtime.order_command_shard_cap() {
+        return Err(LiveRuntimeError::Subscription(format!(
+            "connectivity plan requires {maximum_order_shards} order shards, exceeding the configured safety ceiling {}",
+            config.runtime.order_command_shard_cap()
+        )));
+    }
+    Ok(())
+}
+
+fn runtime_public_subscriptions(
+    plan: &ChaosConnectivityPlan,
+) -> Result<Vec<PlannedPublicSubscription>, LiveRuntimeError> {
+    let mut subscriptions = Vec::with_capacity(plan.public_subscriptions().len());
     let mut seen = HashSet::new();
-    for guard in &config.risk.stablecoin_guards {
-        push_public_subscription(
-            &mut subscriptions,
-            &mut seen,
-            Channel::Custom(okx_reference_channel(ReferenceDataKind::IndexPrice).to_string()),
-            &guard.symbol,
-            FeedPriority::Critical,
-            config.runtime.public_connections_per_subscription,
-        );
+    for planned in plan.public_subscriptions() {
+        if planned.replica_count() == 0 {
+            return Err(LiveRuntimeError::Subscription(format!(
+                "planned public subscription {:?}/{} has zero replicas",
+                planned.channel(),
+                planned.symbol()
+            )));
+        }
+        if planned.requirements().is_empty() {
+            return Err(LiveRuntimeError::Subscription(format!(
+                "planned public subscription {:?}/{} has no Chaos requirement",
+                planned.channel(),
+                planned.symbol()
+            )));
+        }
+        if planned.session_surfaces().is_empty()
+            || planned.channel_surface().capability_id() != planned.channel().capability_id()
+        {
+            return Err(LiveRuntimeError::Subscription(format!(
+                "planned public subscription {:?}/{} has invalid capability metadata",
+                planned.channel(),
+                planned.symbol()
+            )));
+        }
+        if (planned.replica_count() > 1) != planned.redundancy_consumer().is_some() {
+            return Err(LiveRuntimeError::Subscription(format!(
+                "planned public subscription {:?}/{} has replicas without exact redundancy-consumer metadata",
+                planned.channel(),
+                planned.symbol()
+            )));
+        }
+        let channel = match planned.channel() {
+            PublicChannelPlan::Books => Channel::Books,
+            PublicChannelPlan::Trades => Channel::Trades,
+            PublicChannelPlan::FundingRate
+            | PublicChannelPlan::IndexTickers
+            | PublicChannelPlan::MarkPrice
+            | PublicChannelPlan::PriceLimit => {
+                Channel::Custom(planned.channel_surface().endpoint_or_channel().to_string())
+            }
+        };
+        if !seen.insert((channel.clone(), planned.symbol().to_string())) {
+            return Err(LiveRuntimeError::Subscription(format!(
+                "connectivity plan repeats public subscription {:?}/{}",
+                planned.channel(),
+                planned.symbol()
+            )));
+        }
+        let priority = if planned.channel() == PublicChannelPlan::Trades {
+            FeedPriority::High
+        } else {
+            FeedPriority::Critical
+        };
+        let mut subscription =
+            Subscription::public(Venue::Okx, channel, planned.symbol(), priority);
+        subscription.connections = usize::from(planned.replica_count());
+        subscriptions.push(PlannedPublicSubscription {
+            subscription,
+            redundancy_consumer: planned.redundancy_consumer(),
+            requirements: planned.requirements().to_vec(),
+        });
     }
-    for instrument in &config.strategy.instruments {
-        push_public_subscription(
-            &mut subscriptions,
-            &mut seen,
-            Channel::Books,
-            &instrument.symbol,
-            FeedPriority::Critical,
-            config.runtime.public_connections_per_subscription,
-        );
-        push_public_subscription(
-            &mut subscriptions,
-            &mut seen,
-            Channel::Trades,
-            &instrument.symbol,
-            FeedPriority::High,
-            config.runtime.public_connections_per_subscription,
-        );
+    if subscriptions.is_empty() {
+        return Err(LiveRuntimeError::Subscription(
+            "connectivity plan has no public subscriptions".to_string(),
+        ));
     }
-    for requirement in config.strategy.reference_data_requirements() {
-        push_public_subscription(
-            &mut subscriptions,
-            &mut seen,
-            Channel::Custom(okx_reference_channel(requirement.kind).to_string()),
-            &requirement.symbol,
-            FeedPriority::Critical,
-            config.runtime.public_connections_per_subscription,
-        );
-    }
-    subscriptions
+    Ok(subscriptions)
 }
 
-fn okx_reference_channel(kind: ReferenceDataKind) -> &'static str {
-    let capability_id = match kind {
-        ReferenceDataKind::IndexPrice => "OKX-WS-INDEX-TICKERS",
-        ReferenceDataKind::FundingRate => "OKX-WS-FUNDING-RATE",
-        ReferenceDataKind::MarkPrice => "OKX-WS-MARK-PRICE",
-        ReferenceDataKind::PriceLimits => "OKX-WS-PRICE-LIMIT",
-    };
-    okx_capability_registration(capability_id)
-        .expect("strategy reference channel must remain in the OKX capability registry")
-        .endpoint_or_channel
+fn validate_public_socket_plans(
+    subscriptions: &[PlannedPublicSubscription],
+    socket_plans: &[SocketPlan],
+) -> Result<(), LiveRuntimeError> {
+    let mut occurrences = HashMap::<(Channel, Option<String>), usize>::new();
+    for socket in socket_plans {
+        if socket.private || socket.venue != Venue::Okx {
+            return Err(LiveRuntimeError::Subscription(
+                "public connectivity plan produced a private or non-OKX socket".to_string(),
+            ));
+        }
+        for subscription in &socket.subscriptions {
+            *occurrences
+                .entry((subscription.channel.clone(), subscription.symbol.clone()))
+                .or_default() += 1;
+        }
+    }
+    if occurrences.len() != subscriptions.len() {
+        return Err(LiveRuntimeError::Subscription(
+            "public socket plan contains an unplanned subscription".to_string(),
+        ));
+    }
+    for planned in subscriptions {
+        let key = (
+            planned.subscription.channel.clone(),
+            planned.subscription.symbol.clone(),
+        );
+        let actual = occurrences.get(&key).copied().unwrap_or_default();
+        if actual != planned.subscription.connections {
+            return Err(LiveRuntimeError::Subscription(format!(
+                "public socket plan materialized {actual} replicas for {:?}/{}, expected {}",
+                planned.subscription.channel,
+                planned.subscription.symbol.as_deref().unwrap_or("<all>"),
+                planned.subscription.connections
+            )));
+        }
+        let consumers = planned
+            .requirements
+            .iter()
+            .map(RequirementUse::consumer)
+            .collect::<BTreeSet<_>>();
+        if consumers.is_empty() || (actual > 1) != planned.redundancy_consumer.is_some() {
+            return Err(LiveRuntimeError::Subscription(format!(
+                "public socket plan lost consumer metadata for {:?}/{}",
+                planned.subscription.channel,
+                planned.subscription.symbol.as_deref().unwrap_or("<all>")
+            )));
+        }
+    }
+    Ok(())
 }
 
-fn push_public_subscription(
-    subscriptions: &mut Vec<Subscription>,
-    seen: &mut HashSet<(Channel, String)>,
-    channel: Channel,
-    symbol: &str,
-    priority: FeedPriority,
-    connections: usize,
-) {
-    if !seen.insert((channel.clone(), symbol.to_string())) {
-        return;
+fn private_socket_plans_by_account(
+    plan: &ChaosConnectivityPlan,
+) -> Result<BTreeMap<String, Vec<SocketPlan>>, LiveRuntimeError> {
+    let mut plans_by_account = BTreeMap::new();
+    for session in plan.private_state_sessions() {
+        if session.socket_count() == 0
+            || session.channels().is_empty()
+            || session.requirements().is_empty()
+            || session.session_surfaces().is_empty()
+        {
+            return Err(LiveRuntimeError::Subscription(format!(
+                "private state session for {} is empty or has incomplete metadata",
+                session.account_id()
+            )));
+        }
+        if !plan
+            .account_ids()
+            .iter()
+            .any(|account_id| account_id == session.account_id())
+        {
+            return Err(LiveRuntimeError::Subscription(format!(
+                "private state session references unknown account {}",
+                session.account_id()
+            )));
+        }
+        let mut channels = Vec::with_capacity(session.channels().len());
+        let mut seen_channels = HashSet::new();
+        let mut binding_requirements = BTreeSet::new();
+        for binding in session.channels() {
+            if binding.requirements().is_empty()
+                || binding.surface().capability_id() != binding.channel().capability_id()
+            {
+                return Err(LiveRuntimeError::Subscription(format!(
+                    "private state channel {:?} for {} has incomplete requirement metadata",
+                    binding.channel(),
+                    session.account_id()
+                )));
+            }
+            let channel = match binding.channel() {
+                PrivateChannelPlan::Account => Channel::Account,
+                PrivateChannelPlan::Fills => Channel::Fills,
+                PrivateChannelPlan::Orders => Channel::Orders,
+                PrivateChannelPlan::Positions => Channel::Positions,
+            };
+            if !seen_channels.insert(channel.clone()) {
+                return Err(LiveRuntimeError::Subscription(format!(
+                    "private state session for {} repeats channel {:?}",
+                    session.account_id(),
+                    channel
+                )));
+            }
+            binding_requirements.extend(binding.requirements().iter().cloned());
+            channels.push(Subscription::private(
+                Venue::Okx,
+                channel,
+                FeedPriority::Critical,
+            ));
+        }
+        let session_requirements = session
+            .requirements()
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if binding_requirements != session_requirements {
+            return Err(LiveRuntimeError::Subscription(format!(
+                "private state session for {} does not preserve its channel consumers",
+                session.account_id()
+            )));
+        }
+        let account_plans = (0..session.socket_count())
+            .map(|replica| SocketPlan {
+                conn_id: ConnId::new(format!("okx-private-{}-r{replica}", session.account_id())),
+                venue: Venue::Okx,
+                private: true,
+                subscriptions: channels.clone(),
+            })
+            .collect::<Vec<_>>();
+        if plans_by_account
+            .insert(session.account_id().to_string(), account_plans)
+            .is_some()
+        {
+            return Err(LiveRuntimeError::Subscription(format!(
+                "connectivity plan repeats private state session for {}",
+                session.account_id()
+            )));
+        }
     }
-    let mut subscription = Subscription::public(Venue::Okx, channel, symbol, priority);
-    subscription.connections = connections;
-    subscriptions.push(subscription);
+    let planned_accounts = plans_by_account.keys().cloned().collect::<Vec<_>>();
+    if planned_accounts != plan.account_ids() {
+        return Err(LiveRuntimeError::Subscription(
+            "connectivity plan must define exactly one private state session per account"
+                .to_string(),
+        ));
+    }
+    Ok(plans_by_account)
+}
+
+fn planned_order_session_counts(
+    plan: &ChaosConnectivityPlan,
+) -> Result<BTreeMap<String, usize>, LiveRuntimeError> {
+    if plan.mode() != LiveMode::Demo && !plan.command_lanes().is_empty() {
+        return Err(LiveRuntimeError::Subscription(
+            "order command lanes are only valid in demo mode".to_string(),
+        ));
+    }
+    let planned_accounts = plan
+        .account_ids()
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut lanes_by_account = BTreeMap::<String, Vec<_>>::new();
+    for lane in plan.command_lanes() {
+        if !planned_accounts.contains(lane.account_id()) {
+            return Err(LiveRuntimeError::Subscription(format!(
+                "order command lane references unknown account {}",
+                lane.account_id()
+            )));
+        }
+        if lane.dispatch_families().is_empty()
+            || lane.requirements().is_empty()
+            || lane.session_surfaces().is_empty()
+        {
+            return Err(LiveRuntimeError::Subscription(format!(
+                "order command lane {} for {} is empty or has incomplete consumer metadata",
+                lane.lane_index(),
+                lane.account_id()
+            )));
+        }
+        lanes_by_account
+            .entry(lane.account_id().to_string())
+            .or_default()
+            .push(lane);
+    }
+    let mut counts = BTreeMap::new();
+    for (account_id, mut lanes) in lanes_by_account {
+        lanes.sort_by_key(|lane| lane.lane_index());
+        let lane_count = lanes.len();
+        let mut families = BTreeSet::new();
+        for (expected_index, lane) in lanes.into_iter().enumerate() {
+            if usize::from(lane.lane_index()) != expected_index {
+                return Err(LiveRuntimeError::Subscription(format!(
+                    "account {account_id} order lane indices must be contiguous from zero"
+                )));
+            }
+            for family in lane.dispatch_families() {
+                if family.trim().is_empty()
+                    || okx_order_dispatch_key(family) != *family
+                    || !families.insert(family.clone())
+                {
+                    return Err(LiveRuntimeError::Subscription(format!(
+                        "account {account_id} has an invalid or duplicate order dispatch family {family:?}"
+                    )));
+                }
+                if order_dispatch_lane(family, lane_count) != expected_index {
+                    return Err(LiveRuntimeError::Subscription(format!(
+                        "account {account_id} dispatch family {family} does not route to planned lane {expected_index}"
+                    )));
+                }
+            }
+        }
+        counts.insert(account_id, lane_count);
+    }
+    Ok(counts)
+}
+
+fn order_dispatch_lane(dispatch_family: &str, lane_count: usize) -> usize {
+    debug_assert!(lane_count > 0);
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in dispatch_family.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (hash as usize) % lane_count
 }
 
 fn current_executable_sha256() -> Result<String, LiveRuntimeError> {
@@ -5324,17 +5712,6 @@ fn account_identity_sha256s(
                 ),
             ))
         })
-        .collect()
-}
-
-fn private_subscriptions(enable_vip_fills_channel: bool) -> Vec<Subscription> {
-    let mut channels = vec![Channel::Orders, Channel::Account, Channel::Positions];
-    if enable_vip_fills_channel {
-        channels.push(Channel::Fills);
-    }
-    channels
-        .into_iter()
-        .map(|channel| Subscription::private(Venue::Okx, channel, FeedPriority::Critical))
         .collect()
 }
 
@@ -5419,7 +5796,7 @@ mod tests {
         InstrumentOrderLimits, InstrumentRiskModel, RiskLimits, StablecoinGuardConfig,
     };
     use reap_storage::{acquire_storage_lease, start_jsonl_storage};
-    use reap_strategy::{ChaosConfig, InstrumentKindConfig};
+    use reap_strategy::{ChaosConfig, InstrumentKindConfig, ReferenceDataKind};
     use reap_venue::okx::{
         OkxAccountConfig, OkxAccountLevel, OkxApiKeyPermission, OkxCancelOrder, OkxFillPage,
         OkxInstrumentChange, OkxInstrumentChangeParameter, OkxInstrumentType, OkxOrderAck,
@@ -6206,7 +6583,10 @@ mod tests {
     fn exchange_status_guard(enabled: bool, check_interval_ms: u64) -> ExchangeStatusGuard {
         ExchangeStatusGuard {
             enabled,
-            environment: TradingEnvironment::Demo,
+            relevance: ChaosConnectivityPlan::resolve(&config(), LiveMode::Demo)
+                .unwrap()
+                .maintenance_relevance()
+                .clone(),
             check_interval_ms,
             lead_ms: 60_000,
         }
@@ -8099,7 +8479,11 @@ mod tests {
     }
 
     #[test]
-    fn exchange_status_guard_matches_java_service_scope_and_environment() {
+    fn exchange_status_guard_matches_planned_service_scope_and_environment() {
+        let relevance = ChaosConnectivityPlan::resolve(&config(), LiveMode::Demo)
+            .unwrap()
+            .maintenance_relevance()
+            .clone();
         let status = |service_type, environment, state, begin_time_ms| OkxSystemStatus {
             title: "maintenance".to_string(),
             description: String::new(),
@@ -8121,10 +8505,7 @@ mod tests {
             OkxSystemStatusState::Scheduled,
             now_ms + lead_ms,
         );
-        assert!(
-            exchange_status_block_reason(&[trading], TradingEnvironment::Demo, now_ms, lead_ms)
-                .is_some()
-        );
+        assert!(exchange_status_block_reason(&[trading], &relevance, now_ms, lead_ms).is_some());
 
         let too_early = status(
             OkxSystemServiceType::TradingAccounts,
@@ -8132,10 +8513,7 @@ mod tests {
             OkxSystemStatusState::Scheduled,
             now_ms + lead_ms + 1,
         );
-        assert!(
-            exchange_status_block_reason(&[too_early], TradingEnvironment::Demo, now_ms, lead_ms)
-                .is_none()
-        );
+        assert!(exchange_status_block_reason(&[too_early], &relevance, now_ms, lead_ms).is_none());
 
         let copy_trading = status(
             OkxSystemServiceType::CopyTrading,
@@ -8158,11 +8536,57 @@ mod tests {
         assert!(
             exchange_status_block_reason(
                 &[copy_trading, production, completed],
-                TradingEnvironment::Demo,
+                &relevance,
                 now_ms,
                 lead_ms
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn spread_only_ongoing_maintenance_is_irrelevant_to_the_planned_scope() {
+        let relevance = ChaosConnectivityPlan::resolve(&config(), LiveMode::Demo)
+            .unwrap()
+            .maintenance_relevance()
+            .clone();
+        let spread = OkxSystemStatus {
+            title: "spread maintenance".to_string(),
+            description: String::new(),
+            state: OkxSystemStatusState::Ongoing,
+            begin_time_ms: 1,
+            end_time_ms: 60_001,
+            pre_open_begin_time_ms: None,
+            service_type: OkxSystemServiceType::SpreadTrading,
+            maintenance_type: reap_venue::okx::OkxSystemMaintenanceType::Scheduled,
+            environment: OkxSystemEnvironment::Demo,
+            system: "unified".to_string(),
+        };
+
+        assert!(exchange_status_block_reason(&[spread], &relevance, 1_000_000, 60_000).is_none());
+    }
+
+    #[test]
+    fn ambiguous_ongoing_maintenance_blocks_the_planned_scope() {
+        let relevance = ChaosConnectivityPlan::resolve(&config(), LiveMode::Demo)
+            .unwrap()
+            .maintenance_relevance()
+            .clone();
+        let ambiguous = OkxSystemStatus {
+            title: "ambiguous maintenance".to_string(),
+            description: String::new(),
+            state: OkxSystemStatusState::Ongoing,
+            begin_time_ms: 1,
+            end_time_ms: 60_001,
+            pre_open_begin_time_ms: None,
+            service_type: OkxSystemServiceType::Other,
+            maintenance_type: reap_venue::okx::OkxSystemMaintenanceType::Scheduled,
+            environment: OkxSystemEnvironment::Demo,
+            system: "unified".to_string(),
+        };
+
+        assert!(
+            exchange_status_block_reason(&[ambiguous], &relevance, 1_000_000, 60_000).is_some()
         );
     }
 
@@ -8595,43 +9019,145 @@ mod tests {
     }
 
     #[test]
-    fn public_plan_replicates_every_required_subscription() {
+    fn public_plan_materializes_exact_replicas_and_explicit_trades() {
         let mut config = config();
-        let subscriptions = public_subscriptions(&config);
+        let connectivity_plan = ChaosConnectivityPlan::resolve(&config, LiveMode::Demo).unwrap();
+        let subscriptions = runtime_public_subscriptions(&connectivity_plan).unwrap();
 
-        assert!(subscriptions.iter().all(|subscription| {
-            subscription.connections == config.runtime.public_connections_per_subscription
+        assert!(subscriptions.iter().all(|planned| {
+            let expected = if planned.subscription.channel == Channel::Books {
+                2
+            } else {
+                1
+            };
+            planned.subscription.connections == expected
+                && (expected > 1) == planned.redundancy_consumer.is_some()
+                && !planned.requirements.is_empty()
+        }));
+        let configured_symbols = config
+            .strategy
+            .instruments
+            .iter()
+            .map(|instrument| instrument.symbol.as_str())
+            .collect::<BTreeSet<_>>();
+        let trade_symbols = subscriptions
+            .iter()
+            .filter(|planned| planned.subscription.channel == Channel::Trades)
+            .map(|planned| {
+                assert_eq!(planned.subscription.connections, 1);
+                planned.subscription.symbol.as_deref().unwrap()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(trade_symbols, configured_symbols);
+        assert!(subscriptions.iter().any(|subscription| {
+            subscription.subscription.channel == Channel::Custom("price-limit".to_string())
+                && subscription.subscription.symbol.as_deref() == Some("BTC-USDT")
+                && subscription.subscription.priority == FeedPriority::Critical
         }));
         assert!(subscriptions.iter().any(|subscription| {
-            subscription.channel == Channel::Custom("price-limit".to_string())
-                && subscription.symbol.as_deref() == Some("BTC-USDT")
-                && subscription.priority == FeedPriority::Critical
-        }));
-        assert!(subscriptions.iter().any(|subscription| {
-            subscription.channel == Channel::Custom("mark-price".to_string())
-                && subscription.symbol.as_deref() == Some("BTC-PERP")
+            subscription.subscription.channel == Channel::Custom("mark-price".to_string())
+                && subscription.subscription.symbol.as_deref() == Some("BTC-PERP")
         }));
         assert!(!subscriptions.iter().any(|subscription| {
-            subscription.channel == Channel::Custom("funding-rate".to_string())
+            subscription.subscription.channel == Channel::Custom("funding-rate".to_string())
         }));
 
         config.strategy.instruments[1].kind = InstrumentKindConfig::LinearSwap;
-        assert!(public_subscriptions(&config).iter().any(|subscription| {
-            subscription.channel == Channel::Custom("funding-rate".to_string())
-                && subscription.symbol.as_deref() == Some("BTC-PERP")
-                && subscription.priority == FeedPriority::Critical
-        }));
-        assert_eq!(
-            private_subscriptions(false)
-                .into_iter()
-                .map(|subscription| subscription.channel)
-                .collect::<HashSet<_>>(),
-            HashSet::from([Channel::Orders, Channel::Account, Channel::Positions])
+        let connectivity_plan = ChaosConnectivityPlan::resolve(&config, LiveMode::Demo).unwrap();
+        assert!(
+            runtime_public_subscriptions(&connectivity_plan)
+                .unwrap()
+                .iter()
+                .any(|subscription| {
+                    subscription.subscription.channel == Channel::Custom("funding-rate".to_string())
+                        && subscription.subscription.symbol.as_deref() == Some("BTC-PERP")
+                        && subscription.subscription.priority == FeedPriority::Critical
+                        && subscription.subscription.connections == 1
+                })
         );
+    }
+
+    #[test]
+    fn public_plan_packs_stablecoin_requirement_without_extra_replica() {
+        let mut config = config();
+        config.risk.stablecoin_guards = vec![StablecoinGuardConfig {
+            symbol: "USDT-USD".to_string(),
+            max_downside_deviation: 0.01,
+        }];
+        config.strategy.instruments[0].index_symbol = Some("USDT-USD".to_string());
+
+        let connectivity_plan = ChaosConnectivityPlan::resolve(&config, LiveMode::Demo).unwrap();
+        let subscriptions = runtime_public_subscriptions(&connectivity_plan).unwrap();
+        let stablecoin = subscriptions
+            .iter()
+            .filter(|subscription| {
+                subscription.subscription.channel == Channel::Custom("index-tickers".to_string())
+                    && subscription.subscription.symbol.as_deref() == Some("USDT-USD")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(stablecoin.len(), 1);
+        assert_eq!(stablecoin[0].subscription.priority, FeedPriority::Critical);
+        assert_eq!(stablecoin[0].subscription.connections, 1);
+        assert!(stablecoin[0].requirements.len() >= 2);
+    }
+
+    #[test]
+    fn private_sessions_are_packed_per_account_and_unused_account_waits_only_for_positions() {
+        let mut config = config();
+        let mut unused = config.accounts[0].clone();
+        unused.id = "unused".to_string();
+        unused.api_key_env = "UNUSED_KEY".to_string();
+        unused.secret_key_env = "UNUSED_SECRET".to_string();
+        unused.passphrase_env = "UNUSED_PASS".to_string();
+        unused.id_prefix = "unused".to_string();
+        unused.node_id = 2;
+        unused.trade_modes.clear();
+        config.accounts.push(unused);
+        config.venue.enable_vip_fills_channel = true;
+        let connectivity_plan = ChaosConnectivityPlan::resolve(&config, LiveMode::Demo).unwrap();
+
+        let mut plans = private_socket_plans_by_account(&connectivity_plan).unwrap();
+        assert_eq!(plans["main"].len(), 1);
+        assert!(
+            plans["main"][0]
+                .subscriptions
+                .iter()
+                .any(|subscription| subscription.channel == Channel::Orders)
+        );
+        let unused = plans.remove("unused").unwrap();
+        assert_eq!(unused.len(), 1);
+        assert_eq!(unused[0].subscriptions.len(), 1);
+        assert_eq!(unused[0].subscriptions[0].channel, Channel::Positions);
+
+        let conn_id = unused[0].conn_id.0.clone();
+        let adapter: Arc<dyn VenueAdapter> = Arc::new(OkxAdapter::default());
+        let mut source = FeedSourceState::private(adapter, "unused".to_string(), &unused);
+        assert!(
+            source
+                .on_status(status(&conn_id, ConnectionStatusKind::Ready))
+                .is_empty()
+        );
+        let ready = source.on_private_data(Channel::Positions, 7);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].kind, SystemEventKind::PrivateStreamRecovered);
+    }
+
+    #[test]
+    fn packed_private_session_is_permutation_safe_and_disconnect_resets_its_data_round() {
+        let mut config = config();
+        config.venue.enable_vip_fills_channel = true;
+        let connectivity_plan = ChaosConnectivityPlan::resolve(&config, LiveMode::Demo).unwrap();
+        let packed = private_socket_plans_by_account(&connectivity_plan)
+            .unwrap()
+            .remove("main")
+            .unwrap();
+        assert_eq!(packed.len(), 1);
         assert_eq!(
-            private_subscriptions(true)
-                .into_iter()
-                .map(|subscription| subscription.channel)
+            packed[0]
+                .subscriptions
+                .iter()
+                .map(|subscription| subscription.channel.clone())
                 .collect::<HashSet<_>>(),
             HashSet::from([
                 Channel::Orders,
@@ -8640,31 +9166,131 @@ mod tests {
                 Channel::Positions,
             ])
         );
+        let conn_id = packed[0].conn_id.0.clone();
+        let channels = [
+            Channel::Orders,
+            Channel::Fills,
+            Channel::Account,
+            Channel::Positions,
+        ];
+        let mut permutations = 0;
+        for first in 0..channels.len() {
+            for second in 0..channels.len() {
+                if second == first {
+                    continue;
+                }
+                for third in 0..channels.len() {
+                    if third == first || third == second {
+                        continue;
+                    }
+                    for fourth in 0..channels.len() {
+                        if fourth == first || fourth == second || fourth == third {
+                            continue;
+                        }
+                        permutations += 1;
+                        let adapter: Arc<dyn VenueAdapter> = Arc::new(OkxAdapter::default());
+                        let mut source =
+                            FeedSourceState::private(adapter, "main".to_string(), &packed);
+                        assert!(
+                            source
+                                .on_status(status(&conn_id, ConnectionStatusKind::Ready,))
+                                .is_empty()
+                        );
+                        let mut saw_account = false;
+                        let mut saw_positions = false;
+                        let mut recovered = false;
+                        for (offset, channel) in [first, second, third, fourth]
+                            .into_iter()
+                            .map(|index| channels[index].clone())
+                            .enumerate()
+                        {
+                            saw_account |= channel == Channel::Account;
+                            saw_positions |= channel == Channel::Positions;
+                            let events = source.on_private_data(channel, offset as u64 + 2);
+                            if saw_account && saw_positions && !recovered {
+                                assert_eq!(events.len(), 1);
+                                assert_eq!(events[0].kind, SystemEventKind::PrivateStreamRecovered);
+                                recovered = true;
+                            } else {
+                                assert!(events.is_empty());
+                            }
+                        }
+                        assert!(recovered);
+                    }
+                }
+            }
+        }
+        assert_eq!(permutations, 24);
+
+        let adapter: Arc<dyn VenueAdapter> = Arc::new(OkxAdapter::default());
+        let mut source = FeedSourceState::private(adapter, "main".to_string(), &packed);
+        assert!(
+            source
+                .on_status(status(&conn_id, ConnectionStatusKind::Ready))
+                .is_empty()
+        );
+        assert!(source.on_private_data(Channel::Account, 10).is_empty());
+        assert_eq!(
+            source.on_private_data(Channel::Positions, 11)[0].kind,
+            SystemEventKind::PrivateStreamRecovered
+        );
+        let stale = source.on_status(status(&conn_id, ConnectionStatusKind::Disconnected));
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].kind, SystemEventKind::PrivateStreamStale);
+        assert!(
+            source
+                .on_status(status(&conn_id, ConnectionStatusKind::Ready))
+                .is_empty()
+        );
+        assert!(source.on_private_data(Channel::Orders, 12).is_empty());
+        assert!(source.on_private_data(Channel::Fills, 13).is_empty());
+        assert!(source.on_private_data(Channel::Positions, 14).is_empty());
+        let recovered = source.on_private_data(Channel::Account, 15);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].kind, SystemEventKind::PrivateStreamRecovered);
     }
 
     #[test]
-    fn public_plan_replicates_stablecoin_guards_as_critical_feeds() {
+    fn command_sessions_exist_only_for_nonempty_planned_lanes() {
         let mut config = config();
-        config.risk.stablecoin_guards = vec![StablecoinGuardConfig {
-            symbol: "USDT-USD".to_string(),
-            max_downside_deviation: 0.01,
-        }];
-        config.strategy.instruments[0].index_symbol = Some("USDT-USD".to_string());
+        let mut unused = config.accounts[0].clone();
+        unused.id = "unused".to_string();
+        unused.api_key_env = "UNUSED_KEY".to_string();
+        unused.secret_key_env = "UNUSED_SECRET".to_string();
+        unused.passphrase_env = "UNUSED_PASS".to_string();
+        unused.id_prefix = "unused".to_string();
+        unused.node_id = 2;
+        unused.trade_modes.clear();
+        config.accounts.push(unused);
 
-        let subscriptions = public_subscriptions(&config);
-        let stablecoin = subscriptions
-            .iter()
-            .filter(|subscription| {
-                subscription.channel == Channel::Custom("index-tickers".to_string())
-                    && subscription.symbol.as_deref() == Some("USDT-USD")
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(stablecoin.len(), 1);
-        assert_eq!(stablecoin[0].priority, FeedPriority::Critical);
+        let demo_plan = ChaosConnectivityPlan::resolve(&config, LiveMode::Demo).unwrap();
+        let counts = planned_order_session_counts(&demo_plan).unwrap();
+        assert_eq!(counts, BTreeMap::from([("main".to_string(), 1)]));
+        let mut startup =
+            StartupGate::new_with_order_transports(&config, counts.keys().cloned().collect())
+                .unwrap();
         assert_eq!(
-            stablecoin[0].connections,
-            config.runtime.public_connections_per_subscription
+            startup.snapshot().missing_order_transports,
+            vec!["main".to_string()]
+        );
+        startup
+            .mark_order_transport("unused", false, "unplanned account has no lane")
+            .unwrap();
+        assert_eq!(
+            startup.snapshot().missing_order_transports,
+            vec!["main".to_string()]
+        );
+        assert!(
+            !startup
+                .snapshot()
+                .faults
+                .contains_key("order_transport:unused")
+        );
+        let observe_plan = ChaosConnectivityPlan::resolve(&config, LiveMode::Observe).unwrap();
+        assert!(
+            planned_order_session_counts(&observe_plan)
+                .unwrap()
+                .is_empty()
         );
     }
 

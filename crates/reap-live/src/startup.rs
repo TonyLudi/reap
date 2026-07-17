@@ -88,6 +88,27 @@ impl StartupGate {
 
     pub fn new_with_order_transport(config: &LiveConfig, required: bool) -> Self {
         let required_accounts = config.required_accounts();
+        let required_order_transports = if required {
+            required_accounts.clone()
+        } else {
+            HashSet::new()
+        };
+        Self::new_with_order_transports(config, required_order_transports)
+            .expect("config-derived order transport accounts must be valid")
+    }
+
+    pub fn new_with_order_transports(
+        config: &LiveConfig,
+        required_order_transports: HashSet<String>,
+    ) -> Result<Self, StartupError> {
+        let required_accounts = config.required_accounts();
+        if let Some(account_id) = required_order_transports
+            .difference(&required_accounts)
+            .min()
+            .cloned()
+        {
+            return Err(StartupError::UnknownAccount(account_id));
+        }
         let required_strategy_references = config
             .strategy
             .reference_data_requirements()
@@ -102,15 +123,11 @@ impl StartupGate {
                 )
             })
             .collect();
-        Self {
+        Ok(Self {
             phase: LivePhase::Configured,
             required_symbols: config.required_symbols(),
-            required_accounts: required_accounts.clone(),
-            required_order_transports: if required {
-                required_accounts
-            } else {
-                HashSet::new()
-            },
+            required_accounts,
+            required_order_transports,
             required_stablecoin_rates: config
                 .risk
                 .stablecoin_guards
@@ -130,7 +147,7 @@ impl StartupGate {
             ready_strategy_references: HashSet::new(),
             faults: BTreeMap::new(),
             was_ready: false,
-        }
+        })
     }
 
     pub fn phase(&self) -> LivePhase {
@@ -635,7 +652,9 @@ mod tests {
     #[test]
     fn tradable_gate_requires_every_account_order_transport() {
         let config = config();
-        let mut gate = StartupGate::new_with_order_transport(&config, true);
+        let mut gate =
+            StartupGate::new_with_order_transports(&config, HashSet::from(["main".to_string()]))
+                .unwrap();
         gate.mark_metadata_verified();
         gate.mark_storage(true, "open");
         gate.mark_public_connectivity(true, "connected");
@@ -659,6 +678,19 @@ mod tests {
         assert_eq!(gate.phase(), LivePhase::Degraded);
         assert!(!gate.can_submit_new(true));
         assert!(gate.can_cancel());
+    }
+
+    #[test]
+    fn order_transport_scope_accepts_only_configured_accounts() {
+        let config = config();
+        assert_eq!(
+            StartupGate::new_with_order_transports(
+                &config,
+                HashSet::from(["not-configured".to_string()]),
+            )
+            .unwrap_err(),
+            StartupError::UnknownAccount("not-configured".to_string())
+        );
     }
 
     #[test]

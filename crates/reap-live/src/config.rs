@@ -9,7 +9,7 @@ use reap_feed::{
 };
 use reap_order::PacingPolicy;
 use reap_risk::RiskLimits;
-use reap_strategy::{ChaosConfig, InstrumentConfig};
+use reap_strategy::{ChaosConfig, ChaosDecisionInput, InstrumentConfig};
 pub use reap_telemetry::HostGuardConfig;
 use reap_telemetry::WebhookAlertConfig;
 use reap_venue::okx::{
@@ -20,6 +20,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
+
+use crate::connectivity_plan::ChaosConnectivityPlan;
+use crate::runtime::LiveMode;
 
 pub const MAX_LIVE_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_REPORTED_UNKNOWN_FIELDS: usize = 64;
@@ -287,7 +290,11 @@ pub struct RuntimeConfig {
     pub dedup_capacity_per_stream: usize,
     pub max_sequence_buffer: usize,
     pub max_subscriptions_per_socket: usize,
+    /// Deprecated one-window maximum for a plan-derived public subscription's
+    /// replica count. This value cannot create replicas.
     pub public_connections_per_subscription: usize,
+    /// Deprecated one-window per-account maximum for plan-derived order
+    /// command shards. This value cannot create idle sessions.
     pub order_websocket_sessions: usize,
     pub connection_attempt_interval_ms: u64,
     pub connection_attempt_pacer_path: Option<PathBuf>,
@@ -374,6 +381,47 @@ impl RuntimeConfig {
             reconcile_requests: self.reconcile_requests_per_window,
             window: Duration::from_millis(self.request_window_ms),
         }
+    }
+
+    /// One-window legacy maximum for a plan-derived public replica count.
+    pub const fn public_connection_replica_cap(&self) -> usize {
+        self.public_connections_per_subscription
+    }
+
+    /// One-window legacy per-account maximum for plan-derived command shards.
+    pub const fn order_command_shard_cap(&self) -> usize {
+        self.order_websocket_sessions
+    }
+
+    /// Applies the legacy public cap without ever increasing the plan count.
+    pub const fn resolve_public_replica_count(&self, planned: usize) -> Option<usize> {
+        if planned <= self.public_connection_replica_cap() {
+            Some(planned)
+        } else {
+            None
+        }
+    }
+
+    /// Applies the legacy order cap without ever creating an idle shard.
+    pub const fn resolve_order_command_shard_count(&self, planned: usize) -> Option<usize> {
+        if planned <= self.order_command_shard_cap() {
+            Some(planned)
+        } else {
+            None
+        }
+    }
+
+    fn legacy_connectivity_diagnostics(&self) -> [String; 2] {
+        [
+            format!(
+                "runtime.public_connections_per_subscription={} is deprecated and, for one migration window, is interpreted only as a maximum cap on each plan-derived public replica_count; it cannot create replicas",
+                self.public_connection_replica_cap()
+            ),
+            format!(
+                "runtime.order_websocket_sessions={} is deprecated and, for one migration window, is interpreted only as a per-account upper bound on plan-derived command shards; it cannot create idle sessions",
+                self.order_command_shard_cap()
+            ),
+        ]
     }
 }
 
@@ -512,6 +560,8 @@ impl AlertConfig {
 pub struct LiveConfigValidation {
     pub valid: bool,
     pub errors: Vec<String>,
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -645,6 +695,82 @@ impl LiveConfig {
         }
     }
 
+    /// Deterministic one-window diagnostics for the two legacy connectivity
+    /// ceilings. Serde cannot distinguish an omitted field from its legacy
+    /// default, so defaults intentionally emit the same diagnostics.
+    pub fn connectivity_migration_diagnostics(&self) -> Vec<String> {
+        self.runtime.legacy_connectivity_diagnostics().into()
+    }
+
+    /// Validates legacy ceilings against an already-resolved plan. Successful
+    /// resolution always returns the plan's cardinality, never the cap.
+    pub fn connectivity_cap_errors_for_plan(
+        &self,
+        plan: &ChaosConnectivityPlan,
+        prefix: &str,
+    ) -> Vec<String> {
+        let required_public_replicas = plan
+            .public_subscriptions()
+            .iter()
+            .map(|subscription| usize::from(subscription.replica_count()))
+            .max()
+            .unwrap_or_default();
+        let mut command_shards_by_account = HashMap::<&str, usize>::new();
+        for lane in plan.command_lanes() {
+            *command_shards_by_account
+                .entry(lane.account_id())
+                .or_default() += 1;
+        }
+        let required_command_shards = command_shards_by_account
+            .into_values()
+            .max()
+            .unwrap_or_default();
+        let mut errors = Vec::new();
+        if self
+            .runtime
+            .resolve_public_replica_count(required_public_replicas)
+            .is_none()
+        {
+            errors.push(format!(
+                "{prefix}.runtime.public_connections_per_subscription conflicts with the resolved connectivity plan: legacy maximum cap {} is below mandatory replica_count {required_public_replicas}",
+                self.runtime.public_connection_replica_cap()
+            ));
+        }
+        if self
+            .runtime
+            .resolve_order_command_shard_count(required_command_shards)
+            .is_none()
+        {
+            errors.push(format!(
+                "{prefix}.runtime.order_websocket_sessions conflicts with the resolved connectivity plan: legacy per-account upper bound {} is below {required_command_shards} mandatory command shard(s)",
+                self.runtime.order_command_shard_cap()
+            ));
+        }
+        for subscription in plan.public_subscriptions().iter().filter(|subscription| {
+            subscription.replica_count() > 1 && subscription.redundancy_consumer().is_none()
+        }) {
+            errors.push(format!(
+                "{prefix}.resolved connectivity plan assigns {} replicas to {:?}/{} without a named redundancy consumer",
+                subscription.replica_count(),
+                subscription.channel(),
+                subscription.symbol()
+            ));
+        }
+        errors.sort();
+        errors.dedup();
+        errors
+    }
+
+    pub(crate) fn connectivity_plan_ignoring_legacy_caps(
+        &self,
+        mode: LiveMode,
+    ) -> Option<ChaosConnectivityPlan> {
+        let mut uncapped = self.clone();
+        uncapped.runtime.public_connections_per_subscription = usize::from(u16::MAX);
+        uncapped.runtime.order_websocket_sessions = MAX_ORDER_WEBSOCKET_SESSIONS;
+        ChaosConnectivityPlan::resolve(&uncapped, mode).ok()
+    }
+
     pub fn production_evidence_policy_errors(&self, prefix: &str) -> Vec<String> {
         let mut errors = self
             .host_guard
@@ -664,15 +790,13 @@ impl LiveConfig {
                 "{prefix}.operator must be enabled for production evidence"
             ));
         }
-        if self.runtime.public_connections_per_subscription < 2 {
-            errors.push(format!(
-                "{prefix}.runtime.public_connections_per_subscription must be at least 2 for production evidence"
-            ));
-        }
-        if self.runtime.order_websocket_sessions < 2 {
-            errors.push(format!(
-                "{prefix}.runtime.order_websocket_sessions must be at least 2 for production evidence"
-            ));
+        let mode = if self.venue.environment.is_demo() {
+            LiveMode::Demo
+        } else {
+            LiveMode::Observe
+        };
+        if let Some(plan) = self.connectivity_plan_ignoring_legacy_caps(mode) {
+            errors.extend(self.connectivity_cap_errors_for_plan(&plan, prefix));
         }
         match self.runtime.connection_attempt_pacer_path.as_deref() {
             Some(path) if path.is_absolute() => {}
@@ -730,6 +854,7 @@ impl LiveConfig {
         validate_production_stablecoin_guards(self, &mut errors);
         let endpoint_region = validate_okx_venue_endpoints(&self.venue, &mut errors);
         validate_positive_runtime(&self.runtime, &mut errors);
+        validate_legacy_connectivity_caps(self, &mut errors);
         validate_connection_attempt_interval(&self.runtime, endpoint_region, &mut errors);
         if self.runtime.fill_state_convergence_timeout_ms > self.risk.max_private_age_ms {
             errors.push(
@@ -898,9 +1023,13 @@ impl LiveConfig {
 
         errors.sort();
         errors.dedup();
+        let mut diagnostics = self.connectivity_migration_diagnostics();
+        diagnostics.sort();
+        diagnostics.dedup();
         LiveConfigValidation {
             valid: errors.is_empty(),
             errors,
+            diagnostics,
         }
     }
 
@@ -1152,6 +1281,72 @@ fn validate_instrument_account(
             account.id, instrument.symbol
         ));
     }
+}
+
+fn validate_legacy_connectivity_caps(config: &LiveConfig, errors: &mut Vec<String>) {
+    let required_public_replicas = mandatory_public_replica_count(config);
+    if config
+        .runtime
+        .resolve_public_replica_count(required_public_replicas)
+        .is_none()
+    {
+        errors.push(format!(
+            "runtime.public_connections_per_subscription conflicts with plan-derived connectivity: legacy maximum cap {} is below mandatory replica_count {required_public_replicas}",
+            config.runtime.public_connection_replica_cap()
+        ));
+    }
+
+    let required_command_shards = if config.venue.environment.is_demo() {
+        mandatory_demo_command_shards_per_account(config)
+    } else {
+        0
+    };
+    if config
+        .runtime
+        .resolve_order_command_shard_count(required_command_shards)
+        .is_none()
+    {
+        errors.push(format!(
+            "runtime.order_websocket_sessions conflicts with plan-derived connectivity: legacy per-account upper bound {} is below {required_command_shards} mandatory command shard(s)",
+            config.runtime.order_command_shard_cap()
+        ));
+    }
+}
+
+fn mandatory_public_replica_count(config: &LiveConfig) -> usize {
+    let mut required = usize::from(!config.risk.stablecoin_guards.is_empty());
+    for decision in config.strategy.decision_requirements().inputs() {
+        let replicas = match decision.input() {
+            ChaosDecisionInput::Book { .. } => 2,
+            ChaosDecisionInput::Trade { .. } | ChaosDecisionInput::Reference { .. } => 1,
+            ChaosDecisionInput::Timer => 0,
+        };
+        required = required.max(replicas);
+    }
+    required
+}
+
+fn mandatory_demo_command_shards_per_account(config: &LiveConfig) -> usize {
+    let active_accounts = config
+        .strategy
+        .instruments
+        .iter()
+        .filter(|instrument| {
+            !instrument.halted
+                && (instrument.quote_profit_margin < 1.0 || instrument.hedge_profit_margin < 1.0)
+        })
+        .filter_map(|instrument| {
+            config
+                .strategy
+                .risk_groups
+                .iter()
+                .find(|group| group.name == instrument.risk_group)
+        })
+        .filter(|group| group.kind != reap_strategy::RiskGroupKindConfig::RefOnly)
+        .filter_map(|group| group.account_id.as_deref())
+        .filter(|account_id| config.account(account_id).is_some())
+        .collect::<BTreeSet<_>>();
+    usize::from(!active_accounts.is_empty())
 }
 
 fn validate_positive_runtime(runtime: &RuntimeConfig, errors: &mut Vec<String>) {
@@ -2031,6 +2226,99 @@ mod tests {
     }
 
     #[test]
+    fn legacy_connectivity_values_are_caps_and_never_cardinality_requests() {
+        let mut config = valid_config();
+        config.runtime.public_connections_per_subscription = 9;
+        config.runtime.order_websocket_sessions = MAX_ORDER_WEBSOCKET_SESSIONS;
+
+        let demo = ChaosConnectivityPlan::resolve(&config, LiveMode::Demo).unwrap();
+        assert_eq!(
+            demo.public_subscriptions()
+                .iter()
+                .map(|subscription| subscription.replica_count())
+                .max(),
+            Some(2)
+        );
+        assert_eq!(demo.command_lanes().len(), 1);
+        assert!(
+            demo.command_lanes()
+                .iter()
+                .all(|lane| !lane.dispatch_families().is_empty())
+        );
+        assert_eq!(
+            config.runtime.resolve_public_replica_count(2),
+            Some(2),
+            "the cap must not manufacture nine replicas"
+        );
+        assert_eq!(
+            config.runtime.resolve_order_command_shard_count(1),
+            Some(1),
+            "the cap must not manufacture sixteen command shards"
+        );
+
+        let observe = ChaosConnectivityPlan::resolve(&config, LiveMode::Observe).unwrap();
+        assert!(observe.command_lanes().is_empty());
+        assert_eq!(
+            config.runtime.resolve_order_command_shard_count(0),
+            Some(0),
+            "a legacy upper bound must not force an idle session"
+        );
+    }
+
+    #[test]
+    fn legacy_connectivity_cap_conflicts_fail_deterministically() {
+        let mut config = valid_config();
+        config.runtime.public_connections_per_subscription = 1;
+        let errors = config.validate().errors;
+        assert!(errors.iter().any(|error| {
+            error
+                == "runtime.public_connections_per_subscription conflicts with plan-derived connectivity: legacy maximum cap 1 is below mandatory replica_count 2"
+        }));
+
+        config.runtime.public_connections_per_subscription = 2;
+        config.runtime.order_websocket_sessions = 1;
+        let report = config.validate();
+        assert!(report.valid, "{:?}", report.errors);
+        let plan = ChaosConnectivityPlan::resolve(&config, LiveMode::Demo).unwrap();
+        assert!(
+            config
+                .connectivity_cap_errors_for_plan(&plan, "demo")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn legacy_connectivity_diagnostics_are_stable_even_for_omitted_defaults() {
+        let config = valid_config();
+        let expected = vec![
+            "runtime.public_connections_per_subscription=2 is deprecated and, for one migration window, is interpreted only as a maximum cap on each plan-derived public replica_count; it cannot create replicas".to_string(),
+            "runtime.order_websocket_sessions=8 is deprecated and, for one migration window, is interpreted only as a per-account upper bound on plan-derived command shards; it cannot create idle sessions".to_string(),
+        ];
+        assert_eq!(config.connectivity_migration_diagnostics(), expected);
+
+        let mut expected_sorted = expected.clone();
+        expected_sorted.sort();
+        assert_eq!(config.validate().diagnostics, expected_sorted);
+
+        let mut document: toml::Value =
+            toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
+        let runtime = document["runtime"].as_table_mut().unwrap();
+        runtime.remove("public_connections_per_subscription");
+        runtime.remove("order_websocket_sessions");
+        let omitted = LiveConfig::from_toml(&toml::to_string_pretty(&document).unwrap()).unwrap();
+
+        assert_eq!(
+            omitted.runtime.public_connection_replica_cap(),
+            RuntimeConfig::default().public_connection_replica_cap()
+        );
+        assert_eq!(
+            omitted.runtime.order_command_shard_cap(),
+            RuntimeConfig::default().order_command_shard_cap()
+        );
+        assert_eq!(omitted.connectivity_migration_diagnostics(), expected);
+    }
+
+    #[test]
     fn live_config_rejects_act_on_burst_without_a_typed_provider() {
         let mut config = valid_config();
         config.strategy.act_on_burst = true;
@@ -2504,8 +2792,8 @@ mod tests {
             "production.alerts must be enabled",
             "delivery_failure_is_fatal must be true",
             "production.operator must be enabled",
-            "public_connections_per_subscription must be at least 2",
-            "order_websocket_sessions must be at least 2",
+            "public_connections_per_subscription conflicts with the resolved connectivity plan",
+            "legacy maximum cap 1 is below mandatory replica_count 2",
             "connection_attempt_pacer_path must be absolute",
             "expected_permissions must be exactly [read_only, trade]",
             "require_ip_binding must be true",
@@ -2515,6 +2803,12 @@ mod tests {
                 "missing {expected} in {errors:?}"
             );
         }
+        assert!(
+            !errors
+                .iter()
+                .any(|error| error.contains("order_websocket_sessions")),
+            "one planned per-account command shard must fit the legacy cap of one: {errors:?}"
+        );
     }
 
     #[test]

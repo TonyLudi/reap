@@ -670,8 +670,21 @@ fn campaign_config_failures(config: &LiveConfig) -> Vec<LiveFaultMatrixConfigFai
     if !config.operator.enabled {
         failures.push(LiveFaultMatrixConfigFailure::OperatorServiceDisabled);
     }
-    if config.runtime.public_connections_per_subscription < 2 {
-        failures.push(LiveFaultMatrixConfigFailure::PublicWebsocketRedundancyBelowTwo);
+    if let Some(plan) = config.connectivity_plan_ignoring_legacy_caps(LiveMode::Demo) {
+        let planned_public_redundancy_is_satisfied =
+            plan.public_subscriptions().iter().all(|subscription| {
+                config
+                    .runtime
+                    .resolve_public_replica_count(usize::from(subscription.replica_count()))
+                    .is_some()
+                    && (subscription.replica_count() <= 1
+                        || subscription.redundancy_consumer().is_some())
+            });
+        if !planned_public_redundancy_is_satisfied {
+            // Keep the serialized one-window failure code stable while the
+            // predicate now follows the resolved per-requirement plan.
+            failures.push(LiveFaultMatrixConfigFailure::PublicWebsocketRedundancyBelowTwo);
+        }
     }
     failures
 }
@@ -1451,6 +1464,27 @@ mod tests {
             manifest_path,
             manifest,
         }
+    }
+
+    #[test]
+    fn fault_config_gate_uses_resolved_public_replica_requirements() {
+        let mut config =
+            LiveConfig::from_toml(include_str!("../../../examples/live-okx-demo.toml")).unwrap();
+
+        config.runtime.public_connections_per_subscription = 9;
+        config.runtime.order_websocket_sessions = 1;
+        assert!(
+            !campaign_config_failures(&config)
+                .contains(&LiveFaultMatrixConfigFailure::PublicWebsocketRedundancyBelowTwo),
+            "large legacy ceilings and a one-shard order ceiling must not create or require idle connectivity"
+        );
+
+        config.runtime.public_connections_per_subscription = 1;
+        assert!(
+            campaign_config_failures(&config)
+                .contains(&LiveFaultMatrixConfigFailure::PublicWebsocketRedundancyBelowTwo),
+            "the legacy ceiling must not suppress the plan's mandatory redundant books"
+        );
     }
 
     fn scenario_report(

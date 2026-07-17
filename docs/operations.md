@@ -1747,10 +1747,17 @@ only after review.
   canonical `PendingNew` before dispatching to the account gateway task. The
   intent, pending state, and request are enqueued to critical storage before
   authenticated websocket write begins.
-- Demo order entry requires every session in the account's authenticated
-  websocket command pool. `order_websocket_sessions` defaults to eight and
-  stable underlying hashing keeps related spot/swap/future commands on one
-  session, matching the pinned Java dispatch shape.
+- Demo order entry requires every nonempty account command lane in the resolved
+  Chaos connectivity plan. The current plan derives one lane per executing
+  account and stable underlying keys deduplicate related spot/swap/future
+  symbols into one dispatch family. Reference-only accounts construct no
+  mutation role or order-command session.
+- `order_websocket_sessions` is accepted for one migration window only as a
+  per-account upper bound on derived lanes. It cannot create an idle session.
+  `public_connections_per_subscription` is likewise only a maximum cap on each
+  plan-derived replica count: books require two named recovery replicas, while
+  trades and references require one. Validation emits both deprecations and
+  rejects a cap below a mandatory plan count.
 - Connection/login and control writes are bounded, including the shutdown close.
   Pong-derived heartbeat status uses non-blocking delivery at both bounded
   telemetry queues; saturation drops only that redundant heartbeat. Ready,
@@ -1758,10 +1765,12 @@ only after review.
   cannot stall order commands or delay the Java-mapped disconnect cancellation
   and reconciliation path.
 - Each account command owner keeps a FIFO per underlying and permits one
-  operation per family, with total concurrent operations bounded by
-  `order_websocket_sessions`. Unrelated families therefore do not wait for one
-  another's acknowledgements, while same-family submit/cancel order remains
-  stable and all idempotency completion stays single-owner.
+  operation per family. The current single planned lane bounds total in-flight
+  work to one acknowledgement at a time, while same-family submit/cancel order
+  remains stable and all idempotency completion stays single-owner. Adding a
+  lane requires a measured nonempty capacity or isolation requirement; the
+  sample 4,096-command queue exceeds its documented 2,400-command
+  four-ack-horizon threshold.
 - Full REST reconciliation runs on an independent bounded account task. It
   shares account pacing reservations with command IO but cannot sit behind a
   websocket acknowledgement. Fail-closed shutdown flushes every earlier

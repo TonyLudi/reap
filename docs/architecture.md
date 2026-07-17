@@ -498,12 +498,12 @@ backtest decisions share the same freshness behavior.
 Before network feeds start, one unsigned `/api/v5/system/status` request must
 also prove that no relevant maintenance is active or inside the configured lead
 window. The first account safety task repeats that global check every 10 seconds
-by default. Its service filter matches pinned Java
-`OkxNitroUtils.getExchStatus`: unified trading, account-batch, product-batch,
-spread, and other events are relevant; websocket, block, bot, and copy-trading
-events are not. Rust additionally filters OKX's current `env` field and turns a
-relevant status or failed poll into fail-closed cancel/reconcile shutdown rather
-than Java's recoverable strategy pause.
+by default. The resolved Chaos plan admits unified websocket, trading,
+trading-account, trading-product, and ambiguous `other` events for its configured
+regular products. Spread-only, block, bot, copy-trading, and other provably
+unrelated services are excluded. Rust also filters OKX's current `env` field and
+turns a relevant or ambiguous status, or a failed poll, into fail-closed
+cancel/reconcile shutdown rather than Java's recoverable strategy pause.
 Each exact account instrument must also provide current `upcChg` announcements
 and the OKX trading-fee `groupId`. Bootstrap rejects non-live instruments or an
 announced `tickSz`, `minSz` (and synchronous derivative `lotSz`), or `maxMktSz`
@@ -523,17 +523,23 @@ hedges aggregated across depth levels. The metadata sweep runs as a child of
 the account safety lifecycle so a blocked metadata or fee request cannot delay
 Cancel All After heartbeats. Missing or unknown `upcChg` contracts and
 deprecated top-level fee fields are rejected as insufficient evidence.
-Tradable demo startup additionally requires every configured authenticated
-order-command websocket session for every account. The default pool has eight
-sessions, matching the pinned Java topology, and deterministically routes spot,
-swap, and dated-future symbols with the same underlying to one session.
-Orders, account, and positions transports are required, and account plus
-positions must each deliver a real data payload before private recovery. A
-completed pair of fresh state-channel payloads, rather than a socket pong or an
-event-only order/fill message, refreshes account-scoped private health. The
-dedicated fills channel is opt-in because OKX restricts it by fee tier; fills
-from the orders channel remain canonical. Any lost invariant blocks new orders
-while demo-mode cancels remain available.
+Tradable demo startup materializes only the command lanes in the resolved Chaos
+plan. Each executing account currently has one nonempty lane; spot, swap, and
+dated-future symbols with the same underlying deduplicate to one dispatch
+family, and reference-only accounts receive no mutation role or command
+session. The legacy `order_websocket_sessions` value is a one-window upper
+bound, not a requested pool size. The sample queue holds 4,096 commands against
+a credential-free four-ack-horizon threshold of 2,400.
+
+Compatible orders, account, positions, and optional fills subscriptions share
+one authenticated private-state socket per account. The socket must acknowledge
+the whole packed subscription set, and account plus positions must each deliver
+a real data payload before private recovery when both are planned. A completed
+fresh state-data round, rather than a socket pong or an event-only order/fill
+message, refreshes account-scoped private health. The dedicated fills channel is
+opt-in because OKX restricts it by fee tier; fills from the orders channel
+remain canonical. Any lost planned invariant blocks new orders while demo-mode
+cancels remain available.
 
 The websocket command tasks correlate bounded request IDs, attach exchange
 `expTime` to place requests, and classify failures at the write boundary.
@@ -1481,9 +1487,9 @@ components, not a completed production deployment.
 
 Production-transition evidence makes the operational baseline non-optional:
 both exact demo and production configs require fatal alerts, the operator
-service, production host-guard floors, redundant public and order-command
-sessions, and an absolute process-shared connection pacer. Runtime exercise and
-external delivery remain deployment evidence rather than config claims.
+service, production host-guard floors, resolved public redundancy and nonempty
+command lanes, and an absolute process-shared connection pacer. Runtime exercise
+and external delivery remain deployment evidence rather than config claims.
 
 - Add risk gates, kill switch, stale feed policy, metrics, storage.
 - Add operational runbooks and config checks.

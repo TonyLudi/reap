@@ -107,7 +107,13 @@ order_channel_capacity = 4096
 dedup_capacity_per_stream = 100000
 max_sequence_buffer = 4096
 max_subscriptions_per_socket = 100
+# Deprecated migration ceiling only. The resolved plan currently requires two
+# book replicas and one replica for every trade/reference subscription; this
+# value cannot create replicas.
 public_connections_per_subscription = 2
+# Deprecated per-account migration ceiling only. The sample plan opens one
+# nonempty command lane for main; this historical value does not open eight
+# sessions.
 order_websocket_sessions = 8
 # Shared by public and all private supervisors for initial and reconnecting
 # feed/order handshakes; 400 ms remains below OKX's three requests/second/IP ceiling.
