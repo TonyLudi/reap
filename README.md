@@ -40,16 +40,20 @@ Implemented:
 - A fail-closed `reap-live` composition root with account-scoped REST bootstrap,
   exchange metadata/account-mode and zero-liability verification, exact
   plan-derived public replicas, one packed private-state socket per account,
-  account/positions data-round health, one nonempty command lane per executing
-  account, one strategy owner, prioritized gateway tasks, and graceful
-  cancel-and-drain shutdown.
+  account/positions data-round health, in Demo one nonempty command lane per
+  executing account, one strategy owner, prioritized gateway tasks, and
+  graceful cancel-and-drain shutdown.
   Demo entry also validates exchange time, continuously detects authenticated
   account-configuration drift, polls only plan-relevant OKX unified-account
   maintenance with the configured lead time, continuously verifies
   strategy-critical instrument rules, hard single-order maxima, and configured
   fees against authenticated current OKX metadata, enforces the authenticated
   limit-order quantity/amount again before dispatch, and maintains OKX Cancel
-  All After from an independent safety task.
+  All After from an independent safety task. A per-account read-only sentinel
+  continuously proves all seven pending algo families and pending spread orders
+  empty before and during readiness; stale, nonzero, or unverifiable proof
+  blocks placement and starts canonical owned-regular cancellation and
+  reconciliation.
 - Authenticated read-only cash-account certification that embeds exact bounded
   OKX config/balance/position and direct public currency-index responses in a
   create-new mode-`0600` artifact, binds config/binary/host/Java/account
@@ -70,9 +74,12 @@ Implemented:
   available-memory, and kernel-clock guards, with preflight evidence and
   fail-closed periodic enforcement outside the strategy loop.
 - A strategy-independent OKX emergency command that arms regular and spread
-  Cancel All After, exhaustively paginates and cancels regular, algo, and spread
-  orders, and requires a post-trigger account-wide zero proof. Its create-new
-  schema-versioned artifact binds the exact
+  Cancel All After and independently paginates and cancels regular, algo, and
+  spread orders. Regular mitigation is kicked off first; each domain then owns
+  its pacing, progress, and final-zero proof while independently enforcing the
+  shared absolute per-account deadline. The existing report is merged in
+  deterministic regular/algo/spread order. Its create-new schema-versioned
+  artifact binds the exact
   input file, binary, host, Java revision, account coverage, and task failures,
   plus CI-verified hardened systemd templates with mode-specific restart policy,
   no capabilities, and a bounded offline security exposure.
@@ -105,6 +112,24 @@ Implemented:
   report-aware raw/normalized verification, a process-global persisted-frame
   ordinal, bounded-memory capture analysis, normalized diagnostic output, and
   direct raw-capture backtests.
+
+The Phase 0–5 Goal A implementation enforces the
+[Chaos connectivity boundary](docs/chaos-connectivity-boundary.md) against the
+clean sibling `../imm-strategy` checkout pinned at
+`b6b120c7b7c466d8431bf082f3229328c5d7b2ae`. Only behavior reachable from the
+supported Chaos/iarb2 path is a strategy-parity requirement; generic Java
+gateway features such as algo-order execution, and Java's eight-session regular
+command pool, do not grant live Chaos authority or dictate connection count. The
+[capability inventory](docs/chaos-connectivity-inventory.md) records the audited
+surface, and the
+[Goal A handoff](docs/chaos-connectivity-goal-a-handoff.md) records the
+verification gate.
+
+This is a least-authority capability boundary, not a production-readiness
+claim. Production order entry remains unavailable, credentialed target-host
+evidence remains external, and the Phase 6–9 structural decomposition in the
+[refactor plan](docs/chaos-connectivity-refactor-plan.md) is separate follow-on
+work.
 
 Run the sample:
 
@@ -353,6 +378,26 @@ triggers immediate cancellation of canonical working orders. The checked-in
 120-second value accommodates OKX's variable funding update cadence and must be
 reviewed against captured target-region behavior before promotion.
 
+Each configured account also requires an initial, complete read-only proof that
+all seven OKX pending algo query families and pending spread orders are empty.
+The sentinel starts a scan every 15 seconds, treats a proof as usable for at
+most 30 seconds, and gives the algo and spread scans independent 60-second
+domain timeouts. Slow scans may overlap, but the default schedule is bounded
+at five generations and all generations share the two domain pacers. A failure
+invalidates zero results from every scan that was already in flight. Nonzero
+state, proof expiry, endpoint/timeout failure,
+malformed or unknown data, duplicate order identity, repeated pagination
+cursor, or page-limit exhaustion fails closed. The coordinator blocks new
+regular placement globally, targets regular reconciliation to the affected
+account, and, when the Demo mutation role exists, issues canonical cancels only
+for that account's owned regular orders. Regular Cancel All After, control
+events, cancellation, and reconciliation use separate priority paths and
+pacing from the read-only scans. The typed critical event tells an enabled
+alert sink to direct the operator to the separate `reap-emergency` executable;
+live neither imports nor invokes its algo/spread mutation authority. Placement
+recovers only when both a fresh complete zero proof and a clean regular
+reconciliation are present, in either completion order.
+
 `runtime.connection_attempt_interval_ms = 400` serializes initial and
 reconnecting WebSocket handshakes across every public/private feed and
 authenticated order-command session. Official endpoint configurations also
@@ -393,8 +438,10 @@ paths, and operator/alert secret bindings. Strategy, risk, runtime, account
 policy, execution, storage capacity, and safety settings must remain identical,
 and both files must use the same official endpoint region. Both configs must
 also enable fatal alert delivery, the operator service, and the production host
-guard floors; use at least two public replicas and two order-command sessions,
-and name an absolute process-shared connection pacer. A pass does not read
+guard floors; satisfy the exact plan-derived public redundancy and one nonempty
+command lane for each executing account, and name an absolute process-shared
+connection pacer. Legacy connection-count fields are migration caps and cannot
+create replicas or idle command sessions. A pass does not read
 credential values, prove those controls were exercised, authorize production,
 or enable production order entry.
 
@@ -543,16 +590,28 @@ cargo run -p reap-cli -- verify-emergency-cancel \
 ```
 
 The output path is reserved before parsing credentials or starting REST work.
-`all_clear = true` requires regular, algo, spread, and aggregate account-wide
-all-clear flags plus complete config/binary/host/exchange-account/task evidence;
-early configuration failures leave an empty reserved path, which is never a
+The regular workflow is kicked off first. It releases the algo and spread
+workflows immediately before attempting regular Cancel All After, or after
+determining that request cannot be issued; regular enumeration continues in
+either case. Regular, algo, and spread then advance independently with separate
+pacers, progress, incidents, and final-zero proofs. Each workflow enforces the
+same absolute per-account deadline independently, so a slow or failed
+unsupported domain cannot consume the regular workflow's sequential request
+budget or stop another domain. The existing report is merged deterministically
+in regular, algo, then spread order.
+
+`all_clear = true` is conjunctive: regular, algo, spread, and aggregate
+account-wide all-clear flags plus complete config/binary/host/exchange-account/
+task evidence must all pass. A verified domain can therefore retain valid
+evidence while another domain remains unverified and keeps `all_clear = false`.
+Early configuration failures leave an empty reserved path, which is never a
 report. Both report paths are owner-only and synced with their parent directory.
-Offline verification hashes the exact config/report bytes and re-derives account
-coverage, per-domain trigger-horizon/final-zero, provenance, and completion
-invariants. It cannot replay raw exchange responses or prove the operator stopped
-every external order producer. OKX documents no algo-order Cancel All After, so
-algo safety relies on that producer-stop confirmation, explicit cancellation,
-and authoritative polling.
+Offline verification hashes the exact config/report bytes and re-derives
+account coverage, each domain's trigger-horizon/final-zero pair, provenance,
+and completion invariants. It cannot replay raw exchange responses or prove the
+operator stopped every external order producer. OKX documents no algo-order
+Cancel All After, so algo safety relies on that producer-stop confirmation,
+explicit cancellation, and authoritative polling.
 
 For a controlled minimal-size demo process-kill campaign, wait for the already
 armed deadman to expire without issuing another cancel, then collect and verify
@@ -904,6 +963,12 @@ Design docs:
 - [docs/chaos-connectivity-refactor-plan.md](docs/chaos-connectivity-refactor-plan.md)
   is the phased, goal-ready plan for enforcing that boundary and reducing
   repository coupling without changing strategy behavior.
+- [docs/chaos-connectivity-inventory.md](docs/chaos-connectivity-inventory.md)
+  inventories each audited exchange capability, role, requirement, consumer,
+  and disposition.
+- [docs/chaos-connectivity-goal-a-handoff.md](docs/chaos-connectivity-goal-a-handoff.md)
+  records the Goal A Phase 0–5 and Tranche A verification commands, hashes, and
+  results.
 - [docs/architecture.md](docs/architecture.md) describes the target HFT-style
   event-loop architecture, module split, websocket/dedup design, and migration
   plan.

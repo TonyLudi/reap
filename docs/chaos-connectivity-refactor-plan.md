@@ -1,6 +1,7 @@
 # Chaos Connectivity Refactor Plan
 
-Status: proposed implementation plan, not yet implemented.
+Status: Goal A (Phases 0–5 and the Tranche A gate) implemented; Goal B
+(Phases 6–9) pending. This is not a production-readiness claim.
 
 This is a finite, goal-ready refactor plan for enforcing
 [chaos-connectivity-boundary.md](chaos-connectivity-boundary.md) and then
@@ -104,11 +105,13 @@ authority and responsibility.
 10. Work phase by phase. Do not mix production-readiness features or unrelated
     cleanup into a phase.
 
-## Current Deviation Ledger
+## Phase 0 Deviation Ledger
 
-Phase 0 must verify and expand this ledger before code changes:
+This table records the pre-refactor implementation that Phase 0 verified and
+expanded before code changes. The current Goal A disposition is in
+[chaos-connectivity-inventory.md](chaos-connectivity-inventory.md).
 
-| ID | Current implementation | Target |
+| ID | Phase 0 implementation | Target |
 | --- | --- | --- |
 | `D01` | Public `OkxSigner::signature`/`sign_request`/`websocket_login`/credential access, `OkxRestClient::signer`, `SignedRequest`, `HttpTransport::execute`, and the broad REST client are bypass paths | Private role-owned wire adapters and narrow authenticated session factories |
 | `D02` | Wildcard `okx` and `reap-live` exports widen accidental reachability | Explicit exports grouped by role |
@@ -116,7 +119,7 @@ Phase 0 must verify and expand this ledger before code changes:
 | `D04` | Config defaults to eight order websocket sessions; each family hashes to one session, there is no safe failover, and readiness requires every session | Start with one non-idle command shard per account; add shards only for measured capacity/isolation and model real replicas separately |
 | `D05` | The live maintenance filter treats spread trading as fatal to Chaos | Derive service/product relevance from the Chaos plan |
 | `D06` | Live regular reconciliation does not prove pending algo/spread domains empty | Add a read-only startup and recurring forbidden-domain sentinel |
-| `D07` | Emergency enumeration combines regular, seven algo query families, and spread before cancellation; an unsupported-domain failure can delay regular mitigation | Independent per-domain workflows and deadlines |
+| `D07` | Emergency enumeration combines regular, seven algo query families, and spread before cancellation; an unsupported-domain failure can delay regular mitigation | Independent workflows, pacers, progress, and zero proofs with independent enforcement of one shared absolute per-account deadline |
 | `D08` | Emergency mutation code lives in `reap-live` and uses the same broad client surface | Dedicated emergency crate/executable and adapter absent from the live dependency graph |
 | `D09` | `reap-backtest` depends on the entire `reap-live` crate for shared contracts | Move pure shared contracts down and remove the dependency |
 | `D10` | Coordinator, connectivity, safety, evidence, and shutdown responsibilities are concentrated in large modules | Split by owned state and role while retaining one coordinator |
@@ -129,7 +132,7 @@ connection constructor, including test-only and offline-evidence use.
 
 ## Deliverables
 
-The completed goal produces:
+The completed two-goal plan produces:
 
 1. a checked-in `docs/chaos-connectivity-inventory.md` with requirement IDs,
    endpoint/channel, read/write classification, owning plane, production
@@ -441,12 +444,13 @@ Actions:
 - Give regular cancel/CAA/reconciliation priority over the observer. Algo and
   spread scans use bounded per-domain timeouts and a pacing budget that cannot
   hold the regular-safety budget.
-- Emit a typed fatal alert on nonzero/unverifiable state that instructs an
+- Emit a typed critical alert on nonzero/unverifiable state that instructs an
   operator to run the separate emergency executable. Live does not invoke it.
 - Run regular, algo, and spread enumeration/cancellation as independent
-  workflows with independent deadlines, pacers, and progress. Schedule regular
-  mitigation before awaiting either unsupported domain; do not let seven algo
-  queries or spread consume its deadline.
+  workflows with independent enforcement of the shared absolute per-account
+  deadline, pacers, and progress. Schedule regular mitigation before awaiting
+  either unsupported domain; do not let seven algo queries or spread consume
+  its sequential request budget.
 - Keep regular and spread Cancel All After where the emergency contract
   requires them. Never add algo/spread submit.
 - Expose typed internal progress for each domain to the coordinator, telemetry,
@@ -463,10 +467,12 @@ Tests:
 - The sentinel can enumerate but cannot cancel.
 - With algo and spread transports held forever, the regular-domain request
   trace through cancellation/final-zero is identical to its standalone trace
-  except timestamps and completes within its standalone deadline plus one
-  regular pacing quantum.
+  except timestamps. Both use the same absolute per-account deadline, and the
+  composed elapsed bound exceeds the standalone bound by at most one regular
+  pacing quantum.
 - Spread failure does not prevent regular or algo mitigation.
-- One domain timing out does not consume another domain's deadline.
+- One domain timing out does not stop another domain or consume its sequential
+  request budget under the shared absolute per-account deadline.
 - Every unverified domain makes `all_clear = false` even when another domain is
   zero.
 - Emergency roles cannot submit any order.
@@ -492,6 +498,10 @@ Goal A is complete when every boundary acceptance item is structurally
 enforced. The production-readiness session can then be reassessed and rebased
 onto the narrower authority graph; keep it paused if Goal B will follow. Goal A
 does not wait for or claim the Phase 6–9 structural cleanup.
+
+The implementation commits, deterministic anchors, and exact Tranche A command
+results are recorded in
+[chaos-connectivity-goal-a-handoff.md](chaos-connectivity-goal-a-handoff.md).
 
 ## Tranche B: Reduce Structural Coupling
 
@@ -611,9 +621,14 @@ depends on `reap-live`.
 No credentialed smoke test is part of this refactor. Existing production
 evidence MUST NOT be relabeled or regenerated to bless the new structure.
 
-## Global Acceptance Criteria
+## Full-Plan Global Acceptance Criteria
 
-The goal is complete only when:
+The two-goal plan is complete only when:
+
+Goal A's handoff evaluates the Tranche A subset and explicitly defers the
+Phase 6–9 items below, including removal of the
+`reap-backtest -> reap-live` dependency. Those deferred criteria do not make
+the completed capability-boundary tranche a production-readiness claim.
 
 - the sibling Java checkout, Rust pin, fixtures, and evidence bindings agree on
   the full pinned SHA;
@@ -635,7 +650,7 @@ The goal is complete only when:
   exactly plan-derived;
 - every socket above the minimum has a tested
   redundancy/ordering/isolation/capacity consumer;
-- the sample plan contains no idle command session, retains the pinned
+- the sample Demo plan contains no idle command session, retains the pinned
   `CHAOS-MD-TRADE` input, and opens no unplanned subscription;
 - emergency regular mitigation is independent of algo/spread failures and any
   unverified domain keeps `all_clear` false;
@@ -685,9 +700,9 @@ propose a separately scoped follow-up.
 - evidence schema evolution or production campaign execution; and
 - declaring production readiness.
 
-## Ready-To-Run Goals
+## Goal Prompts
 
-Run Goal A first:
+Goal A was completed using this prompt:
 
 > Implement Goal A (Phases 0–5 and the Tranche A verification gate) from
 > `docs/chaos-connectivity-refactor-plan.md`. Treat
@@ -698,7 +713,7 @@ Run Goal A first:
 > journal/report/evidence schemas, or claim production readiness. Stop and
 > report any listed stop condition.
 
-After Goal A is clean and reviewed, run Goal B:
+After reviewing this Goal A handoff, the next refactor prompt is Goal B:
 
 > Implement Goal B (Phases 6–9) from
 > `docs/chaos-connectivity-refactor-plan.md` on top of the completed Goal A

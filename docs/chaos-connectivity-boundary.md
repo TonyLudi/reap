@@ -276,13 +276,18 @@ The forbidden-domain proof is per account. Its default maximum age is 30
 seconds, its configured maximum MUST NOT exceed 60 seconds, and a recurring
 scan MUST start no later than half of the maximum-age interval. The initial
 complete zero proof is required before readiness. An expired proof disables
-placement immediately.
+placement immediately. The current readiness gate is conjunctive and global:
+one account's invalid proof blocks all new placement, while canonical
+owned-regular cancellation and reconciliation remain targeted to the affected
+account. Observe has no mutation role; only Demo can dispatch the owned
+cancellation.
 
 Regular cancellation, regular Cancel All After, and regular reconciliation
 have priority over the sentinel. Algo and spread scans MUST use bounded
 per-domain deadlines and a pacing budget that cannot consume or hold the
-regular-safety budget. A nonzero or unverifiable result emits a typed fatal
-alert instructing operators to run the separate emergency command; the live
+regular-safety budget. A nonzero or unverifiable result MUST create a typed
+critical alert event instructing operators to run the separate emergency command;
+an evidence-bearing Demo configuration MUST enable its delivery sink. The live
 process does not invoke or import that command.
 
 ## Connection And Status Planning
@@ -334,7 +339,9 @@ required capability still fails closed.
 Account-wide emergency recovery intentionally covers regular, algo, and spread
 orders because incident response must handle exposure not created by Chaos.
 Each domain MUST run as an independent mitigation workflow with its own
-deadline, progress, incidents, and final-zero proof.
+enforcement of the one absolute per-account deadline, progress, incidents, and
+final-zero proof. The deadline remains anchored before exchange-clock sampling
+so a failed or hung clock request cannot reset the account timeout.
 
 - Failure or slowness in algo/spread enumeration MUST NOT delay the first
   regular enumeration or cancellation attempt.
@@ -350,9 +357,9 @@ deadline, progress, incidents, and final-zero proof.
   action was attempted or acknowledged.
 - The emergency plane MUST never submit a new order.
 
-This deliberately changes the current combined enumeration loop, where failure
-of any algo/spread query can prevent that iteration from reaching regular
-cancellation.
+Goal A deliberately replaced the pre-refactor combined enumeration loop, where
+failure of any algo/spread query could prevent that iteration from reaching
+regular cancellation.
 
 ## Structural Enforcement
 

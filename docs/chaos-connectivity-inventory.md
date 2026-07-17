@@ -1,11 +1,14 @@
 # Chaos Connectivity Inventory
 
-Status: Phase 0 baseline for Goal A.
+Status: frozen Phase 0 baseline plus the completed Goal A disposition overlay.
 
 This inventory freezes the exchange surface that existed before the Chaos
 connectivity boundary was enforced. It is descriptive, not an authority grant.
 The normative target remains
 [chaos-connectivity-boundary.md](chaos-connectivity-boundary.md).
+The matrix is intentionally retained in its Phase 0 form so that “current
+reachability” means reachability at the start of the refactor. The
+[Goal A disposition](#goal-a-disposition) records what Phases 0–5 changed.
 
 ## Frozen Baseline
 
@@ -168,3 +171,42 @@ The final Phase 0 recheck found the sibling checkout clean at
 Gate result: green. The staged diff/tree and commit identifiers are recorded by
 the Phase 0 Git commit; no strategy/runtime behavior or serialized schema
 changed.
+
+## Goal A Disposition
+
+Goal A completed Phases 0–5 and the Tranche A gate. This overlay does not
+rewrite the frozen matrix above and does not claim that Goal B or the
+production-readiness gate is complete.
+
+| Deviation | Goal A disposition |
+| --- | --- |
+| `D01` broad signer, raw transport, and broad REST authority | Enforced. Production wire details are private to role-owned adapter crates. Compile-fail fixtures reject raw authentication/transport/client recovery and unsupported mutation from narrow roles. |
+| `D02` wildcard exports | Enforced for the audited OKX/live authority surface. Public exports are explicit and role-oriented. |
+| `D03` Java public-trade behavior versus current Rust semantics | Intentionally retained and still documented. `CHAOS-MD-TRADE` remains plan-derived for every configured instrument; Goal A did not pretend to close the separate trade-driven implied-depth behavior gap. |
+| `D04` copied eight-session command pool | Enforced. Each executing account receives exactly one plan-derived nonempty command lane; a reference-only account receives none. `order_websocket_sessions` is a backward-compatible maximum cap, not requested cardinality. |
+| `D05` broad maintenance relevance | Enforced. Relevance is derived from the resolved regular Chaos plan. Spread-only maintenance is irrelevant; relevant and unknown/ambiguous status remains fail-closed. |
+| `D06` missing forbidden-domain proof | Enforced. A read-only per-account observer exhaustively covers one seven-query-family algo domain plus the spread domain. Initial and recurring proof, expiry, strict pagination, and fail-closed cancellation/reconciliation behavior are composed without algo/spread mutation authority. The runtime attempts to queue a typed critical event to the configured alert sink when enabled; delivery remains an operational gate. |
+| `D07` coupled emergency progress | Enforced. Regular mitigation starts first. Regular, algo, and spread own separate pacers, progress, incidents, and zero proofs, and independently enforce one shared absolute per-account deadline. Results merge deterministically and `all_clear` remains conjunctive. |
+| `D08` emergency mutation inside live | Enforced. Emergency core, runner, and OKX adapter are separate crates; the normal `reap-live` dependency graph contains no emergency crate or emergency adapter. Live attempts to queue an operator alert through an enabled sink but cannot invoke emergency mutation. |
+| `D09` backtest depends on live | Deferred to Goal B Phase 6. The normal `reap-backtest -> reap-live` edge still exists and must not be described as removed by Goal A. |
+| `D10` concentrated large modules | Deferred to Goal B Phases 7–8. Goal A changed authority ownership where required but did not claim the responsibility-based module split. |
+| `D11` one global public replica count | Enforced. Every book has two named sequencing/deduplication/recovery replicas; each trade and configured reference input has one. Legacy connection count is only a migration cap. |
+| `D12` one private channel per socket | Enforced. Compatible required private channels are packed onto one exact plan-derived authenticated state socket per account, with order-channel fills canonical and optional fills included only when configured. |
+
+The final implementation anchors before the documentation-only handoff commit
+are:
+
+| Item | Recorded value |
+| --- | --- |
+| Goal A implementation commit | `ab7842446b9cb4f48ccc70425b0c8731ac9eac5f` |
+| Java checkout and Rust pin | `b6b120c7b7c466d8431bf082f3229328c5d7b2ae`; sibling checkout clean |
+| `Cargo.lock` SHA-256 | `74ca0a2b8fd028250cc243832ee7b169dc21ba26e3cf49713add4c7ff8cea213` |
+| Canonical sample Demo-plan SHA-256 | `6771c97a373f12f77093624ea4b2914d867aae6a710eddadde925fc288fc6477` |
+| Ordered-intent fixture SHA-256 | `d95fa7f121e2e8c402c8108cf9fefb7c7d7b3dbd2b9742c58c234a521f0ee0ec` |
+| Pretty backtest output SHA-256 | `38acf9f5e0c310f2ec5528974beffadf4c1a7f84d46efa8d9664ee7051e84691` |
+
+The documentation commit containing this overlay is the final Goal A handoff
+commit. Exact phase commits, commands, and results are recorded in
+[chaos-connectivity-goal-a-handoff.md](chaos-connectivity-goal-a-handoff.md).
+No credentialed exchange call, production evidence, or production order-entry
+claim is part of this result.

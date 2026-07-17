@@ -14,6 +14,21 @@ The current Chaos exchange-authority contract is
 which of the generic venue/runtime capabilities described here may be composed
 for Chaos. The staged enforcement and responsibility split are tracked in
 [chaos-connectivity-refactor-plan.md](chaos-connectivity-refactor-plan.md).
+The audited surface and Goal A verification record are
+[chaos-connectivity-inventory.md](chaos-connectivity-inventory.md) and
+[chaos-connectivity-goal-a-handoff.md](chaos-connectivity-goal-a-handoff.md).
+
+Goal A Phases 0–5 enforce the least-authority capability graph against the
+clean sibling `../imm-strategy` checkout pinned at
+`b6b120c7b7c466d8431bf082f3229328c5d7b2ae`. Only the supported Chaos/iarb2
+call path is a behavior-parity source. Generic Java gateway processors,
+algo-order execution, and the Java eight-session regular command pool do not
+authorize a Rust live capability or determine its cardinality.
+
+This completed capability tranche is not a production-readiness claim.
+Production order entry remains unavailable, target-host and credentialed
+exchange evidence remain operational gates, and Goal B Phases 6–9 still own the
+separate structural decomposition of large modules.
 
 ## Goals
 
@@ -541,24 +556,58 @@ opt-in because OKX restricts it by fee tier; fills from the orders channel
 remain canonical. Any lost planned invariant blocks new orders while demo-mode
 cancels remain available.
 
+Every account also runs one continuous, read-only forbidden-order sentinel. Its
+initial proof must exhaustively show zero pending orders across the seven OKX
+algo query families and spread before readiness can open. The plan uses a
+30-second maximum proof age, starts a scan every 15 seconds, and gives algo and
+spread their own 60-second scan deadlines and pacers. Slow scans overlap rather
+than delaying the half-age start: the default timeout/interval ratio bounds the
+set at five tagged generations, whose cloned pacers share reservations. A
+failure or expiry invalidates zero completion from every generation that
+started before it. The observer interface can only enumerate pages; it cannot
+submit or cancel.
+
+A nonzero result, expired proof, timeout, endpoint failure, malformed/unknown
+payload, duplicate identity, repeated cursor, or pagination bound prevents a
+zero proof and records an account-scoped fault. The global live gate immediately
+leaves `Ready` and blocks all new placement; canonical owned-regular
+cancellation and regular reconciliation target the affected account. The
+coordinator commits those actions before creating a typed critical event that
+instructs the operator to run the separate `reap-emergency` executable. The
+Demo composition dispatches the owned cancels; Observe has no mutation role.
+The runtime attempts to queue the event only when the configured alert sink is
+enabled, and successful external delivery remains an operational gate. The
+live process cannot import or invoke that executable's algo/spread mutation
+authority.
+Regular cancellation, regular Cancel All After, reconciliation, and control
+processing have priority and independent pacing from sentinel reads. Recovery
+requires both a fresh complete forbidden-domain zero proof and a clean regular
+reconciliation, in either completion order; either gate alone cannot reopen
+placement.
+
 The websocket command tasks correlate bounded request IDs, attach exchange
 `expTime` to place requests, and classify failures at the write boundary.
 Unavailable before send is explicit; a write followed by timeout, disconnect,
 or malformed correlation remains pending for private/REST reconciliation. A
 command-session loss invalidates both transport and reconciliation readiness,
 emits canonical account cancels, and requests full reconciliation. REST remains
-independent for snapshots, reconciliation, Cancel All After, pre-send cancel
-fallback, and emergency cancellation.
+independent for live snapshots, regular reconciliation, regular Cancel All
+After, and pre-send owned-cancel fallback. Account-wide emergency mutation uses
+the separate emergency executable and adapter.
 
 Each account has separate command and REST-reconciliation tasks. The command
 owner keeps idempotency and submit finalization single-threaded, but dispatches
 IO through constant-time per-underlying FIFOs. One operation per underlying may
-be in flight, while different underlying families run concurrently up to the
-configured websocket-session count. This preserves submit/cancel order within a
-family, matches the pinned Java family routing, and prevents one acknowledgement
-from blocking unrelated families. Every completion returns to the command owner
-and then to the single-writer coordinator; IO futures never mutate strategy
-state.
+be in flight while different underlying families can progress within the
+bounded lane. The current Chaos Demo plan assigns every derived family to
+exactly one nonempty command lane per executing account; Validate and Observe
+plans assign none, and reference-only accounts get no lane. Additional lanes
+require an explicit measured capacity or isolation consumer, and the legacy
+`order_websocket_sessions` migration cap cannot create one. This preserves
+submit/cancel order within a family, matches the pinned Java family-routing key
+without copying its pool cardinality, and prevents one acknowledgement from
+blocking unrelated families. Every completion returns to the command owner and
+then to the single-writer coordinator; IO futures never mutate strategy state.
 
 The reconciliation task uses a cloned authenticated REST client and cannot be
 blocked by websocket acknowledgement latency. Command and reconciliation
@@ -587,21 +636,32 @@ aggregate-PnL feed is not implemented; the runtime does not silently substitute
 local-only risk semantics.
 
 The emergency composition is intentionally not part of the strategy loop. It
-uses its own REST transport, exchange-adjusted signing clock, absolute
-per-account deadline, separate regular/spread deadman arms, bounded request
-pacing, regular/algo batch cancellation, spread mass cancel, and strict repeated
-pagination of all three pending-order domains. This separation keeps the kill
-path usable after live-process or strategy-state failure. Its optional CLI
-evidence path is reserved before config or network work and fsynced before exit.
+uses its own REST transport, exchange-adjusted signing clock, one absolute
+per-account deadline, separate regular/spread deadman arms, regular/algo batch
+cancellation, spread mass cancel, and strict repeated pagination of all three
+pending-order domains. The regular workflow starts first and signals its
+kickoff immediately before attempting regular Cancel All After, or after
+determining that request cannot be issued; regular enumeration continues in
+either case. Only then are algo and spread released. Regular, algo, and spread
+own independent pacers, progress, incidents, and final-zero proofs, and each
+workflow independently enforces the shared absolute deadline. A hung or failed
+unsupported domain therefore cannot consume the regular workflow's sequential
+request budget or stop the other domain. This separation keeps the kill path
+usable after live-process or strategy-state failure. Its optional CLI evidence
+path is reserved before config or network work and fsynced before exit.
 The schema-versioned report hashes the
 exact input file without invoking the live parser, uses the same executable and
 host identity hashes as live evidence, samples the same pseudonymous OKX
 UID/main-UID account identity only after zero is proven, records the pinned Java
 revision, and converts account-task join failures into bounded evidence.
-`all_clear` requires regular, algo, spread, and aggregate account-wide zero plus
-complete provenance; an early parse/validation failure leaves only an empty
-reserved path. OKX documents no algo-order CAA, so this boundary requires the
-explicit producer-stop confirmation before it cancels and polls algo orders.
+Owned domain outcomes are merged into the existing serialized report in
+deterministic regular/algo/spread order. Each domain's initial/final coverage
+and zero claim is verified independently, but `all_clear` remains conjunctive:
+regular, algo, spread, and aggregate account-wide zero plus complete evidence
+and provenance must all pass. Thus one valid zero domain does not mask an
+unverified peer. An early parse/validation failure leaves only an empty reserved
+path. OKX documents no algo-order CAA, so this boundary requires the explicit
+producer-stop confirmation before it cancels and polls algo orders.
 
 The deadman-certification composition is also outside the strategy loop but has
 the opposite authority boundary from emergency cancellation: it uses only
@@ -1549,10 +1609,14 @@ the deployment blocker.
   soak; tooling alone does not close that gate.
 
 The implemented Phase 8 surface is a record of current capability, not a grant
-of permanent authority to the Chaos process. In particular, broad emergency
-coverage, generic endpoint support, and Java-inspired connection pool size are
-being separated from normal strategy connectivity by the
-[Chaos connectivity refactor](chaos-connectivity-refactor-plan.md).
+of permanent authority to the Chaos process. Goal A has separated broad
+emergency coverage, generic endpoint support, and Java-inspired connection-pool
+cardinality from normal strategy connectivity under the
+[Chaos connectivity boundary](chaos-connectivity-boundary.md). The
+[inventory](chaos-connectivity-inventory.md) and
+[Goal A handoff](chaos-connectivity-goal-a-handoff.md) record that boundary and
+its verification. This does not expose production order entry or complete the
+Goal B structural refactor.
 
 See [trading-readiness.md](trading-readiness.md) for the detailed gate.
 

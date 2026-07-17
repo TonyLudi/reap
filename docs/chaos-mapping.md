@@ -13,8 +13,11 @@ fixture-derived Rust tests whenever that reference revision changes.
 The normative connectivity scope is
 [chaos-connectivity-boundary.md](chaos-connectivity-boundary.md). References to
 generic Java gateway machinery in this mapping are evidence and design context,
-not grants of strategy authority. The enforcement work is sequenced in
-[chaos-connectivity-refactor-plan.md](chaos-connectivity-refactor-plan.md).
+not grants of strategy authority. Goal A (Phases 0–5) of
+[chaos-connectivity-refactor-plan.md](chaos-connectivity-refactor-plan.md)
+enforces that capability boundary. The remaining Phase 6–9 structural
+decomposition is separate follow-on work; neither tranche is exchange
+certification or a production-approval claim.
 
 It is not a byte-for-byte port of the Java runtime, exchange abstractions, or
 control plane.
@@ -241,10 +244,16 @@ the account's routing groups. The pinned Nitro path separately calls
 `/api/v5/sprd/mass-cancel`, while `getAllOpenOrders` follows 100-row spread pages
 with `endId`. Reap's out-of-process emergency command is a stronger operational
 boundary because it does not depend on the strategy process or journal: it
-strictly pages regular, algo, and spread domains, arms regular and spread CAA,
-cancels all three domains, and polls all three to zero. Its offline verifier
-re-derives exact-config, account-coverage, trigger-horizon, and per-domain
-final-zero invariants; it does not turn self-reported REST outcomes into
+starts regular mitigation first, then advances regular, algo, and spread as
+independent workflows with separate pacers, progress, and final-zero proofs.
+Each workflow independently enforces the shared absolute per-account deadline.
+It arms regular and spread CAA, cancels all three domains, and polls all three
+to zero without allowing a slow unsupported domain to consume another
+domain's sequential request budget. Its offline verifier re-derives
+exact-config, account-coverage, trigger-horizon, and independent per-domain
+final-zero invariants. `all_clear` remains the conjunction of every required
+domain and aggregate evidence check; one valid zero proof cannot mask an
+unverified domain. The verifier does not turn self-reported REST outcomes into
 replayable raw exchange evidence.
 Deadman heartbeat, periodic clock skew/check, exchange instrument/fee
 drift/check, and authenticated account-config drift/check failures have
@@ -356,11 +365,12 @@ ownership reference rather than claiming file-format parity.
 | Java `AccountConfig` plus `OkUtils.loadAccountConfig` retain UID, account/position mode, and borrowing-related settings but do not model current `perm` or `ip` response fields | Rust retains API-key label, normalized permission set, and normalized IP bindings from the same authenticated `/api/v5/account/config`; bootstrap enforces exact configured scope, production evidence forbids `withdraw` and requires a binding, periodic checks detect drift, and schema-3 account certification re-derives the decision from raw responses | Intentional Rust credential hardening around the Java account-mode boundary, not strategy parity |
 | Java strategy entities retain an `Instrument` from `instrumentCache` and use its tick, lot/minimum size, currencies, and contract value throughout their lifetime | Strict exact-row `/api/v5/account/instruments` bootstrap plus paced periodic comparison of those fields and current hard order maxima, typed current `upcChg` parsing, and final limit-order maximum enforcement | Current-contract hardening: missing/unknown rules, non-live state, rule drift, an imminent announced change, or an oversized final order fails closed; the poll is isolated from the deadman heartbeat |
 | Java strategy entities receive maker/taker fees from `StrategyToolkit.getTransactionFee`; `ChaosEntity.sanityCheck` rejects taker below maker | Current private-instrument `groupId` plus authenticated `/api/v5/account/trade-fee` `feeGroup` selection for each exact spot symbol or derivative family, startup verification, and paced periodic checks | Current-contract hardening: Rust rejects fee underpricing and unreadable/deprecated-only fee data; the fee poll is isolated from the deadman heartbeat |
-| Eight `OkxNitroOrderSessionKeeper` instances with `BY_UNDERLYING` dispatch, websocket order protocol, and `OkxNitroOrderClient.onOrderSessionDisconnected` immediate `cancelAll()` | Current Rust defaults to eight authenticated command sessions, hashes each underlying to one session without failover, and requires all sessions ready; the target creates only plan-assigned dispatch shards and models actual replicas separately | Java pool topology remains a connectivity reference, not strategy parity; fail-closed disconnect intent, bounded command lifecycle, ambiguity classification, and independent REST reconciliation remain required |
+| Eight `OkxNitroOrderSessionKeeper` instances with `BY_UNDERLYING` dispatch, websocket order protocol, and `OkxNitroOrderClient.onOrderSessionDisconnected` immediate `cancelAll()` | Rust materializes one plan-derived nonempty command lane per executing account, deduplicates configured symbols into dispatch families, creates no lane for a reference-only account, and treats legacy `order_websocket_sessions` only as a migration cap | The pinned Java eight-session topology is retained solely as a connectivity reference, not as strategy parity or a Rust cardinality requirement; fail-closed disconnect intent, bounded command lifecycle, ambiguity classification, and independent REST reconciliation remain required |
 | Batch subscription manager, per-`WsSubArg` `EVENT_SUB` context updates, and retry limits | Bounded socket partitioning, exact unique serialized subscription-argument acknowledgement-set readiness, acknowledgement timeout, and exponential reconnect | Equivalent identity-bound lifecycle with different batching policy; duplicate acknowledgements are idempotent, while malformed or unexpected acknowledgements fail closed |
 | `OrderDetailUpdate` `tradeId`/`fillSz`/`fillPx` and `UserTrade` `tradeId`/`fee`/`feeCcy`/`execType` | Current OKX order-channel `tradeId` plus per-fill `fillFee`/`fillFeeCcy`, optional fills channel with fee-bearing order-update precedence under either arrival order, instrument-scoped once-only journal record, and raw-statement comparison | Current-contract strengthening; the pinned Java order-session fill derivation says fee is unavailable and its separate user-trade processing is commented out |
 | `OkxNitroRestClient.getFills` 100-row pages, 200 ms pacing, descending cursor pagination, and short-page completion | Authenticated read-only `/api/v5/trade/fills` collector with the same page size/pacing/completion rule, fail-closed page bound, raw response retention, bracketed account identity, and offline cursor replay | Lifecycle mapping with a current-contract endpoint adaptation; pinned Java reads Nitro spread trades while Reap certifies regular strategy fills |
-| `OkxNitroRestClient.getAllOpenOrders` follows 100-row Nitro spread pages by `endId`; `massCancel` accepts the spread endpoint result | Typed regular/algo/spread pending-order pages with strict cursor and duplicate-ID checks, bounded terminal-page proof, typed per-item algo cancellation, spread mass cancel, and authoritative post-cancel polling | Emergency-only current-contract hardening: Rust fails closed at a page bound and never treats cancel acceptance as final zero; this does not grant algo/spread mutation to live Chaos |
+| No algo-order or exchange-spread mutation is reached by the pinned Chaos/iarb2 call path; generic `ExecAlgo` machinery is outside the parity scope | A per-account live sentinel can only enumerate one seven-query-family algo domain and the spread domain. It requires an initial complete zero proof, scans every 15 seconds, expires proof after 30 seconds, and gives both read-only domains their own 60-second hard timeout and pacer | Rust fail-closed observation hardening: nonzero, expired, malformed, duplicate, unknown, pagination-failed, timed-out, or otherwise unverifiable state makes the global live gate leave `Ready`, targets regular reconciliation and Demo owned-regular cancellation to the affected account, and attempts to queue a typed critical event directing the operator to the separate emergency executable through an enabled alert sink; live cannot cancel algo/spread orders |
+| `OkxNitroRestClient.getAllOpenOrders` follows 100-row Nitro spread pages by `endId`; `massCancel` accepts the spread endpoint result | The separate emergency executable uses typed regular/algo/spread pages, strict cursor and duplicate-ID checks, bounded terminal-page proof, typed per-item algo cancellation, spread mass cancel, and authoritative post-cancel polling in independently paced workflows that each enforce the shared absolute per-account deadline | Emergency-only current-contract hardening: regular mitigation starts first, a domain failure cannot stop another domain, and every unverified domain keeps conjunctive `all_clear` false; cancel acceptance is never treated as final zero and this authority is absent from live Chaos |
 | `StaleOrderUpdateSafeguard` and `GatewayOrderStatsSafeguard.BookTotalPendingOrder` | Per-order submit-to-private-state and cancel-to-terminal-state deadlines, cancel retry, account block, and full REST reconciliation | Equivalent fail-closed intent with explicit OKX REST/private-state convergence |
 | `PositionGatewaySafeguard.OrsFillDelayToPositionUpdate` and the fill-derived position reconciler | Per-fill derivative-position or spot-currency convergence deadline plus monotonic rows, full REST comparison, tombstone repair, and second-pass confirmation | Equivalent fail-closed intent; Rust uses an explicit post-fill deadline rather than Java's two-cycle timestamp-difference check |
 | `PositionGatewaySafeguard.PosnMgnModeMismatch` | Required OKX `mgnMode` on websocket/REST positions, configured-mode bootstrap/runtime enforcement, and reconciliation comparison | Equivalent fail-closed intent; Rust aborts the live lifecycle instead of pausing inside a separate gateway process |
@@ -370,13 +380,15 @@ ownership reference rather than claiming file-format parity.
 `reap-fault` has no Java strategy counterpart and is not a parity claim. It is a
 separate demo test process built to exercise the mapped connectivity behavior:
 `OkxNitroL2SubscriberGroupFactory` and `AbstractOkxNitroL2Subscriber` market-data
-recovery, `OkxNitroBatchSubscribeManager` subscription lifecycle, and the eight
-`OkxNitroOrderSessionKeeper`/`OkxNitroOrderClient` command-session loss path. The
-routed Rust config gives order commands their own loopback endpoint while normal
-configs still share the private endpoint. This preserves the Java-inspired
-transport roles and lets one campaign disconnect public, private-state, or order
-traffic independently; the stronger typed injector artifact and loopback-only
-upstream policy are Rust testing controls.
+recovery, `OkxNitroBatchSubscribeManager` subscription lifecycle, and the
+`OkxNitroOrderSessionKeeper`/`OkxNitroOrderClient` command-session loss
+semantics. The pinned eight-session topology remains solely a Java connectivity
+reference; the routed Rust demo exercises its one plan-derived nonempty command
+lane through a dedicated loopback endpoint while normal configs still share the
+private endpoint. This preserves the Java-inspired transport roles and lets one
+campaign disconnect public, private-state, or order traffic independently; the
+stronger typed injector artifact and loopback-only upstream policy are Rust
+testing controls.
 
 The proxy's scenario bindings preserve the same ownership boundaries. Dropping
 an exchange-to-client private `orders` frame exercises the convergence deadline
@@ -442,8 +454,12 @@ The pinned Java stop path changes engine state and invokes per-entity
 rate-limit debounce. Rust preserves normal in-process cancellation but does not
 depend on it for the incident path: the separate command arms the exchange
 regular and spread deadmen, strictly enumerates regular, algo, and spread orders
-for the selected account, cancels every domain, and proves all three zero after
-the trigger horizon. This is intentionally broader than strategy-owned Java
+for the selected account, starts regular mitigation first, and then advances
+all three domains independently with separate pacing and progress under one
+absolute per-account deadline. Each domain enforces that deadline independently,
+must prove zero after the trigger horizon, and participates in conjunctive
+`all_clear`; a failed or unverified domain cannot be hidden by another domain's
+valid evidence. This is intentionally broader than strategy-owned Java
 entities. At the pinned
 revision, `OkxNitroOrderClient` also rejects new sends with `REQUEST_BLOCKED`
 while its websocket state is not `CONNECTED`; on order-session disconnect it

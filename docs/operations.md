@@ -4,6 +4,13 @@
 cannot authorize a new order. `reap live` owns the implemented OKX lifecycle;
 production order entry remains intentionally unavailable.
 
+Goal A's completed capability-boundary work (Phases 0 through 5) does not make
+this repository production ready. It was verified without credentials or
+authenticated exchange traffic. The Chaos behavior reference remains the clean
+`../imm-strategy` checkout at
+`b6b120c7b7c466d8431bf082f3229328c5d7b2ae`; broader Java gateway features do
+not widen the live Chaos authority described here.
+
 ## Public Data Capture
 
 `reap capture` is a separate composition root. It opens only the configured
@@ -1141,28 +1148,37 @@ outside source control.
    authoritative REST account replacement is also persisted as a critical
    account-scoped `account_snapshot`. It then requires
    clean account-scoped reconciliation.
-9. In demo mode it arms OKX Cancel All After for every account before starting
-   that account's private feed or order task.
-10. It starts redundant public plans and isolated orders, account, and positions
-   sockets for every account. The dedicated fills channel is optional for
-   eligible fee tiers; order-channel fills remain canonical. Transport
-   acknowledgements alone are not private readiness: account and positions must
-   each deliver a real data payload. Every transition of that complete private
-   state to ready invalidates the earlier reconciliation and requires a fresh
-   REST order/fill/balance/position check, closing the bootstrap-to-stream
-   subscription window.
-11. It waits for a contiguous sequenced book for every instrument and a
+9. In demo mode it arms regular OKX Cancel All After only for accounts with a
+   nonempty command lane in the resolved Chaos connectivity plan, before
+   starting that account's private feed or command task. A reference-only
+   account constructs observation roles but no mutation, order-command, or
+   Cancel All After role.
+10. It materializes only the plan's public subscriptions: each book has two
+    named sequencing/deduplication/recovery replicas, while trades and
+    reference inputs have one. For each account it opens one packed private
+    state socket carrying the required orders, account, positions, and optional
+    fills channels. Order-channel fills remain canonical. Transport
+    acknowledgements alone are not private readiness: account and positions
+    must each deliver a real data payload. Every transition of that complete
+    private state to ready invalidates the earlier reconciliation and requires
+    a fresh REST order/fill/balance/position check, closing the
+    bootstrap-to-stream subscription window.
+11. It starts the read-only forbidden-order sentinel for every account and
+    requires an initial complete zero proof across all seven pending algo query
+    families and pending spread orders. The global live gate cannot become
+    ready while any account's proof is missing or invalid.
+12. It waits for a contiguous sequenced book for every instrument and a
     complete, healthy, post-connect reconciled private stream for every account.
-12. It also waits for every configured stablecoin guard to receive a fresh,
+13. It also waits for every configured stablecoin guard to receive a fresh,
     internally consistent index value within its downside threshold.
-13. Live configuration must set
+14. Live configuration must set
     `strategy.reference_data_stale_threshold_ms`. Startup waits independently
     for every derived index, swap-funding, derivative-mark, and instrument
     price-limit observation, checking exchange source time against host receive
     time. Activity on one reference socket cannot refresh another. A stale
     source degrades readiness, blocks entry, and immediately cancels canonical
     working orders; strategy timers independently withdraw stale quotes.
-14. Only phase `ready`, writable storage, healthy risk, and explicit
+15. Only phase `ready`, writable storage, healthy risk, and explicit
     `--mode demo --confirm-demo` permit a new order.
 
 Live validation rejects `strategy.master_strategy` and
@@ -1172,11 +1188,12 @@ settings; accepting only their static flags would weaken live stop behavior.
 
 ## Private Stream Health
 
-- Orders, account, positions, and optional fills use isolated sockets. Every
-  socket must acknowledge its exact unique serialized argument plan; duplicate
-  acknowledgements do not advance readiness, and malformed or unexpected
-  acknowledgements force reconnect. Any disconnect immediately emits
-  account-scoped `PrivateStreamStale` and blocks new orders. Acknowledged-ready
+- One plan-derived authenticated state socket per account packs orders,
+  account, positions, and optional fills. It must acknowledge the exact unique
+  serialized argument set; duplicate acknowledgements do not advance
+  readiness, and malformed or unexpected acknowledgements force reconnect.
+  Any disconnect invalidates the packed state round, immediately emits
+  account-scoped `PrivateStreamStale`, and blocks new orders. Acknowledged-ready
   and disconnected transitions wait for bounded status capacity and are never
   silently dropped. Raw payloads do not emit redundant status-queue heartbeats.
 - The [OKX API guide](https://www.okx.com/docs-v5/en/) documents account and
@@ -1232,6 +1249,51 @@ settings; accepting only their static flags would weaken live stop behavior.
 - Repair is not proof of agreement. A dirty pass keeps the account degraded and
   retries; only a subsequent clean full-state pass restores the reconciliation
   gate. This intentionally favors a brief false stop over trading stale state.
+
+## Forbidden-Order Zero Proof
+
+Live Chaos never places, amends, or cancels algo or spread orders. Its separate
+`ForbiddenOrderObserver` has read-only pending-page methods and no mutation or
+submit method. For each configured account, it proves zero across these exact
+surfaces:
+
+- `conditional,oco`, `chase`, `trigger`, `move_order_stop`, `iceberg`, `twap`,
+  and `smart_iceberg` pending algo queries; and
+- pending Nitro spread orders.
+
+The first scan starts during startup and every account's scan must complete
+successfully before the global live gate can become ready. A successful proof
+is valid for 30 seconds. Recurring scans start every 15 seconds, no later than
+half the proof age, and the algo and spread scans each have their own 60-second
+timeout and request pacer. The algo scan covers its seven query families inside
+that one domain budget. Slow scans overlap instead of delaying the fixed start
+cadence; the default timeout/interval ratio allows at most five tagged
+generations, all sharing the two domain pacers. Failure or expiry makes every
+already-started zero completion stale, and a bounded coalescing outbox keeps
+scan starts progressing under event-channel backpressure. Proof expiry is
+evaluated while scans are still in flight, so a slow endpoint cannot extend
+placement authority. Regular Cancel All After, canonical regular cancellation,
+and regular reconciliation retain priority over these read-only scans.
+
+Any nonzero result or inability to prove zero fails closed. This includes an
+endpoint error or timeout, malformed response, unknown algo-order enum,
+duplicate order ID, repeated cursor, nonterminal pagination at the configured
+page cap, and an expired proof. Reap records an account-scoped fault; the
+global live gate immediately leaves `Ready` and blocks all new regular
+placement. Reap queues a full regular reconciliation and, when the Demo
+mutation role exists, cancellation of the affected account's canonical owned
+regular orders. It then creates a typed critical `forbidden_order_sentinel`
+event whose message explicitly tells the operator to run the separate
+`reap-emergency` executable; external delivery requires the configured alert
+sink to be enabled. The live process never invokes that executable and never
+widens its own authority to algo/spread mutation.
+
+Recovery requires both a fresh complete forbidden-domain zero proof and a clean
+regular reconciliation, in either completion order. A successful scan alone
+does not revalidate the reconciliation that the failure invalidated. Inspect
+and archive the typed alert, run `reap-emergency` when exposure is present or
+zero remains unverifiable, and keep demo entry disabled until both gates
+recover.
 
 ## Order-State Convergence
 
@@ -1533,10 +1595,10 @@ strategy config or process is unhealthy.
 This command belongs to the isolated emergency plane defined by
 [chaos-connectivity-boundary.md](chaos-connectivity-boundary.md). Its
 regular/algo/spread authority is deliberately broader than live Chaos and MUST
-NOT be used as evidence that the strategy needs those mutation APIs. The
-[refactor plan](chaos-connectivity-refactor-plan.md) moves that authority out
-of the live dependency surface and makes the three domain workflows progress
-independently.
+NOT be used as evidence that the strategy needs those mutation APIs. That
+authority is outside the live dependency and composition surface. The regular,
+algo, and spread workflows own independent progress, pacing, and failure
+handling.
 
 The command covers all documented pending-order domains on each selected OKX
 account, including regular symbols not configured in the strategy: regular
@@ -1586,14 +1648,31 @@ VERIFICATION=/var/lib/reap/live/btc-demo/emergency-cancel-verification-$(date -u
 for demo. `--all-configured-accounts` is available only when every configured
 account's producers have been stopped and replaces all `--account` arguments.
 
-4. For each account, the command samples exchange time, arms regular and spread
-   Cancel All After, then exhaustively enumerates regular, algo, and spread
-   orders. It cancels regular orders in batches of at most 20, algo orders in
-   batches of at most 10, invokes spread mass cancel, and re-enumerates every
-   domain until all are zero after the deadman trigger horizon. Every page,
-   cancel, pacing delay, and final query shares one absolute account timeout.
-   Cancel acknowledgements are only request acceptance; the final REST zero
-   snapshot is authoritative.
+4. For each account, the command samples exchange time, starts the regular
+   workflow first, and signals its kickoff immediately before attempting the
+   first regular Cancel All After request, or after determining that request
+   cannot be issued. Regular enumeration continues in either case. Only after
+   that kickoff do the algo and spread workflows start concurrently. Regular
+   cancellation therefore begins without waiting for any of the seven algo
+   queries or for spread connectivity.
+   Regular orders are cancelled in batches of at most 20; algo orders in
+   batches of at most 10; spread uses its own Cancel All After plus mass cancel.
+   Each domain owns its request pacer, progress, incidents, and initial/final
+   enumeration pair, and independently enforces one fixed absolute deadline
+   derived from the configured account timeout and account-start anchor. One
+   domain does not consume another domain's sequential request budget or stop
+   its progress. A regular, algo, or spread failure is retained without
+   cancelling the other workflows.
+
+   Each workflow continues enumeration/cancellation until it has an
+   authoritative zero snapshot after the deadman trigger horizon or the shared
+   deadline is reached. Cancel acknowledgements prove only request acceptance.
+   Domain results are merged deterministically in regular, algo, then spread
+   order; aggregate enumeration counters are sums of those owned results.
+   `all_clear` is the AND of regular and spread deadman evidence and all three
+   independently verified final-zero results. Any uncovered, timed-out, or
+   nonzero domain keeps `evidence_complete`/`all_clear` non-passing even when
+   another domain succeeded.
 5. Both output paths are owner-only create-new files, synced with their parent
    directory before final status. `verify-emergency-cancel` rejects symlinks and
    oversized files, hashes the exact config/report bytes, rejects unknown JSON
@@ -1808,15 +1887,17 @@ only after review.
 - Bootstrap and the first account safety task poll the official
   [OKX system-status endpoint](https://www.okx.com/docs-v5/en/#status-get-status). Defaults
   match pinned Java: a 10-second interval and 60-second lead. Relevant
-  unified-account trading, account-batch, product-batch, spread, and `99`
-  events for the configured demo/production environment trigger normal
-  fail-closed cleanup. Websocket, block, bot, and copy-trading events retain
-  Java's non-blocking treatment. A failed or malformed status response is
-  fatal. OKX permits one status request per five seconds, which configuration
-  validation enforces. One Reap process polls once regardless of its account
-  count. Operators running multiple processes from one source IP must
-  coordinate their polling intervals so the aggregate request rate remains
-  within that limit.
+  services are derived from the resolved Chaos plan. For the matching
+  demo/production environment, unified system, and guard window, WebSocket,
+  Trading, Trading Accounts, Trading Products, and Other/ambiguous (`99`)
+  events trigger normal fail-closed cleanup. Block Trading, Trading Bot,
+  Spread Trading, and Copy Trading are outside the regular Chaos plan and do
+  not block it; in particular, spread-only maintenance is irrelevant. An
+  unknown enum or failed/malformed status response remains fatal. OKX permits
+  one status request per five seconds, which configuration validation enforces.
+  One Reap process polls once regardless of its account count. Operators
+  running multiple processes from one source IP must coordinate their polling
+  intervals so the aggregate request rate remains within that limit.
 - After each successful periodic clock check, the safety task fetches
   authenticated account configuration and compares the typed identity, API-key
   label/permissions/IP bindings, account and position modes, STP setting, and
@@ -1856,9 +1937,12 @@ only after review.
   REST request timeouts plus one heartbeat interval, so delayed
   clock/config/status checks cannot consume the last armed Cancel All After
   window.
-- In demo mode the safety task refreshes Cancel All After independently of the
-  order queue and strategy loop. `cancel_all_after_heartbeat_ms` must respect the
-  endpoint rate limit and remain below `cancel_all_after_timeout_secs`.
+- In demo mode, only an executing account with a planned nonempty command lane
+  constructs the regular safety role and refreshes Cancel All After,
+  independently of the order queue and strategy loop. A reference-only account
+  has neither that role nor an exchange deadman heartbeat.
+  `cancel_all_after_heartbeat_ms` must respect the endpoint rate limit and
+  remain below `cancel_all_after_timeout_secs`.
 - Cancel All After is account-wide. Use a dedicated OKX account/subaccount and
   do not run unrelated strategies or duplicate runtime credentials against it.
 - A failed deadman heartbeat is fatal. The last armed exchange timer remains in
@@ -2036,12 +2120,13 @@ require their independent procedures and artifacts.
 | Public sequence gap | Book recovering; new orders blocked | Obtain a fresh snapshot and replay contiguous buffered deltas |
 | Public feed stale | Symbol blocked; live orders cancelled | Restore at least one healthy feed and verify sequence continuity |
 | Private stream stale | Account blocked; live orders cancelled | Reconnect, REST reconcile orders/fills/balances/positions, then emit recovery |
-| Order-command websocket stale | Account blocked; live orders cancelled; prior reconciliation invalidated | Reconnect every command session and require a new clean REST reconciliation before entry |
+| Order-command websocket stale | Account blocked; live orders cancelled; prior reconciliation invalidated | Reconnect every planned nonempty command lane and require a new clean REST reconciliation before entry |
 | Submit/cancel order-state convergence timeout | Account blocked; active orders cancelled; expired cancel retried; full reconciliation requested | Suppress each orders-channel transition independently, then verify REST repair and no early readiness recovery |
 | Fill/account-state convergence timeout | Account blocked; live orders cancelled; full reconciliation requested | Inspect the missing symbol/currency target and private-channel latency, then require authoritative repair and a clean pass |
 | Position scope or margin-mode violation | Bootstrap/runtime abort; demo cleanup attempts cancel/reconcile and retains the deadman unless safe | Keep entry disabled; close/correct the unmodeled position or mode outside Reap, then require a clean bootstrap |
 | Forced-repayment indicator at/above limit | Bootstrap/runtime abort; demo cleanup attempts cancel/reconcile and retains the deadman unless safe | Keep entry disabled; reduce borrowing/risk outside Reap and require all currencies below limit plus a clean bootstrap |
 | Reconcile drift | Account blocked; live orders cancelled | Inspect the recorded full-state differences and require a later clean pass before recovery |
+| Forbidden algo/spread orders are nonzero, unverifiable, or the zero proof expires | An account-scoped fault makes the global live gate leave `Ready`, blocking all new placement; the affected account's regular reconciliation is invalidated and requested; Demo dispatches cancellation of its canonical owned regular orders; the runtime attempts to queue a typed critical event to an enabled alert sink | Keep entry disabled, inspect the exact timeout/parse/enum/duplicate/pagination/nonzero cause, run the separate emergency procedure when exposure is present or zero remains uncertain, then require a fresh complete zero proof and a clean regular reconciliation in either completion order |
 | Stablecoin reference missing/stale/conflicting/depegged | New entry blocked immediately; durable global kill and live-order cancellation after debounce | Verify both redundant index routes and an independent venue reference; use the stopped-process latch-clear procedure after a sustained breach |
 | Risk breach | Durable global kill active; live orders cancelled | Reduce exposure externally if needed, diagnose, and follow the stopped-process latch-clear procedure; restart alone does not clear it |
 | Manual account kill | Durable account route latch; its instruments are removed from pricing/hedging and its live orders are cancelled | Reconcile the account and dependent exposure; restart alone does not clear it |
@@ -2217,8 +2302,9 @@ cleartext only with `environment = "demo"` for deterministic tests. Loopback
 cannot be mixed with official endpoints and is ineligible for
 production-transition evidence.
 
-The live runtime shares one connection-attempt pacer across its public feed and
-all account-private feeds. It covers initial connection, reconnect, and book
+The live runtime shares one connection-attempt pacer across its plan-derived
+public feed sockets, one packed private-state socket per account, and each
+nonempty order-command lane. It covers initial connection, reconnect, and book
 recovery handshakes. The default 400 ms interval is intentionally stricter than
 the documented three-requests-per-second/IP boundary; official profiles reject
 less than 334 ms. The readiness timeout includes this serialized startup time.
@@ -2265,11 +2351,16 @@ regions must match; a Global demo file cannot certify an EEA, US/AU, or Turkey
 candidate.
 
 Format-3 transition policy also requires both files to enable the operator
-service, fatal external alerts, and the production host-guard floors; configure
-at least two redundant public connections per subscription and two independent
-order-command sessions, use an absolute connection-attempt pacer path, and
-declare exact `read_only` plus `trade` API-key permissions with required IP
-binding for every account. The
+service, fatal external alerts, and the production host-guard floors. Their
+resolved connectivity must retain two named recovery replicas for each book,
+one replica for each trade/reference input, and exactly one nonempty command
+lane per executing demo account; the production-side observe plan constructs
+no mutation lane. During the migration window,
+`public_connections_per_subscription` and `order_websocket_sessions` are only
+maximum caps on those derived counts, never requests to open extra sockets.
+Both files must use an absolute connection-attempt pacer path and declare exact
+`read_only` plus `trade` API-key permissions with required IP binding for every
+account. The
 checked-in demo example intentionally leaves external alerts and host guarding
 disabled and uses a repository-relative pacer, so it must be copied, deployed,
 and exercised before it can be the exact evidence-bearing demo config.
@@ -2279,8 +2370,9 @@ declared credential policy. The separately required schema-3 account
 certification replays the authenticated `perm`, `ip`, UID, and main-UID evidence
 for the exact production config. Neither artifact proves deployment-secret
 separation, human custody, or runtime behavior. Archive both, but do not treat
-them as production authorization. Production order entry remains unavailable
-until the separate readiness gates pass.
+them as production authorization. Production order entry remains unavailable.
+Passing the separate readiness gates produces evidence but cannot enable that
+mode.
 
 The transition report and research-deployment report answer different questions.
 The transition report proves that the evidence-bearing demo config and proposed
@@ -2554,10 +2646,10 @@ activates the kill switch, dispatches every canonical cancel, and requires a
 post-cancel REST reconciliation result for every account. Only zero active
 canonical orders plus clean order/fill/balance/position reconciliation permits
 task teardown.
-The runtime then explicitly disables Cancel All After unless safety-latch
-durability failed. If any part of shutdown is unresolved or latch durability is
-uncertain, it leaves the exchange timer armed and terminates the safety task so
-the last timeout can expire.
+The runtime then explicitly disables each Cancel All After timer it armed unless
+safety-latch durability failed. If any part of shutdown is unresolved or latch
+durability is uncertain, it leaves the exchange timer armed and terminates the
+safety task so the last timeout can expire.
 
 The `runtime.shutdown_timeout_ms` deadline covers cancel queueing,
 reconciliation, and event processing. The separate

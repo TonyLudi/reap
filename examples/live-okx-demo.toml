@@ -111,7 +111,7 @@ max_subscriptions_per_socket = 100
 # book replicas and one replica for every trade/reference subscription; this
 # value cannot create replicas.
 public_connections_per_subscription = 2
-# Deprecated per-account migration ceiling only. The sample plan opens one
+# Deprecated per-account migration ceiling only. The sample Demo plan opens one
 # nonempty command lane for main; this historical value does not open eight
 # sessions.
 order_websocket_sessions = 8
@@ -133,8 +133,10 @@ order_websocket_ack_timeout_ms = 5000
 safety_latch_sync_timeout_ms = 2000
 max_exchange_clock_skew_ms = 250
 exchange_clock_check_interval_ms = 30000
-# Match pinned Java connectivity polling and safeguard lead time. Relevant OKX
-# unified-account maintenance fails bootstrap or starts fail-closed shutdown.
+# Match pinned Java connectivity polling and safeguard lead time. The resolved
+# Chaos plan admits only its required regular products/services: spread-only
+# maintenance is irrelevant, while relevant or ambiguous unified-account
+# maintenance fails bootstrap or starts fail-closed shutdown.
 exchange_status_check_interval_ms = 10000
 exchange_status_lead_ms = 60000
 # Sweep every configured instrument's authenticated current metadata and fee
@@ -148,6 +150,12 @@ cancel_all_after_heartbeat_ms = 1000
 ambiguous_submit_grace_ms = 10000
 order_state_convergence_timeout_ms = 5000
 fill_state_convergence_timeout_ms = 5000
+# The resolved Chaos Demo plan also owns a read-only sentinel for all seven
+# pending algo families plus pending spread orders. It requires an initial zero proof,
+# scans every 15 seconds, expires proof after 30 seconds, and gives each domain
+# a 60-second hard timeout. Slow generations overlap on shared domain pacers and
+# are bounded at five. Those are plan-owned constants, not new config knobs;
+# this existing cap bounds sentinel and regular-reconciliation pages.
 max_order_reconciliation_pages = 64
 max_fill_reconciliation_pages = 20
 submit_requests_per_window = 50

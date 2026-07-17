@@ -5,26 +5,28 @@ decision model and a fail-closed OKX demo composition are implemented. The
 runtime has not completed a credentialed demo soak and must not be treated as a
 production trading process.
 
-The current broad connectivity implementation is being narrowed under the
-[Chaos connectivity boundary](chaos-connectivity-boundary.md) and its
-[refactor plan](chaos-connectivity-refactor-plan.md). Completing that refactor
-is a design prerequisite, not proof of exchange certification or production
-approval.
+Goal A (Phases 0–5 and its Tranche A gate) now enforces the
+[Chaos connectivity boundary](chaos-connectivity-boundary.md) under the pinned
+`../imm-strategy` reference. The Phase 6–9 structural decomposition in the
+[refactor plan](chaos-connectivity-refactor-plan.md) remains separate follow-on
+work. Goal A is a design and authority milestone only: it grants neither demo
+trading approval nor production approval.
 
 ## Current Gap
 
 | Area | Current state | Trading impact |
 | --- | --- | --- |
 | Iarb2 decision model | Covered for the documented OKX parity boundary | Not a blocker |
+| Connectivity authority | Goal A resolves a secret-free mode-specific Chaos plan; all modes construct only plan-owned observation, Demo adds one nonempty command lane per executing account and typed regular execution, and emergency mutation remains separately composed | Least-authority boundary enforced; this is not credentialed exchange evidence, demo approval, or production approval |
 | Deterministic backtest/data | Shared strategy code, immediate pending-order registration, arrival-time scheduler, Java-mapped class/symbol empirical latency profiles with sampled-usage reporting, versioned target-host/live collectors, deterministic calibration artifacts bound into production research, conservative depth/queue/trade capacity controls, event-clock drawdown/exposure/inventory metrics, per-currency depeg-sensitive valuation, exact private-fill fee currency plus explicit simulated-fee counts, fee/turnover attribution, authenticated recent-fill and account-wide bill collection with verified offline trade/fee/funding reconciliation, journal-backed derivative close-PnL reconstruction, bracketed bill-to-cash continuity, authenticated point-in-time cash/zero-liability/equity-conversion collection and offline verification, forecast/realized funding separation with event-time linear/inverse settlement, manifest-driven chronological walk-forward selection and stress gates with exact independent report reconstruction, credential-free redundant public capture, exact provenance, streaming analysis, and raw/normalized replay | The evidence pipeline is implemented but execution/accounting assumptions remain uncalibrated; needs sustained full-depth and currency-index capture, a passing credentialed target-host/demo latency artifact, complete funding intervals, target-tier fee calibration, real passing target-account and fill/bill economic artifacts including authoritative position-basis/close and opening/closing cash samples, empirical cash-spot bill semantics, reviewed total-equity attribution, and production-candidate reports before capital decisions |
 | Feed components | Plan-derived redundant books and single-replica trade/reference feeds, one packed private-state socket per account, transport/state freshness separation, independently aged index/funding/mark/price-limit sources, account-plus-positions health rounds, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
-| Order components | Event-loop client IDs/registration, exchange/client acknowledgement binding, account-scoped immutable private identity, semantic duplicate suppression across changed exchange timestamps, exchange-side place-request expiry, one nonempty plan-derived command lane per executing account, constant-time per-underlying FIFOs, shared account pacing, independent REST reconciliation, shutdown command flushing, monotonic private reduction, submit/cancel state-convergence deadlines, typed position margin mode, and ambiguity handling are composed | Needs demo exchange fault evidence |
-| Runtime risk | Instrument models, authoritative startup positions, authenticated current instrument-rule, hard single-order maximum, and fee-group checks, final pre-trade exchange-limit enforcement, typed upcoming-change lead, active-order count/notional ceilings, rolling submit-rejection and zero-fill IOC-cancel circuits, terminal strategy-halt promotion, position scope/mode enforcement, zero-liability enforcement, periodic authenticated account-config drift detection, forced-repayment blocking, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock and announced-maintenance checks, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed instrument/fee/deadman/depeg/convergence evidence |
-| Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, strict bounded soak reports, documented region/environment endpoint tuples, an exact demo-to-production config transition verifier, and a source-rebuilding cross-gate production evidence bundle | Demo-capable; production entry intentionally unavailable, and no passing target-host bundle exists |
+| Order components | Event-loop client IDs/registration, exchange/client acknowledgement binding, account-scoped immutable private identity, semantic duplicate suppression across changed exchange timestamps, exchange-side place-request expiry, one nonempty plan-derived Demo command lane per executing account, constant-time per-underlying FIFOs, shared account pacing, independent REST reconciliation, shutdown command flushing, monotonic private reduction, submit/cancel state-convergence deadlines, typed position margin mode, and ambiguity handling are composed; Validate and Observe construct no command lane | Needs demo exchange fault evidence |
+| Runtime risk | Instrument models, authoritative startup positions, authenticated current instrument-rule, hard single-order maximum, and fee-group checks, final pre-trade exchange-limit enforcement, typed upcoming-change lead, active-order count/notional ceilings, rolling submit-rejection and zero-fill IOC-cancel circuits, terminal strategy-halt promotion, position scope/mode enforcement, zero-liability enforcement, periodic authenticated account-config drift detection, forced-repayment blocking, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock and plan-relevant maintenance checks, a per-account read-only seven-algo-family plus spread zero sentinel, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed instrument/fee/deadman/depeg/convergence/sentinel evidence |
+| Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, strict bounded soak reports, documented region/environment endpoint tuples, an exact demo-to-production config transition verifier, and a source-rebuilding cross-gate production evidence bundle | Controlled demo mechanics exist, but Goal A approves no demo campaign; production entry remains unavailable and no passing target-host bundle exists |
 | Instrument/account bootstrap | Account instruments/config/balance/positions are typed; authenticating API-key permissions and IP bindings are retained; exact configured scope is enforced with `withdraw` forbidden and production trade keys IP-bound; economic snapshots preserve borrowing flags, liabilities, interest, and margin-loan fields; live spot and borrow limits are cash-only/zero; enabled borrowing, missing applicable evidence, nonzero liabilities, margin positions, and nonzero positions outside configured ownership/mode fail before strategy/risk application | Needs a passing artifact from the real target account and host; tooling alone is not evidence |
 | Startup/restart gate | Executable phase state, engine-consumed account-snapshot invariant, mandatory independently fresh strategy references, immediate canonical cancellation on reference-readiness loss, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, durable latch restore, authoritative account repair, second-pass clean REST reconciliation, and read-only journal-bound deadman-expiry certification | Needs process-kill demo evidence; tooling alone is not evidence |
 | Event-loop profile | Allocation-aware raw OKX parity benchmark covers redundant wire input through strategy/risk and storage-record construction | Needs target-host capture and exchange-latency validation |
-| Operator control and alerts | HMAC-authenticated local controls use fsynced write-ahead latches; OKX Cancel All After is maintained independently; a separate CLI can arm regular and spread deadmen, exhaustively cancel regular/algo/spread orders account-wide, and prove every domain zero with offline exact-config verification; another read-only CLI can prove regular-order source `20` after controlled process death | Must exercise target alert routing, regular-order deadman expiry, and the account-wide independent cancel procedure on the target account |
+| Operator control and alerts | HMAC-authenticated local controls use fsynced write-ahead latches; OKX Cancel All After is maintained independently; typed forbidden-state events direct an enabled alert sink to a separate CLI whose regular-first, independently paced regular/algo/spread workflows each enforce the shared absolute per-account deadline and prove every domain zero with conjunctive `all_clear`; another read-only CLI can prove regular-order source `20` after controlled process death | Must exercise target alert routing, sentinel failure/recovery, regular-order deadman expiry, and the account-wide independent cancel procedure on the target account |
 | Process/host controls | Canonical journal ownership is exclusively locked before recovery or network setup; live and public capture share Linux disk, memory, and kernel-clock preflight/periodic checks; all official WebSocket handshakes on one host reserve through one owner-only process-shared pacer; capture schema 5 binds binary/host evidence and an exact process-global persisted-frame ordinal; hardened systemd templates encode mode-specific restart policy and bounded evidence capture | Must be installed, enabled, thresholded, monitored, and fault-tested on the target host; hosts sharing a NAT need isolated egress or an external IP-wide pacer |
 | Demo fault injection | A loopback-only proxy independently routes OKX demo REST, public, private-state, and order-command traffic; strict owner-local commands inject disconnects, matched frame drops, and matched REST responses; create-new injector/run artifacts bind proxy config and pinned Java provenance, and the live fault matrix validates supported typed roles | Tooling is implemented and credential-free forwarding smokes passed, but no credentialed isolated campaign or target-host acceptance evidence exists |
 | Build/supply chain | Rust `1.95.0` is pinned; least-privilege CI checks formatting, all-target lint, all workspace tests, a locked release build, and RustSec advisories; Cargo and Actions updates are proposed weekly | CI must remain green and dependency updates reviewed, but this does not replace credentialed exchange or target-host evidence |
@@ -40,7 +42,11 @@ approval.
 3. The runtime starts all public and account-scoped private sockets, obtains
    sequenced books, fetches initial balances and positions, and reconciles open
    orders and recent fills before declaring readiness. It also rejects excessive
-   exchange-clock skew.
+   exchange-clock skew. Every account must additionally complete the
+   plan-owned, read-only seven-algo-family plus spread zero proof before
+   readiness; the 15-second recurring scan, 30-second proof age, and independent
+   60-second domain timeouts fail closed without granting live cancellation of
+   either unsupported domain.
 4. Accepted `NewOrder` intents receive a client ID and canonical `PendingNew`
    synchronously, then route through the account gateway. Cancels are deduplicated,
    every place request carries an OKX `expTime`, and every private
@@ -85,13 +91,19 @@ approval.
     those failures fatal.
 13. A strategy-independent emergency command parses only exchange/account safety
     settings, refuses implicit account selection, requires producer-stop and
-    account-wide confirmations, arms regular and spread Cancel All After,
-    exhaustively pages and cancels every regular, algo, and spread pending order,
-    and verifies all domains zero after the trigger horizon. Its create-new
-    schema-2 report
+    account-wide confirmations, and starts regular mitigation before releasing
+    the algo and spread workflows. Regular, algo, and spread each own an
+    independent pacer, progress record, and final-zero proof, and independently
+    enforce the shared absolute per-account deadline; one slow or failed domain
+    cannot consume another domain's sequential request budget. The command arms
+    regular and spread Cancel All After, exhaustively pages and cancels every
+    domain, and verifies each zero after the trigger horizon.
+    Its create-new schema-2 report
     binds the exact config file, executable, host, Java revision, matching
     pseudonymous exchange-account identity, selected-account coverage, and
-    bounded task failures before returning its final exit status. Its
+    bounded task failures before returning its final exit status. `all_clear`
+    is the conjunction of every domain and aggregate evidence invariant, so
+    partial valid evidence remains nonpassing. Its
     deterministic tests cover regular/algo/spread cancellation, a failed deadman,
     partial batch acknowledgement, hung REST transport, missing credentials,
     identity failure, and task loss.
@@ -638,13 +650,13 @@ approval.
     credentialed demo fault campaigns.
 60. The next source audit followed pinned Java
     `OkxNitroOrderClient.onOrderSessionDisconnected`, which immediately invokes
-    `cancelAll()`, through Rust's then-eight-session command transport and demo fault
-    proxy. Rust heartbeat status previously used awaited sends at both bounded
-    telemetry queues, so a stalled observer could stop a command session before
-    it processed shutdown or delivered the disconnect that triggers canonical
-    cancellation. Heartbeats are now best-effort at both boundaries, while
-    ready, disconnect, and fatal transitions remain lossless; the order-session
-    close uses the existing 5-second control-write deadline.
+    `cancelAll()`, through Rust's pre-Goal-A pooled command transport and demo
+    fault proxy. Rust heartbeat status previously used awaited sends at both
+    bounded telemetry queues, so a stalled observer could stop a command session
+    before it processed shutdown or delivered the disconnect that triggers
+    canonical cancellation. Heartbeats are now best-effort at both boundaries,
+    while ready, disconnect, and fatal transitions remain lossless; the
+    order-session close uses the existing 5-second control-write deadline.
 
     The fault proxy also had unbounded local/upstream websocket handshakes and
     forwarding writes, and protocol `?` returns could bypass active-connection
@@ -918,6 +930,57 @@ approval.
     `708f299f4b9ca3a21bec14d5eba9ef5b395d184d62e0f714be2d4aa37064b62b`.
     No target-host credential artifact exists, and production order entry is
     still unavailable.
+68. Goal A (Phases 0–5 plus the Tranche A verification gate) now enforces the
+    normative Chaos connectivity boundary against the clean sibling
+    `../imm-strategy` checkout at
+    `b6b120c7b7c466d8431bf082f3229328c5d7b2ae`. The secret-free Demo plan owns
+    every live channel, authenticated read, maintenance classification, and
+    regular mutation. Public replicas are requirement-specific, compatible
+    private channels are packed once per account, and each executing account
+    has one plan-derived nonempty command lane. Validate and Observe construct
+    no command lane. The pinned Java eight-session topology remains solely a
+    connectivity reference. Typed Quote, Hedge, and CancelOwned policy plus
+    role-specific private wire adapters prevent live Chaos from reaching
+    generic signing, arbitrary requests, amend, or algo/spread mutation.
+
+    Every live account now requires an initial read-only zero proof across all
+    seven pending algo query families and pending spread orders. The sentinel
+    scans every 15 seconds, ages proof out after 30 seconds, and bounds each
+    domain at 60 seconds. Nonzero, expired, malformed, duplicate, unknown,
+    pagination-failed, timed-out, or otherwise unverifiable state makes the
+    global live gate leave `Ready`, targets regular reconciliation to the
+    affected account, and, in Demo, starts its canonical owned-regular
+    cancellation. A typed critical event directs the operator to the separate
+    emergency executable when the configured alert sink is enabled. The
+    observer has no cancel or submit authority.
+
+    Emergency regular mitigation is issued first; regular, algo, and spread
+    then advance with independent pacers, progress, and final-zero proofs while
+    independently enforcing one shared absolute per-account deadline. Report
+    merging remains deterministic and `all_clear` remains conjunctive, so a
+    verified domain cannot hide an unverified one. The ordered-intent fixture
+    SHA-256 remains
+    `d95fa7f121e2e8c402c8108cf9fefb7c7d7b3dbd2b9742c58c234a521f0ee0ec`,
+    the canonical pretty-backtest SHA-256 remains
+    `38acf9f5e0c310f2ec5528974beffadf4c1a7f84d46efa8d9664ee7051e84691`,
+    and the checked sample Demo-plan SHA-256 is
+    `6771c97a373f12f77093624ea4b2914d867aae6a710eddadde925fc288fc6477`.
+    Journal schema 7, emergency report schema 2, live reports, evidence,
+    fixtures, and serialized order intents are unchanged; only the documented
+    backward-compatible connection-cap migration applies. The exact
+    credential-free gate is recorded in the
+    [Goal A handoff](chaos-connectivity-goal-a-handoff.md).
+
+    This is not demo or production approval. Required follow-on proof must
+    exercise the exact planned lane and packed private socket through
+    disconnect/recovery; distinguish spread-only from relevant or ambiguous
+    maintenance; inject sentinel nonzero, expiry, malformed/pagination, timeout,
+    alert-delivery, cancellation, reconciliation, and clean-recovery cases; and
+    hold or fail algo/spread emergency transports while regular mitigation
+    preserves its independent request/pacing budget within the shared absolute
+    per-account deadline. Archive passing live-fault and
+    `verify-emergency-cancel --require-pass` evidence from the credentialed
+    target account before reassessing demo readiness.
 
 ## Remaining Demo Gate
 
@@ -932,8 +995,10 @@ approval.
    with no reconciliation drift or critical storage backpressure. Use a bounded
    run with `--duration-secs <seconds> --output <create-new-report>
    --require-clean-soak` so the result is machine-verifiable. Confirm both
-   stablecoin references remain fresh and inject a transient guard failure
-   without creating a durable latch.
+   stablecoin references remain fresh, every account obtains its initial
+   forbidden-domain zero proof, and the recurring proof stays inside its
+   30-second age. Inject a transient guard failure without creating a durable
+   latch.
 3. Run minimal-size `demo` orders, then inject public, private, and order-command
    socket disconnects, process kill,
    deadman expiry, exchange-clock skew, IOC miss, partial fill, and REST
@@ -943,13 +1008,20 @@ approval.
    exercise order-state convergence, then suppress derivative position updates
    and each side of a spot balance update to exercise fill convergence. Verify
    cancel retry, `expTime`, and latch restoration from exchange/account
-   evidence. In one controlled process-death iteration, do not issue a cancel,
+   evidence. Separately inject forbidden-order nonzero, proof expiry,
+   malformed/duplicate/pagination failure, and algo/spread timeout responses;
+   require entry block, typed alert delivery, owned-regular cleanup, and fresh
+   zero-proof plus clean-reconciliation recovery. Exercise spread-only,
+   relevant, and ambiguous maintenance classification against the exact plan.
+   In one controlled process-death iteration, do not issue a cancel,
    wait for expiry, and archive a passing `certify-deadman-expiry` artifact plus
    `verify-deadman-certification --require-pass` result. In a separate forced-
    death iteration, exercise the independent emergency command and archive its
    zero-order report plus a passing `verify-emergency-cancel --require-pass`
-   result with `--require-all-configured-accounts`; incident cancellation must
-   never wait for certification.
+   result with `--require-all-configured-accounts`. Hold each unsupported-domain
+   transport in turn and prove regular mitigation still follows its standalone
+   request trace and pacing budget within the shared absolute per-account
+   deadline; incident cancellation must never wait for certification.
    Populate `examples/live-fault-matrix.toml` with the isolated reports and
    injector records, then require `verify-live-fault-matrix --require-pass`.
 4. Complete a sustained soak with zero unexplained order, fill, balance,
