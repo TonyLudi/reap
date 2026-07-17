@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::cleanliness::{CaptureCleanRunInputs, capture_run_is_clean};
 use crate::error::MAX_CAPTURE_FAILURE_MESSAGE_BYTES;
 use crate::hashing::{digest_hex, sha256_hex};
 use crate::{
@@ -459,6 +460,7 @@ pub fn verify_capture_paths(
         &effective_config,
         expected_connections,
         stream_coverage_complete,
+        raw_record_sequence_complete,
     );
     if run_report.clean_capture != derived_clean {
         failures.push(CaptureVerificationFailure::CleanFlagMismatch {
@@ -672,6 +674,7 @@ fn derive_clean_capture(
     config: &CaptureConfig,
     expected_connections: usize,
     stream_coverage_complete: bool,
+    raw_record_sequence_complete: bool,
 ) -> bool {
     let expected_books = config
         .subscriptions
@@ -685,25 +688,30 @@ fn derive_clean_capture(
         .filter(|book| book.sequence_status == "ready" && book.book_status == "ready")
         .map(|book| book.symbol.as_str())
         .collect::<BTreeSet<_>>();
-    report.stop_reason == CaptureStopReason::DurationElapsed
-        && report.failure.is_none()
-        && report.reached_all_connections_ready
-        && report.expected_connections == expected_connections
-        && report.ready_connections_at_stop == expected_connections
-        && !expected_books.is_empty()
-        && report.books.len() == expected_books.len()
-        && ready_books == expected_books
-        && stream_coverage_complete
-        && report.raw_records > 0
-        && (report.normalized_path.is_none() || report.normalized_records > 0)
-        && report.parse_errors == 0
-        && report.stale_book_events == 0
-        && report.recovery_requests == 0
-        && report.missing_recovery_routes == 0
-        && report.gaps == 0
-        && report.recovery_failures == 0
-        && session_bounds_are_valid(report)
-        && host_evidence_is_healthy(report, config)
+    capture_run_is_clean(&CaptureCleanRunInputs {
+        duration_elapsed: report.stop_reason == CaptureStopReason::DurationElapsed,
+        failure_free: report.failure.is_none(),
+        reached_all_connections_ready: report.reached_all_connections_ready,
+        connections_ready_at_stop: report.expected_connections == expected_connections
+            && report.ready_connections_at_stop == expected_connections,
+        books_ready: !expected_books.is_empty()
+            && report.books.len() == expected_books.len()
+            && ready_books == expected_books,
+        stream_coverage_complete,
+        raw_records_present: report.raw_records > 0,
+        raw_record_sequence_complete,
+        normalized_records_present_or_disabled: report.normalized_path.is_none()
+            || report.normalized_records > 0,
+        parse_clean: report.parse_errors == 0,
+        no_stale_book_events: report.stale_book_events == 0,
+        no_recovery_requests: report.recovery_requests == 0,
+        no_missing_recovery_routes: report.missing_recovery_routes == 0,
+        no_gaps: report.gaps == 0,
+        no_recovery_failures: report.recovery_failures == 0,
+        session_bounds_valid: session_bounds_are_valid(report),
+        executable_sha256_valid: is_sha256(&report.executable_sha256),
+        host_evidence_healthy: host_evidence_is_healthy(report, config),
+    })
 }
 
 fn session_bounds_are_valid(report: &CaptureRunReport) -> bool {
@@ -727,7 +735,7 @@ fn host_evidence_is_healthy(report: &CaptureRunReport, config: &CaptureConfig) -
     if !is_sha256(identity)
         || preflight.checked_at_ms < report.session_started_at_ms
         || preflight.checked_at_ms > report.session_completed_at_ms
-        || !host_snapshot_is_healthy(preflight, config)
+        || !preflight.is_healthy_evidence(&config.host_guard)
     {
         return false;
     }
@@ -740,19 +748,9 @@ fn host_evidence_is_healthy(report: &CaptureRunReport, config: &CaptureConfig) -
         (_, Some(last)) => {
             last.checked_at_ms >= preflight.checked_at_ms
                 && last.checked_at_ms <= report.session_completed_at_ms
-                && host_snapshot_is_healthy(last, config)
+                && last.is_healthy_evidence(&config.host_guard)
         }
     }
-}
-
-fn host_snapshot_is_healthy(
-    snapshot: &reap_telemetry::HostHealthSnapshot,
-    config: &CaptureConfig,
-) -> bool {
-    snapshot.checked_at_ms > 0
-        && snapshot.disk_available_bytes >= config.host_guard.min_disk_available_bytes
-        && snapshot.memory_available_bytes >= config.host_guard.min_memory_available_bytes
-        && (!config.host_guard.require_clock_synchronized || snapshot.clock_synchronized)
 }
 
 struct NormalizedScan {
@@ -1167,6 +1165,32 @@ mod tests {
     }
 
     #[test]
+    fn invalid_executable_hash_also_invalidates_a_clean_claim() {
+        let fixture = setup(false);
+        let mut run_report: CaptureRunReport =
+            serde_json::from_slice(&std::fs::read(&fixture.report_path).unwrap()).unwrap();
+        run_report.executable_sha256 = "E".repeat(64);
+        write_report(&fixture.report_path, &run_report);
+
+        let report = verify(&fixture);
+
+        assert!(!report.passed);
+        assert_eq!(report.failures.len(), 2, "{:#?}", report.failures);
+        assert!(report.failures.iter().any(|failure| matches!(
+            failure,
+            CaptureVerificationFailure::RunReportInvariant { message }
+                if message == "executable_sha256 is not lowercase SHA-256"
+        )));
+        assert!(report.failures.iter().any(|failure| matches!(
+            failure,
+            CaptureVerificationFailure::CleanFlagMismatch {
+                reported: true,
+                derived: false,
+            }
+        )));
+    }
+
+    #[test]
     fn verifier_rejects_enabled_guard_without_host_evidence() {
         let fixture = setup(false);
         let mut config = capture_config();
@@ -1377,6 +1401,13 @@ mod tests {
                 expected_records: 7,
                 sequenced_records: 6,
                 ..
+            }
+        )));
+        assert!(report.failures.iter().any(|failure| matches!(
+            failure,
+            CaptureVerificationFailure::CleanFlagMismatch {
+                reported: true,
+                derived: false,
             }
         )));
     }

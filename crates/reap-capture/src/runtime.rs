@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::analysis;
+use crate::cleanliness::{CaptureCleanRunInputs, capture_run_is_clean};
 use crate::configuration::{CaptureConfig, CaptureRuntimeConfig};
 use crate::error::{
     CaptureError, MAX_CAPTURE_FAILURE_MESSAGE_BYTES, combine_capture_failures,
@@ -804,22 +805,33 @@ impl CaptureState {
             })
             .collect::<Vec<_>>();
         let all_connections_ready = self.expected_connections.is_subset(&self.ready_connections);
-        let clean_capture = timing.stop_reason == CaptureStopReason::DurationElapsed
-            && failure.is_none()
-            && self.reached_all_connections_ready
-            && all_connections_ready
-            && all_books_ready
-            && self.stream_coverage.complete()
-            && raw.records > 0
-            && raw.records == self.next_raw_record_seq.saturating_sub(1)
-            && (config.output.normalized_path.is_none() || normalized.records > 0)
-            && self.parse_errors == 0
-            && self.stale_book_events == 0
-            && self.recovery_requests == 0
-            && self.missing_recovery_routes == 0
-            && processor.gaps == 0
-            && processor.recovery_failures == 0
-            && capture_host_evidence_is_healthy(config, &provenance, &host, timing.completed_at_ms);
+        let clean_capture = capture_run_is_clean(&CaptureCleanRunInputs {
+            duration_elapsed: timing.stop_reason == CaptureStopReason::DurationElapsed,
+            failure_free: failure.is_none(),
+            reached_all_connections_ready: self.reached_all_connections_ready,
+            connections_ready_at_stop: all_connections_ready,
+            books_ready: all_books_ready,
+            stream_coverage_complete: self.stream_coverage.complete(),
+            raw_records_present: raw.records > 0,
+            raw_record_sequence_complete: raw.records == self.next_raw_record_seq.saturating_sub(1),
+            normalized_records_present_or_disabled: config.output.normalized_path.is_none()
+                || normalized.records > 0,
+            parse_clean: self.parse_errors == 0,
+            no_stale_book_events: self.stale_book_events == 0,
+            no_recovery_requests: self.recovery_requests == 0,
+            no_missing_recovery_routes: self.missing_recovery_routes == 0,
+            no_gaps: processor.gaps == 0,
+            no_recovery_failures: processor.recovery_failures == 0,
+            session_bounds_valid: provenance.session_started_at_ms > 0
+                && provenance.session_started_at_ms <= timing.completed_at_ms,
+            executable_sha256_valid: is_lower_sha256(&provenance.executable_sha256),
+            host_evidence_healthy: capture_host_evidence_is_healthy(
+                config,
+                &provenance,
+                &host,
+                timing.completed_at_ms,
+            ),
+        });
 
         CaptureRunReport {
             format_version: CAPTURE_RUN_REPORT_FORMAT_VERSION,
@@ -880,12 +892,6 @@ fn capture_host_evidence_is_healthy(
     host: &CaptureHostEvidence,
     session_completed_at_ms: u64,
 ) -> bool {
-    if !is_lower_sha256(&provenance.executable_sha256)
-        || provenance.session_started_at_ms == 0
-        || provenance.session_started_at_ms > session_completed_at_ms
-    {
-        return false;
-    }
     if !config.host_guard.enabled {
         return provenance.host_identity_sha256.is_none()
             && provenance.host_preflight.is_none()
@@ -902,7 +908,7 @@ fn capture_host_evidence_is_healthy(
     if !is_lower_sha256(identity)
         || preflight.checked_at_ms < provenance.session_started_at_ms
         || preflight.checked_at_ms > session_completed_at_ms
-        || !host_snapshot_is_healthy(preflight, &config.host_guard)
+        || !preflight.is_healthy_evidence(&config.host_guard)
     {
         return false;
     }
@@ -912,16 +918,9 @@ fn capture_host_evidence_is_healthy(
         (_, Some(last)) => {
             last.checked_at_ms >= preflight.checked_at_ms
                 && last.checked_at_ms <= session_completed_at_ms
-                && host_snapshot_is_healthy(last, &config.host_guard)
+                && last.is_healthy_evidence(&config.host_guard)
         }
     }
-}
-
-fn host_snapshot_is_healthy(snapshot: &HostHealthSnapshot, config: &HostGuardConfig) -> bool {
-    snapshot.checked_at_ms > 0
-        && snapshot.disk_available_bytes >= config.min_disk_available_bytes
-        && snapshot.memory_available_bytes >= config.min_memory_available_bytes
-        && (!config.require_clock_synchronized || snapshot.clock_synchronized)
 }
 
 fn is_lower_sha256(value: &str) -> bool {

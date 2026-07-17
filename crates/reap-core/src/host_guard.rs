@@ -5,6 +5,19 @@ pub const PRODUCTION_HOST_GUARD_MAX_CHECK_INTERVAL_MS: u64 = 10_000;
 pub const PRODUCTION_HOST_GUARD_MIN_DISK_AVAILABLE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 pub const PRODUCTION_HOST_GUARD_MIN_MEMORY_AVAILABLE_BYTES: u64 = 1024 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostHealthThresholdAssessment {
+    pub disk_low: bool,
+    pub memory_low: bool,
+    pub clock_unsynchronized: bool,
+}
+
+impl HostHealthThresholdAssessment {
+    pub fn is_healthy(self) -> bool {
+        !self.disk_low && !self.memory_low && !self.clock_unsynchronized
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HostGuardConfig {
@@ -28,6 +41,19 @@ impl Default for HostGuardConfig {
 }
 
 impl HostGuardConfig {
+    pub fn assess_host_health(
+        &self,
+        disk_available_bytes: u64,
+        memory_available_bytes: u64,
+        clock_synchronized: bool,
+    ) -> HostHealthThresholdAssessment {
+        HostHealthThresholdAssessment {
+            disk_low: disk_available_bytes < self.min_disk_available_bytes,
+            memory_low: memory_available_bytes < self.min_memory_available_bytes,
+            clock_unsynchronized: self.require_clock_synchronized && !clock_synchronized,
+        }
+    }
+
     pub fn validation_errors(&self, prefix: &str) -> Vec<String> {
         if !self.enabled {
             return Vec::new();
@@ -151,5 +177,53 @@ mod tests {
                 .any(|error| error.contains("at least 1073741824"))
         );
         assert!(errors.iter().any(|error| error.contains("must be true")));
+    }
+
+    #[test]
+    fn host_health_assessment_truth_table_and_boundaries_are_exact() {
+        let config = config();
+        for disk_low in [false, true] {
+            for memory_low in [false, true] {
+                for clock_unsynchronized in [false, true] {
+                    let assessment = config.assess_host_health(
+                        if disk_low {
+                            config.min_disk_available_bytes - 1
+                        } else {
+                            config.min_disk_available_bytes
+                        },
+                        if memory_low {
+                            config.min_memory_available_bytes - 1
+                        } else {
+                            config.min_memory_available_bytes
+                        },
+                        !clock_unsynchronized,
+                    );
+                    assert_eq!(
+                        assessment,
+                        HostHealthThresholdAssessment {
+                            disk_low,
+                            memory_low,
+                            clock_unsynchronized,
+                        }
+                    );
+                    assert_eq!(
+                        assessment.is_healthy(),
+                        !disk_low && !memory_low && !clock_unsynchronized
+                    );
+                }
+            }
+        }
+
+        let mut clock_optional = config;
+        clock_optional.require_clock_synchronized = false;
+        assert!(
+            clock_optional
+                .assess_host_health(
+                    clock_optional.min_disk_available_bytes,
+                    clock_optional.min_memory_available_bytes,
+                    false,
+                )
+                .is_healthy()
+        );
     }
 }

@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub use reap_core::{
-    HostGuardConfig, MAX_HOST_GUARD_CHECK_INTERVAL_MS, PRODUCTION_HOST_GUARD_MAX_CHECK_INTERVAL_MS,
-    PRODUCTION_HOST_GUARD_MIN_DISK_AVAILABLE_BYTES,
+    HostGuardConfig, HostHealthThresholdAssessment, MAX_HOST_GUARD_CHECK_INTERVAL_MS,
+    PRODUCTION_HOST_GUARD_MAX_CHECK_INTERVAL_MS, PRODUCTION_HOST_GUARD_MIN_DISK_AVAILABLE_BYTES,
     PRODUCTION_HOST_GUARD_MIN_MEMORY_AVAILABLE_BYTES,
 };
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,20 @@ pub struct HostHealthSnapshot {
     pub disk_available_bytes: u64,
     pub memory_available_bytes: u64,
     pub clock_synchronized: bool,
+}
+
+impl HostHealthSnapshot {
+    pub fn threshold_assessment(&self, config: &HostGuardConfig) -> HostHealthThresholdAssessment {
+        config.assess_host_health(
+            self.disk_available_bytes,
+            self.memory_available_bytes,
+            self.clock_synchronized,
+        )
+    }
+
+    pub fn is_healthy_evidence(&self, config: &HostGuardConfig) -> bool {
+        self.checked_at_ms > 0 && self.threshold_assessment(config).is_healthy()
+    }
 }
 
 #[derive(Debug, Clone, Error)]
@@ -145,23 +159,24 @@ fn evaluate_host_health(
     config: &HostGuardConfig,
     snapshot: HostHealthSnapshot,
 ) -> Result<HostHealthSnapshot, HostHealthError> {
+    let assessment = snapshot.threshold_assessment(config);
     let mut codes = Vec::new();
     let mut reasons = Vec::new();
-    if snapshot.disk_available_bytes < config.min_disk_available_bytes {
+    if assessment.disk_low {
         codes.push("disk_low");
         reasons.push(format!(
             "storage filesystem has {} bytes available, below {}",
             snapshot.disk_available_bytes, config.min_disk_available_bytes
         ));
     }
-    if snapshot.memory_available_bytes < config.min_memory_available_bytes {
+    if assessment.memory_low {
         codes.push("memory_low");
         reasons.push(format!(
             "host has {} bytes available memory, below {}",
             snapshot.memory_available_bytes, config.min_memory_available_bytes
         ));
     }
-    if config.require_clock_synchronized && !snapshot.clock_synchronized {
+    if assessment.clock_unsynchronized {
         codes.push("clock_unsynchronized");
         reasons.push("kernel reports the host clock as unsynchronized".to_string());
     }
@@ -322,9 +337,10 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code(), "disk_low+memory_low+clock_unsynchronized");
         assert_eq!(error.snapshot().unwrap().checked_at_ms, 1);
-        assert!(error.to_string().contains("storage filesystem"));
-        assert!(error.to_string().contains("available memory"));
-        assert!(error.to_string().contains("unsynchronized"));
+        assert_eq!(
+            error.to_string(),
+            "host health threshold breached: storage filesystem has 999 bytes available, below 1000; host has 1999 bytes available memory, below 2000; kernel reports the host clock as unsynchronized"
+        );
     }
 
     #[test]
@@ -339,6 +355,32 @@ mod tests {
             evaluate_host_health(&config(), snapshot.clone()).unwrap(),
             snapshot
         );
+    }
+
+    #[test]
+    fn snapshot_helpers_separate_thresholds_from_evidence_validity() {
+        let mut snapshot = HostHealthSnapshot {
+            checked_at_ms: 0,
+            disk_available_bytes: 1_000,
+            memory_available_bytes: 2_000,
+            clock_synchronized: true,
+        };
+        assert!(snapshot.threshold_assessment(&config()).is_healthy());
+        assert!(!snapshot.is_healthy_evidence(&config()));
+
+        snapshot.checked_at_ms = 1;
+        assert!(snapshot.is_healthy_evidence(&config()));
+
+        snapshot.disk_available_bytes = 999;
+        assert_eq!(
+            snapshot.threshold_assessment(&config()),
+            HostHealthThresholdAssessment {
+                disk_low: true,
+                memory_low: false,
+                clock_unsynchronized: false,
+            }
+        );
+        assert!(!snapshot.is_healthy_evidence(&config()));
     }
 
     #[cfg(target_os = "linux")]

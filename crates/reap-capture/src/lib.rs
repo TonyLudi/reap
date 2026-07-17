@@ -1,4 +1,5 @@
 mod analysis;
+mod cleanliness;
 mod configuration;
 mod error;
 mod hashing;
