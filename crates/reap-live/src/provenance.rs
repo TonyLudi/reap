@@ -1,32 +1,13 @@
+pub(crate) use reap_live_contracts::okx_account_identity_sha256;
+#[cfg(test)]
+pub(crate) use reap_telemetry::identity_sha256;
+pub(crate) use reap_telemetry::sha256_bytes;
 pub use reap_telemetry::{current_executable_sha256, host_identity_sha256};
-pub(crate) use reap_telemetry::{identity_sha256, sha256_bytes};
-
-use crate::TradingEnvironment;
-
-pub(crate) fn okx_account_identity_sha256(
-    environment: TradingEnvironment,
-    account_id: &str,
-    user_id: &str,
-    main_user_id: &str,
-) -> String {
-    let environment = match environment {
-        TradingEnvironment::Demo => b"demo".as_slice(),
-        TradingEnvironment::Production => b"production".as_slice(),
-    };
-    identity_sha256(
-        b"reap-okx-account-v1",
-        &[
-            environment,
-            account_id.as_bytes(),
-            user_id.trim().as_bytes(),
-            main_user_id.trim().as_bytes(),
-        ],
-    )
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TradingEnvironment;
 
     #[test]
     fn byte_and_identity_hashes_are_stable_and_field_delimited() {
