@@ -1,8 +1,9 @@
-//! Separate emergency-stop composition preserving the pre-Phase-5 combined workflow.
+//! Separate emergency-stop composition with independently progressing order domains.
 
 use std::collections::{BTreeSet, HashSet};
 use std::future::Future;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{SecondsFormat, Utc};
@@ -13,6 +14,7 @@ use reap_order::{PacingPolicy, RequestKind, RequestPacer};
 use reap_telemetry::{
     current_executable_sha256, host_identity_sha256, identity_sha256, sha256_bytes,
 };
+use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 
 #[derive(Debug)]
@@ -35,17 +37,19 @@ struct AccountCancelSettings {
     max_order_reconciliation_pages: usize,
 }
 
-#[derive(Debug, Clone, Default)]
-struct AccountPendingOrders {
-    regular: Vec<RegularOrder>,
-    algo: Vec<AlgoOrder>,
-    spread: Vec<SpreadOrder>,
+#[derive(Debug)]
+struct RegularCancelProgress {
+    report: EmergencyAccountReport,
 }
 
-impl AccountPendingOrders {
-    fn is_empty(&self) -> bool {
-        self.regular.is_empty() && self.algo.is_empty() && self.spread.is_empty()
-    }
+#[derive(Debug)]
+struct AlgoCancelProgress {
+    report: EmergencyAccountReport,
+}
+
+#[derive(Debug)]
+struct SpreadCancelProgress {
+    report: EmergencyAccountReport,
 }
 
 #[derive(Debug, Clone)]
@@ -269,6 +273,7 @@ async fn run_account_cancel(
 ) -> EmergencyAccountReport {
     let started = Instant::now();
     let mut report = EmergencyAccountReport::new(account_id.clone());
+    let client: Arc<dyn EmergencyAccountStopRole> = Arc::from(client);
     let (clock, sampled, skew_ms) = match run_bounded(
         started,
         settings.account_timeout,
@@ -285,7 +290,7 @@ async fn run_account_cancel(
         }
         None => {
             report.push_incident(
-                "account timeout expired while sampling exchange clock; cancellation could not start",
+                "account timeout expired while sampling exchange clock; using local UTC for independently bounded domain workflows",
             );
             (ExchangeClock::local(), false, None)
         }
@@ -300,178 +305,35 @@ async fn run_account_cancel(
         ));
     }
 
-    match clock.timestamp() {
-        Ok(timestamp) => match run_bounded(
-            started,
-            settings.account_timeout,
-            client.cancel_all_after_at(&timestamp, settings.deadman_timeout_secs),
+    let (regular_kickoff_tx, regular_kickoff_rx) = oneshot::channel();
+    let regular_workflow = run_regular_cancel_domain(
+        client.as_ref(),
+        &clock,
+        &account_id,
+        &managed_symbols,
+        started,
+        &settings,
+        regular_kickoff_tx,
+    );
+    let unsupported_workflows = async {
+        // A dropped sender means the regular workflow ended before it could
+        // issue CAA. Unsupported-domain mitigation must still run.
+        let _ = regular_kickoff_rx.await;
+        tokio::join!(
+            run_algo_cancel_domain(
+                client.as_ref(),
+                &clock,
+                &account_id,
+                &managed_symbols,
+                started,
+                &settings,
+            ),
+            run_spread_cancel_domain(client.as_ref(), &clock, &account_id, started, &settings),
         )
-        .await
-        {
-            Some(Ok(())) => report.deadman_armed = true,
-            Some(Err(error)) => {
-                report.push_incident(format!("failed to arm Cancel All After: {error}"));
-            }
-            None => report.push_incident("account timeout expired while arming Cancel All After"),
-        },
-        Err(error) => report.push_incident(format!("failed to format deadman timestamp: {error}")),
-    }
-    match clock.timestamp() {
-        Ok(timestamp) => match run_bounded(
-            started,
-            settings.account_timeout,
-            client.spread_cancel_all_after_at(&timestamp, settings.deadman_timeout_secs),
-        )
-        .await
-        {
-            Some(Ok(())) => report.spread_deadman_armed = true,
-            Some(Err(error)) => {
-                report.push_incident(format!("failed to arm spread Cancel All After: {error}"));
-            }
-            None => {
-                report.push_incident("account timeout expired while arming spread Cancel All After")
-            }
-        },
-        Err(error) => report.push_incident(format!(
-            "failed to format spread deadman timestamp: {error}"
-        )),
-    }
-    let verify_after = Instant::now() + settings.verification_delay;
-    let mut pacer = RequestPacer::new(settings.pacing_policy.clone());
-    let mut seen_regular_orders = BTreeSet::new();
-    let mut seen_algo_orders = BTreeSet::new();
-    let mut seen_spread_orders = BTreeSet::new();
-    let mut unmanaged_symbols = BTreeSet::new();
-    let mut last_orders: Option<AccountPendingOrders> = None;
+    };
+    let (regular, (algo, spread)) = tokio::join!(regular_workflow, unsupported_workflows);
+    merge_domain_progress(&mut report, regular, algo, spread);
 
-    while started.elapsed() < settings.account_timeout {
-        let orders = match enumerate_pending_orders(
-            client.as_ref(),
-            &clock,
-            &account_id,
-            &mut pacer,
-            &mut report,
-            started,
-            &settings,
-        )
-        .await
-        {
-            Ok(orders) => orders,
-            Err(error) => {
-                report.push_incident(error);
-                if started.elapsed() >= settings.account_timeout {
-                    break;
-                }
-                sleep_bounded(settings.poll_interval, started, settings.account_timeout).await;
-                continue;
-            }
-        };
-        if report.initial_open_orders.is_none() {
-            report.initial_open_orders = Some(orders.regular.len());
-            report.initial_algo_orders = Some(orders.algo.len());
-            report.initial_spread_orders = Some(orders.spread.len());
-        }
-        observe_orders(
-            &orders.regular,
-            &managed_symbols,
-            &mut seen_regular_orders,
-            &mut unmanaged_symbols,
-            &mut report,
-        );
-        observe_algo_orders(
-            &orders.algo,
-            &managed_symbols,
-            &mut seen_algo_orders,
-            &mut unmanaged_symbols,
-        );
-        observe_spread_orders(&orders.spread, &mut seen_spread_orders);
-        last_orders = Some(orders.clone());
-        if orders.is_empty() {
-            if Instant::now() >= verify_after {
-                report.verified_zero_after_deadman = true;
-                report.verified_algo_zero_after_deadman = true;
-                report.verified_spread_zero_after_deadman = true;
-                break;
-            }
-        } else {
-            if !orders.regular.is_empty()
-                && !cancel_pending_orders(
-                    client.as_ref(),
-                    &clock,
-                    &orders.regular,
-                    &mut pacer,
-                    &mut report,
-                    started,
-                    &settings,
-                )
-                .await
-            {
-                break;
-            }
-            if !orders.algo.is_empty()
-                && !cancel_pending_algo_orders(
-                    client.as_ref(),
-                    &clock,
-                    &orders.algo,
-                    &mut pacer,
-                    &mut report,
-                    started,
-                    &settings,
-                )
-                .await
-            {
-                break;
-            }
-            if !orders.spread.is_empty()
-                && !cancel_pending_spread_orders(
-                    client.as_ref(),
-                    &clock,
-                    &mut pacer,
-                    &mut report,
-                    started,
-                    &settings,
-                )
-                .await
-            {
-                break;
-            }
-        }
-        sleep_bounded(settings.poll_interval, started, settings.account_timeout).await;
-    }
-
-    report.unique_orders_seen = seen_regular_orders.len();
-    report.unique_algo_orders_seen = seen_algo_orders.len();
-    report.unique_spread_orders_seen = seen_spread_orders.len();
-    report.unmanaged_symbols = unmanaged_symbols.into_iter().collect();
-    report.final_open_orders = last_orders.as_ref().map(|orders| orders.regular.len());
-    report.final_algo_orders = last_orders.as_ref().map(|orders| orders.algo.len());
-    report.final_spread_orders = last_orders.as_ref().map(|orders| orders.spread.len());
-    report.remaining_orders = last_orders
-        .as_ref()
-        .map(|orders| orders.regular.clone())
-        .unwrap_or_default()
-        .into_iter()
-        .take(MAX_REMAINING_ORDER_DETAILS)
-        .map(order_ref)
-        .collect();
-    report.remaining_algo_orders = last_orders
-        .as_ref()
-        .map(|orders| orders.algo.clone())
-        .unwrap_or_default()
-        .into_iter()
-        .take(MAX_REMAINING_ORDER_DETAILS)
-        .map(algo_order_ref)
-        .collect();
-    report.remaining_spread_orders = last_orders
-        .unwrap_or_default()
-        .spread
-        .into_iter()
-        .take(MAX_REMAINING_ORDER_DETAILS)
-        .map(spread_order_ref)
-        .collect();
-    if !report.verified_zero_after_deadman && started.elapsed() >= settings.account_timeout {
-        report.push_incident("account timeout expired before every order domain was proven zero");
-    }
     report.all_clear = report.deadman_armed
         && report.spread_deadman_armed
         && report.verified_zero_after_deadman
@@ -494,7 +356,412 @@ async fn run_account_cancel(
     report
 }
 
-async fn enumerate_pending_orders(
+async fn run_regular_cancel_domain(
+    client: &dyn EmergencyAccountStopRole,
+    clock: &ExchangeClock,
+    account_id: &str,
+    managed_symbols: &HashSet<String>,
+    account_started: Instant,
+    settings: &AccountCancelSettings,
+    regular_kickoff: oneshot::Sender<()>,
+) -> RegularCancelProgress {
+    let mut report = EmergencyAccountReport::new(account_id.to_string());
+    let mut regular_kickoff = Some(regular_kickoff);
+
+    match clock.timestamp() {
+        Ok(timestamp) => {
+            if let Some(kickoff) = regular_kickoff.take() {
+                let _ = kickoff.send(());
+            }
+            match run_bounded(
+                account_started,
+                settings.account_timeout,
+                client.cancel_all_after_at(&timestamp, settings.deadman_timeout_secs),
+            )
+            .await
+            {
+                Some(Ok(())) => report.deadman_armed = true,
+                Some(Err(error)) => {
+                    report.push_incident(format!("failed to arm Cancel All After: {error}"));
+                }
+                None => {
+                    report.push_incident("regular-domain timeout while arming Cancel All After")
+                }
+            }
+        }
+        Err(error) => {
+            report.push_incident(format!("failed to format deadman timestamp: {error}"));
+        }
+    }
+    if let Some(kickoff) = regular_kickoff.take() {
+        let _ = kickoff.send(());
+    }
+
+    let verification_anchor = Instant::now();
+    let verify_after = verification_anchor + settings.verification_delay;
+    let mut pacer = RequestPacer::new(settings.pacing_policy.clone());
+    let mut seen_regular_orders = BTreeSet::new();
+    let mut unmanaged_symbols = BTreeSet::new();
+    let mut last_orders: Option<Vec<RegularOrder>> = None;
+
+    while account_started.elapsed() < settings.account_timeout {
+        let orders = match enumerate_regular_pending_orders(
+            client,
+            clock,
+            account_id,
+            &mut pacer,
+            &mut report,
+            account_started,
+            settings,
+        )
+        .await
+        {
+            Ok(orders) => orders,
+            Err(error) => {
+                report.push_incident(error);
+                if account_started.elapsed() >= settings.account_timeout {
+                    break;
+                }
+                sleep_bounded(
+                    settings.poll_interval,
+                    account_started,
+                    settings.account_timeout,
+                )
+                .await;
+                continue;
+            }
+        };
+        if report.initial_open_orders.is_none() {
+            report.initial_open_orders = Some(orders.len());
+        }
+        observe_orders(
+            &orders,
+            managed_symbols,
+            &mut seen_regular_orders,
+            &mut unmanaged_symbols,
+            &mut report,
+        );
+        last_orders = Some(orders.clone());
+        if orders.is_empty() {
+            if Instant::now() >= verify_after {
+                report.verified_zero_after_deadman = true;
+                break;
+            }
+        } else if !cancel_pending_orders(
+            client,
+            clock,
+            &orders,
+            &mut pacer,
+            &mut report,
+            account_started,
+            settings,
+        )
+        .await
+        {
+            break;
+        }
+        sleep_bounded(
+            settings.poll_interval,
+            account_started,
+            settings.account_timeout,
+        )
+        .await;
+    }
+
+    report.unique_orders_seen = seen_regular_orders.len();
+    report.unmanaged_symbols = unmanaged_symbols.into_iter().collect();
+    report.final_open_orders = last_orders.as_ref().map(Vec::len);
+    report.remaining_orders = last_orders
+        .unwrap_or_default()
+        .into_iter()
+        .take(MAX_REMAINING_ORDER_DETAILS)
+        .map(order_ref)
+        .collect();
+    if !report.verified_zero_after_deadman && account_started.elapsed() >= settings.account_timeout
+    {
+        report.push_incident("regular-domain timeout before regular orders were proven zero");
+    }
+    RegularCancelProgress { report }
+}
+
+async fn run_algo_cancel_domain(
+    client: &dyn EmergencyAccountStopRole,
+    clock: &ExchangeClock,
+    account_id: &str,
+    managed_symbols: &HashSet<String>,
+    account_started: Instant,
+    settings: &AccountCancelSettings,
+) -> AlgoCancelProgress {
+    let verification_anchor = Instant::now();
+    let verify_after = verification_anchor + settings.verification_delay;
+    let mut report = EmergencyAccountReport::new(account_id.to_string());
+    let mut pacer = RequestPacer::new(settings.pacing_policy.clone());
+    let mut seen_orders = BTreeSet::new();
+    let mut unmanaged_symbols = BTreeSet::new();
+    let mut last_orders: Option<Vec<AlgoOrder>> = None;
+
+    while account_started.elapsed() < settings.account_timeout {
+        let orders = match enumerate_algo_pending_orders(
+            client,
+            clock,
+            account_id,
+            &mut pacer,
+            &mut report,
+            account_started,
+            settings,
+        )
+        .await
+        {
+            Ok(orders) => orders,
+            Err(error) => {
+                report.push_incident(error);
+                if account_started.elapsed() >= settings.account_timeout {
+                    break;
+                }
+                sleep_bounded(
+                    settings.poll_interval,
+                    account_started,
+                    settings.account_timeout,
+                )
+                .await;
+                continue;
+            }
+        };
+        if report.initial_algo_orders.is_none() {
+            report.initial_algo_orders = Some(orders.len());
+        }
+        observe_algo_orders(
+            &orders,
+            managed_symbols,
+            &mut seen_orders,
+            &mut unmanaged_symbols,
+        );
+        last_orders = Some(orders.clone());
+        if orders.is_empty() {
+            if Instant::now() >= verify_after {
+                report.verified_algo_zero_after_deadman = true;
+                break;
+            }
+        } else if !cancel_pending_algo_orders(
+            client,
+            clock,
+            &orders,
+            &mut pacer,
+            &mut report,
+            account_started,
+            settings,
+        )
+        .await
+        {
+            break;
+        }
+        sleep_bounded(
+            settings.poll_interval,
+            account_started,
+            settings.account_timeout,
+        )
+        .await;
+    }
+
+    report.unique_algo_orders_seen = seen_orders.len();
+    report.unmanaged_symbols = unmanaged_symbols.into_iter().collect();
+    report.final_algo_orders = last_orders.as_ref().map(Vec::len);
+    report.remaining_algo_orders = last_orders
+        .unwrap_or_default()
+        .into_iter()
+        .take(MAX_REMAINING_ORDER_DETAILS)
+        .map(algo_order_ref)
+        .collect();
+    if !report.verified_algo_zero_after_deadman
+        && account_started.elapsed() >= settings.account_timeout
+    {
+        report.push_incident("algo-domain timeout before algo orders were proven zero");
+    }
+    AlgoCancelProgress { report }
+}
+
+async fn run_spread_cancel_domain(
+    client: &dyn EmergencyAccountStopRole,
+    clock: &ExchangeClock,
+    account_id: &str,
+    account_started: Instant,
+    settings: &AccountCancelSettings,
+) -> SpreadCancelProgress {
+    let mut report = EmergencyAccountReport::new(account_id.to_string());
+
+    match clock.timestamp() {
+        Ok(timestamp) => match run_bounded(
+            account_started,
+            settings.account_timeout,
+            client.spread_cancel_all_after_at(&timestamp, settings.deadman_timeout_secs),
+        )
+        .await
+        {
+            Some(Ok(())) => report.spread_deadman_armed = true,
+            Some(Err(error)) => {
+                report.push_incident(format!("failed to arm spread Cancel All After: {error}"));
+            }
+            None => {
+                report.push_incident("spread-domain timeout while arming spread Cancel All After");
+            }
+        },
+        Err(error) => report.push_incident(format!(
+            "failed to format spread deadman timestamp: {error}"
+        )),
+    }
+
+    let verification_anchor = Instant::now();
+    let verify_after = verification_anchor + settings.verification_delay;
+    let mut pacer = RequestPacer::new(settings.pacing_policy.clone());
+    let mut seen_orders = BTreeSet::new();
+    let mut last_orders: Option<Vec<SpreadOrder>> = None;
+
+    while account_started.elapsed() < settings.account_timeout {
+        let orders = match enumerate_spread_pending_orders(
+            client,
+            clock,
+            account_id,
+            &mut pacer,
+            &mut report,
+            account_started,
+            settings,
+        )
+        .await
+        {
+            Ok(orders) => orders,
+            Err(error) => {
+                report.push_incident(error);
+                if account_started.elapsed() >= settings.account_timeout {
+                    break;
+                }
+                sleep_bounded(
+                    settings.poll_interval,
+                    account_started,
+                    settings.account_timeout,
+                )
+                .await;
+                continue;
+            }
+        };
+        if report.initial_spread_orders.is_none() {
+            report.initial_spread_orders = Some(orders.len());
+        }
+        observe_spread_orders(&orders, &mut seen_orders);
+        last_orders = Some(orders.clone());
+        if orders.is_empty() {
+            if Instant::now() >= verify_after {
+                report.verified_spread_zero_after_deadman = true;
+                break;
+            }
+        } else if !cancel_pending_spread_orders(
+            client,
+            clock,
+            &mut pacer,
+            &mut report,
+            account_started,
+            settings,
+        )
+        .await
+        {
+            break;
+        }
+        sleep_bounded(
+            settings.poll_interval,
+            account_started,
+            settings.account_timeout,
+        )
+        .await;
+    }
+
+    report.unique_spread_orders_seen = seen_orders.len();
+    report.final_spread_orders = last_orders.as_ref().map(Vec::len);
+    report.remaining_spread_orders = last_orders
+        .unwrap_or_default()
+        .into_iter()
+        .take(MAX_REMAINING_ORDER_DETAILS)
+        .map(spread_order_ref)
+        .collect();
+    if !report.verified_spread_zero_after_deadman
+        && account_started.elapsed() >= settings.account_timeout
+    {
+        report.push_incident("spread-domain timeout before spread orders were proven zero");
+    }
+    SpreadCancelProgress { report }
+}
+
+fn merge_domain_progress(
+    report: &mut EmergencyAccountReport,
+    regular: RegularCancelProgress,
+    algo: AlgoCancelProgress,
+    spread: SpreadCancelProgress,
+) {
+    let regular = regular.report;
+    let algo = algo.report;
+    let spread = spread.report;
+
+    report.deadman_armed = regular.deadman_armed;
+    report.spread_deadman_armed = spread.spread_deadman_armed;
+    report.enumeration_attempts = regular
+        .enumeration_attempts
+        .saturating_add(algo.enumeration_attempts)
+        .saturating_add(spread.enumeration_attempts);
+    report.enumeration_failures = regular
+        .enumeration_failures
+        .saturating_add(algo.enumeration_failures)
+        .saturating_add(spread.enumeration_failures);
+    report.initial_open_orders = regular.initial_open_orders;
+    report.initial_algo_orders = algo.initial_algo_orders;
+    report.initial_spread_orders = spread.initial_spread_orders;
+    report.unique_orders_seen = regular.unique_orders_seen;
+    report.unique_algo_orders_seen = algo.unique_algo_orders_seen;
+    report.unique_spread_orders_seen = spread.unique_spread_orders_seen;
+    report.cancel_batches = regular.cancel_batches;
+    report.cancel_batch_failures = regular.cancel_batch_failures;
+    report.accepted_cancel_requests = regular.accepted_cancel_requests;
+    report.rejected_cancel_requests = regular.rejected_cancel_requests;
+    report.unacknowledged_cancel_requests = regular.unacknowledged_cancel_requests;
+    report.algo_cancel_batches = algo.algo_cancel_batches;
+    report.algo_cancel_batch_failures = algo.algo_cancel_batch_failures;
+    report.accepted_algo_cancel_requests = algo.accepted_algo_cancel_requests;
+    report.rejected_algo_cancel_requests = algo.rejected_algo_cancel_requests;
+    report.unacknowledged_algo_cancel_requests = algo.unacknowledged_algo_cancel_requests;
+    report.spread_mass_cancel_attempts = spread.spread_mass_cancel_attempts;
+    report.spread_mass_cancel_failures = spread.spread_mass_cancel_failures;
+    report.verified_zero_after_deadman = regular.verified_zero_after_deadman;
+    report.verified_algo_zero_after_deadman = algo.verified_algo_zero_after_deadman;
+    report.verified_spread_zero_after_deadman = spread.verified_spread_zero_after_deadman;
+    report.final_open_orders = regular.final_open_orders;
+    report.final_algo_orders = algo.final_algo_orders;
+    report.final_spread_orders = spread.final_spread_orders;
+    report.remaining_orders = regular.remaining_orders;
+    report.remaining_algo_orders = algo.remaining_algo_orders;
+    report.remaining_spread_orders = spread.remaining_spread_orders;
+    report.unmanaged_symbols = regular
+        .unmanaged_symbols
+        .into_iter()
+        .chain(algo.unmanaged_symbols)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    merge_domain_incidents(report, regular.incident_count, regular.incidents);
+    merge_domain_incidents(report, algo.incident_count, algo.incidents);
+    merge_domain_incidents(report, spread.incident_count, spread.incidents);
+}
+
+fn merge_domain_incidents(
+    report: &mut EmergencyAccountReport,
+    incident_count: u64,
+    incidents: Vec<String>,
+) {
+    report.incident_count = report.incident_count.saturating_add(incident_count);
+    let remaining = MAX_INCIDENTS.saturating_sub(report.incidents.len());
+    report
+        .incidents
+        .extend(incidents.into_iter().take(remaining));
+}
+
+async fn enumerate_regular_pending_orders(
     client: &dyn EmergencyAccountStopRole,
     clock: &ExchangeClock,
     account_id: &str,
@@ -502,7 +769,7 @@ async fn enumerate_pending_orders(
     report: &mut EmergencyAccountReport,
     started: Instant,
     settings: &AccountCancelSettings,
-) -> Result<AccountPendingOrders, String> {
+) -> Result<Vec<RegularOrder>, String> {
     let mut regular = RegularOrderPagination::new(settings.max_order_reconciliation_pages)
         .map_err(|error| enumeration_failure(report, "regular", error.to_string()))?;
     loop {
@@ -525,7 +792,7 @@ async fn enumerate_pending_orders(
                 return Err(enumeration_failure(
                     report,
                     "regular",
-                    "account timeout expired during request".to_string(),
+                    "domain timeout expired during request".to_string(),
                 ));
             }
         };
@@ -537,7 +804,18 @@ async fn enumerate_pending_orders(
             }
         }
     }
+    Ok(regular.into_orders())
+}
 
+async fn enumerate_algo_pending_orders(
+    client: &dyn EmergencyAccountStopRole,
+    clock: &ExchangeClock,
+    account_id: &str,
+    pacer: &mut RequestPacer,
+    report: &mut EmergencyAccountReport,
+    started: Instant,
+    settings: &AccountCancelSettings,
+) -> Result<Vec<AlgoOrder>, String> {
     let mut algo_orders = Vec::new();
     let mut algo_ids = BTreeSet::new();
     for query in AlgoOrderQuery::ALL {
@@ -563,7 +841,7 @@ async fn enumerate_pending_orders(
                     return Err(enumeration_failure(
                         report,
                         "algo",
-                        "account timeout expired during request".to_string(),
+                        "domain timeout expired during request".to_string(),
                     ));
                 }
             };
@@ -589,7 +867,18 @@ async fn enumerate_pending_orders(
             algo_orders.push(order);
         }
     }
+    Ok(algo_orders)
+}
 
+async fn enumerate_spread_pending_orders(
+    client: &dyn EmergencyAccountStopRole,
+    clock: &ExchangeClock,
+    account_id: &str,
+    pacer: &mut RequestPacer,
+    report: &mut EmergencyAccountReport,
+    started: Instant,
+    settings: &AccountCancelSettings,
+) -> Result<Vec<SpreadOrder>, String> {
     let mut spread = SpreadOrderPagination::new(settings.max_order_reconciliation_pages)
         .map_err(|error| enumeration_failure(report, "spread", error.to_string()))?;
     loop {
@@ -612,7 +901,7 @@ async fn enumerate_pending_orders(
                 return Err(enumeration_failure(
                     report,
                     "spread",
-                    "account timeout expired during request".to_string(),
+                    "domain timeout expired during request".to_string(),
                 ));
             }
         };
@@ -624,13 +913,13 @@ async fn enumerate_pending_orders(
             }
         }
     }
-
-    Ok(AccountPendingOrders {
-        regular: regular.into_orders(),
-        algo: algo_orders,
-        spread: spread.into_orders(),
-    })
+    Ok(spread.into_orders())
 }
+
+/*
+ * The three enumerators above deliberately remain separate. Their paginators,
+ * pacing state, deadlines, and failure accounting must never be recombined.
+ */
 
 async fn prepare_enumeration_request(
     clock: &ExchangeClock,
@@ -1325,6 +1614,148 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum UnsupportedBehavior {
+        InstantEmpty,
+        Hang,
+    }
+
+    struct UnsupportedIsolationState {
+        calls: Vec<String>,
+        regular_pages: VecDeque<RegularOrderPage>,
+        regular_completed_at: Option<Instant>,
+    }
+
+    #[derive(Clone)]
+    struct UnsupportedIsolationRole {
+        state: Arc<Mutex<UnsupportedIsolationState>>,
+        unsupported_behavior: UnsupportedBehavior,
+    }
+
+    impl UnsupportedIsolationRole {
+        fn new(
+            regular_pages: impl IntoIterator<Item = RegularOrderPage>,
+            unsupported_behavior: UnsupportedBehavior,
+        ) -> (Self, Arc<Mutex<UnsupportedIsolationState>>) {
+            let state = Arc::new(Mutex::new(UnsupportedIsolationState {
+                calls: Vec::new(),
+                regular_pages: regular_pages.into_iter().collect(),
+                regular_completed_at: None,
+            }));
+            (
+                Self {
+                    state: Arc::clone(&state),
+                    unsupported_behavior,
+                },
+                state,
+            )
+        }
+
+        fn record(&self, call: &str) {
+            self.state.lock().unwrap().calls.push(call.to_string());
+        }
+    }
+
+    #[async_trait]
+    impl EmergencyAccountStopRole for UnsupportedIsolationRole {
+        async fn server_time_ms(&self) -> RoleResult<u64> {
+            self.record("server_time");
+            Ok(unix_time_ms())
+        }
+
+        async fn account_identity_at(
+            &self,
+            _timestamp: &str,
+        ) -> RoleResult<EmergencyAccountIdentity> {
+            self.record("account_identity");
+            Ok(EmergencyAccountIdentity {
+                user_id: "7".to_string(),
+                main_user_id: "6".to_string(),
+            })
+        }
+
+        async fn regular_pending_orders_page_at(
+            &self,
+            _timestamp: &str,
+            _after: Option<&str>,
+        ) -> RoleResult<RegularOrderPage> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push("enumerate_regular".to_string());
+            let page = state
+                .regular_pages
+                .pop_front()
+                .expect("missing regular page");
+            if page.orders.is_empty() && state.regular_pages.is_empty() {
+                state.regular_completed_at = Some(Instant::now());
+            }
+            Ok(page)
+        }
+
+        async fn algo_pending_orders_page_at(
+            &self,
+            _timestamp: &str,
+            _query: AlgoOrderQuery,
+            _after: Option<&str>,
+        ) -> RoleResult<AlgoOrderPage> {
+            self.record("enumerate_algo");
+            match self.unsupported_behavior {
+                UnsupportedBehavior::InstantEmpty => Ok(empty_algo_page()),
+                UnsupportedBehavior::Hang => std::future::pending().await,
+            }
+        }
+
+        async fn spread_pending_orders_page_at(
+            &self,
+            _timestamp: &str,
+            _end_id: Option<&str>,
+        ) -> RoleResult<SpreadOrderPage> {
+            self.record("enumerate_spread");
+            match self.unsupported_behavior {
+                UnsupportedBehavior::InstantEmpty => Ok(empty_spread_page()),
+                UnsupportedBehavior::Hang => std::future::pending().await,
+            }
+        }
+
+        async fn cancel_all_after_at(
+            &self,
+            _timestamp: &str,
+            _timeout_secs: u64,
+        ) -> RoleResult<()> {
+            self.record("arm_regular_deadman");
+            Ok(())
+        }
+
+        async fn spread_cancel_all_after_at(
+            &self,
+            _timestamp: &str,
+            _timeout_secs: u64,
+        ) -> RoleResult<()> {
+            self.record("arm_spread_deadman");
+            Ok(())
+        }
+
+        async fn cancel_batch_orders_at(
+            &self,
+            _timestamp: &str,
+            _orders: &[CancelOrder],
+        ) -> RoleResult<Vec<CancelOrderResult>> {
+            self.record("cancel_regular");
+            Ok(vec![accepted_regular_cancel()])
+        }
+
+        async fn cancel_algo_orders_at(
+            &self,
+            _timestamp: &str,
+            _orders: &[CancelAlgoOrder],
+        ) -> RoleResult<Vec<AlgoCancelResult>> {
+            panic!("hung algo enumeration must not reach cancellation")
+        }
+
+        async fn spread_mass_cancel_at(&self, _timestamp: &str) -> RoleResult<()> {
+            panic!("hung spread enumeration must not reach cancellation")
+        }
+    }
+
     fn empty_regular_page() -> RegularOrderPage {
         RegularOrderPage {
             orders: Vec::new(),
@@ -1344,6 +1775,103 @@ mod tests {
             orders: Vec::new(),
             next_end_id: None,
         }
+    }
+
+    fn regular_order() -> RegularOrder {
+        RegularOrder {
+            symbol: "BTC-USDT".to_string(),
+            exchange_order_id: "regular-1".to_string(),
+            client_order_id: "regular-client-1".to_string(),
+        }
+    }
+
+    fn algo_order() -> AlgoOrder {
+        AlgoOrder {
+            algo_id: "algo-1".to_string(),
+            client_order_id: "algo-client-1".to_string(),
+            symbol: "BTC-USDT".to_string(),
+        }
+    }
+
+    fn spread_order() -> SpreadOrder {
+        SpreadOrder {
+            spread_id: "BTC-USDT_BTC-USDT-SWAP".to_string(),
+            exchange_order_id: "spread-1".to_string(),
+            client_order_id: "spread-client-1".to_string(),
+        }
+    }
+
+    fn accepted_regular_cancel() -> CancelOrderResult {
+        CancelOrderResult {
+            exchange_order_id: "regular-1".to_string(),
+            client_order_id: "regular-client-1".to_string(),
+            code: "0".to_string(),
+            message: String::new(),
+        }
+    }
+
+    fn accepted_algo_cancel() -> AlgoCancelResult {
+        AlgoCancelResult {
+            algo_id: "algo-1".to_string(),
+            client_order_id: "algo-client-1".to_string(),
+            code: "0".to_string(),
+            message: String::new(),
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FailedDomain {
+        Regular,
+        Spread,
+    }
+
+    fn independent_failure_role(failed_domain: FailedDomain) -> (ScriptedRole, Arc<Mutex<Script>>) {
+        let mut script = Script {
+            server_times: [Ok(unix_time_ms())].into(),
+            regular_deadman: [Ok(())].into(),
+            spread_deadman: [Ok(())].into(),
+            regular_cancels: [Ok(vec![accepted_regular_cancel()])].into(),
+            algo_cancels: [Ok(vec![accepted_algo_cancel()])].into(),
+            spread_cancels: [Ok(())].into(),
+            ..Script::default()
+        };
+        if failed_domain == FailedDomain::Regular {
+            script.regular_pages.extend(
+                (0..64).map(|_| Err(EmergencyRoleError("regular unavailable".to_string()))),
+            );
+        } else {
+            script.regular_pages.extend([
+                Ok(RegularOrderPage {
+                    orders: vec![regular_order()],
+                    next_after: None,
+                }),
+                Ok(empty_regular_page()),
+            ]);
+        }
+        script.algo_pages.push_back(Ok(AlgoOrderPage {
+            orders: vec![algo_order()],
+            next_after: None,
+        }));
+        script
+            .algo_pages
+            .extend((1..AlgoOrderQuery::ALL.len()).map(|_| Ok(empty_algo_page())));
+        script
+            .algo_pages
+            .extend((0..AlgoOrderQuery::ALL.len()).map(|_| Ok(empty_algo_page())));
+        if failed_domain == FailedDomain::Spread {
+            script
+                .spread_pages
+                .extend((0..64).map(|_| Err(EmergencyRoleError("spread unavailable".to_string()))));
+        } else {
+            script.spread_pages.extend([
+                Ok(SpreadOrderPage {
+                    orders: vec![spread_order()],
+                    next_end_id: None,
+                }),
+                Ok(empty_spread_page()),
+            ]);
+        }
+        ScriptedRole::new(script)
     }
 
     fn settings() -> AccountCancelSettings {
@@ -1397,7 +1925,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn combined_workflow_preserves_domain_enumeration_and_cancel_ordering() {
+    async fn independent_workflows_preserve_domain_progress_after_regular_kickoff() {
         let mut script = Script {
             server_times: [Ok(unix_time_ms())].into(),
             identities: [Ok(EmergencyAccountIdentity {
@@ -1482,20 +2010,43 @@ mod tests {
         assert!(report.account_identity_sha256.is_some());
 
         let calls = &recorded.lock().unwrap().calls;
-        assert_eq!(
-            &calls[..3],
-            ["server_time", "arm_regular_deadman", "arm_spread_deadman"]
+        assert_eq!(&calls[..2], ["server_time", "arm_regular_deadman"]);
+        let position = |needle: &str| {
+            calls
+                .iter()
+                .position(|call| call == needle)
+                .unwrap_or_else(|| panic!("missing call {needle}: {calls:?}"))
+        };
+        let positions = |needle: &str| {
+            calls
+                .iter()
+                .enumerate()
+                .filter_map(|(index, call)| (call == needle).then_some(index))
+                .collect::<Vec<_>>()
+        };
+        assert!(position("arm_regular_deadman") < position("arm_spread_deadman"));
+        assert!(position("enumerate_regular") < position("cancel_regular"));
+        assert!(position("cancel_regular") < positions("enumerate_regular")[1]);
+        assert!(
+            calls
+                .iter()
+                .position(|call| call.starts_with("enumerate_algo:"))
+                .unwrap()
+                < position("cancel_algo")
         );
-        assert_eq!(calls[3], "enumerate_regular");
-        assert!(calls[4].starts_with("enumerate_algo:"));
-        assert_eq!(calls[11], "enumerate_spread");
-        assert_eq!(
-            &calls[12..15],
-            ["cancel_regular", "cancel_algo", "cancel_spread"]
+        assert!(
+            position("cancel_algo")
+                < calls
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, call)| call.starts_with("enumerate_algo:"))
+                    .nth(AlgoOrderQuery::ALL.len())
+                    .unwrap()
+                    .0
         );
-        assert_eq!(calls[15], "enumerate_regular");
-        assert_eq!(calls[23], "enumerate_spread");
-        assert_eq!(calls[24], "account_identity");
+        assert!(position("enumerate_spread") < position("cancel_spread"));
+        assert!(position("cancel_spread") < positions("enumerate_spread")[1]);
+        assert_eq!(calls.last().map(String::as_str), Some("account_identity"));
     }
 
     #[tokio::test]
@@ -1565,43 +2116,211 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_algo_enumeration_prevents_every_cancel_domain() {
-        let script = Script {
+    async fn failed_algo_enumeration_does_not_prevent_regular_or_spread_cancel_domains() {
+        let mut script = Script {
             server_times: [Ok(unix_time_ms())].into(),
-            regular_pages: [Ok(RegularOrderPage {
-                orders: vec![RegularOrder {
-                    symbol: "BTC-USDT".to_string(),
-                    exchange_order_id: "regular-1".to_string(),
-                    client_order_id: String::new(),
-                }],
-                next_after: None,
-            })]
+            regular_pages: [
+                Ok(RegularOrderPage {
+                    orders: vec![regular_order()],
+                    next_after: None,
+                }),
+                Ok(empty_regular_page()),
+            ]
             .into(),
-            algo_pages: [Err(EmergencyRoleError("algo unavailable".to_string()))].into(),
+            spread_pages: [
+                Ok(SpreadOrderPage {
+                    orders: vec![spread_order()],
+                    next_end_id: None,
+                }),
+                Ok(empty_spread_page()),
+            ]
+            .into(),
             regular_deadman: [Ok(())].into(),
             spread_deadman: [Ok(())].into(),
+            regular_cancels: [Ok(vec![accepted_regular_cancel()])].into(),
+            spread_cancels: [Ok(())].into(),
             ..Script::default()
         };
+        script
+            .algo_pages
+            .extend((0..64).map(|_| Err(EmergencyRoleError("algo unavailable".to_string()))));
         let (role, recorded) = ScriptedRole::new(script);
         let mut bounded = settings();
-        bounded.account_timeout = Duration::from_millis(20);
-        bounded.poll_interval = Duration::from_millis(20);
+        bounded.account_timeout = Duration::from_millis(30);
+        bounded.poll_interval = Duration::from_millis(5);
 
         let report =
             run_account_cancel(Box::new(role), "main".to_string(), HashSet::new(), bounded).await;
 
         assert!(!report.all_clear);
-        assert_eq!(report.initial_open_orders, None);
+        assert_eq!(report.initial_open_orders, Some(1));
+        assert_eq!(report.final_open_orders, Some(0));
+        assert!(report.verified_zero_after_deadman);
+        assert_eq!(report.accepted_cancel_requests, 1);
+        assert_eq!(report.initial_algo_orders, None);
+        assert_eq!(report.final_algo_orders, None);
+        assert!(!report.verified_algo_zero_after_deadman);
+        assert_eq!(report.initial_spread_orders, Some(1));
+        assert_eq!(report.final_spread_orders, Some(0));
+        assert!(report.verified_spread_zero_after_deadman);
+        assert_eq!(report.spread_mass_cancel_attempts, 1);
         assert!(report.incidents.iter().any(|message| {
             message.contains("algo pending-order enumeration failed: algo unavailable")
         }));
-        assert!(
+        let calls = &recorded.lock().unwrap().calls;
+        assert!(calls.iter().any(|call| call == "cancel_regular"));
+        assert!(calls.iter().any(|call| call == "cancel_spread"));
+        assert!(calls.iter().all(|call| call != "cancel_algo"));
+    }
+
+    #[tokio::test]
+    async fn regular_and_spread_enumeration_failures_are_isolated_from_other_domains() {
+        for failed_domain in [FailedDomain::Regular, FailedDomain::Spread] {
+            let (role, recorded) = independent_failure_role(failed_domain);
+            let mut bounded = settings();
+            bounded.account_timeout = Duration::from_millis(30);
+            bounded.poll_interval = Duration::from_millis(5);
+
+            let report =
+                run_account_cancel(Box::new(role), "main".to_string(), HashSet::new(), bounded)
+                    .await;
+
+            assert!(!report.all_clear, "{failed_domain:?}");
+            assert!(report.enumeration_failures > 0, "{failed_domain:?}");
+            assert_eq!(
+                report.verified_zero_after_deadman,
+                failed_domain != FailedDomain::Regular,
+                "{failed_domain:?}"
+            );
+            assert!(report.verified_algo_zero_after_deadman, "{failed_domain:?}");
+            assert_eq!(
+                report.verified_spread_zero_after_deadman,
+                failed_domain != FailedDomain::Spread,
+                "{failed_domain:?}"
+            );
+            assert_eq!(
+                report.accepted_cancel_requests,
+                u64::from(failed_domain != FailedDomain::Regular),
+                "{failed_domain:?}"
+            );
+            assert_eq!(report.accepted_algo_cancel_requests, 1, "{failed_domain:?}");
+            assert_eq!(
+                report.spread_mass_cancel_attempts,
+                u64::from(failed_domain != FailedDomain::Spread),
+                "{failed_domain:?}"
+            );
+
+            let calls = &recorded.lock().unwrap().calls;
+            assert_eq!(
+                calls.iter().any(|call| call == "cancel_regular"),
+                failed_domain != FailedDomain::Regular,
+                "{failed_domain:?}: {calls:?}"
+            );
+            assert!(
+                calls.iter().any(|call| call == "cancel_algo"),
+                "{failed_domain:?}: {calls:?}"
+            );
+            assert_eq!(
+                calls.iter().any(|call| call == "cancel_spread"),
+                failed_domain != FailedDomain::Spread,
+                "{failed_domain:?}: {calls:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hung_unsupported_domains_do_not_change_the_regular_mitigation_trace() {
+        let regular_pages = || {
+            [
+                RegularOrderPage {
+                    orders: vec![regular_order()],
+                    next_after: None,
+                },
+                empty_regular_page(),
+            ]
+        };
+        let mut bounded = settings();
+        bounded.account_timeout = Duration::from_millis(200);
+        bounded.poll_interval = Duration::from_millis(1);
+        let pacing_quantum = bounded.pacing_policy.window;
+
+        let (baseline_role, baseline_recorded) =
+            UnsupportedIsolationRole::new(regular_pages(), UnsupportedBehavior::InstantEmpty);
+        let baseline_started = Instant::now();
+        let baseline_report = run_account_cancel(
+            Box::new(baseline_role),
+            "main".to_string(),
+            HashSet::new(),
+            bounded.clone(),
+        )
+        .await;
+        let baseline_regular_elapsed = baseline_recorded
+            .lock()
+            .unwrap()
+            .regular_completed_at
+            .expect("baseline regular workflow did not complete")
+            .duration_since(baseline_started);
+        assert!(baseline_report.all_clear, "{:?}", baseline_report.incidents);
+
+        let (hung_role, hung_recorded) =
+            UnsupportedIsolationRole::new(regular_pages(), UnsupportedBehavior::Hang);
+        let hung_started = Instant::now();
+        let report = run_account_cancel(
+            Box::new(hung_role),
+            "main".to_string(),
+            HashSet::new(),
+            bounded,
+        )
+        .await;
+        let hung_regular_elapsed = hung_recorded
+            .lock()
+            .unwrap()
+            .regular_completed_at
+            .expect("hung case regular workflow did not complete")
+            .duration_since(hung_started);
+
+        assert!(report.deadman_armed);
+        assert!(report.verified_zero_after_deadman);
+        assert_eq!(report.initial_open_orders, Some(1));
+        assert_eq!(report.final_open_orders, Some(0));
+        assert_eq!(report.accepted_cancel_requests, 1);
+        assert!(!report.verified_algo_zero_after_deadman);
+        assert!(!report.verified_spread_zero_after_deadman);
+        assert!(!report.all_clear);
+
+        let regular_trace = |recorded: &Arc<Mutex<UnsupportedIsolationState>>| {
             recorded
                 .lock()
                 .unwrap()
                 .calls
                 .iter()
-                .all(|call| !call.starts_with("cancel_"))
+                .filter(|call| {
+                    matches!(
+                        call.as_str(),
+                        "arm_regular_deadman" | "enumerate_regular" | "cancel_regular"
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let baseline_trace = regular_trace(&baseline_recorded);
+        let hung_trace = regular_trace(&hung_recorded);
+        assert_eq!(
+            baseline_trace,
+            [
+                "arm_regular_deadman",
+                "enumerate_regular",
+                "cancel_regular",
+                "enumerate_regular",
+            ]
+        );
+        assert_eq!(hung_trace, baseline_trace);
+        assert!(
+            hung_regular_elapsed
+                <= baseline_regular_elapsed
+                    .saturating_add(pacing_quantum)
+                    .saturating_add(Duration::from_millis(100)),
+            "hung unsupported domains delayed regular completion: baseline={baseline_regular_elapsed:?}, hung={hung_regular_elapsed:?}, pacing_quantum={pacing_quantum:?}"
         );
     }
 
@@ -1769,7 +2488,7 @@ passphrase_env = "REAP_EMERGENCY_VERIFY_TEST_MISSING_PASSPHRASE"
             &self,
             _timestamp: &str,
         ) -> RoleResult<EmergencyAccountIdentity> {
-            unreachable!()
+            std::future::pending().await
         }
 
         async fn regular_pending_orders_page_at(
@@ -1777,7 +2496,7 @@ passphrase_env = "REAP_EMERGENCY_VERIFY_TEST_MISSING_PASSPHRASE"
             _timestamp: &str,
             _after: Option<&str>,
         ) -> RoleResult<RegularOrderPage> {
-            unreachable!()
+            std::future::pending().await
         }
 
         async fn algo_pending_orders_page_at(
@@ -1786,7 +2505,7 @@ passphrase_env = "REAP_EMERGENCY_VERIFY_TEST_MISSING_PASSPHRASE"
             _query: AlgoOrderQuery,
             _after: Option<&str>,
         ) -> RoleResult<AlgoOrderPage> {
-            unreachable!()
+            std::future::pending().await
         }
 
         async fn spread_pending_orders_page_at(
@@ -1794,7 +2513,7 @@ passphrase_env = "REAP_EMERGENCY_VERIFY_TEST_MISSING_PASSPHRASE"
             _timestamp: &str,
             _end_id: Option<&str>,
         ) -> RoleResult<SpreadOrderPage> {
-            unreachable!()
+            std::future::pending().await
         }
 
         async fn cancel_all_after_at(
@@ -1802,7 +2521,7 @@ passphrase_env = "REAP_EMERGENCY_VERIFY_TEST_MISSING_PASSPHRASE"
             _timestamp: &str,
             _timeout_secs: u64,
         ) -> RoleResult<()> {
-            unreachable!()
+            std::future::pending().await
         }
 
         async fn spread_cancel_all_after_at(
@@ -1810,7 +2529,7 @@ passphrase_env = "REAP_EMERGENCY_VERIFY_TEST_MISSING_PASSPHRASE"
             _timestamp: &str,
             _timeout_secs: u64,
         ) -> RoleResult<()> {
-            unreachable!()
+            std::future::pending().await
         }
 
         async fn cancel_batch_orders_at(
@@ -1818,7 +2537,7 @@ passphrase_env = "REAP_EMERGENCY_VERIFY_TEST_MISSING_PASSPHRASE"
             _timestamp: &str,
             _orders: &[CancelOrder],
         ) -> RoleResult<Vec<CancelOrderResult>> {
-            unreachable!()
+            std::future::pending().await
         }
 
         async fn cancel_algo_orders_at(
@@ -1826,18 +2545,19 @@ passphrase_env = "REAP_EMERGENCY_VERIFY_TEST_MISSING_PASSPHRASE"
             _timestamp: &str,
             _orders: &[CancelAlgoOrder],
         ) -> RoleResult<Vec<AlgoCancelResult>> {
-            unreachable!()
+            std::future::pending().await
         }
 
         async fn spread_mass_cancel_at(&self, _timestamp: &str) -> RoleResult<()> {
-            unreachable!()
+            std::future::pending().await
         }
     }
 
     #[tokio::test]
-    async fn account_deadline_bounds_a_hung_role() {
+    async fn clock_hang_cannot_reset_the_absolute_account_deadline() {
         let mut bounded = settings();
-        bounded.account_timeout = Duration::from_millis(20);
+        bounded.account_timeout = Duration::from_millis(200);
+        let account_timeout = bounded.account_timeout;
         let started = Instant::now();
 
         let report = run_account_cancel(
@@ -1849,12 +2569,83 @@ passphrase_env = "REAP_EMERGENCY_VERIFY_TEST_MISSING_PASSPHRASE"
         .await;
 
         assert!(!report.all_clear);
-        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(
+            started.elapsed() <= account_timeout.saturating_add(Duration::from_millis(100)),
+            "clock timeout was followed by a reset domain timeout: elapsed={:?}, account_timeout={account_timeout:?}",
+            started.elapsed()
+        );
+        assert!(
+            report.elapsed_ms
+                <= duration_ms(account_timeout.saturating_add(Duration::from_millis(100)))
+        );
+        assert!(!report.exchange_clock_sampled);
+        assert_eq!(report.exchange_clock_skew_ms, None);
+        assert_eq!(report.enumeration_attempts, 0);
+        assert_eq!(report.enumeration_failures, 0);
+        assert_eq!(report.initial_open_orders, None);
+        assert_eq!(report.initial_algo_orders, None);
+        assert_eq!(report.initial_spread_orders, None);
+        assert_eq!(report.final_open_orders, None);
+        assert_eq!(report.final_algo_orders, None);
+        assert_eq!(report.final_spread_orders, None);
+        assert!(!report.verified_zero_after_deadman);
+        assert!(!report.verified_algo_zero_after_deadman);
+        assert!(!report.verified_spread_zero_after_deadman);
         assert!(
             report
                 .incidents
                 .iter()
                 .any(|message| message.contains("account timeout"))
         );
+        let encoded = serde_json::to_vec(&report).unwrap();
+        let decoded: EmergencyAccountReport = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.account_id, "main");
+        assert_eq!(decoded.initial_open_orders, None);
+        assert_eq!(decoded.final_spread_orders, None);
+    }
+
+    #[tokio::test]
+    async fn clock_error_keeps_domain_pairs_valid_within_the_absolute_deadline() {
+        let mut script = Script {
+            server_times: [Err(EmergencyRoleError("clock unavailable".to_string()))].into(),
+            identities: [Ok(EmergencyAccountIdentity {
+                user_id: "7".to_string(),
+                main_user_id: "6".to_string(),
+            })]
+            .into(),
+            regular_pages: [Ok(empty_regular_page())].into(),
+            spread_pages: [Ok(empty_spread_page())].into(),
+            regular_deadman: [Ok(())].into(),
+            spread_deadman: [Ok(())].into(),
+            ..Script::default()
+        };
+        script
+            .algo_pages
+            .extend((0..AlgoOrderQuery::ALL.len()).map(|_| Ok(empty_algo_page())));
+        let (role, _) = ScriptedRole::new(script);
+        let bounded = settings();
+        let account_timeout = bounded.account_timeout;
+
+        let report =
+            run_account_cancel(Box::new(role), "main".to_string(), HashSet::new(), bounded).await;
+
+        assert!(report.all_clear, "{:?}", report.incidents);
+        assert!(!report.exchange_clock_sampled);
+        assert_eq!(report.exchange_clock_skew_ms, None);
+        assert_eq!(report.initial_open_orders, Some(0));
+        assert_eq!(report.initial_algo_orders, Some(0));
+        assert_eq!(report.initial_spread_orders, Some(0));
+        assert_eq!(report.final_open_orders, Some(0));
+        assert_eq!(report.final_algo_orders, Some(0));
+        assert_eq!(report.final_spread_orders, Some(0));
+        assert!(report.verified_zero_after_deadman);
+        assert!(report.verified_algo_zero_after_deadman);
+        assert!(report.verified_spread_zero_after_deadman);
+        assert!(report.elapsed_ms <= duration_ms(account_timeout));
+        assert!(report.incidents.iter().any(|message| {
+            message.contains(
+                "exchange clock sampling failed; using local UTC for cancellation: clock unavailable",
+            )
+        }));
     }
 }

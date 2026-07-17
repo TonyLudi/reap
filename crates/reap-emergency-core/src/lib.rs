@@ -2,7 +2,8 @@
 //!
 //! This crate deliberately contains no OKX adapter, HTTP client, signer,
 //! credential reader, or production transport. The separate emergency runner
-//! supplies a narrow role factory and preserves the current combined workflow.
+//! supplies a narrow role factory and coordinates independently progressing
+//! regular, algo, and spread mitigation workflows.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
@@ -1051,6 +1052,46 @@ mod tests {
         assert!(!missing_account.regular_orders_all_clear);
         assert!(!missing_account.evidence_complete);
         assert!(!missing_account.all_clear);
+    }
+
+    #[test]
+    fn emergency_completion_preserves_mixed_domain_results() {
+        let selected = vec!["main".to_string()];
+
+        for domain_results in [
+            [false, true, true],
+            [true, false, true],
+            [true, true, false],
+        ] {
+            let mut account = EmergencyAccountReport::new("main".to_string());
+            account.deadman_armed = true;
+            account.spread_deadman_armed = true;
+            account.verified_zero_after_deadman = domain_results[0];
+            account.verified_algo_zero_after_deadman = domain_results[1];
+            account.verified_spread_zero_after_deadman = domain_results[2];
+
+            let completion = emergency_completion(
+                &selected,
+                &[account],
+                &"1".repeat(64),
+                Some(&"2".repeat(64)),
+                Some(&"3".repeat(64)),
+                true,
+                0,
+            );
+
+            assert_eq!(
+                [
+                    completion.regular_orders_all_clear,
+                    completion.algo_orders_all_clear,
+                    completion.spread_orders_all_clear,
+                ],
+                domain_results
+            );
+            assert!(!completion.account_wide_orders_all_clear);
+            assert!(!completion.evidence_complete);
+            assert!(!completion.all_clear);
+        }
     }
 
     #[test]

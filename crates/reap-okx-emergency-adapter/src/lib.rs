@@ -1,11 +1,11 @@
 //! Account-wide OKX cancellation authority for the separate emergency plane.
 //!
-//! The role intentionally contains the current, pre-Phase-5 emergency HTTP
-//! contract: sample time, bind account identity, enumerate regular/algo/spread
-//! pending orders, arm regular/spread Cancel All After, and cancel those three
-//! domains. It has no submit, amend, transfer, withdrawal, or arbitrary-path
-//! operation. Workflow ordering, retry, pacing, deadlines, reports, and final
-//! zero proof remain outside this adapter and are not changed here.
+//! The role intentionally contains only the emergency HTTP contract: sample
+//! time, bind account identity, enumerate regular/algo/spread pending orders,
+//! arm regular/spread Cancel All After, and cancel those three domains. It has
+//! no submit, amend, transfer, withdrawal, or arbitrary-path operation.
+//! Workflow ordering, retry, pacing, independent deadlines, reports, and final
+//! zero proof remain outside this adapter.
 
 use std::fmt;
 use std::net::IpAddr;
@@ -1086,7 +1086,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_combined_workflow_emits_only_exact_allowlisted_requests() {
+    async fn emergency_role_emits_only_exact_allowlisted_requests() {
         let wire = Arc::new(FakeWire::default());
         wire.responses.lock().unwrap().extend([
             response(r#"{"code":"0","msg":"","data":[{"ts":"1607418537715"}]}"#),

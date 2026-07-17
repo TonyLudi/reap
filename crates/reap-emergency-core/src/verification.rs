@@ -592,20 +592,32 @@ fn validate_account_shape(
         account_failures.push("enumeration failures exceed attempts".to_string());
     }
     let enumeration_coverage = [
-        account.initial_open_orders.is_some(),
-        account.initial_algo_orders.is_some(),
-        account.initial_spread_orders.is_some(),
-        account.final_open_orders.is_some(),
-        account.final_algo_orders.is_some(),
-        account.final_spread_orders.is_some(),
+        (
+            "regular",
+            account.initial_open_orders.is_some(),
+            account.final_open_orders.is_some(),
+        ),
+        (
+            "algo",
+            account.initial_algo_orders.is_some(),
+            account.final_algo_orders.is_some(),
+        ),
+        (
+            "spread",
+            account.initial_spread_orders.is_some(),
+            account.final_spread_orders.is_some(),
+        ),
     ];
+    for (label, initial_covered, final_covered) in enumeration_coverage {
+        if initial_covered != final_covered {
+            account_failures.push(format!(
+                "{label} initial/final enumeration evidence coverage disagrees"
+            ));
+        }
+    }
     if enumeration_coverage
         .iter()
-        .any(|covered| *covered != enumeration_coverage[0])
-    {
-        account_failures.push("initial/final order-domain evidence coverage disagrees".to_string());
-    }
-    if account.initial_open_orders.is_some()
+        .any(|(_, initial_covered, final_covered)| *initial_covered || *final_covered)
         && account.enumeration_attempts <= account.enumeration_failures
     {
         account_failures.push("enumerated order evidence has no successful attempt".to_string());
@@ -681,28 +693,34 @@ fn validate_account_shape(
         }
     }
     let verified_domains = [
-        account.verified_zero_after_deadman,
-        account.verified_algo_zero_after_deadman,
-        account.verified_spread_zero_after_deadman,
+        (
+            "regular",
+            account.verified_zero_after_deadman,
+            account.final_open_orders,
+        ),
+        (
+            "algo",
+            account.verified_algo_zero_after_deadman,
+            account.final_algo_orders,
+        ),
+        (
+            "spread",
+            account.verified_spread_zero_after_deadman,
+            account.final_spread_orders,
+        ),
     ];
-    if verified_domains
-        .iter()
-        .any(|verified| *verified != verified_domains[0])
-    {
-        account_failures.push("order-domain zero claims disagree".to_string());
-    }
-    if verified_domains[0] {
-        if account.final_open_orders != Some(0)
-            || account.final_algo_orders != Some(0)
-            || account.final_spread_orders != Some(0)
-        {
-            account_failures
-                .push("account-wide zero is claimed with a nonzero final order domain".to_string());
+    for (label, verified, final_count) in verified_domains {
+        if verified && final_count != Some(0) {
+            account_failures.push(format!(
+                "{label} post-deadman zero is claimed without a zero final count"
+            ));
         }
+    }
+    if verified_domains.iter().any(|(_, verified, _)| *verified) {
         let minimum_elapsed_ms = deadman_timeout_secs.saturating_add(2).saturating_mul(1_000);
         if account.elapsed_ms < minimum_elapsed_ms {
             account_failures
-                .push("account-wide zero was recorded before the deadman horizon".to_string());
+                .push("post-deadman zero was recorded before the deadman horizon".to_string());
         }
     }
     if account.elapsed_ms > report_elapsed_ms
@@ -755,7 +773,7 @@ fn derived_account_all_clear(account: &EmergencyAccountReport, deadman_timeout_s
 fn derived_regular_all_clear(account: &EmergencyAccountReport, deadman_timeout_secs: u64) -> bool {
     account.deadman_armed
         && account.verified_zero_after_deadman
-        && complete_enumeration_coverage(account)
+        && regular_enumeration_coverage(account)
         && account.final_open_orders == Some(0)
         && account.remaining_orders.is_empty()
         && account.elapsed_ms >= deadman_timeout_secs.saturating_add(2).saturating_mul(1_000)
@@ -763,7 +781,7 @@ fn derived_regular_all_clear(account: &EmergencyAccountReport, deadman_timeout_s
 
 fn derived_algo_all_clear(account: &EmergencyAccountReport, deadman_timeout_secs: u64) -> bool {
     account.verified_algo_zero_after_deadman
-        && complete_enumeration_coverage(account)
+        && algo_enumeration_coverage(account)
         && account.final_algo_orders == Some(0)
         && account.remaining_algo_orders.is_empty()
         && account.elapsed_ms >= deadman_timeout_secs.saturating_add(2).saturating_mul(1_000)
@@ -772,20 +790,22 @@ fn derived_algo_all_clear(account: &EmergencyAccountReport, deadman_timeout_secs
 fn derived_spread_all_clear(account: &EmergencyAccountReport, deadman_timeout_secs: u64) -> bool {
     account.spread_deadman_armed
         && account.verified_spread_zero_after_deadman
-        && complete_enumeration_coverage(account)
+        && spread_enumeration_coverage(account)
         && account.final_spread_orders == Some(0)
         && account.remaining_spread_orders.is_empty()
         && account.elapsed_ms >= deadman_timeout_secs.saturating_add(2).saturating_mul(1_000)
 }
 
-fn complete_enumeration_coverage(account: &EmergencyAccountReport) -> bool {
-    account.enumeration_attempts > account.enumeration_failures
-        && account.initial_open_orders.is_some()
-        && account.initial_algo_orders.is_some()
-        && account.initial_spread_orders.is_some()
-        && account.final_open_orders.is_some()
-        && account.final_algo_orders.is_some()
-        && account.final_spread_orders.is_some()
+fn regular_enumeration_coverage(account: &EmergencyAccountReport) -> bool {
+    account.initial_open_orders.is_some() && account.final_open_orders.is_some()
+}
+
+fn algo_enumeration_coverage(account: &EmergencyAccountReport) -> bool {
+    account.initial_algo_orders.is_some() && account.final_algo_orders.is_some()
+}
+
+fn spread_enumeration_coverage(account: &EmergencyAccountReport) -> bool {
+    account.initial_spread_orders.is_some() && account.final_spread_orders.is_some()
 }
 
 fn normalized_account_ids(account_ids: &[String]) -> (Vec<String>, bool) {
@@ -989,6 +1009,17 @@ mod tests {
         std::fs::write(path, serde_json::to_vec_pretty(report).unwrap()).unwrap();
     }
 
+    fn set_nonpassing_completion(report: &mut EmergencyCancelReport, domain_all_clear: [bool; 3]) {
+        report.accounts[0].account_identity_sha256 = None;
+        report.accounts[0].all_clear = false;
+        report.regular_orders_all_clear = domain_all_clear[0];
+        report.algo_orders_all_clear = domain_all_clear[1];
+        report.spread_orders_all_clear = domain_all_clear[2];
+        report.account_wide_orders_all_clear = false;
+        report.evidence_complete = false;
+        report.all_clear = false;
+    }
+
     #[test]
     fn complete_emergency_report_passes_independent_verification() {
         let fixture = fixture(&["main"], &["main"]);
@@ -1130,7 +1161,213 @@ mod tests {
         assert!(verification.failures.iter().any(|failure| matches!(
             failure,
             EmergencyCancelVerificationFailure::AccountInvariant { message, .. }
-                if message.contains("nonzero final order domain")
+                if message.contains("regular post-deadman zero is claimed")
+        )));
+    }
+
+    #[test]
+    fn partial_domain_coverage_is_valid_but_cannot_pass_acceptance() {
+        let fixture = fixture(&["main"], &["main"]);
+        let mut report = fixture.report;
+        report.accounts[0].initial_algo_orders = None;
+        report.accounts[0].final_algo_orders = None;
+        report.accounts[0].verified_algo_zero_after_deadman = false;
+        report.accounts[0].initial_spread_orders = None;
+        report.accounts[0].final_spread_orders = None;
+        report.accounts[0].verified_spread_zero_after_deadman = false;
+        set_nonpassing_completion(&mut report, [true, false, false]);
+        write_report(&fixture.report_path, &report);
+
+        let verification = verify_emergency_cancel_paths(
+            &fixture.config_path,
+            &fixture.report_path,
+            EmergencyCancelVerificationOptions::default(),
+        )
+        .unwrap();
+
+        assert!(verification.evidence_valid);
+        assert!(!verification.acceptance_passed);
+        assert!(verification.derived_regular_orders_all_clear);
+        assert!(!verification.derived_algo_orders_all_clear);
+        assert!(!verification.derived_spread_orders_all_clear);
+        assert!(!verification.derived_account_wide_orders_all_clear);
+        assert!(!verification.derived_evidence_complete);
+        assert!(verification.failures.is_empty());
+    }
+
+    #[test]
+    fn each_unverified_domain_independently_keeps_account_wide_clear_false() {
+        for (unverified_domain, expected_domains) in [
+            ("regular", [false, true, true]),
+            ("algo", [true, false, true]),
+            ("spread", [true, true, false]),
+        ] {
+            let fixture = fixture(&["main"], &["main"]);
+            let mut report = fixture.report;
+            match unverified_domain {
+                "regular" => report.accounts[0].verified_zero_after_deadman = false,
+                "algo" => report.accounts[0].verified_algo_zero_after_deadman = false,
+                "spread" => report.accounts[0].verified_spread_zero_after_deadman = false,
+                _ => unreachable!(),
+            }
+            set_nonpassing_completion(&mut report, expected_domains);
+            write_report(&fixture.report_path, &report);
+
+            let verification = verify_emergency_cancel_paths(
+                &fixture.config_path,
+                &fixture.report_path,
+                EmergencyCancelVerificationOptions::default(),
+            )
+            .unwrap();
+
+            assert!(
+                verification.evidence_valid,
+                "{unverified_domain}: {:?}",
+                verification.failures
+            );
+            assert!(!verification.acceptance_passed, "{unverified_domain}");
+            assert_eq!(
+                [
+                    verification.derived_regular_orders_all_clear,
+                    verification.derived_algo_orders_all_clear,
+                    verification.derived_spread_orders_all_clear,
+                ],
+                expected_domains,
+                "{unverified_domain}"
+            );
+            assert!(
+                !verification.derived_account_wide_orders_all_clear,
+                "{unverified_domain}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_true_domain_flag_requires_its_own_zero_final_count() {
+        for (domain, expected_domains) in [
+            ("regular", [false, true, true]),
+            ("algo", [true, false, true]),
+            ("spread", [true, true, false]),
+        ] {
+            let fixture = fixture(&["main"], &["main"]);
+            let mut report = fixture.report;
+            match domain {
+                "regular" => {
+                    report.accounts[0].final_open_orders = Some(1);
+                    report.accounts[0]
+                        .remaining_orders
+                        .push(crate::EmergencyOrderRef {
+                            symbol: "BTC-USDT".to_string(),
+                            exchange_order_id: "42".to_string(),
+                            client_order_id: String::new(),
+                        });
+                }
+                "algo" => {
+                    report.accounts[0].final_algo_orders = Some(1);
+                    report.accounts[0]
+                        .remaining_algo_orders
+                        .push(crate::EmergencyAlgoOrderRef {
+                            symbol: "BTC-USDT".to_string(),
+                            algo_id: "43".to_string(),
+                            client_order_id: String::new(),
+                        });
+                }
+                "spread" => {
+                    report.accounts[0].final_spread_orders = Some(1);
+                    report.accounts[0].remaining_spread_orders.push(
+                        crate::EmergencySpreadOrderRef {
+                            spread_id: "BTC-USDT_BTC-USDC".to_string(),
+                            exchange_order_id: "44".to_string(),
+                            client_order_id: String::new(),
+                        },
+                    );
+                }
+                _ => unreachable!(),
+            }
+            set_nonpassing_completion(&mut report, expected_domains);
+            write_report(&fixture.report_path, &report);
+
+            let verification = verify_emergency_cancel_paths(
+                &fixture.config_path,
+                &fixture.report_path,
+                EmergencyCancelVerificationOptions::default(),
+            )
+            .unwrap();
+
+            assert!(!verification.evidence_valid, "{domain}");
+            assert!(verification.failures.iter().any(|failure| matches!(
+                failure,
+                EmergencyCancelVerificationFailure::AccountInvariant { message, .. }
+                    if message.contains(&format!(
+                        "{domain} post-deadman zero is claimed without a zero final count"
+                    ))
+            )));
+        }
+    }
+
+    #[test]
+    fn every_domain_zero_claim_is_subject_to_the_deadman_horizon() {
+        for domain in ["regular", "algo", "spread"] {
+            let fixture = fixture(&["main"], &["main"]);
+            let mut report = fixture.report;
+            report.accounts[0].verified_zero_after_deadman = false;
+            report.accounts[0].verified_algo_zero_after_deadman = false;
+            report.accounts[0].verified_spread_zero_after_deadman = false;
+            match domain {
+                "regular" => report.accounts[0].verified_zero_after_deadman = true,
+                "algo" => report.accounts[0].verified_algo_zero_after_deadman = true,
+                "spread" => report.accounts[0].verified_spread_zero_after_deadman = true,
+                _ => unreachable!(),
+            }
+            report.accounts[0].elapsed_ms = 11_999;
+            set_nonpassing_completion(&mut report, [false, false, false]);
+            write_report(&fixture.report_path, &report);
+
+            let verification = verify_emergency_cancel_paths(
+                &fixture.config_path,
+                &fixture.report_path,
+                EmergencyCancelVerificationOptions::default(),
+            )
+            .unwrap();
+
+            assert!(!verification.evidence_valid, "{domain}");
+            assert!(verification.failures.iter().any(|failure| matches!(
+                failure,
+                EmergencyCancelVerificationFailure::AccountInvariant { message, .. }
+                    if message.contains("post-deadman zero was recorded before")
+            )));
+        }
+    }
+
+    #[test]
+    fn initial_and_final_coverage_must_match_only_within_each_domain() {
+        let fixture = fixture(&["main"], &["main"]);
+        let mut report = fixture.report;
+        report.accounts[0].final_algo_orders = None;
+        report.accounts[0].verified_algo_zero_after_deadman = false;
+        set_nonpassing_completion(&mut report, [true, false, true]);
+        write_report(&fixture.report_path, &report);
+
+        let verification = verify_emergency_cancel_paths(
+            &fixture.config_path,
+            &fixture.report_path,
+            EmergencyCancelVerificationOptions::default(),
+        )
+        .unwrap();
+
+        assert!(!verification.evidence_valid);
+        assert!(verification.failures.iter().any(|failure| matches!(
+            failure,
+            EmergencyCancelVerificationFailure::AccountInvariant { message, .. }
+                if message.contains(
+                    "algo initial/final enumeration evidence coverage disagrees"
+                )
+        )));
+        assert!(!verification.failures.iter().any(|failure| matches!(
+            failure,
+            EmergencyCancelVerificationFailure::AccountInvariant { message, .. }
+                if message.contains("regular initial/final")
+                    || message.contains("spread initial/final")
         )));
     }
 
