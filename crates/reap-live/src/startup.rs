@@ -69,6 +69,7 @@ pub struct StartupGate {
     ready_books: HashSet<String>,
     ready_private_streams: HashSet<String>,
     ready_order_transports: HashSet<String>,
+    ready_forbidden_order_proofs: HashSet<String>,
     ready_stablecoin_rates: HashSet<String>,
     ready_strategy_references: HashSet<String>,
     faults: BTreeMap<String, String>,
@@ -143,6 +144,7 @@ impl StartupGate {
             ready_books: HashSet::new(),
             ready_private_streams: HashSet::new(),
             ready_order_transports: HashSet::new(),
+            ready_forbidden_order_proofs: HashSet::new(),
             ready_stablecoin_rates: HashSet::new(),
             ready_strategy_references: HashSet::new(),
             faults: BTreeMap::new(),
@@ -283,6 +285,28 @@ impl StartupGate {
             &mut self.faults,
             &format!("order_transport:{account_id}"),
             ready,
+            reason,
+        );
+        self.refresh();
+        Ok(())
+    }
+
+    pub fn mark_forbidden_order_proof(
+        &mut self,
+        account_id: &str,
+        verified_zero: bool,
+        reason: impl Into<String>,
+    ) -> Result<(), StartupError> {
+        self.require_account(account_id)?;
+        set_membership(
+            &mut self.ready_forbidden_order_proofs,
+            account_id,
+            verified_zero,
+        );
+        set_fault(
+            &mut self.faults,
+            &format!("forbidden_orders:{account_id}"),
+            verified_zero,
             reason,
         );
         self.refresh();
@@ -472,6 +496,7 @@ impl StartupGate {
                 &self.required_order_transports,
                 &self.ready_order_transports,
             )
+            && is_complete(&self.required_accounts, &self.ready_forbidden_order_proofs)
             && is_complete(
                 &self.required_stablecoin_rates,
                 &self.ready_stablecoin_rates,
@@ -618,9 +643,85 @@ mod tests {
         gate.mark_book("BTC-PERP", true, "snapshot").unwrap();
         assert_eq!(gate.phase(), LivePhase::AwaitingStreams);
         gate.mark_private_stream("main", true, "heartbeat").unwrap();
+        assert_eq!(gate.phase(), LivePhase::AwaitingStreams);
+        gate.mark_forbidden_order_proof("main", true, "complete zero proof")
+            .unwrap();
         assert!(gate.snapshot().is_ready());
         assert!(gate.can_submit_new(true));
         assert!(!gate.can_submit_new(false));
+    }
+
+    #[test]
+    fn forbidden_zero_proof_is_per_account_fail_closed_and_explicitly_rearmed() {
+        let mut gate = StartupGate::new(&config());
+        gate.mark_metadata_verified();
+        gate.mark_storage(true, "open");
+        gate.mark_public_connectivity(true, "connected");
+        gate.mark_reconciled("main", true, "clean").unwrap();
+        gate.mark_account_snapshot("main", true, "loaded").unwrap();
+        gate.mark_book("BTC-USDT", true, "snapshot").unwrap();
+        gate.mark_book("BTC-PERP", true, "snapshot").unwrap();
+        gate.mark_private_stream("main", true, "heartbeat").unwrap();
+
+        assert_eq!(gate.phase(), LivePhase::AwaitingStreams);
+        assert!(!gate.can_submit_new(true));
+        gate.mark_forbidden_order_proof("main", true, "all eight checks are zero")
+            .unwrap();
+        assert_eq!(gate.phase(), LivePhase::Ready);
+
+        gate.mark_forbidden_order_proof("main", false, "spread scan timed out")
+            .unwrap();
+        assert_eq!(gate.phase(), LivePhase::Degraded);
+        assert!(!gate.can_submit_new(true));
+        assert_eq!(
+            gate.snapshot().faults.get("forbidden_orders:main"),
+            Some(&"spread scan timed out".to_string())
+        );
+
+        gate.mark_forbidden_order_proof("main", true, "fresh complete zero proof")
+            .unwrap();
+        assert_eq!(gate.phase(), LivePhase::Ready);
+        assert_eq!(
+            gate.mark_forbidden_order_proof("unknown", true, "zero"),
+            Err(StartupError::UnknownAccount("unknown".to_string()))
+        );
+    }
+
+    #[test]
+    fn forbidden_proofs_are_isolated_per_account() {
+        let mut config = config();
+        let mut hedge = config.accounts[0].clone();
+        hedge.id = "hedge".to_string();
+        hedge.id_prefix = "hedge".to_string();
+        hedge.node_id = 2;
+        config.accounts.push(hedge);
+        let mut gate = StartupGate::new(&config);
+        gate.mark_metadata_verified();
+        gate.mark_storage(true, "open");
+        gate.mark_public_connectivity(true, "connected");
+        for account_id in ["main", "hedge"] {
+            gate.mark_reconciled(account_id, true, "clean").unwrap();
+            gate.mark_account_snapshot(account_id, true, "loaded")
+                .unwrap();
+            gate.mark_private_stream(account_id, true, "heartbeat")
+                .unwrap();
+        }
+        gate.mark_book("BTC-USDT", true, "snapshot").unwrap();
+        gate.mark_book("BTC-PERP", true, "snapshot").unwrap();
+
+        gate.mark_forbidden_order_proof("main", true, "main zero")
+            .unwrap();
+        assert_eq!(gate.phase(), LivePhase::AwaitingStreams);
+        gate.mark_forbidden_order_proof("hedge", true, "hedge zero")
+            .unwrap();
+        assert_eq!(gate.phase(), LivePhase::Ready);
+
+        gate.mark_forbidden_order_proof("main", false, "main proof expired")
+            .unwrap();
+        assert_eq!(gate.phase(), LivePhase::Degraded);
+        gate.mark_forbidden_order_proof("main", true, "main reverified")
+            .unwrap();
+        assert_eq!(gate.phase(), LivePhase::Ready);
     }
 
     #[test]
@@ -634,6 +735,8 @@ mod tests {
         gate.mark_book("BTC-USDT", true, "snapshot").unwrap();
         gate.mark_book("BTC-PERP", true, "snapshot").unwrap();
         gate.mark_private_stream("main", true, "heartbeat").unwrap();
+        gate.mark_forbidden_order_proof("main", true, "complete zero proof")
+            .unwrap();
 
         gate.mark_book("BTC-USDT", false, "sequence gap").unwrap();
         assert_eq!(gate.phase(), LivePhase::Degraded);
@@ -663,6 +766,8 @@ mod tests {
         gate.mark_book("BTC-USDT", true, "snapshot").unwrap();
         gate.mark_book("BTC-PERP", true, "snapshot").unwrap();
         gate.mark_private_stream("main", true, "heartbeat").unwrap();
+        gate.mark_forbidden_order_proof("main", true, "complete zero proof")
+            .unwrap();
 
         assert_eq!(gate.phase(), LivePhase::AwaitingStreams);
         assert_eq!(
@@ -709,6 +814,8 @@ mod tests {
         gate.mark_book("BTC-USDT", true, "snapshot").unwrap();
         gate.mark_book("BTC-PERP", true, "snapshot").unwrap();
         gate.mark_private_stream("main", true, "heartbeat").unwrap();
+        gate.mark_forbidden_order_proof("main", true, "complete zero proof")
+            .unwrap();
 
         assert_eq!(gate.phase(), LivePhase::AwaitingStreams);
         assert_eq!(
@@ -757,6 +864,8 @@ mod tests {
         gate.mark_book("BTC-USDT", true, "snapshot").unwrap();
         gate.mark_book("BTC-PERP", true, "snapshot").unwrap();
         gate.mark_private_stream("main", true, "heartbeat").unwrap();
+        gate.mark_forbidden_order_proof("main", true, "complete zero proof")
+            .unwrap();
 
         assert_eq!(
             gate.snapshot().missing_strategy_references,

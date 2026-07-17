@@ -17,6 +17,7 @@ use reap_storage::{
 use reap_strategy::{ChaosExecutionIntent, ChaosStrategy};
 use thiserror::Error;
 
+use crate::forbidden_orders::ForbiddenOrderEvent;
 use crate::regular_execution::{
     OwnedRegularOrders, RegularExecutionPolicy, RegularExecutionPolicyError,
 };
@@ -274,6 +275,44 @@ impl LiveCoordinator {
 
     pub fn mark_public_connectivity(&mut self, ready: bool, reason: impl Into<String>) {
         self.startup.mark_public_connectivity(ready, reason);
+    }
+
+    pub(crate) fn on_forbidden_order_event(
+        &mut self,
+        event: ForbiddenOrderEvent,
+    ) -> Result<CoordinatorOutput, CoordinatorError> {
+        if !self.manages_account(&event.account_id) {
+            return Err(CoordinatorError::UnknownAccount(event.account_id));
+        }
+        let verified_zero = event.state.is_verified_zero();
+        let reason = event
+            .state
+            .failure_reason()
+            .unwrap_or_else(|| "fresh complete forbidden-order zero proof".to_string());
+        self.startup.mark_forbidden_order_proof(
+            &event.account_id,
+            verified_zero,
+            reason.clone(),
+        )?;
+        if verified_zero {
+            return Ok(CoordinatorOutput::default());
+        }
+
+        self.startup
+            .mark_reconciled(&event.account_id, false, reason.clone())?;
+        let mut output = CoordinatorOutput::default();
+        self.ensure_account_cancels(
+            event.observed_at_ms,
+            &event.account_id,
+            &reason,
+            &mut output,
+        );
+        output.actions.push(LiveAction::Reconcile(ReconcileAction {
+            ts_ms: event.observed_at_ms,
+            account_id: event.account_id,
+            reason,
+        }));
+        Ok(output)
     }
 
     pub fn private_state(&self, account_id: &str) -> Option<&PrivateStateReducer> {
@@ -1581,6 +1620,7 @@ mod tests {
     use reap_venue::okx::{OkxAccountLevel, OkxInstrumentType, OkxPositionMode};
     use reap_venue::{PrivateOrderState, PrivateOrderUpdate, RemoteFill, RemoteOrder};
 
+    use crate::forbidden_orders::{ForbiddenOrderEvent, ForbiddenOrderState};
     use crate::{
         LiveAccountConfig, LiveStorageConfig, OkxTradeModeConfig, OkxVenueConfig, RuntimeConfig,
         VerifiedInstrument,
@@ -1852,6 +1892,10 @@ mod tests {
             symbol: None,
             reason: "all sessions authenticated".to_string(),
         }));
+        coordinator
+            .startup
+            .mark_forbidden_order_proof("main", true, "complete zero proof")
+            .unwrap();
         seed_strategy_references(coordinator, 2);
     }
 
@@ -1915,6 +1959,10 @@ mod tests {
                     remote_recent_fills: 0,
                     reason: "clean".to_string(),
                 })
+                .unwrap();
+            coordinator
+                .startup
+                .mark_forbidden_order_proof(account_id, true, "complete zero proof")
                 .unwrap();
         }
         for symbol in ["BTC-USDT", "BTC-PERP"] {
@@ -2039,6 +2087,10 @@ mod tests {
             symbol: None,
             reason: "all sessions authenticated".to_string(),
         }));
+        coordinator
+            .startup
+            .mark_forbidden_order_proof("main", true, "complete zero proof")
+            .unwrap();
         seed_strategy_references(&mut coordinator, 2);
 
         assert!(!coordinator.readiness().is_ready());
@@ -3454,6 +3506,82 @@ mod tests {
                 if event.kind == SystemEventKind::ReconcileDrift
                     && event.account_id.as_deref() == Some("main")
         )));
+    }
+
+    #[test]
+    fn forbidden_state_blocks_placement_cancels_owned_regular_and_requires_clean_reconcile() {
+        let mut coordinator = coordinator();
+        ready(&mut coordinator);
+        coordinator
+            .restore_owned_order(
+                "main",
+                OrderUpdate {
+                    ts_ms: 2,
+                    order_id: "live-order".to_string(),
+                    symbol: "BTC-USDT".to_string(),
+                    side: Side::Sell,
+                    event: OrderEvent::New,
+                    status: OrderStatus::Live,
+                    price: 101.0,
+                    time_in_force: Some(TimeInForce::PostOnly),
+                    qty: 0.1,
+                    open_qty: 0.1,
+                    filled_qty: 0.0,
+                    avg_fill_price: 0.0,
+                    last_fill_qty: 0.0,
+                    last_fill_price: 0.0,
+                    last_fill_liquidity: None,
+                    last_fill_fee: None,
+                    reason: "quote".to_string(),
+                },
+            )
+            .unwrap();
+
+        let output = coordinator
+            .on_forbidden_order_event(ForbiddenOrderEvent {
+                account_id: "main".to_string(),
+                observed_at_ms: 3,
+                state: ForbiddenOrderState::NonZero {
+                    algo_orders_observed: Some(1),
+                    spread_orders_observed: Some(0),
+                },
+            })
+            .unwrap();
+        assert!(!coordinator.readiness().is_ready());
+        assert!(output.actions.iter().any(|action| matches!(
+            action,
+            LiveAction::Cancel(cancel) if cancel.client_order_id == "live-order"
+        )));
+        assert!(output.actions.iter().any(|action| matches!(
+            action,
+            LiveAction::Reconcile(reconcile) if reconcile.account_id == "main"
+        )));
+
+        coordinator
+            .on_forbidden_order_event(ForbiddenOrderEvent {
+                account_id: "main".to_string(),
+                observed_at_ms: 4,
+                state: ForbiddenOrderState::VerifiedZero {
+                    expires_at_ms: 30_004,
+                },
+            })
+            .unwrap();
+        assert!(
+            !coordinator.readiness().is_ready(),
+            "a fresh zero proof must not bypass the clean-reconciliation requirement"
+        );
+        coordinator
+            .on_reconciliation(ReconciliationResult {
+                account_id: "main".to_string(),
+                ts_ms: 5,
+                clean: true,
+                local_live_orders: 1,
+                remote_live_orders: 1,
+                remote_recent_fills: 0,
+                reason: "regular state is clean".to_string(),
+            })
+            .unwrap();
+        assert!(coordinator.readiness().is_ready());
     }
 
     #[test]

@@ -9,6 +9,7 @@ mod deadman_certification;
 mod economic_statement;
 mod fault_campaign;
 mod fill_collection;
+mod forbidden_orders;
 mod host;
 mod latency;
 mod live_verification;

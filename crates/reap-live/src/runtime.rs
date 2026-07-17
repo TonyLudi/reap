@@ -47,6 +47,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::convergence::{FillConvergenceGuard, OrderStateConvergenceGuard};
+use crate::forbidden_orders::{
+    ForbiddenOrderEvent, ForbiddenOrderObserverPort, ForbiddenSentinelPolicy,
+    run_forbidden_order_sentinel,
+};
 use crate::order_ws::{
     OkxOrderWsConfig, OkxOrderWsRuntime, OkxOrderWsStatus, OkxOrderWsStatusKind, spawn_okx_order_ws,
 };
@@ -1768,6 +1772,7 @@ struct LiveRuntime {
     storage_sink: StorageSink,
     control_rx: mpsc::Receiver<RuntimeEvent>,
     feed_rx: mpsc::Receiver<RuntimeEvent>,
+    forbidden_rx: mpsc::Receiver<ForbiddenOrderEvent>,
     order_senders: HashMap<String, mpsc::Sender<OrderTaskCommand>>,
     order_tasks: Vec<JoinHandle<()>>,
     reconcile_senders: HashMap<String, mpsc::Sender<ReconcileTaskCommand>>,
@@ -1776,6 +1781,7 @@ struct LiveRuntime {
     order_ws_status_tasks: Vec<JoinHandle<()>>,
     safety_senders: HashMap<String, mpsc::Sender<SafetyTaskCommand>>,
     safety_tasks: Vec<JoinHandle<()>>,
+    forbidden_tasks: Vec<JoinHandle<()>>,
     feeds: Vec<SupervisedFeed>,
     feed_tasks: Vec<JoinHandle<()>>,
     sources: Vec<FeedSourceState>,
@@ -1856,6 +1862,12 @@ impl LiveRuntime {
     ) -> Result<Self, LiveRuntimeError> {
         validate_runtime_connectivity_plan(&config, &connectivity_plan, mode)?;
         let maintenance_relevance = connectivity_plan.maintenance_relevance().clone();
+        let forbidden_policy = ForbiddenSentinelPolicy::from_plan(
+            connectivity_plan.forbidden_proof_policy(),
+            config.runtime.max_order_reconciliation_pages,
+            config.runtime.pacing_policy(),
+        )
+        .map_err(LiveRuntimeError::Subscription)?;
         let planned_public_subscriptions = runtime_public_subscriptions(&connectivity_plan)?;
         let public_subscriptions = planned_public_subscriptions
             .iter()
@@ -2110,6 +2122,7 @@ impl LiveRuntime {
 
         let (control_tx, control_rx) = mpsc::channel(config.runtime.event_channel_capacity);
         let (feed_tx, feed_rx) = mpsc::channel(config.runtime.event_channel_capacity);
+        let (forbidden_tx, forbidden_rx) = mpsc::channel(config.runtime.event_channel_capacity);
         let mut host_guard = config
             .host_guard
             .enabled
@@ -2152,6 +2165,7 @@ impl LiveRuntime {
         let mut order_ws_status_tasks = StartupTaskGroup::default();
         let mut safety_senders = HashMap::new();
         let mut safety_tasks = StartupTaskGroup::default();
+        let mut forbidden_tasks = StartupTaskGroup::default();
         for (seed_index, seed) in seeds.into_iter().enumerate() {
             let AccountSeed {
                 account_id,
@@ -2188,8 +2202,6 @@ impl LiveRuntime {
                     ),
                 });
             }
-            // Phase 4 wires the already-narrow observer into its recurring scan.
-            let _forbidden_order_observer = forbidden_observer;
             let deadman_timeout_secs = planned_session_count.and(
                 safety
                     .as_ref()
@@ -2229,6 +2241,12 @@ impl LiveRuntime {
                     lead_ms: config.runtime.exchange_status_lead_ms,
                 },
                 instrument_guard,
+            )));
+            forbidden_tasks.push(tokio::spawn(run_forbidden_order_sentinel(
+                account_id.clone(),
+                Arc::new(forbidden_observer) as Arc<dyn ForbiddenOrderObserverPort>,
+                forbidden_policy.clone(),
+                forbidden_tx.clone(),
             )));
             let private_adapter: Arc<dyn VenueAdapter> = Arc::new(
                 OkxAdapter::new(&config.venue.public_ws_url, &config.venue.private_ws_url)
@@ -2356,6 +2374,7 @@ impl LiveRuntime {
             storage_sink,
             control_rx,
             feed_rx,
+            forbidden_rx,
             order_senders,
             order_tasks: order_tasks.take(),
             reconcile_senders,
@@ -2364,6 +2383,7 @@ impl LiveRuntime {
             order_ws_status_tasks: order_ws_status_tasks.take(),
             safety_senders,
             safety_tasks: safety_tasks.take(),
+            forbidden_tasks: forbidden_tasks.take(),
             feeds,
             feed_tasks: feed_tasks.take(),
             sources,
@@ -2669,6 +2689,11 @@ impl LiveRuntime {
                         self.handle_runtime_event(event).await?;
                         Ok(None)
                     }
+                    event = self.forbidden_rx.recv() => {
+                        let event = event.ok_or(LiveRuntimeError::EventChannelClosed)?;
+                        self.handle_forbidden_order_event(event).await?;
+                        Ok(None)
+                    }
                     operator = receive_operator(&mut self.operator_rx) => {
                         let operator = operator.ok_or(LiveRuntimeError::OperatorChannelClosed)?;
                         self.handle_operator_envelope(operator).await?;
@@ -2843,6 +2868,11 @@ impl LiveRuntime {
                         self.handle_runtime_event(event).await?;
                     }
                 }
+                event = self.forbidden_rx.recv(), if !self.forbidden_rx.is_closed() => {
+                    if let Some(event) = event {
+                        self.handle_forbidden_order_event(event).await?;
+                    }
+                }
                 event = self.feed_rx.recv(), if !self.feed_rx.is_closed() => {
                     if let Some(event) = event {
                         self.handle_runtime_event(event).await?;
@@ -2886,6 +2916,14 @@ impl LiveRuntime {
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
         }
+        let pending_forbidden = self.forbidden_rx.len();
+        for _ in 0..pending_forbidden {
+            match self.forbidden_rx.try_recv() {
+                Ok(event) => self.handle_forbidden_order_event(event).await?,
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
         let pending_feed = self.feed_rx.len();
         for _ in 0..pending_feed {
             match self.feed_rx.try_recv() {
@@ -2902,6 +2940,16 @@ impl LiveRuntime {
         for _ in 0..pending_control {
             match self.control_rx.try_recv() {
                 Ok(event) => self.handle_runtime_event(event).await?,
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    return Err(LiveRuntimeError::EventChannelClosed);
+                }
+            }
+        }
+        let pending_forbidden = self.forbidden_rx.len();
+        for _ in 0..pending_forbidden {
+            match self.forbidden_rx.try_recv() {
+                Ok(event) => self.handle_forbidden_order_event(event).await?,
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     return Err(LiveRuntimeError::EventChannelClosed);
@@ -3127,6 +3175,39 @@ impl LiveRuntime {
             shutdown_in_progress: self.shutdown_in_progress
                 || self.operator_shutdown_reason.is_some(),
         }
+    }
+
+    async fn handle_forbidden_order_event(
+        &mut self,
+        mut event: ForbiddenOrderEvent,
+    ) -> Result<(), LiveRuntimeError> {
+        event.expire_delayed_zero_proof(unix_time_ms());
+        let alert = event.state.alert_code().map(|code| {
+            let reason = event
+                .state
+                .failure_reason()
+                .expect("nonzero forbidden state must have a failure reason");
+            let mut alert = AlertEvent::new(
+                AlertSeverity::Critical,
+                "forbidden_order_sentinel",
+                code,
+                format!(
+                    "account {}: {reason}; run the separate reap-emergency executable",
+                    event.account_id
+                ),
+            )
+            .with_attribute("account_id", &event.account_id);
+            alert.ts_ms = event.observed_at_ms;
+            alert
+        });
+        let output = self.coordinator.on_forbidden_order_event(event)?;
+        // Canonical regular cancellation/reconciliation dispatch stays ahead of
+        // telemetry work when the proof becomes invalid.
+        self.commit_output(output).await?;
+        if let Some(alert) = alert {
+            self.emit_alert(alert)?;
+        }
+        Ok(())
     }
 
     async fn handle_runtime_event(&mut self, event: RuntimeEvent) -> Result<(), LiveRuntimeError> {
@@ -4171,7 +4252,11 @@ impl LiveRuntime {
         }
         self.safety_senders.clear();
         self.control_rx.close();
+        self.forbidden_rx.close();
         self.feed_rx.close();
+        for task in &self.forbidden_tasks {
+            task.abort();
+        }
         if let Some(host_guard) = self.host_guard.take() {
             match host_guard.shutdown().await {
                 Ok(stats) => {
@@ -4233,6 +4318,14 @@ impl LiveRuntime {
             }
         }
         self.safety_tasks.clear();
+        for task in &mut self.forbidden_tasks {
+            if let Err(error) = task.await
+                && !error.is_cancelled()
+            {
+                errors.push(("forbidden-order sentinel", LiveRuntimeError::Join(error)));
+            }
+        }
+        self.forbidden_tasks.clear();
         if let Some(storage) = self.storage.as_mut()
             && let Err(error) = storage.stop_writer().await
         {
@@ -4295,6 +4388,7 @@ impl LiveRuntime {
         self.reconcile_senders.clear();
         self.safety_senders.clear();
         self.control_rx.close();
+        self.forbidden_rx.close();
         self.feed_rx.close();
 
         for task in self
@@ -4304,6 +4398,7 @@ impl LiveRuntime {
             .chain(self.reconcile_tasks.iter())
             .chain(self.order_ws_status_tasks.iter())
             .chain(self.safety_tasks.iter())
+            .chain(self.forbidden_tasks.iter())
         {
             task.abort();
         }
@@ -4312,6 +4407,7 @@ impl LiveRuntime {
         self.reconcile_tasks.clear();
         self.order_ws_status_tasks.clear();
         self.safety_tasks.clear();
+        self.forbidden_tasks.clear();
 
         self.feeds.clear();
         self.order_ws_runtimes.clear();
@@ -5811,6 +5907,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{Notify, Semaphore, oneshot};
 
+    use crate::forbidden_orders::ForbiddenOrderState;
     use crate::{
         LiveAccountConfig, LiveStorageConfig, OkxTradeModeConfig, OkxVenueConfig, RuntimeConfig,
         VerifiedInstrument,
@@ -6895,6 +6992,15 @@ mod tests {
             symbol: None,
             reason: "test order sockets".to_string(),
         }));
+        coordinator
+            .on_forbidden_order_event(ForbiddenOrderEvent {
+                account_id: "main".to_string(),
+                observed_at_ms: now_ms,
+                state: ForbiddenOrderState::VerifiedZero {
+                    expires_at_ms: now_ms + 30_000,
+                },
+            })
+            .unwrap();
         for requirement in config.strategy.reference_data_requirements() {
             let event = match requirement.kind {
                 ReferenceDataKind::IndexPrice => MarketEvent::IndexPrice {
@@ -7574,6 +7680,7 @@ mod tests {
             .unwrap();
         let (control_tx, control_rx) = mpsc::channel(16);
         let (feed_tx, feed_rx) = mpsc::channel(16);
+        let (_forbidden_tx, forbidden_rx) = mpsc::channel(16);
         let runtime = LiveRuntime {
             session_id: "test-alert-session".to_string(),
             session_started_at_ms: unix_time_ms(),
@@ -7591,6 +7698,7 @@ mod tests {
             storage_sink,
             control_rx,
             feed_rx,
+            forbidden_rx,
             order_senders: HashMap::new(),
             order_tasks: Vec::new(),
             reconcile_senders: HashMap::new(),
@@ -7599,6 +7707,7 @@ mod tests {
             order_ws_status_tasks: Vec::new(),
             safety_senders: HashMap::new(),
             safety_tasks: Vec::new(),
+            forbidden_tasks: Vec::new(),
             feeds: Vec::new(),
             feed_tasks: Vec::new(),
             sources: Vec::new(),
@@ -7690,6 +7799,7 @@ mod tests {
         let storage_sink = storage.sink();
         let (control_tx, control_rx) = mpsc::channel(16);
         let (feed_tx, feed_rx) = mpsc::channel(16);
+        let (_forbidden_tx, forbidden_rx) = mpsc::channel(16);
         let (aborted_tx, aborted_rx) = oneshot::channel();
         let stalled_task = tokio::spawn(async move {
             let _notice = AbortNotice(Some(aborted_tx));
@@ -7712,6 +7822,7 @@ mod tests {
             storage_sink,
             control_rx,
             feed_rx,
+            forbidden_rx,
             order_senders: HashMap::new(),
             order_tasks: Vec::new(),
             reconcile_senders: HashMap::new(),
@@ -7720,6 +7831,7 @@ mod tests {
             order_ws_status_tasks: Vec::new(),
             safety_senders: HashMap::new(),
             safety_tasks: Vec::new(),
+            forbidden_tasks: Vec::new(),
             feeds: Vec::new(),
             feed_tasks: vec![stalled_task],
             sources: Vec::new(),
@@ -7821,6 +7933,7 @@ mod tests {
         let storage_sink = storage.sink();
         let (control_tx, control_rx) = mpsc::channel(16);
         let (feed_tx, feed_rx) = mpsc::channel(16);
+        let (_forbidden_tx, forbidden_rx) = mpsc::channel(16);
         let (operator_tx, operator_rx) = mpsc::channel(16);
         let operator_service =
             start_operator_service(&operator_config, SECRET.to_vec(), operator_tx)
@@ -7843,6 +7956,7 @@ mod tests {
             storage_sink,
             control_rx,
             feed_rx,
+            forbidden_rx,
             order_senders: HashMap::new(),
             order_tasks: Vec::new(),
             reconcile_senders: HashMap::new(),
@@ -7851,6 +7965,7 @@ mod tests {
             order_ws_status_tasks: Vec::new(),
             safety_senders: HashMap::new(),
             safety_tasks: Vec::new(),
+            forbidden_tasks: Vec::new(),
             feeds: Vec::new(),
             feed_tasks: Vec::new(),
             sources: Vec::new(),
@@ -8045,6 +8160,7 @@ mod tests {
         storage.shutdown().await.unwrap();
         let (control_tx, control_rx) = mpsc::channel(16);
         let (feed_tx, feed_rx) = mpsc::channel(16);
+        let (_forbidden_tx, forbidden_rx) = mpsc::channel(16);
         let (order_tx, mut order_rx) = mpsc::channel(16);
         let (reconcile_tx, mut reconcile_rx) = mpsc::channel(16);
         let cancel_observed = Arc::new(AtomicBool::new(false));
@@ -8133,6 +8249,7 @@ mod tests {
             storage_sink,
             control_rx,
             feed_rx,
+            forbidden_rx,
             order_senders: HashMap::from([("main".to_string(), order_tx)]),
             order_tasks: vec![order_task],
             reconcile_senders: HashMap::from([("main".to_string(), reconcile_tx)]),
@@ -8141,6 +8258,7 @@ mod tests {
             order_ws_status_tasks: Vec::new(),
             safety_senders: HashMap::new(),
             safety_tasks: Vec::new(),
+            forbidden_tasks: Vec::new(),
             feeds: Vec::new(),
             feed_tasks: Vec::new(),
             sources: Vec::new(),
