@@ -1,15 +1,30 @@
-use super::*;
+use std::collections::HashMap;
 
-pub(super) struct AccountSeed {
-    pub(super) account_id: String,
-    pub(super) readiness: Arc<dyn ReadinessPort>,
-    pub(super) reconciliation: OkxReconciliationClient,
-    pub(super) forbidden_observer: ForbiddenOrderObserver,
-    pub(super) private_state_sessions: PrivateStateSessionFactory,
-    pub(super) gateway: Option<LiveGateway>,
-    pub(super) safety: Option<Arc<dyn SafetyPort>>,
-    pub(super) regular_order_sessions: Option<RegularOrderSessionFactory>,
-    pub(super) instrument_guard: ExchangeInstrumentGuard,
+use async_trait::async_trait;
+use reap_okx_live_adapter::{LiveReadiness, LiveSafety};
+use reap_venue::okx::{
+    OkxInstrument, OkxInstrumentType, OkxSystemStatus, OkxTradeFeeRate, RestError,
+};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+use super::{
+    ForbiddenOrderEvent, HostGuardRuntime, HostHealthError, HostHealthSnapshot,
+    MaintenanceRelevancePlan, SafetyTaskCommand,
+};
+
+pub(super) struct ReadinessSafetyState {
+    pub(super) forbidden_rx: mpsc::Receiver<ForbiddenOrderEvent>,
+    pub(super) safety_senders: HashMap<String, mpsc::Sender<SafetyTaskCommand>>,
+    pub(super) safety_tasks: Vec<JoinHandle<()>>,
+    pub(super) forbidden_tasks: Vec<JoinHandle<()>>,
+    pub(super) readiness_timeout_ms: u64,
+    pub(super) timer_interval_ms: u64,
+    pub(super) host_guard: Option<HostGuardRuntime>,
+    pub(super) host_failures: Option<mpsc::Receiver<HostHealthError>>,
+    pub(super) host_preflight: Option<HostHealthSnapshot>,
+    pub(super) host_checks: u64,
+    pub(super) host_last_snapshot: Option<HostHealthSnapshot>,
 }
 
 #[async_trait]

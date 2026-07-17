@@ -1,4 +1,39 @@
-use super::*;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
+
+use futures_util::FutureExt;
+use futures_util::future::BoxFuture;
+use futures_util::stream::{FuturesUnordered, StreamExt};
+use reap_core::AccountUpdate;
+use reap_order::{
+    CancelOutcome, GatewayError, OkxOrderGateway, PreparedOrder, SubmitOutcome, SubmitPreparation,
+    okx_order_dispatch_key,
+};
+use reap_telemetry::{AlertDeliveryFailure, AlertRuntime, AlertSink, AlertStats};
+use reap_venue::{RemoteFill, RemoteOrder};
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
+
+use super::{
+    CancelAction, ConnectionStatus, LiveRuntimeError, OkxOrderWsStatus, OperatorEnvelope,
+    OperatorService, SubmitAction, elapsed_us, unix_time_ms,
+};
+
+pub(super) struct DispatchState {
+    pub(super) control_rx: mpsc::Receiver<RuntimeEvent>,
+    pub(super) order_senders: HashMap<String, mpsc::Sender<OrderTaskCommand>>,
+    pub(super) order_tasks: Vec<JoinHandle<()>>,
+    pub(super) operator_service: Option<OperatorService>,
+    pub(super) operator_rx: Option<mpsc::Receiver<OperatorEnvelope>>,
+    pub(super) operator_shutdown_reason: Option<String>,
+    pub(super) alert_runtime: Option<AlertRuntime>,
+    pub(super) alert_sink: Option<AlertSink>,
+    pub(super) alert_failures: Option<mpsc::Receiver<AlertDeliveryFailure>>,
+    pub(super) alert_shutdown_timeout_ms: u64,
+    pub(super) alert_delivery_failure_is_fatal: bool,
+    pub(super) observed_alert_delivery_failures: u64,
+    pub(super) alert_stats: AlertStats,
+}
 
 pub(super) enum RuntimeEvent {
     Raw {

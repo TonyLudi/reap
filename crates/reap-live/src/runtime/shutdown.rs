@@ -1,4 +1,18 @@
-use super::*;
+use std::collections::HashSet;
+
+use reap_order::ReconcileReport;
+use tokio::task::JoinHandle;
+
+pub(super) struct ShutdownState {
+    pub(super) timeout_ms: u64,
+    pub(super) teardown_timeout_ms: u64,
+    pub(super) safety_latch_sync_timeout_ms: u64,
+    pub(super) in_progress: bool,
+    pub(super) storage_error: Option<String>,
+    pub(super) preserve_deadman: bool,
+    pub(super) reconciliation_requested: HashSet<String>,
+    pub(super) reconciled_accounts: HashSet<String>,
+}
 
 pub(super) fn is_zero_order_reconciliation(report: &ReconcileReport) -> bool {
     report.is_clean() && report.local_live_orders == 0 && report.remote_live_orders == 0

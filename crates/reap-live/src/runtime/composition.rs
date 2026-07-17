@@ -1,4 +1,48 @@
-use super::*;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use reap_okx_live_adapter::{
+    ForbiddenOrderObserver, PrivateStateSessionFactory, RegularOrderSessionFactory,
+};
+use reap_order::OkxReconciliationClient;
+use reap_storage::{OrderAckStatus, OrderOperation, StorageRecord, StorageRuntime, StorageSink};
+
+use super::readiness_safety::{ExchangeInstrumentGuard, ReadinessPort, SafetyPort};
+use super::{
+    LiveConfigFileEvidence, LiveFailureEvidence, LiveGateway, LiveLatencyCollector, LiveMode,
+    LiveRuntimeError, LiveStopReason, MAX_LIVE_FAILURE_MESSAGE_BYTES, OrderStatus,
+    ReadinessSnapshot, SystemEventKind,
+};
+
+pub(super) struct CompositionState {
+    pub(super) session_id: String,
+    pub(super) session_started_at_ms: u64,
+    pub(super) config_source: Option<LiveConfigFileEvidence>,
+    pub(super) config_fingerprint: String,
+    pub(super) evidence_config_fingerprint: String,
+    pub(super) executable_sha256: String,
+    pub(super) host_identity_sha256: Option<String>,
+    pub(super) account_identity_sha256s: BTreeMap<String, String>,
+    pub(super) mode: LiveMode,
+    pub(super) run_duration: Option<Duration>,
+    pub(super) storage: Option<StorageRuntime>,
+    pub(super) storage_sink: StorageSink,
+    pub(super) evidence: RuntimeEvidence,
+    pub(super) latency: LiveLatencyCollector,
+}
+
+pub(super) struct AccountSeed {
+    pub(super) account_id: String,
+    pub(super) readiness: Arc<dyn ReadinessPort>,
+    pub(super) reconciliation: OkxReconciliationClient,
+    pub(super) forbidden_observer: ForbiddenOrderObserver,
+    pub(super) private_state_sessions: PrivateStateSessionFactory,
+    pub(super) gateway: Option<LiveGateway>,
+    pub(super) safety: Option<Arc<dyn SafetyPort>>,
+    pub(super) regular_order_sessions: Option<RegularOrderSessionFactory>,
+    pub(super) instrument_guard: ExchangeInstrumentGuard,
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct RuntimeEvidence {

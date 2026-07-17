@@ -1,39 +1,31 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use async_trait::async_trait;
-use futures_util::FutureExt;
-use futures_util::future::BoxFuture;
-use futures_util::stream::{FuturesUnordered, StreamExt};
 use reap_core::{
-    AccountUpdate, BacktestLatencyClass, Channel, ConnId, FeedPriority, FillKey, MarketEvent,
-    NormalizedEvent, OrderStatus, PINNED_JAVA_REVISION, Subscription, SystemEvent, SystemEventKind,
-    TimeMs, TimerEvent, Venue,
+    BacktestLatencyClass, Channel, ConnId, FeedPriority, FillKey, MarketEvent, NormalizedEvent,
+    OrderStatus, PINNED_JAVA_REVISION, Subscription, SystemEvent, SystemEventKind, TimerEvent,
+    Venue,
 };
 use reap_feed::{
     ConnectionAttemptPacer, ConnectionStatus, ConnectionStatusKind, FeedOutput, FeedProcessor,
-    ReconnectPolicy, SocketPlan, SupervisedFeed, partition_subscriptions, spawn_supervised_feed,
+    ReconnectPolicy, SocketPlan, partition_subscriptions, spawn_supervised_feed,
 };
 use reap_okx_live_adapter::{
-    ConnectionSettings, CredentialEnvNames, ForbiddenOrderObserver, LiveReadiness, LiveSafety,
-    PrivateStateSessionFactory, RegularOrderSessionFactory, demo_from_env, observe_from_env,
+    ConnectionSettings, CredentialEnvNames, demo_from_env, observe_from_env,
 };
 use reap_order::{
-    CancelOutcome, GatewayError, OkxOrderGateway, OkxReconciliationClient, PreparedOrder,
-    ReconcileReport, SubmitOutcome, SubmitPreparation, okx_order_dispatch_key,
-    reconcile_full_state,
+    OkxOrderGateway, OkxReconciliationClient, okx_order_dispatch_key, reconcile_full_state,
 };
 use reap_storage::{
-    BootstrapRecord, OrderAckStatus, OrderOperation, OrderRequestRecord, RecoveredStorage,
-    SafetyLatchRecord, SafetyLatchScope, SafetyLatchSource, SessionStartRecord, StorageConfig,
-    StorageError, StorageRecord, StorageRuntime, StorageSink, acquire_storage_lease, recover_jsonl,
-    start_jsonl_storage_with_lease,
+    BootstrapRecord, OrderOperation, OrderRequestRecord, RecoveredStorage, SafetyLatchRecord,
+    SafetyLatchScope, SafetyLatchSource, SessionStartRecord, StorageConfig, StorageError,
+    StorageRecord, acquire_storage_lease, recover_jsonl, start_jsonl_storage_with_lease,
 };
 use reap_telemetry::{
-    AlertDeliveryFailure, AlertError, AlertEvent, AlertRuntime, AlertSeverity, AlertSink,
-    AlertStats, start_webhook_alerts,
+    AlertDeliveryFailure, AlertError, AlertEvent, AlertRuntime, AlertSeverity, AlertStats,
+    start_webhook_alerts,
 };
 use reap_venue::okx::{
     OKX_MIN_ACCOUNT_INSTRUMENT_REQUEST_INTERVAL_MS, OKX_MIN_TRADE_FEE_REQUEST_INTERVAL_MS,
@@ -44,7 +36,6 @@ use reap_venue::{PrivateOrderState, PrivateOrderUpdate, RemoteFill, RemoteOrder,
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
 
 use crate::convergence::{FillConvergenceGuard, OrderStateConvergenceGuard};
 use crate::forbidden_orders::{
@@ -82,20 +73,21 @@ mod shutdown;
 #[cfg(test)]
 use composition::truncate_utf8;
 use composition::{
-    ReadinessTracker, RunLoopFailure, RunLoopOutcome, RuntimeEvidence, combine_lifecycle_errors,
-    live_failure_evidence, live_startup_failure_evidence, qualifies_as_clean_soak,
+    AccountSeed, CompositionState, ReadinessTracker, RunLoopFailure, RunLoopOutcome,
+    RuntimeEvidence, combine_lifecycle_errors, live_failure_evidence,
+    live_startup_failure_evidence, qualifies_as_clean_soak,
 };
-use connectivity::{FeedSourceState, spawn_feed_forwarders};
+use connectivity::{ConnectivityState, FeedSourceState, spawn_feed_forwarders};
 use dispatch::{
-    OrderTaskCommand, ReconcileOrderRef, ReconcileTaskCommand, RuntimeEvent, RuntimeTaskFailure,
-    SafetyTaskCommand, order_dispatch_lane, run_order_task,
+    DispatchState, OrderTaskCommand, ReconcileOrderRef, ReconcileTaskCommand, RuntimeEvent,
+    RuntimeTaskFailure, SafetyTaskCommand, order_dispatch_lane, run_order_task,
 };
 use readiness_safety::{
-    AccountSeed, ExchangeInstrumentExpectation, ExchangeInstrumentGuard, ExchangeStatusGuard,
-    ReadinessPort, SafetyPort,
+    ExchangeInstrumentExpectation, ExchangeInstrumentGuard, ExchangeStatusGuard, ReadinessPort,
+    ReadinessSafetyState, SafetyPort,
 };
-use reconciliation::run_reconcile_task;
-use shutdown::{StartupTaskGroup, is_zero_order_reconciliation, shutdown_signal};
+use reconciliation::{ReconciliationState, run_reconcile_task};
+use shutdown::{ShutdownState, StartupTaskGroup, is_zero_order_reconciliation, shutdown_signal};
 
 type LiveGateway = OkxOrderGateway;
 pub const LIVE_RUN_REPORT_SCHEMA_VERSION: u32 = 8;
@@ -1384,69 +1376,13 @@ fn alert_for_storage_record(record: &StorageRecord) -> Option<AlertEvent> {
 }
 
 struct LiveRuntime {
-    session_id: String,
-    session_started_at_ms: u64,
-    config_source: Option<LiveConfigFileEvidence>,
-    config_fingerprint: String,
-    evidence_config_fingerprint: String,
-    executable_sha256: String,
-    host_identity_sha256: Option<String>,
-    account_identity_sha256s: BTreeMap<String, String>,
-    mode: LiveMode,
-    run_duration: Option<Duration>,
     coordinator: LiveCoordinator,
-    processor: FeedProcessor,
-    storage: Option<StorageRuntime>,
-    storage_sink: StorageSink,
-    control_rx: mpsc::Receiver<RuntimeEvent>,
-    feed_rx: mpsc::Receiver<RuntimeEvent>,
-    forbidden_rx: mpsc::Receiver<ForbiddenOrderEvent>,
-    order_senders: HashMap<String, mpsc::Sender<OrderTaskCommand>>,
-    order_tasks: Vec<JoinHandle<()>>,
-    reconcile_senders: HashMap<String, mpsc::Sender<ReconcileTaskCommand>>,
-    reconcile_tasks: Vec<JoinHandle<()>>,
-    order_ws_runtimes: Vec<OkxOrderWsRuntime>,
-    order_ws_status_tasks: Vec<JoinHandle<()>>,
-    safety_senders: HashMap<String, mpsc::Sender<SafetyTaskCommand>>,
-    safety_tasks: Vec<JoinHandle<()>>,
-    forbidden_tasks: Vec<JoinHandle<()>>,
-    feeds: Vec<SupervisedFeed>,
-    feed_tasks: Vec<JoinHandle<()>>,
-    sources: Vec<FeedSourceState>,
-    public_feed_index: usize,
-    reconcile_inflight: HashSet<String>,
-    cancel_inflight: HashSet<(String, String)>,
-    last_reconcile_attempt: HashMap<String, Instant>,
-    fill_convergence: FillConvergenceGuard,
-    order_convergence: OrderStateConvergenceGuard,
-    readiness_timeout_ms: u64,
-    timer_interval_ms: u64,
-    max_feed_age_ms: u64,
-    shutdown_timeout_ms: u64,
-    teardown_timeout_ms: u64,
-    safety_latch_sync_timeout_ms: u64,
-    evidence: RuntimeEvidence,
-    latency: LiveLatencyCollector,
-    shutdown_in_progress: bool,
-    shutdown_storage_error: Option<String>,
-    preserve_deadman_on_shutdown: bool,
-    shutdown_reconciliation_requested: HashSet<String>,
-    shutdown_reconciled_accounts: HashSet<String>,
-    operator_service: Option<OperatorService>,
-    operator_rx: Option<mpsc::Receiver<OperatorEnvelope>>,
-    operator_shutdown_reason: Option<String>,
-    alert_runtime: Option<AlertRuntime>,
-    alert_sink: Option<AlertSink>,
-    alert_failures: Option<mpsc::Receiver<AlertDeliveryFailure>>,
-    alert_shutdown_timeout_ms: u64,
-    alert_delivery_failure_is_fatal: bool,
-    observed_alert_delivery_failures: u64,
-    alert_stats: AlertStats,
-    host_guard: Option<HostGuardRuntime>,
-    host_failures: Option<mpsc::Receiver<HostHealthError>>,
-    host_preflight: Option<HostHealthSnapshot>,
-    host_checks: u64,
-    host_last_snapshot: Option<HostHealthSnapshot>,
+    composition: CompositionState,
+    connectivity: ConnectivityState,
+    dispatch: DispatchState,
+    readiness_safety: ReadinessSafetyState,
+    reconciliation: ReconciliationState,
+    shutdown: ShutdownState,
 }
 
 impl LiveRuntime {
@@ -1950,72 +1886,84 @@ impl LiveRuntime {
         }
 
         let mut runtime = Self {
-            session_id,
-            session_started_at_ms,
-            config_source,
-            config_fingerprint,
-            evidence_config_fingerprint,
-            executable_sha256,
-            host_identity_sha256,
-            account_identity_sha256s,
-            mode,
-            run_duration,
             coordinator,
-            processor: FeedProcessor::new(
-                config.runtime.dedup_capacity_per_stream,
-                config.runtime.max_sequence_buffer,
-            ),
-            storage: Some(storage),
-            storage_sink,
-            control_rx,
-            feed_rx,
-            forbidden_rx,
-            order_senders,
-            order_tasks: order_tasks.take(),
-            reconcile_senders,
-            reconcile_tasks: reconcile_tasks.take(),
-            order_ws_runtimes,
-            order_ws_status_tasks: order_ws_status_tasks.take(),
-            safety_senders,
-            safety_tasks: safety_tasks.take(),
-            forbidden_tasks: forbidden_tasks.take(),
-            feeds,
-            feed_tasks: feed_tasks.take(),
-            sources,
-            public_feed_index,
-            reconcile_inflight: HashSet::new(),
-            cancel_inflight: HashSet::new(),
-            last_reconcile_attempt: HashMap::new(),
-            fill_convergence: FillConvergenceGuard::default(),
-            order_convergence,
-            readiness_timeout_ms: config.runtime.readiness_timeout_ms,
-            timer_interval_ms: config.runtime.timer_interval_ms,
-            max_feed_age_ms: config.risk.max_feed_age_ms,
-            shutdown_timeout_ms: config.runtime.shutdown_timeout_ms,
-            teardown_timeout_ms: config.runtime.teardown_timeout_ms,
-            safety_latch_sync_timeout_ms: config.runtime.safety_latch_sync_timeout_ms,
-            evidence: RuntimeEvidence::default(),
-            latency: LiveLatencyCollector::default(),
-            shutdown_in_progress: false,
-            shutdown_storage_error: None,
-            preserve_deadman_on_shutdown: false,
-            shutdown_reconciliation_requested: HashSet::new(),
-            shutdown_reconciled_accounts: HashSet::new(),
-            operator_service: None,
-            operator_rx: None,
-            operator_shutdown_reason: None,
-            alert_runtime,
-            alert_sink,
-            alert_failures,
-            alert_shutdown_timeout_ms: config.alerts.shutdown_timeout_ms,
-            alert_delivery_failure_is_fatal: config.alerts.delivery_failure_is_fatal,
-            observed_alert_delivery_failures: 0,
-            alert_stats: AlertStats::default(),
-            host_guard,
-            host_failures,
-            host_checks: u64::from(host_preflight.is_some()),
-            host_last_snapshot: host_preflight.clone(),
-            host_preflight,
+            composition: CompositionState {
+                session_id,
+                session_started_at_ms,
+                config_source,
+                config_fingerprint,
+                evidence_config_fingerprint,
+                executable_sha256,
+                host_identity_sha256,
+                account_identity_sha256s,
+                mode,
+                run_duration,
+                storage: Some(storage),
+                storage_sink,
+                evidence: RuntimeEvidence::default(),
+                latency: LiveLatencyCollector::default(),
+            },
+            connectivity: ConnectivityState {
+                processor: FeedProcessor::new(
+                    config.runtime.dedup_capacity_per_stream,
+                    config.runtime.max_sequence_buffer,
+                ),
+                feed_rx,
+                order_ws_runtimes,
+                order_ws_status_tasks: order_ws_status_tasks.take(),
+                feeds,
+                feed_tasks: feed_tasks.take(),
+                sources,
+                public_feed_index,
+                max_feed_age_ms: config.risk.max_feed_age_ms,
+            },
+            dispatch: DispatchState {
+                control_rx,
+                order_senders,
+                order_tasks: order_tasks.take(),
+                operator_service: None,
+                operator_rx: None,
+                operator_shutdown_reason: None,
+                alert_runtime,
+                alert_sink,
+                alert_failures,
+                alert_shutdown_timeout_ms: config.alerts.shutdown_timeout_ms,
+                alert_delivery_failure_is_fatal: config.alerts.delivery_failure_is_fatal,
+                observed_alert_delivery_failures: 0,
+                alert_stats: AlertStats::default(),
+            },
+            readiness_safety: ReadinessSafetyState {
+                forbidden_rx,
+                safety_senders,
+                safety_tasks: safety_tasks.take(),
+                forbidden_tasks: forbidden_tasks.take(),
+                readiness_timeout_ms: config.runtime.readiness_timeout_ms,
+                timer_interval_ms: config.runtime.timer_interval_ms,
+                host_guard,
+                host_failures,
+                host_checks: u64::from(host_preflight.is_some()),
+                host_last_snapshot: host_preflight.clone(),
+                host_preflight,
+            },
+            reconciliation: ReconciliationState {
+                senders: reconcile_senders,
+                tasks: reconcile_tasks.take(),
+                inflight: HashSet::new(),
+                cancel_inflight: HashSet::new(),
+                last_attempt: HashMap::new(),
+                fill_convergence: FillConvergenceGuard::default(),
+                order_convergence,
+            },
+            shutdown: ShutdownState {
+                timeout_ms: config.runtime.shutdown_timeout_ms,
+                teardown_timeout_ms: config.runtime.teardown_timeout_ms,
+                safety_latch_sync_timeout_ms: config.runtime.safety_latch_sync_timeout_ms,
+                in_progress: false,
+                storage_error: None,
+                preserve_deadman: false,
+                reconciliation_requested: HashSet::new(),
+                reconciled_accounts: HashSet::new(),
+            },
         };
         for output in initial_outputs {
             if let Err(primary) = runtime.commit_output(output).await {
@@ -2023,15 +1971,18 @@ impl LiveRuntime {
                 return Err(runtime.close_after_error(primary, &context).await);
             }
         }
-        runtime.evidence.begin_live_session(restored_safety_latches);
-        runtime.fill_convergence = fill_convergence;
+        runtime
+            .composition
+            .evidence
+            .begin_live_session(restored_safety_latches);
+        runtime.reconciliation.fill_convergence = fill_convergence;
         if let Some(secret) = operator_secret {
             let (operator_tx, operator_rx) =
                 mpsc::channel(operator_config.command_channel_capacity);
             match start_operator_service(&operator_config, secret, operator_tx).await {
                 Ok(service) => {
-                    runtime.operator_service = Some(service);
-                    runtime.operator_rx = Some(operator_rx);
+                    runtime.dispatch.operator_service = Some(service);
+                    runtime.dispatch.operator_rx = Some(operator_rx);
                 }
                 Err(error) => {
                     let primary = LiveRuntimeError::Operator(error);
@@ -2049,7 +2000,7 @@ impl LiveRuntime {
         context: &str,
     ) -> LiveRuntimeError {
         let readiness_at_stop = self.coordinator.readiness();
-        let elapsed_ms = unix_time_ms().saturating_sub(self.session_started_at_ms);
+        let elapsed_ms = unix_time_ms().saturating_sub(self.composition.session_started_at_ms);
         let stop_result = self.graceful_stop(context).await;
         let shutdown_result = self.shutdown().await;
         let mut additional = Vec::new();
@@ -2087,6 +2038,7 @@ impl LiveRuntime {
             Ok(outcome) => match outcome.stop_reason {
                 LiveStopReason::OperatorSignal => "operator signal".to_string(),
                 LiveStopReason::OperatorCommand => self
+                    .dispatch
                     .operator_shutdown_reason
                     .clone()
                     .unwrap_or_else(|| "authenticated operator command".to_string()),
@@ -2150,29 +2102,29 @@ impl LiveRuntime {
         failure: Option<LiveFailureEvidence>,
     ) -> LiveRunReport {
         let readiness = self.coordinator.readiness();
-        let dropped_storage_records = self.storage_sink.dropped_records();
+        let dropped_storage_records = self.composition.storage_sink.dropped_records();
         let active_orders_after_shutdown = self.coordinator.active_order_count();
-        let evidence = self.evidence;
+        let evidence = self.composition.evidence;
         let clean_soak = qualifies_as_clean_soak(
             &outcome,
             evidence,
             dropped_storage_records,
             active_orders_after_shutdown,
-            self.alert_stats.failed,
+            self.dispatch.alert_stats.failed,
         );
         LiveRunReport {
             schema_version: LIVE_RUN_REPORT_SCHEMA_VERSION,
-            session_id: Some(self.session_id.clone()),
-            session_started_at_ms: self.session_started_at_ms,
-            config_source: self.config_source.clone(),
-            config_fingerprint: self.config_fingerprint.clone(),
-            evidence_config_fingerprint: self.evidence_config_fingerprint.clone(),
+            session_id: Some(self.composition.session_id.clone()),
+            session_started_at_ms: self.composition.session_started_at_ms,
+            config_source: self.composition.config_source.clone(),
+            config_fingerprint: self.composition.config_fingerprint.clone(),
+            evidence_config_fingerprint: self.composition.evidence_config_fingerprint.clone(),
             java_reference_revision: PINNED_JAVA_REVISION.to_string(),
             reap_version: env!("CARGO_PKG_VERSION").to_string(),
-            executable_sha256: self.executable_sha256.clone(),
-            host_identity_sha256: self.host_identity_sha256.clone(),
-            account_identity_sha256s: self.account_identity_sha256s.clone(),
-            mode: self.mode,
+            executable_sha256: self.composition.executable_sha256.clone(),
+            host_identity_sha256: self.composition.host_identity_sha256.clone(),
+            account_identity_sha256s: self.composition.account_identity_sha256s.clone(),
+            mode: self.composition.mode,
             stop_reason: outcome.stop_reason,
             failure,
             elapsed_ms: outcome.elapsed_ms,
@@ -2197,18 +2149,21 @@ impl LiveRuntime {
             operator_commands: evidence.operator_commands,
             operator_mutations: evidence.operator_mutations,
             max_storage_queue_depth: evidence.max_storage_queue_depth,
-            alerts_delivered: self.alert_stats.delivered,
-            alert_delivery_failures: self.alert_stats.failed,
-            alert_failure_notifications_dropped: self.alert_stats.failure_notifications_dropped,
-            max_alert_queue_depth: self.alert_stats.max_queue_depth,
-            host_preflight: self.host_preflight.clone(),
-            host_checks: self.host_checks,
-            host_last_snapshot: self.host_last_snapshot.clone(),
+            alerts_delivered: self.dispatch.alert_stats.delivered,
+            alert_delivery_failures: self.dispatch.alert_stats.failed,
+            alert_failure_notifications_dropped: self
+                .dispatch
+                .alert_stats
+                .failure_notifications_dropped,
+            max_alert_queue_depth: self.dispatch.alert_stats.max_queue_depth,
+            host_preflight: self.readiness_safety.host_preflight.clone(),
+            host_checks: self.readiness_safety.host_checks,
+            host_last_snapshot: self.readiness_safety.host_last_snapshot.clone(),
             readiness_at_stop: outcome.readiness_at_stop,
             readiness,
             dropped_storage_records,
             active_orders_after_shutdown,
-            latency_evidence: self.latency.report(),
+            latency_evidence: self.composition.latency.report(),
             clean_soak,
         }
     }
@@ -2219,11 +2174,13 @@ impl LiveRuntime {
         let initial_readiness = self.coordinator.readiness();
         readiness_tracker.observe(0, &initial_readiness);
         let mut last_phase = initial_readiness.phase;
-        let mut timer = tokio::time::interval(Duration::from_millis(self.timer_interval_ms));
+        let mut timer = tokio::time::interval(Duration::from_millis(
+            self.readiness_safety.timer_interval_ms,
+        ));
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let shutdown = shutdown_signal();
         tokio::pin!(shutdown);
-        let run_duration = self.run_duration;
+        let run_duration = self.composition.run_duration;
         let duration_elapsed = async move {
             match run_duration {
                 Some(duration) => tokio::time::sleep(duration).await,
@@ -2253,9 +2210,10 @@ impl LiveRuntime {
                             self.coordinator.readiness(),
                         )))
                     }
-                    failure = receive_alert_failure(&mut self.alert_failures) => {
+                    failure = receive_alert_failure(&mut self.dispatch.alert_failures) => {
                         let failure = failure.ok_or(LiveRuntimeError::AlertMonitorClosed)?;
-                        self.observed_alert_delivery_failures = self
+                        self.dispatch.observed_alert_delivery_failures = self
+                            .dispatch
                             .observed_alert_delivery_failures
                             .saturating_add(1);
                         tracing::error!(
@@ -2265,7 +2223,7 @@ impl LiveRuntime {
                             reason = %failure.reason,
                             "external alert delivery failed"
                         );
-                        if self.alert_delivery_failure_is_fatal {
+                        if self.dispatch.alert_delivery_failure_is_fatal {
                             Err(LiveRuntimeError::AlertDelivery {
                                 code: failure.code,
                                 attempts: failure.attempts,
@@ -2275,36 +2233,36 @@ impl LiveRuntime {
                             Ok(None)
                         }
                     }
-                    failure = receive_host_failure(&mut self.host_failures) => {
+                    failure = receive_host_failure(&mut self.readiness_safety.host_failures) => {
                         let failure = failure.ok_or(LiveRuntimeError::HostGuardClosed)?;
                         Err(failure.into())
                     }
-                    event = self.control_rx.recv() => {
+                    event = self.dispatch.control_rx.recv() => {
                         let event = event.ok_or(LiveRuntimeError::EventChannelClosed)?;
                         self.handle_runtime_event(event).await?;
                         Ok(None)
                     }
-                    event = self.forbidden_rx.recv() => {
+                    event = self.readiness_safety.forbidden_rx.recv() => {
                         let event = event.ok_or(LiveRuntimeError::EventChannelClosed)?;
                         self.handle_forbidden_order_event(event).await?;
                         Ok(None)
                     }
-                    operator = receive_operator(&mut self.operator_rx) => {
+                    operator = receive_operator(&mut self.dispatch.operator_rx) => {
                         let operator = operator.ok_or(LiveRuntimeError::OperatorChannelClosed)?;
                         self.handle_operator_envelope(operator).await?;
                         Ok(None)
                     }
                     _ = timer.tick() => {
                         let now_ms = unix_time_ms();
-                        for event in self.processor.mark_stale(
+                        for event in self.connectivity.processor.mark_stale(
                             now_ms,
                             self.coordinator_risk_max_feed_age(),
                         ) {
                             let output = self.coordinator.process_event(NormalizedEvent::System(event));
                             self.commit_output(output).await?;
                         }
-                        for breach in self.fill_convergence.expire(now_ms) {
-                            self.evidence.observe_fill_convergence_timeout();
+                        for breach in self.reconciliation.fill_convergence.expire(now_ms) {
+                            self.composition.evidence.observe_fill_convergence_timeout();
                             let output = self.coordinator.reconciliation_fault(
                                 &breach.account_id,
                                 now_ms,
@@ -2313,10 +2271,10 @@ impl LiveRuntime {
                             )?;
                             self.commit_output(output).await?;
                         }
-                        for breach in self.order_convergence.expire(now_ms) {
-                            self.evidence.observe_order_convergence_timeout();
+                        for breach in self.reconciliation.order_convergence.expire(now_ms) {
+                            self.composition.evidence.observe_order_convergence_timeout();
                             for order_id in &breach.expired_cancel_order_ids {
-                                self.cancel_inflight
+                                self.reconciliation.cancel_inflight
                                     .remove(&(breach.account_id.clone(), order_id.clone()));
                             }
                             let output = self.coordinator.reconciliation_fault(
@@ -2335,7 +2293,7 @@ impl LiveRuntime {
                         self.retry_reconciliation(now_ms)?;
                         Ok(None)
                     }
-                    event = self.feed_rx.recv() => {
+                    event = self.connectivity.feed_rx.recv() => {
                         let event = event.ok_or(LiveRuntimeError::EventChannelClosed)?;
                         self.handle_runtime_event(event).await?;
                         Ok(None)
@@ -2366,7 +2324,7 @@ impl LiveRuntime {
                 tracing::info!(from = ?last_phase, to = ?readiness.phase, ?readiness, "live readiness changed");
                 last_phase = readiness.phase;
             }
-            if self.operator_shutdown_reason.is_some() {
+            if self.dispatch.operator_shutdown_reason.is_some() {
                 return Ok(readiness_tracker.finish(
                     LiveStopReason::OperatorCommand,
                     elapsed_ms,
@@ -2374,9 +2332,10 @@ impl LiveRuntime {
                 ));
             }
             if !readiness_tracker.reached_ready
-                && started.elapsed() > Duration::from_millis(self.readiness_timeout_ms)
+                && started.elapsed()
+                    > Duration::from_millis(self.readiness_safety.readiness_timeout_ms)
             {
-                if self.run_duration.is_some() {
+                if self.composition.run_duration.is_some() {
                     let outcome = readiness_tracker.finish(
                         LiveStopReason::ReadinessTimeout,
                         elapsed_ms,
@@ -2385,7 +2344,9 @@ impl LiveRuntime {
                     return Ok(outcome);
                 }
                 return Err(RunLoopFailure {
-                    error: LiveRuntimeError::ReadinessTimeout(self.readiness_timeout_ms),
+                    error: LiveRuntimeError::ReadinessTimeout(
+                        self.readiness_safety.readiness_timeout_ms,
+                    ),
                     outcome: readiness_tracker.finish(
                         LiveStopReason::RuntimeFailure,
                         elapsed_ms,
@@ -2397,16 +2358,16 @@ impl LiveRuntime {
     }
 
     fn coordinator_risk_max_feed_age(&self) -> u64 {
-        self.max_feed_age_ms
+        self.connectivity.max_feed_age_ms
     }
 
     async fn graceful_stop(&mut self, reason: &str) -> Result<(), LiveRuntimeError> {
-        if self.mode != LiveMode::Demo {
+        if self.composition.mode != LiveMode::Demo {
             return Ok(());
         }
-        self.shutdown_in_progress = true;
+        self.shutdown.in_progress = true;
         let result = match tokio::time::timeout(
-            Duration::from_millis(self.shutdown_timeout_ms),
+            Duration::from_millis(self.shutdown.timeout_ms),
             self.graceful_stop_inner(reason),
         )
         .await
@@ -2414,7 +2375,7 @@ impl LiveRuntime {
             Ok(result) => result,
             Err(_) => Err(self.shutdown_unresolved_error()),
         };
-        match (result, self.shutdown_storage_error.take()) {
+        match (result, self.shutdown.storage_error.take()) {
             (Ok(()), None) => Ok(()),
             (Ok(()), Some(error)) => Err(LiveRuntimeError::ShutdownStorage(error)),
             (Err(primary), None) => Err(primary),
@@ -2448,27 +2409,27 @@ impl LiveRuntime {
             let readiness = self.coordinator.readiness();
             if self.coordinator.active_order_count() == 0
                 && readiness.missing_reconciliation.is_empty()
-                && self.reconcile_inflight.is_empty()
-                && self.shutdown_reconciled_accounts.len() == self.order_senders.len()
+                && self.reconciliation.inflight.is_empty()
+                && self.shutdown.reconciled_accounts.len() == self.dispatch.order_senders.len()
             {
-                if !self.preserve_deadman_on_shutdown {
+                if !self.shutdown.preserve_deadman {
                     self.disable_deadman_all().await?;
                 }
                 return Ok(());
             }
             tokio::select! {
                 biased;
-                event = self.control_rx.recv(), if !self.control_rx.is_closed() => {
+                event = self.dispatch.control_rx.recv(), if !self.dispatch.control_rx.is_closed() => {
                     if let Some(event) = event {
                         self.handle_runtime_event(event).await?;
                     }
                 }
-                event = self.forbidden_rx.recv(), if !self.forbidden_rx.is_closed() => {
+                event = self.readiness_safety.forbidden_rx.recv(), if !self.readiness_safety.forbidden_rx.is_closed() => {
                     if let Some(event) = event {
                         self.handle_forbidden_order_event(event).await?;
                     }
                 }
-                event = self.feed_rx.recv(), if !self.feed_rx.is_closed() => {
+                event = self.connectivity.feed_rx.recv(), if !self.connectivity.feed_rx.is_closed() => {
                     if let Some(event) = event {
                         self.handle_runtime_event(event).await?;
                     }
@@ -2488,12 +2449,13 @@ impl LiveRuntime {
                 .readiness()
                 .missing_reconciliation
                 .into_iter()
-                .chain(self.reconcile_inflight.iter().cloned())
+                .chain(self.reconciliation.inflight.iter().cloned())
                 .chain(
-                    self.order_senders
+                    self.dispatch
+                        .order_senders
                         .keys()
                         .filter(|account_id| {
-                            !self.shutdown_reconciled_accounts.contains(*account_id)
+                            !self.shutdown.reconciled_accounts.contains(*account_id)
                         })
                         .cloned(),
                 )
@@ -2503,25 +2465,25 @@ impl LiveRuntime {
     }
 
     async fn drain_shutdown_events(&mut self) -> Result<(), LiveRuntimeError> {
-        let pending_control = self.control_rx.len();
+        let pending_control = self.dispatch.control_rx.len();
         for _ in 0..pending_control {
-            match self.control_rx.try_recv() {
+            match self.dispatch.control_rx.try_recv() {
                 Ok(event) => self.handle_runtime_event(event).await?,
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
         }
-        let pending_forbidden = self.forbidden_rx.len();
+        let pending_forbidden = self.readiness_safety.forbidden_rx.len();
         for _ in 0..pending_forbidden {
-            match self.forbidden_rx.try_recv() {
+            match self.readiness_safety.forbidden_rx.try_recv() {
                 Ok(event) => self.handle_forbidden_order_event(event).await?,
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
         }
-        let pending_feed = self.feed_rx.len();
+        let pending_feed = self.connectivity.feed_rx.len();
         for _ in 0..pending_feed {
-            match self.feed_rx.try_recv() {
+            match self.connectivity.feed_rx.try_recv() {
                 Ok(event) => self.handle_runtime_event(event).await?,
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
@@ -2531,9 +2493,9 @@ impl LiveRuntime {
     }
 
     async fn drain_queued_events(&mut self) -> Result<(), LiveRuntimeError> {
-        let pending_control = self.control_rx.len();
+        let pending_control = self.dispatch.control_rx.len();
         for _ in 0..pending_control {
-            match self.control_rx.try_recv() {
+            match self.dispatch.control_rx.try_recv() {
                 Ok(event) => self.handle_runtime_event(event).await?,
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -2541,9 +2503,9 @@ impl LiveRuntime {
                 }
             }
         }
-        let pending_forbidden = self.forbidden_rx.len();
+        let pending_forbidden = self.readiness_safety.forbidden_rx.len();
         for _ in 0..pending_forbidden {
-            match self.forbidden_rx.try_recv() {
+            match self.readiness_safety.forbidden_rx.try_recv() {
                 Ok(event) => self.handle_forbidden_order_event(event).await?,
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -2551,9 +2513,9 @@ impl LiveRuntime {
                 }
             }
         }
-        let pending_feed = self.feed_rx.len();
+        let pending_feed = self.connectivity.feed_rx.len();
         for _ in 0..pending_feed {
-            match self.feed_rx.try_recv() {
+            match self.connectivity.feed_rx.try_recv() {
                 Ok(event) => self.handle_runtime_event(event).await?,
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -2573,7 +2535,11 @@ impl LiveRuntime {
             command,
             response,
         } = envelope;
-        self.evidence.operator_commands = self.evidence.operator_commands.saturating_add(1);
+        self.composition.evidence.operator_commands = self
+            .composition
+            .evidence
+            .operator_commands
+            .saturating_add(1);
         let result = self.execute_operator_command(&request_id, command).await;
         match result {
             Ok(operator_response) => {
@@ -2612,8 +2578,11 @@ impl LiveRuntime {
                     reason,
                 )
                 .await?;
-                self.evidence.operator_mutations =
-                    self.evidence.operator_mutations.saturating_add(1);
+                self.composition.evidence.operator_mutations = self
+                    .composition
+                    .evidence
+                    .operator_mutations
+                    .saturating_add(1);
                 Ok(OperatorResponse::accepted(
                     request_id,
                     "kill switch activated",
@@ -2646,8 +2615,11 @@ impl LiveRuntime {
                     }),
                 );
                 self.commit_output(output).await?;
-                self.evidence.operator_mutations =
-                    self.evidence.operator_mutations.saturating_add(1);
+                self.composition.evidence.operator_mutations = self
+                    .composition
+                    .evidence
+                    .operator_mutations
+                    .saturating_add(1);
                 Ok(OperatorResponse::accepted(
                     request_id,
                     format!("account {account_id} halted"),
@@ -2670,8 +2642,11 @@ impl LiveRuntime {
                     reason,
                 )
                 .await?;
-                self.evidence.operator_mutations =
-                    self.evidence.operator_mutations.saturating_add(1);
+                self.composition.evidence.operator_mutations = self
+                    .composition
+                    .evidence
+                    .operator_mutations
+                    .saturating_add(1);
                 Ok(OperatorResponse::accepted(
                     request_id,
                     "symbol halted",
@@ -2702,8 +2677,11 @@ impl LiveRuntime {
                     reason,
                 )
                 .await?;
-                self.evidence.operator_mutations =
-                    self.evidence.operator_mutations.saturating_add(1);
+                self.composition.evidence.operator_mutations = self
+                    .composition
+                    .evidence
+                    .operator_mutations
+                    .saturating_add(1);
                 Ok(OperatorResponse::accepted(
                     request_id,
                     "symbol resumed",
@@ -2712,9 +2690,12 @@ impl LiveRuntime {
             }
             OperatorCommand::Shutdown { reason } => {
                 self.coordinator.set_order_entry_enabled(false);
-                self.evidence.operator_mutations =
-                    self.evidence.operator_mutations.saturating_add(1);
-                self.operator_shutdown_reason = Some(format!(
+                self.composition.evidence.operator_mutations = self
+                    .composition
+                    .evidence
+                    .operator_mutations
+                    .saturating_add(1);
+                self.dispatch.operator_shutdown_reason = Some(format!(
                     "authenticated operator shutdown {request_id}: {reason}"
                 ));
                 Ok(OperatorResponse::accepted(
@@ -2767,8 +2748,8 @@ impl LiveRuntime {
             active_orders: self.coordinator.active_order_count(),
             kill_switch_active: self.coordinator.kill_switch_active(),
             halted_accounts: self.coordinator.halted_accounts().clone(),
-            shutdown_in_progress: self.shutdown_in_progress
-                || self.operator_shutdown_reason.is_some(),
+            shutdown_in_progress: self.shutdown.in_progress
+                || self.dispatch.operator_shutdown_reason.is_some(),
         }
     }
 
@@ -2812,7 +2793,7 @@ impl LiveRuntime {
                 envelope,
             } => {
                 let (account_id, adapter, private_source) = {
-                    let source = self.sources.get(source_id).ok_or_else(|| {
+                    let source = self.connectivity.sources.get(source_id).ok_or_else(|| {
                         LiveRuntimeError::FeedAdapter("unknown feed source".to_string())
                     })?;
                     (
@@ -2835,7 +2816,11 @@ impl LiveRuntime {
                             .is_data_frame(&envelope)
                             .map_err(|error| LiveRuntimeError::FeedAdapter(error.to_string()))?);
                 for event in parsed {
-                    for output in self.processor.process_from(&envelope.conn_id, event) {
+                    for output in self
+                        .connectivity
+                        .processor
+                        .process_from(&envelope.conn_id, event)
+                    {
                         let strategy_visible_ns = unix_time_ns();
                         self.observe_feed_latency(
                             &output,
@@ -2878,6 +2863,7 @@ impl LiveRuntime {
                 }
                 if private_state_frame {
                     let events = self
+                        .connectivity
                         .sources
                         .get_mut(source_id)
                         .ok_or_else(|| {
@@ -2895,12 +2881,16 @@ impl LiveRuntime {
                     )));
                 }
                 if status.kind == ConnectionStatusKind::Disconnected {
-                    self.evidence.observe_disconnect(status.private);
+                    self.composition.evidence.observe_disconnect(status.private);
                 }
                 let (events, public_connectivity) = {
-                    let source = self.sources.get_mut(source_id).ok_or_else(|| {
-                        LiveRuntimeError::FeedAdapter("unknown feed source".to_string())
-                    })?;
+                    let source = self
+                        .connectivity
+                        .sources
+                        .get_mut(source_id)
+                        .ok_or_else(|| {
+                            LiveRuntimeError::FeedAdapter("unknown feed source".to_string())
+                        })?;
                     let events = source.on_status(status);
                     (events, source.public_connectivity_ready())
                 };
@@ -2921,7 +2911,9 @@ impl LiveRuntime {
                     OkxOrderWsStatusKind::Ready => SystemEventKind::OrderTransportRecovered,
                     OkxOrderWsStatusKind::Heartbeat => SystemEventKind::OrderTransportHeartbeat,
                     OkxOrderWsStatusKind::Disconnected => {
-                        self.evidence.observe_order_transport_disconnect();
+                        self.composition
+                            .evidence
+                            .observe_order_transport_disconnect();
                         SystemEventKind::OrderTransportStale
                     }
                     OkxOrderWsStatusKind::Fatal => {
@@ -2951,7 +2943,7 @@ impl LiveRuntime {
                 latency_us,
             } => {
                 if let Some(latency_us) = latency_us {
-                    self.latency.observe_us(
+                    self.composition.latency.observe_us(
                         BacktestLatencyClass::MatchingNew,
                         &symbol,
                         LiveLatencySemantics::StrategyDispatchToOrderAckUpperBound,
@@ -2971,7 +2963,7 @@ impl LiveRuntime {
                 ambiguous,
                 reason,
             } => {
-                self.latency.observe_operation_failure(
+                self.composition.latency.observe_operation_failure(
                     BacktestLatencyClass::MatchingNew,
                     &symbol,
                     LiveLatencySemantics::StrategyDispatchToOrderAckUpperBound,
@@ -2992,7 +2984,7 @@ impl LiveRuntime {
                 ts_ms,
                 latency_us,
             } => {
-                self.latency.observe_us(
+                self.composition.latency.observe_us(
                     BacktestLatencyClass::MatchingCancel,
                     &symbol,
                     LiveLatencySemantics::StrategyDispatchToOrderAckUpperBound,
@@ -3011,7 +3003,7 @@ impl LiveRuntime {
                 ambiguous,
                 reason,
             } => {
-                self.latency.observe_operation_failure(
+                self.composition.latency.observe_operation_failure(
                     BacktestLatencyClass::MatchingCancel,
                     &symbol,
                     LiveLatencySemantics::StrategyDispatchToOrderAckUpperBound,
@@ -3032,14 +3024,16 @@ impl LiveRuntime {
                 remote_account,
                 ts_ms,
             } => {
-                self.reconcile_inflight.remove(&account_id);
+                self.reconciliation.inflight.remove(&account_id);
                 self.apply_remote_recovery(&account_id, &remote_orders, &remote_fills)
                     .await?;
-                let order_convergence = &self.order_convergence;
-                self.cancel_inflight.retain(|(cancel_account, order_id)| {
-                    cancel_account != &account_id
-                        || order_convergence.has_pending_cancel(cancel_account, order_id)
-                });
+                let order_convergence = &self.reconciliation.order_convergence;
+                self.reconciliation
+                    .cancel_inflight
+                    .retain(|(cancel_account, order_id)| {
+                        cancel_account != &account_id
+                            || order_convergence.has_pending_cancel(cancel_account, order_id)
+                    });
                 let report = {
                     let state = self
                         .coordinator
@@ -3052,20 +3046,25 @@ impl LiveRuntime {
                     .coordinator
                     .apply_authoritative_account_snapshot(&account_id, remote_account)?;
                 let censored_fill_latencies = self
+                    .reconciliation
                     .fill_convergence
                     .observe_authoritative(&account_id, remote_account_ts_ms);
-                self.latency
+                self.composition
+                    .latency
                     .observe_dropped_observations(censored_fill_latencies as u64);
                 self.commit_output(account_output).await?;
-                let pending_order_state = self.order_convergence.pending_reason(&account_id);
+                let pending_order_state = self
+                    .reconciliation
+                    .order_convergence
+                    .pending_reason(&account_id);
                 let clean = report.is_clean() && pending_order_state.is_none();
-                if self.shutdown_in_progress
-                    && self.shutdown_reconciliation_requested.contains(&account_id)
+                if self.shutdown.in_progress
+                    && self.shutdown.reconciliation_requested.contains(&account_id)
                 {
                     if is_zero_order_reconciliation(&report) {
-                        self.shutdown_reconciled_accounts.insert(account_id.clone());
+                        self.shutdown.reconciled_accounts.insert(account_id.clone());
                     } else {
-                        self.shutdown_reconciled_accounts.remove(&account_id);
+                        self.shutdown.reconciled_accounts.remove(&account_id);
                     }
                 }
                 let reason = if clean {
@@ -3098,8 +3097,8 @@ impl LiveRuntime {
                 ts_ms,
                 reason,
             } => {
-                self.reconcile_inflight.remove(&account_id);
-                self.shutdown_reconciled_accounts.remove(&account_id);
+                self.reconciliation.inflight.remove(&account_id);
+                self.shutdown.reconciled_accounts.remove(&account_id);
                 let output = self.coordinator.on_reconciliation(ReconciliationResult {
                     account_id,
                     ts_ms,
@@ -3158,7 +3157,7 @@ impl LiveRuntime {
                     | MarketEvent::BurstSignal { .. }
                     | MarketEvent::PriceLimits { .. } => BacktestLatencyClass::ReferenceData,
                 };
-                self.latency.observe_ns(
+                self.composition.latency.observe_ns(
                     class,
                     event.symbol(),
                     LiveLatencySemantics::HostReceiveToStrategyVisibility,
@@ -3167,7 +3166,7 @@ impl LiveRuntime {
                 );
             }
             FeedOutput::PrivateOrder { update, .. } => {
-                self.latency.observe_exchange_ms(
+                self.composition.latency.observe_exchange_ms(
                     BacktestLatencyClass::OrderUpdate,
                     &update.symbol,
                     update.ts_ms,
@@ -3175,7 +3174,7 @@ impl LiveRuntime {
                 );
             }
             FeedOutput::PrivateFill { fill, .. } => {
-                self.latency.observe_exchange_ms(
+                self.composition.latency.observe_exchange_ms(
                     BacktestLatencyClass::OrderUpdate,
                     &fill.symbol,
                     fill.ts_ms,
@@ -3198,14 +3197,14 @@ impl LiveRuntime {
     ) {
         for record in &output.records {
             if let StorageRecord::Normalized(NormalizedEvent::Account(update)) = record {
-                let result = self.fill_convergence.observe_account_at(
+                let result = self.reconciliation.fill_convergence.observe_account_at(
                     account_id,
                     update,
                     observed_ns / 1_000_000,
                     observed_ns,
                 );
                 for observation in result.observations {
-                    self.latency.observe_ns(
+                    self.composition.latency.observe_ns(
                         BacktestLatencyClass::OrderFill,
                         &observation.symbol,
                         LiveLatencySemantics::FillToAccountStateVisibility,
@@ -3265,7 +3264,7 @@ impl LiveRuntime {
 
     async fn commit_output(&mut self, output: CoordinatorOutput) -> Result<(), LiveRuntimeError> {
         self.observe_order_convergence(&output, unix_time_ms());
-        let alerts = if self.alert_sink.is_some() {
+        let alerts = if self.dispatch.alert_sink.is_some() {
             output
                 .records
                 .iter()
@@ -3302,7 +3301,7 @@ impl LiveRuntime {
                 update,
             } = record
             {
-                let result = self.fill_convergence.observe_fill_at(
+                let result = self.reconciliation.fill_convergence.observe_fill_at(
                     account_id,
                     update,
                     observed_ns / 1_000_000,
@@ -3311,10 +3310,10 @@ impl LiveRuntime {
                 );
                 if collect_latency {
                     if result.dropped_latency_observation {
-                        self.latency.observe_dropped_observation();
+                        self.composition.latency.observe_dropped_observation();
                     }
                     for observation in result.observations {
-                        self.latency.observe_ns(
+                        self.composition.latency.observe_ns(
                             BacktestLatencyClass::OrderFill,
                             &observation.symbol,
                             LiveLatencySemantics::FillToAccountStateVisibility,
@@ -3334,13 +3333,17 @@ impl LiveRuntime {
                 update,
             } = record
             {
-                self.order_convergence
-                    .observe_order(account_id, update, observed_ms);
+                self.reconciliation.order_convergence.observe_order(
+                    account_id,
+                    update,
+                    observed_ms,
+                );
                 if matches!(
                     update.status,
                     OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected
                 ) {
-                    self.cancel_inflight
+                    self.reconciliation
+                        .cancel_inflight
                         .remove(&(account_id.clone(), update.order_id.clone()));
                 }
             }
@@ -3348,7 +3351,7 @@ impl LiveRuntime {
     }
 
     fn emit_alert(&self, alert: AlertEvent) -> Result<(), LiveRuntimeError> {
-        if let Some(sink) = &self.alert_sink {
+        if let Some(sink) = &self.dispatch.alert_sink {
             sink.try_emit(alert)?;
         }
         Ok(())
@@ -3424,7 +3427,11 @@ impl LiveRuntime {
         let enqueued_at = Instant::now();
         let cancel_key = (action.account_id.clone(), action.client_order_id.clone());
         let symbol = action.symbol.clone();
-        if !self.cancel_inflight.insert(cancel_key.clone()) {
+        if !self
+            .reconciliation
+            .cancel_inflight
+            .insert(cancel_key.clone())
+        {
             return Ok(());
         }
         if let Err(error) = self.record_storage(StorageRecord::OrderRequest(OrderRequestRecord {
@@ -3436,13 +3443,13 @@ impl LiveRuntime {
             exchange_order_id: None,
             symbol: action.symbol.clone(),
         })) {
-            self.cancel_inflight.remove(&cancel_key);
+            self.reconciliation.cancel_inflight.remove(&cancel_key);
             return Err(error);
         }
         let sender = match self.order_sender(&action.account_id) {
             Ok(sender) => sender.clone(),
             Err(error) => {
-                self.cancel_inflight.remove(&cancel_key);
+                self.reconciliation.cancel_inflight.remove(&cancel_key);
                 return Err(error);
             }
         };
@@ -3454,10 +3461,10 @@ impl LiveRuntime {
             .await
             .is_err()
         {
-            self.cancel_inflight.remove(&cancel_key);
+            self.reconciliation.cancel_inflight.remove(&cancel_key);
             return Err(LiveRuntimeError::OrderQueueUnavailable(cancel_key.0));
         }
-        self.order_convergence.observe_cancel(
+        self.reconciliation.order_convergence.observe_cancel(
             &cancel_key.0,
             &cancel_key.1,
             &symbol,
@@ -3467,20 +3474,22 @@ impl LiveRuntime {
     }
 
     fn record_storage(&mut self, record: StorageRecord) -> Result<(), LiveRuntimeError> {
-        self.evidence.observe_record(&record);
-        if let Err(error) = self.storage_sink.try_record(record) {
-            if !self.shutdown_in_progress {
+        self.composition.evidence.observe_record(&record);
+        if let Err(error) = self.composition.storage_sink.try_record(record) {
+            if !self.shutdown.in_progress {
                 return Err(error.into());
             }
             tracing::error!(%error, "storage unavailable during fail-closed shutdown");
-            self.shutdown_storage_error
+            self.shutdown
+                .storage_error
                 .get_or_insert_with(|| error.to_string());
             return Ok(());
         }
-        self.evidence.max_storage_queue_depth = self
+        self.composition.evidence.max_storage_queue_depth = self
+            .composition
             .evidence
             .max_storage_queue_depth
-            .max(self.storage_sink.queue_depth());
+            .max(self.composition.storage_sink.queue_depth());
         Ok(())
     }
 
@@ -3488,26 +3497,29 @@ impl LiveRuntime {
         &mut self,
         record: StorageRecord,
     ) -> Result<(), LiveRuntimeError> {
-        self.evidence.observe_record(&record);
-        self.evidence.max_storage_queue_depth = self
-            .evidence
-            .max_storage_queue_depth
-            .max(self.storage_sink.queue_depth().saturating_add(1));
+        self.composition.evidence.observe_record(&record);
+        self.composition.evidence.max_storage_queue_depth =
+            self.composition.evidence.max_storage_queue_depth.max(
+                self.composition
+                    .storage_sink
+                    .queue_depth()
+                    .saturating_add(1),
+            );
         let result = tokio::time::timeout(
-            Duration::from_millis(self.safety_latch_sync_timeout_ms),
-            self.storage_sink.record_durable(record),
+            Duration::from_millis(self.shutdown.safety_latch_sync_timeout_ms),
+            self.composition.storage_sink.record_durable(record),
         )
         .await;
         match result {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => {
-                self.preserve_deadman_on_shutdown = true;
+                self.shutdown.preserve_deadman = true;
                 Err(error.into())
             }
             Err(_) => {
-                self.preserve_deadman_on_shutdown = true;
+                self.shutdown.preserve_deadman = true;
                 Err(LiveRuntimeError::SafetyLatchSyncTimeout(
-                    self.safety_latch_sync_timeout_ms,
+                    self.shutdown.safety_latch_sync_timeout_ms,
                 ))
             }
         }
@@ -3539,7 +3551,11 @@ impl LiveRuntime {
                 let enqueued_at = Instant::now();
                 let cancel_key = (action.account_id.clone(), action.client_order_id.clone());
                 let symbol = action.symbol.clone();
-                if !self.cancel_inflight.insert(cancel_key.clone()) {
+                if !self
+                    .reconciliation
+                    .cancel_inflight
+                    .insert(cancel_key.clone())
+                {
                     return Ok(());
                 }
                 if let Err(error) =
@@ -3553,13 +3569,13 @@ impl LiveRuntime {
                         symbol: action.symbol.clone(),
                     }))
                 {
-                    self.cancel_inflight.remove(&cancel_key);
+                    self.reconciliation.cancel_inflight.remove(&cancel_key);
                     return Err(error);
                 }
                 let sender = match self.order_sender(&action.account_id) {
                     Ok(sender) => sender.clone(),
                     Err(error) => {
-                        self.cancel_inflight.remove(&cancel_key);
+                        self.reconciliation.cancel_inflight.remove(&cancel_key);
                         return Err(error);
                     }
                 };
@@ -3570,10 +3586,10 @@ impl LiveRuntime {
                     })
                     .is_err()
                 {
-                    self.cancel_inflight.remove(&cancel_key);
+                    self.reconciliation.cancel_inflight.remove(&cancel_key);
                     return Err(LiveRuntimeError::OrderQueueUnavailable(cancel_key.0));
                 }
-                self.order_convergence.observe_cancel(
+                self.reconciliation.order_convergence.observe_cancel(
                     &cancel_key.0,
                     &cancel_key.1,
                     &symbol,
@@ -3581,7 +3597,8 @@ impl LiveRuntime {
                 );
             }
             LiveAction::RecoverBook(request) => {
-                let routes = self.feeds[self.public_feed_index].request_recovery(&request);
+                let routes = self.connectivity.feeds[self.connectivity.public_feed_index]
+                    .request_recovery(&request);
                 if routes == 0 {
                     return Err(LiveRuntimeError::MissingRecoveryRoute(
                         request.stream.symbol,
@@ -3594,22 +3611,27 @@ impl LiveRuntime {
     }
 
     fn dispatch_reconcile(&mut self, action: ReconcileAction) -> Result<(), LiveRuntimeError> {
-        if !self.reconcile_inflight.insert(action.account_id.clone()) {
+        if !self
+            .reconciliation
+            .inflight
+            .insert(action.account_id.clone())
+        {
             return Ok(());
         }
-        self.last_reconcile_attempt
+        self.reconciliation
+            .last_attempt
             .insert(action.account_id.clone(), Instant::now());
         let orders = match self.reconciliation_order_refs(&action.account_id) {
             Ok(orders) => orders,
             Err(error) => {
-                self.reconcile_inflight.remove(&action.account_id);
+                self.reconciliation.inflight.remove(&action.account_id);
                 return Err(error);
             }
         };
         let sender = match self.reconcile_sender(&action.account_id) {
             Ok(sender) => sender.clone(),
             Err(error) => {
-                self.reconcile_inflight.remove(&action.account_id);
+                self.reconciliation.inflight.remove(&action.account_id);
                 return Err(error);
             }
         };
@@ -3619,7 +3641,7 @@ impl LiveRuntime {
                 command_flush: None,
             })
             .map_err(|_| {
-                self.reconcile_inflight.remove(&action.account_id);
+                self.reconciliation.inflight.remove(&action.account_id);
                 LiveRuntimeError::OrderQueueUnavailable(action.account_id)
             })
     }
@@ -3628,15 +3650,20 @@ impl LiveRuntime {
         &mut self,
         action: ReconcileAction,
     ) -> Result<(), LiveRuntimeError> {
-        if !self.reconcile_inflight.insert(action.account_id.clone()) {
+        if !self
+            .reconciliation
+            .inflight
+            .insert(action.account_id.clone())
+        {
             return Ok(());
         }
-        self.last_reconcile_attempt
+        self.reconciliation
+            .last_attempt
             .insert(action.account_id.clone(), Instant::now());
         let order_sender = match self.order_sender(&action.account_id) {
             Ok(sender) => sender.clone(),
             Err(error) => {
-                self.reconcile_inflight.remove(&action.account_id);
+                self.reconciliation.inflight.remove(&action.account_id);
                 return Err(error);
             }
         };
@@ -3646,20 +3673,20 @@ impl LiveRuntime {
             .await
             .is_err()
         {
-            self.reconcile_inflight.remove(&action.account_id);
+            self.reconciliation.inflight.remove(&action.account_id);
             return Err(LiveRuntimeError::OrderQueueUnavailable(action.account_id));
         }
         let orders = match self.reconciliation_order_refs(&action.account_id) {
             Ok(orders) => orders,
             Err(error) => {
-                self.reconcile_inflight.remove(&action.account_id);
+                self.reconciliation.inflight.remove(&action.account_id);
                 return Err(error);
             }
         };
         let sender = match self.reconcile_sender(&action.account_id) {
             Ok(sender) => sender.clone(),
             Err(error) => {
-                self.reconcile_inflight.remove(&action.account_id);
+                self.reconciliation.inflight.remove(&action.account_id);
                 return Err(error);
             }
         };
@@ -3671,7 +3698,7 @@ impl LiveRuntime {
             .await
             .is_err()
         {
-            self.reconcile_inflight.remove(&action.account_id);
+            self.reconciliation.inflight.remove(&action.account_id);
             return Err(LiveRuntimeError::OrderQueueUnavailable(action.account_id));
         }
         Ok(())
@@ -3713,15 +3740,17 @@ impl LiveRuntime {
         force: bool,
     ) -> Result<(), LiveRuntimeError> {
         let accounts = self
+            .dispatch
             .order_senders
             .keys()
-            .filter(|account_id| !self.shutdown_reconciled_accounts.contains(*account_id))
-            .filter(|account_id| !self.reconcile_inflight.contains(*account_id))
+            .filter(|account_id| !self.shutdown.reconciled_accounts.contains(*account_id))
+            .filter(|account_id| !self.reconciliation.inflight.contains(*account_id))
             .filter(|account_id| {
-                !self.shutdown_reconciliation_requested.contains(*account_id)
+                !self.shutdown.reconciliation_requested.contains(*account_id)
                     || force
                     || self
-                        .last_reconcile_attempt
+                        .reconciliation
+                        .last_attempt
                         .get(*account_id)
                         .is_none_or(|last| last.elapsed() >= Duration::from_secs(2))
             })
@@ -3734,7 +3763,7 @@ impl LiveRuntime {
                 reason: "verify zero exchange orders during graceful shutdown".to_string(),
             })
             .await?;
-            self.shutdown_reconciliation_requested.insert(account_id);
+            self.shutdown.reconciliation_requested.insert(account_id);
         }
         Ok(())
     }
@@ -3744,9 +3773,10 @@ impl LiveRuntime {
         let accounts = readiness
             .missing_reconciliation
             .into_iter()
-            .filter(|account_id| !self.reconcile_inflight.contains(account_id))
+            .filter(|account_id| !self.reconciliation.inflight.contains(account_id))
             .filter(|account_id| {
-                self.last_reconcile_attempt
+                self.reconciliation
+                    .last_attempt
                     .get(account_id)
                     .is_none_or(|last| last.elapsed() >= Duration::from_secs(2))
             })
@@ -3765,7 +3795,8 @@ impl LiveRuntime {
         &self,
         account_id: &str,
     ) -> Result<&mpsc::Sender<OrderTaskCommand>, LiveRuntimeError> {
-        self.order_senders
+        self.dispatch
+            .order_senders
             .get(account_id)
             .ok_or_else(|| LiveRuntimeError::OrderQueueUnavailable(account_id.to_string()))
     }
@@ -3774,14 +3805,15 @@ impl LiveRuntime {
         &self,
         account_id: &str,
     ) -> Result<&mpsc::Sender<ReconcileTaskCommand>, LiveRuntimeError> {
-        self.reconcile_senders
+        self.reconciliation
+            .senders
             .get(account_id)
             .ok_or_else(|| LiveRuntimeError::OrderQueueUnavailable(account_id.to_string()))
     }
 
     async fn disable_deadman_all(&mut self) -> Result<(), LiveRuntimeError> {
         let mut acknowledgements = Vec::new();
-        for (account_id, sender) in &self.safety_senders {
+        for (account_id, sender) in &self.readiness_safety.safety_senders {
             let (result_tx, result_rx) = oneshot::channel();
             sender
                 .send(SafetyTaskCommand::DisableDeadMan { result: result_tx })
@@ -3809,7 +3841,7 @@ impl LiveRuntime {
     }
 
     async fn shutdown(&mut self) -> Result<(), LiveRuntimeError> {
-        let timeout_ms = self.teardown_timeout_ms;
+        let timeout_ms = self.shutdown.teardown_timeout_ms;
         match tokio::time::timeout(Duration::from_millis(timeout_ms), self.shutdown_inner()).await {
             Ok(result) => result,
             Err(_) => {
@@ -3822,106 +3854,109 @@ impl LiveRuntime {
 
     async fn shutdown_inner(&mut self) -> Result<(), LiveRuntimeError> {
         let mut errors = Vec::new();
-        if let Some(host_guard) = self.host_guard.as_mut() {
+        if let Some(host_guard) = self.readiness_safety.host_guard.as_mut() {
             host_guard.request_shutdown();
         }
-        if let Some(service) = self.operator_service.as_mut() {
+        if let Some(service) = self.dispatch.operator_service.as_mut() {
             service.request_shutdown();
         }
-        for feed in &self.feeds {
+        for feed in &self.connectivity.feeds {
             feed.request_shutdown();
         }
-        for runtime in &self.order_ws_runtimes {
+        for runtime in &self.connectivity.order_ws_runtimes {
             runtime.request_shutdown();
         }
-        for sender in self.order_senders.values() {
+        for sender in self.dispatch.order_senders.values() {
             let _ = sender.try_send(OrderTaskCommand::Shutdown);
         }
-        self.order_senders.clear();
-        for sender in self.reconcile_senders.values() {
+        self.dispatch.order_senders.clear();
+        for sender in self.reconciliation.senders.values() {
             let _ = sender.try_send(ReconcileTaskCommand::Shutdown);
         }
-        self.reconcile_senders.clear();
-        for sender in self.safety_senders.values() {
+        self.reconciliation.senders.clear();
+        for sender in self.readiness_safety.safety_senders.values() {
             let _ = sender.try_send(SafetyTaskCommand::Shutdown);
         }
-        self.safety_senders.clear();
-        self.control_rx.close();
-        self.forbidden_rx.close();
-        self.feed_rx.close();
-        for task in &self.forbidden_tasks {
+        self.readiness_safety.safety_senders.clear();
+        self.dispatch.control_rx.close();
+        self.readiness_safety.forbidden_rx.close();
+        self.connectivity.feed_rx.close();
+        for task in &self.readiness_safety.forbidden_tasks {
             task.abort();
         }
-        if let Some(host_guard) = self.host_guard.take() {
+        if let Some(host_guard) = self.readiness_safety.host_guard.take() {
             match host_guard.shutdown().await {
                 Ok(stats) => {
-                    self.host_checks = self.host_checks.saturating_add(stats.checks);
+                    self.readiness_safety.host_checks = self
+                        .readiness_safety
+                        .host_checks
+                        .saturating_add(stats.checks);
                     if let Some(snapshot) = stats.last_snapshot {
-                        self.host_last_snapshot = Some(snapshot);
+                        self.readiness_safety.host_last_snapshot = Some(snapshot);
                     }
                 }
                 Err(error) => errors.push(("host guard", LiveRuntimeError::Join(error))),
             }
         }
-        if let Some(failures) = &mut self.host_failures
+        if let Some(failures) = &mut self.readiness_safety.host_failures
             && let Ok(error) = failures.try_recv()
         {
             errors.push(("host health", error.into()));
         }
-        self.host_failures.take();
-        if let Some(service) = self.operator_service.take()
+        self.readiness_safety.host_failures.take();
+        if let Some(service) = self.dispatch.operator_service.take()
             && let Err(error) = service.shutdown().await
         {
             errors.push(("operator service", LiveRuntimeError::Operator(error)));
         }
-        self.operator_rx.take();
-        for feed in self.feeds.drain(..) {
+        self.dispatch.operator_rx.take();
+        for feed in self.connectivity.feeds.drain(..) {
             feed.shutdown().await;
         }
-        for task in &mut self.feed_tasks {
+        for task in &mut self.connectivity.feed_tasks {
             if let Err(error) = task.await {
                 errors.push(("feed task", LiveRuntimeError::Join(error)));
             }
         }
-        self.feed_tasks.clear();
-        for task in &mut self.order_tasks {
+        self.connectivity.feed_tasks.clear();
+        for task in &mut self.dispatch.order_tasks {
             if let Err(error) = task.await {
                 errors.push(("order task", LiveRuntimeError::Join(error)));
             }
         }
-        self.order_tasks.clear();
-        for task in &mut self.reconcile_tasks {
+        self.dispatch.order_tasks.clear();
+        for task in &mut self.reconciliation.tasks {
             if let Err(error) = task.await {
                 errors.push(("reconciliation task", LiveRuntimeError::Join(error)));
             }
         }
-        self.reconcile_tasks.clear();
-        for runtime in self.order_ws_runtimes.drain(..) {
+        self.reconciliation.tasks.clear();
+        for runtime in self.connectivity.order_ws_runtimes.drain(..) {
             if let Err(error) = runtime.shutdown().await {
                 errors.push(("order websocket", LiveRuntimeError::Join(error)));
             }
         }
-        for task in &mut self.order_ws_status_tasks {
+        for task in &mut self.connectivity.order_ws_status_tasks {
             if let Err(error) = task.await {
                 errors.push(("order websocket status", LiveRuntimeError::Join(error)));
             }
         }
-        self.order_ws_status_tasks.clear();
-        for task in &mut self.safety_tasks {
+        self.connectivity.order_ws_status_tasks.clear();
+        for task in &mut self.readiness_safety.safety_tasks {
             if let Err(error) = task.await {
                 errors.push(("safety task", LiveRuntimeError::Join(error)));
             }
         }
-        self.safety_tasks.clear();
-        for task in &mut self.forbidden_tasks {
+        self.readiness_safety.safety_tasks.clear();
+        for task in &mut self.readiness_safety.forbidden_tasks {
             if let Err(error) = task.await
                 && !error.is_cancelled()
             {
                 errors.push(("forbidden-order sentinel", LiveRuntimeError::Join(error)));
             }
         }
-        self.forbidden_tasks.clear();
-        if let Some(storage) = self.storage.as_mut()
+        self.readiness_safety.forbidden_tasks.clear();
+        if let Some(storage) = self.composition.storage.as_mut()
             && let Err(error) = storage.stop_writer().await
         {
             errors.push(("storage", LiveRuntimeError::Storage(error)));
@@ -3941,20 +3976,20 @@ impl LiveRuntime {
                 errors.push(("teardown alert enqueue", error));
             }
         }
-        self.alert_sink.take();
-        if let Some(alert_runtime) = self.alert_runtime.take() {
+        self.dispatch.alert_sink.take();
+        if let Some(alert_runtime) = self.dispatch.alert_runtime.take() {
             match tokio::time::timeout(
-                Duration::from_millis(self.alert_shutdown_timeout_ms),
+                Duration::from_millis(self.dispatch.alert_shutdown_timeout_ms),
                 alert_runtime.shutdown(),
             )
             .await
             {
                 Ok(Ok(stats)) => {
-                    self.alert_stats = stats;
+                    self.dispatch.alert_stats = stats;
                     let unobserved_failures = stats
                         .failed
-                        .saturating_sub(self.observed_alert_delivery_failures);
-                    if self.alert_delivery_failure_is_fatal && unobserved_failures > 0 {
+                        .saturating_sub(self.dispatch.observed_alert_delivery_failures);
+                    if self.dispatch.alert_delivery_failure_is_fatal && unobserved_failures > 0 {
                         errors.push((
                             "alert delivery",
                             LiveRuntimeError::AlertFailuresDuringShutdown(unobserved_failures),
@@ -3964,11 +3999,11 @@ impl LiveRuntime {
                 Ok(Err(error)) => errors.push(("alert service", error.into())),
                 Err(_) => errors.push((
                     "alert service",
-                    LiveRuntimeError::AlertShutdownTimeout(self.alert_shutdown_timeout_ms),
+                    LiveRuntimeError::AlertShutdownTimeout(self.dispatch.alert_shutdown_timeout_ms),
                 )),
             }
         }
-        self.alert_failures.take();
+        self.dispatch.alert_failures.take();
         if errors.is_empty() {
             return Ok(());
         }
@@ -3978,42 +4013,43 @@ impl LiveRuntime {
     }
 
     fn abort_remaining_teardown(&mut self) {
-        self.preserve_deadman_on_shutdown = true;
-        self.order_senders.clear();
-        self.reconcile_senders.clear();
-        self.safety_senders.clear();
-        self.control_rx.close();
-        self.forbidden_rx.close();
-        self.feed_rx.close();
+        self.shutdown.preserve_deadman = true;
+        self.dispatch.order_senders.clear();
+        self.reconciliation.senders.clear();
+        self.readiness_safety.safety_senders.clear();
+        self.dispatch.control_rx.close();
+        self.readiness_safety.forbidden_rx.close();
+        self.connectivity.feed_rx.close();
 
         for task in self
+            .connectivity
             .feed_tasks
             .iter()
-            .chain(self.order_tasks.iter())
-            .chain(self.reconcile_tasks.iter())
-            .chain(self.order_ws_status_tasks.iter())
-            .chain(self.safety_tasks.iter())
-            .chain(self.forbidden_tasks.iter())
+            .chain(self.dispatch.order_tasks.iter())
+            .chain(self.reconciliation.tasks.iter())
+            .chain(self.connectivity.order_ws_status_tasks.iter())
+            .chain(self.readiness_safety.safety_tasks.iter())
+            .chain(self.readiness_safety.forbidden_tasks.iter())
         {
             task.abort();
         }
-        self.feed_tasks.clear();
-        self.order_tasks.clear();
-        self.reconcile_tasks.clear();
-        self.order_ws_status_tasks.clear();
-        self.safety_tasks.clear();
-        self.forbidden_tasks.clear();
+        self.connectivity.feed_tasks.clear();
+        self.dispatch.order_tasks.clear();
+        self.reconciliation.tasks.clear();
+        self.connectivity.order_ws_status_tasks.clear();
+        self.readiness_safety.safety_tasks.clear();
+        self.readiness_safety.forbidden_tasks.clear();
 
-        self.feeds.clear();
-        self.order_ws_runtimes.clear();
-        self.operator_service.take();
-        self.operator_rx.take();
-        self.host_guard.take();
-        self.host_failures.take();
-        self.storage.take();
-        self.alert_sink.take();
-        self.alert_runtime.take();
-        self.alert_failures.take();
+        self.connectivity.feeds.clear();
+        self.connectivity.order_ws_runtimes.clear();
+        self.dispatch.operator_service.take();
+        self.dispatch.operator_rx.take();
+        self.readiness_safety.host_guard.take();
+        self.readiness_safety.host_failures.take();
+        self.composition.storage.take();
+        self.dispatch.alert_sink.take();
+        self.dispatch.alert_runtime.take();
+        self.dispatch.alert_failures.take();
     }
 }
 
@@ -4674,15 +4710,19 @@ mod tests {
 
     use async_trait::async_trait;
     use reap_core::{AccountUpdate, Balance, NewOrder, OrderEvent, OrderUpdate, Side, TimeInForce};
+    use reap_feed::SupervisedFeed;
     use reap_order::{
-        OkxOrderTransport, OrderTransportError, PacingPolicy, RegularExecution,
+        OkxOrderTransport, OrderTransportError, PacingPolicy, ReconcileReport, RegularExecution,
         RegularReconciliation,
     };
     use reap_risk::{
         InstrumentOrderLimits, InstrumentRiskModel, RiskLimits, StablecoinGuardConfig,
     };
-    use reap_storage::{acquire_storage_lease, start_jsonl_storage};
+    use reap_storage::{
+        OrderAckStatus, StorageRuntime, StorageSink, acquire_storage_lease, start_jsonl_storage,
+    };
     use reap_strategy::{ChaosConfig, InstrumentKindConfig, ReferenceDataKind};
+    use reap_telemetry::AlertSink;
     use reap_venue::okx::{
         OkxAccountConfig, OkxAccountLevel, OkxApiKeyPermission, OkxCancelOrder, OkxFillPage,
         OkxInstrumentChange, OkxInstrumentChangeParameter, OkxInstrumentType, OkxOrderAck,
@@ -4696,6 +4736,7 @@ mod tests {
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{Notify, Semaphore, oneshot};
+    use tokio::task::JoinHandle;
 
     use crate::forbidden_orders::ForbiddenOrderState;
     use crate::{
@@ -4704,6 +4745,208 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn production_runtime_keeps_single_owner_responsibility_state() {
+        let runtime_source = include_str!("runtime.rs");
+        let (production_runtime, _) = runtime_source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("runtime test module marker");
+        let responsibility_modules = [
+            include_str!("runtime/composition.rs"),
+            include_str!("runtime/connectivity.rs"),
+            include_str!("runtime/dispatch.rs"),
+            include_str!("runtime/readiness_safety.rs"),
+            include_str!("runtime/reconciliation.rs"),
+            include_str!("runtime/shutdown.rs"),
+        ];
+
+        assert_eq!(
+            production_runtime
+                .matches("coordinator: LiveCoordinator")
+                .count(),
+            1,
+            "LiveRuntime must remain the sole LiveCoordinator owner",
+        );
+        for state_field in [
+            "composition: CompositionState",
+            "connectivity: ConnectivityState",
+            "dispatch: DispatchState",
+            "readiness_safety: ReadinessSafetyState",
+            "reconciliation: ReconciliationState",
+            "shutdown: ShutdownState",
+        ] {
+            assert!(
+                production_runtime.contains(state_field),
+                "LiveRuntime is missing responsibility state `{state_field}`",
+            );
+        }
+
+        for source in std::iter::once(production_runtime).chain(responsibility_modules) {
+            let compact_source = source
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>();
+            assert!(
+                !compact_source.contains("Arc<Mutex"),
+                "production runtime ownership must not use Arc<Mutex<_>>",
+            );
+        }
+        for source in responsibility_modules {
+            assert!(
+                !source.contains("use super::*;"),
+                "responsibility modules must declare explicit dependencies",
+            );
+        }
+    }
+
+    struct TestRuntimeParts {
+        session_id: String,
+        session_started_at_ms: u64,
+        config_source: Option<LiveConfigFileEvidence>,
+        config_fingerprint: String,
+        evidence_config_fingerprint: String,
+        executable_sha256: String,
+        host_identity_sha256: Option<String>,
+        account_identity_sha256s: BTreeMap<String, String>,
+        mode: LiveMode,
+        run_duration: Option<Duration>,
+        coordinator: LiveCoordinator,
+        processor: FeedProcessor,
+        storage: Option<StorageRuntime>,
+        storage_sink: StorageSink,
+        control_rx: mpsc::Receiver<RuntimeEvent>,
+        feed_rx: mpsc::Receiver<RuntimeEvent>,
+        forbidden_rx: mpsc::Receiver<ForbiddenOrderEvent>,
+        order_senders: HashMap<String, mpsc::Sender<OrderTaskCommand>>,
+        order_tasks: Vec<JoinHandle<()>>,
+        reconcile_senders: HashMap<String, mpsc::Sender<ReconcileTaskCommand>>,
+        reconcile_tasks: Vec<JoinHandle<()>>,
+        order_ws_runtimes: Vec<OkxOrderWsRuntime>,
+        order_ws_status_tasks: Vec<JoinHandle<()>>,
+        safety_senders: HashMap<String, mpsc::Sender<SafetyTaskCommand>>,
+        safety_tasks: Vec<JoinHandle<()>>,
+        forbidden_tasks: Vec<JoinHandle<()>>,
+        feeds: Vec<SupervisedFeed>,
+        feed_tasks: Vec<JoinHandle<()>>,
+        sources: Vec<FeedSourceState>,
+        public_feed_index: usize,
+        reconcile_inflight: HashSet<String>,
+        cancel_inflight: HashSet<(String, String)>,
+        last_reconcile_attempt: HashMap<String, Instant>,
+        fill_convergence: FillConvergenceGuard,
+        order_convergence: OrderStateConvergenceGuard,
+        readiness_timeout_ms: u64,
+        timer_interval_ms: u64,
+        max_feed_age_ms: u64,
+        shutdown_timeout_ms: u64,
+        teardown_timeout_ms: u64,
+        safety_latch_sync_timeout_ms: u64,
+        evidence: RuntimeEvidence,
+        latency: LiveLatencyCollector,
+        shutdown_in_progress: bool,
+        shutdown_storage_error: Option<String>,
+        preserve_deadman_on_shutdown: bool,
+        shutdown_reconciliation_requested: HashSet<String>,
+        shutdown_reconciled_accounts: HashSet<String>,
+        operator_service: Option<OperatorService>,
+        operator_rx: Option<mpsc::Receiver<OperatorEnvelope>>,
+        operator_shutdown_reason: Option<String>,
+        alert_runtime: Option<AlertRuntime>,
+        alert_sink: Option<AlertSink>,
+        alert_failures: Option<mpsc::Receiver<AlertDeliveryFailure>>,
+        alert_shutdown_timeout_ms: u64,
+        alert_delivery_failure_is_fatal: bool,
+        observed_alert_delivery_failures: u64,
+        alert_stats: AlertStats,
+        host_guard: Option<HostGuardRuntime>,
+        host_failures: Option<mpsc::Receiver<HostHealthError>>,
+        host_preflight: Option<HostHealthSnapshot>,
+        host_checks: u64,
+        host_last_snapshot: Option<HostHealthSnapshot>,
+    }
+
+    impl TestRuntimeParts {
+        fn into_runtime(self) -> LiveRuntime {
+            LiveRuntime {
+                coordinator: self.coordinator,
+                composition: CompositionState {
+                    session_id: self.session_id,
+                    session_started_at_ms: self.session_started_at_ms,
+                    config_source: self.config_source,
+                    config_fingerprint: self.config_fingerprint,
+                    evidence_config_fingerprint: self.evidence_config_fingerprint,
+                    executable_sha256: self.executable_sha256,
+                    host_identity_sha256: self.host_identity_sha256,
+                    account_identity_sha256s: self.account_identity_sha256s,
+                    mode: self.mode,
+                    run_duration: self.run_duration,
+                    storage: self.storage,
+                    storage_sink: self.storage_sink,
+                    evidence: self.evidence,
+                    latency: self.latency,
+                },
+                connectivity: ConnectivityState {
+                    processor: self.processor,
+                    feed_rx: self.feed_rx,
+                    order_ws_runtimes: self.order_ws_runtimes,
+                    order_ws_status_tasks: self.order_ws_status_tasks,
+                    feeds: self.feeds,
+                    feed_tasks: self.feed_tasks,
+                    sources: self.sources,
+                    public_feed_index: self.public_feed_index,
+                    max_feed_age_ms: self.max_feed_age_ms,
+                },
+                dispatch: DispatchState {
+                    control_rx: self.control_rx,
+                    order_senders: self.order_senders,
+                    order_tasks: self.order_tasks,
+                    operator_service: self.operator_service,
+                    operator_rx: self.operator_rx,
+                    operator_shutdown_reason: self.operator_shutdown_reason,
+                    alert_runtime: self.alert_runtime,
+                    alert_sink: self.alert_sink,
+                    alert_failures: self.alert_failures,
+                    alert_shutdown_timeout_ms: self.alert_shutdown_timeout_ms,
+                    alert_delivery_failure_is_fatal: self.alert_delivery_failure_is_fatal,
+                    observed_alert_delivery_failures: self.observed_alert_delivery_failures,
+                    alert_stats: self.alert_stats,
+                },
+                readiness_safety: ReadinessSafetyState {
+                    forbidden_rx: self.forbidden_rx,
+                    safety_senders: self.safety_senders,
+                    safety_tasks: self.safety_tasks,
+                    forbidden_tasks: self.forbidden_tasks,
+                    readiness_timeout_ms: self.readiness_timeout_ms,
+                    timer_interval_ms: self.timer_interval_ms,
+                    host_guard: self.host_guard,
+                    host_failures: self.host_failures,
+                    host_preflight: self.host_preflight,
+                    host_checks: self.host_checks,
+                    host_last_snapshot: self.host_last_snapshot,
+                },
+                reconciliation: ReconciliationState {
+                    senders: self.reconcile_senders,
+                    tasks: self.reconcile_tasks,
+                    inflight: self.reconcile_inflight,
+                    cancel_inflight: self.cancel_inflight,
+                    last_attempt: self.last_reconcile_attempt,
+                    fill_convergence: self.fill_convergence,
+                    order_convergence: self.order_convergence,
+                },
+                shutdown: ShutdownState {
+                    timeout_ms: self.shutdown_timeout_ms,
+                    teardown_timeout_ms: self.teardown_timeout_ms,
+                    safety_latch_sync_timeout_ms: self.safety_latch_sync_timeout_ms,
+                    in_progress: self.shutdown_in_progress,
+                    storage_error: self.shutdown_storage_error,
+                    preserve_deadman: self.preserve_deadman_on_shutdown,
+                    reconciliation_requested: self.shutdown_reconciliation_requested,
+                    reconciled_accounts: self.shutdown_reconciled_accounts,
+                },
+            }
+        }
+    }
 
     #[derive(Clone)]
     struct HttpResponse {
@@ -6471,7 +6714,7 @@ mod tests {
         let (control_tx, control_rx) = mpsc::channel(16);
         let (feed_tx, feed_rx) = mpsc::channel(16);
         let (_forbidden_tx, forbidden_rx) = mpsc::channel(16);
-        let runtime = LiveRuntime {
+        let runtime = TestRuntimeParts {
             session_id: "test-alert-session".to_string(),
             session_started_at_ms: unix_time_ms(),
             config_source: None,
@@ -6535,7 +6778,8 @@ mod tests {
             host_preflight: None,
             host_checks: 0,
             host_last_snapshot: None,
-        };
+        }
+        .into_runtime();
 
         let report = runtime.run().await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), alert_server)
@@ -6595,7 +6839,7 @@ mod tests {
             let _notice = AbortNotice(Some(aborted_tx));
             std::future::pending::<()>().await;
         });
-        let runtime = LiveRuntime {
+        let runtime = TestRuntimeParts {
             session_id: "test-teardown-timeout".to_string(),
             session_started_at_ms: unix_time_ms(),
             config_source: None,
@@ -6659,7 +6903,8 @@ mod tests {
             host_preflight: None,
             host_checks: 0,
             host_last_snapshot: None,
-        };
+        }
+        .into_runtime();
 
         let error = tokio::time::timeout(Duration::from_secs(1), runtime.run())
             .await
@@ -6729,7 +6974,7 @@ mod tests {
             start_operator_service(&operator_config, SECRET.to_vec(), operator_tx)
                 .await
                 .unwrap();
-        let runtime = LiveRuntime {
+        let runtime = TestRuntimeParts {
             session_id: "test-operator-session".to_string(),
             session_started_at_ms: unix_time_ms(),
             config_source: None,
@@ -6793,7 +7038,8 @@ mod tests {
             host_preflight: None,
             host_checks: 0,
             host_last_snapshot: None,
-        };
+        }
+        .into_runtime();
         let runtime_task = tokio::spawn(runtime.run());
 
         let status =
@@ -7022,7 +7268,7 @@ mod tests {
             )))
             .await
             .unwrap();
-        let mut runtime = LiveRuntime {
+        let mut runtime = TestRuntimeParts {
             session_id: "test-shutdown-session".to_string(),
             session_started_at_ms: unix_time_ms(),
             config_source: None,
@@ -7086,7 +7332,8 @@ mod tests {
             host_preflight: None,
             host_checks: 0,
             host_last_snapshot: None,
-        };
+        }
+        .into_runtime();
 
         assert!(matches!(
             runtime.dispatch_action(LiveAction::Cancel(CancelAction {
@@ -7098,7 +7345,7 @@ mod tests {
             })),
             Err(LiveRuntimeError::Storage(StorageError::Closed))
         ));
-        assert!(runtime.cancel_inflight.is_empty());
+        assert!(runtime.reconciliation.cancel_inflight.is_empty());
 
         let error = runtime.run().await.unwrap_err();
         drop(control_tx);

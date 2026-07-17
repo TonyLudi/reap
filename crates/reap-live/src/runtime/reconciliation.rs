@@ -1,4 +1,26 @@
-use super::*;
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
+
+use reap_core::AccountUpdate;
+use reap_order::OkxReconciliationClient;
+use reap_venue::{PrivateOrderState, RemoteFill, RemoteOrder};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+use super::{
+    FillConvergenceGuard, OrderStateConvergenceGuard, ReconcileOrderRef, ReconcileTaskCommand,
+    RuntimeEvent, remote_order_id, unix_time_ms,
+};
+
+pub(super) struct ReconciliationState {
+    pub(super) senders: HashMap<String, mpsc::Sender<ReconcileTaskCommand>>,
+    pub(super) tasks: Vec<JoinHandle<()>>,
+    pub(super) inflight: HashSet<String>,
+    pub(super) cancel_inflight: HashSet<(String, String)>,
+    pub(super) last_attempt: HashMap<String, Instant>,
+    pub(super) fill_convergence: FillConvergenceGuard,
+    pub(super) order_convergence: OrderStateConvergenceGuard,
+}
 
 pub(super) async fn run_reconcile_task(
     account_id: String,
