@@ -1,0 +1,20 @@
+[package]
+name = "reap-okx-live-adapter"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+reap-core.workspace = true
+reap-feed.workspace = true
+reap-okx-wire.workspace = true
+reap-order.workspace = true
+reap-venue.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+trybuild.workspace = true

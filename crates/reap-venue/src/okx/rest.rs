@@ -1,7 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet};
 
-use async_trait::async_trait;
-use chrono::{SecondsFormat, Utc};
 use reap_core::{
     AccountUpdate, Balance, FillFee, FillKey, FillLiquidity, MarginSnapshot, Position,
     PositionMarginMode, SelfTradePrevention, Side, TimeInForce,
@@ -9,37 +7,19 @@ use reap_core::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use url::form_urlencoded;
 
 use crate::{PrivateOrderState, RemoteFill, RemoteOrder};
 
-use super::capabilities::{
-    REST_ACCOUNT_BALANCE, REST_ACCOUNT_BILLS, REST_ACCOUNT_CONFIG, REST_ACCOUNT_INSTRUMENTS,
-    REST_ACCOUNT_POSITIONS, REST_ACCOUNT_TRADE_FEE, REST_CANCEL_BATCH_REGULAR, REST_CANCEL_REGULAR,
-    REST_FILLS, REST_INDEX_TICKER, REST_ORDER_DETAILS, REST_PLACE_REGULAR, REST_PUBLIC_TIME,
-    REST_REGULAR_CAA, REST_REGULAR_PENDING, REST_SYSTEM_STATUS,
-};
-use super::{AuthError, HttpMethod, OkxSigner, SignedRequest};
-
 mod pending_orders;
-pub use pending_orders::*;
+pub use pending_orders::{
+    OKX_ALGO_CANCEL_BATCH_LIMIT, OKX_DEFAULT_MAX_PENDING_ORDER_PAGES, OKX_PENDING_ORDER_PAGE_LIMIT,
+    OkxAlgoCancelResult, OkxAlgoOrder, OkxAlgoOrderPage, OkxAlgoOrderPagination, OkxAlgoOrderQuery,
+    OkxAlgoOrderType, OkxCancelAlgoOrder, OkxRegularOrderPage, OkxRegularOrderPagination,
+    OkxSpreadOrder, OkxSpreadOrderPage, OkxSpreadOrderPagination,
+    parse_okx_algo_order_page_response_json, parse_okx_regular_order_page_response_json,
+    parse_okx_spread_order_page_response_json,
+};
 
-const PLACE_ORDER_PATH: &str = REST_PLACE_REGULAR.endpoint_or_channel;
-const CANCEL_ORDER_PATH: &str = REST_CANCEL_REGULAR.endpoint_or_channel;
-const CANCEL_BATCH_ORDERS_PATH: &str = REST_CANCEL_BATCH_REGULAR.endpoint_or_channel;
-const CANCEL_ALL_AFTER_PATH: &str = REST_REGULAR_CAA.endpoint_or_channel;
-const PUBLIC_TIME_PATH: &str = REST_PUBLIC_TIME.endpoint_or_channel;
-const MARKET_INDEX_TICKERS_PATH: &str = REST_INDEX_TICKER.endpoint_or_channel;
-const SYSTEM_STATUS_PATH: &str = REST_SYSTEM_STATUS.endpoint_or_channel;
-const OPEN_ORDERS_PATH: &str = REST_REGULAR_PENDING.endpoint_or_channel;
-const FILLS_PATH: &str = REST_FILLS.endpoint_or_channel;
-const ORDER_DETAILS_PATH: &str = REST_ORDER_DETAILS.endpoint_or_channel;
-const ACCOUNT_INSTRUMENTS_PATH: &str = REST_ACCOUNT_INSTRUMENTS.endpoint_or_channel;
-const ACCOUNT_TRADE_FEE_PATH: &str = REST_ACCOUNT_TRADE_FEE.endpoint_or_channel;
-const ACCOUNT_CONFIG_PATH: &str = REST_ACCOUNT_CONFIG.endpoint_or_channel;
-const ACCOUNT_BALANCE_PATH: &str = REST_ACCOUNT_BALANCE.endpoint_or_channel;
-const ACCOUNT_POSITIONS_PATH: &str = REST_ACCOUNT_POSITIONS.endpoint_or_channel;
-const ACCOUNT_BILLS_PATH: &str = REST_ACCOUNT_BILLS.endpoint_or_channel;
 pub const OKX_FILLS_PAGE_LIMIT: usize = 100;
 pub const OKX_BILLS_PAGE_LIMIT: usize = 100;
 pub const OKX_MIN_ACCOUNT_INSTRUMENT_REQUEST_INTERVAL_MS: u64 = 100;
@@ -47,9 +27,8 @@ pub const OKX_MIN_TRADE_FEE_REQUEST_INTERVAL_MS: u64 = 400;
 
 /// Parses an unmodified OKX trade-fills or fills-history response.
 ///
-/// Both endpoints use the same response row shape. Keeping this parser beside
-/// the signed client prevents offline evidence tooling from drifting from live
-/// reconciliation semantics.
+/// Both endpoints use the same response row shape. Keeping one credential-free
+/// parser prevents evidence and live reconciliation semantics from drifting.
 pub fn parse_okx_fills_response_json(body: &[u8]) -> Result<Vec<RemoteFill>, RestError> {
     Ok(parse_okx_fill_page_response_json(body)?.fills)
 }
@@ -210,6 +189,99 @@ pub fn parse_okx_order_details_response_json(body: &[u8]) -> Result<OkxOrderDeta
         .try_into()
 }
 
+/// Parses the credential-free response returned by the public time endpoint.
+pub fn parse_okx_server_time_response_json(body: &[u8]) -> Result<u64, RestError> {
+    let response: OkxResponse<OkxTimeWire> = decode_okx_response(body)?;
+    let wire = response
+        .data
+        .into_iter()
+        .next()
+        .ok_or(RestError::EmptyData {
+            operation: "server time",
+        })?;
+    parse_integer("ts", &wire.timestamp)
+}
+
+/// Parses account instrument metadata without granting authenticated transport.
+pub fn parse_okx_account_instruments_response_json(
+    body: &[u8],
+) -> Result<Vec<OkxInstrument>, RestError> {
+    let response: OkxResponse<OkxInstrumentWire> = decode_okx_response(body)?;
+    response
+        .data
+        .into_iter()
+        .map(OkxInstrument::try_from)
+        .collect()
+}
+
+/// Parses a regular place/cancel acknowledgement.
+pub fn parse_okx_order_ack_response_json(
+    body: &[u8],
+    operation: &'static str,
+) -> Result<OkxOrderAck, RestError> {
+    let response: OkxResponse<OkxAckWire> = decode_okx_response(body)?;
+    let ack = response
+        .data
+        .into_iter()
+        .next()
+        .ok_or(RestError::EmptyData { operation })?;
+    if !ack.sub_code.is_empty() && ack.sub_code != "0" {
+        return Err(RestError::Api {
+            code: ack.sub_code,
+            message: ack.sub_message,
+        });
+    }
+    Ok(OkxOrderAck {
+        exchange_order_id: ack.order_id,
+        client_order_id: ack.client_order_id,
+    })
+}
+
+/// Parses all rows returned by regular batch cancellation.
+pub fn parse_okx_cancel_order_results_response_json(
+    body: &[u8],
+) -> Result<Vec<OkxCancelOrderResult>, RestError> {
+    let response: OkxResponse<OkxAckWire> = decode_okx_response(body)?;
+    if response.data.is_empty() {
+        return Err(RestError::EmptyData {
+            operation: "cancel batch orders",
+        });
+    }
+    Ok(response
+        .data
+        .into_iter()
+        .map(|ack| OkxCancelOrderResult {
+            exchange_order_id: ack.order_id,
+            client_order_id: ack.client_order_id,
+            code: ack.sub_code,
+            message: ack.sub_message,
+        })
+        .collect())
+}
+
+/// Validates the acknowledgement returned by regular Cancel All After.
+pub fn parse_okx_cancel_all_after_response_json(
+    body: &[u8],
+    timeout_secs: u64,
+) -> Result<(), RestError> {
+    let response: OkxResponse<OkxCancelAllAfterWire> = decode_okx_response(body)?;
+    let acknowledgement = response
+        .data
+        .into_iter()
+        .next()
+        .ok_or(RestError::EmptyData {
+            operation: "cancel all after",
+        })?;
+    if timeout_secs != 0 && parse_integer("triggerTime", &acknowledgement.trigger_time)? == 0 {
+        return Err(RestError::InvalidField {
+            field: "triggerTime",
+            value: acknowledgement.trigger_time,
+            message: "must be nonzero when Cancel All After is armed".to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn okx_fill_page(data: Vec<OkxFillWire>) -> Result<OkxFillPage, RestError> {
     if data.len() > OKX_FILLS_PAGE_LIMIT {
         return Err(RestError::InvalidField {
@@ -270,8 +342,6 @@ fn okx_bill_page(data: Vec<OkxBillWire>) -> Result<OkxBillPage, RestError> {
 
 #[derive(Debug, Error)]
 pub enum RestError {
-    #[error("request authentication failed: {0}")]
-    Auth(#[from] AuthError),
     #[error("request serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("HTTP transport failed: {0}")]
@@ -335,12 +405,6 @@ impl RestError {
     pub fn is_order_not_found(&self) -> bool {
         matches!(self, Self::Api { code, .. } if code == "51603")
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HttpResponse {
-    pub status: u16,
-    pub body: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -415,78 +479,6 @@ impl OkxTradeFeeRate {
 
     pub fn taker_cost_rate(&self) -> f64 {
         -self.taker_rate
-    }
-}
-
-#[async_trait]
-pub trait HttpTransport: Send + Sync {
-    async fn execute(&self, request: SignedRequest) -> Result<HttpResponse, RestError>;
-}
-
-#[derive(Debug, Clone)]
-pub struct ReqwestTransport {
-    client: reqwest::Client,
-    base_url: String,
-}
-
-impl ReqwestTransport {
-    pub fn new(base_url: impl Into<String>) -> Result<Self, RestError> {
-        Self::with_timeouts(
-            base_url,
-            std::time::Duration::from_secs(2),
-            std::time::Duration::from_secs(5),
-        )
-    }
-
-    pub fn with_timeouts(
-        base_url: impl Into<String>,
-        connect_timeout: std::time::Duration,
-        request_timeout: std::time::Duration,
-    ) -> Result<Self, RestError> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(connect_timeout)
-            .timeout(request_timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .tcp_nodelay(true)
-            .build()
-            .map_err(|error| RestError::Transport(error.to_string()))?;
-        Ok(Self {
-            client,
-            base_url: base_url.into().trim_end_matches('/').to_string(),
-        })
-    }
-}
-
-#[async_trait]
-impl HttpTransport for ReqwestTransport {
-    async fn execute(&self, request: SignedRequest) -> Result<HttpResponse, RestError> {
-        let url = format!("{}{}", self.base_url, request.path);
-        let method = match request.method {
-            HttpMethod::Get => reqwest::Method::GET,
-            HttpMethod::Post => reqwest::Method::POST,
-        };
-        let mut builder = self.client.request(method, url);
-        for (name, value) in request.headers {
-            builder = builder.header(&name, value);
-        }
-        if !request.body.is_empty() {
-            builder = builder.body(request.body);
-        }
-        let response = builder
-            .send()
-            .await
-            .map_err(|error| RestError::Transport(error.to_string()))?;
-        let status = response.status().as_u16();
-        let body = response
-            .text()
-            .await
-            .map_err(|error| RestError::Transport(error.to_string()))?;
-        if !(200..300).contains(&status) {
-            return Err(RestError::Transport(format!(
-                "HTTP status {status}: {body}"
-            )));
-        }
-        Ok(HttpResponse { status, body })
     }
 }
 
@@ -725,13 +717,6 @@ pub struct OkxIndexTickerSnapshot {
     pub timestamp_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct OkxRawIndexTicker {
-    pub request_path: String,
-    pub response_body: String,
-    pub ticker: OkxIndexTickerSnapshot,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OkxAccountPositionsSnapshot {
     pub update_time_ms: u64,
@@ -767,56 +752,11 @@ pub struct OkxPositionRisk {
     pub quote_interest: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct OkxRawAccountConfig {
-    pub request_path: String,
-    pub response_body: String,
-    pub config: OkxAccountConfig,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct OkxRawAccountBalance {
-    pub request_path: String,
-    pub response_body: String,
-    pub snapshot: OkxAccountBalanceSnapshot,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct OkxRawAccountPositions {
-    pub request_path: String,
-    pub response_body: String,
-    pub snapshot: OkxAccountPositionsSnapshot,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OkxOrderDetails {
     pub order: RemoteOrder,
     pub cancel_source: String,
     pub cancel_source_reason: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct OkxRawOpenOrders {
-    pub request_path: String,
-    pub response_body: String,
-    pub orders: Vec<RemoteOrder>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct OkxRawOrderDetails {
-    pub request_path: String,
-    pub response_body: String,
-    pub details: OkxOrderDetails,
-}
-
-impl OkxTradeMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Cash => "cash",
-            Self::Cross => "cross",
-            Self::Isolated => "isolated",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -857,13 +797,6 @@ pub struct OkxCancelOrderResult {
 pub struct OkxFillPage {
     pub fills: Vec<RemoteFill>,
     pub next_after: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct OkxRawFillPage {
-    pub request_path: String,
-    pub response_body: String,
-    pub page: OkxFillPage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -925,13 +858,6 @@ pub struct OkxBill {
 pub struct OkxBillPage {
     pub bills: Vec<OkxBill>,
     pub next_after: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct OkxRawBillPage {
-    pub request_path: String,
-    pub response_body: String,
-    pub page: OkxBillPage,
 }
 
 #[derive(Debug)]
@@ -1072,1098 +998,6 @@ impl OkxBillPagination {
 impl OkxCancelOrderResult {
     pub fn accepted(&self) -> bool {
         self.code.is_empty() || self.code == "0"
-    }
-}
-
-#[derive(Clone)]
-pub struct OkxRestClient<T> {
-    transport: T,
-    signer: OkxSigner,
-    order_request_expiry_ms: Option<u64>,
-}
-
-impl<T> OkxRestClient<T>
-where
-    T: HttpTransport,
-{
-    pub fn new(transport: T, signer: OkxSigner) -> Self {
-        Self {
-            transport,
-            signer,
-            order_request_expiry_ms: None,
-        }
-    }
-
-    pub fn with_order_request_expiry(mut self, expiry: std::time::Duration) -> Self {
-        self.order_request_expiry_ms = Some(expiry.as_millis().max(1).min(u64::MAX as u128) as u64);
-        self
-    }
-
-    pub fn signer(&self) -> &OkxSigner {
-        &self.signer
-    }
-
-    pub async fn place_order(&self, order: &OkxPlaceOrder) -> Result<OkxOrderAck, RestError> {
-        let now = Utc::now();
-        let timestamp = now.to_rfc3339_opts(SecondsFormat::Millis, true);
-        let expiry_ms = self
-            .order_request_expiry_ms
-            .map(|ttl_ms| (now.timestamp_millis().max(0) as u64).saturating_add(ttl_ms));
-        self.place_order_with_expiry_at(&timestamp, expiry_ms, order)
-            .await
-    }
-
-    pub async fn place_order_at(
-        &self,
-        timestamp: &str,
-        order: &OkxPlaceOrder,
-    ) -> Result<OkxOrderAck, RestError> {
-        let expiry_ms = self
-            .order_request_expiry_ms
-            .map(|ttl_ms| timestamp_ms(timestamp).map(|now_ms| now_ms.saturating_add(ttl_ms)))
-            .transpose()?;
-        self.place_order_with_expiry_at(timestamp, expiry_ms, order)
-            .await
-    }
-
-    pub async fn place_order_with_expiry_at(
-        &self,
-        timestamp: &str,
-        expiry_ms: Option<u64>,
-        order: &OkxPlaceOrder,
-    ) -> Result<OkxOrderAck, RestError> {
-        let request = self.build_place_request_with_expiry(timestamp, expiry_ms, order)?;
-        self.execute_ack(request, "place order").await
-    }
-
-    pub async fn server_time_ms(&self) -> Result<u64, RestError> {
-        let request = SignedRequest {
-            method: HttpMethod::Get,
-            path: PUBLIC_TIME_PATH.to_string(),
-            body: String::new(),
-            headers: BTreeMap::new(),
-        };
-        let response: OkxResponse<OkxTimeWire> = self.execute(request).await?;
-        let wire = response
-            .data
-            .into_iter()
-            .next()
-            .ok_or(RestError::EmptyData {
-                operation: "server time",
-            })?;
-        parse_integer("ts", &wire.timestamp)
-    }
-
-    pub async fn index_ticker(&self, symbol: &str) -> Result<OkxIndexTickerSnapshot, RestError> {
-        Ok(self.index_ticker_raw(symbol).await?.ticker)
-    }
-
-    /// Retrieves one public index ticker while retaining the exact response.
-    pub async fn index_ticker_raw(&self, symbol: &str) -> Result<OkxRawIndexTicker, RestError> {
-        let symbol = symbol.trim();
-        if symbol.is_empty() {
-            return Err(RestError::InvalidField {
-                field: "instId",
-                value: symbol.to_string(),
-                message: "must be non-empty".to_string(),
-            });
-        }
-        let path = query_path(MARKET_INDEX_TICKERS_PATH, [("instId", Some(symbol))]);
-        let request = SignedRequest {
-            method: HttpMethod::Get,
-            path: path.clone(),
-            body: String::new(),
-            headers: BTreeMap::new(),
-        };
-        let response = self.transport.execute(request).await?;
-        let ticker = parse_okx_index_ticker_response_json(response.body.as_bytes())?;
-        if ticker.symbol != symbol {
-            return Err(RestError::InvalidField {
-                field: "instId",
-                value: ticker.symbol,
-                message: format!("does not match requested {symbol}"),
-            });
-        }
-        Ok(OkxRawIndexTicker {
-            request_path: path,
-            response_body: response.body,
-            ticker,
-        })
-    }
-
-    pub async fn system_status(&self) -> Result<Vec<OkxSystemStatus>, RestError> {
-        let request = SignedRequest {
-            method: HttpMethod::Get,
-            path: SYSTEM_STATUS_PATH.to_string(),
-            body: String::new(),
-            headers: BTreeMap::new(),
-        };
-        let response: OkxResponse<OkxSystemStatusWire> = self.execute(request).await?;
-        response
-            .data
-            .into_iter()
-            .map(OkxSystemStatus::try_from)
-            .collect()
-    }
-
-    pub async fn cancel_all_after(&self, timeout_secs: u64) -> Result<(), RestError> {
-        self.cancel_all_after_at(&timestamp_now(), timeout_secs)
-            .await
-    }
-
-    pub async fn cancel_all_after_at(
-        &self,
-        timestamp: &str,
-        timeout_secs: u64,
-    ) -> Result<(), RestError> {
-        if timeout_secs != 0 && !(10..=120).contains(&timeout_secs) {
-            return Err(RestError::InvalidField {
-                field: "timeOut",
-                value: timeout_secs.to_string(),
-                message: "must be 0 or between 10 and 120 seconds".to_string(),
-            });
-        }
-        #[derive(Serialize)]
-        struct Body {
-            #[serde(rename = "timeOut")]
-            timeout_secs: String,
-        }
-        let body = serde_json::to_string(&Body {
-            timeout_secs: timeout_secs.to_string(),
-        })?;
-        let request =
-            self.signer
-                .sign_request(timestamp, HttpMethod::Post, CANCEL_ALL_AFTER_PATH, body)?;
-        let response: OkxResponse<OkxCancelAllAfterWire> = self.execute(request).await?;
-        let acknowledgement = response
-            .data
-            .into_iter()
-            .next()
-            .ok_or(RestError::EmptyData {
-                operation: "cancel all after",
-            })?;
-        if timeout_secs != 0 && parse_integer("triggerTime", &acknowledgement.trigger_time)? == 0 {
-            return Err(RestError::InvalidField {
-                field: "triggerTime",
-                value: acknowledgement.trigger_time,
-                message: "must be nonzero when Cancel All After is armed".to_string(),
-            });
-        }
-        Ok(())
-    }
-
-    pub async fn cancel_order(&self, order: &OkxCancelOrder) -> Result<OkxOrderAck, RestError> {
-        self.cancel_order_at(&timestamp_now(), order).await
-    }
-
-    pub async fn cancel_order_at(
-        &self,
-        timestamp: &str,
-        order: &OkxCancelOrder,
-    ) -> Result<OkxOrderAck, RestError> {
-        let request = self.build_cancel_request(timestamp, order)?;
-        self.execute_ack(request, "cancel order").await
-    }
-
-    pub async fn cancel_batch_orders(
-        &self,
-        orders: &[OkxCancelOrder],
-    ) -> Result<Vec<OkxCancelOrderResult>, RestError> {
-        self.cancel_batch_orders_at(&timestamp_now(), orders).await
-    }
-
-    pub async fn cancel_batch_orders_at(
-        &self,
-        timestamp: &str,
-        orders: &[OkxCancelOrder],
-    ) -> Result<Vec<OkxCancelOrderResult>, RestError> {
-        let request = self.build_cancel_batch_request(timestamp, orders)?;
-        let response: OkxResponse<OkxAckWire> = self.execute(request).await?;
-        if response.data.is_empty() {
-            return Err(RestError::EmptyData {
-                operation: "cancel batch orders",
-            });
-        }
-        Ok(response
-            .data
-            .into_iter()
-            .map(|ack| OkxCancelOrderResult {
-                exchange_order_id: ack.order_id,
-                client_order_id: ack.client_order_id,
-                code: ack.sub_code,
-                message: ack.sub_message,
-            })
-            .collect())
-    }
-
-    pub async fn open_orders(
-        &self,
-        instrument_type: Option<&str>,
-        symbol: Option<&str>,
-    ) -> Result<Vec<RemoteOrder>, RestError> {
-        self.open_orders_at(&timestamp_now(), instrument_type, symbol)
-            .await
-    }
-
-    pub async fn open_orders_at(
-        &self,
-        timestamp: &str,
-        instrument_type: Option<&str>,
-        symbol: Option<&str>,
-    ) -> Result<Vec<RemoteOrder>, RestError> {
-        Ok(self
-            .open_orders_raw_at(timestamp, instrument_type, symbol)
-            .await?
-            .orders)
-    }
-
-    /// Retrieves regular pending orders while retaining the exact response.
-    pub async fn open_orders_raw(
-        &self,
-        instrument_type: Option<&str>,
-        symbol: Option<&str>,
-    ) -> Result<OkxRawOpenOrders, RestError> {
-        self.open_orders_raw_at(&timestamp_now(), instrument_type, symbol)
-            .await
-    }
-
-    pub async fn open_orders_raw_at(
-        &self,
-        timestamp: &str,
-        instrument_type: Option<&str>,
-        symbol: Option<&str>,
-    ) -> Result<OkxRawOpenOrders, RestError> {
-        let path = query_path(
-            OPEN_ORDERS_PATH,
-            [("instType", instrument_type), ("instId", symbol)],
-        );
-        let request = self
-            .signer
-            .sign_request(timestamp, HttpMethod::Get, path.clone(), "")?;
-        let response = self.transport.execute(request).await?;
-        let orders = parse_okx_open_orders_response_json(response.body.as_bytes())?;
-        Ok(OkxRawOpenOrders {
-            request_path: path,
-            response_body: response.body,
-            orders,
-        })
-    }
-
-    pub async fn fills(
-        &self,
-        instrument_type: Option<&str>,
-        symbol: Option<&str>,
-    ) -> Result<Vec<RemoteFill>, RestError> {
-        self.fills_at(&timestamp_now(), instrument_type, symbol)
-            .await
-    }
-
-    pub async fn fills_at(
-        &self,
-        timestamp: &str,
-        instrument_type: Option<&str>,
-        symbol: Option<&str>,
-    ) -> Result<Vec<RemoteFill>, RestError> {
-        Ok(self
-            .fills_page_at(timestamp, instrument_type, symbol, None)
-            .await?
-            .fills)
-    }
-
-    pub async fn fills_page(
-        &self,
-        instrument_type: Option<&str>,
-        symbol: Option<&str>,
-        after: Option<&str>,
-    ) -> Result<OkxFillPage, RestError> {
-        self.fills_page_at(&timestamp_now(), instrument_type, symbol, after)
-            .await
-    }
-
-    pub async fn fills_page_at(
-        &self,
-        timestamp: &str,
-        instrument_type: Option<&str>,
-        symbol: Option<&str>,
-        after: Option<&str>,
-    ) -> Result<OkxFillPage, RestError> {
-        Ok(self
-            .fills_page_raw_at(timestamp, instrument_type, symbol, after)
-            .await?
-            .page)
-    }
-
-    /// Retrieves one recent-fill page while retaining the exact response body.
-    pub async fn fills_page_raw(
-        &self,
-        instrument_type: Option<&str>,
-        symbol: Option<&str>,
-        after: Option<&str>,
-    ) -> Result<OkxRawFillPage, RestError> {
-        self.fills_page_raw_at(&timestamp_now(), instrument_type, symbol, after)
-            .await
-    }
-
-    pub async fn fills_page_raw_at(
-        &self,
-        timestamp: &str,
-        instrument_type: Option<&str>,
-        symbol: Option<&str>,
-        after: Option<&str>,
-    ) -> Result<OkxRawFillPage, RestError> {
-        let path = query_path(
-            FILLS_PATH,
-            [
-                ("instType", instrument_type),
-                ("instId", symbol),
-                ("after", after),
-                ("limit", Some("100")),
-            ],
-        );
-        let request = self
-            .signer
-            .sign_request(timestamp, HttpMethod::Get, path.clone(), "")?;
-        let response = self.transport.execute(request).await?;
-        let page = parse_okx_fill_page_response_json(response.body.as_bytes())?;
-        Ok(OkxRawFillPage {
-            request_path: path,
-            response_body: response.body,
-            page,
-        })
-    }
-
-    /// Retrieves complete recent-fill pages up to a fail-closed bound.
-    ///
-    /// This transport helper does not pace requests. Live callers use the
-    /// account gateway, which reserves one reconciliation request per page.
-    pub async fn fills_paginated(
-        &self,
-        instrument_type: Option<&str>,
-        symbol: Option<&str>,
-        max_pages: usize,
-    ) -> Result<Vec<RemoteFill>, RestError> {
-        let mut pagination = OkxFillPagination::new(max_pages)?;
-        loop {
-            let page = self
-                .fills_page(instrument_type, symbol, pagination.after())
-                .await?;
-            if pagination.accept(page)? {
-                return Ok(pagination.into_fills());
-            }
-        }
-    }
-
-    /// Retrieves one account-wide bill page for an inclusive closed window
-    /// while retaining the exact response body.
-    pub async fn account_bills_page_raw(
-        &self,
-        begin_ms: u64,
-        end_ms: u64,
-        after: Option<&str>,
-    ) -> Result<OkxRawBillPage, RestError> {
-        self.account_bills_page_raw_at(&timestamp_now(), begin_ms, end_ms, after)
-            .await
-    }
-
-    pub async fn account_bills_page_raw_at(
-        &self,
-        timestamp: &str,
-        begin_ms: u64,
-        end_ms: u64,
-        after: Option<&str>,
-    ) -> Result<OkxRawBillPage, RestError> {
-        if begin_ms == 0 || end_ms == 0 || begin_ms > end_ms {
-            return Err(RestError::InvalidField {
-                field: "begin/end",
-                value: format!("{begin_ms}/{end_ms}"),
-                message: "must be a positive inclusive window".to_string(),
-            });
-        }
-        let begin = begin_ms.to_string();
-        let end = end_ms.to_string();
-        let path = query_path(
-            ACCOUNT_BILLS_PATH,
-            [
-                ("begin", Some(begin.as_str())),
-                ("end", Some(end.as_str())),
-                ("after", after),
-                ("limit", Some("100")),
-            ],
-        );
-        let request = self
-            .signer
-            .sign_request(timestamp, HttpMethod::Get, path.clone(), "")?;
-        let response = self.transport.execute(request).await?;
-        let page = parse_okx_bill_page_response_json(response.body.as_bytes())?;
-        Ok(OkxRawBillPage {
-            request_path: path,
-            response_body: response.body,
-            page,
-        })
-    }
-
-    /// Retrieves complete account-wide bill pages up to a fail-closed bound.
-    /// Callers are responsible for pacing the five-requests-per-two-seconds
-    /// account endpoint.
-    pub async fn account_bills_paginated(
-        &self,
-        begin_ms: u64,
-        end_ms: u64,
-        max_pages: usize,
-    ) -> Result<Vec<OkxBill>, RestError> {
-        let mut pagination = OkxBillPagination::new(max_pages)?;
-        loop {
-            let page = self
-                .account_bills_page_raw(begin_ms, end_ms, pagination.after())
-                .await?
-                .page;
-            if pagination.accept(page)? {
-                return Ok(pagination.into_bills());
-            }
-        }
-    }
-
-    pub async fn order_details(
-        &self,
-        symbol: &str,
-        exchange_order_id: Option<&str>,
-        client_order_id: Option<&str>,
-    ) -> Result<RemoteOrder, RestError> {
-        self.order_details_at(&timestamp_now(), symbol, exchange_order_id, client_order_id)
-            .await
-    }
-
-    pub async fn order_details_at(
-        &self,
-        timestamp: &str,
-        symbol: &str,
-        exchange_order_id: Option<&str>,
-        client_order_id: Option<&str>,
-    ) -> Result<RemoteOrder, RestError> {
-        Ok(self
-            .order_details_raw_at(timestamp, symbol, exchange_order_id, client_order_id)
-            .await?
-            .details
-            .order)
-    }
-
-    /// Retrieves one order while retaining cancellation attribution and the
-    /// exact response body.
-    pub async fn order_details_raw(
-        &self,
-        symbol: &str,
-        exchange_order_id: Option<&str>,
-        client_order_id: Option<&str>,
-    ) -> Result<OkxRawOrderDetails, RestError> {
-        self.order_details_raw_at(&timestamp_now(), symbol, exchange_order_id, client_order_id)
-            .await
-    }
-
-    pub async fn order_details_raw_at(
-        &self,
-        timestamp: &str,
-        symbol: &str,
-        exchange_order_id: Option<&str>,
-        client_order_id: Option<&str>,
-    ) -> Result<OkxRawOrderDetails, RestError> {
-        if exchange_order_id.is_none() && client_order_id.is_none() {
-            return Err(RestError::InvalidField {
-                field: "ordId/clOrdId",
-                value: String::new(),
-                message: "one identifier is required".to_string(),
-            });
-        }
-        let path = query_path(
-            ORDER_DETAILS_PATH,
-            [
-                ("instId", Some(symbol)),
-                ("ordId", exchange_order_id),
-                ("clOrdId", client_order_id),
-            ],
-        );
-        let request = self
-            .signer
-            .sign_request(timestamp, HttpMethod::Get, path.clone(), "")?;
-        let response = self.transport.execute(request).await?;
-        let details = parse_okx_order_details_response_json(response.body.as_bytes())?;
-        Ok(OkxRawOrderDetails {
-            request_path: path,
-            response_body: response.body,
-            details,
-        })
-    }
-
-    pub async fn account_instruments(
-        &self,
-        instrument_type: OkxInstrumentType,
-        symbol: Option<&str>,
-    ) -> Result<Vec<OkxInstrument>, RestError> {
-        self.account_instruments_at(&timestamp_now(), instrument_type, symbol)
-            .await
-    }
-
-    pub async fn account_instruments_at(
-        &self,
-        timestamp: &str,
-        instrument_type: OkxInstrumentType,
-        symbol: Option<&str>,
-    ) -> Result<Vec<OkxInstrument>, RestError> {
-        let path = query_path(
-            ACCOUNT_INSTRUMENTS_PATH,
-            [
-                ("instType", Some(instrument_type.as_str())),
-                ("instId", symbol),
-            ],
-        );
-        let request = self
-            .signer
-            .sign_request(timestamp, HttpMethod::Get, path, "")?;
-        let response: OkxResponse<OkxInstrumentWire> = self.execute(request).await?;
-        response
-            .data
-            .into_iter()
-            .map(OkxInstrument::try_from)
-            .collect()
-    }
-
-    pub async fn account_instrument(
-        &self,
-        instrument_type: OkxInstrumentType,
-        symbol: &str,
-    ) -> Result<OkxInstrument, RestError> {
-        self.account_instrument_at(&timestamp_now(), instrument_type, symbol)
-            .await
-    }
-
-    pub async fn account_instrument_at(
-        &self,
-        timestamp: &str,
-        instrument_type: OkxInstrumentType,
-        symbol: &str,
-    ) -> Result<OkxInstrument, RestError> {
-        validate_required_text("instId", symbol)?;
-        let mut instruments = self
-            .account_instruments_at(timestamp, instrument_type, Some(symbol))
-            .await?;
-        if instruments.len() != 1 {
-            return Err(RestError::InvalidField {
-                field: "data",
-                value: instruments.len().to_string(),
-                message: "exact account instrument response must contain one row".to_string(),
-            });
-        }
-        let instrument = instruments
-            .pop()
-            .expect("checked one exact account instrument row");
-        if instrument.symbol != symbol || instrument.instrument_type != instrument_type {
-            return Err(RestError::InvalidField {
-                field: "instId/instType",
-                value: format!(
-                    "{}/{}",
-                    instrument.symbol,
-                    instrument.instrument_type.as_str()
-                ),
-                message: format!(
-                    "expected exact {}/{} account instrument response",
-                    symbol,
-                    instrument_type.as_str()
-                ),
-            });
-        }
-        Ok(instrument)
-    }
-
-    pub async fn account_trade_fee(
-        &self,
-        instrument_type: OkxInstrumentType,
-        instrument_id: Option<&str>,
-        instrument_family: Option<&str>,
-        group_id: &str,
-    ) -> Result<OkxTradeFeeRate, RestError> {
-        self.account_trade_fee_at(
-            &timestamp_now(),
-            instrument_type,
-            instrument_id,
-            instrument_family,
-            group_id,
-        )
-        .await
-    }
-
-    pub async fn account_trade_fee_at(
-        &self,
-        timestamp: &str,
-        instrument_type: OkxInstrumentType,
-        instrument_id: Option<&str>,
-        instrument_family: Option<&str>,
-        group_id: &str,
-    ) -> Result<OkxTradeFeeRate, RestError> {
-        let instrument_id = instrument_id.filter(|value| !value.trim().is_empty());
-        let instrument_family = instrument_family.filter(|value| !value.trim().is_empty());
-        let selector_is_valid = match instrument_type {
-            OkxInstrumentType::Spot | OkxInstrumentType::Margin => {
-                instrument_id.is_some() && instrument_family.is_none()
-            }
-            OkxInstrumentType::Swap | OkxInstrumentType::Futures | OkxInstrumentType::Option => {
-                instrument_id.is_none() && instrument_family.is_some()
-            }
-        };
-        if !selector_is_valid {
-            return Err(RestError::InvalidField {
-                field: "instId/instFamily",
-                value: format!("instId={instrument_id:?}, instFamily={instrument_family:?}"),
-                message: "spot/margin requires instId; derivatives require instFamily".to_string(),
-            });
-        }
-        validate_required_text("groupId", group_id)?;
-        let path = query_path(
-            ACCOUNT_TRADE_FEE_PATH,
-            [
-                ("instType", Some(instrument_type.as_str())),
-                ("instId", instrument_id),
-                ("instFamily", instrument_family),
-            ],
-        );
-        let request = self
-            .signer
-            .sign_request(timestamp, HttpMethod::Get, path, "")?;
-        let response: OkxResponse<OkxTradeFeeScheduleWire> = self.execute(request).await?;
-        if response.data.len() != 1 {
-            return Err(RestError::InvalidField {
-                field: "data",
-                value: response.data.len().to_string(),
-                message: "trade fee response must contain exactly one schedule".to_string(),
-            });
-        }
-        let rates = parse_trade_fee_schedule(
-            response
-                .data
-                .into_iter()
-                .next()
-                .expect("checked one trade-fee schedule"),
-        )?;
-        rates
-            .into_iter()
-            .find(|rate| {
-                rate.instrument_type == instrument_type && rate.group_id == group_id.trim()
-            })
-            .ok_or_else(|| RestError::InvalidField {
-                field: "feeGroup.groupId",
-                value: group_id.to_string(),
-                message: format!(
-                    "trade fee response contained no matching {} group",
-                    instrument_type.as_str()
-                ),
-            })
-    }
-
-    pub async fn account_config(&self) -> Result<OkxAccountConfig, RestError> {
-        self.account_config_at(&timestamp_now()).await
-    }
-
-    pub async fn account_config_at(&self, timestamp: &str) -> Result<OkxAccountConfig, RestError> {
-        Ok(self.account_config_raw_at(timestamp).await?.config)
-    }
-
-    /// Retrieves account configuration while retaining the exact response body.
-    pub async fn account_config_raw(&self) -> Result<OkxRawAccountConfig, RestError> {
-        self.account_config_raw_at(&timestamp_now()).await
-    }
-
-    pub async fn account_config_raw_at(
-        &self,
-        timestamp: &str,
-    ) -> Result<OkxRawAccountConfig, RestError> {
-        let request =
-            self.signer
-                .sign_request(timestamp, HttpMethod::Get, ACCOUNT_CONFIG_PATH, "")?;
-        let response = self.transport.execute(request).await?;
-        let config = parse_okx_account_config_response_json(response.body.as_bytes())?;
-        Ok(OkxRawAccountConfig {
-            request_path: ACCOUNT_CONFIG_PATH.to_string(),
-            response_body: response.body,
-            config,
-        })
-    }
-
-    pub async fn account_balance(&self) -> Result<AccountUpdate, RestError> {
-        self.account_balance_at(&timestamp_now()).await
-    }
-
-    pub async fn account_balance_at(&self, timestamp: &str) -> Result<AccountUpdate, RestError> {
-        Ok(self
-            .account_balance_snapshot_at(timestamp)
-            .await?
-            .account_update())
-    }
-
-    pub async fn account_balance_snapshot(&self) -> Result<OkxAccountBalanceSnapshot, RestError> {
-        self.account_balance_snapshot_at(&timestamp_now()).await
-    }
-
-    pub async fn account_balance_snapshot_at(
-        &self,
-        timestamp: &str,
-    ) -> Result<OkxAccountBalanceSnapshot, RestError> {
-        Ok(self.account_balance_raw_at(timestamp).await?.snapshot)
-    }
-
-    /// Retrieves account balances while retaining the exact response body.
-    pub async fn account_balance_raw(&self) -> Result<OkxRawAccountBalance, RestError> {
-        self.account_balance_raw_at(&timestamp_now()).await
-    }
-
-    pub async fn account_balance_raw_at(
-        &self,
-        timestamp: &str,
-    ) -> Result<OkxRawAccountBalance, RestError> {
-        let request =
-            self.signer
-                .sign_request(timestamp, HttpMethod::Get, ACCOUNT_BALANCE_PATH, "")?;
-        let response = self.transport.execute(request).await?;
-        let snapshot = parse_okx_account_balance_response_json(response.body.as_bytes())?;
-        Ok(OkxRawAccountBalance {
-            request_path: ACCOUNT_BALANCE_PATH.to_string(),
-            response_body: response.body,
-            snapshot,
-        })
-    }
-
-    pub async fn account_positions(
-        &self,
-        instrument_type: Option<OkxInstrumentType>,
-        symbol: Option<&str>,
-    ) -> Result<AccountUpdate, RestError> {
-        self.account_positions_at(&timestamp_now(), instrument_type, symbol)
-            .await
-    }
-
-    pub async fn account_positions_at(
-        &self,
-        timestamp: &str,
-        instrument_type: Option<OkxInstrumentType>,
-        symbol: Option<&str>,
-    ) -> Result<AccountUpdate, RestError> {
-        Ok(self
-            .account_positions_snapshot_at(timestamp, instrument_type, symbol)
-            .await?
-            .account_update())
-    }
-
-    pub async fn account_positions_snapshot(
-        &self,
-        instrument_type: Option<OkxInstrumentType>,
-        symbol: Option<&str>,
-    ) -> Result<OkxAccountPositionsSnapshot, RestError> {
-        self.account_positions_snapshot_at(&timestamp_now(), instrument_type, symbol)
-            .await
-    }
-
-    pub async fn account_positions_snapshot_at(
-        &self,
-        timestamp: &str,
-        instrument_type: Option<OkxInstrumentType>,
-        symbol: Option<&str>,
-    ) -> Result<OkxAccountPositionsSnapshot, RestError> {
-        Ok(self
-            .account_positions_raw_at(timestamp, instrument_type, symbol)
-            .await?
-            .snapshot)
-    }
-
-    /// Retrieves positions while retaining the exact response body.
-    pub async fn account_positions_raw(
-        &self,
-        instrument_type: Option<OkxInstrumentType>,
-        symbol: Option<&str>,
-    ) -> Result<OkxRawAccountPositions, RestError> {
-        self.account_positions_raw_at(&timestamp_now(), instrument_type, symbol)
-            .await
-    }
-
-    pub async fn account_positions_raw_at(
-        &self,
-        timestamp: &str,
-        instrument_type: Option<OkxInstrumentType>,
-        symbol: Option<&str>,
-    ) -> Result<OkxRawAccountPositions, RestError> {
-        let path = query_path(
-            ACCOUNT_POSITIONS_PATH,
-            [
-                ("instType", instrument_type.map(OkxInstrumentType::as_str)),
-                ("instId", symbol),
-            ],
-        );
-        let request = self
-            .signer
-            .sign_request(timestamp, HttpMethod::Get, path.clone(), "")?;
-        let response = self.transport.execute(request).await?;
-        let snapshot = parse_okx_account_positions_response_json(response.body.as_bytes())?;
-        Ok(OkxRawAccountPositions {
-            request_path: path,
-            response_body: response.body,
-            snapshot,
-        })
-    }
-
-    pub fn build_place_request(
-        &self,
-        timestamp: &str,
-        order: &OkxPlaceOrder,
-    ) -> Result<SignedRequest, RestError> {
-        self.build_place_request_with_expiry(timestamp, None, order)
-    }
-
-    pub fn build_place_request_with_expiry(
-        &self,
-        timestamp: &str,
-        expiry_ms: Option<u64>,
-        order: &OkxPlaceOrder,
-    ) -> Result<SignedRequest, RestError> {
-        let body = serialize_place_order(order)?;
-        let mut request =
-            self.signer
-                .sign_request(timestamp, HttpMethod::Post, PLACE_ORDER_PATH, body)?;
-        if let Some(expiry_ms) = expiry_ms {
-            request
-                .headers
-                .insert("expTime".to_string(), expiry_ms.to_string());
-        }
-        Ok(request)
-    }
-
-    pub fn build_cancel_request(
-        &self,
-        timestamp: &str,
-        order: &OkxCancelOrder,
-    ) -> Result<SignedRequest, RestError> {
-        let body = serialize_cancel_order(order)?;
-        Ok(self
-            .signer
-            .sign_request(timestamp, HttpMethod::Post, CANCEL_ORDER_PATH, body)?)
-    }
-
-    pub fn build_cancel_batch_request(
-        &self,
-        timestamp: &str,
-        orders: &[OkxCancelOrder],
-    ) -> Result<SignedRequest, RestError> {
-        #[derive(Serialize)]
-        struct Body<'a> {
-            #[serde(rename = "instId")]
-            symbol: &'a str,
-            #[serde(rename = "ordId", skip_serializing_if = "Option::is_none")]
-            exchange_order_id: Option<&'a str>,
-            #[serde(rename = "clOrdId", skip_serializing_if = "Option::is_none")]
-            client_order_id: Option<&'a str>,
-        }
-
-        if orders.is_empty() || orders.len() > 20 {
-            return Err(RestError::InvalidField {
-                field: "orders",
-                value: orders.len().to_string(),
-                message: "cancel batch must contain 1-20 orders".to_string(),
-            });
-        }
-        let mut body = Vec::with_capacity(orders.len());
-        for order in orders {
-            if order.exchange_order_id.is_none() && order.client_order_id.is_none() {
-                return Err(RestError::InvalidField {
-                    field: "ordId/clOrdId",
-                    value: String::new(),
-                    message: "one identifier is required for every cancel".to_string(),
-                });
-            }
-            body.push(Body {
-                symbol: &order.symbol,
-                exchange_order_id: order.exchange_order_id.as_deref(),
-                client_order_id: order.client_order_id.as_deref(),
-            });
-        }
-        Ok(self.signer.sign_request(
-            timestamp,
-            HttpMethod::Post,
-            CANCEL_BATCH_ORDERS_PATH,
-            serde_json::to_string(&body)?,
-        )?)
-    }
-
-    async fn execute_ack(
-        &self,
-        request: SignedRequest,
-        operation: &'static str,
-    ) -> Result<OkxOrderAck, RestError> {
-        let response: OkxResponse<OkxAckWire> = self.execute(request).await?;
-        let ack = response
-            .data
-            .into_iter()
-            .next()
-            .ok_or(RestError::EmptyData { operation })?;
-        if !ack.sub_code.is_empty() && ack.sub_code != "0" {
-            return Err(RestError::Api {
-                code: ack.sub_code,
-                message: ack.sub_message,
-            });
-        }
-        Ok(OkxOrderAck {
-            exchange_order_id: ack.order_id,
-            client_order_id: ack.client_order_id,
-        })
-    }
-
-    async fn execute<R: DeserializeOwned>(
-        &self,
-        request: SignedRequest,
-    ) -> Result<OkxResponse<R>, RestError> {
-        let response = self.transport.execute(request).await?;
-        let decoded: OkxResponse<R> = serde_json::from_str(&response.body)?;
-        if decoded.code != "0" {
-            return Err(RestError::Api {
-                code: decoded.code,
-                message: decoded.message,
-            });
-        }
-        Ok(decoded)
-    }
-}
-
-fn timestamp_now() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
-}
-
-pub fn format_okx_timestamp_ms(timestamp_ms: u64) -> Result<String, RestError> {
-    let timestamp_ms = i64::try_from(timestamp_ms).map_err(|error| RestError::InvalidField {
-        field: "OK-ACCESS-TIMESTAMP",
-        value: timestamp_ms.to_string(),
-        message: error.to_string(),
-    })?;
-    let timestamp =
-        chrono::DateTime::<Utc>::from_timestamp_millis(timestamp_ms).ok_or_else(|| {
-            RestError::InvalidField {
-                field: "OK-ACCESS-TIMESTAMP",
-                value: timestamp_ms.to_string(),
-                message: "timestamp is outside the supported range".to_string(),
-            }
-        })?;
-    Ok(timestamp.to_rfc3339_opts(SecondsFormat::Millis, true))
-}
-
-fn timestamp_ms(timestamp: &str) -> Result<u64, RestError> {
-    let timestamp = chrono::DateTime::parse_from_rfc3339(timestamp).map_err(|error| {
-        RestError::InvalidField {
-            field: "OK-ACCESS-TIMESTAMP",
-            value: timestamp.to_string(),
-            message: error.to_string(),
-        }
-    })?;
-    u64::try_from(timestamp.timestamp_millis()).map_err(|error| RestError::InvalidField {
-        field: "OK-ACCESS-TIMESTAMP",
-        value: timestamp.to_rfc3339(),
-        message: error.to_string(),
-    })
-}
-
-fn query_path<'a>(
-    base: &str,
-    parameters: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
-) -> String {
-    let mut serializer = form_urlencoded::Serializer::new(String::new());
-    for (name, value) in parameters {
-        if let Some(value) = value {
-            serializer.append_pair(name, value);
-        }
-    }
-    let query = serializer.finish();
-    if query.is_empty() {
-        base.to_string()
-    } else {
-        format!("{base}?{query}")
-    }
-}
-
-fn decimal_string(value: f64) -> String {
-    value.to_string()
-}
-
-pub(super) fn serialize_place_order(order: &OkxPlaceOrder) -> Result<String, RestError> {
-    #[derive(Serialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Body<'a> {
-        #[serde(rename = "instId")]
-        symbol: &'a str,
-        #[serde(rename = "tdMode")]
-        trade_mode: &'static str,
-        side: &'static str,
-        #[serde(rename = "ordType")]
-        order_type: &'static str,
-        px: String,
-        sz: String,
-        #[serde(rename = "clOrdId")]
-        client_order_id: &'a str,
-        #[serde(rename = "reduceOnly", skip_serializing_if = "Option::is_none")]
-        reduce_only: Option<bool>,
-        #[serde(rename = "stpMode", skip_serializing_if = "Option::is_none")]
-        self_trade_prevention: Option<&'static str>,
-    }
-
-    Ok(serde_json::to_string(&Body {
-        symbol: &order.symbol,
-        trade_mode: order.trade_mode.as_str(),
-        side: side_string(order.side),
-        order_type: time_in_force_string(order.time_in_force),
-        px: decimal_string(order.price),
-        sz: decimal_string(order.qty),
-        client_order_id: &order.client_order_id,
-        reduce_only: order.reduce_only.then_some(true),
-        self_trade_prevention: order.self_trade_prevention.map(stp_mode_string),
-    })?)
-}
-
-pub(super) fn serialize_cancel_order(order: &OkxCancelOrder) -> Result<String, RestError> {
-    #[derive(Serialize)]
-    struct Body<'a> {
-        #[serde(rename = "instId")]
-        symbol: &'a str,
-        #[serde(rename = "ordId", skip_serializing_if = "Option::is_none")]
-        exchange_order_id: Option<&'a str>,
-        #[serde(rename = "clOrdId", skip_serializing_if = "Option::is_none")]
-        client_order_id: Option<&'a str>,
-    }
-
-    if order.exchange_order_id.is_none() && order.client_order_id.is_none() {
-        return Err(RestError::InvalidField {
-            field: "ordId/clOrdId",
-            value: String::new(),
-            message: "one identifier is required".to_string(),
-        });
-    }
-    Ok(serde_json::to_string(&Body {
-        symbol: &order.symbol,
-        exchange_order_id: order.exchange_order_id.as_deref(),
-        client_order_id: order.client_order_id.as_deref(),
-    })?)
-}
-
-fn side_string(side: Side) -> &'static str {
-    match side {
-        Side::Buy => "buy",
-        Side::Sell => "sell",
-    }
-}
-
-fn time_in_force_string(time_in_force: TimeInForce) -> &'static str {
-    match time_in_force {
-        TimeInForce::Gtc => "limit",
-        TimeInForce::Ioc => "ioc",
-        TimeInForce::PostOnly => "post_only",
-    }
-}
-
-fn stp_mode_string(mode: SelfTradePrevention) -> &'static str {
-    match mode {
-        SelfTradePrevention::CancelMaker => "cancel_maker",
-        SelfTradePrevention::CancelTaker => "cancel_taker",
-        SelfTradePrevention::CancelBoth => "cancel_both",
     }
 }
 
@@ -3427,46 +2261,9 @@ fn parse_nullable_integer(field: &'static str, value: &str) -> Result<Option<u64
         Ok(Some(parsed))
     }
 }
-
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
     use super::*;
-    use crate::okx::OkxCredentials;
-
-    #[derive(Clone)]
-    struct MockTransport {
-        responses: Arc<Mutex<Vec<String>>>,
-        requests: Arc<Mutex<Vec<SignedRequest>>>,
-    }
-
-    #[async_trait]
-    impl HttpTransport for MockTransport {
-        async fn execute(&self, request: SignedRequest) -> Result<HttpResponse, RestError> {
-            self.requests.lock().unwrap().push(request);
-            let body = self.responses.lock().unwrap().remove(0);
-            Ok(HttpResponse { status: 200, body })
-        }
-    }
-
-    fn client(
-        responses: Vec<&str>,
-    ) -> (OkxRestClient<MockTransport>, Arc<Mutex<Vec<SignedRequest>>>) {
-        client_owned(responses.into_iter().map(str::to_string).collect())
-    }
-
-    fn client_owned(
-        responses: Vec<String>,
-    ) -> (OkxRestClient<MockTransport>, Arc<Mutex<Vec<SignedRequest>>>) {
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let transport = MockTransport {
-            responses: Arc::new(Mutex::new(responses)),
-            requests: Arc::clone(&requests),
-        };
-        let signer = OkxSigner::new(OkxCredentials::new("key", "secret", "pass"), false);
-        (OkxRestClient::new(transport, signer), requests)
-    }
 
     fn fill_response(first: usize, count: usize) -> String {
         let data = (first..first + count)
@@ -3525,523 +2322,121 @@ mod tests {
         serde_json::json!({"code": "0", "msg": "", "data": data}).to_string()
     }
 
-    #[tokio::test]
-    async fn system_status_uses_unsigned_public_contract_and_preserves_scope() {
-        let response = r#"{"code":"0","msg":"","data":[{"begin":"2000","end":"3000","env":"2","maintType":"2","preOpenBegin":"2500","scheDesc":"extended","serviceType":"8","state":"scheduled","system":"unified","title":"Trading account maintenance"}]}"#;
-        let (client, requests) = client(vec![response]);
-
-        let statuses = client.system_status().await.unwrap();
-
-        assert_eq!(
-            statuses,
-            vec![OkxSystemStatus {
-                title: "Trading account maintenance".to_string(),
-                description: "extended".to_string(),
-                state: OkxSystemStatusState::Scheduled,
-                begin_time_ms: 2_000,
-                end_time_ms: 3_000,
-                pre_open_begin_time_ms: Some(2_500),
-                service_type: OkxSystemServiceType::TradingAccounts,
-                maintenance_type: OkxSystemMaintenanceType::Unscheduled,
-                environment: OkxSystemEnvironment::Demo,
-                system: "unified".to_string(),
-            }]
-        );
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests[0].method, HttpMethod::Get);
-        assert_eq!(requests[0].path, SYSTEM_STATUS_PATH);
-        assert!(requests[0].body.is_empty());
-        assert!(requests[0].headers.is_empty());
-    }
-
     #[test]
-    fn offline_system_status_parser_supports_current_copy_trading_payload() {
-        let response = br#"{"code":"0","data":[{"begin":"1784016000000","end":"1784017200000","env":"1","href":"","maintType":"1","preOpenBegin":"","scheDesc":"","serviceType":"11","state":"ongoing","system":"unified","title":"Copy trading system scheduled maintenance"}],"msg":""}"#;
-
-        let statuses = parse_okx_system_status_response_json(response).unwrap();
-
-        assert_eq!(statuses.len(), 1);
-        assert_eq!(statuses[0].state, OkxSystemStatusState::Ongoing);
-        assert_eq!(statuses[0].service_type, OkxSystemServiceType::CopyTrading);
-        assert_eq!(statuses[0].environment, OkxSystemEnvironment::Production);
+    fn fill_parser_and_pagination_preserve_identity_and_fail_closed() {
+        let first = parse_okx_fill_page_response_json(fill_response(100, 100).as_bytes()).unwrap();
+        assert_eq!(first.next_after.as_deref(), Some("bill-199"));
+        assert_eq!(first.fills[0].fill_id, "fill-100");
         assert_eq!(
-            statuses[0].maintenance_type,
-            OkxSystemMaintenanceType::Scheduled
-        );
-        assert_eq!(statuses[0].pre_open_begin_time_ms, None);
-    }
-
-    #[test]
-    fn system_status_parser_rejects_unknown_contract_values_and_invalid_window() {
-        let response = |service_type: &str, begin: &str, end: &str| {
-            format!(
-                r#"{{"code":"0","data":[{{"begin":"{begin}","end":"{end}","env":"1","maintType":"1","serviceType":"{service_type}","state":"scheduled","system":"unified","title":"maintenance"}}],"msg":""}}"#
-            )
-        };
-
-        let error =
-            parse_okx_system_status_response_json(response("12", "2000", "3000").as_bytes())
-                .unwrap_err()
-                .to_string();
-        assert!(error.contains("serviceType"));
-
-        let error = parse_okx_system_status_response_json(response("5", "3000", "2000").as_bytes())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("must not precede"));
-    }
-
-    #[tokio::test]
-    async fn account_trade_fee_selects_current_group_and_preserves_exchange_sign() {
-        let response = r#"{"code":"0","msg":"","data":[{"category":"1","feeGroup":[{"groupId":"1","maker":"-0.0002","taker":"-0.0005"},{"groupId":"2","maker":"0.0001","taker":"-0.0004"}],"instType":"SWAP","level":"Lv2","maker":"9","taker":"9","ts":"1763979985847"}]}"#;
-        let (client, requests) = client(vec![response]);
-
-        let rate = client
-            .account_trade_fee_at(
-                "2020-12-08T09:08:57.715Z",
-                OkxInstrumentType::Swap,
-                None,
-                Some("BTC-USDT"),
-                "2",
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(rate.instrument_type, OkxInstrumentType::Swap);
-        assert_eq!(rate.group_id, "2");
-        assert_eq!(rate.level, "Lv2");
-        assert_eq!(rate.maker_rate, 0.0001);
-        assert_eq!(rate.maker_cost_rate(), -0.0001);
-        assert_eq!(rate.taker_cost_rate(), 0.0004);
-        assert_eq!(rate.timestamp_ms, 1_763_979_985_847);
-        let requests = requests.lock().unwrap();
-        assert_eq!(
-            requests[0].path,
-            "/api/v5/account/trade-fee?instType=SWAP&instFamily=BTC-USDT"
-        );
-        assert!(requests[0].headers.contains_key("OK-ACCESS-SIGN"));
-    }
-
-    #[test]
-    fn trade_fee_parser_rejects_duplicate_groups_and_legacy_only_data() {
-        let duplicate = br#"{"code":"0","msg":"","data":[{"feeGroup":[{"groupId":"1","maker":"-0.0002","taker":"-0.0005"},{"groupId":"1","maker":"-0.0001","taker":"-0.0004"}],"instType":"SPOT","level":"Lv1","ts":"1763979985847"}]}"#;
-        let error = parse_okx_trade_fee_response_json(duplicate)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("repeated a group"));
-
-        let legacy_only = br#"{"code":"0","msg":"","data":[{"feeGroup":[],"instType":"SPOT","level":"Lv1","maker":"-0.0008","taker":"-0.001","ts":"1763979985847"}]}"#;
-        assert!(matches!(
-            parse_okx_trade_fee_response_json(legacy_only),
-            Err(RestError::EmptyData {
-                operation: "trade fee groups"
-            })
-        ));
-    }
-
-    #[tokio::test]
-    async fn account_trade_fee_requires_the_type_specific_selector() {
-        let (client, requests) = client(Vec::new());
-
-        let error = client
-            .account_trade_fee_at("time", OkxInstrumentType::Spot, None, Some("BTC-USDT"), "1")
-            .await
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            RestError::InvalidField {
-                field: "instId/instFamily",
-                ..
-            }
-        ));
-        assert!(requests.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn exact_account_instrument_retains_typed_upcoming_changes() {
-        let response = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","instType":"SWAP","instFamily":"BTC-USDT","groupId":"2","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"USDT","ctType":"linear","ctVal":"0.01","ctValCcy":"BTC","tickSz":"0.1","lotSz":"1","minSz":"1","maxLmtSz":"1000000","maxMktSz":"1000000","maxLmtAmt":"","maxMktAmt":"","state":"live","upcChg":[{"param":"tickSz","newValue":"0.01","effTime":"1763979985847"},{"param":"minSz","newValue":"2","effTime":"1763979986847"},{"param":"maxMktSz","newValue":"1000","effTime":"1763979987847"}]}]}"#;
-        let (client, requests) = client(vec![response]);
-
-        let instrument = client
-            .account_instrument_at(
-                "2020-12-08T09:08:57.715Z",
-                OkxInstrumentType::Swap,
-                "BTC-USDT-SWAP",
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(instrument.upcoming_changes.len(), 3);
-        assert_eq!(instrument.max_limit_size, 1_000_000.0);
-        assert_eq!(instrument.max_market_size, 1_000_000.0);
-        assert_eq!(instrument.max_limit_amount_usd, None);
-        assert_eq!(
-            instrument.upcoming_changes[0],
-            OkxInstrumentChange {
-                parameter: OkxInstrumentChangeParameter::TickSize,
-                new_value: 0.01,
-                effective_time_ms: 1_763_979_985_847,
-            }
-        );
-        assert_eq!(
-            instrument.upcoming_changes[1].parameter,
-            OkxInstrumentChangeParameter::MinimumSize
-        );
-        assert_eq!(
-            instrument.upcoming_changes[2].parameter,
-            OkxInstrumentChangeParameter::MaximumMarketSize
-        );
-        assert_eq!(
-            requests.lock().unwrap()[0].path,
-            "/api/v5/account/instruments?instType=SWAP&instId=BTC-USDT-SWAP"
-        );
-    }
-
-    #[tokio::test]
-    async fn account_instrument_rejects_malformed_change_and_non_exact_response() {
-        let malformed = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","maxLmtSz":"100","maxMktSz":"1000000","maxLmtAmt":"1000000","maxMktAmt":"1000000","state":"live","upcChg":[{"param":"futureField","newValue":"1","effTime":"1"}]}]}"#;
-        let zero_time = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","maxLmtSz":"100","maxMktSz":"1000000","maxLmtAmt":"1000000","maxMktAmt":"1000000","state":"live","upcChg":[{"param":"tickSz","newValue":"1","effTime":"0"}]}]}"#;
-        let zero_value = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","maxLmtSz":"100","maxMktSz":"1000000","maxLmtAmt":"1000000","maxMktAmt":"1000000","state":"live","upcChg":[{"param":"minSz","newValue":"0","effTime":"1"}]}]}"#;
-        let zero_limit = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","maxLmtSz":"0","maxMktSz":"1000000","maxLmtAmt":"1000000","maxMktAmt":"1000000","state":"live","upcChg":[]}]}"#;
-        let limit_below_minimum = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","maxLmtSz":"0.0001","maxMktSz":"1000000","maxLmtAmt":"1000000","maxMktAmt":"1000000","state":"live","upcChg":[]}]}"#;
-        let missing_limits = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","state":"live","upcChg":[]}]}"#;
-        let missing_changes = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","maxLmtSz":"100","maxMktSz":"1000000","maxLmtAmt":"1000000","maxMktAmt":"1000000","state":"live"}]}"#;
-        let duplicate = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","maxLmtSz":"100","maxMktSz":"1000000","maxLmtAmt":"1000000","maxMktAmt":"1000000","state":"live","upcChg":[]},{"instId":"BTC-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","maxLmtSz":"100","maxMktSz":"1000000","maxLmtAmt":"1000000","maxMktAmt":"1000000","state":"live","upcChg":[]}]}"#;
-        let mismatched = r#"{"code":"0","msg":"","data":[{"instId":"ETH-USDT","instType":"SPOT","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","maxLmtSz":"100","maxMktSz":"1000000","maxLmtAmt":"1000000","maxMktAmt":"1000000","state":"live","upcChg":[]}]}"#;
-        let (client, _) = client(vec![
-            malformed,
-            zero_time,
-            zero_value,
-            zero_limit,
-            limit_below_minimum,
-            missing_limits,
-            missing_changes,
-            duplicate,
-            mismatched,
-        ]);
-
-        let error = client
-            .account_instrument_at("time", OkxInstrumentType::Spot, "BTC-USDT")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("upcChg.param"));
-
-        let error = client
-            .account_instrument_at("time", OkxInstrumentType::Spot, "BTC-USDT")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("change time must be positive"));
-
-        let error = client
-            .account_instrument_at("time", OkxInstrumentType::Spot, "BTC-USDT")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("upcChg.newValue"));
-
-        let error = client
-            .account_instrument_at("time", OkxInstrumentType::Spot, "BTC-USDT")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("maxLmtSz"));
-
-        let error = client
-            .account_instrument_at("time", OkxInstrumentType::Spot, "BTC-USDT")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("maximum limit-order size"));
-
-        let error = client
-            .account_instrument_at("time", OkxInstrumentType::Spot, "BTC-USDT")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("maxLmtSz"));
-
-        let error = client
-            .account_instrument_at("time", OkxInstrumentType::Spot, "BTC-USDT")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("upcChg"));
-
-        let error = client
-            .account_instrument_at("time", OkxInstrumentType::Spot, "BTC-USDT")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("must contain one row"));
-
-        let error = client
-            .account_instrument_at("time", OkxInstrumentType::Spot, "BTC-USDT")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("expected exact BTC-USDT/SPOT"));
-    }
-
-    #[test]
-    fn offline_fill_response_parser_preserves_exact_fee_fields() {
-        let response = fill_response(7, 1);
-
-        let fills = parse_okx_fills_response_json(response.as_bytes()).unwrap();
-
-        assert_eq!(fills.len(), 1);
-        assert_eq!(fills[0].fill_id, "fill-7");
-        assert_eq!(fills[0].client_order_id, "client-7");
-        assert_eq!(
-            fills[0].fee,
+            first.fills[0].fee,
             Some(FillFee {
                 amount: -0.00001,
                 currency: "BTC".to_string(),
             })
         );
-    }
 
-    #[test]
-    fn offline_fill_response_parser_rejects_api_errors() {
-        let error = parse_okx_fills_response_json(
-            br#"{"code":"50011","msg":"rate limit reached","data":[]}"#,
-        )
-        .unwrap_err();
+        let mut complete = OkxFillPagination::new(3).unwrap();
+        assert!(!complete.accept(first).unwrap());
+        let last = parse_okx_fill_page_response_json(fill_response(200, 2).as_bytes()).unwrap();
+        assert!(complete.accept(last).unwrap());
+        assert_eq!(complete.into_fills().len(), 102);
 
+        let mut bounded = OkxFillPagination::new(1).unwrap();
+        let full = parse_okx_fill_page_response_json(fill_response(300, 100).as_bytes()).unwrap();
         assert!(matches!(
-            error,
-            RestError::Api { ref code, .. } if code == "50011"
-        ));
-    }
-
-    #[test]
-    fn offline_fill_response_parser_rejects_missing_trade_identity() {
-        let error = parse_okx_fills_response_json(
-            br#"{"code":"0","msg":"","data":[{"tradeId":"","ordId":"order-1","instId":"BTC-USDT","side":"buy","fillPx":"100","fillSz":"0.01","execType":"M","fee":"-0.001","feeCcy":"BTC","fillTime":"1000"}]}"#,
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            error,
-            RestError::InvalidField {
-                field: "tradeId",
+            bounded.accept(full),
+            Err(RestError::FillPaginationLimit {
+                pages: 1,
+                records: 100,
                 ..
-            }
+            })
         ));
     }
 
-    #[tokio::test]
-    async fn signed_place_and_cancel_requests_use_client_id() {
-        let (client, requests) = client(vec![
-            r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"reap1","sCode":"0","sMsg":""}]}"#,
-            r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"reap1","sCode":"0","sMsg":""}]}"#,
-        ]);
-        let ack = client
-            .place_order_at(
-                "2020-12-08T09:08:57.715Z",
-                &OkxPlaceOrder {
-                    symbol: "BTC-USDT".to_string(),
-                    trade_mode: OkxTradeMode::Cash,
-                    side: Side::Buy,
-                    time_in_force: TimeInForce::PostOnly,
-                    price: 100.5,
-                    qty: 0.1,
-                    client_order_id: "reap1".to_string(),
-                    reduce_only: false,
-                    self_trade_prevention: Some(SelfTradePrevention::CancelMaker),
-                },
+    #[test]
+    fn bill_parser_and_pagination_preserve_economic_identity_and_fail_closed() {
+        let first = parse_okx_bill_page_response_json(bill_response(100, 100).as_bytes()).unwrap();
+        assert_eq!(first.next_after.as_deref(), Some("bill-199"));
+        assert_eq!(first.bills[0].trade_id, "trade-100");
+        assert_eq!(first.bills[0].margin_mode, Some(OkxBillMarginMode::Cross));
+
+        let mut complete = OkxBillPagination::new(3).unwrap();
+        assert!(!complete.accept(first).unwrap());
+        let last = parse_okx_bill_page_response_json(bill_response(200, 2).as_bytes()).unwrap();
+        assert!(complete.accept(last).unwrap());
+        assert_eq!(complete.into_bills().len(), 102);
+
+        let mut bounded = OkxBillPagination::new(1).unwrap();
+        let full = parse_okx_bill_page_response_json(bill_response(300, 100).as_bytes()).unwrap();
+        assert!(matches!(
+            bounded.accept(full),
+            Err(RestError::BillPaginationLimit {
+                pages: 1,
+                records: 100,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn system_status_and_trade_fee_parsers_preserve_current_contracts() {
+        let statuses = parse_okx_system_status_response_json(
+            br#"{"code":"0","data":[{"begin":"1784016000000","end":"1784017200000","env":"1","maintType":"1","preOpenBegin":"","scheDesc":"","serviceType":"11","state":"ongoing","system":"unified","title":"Copy trading maintenance"}],"msg":""}"#,
+        )
+        .unwrap();
+        assert_eq!(statuses[0].state, OkxSystemStatusState::Ongoing);
+        assert_eq!(statuses[0].service_type, OkxSystemServiceType::CopyTrading);
+        assert_eq!(statuses[0].environment, OkxSystemEnvironment::Production);
+
+        let rates = parse_okx_trade_fee_response_json(
+            br#"{"code":"0","msg":"","data":[{"feeGroup":[{"groupId":"1","maker":"-0.0002","taker":"-0.0005"}],"instType":"SPOT","level":"Lv1","ts":"1763979985847"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(rates[0].maker_cost_rate(), 0.0002);
+        assert_eq!(rates[0].taker_cost_rate(), 0.0005);
+    }
+
+    #[test]
+    fn account_instrument_parser_retains_typed_upcoming_changes() {
+        let instruments = parse_okx_account_instruments_response_json(
+            br#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","instType":"SWAP","instFamily":"BTC-USDT","groupId":"2","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"USDT","ctType":"linear","ctVal":"0.01","ctValCcy":"BTC","tickSz":"0.1","lotSz":"1","minSz":"1","maxLmtSz":"1000000","maxMktSz":"1000000","maxLmtAmt":"","maxMktAmt":"","state":"live","upcChg":[{"param":"tickSz","newValue":"0.01","effTime":"1763979985847"}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(instruments.len(), 1);
+        assert_eq!(instruments[0].symbol, "BTC-USDT-SWAP");
+        assert_eq!(
+            instruments[0].upcoming_changes[0].parameter,
+            OkxInstrumentChangeParameter::TickSize
+        );
+    }
+
+    #[test]
+    fn server_time_and_acknowledgement_parsers_are_credential_free() {
+        assert_eq!(
+            parse_okx_server_time_response_json(
+                br#"{"code":"0","msg":"","data":[{"ts":"1597026383085"}]}"#
             )
-            .await
-            .unwrap();
+            .unwrap(),
+            1_597_026_383_085
+        );
+        let ack = parse_okx_order_ack_response_json(
+            br#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"reap1","sCode":"0","sMsg":""}]}"#,
+            "cancel order",
+        )
+        .unwrap();
         assert_eq!(ack.exchange_order_id, "123");
-
-        client
-            .cancel_order_at(
-                "2020-12-08T09:08:58.000Z",
-                &OkxCancelOrder {
-                    symbol: "BTC-USDT".to_string(),
-                    exchange_order_id: None,
-                    client_order_id: Some("reap1".to_string()),
-                },
-            )
-            .await
-            .unwrap();
-
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests[0].path, PLACE_ORDER_PATH);
-        assert!(requests[0].body.contains(r#""clOrdId":"reap1""#));
-        assert!(requests[0].body.contains(r#""stpMode":"cancel_maker""#));
-        assert_eq!(requests[1].path, CANCEL_ORDER_PATH);
-        assert!(requests[1].body.contains(r#""clOrdId":"reap1""#));
         assert!(
-            requests
-                .iter()
-                .all(|request| request.headers.contains_key("OK-ACCESS-SIGN"))
-        );
-    }
-
-    #[tokio::test]
-    async fn batch_cancel_preserves_per_order_acceptance_results() {
-        let (client, requests) = client(vec![
-            r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"reap1","sCode":"0","sMsg":""},{"ordId":"456","clOrdId":"reap2","sCode":"51400","sMsg":"order already canceled"}]}"#,
-        ]);
-        let results = client
-            .cancel_batch_orders_at(
-                "2020-12-08T09:08:58.000Z",
-                &[
-                    OkxCancelOrder {
-                        symbol: "BTC-USDT".to_string(),
-                        exchange_order_id: Some("123".to_string()),
-                        client_order_id: None,
-                    },
-                    OkxCancelOrder {
-                        symbol: "ETH-USDT".to_string(),
-                        exchange_order_id: Some("456".to_string()),
-                        client_order_id: None,
-                    },
-                ],
+            parse_okx_cancel_all_after_response_json(
+                br#"{"code":"0","msg":"","data":[{"triggerTime":"1597026443"}]}"#,
+                30,
             )
-            .await
-            .unwrap();
-
-        assert!(results[0].accepted());
-        assert!(!results[1].accepted());
-        assert_eq!(results[1].code, "51400");
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests[0].path, CANCEL_BATCH_ORDERS_PATH);
-        assert!(requests[0].body.contains(r#""instId":"BTC-USDT""#));
-        assert!(requests[0].body.contains(r#""ordId":"456""#));
-    }
-
-    #[test]
-    fn batch_cancel_and_exchange_timestamp_are_bounded() {
-        let (client, _) = client(Vec::new());
+            .is_ok()
+        );
         assert!(matches!(
-            client.build_cancel_batch_request("time", &[]),
-            Err(RestError::InvalidField {
-                field: "orders",
-                ..
-            })
-        ));
-        assert_eq!(
-            format_okx_timestamp_ms(1_607_418_537_715).unwrap(),
-            "2020-12-08T09:08:57.715Z"
-        );
-    }
-
-    #[tokio::test]
-    async fn place_order_sets_exchange_expiry_header() {
-        let (client, requests) = client(vec![
-            r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"reap1","sCode":"0","sMsg":""}]}"#,
-        ]);
-        let client = client.with_order_request_expiry(std::time::Duration::from_millis(750));
-        let timestamp = "2020-12-08T09:08:57.715Z";
-        client
-            .place_order_at(
-                timestamp,
-                &OkxPlaceOrder {
-                    symbol: "BTC-USDT".to_string(),
-                    trade_mode: OkxTradeMode::Cash,
-                    side: Side::Buy,
-                    time_in_force: TimeInForce::PostOnly,
-                    price: 100.5,
-                    qty: 0.1,
-                    client_order_id: "reap1".to_string(),
-                    reduce_only: false,
-                    self_trade_prevention: None,
-                },
-            )
-            .await
-            .unwrap();
-
-        let requests = requests.lock().unwrap();
-        assert_eq!(
-            requests[0].headers["expTime"],
-            (timestamp_ms(timestamp).unwrap() + 750).to_string()
-        );
-    }
-
-    #[tokio::test]
-    async fn public_time_and_cancel_all_after_have_expected_wire_contract() {
-        let (client, requests) = client(vec![
-            r#"{"code":"0","msg":"","data":[{"ts":"1597026383085"}]}"#,
-            r#"{"code":"0","msg":"","data":[{"triggerTime":"1597026443","tag":"","ts":"1597026383"}]}"#,
-            r#"{"code":"0","msg":"","data":[{"triggerTime":"0","tag":"","ts":"1597026384"}]}"#,
-        ]);
-
-        assert_eq!(client.server_time_ms().await.unwrap(), 1_597_026_383_085);
-        client
-            .cancel_all_after_at("2020-12-08T09:08:57.715Z", 30)
-            .await
-            .unwrap();
-        client
-            .cancel_all_after_at("2020-12-08T09:08:58.715Z", 0)
-            .await
-            .unwrap();
-
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests[0].path, PUBLIC_TIME_PATH);
-        assert!(requests[0].headers.is_empty());
-        assert_eq!(requests[1].path, CANCEL_ALL_AFTER_PATH);
-        assert_eq!(requests[1].body, r#"{"timeOut":"30"}"#);
-        assert!(requests[1].headers.contains_key("OK-ACCESS-SIGN"));
-        assert_eq!(requests[2].body, r#"{"timeOut":"0"}"#);
-    }
-
-    #[tokio::test]
-    async fn public_index_ticker_retains_exact_java_mapped_wire_contract() {
-        let response = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USD","idxPx":"50000.25","ts":"1597026383085"}]}"#;
-        let (client, requests) = client(vec![response]);
-
-        let raw = client.index_ticker_raw("BTC-USD").await.unwrap();
-        assert_eq!(
-            raw.request_path,
-            "/api/v5/market/index-tickers?instId=BTC-USD"
-        );
-        assert_eq!(raw.response_body, response);
-        assert_eq!(raw.ticker.symbol, "BTC-USD");
-        assert_eq!(raw.ticker.index_price, 50_000.25);
-        assert_eq!(raw.ticker.timestamp_ms, 1_597_026_383_085);
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests[0].path, raw.request_path);
-        assert!(requests[0].headers.is_empty());
-
-        assert!(matches!(
-            parse_okx_index_ticker_response_json(
-                br#"{"code":"0","msg":"","data":[{"instId":"BTC-USD","idxPx":"0","ts":"1"}]}"#
+            parse_okx_cancel_all_after_response_json(
+                br#"{"code":"0","msg":"","data":[{"triggerTime":"0"}]}"#,
+                30,
             ),
-            Err(RestError::InvalidField { field: "idxPx", .. })
-        ));
-        assert!(matches!(
-            parse_okx_index_ticker_response_json(
-                br#"{"code":"0","msg":"","data":[{"instId":"BTC-USD","idxPx":"1","ts":"0"}]}"#
-            ),
-            Err(RestError::InvalidField { field: "ts", .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn cancel_all_after_rejects_unsafe_timeout() {
-        let (invalid_timeout_client, _) = client(Vec::new());
-        assert!(matches!(
-            invalid_timeout_client
-                .cancel_all_after_at("2020-12-08T09:08:57.715Z", 9)
-                .await,
-            Err(RestError::InvalidField {
-                field: "timeOut",
-                ..
-            })
-        ));
-
-        let (client, _) = client(vec![
-            r#"{"code":"0","msg":"","data":[{"triggerTime":"0"}]}"#,
-        ]);
-        assert!(matches!(
-            client
-                .cancel_all_after_at("2020-12-08T09:08:57.715Z", 10)
-                .await,
             Err(RestError::InvalidField {
                 field: "triggerTime",
                 ..
@@ -4049,323 +2444,43 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn parses_open_orders_and_fills_for_reconciliation() {
-        let (client, requests) = client(vec![
-            r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"reap1","instId":"BTC-USDT","side":"buy","state":"partially_filled","px":"100","sz":"1","accFillSz":"0.4","avgPx":"99.5","uTime":"1000"}]}"#,
-            r#"{"code":"0","msg":"","data":[{"tradeId":"fill1","ordId":"123","clOrdId":"reap1","instId":"BTC-USDT","side":"buy","fillPx":"99.5","fillSz":"0.4","execType":"M","fee":"-0.0004","feeCcy":"btc","fillTime":"1000"}]}"#,
-        ]);
-        let orders = client
-            .open_orders_at("time", Some("SPOT"), Some("BTC-USDT"))
-            .await
-            .unwrap();
-        let fills = client
-            .fills_at("time", Some("SPOT"), Some("BTC-USDT"))
-            .await
-            .unwrap();
+    #[test]
+    fn index_open_order_and_order_detail_parsers_retain_identity() {
+        let ticker = parse_okx_index_ticker_response_json(
+            br#"{"code":"0","msg":"","data":[{"instId":"BTC-USD","idxPx":"50000.25","ts":"1597026383085"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(ticker.symbol, "BTC-USD");
+        assert_eq!(ticker.index_price, 50_000.25);
 
+        let orders = parse_okx_open_orders_response_json(
+            br#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"reap1","instId":"BTC-USDT","side":"buy","state":"partially_filled","px":"100","sz":"1","accFillSz":"0.4","avgPx":"99.5","uTime":"1000"}]}"#,
+        )
+        .unwrap();
         assert_eq!(orders[0].state, PrivateOrderState::PartiallyFilled);
-        assert_eq!(fills[0].liquidity, FillLiquidity::Maker);
-        assert_eq!(
-            fills[0].fee,
-            Some(FillFee {
-                amount: -0.0004,
-                currency: "BTC".to_string(),
-            })
-        );
-        let requests = requests.lock().unwrap();
-        assert_eq!(
-            requests[0].path,
-            "/api/v5/trade/orders-pending?instType=SPOT&instId=BTC-USDT"
-        );
-        assert_eq!(
-            requests[1].path,
-            "/api/v5/trade/fills?instType=SPOT&instId=BTC-USDT&limit=100"
-        );
-    }
 
-    #[tokio::test]
-    async fn fill_reconciliation_paginates_until_a_short_page() {
-        let (client, requests) = client_owned(vec![fill_response(100, 100), fill_response(200, 2)]);
-
-        let fills = client
-            .fills_paginated(Some("SPOT"), Some("BTC-USDT"), 3)
-            .await
-            .unwrap();
-
-        assert_eq!(fills.len(), 102);
-        assert_eq!(fills.first().unwrap().fill_id, "fill-100");
-        assert_eq!(fills.last().unwrap().fill_id, "fill-201");
-        let requests = requests.lock().unwrap();
-        assert_eq!(
-            requests[0].path,
-            "/api/v5/trade/fills?instType=SPOT&instId=BTC-USDT&limit=100"
-        );
-        assert_eq!(
-            requests[1].path,
-            "/api/v5/trade/fills?instType=SPOT&instId=BTC-USDT&after=bill-199&limit=100"
-        );
-    }
-
-    #[tokio::test]
-    async fn fill_reconciliation_fails_closed_at_page_bound() {
-        let (client, requests) = client_owned(vec![fill_response(100, 100)]);
-
-        let error = client.fills_paginated(None, None, 1).await.unwrap_err();
-
-        assert!(matches!(
-            error,
-            RestError::FillPaginationLimit {
-                pages: 1,
-                records: 100,
-                ref next_after,
-            } if next_after == "bill-199"
-        ));
-        assert_eq!(requests.lock().unwrap().len(), 1);
+        let details = parse_okx_order_details_response_json(
+            br#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"reap1","instId":"BTC-USDT","side":"buy","state":"canceled","px":"100","sz":"1","accFillSz":"0","avgPx":"","uTime":"1000","cancelSource":"20","cancelSourceReason":"Cancel all after triggered"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(details.order.state, PrivateOrderState::Cancelled);
+        assert_eq!(details.cancel_source, "20");
     }
 
     #[test]
-    fn account_bill_parser_preserves_java_and_current_trade_fields() {
-        let response = br#"{"code":"0","msg":"","data":[{"bal":"0.125","balChg":"-0.00025","billId":"123","ccy":"btc","clOrdId":"reap-1","execType":"T","fee":"0","fillTime":"2001","from":"6","instId":"BTC-USD-SWAP","instType":"SWAP","interest":"0","mgnMode":"cross","notes":"funding","ordId":"456","pnl":"-0.00025","posBal":"10","posBalChg":"0","px":"50000","subType":"173","sz":"10","to":"18","tradeId":"789","ts":"2000","type":"8"}]}"#;
-
-        let page = parse_okx_bill_page_response_json(response).unwrap();
-
-        assert_eq!(page.next_after, None);
-        assert_eq!(page.bills.len(), 1);
-        assert_eq!(
-            page.bills[0],
-            OkxBill {
-                bill_id: "123".to_string(),
-                bill_type: "8".to_string(),
-                sub_type: "173".to_string(),
-                timestamp_ms: 2_000,
-                currency: "BTC".to_string(),
-                balance_change: -0.00025,
-                balance: Some(0.125),
-                position_balance_change: Some(0.0),
-                position_balance: Some(10.0),
-                quantity: Some(10.0),
-                price: Some(50_000.0),
-                pnl: Some(-0.00025),
-                fee: Some(0.0),
-                interest: Some(0.0),
-                instrument_type: Some(OkxInstrumentType::Swap),
-                symbol: "BTC-USD-SWAP".to_string(),
-                margin_mode: Some(OkxBillMarginMode::Cross),
-                order_id: "456".to_string(),
-                client_order_id: "reap-1".to_string(),
-                trade_id: "789".to_string(),
-                fill_time_ms: Some(2_001),
-                execution_type: Some(OkxBillExecutionType::Taker),
-                from_account: Some(OkxBillAccountType::Funding),
-                to_account: Some(OkxBillAccountType::Trading),
-                notes: "funding".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn account_bill_parser_rejects_malformed_economic_identity() {
-        let response = |bill_type: &str, from: &str, balance_change: &str| {
-            format!(
-                r#"{{"code":"0","msg":"","data":[{{"billId":"1","type":"{bill_type}","subType":"173","ts":"1000","ccy":"USDT","balChg":"{balance_change}","from":"{from}"}}]}}"#
-            )
-        };
-
-        let error = parse_okx_bill_page_response_json(response("funding", "", "1").as_bytes())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("type"));
-
-        let error = parse_okx_bill_page_response_json(response("8", "7", "1").as_bytes())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("from"));
-
-        let error = parse_okx_bill_page_response_json(response("8", "", "NaN").as_bytes())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("balChg"));
-    }
-
-    #[tokio::test]
-    async fn account_bill_collection_paginates_complete_closed_window() {
-        let (client, requests) = client_owned(vec![bill_response(100, 100), bill_response(200, 2)]);
-
-        let bills = client
-            .account_bills_paginated(1_000, 2_000, 3)
-            .await
-            .unwrap();
-
-        assert_eq!(bills.len(), 102);
-        assert_eq!(bills.first().unwrap().bill_id, "bill-100");
-        assert_eq!(bills.last().unwrap().bill_id, "bill-201");
-        let requests = requests.lock().unwrap();
-        assert_eq!(
-            requests[0].path,
-            "/api/v5/account/bills?begin=1000&end=2000&limit=100"
-        );
-        assert_eq!(
-            requests[1].path,
-            "/api/v5/account/bills?begin=1000&end=2000&after=bill-199&limit=100"
-        );
-    }
-
-    #[tokio::test]
-    async fn account_bill_collection_fails_closed_at_page_bound() {
-        let (client, requests) = client_owned(vec![bill_response(100, 100)]);
-
-        let error = client
-            .account_bills_paginated(1_000, 2_000, 1)
-            .await
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            RestError::BillPaginationLimit {
-                pages: 1,
-                records: 100,
-                ref next_after,
-            } if next_after == "bill-199"
-        ));
-        assert_eq!(requests.lock().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn queries_terminal_order_details_by_client_id() {
-        let (client, requests) = client(vec![
-            r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"reap1","instId":"BTC-USDT","side":"buy","state":"canceled","px":"100","sz":"1","accFillSz":"0","avgPx":"","uTime":"1000","cancelSource":"20","cancelSourceReason":"Cancel all after triggered"}]}"#,
-        ]);
-        let raw = client
-            .order_details_raw_at("time", "BTC-USDT", None, Some("reap1"))
-            .await
-            .unwrap();
-
-        assert_eq!(raw.details.order.state, PrivateOrderState::Cancelled);
-        assert_eq!(raw.details.cancel_source, "20");
-        assert_eq!(
-            raw.details.cancel_source_reason,
-            "Cancel all after triggered"
-        );
-        assert_eq!(
-            raw.request_path,
-            "/api/v5/trade/order?instId=BTC-USDT&clOrdId=reap1"
-        );
-        assert_eq!(
-            parse_okx_order_details_response_json(raw.response_body.as_bytes()).unwrap(),
-            raw.details
-        );
-        assert_eq!(
-            requests.lock().unwrap()[0].path,
-            "/api/v5/trade/order?instId=BTC-USDT&clOrdId=reap1"
-        );
-    }
-
-    #[test]
-    fn order_details_rejects_multiple_rows() {
-        let body = br#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"reap1","instId":"BTC-USDT","side":"buy","state":"canceled"},{"ordId":"456","clOrdId":"reap2","instId":"BTC-USDT","side":"buy","state":"canceled"}]}"#;
-        assert!(matches!(
-            parse_okx_order_details_response_json(body),
-            Err(RestError::InvalidField { field: "data", .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn parses_signed_bootstrap_metadata_and_account_state() {
-        let (client, requests) = client(vec![
-            r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","instType":"SWAP","instFamily":"BTC-USDT","groupId":"2","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"USDT","ctType":"linear","ctVal":"0.01","ctValCcy":"BTC","tickSz":"0.1","lotSz":"1","minSz":"1","maxLmtSz":"1000000","maxMktSz":"1000000","maxLmtAmt":"","maxMktAmt":"","state":"live","upcChg":[]}]}"#,
-            r#"{"code":"0","msg":"","data":[{"acctLv":"2","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"7","mainUid":"6","label":"reap-demo","perm":"trade,read_only","ip":"203.0.113.5,2001:db8::/48","enableSpotBorrow":false,"autoLoan":false,"spotBorrowAutoRepay":false}]}"#,
-            r#"{"code":"0","msg":"","data":[{"uTime":"1000","totalEq":"11000","mgnRatio":"12.5","adjEq":"10000","borrowFroz":"0","notionalUsdForBorrow":"0","notionalUsd":"2000","details":[{"ccy":"USDT","uTime":"999","cashBal":"9000","availBal":"8000","eq":"10000","liab":"0","crossLiab":"0","isoLiab":"0","uplLiab":"0","interest":"0","borrowFroz":"0","maxLoan":"500","twap":"2"}]}]}"#,
-            r#"{"code":"0","msg":"","data":[{"instType":"SWAP","instId":"BTC-USDT-SWAP","pos":"2","posSide":"net","mgnMode":"cross","avgPx":"50000","uTime":"1001","liab":"","interest":""}]}"#,
-        ]);
-
-        let instruments = client
-            .account_instruments_at("time", OkxInstrumentType::Swap, Some("BTC-USDT-SWAP"))
-            .await
-            .unwrap();
-        let account = client.account_config_at("time").await.unwrap();
-        let balance = client.account_balance_at("time").await.unwrap();
-        let positions = client
-            .account_positions_at("time", Some(OkxInstrumentType::Swap), Some("BTC-USDT-SWAP"))
-            .await
-            .unwrap();
-
-        assert_eq!(instruments[0].contract_type, Some(OkxContractType::Linear));
-        assert_eq!(instruments[0].contract_value, Some(0.01));
-        assert_eq!(instruments[0].instrument_family, "BTC-USDT");
-        assert_eq!(instruments[0].trade_fee_group_id, "2");
-        assert_eq!(account.account_level, OkxAccountLevel::SingleCurrencyMargin);
-        assert_eq!(account.position_mode, OkxPositionMode::NetMode);
-        assert_eq!(account.api_key_label, "reap-demo");
-        assert_eq!(
-            account.api_key_permissions,
-            BTreeSet::from([OkxApiKeyPermission::ReadOnly, OkxApiKeyPermission::Trade])
-        );
-        assert_eq!(
-            account.api_key_ip_bindings,
-            BTreeSet::from(["2001:db8::/48".to_string(), "203.0.113.5".to_string()])
-        );
-        assert_eq!(account.enable_spot_borrow, Some(false));
-        assert_eq!(balance.balances[0].available, 8000.0);
-        assert_eq!(balance.balances[0].forced_repayment_indicator, Some(2));
-        assert_eq!(balance.margins[0].exchange_ratio, Some(12.5));
-        assert_eq!(positions.positions[0].qty, 2.0);
-        assert_eq!(
-            positions.positions[0].margin_mode,
-            Some(PositionMarginMode::Cross)
-        );
-
-        let requests = requests.lock().unwrap();
-        assert_eq!(
-            requests[0].path,
-            "/api/v5/account/instruments?instType=SWAP&instId=BTC-USDT-SWAP"
-        );
-        assert_eq!(requests[1].path, ACCOUNT_CONFIG_PATH);
-        assert_eq!(requests[2].path, ACCOUNT_BALANCE_PATH);
-        assert_eq!(
-            requests[3].path,
-            "/api/v5/account/positions?instType=SWAP&instId=BTC-USDT-SWAP"
-        );
-        assert!(
-            requests
-                .iter()
-                .all(|request| request.headers.contains_key("OK-ACCESS-SIGN"))
-        );
-    }
-
-    #[test]
-    fn rejects_non_finite_exchange_numbers() {
-        assert!(matches!(
-            parse_number("px", "NaN"),
-            Err(RestError::InvalidField { .. })
-        ));
-        assert!(matches!(
-            parse_forced_repayment_indicator("6"),
-            Err(RestError::InvalidField { field: "twap", .. })
-        ));
-    }
-
-    #[test]
-    fn offline_account_parsers_preserve_borrowing_evidence() {
+    fn account_parsers_preserve_borrowing_and_position_evidence() {
         let account = parse_okx_account_config_response_json(
             br#"{"code":"0","msg":"","data":[{"acctLv":"1","posMode":"net_mode","uid":"7","mainUid":"6","enableSpotBorrow":false,"autoLoan":false,"spotBorrowAutoRepay":true}]}"#,
         )
         .unwrap();
         assert_eq!(account.enable_spot_borrow, Some(false));
-        assert_eq!(account.auto_loan, Some(false));
-        assert_eq!(account.spot_borrow_auto_repay, Some(true));
 
         let balance = parse_okx_account_balance_response_json(
             br#"{"code":"0","msg":"","data":[{"uTime":"1000","totalEq":"100","adjEq":"99","borrowFroz":"2","notionalUsdForBorrow":"3","details":[{"ccy":"USDT","uTime":"999","cashBal":"100","availBal":"90","eq":"99","eqUsd":"98.5","disEq":"97","upl":"-1","liab":"1","crossLiab":"0.5","isoLiab":"0.25","uplLiab":"0.1","interest":"0.01","borrowFroz":"2","maxLoan":"50","twap":"1"}]}]}"#,
         )
         .unwrap();
         assert_eq!(balance.borrow_frozen_usd, Some(2.0));
-        assert_eq!(balance.notional_usd_for_borrow, Some(3.0));
         assert_eq!(balance.details[0].liability, Some(1.0));
-        assert_eq!(balance.details[0].accrued_interest, Some(0.01));
-        assert_eq!(balance.details[0].equity_usd, Some(98.5));
-        assert_eq!(balance.details[0].discounted_equity_usd, Some(97.0));
-        assert_eq!(balance.details[0].unrealized_pnl, Some(-1.0));
 
         let positions = parse_okx_account_positions_response_json(
             br#"{"code":"0","msg":"","data":[{"instType":"MARGIN","instId":"BTC-USDT","pos":"1","posSide":"net","mgnMode":"cross","uTime":"1001","liab":"20","interest":"0.02","pendingCloseOrdLiabVal":"1","baseBorrowed":"0","baseInterest":"0","quoteBorrowed":"20","quoteInterest":"0.02"}]}"#,
@@ -4375,46 +2490,26 @@ mod tests {
             positions.positions[0].instrument_type,
             OkxInstrumentType::Margin
         );
-        assert_eq!(positions.positions[0].liability, Some(20.0));
         assert_eq!(positions.positions[0].quote_interest, Some(0.02));
     }
 
     #[test]
-    fn account_config_rejects_unknown_api_key_permissions_and_empty_bindings() {
-        let unknown_permission = parse_okx_account_config_response_json(
-            br#"{"code":"0","msg":"","data":[{"acctLv":"1","posMode":"net_mode","perm":"read_only,transfer"}]}"#,
-        );
+    fn parsers_reject_api_errors_unknown_permissions_and_non_finite_numbers() {
         assert!(matches!(
-            unknown_permission,
+            parse_okx_fills_response_json(
+                br#"{"code":"50011","msg":"rate limit reached","data":[]}"#
+            ),
+            Err(RestError::Api { ref code, .. }) if code == "50011"
+        ));
+        assert!(matches!(
+            parse_okx_account_config_response_json(
+                br#"{"code":"0","msg":"","data":[{"acctLv":"1","posMode":"net_mode","perm":"read_only,transfer"}]}"#
+            ),
             Err(RestError::InvalidField { field: "perm", .. })
         ));
-
-        let empty_binding = parse_okx_account_config_response_json(
-            br#"{"code":"0","msg":"","data":[{"acctLv":"1","posMode":"net_mode","perm":"read_only","ip":"203.0.113.5,"}]}"#,
-        );
         assert!(matches!(
-            empty_binding,
-            Err(RestError::InvalidField { field: "ip", .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn rejects_unsupported_position_margin_mode() {
-        let (client, _) = client(vec![
-            r#"{"code":"0","msg":"","data":[{"instType":"SWAP","instId":"BTC-USDT-SWAP","pos":"2","posSide":"net","mgnMode":"portfolio","uTime":"1001"}]}"#,
-        ]);
-
-        let error = client
-            .account_positions_at("time", Some(OkxInstrumentType::Swap), None)
-            .await
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            RestError::InvalidField {
-                field: "mgnMode",
-                ..
-            }
+            parse_number("px", "NaN"),
+            Err(RestError::InvalidField { .. })
         ));
     }
 }

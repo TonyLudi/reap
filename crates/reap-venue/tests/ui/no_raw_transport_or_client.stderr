@@ -1,0 +1,9 @@
+error[E0432]: unresolved imports `reap_venue::okx::HttpResponse`, `reap_venue::okx::HttpTransport`, `reap_venue::okx::OkxRestClient`, `reap_venue::okx::ReqwestTransport`
+ --> tests/ui/no_raw_transport_or_client.rs:1:23
+  |
+1 | use reap_venue::okx::{HttpResponse, HttpTransport, OkxRestClient, ReqwestTransport};
+  |                       ^^^^^^^^^^^^  ^^^^^^^^^^^^^  ^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^ no `ReqwestTransport` in `okx`
+  |                       |             |              |
+  |                       |             |              no `OkxRestClient` in `okx`
+  |                       |             no `HttpTransport` in `okx`
+  |                       no `HttpResponse` in `okx`

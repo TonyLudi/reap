@@ -1,0 +1,17 @@
+error[E0432]: unresolved import `reap_okx_emergency_adapter`
+ --> tests/ui/no_broad_authenticated_authority.rs:1:5
+  |
+1 | use reap_okx_emergency_adapter as emergency_authority;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no external crate `reap_okx_emergency_adapter`
+
+error[E0432]: unresolved import `reap_okx_evidence_adapter`
+ --> tests/ui/no_broad_authenticated_authority.rs:2:5
+  |
+2 | use reap_okx_evidence_adapter as evidence_authority;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no external crate `reap_okx_evidence_adapter`
+
+error[E0432]: unresolved import `reap_okx_wire`
+ --> tests/ui/no_broad_authenticated_authority.rs:3:5
+  |
+3 | use reap_okx_wire as raw_wire_authority;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no external crate `reap_okx_wire`

@@ -9,6 +9,7 @@ use reap_live::{
     reconcile_okx_fill_collection_paths, reconcile_okx_fill_statement_paths,
     verify_bill_collection_manifest_path,
 };
+use reap_okx_evidence_adapter::OkxEvidenceClientFactory;
 
 use crate::{persist_reserved_output, reserve_private_output};
 
@@ -51,6 +52,7 @@ pub(crate) struct CollectFillsArgs {
 }
 
 pub(crate) async fn collect(args: CollectFillsArgs) -> Result<()> {
+    let evidence_factory = OkxEvidenceClientFactory::new();
     let manifest = collect_recent_okx_fills_paths(
         &args.config,
         &args.output_directory,
@@ -62,6 +64,7 @@ pub(crate) async fn collect(args: CollectFillsArgs) -> Result<()> {
             page_interval_ms: args.page_interval_ms,
             minimum_window_close_delay_ms: args.minimum_window_close_delay_ms,
         },
+        &evidence_factory,
     )
     .await
     .with_context(|| {
@@ -118,6 +121,7 @@ pub(crate) struct CollectBillsArgs {
 }
 
 pub(crate) async fn collect_bills(args: CollectBillsArgs) -> Result<()> {
+    let evidence_factory = OkxEvidenceClientFactory::new();
     let manifest = collect_okx_bills_paths(
         &args.config,
         &args.output_directory,
@@ -129,6 +133,7 @@ pub(crate) async fn collect_bills(args: CollectBillsArgs) -> Result<()> {
             page_interval_ms: args.page_interval_ms,
             minimum_window_close_delay_ms: args.minimum_window_close_delay_ms,
         },
+        &evidence_factory,
     )
     .await
     .with_context(|| {

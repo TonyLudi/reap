@@ -5,10 +5,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reap_core::PINNED_JAVA_REVISION;
+use reap_evidence_core::{
+    EvidenceClientFactory, EvidenceClientFactoryError, EvidenceCredentialEnvironment,
+    EvidenceHttpConfig, EvidenceReadError, EvidenceReadOnly,
+};
 use reap_venue::RemoteFill;
 use reap_venue::okx::{
-    HttpTransport, OkxAccountConfig, OkxAccountLevel, OkxFillPagination, OkxPositionMode,
-    OkxRestClient, OkxSigner, ReqwestTransport, RestError, parse_okx_fill_page_response_json,
+    OkxAccountConfig, OkxAccountLevel, OkxFillPagination, OkxPositionMode, RestError,
+    parse_okx_account_config_response_json, parse_okx_fill_page_response_json,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -204,6 +208,8 @@ pub enum FillCollectionError {
     Transport(#[source] RestError),
     #[error("OKX fill collection failed: {0}")]
     Rest(#[from] RestError),
+    #[error("OKX fill collection failed: {0}")]
+    Evidence(#[from] EvidenceReadError),
     #[error("exchange clock evidence is invalid: {0}")]
     Clock(String),
     #[error("exchange account identity evidence is invalid: {0}")]
@@ -262,16 +268,48 @@ struct CollectionProvenance {
     host_identity_sha256: String,
 }
 
+fn evidence_credential_environment(
+    account: &crate::LiveAccountConfig,
+) -> EvidenceCredentialEnvironment {
+    EvidenceCredentialEnvironment::new(
+        &account.id,
+        &account.api_key_env,
+        &account.secret_key_env,
+        &account.passphrase_env,
+    )
+}
+
+fn map_factory_error(error: EvidenceClientFactoryError) -> FillCollectionError {
+    match error {
+        EvidenceClientFactoryError::MissingCredential { account_id, name } => {
+            FillCollectionError::Config(LiveConfigError::MissingCredential { account_id, name })
+        }
+        EvidenceClientFactoryError::InvalidConfiguration(message) => {
+            FillCollectionError::Transport(RestError::Transport(format!(
+                "invalid evidence client configuration: {message}"
+            )))
+        }
+        EvidenceClientFactoryError::Transport(message) => {
+            FillCollectionError::Transport(RestError::Transport(message))
+        }
+    }
+}
+
 /// Collects complete recent fills for one configured account without order entry.
 ///
 /// The output directory is reserved before config parsing, credentials, or
 /// network access. A failed collection intentionally leaves a partial directory
 /// without a complete manifest, which must never be accepted as evidence.
-pub async fn collect_recent_okx_fills_paths(
+pub async fn collect_recent_okx_fills_paths<F>(
     config_path: impl AsRef<Path>,
     output_directory: impl AsRef<Path>,
     options: FillCollectionOptions,
-) -> Result<FillCollectionManifest, FillCollectionError> {
+    factory: &F,
+) -> Result<FillCollectionManifest, FillCollectionError>
+where
+    F: EvidenceClientFactory,
+    F::Client: EvidenceReadOnly<Error = EvidenceReadError>,
+{
     options.validate()?;
     let output_directory = reserve_output_directory(output_directory.as_ref())?;
     let (config_file, config_bytes) = read_regular_file(config_path.as_ref(), "live config")?;
@@ -285,19 +323,24 @@ pub async fn collect_recent_okx_fills_paths(
     let account = config
         .account(&options.account_id)
         .ok_or_else(|| FillCollectionError::UnknownAccount(options.account_id.clone()))?;
-    let credentials = account.credentials_from_env()?;
+    let prepared = factory
+        .prepare_credentials(&evidence_credential_environment(account))
+        .map_err(map_factory_error)?;
     let provenance = CollectionProvenance {
         executable_sha256: current_executable_sha256().map_err(FillCollectionError::Provenance)?,
         host_identity_sha256: host_identity_sha256().map_err(FillCollectionError::Provenance)?,
     };
-    let transport = ReqwestTransport::with_timeouts(
-        &config.venue.rest_url,
-        Duration::from_millis(config.runtime.rest_connect_timeout_ms),
-        Duration::from_millis(config.runtime.rest_request_timeout_ms),
-    )
-    .map_err(FillCollectionError::Transport)?;
-    let signer = OkxSigner::new(credentials, config.venue.environment.is_demo());
-    let client = OkxRestClient::new(transport, signer);
+    let client = factory
+        .connect(
+            prepared,
+            &EvidenceHttpConfig::new(
+                &config.venue.rest_url,
+                config.venue.environment.is_demo(),
+                Duration::from_millis(config.runtime.rest_connect_timeout_ms),
+                Duration::from_millis(config.runtime.rest_request_timeout_ms),
+            ),
+        )
+        .map_err(map_factory_error)?;
     let manifest = collect_recent_okx_fills_with_client(
         &client,
         &config,
@@ -638,8 +681,8 @@ fn invalid_evidence<T>(message: impl Into<String>) -> Result<T, FillCollectionEr
     Err(FillCollectionError::InvalidEvidence(message.into()))
 }
 
-async fn collect_recent_okx_fills_with_client<T>(
-    client: &OkxRestClient<T>,
+async fn collect_recent_okx_fills_with_client<C>(
+    client: &C,
     config: &LiveConfig,
     config_file: FillCollectionFileEvidence,
     output_directory: &Path,
@@ -647,7 +690,7 @@ async fn collect_recent_okx_fills_with_client<T>(
     provenance: CollectionProvenance,
 ) -> Result<FillCollectionManifest, FillCollectionError>
 where
-    T: HttpTransport,
+    C: EvidenceReadOnly<Error = EvidenceReadError> + ?Sized,
 {
     let account = config
         .account(&options.account_id)
@@ -672,7 +715,9 @@ where
         )));
     }
 
-    let account_before = client.account_config().await?;
+    let account_before_response = client.account_config().await?;
+    let account_before =
+        parse_okx_account_config_response_json(account_before_response.response_body().as_bytes())?;
     validate_account_config(account, &account_before)?;
     let account_identity_sha256 = account_identity(config, &options.account_id, &account_before)?;
 
@@ -686,10 +731,10 @@ where
         }
         page_index += 1;
         let requested_after = pagination.after().map(str::to_string);
-        let raw = client
-            .fills_page_raw(None, None, pagination.after())
-            .await?;
-        let bytes = raw.response_body.as_bytes();
+        let raw = client.recent_fills_page(pagination.after()).await?;
+        let page = parse_okx_fill_page_response_json(raw.response_body().as_bytes())?;
+        let (request_path, response_body) = raw.into_parts();
+        let bytes = response_body.as_bytes();
         let bytes_len = bytes.len() as u64;
         if bytes_len > MAX_FILL_COLLECTION_PAGE_BYTES {
             return Err(FillCollectionError::PageTooLarge {
@@ -705,14 +750,14 @@ where
                 limit: MAX_FILL_COLLECTION_TOTAL_BYTES,
             });
         }
-        let rows = raw.page.fills.len() as u64;
-        let minimum_fill_time_ms = raw.page.fills.iter().map(|fill| fill.ts_ms).min();
-        let maximum_fill_time_ms = raw.page.fills.iter().map(|fill| fill.ts_ms).max();
-        let next_after = raw.page.next_after.clone();
+        let rows = page.fills.len() as u64;
+        let minimum_fill_time_ms = page.fills.iter().map(|fill| fill.ts_ms).min();
+        let maximum_fill_time_ms = page.fills.iter().map(|fill| fill.ts_ms).max();
+        let next_after = page.next_after.clone();
         let response = write_page(output_directory, page_index, bytes)?;
         pages.push(FillCollectionPageEvidence {
             page_index,
-            request_path: raw.request_path,
+            request_path,
             requested_after,
             next_after,
             rows,
@@ -720,13 +765,15 @@ where
             maximum_fill_time_ms,
             response,
         });
-        if pagination.accept(raw.page)? {
+        if pagination.accept(page)? {
             break;
         }
     }
     let fills = pagination.into_fills();
 
-    let account_after = client.account_config().await?;
+    let account_after_response = client.account_config().await?;
+    let account_after =
+        parse_okx_account_config_response_json(account_after_response.response_body().as_bytes())?;
     validate_account_config(account, &account_after)?;
     let account_identity_after = account_identity(config, &options.account_id, &account_after)?;
     if account_identity_after != account_identity_sha256 {
@@ -790,12 +837,12 @@ where
     })
 }
 
-async fn sample_clock<T>(
-    client: &OkxRestClient<T>,
+async fn sample_clock<C>(
+    client: &C,
     maximum_skew_ms: u64,
 ) -> Result<FillCollectionClockEvidence, FillCollectionError>
 where
-    T: HttpTransport,
+    C: EvidenceReadOnly<Error = EvidenceReadError> + ?Sized,
 {
     let local_before = unix_time_ms()?;
     let server_ms = client.server_time_ms().await?;
@@ -1061,40 +1108,20 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
-    use async_trait::async_trait;
-    use reap_venue::okx::{HttpResponse, OkxCredentials, SignedRequest};
-
     use super::*;
+    use crate::account_certification::NarrowEvidenceFake;
 
-    #[derive(Clone)]
-    struct MockTransport {
-        responses: Arc<Mutex<VecDeque<Result<HttpResponse, RestError>>>>,
-        requests: Arc<Mutex<Vec<SignedRequest>>>,
+    fn response(body: String) -> Result<String, EvidenceReadError> {
+        Ok(body)
     }
 
-    #[async_trait]
-    impl HttpTransport for MockTransport {
-        async fn execute(&self, request: SignedRequest) -> Result<HttpResponse, RestError> {
-            self.requests.lock().unwrap().push(request);
-            self.responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("missing mock response")
-        }
-    }
-
-    fn response(body: String) -> Result<HttpResponse, RestError> {
-        Ok(HttpResponse { status: 200, body })
-    }
-
-    fn time_response(timestamp_ms: u64) -> Result<HttpResponse, RestError> {
+    fn time_response(timestamp_ms: u64) -> Result<String, EvidenceReadError> {
         response(format!(
             r#"{{"code":"0","msg":"","data":[{{"ts":"{timestamp_ms}"}}]}}"#
         ))
     }
 
-    fn account_response(user_id: &str) -> Result<HttpResponse, RestError> {
+    fn account_response(user_id: &str) -> Result<String, EvidenceReadError> {
         response(format!(
             r#"{{"code":"0","msg":"","data":[{{"acctLv":"2","posMode":"net_mode","acctStpMode":"cancel_maker","uid":"{user_id}","mainUid":"6"}}]}}"#
         ))
@@ -1158,18 +1185,15 @@ mod tests {
         )
         .unwrap();
         let (config_file, _) = read_regular_file(&config_path, "live config").unwrap();
-        let client = OkxRestClient::new(
-            MockTransport {
-                responses: Arc::new(Mutex::new(VecDeque::from([
-                    time_response(now_ms),
-                    account_response("7"),
-                    response(fill_response(now_ms - 90_000)),
-                    account_response("7"),
-                    time_response(now_ms + 1),
-                ]))),
-                requests: Arc::new(Mutex::new(Vec::new())),
-            },
-            OkxSigner::new(OkxCredentials::new("key", "secret", "pass"), true),
+        let client = NarrowEvidenceFake::new(
+            VecDeque::from([
+                time_response(now_ms),
+                account_response("7"),
+                response(fill_response(now_ms - 90_000)),
+                account_response("7"),
+                time_response(now_ms + 1),
+            ]),
+            Arc::new(Mutex::new(Vec::new())),
         );
         collect_recent_okx_fills_with_client(
             &client,
@@ -1188,18 +1212,15 @@ mod tests {
         let now_ms = unix_time_ms().unwrap();
         let raw_fill = fill_response(now_ms - 90_000);
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let client = OkxRestClient::new(
-            MockTransport {
-                responses: Arc::new(Mutex::new(VecDeque::from([
-                    time_response(now_ms),
-                    account_response("7"),
-                    response(raw_fill.clone()),
-                    account_response("7"),
-                    time_response(now_ms + 1),
-                ]))),
-                requests: Arc::clone(&requests),
-            },
-            OkxSigner::new(OkxCredentials::new("key", "secret", "pass"), true),
+        let client = NarrowEvidenceFake::new(
+            VecDeque::from([
+                time_response(now_ms),
+                account_response("7"),
+                response(raw_fill.clone()),
+                account_response("7"),
+                time_response(now_ms + 1),
+            ]),
+            Arc::clone(&requests),
         );
         let directory = output_directory();
 
@@ -1229,7 +1250,7 @@ mod tests {
         );
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 5);
-        assert_eq!(requests[2].path, "/api/v5/trade/fills?limit=100");
+        assert_eq!(requests[2], "/api/v5/trade/fills?limit=100");
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -1238,17 +1259,14 @@ mod tests {
     async fn account_identity_change_fails_after_preserving_raw_page() {
         let now_ms = unix_time_ms().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let client = OkxRestClient::new(
-            MockTransport {
-                responses: Arc::new(Mutex::new(VecDeque::from([
-                    time_response(now_ms),
-                    account_response("7"),
-                    response(fill_response(now_ms - 90_000)),
-                    account_response("8"),
-                ]))),
-                requests,
-            },
-            OkxSigner::new(OkxCredentials::new("key", "secret", "pass"), true),
+        let client = NarrowEvidenceFake::new(
+            VecDeque::from([
+                time_response(now_ms),
+                account_response("7"),
+                response(fill_response(now_ms - 90_000)),
+                account_response("8"),
+            ]),
+            requests,
         );
         let directory = output_directory();
 

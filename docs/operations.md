@@ -1523,7 +1523,7 @@ the deployment secret provider.
 
 ## Independent Emergency Cancel
 
-`reap emergency-cancel` is a separate composition root. It does not acquire or
+`reap-emergency` is a separate executable and composition root. It does not acquire or
 trust the strategy journal, operator socket, live event loop, websocket state,
 or strategy configuration. It parses only the OKX environment/REST settings,
 request pacing/timeouts, account credential environment names, and configured
@@ -1563,7 +1563,7 @@ Incident procedure:
 umask 077
 REPORT=/var/lib/reap/live/btc-demo/emergency-cancel-$(date -u +%Y%m%dT%H%M%SZ).json
 VERIFICATION=/var/lib/reap/live/btc-demo/emergency-cancel-verification-$(date -u +%Y%m%dT%H%M%SZ).json
-/usr/local/bin/reap emergency-cancel \
+/usr/local/bin/reap-emergency \
   --config /etc/reap/live/btc-demo.toml \
   --account main \
   --confirm-account-wide-cancel \

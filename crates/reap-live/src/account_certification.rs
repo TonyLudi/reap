@@ -5,15 +5,27 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reap_core::PINNED_JAVA_REVISION;
+use reap_evidence_core::{
+    EvidenceClientFactory, EvidenceClientFactoryError, EvidenceCredentialEnvironment,
+    EvidenceHttpConfig, EvidenceReadError, EvidenceReadOnly,
+};
 use reap_venue::okx::{
-    HttpTransport, OkxAccountBalanceSnapshot, OkxAccountConfig, OkxAccountLevel,
-    OkxAccountPositionsSnapshot, OkxIndexTickerSnapshot, OkxInstrumentType, OkxRestClient,
-    OkxSigner, ReqwestTransport, RestError, parse_okx_account_balance_response_json,
+    OkxAccountBalanceSnapshot, OkxAccountConfig, OkxAccountLevel, OkxAccountPositionsSnapshot,
+    OkxIndexTickerSnapshot, OkxInstrumentType, RestError, parse_okx_account_balance_response_json,
     parse_okx_account_config_response_json, parse_okx_account_positions_response_json,
     parse_okx_index_ticker_response_json,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+#[cfg(test)]
+use reap_evidence_core::{
+    AccountBalanceResponse, AccountBillsPageResponse, AccountConfigResponse,
+    AccountPositionsResponse, IndexTickerResponse, RecentFillsPageResponse,
+    RegularOpenOrdersResponse, RegularOrderDetailsResponse,
+};
+#[cfg(test)]
+use reap_venue::okx::parse_okx_server_time_response_json;
 
 use crate::provenance::{
     current_executable_sha256, host_identity_sha256, okx_account_identity_sha256, sha256_bytes,
@@ -185,6 +197,8 @@ pub enum AccountCertificationError {
     Transport(#[source] RestError),
     #[error("OKX account certification failed: {0}")]
     Rest(#[from] RestError),
+    #[error("OKX account certification failed: {0}")]
+    Evidence(#[from] EvidenceReadError),
     #[error("account-certification response for {endpoint} is {actual} bytes; limit is {limit}")]
     ResponseTooLarge {
         endpoint: String,
@@ -525,14 +539,49 @@ fn check_optional_zero(
     }
 }
 
+fn evidence_credential_environment(
+    account: &crate::LiveAccountConfig,
+) -> EvidenceCredentialEnvironment {
+    EvidenceCredentialEnvironment::new(
+        &account.id,
+        &account.api_key_env,
+        &account.secret_key_env,
+        &account.passphrase_env,
+    )
+}
+
+fn map_factory_error(error: EvidenceClientFactoryError) -> AccountCertificationError {
+    match error {
+        EvidenceClientFactoryError::MissingCredential { account_id, name } => {
+            AccountCertificationError::Config(LiveConfigError::MissingCredential {
+                account_id,
+                name,
+            })
+        }
+        EvidenceClientFactoryError::InvalidConfiguration(message) => {
+            AccountCertificationError::Transport(RestError::Transport(format!(
+                "invalid evidence client configuration: {message}"
+            )))
+        }
+        EvidenceClientFactoryError::Transport(message) => {
+            AccountCertificationError::Transport(RestError::Transport(message))
+        }
+    }
+}
+
 /// Collects authenticated read-only account evidence into one create-new,
 /// owner-readable artifact. A failed collection leaves an empty reserved file,
 /// which the verifier rejects.
-pub async fn collect_account_certification_path(
+pub async fn collect_account_certification_path<F>(
     config_path: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
     account_id: &str,
-) -> Result<AccountCertificationSummary, AccountCertificationError> {
+    factory: &F,
+) -> Result<AccountCertificationSummary, AccountCertificationError>
+where
+    F: EvidenceClientFactory,
+    F::Client: EvidenceReadOnly<Error = EvidenceReadError>,
+{
     validate_account_id(account_id)?;
     let output_path = output_path.as_ref();
     let mut output = reserve_output(output_path)?;
@@ -541,21 +590,24 @@ pub async fn collect_account_certification_path(
     let account = config
         .account(account_id)
         .ok_or_else(|| AccountCertificationError::UnknownAccount(account_id.to_string()))?;
-    let credentials = account.credentials_from_env()?;
+    let prepared = factory
+        .prepare_credentials(&evidence_credential_environment(account))
+        .map_err(map_factory_error)?;
     let executable_sha256 =
         current_executable_sha256().map_err(AccountCertificationError::Provenance)?;
     let host_identity_sha256 =
         host_identity_sha256().map_err(AccountCertificationError::Provenance)?;
-    let transport = ReqwestTransport::with_timeouts(
-        &config.venue.rest_url,
-        Duration::from_millis(config.runtime.rest_connect_timeout_ms),
-        Duration::from_millis(config.runtime.rest_request_timeout_ms),
-    )
-    .map_err(AccountCertificationError::Transport)?;
-    let client = OkxRestClient::new(
-        transport,
-        OkxSigner::new(credentials, config.venue.environment.is_demo()),
-    );
+    let client = factory
+        .connect(
+            prepared,
+            &EvidenceHttpConfig::new(
+                &config.venue.rest_url,
+                config.venue.environment.is_demo(),
+                Duration::from_millis(config.runtime.rest_connect_timeout_ms),
+                Duration::from_millis(config.runtime.rest_request_timeout_ms),
+            ),
+        )
+        .map_err(map_factory_error)?;
     let artifact = collect_account_certification_with_client(
         &client,
         &config,
@@ -584,8 +636,8 @@ pub async fn collect_account_certification_path(
     Ok(artifact.summary)
 }
 
-async fn collect_account_certification_with_client<T>(
-    client: &OkxRestClient<T>,
+async fn collect_account_certification_with_client<C>(
+    client: &C,
     config: &LiveConfig,
     config_evidence: AccountCertificationConfigEvidence,
     account_id: &str,
@@ -593,65 +645,77 @@ async fn collect_account_certification_with_client<T>(
     host_identity_sha256: String,
 ) -> Result<AccountCertificationArtifact, AccountCertificationError>
 where
-    T: HttpTransport,
+    C: EvidenceReadOnly<Error = EvidenceReadError> + ?Sized,
 {
     let start_clock = sample_clock(client, config.runtime.max_exchange_clock_skew_ms).await?;
-    let config_before = client.account_config_raw().await?;
-    let balance = client.account_balance_raw().await?;
+    let config_before_response = client.account_config().await?;
+    let config_before =
+        parse_okx_account_config_response_json(config_before_response.response_body().as_bytes())?;
+    let balance_response = client.account_balance().await?;
+    let balance =
+        parse_okx_account_balance_response_json(balance_response.response_body().as_bytes())?;
     let mut index_tickers = Vec::new();
     let mut parsed_index_tickers = BTreeMap::new();
-    for (offset, (currency, symbol)) in required_index_symbols(&balance.snapshot)?
-        .into_iter()
-        .enumerate()
-    {
+    for (offset, (currency, symbol)) in required_index_symbols(&balance)?.into_iter().enumerate() {
         if offset > 0 {
             tokio::time::sleep(Duration::from_millis(
                 MIN_ACCOUNT_CERTIFICATION_INDEX_INTERVAL_MS,
             ))
             .await;
         }
-        let raw = client.index_ticker_raw(&symbol).await?;
+        let raw = client.index_ticker(&symbol).await?;
+        let ticker = parse_okx_index_ticker_response_json(raw.response_body().as_bytes())?;
+        if ticker.symbol != symbol {
+            return Err(RestError::InvalidField {
+                field: "instId",
+                value: ticker.symbol,
+                message: format!("does not match requested {symbol}"),
+            }
+            .into());
+        }
         let endpoint = index_ticker_endpoint(&symbol);
-        let response = response_evidence(&endpoint, &raw.request_path, raw.response_body)?;
-        parsed_index_tickers.insert(currency.clone(), raw.ticker);
+        let (request_path, response_body) = raw.into_parts();
+        let response = response_evidence(&endpoint, &request_path, response_body)?;
+        parsed_index_tickers.insert(currency.clone(), ticker);
         index_tickers.push(AccountCertificationIndexEvidence {
             currency,
             symbol,
             response,
         });
     }
-    let positions = client.account_positions_raw(None, None).await?;
-    let config_after = client.account_config_raw().await?;
+    let positions_response = client.account_positions().await?;
+    let positions =
+        parse_okx_account_positions_response_json(positions_response.response_body().as_bytes())?;
+    let config_after_response = client.account_config().await?;
+    let config_after =
+        parse_okx_account_config_response_json(config_after_response.response_body().as_bytes())?;
     let finish_clock = sample_clock(client, config.runtime.max_exchange_clock_skew_ms).await?;
 
+    let (config_before_path, config_before_body) = config_before_response.into_parts();
     let account_config_before = response_evidence(
         ACCOUNT_CONFIG_ENDPOINT,
-        &config_before.request_path,
-        config_before.response_body,
+        &config_before_path,
+        config_before_body,
     )?;
-    let account_balance = response_evidence(
-        ACCOUNT_BALANCE_ENDPOINT,
-        &balance.request_path,
-        balance.response_body,
-    )?;
-    let account_positions = response_evidence(
-        ACCOUNT_POSITIONS_ENDPOINT,
-        &positions.request_path,
-        positions.response_body,
-    )?;
+    let (balance_path, balance_body) = balance_response.into_parts();
+    let account_balance = response_evidence(ACCOUNT_BALANCE_ENDPOINT, &balance_path, balance_body)?;
+    let (positions_path, positions_body) = positions_response.into_parts();
+    let account_positions =
+        response_evidence(ACCOUNT_POSITIONS_ENDPOINT, &positions_path, positions_body)?;
+    let (config_after_path, config_after_body) = config_after_response.into_parts();
     let account_config_after = response_evidence(
         ACCOUNT_CONFIG_ENDPOINT,
-        &config_after.request_path,
-        config_after.response_body,
+        &config_after_path,
+        config_after_body,
     )?;
     let summary = derive_summary(
         config,
         account_id,
-        &config_before.config,
-        &balance.snapshot,
+        &config_before,
+        &balance,
         &parsed_index_tickers,
-        &positions.snapshot,
-        &config_after.config,
+        &positions,
+        &config_after,
         &start_clock,
         &finish_clock,
     )?;
@@ -1139,12 +1203,12 @@ fn evaluate_account_equity(
     })
 }
 
-async fn sample_clock<T>(
-    client: &OkxRestClient<T>,
+async fn sample_clock<C>(
+    client: &C,
     maximum_skew_ms: u64,
 ) -> Result<AccountCertificationClockEvidence, AccountCertificationError>
 where
-    T: HttpTransport,
+    C: EvidenceReadOnly<Error = EvidenceReadError> + ?Sized,
 {
     let before = unix_time_ms()?;
     let server_ms = client.server_time_ms().await?;
@@ -1434,17 +1498,149 @@ fn invalid_evidence<T>(message: impl Into<String>) -> Result<T, AccountCertifica
 }
 
 #[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct NarrowEvidenceFake {
+    responses: std::sync::Arc<
+        std::sync::Mutex<std::collections::VecDeque<Result<String, EvidenceReadError>>>,
+    >,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[cfg(test)]
+impl NarrowEvidenceFake {
+    pub(crate) fn new(
+        responses: std::collections::VecDeque<Result<String, EvidenceReadError>>,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Self {
+        Self {
+            responses: std::sync::Arc::new(std::sync::Mutex::new(responses)),
+            requests,
+        }
+    }
+
+    fn response(&self, path: String) -> Result<String, EvidenceReadError> {
+        self.requests.lock().unwrap().push(path);
+        self.responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("missing mock response")
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl EvidenceReadOnly for NarrowEvidenceFake {
+    type Error = EvidenceReadError;
+
+    async fn server_time_ms(&self) -> Result<u64, Self::Error> {
+        let body = self.response("/api/v5/public/time".to_string())?;
+        parse_okx_server_time_response_json(body.as_bytes())
+            .map_err(|error| EvidenceReadError::Other(error.to_string()))
+    }
+
+    async fn account_config(&self) -> Result<AccountConfigResponse, Self::Error> {
+        let path = ACCOUNT_CONFIG_ENDPOINT.to_string();
+        Ok(AccountConfigResponse::new(
+            &path,
+            self.response(path.clone())?,
+        ))
+    }
+
+    async fn account_balance(&self) -> Result<AccountBalanceResponse, Self::Error> {
+        let path = ACCOUNT_BALANCE_ENDPOINT.to_string();
+        Ok(AccountBalanceResponse::new(
+            &path,
+            self.response(path.clone())?,
+        ))
+    }
+
+    async fn account_positions(&self) -> Result<AccountPositionsResponse, Self::Error> {
+        let path = ACCOUNT_POSITIONS_ENDPOINT.to_string();
+        Ok(AccountPositionsResponse::new(
+            &path,
+            self.response(path.clone())?,
+        ))
+    }
+
+    async fn index_ticker(&self, symbol: &str) -> Result<IndexTickerResponse, Self::Error> {
+        let path = index_ticker_endpoint(symbol);
+        Ok(IndexTickerResponse::new(
+            &path,
+            self.response(path.clone())?,
+        ))
+    }
+
+    async fn recent_fills_page(
+        &self,
+        after: Option<&str>,
+    ) -> Result<RecentFillsPageResponse, Self::Error> {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        if let Some(after) = after {
+            query.append_pair("after", after);
+        }
+        query.append_pair("limit", "100");
+        let path = format!("/api/v5/trade/fills?{}", query.finish());
+        Ok(RecentFillsPageResponse::new(
+            &path,
+            self.response(path.clone())?,
+        ))
+    }
+
+    async fn account_bills_page(
+        &self,
+        begin_ms: u64,
+        end_ms: u64,
+        after: Option<&str>,
+    ) -> Result<AccountBillsPageResponse, Self::Error> {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query.append_pair("begin", &begin_ms.to_string());
+        query.append_pair("end", &end_ms.to_string());
+        if let Some(after) = after {
+            query.append_pair("after", after);
+        }
+        query.append_pair("limit", "100");
+        let path = format!("/api/v5/account/bills?{}", query.finish());
+        Ok(AccountBillsPageResponse::new(
+            &path,
+            self.response(path.clone())?,
+        ))
+    }
+
+    async fn regular_order_details(
+        &self,
+        symbol: &str,
+        exchange_order_id: &str,
+        client_order_id: &str,
+    ) -> Result<RegularOrderDetailsResponse, Self::Error> {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query.append_pair("instId", symbol);
+        query.append_pair("ordId", exchange_order_id);
+        query.append_pair("clOrdId", client_order_id);
+        let path = format!("/api/v5/trade/order?{}", query.finish());
+        Ok(RegularOrderDetailsResponse::new(
+            &path,
+            self.response(path.clone())?,
+        ))
+    }
+
+    async fn regular_open_orders(&self) -> Result<RegularOpenOrdersResponse, Self::Error> {
+        let path = "/api/v5/trade/orders-pending".to_string();
+        Ok(RegularOpenOrdersResponse::new(
+            &path,
+            self.response(path.clone())?,
+        ))
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex};
 
-    use async_trait::async_trait;
     use reap_risk::RiskLimits;
     use reap_strategy::ChaosConfig;
-    use reap_venue::okx::{
-        HttpResponse, OkxApiKeyPermission, OkxBalanceDetail, OkxCredentials, OkxPositionMode,
-        SignedRequest,
-    };
+    use reap_venue::okx::{OkxApiKeyPermission, OkxBalanceDetail, OkxPositionMode};
 
     use crate::{
         AlertConfig, HostGuardConfig, LiveAccountConfig, LiveStorageConfig, OkxVenueConfig,
@@ -1452,26 +1648,6 @@ mod tests {
     };
 
     use super::*;
-
-    #[derive(Clone)]
-    struct MockTransport {
-        responses: Arc<Mutex<VecDeque<String>>>,
-        requests: Arc<Mutex<Vec<SignedRequest>>>,
-    }
-
-    #[async_trait]
-    impl HttpTransport for MockTransport {
-        async fn execute(&self, request: SignedRequest) -> Result<HttpResponse, RestError> {
-            self.requests.lock().unwrap().push(request);
-            let body = self
-                .responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("missing mock response");
-            Ok(HttpResponse { status: 200, body })
-        }
-    }
 
     fn live_config(level: OkxAccountLevel) -> LiveConfig {
         let mut strategy: ChaosConfig =
@@ -1720,22 +1896,21 @@ mod tests {
         );
         let positions_json = r#"{"code":"0","msg":"","data":[]}"#;
         let responses = VecDeque::from([
-            format!(r#"{{"code":"0","msg":"","data":[{{"ts":"{now}"}}]}}"#),
-            account_json.to_string(),
-            balance_json.to_string(),
-            index_json,
-            positions_json.to_string(),
-            account_json.to_string(),
-            format!(r#"{{"code":"0","msg":"","data":[{{"ts":"{}"}}]}}"#, now + 1),
+            Ok(format!(
+                r#"{{"code":"0","msg":"","data":[{{"ts":"{now}"}}]}}"#
+            )),
+            Ok(account_json.to_string()),
+            Ok(balance_json.to_string()),
+            Ok(index_json),
+            Ok(positions_json.to_string()),
+            Ok(account_json.to_string()),
+            Ok(format!(
+                r#"{{"code":"0","msg":"","data":[{{"ts":"{}"}}]}}"#,
+                now + 1
+            )),
         ]);
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let client = OkxRestClient::new(
-            MockTransport {
-                responses: Arc::new(Mutex::new(responses)),
-                requests: Arc::clone(&requests),
-            },
-            OkxSigner::new(OkxCredentials::new("key", "secret", "pass"), true),
-        );
+        let client = NarrowEvidenceFake::new(responses, Arc::clone(&requests));
         let artifact = collect_account_certification_with_client(
             &client,
             &config,
@@ -1759,12 +1934,7 @@ mod tests {
             artifact.summary.api_key_policy.observed_permissions,
             BTreeSet::from([OkxApiKeyPermission::ReadOnly, OkxApiKeyPermission::Trade])
         );
-        let paths = requests
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|request| request.path.clone())
-            .collect::<Vec<_>>();
+        let paths = requests.lock().unwrap().iter().cloned().collect::<Vec<_>>();
         assert_eq!(
             paths,
             vec![

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 use reap_core::{ConnId, RawEnvelope, Symbol, Venue};
-use reap_venue::{VenueAdapter, okx::OkxSigner};
+use reap_venue::VenueAdapter;
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -541,23 +541,6 @@ pub fn no_bootstrap() -> BootstrapFactory {
     Arc::new(|_| Ok(Vec::new()))
 }
 
-pub fn okx_login_bootstrap(signer: OkxSigner) -> BootstrapFactory {
-    Arc::new(move |plan| {
-        if !plan.private {
-            return Ok(Vec::new());
-        }
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            .to_string();
-        signer
-            .websocket_login(&timestamp)
-            .map(|message| vec![message])
-            .map_err(|error| ConnectionError::LoginFailed(error.to_string()))
-    })
-}
-
 impl Default for ReconnectPolicy {
     fn default() -> Self {
         Self {
@@ -868,8 +851,10 @@ async fn supervise_connection(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use reap_core::{Channel, FeedPriority, Subscription};
-    use reap_venue::okx::{OkxAdapter, OkxCredentials};
+    use reap_venue::okx::OkxAdapter;
 
     use super::*;
 
@@ -1260,11 +1245,24 @@ mod tests {
     }
 
     #[test]
-    fn okx_private_bootstrap_builds_login_per_attempt() {
-        let factory = okx_login_bootstrap(OkxSigner::new(
-            OkxCredentials::new("key", "secret", "pass"),
-            true,
-        ));
+    fn private_bootstrap_builds_login_per_attempt() {
+        let attempt = Arc::new(AtomicUsize::new(0));
+        let factory: BootstrapFactory = Arc::new({
+            let attempt = Arc::clone(&attempt);
+            move |plan| {
+                if !plan.private {
+                    return Ok(Vec::new());
+                }
+                let attempt = attempt.fetch_add(1, Ordering::Relaxed) + 1;
+                Ok(vec![
+                    serde_json::json!({
+                        "op": "login",
+                        "args": [{ "timestamp": attempt.to_string() }],
+                    })
+                    .to_string(),
+                ])
+            }
+        });
         let private = SocketPlan {
             conn_id: reap_core::ConnId::new("private"),
             venue: Venue::Okx,
@@ -1290,7 +1288,11 @@ mod tests {
         let login: serde_json::Value =
             serde_json::from_str(&factory(&private).unwrap()[0]).unwrap();
         assert_eq!(login["op"], "login");
-        assert!(login["args"][0]["timestamp"].as_str().is_some());
+        assert_eq!(login["args"][0]["timestamp"], "1");
         assert!(factory(&public).unwrap().is_empty());
+
+        let next_login: serde_json::Value =
+            serde_json::from_str(&factory(&private).unwrap()[0]).unwrap();
+        assert_eq!(next_login["args"][0]["timestamp"], "2");
     }
 }

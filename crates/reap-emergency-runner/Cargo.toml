@@ -1,0 +1,24 @@
+[package]
+name = "reap-emergency-runner"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "reap-emergency"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+reap-core.workspace = true
+reap-emergency-core.workspace = true
+reap-okx-emergency-adapter.workspace = true
+reap-order.workspace = true
+reap-telemetry.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+tempfile = "3"

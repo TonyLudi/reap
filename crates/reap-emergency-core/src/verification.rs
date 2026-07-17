@@ -6,13 +6,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::emergency::{
-    ACCOUNT_WIDE_ORDER_SCOPE, EXCLUDED_ORDER_CLASSES, MAX_INCIDENT_MESSAGE_BYTES, MAX_INCIDENTS,
-    MAX_REMAINING_ORDER_DETAILS, review_emergency_config,
-};
 use crate::{
-    EMERGENCY_CANCEL_REPORT_SCHEMA_VERSION, EmergencyAccountReport, EmergencyCancelReport,
-    TradingEnvironment,
+    ACCOUNT_WIDE_ORDER_SCOPE, EMERGENCY_CANCEL_REPORT_SCHEMA_VERSION, EXCLUDED_ORDER_CLASSES,
+    EmergencyAccountReport, EmergencyCancelReport, MAX_INCIDENT_MESSAGE_BYTES, MAX_INCIDENTS,
+    MAX_REMAINING_ORDER_DETAILS, TradingEnvironment, review_emergency_config,
 };
 
 pub const EMERGENCY_CANCEL_VERIFICATION_FORMAT_VERSION: u16 = 3;
@@ -874,10 +871,7 @@ fn file_evidence(path: PathBuf, bytes: &[u8]) -> EmergencyCancelFileEvidence {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
-    use crate::{EmergencyCancelOptions, run_emergency_cancel_path};
 
     struct Fixture {
         _directory: tempfile::TempDir,
@@ -1013,46 +1007,6 @@ mod tests {
         assert!(verification.all_configured_accounts_selected);
         assert_eq!(verification.account_identity_sha256s.len(), 1);
         assert!(verification.failures.is_empty());
-    }
-
-    #[tokio::test]
-    async fn collector_failure_report_remains_structurally_verifiable() {
-        for name in [
-            "REAP_EMERGENCY_VERIFY_TEST_MISSING_KEY",
-            "REAP_EMERGENCY_VERIFY_TEST_MISSING_SECRET",
-            "REAP_EMERGENCY_VERIFY_TEST_MISSING_PASSPHRASE",
-        ] {
-            assert!(std::env::var_os(name).is_none());
-        }
-        let fixture = fixture(&["main"], &["main"]);
-        let report = run_emergency_cancel_path(
-            &fixture.config_path,
-            EmergencyCancelOptions {
-                account_ids: vec!["main".to_string()],
-                confirm_account_wide_cancel: true,
-                confirm_order_producers_stopped: true,
-                account_timeout: Duration::from_secs(40),
-                ..EmergencyCancelOptions::default()
-            },
-        )
-        .await
-        .unwrap();
-        assert!(!report.all_clear);
-        write_report(&fixture.report_path, &report);
-
-        let verification = verify_emergency_cancel_paths(
-            &fixture.config_path,
-            &fixture.report_path,
-            EmergencyCancelVerificationOptions {
-                require_all_configured_accounts: true,
-            },
-        )
-        .unwrap();
-
-        assert!(verification.evidence_valid, "{:?}", verification.failures);
-        assert!(!verification.acceptance_passed);
-        assert!(!verification.derived_regular_orders_all_clear);
-        assert!(!verification.derived_evidence_complete);
     }
 
     #[test]

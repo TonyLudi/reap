@@ -14,9 +14,11 @@ futures-util.workspace = true
 hmac.workspace = true
 libc.workspace = true
 reap-core.workspace = true
+reap-evidence-core.workspace = true
 reap-engine.workspace = true
 reap-feed.workspace = true
 reap-order.workspace = true
+reap-okx-live-adapter.workspace = true
 reap-risk.workspace = true
 reap-storage.workspace = true
 reap-strategy.workspace = true
@@ -35,3 +37,4 @@ url.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+trybuild.workspace = true

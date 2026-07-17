@@ -6,6 +6,13 @@ members = [
     "crates/reap-fault",
     "crates/reap-book",
     "crates/reap-order",
+    "crates/reap-okx-wire",
+    "crates/reap-okx-live-adapter",
+    "crates/reap-emergency-core",
+    "crates/reap-emergency-runner",
+    "crates/reap-evidence-core",
+    "crates/reap-okx-evidence-adapter",
+    "crates/reap-okx-emergency-adapter",
     "crates/reap-risk",
     "crates/reap-strategy",
     "crates/reap-engine",
@@ -43,9 +50,16 @@ reap-capture = { path = "crates/reap-capture" }
 reap-core = { path = "crates/reap-core" }
 reap-feed = { path = "crates/reap-feed" }
 reap-fault = { path = "crates/reap-fault" }
+reap-emergency-core = { path = "crates/reap-emergency-core" }
+reap-emergency-runner = { path = "crates/reap-emergency-runner" }
 reap-live = { path = "crates/reap-live" }
 reap-engine = { path = "crates/reap-engine" }
 reap-order = { path = "crates/reap-order" }
+reap-okx-wire = { path = "crates/reap-okx-wire" }
+reap-okx-live-adapter = { path = "crates/reap-okx-live-adapter" }
+reap-evidence-core = { path = "crates/reap-evidence-core" }
+reap-okx-evidence-adapter = { path = "crates/reap-okx-evidence-adapter" }
+reap-okx-emergency-adapter = { path = "crates/reap-okx-emergency-adapter" }
 reap-risk = { path = "crates/reap-risk" }
 reap-storage = { path = "crates/reap-storage" }
 reap-strategy = { path = "crates/reap-strategy" }
@@ -63,6 +77,7 @@ tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+trybuild = "1"
 url = "2"
 zeroize = "1"
 

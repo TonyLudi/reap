@@ -5,19 +5,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use reap_backtest::ResearchOpeningAccountEvidence;
 use reap_core::PINNED_JAVA_REVISION;
+use reap_emergency_core::{
+    EmergencyCancelVerificationOptions, EmergencyCancelVerificationReport,
+    verify_emergency_cancel_paths,
+};
 use reap_fault::{
     FaultProxyConfig, FaultProxyConfigEvidence, FaultProxyRunVerificationReport,
     verify_fault_proxy_run_paths,
 };
 use reap_live::{
     AccountCertificationArtifact, DeadmanExpiryCertificationArtifact,
-    EconomicReconciliationOptions, EconomicReconciliationTolerances,
-    EmergencyCancelVerificationOptions, FillStatementCoverage, FillStatementReconciliationOptions,
-    FillStatementTolerances, LiveConfig, LiveConfigFileEvidence, LiveMode, TradingEnvironment,
-    current_executable_sha256, host_identity_sha256, reconcile_okx_economics_paths,
-    reconcile_okx_fill_collection_paths, verify_account_certification_artifact_path,
-    verify_bill_collection_manifest_path, verify_deadman_expiry_certification_artifact_path,
-    verify_emergency_cancel_paths, verify_fill_collection_manifest_path,
+    EconomicReconciliationOptions, EconomicReconciliationTolerances, FillStatementCoverage,
+    FillStatementReconciliationOptions, FillStatementTolerances, LiveConfig,
+    LiveConfigFileEvidence, LiveMode, TradingEnvironment, current_executable_sha256,
+    host_identity_sha256, reconcile_okx_economics_paths, reconcile_okx_fill_collection_paths,
+    verify_account_certification_artifact_path, verify_bill_collection_manifest_path,
+    verify_deadman_expiry_certification_artifact_path, verify_fill_collection_manifest_path,
     verify_live_fault_matrix_paths, verify_live_run_paths, verify_production_transition_paths,
 };
 use serde::{Deserialize, Serialize};
@@ -1252,7 +1255,7 @@ struct FreshnessInputs<'a> {
     account_artifacts: &'a [(PathBuf, AccountCertificationArtifact)],
     deadman_artifacts: &'a [(&'a ResolvedDeadmanInput, DeadmanExpiryCertificationArtifact)],
     emergency_path: &'a Path,
-    emergency: &'a reap_live::EmergencyCancelVerificationReport,
+    emergency: &'a EmergencyCancelVerificationReport,
     fill_inputs: &'a [VerifiedFillInput],
     economic_inputs: &'a [VerifiedEconomicInput],
 }
@@ -1579,7 +1582,7 @@ struct BindingInputs<'a> {
     latency: &'a LatencyCalibrationVerificationReport,
     account_artifacts: &'a [(PathBuf, AccountCertificationArtifact)],
     deadman_artifacts: &'a [(&'a ResolvedDeadmanInput, DeadmanExpiryCertificationArtifact)],
-    emergency: &'a reap_live::EmergencyCancelVerificationReport,
+    emergency: &'a EmergencyCancelVerificationReport,
     fill_inputs: &'a [VerifiedFillInput],
     economic_inputs: &'a [VerifiedEconomicInput],
 }

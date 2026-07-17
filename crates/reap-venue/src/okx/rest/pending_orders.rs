@@ -5,21 +5,9 @@ use serde::{Deserialize, Serialize};
 use crate::RemoteOrder;
 
 use super::{
-    HttpMethod, HttpTransport, OPEN_ORDERS_PATH, OkxOrderWire, OkxResponse, OkxRestClient,
-    RestError, decode_okx_response, parse_integer, query_path, timestamp_now,
-    validate_optional_text, validate_required_text,
+    OkxOrderWire, OkxResponse, RestError, decode_okx_response, validate_optional_text,
+    validate_required_text,
 };
-
-use super::super::capabilities::{
-    REST_ALGO_PENDING, REST_CANCEL_ALGO, REST_SPREAD_CAA, REST_SPREAD_MASS_CANCEL,
-    REST_SPREAD_PENDING,
-};
-
-const ALGO_ORDERS_PATH: &str = REST_ALGO_PENDING.endpoint_or_channel;
-const CANCEL_ALGO_ORDERS_PATH: &str = REST_CANCEL_ALGO.endpoint_or_channel;
-const SPREAD_ORDERS_PATH: &str = REST_SPREAD_PENDING.endpoint_or_channel;
-const SPREAD_MASS_CANCEL_PATH: &str = REST_SPREAD_MASS_CANCEL.endpoint_or_channel;
-const SPREAD_CANCEL_ALL_AFTER_PATH: &str = REST_SPREAD_CAA.endpoint_or_channel;
 
 pub const OKX_PENDING_ORDER_PAGE_LIMIT: usize = 100;
 pub const OKX_ALGO_CANCEL_BATCH_LIMIT: usize = 10;
@@ -385,230 +373,6 @@ fn full_page_cursor(
     Ok(Some(cursor.to_string()))
 }
 
-impl<T> OkxRestClient<T>
-where
-    T: HttpTransport,
-{
-    pub async fn regular_pending_orders_page(
-        &self,
-        instrument_type: Option<&str>,
-        symbol: Option<&str>,
-        after: Option<&str>,
-    ) -> Result<OkxRegularOrderPage, RestError> {
-        self.regular_pending_orders_page_at(&timestamp_now(), instrument_type, symbol, after)
-            .await
-    }
-
-    pub async fn regular_pending_orders_page_at(
-        &self,
-        timestamp: &str,
-        instrument_type: Option<&str>,
-        symbol: Option<&str>,
-        after: Option<&str>,
-    ) -> Result<OkxRegularOrderPage, RestError> {
-        let path = query_path(
-            OPEN_ORDERS_PATH,
-            [
-                ("instType", instrument_type),
-                ("instId", symbol),
-                ("after", after),
-                ("limit", Some("100")),
-            ],
-        );
-        let request = self
-            .signer
-            .sign_request(timestamp, HttpMethod::Get, path, "")?;
-        let response = self.transport.execute(request).await?;
-        parse_okx_regular_order_page_response_json(response.body.as_bytes())
-    }
-
-    pub async fn algo_pending_orders_page(
-        &self,
-        query: OkxAlgoOrderQuery,
-        after: Option<&str>,
-    ) -> Result<OkxAlgoOrderPage, RestError> {
-        self.algo_pending_orders_page_at(&timestamp_now(), query, after)
-            .await
-    }
-
-    pub async fn algo_pending_orders_page_at(
-        &self,
-        timestamp: &str,
-        query: OkxAlgoOrderQuery,
-        after: Option<&str>,
-    ) -> Result<OkxAlgoOrderPage, RestError> {
-        let path = query_path(
-            ALGO_ORDERS_PATH,
-            [
-                ("ordType", Some(query.as_str())),
-                ("after", after),
-                ("limit", Some("100")),
-            ],
-        );
-        let request = self
-            .signer
-            .sign_request(timestamp, HttpMethod::Get, path, "")?;
-        let response = self.transport.execute(request).await?;
-        parse_okx_algo_order_page_response_json(response.body.as_bytes())
-    }
-
-    pub async fn spread_pending_orders_page(
-        &self,
-        end_id: Option<&str>,
-    ) -> Result<OkxSpreadOrderPage, RestError> {
-        self.spread_pending_orders_page_at(&timestamp_now(), end_id)
-            .await
-    }
-
-    pub async fn spread_pending_orders_page_at(
-        &self,
-        timestamp: &str,
-        end_id: Option<&str>,
-    ) -> Result<OkxSpreadOrderPage, RestError> {
-        let path = query_path(
-            SPREAD_ORDERS_PATH,
-            [("endId", end_id), ("limit", Some("100"))],
-        );
-        let request = self
-            .signer
-            .sign_request(timestamp, HttpMethod::Get, path, "")?;
-        let response = self.transport.execute(request).await?;
-        parse_okx_spread_order_page_response_json(response.body.as_bytes())
-    }
-
-    pub async fn cancel_algo_orders(
-        &self,
-        orders: &[OkxCancelAlgoOrder],
-    ) -> Result<Vec<OkxAlgoCancelResult>, RestError> {
-        self.cancel_algo_orders_at(&timestamp_now(), orders).await
-    }
-
-    pub async fn cancel_algo_orders_at(
-        &self,
-        timestamp: &str,
-        orders: &[OkxCancelAlgoOrder],
-    ) -> Result<Vec<OkxAlgoCancelResult>, RestError> {
-        if orders.is_empty() || orders.len() > OKX_ALGO_CANCEL_BATCH_LIMIT {
-            return Err(RestError::InvalidField {
-                field: "orders",
-                value: orders.len().to_string(),
-                message: format!(
-                    "algo cancel batch must contain 1-{OKX_ALGO_CANCEL_BATCH_LIMIT} orders"
-                ),
-            });
-        }
-        #[derive(Serialize)]
-        struct Body<'a> {
-            #[serde(rename = "instId")]
-            symbol: &'a str,
-            #[serde(rename = "algoId")]
-            algo_id: &'a str,
-        }
-        let mut body = Vec::with_capacity(orders.len());
-        for order in orders {
-            validate_required_text("instId", &order.symbol)?;
-            validate_required_text("algoId", &order.algo_id)?;
-            body.push(Body {
-                symbol: &order.symbol,
-                algo_id: &order.algo_id,
-            });
-        }
-        let request = self.signer.sign_request(
-            timestamp,
-            HttpMethod::Post,
-            CANCEL_ALGO_ORDERS_PATH,
-            serde_json::to_string(&body)?,
-        )?;
-        let response: OkxResponse<OkxAlgoCancelWire> = self.execute(request).await?;
-        if response.data.is_empty() {
-            return Err(RestError::EmptyData {
-                operation: "cancel algo orders",
-            });
-        }
-        response
-            .data
-            .into_iter()
-            .map(OkxAlgoCancelResult::try_from)
-            .collect()
-    }
-
-    pub async fn spread_mass_cancel(&self) -> Result<(), RestError> {
-        self.spread_mass_cancel_at(&timestamp_now()).await
-    }
-
-    pub async fn spread_mass_cancel_at(&self, timestamp: &str) -> Result<(), RestError> {
-        let request =
-            self.signer
-                .sign_request(timestamp, HttpMethod::Post, SPREAD_MASS_CANCEL_PATH, "{}")?;
-        let mut response: OkxResponse<OkxSpreadMassCancelWire> = self.execute(request).await?;
-        if response.data.len() != 1 {
-            return Err(RestError::InvalidField {
-                field: "data",
-                value: response.data.len().to_string(),
-                message: "spread mass cancel must return exactly one result".to_string(),
-            });
-        }
-        if !response.data.remove(0).result {
-            return Err(RestError::InvalidField {
-                field: "result",
-                value: "false".to_string(),
-                message: "spread mass cancel was not accepted".to_string(),
-            });
-        }
-        Ok(())
-    }
-
-    pub async fn spread_cancel_all_after(&self, timeout_secs: u64) -> Result<(), RestError> {
-        self.spread_cancel_all_after_at(&timestamp_now(), timeout_secs)
-            .await
-    }
-
-    pub async fn spread_cancel_all_after_at(
-        &self,
-        timestamp: &str,
-        timeout_secs: u64,
-    ) -> Result<(), RestError> {
-        if timeout_secs != 0 && !(10..=120).contains(&timeout_secs) {
-            return Err(RestError::InvalidField {
-                field: "timeOut",
-                value: timeout_secs.to_string(),
-                message: "must be 0 or between 10 and 120 seconds".to_string(),
-            });
-        }
-        #[derive(Serialize)]
-        struct Body {
-            #[serde(rename = "timeOut")]
-            timeout_secs: String,
-        }
-        let request = self.signer.sign_request(
-            timestamp,
-            HttpMethod::Post,
-            SPREAD_CANCEL_ALL_AFTER_PATH,
-            serde_json::to_string(&Body {
-                timeout_secs: timeout_secs.to_string(),
-            })?,
-        )?;
-        let mut response: OkxResponse<OkxSpreadCancelAllAfterWire> = self.execute(request).await?;
-        if response.data.len() != 1 {
-            return Err(RestError::InvalidField {
-                field: "data",
-                value: response.data.len().to_string(),
-                message: "spread Cancel All After must return exactly one acknowledgement"
-                    .to_string(),
-            });
-        }
-        let acknowledgement = response.data.remove(0);
-        if timeout_secs != 0 && parse_integer("triggerTime", &acknowledgement.trigger_time)? == 0 {
-            return Err(RestError::InvalidField {
-                field: "triggerTime",
-                value: acknowledgement.trigger_time,
-                message: "must be nonzero when spread Cancel All After is armed".to_string(),
-            });
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug, Deserialize)]
 struct OkxAlgoOrderWire {
     #[serde(rename = "algoId")]
@@ -679,82 +443,9 @@ impl TryFrom<OkxSpreadOrderWire> for OkxSpreadOrder {
         })
     }
 }
-
-#[derive(Debug, Deserialize)]
-struct OkxAlgoCancelWire {
-    #[serde(rename = "algoId")]
-    algo_id: String,
-    #[serde(default, rename = "algoClOrdId")]
-    client_order_id: String,
-    #[serde(default, rename = "sCode")]
-    code: String,
-    #[serde(default, rename = "sMsg")]
-    message: String,
-}
-
-impl TryFrom<OkxAlgoCancelWire> for OkxAlgoCancelResult {
-    type Error = RestError;
-
-    fn try_from(value: OkxAlgoCancelWire) -> Result<Self, Self::Error> {
-        validate_required_text("algoId", &value.algo_id)?;
-        validate_optional_text("algoClOrdId", value.client_order_id.clone())?;
-        Ok(Self {
-            algo_id: value.algo_id,
-            client_order_id: value.client_order_id,
-            code: value.code,
-            message: value.message,
-        })
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct OkxSpreadMassCancelWire {
-    result: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct OkxSpreadCancelAllAfterWire {
-    #[serde(rename = "triggerTime")]
-    trigger_time: String,
-}
-
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
-    use async_trait::async_trait;
-
     use super::*;
-    use crate::okx::{HttpResponse, OkxCredentials, OkxSigner, SignedRequest};
-
-    #[derive(Clone)]
-    struct MockTransport {
-        responses: Arc<Mutex<Vec<String>>>,
-        requests: Arc<Mutex<Vec<SignedRequest>>>,
-    }
-
-    #[async_trait]
-    impl HttpTransport for MockTransport {
-        async fn execute(&self, request: SignedRequest) -> Result<HttpResponse, RestError> {
-            self.requests.lock().unwrap().push(request);
-            Ok(HttpResponse {
-                status: 200,
-                body: self.responses.lock().unwrap().remove(0),
-            })
-        }
-    }
-
-    fn client(
-        responses: Vec<String>,
-    ) -> (OkxRestClient<MockTransport>, Arc<Mutex<Vec<SignedRequest>>>) {
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let transport = MockTransport {
-            responses: Arc::new(Mutex::new(responses)),
-            requests: Arc::clone(&requests),
-        };
-        let signer = OkxSigner::new(OkxCredentials::new("key", "secret", "pass"), false);
-        (OkxRestClient::new(transport, signer), requests)
-    }
 
     fn regular_page(first: usize, count: usize) -> String {
         let data = (first..first + count)
@@ -776,110 +467,65 @@ mod tests {
         serde_json::json!({"code": "0", "msg": "", "data": data}).to_string()
     }
 
-    #[tokio::test]
-    async fn regular_pages_use_after_and_fail_closed_at_the_bound() {
-        let (client, requests) = client(vec![regular_page(100, 100)]);
+    #[test]
+    fn regular_parser_derives_cursor_and_pagination_fails_closed_at_bound() {
+        let page =
+            parse_okx_regular_order_page_response_json(regular_page(100, 100).as_bytes()).unwrap();
+        assert_eq!(page.orders.len(), 100);
+        assert_eq!(page.next_after.as_deref(), Some("199"));
+
         let mut pagination = OkxRegularOrderPagination::new(1).unwrap();
-        let page = client
-            .regular_pending_orders_page_at("time", None, None, pagination.after())
-            .await
-            .unwrap();
-        let error = pagination.accept(page).unwrap_err();
         assert!(matches!(
-            error,
-            RestError::PendingOrderPaginationLimit {
+            pagination.accept(page),
+            Err(RestError::PendingOrderPaginationLimit {
                 domain: REGULAR_DOMAIN,
                 pages: 1,
                 records: 100,
                 ..
-            }
-        ));
-        assert_eq!(
-            requests.lock().unwrap()[0].path,
-            "/api/v5/trade/orders-pending?limit=100"
-        );
-    }
-
-    #[tokio::test]
-    async fn parses_all_algo_queries_and_builds_bounded_cancel() {
-        let responses = OkxAlgoOrderQuery::ALL
-            .into_iter()
-            .map(|query| {
-                let order_type = if query == OkxAlgoOrderQuery::ConditionalAndOco {
-                    "conditional"
-                } else {
-                    query.as_str()
-                };
-                serde_json::json!({
-                    "code": "0",
-                    "msg": "",
-                    "data": [{
-                        "algoId": format!("algo-{order_type}"),
-                        "algoClOrdId": "client",
-                        "instId": "BTC-USDT",
-                        "ordType": order_type,
-                        "state": "live"
-                    }]
-                })
-                .to_string()
             })
-            .chain(std::iter::once(
-                r#"{"code":"0","msg":"","data":[{"algoId":"algo-trigger","algoClOrdId":"client","sCode":"0","sMsg":""}]}"#.to_string(),
-            ))
-            .collect();
-        let (client, requests) = client(responses);
-        for query in OkxAlgoOrderQuery::ALL {
-            let page = client
-                .algo_pending_orders_page_at("time", query, None)
-                .await
-                .unwrap();
-            assert_eq!(page.orders.len(), 1);
-        }
-        let results = client
-            .cancel_algo_orders_at(
-                "time",
-                &[OkxCancelAlgoOrder {
-                    symbol: "BTC-USDT".to_string(),
-                    algo_id: "algo-trigger".to_string(),
-                }],
-            )
-            .await
-            .unwrap();
-        assert!(results[0].accepted());
-        let requests = requests.lock().unwrap();
-        assert_eq!(
-            requests[0].path,
-            "/api/v5/trade/orders-algo-pending?ordType=conditional%2Coco&limit=100"
-        );
-        assert_eq!(requests.last().unwrap().path, CANCEL_ALGO_ORDERS_PATH);
-        assert_eq!(
-            requests.last().unwrap().body,
-            r#"[{"instId":"BTC-USDT","algoId":"algo-trigger"}]"#
-        );
+        ));
     }
 
-    #[tokio::test]
-    async fn spread_contract_uses_end_id_mass_cancel_and_its_own_deadman() {
-        let (client, requests) = client(vec![
-            r#"{"code":"0","msg":"","data":[{"sprdId":"BTC-USDT_BTC-USDT-SWAP","ordId":"123","clOrdId":"client","state":"partially_filled"}]}"#.to_string(),
-            r#"{"code":"0","msg":"","data":[{"result":true}]}"#.to_string(),
-            r#"{"code":"0","msg":"","data":[{"triggerTime":"1000","ts":"1"}]}"#.to_string(),
-        ]);
-        let page = client
-            .spread_pending_orders_page_at("time", Some("456"))
-            .await
-            .unwrap();
+    #[test]
+    fn algo_parser_supports_every_query_family() {
+        for query in OkxAlgoOrderQuery::ALL {
+            let order_type = if query == OkxAlgoOrderQuery::ConditionalAndOco {
+                "conditional"
+            } else {
+                query.as_str()
+            };
+            let body = serde_json::json!({
+                "code": "0",
+                "msg": "",
+                "data": [{
+                    "algoId": format!("algo-{order_type}"),
+                    "algoClOrdId": "client",
+                    "instId": "BTC-USDT",
+                    "ordType": order_type,
+                    "state": "live"
+                }]
+            })
+            .to_string();
+            let page = parse_okx_algo_order_page_response_json(body.as_bytes()).unwrap();
+            assert_eq!(page.orders.len(), 1);
+            assert_eq!(page.orders[0].symbol, "BTC-USDT");
+        }
+    }
+
+    #[test]
+    fn spread_parser_retains_identity_and_rejects_terminal_state() {
+        let page = parse_okx_spread_order_page_response_json(
+            br#"{"code":"0","msg":"","data":[{"sprdId":"BTC-USDT_BTC-USDT-SWAP","ordId":"123","clOrdId":"client","state":"partially_filled"}]}"#,
+        )
+        .unwrap();
         assert_eq!(page.orders[0].exchange_order_id, "123");
-        client.spread_mass_cancel_at("time").await.unwrap();
-        client.spread_cancel_all_after_at("time", 10).await.unwrap();
-        let requests = requests.lock().unwrap();
-        assert_eq!(
-            requests[0].path,
-            "/api/v5/sprd/orders-pending?endId=456&limit=100"
-        );
-        assert_eq!(requests[1].path, SPREAD_MASS_CANCEL_PATH);
-        assert_eq!(requests[1].body, "{}");
-        assert_eq!(requests[2].path, SPREAD_CANCEL_ALL_AFTER_PATH);
+
+        assert!(matches!(
+            parse_okx_spread_order_page_response_json(
+                br#"{"code":"0","msg":"","data":[{"sprdId":"BTC-USDT_BTC-USDT-SWAP","ordId":"123","clOrdId":"client","state":"canceled"}]}"#
+            ),
+            Err(RestError::InvalidField { field: "state", .. })
+        ));
     }
 
     #[test]
@@ -926,5 +572,27 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn cancellation_result_contracts_preserve_per_item_acceptance() {
+        assert!(
+            OkxAlgoCancelResult {
+                algo_id: "1".to_string(),
+                client_order_id: String::new(),
+                code: "0".to_string(),
+                message: String::new(),
+            }
+            .accepted()
+        );
+        assert!(
+            !OkxAlgoCancelResult {
+                algo_id: "2".to_string(),
+                client_order_id: String::new(),
+                code: "51400".to_string(),
+                message: "already canceled".to_string(),
+            }
+            .accepted()
+        );
     }
 }

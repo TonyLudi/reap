@@ -1120,7 +1120,7 @@ Target command surface:
 ```text
 reap live --config config/live.toml
 reap capture --config config/capture.toml --output capture-report.json
-reap emergency-cancel --config config/live.toml --account account-id --output emergency.json
+reap-emergency --config config/live.toml --account account-id --output emergency.json
 reap verify-emergency-cancel --config config/live.toml --report emergency.json --require-pass
 reap certify-deadman-expiry --config config/live.toml --account account-id --output deadman.json
 reap verify-deadman-certification --artifact deadman.json --journal live-events.jsonl
@@ -1140,8 +1140,9 @@ reap inspect-book --capture raw/ws.jsonl --symbol BTC-USDT
 reap config-check --config config/live.toml
 ```
 
-`live`, `capture`, both emergency-cancel commands, both deadman-certification
-commands, `operator`, `backtest`, `research`, `replay-check`, `analyze-capture`,
+`live`, `capture`, the separate `reap-emergency` binary, the emergency verifier,
+both deadman-certification commands, `operator`, `backtest`, `research`,
+`replay-check`, `analyze-capture`,
 `verify-capture`, `calibrate-latency`, `verify-fault-proxy-run`,
 `verify-production-evidence`, all production-approval commands, and
 `config-check` are implemented.

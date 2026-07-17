@@ -14,7 +14,7 @@ pub use reap_telemetry::HostGuardConfig;
 use reap_telemetry::WebhookAlertConfig;
 use reap_venue::okx::{
     OKX_MIN_TRADE_FEE_REQUEST_INTERVAL_MS, OkxAccountConfig, OkxAccountLevel, OkxApiKeyPermission,
-    OkxCredentials, OkxPositionMode, OkxTradeMode,
+    OkxPositionMode, OkxTradeMode,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -251,14 +251,6 @@ pub fn evaluate_okx_api_key_policy(
 }
 
 impl LiveAccountConfig {
-    pub fn credentials_from_env(&self) -> Result<OkxCredentials, LiveConfigError> {
-        Ok(OkxCredentials::new(
-            required_env(&self.id, &self.api_key_env)?,
-            required_env(&self.id, &self.secret_key_env)?,
-            required_env(&self.id, &self.passphrase_env)?,
-        ))
-    }
-
     pub fn trade_mode(&self, symbol: &str) -> Option<OkxTradeMode> {
         self.trade_modes.get(symbol).copied().map(Into::into)
     }
@@ -1653,34 +1645,6 @@ fn validate_okx_venue_endpoints(
     }
 }
 
-pub(crate) fn validate_okx_rest_origin(
-    environment: TradingEnvironment,
-    name: &str,
-    value: &str,
-    errors: &mut Vec<String>,
-) -> Option<OkxEndpointRegion> {
-    let endpoint = parse_okx_endpoint(name, value, environment, "https", "http", "/", 443, errors)?;
-    if endpoint.loopback {
-        if environment == TradingEnvironment::Demo {
-            return Some(OkxEndpointRegion::DemoLoopback);
-        }
-        errors.push(format!("{name} loopback origin is demo-test only"));
-        return None;
-    }
-    let profile = OKX_ENDPOINT_PROFILES.iter().find(|profile| {
-        profile.environment == environment && profile.rest_hosts.contains(&endpoint.host.as_str())
-    });
-    match profile {
-        Some(profile) => Some(profile.region),
-        None => {
-            errors.push(format!(
-                "{name} host is not a documented OKX REST origin for {environment:?}"
-            ));
-            None
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn parse_okx_endpoint(
     name: &str,
@@ -1737,13 +1701,6 @@ fn is_loopback_host(host: &str) -> bool {
             .trim_matches(['[', ']'])
             .parse::<IpAddr>()
             .is_ok_and(|address| address.is_loopback())
-}
-
-fn required_env(account_id: &str, name: &str) -> Result<String, LiveConfigError> {
-    std::env::var(name).map_err(|_| LiveConfigError::MissingCredential {
-        account_id: account_id.to_string(),
-        name: name.to_string(),
-    })
 }
 
 #[cfg(test)]

@@ -6,10 +6,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use reap_feed::{ConnectionAttemptPacer, ReconnectPolicy};
+use reap_okx_live_adapter::RegularOrderSessionFactory;
 use reap_order::{OkxOrderTransport, OrderTransportError, okx_order_dispatch_key};
 use reap_venue::okx::{
-    OkxCancelOrder, OkxOrderAck, OkxPlaceOrder, OkxSigner, OkxWsOrderOperation, OkxWsOrderResult,
-    build_okx_ws_cancel_order_request, build_okx_ws_place_order_request,
+    OkxCancelOrder, OkxOrderAck, OkxPlaceOrder, OkxWsOrderOperation, OkxWsOrderResult,
     okx_capability_registration, parse_okx_ws_order_response,
 };
 use serde_json::Value;
@@ -27,7 +27,7 @@ const EXPIRY_SCAN_INTERVAL: Duration = Duration::from_millis(10);
 pub(crate) struct OkxOrderWsConfig {
     pub account_id: String,
     pub websocket_url: String,
-    pub signer: OkxSigner,
+    pub session_factory: Arc<dyn OrderSessionOperations>,
     pub session_count: usize,
     pub command_capacity: usize,
     pub request_expiry: Duration,
@@ -57,6 +57,7 @@ pub(crate) struct OkxOrderWsStatus {
 #[derive(Clone)]
 pub(crate) struct OkxOrderWsTransport {
     sessions: Arc<Vec<SessionHandle>>,
+    session_factory: Arc<dyn OrderSessionOperations>,
     request_sequence: Arc<AtomicU64>,
     request_expiry: Duration,
 }
@@ -110,6 +111,38 @@ struct PendingRequest {
     response: oneshot::Sender<Result<OkxOrderAck, OrderTransportError>>,
 }
 
+pub(crate) trait OrderSessionOperations: Send + Sync {
+    fn login_message(&self) -> Result<String, String>;
+    fn place_request(
+        &self,
+        request_id: &str,
+        expiry_ms: u64,
+        order: &OkxPlaceOrder,
+    ) -> Result<String, String>;
+    fn cancel_request(&self, request_id: &str, order: &OkxCancelOrder) -> Result<String, String>;
+}
+
+impl OrderSessionOperations for RegularOrderSessionFactory {
+    fn login_message(&self) -> Result<String, String> {
+        RegularOrderSessionFactory::login_message(self)
+    }
+
+    fn place_request(
+        &self,
+        request_id: &str,
+        expiry_ms: u64,
+        order: &OkxPlaceOrder,
+    ) -> Result<String, String> {
+        RegularOrderSessionFactory::place_request(self, request_id, expiry_ms, order)
+            .map_err(|error| error.to_string())
+    }
+
+    fn cancel_request(&self, request_id: &str, order: &OkxCancelOrder) -> Result<String, String> {
+        RegularOrderSessionFactory::cancel_request(self, request_id, order)
+            .map_err(|error| error.to_string())
+    }
+}
+
 #[derive(Debug)]
 struct SessionStatus {
     index: usize,
@@ -143,7 +176,7 @@ pub(crate) fn spawn_okx_order_ws(
         tasks.push(tokio::spawn(supervise_session(
             index,
             config.websocket_url.clone(),
-            config.signer.clone(),
+            Arc::clone(&config.session_factory),
             command_rx,
             ready_tx,
             session_status_tx.clone(),
@@ -165,6 +198,7 @@ pub(crate) fn spawn_okx_order_ws(
     (
         OkxOrderWsTransport {
             sessions: Arc::new(handles),
+            session_factory: config.session_factory,
             request_sequence: Arc::new(AtomicU64::new(unix_time_ns())),
             request_expiry: config.request_expiry,
         },
@@ -182,7 +216,9 @@ impl OkxOrderTransport for OkxOrderWsTransport {
         let session_index = route_session(&order.symbol, self.sessions.len());
         let request_id = self.next_request_id(session_index);
         let expiry_ms = unix_time_ms().saturating_add(duration_ms(self.request_expiry));
-        let payload = build_okx_ws_place_order_request(&request_id, expiry_ms, order)
+        let payload = self
+            .session_factory
+            .place_request(&request_id, expiry_ms, order)
             .map_err(|error| OrderTransportError::InvalidRequest(error.to_string()))?;
         self.execute(
             session_index,
@@ -199,7 +235,9 @@ impl OkxOrderTransport for OkxOrderWsTransport {
     ) -> Result<OkxOrderAck, OrderTransportError> {
         let session_index = route_session(&order.symbol, self.sessions.len());
         let request_id = self.next_request_id(session_index);
-        let payload = build_okx_ws_cancel_order_request(&request_id, order)
+        let payload = self
+            .session_factory
+            .cancel_request(&request_id, order)
             .map_err(|error| OrderTransportError::InvalidRequest(error.to_string()))?;
         self.execute(
             session_index,
@@ -261,7 +299,7 @@ impl OkxOrderWsTransport {
 async fn supervise_session(
     index: usize,
     websocket_url: String,
-    signer: OkxSigner,
+    session_factory: Arc<dyn OrderSessionOperations>,
     mut commands: mpsc::Receiver<SessionCommand>,
     ready: watch::Sender<bool>,
     status: mpsc::Sender<SessionStatus>,
@@ -302,7 +340,7 @@ async fn supervise_session(
         let result = run_authenticated_session(
             index,
             &websocket_url,
-            &signer,
+            session_factory.as_ref(),
             &mut commands,
             &ready,
             &status,
@@ -352,7 +390,7 @@ async fn supervise_session(
 async fn run_authenticated_session(
     index: usize,
     websocket_url: &str,
-    signer: &OkxSigner,
+    session_factory: &dyn OrderSessionOperations,
     commands: &mut mpsc::Receiver<SessionCommand>,
     ready: &watch::Sender<bool>,
     status: &mpsc::Sender<SessionStatus>,
@@ -379,8 +417,8 @@ async fn run_authenticated_session(
         }
     };
     let (mut writer, mut reader) = socket.split();
-    let login = signer
-        .websocket_login(&unix_time_seconds().to_string())
+    let login = session_factory
+        .login_message()
         .map_err(|error| format!("login generation failed: {error}"))?;
     send_control_message(&mut writer, Message::Text(login.into()), "login").await?;
     await_login(&mut writer, &mut reader, shutdown).await?;
@@ -815,13 +853,6 @@ fn route_session(symbol: &str, session_count: usize) -> usize {
     (hash as usize) % session_count
 }
 
-fn unix_time_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 fn unix_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -845,23 +876,65 @@ fn duration_ms(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use reap_core::{Side, TimeInForce};
-    use reap_venue::okx::{
-        OKX_WS_CANCEL_ORDER_OP, OKX_WS_PLACE_ORDER_OP, OkxCredentials, OkxTradeMode,
-    };
+    use reap_venue::okx::{OKX_WS_CANCEL_ORDER_OP, OKX_WS_PLACE_ORDER_OP, OkxTradeMode};
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
 
     use super::*;
 
-    fn signer() -> OkxSigner {
-        OkxSigner::new(OkxCredentials::new("key", "secret", "pass"), true)
+    struct TestSessionOperations;
+
+    impl OrderSessionOperations for TestSessionOperations {
+        fn login_message(&self) -> Result<String, String> {
+            Ok(r#"{"op":"login","args":[{"apiKey":"test"}]}"#.to_string())
+        }
+
+        fn place_request(
+            &self,
+            request_id: &str,
+            expiry_ms: u64,
+            order: &OkxPlaceOrder,
+        ) -> Result<String, String> {
+            Ok(serde_json::json!({
+                "id": request_id,
+                "op": OKX_WS_PLACE_ORDER_OP,
+                "expTime": expiry_ms.to_string(),
+                "args": [{
+                    "instId": order.symbol,
+                    "tdMode": "cross",
+                    "side": "buy",
+                    "ordType": "post_only",
+                    "px": order.price.to_string(),
+                    "sz": order.qty.to_string(),
+                    "clOrdId": order.client_order_id,
+                }],
+            })
+            .to_string())
+        }
+
+        fn cancel_request(
+            &self,
+            request_id: &str,
+            order: &OkxCancelOrder,
+        ) -> Result<String, String> {
+            Ok(serde_json::json!({
+                "id": request_id,
+                "op": OKX_WS_CANCEL_ORDER_OP,
+                "args": [{
+                    "instId": order.symbol,
+                    "ordId": order.exchange_order_id,
+                    "clOrdId": order.client_order_id,
+                }],
+            })
+            .to_string())
+        }
     }
 
     fn config(url: String, session_count: usize) -> OkxOrderWsConfig {
         OkxOrderWsConfig {
             account_id: "account-a".to_string(),
             websocket_url: url,
-            signer: signer(),
+            session_factory: Arc::new(TestSessionOperations),
             session_count,
             command_capacity: 8,
             request_expiry: Duration::from_millis(1_000),

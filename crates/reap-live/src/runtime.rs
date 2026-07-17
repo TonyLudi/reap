@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -13,12 +14,16 @@ use reap_core::{
 };
 use reap_feed::{
     ConnectionAttemptPacer, ConnectionStatus, ConnectionStatusKind, FeedOutput, FeedProcessor,
-    ReconnectPolicy, SocketPlan, SupervisedFeed, okx_login_bootstrap, partition_subscriptions,
-    spawn_supervised_feed,
+    ReconnectPolicy, SocketPlan, SupervisedFeed, partition_subscriptions, spawn_supervised_feed,
+};
+use reap_okx_live_adapter::{
+    ConnectionSettings, CredentialEnvNames, ForbiddenOrderObserver, LiveReadiness, LiveSafety,
+    PrivateStateSessionFactory, RegularOrderSessionFactory, demo_from_env, observe_from_env,
 };
 use reap_order::{
-    CancelOutcome, GatewayError, OkxGatewayIo, OkxOrderGateway, PreparedOrder, ReconcileReport,
-    SubmitOutcome, SubmitPreparation, okx_order_dispatch_key, reconcile_full_state,
+    CancelOutcome, GatewayError, OkxOrderGateway, OkxReconciliationClient, PreparedOrder,
+    ReconcileReport, SubmitOutcome, SubmitPreparation, okx_order_dispatch_key,
+    reconcile_full_state,
 };
 use reap_storage::{
     BootstrapRecord, OrderAckStatus, OrderOperation, OrderRequestRecord, RecoveredStorage,
@@ -32,11 +37,9 @@ use reap_telemetry::{
     AlertStats, start_webhook_alerts,
 };
 use reap_venue::okx::{
-    HttpTransport, OKX_MIN_ACCOUNT_INSTRUMENT_REQUEST_INTERVAL_MS,
-    OKX_MIN_TRADE_FEE_REQUEST_INTERVAL_MS, OkxAdapter, OkxInstrument, OkxInstrumentType,
-    OkxRestClient, OkxSigner, OkxSystemEnvironment, OkxSystemServiceType, OkxSystemStatus,
-    OkxSystemStatusState, OkxTradeFeeRate, ReqwestTransport, RestError,
-    okx_capability_registration,
+    OKX_MIN_ACCOUNT_INSTRUMENT_REQUEST_INTERVAL_MS, OKX_MIN_TRADE_FEE_REQUEST_INTERVAL_MS,
+    OkxAdapter, OkxInstrument, OkxInstrumentType, OkxSystemEnvironment, OkxSystemServiceType,
+    OkxSystemStatus, OkxSystemStatusState, OkxTradeFeeRate, RestError, okx_capability_registration,
 };
 use reap_venue::{PrivateOrderState, PrivateOrderUpdate, RemoteFill, RemoteOrder, VenueAdapter};
 use serde::{Deserialize, Serialize};
@@ -63,7 +66,7 @@ use crate::{
     start_host_guard, start_operator_service, verify_bootstrap,
 };
 
-type LiveGateway = OkxOrderGateway<ReqwestTransport>;
+type LiveGateway = OkxOrderGateway;
 pub const LIVE_RUN_REPORT_SCHEMA_VERSION: u32 = 8;
 pub const MAX_LIVE_FAILURE_CODE_BYTES: usize = 64;
 pub const MAX_LIVE_FAILURE_MESSAGE_BYTES: usize = 4_096;
@@ -758,10 +761,128 @@ pub async fn run_live(
 
 struct AccountSeed {
     account_id: String,
-    signer: OkxSigner,
-    gateway: LiveGateway,
-    safety_client: OkxRestClient<ReqwestTransport>,
+    readiness: Arc<dyn ReadinessPort>,
+    reconciliation: OkxReconciliationClient,
+    forbidden_observer: ForbiddenOrderObserver,
+    private_state_sessions: PrivateStateSessionFactory,
+    gateway: Option<LiveGateway>,
+    safety: Option<Arc<dyn SafetyPort>>,
+    regular_order_sessions: Option<RegularOrderSessionFactory>,
     instrument_guard: ExchangeInstrumentGuard,
+}
+
+#[async_trait]
+trait ReadinessPort: Send + Sync {
+    async fn server_time_ms(&self) -> Result<u64, RestError> {
+        Err(unimplemented_readiness("server time"))
+    }
+    async fn system_status(&self) -> Result<Vec<OkxSystemStatus>, RestError> {
+        Err(unimplemented_readiness("system status"))
+    }
+    async fn account_config(&self) -> Result<reap_venue::okx::OkxAccountConfig, RestError> {
+        Err(unimplemented_readiness("account config"))
+    }
+    async fn account_balance_snapshot(
+        &self,
+    ) -> Result<reap_venue::okx::OkxAccountBalanceSnapshot, RestError> {
+        Err(unimplemented_readiness("account balance"))
+    }
+    async fn account_positions_snapshot(
+        &self,
+        instrument_type: Option<OkxInstrumentType>,
+        symbol: Option<&str>,
+    ) -> Result<reap_venue::okx::OkxAccountPositionsSnapshot, RestError> {
+        let _ = (instrument_type, symbol);
+        Err(unimplemented_readiness("account positions"))
+    }
+    async fn account_instrument(
+        &self,
+        instrument_type: OkxInstrumentType,
+        symbol: &str,
+    ) -> Result<OkxInstrument, RestError> {
+        let _ = (instrument_type, symbol);
+        Err(unimplemented_readiness("account instrument"))
+    }
+    async fn account_trade_fee(
+        &self,
+        instrument_type: OkxInstrumentType,
+        instrument_id: Option<&str>,
+        instrument_family: Option<&str>,
+        group_id: &str,
+    ) -> Result<OkxTradeFeeRate, RestError> {
+        let _ = (instrument_type, instrument_id, instrument_family, group_id);
+        Err(unimplemented_readiness("account trade fee"))
+    }
+}
+
+fn unimplemented_readiness(operation: &str) -> RestError {
+    RestError::Transport(format!("readiness fake did not implement {operation}"))
+}
+
+#[async_trait]
+impl ReadinessPort for LiveReadiness {
+    async fn server_time_ms(&self) -> Result<u64, RestError> {
+        LiveReadiness::server_time_ms(self).await
+    }
+
+    async fn system_status(&self) -> Result<Vec<OkxSystemStatus>, RestError> {
+        LiveReadiness::system_status(self).await
+    }
+
+    async fn account_config(&self) -> Result<reap_venue::okx::OkxAccountConfig, RestError> {
+        LiveReadiness::account_config(self).await
+    }
+
+    async fn account_balance_snapshot(
+        &self,
+    ) -> Result<reap_venue::okx::OkxAccountBalanceSnapshot, RestError> {
+        LiveReadiness::account_balance_snapshot(self).await
+    }
+
+    async fn account_positions_snapshot(
+        &self,
+        instrument_type: Option<OkxInstrumentType>,
+        symbol: Option<&str>,
+    ) -> Result<reap_venue::okx::OkxAccountPositionsSnapshot, RestError> {
+        LiveReadiness::account_positions_snapshot(self, instrument_type, symbol).await
+    }
+
+    async fn account_instrument(
+        &self,
+        instrument_type: OkxInstrumentType,
+        symbol: &str,
+    ) -> Result<OkxInstrument, RestError> {
+        LiveReadiness::account_instrument(self, instrument_type, symbol).await
+    }
+
+    async fn account_trade_fee(
+        &self,
+        instrument_type: OkxInstrumentType,
+        instrument_id: Option<&str>,
+        instrument_family: Option<&str>,
+        group_id: &str,
+    ) -> Result<OkxTradeFeeRate, RestError> {
+        LiveReadiness::account_trade_fee(
+            self,
+            instrument_type,
+            instrument_id,
+            instrument_family,
+            group_id,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+trait SafetyPort: Send + Sync {
+    async fn cancel_all_after(&self, timeout_secs: u64) -> Result<(), RestError>;
+}
+
+#[async_trait]
+impl SafetyPort for LiveSafety {
+    async fn cancel_all_after(&self, timeout_secs: u64) -> Result<(), RestError> {
+        LiveSafety::cancel_all_after(self, timeout_secs).await
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -794,6 +915,7 @@ struct ExchangeInstrumentGuard {
 async fn bootstrap_accounts(
     config: &LiveConfig,
     restored_orders: &HashMap<String, Vec<reap_core::OrderUpdate>>,
+    mode: LiveMode,
 ) -> Result<
     (
         VerifiedBootstrap,
@@ -805,10 +927,9 @@ async fn bootstrap_accounts(
     let mut snapshots = HashMap::new();
     let mut seeds = Vec::new();
     for account in &config.accounts {
-        let credentials = account.credentials_from_env()?;
-        let signer = OkxSigner::new(credentials, config.venue.environment.is_demo());
-        let transport = ReqwestTransport::with_timeouts(
-            &config.venue.rest_url,
+        let connection = ConnectionSettings::new(
+            config.venue.rest_url.clone(),
+            config.venue.environment.is_demo(),
             Duration::from_millis(config.runtime.rest_connect_timeout_ms),
             Duration::from_millis(config.runtime.rest_request_timeout_ms),
         )
@@ -816,26 +937,94 @@ async fn bootstrap_accounts(
             account_id: account.id.clone(),
             message: error.to_string(),
         })?;
-        let client = OkxRestClient::new(transport, signer.clone()).with_order_request_expiry(
-            Duration::from_millis(config.runtime.order_request_expiry_ms),
-        );
+        let credential_env = CredentialEnvNames::new(
+            account.api_key_env.clone(),
+            account.secret_key_env.clone(),
+            account.passphrase_env.clone(),
+        )
+        .map_err(|error| LiveRuntimeError::Bootstrap {
+            account_id: account.id.clone(),
+            message: error.to_string(),
+        })?;
         let trade_modes = account
             .trade_modes
             .iter()
             .map(|(symbol, mode)| (symbol.clone(), (*mode).into()))
             .collect();
-        let gateway = OkxOrderGateway::new(
-            client.clone(),
-            account.id_prefix.clone(),
-            account.node_id,
-            trade_modes,
+        let (
+            readiness,
+            live_reconciliation,
+            forbidden_observer,
+            private_state_sessions,
+            gateway,
+            safety,
+            regular_order_sessions,
+        ) = match mode {
+            LiveMode::Observe => {
+                let roles = observe_from_env(
+                    connection,
+                    credential_env,
+                    config.venue.enable_vip_fills_channel,
+                )
+                .map_err(|error| LiveRuntimeError::Bootstrap {
+                    account_id: account.id.clone(),
+                    message: error.to_string(),
+                })?;
+                (
+                    Arc::new(roles.readiness()) as Arc<dyn ReadinessPort>,
+                    roles.reconciliation(),
+                    roles.forbidden_observer(),
+                    roles.private_state_sessions(),
+                    None,
+                    None,
+                    None,
+                )
+            }
+            LiveMode::Demo => {
+                let roles = demo_from_env(
+                    connection,
+                    credential_env,
+                    config.venue.enable_vip_fills_channel,
+                )
+                .map_err(|error| LiveRuntimeError::Bootstrap {
+                    account_id: account.id.clone(),
+                    message: error.to_string(),
+                })?;
+                let reconciliation = roles.observe().reconciliation();
+                let gateway = OkxOrderGateway::new(
+                    Arc::new(roles.execution()),
+                    Arc::new(reconciliation.clone()),
+                    account.id_prefix.clone(),
+                    account.node_id,
+                    trade_modes,
+                    config.runtime.pacing_policy(),
+                )
+                .map_err(|error| LiveRuntimeError::GatewaySetup {
+                    account_id: account.id.clone(),
+                    message: error.to_string(),
+                })?;
+                (
+                    Arc::new(roles.observe().readiness()) as Arc<dyn ReadinessPort>,
+                    reconciliation,
+                    roles.observe().forbidden_observer(),
+                    roles.observe().private_state_sessions(),
+                    Some(gateway),
+                    Some(Arc::new(roles.safety()) as Arc<dyn SafetyPort>),
+                    Some(roles.regular_order_sessions()),
+                )
+            }
+            LiveMode::Validate => {
+                return Err(LiveRuntimeError::Bootstrap {
+                    account_id: account.id.clone(),
+                    message: "validate mode cannot construct network authority".to_string(),
+                });
+            }
+        };
+        let reconciliation = OkxReconciliationClient::new(
+            Arc::new(live_reconciliation),
             config.runtime.pacing_policy(),
-        )
-        .map_err(|error| LiveRuntimeError::GatewaySetup {
-            account_id: account.id.clone(),
-            message: error.to_string(),
-        })?;
-        let clock_skew_ms = rest_clock_skew_ms(&client)
+        );
+        let clock_skew_ms = rest_clock_skew_ms(readiness.as_ref())
             .await
             .map_err(|error| bootstrap_error(&account.id, "exchange clock", error.to_string()))?;
         if clock_skew_ms > config.runtime.max_exchange_clock_skew_ms {
@@ -849,7 +1038,7 @@ async fn bootstrap_accounts(
             ));
         }
         if seeds.is_empty() {
-            let statuses = client
+            let statuses = readiness
                 .system_status()
                 .await
                 .map_err(|error| LiveRuntimeError::ExchangeStatusCheck(error.to_string()))?;
@@ -862,24 +1051,23 @@ async fn bootstrap_accounts(
                 return Err(LiveRuntimeError::ExchangeStatus(reason));
             }
         }
-        let safety_client = client.clone();
-        let account_config = client
+        let account_config = readiness
             .account_config()
             .await
             .map_err(|error| bootstrap_error(&account.id, "account config", error.to_string()))?;
-        let balance_economics = client
+        let balance_economics = readiness
             .account_balance_snapshot()
             .await
             .map_err(|error| bootstrap_error(&account.id, "account balance", error.to_string()))?;
         let balance = balance_economics.account_update();
-        let position_risks = client
+        let position_risks = readiness
             .account_positions_snapshot(None, None)
             .await
             .map_err(|error| {
                 bootstrap_error(&account.id, "account positions", error.to_string())
             })?;
         let positions = position_risks.account_update();
-        let (mut open_orders, recent_fills) = gateway
+        let (mut open_orders, recent_fills) = reconciliation
             .fetch_remote_state(
                 None,
                 None,
@@ -902,8 +1090,8 @@ async fn bootstrap_accounts(
             if remote_ids.contains(&restored.order_id) {
                 continue;
             }
-            let details = match client
-                .order_details(&restored.symbol, None, Some(&restored.order_id))
+            let details = match reconciliation
+                .fetch_order_details(&restored.symbol, &restored.order_id)
                 .await
             {
                 Ok(details) => details,
@@ -945,7 +1133,7 @@ async fn bootstrap_accounts(
                 ))
                 .await;
             }
-            let metadata = client
+            let metadata = readiness
                 .account_instrument(okx_instrument_type(instrument.kind), &instrument.symbol)
                 .await
                 .map_err(|error| {
@@ -963,7 +1151,7 @@ async fn bootstrap_accounts(
             expectations: exchange_instrument_expectations(config, &account.id, &instruments)?,
         };
         verify_initial_exchange_instruments(&account.id, &instrument_guard, unix_time_ms())?;
-        verify_initial_exchange_fees(&account.id, &client, &instrument_guard).await?;
+        verify_initial_exchange_fees(&account.id, readiness.as_ref(), &instrument_guard).await?;
         snapshots.insert(
             account.id.clone(),
             AccountBootstrapSnapshot {
@@ -979,9 +1167,13 @@ async fn bootstrap_accounts(
         );
         seeds.push(AccountSeed {
             account_id: account.id.clone(),
-            signer,
+            readiness,
+            reconciliation,
+            forbidden_observer,
+            private_state_sessions,
             gateway,
-            safety_client,
+            safety,
+            regular_order_sessions,
             instrument_guard,
         });
     }
@@ -990,10 +1182,7 @@ async fn bootstrap_accounts(
     Ok((verified, seeds, snapshots))
 }
 
-async fn rest_clock_skew_ms<T>(client: &OkxRestClient<T>) -> Result<u64, RestError>
-where
-    T: HttpTransport,
-{
+async fn rest_clock_skew_ms(client: &dyn ReadinessPort) -> Result<u64, RestError> {
     let before_ms = unix_time_ms();
     let exchange_ms = client.server_time_ms().await?;
     let after_ms = unix_time_ms();
@@ -1060,13 +1249,10 @@ fn exchange_instrument_expectations(
         .collect()
 }
 
-async fn fetch_exchange_fee<T>(
-    client: &OkxRestClient<T>,
+async fn fetch_exchange_fee(
+    client: &dyn ReadinessPort,
     expectation: &ExchangeInstrumentExpectation,
-) -> Result<OkxTradeFeeRate, RestError>
-where
-    T: HttpTransport,
-{
+) -> Result<OkxTradeFeeRate, RestError> {
     client
         .account_trade_fee(
             expectation.instrument_type,
@@ -1236,14 +1422,11 @@ fn verify_initial_exchange_instruments(
     Ok(())
 }
 
-async fn verify_initial_exchange_fees<T>(
+async fn verify_initial_exchange_fees(
     account_id: &str,
-    client: &OkxRestClient<T>,
+    client: &dyn ReadinessPort,
     guard: &ExchangeInstrumentGuard,
-) -> Result<(), LiveRuntimeError>
-where
-    T: HttpTransport,
-{
+) -> Result<(), LiveRuntimeError> {
     for (index, expectation) in guard.expectations.iter().enumerate() {
         if index > 0 {
             tokio::time::sleep(Duration::from_millis(OKX_MIN_TRADE_FEE_REQUEST_INTERVAL_MS)).await;
@@ -1730,7 +1913,7 @@ impl LiveRuntime {
                 .push(update.clone());
         }
         let (mut verified, seeds, snapshots) =
-            bootstrap_accounts(&config, &restored_by_account).await?;
+            bootstrap_accounts(&config, &restored_by_account, mode).await?;
         let account_identity_sha256s = account_identity_sha256s(&config, &snapshots)?;
         let session_id = format!("{:x}", unix_time_ns());
         let mut startup_records = Vec::new();
@@ -1947,15 +2130,22 @@ impl LiveRuntime {
         for (seed_index, seed) in seeds.into_iter().enumerate() {
             let AccountSeed {
                 account_id,
-                signer,
-                mut gateway,
-                safety_client,
+                readiness,
+                reconciliation,
+                forbidden_observer,
+                private_state_sessions,
+                gateway,
+                safety,
+                regular_order_sessions,
                 instrument_guard,
             } = seed;
-            let deadman_timeout_secs =
-                (mode == LiveMode::Demo).then_some(config.runtime.cancel_all_after_timeout_secs);
-            if let Some(timeout_secs) = deadman_timeout_secs {
-                safety_client
+            // Phase 4 wires the already-narrow observer into its recurring scan.
+            let _forbidden_order_observer = forbidden_observer;
+            let deadman_timeout_secs = safety
+                .as_ref()
+                .map(|_| config.runtime.cancel_all_after_timeout_secs);
+            if let (Some(timeout_secs), Some(safety)) = (deadman_timeout_secs, safety.as_ref()) {
+                safety
                     .cancel_all_after(timeout_secs)
                     .await
                     .map_err(|error| LiveRuntimeError::GatewaySetup {
@@ -1972,7 +2162,8 @@ impl LiveRuntime {
                 .clone();
             safety_tasks.push(tokio::spawn(run_account_safety_task(
                 account_id.clone(),
-                safety_client,
+                readiness,
+                safety,
                 expected_account_config,
                 safety_rx,
                 control_tx.clone(),
@@ -1998,7 +2189,7 @@ impl LiveRuntime {
             let mut private_feed = spawn_supervised_feed(
                 Arc::clone(&private_adapter),
                 private_plans.clone(),
-                okx_login_bootstrap(signer.clone()),
+                private_state_sessions.bootstrap_factory(),
                 config.runtime.feed_channel_capacity,
                 connection_attempt_pacer.clone(),
                 ReconnectPolicy::default(),
@@ -2012,7 +2203,9 @@ impl LiveRuntime {
             spawn_feed_forwarders(source_id, &mut private_feed, &feed_tx, &mut feed_tasks);
             feeds.push(private_feed);
 
-            if mode == LiveMode::Demo {
+            if let (Some(mut gateway), Some(order_session_factory)) =
+                (gateway, regular_order_sessions)
+            {
                 let session_count = config.runtime.order_websocket_sessions;
                 let command_capacity = config
                     .runtime
@@ -2023,7 +2216,7 @@ impl LiveRuntime {
                     spawn_okx_order_ws(OkxOrderWsConfig {
                         account_id: account_id.clone(),
                         websocket_url: config.venue.order_ws_url().to_string(),
-                        signer,
+                        session_factory: Arc::new(order_session_factory),
                         session_count,
                         command_capacity,
                         request_expiry: Duration::from_millis(
@@ -2049,24 +2242,23 @@ impl LiveRuntime {
                     }
                 }));
                 order_ws_runtimes.push(order_ws_runtime);
+                let (order_tx, order_rx) = mpsc::channel(config.runtime.order_channel_capacity);
+                order_senders.insert(account_id.clone(), order_tx);
+                order_tasks.push(tokio::spawn(run_order_task(
+                    account_id.clone(),
+                    gateway,
+                    order_rx,
+                    control_tx.clone(),
+                    config.runtime.order_websocket_sessions,
+                    config.runtime.order_channel_capacity,
+                )));
             }
 
-            let io = gateway.io_client();
-            let (order_tx, order_rx) = mpsc::channel(config.runtime.order_channel_capacity);
-            order_senders.insert(account_id.clone(), order_tx);
-            order_tasks.push(tokio::spawn(run_order_task(
-                account_id.clone(),
-                gateway,
-                order_rx,
-                control_tx.clone(),
-                config.runtime.order_websocket_sessions,
-                config.runtime.order_channel_capacity,
-            )));
             let (reconcile_tx, reconcile_rx) = mpsc::channel(8);
             reconcile_senders.insert(account_id.clone(), reconcile_tx);
             reconcile_tasks.push(tokio::spawn(run_reconcile_task(
                 account_id,
-                io,
+                reconciliation,
                 reconcile_rx,
                 control_tx.clone(),
                 config.runtime.ambiguous_submit_grace_ms,
@@ -4224,17 +4416,15 @@ impl OrderTaskCompletion {
     }
 }
 
-async fn run_order_task<T>(
+async fn run_order_task(
     account_id: String,
-    mut gateway: OkxOrderGateway<T>,
+    mut gateway: OkxOrderGateway,
     mut commands: mpsc::Receiver<OrderTaskCommand>,
     events: mpsc::Sender<RuntimeEvent>,
     max_inflight: usize,
     max_pending: usize,
-) where
-    T: HttpTransport + Clone + 'static,
-{
-    let io = gateway.io_client();
+) {
+    let io = gateway.command_client();
     let max_inflight = max_inflight.max(1);
     let max_pending = max_pending.max(1);
     let mut pending = HashMap::<String, VecDeque<OrderTaskCommand>>::new();
@@ -4439,15 +4629,12 @@ fn make_dispatch_key_ready(
     }
 }
 
-async fn emit_order_task_completion<T>(
+async fn emit_order_task_completion(
     account_id: &str,
-    gateway: &mut OkxOrderGateway<T>,
+    gateway: &mut OkxOrderGateway,
     events: &mpsc::Sender<RuntimeEvent>,
     completion: OrderTaskCompletion,
-) -> bool
-where
-    T: HttpTransport,
-{
+) -> bool {
     let event = match completion {
         OrderTaskCompletion::Submit {
             symbol,
@@ -4505,17 +4692,15 @@ where
     events.send(event).await.is_ok()
 }
 
-async fn run_reconcile_task<T>(
+async fn run_reconcile_task(
     account_id: String,
-    io: OkxGatewayIo<T>,
+    io: OkxReconciliationClient,
     mut commands: mpsc::Receiver<ReconcileTaskCommand>,
     events: mpsc::Sender<RuntimeEvent>,
     ambiguous_submit_grace_ms: u64,
     max_order_reconciliation_pages: usize,
     max_fill_reconciliation_pages: usize,
-) where
-    T: HttpTransport + 'static,
-{
+) {
     while let Some(command) = commands.recv().await {
         let ReconcileTaskCommand::Reconcile {
             restored_orders,
@@ -4568,16 +4753,13 @@ async fn run_reconcile_task<T>(
     }
 }
 
-async fn reconcile_remote_account<T>(
-    io: &OkxGatewayIo<T>,
+async fn reconcile_remote_account(
+    io: &OkxReconciliationClient,
     restored_orders: Vec<ReconcileOrderRef>,
     ambiguous_submit_grace_ms: u64,
     max_order_reconciliation_pages: usize,
     max_fill_reconciliation_pages: usize,
-) -> Result<(Vec<RemoteOrder>, Vec<RemoteFill>, AccountUpdate), String>
-where
-    T: HttpTransport,
-{
+) -> Result<(Vec<RemoteOrder>, Vec<RemoteFill>, AccountUpdate), String> {
     let (mut remote_orders, remote_fills) = io
         .fetch_remote_state(
             None,
@@ -4634,14 +4816,11 @@ where
     Ok((remote_orders, remote_fills, remote_account))
 }
 
-async fn run_exchange_instrument_guard<T>(
+async fn run_exchange_instrument_guard(
     account_id: String,
-    client: OkxRestClient<T>,
+    client: Arc<dyn ReadinessPort>,
     guard: ExchangeInstrumentGuard,
-) -> RuntimeTaskFailure
-where
-    T: HttpTransport,
-{
+) -> RuntimeTaskFailure {
     if guard.expectations.is_empty() {
         return std::future::pending::<RuntimeTaskFailure>().await;
     }
@@ -4677,7 +4856,7 @@ where
                 "account {account_id}: {reason}"
             ));
         }
-        let rate = match fetch_exchange_fee(&client, expectation).await {
+        let rate = match fetch_exchange_fee(client.as_ref(), expectation).await {
             Ok(rate) => rate,
             Err(error) => {
                 return RuntimeTaskFailure::ExchangeFeeCheck(format!(
@@ -4699,9 +4878,10 @@ fn exchange_fee_request_interval_ms(sweep_interval_ms: u64, instrument_count: us
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_account_safety_task<T>(
+async fn run_account_safety_task(
     account_id: String,
-    client: OkxRestClient<T>,
+    readiness: Arc<dyn ReadinessPort>,
+    safety: Option<Arc<dyn SafetyPort>>,
     expected_account_config: reap_venue::okx::OkxAccountConfig,
     mut commands: mpsc::Receiver<SafetyTaskCommand>,
     events: mpsc::Sender<RuntimeEvent>,
@@ -4711,12 +4891,10 @@ async fn run_account_safety_task<T>(
     max_clock_skew_ms: u64,
     exchange_status_guard: ExchangeStatusGuard,
     exchange_instrument_guard: ExchangeInstrumentGuard,
-) where
-    T: HttpTransport + Clone + 'static,
-{
+) {
     let mut instrument_task = tokio::spawn(run_exchange_instrument_guard(
         account_id.clone(),
-        client.clone(),
+        readiness.clone(),
         exchange_instrument_guard,
     ));
     let mut deadman = tokio::time::interval(Duration::from_millis(deadman_heartbeat_ms));
@@ -4745,9 +4923,10 @@ async fn run_account_safety_task<T>(
                 let Some(command) = command else { break None; };
                 match command {
                     SafetyTaskCommand::DisableDeadMan { result } => {
-                        let disabled = match deadman_timeout_secs {
-                            Some(_) => client.cancel_all_after(0).await.map_err(|error| error.to_string()),
-                            None => Ok(()),
+                        let disabled = match (deadman_timeout_secs, safety.as_ref()) {
+                            (Some(_), Some(safety)) => safety.cancel_all_after(0).await.map_err(|error| error.to_string()),
+                            (None, _) => Ok(()),
+                            (Some(_), None) => Err("dead-man authority is absent".to_string()),
                         };
                         if disabled.is_ok() {
                             deadman_timeout_secs = None;
@@ -4759,14 +4938,19 @@ async fn run_account_safety_task<T>(
             }
             _ = deadman.tick(), if deadman_timeout_secs.is_some() => {
                 let timeout_secs = deadman_timeout_secs.expect("guarded dead-man timeout");
-                if let Err(error) = client.cancel_all_after(timeout_secs).await {
+                let Some(safety) = safety.as_ref() else {
+                    break Some(RuntimeTaskFailure::DeadmanHeartbeat(format!(
+                        "account {account_id}: dead-man authority is absent"
+                    )));
+                };
+                if let Err(error) = safety.cancel_all_after(timeout_secs).await {
                     break Some(RuntimeTaskFailure::DeadmanHeartbeat(format!(
                         "account {account_id}: {error}"
                     )));
                 }
             }
             _ = clock.tick() => {
-                match rest_clock_skew_ms(&client).await {
+                match rest_clock_skew_ms(readiness.as_ref()).await {
                     Ok(skew_ms) if skew_ms <= max_clock_skew_ms => {}
                     Ok(skew_ms) => {
                         break Some(RuntimeTaskFailure::ExchangeClockSkew(format!(
@@ -4779,7 +4963,7 @@ async fn run_account_safety_task<T>(
                         )));
                     }
                 }
-                match client.account_config().await {
+                match readiness.account_config().await {
                     Ok(current) if current == expected_account_config => {}
                     Ok(_) => {
                         break Some(RuntimeTaskFailure::AccountConfigDrift(format!(
@@ -4794,7 +4978,7 @@ async fn run_account_safety_task<T>(
                 }
             }
             _ = exchange_status.tick(), if exchange_status_guard.enabled => {
-                match client.system_status().await {
+                match readiness.system_status().await {
                     Ok(statuses) => {
                         if let Some(reason) = exchange_status_block_reason(
                             &statuses,
@@ -5227,17 +5411,25 @@ mod tests {
 
     use async_trait::async_trait;
     use reap_core::{AccountUpdate, Balance, NewOrder, OrderEvent, OrderUpdate, Side, TimeInForce};
-    use reap_order::{OkxOrderTransport, OrderTransportError, PacingPolicy};
+    use reap_order::{
+        OkxOrderTransport, OrderTransportError, PacingPolicy, RegularExecution,
+        RegularReconciliation,
+    };
     use reap_risk::{
         InstrumentOrderLimits, InstrumentRiskModel, RiskLimits, StablecoinGuardConfig,
     };
     use reap_storage::{acquire_storage_lease, start_jsonl_storage};
     use reap_strategy::{ChaosConfig, InstrumentKindConfig};
     use reap_venue::okx::{
-        HttpResponse, OkxAccountConfig, OkxAccountLevel, OkxApiKeyPermission, OkxCancelOrder,
-        OkxCredentials, OkxInstrumentChange, OkxInstrumentChangeParameter, OkxInstrumentType,
-        OkxOrderAck, OkxPlaceOrder, OkxPositionMode, OkxRestClient, OkxSigner, OkxTradeMode,
-        RestError, SignedRequest,
+        OkxAccountConfig, OkxAccountLevel, OkxApiKeyPermission, OkxCancelOrder, OkxFillPage,
+        OkxInstrumentChange, OkxInstrumentChangeParameter, OkxInstrumentType, OkxOrderAck,
+        OkxPlaceOrder, OkxPositionMode, OkxRegularOrderPage, OkxTradeMode, RestError,
+        parse_okx_account_balance_response_json, parse_okx_account_config_response_json,
+        parse_okx_account_instruments_response_json, parse_okx_account_positions_response_json,
+        parse_okx_cancel_all_after_response_json, parse_okx_fill_page_response_json,
+        parse_okx_order_ack_response_json, parse_okx_order_details_response_json,
+        parse_okx_regular_order_page_response_json, parse_okx_server_time_response_json,
+        parse_okx_system_status_response_json, parse_okx_trade_fee_response_json,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{Notify, Semaphore, oneshot};
@@ -5248,6 +5440,13 @@ mod tests {
     };
 
     use super::*;
+
+    #[derive(Clone)]
+    struct HttpResponse {
+        #[allow(dead_code)]
+        status: u16,
+        body: String,
+    }
 
     struct TaskDropSignal(Option<oneshot::Sender<()>>);
 
@@ -5296,18 +5495,78 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct RuntimeMockHttp {
+    struct RuntimeMockRoles {
         responses: Arc<Mutex<VecDeque<Result<HttpResponse, RestError>>>>,
     }
 
-    #[async_trait]
-    impl HttpTransport for RuntimeMockHttp {
-        async fn execute(&self, _request: SignedRequest) -> Result<HttpResponse, RestError> {
+    impl RuntimeMockRoles {
+        fn next(&self) -> Result<HttpResponse, RestError> {
             self.responses
                 .lock()
                 .unwrap()
                 .pop_front()
                 .expect("unexpected runtime mock HTTP request")
+        }
+    }
+
+    #[async_trait]
+    impl RegularExecution for RuntimeMockRoles {
+        async fn cancel_regular_order(
+            &self,
+            _order: &OkxCancelOrder,
+        ) -> Result<OkxOrderAck, RestError> {
+            let response = self.next()?;
+            parse_okx_order_ack_response_json(response.body.as_bytes(), "cancel order")
+        }
+    }
+
+    #[async_trait]
+    impl RegularReconciliation for RuntimeMockRoles {
+        async fn regular_pending_orders_page(
+            &self,
+            _instrument_type: Option<&str>,
+            _symbol: Option<&str>,
+            _after: Option<&str>,
+        ) -> Result<OkxRegularOrderPage, RestError> {
+            let response = self.next()?;
+            parse_okx_regular_order_page_response_json(response.body.as_bytes())
+        }
+
+        async fn recent_fills_page(
+            &self,
+            _instrument_type: Option<&str>,
+            _symbol: Option<&str>,
+            _after: Option<&str>,
+        ) -> Result<OkxFillPage, RestError> {
+            let response = self.next()?;
+            parse_okx_fill_page_response_json(response.body.as_bytes())
+        }
+
+        async fn account_balance(&self) -> Result<AccountUpdate, RestError> {
+            let response = self.next()?;
+            Ok(parse_okx_account_balance_response_json(response.body.as_bytes())?.account_update())
+        }
+
+        async fn account_positions(&self) -> Result<AccountUpdate, RestError> {
+            let response = self.next()?;
+            Ok(
+                parse_okx_account_positions_response_json(response.body.as_bytes())?
+                    .account_update(),
+            )
+        }
+
+        async fn order_details(
+            &self,
+            _symbol: &str,
+            _client_order_id: &str,
+        ) -> Result<RemoteOrder, RestError> {
+            let response = self.next()?;
+            Ok(parse_okx_order_details_response_json(response.body.as_bytes())?.order)
+        }
+
+        async fn server_time_ms(&self) -> Result<u64, RestError> {
+            let response = self.next()?;
+            parse_okx_server_time_response_json(response.body.as_bytes())
         }
     }
 
@@ -5375,15 +5634,13 @@ mod tests {
     fn runtime_order_gateway(
         symbols: &[&str],
         responses: Vec<Result<HttpResponse, RestError>>,
-    ) -> OkxOrderGateway<RuntimeMockHttp> {
-        let client = OkxRestClient::new(
-            RuntimeMockHttp {
-                responses: Arc::new(Mutex::new(responses.into())),
-            },
-            OkxSigner::new(OkxCredentials::new("key", "secret", "pass"), true),
-        );
+    ) -> OkxOrderGateway {
+        let roles = Arc::new(RuntimeMockRoles {
+            responses: Arc::new(Mutex::new(responses.into())),
+        });
         OkxOrderGateway::new(
-            client,
+            Arc::clone(&roles) as Arc<dyn RegularExecution>,
+            roles as Arc<dyn RegularReconciliation>,
             "reap",
             1,
             symbols
@@ -5562,7 +5819,7 @@ mod tests {
         let mut gateway = runtime_order_gateway(&[symbol], responses);
         let (transport, mut started, gates, _) = gated_order_transport(&[symbol]);
         gateway.set_order_transport(Box::new(transport));
-        let io = gateway.io_client();
+        let io = gateway.reconciliation_client();
         let (command_tx, command_rx) = mpsc::channel(8);
         let (reconcile_tx, reconcile_rx) = mpsc::channel(2);
         let (event_tx, mut event_rx) = mpsc::channel(8);
@@ -5727,93 +5984,195 @@ mod tests {
         assert_eq!(first.len(), 64);
     }
 
-    #[derive(Clone)]
-    struct SafetyMockTransport {
-        responses: Arc<Mutex<VecDeque<Result<String, RestError>>>>,
-        requests: Arc<Mutex<Vec<SignedRequest>>>,
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedRoleRequest {
+        path: String,
+        body: String,
     }
 
-    #[async_trait]
-    impl HttpTransport for SafetyMockTransport {
-        async fn execute(&self, request: SignedRequest) -> Result<HttpResponse, RestError> {
-            self.requests.lock().unwrap().push(request);
-            let body = self
-                .responses
+    struct SafetyMockPort {
+        responses: Arc<Mutex<VecDeque<Result<String, RestError>>>>,
+        requests: Arc<Mutex<Vec<RecordedRoleRequest>>>,
+    }
+
+    impl SafetyMockPort {
+        fn next(
+            &self,
+            path: impl Into<String>,
+            body: impl Into<String>,
+        ) -> Result<String, RestError> {
+            self.requests.lock().unwrap().push(RecordedRoleRequest {
+                path: path.into(),
+                body: body.into(),
+            });
+            self.responses
                 .lock()
                 .unwrap()
                 .pop_front()
-                .expect("mock response");
-            Ok(HttpResponse {
-                status: 200,
-                body: body?,
-            })
+                .expect("mock role response")
         }
     }
 
-    #[derive(Clone)]
-    struct BlockingFeeTransport {
+    #[async_trait]
+    impl ReadinessPort for SafetyMockPort {
+        async fn server_time_ms(&self) -> Result<u64, RestError> {
+            let body = self.next("/api/v5/public/time", "")?;
+            parse_okx_server_time_response_json(body.as_bytes())
+        }
+
+        async fn system_status(&self) -> Result<Vec<OkxSystemStatus>, RestError> {
+            let body = self.next("/api/v5/system/status", "")?;
+            parse_okx_system_status_response_json(body.as_bytes())
+        }
+
+        async fn account_config(&self) -> Result<OkxAccountConfig, RestError> {
+            let body = self.next("/api/v5/account/config", "")?;
+            parse_okx_account_config_response_json(body.as_bytes())
+        }
+
+        async fn account_balance_snapshot(
+            &self,
+        ) -> Result<reap_venue::okx::OkxAccountBalanceSnapshot, RestError> {
+            let body = self.next("/api/v5/account/balance", "")?;
+            parse_okx_account_balance_response_json(body.as_bytes())
+        }
+
+        async fn account_positions_snapshot(
+            &self,
+            _instrument_type: Option<OkxInstrumentType>,
+            _symbol: Option<&str>,
+        ) -> Result<reap_venue::okx::OkxAccountPositionsSnapshot, RestError> {
+            let body = self.next("/api/v5/account/positions", "")?;
+            parse_okx_account_positions_response_json(body.as_bytes())
+        }
+
+        async fn account_instrument(
+            &self,
+            instrument_type: OkxInstrumentType,
+            symbol: &str,
+        ) -> Result<OkxInstrument, RestError> {
+            let path = format!(
+                "/api/v5/account/instruments?instType={}&instId={symbol}",
+                instrument_type.as_str()
+            );
+            let body = self.next(path, "")?;
+            parse_okx_account_instruments_response_json(body.as_bytes())?
+                .into_iter()
+                .next()
+                .ok_or(RestError::EmptyData {
+                    operation: "account instrument",
+                })
+        }
+
+        async fn account_trade_fee(
+            &self,
+            instrument_type: OkxInstrumentType,
+            instrument_id: Option<&str>,
+            instrument_family: Option<&str>,
+            group_id: &str,
+        ) -> Result<OkxTradeFeeRate, RestError> {
+            let selector = instrument_id
+                .map(|value| format!("&instId={value}"))
+                .or_else(|| instrument_family.map(|value| format!("&instFamily={value}")))
+                .unwrap_or_default();
+            let path = format!(
+                "/api/v5/account/trade-fee?instType={}{}",
+                instrument_type.as_str(),
+                selector
+            );
+            let body = self.next(path, "")?;
+            parse_okx_trade_fee_response_json(body.as_bytes())?
+                .into_iter()
+                .find(|rate| rate.group_id == group_id)
+                .ok_or(RestError::EmptyData {
+                    operation: "account trade fee",
+                })
+        }
+    }
+
+    #[async_trait]
+    impl SafetyPort for SafetyMockPort {
+        async fn cancel_all_after(&self, timeout_secs: u64) -> Result<(), RestError> {
+            let body = format!(r#"{{"timeOut":"{timeout_secs}"}}"#);
+            let response = self.next("/api/v5/trade/cancel-all-after", body)?;
+            parse_okx_cancel_all_after_response_json(response.as_bytes(), timeout_secs)
+        }
+    }
+
+    struct BlockingFeePort {
         fee_started: Arc<Notify>,
-        deadman_seen: Arc<Notify>,
     }
 
     #[async_trait]
-    impl HttpTransport for BlockingFeeTransport {
-        async fn execute(&self, request: SignedRequest) -> Result<HttpResponse, RestError> {
-            if request.path.starts_with("/api/v5/account/instruments?") {
-                return Ok(HttpResponse {
-                    status: 200,
-                    body: spot_instrument_response().to_string(),
-                });
-            }
-            if request.path.starts_with("/api/v5/account/trade-fee?") {
-                self.fee_started.notify_one();
-                return std::future::pending().await;
-            }
-            if request.path == "/api/v5/trade/cancel-all-after" {
-                self.deadman_seen.notify_one();
-                return Ok(HttpResponse {
-                    status: 200,
-                    body: r#"{"code":"0","msg":"","data":[{"triggerTime":"1","tag":"","ts":"1"}]}"#
-                        .to_string(),
-                });
-            }
-            panic!("unexpected blocking-fee request {}", request.path);
+    impl ReadinessPort for BlockingFeePort {
+        async fn account_instrument(
+            &self,
+            _instrument_type: OkxInstrumentType,
+            _symbol: &str,
+        ) -> Result<OkxInstrument, RestError> {
+            Ok(
+                parse_okx_account_instruments_response_json(spot_instrument_response().as_bytes())?
+                    .into_iter()
+                    .next()
+                    .unwrap(),
+            )
+        }
+
+        async fn account_trade_fee(
+            &self,
+            _instrument_type: OkxInstrumentType,
+            _instrument_id: Option<&str>,
+            _instrument_family: Option<&str>,
+            _group_id: &str,
+        ) -> Result<OkxTradeFeeRate, RestError> {
+            self.fee_started.notify_one();
+            std::future::pending().await
         }
     }
 
-    #[derive(Clone)]
-    struct BlockingInstrumentTransport {
+    struct BlockingInstrumentPort {
         instrument_started: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl ReadinessPort for BlockingInstrumentPort {
+        async fn account_instrument(
+            &self,
+            _instrument_type: OkxInstrumentType,
+            _symbol: &str,
+        ) -> Result<OkxInstrument, RestError> {
+            self.instrument_started.notify_one();
+            std::future::pending().await
+        }
+
+        async fn account_trade_fee(
+            &self,
+            _instrument_type: OkxInstrumentType,
+            _instrument_id: Option<&str>,
+            _instrument_family: Option<&str>,
+            _group_id: &str,
+        ) -> Result<OkxTradeFeeRate, RestError> {
+            panic!("fee should not run while the instrument request is blocked")
+        }
+    }
+
+    struct NotifyingSafety {
         deadman_seen: Arc<Notify>,
     }
 
     #[async_trait]
-    impl HttpTransport for BlockingInstrumentTransport {
-        async fn execute(&self, request: SignedRequest) -> Result<HttpResponse, RestError> {
-            if request.path.starts_with("/api/v5/account/instruments?") {
-                self.instrument_started.notify_one();
-                return std::future::pending().await;
-            }
-            if request.path == "/api/v5/trade/cancel-all-after" {
-                self.deadman_seen.notify_one();
-                return Ok(HttpResponse {
-                    status: 200,
-                    body: r#"{"code":"0","msg":"","data":[{"triggerTime":"1","tag":"","ts":"1"}]}"#
-                        .to_string(),
-                });
-            }
-            panic!("unexpected blocking-instrument request {}", request.path);
+    impl SafetyPort for NotifyingSafety {
+        async fn cancel_all_after(&self, _timeout_secs: u64) -> Result<(), RestError> {
+            self.deadman_seen.notify_one();
+            Ok(())
         }
     }
 
     fn safety_client(
         responses: Vec<Result<&str, RestError>>,
-    ) -> (
-        OkxRestClient<SafetyMockTransport>,
-        Arc<Mutex<Vec<SignedRequest>>>,
-    ) {
+    ) -> (Arc<SafetyMockPort>, Arc<Mutex<Vec<RecordedRoleRequest>>>) {
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let transport = SafetyMockTransport {
+        let port = Arc::new(SafetyMockPort {
             responses: Arc::new(Mutex::new(
                 responses
                     .into_iter()
@@ -5821,9 +6180,8 @@ mod tests {
                     .collect(),
             )),
             requests: Arc::clone(&requests),
-        };
-        let signer = OkxSigner::new(OkxCredentials::new("key", "secret", "pass"), true);
-        (OkxRestClient::new(transport, signer), requests)
+        });
+        (port, requests)
     }
 
     fn safety_account_config() -> OkxAccountConfig {
@@ -7491,7 +7849,8 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::channel(2);
         let task = tokio::spawn(run_account_safety_task(
             "main".to_string(),
-            client,
+            client.clone(),
+            Some(client),
             safety_account_config(),
             command_rx,
             event_tx,
@@ -7526,7 +7885,8 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(2);
         let task = tokio::spawn(run_account_safety_task(
             "main".to_string(),
-            client,
+            client.clone(),
+            Some(client),
             safety_account_config(),
             command_rx,
             event_tx,
@@ -7554,18 +7914,18 @@ mod tests {
     async fn blocked_exchange_fee_check_does_not_delay_deadman_heartbeat() {
         let fee_started = Arc::new(Notify::new());
         let deadman_seen = Arc::new(Notify::new());
-        let client = OkxRestClient::new(
-            BlockingFeeTransport {
-                fee_started: Arc::clone(&fee_started),
-                deadman_seen: Arc::clone(&deadman_seen),
-            },
-            OkxSigner::new(OkxCredentials::new("key", "secret", "pass"), true),
-        );
+        let readiness: Arc<dyn ReadinessPort> = Arc::new(BlockingFeePort {
+            fee_started: Arc::clone(&fee_started),
+        });
+        let safety: Arc<dyn SafetyPort> = Arc::new(NotifyingSafety {
+            deadman_seen: Arc::clone(&deadman_seen),
+        });
         let (command_tx, command_rx) = mpsc::channel(2);
         let (event_tx, mut event_rx) = mpsc::channel(2);
         let task = tokio::spawn(run_account_safety_task(
             "main".to_string(),
-            client,
+            readiness,
+            Some(safety),
             safety_account_config(),
             command_rx,
             event_tx,
@@ -7593,18 +7953,18 @@ mod tests {
     async fn blocked_exchange_instrument_check_does_not_delay_deadman_heartbeat() {
         let instrument_started = Arc::new(Notify::new());
         let deadman_seen = Arc::new(Notify::new());
-        let client = OkxRestClient::new(
-            BlockingInstrumentTransport {
-                instrument_started: Arc::clone(&instrument_started),
-                deadman_seen: Arc::clone(&deadman_seen),
-            },
-            OkxSigner::new(OkxCredentials::new("key", "secret", "pass"), true),
-        );
+        let readiness: Arc<dyn ReadinessPort> = Arc::new(BlockingInstrumentPort {
+            instrument_started: Arc::clone(&instrument_started),
+        });
+        let safety: Arc<dyn SafetyPort> = Arc::new(NotifyingSafety {
+            deadman_seen: Arc::clone(&deadman_seen),
+        });
         let (command_tx, command_rx) = mpsc::channel(2);
         let (event_tx, mut event_rx) = mpsc::channel(2);
         let task = tokio::spawn(run_account_safety_task(
             "main".to_string(),
-            client,
+            readiness,
+            Some(safety),
             safety_account_config(),
             command_rx,
             event_tx,
@@ -7637,6 +7997,7 @@ mod tests {
         let task = tokio::spawn(run_account_safety_task(
             "main".to_string(),
             client,
+            None,
             safety_account_config(),
             command_rx,
             event_tx,
@@ -7674,6 +8035,7 @@ mod tests {
         let task = tokio::spawn(run_account_safety_task(
             "main".to_string(),
             client,
+            None,
             safety_account_config(),
             command_rx,
             event_tx,
@@ -7711,6 +8073,7 @@ mod tests {
         let task = tokio::spawn(run_account_safety_task(
             "main".to_string(),
             client,
+            None,
             safety_account_config(),
             command_rx,
             event_tx,
@@ -7905,7 +8268,7 @@ mod tests {
             vec![exchange_instrument_expectation(0.0002, 0.0005)],
         );
 
-        let error = verify_initial_exchange_fees("main", &client, &guard)
+        let error = verify_initial_exchange_fees("main", client.as_ref(), &guard)
             .await
             .unwrap_err();
 
@@ -7930,6 +8293,7 @@ mod tests {
         let task = tokio::spawn(run_account_safety_task(
             "main".to_string(),
             client,
+            None,
             safety_account_config(),
             command_rx,
             event_tx,
@@ -7974,6 +8338,7 @@ mod tests {
         let task = tokio::spawn(run_account_safety_task(
             "main".to_string(),
             client,
+            None,
             safety_account_config(),
             command_rx,
             event_tx,
@@ -8006,6 +8371,7 @@ mod tests {
         let task = tokio::spawn(run_account_safety_task(
             "main".to_string(),
             client,
+            None,
             safety_account_config(),
             command_rx,
             event_tx,
@@ -8040,6 +8406,7 @@ mod tests {
         let task = tokio::spawn(run_account_safety_task(
             "main".to_string(),
             client,
+            None,
             safety_account_config(),
             command_rx,
             event_tx,
@@ -8073,6 +8440,7 @@ mod tests {
         let task = tokio::spawn(run_account_safety_task(
             "main".to_string(),
             client,
+            None,
             safety_account_config(),
             command_rx,
             event_tx,
@@ -8109,6 +8477,7 @@ mod tests {
         let task = tokio::spawn(run_account_safety_task(
             "main".to_string(),
             client,
+            None,
             safety_account_config(),
             command_rx,
             event_tx,

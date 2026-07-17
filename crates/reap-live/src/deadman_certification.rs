@@ -5,12 +5,15 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reap_core::{OrderStatus, PINNED_JAVA_REVISION, Side};
+use reap_evidence_core::{
+    EvidenceClientFactory, EvidenceClientFactoryError, EvidenceCredentialEnvironment,
+    EvidenceHttpConfig, EvidenceReadError, EvidenceReadOnly,
+};
 use reap_storage::{RecoveredStorage, StorageError, acquire_storage_lease, recover_jsonl_bytes};
 use reap_venue::PrivateOrderState;
 use reap_venue::okx::{
-    HttpTransport, OkxAccountConfig, OkxOrderDetails, OkxRestClient, OkxSigner, ReqwestTransport,
-    RestError, parse_okx_account_config_response_json, parse_okx_open_orders_response_json,
-    parse_okx_order_details_response_json,
+    OkxAccountConfig, OkxOrderDetails, RestError, parse_okx_account_config_response_json,
+    parse_okx_open_orders_response_json, parse_okx_order_details_response_json,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -246,6 +249,8 @@ pub enum DeadmanExpiryCertificationError {
     Transport(#[source] RestError),
     #[error("OKX deadman-expiry certification failed: {0}")]
     Rest(#[from] RestError),
+    #[error("OKX deadman-expiry certification failed: {0}")]
+    Evidence(#[from] EvidenceReadError),
     #[error("deadman response for {request_path} is {actual} bytes; limit is {limit}")]
     ResponseTooLarge {
         request_path: String,
@@ -282,14 +287,49 @@ pub enum DeadmanExpiryCertificationError {
     InvalidEvidence(String),
 }
 
+fn evidence_credential_environment(
+    account: &crate::LiveAccountConfig,
+) -> EvidenceCredentialEnvironment {
+    EvidenceCredentialEnvironment::new(
+        &account.id,
+        &account.api_key_env,
+        &account.secret_key_env,
+        &account.passphrase_env,
+    )
+}
+
+fn map_factory_error(error: EvidenceClientFactoryError) -> DeadmanExpiryCertificationError {
+    match error {
+        EvidenceClientFactoryError::MissingCredential { account_id, name } => {
+            DeadmanExpiryCertificationError::Config(LiveConfigError::MissingCredential {
+                account_id,
+                name,
+            })
+        }
+        EvidenceClientFactoryError::InvalidConfiguration(message) => {
+            DeadmanExpiryCertificationError::Transport(RestError::Transport(format!(
+                "invalid evidence client configuration: {message}"
+            )))
+        }
+        EvidenceClientFactoryError::Transport(message) => {
+            DeadmanExpiryCertificationError::Transport(RestError::Transport(message))
+        }
+    }
+}
+
 /// Collects read-only proof that the exchange deadman cancelled the stopped
 /// runtime's durable regular orders. The journal lease is acquired before
 /// credentials are loaded or any network request is made.
-pub async fn collect_deadman_expiry_certification_path(
+pub async fn collect_deadman_expiry_certification_path<F>(
     config_path: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
     options: DeadmanExpiryCertificationOptions,
-) -> Result<DeadmanExpiryCertificationSummary, DeadmanExpiryCertificationError> {
+    factory: &F,
+) -> Result<DeadmanExpiryCertificationSummary, DeadmanExpiryCertificationError>
+where
+    F: EvidenceClientFactory,
+    F::Client: EvidenceReadOnly<Error = EvidenceReadError>,
+{
     validate_options(&options)?;
     let config_evidence = read_config(config_path.as_ref())?;
     let config = LiveConfig::from_toml(&config_evidence.toml)?;
@@ -320,21 +360,24 @@ pub async fn collect_deadman_expiry_certification_path(
         ));
     }
 
-    let credentials = account.credentials_from_env()?;
+    let prepared = factory
+        .prepare_credentials(&evidence_credential_environment(account))
+        .map_err(map_factory_error)?;
     let executable_sha256 =
         current_executable_sha256().map_err(DeadmanExpiryCertificationError::Provenance)?;
     let host_identity_sha256 =
         host_identity_sha256().map_err(DeadmanExpiryCertificationError::Provenance)?;
-    let transport = ReqwestTransport::with_timeouts(
-        &config.venue.rest_url,
-        Duration::from_millis(config.runtime.rest_connect_timeout_ms),
-        Duration::from_millis(config.runtime.rest_request_timeout_ms),
-    )
-    .map_err(DeadmanExpiryCertificationError::Transport)?;
-    let client = OkxRestClient::new(
-        transport,
-        OkxSigner::new(credentials, config.venue.environment.is_demo()),
-    );
+    let client = factory
+        .connect(
+            prepared,
+            &EvidenceHttpConfig::new(
+                &config.venue.rest_url,
+                config.venue.environment.is_demo(),
+                Duration::from_millis(config.runtime.rest_connect_timeout_ms),
+                Duration::from_millis(config.runtime.rest_request_timeout_ms),
+            ),
+        )
+        .map_err(map_factory_error)?;
     let artifact = collect_with_client(
         &client,
         &config,
@@ -370,8 +413,8 @@ pub async fn collect_deadman_expiry_certification_path(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn collect_with_client<T>(
-    client: &OkxRestClient<T>,
+async fn collect_with_client<C>(
+    client: &C,
     config: &LiveConfig,
     config_evidence: AccountCertificationConfigEvidence,
     config_fingerprint: String,
@@ -383,14 +426,17 @@ async fn collect_with_client<T>(
     host_identity_sha256: String,
 ) -> Result<DeadmanExpiryCertificationArtifact, DeadmanExpiryCertificationError>
 where
-    T: HttpTransport,
+    C: EvidenceReadOnly<Error = EvidenceReadError> + ?Sized,
 {
     let start_clock = sample_clock(client, config.runtime.max_exchange_clock_skew_ms).await?;
-    let config_before = client.account_config_raw().await?;
+    let config_before_response = client.account_config().await?;
+    let config_before =
+        parse_okx_account_config_response_json(config_before_response.response_body().as_bytes())?;
+    let (config_before_path, config_before_body) = config_before_response.into_parts();
     let account_config_before = response_evidence(
         ACCOUNT_CONFIG_ENDPOINT,
-        &config_before.request_path,
-        config_before.response_body,
+        &config_before_path,
+        config_before_body,
     )?;
 
     let mut order_details = Vec::new();
@@ -404,33 +450,39 @@ where
             continue;
         };
         let raw = client
-            .order_details_raw(
+            .regular_order_details(
                 &recovered.symbol,
-                Some(exchange_order_id),
-                Some(&recovered.client_order_id),
+                exchange_order_id,
+                &recovered.client_order_id,
             )
             .await?;
+        parse_okx_order_details_response_json(raw.response_body().as_bytes())?;
         let expected_path = order_details_path(
             &recovered.symbol,
             exchange_order_id,
             &recovered.client_order_id,
         );
+        let (request_path, response_body) = raw.into_parts();
         order_details.push(DeadmanOrderDetailEvidence {
             client_order_id: recovered.client_order_id.clone(),
             exchange_order_id: exchange_order_id.to_string(),
             symbol: recovered.symbol.clone(),
-            response: response_evidence(&expected_path, &raw.request_path, raw.response_body)?,
+            response: response_evidence(&expected_path, &request_path, response_body)?,
         });
     }
 
-    let open = client.open_orders_raw(None, None).await?;
-    let open_orders =
-        response_evidence(OPEN_ORDERS_ENDPOINT, &open.request_path, open.response_body)?;
-    let config_after = client.account_config_raw().await?;
+    let open_response = client.regular_open_orders().await?;
+    let open = parse_okx_open_orders_response_json(open_response.response_body().as_bytes())?;
+    let (open_path, open_body) = open_response.into_parts();
+    let open_orders = response_evidence(OPEN_ORDERS_ENDPOINT, &open_path, open_body)?;
+    let config_after_response = client.account_config().await?;
+    let config_after =
+        parse_okx_account_config_response_json(config_after_response.response_body().as_bytes())?;
+    let (config_after_path, config_after_body) = config_after_response.into_parts();
     let account_config_after = response_evidence(
         ACCOUNT_CONFIG_ENDPOINT,
-        &config_after.request_path,
-        config_after.response_body,
+        &config_after_path,
+        config_after_body,
     )?;
     let finish_clock = sample_clock(client, config.runtime.max_exchange_clock_skew_ms).await?;
     let parsed_details = order_details
@@ -446,10 +498,10 @@ where
         &journal,
         &recovered_orders,
         &unmapped_nonterminal_order_ids,
-        &config_before.config,
+        &config_before,
         &parsed_details,
-        &open.orders,
-        &config_after.config,
+        &open,
+        &config_after,
         &start_clock,
         &finish_clock,
     );
@@ -943,12 +995,12 @@ fn journal_evidence_matches(
         && collected.bootstraps == derived.bootstraps
 }
 
-async fn sample_clock<T>(
-    client: &OkxRestClient<T>,
+async fn sample_clock<C>(
+    client: &C,
     maximum_skew_ms: u64,
 ) -> Result<AccountCertificationClockEvidence, DeadmanExpiryCertificationError>
 where
-    T: HttpTransport,
+    C: EvidenceReadOnly<Error = EvidenceReadError> + ?Sized,
 {
     let before = unix_time_ms()?;
     let server_ms = client.server_time_ms().await?;
@@ -1323,7 +1375,6 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex};
 
-    use async_trait::async_trait;
     use reap_core::{OrderEvent, OrderUpdate, TimeInForce};
     use reap_risk::RiskLimits;
     use reap_storage::{
@@ -1331,37 +1382,15 @@ mod tests {
         StorageRecord, start_jsonl_storage,
     };
     use reap_strategy::ChaosConfig;
-    use reap_venue::okx::{
-        HttpMethod, HttpResponse, OkxAccountLevel, OkxApiKeyPermission, OkxCredentials,
-        OkxPositionMode, SignedRequest,
-    };
+    use reap_venue::okx::{OkxAccountLevel, OkxApiKeyPermission, OkxPositionMode};
 
+    use crate::account_certification::NarrowEvidenceFake;
     use crate::{
         AlertConfig, HostGuardConfig, LiveAccountConfig, LiveStorageConfig, OkxTradeModeConfig,
         OkxVenueConfig, OperatorConfig, RuntimeConfig,
     };
 
     use super::*;
-
-    #[derive(Clone)]
-    struct MockTransport {
-        responses: Arc<Mutex<VecDeque<String>>>,
-        requests: Arc<Mutex<Vec<SignedRequest>>>,
-    }
-
-    #[async_trait]
-    impl HttpTransport for MockTransport {
-        async fn execute(&self, request: SignedRequest) -> Result<HttpResponse, RestError> {
-            self.requests.lock().unwrap().push(request);
-            let body = self
-                .responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("missing mock response");
-            Ok(HttpResponse { status: 200, body })
-        }
-    }
 
     fn live_config(journal_path: PathBuf) -> LiveConfig {
         let mut strategy: ChaosConfig =
@@ -1486,19 +1515,21 @@ mod tests {
             select_recovered_orders(&config, "main", &recovered).unwrap();
         let config_toml = toml::to_string(&config).unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let client = OkxRestClient::new(
-            MockTransport {
-                responses: Arc::new(Mutex::new(VecDeque::from([
-                    format!(r#"{{"code":"0","msg":"","data":[{{"ts":"{now}"}}]}}"#),
-                    account_config_json(),
-                    order_detail_json(OKX_DEADMAN_CANCEL_SOURCE),
-                    r#"{"code":"0","msg":"","data":[]}"#.to_string(),
-                    account_config_json(),
-                    format!(r#"{{"code":"0","msg":"","data":[{{"ts":"{}"}}]}}"#, now + 1),
-                ]))),
-                requests: Arc::clone(&requests),
-            },
-            OkxSigner::new(OkxCredentials::new("key", "secret", "pass"), true),
+        let client = NarrowEvidenceFake::new(
+            VecDeque::from([
+                Ok(format!(
+                    r#"{{"code":"0","msg":"","data":[{{"ts":"{now}"}}]}}"#
+                )),
+                Ok(account_config_json()),
+                Ok(order_detail_json(OKX_DEADMAN_CANCEL_SOURCE)),
+                Ok(r#"{"code":"0","msg":"","data":[]}"#.to_string()),
+                Ok(account_config_json()),
+                Ok(format!(
+                    r#"{{"code":"0","msg":"","data":[{{"ts":"{}"}}]}}"#,
+                    now + 1
+                )),
+            ]),
+            Arc::clone(&requests),
         );
         let artifact = collect_with_client(
             &client,
@@ -1525,16 +1556,8 @@ mod tests {
         assert!(artifact.summary.passed, "{:?}", artifact.summary.failures);
         assert_eq!(artifact.summary.deadman_cancelled_orders, 1);
         let requests = requests.lock().unwrap();
-        assert!(
-            requests
-                .iter()
-                .all(|request| { request.method == HttpMethod::Get && request.body.is_empty() })
-        );
         assert_eq!(
-            requests
-                .iter()
-                .map(|request| request.path.as_str())
-                .collect::<Vec<_>>(),
+            requests.iter().map(String::as_str).collect::<Vec<_>>(),
             vec![
                 "/api/v5/public/time",
                 ACCOUNT_CONFIG_ENDPOINT,

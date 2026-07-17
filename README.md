@@ -522,7 +522,7 @@ loading strategy or journal state:
 
 ```bash
 EMERGENCY_REPORT="/tmp/reap-emergency-$(date -u +%Y%m%dT%H%M%SZ).json"
-cargo run -p reap-cli -- emergency-cancel \
+cargo run -p reap-emergency-runner --bin reap-emergency -- \
   --config examples/live-okx-demo.toml \
   --account main \
   --confirm-account-wide-cancel \

@@ -1,0 +1,35 @@
+error[E0432]: unresolved import `reap_live`
+ --> tests/ui/no_infrastructure_dependencies.rs:1:5
+  |
+1 | use reap_live as live_runtime;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^ no external crate `reap_live`
+
+error[E0432]: unresolved import `reap_okx_emergency_adapter`
+ --> tests/ui/no_infrastructure_dependencies.rs:2:5
+  |
+2 | use reap_okx_emergency_adapter as emergency_adapter;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no external crate `reap_okx_emergency_adapter`
+
+error[E0432]: unresolved import `reap_okx_evidence_adapter`
+ --> tests/ui/no_infrastructure_dependencies.rs:3:5
+  |
+3 | use reap_okx_evidence_adapter as evidence_adapter;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no external crate `reap_okx_evidence_adapter`
+
+error[E0432]: unresolved import `reap_okx_live_adapter`
+ --> tests/ui/no_infrastructure_dependencies.rs:4:5
+  |
+4 | use reap_okx_live_adapter as live_adapter;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no external crate `reap_okx_live_adapter`
+
+error[E0432]: unresolved import `reap_okx_wire`
+ --> tests/ui/no_infrastructure_dependencies.rs:5:5
+  |
+5 | use reap_okx_wire as wire;
+  |     ^^^^^^^^^^^^^^^^^^^^^ no external crate `reap_okx_wire`
+
+error[E0432]: unresolved import `reap_venue`
+ --> tests/ui/no_infrastructure_dependencies.rs:6:5
+  |
+6 | use reap_venue as venue;
+  |     ^^^^^^^^^^^^^^^^^^^ no external crate `reap_venue`

@@ -11,18 +11,18 @@ use reap_capture::{
     CaptureConfig, CaptureError, CaptureRunOptions, analyze_capture_path,
     capture_startup_failure_report, run_capture, verify_capture_paths,
 };
+use reap_emergency_core::{EmergencyCancelVerificationOptions, verify_emergency_cancel_paths};
 use reap_fault::{
     FaultProxyCommand, FaultProxyConfig, FaultProxyRunOptions, run_fault_proxy,
     send_fault_proxy_command, verify_fault_proxy_run_paths,
 };
 use reap_live::{
-    DeadmanExpiryCertificationOptions, EmergencyCancelOptions, EmergencyCancelVerificationOptions,
-    LiveConfig, LiveMode, LiveRunOptions, LiveRuntimeError, OperatorCommand,
-    collect_account_certification_path, collect_deadman_expiry_certification_path,
-    run_emergency_cancel_path, send_operator_command, verify_account_certification_path,
-    verify_deadman_expiry_certification_path, verify_emergency_cancel_paths,
-    verify_production_transition_paths,
+    DeadmanExpiryCertificationOptions, LiveConfig, LiveMode, LiveRunOptions, LiveRuntimeError,
+    OperatorCommand, collect_account_certification_path, collect_deadman_expiry_certification_path,
+    send_operator_command, verify_account_certification_path,
+    verify_deadman_expiry_certification_path, verify_production_transition_paths,
 };
+use reap_okx_evidence_adapter::OkxEvidenceClientFactory;
 use reap_strategy::ChaosConfig;
 
 mod deployment;
@@ -623,64 +623,6 @@ enum Command {
         #[command(subcommand)]
         command: OperatorCliCommand,
         #[arg(long, global = true)]
-        pretty: bool,
-    },
-    #[command(
-        about = "Cancel and verify regular, algo, and spread OKX orders",
-        long_about = "Arm regular and spread OKX Cancel All After, exhaustively cancel regular, algo, and spread pending orders account-wide, and verify every domain at zero after the trigger horizon."
-    )]
-    EmergencyCancel {
-        #[arg(
-            short,
-            long,
-            help = "Live TOML used only for REST/account safety settings"
-        )]
-        config: PathBuf,
-        #[arg(
-            long,
-            conflicts_with = "all_configured_accounts",
-            help = "Configured account id; repeat to select multiple accounts"
-        )]
-        account: Vec<String>,
-        #[arg(
-            long,
-            conflicts_with = "account",
-            help = "Select every account in the config"
-        )]
-        all_configured_accounts: bool,
-        #[arg(long, help = "Acknowledge that cancellation is account-wide")]
-        confirm_account_wide_cancel: bool,
-        #[arg(
-            long,
-            help = "Attest that every order producer for the selected accounts is stopped"
-        )]
-        confirm_order_producers_stopped: bool,
-        #[arg(
-            long,
-            help = "Additional acknowledgement required by production configs"
-        )]
-        confirm_production: bool,
-        #[arg(
-            long,
-            default_value_t = 40,
-            help = "Absolute deadline for each account"
-        )]
-        account_timeout_secs: u64,
-        #[arg(long, default_value_t = 250, help = "Delay between zero checks")]
-        poll_interval_ms: u64,
-        #[arg(
-            long,
-            default_value_t = 10,
-            help = "OKX Cancel All After trigger delay (10-120 seconds)"
-        )]
-        deadman_timeout_secs: u64,
-        #[arg(
-            short,
-            long,
-            help = "Create a JSON evidence artifact; an existing path is refused"
-        )]
-        output: Option<PathBuf>,
-        #[arg(long, help = "Pretty-print JSON evidence")]
         pretty: bool,
     },
     #[command(
@@ -1624,15 +1566,17 @@ async fn main() -> Result<()> {
             output,
             pretty,
         } => {
-            let summary = collect_account_certification_path(&config, &output, &account)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to collect account certification for {} into {}",
-                        account,
-                        output.display()
-                    )
-                })?;
+            let evidence_factory = OkxEvidenceClientFactory::new();
+            let summary =
+                collect_account_certification_path(&config, &output, &account, &evidence_factory)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to collect account certification for {} into {}",
+                            account,
+                            output.display()
+                        )
+                    })?;
             if pretty {
                 println!("{}", serde_json::to_string_pretty(&summary)?);
             } else {
@@ -1671,6 +1615,7 @@ async fn main() -> Result<()> {
             confirm_order_producers_stopped,
             pretty,
         } => {
+            let evidence_factory = OkxEvidenceClientFactory::new();
             let summary = collect_deadman_expiry_certification_path(
                 &config,
                 &output,
@@ -1678,6 +1623,7 @@ async fn main() -> Result<()> {
                     account_id: account.clone(),
                     order_producers_stopped_attested: confirm_order_producers_stopped,
                 },
+                &evidence_factory,
             )
             .await
             .with_context(|| {
@@ -1736,69 +1682,6 @@ async fn main() -> Result<()> {
             }
             if !response.ok {
                 anyhow::bail!("operator command was rejected: {}", response.message);
-            }
-        }
-        Command::EmergencyCancel {
-            config,
-            account,
-            all_configured_accounts,
-            confirm_account_wide_cancel,
-            confirm_order_producers_stopped,
-            confirm_production,
-            account_timeout_secs,
-            poll_interval_ms,
-            deadman_timeout_secs,
-            output,
-            pretty,
-        } => {
-            reap_telemetry::init_json_tracing("info")
-                .map_err(anyhow::Error::msg)
-                .context("failed to initialize emergency-cancel tracing")?;
-            let mut output_file = output
-                .as_ref()
-                .map(|path| reserve_private_output(path, "emergency-cancel report"))
-                .transpose()?;
-            let report = run_emergency_cancel_path(
-                &config,
-                EmergencyCancelOptions {
-                    account_ids: account,
-                    all_configured_accounts,
-                    confirm_account_wide_cancel,
-                    confirm_order_producers_stopped,
-                    confirm_production,
-                    account_timeout: Duration::from_secs(account_timeout_secs),
-                    poll_interval: Duration::from_millis(poll_interval_ms),
-                    deadman_timeout_secs,
-                },
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "emergency cancel failed before producing evidence for {}",
-                    config.display()
-                )
-            })?;
-            let json = if pretty {
-                serde_json::to_string_pretty(&report)?
-            } else {
-                serde_json::to_string(&report)?
-            };
-            if let (Some(file), Some(path)) = (&mut output_file, output.as_deref()) {
-                persist_reserved_output(file, path, &json, "emergency-cancel report")?;
-            }
-            println!("{json}");
-            if !report.account_wide_orders_all_clear {
-                anyhow::bail!(
-                    "emergency cancel did not verify every selected account's regular, algo, and spread orders at zero"
-                );
-            }
-            if !report.evidence_complete {
-                anyhow::bail!(
-                    "emergency cancel reached account-wide zero but its provenance evidence is incomplete"
-                );
-            }
-            if !report.all_clear {
-                anyhow::bail!("emergency cancel report violated its all-clear invariant");
             }
         }
         Command::VerifyEmergencyCancel {

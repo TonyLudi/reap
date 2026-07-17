@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use reap_core::{AccountUpdate, NewOrder};
 use reap_venue::okx::{
-    HttpTransport, OkxCancelOrder, OkxFillPagination, OkxOrderAck, OkxPlaceOrder,
-    OkxRegularOrderPagination, OkxRestClient, OkxTradeMode, RestError,
+    OkxCancelOrder, OkxFillPage, OkxFillPagination, OkxOrderAck, OkxPlaceOrder,
+    OkxRegularOrderPage, OkxRegularOrderPagination, OkxTradeMode, RestError,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -89,8 +90,42 @@ pub struct CancelOutcome {
     pub exchange_order_id: String,
 }
 
-pub struct OkxOrderGateway<T> {
-    io: OkxGatewayIo<T>,
+#[async_trait]
+pub trait RegularExecution: Send + Sync {
+    async fn cancel_regular_order(&self, order: &OkxCancelOrder) -> Result<OkxOrderAck, RestError>;
+}
+
+#[async_trait]
+pub trait RegularReconciliation: Send + Sync {
+    async fn regular_pending_orders_page(
+        &self,
+        instrument_type: Option<&str>,
+        symbol: Option<&str>,
+        after: Option<&str>,
+    ) -> Result<OkxRegularOrderPage, RestError>;
+
+    async fn recent_fills_page(
+        &self,
+        instrument_type: Option<&str>,
+        symbol: Option<&str>,
+        after: Option<&str>,
+    ) -> Result<OkxFillPage, RestError>;
+
+    async fn account_balance(&self) -> Result<AccountUpdate, RestError>;
+
+    async fn account_positions(&self) -> Result<AccountUpdate, RestError>;
+
+    async fn order_details(
+        &self,
+        symbol: &str,
+        client_order_id: &str,
+    ) -> Result<reap_venue::RemoteOrder, RestError>;
+
+    async fn server_time_ms(&self) -> Result<u64, RestError>;
+}
+
+pub struct OkxOrderGateway {
+    io: OkxGatewayIo,
     ids: ClientOrderIdGenerator,
     idempotency: IdempotencyRegistry,
     trade_modes: HashMap<String, OkxTradeMode>,
@@ -98,18 +133,23 @@ pub struct OkxOrderGateway<T> {
 }
 
 #[derive(Clone)]
-pub struct OkxGatewayIo<T> {
-    client: OkxRestClient<T>,
+pub struct OkxGatewayIo {
+    execution: Arc<dyn RegularExecution>,
+    reconciliation: OkxReconciliationClient,
     order_transport: Option<Arc<dyn OkxOrderTransport>>,
     pacer: RequestPacer,
 }
 
-impl<T> OkxOrderGateway<T>
-where
-    T: HttpTransport,
-{
+#[derive(Clone)]
+pub struct OkxReconciliationClient {
+    reconciliation: Arc<dyn RegularReconciliation>,
+    pacer: RequestPacer,
+}
+
+impl OkxOrderGateway {
     pub fn new(
-        client: OkxRestClient<T>,
+        execution: Arc<dyn RegularExecution>,
+        reconciliation: Arc<dyn RegularReconciliation>,
         id_prefix: impl Into<String>,
         node_id: u16,
         trade_modes: HashMap<String, OkxTradeMode>,
@@ -117,7 +157,11 @@ where
     ) -> Result<Self, GatewayError> {
         Ok(Self {
             io: OkxGatewayIo {
-                client,
+                execution,
+                reconciliation: OkxReconciliationClient {
+                    reconciliation,
+                    pacer: RequestPacer::new(pacing.clone()),
+                },
                 order_transport: None,
                 pacer: RequestPacer::new(pacing),
             },
@@ -132,10 +176,11 @@ where
         self.io.order_transport = Some(Arc::from(transport));
     }
 
-    pub fn io_client(&self) -> OkxGatewayIo<T>
-    where
-        T: Clone,
-    {
+    pub fn reconciliation_client(&self) -> OkxReconciliationClient {
+        self.io.reconciliation.clone()
+    }
+
+    pub fn command_client(&self) -> OkxGatewayIo {
         self.io.clone()
     }
 
@@ -189,7 +234,7 @@ where
                     }
                     | SubmitOutcome::PendingReconciliation { client_order_id } => client_order_id,
                     SubmitOutcome::Submitted { .. } => {
-                        unreachable!("submitted outcomes require REST execution")
+                        unreachable!("submitted outcomes require new order execution")
                     }
                 };
                 self.register_local_order(client_order_id, state);
@@ -370,20 +415,16 @@ where
     pub async fn exchange_time_ms(&self) -> Result<u64, GatewayError> {
         self.io.exchange_time_ms().await
     }
-
-    pub async fn cancel_all_after(&self, timeout_secs: u64) -> Result<(), GatewayError> {
-        self.io.cancel_all_after(timeout_secs).await
-    }
 }
 
-impl<T> OkxGatewayIo<T>
-where
-    T: HttpTransport,
-{
+impl OkxGatewayIo {
     pub async fn place_prepared(
         &self,
         prepared: &PreparedOrder,
     ) -> Result<OkxOrderAck, GatewayError> {
+        let transport = self.order_transport.as_ref().ok_or_else(|| {
+            OrderTransportError::Unavailable("regular order transport is not installed".to_string())
+        })?;
         self.pacer.pace(RequestKind::Submit, "account").await;
         self.pacer
             .pace(RequestKind::Submit, &prepared.order.symbol)
@@ -399,17 +440,10 @@ where
             reduce_only: prepared.order.reduce_only,
             self_trade_prevention: prepared.order.self_trade_prevention,
         };
-        match self.order_transport.as_ref() {
-            Some(transport) => transport
-                .place_order(&request)
-                .await
-                .map_err(GatewayError::from),
-            None => self
-                .client
-                .place_order(&request)
-                .await
-                .map_err(GatewayError::from),
-        }
+        transport
+            .place_order(&request)
+            .await
+            .map_err(GatewayError::from)
     }
 
     pub async fn cancel(
@@ -427,10 +461,12 @@ where
         let ack = match self.order_transport.as_ref() {
             Some(transport) => match transport.cancel_order(&request).await {
                 Ok(ack) => ack,
-                Err(error) if error.is_unavailable() => self.client.cancel_order(&request).await?,
+                Err(error) if error.is_unavailable() => {
+                    self.execution.cancel_regular_order(&request).await?
+                }
                 Err(error) => return Err(error.into()),
             },
-            None => self.client.cancel_order(&request).await?,
+            None => self.execution.cancel_regular_order(&request).await?,
         };
         Ok(CancelOutcome {
             client_order_id: ack.client_order_id,
@@ -445,11 +481,50 @@ where
         max_order_pages: usize,
         max_fill_pages: usize,
     ) -> Result<(Vec<reap_venue::RemoteOrder>, Vec<reap_venue::RemoteFill>), GatewayError> {
+        self.reconciliation
+            .fetch_remote_state(instrument_type, symbol, max_order_pages, max_fill_pages)
+            .await
+    }
+
+    pub async fn fetch_remote_account_state(&self) -> Result<AccountUpdate, GatewayError> {
+        self.reconciliation.fetch_remote_account_state().await
+    }
+
+    pub async fn fetch_order_details(
+        &self,
+        symbol: &str,
+        client_order_id: &str,
+    ) -> Result<reap_venue::RemoteOrder, GatewayError> {
+        self.reconciliation
+            .fetch_order_details(symbol, client_order_id)
+            .await
+    }
+
+    pub async fn exchange_time_ms(&self) -> Result<u64, GatewayError> {
+        self.reconciliation.exchange_time_ms().await
+    }
+}
+
+impl OkxReconciliationClient {
+    pub fn new(reconciliation: Arc<dyn RegularReconciliation>, pacing: PacingPolicy) -> Self {
+        Self {
+            reconciliation,
+            pacer: RequestPacer::new(pacing),
+        }
+    }
+
+    pub async fn fetch_remote_state(
+        &self,
+        instrument_type: Option<&str>,
+        symbol: Option<&str>,
+        max_order_pages: usize,
+        max_fill_pages: usize,
+    ) -> Result<(Vec<reap_venue::RemoteOrder>, Vec<reap_venue::RemoteFill>), GatewayError> {
         let mut order_pagination = OkxRegularOrderPagination::new(max_order_pages)?;
         loop {
             self.pacer.pace(RequestKind::Reconcile, "account").await;
             let page = self
-                .client
+                .reconciliation
                 .regular_pending_orders_page(instrument_type, symbol, order_pagination.after())
                 .await?;
             if order_pagination.accept(page)? {
@@ -461,8 +536,8 @@ where
         loop {
             self.pacer.pace(RequestKind::Reconcile, "account").await;
             let page = self
-                .client
-                .fills_page(instrument_type, symbol, pagination.after())
+                .reconciliation
+                .recent_fills_page(instrument_type, symbol, pagination.after())
                 .await?;
             if pagination.accept(page)? {
                 break;
@@ -473,12 +548,12 @@ where
 
     pub async fn fetch_remote_account_state(&self) -> Result<AccountUpdate, GatewayError> {
         self.pacer.pace(RequestKind::Reconcile, "account").await;
-        let mut account = self.client.account_balance().await?;
+        let mut account = self.reconciliation.account_balance().await?;
         if account.balances.is_empty() {
             return Err(GatewayError::EmptyAccountBalance);
         }
         self.pacer.pace(RequestKind::Reconcile, "account").await;
-        let positions = self.client.account_positions(None, None).await?;
+        let positions = self.reconciliation.account_positions().await?;
         account.ts_ms = account.ts_ms.max(positions.ts_ms);
         account.positions = positions.positions;
         Ok(account)
@@ -491,17 +566,13 @@ where
     ) -> Result<reap_venue::RemoteOrder, GatewayError> {
         self.pacer.pace(RequestKind::Reconcile, "account").await;
         Ok(self
-            .client
-            .order_details(symbol, None, Some(client_order_id))
+            .reconciliation
+            .order_details(symbol, client_order_id)
             .await?)
     }
 
     pub async fn exchange_time_ms(&self) -> Result<u64, GatewayError> {
-        Ok(self.client.server_time_ms().await?)
-    }
-
-    pub async fn cancel_all_after(&self, timeout_secs: u64) -> Result<(), GatewayError> {
-        Ok(self.client.cancel_all_after(timeout_secs).await?)
+        Ok(self.reconciliation.server_time_ms().await?)
     }
 }
 
@@ -520,12 +591,23 @@ mod tests {
 
     use async_trait::async_trait;
     use reap_core::{Side, TimeInForce};
-    use reap_venue::okx::{HttpResponse, OkxCredentials, OkxSigner, SignedRequest};
+    use reap_venue::okx::{
+        parse_okx_account_balance_response_json, parse_okx_account_positions_response_json,
+        parse_okx_fill_page_response_json, parse_okx_order_details_response_json,
+        parse_okx_regular_order_page_response_json,
+    };
 
     use super::*;
 
     #[derive(Clone)]
-    struct MockTransport {
+    struct HttpResponse {
+        #[allow(dead_code)]
+        status: u16,
+        body: String,
+    }
+
+    #[derive(Clone)]
+    struct MockRoles {
         responses: Arc<Mutex<VecDeque<Result<HttpResponse, RestError>>>>,
         calls: Arc<Mutex<usize>>,
     }
@@ -563,9 +645,8 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl HttpTransport for MockTransport {
-        async fn execute(&self, _request: SignedRequest) -> Result<HttpResponse, RestError> {
+    impl MockRoles {
+        fn next(&self) -> Result<HttpResponse, RestError> {
             *self.calls.lock().unwrap() += 1;
             self.responses
                 .lock()
@@ -573,6 +654,112 @@ mod tests {
                 .pop_front()
                 .expect("mock response")
         }
+    }
+
+    #[async_trait]
+    impl RegularExecution for MockRoles {
+        async fn cancel_regular_order(
+            &self,
+            order: &OkxCancelOrder,
+        ) -> Result<OkxOrderAck, RestError> {
+            parse_ack(
+                self.next()?,
+                order.client_order_id.as_deref().unwrap_or_default(),
+            )
+        }
+    }
+
+    #[async_trait]
+    impl RegularReconciliation for MockRoles {
+        async fn regular_pending_orders_page(
+            &self,
+            _instrument_type: Option<&str>,
+            _symbol: Option<&str>,
+            _after: Option<&str>,
+        ) -> Result<OkxRegularOrderPage, RestError> {
+            let response = self.next()?;
+            parse_okx_regular_order_page_response_json(response.body.as_bytes())
+        }
+
+        async fn recent_fills_page(
+            &self,
+            _instrument_type: Option<&str>,
+            _symbol: Option<&str>,
+            _after: Option<&str>,
+        ) -> Result<OkxFillPage, RestError> {
+            let response = self.next()?;
+            parse_okx_fill_page_response_json(response.body.as_bytes())
+        }
+
+        async fn account_balance(&self) -> Result<AccountUpdate, RestError> {
+            let response = self.next()?;
+            Ok(parse_okx_account_balance_response_json(response.body.as_bytes())?.account_update())
+        }
+
+        async fn account_positions(&self) -> Result<AccountUpdate, RestError> {
+            let response = self.next()?;
+            Ok(
+                parse_okx_account_positions_response_json(response.body.as_bytes())?
+                    .account_update(),
+            )
+        }
+
+        async fn order_details(
+            &self,
+            _symbol: &str,
+            _client_order_id: &str,
+        ) -> Result<reap_venue::RemoteOrder, RestError> {
+            let response = self.next()?;
+            Ok(parse_okx_order_details_response_json(response.body.as_bytes())?.order)
+        }
+
+        async fn server_time_ms(&self) -> Result<u64, RestError> {
+            let response = self.next()?;
+            let value: serde_json::Value = serde_json::from_str(&response.body)?;
+            value["data"][0]["ts"]
+                .as_str()
+                .ok_or_else(|| RestError::InvalidField {
+                    field: "ts",
+                    value: value["data"][0]["ts"].to_string(),
+                    message: "must be a string".to_string(),
+                })?
+                .parse()
+                .map_err(|_| RestError::InvalidField {
+                    field: "ts",
+                    value: value["data"][0]["ts"].to_string(),
+                    message: "must be an unsigned integer".to_string(),
+                })
+        }
+    }
+
+    fn parse_ack(
+        response: HttpResponse,
+        fallback_client_id: &str,
+    ) -> Result<OkxOrderAck, RestError> {
+        let value: serde_json::Value = serde_json::from_str(&response.body)?;
+        let code = value["code"].as_str().unwrap_or_default();
+        if code != "0" {
+            return Err(RestError::Api {
+                code: code.to_string(),
+                message: value["msg"].as_str().unwrap_or_default().to_string(),
+            });
+        }
+        let row = &value["data"][0];
+        let sub_code = row["sCode"].as_str().unwrap_or_default();
+        if !sub_code.is_empty() && sub_code != "0" {
+            return Err(RestError::Api {
+                code: sub_code.to_string(),
+                message: row["sMsg"].as_str().unwrap_or_default().to_string(),
+            });
+        }
+        Ok(OkxOrderAck {
+            exchange_order_id: row["ordId"].as_str().unwrap_or_default().to_string(),
+            client_order_id: row["clOrdId"]
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .unwrap_or(fallback_client_id)
+                .to_string(),
+        })
     }
 
     fn order() -> NewOrder {
@@ -638,18 +825,15 @@ mod tests {
 
     fn gateway(
         responses: Vec<Result<HttpResponse, RestError>>,
-    ) -> (OkxOrderGateway<MockTransport>, Arc<Mutex<usize>>) {
+    ) -> (OkxOrderGateway, Arc<Mutex<usize>>) {
         let calls = Arc::new(Mutex::new(0));
-        let transport = MockTransport {
+        let roles = Arc::new(MockRoles {
             responses: Arc::new(Mutex::new(responses.into())),
             calls: Arc::clone(&calls),
-        };
-        let client = OkxRestClient::new(
-            transport,
-            OkxSigner::new(OkxCredentials::new("key", "secret", "pass"), true),
-        );
+        });
         let gateway = OkxOrderGateway::new(
-            client,
+            Arc::clone(&roles) as Arc<dyn RegularExecution>,
+            roles as Arc<dyn RegularReconciliation>,
             "reap",
             1,
             HashMap::from([("BTC-USDT".to_string(), OkxTradeMode::Cash)]),
@@ -660,7 +844,7 @@ mod tests {
     }
 
     fn install_order_transport(
-        gateway: &mut OkxOrderGateway<MockTransport>,
+        gateway: &mut OkxOrderGateway,
         responses: Vec<Result<reap_venue::okx::OkxOrderAck, OrderTransportError>>,
     ) -> Arc<Mutex<usize>> {
         let calls = Arc::new(Mutex::new(0));
@@ -673,11 +857,14 @@ mod tests {
 
     #[tokio::test]
     async fn accepted_idempotent_submit_does_not_send_twice() {
-        let response = HttpResponse {
-            status: 200,
-            body: r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"ignored","sCode":"0","sMsg":""}]}"#.to_string(),
-        };
-        let (mut gateway, calls) = gateway(vec![Ok(response)]);
+        let (mut gateway, rest_calls) = gateway(Vec::new());
+        let order_calls = install_order_transport(
+            &mut gateway,
+            vec![Ok(OkxOrderAck {
+                exchange_order_id: "123".to_string(),
+                client_order_id: "ignored".to_string(),
+            })],
+        );
         let mut state = PrivateStateReducer::new();
 
         let first = gateway
@@ -688,7 +875,8 @@ mod tests {
 
         assert!(matches!(&first, SubmitOutcome::Submitted { .. }));
         assert!(matches!(&second, SubmitOutcome::Duplicate { .. }));
-        assert_eq!(*calls.lock().unwrap(), 1);
+        assert_eq!(*order_calls.lock().unwrap(), 1);
+        assert_eq!(*rest_calls.lock().unwrap(), 0);
         let SubmitOutcome::Submitted {
             client_order_id, ..
         } = first
@@ -702,12 +890,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepared_submit_can_be_registered_before_rest_io() {
-        let response = HttpResponse {
-            status: 200,
-            body: r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"ignored","sCode":"0","sMsg":""}]}"#.to_string(),
-        };
-        let (mut gateway, calls) = gateway(vec![Ok(response)]);
+    async fn prepared_submit_can_be_registered_before_order_transport_io() {
+        let (mut gateway, rest_calls) = gateway(Vec::new());
+        let order_calls = install_order_transport(
+            &mut gateway,
+            vec![Ok(OkxOrderAck {
+                exchange_order_id: "123".to_string(),
+                client_order_id: "ignored".to_string(),
+            })],
+        );
         let mut state = PrivateStateReducer::new();
 
         let SubmitPreparation::Ready(prepared) = gateway
@@ -717,7 +908,8 @@ mod tests {
             panic!("new submission should require execution");
         };
 
-        assert_eq!(*calls.lock().unwrap(), 0);
+        assert_eq!(*order_calls.lock().unwrap(), 0);
+        assert_eq!(*rest_calls.lock().unwrap(), 0);
         state.register_local_order(prepared.client_order_id(), prepared.order().clone());
         let client_order_id = prepared.client_order_id().to_string();
 
@@ -725,7 +917,8 @@ mod tests {
             gateway.execute_submit(prepared).await.unwrap(),
             SubmitOutcome::Submitted { .. }
         ));
-        assert_eq!(*calls.lock().unwrap(), 1);
+        assert_eq!(*order_calls.lock().unwrap(), 1);
+        assert_eq!(*rest_calls.lock().unwrap(), 0);
         assert_eq!(
             state.order_reducer().get(&client_order_id).unwrap().reason,
             "quote"
@@ -803,34 +996,58 @@ mod tests {
 
     #[tokio::test]
     async fn ambiguous_failure_is_held_for_reconciliation() {
-        let (mut gateway, calls) = gateway(vec![Err(RestError::Transport("timeout".to_string()))]);
+        let (mut gateway, rest_calls) = gateway(Vec::new());
+        let order_calls = install_order_transport(
+            &mut gateway,
+            vec![Err(OrderTransportError::Ambiguous("timeout".to_string()))],
+        );
         assert!(gateway.submit("decision-1", order()).await.is_err());
 
         let retry = gateway.submit("decision-1", order()).await.unwrap();
         assert!(matches!(retry, SubmitOutcome::PendingReconciliation { .. }));
-        assert_eq!(*calls.lock().unwrap(), 1);
+        assert_eq!(*order_calls.lock().unwrap(), 1);
+        assert_eq!(*rest_calls.lock().unwrap(), 0);
     }
 
     #[tokio::test]
     async fn explicit_api_rejection_releases_idempotency_key_for_retry() {
-        let response = HttpResponse {
-            status: 200,
-            body: r#"{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"ignored","sCode":"0","sMsg":""}]}"#.to_string(),
-        };
-        let (mut gateway, calls) = gateway(vec![
-            Err(RestError::Api {
-                code: "51000".to_string(),
-                message: "parameter error".to_string(),
-            }),
-            Ok(response),
-        ]);
+        let (mut gateway, rest_calls) = gateway(Vec::new());
+        let order_calls = install_order_transport(
+            &mut gateway,
+            vec![
+                Err(OrderTransportError::Rejected {
+                    code: "51000".to_string(),
+                    message: "parameter error".to_string(),
+                }),
+                Ok(OkxOrderAck {
+                    exchange_order_id: "123".to_string(),
+                    client_order_id: "ignored".to_string(),
+                }),
+            ],
+        );
 
         assert!(gateway.submit("decision-1", order()).await.is_err());
         assert!(matches!(
             gateway.submit("decision-1", order()).await.unwrap(),
             SubmitOutcome::Submitted { .. }
         ));
-        assert_eq!(*calls.lock().unwrap(), 2);
+        assert_eq!(*order_calls.lock().unwrap(), 2);
+        assert_eq!(*rest_calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_order_transport_is_typed_unavailable_and_retryable() {
+        let (mut gateway, rest_calls) = gateway(Vec::new());
+
+        for _ in 0..2 {
+            let error = gateway.submit("decision-1", order()).await.unwrap_err();
+            assert!(matches!(
+                &error,
+                GatewayError::OrderTransport(OrderTransportError::Unavailable(_))
+            ));
+            assert!(!error.is_ambiguous());
+        }
+        assert_eq!(*rest_calls.lock().unwrap(), 0);
     }
 
     #[tokio::test]

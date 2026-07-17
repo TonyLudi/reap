@@ -1,9 +1,8 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use thiserror::Error;
 
+use super::OkxOrderAck;
 use super::capabilities::{WS_CANCEL_REGULAR, WS_PLACE_REGULAR};
-use super::rest::{serialize_cancel_order, serialize_place_order};
-use super::{OkxCancelOrder, OkxOrderAck, OkxPlaceOrder};
 
 pub const OKX_WS_PLACE_ORDER_OP: &str = WS_PLACE_REGULAR.endpoint_or_channel;
 pub const OKX_WS_CANCEL_ORDER_OP: &str = WS_CANCEL_REGULAR.endpoint_or_channel;
@@ -75,59 +74,6 @@ impl OkxWsOrderResult {
             Self::Accepted { operation, .. } | Self::Rejected { operation, .. } => *operation,
         }
     }
-}
-
-pub fn build_okx_ws_place_order_request(
-    request_id: &str,
-    expiry_ms: u64,
-    order: &OkxPlaceOrder,
-) -> Result<String, OkxWsOrderProtocolError> {
-    validate_request_id(request_id)?;
-    let argument = serde_json::from_str(
-        &serialize_place_order(order)
-            .map_err(|error| OkxWsOrderProtocolError::InvalidOrder(error.to_string()))?,
-    )?;
-    serialize_request(
-        request_id,
-        OkxWsOrderOperation::Place,
-        Some(expiry_ms),
-        argument,
-    )
-}
-
-pub fn build_okx_ws_cancel_order_request(
-    request_id: &str,
-    order: &OkxCancelOrder,
-) -> Result<String, OkxWsOrderProtocolError> {
-    validate_request_id(request_id)?;
-    let argument = serde_json::from_str(
-        &serialize_cancel_order(order)
-            .map_err(|error| OkxWsOrderProtocolError::InvalidOrder(error.to_string()))?,
-    )?;
-    serialize_request(request_id, OkxWsOrderOperation::Cancel, None, argument)
-}
-
-fn serialize_request(
-    request_id: &str,
-    operation: OkxWsOrderOperation,
-    expiry_ms: Option<u64>,
-    argument: serde_json::Value,
-) -> Result<String, OkxWsOrderProtocolError> {
-    #[derive(Serialize)]
-    struct Request<'a> {
-        id: &'a str,
-        op: &'static str,
-        #[serde(rename = "expTime", skip_serializing_if = "Option::is_none")]
-        expiry_ms: Option<String>,
-        args: [serde_json::Value; 1],
-    }
-
-    Ok(serde_json::to_string(&Request {
-        id: request_id,
-        op: operation.as_str(),
-        expiry_ms: expiry_ms.map(|value| value.to_string()),
-        args: [argument],
-    })?)
 }
 
 pub fn parse_okx_ws_order_response(
@@ -245,57 +191,7 @@ fn optional_u64(
 
 #[cfg(test)]
 mod tests {
-    use reap_core::{SelfTradePrevention, Side, TimeInForce};
-
     use super::*;
-    use crate::okx::OkxTradeMode;
-
-    fn place_order() -> OkxPlaceOrder {
-        OkxPlaceOrder {
-            symbol: "BTC-USDT-SWAP".to_string(),
-            trade_mode: OkxTradeMode::Cross,
-            side: Side::Buy,
-            time_in_force: TimeInForce::PostOnly,
-            price: 50_000.5,
-            qty: 0.01,
-            client_order_id: "reap123".to_string(),
-            reduce_only: true,
-            self_trade_prevention: Some(SelfTradePrevention::CancelMaker),
-        }
-    }
-
-    #[test]
-    fn websocket_place_uses_structured_rest_equivalent_argument_and_expiry() {
-        let request: serde_json::Value = serde_json::from_str(
-            &build_okx_ws_place_order_request("a1", 1_700_000_000_123, &place_order()).unwrap(),
-        )
-        .unwrap();
-
-        assert_eq!(request["id"], "a1");
-        assert_eq!(request["op"], OKX_WS_PLACE_ORDER_OP);
-        assert_eq!(request["expTime"], "1700000000123");
-        assert_eq!(request["args"][0]["instId"], "BTC-USDT-SWAP");
-        assert_eq!(request["args"][0]["tdMode"], "cross");
-        assert_eq!(request["args"][0]["ordType"], "post_only");
-        assert_eq!(request["args"][0]["clOrdId"], "reap123");
-        assert_eq!(request["args"][0]["reduceOnly"], true);
-        assert_eq!(request["args"][0]["stpMode"], "cancel_maker");
-    }
-
-    #[test]
-    fn websocket_cancel_requires_an_order_identifier() {
-        let error = build_okx_ws_cancel_order_request(
-            "a2",
-            &OkxCancelOrder {
-                symbol: "BTC-USDT".to_string(),
-                exchange_order_id: None,
-                client_order_id: None,
-            },
-        )
-        .unwrap_err();
-
-        assert!(matches!(error, OkxWsOrderProtocolError::InvalidOrder(_)));
-    }
 
     #[test]
     fn websocket_ack_and_exchange_rejection_are_distinct() {

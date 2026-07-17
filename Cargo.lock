@@ -444,6 +444,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glob"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
+
+[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1016,7 +1022,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
- "toml",
+ "toml 0.9.12+spec-1.1.0",
 ]
 
 [[package]]
@@ -1043,7 +1049,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
- "toml",
+ "toml 0.9.12+spec-1.1.0",
  "tracing",
  "url",
 ]
@@ -1058,9 +1064,11 @@ dependencies = [
  "reap-backtest",
  "reap-capture",
  "reap-core",
+ "reap-emergency-core",
  "reap-fault",
  "reap-feed",
  "reap-live",
+ "reap-okx-evidence-adapter",
  "reap-strategy",
  "reap-telemetry",
  "ring",
@@ -1069,7 +1077,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
- "toml",
+ "toml 0.9.12+spec-1.1.0",
  "zeroize",
 ]
 
@@ -1082,13 +1090,54 @@ dependencies = [
 ]
 
 [[package]]
+name = "reap-emergency-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "reap-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "toml 0.9.12+spec-1.1.0",
+ "url",
+]
+
+[[package]]
+name = "reap-emergency-runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "clap",
+ "reap-core",
+ "reap-emergency-core",
+ "reap-okx-emergency-adapter",
+ "reap-order",
+ "reap-telemetry",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "reap-engine"
 version = "0.1.0"
 dependencies = [
  "reap-core",
  "reap-risk",
  "reap-strategy",
- "toml",
+ "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
+name = "reap-evidence-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "thiserror",
 ]
 
 [[package]]
@@ -1111,7 +1160,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-tungstenite",
- "toml",
+ "toml 0.9.12+spec-1.1.0",
  "url",
 ]
 
@@ -1146,7 +1195,9 @@ dependencies = [
  "libc",
  "reap-core",
  "reap-engine",
+ "reap-evidence-core",
  "reap-feed",
+ "reap-okx-live-adapter",
  "reap-order",
  "reap-risk",
  "reap-storage",
@@ -1161,9 +1212,72 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-tungstenite",
- "toml",
+ "toml 0.9.12+spec-1.1.0",
  "tracing",
+ "trybuild",
  "url",
+]
+
+[[package]]
+name = "reap-okx-emergency-adapter"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "reap-emergency-core",
+ "reap-okx-wire",
+ "reap-venue",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "reap-okx-evidence-adapter"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "reap-evidence-core",
+ "reap-okx-wire",
+ "reap-venue",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "reap-okx-live-adapter"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "reap-core",
+ "reap-feed",
+ "reap-okx-wire",
+ "reap-order",
+ "reap-venue",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "trybuild",
+ "url",
+]
+
+[[package]]
+name = "reap-okx-wire"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "chrono",
+ "hmac",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -1206,6 +1320,7 @@ dependencies = [
  "reap-core",
  "serde",
  "serde_json",
+ "trybuild",
 ]
 
 [[package]]
@@ -1226,18 +1341,11 @@ dependencies = [
 name = "reap-venue"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "base64",
- "chrono",
- "hmac",
  "reap-core",
- "reqwest",
  "serde",
  "serde_json",
- "sha2",
  "thiserror",
- "tokio",
- "url",
+ "trybuild",
 ]
 
 [[package]]
@@ -1568,6 +1676,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "target-triple"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "591ef38edfb78ca4771ee32cf494cb8771944bee237a9b91fc9c1424ac4b777b"
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1578,6 +1692,15 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "termcolor"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
+dependencies = [
+ "winapi-util",
 ]
 
 [[package]]
@@ -1696,10 +1819,25 @@ dependencies = [
  "indexmap",
  "serde_core",
  "serde_spanned",
- "toml_datetime",
+ "toml_datetime 0.7.5+spec-1.1.0",
  "toml_parser",
  "toml_writer",
  "winnow 0.7.15",
+]
+
+[[package]]
+name = "toml"
+version = "1.1.2+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81f3d15e84cbcd896376e6730314d59fb5a87f31e4b038454184435cd57defee"
+dependencies = [
+ "indexmap",
+ "serde_core",
+ "serde_spanned",
+ "toml_datetime 1.1.1+spec-1.1.0",
+ "toml_parser",
+ "toml_writer",
+ "winnow 1.0.3",
 ]
 
 [[package]]
@@ -1707,6 +1845,15 @@ name = "toml_datetime"
 version = "0.7.5+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92e1cfed4a3038bc5a127e35a2d360f145e1f4b971b551a2ba5fd7aedf7e1347"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
+name = "toml_datetime"
+version = "1.1.1+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3165f65f62e28e0115a00b2ebdd37eb6f3b641855f9d636d3cd4103767159ad7"
 dependencies = [
  "serde_core",
 ]
@@ -1850,6 +1997,21 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
+name = "trybuild"
+version = "1.0.118"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06649c6f63d86604ba0c8950d5a1829fc9a17afd70fc6629f481d75b6a624c78"
+dependencies = [
+ "glob",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "target-triple",
+ "termcolor",
+ "toml 1.1.2+spec-1.1.0",
+]
 
 [[package]]
 name = "tungstenite"
@@ -2045,6 +2207,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf85cb06032201fa7c6f829d7db5a7e5aa45bcc0655327713065f6f0576731bf"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "winapi-util"
+version = "0.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
