@@ -1,8 +1,11 @@
 use std::future::Future;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use futures_util::FutureExt;
+use futures_util::future::BoxFuture;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use reap_okx_live_adapter::ForbiddenOrderObserver;
 use reap_order::{PacingPolicy, RequestKind, RequestPacer};
 use reap_venue::okx::{
@@ -10,8 +13,11 @@ use reap_venue::okx::{
     OkxSpreadOrderPagination, RestError,
 };
 use tokio::sync::mpsc;
+use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::{FORBIDDEN_PROOF_HARD_MAX_AGE_MS, ForbiddenProofPolicy};
+
+const MAX_CONCURRENT_FORBIDDEN_SCANS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ForbiddenOrderEvent {
@@ -121,6 +127,7 @@ pub(crate) struct ForbiddenSentinelPolicy {
     max_age: Duration,
     scan_interval: Duration,
     domain_timeout: Duration,
+    max_concurrent_scans: usize,
     max_pages: usize,
     pacing_policy: PacingPolicy,
 }
@@ -162,6 +169,15 @@ impl ForbiddenSentinelPolicy {
                 "forbidden scan timeout must be between 1 and {FORBIDDEN_PROOF_HARD_MAX_AGE_MS}ms"
             ));
         }
+        let max_concurrent_scans = concurrent_scan_bound(
+            Duration::from_millis(domain_timeout_ms),
+            Duration::from_millis(scan_interval_ms),
+        );
+        if max_concurrent_scans > MAX_CONCURRENT_FORBIDDEN_SCANS {
+            return Err(format!(
+                "forbidden scan timeout/interval ratio requires {max_concurrent_scans} concurrent scans, above the hard maximum {MAX_CONCURRENT_FORBIDDEN_SCANS}"
+            ));
+        }
         if max_pages == 0 {
             return Err("forbidden scan page cap must be positive".to_string());
         }
@@ -169,10 +185,17 @@ impl ForbiddenSentinelPolicy {
             max_age: Duration::from_millis(max_age_ms),
             scan_interval: Duration::from_millis(scan_interval_ms),
             domain_timeout: Duration::from_millis(domain_timeout_ms),
+            max_concurrent_scans,
             max_pages,
             pacing_policy,
         })
     }
+}
+
+fn concurrent_scan_bound(domain_timeout: Duration, scan_interval: Duration) -> usize {
+    let timeout_ms = domain_timeout.as_millis();
+    let interval_ms = scan_interval.as_millis().max(1);
+    usize::try_from(timeout_ms / interval_ms + 1).unwrap_or(usize::MAX)
 }
 
 #[async_trait]
@@ -220,6 +243,86 @@ enum ForbiddenScanResult {
     },
 }
 
+struct TaggedForbiddenScanResult {
+    generation: u64,
+    completed_at: Instant,
+    observed_at_ms: u64,
+    result: ForbiddenScanResult,
+}
+
+#[derive(Debug, Default)]
+struct ForbiddenScanOrder {
+    zero_generation_floor: u64,
+    latest_accepted_zero_generation: Option<u64>,
+}
+
+impl ForbiddenScanOrder {
+    fn accept(
+        &mut self,
+        generation: u64,
+        next_generation: u64,
+        result: ForbiddenScanResult,
+    ) -> Option<ForbiddenScanResult> {
+        if result != ForbiddenScanResult::VerifiedZero {
+            self.invalidate(next_generation);
+            return Some(result);
+        }
+        if generation < self.zero_generation_floor
+            || self
+                .latest_accepted_zero_generation
+                .is_some_and(|latest| generation <= latest)
+        {
+            return None;
+        }
+        self.latest_accepted_zero_generation = Some(generation);
+        Some(result)
+    }
+
+    fn invalidate(&mut self, next_generation: u64) {
+        self.zero_generation_floor = next_generation;
+        self.latest_accepted_zero_generation = None;
+    }
+}
+
+#[derive(Default)]
+struct ForbiddenEventOutbox {
+    failure: Option<ForbiddenOrderEvent>,
+    recovery: Option<ForbiddenOrderEvent>,
+}
+
+impl ForbiddenEventOutbox {
+    fn push(&mut self, event: ForbiddenOrderEvent) {
+        if event.state.is_verified_zero() {
+            self.recovery = Some(event);
+            return;
+        }
+        self.recovery = None;
+        let replace_failure = self.failure.as_ref().is_none_or(|pending| {
+            failure_priority(&event.state) >= failure_priority(&pending.state)
+        });
+        if replace_failure {
+            self.failure = Some(event);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.failure.is_none() && self.recovery.is_none()
+    }
+
+    fn pop_front(&mut self) -> Option<ForbiddenOrderEvent> {
+        self.failure.take().or_else(|| self.recovery.take())
+    }
+}
+
+fn failure_priority(state: &ForbiddenOrderState) -> u8 {
+    match state {
+        ForbiddenOrderState::VerifiedZero { .. } => 0,
+        ForbiddenOrderState::Expired { .. } => 1,
+        ForbiddenOrderState::Unverifiable { .. } => 2,
+        ForbiddenOrderState::NonZero { .. } => 3,
+    }
+}
+
 pub(crate) async fn run_forbidden_order_sentinel(
     account_id: String,
     observer: Arc<dyn ForbiddenOrderObserverPort>,
@@ -229,80 +332,151 @@ pub(crate) async fn run_forbidden_order_sentinel(
     let algo_pacer = RequestPacer::new(policy.pacing_policy.clone());
     let spread_pacer = RequestPacer::new(policy.pacing_policy.clone());
     let mut last_verified: Option<(Instant, u64)> = None;
+    let mut scans = FuturesUnordered::<BoxFuture<'static, TaggedForbiddenScanResult>>::new();
+    let mut scan_order = ForbiddenScanOrder::default();
+    let mut outbox = ForbiddenEventOutbox::default();
+    let mut next_generation = 0_u64;
+    let mut scan_starts = tokio::time::interval_at(Instant::now(), policy.scan_interval);
+    scan_starts.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
-        let scan_started = Instant::now();
-        let scan = scan_forbidden_orders(
-            observer.as_ref(),
-            policy.max_pages,
-            policy.domain_timeout,
-            &algo_pacer,
-            &spread_pacer,
-        );
-        tokio::pin!(scan);
-        let result = loop {
-            let expiry = last_verified.map(|(verified_at, _)| verified_at + policy.max_age);
-            tokio::select! {
-                result = &mut scan => break result,
-                _ = wait_until(expiry), if expiry.is_some() => {
-                    let (_, last_verified_at_ms) =
-                        last_verified.take().expect("guarded forbidden proof expiry");
-                    if events.send(ForbiddenOrderEvent {
+        let expiry = last_verified.map(|(verified_at, _)| verified_at + policy.max_age);
+        tokio::select! {
+            biased;
+            _ = wait_until(expiry), if expiry.is_some() => {
+                let (_, last_verified_at_ms) =
+                    last_verified.take().expect("guarded forbidden proof expiry");
+                scan_order.invalidate(next_generation);
+                outbox.push(ForbiddenOrderEvent {
+                    account_id: account_id.clone(),
+                    observed_at_ms: unix_time_ms(),
+                    state: ForbiddenOrderState::Expired {
+                        last_verified_at_ms,
+                        max_age_ms: duration_ms(policy.max_age),
+                    },
+                });
+            }
+            Some(completed) = scans.next(), if !scans.is_empty() => {
+                let Some(result) =
+                    scan_order.accept(completed.generation, next_generation, completed.result)
+                else {
+                    continue;
+                };
+                let state = match result {
+                    ForbiddenScanResult::VerifiedZero => {
+                        if Instant::now() >= completed.completed_at + policy.max_age {
+                            last_verified = None;
+                            scan_order.invalidate(next_generation);
+                            ForbiddenOrderState::Expired {
+                                last_verified_at_ms: completed.observed_at_ms,
+                                max_age_ms: duration_ms(policy.max_age),
+                            }
+                        } else {
+                            last_verified =
+                                Some((completed.completed_at, completed.observed_at_ms));
+                            ForbiddenOrderState::VerifiedZero {
+                                expires_at_ms: completed
+                                    .observed_at_ms
+                                    .saturating_add(duration_ms(policy.max_age)),
+                            }
+                        }
+                    }
+                    ForbiddenScanResult::NonZero {
+                        algo_orders_observed,
+                        spread_orders_observed,
+                    } => {
+                        last_verified = None;
+                        ForbiddenOrderState::NonZero {
+                            algo_orders_observed,
+                            spread_orders_observed,
+                        }
+                    }
+                    ForbiddenScanResult::Unverifiable { domain, reason } => {
+                        last_verified = None;
+                        ForbiddenOrderState::Unverifiable { domain, reason }
+                    }
+                };
+                outbox.push(ForbiddenOrderEvent {
+                    account_id: account_id.clone(),
+                    observed_at_ms: completed.observed_at_ms,
+                    state,
+                });
+            }
+            _ = scan_starts.tick() => {
+                if scans.len() >= policy.max_concurrent_scans {
+                    scans = FuturesUnordered::new();
+                    last_verified = None;
+                    scan_order.invalidate(next_generation);
+                    outbox.push(ForbiddenOrderEvent {
                         account_id: account_id.clone(),
                         observed_at_ms: unix_time_ms(),
-                        state: ForbiddenOrderState::Expired {
-                            last_verified_at_ms,
-                            max_age_ms: duration_ms(policy.max_age),
+                        state: ForbiddenOrderState::Unverifiable {
+                            domain: ForbiddenOrderDomain::Algo,
+                            reason: format!(
+                                "forbidden scan scheduler reached its bounded concurrency limit {}",
+                                policy.max_concurrent_scans
+                            ),
                         },
-                    }).await.is_err() {
-                        return;
+                    });
+                }
+                let generation = next_generation;
+                next_generation = next_generation.saturating_add(1);
+                scans.push(
+                    launch_forbidden_scan(
+                        generation,
+                        Arc::clone(&observer),
+                        policy.max_pages,
+                        policy.domain_timeout,
+                        algo_pacer.clone(),
+                        spread_pacer.clone(),
+                    )
+                    .boxed(),
+                );
+            }
+            permit = events.reserve(), if !outbox.is_empty() => {
+                match permit {
+                    Ok(permit) => {
+                        permit.send(
+                            outbox
+                                .pop_front()
+                                .expect("guarded forbidden event outbox"),
+                        );
                     }
+                    Err(_) => return,
                 }
             }
-        };
-
-        let observed_at_ms = unix_time_ms();
-        let state = match result {
-            ForbiddenScanResult::VerifiedZero => {
-                last_verified = Some((Instant::now(), observed_at_ms));
-                ForbiddenOrderState::VerifiedZero {
-                    expires_at_ms: observed_at_ms.saturating_add(duration_ms(policy.max_age)),
-                }
-            }
-            ForbiddenScanResult::NonZero {
-                algo_orders_observed,
-                spread_orders_observed,
-            } => {
-                last_verified = None;
-                ForbiddenOrderState::NonZero {
-                    algo_orders_observed,
-                    spread_orders_observed,
-                }
-            }
-            ForbiddenScanResult::Unverifiable { domain, reason } => {
-                last_verified = None;
-                ForbiddenOrderState::Unverifiable { domain, reason }
-            }
-        };
-        if events
-            .send(ForbiddenOrderEvent {
-                account_id: account_id.clone(),
-                observed_at_ms,
-                state,
-            })
-            .await
-            .is_err()
-        {
-            return;
+            _ = events.closed() => return,
         }
+    }
+}
 
-        tokio::time::sleep_until((scan_started + policy.scan_interval).into()).await;
+async fn launch_forbidden_scan(
+    generation: u64,
+    observer: Arc<dyn ForbiddenOrderObserverPort>,
+    max_pages: usize,
+    domain_timeout: Duration,
+    algo_pacer: RequestPacer,
+    spread_pacer: RequestPacer,
+) -> TaggedForbiddenScanResult {
+    let result = scan_forbidden_orders(
+        observer.as_ref(),
+        max_pages,
+        domain_timeout,
+        &algo_pacer,
+        &spread_pacer,
+    )
+    .await;
+    TaggedForbiddenScanResult {
+        generation,
+        completed_at: Instant::now(),
+        observed_at_ms: unix_time_ms(),
+        result,
     }
 }
 
 async fn wait_until(deadline: Option<Instant>) {
     match deadline {
-        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending::<()>().await,
     }
 }
@@ -841,19 +1015,23 @@ mod tests {
         assert_eq!(policy.max_age, Duration::from_secs(30));
         assert_eq!(policy.scan_interval, Duration::from_secs(15));
         assert_eq!(policy.domain_timeout, Duration::from_secs(60));
+        assert_eq!(policy.max_concurrent_scans, 5);
         assert!(ForbiddenSentinelPolicy::new(60_001, 15_000, 60_000, 64, no_pacing()).is_err());
         assert!(ForbiddenSentinelPolicy::new(30_000, 15_001, 60_000, 64, no_pacing()).is_err());
         assert!(ForbiddenSentinelPolicy::new(30_000, 15_000, 60_001, 64, no_pacing()).is_err());
+        assert!(ForbiddenSentinelPolicy::new(2, 1, 60_000, 64, no_pacing()).is_err());
     }
 
     #[tokio::test]
-    async fn task_requires_initial_zero_then_expires_and_rearms() {
+    async fn task_requires_initial_zero_and_expires_while_overlapping_scans_hang() {
         let observer = Arc::new(ObserverMock::default());
         observer.spread_response(SpreadResponse::Page(OkxSpreadOrderPage {
             orders: Vec::new(),
             next_end_id: None,
         }));
-        observer.spread_response(SpreadResponse::Hang);
+        for _ in 0..8 {
+            observer.spread_response(SpreadResponse::Hang);
+        }
         let (tx, mut rx) = mpsc::channel(8);
         let task = tokio::spawn(run_forbidden_order_sentinel(
             "main".to_string(),
@@ -880,14 +1058,168 @@ mod tests {
             unverifiable.state,
             ForbiddenOrderState::Unverifiable { .. }
         ));
-        let rearmed = tokio::time::timeout(Duration::from_millis(50), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(rearmed.state.is_verified_zero());
 
         task.abort();
         let _ = task.await;
+    }
+
+    async fn settle_spawned_tasks() {
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn call_count(observer: &ObserverMock, expected: &str) -> usize {
+        observer
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.as_str() == expected)
+            .count()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hung_scans_do_not_delay_half_age_scan_starts() {
+        let observer = Arc::new(ObserverMock::default());
+        for _ in 0..8 {
+            observer.algo_response(OkxAlgoOrderQuery::ConditionalAndOco, AlgoResponse::Hang);
+            observer.spread_response(SpreadResponse::Hang);
+        }
+        let (tx, _rx) = mpsc::channel(8);
+        let task = tokio::spawn(run_forbidden_order_sentinel(
+            "main".to_string(),
+            Arc::clone(&observer) as Arc<dyn ForbiddenOrderObserverPort>,
+            ForbiddenSentinelPolicy::new(40, 10, 100, 4, no_pacing()).unwrap(),
+            tx,
+        ));
+
+        settle_spawned_tasks().await;
+        for expected_starts in 1..=5 {
+            assert_eq!(
+                call_count(&observer, "algo:conditional,oco:None"),
+                expected_starts
+            );
+            assert_eq!(call_count(&observer, "spread:None"), expected_starts);
+            if expected_starts < 5 {
+                tokio::time::advance(Duration::from_millis(10)).await;
+                settle_spawned_tasks().await;
+            }
+        }
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_output_channel_does_not_delay_scan_starts() {
+        let observer = Arc::new(ObserverMock::default());
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(ForbiddenOrderEvent {
+            account_id: "occupied".to_string(),
+            observed_at_ms: 0,
+            state: ForbiddenOrderState::Expired {
+                last_verified_at_ms: 0,
+                max_age_ms: 1,
+            },
+        })
+        .unwrap();
+        let task = tokio::spawn(run_forbidden_order_sentinel(
+            "main".to_string(),
+            Arc::clone(&observer) as Arc<dyn ForbiddenOrderObserverPort>,
+            ForbiddenSentinelPolicy::new(40, 10, 100, 4, no_pacing()).unwrap(),
+            tx,
+        ));
+
+        settle_spawned_tasks().await;
+        for expected_starts in 1..=5 {
+            assert_eq!(call_count(&observer, "spread:None"), expected_starts);
+            if expected_starts < 5 {
+                tokio::time::advance(Duration::from_millis(10)).await;
+                settle_spawned_tasks().await;
+            }
+        }
+        assert_eq!(rx.try_recv().unwrap().account_id, "occupied");
+        assert!(rx.try_recv().is_err());
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[test]
+    fn out_of_order_zero_cannot_rearm_after_a_newer_failure() {
+        let mut order = ForbiddenScanOrder::default();
+        assert!(matches!(
+            order.accept(
+                1,
+                2,
+                ForbiddenScanResult::Unverifiable {
+                    domain: ForbiddenOrderDomain::Spread,
+                    reason: "newer scan failed".to_string(),
+                },
+            ),
+            Some(ForbiddenScanResult::Unverifiable { .. })
+        ));
+        assert_eq!(order.accept(0, 2, ForbiddenScanResult::VerifiedZero), None);
+        assert_eq!(order.accept(1, 2, ForbiddenScanResult::VerifiedZero), None);
+        assert_eq!(
+            order.accept(2, 3, ForbiddenScanResult::VerifiedZero),
+            Some(ForbiddenScanResult::VerifiedZero)
+        );
+    }
+
+    #[test]
+    fn older_failure_invalidates_a_newer_zero_until_a_post_failure_scan() {
+        let mut order = ForbiddenScanOrder::default();
+        assert_eq!(
+            order.accept(3, 4, ForbiddenScanResult::VerifiedZero),
+            Some(ForbiddenScanResult::VerifiedZero)
+        );
+        assert!(matches!(
+            order.accept(
+                1,
+                4,
+                ForbiddenScanResult::Unverifiable {
+                    domain: ForbiddenOrderDomain::Algo,
+                    reason: "older scan completed late".to_string(),
+                },
+            ),
+            Some(ForbiddenScanResult::Unverifiable { .. })
+        ));
+        assert_eq!(order.accept(3, 4, ForbiddenScanResult::VerifiedZero), None);
+        assert_eq!(
+            order.accept(4, 5, ForbiddenScanResult::VerifiedZero),
+            Some(ForbiddenScanResult::VerifiedZero)
+        );
+    }
+
+    #[test]
+    fn outbox_delivers_failure_before_a_later_recovery_and_drops_stale_zero() {
+        let zero = ForbiddenOrderEvent {
+            account_id: "main".to_string(),
+            observed_at_ms: 1,
+            state: ForbiddenOrderState::VerifiedZero { expires_at_ms: 31 },
+        };
+        let failure = ForbiddenOrderEvent {
+            account_id: "main".to_string(),
+            observed_at_ms: 2,
+            state: ForbiddenOrderState::Unverifiable {
+                domain: ForbiddenOrderDomain::Algo,
+                reason: "timeout".to_string(),
+            },
+        };
+        let recovery = ForbiddenOrderEvent {
+            account_id: "main".to_string(),
+            observed_at_ms: 3,
+            state: ForbiddenOrderState::VerifiedZero { expires_at_ms: 33 },
+        };
+        let mut outbox = ForbiddenEventOutbox::default();
+        outbox.push(zero);
+        outbox.push(failure.clone());
+        outbox.push(recovery.clone());
+        assert_eq!(outbox.pop_front(), Some(failure));
+        assert_eq!(outbox.pop_front(), Some(recovery));
+        assert!(outbox.is_empty());
     }
 
     #[test]
