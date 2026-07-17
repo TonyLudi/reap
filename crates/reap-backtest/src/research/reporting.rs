@@ -1,8 +1,6 @@
-use crate::BacktestExecutionConfig;
-
 use super::{
-    CandidateTrainingReport, FoldReport, ResearchAggregate, ResearchRunReport,
-    ResearchScenarioKind, RunAggregate, SelectionMetric,
+    CandidateTrainingReport, FoldReport, ResearchAggregate, ResearchGates, ResearchManifest,
+    ResearchRunReport, ResearchScenario, ResearchScenarioKind, RunAggregate, SelectionMetric,
 };
 
 impl RunAggregate {
@@ -261,19 +259,6 @@ pub(super) fn selection_score(aggregate: &RunAggregate, metric: SelectionMetric)
     score.is_finite().then_some(score)
 }
 
-pub(super) fn no_less_conservative(
-    stress: &BacktestExecutionConfig,
-    baseline: &BacktestExecutionConfig,
-) -> bool {
-    stress.latency_is_no_less_conservative_than(baseline)
-        && stress.depth_fill_conservative_threshold >= baseline.depth_fill_conservative_threshold
-        && stress.queue_ahead_multiplier >= baseline.queue_ahead_multiplier
-        && stress.historical_trade_fill_fraction <= baseline.historical_trade_fill_fraction
-        && stress.displayed_depth_fill_fraction <= baseline.displayed_depth_fill_fraction
-        && stress.derivative_leverage <= baseline.derivative_leverage
-        && stress.exchange_cmr_multiplier <= baseline.exchange_cmr_multiplier
-}
-
 pub(super) fn deployment_selection_failure(
     deployment_candidate_id: Option<&str>,
     selected_candidate_id: Option<&str>,
@@ -301,4 +286,298 @@ fn max_option(left: Option<u64>, right: Option<u64>) -> Option<u64> {
         (Some(left), Some(right)) => Some(left.max(right)),
         (left, right) => left.or(right),
     }
+}
+
+pub(super) fn training_failures(
+    runs: &[ResearchRunReport],
+    aggregate: &RunAggregate,
+    scenario: &ResearchScenario,
+    gates: &ResearchGates,
+) -> Vec<String> {
+    let mut failures = evidence_failures(runs, aggregate, scenario, gates);
+    if aggregate.input_events < gates.minimum_train_input_events_per_fold {
+        failures.push(format!(
+            "training input events {} below {}",
+            aggregate.input_events, gates.minimum_train_input_events_per_fold
+        ));
+    }
+    if aggregate.fills < gates.minimum_train_fills_per_fold {
+        failures.push(format!(
+            "training fills {} below {}",
+            aggregate.fills, gates.minimum_train_fills_per_fold
+        ));
+    }
+    if aggregate.funding_settlements < gates.minimum_train_funding_settlements_per_fold {
+        failures.push(format!(
+            "training funding settlements {} below {}",
+            aggregate.funding_settlements, gates.minimum_train_funding_settlements_per_fold
+        ));
+    }
+    failures
+}
+
+pub(super) fn test_failures(
+    runs: &[ResearchRunReport],
+    aggregate: &RunAggregate,
+    scenario: &ResearchScenario,
+    gates: &ResearchGates,
+) -> (Vec<String>, Vec<String>) {
+    let mut evidence = evidence_failures(runs, aggregate, scenario, gates);
+    if aggregate.input_events < gates.minimum_test_input_events_per_fold {
+        evidence.push(format!(
+            "test input events {} below {}",
+            aggregate.input_events, gates.minimum_test_input_events_per_fold
+        ));
+    }
+    if aggregate.fills < gates.minimum_test_fills_per_fold {
+        evidence.push(format!(
+            "test fills {} below {}",
+            aggregate.fills, gates.minimum_test_fills_per_fold
+        ));
+    }
+    if aggregate.funding_settlements < gates.minimum_test_funding_settlements_per_fold {
+        evidence.push(format!(
+            "test funding settlements {} below {}",
+            aggregate.funding_settlements, gates.minimum_test_funding_settlements_per_fold
+        ));
+    }
+    if aggregate.observed_duration_ns < gates.minimum_test_duration_ns_per_fold {
+        evidence.push(format!(
+            "test duration {} ns below {} ns",
+            aggregate.observed_duration_ns, gates.minimum_test_duration_ns_per_fold
+        ));
+    }
+
+    let mut performance = Vec::new();
+    if aggregate.net_pnl_usd < gates.minimum_test_pnl_usd_per_fold {
+        performance.push(format!(
+            "test PnL {} below {}",
+            aggregate.net_pnl_usd, gates.minimum_test_pnl_usd_per_fold
+        ));
+    }
+    if aggregate.maximum_drawdown_usd > gates.maximum_test_drawdown_usd {
+        performance.push(format!(
+            "test drawdown {} exceeds {}",
+            aggregate.maximum_drawdown_usd, gates.maximum_test_drawdown_usd
+        ));
+    }
+    if aggregate.maximum_abs_delta_usd > gates.maximum_test_abs_delta_usd {
+        performance.push(format!(
+            "test maximum absolute delta {} exceeds {}",
+            aggregate.maximum_abs_delta_usd, gates.maximum_test_abs_delta_usd
+        ));
+    }
+    if aggregate.maximum_final_abs_delta_usd > gates.maximum_test_final_abs_delta_usd {
+        performance.push(format!(
+            "test final absolute delta {} exceeds {}",
+            aggregate.maximum_final_abs_delta_usd, gates.maximum_test_final_abs_delta_usd
+        ));
+    }
+    if aggregate.maximum_abs_pending_delta_usd > gates.maximum_test_abs_pending_delta_usd {
+        performance.push(format!(
+            "test maximum absolute pending delta {} exceeds {}",
+            aggregate.maximum_abs_pending_delta_usd, gates.maximum_test_abs_pending_delta_usd
+        ));
+    }
+    if aggregate.maximum_final_abs_pending_delta_usd
+        > gates.maximum_test_final_abs_pending_delta_usd
+    {
+        performance.push(format!(
+            "test final absolute pending delta {} exceeds {}",
+            aggregate.maximum_final_abs_pending_delta_usd,
+            gates.maximum_test_final_abs_pending_delta_usd
+        ));
+    }
+    if aggregate.maximum_gross_exposure_usd > gates.maximum_test_gross_exposure_usd {
+        performance.push(format!(
+            "test maximum gross exposure {} exceeds {}",
+            aggregate.maximum_gross_exposure_usd, gates.maximum_test_gross_exposure_usd
+        ));
+    }
+    if aggregate.maximum_final_gross_exposure_usd > gates.maximum_test_final_gross_exposure_usd {
+        performance.push(format!(
+            "test final gross exposure {} exceeds {}",
+            aggregate.maximum_final_gross_exposure_usd, gates.maximum_test_final_gross_exposure_usd
+        ));
+    }
+    if aggregate.maximum_active_orders > gates.maximum_test_active_orders {
+        performance.push(format!(
+            "test maximum active orders {} exceeds {}",
+            aggregate.maximum_active_orders, gates.maximum_test_active_orders
+        ));
+    }
+    if aggregate.maximum_active_order_notional_usd > gates.maximum_test_active_order_notional_usd {
+        performance.push(format!(
+            "test maximum active-order notional {} exceeds {}",
+            aggregate.maximum_active_order_notional_usd,
+            gates.maximum_test_active_order_notional_usd
+        ));
+    }
+    if aggregate.maximum_final_active_order_notional_usd
+        > gates.maximum_test_final_active_order_notional_usd
+    {
+        performance.push(format!(
+            "test final active-order notional {} exceeds {}",
+            aggregate.maximum_final_active_order_notional_usd,
+            gates.maximum_test_final_active_order_notional_usd
+        ));
+    }
+    if aggregate.average_abs_delta_usd > gates.maximum_test_average_abs_delta_usd {
+        performance.push(format!(
+            "test average absolute delta {} exceeds {}",
+            aggregate.average_abs_delta_usd, gates.maximum_test_average_abs_delta_usd
+        ));
+    }
+    if aggregate.inventory_open_fraction > gates.maximum_inventory_open_fraction {
+        performance.push(format!(
+            "test inventory-open fraction {} exceeds {}",
+            aggregate.inventory_open_fraction, gates.maximum_inventory_open_fraction
+        ));
+    }
+    (evidence, performance)
+}
+
+fn evidence_failures(
+    runs: &[ResearchRunReport],
+    aggregate: &RunAggregate,
+    scenario: &ResearchScenario,
+    gates: &ResearchGates,
+) -> Vec<String> {
+    let mut failures = runs
+        .iter()
+        .filter_map(|run| {
+            run.error
+                .as_ref()
+                .map(|error| format!("dataset {} failed: {error}", run.dataset_id))
+        })
+        .collect::<Vec<_>>();
+    if aggregate.successful_runs != aggregate.runs {
+        failures.push(format!(
+            "only {} of {} runs completed",
+            aggregate.successful_runs, aggregate.runs
+        ));
+    }
+    if gates.require_complete_accounting && !aggregate.accounting_complete {
+        failures.push("accounting is incomplete".to_string());
+    }
+    if !aggregate.final_valuation_complete {
+        failures.push("one or more final portfolio/order valuations are incomplete".to_string());
+    }
+    if aggregate.strategy_halts > 0 {
+        failures.push(format!(
+            "{} backtest runs ended with a terminal strategy safety halt",
+            aggregate.strategy_halts
+        ));
+    }
+    if gates.require_calibrated_execution
+        && scenario.kind == ResearchScenarioKind::Baseline
+        && (!scenario.execution.calibrated || !aggregate.execution_calibrated)
+    {
+        failures.push("execution assumptions are not declared calibrated".to_string());
+    }
+    if aggregate.pending_non_funding_actions > gates.maximum_pending_non_funding_actions_per_fold {
+        failures.push(format!(
+            "{} non-funding actions remain pending, limit {}",
+            aggregate.pending_non_funding_actions,
+            gates.maximum_pending_non_funding_actions_per_fold
+        ));
+    }
+    if aggregate.maximum_terminal_pending_orders > gates.maximum_terminal_pending_orders_per_run {
+        failures.push(format!(
+            "up to {} exchange orders remain pending, limit {}",
+            aggregate.maximum_terminal_pending_orders,
+            gates.maximum_terminal_pending_orders_per_run
+        ));
+    }
+    if aggregate.maximum_terminal_pending_cancel_requests
+        > gates.maximum_terminal_pending_cancel_requests_per_run
+    {
+        failures.push(format!(
+            "up to {} cancel requests remain pending, limit {}",
+            aggregate.maximum_terminal_pending_cancel_requests,
+            gates.maximum_terminal_pending_cancel_requests_per_run
+        ));
+    }
+    for run in runs {
+        let Some(report) = &run.report else {
+            continue;
+        };
+        if report.input_clock_regressions > gates.maximum_clock_regressions_per_run {
+            failures.push(format!(
+                "dataset {} has {} clock regressions, limit {}",
+                run.dataset_id,
+                report.input_clock_regressions,
+                gates.maximum_clock_regressions_per_run
+            ));
+        }
+    }
+    failures
+}
+
+pub(super) fn overall_failures(
+    manifest: &ResearchManifest,
+    folds: &[FoldReport],
+    aggregate: &ResearchAggregate,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    if folds.len() < manifest.gates.minimum_folds {
+        failures.push(format!(
+            "fold count {} below {}",
+            folds.len(),
+            manifest.gates.minimum_folds
+        ));
+    }
+    let stress_count = manifest
+        .scenarios
+        .iter()
+        .filter(|scenario| scenario.kind == ResearchScenarioKind::Stress)
+        .count();
+    if stress_count < manifest.gates.minimum_stress_scenarios {
+        failures.push(format!(
+            "stress scenario count {} below {}",
+            stress_count, manifest.gates.minimum_stress_scenarios
+        ));
+    }
+    if let Some(expected) = manifest.deployment_candidate_id.as_deref() {
+        let mismatched_folds = folds
+            .iter()
+            .filter(|fold| fold.selected_candidate_id.as_deref() != Some(expected))
+            .map(|fold| fold.id.as_str())
+            .collect::<Vec<_>>();
+        if !mismatched_folds.is_empty() {
+            failures.push(format!(
+                "predeclared deployment candidate {expected} was not training-selected in folds: {}",
+                mismatched_folds.join(", ")
+            ));
+        }
+    }
+    if folds.iter().any(|fold| !fold.evidence_complete) {
+        failures.push("one or more folds have incomplete evidence".to_string());
+    }
+    if aggregate.passing_fold_fraction < manifest.gates.minimum_passing_fold_fraction {
+        failures.push(format!(
+            "passing fold fraction {} below {}",
+            aggregate.passing_fold_fraction, manifest.gates.minimum_passing_fold_fraction
+        ));
+    }
+    if aggregate.profitable_fold_fraction < manifest.gates.minimum_profitable_fold_fraction {
+        failures.push(format!(
+            "profitable baseline fold fraction {} below {}",
+            aggregate.profitable_fold_fraction, manifest.gates.minimum_profitable_fold_fraction
+        ));
+    }
+    if aggregate.stress_pass_fraction < manifest.gates.minimum_stress_pass_fraction {
+        failures.push(format!(
+            "stress pass fraction {} below {}",
+            aggregate.stress_pass_fraction, manifest.gates.minimum_stress_pass_fraction
+        ));
+    }
+    if aggregate.total_baseline_test_pnl_usd < manifest.gates.minimum_total_baseline_test_pnl_usd {
+        failures.push(format!(
+            "total baseline test PnL {} below {}",
+            aggregate.total_baseline_test_pnl_usd,
+            manifest.gates.minimum_total_baseline_test_pnl_usd
+        ));
+    }
+    failures
 }
