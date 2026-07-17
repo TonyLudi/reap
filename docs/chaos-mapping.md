@@ -15,9 +15,16 @@ The normative connectivity scope is
 generic Java gateway machinery in this mapping are evidence and design context,
 not grants of strategy authority. Goal A (Phases 0–5) of
 [chaos-connectivity-refactor-plan.md](chaos-connectivity-refactor-plan.md)
-enforces that capability boundary. The remaining Phase 6–9 structural
-decomposition is separate follow-on work; neither tranche is exchange
-certification or a production-approval claim.
+enforces that capability boundary. Goal B Phase 6 has removed the normal
+backtest-to-live dependency, Phase 7 has split runtime/research/capture
+responsibilities while retaining their single writers, and the Phase 8
+implementation candidate adds named shared decisions, linear regular
+authority, leased recovery, and adapter-owned command transport. Goal B is
+complete only if the focused and Phase 9 global gates are green in
+[its handoff](chaos-connectivity-goal-b-handoff.md). Neither tranche is
+exchange certification or a production-approval claim. The completed
+[Goal A record](chaos-connectivity-goal-a-handoff.md) remains the authority
+baseline.
 
 It is not a byte-for-byte port of the Java runtime, exchange abstractions, or
 control plane.
@@ -33,6 +40,22 @@ control plane.
 - **Not implemented**: the behavior is rejected at the live boundary rather
   than accepted with weaker semantics.
 - **Delegated**: intentionally owned by another Rust module or the deployment.
+
+## Capability Scope
+
+Parity status does not collapse the repository's trust planes:
+
+| Scope | Mapping rule |
+| --- | --- |
+| Current Chaos capability | Only the pinned supported iarb2 call path supplies requirements. It consumes plan-derived normalized inputs and emits regular PostOnly quote, regular IOC `CancelMaker` hedge, or canonical owned-regular cancel purposes. |
+| Reap safety hardening | Narrow metadata/reconciliation reads, readiness/host checks, regular CAA and owned cancellation, and read-only algo/spread zero proof are explicit Rust safety additions, not claims of Java strategy parity. |
+| Evidence and research | Credential-free capture and backtest/research, separately composed authenticated-read-only certification/collection, and offline independent verifiers remain outside live mutation. A passing artifact is evidence, not trading authority. |
+| Account-wide emergency recovery | The separate executable can enumerate/cancel regular, algo, and spread orders but can never submit. That incident scope is intentionally broader than Chaos and absent from live. |
+| Not implemented | Amend/batch amend, other regular profiles, algo/spread placement, margin-spot borrowing, master/group feeds, and production order entry remain unavailable even where generic Java or venue infrastructure exists. |
+
+The mapping remains pinned to the clean `../imm-strategy` revision
+`b6b120c7b7c466d8431bf082f3229328c5d7b2ae`. No generic `ExecAlgo`,
+gateway-processor, or eight-session-pool code widens the supported call path.
 
 ## Strategy Matrix
 
@@ -318,6 +341,65 @@ The following differences do not change the covered quote/hedge calculations:
   the documented CSV format, and now consume public OKX raw captures through
   the Rust adapter/reducer path.
 
+Goal B moves ownership without changing these mapped decisions. Pure live
+configuration/evidence contracts are owned below the runtime by
+`reap-live-contracts`, so `reap-backtest` no longer depends on `reap-live`.
+Live runtime responsibilities are split into composition, connectivity,
+dispatch, readiness/safety, reconciliation, and shutdown modules; research into
+configuration, execution, reporting, and verification; and capture into
+narrow configuration/runtime/writer/report/analysis/verification support
+modules. One top-level live coordinator and one capture writer still order
+their respective mutations.
+
+Repeated safety semantics now have named pure contracts:
+`HostHealthThresholdAssessment` owns host-threshold results;
+`CaptureCleanRunInputs` plus `capture_run_is_clean` owns capture clean-run
+classification; and `LiveCleanSoakInputs`, `LiveFaultFailureCode`, and
+`LiveFaultFailureClass` own live soak/fault classification. These are Rust
+safety/evidence consistency changes, not new Java behavior or new exchange
+capabilities.
+
+The final regular-order mapping is monotonic:
+
+```text
+Chaos Quote/Hedge
+  -> RegularExecutionPolicy -> ApprovedRegularSubmit
+  + gateway-bound GeneratedClientOrderId
+  -> OwnedRegularOrders::reserve_local
+  -> canonical PendingNew + ownership -> ReservedRegularSubmit
+  -> OkxOrderGateway -> PreparedRegularSubmit
+
+Chaos CancelOwned
+  -> RegularExecutionPolicy -> ApprovedRegularCancel
+  -> OkxOrderGateway -> PreparedRegularCancel
+
+PreparedRegularSubmit | PreparedRegularCancel
+  -> reap-okx-live-adapter command websocket
+  -> private OKX request bytes
+```
+
+Approval validates the exact mapped regular profile and ownership. For submit,
+a gateway-bound generator and the coordinator consume the approval while
+synchronously registering canonical `PendingNew` ownership; the gateway
+consumes the resulting reservation. For cancel, the gateway consumes the
+approved cancel directly. It validates binding, idempotency, and trade mode as
+applicable. The dispatcher reserves pacing before adapter IO. Only the live
+adapter authenticates the normal-live command session, correlates
+acknowledgements, owns reconnect/shutdown, and serializes the prepared value.
+The strategy/coordinator cannot construct venue DTOs, and neither evidence nor
+the separate cancel-only emergency root can reuse this chain to submit. The
+current normative Chaos plan uses exactly one command session per executing
+account; the Java eight-session pool remains reference-only.
+
+Restart authority is a Rust hardening boundary, not a Java parity claim:
+
+Only one-shot `recover_leased_jsonl(&mut StorageLease)` retains non-Clone recovery proofs from the exact canonical journal; ordinary path/byte recovery strips them. Proofs are consumed and rebound to the current gateway scope. This is a structural authority boundary rooted in an exclusively leased, operator-controlled journal, not cryptographic authentication of disk contents.
+
+Private updates, reconciliation rows, client-ID prefixes, reason strings, and
+ordinary parsers remain evidence-only. This hardening changes no journal,
+report, evidence, configuration, or intent schema and has no Java behavior
+counterpart.
+
 ## Connectivity Cross-Check
 
 Pinned Java `ChaosStrategyBase.doInit` subscribes to configured index data,
@@ -365,7 +447,7 @@ ownership reference rather than claiming file-format parity.
 | Java `AccountConfig` plus `OkUtils.loadAccountConfig` retain UID, account/position mode, and borrowing-related settings but do not model current `perm` or `ip` response fields | Rust retains API-key label, normalized permission set, and normalized IP bindings from the same authenticated `/api/v5/account/config`; bootstrap enforces exact configured scope, production evidence forbids `withdraw` and requires a binding, periodic checks detect drift, and schema-3 account certification re-derives the decision from raw responses | Intentional Rust credential hardening around the Java account-mode boundary, not strategy parity |
 | Java strategy entities retain an `Instrument` from `instrumentCache` and use its tick, lot/minimum size, currencies, and contract value throughout their lifetime | Strict exact-row `/api/v5/account/instruments` bootstrap plus paced periodic comparison of those fields and current hard order maxima, typed current `upcChg` parsing, and final limit-order maximum enforcement | Current-contract hardening: missing/unknown rules, non-live state, rule drift, an imminent announced change, or an oversized final order fails closed; the poll is isolated from the deadman heartbeat |
 | Java strategy entities receive maker/taker fees from `StrategyToolkit.getTransactionFee`; `ChaosEntity.sanityCheck` rejects taker below maker | Current private-instrument `groupId` plus authenticated `/api/v5/account/trade-fee` `feeGroup` selection for each exact spot symbol or derivative family, startup verification, and paced periodic checks | Current-contract hardening: Rust rejects fee underpricing and unreadable/deprecated-only fee data; the fee poll is isolated from the deadman heartbeat |
-| Eight `OkxNitroOrderSessionKeeper` instances with `BY_UNDERLYING` dispatch, websocket order protocol, and `OkxNitroOrderClient.onOrderSessionDisconnected` immediate `cancelAll()` | Rust materializes one plan-derived nonempty command lane per executing account, deduplicates configured symbols into dispatch families, creates no lane for a reference-only account, and treats legacy `order_websocket_sessions` only as a migration cap | The pinned Java eight-session topology is retained solely as a connectivity reference, not as strategy parity or a Rust cardinality requirement; fail-closed disconnect intent, bounded command lifecycle, ambiguity classification, and independent REST reconciliation remain required |
+| Eight `OkxNitroOrderSessionKeeper` instances with `BY_UNDERLYING` dispatch, websocket order protocol, and `OkxNitroOrderClient.onOrderSessionDisconnected` immediate `cancelAll()` | Rust materializes one plan-derived nonempty command lane per executing account, deduplicates configured symbols into dispatch families, creates no lane for a reference-only account, and treats legacy `order_websocket_sessions` only as a migration cap. Policy-issued submit approval is synchronously converted to canonical `ReservedRegularSubmit`; the gateway consumes that reservation or an approved cancel to create opaque `PreparedRegular*`. A nonseparable adapter bundle installs the private matching command slot before releasing the gateway, and the OKX live adapter alone owns normal-live command login/session/write/ack lifecycle and prepared-to-wire serialization. | The pinned Java eight-session topology is retained solely as a connectivity reference, not as strategy parity or a Rust cardinality requirement. The narrowed token chain admits only mapped regular Quote/Hedge/CancelOwned operations; fail-closed disconnect intent, bounded command lifecycle, ambiguity classification, and independent REST reconciliation remain required. |
 | Batch subscription manager, per-`WsSubArg` `EVENT_SUB` context updates, and retry limits | Bounded socket partitioning, exact unique serialized subscription-argument acknowledgement-set readiness, acknowledgement timeout, and exponential reconnect | Equivalent identity-bound lifecycle with different batching policy; duplicate acknowledgements are idempotent, while malformed or unexpected acknowledgements fail closed |
 | `OrderDetailUpdate` `tradeId`/`fillSz`/`fillPx` and `UserTrade` `tradeId`/`fee`/`feeCcy`/`execType` | Current OKX order-channel `tradeId` plus per-fill `fillFee`/`fillFeeCcy`, optional fills channel with fee-bearing order-update precedence under either arrival order, instrument-scoped once-only journal record, and raw-statement comparison | Current-contract strengthening; the pinned Java order-session fill derivation says fee is unavailable and its separate user-trade processing is commented out |
 | `OkxNitroRestClient.getFills` 100-row pages, 200 ms pacing, descending cursor pagination, and short-page completion | Authenticated read-only `/api/v5/trade/fills` collector with the same page size/pacing/completion rule, fail-closed page bound, raw response retention, bracketed account identity, and offline cursor replay | Lifecycle mapping with a current-contract endpoint adaptation; pinned Java reads Nitro spread trades while Reap certifies regular strategy fills |
@@ -576,6 +658,11 @@ cargo audit --deny warnings
 These commands run in least-privilege GitHub CI under the repository's exact
 Rust toolchain. This verifies the Rust implementation and dependency lockfile;
 it does not execute the private Java build or establish exchange certification.
+Credential-free public capture and deterministic backtest/research,
+separately composed authenticated-read-only account/fill/bill/deadman
+collection, and offline verification are evidence planes. They do not grant
+the normal live process a capability and cannot turn a passing artifact into
+production order entry.
 
 The local Java source was cross-checked directly. Running its tests additionally
 requires the private Java build environment and dependencies; this workspace

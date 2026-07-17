@@ -1,3 +1,14 @@
+# This Demo config admits only current Chaos regular execution: PostOnly quote,
+# IOC CancelMaker hedge, and canonical owned-regular cancel. In-process safety
+# owns canonical cleanup and regular Cancel All After. The separate cancel-only
+# emergency executable may enumerate/cancel regular, algo, and spread exposure
+# and arm regular/spread deadmen, but never submit an order. Authenticated
+# read-only evidence commands separately certify and verify deadman expiry.
+# Amend, algo/spread placement, other placement profiles, and production order
+# entry are unavailable.
+# Credential-free capture/research, authenticated-read-only evidence
+# collection, and offline verification use separate commands and are not
+# configured or authorized by this live file.
 [strategy]
 strategy_name = "reap-chaos-demo"
 underlying = "BTC"

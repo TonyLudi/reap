@@ -17,6 +17,10 @@ The governing principle is:
 
 The implementation plan is
 [chaos-connectivity-refactor-plan.md](chaos-connectivity-refactor-plan.md).
+The completed Goal A record is
+[chaos-connectivity-goal-a-handoff.md](chaos-connectivity-goal-a-handoff.md);
+the conditional Goal B verification record is
+[chaos-connectivity-goal-b-handoff.md](chaos-connectivity-goal-b-handoff.md).
 The words MUST, MUST NOT, SHOULD, and MAY are normative.
 
 ## Pinned Java Reference
@@ -105,7 +109,7 @@ be removed from that composition root.
 | Live safety and readiness | Bootstrap, reconcile, maintain regular deadman protection, and consume forbidden-domain proof | Canonical owned regular cancel and regular Cancel All After only |
 | Forbidden-domain observer | Prove that algo and spread pending order sets are empty | None |
 | Emergency account stop | Make an uncertain account safe independently of the live process | Enumerate/cancel regular, algo, and spread orders; arm regular/spread deadmen; never submit |
-| Offline evidence | Collect and verify account/exchange evidence outside the trading loop | None |
+| Evidence and research | Run credential-free capture/research, separately composed authenticated-read-only collection, and offline verification outside the trading loop | None |
 
 The emergency plane is not a superset object that the live process may hold in
 reserve. It MUST have a separate composition root and MUST NOT be constructible
@@ -183,16 +187,56 @@ matches pinned OKX `OkEntity`; quote amend/TIF/per-order-STP policy remains an
 intentional difference from the Java quoter.
 
 The Chaos decision layer SHOULD emit typed `Quote`, `Hedge`, and
-`CancelOwned` values. A regular execution policy MUST construct the final venue
-request and validate the complete field profile immediately before transport.
-Free-form strings such as the current `reason` field MAY remain as evidence,
-but MUST NOT be the authority that selects an order type.
+`CancelOwned` values. A regular execution policy MUST validate the complete
+field profile and consume the gateway-bound role needed to issue an opaque,
+one-shot approval. It does not construct a final venue request. Free-form
+strings such as the current `reason` field MAY remain as evidence, but MUST NOT
+be the authority that selects an order type or mints an approval.
+
+The normal regular-order authority chain is linear:
+
+```text
+Quote | Hedge
+  -> RegularExecutionPolicy -> ApprovedRegularSubmit
+  + gateway-bound GeneratedClientOrderId
+  -> OwnedRegularOrders::reserve_local
+  -> canonical PendingNew + ownership -> ReservedRegularSubmit
+  -> OkxOrderGateway -> PreparedRegularSubmit
+
+CancelOwned
+  -> RegularExecutionPolicy -> ApprovedRegularCancel
+  -> OkxOrderGateway -> PreparedRegularCancel
+
+PreparedRegularSubmit | PreparedRegularCancel
+  -> reap-okx-live-adapter
+  -> private OKX DTO / authenticated command bytes
+```
+
+For submit, the gateway-bound client-ID generator and coordinator consume the
+approval while synchronously reserving the canonical local identity before
+transport. `OkxOrderGateway` then consumes that reservation. For cancel, the
+gateway consumes the approved cancel directly. It validates the binding,
+enforces idempotency and configured trade mode as applicable, and creates one
+prepared command. The dispatcher reserves pacing before adapter IO. The
+adapter alone owns normal-live command websocket connect, login, write,
+acknowledgement correlation, reconnect, shutdown, and prepared-to-DTO
+conversion. No layer returns a raw transport, signer, request DTO, or reusable
+mutation token to its caller.
 
 Normal live safety MAY cancel a regular order reconstructed from durable state
-or authoritative reconciliation only when a documented ownership predicate
-proves its account, symbol, and Reap client identity. Unknown or foreign regular
-orders block readiness and require operator handling; they do not widen Chaos
-authority.
+or authoritative reconciliation only when a separately retained local or
+leased-journal ownership proof establishes its account, symbol, and Reap client
+identity. Reconciliation reconstructs observed state; it does not mint that
+proof. Unknown or foreign regular orders block readiness and require operator
+handling; they do not widen Chaos authority.
+
+Normal mutation authority can be recovered only from either the synchronous
+gateway-bound local reservation or the exact canonical journal under its
+exclusive lease. Private websocket rows, REST reconciliation rows, client-ID
+prefixes, symbols, free-form reasons, and ordinary JSONL parsers are evidence;
+none can mint an ownership or approval proof.
+
+Only one-shot `recover_leased_jsonl(&mut StorageLease)` retains non-Clone recovery proofs from the exact canonical journal; ordinary path/byte recovery strips them. Proofs are consumed and rebound to the current gateway scope. This is a structural authority boundary rooted in an exclusively leased, operator-controlled journal, not cryptographic authentication of disk contents.
 
 The Chaos and in-process live execution planes MUST NOT represent or reach:
 
@@ -224,9 +268,10 @@ The additional mutation/recovery identifiers are:
 | `EVIDENCE-ACCOUNT-READ` | Authenticated read-only account config, instruments, fees, orders, fills, bills, balances, and positions |
 | `TEST-FAULT-TRANSPORT` | Loopback-only fault proxy connectivity used by controlled tests |
 
-`ChaosConnectivityPlan` is the live strategy plan. Capture, offline evidence,
-emergency, and fault tooling MUST resolve their own narrow plans/contracts and
-MUST NOT union their capabilities into the Chaos plan.
+`ChaosConnectivityPlan` is the live strategy plan. Capture,
+authenticated-read-only evidence collection, offline verification, emergency,
+and fault tooling MUST resolve their own narrow plans/contracts and MUST NOT
+union their capabilities into the Chaos plan.
 
 ## Mode Composition
 
@@ -238,7 +283,7 @@ MUST NOT union their capabilities into the Chaos plan.
 | Production order entry | Unavailable |
 | Capture | Separate credential-free `CAPTURE-PUBLIC-MARKET` contract; no live/private role |
 | Emergency | Separate confirmed emergency plan and executable; no strategy or submit role |
-| Offline evidence | Separate read-only evidence plan/executable; no strategy or mutation role |
+| Evidence collection/verification | Separate authenticated-read-only collection and offline verification contracts/executables; no strategy or mutation role |
 
 Mode tests MUST prove absent roles are not merely disabled by a boolean after
 construction; their credentials, clients, sessions, and methods are not
@@ -249,7 +294,7 @@ constructed or reachable in that composition.
 The resolved plan MUST express paths and websocket channels explicitly. The
 following is the target allowlist by role; blank cells mean no authority.
 
-| Capability family | Live observation | Regular execution | Live safety/readiness | Forbidden observer | Emergency stop | Offline evidence |
+| Capability family | Live observation | Regular execution | Live safety/readiness | Forbidden observer | Emergency stop | Evidence/research |
 | --- | --- | --- | --- | --- | --- | --- |
 | Public books and required references | Subscribe |  | Observe health |  |  | Read/capture |
 | Private orders, account, positions, required fills | Subscribe/normalize |  | Reconcile health |  |  | Read/verify |
@@ -309,13 +354,26 @@ the strategy must fill.
   Additional private sockets require a documented ordering, isolation, or
   rate/capacity rationale; splitting one channel per socket by convention is
   forbidden.
-- Each executing account starts with one order-command shard. Account-scoped
+- The current resolver admits only two private channel shapes: positions alone
+  for an unused observation-only account, or account/orders/positions plus
+  fills exactly when configured for an executing account. It must not add a
+  channel merely to make the shapes uniform.
+- Private-session authority is non-Clone and transferred take-once. Its
+  consuming bootstrap is bound to the exact account, private destination,
+  connection identity, and complete packed subscription set selected by the
+  resolved plan. It may reconnect that same planned socket, but cannot split
+  the set, change the connection identity, or authenticate another socket.
+  Runtime and supervisor validation reject a private session count other than
+  one and duplicate connection identities.
+- Each executing account has exactly one order-command shard in the current
+  normative Chaos plan. Account-scoped
   dispatch families are derived from configured Chaos instruments, currently
   using the canonical OKX underlying key, and assigned deterministically to
   that shard.
-- Additional shards require an explicit measured capacity or fault-isolation
-  requirement in the plan. Every shard MUST own at least one dispatch family,
-  and tests MUST enforce configured exchange connection bounds.
+- Additional shards are outside this boundary. Admitting one requires a new
+  reviewed requirement, measured capacity or fault-isolation evidence, updated
+  plan/schema semantics, and acceptance tests; a legacy configured maximum
+  does not authorize another session.
 - `replicas_per_shard`, if introduced, MUST be separate from shard count.
   More than one replica may be claimed only after pre-write failover semantics
   make it safe to route before any bytes could have reached the exchange.
@@ -372,8 +430,16 @@ MUST enforce:
 - role clients expose explicit methods and cannot be converted into a broader
   client;
 - authenticated private-feed factories expose only the planned
-  orders/account/positions/required-fill channels, and order-command factories
-  expose only approved regular place/cancel operations;
+  orders/account/positions/required-fill channels, are non-Clone and take-once,
+  and bind reconnect-capable bootstrap to the exact single packed socket plan;
+- the adapter's order-command bootstrap consumes a non-Clone, take-once bound
+  gateway/session bundle, installs its adapter-private matching command slot,
+  and only then releases the gateway plus typed lifecycle/status observation;
+  it exposes no raw place/cancel method, transport, signer, DTO, login builder,
+  independently extractable session role, or reusable bundle;
+- approved, prepared, ownership, generator, dispatcher, and recovery authority
+  values are non-Clone and take-once, and late installation or replacement of
+  an order transport is rejected;
 - the live Chaos composition root cannot depend on emergency mutation types;
 - emergency and evidence adapters live in crates absent from the `reap-live`
   dependency graph; shared lower crates expose only credential-free
@@ -383,7 +449,10 @@ MUST enforce:
 - test fakes implement role ports rather than gaining production signing
   access; and
 - one coordinator remains the single writer of strategy, risk, and canonical
-  order state.
+  order state; and
+- the only `reap-order -> reap-storage` authority edge consumes the linear
+  leased-recovery proof described above; ordinary storage parsing remains
+  evidence-only.
 
 Rust visibility reduces accidental authority. Operational containment still
 requires dedicated accounts/keys where possible, secret separation, and
@@ -418,6 +487,10 @@ The boundary is structurally enforced when all of the following are true:
 - the normalized ordered Chaos intents and deterministic backtest fixtures are
   unchanged;
 - only Quote, Hedge, and CancelOwned can reach regular execution;
+- only a synchronous gateway-bound reservation or one-shot leased recovery can
+  establish canonical mutation ownership;
+- command websocket connect/login/write/ack/reconnect/shutdown and
+  prepared-to-wire lowering exist only in `reap-okx-live-adapter`;
 - Validate constructs no credential/network role, Observe constructs no
   mutation/CAA role, and Demo constructs only the approved live roles;
 - quote-capable accounts are blocked unless `acctStpMode = cancel_maker`;

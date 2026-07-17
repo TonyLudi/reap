@@ -14,9 +14,11 @@ The current Chaos exchange-authority contract is
 which of the generic venue/runtime capabilities described here may be composed
 for Chaos. The staged enforcement and responsibility split are tracked in
 [chaos-connectivity-refactor-plan.md](chaos-connectivity-refactor-plan.md).
-The audited surface and Goal A verification record are
+The audited surface and Goal A/Goal B disposition record are
 [chaos-connectivity-inventory.md](chaos-connectivity-inventory.md) and
 [chaos-connectivity-goal-a-handoff.md](chaos-connectivity-goal-a-handoff.md).
+The Phase 6–9 verification template and eventual result are
+[chaos-connectivity-goal-b-handoff.md](chaos-connectivity-goal-b-handoff.md).
 
 Goal A Phases 0–5 enforce the least-authority capability graph against the
 clean sibling `../imm-strategy` checkout pinned at
@@ -25,10 +27,15 @@ call path is a behavior-parity source. Generic Java gateway processors,
 algo-order execution, and the Java eight-session regular command pool do not
 authorize a Rust live capability or determine its cardinality.
 
-This completed capability tranche is not a production-readiness claim.
-Production order entry remains unavailable, target-host and credentialed
-exchange evidence remain operational gates, and Goal B Phases 6–9 still own the
-separate structural decomposition of large modules.
+This work is not a production-readiness claim. Goal B Phase 6 has lowered pure
+contracts and inverted the backtest dependency; Phase 7 has split live,
+research, and capture responsibilities without changing the single writer; and
+the Phase 8 implementation candidate centralizes shared decisions and narrows
+regular-order authority into the live adapter. Goal B is structurally complete
+only if the focused checks and Phase 9 global gate recorded in its handoff are
+green. Production order entry remains unavailable, and target-host and
+credentialed exchange evidence remain operational gates even after structural
+completion.
 
 ## Goals
 
@@ -51,6 +58,58 @@ separate structural decomposition of large modules.
 - Exact reproduction of Spring, Redis control plane, Luban bootstrapping, or
   Java infrastructure.
 - Premature thread-per-core/io_uring optimization before profiling.
+
+## Capability And Authority Planes
+
+The generic components below are not one union of authority. For the current
+Chaos composition, the following separation is mandatory:
+
+| Plane | Current scope |
+| --- | --- |
+| Chaos strategy capability | Plan-derived normalized book, trade, reference, order, account, position, and timer inputs; typed regular PostOnly quote, regular IOC `CancelMaker` hedge, and canonical owned-regular cancel purposes only. |
+| Reap safety hardening | Readiness, host/resource checks, narrow authenticated metadata and reconciliation reads, regular Cancel All After, canonical owned-regular cancellation, and read-only algo/spread zero proof. |
+| Evidence and research | Credential-free public capture and deterministic backtest/research, separately composed authenticated-read-only account/fill/bill/deadman collection, and offline independent verification. None can mutate live strategy state or authorize entry. |
+| Emergency recovery | A separate executable and adapter can enumerate/cancel account-wide regular, algo, and spread orders and arm regular/spread deadmen. It has no submit method and is absent from live. |
+| Not implemented | Amend/batch amend, other regular order profiles, algo/spread placement, margin-spot borrowing, master/group feeds, additional venues in the live composition, generic strategy plugins, and production order entry. |
+
+The behavior source remains only the supported call path in the clean sibling
+`../imm-strategy` checkout at
+`b6b120c7b7c466d8431bf082f3229328c5d7b2ae`. Generic Java gateway processors
+and `ExecAlgo` machinery are context, not authority.
+
+The final regular-order authority chain is intentionally monotonic and
+asymmetric:
+
+```text
+Quote | Hedge
+  -> RegularExecutionPolicy -> ApprovedRegularSubmit
+  + gateway-bound GeneratedClientOrderId
+  -> OwnedRegularOrders::reserve_local
+  -> canonical PendingNew + ownership -> ReservedRegularSubmit
+  -> OkxOrderGateway -> PreparedRegularSubmit
+
+CancelOwned
+  -> RegularExecutionPolicy -> ApprovedRegularCancel
+  -> OkxOrderGateway -> PreparedRegularCancel
+
+PreparedRegularSubmit | PreparedRegularCancel
+  -> adapter-owned order-command websocket
+  -> private OKX DTO / JSON
+```
+
+The strategy and coordinator never construct venue requests.
+`RegularExecutionPolicy` is the sole producer of approved values;
+for submit, the gateway-bound client-ID generator and coordinator consume the
+approval while making the synchronous canonical local reservation, and the
+gateway consumes the resulting `ReservedRegularSubmit`; for cancel, the gateway
+consumes the approved cancel directly. `OkxOrderGateway` validates identity,
+idempotency, and trade mode as applicable; the dispatcher reserves pacing
+before adapter IO; and
+`reap-okx-live-adapter` owns connection/login/write/acknowledgement lifecycle
+and the final prepared-to-wire conversion. Goal B cannot pass if `reap-live`
+retains that order-command websocket lifecycle or if a caller can construct,
+clone, reuse, or recover an opaque authority token outside the documented
+local-reservation or leased-journal path.
 
 ## Runtime Model
 
@@ -99,11 +158,17 @@ reap/
     reap-risk/
     reap-strategy/
     reap-engine/
+    reap-live-contracts/
     reap-backtest/
     reap-capture/
     reap-storage/
     reap-telemetry/
     reap-live/
+    reap-okx-live-adapter/
+    reap-okx-evidence-adapter/
+    reap-emergency-core/
+    reap-okx-emergency-adapter/
+    reap-emergency-runner/
     reap-fault/
     reap-cli/
 ```
@@ -119,6 +184,9 @@ Responsibilities:
 - Side, order type, time-in-force, liquidity, order status.
 - Normalized market events and private events.
 - Price/quantity helpers, tick/lot rounding.
+- Pure host-guard policy through `HostGuardConfig::assess_host_health` and the
+  shared `HostHealthThresholdAssessment`; telemetry supplies measurements but
+  does not redefine the thresholds.
 - Small fixed-capacity containers if needed by hot path.
 
 Example types:
@@ -152,7 +220,14 @@ Responsibilities:
 - Exchange parser modules such as OKX, Binance, Hyperliquid, etc.
 - Normalization from exchange payloads into `reap-core` events.
 - Venue-specific sequence, checksum, and channel semantics.
-- Venue-specific order request signing and response parsing.
+- Venue-specific public order protocol types and response parsing; authenticated
+  request signing belongs to role-owned wire adapters.
+
+For current Chaos, public OKX protocol types in this generic layer are not
+authenticated authority. Signing, credentials, websocket login construction,
+and prepared regular-order serialization remain private to role-owned adapter
+crates; `reap-venue` does not expose a broad production client to strategy or
+live composition.
 
 Suggested structure:
 
@@ -256,16 +331,28 @@ Order command routing and canonical order state.
 Responsibilities:
 
 - Client order id generation.
-- Idempotent new/cancel/replace handling.
+- Idempotent new/cancel handling; target replacement is cancel/new, not an
+  exchange amend capability.
 - Per-venue/account order gateway.
 - Rate limiting and request pacing.
-- A command-transport boundary that keeps canonical identity independent from
-  REST or authenticated websocket IO.
-- Authenticated websocket command sessions with bounded handshakes, login,
-  control writes, request expiry, and acknowledgements. Heartbeat telemetry is
-  best-effort at both bounded status queues so it cannot stall command IO;
-  ready/disconnected/fatal transitions remain lossless and drive fail-closed
-  cancellation plus reconciliation.
+- `RegularExecutionPolicy`, which is the only producer of opaque
+  `ApprovedRegularSubmit` and `ApprovedRegularCancel` values after validating
+  the exact Quote, Hedge, or CancelOwned profile and ownership proof.
+- `OwnedRegularOrders::reserve_local`, which consumes an approved submit plus a
+  gateway-bound generated client ID while atomically registering canonical
+  `PendingNew` ownership and emits `ReservedRegularSubmit`.
+- `OkxOrderGateway`, which consumes that submit reservation or an approved
+  cancel directly. It validates the gateway binding, enforces idempotency and
+  configured trade mode as applicable, and emits an opaque
+  `PreparedRegularSubmit` or `PreparedRegularCancel`. The dispatcher reserves
+  pacing before adapter IO; preparation itself is not a pacing grant.
+- Non-Clone, take-once policy scopes, roles, approvals, generators,
+  submit reservations, dispatchers, and prepared commands. The adapter keeps a
+  gateway and its command-session role in one nonseparable bundle and releases
+  the gateway only after its private command slot is installed.
+- A prepared-command transport boundary that keeps canonical identity
+  independent from REST or authenticated websocket IO. It accepts no raw
+  request DTO, algo/spread operation, amend, or arbitrary order profile.
 - Canonical order state reducer.
 - Typed one-to-one exchange/client order-ID binding from exchange acknowledgements,
   with contradictory journal history rejected and active bindings restored
@@ -301,12 +388,52 @@ Responsibilities:
   accepted and compared during reconciliation.
 - Missed cancel and unknown-order handling.
 
-Strategy code sends intents. The order layer owns what actually happened.
+Strategy code sends purposes. Policy approves the supported regular profile,
+the coordinator reserves submits synchronously, the gateway prepares submit
+reservations or approved cancels, and the order reducer owns what actually
+happened.
 
 ```text
-OrderIntent -> RiskGate -> OrderCommand -> VenueGateway
-VenueGateway -> RawAck/RawUpdate -> OrderReducer -> OrderEvent
+Quote/Hedge -> RiskGate -> RegularExecutionPolicy -> ApprovedRegularSubmit
+ApprovedRegularSubmit + GeneratedClientOrderId
+  -> OwnedRegularOrders::reserve_local -> ReservedRegularSubmit
+  -> OkxOrderGateway -> PreparedRegularSubmit -> Adapter
+CancelOwned -> RegularExecutionPolicy -> ApprovedRegularCancel
+  -> OkxOrderGateway -> PreparedRegularCancel -> Adapter
+AdapterAck/PrivateUpdate -> OrderReducer -> OrderEvent
 ```
+
+### `reap-okx-live-adapter`
+
+The role-specific authenticated OKX boundary for normal live operation.
+
+Responsibilities:
+
+- Own private-state, regular reconciliation, live-safety, forbidden-order
+  observation, and regular-order session factories without exposing a broad
+  authenticated client.
+- Own authenticated order-command websocket connection, login, bounded
+  control writes, request expiry, correlation, acknowledgement, reconnect, and
+  shutdown lifecycle.
+- Convert opaque `PreparedRegularSubmit` and `PreparedRegularCancel` values to
+  private OKX DTO/JSON only inside the adapter.
+- Hold each account-bound gateway and command-session role in one non-Clone
+  bundle. The bundle may transfer its approval scope, but it exposes no
+  gateway/dispatcher/session accessor. Consuming startup validates the
+  supplied destination and account, installs the adapter-private matching
+  command slot before spawn, and then returns the now-bound gateway, typed
+  lifecycle handle, and status receiver. The current Chaos plan starts exactly
+  one command shard for each executing account.
+- Do not return the transport, signer, login message, raw request method,
+  session factory, or exchange DTO.
+- Expose no arbitrary signer/transport/request escape and no algo, spread,
+  amend, or unsupported placement operation.
+
+Heartbeat telemetry is best-effort at bounded status queues so it cannot stall
+command IO. Ready/disconnected/fatal transitions remain lossless and drive
+fail-closed owned cancellation plus reconciliation through the live
+coordinator. The adapter owns transport; it does not own strategy, risk, or
+canonical order mutation.
 
 ### `reap-risk`
 
@@ -365,6 +492,16 @@ Live composition and lifecycle ownership.
 
 Responsibilities:
 
+- Compose the Phase 7 responsibility modules: `composition`,
+  `connectivity`, `dispatch`, `readiness_safety`, `reconciliation`, and
+  `shutdown`.
+- Retain one top-level `LiveRuntime`/`LiveCoordinator` writer that orders all
+  strategy, risk, and canonical order mutations. Subsystems perform IO or
+  return typed outcomes; they do not add a second state owner.
+- Use private named pure contracts for repeated classifications:
+  `LiveCleanSoakInputs` derives clean-soak status, while
+  `LiveFaultFailureCode` and `LiveFaultFailureClass` own exact fault-code
+  serialization and grouping across runtime reports and verification.
 - Wire feeds, book reducers, strategy, risk, order gateway, storage, telemetry.
 - Own task topology.
 - Own bounded channels and backpressure policy.
@@ -446,9 +583,9 @@ Responsibilities:
   maintenance, compare strategy-critical instrument rules and fee assumptions
   to authenticated current metadata, expire stale place requests at the venue,
   and own an independently scheduled exchange deadman lifecycle per account.
-- Expose a separate minimal-config emergency composition that bypasses strategy,
-  journal, websocket, and operator dependencies while cancelling and verifying
-  the regular, algo, and spread pending-order domains account-wide.
+- Direct operators to the separately composed emergency executable when
+  account-wide regular/algo/spread recovery is required. `reap-live` neither
+  imports nor constructs that mutation authority.
 
 Implemented topology:
 
@@ -546,15 +683,24 @@ session. The legacy `order_websocket_sessions` value is a one-window upper
 bound, not a requested pool size. The sample queue holds 4,096 commands against
 a credential-free four-ack-horizon threshold of 2,400.
 
-Compatible orders, account, positions, and optional fills subscriptions share
-one authenticated private-state socket per account. The socket must acknowledge
-the whole packed subscription set, and account plus positions must each deliver
-a real data payload before private recovery when both are planned. A completed
-fresh state-data round, rather than a socket pong or an event-only order/fill
-message, refreshes account-scoped private health. The dedicated fills channel is
-opt-in because OKX restricts it by fee tier; fills from the orders channel
-remain canonical. Any lost planned invariant blocks new orders while demo-mode
-cancels remain available.
+Exactly the plan-required subset of orders, account, positions, and optional
+fills subscriptions shares one authenticated private-state socket per account;
+an unused observation-only account may require positions alone. The socket
+must acknowledge the whole packed subscription set, and account plus positions
+must each deliver a real data payload before private recovery when both are
+planned. A completed fresh state-data round, rather than a socket pong or an
+event-only order/fill message, refreshes account-scoped private health. The
+dedicated fills channel is opt-in because OKX restricts it by fee tier; fills
+from the orders channel remain canonical. Any lost planned invariant blocks
+new orders while demo-mode cancels remain available.
+
+The account's private-session authority is non-Clone and transferred once. Its
+consuming factory binds authenticated bootstrap to the exact private
+destination, account, connection identity, and complete packed subscription
+set in the resolved plan. The bootstrap may be reused only by supervision to
+reconnect that same planned socket. Runtime rejects any private session count
+other than one, and feed supervision rejects duplicate connection identities;
+callers cannot split the packed set into extra authenticated sockets.
 
 Every account also runs one continuous, read-only forbidden-order sentinel. Its
 initial proof must exhaustively show zero pending orders across the seven OKX
@@ -602,20 +748,21 @@ be in flight while different underlying families can progress within the
 bounded lane. The current Chaos Demo plan assigns every derived family to
 exactly one nonempty command lane per executing account; Validate and Observe
 plans assign none, and reference-only accounts get no lane. Additional lanes
-require an explicit measured capacity or isolation consumer, and the legacy
+are outside the current normative Chaos boundary and require a separately
+reviewed measured-capacity or isolation change; the legacy
 `order_websocket_sessions` migration cap cannot create one. This preserves
 submit/cancel order within a family, matches the pinned Java family-routing key
 without copying its pool cardinality, and prevents one acknowledgement from
 blocking unrelated families. Every completion returns to the command owner and
 then to the single-writer coordinator; IO futures never mutate strategy state.
 
-The reconciliation task uses a cloned authenticated REST client and cannot be
-blocked by websocket acknowledgement latency. Command and reconciliation
-clients share account pacing reservations without holding a lock across an
-await. During fail-closed shutdown, an explicit command flush waits for all
-earlier cancels and command completions before zero-order REST reconciliation is
-queued. The command channel, per-family pending queues, total in-flight work,
-and reconciliation channel are all bounded.
+The reconciliation task uses a cloned narrow `RegularReconciliation` role and
+cannot be blocked by websocket acknowledgement latency. Command and
+reconciliation roles share account pacing reservations without holding a lock
+across an await. During fail-closed shutdown, an explicit command flush waits
+for all earlier cancels and command completions before zero-order REST
+reconciliation is queued. The command channel, per-family pending queues,
+total in-flight work, and reconciliation channel are all bounded.
 
 Private fill fees use one normalized contract: the amount is the signed balance
 delta, so a charge is negative and a rebate is positive, and the currency names
@@ -722,9 +869,28 @@ non-loopback listeners, mixed endpoint tuples, and reused evidence. Runtime
 fault switches are deliberately absent from `reap-live`; the process boundary
 keeps campaign authority out of normal trading state.
 
+### `reap-live-contracts`
+
+Pure serialized live configuration, connectivity-plan, mode, and
+account-certification contracts shared without importing the live runtime.
+Shared pacing policy lives in `reap-core`, and credential-free OKX connectivity
+keys live in `reap-venue`; neither requires the live runtime. These lower
+contracts have no networking, credential execution, host inspection, task
+ownership, or exchange mutation authority. Runtime implementations remain in
+`reap-live` and role adapters; research/backtest may depend only on the pure
+contract side.
+
 ### `reap-backtest`
 
 Replay and simulation.
+
+Its normal dependency graph ends at pure contracts and shared event/strategy
+crates. It consumes `reap-live-contracts` for serialized configuration and
+evidence compatibility and does not depend on `reap-live` or its runtime,
+network, credentials, host inspection, or mutation authority. Research
+ownership is split into `configuration`, `execution`, `reporting`, and
+`verification`; the top-level research module retains deterministic
+orchestration and schema compatibility.
 
 Responsibilities:
 
@@ -1084,6 +1250,12 @@ statement, deadman, or emergency evidence.
 
 Credential-free public market-data composition.
 
+Capture is split by responsibility into configuration, runtime, writer,
+report, analysis, verification, hashing, error, and cleanliness modules while
+retaining one bounded raw-writer owner. Both runtime reporting and independent
+verification use the private `CaptureCleanRunInputs` plus
+`capture_run_is_clean` decision; neither reimplements the clean-run predicate.
+
 Responsibilities:
 
 - Build explicit public-only subscription plans from TOML.
@@ -1153,6 +1325,13 @@ Responsibilities:
   lease acquired before recovery or network setup.
 - Streaming recovery with a validated-record visitor so offline evidence tools
   can retain only the needed event class instead of materializing a long journal.
+- One-shot leased recovery for mutation authority. Only
+  `recover_leased_jsonl(&mut StorageLease)` retains non-Clone recovery proofs
+  from the exact canonical journal; ordinary path/byte recovery strips them.
+  Proofs are consumed and rebound to the current gateway scope. This is a
+  structural authority boundary rooted in an exclusively leased,
+  operator-controlled journal, not cryptographic authentication of disk
+  contents.
 - Book snapshots.
 - JSONL initially, Parquet or binary logs later.
 
@@ -1160,6 +1339,12 @@ Normal storage must never block the hot path. Use bounded queues and explicit
 drop or degrade policies. Safety-control mutations are infrequent and may await
 durable media before dispatch because losing a kill across process restart is
 more dangerous than control-path latency.
+
+The narrow `reap-order -> reap-storage` production dependency exists solely so
+order recovery can consume that linear leased proof. It does not give order
+code general storage-derived authority: ordinary parsers, byte/path recovery,
+private observations, reconciliation rows, prefixes, and reasons remain
+evidence-only.
 
 ### `reap-telemetry`
 
@@ -1174,6 +1359,8 @@ Responsibilities:
 - Panic and task death reporting.
 - Bounded webhook alert delivery with timeout/retry limits and delivery-failure
   feedback to the live coordinator.
+- Measurement-side `HostHealthSnapshot::threshold_assessment`, delegating the
+  threshold decision to the pure core `HostGuardConfig` contract.
 
 Metrics should be cheap to emit and safe to drop under pressure.
 
@@ -1608,15 +1795,21 @@ the deployment blocker.
   Done. Execute and accept the credentialed target-host campaign and OKX demo
   soak; tooling alone does not close that gate.
 
-The implemented Phase 8 surface is a record of current capability, not a grant
-of permanent authority to the Chaos process. Goal A has separated broad
-emergency coverage, generic endpoint support, and Java-inspired connection-pool
-cardinality from normal strategy connectivity under the
-[Chaos connectivity boundary](chaos-connectivity-boundary.md). The
-[inventory](chaos-connectivity-inventory.md) and
-[Goal A handoff](chaos-connectivity-goal-a-handoff.md) record that boundary and
-its verification. This does not expose production order entry or complete the
-Goal B structural refactor.
+The implemented demo surface is a record of current capability, not a grant of
+permanent authority to the Chaos process. Goal A separated broad emergency
+coverage, generic endpoint support, and Java-inspired connection-pool
+cardinality from normal strategy connectivity. Goal B Phases 6 and 7 removed
+the live/backtest dependency and split responsibilities; the Phase 8
+implementation candidate names repeated safety decisions, binds regular
+authority linearly, and moves command websocket ownership into the adapter.
+Those claims become a completed structural result only when the focused and
+Phase 9 gates in the Goal B handoff are green. The
+[Chaos connectivity boundary](chaos-connectivity-boundary.md),
+[inventory](chaos-connectivity-inventory.md), and
+[Goal A handoff](chaos-connectivity-goal-a-handoff.md) record the authority
+history; the
+[Goal B handoff](chaos-connectivity-goal-b-handoff.md) records the conditional
+structural verification. None of this exposes production order entry.
 
 See [trading-readiness.md](trading-readiness.md) for the detailed gate.
 

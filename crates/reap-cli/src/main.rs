@@ -47,7 +47,10 @@ use production_evidence::verify_production_evidence_manifest_path;
 
 #[derive(Debug, Parser)]
 #[command(name = "reap")]
-#[command(about = "Rust chaos/iarb2 strategy, capture, backtest, replay, and OKX runtime")]
+#[command(
+    about = "Bounded Chaos/iarb2 demo runtime and separate evidence/research tools",
+    long_about = "Run the current Chaos/iarb2 Validate, Observe, or explicitly confirmed OKX Demo boundary plus credential-free capture, deterministic backtest/research, authenticated-read-only evidence collection, and offline verification. Production order entry and unsupported amend/algo/spread placement are unavailable; account-wide cancellation uses the separate reap-emergency executable."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -419,6 +422,10 @@ enum Command {
         #[arg(long)]
         pretty: bool,
     },
+    #[command(
+        about = "Validate, observe, or run the bounded regular-order Chaos demo",
+        long_about = "Resolve only the plan-derived Chaos connectivity boundary. Validate reads no credentials or network; Observe constructs no mutation role; explicitly confirmed Demo admits only approved regular PostOnly quote, IOC CancelMaker hedge, and owned-regular cancellation. In-process safety separately owns canonical cleanup of those orders and regular Cancel All After. The separate reap-emergency executable is cancel-only: it may enumerate/cancel regular, algo, and spread exposure and arm regular/spread deadmen, but never submit. Authenticated-read-only evidence commands separately certify deadman expiry. This command cannot run production entry, amend, or algo/spread placement."
+    )]
     Live {
         #[arg(short, long)]
         config: PathBuf,

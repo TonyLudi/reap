@@ -4,12 +4,34 @@
 cannot authorize a new order. `reap live` owns the implemented OKX lifecycle;
 production order entry remains intentionally unavailable.
 
-Goal A's completed capability-boundary work (Phases 0 through 5) does not make
-this repository production ready. It was verified without credentials or
-authenticated exchange traffic. The Chaos behavior reference remains the clean
+Goal A's completed capability-boundary work and Goal B's structural work do not
+make this repository production ready. Goal B Phases 6 and 7 have lowered pure
+contracts and split responsibilities; the Phase 8 implementation candidate
+adds named decisions, linear regular authority, leased recovery, and an
+adapter-owned command session. Goal B is structurally complete only when its
+[handoff](chaos-connectivity-goal-b-handoff.md) records green focused and Phase
+9 gates. This refactor uses no credentials or authenticated exchange traffic.
+It remains grounded in the completed
+[Goal A authority record](chaos-connectivity-goal-a-handoff.md). The Chaos
+behavior reference remains the clean
 `../imm-strategy` checkout at
 `b6b120c7b7c466d8431bf082f3229328c5d7b2ae`; broader Java gateway features do
 not widen the live Chaos authority described here.
+
+## Capability Separation
+
+Operators must keep these scopes distinct:
+
+| Scope | Operational rule |
+| --- | --- |
+| Current Chaos capability | Demo may submit only approved regular PostOnly quotes and regular IOC `CancelMaker` hedges, and cancel canonical owned regular orders. Validate has no credentials/network roles; Observe has no mutation role; production entry is unavailable. |
+| Reap safety hardening | Readiness, host guard, authenticated metadata/reconciliation reads, regular Cancel All After, canonical owned cancellation, and read-only algo/spread zero proof protect the Chaos path without adding unsupported placement authority. |
+| Evidence and research | Credential-free public capture and deterministic backtest/research, separately composed authenticated-read-only collection, and offline certification/verification have no live mutation authority. Stop live producers where a procedure requires it; never treat an evidence pass as authority to trade. |
+| Account-wide emergency recovery | `reap-emergency` is a separate confirmed incident executable. It may enumerate/cancel regular, algo, and spread orders and arm regular/spread deadmen, but it cannot submit and is not callable by live. |
+| Not implemented | Do not attempt amend/batch amend, market/GTC/FOK or algo/trigger/conditional/iceberg/TWAP/spread placement, margin-spot borrowing, master/group controls, other venue adapters, or production order entry. |
+
+All operational scope derives from the supported pinned Chaos/iarb2 call path,
+not the broader Java gateway or generic OKX API surface.
 
 ## Public Data Capture
 
@@ -218,6 +240,11 @@ redundant-socket disconnect can
 remain clean only when the other replica preserves sequence continuity;
 inspect disconnect, duplicate, and writer queue counts on every run.
 
+Runtime reporting and `verify-capture` both call the same private
+`CaptureCleanRunInputs`/`capture_run_is_clean` decision. Do not duplicate that
+truth table in a collector, verifier, script, or dashboard; the fields above
+explain the contract, while the named pure decision is authoritative in code.
+
 Raw and optional normalized writers use bounded channels. Event-loop enqueue
 waits at most one second; saturation stops capture instead of dropping a frame or
 waiting forever. Teardown allows five seconds for supervised-feed shutdown plus
@@ -279,6 +306,14 @@ cargo run -p reap-cli -- backtest \
 ```
 
 ### Backtest Execution Assumptions
+
+`reap-backtest` consumes pure serialized configuration/evidence through
+`reap-live-contracts`; it does not depend on or instantiate `reap-live`,
+networking, credentials, host inspection, or mutation authority. Research is
+split into configuration, execution, reporting, and verification modules but
+retains one deterministic scheduler/orchestrator. This dependency inversion
+does not change any backtest semantics or make simulation evidence live
+authorization.
 
 Strategy TOML may include:
 
@@ -1112,12 +1147,22 @@ outside source control.
    private domains together when the account belongs to another region.
 3. Before recovery, credentials, or network setup, the runtime canonicalizes
    the journal path and exclusively locks its sibling `<journal>.lock` file.
-   When enabled, the Linux host guard then checks journal-filesystem space,
-   available memory, and kernel clock synchronization.
-4. The runtime recovers the critical JSONL log and binds its checkpoint to the
+   It holds that lease continuously through startup. When enabled, the Linux
+   host guard first checks journal-filesystem space, available memory, and
+   kernel clock synchronization. Startup then resolves operator/alert secrets
+   and invokes one-shot `recover_leased_jsonl(&mut StorageLease)` on the exact
+   lease; that parse retains, but does not consume or rebind, recovered
+   ownership proofs. After authenticated account bootstrap creates the current
+   gateway scopes, the coordinator consumes and rebinds those proofs while
+   restoring canonical orders. The same still-held lease then transfers into
+   the sole storage writer. Ordinary path/byte recovery remains evidence-only
+   and cannot restore mutation authority.
+4. The runtime binds the recovered critical JSONL checkpoint to the
    strategy/config fingerprint. It rejects safety latches for accounts or
    symbols not owned by the current config. Do not share a storage path between
    strategy configs.
+
+   Only one-shot `recover_leased_jsonl(&mut StorageLease)` retains non-Clone recovery proofs from the exact canonical journal; ordinary path/byte recovery strips them. Proofs are consumed and rebound to the current gateway scope. This is a structural authority boundary rooted in an exclusively leased, operator-controlled journal, not cryptographic authentication of disk contents.
 5. It compares midpoint-adjusted local time with OKX `/api/v5/public/time` and
    fails bootstrap when skew exceeds `max_exchange_clock_skew_ms`. It then
    checks `/api/v5/system/status` and refuses startup when relevant
@@ -1156,8 +1201,14 @@ outside source control.
 10. It materializes only the plan's public subscriptions: each book has two
     named sequencing/deduplication/recovery replicas, while trades and
     reference inputs have one. For each account it opens one packed private
-    state socket carrying the required orders, account, positions, and optional
-    fills channels. Order-channel fills remain canonical. Transport
+    state socket carrying exactly that account's plan-required subset of
+    orders, account, positions, and optional fills channels; an unused
+    observation-only account may require positions alone. The non-Clone
+    session authority is taken once and binds
+    reconnect-capable bootstrap to that exact account, private destination,
+    connection identity, and full packed set; a count other than one, a
+    duplicate connection identity, or a split/substituted set is rejected.
+    Order-channel fills remain canonical. Transport
     acknowledgements alone are not private readiness: account and positions
     must each deliver a real data payload. Every transition of that complete
     private state to ready invalidates the earlier reconciliation and requires
@@ -1503,6 +1554,16 @@ recover.
 
 ## Process Ownership And Host Guard
 
+- Phase 7 divides live operation into composition, connectivity, dispatch,
+  readiness/safety, reconciliation, and shutdown responsibilities, but
+  `LiveRuntime`/`LiveCoordinator` remains the one ordered writer of strategy,
+  risk, and canonical order state. Treat any second mutable owner or
+  `Arc<Mutex<_>>` around those states as an architectural regression.
+- Core `HostGuardConfig::assess_host_health` produces the shared
+  `HostHealthThresholdAssessment`; telemetry's
+  `HostHealthSnapshot::threshold_assessment` supplies observed values to that
+  policy. Live, capture, reports, and verifiers must consume this named
+  decision instead of maintaining local threshold comparisons.
 - The journal's sibling lock file contains PID and acquisition-time metadata
   and is mode `0600` on Unix. The kernel file lock, not the file's existence or
   metadata, is authoritative. A stale lock file after a crash is expected; do
@@ -1511,6 +1572,13 @@ recover.
   aliases contend for the same lease. The lease remains owned by the runtime
   even if the storage writer task fails and is released only during teardown or
   failed startup cleanup.
+- The lease excludes cooperating users/processes that honor the same canonical
+  lock and protects against path aliases. It is not cryptographic
+  authentication of journal bytes and cannot stop a noncooperating same-user
+  writer, path substitution before canonicalization/lease acquisition, or a
+  host/process compromise. Treat the journal and its parent as
+  operator-controlled security state; never infer exchange truth solely from
+  the local proof.
 - Live config/run-option validation and exact source/build/host provenance are
   completed before `--output` reservation. After reservation, raw startup task
   handles remain abort-on-drop until ownership transfers into `LiveRuntime`, so
@@ -1598,7 +1666,9 @@ regular/algo/spread authority is deliberately broader than live Chaos and MUST
 NOT be used as evidence that the strategy needs those mutation APIs. That
 authority is outside the live dependency and composition surface. The regular,
 algo, and spread workflows own independent progress, pacing, and failure
-handling.
+handling. The emergency adapter exposes cancellation and proof only: it has no
+regular, algo, or spread submit operation and must never be used as a normal
+strategy gateway.
 
 The command covers all documented pending-order domains on each selected OKX
 account, including regular symbols not configured in the strategy: regular
@@ -1822,13 +1892,38 @@ only after review.
 
 ## Order Path
 
-- The coordinator generates the client order ID and synchronously records a
-  canonical `PendingNew` before dispatching to the account gateway task. The
-  intent, pending state, and request are enqueued to critical storage before
-  authenticated websocket write begins.
+- `RegularExecutionPolicy` can issue only opaque `ApprovedRegularSubmit` and
+  `ApprovedRegularCancel` values after the exact Quote/Hedge/CancelOwned
+  profile and ownership-proof checks. Free-form reason strings, private
+  observations, reconciliation rows, and client-ID prefixes cannot create
+  approval.
+- Submit is deliberately asymmetric with cancel. A gateway-bound
+  `GeneratedClientOrderId` and `ApprovedRegularSubmit` are consumed by
+  `OwnedRegularOrders::reserve_local`, which creates canonical `PendingNew`
+  ownership and returns one opaque `ReservedRegularSubmit`.
+  `OkxOrderGateway` validates that reservation, idempotency, account, and trade
+  mode and consumes it to emit `PreparedRegularSubmit`. An
+  `ApprovedRegularCancel` already carries canonical ownership and goes
+  directly through the gateway to `PreparedRegularCancel`. The canonical
+  intent/request records are enqueued to critical storage, and the dispatcher
+  reserves pacing, before adapter IO.
+- `reap-okx-live-adapter` owns the authenticated order-command websocket
+  connection/login/write/acknowledgement/reconnect/shutdown lifecycle and is
+  the only normal-live component that converts prepared values to private OKX
+  DTO/JSON. An account-bound nonseparable bundle exposes no independently
+  extractable gateway/session pair. Consuming startup validates the supplied
+  destination and account, installs the private matching command slot before
+  spawn, and returns the now-bound gateway plus typed lifecycle/status
+  observation. It exposes no transport, signer, dispatcher, or late-install
+  hook. The strategy, coordinator, and gateway caller cannot construct raw
+  regular requests or recover those internals. Separately composed emergency
+  tooling may construct its allowlisted cancel-only DTOs, but it cannot receive
+  or reuse the normal-live prepared-command chain or transport and cannot place
+  an order.
 - Demo order entry requires every nonempty account command lane in the resolved
-  Chaos connectivity plan. The current plan derives one lane per executing
-  account and stable underlying keys deduplicate related spot/swap/future
+  Chaos connectivity plan. The current normative plan derives exactly one lane
+  per executing account, and stable underlying keys deduplicate related
+  spot/swap/future
   symbols into one dispatch family. Reference-only accounts construct no
   mutation role or order-command session.
 - `order_websocket_sessions` is accepted for one migration window only as a
@@ -1837,7 +1932,8 @@ only after review.
   plan-derived replica count: books require two named recovery replicas, while
   trades and references require one. Validation emits both deprecations and
   rejects a cap below a mandatory plan count.
-- Connection/login and control writes are bounded, including the shutdown close.
+- Adapter-owned connection/login and control writes are bounded, including the
+  shutdown close.
   Pong-derived heartbeat status uses non-blocking delivery at both bounded
   telemetry queues; saturation drops only that redundant heartbeat. Ready,
   disconnect, and fatal transitions remain lossless, so telemetry backpressure
@@ -2766,6 +2862,12 @@ exchange-status block/check, authenticated instrument drift/check, authenticated
 exchange-fee drift/check, and authenticated account-config drift/check failures
 use distinct stable failure codes; do not classify them by matching
 `failure.message`.
+Runtime/fault reporting and verification share `LiveFaultFailureCode` and
+`LiveFaultFailureClass` for those exact codes, and both derive clean-soak status
+from `LiveCleanSoakInputs`. Host snapshots delegate threshold evaluation to
+`HostGuardConfig::assess_host_health` through
+`HostHealthSnapshot::threshold_assessment`. Do not reimplement these decisions
+in operational scripts.
 When enabled, it includes host preflight/last snapshots and check count plus
 alert delivery and queue evidence. A runtime/teardown failure additionally
 records its stable code and bounded message after cleanup while retaining a

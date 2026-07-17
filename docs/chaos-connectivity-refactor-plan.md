@@ -1,7 +1,13 @@
 # Chaos Connectivity Refactor Plan
 
-Status: Goal A (Phases 0–5 and the Tranche A gate) implemented; Goal B
-(Phases 6–9) pending. This is not a production-readiness claim.
+Status: Goal A (Phases 0–5 and the Tranche A gate) implemented. Goal B Phases
+6–8 are implemented through commit
+`246f5b21d046dc20fd84460c7b59346231d6107f`: named safety contracts, linear
+regular authority, leased recovery, and the adapter-owned order-command
+websocket are committed. The final focused exit gate and the Phase 9 global
+gate remain to be recorded. Goal B is not complete unless
+[chaos-connectivity-goal-b-handoff.md](chaos-connectivity-goal-b-handoff.md)
+records every required gate as green. This is not a production-readiness claim.
 
 This is a finite, goal-ready refactor plan for enforcing
 [chaos-connectivity-boundary.md](chaos-connectivity-boundary.md) and then
@@ -17,6 +23,19 @@ Related context:
 - [operations.md](operations.md) defines live and emergency procedures.
 - [trading-readiness.md](trading-readiness.md) remains the production-readiness
   gate; this refactor does not satisfy that gate.
+- [chaos-connectivity-goal-a-handoff.md](chaos-connectivity-goal-a-handoff.md)
+  is the completed Phases 0–5 record.
+- [chaos-connectivity-goal-b-handoff.md](chaos-connectivity-goal-b-handoff.md)
+  is the conditional Phases 6–9 verification and handoff record.
+
+Current Goal B progress:
+
+| Phase | Status |
+| --- | --- |
+| Phase 6 | Implemented: pure pacing/key/host/live/account-certification contracts were lowered, and `reap-backtest` now depends on `reap-live-contracts` rather than `reap-live`. |
+| Phase 7 | Implemented: live, research, and capture responsibilities were split while preserving their ordered single writers and serialized behavior. |
+| Phase 8 | Implemented and committed: named host/capture/live decisions, the opaque approved/prepared chain, leased recovery, and an adapter-owned command websocket. Final focused tests and source guards still must be recorded against the documentation/verification base. |
+| Phase 9 | In progress: documentation and the handoff template are being reconciled; the full global command gate remains. |
 
 ## Goal Execution Contract
 
@@ -108,15 +127,17 @@ authority and responsibility.
 ## Phase 0 Deviation Ledger
 
 This table records the pre-refactor implementation that Phase 0 verified and
-expanded before code changes. The current Goal A disposition is in
-[chaos-connectivity-inventory.md](chaos-connectivity-inventory.md).
+expanded before code changes. The completed Goal A authority disposition and
+the final Goal B structural overlay are both recorded in
+[chaos-connectivity-inventory.md](chaos-connectivity-inventory.md), with exact
+verification evidence in their respective handoffs.
 
 | ID | Phase 0 implementation | Target |
 | --- | --- | --- |
 | `D01` | Public `OkxSigner::signature`/`sign_request`/`websocket_login`/credential access, `OkxRestClient::signer`, `SignedRequest`, `HttpTransport::execute`, and the broad REST client are bypass paths | Private role-owned wire adapters and narrow authenticated session factories |
 | `D02` | Wildcard `okx` and `reap-live` exports widen accidental reachability | Explicit exports grouped by role |
 | `D03` | Rust live `MarketEvent::Trade` only advances time, but pinned Java uses public trades to invalidate implied OKX depth and schedule repricing | Retain plan-derived live trades and record the behavior gap; do not remove them in this no-semantic-change refactor |
-| `D04` | Config defaults to eight order websocket sessions; each family hashes to one session, there is no safe failover, and readiness requires every session | Start with one non-idle command shard per account; add shards only for measured capacity/isolation and model real replicas separately |
+| `D04` | Config defaults to eight order websocket sessions; each family hashes to one session, there is no safe failover, and readiness requires every session | Use exactly one non-idle command shard per executing account in the current normative Chaos plan; any additional shard is a separately reviewed future capability |
 | `D05` | The live maintenance filter treats spread trading as fatal to Chaos | Derive service/product relevance from the Chaos plan |
 | `D06` | Live regular reconciliation does not prove pending algo/spread domains empty | Add a read-only startup and recurring forbidden-domain sentinel |
 | `D07` | Emergency enumeration combines regular, seven algo query families, and spread before cancellation; an unsupported-domain failure can delay regular mitigation | Independent workflows, pacers, progress, and zero proofs with independent enforcement of one shared absolute per-account deadline |
@@ -373,9 +394,10 @@ Actions:
   failure-domain tests pass. Additional private sockets need an explicit tested
   ordering/isolation/capacity requirement.
 - Derive account-scoped order dispatch families from configured instruments.
-  Start with one active command shard per account, assign every family to
-  exactly one shard, and add a shard only for a measured capacity/isolation
-  requirement. Every shard must be nonempty.
+  Use exactly one active command shard per executing account and assign every
+  family to it. Do not add a shard in this goal; a future measured
+  capacity/isolation change requires separate boundary review. Every created
+  shard must be nonempty.
 - Separate `shard_count` from any future `replicas_per_shard`. Keep replicas at
   one until safe pre-write failover exists and is tested.
 - Make readiness depend on every planned lane/subscription and on no unused
@@ -511,6 +533,10 @@ files.
 
 ### Phase 6: Move Pure Contracts Below Live
 
+Status: implemented by commits `0915bdb`, `64b2d55`, `2ea108f`, `51ea2b0`,
+and `b6eb537`. `cargo tree -p reap-backtest -e normal --locked` contains
+`reap-live-contracts` and no `reap-live` edge.
+
 Actions:
 
 - Inventory why `reap-backtest` depends on `reap-live`.
@@ -536,6 +562,13 @@ Exit gate:
 Suggested commits: one contract family at a time, then dependency removal.
 
 ### Phase 7: Split State By Responsibility
+
+Status: implemented by commits `9eef036`, `aad0630`, `ad3e9b7`, `cc88a15`,
+`4951e70`, and `1d2b0f8`. Live runtime modules are `composition`,
+`connectivity`, `dispatch`, `readiness_safety`, `reconciliation`, and
+`shutdown`; research modules are `configuration`, `execution`, `reporting`,
+and `verification`; capture uses narrow configuration/runtime/writer/report/
+analysis/verification support modules. Ordered owners remain explicit.
 
 Actions:
 
@@ -569,14 +602,61 @@ commits.
 
 ### Phase 8: Centralize Safety Semantics And Public Surface
 
+Status: exit gate pending. Commits `dd0d5db` and `2f172e8` implement the named
+host/capture/live decisions, and
+`38babe6e4d12d598730d3c79aeeccbbec1ec018d` implements the linear
+regular-authority and leased-recovery slice. Commit
+`246f5b21d046dc20fd84460c7b59346231d6107f` implements the adapter-owned
+order-command slice. All final focused checks must be recorded before the phase
+is green.
+
 Actions:
 
 - Centralize duplicated safety-event classification and fail-closed transition
   semantics used by config, runtime, and verification.
+- Keep the implemented names stable:
+  `HostHealthThresholdAssessment`/`HostGuardConfig::assess_host_health` for
+  host thresholds, `CaptureCleanRunInputs`/`capture_run_is_clean` for capture
+  cleanliness, and `LiveCleanSoakInputs` plus
+  `LiveFaultFailureCode`/`LiveFaultFailureClass` for live soak/fault evidence.
 - Keep pure decision functions separate from side effects and transport.
 - Replace remaining glob exports that cross the defined authority/dependency
   boundaries with explicit, role-oriented exports; do not turn this into
   workspace-wide API-style churn.
+- Make `RegularExecutionPolicy` the sole producer of opaque
+  `ApprovedRegularSubmit`/`ApprovedRegularCancel` values. For submit, the
+  gateway-bound generator and coordinator consume the approval while
+  synchronously registering canonical `PendingNew` ownership and produce
+  `ReservedRegularSubmit`; `OkxOrderGateway` consumes that reservation. For
+  cancel, the gateway consumes the approved cancel directly. It validates
+  binding, idempotency, and trade mode as applicable and produces opaque
+  `PreparedRegularSubmit`/`PreparedRegularCancel`; the dispatcher reserves
+  pacing before adapter IO.
+- Keep every scope, mutation role, approval, submit reservation, generator,
+  dispatcher, prepared command, and recovered ownership proof non-Clone and
+  take-once. Reject dispatcher/session reuse and destination/account mismatch.
+- Permit mutation ownership recovery only through
+  `recover_leased_jsonl(&mut StorageLease)`. Ordinary path/byte recovery,
+  private observations, reconciliation rows, client-ID prefixes, and reason
+  strings must not retain or mint authority. Consume each recovered proof and
+  rebind it to the current gateway scope without changing a journal schema.
+- Move the authenticated order-command websocket connection, login,
+  write/acknowledgement correlation, reconnect/shutdown lifecycle, and final
+  prepared-to-private-OKX DTO/JSON conversion into
+  `reap-okx-live-adapter`. The adapter consumes an account-bound nonseparable
+  gateway/session bundle. Consuming startup validates the supplied destination
+  and account, installs its private matching command slot before spawn, and
+  only then returns the now-bound gateway plus typed lifecycle/status
+  observation. `reap-live` must not own or receive an independently
+  extractable session role, raw authenticated protocol, transport, signer,
+  login builder, or request DTO.
+- Keep the current normative Chaos plan at exactly one order-command shard per
+  executing account. The pinned Java eight-session pool remains reference-only.
+- Make private-state session authority non-Clone and take-once. Bind its
+  reconnect-capable bootstrap to the exact single packed private socket plan
+  (account, destination, connection identity, and complete subscription set);
+  reject another session, split set, substituted plan, or duplicate connection
+  identity.
 - Document crate ownership and forbidden dependency directions.
 - Add dependency/visibility checks that fail when emergency or raw wire
   authority leaks back into live execution.
@@ -585,11 +665,29 @@ Exit gate:
 
 - One named contract owns each safety classification.
 - Public APIs correspond to supported roles, not source-file contents.
+- Strategy/coordinator callers cannot construct approved or prepared values,
+  the gateway cannot accept raw order DTOs, and only the adapter can lower a
+  prepared value to authenticated command bytes.
+- Ordinary path/byte recovery and all untrusted/private/reconciliation inputs
+  cannot retain or mint regular mutation authority; leased recovery is
+  non-Clone, take-once, exact-journal-bound, and gateway-rebound.
+- The order-command websocket lifecycle is absent from `reap-live`; the live
+  adapter exposes no transport, login builder, raw request, amend, algo/spread,
+  arbitrary request, or signer escape.
+- The current executable Demo plan creates exactly one command session per
+  executing account. A nonempty mismatched account/symbol/client ID, a
+  non-string identity field, or an accepted empty/untrimmed/zero exchange-order
+  ID is ambiguous/fail-closed; only an empty or `"0"` client ID may normalize
+  to the already expected pending client identity.
 - No semantic fixture changes.
 
 Suggested commit: one safety contract/export surface at a time.
 
 ## Phase 9: Global Verification And Documentation
+
+Status: documentation and handoff template in progress. Focused checks and the
+full command gate remain; the handoff must retain explicit placeholders until
+each result is actually observed.
 
 Update the capability inventory and deviation ledger with the final
 implementation. Update architecture, mapping, operations, trading readiness,
@@ -597,26 +695,48 @@ sample config, and CLI help to distinguish:
 
 - current Chaos strategy capabilities;
 - Reap safety hardening;
-- offline evidence;
+- credential-free capture/research, authenticated-read-only collection, and
+  offline verification;
 - account-wide emergency recovery; and
 - capabilities explicitly not implemented.
 
 Run at minimum:
 
 ```bash
+mkdir -p /home/ubuntu/code/reap/target/tmp
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked --no-fail-fast
-cargo build --release --workspace --locked
-deploy/systemd/verify-units.sh target/release/reap
-cargo audit --deny warnings
+TMPDIR=/home/ubuntu/code/reap/target/tmp \
+  cargo clippy --workspace --all-targets --locked -- -D warnings
+TMPDIR=/home/ubuntu/code/reap/target/tmp \
+  cargo test --workspace --locked --no-fail-fast
+TMPDIR=/home/ubuntu/code/reap/target/tmp \
+  cargo build --release --workspace --locked
+TMPDIR=/home/ubuntu/code/reap/target/tmp \
+  deploy/systemd/verify-units.sh target/release/reap
+TMPDIR=/home/ubuntu/code/reap/target/tmp \
+  cargo audit --deny warnings
+cargo metadata --locked --format-version 1 >/dev/null
 git diff --check
 ```
 
 Also run the role visibility fixtures, endpoint/channel allowlist tests,
 deterministic Java-parity fixtures, backtest semantic snapshots, config
 migration tests, and a dependency check proving `reap-backtest` no longer
-depends on `reap-live`.
+depends on `reap-live`. Prove shared contract crates contain no network or
+credential dependency, `reap-live` contains no raw order-command websocket
+protocol or transport installation, the live adapter is the sole normal-live
+prepared-regular websocket DTO/wire owner, ordinary recovery cannot retain
+authority, and emergency/raw wire authority remains absent from normal live
+execution.
+
+Fill
+[chaos-connectivity-goal-b-handoff.md](chaos-connectivity-goal-b-handoff.md)
+with the exact commands, results, test counts, dependency output, commit
+SHAs/trees/patch IDs, deterministic hashes, clean sibling proof, and explicit
+deferrals. The handoff records the committed documentation/verification base;
+the subsequent documentation-only result commit is necessarily identified by
+Git history and the final goal report rather than self-referencing its own SHA.
+Do not replace a placeholder by inference.
 
 No credentialed smoke test is part of this refactor. Existing production
 evidence MUST NOT be relabeled or regenerated to bless the new structure.
@@ -713,7 +833,9 @@ Goal A was completed using this prompt:
 > journal/report/evidence schemas, or claim production readiness. Stop and
 > report any listed stop condition.
 
-After reviewing this Goal A handoff, the next refactor prompt is Goal B:
+Goal B was launched from the following concise entry point. Retain it as an
+archival execution record after completion; do not treat it as authority to
+rerun or extend the completed goal:
 
 > Implement Goal B (Phases 6–9) from
 > `docs/chaos-connectivity-refactor-plan.md` on top of the completed Goal A
@@ -726,8 +848,16 @@ After reviewing this Goal A handoff, the next refactor prompt is Goal B:
 The complete ready-to-run instruction set, including phase discipline, final
 commands, stop conditions, and completion criteria, is
 [chaos-connectivity-goal-b-prompt.md](chaos-connectivity-goal-b-prompt.md).
-Invoke it with:
+While the Goal B handoff still contains pending gate placeholders, invoke it
+with:
 
 > Implement Goal B exactly as specified in
 > `docs/chaos-connectivity-goal-b-prompt.md`. Continue through green phase
 > gates and stop only at completion or a documented stop condition.
+
+After every placeholder in the Goal B handoff is replaced by verified green
+evidence, a repository-wide source/documentation scan finds no pending marker,
+and the documentation-only handoff-result commit is made, the prompt and this
+invocation are historical records. That result commit is identified by Git
+history and the final goal report because a commit cannot contain its own SHA.
+Any further authority or structural change requires a new reviewed goal.

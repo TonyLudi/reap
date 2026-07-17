@@ -1,6 +1,12 @@
 # Chaos Connectivity Goal B Execution Prompt
 
-Status: ready to run after the completed Goal A handoff.
+Status: execution contract and eventual historical record. While
+[chaos-connectivity-goal-b-handoff.md](chaos-connectivity-goal-b-handoff.md)
+contains pending gate placeholders, this prompt remains active. After that
+handoff records every required gate green and its documentation-only result
+commit is made, this file is archival and MUST NOT be treated as authority to
+rerun or broaden Goal B. The result commit is identified by Git history and the
+final goal report; it cannot self-reference its own SHA.
 
 Use this document as the complete instruction set for Goal B. The short
 invocation is:
@@ -8,6 +14,12 @@ invocation is:
 > Implement Goal B exactly as specified in
 > `docs/chaos-connectivity-goal-b-prompt.md`. Continue through green phase
 > gates and stop only at completion or a documented stop condition.
+
+Result/clarification note: Goal B narrows structural ownership only. Its final
+result is the exact verified state recorded in the
+[Goal B handoff](chaos-connectivity-goal-b-handoff.md), not a production- or
+demo-readiness claim. The completed Phase 0–5 authority baseline remains the
+[Goal A handoff](chaos-connectivity-goal-a-handoff.md).
 
 ## Objective
 
@@ -124,6 +136,29 @@ ambiguity, storage failure, and restart.
 - Keep pure decisions separate from side effects and transport.
 - Replace remaining exports that cross the defined authority boundaries with
   explicit, role-oriented exports.
+- Keep `RegularExecutionPolicy` as the sole producer of non-Clone, take-once
+  approved values. For submit, a gateway-bound generator and the coordinator
+  consume that approval while synchronously registering canonical
+  `PendingNew` ownership and return `ReservedRegularSubmit`;
+  `OkxOrderGateway` consumes the reservation. For cancel, the gateway consumes
+  `ApprovedRegularCancel` directly. In both paths the gateway validates
+  binding/idempotency/trade mode and creates one prepared value; the dispatcher
+  reserves pacing before adapter IO.
+- Allow ownership recovery only through one-shot
+  `recover_leased_jsonl(&mut StorageLease)` on the exact canonical journal.
+  Ordinary path/byte recovery, private rows, reconciliation, client-ID prefixes,
+  and reasons MUST remain evidence-only. Consume and rebind each recovered
+  proof to the current gateway scope without a schema change.
+- Move command websocket connect/login/write/acknowledgement
+  correlation/reconnect/shutdown and prepared-to-DTO lowering solely into
+  `reap-okx-live-adapter`. A non-Clone bound gateway/session bundle may expose
+  approval-scope transfer before startup, but it releases the gateway only
+  while consuming itself to install its matching adapter-private command slot.
+  Besides the now-bound gateway, the adapter may return only typed
+  lifecycle/status observation, never a transport, signer, raw request method,
+  login builder, or DTO.
+- Keep the current normative Chaos plan at exactly one command shard per
+  executing account; Java's eight-session pool remains reference-only.
 - Do not turn this into workspace-wide API-style cleanup.
 - Document crate ownership and forbidden dependency directions.
 - Add dependency and visibility checks that prevent emergency or raw wire
@@ -131,8 +166,14 @@ ambiguity, storage failure, and restart.
 - Preserve every Goal A compile-fail boundary and capability restriction.
 
 Phase 8 is complete only when one named contract owns each safety
-classification, public APIs correspond to supported roles, and no semantic
-fixture changes.
+classification; public APIs correspond to supported roles; ordinary recovery
+cannot retain mutation authority; approved/reserved/prepared values and roles
+are non-Clone and take-once; `reap-live` contains no raw command websocket
+protocol; the adapter consumes the nonseparable gateway/session bundle,
+installs its matching private slot before releasing the gateway, and performs
+prepared-to-wire lowering; the current executable Demo plan creates exactly
+one command session per executing account; negative source/compile-fail guards
+cover every bypass; and no semantic fixture changes.
 
 ## Phase 9: Global Verification And Documentation
 
@@ -145,7 +186,8 @@ The final documentation MUST distinguish:
 
 - current Chaos strategy capabilities;
 - Reap safety hardening;
-- offline evidence;
+- credential-free capture/research, authenticated-read-only collection, and
+  offline verification;
 - account-wide emergency recovery; and
 - capabilities explicitly not implemented.
 
@@ -243,3 +285,8 @@ Goal B is complete only when:
 
 Completion means that the defined boundary is easier to change safely. It does
 not mean the repository is production ready.
+
+After completion, preserve this prompt unchanged as the historical execution
+contract. Further refactoring, authority changes, credentialed campaigns, or
+readiness work require a separately reviewed goal and must cite the completed
+Goal B handoff rather than rerunning this prompt.

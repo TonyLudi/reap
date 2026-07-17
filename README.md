@@ -127,9 +127,13 @@ verification gate.
 
 This is a least-authority capability boundary, not a production-readiness
 claim. Production order entry remains unavailable, credentialed target-host
-evidence remains external, and the Phase 6–9 structural decomposition in the
-[refactor plan](docs/chaos-connectivity-refactor-plan.md) is separate follow-on
-work.
+evidence remains external, and Goal B does not change that. Goal B Phases 6
+and 7 have lowered pure shared contracts and split live/research/capture
+responsibilities while preserving their ordered owners. Its Phase 8 authority
+hardening and Phase 9 verification are complete only when every focused and
+global gate is green in the
+[Goal B handoff](docs/chaos-connectivity-goal-b-handoff.md); see the
+[refactor plan](docs/chaos-connectivity-refactor-plan.md) for the exact scope.
 
 Run the sample:
 
@@ -959,7 +963,8 @@ Design docs:
 
 - [docs/chaos-connectivity-boundary.md](docs/chaos-connectivity-boundary.md)
   defines the normative exchange capability allowlist for the current
-  Chaos/iarb2 strategy, live safety, emergency recovery, and offline evidence.
+  Chaos/iarb2 strategy, live safety, emergency recovery, and
+  evidence/research separation.
 - [docs/chaos-connectivity-refactor-plan.md](docs/chaos-connectivity-refactor-plan.md)
   is the phased, goal-ready plan for enforcing that boundary and reducing
   repository coupling without changing strategy behavior.

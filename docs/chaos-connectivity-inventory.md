@@ -1,14 +1,21 @@
 # Chaos Connectivity Inventory
 
-Status: frozen Phase 0 baseline plus the completed Goal A disposition overlay.
+Status: frozen Phase 0 baseline with the completed Goal A and conditional Goal
+B disposition overlays. Goal B becomes a completed structural result only
+after its handoff records green focused and Phase 9 gates.
 
 This inventory freezes the exchange surface that existed before the Chaos
 connectivity boundary was enforced. It is descriptive, not an authority grant.
 The normative target remains
 [chaos-connectivity-boundary.md](chaos-connectivity-boundary.md).
+The verified phase records are the completed
+[Goal A handoff](chaos-connectivity-goal-a-handoff.md) and the conditional
+[Goal B handoff](chaos-connectivity-goal-b-handoff.md).
 The matrix is intentionally retained in its Phase 0 form so that “current
 reachability” means reachability at the start of the refactor. The
-[Goal A disposition](#goal-a-disposition) records what Phases 0–5 changed.
+[Goal A disposition](#goal-a-disposition) records what Phases 0–5 changed, and
+the [Goal B disposition](#goal-b-disposition) records the structural result
+without rewriting that historical evidence.
 
 ## Frozen Baseline
 
@@ -191,7 +198,7 @@ production-readiness gate is complete.
 | `D09` backtest depends on live | Deferred to Goal B Phase 6. The normal `reap-backtest -> reap-live` edge still exists and must not be described as removed by Goal A. |
 | `D10` concentrated large modules | Deferred to Goal B Phases 7–8. Goal A changed authority ownership where required but did not claim the responsibility-based module split. |
 | `D11` one global public replica count | Enforced. Every book has two named sequencing/deduplication/recovery replicas; each trade and configured reference input has one. Legacy connection count is only a migration cap. |
-| `D12` one private channel per socket | Enforced. Compatible required private channels are packed onto one exact plan-derived authenticated state socket per account, with order-channel fills canonical and optional fills included only when configured. |
+| `D12` one private channel per socket | Enforced. Compatible required private channels are packed onto one exact plan-derived authenticated state socket per account, with positions alone for an unused observation-only account or account/orders/positions plus configured fills for an executing account. Order-channel fills remain canonical; no channel is added merely to make shapes uniform. |
 
 The final implementation anchors before the documentation-only handoff commit
 are:
@@ -210,3 +217,96 @@ commit. Exact phase commits, commands, and results are recorded in
 [chaos-connectivity-goal-a-handoff.md](chaos-connectivity-goal-a-handoff.md).
 No credentialed exchange call, production evidence, or production order-entry
 claim is part of this result.
+
+## Goal B Disposition
+
+Goal B preserves the frozen Phase 0 matrix and the Goal A authority graph while
+removing structural coupling. It does not reinterpret a baseline
+“current reachability” cell as current implementation truth. The normative
+capability set remains
+[chaos-connectivity-boundary.md](chaos-connectivity-boundary.md), under the
+clean `../imm-strategy` checkout and
+`reap_core::PINNED_JAVA_REVISION` at
+`b6b120c7b7c466d8431bf082f3229328c5d7b2ae`.
+
+The final scope is deliberately separated:
+
+| Scope | Final disposition |
+| --- | --- |
+| Current Chaos capability | Consume only plan-derived normalized inputs. The only executable purposes are regular PostOnly quote, regular IOC `CancelMaker` hedge, and cancellation of a regular order with canonical Reap ownership proof. |
+| Reap safety hardening | May perform narrow authenticated reads, regular reconciliation, canonical owned-regular cancellation, regular Cancel All After, host/readiness checks, and read-only algo/spread zero proof. Safety observation does not authorize unsupported order placement or account-wide mutation. |
+| Evidence and research | Credential-free public capture and deterministic backtest/research, separately composed authenticated-read-only collection, and offline certification/verification have no live strategy mutation authority and cannot authorize trading. |
+| Account-wide emergency recovery | The separate emergency executable may enumerate and cancel regular, algo, and spread orders and arm regular/spread deadmen. It can never submit and is absent from the normal live dependency graph. |
+| Explicitly not implemented | Amend/batch amend, GTC/FOK/market order profiles, trigger/conditional/OCO/chase/iceberg/TWAP/smart-algo placement, spread placement, arbitrary reduce-only/STP combinations, margin-spot borrowing, master/group feeds, additional venues, generic strategy plugins, and production order entry. |
+
+The regular-order capability chain is:
+
+```text
+Quote | Hedge
+  -> RegularExecutionPolicy -> ApprovedRegularSubmit
+  + gateway-bound GeneratedClientOrderId
+  -> OwnedRegularOrders::reserve_local
+  -> canonical PendingNew + ownership -> ReservedRegularSubmit
+  -> OkxOrderGateway -> PreparedRegularSubmit
+
+CancelOwned
+  -> RegularExecutionPolicy -> ApprovedRegularCancel
+  -> OkxOrderGateway -> PreparedRegularCancel
+
+PreparedRegularSubmit | PreparedRegularCancel
+  -> reap-okx-live-adapter order-command session
+  -> private OKX wire DTO / websocket bytes
+```
+
+Only `RegularExecutionPolicy` can turn the supported Chaos purposes into
+opaque `ApprovedRegular*` values. For submit, a gateway-bound generator and the
+coordinator consume the approval while synchronously registering canonical
+`PendingNew` ownership and produce `ReservedRegularSubmit`; only
+`OkxOrderGateway` can consume that reservation. For cancel, the gateway
+consumes the approved cancel directly. It validates the binding and applies
+idempotency and trade mode as applicable to produce opaque
+`PreparedRegular*` values. The dispatcher reserves pacing before adapter IO.
+The live adapter owns normal-live command-session authentication, lifecycle,
+acknowledgement correlation, and final private lowering to OKX DTO/JSON.
+Strategy, coordinator, and gateway consumers cannot construct raw payloads or
+recover a signer from these values. Evidence has no mutation authority;
+emergency owns a separate cancel-only wire root and cannot receive this
+prepared-command chain or construct a place request.
+
+Normal authority is established only by the synchronous gateway-bound local
+reservation or by one-shot recovery from the exclusively leased canonical
+journal. Private-state rows, reconciliation, a client-ID prefix, and a
+free-form reason remain evidence and cannot mint an approval or ownership
+proof.
+
+Only one-shot `recover_leased_jsonl(&mut StorageLease)` retains non-Clone recovery proofs from the exact canonical journal; ordinary path/byte recovery strips them. Proofs are consumed and rebound to the current gateway scope. This is a structural authority boundary rooted in an exclusively leased, operator-controlled journal, not cryptographic authentication of disk contents.
+
+Goal B resolves the deviations that Goal A intentionally deferred:
+
+| Deviation | Goal B disposition |
+| --- | --- |
+| `D09` backtest depends on live | Resolved in Phase 6. Pure live configuration, connectivity, account-certification, pacing, and key contracts were lowered into dependency-safe crates. `reap-backtest` depends on `reap-live-contracts`, not the runtime crate, and the shared contracts contain no networking or credential execution. |
+| `D10` concentrated large modules | Resolved in Phase 7 without creating concurrent state writers. Live runtime responsibilities are split into composition, connectivity, dispatch, readiness/safety, reconciliation, and shutdown modules; research into configuration, execution, reporting, and verification; capture into configuration, runtime, writer, report, analysis, verification, hashing, error, and cleanliness responsibilities. `LiveRuntime`/`LiveCoordinator` remain the ordered owner of strategy, risk, and canonical order mutation. |
+| Duplicated host-health classification | Resolved in Phase 8 by `HostHealthThresholdAssessment`, `HostGuardConfig::assess_host_health`, and `HostHealthSnapshot::threshold_assessment`; runtime and evidence consume the same pure threshold decision. |
+| Duplicated capture-clean classification | Resolved in Phase 8 by the private `CaptureCleanRunInputs` and `capture_run_is_clean` contract used by runtime and verification. |
+| Duplicated live soak/fault classification | Resolved in Phase 8 by private `LiveCleanSoakInputs`, `LiveFaultFailureCode`, and `LiveFaultFailureClass` contracts shared by runtime/fault reporting and independent verification. |
+| Regular execution values retained too much wire authority | The Phase 8 implementation candidate uses the approved/reserved/prepared chain above. Values crossing strategy, coordinator, gateway, and adapter boundaries expose only the fields needed by the next role; raw authenticated wire construction remains adapter-private. This row is resolved only when the recorded focused and global gates pass. |
+| Order-command websocket ownership outside the wire adapter | The implementation candidate moves the final hop above into the adapter. Consuming startup on an account-bound nonseparable gateway/session bundle validates the supplied destination/account, installs its private matching slot before spawn, and then returns the now-bound gateway. Besides that gateway, only typed lifecycle/status observation returns to live. The current plan has exactly one command shard per executing account. A tree in which connection/login/write/ack/reconnect/shutdown or prepared-to-wire lowering remains owned by `reap-live` must not pass the Phase 9 gate. |
+| Recovery parsing could recreate mutation authority | The implementation candidate preserves proofs only through take-once leased recovery; ordinary path/byte recovery strips them. This requires no journal schema change and is Rust structural hardening with an explicitly operator-controlled, non-cryptographic trust root. |
+
+Implementation commits through the named safety-contract work are:
+
+| Phase | Commits |
+| --- | --- |
+| Phase 6 | `0915bdb`, `64b2d55`, `2ea108f`, `51ea2b0`, `b6eb537` |
+| Phase 7 | `9eef036`, `aad0630`, `ad3e9b7`, `cc88a15`, `4951e70`, `1d2b0f8` |
+| Phase 8 named safety contracts | `dd0d5db`, `2f172e8` |
+| Phase 8 regular authority | `38babe6e4d12d598730d3c79aeeccbbec1ec018d` |
+| Phase 8 adapter-owned command websocket | `246f5b21d046dc20fd84460c7b59346231d6107f` |
+| Phase 9 documentation/verification base | `[PENDING_GOAL_B_DOCS_BASE_SHA]` |
+
+Exact trees, patch IDs, commands, focused counts, deterministic anchors, and
+global results are recorded conditionally in
+[chaos-connectivity-goal-b-handoff.md](chaos-connectivity-goal-b-handoff.md).
+No credentialed exchange call, production evidence, demo approval, or
+production-readiness claim is part of Goal B.
