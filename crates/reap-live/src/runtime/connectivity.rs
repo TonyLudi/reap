@@ -5,17 +5,17 @@ use reap_core::{Channel, ConnId, SystemEvent, SystemEventKind, TimeMs, Venue};
 use reap_feed::{
     ConnectionStatus, ConnectionStatusKind, FeedProcessor, SocketPlan, SupervisedFeed,
 };
+use reap_okx_live_adapter::OrderCommandWebsocketLifecycle;
 use reap_venue::VenueAdapter;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use super::OkxOrderWsRuntime;
 use super::dispatch::RuntimeEvent;
 
 pub(super) struct ConnectivityState {
     pub(super) processor: FeedProcessor,
     pub(super) feed_rx: mpsc::Receiver<RuntimeEvent>,
-    pub(super) order_ws_runtimes: Vec<OkxOrderWsRuntime>,
+    pub(super) order_ws_runtimes: Vec<OrderCommandWebsocketLifecycle>,
     pub(super) order_ws_status_tasks: Vec<JoinHandle<()>>,
     pub(super) feeds: Vec<SupervisedFeed>,
     pub(super) feed_tasks: Vec<JoinHandle<()>>,

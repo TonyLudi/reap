@@ -1,9 +1,7 @@
-use async_trait::async_trait;
-use reap_venue::okx::OkxOrderAck;
 pub use reap_venue::okx::okx_order_dispatch_key;
 use thiserror::Error;
 
-use crate::{PreparedRegularCancel, PreparedRegularSubmit};
+use crate::PreparedRegularCancel;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum OrderTransportError {
@@ -64,21 +62,6 @@ impl CancelOrderTransportError {
     pub(crate) fn into_parts(self) -> (OrderTransportError, Option<PreparedRegularCancel>) {
         (self.error, self.prepared)
     }
-}
-
-/// Low-latency command transport only. REST snapshots and reconciliation stay
-/// on the gateway's independent authenticated client.
-#[async_trait]
-pub trait OkxOrderTransport: Send + Sync {
-    async fn place_order(
-        &self,
-        order: PreparedRegularSubmit,
-    ) -> Result<OkxOrderAck, OrderTransportError>;
-
-    async fn cancel_order(
-        &self,
-        order: PreparedRegularCancel,
-    ) -> Result<OkxOrderAck, CancelOrderTransportError>;
 }
 
 #[cfg(test)]

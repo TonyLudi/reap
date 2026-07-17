@@ -1,0 +1,19 @@
+error[E0603]: struct `OrderCommandWebsocketTransport` is private
+ --> tests/ui/order_command_config_has_no_raw_transport_or_shards.rs:5:34
+  |
+5 |     OrderCommandWebsocketConfig, OrderCommandWebsocketTransport,
+  |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private struct
+  |
+note: the struct `OrderCommandWebsocketTransport` is defined here
+ --> src/lib.rs
+  |
+  | use order_ws::OrderCommandWebsocketTransport;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0560]: struct `OrderCommandWebsocketConfig` has no field named `session_count`
+  --> tests/ui/order_command_config_has_no_raw_transport_or_shards.rs:12:9
+   |
+12 |         session_count: 8,
+   |         ^^^^^^^^^^^^^ `OrderCommandWebsocketConfig` does not have this field
+   |
+   = note: all struct fields are already assigned

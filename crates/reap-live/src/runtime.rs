@@ -10,14 +10,17 @@ use reap_core::{
 };
 use reap_feed::{
     ConnectionAttemptPacer, ConnectionStatus, ConnectionStatusKind, FeedOutput, FeedProcessor,
-    ReconnectPolicy, SocketPlan, partition_subscriptions, spawn_supervised_feed,
+    ReconnectPolicy, SocketPlan, partition_subscriptions, try_spawn_supervised_feed,
 };
+#[cfg(test)]
+use reap_okx_live_adapter::OrderCommandWebsocketLifecycle;
 use reap_okx_live_adapter::{
-    ConnectionSettings, CredentialEnvNames, demo_from_env, observe_from_env,
+    ConnectionSettings, CredentialEnvNames, OrderCommandWebsocketConfig,
+    OrderCommandWebsocketStatusKind, demo_from_env, observe_from_env,
 };
-use reap_order::{
-    OkxOrderGateway, OkxReconciliationClient, okx_order_dispatch_key, reconcile_full_state,
-};
+#[cfg(test)]
+use reap_order::OkxOrderGateway;
+use reap_order::{OkxReconciliationClient, okx_order_dispatch_key, reconcile_full_state};
 use reap_storage::{
     BootstrapRecord, OrderOperation, OrderRequestRecord, RecoveredStorage, SafetyLatchRecord,
     SafetyLatchScope, SafetyLatchSource, SessionStartRecord, StorageConfig, StorageError,
@@ -42,9 +45,6 @@ use crate::coordinator::{CancelAction, LiveAction, ReconcileAction, SubmitAction
 use crate::forbidden_orders::{
     ForbiddenOrderEvent, ForbiddenOrderObserverPort, ForbiddenSentinelPolicy,
     run_forbidden_order_sentinel,
-};
-use crate::order_ws::{
-    OkxOrderWsConfig, OkxOrderWsRuntime, OkxOrderWsStatus, OkxOrderWsStatusKind, spawn_okx_order_ws,
 };
 use crate::provenance::{
     current_executable_sha256 as hash_current_executable,
@@ -90,7 +90,6 @@ use readiness_safety::{
 use reconciliation::{ReconciliationState, run_reconcile_task};
 use shutdown::{ShutdownState, StartupTaskGroup, is_zero_order_reconciliation, shutdown_signal};
 
-type LiveGateway = OkxOrderGateway;
 pub const LIVE_RUN_REPORT_SCHEMA_VERSION: u32 = 8;
 pub const MAX_LIVE_FAILURE_CODE_BYTES: usize = 64;
 pub const MAX_LIVE_FAILURE_MESSAGE_BYTES: usize = 4_096;
@@ -593,12 +592,11 @@ async fn bootstrap_accounts(
             live_reconciliation,
             forbidden_observer,
             private_state_sessions,
-            gateway,
+            bound_order_gateway,
             safety,
-            regular_order_sessions,
         ) = match (mode, planned_order_accounts.contains(&account.id)) {
             (LiveMode::Observe, _) | (LiveMode::Demo, false) => {
-                let roles = observe_from_env(
+                let mut roles = observe_from_env(
                     connection,
                     credential_env,
                     config.venue.enable_vip_fills_channel,
@@ -607,12 +605,19 @@ async fn bootstrap_accounts(
                     account_id: account.id.clone(),
                     message: error.to_string(),
                 })?;
+                let private_state_sessions =
+                    roles.take_private_state_sessions().ok_or_else(|| {
+                        LiveRuntimeError::Bootstrap {
+                            account_id: account.id.clone(),
+                            message: "private state session authority was already consumed"
+                                .to_string(),
+                        }
+                    })?;
                 (
                     Arc::new(roles.readiness()) as Arc<dyn ReadinessPort>,
                     roles.reconciliation(),
                     roles.forbidden_observer(),
-                    roles.private_state_sessions(),
-                    None,
+                    private_state_sessions,
                     None,
                     None,
                 )
@@ -628,41 +633,34 @@ async fn bootstrap_accounts(
                     account_id: account.id.clone(),
                     message: error.to_string(),
                 })?;
-                let execution =
-                    roles
-                        .take_execution()
-                        .ok_or_else(|| LiveRuntimeError::GatewaySetup {
+                let reconciliation = roles.observe().reconciliation();
+                let bound_order_gateway = roles
+                    .take_bound_order_gateway(trade_modes, config.runtime.pacing_policy())
+                    .map_err(|error| LiveRuntimeError::GatewaySetup {
+                        account_id: account.id.clone(),
+                        message: error.to_string(),
+                    })?;
+                let safety = roles
+                    .take_safety()
+                    .ok_or_else(|| LiveRuntimeError::GatewaySetup {
+                        account_id: account.id.clone(),
+                        message: "demo live-safety authority was already consumed".to_string(),
+                    })?;
+                let private_state_sessions =
+                    roles.take_private_state_sessions().ok_or_else(|| {
+                        LiveRuntimeError::Bootstrap {
                             account_id: account.id.clone(),
-                            message: "demo execution authority was already consumed".to_string(),
-                        })?;
-                let regular_order_sessions =
-                    roles.take_regular_order_sessions().ok_or_else(|| {
-                        LiveRuntimeError::GatewaySetup {
-                            account_id: account.id.clone(),
-                            message: "demo command websocket authority was already consumed"
+                            message: "private state session authority was already consumed"
                                 .to_string(),
                         }
                     })?;
-                let reconciliation = roles.observe().reconciliation();
-                let gateway = OkxOrderGateway::new(
-                    account.id.clone(),
-                    Box::new(execution),
-                    Arc::new(reconciliation.clone()),
-                    trade_modes,
-                    config.runtime.pacing_policy(),
-                )
-                .map_err(|error| LiveRuntimeError::GatewaySetup {
-                    account_id: account.id.clone(),
-                    message: error.to_string(),
-                })?;
                 (
                     Arc::new(roles.observe().readiness()) as Arc<dyn ReadinessPort>,
                     reconciliation,
                     roles.observe().forbidden_observer(),
-                    roles.observe().private_state_sessions(),
-                    Some(gateway),
-                    Some(Arc::new(roles.safety()) as Arc<dyn SafetyPort>),
-                    Some(regular_order_sessions),
+                    private_state_sessions,
+                    Some(bound_order_gateway),
+                    Some(Arc::new(safety) as Arc<dyn SafetyPort>),
                 )
             }
             (LiveMode::Validate, _) => {
@@ -823,9 +821,8 @@ async fn bootstrap_accounts(
             reconciliation,
             forbidden_observer,
             private_state_sessions,
-            gateway,
+            bound_order_gateway,
             safety,
-            regular_order_sessions,
             instrument_guard,
         });
     }
@@ -1510,7 +1507,7 @@ impl LiveRuntime {
         .await?;
         let mut approval_scopes = HashMap::new();
         for seed in &mut seeds {
-            let Some(gateway) = seed.gateway.as_mut() else {
+            let Some(gateway) = seed.bound_order_gateway.as_mut() else {
                 continue;
             };
             let scope =
@@ -1688,14 +1685,15 @@ impl LiveRuntime {
         ));
         let _public_connection_capability = okx_capability_registration("OKX-CONNECTION-PUBLIC")
             .expect("live public connection must remain in the OKX capability registry");
-        let mut public_feed = spawn_supervised_feed(
+        let mut public_feed = try_spawn_supervised_feed(
             Arc::clone(&public_adapter),
             public_plans.clone(),
             reap_feed::no_bootstrap(),
             config.runtime.feed_channel_capacity,
             connection_attempt_pacer.clone(),
             ReconnectPolicy::default(),
-        );
+        )
+        .map_err(|error| LiveRuntimeError::Subscription(error.to_string()))?;
         let public_source_id = sources.len();
         sources.push(FeedSourceState::public(public_adapter, &public_plans));
         spawn_feed_forwarders(
@@ -1723,9 +1721,8 @@ impl LiveRuntime {
                 reconciliation,
                 forbidden_observer,
                 private_state_sessions,
-                gateway,
+                bound_order_gateway,
                 safety,
-                regular_order_sessions,
                 instrument_guard,
             } = seed;
             let private_plans = private_plans_by_account
@@ -1735,12 +1732,17 @@ impl LiveRuntime {
                         "connectivity plan has no private state session for account {account_id}"
                     ))
                 })?;
+            if private_plans.len() != 1 {
+                return Err(LiveRuntimeError::Subscription(format!(
+                    "connectivity plan must provide exactly one private state socket plan for account {account_id}, received {}",
+                    private_plans.len()
+                )));
+            }
             let planned_session_count = order_session_counts.remove(&account_id);
-            let mutation_role_count = usize::from(gateway.is_some())
-                + usize::from(safety.is_some())
-                + usize::from(regular_order_sessions.is_some());
+            let mutation_role_count =
+                usize::from(bound_order_gateway.is_some()) + usize::from(safety.is_some());
             let expected_mutation_role_count = if planned_session_count.is_some() {
-                3
+                2
             } else {
                 0
             };
@@ -1806,21 +1808,26 @@ impl LiveRuntime {
                 okx_capability_registration("OKX-CONNECTION-PRIVATE-STATE")
                     .expect("private state connection must remain in the OKX capability registry");
             let private_bootstrap = private_state_sessions
-                .bootstrap_factory(&config.venue.private_ws_url)
+                .bootstrap_factory(
+                    account_id.clone(),
+                    private_plans[0].clone(),
+                    &config.venue.private_ws_url,
+                )
                 .map_err(|error| LiveRuntimeError::GatewaySetup {
                     account_id: account_id.clone(),
                     message: format!(
                         "failed to bind private state bootstrap to its websocket destination: {error}"
                     ),
                 })?;
-            let mut private_feed = spawn_supervised_feed(
+            let mut private_feed = try_spawn_supervised_feed(
                 Arc::clone(&private_adapter),
                 private_plans.clone(),
                 private_bootstrap,
                 config.runtime.feed_channel_capacity,
                 connection_attempt_pacer.clone(),
                 ReconnectPolicy::default(),
-            );
+            )
+            .map_err(|error| LiveRuntimeError::Subscription(error.to_string()))?;
             let source_id = sources.len();
             sources.push(FeedSourceState::private(
                 private_adapter,
@@ -1830,34 +1837,38 @@ impl LiveRuntime {
             spawn_feed_forwarders(source_id, &mut private_feed, &feed_tx, &mut feed_tasks);
             feeds.push(private_feed);
 
-            match (planned_session_count, gateway, regular_order_sessions) {
-                (Some(session_count), Some(mut gateway), Some(order_session_factory)) => {
-                    let command_capacity = config
-                        .runtime
-                        .order_channel_capacity
-                        .div_ceil(session_count)
-                        .max(1);
-                    let (transport, order_ws_runtime, mut order_ws_status) =
-                        spawn_okx_order_ws(OkxOrderWsConfig {
+            match (planned_session_count, bound_order_gateway) {
+                (Some(session_count), Some(bound_order_gateway)) => {
+                    if session_count != 1 {
+                        return Err(LiveRuntimeError::GatewaySetup {
                             account_id: account_id.clone(),
-                            websocket_url: config.venue.order_ws_url().to_string(),
-                            session_factory: Arc::new(order_session_factory),
-                            session_count,
-                            command_capacity,
-                            request_expiry: Duration::from_millis(
-                                config.runtime.order_request_expiry_ms,
+                            message: format!(
+                                "regular order command plan must contain exactly one session, found {session_count}"
                             ),
-                            acknowledgement_timeout: Duration::from_millis(
-                                config.runtime.order_websocket_ack_timeout_ms,
-                            ),
-                            connection_attempt_pacer: connection_attempt_pacer.clone(),
-                            reconnect: ReconnectPolicy::default(),
                         });
-                    gateway
-                        .set_order_transport(Box::new(transport))
+                    }
+                    let order_ws_config = OrderCommandWebsocketConfig::new(
+                        account_id.clone(),
+                        config.venue.order_ws_url().to_string(),
+                        config.runtime.order_channel_capacity,
+                        Duration::from_millis(config.runtime.order_request_expiry_ms),
+                        Duration::from_millis(config.runtime.order_websocket_ack_timeout_ms),
+                        connection_attempt_pacer.clone(),
+                        ReconnectPolicy::default(),
+                    )
+                    .map_err(|error| LiveRuntimeError::GatewaySetup {
+                        account_id: account_id.clone(),
+                        message: format!(
+                            "invalid regular order command websocket configuration: {error}"
+                        ),
+                    })?;
+                    let (gateway, order_ws_runtime, mut order_ws_status) = bound_order_gateway
+                        .start_and_install(order_ws_config)
                         .map_err(|error| LiveRuntimeError::GatewaySetup {
                             account_id: account_id.clone(),
-                            message: format!("failed to install regular order transport: {error}"),
+                            message: format!(
+                                "failed to start and install regular order command websocket: {error}"
+                            ),
                         })?;
                     let order_status_events = control_tx.clone();
                     order_ws_status_tasks.push(tokio::spawn(async move {
@@ -1883,15 +1894,14 @@ impl LiveRuntime {
                         config.runtime.order_channel_capacity,
                     )));
                 }
-                (Some(_), _, _) => {
+                (Some(_), _) => {
                     return Err(LiveRuntimeError::GatewaySetup {
                         account_id,
-                        message:
-                            "planned regular order lane has no gateway or authenticated session factory"
-                                .to_string(),
+                        message: "planned regular order lane has no bound gateway authority"
+                            .to_string(),
                     });
                 }
-                (None, _, _) => {}
+                (None, _) => {}
             }
 
             let (reconcile_tx, reconcile_rx) = mpsc::channel(8);
@@ -2940,15 +2950,19 @@ impl LiveRuntime {
             }
             RuntimeEvent::OrderTransport(status) => {
                 let kind = match status.kind {
-                    OkxOrderWsStatusKind::Ready => SystemEventKind::OrderTransportRecovered,
-                    OkxOrderWsStatusKind::Heartbeat => SystemEventKind::OrderTransportHeartbeat,
-                    OkxOrderWsStatusKind::Disconnected => {
+                    OrderCommandWebsocketStatusKind::Ready => {
+                        SystemEventKind::OrderTransportRecovered
+                    }
+                    OrderCommandWebsocketStatusKind::Heartbeat => {
+                        SystemEventKind::OrderTransportHeartbeat
+                    }
+                    OrderCommandWebsocketStatusKind::Disconnected => {
                         self.composition
                             .evidence
                             .observe_order_transport_disconnect();
                         SystemEventKind::OrderTransportStale
                     }
-                    OkxOrderWsStatusKind::Fatal => {
+                    OrderCommandWebsocketStatusKind::Fatal => {
                         return Err(LiveRuntimeError::ConnectionPacerRuntime(status.reason));
                     }
                 };
@@ -4513,8 +4527,8 @@ fn private_socket_plans_by_account(
 ) -> Result<BTreeMap<String, Vec<SocketPlan>>, LiveRuntimeError> {
     let mut plans_by_account = BTreeMap::new();
     for session in plan.private_state_sessions() {
-        if session.socket_count() == 0
-            || session.channels().is_empty()
+        validate_private_state_socket_count(session.account_id(), session.socket_count())?;
+        if session.channels().is_empty()
             || session.requirements().is_empty()
             || session.session_surfaces().is_empty()
         {
@@ -4577,14 +4591,12 @@ fn private_socket_plans_by_account(
                 session.account_id()
             )));
         }
-        let account_plans = (0..session.socket_count())
-            .map(|replica| SocketPlan {
-                conn_id: ConnId::new(format!("okx-private-{}-r{replica}", session.account_id())),
-                venue: Venue::Okx,
-                private: true,
-                subscriptions: channels.clone(),
-            })
-            .collect::<Vec<_>>();
+        let account_plans = vec![SocketPlan {
+            conn_id: ConnId::new(format!("okx-private-{}-r0", session.account_id())),
+            venue: Venue::Okx,
+            private: true,
+            subscriptions: channels,
+        }];
         if plans_by_account
             .insert(session.account_id().to_string(), account_plans)
             .is_some()
@@ -4603,6 +4615,18 @@ fn private_socket_plans_by_account(
         ));
     }
     Ok(plans_by_account)
+}
+
+fn validate_private_state_socket_count(
+    account_id: &str,
+    socket_count: u16,
+) -> Result<(), LiveRuntimeError> {
+    if socket_count != 1 {
+        return Err(LiveRuntimeError::Subscription(format!(
+            "private state session for {account_id} must use exactly one socket, configured {socket_count}"
+        )));
+    }
+    Ok(())
 }
 
 fn planned_order_session_counts(
@@ -4645,6 +4669,11 @@ fn planned_order_session_counts(
     for (account_id, mut lanes) in lanes_by_account {
         lanes.sort_by_key(|lane| lane.lane_index());
         let lane_count = lanes.len();
+        if lane_count != 1 {
+            return Err(LiveRuntimeError::Subscription(format!(
+                "account {account_id} must have exactly one order command lane, found {lane_count}"
+            )));
+        }
         let mut families = BTreeSet::new();
         for (expected_index, lane) in lanes.into_iter().enumerate() {
             if usize::from(lane.lane_index()) != expected_index {
@@ -4772,10 +4801,10 @@ mod tests {
     };
     use reap_feed::SupervisedFeed;
     use reap_order::{
-        CancelOrderTransportError, ClientOrderIdGenerator, OkxOrderTransport, OrderTransportError,
-        OwnedRegularOrders, PacingPolicy, PreparedRegularCancel, PreparedRegularSubmit,
-        PrivateStateReducer, ReconcileReport, RegularExecution, RegularExecutionPolicy,
-        RegularExecutionProfile, RegularReconciliation,
+        CancelOrderTransportError, ClientOrderIdGenerator, OrderTransportError, OwnedRegularOrders,
+        PacingPolicy, PreparedRegularCancel, PreparedRegularSubmit, PrivateStateReducer,
+        ReconcileReport, RegularExecution, RegularExecutionPolicy, RegularExecutionProfile,
+        RegularReconciliation,
     };
     use reap_risk::{
         InstrumentOrderLimits, InstrumentRiskModel, RiskLimits, StablecoinGuardConfig,
@@ -4888,7 +4917,7 @@ mod tests {
         order_tasks: Vec<JoinHandle<()>>,
         reconcile_senders: HashMap<String, mpsc::Sender<ReconcileTaskCommand>>,
         reconcile_tasks: Vec<JoinHandle<()>>,
-        order_ws_runtimes: Vec<OkxOrderWsRuntime>,
+        order_ws_runtimes: Vec<OrderCommandWebsocketLifecycle>,
         order_ws_status_tasks: Vec<JoinHandle<()>>,
         safety_senders: HashMap<String, mpsc::Sender<SafetyTaskCommand>>,
         safety_tasks: Vec<JoinHandle<()>>,
@@ -5108,12 +5137,34 @@ mod tests {
 
     #[async_trait]
     impl RegularExecution for RuntimeMockRoles {
+        async fn place_regular_order(
+            &self,
+            _order: PreparedRegularSubmit,
+        ) -> Result<OkxOrderAck, OrderTransportError> {
+            Err(OrderTransportError::Unavailable(
+                "runtime mock command websocket is not installed".to_string(),
+            ))
+        }
+
         async fn cancel_regular_order(
             &self,
+            order: PreparedRegularCancel,
+        ) -> Result<OkxOrderAck, CancelOrderTransportError> {
+            Err(CancelOrderTransportError::pre_send_unavailable(
+                "runtime mock command websocket is not installed",
+                order,
+            ))
+        }
+
+        async fn cancel_regular_order_via_rest(
+            &self,
             _order: PreparedRegularCancel,
-        ) -> Result<OkxOrderAck, RestError> {
-            let response = self.next()?;
+        ) -> Result<OkxOrderAck, OrderTransportError> {
+            let response = self
+                .next()
+                .map_err(|error| OrderTransportError::Ambiguous(error.to_string()))?;
             parse_okx_order_ack_response_json(response.body.as_bytes(), "cancel order")
+                .map_err(|error| OrderTransportError::Ambiguous(error.to_string()))
         }
     }
 
@@ -5183,8 +5234,8 @@ mod tests {
     );
 
     #[async_trait]
-    impl OkxOrderTransport for GatedOrderTransport {
-        async fn place_order(
+    impl RegularExecution for GatedOrderTransport {
+        async fn place_regular_order(
             &self,
             order: PreparedRegularSubmit,
         ) -> Result<OkxOrderAck, OrderTransportError> {
@@ -5192,13 +5243,20 @@ mod tests {
                 .await
         }
 
-        async fn cancel_order(
+        async fn cancel_regular_order(
             &self,
             order: PreparedRegularCancel,
         ) -> Result<OkxOrderAck, CancelOrderTransportError> {
             self.execute(order.symbol(), order.client_order_id())
                 .await
                 .map_err(CancelOrderTransportError::failed)
+        }
+
+        async fn cancel_regular_order_via_rest(
+            &self,
+            _order: PreparedRegularCancel,
+        ) -> Result<OkxOrderAck, OrderTransportError> {
+            unreachable!("gated command tests never use REST cancellation fallback")
         }
     }
 
@@ -5236,11 +5294,36 @@ mod tests {
         ClientOrderIdGenerator,
     ) {
         let responses = Arc::new(Mutex::new(responses.into()));
+        let execution = Box::new(RuntimeMockRoles {
+            responses: Arc::clone(&responses),
+        });
+        runtime_order_gateway_from_parts(symbols, responses, execution)
+    }
+
+    fn runtime_order_gateway_with_execution(
+        symbols: &[&str],
+        responses: Vec<Result<HttpResponse, RestError>>,
+        execution: Box<dyn RegularExecution>,
+    ) -> (
+        OkxOrderGateway,
+        RegularExecutionPolicy,
+        ClientOrderIdGenerator,
+    ) {
+        runtime_order_gateway_from_parts(symbols, Arc::new(Mutex::new(responses.into())), execution)
+    }
+
+    fn runtime_order_gateway_from_parts(
+        symbols: &[&str],
+        responses: Arc<Mutex<VecDeque<Result<HttpResponse, RestError>>>>,
+        execution: Box<dyn RegularExecution>,
+    ) -> (
+        OkxOrderGateway,
+        RegularExecutionPolicy,
+        ClientOrderIdGenerator,
+    ) {
         let mut gateway = OkxOrderGateway::new(
             "main",
-            Box::new(RuntimeMockRoles {
-                responses: Arc::clone(&responses),
-            }),
+            execution,
             Arc::new(RuntimeMockRoles { responses }),
             symbols
                 .iter()
@@ -5461,9 +5544,9 @@ mod tests {
             "ETH-USDT-SWAP",
             "SOL-USDT-SWAP",
         ];
-        let (mut gateway, policy, client_order_ids) = runtime_order_gateway(&symbols, Vec::new());
         let (transport, mut started, gates, max_active) = gated_order_transport(&symbols);
-        gateway.set_order_transport(Box::new(transport)).unwrap();
+        let (gateway, policy, client_order_ids) =
+            runtime_order_gateway_with_execution(&symbols, Vec::new(), Box::new(transport));
         let (command_tx, command_rx) = mpsc::channel(16);
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let task = tokio::spawn(run_order_task(
@@ -5547,9 +5630,9 @@ mod tests {
     #[tokio::test]
     async fn order_task_rejects_authority_for_a_different_account_before_preparation() {
         let symbol = "BTC-USDT-SWAP";
-        let (mut gateway, policy, client_order_ids) = runtime_order_gateway(&[symbol], Vec::new());
         let (transport, mut started, _gates, _) = gated_order_transport(&[symbol]);
-        gateway.set_order_transport(Box::new(transport)).unwrap();
+        let (gateway, policy, client_order_ids) =
+            runtime_order_gateway_with_execution(&[symbol], Vec::new(), Box::new(transport));
         let (command_tx, command_rx) = mpsc::channel(2);
         let (event_tx, mut event_rx) = mpsc::channel(2);
         let task = tokio::spawn(run_order_task(
@@ -5606,9 +5689,9 @@ mod tests {
                 body: r#"{"code":"0","msg":"","data":[]}"#.to_string(),
             }),
         ];
-        let (mut gateway, policy, client_order_ids) = runtime_order_gateway(&[symbol], responses);
         let (transport, mut started, gates, _) = gated_order_transport(&[symbol]);
-        gateway.set_order_transport(Box::new(transport)).unwrap();
+        let (gateway, policy, client_order_ids) =
+            runtime_order_gateway_with_execution(&[symbol], responses, Box::new(transport));
         let io = gateway.reconciliation_client();
         let (command_tx, command_rx) = mpsc::channel(8);
         let (reconcile_tx, reconcile_rx) = mpsc::channel(2);
@@ -8604,6 +8687,19 @@ mod tests {
         let ready = source.on_private_data(Channel::Positions, 7);
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].kind, SystemEventKind::PrivateStreamRecovered);
+    }
+
+    #[test]
+    fn private_session_socket_overcount_is_rejected_by_runtime_composition() {
+        let error = validate_private_state_socket_count("main", 2).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                LiveRuntimeError::Subscription(message)
+                    if message.contains("must use exactly one socket, configured 2")
+            ),
+            "unexpected private socket overcount error: {error}"
+        );
     }
 
     #[test]

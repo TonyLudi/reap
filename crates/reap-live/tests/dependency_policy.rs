@@ -180,6 +180,8 @@ fn authenticated_okx_authority_obeys_the_workspace_dependency_policy() {
 
     assert_direct(&packages, "reap-live", "reap-okx-live-adapter");
     assert_not_direct(&packages, "reap-live", "reap-okx-wire");
+    assert_not_direct(&packages, "reap-live", "tokio-tungstenite");
+    assert_direct(&packages, "reap-okx-live-adapter", "tokio-tungstenite");
     for forbidden in [
         "reap-emergency-core",
         "reap-emergency-runner",
@@ -455,9 +457,10 @@ fn regular_order_authority_construction_is_source_allowlisted() {
         approval_scope_takes,
         BTreeSet::from([
             "crates/reap-live/src/runtime.rs".to_string(),
+            "crates/reap-okx-live-adapter/src/lib.rs".to_string(),
             "crates/reap-order/src/gateway.rs".to_string(),
         ]),
-        "account approval scopes must transfer only from the gateway into live composition"
+        "account approval scopes must transfer only through the sealed adapter bundle into live composition"
     );
     assert_eq!(
         command_dispatcher_takes,
@@ -469,11 +472,8 @@ fn regular_order_authority_construction_is_source_allowlisted() {
     );
     assert_eq!(
         order_transport_installs,
-        BTreeSet::from([
-            "crates/reap-live/src/runtime.rs".to_string(),
-            "crates/reap-order/src/gateway.rs".to_string(),
-        ]),
-        "the regular order transport must be installed only by live composition before command-role transfer"
+        BTreeSet::new(),
+        "no public gateway transport installation seam may exist; the authenticated adapter owns its private once-only command slot"
     );
 
     let order_lib = fs::read_to_string(workspace.join("crates/reap-order/src/lib.rs"))
@@ -512,22 +512,49 @@ fn raw_regular_order_dtos_are_constructed_only_by_the_live_adapter() {
         .expect("reap-live must be inside the workspace crates directory");
     let place_constructor = ["OkxPlaceOrder", "{symbol:"].concat();
     let cancel_constructor = ["OkxCancelOrder", "{symbol:"].concat();
+    let mut live_bundle_starts = BTreeMap::<String, usize>::new();
 
     let mut live_sources = Vec::new();
     collect_rust_sources(&workspace.join("crates/reap-live/src"), &mut live_sources);
     for path in live_sources {
         let source = fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
-        let compact = source
+        let compact = production_rust_source(&source)
             .chars()
             .filter(|character| !character.is_whitespace())
             .collect::<String>();
+        let relative = workspace_relative(workspace, &path);
         assert!(
             !compact.contains(&place_constructor) && !compact.contains(&cancel_constructor),
             "{} constructs a raw OKX regular-order DTO",
-            workspace_relative(workspace, &path)
+            relative
         );
+        for forbidden in [
+            "tokio_tungstenite",
+            "tungstenite::",
+            "OrderCommandWebsocketTransport",
+            "OrderCommandTransportSlot",
+            "OrderSessionOperations",
+            "OkxWsOrderOperation",
+            "start_order_command_websocket(",
+            "set_order_transport(",
+            "order_transport.install(",
+        ] {
+            assert!(
+                !compact.contains(forbidden),
+                "{relative} owns forbidden raw order-websocket authority token {forbidden}"
+            );
+        }
+        let starts = compact.matches(".start_and_install(").count();
+        if starts != 0 {
+            live_bundle_starts.insert(relative, starts);
+        }
     }
+    assert_eq!(
+        live_bundle_starts,
+        BTreeMap::from([("crates/reap-live/src/runtime.rs".to_string(), 1)]),
+        "the live runtime must consume exactly one sealed gateway/session bundle start seam"
+    );
 
     for relative in [
         "crates/reap-order/src/gateway.rs",
@@ -545,16 +572,34 @@ fn raw_regular_order_dtos_are_constructed_only_by_the_live_adapter() {
         );
     }
 
-    let adapter_source =
-        fs::read_to_string(workspace.join("crates/reap-okx-live-adapter/src/lib.rs"))
-            .expect("live adapter source");
-    let (adapter_production, _) = adapter_source
-        .split_once("#[cfg(test)]\nmod tests")
-        .expect("live adapter test module marker");
-    let adapter_production = adapter_production
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect::<String>();
+    let mut adapter_sources = Vec::new();
+    collect_rust_sources(
+        &workspace.join("crates/reap-okx-live-adapter/src"),
+        &mut adapter_sources,
+    );
+    let mut adapter_production = String::new();
+    let mut websocket_transport_owners = BTreeSet::new();
+    let mut tungstenite_owners = BTreeSet::new();
+    let mut transport_install_owners = BTreeSet::new();
+    for path in adapter_sources {
+        let relative = workspace_relative(workspace, &path);
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        let compact = production_rust_source(&source)
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        if compact.contains("OrderCommandWebsocketTransport") {
+            websocket_transport_owners.insert(relative.clone());
+        }
+        if compact.contains("tokio_tungstenite") {
+            tungstenite_owners.insert(relative.clone());
+        }
+        if compact.contains("order_transport.install(") {
+            transport_install_owners.insert(relative);
+        }
+        adapter_production.push_str(&compact);
+    }
     assert_eq!(
         adapter_production.matches(&place_constructor).count(),
         1,
@@ -564,6 +609,37 @@ fn raw_regular_order_dtos_are_constructed_only_by_the_live_adapter() {
         adapter_production.matches(&cancel_constructor).count(),
         1,
         "the live adapter must have one regular cancel DTO mapper"
+    );
+    assert_eq!(
+        websocket_transport_owners,
+        BTreeSet::from([
+            "crates/reap-okx-live-adapter/src/lib.rs".to_string(),
+            "crates/reap-okx-live-adapter/src/order_ws.rs".to_string(),
+        ]),
+        "the adapter's private command transport may span only its role root and websocket module"
+    );
+    assert_eq!(
+        tungstenite_owners,
+        BTreeSet::from(["crates/reap-okx-live-adapter/src/order_ws.rs".to_string()]),
+        "only the adapter order-websocket module may own the raw websocket dependency"
+    );
+    assert_eq!(
+        transport_install_owners,
+        BTreeSet::from(["crates/reap-okx-live-adapter/src/order_ws.rs".to_string()]),
+        "only the sealed bundle start may install the adapter's private command transport"
+    );
+    assert_eq!(
+        adapter_production
+            .matches("pubfnstart_and_install(")
+            .count(),
+        1,
+        "the adapter must expose exactly one consuming bound gateway/session start seam"
+    );
+    assert!(
+        !adapter_production.contains("pubstructOrderCommandWebsocketTransport")
+            && !adapter_production.contains("pubtraitOrderSessionOperations")
+            && !adapter_production.contains("pubfninstall("),
+        "raw order-websocket transport, protocol, and installation authority must remain private"
     );
 }
 

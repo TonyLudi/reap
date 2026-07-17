@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reap_okx_live_adapter::{
-    ForbiddenOrderObserver, PrivateStateSessionFactory, RegularOrderSessionFactory,
+    BoundRegularOrderGateway, ForbiddenOrderObserver, PrivateStateSessionFactory,
 };
 use reap_order::OkxReconciliationClient;
 use reap_storage::{OrderAckStatus, OrderOperation, StorageRecord, StorageRuntime, StorageSink};
@@ -12,9 +12,9 @@ use crate::safety_contracts::LiveCleanSoakInputs;
 
 use super::readiness_safety::{ExchangeInstrumentGuard, ReadinessPort, SafetyPort};
 use super::{
-    LiveConfigFileEvidence, LiveFailureEvidence, LiveGateway, LiveLatencyCollector, LiveMode,
-    LiveRuntimeError, LiveStopReason, MAX_LIVE_FAILURE_MESSAGE_BYTES, OrderStatus,
-    ReadinessSnapshot, SystemEventKind,
+    LiveConfigFileEvidence, LiveFailureEvidence, LiveLatencyCollector, LiveMode, LiveRuntimeError,
+    LiveStopReason, MAX_LIVE_FAILURE_MESSAGE_BYTES, OrderStatus, ReadinessSnapshot,
+    SystemEventKind,
 };
 
 pub(super) struct CompositionState {
@@ -40,9 +40,8 @@ pub(super) struct AccountSeed {
     pub(super) reconciliation: OkxReconciliationClient,
     pub(super) forbidden_observer: ForbiddenOrderObserver,
     pub(super) private_state_sessions: PrivateStateSessionFactory,
-    pub(super) gateway: Option<LiveGateway>,
+    pub(super) bound_order_gateway: Option<BoundRegularOrderGateway>,
     pub(super) safety: Option<Arc<dyn SafetyPort>>,
-    pub(super) regular_order_sessions: Option<RegularOrderSessionFactory>,
     pub(super) instrument_guard: ExchangeInstrumentGuard,
 }
 

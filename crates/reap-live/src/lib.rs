@@ -12,7 +12,6 @@ mod host;
 mod latency;
 mod live_verification;
 mod operator;
-mod order_ws;
 mod production_transition;
 mod provenance;
 mod regular_execution;

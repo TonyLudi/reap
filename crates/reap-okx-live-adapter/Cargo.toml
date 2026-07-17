@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+futures-util.workspace = true
 reap-core.workspace = true
 reap-feed.workspace = true
 reap-okx-wire.workspace = true
@@ -13,10 +14,12 @@ reap-venue.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
 reap-risk.workspace = true
 reap-strategy.workspace = true
-tokio.workspace = true
 trybuild.workspace = true

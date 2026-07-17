@@ -12,7 +12,7 @@ use thiserror::Error;
 
 use crate::authority::{RegularApprovalBinding, RegularApprovalScope};
 use crate::{
-    ApprovedRegularCancel, IdempotencyError, IdempotencyRegistry, OkxOrderTransport,
+    ApprovedRegularCancel, CancelOrderTransportError, IdempotencyError, IdempotencyRegistry,
     OrderTransportError, PacingPolicy, PrivateStateReducer, ReconciliationSnapshot, RequestKind,
     RequestPacer, Reservation, ReservedRegularSubmit, reconcile_full_state,
 };
@@ -56,6 +56,11 @@ impl GatewayError {
 
     pub fn is_order_not_found(&self) -> bool {
         matches!(self, Self::Rest(error) if error.is_order_not_found())
+            || matches!(
+                self,
+                Self::OrderTransport(OrderTransportError::Rejected { code, .. })
+                    if code == "51603"
+            )
     }
 }
 
@@ -159,10 +164,20 @@ pub struct CancelOutcome {
 
 #[async_trait]
 pub trait RegularExecution: Send + Sync {
+    async fn place_regular_order(
+        &self,
+        order: PreparedRegularSubmit,
+    ) -> Result<OkxOrderAck, OrderTransportError>;
+
     async fn cancel_regular_order(
         &self,
         cancel: PreparedRegularCancel,
-    ) -> Result<OkxOrderAck, RestError>;
+    ) -> Result<OkxOrderAck, CancelOrderTransportError>;
+
+    async fn cancel_regular_order_via_rest(
+        &self,
+        cancel: PreparedRegularCancel,
+    ) -> Result<OkxOrderAck, OrderTransportError>;
 }
 
 #[async_trait]
@@ -209,7 +224,6 @@ pub struct RegularCommandDispatcher {
     account_id: String,
     binding: RegularApprovalBinding,
     execution: Arc<dyn RegularExecution>,
-    order_transport: Option<Arc<dyn OkxOrderTransport>>,
     pacer: RequestPacer,
 }
 
@@ -248,7 +262,6 @@ impl OkxOrderGateway {
                 account_id,
                 binding,
                 execution,
-                order_transport: None,
                 pacer: RequestPacer::new(pacing),
             }),
             reconciliation,
@@ -264,16 +277,8 @@ impl OkxOrderGateway {
             .ok_or_else(|| GatewayError::ApprovalScopeTaken(self.account_id.clone()))
     }
 
-    pub fn set_order_transport(
-        &mut self,
-        transport: Box<dyn OkxOrderTransport>,
-    ) -> Result<(), GatewayError> {
-        let dispatcher = self
-            .dispatcher
-            .as_mut()
-            .ok_or_else(|| GatewayError::CommandDispatcherTaken(self.account_id.clone()))?;
-        dispatcher.order_transport = Some(Arc::from(transport));
-        Ok(())
+    pub fn account_id(&self) -> &str {
+        &self.account_id
     }
 
     pub fn reconciliation_client(&self) -> OkxReconciliationClient {
@@ -571,41 +576,31 @@ impl RegularCommandDispatcher {
         let result = match self.validate_prepared_submit(&prepared) {
             Err(error) => Err(error),
             Ok(()) => {
-                let transport = self.order_transport.as_ref().ok_or_else(|| {
-                    OrderTransportError::Unavailable(
-                        "regular order transport is not installed".to_string(),
-                    )
-                });
-                match transport {
-                    Err(error) => Err(error.into()),
-                    Ok(transport) => {
-                        self.pacer.pace(RequestKind::Submit, "account").await;
-                        self.pacer
-                            .pace(RequestKind::Submit, &prepared.order.symbol)
-                            .await;
-                        transport
-                            .place_order(prepared)
-                            .await
-                            .and_then(|mut acknowledgement| {
-                                validate_acknowledgement_client_id(
-                                    &client_order_id,
-                                    &acknowledgement.client_order_id,
-                                )
-                                .map_err(|error| match error {
-                                    GatewayError::AcknowledgementClientIdMismatch {
-                                        expected,
-                                        actual,
-                                    } => OrderTransportError::Ambiguous(format!(
-                                        "acknowledgement client id {actual:?} does not match expected {expected:?}"
-                                    )),
-                                    error => OrderTransportError::Ambiguous(error.to_string()),
-                                })?;
-                                acknowledgement.client_order_id = client_order_id.clone();
-                                Ok(acknowledgement)
-                            })
-                            .map_err(GatewayError::from)
-                    }
-                }
+                self.pacer.pace(RequestKind::Submit, "account").await;
+                self.pacer
+                    .pace(RequestKind::Submit, &prepared.order.symbol)
+                    .await;
+                self.execution
+                    .place_regular_order(prepared)
+                    .await
+                    .and_then(|mut acknowledgement| {
+                        validate_acknowledgement_client_id(
+                            &client_order_id,
+                            &acknowledgement.client_order_id,
+                        )
+                        .map_err(|error| match error {
+                            GatewayError::AcknowledgementClientIdMismatch {
+                                expected,
+                                actual,
+                            } => OrderTransportError::Ambiguous(format!(
+                                "acknowledgement client id {actual:?} does not match expected {expected:?}"
+                            )),
+                            error => OrderTransportError::Ambiguous(error.to_string()),
+                        })?;
+                        acknowledgement.client_order_id = client_order_id.clone();
+                        Ok(acknowledgement)
+                    })
+                    .map_err(GatewayError::from)
             }
         };
         RegularSubmitCompletion {
@@ -629,41 +624,40 @@ impl RegularCommandDispatcher {
         self.pacer
             .pace(RequestKind::Cancel, prepared.symbol())
             .await;
-        let ack = match self.order_transport.as_ref() {
-            Some(transport) => match transport.cancel_order(prepared).await {
-                Ok(ack) => ack,
-                Err(error) => {
-                    let (error, prepared) = error.into_parts();
-                    match prepared {
-                        Some(prepared) => {
-                            self.validate_prepared_cancel(&prepared)?;
-                            let identity_matches = prepared.account_id == expected_account_id
-                                && prepared.symbol == expected_symbol
-                                && prepared.client_order_id == expected_client_order_id
-                                && prepared.reason == expected_reason;
-                            let expected = format!(
-                                "{expected_account_id}/{expected_symbol}/{expected_client_order_id}/{expected_reason}"
-                            );
-                            let actual = format!(
-                                "{}/{}/{}/{}",
-                                prepared.account_id,
-                                prepared.symbol,
-                                prepared.client_order_id,
-                                prepared.reason
-                            );
-                            if !identity_matches {
-                                return Err(GatewayError::CancelFallbackIdentityMismatch {
-                                    expected,
-                                    actual,
-                                });
-                            }
-                            self.execution.cancel_regular_order(prepared).await?
+        let ack = match self.execution.cancel_regular_order(prepared).await {
+            Ok(ack) => ack,
+            Err(error) => {
+                let (error, prepared) = error.into_parts();
+                match prepared {
+                    Some(prepared) => {
+                        self.validate_prepared_cancel(&prepared)?;
+                        let identity_matches = prepared.account_id == expected_account_id
+                            && prepared.symbol == expected_symbol
+                            && prepared.client_order_id == expected_client_order_id
+                            && prepared.reason == expected_reason;
+                        let expected = format!(
+                            "{expected_account_id}/{expected_symbol}/{expected_client_order_id}/{expected_reason}"
+                        );
+                        let actual = format!(
+                            "{}/{}/{}/{}",
+                            prepared.account_id,
+                            prepared.symbol,
+                            prepared.client_order_id,
+                            prepared.reason
+                        );
+                        if !identity_matches {
+                            return Err(GatewayError::CancelFallbackIdentityMismatch {
+                                expected,
+                                actual,
+                            });
                         }
-                        None => return Err(error.into()),
+                        self.execution
+                            .cancel_regular_order_via_rest(prepared)
+                            .await?
                     }
+                    None => return Err(error.into()),
                 }
-            },
-            None => self.execution.cancel_regular_order(prepared).await?,
+            }
         };
         validate_acknowledgement_client_id(&expected_client_order_id, &ack.client_order_id)?;
         Ok(CancelOutcome {
@@ -813,71 +807,29 @@ mod tests {
     struct MockRoles {
         responses: Arc<Mutex<VecDeque<Result<HttpResponse, RestError>>>>,
         calls: Arc<Mutex<usize>>,
+        order_responses:
+            Arc<Mutex<VecDeque<Result<reap_venue::okx::OkxOrderAck, OrderTransportError>>>>,
+        order_calls: Arc<Mutex<usize>>,
+        command_behavior: MockCommandBehavior,
     }
 
-    struct MockOrderTransport {
-        responses: Arc<Mutex<VecDeque<Result<reap_venue::okx::OkxOrderAck, OrderTransportError>>>>,
-        calls: Arc<Mutex<usize>>,
+    #[derive(Clone, Copy)]
+    enum MockCommandBehavior {
+        Missing,
+        Responses,
+        SubstituteCancel,
     }
 
-    struct SubstitutingCancelTransport;
-
-    #[async_trait]
-    impl OkxOrderTransport for MockOrderTransport {
-        async fn place_order(
-            &self,
-            _order: PreparedRegularSubmit,
-        ) -> Result<reap_venue::okx::OkxOrderAck, OrderTransportError> {
-            self.next()
-        }
-
-        async fn cancel_order(
-            &self,
-            order: PreparedRegularCancel,
-        ) -> Result<reap_venue::okx::OkxOrderAck, CancelOrderTransportError> {
-            match self.next() {
-                Ok(ack) => Ok(ack),
-                Err(OrderTransportError::Unavailable(message)) => Err(
-                    CancelOrderTransportError::pre_send_unavailable(message, order),
-                ),
-                Err(error) => Err(CancelOrderTransportError::failed(error)),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl OkxOrderTransport for SubstitutingCancelTransport {
-        async fn place_order(
-            &self,
-            _order: PreparedRegularSubmit,
-        ) -> Result<reap_venue::okx::OkxOrderAck, OrderTransportError> {
-            unreachable!("substitution test exercises only cancellation")
-        }
-
-        async fn cancel_order(
-            &self,
-            mut order: PreparedRegularCancel,
-        ) -> Result<reap_venue::okx::OkxOrderAck, CancelOrderTransportError> {
-            order.client_order_id = "foreign-order".to_string();
-            Err(CancelOrderTransportError::pre_send_unavailable(
-                "substituted before REST fallback",
-                order,
-            ))
-        }
-    }
-
-    impl MockOrderTransport {
-        fn next(&self) -> Result<reap_venue::okx::OkxOrderAck, OrderTransportError> {
-            *self.calls.lock().unwrap() += 1;
-            self.responses
+    impl MockRoles {
+        fn next_order(&self) -> Result<reap_venue::okx::OkxOrderAck, OrderTransportError> {
+            *self.order_calls.lock().unwrap() += 1;
+            self.order_responses
                 .lock()
                 .unwrap()
                 .pop_front()
                 .expect("mock order response")
         }
-    }
 
-    impl MockRoles {
         fn next(&self) -> Result<HttpResponse, RestError> {
             *self.calls.lock().unwrap() += 1;
             self.responses
@@ -890,11 +842,58 @@ mod tests {
 
     #[async_trait]
     impl RegularExecution for MockRoles {
+        async fn place_regular_order(
+            &self,
+            _order: PreparedRegularSubmit,
+        ) -> Result<OkxOrderAck, OrderTransportError> {
+            match self.command_behavior {
+                MockCommandBehavior::Missing => Err(OrderTransportError::Unavailable(
+                    "regular order transport is not installed".to_string(),
+                )),
+                MockCommandBehavior::Responses => self.next_order(),
+                MockCommandBehavior::SubstituteCancel => {
+                    unreachable!("substitution test exercises only cancellation")
+                }
+            }
+        }
+
         async fn cancel_regular_order(
             &self,
+            mut cancel: PreparedRegularCancel,
+        ) -> Result<OkxOrderAck, CancelOrderTransportError> {
+            match self.command_behavior {
+                MockCommandBehavior::Missing => {
+                    Err(CancelOrderTransportError::pre_send_unavailable(
+                        "regular order transport is not installed",
+                        cancel,
+                    ))
+                }
+                MockCommandBehavior::Responses => match self.next_order() {
+                    Ok(ack) => Ok(ack),
+                    Err(OrderTransportError::Unavailable(message)) => Err(
+                        CancelOrderTransportError::pre_send_unavailable(message, cancel),
+                    ),
+                    Err(error) => Err(CancelOrderTransportError::failed(error)),
+                },
+                MockCommandBehavior::SubstituteCancel => {
+                    cancel.client_order_id = "foreign-order".to_string();
+                    Err(CancelOrderTransportError::pre_send_unavailable(
+                        "substituted before REST fallback",
+                        cancel,
+                    ))
+                }
+            }
+        }
+
+        async fn cancel_regular_order_via_rest(
+            &self,
             cancel: PreparedRegularCancel,
-        ) -> Result<OkxOrderAck, RestError> {
-            parse_ack(self.next()?, cancel.client_order_id())
+        ) -> Result<OkxOrderAck, OrderTransportError> {
+            let response = self
+                .next()
+                .map_err(|error| OrderTransportError::Ambiguous(error.to_string()))?;
+            parse_ack(response, cancel.client_order_id())
+                .map_err(|error| OrderTransportError::Ambiguous(error.to_string()))
         }
     }
 
@@ -1069,10 +1068,31 @@ mod tests {
     fn gateway(
         responses: Vec<Result<HttpResponse, RestError>>,
     ) -> (OkxOrderGateway, Arc<Mutex<usize>>) {
+        let (gateway, rest_calls, _) =
+            gateway_with_command_behavior(responses, Vec::new(), MockCommandBehavior::Missing);
+        (gateway, rest_calls)
+    }
+
+    fn gateway_with_order_responses(
+        responses: Vec<Result<HttpResponse, RestError>>,
+        order_responses: Vec<Result<reap_venue::okx::OkxOrderAck, OrderTransportError>>,
+    ) -> (OkxOrderGateway, Arc<Mutex<usize>>, Arc<Mutex<usize>>) {
+        gateway_with_command_behavior(responses, order_responses, MockCommandBehavior::Responses)
+    }
+
+    fn gateway_with_command_behavior(
+        responses: Vec<Result<HttpResponse, RestError>>,
+        order_responses: Vec<Result<reap_venue::okx::OkxOrderAck, OrderTransportError>>,
+        command_behavior: MockCommandBehavior,
+    ) -> (OkxOrderGateway, Arc<Mutex<usize>>, Arc<Mutex<usize>>) {
         let calls = Arc::new(Mutex::new(0));
+        let order_calls = Arc::new(Mutex::new(0));
         let roles = Arc::new(MockRoles {
             responses: Arc::new(Mutex::new(responses.into())),
             calls: Arc::clone(&calls),
+            order_responses: Arc::new(Mutex::new(order_responses.into())),
+            order_calls: Arc::clone(&order_calls),
+            command_behavior,
         });
         let gateway = OkxOrderGateway::new(
             "main",
@@ -1082,45 +1102,18 @@ mod tests {
             PacingPolicy::default(),
         )
         .unwrap();
-        (gateway, calls)
-    }
-
-    fn install_order_transport(
-        gateway: &mut OkxOrderGateway,
-        responses: Vec<Result<reap_venue::okx::OkxOrderAck, OrderTransportError>>,
-    ) -> Arc<Mutex<usize>> {
-        let calls = Arc::new(Mutex::new(0));
-        gateway
-            .set_order_transport(Box::new(MockOrderTransport {
-                responses: Arc::new(Mutex::new(responses.into())),
-                calls: Arc::clone(&calls),
-            }))
-            .unwrap();
-        calls
+        (gateway, calls, order_calls)
     }
 
     #[test]
-    fn command_dispatcher_is_transferred_once_and_transport_cannot_change_after_take() {
+    fn command_dispatcher_is_transferred_once() {
         let (mut gateway, _) = gateway(Vec::new());
-        gateway
-            .set_order_transport(Box::new(MockOrderTransport {
-                responses: Arc::new(Mutex::new(VecDeque::new())),
-                calls: Arc::new(Mutex::new(0)),
-            }))
-            .unwrap();
 
         let _dispatcher = gateway
             .take_command_dispatcher()
             .expect("the command role must transfer once");
         assert!(matches!(
             gateway.take_command_dispatcher(),
-            Err(GatewayError::CommandDispatcherTaken(account_id)) if account_id == "main"
-        ));
-        assert!(matches!(
-            gateway.set_order_transport(Box::new(MockOrderTransport {
-                responses: Arc::new(Mutex::new(VecDeque::new())),
-                calls: Arc::new(Mutex::new(0)),
-            })),
             Err(GatewayError::CommandDispatcherTaken(account_id)) if account_id == "main"
         ));
     }
@@ -1142,6 +1135,9 @@ mod tests {
         let roles = Arc::new(MockRoles {
             responses: Arc::new(Mutex::new(VecDeque::new())),
             calls: Arc::new(Mutex::new(0)),
+            order_responses: Arc::new(Mutex::new(VecDeque::new())),
+            order_calls: Arc::new(Mutex::new(0)),
+            command_behavior: MockCommandBehavior::Missing,
         });
         let mut target = OkxOrderGateway::new(
             "other",
@@ -1161,9 +1157,8 @@ mod tests {
 
     #[tokio::test]
     async fn accepted_idempotent_submit_does_not_send_twice() {
-        let (mut gateway, rest_calls) = gateway(Vec::new());
-        let order_calls = install_order_transport(
-            &mut gateway,
+        let (mut gateway, rest_calls, order_calls) = gateway_with_order_responses(
+            Vec::new(),
             vec![Ok(OkxOrderAck {
                 exchange_order_id: "123".to_string(),
                 client_order_id: "reap1".to_string(),
@@ -1198,9 +1193,8 @@ mod tests {
 
     #[tokio::test]
     async fn mismatched_submit_acknowledgement_is_ambiguous_and_not_bound() {
-        let (mut gateway, rest_calls) = gateway(Vec::new());
-        let order_calls = install_order_transport(
-            &mut gateway,
+        let (mut gateway, rest_calls, order_calls) = gateway_with_order_responses(
+            Vec::new(),
             vec![Ok(OkxOrderAck {
                 exchange_order_id: "123".to_string(),
                 client_order_id: "foreign-order".to_string(),
@@ -1226,9 +1220,8 @@ mod tests {
 
     #[tokio::test]
     async fn prepared_submit_can_be_registered_before_order_transport_io() {
-        let (mut gateway, rest_calls) = gateway(Vec::new());
-        let order_calls = install_order_transport(
-            &mut gateway,
+        let (mut gateway, rest_calls, order_calls) = gateway_with_order_responses(
+            Vec::new(),
             vec![Ok(OkxOrderAck {
                 exchange_order_id: "123".to_string(),
                 client_order_id: "reap1".to_string(),
@@ -1331,9 +1324,8 @@ mod tests {
 
     #[tokio::test]
     async fn ambiguous_failure_is_held_for_reconciliation() {
-        let (mut gateway, rest_calls) = gateway(Vec::new());
-        let order_calls = install_order_transport(
-            &mut gateway,
+        let (mut gateway, rest_calls, order_calls) = gateway_with_order_responses(
+            Vec::new(),
             vec![Err(OrderTransportError::Ambiguous("timeout".to_string()))],
         );
         assert!(
@@ -1354,9 +1346,8 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_api_rejection_releases_idempotency_key_for_retry() {
-        let (mut gateway, rest_calls) = gateway(Vec::new());
-        let order_calls = install_order_transport(
-            &mut gateway,
+        let (mut gateway, rest_calls, order_calls) = gateway_with_order_responses(
+            Vec::new(),
             vec![
                 Err(OrderTransportError::Rejected {
                     code: "51000".to_string(),
@@ -1387,7 +1378,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_order_transport_is_typed_unavailable_and_retryable() {
+    async fn uninstalled_execution_place_is_pre_send_unavailable_and_retryable() {
         let (mut gateway, rest_calls) = gateway(Vec::new());
 
         for _ in 0..2 {
@@ -1405,10 +1396,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn uninstalled_execution_cancel_returns_exact_token_for_rest_fallback() {
+        let response = HttpResponse {
+            status: 200,
+            body: r#"{"code":"0","msg":"","data":[{"ordId":"42","clOrdId":"reap1","sCode":"0","sMsg":""}]}"#.to_string(),
+        };
+        let (gateway, rest_calls) = gateway(vec![Ok(response)]);
+
+        let outcome = gateway
+            .cancel(approved_cancel(&gateway, "reap1"))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.client_order_id, "reap1");
+        assert_eq!(outcome.exchange_order_id, "42");
+        assert_eq!(*rest_calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
     async fn websocket_ambiguity_retains_pending_identity_without_rest_fallback() {
-        let (mut gateway, rest_calls) = gateway(Vec::new());
-        let order_calls = install_order_transport(
-            &mut gateway,
+        let (mut gateway, rest_calls, order_calls) = gateway_with_order_responses(
+            Vec::new(),
             vec![Err(OrderTransportError::Ambiguous(
                 "disconnect after write".to_string(),
             ))],
@@ -1432,9 +1440,8 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_rejection_releases_identity_for_a_later_decision_retry() {
-        let (mut gateway, rest_calls) = gateway(Vec::new());
-        let order_calls = install_order_transport(
-            &mut gateway,
+        let (mut gateway, rest_calls, order_calls) = gateway_with_order_responses(
+            Vec::new(),
             vec![
                 Err(OrderTransportError::Rejected {
                     code: "51000".to_string(),
@@ -1470,9 +1477,8 @@ mod tests {
             status: 200,
             body: r#"{"code":"0","msg":"","data":[{"ordId":"42","clOrdId":"reap1","sCode":"0","sMsg":""}]}"#.to_string(),
         };
-        let (mut gateway, rest_calls) = gateway(vec![Ok(response)]);
-        let order_calls = install_order_transport(
-            &mut gateway,
+        let (gateway, rest_calls, order_calls) = gateway_with_order_responses(
+            vec![Ok(response)],
             vec![Err(OrderTransportError::Unavailable(
                 "session disconnected".to_string(),
             ))],
@@ -1493,10 +1499,11 @@ mod tests {
             status: 200,
             body: r#"{"code":"0","msg":"","data":[{"ordId":"42","clOrdId":"reap1","sCode":"0","sMsg":""}]}"#.to_string(),
         };
-        let (mut gateway, rest_calls) = gateway(vec![Ok(response)]);
-        gateway
-            .set_order_transport(Box::new(SubstitutingCancelTransport))
-            .unwrap();
+        let (gateway, rest_calls, _) = gateway_with_command_behavior(
+            vec![Ok(response)],
+            Vec::new(),
+            MockCommandBehavior::SubstituteCancel,
+        );
 
         let error = gateway
             .cancel(approved_cancel(&gateway, "reap1"))
@@ -1512,9 +1519,8 @@ mod tests {
 
     #[tokio::test]
     async fn mismatched_cancel_acknowledgement_is_ambiguous_without_rest_retry() {
-        let (mut gateway, rest_calls) = gateway(Vec::new());
-        let order_calls = install_order_transport(
-            &mut gateway,
+        let (gateway, rest_calls, order_calls) = gateway_with_order_responses(
+            Vec::new(),
             vec![Ok(OkxOrderAck {
                 exchange_order_id: "42".to_string(),
                 client_order_id: "foreign-order".to_string(),
@@ -1541,9 +1547,8 @@ mod tests {
             status: 200,
             body: r#"{"code":"0","msg":"","data":[{"ordId":"42","clOrdId":"reap1","sCode":"0","sMsg":""}]}"#.to_string(),
         };
-        let (mut gateway, rest_calls) = gateway(vec![Ok(response)]);
-        let order_calls = install_order_transport(
-            &mut gateway,
+        let (gateway, rest_calls, order_calls) = gateway_with_order_responses(
+            vec![Ok(response)],
             vec![Err(OrderTransportError::Ambiguous(
                 "disconnect after write".to_string(),
             ))],

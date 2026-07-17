@@ -125,6 +125,14 @@ impl ConnectionAttemptPacer {
         })
     }
 
+    pub fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    pub fn is_process_shared(&self) -> bool {
+        self.shared.is_some()
+    }
+
     pub async fn wait_for_turn(
         &self,
         shutdown: &mut watch::Receiver<bool>,
@@ -700,6 +708,12 @@ impl Drop for SupervisedFeed {
     }
 }
 
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum SupervisedFeedSpawnError {
+    #[error("supervised feed plans repeat connection id {conn_id}")]
+    DuplicateConnectionId { conn_id: ConnId },
+}
+
 pub fn spawn_supervised_feed(
     adapter: Arc<dyn VenueAdapter>,
     plans: Vec<SocketPlan>,
@@ -708,6 +722,33 @@ pub fn spawn_supervised_feed(
     connection_attempt_pacer: ConnectionAttemptPacer,
     reconnect: ReconnectPolicy,
 ) -> SupervisedFeed {
+    try_spawn_supervised_feed(
+        adapter,
+        plans,
+        bootstrap,
+        channel_capacity,
+        connection_attempt_pacer,
+        reconnect,
+    )
+    .expect("supervised feed plans must have unique connection ids")
+}
+
+pub fn try_spawn_supervised_feed(
+    adapter: Arc<dyn VenueAdapter>,
+    plans: Vec<SocketPlan>,
+    bootstrap: BootstrapFactory,
+    channel_capacity: usize,
+    connection_attempt_pacer: ConnectionAttemptPacer,
+    reconnect: ReconnectPolicy,
+) -> Result<SupervisedFeed, SupervisedFeedSpawnError> {
+    let mut connection_ids = HashSet::new();
+    for plan in &plans {
+        if !connection_ids.insert(plan.conn_id.clone()) {
+            return Err(SupervisedFeedSpawnError::DuplicateConnectionId {
+                conn_id: plan.conn_id.clone(),
+            });
+        }
+    }
     let (raw_tx, raw_rx) = mpsc::channel(channel_capacity.max(1));
     let (status_tx, status_rx) = mpsc::channel(channel_capacity.max(1));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -756,14 +797,14 @@ pub fn spawn_supervised_feed(
     }
     drop(raw_tx);
     drop(status_tx);
-    SupervisedFeed {
+    Ok(SupervisedFeed {
         raw: raw_rx,
         status: status_rx,
         shutdown: shutdown_tx,
         recovery_routes,
         _recovery_guards: recovery_guards,
         tasks,
-    }
+    })
 }
 
 struct ConnectionChannels {
@@ -1130,6 +1171,34 @@ mod tests {
         assert_eq!(feed._recovery_guards.len(), 1);
         assert!(!feed._recovery_guards[0].is_closed());
         feed.shutdown().await;
+    }
+
+    #[test]
+    fn duplicate_connection_ids_are_rejected_before_tasks_are_spawned() {
+        let plan = SocketPlan {
+            conn_id: reap_core::ConnId::new("private-account-r0"),
+            venue: Venue::Okx,
+            private: true,
+            subscriptions: vec![Subscription::private(
+                Venue::Okx,
+                Channel::Account,
+                FeedPriority::Critical,
+            )],
+        };
+        let result = try_spawn_supervised_feed(
+            Arc::new(OkxAdapter::new("ws://127.0.0.1:9", "ws://127.0.0.1:9")),
+            vec![plan.clone(), plan],
+            no_bootstrap(),
+            4,
+            ConnectionAttemptPacer::new(Duration::ZERO),
+            ReconnectPolicy::default(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(SupervisedFeedSpawnError::DuplicateConnectionId { conn_id })
+                if conn_id == reap_core::ConnId::new("private-account-r0")
+        ));
     }
 
     #[test]

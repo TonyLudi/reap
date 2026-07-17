@@ -1,13 +1,13 @@
 error[E0432]: unresolved import `reap_order::OkxGatewayIo`
- --> tests/ui/no_raw_regular_gateway.rs:3:5
+ --> tests/ui/no_raw_regular_gateway.rs:2:18
   |
-3 |     OkxGatewayIo, OkxOrderGateway, OkxOrderTransport, PrivateStateReducer, RegularExecution,
-  |     ^^^^^^^^^^^^ no `OkxGatewayIo` in the root
+2 | use reap_order::{OkxGatewayIo, OkxOrderGateway, PrivateStateReducer, RegularExecution};
+  |                  ^^^^^^^^^^^^ no `OkxGatewayIo` in the root
 
 error[E0308]: mismatched types
-  --> tests/ui/no_raw_regular_gateway.rs:13:40
+  --> tests/ui/no_raw_regular_gateway.rs:11:40
    |
-13 |     let _ = gateway.submit("decision", order.clone()).await;
+11 |     let _ = gateway.submit("decision", order.clone()).await;
    |                     ------             ^^^^^^^^^^^^^ expected `ReservedRegularSubmit`, found `NewOrder`
    |                     |
    |                     arguments to this method are incorrect
@@ -19,9 +19,9 @@ note: method defined here
    |                  ^^^^^^
 
 error[E0308]: mismatched types
-  --> tests/ui/no_raw_regular_gateway.rs:15:40
+  --> tests/ui/no_raw_regular_gateway.rs:13:40
    |
-15 |         .submit_registered("decision", order.clone(), state)
+13 |         .submit_registered("decision", order.clone(), state)
    |          -----------------             ^^^^^^^^^^^^^ expected `ReservedRegularSubmit`, found `NewOrder`
    |          |
    |          arguments to this method are incorrect
@@ -33,9 +33,9 @@ note: method defined here
    |                  ^^^^^^^^^^^^^^^^^
 
 error[E0308]: mismatched types
-  --> tests/ui/no_raw_regular_gateway.rs:17:48
+  --> tests/ui/no_raw_regular_gateway.rs:15:48
    |
-17 |     let _ = gateway.prepare_submit("decision", order.clone());
+15 |     let _ = gateway.prepare_submit("decision", order.clone());
    |                     --------------             ^^^^^^^^^^^^^ expected `ReservedRegularSubmit`, found `NewOrder`
    |                     |
    |                     arguments to this method are incorrect
@@ -47,9 +47,9 @@ note: method defined here
    |            ^^^^^^^^^^^^^^
 
 error[E0599]: no method named `prepare_registered_submit` found for mutable reference `&mut OkxOrderGateway` in the current scope
-  --> tests/ui/no_raw_regular_gateway.rs:18:21
+  --> tests/ui/no_raw_regular_gateway.rs:16:21
    |
-18 |     let _ = gateway.prepare_registered_submit("decision", order, "client-1");
+16 |     let _ = gateway.prepare_registered_submit("decision", order, "client-1");
    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^
    |
 help: there is a method `prepare_submit` with a similar name, but with different arguments
@@ -63,9 +63,9 @@ help: there is a method `prepare_submit` with a similar name, but with different
    | |________________________________________________^
 
 error[E0061]: this method takes 1 argument but 3 arguments were supplied
-  --> tests/ui/no_raw_regular_gateway.rs:20:10
+  --> tests/ui/no_raw_regular_gateway.rs:18:10
    |
-20 |         .cancel("BTC-USDT", None, Some("client-1".to_string()))
+18 |         .cancel("BTC-USDT", None, Some("client-1".to_string()))
    |          ^^^^^^ ----------  ----  ---------------------------- unexpected argument #3 of type `std::option::Option<String>`
    |                 |           |
    |                 |           unexpected argument #2 of type `std::option::Option<_>`
@@ -78,22 +78,22 @@ note: method defined here
    |                  ^^^^^^
 help: remove the extra arguments
    |
-20 -         .cancel("BTC-USDT", None, Some("client-1".to_string()))
-20 +         .cancel(/* ApprovedRegularCancel */)
+18 -         .cancel("BTC-USDT", None, Some("client-1".to_string()))
+18 +         .cancel(/* ApprovedRegularCancel */)
    |
 
 error[E0308]: mismatched types
-  --> tests/ui/no_raw_regular_gateway.rs:25:36
+  --> tests/ui/no_raw_regular_gateway.rs:23:36
    |
-25 |       let _ = gateway.prepare_cancel((
+23 |       let _ = gateway.prepare_cancel((
    |  _____________________--------------_^
    | |                     |
    | |                     arguments to this method are incorrect
-26 | |         "account".to_string(),
-27 | |         "BTC-USDT".to_string(),
-28 | |         "client-1".to_string(),
-29 | |         "reason".to_string(),
-30 | |     ));
+24 | |         "account".to_string(),
+25 | |         "BTC-USDT".to_string(),
+26 | |         "client-1".to_string(),
+27 | |         "reason".to_string(),
+28 | |     ));
    | |_____^ expected `ApprovedRegularCancel`, found `(String, String, String, String)`
    |
    = note: expected struct `ApprovedRegularCancel`
@@ -104,38 +104,30 @@ note: method defined here
    |     pub fn prepare_cancel(
    |            ^^^^^^^^^^^^^^
 
-error[E0308]: mismatched types
-  --> tests/ui/no_raw_regular_gateway.rs:39:55
+error[E0599]: no method named `set_order_transport` found for mutable reference `&mut OkxOrderGateway` in the current scope
+  --> tests/ui/no_raw_regular_gateway.rs:37:21
    |
-39 |     let _ = OkxOrderTransport::place_order(transport, place);
-   |             ------------------------------            ^^^^^ expected `PreparedRegularSubmit`, found `&OkxPlaceOrder`
+37 |     let _ = gateway.set_order_transport(Box::new(()));
+   |                     ^^^^^^^^^^^^^^^^^^^ method not found in `&mut OkxOrderGateway`
+
+error[E0308]: mismatched types
+  --> tests/ui/no_raw_regular_gateway.rs:38:62
+   |
+38 |     let _ = RegularExecution::place_regular_order(execution, place);
+   |             -------------------------------------            ^^^^^ expected `PreparedRegularSubmit`, found `&OkxPlaceOrder`
    |             |
    |             arguments to this function are incorrect
    |
 note: method defined here
-  --> src/transport.rs
+  --> src/gateway.rs
    |
-   |     async fn place_order(
-   |              ^^^^^^^^^^^
+   |     async fn place_regular_order(
+   |              ^^^^^^^^^^^^^^^^^^^
 
 error[E0308]: mismatched types
-  --> tests/ui/no_raw_regular_gateway.rs:40:56
+  --> tests/ui/no_raw_regular_gateway.rs:39:63
    |
-40 |     let _ = OkxOrderTransport::cancel_order(transport, cancel);
-   |             -------------------------------            ^^^^^^ expected `PreparedRegularCancel`, found `&OkxCancelOrder`
-   |             |
-   |             arguments to this function are incorrect
-   |
-note: method defined here
-  --> src/transport.rs
-   |
-   |     async fn cancel_order(
-   |              ^^^^^^^^^^^^
-
-error[E0308]: mismatched types
-  --> tests/ui/no_raw_regular_gateway.rs:41:63
-   |
-41 |     let _ = RegularExecution::cancel_regular_order(execution, cancel);
+39 |     let _ = RegularExecution::cancel_regular_order(execution, cancel);
    |             --------------------------------------            ^^^^^^ expected `PreparedRegularCancel`, found `&OkxCancelOrder`
    |             |
    |             arguments to this function are incorrect
@@ -145,3 +137,17 @@ note: method defined here
    |
    |     async fn cancel_regular_order(
    |              ^^^^^^^^^^^^^^^^^^^^
+
+error[E0308]: mismatched types
+  --> tests/ui/no_raw_regular_gateway.rs:40:72
+   |
+40 |     let _ = RegularExecution::cancel_regular_order_via_rest(execution, cancel);
+   |             -----------------------------------------------            ^^^^^^ expected `PreparedRegularCancel`, found `&OkxCancelOrder`
+   |             |
+   |             arguments to this function are incorrect
+   |
+note: method defined here
+  --> src/gateway.rs
+   |
+   |     async fn cancel_regular_order_via_rest(
+   |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -1,136 +1,65 @@
-error[E0599]: no method named `place_regular_order` found for reference `&RegularExecution` in the current scope
-  --> tests/ui/roles_no_unsupported_mutations.rs:11:23
-   |
-11 |     let _ = execution.place_regular_order();
-   |                       ^^^^^^^^^^^^^^^^^^^
-   |
-help: there is a method `cancel_regular_order` with a similar name, but with different arguments
-  --> $WORKSPACE/crates/reap-order/src/gateway.rs
-   |
-   | /     async fn cancel_regular_order(
-   | |         &self,
-   | |         cancel: PreparedRegularCancel,
-   | |     ) -> Result<OkxOrderAck, RestError>;
-   | |________________________________________^
-
-error[E0599]: no method named `submit_algo_order` found for reference `&RegularExecution` in the current scope
-  --> tests/ui/roles_no_unsupported_mutations.rs:12:23
-   |
-12 |     let _ = execution.submit_algo_order();
-   |                       ^^^^^^^^^^^^^^^^^ method not found in `&RegularExecution`
-
-error[E0599]: no method named `submit_spread_order` found for reference `&RegularExecution` in the current scope
-  --> tests/ui/roles_no_unsupported_mutations.rs:13:23
-   |
-13 |     let _ = execution.submit_spread_order();
-   |                       ^^^^^^^^^^^^^^^^^^^ method not found in `&RegularExecution`
-
-error[E0599]: no method named `amend_regular_order` found for reference `&RegularExecution` in the current scope
-  --> tests/ui/roles_no_unsupported_mutations.rs:14:23
-   |
-14 |     let _ = execution.amend_regular_order();
-   |                       ^^^^^^^^^^^^^^^^^^^
-   |
-help: there is a method `cancel_regular_order` with a similar name, but with different arguments
-  --> $WORKSPACE/crates/reap-order/src/gateway.rs
-   |
-   | /     async fn cancel_regular_order(
-   | |         &self,
-   | |         cancel: PreparedRegularCancel,
-   | |     ) -> Result<OkxOrderAck, RestError>;
-   | |________________________________________^
-
 error[E0599]: no method named `cancel_algo_orders` found for reference `&LiveSafety` in the current scope
-  --> tests/ui/roles_no_unsupported_mutations.rs:16:20
-   |
-16 |     let _ = safety.cancel_algo_orders();
-   |                    ^^^^^^^^^^^^^^^^^^
-   |
+ --> tests/ui/roles_no_unsupported_mutations.rs:7:20
+  |
+7 |     let _ = safety.cancel_algo_orders();
+  |                    ^^^^^^^^^^^^^^^^^^
+  |
 help: there is a method `cancel_all_after` with a similar name, but with different arguments
-  --> src/lib.rs
-   |
-   |     pub async fn cancel_all_after(&self, timeout_secs: u64) -> Result<(), RestError> {
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ --> src/lib.rs
+  |
+  |     pub async fn cancel_all_after(&self, timeout_secs: u64) -> Result<(), RestError> {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 error[E0599]: no method named `spread_mass_cancel` found for reference `&LiveSafety` in the current scope
-  --> tests/ui/roles_no_unsupported_mutations.rs:17:20
-   |
-17 |     let _ = safety.spread_mass_cancel();
-   |                    ^^^^^^^^^^^^^^^^^^ method not found in `&LiveSafety`
+ --> tests/ui/roles_no_unsupported_mutations.rs:8:20
+  |
+8 |     let _ = safety.spread_mass_cancel();
+  |                    ^^^^^^^^^^^^^^^^^^ method not found in `&LiveSafety`
 
 error[E0599]: no method named `spread_cancel_all_after` found for reference `&LiveSafety` in the current scope
-  --> tests/ui/roles_no_unsupported_mutations.rs:18:20
-   |
-18 |     let _ = safety.spread_cancel_all_after();
-   |                    ^^^^^^^^^^^^^^^^^^^^^^^
-   |
+ --> tests/ui/roles_no_unsupported_mutations.rs:9:20
+  |
+9 |     let _ = safety.spread_cancel_all_after();
+  |                    ^^^^^^^^^^^^^^^^^^^^^^^
+  |
 help: there is a method `cancel_all_after` with a similar name, but with different arguments
-  --> src/lib.rs
-   |
-   |     pub async fn cancel_all_after(&self, timeout_secs: u64) -> Result<(), RestError> {
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ --> src/lib.rs
+  |
+  |     pub async fn cancel_all_after(&self, timeout_secs: u64) -> Result<(), RestError> {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 error[E0599]: no method named `amend_order` found for reference `&LiveSafety` in the current scope
-  --> tests/ui/roles_no_unsupported_mutations.rs:19:20
+  --> tests/ui/roles_no_unsupported_mutations.rs:10:20
    |
-19 |     let _ = safety.amend_order();
+10 |     let _ = safety.amend_order();
    |                    ^^^^^^^^^^^ method not found in `&LiveSafety`
 
 error[E0599]: no method named `submit_algo_order` found for reference `&ForbiddenOrderObserver` in the current scope
-  --> tests/ui/roles_no_unsupported_mutations.rs:21:23
+  --> tests/ui/roles_no_unsupported_mutations.rs:12:23
    |
-21 |     let _ = forbidden.submit_algo_order();
+12 |     let _ = forbidden.submit_algo_order();
    |                       ^^^^^^^^^^^^^^^^^ method not found in `&ForbiddenOrderObserver`
 
 error[E0599]: no method named `cancel_algo_orders` found for reference `&ForbiddenOrderObserver` in the current scope
-  --> tests/ui/roles_no_unsupported_mutations.rs:22:23
+  --> tests/ui/roles_no_unsupported_mutations.rs:13:23
    |
-22 |     let _ = forbidden.cancel_algo_orders();
+13 |     let _ = forbidden.cancel_algo_orders();
    |                       ^^^^^^^^^^^^^^^^^^ method not found in `&ForbiddenOrderObserver`
 
 error[E0599]: no method named `submit_spread_order` found for reference `&ForbiddenOrderObserver` in the current scope
-  --> tests/ui/roles_no_unsupported_mutations.rs:23:23
+  --> tests/ui/roles_no_unsupported_mutations.rs:14:23
    |
-23 |     let _ = forbidden.submit_spread_order();
+14 |     let _ = forbidden.submit_spread_order();
    |                       ^^^^^^^^^^^^^^^^^^^ method not found in `&ForbiddenOrderObserver`
 
 error[E0599]: no method named `spread_mass_cancel` found for reference `&ForbiddenOrderObserver` in the current scope
-  --> tests/ui/roles_no_unsupported_mutations.rs:24:23
+  --> tests/ui/roles_no_unsupported_mutations.rs:15:23
    |
-24 |     let _ = forbidden.spread_mass_cancel();
+15 |     let _ = forbidden.spread_mass_cancel();
    |                       ^^^^^^^^^^^^^^^^^^ method not found in `&ForbiddenOrderObserver`
 
 error[E0599]: no method named `amend_order` found for reference `&ForbiddenOrderObserver` in the current scope
-  --> tests/ui/roles_no_unsupported_mutations.rs:25:23
+  --> tests/ui/roles_no_unsupported_mutations.rs:16:23
    |
-25 |     let _ = forbidden.amend_order();
+16 |     let _ = forbidden.amend_order();
    |                       ^^^^^^^^^^^ method not found in `&ForbiddenOrderObserver`
-
-error[E0599]: no method named `algo_request` found for reference `&RegularOrderSessionFactory` in the current scope
-  --> tests/ui/roles_no_unsupported_mutations.rs:27:28
-   |
-27 |     let _ = order_sessions.algo_request();
-   |                            ^^^^^^^^^^^^
-   |
-help: there is a method `place_request` with a similar name, but with different arguments
-  --> src/lib.rs
-   |
-   | /     pub fn place_request(
-   | |         &self,
-   | |         request_id: &str,
-   | |         expiry_ms: u64,
-   | |         prepared: PreparedRegularSubmit,
-   | |     ) -> Result<String, OkxWsOrderProtocolError> {
-   | |________________________________________________^
-
-error[E0599]: no method named `spread_request` found for reference `&RegularOrderSessionFactory` in the current scope
-  --> tests/ui/roles_no_unsupported_mutations.rs:28:28
-   |
-28 |     let _ = order_sessions.spread_request();
-   |                            ^^^^^^^^^^^^^^ method not found in `&RegularOrderSessionFactory`
-
-error[E0599]: no method named `amend_request` found for reference `&RegularOrderSessionFactory` in the current scope
-  --> tests/ui/roles_no_unsupported_mutations.rs:29:28
-   |
-29 |     let _ = order_sessions.amend_request();
-   |                            ^^^^^^^^^^^^^ method not found in `&RegularOrderSessionFactory`

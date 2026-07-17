@@ -1,7 +1,5 @@
 use reap_core::NewOrder;
-use reap_order::{
-    OkxGatewayIo, OkxOrderGateway, OkxOrderTransport, PrivateStateReducer, RegularExecution,
-};
+use reap_order::{OkxGatewayIo, OkxOrderGateway, PrivateStateReducer, RegularExecution};
 use reap_venue::okx::{OkxCancelOrder, OkxPlaceOrder};
 
 async fn raw_gateway_entrypoints(
@@ -31,14 +29,15 @@ async fn raw_gateway_entrypoints(
 }
 
 fn raw_transports_are_rejected(
-    transport: &dyn OkxOrderTransport,
+    gateway: &mut OkxOrderGateway,
     execution: &dyn RegularExecution,
     place: &OkxPlaceOrder,
     cancel: &OkxCancelOrder,
 ) {
-    let _ = OkxOrderTransport::place_order(transport, place);
-    let _ = OkxOrderTransport::cancel_order(transport, cancel);
+    let _ = gateway.set_order_transport(Box::new(()));
+    let _ = RegularExecution::place_regular_order(execution, place);
     let _ = RegularExecution::cancel_regular_order(execution, cancel);
+    let _ = RegularExecution::cancel_regular_order_via_rest(execution, cancel);
 }
 
 fn main() {}

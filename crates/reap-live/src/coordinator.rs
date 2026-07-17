@@ -1719,7 +1719,8 @@ mod tests {
     };
     use reap_feed::FeedOutput;
     use reap_order::{
-        OkxOrderGateway, PacingPolicy, PreparedRegularCancel, ReconcileIssue, RegularExecution,
+        CancelOrderTransportError, OkxOrderGateway, OrderTransportError, PacingPolicy,
+        PreparedRegularCancel, PreparedRegularSubmit, ReconcileIssue, RegularExecution,
         RegularReconciliation, reconcile, reconcile_full_state,
     };
     use reap_risk::{
@@ -1746,10 +1747,24 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RegularExecution for ScopeOnlyGatewayRoles {
+        async fn place_regular_order(
+            &self,
+            _order: PreparedRegularSubmit,
+        ) -> Result<OkxOrderAck, OrderTransportError> {
+            unreachable!("scope-only test gateway never executes orders")
+        }
+
         async fn cancel_regular_order(
             &self,
             _cancel: PreparedRegularCancel,
-        ) -> Result<OkxOrderAck, RestError> {
+        ) -> Result<OkxOrderAck, CancelOrderTransportError> {
+            unreachable!("scope-only test gateway never executes orders")
+        }
+
+        async fn cancel_regular_order_via_rest(
+            &self,
+            _cancel: PreparedRegularCancel,
+        ) -> Result<OkxOrderAck, OrderTransportError> {
             unreachable!("scope-only test gateway never executes orders")
         }
     }

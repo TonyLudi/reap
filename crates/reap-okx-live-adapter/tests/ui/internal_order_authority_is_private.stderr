@@ -1,0 +1,23 @@
+error[E0603]: struct `RegularExecution` is private
+ --> tests/ui/internal_order_authority_is_private.rs:1:29
+  |
+1 | use reap_okx_live_adapter::{RegularExecution, RegularOrderSessionFactory};
+  |                             ^^^^^^^^^^^^^^^^ private struct
+  |
+note: the struct `RegularExecution` is defined here
+ --> src/lib.rs
+  |
+  | struct RegularExecution {
+  | ^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0603]: struct `RegularOrderSessionFactory` is private
+ --> tests/ui/internal_order_authority_is_private.rs:1:47
+  |
+1 | use reap_okx_live_adapter::{RegularExecution, RegularOrderSessionFactory};
+  |                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^ private struct
+  |
+note: the struct `RegularOrderSessionFactory` is defined here
+ --> src/lib.rs
+  |
+  | struct RegularOrderSessionFactory {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

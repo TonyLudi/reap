@@ -25,9 +25,7 @@ pub use private::{PrivateOrderIdentityError, PrivateStateReducer};
 pub use reconcile::{
     ReconcileIssue, ReconcileReport, ReconciliationSnapshot, reconcile, reconcile_full_state,
 };
-pub use transport::{
-    CancelOrderTransportError, OkxOrderTransport, OrderTransportError, okx_order_dispatch_key,
-};
+pub use transport::{CancelOrderTransportError, OrderTransportError, okx_order_dispatch_key};
 
 use std::collections::{BTreeMap, HashSet};
 

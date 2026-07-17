@@ -6,6 +6,7 @@ use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use reap_core::AccountUpdate;
+use reap_okx_live_adapter::OrderCommandWebsocketStatus;
 use reap_order::{
     CancelOutcome, GatewayError, OkxOrderGateway, RegularSubmitCompletion, SubmitOutcome,
     SubmitPreparation, okx_order_dispatch_key,
@@ -16,8 +17,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use super::{
-    CancelAction, ConnectionStatus, LiveRuntimeError, OkxOrderWsStatus, OperatorEnvelope,
-    OperatorService, SubmitAction, elapsed_us, unix_time_ms,
+    CancelAction, ConnectionStatus, LiveRuntimeError, OperatorEnvelope, OperatorService,
+    SubmitAction, elapsed_us, unix_time_ms,
 };
 
 pub(super) struct DispatchState {
@@ -45,7 +46,7 @@ pub(super) enum RuntimeEvent {
         source_id: usize,
         status: ConnectionStatus,
     },
-    OrderTransport(OkxOrderWsStatus),
+    OrderTransport(OrderCommandWebsocketStatus),
     SubmitComplete {
         account_id: String,
         symbol: String,

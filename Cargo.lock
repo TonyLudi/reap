@@ -1213,7 +1213,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
- "tokio-tungstenite",
  "toml 0.9.12+spec-1.1.0",
  "tracing",
  "trybuild",
@@ -1269,6 +1268,7 @@ name = "reap-okx-live-adapter"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "reap-core",
  "reap-feed",
  "reap-okx-wire",
@@ -1280,6 +1280,8 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-tungstenite",
+ "tracing",
  "trybuild",
  "url",
 ]

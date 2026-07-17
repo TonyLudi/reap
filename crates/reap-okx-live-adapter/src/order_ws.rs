@@ -3,13 +3,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
-use reap_feed::{ConnectionAttemptPacer, ReconnectPolicy};
-use reap_okx_live_adapter::RegularOrderSessionFactory;
+use reap_feed::{ConnectionAttemptPacer, OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS, ReconnectPolicy};
 use reap_order::{
-    CancelOrderTransportError, OkxOrderTransport, OrderTransportError, PreparedRegularCancel,
-    PreparedRegularSubmit, okx_order_dispatch_key,
+    CancelOrderTransportError, OkxOrderGateway, OrderTransportError, PreparedRegularCancel,
+    PreparedRegularSubmit,
 };
 use reap_venue::okx::{
     OkxOrderAck, OkxWsOrderOperation, OkxWsOrderResult, okx_capability_registration,
@@ -20,27 +18,88 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinError, JoinHandle};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::{
+    AdapterError, BoundRegularOrderGateway, OrderCommandTransportSlot, RegularOrderSessionFactory,
+    is_loopback_host, validate_private_websocket_url,
+};
+
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const EXPIRY_SCAN_INTERVAL: Duration = Duration::from_millis(10);
+const ORDER_COMMAND_SESSION_COUNT: usize = 1;
+const ORDER_COMMAND_SESSION_INDEX: usize = 0;
+const STATUS_CHANNEL_CAPACITY: usize = 64;
 
-#[derive(Clone)]
-pub(crate) struct OkxOrderWsConfig {
-    pub account_id: String,
-    pub websocket_url: String,
-    pub session_factory: Arc<dyn OrderSessionOperations>,
-    pub session_count: usize,
-    pub command_capacity: usize,
-    pub request_expiry: Duration,
-    pub acknowledgement_timeout: Duration,
-    pub connection_attempt_pacer: ConnectionAttemptPacer,
-    pub reconnect: ReconnectPolicy,
+pub struct OrderCommandWebsocketConfig {
+    account_id: String,
+    websocket_url: String,
+    command_capacity: usize,
+    request_expiry: Duration,
+    acknowledgement_timeout: Duration,
+    connection_attempt_pacer: ConnectionAttemptPacer,
+    reconnect: ReconnectPolicy,
+}
+
+impl OrderCommandWebsocketConfig {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        account_id: impl Into<String>,
+        websocket_url: impl Into<String>,
+        command_capacity: usize,
+        request_expiry: Duration,
+        acknowledgement_timeout: Duration,
+        connection_attempt_pacer: ConnectionAttemptPacer,
+        reconnect: ReconnectPolicy,
+    ) -> Result<Self, AdapterError> {
+        let account_id = account_id.into();
+        if account_id.trim().is_empty() || account_id.trim() != account_id {
+            return Err(AdapterError::InvalidConfiguration(
+                "order command websocket account id must be non-empty and trimmed".to_string(),
+            ));
+        }
+        let websocket_url = websocket_url.into();
+        if websocket_url.trim().is_empty() || websocket_url.trim() != websocket_url {
+            return Err(AdapterError::InvalidConfiguration(
+                "order command websocket URL must be non-empty and trimmed".to_string(),
+            ));
+        }
+        if command_capacity == 0 {
+            return Err(AdapterError::InvalidConfiguration(
+                "order command websocket capacity must be positive".to_string(),
+            ));
+        }
+        if request_expiry.is_zero() || acknowledgement_timeout.is_zero() {
+            return Err(AdapterError::InvalidConfiguration(
+                "order command websocket request and acknowledgement timeouts must be positive"
+                    .to_string(),
+            ));
+        }
+        if reconnect.initial_delay.is_zero()
+            || reconnect.max_delay.is_zero()
+            || reconnect.max_delay < reconnect.initial_delay
+            || reconnect.multiplier == 0
+        {
+            return Err(AdapterError::InvalidConfiguration(
+                "order command websocket reconnect policy requires positive ordered delays and a positive multiplier"
+                    .to_string(),
+            ));
+        }
+        Ok(Self {
+            account_id,
+            websocket_url,
+            command_capacity,
+            request_expiry,
+            acknowledgement_timeout,
+            connection_attempt_pacer,
+            reconnect,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OkxOrderWsStatusKind {
+pub enum OrderCommandWebsocketStatusKind {
     Ready,
     Heartbeat,
     Disconnected,
@@ -48,29 +107,29 @@ pub(crate) enum OkxOrderWsStatusKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct OkxOrderWsStatus {
+pub struct OrderCommandWebsocketStatus {
     pub account_id: String,
     pub ts_ms: u64,
-    pub kind: OkxOrderWsStatusKind,
+    pub kind: OrderCommandWebsocketStatusKind,
     pub ready_sessions: usize,
     pub total_sessions: usize,
     pub reason: String,
 }
 
 #[derive(Clone)]
-pub(crate) struct OkxOrderWsTransport {
+pub(crate) struct OrderCommandWebsocketTransport {
     sessions: Arc<Vec<SessionHandle>>,
     session_factory: Arc<dyn OrderSessionOperations>,
     request_sequence: Arc<AtomicU64>,
     request_expiry: Duration,
 }
 
-pub(crate) struct OkxOrderWsRuntime {
+pub struct OrderCommandWebsocketLifecycle {
     shutdown: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
 }
 
-impl OkxOrderWsRuntime {
+impl OrderCommandWebsocketLifecycle {
     pub fn request_shutdown(&self) {
         let _ = self.shutdown.send(true);
     }
@@ -85,7 +144,7 @@ impl OkxOrderWsRuntime {
     }
 }
 
-impl Drop for OkxOrderWsRuntime {
+impl Drop for OrderCommandWebsocketLifecycle {
     fn drop(&mut self) {
         self.request_shutdown();
         for task in &self.tasks {
@@ -100,9 +159,18 @@ struct SessionHandle {
     ready: watch::Receiver<bool>,
 }
 
+struct ExpectedOrderIdentity {
+    account_id: String,
+    symbol: String,
+    client_order_id: String,
+}
+
 struct SessionCommand {
     request_id: String,
     operation: OkxWsOrderOperation,
+    expected_account_id: String,
+    expected_symbol: String,
+    expected_client_order_id: String,
     payload: String,
     send_deadline: Instant,
     response: oneshot::Sender<Result<OkxOrderAck, OrderTransportError>>,
@@ -110,6 +178,9 @@ struct SessionCommand {
 
 struct PendingRequest {
     operation: OkxWsOrderOperation,
+    expected_account_id: String,
+    expected_symbol: String,
+    expected_client_order_id: String,
     acknowledgement_deadline: Instant,
     response: oneshot::Sender<Result<OkxOrderAck, OrderTransportError>>,
 }
@@ -154,40 +225,143 @@ impl OrderSessionOperations for RegularOrderSessionFactory {
     }
 }
 
+impl BoundRegularOrderGateway {
+    pub fn start_and_install(
+        self,
+        config: OrderCommandWebsocketConfig,
+    ) -> Result<
+        (
+            OkxOrderGateway,
+            OrderCommandWebsocketLifecycle,
+            mpsc::Receiver<OrderCommandWebsocketStatus>,
+        ),
+        AdapterError,
+    > {
+        let Self {
+            gateway,
+            order_sessions,
+            order_transport,
+        } = self;
+        order_sessions.validate_start(&config)?;
+        let (lifecycle, status) =
+            start_and_install_order_command_websocket(order_sessions, order_transport, config)?;
+        Ok((gateway, lifecycle, status))
+    }
+}
+
+impl RegularOrderSessionFactory {
+    pub(crate) fn validate_start(
+        &self,
+        config: &OrderCommandWebsocketConfig,
+    ) -> Result<(), AdapterError> {
+        if !self.demo_trading {
+            return Err(AdapterError::InvalidConfiguration(
+                "order command websocket authority is demo-trading only".to_string(),
+            ));
+        }
+        if config.account_id != self.expected_account_id {
+            return Err(AdapterError::InvalidConfiguration(format!(
+                "order command websocket account {} does not match credential role account {}",
+                config.account_id, self.expected_account_id
+            )));
+        }
+        validate_private_websocket_url(&config.websocket_url, self.demo_trading)?;
+        let endpoint = url::Url::parse(&config.websocket_url).map_err(|error| {
+            AdapterError::InvalidConfiguration(format!(
+                "order command websocket URL is invalid: {error}"
+            ))
+        })?;
+        let host = endpoint.host_str().ok_or_else(|| {
+            AdapterError::InvalidConfiguration(
+                "order command websocket URL must contain a host".to_string(),
+            )
+        })?;
+        let demo_loopback = self.demo_trading && is_loopback_host(host);
+        if !demo_loopback {
+            let minimum = Duration::from_millis(OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS);
+            if config.connection_attempt_pacer.interval() < minimum {
+                return Err(AdapterError::InvalidConfiguration(format!(
+                    "official order command websocket pacing must be at least {}ms",
+                    OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS
+                )));
+            }
+            if !config.connection_attempt_pacer.is_process_shared() {
+                return Err(AdapterError::InvalidConfiguration(
+                    "official order command websocket pacing must be process-shared".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct SessionStatus {
     index: usize,
-    kind: OkxOrderWsStatusKind,
+    kind: OrderCommandWebsocketStatusKind,
     reason: String,
 }
 
-pub(crate) fn spawn_okx_order_ws(
-    config: OkxOrderWsConfig,
-) -> (
-    OkxOrderWsTransport,
-    OkxOrderWsRuntime,
-    mpsc::Receiver<OkxOrderWsStatus>,
-) {
+fn start_and_install_order_command_websocket(
+    session_factory: RegularOrderSessionFactory,
+    order_transport: Arc<OrderCommandTransportSlot>,
+    config: OrderCommandWebsocketConfig,
+) -> Result<
+    (
+        OrderCommandWebsocketLifecycle,
+        mpsc::Receiver<OrderCommandWebsocketStatus>,
+    ),
+    AdapterError,
+> {
+    let session_factory: Arc<dyn OrderSessionOperations> = Arc::new(session_factory);
+    start_order_command_websocket(session_factory, config, move |transport| {
+        order_transport.install(transport.clone())
+    })
+}
+
+fn start_order_command_websocket(
+    session_factory: Arc<dyn OrderSessionOperations>,
+    config: OrderCommandWebsocketConfig,
+    before_spawn: impl FnOnce(&OrderCommandWebsocketTransport) -> Result<(), AdapterError>,
+) -> Result<
+    (
+        OrderCommandWebsocketLifecycle,
+        mpsc::Receiver<OrderCommandWebsocketStatus>,
+    ),
+    AdapterError,
+> {
     let _connection_capability = okx_capability_registration("OKX-CONNECTION-ORDER-COMMAND")
         .expect("order command connection must remain in the OKX capability registry");
-    assert!(config.session_count > 0, "validated session count");
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let (session_status_tx, session_status_rx) = mpsc::channel(config.session_count.max(1) * 4);
-    let (aggregate_status_tx, aggregate_status_rx) = mpsc::channel(64);
-    let mut handles = Vec::with_capacity(config.session_count);
-    let mut tasks = Vec::with_capacity(config.session_count + 1);
+    let (session_status_tx, session_status_rx) = mpsc::channel(ORDER_COMMAND_SESSION_COUNT * 4);
+    let (aggregate_status_tx, aggregate_status_rx) = mpsc::channel(STATUS_CHANNEL_CAPACITY);
+    let mut handles = Vec::with_capacity(ORDER_COMMAND_SESSION_COUNT);
+    let mut session_starts = Vec::with_capacity(ORDER_COMMAND_SESSION_COUNT);
 
-    for index in 0..config.session_count {
-        let (command_tx, command_rx) = mpsc::channel(config.command_capacity.max(1));
+    for index in 0..ORDER_COMMAND_SESSION_COUNT {
+        let (command_tx, command_rx) = mpsc::channel(config.command_capacity);
         let (ready_tx, ready_rx) = watch::channel(false);
         handles.push(SessionHandle {
             commands: command_tx,
             ready: ready_rx,
         });
+        session_starts.push((index, command_rx, ready_tx));
+    }
+
+    let transport = OrderCommandWebsocketTransport {
+        sessions: Arc::new(handles),
+        session_factory: Arc::clone(&session_factory),
+        request_sequence: Arc::new(AtomicU64::new(unix_time_ns())),
+        request_expiry: config.request_expiry,
+    };
+    before_spawn(&transport)?;
+
+    let mut tasks = Vec::with_capacity(ORDER_COMMAND_SESSION_COUNT + 1);
+    for (index, command_rx, ready_tx) in session_starts {
         tasks.push(tokio::spawn(supervise_session(
             index,
             config.websocket_url.clone(),
-            Arc::clone(&config.session_factory),
+            Arc::clone(&session_factory),
             command_rx,
             ready_tx,
             session_status_tx.clone(),
@@ -200,36 +374,34 @@ pub(crate) fn spawn_okx_order_ws(
     drop(session_status_tx);
     tasks.push(tokio::spawn(aggregate_status(
         config.account_id,
-        config.session_count,
+        ORDER_COMMAND_SESSION_COUNT,
         session_status_rx,
         aggregate_status_tx,
         shutdown_rx,
     )));
 
-    (
-        OkxOrderWsTransport {
-            sessions: Arc::new(handles),
-            session_factory: config.session_factory,
-            request_sequence: Arc::new(AtomicU64::new(unix_time_ns())),
-            request_expiry: config.request_expiry,
-        },
-        OkxOrderWsRuntime {
+    Ok((
+        OrderCommandWebsocketLifecycle {
             shutdown: shutdown_tx,
             tasks,
         },
         aggregate_status_rx,
-    )
+    ))
 }
 
-#[async_trait]
-impl OkxOrderTransport for OkxOrderWsTransport {
-    async fn place_order(
+impl OrderCommandWebsocketTransport {
+    pub(crate) async fn place_order(
         &self,
         order: PreparedRegularSubmit,
     ) -> Result<OkxOrderAck, OrderTransportError> {
-        let session_index = route_session(&order.order().symbol, self.sessions.len());
+        let session_index = ORDER_COMMAND_SESSION_INDEX;
         let request_id = self.next_request_id(session_index);
         let expiry_ms = unix_time_ms().saturating_add(duration_ms(self.request_expiry));
+        let expected_identity = ExpectedOrderIdentity {
+            account_id: order.account_id().to_string(),
+            symbol: order.order().symbol.clone(),
+            client_order_id: order.client_order_id().to_string(),
+        };
         let payload = self
             .session_factory
             .place_request(&request_id, expiry_ms, order)
@@ -238,16 +410,17 @@ impl OkxOrderTransport for OkxOrderWsTransport {
             session_index,
             request_id,
             OkxWsOrderOperation::Place,
+            expected_identity,
             payload,
         )
         .await
     }
 
-    async fn cancel_order(
+    pub(crate) async fn cancel_order(
         &self,
         order: PreparedRegularCancel,
     ) -> Result<OkxOrderAck, CancelOrderTransportError> {
-        let session_index = route_session(order.symbol(), self.sessions.len());
+        let session_index = ORDER_COMMAND_SESSION_INDEX;
         if !*self.sessions[session_index].ready.borrow() {
             return Err(CancelOrderTransportError::pre_send_unavailable(
                 format!("session {session_index} is not authenticated"),
@@ -255,6 +428,11 @@ impl OkxOrderTransport for OkxOrderWsTransport {
             ));
         }
         let request_id = self.next_request_id(session_index);
+        let expected_identity = ExpectedOrderIdentity {
+            account_id: order.account_id().to_string(),
+            symbol: order.symbol().to_string(),
+            client_order_id: order.client_order_id().to_string(),
+        };
         let payload = self
             .session_factory
             .cancel_request(&request_id, &order)
@@ -268,6 +446,7 @@ impl OkxOrderTransport for OkxOrderWsTransport {
                 session_index,
                 request_id,
                 OkxWsOrderOperation::Cancel,
+                expected_identity,
                 payload,
             )
             .await
@@ -281,7 +460,7 @@ impl OkxOrderTransport for OkxOrderWsTransport {
     }
 }
 
-impl OkxOrderWsTransport {
+impl OrderCommandWebsocketTransport {
     fn next_request_id(&self, session_index: usize) -> String {
         let sequence = self.request_sequence.fetch_add(1, Ordering::Relaxed);
         format!("r{session_index:02x}{sequence:016x}")
@@ -292,6 +471,7 @@ impl OkxOrderWsTransport {
         session_index: usize,
         request_id: String,
         operation: OkxWsOrderOperation,
+        expected_identity: ExpectedOrderIdentity,
         payload: String,
     ) -> Result<OkxOrderAck, OrderTransportError> {
         let session = &self.sessions[session_index];
@@ -301,9 +481,17 @@ impl OkxOrderWsTransport {
             )));
         }
         let (response_tx, response_rx) = oneshot::channel();
+        let ExpectedOrderIdentity {
+            account_id: expected_account_id,
+            symbol: expected_symbol,
+            client_order_id: expected_client_order_id,
+        } = expected_identity;
         let command = SessionCommand {
             request_id,
             operation,
+            expected_account_id,
+            expected_symbol,
+            expected_client_order_id,
             payload,
             send_deadline: Instant::now() + self.request_expiry,
             response: response_tx,
@@ -359,7 +547,7 @@ async fn supervise_session(
                 let _ = status
                     .send(SessionStatus {
                         index,
-                        kind: OkxOrderWsStatusKind::Fatal,
+                        kind: OrderCommandWebsocketStatusKind::Fatal,
                         reason: reason.clone(),
                     })
                     .await;
@@ -395,7 +583,7 @@ async fn supervise_session(
         if status
             .send(SessionStatus {
                 index,
-                kind: OkxOrderWsStatusKind::Disconnected,
+                kind: OrderCommandWebsocketStatusKind::Disconnected,
                 reason: reason.clone(),
             })
             .await
@@ -458,7 +646,7 @@ async fn run_authenticated_session(
     status
         .send(SessionStatus {
             index,
-            kind: OkxOrderWsStatusKind::Ready,
+            kind: OrderCommandWebsocketStatusKind::Ready,
             reason: "authenticated".to_string(),
         })
         .await
@@ -561,6 +749,9 @@ where
                 let SessionCommand {
                     request_id,
                     operation,
+                    expected_account_id,
+                    expected_symbol,
+                    expected_client_order_id,
                     payload,
                     send_deadline,
                     response,
@@ -596,6 +787,9 @@ where
                     request_id,
                     PendingRequest {
                         operation,
+                        expected_account_id,
+                        expected_symbol,
+                        expected_client_order_id,
                         acknowledgement_deadline: Instant::now() + acknowledgement_timeout,
                         response,
                     },
@@ -739,10 +933,34 @@ fn process_order_response(
             ))));
         return Err(format!("request {request_id} operation mismatch"));
     }
+    if let Err(message) = validate_acknowledgement_identity(&value, &request) {
+        let _ = request
+            .response
+            .send(Err(OrderTransportError::Ambiguous(message.clone())));
+        return Err(message);
+    }
     match result {
         OkxWsOrderResult::Accepted {
-            acknowledgement, ..
+            mut acknowledgement,
+            ..
         } => {
+            if acknowledgement.exchange_order_id.trim().is_empty()
+                || acknowledgement.exchange_order_id.trim() != acknowledgement.exchange_order_id
+                || acknowledgement.exchange_order_id == "0"
+            {
+                let message = format!(
+                    "request {request_id} returned invalid exchange order id {:?}",
+                    acknowledgement.exchange_order_id
+                );
+                let _ = request
+                    .response
+                    .send(Err(OrderTransportError::Ambiguous(message.clone())));
+                return Err(message);
+            }
+            if acknowledgement.client_order_id.is_empty() || acknowledgement.client_order_id == "0"
+            {
+                acknowledgement.client_order_id = request.expected_client_order_id;
+            }
             let _ = request.response.send(Ok(acknowledgement));
         }
         OkxWsOrderResult::Rejected { code, message, .. } => {
@@ -754,10 +972,63 @@ fn process_order_response(
     Ok(())
 }
 
+fn validate_acknowledgement_identity(
+    response: &Value,
+    request: &PendingRequest,
+) -> Result<(), String> {
+    for (field, expected, aliases, allows_zero_placeholder) in [
+        (
+            "account",
+            request.expected_account_id.as_str(),
+            &["accountId", "acctId", "account_id"][..],
+            false,
+        ),
+        (
+            "symbol",
+            request.expected_symbol.as_str(),
+            &["instId", "symbol"][..],
+            false,
+        ),
+        (
+            "client order id",
+            request.expected_client_order_id.as_str(),
+            &["clOrdId", "clientOrderId", "client_order_id"][..],
+            true,
+        ),
+    ] {
+        let row = response
+            .get("data")
+            .and_then(Value::as_array)
+            .and_then(|rows| rows.first());
+        for container in std::iter::once(response).chain(row) {
+            for alias in aliases {
+                let Some(value) = container.get(*alias) else {
+                    continue;
+                };
+                let actual = value.as_str().ok_or_else(|| {
+                    format!(
+                        "order websocket {field} acknowledgement field {alias} must be a string"
+                    )
+                })?;
+                if actual.is_empty()
+                    || (allows_zero_placeholder && actual == "0")
+                    || (actual == expected && actual != "0")
+                {
+                    continue;
+                }
+                return Err(format!(
+                    "order websocket {field} acknowledgement mismatch: expected {expected:?}, received {actual:?}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn try_send_heartbeat(index: usize, status: &mpsc::Sender<SessionStatus>) -> Result<(), String> {
     match status.try_send(SessionStatus {
         index,
-        kind: OkxOrderWsStatusKind::Heartbeat,
+        kind: OrderCommandWebsocketStatusKind::Heartbeat,
         reason: "pong received".to_string(),
     }) {
         Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
@@ -789,7 +1060,7 @@ async fn aggregate_status(
     account_id: String,
     total_sessions: usize,
     mut session_status: mpsc::Receiver<SessionStatus>,
-    output: mpsc::Sender<OkxOrderWsStatus>,
+    output: mpsc::Sender<OrderCommandWebsocketStatus>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut ready_sessions = HashSet::new();
@@ -805,51 +1076,51 @@ async fn aggregate_status(
             status = session_status.recv() => {
                 let Some(status) = status else { return; };
                 match status.kind {
-                    OkxOrderWsStatusKind::Ready | OkxOrderWsStatusKind::Heartbeat => {
+                    OrderCommandWebsocketStatusKind::Ready | OrderCommandWebsocketStatusKind::Heartbeat => {
                         ready_sessions.insert(status.index);
                     }
-                    OkxOrderWsStatusKind::Disconnected | OkxOrderWsStatusKind::Fatal => {
+                    OrderCommandWebsocketStatusKind::Disconnected | OrderCommandWebsocketStatusKind::Fatal => {
                         ready_sessions.remove(&status.index);
                     }
                 }
                 let all_ready = ready_sessions.len() == total_sessions;
                 let aggregate_kind = match status.kind {
-                    OkxOrderWsStatusKind::Disconnected
+                    OrderCommandWebsocketStatusKind::Disconnected
                         if aggregate_ready || !disconnected_reported =>
                     {
                         disconnected_reported = true;
-                        Some(OkxOrderWsStatusKind::Disconnected)
+                        Some(OrderCommandWebsocketStatusKind::Disconnected)
                     }
-                    OkxOrderWsStatusKind::Ready if all_ready && !aggregate_ready => {
+                    OrderCommandWebsocketStatusKind::Ready if all_ready && !aggregate_ready => {
                         disconnected_reported = false;
-                        Some(OkxOrderWsStatusKind::Ready)
+                        Some(OrderCommandWebsocketStatusKind::Ready)
                     }
-                    OkxOrderWsStatusKind::Heartbeat if all_ready => {
-                        Some(OkxOrderWsStatusKind::Heartbeat)
+                    OrderCommandWebsocketStatusKind::Heartbeat if all_ready => {
+                        Some(OrderCommandWebsocketStatusKind::Heartbeat)
                     }
-                    OkxOrderWsStatusKind::Fatal => Some(OkxOrderWsStatusKind::Fatal),
+                    OrderCommandWebsocketStatusKind::Fatal => Some(OrderCommandWebsocketStatusKind::Fatal),
                     _ => None,
                 };
                 aggregate_ready = all_ready;
                 let Some(kind) = aggregate_kind else { continue; };
-                let terminal = kind == OkxOrderWsStatusKind::Fatal;
+                let terminal = kind == OrderCommandWebsocketStatusKind::Fatal;
                 let reason = match kind {
-                    OkxOrderWsStatusKind::Ready => {
+                    OrderCommandWebsocketStatusKind::Ready => {
                         "every order websocket session is authenticated".to_string()
                     }
-                    OkxOrderWsStatusKind::Heartbeat => {
+                    OrderCommandWebsocketStatusKind::Heartbeat => {
                         "every order websocket session is authenticated and responsive".to_string()
                     }
-                    OkxOrderWsStatusKind::Disconnected => format!(
+                    OrderCommandWebsocketStatusKind::Disconnected => format!(
                         "order websocket session {} disconnected: {}",
                         status.index, status.reason
                     ),
-                    OkxOrderWsStatusKind::Fatal => format!(
+                    OrderCommandWebsocketStatusKind::Fatal => format!(
                         "order websocket session {} failed permanently: {}",
                         status.index, status.reason
                     ),
                 };
-                let aggregate = OkxOrderWsStatus {
+                let aggregate = OrderCommandWebsocketStatus {
                     account_id: account_id.clone(),
                     ts_ms: unix_time_ms(),
                     kind,
@@ -857,7 +1128,7 @@ async fn aggregate_status(
                     total_sessions,
                     reason,
                 };
-                let output_closed = if kind == OkxOrderWsStatusKind::Heartbeat {
+                let output_closed = if kind == OrderCommandWebsocketStatusKind::Heartbeat {
                     matches!(
                         output.try_send(aggregate),
                         Err(mpsc::error::TrySendError::Closed(_))
@@ -874,15 +1145,6 @@ async fn aggregate_status(
             }
         }
     }
-}
-
-fn route_session(symbol: &str, session_count: usize) -> usize {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in okx_order_dispatch_key(symbol).bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    (hash as usize) % session_count
 }
 
 fn unix_time_ms() -> u64 {
@@ -910,6 +1172,8 @@ mod tests {
     use reap_venue::okx::{OKX_WS_CANCEL_ORDER_OP, OKX_WS_PLACE_ORDER_OP};
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
+
+    use crate::OrderCommandTransportSlot;
 
     use super::*;
 
@@ -961,27 +1225,47 @@ mod tests {
         }
     }
 
-    fn config(url: String, session_count: usize) -> OkxOrderWsConfig {
-        OkxOrderWsConfig {
-            account_id: "account-a".to_string(),
-            websocket_url: url,
-            session_factory: Arc::new(TestSessionOperations),
-            session_count,
-            command_capacity: 8,
-            request_expiry: Duration::from_millis(1_000),
-            acknowledgement_timeout: Duration::from_millis(500),
-            connection_attempt_pacer: ConnectionAttemptPacer::new(Duration::ZERO),
-            reconnect: ReconnectPolicy {
+    fn config(url: String) -> OrderCommandWebsocketConfig {
+        OrderCommandWebsocketConfig::new(
+            "account-a",
+            url,
+            8,
+            Duration::from_millis(1_000),
+            Duration::from_millis(500),
+            ConnectionAttemptPacer::new(Duration::ZERO),
+            ReconnectPolicy {
                 initial_delay: Duration::from_millis(10),
                 max_delay: Duration::from_millis(20),
                 multiplier: 2,
             },
-        }
+        )
+        .unwrap()
     }
 
-    impl OkxOrderWsTransport {
+    fn start_test_order_command_websocket(
+        config: OrderCommandWebsocketConfig,
+    ) -> (
+        OrderCommandWebsocketTransport,
+        OrderCommandWebsocketLifecycle,
+        mpsc::Receiver<OrderCommandWebsocketStatus>,
+    ) {
+        let mut installed = None;
+        let (runtime, status) =
+            start_order_command_websocket(Arc::new(TestSessionOperations), config, |transport| {
+                installed = Some(transport.clone());
+                Ok(())
+            })
+            .unwrap();
+        (
+            installed.expect("test transport must be installed before tasks start"),
+            runtime,
+            status,
+        )
+    }
+
+    impl OrderCommandWebsocketTransport {
         async fn place_test_order(&self) -> Result<OkxOrderAck, OrderTransportError> {
-            let session_index = route_session("BTC-USDT-SWAP", self.sessions.len());
+            let session_index = ORDER_COMMAND_SESSION_INDEX;
             let request_id = self.next_request_id(session_index);
             let expiry_ms = unix_time_ms().saturating_add(duration_ms(self.request_expiry));
             let payload = serde_json::json!({
@@ -1003,13 +1287,18 @@ mod tests {
                 session_index,
                 request_id,
                 OkxWsOrderOperation::Place,
+                ExpectedOrderIdentity {
+                    account_id: "account-a".to_string(),
+                    symbol: "BTC-USDT-SWAP".to_string(),
+                    client_order_id: "reap1".to_string(),
+                },
                 payload,
             )
             .await
         }
 
         async fn cancel_test_order(&self) -> Result<OkxOrderAck, OrderTransportError> {
-            let session_index = route_session("BTC-USDT-SWAP", self.sessions.len());
+            let session_index = ORDER_COMMAND_SESSION_INDEX;
             let request_id = self.next_request_id(session_index);
             let payload = serde_json::json!({
                 "id": request_id,
@@ -1024,6 +1313,11 @@ mod tests {
                 session_index,
                 request_id,
                 OkxWsOrderOperation::Cancel,
+                ExpectedOrderIdentity {
+                    account_id: "account-a".to_string(),
+                    symbol: "BTC-USDT-SWAP".to_string(),
+                    client_order_id: "reap1".to_string(),
+                },
                 payload,
             )
             .await
@@ -1054,11 +1348,13 @@ mod tests {
             .unwrap();
     }
 
-    async fn ready(status: &mut mpsc::Receiver<OkxOrderWsStatus>) -> OkxOrderWsStatus {
+    async fn ready(
+        status: &mut mpsc::Receiver<OrderCommandWebsocketStatus>,
+    ) -> OrderCommandWebsocketStatus {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let status = status.recv().await.expect("aggregate status");
-                if status.kind == OkxOrderWsStatusKind::Ready {
+                if status.kind == OrderCommandWebsocketStatusKind::Ready {
                     return status;
                 }
             }
@@ -1067,13 +1363,250 @@ mod tests {
         .expect("order websocket should become ready")
     }
 
+    fn pending_request() -> (
+        HashMap<String, PendingRequest>,
+        oneshot::Receiver<Result<OkxOrderAck, OrderTransportError>>,
+    ) {
+        let (response, receiver) = oneshot::channel();
+        let pending = HashMap::from([(
+            "request1".to_string(),
+            PendingRequest {
+                operation: OkxWsOrderOperation::Place,
+                expected_account_id: "account-a".to_string(),
+                expected_symbol: "BTC-USDT-SWAP".to_string(),
+                expected_client_order_id: "client-a".to_string(),
+                acknowledgement_deadline: Instant::now() + Duration::from_secs(1),
+                response,
+            },
+        )]);
+        (pending, receiver)
+    }
+
+    fn accepted_response(row: Value) -> String {
+        serde_json::json!({
+            "id": "request1",
+            "op": OKX_WS_PLACE_ORDER_OP,
+            "code": "0",
+            "msg": "",
+            "data": [row],
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn command_config_rejects_zero_capacity_timeouts_and_invalid_reconnect() {
+        let build = |capacity, request_expiry, acknowledgement_timeout, reconnect| {
+            OrderCommandWebsocketConfig::new(
+                "account-a",
+                "ws://127.0.0.1:1/ws/v5/private",
+                capacity,
+                request_expiry,
+                acknowledgement_timeout,
+                ConnectionAttemptPacer::new(Duration::ZERO),
+                reconnect,
+            )
+        };
+        let reconnect = ReconnectPolicy {
+            initial_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(20),
+            multiplier: 2,
+        };
+
+        for error in [
+            build(
+                0,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                reconnect.clone(),
+            )
+            .err()
+            .expect("zero capacity must be rejected"),
+            build(1, Duration::ZERO, Duration::from_secs(1), reconnect.clone())
+                .err()
+                .expect("zero request expiry must be rejected"),
+            build(1, Duration::from_secs(1), Duration::ZERO, reconnect.clone())
+                .err()
+                .expect("zero acknowledgement timeout must be rejected"),
+            build(
+                1,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                ReconnectPolicy {
+                    initial_delay: Duration::from_millis(20),
+                    max_delay: Duration::from_millis(10),
+                    multiplier: 2,
+                },
+            )
+            .err()
+            .expect("reversed reconnect delays must be rejected"),
+            build(
+                1,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                ReconnectPolicy {
+                    initial_delay: Duration::from_millis(10),
+                    max_delay: Duration::from_millis(20),
+                    multiplier: 0,
+                },
+            )
+            .err()
+            .expect("zero reconnect multiplier must be rejected"),
+        ] {
+            assert!(matches!(error, AdapterError::InvalidConfiguration(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_command_transport_slot_installs_exactly_once_before_spawn() {
+        let slot = Arc::new(OrderCommandTransportSlot::default());
+        let first_slot = Arc::clone(&slot);
+        let (lifecycle, _status) = start_order_command_websocket(
+            Arc::new(TestSessionOperations),
+            config("ws://127.0.0.1:1/ws/v5/private".to_string()),
+            move |transport| first_slot.install(transport.clone()),
+        )
+        .unwrap();
+
+        let second_slot = Arc::clone(&slot);
+        let error = start_order_command_websocket(
+            Arc::new(TestSessionOperations),
+            config("ws://127.0.0.1:1/ws/v5/private".to_string()),
+            move |transport| second_slot.install(transport.clone()),
+        )
+        .err()
+        .expect("the shared command transport slot must reject a second install");
+
+        assert!(error.to_string().contains("already installed"), "{error}");
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mismatching_acknowledgement_identity_is_ambiguous_and_disconnects() {
+        for (field, actual, expected_dimension) in [
+            ("accountId", serde_json::json!("account-b"), "account"),
+            ("accountId", serde_json::json!("0"), "account"),
+            ("acctId", serde_json::json!(7), "account"),
+            ("instId", serde_json::json!("ETH-USDT-SWAP"), "symbol"),
+            ("instId", serde_json::json!("0"), "symbol"),
+            ("symbol", serde_json::json!(7), "symbol"),
+            ("clOrdId", serde_json::json!("client-b"), "client order id"),
+            ("clientOrderId", serde_json::json!(7), "client order id"),
+        ] {
+            let (mut pending, receiver) = pending_request();
+            let mut row = serde_json::json!({
+                "ordId": "42",
+                "clOrdId": "client-a",
+                "sCode": "0",
+                "sMsg": "",
+            });
+            row[field] = actual;
+
+            let error = process_order_response(&accepted_response(row), &mut pending).unwrap_err();
+            assert!(error.contains(expected_dimension), "{error}");
+            assert!(pending.is_empty());
+            assert!(matches!(
+                receiver.await.unwrap(),
+                Err(OrderTransportError::Ambiguous(message))
+                    if message.contains(expected_dimension)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn client_placeholder_acknowledgement_normalizes_to_expected_client_id() {
+        for client_order_id in ["", "0"] {
+            let (mut pending, receiver) = pending_request();
+            let response = accepted_response(serde_json::json!({
+                "ordId": "42",
+                "clOrdId": client_order_id,
+                "sCode": "0",
+                "sMsg": "",
+            }));
+
+            process_order_response(&response, &mut pending).unwrap();
+            let acknowledgement = receiver.await.unwrap().unwrap();
+            assert_eq!(acknowledgement.exchange_order_id, "42");
+            assert_eq!(acknowledgement.client_order_id, "client-a");
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_or_empty_optional_account_and_symbol_aliases_are_tolerated() {
+        for optional_identity in [
+            serde_json::json!({}),
+            serde_json::json!({"accountId": "", "instId": ""}),
+        ] {
+            let (mut pending, receiver) = pending_request();
+            let mut row = serde_json::json!({
+                "ordId": "42",
+                "clOrdId": "client-a",
+                "sCode": "0",
+                "sMsg": "",
+            });
+            row.as_object_mut()
+                .unwrap()
+                .extend(optional_identity.as_object().unwrap().clone());
+
+            process_order_response(&accepted_response(row), &mut pending).unwrap();
+            assert_eq!(
+                receiver.await.unwrap().unwrap(),
+                OkxOrderAck {
+                    exchange_order_id: "42".to_string(),
+                    client_order_id: "client-a".to_string(),
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_string_top_level_identity_alias_is_ambiguous() {
+        let (mut pending, receiver) = pending_request();
+        let mut response: Value = serde_json::from_str(&accepted_response(serde_json::json!({
+            "ordId": "42",
+            "clOrdId": "client-a",
+            "sCode": "0",
+            "sMsg": "",
+        })))
+        .unwrap();
+        response["account_id"] = serde_json::json!(7);
+
+        let error = process_order_response(&response.to_string(), &mut pending).unwrap_err();
+        assert!(error.contains("account"), "{error}");
+        assert!(matches!(
+            receiver.await.unwrap(),
+            Err(OrderTransportError::Ambiguous(message)) if message.contains("must be a string")
+        ));
+    }
+
+    #[tokio::test]
+    async fn zero_or_untrimmed_exchange_order_id_is_ambiguous_and_disconnects() {
+        for exchange_order_id in ["0", " 42", "42 "] {
+            let (mut pending, receiver) = pending_request();
+            let response = accepted_response(serde_json::json!({
+                "ordId": exchange_order_id,
+                "clOrdId": "client-a",
+                "sCode": "0",
+                "sMsg": "",
+            }));
+
+            let error = process_order_response(&response, &mut pending).unwrap_err();
+            assert!(error.contains("invalid exchange order id"), "{error}");
+            assert!(pending.is_empty());
+            assert!(matches!(
+                receiver.await.unwrap(),
+                Err(OrderTransportError::Ambiguous(message))
+                    if message.contains("invalid exchange order id")
+            ));
+        }
+    }
+
     #[test]
     fn session_heartbeat_is_best_effort_under_status_backpressure() {
         let (status, mut receiver) = mpsc::channel(1);
         status
             .try_send(SessionStatus {
                 index: 0,
-                kind: OkxOrderWsStatusKind::Ready,
+                kind: OrderCommandWebsocketStatusKind::Ready,
                 reason: "authenticated".to_string(),
             })
             .unwrap();
@@ -1081,7 +1614,7 @@ mod tests {
         try_send_heartbeat(0, &status).unwrap();
         assert_eq!(
             receiver.try_recv().unwrap().kind,
-            OkxOrderWsStatusKind::Ready
+            OrderCommandWebsocketStatusKind::Ready
         );
         drop(receiver);
         assert_eq!(
@@ -1107,7 +1640,7 @@ mod tests {
         session_tx
             .send(SessionStatus {
                 index: 0,
-                kind: OkxOrderWsStatusKind::Ready,
+                kind: OrderCommandWebsocketStatusKind::Ready,
                 reason: "authenticated".to_string(),
             })
             .await
@@ -1124,7 +1657,7 @@ mod tests {
         session_tx
             .send(SessionStatus {
                 index: 0,
-                kind: OkxOrderWsStatusKind::Heartbeat,
+                kind: OrderCommandWebsocketStatusKind::Heartbeat,
                 reason: "pong received".to_string(),
             })
             .await
@@ -1142,7 +1675,7 @@ mod tests {
         session_tx
             .send(SessionStatus {
                 index: 0,
-                kind: OkxOrderWsStatusKind::Disconnected,
+                kind: OrderCommandWebsocketStatusKind::Disconnected,
                 reason: "transport lost".to_string(),
             })
             .await
@@ -1150,13 +1683,16 @@ mod tests {
 
         assert_eq!(
             output_rx.recv().await.unwrap().kind,
-            OkxOrderWsStatusKind::Ready
+            OrderCommandWebsocketStatusKind::Ready
         );
         let disconnected = tokio::time::timeout(Duration::from_secs(1), output_rx.recv())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(disconnected.kind, OkxOrderWsStatusKind::Disconnected);
+        assert_eq!(
+            disconnected.kind,
+            OrderCommandWebsocketStatusKind::Disconnected
+        );
         shutdown_tx.send(true).unwrap();
         task.await.unwrap();
     }
@@ -1177,14 +1713,14 @@ mod tests {
         session_tx
             .send(SessionStatus {
                 index: 1,
-                kind: OkxOrderWsStatusKind::Fatal,
+                kind: OrderCommandWebsocketStatusKind::Fatal,
                 reason: "connection pacer failed".to_string(),
             })
             .await
             .unwrap();
 
         let status = output_rx.recv().await.unwrap();
-        assert_eq!(status.kind, OkxOrderWsStatusKind::Fatal);
+        assert_eq!(status.kind, OrderCommandWebsocketStatusKind::Fatal);
         assert_eq!(status.ready_sessions, 0);
         assert!(status.reason.contains("connection pacer failed"));
         task.await.unwrap();
@@ -1238,7 +1774,7 @@ mod tests {
                 .unwrap();
         });
 
-        let (transport, runtime, mut status) = spawn_okx_order_ws(config(url, 1));
+        let (transport, runtime, mut status) = start_test_order_command_websocket(config(url));
         let ready = ready(&mut status).await;
         assert_eq!(ready.ready_sessions, 1);
         let acknowledgement = transport.place_test_order().await.unwrap();
@@ -1262,7 +1798,7 @@ mod tests {
             socket.close(None).await.unwrap();
         });
 
-        let (transport, runtime, mut status) = spawn_okx_order_ws(config(url, 1));
+        let (transport, runtime, mut status) = start_test_order_command_websocket(config(url));
         ready(&mut status).await;
         let error = transport.place_test_order().await.unwrap_err();
         assert!(error.is_ambiguous(), "{error}");
@@ -1275,7 +1811,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         drop(listener);
-        let (transport, runtime, _status) = spawn_okx_order_ws(config(url, 1));
+        let (transport, runtime, _status) = start_test_order_command_websocket(config(url));
 
         let error = transport.place_test_order().await.unwrap_err();
         assert!(error.is_unavailable(), "{error}");
@@ -1294,7 +1830,7 @@ mod tests {
             std::future::pending::<()>().await;
         });
 
-        let (_transport, runtime, _status) = spawn_okx_order_ws(config(url, 1));
+        let (_transport, runtime, _status) = start_test_order_command_websocket(config(url));
         tokio::time::timeout(Duration::from_secs(1), accepted_rx)
             .await
             .expect("client should connect")
@@ -1308,37 +1844,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aggregate_readiness_requires_every_configured_session() {
+    async fn configured_authority_uses_exactly_one_session() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
-            let mut handlers = Vec::new();
-            for _ in 0..2 {
-                let (stream, _) = listener.accept().await.unwrap();
-                handlers.push(tokio::spawn(async move {
-                    let mut socket = accept_async(stream).await.unwrap();
-                    authenticate(&mut socket).await;
-                    while socket.next().await.is_some() {}
-                }));
-            }
-            for handler in handlers {
-                handler.await.unwrap();
-            }
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            authenticate(&mut socket).await;
+            while socket.next().await.is_some() {}
         });
 
-        let (_transport, runtime, mut status) = spawn_okx_order_ws(config(url, 2));
+        let (_transport, runtime, mut status) = start_test_order_command_websocket(config(url));
         let ready = ready(&mut status).await;
-        assert_eq!(ready.ready_sessions, 2);
-        assert_eq!(ready.total_sessions, 2);
+        assert_eq!(ready.ready_sessions, 1);
+        assert_eq!(ready.total_sessions, 1);
         runtime.shutdown().await.unwrap();
         server.await.unwrap();
-    }
-
-    #[test]
-    fn stable_underlying_dispatches_spot_swap_and_future_to_one_session() {
-        let spot = route_session("BTC-USDT", 8);
-        assert_eq!(route_session("BTC-USDT-SWAP", 8), spot);
-        assert_eq!(route_session("BTC-USDT-260925", 8), spot);
-        assert_ne!(route_session("ETH-USDT-SWAP", 8), spot);
     }
 }

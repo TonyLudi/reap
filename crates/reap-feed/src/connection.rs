@@ -174,6 +174,7 @@ pub(crate) fn prepare_connection_subscription(
     Ok(PreparedSubscription { payload, readiness })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_connection_once_with_readiness(
     websocket_url: &str,
     plan: &SocketPlan,
