@@ -81,7 +81,9 @@ fn authenticated_okx_authority_obeys_the_workspace_dependency_policy() {
     }
 
     for required in [
+        "reap-backtest",
         "reap-live",
+        "reap-live-contracts",
         "reap-strategy",
         "reap-feed",
         "reap-order",
@@ -101,6 +103,45 @@ fn authenticated_okx_authority_obeys_the_workspace_dependency_policy() {
     }
 
     let resolved = resolved_production_edges(&metadata, &packages);
+    assert_direct(&packages, "reap-backtest", "reap-live-contracts");
+    assert_not_reachable(&packages, &resolved, "reap-backtest", "reap-live");
+
+    assert_eq!(
+        packages["reap-live-contracts"].production_dependencies,
+        BTreeSet::from([
+            "reap-core".to_string(),
+            "reap-risk".to_string(),
+            "reap-strategy".to_string(),
+            "reap-venue".to_string(),
+            "serde".to_string(),
+            "serde_ignored".to_string(),
+            "serde_json".to_string(),
+            "sha2".to_string(),
+            "thiserror".to_string(),
+            "toml".to_string(),
+            "url".to_string(),
+        ])
+    );
+    assert!(
+        packages["reap-live-contracts"].binary_targets.is_empty(),
+        "reap-live-contracts must not provide a runtime executable"
+    );
+    for forbidden in [
+        "reap-live",
+        "reap-feed",
+        "reap-order",
+        "reap-storage",
+        "reap-telemetry",
+        "reap-evidence-core",
+        "reap-emergency-core",
+        "reap-emergency-runner",
+        "reap-okx-wire",
+        "reap-okx-live-adapter",
+        "reap-okx-evidence-adapter",
+        "reap-okx-emergency-adapter",
+    ] {
+        assert_not_reachable(&packages, &resolved, "reap-live-contracts", forbidden);
+    }
     assert_direct(&packages, "reap-live", "reap-okx-live-adapter");
     assert_not_direct(&packages, "reap-live", "reap-okx-wire");
     for forbidden in [

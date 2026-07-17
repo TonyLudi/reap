@@ -10,9 +10,10 @@ use reap_capture::{
 };
 use reap_core::PositionMarginMode;
 use reap_feed::{ReplayCheckReport, replay_check_path};
-use reap_live::{
-    AccountCertificationArtifact, LiveConfig, OkxTradeModeConfig, TradingEnvironment,
-    verify_account_certification_artifact_path,
+use reap_live_contracts::{
+    ACCOUNT_CERTIFICATION_SCHEMA_VERSION, AccountCertificationArtifact, LiveConfig,
+    MAX_ACCOUNT_CERTIFICATION_ARTIFACT_BYTES, OkxTradeModeConfig, TradingEnvironment,
+    verify_account_certification_artifact_bytes,
 };
 use reap_venue::okx::{
     OkxAccountBalanceSnapshot, OkxAccountPositionsSnapshot,
@@ -1891,7 +1892,7 @@ fn load_dataset_opening_account(
         )
     })?;
     let sha256 = sha256_path(&canonical)?;
-    let artifact = verify_account_certification_artifact_path(&canonical).with_context(|| {
+    let artifact = verify_opening_account_certification_path(&canonical).with_context(|| {
         format!(
             "failed to reconstruct opening account certification for dataset {}",
             dataset.id
@@ -1952,7 +1953,7 @@ fn load_dataset_opening_account(
     if mode == ResearchMode::ProductionCandidate {
         let expected_host = expected_host_identity_sha256
             .context("production opening account requires a latency-calibrated target host")?;
-        if artifact.schema_version != reap_live::ACCOUNT_CERTIFICATION_SCHEMA_VERSION
+        if artifact.schema_version != ACCOUNT_CERTIFICATION_SCHEMA_VERSION
             || artifact.java_reference_revision != PINNED_JAVA_REVISION
             || artifact.reap_version != env!("CARGO_PKG_VERSION")
             || artifact.executable_sha256 != expected_executable_sha256
@@ -3198,6 +3199,42 @@ fn sha256_path(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn verify_opening_account_certification_path(path: &Path) -> Result<AccountCertificationArtifact> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        anyhow::anyhow!(
+            "invalid account-certification artifact path {}: {error}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "invalid account-certification artifact path {}: must be a regular file and not a symbolic link",
+            path.display()
+        );
+    }
+    if metadata.len() > MAX_ACCOUNT_CERTIFICATION_ARTIFACT_BYTES {
+        bail!(
+            "account-certification artifact is {} bytes; limit is {}",
+            metadata.len(),
+            MAX_ACCOUNT_CERTIFICATION_ARTIFACT_BYTES
+        );
+    }
+    let bytes = std::fs::read(path).map_err(|source| {
+        anyhow::anyhow!(
+            "failed to read account-certification artifact {}: {source}",
+            path.display()
+        )
+    })?;
+    if bytes.len() as u64 > MAX_ACCOUNT_CERTIFICATION_ARTIFACT_BYTES {
+        bail!(
+            "account-certification artifact is {} bytes; limit is {}",
+            bytes.len(),
+            MAX_ACCOUNT_CERTIFICATION_ARTIFACT_BYTES
+        );
+    }
+    verify_account_certification_artifact_bytes(&bytes, path).map_err(Into::into)
+}
+
 fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -3223,6 +3260,37 @@ mod tests {
 
     const RAW_CAPTURE_FIXTURE: &[u8] =
         include_bytes!("../../../fixtures/raw/okx/depth-reset.jsonl");
+
+    #[test]
+    fn opening_account_loader_preserves_bounded_file_errors() {
+        let directory = TempDir::new().unwrap();
+        let missing = directory.path().join("missing.json");
+        assert!(
+            verify_opening_account_certification_path(&missing)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid account-certification artifact path")
+        );
+
+        let malformed = directory.path().join("malformed.json");
+        std::fs::write(&malformed, b"{").unwrap();
+        let error = verify_opening_account_certification_path(&malformed)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("failed to parse account-certification artifact"));
+        assert!(error.contains(&malformed.display().to_string()));
+
+        let oversized = directory.path().join("oversized.json");
+        std::fs::File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_ACCOUNT_CERTIFICATION_ARTIFACT_BYTES + 1)
+            .unwrap();
+        let error = verify_opening_account_certification_path(&oversized)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("account-certification artifact is 50331649 bytes"));
+        assert!(error.contains("limit is 50331648"));
+    }
 
     struct ResearchCaptureFixture {
         _directory: TempDir,

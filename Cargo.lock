@@ -1014,7 +1014,7 @@ dependencies = [
  "reap-capture",
  "reap-core",
  "reap-feed",
- "reap-live",
+ "reap-live-contracts",
  "reap-order",
  "reap-strategy",
  "reap-venue",
