@@ -10,6 +10,9 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 use reap_core::{ConnId, RawEnvelope, Symbol, Venue};
 use reap_venue::VenueAdapter;
+pub use reap_venue::okx::{
+    DEFAULT_OKX_CONNECTION_ATTEMPT_PACER_PATH, OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS,
+};
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -18,10 +21,6 @@ use crate::{
     ConnectionError, ConnectionStatus, ConnectionStatusKind, RecoveryRequest, SocketPlan,
     run_connection_once_with_readiness,
 };
-
-/// OKX documents at most three WebSocket connection requests per second per IP.
-pub const OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS: u64 = 334;
-pub const DEFAULT_OKX_CONNECTION_ATTEMPT_PACER_PATH: &str = "var/reap/okx-connection-attempt.pacer";
 
 type RecoveryStreamKey = (Venue, Symbol);
 type RecoveryRoute = (ConnId, watch::Sender<u64>);

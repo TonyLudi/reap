@@ -2,6 +2,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+pub use reap_core::PacingPolicy;
+
 type ReservationQueues = HashMap<(RequestKind, String), VecDeque<Instant>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -9,25 +11,6 @@ pub enum RequestKind {
     Submit,
     Cancel,
     Reconcile,
-}
-
-#[derive(Debug, Clone)]
-pub struct PacingPolicy {
-    pub submit_requests: usize,
-    pub cancel_requests: usize,
-    pub reconcile_requests: usize,
-    pub window: Duration,
-}
-
-impl Default for PacingPolicy {
-    fn default() -> Self {
-        Self {
-            submit_requests: 50,
-            cancel_requests: 50,
-            reconcile_requests: 50,
-            window: Duration::from_secs(2),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

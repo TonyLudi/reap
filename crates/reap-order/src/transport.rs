@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+pub use reap_venue::okx::okx_order_dispatch_key;
 use reap_venue::okx::{OkxCancelOrder, OkxOrderAck, OkxPlaceOrder};
 use thiserror::Error;
 
@@ -34,17 +35,6 @@ pub trait OkxOrderTransport: Send + Sync {
         &self,
         order: &OkxCancelOrder,
     ) -> Result<OkxOrderAck, OrderTransportError>;
-}
-
-pub fn okx_order_dispatch_key(symbol: &str) -> String {
-    let mut components = symbol.split('-');
-    let Some(base) = components.next().filter(|component| !component.is_empty()) else {
-        return symbol.to_string();
-    };
-    let Some(quote) = components.next().filter(|component| !component.is_empty()) else {
-        return symbol.to_string();
-    };
-    format!("{base}-{quote}")
 }
 
 #[cfg(test)]

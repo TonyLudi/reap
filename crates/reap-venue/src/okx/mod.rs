@@ -1,4 +1,5 @@
 mod capabilities;
+mod connectivity;
 mod public;
 mod rest;
 mod ws_order;
@@ -6,6 +7,10 @@ mod ws_order;
 pub use capabilities::{
     OKX_CAPABILITY_REGISTRY, OkxCapabilityAccess, OkxCapabilityClass, OkxCapabilityRegistration,
     okx_capability_registration, okx_public_channel_registration,
+};
+pub use connectivity::{
+    DEFAULT_OKX_CONNECTION_ATTEMPT_PACER_PATH, OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS,
+    okx_order_dispatch_key,
 };
 pub use public::OkxAdapter;
 pub use rest::{
