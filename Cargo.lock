@@ -1328,6 +1328,7 @@ name = "reap-telemetry"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "reap-core",
  "reqwest",
  "serde",
  "sha2",
