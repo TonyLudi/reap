@@ -1,7 +1,9 @@
 use async_trait::async_trait;
+use reap_venue::okx::OkxOrderAck;
 pub use reap_venue::okx::okx_order_dispatch_key;
-use reap_venue::okx::{OkxCancelOrder, OkxOrderAck, OkxPlaceOrder};
 use thiserror::Error;
+
+use crate::{PreparedRegularCancel, PreparedRegularSubmit};
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum OrderTransportError {
@@ -25,16 +27,58 @@ impl OrderTransportError {
     }
 }
 
+#[derive(Debug)]
+pub struct CancelOrderTransportError {
+    error: OrderTransportError,
+    prepared: Option<PreparedRegularCancel>,
+}
+
+impl CancelOrderTransportError {
+    /// Reports a failure proven to have happened before any transport write.
+    ///
+    /// The capability remains opaque to callers and can only be recovered by
+    /// the order gateway for its immediate REST fallback.
+    pub fn pre_send_unavailable(
+        message: impl Into<String>,
+        prepared: PreparedRegularCancel,
+    ) -> Self {
+        Self {
+            error: OrderTransportError::Unavailable(message.into()),
+            prepared: Some(prepared),
+        }
+    }
+
+    pub fn failed(error: OrderTransportError) -> Self {
+        let error = match error {
+            OrderTransportError::Unavailable(message) => OrderTransportError::Ambiguous(format!(
+                "transport reported unavailable without a recoverable pre-send capability: {message}"
+            )),
+            error => error,
+        };
+        Self {
+            error,
+            prepared: None,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (OrderTransportError, Option<PreparedRegularCancel>) {
+        (self.error, self.prepared)
+    }
+}
+
 /// Low-latency command transport only. REST snapshots and reconciliation stay
 /// on the gateway's independent authenticated client.
 #[async_trait]
 pub trait OkxOrderTransport: Send + Sync {
-    async fn place_order(&self, order: &OkxPlaceOrder) -> Result<OkxOrderAck, OrderTransportError>;
+    async fn place_order(
+        &self,
+        order: PreparedRegularSubmit,
+    ) -> Result<OkxOrderAck, OrderTransportError>;
 
     async fn cancel_order(
         &self,
-        order: &OkxCancelOrder,
-    ) -> Result<OkxOrderAck, OrderTransportError>;
+        order: PreparedRegularCancel,
+    ) -> Result<OkxOrderAck, CancelOrderTransportError>;
 }
 
 #[cfg(test)]

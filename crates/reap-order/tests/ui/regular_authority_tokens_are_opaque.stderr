@@ -1,0 +1,163 @@
+error[E0277]: the trait bound `ApprovedRegularSubmit: Clone` is not satisfied
+  --> tests/ui/regular_authority_tokens_are_opaque.rs:12:21
+   |
+12 |     require_clone::<ApprovedRegularSubmit>();
+   |                     ^^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `ApprovedRegularSubmit`
+   |
+note: required by a bound in `require_clone`
+  --> tests/ui/regular_authority_tokens_are_opaque.rs:9:21
+   |
+ 9 | fn require_clone<T: Clone>() {}
+   |                     ^^^^^ required by this bound in `require_clone`
+
+error[E0277]: the trait bound `ApprovedRegularCancel: Clone` is not satisfied
+  --> tests/ui/regular_authority_tokens_are_opaque.rs:13:21
+   |
+13 |     require_clone::<ApprovedRegularCancel>();
+   |                     ^^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `ApprovedRegularCancel`
+   |
+note: required by a bound in `require_clone`
+  --> tests/ui/regular_authority_tokens_are_opaque.rs:9:21
+   |
+ 9 | fn require_clone<T: Clone>() {}
+   |                     ^^^^^ required by this bound in `require_clone`
+
+error[E0277]: the trait bound `PreparedRegularSubmit: Clone` is not satisfied
+  --> tests/ui/regular_authority_tokens_are_opaque.rs:14:21
+   |
+14 |     require_clone::<PreparedRegularSubmit>();
+   |                     ^^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `PreparedRegularSubmit`
+   |
+note: required by a bound in `require_clone`
+  --> tests/ui/regular_authority_tokens_are_opaque.rs:9:21
+   |
+ 9 | fn require_clone<T: Clone>() {}
+   |                     ^^^^^ required by this bound in `require_clone`
+
+error[E0277]: the trait bound `PreparedRegularCancel: Clone` is not satisfied
+  --> tests/ui/regular_authority_tokens_are_opaque.rs:15:21
+   |
+15 |     require_clone::<PreparedRegularCancel>();
+   |                     ^^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `PreparedRegularCancel`
+   |
+note: required by a bound in `require_clone`
+  --> tests/ui/regular_authority_tokens_are_opaque.rs:9:21
+   |
+ 9 | fn require_clone<T: Clone>() {}
+   |                     ^^^^^ required by this bound in `require_clone`
+
+error[E0277]: the trait bound `ReservedRegularSubmit: Clone` is not satisfied
+  --> tests/ui/regular_authority_tokens_are_opaque.rs:16:21
+   |
+16 |     require_clone::<ReservedRegularSubmit>();
+   |                     ^^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `ReservedRegularSubmit`
+   |
+note: required by a bound in `require_clone`
+  --> tests/ui/regular_authority_tokens_are_opaque.rs:9:21
+   |
+ 9 | fn require_clone<T: Clone>() {}
+   |                     ^^^^^ required by this bound in `require_clone`
+
+error[E0277]: the trait bound `RegularApprovalScope: Clone` is not satisfied
+  --> tests/ui/regular_authority_tokens_are_opaque.rs:17:21
+   |
+17 |     require_clone::<RegularApprovalScope>();
+   |                     ^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `RegularApprovalScope`
+   |
+note: required by a bound in `require_clone`
+  --> tests/ui/regular_authority_tokens_are_opaque.rs:9:21
+   |
+ 9 | fn require_clone<T: Clone>() {}
+   |                     ^^^^^ required by this bound in `require_clone`
+
+error[E0277]: the trait bound `RegularExecutionProfileSet: Clone` is not satisfied
+  --> tests/ui/regular_authority_tokens_are_opaque.rs:18:21
+   |
+18 |     require_clone::<RegularExecutionProfileSet>();
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `RegularExecutionProfileSet`
+   |
+note: required by a bound in `require_clone`
+  --> tests/ui/regular_authority_tokens_are_opaque.rs:9:21
+   |
+ 9 | fn require_clone<T: Clone>() {}
+   |                     ^^^^^ required by this bound in `require_clone`
+
+error[E0277]: the trait bound `RegularSubmitCompletion: Clone` is not satisfied
+  --> tests/ui/regular_authority_tokens_are_opaque.rs:19:21
+   |
+19 |     require_clone::<RegularSubmitCompletion>();
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `RegularSubmitCompletion`
+   |
+note: required by a bound in `require_clone`
+  --> tests/ui/regular_authority_tokens_are_opaque.rs:9:21
+   |
+ 9 | fn require_clone<T: Clone>() {}
+   |                     ^^^^^ required by this bound in `require_clone`
+
+error[E0277]: the trait bound `CancelOrderTransportError: Clone` is not satisfied
+  --> tests/ui/regular_authority_tokens_are_opaque.rs:20:21
+   |
+20 |     require_clone::<CancelOrderTransportError>();
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `CancelOrderTransportError`
+   |
+note: required by a bound in `require_clone`
+  --> tests/ui/regular_authority_tokens_are_opaque.rs:9:21
+   |
+ 9 | fn require_clone<T: Clone>() {}
+   |                     ^^^^^ required by this bound in `require_clone`
+
+error[E0277]: the trait bound `RegularCommandDispatcher: Clone` is not satisfied
+  --> tests/ui/regular_authority_tokens_are_opaque.rs:21:21
+   |
+21 |     require_clone::<RegularCommandDispatcher>();
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `RegularCommandDispatcher`
+   |
+note: required by a bound in `require_clone`
+  --> tests/ui/regular_authority_tokens_are_opaque.rs:9:21
+   |
+ 9 | fn require_clone<T: Clone>() {}
+   |                     ^^^^^ required by this bound in `require_clone`
+
+error[E0599]: no method named `into_parts` found for struct `ApprovedRegularSubmit` in the current scope
+  --> tests/ui/regular_authority_tokens_are_opaque.rs:25:20
+   |
+25 |     let _ = submit.into_parts();
+   |                    ^^^^^^^^^^ method not found in `ApprovedRegularSubmit`
+
+error[E0624]: method `into_parts` is private
+  --> tests/ui/regular_authority_tokens_are_opaque.rs:26:20
+   |
+26 |     let _ = cancel.into_parts();
+   |                    ^^^^^^^^^^ private method
+   |
+  ::: src/authority.rs
+   |
+   |     pub(crate) fn into_parts(self) -> (String, String, String, String, RegularApprovalBinding) {
+   |     ------------------------------------------------------------------------------------------ private method defined here
+
+error[E0624]: method `into_parts` is private
+  --> tests/ui/regular_authority_tokens_are_opaque.rs:30:22
+   |
+30 |     let _ = reserved.into_parts();
+   |                      ^^^^^^^^^^ private method
+   |
+  ::: src/authority.rs
+   |
+   |     pub(crate) fn into_parts(self) -> (String, String, NewOrder, RegularApprovalBinding) {
+   |     ------------------------------------------------------------------------------------ private method defined here
+
+error[E0277]: the trait bound `PreparedRegularSubmit: From<reap_core::NewOrder>` is not satisfied
+  --> tests/ui/regular_authority_tokens_are_opaque.rs:34:42
+   |
+34 |     let _: PreparedRegularSubmit = order.into();
+   |                                          ^^^^ the trait `From<reap_core::NewOrder>` is not implemented for `PreparedRegularSubmit`
+   |
+   = note: required for `reap_core::NewOrder` to implement `Into<PreparedRegularSubmit>`
+
+error[E0277]: the trait bound `PreparedRegularCancel: From<(String, String, String, String)>` is not satisfied
+  --> tests/ui/regular_authority_tokens_are_opaque.rs:35:43
+   |
+35 |     let _: PreparedRegularCancel = cancel.into();
+   |                                           ^^^^ the trait `From<(String, String, String, String)>` is not implemented for `PreparedRegularCancel`
+   |
+   = note: required for `(String, String, String, String)` to implement `Into<PreparedRegularCancel>`

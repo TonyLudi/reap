@@ -7,10 +7,13 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use reap_feed::{ConnectionAttemptPacer, ReconnectPolicy};
 use reap_okx_live_adapter::RegularOrderSessionFactory;
-use reap_order::{OkxOrderTransport, OrderTransportError, okx_order_dispatch_key};
+use reap_order::{
+    CancelOrderTransportError, OkxOrderTransport, OrderTransportError, PreparedRegularCancel,
+    PreparedRegularSubmit, okx_order_dispatch_key,
+};
 use reap_venue::okx::{
-    OkxCancelOrder, OkxOrderAck, OkxPlaceOrder, OkxWsOrderOperation, OkxWsOrderResult,
-    okx_capability_registration, parse_okx_ws_order_response,
+    OkxOrderAck, OkxWsOrderOperation, OkxWsOrderResult, okx_capability_registration,
+    parse_okx_ws_order_response,
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -117,9 +120,13 @@ pub(crate) trait OrderSessionOperations: Send + Sync {
         &self,
         request_id: &str,
         expiry_ms: u64,
-        order: &OkxPlaceOrder,
+        order: PreparedRegularSubmit,
     ) -> Result<String, String>;
-    fn cancel_request(&self, request_id: &str, order: &OkxCancelOrder) -> Result<String, String>;
+    fn cancel_request(
+        &self,
+        request_id: &str,
+        order: &PreparedRegularCancel,
+    ) -> Result<String, String>;
 }
 
 impl OrderSessionOperations for RegularOrderSessionFactory {
@@ -131,13 +138,17 @@ impl OrderSessionOperations for RegularOrderSessionFactory {
         &self,
         request_id: &str,
         expiry_ms: u64,
-        order: &OkxPlaceOrder,
+        order: PreparedRegularSubmit,
     ) -> Result<String, String> {
         RegularOrderSessionFactory::place_request(self, request_id, expiry_ms, order)
             .map_err(|error| error.to_string())
     }
 
-    fn cancel_request(&self, request_id: &str, order: &OkxCancelOrder) -> Result<String, String> {
+    fn cancel_request(
+        &self,
+        request_id: &str,
+        order: &PreparedRegularCancel,
+    ) -> Result<String, String> {
         RegularOrderSessionFactory::cancel_request(self, request_id, order)
             .map_err(|error| error.to_string())
     }
@@ -212,8 +223,11 @@ pub(crate) fn spawn_okx_order_ws(
 
 #[async_trait]
 impl OkxOrderTransport for OkxOrderWsTransport {
-    async fn place_order(&self, order: &OkxPlaceOrder) -> Result<OkxOrderAck, OrderTransportError> {
-        let session_index = route_session(&order.symbol, self.sessions.len());
+    async fn place_order(
+        &self,
+        order: PreparedRegularSubmit,
+    ) -> Result<OkxOrderAck, OrderTransportError> {
+        let session_index = route_session(&order.order().symbol, self.sessions.len());
         let request_id = self.next_request_id(session_index);
         let expiry_ms = unix_time_ms().saturating_add(duration_ms(self.request_expiry));
         let payload = self
@@ -231,21 +245,39 @@ impl OkxOrderTransport for OkxOrderWsTransport {
 
     async fn cancel_order(
         &self,
-        order: &OkxCancelOrder,
-    ) -> Result<OkxOrderAck, OrderTransportError> {
-        let session_index = route_session(&order.symbol, self.sessions.len());
+        order: PreparedRegularCancel,
+    ) -> Result<OkxOrderAck, CancelOrderTransportError> {
+        let session_index = route_session(order.symbol(), self.sessions.len());
+        if !*self.sessions[session_index].ready.borrow() {
+            return Err(CancelOrderTransportError::pre_send_unavailable(
+                format!("session {session_index} is not authenticated"),
+                order,
+            ));
+        }
         let request_id = self.next_request_id(session_index);
         let payload = self
             .session_factory
-            .cancel_request(&request_id, order)
-            .map_err(|error| OrderTransportError::InvalidRequest(error.to_string()))?;
-        self.execute(
-            session_index,
-            request_id,
-            OkxWsOrderOperation::Cancel,
-            payload,
-        )
-        .await
+            .cancel_request(&request_id, &order)
+            .map_err(|error| {
+                CancelOrderTransportError::failed(OrderTransportError::InvalidRequest(
+                    error.to_string(),
+                ))
+            })?;
+        match self
+            .execute(
+                session_index,
+                request_id,
+                OkxWsOrderOperation::Cancel,
+                payload,
+            )
+            .await
+        {
+            Ok(ack) => Ok(ack),
+            Err(OrderTransportError::Unavailable(message)) => Err(
+                CancelOrderTransportError::pre_send_unavailable(message, order),
+            ),
+            Err(error) => Err(CancelOrderTransportError::failed(error)),
+        }
     }
 }
 
@@ -875,8 +907,7 @@ fn duration_ms(duration: Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use reap_core::{Side, TimeInForce};
-    use reap_venue::okx::{OKX_WS_CANCEL_ORDER_OP, OKX_WS_PLACE_ORDER_OP, OkxTradeMode};
+    use reap_venue::okx::{OKX_WS_CANCEL_ORDER_OP, OKX_WS_PLACE_ORDER_OP};
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
 
@@ -893,20 +924,21 @@ mod tests {
             &self,
             request_id: &str,
             expiry_ms: u64,
-            order: &OkxPlaceOrder,
+            order: PreparedRegularSubmit,
         ) -> Result<String, String> {
+            let regular_order = order.order();
             Ok(serde_json::json!({
                 "id": request_id,
                 "op": OKX_WS_PLACE_ORDER_OP,
                 "expTime": expiry_ms.to_string(),
                 "args": [{
-                    "instId": order.symbol,
+                    "instId": regular_order.symbol,
                     "tdMode": "cross",
                     "side": "buy",
                     "ordType": "post_only",
-                    "px": order.price.to_string(),
-                    "sz": order.qty.to_string(),
-                    "clOrdId": order.client_order_id,
+                    "px": regular_order.price.to_string(),
+                    "sz": regular_order.qty.to_string(),
+                    "clOrdId": order.client_order_id(),
                 }],
             })
             .to_string())
@@ -915,15 +947,14 @@ mod tests {
         fn cancel_request(
             &self,
             request_id: &str,
-            order: &OkxCancelOrder,
+            order: &PreparedRegularCancel,
         ) -> Result<String, String> {
             Ok(serde_json::json!({
                 "id": request_id,
                 "op": OKX_WS_CANCEL_ORDER_OP,
                 "args": [{
-                    "instId": order.symbol,
-                    "ordId": order.exchange_order_id,
-                    "clOrdId": order.client_order_id,
+                    "instId": order.symbol(),
+                    "clOrdId": order.client_order_id(),
                 }],
             })
             .to_string())
@@ -948,17 +979,54 @@ mod tests {
         }
     }
 
-    fn place_order() -> OkxPlaceOrder {
-        OkxPlaceOrder {
-            symbol: "BTC-USDT-SWAP".to_string(),
-            trade_mode: OkxTradeMode::Cross,
-            side: Side::Buy,
-            time_in_force: TimeInForce::PostOnly,
-            price: 50_000.0,
-            qty: 0.01,
-            client_order_id: "reap1".to_string(),
-            reduce_only: false,
-            self_trade_prevention: None,
+    impl OkxOrderWsTransport {
+        async fn place_test_order(&self) -> Result<OkxOrderAck, OrderTransportError> {
+            let session_index = route_session("BTC-USDT-SWAP", self.sessions.len());
+            let request_id = self.next_request_id(session_index);
+            let expiry_ms = unix_time_ms().saturating_add(duration_ms(self.request_expiry));
+            let payload = serde_json::json!({
+                "id": request_id,
+                "op": OKX_WS_PLACE_ORDER_OP,
+                "expTime": expiry_ms.to_string(),
+                "args": [{
+                    "instId": "BTC-USDT-SWAP",
+                    "tdMode": "cross",
+                    "side": "buy",
+                    "ordType": "post_only",
+                    "px": "50000",
+                    "sz": "0.01",
+                    "clOrdId": "reap1",
+                }],
+            })
+            .to_string();
+            self.execute(
+                session_index,
+                request_id,
+                OkxWsOrderOperation::Place,
+                payload,
+            )
+            .await
+        }
+
+        async fn cancel_test_order(&self) -> Result<OkxOrderAck, OrderTransportError> {
+            let session_index = route_session("BTC-USDT-SWAP", self.sessions.len());
+            let request_id = self.next_request_id(session_index);
+            let payload = serde_json::json!({
+                "id": request_id,
+                "op": OKX_WS_CANCEL_ORDER_OP,
+                "args": [{
+                    "instId": "BTC-USDT-SWAP",
+                    "clOrdId": "reap1",
+                }],
+            })
+            .to_string();
+            self.execute(
+                session_index,
+                request_id,
+                OkxWsOrderOperation::Cancel,
+                payload,
+            )
+            .await
         }
     }
 
@@ -1173,16 +1241,9 @@ mod tests {
         let (transport, runtime, mut status) = spawn_okx_order_ws(config(url, 1));
         let ready = ready(&mut status).await;
         assert_eq!(ready.ready_sessions, 1);
-        let acknowledgement = transport.place_order(&place_order()).await.unwrap();
+        let acknowledgement = transport.place_test_order().await.unwrap();
         assert_eq!(acknowledgement.exchange_order_id, "42");
-        let cancellation = transport
-            .cancel_order(&OkxCancelOrder {
-                symbol: "BTC-USDT-SWAP".to_string(),
-                exchange_order_id: None,
-                client_order_id: Some("reap1".to_string()),
-            })
-            .await
-            .unwrap();
+        let cancellation = transport.cancel_test_order().await.unwrap();
         assert_eq!(cancellation.client_order_id, "reap1");
         runtime.shutdown().await.unwrap();
         server.await.unwrap();
@@ -1203,7 +1264,7 @@ mod tests {
 
         let (transport, runtime, mut status) = spawn_okx_order_ws(config(url, 1));
         ready(&mut status).await;
-        let error = transport.place_order(&place_order()).await.unwrap_err();
+        let error = transport.place_test_order().await.unwrap_err();
         assert!(error.is_ambiguous(), "{error}");
         runtime.shutdown().await.unwrap();
         server.await.unwrap();
@@ -1216,7 +1277,7 @@ mod tests {
         drop(listener);
         let (transport, runtime, _status) = spawn_okx_order_ws(config(url, 1));
 
-        let error = transport.place_order(&place_order()).await.unwrap_err();
+        let error = transport.place_test_order().await.unwrap_err();
         assert!(error.is_unavailable(), "{error}");
         runtime.shutdown().await.unwrap();
     }

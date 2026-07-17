@@ -1,0 +1,5 @@
+error[E0432]: unresolved import `reap_feed::run_connection_once`
+ --> tests/ui/run_connection_once_is_private.rs:1:5
+  |
+1 | use reap_feed::run_connection_once;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `run_connection_once` in the root

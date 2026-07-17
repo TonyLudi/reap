@@ -1,3 +1,4 @@
+mod authority;
 mod client_id;
 mod gateway;
 mod pacing;
@@ -5,12 +6,28 @@ mod private;
 mod reconcile;
 mod transport;
 
-pub use client_id::*;
-pub use gateway::*;
-pub use pacing::*;
-pub use private::*;
-pub use reconcile::*;
-pub use transport::*;
+pub use authority::{
+    ApprovedRegularCancel, ApprovedRegularSubmit, OwnedRegularOrders, RegularApprovalScope,
+    RegularExecutionPolicy, RegularExecutionPolicyError, RegularExecutionProfile,
+    RegularExecutionProfileSet, ReservedRegularSubmit,
+};
+pub use client_id::{
+    ClientIdError, ClientOrderIdGenerator, GeneratedClientOrderId, IdempotencyError,
+    IdempotencyRegistry, Reservation,
+};
+pub use gateway::{
+    CancelOutcome, GatewayError, OkxOrderGateway, OkxReconciliationClient, PreparedRegularCancel,
+    PreparedRegularSubmit, RegularCommandDispatcher, RegularExecution, RegularReconciliation,
+    RegularSubmitCompletion, SubmitOutcome, SubmitPreparation,
+};
+pub use pacing::{PacingPolicy, RequestKind, RequestPacer};
+pub use private::{PrivateOrderIdentityError, PrivateStateReducer};
+pub use reconcile::{
+    ReconcileIssue, ReconcileReport, ReconciliationSnapshot, reconcile, reconcile_full_state,
+};
+pub use transport::{
+    CancelOrderTransportError, OkxOrderTransport, OrderTransportError, okx_order_dispatch_key,
+};
 
 use std::collections::{BTreeMap, HashSet};
 

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::Value;
@@ -142,6 +143,41 @@ fn authenticated_okx_authority_obeys_the_workspace_dependency_policy() {
     ] {
         assert_not_reachable(&packages, &resolved, "reap-live-contracts", forbidden);
     }
+
+    assert_eq!(
+        packages["reap-order"].production_dependencies,
+        BTreeSet::from([
+            "async-trait".to_string(),
+            "reap-core".to_string(),
+            "reap-risk".to_string(),
+            "reap-storage".to_string(),
+            "reap-strategy".to_string(),
+            "reap-venue".to_string(),
+            "serde".to_string(),
+            "thiserror".to_string(),
+            "tokio".to_string(),
+        ])
+    );
+    assert!(
+        packages["reap-order"].binary_targets.is_empty(),
+        "reap-order must not provide a runtime executable"
+    );
+    for forbidden in [
+        "reap-live",
+        "reap-live-contracts",
+        "reap-feed",
+        "reap-telemetry",
+        "reap-evidence-core",
+        "reap-emergency-core",
+        "reap-emergency-runner",
+        "reap-okx-wire",
+        "reap-okx-live-adapter",
+        "reap-okx-evidence-adapter",
+        "reap-okx-emergency-adapter",
+    ] {
+        assert_not_reachable(&packages, &resolved, "reap-order", forbidden);
+    }
+
     assert_direct(&packages, "reap-live", "reap-okx-live-adapter");
     assert_not_direct(&packages, "reap-live", "reap-okx-wire");
     for forbidden in [
@@ -241,9 +277,25 @@ fn authenticated_okx_authority_obeys_the_workspace_dependency_policy() {
             "reap-okx-emergency-adapter",
             "reap-okx-evidence-adapter",
         ] {
-            assert_not_direct(&packages, consumer, authority);
+            assert_not_reachable(&packages, &resolved, consumer, authority);
         }
     }
+
+    let normal_regular_mutation_composers = packages
+        .iter()
+        .filter(|(_, package)| {
+            package.production_dependencies.contains("reap-order")
+                && package
+                    .production_dependencies
+                    .contains("reap-okx-live-adapter")
+        })
+        .map(|(name, _)| name.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        normal_regular_mutation_composers,
+        BTreeSet::from(["reap-live"]),
+        "only reap-live may directly compose regular approval with the authenticated live adapter"
+    );
 
     let strategy_workspace_dependencies = packages["reap-strategy"]
         .production_dependencies
@@ -267,6 +319,252 @@ fn authenticated_okx_authority_obeys_the_workspace_dependency_policy() {
     ] {
         assert_not_reachable(&packages, &resolved, "reap-strategy", forbidden);
     }
+}
+
+#[test]
+fn regular_order_authority_construction_is_source_allowlisted() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("reap-live must be inside the workspace crates directory");
+    let mut sources = Vec::new();
+    collect_rust_sources(&workspace.join("crates"), &mut sources);
+
+    let profile_type = ["RegularExecution", "Profile"].concat();
+    let profile_constructor = ["RegularExecutionPolicy", "::from_profile"].concat();
+    let profile_binding = ["bind_", "profiles"].concat();
+    let ownership_registry = ["OwnedRegular", "Orders"].concat();
+    let local_reservation = ["reserve_", "local("].concat();
+    let recovered_registration = ["register_", "recovered("].concat();
+    let recovered_storage_proof = ["ProvenRegular", "SubmitRequest"].concat();
+    let approval_scope_take = ["take_approval_", "scope("].concat();
+    let command_dispatcher_take = ["take_command_", "dispatcher("].concat();
+    let order_transport_install = ["set_order_", "transport("].concat();
+    let mut profile_mentions = BTreeSet::new();
+    let mut profile_constructors = BTreeSet::new();
+    let mut profile_bindings = BTreeSet::new();
+    let mut ownership_mentions = BTreeSet::new();
+    let mut local_reservations = BTreeSet::new();
+    let mut recovered_registrations = BTreeSet::new();
+    let mut recovered_storage_proof_mentions = BTreeSet::new();
+    let mut approval_scope_takes = BTreeSet::new();
+    let mut command_dispatcher_takes = BTreeSet::new();
+    let mut order_transport_installs = BTreeSet::new();
+
+    for path in &sources {
+        let relative = workspace_relative(workspace, path);
+        if !relative.contains("/src/") {
+            continue;
+        }
+        let source = fs::read_to_string(path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        let compact = production_rust_source(&source)
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        if compact.contains(&profile_type) {
+            profile_mentions.insert(relative.clone());
+        }
+        if compact.contains(&profile_constructor) {
+            profile_constructors.insert(relative.clone());
+        }
+        if compact.contains(&profile_binding) {
+            profile_bindings.insert(relative.clone());
+        }
+        if compact.contains(&ownership_registry) {
+            ownership_mentions.insert(relative.clone());
+        }
+        if compact.contains(&local_reservation) {
+            local_reservations.insert(relative.clone());
+        }
+        if compact.contains(&recovered_registration) {
+            recovered_registrations.insert(relative.clone());
+        }
+        if compact.contains(&recovered_storage_proof) {
+            recovered_storage_proof_mentions.insert(relative.clone());
+        }
+        if compact.contains(&approval_scope_take) {
+            approval_scope_takes.insert(relative.clone());
+        }
+        if compact.contains(&command_dispatcher_take) {
+            command_dispatcher_takes.insert(relative.clone());
+        }
+        if compact.contains(&order_transport_install) {
+            order_transport_installs.insert(relative);
+        }
+    }
+
+    assert_eq!(
+        profile_mentions,
+        BTreeSet::from([
+            "crates/reap-live/src/regular_execution.rs".to_string(),
+            "crates/reap-order/src/authority.rs".to_string(),
+            "crates/reap-order/src/lib.rs".to_string(),
+        ]),
+        "regular execution profiles must stay inside their policy owner and the one live composition seam"
+    );
+    assert_eq!(
+        profile_constructors,
+        BTreeSet::from(["crates/reap-live/src/regular_execution.rs".to_string()]),
+        "only the live verified-bootstrap seam may construct the regular execution policy"
+    );
+    assert_eq!(
+        profile_bindings,
+        BTreeSet::from([
+            "crates/reap-live/src/regular_execution.rs".to_string(),
+            "crates/reap-order/src/authority.rs".to_string(),
+        ]),
+        "gateway-bound profiles must be assembled only at the verified live composition seam"
+    );
+    assert_eq!(
+        ownership_mentions,
+        BTreeSet::from([
+            "crates/reap-live/src/coordinator.rs".to_string(),
+            "crates/reap-order/src/authority.rs".to_string(),
+            "crates/reap-order/src/lib.rs".to_string(),
+        ]),
+        "owned-order cancellation authority must stay inside reap-order and the single live coordinator"
+    );
+    assert_eq!(
+        local_reservations,
+        BTreeSet::from([
+            "crates/reap-live/src/coordinator.rs".to_string(),
+            "crates/reap-order/src/authority.rs".to_string(),
+        ]),
+        "local ownership reservation must stay inside its definition and the single live coordinator"
+    );
+    assert_eq!(
+        recovered_registrations,
+        BTreeSet::from([
+            "crates/reap-live/src/coordinator.rs".to_string(),
+            "crates/reap-order/src/authority.rs".to_string(),
+        ]),
+        "recovered ownership registration must stay inside its definition and the storage-proof validating coordinator"
+    );
+    assert_eq!(
+        recovered_storage_proof_mentions,
+        BTreeSet::from([
+            "crates/reap-live/src/coordinator.rs".to_string(),
+            "crates/reap-live/src/runtime.rs".to_string(),
+            "crates/reap-order/src/authority.rs".to_string(),
+            "crates/reap-storage/src/lib.rs".to_string(),
+        ]),
+        "durable regular-submit ownership proof must stay inside storage, order policy, and the one live recovery path"
+    );
+    assert_eq!(
+        approval_scope_takes,
+        BTreeSet::from([
+            "crates/reap-live/src/runtime.rs".to_string(),
+            "crates/reap-order/src/gateway.rs".to_string(),
+        ]),
+        "account approval scopes must transfer only from the gateway into live composition"
+    );
+    assert_eq!(
+        command_dispatcher_takes,
+        BTreeSet::from([
+            "crates/reap-live/src/runtime/dispatch.rs".to_string(),
+            "crates/reap-order/src/gateway.rs".to_string(),
+        ]),
+        "the command role must transfer only from the gateway into the bounded order task"
+    );
+    assert_eq!(
+        order_transport_installs,
+        BTreeSet::from([
+            "crates/reap-live/src/runtime.rs".to_string(),
+            "crates/reap-order/src/gateway.rs".to_string(),
+        ]),
+        "the regular order transport must be installed only by live composition before command-role transfer"
+    );
+
+    let order_lib = fs::read_to_string(workspace.join("crates/reap-order/src/lib.rs"))
+        .expect("reap-order lib source");
+    let compact_order_lib = order_lib
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    assert!(
+        !compact_order_lib.contains("pubuseclient_id::*")
+            && !compact_order_lib.contains("pubusegateway::*")
+            && !compact_order_lib.contains("pubusepacing::*")
+            && !compact_order_lib.contains("pubuseprivate::*")
+            && !compact_order_lib.contains("pubusereconcile::*")
+            && !compact_order_lib.contains("pubusetransport::*"),
+        "reap-order must use an explicit public export surface"
+    );
+
+    let order_authority = fs::read_to_string(workspace.join("crates/reap-order/src/authority.rs"))
+        .expect("reap-order authority source");
+    let order_authority = production_rust_source(&order_authority)
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    assert!(
+        !order_authority.contains("recover_jsonl"),
+        "reap-order may accept the opaque durable-submit proof type but must not own storage recovery IO"
+    );
+}
+
+#[test]
+fn raw_regular_order_dtos_are_constructed_only_by_the_live_adapter() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("reap-live must be inside the workspace crates directory");
+    let place_constructor = ["OkxPlaceOrder", "{symbol:"].concat();
+    let cancel_constructor = ["OkxCancelOrder", "{symbol:"].concat();
+
+    let mut live_sources = Vec::new();
+    collect_rust_sources(&workspace.join("crates/reap-live/src"), &mut live_sources);
+    for path in live_sources {
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        let compact = source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        assert!(
+            !compact.contains(&place_constructor) && !compact.contains(&cancel_constructor),
+            "{} constructs a raw OKX regular-order DTO",
+            workspace_relative(workspace, &path)
+        );
+    }
+
+    for relative in [
+        "crates/reap-order/src/gateway.rs",
+        "crates/reap-order/src/transport.rs",
+    ] {
+        let source = fs::read_to_string(workspace.join(relative))
+            .unwrap_or_else(|error| panic!("failed to read {relative}: {error}"));
+        let compact = source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        assert!(
+            !compact.contains(&place_constructor) && !compact.contains(&cancel_constructor),
+            "{relative} constructs a raw OKX regular-order DTO"
+        );
+    }
+
+    let adapter_source =
+        fs::read_to_string(workspace.join("crates/reap-okx-live-adapter/src/lib.rs"))
+            .expect("live adapter source");
+    let (adapter_production, _) = adapter_source
+        .split_once("#[cfg(test)]\nmod tests")
+        .expect("live adapter test module marker");
+    let adapter_production = adapter_production
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    assert_eq!(
+        adapter_production.matches(&place_constructor).count(),
+        1,
+        "the live adapter must have one regular place DTO mapper"
+    );
+    assert_eq!(
+        adapter_production.matches(&cancel_constructor).count(),
+        1,
+        "the live adapter must have one regular cancel DTO mapper"
+    );
 }
 
 fn resolved_production_edges(
@@ -346,4 +644,33 @@ fn assert_not_reachable(
                 .cloned(),
         );
     }
+}
+
+fn collect_rust_sources(directory: &Path, sources: &mut Vec<PathBuf>) {
+    let mut entries = fs::read_dir(directory)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", directory.display()))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_else(|error| panic!("failed to enumerate {}: {error}", directory.display()));
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rust_sources(&path, sources);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            sources.push(path);
+        }
+    }
+}
+
+fn workspace_relative(workspace: &Path, path: &Path) -> String {
+    path.strip_prefix(workspace)
+        .expect("source must be inside workspace")
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn production_rust_source(source: &str) -> &str {
+    source
+        .split_once("#[cfg(test)]\nmod tests")
+        .map_or(source, |(production, _)| production)
 }

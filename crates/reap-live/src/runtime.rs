@@ -21,7 +21,7 @@ use reap_order::{
 use reap_storage::{
     BootstrapRecord, OrderOperation, OrderRequestRecord, RecoveredStorage, SafetyLatchRecord,
     SafetyLatchScope, SafetyLatchSource, SessionStartRecord, StorageConfig, StorageError,
-    StorageRecord, acquire_storage_lease, recover_jsonl, start_jsonl_storage_with_lease,
+    StorageRecord, acquire_storage_lease, recover_leased_jsonl, start_jsonl_storage_with_lease,
 };
 use reap_telemetry::{
     AlertDeliveryFailure, AlertError, AlertEvent, AlertRuntime, AlertSeverity, AlertStats,
@@ -38,6 +38,7 @@ use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::convergence::{FillConvergenceGuard, OrderStateConvergenceGuard};
+use crate::coordinator::{CancelAction, LiveAction, ReconcileAction, SubmitAction};
 use crate::forbidden_orders::{
     ForbiddenOrderEvent, ForbiddenOrderObserverPort, ForbiddenSentinelPolicy,
     run_forbidden_order_sentinel,
@@ -51,17 +52,16 @@ use crate::provenance::{
 };
 use crate::safety_contracts::LiveFaultFailureCode;
 use crate::{
-    AccountBootstrapSnapshot, CancelAction, ChaosConnectivityPlan, ChaosConnectivityPlanError,
-    CoordinatorError, CoordinatorOutput, HostGuardRuntime, HostHealthError, HostHealthSnapshot,
-    LiveAction, LiveConfig, LiveConfigError, LiveConfigFileEvidence, LiveCoordinator,
-    LiveLatencyCollector, LiveLatencyEvidence, LiveLatencySemantics, LiveMode,
-    MaintenanceRelevancePlan, MaintenanceServicePlan, OperatorCommand, OperatorEnvelope,
-    OperatorError, OperatorResponse, OperatorService, OperatorStatus, PrivateChannelPlan,
-    PublicChannelPlan, PublicRedundancyConsumer, ReadinessSnapshot, ReconcileAction,
-    ReconciliationResult, RequirementUse, StartupGate, SubmitAction, TradingEnvironment,
-    VerifiedBootstrap, alert_webhook_from_env, check_host_health, load_live_config_with_evidence,
-    okx_instrument_type, operator_secret_from_env, start_host_guard, start_operator_service,
-    verify_bootstrap,
+    AccountBootstrapSnapshot, ChaosConnectivityPlan, ChaosConnectivityPlanError, CoordinatorError,
+    CoordinatorOutput, HostGuardRuntime, HostHealthError, HostHealthSnapshot, LiveConfig,
+    LiveConfigError, LiveConfigFileEvidence, LiveCoordinator, LiveLatencyCollector,
+    LiveLatencyEvidence, LiveLatencySemantics, LiveMode, MaintenanceRelevancePlan,
+    MaintenanceServicePlan, OperatorCommand, OperatorEnvelope, OperatorError, OperatorResponse,
+    OperatorService, OperatorStatus, PrivateChannelPlan, PublicChannelPlan,
+    PublicRedundancyConsumer, ReadinessSnapshot, ReconciliationResult, RequirementUse, StartupGate,
+    TradingEnvironment, VerifiedBootstrap, alert_webhook_from_env, check_host_health,
+    load_live_config_with_evidence, okx_instrument_type, operator_secret_from_env,
+    start_host_guard, start_operator_service, verify_bootstrap,
 };
 
 mod composition;
@@ -618,21 +618,36 @@ async fn bootstrap_accounts(
                 )
             }
             (LiveMode::Demo, true) => {
-                let roles = demo_from_env(
+                let mut roles = demo_from_env(
                     connection,
                     credential_env,
+                    account.id.clone(),
                     config.venue.enable_vip_fills_channel,
                 )
                 .map_err(|error| LiveRuntimeError::Bootstrap {
                     account_id: account.id.clone(),
                     message: error.to_string(),
                 })?;
+                let execution =
+                    roles
+                        .take_execution()
+                        .ok_or_else(|| LiveRuntimeError::GatewaySetup {
+                            account_id: account.id.clone(),
+                            message: "demo execution authority was already consumed".to_string(),
+                        })?;
+                let regular_order_sessions =
+                    roles.take_regular_order_sessions().ok_or_else(|| {
+                        LiveRuntimeError::GatewaySetup {
+                            account_id: account.id.clone(),
+                            message: "demo command websocket authority was already consumed"
+                                .to_string(),
+                        }
+                    })?;
                 let reconciliation = roles.observe().reconciliation();
                 let gateway = OkxOrderGateway::new(
-                    Arc::new(roles.execution()),
+                    account.id.clone(),
+                    Box::new(execution),
                     Arc::new(reconciliation.clone()),
-                    account.id_prefix.clone(),
-                    account.node_id,
                     trade_modes,
                     config.runtime.pacing_policy(),
                 )
@@ -647,7 +662,7 @@ async fn bootstrap_accounts(
                     roles.observe().private_state_sessions(),
                     Some(gateway),
                     Some(Arc::new(roles.safety()) as Arc<dyn SafetyPort>),
-                    Some(roles.regular_order_sessions()),
+                    Some(regular_order_sessions),
                 )
             }
             (LiveMode::Validate, _) => {
@@ -1212,61 +1227,55 @@ fn recovered_safety_latch_count(recovered: &RecoveredStorage) -> u64 {
 
 fn proven_active_recovered_orders(
     config: &LiveConfig,
-    recovered: &RecoveredStorage,
-) -> Vec<reap_core::OrderUpdate> {
-    let mut orders = recovered
-        .latest_orders
-        .values()
-        .filter(|update| {
-            matches!(
+    recovered: &mut RecoveredStorage,
+) -> Vec<(
+    reap_core::OrderUpdate,
+    reap_storage::ProvenRegularSubmitRequest,
+)> {
+    let requests = std::mem::take(&mut recovered.proven_regular_submit_requests);
+    let mut orders = requests
+        .into_values()
+        .filter_map(|proof| {
+            let update = recovered.latest_orders.get(proof.client_order_id())?;
+            if !matches!(
                 update.status,
                 OrderStatus::PendingNew | OrderStatus::Live | OrderStatus::PartiallyFilled
-            )
-        })
-        .filter(|update| {
-            let Some(account_id) = config
+            ) {
+                return None;
+            }
+            let account_id = config
                 .account_for_symbol(&update.symbol)
-                .map(|account| account.id.as_str())
-            else {
-                return false;
-            };
-            recovered
-                .proven_regular_submit_requests
-                .values()
-                .any(|request| {
-                    request.account_id() == account_id
-                        && request.symbol() == update.symbol
-                        && request.client_order_id() == update.order_id
-                })
+                .map(|account| account.id.as_str())?;
+            (proof.account_id() == account_id
+                && proof.symbol() == update.symbol
+                && proof.client_order_id() == update.order_id)
+                .then(|| (update.clone(), proof))
         })
-        .cloned()
         .collect::<Vec<_>>();
-    orders.sort_by(|left, right| left.order_id.cmp(&right.order_id));
+    orders.sort_by(|(left, _), (right, _)| left.order_id.cmp(&right.order_id));
     orders
 }
 
 fn restore_active_order_bindings(
     coordinator: &mut LiveCoordinator,
-    recovered: &RecoveredStorage,
+    recovered: &mut RecoveredStorage,
 ) -> Result<(), LiveRuntimeError> {
-    for binding in recovered.proven_regular_order_bindings.values() {
-        let account_id = binding.account_id();
-        if !coordinator.manages_account(account_id) {
+    let bindings = std::mem::take(&mut recovered.proven_regular_order_bindings);
+    for binding in bindings.into_values() {
+        let account_id = binding.account_id().to_string();
+        if !coordinator.manages_account(&account_id) {
             return Err(LiveRuntimeError::BootstrapVerification(format!(
                 "recovered order binding references unknown account {account_id}; retain the journal and reconcile before changing account identity"
             )));
         }
-        let active_order_is_restored = coordinator.private_state(account_id).is_some_and(|state| {
-            state
-                .order_reducer()
-                .contains_order(binding.client_order_id())
-        });
+        let active_order_is_restored =
+            coordinator.private_state(&account_id).is_some_and(|state| {
+                state
+                    .order_reducer()
+                    .contains_order(binding.client_order_id())
+            });
         if active_order_is_restored {
-            coordinator.restore_order_binding(
-                account_id,
-                binding.client_order_id(),
-                binding.exchange_order_id(),
-            )?;
+            coordinator.restore_order_binding(binding)?;
         }
     }
     Ok(())
@@ -1428,7 +1437,7 @@ impl LiveRuntime {
             executable_sha256,
             host_identity_sha256,
         } = attempt;
-        let storage_lease = acquire_storage_lease(&config.storage.path)?;
+        let mut storage_lease = acquire_storage_lease(&config.storage.path)?;
         let journal_path = storage_lease.journal_path().to_path_buf();
         let host_preflight = if config.host_guard.enabled {
             Some(check_host_health(&config.host_guard, &journal_path)?)
@@ -1456,7 +1465,7 @@ impl LiveRuntime {
         let fill_convergence = FillConvergenceGuard::new(&config);
         let order_convergence =
             OrderStateConvergenceGuard::new(config.runtime.order_state_convergence_timeout_ms);
-        let recovered = recover_jsonl(storage_lease.journal_path())?;
+        let mut recovered = recover_leased_jsonl(&mut storage_lease)?;
         validate_recovered_safety_latches(&config, &recovered)?;
         let restored_safety_latches = recovered_safety_latch_count(&recovered);
         for (account_id, (strategy_name, fingerprint)) in &recovered.bootstrap_identities {
@@ -1474,9 +1483,9 @@ impl LiveRuntime {
                 });
             }
         }
-        let recovered_orders = proven_active_recovered_orders(&config, &recovered);
+        let recovered_orders = proven_active_recovered_orders(&config, &mut recovered);
         let mut restored_by_account: HashMap<String, Vec<reap_core::OrderUpdate>> = HashMap::new();
-        for update in &recovered_orders {
+        for (update, _) in &recovered_orders {
             let account_id = config
                 .account_for_symbol(&update.symbol)
                 .map(|account| account.id.clone())
@@ -1491,7 +1500,7 @@ impl LiveRuntime {
                 .or_default()
                 .push(update.clone());
         }
-        let (mut verified, seeds, snapshots) = bootstrap_accounts(
+        let (mut verified, mut seeds, snapshots) = bootstrap_accounts(
             &config,
             &restored_by_account,
             mode,
@@ -1499,6 +1508,20 @@ impl LiveRuntime {
             &maintenance_relevance,
         )
         .await?;
+        let mut approval_scopes = HashMap::new();
+        for seed in &mut seeds {
+            let Some(gateway) = seed.gateway.as_mut() else {
+                continue;
+            };
+            let scope =
+                gateway
+                    .take_approval_scope()
+                    .map_err(|error| LiveRuntimeError::GatewaySetup {
+                        account_id: seed.account_id.clone(),
+                        message: format!("failed to take regular approval scope: {error}"),
+                    })?;
+            approval_scopes.insert(seed.account_id.clone(), scope);
+        }
         let account_identity_sha256s = account_identity_sha256s(&config, &snapshots)?;
         let session_id = format!("{:x}", unix_time_ns());
         let mut startup_records = Vec::new();
@@ -1558,7 +1581,7 @@ impl LiveRuntime {
         let mut coordinator = LiveCoordinator::new_with_order_transports(
             config.clone(),
             verified,
-            planned_order_accounts,
+            approval_scopes,
             session_id.clone(),
         )?;
         // Apply recovered halt state before replaying anything that can produce an intent.
@@ -1568,19 +1591,10 @@ impl LiveRuntime {
             actions: Vec::new(),
             records: startup_records,
         }];
-        for update in recovered_orders {
-            let account_id = config
-                .account_for_symbol(&update.symbol)
-                .map(|account| account.id.clone())
-                .ok_or_else(|| {
-                    LiveRuntimeError::BootstrapVerification(format!(
-                        "recovered order {} has unmapped symbol {}",
-                        update.order_id, update.symbol
-                    ))
-                })?;
-            initial_outputs.push(coordinator.restore_owned_order(&account_id, update)?);
+        for (update, proof) in recovered_orders {
+            initial_outputs.push(coordinator.restore_owned_order(proof, update)?);
         }
-        restore_active_order_bindings(&mut coordinator, &recovered)?;
+        restore_active_order_bindings(&mut coordinator, &mut recovered)?;
         for account in &config.accounts {
             let snapshot = snapshots.get(&account.id).ok_or_else(|| {
                 LiveRuntimeError::BootstrapVerification(format!(
@@ -1791,10 +1805,18 @@ impl LiveRuntime {
             let _private_connection_capability =
                 okx_capability_registration("OKX-CONNECTION-PRIVATE-STATE")
                     .expect("private state connection must remain in the OKX capability registry");
+            let private_bootstrap = private_state_sessions
+                .bootstrap_factory(&config.venue.private_ws_url)
+                .map_err(|error| LiveRuntimeError::GatewaySetup {
+                    account_id: account_id.clone(),
+                    message: format!(
+                        "failed to bind private state bootstrap to its websocket destination: {error}"
+                    ),
+                })?;
             let mut private_feed = spawn_supervised_feed(
                 Arc::clone(&private_adapter),
                 private_plans.clone(),
-                private_state_sessions.bootstrap_factory(),
+                private_bootstrap,
                 config.runtime.feed_channel_capacity,
                 connection_attempt_pacer.clone(),
                 ReconnectPolicy::default(),
@@ -1831,7 +1853,12 @@ impl LiveRuntime {
                             connection_attempt_pacer: connection_attempt_pacer.clone(),
                             reconnect: ReconnectPolicy::default(),
                         });
-                    gateway.set_order_transport(Box::new(transport));
+                    gateway
+                        .set_order_transport(Box::new(transport))
+                        .map_err(|error| LiveRuntimeError::GatewaySetup {
+                            account_id: account_id.clone(),
+                            message: format!("failed to install regular order transport: {error}"),
+                        })?;
                     let order_status_events = control_tx.clone();
                     order_ws_status_tasks.push(tokio::spawn(async move {
                         while let Some(status) = order_ws_status.recv().await {
@@ -3429,9 +3456,19 @@ impl LiveRuntime {
         &mut self,
         action: CancelAction,
     ) -> Result<(), LiveRuntimeError> {
+        tracing::debug!(
+            account_id = action.account_id(),
+            symbol = action.symbol(),
+            client_order_id = action.client_order_id(),
+            reason = action.reason(),
+            "dispatching approved shutdown cancellation"
+        );
         let enqueued_at = Instant::now();
-        let cancel_key = (action.account_id.clone(), action.client_order_id.clone());
-        let symbol = action.symbol.clone();
+        let cancel_key = (
+            action.account_id().to_string(),
+            action.client_order_id().to_string(),
+        );
+        let symbol = action.symbol().to_string();
         if !self
             .reconciliation
             .cancel_inflight
@@ -3440,18 +3477,18 @@ impl LiveRuntime {
             return Ok(());
         }
         if let Err(error) = self.record_storage(StorageRecord::OrderRequest(OrderRequestRecord {
-            ts_ms: action.ts_ms,
-            account_id: action.account_id.clone(),
+            ts_ms: action.ts_ms(),
+            account_id: action.account_id().to_string(),
             operation: OrderOperation::Cancel,
             idempotency_key: None,
-            client_order_id: Some(action.client_order_id.clone()),
+            client_order_id: Some(action.client_order_id().to_string()),
             exchange_order_id: None,
-            symbol: action.symbol.clone(),
+            symbol: action.symbol().to_string(),
         })) {
             self.reconciliation.cancel_inflight.remove(&cancel_key);
             return Err(error);
         }
-        let sender = match self.order_sender(&action.account_id) {
+        let sender = match self.order_sender(action.account_id()) {
             Ok(sender) => sender.clone(),
             Err(error) => {
                 self.reconciliation.cancel_inflight.remove(&cancel_key);
@@ -3535,15 +3572,15 @@ impl LiveRuntime {
             LiveAction::Submit(action) => {
                 let enqueued_at = Instant::now();
                 self.record_storage(StorageRecord::OrderRequest(OrderRequestRecord {
-                    ts_ms: action.ts_ms,
-                    account_id: action.account_id.clone(),
+                    ts_ms: action.ts_ms(),
+                    account_id: action.account_id().to_string(),
                     operation: OrderOperation::Submit,
-                    idempotency_key: Some(action.idempotency_key.clone()),
-                    client_order_id: Some(action.client_order_id.clone()),
+                    idempotency_key: Some(action.idempotency_key().to_string()),
+                    client_order_id: Some(action.client_order_id().to_string()),
                     exchange_order_id: None,
-                    symbol: action.order.symbol.clone(),
+                    symbol: action.order().symbol.clone(),
                 }))?;
-                self.order_sender(&action.account_id)?
+                self.order_sender(action.account_id())?
                     .try_send(OrderTaskCommand::Submit {
                         action,
                         enqueued_at,
@@ -3554,8 +3591,11 @@ impl LiveRuntime {
             }
             LiveAction::Cancel(action) => {
                 let enqueued_at = Instant::now();
-                let cancel_key = (action.account_id.clone(), action.client_order_id.clone());
-                let symbol = action.symbol.clone();
+                let cancel_key = (
+                    action.account_id().to_string(),
+                    action.client_order_id().to_string(),
+                );
+                let symbol = action.symbol().to_string();
                 if !self
                     .reconciliation
                     .cancel_inflight
@@ -3565,19 +3605,19 @@ impl LiveRuntime {
                 }
                 if let Err(error) =
                     self.record_storage(StorageRecord::OrderRequest(OrderRequestRecord {
-                        ts_ms: action.ts_ms,
-                        account_id: action.account_id.clone(),
+                        ts_ms: action.ts_ms(),
+                        account_id: action.account_id().to_string(),
                         operation: OrderOperation::Cancel,
                         idempotency_key: None,
-                        client_order_id: Some(action.client_order_id.clone()),
+                        client_order_id: Some(action.client_order_id().to_string()),
                         exchange_order_id: None,
-                        symbol: action.symbol.clone(),
+                        symbol: action.symbol().to_string(),
                     }))
                 {
                     self.reconciliation.cancel_inflight.remove(&cancel_key);
                     return Err(error);
                 }
-                let sender = match self.order_sender(&action.account_id) {
+                let sender = match self.order_sender(action.account_id()) {
                     Ok(sender) => sender.clone(),
                     Err(error) => {
                         self.reconciliation.cancel_inflight.remove(&cancel_key);
@@ -3616,6 +3656,12 @@ impl LiveRuntime {
     }
 
     fn dispatch_reconcile(&mut self, action: ReconcileAction) -> Result<(), LiveRuntimeError> {
+        tracing::debug!(
+            account_id = action.account_id,
+            requested_at_ms = action.ts_ms,
+            reason = action.reason,
+            "dispatching reconciliation"
+        );
         if !self
             .reconciliation
             .inflight
@@ -3655,6 +3701,12 @@ impl LiveRuntime {
         &mut self,
         action: ReconcileAction,
     ) -> Result<(), LiveRuntimeError> {
+        tracing::debug!(
+            account_id = action.account_id,
+            requested_at_ms = action.ts_ms,
+            reason = action.reason,
+            "dispatching shutdown reconciliation"
+        );
         if !self
             .reconciliation
             .inflight
@@ -4714,30 +4766,39 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
-    use reap_core::{AccountUpdate, Balance, NewOrder, OrderEvent, OrderUpdate, Side, TimeInForce};
+    use reap_core::{
+        AccountUpdate, Balance, Level, MarketEvent, OrderBook, OrderEvent, OrderUpdate, Side,
+        TimeInForce,
+    };
     use reap_feed::SupervisedFeed;
     use reap_order::{
-        OkxOrderTransport, OrderTransportError, PacingPolicy, ReconcileReport, RegularExecution,
-        RegularReconciliation,
+        CancelOrderTransportError, ClientOrderIdGenerator, OkxOrderTransport, OrderTransportError,
+        OwnedRegularOrders, PacingPolicy, PreparedRegularCancel, PreparedRegularSubmit,
+        PrivateStateReducer, ReconcileReport, RegularExecution, RegularExecutionPolicy,
+        RegularExecutionProfile, RegularReconciliation,
     };
     use reap_risk::{
         InstrumentOrderLimits, InstrumentRiskModel, RiskLimits, StablecoinGuardConfig,
     };
     use reap_storage::{
-        OrderAckStatus, StorageRuntime, StorageSink, acquire_storage_lease, start_jsonl_storage,
+        OrderAckStatus, StorageRuntime, StorageSink, acquire_storage_lease, recover_jsonl,
+        recover_leased_jsonl, start_jsonl_storage,
     };
-    use reap_strategy::{ChaosConfig, InstrumentKindConfig, ReferenceDataKind};
+    use reap_strategy::{
+        ChaosConfig, ChaosExecutionIntent, ChaosStrategy, InstrumentConfig, InstrumentKindConfig,
+        ReferenceDataKind, RiskGroupConfig,
+    };
     use reap_telemetry::AlertSink;
     use reap_venue::okx::{
-        OkxAccountConfig, OkxAccountLevel, OkxApiKeyPermission, OkxCancelOrder, OkxFillPage,
-        OkxInstrumentChange, OkxInstrumentChangeParameter, OkxInstrumentType, OkxOrderAck,
-        OkxPlaceOrder, OkxPositionMode, OkxRegularOrderPage, OkxTradeMode, RestError,
-        parse_okx_account_balance_response_json, parse_okx_account_config_response_json,
-        parse_okx_account_instruments_response_json, parse_okx_account_positions_response_json,
-        parse_okx_cancel_all_after_response_json, parse_okx_fill_page_response_json,
-        parse_okx_order_ack_response_json, parse_okx_order_details_response_json,
-        parse_okx_regular_order_page_response_json, parse_okx_server_time_response_json,
-        parse_okx_system_status_response_json, parse_okx_trade_fee_response_json,
+        OkxAccountConfig, OkxAccountLevel, OkxApiKeyPermission, OkxFillPage, OkxInstrumentChange,
+        OkxInstrumentChangeParameter, OkxInstrumentType, OkxOrderAck, OkxPositionMode,
+        OkxRegularOrderPage, OkxTradeMode, RestError, parse_okx_account_balance_response_json,
+        parse_okx_account_config_response_json, parse_okx_account_instruments_response_json,
+        parse_okx_account_positions_response_json, parse_okx_cancel_all_after_response_json,
+        parse_okx_fill_page_response_json, parse_okx_order_ack_response_json,
+        parse_okx_order_details_response_json, parse_okx_regular_order_page_response_json,
+        parse_okx_server_time_response_json, parse_okx_system_status_response_json,
+        parse_okx_trade_fee_response_json,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{Notify, Semaphore, oneshot};
@@ -4984,7 +5045,31 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        reap_storage::recover_jsonl_bytes(format!("{journal}\n").as_bytes()).unwrap()
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime-recovery.jsonl");
+        std::fs::write(&path, format!("{journal}\n")).unwrap();
+        let mut lease = acquire_storage_lease(&path).unwrap();
+        recover_leased_jsonl(&mut lease).unwrap()
+    }
+
+    fn recovered_submit_proof(
+        account_id: &str,
+        symbol: &str,
+        client_order_id: &str,
+    ) -> reap_storage::ProvenRegularSubmitRequest {
+        recover_storage_records([StorageRecord::OrderRequest(OrderRequestRecord {
+            ts_ms: 1,
+            account_id: account_id.to_string(),
+            operation: OrderOperation::Submit,
+            idempotency_key: Some(format!("proof-{client_order_id}")),
+            client_order_id: Some(client_order_id.to_string()),
+            exchange_order_id: None,
+            symbol: symbol.to_string(),
+        })])
+        .proven_regular_submit_requests
+        .into_values()
+        .next()
+        .expect("test journal must produce a durable submit proof")
     }
 
     fn unwrap_startup_failure(error: LiveRuntimeError) -> (LiveRuntimeError, LiveRunReport) {
@@ -5025,7 +5110,7 @@ mod tests {
     impl RegularExecution for RuntimeMockRoles {
         async fn cancel_regular_order(
             &self,
-            _order: &OkxCancelOrder,
+            _order: PreparedRegularCancel,
         ) -> Result<OkxOrderAck, RestError> {
             let response = self.next()?;
             parse_okx_order_ack_response_json(response.body.as_bytes(), "cancel order")
@@ -5101,20 +5186,19 @@ mod tests {
     impl OkxOrderTransport for GatedOrderTransport {
         async fn place_order(
             &self,
-            order: &OkxPlaceOrder,
+            order: PreparedRegularSubmit,
         ) -> Result<OkxOrderAck, OrderTransportError> {
-            self.execute(&order.symbol, &order.client_order_id).await
+            self.execute(&order.order().symbol, order.client_order_id())
+                .await
         }
 
         async fn cancel_order(
             &self,
-            order: &OkxCancelOrder,
-        ) -> Result<OkxOrderAck, OrderTransportError> {
-            self.execute(
-                &order.symbol,
-                order.client_order_id.as_deref().unwrap_or_default(),
-            )
-            .await
+            order: PreparedRegularCancel,
+        ) -> Result<OkxOrderAck, CancelOrderTransportError> {
+            self.execute(order.symbol(), order.client_order_id())
+                .await
+                .map_err(CancelOrderTransportError::failed)
         }
     }
 
@@ -5146,22 +5230,33 @@ mod tests {
     fn runtime_order_gateway(
         symbols: &[&str],
         responses: Vec<Result<HttpResponse, RestError>>,
-    ) -> OkxOrderGateway {
-        let roles = Arc::new(RuntimeMockRoles {
-            responses: Arc::new(Mutex::new(responses.into())),
-        });
-        OkxOrderGateway::new(
-            Arc::clone(&roles) as Arc<dyn RegularExecution>,
-            roles as Arc<dyn RegularReconciliation>,
-            "reap",
-            1,
+    ) -> (
+        OkxOrderGateway,
+        RegularExecutionPolicy,
+        ClientOrderIdGenerator,
+    ) {
+        let responses = Arc::new(Mutex::new(responses.into()));
+        let mut gateway = OkxOrderGateway::new(
+            "main",
+            Box::new(RuntimeMockRoles {
+                responses: Arc::clone(&responses),
+            }),
+            Arc::new(RuntimeMockRoles { responses }),
             symbols
                 .iter()
                 .map(|symbol| ((*symbol).to_string(), OkxTradeMode::Cash))
                 .collect(),
             PacingPolicy::default(),
         )
-        .unwrap()
+        .unwrap();
+        let profiles = symbols.iter().map(|symbol| execution_profile(symbol));
+        let (profile_set, client_order_id_generator) = gateway
+            .take_approval_scope()
+            .unwrap()
+            .bind_profiles_and_client_id_generator(profiles, "test", 1)
+            .unwrap();
+        let policy = RegularExecutionPolicy::from_profile_sets([profile_set]).unwrap();
+        (gateway, policy, client_order_id_generator)
     }
 
     fn gated_order_transport(symbols: &[&str]) -> GatedOrderHarness {
@@ -5186,23 +5281,165 @@ mod tests {
         )
     }
 
-    fn submit_action(symbol: &str, id: &str) -> SubmitAction {
-        SubmitAction {
-            ts_ms: unix_time_ms(),
-            account_id: "main".to_string(),
-            idempotency_key: format!("decision-{id}"),
-            client_order_id: format!("client-{id}"),
-            order: NewOrder {
-                symbol: symbol.to_string(),
-                side: Side::Buy,
-                qty: 1.0,
-                price: 100.0,
-                time_in_force: TimeInForce::PostOnly,
-                reduce_only: false,
-                self_trade_prevention: None,
-                reason: "runtime worker test".to_string(),
+    fn execution_profile(symbol: &str) -> RegularExecutionProfile {
+        RegularExecutionProfile::new(
+            symbol,
+            "main",
+            InstrumentRiskModel::Spot,
+            InstrumentOrderLimits {
+                max_limit_quantity: 1_000_000.0,
+                max_limit_notional_usd: None,
             },
-        }
+            0.1,
+            0.0001,
+            0.0001,
+            true,
+            false,
+            true,
+        )
+    }
+
+    fn strategy_quote(symbol: &str) -> ChaosExecutionIntent {
+        let hedge_symbol = format!("{symbol}-HEDGE");
+        let mut strategy = ChaosStrategy::new(ChaosConfig {
+            ref_symbol: symbol.to_string(),
+            delta_limit_usd: 50_000.0,
+            active_hedge_threshold_usd: 1_000.0,
+            min_hedge_interval_ms: 0,
+            risk_groups: vec![RiskGroupConfig {
+                name: "main".to_string(),
+                symbols: vec![symbol.to_string(), hedge_symbol.clone()],
+                soft_delta_limit_usd: 25_000.0,
+                hard_delta_limit_usd: 40_000.0,
+                live_order_limit_usd: 100_000.0,
+                ..RiskGroupConfig::default()
+            }],
+            instruments: vec![
+                InstrumentConfig {
+                    symbol: symbol.to_string(),
+                    risk_group: "main".to_string(),
+                    kind: InstrumentKindConfig::Spot,
+                    tick_size: 0.1,
+                    lot_size: 0.0001,
+                    min_trade_size: 0.0001,
+                    max_order_size_usd: 5_000.0,
+                    min_order_size_usd: 100.0,
+                    max_order_size: 1.0,
+                    ..InstrumentConfig::default()
+                },
+                InstrumentConfig {
+                    symbol: hedge_symbol.clone(),
+                    risk_group: "main".to_string(),
+                    kind: InstrumentKindConfig::Future,
+                    tick_size: 0.1,
+                    lot_size: 1.0,
+                    min_trade_size: 1.0,
+                    contract_value: 0.001,
+                    max_order_size_usd: 5_000.0,
+                    min_order_size_usd: 100.0,
+                    max_order_size: 200.0,
+                    min_position: -10_000.0,
+                    max_position: 10_000.0,
+                    ..InstrumentConfig::default()
+                },
+            ],
+            ..ChaosConfig::default()
+        })
+        .unwrap();
+        let depths = [
+            OrderBook {
+                symbol: symbol.to_string(),
+                ts_ms: 1,
+                bids: vec![Level {
+                    px: 50_000.0,
+                    qty: 2.0,
+                }],
+                asks: vec![Level {
+                    px: 50_001.0,
+                    qty: 2.0,
+                }],
+            },
+            OrderBook {
+                symbol: hedge_symbol,
+                ts_ms: 1,
+                bids: vec![Level {
+                    px: 50_003.0,
+                    qty: 10_000.0,
+                }],
+                asks: vec![Level {
+                    px: 50_004.0,
+                    qty: 10_000.0,
+                }],
+            },
+        ];
+        depths
+            .into_iter()
+            .flat_map(|book| {
+                strategy.on_execution_event(
+                    &NormalizedEvent::Market(MarketEvent::Depth(book)).into_strategy_event(),
+                )
+            })
+            .find(|intent| {
+                intent
+                    .as_quote()
+                    .is_some_and(|quote| quote.symbol() == symbol)
+            })
+            .expect("strategy fixture must emit a typed quote")
+    }
+
+    fn submit_action(
+        policy: &RegularExecutionPolicy,
+        client_order_ids: &ClientOrderIdGenerator,
+        symbol: &str,
+        id: &str,
+    ) -> SubmitAction {
+        let approved = policy
+            .authorize_submit(strategy_quote(symbol))
+            .expect("typed strategy quote must satisfy regular execution policy");
+        let mut owned = OwnedRegularOrders::default();
+        let mut private_state = PrivateStateReducer::new();
+        let (_, reserved) = owned
+            .reserve_local(
+                approved,
+                client_order_ids.next(unix_time_ms()),
+                &mut private_state,
+                unix_time_ms(),
+            )
+            .expect("test order must establish ownership");
+        SubmitAction::new(unix_time_ms(), format!("decision-{id}"), reserved)
+    }
+
+    fn cancel_action(
+        policy: &RegularExecutionPolicy,
+        client_order_ids: &ClientOrderIdGenerator,
+        symbol: &str,
+        _client_order_id: &str,
+        reason: &str,
+    ) -> CancelAction {
+        let approved_submit = policy
+            .authorize_submit(strategy_quote(symbol))
+            .expect("typed strategy quote must satisfy regular execution policy");
+        let mut owned = OwnedRegularOrders::default();
+        let mut private_state = PrivateStateReducer::new();
+        let generated_client_order_id = client_order_ids.next(unix_time_ms());
+        let client_order_id = generated_client_order_id.as_str().to_string();
+        owned
+            .reserve_local(
+                approved_submit,
+                generated_client_order_id,
+                &mut private_state,
+                unix_time_ms(),
+            )
+            .expect("test order must establish ownership");
+        let approved_cancel = policy
+            .authorize_cancel(
+                &client_order_id,
+                reason,
+                &owned,
+                &HashMap::from([("main".to_string(), private_state)]),
+            )
+            .expect("owned canonical order must be cancellable");
+        CancelAction::new(unix_time_ms(), approved_cancel)
     }
 
     fn release_order(gates: &OrderGates, symbol: &str) {
@@ -5224,9 +5461,9 @@ mod tests {
             "ETH-USDT-SWAP",
             "SOL-USDT-SWAP",
         ];
-        let mut gateway = runtime_order_gateway(&symbols, Vec::new());
+        let (mut gateway, policy, client_order_ids) = runtime_order_gateway(&symbols, Vec::new());
         let (transport, mut started, gates, max_active) = gated_order_transport(&symbols);
-        gateway.set_order_transport(Box::new(transport));
+        gateway.set_order_transport(Box::new(transport)).unwrap();
         let (command_tx, command_rx) = mpsc::channel(16);
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let task = tokio::spawn(run_order_task(
@@ -5245,7 +5482,7 @@ mod tests {
         ] {
             command_tx
                 .send(OrderTaskCommand::Submit {
-                    action: submit_action(symbol, id),
+                    action: submit_action(&policy, &client_order_ids, symbol, id),
                     enqueued_at: Instant::now(),
                 })
                 .await
@@ -5269,7 +5506,7 @@ mod tests {
         assert_eq!(receive_started(&mut started).await, symbols[1]);
         command_tx
             .send(OrderTaskCommand::Submit {
-                action: submit_action(symbols[3], "sol"),
+                action: submit_action(&policy, &client_order_ids, symbols[3], "sol"),
                 enqueued_at: Instant::now(),
             })
             .await
@@ -5308,6 +5545,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn order_task_rejects_authority_for_a_different_account_before_preparation() {
+        let symbol = "BTC-USDT-SWAP";
+        let (mut gateway, policy, client_order_ids) = runtime_order_gateway(&[symbol], Vec::new());
+        let (transport, mut started, _gates, _) = gated_order_transport(&[symbol]);
+        gateway.set_order_transport(Box::new(transport)).unwrap();
+        let (command_tx, command_rx) = mpsc::channel(2);
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+        let task = tokio::spawn(run_order_task(
+            "other-account".to_string(),
+            gateway,
+            command_rx,
+            event_tx,
+            1,
+            2,
+        ));
+
+        command_tx
+            .send(OrderTaskCommand::Submit {
+                action: submit_action(&policy, &client_order_ids, symbol, "wrong-account"),
+                enqueued_at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        let event = event_rx.recv().await.expect("worker must fail closed");
+        assert!(matches!(
+            event,
+            RuntimeEvent::Fatal(RuntimeTaskFailure::Gateway(message))
+                if message.contains("received submit authority for account main")
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), started.recv())
+                .await
+                .is_err(),
+            "wrong-account authority reached the order transport"
+        );
+
+        command_tx.send(OrderTaskCommand::Shutdown).await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn reconciliation_completes_while_an_order_command_is_blocked() {
         let symbol = "BTC-USDT-SWAP";
         let responses = vec![
@@ -5328,9 +5606,9 @@ mod tests {
                 body: r#"{"code":"0","msg":"","data":[]}"#.to_string(),
             }),
         ];
-        let mut gateway = runtime_order_gateway(&[symbol], responses);
+        let (mut gateway, policy, client_order_ids) = runtime_order_gateway(&[symbol], responses);
         let (transport, mut started, gates, _) = gated_order_transport(&[symbol]);
-        gateway.set_order_transport(Box::new(transport));
+        gateway.set_order_transport(Box::new(transport)).unwrap();
         let io = gateway.reconciliation_client();
         let (command_tx, command_rx) = mpsc::channel(8);
         let (reconcile_tx, reconcile_rx) = mpsc::channel(2);
@@ -5355,7 +5633,7 @@ mod tests {
 
         command_tx
             .send(OrderTaskCommand::Submit {
-                action: submit_action(symbol, "blocked"),
+                action: submit_action(&policy, &client_order_ids, symbol, "blocked"),
                 enqueued_at: Instant::now(),
             })
             .await
@@ -5978,10 +6256,31 @@ mod tests {
         gateway_actions_enabled: bool,
     ) -> LiveCoordinator {
         let update = account_update(now_ms);
+        let mut approval_scopes = HashMap::new();
+        if gateway_actions_enabled {
+            for account in &config.accounts {
+                let responses = Arc::new(Mutex::new(VecDeque::new()));
+                let mut gateway = OkxOrderGateway::new(
+                    account.id.clone(),
+                    Box::new(RuntimeMockRoles {
+                        responses: Arc::clone(&responses),
+                    }),
+                    Arc::new(RuntimeMockRoles { responses }),
+                    account
+                        .trade_modes
+                        .iter()
+                        .map(|(symbol, mode)| (symbol.clone(), (*mode).into()))
+                        .collect(),
+                    PacingPolicy::default(),
+                )
+                .unwrap();
+                approval_scopes.insert(account.id.clone(), gateway.take_approval_scope().unwrap());
+            }
+        }
         let mut coordinator = LiveCoordinator::new(
             config.clone(),
             verified(config, update.clone()),
-            gateway_actions_enabled,
+            approval_scopes,
             "bounded-test",
         )
         .unwrap();
@@ -6152,7 +6451,7 @@ mod tests {
         let mut coordinator = ready_coordinator(&config, unix_time_ms(), true);
         coordinator
             .restore_owned_order(
-                "main",
+                recovered_submit_proof("main", "BTC-USDT", "restored-live"),
                 OrderUpdate {
                     ts_ms: 2,
                     order_id: "restored-live".to_string(),
@@ -6174,7 +6473,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let recovered = recover_storage_records([
+        let mut recovered = recover_storage_records([
             StorageRecord::OrderRequest(OrderRequestRecord {
                 ts_ms: 1,
                 account_id: "main".to_string(),
@@ -6195,7 +6494,7 @@ mod tests {
             }),
         ]);
 
-        restore_active_order_bindings(&mut coordinator, &recovered).unwrap();
+        restore_active_order_bindings(&mut coordinator, &mut recovered).unwrap();
 
         assert_eq!(
             coordinator
@@ -6210,7 +6509,7 @@ mod tests {
     fn recovered_order_binding_account_must_match_live_config() {
         let config = config();
         let mut coordinator = ready_coordinator(&config, unix_time_ms(), true);
-        let recovered = recover_storage_records([
+        let mut recovered = recover_storage_records([
             StorageRecord::OrderRequest(OrderRequestRecord {
                 ts_ms: 1,
                 account_id: "removed".to_string(),
@@ -6231,7 +6530,7 @@ mod tests {
             }),
         ]);
 
-        let error = restore_active_order_bindings(&mut coordinator, &recovered).unwrap_err();
+        let error = restore_active_order_bindings(&mut coordinator, &mut recovered).unwrap_err();
 
         assert!(error.to_string().contains("unknown account removed"));
     }
@@ -6258,13 +6557,13 @@ mod tests {
             last_fill_fee: None,
             reason: "private observation".to_string(),
         };
-        let unproven = recover_storage_records([StorageRecord::Order {
+        let mut unproven = recover_storage_records([StorageRecord::Order {
             account_id: Some("main".to_string()),
             update: update.clone(),
         }]);
-        assert!(proven_active_recovered_orders(&config, &unproven).is_empty());
+        assert!(proven_active_recovered_orders(&config, &mut unproven).is_empty());
 
-        let proven = recover_storage_records([
+        let mut proven = recover_storage_records([
             StorageRecord::OrderRequest(OrderRequestRecord {
                 ts_ms: 1,
                 account_id: "main".to_string(),
@@ -6279,11 +6578,13 @@ mod tests {
                 update: update.clone(),
             },
         ]);
-        let restored = proven_active_recovered_orders(&config, &proven);
+        let restored = proven_active_recovered_orders(&config, &mut proven);
         assert_eq!(restored.len(), 1);
-        assert_eq!(restored[0].order_id, update.order_id);
-        assert_eq!(restored[0].symbol, update.symbol);
-        assert_eq!(restored[0].status, update.status);
+        assert_eq!(restored[0].0.order_id, update.order_id);
+        assert_eq!(restored[0].0.symbol, update.symbol);
+        assert_eq!(restored[0].0.status, update.status);
+        assert_eq!(restored[0].1.account_id(), "main");
+        assert_eq!(restored[0].1.client_order_id(), update.order_id);
     }
 
     #[test]
@@ -6303,7 +6604,7 @@ mod tests {
         let _ = restore_safety_latches(&mut coordinator, &recovered).unwrap();
         let replay = coordinator
             .restore_owned_order(
-                "main",
+                recovered_submit_proof("main", "BTC-USDT", "restored-live"),
                 OrderUpdate {
                     ts_ms: 2,
                     order_id: "restored-live".to_string(),
@@ -6339,7 +6640,7 @@ mod tests {
                 .flat_map(|output| &output.actions)
                 .any(|action| matches!(
                     action,
-                    LiveAction::Cancel(cancel) if cancel.client_order_id == "restored-live"
+                    LiveAction::Cancel(cancel) if cancel.client_order_id() == "restored-live"
                 ))
         );
     }
@@ -7160,7 +7461,7 @@ mod tests {
         let mut coordinator = ready_coordinator(&config, now_ms, true);
         coordinator
             .restore_owned_order(
-                "main",
+                recovered_submit_proof("main", "BTC-USDT", "client-live"),
                 OrderUpdate {
                     ts_ms: now_ms,
                     order_id: "client-live".to_string(),
@@ -7212,7 +7513,7 @@ mod tests {
             while let Some(command) = order_rx.recv().await {
                 match command {
                     OrderTaskCommand::Cancel { action, .. } => {
-                        assert_eq!(action.client_order_id, "client-live");
+                        assert_eq!(action.client_order_id(), "client-live");
                         task_cancel_observed.store(true, Ordering::SeqCst);
                     }
                     OrderTaskCommand::Flush(waiter) => {
@@ -7340,14 +7641,16 @@ mod tests {
         }
         .into_runtime();
 
+        let (_authority_gateway, cancel_policy, client_order_ids) =
+            runtime_order_gateway(&["BTC-USDT"], Vec::new());
         assert!(matches!(
-            runtime.dispatch_action(LiveAction::Cancel(CancelAction {
-                ts_ms: unix_time_ms(),
-                account_id: "main".to_string(),
-                symbol: "BTC-USDT".to_string(),
-                client_order_id: "client-live".to_string(),
-                reason: "injected pre-shutdown storage failure".to_string(),
-            })),
+            runtime.dispatch_action(LiveAction::Cancel(cancel_action(
+                &cancel_policy,
+                &client_order_ids,
+                "BTC-USDT",
+                "client-live",
+                "injected pre-shutdown storage failure",
+            ))),
             Err(LiveRuntimeError::Storage(StorageError::Closed))
         ));
         assert!(runtime.reconciliation.cancel_inflight.is_empty());

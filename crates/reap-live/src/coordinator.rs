@@ -6,46 +6,109 @@ use reap_core::{
 use reap_engine::{ChaosEngineOutput, SafetyCancelCandidate, TradingEngine};
 use reap_feed::{FeedOutput, RecoveryRequest};
 use reap_order::{
-    CancelOutcome, ClientOrderIdGenerator, PrivateOrderIdentityError, PrivateStateReducer,
-    SubmitOutcome,
+    ApprovedRegularCancel, CancelOutcome, ClientOrderIdGenerator, OwnedRegularOrders,
+    PrivateOrderIdentityError, PrivateStateReducer, RegularApprovalScope, RegularExecutionPolicy,
+    RegularExecutionPolicyError, ReservedRegularSubmit, SubmitOutcome,
 };
 use reap_risk::{RiskDecision, RiskGate};
 use reap_storage::{
     AccountSnapshotRecord, FillRecord, OrderAckRecord, OrderAckStatus, OrderOperation,
-    ReconciliationRecord, SafetyLatchRecord, SafetyLatchScope, SafetyLatchSource, StorageRecord,
+    ProvenRegularOrderBinding, ProvenRegularSubmitRequest, ReconciliationRecord, SafetyLatchRecord,
+    SafetyLatchScope, SafetyLatchSource, StorageRecord,
 };
 use reap_strategy::{ChaosExecutionIntent, ChaosStrategy};
 use thiserror::Error;
 
 use crate::forbidden_orders::ForbiddenOrderEvent;
-use crate::regular_execution::{
-    OwnedRegularOrders, RegularExecutionPolicy, RegularExecutionPolicyError,
-};
+use crate::regular_execution::regular_execution_policy;
 use crate::{LiveConfig, ReadinessSnapshot, StartupError, StartupGate, VerifiedBootstrap};
 
-#[derive(Debug, Clone)]
-pub struct SubmitAction {
-    pub ts_ms: TimeMs,
-    pub account_id: String,
-    pub idempotency_key: String,
-    pub client_order_id: String,
-    pub order: reap_core::NewOrder,
+#[derive(Debug)]
+pub(crate) struct SubmitAction {
+    ts_ms: TimeMs,
+    idempotency_key: String,
+    reserved: ReservedRegularSubmit,
+}
+
+impl SubmitAction {
+    pub(crate) fn new(
+        ts_ms: TimeMs,
+        idempotency_key: String,
+        reserved: ReservedRegularSubmit,
+    ) -> Self {
+        Self {
+            ts_ms,
+            idempotency_key,
+            reserved,
+        }
+    }
+
+    pub(crate) fn ts_ms(&self) -> TimeMs {
+        self.ts_ms
+    }
+
+    pub(crate) fn account_id(&self) -> &str {
+        self.reserved.account_id()
+    }
+
+    pub(crate) fn idempotency_key(&self) -> &str {
+        &self.idempotency_key
+    }
+
+    pub(crate) fn client_order_id(&self) -> &str {
+        self.reserved.client_order_id()
+    }
+
+    pub(crate) fn order(&self) -> &reap_core::NewOrder {
+        self.reserved.order()
+    }
+
+    pub(crate) fn into_parts(self) -> (String, ReservedRegularSubmit) {
+        (self.idempotency_key, self.reserved)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CancelAction {
+    ts_ms: TimeMs,
+    approved: ApprovedRegularCancel,
+}
+
+impl CancelAction {
+    pub(crate) fn new(ts_ms: TimeMs, approved: ApprovedRegularCancel) -> Self {
+        Self { ts_ms, approved }
+    }
+
+    pub(crate) fn ts_ms(&self) -> TimeMs {
+        self.ts_ms
+    }
+
+    pub(crate) fn account_id(&self) -> &str {
+        self.approved.account_id()
+    }
+
+    pub(crate) fn symbol(&self) -> &str {
+        self.approved.symbol()
+    }
+
+    pub(crate) fn client_order_id(&self) -> &str {
+        self.approved.client_order_id()
+    }
+
+    pub(crate) fn reason(&self) -> &str {
+        self.approved.reason()
+    }
+
+    pub(crate) fn into_approved(self) -> ApprovedRegularCancel {
+        self.approved
+    }
 }
 
 #[derive(Debug, Clone)]
-pub struct CancelAction {
-    pub ts_ms: TimeMs,
-    pub account_id: String,
-    pub symbol: String,
-    pub client_order_id: String,
-    pub reason: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct ReconcileAction {
-    pub ts_ms: TimeMs,
-    pub account_id: String,
-    pub reason: String,
+pub(crate) struct ReconcileAction {
+    pub(crate) ts_ms: TimeMs,
+    pub(crate) account_id: String,
+    pub(crate) reason: String,
 }
 
 #[derive(Debug, Clone)]
@@ -59,8 +122,8 @@ pub struct ReconciliationResult {
     pub reason: String,
 }
 
-#[derive(Debug, Clone)]
-pub enum LiveAction {
+#[derive(Debug)]
+pub(crate) enum LiveAction {
     Submit(SubmitAction),
     Cancel(CancelAction),
     RecoverBook(RecoveryRequest),
@@ -69,11 +132,19 @@ pub enum LiveAction {
 
 #[derive(Debug, Default)]
 pub struct CoordinatorOutput {
-    pub actions: Vec<LiveAction>,
+    pub(crate) actions: Vec<LiveAction>,
     pub records: Vec<StorageRecord>,
 }
 
 impl CoordinatorOutput {
+    pub fn action_count(&self) -> usize {
+        self.actions.len()
+    }
+
+    pub fn record_count(&self) -> usize {
+        self.records.len()
+    }
+
     fn extend(&mut self, other: Self) {
         self.actions.extend(other.actions);
         self.records.extend(other.records);
@@ -109,13 +180,23 @@ pub enum CoordinatorError {
     AccountStatePolicy { account_id: String, message: String },
     #[error("regular execution policy failed: {0}")]
     RegularExecutionPolicy(String),
+    #[error("durable regular-submit proof does not match recovered order {order_id}: {message}")]
+    RecoveredOrderProof { order_id: String, message: String },
     #[error(transparent)]
     Startup(#[from] StartupError),
 }
 
 impl From<RegularExecutionPolicyError> for CoordinatorError {
     fn from(error: RegularExecutionPolicyError) -> Self {
-        Self::RegularExecutionPolicy(error.to_string())
+        match error {
+            RegularExecutionPolicyError::ClientIdSetup { account_id, source } => {
+                Self::ClientIdSetup {
+                    account_id,
+                    message: source.to_string(),
+                }
+            }
+            error => Self::RegularExecutionPolicy(error.to_string()),
+        }
     }
 }
 
@@ -139,21 +220,16 @@ impl LiveCoordinator {
     pub fn new(
         config: LiveConfig,
         verified: VerifiedBootstrap,
-        gateway_actions_enabled: bool,
+        approval_scopes: HashMap<String, RegularApprovalScope>,
         session_id: impl Into<String>,
     ) -> Result<Self, CoordinatorError> {
-        let gateway_action_accounts = if gateway_actions_enabled {
-            config.required_accounts()
-        } else {
-            HashSet::new()
-        };
-        Self::new_with_order_transports(config, verified, gateway_action_accounts, session_id)
+        Self::new_with_order_transports(config, verified, approval_scopes, session_id)
     }
 
     pub fn new_with_order_transports(
         config: LiveConfig,
         verified: VerifiedBootstrap,
-        gateway_action_accounts: HashSet<String>,
+        approval_scopes: HashMap<String, RegularApprovalScope>,
         session_id: impl Into<String>,
     ) -> Result<Self, CoordinatorError> {
         let session_id = session_id.into();
@@ -162,7 +238,9 @@ impl LiveCoordinator {
         }
         let strategy = ChaosStrategy::new(config.strategy.clone())
             .map_err(|error| CoordinatorError::Strategy(error.to_string()))?;
-        let regular_execution = RegularExecutionPolicy::from_verified(&config, &verified)?;
+        let gateway_action_accounts = approval_scopes.keys().cloned().collect::<HashSet<_>>();
+        let (regular_execution, client_ids) =
+            regular_execution_policy(&config, &verified, approval_scopes)?;
         let mut risk = RiskGate::new(config.risk.clone());
         for instrument in verified.instruments.values() {
             risk.set_instrument_model(instrument.symbol.clone(), instrument.risk_model);
@@ -173,7 +251,6 @@ impl LiveCoordinator {
         startup.mark_metadata_verified();
         let order_entry_enabled = !gateway_action_accounts.is_empty();
         let mut private_states = HashMap::new();
-        let mut client_ids = HashMap::new();
         // Baseline keys predate this session and recovered fill keys are already
         // durable, so neither should be appended again when private streams race.
         let journal_fill_keys_by_account = verified.baseline_fill_ids.clone();
@@ -186,15 +263,6 @@ impl LiveCoordinator {
                 state.apply_account(update.clone());
             }
             private_states.insert(account.id.clone(), state);
-            client_ids.insert(
-                account.id.clone(),
-                ClientOrderIdGenerator::new(&account.id_prefix, account.node_id).map_err(
-                    |error| CoordinatorError::ClientIdSetup {
-                        account_id: account.id.clone(),
-                        message: error.to_string(),
-                    },
-                )?,
-            );
         }
         Ok(Self {
             config,
@@ -321,9 +389,22 @@ impl LiveCoordinator {
 
     pub(crate) fn restore_owned_order(
         &mut self,
-        account_id: &str,
+        proof: ProvenRegularSubmitRequest,
         update: reap_core::OrderUpdate,
     ) -> Result<CoordinatorOutput, CoordinatorError> {
+        let account_id = proof.account_id().to_string();
+        if proof.symbol() != update.symbol || proof.client_order_id() != update.order_id {
+            return Err(CoordinatorError::RecoveredOrderProof {
+                order_id: update.order_id.clone(),
+                message: format!(
+                    "proof identifies {}/{} but update identifies {}/{}",
+                    proof.symbol(),
+                    proof.client_order_id(),
+                    update.symbol,
+                    update.order_id
+                ),
+            });
+        }
         let expected = self
             .config
             .account_for_symbol(&update.symbol)
@@ -333,40 +414,43 @@ impl LiveCoordinator {
             return Err(CoordinatorError::WrongOrderAccount {
                 order_id: update.order_id.clone(),
                 symbol: update.symbol.clone(),
-                actual: account_id.to_string(),
+                actual: account_id,
                 expected,
             });
         }
-        self.regular_execution
-            .validate_recovered_identity(account_id, &update.symbol)?;
-        self.owned_regular_orders.register_recovered(
-            account_id,
-            &update.symbol,
-            &update.order_id,
-            None,
-        )?;
-        self.private_state_mut(account_id)?
+        self.owned_regular_orders
+            .register_recovered(&self.regular_execution, proof)?;
+        self.private_state_mut(&account_id)?
             .restore_order_update(update.clone());
         Ok(self.process_normalized(NormalizedEvent::Order(update)))
     }
 
-    pub fn restore_order_binding(
+    pub(crate) fn restore_order_binding(
         &mut self,
-        account_id: &str,
-        client_order_id: &str,
-        exchange_order_id: &str,
+        binding: ProvenRegularOrderBinding,
     ) -> Result<(), CoordinatorError> {
+        let account_id = binding.account_id().to_string();
+        let client_order_id = binding.client_order_id().to_string();
+        let exchange_order_id = binding.exchange_order_id().to_string();
+        if !self.owned_regular_orders.proves_identity(
+            &client_order_id,
+            &account_id,
+            binding.symbol(),
+        ) {
+            return Err(CoordinatorError::RecoveredOrderProof {
+                order_id: client_order_id.to_string(),
+                message: "durable exchange binding does not match restored owned identity"
+                    .to_string(),
+            });
+        }
         self.owned_regular_orders.bind_exchange_order_id(
-            account_id,
-            client_order_id,
-            exchange_order_id,
+            &account_id,
+            &client_order_id,
+            &exchange_order_id,
         )?;
-        self.private_state_mut(account_id)?
-            .bind_exchange_order_id(client_order_id, exchange_order_id)
-            .map_err(|source| CoordinatorError::PrivateOrderIdentity {
-                account_id: account_id.to_string(),
-                source,
-            })
+        self.private_state_mut(&account_id)?
+            .bind_exchange_order_id(&client_order_id, &exchange_order_id)
+            .map_err(|source| CoordinatorError::PrivateOrderIdentity { account_id, source })
     }
 
     pub fn process_feed(
@@ -461,10 +545,7 @@ impl LiveCoordinator {
                     .map(|order| (order.symbol.clone(), order.status));
                 let proven_owned = canonical_identity.as_ref().is_some_and(|(symbol, _)| {
                     self.owned_regular_orders
-                        .get(&canonical_id)
-                        .is_some_and(|owned| {
-                            owned.account_id() == account_id && owned.symbol() == symbol
-                        })
+                        .proves_identity(&canonical_id, &account_id, symbol)
                 });
                 if !proven_owned {
                     let active = canonical_identity.as_ref().is_some_and(|(_, status)| {
@@ -708,14 +789,9 @@ impl LiveCoordinator {
                 expected,
             });
         }
-        self.regular_execution
-            .validate_recovered_identity(account_id, &order.symbol)?;
-        self.owned_regular_orders.register_recovered(
-            account_id,
-            &order.symbol,
-            client_order_id,
-            None,
-        )?;
+        let proof = test_recovered_submit_proof(account_id, &order.symbol, client_order_id);
+        self.owned_regular_orders
+            .register_recovered(&self.regular_execution, proof)?;
         let update = self.private_state_mut(account_id)?.register_local_order_at(
             client_order_id,
             order,
@@ -1274,9 +1350,9 @@ impl LiveCoordinator {
                     .get(&account_id)
                     .expect("validated account must have a client id generator")
                     .next(now_ms);
-                let pending = match self.owned_regular_orders.reserve_local(
-                    &approved,
-                    &client_order_id,
+                let (pending, reserved) = match self.owned_regular_orders.reserve_local(
+                    approved,
+                    client_order_id,
                     self.private_states
                         .get_mut(&account_id)
                         .expect("validated account must have private state"),
@@ -1288,14 +1364,11 @@ impl LiveCoordinator {
                         return;
                     }
                 };
-                let (approved_account_id, order) = approved.into_parts();
-                output.actions.push(LiveAction::Submit(SubmitAction {
-                    ts_ms: now_ms,
-                    account_id: approved_account_id,
+                output.actions.push(LiveAction::Submit(SubmitAction::new(
+                    now_ms,
                     idempotency_key,
-                    client_order_id: client_order_id.clone(),
-                    order: order.clone(),
-                }));
+                    reserved,
+                )));
                 output.extend(self.process_normalized(NormalizedEvent::Order(pending)));
             }
             ChaosExecutionIntent::CancelOwned(cancel) => {
@@ -1358,22 +1431,20 @@ impl LiveCoordinator {
                 return;
             }
         };
-        let (account_id, symbol, client_order_id, reason) = approved.into_parts();
-        if !self.gateway_action_accounts.contains(&account_id) {
+        if !self.gateway_action_accounts.contains(approved.account_id()) {
             output.records.push(StorageRecord::IntentRejected {
                 ts_ms: now_ms,
                 intent: legacy,
-                reason: format!("account {account_id} has no planned regular order transport"),
+                reason: format!(
+                    "account {} has no planned regular order transport",
+                    approved.account_id()
+                ),
             });
             return;
         }
-        output.actions.push(LiveAction::Cancel(CancelAction {
-            ts_ms: now_ms,
-            account_id,
-            symbol,
-            client_order_id,
-            reason,
-        }));
+        output
+            .actions
+            .push(LiveAction::Cancel(CancelAction::new(now_ms, approved)));
     }
 
     fn reject_execution_policy(
@@ -1421,8 +1492,8 @@ impl LiveCoordinator {
             .actions
             .iter()
             .filter_map(|action| match action {
-                LiveAction::Cancel(cancel) if cancel.account_id == account_id => {
-                    Some(cancel.client_order_id.clone())
+                LiveAction::Cancel(cancel) if cancel.account_id() == account_id => {
+                    Some(cancel.client_order_id().to_string())
                 }
                 _ => None,
             })
@@ -1443,8 +1514,7 @@ impl LiveCoordinator {
             })
             .filter(|(order_id, _)| {
                 self.owned_regular_orders
-                    .get(order_id)
-                    .is_some_and(|owned| owned.account_id() == account_id)
+                    .proves_account(order_id, account_id)
             })
             .map(|(order_id, _)| order_id.to_string())
             .filter(|order_id| !existing.contains(order_id))
@@ -1604,8 +1674,43 @@ fn scope_account_update(account_id: &str, update: &mut reap_core::AccountUpdate)
 }
 
 #[cfg(test)]
+fn test_recovered_submit_proof(
+    account_id: &str,
+    symbol: &str,
+    client_order_id: &str,
+) -> ProvenRegularSubmitRequest {
+    let request = StorageRecord::OrderRequest(reap_storage::OrderRequestRecord {
+        ts_ms: 1,
+        account_id: account_id.to_string(),
+        operation: OrderOperation::Submit,
+        idempotency_key: Some(format!("test:{account_id}:{client_order_id}")),
+        client_order_id: Some(client_order_id.to_string()),
+        exchange_order_id: None,
+        symbol: symbol.to_string(),
+    });
+    let mut journal = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 7,
+        "record": request,
+    }))
+    .expect("test regular-submit request must serialize");
+    journal.push(b'\n');
+    let directory = tempfile::tempdir().expect("test journal directory must exist");
+    let path = directory.path().join("coordinator-proof.jsonl");
+    std::fs::write(&path, journal).expect("test journal must be written");
+    let mut lease =
+        reap_storage::acquire_storage_lease(&path).expect("test journal must be leased");
+    reap_storage::recover_leased_jsonl(&mut lease)
+        .expect("test regular-submit request must recover under its lease")
+        .proven_regular_submit_requests
+        .into_values()
+        .next()
+        .expect("test recovery must produce a regular-submit proof")
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
 
     use reap_core::{
         AccountUpdate, Balance, FillFee, FillKey, FillLiquidity, Level, MarketEvent, NewOrder,
@@ -1613,13 +1718,19 @@ mod tests {
         SystemEvent, SystemEventKind, TimeInForce, TimeMs, Venue,
     };
     use reap_feed::FeedOutput;
-    use reap_order::{ReconcileIssue, reconcile, reconcile_full_state};
+    use reap_order::{
+        OkxOrderGateway, PacingPolicy, PreparedRegularCancel, ReconcileIssue, RegularExecution,
+        RegularReconciliation, reconcile, reconcile_full_state,
+    };
     use reap_risk::{
         InstrumentOrderLimits, InstrumentRiskModel, RiskDecision, RiskLimits, RiskRejectReason,
         StablecoinGuardConfig,
     };
     use reap_strategy::{ChaosConfig, ReferenceDataKind};
-    use reap_venue::okx::{OkxAccountLevel, OkxInstrumentType, OkxPositionMode};
+    use reap_venue::okx::{
+        OkxAccountLevel, OkxFillPage, OkxInstrumentType, OkxOrderAck, OkxPositionMode,
+        OkxRegularOrderPage, RestError,
+    };
     use reap_venue::{PrivateOrderState, PrivateOrderUpdate, RemoteFill, RemoteOrder};
 
     use crate::forbidden_orders::{ForbiddenOrderEvent, ForbiddenOrderState};
@@ -1629,6 +1740,92 @@ mod tests {
     };
 
     use super::*;
+
+    #[derive(Debug)]
+    struct ScopeOnlyGatewayRoles;
+
+    #[async_trait::async_trait]
+    impl RegularExecution for ScopeOnlyGatewayRoles {
+        async fn cancel_regular_order(
+            &self,
+            _cancel: PreparedRegularCancel,
+        ) -> Result<OkxOrderAck, RestError> {
+            unreachable!("scope-only test gateway never executes orders")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RegularReconciliation for ScopeOnlyGatewayRoles {
+        async fn regular_pending_orders_page(
+            &self,
+            _instrument_type: Option<&str>,
+            _symbol: Option<&str>,
+            _after: Option<&str>,
+        ) -> Result<OkxRegularOrderPage, RestError> {
+            unreachable!("scope-only test gateway never reconciles orders")
+        }
+
+        async fn recent_fills_page(
+            &self,
+            _instrument_type: Option<&str>,
+            _symbol: Option<&str>,
+            _after: Option<&str>,
+        ) -> Result<OkxFillPage, RestError> {
+            unreachable!("scope-only test gateway never reconciles fills")
+        }
+
+        async fn account_balance(&self) -> Result<AccountUpdate, RestError> {
+            unreachable!("scope-only test gateway never fetches balances")
+        }
+
+        async fn account_positions(&self) -> Result<AccountUpdate, RestError> {
+            unreachable!("scope-only test gateway never fetches positions")
+        }
+
+        async fn order_details(
+            &self,
+            _symbol: &str,
+            _client_order_id: &str,
+        ) -> Result<RemoteOrder, RestError> {
+            unreachable!("scope-only test gateway never fetches order details")
+        }
+
+        async fn server_time_ms(&self) -> Result<u64, RestError> {
+            unreachable!("scope-only test gateway never fetches server time")
+        }
+    }
+
+    fn approval_scopes(
+        account_ids: impl IntoIterator<Item = &'static str>,
+    ) -> HashMap<String, RegularApprovalScope> {
+        let roles = Arc::new(ScopeOnlyGatewayRoles);
+        account_ids
+            .into_iter()
+            .map(|account_id| {
+                let mut gateway = OkxOrderGateway::new(
+                    account_id,
+                    Box::new(ScopeOnlyGatewayRoles),
+                    roles.clone(),
+                    HashMap::new(),
+                    PacingPolicy::default(),
+                )
+                .expect("scope-only test gateway must be valid");
+                let scope = gateway
+                    .take_approval_scope()
+                    .expect("test gateway must yield its approval scope once");
+                (account_id.to_string(), scope)
+            })
+            .collect()
+    }
+
+    fn restore_test_owned_order(
+        coordinator: &mut LiveCoordinator,
+        account_id: &str,
+        update: OrderUpdate,
+    ) -> Result<CoordinatorOutput, CoordinatorError> {
+        let proof = test_recovered_submit_proof(account_id, &update.symbol, &update.order_id);
+        coordinator.restore_owned_order(proof, update)
+    }
 
     fn coordinator_with_gateway_actions(gateway_actions_enabled: bool) -> LiveCoordinator {
         coordinator_with_risk(
@@ -1733,7 +1930,12 @@ mod tests {
             baseline_fill_ids: HashMap::from([("main".to_string(), HashSet::new())]),
             quote_stp_verified_accounts: HashSet::from(["main".to_string()]),
         };
-        LiveCoordinator::new(config, verified, gateway_actions_enabled, "test-session").unwrap()
+        let approval_scopes = if gateway_actions_enabled {
+            approval_scopes(["main"])
+        } else {
+            HashMap::new()
+        };
+        LiveCoordinator::new(config, verified, approval_scopes, "test-session").unwrap()
     }
 
     fn coordinator() -> LiveCoordinator {
@@ -1813,7 +2015,13 @@ mod tests {
             ]),
             quote_stp_verified_accounts: HashSet::from(["main".to_string(), "hedge".to_string()]),
         };
-        LiveCoordinator::new(config, verified, true, "two-account-test").unwrap()
+        LiveCoordinator::new(
+            config,
+            verified,
+            approval_scopes(["main", "hedge"]),
+            "two-account-test",
+        )
+        .unwrap()
     }
 
     fn account_update(account_id: &str, ts_ms: TimeMs) -> AccountUpdate {
@@ -2314,7 +2522,7 @@ mod tests {
                 .contains_key("strategy_reference:price_limits:BTC-USDT")
         );
         assert!(output.actions.iter().any(|action| {
-            matches!(action, LiveAction::Cancel(cancel) if cancel.client_order_id == "reference-q1")
+            matches!(action, LiveAction::Cancel(cancel) if cancel.client_order_id() == "reference-q1")
         }));
     }
 
@@ -2341,7 +2549,7 @@ mod tests {
         assert_eq!(readiness.missing_reconciliation, vec!["main"]);
         assert!(output.actions.iter().any(|action| matches!(
             action,
-            LiveAction::Cancel(cancel) if cancel.client_order_id == "client-1"
+            LiveAction::Cancel(cancel) if cancel.client_order_id() == "client-1"
         )));
         assert!(output.actions.iter().any(|action| matches!(
             action,
@@ -2610,7 +2818,7 @@ mod tests {
         assert!(latched.actions.iter().any(|action| {
             matches!(
                 action,
-                LiveAction::Cancel(cancel) if cancel.client_order_id == "live-1"
+                LiveAction::Cancel(cancel) if cancel.client_order_id() == "live-1"
             )
         }));
     }
@@ -3062,7 +3270,7 @@ mod tests {
             );
             assert!(!coordinator.readiness().is_ready());
             assert!(output.actions.iter().all(|action| {
-                !matches!(action, LiveAction::Cancel(cancel) if cancel.client_order_id == foreign_id)
+                !matches!(action, LiveAction::Cancel(cancel) if cancel.client_order_id() == foreign_id)
             }));
             assert!(output.actions.iter().any(|action| {
                 matches!(action, LiveAction::Reconcile(reconcile) if reconcile.account_id == "main")
@@ -3117,7 +3325,7 @@ mod tests {
                 reason: "test fail-closed cancellation".to_string(),
             }));
             assert!(safety.actions.iter().all(|action| {
-                !matches!(action, LiveAction::Cancel(cancel) if cancel.client_order_id == foreign_id)
+                !matches!(action, LiveAction::Cancel(cancel) if cancel.client_order_id() == foreign_id)
             }));
             assert!(safety.records.iter().any(|record| matches!(
                 record,
@@ -3217,30 +3425,30 @@ mod tests {
             },
         );
         ready(&mut coordinator);
-        coordinator
-            .restore_owned_order(
-                "main",
-                OrderUpdate {
-                    ts_ms: 2,
-                    order_id: "live-order".to_string(),
-                    symbol: "BTC-USDT".to_string(),
-                    side: Side::Buy,
-                    event: OrderEvent::New,
-                    status: OrderStatus::Live,
-                    price: 100.0,
-                    time_in_force: Some(TimeInForce::PostOnly),
-                    qty: 1.0,
-                    open_qty: 1.0,
-                    filled_qty: 0.0,
-                    avg_fill_price: 0.0,
-                    last_fill_qty: 0.0,
-                    last_fill_price: 0.0,
-                    last_fill_liquidity: None,
-                    last_fill_fee: None,
-                    reason: "quote".to_string(),
-                },
-            )
-            .unwrap();
+        restore_test_owned_order(
+            &mut coordinator,
+            "main",
+            OrderUpdate {
+                ts_ms: 2,
+                order_id: "live-order".to_string(),
+                symbol: "BTC-USDT".to_string(),
+                side: Side::Buy,
+                event: OrderEvent::New,
+                status: OrderStatus::Live,
+                price: 100.0,
+                time_in_force: Some(TimeInForce::PostOnly),
+                qty: 1.0,
+                open_qty: 1.0,
+                filled_qty: 0.0,
+                avg_fill_price: 0.0,
+                last_fill_qty: 0.0,
+                last_fill_price: 0.0,
+                last_fill_liquidity: None,
+                last_fill_fee: None,
+                reason: "quote".to_string(),
+            },
+        )
+        .unwrap();
         coordinator
             .register_local_order("main", "reject-1", order(), 3)
             .unwrap();
@@ -3273,7 +3481,7 @@ mod tests {
         )));
         assert!(second.actions.iter().any(|action| matches!(
             action,
-            LiveAction::Cancel(cancel) if cancel.client_order_id == "live-order"
+            LiveAction::Cancel(cancel) if cancel.client_order_id() == "live-order"
         )));
     }
 
@@ -3290,30 +3498,30 @@ mod tests {
             },
         );
         ready(&mut coordinator);
-        coordinator
-            .restore_owned_order(
-                "main",
-                OrderUpdate {
-                    ts_ms: 2,
-                    order_id: "live-order".to_string(),
-                    symbol: "BTC-USDT".to_string(),
-                    side: Side::Sell,
-                    event: OrderEvent::New,
-                    status: OrderStatus::Live,
-                    price: 101.0,
-                    time_in_force: Some(TimeInForce::PostOnly),
-                    qty: 0.1,
-                    open_qty: 0.1,
-                    filled_qty: 0.0,
-                    avg_fill_price: 0.0,
-                    last_fill_qty: 0.0,
-                    last_fill_price: 0.0,
-                    last_fill_liquidity: None,
-                    last_fill_fee: None,
-                    reason: "quote".to_string(),
-                },
-            )
-            .unwrap();
+        restore_test_owned_order(
+            &mut coordinator,
+            "main",
+            OrderUpdate {
+                ts_ms: 2,
+                order_id: "live-order".to_string(),
+                symbol: "BTC-USDT".to_string(),
+                side: Side::Sell,
+                event: OrderEvent::New,
+                status: OrderStatus::Live,
+                price: 101.0,
+                time_in_force: Some(TimeInForce::PostOnly),
+                qty: 0.1,
+                open_qty: 0.1,
+                filled_qty: 0.0,
+                avg_fill_price: 0.0,
+                last_fill_qty: 0.0,
+                last_fill_price: 0.0,
+                last_fill_liquidity: None,
+                last_fill_fee: None,
+                reason: "quote".to_string(),
+            },
+        )
+        .unwrap();
 
         let mut ioc = order();
         ioc.time_in_force = TimeInForce::Ioc;
@@ -3373,7 +3581,7 @@ mod tests {
         )));
         assert!(second.actions.iter().any(|action| matches!(
             action,
-            LiveAction::Cancel(cancel) if cancel.client_order_id == "live-order"
+            LiveAction::Cancel(cancel) if cancel.client_order_id() == "live-order"
         )));
     }
 
@@ -3390,30 +3598,30 @@ mod tests {
         );
         ready(&mut coordinator);
         coordinator.set_order_entry_enabled(false);
-        coordinator
-            .restore_owned_order(
-                "main",
-                OrderUpdate {
-                    ts_ms: 2,
-                    order_id: "live-order".to_string(),
-                    symbol: "BTC-USDT".to_string(),
-                    side: Side::Sell,
-                    event: OrderEvent::New,
-                    status: OrderStatus::Live,
-                    price: 101.0,
-                    time_in_force: Some(TimeInForce::PostOnly),
-                    qty: 0.1,
-                    open_qty: 0.1,
-                    filled_qty: 0.0,
-                    avg_fill_price: 0.0,
-                    last_fill_qty: 0.0,
-                    last_fill_price: 0.0,
-                    last_fill_liquidity: None,
-                    last_fill_fee: None,
-                    reason: "quote".to_string(),
-                },
-            )
-            .unwrap();
+        restore_test_owned_order(
+            &mut coordinator,
+            "main",
+            OrderUpdate {
+                ts_ms: 2,
+                order_id: "live-order".to_string(),
+                symbol: "BTC-USDT".to_string(),
+                side: Side::Sell,
+                event: OrderEvent::New,
+                status: OrderStatus::Live,
+                price: 101.0,
+                time_in_force: Some(TimeInForce::PostOnly),
+                qty: 0.1,
+                open_qty: 0.1,
+                filled_qty: 0.0,
+                avg_fill_price: 0.0,
+                last_fill_qty: 0.0,
+                last_fill_price: 0.0,
+                last_fill_liquidity: None,
+                last_fill_fee: None,
+                reason: "quote".to_string(),
+            },
+        )
+        .unwrap();
         for symbol in ["BTC-USDT", "BTC-PERP"] {
             coordinator.process_event(NormalizedEvent::Market(MarketEvent::Depth(
                 OrderBook::one_level(
@@ -3449,7 +3657,7 @@ mod tests {
         )));
         assert!(output.actions.iter().any(|action| matches!(
             action,
-            LiveAction::Cancel(cancel) if cancel.client_order_id == "live-order"
+            LiveAction::Cancel(cancel) if cancel.client_order_id() == "live-order"
         )));
     }
 
@@ -3496,7 +3704,7 @@ mod tests {
         assert!(!coordinator.readiness().is_ready());
         assert!(output.actions.iter().any(|action| matches!(
             action,
-            LiveAction::Cancel(cancel) if cancel.client_order_id == "client-1"
+            LiveAction::Cancel(cancel) if cancel.client_order_id() == "client-1"
         )));
         assert!(output.actions.iter().any(|action| matches!(
             action,
@@ -3514,30 +3722,30 @@ mod tests {
     fn forbidden_state_blocks_placement_cancels_owned_regular_and_requires_clean_reconcile() {
         let mut coordinator = coordinator();
         ready(&mut coordinator);
-        coordinator
-            .restore_owned_order(
-                "main",
-                OrderUpdate {
-                    ts_ms: 2,
-                    order_id: "live-order".to_string(),
-                    symbol: "BTC-USDT".to_string(),
-                    side: Side::Sell,
-                    event: OrderEvent::New,
-                    status: OrderStatus::Live,
-                    price: 101.0,
-                    time_in_force: Some(TimeInForce::PostOnly),
-                    qty: 0.1,
-                    open_qty: 0.1,
-                    filled_qty: 0.0,
-                    avg_fill_price: 0.0,
-                    last_fill_qty: 0.0,
-                    last_fill_price: 0.0,
-                    last_fill_liquidity: None,
-                    last_fill_fee: None,
-                    reason: "quote".to_string(),
-                },
-            )
-            .unwrap();
+        restore_test_owned_order(
+            &mut coordinator,
+            "main",
+            OrderUpdate {
+                ts_ms: 2,
+                order_id: "live-order".to_string(),
+                symbol: "BTC-USDT".to_string(),
+                side: Side::Sell,
+                event: OrderEvent::New,
+                status: OrderStatus::Live,
+                price: 101.0,
+                time_in_force: Some(TimeInForce::PostOnly),
+                qty: 0.1,
+                open_qty: 0.1,
+                filled_qty: 0.0,
+                avg_fill_price: 0.0,
+                last_fill_qty: 0.0,
+                last_fill_price: 0.0,
+                last_fill_liquidity: None,
+                last_fill_fee: None,
+                reason: "quote".to_string(),
+            },
+        )
+        .unwrap();
 
         let output = coordinator
             .on_forbidden_order_event(ForbiddenOrderEvent {
@@ -3552,7 +3760,7 @@ mod tests {
         assert!(!coordinator.readiness().is_ready());
         assert!(output.actions.iter().any(|action| matches!(
             action,
-            LiveAction::Cancel(cancel) if cancel.client_order_id == "live-order"
+            LiveAction::Cancel(cancel) if cancel.client_order_id() == "live-order"
         )));
         assert!(output.actions.iter().any(|action| matches!(
             action,
@@ -3616,10 +3824,10 @@ mod tests {
         for submit in submits {
             assert_eq!(
                 coordinator
-                    .private_state(&submit.account_id)
+                    .private_state(submit.account_id())
                     .unwrap()
                     .order_reducer()
-                    .get(&submit.client_order_id)
+                    .get(submit.client_order_id())
                     .unwrap()
                     .status,
                 OrderStatus::PendingNew
@@ -3649,8 +3857,7 @@ mod tests {
             last_fill_fee: None,
             reason: "quote".to_string(),
         };
-        coordinator
-            .restore_owned_order("main", restored)
+        restore_test_owned_order(&mut coordinator, "main", restored)
             .expect("checkpoint order should restore");
         let fill = RemoteFill {
             fill_id: "fill-1".to_string(),
@@ -3745,9 +3952,7 @@ mod tests {
             .actions
             .iter()
             .filter_map(|action| match action {
-                LiveAction::Cancel(cancel) => {
-                    Some((cancel.account_id.as_str(), cancel.client_order_id.as_str()))
-                }
+                LiveAction::Cancel(cancel) => Some((cancel.account_id(), cancel.client_order_id())),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -3836,10 +4041,7 @@ mod tests {
 
         assert!(output.actions.iter().any(|action| matches!(
             action,
-            LiveAction::Cancel(CancelAction {
-                client_order_id,
-                ..
-            }) if client_order_id == "client-1"
+            LiveAction::Cancel(cancel) if cancel.client_order_id() == "client-1"
         )));
         assert!(
             !output

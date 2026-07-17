@@ -14,7 +14,8 @@ use reap_core::{AccountUpdate, Channel, SelfTradePrevention, Side, TimeInForce, 
 use reap_feed::{BootstrapFactory, ConnectionError};
 use reap_okx_wire::{Client, Credentials, ReqwestTransport, Response, Transport};
 use reap_order::{
-    RegularExecution as RegularExecutionPort, RegularReconciliation as RegularReconciliationPort,
+    PreparedRegularCancel, PreparedRegularSubmit, RegularExecution as RegularExecutionPort,
+    RegularReconciliation as RegularReconciliationPort,
 };
 use reap_venue::okx::{
     OkxAccountBalanceSnapshot, OkxAccountConfig, OkxAccountPositionsSnapshot, OkxAlgoOrderPage,
@@ -60,6 +61,10 @@ const OKX_PRODUCTION_REST_HOSTS: &[&str] = &[
     "eea.okx.com",
     "tr.okx.com",
 ];
+const OKX_DEMO_PRIVATE_WEBSOCKET_HOSTS: &[&str] =
+    &["wspap.okx.com", "wsuspap.okx.com", "wseeapap.okx.com"];
+const OKX_PRODUCTION_PRIVATE_WEBSOCKET_HOSTS: &[&str] =
+    &["ws.okx.com", "wsus.okx.com", "wseea.okx.com"];
 
 pub const LIVE_READINESS_HTTP_ALLOWLIST: &[(&str, &str)] = &[
     ("GET", PUBLIC_TIME_PATH),
@@ -236,6 +241,63 @@ fn validate_rest_origin(rest_url: &str, demo_trading: bool) -> Result<(), Adapte
     Ok(())
 }
 
+fn validate_private_websocket_url(
+    private_websocket_url: &str,
+    demo_trading: bool,
+) -> Result<(), AdapterError> {
+    let invalid = |message: String| AdapterError::InvalidConfiguration(message);
+    let url = url::Url::parse(private_websocket_url)
+        .map_err(|error| invalid(format!("private websocket URL is invalid: {error}")))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| invalid("private websocket URL must contain a host".to_string()))?;
+    let loopback = is_loopback_host(host);
+    let demo_loopback = demo_trading && loopback;
+
+    if url.scheme() != "wss" && !(demo_loopback && url.scheme() == "ws") {
+        return Err(invalid(
+            "private websocket URL must use wss (loopback ws is demo-test only)".to_string(),
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(invalid(
+            "private websocket URL must not contain user information".to_string(),
+        ));
+    }
+    if url.path() != "/ws/v5/private" || url.query().is_some() || url.fragment().is_some() {
+        return Err(invalid(
+            "private websocket URL must use exact path /ws/v5/private without query or fragment"
+                .to_string(),
+        ));
+    }
+    if !demo_loopback && url.port() != Some(8443) {
+        return Err(invalid(
+            "private websocket URL must use explicit port 8443".to_string(),
+        ));
+    }
+    if loopback {
+        if demo_trading {
+            return Ok(());
+        }
+        return Err(invalid(
+            "private websocket URL loopback destination is demo-test only".to_string(),
+        ));
+    }
+
+    let allowed_hosts = if demo_trading {
+        OKX_DEMO_PRIVATE_WEBSOCKET_HOSTS
+    } else {
+        OKX_PRODUCTION_PRIVATE_WEBSOCKET_HOSTS
+    };
+    if !allowed_hosts.contains(&host.to_ascii_lowercase().as_str()) {
+        let environment = if demo_trading { "demo" } else { "production" };
+        return Err(invalid(format!(
+            "private websocket URL host is not a documented OKX {environment} destination"
+        )));
+    }
+    Ok(())
+}
+
 fn is_loopback_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost")
         || host
@@ -279,9 +341,9 @@ pub struct LiveReadiness {
     wire: Arc<dyn RoleWire>,
 }
 
-#[derive(Clone)]
 pub struct RegularExecution {
     wire: Arc<dyn RoleWire>,
+    expected_account_id: String,
 }
 
 #[derive(Clone)]
@@ -303,11 +365,12 @@ pub struct ForbiddenOrderObserver {
 pub struct PrivateStateSessionFactory {
     wire: Arc<dyn RoleWire>,
     allow_fills: bool,
+    demo_trading: bool,
 }
 
-#[derive(Clone)]
 pub struct RegularOrderSessionFactory {
     wire: Arc<dyn RoleWire>,
+    expected_account_id: String,
 }
 
 pub struct ObserveRoles {
@@ -319,9 +382,9 @@ pub struct ObserveRoles {
 
 pub struct DemoRoles {
     observe: ObserveRoles,
-    execution: RegularExecution,
+    execution: Option<RegularExecution>,
     safety: LiveSafety,
-    regular_order_sessions: RegularOrderSessionFactory,
+    regular_order_sessions: Option<RegularOrderSessionFactory>,
 }
 
 impl ObserveRoles {
@@ -347,16 +410,16 @@ impl DemoRoles {
         &self.observe
     }
 
-    pub fn execution(&self) -> RegularExecution {
-        self.execution.clone()
+    pub fn take_execution(&mut self) -> Option<RegularExecution> {
+        self.execution.take()
     }
 
     pub fn safety(&self) -> LiveSafety {
         self.safety.clone()
     }
 
-    pub fn regular_order_sessions(&self) -> RegularOrderSessionFactory {
-        self.regular_order_sessions.clone()
+    pub fn take_regular_order_sessions(&mut self) -> Option<RegularOrderSessionFactory> {
+        self.regular_order_sessions.take()
     }
 }
 
@@ -365,13 +428,15 @@ pub fn observe_from_env(
     credentials: CredentialEnvNames,
     allow_fills: bool,
 ) -> Result<ObserveRoles, AdapterError> {
+    let demo_trading = settings.demo_trading;
     let wire = production_wire(settings, credentials)?;
-    Ok(observe_roles(wire, allow_fills))
+    Ok(observe_roles(wire, allow_fills, demo_trading))
 }
 
 pub fn demo_from_env(
     settings: ConnectionSettings,
     credentials: CredentialEnvNames,
+    expected_account_id: impl Into<String>,
     allow_fills: bool,
 ) -> Result<DemoRoles, AdapterError> {
     if !settings.demo_trading {
@@ -379,16 +444,27 @@ pub fn demo_from_env(
             "regular mutation roles can only be constructed for demo trading".to_string(),
         ));
     }
+    let expected_account_id = expected_account_id.into();
+    if expected_account_id.trim().is_empty() {
+        return Err(AdapterError::InvalidConfiguration(
+            "regular mutation role account id must not be empty".to_string(),
+        ));
+    }
+    let demo_trading = settings.demo_trading;
     let wire = production_wire(settings, credentials)?;
     Ok(DemoRoles {
-        observe: observe_roles(Arc::clone(&wire), allow_fills),
-        execution: RegularExecution {
+        observe: observe_roles(Arc::clone(&wire), allow_fills, demo_trading),
+        execution: Some(RegularExecution {
             wire: Arc::clone(&wire),
-        },
+            expected_account_id: expected_account_id.clone(),
+        }),
         safety: LiveSafety {
             wire: Arc::clone(&wire),
         },
-        regular_order_sessions: RegularOrderSessionFactory { wire },
+        regular_order_sessions: Some(RegularOrderSessionFactory {
+            wire,
+            expected_account_id,
+        }),
     })
 }
 
@@ -409,7 +485,7 @@ fn production_wire(
     )))
 }
 
-fn observe_roles(wire: Arc<dyn RoleWire>, allow_fills: bool) -> ObserveRoles {
+fn observe_roles(wire: Arc<dyn RoleWire>, allow_fills: bool, demo_trading: bool) -> ObserveRoles {
     ObserveRoles {
         readiness: LiveReadiness {
             wire: Arc::clone(&wire),
@@ -420,7 +496,11 @@ fn observe_roles(wire: Arc<dyn RoleWire>, allow_fills: bool) -> ObserveRoles {
         forbidden: ForbiddenOrderObserver {
             wire: Arc::clone(&wire),
         },
-        private_state_sessions: PrivateStateSessionFactory { wire, allow_fills },
+        private_state_sessions: PrivateStateSessionFactory {
+            wire,
+            allow_fills,
+            demo_trading,
+        },
     }
 }
 
@@ -627,11 +707,23 @@ impl RegularReconciliationPort for RegularReconciliation {
 
 #[async_trait]
 impl RegularExecutionPort for RegularExecution {
-    async fn cancel_regular_order(&self, order: &OkxCancelOrder) -> Result<OkxOrderAck, RestError> {
-        let body = serialize_cancel(order)?;
-        let response = post_body(&self.wire, CANCEL_ORDER_PATH, &body).await?;
-        parse_okx_order_ack_response_json(&response, "cancel order")
+    async fn cancel_regular_order(
+        &self,
+        cancel: PreparedRegularCancel,
+    ) -> Result<OkxOrderAck, RestError> {
+        ensure_rest_account(&self.expected_account_id, cancel.account_id())?;
+        let order = regular_cancel_order(&cancel);
+        post_regular_cancel(&self.wire, &order).await
     }
+}
+
+async fn post_regular_cancel(
+    wire: &Arc<dyn RoleWire>,
+    order: &OkxCancelOrder,
+) -> Result<OkxOrderAck, RestError> {
+    let body = serialize_cancel(order)?;
+    let response = post_body(wire, CANCEL_ORDER_PATH, &body).await?;
+    parse_okx_order_ack_response_json(&response, "cancel order")
 }
 
 impl LiveSafety {
@@ -688,36 +780,54 @@ impl ForbiddenOrderObserver {
 }
 
 impl PrivateStateSessionFactory {
-    pub fn bootstrap_factory(&self) -> BootstrapFactory {
+    pub fn bootstrap_factory(
+        &self,
+        private_websocket_url: impl Into<String>,
+    ) -> Result<BootstrapFactory, AdapterError> {
+        let private_websocket_url = private_websocket_url.into();
+        validate_private_websocket_url(&private_websocket_url, self.demo_trading)?;
         let wire = Arc::clone(&self.wire);
         let allow_fills = self.allow_fills;
-        Arc::new(move |plan| {
-            if !plan.private {
-                return Ok(Vec::new());
-            }
-            if plan.venue != Venue::Okx {
-                return Err(ConnectionError::LoginFailed(
-                    "private OKX session received a non-OKX plan".to_string(),
-                ));
-            }
-            for subscription in &plan.subscriptions {
-                let allowed = match subscription.channel {
-                    Channel::Account | Channel::Orders | Channel::Positions => true,
-                    Channel::Fills => allow_fills,
-                    _ => false,
-                };
-                if !allowed || subscription.symbol.is_some() {
-                    return Err(ConnectionError::LoginFailed(format!(
-                        "private OKX session rejected channel {:?}",
-                        subscription.channel
-                    )));
-                }
-            }
-            wire.websocket_login()
-                .map(|payload| vec![payload])
-                .map_err(|error| ConnectionError::LoginFailed(error.to_string()))
-        })
+        Ok(BootstrapFactory::bind_private_websocket(
+            private_websocket_url,
+            move |plan| {
+                validate_private_state_plan(plan, allow_fills)?;
+                wire.websocket_login()
+                    .map(|payload| vec![payload])
+                    .map_err(|error| ConnectionError::LoginFailed(error.to_string()))
+            },
+        ))
     }
+}
+
+fn validate_private_state_plan(
+    plan: &reap_feed::SocketPlan,
+    allow_fills: bool,
+) -> Result<(), ConnectionError> {
+    if !plan.private {
+        return Err(ConnectionError::LoginFailed(
+            "private OKX session received a public plan".to_string(),
+        ));
+    }
+    if plan.venue != Venue::Okx {
+        return Err(ConnectionError::LoginFailed(
+            "private OKX session received a non-OKX plan".to_string(),
+        ));
+    }
+    for subscription in &plan.subscriptions {
+        let allowed = match subscription.channel {
+            Channel::Account | Channel::Orders | Channel::Positions => true,
+            Channel::Fills => allow_fills,
+            _ => false,
+        };
+        if !allowed || subscription.symbol.is_some() {
+            return Err(ConnectionError::LoginFailed(format!(
+                "private OKX session rejected channel {:?}",
+                subscription.channel
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl RegularOrderSessionFactory {
@@ -731,17 +841,62 @@ impl RegularOrderSessionFactory {
         &self,
         request_id: &str,
         expiry_ms: u64,
-        order: &OkxPlaceOrder,
+        prepared: PreparedRegularSubmit,
     ) -> Result<String, OkxWsOrderProtocolError> {
-        build_ws_place_request(request_id, expiry_ms, order)
+        ensure_ws_account(&self.expected_account_id, prepared.account_id())?;
+        build_ws_place_request(request_id, expiry_ms, &regular_place_order(&prepared))
     }
 
     pub fn cancel_request(
         &self,
         request_id: &str,
-        order: &OkxCancelOrder,
+        prepared: &PreparedRegularCancel,
     ) -> Result<String, OkxWsOrderProtocolError> {
-        build_ws_cancel_request(request_id, order)
+        ensure_ws_account(&self.expected_account_id, prepared.account_id())?;
+        build_ws_cancel_request(request_id, &regular_cancel_order(prepared))
+    }
+}
+
+fn ensure_rest_account(expected: &str, actual: &str) -> Result<(), RestError> {
+    if actual == expected {
+        return Ok(());
+    }
+    Err(RestError::InvalidField {
+        field: "accountId",
+        value: actual.to_string(),
+        message: format!("regular order belongs to account {actual}, expected {expected}"),
+    })
+}
+
+fn ensure_ws_account(expected: &str, actual: &str) -> Result<(), OkxWsOrderProtocolError> {
+    if actual == expected {
+        return Ok(());
+    }
+    Err(OkxWsOrderProtocolError::InvalidOrder(format!(
+        "regular order belongs to account {actual}, expected {expected}"
+    )))
+}
+
+fn regular_place_order(prepared: &PreparedRegularSubmit) -> OkxPlaceOrder {
+    let order = prepared.order();
+    OkxPlaceOrder {
+        symbol: order.symbol.clone(),
+        trade_mode: prepared.trade_mode(),
+        side: order.side,
+        time_in_force: order.time_in_force,
+        price: order.price,
+        qty: order.qty,
+        client_order_id: prepared.client_order_id().to_string(),
+        reduce_only: order.reduce_only,
+        self_trade_prevention: order.self_trade_prevention,
+    }
+}
+
+fn regular_cancel_order(prepared: &PreparedRegularCancel) -> OkxCancelOrder {
+    OkxCancelOrder {
+        symbol: prepared.symbol().to_string(),
+        exchange_order_id: None,
+        client_order_id: Some(prepared.client_order_id().to_string()),
     }
 }
 
@@ -942,8 +1097,21 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    use reap_core::{ConnId, FeedPriority, SelfTradePrevention, Side, Subscription, TimeInForce};
-    use reap_feed::SocketPlan;
+    use reap_core::{
+        ConnId, FeedPriority, NormalizedEvent, SelfTradePrevention, Side, Subscription, TimeInForce,
+    };
+    use reap_feed::{
+        ConnectionAttemptPacer, ConnectionStatusKind, ReconnectPolicy, SocketPlan,
+        spawn_supervised_feed,
+    };
+    use reap_order::{
+        OkxOrderGateway, OwnedRegularOrders, PacingPolicy, PrivateStateReducer,
+        RegularExecutionPolicy, RegularExecutionProfile, SubmitPreparation,
+    };
+    use reap_risk::{InstrumentOrderLimits, InstrumentRiskModel};
+    use reap_strategy::{
+        ChaosConfig, ChaosStrategy, InstrumentConfig, InstrumentKindConfig, RiskGroupConfig,
+    };
     use reap_venue::okx::OkxTradeMode;
 
     use super::*;
@@ -1303,19 +1471,22 @@ mod tests {
         ]);
         let execution = RegularExecution {
             wire: role_wire(&wire),
+            expected_account_id: "main".to_string(),
         };
         let safety = LiveSafety {
             wire: role_wire(&wire),
         };
 
-        execution
-            .cancel_regular_order(&OkxCancelOrder {
+        post_regular_cancel(
+            &execution.wire,
+            &OkxCancelOrder {
                 symbol: "BTC-USDT".to_string(),
-                exchange_order_id: Some("exchange-1".to_string()),
+                exchange_order_id: None,
                 client_order_id: Some("client-1".to_string()),
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await
+        .unwrap();
         safety.cancel_all_after(30).await.unwrap();
 
         assert_trace(
@@ -1323,8 +1494,7 @@ mod tests {
             &[
                 Call::Post(
                     CANCEL_ORDER_PATH.to_string(),
-                    r#"{"instId":"BTC-USDT","ordId":"exchange-1","clOrdId":"client-1"}"#
-                        .to_string(),
+                    r#"{"instId":"BTC-USDT","clOrdId":"client-1"}"#.to_string(),
                 ),
                 Call::Post(
                     CANCEL_ALL_AFTER_PATH.to_string(),
@@ -1355,26 +1525,16 @@ mod tests {
             }
         }
 
-        let wire = fake_wire(&[]);
-        let without_fills = PrivateStateSessionFactory {
-            wire: role_wire(&wire),
-            allow_fills: false,
-        }
-        .bootstrap_factory();
-
-        assert_eq!(
-            without_fills(&plan(
+        assert!(matches!(
+            validate_private_state_plan(
+                &plan(false, vec![subscription(Channel::Books, Some("BTC-USDT"))],),
                 false,
-                vec![subscription(Channel::Books, Some("BTC-USDT"))],
-            ))
-            .unwrap(),
-            Vec::<String>::new()
-        );
+            ),
+            Err(ConnectionError::LoginFailed(_))
+        ));
         for channel in [Channel::Account, Channel::Orders, Channel::Positions] {
-            assert_eq!(
-                without_fills(&plan(true, vec![subscription(channel, None)])).unwrap(),
-                vec!["login".to_string()]
-            );
+            validate_private_state_plan(&plan(true, vec![subscription(channel, None)]), false)
+                .unwrap();
         }
         for channel in [
             Channel::Fills,
@@ -1383,29 +1543,322 @@ mod tests {
             Channel::Custom("orders-algo".to_string()),
         ] {
             assert!(matches!(
-                without_fills(&plan(true, vec![subscription(channel, None)])),
+                validate_private_state_plan(&plan(true, vec![subscription(channel, None)]), false),
                 Err(ConnectionError::LoginFailed(_))
             ));
         }
         assert!(matches!(
-            without_fills(&plan(
-                true,
-                vec![subscription(Channel::Orders, Some("BTC-USDT"))],
-            )),
+            validate_private_state_plan(
+                &plan(true, vec![subscription(Channel::Orders, Some("BTC-USDT"))],),
+                false,
+            ),
             Err(ConnectionError::LoginFailed(_))
         ));
+        validate_private_state_plan(&plan(true, vec![subscription(Channel::Fills, None)]), true)
+            .unwrap();
+    }
 
-        let with_fills = PrivateStateSessionFactory {
-            wire: role_wire(&wire),
-            allow_fills: true,
+    #[test]
+    fn private_bootstrap_urls_are_exact_and_environment_scoped() {
+        for destination in [
+            "wss://wspap.okx.com:8443/ws/v5/private",
+            "wss://wsuspap.okx.com:8443/ws/v5/private",
+            "wss://wseeapap.okx.com:8443/ws/v5/private",
+            "ws://127.0.0.1:18082/ws/v5/private",
+            "ws://[::1]:18082/ws/v5/private",
+        ] {
+            validate_private_websocket_url(destination, true).unwrap();
         }
-        .bootstrap_factory();
-        assert_eq!(
-            with_fills(&plan(true, vec![subscription(Channel::Fills, None)],)).unwrap(),
-            vec!["login".to_string()]
+        for destination in [
+            "wss://ws.okx.com:8443/ws/v5/private",
+            "wss://wsus.okx.com:8443/ws/v5/private",
+            "wss://wseea.okx.com:8443/ws/v5/private",
+        ] {
+            validate_private_websocket_url(destination, false).unwrap();
+        }
+        for (destination, demo_trading, expected) in [
+            (
+                "wss://attacker.example:8443/ws/v5/private",
+                false,
+                "documented OKX production",
+            ),
+            (
+                "wss://ws.okx.com:8443/ws/v5/private",
+                true,
+                "documented OKX demo",
+            ),
+            (
+                "wss://wspap.okx.com:8443/ws/v5/private",
+                false,
+                "documented OKX production",
+            ),
+            (
+                "wss://ws.okx.com/ws/v5/private",
+                false,
+                "explicit port 8443",
+            ),
+            (
+                "wss://ws.okx.com:9443/ws/v5/private",
+                false,
+                "explicit port 8443",
+            ),
+            (
+                "wss://ws.okx.com:8443/ws/v5/public",
+                false,
+                "exact path /ws/v5/private",
+            ),
+            (
+                "wss://ws.okx.com:8443/ws/v5/private?redirect=1",
+                false,
+                "without query or fragment",
+            ),
+            (
+                "wss://key@ws.okx.com:8443/ws/v5/private",
+                false,
+                "must not contain user information",
+            ),
+            ("ws://ws.okx.com:8443/ws/v5/private", false, "must use wss"),
+            (
+                "wss://127.0.0.1:8443/ws/v5/private",
+                false,
+                "demo-test only",
+            ),
+        ] {
+            let error = validate_private_websocket_url(destination, demo_trading).unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?} for {destination:?}, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn demo_mutation_roles_are_released_exactly_once() {
+        let wire = fake_wire(&[]);
+        let role = role_wire(&wire);
+        let mut roles = DemoRoles {
+            observe: observe_roles(Arc::clone(&role), false, true),
+            execution: Some(RegularExecution {
+                wire: Arc::clone(&role),
+                expected_account_id: "main".to_string(),
+            }),
+            safety: LiveSafety {
+                wire: Arc::clone(&role),
+            },
+            regular_order_sessions: Some(RegularOrderSessionFactory {
+                wire: role,
+                expected_account_id: "main".to_string(),
+            }),
+        };
+
+        assert!(roles.take_execution().is_some());
+        assert!(roles.take_execution().is_none());
+        assert!(roles.take_regular_order_sessions().is_some());
+        assert!(roles.take_regular_order_sessions().is_none());
+        assert_trace(&wire, &[]);
+    }
+
+    #[tokio::test]
+    async fn private_state_role_cannot_sign_for_a_different_websocket_destination() {
+        let plan = SocketPlan {
+            conn_id: ConnId::new("private-destination-binding"),
+            venue: Venue::Okx,
+            private: true,
+            subscriptions: vec![Subscription::private(
+                Venue::Okx,
+                Channel::Orders,
+                FeedPriority::Critical,
+            )],
+        };
+        let bound_url = "ws://127.0.0.1:9/ws/v5/private";
+        let selected_url = "ws://127.0.0.1:10/ws/v5/private";
+        let wire = fake_wire(&[]);
+        let factory = PrivateStateSessionFactory {
+            wire: role_wire(&wire),
+            allow_fills: false,
+            demo_trading: true,
+        }
+        .bootstrap_factory(bound_url)
+        .unwrap();
+        let mut feed = spawn_supervised_feed(
+            Arc::new(reap_venue::okx::OkxAdapter::new(
+                "ws://127.0.0.1:8/ws/v5/public",
+                selected_url,
+            )),
+            vec![plan.clone()],
+            factory,
+            4,
+            ConnectionAttemptPacer::new(Duration::ZERO),
+            ReconnectPolicy::default(),
         );
 
-        assert_trace(&wire, &[Call::Login, Call::Login, Call::Login, Call::Login]);
+        let status = tokio::time::timeout(Duration::from_secs(2), feed.status.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.kind, ConnectionStatusKind::Fatal);
+        assert!(status.reason.contains(bound_url));
+        assert!(status.reason.contains(selected_url));
+        feed.shutdown().await;
+        assert_trace(&wire, &[]);
+
+        let wire = fake_wire(&[]);
+        let factory = PrivateStateSessionFactory {
+            wire: role_wire(&wire),
+            allow_fills: false,
+            demo_trading: true,
+        }
+        .bootstrap_factory(bound_url)
+        .unwrap();
+        let mut feed = spawn_supervised_feed(
+            Arc::new(reap_venue::okx::OkxAdapter::new(
+                "ws://127.0.0.1:8/ws/v5/public",
+                bound_url,
+            )),
+            vec![plan],
+            factory,
+            4,
+            ConnectionAttemptPacer::new(Duration::ZERO),
+            ReconnectPolicy::default(),
+        );
+
+        let status = tokio::time::timeout(Duration::from_secs(2), feed.status.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.kind, ConnectionStatusKind::Disconnected);
+        feed.shutdown().await;
+        assert_trace(&wire, &[Call::Login]);
+    }
+
+    #[test]
+    fn typed_strategy_authority_is_serialized_only_after_gateway_preparation() {
+        let mut strategy = ChaosStrategy::new(ChaosConfig {
+            ref_symbol: "BTC-USDT".to_string(),
+            delta_limit_usd: 50_000.0,
+            active_hedge_threshold_usd: 1_000.0,
+            min_hedge_interval_ms: 0,
+            risk_groups: vec![RiskGroupConfig {
+                name: "main".to_string(),
+                symbols: vec!["BTC-USDT".to_string(), "BTC-PERP".to_string()],
+                soft_delta_limit_usd: 25_000.0,
+                hard_delta_limit_usd: 40_000.0,
+                live_order_limit_usd: 100_000.0,
+                ..RiskGroupConfig::default()
+            }],
+            instruments: vec![
+                InstrumentConfig {
+                    symbol: "BTC-USDT".to_string(),
+                    risk_group: "main".to_string(),
+                    kind: InstrumentKindConfig::Spot,
+                    tick_size: 0.1,
+                    lot_size: 0.0001,
+                    min_trade_size: 0.0001,
+                    max_order_size_usd: 5_000.0,
+                    min_order_size_usd: 100.0,
+                    max_order_size: 1.0,
+                    ..InstrumentConfig::default()
+                },
+                InstrumentConfig {
+                    symbol: "BTC-PERP".to_string(),
+                    risk_group: "main".to_string(),
+                    kind: InstrumentKindConfig::Future,
+                    tick_size: 0.1,
+                    lot_size: 1.0,
+                    min_trade_size: 1.0,
+                    contract_value: 0.001,
+                    max_order_size_usd: 5_000.0,
+                    min_order_size_usd: 100.0,
+                    max_order_size: 200.0,
+                    min_position: -10_000.0,
+                    max_position: 10_000.0,
+                    ..InstrumentConfig::default()
+                },
+            ],
+            ..ChaosConfig::default()
+        })
+        .unwrap();
+        let intent = include_str!("../../../fixtures/normalized/chaos_quote_hedge.jsonl")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .flat_map(|line| {
+                let event = serde_json::from_str::<NormalizedEvent>(line).unwrap();
+                strategy.on_execution_event(&event.into_strategy_event())
+            })
+            .find(|intent| {
+                intent
+                    .as_quote()
+                    .is_some_and(|quote| quote.symbol() == "BTC-USDT")
+            })
+            .expect("fixture must emit a typed Chaos quote");
+        let wire = fake_wire(&[]);
+        let role = role_wire(&wire);
+        let mut gateway = OkxOrderGateway::new(
+            "main",
+            Box::new(RegularExecution {
+                wire: Arc::clone(&role),
+                expected_account_id: "main".to_string(),
+            }),
+            Arc::new(RegularReconciliation {
+                wire: Arc::clone(&role),
+            }),
+            std::collections::HashMap::from([("BTC-USDT".to_string(), OkxTradeMode::Cash)]),
+            PacingPolicy::default(),
+        )
+        .unwrap();
+        let (profile_set, client_order_id_generator) = gateway
+            .take_approval_scope()
+            .unwrap()
+            .bind_profiles_and_client_id_generator(
+                [RegularExecutionProfile::new(
+                    "BTC-USDT",
+                    "main",
+                    InstrumentRiskModel::Spot,
+                    InstrumentOrderLimits {
+                        max_limit_quantity: 1_000_000.0,
+                        max_limit_notional_usd: None,
+                    },
+                    0.1,
+                    0.0001,
+                    0.0001,
+                    true,
+                    false,
+                    true,
+                )],
+                "typed",
+                1,
+            )
+            .unwrap();
+        let policy = RegularExecutionPolicy::from_profile_sets([profile_set]).unwrap();
+        let approved = policy.authorize_submit(intent).unwrap();
+        let mut owned = OwnedRegularOrders::default();
+        let mut private_state = PrivateStateReducer::new();
+        let generated_client_order_id = client_order_id_generator.next(1);
+        let expected_client_order_id = generated_client_order_id.as_str().to_string();
+        let (_, reserved) = owned
+            .reserve_local(approved, generated_client_order_id, &mut private_state, 1)
+            .unwrap();
+        let SubmitPreparation::Ready(prepared) =
+            gateway.prepare_submit("typed-decision", reserved).unwrap()
+        else {
+            panic!("fresh typed decision must require transport");
+        };
+        assert_eq!(prepared.account_id(), "main");
+
+        let factory = RegularOrderSessionFactory {
+            wire: Arc::clone(&role),
+            expected_account_id: "main".to_string(),
+        };
+        let request = factory.place_request("typed1", 123_456, prepared).unwrap();
+        let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(request["op"], "order");
+        assert_eq!(request["expTime"], "123456");
+        assert_eq!(request["args"][0]["instId"], "BTC-USDT");
+        assert_eq!(request["args"][0]["tdMode"], "cash");
+        assert_eq!(request["args"][0]["clOrdId"], expected_client_order_id);
+        assert_eq!(request["args"][0]["ordType"], "post_only");
+        assert!(request["args"][0].get("account_id").is_none());
+        assert_trace(&wire, &[]);
     }
 
     #[test]
@@ -1413,36 +1866,35 @@ mod tests {
         let wire = fake_wire(&[]);
         let factory = RegularOrderSessionFactory {
             wire: role_wire(&wire),
+            expected_account_id: "main".to_string(),
         };
 
         assert_eq!(factory.login_message().unwrap(), "login");
-        let place = factory
-            .place_request(
-                "place1",
-                123_456,
-                &OkxPlaceOrder {
-                    symbol: "BTC-USDT".to_string(),
-                    trade_mode: OkxTradeMode::Cash,
-                    side: Side::Buy,
-                    time_in_force: TimeInForce::PostOnly,
-                    price: 100.5,
-                    qty: 0.25,
-                    client_order_id: "client-1".to_string(),
-                    reduce_only: false,
-                    self_trade_prevention: Some(SelfTradePrevention::CancelMaker),
-                },
-            )
-            .unwrap();
-        let cancel = factory
-            .cancel_request(
-                "cancel1",
-                &OkxCancelOrder {
-                    symbol: "BTC-USDT".to_string(),
-                    exchange_order_id: Some("exchange-1".to_string()),
-                    client_order_id: Some("client-1".to_string()),
-                },
-            )
-            .unwrap();
+        let place = build_ws_place_request(
+            "place1",
+            123_456,
+            &OkxPlaceOrder {
+                symbol: "BTC-USDT".to_string(),
+                trade_mode: OkxTradeMode::Cash,
+                side: Side::Buy,
+                time_in_force: TimeInForce::PostOnly,
+                price: 100.5,
+                qty: 0.25,
+                client_order_id: "client-1".to_string(),
+                reduce_only: false,
+                self_trade_prevention: Some(SelfTradePrevention::CancelMaker),
+            },
+        )
+        .unwrap();
+        let cancel = build_ws_cancel_request(
+            "cancel1",
+            &OkxCancelOrder {
+                symbol: "BTC-USDT".to_string(),
+                exchange_order_id: None,
+                client_order_id: Some("client-1".to_string()),
+            },
+        )
+        .unwrap();
 
         assert_eq!(
             place,
@@ -1450,7 +1902,7 @@ mod tests {
         );
         assert_eq!(
             cancel,
-            r#"{"id":"cancel1","op":"cancel-order","args":[{"clOrdId":"client-1","instId":"BTC-USDT","ordId":"exchange-1"}]}"#
+            r#"{"id":"cancel1","op":"cancel-order","args":[{"clOrdId":"client-1","instId":"BTC-USDT"}]}"#
         );
         let operation_trace = [&place, &cancel].map(|request| {
             serde_json::from_str::<serde_json::Value>(request).unwrap()["op"].clone()

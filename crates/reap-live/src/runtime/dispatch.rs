@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::Instant;
 
 use futures_util::FutureExt;
@@ -6,8 +7,8 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use reap_core::AccountUpdate;
 use reap_order::{
-    CancelOutcome, GatewayError, OkxOrderGateway, PreparedOrder, SubmitOutcome, SubmitPreparation,
-    okx_order_dispatch_key,
+    CancelOutcome, GatewayError, OkxOrderGateway, RegularSubmitCompletion, SubmitOutcome,
+    SubmitPreparation, okx_order_dispatch_key,
 };
 use reap_telemetry::{AlertDeliveryFailure, AlertRuntime, AlertSink, AlertStats};
 use reap_venue::{RemoteFill, RemoteOrder};
@@ -173,8 +174,7 @@ enum OrderTaskCompletion {
         dispatch_key: String,
         symbol: String,
         client_order_id: String,
-        prepared: PreparedOrder,
-        result: Result<reap_venue::okx::OkxOrderAck, GatewayError>,
+        completion: RegularSubmitCompletion,
         enqueued_at: Instant,
     },
     Cancel {
@@ -202,7 +202,17 @@ pub(super) async fn run_order_task(
     max_inflight: usize,
     max_pending: usize,
 ) {
-    let io = gateway.command_client();
+    let io = match gateway.take_command_dispatcher() {
+        Ok(io) => Arc::new(io),
+        Err(error) => {
+            let _ = events
+                .send(RuntimeEvent::Fatal(RuntimeTaskFailure::Gateway(format!(
+                    "account {account_id} command dispatcher setup failed: {error}"
+                ))))
+                .await;
+            return;
+        }
+    };
     let max_inflight = max_inflight.max(1);
     let max_pending = max_pending.max(1);
     let mut pending = HashMap::<String, VecDeque<OrderTaskCommand>>::new();
@@ -237,13 +247,29 @@ pub(super) async fn run_order_task(
                     action,
                     enqueued_at,
                 } => {
-                    let symbol = action.order.symbol.clone();
-                    let client_order_id = action.client_order_id;
-                    let preparation = match gateway.prepare_registered_submit(
-                        action.idempotency_key,
-                        action.order,
-                        client_order_id.clone(),
-                    ) {
+                    if action.account_id() != account_id {
+                        if events
+                            .send(RuntimeEvent::Fatal(RuntimeTaskFailure::Gateway(format!(
+                                "account {account_id} received submit authority for account {}",
+                                action.account_id()
+                            ))))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        make_dispatch_key_ready(
+                            &dispatch_key,
+                            &pending,
+                            &busy_dispatch_keys,
+                            &mut ready_dispatch_keys,
+                        );
+                        continue;
+                    }
+                    let symbol = action.order().symbol.clone();
+                    let client_order_id = action.client_order_id().to_string();
+                    let (idempotency_key, reserved) = action.into_parts();
+                    let preparation = match gateway.prepare_submit(idempotency_key, reserved) {
                         Ok(preparation) => preparation,
                         Err(error) => {
                             if events
@@ -293,13 +319,12 @@ pub(super) async fn run_order_task(
                     let io = io.clone();
                     inflight.push(
                         async move {
-                            let result = io.place_prepared(&prepared).await;
+                            let completion = io.place_prepared(prepared).await;
                             OrderTaskCompletion::Submit {
                                 dispatch_key,
                                 symbol,
                                 client_order_id,
-                                prepared,
-                                result,
+                                completion,
                                 enqueued_at,
                             }
                         }
@@ -310,15 +335,53 @@ pub(super) async fn run_order_task(
                     action,
                     enqueued_at,
                 } => {
-                    let symbol = action.symbol.clone();
-                    let client_order_id = action.client_order_id;
+                    if action.account_id() != account_id {
+                        if events
+                            .send(RuntimeEvent::Fatal(RuntimeTaskFailure::Gateway(format!(
+                                "account {account_id} received cancel authority for account {}",
+                                action.account_id()
+                            ))))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        make_dispatch_key_ready(
+                            &dispatch_key,
+                            &pending,
+                            &busy_dispatch_keys,
+                            &mut ready_dispatch_keys,
+                        );
+                        continue;
+                    }
+                    let symbol = action.symbol().to_string();
+                    let client_order_id = action.client_order_id().to_string();
+                    let prepared = match gateway.prepare_cancel(action.into_approved()) {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            if events
+                                .send(RuntimeEvent::Fatal(RuntimeTaskFailure::Gateway(format!(
+                                    "account {account_id} cancel preparation failed: {error}"
+                                ))))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            make_dispatch_key_ready(
+                                &dispatch_key,
+                                &pending,
+                                &busy_dispatch_keys,
+                                &mut ready_dispatch_keys,
+                            );
+                            continue;
+                        }
+                    };
                     busy_dispatch_keys.insert(dispatch_key.clone());
                     let io = io.clone();
                     inflight.push(
                         async move {
-                            let result = io
-                                .cancel(&symbol, None, Some(client_order_id.clone()))
-                                .await;
+                            let result = io.cancel_prepared(prepared).await;
                             OrderTaskCompletion::Cancel {
                                 dispatch_key,
                                 symbol,
@@ -371,8 +434,8 @@ pub(super) async fn run_order_task(
                     Some(command @ OrderTaskCommand::Submit { .. })
                     | Some(command @ OrderTaskCommand::Cancel { .. }) => {
                         let symbol = match &command {
-                            OrderTaskCommand::Submit { action, .. } => &action.order.symbol,
-                            OrderTaskCommand::Cancel { action, .. } => &action.symbol,
+                            OrderTaskCommand::Submit { action, .. } => &action.order().symbol,
+                            OrderTaskCommand::Cancel { action, .. } => action.symbol(),
                             OrderTaskCommand::Flush(_) | OrderTaskCommand::Shutdown => unreachable!(),
                         };
                         let dispatch_key = okx_order_dispatch_key(symbol);
@@ -417,11 +480,10 @@ async fn emit_order_task_completion(
         OrderTaskCompletion::Submit {
             symbol,
             client_order_id,
-            prepared,
-            result,
+            completion,
             enqueued_at,
             ..
-        } => match gateway.finish_submit(prepared, result) {
+        } => match gateway.finish_submit(completion) {
             Ok(outcome) => RuntimeEvent::SubmitComplete {
                 account_id: account_id.to_string(),
                 symbol,

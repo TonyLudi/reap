@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use reap_core::{NewOrder, Side, TimeInForce};
 use thiserror::Error;
 
+use crate::authority::RegularApprovalBinding;
+
 const COUNTER_MODULUS: u64 = 2_176_782_336;
 const SESSION_MODULUS: u64 = 1_679_616;
 const TIMESTAMP_MODULUS: u64 = 101_559_956_668_416;
@@ -20,10 +22,47 @@ pub struct ClientOrderIdGenerator {
     node_id: u16,
     session_id: u64,
     counter: AtomicU64,
+    binding: RegularApprovalBinding,
+}
+
+/// One-shot proof that a client-order ID came from the bounded generator.
+///
+/// The value can be inspected for logging and persistence, but only the order
+/// authority layer can consume it into a local ownership reservation.
+#[derive(Debug, PartialEq, Eq)]
+pub struct GeneratedClientOrderId {
+    value: String,
+    binding: RegularApprovalBinding,
+}
+
+impl GeneratedClientOrderId {
+    pub fn as_str(&self) -> &str {
+        &self.value
+    }
+
+    pub(crate) fn binding(&self) -> &RegularApprovalBinding {
+        &self.binding
+    }
+
+    pub(crate) fn into_string(self) -> String {
+        self.value
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(value: impl Into<String>, binding: RegularApprovalBinding) -> Self {
+        Self {
+            value: value.into(),
+            binding,
+        }
+    }
 }
 
 impl ClientOrderIdGenerator {
-    pub fn new(prefix: impl Into<String>, node_id: u16) -> Result<Self, ClientIdError> {
+    pub(crate) fn new(
+        prefix: impl Into<String>,
+        node_id: u16,
+        binding: RegularApprovalBinding,
+    ) -> Result<Self, ClientIdError> {
         let prefix = prefix.into();
         if prefix.is_empty()
             || prefix.len() > 8
@@ -38,10 +77,11 @@ impl ClientOrderIdGenerator {
             node_id,
             session_id: process_session_id(),
             counter: AtomicU64::new(0),
+            binding,
         })
     }
 
-    pub fn next(&self, ts_ms: u64) -> String {
+    pub fn next(&self, ts_ms: u64) -> GeneratedClientOrderId {
         let counter = self.counter.fetch_add(1, Ordering::Relaxed) % COUNTER_MODULUS;
         let id = format!(
             "{}{}{}{}{}",
@@ -52,7 +92,10 @@ impl ClientOrderIdGenerator {
             padded_base36(counter, 6)
         );
         debug_assert!(id.len() <= 32);
-        id
+        GeneratedClientOrderId {
+            value: id,
+            binding: self.binding.clone(),
+        }
     }
 }
 
@@ -229,14 +272,16 @@ mod tests {
 
     #[test]
     fn generated_ids_are_unique_valid_and_bounded() {
-        let generator = ClientOrderIdGenerator::new("reap", 7).unwrap();
+        let generator =
+            ClientOrderIdGenerator::new("reap", 7, RegularApprovalBinding::new()).unwrap();
         let first = generator.next(1_700_000_000_000);
         let second = generator.next(1_700_000_000_000);
 
         assert_ne!(first, second);
-        assert!(first.len() <= 32);
+        assert!(first.as_str().len() <= 32);
         assert!(
             first
+                .as_str()
                 .chars()
                 .all(|character| character.is_ascii_alphanumeric())
         );

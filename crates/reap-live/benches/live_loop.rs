@@ -226,8 +226,8 @@ fn benchmark_coordinator(workload: &[CaptureFrame]) -> Measurement<WorkCounters>
             let output = coordinator
                 .process_feed(output)
                 .expect("benchmark feed output must be accepted");
-            counters.records += output.records.len() as u64;
-            counters.actions += output.actions.len() as u64;
+            counters.records += output.record_count() as u64;
+            counters.actions += output.action_count() as u64;
             black_box(output);
         }
         counters
@@ -249,8 +249,8 @@ fn benchmark_parity(workload: &[CaptureFrame]) -> Measurement<WorkCounters> {
                     let output = coordinator
                         .process_feed(output)
                         .expect("benchmark feed output must be accepted");
-                    counters.records += output.records.len() as u64;
-                    counters.actions += output.actions.len() as u64;
+                    counters.records += output.record_count() as u64;
+                    counters.actions += output.action_count() as u64;
                     black_box(output);
                 }
             }
@@ -378,8 +378,9 @@ fn benchmark_coordinator_state() -> LiveCoordinator {
         baseline_fill_ids: HashMap::from([(ACCOUNT_ID.to_string(), HashSet::new())]),
         quote_stp_verified_accounts: HashSet::from([ACCOUNT_ID.to_string()]),
     };
-    let mut coordinator = LiveCoordinator::new(config, verified, false, "benchmark-session")
-        .expect("benchmark coordinator");
+    let mut coordinator =
+        LiveCoordinator::new(config, verified, HashMap::new(), "benchmark-session")
+            .expect("benchmark coordinator");
     coordinator.mark_storage_ready(true, "benchmark sink ready");
     coordinator.mark_public_connectivity(true, "redundant benchmark sources ready");
     coordinator

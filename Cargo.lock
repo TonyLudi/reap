@@ -1182,6 +1182,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "trybuild",
 ]
 
 [[package]]
@@ -1272,6 +1273,8 @@ dependencies = [
  "reap-feed",
  "reap-okx-wire",
  "reap-order",
+ "reap-risk",
+ "reap-strategy",
  "reap-venue",
  "serde",
  "serde_json",
@@ -1304,11 +1307,16 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "reap-core",
+ "reap-risk",
+ "reap-storage",
+ "reap-strategy",
  "reap-venue",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
+ "trybuild",
 ]
 
 [[package]]

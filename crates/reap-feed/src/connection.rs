@@ -47,6 +47,13 @@ pub enum ConnectionError {
     NonUtf8Payload,
     #[error("private websocket requires a login bootstrap message")]
     MissingPrivateLogin,
+    #[error(
+        "private websocket bootstrap is bound to {bound_url}, but the adapter selected {selected_url}"
+    )]
+    PrivateBootstrapDestinationMismatch {
+        bound_url: String,
+        selected_url: String,
+    },
     #[error("private websocket login timed out")]
     LoginTimeout,
     #[error("private websocket login failed: {0}")]
@@ -153,32 +160,25 @@ pub(crate) struct ConnectionRunOutcome {
     pub(crate) reached_ready: bool,
 }
 
-pub async fn run_connection_once(
+pub(crate) struct PreparedSubscription {
+    payload: String,
+    readiness: SubscriptionReadiness,
+}
+
+pub(crate) fn prepare_connection_subscription(
     adapter: &dyn VenueAdapter,
     plan: &SocketPlan,
-    bootstrap_messages: &[String],
-    output: &mpsc::Sender<RawEnvelope>,
-    status: &mpsc::Sender<ConnectionStatus>,
-    shutdown: &mut watch::Receiver<bool>,
-    recovery: &mut watch::Receiver<u64>,
-) -> Result<(), ConnectionError> {
-    run_connection_once_with_readiness(
-        adapter,
-        plan,
-        bootstrap_messages,
-        output,
-        status,
-        shutdown,
-        recovery,
-    )
-    .await
-    .result
+) -> Result<PreparedSubscription, ConnectionError> {
+    let payload = adapter.subscription_message(&plan.subscriptions)?;
+    let readiness = SubscriptionReadiness::from_request(&payload, plan.subscriptions.len())?;
+    Ok(PreparedSubscription { payload, readiness })
 }
 
 pub(crate) async fn run_connection_once_with_readiness(
-    adapter: &dyn VenueAdapter,
+    websocket_url: &str,
     plan: &SocketPlan,
     bootstrap_messages: &[String],
+    prepared_subscription: PreparedSubscription,
     output: &mpsc::Sender<RawEnvelope>,
     status: &mpsc::Sender<ConnectionStatus>,
     shutdown: &mut watch::Receiver<bool>,
@@ -189,11 +189,12 @@ pub(crate) async fn run_connection_once_with_readiness(
         if plan.private && bootstrap_messages.is_empty() {
             return Err(ConnectionError::MissingPrivateLogin);
         }
-        let subscription = adapter.subscription_message(&plan.subscriptions)?;
-        let subscription_readiness =
-            SubscriptionReadiness::from_request(&subscription, plan.subscriptions.len())?;
+        let PreparedSubscription {
+            payload: subscription,
+            readiness: subscription_readiness,
+        } = prepared_subscription;
         let (socket, _) = await_websocket_connection(
-            connect_async(adapter.websocket_url(plan.private)),
+            connect_async(websocket_url),
             shutdown,
             recovery,
             CONNECTION_TIMEOUT,
@@ -982,11 +983,13 @@ mod tests {
         let (status_tx, mut status_rx) = mpsc::channel(8);
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let (_recovery_tx, mut recovery_rx) = watch::channel(0_u64);
+        let prepared_subscription = prepare_connection_subscription(&adapter, &plan).unwrap();
         let client = tokio::spawn(async move {
             run_connection_once_with_readiness(
-                &adapter,
+                &url,
                 &plan,
                 &[],
+                prepared_subscription,
                 &output_tx,
                 &status_tx,
                 &mut shutdown_rx,

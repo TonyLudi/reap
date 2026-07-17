@@ -1,0 +1,43 @@
+error[E0061]: this method takes 2 arguments but 4 arguments were supplied
+ --> tests/ui/recovered_ownership_requires_storage_proof.rs:7:19
+  |
+7 |     let _ = owned.register_recovered(policy, "account", "BTC-USDT", "foreign-order");
+  |                   ^^^^^^^^^^^^^^^^^^         ---------  ----------  --------------- unexpected argument #4 of type `&'static str`
+  |                                              |          |
+  |                                              |          unexpected argument #3 of type `&'static str`
+  |                                              expected `ProvenRegularSubmitRequest`, found `&str`
+  |
+note: method defined here
+ --> src/authority.rs
+  |
+  |     pub fn register_recovered(
+  |            ^^^^^^^^^^^^^^^^^^
+help: remove the extra arguments
+  |
+7 -     let _ = owned.register_recovered(policy, "account", "BTC-USDT", "foreign-order");
+7 +     let _ = owned.register_recovered(policy, /* ProvenRegularSubmitRequest */);
+  |
+
+error[E0277]: the trait bound `ProvenRegularSubmitRequest: Clone` is not satisfied
+  --> tests/ui/recovered_ownership_requires_storage_proof.rs:20:21
+   |
+20 |     require_clone::<ProvenRegularSubmitRequest>();
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `ProvenRegularSubmitRequest`
+   |
+note: required by a bound in `require_clone`
+  --> tests/ui/recovered_ownership_requires_storage_proof.rs:4:21
+   |
+ 4 | fn require_clone<T: Clone>() {}
+   |                     ^^^^^ required by this bound in `require_clone`
+
+error[E0277]: the trait bound `ProvenRegularOrderBinding: Clone` is not satisfied
+  --> tests/ui/recovered_ownership_requires_storage_proof.rs:21:21
+   |
+21 |     require_clone::<ProvenRegularOrderBinding>();
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `ProvenRegularOrderBinding`
+   |
+note: required by a bound in `require_clone`
+  --> tests/ui/recovered_ownership_requires_storage_proof.rs:4:21
+   |
+ 4 | fn require_clone<T: Clone>() {}
+   |                     ^^^^^ required by this bound in `require_clone`

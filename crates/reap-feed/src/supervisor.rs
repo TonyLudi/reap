@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 
 use crate::{
     ConnectionError, ConnectionStatus, ConnectionStatusKind, RecoveryRequest, SocketPlan,
-    run_connection_once_with_readiness,
+    prepare_connection_subscription, run_connection_once_with_readiness,
 };
 
 type RecoveryStreamKey = (Venue, Symbol);
@@ -533,11 +533,61 @@ impl ConnectionAttemptPacerState {
     }
 }
 
-pub type BootstrapFactory =
-    Arc<dyn Fn(&SocketPlan) -> Result<Vec<String>, ConnectionError> + Send + Sync>;
+type BootstrapGenerator = dyn Fn(&SocketPlan) -> Result<Vec<String>, ConnectionError> + Send + Sync;
+
+pub struct BootstrapFactory {
+    kind: BootstrapKind,
+}
+
+enum BootstrapKind {
+    None,
+    Private {
+        websocket_url: Arc<str>,
+        generator: Arc<BootstrapGenerator>,
+    },
+}
+
+impl BootstrapFactory {
+    pub fn bind_private_websocket(
+        websocket_url: impl Into<String>,
+        generator: impl Fn(&SocketPlan) -> Result<Vec<String>, ConnectionError> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            kind: BootstrapKind::Private {
+                websocket_url: Arc::from(websocket_url.into()),
+                generator: Arc::new(generator),
+            },
+        }
+    }
+
+    fn generate(
+        &self,
+        plan: &SocketPlan,
+        selected_websocket_url: &str,
+    ) -> Result<Vec<String>, ConnectionError> {
+        match &self.kind {
+            BootstrapKind::None => Ok(Vec::new()),
+            BootstrapKind::Private { .. } if !plan.private => Ok(Vec::new()),
+            BootstrapKind::Private {
+                websocket_url,
+                generator,
+            } => {
+                if websocket_url.as_ref() != selected_websocket_url {
+                    return Err(ConnectionError::PrivateBootstrapDestinationMismatch {
+                        bound_url: websocket_url.to_string(),
+                        selected_url: selected_websocket_url.to_string(),
+                    });
+                }
+                generator(plan)
+            }
+        }
+    }
+}
 
 pub fn no_bootstrap() -> BootstrapFactory {
-    Arc::new(|_| Ok(Vec::new()))
+    BootstrapFactory {
+        kind: BootstrapKind::None,
+    }
 }
 
 impl Default for ReconnectPolicy {
@@ -664,6 +714,7 @@ pub fn spawn_supervised_feed(
     let mut tasks = Vec::new();
     let mut recovery_routes = RecoveryRoutes::new();
     let mut recovery_guards = Vec::new();
+    let bootstrap = Arc::new(bootstrap);
     for plan in plans {
         let (recovery_tx, recovery_rx) = watch::channel(0_u64);
         let mut routed_symbols = HashSet::new();
@@ -725,14 +776,16 @@ struct ConnectionChannels {
 fn is_fatal_connection_error(error: &ConnectionError) -> bool {
     matches!(
         error,
-        ConnectionError::InvalidSubscriptionPlan(_) | ConnectionError::RecoveryChannelClosed
+        ConnectionError::InvalidSubscriptionPlan(_)
+            | ConnectionError::PrivateBootstrapDestinationMismatch { .. }
+            | ConnectionError::RecoveryChannelClosed
     )
 }
 
 async fn supervise_connection(
     adapter: Arc<dyn VenueAdapter>,
     plan: SocketPlan,
-    bootstrap: BootstrapFactory,
+    bootstrap: Arc<BootstrapFactory>,
     channels: ConnectionChannels,
     connection_attempt_pacer: ConnectionAttemptPacer,
     reconnect: ReconnectPolicy,
@@ -766,8 +819,71 @@ async fn supervise_connection(
                 return;
             }
         }
-        let bootstrap_messages = match bootstrap(&plan) {
+        let prepared_subscription = match prepare_connection_subscription(adapter.as_ref(), &plan) {
+            Ok(subscription) => subscription,
+            Err(error) => {
+                let fatal = is_fatal_connection_error(&error);
+                let _ = status
+                    .send(ConnectionStatus {
+                        conn_id: plan.conn_id.clone(),
+                        venue: plan.venue,
+                        private: plan.private,
+                        ts_ms: crate::unix_time_ns() / 1_000_000,
+                        kind: if fatal {
+                            ConnectionStatusKind::Fatal
+                        } else {
+                            ConnectionStatusKind::Disconnected
+                        },
+                        reason: error.to_string(),
+                    })
+                    .await;
+                if fatal {
+                    tracing::error!(
+                        conn_id = %plan.conn_id,
+                        ?error,
+                        "feed subscription serializer produced an invalid request"
+                    );
+                    return;
+                }
+                let delay = backoff.after_failure(false);
+                tracing::warn!(
+                    conn_id = %plan.conn_id,
+                    ?error,
+                    ?delay,
+                    "feed subscription generation failed"
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            return;
+                        }
+                    }
+                }
+                continue;
+            }
+        };
+        let websocket_url = adapter.websocket_url(plan.private).to_string();
+        let bootstrap_messages = match bootstrap.generate(&plan, &websocket_url) {
             Ok(messages) => messages,
+            Err(error) if is_fatal_connection_error(&error) => {
+                tracing::error!(
+                    conn_id = %plan.conn_id,
+                    ?error,
+                    "feed bootstrap destination is invalid"
+                );
+                let _ = status
+                    .send(ConnectionStatus {
+                        conn_id: plan.conn_id.clone(),
+                        venue: plan.venue,
+                        private: plan.private,
+                        ts_ms: crate::unix_time_ns() / 1_000_000,
+                        kind: ConnectionStatusKind::Fatal,
+                        reason: error.to_string(),
+                    })
+                    .await;
+                return;
+            }
             Err(error) => {
                 let delay = backoff.after_failure(false);
                 tracing::warn!(conn_id = %plan.conn_id, ?error, ?delay, "feed bootstrap generation failed");
@@ -783,9 +899,10 @@ async fn supervise_connection(
             }
         };
         let outcome = run_connection_once_with_readiness(
-            adapter.as_ref(),
+            &websocket_url,
             &plan,
             &bootstrap_messages,
+            prepared_subscription,
             &output,
             &status,
             &mut shutdown,
@@ -857,6 +974,45 @@ mod tests {
 
     use super::*;
 
+    struct RawOrderSubscriptionAdapter {
+        delegate: OkxAdapter,
+        websocket_calls: Arc<AtomicUsize>,
+        subscription_calls: Arc<AtomicUsize>,
+    }
+
+    impl VenueAdapter for RawOrderSubscriptionAdapter {
+        fn venue(&self) -> Venue {
+            self.delegate.venue()
+        }
+
+        fn websocket_url(&self, private: bool) -> &str {
+            self.websocket_calls.fetch_add(1, Ordering::Relaxed);
+            self.delegate.websocket_url(private)
+        }
+
+        fn parse(
+            &self,
+            envelope: &RawEnvelope,
+        ) -> Result<Vec<reap_venue::ParsedEvent>, reap_venue::VenueError> {
+            self.delegate.parse(envelope)
+        }
+
+        fn is_data_frame(&self, envelope: &RawEnvelope) -> Result<bool, reap_venue::VenueError> {
+            self.delegate.is_data_frame(envelope)
+        }
+
+        fn subscription_message(
+            &self,
+            _subscriptions: &[Subscription],
+        ) -> Result<String, reap_venue::VenueError> {
+            self.subscription_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(
+                r#"{"id":"attack","op":"order","args":[{"instId":"BTC-USDT","side":"buy"}]}"#
+                    .to_string(),
+            )
+        }
+    }
+
     #[test]
     fn reconnect_backoff_is_bounded() {
         let policy = ReconnectPolicy {
@@ -893,6 +1049,12 @@ mod tests {
             &ConnectionError::InvalidSubscriptionPlan("duplicate".to_string())
         ));
         assert!(is_fatal_connection_error(
+            &ConnectionError::PrivateBootstrapDestinationMismatch {
+                bound_url: "wss://bound.example/ws/v5/private".to_string(),
+                selected_url: "wss://selected.example/ws/v5/private".to_string(),
+            }
+        ));
+        assert!(is_fatal_connection_error(
             &ConnectionError::RecoveryChannelClosed
         ));
         assert!(!is_fatal_connection_error(
@@ -925,7 +1087,7 @@ mod tests {
         supervise_connection(
             Arc::new(OkxAdapter::new("ws://127.0.0.1:9", "ws://127.0.0.1:9")),
             plan,
-            no_bootstrap(),
+            Arc::new(no_bootstrap()),
             ConnectionChannels {
                 output,
                 status,
@@ -1246,7 +1408,8 @@ mod tests {
     #[test]
     fn private_bootstrap_builds_login_per_attempt() {
         let attempt = Arc::new(AtomicUsize::new(0));
-        let factory: BootstrapFactory = Arc::new({
+        let bound_url = "wss://private.example/ws/v5/private";
+        let factory = BootstrapFactory::bind_private_websocket(bound_url, {
             let attempt = Arc::clone(&attempt);
             move |plan| {
                 if !plan.private {
@@ -1285,13 +1448,127 @@ mod tests {
         };
 
         let login: serde_json::Value =
-            serde_json::from_str(&factory(&private).unwrap()[0]).unwrap();
+            serde_json::from_str(&factory.generate(&private, bound_url).unwrap()[0]).unwrap();
         assert_eq!(login["op"], "login");
         assert_eq!(login["args"][0]["timestamp"], "1");
-        assert!(factory(&public).unwrap().is_empty());
+        assert!(
+            factory
+                .generate(&public, "wss://public.example")
+                .unwrap()
+                .is_empty()
+        );
 
         let next_login: serde_json::Value =
-            serde_json::from_str(&factory(&private).unwrap()[0]).unwrap();
+            serde_json::from_str(&factory.generate(&private, bound_url).unwrap()[0]).unwrap();
         assert_eq!(next_login["args"][0]["timestamp"], "2");
+    }
+
+    #[tokio::test]
+    async fn mismatched_private_destination_is_fatal_before_bootstrap_generation() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let factory =
+            BootstrapFactory::bind_private_websocket("wss://bound.example:8443/ws/v5/private", {
+                let attempts = Arc::clone(&attempts);
+                move |_| {
+                    attempts.fetch_add(1, Ordering::Relaxed);
+                    Ok(vec!["signed-login".to_string()])
+                }
+            });
+        let plan = SocketPlan {
+            conn_id: ConnId::new("private-destination-mismatch"),
+            venue: Venue::Okx,
+            private: true,
+            subscriptions: vec![Subscription::private(
+                Venue::Okx,
+                Channel::Orders,
+                FeedPriority::Critical,
+            )],
+        };
+        let (output, _output_rx) = mpsc::channel(1);
+        let (status, mut status_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let (_recovery_tx, recovery) = watch::channel(0_u64);
+
+        supervise_connection(
+            Arc::new(OkxAdapter::new(
+                "wss://public.example:8443/ws/v5/public",
+                "wss://selected.example:8443/ws/v5/private",
+            )),
+            plan,
+            Arc::new(factory),
+            ConnectionChannels {
+                output,
+                status,
+                shutdown,
+                recovery,
+            },
+            ConnectionAttemptPacer::new(Duration::ZERO),
+            ReconnectPolicy::default(),
+        )
+        .await;
+
+        let fatal = status_rx.recv().await.unwrap();
+        assert_eq!(fatal.kind, ConnectionStatusKind::Fatal);
+        assert!(fatal.reason.contains("bound.example"));
+        assert!(fatal.reason.contains("selected.example"));
+        assert_eq!(attempts.load(Ordering::Relaxed), 0);
+        assert!(status_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn raw_order_subscription_is_rejected_before_bootstrap_or_connection() {
+        let bootstrap_attempts = Arc::new(AtomicUsize::new(0));
+        let websocket_calls = Arc::new(AtomicUsize::new(0));
+        let subscription_calls = Arc::new(AtomicUsize::new(0));
+        let bound_url = "wss://bound.example:8443/ws/v5/private";
+        let factory = BootstrapFactory::bind_private_websocket(bound_url, {
+            let bootstrap_attempts = Arc::clone(&bootstrap_attempts);
+            move |_| {
+                bootstrap_attempts.fetch_add(1, Ordering::Relaxed);
+                Ok(vec!["signed-login".to_string()])
+            }
+        });
+        let adapter = RawOrderSubscriptionAdapter {
+            delegate: OkxAdapter::new("wss://public.example:8443/ws/v5/public", bound_url),
+            websocket_calls: Arc::clone(&websocket_calls),
+            subscription_calls: Arc::clone(&subscription_calls),
+        };
+        let plan = SocketPlan {
+            conn_id: ConnId::new("raw-order-subscription"),
+            venue: Venue::Okx,
+            private: true,
+            subscriptions: vec![Subscription::private(
+                Venue::Okx,
+                Channel::Orders,
+                FeedPriority::Critical,
+            )],
+        };
+        let (output, _output_rx) = mpsc::channel(1);
+        let (status, mut status_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let (_recovery_tx, recovery) = watch::channel(0_u64);
+
+        supervise_connection(
+            Arc::new(adapter),
+            plan,
+            Arc::new(factory),
+            ConnectionChannels {
+                output,
+                status,
+                shutdown,
+                recovery,
+            },
+            ConnectionAttemptPacer::new(Duration::ZERO),
+            ReconnectPolicy::default(),
+        )
+        .await;
+
+        let fatal = status_rx.recv().await.unwrap();
+        assert_eq!(fatal.kind, ConnectionStatusKind::Fatal);
+        assert!(fatal.reason.contains("no subscribe operation"));
+        assert_eq!(subscription_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(websocket_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(bootstrap_attempts.load(Ordering::Relaxed), 0);
+        assert!(status_rx.recv().await.is_none());
     }
 }

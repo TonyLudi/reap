@@ -16,5 +16,7 @@ thiserror.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+reap-risk.workspace = true
+reap-strategy.workspace = true
 tokio.workspace = true
 trybuild.workspace = true

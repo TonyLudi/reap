@@ -1,53 +1,197 @@
-error[E0599]: no method named `credentials` found for reference `&LiveReadiness` in the current scope
-  --> tests/ui/roles_no_raw_authority.rs:15:23
+error[E0277]: the trait bound `reap_okx_live_adapter::RegularExecution: Clone` is not satisfied
+  --> tests/ui/roles_no_raw_authority.rs:12:21
    |
-15 |     let _ = readiness.credentials();
+12 |     require_clone::<RegularExecution>();
+   |                     ^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `reap_okx_live_adapter::RegularExecution`
+   |
+note: required by a bound in `require_clone`
+  --> tests/ui/roles_no_raw_authority.rs:9:21
+   |
+ 9 | fn require_clone<T: Clone>() {}
+   |                     ^^^^^ required by this bound in `require_clone`
+
+error[E0277]: the trait bound `RegularOrderSessionFactory: Clone` is not satisfied
+  --> tests/ui/roles_no_raw_authority.rs:13:21
+   |
+13 |     require_clone::<RegularOrderSessionFactory>();
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `RegularOrderSessionFactory`
+   |
+note: required by a bound in `require_clone`
+  --> tests/ui/roles_no_raw_authority.rs:9:21
+   |
+ 9 | fn require_clone<T: Clone>() {}
+   |                     ^^^^^ required by this bound in `require_clone`
+
+error[E0599]: no method named `execution` found for reference `&DemoRoles` in the current scope
+  --> tests/ui/roles_no_raw_authority.rs:14:19
+   |
+14 |     let _ = roles.execution();
+   |                   ^^^^^^^^^ private field, not a method
+   |
+help: there is a method `take_execution` with a similar name
+   |
+14 |     let _ = roles.take_execution();
+   |                   +++++
+
+error[E0599]: no method named `regular_order_sessions` found for reference `&DemoRoles` in the current scope
+  --> tests/ui/roles_no_raw_authority.rs:15:19
+   |
+15 |     let _ = roles.regular_order_sessions();
+   |                   ^^^^^^^^^^^^^^^^^^^^^^ private field, not a method
+   |
+help: there is a method `take_regular_order_sessions` with a similar name
+   |
+15 |     let _ = roles.take_regular_order_sessions();
+   |                   +++++
+
+error[E0599]: no method named `credentials` found for reference `&LiveReadiness` in the current scope
+  --> tests/ui/roles_no_raw_authority.rs:33:23
+   |
+33 |     let _ = readiness.credentials();
    |                       ^^^^^^^^^^^ method not found in `&LiveReadiness`
 
-error[E0599]: no method named `signer` found for reference `&RegularReconciliation` in the current scope
-  --> tests/ui/roles_no_raw_authority.rs:16:28
+error[E0599]: no method named `signer` found for reference `&reap_okx_live_adapter::RegularReconciliation` in the current scope
+  --> tests/ui/roles_no_raw_authority.rs:34:28
    |
-16 |     let _ = reconciliation.signer();
-   |                            ^^^^^^ method not found in `&RegularReconciliation`
+34 |     let _ = reconciliation.signer();
+   |                            ^^^^^^ method not found in `&reap_okx_live_adapter::RegularReconciliation`
 
-error[E0599]: no method named `wire` found for reference `&RegularExecution` in the current scope
-  --> tests/ui/roles_no_raw_authority.rs:17:23
+error[E0599]: no method named `wire` found for reference `&reap_okx_live_adapter::RegularExecution` in the current scope
+  --> tests/ui/roles_no_raw_authority.rs:35:23
    |
-17 |     let _ = execution.wire();
+35 |     let _ = execution.wire();
    |                       ^^^^ private field, not a method
 
 error[E0599]: no method named `transport` found for reference `&LiveSafety` in the current scope
-  --> tests/ui/roles_no_raw_authority.rs:18:20
+  --> tests/ui/roles_no_raw_authority.rs:36:20
    |
-18 |     let _ = safety.transport();
+36 |     let _ = safety.transport();
    |                    ^^^^^^^^^
    |
 help: there is a method `transform` with a similar name
    |
-18 -     let _ = safety.transport();
-18 +     let _ = safety.transform();
+36 -     let _ = safety.transport();
+36 +     let _ = safety.transform();
    |
 
 error[E0599]: no method named `get` found for reference `&ForbiddenOrderObserver` in the current scope
-  --> tests/ui/roles_no_raw_authority.rs:19:23
+  --> tests/ui/roles_no_raw_authority.rs:37:23
    |
-19 |     let _ = forbidden.get("/api/v5/account/config");
+37 |     let _ = forbidden.get("/api/v5/account/config");
    |                       ^^^ method not found in `&ForbiddenOrderObserver`
 
 error[E0599]: no method named `post` found for reference `&PrivateStateSessionFactory` in the current scope
-  --> tests/ui/roles_no_raw_authority.rs:20:27
+  --> tests/ui/roles_no_raw_authority.rs:38:27
    |
-20 |     let _ = private_state.post("/api/v5/trade/order", "{}");
+38 |     let _ = private_state.post("/api/v5/trade/order", "{}");
    |                           ^^^^ method not found in `&PrivateStateSessionFactory`
 
-error[E0599]: no method named `get` found for reference `&RegularOrderSessionFactory` in the current scope
-  --> tests/ui/roles_no_raw_authority.rs:21:28
+error[E0618]: expected function, found `BootstrapFactory`
+  --> tests/ui/roles_no_raw_authority.rs:42:13
    |
-21 |     let _ = order_sessions.get("/api/v5/account/config");
+39 |     let bootstrap = private_state
+   |         --------- `bootstrap` has type `BootstrapFactory`
+...
+42 |     let _ = bootstrap(plan);
+   |             ^^^^^^^^^------
+   |             |
+   |             call expression requires function
+
+error[E0624]: method `generate` is private
+  --> tests/ui/roles_no_raw_authority.rs:43:23
+   |
+43 |       let _ = bootstrap.generate(plan, "wss://wspap.okx.com:8443/ws/v5/private");
+   |                         ^^^^^^^^ private method
+   |
+  ::: $WORKSPACE/crates/reap-feed/src/supervisor.rs
+   |
+   | /     fn generate(
+   | |         &self,
+   | |         plan: &SocketPlan,
+   | |         selected_websocket_url: &str,
+   | |     ) -> Result<Vec<String>, ConnectionError> {
+   | |_____________________________________________- private method defined here
+
+error[E0599]: no method named `get` found for reference `&RegularOrderSessionFactory` in the current scope
+  --> tests/ui/roles_no_raw_authority.rs:44:28
+   |
+44 |     let _ = order_sessions.get("/api/v5/account/config");
    |                            ^^^ method not found in `&RegularOrderSessionFactory`
 
 error[E0599]: no method named `post` found for reference `&RegularOrderSessionFactory` in the current scope
-  --> tests/ui/roles_no_raw_authority.rs:22:28
+  --> tests/ui/roles_no_raw_authority.rs:45:28
    |
-22 |     let _ = order_sessions.post("/api/v5/trade/order", "{}");
+45 |     let _ = order_sessions.post("/api/v5/trade/order", "{}");
    |                            ^^^^ method not found in `&RegularOrderSessionFactory`
+
+error[E0308]: mismatched types
+  --> tests/ui/roles_no_raw_authority.rs:46:55
+   |
+46 |     let _ = order_sessions.place_request("place1", 1, place);
+   |                            -------------              ^^^^^ expected `PreparedRegularSubmit`, found `&OkxPlaceOrder`
+   |                            |
+   |                            arguments to this method are incorrect
+   |
+note: method defined here
+  --> src/lib.rs
+   |
+   |     pub fn place_request(
+   |            ^^^^^^^^^^^^^
+
+error[E0308]: mismatched types
+  --> tests/ui/roles_no_raw_authority.rs:47:54
+   |
+47 |     let _ = order_sessions.cancel_request("cancel1", cancel);
+   |                            --------------            ^^^^^^ expected `&PreparedRegularCancel`, found `&OkxCancelOrder`
+   |                            |
+   |                            arguments to this method are incorrect
+   |
+   = note: expected reference `&PreparedRegularCancel`
+              found reference `&OkxCancelOrder`
+note: method defined here
+  --> src/lib.rs
+   |
+   |     pub fn cancel_request(
+   |            ^^^^^^^^^^^^^^
+
+error[E0308]: mismatched types
+  --> tests/ui/roles_no_raw_authority.rs:48:55
+   |
+48 |     let _ = OkxOrderTransport::place_order(transport, place);
+   |             ------------------------------            ^^^^^ expected `PreparedRegularSubmit`, found `&OkxPlaceOrder`
+   |             |
+   |             arguments to this function are incorrect
+   |
+note: method defined here
+  --> $WORKSPACE/crates/reap-order/src/transport.rs
+   |
+   |     async fn place_order(
+   |              ^^^^^^^^^^^
+
+error[E0308]: mismatched types
+  --> tests/ui/roles_no_raw_authority.rs:49:56
+   |
+49 |     let _ = OkxOrderTransport::cancel_order(transport, cancel);
+   |             -------------------------------            ^^^^^^ expected `PreparedRegularCancel`, found `&OkxCancelOrder`
+   |             |
+   |             arguments to this function are incorrect
+   |
+note: method defined here
+  --> $WORKSPACE/crates/reap-order/src/transport.rs
+   |
+   |     async fn cancel_order(
+   |              ^^^^^^^^^^^^
+
+error[E0308]: mismatched types
+  --> tests/ui/roles_no_raw_authority.rs:50:67
+   |
+50 |     let _ = RegularExecutionPort::cancel_regular_order(execution, cancel);
+   |             ------------------------------------------            ^^^^^^ expected `PreparedRegularCancel`, found `&OkxCancelOrder`
+   |             |
+   |             arguments to this function are incorrect
+   |
+note: method defined here
+  --> $WORKSPACE/crates/reap-order/src/gateway.rs
+   |
+   |     async fn cancel_regular_order(
+   |              ^^^^^^^^^^^^^^^^^^^^

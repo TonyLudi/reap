@@ -6,6 +6,9 @@ edition.workspace = true
 [dependencies]
 async-trait.workspace = true
 reap-core.workspace = true
+reap-risk.workspace = true
+reap-storage.workspace = true
+reap-strategy.workspace = true
 reap-venue.workspace = true
 serde.workspace = true
 thiserror.workspace = true
@@ -13,3 +16,5 @@ tokio.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+tempfile = "3"
+trybuild.workspace = true

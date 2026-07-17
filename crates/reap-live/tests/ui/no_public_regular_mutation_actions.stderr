@@ -1,0 +1,15 @@
+error[E0432]: unresolved imports `reap_live::CancelAction`, `reap_live::LiveAction`, `reap_live::ReconcileAction`, `reap_live::SubmitAction`
+ --> tests/ui/no_public_regular_mutation_actions.rs:1:17
+  |
+1 | use reap_live::{CancelAction, CoordinatorOutput, LiveAction, ReconcileAction, SubmitAction};
+  |                 ^^^^^^^^^^^^                     ^^^^^^^^^^  ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^ no `SubmitAction` in the root
+  |                 |                                |           |
+  |                 |                                |           no `ReconcileAction` in the root
+  |                 |                                no `LiveAction` in the root
+  |                 no `CancelAction` in the root
+
+error[E0616]: field `actions` of struct `CoordinatorOutput` is private
+ --> tests/ui/no_public_regular_mutation_actions.rs:4:20
+  |
+4 |     let _ = output.actions;
+  |                    ^^^^^^^ private field

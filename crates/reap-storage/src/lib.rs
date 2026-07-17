@@ -201,7 +201,7 @@ impl ProvenRegularExchangeOrderKey {
 ///
 /// This is an in-memory ownership proof only. It deliberately is not
 /// serializable and does not change the journal schema.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ProvenRegularSubmitRequest {
     account_id: String,
     symbol: Symbol,
@@ -231,7 +231,7 @@ impl ProvenRegularSubmitRequest {
 /// proven request.
 ///
 /// This type is also recovery-only, non-serialized ownership state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ProvenRegularOrderBinding {
     request: ProvenRegularSubmitRequest,
     exchange_order_id: String,
@@ -263,7 +263,7 @@ impl ProvenRegularOrderBinding {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct RecoveredStorage {
     pub latest_orders: HashMap<String, OrderUpdate>,
     /// Legacy acknowledgement-derived bindings retained for compatibility.
@@ -333,6 +333,8 @@ pub enum StorageError {
         config_path: PathBuf,
         lease_path: PathBuf,
     },
+    #[error("regular-order authority was already recovered from leased journal {path}")]
+    AuthorityAlreadyRecovered { path: PathBuf },
     #[error("durable storage write failed: {0}")]
     Durability(String),
     #[error("storage recovery found an invalid record on line {line}: {message}")]
@@ -488,6 +490,7 @@ pub struct StorageLease {
     journal_path: PathBuf,
     lock_path: PathBuf,
     lock_file: std::fs::File,
+    authority_recovered: bool,
 }
 
 impl StorageLease {
@@ -545,6 +548,7 @@ pub fn acquire_storage_lease(path: impl AsRef<Path>) -> Result<StorageLease, Sto
         journal_path,
         lock_path,
         lock_file,
+        authority_recovered: false,
     })
 }
 
@@ -626,6 +630,28 @@ pub fn recover_jsonl(path: impl AsRef<Path>) -> Result<RecoveredStorage, Storage
     recover_jsonl_bytes(&bytes)
 }
 
+/// Recovers live regular-order authority from the journal protected by an
+/// exclusively borrowed storage lease.
+///
+/// Ordinary path/byte recovery intentionally strips authority-bearing proofs.
+/// Live startup must already own the journal lease and cannot select different
+/// bytes from those protected by that lease.
+pub fn recover_leased_jsonl(lease: &mut StorageLease) -> Result<RecoveredStorage, StorageError> {
+    if std::mem::replace(&mut lease.authority_recovered, true) {
+        return Err(StorageError::AuthorityAlreadyRecovered {
+            path: lease.journal_path.clone(),
+        });
+    }
+    let bytes = match std::fs::read(lease.journal_path()) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RecoveredStorage::default());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    recover_jsonl_bytes_with_visitor_inner(&bytes, |_, _| {}, true)
+}
+
 /// Recovers exactly the supplied journal bytes.
 ///
 /// Evidence tooling uses this entry point so the bytes it fingerprints are the
@@ -642,7 +668,18 @@ pub fn recover_jsonl_bytes(bytes: &[u8]) -> Result<RecoveredStorage, StorageErro
 /// to [`RecoveredStorage`] or live startup memory.
 pub fn recover_jsonl_bytes_with_visitor<F>(
     bytes: &[u8],
+    visitor: F,
+) -> Result<RecoveredStorage, StorageError>
+where
+    F: FnMut(u64, &StorageRecord),
+{
+    recover_jsonl_bytes_with_visitor_inner(bytes, visitor, false)
+}
+
+fn recover_jsonl_bytes_with_visitor_inner<F>(
+    bytes: &[u8],
     mut visitor: F,
+    retain_regular_authority: bool,
 ) -> Result<RecoveredStorage, StorageError>
 where
     F: FnMut(u64, &StorageRecord),
@@ -727,6 +764,10 @@ where
             }
             _ => {}
         }
+    }
+    if !retain_regular_authority {
+        recovered.proven_regular_submit_requests.clear();
+        recovered.proven_regular_order_bindings.clear();
     }
     Ok(recovered)
 }
@@ -873,11 +914,7 @@ fn apply_proven_regular_submit_ack(
     if !valid_recovered_order_id(exchange_order_id) {
         return Ok(());
     }
-    let Some(request) = recovered
-        .proven_regular_submit_requests
-        .get(&client_key)
-        .cloned()
-    else {
+    let Some(request) = recovered.proven_regular_submit_requests.get(&client_key) else {
         return Ok(());
     };
     let exchange_key = ProvenRegularExchangeOrderKey {
@@ -885,7 +922,12 @@ fn apply_proven_regular_submit_ack(
         exchange_order_id: exchange_order_id.clone(),
     };
     let binding = ProvenRegularOrderBinding {
-        request,
+        request: ProvenRegularSubmitRequest {
+            account_id: request.account_id.clone(),
+            symbol: request.symbol.clone(),
+            client_order_id: request.client_order_id.clone(),
+            idempotency_key: request.idempotency_key.clone(),
+        },
         exchange_order_id: exchange_order_id.clone(),
     };
     if let Some(existing) = recovered.proven_regular_order_bindings.get(&exchange_key) {
@@ -1181,9 +1223,7 @@ mod tests {
         }
     }
 
-    fn recover_records(
-        records: impl IntoIterator<Item = StorageRecord>,
-    ) -> Result<RecoveredStorage, StorageError> {
+    fn journal_bytes(records: impl IntoIterator<Item = StorageRecord>) -> Vec<u8> {
         let journal = records
             .into_iter()
             .map(|record| {
@@ -1195,7 +1235,17 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        recover_jsonl_bytes(format!("{journal}\n").as_bytes())
+        format!("{journal}\n").into_bytes()
+    }
+
+    fn recover_records(
+        records: impl IntoIterator<Item = StorageRecord>,
+    ) -> Result<RecoveredStorage, StorageError> {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("leased-recovery.jsonl");
+        std::fs::write(&path, journal_bytes(records)).unwrap();
+        let mut lease = acquire_storage_lease(&path)?;
+        recover_leased_jsonl(&mut lease)
     }
 
     fn regular_submit_request(
@@ -1801,6 +1851,40 @@ mod tests {
         );
         assert_eq!(recovered.order_bindings["main"]["exchange-1"], "order-1");
         assert_eq!(recovered.last_ts_ms, 2);
+    }
+
+    #[test]
+    fn ordinary_recovery_cannot_return_regular_authority_but_a_lease_can_once() {
+        let records = [
+            regular_submit_request("main", "BTC-USDT", "client-1", "idem-1"),
+            regular_submit_ack(
+                "main",
+                "client-1",
+                Some("exchange-1"),
+                OrderAckStatus::Accepted,
+            ),
+        ];
+        let bytes = journal_bytes(records.clone());
+
+        let from_bytes = recover_jsonl_bytes(&bytes).unwrap();
+        assert!(from_bytes.proven_regular_submit_requests.is_empty());
+        assert!(from_bytes.proven_regular_order_bindings.is_empty());
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("authority.jsonl");
+        std::fs::write(&path, &bytes).unwrap();
+        let from_path = recover_jsonl(&path).unwrap();
+        assert!(from_path.proven_regular_submit_requests.is_empty());
+        assert!(from_path.proven_regular_order_bindings.is_empty());
+
+        let mut lease = acquire_storage_lease(&path).unwrap();
+        let leased = recover_leased_jsonl(&mut lease).unwrap();
+        assert_eq!(leased.proven_regular_submit_requests.len(), 1);
+        assert_eq!(leased.proven_regular_order_bindings.len(), 1);
+        assert!(matches!(
+            recover_leased_jsonl(&mut lease),
+            Err(StorageError::AuthorityAlreadyRecovered { path: repeated }) if repeated == path
+        ));
     }
 
     #[test]

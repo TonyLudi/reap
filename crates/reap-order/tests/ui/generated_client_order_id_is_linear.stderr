@@ -1,0 +1,57 @@
+error[E0277]: the trait bound `GeneratedClientOrderId: Clone` is not satisfied
+ --> tests/ui/generated_client_order_id_is_linear.rs:9:21
+  |
+9 |     require_clone::<GeneratedClientOrderId>();
+  |                     ^^^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `GeneratedClientOrderId`
+  |
+note: required by a bound in `require_clone`
+ --> tests/ui/generated_client_order_id_is_linear.rs:6:21
+  |
+6 | fn require_clone<T: Clone>() {}
+  |                     ^^^^^ required by this bound in `require_clone`
+
+error[E0624]: associated function `new` is private
+  --> tests/ui/generated_client_order_id_is_linear.rs:13:37
+   |
+13 |       let _ = ClientOrderIdGenerator::new("forged", 7);
+   |                                       ^^^ private associated function
+   |
+  ::: src/client_id.rs
+   |
+   | /     pub(crate) fn new(
+   | |         prefix: impl Into<String>,
+   | |         node_id: u16,
+   | |         binding: RegularApprovalBinding,
+   | |     ) -> Result<Self, ClientIdError> {
+   | |____________________________________- private associated function defined here
+
+error[E0061]: this function takes 3 arguments but 2 arguments were supplied
+  --> tests/ui/generated_client_order_id_is_linear.rs:13:13
+   |
+13 |     let _ = ClientOrderIdGenerator::new("forged", 7);
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^------------- argument #3 of type `reap_order::authority::RegularApprovalBinding` is missing
+   |
+note: associated function defined here
+  --> src/client_id.rs
+   |
+   |     pub(crate) fn new(
+   |                   ^^^
+help: provide the argument
+   |
+13 |     let _ = ClientOrderIdGenerator::new("forged", 7, /* reap_order::authority::RegularApprovalBinding */);
+   |                                                    +++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+error[E0308]: mismatched types
+  --> tests/ui/generated_client_order_id_is_linear.rs:23:9
+   |
+21 |     let _ = owned.reserve_local(
+   |                   ------------- arguments to this method are incorrect
+22 |         approved,
+23 |         "forged-client-order-id".to_string(),
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `GeneratedClientOrderId`, found `String`
+   |
+note: method defined here
+  --> src/authority.rs
+   |
+   |     pub fn reserve_local(
+   |            ^^^^^^^^^^^^^

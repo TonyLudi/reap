@@ -7,8 +7,11 @@ error[E0599]: no method named `place_regular_order` found for reference `&Regula
 help: there is a method `cancel_regular_order` with a similar name, but with different arguments
   --> $WORKSPACE/crates/reap-order/src/gateway.rs
    |
-   |     async fn cancel_regular_order(&self, order: &OkxCancelOrder) -> Result<OkxOrderAck, RestError>;
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   | /     async fn cancel_regular_order(
+   | |         &self,
+   | |         cancel: PreparedRegularCancel,
+   | |     ) -> Result<OkxOrderAck, RestError>;
+   | |________________________________________^
 
 error[E0599]: no method named `submit_algo_order` found for reference `&RegularExecution` in the current scope
   --> tests/ui/roles_no_unsupported_mutations.rs:12:23
@@ -31,8 +34,11 @@ error[E0599]: no method named `amend_regular_order` found for reference `&Regula
 help: there is a method `cancel_regular_order` with a similar name, but with different arguments
   --> $WORKSPACE/crates/reap-order/src/gateway.rs
    |
-   |     async fn cancel_regular_order(&self, order: &OkxCancelOrder) -> Result<OkxOrderAck, RestError>;
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   | /     async fn cancel_regular_order(
+   | |         &self,
+   | |         cancel: PreparedRegularCancel,
+   | |     ) -> Result<OkxOrderAck, RestError>;
+   | |________________________________________^
 
 error[E0599]: no method named `cancel_algo_orders` found for reference `&LiveSafety` in the current scope
   --> tests/ui/roles_no_unsupported_mutations.rs:16:20
@@ -113,7 +119,7 @@ help: there is a method `place_request` with a similar name, but with different 
    | |         &self,
    | |         request_id: &str,
    | |         expiry_ms: u64,
-   | |         order: &OkxPlaceOrder,
+   | |         prepared: PreparedRegularSubmit,
    | |     ) -> Result<String, OkxWsOrderProtocolError> {
    | |________________________________________________^
 
