@@ -8,10 +8,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::error::MAX_CAPTURE_FAILURE_MESSAGE_BYTES;
+use crate::hashing::{digest_hex, sha256_hex};
 use crate::{
     CAPTURE_RUN_REPORT_FORMAT_VERSION, CaptureAnalysisBookHealth, CaptureAnalysisReport,
     CaptureConfig, CaptureError, CaptureRunReport, CaptureStopReason, MAX_CAPTURE_CONFIG_BYTES,
-    analyze_capture, digest_hex, is_book_channel, sha256_hex,
+    analyze_capture, is_book_channel,
 };
 
 pub const CAPTURE_VERIFICATION_FORMAT_VERSION: u16 = 3;
@@ -609,7 +611,7 @@ fn run_report_invariant_failures(report: &CaptureRunReport, config: &CaptureConf
         {
             failures.push("capture failure code is not a bounded stable identifier".to_string());
         }
-        if failure.message.len() > crate::MAX_CAPTURE_FAILURE_MESSAGE_BYTES {
+        if failure.message.len() > MAX_CAPTURE_FAILURE_MESSAGE_BYTES {
             failures.push("capture failure message exceeds its evidence bound".to_string());
         }
     }

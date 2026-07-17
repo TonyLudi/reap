@@ -1,11 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::analysis;
-use crate::configuration::*;
-use crate::writer::*;
+use crate::configuration::{CaptureConfig, CaptureRuntimeConfig};
+use crate::error::{
+    CaptureError, MAX_CAPTURE_FAILURE_MESSAGE_BYTES, combine_capture_failures,
+    combine_capture_lifecycle_errors, truncate_utf8,
+};
+use crate::report::{
+    CAPTURE_RUN_REPORT_FORMAT_VERSION, CaptureBookHealth, CaptureConfigFileEvidence,
+    CaptureFailureEvidence, CaptureRunReport, CaptureStopReason,
+};
+use crate::writer::{JsonlWriter, JsonlWriterShutdown, JsonlWriterStats};
 use reap_book::BookStatus;
 use reap_core::{
     Channel, NormalizedEvent, PINNED_JAVA_REVISION, RawEnvelope, SystemEventKind, Venue,
@@ -20,230 +28,17 @@ use reap_telemetry::{
     HostGuardRuntime, HostGuardStats, HostHealthError, check_host_health,
     current_executable_sha256, host_identity_sha256, start_host_guard,
 };
-use reap_venue::{VenueAdapter, VenueError, okx::OkxAdapter};
-use serde::{Deserialize, Serialize};
+use reap_venue::{VenueAdapter, okx::OkxAdapter};
 use serde_json::Value;
-use thiserror::Error;
 use tokio::sync::mpsc;
 
-pub const CAPTURE_RUN_REPORT_FORMAT_VERSION: u16 = 5;
 const FEED_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const HOST_GUARD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-pub(crate) const MAX_CAPTURE_FAILURE_MESSAGE_BYTES: usize = 2_048;
 
 #[derive(Debug, Clone)]
 pub struct CaptureRunOptions {
     pub run_duration: Option<Duration>,
     pub config_source: Option<CaptureConfigFileEvidence>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CaptureStopReason {
-    DurationElapsed,
-    OperatorSignal,
-    RuntimeFailure,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CaptureFailureEvidence {
-    pub code: String,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CaptureBookHealth {
-    pub symbol: String,
-    pub sequence_status: String,
-    pub book_status: String,
-    pub last_seq_id: Option<i64>,
-    pub buffered_updates: usize,
-    pub sequence_resets: u64,
-    pub same_sequence_updates: u64,
-    pub best_bid: Option<f64>,
-    pub best_ask: Option<f64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CaptureRunReport {
-    pub format_version: u16,
-    pub reap_version: String,
-    pub java_reference_revision: String,
-    pub executable_sha256: String,
-    pub host_identity_sha256: Option<String>,
-    pub host_preflight: Option<HostHealthSnapshot>,
-    pub host_periodic_checks: u64,
-    pub host_last_snapshot: Option<HostHealthSnapshot>,
-    pub session_started_at_ms: u64,
-    pub session_completed_at_ms: u64,
-    pub capture_session_id: String,
-    pub config_fingerprint: String,
-    #[serde(default)]
-    pub config_source: Option<CaptureConfigFileEvidence>,
-    pub stop_reason: CaptureStopReason,
-    pub elapsed_ms: u64,
-    pub raw_path: PathBuf,
-    pub normalized_path: Option<PathBuf>,
-    pub raw_records: u64,
-    pub normalized_records: u64,
-    pub raw_bytes: u64,
-    pub normalized_bytes: u64,
-    pub raw_sha256: String,
-    pub normalized_sha256: Option<String>,
-    pub max_raw_queue_depth: usize,
-    pub max_normalized_queue_depth: usize,
-    pub parsed_events: u64,
-    pub accepted_events: u64,
-    pub duplicates: u64,
-    pub gaps: u64,
-    pub recoveries: u64,
-    pub recovery_failures: u64,
-    pub sequence_resets: u64,
-    pub same_sequence_updates: u64,
-    pub recovery_requests: u64,
-    pub missing_recovery_routes: u64,
-    pub parse_errors: u64,
-    pub stale_book_events: u64,
-    pub connection_disconnects: u64,
-    pub expected_connections: usize,
-    pub ready_connections_at_stop: usize,
-    pub reached_all_connections_ready: bool,
-    pub books: Vec<CaptureBookHealth>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub failure: Option<CaptureFailureEvidence>,
-    pub clean_capture: bool,
-}
-
-#[derive(Debug, Error)]
-pub enum CaptureError {
-    #[error("invalid capture config path {path}: {message}")]
-    InvalidConfigPath { path: PathBuf, message: String },
-    #[error("failed to read capture config {path}: {source}")]
-    ReadConfig {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("capture config {path} is {actual} bytes; maximum is {limit}")]
-    ConfigTooLarge {
-        path: PathBuf,
-        actual: u64,
-        limit: u64,
-    },
-    #[error("failed to parse capture config: {0}")]
-    ParseConfig(#[from] toml::de::Error),
-    #[error("capture configuration contains unknown fields: {0}")]
-    UnknownFields(String),
-    #[error("capture configuration is invalid: {0}")]
-    InvalidConfig(String),
-    #[error("failed to partition capture subscriptions: {0}")]
-    Partition(#[from] reap_feed::PartitionError),
-    #[error("venue adapter failed: {0}")]
-    Venue(#[from] VenueError),
-    #[error("capture IO failed: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("failed to create new {name} capture output {path}: {source}")]
-    OpenOutput {
-        name: &'static str,
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("capture serialization failed: {0}")]
-    Serialization(#[from] serde_json::Error),
-    #[error("{0} capture writer closed unexpectedly")]
-    WriterClosed(&'static str),
-    #[error("capture writer task failed: {0}")]
-    WriterJoin(#[from] tokio::task::JoinError),
-    #[error("{name} capture writer queue remained full for {timeout_ms}ms")]
-    WriterBackpressure {
-        name: &'static str,
-        timeout_ms: u128,
-    },
-    #[error("{name} capture writer did not shut down within {timeout_ms}ms")]
-    WriterShutdownTimeout {
-        name: &'static str,
-        timeout_ms: u128,
-    },
-    #[error("{name} capture writer did not abort within {timeout_ms}ms")]
-    WriterAbortTimeout {
-        name: &'static str,
-        timeout_ms: u128,
-    },
-    #[error("{name} capture writer evidence scan exceeded {timeout_ms}ms")]
-    WriterEvidenceTimeout {
-        name: &'static str,
-        timeout_ms: u128,
-    },
-    #[error("capture feed channel closed unexpectedly")]
-    FeedClosed,
-    #[error("capture feed shutdown and drain exceeded {timeout_ms}ms")]
-    FeedShutdownTimeout { timeout_ms: u128 },
-    #[error("capture raw record sequence exhausted")]
-    RawRecordSequenceExhausted,
-    #[error("capture connection pacer failed: {0}")]
-    ConnectionPacer(#[from] reap_feed::ConnectionAttemptPacerError),
-    #[error("capture connection pacer failed during runtime: {0}")]
-    ConnectionPacerRuntime(String),
-    #[error("capture provenance failed: {0}")]
-    Provenance(String),
-    #[error(transparent)]
-    Host(#[from] HostHealthError),
-    #[error("capture host guard closed unexpectedly")]
-    HostGuardClosed,
-    #[error("capture host guard task failed: {0}")]
-    HostGuardJoin(tokio::task::JoinError),
-    #[error("capture host guard shutdown exceeded {timeout_ms}ms")]
-    HostGuardShutdownTimeout { timeout_ms: u128 },
-    #[error("{primary}; additional capture lifecycle failures: {secondary}")]
-    LifecycleFailure {
-        #[source]
-        primary: Box<CaptureError>,
-        secondary: String,
-    },
-    #[error("{source}")]
-    ReportedFailure {
-        #[source]
-        source: Box<CaptureError>,
-        report: Box<CaptureRunReport>,
-    },
-}
-
-impl CaptureError {
-    pub fn stable_code(&self) -> &'static str {
-        match self {
-            Self::InvalidConfigPath { .. }
-            | Self::ReadConfig { .. }
-            | Self::ConfigTooLarge { .. }
-            | Self::ParseConfig(_)
-            | Self::UnknownFields(_)
-            | Self::InvalidConfig(_) => "config",
-            Self::Partition(_) => "subscription_partition",
-            Self::Venue(_) => "venue_adapter",
-            Self::Io(_) | Self::OpenOutput { .. } => "capture_io",
-            Self::Serialization(_) => "serialization",
-            Self::WriterClosed(_) => "writer_closed",
-            Self::WriterJoin(_) => "writer_task",
-            Self::WriterBackpressure { .. } => "writer_backpressure",
-            Self::WriterShutdownTimeout { .. } => "writer_shutdown_timeout",
-            Self::WriterAbortTimeout { .. } => "writer_abort_timeout",
-            Self::WriterEvidenceTimeout { .. } => "writer_evidence_timeout",
-            Self::FeedClosed => "feed_closed",
-            Self::FeedShutdownTimeout { .. } => "feed_shutdown_timeout",
-            Self::RawRecordSequenceExhausted => "raw_record_sequence",
-            Self::ConnectionPacer(_) | Self::ConnectionPacerRuntime(_) => "connection_pacer",
-            Self::Provenance(_) => "provenance",
-            Self::Host(_)
-            | Self::HostGuardClosed
-            | Self::HostGuardJoin(_)
-            | Self::HostGuardShutdownTimeout { .. } => "host_guard",
-            Self::LifecycleFailure { primary, .. } => primary.stable_code(),
-            Self::ReportedFailure { source, .. } => source.stable_code(),
-        }
-    }
 }
 
 pub async fn run_capture_path(
@@ -1155,50 +950,11 @@ fn raw_capture(
     }
 }
 
-fn combine_capture_failures(failures: Vec<(&'static str, CaptureError)>) -> CaptureError {
-    let mut failures = failures.into_iter();
-    let Some((_, primary)) = failures.next() else {
-        return CaptureError::InvalidConfig(
-            "capture lifecycle failure aggregation received no failures".to_string(),
-        );
-    };
-    combine_capture_lifecycle_errors(primary, failures.collect())
-}
-
-pub(crate) fn combine_capture_lifecycle_errors(
-    primary: CaptureError,
-    additional: Vec<(&'static str, CaptureError)>,
-) -> CaptureError {
-    if additional.is_empty() {
-        return primary;
-    }
-    let secondary = additional
-        .into_iter()
-        .map(|(label, error)| format!("{label}: {error}"))
-        .collect::<Vec<_>>()
-        .join("; ");
-    CaptureError::LifecycleFailure {
-        primary: Box::new(primary),
-        secondary: truncate_utf8(&secondary, MAX_CAPTURE_FAILURE_MESSAGE_BYTES),
-    }
-}
-
 fn capture_failure_evidence(error: &CaptureError) -> CaptureFailureEvidence {
     CaptureFailureEvidence {
         code: error.stable_code().to_string(),
         message: truncate_utf8(&error.to_string(), MAX_CAPTURE_FAILURE_MESSAGE_BYTES),
     }
-}
-
-fn truncate_utf8(value: &str, maximum_bytes: usize) -> String {
-    if value.len() <= maximum_bytes {
-        return value.to_string();
-    }
-    let mut boundary = maximum_bytes;
-    while boundary > 0 && !value.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    value[..boundary].to_string()
 }
 
 fn unix_time_ms() -> u64 {
@@ -1225,253 +981,14 @@ async fn shutdown_signal() -> Result<(), std::io::Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use reap_core::{Channel, ConnId, Venue};
 
-    use reap_core::{Channel, ConnId, Level, MarketEvent, OrderBook, Venue};
-    use tokio::task::JoinHandle;
+    use crate::configuration::{
+        CaptureOutputConfig, CapturePriority, CaptureSubscriptionConfig, CaptureVenueConfig,
+    };
+    use crate::hashing::sha256_hex;
 
     use super::*;
-
-    #[test]
-    fn example_config_is_valid_and_public_only() {
-        let config =
-            CaptureConfig::from_toml(include_str!("../../../examples/capture-okx-public.toml"))
-                .unwrap();
-        assert!(config.validate().valid);
-        assert!(
-            config
-                .subscriptions()
-                .iter()
-                .all(|subscription| !subscription.channel.is_private())
-        );
-        assert!(
-            config
-                .subscriptions()
-                .iter()
-                .all(|subscription| subscription.connections == 2)
-        );
-    }
-
-    #[test]
-    fn deployment_config_is_absolute_redundant_and_matches_example() {
-        let mut deployment =
-            CaptureConfig::from_toml(include_str!("../../../deploy/capture/okx-btc-public.toml"))
-                .unwrap();
-        let local =
-            CaptureConfig::from_toml(include_str!("../../../examples/capture-okx-public.toml"))
-                .unwrap();
-
-        assert_eq!(
-            deployment.runtime.connection_attempt_pacer_path.as_deref(),
-            Some(Path::new("/var/lib/reap/connectivity/okx-global.pacer"))
-        );
-        assert!(deployment.output.raw_path.is_absolute());
-        assert!(
-            deployment
-                .subscriptions()
-                .iter()
-                .all(|subscription| !subscription.channel.is_private())
-        );
-        assert!(
-            deployment
-                .subscriptions()
-                .iter()
-                .all(|subscription| subscription.connections == 2)
-        );
-
-        deployment.runtime.connection_attempt_pacer_path =
-            local.runtime.connection_attempt_pacer_path.clone();
-        deployment.output.raw_path = local.output.raw_path.clone();
-        assert_eq!(
-            deployment.fingerprint().unwrap(),
-            local.fingerprint().unwrap()
-        );
-    }
-
-    #[test]
-    fn config_loader_records_one_canonical_source_path() {
-        let directory = tempfile::tempdir().unwrap();
-        let config_path = directory.path().join("capture.toml");
-        let alias_directory = directory.path().join("alias");
-        std::fs::create_dir(&alias_directory).unwrap();
-        std::fs::write(
-            &config_path,
-            include_str!("../../../examples/capture-okx-public.toml"),
-        )
-        .unwrap();
-
-        let (_, direct) = CaptureConfig::load_with_evidence(&config_path).unwrap();
-        let (_, aliased) =
-            CaptureConfig::load_with_evidence(alias_directory.join("..").join("capture.toml"))
-                .unwrap();
-
-        assert_eq!(direct, aliased);
-        assert_eq!(
-            direct.source_path,
-            std::fs::canonicalize(config_path).unwrap()
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn config_loader_rejects_symbolic_link() {
-        use std::os::unix::fs::symlink;
-
-        let directory = tempfile::tempdir().unwrap();
-        let config_path = directory.path().join("capture.toml");
-        let symlink_path = directory.path().join("capture-link.toml");
-        std::fs::write(
-            &config_path,
-            include_str!("../../../examples/capture-okx-public.toml"),
-        )
-        .unwrap();
-        symlink(&config_path, &symlink_path).unwrap();
-
-        assert!(matches!(
-            CaptureConfig::load_with_evidence(&symlink_path),
-            Err(CaptureError::InvalidConfigPath { path, .. }) if path == symlink_path
-        ));
-    }
-
-    #[test]
-    fn config_loader_rejects_oversized_regular_file() {
-        let directory = tempfile::tempdir().unwrap();
-        let config_path = directory.path().join("capture.toml");
-        let file = std::fs::File::create(&config_path).unwrap();
-        file.set_len(MAX_CAPTURE_CONFIG_BYTES + 1).unwrap();
-
-        assert!(matches!(
-            CaptureConfig::load_with_evidence(&config_path),
-            Err(CaptureError::ConfigTooLarge {
-                actual,
-                limit: MAX_CAPTURE_CONFIG_BYTES,
-                ..
-            }) if actual == MAX_CAPTURE_CONFIG_BYTES + 1
-        ));
-    }
-
-    #[test]
-    fn config_rejects_private_duplicate_and_missing_book_subscriptions() {
-        let config = CaptureConfig {
-            venue: CaptureVenueConfig::default(),
-            runtime: CaptureRuntimeConfig::default(),
-            output: CaptureOutputConfig::default(),
-            host_guard: HostGuardConfig::default(),
-            subscriptions: vec![
-                CaptureSubscriptionConfig {
-                    channel: "orders".to_string(),
-                    symbol: "BTC-USDT".to_string(),
-                    connections: 1,
-                    priority: CapturePriority::Critical,
-                },
-                CaptureSubscriptionConfig {
-                    channel: "orders".to_string(),
-                    symbol: "BTC-USDT".to_string(),
-                    connections: 1,
-                    priority: CapturePriority::Critical,
-                },
-            ],
-        };
-        let validation = config.validate();
-        assert!(!validation.valid);
-        assert!(
-            validation
-                .errors
-                .iter()
-                .any(|error| error.contains("unsupported public"))
-        );
-        assert!(
-            validation
-                .errors
-                .iter()
-                .any(|error| error.contains("duplicate capture"))
-        );
-        assert!(
-            validation
-                .errors
-                .iter()
-                .any(|error| error.contains("order-book"))
-        );
-    }
-
-    #[test]
-    fn config_rejects_multiple_book_channels_for_one_symbol() {
-        let config = CaptureConfig {
-            venue: CaptureVenueConfig::default(),
-            runtime: CaptureRuntimeConfig::default(),
-            output: CaptureOutputConfig::default(),
-            host_guard: HostGuardConfig::default(),
-            subscriptions: vec![
-                CaptureSubscriptionConfig {
-                    channel: "books".to_string(),
-                    symbol: "BTC-USDT".to_string(),
-                    connections: 1,
-                    priority: CapturePriority::Critical,
-                },
-                CaptureSubscriptionConfig {
-                    channel: "books-l2-tbt".to_string(),
-                    symbol: "BTC-USDT".to_string(),
-                    connections: 1,
-                    priority: CapturePriority::Critical,
-                },
-            ],
-        };
-
-        let validation = config.validate();
-
-        assert!(!validation.valid);
-        assert!(
-            validation
-                .errors
-                .iter()
-                .any(|error| error.contains("exactly one order-book channel"))
-        );
-    }
-
-    #[test]
-    fn config_requires_tls_except_for_loopback_tests() {
-        let mut config =
-            CaptureConfig::from_toml(include_str!("../../../examples/capture-okx-public.toml"))
-                .unwrap();
-        config.venue.public_ws_url = "ws://example.com/ws/v5/public".to_string();
-
-        let validation = config.validate();
-
-        assert!(!validation.valid);
-        assert!(validation.errors.iter().any(|error| error.contains("wss")));
-        config.venue.public_ws_url = "ws://127.0.0.1:8080/ws/v5/public".to_string();
-        config.runtime.connection_attempt_interval_ms = 0;
-        assert!(config.validate().valid);
-
-        config.venue.public_ws_url = "wss://ws.okx.com:8443/ws/v5/public".to_string();
-        let validation = config.validate();
-        assert!(!validation.valid);
-        assert!(
-            validation
-                .errors
-                .iter()
-                .any(|error| error.contains("must be at least 334"))
-        );
-
-        config.runtime.connection_attempt_interval_ms = 400;
-        config.runtime.connection_attempt_pacer_path = None;
-        let validation = config.validate();
-        assert!(
-            validation
-                .errors
-                .iter()
-                .any(|error| error.contains("pacer_path is required"))
-        );
-
-        config.runtime.connection_attempt_pacer_path = Some(config.output.raw_path.clone());
-        let validation = config.validate();
-        assert!(
-            validation
-                .errors
-                .iter()
-                .any(|error| error.contains("must differ from output.raw_path"))
-        );
-    }
 
     #[test]
     fn guarded_capture_evidence_is_bound_to_session_time_and_thresholds() {
@@ -1525,53 +1042,6 @@ mod tests {
             &late,
             12,
         ));
-    }
-
-    #[test]
-    fn capture_parser_rejects_unknown_fields_at_every_config_layer() {
-        let config =
-            CaptureConfig::from_toml(include_str!("../../../examples/capture-okx-public.toml"))
-                .unwrap();
-        let mut document = toml::Value::try_from(config).unwrap();
-        document
-            .as_table_mut()
-            .unwrap()
-            .insert("top_level_typo".to_string(), toml::Value::Boolean(true));
-        document["venue"]
-            .as_table_mut()
-            .unwrap()
-            .insert("websocket_typo".to_string(), toml::Value::Boolean(true));
-        document["runtime"]
-            .as_table_mut()
-            .unwrap()
-            .insert("pacing_typo".to_string(), toml::Value::Boolean(true));
-        document["output"]
-            .as_table_mut()
-            .unwrap()
-            .insert("fsync_typo".to_string(), toml::Value::Boolean(true));
-        document["host_guard"]
-            .as_table_mut()
-            .unwrap()
-            .insert("guard_typo".to_string(), toml::Value::Boolean(true));
-        document["subscriptions"].as_array_mut().unwrap()[0]
-            .as_table_mut()
-            .unwrap()
-            .insert("channel_typo".to_string(), toml::Value::Boolean(true));
-
-        let error = CaptureConfig::from_toml(&toml::to_string(&document).unwrap())
-            .unwrap_err()
-            .to_string();
-
-        for field in [
-            "top_level_typo",
-            "websocket_typo",
-            "pacing_typo",
-            "fsync_typo",
-            "guard_typo",
-            "channel_typo",
-        ] {
-            assert!(error.contains(field), "missing {field:?} in {error}");
-        }
     }
 
     #[test]
@@ -1768,39 +1238,6 @@ mod tests {
                 "okx-books-critical-r1-1".to_string(),
             ])
         );
-    }
-
-    #[tokio::test]
-    async fn normalized_writer_emits_backtest_compatible_jsonl() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("normalized.jsonl");
-        let writer = JsonlWriter::start("test", path.clone(), 4, 1, 0)
-            .await
-            .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600);
-        }
-        let event = NormalizedEvent::from(MarketEvent::Depth(OrderBook {
-            symbol: "BTC-USDT".to_string(),
-            ts_ms: 1,
-            bids: vec![Level::new(100.0, 1.0)],
-            asks: vec![Level::new(101.0, 1.0)],
-        }));
-        writer.send(event).await.unwrap();
-        let outcome = writer.shutdown_with_evidence().await.unwrap();
-        assert!(outcome.failure.is_none());
-        let stats = outcome.stats;
-        assert_eq!(stats.records, 1);
-        assert_eq!(stats.sha256.len(), 64);
-
-        let text = std::fs::read_to_string(path).unwrap();
-        let decoded: NormalizedEvent = serde_json::from_str(text.trim()).unwrap();
-        assert_eq!(decoded.ts_ms(), 1);
-        assert_eq!(stats.sha256, sha256_hex(text.as_bytes()));
     }
 
     #[cfg(target_os = "linux")]
@@ -2009,102 +1446,6 @@ mod tests {
         assert!(!evidence.message.is_empty());
         assert!(evidence.message.len() <= MAX_CAPTURE_FAILURE_MESSAGE_BYTES);
         assert!(evidence.message.is_char_boundary(evidence.message.len()));
-    }
-
-    #[tokio::test]
-    async fn writer_enqueue_fails_with_bounded_backpressure_evidence() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("stalled.jsonl");
-        std::fs::write(&path, []).unwrap();
-        let (sender, _receiver) = mpsc::channel::<u64>(1);
-        sender.send(1).await.unwrap();
-        let queued = Arc::new(AtomicUsize::new(1));
-        let max_queue_depth = Arc::new(AtomicUsize::new(1));
-        let task: JoinHandle<Result<String, CaptureError>> = tokio::spawn(std::future::pending());
-        let writer = JsonlWriter {
-            name: "test",
-            path,
-            sender: Some(sender),
-            task,
-            queued: Arc::clone(&queued),
-            max_queue_depth: Arc::clone(&max_queue_depth),
-            records: Arc::new(AtomicU64::new(0)),
-            bytes: Arc::new(AtomicU64::new(0)),
-        };
-
-        let error = tokio::time::timeout(
-            Duration::from_secs(1),
-            writer.send_with_timeout(2, Duration::from_millis(10)),
-        )
-        .await
-        .unwrap()
-        .unwrap_err();
-
-        assert!(matches!(
-            error,
-            CaptureError::WriterBackpressure {
-                name: "test",
-                timeout_ms: 10,
-            }
-        ));
-        assert_eq!(queued.load(Ordering::Relaxed), 1);
-        assert_eq!(max_queue_depth.load(Ordering::Relaxed), 2);
-        writer.task.abort();
-    }
-
-    #[tokio::test]
-    async fn writer_shutdown_timeout_aborts_task_and_recovers_partial_file_stats() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("partial.jsonl");
-        let partial = b"{\"record\":1}\n{\"record\":2}";
-        std::fs::write(&path, partial).unwrap();
-        let (sender, _receiver) = mpsc::channel::<u64>(1);
-        let task: JoinHandle<Result<String, CaptureError>> = tokio::spawn(std::future::pending());
-        let writer = JsonlWriter {
-            name: "test",
-            path,
-            sender: Some(sender),
-            task,
-            queued: Arc::new(AtomicUsize::new(0)),
-            max_queue_depth: Arc::new(AtomicUsize::new(3)),
-            records: Arc::new(AtomicU64::new(0)),
-            bytes: Arc::new(AtomicU64::new(0)),
-        };
-
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(1),
-            writer.shutdown_with_evidence_timeout(Duration::from_millis(10)),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-        assert!(matches!(
-            outcome.failure,
-            Some(CaptureError::WriterShutdownTimeout {
-                name: "test",
-                timeout_ms: 10,
-            })
-        ));
-        assert_eq!(outcome.stats.records, 2);
-        assert_eq!(outcome.stats.bytes, partial.len() as u64);
-        assert_eq!(outcome.stats.max_queue_depth, 3);
-        assert_eq!(outcome.stats.sha256, sha256_hex(partial));
-    }
-
-    #[tokio::test]
-    async fn writer_stats_scan_counts_a_trailing_partial_record() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("partial.jsonl");
-        let partial = b"first\nsecond";
-        std::fs::write(&path, partial).unwrap();
-
-        let stats = scan_jsonl_writer_stats(&path, 7).await.unwrap();
-
-        assert_eq!(stats.records, 2);
-        assert_eq!(stats.bytes, partial.len() as u64);
-        assert_eq!(stats.max_queue_depth, 7);
-        assert_eq!(stats.sha256, sha256_hex(partial));
     }
 
     #[tokio::test]

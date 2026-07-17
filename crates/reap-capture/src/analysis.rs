@@ -9,7 +9,8 @@ use reap_venue::{VenueAdapter, VenueEvent, okx::OkxAdapter};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{CaptureConfig, CaptureError, digest_hex, is_book_channel};
+use crate::hashing::digest_hex;
+use crate::{CaptureConfig, CaptureError, is_book_channel};
 
 const ANALYSIS_FORMAT_VERSION: u16 = 5;
 const DISTRIBUTION_SAMPLE_CAPACITY: usize = 8_192;
@@ -1017,9 +1018,10 @@ fn lower_debug(value: impl std::fmt::Debug) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hashing::sha256_hex;
     use crate::{
         CaptureOutputConfig, CapturePriority, CaptureRuntimeConfig, CaptureSubscriptionConfig,
-        CaptureVenueConfig, sha256_hex,
+        CaptureVenueConfig,
     };
 
     fn config(include_trades: bool) -> CaptureConfig {

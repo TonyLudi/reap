@@ -12,8 +12,9 @@ use reap_venue::okx::{okx_capability_registration, okx_public_channel_registrati
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::runtime::CaptureError;
-use crate::writer::sha256_hex;
+use crate::error::CaptureError;
+use crate::hashing::sha256_hex;
+use crate::report::CaptureConfigFileEvidence;
 
 pub const MAX_CAPTURE_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CONNECTION_ATTEMPT_INTERVAL_MS: u64 = 60_000;
@@ -137,14 +138,6 @@ impl From<CapturePriority> for FeedPriority {
 pub struct CaptureValidation {
     pub valid: bool,
     pub errors: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CaptureConfigFileEvidence {
-    pub source_path: PathBuf,
-    pub bytes: u64,
-    pub sha256: String,
 }
 
 impl CaptureConfig {
@@ -459,4 +452,297 @@ fn is_loopback_host(host: &str) -> bool {
             .trim_matches(['[', ']'])
             .parse::<IpAddr>()
             .is_ok_and(|address| address.is_loopback())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn example_config_is_valid_and_public_only() {
+        let config =
+            CaptureConfig::from_toml(include_str!("../../../examples/capture-okx-public.toml"))
+                .unwrap();
+        assert!(config.validate().valid);
+        assert!(
+            config
+                .subscriptions()
+                .iter()
+                .all(|subscription| !subscription.channel.is_private())
+        );
+        assert!(
+            config
+                .subscriptions()
+                .iter()
+                .all(|subscription| subscription.connections == 2)
+        );
+    }
+
+    #[test]
+    fn deployment_config_is_absolute_redundant_and_matches_example() {
+        let mut deployment =
+            CaptureConfig::from_toml(include_str!("../../../deploy/capture/okx-btc-public.toml"))
+                .unwrap();
+        let local =
+            CaptureConfig::from_toml(include_str!("../../../examples/capture-okx-public.toml"))
+                .unwrap();
+
+        assert_eq!(
+            deployment.runtime.connection_attempt_pacer_path.as_deref(),
+            Some(Path::new("/var/lib/reap/connectivity/okx-global.pacer"))
+        );
+        assert!(deployment.output.raw_path.is_absolute());
+        assert!(
+            deployment
+                .subscriptions()
+                .iter()
+                .all(|subscription| !subscription.channel.is_private())
+        );
+        assert!(
+            deployment
+                .subscriptions()
+                .iter()
+                .all(|subscription| subscription.connections == 2)
+        );
+
+        deployment.runtime.connection_attempt_pacer_path =
+            local.runtime.connection_attempt_pacer_path.clone();
+        deployment.output.raw_path = local.output.raw_path.clone();
+        assert_eq!(
+            deployment.fingerprint().unwrap(),
+            local.fingerprint().unwrap()
+        );
+    }
+
+    #[test]
+    fn config_loader_records_one_canonical_source_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("capture.toml");
+        let alias_directory = directory.path().join("alias");
+        std::fs::create_dir(&alias_directory).unwrap();
+        std::fs::write(
+            &config_path,
+            include_str!("../../../examples/capture-okx-public.toml"),
+        )
+        .unwrap();
+
+        let (_, direct) = CaptureConfig::load_with_evidence(&config_path).unwrap();
+        let (_, aliased) =
+            CaptureConfig::load_with_evidence(alias_directory.join("..").join("capture.toml"))
+                .unwrap();
+
+        assert_eq!(direct, aliased);
+        assert_eq!(
+            direct.source_path,
+            std::fs::canonicalize(config_path).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_loader_rejects_symbolic_link() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("capture.toml");
+        let symlink_path = directory.path().join("capture-link.toml");
+        std::fs::write(
+            &config_path,
+            include_str!("../../../examples/capture-okx-public.toml"),
+        )
+        .unwrap();
+        symlink(&config_path, &symlink_path).unwrap();
+
+        assert!(matches!(
+            CaptureConfig::load_with_evidence(&symlink_path),
+            Err(CaptureError::InvalidConfigPath { path, .. }) if path == symlink_path
+        ));
+    }
+
+    #[test]
+    fn config_loader_rejects_oversized_regular_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("capture.toml");
+        let file = std::fs::File::create(&config_path).unwrap();
+        file.set_len(MAX_CAPTURE_CONFIG_BYTES + 1).unwrap();
+
+        assert!(matches!(
+            CaptureConfig::load_with_evidence(&config_path),
+            Err(CaptureError::ConfigTooLarge {
+                actual,
+                limit: MAX_CAPTURE_CONFIG_BYTES,
+                ..
+            }) if actual == MAX_CAPTURE_CONFIG_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn config_rejects_private_duplicate_and_missing_book_subscriptions() {
+        let config = CaptureConfig {
+            venue: CaptureVenueConfig::default(),
+            runtime: CaptureRuntimeConfig::default(),
+            output: CaptureOutputConfig::default(),
+            host_guard: HostGuardConfig::default(),
+            subscriptions: vec![
+                CaptureSubscriptionConfig {
+                    channel: "orders".to_string(),
+                    symbol: "BTC-USDT".to_string(),
+                    connections: 1,
+                    priority: CapturePriority::Critical,
+                },
+                CaptureSubscriptionConfig {
+                    channel: "orders".to_string(),
+                    symbol: "BTC-USDT".to_string(),
+                    connections: 1,
+                    priority: CapturePriority::Critical,
+                },
+            ],
+        };
+        let validation = config.validate();
+        assert!(!validation.valid);
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("unsupported public"))
+        );
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("duplicate capture"))
+        );
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("order-book"))
+        );
+    }
+
+    #[test]
+    fn config_rejects_multiple_book_channels_for_one_symbol() {
+        let config = CaptureConfig {
+            venue: CaptureVenueConfig::default(),
+            runtime: CaptureRuntimeConfig::default(),
+            output: CaptureOutputConfig::default(),
+            host_guard: HostGuardConfig::default(),
+            subscriptions: vec![
+                CaptureSubscriptionConfig {
+                    channel: "books".to_string(),
+                    symbol: "BTC-USDT".to_string(),
+                    connections: 1,
+                    priority: CapturePriority::Critical,
+                },
+                CaptureSubscriptionConfig {
+                    channel: "books-l2-tbt".to_string(),
+                    symbol: "BTC-USDT".to_string(),
+                    connections: 1,
+                    priority: CapturePriority::Critical,
+                },
+            ],
+        };
+
+        let validation = config.validate();
+
+        assert!(!validation.valid);
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("exactly one order-book channel"))
+        );
+    }
+
+    #[test]
+    fn config_requires_tls_except_for_loopback_tests() {
+        let mut config =
+            CaptureConfig::from_toml(include_str!("../../../examples/capture-okx-public.toml"))
+                .unwrap();
+        config.venue.public_ws_url = "ws://example.com/ws/v5/public".to_string();
+
+        let validation = config.validate();
+
+        assert!(!validation.valid);
+        assert!(validation.errors.iter().any(|error| error.contains("wss")));
+        config.venue.public_ws_url = "ws://127.0.0.1:8080/ws/v5/public".to_string();
+        config.runtime.connection_attempt_interval_ms = 0;
+        assert!(config.validate().valid);
+
+        config.venue.public_ws_url = "wss://ws.okx.com:8443/ws/v5/public".to_string();
+        let validation = config.validate();
+        assert!(!validation.valid);
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("must be at least 334"))
+        );
+
+        config.runtime.connection_attempt_interval_ms = 400;
+        config.runtime.connection_attempt_pacer_path = None;
+        let validation = config.validate();
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("pacer_path is required"))
+        );
+
+        config.runtime.connection_attempt_pacer_path = Some(config.output.raw_path.clone());
+        let validation = config.validate();
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("must differ from output.raw_path"))
+        );
+    }
+
+    #[test]
+    fn capture_parser_rejects_unknown_fields_at_every_config_layer() {
+        let config =
+            CaptureConfig::from_toml(include_str!("../../../examples/capture-okx-public.toml"))
+                .unwrap();
+        let mut document = toml::Value::try_from(config).unwrap();
+        document
+            .as_table_mut()
+            .unwrap()
+            .insert("top_level_typo".to_string(), toml::Value::Boolean(true));
+        document["venue"]
+            .as_table_mut()
+            .unwrap()
+            .insert("websocket_typo".to_string(), toml::Value::Boolean(true));
+        document["runtime"]
+            .as_table_mut()
+            .unwrap()
+            .insert("pacing_typo".to_string(), toml::Value::Boolean(true));
+        document["output"]
+            .as_table_mut()
+            .unwrap()
+            .insert("fsync_typo".to_string(), toml::Value::Boolean(true));
+        document["host_guard"]
+            .as_table_mut()
+            .unwrap()
+            .insert("guard_typo".to_string(), toml::Value::Boolean(true));
+        document["subscriptions"].as_array_mut().unwrap()[0]
+            .as_table_mut()
+            .unwrap()
+            .insert("channel_typo".to_string(), toml::Value::Boolean(true));
+
+        let error = CaptureConfig::from_toml(&toml::to_string(&document).unwrap())
+            .unwrap_err()
+            .to_string();
+
+        for field in [
+            "top_level_typo",
+            "websocket_typo",
+            "pacing_typo",
+            "fsync_typo",
+            "guard_typo",
+            "channel_typo",
+        ] {
+            assert!(error.contains(field), "missing {field:?} in {error}");
+        }
+    }
 }

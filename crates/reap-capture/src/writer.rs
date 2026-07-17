@@ -9,7 +9,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::runtime::{CaptureError, combine_capture_lifecycle_errors};
+use crate::error::{CaptureError, combine_capture_lifecycle_errors};
+use crate::hashing::{digest_hex, sha256_hex};
 
 const WRITER_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(1);
 const WRITER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -17,15 +18,15 @@ const WRITER_ABORT_TIMEOUT: Duration = Duration::from_secs(1);
 const WRITER_EVIDENCE_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct JsonlWriterStats {
-    pub(crate) records: u64,
-    pub(crate) bytes: u64,
-    pub(crate) max_queue_depth: usize,
-    pub(crate) sha256: String,
+pub(super) struct JsonlWriterStats {
+    pub(super) records: u64,
+    pub(super) bytes: u64,
+    pub(super) max_queue_depth: usize,
+    pub(super) sha256: String,
 }
 
 impl JsonlWriterStats {
-    pub(crate) fn empty() -> Self {
+    pub(super) fn empty() -> Self {
         Self {
             sha256: sha256_hex(&[]),
             ..Self::default()
@@ -33,27 +34,27 @@ impl JsonlWriterStats {
     }
 }
 
-pub(crate) struct JsonlWriter<T> {
-    pub(crate) name: &'static str,
-    pub(crate) path: PathBuf,
-    pub(crate) sender: Option<mpsc::Sender<T>>,
-    pub(crate) task: JoinHandle<Result<String, CaptureError>>,
-    pub(crate) queued: Arc<AtomicUsize>,
-    pub(crate) max_queue_depth: Arc<AtomicUsize>,
-    pub(crate) records: Arc<AtomicU64>,
-    pub(crate) bytes: Arc<AtomicU64>,
+pub(super) struct JsonlWriter<T> {
+    name: &'static str,
+    path: PathBuf,
+    sender: Option<mpsc::Sender<T>>,
+    task: JoinHandle<Result<String, CaptureError>>,
+    queued: Arc<AtomicUsize>,
+    max_queue_depth: Arc<AtomicUsize>,
+    records: Arc<AtomicU64>,
+    bytes: Arc<AtomicU64>,
 }
 
-pub(crate) struct JsonlWriterShutdown {
-    pub(crate) stats: JsonlWriterStats,
-    pub(crate) failure: Option<CaptureError>,
+pub(super) struct JsonlWriterShutdown {
+    pub(super) stats: JsonlWriterStats,
+    pub(super) failure: Option<CaptureError>,
 }
 
 impl<T> JsonlWriter<T>
 where
     T: Serialize + Send + 'static,
 {
-    pub(crate) async fn start(
+    pub(super) async fn start(
         name: &'static str,
         path: PathBuf,
         capacity: usize,
@@ -102,11 +103,11 @@ where
         })
     }
 
-    pub(crate) async fn send(&self, value: T) -> Result<(), CaptureError> {
+    pub(super) async fn send(&self, value: T) -> Result<(), CaptureError> {
         self.send_with_timeout(value, WRITER_ENQUEUE_TIMEOUT).await
     }
 
-    pub(crate) async fn send_with_timeout(
+    async fn send_with_timeout(
         &self,
         value: T,
         enqueue_timeout: Duration,
@@ -133,12 +134,12 @@ where
         }
     }
 
-    pub(crate) async fn shutdown_with_evidence(self) -> Result<JsonlWriterShutdown, CaptureError> {
+    pub(super) async fn shutdown_with_evidence(self) -> Result<JsonlWriterShutdown, CaptureError> {
         self.shutdown_with_evidence_timeout(WRITER_SHUTDOWN_TIMEOUT)
             .await
     }
 
-    pub(crate) async fn shutdown_with_evidence_timeout(
+    async fn shutdown_with_evidence_timeout(
         mut self,
         shutdown_timeout: Duration,
     ) -> Result<JsonlWriterShutdown, CaptureError> {
@@ -221,7 +222,7 @@ where
     }
 }
 
-pub(crate) async fn scan_jsonl_writer_stats(
+async fn scan_jsonl_writer_stats(
     path: &Path,
     max_queue_depth: usize,
 ) -> Result<JsonlWriterStats, CaptureError> {
@@ -311,16 +312,141 @@ async fn sync_parent_directory(_path: &Path) -> Result<(), CaptureError> {
     Ok(())
 }
 
-pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    digest_hex(hasher.finalize())
-}
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-pub(crate) fn digest_hex(bytes: impl AsRef<[u8]>) -> String {
-    bytes
-        .as_ref()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    use reap_core::{Level, MarketEvent, NormalizedEvent, OrderBook};
+    use tokio::task::JoinHandle;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn normalized_writer_emits_backtest_compatible_jsonl() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("normalized.jsonl");
+        let writer = JsonlWriter::start("test", path.clone(), 4, 1, 0)
+            .await
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let event = NormalizedEvent::from(MarketEvent::Depth(OrderBook {
+            symbol: "BTC-USDT".to_string(),
+            ts_ms: 1,
+            bids: vec![Level::new(100.0, 1.0)],
+            asks: vec![Level::new(101.0, 1.0)],
+        }));
+        writer.send(event).await.unwrap();
+        let outcome = writer.shutdown_with_evidence().await.unwrap();
+        assert!(outcome.failure.is_none());
+        let stats = outcome.stats;
+        assert_eq!(stats.records, 1);
+        assert_eq!(stats.sha256.len(), 64);
+
+        let text = std::fs::read_to_string(path).unwrap();
+        let decoded: NormalizedEvent = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(decoded.ts_ms(), 1);
+        assert_eq!(stats.sha256, sha256_hex(text.as_bytes()));
+    }
+
+    #[tokio::test]
+    async fn writer_enqueue_fails_with_bounded_backpressure_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stalled.jsonl");
+        std::fs::write(&path, []).unwrap();
+        let (sender, _receiver) = mpsc::channel::<u64>(1);
+        sender.send(1).await.unwrap();
+        let queued = Arc::new(AtomicUsize::new(1));
+        let max_queue_depth = Arc::new(AtomicUsize::new(1));
+        let task: JoinHandle<Result<String, CaptureError>> = tokio::spawn(std::future::pending());
+        let writer = JsonlWriter {
+            name: "test",
+            path,
+            sender: Some(sender),
+            task,
+            queued: Arc::clone(&queued),
+            max_queue_depth: Arc::clone(&max_queue_depth),
+            records: Arc::new(AtomicU64::new(0)),
+            bytes: Arc::new(AtomicU64::new(0)),
+        };
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            writer.send_with_timeout(2, Duration::from_millis(10)),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CaptureError::WriterBackpressure {
+                name: "test",
+                timeout_ms: 10,
+            }
+        ));
+        assert_eq!(queued.load(Ordering::Relaxed), 1);
+        assert_eq!(max_queue_depth.load(Ordering::Relaxed), 2);
+        writer.task.abort();
+    }
+
+    #[tokio::test]
+    async fn writer_shutdown_timeout_aborts_task_and_recovers_partial_file_stats() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("partial.jsonl");
+        let partial = b"{\"record\":1}\n{\"record\":2}";
+        std::fs::write(&path, partial).unwrap();
+        let (sender, _receiver) = mpsc::channel::<u64>(1);
+        let task: JoinHandle<Result<String, CaptureError>> = tokio::spawn(std::future::pending());
+        let writer = JsonlWriter {
+            name: "test",
+            path,
+            sender: Some(sender),
+            task,
+            queued: Arc::new(AtomicUsize::new(0)),
+            max_queue_depth: Arc::new(AtomicUsize::new(3)),
+            records: Arc::new(AtomicU64::new(0)),
+            bytes: Arc::new(AtomicU64::new(0)),
+        };
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            writer.shutdown_with_evidence_timeout(Duration::from_millis(10)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(matches!(
+            outcome.failure,
+            Some(CaptureError::WriterShutdownTimeout {
+                name: "test",
+                timeout_ms: 10,
+            })
+        ));
+        assert_eq!(outcome.stats.records, 2);
+        assert_eq!(outcome.stats.bytes, partial.len() as u64);
+        assert_eq!(outcome.stats.max_queue_depth, 3);
+        assert_eq!(outcome.stats.sha256, sha256_hex(partial));
+    }
+
+    #[tokio::test]
+    async fn writer_stats_scan_counts_a_trailing_partial_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("partial.jsonl");
+        let partial = b"first\nsecond";
+        std::fs::write(&path, partial).unwrap();
+
+        let stats = scan_jsonl_writer_stats(&path, 7).await.unwrap();
+
+        assert_eq!(stats.records, 2);
+        assert_eq!(stats.bytes, partial.len() as u64);
+        assert_eq!(stats.max_queue_depth, 7);
+        assert_eq!(stats.sha256, sha256_hex(partial));
+    }
 }
