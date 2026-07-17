@@ -722,3 +722,12 @@ After reviewing this Goal A handoff, the next refactor prompt is Goal B:
 > `../imm-strategy` behavior, serialized evidence, and single-writer
 > semantics. Record and continue through green phase gates; stop and report any
 > listed stop condition. Do not add production-readiness features.
+
+The complete ready-to-run instruction set, including phase discipline, final
+commands, stop conditions, and completion criteria, is
+[chaos-connectivity-goal-b-prompt.md](chaos-connectivity-goal-b-prompt.md).
+Invoke it with:
+
+> Implement Goal B exactly as specified in
+> `docs/chaos-connectivity-goal-b-prompt.md`. Continue through green phase
+> gates and stop only at completion or a documented stop condition.
