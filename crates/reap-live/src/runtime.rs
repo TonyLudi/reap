@@ -49,6 +49,7 @@ use crate::provenance::{
     current_executable_sha256 as hash_current_executable,
     host_identity_sha256 as hash_host_identity, okx_account_identity_sha256,
 };
+use crate::safety_contracts::LiveFaultFailureCode;
 use crate::{
     AccountBootstrapSnapshot, CancelAction, ChaosConnectivityPlan, ChaosConnectivityPlanError,
     CoordinatorError, CoordinatorOutput, HostGuardRuntime, HostHealthError, HostHealthSnapshot,
@@ -330,17 +331,21 @@ impl LiveRuntimeError {
             Self::MissingRecoveryRoute(_) => "missing_recovery_route",
             Self::ReadinessTimeout(_) => "readiness_timeout",
             Self::GatewayTask(_) => "gateway_task",
-            Self::DeadmanHeartbeat(_) => "deadman_heartbeat",
-            Self::ExchangeClockSkew(_) => "exchange_clock_skew",
-            Self::ExchangeClockCheck(_) => "exchange_clock_check",
-            Self::ExchangeStatus(_) => "exchange_status",
-            Self::ExchangeStatusCheck(_) => "exchange_status_check",
-            Self::ExchangeFeeDrift(_) => "exchange_fee_drift",
-            Self::ExchangeFeeCheck(_) => "exchange_fee_check",
-            Self::ExchangeInstrumentDrift(_) => "exchange_instrument_drift",
-            Self::ExchangeInstrumentCheck(_) => "exchange_instrument_check",
-            Self::AccountConfigDrift(_) => "account_config_drift",
-            Self::AccountConfigCheck(_) => "account_config_check",
+            Self::DeadmanHeartbeat(_) => LiveFaultFailureCode::DeadmanHeartbeat.as_str(),
+            Self::ExchangeClockSkew(_) => LiveFaultFailureCode::ExchangeClockSkew.as_str(),
+            Self::ExchangeClockCheck(_) => LiveFaultFailureCode::ExchangeClockCheck.as_str(),
+            Self::ExchangeStatus(_) => LiveFaultFailureCode::ExchangeStatus.as_str(),
+            Self::ExchangeStatusCheck(_) => LiveFaultFailureCode::ExchangeStatusCheck.as_str(),
+            Self::ExchangeFeeDrift(_) => LiveFaultFailureCode::ExchangeFeeDrift.as_str(),
+            Self::ExchangeFeeCheck(_) => LiveFaultFailureCode::ExchangeFeeCheck.as_str(),
+            Self::ExchangeInstrumentDrift(_) => {
+                LiveFaultFailureCode::ExchangeInstrumentDrift.as_str()
+            }
+            Self::ExchangeInstrumentCheck(_) => {
+                LiveFaultFailureCode::ExchangeInstrumentCheck.as_str()
+            }
+            Self::AccountConfigDrift(_) => LiveFaultFailureCode::AccountConfigDrift.as_str(),
+            Self::AccountConfigCheck(_) => LiveFaultFailureCode::AccountConfigCheck.as_str(),
             Self::SafetyLatchSyncTimeout(_) => "safety_latch_sync_timeout",
             Self::ShutdownUnresolved { .. } => "shutdown_unresolved",
             Self::TeardownTimeout(_) => "teardown_timeout",

@@ -7,6 +7,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::safety_contracts::{LiveFaultFailureClass, LiveFaultFailureCode};
 use crate::{
     LiveConfig, LiveConfigError, LiveConfigFileEvidence, LiveMode, LiveRunFileEvidence,
     LiveRunReport, LiveRunVerificationError, LiveRunVerificationFailure, LiveStopReason,
@@ -774,74 +775,55 @@ fn evaluate_scenario(
         LiveFaultScenario::DeadmanHeartbeatFailure => {
             require_demo(report, &mut failures);
             require_safe_runtime_failure_shutdown(report, &mut failures);
-            if report.failure.as_ref().map(|failure| failure.code.as_str())
-                != Some("deadman_heartbeat")
-            {
+            if !has_fault_failure_class(report, LiveFaultFailureClass::DeadmanHeartbeat) {
                 failures.push(LiveFaultScenarioFailure::DeadmanHeartbeatFailureMissing);
             }
         }
         LiveFaultScenario::ExchangeClockFailure => {
             require_demo(report, &mut failures);
             require_safe_runtime_failure_shutdown(report, &mut failures);
-            if !report.failure.as_ref().is_some_and(|failure| {
-                matches!(
-                    failure.code.as_str(),
-                    "exchange_clock_skew" | "exchange_clock_check"
-                )
-            }) {
+            if !has_fault_failure_class(report, LiveFaultFailureClass::ExchangeClock) {
                 failures.push(LiveFaultScenarioFailure::ExchangeClockFailureMissing);
             }
         }
         LiveFaultScenario::ExchangeStatusFailure => {
             require_demo(report, &mut failures);
             require_safe_runtime_failure_shutdown(report, &mut failures);
-            if !report.failure.as_ref().is_some_and(|failure| {
-                matches!(
-                    failure.code.as_str(),
-                    "exchange_status" | "exchange_status_check"
-                )
-            }) {
+            if !has_fault_failure_class(report, LiveFaultFailureClass::ExchangeStatus) {
                 failures.push(LiveFaultScenarioFailure::ExchangeStatusFailureMissing);
             }
         }
         LiveFaultScenario::ExchangeInstrumentFailure => {
             require_demo(report, &mut failures);
             require_safe_runtime_failure_shutdown(report, &mut failures);
-            if !report.failure.as_ref().is_some_and(|failure| {
-                matches!(
-                    failure.code.as_str(),
-                    "exchange_instrument_drift" | "exchange_instrument_check"
-                )
-            }) {
+            if !has_fault_failure_class(report, LiveFaultFailureClass::ExchangeInstrument) {
                 failures.push(LiveFaultScenarioFailure::ExchangeInstrumentFailureMissing);
             }
         }
         LiveFaultScenario::ExchangeFeeFailure => {
             require_demo(report, &mut failures);
             require_safe_runtime_failure_shutdown(report, &mut failures);
-            if !report.failure.as_ref().is_some_and(|failure| {
-                matches!(
-                    failure.code.as_str(),
-                    "exchange_fee_drift" | "exchange_fee_check"
-                )
-            }) {
+            if !has_fault_failure_class(report, LiveFaultFailureClass::ExchangeFee) {
                 failures.push(LiveFaultScenarioFailure::ExchangeFeeFailureMissing);
             }
         }
         LiveFaultScenario::AccountConfigFailure => {
             require_demo(report, &mut failures);
             require_safe_runtime_failure_shutdown(report, &mut failures);
-            if !report.failure.as_ref().is_some_and(|failure| {
-                matches!(
-                    failure.code.as_str(),
-                    "account_config_drift" | "account_config_check"
-                )
-            }) {
+            if !has_fault_failure_class(report, LiveFaultFailureClass::AccountConfig) {
                 failures.push(LiveFaultScenarioFailure::AccountConfigFailureMissing);
             }
         }
     }
     failures
+}
+
+fn has_fault_failure_class(report: &LiveRunReport, expected: LiveFaultFailureClass) -> bool {
+    report
+        .failure
+        .as_ref()
+        .and_then(|failure| LiveFaultFailureCode::parse(&failure.code))
+        .is_some_and(|code| code.class() == expected)
 }
 
 fn require_observe(report: &LiveRunReport, failures: &mut Vec<LiveFaultScenarioFailure>) {
@@ -1372,6 +1354,7 @@ mod tests {
     use reap_core::PINNED_JAVA_REVISION;
 
     use super::*;
+    use crate::safety_contracts::LiveCleanSoakInputs;
     use crate::{
         HostHealthSnapshot, LIVE_RUN_REPORT_SCHEMA_VERSION, LiveFailureEvidence,
         LiveLatencyEvidence, LivePhase, ReadinessSnapshot,
@@ -1587,43 +1570,46 @@ mod tests {
                 report.restored_safety_latches = 1;
             }
             LiveFaultScenario::DeadmanHeartbeatFailure => {
-                set_runtime_failure(&mut report, "deadman_heartbeat");
+                set_runtime_failure(&mut report, LiveFaultFailureCode::DeadmanHeartbeat);
             }
             LiveFaultScenario::ExchangeClockFailure => {
-                set_runtime_failure(&mut report, "exchange_clock_skew");
+                set_runtime_failure(&mut report, LiveFaultFailureCode::ExchangeClockSkew);
             }
             LiveFaultScenario::ExchangeStatusFailure => {
-                set_runtime_failure(&mut report, "exchange_status");
+                set_runtime_failure(&mut report, LiveFaultFailureCode::ExchangeStatus);
             }
             LiveFaultScenario::ExchangeInstrumentFailure => {
-                set_runtime_failure(&mut report, "exchange_instrument_drift");
+                set_runtime_failure(&mut report, LiveFaultFailureCode::ExchangeInstrumentDrift);
             }
             LiveFaultScenario::ExchangeFeeFailure => {
-                set_runtime_failure(&mut report, "exchange_fee_drift");
+                set_runtime_failure(&mut report, LiveFaultFailureCode::ExchangeFeeDrift);
             }
             LiveFaultScenario::AccountConfigFailure => {
-                set_runtime_failure(&mut report, "account_config_drift");
+                set_runtime_failure(&mut report, LiveFaultFailureCode::AccountConfigDrift);
             }
         }
         report.connection_disconnect_events = report
             .public_connection_disconnect_events
             .saturating_add(report.private_connection_disconnect_events)
             .saturating_add(report.order_transport_disconnect_events);
-        report.clean_soak = report.stop_reason == LiveStopReason::DurationElapsed
-            && report.reached_ready
-            && report.readiness_at_stop.is_ready()
-            && report.reconciliation_drift_events == 0
-            && report.operator_mutations == 0
-            && report.dropped_storage_records == 0
-            && report.active_orders_after_shutdown == 0
-            && report.alert_delivery_failures == 0;
+        report.clean_soak = LiveCleanSoakInputs {
+            duration_elapsed: report.stop_reason == LiveStopReason::DurationElapsed,
+            reached_ready: report.reached_ready,
+            readiness_at_stop_ready: report.readiness_at_stop.is_ready(),
+            reconciliation_drift_free: report.reconciliation_drift_events == 0,
+            operator_mutation_free: report.operator_mutations == 0,
+            storage_records_complete: report.dropped_storage_records == 0,
+            no_active_orders_after_shutdown: report.active_orders_after_shutdown == 0,
+            alert_delivery_failure_free: report.alert_delivery_failures == 0,
+        }
+        .qualifies_as_clean_soak();
         report
     }
 
-    fn set_runtime_failure(report: &mut LiveRunReport, code: &str) {
+    fn set_runtime_failure(report: &mut LiveRunReport, code: LiveFaultFailureCode) {
         report.stop_reason = LiveStopReason::RuntimeFailure;
         report.failure = Some(LiveFailureEvidence {
-            code: code.to_string(),
+            code: code.as_str().to_string(),
             message: "injected campaign failure".to_string(),
         });
     }
@@ -2027,7 +2013,8 @@ mod tests {
             .clone();
         let mut instrument: LiveRunReport =
             serde_json::from_slice(&std::fs::read(&instrument_path).unwrap()).unwrap();
-        instrument.failure.as_mut().unwrap().code = "exchange_fee_drift".to_string();
+        instrument.failure.as_mut().unwrap().code =
+            LiveFaultFailureCode::ExchangeFeeDrift.as_str().to_string();
         std::fs::write(
             &instrument_path,
             serde_json::to_vec_pretty(&instrument).unwrap(),

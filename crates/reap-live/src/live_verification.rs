@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::safety_contracts::LiveCleanSoakInputs;
 use crate::{
     LIVE_LATENCY_EVIDENCE_SCHEMA_VERSION, LIVE_LATENCY_RESERVOIR_CAPACITY,
     LIVE_RUN_REPORT_SCHEMA_VERSION, LiveConfig, LiveConfigError, LiveMode, LiveRunReport,
@@ -556,14 +557,17 @@ fn validate_latency_evidence(
 }
 
 fn derive_clean_soak(report: &LiveRunReport) -> bool {
-    report.stop_reason == LiveStopReason::DurationElapsed
-        && report.reached_ready
-        && report.readiness_at_stop.is_ready()
-        && report.reconciliation_drift_events == 0
-        && report.operator_mutations == 0
-        && report.dropped_storage_records == 0
-        && report.active_orders_after_shutdown == 0
-        && report.alert_delivery_failures == 0
+    LiveCleanSoakInputs {
+        duration_elapsed: report.stop_reason == LiveStopReason::DurationElapsed,
+        reached_ready: report.reached_ready,
+        readiness_at_stop_ready: report.readiness_at_stop.is_ready(),
+        reconciliation_drift_free: report.reconciliation_drift_events == 0,
+        operator_mutation_free: report.operator_mutations == 0,
+        storage_records_complete: report.dropped_storage_records == 0,
+        no_active_orders_after_shutdown: report.active_orders_after_shutdown == 0,
+        alert_delivery_failure_free: report.alert_delivery_failures == 0,
+    }
+    .qualifies_as_clean_soak()
 }
 
 fn read_report(path: &Path) -> Result<(PathBuf, Vec<u8>), LiveRunVerificationError> {

@@ -18,6 +18,7 @@ mod provenance;
 mod regular_execution;
 mod runtime;
 mod runtime_config;
+mod safety_contracts;
 mod startup;
 mod statement;
 

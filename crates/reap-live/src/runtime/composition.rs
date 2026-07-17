@@ -8,6 +8,8 @@ use reap_okx_live_adapter::{
 use reap_order::OkxReconciliationClient;
 use reap_storage::{OrderAckStatus, OrderOperation, StorageRecord, StorageRuntime, StorageSink};
 
+use crate::safety_contracts::LiveCleanSoakInputs;
+
 use super::readiness_safety::{ExchangeInstrumentGuard, ReadinessPort, SafetyPort};
 use super::{
     LiveConfigFileEvidence, LiveFailureEvidence, LiveGateway, LiveLatencyCollector, LiveMode,
@@ -218,14 +220,17 @@ pub(super) fn qualifies_as_clean_soak(
     active_orders_after_shutdown: usize,
     alert_delivery_failures: u64,
 ) -> bool {
-    outcome.stop_reason == LiveStopReason::DurationElapsed
-        && outcome.reached_ready
-        && outcome.readiness_at_stop.is_ready()
-        && evidence.reconciliation_drift_events == 0
-        && evidence.operator_mutations == 0
-        && dropped_storage_records == 0
-        && active_orders_after_shutdown == 0
-        && alert_delivery_failures == 0
+    LiveCleanSoakInputs {
+        duration_elapsed: outcome.stop_reason == LiveStopReason::DurationElapsed,
+        reached_ready: outcome.reached_ready,
+        readiness_at_stop_ready: outcome.readiness_at_stop.is_ready(),
+        reconciliation_drift_free: evidence.reconciliation_drift_events == 0,
+        operator_mutation_free: evidence.operator_mutations == 0,
+        storage_records_complete: dropped_storage_records == 0,
+        no_active_orders_after_shutdown: active_orders_after_shutdown == 0,
+        alert_delivery_failure_free: alert_delivery_failures == 0,
+    }
+    .qualifies_as_clean_soak()
 }
 
 pub(super) fn combine_lifecycle_errors(
