@@ -8,7 +8,7 @@ pub(super) const TRADE_MS: u64 = 1_050_000;
 pub(super) const FUNDING_MS: u64 = 1_100_000;
 
 pub(super) fn config() -> LiveConfig {
-    LiveConfig::from_toml(include_str!("../../../../../examples/live-okx-demo.toml")).unwrap()
+    LiveConfig::from_toml(include_str!("../../../../examples/live-okx-demo.toml")).unwrap()
 }
 
 pub(super) fn options() -> EconomicReconciliationOptions {

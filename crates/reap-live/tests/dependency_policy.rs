@@ -765,16 +765,62 @@ fn workspace_relative(workspace: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
+const INLINE_TEST_MODULE_MARKER: &str = "#[cfg(test)]\nmod tests";
+const EXTERNAL_TEST_MODULE_MARKERS: [&str; 5] = [
+    "#[cfg(test)]\n#[path = \"../tests/runner_unit/mod.rs\"]\nmod tests;",
+    "#[cfg(test)]\n#[path = \"../tests/coordinator_unit/mod.rs\"]\nmod tests;",
+    "#[cfg(test)]\n#[path = \"../tests/runtime_unit/mod.rs\"]\nmod tests;",
+    "#[cfg(test)]\n#[path = \"../tests/economic_statement_unit/mod.rs\"]\nmod tests;",
+    "#[cfg(test)]\n#[path = \"../tests/production_evidence_unit/mod.rs\"]\nmod tests;",
+];
+
 fn production_rust_source(source: &str) -> &str {
-    for marker in [
-        "#[cfg(test)]\nmod tests",
-        "#[cfg(test)]\n#[path = \"../tests/runner_unit/mod.rs\"]\nmod tests",
-        "#[cfg(test)]\n#[path = \"../tests/coordinator_unit/mod.rs\"]\nmod tests",
-        "#[cfg(test)]\n#[path = \"../tests/runtime_unit/mod.rs\"]\nmod tests",
-    ] {
-        if let Some((production, _)) = source.split_once(marker) {
+    if let Some((production, _)) = source.split_once(INLINE_TEST_MODULE_MARKER) {
+        return production;
+    }
+
+    let source_without_final_newline = source.strip_suffix('\n').unwrap_or(source);
+    for marker in EXTERNAL_TEST_MODULE_MARKERS {
+        if let Some(production) = source_without_final_newline.strip_suffix(marker) {
             return production;
         }
     }
     source
+}
+
+#[test]
+fn external_test_markers_cannot_hide_later_production_source() {
+    const PRODUCTION: &str = "fn visible_production() {}\n";
+
+    for marker in EXTERNAL_TEST_MODULE_MARKERS {
+        let terminal = [PRODUCTION, marker].concat();
+        assert_eq!(production_rust_source(&terminal), PRODUCTION);
+
+        let terminal_with_newline = [PRODUCTION, marker, "\n"].concat();
+        assert_eq!(production_rust_source(&terminal_with_newline), PRODUCTION);
+
+        let bypass = [
+            PRODUCTION,
+            marker,
+            "\nfn production_after_test_marker() {}\n",
+        ]
+        .concat();
+        assert_eq!(
+            production_rust_source(&bypass),
+            bypass,
+            "a non-terminal external test marker must not hide later production"
+        );
+    }
+
+    let inline = [
+        PRODUCTION,
+        INLINE_TEST_MODULE_MARKER,
+        " { fn existing_inline_test() {} }\n",
+    ]
+    .concat();
+    assert_eq!(
+        production_rust_source(&inline),
+        PRODUCTION,
+        "the existing inline test-module truncation must remain unchanged"
+    );
 }

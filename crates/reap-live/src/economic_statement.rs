@@ -3783,5 +3783,5 @@ fn read_input(
 }
 
 #[cfg(test)]
-#[path = "economic_statement/tests/mod.rs"]
+#[path = "../tests/economic_statement_unit/mod.rs"]
 mod tests;
