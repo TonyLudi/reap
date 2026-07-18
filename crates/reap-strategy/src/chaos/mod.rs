@@ -1,13 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, DefaultHasher};
 
-use serde::{Deserialize, Serialize};
-
 use crate::{ChaosExecutionIntent, Strategy};
-use reap_core::{
-    MarketEvent, OrderBook, OrderEvent, OrderIntent, OrderUpdate, Price, Quantity, Side,
-    StrategyEvent, Symbol, TimeMs, round_down_to_lot,
-};
+use reap_core::{MarketEvent, OrderBook, OrderIntent, Side, StrategyEvent, Symbol, TimeMs};
 
 const LIVE_ORDER_STOP_QUOTE_THRESHOLD: f64 = 0.6;
 const EXTRA_MARGIN_BPS: f64 = 0.0002;
@@ -21,12 +16,14 @@ const EPS: f64 = 1e-9;
 type StableMap<K, V> = HashMap<K, V, BuildHasherDefault<DefaultHasher>>;
 
 mod config;
+mod execution_state;
 mod hedging;
 mod instrument;
 mod pricing;
 mod reference_health;
 mod risk;
 
+use execution_state::{ActiveHedge, ActiveQuote};
 use hedging::HedgeCandidate;
 use pricing::{JavaRandom, QuoteTargetState, round_passive_to_tick};
 use reference_health::{
@@ -38,6 +35,7 @@ pub use config::{
     InstrumentKindConfig, ReferenceDataKind, ReferenceDataRequirement, RiskGroupConfig,
     RiskGroupKindConfig, SkewTypeConfig,
 };
+pub use execution_state::MissedHedge;
 pub use hedging::HedgeLevel;
 pub use instrument::InstrumentState;
 pub use pricing::TheoQuote;
@@ -360,91 +358,6 @@ impl ChaosStrategy {
         commands
     }
 
-    fn sync_quotes(
-        &mut self,
-        symbol: &str,
-        side: Side,
-        desired: &[TheoQuote],
-        commands: &mut Vec<ChaosExecutionIntent>,
-    ) {
-        let Some(entity) = self.entities.get(symbol) else {
-            return;
-        };
-        let min_refill_interval_ms = entity.config.min_refill_interval_ms;
-        let refill_blocked = self
-            .last_quote_fill_ms
-            .get(&(symbol.to_string(), side))
-            .is_some_and(|last_fill_ms| {
-                self.now_ms.saturating_sub(*last_fill_ms) < min_refill_interval_ms
-            });
-        let desired = desired
-            .iter()
-            .filter_map(|quote| {
-                let price = round_passive_to_tick(quote.price, entity.config.tick_size, side);
-                let qty = round_down_to_lot(quote.qty, entity.config.lot_size);
-                (price.is_finite() && price > 0.0 && qty >= entity.config.min_trade_size)
-                    .then_some((price, qty))
-            })
-            .collect::<Vec<_>>();
-
-        let mut active_levels = self
-            .active_quotes
-            .iter()
-            .filter(|((active_symbol, active_side, _), _)| {
-                active_symbol == symbol && *active_side == side
-            })
-            .map(|((_, _, level), quote)| (*level, quote))
-            .collect::<Vec<_>>();
-        active_levels.sort_unstable_by_key(|(level, _)| *level);
-
-        for (level, active) in &active_levels {
-            let matches = desired.get(*level).is_some_and(|(price, qty)| {
-                approx_eq(active.price, *price)
-                    && (approx_eq(active.qty, *qty)
-                        || (*level == 0 && refill_blocked && active.qty < *qty))
-            });
-            if !matches {
-                commands.push(ChaosExecutionIntent::cancel_owned(
-                    active.order_id.clone(),
-                    if desired.get(*level).is_some() {
-                        "replace_quote".to_string()
-                    } else {
-                        "quote_disabled".to_string()
-                    },
-                ));
-            }
-        }
-
-        for (level, (price, qty)) in desired.into_iter().enumerate() {
-            let active = active_levels
-                .binary_search_by_key(&level, |(active_level, _)| *active_level)
-                .ok()
-                .map(|index| active_levels[index].1);
-            let current_matches = active.is_some_and(|active| {
-                approx_eq(active.price, price)
-                    && (approx_eq(active.qty, qty)
-                        || (level == 0 && refill_blocked && active.qty < qty))
-            });
-            if current_matches {
-                continue;
-            }
-            if level == 0 && refill_blocked && active.is_none() {
-                continue;
-            }
-            commands.push(ChaosExecutionIntent::quote(
-                symbol.to_string(),
-                side,
-                qty,
-                price,
-                if level == 0 {
-                    "quote".to_string()
-                } else {
-                    format!("quote:{level}")
-                },
-            ));
-        }
-    }
-
     fn ref_mid(&self) -> Option<f64> {
         self.entities
             .get(&self.config.ref_symbol)
@@ -598,131 +511,6 @@ impl ChaosStrategy {
             }
         }
     }
-
-    fn on_order_update(&mut self, update: &OrderUpdate) -> Vec<ChaosExecutionIntent> {
-        self.advance_time(update.ts_ms);
-        if update.event == OrderEvent::Cancelled && update.reason.starts_with("hedge") {
-            let missed_qty = (update.qty - update.filled_qty).max(0.0);
-            if missed_qty > 0.0
-                && let (Some(entity), Some(ref_mid)) =
-                    (self.entities.get(&update.symbol), self.ref_mid())
-            {
-                self.missed_hedges.push(MissedHedge {
-                    ts_ms: update.ts_ms,
-                    order_id: update.order_id.clone(),
-                    symbol: update.symbol.clone(),
-                    side: update.side,
-                    price: update.price,
-                    missed_qty,
-                    missed_delta_usd: entity
-                        .delta_coin_for_qty(update.side.factor() * missed_qty, update.price)
-                        * ref_mid,
-                    reference_symbol: update.reason.split(':').nth(1).map(str::to_string),
-                });
-                if self.missed_hedges.len() > 4_096 {
-                    self.missed_hedges.remove(0);
-                }
-            }
-        }
-        if update.reason.starts_with("hedge") {
-            if matches!(
-                update.event,
-                OrderEvent::PendingNew | OrderEvent::New | OrderEvent::PartialFill
-            ) && update.open_qty > 0.0
-            {
-                self.active_hedges.insert(
-                    update.order_id.clone(),
-                    ActiveHedge {
-                        symbol: update.symbol.clone(),
-                        signed_open_qty: update.side.factor() * update.open_qty,
-                        price: update.price,
-                        reference_price: hedge_reference_price(&update.reason)
-                            .unwrap_or(update.price),
-                        updated_ms: update.ts_ms,
-                    },
-                );
-            } else if matches!(
-                update.event,
-                OrderEvent::Cancelled | OrderEvent::FullyFilled | OrderEvent::Rejected
-            ) {
-                self.active_hedges.remove(&update.order_id);
-            }
-        }
-        match update.event {
-            OrderEvent::PendingNew | OrderEvent::New if update.reason.starts_with("quote") => {
-                let level = quote_level_from_reason(&update.reason);
-                self.active_quotes.insert(
-                    (update.symbol.clone(), update.side, level),
-                    ActiveQuote {
-                        order_id: update.order_id.clone(),
-                        price: update.price,
-                        qty: update.open_qty,
-                    },
-                );
-            }
-            OrderEvent::PartialFill if update.reason.starts_with("quote") => {
-                if let Some(active) = self
-                    .active_quotes
-                    .values_mut()
-                    .find(|quote| quote.order_id == update.order_id)
-                {
-                    active.qty = update.open_qty;
-                }
-            }
-            OrderEvent::Cancelled | OrderEvent::FullyFilled | OrderEvent::Rejected => {
-                self.active_quotes
-                    .retain(|_, quote| quote.order_id != update.order_id);
-            }
-            _ => {}
-        }
-
-        if update.has_fill() && update.reason.starts_with("quote") {
-            self.last_quote_fill_ms
-                .insert((update.symbol.clone(), update.side), self.now_ms);
-        }
-
-        if update.has_fill() {
-            if let Some(ref_mid) = self.ref_mid()
-                && let Some(entity) = self.entities.get(&update.symbol)
-            {
-                let turnover =
-                    entity.notional_usd(update.last_fill_qty, update.last_fill_price, ref_mid);
-                self.net_filled_delta_usd += entity.delta_coin_for_qty(
-                    update.side.factor() * update.last_fill_qty,
-                    update.last_fill_price,
-                ) * ref_mid;
-                *self
-                    .turnover_by_group
-                    .entry(entity.config.risk_group.clone())
-                    .or_default() += turnover;
-            }
-            if let Some(entity) = self.entities.get_mut(&update.symbol) {
-                entity.record_fill(
-                    update.side,
-                    update.last_fill_qty,
-                    update.last_fill_price,
-                    update.last_fill_liquidity,
-                );
-                if !update.reason.starts_with("hedge")
-                    && entity.anomalous_fill_should_stop(
-                        update.ts_ms,
-                        update.side,
-                        update.price,
-                        update.last_fill_price,
-                    )
-                {
-                    self.halt_reason = Some(format!(
-                        "{} received consecutive anomalous fills",
-                        update.symbol
-                    ));
-                }
-            }
-            self.update_risk();
-            return Vec::new();
-        }
-
-        Vec::new()
-    }
 }
 
 impl Strategy for ChaosStrategy {
@@ -745,48 +533,8 @@ impl Strategy for ChaosStrategy {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MissedHedge {
-    pub ts_ms: TimeMs,
-    pub order_id: String,
-    pub symbol: Symbol,
-    pub side: Side,
-    pub price: Price,
-    pub missed_qty: Quantity,
-    pub missed_delta_usd: f64,
-    pub reference_symbol: Option<Symbol>,
-}
-
-#[derive(Debug, Clone)]
-struct ActiveQuote {
-    order_id: String,
-    price: Price,
-    qty: Quantity,
-}
-
-#[derive(Debug, Clone)]
-struct ActiveHedge {
-    symbol: Symbol,
-    signed_open_qty: Quantity,
-    price: Price,
-    reference_price: Price,
-    updated_ms: TimeMs,
-}
-
 fn approx_eq(a: f64, b: f64) -> bool {
     (a - b).abs() <= 1e-7_f64.max(a.abs().max(b.abs()) * 1e-9)
-}
-
-fn quote_level_from_reason(reason: &str) -> usize {
-    reason
-        .split(':')
-        .nth(1)
-        .and_then(|level| level.parse().ok())
-        .unwrap_or(0)
-}
-
-fn hedge_reference_price(reason: &str) -> Option<Price> {
-    reason.split(':').nth(2)?.parse().ok()
 }
 
 #[cfg(test)]
@@ -796,8 +544,8 @@ mod tests {
     use super::*;
     use reap_core::{
         AccountUpdate, Balance, FillLiquidity, Level, MarginSnapshot, MarketEvent, NormalizedEvent,
-        OrderBook, OrderStatus, SelfTradePrevention, StrategyEvent, SystemEvent, SystemEventKind,
-        TimeInForce,
+        OrderBook, OrderEvent, OrderStatus, OrderUpdate, SelfTradePrevention, StrategyEvent,
+        SystemEvent, SystemEventKind, TimeInForce,
     };
 
     fn legacy_intents(intents: Vec<ChaosExecutionIntent>) -> Vec<OrderIntent> {
