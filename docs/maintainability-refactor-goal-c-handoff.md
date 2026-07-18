@@ -1,8 +1,8 @@
 # Maintainability Refactor Goal C Handoff
 
-Status: active. Phase 0 is complete and green. Phases 1–5 and final global
-verification remain pending. Nothing in this document approves demo trading,
-production order entry, authenticated exchange activity, target-host
+Status: active. Phases 0 and 1 are complete and green. Phases 2–5 and final
+global verification remain pending. Nothing in this document approves demo
+trading, production order entry, authenticated exchange activity, target-host
 deployment, or a low-latency runtime redesign.
 
 Prepared: 2026-07-18.
@@ -20,7 +20,7 @@ verified starting structure remains the completed
 | --- | --- | --- |
 | Goal C execution contract | Complete | Commit `8fe5fad86ed29fcab5ba80ec3c7ac30e2332bfe0` |
 | Phase 0: baseline and inventory | Complete | Green; commit is the documentation commit containing this record and is identified by Git history because a commit cannot self-reference its own SHA |
-| Phase 1: Chaos strategy decomposition | Pending | Not started |
+| Phase 1: Chaos strategy decomposition | Complete | Green; the handoff commit is the documentation commit containing this record and is identified by Git history because a commit cannot self-reference its own SHA |
 | Phase 2: live runtime decomposition | Pending | Not started |
 | Phase 3: coordinator reductions | Pending | Not started |
 | Phase 4: backtest runner decomposition | Pending | Not started |
@@ -338,6 +338,142 @@ Phase 0 is green because:
 - Phase 0 changed documentation only.
 
 No production source may move until this Phase 0 record is committed.
+
+## Phase 1: Chaos Strategy Decomposition
+
+Phase 1 is complete and green. The original
+`crates/reap-strategy/src/chaos.rs` monolith is now a private module tree with
+an aggregate facade and narrow public re-exports:
+
+| Production module | Lines | Responsibility |
+| --- | ---: | --- |
+| `chaos/mod.rs` | 345 | Aggregate construction, public queries, and deterministic quote-refresh orchestration |
+| `chaos/config.rs` | 1,094 | Configuration, defaults, validation, and instrument/risk-group definitions |
+| `chaos/events.rs` | 196 | Ordered aggregate event dispatch |
+| `chaos/execution_state.rs` | 276 | Active quote/hedge and fill execution tracking |
+| `chaos/hedging.rs` | 527 | Hedge candidates, selection, sizing, and missed-hedge handling |
+| `chaos/instrument.rs` | 1,153 | Per-instrument state, permissions, sizing, accounting, and calculations |
+| `chaos/pricing.rs` | 405 | Theoretical pricing, skew, and quote construction |
+| `chaos/reference_health.rs` | 294 | Reference freshness, basis, interval health, and debounce state |
+| `chaos/risk.rs` | 640 | Aggregate/group risk state, limits, balances, positions, and PnL |
+
+No production module exceeds the 1,500-line limit. The facade is 345 physical
+lines rather than a renamed monolith. The responsibility split uses private,
+inline, by-value state only: it adds no service object, trait object, lock,
+channel, async work, cloned canonical state, dependency, or public export.
+
+The 2,604 test lines are outside production source in
+`crates/reap-strategy/tests/chaos_unit/`. The shared module is 263 lines and
+the six responsibility files range from 263 to 535 lines. All 68 Chaos tests
+remain present exactly once, and the canonical exact test path remains
+`chaos::tests::normalized_fixture_typed_output_preserves_exact_ordered_intents`.
+There are 74 strategy unit tests in total.
+
+### Phase 1 Aggregate And Function Results
+
+| Item | Before | After | Result |
+| --- | ---: | ---: | --- |
+| `ChaosStrategy` top-level fields | 34 | 11 | Reference health, pricing, hedging, execution, and aggregate risk are cohesive by-value substates |
+| `InstrumentState` top-level fields | 54 | 40 | Private fill history and trade control are grouped; all 31 public fields are unchanged |
+| `ChaosConfig::validate` | 547 lines | 14 lines | Ordered orchestration of six named validation stages |
+| `ChaosStrategy::check_risk_limits` | 235 lines | 15 lines | Ordered orchestration of strategy, group, PnL, liability, and balance-sheet checks |
+| Spot trade permission calculation | One mixed branch | Two named side checks | Original full-book clones and branch operation order retained |
+| Maximum trade sizing | One mixed calculation | Three named capacity checks | Early returns and floating-point operation order retained |
+
+The public `ChaosStrategy` surface and root re-exports are byte-identical.
+`InstrumentState::theo` is unchanged. Refresh, event, risk, quote, hedge,
+fill, RNG, stable-map traversal, and floating-point order were preserved by
+mechanical movement before private state grouping.
+
+### Phase 1 Commits
+
+The focused Phase 1 commits, in order, are:
+
+```text
+caecc3065f260accae744ad36e4c973374db8f6b  extract chaos configuration
+f2058d82cd0a71d8b1479c9fa4d573927eb2d556  stage configuration validation
+3a0313a0b5aeb2ae08092559141219d9a986ea61  extract instrument state
+0ec538d29f6986bc38458ec2a4ba96fc1794feca  extract reference health
+a1a2d123301c1b8480cfb908baff546836318a79  extract risk state
+c353555eec275407728b26055aa1ab8734f66cfe  stage ordered risk checks
+ac1f8854dc15bde89ee90553bd82e6eb1651e6b6  extract hedging
+698bc784b12157334254a4f925b7e1060917d8ec  extract theoretical pricing
+e3c102e7dd1915390c969f7a449f91c117c00091  extract execution state
+7f7d7bc9f3a9fdbfafb796c71ac43ce17e5d34dd  extract event dispatch
+9e936e9be93eadcee653010f866a62f8a7791526  group reference health state
+56372a1e405a169a6d6ca9ff8a1d4e51d58649c8  group execution tracking state
+356c2ea743d11623a476ba818ef979a16adf45bf  group aggregate risk state
+d6e0cce72c8a7673b7c56c0878c7ad8cf5515a71  group hedging state
+de834359bd9cf25930fcfe9a2ddf9b18a9889c09  group pricing state
+4913c7c33e3fd092b01a2509e34fc7d642724230  group fill history state
+350b939c4dd7eb39cc0eb9428a426907a1090839  group trade control state
+6b44a49fdc510999300a70eef2b468c984d07e3b  split spot trade permissions
+c84e834569c3685f008f3653907fb1a77222d999  split instrument sizing
+ef18b5be4777b1026ee2874a26269fc0312a4eb5  split Chaos unit tests
+```
+
+### Phase 1 Determinism, Policy, And Test Evidence
+
+The canonical CLI backtest was run twice after the final Phase 1 source
+change. `cmp` exited `0`; both outputs have SHA-256
+`38acf9f5e0c310f2ec5528974beffadf4c1a7f84d46efa8d9664ee7051e84691`.
+
+The final focused and cross-crate gates were green:
+
+| Gate | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | Exit `0` |
+| Exact typed ordered-intent fixture | 1 passed |
+| `cargo test -p reap-strategy --locked` | 74 unit tests, compile-fail suite, and docs passed |
+| `cargo test -p reap-engine -p reap-backtest -p reap-live --locked --no-fail-fast` | Engine 5, backtest 117, live 230, two live compile-fail cases, dependency-policy 3, runtime-config compatibility 1, and docs passed |
+| Strategy all-target clippy with `-D warnings` | Exit `0` |
+| Live dependency policy after test extraction | 3 passed |
+
+`Cargo.lock`, all five deterministic fixtures/examples, all four target
+manifests, and all four recorded public/root source hashes are exactly
+unchanged. In particular, the strategy root remains
+`4e8eeb31f80e3283b327004c6d0b69ecf02eb2402a10750ea826681b681b4151`,
+its manifest remains
+`173bfea6e0911dfe4c3fd589e5badd2175c5867e96f98ec51ba66c31093272e8`,
+and `Cargo.lock` remains
+`d8a19fb100aeb4e542a2135d546edfb5ae24629717f5ab65e285cf9bfe483b02`.
+The sibling `../imm-strategy` checkout remains clean at the pinned
+`b6b120c7b7c466d8431bf082f3229328c5d7b2ae`.
+
+### Phase 1 Performance Evidence
+
+The required one warm-up plus three recorded runs used the Phase 0 host and
+toolchain.
+
+| Engine run | ns/event | Intents |
+| --- | ---: | ---: |
+| Warm-up | 11,265.1 | 999,996 |
+| Recorded 1 | 11,223.1 | 999,996 |
+| Recorded 2 | 11,234.9 | 999,996 |
+| Recorded 3 | 11,459.1 | 999,996 |
+| Recorded median | 11,234.9 | 999,996 |
+
+The engine median is 1.95% below the Phase 0 median.
+
+| Live run | ns/raw frame | Allocation calls/raw | Requested bytes/raw | Parsed | Feed outputs | Records | Actions |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Warm-up | 16,991.5 | 83.53 | 37,286.9 | 50,204 | 70,208 | 65,130 | 0 |
+| Recorded 1 | 16,908.4 | 83.53 | 37,286.9 | 50,204 | 70,208 | 65,130 | 0 |
+| Recorded 2 | 16,970.6 | 83.53 | 37,286.9 | 50,204 | 70,208 | 65,130 | 0 |
+| Recorded 3 | 18,367.4 | 83.53 | 37,286.9 | 50,204 | 70,208 | 65,130 | 0 |
+| Recorded median | 16,970.6 | 83.53 | 37,286.9 | 50,204 | 70,208 | 65,130 | 0 |
+
+The complete live-path median is 0.64% below the Phase 0 median. Its recorded
+stage medians are 2,941.5 ns/unit for wire parse and raw record, 7,838.1 for
+deduplication/sequence/book, and 4,019.9 for coordinator/strategy/risk/storage.
+Every run retained exactly `4,193,771` allocation calls and
+`1,871,951,969` requested bytes. No timing investigation threshold was
+crossed.
+
+Phase 1 therefore satisfies its structural, behavioral, deterministic,
+authority, dependency, allocation, and timing gates. It does not broaden the
+plan-derived Quote, Hedge, and CancelOwned capability boundary or the
+behavioral reference to `../imm-strategy`.
 
 ## Pending Completion Evidence
 

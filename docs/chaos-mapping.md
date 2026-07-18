@@ -639,11 +639,12 @@ currencies appear in instrument metadata or symbols. See the current
 
 ## Evidence
 
-Parity tests are in `crates/reap-strategy/src/chaos.rs`. They include the Java
-calculator fixture values for spot, linear, and inverse pricing; hedge
-summaries; risk multiplier behavior; funding; skew; account risk; debounce;
-and stop conditions. Transport, deduplication, reconciliation, and fail-closed
-tests live in their owning crates.
+Parity tests are in `crates/reap-strategy/tests/chaos_unit/`, included as the
+private `chaos::tests` module. They include the Java calculator fixture values
+for spot, linear, and inverse pricing; hedge summaries; risk multiplier
+behavior; funding; skew; account risk; debounce; and stop conditions.
+Transport, deduplication, reconciliation, and fail-closed tests live in their
+owning crates.
 
 Run all Rust acceptance tests with:
 
