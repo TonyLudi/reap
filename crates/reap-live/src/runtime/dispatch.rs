@@ -41,6 +41,18 @@ pub(super) struct DispatchState {
     pub(super) alert_stats: AlertStats,
 }
 
+impl LiveRuntime {
+    pub(super) fn order_sender(
+        &self,
+        account_id: &str,
+    ) -> Result<&mpsc::Sender<OrderTaskCommand>, LiveRuntimeError> {
+        self.dispatch
+            .order_senders
+            .get(account_id)
+            .ok_or_else(|| LiveRuntimeError::OrderQueueUnavailable(account_id.to_string()))
+    }
+}
+
 pub(super) enum RuntimeEvent {
     Raw {
         source_id: usize,

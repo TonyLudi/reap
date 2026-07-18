@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use reap_core::{
     AccountUpdate, Balance, ConnId, FeedPriority, Level, MarketEvent, OrderBook, OrderEvent,
-    OrderUpdate, Side, Subscription, TimeInForce,
+    OrderStatus, OrderUpdate, Side, Subscription, TimeInForce,
 };
 use reap_feed::{SocketPlan, SupervisedFeed};
 use reap_order::{
@@ -24,7 +24,6 @@ use reap_strategy::{
     ReferenceDataKind, RiskGroupConfig,
 };
 use reap_telemetry::{AlertDeliveryFailure, AlertSink};
-use reap_venue::PrivateOrderState;
 use reap_venue::okx::{
     OkxAccountConfig, OkxAccountLevel, OkxApiKeyPermission, OkxFillPage, OkxInstrumentChange,
     OkxInstrumentChangeParameter, OkxInstrumentType, OkxOrderAck, OkxPositionMode,
@@ -36,6 +35,7 @@ use reap_venue::okx::{
     parse_okx_server_time_response_json, parse_okx_system_status_response_json,
     parse_okx_trade_fee_response_json,
 };
+use reap_venue::{PrivateOrderState, RemoteOrder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Notify, Semaphore, oneshot};
 use tokio::task::JoinHandle;
