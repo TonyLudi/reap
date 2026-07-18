@@ -16,6 +16,8 @@ struct BoundaryCurrencyValue {
     equity_usd: f64,
 }
 
+type BillsByCurrency<'a> = BTreeMap<String, Vec<(&'a OkxBill, u128)>>;
+
 pub(super) fn validate_account_balance_continuity(
     sources: &BoundEconomicSources,
     options: &EconomicReconciliationOptions,
@@ -51,9 +53,44 @@ pub(super) fn validate_account_balance_continuity(
         failures,
         issues,
     );
-    let mut bills_by_currency = BTreeMap::<String, Vec<(&OkxBill, u128)>>::new();
+    let bills_by_currency = collect_bills_by_currency(&sources.bills, failures, issues);
+
+    let currencies = opening
+        .keys()
+        .chain(closing.keys())
+        .chain(bills_by_currency.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut samples = Vec::new();
+    for currency in currencies {
+        let opening_value = opening.get(&currency).copied().unwrap_or_default();
+        let closing_value = closing.get(&currency).copied().unwrap_or_default();
+        let bills = bills_by_currency
+            .get(&currency)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        samples.push(validate_currency_balance_continuity(
+            currency,
+            opening_value,
+            closing_value,
+            bills,
+            options,
+            counts,
+            failures,
+            issues,
+        ));
+    }
+    samples
+}
+
+fn collect_bills_by_currency<'a>(
+    bills: &'a [OkxBill],
+    failures: &mut BTreeSet<EconomicReconciliationFailure>,
+    issues: &mut IssueSink,
+) -> BillsByCurrency<'a> {
+    let mut bills_by_currency = BillsByCurrency::new();
     let mut seen_bill_ids = BTreeSet::new();
-    for bill in &sources.bills {
+    for bill in bills {
         if !valid_currency(&bill.currency) {
             issues.push(
                 EconomicReconciliationFailure::InvalidOrDuplicateBalanceCurrencies,
@@ -115,198 +152,195 @@ pub(super) fn validate_account_balance_continuity(
             ))
         });
     }
+    bills_by_currency
+}
 
-    let currencies = opening
-        .keys()
-        .chain(closing.keys())
-        .chain(bills_by_currency.keys())
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let mut samples = Vec::new();
-    for currency in currencies {
-        let opening_value = opening.get(&currency).copied().unwrap_or_default();
-        let closing_value = closing.get(&currency).copied().unwrap_or_default();
-        let bills = bills_by_currency
-            .get(&currency)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        let mut summed_balance_change = 0.0;
-        let links = (bills.len() as u64).saturating_add(1);
-        let mut links_validated = 0_u64;
-        let mut valid = true;
-        let mut previous_post_balance = None::<f64>;
+#[allow(clippy::too_many_arguments)]
+fn validate_currency_balance_continuity(
+    currency: String,
+    opening_value: BoundaryCurrencyValue,
+    closing_value: BoundaryCurrencyValue,
+    bills: &[(&OkxBill, u128)],
+    options: &EconomicReconciliationOptions,
+    counts: &mut EconomicReconciliationCounts,
+    failures: &mut BTreeSet<EconomicReconciliationFailure>,
+    issues: &mut IssueSink,
+) -> CurrencyBalanceContinuitySample {
+    let mut summed_balance_change = 0.0;
+    let links = (bills.len() as u64).saturating_add(1);
+    let mut links_validated = 0_u64;
+    let mut valid = true;
+    let mut previous_post_balance = None::<f64>;
 
-        if bills.is_empty() {
-            if close_abs(
+    if bills.is_empty() {
+        if close_abs(
+            opening_value.cash_balance,
+            closing_value.cash_balance,
+            options.tolerances.balance_abs,
+        ) {
+            links_validated = 1;
+        } else {
+            valid = false;
+            push_cash_continuity_issue(
+                &currency,
+                "boundary_cash_balance",
                 opening_value.cash_balance,
+                closing_value.cash_balance,
+                "currency cash balance changed without an account bill",
+                failures,
+                issues,
+            );
+        }
+    } else {
+        for (offset, (bill, numeric_id)) in bills.iter().enumerate() {
+            if *numeric_id == 0 {
+                valid = false;
+            }
+            if !bill.balance_change.is_finite() {
+                valid = false;
+                issues.push(
+                    EconomicReconciliationFailure::InvalidBillBalanceChain,
+                    issue_for_bill(
+                        EconomicIssueSource::BillCollection,
+                        bill,
+                        "balChg",
+                        "finite balance change",
+                        &bill.balance_change.to_string(),
+                        "bill balance change is not finite",
+                    ),
+                    failures,
+                );
+                continue;
+            }
+            summed_balance_change += bill.balance_change;
+            let Some(post_balance) = bill.balance.filter(|value| value.is_finite()) else {
+                valid = false;
+                issues.push(
+                    EconomicReconciliationFailure::InvalidBillBalanceChain,
+                    issue_for_bill(
+                        EconomicIssueSource::BillCollection,
+                        bill,
+                        "bal",
+                        "finite post-bill cash balance",
+                        "missing or non-finite",
+                        "bill does not expose the post-change balance needed for continuity",
+                    ),
+                    failures,
+                );
+                previous_post_balance = None;
+                continue;
+            };
+            let pre_balance = post_balance - bill.balance_change;
+            let (expected, field, message, failure) = if offset == 0 {
+                (
+                    opening_value.cash_balance,
+                    "opening_cash_balance",
+                    "first bill pre-balance does not match the opening account snapshot",
+                    EconomicReconciliationFailure::CashBalanceContinuityMismatches,
+                )
+            } else if let Some(previous) = previous_post_balance {
+                (
+                    previous,
+                    "bill_balance_chain",
+                    "adjacent bill post/pre balances are discontinuous",
+                    EconomicReconciliationFailure::InvalidBillBalanceChain,
+                )
+            } else {
+                valid = false;
+                previous_post_balance = Some(post_balance);
+                continue;
+            };
+            if close_abs(expected, pre_balance, options.tolerances.balance_abs) {
+                links_validated = links_validated.saturating_add(1);
+            } else {
+                valid = false;
+                issues.push(
+                    failure,
+                    issue_for_bill(
+                        EconomicIssueSource::BillCollection,
+                        bill,
+                        field,
+                        &expected.to_string(),
+                        &pre_balance.to_string(),
+                        message,
+                    ),
+                    failures,
+                );
+            }
+            previous_post_balance = Some(post_balance);
+        }
+        if let Some(last_post_balance) = previous_post_balance {
+            if close_abs(
+                last_post_balance,
                 closing_value.cash_balance,
                 options.tolerances.balance_abs,
             ) {
-                links_validated = 1;
+                links_validated = links_validated.saturating_add(1);
             } else {
                 valid = false;
                 push_cash_continuity_issue(
                     &currency,
-                    "boundary_cash_balance",
-                    opening_value.cash_balance,
+                    "closing_cash_balance",
+                    last_post_balance,
                     closing_value.cash_balance,
-                    "currency cash balance changed without an account bill",
+                    "last bill post-balance does not match the closing account snapshot",
                     failures,
                     issues,
                 );
             }
         } else {
-            for (offset, (bill, numeric_id)) in bills.iter().enumerate() {
-                if *numeric_id == 0 {
-                    valid = false;
-                }
-                if !bill.balance_change.is_finite() {
-                    valid = false;
-                    issues.push(
-                        EconomicReconciliationFailure::InvalidBillBalanceChain,
-                        issue_for_bill(
-                            EconomicIssueSource::BillCollection,
-                            bill,
-                            "balChg",
-                            "finite balance change",
-                            &bill.balance_change.to_string(),
-                            "bill balance change is not finite",
-                        ),
-                        failures,
-                    );
-                    continue;
-                }
-                summed_balance_change += bill.balance_change;
-                let Some(post_balance) = bill.balance.filter(|value| value.is_finite()) else {
-                    valid = false;
-                    issues.push(
-                        EconomicReconciliationFailure::InvalidBillBalanceChain,
-                        issue_for_bill(
-                            EconomicIssueSource::BillCollection,
-                            bill,
-                            "bal",
-                            "finite post-bill cash balance",
-                            "missing or non-finite",
-                            "bill does not expose the post-change balance needed for continuity",
-                        ),
-                        failures,
-                    );
-                    previous_post_balance = None;
-                    continue;
-                };
-                let pre_balance = post_balance - bill.balance_change;
-                let (expected, field, message, failure) = if offset == 0 {
-                    (
-                        opening_value.cash_balance,
-                        "opening_cash_balance",
-                        "first bill pre-balance does not match the opening account snapshot",
-                        EconomicReconciliationFailure::CashBalanceContinuityMismatches,
-                    )
-                } else if let Some(previous) = previous_post_balance {
-                    (
-                        previous,
-                        "bill_balance_chain",
-                        "adjacent bill post/pre balances are discontinuous",
-                        EconomicReconciliationFailure::InvalidBillBalanceChain,
-                    )
-                } else {
-                    valid = false;
-                    previous_post_balance = Some(post_balance);
-                    continue;
-                };
-                if close_abs(expected, pre_balance, options.tolerances.balance_abs) {
-                    links_validated = links_validated.saturating_add(1);
-                } else {
-                    valid = false;
-                    issues.push(
-                        failure,
-                        issue_for_bill(
-                            EconomicIssueSource::BillCollection,
-                            bill,
-                            field,
-                            &expected.to_string(),
-                            &pre_balance.to_string(),
-                            message,
-                        ),
-                        failures,
-                    );
-                }
-                previous_post_balance = Some(post_balance);
-            }
-            if let Some(last_post_balance) = previous_post_balance {
-                if close_abs(
-                    last_post_balance,
-                    closing_value.cash_balance,
-                    options.tolerances.balance_abs,
-                ) {
-                    links_validated = links_validated.saturating_add(1);
-                } else {
-                    valid = false;
-                    push_cash_continuity_issue(
-                        &currency,
-                        "closing_cash_balance",
-                        last_post_balance,
-                        closing_value.cash_balance,
-                        "last bill post-balance does not match the closing account snapshot",
-                        failures,
-                        issues,
-                    );
-                }
-            } else {
-                valid = false;
-            }
-        }
-
-        let expected_closing_cash_balance = opening_value.cash_balance + summed_balance_change;
-        let aggregate_absolute_difference =
-            (expected_closing_cash_balance - closing_value.cash_balance).abs();
-        if !expected_closing_cash_balance.is_finite()
-            || aggregate_absolute_difference > options.tolerances.balance_abs
-        {
-            valid = false;
-            push_cash_continuity_issue(
-                &currency,
-                "aggregate_cash_balance",
-                expected_closing_cash_balance,
-                closing_value.cash_balance,
-                "opening cash plus all bill balance changes does not equal closing cash",
-                failures,
-                issues,
-            );
-        }
-        if links_validated != links {
             valid = false;
         }
-        counts.cash_balance_chain_links = counts.cash_balance_chain_links.saturating_add(links);
-        counts.cash_balance_chain_links_validated = counts
-            .cash_balance_chain_links_validated
-            .saturating_add(links_validated);
-        counts.cash_balance_currencies = counts.cash_balance_currencies.saturating_add(1);
-        if valid {
-            counts.cash_balance_currencies_validated =
-                counts.cash_balance_currencies_validated.saturating_add(1);
-        }
-        samples.push(CurrencyBalanceContinuitySample {
-            currency,
-            opening_cash_balance: opening_value.cash_balance,
-            closing_cash_balance: closing_value.cash_balance,
-            opening_equity: opening_value.equity,
-            closing_equity: closing_value.equity,
-            opening_equity_usd: opening_value.equity_usd,
-            closing_equity_usd: closing_value.equity_usd,
-            bill_count: bills.len() as u64,
-            first_bill_id: bills.first().map(|(bill, _)| bill.bill_id.clone()),
-            last_bill_id: bills.last().map(|(bill, _)| bill.bill_id.clone()),
-            summed_balance_change,
-            expected_closing_cash_balance,
-            aggregate_absolute_difference,
-            effective_tolerance: options.tolerances.balance_abs,
-            balance_chain_links: links,
-            balance_chain_links_validated: links_validated,
-            validated: valid,
-        });
     }
-    samples
+
+    let expected_closing_cash_balance = opening_value.cash_balance + summed_balance_change;
+    let aggregate_absolute_difference =
+        (expected_closing_cash_balance - closing_value.cash_balance).abs();
+    if !expected_closing_cash_balance.is_finite()
+        || aggregate_absolute_difference > options.tolerances.balance_abs
+    {
+        valid = false;
+        push_cash_continuity_issue(
+            &currency,
+            "aggregate_cash_balance",
+            expected_closing_cash_balance,
+            closing_value.cash_balance,
+            "opening cash plus all bill balance changes does not equal closing cash",
+            failures,
+            issues,
+        );
+    }
+    if links_validated != links {
+        valid = false;
+    }
+    counts.cash_balance_chain_links = counts.cash_balance_chain_links.saturating_add(links);
+    counts.cash_balance_chain_links_validated = counts
+        .cash_balance_chain_links_validated
+        .saturating_add(links_validated);
+    counts.cash_balance_currencies = counts.cash_balance_currencies.saturating_add(1);
+    if valid {
+        counts.cash_balance_currencies_validated =
+            counts.cash_balance_currencies_validated.saturating_add(1);
+    }
+    CurrencyBalanceContinuitySample {
+        currency,
+        opening_cash_balance: opening_value.cash_balance,
+        closing_cash_balance: closing_value.cash_balance,
+        opening_equity: opening_value.equity,
+        closing_equity: closing_value.equity,
+        opening_equity_usd: opening_value.equity_usd,
+        closing_equity_usd: closing_value.equity_usd,
+        bill_count: bills.len() as u64,
+        first_bill_id: bills.first().map(|(bill, _)| bill.bill_id.clone()),
+        last_bill_id: bills.last().map(|(bill, _)| bill.bill_id.clone()),
+        summed_balance_change,
+        expected_closing_cash_balance,
+        aggregate_absolute_difference,
+        effective_tolerance: options.tolerances.balance_abs,
+        balance_chain_links: links,
+        balance_chain_links_validated: links_validated,
+        validated: valid,
+    }
 }
 
 fn validate_bound_account_identity(

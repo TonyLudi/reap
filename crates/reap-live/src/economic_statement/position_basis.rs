@@ -94,6 +94,28 @@ pub(super) fn runtime_session_for_line<'a>(
         .max_by_key(|session| session.line)
 }
 
+enum TimelineEvent<'a> {
+    Snapshot(&'a JournalAuthoritativeAccountSnapshot),
+    Fill(&'a JournalFillObservation),
+}
+
+impl TimelineEvent<'_> {
+    fn line(&self) -> u64 {
+        match self {
+            Self::Snapshot(snapshot) => snapshot.line,
+            Self::Fill(fill) => fill.line,
+        }
+    }
+}
+
+#[derive(Default)]
+struct JournalTradeState {
+    session_id: Option<String>,
+    positions: BTreeMap<String, PositionBasis>,
+    by_key: BTreeMap<(String, String), Vec<JournalTradeEvidence>>,
+    seen_fill_keys: BTreeSet<(String, String)>,
+}
+
 pub(super) fn build_journal_trade_evidence(
     sources: &BoundEconomicSources,
     runtime_sessions: &[&JournalRuntimeSession],
@@ -101,20 +123,6 @@ pub(super) fn build_journal_trade_evidence(
     failures: &mut BTreeSet<EconomicReconciliationFailure>,
     issues: &mut IssueSink,
 ) -> BTreeMap<(String, String), Vec<JournalTradeEvidence>> {
-    enum TimelineEvent<'a> {
-        Snapshot(&'a JournalAuthoritativeAccountSnapshot),
-        Fill(&'a JournalFillObservation),
-    }
-
-    impl TimelineEvent<'_> {
-        fn line(&self) -> u64 {
-            match self {
-                Self::Snapshot(snapshot) => snapshot.line,
-                Self::Fill(fill) => fill.line,
-            }
-        }
-    }
-
     let mut timeline = sources
         .authoritative_account_snapshots
         .iter()
@@ -130,260 +138,289 @@ pub(super) fn build_journal_trade_evidence(
             .push(fill);
     }
 
-    let mut state_session_id = None::<String>;
-    let mut positions = BTreeMap::<String, PositionBasis>::new();
-    let mut by_key = BTreeMap::<(String, String), Vec<JournalTradeEvidence>>::new();
-    let mut seen_fill_keys = BTreeSet::new();
-
+    let mut state = JournalTradeState::default();
     for event in timeline {
         match event {
-            TimelineEvent::Snapshot(snapshot) => {
-                if snapshot.account_id != sources.account_id {
-                    continue;
-                }
-                let Some(session) =
-                    runtime_session_for_line(runtime_sessions, &sources.account_id, snapshot.line)
-                else {
-                    push_invalid_snapshot_issue(
-                        snapshot,
-                        "same-account runtime session before the snapshot",
-                        "missing",
-                        failures,
-                        issues,
-                    );
-                    state_session_id = None;
-                    positions.clear();
-                    continue;
-                };
-                if session.account_identity_sha256 != sources.account_identity_sha256 {
-                    push_invalid_snapshot_issue(
-                        snapshot,
-                        "runtime session with the exact collected account identity",
-                        &session.account_identity_sha256,
-                        failures,
-                        issues,
-                    );
-                    state_session_id = None;
-                    positions.clear();
-                    continue;
-                }
-                if snapshot.event_ts_ms == 0 || snapshot.event_ts_ms != snapshot.update_ts_ms {
-                    push_invalid_snapshot_issue(
-                        snapshot,
-                        "matching positive record/update timestamps",
-                        &format!(
-                            "record={}, update={}",
-                            snapshot.event_ts_ms, snapshot.update_ts_ms
-                        ),
-                        failures,
-                        issues,
-                    );
-                    state_session_id = None;
-                    positions.clear();
-                    continue;
-                }
-
-                let mut snapshot_positions = BTreeMap::new();
-                let mut invalid = None;
-                for position in &snapshot.positions {
-                    let configured = instrument(&sources.config, &position.symbol);
-                    let owned = sources
-                        .config
-                        .account_for_symbol(&position.symbol)
-                        .is_some_and(|account| account.id == sources.account_id);
-                    let margin_mode_valid = if position.qty == 0.0 {
-                        true
-                    } else {
-                        matches!(
-                            (
-                                expected_bill_margin_mode(
-                                    &sources.config,
-                                    &sources.account_id,
-                                    &position.symbol,
-                                ),
-                                position.margin_mode,
-                            ),
-                            (
-                                Some(OkxBillMarginMode::Cross),
-                                Some(PositionMarginMode::Cross)
-                            ) | (
-                                Some(OkxBillMarginMode::Isolated),
-                                Some(PositionMarginMode::Isolated)
-                            )
-                        )
-                    };
-                    if position.symbol.is_empty()
-                        || !position.qty.is_finite()
-                        || !position.avg_price.is_finite()
-                        || (position.qty != 0.0
-                            && (!owned
-                                || !margin_mode_valid
-                                || !configured.is_some_and(|instrument| {
-                                    instrument.kind.is_derivative() && position.avg_price > 0.0
-                                })))
-                    {
-                        invalid = Some(format!(
-                            "invalid position {} qty={} avgPx={}",
-                            position.symbol, position.qty, position.avg_price
-                        ));
-                        break;
-                    }
-                    if snapshot_positions
-                        .insert(position.symbol.clone(), position)
-                        .is_some()
-                    {
-                        invalid = Some(format!("duplicate position {}", position.symbol));
-                        break;
-                    }
-                }
-                if let Some(invalid) = invalid {
-                    push_invalid_snapshot_issue(
-                        snapshot,
-                        "unique finite configured derivative positions with positive avgPx when non-zero",
-                        &invalid,
-                        failures,
-                        issues,
-                    );
-                    state_session_id = None;
-                    positions.clear();
-                    continue;
-                }
-
-                positions.clear();
-                for configured in sources.config.instruments_for_account(&sources.account_id) {
-                    if !configured.kind.is_derivative() {
-                        continue;
-                    }
-                    let (quantity, avg_price) =
-                        snapshot_positions
-                            .get(&configured.symbol)
-                            .map_or((0.0, 0.0), |position| {
-                                if position.qty == 0.0 {
-                                    (0.0, 0.0)
-                                } else {
-                                    (position.qty, position.avg_price)
-                                }
-                            });
-                    positions.insert(
-                        configured.symbol.clone(),
-                        PositionBasis {
-                            quantity,
-                            avg_price,
-                            snapshot_line: snapshot.line,
-                            snapshot_time_ms: snapshot.event_ts_ms,
-                        },
-                    );
-                }
-                state_session_id = Some(session.session_id.clone());
-            }
-            TimelineEvent::Fill(observation) => {
-                if observation.fill.account_id.as_deref() != Some(sources.account_id.as_str()) {
-                    continue;
-                }
-                let fill_key = (
-                    observation.fill.symbol.clone(),
-                    observation.fill.fill_id.clone(),
-                );
-                if observation.fill.fill_id.is_empty() || !seen_fill_keys.insert(fill_key.clone()) {
-                    issues.push(
-                        EconomicReconciliationFailure::TradeJournalFillMismatches,
-                        issue(
-                            EconomicIssueSource::Journal,
-                            None,
-                            Some(&observation.fill.symbol),
-                            (!observation.fill.fill_id.is_empty())
-                                .then_some(observation.fill.fill_id.as_str()),
-                            "journal_fill_identity",
-                            "unique non-empty (symbol, fill_id) for the account",
-                            &format!("duplicate or empty at line {}", observation.line),
-                            "critical fill journal contains an ambiguous trade identity",
-                        ),
-                        failures,
-                    );
-                    positions.remove(&observation.fill.symbol);
-                    by_key
-                        .entry(fill_key)
-                        .or_default()
-                        .push(JournalTradeEvidence {
-                            observation: observation.clone(),
-                            derivative: None,
-                        });
-                    continue;
-                }
-                let session = runtime_session_for_line(
-                    runtime_sessions,
-                    &sources.account_id,
-                    observation.line,
-                );
-                if state_session_id.as_deref() != session.map(|session| session.session_id.as_str())
-                {
-                    state_session_id = None;
-                    positions.clear();
-                }
-                let derivative_instrument = instrument(&sources.config, &observation.fill.symbol)
-                    .filter(|instrument| instrument.kind.is_derivative());
-                let derivative = derivative_instrument.and_then(|instrument| {
-                    let session = session?;
-                    let basis = *positions.get(&observation.fill.symbol)?;
-                    let [exchange_fill] = verified_fills.get(&fill_key)?.as_slice() else {
-                        return None;
-                    };
-                    if basis.snapshot_time_ms >= observation.fill.ts_ms
-                        || exchange_fill.ts_ms != observation.fill.ts_ms
-                        || exchange_fill.side != observation.fill.side
-                        || !close_abs(
-                            exchange_fill.price,
-                            observation.fill.price,
-                            options.tolerances.price_abs,
-                        )
-                        || !close_abs(
-                            exchange_fill.qty,
-                            observation.fill.qty,
-                            options.tolerances.quantity_abs,
-                        )
-                    {
-                        return None;
-                    }
-                    let calculation = apply_derivative_fill(
-                        basis,
-                        &observation.fill,
-                        instrument,
-                        options.tolerances.quantity_abs,
-                    )?;
-                    positions.insert(
-                        observation.fill.symbol.clone(),
-                        PositionBasis {
-                            quantity: calculation.post_quantity,
-                            avg_price: calculation.post_avg_price,
-                            ..basis
-                        },
-                    );
-                    Some(JournalDerivativePnlEvidence {
-                        fill_line: observation.line,
-                        runtime_session_id: session.session_id.clone(),
-                        runtime_session_start_line: session.line,
-                        basis,
-                        close_quantity: calculation.close_quantity,
-                        post_quantity: calculation.post_quantity,
-                        post_avg_price: calculation.post_avg_price,
-                        expected_sub_type: calculation.expected_sub_type,
-                        expected_pnl: calculation.expected_pnl,
-                    })
-                });
-                if derivative_instrument.is_some() && derivative.is_none() {
-                    positions.remove(&observation.fill.symbol);
-                }
-                by_key
-                    .entry(fill_key)
-                    .or_default()
-                    .push(JournalTradeEvidence {
-                        observation: observation.clone(),
-                        derivative,
-                    });
-            }
+            TimelineEvent::Snapshot(snapshot) => apply_authoritative_snapshot(
+                snapshot,
+                sources,
+                runtime_sessions,
+                &mut state,
+                failures,
+                issues,
+            ),
+            TimelineEvent::Fill(observation) => apply_journal_fill(
+                observation,
+                sources,
+                runtime_sessions,
+                options,
+                &verified_fills,
+                &mut state,
+                failures,
+                issues,
+            ),
         }
     }
-    by_key
+    state.by_key
+}
+
+fn apply_authoritative_snapshot(
+    snapshot: &JournalAuthoritativeAccountSnapshot,
+    sources: &BoundEconomicSources,
+    runtime_sessions: &[&JournalRuntimeSession],
+    state: &mut JournalTradeState,
+    failures: &mut BTreeSet<EconomicReconciliationFailure>,
+    issues: &mut IssueSink,
+) {
+    if snapshot.account_id != sources.account_id {
+        return;
+    }
+    let Some(session) =
+        runtime_session_for_line(runtime_sessions, &sources.account_id, snapshot.line)
+    else {
+        push_invalid_snapshot_issue(
+            snapshot,
+            "same-account runtime session before the snapshot",
+            "missing",
+            failures,
+            issues,
+        );
+        state.session_id = None;
+        state.positions.clear();
+        return;
+    };
+    if session.account_identity_sha256 != sources.account_identity_sha256 {
+        push_invalid_snapshot_issue(
+            snapshot,
+            "runtime session with the exact collected account identity",
+            &session.account_identity_sha256,
+            failures,
+            issues,
+        );
+        state.session_id = None;
+        state.positions.clear();
+        return;
+    }
+    if snapshot.event_ts_ms == 0 || snapshot.event_ts_ms != snapshot.update_ts_ms {
+        push_invalid_snapshot_issue(
+            snapshot,
+            "matching positive record/update timestamps",
+            &format!(
+                "record={}, update={}",
+                snapshot.event_ts_ms, snapshot.update_ts_ms
+            ),
+            failures,
+            issues,
+        );
+        state.session_id = None;
+        state.positions.clear();
+        return;
+    }
+
+    let mut snapshot_positions = BTreeMap::new();
+    let mut invalid = None;
+    for position in &snapshot.positions {
+        let configured = instrument(&sources.config, &position.symbol);
+        let owned = sources
+            .config
+            .account_for_symbol(&position.symbol)
+            .is_some_and(|account| account.id == sources.account_id);
+        let margin_mode_valid = if position.qty == 0.0 {
+            true
+        } else {
+            matches!(
+                (
+                    expected_bill_margin_mode(
+                        &sources.config,
+                        &sources.account_id,
+                        &position.symbol,
+                    ),
+                    position.margin_mode,
+                ),
+                (
+                    Some(OkxBillMarginMode::Cross),
+                    Some(PositionMarginMode::Cross)
+                ) | (
+                    Some(OkxBillMarginMode::Isolated),
+                    Some(PositionMarginMode::Isolated)
+                )
+            )
+        };
+        if position.symbol.is_empty()
+            || !position.qty.is_finite()
+            || !position.avg_price.is_finite()
+            || (position.qty != 0.0
+                && (!owned
+                    || !margin_mode_valid
+                    || !configured.is_some_and(|instrument| {
+                        instrument.kind.is_derivative() && position.avg_price > 0.0
+                    })))
+        {
+            invalid = Some(format!(
+                "invalid position {} qty={} avgPx={}",
+                position.symbol, position.qty, position.avg_price
+            ));
+            break;
+        }
+        if snapshot_positions
+            .insert(position.symbol.clone(), position)
+            .is_some()
+        {
+            invalid = Some(format!("duplicate position {}", position.symbol));
+            break;
+        }
+    }
+    if let Some(invalid) = invalid {
+        push_invalid_snapshot_issue(
+            snapshot,
+            "unique finite configured derivative positions with positive avgPx when non-zero",
+            &invalid,
+            failures,
+            issues,
+        );
+        state.session_id = None;
+        state.positions.clear();
+        return;
+    }
+
+    state.positions.clear();
+    for configured in sources.config.instruments_for_account(&sources.account_id) {
+        if !configured.kind.is_derivative() {
+            continue;
+        }
+        let (quantity, avg_price) =
+            snapshot_positions
+                .get(&configured.symbol)
+                .map_or((0.0, 0.0), |position| {
+                    if position.qty == 0.0 {
+                        (0.0, 0.0)
+                    } else {
+                        (position.qty, position.avg_price)
+                    }
+                });
+        state.positions.insert(
+            configured.symbol.clone(),
+            PositionBasis {
+                quantity,
+                avg_price,
+                snapshot_line: snapshot.line,
+                snapshot_time_ms: snapshot.event_ts_ms,
+            },
+        );
+    }
+    state.session_id = Some(session.session_id.clone());
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_journal_fill(
+    observation: &JournalFillObservation,
+    sources: &BoundEconomicSources,
+    runtime_sessions: &[&JournalRuntimeSession],
+    options: &EconomicReconciliationOptions,
+    verified_fills: &BTreeMap<(String, String), Vec<&RemoteFill>>,
+    state: &mut JournalTradeState,
+    failures: &mut BTreeSet<EconomicReconciliationFailure>,
+    issues: &mut IssueSink,
+) {
+    if observation.fill.account_id.as_deref() != Some(sources.account_id.as_str()) {
+        return;
+    }
+    let fill_key = (
+        observation.fill.symbol.clone(),
+        observation.fill.fill_id.clone(),
+    );
+    if observation.fill.fill_id.is_empty() || !state.seen_fill_keys.insert(fill_key.clone()) {
+        issues.push(
+            EconomicReconciliationFailure::TradeJournalFillMismatches,
+            issue(
+                EconomicIssueSource::Journal,
+                None,
+                Some(&observation.fill.symbol),
+                (!observation.fill.fill_id.is_empty()).then_some(observation.fill.fill_id.as_str()),
+                "journal_fill_identity",
+                "unique non-empty (symbol, fill_id) for the account",
+                &format!("duplicate or empty at line {}", observation.line),
+                "critical fill journal contains an ambiguous trade identity",
+            ),
+            failures,
+        );
+        state.positions.remove(&observation.fill.symbol);
+        state
+            .by_key
+            .entry(fill_key)
+            .or_default()
+            .push(JournalTradeEvidence {
+                observation: observation.clone(),
+                derivative: None,
+            });
+        return;
+    }
+    let session = runtime_session_for_line(runtime_sessions, &sources.account_id, observation.line);
+    if state.session_id.as_deref() != session.map(|session| session.session_id.as_str()) {
+        state.session_id = None;
+        state.positions.clear();
+    }
+    let derivative_instrument = instrument(&sources.config, &observation.fill.symbol)
+        .filter(|instrument| instrument.kind.is_derivative());
+    let derivative = derivative_instrument.and_then(|instrument| {
+        let session = session?;
+        let basis = *state.positions.get(&observation.fill.symbol)?;
+        let [exchange_fill] = verified_fills.get(&fill_key)?.as_slice() else {
+            return None;
+        };
+        if basis.snapshot_time_ms >= observation.fill.ts_ms
+            || exchange_fill.ts_ms != observation.fill.ts_ms
+            || exchange_fill.side != observation.fill.side
+            || !close_abs(
+                exchange_fill.price,
+                observation.fill.price,
+                options.tolerances.price_abs,
+            )
+            || !close_abs(
+                exchange_fill.qty,
+                observation.fill.qty,
+                options.tolerances.quantity_abs,
+            )
+        {
+            return None;
+        }
+        let calculation = apply_derivative_fill(
+            basis,
+            &observation.fill,
+            instrument,
+            options.tolerances.quantity_abs,
+        )?;
+        state.positions.insert(
+            observation.fill.symbol.clone(),
+            PositionBasis {
+                quantity: calculation.post_quantity,
+                avg_price: calculation.post_avg_price,
+                ..basis
+            },
+        );
+        Some(JournalDerivativePnlEvidence {
+            fill_line: observation.line,
+            runtime_session_id: session.session_id.clone(),
+            runtime_session_start_line: session.line,
+            basis,
+            close_quantity: calculation.close_quantity,
+            post_quantity: calculation.post_quantity,
+            post_avg_price: calculation.post_avg_price,
+            expected_sub_type: calculation.expected_sub_type,
+            expected_pnl: calculation.expected_pnl,
+        })
+    });
+    if derivative_instrument.is_some() && derivative.is_none() {
+        state.positions.remove(&observation.fill.symbol);
+    }
+    state
+        .by_key
+        .entry(fill_key)
+        .or_default()
+        .push(JournalTradeEvidence {
+            observation: observation.clone(),
+            derivative,
+        });
 }
 
 pub(super) struct DerivativeFillCalculation {
