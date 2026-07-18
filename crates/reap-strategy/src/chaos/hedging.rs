@@ -92,6 +92,7 @@ impl ChaosStrategy {
                             continue;
                         }
                         let own_quotes = self
+                            .execution
                             .active_quotes
                             .iter()
                             .filter(|((quote_symbol, _, _), _)| quote_symbol == symbol)
@@ -355,6 +356,7 @@ impl ChaosStrategy {
                 continue;
             };
             let pending = self
+                .execution
                 .active_hedges
                 .values()
                 .filter(|hedge| {

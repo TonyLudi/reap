@@ -24,7 +24,7 @@ mod pricing;
 mod reference_health;
 mod risk;
 
-use execution_state::{ActiveHedge, ActiveQuote};
+use execution_state::ExecutionTrackingState;
 use hedging::HedgeCandidate;
 use pricing::{JavaRandom, QuoteTargetState, round_passive_to_tick};
 use reference_health::{
@@ -55,10 +55,8 @@ pub struct ChaosStrategy {
     burst_symbol: Option<Symbol>,
     best_hedges: HashMap<Side, Vec<HedgeLevel>>,
     hedge_candidate_scratch: Vec<HedgeCandidate>,
-    active_quotes: StableMap<(Symbol, Side, usize), ActiveQuote>,
-    active_hedges: StableMap<String, ActiveHedge>,
+    execution: ExecutionTrackingState,
     quote_targets: HashMap<(Symbol, Side), QuoteTargetState>,
-    last_quote_fill_ms: HashMap<(Symbol, Side), TimeMs>,
     random: JavaRandom,
     now_ms: TimeMs,
     last_hedge_ms: TimeMs,
@@ -72,7 +70,6 @@ pub struct ChaosStrategy {
     no_hedge_found_since: Option<TimeMs>,
     hedge_not_found_since: Option<TimeMs>,
     all_hedges_halted_since: Option<TimeMs>,
-    missed_hedges: Vec<MissedHedge>,
 }
 
 impl ChaosStrategy {
@@ -201,10 +198,13 @@ impl ChaosStrategy {
             burst_symbol: None,
             best_hedges,
             hedge_candidate_scratch: Vec::new(),
-            active_quotes: StableMap::default(),
-            active_hedges: StableMap::default(),
+            execution: ExecutionTrackingState {
+                active_quotes: StableMap::default(),
+                active_hedges: StableMap::default(),
+                last_quote_fill_ms: HashMap::new(),
+                missed_hedges: Vec::new(),
+            },
             quote_targets: HashMap::new(),
-            last_quote_fill_ms: HashMap::new(),
             random: JavaRandom::new(1),
             now_ms: 0,
             last_hedge_ms: 0,
@@ -218,7 +218,6 @@ impl ChaosStrategy {
             no_hedge_found_since: None,
             hedge_not_found_since: None,
             all_hedges_halted_since: None,
-            missed_hedges: Vec::new(),
         })
     }
 
@@ -253,7 +252,7 @@ impl ChaosStrategy {
     }
 
     pub fn missed_hedges(&self) -> &[MissedHedge] {
-        &self.missed_hedges
+        &self.execution.missed_hedges
     }
 
     pub fn basis_breaches(&self) -> &HashMap<String, (Symbol, f64)> {
@@ -939,9 +938,9 @@ mod tests {
     #[test]
     fn quote_replacement_emits_typed_cancel_owned_without_changing_legacy_record() {
         let mut strategy = ChaosStrategy::new(config()).unwrap();
-        strategy.active_quotes.insert(
+        strategy.execution.active_quotes.insert(
             ("BTC-USDT".to_string(), Side::Buy, 0),
-            ActiveQuote {
+            execution_state::ActiveQuote {
                 order_id: "canonical-q1".to_string(),
                 price: 49_900.0,
                 qty: 0.1,
@@ -1629,9 +1628,9 @@ mod tests {
         seed_java_calculator_books(&mut strategy);
         let entity = strategy.entity("BTC-USD-SWAP.OK").unwrap();
         let level = entity.hedge_levels(Side::Sell, 50_000.0, &[])[0].to_owned_level();
-        strategy.active_hedges.insert(
+        strategy.execution.active_hedges.insert(
             "h1".to_string(),
-            ActiveHedge {
+            execution_state::ActiveHedge {
                 symbol: level.symbol.clone(),
                 signed_open_qty: -level.qty,
                 price: 44_986.5,

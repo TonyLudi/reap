@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use reap_core::{
     OrderEvent, OrderUpdate, Price, Quantity, Side, Symbol, TimeMs, round_down_to_lot,
 };
@@ -5,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ChaosExecutionIntent;
 
-use super::{ChaosStrategy, TheoQuote, approx_eq, round_passive_to_tick};
+use super::{ChaosStrategy, StableMap, TheoQuote, approx_eq, round_passive_to_tick};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MissedHedge {
@@ -35,6 +37,14 @@ pub(super) struct ActiveHedge {
     pub(super) updated_ms: TimeMs,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct ExecutionTrackingState {
+    pub(super) active_quotes: StableMap<(Symbol, Side, usize), ActiveQuote>,
+    pub(super) active_hedges: StableMap<String, ActiveHedge>,
+    pub(super) last_quote_fill_ms: HashMap<(Symbol, Side), TimeMs>,
+    pub(super) missed_hedges: Vec<MissedHedge>,
+}
+
 impl ChaosStrategy {
     pub(super) fn sync_quotes(
         &mut self,
@@ -48,6 +58,7 @@ impl ChaosStrategy {
         };
         let min_refill_interval_ms = entity.config.min_refill_interval_ms;
         let refill_blocked = self
+            .execution
             .last_quote_fill_ms
             .get(&(symbol.to_string(), side))
             .is_some_and(|last_fill_ms| {
@@ -64,6 +75,7 @@ impl ChaosStrategy {
             .collect::<Vec<_>>();
 
         let mut active_levels = self
+            .execution
             .active_quotes
             .iter()
             .filter(|((active_symbol, active_side, _), _)| {
@@ -129,7 +141,7 @@ impl ChaosStrategy {
                 && let (Some(entity), Some(ref_mid)) =
                     (self.entities.get(&update.symbol), self.ref_mid())
             {
-                self.missed_hedges.push(MissedHedge {
+                self.execution.missed_hedges.push(MissedHedge {
                     ts_ms: update.ts_ms,
                     order_id: update.order_id.clone(),
                     symbol: update.symbol.clone(),
@@ -141,8 +153,8 @@ impl ChaosStrategy {
                         * ref_mid,
                     reference_symbol: update.reason.split(':').nth(1).map(str::to_string),
                 });
-                if self.missed_hedges.len() > 4_096 {
-                    self.missed_hedges.remove(0);
+                if self.execution.missed_hedges.len() > 4_096 {
+                    self.execution.missed_hedges.remove(0);
                 }
             }
         }
@@ -152,7 +164,7 @@ impl ChaosStrategy {
                 OrderEvent::PendingNew | OrderEvent::New | OrderEvent::PartialFill
             ) && update.open_qty > 0.0
             {
-                self.active_hedges.insert(
+                self.execution.active_hedges.insert(
                     update.order_id.clone(),
                     ActiveHedge {
                         symbol: update.symbol.clone(),
@@ -167,13 +179,13 @@ impl ChaosStrategy {
                 update.event,
                 OrderEvent::Cancelled | OrderEvent::FullyFilled | OrderEvent::Rejected
             ) {
-                self.active_hedges.remove(&update.order_id);
+                self.execution.active_hedges.remove(&update.order_id);
             }
         }
         match update.event {
             OrderEvent::PendingNew | OrderEvent::New if update.reason.starts_with("quote") => {
                 let level = quote_level_from_reason(&update.reason);
-                self.active_quotes.insert(
+                self.execution.active_quotes.insert(
                     (update.symbol.clone(), update.side, level),
                     ActiveQuote {
                         order_id: update.order_id.clone(),
@@ -184,6 +196,7 @@ impl ChaosStrategy {
             }
             OrderEvent::PartialFill if update.reason.starts_with("quote") => {
                 if let Some(active) = self
+                    .execution
                     .active_quotes
                     .values_mut()
                     .find(|quote| quote.order_id == update.order_id)
@@ -192,14 +205,16 @@ impl ChaosStrategy {
                 }
             }
             OrderEvent::Cancelled | OrderEvent::FullyFilled | OrderEvent::Rejected => {
-                self.active_quotes
+                self.execution
+                    .active_quotes
                     .retain(|_, quote| quote.order_id != update.order_id);
             }
             _ => {}
         }
 
         if update.has_fill() && update.reason.starts_with("quote") {
-            self.last_quote_fill_ms
+            self.execution
+                .last_quote_fill_ms
                 .insert((update.symbol.clone(), update.side), self.now_ms);
         }
 

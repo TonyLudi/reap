@@ -116,7 +116,7 @@ impl ChaosStrategy {
         if self.halt_reason.is_some() {
             return false;
         }
-        if let Some((order_id, hedge)) = self.active_hedges.iter().find(|(_, hedge)| {
+        if let Some((order_id, hedge)) = self.execution.active_hedges.iter().find(|(_, hedge)| {
             self.now_ms.saturating_sub(hedge.updated_ms) > ZOMBIE_HEDGE_THRESHOLD_MS
         }) {
             self.halt_reason = Some(format!(
@@ -363,6 +363,7 @@ impl ChaosStrategy {
             .iter()
             .map(|(name, rg)| {
                 let quote_size = self
+                    .execution
                     .active_quotes
                     .iter()
                     .filter(|((symbol, _, _), _)| rg.symbols.contains(symbol))
@@ -374,6 +375,7 @@ impl ChaosStrategy {
                     })
                     .sum::<f64>();
                 let hedge_size = self
+                    .execution
                     .active_hedges
                     .values()
                     .filter(|hedge| rg.symbols.contains(&hedge.symbol))
@@ -454,6 +456,7 @@ impl ChaosStrategy {
             } - rg.config.coin_offset;
             rg.delta_usd = delta_coin * ref_mid;
             let live_hedge_delta_coin = self
+                .execution
                 .active_hedges
                 .values()
                 .filter(|hedge| rg.symbols.contains(&hedge.symbol))
