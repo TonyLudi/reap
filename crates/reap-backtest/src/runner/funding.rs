@@ -12,22 +12,23 @@ impl BacktestRunner {
         }
 
         let key = (symbol.to_string(), funding_time_ms);
-        if self.settled_funding.contains(&key)
+        if self.funding.settled_funding.contains(&key)
             || self
+                .funding
                 .last_settled_funding_time_ms
                 .get(symbol)
                 .is_some_and(|settled| *settled >= funding_time_ms)
         {
             return;
         }
-        if !self.scheduled_funding.insert(key.clone()) {
+        if !self.funding.scheduled_funding.insert(key.clone()) {
             return;
         }
 
         let funding_time_ns = funding_time_ms.saturating_mul(NS_PER_MS);
         if funding_time_ns.saturating_add(FUNDING_LATE_TOLERANCE_NS) < self.replay.now_ns {
-            self.scheduled_funding.remove(&key);
-            self.settled_funding.insert(key.clone());
+            self.funding.scheduled_funding.remove(&key);
+            self.funding.settled_funding.insert(key.clone());
             self.record_settled_funding(&key.0, key.1);
             self.missed_funding_settlements += 1;
             return;
@@ -64,7 +65,7 @@ impl BacktestRunner {
             );
         }
         let key = (symbol.clone(), settlement.funding_time_ms);
-        if let Some(previous) = self.realized_funding_rates.get(&key) {
+        if let Some(previous) = self.funding.realized_funding_rates.get(&key) {
             if *previous != settlement.rate {
                 bail!(
                     "conflicting realized funding rates for {} at {}: {} and {}",
@@ -75,19 +76,21 @@ impl BacktestRunner {
                 );
             }
         } else {
-            self.realized_funding_rates.insert(key, settlement.rate);
+            self.funding
+                .realized_funding_rates
+                .insert(key, settlement.rate);
         }
         Ok(())
     }
 
     pub(super) fn settle_funding(&mut self, symbol: Symbol, funding_time_ms: u64) {
         let key = (symbol.clone(), funding_time_ms);
-        self.scheduled_funding.remove(&key);
-        if !self.settled_funding.insert(key.clone()) {
+        self.funding.scheduled_funding.remove(&key);
+        if !self.funding.settled_funding.insert(key.clone()) {
             return;
         }
         self.record_settled_funding(&symbol, funding_time_ms);
-        let Some(rate) = self.realized_funding_rates.get(&key).copied() else {
+        let Some(rate) = self.funding.realized_funding_rates.get(&key).copied() else {
             self.funding_settlement_failures += 1;
             return;
         };
@@ -115,7 +118,8 @@ impl BacktestRunner {
     }
 
     fn record_settled_funding(&mut self, symbol: &str, funding_time_ms: u64) {
-        self.last_settled_funding_time_ms
+        self.funding
+            .last_settled_funding_time_ms
             .entry(symbol.to_string())
             .and_modify(|current| *current = (*current).max(funding_time_ms))
             .or_insert(funding_time_ms);

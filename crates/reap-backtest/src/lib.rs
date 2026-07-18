@@ -43,7 +43,9 @@ pub use research_verification::{
 };
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::HashMap;
 
 use crate::portfolio::Portfolio;
 use reap_core::{AccountUpdate, MarketEvent, OrderUpdate, StrategyEvent, Symbol};
@@ -240,7 +242,7 @@ mod runner_state;
 #[path = "runner/valuation.rs"]
 mod runner_valuation;
 use runner_construction::validate_currency_rate_coverage;
-use runner_state::{OrderLifecycleState, ReplayState, ScheduleState, ValuationState};
+use runner_state::{FundingState, OrderLifecycleState, ReplayState, ScheduleState, ValuationState};
 
 #[derive(Debug)]
 enum ScheduledAction {
@@ -281,10 +283,7 @@ pub struct BacktestRunner {
     schedule: ScheduleState,
     orders: OrderLifecycleState,
     valuation: ValuationState,
-    realized_funding_rates: HashMap<(Symbol, u64), f64>,
-    scheduled_funding: HashSet<(Symbol, u64)>,
-    settled_funding: HashSet<(Symbol, u64)>,
-    last_settled_funding_time_ms: BTreeMap<Symbol, u64>,
+    funding: FundingState,
     funding_rate_events: u64,
     funding_settlements: u64,
     late_funding_rate_events: u64,

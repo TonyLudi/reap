@@ -7,7 +7,7 @@ use crate::execution::BacktestLatencySampler;
 use crate::portfolio::{Portfolio, required_accounting_currencies};
 use crate::{
     BacktestCarryState, BacktestConfig, BacktestExecutionConfig, BacktestInitialPortfolioConfig,
-    BacktestRunner, BacktestTimeBasis, CurrencyRateObservation, MatchingAssumptions,
+    BacktestRunner, BacktestTimeBasis, CurrencyRateObservation, FundingState, MatchingAssumptions,
     MatchingEngine, OrderLifecycleState, ReplayState, ScheduleState, ScheduledAction,
     ValuationState,
 };
@@ -74,9 +74,12 @@ impl BacktestRunner {
         for pending in carry.pending_funding {
             let key = (pending.symbol.clone(), pending.funding_time_ms);
             if let Some(rate) = pending.realized_rate {
-                runner.realized_funding_rates.insert(key.clone(), rate);
+                runner
+                    .funding
+                    .realized_funding_rates
+                    .insert(key.clone(), rate);
             }
-            runner.scheduled_funding.insert(key);
+            runner.funding.scheduled_funding.insert(key);
             runner.schedule_at(
                 pending.due_at_ns,
                 ScheduledAction::SettleFunding {
@@ -85,7 +88,7 @@ impl BacktestRunner {
                 },
             );
         }
-        runner.last_settled_funding_time_ms = carry.last_settled_funding_time_ms;
+        runner.funding.last_settled_funding_time_ms = carry.last_settled_funding_time_ms;
         runner.replay.carry_source_boundary = carry.source_raw_boundary;
         runner.deliver_initial_account_snapshot()?;
         Ok(runner)
@@ -184,10 +187,12 @@ impl BacktestRunner {
                 opening_equity_usd,
                 opening_valuation_at_ns,
             },
-            realized_funding_rates: HashMap::new(),
-            scheduled_funding: HashSet::new(),
-            settled_funding: HashSet::new(),
-            last_settled_funding_time_ms: BTreeMap::new(),
+            funding: FundingState {
+                realized_funding_rates: HashMap::new(),
+                scheduled_funding: HashSet::new(),
+                settled_funding: HashSet::new(),
+                last_settled_funding_time_ms: BTreeMap::new(),
+            },
             funding_rate_events: 0,
             funding_settlements: 0,
             late_funding_rate_events: 0,

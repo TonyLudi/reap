@@ -207,7 +207,7 @@ impl BacktestRunner {
             risk_metric_samples: self.risk_metric_samples,
             invalid_risk_metric_samples: self.invalid_risk_metric_samples,
             funding_rate_events: self.funding_rate_events,
-            funding_settlement_observations: self.realized_funding_rates.len() as u64,
+            funding_settlement_observations: self.funding.realized_funding_rates.len() as u64,
             funding_settlements: self.funding_settlements,
             late_funding_rate_events: self.late_funding_rate_events,
             invalid_funding_rate_events: self.invalid_funding_rate_events,

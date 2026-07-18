@@ -378,7 +378,7 @@ impl BacktestRunner {
                         symbol: symbol.clone(),
                         funding_time_ms: *funding_time_ms,
                         due_at_ns,
-                        realized_rate: self.realized_funding_rates.get(&key).copied(),
+                        realized_rate: self.funding.realized_funding_rates.get(&key).copied(),
                     })
                 })
                 .collect::<Vec<_>>();
@@ -409,7 +409,7 @@ impl BacktestRunner {
                     .collect(),
                 currency_rates: carry_rates,
                 pending_funding,
-                last_settled_funding_time_ms: self.last_settled_funding_time_ms.clone(),
+                last_settled_funding_time_ms: self.funding.last_settled_funding_time_ms.clone(),
             };
             state.validate_for(&self.strategy_config, &self.execution)?;
             Ok(state)

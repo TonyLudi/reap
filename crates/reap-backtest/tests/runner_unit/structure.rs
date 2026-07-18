@@ -25,7 +25,7 @@ fn collect_runner_module_sources(directory: &Path, sources: &mut Vec<(String, St
 fn production_runner_keeps_single_owner_responsibility_state() {
     const TEST_MODULE_MARKER: &str =
         "#[cfg(test)]\n#[path = \"../tests/runner_unit/mod.rs\"]\nmod tests";
-    const ROOT_FIELDS: [&str; 34] = [
+    const ROOT_FIELDS: [&str; 31] = [
         "strategy_config: ChaosConfig",
         "strategy: ChaosStrategy",
         "orders: OrderLifecycleState",
@@ -36,10 +36,7 @@ fn production_runner_keeps_single_owner_responsibility_state() {
         "replay: ReplayState",
         "schedule: ScheduleState",
         "valuation: ValuationState",
-        "realized_funding_rates: HashMap<(Symbol, u64), f64>",
-        "scheduled_funding: HashSet<(Symbol, u64)>",
-        "settled_funding: HashSet<(Symbol, u64)>",
-        "last_settled_funding_time_ms: BTreeMap<Symbol, u64>",
+        "funding: FundingState",
         "funding_rate_events: u64",
         "funding_settlements: u64",
         "late_funding_rate_events: u64",

@@ -54,3 +54,10 @@ pub(super) struct ValuationState {
     pub(super) opening_equity_usd: Option<f64>,
     pub(super) opening_valuation_at_ns: Option<u64>,
 }
+
+pub(super) struct FundingState {
+    pub(super) realized_funding_rates: HashMap<(Symbol, u64), f64>,
+    pub(super) scheduled_funding: HashSet<(Symbol, u64)>,
+    pub(super) settled_funding: HashSet<(Symbol, u64)>,
+    pub(super) last_settled_funding_time_ms: BTreeMap<Symbol, u64>,
+}
