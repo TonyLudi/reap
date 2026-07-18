@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use reap_core::{FillKey, NormalizedEvent, OrderIntent, SystemEvent, SystemEventKind, TimeMs};
-use reap_engine::{ChaosEngineOutput, SafetyCancelCandidate, TradingEngine};
+use reap_engine::{SafetyCancelCandidate, TradingEngine};
 use reap_feed::{FeedOutput, RecoveryRequest};
 #[cfg(test)]
 use reap_order::SubmitOutcome;
@@ -10,13 +10,10 @@ use reap_order::{
     PrivateStateReducer, RegularApprovalScope, RegularExecutionPolicy, RegularExecutionPolicyError,
     ReservedRegularSubmit,
 };
-use reap_risk::{RiskDecision, RiskGate};
+use reap_risk::RiskGate;
 #[cfg(test)]
-use reap_storage::OrderOperation;
-use reap_storage::{
-    ProvenRegularOrderBinding, ProvenRegularSubmitRequest, SafetyLatchRecord, SafetyLatchScope,
-    SafetyLatchSource, StorageRecord,
-};
+use reap_storage::{OrderOperation, SafetyLatchScope, SafetyLatchSource};
+use reap_storage::{ProvenRegularOrderBinding, ProvenRegularSubmitRequest, StorageRecord};
 use reap_strategy::{ChaosExecutionIntent, ChaosStrategy};
 use thiserror::Error;
 
@@ -26,6 +23,7 @@ use crate::{LiveConfig, ReadinessSnapshot, StartupError, StartupGate, VerifiedBo
 
 mod account_reconciliation;
 mod private_feed;
+mod reduction;
 
 #[derive(Debug)]
 pub(crate) struct SubmitAction {
@@ -571,222 +569,6 @@ impl LiveCoordinator {
             .unwrap_or_default())
     }
 
-    fn process_normalized(&mut self, event: NormalizedEvent) -> CoordinatorOutput {
-        let observed_now_ms = event.ts_ms();
-        self.process_normalized_at(event, observed_now_ms)
-    }
-
-    fn process_normalized_at(
-        &mut self,
-        event: NormalizedEvent,
-        observed_now_ms: TimeMs,
-    ) -> CoordinatorOutput {
-        let strategy_references_were_ready = self.startup.strategy_references_ready();
-        let account_halt = match &event {
-            NormalizedEvent::System(system)
-                if system.kind == SystemEventKind::AccountHalted
-                    && system
-                        .account_id
-                        .as_deref()
-                        .is_some_and(|account_id| self.private_states.contains_key(account_id)) =>
-            {
-                let account_id = system
-                    .account_id
-                    .clone()
-                    .expect("checked account halt must have an account id");
-                self.halted_accounts
-                    .insert(account_id.clone(), system.reason.clone());
-                Some((account_id, system.reason.clone()))
-            }
-            _ => None,
-        };
-        let order_transport_stale = match &event {
-            NormalizedEvent::System(system)
-                if system.kind == SystemEventKind::OrderTransportStale
-                    && system
-                        .account_id
-                        .as_deref()
-                        .is_some_and(|account_id| self.private_states.contains_key(account_id)) =>
-            {
-                Some((
-                    system
-                        .account_id
-                        .clone()
-                        .expect("checked order transport event must have an account id"),
-                    system.reason.clone(),
-                ))
-            }
-            _ => None,
-        };
-        if let NormalizedEvent::System(system) = &event {
-            self.apply_system_to_startup(system);
-        }
-        match &event {
-            NormalizedEvent::Market(market) => self
-                .startup
-                .observe_strategy_market(market, observed_now_ms),
-            NormalizedEvent::Timer(_) => self.startup.refresh_strategy_references(observed_now_ms),
-            NormalizedEvent::Order(_)
-            | NormalizedEvent::Account(_)
-            | NormalizedEvent::Control(_)
-            | NormalizedEvent::System(_) => {}
-        }
-        let strategy_reference_readiness_lost =
-            strategy_references_were_ready && !self.startup.strategy_references_ready();
-        let now_ms = event.ts_ms();
-        let mut records = vec![StorageRecord::Normalized(event.clone())];
-        match &event {
-            NormalizedEvent::Order(update) => records.push(StorageRecord::Order {
-                account_id: self
-                    .config
-                    .account_for_symbol(&update.symbol)
-                    .map(|account| account.id.clone()),
-                update: update.clone(),
-            }),
-            NormalizedEvent::System(system) => records.push(StorageRecord::System(system.clone())),
-            _ => {}
-        }
-        let sync_stablecoin_readiness = self.event_updates_stablecoin_readiness(&event);
-        let engine_output = self.engine.on_chaos_event(event);
-        if sync_stablecoin_readiness {
-            self.sync_stablecoin_readiness(now_ms);
-        }
-        let mut output = CoordinatorOutput {
-            actions: Vec::new(),
-            records,
-        };
-        self.handle_engine_output(now_ms, engine_output, &mut output);
-        if let Some((account_id, reason)) = account_halt {
-            self.ensure_account_cancels(
-                now_ms,
-                &account_id,
-                &format!("account {account_id} halted: {reason}"),
-                &mut output,
-            );
-        }
-        if let Some((account_id, reason)) = order_transport_stale {
-            self.ensure_account_cancels(
-                now_ms,
-                &account_id,
-                &format!("order transport stale for account {account_id}: {reason}"),
-                &mut output,
-            );
-            output.actions.push(LiveAction::Reconcile(ReconcileAction {
-                ts_ms: now_ms,
-                account_id,
-                reason: format!("order transport disconnected: {reason}"),
-            }));
-        }
-        if strategy_reference_readiness_lost {
-            let missing = self
-                .startup
-                .snapshot()
-                .missing_strategy_references
-                .join(", ");
-            let account_ids = self
-                .config
-                .accounts
-                .iter()
-                .map(|account| account.id.clone())
-                .collect::<Vec<_>>();
-            for account_id in account_ids {
-                self.ensure_account_cancels(
-                    observed_now_ms,
-                    &account_id,
-                    &format!("strategy reference data stale: {missing}"),
-                    &mut output,
-                );
-            }
-        }
-        output
-    }
-
-    fn event_updates_stablecoin_readiness(&self, event: &NormalizedEvent) -> bool {
-        match event {
-            NormalizedEvent::Timer(_) => !self.config.risk.stablecoin_guards.is_empty(),
-            NormalizedEvent::Market(reap_core::MarketEvent::IndexPrice { symbol, .. }) => self
-                .config
-                .risk
-                .stablecoin_guards
-                .iter()
-                .any(|guard| guard.symbol == *symbol),
-            NormalizedEvent::System(system) => {
-                system.kind == SystemEventKind::KillSwitchReset
-                    && !self.config.risk.stablecoin_guards.is_empty()
-            }
-            NormalizedEvent::Order(_)
-            | NormalizedEvent::Account(_)
-            | NormalizedEvent::Control(_)
-            | NormalizedEvent::Market(_) => false,
-        }
-    }
-
-    fn sync_stablecoin_readiness(&mut self, now_ms: TimeMs) {
-        let health = self.engine.risk().stablecoin_guard_health(now_ms);
-        for guard in health {
-            if let Err(error) =
-                self.startup
-                    .mark_stablecoin_rate(&guard.symbol, guard.healthy, guard.reason)
-            {
-                self.startup.mark_runtime_health(
-                    "stablecoin_guard",
-                    false,
-                    format!("stablecoin readiness configuration mismatch: {error}"),
-                );
-            }
-        }
-    }
-
-    fn handle_engine_output(
-        &mut self,
-        now_ms: TimeMs,
-        engine_output: ChaosEngineOutput,
-        output: &mut CoordinatorOutput,
-    ) {
-        for system in engine_output.system_events {
-            if system.kind == SystemEventKind::RiskBreach {
-                output
-                    .records
-                    .push(StorageRecord::SafetyLatch(SafetyLatchRecord {
-                        ts_ms: system.ts_ms,
-                        scope: SafetyLatchScope::Global,
-                        active: true,
-                        source: SafetyLatchSource::Risk,
-                        request_id: None,
-                        reason: system.reason.clone(),
-                    }));
-            }
-            self.apply_system_to_startup(&system);
-            output.records.push(StorageRecord::System(system));
-        }
-        for rejection in engine_output.rejected {
-            let RiskDecision::Rejected { intent, reason } = rejection else {
-                continue;
-            };
-            output.records.push(StorageRecord::IntentRejected {
-                ts_ms: now_ms,
-                intent,
-                reason: format!("{reason:?}"),
-            });
-        }
-        for intent in engine_output.intents {
-            let legacy = intent.to_order_intent();
-            output.records.push(StorageRecord::Intent {
-                ts_ms: now_ms,
-                intent: legacy.clone(),
-            });
-            self.route_chaos_intent(now_ms, intent, legacy, output);
-        }
-        for candidate in engine_output.safety_cancel_candidates {
-            let legacy = candidate.to_order_intent();
-            output.records.push(StorageRecord::Intent {
-                ts_ms: now_ms,
-                intent: legacy.clone(),
-            });
-            self.route_safety_cancel(now_ms, candidate, legacy, output);
-        }
-    }
-
     fn route_chaos_intent(
         &mut self,
         now_ms: TimeMs,
@@ -1071,73 +853,6 @@ impl LiveCoordinator {
                     .count()
             })
             .sum()
-    }
-
-    fn apply_system_to_startup(&mut self, event: &SystemEvent) {
-        match event.kind {
-            SystemEventKind::FeedHeartbeat | SystemEventKind::FeedRecovered => {
-                if let Some(symbol) = event.symbol.as_deref() {
-                    let _ = self.startup.mark_book(symbol, true, &event.reason);
-                }
-            }
-            SystemEventKind::FeedStale
-            | SystemEventKind::FeedGap
-            | SystemEventKind::BookRecoveryStarted
-            | SystemEventKind::BookRecoveryFailed => {
-                if let Some(symbol) = event.symbol.as_deref() {
-                    let _ = self.startup.mark_book(symbol, false, &event.reason);
-                }
-            }
-            SystemEventKind::PrivateStreamHeartbeat | SystemEventKind::PrivateStreamRecovered => {
-                if let Some(account_id) = event.account_id.as_deref() {
-                    let _ = self
-                        .startup
-                        .mark_private_stream(account_id, true, &event.reason);
-                }
-            }
-            SystemEventKind::PrivateStreamStale => {
-                if let Some(account_id) = event.account_id.as_deref() {
-                    let _ = self
-                        .startup
-                        .mark_private_stream(account_id, false, &event.reason);
-                }
-            }
-            SystemEventKind::OrderTransportHeartbeat | SystemEventKind::OrderTransportRecovered => {
-                if let Some(account_id) = event.account_id.as_deref() {
-                    let _ = self
-                        .startup
-                        .mark_order_transport(account_id, true, &event.reason);
-                }
-            }
-            SystemEventKind::OrderTransportStale => {
-                if let Some(account_id) = event.account_id.as_deref() {
-                    let _ = self
-                        .startup
-                        .mark_order_transport(account_id, false, &event.reason);
-                    let _ = self
-                        .startup
-                        .mark_reconciled(account_id, false, &event.reason);
-                }
-            }
-            SystemEventKind::ReconcileDrift => {
-                if let Some(account_id) = event.account_id.as_deref() {
-                    let _ = self
-                        .startup
-                        .mark_reconciled(account_id, false, &event.reason);
-                }
-            }
-            SystemEventKind::RiskBreach | SystemEventKind::KillSwitchActivated => {
-                self.startup
-                    .mark_runtime_health("risk", false, &event.reason);
-            }
-            SystemEventKind::KillSwitchReset => {
-                self.startup
-                    .mark_runtime_health("risk", true, &event.reason);
-            }
-            SystemEventKind::AccountHalted
-            | SystemEventKind::SymbolHalted
-            | SystemEventKind::SymbolResumed => {}
-        }
     }
 
     fn require_account_id(&self, account_id: Option<String>) -> Result<String, CoordinatorError> {
