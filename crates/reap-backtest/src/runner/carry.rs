@@ -1,11 +1,14 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, bail};
+use reap_core::Symbol;
 use reap_strategy::ChaosConfig;
 
 use crate::portfolio::Portfolio;
 use crate::{
-    BACKTEST_CARRY_STATE_SCHEMA_VERSION, BacktestCarryState, BacktestExecutionConfig, NS_PER_MS,
+    BACKTEST_CARRY_STATE_SCHEMA_VERSION, BacktestCarryCurrencyRate, BacktestCarryState,
+    BacktestExecutionConfig, BacktestPendingFundingCarry, BacktestRunner, NS_PER_MS,
+    ScheduledAction,
 };
 
 impl BacktestCarryState {
@@ -287,5 +290,132 @@ fn require_optional_close(name: &str, actual: Option<f64>, expected: Option<f64>
         (Some(actual), Some(expected)) => require_close(name, actual, expected),
         (None, None) => Ok(()),
         _ => bail!("{name} presence mismatch: actual={actual:?}, expected={expected:?}"),
+    }
+}
+
+impl BacktestRunner {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn build_settled_carry_state(
+        &self,
+        marks: &HashMap<Symbol, f64>,
+        currency_rates: &HashMap<String, f64>,
+        terminal_equity_usd: Option<f64>,
+        final_valuation_complete: bool,
+        accounting_complete: bool,
+    ) -> (Option<BacktestCarryState>, Vec<String>) {
+        let mut failures = Vec::new();
+        if self.initial_portfolio.is_empty() {
+            failures.push("settled carry requires a non-empty opening portfolio".to_string());
+        }
+        if !final_valuation_complete || terminal_equity_usd.is_none() {
+            failures.push("settled carry requires complete terminal valuation".to_string());
+        }
+        if !accounting_complete {
+            failures.push("settled carry requires complete accounting".to_string());
+        }
+        if let Some(reason) = self.strategy.halt_reason() {
+            failures.push(format!(
+                "settled carry is unavailable after terminal strategy halt: {reason}"
+            ));
+        }
+        if !failures.is_empty() {
+            return (None, failures);
+        }
+
+        let build = (|| -> Result<BacktestCarryState> {
+            let portfolio = self.portfolio.settled_initial_portfolio(
+                &self.initial_portfolio,
+                marks,
+                currency_rates,
+                self.execution.derivative_leverage,
+                self.execution.exchange_cmr_multiplier,
+            )?;
+            portfolio
+                .validate(&self.strategy_config.effective(), &self.execution)
+                .context("terminal settled portfolio failed opening-state validation")?;
+            let mut carry_rates = Vec::with_capacity(self.execution.currency_rates.len());
+            for route in &self.execution.currency_rates {
+                let observation = self
+                    .currency_rate_observations
+                    .get(&route.currency)
+                    .with_context(|| {
+                        format!(
+                            "terminal settled carry has no observation for currency {}",
+                            route.currency
+                        )
+                    })?;
+                if currency_rates.get(&route.currency).copied() != Some(observation.usd_per_unit) {
+                    bail!(
+                        "terminal settled carry currency observation for {} is stale",
+                        route.currency
+                    );
+                }
+                carry_rates.push(BacktestCarryCurrencyRate {
+                    currency: route.currency.clone(),
+                    index_symbol: route.index_symbol.clone(),
+                    usd_per_unit: observation.usd_per_unit,
+                    source_ts_ms: observation.source_ts_ms,
+                    effective_at_ns: observation.effective_at_ns,
+                });
+            }
+            carry_rates.sort_by(|left, right| left.currency.cmp(&right.currency));
+
+            let mut pending_funding = self
+                .scheduled
+                .iter()
+                .filter_map(|(&(due_at_ns, _), action)| {
+                    let ScheduledAction::SettleFunding {
+                        symbol,
+                        funding_time_ms,
+                    } = action
+                    else {
+                        return None;
+                    };
+                    let key = (symbol.clone(), *funding_time_ms);
+                    Some(BacktestPendingFundingCarry {
+                        symbol: symbol.clone(),
+                        funding_time_ms: *funding_time_ms,
+                        due_at_ns,
+                        realized_rate: self.realized_funding_rates.get(&key).copied(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            pending_funding.sort_by(|left, right| {
+                (&left.symbol, left.funding_time_ms).cmp(&(&right.symbol, right.funding_time_ms))
+            });
+
+            let state = BacktestCarryState {
+                schema_version: BACKTEST_CARRY_STATE_SCHEMA_VERSION,
+                settled_at_ns: self.now_ns,
+                terminal_equity_usd: terminal_equity_usd
+                    .context("terminal equity disappeared while building settled carry")?,
+                source_raw_boundary: self.raw_replay_boundary.clone(),
+                portfolio,
+                terminal_depth_marks: self
+                    .depth_marks
+                    .iter()
+                    .filter(|(_, mark)| mark.is_finite() && **mark > 0.0)
+                    .map(|(symbol, mark)| (symbol.clone(), *mark))
+                    .collect(),
+                terminal_exchange_marks: self
+                    .exchange_marks
+                    .iter()
+                    .filter(|(_, mark)| mark.is_finite() && **mark > 0.0)
+                    .map(|(symbol, mark)| (symbol.clone(), *mark))
+                    .collect(),
+                currency_rates: carry_rates,
+                pending_funding,
+                last_settled_funding_time_ms: self.last_settled_funding_time_ms.clone(),
+            };
+            state.validate_for(&self.strategy_config, &self.execution)?;
+            Ok(state)
+        })();
+        match build {
+            Ok(state) => (Some(state), failures),
+            Err(error) => {
+                failures.push(format!("failed to build settled carry: {error:#}"));
+                (None, failures)
+            }
+        }
     }
 }
