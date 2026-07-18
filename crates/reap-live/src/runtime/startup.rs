@@ -753,12 +753,14 @@ impl RuntimeResources {
                             "invalid regular order command websocket configuration: {error}"
                         ),
                     })?;
-                    let (gateway, order_ws_runtime, mut order_ws_status) =
-                        super::start_regular_order_lane(
-                            bound_order_gateway,
-                            order_ws_config,
-                            &account_id,
-                        )?;
+                    let (gateway, order_ws_runtime, mut order_ws_status) = bound_order_gateway
+                        .start_and_install(order_ws_config)
+                        .map_err(|error| LiveRuntimeError::GatewaySetup {
+                            account_id: account_id.clone(),
+                            message: format!(
+                                "failed to start and install regular order command websocket: {error}"
+                            ),
+                        })?;
                     let order_status_events = control_tx.clone();
                     order_ws_status_tasks.push(tokio::spawn(async move {
                         while let Some(status) = order_ws_status.recv().await {

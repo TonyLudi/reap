@@ -572,7 +572,7 @@ fn raw_regular_order_dtos_are_constructed_only_by_the_live_adapter() {
     }
     assert_eq!(
         live_bundle_starts,
-        BTreeMap::from([("crates/reap-live/src/runtime.rs".to_string(), 1)]),
+        BTreeMap::from([("crates/reap-live/src/runtime/startup.rs".to_string(), 1,)]),
         "the live runtime must consume exactly one sealed gateway/session bundle start seam"
     );
 

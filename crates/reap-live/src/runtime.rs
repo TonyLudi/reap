@@ -11,10 +11,9 @@ use reap_feed::ConnectionStatusKind;
 #[cfg(test)]
 use reap_feed::FeedProcessor;
 use reap_feed::{ConnectionStatus, FeedOutput};
-use reap_okx_live_adapter::{
-    BoundRegularOrderGateway, OrderCommandWebsocketConfig, OrderCommandWebsocketLifecycle,
-    OrderCommandWebsocketStatus,
-};
+#[cfg(test)]
+use reap_okx_live_adapter::OrderCommandWebsocketLifecycle;
+#[cfg(test)]
 use reap_order::OkxOrderGateway;
 #[cfg(test)]
 use reap_storage::StorageConfig;
@@ -31,6 +30,7 @@ use reap_venue::okx::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+#[cfg(test)]
 use tokio::sync::mpsc;
 
 use crate::convergence::{FillConvergenceGuard, OrderStateConvergenceGuard};
@@ -579,28 +579,6 @@ struct LiveRuntime {
     readiness_safety: ReadinessSafetyState,
     reconciliation: ReconciliationState,
     shutdown: ShutdownState,
-}
-
-fn start_regular_order_lane(
-    bound_order_gateway: BoundRegularOrderGateway,
-    order_ws_config: OrderCommandWebsocketConfig,
-    account_id: &str,
-) -> Result<
-    (
-        OkxOrderGateway,
-        OrderCommandWebsocketLifecycle,
-        mpsc::Receiver<OrderCommandWebsocketStatus>,
-    ),
-    LiveRuntimeError,
-> {
-    bound_order_gateway
-        .start_and_install(order_ws_config)
-        .map_err(|error| LiveRuntimeError::GatewaySetup {
-            account_id: account_id.to_string(),
-            message: format!(
-                "failed to start and install regular order command websocket: {error}"
-            ),
-        })
 }
 
 impl LiveRuntime {
