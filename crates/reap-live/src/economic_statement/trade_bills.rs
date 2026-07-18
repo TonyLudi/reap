@@ -53,6 +53,59 @@ pub(super) fn validate_trade_bill(
     let journal_trade =
         validate_journal_trade_fill(bill, fill, journal_candidates, options, failures, issues);
     let expected_side = trade_subtype_side(&bill.sub_type);
+    validate_trade_identity(
+        bill,
+        fill,
+        instrument,
+        expected_side,
+        config,
+        account_id,
+        failures,
+        issues,
+    );
+    validate_trade_contract_execution(
+        bill, fill, instrument, config, account_id, options, failures, issues,
+    );
+    validate_trade_fill_amounts(
+        bill,
+        fill,
+        instrument,
+        expected_side,
+        options,
+        failures,
+        issues,
+    );
+    validate_trade_accounting(bill, instrument, options, failures, issues);
+    let derivative_sample = if instrument.kind.is_derivative() {
+        validate_derivative_trade_pnl(
+            bill,
+            fill,
+            journal_trade,
+            instrument,
+            options,
+            failures,
+            issues,
+        )
+    } else {
+        None
+    };
+    TradeBillValidation {
+        valid: before == issues.total,
+        derivative_sample,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_trade_identity(
+    bill: &OkxBill,
+    fill: &RemoteFill,
+    instrument: &InstrumentConfig,
+    expected_side: Option<Side>,
+    config: &LiveConfig,
+    account_id: &str,
+    failures: &mut BTreeSet<EconomicReconciliationFailure>,
+    issues: &mut IssueSink,
+) {
     if expected_side.is_none()
         || (instrument.kind.is_spot() && !matches!(bill.sub_type.as_str(), "1" | "2"))
     {
@@ -128,6 +181,19 @@ pub(super) fn validate_trade_bill(
             );
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_trade_contract_execution(
+    bill: &OkxBill,
+    fill: &RemoteFill,
+    instrument: &InstrumentConfig,
+    config: &LiveConfig,
+    account_id: &str,
+    options: &EconomicReconciliationOptions,
+    failures: &mut BTreeSet<EconomicReconciliationFailure>,
+    issues: &mut IssueSink,
+) {
     let expected_instrument_type = instrument_type(instrument.kind);
     if bill.instrument_type != Some(expected_instrument_type) {
         push_bill_issue(
@@ -225,6 +291,17 @@ pub(super) fn validate_trade_bill(
             "trade bill does not retain an exact fill timestamp",
         ),
     }
+}
+
+fn validate_trade_fill_amounts(
+    bill: &OkxBill,
+    fill: &RemoteFill,
+    instrument: &InstrumentConfig,
+    expected_side: Option<Side>,
+    options: &EconomicReconciliationOptions,
+    failures: &mut BTreeSet<EconomicReconciliationFailure>,
+    issues: &mut IssueSink,
+) {
     compare_number(
         bill,
         "px",
@@ -319,7 +396,15 @@ pub(super) fn validate_trade_bill(
             "trade economics cannot be accepted without exact signed fee evidence",
         ),
     }
+}
 
+fn validate_trade_accounting(
+    bill: &OkxBill,
+    instrument: &InstrumentConfig,
+    options: &EconomicReconciliationOptions,
+    failures: &mut BTreeSet<EconomicReconciliationFailure>,
+    issues: &mut IssueSink,
+) {
     if let Some(interest) = bill.interest
         && !close_abs(interest, 0.0, options.tolerances.balance_abs)
     {
@@ -378,23 +463,6 @@ pub(super) fn validate_trade_bill(
             "missing",
             "trade bill balance change cannot be checked for internal consistency",
         );
-    }
-    let derivative_sample = if instrument.kind.is_derivative() {
-        validate_derivative_trade_pnl(
-            bill,
-            fill,
-            journal_trade,
-            instrument,
-            options,
-            failures,
-            issues,
-        )
-    } else {
-        None
-    };
-    TradeBillValidation {
-        valid: before == issues.total,
-        derivative_sample,
     }
 }
 
