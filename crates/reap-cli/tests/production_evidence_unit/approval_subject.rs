@@ -149,3 +149,42 @@ fn approval_subject_ignores_verifier_time_and_derived_age_but_binds_stable_evide
     changed_gate_hash.gates[1].reconstructed_sha256 = sha256('e');
     assert_ne!(approval_sha256(&changed_gate_hash), original_sha256);
 }
+
+#[test]
+fn synthetic_report_and_approval_subject_have_fixed_compact_json_hashes() {
+    const REPORT_JSON_SHA256: &str =
+        "ca0e09a2e2f741d72a2497904abd592f8266255ebc34f2365ac24bdb5f3ee706";
+    const APPROVAL_SUBJECT_JSON_SHA256: &str =
+        "483e676610b0d5104bfa6b35af1e2ba90b2bb12f6d36a2f7e0edd9397d141104";
+
+    let report = passing_report();
+    assert_eq!(
+        report.format_version,
+        PRODUCTION_EVIDENCE_REPORT_FORMAT_VERSION
+    );
+    assert_eq!(
+        report.manifest_schema_version,
+        PRODUCTION_EVIDENCE_MANIFEST_SCHEMA_VERSION
+    );
+    assert!(!report.production_order_entry_authorized);
+    let report_json = serde_json::to_vec(&report).unwrap();
+    assert_eq!(sha256_bytes(&report_json), REPORT_JSON_SHA256);
+
+    let subject = ProductionEvidenceApprovalSubject::from_report(&report).unwrap();
+    assert_eq!(
+        subject.format_version,
+        PRODUCTION_EVIDENCE_APPROVAL_SUBJECT_FORMAT_VERSION
+    );
+    assert_eq!(
+        subject.production_evidence_report_format_version,
+        PRODUCTION_EVIDENCE_REPORT_FORMAT_VERSION
+    );
+    assert_eq!(
+        subject.manifest_schema_version,
+        PRODUCTION_EVIDENCE_MANIFEST_SCHEMA_VERSION
+    );
+    assert!(!subject.production_order_entry_authorized);
+    let subject_json = serde_json::to_vec(&subject).unwrap();
+    assert_eq!(sha256_bytes(&subject_json), APPROVAL_SUBJECT_JSON_SHA256);
+    assert_eq!(subject.sha256().unwrap(), APPROVAL_SUBJECT_JSON_SHA256);
+}
