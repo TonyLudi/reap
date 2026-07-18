@@ -6,12 +6,12 @@ use anyhow::{Context, Result, bail};
 use reap_backtest::ResearchOpeningAccountEvidence;
 use reap_core::PINNED_JAVA_REVISION;
 use reap_emergency_core::{EmergencyCancelVerificationOptions, verify_emergency_cancel_paths};
-use reap_fault::{FaultProxyConfig, FaultProxyRunVerificationReport, verify_fault_proxy_run_paths};
+use reap_fault::{FaultProxyConfig, verify_fault_proxy_run_paths};
 use reap_live::{
-    AccountCertificationArtifact, EconomicReconciliationOptions, EconomicReconciliationTolerances,
-    FillStatementReconciliationOptions, FillStatementTolerances, LiveConfig,
-    LiveConfigFileEvidence, LiveMode, TradingEnvironment, current_executable_sha256,
-    host_identity_sha256, load_live_config_with_evidence, reconcile_okx_economics_paths,
+    EconomicReconciliationOptions, EconomicReconciliationTolerances,
+    FillStatementReconciliationOptions, FillStatementTolerances, LiveConfigFileEvidence, LiveMode,
+    TradingEnvironment, current_executable_sha256, host_identity_sha256,
+    load_live_config_with_evidence, reconcile_okx_economics_paths,
     reconcile_okx_fill_collection_paths, verify_account_certification_artifact_path,
     verify_bill_collection_manifest_path, verify_deadman_expiry_certification_artifact_path,
     verify_fill_collection_manifest_path, verify_live_fault_matrix_paths, verify_live_run_paths,
@@ -20,14 +20,15 @@ use reap_live::{
 use serde::{Deserialize, Serialize};
 
 use crate::deployment::verify_research_deployment_paths;
-use crate::latency::{LatencyCalibrationVerificationReport, verify_latency_calibration};
+use crate::latency::verify_latency_calibration;
 
 mod bindings;
 mod canonical;
 mod manifest;
 mod policy_time;
+mod source_verifiers;
 
-use bindings::{BindingInputs, account_ids, evaluate_bindings};
+use bindings::{BindingInputs, evaluate_bindings};
 #[cfg(test)]
 use bindings::{
     check_account_coverage, check_fault_proxy_entries, check_live_identity,
@@ -40,6 +41,10 @@ use manifest::{resolve_regular_file, resolve_unique_paths};
 use policy_time::{FreshnessInputs, evaluate_freshness, unix_time_ms};
 #[cfg(test)]
 use policy_time::{check_fault_proxy_live_session, push_freshness};
+use source_verifiers::{
+    VerifiedEconomicInput, VerifiedFaultProxyRun, VerifiedFillInput, VerifiedTimedLiveSource,
+    config_evidence, verify_fault_live_sources, verify_latency_live_sources,
+};
 
 pub(crate) const PRODUCTION_EVIDENCE_MANIFEST_SCHEMA_VERSION: u16 = 8;
 pub(crate) const PRODUCTION_EVIDENCE_REPORT_FORMAT_VERSION: u16 = 9;
@@ -567,37 +572,6 @@ struct ResolvedEconomicInput {
     maximum_funding_mark_bracket_distance_ms: u64,
     maximum_account_boundary_gap_ms: u64,
     tolerances: EconomicReconciliationTolerances,
-}
-
-struct VerifiedFillInput {
-    collection_manifest: PathBuf,
-    journal: PathBuf,
-    manifest: reap_live::FillCollectionManifest,
-    report: reap_live::FillStatementReconciliationReport,
-}
-
-struct VerifiedEconomicInput {
-    fill_collection_manifest: PathBuf,
-    bill_collection_manifest: PathBuf,
-    opening_account_certification: PathBuf,
-    closing_account_certification: PathBuf,
-    journal: PathBuf,
-    fill_manifest: reap_live::FillCollectionManifest,
-    bill_manifest: reap_live::BillCollectionManifest,
-    opening_account: AccountCertificationArtifact,
-    closing_account: AccountCertificationArtifact,
-    report: reap_live::EconomicReconciliationReport,
-}
-
-struct VerifiedTimedLiveSource {
-    gate: ProductionEvidenceGate,
-    subject: Option<String>,
-    report: reap_live::LiveRunVerificationReport,
-}
-
-struct VerifiedFaultProxyRun {
-    scenario: reap_live::LiveFaultScenario,
-    report: FaultProxyRunVerificationReport,
 }
 
 pub(crate) fn verify_production_evidence_manifest_path(
@@ -1171,65 +1145,6 @@ pub(crate) fn verify_production_evidence_manifest_path(
     })
 }
 
-fn verify_fault_live_sources(
-    config_path: &Path,
-    matrix: &reap_live::LiveFaultMatrixVerificationReport,
-) -> Result<Vec<VerifiedTimedLiveSource>> {
-    let mut sources = Vec::with_capacity(matrix.runs.len());
-    for run in &matrix.runs {
-        let report = verify_live_run_paths(config_path, &run.report.source_path, None)
-            .with_context(|| {
-                format!(
-                    "failed to reverify fault source report {}",
-                    run.report.source_path.display()
-                )
-            })?;
-        if report.run_report != run.report || report.session_id != run.session_id {
-            bail!(
-                "fault source report {} changed after matrix reconstruction",
-                run.report.source_path.display()
-            );
-        }
-        sources.push(VerifiedTimedLiveSource {
-            gate: ProductionEvidenceGate::FaultMatrix,
-            subject: Some(scenario_name(run.scenario)),
-            report,
-        });
-    }
-    Ok(sources)
-}
-
-fn verify_latency_live_sources(
-    config_path: &Path,
-    latency: &LatencyCalibrationVerificationReport,
-) -> Result<Vec<VerifiedTimedLiveSource>> {
-    let mut sources = Vec::with_capacity(latency.source_reports.len());
-    for source in &latency.source_reports {
-        let report =
-            verify_live_run_paths(config_path, &source.source_path, None).with_context(|| {
-                format!(
-                    "failed to reverify latency source report {}",
-                    source.source_path.display()
-                )
-            })?;
-        if report.run_report.source_path != source.source_path
-            || report.run_report.bytes != source.bytes
-            || report.run_report.sha256 != source.sha256
-        {
-            bail!(
-                "latency source report {} changed after calibration reconstruction",
-                source.source_path.display()
-            );
-        }
-        sources.push(VerifiedTimedLiveSource {
-            gate: ProductionEvidenceGate::LatencyCalibration,
-            subject: report.session_id.clone(),
-            report,
-        });
-    }
-    Ok(sources)
-}
-
 fn gate_report<T: Serialize>(
     gate: ProductionEvidenceGate,
     subject: Option<String>,
@@ -1243,19 +1158,6 @@ fn gate_report<T: Serialize>(
         source_paths,
         reconstructed_sha256: serialized_sha256(reconstructed)?,
         acceptance_passed,
-    })
-}
-
-fn config_evidence(
-    config: &LiveConfig,
-    file: LiveConfigFileEvidence,
-) -> Result<ProductionEvidenceConfigEvidence> {
-    Ok(ProductionEvidenceConfigEvidence {
-        file,
-        config_fingerprint: config.fingerprint()?,
-        evidence_config_fingerprint: config.evidence_fingerprint()?,
-        environment: config.venue.environment,
-        account_ids: account_ids(config).into_iter().collect(),
     })
 }
 
