@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use reap_strategy::InstrumentConfig;
 use reap_venue::okx::{OkxBill, OkxInstrumentType};
 
 use super::position_basis::runtime_session_for_line;
@@ -159,6 +160,42 @@ pub(super) fn validate_funding_mark_prices<'a>(
     valid
 }
 
+struct FundingBillShape<'a> {
+    instrument: &'a InstrumentConfig,
+    assessment_time_ms: u64,
+}
+
+struct FundingSettlementBinding<'settlement, 'session> {
+    settlement: &'settlement JournalFundingSettlement,
+    runtime_session: &'session JournalRuntimeSession,
+    next_session_line: u64,
+}
+
+struct FundingPositionBinding<'a> {
+    position: &'a JournalPositionObservation,
+    quantity: f64,
+}
+
+struct FundingMarkBracket<'a> {
+    mark_before: &'a JournalMarkPriceObservation,
+    mark_after: &'a JournalMarkPriceObservation,
+    mark_lower_bound: f64,
+    mark_upper_bound: f64,
+    mark_effective_tolerance: f64,
+    mark_valid: bool,
+}
+
+struct FundingFormulaValidation {
+    expected_pnl_at_bill_mark: f64,
+    expected_pnl_lower_bound: f64,
+    expected_pnl_upper_bound: f64,
+    expected_pnl_absolute: f64,
+    absolute_difference: f64,
+    relative_difference: f64,
+    effective_tolerance: f64,
+    formula_valid: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn validate_funding_bill(
     bill: &OkxBill,
@@ -176,6 +213,134 @@ pub(super) fn validate_funding_bill(
     issues: &mut IssueSink,
 ) -> Option<FundingFormulaSample> {
     let before = issues.total;
+    let FundingBillShape {
+        instrument,
+        assessment_time_ms,
+    } = validate_funding_bill_shape(bill, config, account_id, options, failures, issues)?;
+    let FundingSettlementBinding {
+        settlement,
+        runtime_session,
+        next_session_line,
+    } = bind_funding_settlement_and_session(
+        bill,
+        settlements,
+        runtime_sessions,
+        config_fingerprint,
+        account_identity_sha256,
+        account_id,
+        assessment_time_ms,
+        options,
+        counts,
+        failures,
+        issues,
+    )?;
+    let FundingPositionBinding { position, quantity } = bind_funding_position(
+        bill,
+        position_observations,
+        runtime_session,
+        next_session_line,
+        assessment_time_ms,
+        options,
+        failures,
+        issues,
+    )?;
+    let bill_mark_price = require_funding_bill_mark(bill, failures, issues)?;
+    let FundingMarkBracket {
+        mark_before,
+        mark_after,
+        mark_lower_bound,
+        mark_upper_bound,
+        mark_effective_tolerance,
+        mark_valid,
+    } = validate_funding_mark_bracket(
+        bill,
+        mark_price_observations,
+        runtime_session,
+        next_session_line,
+        assessment_time_ms,
+        bill_mark_price,
+        options,
+        counts,
+        failures,
+        issues,
+    )?;
+    let pnl = validate_funding_payment(bill, options, failures, issues)?;
+    let FundingFormulaValidation {
+        expected_pnl_at_bill_mark,
+        expected_pnl_lower_bound,
+        expected_pnl_upper_bound,
+        expected_pnl_absolute,
+        absolute_difference,
+        relative_difference,
+        effective_tolerance,
+        formula_valid,
+    } = validate_funding_formula(
+        bill,
+        position,
+        instrument,
+        settlement,
+        bill_mark_price,
+        mark_before,
+        mark_after,
+        pnl,
+        options,
+        failures,
+        issues,
+    );
+    let validated = before == issues.total && mark_valid && formula_valid;
+    if validated {
+        counts.funding_bills_validated += 1;
+    }
+    Some(FundingFormulaSample {
+        bill_id: bill.bill_id.clone(),
+        symbol: bill.symbol.clone(),
+        runtime_session_id: runtime_session.session_id.clone(),
+        runtime_session_start_line: runtime_session.line,
+        runtime_session_started_at_ms: runtime_session.started_at_ms,
+        bill_timestamp_ms: bill.timestamp_ms,
+        settlement_time_ms: settlement.funding_time_ms,
+        settlement_delay_ms: bill.timestamp_ms - settlement.funding_time_ms,
+        assessment_time_ms,
+        assessment_delay_ms: assessment_time_ms.saturating_sub(settlement.funding_time_ms),
+        rate: settlement.rate,
+        inverse: instrument.kind.is_inverse(),
+        currency: bill.currency.clone(),
+        quantity,
+        journal_position_quantity: position.quantity,
+        position_observation_line: position.line,
+        position_observation_time_ms: position.event_ts_ms,
+        contract_value: instrument.contract_value,
+        bill_mark_price,
+        mark_before_line: mark_before.line,
+        mark_before_time_ms: mark_before.event_ts_ms,
+        mark_before_price: mark_before.price,
+        mark_after_line: mark_after.line,
+        mark_after_time_ms: mark_after.event_ts_ms,
+        mark_after_price: mark_after.price,
+        mark_lower_bound,
+        mark_upper_bound,
+        mark_effective_tolerance,
+        mark_validated: mark_valid,
+        expected_pnl_at_bill_mark,
+        expected_pnl_lower_bound,
+        expected_pnl_upper_bound,
+        expected_pnl_absolute,
+        observed_pnl: pnl,
+        absolute_difference,
+        relative_difference,
+        effective_tolerance,
+        validated,
+    })
+}
+
+fn validate_funding_bill_shape<'a>(
+    bill: &OkxBill,
+    config: &'a LiveConfig,
+    account_id: &str,
+    options: &EconomicReconciliationOptions,
+    failures: &mut BTreeSet<EconomicReconciliationFailure>,
+    issues: &mut IssueSink,
+) -> Option<FundingBillShape<'a>> {
     let Some(instrument) = instrument(config, &bill.symbol) else {
         push_bill_issue(
             failures,
@@ -329,6 +494,26 @@ pub(super) fn validate_funding_bill(
         );
     }
 
+    Some(FundingBillShape {
+        instrument,
+        assessment_time_ms,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bind_funding_settlement_and_session<'settlement, 'session>(
+    bill: &OkxBill,
+    settlements: &[&'settlement JournalFundingSettlement],
+    runtime_sessions: &[&'session JournalRuntimeSession],
+    config_fingerprint: &str,
+    account_identity_sha256: &str,
+    account_id: &str,
+    assessment_time_ms: u64,
+    options: &EconomicReconciliationOptions,
+    counts: &mut EconomicReconciliationCounts,
+    failures: &mut BTreeSet<EconomicReconciliationFailure>,
+    issues: &mut IssueSink,
+) -> Option<FundingSettlementBinding<'settlement, 'session>> {
     let candidates = settlements
         .iter()
         .copied()
@@ -419,6 +604,25 @@ pub(super) fn validate_funding_bill(
         .map(|session| session.line)
         .min()
         .unwrap_or(u64::MAX);
+
+    Some(FundingSettlementBinding {
+        settlement,
+        runtime_session,
+        next_session_line,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bind_funding_position<'a>(
+    bill: &OkxBill,
+    position_observations: &'a [JournalPositionObservation],
+    runtime_session: &JournalRuntimeSession,
+    next_session_line: u64,
+    assessment_time_ms: u64,
+    options: &EconomicReconciliationOptions,
+    failures: &mut BTreeSet<EconomicReconciliationFailure>,
+    issues: &mut IssueSink,
+) -> Option<FundingPositionBinding<'a>> {
     let position = position_observations
         .iter()
         .filter(|position| {
@@ -491,6 +695,15 @@ pub(super) fn validate_funding_bill(
             failures,
         );
     }
+
+    Some(FundingPositionBinding { position, quantity })
+}
+
+fn require_funding_bill_mark(
+    bill: &OkxBill,
+    failures: &mut BTreeSet<EconomicReconciliationFailure>,
+    issues: &mut IssueSink,
+) -> Option<f64> {
     let Some(bill_mark_price) = bill.price.filter(|value| value.is_finite() && *value > 0.0) else {
         push_bill_issue(
             failures,
@@ -504,6 +717,23 @@ pub(super) fn validate_funding_bill(
         );
         return None;
     };
+
+    Some(bill_mark_price)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_funding_mark_bracket<'a>(
+    bill: &OkxBill,
+    mark_price_observations: &[&'a JournalMarkPriceObservation],
+    runtime_session: &JournalRuntimeSession,
+    next_session_line: u64,
+    assessment_time_ms: u64,
+    bill_mark_price: f64,
+    options: &EconomicReconciliationOptions,
+    counts: &mut EconomicReconciliationCounts,
+    failures: &mut BTreeSet<EconomicReconciliationFailure>,
+    issues: &mut IssueSink,
+) -> Option<FundingMarkBracket<'a>> {
     let mark_before = mark_price_observations
         .iter()
         .copied()
@@ -580,6 +810,23 @@ pub(super) fn validate_funding_bill(
             "funding bill mark lies outside the independently journaled assessment bracket",
         );
     }
+
+    Some(FundingMarkBracket {
+        mark_before,
+        mark_after,
+        mark_lower_bound,
+        mark_upper_bound,
+        mark_effective_tolerance,
+        mark_valid,
+    })
+}
+
+fn validate_funding_payment(
+    bill: &OkxBill,
+    options: &EconomicReconciliationOptions,
+    failures: &mut BTreeSet<EconomicReconciliationFailure>,
+    issues: &mut IssueSink,
+) -> Option<f64> {
     let Some(pnl) = bill.pnl.filter(|value| value.is_finite() && *value != 0.0) else {
         push_bill_issue(
             failures,
@@ -622,6 +869,23 @@ pub(super) fn validate_funding_bill(
         );
     }
 
+    Some(pnl)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_funding_formula(
+    bill: &OkxBill,
+    position: &JournalPositionObservation,
+    instrument: &InstrumentConfig,
+    settlement: &JournalFundingSettlement,
+    bill_mark_price: f64,
+    mark_before: &JournalMarkPriceObservation,
+    mark_after: &JournalMarkPriceObservation,
+    pnl: f64,
+    options: &EconomicReconciliationOptions,
+    failures: &mut BTreeSet<EconomicReconciliationFailure>,
+    issues: &mut IssueSink,
+) -> FundingFormulaValidation {
     let expected_pnl_at_bill_mark = funding_pnl_at_mark(
         position.quantity,
         instrument.contract_value,
@@ -681,50 +945,17 @@ pub(super) fn validate_funding_bill(
             "funding payment does not match the configured contract formula, journaled signed position/rate, and independent mark bracket",
         );
     }
-    let validated = before == issues.total && mark_valid && formula_valid;
-    if validated {
-        counts.funding_bills_validated += 1;
-    }
-    Some(FundingFormulaSample {
-        bill_id: bill.bill_id.clone(),
-        symbol: bill.symbol.clone(),
-        runtime_session_id: runtime_session.session_id.clone(),
-        runtime_session_start_line: runtime_session.line,
-        runtime_session_started_at_ms: runtime_session.started_at_ms,
-        bill_timestamp_ms: bill.timestamp_ms,
-        settlement_time_ms: settlement.funding_time_ms,
-        settlement_delay_ms: bill.timestamp_ms - settlement.funding_time_ms,
-        assessment_time_ms,
-        assessment_delay_ms: assessment_time_ms.saturating_sub(settlement.funding_time_ms),
-        rate: settlement.rate,
-        inverse: instrument.kind.is_inverse(),
-        currency: bill.currency.clone(),
-        quantity,
-        journal_position_quantity: position.quantity,
-        position_observation_line: position.line,
-        position_observation_time_ms: position.event_ts_ms,
-        contract_value: instrument.contract_value,
-        bill_mark_price,
-        mark_before_line: mark_before.line,
-        mark_before_time_ms: mark_before.event_ts_ms,
-        mark_before_price: mark_before.price,
-        mark_after_line: mark_after.line,
-        mark_after_time_ms: mark_after.event_ts_ms,
-        mark_after_price: mark_after.price,
-        mark_lower_bound,
-        mark_upper_bound,
-        mark_effective_tolerance,
-        mark_validated: mark_valid,
+
+    FundingFormulaValidation {
         expected_pnl_at_bill_mark,
         expected_pnl_lower_bound,
         expected_pnl_upper_bound,
         expected_pnl_absolute,
-        observed_pnl: pnl,
         absolute_difference,
         relative_difference,
         effective_tolerance,
-        validated,
-    })
+        formula_valid,
+    }
 }
 
 fn funding_pnl_at_mark(
