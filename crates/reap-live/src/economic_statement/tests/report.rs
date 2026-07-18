@@ -1,3 +1,5 @@
+use sha2::{Digest, Sha256};
+
 use super::super::*;
 use super::support::*;
 
@@ -68,6 +70,19 @@ fn validates_normal_trade_and_linear_funding_from_exact_sources() {
     assert_eq!(report.derivative_pnl_formula_samples[0].expected_pnl, 20.0);
     assert_eq!(report.derivative_pnl_formula_samples[0].post_quantity, 8.0);
     assert!(report.derivative_pnl_formula_samples[0].validated);
+}
+
+#[test]
+fn passing_report_canonical_json_is_byte_stable() {
+    let report = build_report(sources(), options(), "c".repeat(64));
+    let canonical_json = serde_json::to_vec(&report).unwrap();
+
+    // The complete compact serialization pins schema field order, formula samples,
+    // limitation text, counts, failures, issues, and numeric rendering together.
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&canonical_json)),
+        "da1607a6459af0f6c9f30a963a335cd6aeb96d0896b7e7df7b6fd2eee8d7595e"
+    );
 }
 
 #[test]
