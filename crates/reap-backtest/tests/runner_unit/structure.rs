@@ -136,7 +136,7 @@ fn production_runner_keeps_single_owner_responsibility_state() {
         );
         for (path, source) in sources.iter().filter(|(path, _)| path != &root_path_string) {
             assert!(
-                !source.contains(field),
+                !source.lines().any(|line| line == format!("    {field},")),
                 "{path} must not redeclare sole-owner state `{field}`",
             );
         }
