@@ -33,5 +33,25 @@ error[E0624]: method `generate` is private
   | |         &self,
   | |         plan: &SocketPlan,
   | |         selected_websocket_url: &str,
-  | |     ) -> Result<Vec<String>, ConnectionError> {
-  | |_____________________________________________- private method defined here
+  | |     ) -> Result<Option<PrivateLoginBootstrap>, ConnectionError> {
+  | |_______________________________________________________________- private method defined here
+
+error[E0308]: mismatched types
+  --> tests/ui/bootstrap_factory_is_opaque.rs:11:16
+   |
+11 |         |_| Ok(vec!["raw-login-or-command".to_string()]),
+   |             -- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `PrivateLoginBootstrap`, found `Vec<String>`
+   |             |
+   |             arguments to this enum variant are incorrect
+   |
+   = note: expected struct `PrivateLoginBootstrap`
+              found struct `Vec<String>`
+help: the type constructed contains `Vec<String>` due to the type of the argument passed
+  --> tests/ui/bootstrap_factory_is_opaque.rs:11:13
+   |
+11 |         |_| Ok(vec!["raw-login-or-command".to_string()]),
+   |             ^^^----------------------------------------^
+   |                |
+   |                this argument influences the type of `Ok`
+note: tuple variant defined here
+  --> $RUST/core/src/result.rs

@@ -18,8 +18,9 @@ use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::{
-    ConnectionError, ConnectionStatus, ConnectionStatusKind, RecoveryRequest, SocketPlan,
-    prepare_connection_subscription, run_connection_once_with_readiness,
+    ConnectionError, ConnectionStatus, ConnectionStatusKind, PrivateLoginBootstrap,
+    RecoveryRequest, SocketPlan, prepare_connection_subscription,
+    run_connection_once_with_readiness,
 };
 
 type RecoveryStreamKey = (Venue, Symbol);
@@ -541,7 +542,8 @@ impl ConnectionAttemptPacerState {
     }
 }
 
-type BootstrapGenerator = dyn Fn(&SocketPlan) -> Result<Vec<String>, ConnectionError> + Send + Sync;
+type BootstrapGenerator =
+    dyn Fn(&SocketPlan) -> Result<PrivateLoginBootstrap, ConnectionError> + Send + Sync;
 
 pub struct BootstrapFactory {
     kind: BootstrapKind,
@@ -558,7 +560,10 @@ enum BootstrapKind {
 impl BootstrapFactory {
     pub fn bind_private_websocket(
         websocket_url: impl Into<String>,
-        generator: impl Fn(&SocketPlan) -> Result<Vec<String>, ConnectionError> + Send + Sync + 'static,
+        generator: impl Fn(&SocketPlan) -> Result<PrivateLoginBootstrap, ConnectionError>
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         Self {
             kind: BootstrapKind::Private {
@@ -572,10 +577,10 @@ impl BootstrapFactory {
         &self,
         plan: &SocketPlan,
         selected_websocket_url: &str,
-    ) -> Result<Vec<String>, ConnectionError> {
+    ) -> Result<Option<PrivateLoginBootstrap>, ConnectionError> {
         match &self.kind {
-            BootstrapKind::None => Ok(Vec::new()),
-            BootstrapKind::Private { .. } if !plan.private => Ok(Vec::new()),
+            BootstrapKind::None => Ok(None),
+            BootstrapKind::Private { .. } if !plan.private => Ok(None),
             BootstrapKind::Private {
                 websocket_url,
                 generator,
@@ -586,7 +591,7 @@ impl BootstrapFactory {
                         selected_url: selected_websocket_url.to_string(),
                     });
                 }
-                generator(plan)
+                generator(plan).map(Some)
             }
         }
     }
@@ -818,6 +823,7 @@ fn is_fatal_connection_error(error: &ConnectionError) -> bool {
     matches!(
         error,
         ConnectionError::InvalidSubscriptionPlan(_)
+            | ConnectionError::InvalidPrivateLogin(_)
             | ConnectionError::PrivateBootstrapDestinationMismatch { .. }
             | ConnectionError::RecoveryChannelClosed
     )
@@ -905,8 +911,8 @@ async fn supervise_connection(
             }
         };
         let websocket_url = adapter.websocket_url(plan.private).to_string();
-        let bootstrap_messages = match bootstrap.generate(&plan, &websocket_url) {
-            Ok(messages) => messages,
+        let private_login = match bootstrap.generate(&plan, &websocket_url) {
+            Ok(private_login) => private_login,
             Err(error) if is_fatal_connection_error(&error) => {
                 tracing::error!(
                     conn_id = %plan.conn_id,
@@ -942,7 +948,7 @@ async fn supervise_connection(
         let outcome = run_connection_once_with_readiness(
             &websocket_url,
             &plan,
-            &bootstrap_messages,
+            private_login.as_ref(),
             prepared_subscription,
             &output,
             &status,
@@ -1015,13 +1021,16 @@ mod tests {
 
     use super::*;
 
-    struct RawOrderSubscriptionAdapter {
+    const ATTACK_BOUND_URL: &str = "wss://bound.example:8443/ws/v5/private";
+
+    struct SubstitutingSubscriptionAdapter {
         delegate: OkxAdapter,
         websocket_calls: Arc<AtomicUsize>,
         subscription_calls: Arc<AtomicUsize>,
+        payload: String,
     }
 
-    impl VenueAdapter for RawOrderSubscriptionAdapter {
+    impl VenueAdapter for SubstitutingSubscriptionAdapter {
         fn venue(&self) -> Venue {
             self.delegate.venue()
         }
@@ -1047,11 +1056,66 @@ mod tests {
             _subscriptions: &[Subscription],
         ) -> Result<String, reap_venue::VenueError> {
             self.subscription_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(
-                r#"{"id":"attack","op":"order","args":[{"instId":"BTC-USDT","side":"buy"}]}"#
-                    .to_string(),
-            )
+            Ok(self.payload.clone())
         }
+    }
+
+    fn private_login(timestamp: usize) -> PrivateLoginBootstrap {
+        PrivateLoginBootstrap::parse(
+            serde_json::json!({
+                "op": "login",
+                "args": [{
+                    "apiKey": "key",
+                    "passphrase": "passphrase",
+                    "timestamp": timestamp.to_string(),
+                    "sign": "signature",
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap()
+    }
+
+    async fn assert_subscription_substitution_is_fatal(
+        plan: SocketPlan,
+        bootstrap: BootstrapFactory,
+        payload: &str,
+        expected_reason: &str,
+    ) {
+        let websocket_calls = Arc::new(AtomicUsize::new(0));
+        let subscription_calls = Arc::new(AtomicUsize::new(0));
+        let adapter = SubstitutingSubscriptionAdapter {
+            delegate: OkxAdapter::new("wss://public.example:8443/ws/v5/public", ATTACK_BOUND_URL),
+            websocket_calls: Arc::clone(&websocket_calls),
+            subscription_calls: Arc::clone(&subscription_calls),
+            payload: payload.to_string(),
+        };
+        let (output, _output_rx) = mpsc::channel(1);
+        let (status, mut status_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let (_recovery_tx, recovery) = watch::channel(0_u64);
+
+        supervise_connection(
+            Arc::new(adapter),
+            plan,
+            Arc::new(bootstrap),
+            ConnectionChannels {
+                output,
+                status,
+                shutdown,
+                recovery,
+            },
+            ConnectionAttemptPacer::new(Duration::ZERO),
+            ReconnectPolicy::default(),
+        )
+        .await;
+
+        let fatal = status_rx.recv().await.unwrap();
+        assert_eq!(fatal.kind, ConnectionStatusKind::Fatal);
+        assert!(fatal.reason.contains(expected_reason), "{}", fatal.reason);
+        assert_eq!(subscription_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(websocket_calls.load(Ordering::Relaxed), 0);
+        assert!(status_rx.recv().await.is_none());
     }
 
     #[test]
@@ -1480,18 +1544,9 @@ mod tests {
         let bound_url = "wss://private.example/ws/v5/private";
         let factory = BootstrapFactory::bind_private_websocket(bound_url, {
             let attempt = Arc::clone(&attempt);
-            move |plan| {
-                if !plan.private {
-                    return Ok(Vec::new());
-                }
+            move |_| {
                 let attempt = attempt.fetch_add(1, Ordering::Relaxed) + 1;
-                Ok(vec![
-                    serde_json::json!({
-                        "op": "login",
-                        "args": [{ "timestamp": attempt.to_string() }],
-                    })
-                    .to_string(),
-                ])
+                Ok(private_login(attempt))
             }
         });
         let private = SocketPlan {
@@ -1516,20 +1571,18 @@ mod tests {
             )],
         };
 
-        let login: serde_json::Value =
-            serde_json::from_str(&factory.generate(&private, bound_url).unwrap()[0]).unwrap();
-        assert_eq!(login["op"], "login");
-        assert_eq!(login["args"][0]["timestamp"], "1");
+        assert!(factory.generate(&private, bound_url).unwrap().is_some());
+        assert_eq!(attempt.load(Ordering::Relaxed), 1);
         assert!(
             factory
                 .generate(&public, "wss://public.example")
                 .unwrap()
-                .is_empty()
+                .is_none()
         );
+        assert_eq!(attempt.load(Ordering::Relaxed), 1);
 
-        let next_login: serde_json::Value =
-            serde_json::from_str(&factory.generate(&private, bound_url).unwrap()[0]).unwrap();
-        assert_eq!(next_login["args"][0]["timestamp"], "2");
+        assert!(factory.generate(&private, bound_url).unwrap().is_some());
+        assert_eq!(attempt.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
@@ -1540,7 +1593,7 @@ mod tests {
                 let attempts = Arc::clone(&attempts);
                 move |_| {
                     attempts.fetch_add(1, Ordering::Relaxed);
-                    Ok(vec!["signed-login".to_string()])
+                    Ok(private_login(1))
                 }
             });
         let plan = SocketPlan {
@@ -1594,13 +1647,15 @@ mod tests {
             let bootstrap_attempts = Arc::clone(&bootstrap_attempts);
             move |_| {
                 bootstrap_attempts.fetch_add(1, Ordering::Relaxed);
-                Ok(vec!["signed-login".to_string()])
+                Ok(private_login(1))
             }
         });
-        let adapter = RawOrderSubscriptionAdapter {
+        let adapter = SubstitutingSubscriptionAdapter {
             delegate: OkxAdapter::new("wss://public.example:8443/ws/v5/public", bound_url),
             websocket_calls: Arc::clone(&websocket_calls),
             subscription_calls: Arc::clone(&subscription_calls),
+            payload: r#"{"id":"attack","op":"order","args":[{"instId":"BTC-USDT","side":"buy"}]}"#
+                .to_string(),
         };
         let plan = SocketPlan {
             conn_id: ConnId::new("raw-order-subscription"),
@@ -1639,5 +1694,59 @@ mod tests {
         assert_eq!(websocket_calls.load(Ordering::Relaxed), 0);
         assert_eq!(bootstrap_attempts.load(Ordering::Relaxed), 0);
         assert!(status_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn same_count_private_channel_substitution_is_rejected_before_bootstrap_or_connection() {
+        let bootstrap_attempts = Arc::new(AtomicUsize::new(0));
+        let factory = BootstrapFactory::bind_private_websocket(ATTACK_BOUND_URL, {
+            let bootstrap_attempts = Arc::clone(&bootstrap_attempts);
+            move |_| {
+                bootstrap_attempts.fetch_add(1, Ordering::Relaxed);
+                Ok(private_login(1))
+            }
+        });
+        let plan = SocketPlan {
+            conn_id: ConnId::new("private-channel-substitution"),
+            venue: Venue::Okx,
+            private: true,
+            subscriptions: vec![Subscription::private(
+                Venue::Okx,
+                Channel::Orders,
+                FeedPriority::Critical,
+            )],
+        };
+
+        assert_subscription_substitution_is_fatal(
+            plan,
+            factory,
+            r#"{"op":"subscribe","args":[{"channel":"positions","instType":"ANY"}]}"#,
+            "does not exactly match the bound socket plan",
+        )
+        .await;
+        assert_eq!(bootstrap_attempts.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn same_count_public_symbol_substitution_is_rejected_before_connection() {
+        let plan = SocketPlan {
+            conn_id: ConnId::new("public-symbol-substitution"),
+            venue: Venue::Okx,
+            private: false,
+            subscriptions: vec![Subscription::public(
+                Venue::Okx,
+                Channel::Books,
+                "BTC-USDT",
+                FeedPriority::Critical,
+            )],
+        };
+
+        assert_subscription_substitution_is_fatal(
+            plan,
+            no_bootstrap(),
+            r#"{"op":"subscribe","args":[{"channel":"books","instId":"ETH-USDT"}]}"#,
+            "does not exactly match the bound socket plan",
+        )
+        .await;
     }
 }

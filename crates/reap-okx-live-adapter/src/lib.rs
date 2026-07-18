@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use reap_core::{AccountUpdate, Channel, ConnId, SelfTradePrevention, Side, TimeInForce, Venue};
-use reap_feed::{BootstrapFactory, ConnectionError, SocketPlan};
+use reap_feed::{BootstrapFactory, ConnectionError, PrivateLoginBootstrap, SocketPlan};
 use reap_okx_wire::{Client, Credentials, ReqwestTransport, Response, Transport};
 use reap_order::{
     CancelOrderTransportError, GatewayError, OkxOrderGateway, OrderTransportError, PacingPolicy,
@@ -1014,9 +1014,10 @@ impl PrivateStateSessionFactory {
                         bound_plan.conn_id, plan.conn_id
                     )));
                 }
-                wire.websocket_login()
-                    .map(|payload| vec![payload])
-                    .map_err(|error| ConnectionError::LoginFailed(error.to_string()))
+                let payload = wire
+                    .websocket_login()
+                    .map_err(|error| ConnectionError::LoginFailed(error.to_string()))?;
+                PrivateLoginBootstrap::parse(payload)
             },
         ))
     }
@@ -1410,7 +1411,7 @@ mod tests {
 
         fn websocket_login(&self) -> Result<String, reap_okx_wire::Error> {
             self.calls.lock().unwrap().push(Call::Login);
-            Ok("login".to_string())
+            Ok(r#"{"op":"login","args":[{"apiKey":"key","passphrase":"pass","timestamp":"1538054050","sign":"signature"}]}"#.to_string())
         }
     }
 
@@ -2543,7 +2544,10 @@ mod tests {
             demo_trading: true,
         };
 
-        assert_eq!(factory.login_message().unwrap(), "login");
+        assert_eq!(
+            factory.login_message().unwrap(),
+            r#"{"op":"login","args":[{"apiKey":"key","passphrase":"pass","timestamp":"1538054050","sign":"signature"}]}"#
+        );
         let place = build_ws_place_request(
             "place1",
             123_456,

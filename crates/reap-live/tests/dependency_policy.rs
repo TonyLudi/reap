@@ -342,6 +342,8 @@ fn regular_order_authority_construction_is_source_allowlisted() {
     let approval_scope_take = ["take_approval_", "scope("].concat();
     let command_dispatcher_take = ["take_command_", "dispatcher("].concat();
     let order_transport_install = ["set_order_", "transport("].concat();
+    let private_bootstrap_binding = ["BootstrapFactory", "::bind_private_websocket("].concat();
+    let private_login_validation = ["PrivateLoginBootstrap", "::parse("].concat();
     let mut profile_mentions = BTreeSet::new();
     let mut profile_constructors = BTreeSet::new();
     let mut profile_bindings = BTreeSet::new();
@@ -352,6 +354,8 @@ fn regular_order_authority_construction_is_source_allowlisted() {
     let mut approval_scope_takes = BTreeSet::new();
     let mut command_dispatcher_takes = BTreeSet::new();
     let mut order_transport_installs = BTreeSet::new();
+    let mut private_bootstrap_bindings = BTreeSet::new();
+    let mut private_login_validations = BTreeSet::new();
 
     for path in &sources {
         let relative = workspace_relative(workspace, path);
@@ -392,7 +396,13 @@ fn regular_order_authority_construction_is_source_allowlisted() {
             command_dispatcher_takes.insert(relative.clone());
         }
         if compact.contains(&order_transport_install) {
-            order_transport_installs.insert(relative);
+            order_transport_installs.insert(relative.clone());
+        }
+        if compact.contains(&private_bootstrap_binding) {
+            private_bootstrap_bindings.insert(relative.clone());
+        }
+        if compact.contains(&private_login_validation) {
+            private_login_validations.insert(relative);
         }
     }
 
@@ -474,6 +484,16 @@ fn regular_order_authority_construction_is_source_allowlisted() {
         order_transport_installs,
         BTreeSet::new(),
         "no public gateway transport installation seam may exist; the authenticated adapter owns its private once-only command slot"
+    );
+    assert_eq!(
+        private_bootstrap_bindings,
+        BTreeSet::from(["crates/reap-okx-live-adapter/src/lib.rs".to_string()]),
+        "only the authenticated live adapter may bind a private feed-login factory in production source"
+    );
+    assert_eq!(
+        private_login_validations,
+        BTreeSet::from(["crates/reap-okx-live-adapter/src/lib.rs".to_string()]),
+        "only the authenticated live adapter may create a validated private feed-login payload in production source"
     );
 
     let order_lib = fs::read_to_string(workspace.join("crates/reap-order/src/lib.rs"))

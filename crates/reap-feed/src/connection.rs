@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use reap_core::{Channel, ConnId, RawEnvelope, Venue};
-use reap_venue::{VenueAdapter, VenueError};
+use reap_venue::{VenueAdapter, VenueError, okx::OkxAdapter};
+use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -47,6 +48,8 @@ pub enum ConnectionError {
     NonUtf8Payload,
     #[error("private websocket requires a login bootstrap message")]
     MissingPrivateLogin,
+    #[error("private websocket login bootstrap is invalid: {0}")]
+    InvalidPrivateLogin(String),
     #[error(
         "private websocket bootstrap is bound to {bound_url}, but the adapter selected {selected_url}"
     )]
@@ -93,6 +96,87 @@ pub struct ConnectionStatus {
 impl From<tokio_tungstenite::tungstenite::Error> for ConnectionError {
     fn from(error: tokio_tungstenite::tungstenite::Error) -> Self {
         Self::Websocket(Box::new(error))
+    }
+}
+
+/// One strictly validated OKX private-session login frame.
+///
+/// The payload is intentionally opaque after validation: feed supervision can
+/// transmit it once per connection attempt, but callers cannot recover or
+/// mutate the credential-bearing JSON through this type.
+pub struct PrivateLoginBootstrap {
+    payload: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrivateLoginRequest {
+    op: String,
+    args: Vec<PrivateLoginArgument>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct PrivateLoginArgument {
+    api_key: String,
+    passphrase: String,
+    timestamp: String,
+    sign: String,
+}
+
+impl PrivateLoginBootstrap {
+    pub fn parse(payload: String) -> Result<Self, ConnectionError> {
+        let request: PrivateLoginRequest = serde_json::from_str(&payload).map_err(|error| {
+            ConnectionError::InvalidPrivateLogin(format!(
+                "payload is not one exact login request: {error}"
+            ))
+        })?;
+        if request.op != "login" {
+            return Err(ConnectionError::InvalidPrivateLogin(
+                "operation must be login".to_string(),
+            ));
+        }
+        let [argument] = request.args.as_slice() else {
+            return Err(ConnectionError::InvalidPrivateLogin(
+                "login request must contain exactly one argument".to_string(),
+            ));
+        };
+        for (field, value) in [
+            ("apiKey", argument.api_key.as_str()),
+            ("passphrase", argument.passphrase.as_str()),
+            ("timestamp", argument.timestamp.as_str()),
+            ("sign", argument.sign.as_str()),
+        ] {
+            if value.is_empty() {
+                return Err(ConnectionError::InvalidPrivateLogin(format!(
+                    "{field} must be a non-empty string"
+                )));
+            }
+        }
+        if argument
+            .timestamp
+            .parse::<i64>()
+            .map_or(true, |timestamp| timestamp <= 0)
+        {
+            return Err(ConnectionError::InvalidPrivateLogin(
+                "timestamp must be a positive integer number of seconds".to_string(),
+            ));
+        }
+        Ok(Self { payload })
+    }
+
+    fn as_str(&self) -> &str {
+        self.payload.as_str()
+    }
+}
+
+impl std::fmt::Debug for PrivateLoginBootstrap {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PrivateLoginBootstrap")
+            .field("payload", &"[REDACTED]")
+            .field("payload_len", &self.payload.len())
+            .finish()
     }
 }
 
@@ -171,6 +255,14 @@ pub(crate) fn prepare_connection_subscription(
 ) -> Result<PreparedSubscription, ConnectionError> {
     let payload = adapter.subscription_message(&plan.subscriptions)?;
     let readiness = SubscriptionReadiness::from_request(&payload, plan.subscriptions.len())?;
+    let canonical_payload = match plan.venue {
+        Venue::Okx => OkxAdapter::default().subscription_message(&plan.subscriptions)?,
+    };
+    if payload != canonical_payload {
+        return Err(ConnectionError::InvalidSubscriptionPlan(
+            "subscription request does not exactly match the bound socket plan".to_string(),
+        ));
+    }
     Ok(PreparedSubscription { payload, readiness })
 }
 
@@ -178,7 +270,7 @@ pub(crate) fn prepare_connection_subscription(
 pub(crate) async fn run_connection_once_with_readiness(
     websocket_url: &str,
     plan: &SocketPlan,
-    bootstrap_messages: &[String],
+    private_login: Option<&PrivateLoginBootstrap>,
     prepared_subscription: PreparedSubscription,
     output: &mpsc::Sender<RawEnvelope>,
     status: &mpsc::Sender<ConnectionStatus>,
@@ -187,8 +279,13 @@ pub(crate) async fn run_connection_once_with_readiness(
 ) -> ConnectionRunOutcome {
     let mut reached_ready = false;
     let result = async {
-        if plan.private && bootstrap_messages.is_empty() {
+        if plan.private && private_login.is_none() {
             return Err(ConnectionError::MissingPrivateLogin);
+        }
+        if !plan.private && private_login.is_some() {
+            return Err(ConnectionError::InvalidPrivateLogin(
+                "a public socket plan cannot carry a private login".to_string(),
+            ));
         }
         let PreparedSubscription {
             payload: subscription,
@@ -203,15 +300,13 @@ pub(crate) async fn run_connection_once_with_readiness(
         .await?;
         let (mut writer, mut reader) = socket.split();
 
-        if plan.private {
-            for message in bootstrap_messages {
-                send_message(
-                    &mut writer,
-                    Message::Text(message.clone().into()),
-                    "private bootstrap",
-                )
-                .await?;
-            }
+        if let Some(private_login) = private_login {
+            send_message(
+                &mut writer,
+                Message::Text(private_login.as_str().to_string().into()),
+                "private login",
+            )
+            .await?;
             await_private_login(&mut writer, &mut reader, shutdown, recovery).await?;
         }
         send_message(
@@ -740,6 +835,34 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn private_login_bootstrap_admits_one_exact_login_frame_only() {
+        let valid = r#"{"op":"login","args":[{"apiKey":"key","passphrase":"pass","timestamp":"1538054050","sign":"signature"}]}"#;
+        let login = PrivateLoginBootstrap::parse(valid.to_string()).unwrap();
+        let debug = format!("{login:?}");
+        for secret in ["key", "pass", "1538054050", "signature"] {
+            assert!(!debug.contains(secret));
+        }
+
+        for invalid in [
+            r#"{"op":"order","args":[{"apiKey":"key","passphrase":"pass","timestamp":"1538054050","sign":"signature"}]}"#,
+            r#"{"op":"login","args":[]}"#,
+            r#"{"op":"login","args":[{"apiKey":"key","passphrase":"pass","timestamp":"1538054050","sign":"signature"},{"apiKey":"key","passphrase":"pass","timestamp":"1538054051","sign":"signature"}]}"#,
+            r#"{"op":"login","args":[{"apiKey":"key","passphrase":"pass","timestamp":"1538054050","sign":"signature","ordType":"market"}]}"#,
+            r#"{"op":"login","args":[{"apiKey":"key","passphrase":"pass","timestamp":"0","sign":"signature"}]}"#,
+            r#"{"op":"login","args":[{"apiKey":"key","passphrase":"pass","timestamp":"1538054050","sign":"signature"}]}
+{"op":"order","args":[{"instId":"BTC-USDT","side":"buy"}]}"#,
+        ] {
+            assert!(
+                matches!(
+                    PrivateLoginBootstrap::parse(invalid.to_string()),
+                    Err(ConnectionError::InvalidPrivateLogin(_))
+                ),
+                "unexpectedly admitted {invalid}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn connection_establishment_is_bounded_cancellable_and_rejects_closed_recovery() {
         let (_shutdown_tx, mut shutdown) = watch::channel(false);
@@ -989,7 +1112,7 @@ mod tests {
             run_connection_once_with_readiness(
                 &url,
                 &plan,
-                &[],
+                None,
                 prepared_subscription,
                 &output_tx,
                 &status_tx,

@@ -93,5 +93,5 @@ error[E0624]: method `generate` is private
    | |         &self,
    | |         plan: &SocketPlan,
    | |         selected_websocket_url: &str,
-   | |     ) -> Result<Vec<String>, ConnectionError> {
-   | |_____________________________________________- private method defined here
+   | |     ) -> Result<Option<PrivateLoginBootstrap>, ConnectionError> {
+   | |_______________________________________________________________- private method defined here

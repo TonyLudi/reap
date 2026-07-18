@@ -1,0 +1,7 @@
+error[E0451]: field `payload` of struct `PrivateLoginBootstrap` is private
+ --> tests/ui/private_login_bootstrap_is_opaque.rs:5:9
+  |
+4 |     let _ = PrivateLoginBootstrap {
+  |             --------------------- in this type
+5 |         payload: "raw-login-or-command".to_string(),
+  |         ^^^^^^^ private field
