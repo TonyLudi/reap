@@ -1,26 +1,15 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 #[cfg(test)]
 use reap_backtest::ResearchOpeningAccountEvidence;
 use reap_core::PINNED_JAVA_REVISION;
-use reap_emergency_core::{EmergencyCancelVerificationOptions, verify_emergency_cancel_paths};
-use reap_fault::{FaultProxyConfig, verify_fault_proxy_run_paths};
 use reap_live::{
-    EconomicReconciliationOptions, EconomicReconciliationTolerances,
-    FillStatementReconciliationOptions, FillStatementTolerances, LiveConfigFileEvidence, LiveMode,
+    EconomicReconciliationTolerances, FillStatementTolerances, LiveConfigFileEvidence,
     TradingEnvironment, current_executable_sha256, host_identity_sha256,
-    load_live_config_with_evidence, reconcile_okx_economics_paths,
-    reconcile_okx_fill_collection_paths, verify_account_certification_artifact_path,
-    verify_bill_collection_manifest_path, verify_deadman_expiry_certification_artifact_path,
-    verify_fill_collection_manifest_path, verify_live_fault_matrix_paths, verify_live_run_paths,
-    verify_production_transition_paths,
 };
 use serde::{Deserialize, Serialize};
-
-use crate::deployment::verify_research_deployment_paths;
-use crate::latency::verify_latency_calibration;
 
 mod bindings;
 mod canonical;
@@ -35,17 +24,17 @@ use bindings::{
     check_account_coverage, check_fault_proxy_entries, check_live_identity,
     check_research_opening_accounts, enclosed_fault_scenarios,
 };
-use canonical::{failure_sort_key, scenario_name, serialized_sha256, sha256_bytes};
+use canonical::{failure_sort_key, serialized_sha256, sha256_bytes};
 use manifest::{load_manifest, resolve_manifest, validate_manifest};
 #[cfg(test)]
 use manifest::{resolve_regular_file, resolve_unique_paths};
 use policy_time::{FreshnessInputs, evaluate_freshness, unix_time_ms};
 #[cfg(test)]
 use policy_time::{check_fault_proxy_live_session, push_freshness};
-use report::{expected_identity, gate_report};
+use report::{GateInputs, build_gate_reports, expected_identity, summarize_sources};
 use source_verifiers::{
     VerifiedEconomicInput, VerifiedFaultProxyRun, VerifiedFillInput, VerifiedTimedLiveSource,
-    config_evidence, verify_fault_live_sources, verify_latency_live_sources,
+    load_initial_configs, reconstruct_sources, reopen_verified_configs,
 };
 
 pub(crate) const PRODUCTION_EVIDENCE_MANIFEST_SCHEMA_VERSION: u16 = 8;
@@ -594,511 +583,60 @@ pub(crate) fn verify_production_evidence_manifest_path(
             .context("failed to fingerprint production-evidence verifier host")?,
     };
 
-    let (demo_config_start, demo_file_start) =
-        load_live_config_with_evidence(&paths.demo_config)
-            .context("failed to load exact demo config for production evidence")?;
-    let (production_config_start, production_file_start) =
-        load_live_config_with_evidence(&paths.production_config)
-            .context("failed to load exact production config for production evidence")?;
-    let (_fault_config_start, fault_file_start) =
-        load_live_config_with_evidence(&paths.fault_demo_config)
-            .context("failed to load exact routed fault config for production evidence")?;
-    let (_, fault_proxy_evidence_start) = FaultProxyConfig::load(&paths.fault_proxy_config)
-        .context("failed to load exact fault-proxy config for production evidence")?;
-
-    let transition =
-        verify_production_transition_paths(&paths.demo_config, &paths.production_config)
-            .context("failed to reconstruct production-transition evidence")?;
-    let research = verify_research_deployment_paths(
-        &paths.production_config,
-        &paths.research_manifest,
-        &paths.research_report,
-    )
-    .context("failed to reconstruct research deployment evidence")?;
-    let demo_soak = verify_live_run_paths(
-        &paths.demo_config,
-        &paths.demo_soak_report,
-        Some(LiveMode::Demo),
-    )
-    .context("failed to verify the dedicated demo soak report")?;
-    let fault_matrix =
-        verify_live_fault_matrix_paths(&paths.fault_demo_config, &paths.fault_matrix_manifest)
-            .context("failed to reconstruct the live fault matrix")?;
-    let latency = verify_latency_calibration(
-        &paths.demo_config,
-        &paths.latency_calibration_artifact,
-        &paths.latency_source_reports,
-    )
-    .context("failed to reconstruct latency calibration")?;
-    let fault_live_sources = verify_fault_live_sources(&paths.fault_demo_config, &fault_matrix)
-        .context("failed to bind fault-matrix source timestamps")?;
-    let mut fault_proxy_runs = Vec::with_capacity(paths.fault_proxy_runs.len());
-    for input in &paths.fault_proxy_runs {
-        let report = verify_fault_proxy_run_paths(&paths.fault_proxy_config, &input.report)
-            .with_context(|| {
-                format!(
-                    "failed to reconstruct fault-proxy run evidence for {}",
-                    scenario_name(input.scenario)
-                )
-            })?;
-        fault_proxy_runs.push(VerifiedFaultProxyRun {
-            scenario: input.scenario,
-            report,
-        });
-    }
-    let latency_live_sources = verify_latency_live_sources(&paths.demo_config, &latency)
-        .context("failed to bind latency source timestamps")?;
-
-    let mut account_artifacts = Vec::with_capacity(paths.account_certifications.len());
-    for path in &paths.account_certifications {
-        let artifact = verify_account_certification_artifact_path(path).with_context(|| {
-            format!(
-                "failed to reconstruct account certification {}",
-                path.display()
-            )
-        })?;
-        account_artifacts.push((path.clone(), artifact));
-    }
-
-    let mut deadman_artifacts = Vec::with_capacity(paths.deadman_certifications.len());
-    for input in &paths.deadman_certifications {
-        let artifact =
-            verify_deadman_expiry_certification_artifact_path(&input.artifact, &input.journal)
-                .with_context(|| {
-                    format!(
-                        "failed to reconstruct deadman certification {}",
-                        input.artifact.display()
-                    )
-                })?;
-        deadman_artifacts.push((input, artifact));
-    }
-
-    let emergency = verify_emergency_cancel_paths(
-        &paths.demo_config,
-        &paths.emergency_cancel_report,
-        EmergencyCancelVerificationOptions {
-            require_all_configured_accounts: true,
-        },
-    )
-    .context("failed to reconstruct emergency-cancel evidence")?;
-
-    let mut fill_inputs = Vec::with_capacity(paths.fill_reconciliations.len());
-    for input in &paths.fill_reconciliations {
-        let verified_before = verify_fill_collection_manifest_path(&input.collection_manifest)
-            .with_context(|| {
-                format!(
-                    "failed to reconstruct fill collection {}",
-                    input.collection_manifest.display()
-                )
-            })?;
-        let manifest = verified_before.manifest.clone();
-        let report = reconcile_okx_fill_collection_paths(
-            &input.journal,
-            &input.collection_manifest,
-            FillStatementReconciliationOptions {
-                account_id: manifest.account_id.clone(),
-                begin_ms: manifest.window.begin_ms,
-                end_ms: manifest.window.end_ms,
-                minimum_fills: input.minimum_fills,
-                tolerances: input.tolerances,
-                statement_account_and_window_completeness_attested: false,
-            },
-        )
-        .with_context(|| {
-            format!(
-                "failed to reconstruct fill reconciliation for {}",
-                manifest.account_id
-            )
-        })?;
-        let verified_after = verify_fill_collection_manifest_path(&input.collection_manifest)
-            .with_context(|| {
-                format!(
-                    "failed to recheck fill collection {} after reconciliation",
-                    input.collection_manifest.display()
-                )
-            })?;
-        if verified_before != verified_after {
-            bail!(
-                "fill collection {} changed while it was being reconciled",
-                input.collection_manifest.display()
-            );
-        }
-        fill_inputs.push(VerifiedFillInput {
-            collection_manifest: input.collection_manifest.clone(),
-            journal: input.journal.clone(),
-            manifest,
-            report,
-        });
-    }
-
-    let mut economic_inputs = Vec::with_capacity(paths.economic_reconciliations.len());
-    for input in &paths.economic_reconciliations {
-        let fills_before = verify_fill_collection_manifest_path(&input.fill_collection_manifest)
-            .with_context(|| {
-                format!(
-                    "failed to reconstruct economic fill collection {}",
-                    input.fill_collection_manifest.display()
-                )
-            })?;
-        let bills_before = verify_bill_collection_manifest_path(&input.bill_collection_manifest)
-            .with_context(|| {
-                format!(
-                    "failed to reconstruct economic bill collection {}",
-                    input.bill_collection_manifest.display()
-                )
-            })?;
-        let opening_before =
-            verify_account_certification_artifact_path(&input.opening_account_certification)
-                .with_context(|| {
-                    format!(
-                        "failed to reconstruct opening economic account certification {}",
-                        input.opening_account_certification.display()
-                    )
-                })?;
-        let closing_before =
-            verify_account_certification_artifact_path(&input.closing_account_certification)
-                .with_context(|| {
-                    format!(
-                        "failed to reconstruct closing economic account certification {}",
-                        input.closing_account_certification.display()
-                    )
-                })?;
-        let report = reconcile_okx_economics_paths(
-            &input.journal,
-            &input.fill_collection_manifest,
-            &input.bill_collection_manifest,
-            &input.opening_account_certification,
-            &input.closing_account_certification,
-            EconomicReconciliationOptions {
-                account_id: bills_before.manifest.account_id.clone(),
-                begin_ms: bills_before.manifest.window.begin_ms,
-                end_ms: bills_before.manifest.window.end_ms,
-                minimum_trade_bills: input.minimum_trade_bills,
-                minimum_derivative_close_bills: input.minimum_derivative_close_bills,
-                minimum_funding_bills: input.minimum_funding_bills,
-                maximum_trade_bill_delay_ms: input.maximum_trade_bill_delay_ms,
-                maximum_funding_bill_delay_ms: input.maximum_funding_bill_delay_ms,
-                maximum_funding_mark_bracket_distance_ms: input
-                    .maximum_funding_mark_bracket_distance_ms,
-                maximum_account_boundary_gap_ms: input.maximum_account_boundary_gap_ms,
-                tolerances: input.tolerances,
-            },
-        )
-        .with_context(|| {
-            format!(
-                "failed to reconstruct economic reconciliation for {}",
-                bills_before.manifest.account_id
-            )
-        })?;
-        let fills_after = verify_fill_collection_manifest_path(&input.fill_collection_manifest)
-            .with_context(|| {
-                format!(
-                    "failed to recheck economic fill collection {}",
-                    input.fill_collection_manifest.display()
-                )
-            })?;
-        let bills_after = verify_bill_collection_manifest_path(&input.bill_collection_manifest)
-            .with_context(|| {
-                format!(
-                    "failed to recheck economic bill collection {}",
-                    input.bill_collection_manifest.display()
-                )
-            })?;
-        let opening_after =
-            verify_account_certification_artifact_path(&input.opening_account_certification)
-                .with_context(|| {
-                    format!(
-                        "failed to recheck opening economic account certification {}",
-                        input.opening_account_certification.display()
-                    )
-                })?;
-        let closing_after =
-            verify_account_certification_artifact_path(&input.closing_account_certification)
-                .with_context(|| {
-                    format!(
-                        "failed to recheck closing economic account certification {}",
-                        input.closing_account_certification.display()
-                    )
-                })?;
-        if fills_before != fills_after
-            || bills_before != bills_after
-            || opening_before != opening_after
-            || closing_before != closing_after
-        {
-            bail!(
-                "economic source collections changed while {} was being reconciled",
-                bills_before.manifest.account_id
-            );
-        }
-        economic_inputs.push(VerifiedEconomicInput {
-            fill_collection_manifest: input.fill_collection_manifest.clone(),
-            bill_collection_manifest: input.bill_collection_manifest.clone(),
-            opening_account_certification: input.opening_account_certification.clone(),
-            closing_account_certification: input.closing_account_certification.clone(),
-            journal: input.journal.clone(),
-            fill_manifest: fills_before.manifest,
-            bill_manifest: bills_before.manifest,
-            opening_account: opening_before,
-            closing_account: closing_before,
-            report,
-        });
-    }
-
-    // Reopen all configs after the expensive source reconstructions. Every
-    // subordinate report is compared to this final exact-file observation.
-    let (demo_config, demo_file) = load_live_config_with_evidence(&paths.demo_config)
-        .context("failed to reload exact demo config after production-evidence verification")?;
-    let (production_config, production_file) = load_live_config_with_evidence(
-        &paths.production_config,
-    )
-    .context("failed to reload exact production config after production-evidence verification")?;
-    let (fault_config, fault_file) = load_live_config_with_evidence(&paths.fault_demo_config)
-        .context("failed to reload exact routed fault config after verification")?;
-    let (fault_proxy_config, fault_proxy_evidence) =
-        FaultProxyConfig::load(&paths.fault_proxy_config)
-            .context("failed to reload exact fault-proxy config after verification")?;
-    let manifest_final = load_manifest(&loaded.evidence.source_path)
-        .context("failed to reload production-evidence manifest after verification")?;
-    if manifest_final.evidence != loaded.evidence || manifest_final.value != loaded.value {
-        bail!("production-evidence manifest changed while it was being verified");
-    }
-    let expected_fault_config = fault_proxy_config
-        .route_live_config(&demo_config)
-        .context("failed to reconstruct routed fault config from exact demo/proxy configs")?;
-    let expected_fault_config_fingerprint = expected_fault_config.evidence_fingerprint()?;
-    let fault_config_derived = serde_json::to_value(&fault_config)?
-        == serde_json::to_value(&expected_fault_config)?
-        && fault_config.fingerprint()? == expected_fault_config.fingerprint()?
-        && fault_config.evidence_fingerprint()? == expected_fault_config.evidence_fingerprint()?;
-    let demo_evidence = config_evidence(&demo_config, demo_file.clone())?;
-    let production_evidence = config_evidence(&production_config, production_file.clone())?;
-    let fault_evidence = config_evidence(&fault_config, fault_file.clone())?;
-
-    let observed_demo_identity = ProductionEvidenceLiveIdentity {
-        reap_version: demo_soak.reap_version.clone(),
-        executable_sha256: demo_soak.executable_sha256.clone(),
-        host_identity_sha256: demo_soak.host_identity_sha256.clone().unwrap_or_default(),
-        account_identity_sha256s: demo_soak.account_identity_sha256s.clone(),
-    };
-    let observed_production_accounts = account_artifacts
-        .iter()
-        .map(|(_, artifact)| {
-            (
-                artifact.summary.account_id.clone(),
-                artifact.summary.account_identity_sha256.clone(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut observed_fault_proxy_runs = fault_proxy_runs
-        .iter()
-        .map(|proxy| ProductionEvidenceFaultProxyRunSummary {
-            scenario: proxy.scenario,
-            run_report: proxy.report.run_report.clone(),
-            proxy_session_id: proxy.report.proxy_session_id.clone(),
-            started_at_ms: proxy.report.started_at_ms,
-            stopped_at_ms: proxy.report.stopped_at_ms,
-            completed_faults: proxy.report.completed_faults,
-            acceptance_passed: proxy.report.acceptance_passed,
-        })
-        .collect::<Vec<_>>();
-    observed_fault_proxy_runs.sort_by_key(|proxy| proxy.scenario);
+    let initial = load_initial_configs(&paths)?;
+    let sources = reconstruct_sources(&paths)?;
+    let reopened = reopen_verified_configs(&paths, &loaded)?;
+    let summaries = summarize_sources(&sources);
     let verified_at_ms = unix_time_ms()?;
     let (freshness_observations, freshness_failures) = evaluate_freshness(FreshnessInputs {
         policy: &loaded.value.freshness,
         verified_at_ms,
         demo_soak_path: &paths.demo_soak_report,
-        demo_soak: &demo_soak,
-        fault_matrix: &fault_matrix,
-        fault_live_sources: &fault_live_sources,
-        fault_proxy_runs: &fault_proxy_runs,
-        latency_live_sources: &latency_live_sources,
-        account_artifacts: &account_artifacts,
-        deadman_artifacts: &deadman_artifacts,
+        demo_soak: &sources.demo_soak,
+        fault_matrix: &sources.fault_matrix,
+        fault_live_sources: &sources.fault_live_sources,
+        fault_proxy_runs: &sources.fault_proxy_runs,
+        latency_live_sources: &sources.latency_live_sources,
+        account_artifacts: &sources.account_artifacts,
+        deadman_artifacts: &sources.deadman_artifacts,
         emergency_path: &paths.emergency_cancel_report,
-        emergency: &emergency,
-        fill_inputs: &fill_inputs,
-        economic_inputs: &economic_inputs,
+        emergency: &sources.emergency,
+        fill_inputs: &sources.fill_inputs,
+        economic_inputs: &sources.economic_inputs,
     });
-
-    let mut gates = vec![
-        gate_report(
-            ProductionEvidenceGate::ProductionTransition,
-            None,
-            vec![paths.demo_config.clone(), paths.production_config.clone()],
-            &transition,
-            transition.acceptance_passed,
-        )?,
-        gate_report(
-            ProductionEvidenceGate::ResearchDeployment,
-            None,
-            vec![
-                paths.production_config.clone(),
-                paths.research_manifest.clone(),
-                paths.research_report.clone(),
-            ],
-            &research,
-            research.acceptance_passed,
-        )?,
-        gate_report(
-            ProductionEvidenceGate::DemoSoak,
-            None,
-            vec![paths.demo_config.clone(), paths.demo_soak_report.clone()],
-            &demo_soak,
-            demo_soak.acceptance_passed,
-        )?,
-        gate_report(
-            ProductionEvidenceGate::FaultConfiguration,
-            None,
-            vec![
-                paths.demo_config.clone(),
-                paths.fault_proxy_config.clone(),
-                paths.fault_demo_config.clone(),
-            ],
-            &(
-                &fault_proxy_evidence,
-                &expected_fault_config,
-                &fault_config,
-                &fault_evidence,
-            ),
-            fault_config_derived,
-        )?,
-        gate_report(
-            ProductionEvidenceGate::FaultMatrix,
-            None,
-            vec![
-                paths.fault_demo_config.clone(),
-                paths.fault_matrix_manifest.clone(),
-            ],
-            &fault_matrix,
-            fault_matrix.live_fault_matrix_passed,
-        )?,
-    ];
-    for proxy in &fault_proxy_runs {
-        gates.push(gate_report(
-            ProductionEvidenceGate::FaultProxyRun,
-            Some(scenario_name(proxy.scenario)),
-            vec![
-                paths.fault_proxy_config.clone(),
-                proxy.report.run_report.source_path.clone(),
-            ],
-            &proxy.report,
-            proxy.report.acceptance_passed,
-        )?);
-    }
-    let freshness_paths = freshness_observations
-        .iter()
-        .map(|observation| observation.source_path.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    gates.push(gate_report(
-        ProductionEvidenceGate::Freshness,
-        None,
-        freshness_paths,
-        &freshness_observations,
-        freshness_failures.is_empty(),
-    )?);
-    let mut latency_paths = vec![
-        paths.demo_config.clone(),
-        paths.latency_calibration_artifact.clone(),
-    ];
-    latency_paths.extend(paths.latency_source_reports.iter().cloned());
-    gates.push(gate_report(
-        ProductionEvidenceGate::LatencyCalibration,
-        None,
-        latency_paths,
-        &latency,
-        latency.acceptance_passed,
-    )?);
-    for (path, artifact) in &account_artifacts {
-        gates.push(gate_report(
-            ProductionEvidenceGate::AccountCertification,
-            Some(artifact.summary.account_id.clone()),
-            vec![path.clone()],
-            artifact,
-            artifact.summary.passed,
-        )?);
-    }
-    for (input, artifact) in &deadman_artifacts {
-        gates.push(gate_report(
-            ProductionEvidenceGate::DeadmanCertification,
-            Some(artifact.summary.account_id.clone()),
-            vec![input.artifact.clone(), input.journal.clone()],
-            artifact,
-            artifact.summary.passed,
-        )?);
-    }
-    gates.push(gate_report(
-        ProductionEvidenceGate::EmergencyCancel,
-        None,
-        vec![
-            paths.demo_config.clone(),
-            paths.emergency_cancel_report.clone(),
-        ],
-        &emergency,
-        emergency.acceptance_passed,
-    )?);
-    for input in &fill_inputs {
-        gates.push(gate_report(
-            ProductionEvidenceGate::FillReconciliation,
-            Some(input.manifest.account_id.clone()),
-            vec![input.collection_manifest.clone(), input.journal.clone()],
-            &(&input.manifest, &input.report),
-            input.report.passed,
-        )?);
-    }
-    for input in &economic_inputs {
-        gates.push(gate_report(
-            ProductionEvidenceGate::EconomicReconciliation,
-            Some(input.bill_manifest.account_id.clone()),
-            vec![
-                input.fill_collection_manifest.clone(),
-                input.bill_collection_manifest.clone(),
-                input.opening_account_certification.clone(),
-                input.closing_account_certification.clone(),
-                input.journal.clone(),
-            ],
-            &(
-                &input.fill_manifest,
-                &input.bill_manifest,
-                &input.opening_account,
-                &input.closing_account,
-                &input.report,
-            ),
-            input.report.passed,
-        )?);
-    }
-    gates.sort_by(|left, right| {
-        left.gate
-            .cmp(&right.gate)
-            .then_with(|| left.subject.cmp(&right.subject))
-    });
+    let gates = build_gate_reports(GateInputs {
+        paths: &paths,
+        reopened: &reopened,
+        sources: &sources,
+        freshness_observations: &freshness_observations,
+        freshness_failures: &freshness_failures,
+    })?;
 
     let bindings = BindingInputs {
         expected: &expected,
         verifier: &verifier,
-        demo_start: (&demo_config_start, &demo_file_start),
-        production_start: (&production_config_start, &production_file_start),
-        fault_start: &fault_file_start,
-        fault_proxy_start: &fault_proxy_evidence_start,
-        demo: (&demo_config, &demo_evidence),
-        production: (&production_config, &production_evidence),
-        fault: (&fault_config, &fault_evidence),
-        fault_proxy: &fault_proxy_evidence,
-        expected_fault_config_fingerprint: &expected_fault_config_fingerprint,
-        fault_config_derived,
-        transition: &transition,
-        research: &research,
-        demo_soak: &demo_soak,
-        fault_matrix: &fault_matrix,
-        fault_live_sources: &fault_live_sources,
-        fault_proxy_runs: &fault_proxy_runs,
-        latency: &latency,
-        account_artifacts: &account_artifacts,
-        deadman_artifacts: &deadman_artifacts,
-        emergency: &emergency,
-        fill_inputs: &fill_inputs,
-        economic_inputs: &economic_inputs,
+        demo_start: (&initial.demo_config, &initial.demo_file),
+        production_start: (&initial.production_config, &initial.production_file),
+        fault_start: &initial.fault_file,
+        fault_proxy_start: &initial.fault_proxy_evidence,
+        demo: (&reopened.demo_config, &reopened.demo_evidence),
+        production: (&reopened.production_config, &reopened.production_evidence),
+        fault: (&reopened.fault_config, &reopened.fault_evidence),
+        fault_proxy: &reopened.fault_proxy_evidence,
+        expected_fault_config_fingerprint: &reopened.expected_fault_config_fingerprint,
+        fault_config_derived: reopened.fault_config_derived,
+        transition: &sources.transition,
+        research: &sources.research,
+        demo_soak: &sources.demo_soak,
+        fault_matrix: &sources.fault_matrix,
+        fault_live_sources: &sources.fault_live_sources,
+        fault_proxy_runs: &sources.fault_proxy_runs,
+        latency: &sources.latency,
+        account_artifacts: &sources.account_artifacts,
+        deadman_artifacts: &sources.deadman_artifacts,
+        emergency: &sources.emergency,
+        fill_inputs: &sources.fill_inputs,
+        economic_inputs: &sources.economic_inputs,
     };
     let mut failures = evaluate_bindings(bindings);
     failures.extend(freshness_failures);
@@ -1117,14 +655,14 @@ pub(crate) fn verify_production_evidence_manifest_path(
         expected,
         freshness_policy: loaded.value.freshness,
         freshness_observations,
-        fault_proxy_runs: observed_fault_proxy_runs,
+        fault_proxy_runs: summaries.observed_fault_proxy_runs,
         verifier,
-        demo_config: demo_evidence,
-        production_config: production_evidence,
-        fault_demo_config: fault_evidence,
-        observed_demo_identity,
-        observed_production_account_identity_sha256s: observed_production_accounts,
-        observed_deployment_candidate_id: research.deployment_candidate_id.clone(),
+        demo_config: reopened.demo_evidence,
+        production_config: reopened.production_evidence,
+        fault_demo_config: reopened.fault_evidence,
+        observed_demo_identity: summaries.observed_demo_identity,
+        observed_production_account_identity_sha256s: summaries.observed_production_accounts,
+        observed_deployment_candidate_id: sources.research.deployment_candidate_id.clone(),
         gates,
         failures,
         limitations: vec![
@@ -1146,7 +684,6 @@ pub(crate) fn verify_production_evidence_manifest_path(
         production_order_entry_authorized: false,
     })
 }
-
 #[cfg(test)]
 #[path = "../tests/production_evidence_unit/mod.rs"]
 mod tests;
