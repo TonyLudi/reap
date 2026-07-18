@@ -440,8 +440,8 @@ impl ChaosStrategy {
             }
             .min(use_notional);
             let hedge_aggression =
-                if self.config.act_on_burst && hedge_side.factor() * self.burst > 0.0 {
-                    entity.hedge_aggression().max(self.burst.abs())
+                if self.config.act_on_burst && hedge_side.factor() * self.pricing.burst > 0.0 {
+                    entity.hedge_aggression().max(self.pricing.burst.abs())
                 } else {
                     entity.hedge_aggression()
                 };

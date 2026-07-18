@@ -116,20 +116,20 @@ impl ChaosStrategy {
                 self.advance_time(*ts_ms);
                 let mut should_reprice = false;
                 if *value == 0.0 {
-                    if self.burst_symbol.as_deref() == Some(symbol) {
-                        self.burst = 0.0;
-                        self.burst_symbol = None;
+                    if self.pricing.burst_symbol.as_deref() == Some(symbol) {
+                        self.pricing.burst = 0.0;
+                        self.pricing.burst_symbol = None;
                     }
-                } else if self.burst == 0.0 {
-                    self.burst = *value;
-                    self.burst_symbol = Some(symbol.clone());
+                } else if self.pricing.burst == 0.0 {
+                    self.pricing.burst = *value;
+                    self.pricing.burst_symbol = Some(symbol.clone());
                     should_reprice = true;
-                } else if self.burst * value < 0.0 {
-                    self.burst = 0.0;
-                    self.burst_symbol = None;
-                } else if value.abs() > self.burst.abs() {
-                    self.burst = *value;
-                    self.burst_symbol = Some(symbol.clone());
+                } else if self.pricing.burst * value < 0.0 {
+                    self.pricing.burst = 0.0;
+                    self.pricing.burst_symbol = None;
+                } else if value.abs() > self.pricing.burst.abs() {
+                    self.pricing.burst = *value;
+                    self.pricing.burst_symbol = Some(symbol.clone());
                     should_reprice = true;
                 }
 

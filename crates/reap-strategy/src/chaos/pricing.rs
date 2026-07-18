@@ -52,6 +52,14 @@ impl JavaRandom {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct PricingState {
+    pub(super) burst: f64,
+    pub(super) burst_symbol: Option<Symbol>,
+    pub(super) quote_targets: HashMap<(Symbol, Side), QuoteTargetState>,
+    pub(super) random: JavaRandom,
+}
+
 impl ChaosStrategy {
     pub(super) fn desired_quote_levels(
         &mut self,
@@ -61,7 +69,7 @@ impl ChaosStrategy {
     ) -> Vec<TheoQuote> {
         let key = (symbol.to_string(), side);
         let Some(mut top) = desired else {
-            self.quote_targets.remove(&key);
+            self.pricing.quote_targets.remove(&key);
             return Vec::new();
         };
         let Some(entity) = self.entities.get(symbol).cloned() else {
@@ -73,7 +81,7 @@ impl ChaosStrategy {
         let quote_level_count = entity.quote_level_count(side);
         top.price = round_passive_to_tick(top.price, entity.config.tick_size, side);
 
-        if let Some(current) = self.quote_targets.get(&key) {
+        if let Some(current) = self.pricing.quote_targets.get(&key) {
             let current_top = current.levels.first();
             let price_changed = current_top.is_none_or(|quote| {
                 let passive_width = if self.config.quote_only {
@@ -116,7 +124,7 @@ impl ChaosStrategy {
         let spread_span = entity.config.max_level_spread - entity.config.min_level_spread;
         let mut last_px = top.price;
         for _ in 1..quote_level_count {
-            let random = self.random.next_f64();
+            let random = self.pricing.random.next_f64();
             let spread = entity.config.min_level_spread + random * spread_span;
             let raw_px = match side {
                 Side::Buy => last_px * (1.0 - spread),
@@ -136,7 +144,7 @@ impl ChaosStrategy {
             });
             last_px = price;
         }
-        self.quote_targets.insert(
+        self.pricing.quote_targets.insert(
             key,
             QuoteTargetState {
                 levels: levels.clone(),
@@ -285,8 +293,9 @@ impl ChaosStrategy {
 
             let pos_skew_adj =
                 self.calculate_total_pos_skew_adj(side, &hedge_notional_by_symbol, symbol);
-            let burst_adj = if self.config.act_on_burst && side.factor() * self.burst < 0.0 {
-                self.burst * ref_mid
+            let burst_adj = if self.config.act_on_burst && side.factor() * self.pricing.burst < 0.0
+            {
+                self.pricing.burst * ref_mid
             } else {
                 0.0
             };

@@ -26,7 +26,7 @@ mod risk;
 
 use execution_state::ExecutionTrackingState;
 use hedging::{HedgeCandidate, HedgingState};
-use pricing::{JavaRandom, QuoteTargetState, round_passive_to_tick};
+use pricing::{JavaRandom, PricingState, round_passive_to_tick};
 use reference_health::{
     DebouncedCondition, ReferenceHealthState, TimedPrice, should_accept_timestamp,
     timestamp_is_fresh,
@@ -52,12 +52,9 @@ pub struct ChaosStrategy {
     symbol_to_group: HashMap<Symbol, String>,
     reference_health: ReferenceHealthState,
     halt_reason: Option<String>,
-    burst: f64,
-    burst_symbol: Option<Symbol>,
+    pricing: PricingState,
     hedging: HedgingState,
     execution: ExecutionTrackingState,
-    quote_targets: HashMap<(Symbol, Side), QuoteTargetState>,
-    random: JavaRandom,
     now_ms: TimeMs,
     risk: AggregateRiskState,
 }
@@ -184,8 +181,12 @@ impl ChaosStrategy {
                 insufficient_valid_since: None,
             },
             halt_reason: None,
-            burst: 0.0,
-            burst_symbol: None,
+            pricing: PricingState {
+                burst: 0.0,
+                burst_symbol: None,
+                quote_targets: HashMap::new(),
+                random: JavaRandom::new(1),
+            },
             hedging: HedgingState {
                 best_hedges,
                 hedge_candidate_scratch: Vec::new(),
@@ -200,8 +201,6 @@ impl ChaosStrategy {
                 last_quote_fill_ms: HashMap::new(),
                 missed_hedges: Vec::new(),
             },
-            quote_targets: HashMap::new(),
-            random: JavaRandom::new(1),
             now_ms: 0,
             risk: AggregateRiskState {
                 delta_usd: 0.0,
@@ -1776,8 +1775,8 @@ mod tests {
             symbol: "BTC-USDT-SWAP.OK".to_string(),
             value: -0.002,
         });
-        assert!(approx_eq(strategy.burst, 0.0));
-        assert!(strategy.burst_symbol.is_none());
+        assert!(approx_eq(strategy.pricing.burst, 0.0));
+        assert!(strategy.pricing.burst_symbol.is_none());
     }
 
     #[test]
