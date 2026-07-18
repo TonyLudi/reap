@@ -4,10 +4,10 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use reap_core::{
-    AccountUpdate, Balance, Level, MarketEvent, OrderBook, OrderEvent, OrderUpdate, Side,
-    TimeInForce,
+    AccountUpdate, Balance, ConnId, FeedPriority, Level, MarketEvent, OrderBook, OrderEvent,
+    OrderUpdate, Side, Subscription, TimeInForce,
 };
-use reap_feed::SupervisedFeed;
+use reap_feed::{SocketPlan, SupervisedFeed};
 use reap_order::{
     CancelOrderTransportError, ClientOrderIdGenerator, OrderTransportError, OwnedRegularOrders,
     PacingPolicy, PreparedRegularCancel, PreparedRegularSubmit, PrivateStateReducer,
@@ -57,6 +57,7 @@ fn production_runtime_keeps_single_owner_responsibility_state() {
         include_str!("../../src/runtime/composition.rs"),
         include_str!("../../src/runtime/connectivity.rs"),
         include_str!("../../src/runtime/dispatch.rs"),
+        include_str!("../../src/runtime/planning.rs"),
         include_str!("../../src/runtime/readiness_safety.rs"),
         include_str!("../../src/runtime/reconciliation.rs"),
         include_str!("../../src/runtime/shutdown.rs"),
