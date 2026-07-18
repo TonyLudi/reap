@@ -31,6 +31,7 @@ use reference_health::{
     DebouncedCondition, ReferenceHealthState, TimedPrice, should_accept_timestamp,
     timestamp_is_fresh,
 };
+use risk::AggregateRiskState;
 
 pub use config::{
     ChaosConfig, CoinConfig, ConfigValidation, HaltIntervalConfig, InstrumentConfig,
@@ -60,13 +61,7 @@ pub struct ChaosStrategy {
     random: JavaRandom,
     now_ms: TimeMs,
     last_hedge_ms: TimeMs,
-    delta_usd: f64,
-    pending_delta_usd: f64,
-    net_filled_delta_usd: f64,
-    turnover_by_group: HashMap<String, f64>,
-    pnl_debouncer: DebouncedCondition,
-    margin_debouncers: HashMap<String, DebouncedCondition>,
-    exchange_margin_debouncers: HashMap<String, DebouncedCondition>,
+    risk: AggregateRiskState,
     no_hedge_found_since: Option<TimeMs>,
     hedge_not_found_since: Option<TimeMs>,
     all_hedges_halted_since: Option<TimeMs>,
@@ -208,13 +203,15 @@ impl ChaosStrategy {
             random: JavaRandom::new(1),
             now_ms: 0,
             last_hedge_ms: 0,
-            delta_usd: 0.0,
-            pending_delta_usd: 0.0,
-            net_filled_delta_usd: 0.0,
-            turnover_by_group: HashMap::new(),
-            pnl_debouncer: DebouncedCondition::default(),
-            margin_debouncers,
-            exchange_margin_debouncers,
+            risk: AggregateRiskState {
+                delta_usd: 0.0,
+                pending_delta_usd: 0.0,
+                net_filled_delta_usd: 0.0,
+                turnover_by_group: HashMap::new(),
+                pnl_debouncer: DebouncedCondition::default(),
+                margin_debouncers,
+                exchange_margin_debouncers,
+            },
             no_hedge_found_since: None,
             hedge_not_found_since: None,
             all_hedges_halted_since: None,
@@ -222,11 +219,11 @@ impl ChaosStrategy {
     }
 
     pub fn delta_usd(&self) -> f64 {
-        self.delta_usd
+        self.risk.delta_usd
     }
 
     pub fn pending_delta_usd(&self) -> f64 {
-        self.pending_delta_usd
+        self.risk.pending_delta_usd
     }
 
     pub fn entity(&self, symbol: &str) -> Option<&InstrumentState> {
@@ -290,10 +287,10 @@ impl ChaosStrategy {
             && reference_healthy
             && self.check_index_deviation();
 
-        let strat_can_buy = self.pending_delta_usd <= 0.5 * self.config.delta_limit_usd
-            && self.delta_usd <= 0.5 * self.config.delta_limit_usd;
-        let strat_can_sell = self.pending_delta_usd >= -0.5 * self.config.delta_limit_usd
-            && self.delta_usd >= -0.5 * self.config.delta_limit_usd;
+        let strat_can_buy = self.risk.pending_delta_usd <= 0.5 * self.config.delta_limit_usd
+            && self.risk.delta_usd <= 0.5 * self.config.delta_limit_usd;
+        let strat_can_sell = self.risk.pending_delta_usd >= -0.5 * self.config.delta_limit_usd
+            && self.risk.delta_usd >= -0.5 * self.config.delta_limit_usd;
 
         let mut commands = Vec::new();
         // Java ChaosContext uses a TreeSet here so backtest command order is stable.

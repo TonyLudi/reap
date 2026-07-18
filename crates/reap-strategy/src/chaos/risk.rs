@@ -5,8 +5,9 @@ use reap_core::{AccountUpdate, Quantity, Side, Symbol};
 use crate::ChaosExecutionIntent;
 
 use super::{
-    ChaosStrategy, EXCHANGE_MARGIN_RATIO_THRESHOLD, HedgeLevel, ORDER_CHECK_DELTA_THRESHOLD_USD,
-    RiskGroupConfig, RiskGroupKindConfig, StableMap, ZOMBIE_HEDGE_THRESHOLD_MS,
+    ChaosStrategy, DebouncedCondition, EXCHANGE_MARGIN_RATIO_THRESHOLD, HedgeLevel,
+    ORDER_CHECK_DELTA_THRESHOLD_USD, RiskGroupConfig, RiskGroupKindConfig, StableMap,
+    ZOMBIE_HEDGE_THRESHOLD_MS,
 };
 
 #[derive(Debug, Clone)]
@@ -89,6 +90,17 @@ impl RiskGroupState {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct AggregateRiskState {
+    pub(super) delta_usd: f64,
+    pub(super) pending_delta_usd: f64,
+    pub(super) net_filled_delta_usd: f64,
+    pub(super) turnover_by_group: HashMap<String, f64>,
+    pub(super) pnl_debouncer: DebouncedCondition,
+    pub(super) margin_debouncers: HashMap<String, DebouncedCondition>,
+    pub(super) exchange_margin_debouncers: HashMap<String, DebouncedCondition>,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct AccountBalanceState {
     cash: Quantity,
@@ -125,26 +137,26 @@ impl ChaosStrategy {
             ));
             return false;
         }
-        if !self.delta_usd.is_finite() || !self.pending_delta_usd.is_finite() {
+        if !self.risk.delta_usd.is_finite() || !self.risk.pending_delta_usd.is_finite() {
             self.halt_reason = Some(format!(
                 "non-finite strategy delta/pending delta {}/{}",
-                self.delta_usd, self.pending_delta_usd
+                self.risk.delta_usd, self.risk.pending_delta_usd
             ));
             return false;
         }
-        if self.delta_usd.abs() > self.config.delta_limit_usd {
+        if self.risk.delta_usd.abs() > self.config.delta_limit_usd {
             self.halt_reason = Some(format!(
                 "strategy delta {} exceeds {}",
-                self.delta_usd, self.config.delta_limit_usd
+                self.risk.delta_usd, self.config.delta_limit_usd
             ));
             return false;
         }
         if self.config.strategy_group.is_none()
-            && self.net_filled_delta_usd > self.config.delta_limit_usd * 2.0
+            && self.risk.net_filled_delta_usd > self.config.delta_limit_usd * 2.0
         {
             self.halt_reason = Some(format!(
                 "net filled delta {} exceeds {}",
-                self.net_filled_delta_usd,
+                self.risk.net_filled_delta_usd,
                 self.config.delta_limit_usd * 2.0
             ));
             return false;
@@ -185,6 +197,7 @@ impl ChaosStrategy {
                 return false;
             }
             let turnover = self
+                .risk
                 .turnover_by_group
                 .get(&group.config.name)
                 .copied()
@@ -200,6 +213,7 @@ impl ChaosStrategy {
                 let breaching = !exchange_margin_ratio.is_finite()
                     || exchange_margin_ratio < EXCHANGE_MARGIN_RATIO_THRESHOLD;
                 if self
+                    .risk
                     .exchange_margin_debouncers
                     .entry(group.config.name.clone())
                     .or_default()
@@ -220,6 +234,7 @@ impl ChaosStrategy {
                 let breaching =
                     !margin_ratio.is_finite() || margin_ratio < group.config.min_margin_level;
                 if self
+                    .risk
                     .margin_debouncers
                     .entry(group.config.name.clone())
                     .or_default()
@@ -250,7 +265,7 @@ impl ChaosStrategy {
             self.halt_reason = Some("trading pnl is non-finite".to_string());
             return false;
         }
-        if self.pnl_debouncer.check(
+        if self.risk.pnl_debouncer.check(
             trading_pnl < -self.config.pnl_limit_usd,
             self.now_ms,
             self.config.pnl_breach_debounce_ms,
@@ -470,12 +485,12 @@ impl ChaosStrategy {
             rg.live_order_size_usd = live_sizes.get(name).copied().unwrap_or(0.0);
         }
 
-        self.delta_usd = self
+        self.risk.delta_usd = self
             .risk_groups
             .values()
             .map(|rg| rg.delta_usd)
             .sum::<f64>();
-        self.pending_delta_usd = self
+        self.risk.pending_delta_usd = self
             .risk_groups
             .values()
             .map(|rg| rg.pending_delta_usd)
@@ -488,7 +503,7 @@ impl ChaosStrategy {
     ) -> Vec<ChaosExecutionIntent> {
         self.advance_time(update.ts_ms);
         self.update_risk();
-        let old_delta = self.delta_usd;
+        let old_delta = self.risk.delta_usd;
         let mut source_symbol = None;
 
         for position in &update.positions {
@@ -588,23 +603,23 @@ impl ChaosStrategy {
         }
 
         let mut intents = self.refresh_quotes();
-        let delta_change = self.delta_usd - old_delta;
+        let delta_change = self.risk.delta_usd - old_delta;
         if self.halt_reason.is_none()
             && delta_change.abs() > ORDER_CHECK_DELTA_THRESHOLD_USD
-            && delta_change.signum() == self.delta_usd.signum()
-            && delta_change.signum() == self.pending_delta_usd.signum()
+            && delta_change.signum() == self.risk.delta_usd.signum()
+            && delta_change.signum() == self.risk.pending_delta_usd.signum()
             && let Some(source_symbol) = source_symbol
         {
             let (delta_to_hedge, strategy_delta_hedge) = if self.should_hedge_strategy_delta() {
                 (self.delta_to_hedge(), true)
             } else if delta_change > 0.0 {
                 (
-                    delta_change.min(self.pending_delta_usd.min(self.delta_usd)),
+                    delta_change.min(self.risk.pending_delta_usd.min(self.risk.delta_usd)),
                     false,
                 )
             } else {
                 (
-                    delta_change.max(self.pending_delta_usd.max(self.delta_usd)),
+                    delta_change.max(self.risk.pending_delta_usd.max(self.risk.delta_usd)),
                     false,
                 )
             };

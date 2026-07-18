@@ -231,8 +231,12 @@ impl ChaosStrategy {
             .sum::<f64>()
             * 2.0;
         let min_hedge_usd = self.config.delta_limit_usd.min(hedge_required_for_quote);
-        let delta_need =
-            self.delta_usd.abs().max(self.pending_delta_usd.abs()) * HEDGE_VOL_TO_DELTA_RATIO;
+        let delta_need = self
+            .risk
+            .delta_usd
+            .abs()
+            .max(self.risk.pending_delta_usd.abs())
+            * HEDGE_VOL_TO_DELTA_RATIO;
         Some(min_hedge_usd.max(delta_need))
     }
 
@@ -325,13 +329,13 @@ impl ChaosStrategy {
     }
 
     pub(super) fn delta_to_hedge(&self) -> f64 {
-        if self.pending_delta_usd * self.delta_usd < 0.0 {
+        if self.risk.pending_delta_usd * self.risk.delta_usd < 0.0 {
             return 0.0;
         }
-        if self.delta_usd > 0.0 && self.pending_delta_usd > 0.0 {
-            self.delta_usd.min(self.pending_delta_usd)
+        if self.risk.delta_usd > 0.0 && self.risk.pending_delta_usd > 0.0 {
+            self.risk.delta_usd.min(self.risk.pending_delta_usd)
         } else {
-            self.delta_usd.max(self.pending_delta_usd)
+            self.risk.delta_usd.max(self.risk.pending_delta_usd)
         }
     }
 

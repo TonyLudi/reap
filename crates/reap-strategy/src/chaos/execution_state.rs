@@ -224,11 +224,12 @@ impl ChaosStrategy {
             {
                 let turnover =
                     entity.notional_usd(update.last_fill_qty, update.last_fill_price, ref_mid);
-                self.net_filled_delta_usd += entity.delta_coin_for_qty(
+                self.risk.net_filled_delta_usd += entity.delta_coin_for_qty(
                     update.side.factor() * update.last_fill_qty,
                     update.last_fill_price,
                 ) * ref_mid;
                 *self
+                    .risk
                     .turnover_by_group
                     .entry(entity.config.risk_group.clone())
                     .or_default() += turnover;
