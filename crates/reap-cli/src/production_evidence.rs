@@ -26,6 +26,7 @@ mod bindings;
 mod canonical;
 mod manifest;
 mod policy_time;
+mod report;
 mod source_verifiers;
 
 use bindings::{BindingInputs, evaluate_bindings};
@@ -41,6 +42,7 @@ use manifest::{resolve_regular_file, resolve_unique_paths};
 use policy_time::{FreshnessInputs, evaluate_freshness, unix_time_ms};
 #[cfg(test)]
 use policy_time::{check_fault_proxy_live_session, push_freshness};
+use report::{expected_identity, gate_report};
 use source_verifiers::{
     VerifiedEconomicInput, VerifiedFaultProxyRun, VerifiedFillInput, VerifiedTimedLiveSource,
     config_evidence, verify_fault_live_sources, verify_latency_live_sources,
@@ -1143,36 +1145,6 @@ pub(crate) fn verify_production_evidence_manifest_path(
         evidence_bundle_passed,
         production_order_entry_authorized: false,
     })
-}
-
-fn gate_report<T: Serialize>(
-    gate: ProductionEvidenceGate,
-    subject: Option<String>,
-    source_paths: Vec<PathBuf>,
-    reconstructed: &T,
-    acceptance_passed: bool,
-) -> Result<ProductionEvidenceGateReport> {
-    Ok(ProductionEvidenceGateReport {
-        gate,
-        subject,
-        source_paths,
-        reconstructed_sha256: serialized_sha256(reconstructed)?,
-        acceptance_passed,
-    })
-}
-
-fn expected_identity(manifest: &ProductionEvidenceManifest) -> ProductionEvidenceExpectedIdentity {
-    ProductionEvidenceExpectedIdentity {
-        reap_version: manifest.expected_reap_version.clone(),
-        live_executable_sha256: manifest.expected_live_executable_sha256.clone(),
-        host_identity_sha256: manifest.expected_host_identity_sha256.clone(),
-        approval_policy_sha256: manifest.expected_approval_policy_sha256.clone(),
-        deployment_candidate_id: manifest.expected_deployment_candidate_id.clone(),
-        demo_account_identity_sha256s: manifest.expected_demo_account_identity_sha256s.clone(),
-        production_account_identity_sha256s: manifest
-            .expected_production_account_identity_sha256s
-            .clone(),
-    }
 }
 
 #[cfg(test)]
