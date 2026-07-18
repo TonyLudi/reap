@@ -440,7 +440,7 @@ fn regular_order_authority_construction_is_source_allowlisted() {
     assert_eq!(
         local_reservations,
         BTreeSet::from([
-            "crates/reap-live/src/coordinator.rs".to_string(),
+            "crates/reap-live/src/coordinator/routing.rs".to_string(),
             "crates/reap-order/src/authority.rs".to_string(),
         ]),
         "local ownership reservation must stay inside its definition and the single live coordinator"
