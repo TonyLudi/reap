@@ -3,17 +3,21 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+use reap_core::Venue;
 use reap_core::{
-    BacktestLatencyClass, Channel, FillKey, MarketEvent, NormalizedEvent, OrderStatus,
-    PINNED_JAVA_REVISION, SystemEvent, SystemEventKind, TimerEvent, Venue,
-};
-use reap_feed::{
-    ConnectionAttemptPacer, ConnectionStatus, ConnectionStatusKind, FeedOutput, FeedProcessor,
-    ReconnectPolicy, partition_subscriptions, try_spawn_supervised_feed,
+    BacktestLatencyClass, Channel, FillKey, NormalizedEvent, OrderStatus, PINNED_JAVA_REVISION,
+    SystemEvent, SystemEventKind, TimerEvent,
 };
 #[cfg(test)]
+use reap_feed::ConnectionStatusKind;
+use reap_feed::{
+    ConnectionAttemptPacer, ConnectionStatus, FeedOutput, FeedProcessor, ReconnectPolicy,
+    partition_subscriptions, try_spawn_supervised_feed,
+};
+use reap_okx_live_adapter::OrderCommandWebsocketConfig;
+#[cfg(test)]
 use reap_okx_live_adapter::OrderCommandWebsocketLifecycle;
-use reap_okx_live_adapter::{OrderCommandWebsocketConfig, OrderCommandWebsocketStatusKind};
 #[cfg(test)]
 use reap_order::OkxOrderGateway;
 use reap_order::reconcile_full_state;
@@ -103,7 +107,9 @@ use recovery::{
     private_update_from_remote, proven_active_recovered_orders, recovered_safety_latch_count,
     restore_active_order_bindings, restore_safety_latches, validate_recovered_safety_latches,
 };
-use shutdown::{ShutdownState, StartupTaskGroup, is_zero_order_reconciliation, shutdown_signal};
+#[cfg(test)]
+use shutdown::is_zero_order_reconciliation;
+use shutdown::{ShutdownState, StartupTaskGroup, shutdown_signal};
 
 pub const LIVE_RUN_REPORT_SCHEMA_VERSION: u32 = 8;
 pub const MAX_LIVE_FAILURE_CODE_BYTES: usize = 64;
@@ -2149,324 +2155,22 @@ impl LiveRuntime {
                     self.handle_feed_source_events(events).await?;
                 }
             }
-            RuntimeEvent::Connection { source_id, status } => {
-                if status.kind == ConnectionStatusKind::Fatal {
-                    return Err(LiveRuntimeError::ConnectionPacerRuntime(format!(
-                        "{}: {}",
-                        status.conn_id, status.reason
-                    )));
-                }
-                if status.kind == ConnectionStatusKind::Disconnected {
-                    self.composition.evidence.observe_disconnect(status.private);
-                }
-                let (events, public_connectivity) = {
-                    let source = self
-                        .connectivity
-                        .sources
-                        .get_mut(source_id)
-                        .ok_or_else(|| {
-                            LiveRuntimeError::FeedAdapter("unknown feed source".to_string())
-                        })?;
-                    let events = source.on_status(status);
-                    (events, source.public_connectivity_ready())
-                };
-                if let Some(ready) = public_connectivity {
-                    self.coordinator.mark_public_connectivity(
-                        ready,
-                        if ready {
-                            "every public subscription has an acknowledged connection"
-                        } else {
-                            "one or more public subscriptions has no acknowledged connection"
-                        },
-                    );
-                }
-                self.handle_feed_source_events(events).await?;
+            event @ RuntimeEvent::Connection { .. } => {
+                connectivity::handle_runtime_event(self, event).await?;
             }
-            RuntimeEvent::OrderTransport(status) => {
-                let kind = match status.kind {
-                    OrderCommandWebsocketStatusKind::Ready => {
-                        SystemEventKind::OrderTransportRecovered
-                    }
-                    OrderCommandWebsocketStatusKind::Heartbeat => {
-                        SystemEventKind::OrderTransportHeartbeat
-                    }
-                    OrderCommandWebsocketStatusKind::Disconnected => {
-                        self.composition
-                            .evidence
-                            .observe_order_transport_disconnect();
-                        SystemEventKind::OrderTransportStale
-                    }
-                    OrderCommandWebsocketStatusKind::Fatal => {
-                        return Err(LiveRuntimeError::ConnectionPacerRuntime(status.reason));
-                    }
-                };
-                let output = self
-                    .coordinator
-                    .process_event(NormalizedEvent::System(SystemEvent {
-                        ts_ms: status.ts_ms,
-                        kind,
-                        venue: Some(Venue::Okx),
-                        account_id: Some(status.account_id),
-                        symbol: None,
-                        reason: format!(
-                            "{} ({}/{} sessions ready)",
-                            status.reason, status.ready_sessions, status.total_sessions
-                        ),
-                    }));
-                self.commit_output(output).await?;
+            event @ (RuntimeEvent::OrderTransport(_)
+            | RuntimeEvent::SubmitComplete { .. }
+            | RuntimeEvent::SubmitFailed { .. }
+            | RuntimeEvent::CancelComplete { .. }
+            | RuntimeEvent::CancelFailed { .. }) => {
+                dispatch::handle_runtime_event(self, event).await?;
             }
-            RuntimeEvent::SubmitComplete {
-                account_id,
-                symbol,
-                outcome,
-                ts_ms,
-                latency_us,
-            } => {
-                if let Some(latency_us) = latency_us {
-                    self.composition.latency.observe_us(
-                        BacktestLatencyClass::MatchingNew,
-                        &symbol,
-                        LiveLatencySemantics::StrategyDispatchToOrderAckUpperBound,
-                        latency_us,
-                    );
-                }
-                let output = self
-                    .coordinator
-                    .on_submit_outcome(&account_id, outcome, ts_ms)?;
-                self.commit_output(output).await?;
-            }
-            RuntimeEvent::SubmitFailed {
-                account_id,
-                client_order_id,
-                symbol,
-                ts_ms,
-                ambiguous,
-                reason,
-            } => {
-                self.composition.latency.observe_operation_failure(
-                    BacktestLatencyClass::MatchingNew,
-                    &symbol,
-                    LiveLatencySemantics::StrategyDispatchToOrderAckUpperBound,
-                );
-                let output = self.coordinator.on_submit_error(
-                    &account_id,
-                    &client_order_id,
-                    ts_ms,
-                    ambiguous,
-                    reason,
-                )?;
-                self.commit_output(output).await?;
-            }
-            RuntimeEvent::CancelComplete {
-                account_id,
-                symbol,
-                outcome,
-                ts_ms,
-                latency_us,
-            } => {
-                self.composition.latency.observe_us(
-                    BacktestLatencyClass::MatchingCancel,
-                    &symbol,
-                    LiveLatencySemantics::StrategyDispatchToOrderAckUpperBound,
-                    latency_us,
-                );
-                let output = self
-                    .coordinator
-                    .on_cancel_outcome(&account_id, outcome, ts_ms)?;
-                self.commit_output(output).await?;
-            }
-            RuntimeEvent::CancelFailed {
-                account_id,
-                client_order_id,
-                symbol,
-                ts_ms,
-                ambiguous,
-                reason,
-            } => {
-                self.composition.latency.observe_operation_failure(
-                    BacktestLatencyClass::MatchingCancel,
-                    &symbol,
-                    LiveLatencySemantics::StrategyDispatchToOrderAckUpperBound,
-                );
-                let output = self.coordinator.on_cancel_error(
-                    &account_id,
-                    &client_order_id,
-                    ts_ms,
-                    ambiguous,
-                    reason,
-                )?;
-                self.commit_output(output).await?;
-            }
-            RuntimeEvent::RemoteState {
-                account_id,
-                remote_orders,
-                remote_fills,
-                remote_account,
-                ts_ms,
-            } => {
-                self.reconciliation.inflight.remove(&account_id);
-                self.apply_remote_recovery(&account_id, &remote_orders, &remote_fills)
-                    .await?;
-                let order_convergence = &self.reconciliation.order_convergence;
-                self.reconciliation
-                    .cancel_inflight
-                    .retain(|(cancel_account, order_id)| {
-                        cancel_account != &account_id
-                            || order_convergence.has_pending_cancel(cancel_account, order_id)
-                    });
-                let report = {
-                    let state = self
-                        .coordinator
-                        .private_state(&account_id)
-                        .ok_or_else(|| CoordinatorError::UnknownAccount(account_id.clone()))?;
-                    reconcile_full_state(state, &remote_orders, &remote_fills, &remote_account)
-                };
-                let remote_account_ts_ms = remote_account.ts_ms;
-                let account_output = self
-                    .coordinator
-                    .apply_authoritative_account_snapshot(&account_id, remote_account)?;
-                let censored_fill_latencies = self
-                    .reconciliation
-                    .fill_convergence
-                    .observe_authoritative(&account_id, remote_account_ts_ms);
-                self.composition
-                    .latency
-                    .observe_dropped_observations(censored_fill_latencies as u64);
-                self.commit_output(account_output).await?;
-                let pending_order_state = self
-                    .reconciliation
-                    .order_convergence
-                    .pending_reason(&account_id);
-                let clean = report.is_clean() && pending_order_state.is_none();
-                if self.shutdown.in_progress
-                    && self.shutdown.reconciliation_requested.contains(&account_id)
-                {
-                    if is_zero_order_reconciliation(&report) {
-                        self.shutdown.reconciled_accounts.insert(account_id.clone());
-                    } else {
-                        self.shutdown.reconciled_accounts.remove(&account_id);
-                    }
-                }
-                let reason = if clean {
-                    "REST orders, fills, balances, positions, and canonical private state agree"
-                        .to_string()
-                } else if report.is_clean() {
-                    pending_order_state
-                        .expect("non-clean order convergence must include a pending reason")
-                } else {
-                    let mut reason = format!("{:?}", report.issues);
-                    if let Some(pending) = pending_order_state {
-                        reason.push_str("; ");
-                        reason.push_str(&pending);
-                    }
-                    reason
-                };
-                let output = self.coordinator.on_reconciliation(ReconciliationResult {
-                    account_id,
-                    ts_ms,
-                    clean,
-                    local_live_orders: report.local_live_orders,
-                    remote_live_orders: report.remote_live_orders,
-                    remote_recent_fills: report.remote_fills,
-                    reason,
-                })?;
-                self.commit_output(output).await?;
-            }
-            RuntimeEvent::ReconcileFailed {
-                account_id,
-                ts_ms,
-                reason,
-            } => {
-                self.reconciliation.inflight.remove(&account_id);
-                self.shutdown.reconciled_accounts.remove(&account_id);
-                let output = self.coordinator.on_reconciliation(ReconciliationResult {
-                    account_id,
-                    ts_ms,
-                    clean: false,
-                    local_live_orders: 0,
-                    remote_live_orders: 0,
-                    remote_recent_fills: 0,
-                    reason: format!("REST reconciliation request failed: {reason}"),
-                })?;
-                self.commit_output(output).await?;
+            event @ (RuntimeEvent::RemoteState { .. } | RuntimeEvent::ReconcileFailed { .. }) => {
+                reconciliation::handle_runtime_event(self, event).await?;
             }
             RuntimeEvent::Fatal(failure) => return Err(failure.into()),
         }
         Ok(())
-    }
-
-    async fn handle_feed_source_events(
-        &mut self,
-        events: Vec<SystemEvent>,
-    ) -> Result<(), LiveRuntimeError> {
-        for event in events {
-            if event.kind == SystemEventKind::PrivateStreamRecovered {
-                let account_id = event.account_id.as_deref().ok_or_else(|| {
-                    LiveRuntimeError::FeedAdapter(
-                        "private recovery event has no account identity".to_string(),
-                    )
-                })?;
-                let output = self.coordinator.require_reconciliation(
-                    account_id,
-                    event.ts_ms,
-                    "verify REST state after private websocket state recovery",
-                )?;
-                self.commit_output(output).await?;
-            }
-            let output = self
-                .coordinator
-                .process_event(NormalizedEvent::System(event));
-            self.commit_output(output).await?;
-        }
-        Ok(())
-    }
-
-    fn observe_feed_latency(
-        &mut self,
-        output: &FeedOutput,
-        received_ns: u64,
-        strategy_visible_ns: u64,
-    ) {
-        match output {
-            FeedOutput::Event(NormalizedEvent::Market(event)) => {
-                let class = match event {
-                    MarketEvent::Depth(_) => BacktestLatencyClass::MarketDepth,
-                    MarketEvent::Trade { .. } => BacktestLatencyClass::HistoricalTrade,
-                    MarketEvent::IndexPrice { .. }
-                    | MarketEvent::FundingRate { .. }
-                    | MarketEvent::BurstSignal { .. }
-                    | MarketEvent::PriceLimits { .. } => BacktestLatencyClass::ReferenceData,
-                };
-                self.composition.latency.observe_ns(
-                    class,
-                    event.symbol(),
-                    LiveLatencySemantics::HostReceiveToStrategyVisibility,
-                    received_ns,
-                    strategy_visible_ns,
-                );
-            }
-            FeedOutput::PrivateOrder { update, .. } => {
-                self.composition.latency.observe_exchange_ms(
-                    BacktestLatencyClass::OrderUpdate,
-                    &update.symbol,
-                    update.ts_ms,
-                    strategy_visible_ns,
-                );
-            }
-            FeedOutput::PrivateFill { fill, .. } => {
-                self.composition.latency.observe_exchange_ms(
-                    BacktestLatencyClass::OrderUpdate,
-                    &fill.symbol,
-                    fill.ts_ms,
-                    strategy_visible_ns,
-                );
-            }
-            FeedOutput::Event(_)
-            | FeedOutput::PrivateAccount { .. }
-            | FeedOutput::Duplicate(_)
-            | FeedOutput::RecoveryRequired(_)
-            | FeedOutput::System(_) => {}
-        }
     }
 
     fn observe_account_convergence(

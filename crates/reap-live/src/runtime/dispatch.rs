@@ -5,8 +5,10 @@ use std::time::Instant;
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 use futures_util::stream::{FuturesUnordered, StreamExt};
-use reap_core::AccountUpdate;
-use reap_okx_live_adapter::OrderCommandWebsocketStatus;
+use reap_core::{
+    AccountUpdate, BacktestLatencyClass, NormalizedEvent, SystemEvent, SystemEventKind, Venue,
+};
+use reap_okx_live_adapter::{OrderCommandWebsocketStatus, OrderCommandWebsocketStatusKind};
 use reap_order::{
     CancelOutcome, GatewayError, OkxOrderGateway, RegularSubmitCompletion, SubmitOutcome,
     SubmitPreparation, okx_order_dispatch_key,
@@ -16,9 +18,11 @@ use reap_venue::{RemoteFill, RemoteOrder};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::LiveLatencySemantics;
+
 use super::{
-    CancelAction, ConnectionStatus, LiveRuntimeError, OperatorEnvelope, OperatorService,
-    SubmitAction, elapsed_us, unix_time_ms,
+    CancelAction, ConnectionStatus, LiveRuntime, LiveRuntimeError, OperatorEnvelope,
+    OperatorService, SubmitAction, elapsed_us, unix_time_ms,
 };
 
 pub(super) struct DispatchState {
@@ -128,6 +132,130 @@ impl From<RuntimeTaskFailure> for LiveRuntimeError {
             RuntimeTaskFailure::AccountConfigCheck(message) => Self::AccountConfigCheck(message),
         }
     }
+}
+
+pub(super) async fn handle_runtime_event(
+    runtime: &mut LiveRuntime,
+    event: RuntimeEvent,
+) -> Result<(), LiveRuntimeError> {
+    match event {
+        RuntimeEvent::OrderTransport(status) => {
+            let kind = match status.kind {
+                OrderCommandWebsocketStatusKind::Ready => SystemEventKind::OrderTransportRecovered,
+                OrderCommandWebsocketStatusKind::Heartbeat => {
+                    SystemEventKind::OrderTransportHeartbeat
+                }
+                OrderCommandWebsocketStatusKind::Disconnected => {
+                    runtime
+                        .composition
+                        .evidence
+                        .observe_order_transport_disconnect();
+                    SystemEventKind::OrderTransportStale
+                }
+                OrderCommandWebsocketStatusKind::Fatal => {
+                    return Err(LiveRuntimeError::ConnectionPacerRuntime(status.reason));
+                }
+            };
+            let output = runtime
+                .coordinator
+                .process_event(NormalizedEvent::System(SystemEvent {
+                    ts_ms: status.ts_ms,
+                    kind,
+                    venue: Some(Venue::Okx),
+                    account_id: Some(status.account_id),
+                    symbol: None,
+                    reason: format!(
+                        "{} ({}/{} sessions ready)",
+                        status.reason, status.ready_sessions, status.total_sessions
+                    ),
+                }));
+            runtime.commit_output(output).await?;
+        }
+        RuntimeEvent::SubmitComplete {
+            account_id,
+            symbol,
+            outcome,
+            ts_ms,
+            latency_us,
+        } => {
+            if let Some(latency_us) = latency_us {
+                runtime.composition.latency.observe_us(
+                    BacktestLatencyClass::MatchingNew,
+                    &symbol,
+                    LiveLatencySemantics::StrategyDispatchToOrderAckUpperBound,
+                    latency_us,
+                );
+            }
+            let output = runtime
+                .coordinator
+                .on_submit_outcome(&account_id, outcome, ts_ms)?;
+            runtime.commit_output(output).await?;
+        }
+        RuntimeEvent::SubmitFailed {
+            account_id,
+            client_order_id,
+            symbol,
+            ts_ms,
+            ambiguous,
+            reason,
+        } => {
+            runtime.composition.latency.observe_operation_failure(
+                BacktestLatencyClass::MatchingNew,
+                &symbol,
+                LiveLatencySemantics::StrategyDispatchToOrderAckUpperBound,
+            );
+            let output = runtime.coordinator.on_submit_error(
+                &account_id,
+                &client_order_id,
+                ts_ms,
+                ambiguous,
+                reason,
+            )?;
+            runtime.commit_output(output).await?;
+        }
+        RuntimeEvent::CancelComplete {
+            account_id,
+            symbol,
+            outcome,
+            ts_ms,
+            latency_us,
+        } => {
+            runtime.composition.latency.observe_us(
+                BacktestLatencyClass::MatchingCancel,
+                &symbol,
+                LiveLatencySemantics::StrategyDispatchToOrderAckUpperBound,
+                latency_us,
+            );
+            let output = runtime
+                .coordinator
+                .on_cancel_outcome(&account_id, outcome, ts_ms)?;
+            runtime.commit_output(output).await?;
+        }
+        RuntimeEvent::CancelFailed {
+            account_id,
+            client_order_id,
+            symbol,
+            ts_ms,
+            ambiguous,
+            reason,
+        } => {
+            runtime.composition.latency.observe_operation_failure(
+                BacktestLatencyClass::MatchingCancel,
+                &symbol,
+                LiveLatencySemantics::StrategyDispatchToOrderAckUpperBound,
+            );
+            let output = runtime.coordinator.on_cancel_error(
+                &account_id,
+                &client_order_id,
+                ts_ms,
+                ambiguous,
+                reason,
+            )?;
+            runtime.commit_output(output).await?;
+        }
+        _ => unreachable!("non-dispatch event sent to dispatch handler"),
+    }
+    Ok(())
 }
 
 pub(super) enum OrderTaskCommand {

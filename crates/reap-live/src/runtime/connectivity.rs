@@ -1,16 +1,22 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use reap_core::{Channel, ConnId, SystemEvent, SystemEventKind, TimeMs, Venue};
+use reap_core::{
+    BacktestLatencyClass, Channel, ConnId, MarketEvent, NormalizedEvent, SystemEvent,
+    SystemEventKind, TimeMs, Venue,
+};
 use reap_feed::{
-    ConnectionStatus, ConnectionStatusKind, FeedProcessor, SocketPlan, SupervisedFeed,
+    ConnectionStatus, ConnectionStatusKind, FeedOutput, FeedProcessor, SocketPlan, SupervisedFeed,
 };
 use reap_okx_live_adapter::OrderCommandWebsocketLifecycle;
 use reap_venue::VenueAdapter;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::LiveLatencySemantics;
+
 use super::dispatch::RuntimeEvent;
+use super::{LiveRuntime, LiveRuntimeError};
 
 pub(super) struct ConnectivityState {
     pub(super) processor: FeedProcessor,
@@ -210,6 +216,128 @@ impl FeedSourceState {
             symbol: None,
             reason: reason.to_string(),
         })
+    }
+}
+
+pub(super) async fn handle_runtime_event(
+    runtime: &mut LiveRuntime,
+    event: RuntimeEvent,
+) -> Result<(), LiveRuntimeError> {
+    match event {
+        RuntimeEvent::Connection { source_id, status } => {
+            if status.kind == ConnectionStatusKind::Fatal {
+                return Err(LiveRuntimeError::ConnectionPacerRuntime(format!(
+                    "{}: {}",
+                    status.conn_id, status.reason
+                )));
+            }
+            if status.kind == ConnectionStatusKind::Disconnected {
+                runtime
+                    .composition
+                    .evidence
+                    .observe_disconnect(status.private);
+            }
+            let (events, public_connectivity) = {
+                let source = runtime
+                    .connectivity
+                    .sources
+                    .get_mut(source_id)
+                    .ok_or_else(|| {
+                        LiveRuntimeError::FeedAdapter("unknown feed source".to_string())
+                    })?;
+                let events = source.on_status(status);
+                (events, source.public_connectivity_ready())
+            };
+            if let Some(ready) = public_connectivity {
+                runtime.coordinator.mark_public_connectivity(
+                    ready,
+                    if ready {
+                        "every public subscription has an acknowledged connection"
+                    } else {
+                        "one or more public subscriptions has no acknowledged connection"
+                    },
+                );
+            }
+            runtime.handle_feed_source_events(events).await?;
+        }
+        _ => unreachable!("non-connectivity event sent to connectivity handler"),
+    }
+    Ok(())
+}
+
+impl LiveRuntime {
+    pub(super) async fn handle_feed_source_events(
+        &mut self,
+        events: Vec<SystemEvent>,
+    ) -> Result<(), LiveRuntimeError> {
+        for event in events {
+            if event.kind == SystemEventKind::PrivateStreamRecovered {
+                let account_id = event.account_id.as_deref().ok_or_else(|| {
+                    LiveRuntimeError::FeedAdapter(
+                        "private recovery event has no account identity".to_string(),
+                    )
+                })?;
+                let output = self.coordinator.require_reconciliation(
+                    account_id,
+                    event.ts_ms,
+                    "verify REST state after private websocket state recovery",
+                )?;
+                self.commit_output(output).await?;
+            }
+            let output = self
+                .coordinator
+                .process_event(NormalizedEvent::System(event));
+            self.commit_output(output).await?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn observe_feed_latency(
+        &mut self,
+        output: &FeedOutput,
+        received_ns: u64,
+        strategy_visible_ns: u64,
+    ) {
+        match output {
+            FeedOutput::Event(NormalizedEvent::Market(event)) => {
+                let class = match event {
+                    MarketEvent::Depth(_) => BacktestLatencyClass::MarketDepth,
+                    MarketEvent::Trade { .. } => BacktestLatencyClass::HistoricalTrade,
+                    MarketEvent::IndexPrice { .. }
+                    | MarketEvent::FundingRate { .. }
+                    | MarketEvent::BurstSignal { .. }
+                    | MarketEvent::PriceLimits { .. } => BacktestLatencyClass::ReferenceData,
+                };
+                self.composition.latency.observe_ns(
+                    class,
+                    event.symbol(),
+                    LiveLatencySemantics::HostReceiveToStrategyVisibility,
+                    received_ns,
+                    strategy_visible_ns,
+                );
+            }
+            FeedOutput::PrivateOrder { update, .. } => {
+                self.composition.latency.observe_exchange_ms(
+                    BacktestLatencyClass::OrderUpdate,
+                    &update.symbol,
+                    update.ts_ms,
+                    strategy_visible_ns,
+                );
+            }
+            FeedOutput::PrivateFill { fill, .. } => {
+                self.composition.latency.observe_exchange_ms(
+                    BacktestLatencyClass::OrderUpdate,
+                    &fill.symbol,
+                    fill.ts_ms,
+                    strategy_visible_ns,
+                );
+            }
+            FeedOutput::Event(_)
+            | FeedOutput::PrivateAccount { .. }
+            | FeedOutput::Duplicate(_)
+            | FeedOutput::RecoveryRequired(_)
+            | FeedOutput::System(_) => {}
+        }
     }
 }
 
