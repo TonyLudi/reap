@@ -656,6 +656,10 @@ fn production_coordinator_keeps_single_owner_responsibility_state() {
         production_root.contains("ProvenRegularSubmitRequest"),
         "durable recovered-submit proof handling must remain on the root coordinator",
     );
+    assert!(
+        !production_root.contains("#[cfg(test)]\n    pub fn"),
+        "test-only coordinator seams must be private or pub(crate), never public",
+    );
 
     for (path, source) in sources {
         let compact = source

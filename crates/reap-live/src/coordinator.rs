@@ -539,7 +539,7 @@ impl LiveCoordinator {
     }
 
     #[cfg(test)]
-    pub fn register_local_order(
+    pub(crate) fn register_local_order(
         &mut self,
         account_id: &str,
         client_order_id: &str,
