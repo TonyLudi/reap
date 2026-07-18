@@ -17,7 +17,7 @@ for Chaos. The staged enforcement and responsibility split are tracked in
 The audited surface and Goal A/Goal B disposition record are
 [chaos-connectivity-inventory.md](chaos-connectivity-inventory.md) and
 [chaos-connectivity-goal-a-handoff.md](chaos-connectivity-goal-a-handoff.md).
-The Phase 6–9 verification template and eventual result are
+The completed Phase 6–9 verification record is
 [chaos-connectivity-goal-b-handoff.md](chaos-connectivity-goal-b-handoff.md).
 
 Goal A Phases 0–5 enforce the least-authority capability graph against the
@@ -27,15 +27,13 @@ call path is a behavior-parity source. Generic Java gateway processors,
 algo-order execution, and the Java eight-session regular command pool do not
 authorize a Rust live capability or determine its cardinality.
 
-This work is not a production-readiness claim. Goal B Phase 6 has lowered pure
-contracts and inverted the backtest dependency; Phase 7 has split live,
-research, and capture responsibilities without changing the single writer; and
-the Phase 8 implementation candidate centralizes shared decisions and narrows
-regular-order authority into the live adapter. Goal B is structurally complete
-only if the focused checks and Phase 9 global gate recorded in its handoff are
-green. Production order entry remains unavailable, and target-host and
-credentialed exchange evidence remain operational gates even after structural
-completion.
+This work is not a production-readiness claim. Goal B completed the
+pure-contract dependency inversion, responsibility splits, shared safety
+decisions, linear regular-order authority, leased recovery, adapter-owned
+command transport, and the exact-plan private-feed bootstrap/subscription seal.
+Its exact structural gates are recorded in its handoff. Production order entry
+remains unavailable, and target-host and credentialed exchange evidence remain
+operational gates after structural completion.
 
 ## Goals
 
@@ -106,10 +104,12 @@ consumes the approved cancel directly. `OkxOrderGateway` validates identity,
 idempotency, and trade mode as applicable; the dispatcher reserves pacing
 before adapter IO; and
 `reap-okx-live-adapter` owns connection/login/write/acknowledgement lifecycle
-and the final prepared-to-wire conversion. Goal B cannot pass if `reap-live`
-retains that order-command websocket lifecycle or if a caller can construct,
-clone, reuse, or recover an opaque authority token outside the documented
-local-reservation or leased-journal path.
+and the final prepared-to-wire conversion. `reap-live` retains neither that
+order-command websocket lifecycle nor a path for callers to construct, clone,
+reuse, or recover an opaque authority token outside the documented
+local-reservation or leased-journal path. Private-feed bootstrap likewise
+admits exactly one opaque validated login frame and requires subscription bytes
+to match trusted canonical serialization of the exact packed socket plan.
 
 ## Runtime Model
 
@@ -1805,16 +1805,15 @@ The implemented demo surface is a record of current capability, not a grant of
 permanent authority to the Chaos process. Goal A separated broad emergency
 coverage, generic endpoint support, and Java-inspired connection-pool
 cardinality from normal strategy connectivity. Goal B Phases 6 and 7 removed
-the live/backtest dependency and split responsibilities; the Phase 8
-implementation candidate names repeated safety decisions, binds regular
-authority linearly, and moves command websocket ownership into the adapter.
-Those claims become a completed structural result only when the focused and
-Phase 9 gates in the Goal B handoff are green. The
+the live/backtest dependency and split responsibilities. Phase 8 named repeated
+safety decisions, bound regular authority linearly, preserved recovery proof
+only through the leased journal, moved command websocket ownership into the
+adapter, and sealed private-feed bootstrap/subscriptions to the exact plan. The
 [Chaos connectivity boundary](chaos-connectivity-boundary.md),
 [inventory](chaos-connectivity-inventory.md), and
 [Goal A handoff](chaos-connectivity-goal-a-handoff.md) record the authority
 history; the
-[Goal B handoff](chaos-connectivity-goal-b-handoff.md) records the conditional
+[Goal B handoff](chaos-connectivity-goal-b-handoff.md) records the completed
 structural verification. None of this exposes production order entry.
 
 See [trading-readiness.md](trading-readiness.md) for the detailed gate.

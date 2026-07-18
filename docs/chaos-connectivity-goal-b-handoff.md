@@ -1,11 +1,11 @@
 # Chaos Connectivity Goal B Handoff
 
-Status: conditional Phase 6–9 handoff. Goal B is **not complete** while any
-`[PENDING_*]` marker remains or any required gate is not green. This document
-does not approve demo trading, production order entry, a credentialed campaign,
-or target-host deployment.
+Status: completed Phase 6–9 structural handoff. Every required Goal B gate
+recorded below is green. This document does not approve demo trading,
+production order entry, a credentialed campaign, or target-host deployment.
 
 Prepared: 2026-07-17.
+Completed: 2026-07-18.
 
 This is the verification record for Goal B in
 [chaos-connectivity-refactor-plan.md](chaos-connectivity-refactor-plan.md).
@@ -19,11 +19,11 @@ Goal B starts from the completed
 [Goal A handoff](chaos-connectivity-goal-a-handoff.md) and preserves its
 authority result.
 
-## Completion Rule
+## Completion Criteria And Evidence Discipline
 
-Replace a placeholder only with directly observed evidence from the committed
-documentation/verification base or, for final documentation-only checks, the
-exact staged handoff-result tree. Goal B is complete only when:
+Each placeholder was replaced only with directly observed evidence from the
+committed documentation/verification base or, for final documentation-only
+checks, the exact staged handoff-result tree. Goal B was complete only after:
 
 - all Phase 6–8 focused gates and every Phase 9 command below pass;
 - all commit, tree, patch, deterministic-hash, and clean-worktree fields are
@@ -35,8 +35,8 @@ exact staged handoff-result tree. Goal B is complete only when:
 - the final result still says structural completion only, not trading
   readiness.
 
-If a required result is red, retain the placeholder or record the exact
-failure. Do not describe the goal as complete.
+Had a required result been red, its placeholder would have been retained or the
+exact failure recorded. No required result was red.
 
 ## Reference And Scope
 
@@ -47,12 +47,12 @@ failure. Do not describe the goal as complete.
 | Goal A documentation/handoff | `1fbf8955097fdb29fc38b04866005aa1f7095bee` |
 | Goal B prompt/starting `HEAD` | `21d20e288c7de9e038550666fbb1f1d95763912a` |
 | Final Goal B implementation tip | `12ebbbf870e8f6a1d35cff468fcc6a32f24230af` |
-| Goal B documentation/verification-base commit | `[PENDING_GOAL_B_DOCS_BASE_SHA]` |
+| Goal B documentation/verification-base commit | `9d8dd5ac45f8c9f74f3cf86ce3af9c7d4b7f045d` |
 | Sibling behavior reference | clean `../imm-strategy` checkout at `b6b120c7b7c466d8431bf082f3229328c5d7b2ae` |
 | Rust reference pin | `reap_core::PINNED_JAVA_REVISION` equals `b6b120c7b7c466d8431bf082f3229328c5d7b2ae` |
 | Supported Java scope | Only `chaos/chaos-core`, `chaos/chaos-iarb2`, and supporting code transitively reached by the supported Chaos/iarb2 path |
 | Excluded parity authority | Generic gateway/`ExecAlgo` features, unrelated strategies/venues, and Java's eight-session command-pool cardinality |
-| Exchange access during Goal B | `[PENDING_CONFIRM_NO_CREDENTIALS_OR_AUTHENTICATED_EXCHANGE_REQUESTS]` |
+| Exchange access during Goal B | No credentials were supplied or loaded and no authenticated exchange request was made; activity was limited to local build/test commands and public Cargo/advisory network access |
 
 The current Chaos strategy has exactly three executable purposes:
 
@@ -84,9 +84,9 @@ strategy framework, or production order entry.
 | Phase 8 host/capture decisions | `dd0d5db9cb4ee93a225e53361b18e5cb51a06996` | Shared pure decisions |
 | Phase 8 live safety decisions | `2f172e8b6ce03f73505c79deb80330bccf59aef8` | Shared soak/fault decisions |
 | Phase 8 regular authority/recovery | `38babe6e4d12d598730d3c79aeeccbbec1ec018d` | Linear gateway-bound mutation authority |
-| Phase 8 adapter command websocket | `246f5b21d046dc20fd84460c7b59346231d6107f` | Adapter-owned single command session, sealed take-once authority, exact acknowledgement/fallback boundaries, and teardown release regression committed; final gates below remain pending |
+| Phase 8 adapter command websocket | `246f5b21d046dc20fd84460c7b59346231d6107f` | Adapter-owned single command session, sealed take-once authority, exact acknowledgement/fallback boundaries, and teardown release regression |
 | Phase 8 private-feed bootstrap seal | `12ebbbf870e8f6a1d35cff468fcc6a32f24230af` | Exactly one opaque validated login frame, exact socket-plan subscription binding, and source/compile-fail bypass guards |
-| Phase 9 documentation/verification base | `[PENDING_GOAL_B_DOCS_BASE_SHA]` | README, capability inventory/deviation ledger, architecture, mapping, operations, readiness, prompt, CLI help, sample config, and handoff record before result fields are filled |
+| Phase 9 documentation/verification base | `9d8dd5ac45f8c9f74f3cf86ce3af9c7d4b7f045d` | README, capability inventory/deviation ledger, architecture, mapping, operations, readiness, prompt, CLI help, sample config, and handoff record before result fields were filled |
 
 Immutable identities for every committed Phase 6–8 family:
 
@@ -114,7 +114,7 @@ Final Phase 8 and documentation identity:
 | --- | --- | --- | --- |
 | Adapter-owned command websocket | `246f5b21d046dc20fd84460c7b59346231d6107f` | `8da0cee31acc15f64a32c75e70808279d840537a` | `ab22b63351b3a17a44da360ed686289ad0d58159` |
 | Private-feed bootstrap seal | `12ebbbf870e8f6a1d35cff468fcc6a32f24230af` | `a2302595763fad07fcb7ba06a01e110bd9996634` | `a85b825fd7b0002df95cb1503cbde4c4379ea8b0` |
-| Goal B documentation/verification base | `[PENDING_GOAL_B_DOCS_BASE_SHA]` | `[PENDING_GOAL_B_DOCS_BASE_TREE_SHA]` | `[PENDING_GOAL_B_DOCS_BASE_PATCH_ID]` |
+| Goal B documentation/verification base | `9d8dd5ac45f8c9f74f3cf86ce3af9c7d4b7f045d` | `ec2f4aeeffa0ef771d61e8c20239a0cf63e15dc0` | `090bb79c56a86f68b74f939793687b1ff7237e4d` |
 
 The later commit that replaces the final verification placeholders is the
 handoff-result commit. It is intentionally not self-referenced in this file;
@@ -133,7 +133,7 @@ authority into a shared crate.
 
 ## Final Structural Properties
 
-These claims become final only when their checks below pass:
+These are the verified final structural properties:
 
 - Pure live configuration, connectivity, account-certification, pacing, key,
   and host-policy contracts sit below the runtime.
@@ -209,33 +209,33 @@ state.
 
 ## Deterministic Anchors
 
-Do not copy forward a prior value for a mutable final artifact. Recompute every
-`[PENDING_*]` hash from the final committed tree or exact final command output.
+Every mutable final artifact below was recomputed from the committed
+verification base or exact final command output.
 
 | Artifact | Final SHA-256 |
 | --- | --- |
-| `Cargo.lock` | `[PENDING_FINAL_CARGO_LOCK_SHA256]` |
+| `Cargo.lock` | `d8a19fb100aeb4e542a2135d546edfb5ae24629717f5ab65e285cf9bfe483b02` |
 | `fixtures/normalized/chaos_quote_hedge.jsonl` | `27f2eb4b9dba7ee600ed645ad8b7c88143e8b54531232991b492cb7595e8ccaa` |
 | `fixtures/normalized/chaos_quote_hedge_later.jsonl` | `40453b8be283178b20531c84142dbaeeeca82b4723e5c13594df171c778cd8ee` |
 | `fixtures/normalized/chaos_quote_hedge_intents.json` | `d95fa7f121e2e8c402c8108cf9fefb7c7d7b3dbd2b9742c58c234a521f0ee0ec` |
 | `examples/iarb2-basic.toml` | `0fac5a3a35fe28cdc05118b7e22241077aa7f604a9a5436355797605b51b3b26` |
-| Canonical sample Demo plan | `[PENDING_FINAL_DEMO_PLAN_SHA256]` |
-| `examples/live-okx-demo.toml` raw bytes | `[PENDING_FINAL_DEMO_CONFIG_SHA256]` |
-| Pretty CLI backtest output, two byte-identical runs | `[PENDING_FINAL_BACKTEST_OUTPUT_SHA256]` |
-| Account-certification fixed-artifact result | `[PENDING_FINAL_ACCOUNT_CERT_FIXED_ARTIFACT_SHA256]` |
-| Account identity result | `[PENDING_FINAL_ACCOUNT_IDENTITY_SHA256]` |
-| Locked release executable `target/release/reap` | `[PENDING_FINAL_RELEASE_SHA256]` |
-| Rebuilt root CLI help | `[PENDING_FINAL_ROOT_HELP_SHA256]` |
-| Rebuilt `live` CLI help | `[PENDING_FINAL_LIVE_HELP_SHA256]` |
+| Canonical sample Demo plan | `6771c97a373f12f77093624ea4b2914d867aae6a710eddadde925fc288fc6477` |
+| `examples/live-okx-demo.toml` raw bytes | `caea78e0a75d2586ecbd16d5b4414f9606a7064b6e1684f82fff2d132a197195` |
+| Pretty CLI backtest output, two byte-identical runs | `38acf9f5e0c310f2ec5528974beffadf4c1a7f84d46efa8d9664ee7051e84691` |
+| Account-certification fixed-artifact result | `7684a2f788c57f9072020a5538ed27eaf86aa4bb19e89b6450a78af61ceeecf0` |
+| Account identity result | `9658c99fd44c3caeac43717eefdb0ddcac497f4af352fa2e0c91b735d6108475` |
+| Locked release executable `target/release/reap` | `579ebf7501e0783a586cd620c245f96b1cc475fe49273f2b8437cbe5d07d36e1` |
+| Rebuilt root CLI help | `769d0fd01755d1a6d8f6d11e81d99e4964f84fd4802331547556a462d1989324` |
+| Rebuilt `live` CLI help | `4a4627deffc69c8c8076d4ff1ca6d547677f4fdd0199d51a97348623fe489f29` |
 
-Record the exact command used for each derived hash:
+The exact command used for each derived hash is recorded here:
 
 | Derived artifact | Command |
 | --- | --- |
-| Demo plan | `[PENDING_DEMO_PLAN_HASH_COMMAND]` |
+| Demo plan | `cargo test -q -p reap-live-contracts --locked connectivity_plan::tests::equal_effective_configs_have_identical_canonical_bytes_and_hash -- --exact` |
 | Demo config source | `sha256sum examples/live-okx-demo.toml` |
-| Backtest output | `[PENDING_BACKTEST_HASH_COMMAND]` |
-| Account-certification fixed artifact/identity | `[PENDING_ACCOUNT_ARTIFACT_HASH_COMMAND]` |
+| Backtest output | `cargo run --locked -q -p reap-cli -- backtest --format normalized-jsonl --config examples/iarb2-basic.toml --data fixtures/normalized/chaos_quote_hedge.jsonl --pretty`, run twice to `target/tmp/goal-b-backtest-{1,2}.json`, followed by `cmp` and `sha256sum` |
+| Account-certification fixed artifact/identity | `cargo test -q -p reap-live-contracts --locked account_certification::tests::serialized_artifact_schema_and_hash_are_stable -- --exact` and `cargo test -q -p reap-live-contracts --locked account_certification::tests::account_identity_hash_is_stable_and_field_delimited -- --exact` |
 | Release executable and help | `sha256sum target/release/reap target/tmp/reap-help.txt target/tmp/reap-live-help.txt` after the locked release build |
 
 ## Focused Verification
@@ -252,36 +252,36 @@ The authority commit was observed green before the adapter ownership move:
 | `reap-okx-live-adapter` | 13 tests, 3 compile-fail cases, and docs passed |
 
 Those observations do not replace final verification after the adapter move.
-Record the exact final commands/counts here:
+The exact final commands and counts are recorded here:
 
 The final tree also re-proves the earlier responsibility phases explicitly:
 
 | Phase | Exact final command | Final result |
 | --- | --- | --- |
-| Phase 6 pure contracts and consumers | `TMPDIR=/home/ubuntu/code/reap/target/tmp cargo test -p reap-core -p reap-venue -p reap-feed -p reap-order -p reap-telemetry -p reap-live-contracts -p reap-backtest --locked --no-fail-fast && TMPDIR=/home/ubuntu/code/reap/target/tmp cargo test -p reap-live --test dependency_policy --locked authenticated_okx_authority_obeys_the_workspace_dependency_policy -- --exact` | `[PENDING_PHASE6_FINAL_RESULT]` |
-| Phase 7 capture/research/live owners | `TMPDIR=/home/ubuntu/code/reap/target/tmp cargo test -p reap-capture -p reap-backtest -p reap-live --locked` | `[PENDING_PHASE7_FINAL_RESULT]` |
-| Phase 8 shared safety decisions | `TMPDIR=/home/ubuntu/code/reap/target/tmp cargo test -p reap-core -p reap-capture -p reap-live-contracts -p reap-live --locked` | `[PENDING_PHASE8_SAFETY_RESULT]` |
+| Phase 6 pure contracts and consumers | `TMPDIR=/home/ubuntu/code/reap/target/tmp cargo test -p reap-core -p reap-venue -p reap-feed -p reap-order -p reap-telemetry -p reap-live-contracts -p reap-backtest --locked --no-fail-fast && TMPDIR=/home/ubuntu/code/reap/target/tmp cargo test -p reap-live --test dependency_policy --locked authenticated_okx_authority_obeys_the_workspace_dependency_policy -- --exact` | Exit 0; all selected suites and the exact dependency-policy test passed. The final workspace rerun confirmed the current 9 core, 30 venue, 70 feed, 60 order, 13 telemetry, 58 live-contract, and 117 backtest unit/integration tests plus their UI and documentation tests. |
+| Phase 7 capture/research/live owners | `TMPDIR=/home/ubuntu/code/reap/target/tmp cargo test -p reap-capture -p reap-backtest -p reap-live --locked` | Exit 0; capture 50, backtest 117, and live 230 unit/integration tests passed with live UI, source/dependency-policy, compatibility, and documentation tests. |
+| Phase 8 shared safety decisions | `TMPDIR=/home/ubuntu/code/reap/target/tmp cargo test -p reap-core -p reap-capture -p reap-live-contracts -p reap-live --locked` | Exit 0; core 9, capture 50, live-contracts 58, and live 230 unit/integration tests passed with all associated integration, UI, and documentation tests. |
 
 | Required focused gate | Final command | Final result |
 | --- | --- | --- |
-| Order authority, leased recovery, and compile-fail boundaries | `[PENDING_ORDER_AUTHORITY_COMMAND]` | `[PENDING_ORDER_AUTHORITY_RESULT]` |
-| Adapter command lifecycle, routing, identity, ambiguity, and compile-fail boundaries | `[PENDING_ADAPTER_COMMAND]` | `[PENDING_ADAPTER_RESULT]` |
-| Live runtime integration, source/dependency guards, and configuration compatibility | `[PENDING_LIVE_COMMAND]` | `[PENDING_LIVE_RESULT]` |
-| Feed pacer and private-bootstrap boundaries | `[PENDING_FEED_COMMAND]` | `[PENDING_FEED_RESULT]` |
-| Strategy role visibility and exact Java-parity fixture | `[PENDING_STRATEGY_COMMAND]` | `[PENDING_STRATEGY_RESULT]` |
-| Exact backtest snapshot and two-run byte identity | `[PENDING_BACKTEST_COMMAND]` | `[PENDING_BACKTEST_RESULT]` |
-| Exact sample Demo-plan hash and endpoint/channel allowlist | `[PENDING_PLAN_ALLOWLIST_COMMAND]` | `[PENDING_PLAN_ALLOWLIST_RESULT]` |
-| Configuration migration compatibility | `[PENDING_CONFIG_COMMAND]` | `[PENDING_CONFIG_RESULT]` |
-| `reap-backtest` normal graph excludes `reap-live` | `[PENDING_BACKTEST_TREE_COMMAND]` | `[PENDING_BACKTEST_TREE_RESULT]` |
-| Shared contracts exclude network/credential dependencies | `[PENDING_CONTRACT_TREE_COMMAND]` | `[PENDING_CONTRACT_TREE_RESULT]` |
-| `reap-live` excludes raw command websocket and emergency authority | `[PENDING_LIVE_NEGATIVE_COMMAND]` | `[PENDING_LIVE_NEGATIVE_RESULT]` |
-| Adapter is sole normal-live prepared-regular command DTO/wire owner and exposes no transport/signer | `[PENDING_ADAPTER_SOURCE_GUARD_COMMAND]` | `[PENDING_ADAPTER_SOURCE_GUARD_RESULT]` |
-| Serialized config, journal/report/evidence, and order-intent compatibility | `[PENDING_SCHEMA_COMPAT_COMMAND]` | `[PENDING_SCHEMA_COMPAT_RESULT]` |
-| Emergency workflows remain independent and cancel-only; forbidden sentinel remains read-only/fail-closed | `[PENDING_EMERGENCY_SENTINEL_COMMAND]` | `[PENDING_EMERGENCY_SENTINEL_RESULT]` |
-| Baseline-to-final capability/schema diff review | `[PENDING_BASELINE_DIFF_COMMAND]` | `[PENDING_BASELINE_DIFF_RESULT]` |
-| Release CLI root/live help states the bounded Demo/safety/emergency split | `[PENDING_CLI_HELP_COMMAND]` | `[PENDING_CLI_HELP_RESULT]` |
-| Raw sample Demo config hash | `sha256sum examples/live-okx-demo.toml` | `[PENDING_DEMO_CONFIG_HASH_RESULT]` |
-| `../imm-strategy` full SHA, Rust pin, evidence bindings, and clean tree | `[PENDING_JAVA_PIN_COMMAND]` | `[PENDING_JAVA_PIN_RESULT]` |
+| Order authority, leased recovery, and compile-fail boundaries | `TMPDIR=/home/ubuntu/code/reap/target/tmp cargo test --workspace --locked --no-fail-fast` | Exit 0; order 60, storage 24, and all 5 order UI boundary cases passed, including gateway-bound submit reservation and one-shot leased recovery. |
+| Adapter command lifecycle, routing, identity, ambiguity, and compile-fail boundaries | `TMPDIR=/home/ubuntu/code/reap/target/tmp cargo test -p reap-okx-live-adapter --locked` | Exit 0; 37 adapter unit tests, all 6 UI boundary cases, and documentation tests passed. |
+| Live runtime integration, source/dependency guards, and configuration compatibility | `TMPDIR=/home/ubuntu/code/reap/target/tmp cargo test --workspace --locked --no-fail-fast` and `TMPDIR=/home/ubuntu/code/reap/target/tmp cargo test -p reap-live --test dependency_policy --locked` | Exit 0; 230 live unit/integration tests, 2 UI cases, all 3 dependency/source-policy tests, runtime configuration compatibility, and documentation tests passed. |
+| Feed pacer and private-bootstrap boundaries | `TMPDIR=/home/ubuntu/code/reap/target/tmp cargo test -p reap-feed --locked` | Exit 0; 70 feed unit tests, all 4 UI boundary cases, and documentation tests passed. Raw/multiple login frames and same-count channel/symbol substitutions fail closed before connection. |
+| Strategy role visibility and exact Java-parity fixture | `cargo test -q -p reap-strategy --locked chaos::tests::normalized_fixture_typed_output_preserves_exact_ordered_intents -- --exact` and the locked workspace test | Exit 0; the exact ordered-intent fixture, 74 strategy tests, both UI role-boundary cases, and documentation tests passed. |
+| Exact backtest snapshot and two-run byte identity | `cargo run --locked -q -p reap-cli -- backtest --format normalized-jsonl --config examples/iarb2-basic.toml --data fixtures/normalized/chaos_quote_hedge.jsonl --pretty`, twice, then `cmp target/tmp/goal-b-backtest-1.json target/tmp/goal-b-backtest-2.json` | Exit 0; both outputs were byte-identical with SHA-256 `38acf9f5e0c310f2ec5528974beffadf4c1a7f84d46efa8d9664ee7051e84691`. |
+| Exact sample Demo-plan hash and endpoint/channel allowlist | `cargo test -q -p reap-live-contracts --locked connectivity_plan::tests::equal_effective_configs_have_identical_canonical_bytes_and_hash -- --exact` and the locked adapter/workspace tests | Exit 0; the canonical plan hash was `6771c97a373f12f77093624ea4b2914d867aae6a710eddadde925fc288fc6477`; exact endpoint, channel, account, symbol, and selector binding tests passed. |
+| Configuration migration compatibility | `cargo test -q -p reap-live --test runtime_config_compatibility --locked moved_config_types_retain_runtime_method_compatibility -- --exact` | Exit 0; moved live configuration types retained runtime-method and serialized compatibility. |
+| `reap-backtest` normal graph excludes `reap-live` | `cargo tree -p reap-backtest -e normal --depth 1 --locked > target/tmp/reap-backtest-tree.txt` followed by an anchored negative scan for a direct `reap-live` edge | Exit 0; `reap-backtest` directly uses `reap-live-contracts` and has no direct normal `reap-live` dependency. |
+| Shared contracts exclude network/credential dependencies | `cargo tree -p reap-live-contracts -e normal --depth 1 --locked > target/tmp/reap-live-contracts-tree.txt` followed by anchored negative scans for network, credential, runtime, and emergency crates | Exit 0; direct internal dependencies are limited to core, risk, strategy, and venue, with pure serialization/hash/error dependencies only. |
+| `reap-live` excludes raw command websocket and emergency authority | `cargo tree -p reap-live -e normal --depth 1 --locked > target/tmp/reap-live-tree.txt` followed by anchored negative scans for `tokio-tungstenite`, `reap-okx-wire`, and emergency crates | Exit 0; no direct raw command-websocket, wire, or emergency-authority edge exists. |
+| Adapter is sole normal-live prepared-regular command DTO/wire owner and exposes no transport/signer | `cargo tree -p reap-okx-live-adapter -e normal --depth 1 --locked > target/tmp/reap-okx-live-adapter-tree.txt` and `cargo test -p reap-live --test dependency_policy --locked` | Exit 0; the adapter alone owns the normal-live wire dependencies and both allowed private-bootstrap constructors; all 3 source/dependency guards and all adapter UI encapsulation cases passed. |
+| Serialized config, journal/report/evidence, and order-intent compatibility | The locked workspace test plus both exact account-certification hash tests and `moved_config_types_retain_runtime_method_compatibility` | Exit 0; storage 24 and all compatibility/hash tests passed. No persistent serialized schema changed; the seal added only private transient login parser structs. |
+| Emergency workflows remain independent and cancel-only; forbidden sentinel remains read-only/fail-closed | `TMPDIR=/home/ubuntu/code/reap/target/tmp cargo test --workspace --locked --no-fail-fast` | Exit 0; emergency core 20, runner 11 library plus 3 binary, adapter 6, and all 15 forbidden-sentinel filtered tests passed. |
+| Baseline-to-final capability/schema diff review | `git diff --check 1fbf8955097fdb29fc38b04866005aa1f7095bee..HEAD` and `git diff --name-status 1fbf8955097fdb29fc38b04866005aa1f7095bee..HEAD` plus production capability/schema path review | Exit 0; 122 files changed through responsibility moves and authority narrowing. Strategy/risk/engine behavior, registries, emergency/evidence crates, fixtures, and the iarb2 sample remained unchanged; no new capability or persistent schema was introduced. |
+| Release CLI root/live help states the bounded Demo/safety/emergency split | `target/release/reap --help > target/tmp/reap-help.txt` and `target/release/reap live --help > target/tmp/reap-live-help.txt`, followed by exact bounded-Demo, no-production, and emergency-split text scans | Exit 0; the rebuilt help surfaces retain the required boundaries. Root help SHA-256: `769d0fd01755d1a6d8f6d11e81d99e4964f84fd4802331547556a462d1989324`; live help: `4a4627deffc69c8c8076d4ff1ca6d547677f4fdd0199d51a97348623fe489f29`. |
+| Raw sample Demo config hash | `sha256sum examples/live-okx-demo.toml` | Exit 0; `caea78e0a75d2586ecbd16d5b4414f9606a7064b6e1684f82fff2d132a197195`. |
+| `../imm-strategy` full SHA, Rust pin, evidence bindings, and clean tree | `git -C ../imm-strategy status --porcelain=v1`, `git -C ../imm-strategy rev-parse HEAD`, and exact comparisons with `PINNED_JAVA_REVISION` plus `examples/research-smoke.toml` | Exit 0; sibling tree clean at `b6b120c7b7c466d8431bf082f3229328c5d7b2ae`, with an exact Rust pin and research evidence binding. |
 
 ### Full-Plan Acceptance Crosswalk
 
@@ -296,26 +296,26 @@ The final tree also re-proves the earlier responsibility phases explicitly:
 
 ## Phase 9 Global Verification
 
-The build, test, release, audit, and metadata commands run from the committed
+The build, test, release, audit, and metadata commands ran from the committed
 documentation/verification base, which contains the final implementation plus
-the intended documentation, CLI-help, and sample-config changes. Run
-`git diff --check` both on that base and again on the exact staged
-handoff-result tree. The no-placeholder scan can pass only on that staged
-result tree after every directly observed result is recorded. Use the
+the intended documentation, CLI-help, and sample-config changes.
+`git diff --check` passed both on that base and on the exact staged
+handoff-result tree. The no-placeholder scan ran on that staged result tree
+after every directly observed result was recorded. Every command used the
 repository-local temporary directory exactly as shown.
 
 | Command | Final result |
 | --- | --- |
-| `mkdir -p /home/ubuntu/code/reap/target/tmp` | `[PENDING_MKDIR_RESULT]` |
-| `cargo fmt --all -- --check` | `[PENDING_FMT_RESULT]` |
-| `TMPDIR=/home/ubuntu/code/reap/target/tmp cargo clippy --workspace --all-targets --locked -- -D warnings` | `[PENDING_CLIPPY_RESULT]` |
-| `TMPDIR=/home/ubuntu/code/reap/target/tmp cargo test --workspace --locked --no-fail-fast` | `[PENDING_WORKSPACE_TEST_RESULT]` |
-| `TMPDIR=/home/ubuntu/code/reap/target/tmp cargo build --release --workspace --locked` | `[PENDING_RELEASE_BUILD_RESULT]` |
-| `TMPDIR=/home/ubuntu/code/reap/target/tmp deploy/systemd/verify-units.sh target/release/reap` | `[PENDING_SYSTEMD_VERIFY_RESULT]` |
-| `TMPDIR=/home/ubuntu/code/reap/target/tmp cargo audit --deny warnings` | `[PENDING_CARGO_AUDIT_RESULT]` |
-| `cargo metadata --locked --format-version 1 >/dev/null` | `[PENDING_LOCKED_METADATA_RESULT]` |
-| `git diff --check` | `[PENDING_DIFF_CHECK_RESULT]` |
-| `placeholder_rx='\[''PENDING_[A-Z0-9_]+\]'; ! rg -n --hidden --glob '!.git/**' "$placeholder_rx" README.md Cargo.toml Cargo.lock crates docs examples deploy` | `[PENDING_NO_PLACEHOLDER_RESULT]` |
+| `mkdir -p /home/ubuntu/code/reap/target/tmp` | Exit 0; repository-local temporary directory present. |
+| `cargo fmt --all -- --check` | Exit 0; no formatting drift. |
+| `TMPDIR=/home/ubuntu/code/reap/target/tmp cargo clippy --workspace --all-targets --locked -- -D warnings` | Exit 0; every workspace target was warning-free. |
+| `TMPDIR=/home/ubuntu/code/reap/target/tmp cargo test --workspace --locked --no-fail-fast` | Exit 0; every unit, integration, binary, UI, and documentation harness passed: 931 reported test/harness results, including all 22 trybuild cases. |
+| `TMPDIR=/home/ubuntu/code/reap/target/tmp cargo build --release --workspace --locked` | Exit 0; the locked release workspace built successfully. Final `reap` SHA-256: `579ebf7501e0783a586cd620c245f96b1cc475fe49273f2b8437cbe5d07d36e1`. |
+| `TMPDIR=/home/ubuntu/code/reap/target/tmp deploy/systemd/verify-units.sh target/release/reap` | Exit 0; observe, demo, and capture units each passed with systemd-analyze exposure level `2.9 OK`. |
+| `TMPDIR=/home/ubuntu/code/reap/target/tmp cargo audit --deny warnings` | Exit 0; 249 locked dependencies were checked against 1,166 loaded advisories with no findings. |
+| `cargo metadata --locked --format-version 1 >/dev/null` | Exit 0; locked metadata resolved without changing the lockfile. |
+| `git diff --check` | Exit 0 on the committed verification base and on the exact staged handoff-result tree. |
+| `placeholder_rx='\[''PENDING_[A-Z0-9_]+\]'; ! rg -n --hidden --glob '!.git/**' "$placeholder_rx" README.md Cargo.toml Cargo.lock crates docs examples deploy` | Exit 0 on the exact staged handoff-result tree; no unresolved Goal B result marker remained. |
 
 ## Verification-Base Repository State
 
@@ -326,17 +326,16 @@ final goal report and Git history rather than a self-reference here.
 
 | Check | Recorded result |
 | --- | --- |
-| Reap implementation/verification-base status | `[PENDING_REAP_VERIFICATION_BASE_STATUS]` |
-| Reap implementation/verification-base `HEAD` | `[PENDING_REAP_VERIFICATION_BASE_HEAD]` |
-| `git -C ../imm-strategy status --porcelain=v1` | `[PENDING_IMM_CLEAN_STATUS]` |
-| `git -C ../imm-strategy rev-parse HEAD` | `[PENDING_IMM_HEAD]` |
-| Rust pin/evidence-binding scan | `[PENDING_PIN_BINDING_RESULT]` |
-| Credential/authenticated-exchange audit | `[PENDING_NO_CREDENTIAL_OR_AUTH_CALL_CONFIRMATION]` (local build/test commands and public Cargo/advisory network access only; no credential source or authenticated exchange endpoint was invoked) |
+| Reap implementation/verification-base status | Clean; `git status --porcelain=v1` produced no output before handoff-result edits |
+| Reap implementation/verification-base `HEAD` | `9d8dd5ac45f8c9f74f3cf86ce3af9c7d4b7f045d` |
+| `git -C ../imm-strategy status --porcelain=v1` | Clean; no output |
+| `git -C ../imm-strategy rev-parse HEAD` | `b6b120c7b7c466d8431bf082f3229328c5d7b2ae` |
+| Rust pin/evidence-binding scan | Exact match: `PINNED_JAVA_REVISION` and `examples/research-smoke.toml` both bind `b6b120c7b7c466d8431bf082f3229328c5d7b2ae` |
+| Credential/authenticated-exchange audit | Confirmed: no credentials were supplied or loaded and no authenticated exchange request was made; only local build/test commands and public Cargo/advisory network access occurred |
 
 ## Explicit Deferrals
 
-Even after every placeholder is replaced by green evidence, Goal B does not
-complete or claim:
+Goal B's completed structural handoff does not provide or claim:
 
 - a credentialed target-account observe/demo soak or fault campaign;
 - sustained target-host capture, latency calibration, systemd installation, or
@@ -354,7 +353,7 @@ complete or claim:
   semantics; or
 - cryptographic authentication of the local journal.
 
-When the final gate is green, the accurate claim is:
+The accurate completed claim is:
 
 > Goal B structurally narrows the current Chaos connectivity and authority
 > implementation while preserving the pinned `../imm-strategy` behavior,

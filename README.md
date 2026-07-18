@@ -127,11 +127,13 @@ verification gate.
 
 This is a least-authority capability boundary, not a production-readiness
 claim. Production order entry remains unavailable, credentialed target-host
-evidence remains external, and Goal B does not change that. Goal B Phases 6
-and 7 have lowered pure shared contracts and split live/research/capture
-responsibilities while preserving their ordered owners. Its Phase 8 authority
-hardening and Phase 9 verification are complete only when every focused and
-global gate is green in the
+evidence remains external, and Goal B does not change that. Goal B completed
+Phases 6–9 by lowering pure shared contracts, splitting
+live/research/capture responsibilities while preserving their ordered owners,
+centralizing named safety decisions, binding regular authority linearly through
+leased recovery and adapter-owned command transport, and sealing private-feed
+bootstrap and subscriptions to the exact plan. Its completed structural
+verification is recorded in the
 [Goal B handoff](docs/chaos-connectivity-goal-b-handoff.md); see the
 [refactor plan](docs/chaos-connectivity-refactor-plan.md) for the exact scope.
 

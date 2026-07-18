@@ -17,11 +17,11 @@ not grants of strategy authority. Goal A (Phases 0–5) of
 [chaos-connectivity-refactor-plan.md](chaos-connectivity-refactor-plan.md)
 enforces that capability boundary. Goal B Phase 6 has removed the normal
 backtest-to-live dependency, Phase 7 has split runtime/research/capture
-responsibilities while retaining their single writers, and the Phase 8
-implementation candidate adds named shared decisions, linear regular
-authority, leased recovery, and adapter-owned command transport. Goal B is
-complete only if the focused and Phase 9 global gates are green in
-[its handoff](chaos-connectivity-goal-b-handoff.md). Neither tranche is
+responsibilities while retaining their single writers, and Phase 8 added named
+shared decisions, linear regular authority, leased recovery, adapter-owned
+command transport, and an exact-plan private-feed bootstrap/subscription seal.
+The completed structural gate is recorded in
+[the Goal B handoff](chaos-connectivity-goal-b-handoff.md). Neither tranche is
 exchange certification or a production-approval claim. The completed
 [Goal A record](chaos-connectivity-goal-a-handoff.md) remains the authority
 baseline.

@@ -19,7 +19,7 @@ The implementation plan is
 [chaos-connectivity-refactor-plan.md](chaos-connectivity-refactor-plan.md).
 The completed Goal A record is
 [chaos-connectivity-goal-a-handoff.md](chaos-connectivity-goal-a-handoff.md);
-the conditional Goal B verification record is
+the completed Goal B verification record is
 [chaos-connectivity-goal-b-handoff.md](chaos-connectivity-goal-b-handoff.md).
 The words MUST, MUST NOT, SHOULD, and MAY are normative.
 

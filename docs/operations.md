@@ -5,13 +5,13 @@ cannot authorize a new order. `reap live` owns the implemented OKX lifecycle;
 production order entry remains intentionally unavailable.
 
 Goal A's completed capability-boundary work and Goal B's structural work do not
-make this repository production ready. Goal B Phases 6 and 7 have lowered pure
-contracts and split responsibilities; the Phase 8 implementation candidate
-adds named decisions, linear regular authority, leased recovery, and an
-adapter-owned command session. Goal B is structurally complete only when its
-[handoff](chaos-connectivity-goal-b-handoff.md) records green focused and Phase
-9 gates. This refactor uses no credentials or authenticated exchange traffic.
-It remains grounded in the completed
+make this repository production ready. Goal B completed the pure-contract
+inversion, responsibility splits, named decisions, linear regular authority,
+leased recovery, adapter-owned command session, and exact-plan private-feed
+bootstrap/subscription seal. Its completed
+[handoff](chaos-connectivity-goal-b-handoff.md) records the green focused and
+Phase 9 gates. This refactor used no credentials or authenticated exchange
+traffic. It remains grounded in the completed
 [Goal A authority record](chaos-connectivity-goal-a-handoff.md). The Chaos
 behavior reference remains the clean
 `../imm-strategy` checkout at

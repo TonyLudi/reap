@@ -1,15 +1,14 @@
 # Chaos Connectivity Inventory
 
-Status: frozen Phase 0 baseline with the completed Goal A and conditional Goal
-B disposition overlays. Goal B becomes a completed structural result only
-after its handoff records green focused and Phase 9 gates.
+Status: frozen Phase 0 baseline with the completed Goal A and Goal B
+disposition overlays.
 
 This inventory freezes the exchange surface that existed before the Chaos
 connectivity boundary was enforced. It is descriptive, not an authority grant.
 The normative target remains
 [chaos-connectivity-boundary.md](chaos-connectivity-boundary.md).
 The verified phase records are the completed
-[Goal A handoff](chaos-connectivity-goal-a-handoff.md) and the conditional
+[Goal A handoff](chaos-connectivity-goal-a-handoff.md) and the completed
 [Goal B handoff](chaos-connectivity-goal-b-handoff.md).
 The matrix is intentionally retained in its Phase 0 form so that “current
 reachability” means reachability at the start of the refactor. The
@@ -290,12 +289,12 @@ Goal B resolves the deviations that Goal A intentionally deferred:
 | Duplicated host-health classification | Resolved in Phase 8 by `HostHealthThresholdAssessment`, `HostGuardConfig::assess_host_health`, and `HostHealthSnapshot::threshold_assessment`; runtime and evidence consume the same pure threshold decision. |
 | Duplicated capture-clean classification | Resolved in Phase 8 by the private `CaptureCleanRunInputs` and `capture_run_is_clean` contract used by runtime and verification. |
 | Duplicated live soak/fault classification | Resolved in Phase 8 by private `LiveCleanSoakInputs`, `LiveFaultFailureCode`, and `LiveFaultFailureClass` contracts shared by runtime/fault reporting and independent verification. |
-| Regular execution values retained too much wire authority | The Phase 8 implementation candidate uses the approved/reserved/prepared chain above. Values crossing strategy, coordinator, gateway, and adapter boundaries expose only the fields needed by the next role; raw authenticated wire construction remains adapter-private. This row is resolved only when the recorded focused and global gates pass. |
-| Order-command websocket ownership outside the wire adapter | The implementation candidate moves the final hop above into the adapter. Consuming startup on an account-bound nonseparable gateway/session bundle validates the supplied destination/account, installs its private matching slot before spawn, and then returns the now-bound gateway. Besides that gateway, only typed lifecycle/status observation returns to live. The current plan has exactly one command shard per executing account. A tree in which connection/login/write/ack/reconnect/shutdown or prepared-to-wire lowering remains owned by `reap-live` must not pass the Phase 9 gate. |
-| Private feed bootstrap or subscription serialization could bypass its plan | The Phase 8 boundary seal replaces arbitrary bootstrap-frame vectors with one opaque, non-Clone, strictly validated login frame and compares subscription bytes with trusted canonical serialization of the exact `SocketPlan` before bootstrap or connect. Non-login/extra frames and same-count channel, symbol, or selector substitutions fail closed; production construction is source-allowlisted to the live adapter. |
-| Recovery parsing could recreate mutation authority | The implementation candidate preserves proofs only through take-once leased recovery; ordinary path/byte recovery strips them. This requires no journal schema change and is Rust structural hardening with an explicitly operator-controlled, non-cryptographic trust root. |
+| Regular execution values retained too much wire authority | Resolved. Phase 8 uses the approved/reserved/prepared chain above. Values crossing strategy, coordinator, gateway, and adapter boundaries expose only the fields needed by the next role; raw authenticated wire construction remains adapter-private. |
+| Order-command websocket ownership outside the wire adapter | Resolved. Consuming startup on an account-bound nonseparable gateway/session bundle validates the supplied destination/account, installs its private matching slot before spawn, and then returns the now-bound gateway. Besides that gateway, only typed lifecycle/status observation returns to live. The current plan has exactly one command shard per executing account; connection/login/write/ack/reconnect/shutdown and prepared-to-wire lowering are adapter-owned. |
+| Private feed bootstrap or subscription serialization could bypass its plan | Resolved. The Phase 8 boundary seal replaces arbitrary bootstrap-frame vectors with one opaque, non-Clone, strictly validated login frame and compares subscription bytes with trusted canonical serialization of the exact `SocketPlan` before bootstrap or connect. Non-login/extra frames and same-count channel, symbol, or selector substitutions fail closed; production construction is source-allowlisted to the live adapter. |
+| Recovery parsing could recreate mutation authority | Resolved. Proofs are preserved only through take-once leased recovery; ordinary path/byte recovery strips them. This requires no journal schema change and is Rust structural hardening with an explicitly operator-controlled, non-cryptographic trust root. |
 
-Implementation commits through the named safety-contract work are:
+Goal B implementation commits are:
 
 | Phase | Commits |
 | --- | --- |
@@ -305,10 +304,10 @@ Implementation commits through the named safety-contract work are:
 | Phase 8 regular authority | `38babe6e4d12d598730d3c79aeeccbbec1ec018d` |
 | Phase 8 adapter-owned command websocket | `246f5b21d046dc20fd84460c7b59346231d6107f` |
 | Phase 8 private-feed bootstrap seal | `12ebbbf870e8f6a1d35cff468fcc6a32f24230af` |
-| Phase 9 documentation/verification base | `[PENDING_GOAL_B_DOCS_BASE_SHA]` |
+| Phase 9 documentation/verification base | `9d8dd5ac45f8c9f74f3cf86ce3af9c7d4b7f045d` |
 
 Exact trees, patch IDs, commands, focused counts, deterministic anchors, and
-global results are recorded conditionally in
+global results are recorded in the completed
 [chaos-connectivity-goal-b-handoff.md](chaos-connectivity-goal-b-handoff.md).
 No credentialed exchange call, production evidence, demo approval, or
 production-readiness claim is part of Goal B.

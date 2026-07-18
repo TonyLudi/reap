@@ -1,13 +1,12 @@
 # Chaos Connectivity Refactor Plan
 
-Status: Goal A (Phases 0–5 and the Tranche A gate) implemented. Goal B Phases
-6–8 are implemented through commit
-`246f5b21d046dc20fd84460c7b59346231d6107f`: named safety contracts, linear
-regular authority, leased recovery, and the adapter-owned order-command
-websocket are committed. The final focused exit gate and the Phase 9 global
-gate remain to be recorded. Goal B is not complete unless
-[chaos-connectivity-goal-b-handoff.md](chaos-connectivity-goal-b-handoff.md)
-records every required gate as green. This is not a production-readiness claim.
+Status: Goal A (Phases 0–5 and the Tranche A gate) and Goal B (Phases 6–9) are
+implemented and verified. Goal B completed the pure-contract inversion,
+responsibility splits, named safety contracts, linear regular authority,
+leased recovery, adapter-owned command websocket, and exact-plan private-feed
+bootstrap/subscription seal. Its exact structural gates are recorded in
+[chaos-connectivity-goal-b-handoff.md](chaos-connectivity-goal-b-handoff.md).
+This is not a production-readiness claim.
 
 This is a finite, goal-ready refactor plan for enforcing
 [chaos-connectivity-boundary.md](chaos-connectivity-boundary.md) and then
@@ -26,16 +25,16 @@ Related context:
 - [chaos-connectivity-goal-a-handoff.md](chaos-connectivity-goal-a-handoff.md)
   is the completed Phases 0–5 record.
 - [chaos-connectivity-goal-b-handoff.md](chaos-connectivity-goal-b-handoff.md)
-  is the conditional Phases 6–9 verification and handoff record.
+  is the completed Phases 6–9 verification and handoff record.
 
-Current Goal B progress:
+Completed Goal B result:
 
 | Phase | Status |
 | --- | --- |
 | Phase 6 | Implemented: pure pacing/key/host/live/account-certification contracts were lowered, and `reap-backtest` now depends on `reap-live-contracts` rather than `reap-live`. |
 | Phase 7 | Implemented: live, research, and capture responsibilities were split while preserving their ordered single writers and serialized behavior. |
-| Phase 8 | Implemented and committed: named host/capture/live decisions, the opaque approved/prepared chain, leased recovery, and an adapter-owned command websocket. Final focused tests and source guards still must be recorded against the documentation/verification base. |
-| Phase 9 | In progress: documentation and the handoff template are being reconciled; the full global command gate remains. |
+| Phase 8 | Completed and verified: named host/capture/live decisions, the opaque approved/prepared chain, leased recovery, an adapter-owned command websocket, and the exact-plan private-feed bootstrap/subscription seal. Final focused tests and source guards are recorded in the handoff. |
+| Phase 9 | Completed: documentation and the handoff were reconciled, and the full global command gate is recorded green. |
 
 ## Goal Execution Contract
 
@@ -602,13 +601,15 @@ commits.
 
 ### Phase 8: Centralize Safety Semantics And Public Surface
 
-Status: exit gate pending. Commits `dd0d5db` and `2f172e8` implement the named
+Status: complete. Commits `dd0d5db` and `2f172e8` implement the named
 host/capture/live decisions, and
 `38babe6e4d12d598730d3c79aeeccbbec1ec018d` implements the linear
 regular-authority and leased-recovery slice. Commit
 `246f5b21d046dc20fd84460c7b59346231d6107f` implements the adapter-owned
-order-command slice. All final focused checks must be recorded before the phase
-is green.
+order-command slice, and commit
+`12ebbbf870e8f6a1d35cff468fcc6a32f24230af` seals private-feed bootstrap and
+subscription serialization to the exact plan. Final focused checks are
+recorded in the Goal B handoff.
 
 Actions:
 
@@ -690,9 +691,9 @@ Suggested commit: one safety contract/export surface at a time.
 
 ## Phase 9: Global Verification And Documentation
 
-Status: documentation and handoff template in progress. Focused checks and the
-full command gate remain; the handoff must retain explicit placeholders until
-each result is actually observed.
+Status: complete. Documentation and the handoff are reconciled, and the full
+command gate is recorded green against verification base
+`9d8dd5ac45f8c9f74f3cf86ce3af9c7d4b7f045d`.
 
 Update the capability inventory and deviation ledger with the final
 implementation. Update architecture, mapping, operations, trading readiness,
@@ -853,16 +854,14 @@ rerun or extend the completed goal:
 The complete ready-to-run instruction set, including phase discipline, final
 commands, stop conditions, and completion criteria, is
 [chaos-connectivity-goal-b-prompt.md](chaos-connectivity-goal-b-prompt.md).
-While the Goal B handoff still contains pending gate placeholders, invoke it
-with:
+The concise invocation used for Goal B was:
 
 > Implement Goal B exactly as specified in
 > `docs/chaos-connectivity-goal-b-prompt.md`. Continue through green phase
 > gates and stop only at completion or a documented stop condition.
 
-After every placeholder in the Goal B handoff is replaced by verified green
-evidence, a repository-wide source/documentation scan finds no pending marker,
-and the documentation-only handoff-result commit is made, the prompt and this
-invocation are historical records. That result commit is identified by Git
-history and the final goal report because a commit cannot contain its own SHA.
-Any further authority or structural change requires a new reviewed goal.
+The completed Goal B handoff contains the verified green evidence and no
+pending markers. The prompt and invocation are historical records. The
+documentation-only result commit is identified by Git history and the final
+goal report because a commit cannot contain its own SHA. Any further authority
+or structural change requires a new reviewed goal.
