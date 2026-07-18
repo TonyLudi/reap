@@ -288,86 +288,108 @@ impl InstrumentState {
         };
         let full_levels = self.config.num_quote_levels;
         match side {
-            Side::Buy => {
-                let full_sufficient = self.quote_balance_sufficient(
-                    self.config.max_order_size,
-                    full_levels,
-                    base.borrow_limit(mid),
-                    1.0,
-                    quote.min_balance,
-                );
-                if !full_sufficient {
-                    self.trade.reduced_quote_level_side = Some(side);
-                    if !self.quote_balance_sufficient(
-                        self.config.max_order_size,
-                        1,
-                        quote.borrow_limit(1.0),
-                        quote.safety_multiplier,
-                        quote.min_balance,
-                    ) {
-                        return false;
-                    }
-                } else if self.trade.reduced_quote_level_side == Some(side) {
-                    let can_restore = self.quote_balance_sufficient(
-                        self.config.max_order_size,
-                        full_levels,
-                        base.borrow_limit(mid),
-                        2.0,
-                        quote.min_balance,
-                    );
-                    if self.trade.full_quote_balance_debouncer.check(
-                        can_restore,
-                        now_ms,
-                        CAN_QUOTE_FULL_SIZE_DEBOUNCE_MS,
-                    ) {
-                        self.trade.reduced_quote_level_side = None;
-                    }
-                }
-                self.quote_balance >= quote.min_balance
-            }
+            Side::Buy => self.spot_buy_can_trade_raw(side, now_ms, &base, &quote, mid, full_levels),
             Side::Sell => {
-                let safety = if self.config.quote_currency == "USDC" {
-                    base.safety_multiplier.max(10.0)
-                } else {
-                    base.safety_multiplier
-                };
-                let full_sufficient = self.trade_balance_sufficient(
-                    self.config.max_order_size,
-                    full_levels,
-                    base.borrow_limit(mid),
-                    safety,
-                    base.min_balance,
-                );
-                if !full_sufficient {
-                    self.trade.reduced_quote_level_side = Some(side);
-                    if !self.trade_balance_sufficient(
-                        self.config.max_order_size,
-                        1,
-                        base.borrow_limit(mid),
-                        safety,
-                        base.min_balance,
-                    ) {
-                        return false;
-                    }
-                } else if self.trade.reduced_quote_level_side == Some(side) {
-                    let can_restore = self.trade_balance_sufficient(
-                        self.config.max_order_size,
-                        full_levels,
-                        base.borrow_limit(mid),
-                        2.0,
-                        base.min_balance,
-                    );
-                    if self.trade.full_quote_balance_debouncer.check(
-                        can_restore,
-                        now_ms,
-                        CAN_QUOTE_FULL_SIZE_DEBOUNCE_MS,
-                    ) {
-                        self.trade.reduced_quote_level_side = None;
-                    }
-                }
-                quote.max_balance <= 0.0 || self.quote_balance < quote.max_balance
+                self.spot_sell_can_trade_raw(side, now_ms, &base, &quote, mid, full_levels)
             }
         }
+    }
+
+    fn spot_buy_can_trade_raw(
+        &mut self,
+        side: Side,
+        now_ms: TimeMs,
+        base: &CoinConfig,
+        quote: &CoinConfig,
+        mid: f64,
+        full_levels: usize,
+    ) -> bool {
+        let full_sufficient = self.quote_balance_sufficient(
+            self.config.max_order_size,
+            full_levels,
+            base.borrow_limit(mid),
+            1.0,
+            quote.min_balance,
+        );
+        if !full_sufficient {
+            self.trade.reduced_quote_level_side = Some(side);
+            if !self.quote_balance_sufficient(
+                self.config.max_order_size,
+                1,
+                quote.borrow_limit(1.0),
+                quote.safety_multiplier,
+                quote.min_balance,
+            ) {
+                return false;
+            }
+        } else if self.trade.reduced_quote_level_side == Some(side) {
+            let can_restore = self.quote_balance_sufficient(
+                self.config.max_order_size,
+                full_levels,
+                base.borrow_limit(mid),
+                2.0,
+                quote.min_balance,
+            );
+            if self.trade.full_quote_balance_debouncer.check(
+                can_restore,
+                now_ms,
+                CAN_QUOTE_FULL_SIZE_DEBOUNCE_MS,
+            ) {
+                self.trade.reduced_quote_level_side = None;
+            }
+        }
+        self.quote_balance >= quote.min_balance
+    }
+
+    fn spot_sell_can_trade_raw(
+        &mut self,
+        side: Side,
+        now_ms: TimeMs,
+        base: &CoinConfig,
+        quote: &CoinConfig,
+        mid: f64,
+        full_levels: usize,
+    ) -> bool {
+        let safety = if self.config.quote_currency == "USDC" {
+            base.safety_multiplier.max(10.0)
+        } else {
+            base.safety_multiplier
+        };
+        let full_sufficient = self.trade_balance_sufficient(
+            self.config.max_order_size,
+            full_levels,
+            base.borrow_limit(mid),
+            safety,
+            base.min_balance,
+        );
+        if !full_sufficient {
+            self.trade.reduced_quote_level_side = Some(side);
+            if !self.trade_balance_sufficient(
+                self.config.max_order_size,
+                1,
+                base.borrow_limit(mid),
+                safety,
+                base.min_balance,
+            ) {
+                return false;
+            }
+        } else if self.trade.reduced_quote_level_side == Some(side) {
+            let can_restore = self.trade_balance_sufficient(
+                self.config.max_order_size,
+                full_levels,
+                base.borrow_limit(mid),
+                2.0,
+                base.min_balance,
+            );
+            if self.trade.full_quote_balance_debouncer.check(
+                can_restore,
+                now_ms,
+                CAN_QUOTE_FULL_SIZE_DEBOUNCE_MS,
+            ) {
+                self.trade.reduced_quote_level_side = None;
+            }
+        }
+        quote.max_balance <= 0.0 || self.quote_balance < quote.max_balance
     }
 
     pub(super) fn trade_balance_sufficient(
