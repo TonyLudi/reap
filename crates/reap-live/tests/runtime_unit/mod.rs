@@ -49,6 +49,9 @@ use crate::{
 };
 
 use super::commit::alert_for_storage_record;
+use super::composition::{
+    combine_lifecycle_errors, live_failure_evidence, qualifies_as_clean_soak,
+};
 use super::dispatch::{OrderTaskCommand, ReconcileTaskCommand, SafetyTaskCommand};
 use super::*;
 
@@ -71,6 +74,7 @@ fn production_runtime_keeps_single_owner_responsibility_state() {
         include_str!("../../src/runtime/composition.rs"),
         include_str!("../../src/runtime/connectivity.rs"),
         include_str!("../../src/runtime/dispatch.rs"),
+        include_str!("../../src/runtime/lifecycle.rs"),
         include_str!("../../src/runtime/operator_flow.rs"),
         include_str!("../../src/runtime/planning.rs"),
         include_str!("../../src/runtime/readiness_safety.rs"),
