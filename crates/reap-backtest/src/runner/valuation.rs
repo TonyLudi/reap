@@ -182,7 +182,7 @@ impl BacktestRunner {
             {
                 self.valuation.opening_equity_usd = Some(opening_equity_usd);
                 self.valuation.opening_valuation_at_ns = Some(self.replay.now_ns);
-                self.peak_equity_usd = opening_equity_usd;
+                self.metrics.peak_equity_usd = opening_equity_usd;
             }
         }
         if self.orders.order_entry_ready_at_ns.is_none() && self.order_entry_ready() {

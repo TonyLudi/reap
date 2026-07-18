@@ -95,7 +95,7 @@ impl BacktestRunner {
             && self.valuation.invalid_currency_rate_events == 0
             && self.accounting.portfolio.currency_conversion_failures() == 0
             && self.accounting.portfolio.invalid_accounting_events() == 0
-            && self.invalid_risk_metric_samples == 0
+            && self.metrics.invalid_risk_metric_samples == 0
             && opening_valuation_complete
             && net_pnl_usd.is_some()
             && final_valuation_complete;
@@ -110,25 +110,25 @@ impl BacktestRunner {
         let observed_duration_ns = self
             .replay
             .first_arrival_ns
-            .zip(self.metric_clock_ns)
+            .zip(self.metrics.metric_clock_ns)
             .map(|(first, metric_horizon)| metric_horizon.saturating_sub(first))
             .unwrap_or(0);
-        if self.inventory_open_duration_ns > observed_duration_ns {
+        if self.metrics.inventory_open_duration_ns > observed_duration_ns {
             bail!(
                 "inventory-open duration {}ns exceeds observed metric horizon {}ns",
-                self.inventory_open_duration_ns,
+                self.metrics.inventory_open_duration_ns,
                 observed_duration_ns
             );
         }
         let average_abs_delta_usd = if observed_duration_ns == 0 {
             0.0
         } else {
-            self.abs_delta_time_integral / observed_duration_ns as f64
+            self.metrics.abs_delta_time_integral / observed_duration_ns as f64
         };
         let inventory_open_fraction = if observed_duration_ns == 0 {
             0.0
         } else {
-            self.inventory_open_duration_ns as f64 / observed_duration_ns as f64
+            self.metrics.inventory_open_duration_ns as f64 / observed_duration_ns as f64
         };
 
         Ok(BacktestReport {
@@ -204,17 +204,17 @@ impl BacktestRunner {
             missing_currency_rates,
             currency_rates: currency_rate_reports,
             observed_duration_ns,
-            max_drawdown_usd: self.max_drawdown_usd,
-            max_abs_delta_usd: self.max_abs_delta_usd,
-            max_abs_pending_delta_usd: self.max_abs_pending_delta_usd,
-            max_gross_exposure_usd: self.max_gross_exposure_usd,
-            max_active_orders: self.max_active_orders,
-            max_active_order_notional_usd: self.max_active_order_notional_usd,
+            max_drawdown_usd: self.metrics.max_drawdown_usd,
+            max_abs_delta_usd: self.metrics.max_abs_delta_usd,
+            max_abs_pending_delta_usd: self.metrics.max_abs_pending_delta_usd,
+            max_gross_exposure_usd: self.metrics.max_gross_exposure_usd,
+            max_active_orders: self.metrics.max_active_orders,
+            max_active_order_notional_usd: self.metrics.max_active_order_notional_usd,
             average_abs_delta_usd,
-            inventory_open_duration_ns: self.inventory_open_duration_ns,
+            inventory_open_duration_ns: self.metrics.inventory_open_duration_ns,
             inventory_open_fraction,
-            risk_metric_samples: self.risk_metric_samples,
-            invalid_risk_metric_samples: self.invalid_risk_metric_samples,
+            risk_metric_samples: self.metrics.risk_metric_samples,
+            invalid_risk_metric_samples: self.metrics.invalid_risk_metric_samples,
             funding_rate_events: self.accounting.funding_rate_events,
             funding_settlement_observations: self.funding.realized_funding_rates.len() as u64,
             funding_settlements: self.accounting.funding_settlements,

@@ -8,8 +8,8 @@ use crate::portfolio::{Portfolio, required_accounting_currencies};
 use crate::{
     AccountingState, BacktestCarryState, BacktestConfig, BacktestExecutionConfig,
     BacktestInitialPortfolioConfig, BacktestRunner, BacktestTimeBasis, CurrencyRateObservation,
-    FundingState, MatchingAssumptions, MatchingEngine, OrderLifecycleState, ReplayState,
-    ScheduleState, ScheduledAction, ValuationState,
+    FundingState, MatchingAssumptions, MatchingEngine, MetricState, OrderLifecycleState,
+    ReplayState, ScheduleState, ScheduledAction, ValuationState,
 };
 
 impl BacktestRunner {
@@ -54,7 +54,7 @@ impl BacktestRunner {
         runner.replay.now_ns = carry.settled_at_ns;
         runner.valuation.opening_equity_usd = Some(carry.terminal_equity_usd);
         runner.valuation.opening_valuation_at_ns = Some(carry.settled_at_ns);
-        runner.peak_equity_usd = carry.terminal_equity_usd;
+        runner.metrics.peak_equity_usd = carry.terminal_equity_usd;
         runner.valuation.depth_marks = carry.terminal_depth_marks.into_iter().collect();
         runner.valuation.exchange_marks = carry.terminal_exchange_marks.into_iter().collect();
         runner.valuation.currency_rate_observations = carry
@@ -201,20 +201,22 @@ impl BacktestRunner {
                 missed_funding_settlements: 0,
                 funding_settlement_failures: 0,
             },
-            peak_equity_usd: 0.0,
-            max_drawdown_usd: 0.0,
-            max_abs_delta_usd: 0.0,
-            max_abs_pending_delta_usd: 0.0,
-            max_gross_exposure_usd: 0.0,
-            max_active_orders: 0,
-            max_active_order_notional_usd: 0.0,
-            abs_delta_time_integral: 0.0,
-            inventory_open_duration_ns: 0,
-            metric_clock_ns: None,
-            current_abs_delta_usd: 0.0,
-            current_inventory_open: initial_inventory_open,
-            risk_metric_samples: 0,
-            invalid_risk_metric_samples: 0,
+            metrics: MetricState {
+                peak_equity_usd: 0.0,
+                max_drawdown_usd: 0.0,
+                max_abs_delta_usd: 0.0,
+                max_abs_pending_delta_usd: 0.0,
+                max_gross_exposure_usd: 0.0,
+                max_active_orders: 0,
+                max_active_order_notional_usd: 0.0,
+                abs_delta_time_integral: 0.0,
+                inventory_open_duration_ns: 0,
+                metric_clock_ns: None,
+                current_abs_delta_usd: 0.0,
+                current_inventory_open: initial_inventory_open,
+                risk_metric_samples: 0,
+                invalid_risk_metric_samples: 0,
+            },
         })
     }
 }

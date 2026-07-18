@@ -74,3 +74,20 @@ pub(super) struct AccountingState {
     pub(super) missed_funding_settlements: u64,
     pub(super) funding_settlement_failures: u64,
 }
+
+pub(super) struct MetricState {
+    pub(super) peak_equity_usd: f64,
+    pub(super) max_drawdown_usd: f64,
+    pub(super) max_abs_delta_usd: f64,
+    pub(super) max_abs_pending_delta_usd: f64,
+    pub(super) max_gross_exposure_usd: f64,
+    pub(super) max_active_orders: usize,
+    pub(super) max_active_order_notional_usd: f64,
+    pub(super) abs_delta_time_integral: f64,
+    pub(super) inventory_open_duration_ns: u64,
+    pub(super) metric_clock_ns: Option<u64>,
+    pub(super) current_abs_delta_usd: f64,
+    pub(super) current_inventory_open: bool,
+    pub(super) risk_metric_samples: u64,
+    pub(super) invalid_risk_metric_samples: u64,
+}

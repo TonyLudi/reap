@@ -242,7 +242,8 @@ mod runner_state;
 mod runner_valuation;
 use runner_construction::validate_currency_rate_coverage;
 use runner_state::{
-    AccountingState, FundingState, OrderLifecycleState, ReplayState, ScheduleState, ValuationState,
+    AccountingState, FundingState, MetricState, OrderLifecycleState, ReplayState, ScheduleState,
+    ValuationState,
 };
 
 #[derive(Debug)]
@@ -284,20 +285,7 @@ pub struct BacktestRunner {
     valuation: ValuationState,
     funding: FundingState,
     accounting: AccountingState,
-    peak_equity_usd: f64,
-    max_drawdown_usd: f64,
-    max_abs_delta_usd: f64,
-    max_abs_pending_delta_usd: f64,
-    max_gross_exposure_usd: f64,
-    max_active_orders: usize,
-    max_active_order_notional_usd: f64,
-    abs_delta_time_integral: f64,
-    inventory_open_duration_ns: u64,
-    metric_clock_ns: Option<u64>,
-    current_abs_delta_usd: f64,
-    current_inventory_open: bool,
-    risk_metric_samples: u64,
-    invalid_risk_metric_samples: u64,
+    metrics: MetricState,
 }
 
 fn time_ms(time_ns: u64) -> u64 {
