@@ -655,8 +655,10 @@ Actions:
 - Make private-state session authority non-Clone and take-once. Bind its
   reconnect-capable bootstrap to the exact single packed private socket plan
   (account, destination, connection identity, and complete subscription set);
-  reject another session, split set, substituted plan, or duplicate connection
-  identity.
+  admit exactly one opaque strictly validated login frame, compare emitted
+  subscription bytes with trusted canonical serialization of that plan before
+  connect, and reject another session, extra frame, split set, substituted
+  channel/symbol/selectors, or duplicate connection identity.
 - Document crate ownership and forbidden dependency directions.
 - Add dependency/visibility checks that fail when emergency or raw wire
   authority leaks back into live execution.
@@ -674,6 +676,9 @@ Exit gate:
 - The order-command websocket lifecycle is absent from `reap-live`; the live
   adapter exposes no transport, login builder, raw request, amend, algo/spread,
   arbitrary request, or signer escape.
+- Private feed bootstrap cannot write a non-login or additional frame, and its
+  subscription serializer cannot substitute a channel, symbol, or selector
+  from the exact packed plan.
 - The current executable Demo plan creates exactly one command session per
   executing account. A nonempty mismatched account/symbol/client ID, a
   non-string identity field, or an accepted empty/untrimmed/zero exchange-order

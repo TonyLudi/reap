@@ -85,7 +85,9 @@ This scope remains pinned to the supported call path in the clean
    only typed lifecycle/status observation. Cancels are deduplicated, every
    place request carries an OKX
    `expTime`, and every private acknowledgement/fill returns through the
-   reducer/engine.
+   reducer/engine. Private state bootstrap separately admits exactly one
+   opaque validated login frame and requires trusted canonical subscription
+   bytes for the exact packed `SocketPlan` before any connection is opened.
 5. The critical log persists account-scoped raw input, normalized input,
    intent, request, acknowledgement, fill, system event, reconciliation result,
    and safety-latch mutation with enough identity to replay one account

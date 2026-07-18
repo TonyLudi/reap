@@ -431,7 +431,10 @@ MUST enforce:
   client;
 - authenticated private-feed factories expose only the planned
   orders/account/positions/required-fill channels, are non-Clone and take-once,
-  and bind reconnect-capable bootstrap to the exact single packed socket plan;
+  bind reconnect-capable bootstrap to the exact single packed socket plan,
+  produce exactly one opaque strictly validated login frame per attempt, and
+  require the emitted subscription bytes to equal trusted canonical
+  serialization of that plan before connect;
 - the adapter's order-command bootstrap consumes a non-Clone, take-once bound
   gateway/session bundle, installs its adapter-private matching command slot,
   and only then releases the gateway plus typed lifecycle/status observation;

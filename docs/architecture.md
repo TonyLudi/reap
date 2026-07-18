@@ -697,10 +697,16 @@ new orders while demo-mode cancels remain available.
 The account's private-session authority is non-Clone and transferred once. Its
 consuming factory binds authenticated bootstrap to the exact private
 destination, account, connection identity, and complete packed subscription
-set in the resolved plan. The bootstrap may be reused only by supervision to
-reconnect that same planned socket. Runtime rejects any private session count
-other than one, and feed supervision rejects duplicate connection identities;
-callers cannot split the packed set into extra authenticated sockets.
+set in the resolved plan. On every attempt the factory produces one opaque,
+non-Clone login frame whose exact OKX login shape is validated before connect;
+non-login, multiple, concatenated, or malformed frames fail closed. Feed
+supervision also compares the subscription bytes with trusted canonical
+serialization of that exact socket plan before bootstrap or connect, so an
+adapter cannot substitute a same-count channel, symbol, or selector. The
+bootstrap may be reused only by supervision to reconnect that same planned
+socket. Runtime rejects any private session count other than one, and feed
+supervision rejects duplicate connection identities; callers cannot split the
+packed set into extra authenticated sockets.
 
 Every account also runs one continuous, read-only forbidden-order sentinel. Its
 initial proof must exhaustively show zero pending orders across the seven OKX

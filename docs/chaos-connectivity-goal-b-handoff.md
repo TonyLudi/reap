@@ -46,7 +46,7 @@ failure. Do not describe the goal as complete.
 | Goal A final implementation | `ab7842446b9cb4f48ccc70425b0c8731ac9eac5f` |
 | Goal A documentation/handoff | `1fbf8955097fdb29fc38b04866005aa1f7095bee` |
 | Goal B prompt/starting `HEAD` | `21d20e288c7de9e038550666fbb1f1d95763912a` |
-| Final Goal B implementation tip | `246f5b21d046dc20fd84460c7b59346231d6107f` |
+| Final Goal B implementation tip | `12ebbbf870e8f6a1d35cff468fcc6a32f24230af` |
 | Goal B documentation/verification-base commit | `[PENDING_GOAL_B_DOCS_BASE_SHA]` |
 | Sibling behavior reference | clean `../imm-strategy` checkout at `b6b120c7b7c466d8431bf082f3229328c5d7b2ae` |
 | Rust reference pin | `reap_core::PINNED_JAVA_REVISION` equals `b6b120c7b7c466d8431bf082f3229328c5d7b2ae` |
@@ -85,6 +85,7 @@ strategy framework, or production order entry.
 | Phase 8 live safety decisions | `2f172e8b6ce03f73505c79deb80330bccf59aef8` | Shared soak/fault decisions |
 | Phase 8 regular authority/recovery | `38babe6e4d12d598730d3c79aeeccbbec1ec018d` | Linear gateway-bound mutation authority |
 | Phase 8 adapter command websocket | `246f5b21d046dc20fd84460c7b59346231d6107f` | Adapter-owned single command session, sealed take-once authority, exact acknowledgement/fallback boundaries, and teardown release regression committed; final gates below remain pending |
+| Phase 8 private-feed bootstrap seal | `12ebbbf870e8f6a1d35cff468fcc6a32f24230af` | Exactly one opaque validated login frame, exact socket-plan subscription binding, and source/compile-fail bypass guards |
 | Phase 9 documentation/verification base | `[PENDING_GOAL_B_DOCS_BASE_SHA]` | README, capability inventory/deviation ledger, architecture, mapping, operations, readiness, prompt, CLI help, sample config, and handoff record before result fields are filled |
 
 Immutable identities for every committed Phase 6–8 family:
@@ -105,12 +106,14 @@ Immutable identities for every committed Phase 6–8 family:
 | `dd0d5db9cb4ee93a225e53361b18e5cb51a06996` | `967481ee852daba2d2199d70800747ca6ad00fff` | `ecb6582b8d3b3bba6e685283600806186a2bded8` |
 | `2f172e8b6ce03f73505c79deb80330bccf59aef8` | `7eb2c3c3d9f12adaeb5d261755ea254bde3dccd8` | `9ba5e0e0c2f5ac6e8bb30a3b2a8e514ba671fa24` |
 | `38babe6e4d12d598730d3c79aeeccbbec1ec018d` | `92fdc4fe4224a073bc489c99c3f5a63f16d2166d` | `9ed5315dfb8d7825f34405d520044e5987b7b8c2` |
+| `12ebbbf870e8f6a1d35cff468fcc6a32f24230af` | `a2302595763fad07fcb7ba06a01e110bd9996634` | `a85b825fd7b0002df95cb1503cbde4c4379ea8b0` |
 
-Final adapter and documentation identity:
+Final Phase 8 and documentation identity:
 
 | Family | Commit | Tree | Stable patch ID |
 | --- | --- | --- | --- |
 | Adapter-owned command websocket | `246f5b21d046dc20fd84460c7b59346231d6107f` | `8da0cee31acc15f64a32c75e70808279d840537a` | `ab22b63351b3a17a44da360ed686289ad0d58159` |
+| Private-feed bootstrap seal | `12ebbbf870e8f6a1d35cff468fcc6a32f24230af` | `a2302595763fad07fcb7ba06a01e110bd9996634` | `a85b825fd7b0002df95cb1503cbde4c4379ea8b0` |
 | Goal B documentation/verification base | `[PENDING_GOAL_B_DOCS_BASE_SHA]` | `[PENDING_GOAL_B_DOCS_BASE_TREE_SHA]` | `[PENDING_GOAL_B_DOCS_BASE_PATCH_ID]` |
 
 The later commit that replaces the final verification placeholders is the
@@ -166,8 +169,12 @@ These claims become final only when their checks below pass:
 - Each account's private-state session authority is non-Clone and taken once.
   Its consuming factory binds reconnect-capable bootstrap to the exact private
   destination, account, connection identity, and complete packed subscription
-  set in the resolved plan. A count other than one, a duplicate identity, or a
-  split/substituted plan is rejected. The admitted channel set remains
+  set in the resolved plan. Each attempt produces exactly one opaque,
+  non-Clone, strictly validated login frame, and feed supervision requires
+  emitted subscription bytes to equal trusted canonical serialization of that
+  plan before bootstrap or connect. A count other than one, a duplicate
+  identity, an extra/non-login frame, or a split/substituted plan, channel,
+  symbol, or selector is rejected. The admitted channel set remains
   plan-minimal: positions alone for an unused observation-only account, or
   account/orders/positions plus configured fills for an executing account.
 - Mismatched nonempty acknowledgement account/symbol/client ID and an accepted

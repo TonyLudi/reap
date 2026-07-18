@@ -292,6 +292,7 @@ Goal B resolves the deviations that Goal A intentionally deferred:
 | Duplicated live soak/fault classification | Resolved in Phase 8 by private `LiveCleanSoakInputs`, `LiveFaultFailureCode`, and `LiveFaultFailureClass` contracts shared by runtime/fault reporting and independent verification. |
 | Regular execution values retained too much wire authority | The Phase 8 implementation candidate uses the approved/reserved/prepared chain above. Values crossing strategy, coordinator, gateway, and adapter boundaries expose only the fields needed by the next role; raw authenticated wire construction remains adapter-private. This row is resolved only when the recorded focused and global gates pass. |
 | Order-command websocket ownership outside the wire adapter | The implementation candidate moves the final hop above into the adapter. Consuming startup on an account-bound nonseparable gateway/session bundle validates the supplied destination/account, installs its private matching slot before spawn, and then returns the now-bound gateway. Besides that gateway, only typed lifecycle/status observation returns to live. The current plan has exactly one command shard per executing account. A tree in which connection/login/write/ack/reconnect/shutdown or prepared-to-wire lowering remains owned by `reap-live` must not pass the Phase 9 gate. |
+| Private feed bootstrap or subscription serialization could bypass its plan | The Phase 8 boundary seal replaces arbitrary bootstrap-frame vectors with one opaque, non-Clone, strictly validated login frame and compares subscription bytes with trusted canonical serialization of the exact `SocketPlan` before bootstrap or connect. Non-login/extra frames and same-count channel, symbol, or selector substitutions fail closed; production construction is source-allowlisted to the live adapter. |
 | Recovery parsing could recreate mutation authority | The implementation candidate preserves proofs only through take-once leased recovery; ordinary path/byte recovery strips them. This requires no journal schema change and is Rust structural hardening with an explicitly operator-controlled, non-cryptographic trust root. |
 
 Implementation commits through the named safety-contract work are:
@@ -303,6 +304,7 @@ Implementation commits through the named safety-contract work are:
 | Phase 8 named safety contracts | `dd0d5db`, `2f172e8` |
 | Phase 8 regular authority | `38babe6e4d12d598730d3c79aeeccbbec1ec018d` |
 | Phase 8 adapter-owned command websocket | `246f5b21d046dc20fd84460c7b59346231d6107f` |
+| Phase 8 private-feed bootstrap seal | `12ebbbf870e8f6a1d35cff468fcc6a32f24230af` |
 | Phase 9 documentation/verification base | `[PENDING_GOAL_B_DOCS_BASE_SHA]` |
 
 Exact trees, patch IDs, commands, focused counts, deterministic anchors, and

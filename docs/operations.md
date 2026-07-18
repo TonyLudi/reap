@@ -1206,8 +1206,12 @@ outside source control.
     observation-only account may require positions alone. The non-Clone
     session authority is taken once and binds
     reconnect-capable bootstrap to that exact account, private destination,
-    connection identity, and full packed set; a count other than one, a
-    duplicate connection identity, or a split/substituted set is rejected.
+    connection identity, and full packed set. Each attempt admits exactly one
+    opaque, strictly validated OKX login frame, and feed supervision requires
+    subscription bytes to equal trusted canonical serialization of the exact
+    plan before bootstrap or connect. A count other than one, a duplicate
+    connection identity, a split/substituted set, an extra bootstrap frame, or
+    a same-count channel/symbol substitution is rejected.
     Order-channel fills remain canonical. Transport
     acknowledgements alone are not private readiness: account and positions
     must each deliver a real data payload. Every transition of that complete
