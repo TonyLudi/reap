@@ -455,6 +455,32 @@ impl LiveCoordinator {
             .map_err(|source| CoordinatorError::PrivateOrderIdentity { account_id, source })
     }
 
+    pub fn process_feed(
+        &mut self,
+        output: FeedOutput,
+    ) -> Result<CoordinatorOutput, CoordinatorError> {
+        match output {
+            FeedOutput::Event(event) => Ok(self.process_normalized(event)),
+            FeedOutput::System(event) => {
+                Ok(self.process_normalized(NormalizedEvent::System(event)))
+            }
+            FeedOutput::Duplicate(_) => Ok(CoordinatorOutput::default()),
+            FeedOutput::RecoveryRequired(request) => Ok(CoordinatorOutput {
+                actions: vec![LiveAction::RecoverBook(request)],
+                records: Vec::new(),
+            }),
+            FeedOutput::PrivateAccount { account_id, update } => {
+                self.process_private_account(account_id, update)
+            }
+            FeedOutput::PrivateOrder { account_id, update } => {
+                self.process_private_order(account_id, update)
+            }
+            FeedOutput::PrivateFill { account_id, fill } => {
+                self.process_private_fill(account_id, fill)
+            }
+        }
+    }
+
     pub fn process_feed_at(
         &mut self,
         output: FeedOutput,
