@@ -1,4 +1,5 @@
 use reap_core::FillFee;
+use reap_venue::okx::OkxBalanceDetail;
 
 use super::super::*;
 
