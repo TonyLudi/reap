@@ -49,7 +49,31 @@ pub(super) struct BindingInputs<'a> {
 }
 
 pub(super) fn evaluate_bindings(input: BindingInputs<'_>) -> Vec<ProductionEvidenceFailure> {
-    let mut failures = Vec::new();
+    let (failures, demo_accounts, production_accounts) =
+        check_verifier_and_config_bindings(&input, Vec::new());
+    let failures = check_transition_and_research(&input, failures, &production_accounts);
+    let failures = check_demo(&input, failures);
+    let failures = check_fault(&input, failures);
+    let failures = check_latency(&input, failures);
+    let failures = check_account(&input, failures, &production_accounts);
+    let failures = check_deadman(&input, failures, &demo_accounts);
+    let failures = check_emergency(&input, failures);
+    let failures = check_fill(&input, failures, &demo_accounts);
+    let mut failures = check_economic(&input, failures, &demo_accounts);
+
+    failures.sort_by_key(failure_sort_key);
+    failures.dedup();
+    failures
+}
+
+fn check_verifier_and_config_bindings(
+    input: &BindingInputs<'_>,
+    mut failures: Vec<ProductionEvidenceFailure>,
+) -> (
+    Vec<ProductionEvidenceFailure>,
+    BTreeSet<String>,
+    BTreeSet<String>,
+) {
     check_binding(
         &mut failures,
         ProductionEvidenceGate::Verifier,
@@ -204,6 +228,14 @@ pub(super) fn evaluate_bindings(input: BindingInputs<'_>) -> Vec<ProductionEvide
             .collect(),
     );
 
+    (failures, demo_accounts, production_accounts)
+}
+
+fn check_transition_and_research(
+    input: &BindingInputs<'_>,
+    mut failures: Vec<ProductionEvidenceFailure>,
+    production_accounts: &BTreeSet<String>,
+) -> Vec<ProductionEvidenceFailure> {
     reject_gate(
         &mut failures,
         ProductionEvidenceGate::ProductionTransition,
@@ -256,13 +288,20 @@ pub(super) fn evaluate_bindings(input: BindingInputs<'_>) -> Vec<ProductionEvide
     check_research_opening_accounts(
         &mut failures,
         &input.research.research.artifact_opening_accounts,
-        &production_accounts,
+        production_accounts,
         &input.production.1.file.sha256,
         &input.expected.live_executable_sha256,
         &input.expected.host_identity_sha256,
         &input.expected.production_account_identity_sha256s,
     );
 
+    failures
+}
+
+fn check_demo(
+    input: &BindingInputs<'_>,
+    mut failures: Vec<ProductionEvidenceFailure>,
+) -> Vec<ProductionEvidenceFailure> {
     reject_gate(
         &mut failures,
         ProductionEvidenceGate::DemoSoak,
@@ -295,6 +334,13 @@ pub(super) fn evaluate_bindings(input: BindingInputs<'_>) -> Vec<ProductionEvide
         &input.expected.demo_account_identity_sha256s,
     );
 
+    failures
+}
+
+fn check_fault(
+    input: &BindingInputs<'_>,
+    mut failures: Vec<ProductionEvidenceFailure>,
+) -> Vec<ProductionEvidenceFailure> {
     reject_gate(
         &mut failures,
         ProductionEvidenceGate::FaultMatrix,
@@ -362,6 +408,13 @@ pub(super) fn evaluate_bindings(input: BindingInputs<'_>) -> Vec<ProductionEvide
         );
     }
 
+    failures
+}
+
+fn check_latency(
+    input: &BindingInputs<'_>,
+    mut failures: Vec<ProductionEvidenceFailure>,
+) -> Vec<ProductionEvidenceFailure> {
     reject_gate(
         &mut failures,
         ProductionEvidenceGate::LatencyCalibration,
@@ -390,6 +443,14 @@ pub(super) fn evaluate_bindings(input: BindingInputs<'_>) -> Vec<ProductionEvide
         &input.expected.demo_account_identity_sha256s,
     );
 
+    failures
+}
+
+fn check_account(
+    input: &BindingInputs<'_>,
+    mut failures: Vec<ProductionEvidenceFailure>,
+    production_accounts: &BTreeSet<String>,
+) -> Vec<ProductionEvidenceFailure> {
     let mut production_certified_accounts = BTreeSet::new();
     for (_, artifact) in input.account_artifacts {
         let account_id = artifact.summary.account_id.as_str();
@@ -454,10 +515,18 @@ pub(super) fn evaluate_bindings(input: BindingInputs<'_>) -> Vec<ProductionEvide
     check_account_coverage(
         &mut failures,
         ProductionEvidenceGate::AccountCertification,
-        &production_accounts,
+        production_accounts,
         &production_certified_accounts,
     );
 
+    failures
+}
+
+fn check_deadman(
+    input: &BindingInputs<'_>,
+    mut failures: Vec<ProductionEvidenceFailure>,
+    demo_accounts: &BTreeSet<String>,
+) -> Vec<ProductionEvidenceFailure> {
     let mut deadman_accounts = BTreeSet::new();
     for (_, artifact) in input.deadman_artifacts {
         let account_id = artifact.summary.account_id.as_str();
@@ -482,16 +551,23 @@ pub(super) fn evaluate_bindings(input: BindingInputs<'_>) -> Vec<ProductionEvide
             &artifact.executable_sha256,
             &artifact.host_identity_sha256,
             &artifact.summary.account_identity_sha256,
-            &input,
+            input,
         );
     }
     check_account_coverage(
         &mut failures,
         ProductionEvidenceGate::DeadmanCertification,
-        &demo_accounts,
+        demo_accounts,
         &deadman_accounts,
     );
 
+    failures
+}
+
+fn check_emergency(
+    input: &BindingInputs<'_>,
+    mut failures: Vec<ProductionEvidenceFailure>,
+) -> Vec<ProductionEvidenceFailure> {
     reject_gate(
         &mut failures,
         ProductionEvidenceGate::EmergencyCancel,
@@ -524,6 +600,14 @@ pub(super) fn evaluate_bindings(input: BindingInputs<'_>) -> Vec<ProductionEvide
         &input.expected.demo_account_identity_sha256s,
     );
 
+    failures
+}
+
+fn check_fill(
+    input: &BindingInputs<'_>,
+    mut failures: Vec<ProductionEvidenceFailure>,
+    demo_accounts: &BTreeSet<String>,
+) -> Vec<ProductionEvidenceFailure> {
     let mut fill_accounts = BTreeSet::new();
     for fill in input.fill_inputs {
         let account_id = fill.manifest.account_id.as_str();
@@ -550,16 +634,24 @@ pub(super) fn evaluate_bindings(input: BindingInputs<'_>) -> Vec<ProductionEvide
             &fill.manifest.executable_sha256,
             &fill.manifest.host_identity_sha256,
             &fill.manifest.account_identity_sha256,
-            &input,
+            input,
         );
     }
     check_account_coverage(
         &mut failures,
         ProductionEvidenceGate::FillReconciliation,
-        &demo_accounts,
+        demo_accounts,
         &fill_accounts,
     );
 
+    failures
+}
+
+fn check_economic(
+    input: &BindingInputs<'_>,
+    mut failures: Vec<ProductionEvidenceFailure>,
+    demo_accounts: &BTreeSet<String>,
+) -> Vec<ProductionEvidenceFailure> {
     let mut economic_accounts = BTreeSet::new();
     for economic in input.economic_inputs {
         let account_id = economic.bill_manifest.account_id.as_str();
@@ -596,7 +688,7 @@ pub(super) fn evaluate_bindings(input: BindingInputs<'_>) -> Vec<ProductionEvide
             &economic.fill_manifest.executable_sha256,
             &economic.fill_manifest.host_identity_sha256,
             &economic.fill_manifest.account_identity_sha256,
-            &input,
+            input,
         );
         for artifact in [&economic.opening_account, &economic.closing_account] {
             check_demo_artifact_identity(
@@ -608,7 +700,7 @@ pub(super) fn evaluate_bindings(input: BindingInputs<'_>) -> Vec<ProductionEvide
                 &artifact.executable_sha256,
                 &artifact.host_identity_sha256,
                 &artifact.summary.account_identity_sha256,
-                &input,
+                input,
             );
             check_binding(
                 &mut failures,
@@ -628,7 +720,7 @@ pub(super) fn evaluate_bindings(input: BindingInputs<'_>) -> Vec<ProductionEvide
             &economic.bill_manifest.executable_sha256,
             &economic.bill_manifest.host_identity_sha256,
             &economic.bill_manifest.account_identity_sha256,
-            &input,
+            input,
         );
         check_binding(
             &mut failures,
@@ -773,12 +865,10 @@ pub(super) fn evaluate_bindings(input: BindingInputs<'_>) -> Vec<ProductionEvide
     check_account_coverage(
         &mut failures,
         ProductionEvidenceGate::EconomicReconciliation,
-        &demo_accounts,
+        demo_accounts,
         &economic_accounts,
     );
 
-    failures.sort_by_key(failure_sort_key);
-    failures.dedup();
     failures
 }
 
