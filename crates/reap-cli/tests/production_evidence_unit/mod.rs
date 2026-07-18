@@ -6,4 +6,5 @@ mod ordering;
 mod paths;
 mod policy_time;
 mod schema;
+mod structure;
 mod support;
