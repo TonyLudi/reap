@@ -478,58 +478,79 @@ impl InstrumentState {
 
     pub(super) fn max_trade_size(&self, side: Side, is_hedge: bool) -> f64 {
         let size_limit = self.config.max_order_size * if is_hedge { 10.0 } else { 1.0 };
-        if self.config.kind.is_spot()
-            && self.balances_initialized
-            && let (Some(base), Some(quote)) =
-                (&self.trade.base_coin_config, &self.trade.quote_coin_config)
-        {
-            let mid = self.mid().unwrap_or(0.0);
-            if mid <= 0.0 {
-                return 0.0;
-            }
-            let base_equity = account_equity(self.base_equity, self.base_balance);
-            let quote_available = available_coin_qty(
-                self.quote_balance,
-                self.quote_max_loan,
-                quote.borrow_limit(1.0),
-                0.0,
-            );
-            let base_available = available_coin_qty(
-                self.base_balance,
-                self.base_max_loan,
-                base.borrow_limit(mid),
-                0.0,
-            );
-            let available = match side {
-                Side::Buy => {
-                    let base_capacity = base.max_balance - base_equity;
-                    let quote_capacity = quote_available / mid;
-                    base_capacity.min(quote_capacity)
-                }
-                Side::Sell => {
-                    if quote.max_balance > 0.0 && self.quote_balance >= quote.max_balance {
-                        return 0.0;
-                    }
-                    let base_capacity = base_equity - base.min_balance;
-                    base_capacity.min(base_available - quote.min_balance)
-                }
-            };
-            return available.min(size_limit);
+        if let Some(available) = self.spot_balance_capacity(side, size_limit) {
+            return available;
         }
 
         let buffer = self.config.max_order_size * self.config.safety_multiplier;
-        let available_by_position = match side {
+        let available_by_position = self.position_capacity(side, buffer);
+        let Some(available_by_margin) = self.margin_capacity(side, buffer) else {
+            return 0.0;
+        };
+        available_by_position
+            .min(available_by_margin)
+            .min(size_limit)
+    }
+
+    fn spot_balance_capacity(&self, side: Side, size_limit: f64) -> Option<f64> {
+        if !self.config.kind.is_spot() || !self.balances_initialized {
+            return None;
+        }
+        let (Some(base), Some(quote)) =
+            (&self.trade.base_coin_config, &self.trade.quote_coin_config)
+        else {
+            return None;
+        };
+        let mid = self.mid().unwrap_or(0.0);
+        if mid <= 0.0 {
+            return Some(0.0);
+        }
+        let base_equity = account_equity(self.base_equity, self.base_balance);
+        let quote_available = available_coin_qty(
+            self.quote_balance,
+            self.quote_max_loan,
+            quote.borrow_limit(1.0),
+            0.0,
+        );
+        let base_available = available_coin_qty(
+            self.base_balance,
+            self.base_max_loan,
+            base.borrow_limit(mid),
+            0.0,
+        );
+        let available = match side {
+            Side::Buy => {
+                let base_capacity = base.max_balance - base_equity;
+                let quote_capacity = quote_available / mid;
+                base_capacity.min(quote_capacity)
+            }
+            Side::Sell => {
+                if quote.max_balance > 0.0 && self.quote_balance >= quote.max_balance {
+                    return Some(0.0);
+                }
+                let base_capacity = base_equity - base.min_balance;
+                base_capacity.min(base_available - quote.min_balance)
+            }
+        };
+        Some(available.min(size_limit))
+    }
+
+    fn position_capacity(&self, side: Side, buffer: f64) -> f64 {
+        match side {
             Side::Buy => self.config.max_position - self.position_qty - buffer,
             Side::Sell => self.position_qty - self.config.min_position - buffer,
-        };
-        let available_by_margin = if side.factor() * self.position_qty < 0.0 {
-            f64::MAX
+        }
+    }
+
+    fn margin_capacity(&self, side: Side, buffer: f64) -> Option<f64> {
+        if side.factor() * self.position_qty < 0.0 {
+            Some(f64::MAX)
         } else if self.margin_initialized
             && let Some(margin_coin) = &self.trade.margin_coin_config
         {
             let mid = self.mid().unwrap_or(0.0);
             if mid <= 0.0 {
-                return 0.0;
+                return None;
             }
             let borrow_limit = margin_coin.borrow_limit(if self.config.kind.is_inverse() {
                 mid
@@ -537,7 +558,7 @@ impl InstrumentState {
                 1.0
             });
             if self.margin_balance < -borrow_limit || self.margin_liability.abs() > borrow_limit {
-                0.0
+                Some(0.0)
             } else {
                 let available_coin = available_coin_qty(
                     self.margin_balance,
@@ -555,14 +576,13 @@ impl InstrumentState {
                 } else {
                     2.0
                 };
-                available_coin / margin_coin_per_contract.max(EPS) * margin_multiplier - buffer
+                Some(
+                    available_coin / margin_coin_per_contract.max(EPS) * margin_multiplier - buffer,
+                )
             }
         } else {
-            f64::MAX
-        };
-        available_by_position
-            .min(available_by_margin)
-            .min(size_limit)
+            Some(f64::MAX)
+        }
     }
 
     pub(super) fn append_hedge_candidates(
