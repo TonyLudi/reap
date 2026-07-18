@@ -25,7 +25,7 @@ mod reference_health;
 mod risk;
 
 use execution_state::ExecutionTrackingState;
-use hedging::HedgeCandidate;
+use hedging::{HedgeCandidate, HedgingState};
 use pricing::{JavaRandom, QuoteTargetState, round_passive_to_tick};
 use reference_health::{
     DebouncedCondition, ReferenceHealthState, TimedPrice, should_accept_timestamp,
@@ -54,17 +54,12 @@ pub struct ChaosStrategy {
     halt_reason: Option<String>,
     burst: f64,
     burst_symbol: Option<Symbol>,
-    best_hedges: HashMap<Side, Vec<HedgeLevel>>,
-    hedge_candidate_scratch: Vec<HedgeCandidate>,
+    hedging: HedgingState,
     execution: ExecutionTrackingState,
     quote_targets: HashMap<(Symbol, Side), QuoteTargetState>,
     random: JavaRandom,
     now_ms: TimeMs,
-    last_hedge_ms: TimeMs,
     risk: AggregateRiskState,
-    no_hedge_found_since: Option<TimeMs>,
-    hedge_not_found_since: Option<TimeMs>,
-    all_hedges_halted_since: Option<TimeMs>,
 }
 
 impl ChaosStrategy {
@@ -191,8 +186,14 @@ impl ChaosStrategy {
             halt_reason: None,
             burst: 0.0,
             burst_symbol: None,
-            best_hedges,
-            hedge_candidate_scratch: Vec::new(),
+            hedging: HedgingState {
+                best_hedges,
+                hedge_candidate_scratch: Vec::new(),
+                last_hedge_ms: 0,
+                no_hedge_found_since: None,
+                hedge_not_found_since: None,
+                all_hedges_halted_since: None,
+            },
             execution: ExecutionTrackingState {
                 active_quotes: StableMap::default(),
                 active_hedges: StableMap::default(),
@@ -202,7 +203,6 @@ impl ChaosStrategy {
             quote_targets: HashMap::new(),
             random: JavaRandom::new(1),
             now_ms: 0,
-            last_hedge_ms: 0,
             risk: AggregateRiskState {
                 delta_usd: 0.0,
                 pending_delta_usd: 0.0,
@@ -212,9 +212,6 @@ impl ChaosStrategy {
                 margin_debouncers,
                 exchange_margin_debouncers,
             },
-            no_hedge_found_since: None,
-            hedge_not_found_since: None,
-            all_hedges_halted_since: None,
         })
     }
 
@@ -1338,7 +1335,7 @@ mod tests {
         strategy.update_best_hedges();
 
         let targets = strategy.summarize_hedges(
-            strategy.best_hedges.get(&Side::Sell).unwrap(),
+            strategy.hedging.best_hedges.get(&Side::Sell).unwrap(),
             Side::Sell,
             3_000.0,
             None,
@@ -1362,7 +1359,7 @@ mod tests {
         strategy.update_best_hedges();
 
         let targets = strategy.summarize_hedges(
-            strategy.best_hedges.get(&Side::Sell).unwrap(),
+            strategy.hedging.best_hedges.get(&Side::Sell).unwrap(),
             Side::Sell,
             3_000.0,
             None,
@@ -1398,7 +1395,7 @@ mod tests {
         strategy.update_best_hedges();
 
         let targets = strategy.summarize_hedges(
-            strategy.best_hedges.get(&Side::Sell).unwrap(),
+            strategy.hedging.best_hedges.get(&Side::Sell).unwrap(),
             Side::Sell,
             3_000.0,
             None,
@@ -1763,7 +1760,7 @@ mod tests {
         assert!(approx_eq(burst_sell, baseline_sell + 50.0));
 
         let targets = strategy.summarize_hedges(
-            strategy.best_hedges.get(&Side::Buy).unwrap(),
+            strategy.hedging.best_hedges.get(&Side::Buy).unwrap(),
             Side::Buy,
             9_000.0,
             None,
@@ -2403,7 +2400,7 @@ mod tests {
             Level::new(50_000.0, 10_000.0),
             Level::new(50_001.0, 10_000.0),
         ));
-        strategy.last_hedge_ms = 10;
+        strategy.hedging.last_hedge_ms = 10;
 
         let intents = legacy_intents(strategy.on_account_update(&AccountUpdate {
             ts_ms: 20,
@@ -2419,7 +2416,7 @@ mod tests {
 
         assert!(intents.iter().any(|intent| matches!(intent, OrderIntent::NewOrder(order)
             if order.symbol == "BTC-PERP" && order.side == Side::Sell && order.time_in_force == TimeInForce::Ioc)));
-        assert_eq!(strategy.last_hedge_ms, 10);
+        assert_eq!(strategy.hedging.last_hedge_ms, 10);
     }
 
     #[test]
@@ -2684,6 +2681,7 @@ mod tests {
         strategy.update_best_hedges();
         assert!(
             strategy
+                .hedging
                 .best_hedges
                 .values()
                 .flatten()
@@ -2700,6 +2698,7 @@ mod tests {
         });
         assert!(
             strategy
+                .hedging
                 .best_hedges
                 .values()
                 .flatten()
@@ -2716,6 +2715,7 @@ mod tests {
         });
         assert!(
             strategy
+                .hedging
                 .best_hedges
                 .values()
                 .flatten()

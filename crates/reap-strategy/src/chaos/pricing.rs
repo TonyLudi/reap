@@ -169,7 +169,8 @@ impl ChaosStrategy {
 
                 let hedge_side = side.reverse();
                 let hedges = if rg.can_increase_delta_with_quote_buffer(side) {
-                    self.best_hedges
+                    self.hedging
+                        .best_hedges
                         .get(&hedge_side)
                         .cloned()
                         .unwrap_or_default()

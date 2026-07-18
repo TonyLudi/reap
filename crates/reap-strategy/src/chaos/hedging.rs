@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use reap_core::{Price, Quantity, Side, Symbol, round_down_to_lot};
+use reap_core::{Price, Quantity, Side, Symbol, TimeMs, round_down_to_lot};
 
 use crate::ChaosExecutionIntent;
 
@@ -31,6 +31,16 @@ pub(super) struct HedgeCandidate {
     pub(super) hedge_rate: f64,
     pub(super) notional_usd: f64,
     pub(super) acc_qty: Quantity,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct HedgingState {
+    pub(super) best_hedges: HashMap<Side, Vec<HedgeLevel>>,
+    pub(super) hedge_candidate_scratch: Vec<HedgeCandidate>,
+    pub(super) last_hedge_ms: TimeMs,
+    pub(super) no_hedge_found_since: Option<TimeMs>,
+    pub(super) hedge_not_found_since: Option<TimeMs>,
+    pub(super) all_hedges_halted_since: Option<TimeMs>,
 }
 
 impl HedgeCandidate {
@@ -71,10 +81,18 @@ impl ChaosStrategy {
             entity.update_take_rate(Side::Sell, ref_mid);
         }
 
-        self.best_hedges.entry(Side::Buy).or_default().clear();
-        self.best_hedges.entry(Side::Sell).or_default().clear();
+        self.hedging
+            .best_hedges
+            .entry(Side::Buy)
+            .or_default()
+            .clear();
+        self.hedging
+            .best_hedges
+            .entry(Side::Sell)
+            .or_default()
+            .clear();
 
-        let mut levels = std::mem::take(&mut self.hedge_candidate_scratch);
+        let mut levels = std::mem::take(&mut self.hedging.hedge_candidate_scratch);
         let mut group_names = self.risk_groups.keys().cloned().collect::<Vec<_>>();
         group_names.sort();
         for group_name in group_names {
@@ -118,13 +136,15 @@ impl ChaosStrategy {
             }
         }
         levels.clear();
-        self.hedge_candidate_scratch = levels;
+        self.hedging.hedge_candidate_scratch = levels;
 
         if self.risk_groups.len() == 1 {
             if let Some(rg) = self.risk_groups.values().next() {
-                self.best_hedges
+                self.hedging
+                    .best_hedges
                     .insert(Side::Buy, rg.best_hedges_for(Side::Buy).to_vec());
-                self.best_hedges
+                self.hedging
+                    .best_hedges
                     .insert(Side::Sell, rg.best_hedges_for(Side::Sell).to_vec());
             }
             return;
@@ -138,14 +158,17 @@ impl ChaosStrategy {
                 }
             }
             sort_hedge_levels(side, &mut levels);
-            self.best_hedges.insert(side, levels);
+            self.hedging.best_hedges.insert(side, levels);
         }
     }
 
     pub(super) fn check_hedge_availability(&mut self) -> bool {
         let all_halted = self.all_hedges_halted();
         if all_halted {
-            let since = self.all_hedges_halted_since.get_or_insert(self.now_ms);
+            let since = self
+                .hedging
+                .all_hedges_halted_since
+                .get_or_insert(self.now_ms);
             if self.now_ms.saturating_sub(*since) > self.config.all_hedges_halted_stop_ms {
                 self.halt_reason = Some(format!(
                     "all hedge-enabled instruments halted for more than {}ms",
@@ -154,13 +177,21 @@ impl ChaosStrategy {
                 return false;
             }
         } else {
-            self.all_hedges_halted_since = None;
+            self.hedging.all_hedges_halted_since = None;
         }
 
-        let no_hedges = self.best_hedges.get(&Side::Buy).is_none_or(Vec::is_empty)
-            && self.best_hedges.get(&Side::Sell).is_none_or(Vec::is_empty);
+        let no_hedges = self
+            .hedging
+            .best_hedges
+            .get(&Side::Buy)
+            .is_none_or(Vec::is_empty)
+            && self
+                .hedging
+                .best_hedges
+                .get(&Side::Sell)
+                .is_none_or(Vec::is_empty);
         if no_hedges && !all_halted {
-            let since = self.no_hedge_found_since.get_or_insert(self.now_ms);
+            let since = self.hedging.no_hedge_found_since.get_or_insert(self.now_ms);
             if self.now_ms.saturating_sub(*since) > self.config.no_hedge_stop_ms {
                 self.halt_reason = Some(format!(
                     "neither buy nor sell hedge found for more than {}ms",
@@ -169,7 +200,7 @@ impl ChaosStrategy {
                 return false;
             }
         } else {
-            self.no_hedge_found_since = None;
+            self.hedging.no_hedge_found_since = None;
         }
         true
     }
@@ -244,7 +275,7 @@ impl ChaosStrategy {
         if self.config.master_strategy.is_some() {
             return false;
         }
-        if self.now_ms < self.last_hedge_ms + self.config.min_hedge_interval_ms {
+        if self.now_ms < self.hedging.last_hedge_ms + self.config.min_hedge_interval_ms {
             return false;
         }
         self.delta_to_hedge().abs() >= self.config.active_hedge_threshold_usd
@@ -284,6 +315,7 @@ impl ChaosStrategy {
         }
         if targets.is_empty() {
             let hedges = self
+                .hedging
                 .best_hedges
                 .get(&hedge_side)
                 .map(Vec::as_slice)
@@ -294,7 +326,10 @@ impl ChaosStrategy {
 
         if targets.is_empty() {
             if !self.all_hedges_halted() {
-                let since = self.hedge_not_found_since.get_or_insert(self.now_ms);
+                let since = self
+                    .hedging
+                    .hedge_not_found_since
+                    .get_or_insert(self.now_ms);
                 if self.now_ms.saturating_sub(*since) > self.config.hedge_not_found_stop_ms {
                     self.halt_reason = Some(format!(
                         "delta hedge unavailable for more than {}ms",
@@ -304,10 +339,10 @@ impl ChaosStrategy {
             }
             return Vec::new();
         }
-        self.hedge_not_found_since = None;
+        self.hedging.hedge_not_found_since = None;
 
         if strategy_delta_hedge {
-            self.last_hedge_ms = self.now_ms;
+            self.hedging.last_hedge_ms = self.now_ms;
         }
         let source_label = source_symbol.unwrap_or("timer");
         targets
