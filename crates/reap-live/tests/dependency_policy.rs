@@ -766,7 +766,13 @@ fn workspace_relative(workspace: &Path, path: &Path) -> String {
 }
 
 fn production_rust_source(source: &str) -> &str {
+    for marker in [
+        "#[cfg(test)]\nmod tests",
+        "#[cfg(test)]\n#[path = \"../tests/runtime_unit/mod.rs\"]\nmod tests",
+    ] {
+        if let Some((production, _)) = source.split_once(marker) {
+            return production;
+        }
+    }
     source
-        .split_once("#[cfg(test)]\nmod tests")
-        .map_or(source, |(production, _)| production)
 }
