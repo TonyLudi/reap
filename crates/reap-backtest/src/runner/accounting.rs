@@ -12,7 +12,8 @@ impl BacktestRunner {
             return Ok(());
         }
         let commands = self.strategy.on_event(&StrategyEvent::Account(
-            self.initial_portfolio
+            self.accounting
+                .initial_portfolio
                 .account_update(time_ms(self.replay.now_ns)),
         ));
         if !commands.is_empty() {
@@ -50,21 +51,23 @@ impl BacktestRunner {
         }
         AccountUpdate {
             ts_ms: time_ms(self.replay.now_ns),
-            balances: if self.initial_portfolio.is_empty() {
+            balances: if self.accounting.initial_portfolio.is_empty() {
                 Vec::new()
             } else {
-                self.initial_portfolio
+                self.accounting
+                    .initial_portfolio
                     .balances
                     .iter()
                     .map(|balance| {
-                        let total = self.portfolio.account_balance(&balance.currency);
+                        let total = self.accounting.portfolio.account_balance(&balance.currency);
                         let change = total - balance.total;
                         Balance {
-                            account_id: self.initial_portfolio.account_id.clone(),
+                            account_id: self.accounting.initial_portfolio.account_id.clone(),
                             currency: balance.currency.clone(),
                             total,
                             available: balance.available() + change,
                             equity: self
+                                .accounting
                                 .portfolio
                                 .account_equity(&balance.currency, &marks)
                                 .unwrap_or_else(|| balance.equity() + change),
@@ -79,13 +82,15 @@ impl BacktestRunner {
                 .into_iter()
                 .map(|symbol| Position {
                     qty: self
+                        .accounting
                         .portfolio
                         .positions()
                         .get(&symbol)
                         .copied()
                         .unwrap_or(0.0),
-                    avg_price: self.portfolio.position_avg_price(&symbol),
+                    avg_price: self.accounting.portfolio.position_avg_price(&symbol),
                     margin_mode: self
+                        .accounting
                         .initial_portfolio
                         .positions
                         .iter()
@@ -99,7 +104,7 @@ impl BacktestRunner {
     }
 
     pub(super) fn schedule_next_account_refresh(&mut self) {
-        if self.initial_portfolio.is_empty() {
+        if self.accounting.initial_portfolio.is_empty() {
             return;
         }
         let due_ns = self
@@ -112,15 +117,19 @@ impl BacktestRunner {
     }
 
     fn current_margin_snapshots(&self, marks: &HashMap<Symbol, f64>) -> Vec<MarginSnapshot> {
-        if self.initial_portfolio.is_empty() {
+        if self.accounting.initial_portfolio.is_empty() {
             return Vec::new();
         }
         let currency_rates = self.fresh_currency_rates();
-        let Some(adjusted_equity_usd) = self.portfolio.equity_usd_checked(marks, &currency_rates)
+        let Some(adjusted_equity_usd) = self
+            .accounting
+            .portfolio
+            .equity_usd_checked(marks, &currency_rates)
         else {
             return Vec::new();
         };
         let Some(notional_usd) = self
+            .accounting
             .portfolio
             .derivative_notional_usd_checked(marks, &currency_rates)
         else {
@@ -128,7 +137,7 @@ impl BacktestRunner {
         };
         let ratio = (notional_usd > 0.0).then_some(adjusted_equity_usd / notional_usd);
         vec![MarginSnapshot {
-            account_id: self.initial_portfolio.account_id.clone(),
+            account_id: self.accounting.initial_portfolio.account_id.clone(),
             ratio,
             exchange_ratio: ratio.map(|ratio| {
                 ratio * self.execution.derivative_leverage * self.execution.exchange_cmr_multiplier

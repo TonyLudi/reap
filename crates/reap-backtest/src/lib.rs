@@ -47,7 +47,6 @@ use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::HashMap;
 
-use crate::portfolio::Portfolio;
 use reap_core::{AccountUpdate, MarketEvent, OrderUpdate, StrategyEvent, Symbol};
 #[cfg(test)]
 use reap_core::{FillLiquidity, FundingSettlement, NormalizedEvent, OrderEvent, OrderIntent};
@@ -242,7 +241,9 @@ mod runner_state;
 #[path = "runner/valuation.rs"]
 mod runner_valuation;
 use runner_construction::validate_currency_rate_coverage;
-use runner_state::{FundingState, OrderLifecycleState, ReplayState, ScheduleState, ValuationState};
+use runner_state::{
+    AccountingState, FundingState, OrderLifecycleState, ReplayState, ScheduleState, ValuationState,
+};
 
 #[derive(Debug)]
 enum ScheduledAction {
@@ -275,8 +276,6 @@ struct CurrencyRateObservation {
 pub struct BacktestRunner {
     strategy_config: ChaosConfig,
     strategy: ChaosStrategy,
-    portfolio: Portfolio,
-    initial_portfolio: BacktestInitialPortfolioConfig,
     execution: BacktestExecutionConfig,
     latency_sampler: BacktestLatencySampler,
     replay: ReplayState,
@@ -284,12 +283,7 @@ pub struct BacktestRunner {
     orders: OrderLifecycleState,
     valuation: ValuationState,
     funding: FundingState,
-    funding_rate_events: u64,
-    funding_settlements: u64,
-    late_funding_rate_events: u64,
-    invalid_funding_rate_events: u64,
-    missed_funding_settlements: u64,
-    funding_settlement_failures: u64,
+    accounting: AccountingState,
     peak_equity_usd: f64,
     max_drawdown_usd: f64,
     max_abs_delta_usd: f64,

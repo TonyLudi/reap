@@ -6,10 +6,10 @@ use reap_strategy::{ChaosConfig, ChaosStrategy};
 use crate::execution::BacktestLatencySampler;
 use crate::portfolio::{Portfolio, required_accounting_currencies};
 use crate::{
-    BacktestCarryState, BacktestConfig, BacktestExecutionConfig, BacktestInitialPortfolioConfig,
-    BacktestRunner, BacktestTimeBasis, CurrencyRateObservation, FundingState, MatchingAssumptions,
-    MatchingEngine, OrderLifecycleState, ReplayState, ScheduleState, ScheduledAction,
-    ValuationState,
+    AccountingState, BacktestCarryState, BacktestConfig, BacktestExecutionConfig,
+    BacktestInitialPortfolioConfig, BacktestRunner, BacktestTimeBasis, CurrencyRateObservation,
+    FundingState, MatchingAssumptions, MatchingEngine, OrderLifecycleState, ReplayState,
+    ScheduleState, ScheduledAction, ValuationState,
 };
 
 impl BacktestRunner {
@@ -137,8 +137,6 @@ impl BacktestRunner {
             ChaosStrategy::new(config.clone()).context("invalid chaos/iarb2 configuration")?;
         Ok(Self {
             strategy_config: config,
-            portfolio,
-            initial_portfolio,
             strategy,
             execution,
             latency_sampler,
@@ -193,12 +191,16 @@ impl BacktestRunner {
                 settled_funding: HashSet::new(),
                 last_settled_funding_time_ms: BTreeMap::new(),
             },
-            funding_rate_events: 0,
-            funding_settlements: 0,
-            late_funding_rate_events: 0,
-            invalid_funding_rate_events: 0,
-            missed_funding_settlements: 0,
-            funding_settlement_failures: 0,
+            accounting: AccountingState {
+                portfolio,
+                initial_portfolio,
+                funding_rate_events: 0,
+                funding_settlements: 0,
+                late_funding_rate_events: 0,
+                invalid_funding_rate_events: 0,
+                missed_funding_settlements: 0,
+                funding_settlement_failures: 0,
+            },
             peak_equity_usd: 0.0,
             max_drawdown_usd: 0.0,
             max_abs_delta_usd: 0.0,

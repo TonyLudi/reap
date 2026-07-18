@@ -304,7 +304,7 @@ impl BacktestRunner {
         accounting_complete: bool,
     ) -> (Option<BacktestCarryState>, Vec<String>) {
         let mut failures = Vec::new();
-        if self.initial_portfolio.is_empty() {
+        if self.accounting.initial_portfolio.is_empty() {
             failures.push("settled carry requires a non-empty opening portfolio".to_string());
         }
         if !final_valuation_complete || terminal_equity_usd.is_none() {
@@ -323,8 +323,8 @@ impl BacktestRunner {
         }
 
         let build = (|| -> Result<BacktestCarryState> {
-            let portfolio = self.portfolio.settled_initial_portfolio(
-                &self.initial_portfolio,
+            let portfolio = self.accounting.portfolio.settled_initial_portfolio(
+                &self.accounting.initial_portfolio,
                 marks,
                 currency_rates,
                 self.execution.derivative_leverage,

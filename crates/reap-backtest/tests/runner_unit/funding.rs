@@ -10,7 +10,7 @@ fn realized_funding_rate_settles_signed_linear_swap_position() {
         .valuation
         .depth_marks
         .insert("BTC-PERP".to_string(), 50_000.0);
-    runner.portfolio.apply_fill(
+    runner.accounting.portfolio.apply_fill(
         &OrderUpdate {
             ts_ms: 0,
             order_id: "initial-fill".to_string(),

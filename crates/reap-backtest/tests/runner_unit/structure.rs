@@ -25,24 +25,17 @@ fn collect_runner_module_sources(directory: &Path, sources: &mut Vec<(String, St
 fn production_runner_keeps_single_owner_responsibility_state() {
     const TEST_MODULE_MARKER: &str =
         "#[cfg(test)]\n#[path = \"../tests/runner_unit/mod.rs\"]\nmod tests";
-    const ROOT_FIELDS: [&str; 31] = [
+    const ROOT_FIELDS: [&str; 24] = [
         "strategy_config: ChaosConfig",
         "strategy: ChaosStrategy",
         "orders: OrderLifecycleState",
-        "portfolio: Portfolio",
-        "initial_portfolio: BacktestInitialPortfolioConfig",
+        "accounting: AccountingState",
         "execution: BacktestExecutionConfig",
         "latency_sampler: BacktestLatencySampler",
         "replay: ReplayState",
         "schedule: ScheduleState",
         "valuation: ValuationState",
         "funding: FundingState",
-        "funding_rate_events: u64",
-        "funding_settlements: u64",
-        "late_funding_rate_events: u64",
-        "invalid_funding_rate_events: u64",
-        "missed_funding_settlements: u64",
-        "funding_settlement_failures: u64",
         "peak_equity_usd: f64",
         "max_drawdown_usd: f64",
         "max_abs_delta_usd: f64",

@@ -17,6 +17,7 @@ impl BacktestRunner {
 
     pub(super) fn sample_risk_metrics(&mut self) {
         self.current_inventory_open = self
+            .accounting
             .portfolio
             .positions()
             .values()
@@ -28,13 +29,18 @@ impl BacktestRunner {
         let mut valid = true;
         let marks = self.valuation_marks();
         let currency_rates = self.fresh_currency_rates();
-        if let Some(equity_usd) = self.portfolio.equity_usd_checked(&marks, &currency_rates) {
+        if let Some(equity_usd) = self
+            .accounting
+            .portfolio
+            .equity_usd_checked(&marks, &currency_rates)
+        {
             self.peak_equity_usd = self.peak_equity_usd.max(equity_usd);
             self.max_drawdown_usd = self.max_drawdown_usd.max(self.peak_equity_usd - equity_usd);
         } else {
             valid = false;
         }
         if let Some(gross_exposure_usd) = self
+            .accounting
             .portfolio
             .gross_exposure_usd_checked(&marks, &currency_rates)
         {

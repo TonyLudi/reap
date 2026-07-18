@@ -2,8 +2,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use reap_core::Symbol;
 
+use crate::portfolio::Portfolio;
 use crate::{
-    BacktestTimeBasis, CurrencyRateObservation, MatchingEngine, RawReplayBoundary, ScheduledAction,
+    BacktestInitialPortfolioConfig, BacktestTimeBasis, CurrencyRateObservation, MatchingEngine,
+    RawReplayBoundary, ScheduledAction,
 };
 
 pub(super) struct ReplayState {
@@ -60,4 +62,15 @@ pub(super) struct FundingState {
     pub(super) scheduled_funding: HashSet<(Symbol, u64)>,
     pub(super) settled_funding: HashSet<(Symbol, u64)>,
     pub(super) last_settled_funding_time_ms: BTreeMap<Symbol, u64>,
+}
+
+pub(super) struct AccountingState {
+    pub(super) portfolio: Portfolio,
+    pub(super) initial_portfolio: BacktestInitialPortfolioConfig,
+    pub(super) funding_rate_events: u64,
+    pub(super) funding_settlements: u64,
+    pub(super) late_funding_rate_events: u64,
+    pub(super) invalid_funding_rate_events: u64,
+    pub(super) missed_funding_settlements: u64,
+    pub(super) funding_settlement_failures: u64,
 }

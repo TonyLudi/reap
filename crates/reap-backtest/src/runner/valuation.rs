@@ -119,6 +119,7 @@ impl BacktestRunner {
                     return Some(total);
                 }
                 let rate = self
+                    .accounting
                     .portfolio
                     .notional_currency_rate_usd_checked(symbol, currency_rates)?;
                 let value = notional * rate;
@@ -135,6 +136,7 @@ impl BacktestRunner {
                 matcher.active_order_notional_checked().map(|notional| {
                     notional
                         * self
+                            .accounting
                             .portfolio
                             .notional_currency_rate_usd(symbol, currency_rates)
                 })
@@ -173,8 +175,10 @@ impl BacktestRunner {
         if self.valuation.opening_equity_usd.is_none() && self.valuation_inputs_ready() {
             let marks = self.valuation_marks();
             let currency_rates = self.fresh_currency_rates();
-            if let Some(opening_equity_usd) =
-                self.portfolio.equity_usd_checked(&marks, &currency_rates)
+            if let Some(opening_equity_usd) = self
+                .accounting
+                .portfolio
+                .equity_usd_checked(&marks, &currency_rates)
             {
                 self.valuation.opening_equity_usd = Some(opening_equity_usd);
                 self.valuation.opening_valuation_at_ns = Some(self.replay.now_ns);

@@ -20,10 +20,14 @@ impl BacktestRunner {
             .filter(|report| !report.usable)
             .map(|report| report.currency.clone())
             .collect::<Vec<_>>();
-        let checked_final_equity = self.portfolio.equity_usd_checked(&marks, &currency_rates);
+        let checked_final_equity = self
+            .accounting
+            .portfolio
+            .equity_usd_checked(&marks, &currency_rates);
         let checked_final_active_order_notional =
             self.active_order_notional_usd_checked(&currency_rates);
         let checked_final_gross_exposure = self
+            .accounting
             .portfolio
             .gross_exposure_usd_checked(&marks, &currency_rates);
         let final_delta_usd = self.strategy.delta_usd();
@@ -34,8 +38,11 @@ impl BacktestRunner {
             && currency_rate_coverage_complete
             && final_delta_usd.is_finite()
             && final_pending_delta_usd.is_finite();
-        let final_equity_usd = checked_final_equity
-            .unwrap_or_else(|| self.portfolio.equity_usd(&marks, &fallback_currency_rates));
+        let final_equity_usd = checked_final_equity.unwrap_or_else(|| {
+            self.accounting
+                .portfolio
+                .equity_usd(&marks, &fallback_currency_rates)
+        });
         let opening_valuation_complete = self.valuation.opening_equity_usd.is_some();
         let net_pnl_usd = if final_valuation_complete {
             self.valuation
@@ -48,7 +55,8 @@ impl BacktestRunner {
         let final_active_order_notional_usd = checked_final_active_order_notional
             .unwrap_or_else(|| self.active_order_notional_usd(&fallback_currency_rates));
         let final_gross_exposure_usd = checked_final_gross_exposure.unwrap_or_else(|| {
-            self.portfolio
+            self.accounting
+                .portfolio
                 .gross_exposure_usd_checked(&marks, &fallback_currency_rates)
                 .unwrap_or(0.0)
         });
@@ -80,13 +88,13 @@ impl BacktestRunner {
                 ScheduledAction::SettleFunding { .. } => pending_funding_actions += 1,
             }
         }
-        let accounting_complete = self.late_funding_rate_events == 0
-            && self.invalid_funding_rate_events == 0
-            && self.missed_funding_settlements == 0
-            && self.funding_settlement_failures == 0
+        let accounting_complete = self.accounting.late_funding_rate_events == 0
+            && self.accounting.invalid_funding_rate_events == 0
+            && self.accounting.missed_funding_settlements == 0
+            && self.accounting.funding_settlement_failures == 0
             && self.valuation.invalid_currency_rate_events == 0
-            && self.portfolio.currency_conversion_failures() == 0
-            && self.portfolio.invalid_accounting_events() == 0
+            && self.accounting.portfolio.currency_conversion_failures() == 0
+            && self.accounting.portfolio.invalid_accounting_events() == 0
             && self.invalid_risk_metric_samples == 0
             && opening_valuation_complete
             && net_pnl_usd.is_some()
@@ -125,7 +133,7 @@ impl BacktestRunner {
 
         Ok(BacktestReport {
             execution: self.execution.clone(),
-            initial_portfolio: self.initial_portfolio.clone(),
+            initial_portfolio: self.accounting.initial_portfolio.clone(),
             latency_usage: self.latency_sampler.usage(),
             time_basis: self.replay.time_basis,
             raw_replay_boundary: self.replay.raw_replay_boundary.clone(),
@@ -168,29 +176,30 @@ impl BacktestRunner {
             net_pnl_usd,
             final_valuation_complete,
             final_gross_exposure_usd,
-            cash_usd: self.portfolio.cash_usd(&fallback_currency_rates),
-            cash_by_currency: self.portfolio.cash_by_currency(),
-            inverse_cash_coin_by_symbol: self.portfolio.inverse_cash_coin_by_symbol(),
+            cash_usd: self.accounting.portfolio.cash_usd(&fallback_currency_rates),
+            cash_by_currency: self.accounting.portfolio.cash_by_currency(),
+            inverse_cash_coin_by_symbol: self.accounting.portfolio.inverse_cash_coin_by_symbol(),
             account_balances: self
+                .accounting
                 .initial_portfolio
                 .balances
                 .iter()
                 .map(|balance| {
                     (
                         balance.currency.clone(),
-                        self.portfolio.account_balance(&balance.currency),
+                        self.accounting.portfolio.account_balance(&balance.currency),
                     )
                 })
                 .collect(),
-            fee_cost_usd: self.portfolio.fee_cost_usd(),
-            exact_fee_fills: self.portfolio.exact_fee_fills(),
-            estimated_fee_fills: self.portfolio.estimated_fee_fills(),
-            funding_pnl_usd: self.portfolio.funding_pnl_usd(),
-            turnover_usd: self.portfolio.turnover_usd(),
+            fee_cost_usd: self.accounting.portfolio.fee_cost_usd(),
+            exact_fee_fills: self.accounting.portfolio.exact_fee_fills(),
+            estimated_fee_fills: self.accounting.portfolio.estimated_fee_fills(),
+            funding_pnl_usd: self.accounting.portfolio.funding_pnl_usd(),
+            turnover_usd: self.accounting.portfolio.turnover_usd(),
             currency_rate_events: self.valuation.currency_rate_events,
             invalid_currency_rate_events: self.valuation.invalid_currency_rate_events,
-            currency_conversion_failures: self.portfolio.currency_conversion_failures(),
-            invalid_accounting_events: self.portfolio.invalid_accounting_events(),
+            currency_conversion_failures: self.accounting.portfolio.currency_conversion_failures(),
+            invalid_accounting_events: self.accounting.portfolio.invalid_accounting_events(),
             currency_rate_coverage_complete,
             missing_currency_rates,
             currency_rates: currency_rate_reports,
@@ -206,27 +215,34 @@ impl BacktestRunner {
             inventory_open_fraction,
             risk_metric_samples: self.risk_metric_samples,
             invalid_risk_metric_samples: self.invalid_risk_metric_samples,
-            funding_rate_events: self.funding_rate_events,
+            funding_rate_events: self.accounting.funding_rate_events,
             funding_settlement_observations: self.funding.realized_funding_rates.len() as u64,
-            funding_settlements: self.funding_settlements,
-            late_funding_rate_events: self.late_funding_rate_events,
-            invalid_funding_rate_events: self.invalid_funding_rate_events,
-            missed_funding_settlements: self.missed_funding_settlements,
-            funding_settlement_failures: self.funding_settlement_failures,
+            funding_settlements: self.accounting.funding_settlements,
+            late_funding_rate_events: self.accounting.late_funding_rate_events,
+            invalid_funding_rate_events: self.accounting.invalid_funding_rate_events,
+            missed_funding_settlements: self.accounting.missed_funding_settlements,
+            funding_settlement_failures: self.accounting.funding_settlement_failures,
             accounting_complete,
             settled_carry_state,
             carry_state_failures,
             positions: self
+                .accounting
                 .portfolio
                 .positions()
                 .iter()
                 .map(|(symbol, quantity)| (symbol.clone(), *quantity))
                 .collect(),
             position_avg_prices: self
+                .accounting
                 .portfolio
                 .positions()
                 .keys()
-                .map(|symbol| (symbol.clone(), self.portfolio.position_avg_price(symbol)))
+                .map(|symbol| {
+                    (
+                        symbol.clone(),
+                        self.accounting.portfolio.position_avg_price(symbol),
+                    )
+                })
                 .collect(),
         })
     }

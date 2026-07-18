@@ -32,7 +32,9 @@ impl BacktestRunner {
                     None => {}
                 }
                 let currency_rates = self.fresh_currency_rates();
-                self.portfolio.apply_fill(&update, &currency_rates);
+                self.accounting
+                    .portfolio
+                    .apply_fill(&update, &currency_rates);
                 self.sample_risk_metrics();
                 Some(self.current_account_update(Some(&update.symbol)))
             } else {

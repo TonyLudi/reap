@@ -5,9 +5,12 @@ use crate::{BacktestRunner, FUNDING_LATE_TOLERANCE_NS, NS_PER_MS, ScheduledActio
 
 impl BacktestRunner {
     pub(super) fn register_funding_rate(&mut self, symbol: &str, rate: f64, funding_time_ms: u64) {
-        self.funding_rate_events += 1;
-        if !self.portfolio.supports_funding(symbol) || !rate.is_finite() || funding_time_ms == 0 {
-            self.invalid_funding_rate_events += 1;
+        self.accounting.funding_rate_events += 1;
+        if !self.accounting.portfolio.supports_funding(symbol)
+            || !rate.is_finite()
+            || funding_time_ms == 0
+        {
+            self.accounting.invalid_funding_rate_events += 1;
             return;
         }
 
@@ -30,11 +33,11 @@ impl BacktestRunner {
             self.funding.scheduled_funding.remove(&key);
             self.funding.settled_funding.insert(key.clone());
             self.record_settled_funding(&key.0, key.1);
-            self.missed_funding_settlements += 1;
+            self.accounting.missed_funding_settlements += 1;
             return;
         }
         let due_ns = if funding_time_ns < self.replay.now_ns {
-            self.late_funding_rate_events += 1;
+            self.accounting.late_funding_rate_events += 1;
             self.replay.now_ns
         } else {
             funding_time_ns
@@ -91,11 +94,11 @@ impl BacktestRunner {
         }
         self.record_settled_funding(&symbol, funding_time_ms);
         let Some(rate) = self.funding.realized_funding_rates.get(&key).copied() else {
-            self.funding_settlement_failures += 1;
+            self.accounting.funding_settlement_failures += 1;
             return;
         };
         if self.valuation.opening_equity_usd.is_none() {
-            self.funding_settlement_failures += 1;
+            self.accounting.funding_settlement_failures += 1;
             return;
         }
         let mark = self
@@ -107,13 +110,14 @@ impl BacktestRunner {
             .unwrap_or(f64::NAN);
         let currency_rates = self.fresh_currency_rates();
         if self
+            .accounting
             .portfolio
             .apply_funding(&symbol, rate, mark, &currency_rates)
             .is_some()
         {
-            self.funding_settlements += 1;
+            self.accounting.funding_settlements += 1;
         } else {
-            self.funding_settlement_failures += 1;
+            self.accounting.funding_settlement_failures += 1;
         }
     }
 
