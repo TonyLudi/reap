@@ -578,6 +578,16 @@ fn collect_coordinator_module_sources(
     }
 }
 
+fn contains_rust_identifier(source: &str, identifier: &str) -> bool {
+    source.match_indices(identifier).any(|(start, _)| {
+        let before = source[..start].chars().next_back();
+        let after = source[start + identifier.len()..].chars().next();
+        let is_identifier_character =
+            |character: char| character.is_ascii_alphanumeric() || character == '_';
+        !before.is_some_and(is_identifier_character) && !after.is_some_and(is_identifier_character)
+    })
+}
+
 #[test]
 fn production_coordinator_keeps_single_owner_responsibility_state() {
     const TEST_MODULE_MARKER: &str =
@@ -587,6 +597,7 @@ fn production_coordinator_keeps_single_owner_responsibility_state() {
     let root_path = manifest.join("src/coordinator.rs");
     let root_source = std::fs::read_to_string(&root_path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", root_path.display()));
+    let root_path_string = root_path.display().to_string();
     let (production_root, _) = root_source
         .split_once(TEST_MODULE_MARKER)
         .expect("coordinator test module marker");
@@ -618,9 +629,34 @@ fn production_coordinator_keeps_single_owner_responsibility_state() {
     ] {
         assert!(
             production_root.contains(field),
-            "LiveCoordinator is missing sole-owner state `{field}`",
+            "sole-owner state `{field}` must remain on the root LiveCoordinator",
         );
+        for (path, source) in sources.iter().filter(|(path, _)| path != &root_path_string) {
+            assert!(
+                !source.contains(field),
+                "{path} must not redeclare sole-owner state `{field}`",
+            );
+        }
     }
+    assert_eq!(
+        production_root.matches(".register_recovered(").count(),
+        2,
+        "production and test recovery seams must remain one-for-one on the root coordinator",
+    );
+    assert_eq!(
+        sources
+            .iter()
+            .filter(|(path, _)| path != &root_path_string)
+            .map(|(_, source)| source.matches(".register_recovered(").count())
+            .sum::<usize>(),
+        0,
+        "child coordinator reducers must not register recovered ownership authority",
+    );
+    assert!(
+        production_root.contains("ProvenRegularSubmitRequest"),
+        "durable recovered-submit proof handling must remain on the root coordinator",
+    );
+
     for (path, source) in sources {
         let compact = source
             .chars()
@@ -634,5 +670,23 @@ fn production_coordinator_keeps_single_owner_responsibility_state() {
             !source.contains("use super::*;"),
             "{path} must declare explicit production dependencies",
         );
+        if path != root_path_string {
+            for authority_type in [
+                "TradingEngine",
+                "StartupGate",
+                "PrivateStateReducer",
+                "RegularExecutionPolicy",
+                "OwnedRegularOrders",
+                "ClientOrderIdGenerator",
+                "ProvenRegularSubmitRequest",
+                "ReservedRegularSubmit",
+                "ApprovedRegularCancel",
+            ] {
+                assert!(
+                    !contains_rust_identifier(&source, authority_type),
+                    "{path} must not declare, accept, or mint authority-bearing `{authority_type}` state",
+                );
+            }
+        }
     }
 }
