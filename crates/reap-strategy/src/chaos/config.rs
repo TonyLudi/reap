@@ -181,6 +181,20 @@ impl ChaosConfig {
 
     pub fn validate(&self) -> ConfigValidation {
         let mut errors = Vec::new();
+        self.validate_top_level_fields(&mut errors);
+        let symbols = self.validate_instruments(&mut errors);
+        self.validate_reference_instrument(&symbols, &mut errors);
+        let (group_names, grouped_symbols) = self.validate_risk_groups(&symbols, &mut errors);
+        self.validate_instrument_membership_and_hedges(&group_names, &grouped_symbols, &mut errors);
+        self.validate_coin_offset(&mut errors);
+
+        ConfigValidation {
+            valid: errors.is_empty(),
+            errors,
+        }
+    }
+
+    fn validate_top_level_fields(&self, errors: &mut Vec<String>) {
         if self.strategy_name.trim().is_empty() {
             errors.push("strategy_name must not be empty".to_string());
         }
@@ -207,31 +221,29 @@ impl ChaosConfig {
                     .to_string(),
             );
         }
-        check_finite("coin_offset", self.coin_offset, &mut errors);
-        check_positive("risk_multiplier", self.risk_multiplier, &mut errors);
+        check_finite("coin_offset", self.coin_offset, errors);
+        check_positive("risk_multiplier", self.risk_multiplier, errors);
         check_positive(
             "balance_sheet_limit_usd",
             self.balance_sheet_limit_usd,
-            &mut errors,
+            errors,
         );
-        check_positive("delta_limit_usd", self.delta_limit_usd, &mut errors);
-        check_positive("pnl_limit_usd", self.pnl_limit_usd, &mut errors);
+        check_positive("delta_limit_usd", self.delta_limit_usd, errors);
+        check_positive("pnl_limit_usd", self.pnl_limit_usd, errors);
         check_non_negative(
             "active_hedge_threshold_usd",
             self.active_hedge_threshold_usd,
-            &mut errors,
+            errors,
         );
-        check_non_negative(
-            "index_deviation_limit",
-            self.index_deviation_limit,
-            &mut errors,
-        );
+        check_non_negative("index_deviation_limit", self.index_deviation_limit, errors);
         if self.reference_data_stale_threshold_ms == Some(0) {
             errors.push(
                 "reference_data_stale_threshold_ms must be positive when configured".to_string(),
             );
         }
+    }
 
+    fn validate_instruments(&self, errors: &mut Vec<String>) -> HashSet<Symbol> {
         let mut symbols = HashSet::new();
         for instrument in &self.instruments {
             if instrument.symbol.trim().is_empty() {
@@ -248,32 +260,32 @@ impl ChaosConfig {
             check_positive(
                 &format!("{}.tick_size", instrument.symbol),
                 instrument.tick_size,
-                &mut errors,
+                errors,
             );
             check_positive(
                 &format!("{}.lot_size", instrument.symbol),
                 instrument.lot_size,
-                &mut errors,
+                errors,
             );
             check_positive(
                 &format!("{}.max_order_size", instrument.symbol),
                 instrument.max_order_size,
-                &mut errors,
+                errors,
             );
             check_positive(
                 &format!("{}.max_order_size_usd", instrument.symbol),
                 instrument.max_order_size_usd,
-                &mut errors,
+                errors,
             );
             check_positive(
                 &format!("{}.safety_multiplier", instrument.symbol),
                 instrument.safety_multiplier,
-                &mut errors,
+                errors,
             );
             check_non_negative(
                 &format!("{}.min_order_size_usd", instrument.symbol),
                 instrument.min_order_size_usd,
-                &mut errors,
+                errors,
             );
             if instrument.num_quote_levels == 0 {
                 errors.push(format!(
@@ -284,22 +296,22 @@ impl ChaosConfig {
             check_non_negative(
                 &format!("{}.min_level_spread", instrument.symbol),
                 instrument.min_level_spread,
-                &mut errors,
+                errors,
             );
             check_non_negative(
                 &format!("{}.max_level_spread", instrument.symbol),
                 instrument.max_level_spread,
-                &mut errors,
+                errors,
             );
             check_non_negative(
                 &format!("{}.debounce_width", instrument.symbol),
                 instrument.debounce_width,
-                &mut errors,
+                errors,
             );
             check_non_negative(
                 &format!("{}.debounce_size_usd", instrument.symbol),
                 instrument.debounce_size_usd,
-                &mut errors,
+                errors,
             );
             if instrument.min_level_spread > instrument.max_level_spread {
                 errors.push(format!(
@@ -322,7 +334,7 @@ impl ChaosConfig {
             check_positive(
                 &format!("{}.min_trade_size", instrument.symbol),
                 instrument.min_trade_size,
-                &mut errors,
+                errors,
             );
             for (field, value) in [
                 ("maker_fee", instrument.maker_fee),
@@ -346,11 +358,7 @@ impl ChaosConfig {
                 ),
                 ("price_limit_buffer", instrument.price_limit_buffer),
             ] {
-                check_finite(
-                    &format!("{}.{field}", instrument.symbol),
-                    value,
-                    &mut errors,
-                );
+                check_finite(&format!("{}.{field}", instrument.symbol), value, errors);
             }
             if instrument.taker_fee < instrument.maker_fee {
                 errors.push(format!(
@@ -383,11 +391,7 @@ impl ChaosConfig {
                 ("hedge_profit_margin", instrument.hedge_profit_margin),
                 ("quote_profit_margin", instrument.quote_profit_margin),
             ] {
-                check_positive(
-                    &format!("{}.{field}", instrument.symbol),
-                    value,
-                    &mut errors,
-                );
+                check_positive(&format!("{}.{field}", instrument.symbol), value, errors);
             }
             for (field, value) in [
                 ("hedge_aggression", instrument.hedge_aggression),
@@ -396,11 +400,7 @@ impl ChaosConfig {
                 ("pos_extra_skew", instrument.pos_extra_skew),
                 ("neg_extra_skew", instrument.neg_extra_skew),
             ] {
-                check_non_negative(
-                    &format!("{}.{field}", instrument.symbol),
-                    value,
-                    &mut errors,
-                );
+                check_non_negative(&format!("{}.{field}", instrument.symbol), value, errors);
             }
             if instrument.min_order_size_usd > instrument.max_order_size_usd {
                 errors.push(format!(
@@ -424,7 +424,7 @@ impl ChaosConfig {
                 check_positive(
                     &format!("{}.contract_value", instrument.symbol),
                     instrument.contract_value,
-                    &mut errors,
+                    errors,
                 );
             }
             for interval in &instrument.halt_intervals {
@@ -436,6 +436,10 @@ impl ChaosConfig {
                 }
             }
         }
+        symbols
+    }
+
+    fn validate_reference_instrument(&self, symbols: &HashSet<Symbol>, errors: &mut Vec<String>) {
         if self.ref_symbol.trim().is_empty() {
             errors.push("ref_symbol must not be empty".to_string());
         } else if !symbols.contains(&self.ref_symbol) {
@@ -454,7 +458,13 @@ impl ChaosConfig {
                 self.ref_symbol
             ));
         }
+    }
 
+    fn validate_risk_groups(
+        &self,
+        symbols: &HashSet<Symbol>,
+        errors: &mut Vec<String>,
+    ) -> (HashSet<String>, HashSet<Symbol>) {
         let mut group_names = HashSet::new();
         let mut grouped_symbols = HashSet::new();
         let mut account_coin_owner: HashMap<(Option<String>, String), String> = HashMap::new();
@@ -470,32 +480,32 @@ impl ChaosConfig {
             check_positive(
                 &format!("{}.soft_delta_limit_usd", group.name),
                 group.soft_delta_limit_usd,
-                &mut errors,
+                errors,
             );
             check_positive(
                 &format!("{}.hard_delta_limit_usd", group.name),
                 group.hard_delta_limit_usd,
-                &mut errors,
+                errors,
             );
             check_positive(
                 &format!("{}.delta_stop_limit_usd", group.name),
                 group.delta_stop_limit_usd,
-                &mut errors,
+                errors,
             );
             check_positive(
                 &format!("{}.live_order_limit_usd", group.name),
                 group.live_order_limit_usd,
-                &mut errors,
+                errors,
             );
             check_positive(
                 &format!("{}.turnover_limit_usd", group.name),
                 group.turnover_limit_usd,
-                &mut errors,
+                errors,
             );
             check_non_negative(
                 &format!("{}.min_margin_level", group.name),
                 group.min_margin_level,
-                &mut errors,
+                errors,
             );
             if group.min_margin_level < 0.2 {
                 errors.push(format!(
@@ -506,12 +516,12 @@ impl ChaosConfig {
             check_non_negative(
                 &format!("{}.basis_limit", group.name),
                 group.basis_limit,
-                &mut errors,
+                errors,
             );
             check_finite(
                 &format!("{}.coin_offset", group.name),
                 group.coin_offset,
-                &mut errors,
+                errors,
             );
             if !(group.soft_delta_limit_usd <= group.hard_delta_limit_usd
                 && group.hard_delta_limit_usd <= group.delta_stop_limit_usd)
@@ -638,17 +648,17 @@ impl ChaosConfig {
                 check_non_negative(
                     &format!("{}.{}.borrow_limit_usd", group.name, coin.currency),
                     coin.borrow_limit_usd,
-                    &mut errors,
+                    errors,
                 );
                 check_non_negative(
                     &format!("{}.{}.borrow_limit_coin", group.name, coin.currency),
                     coin.borrow_limit_coin,
-                    &mut errors,
+                    errors,
                 );
                 check_positive(
                     &format!("{}.{}.safety_multiplier", group.name, coin.currency),
                     coin.safety_multiplier,
-                    &mut errors,
+                    errors,
                 );
                 for (field, value) in [
                     ("buy_skew", coin.buy_skew),
@@ -659,7 +669,7 @@ impl ChaosConfig {
                     check_non_negative(
                         &format!("{}.{}.{field}", group.name, coin.currency),
                         value,
-                        &mut errors,
+                        errors,
                     );
                 }
                 if coin.skew_type.is_none()
@@ -676,6 +686,15 @@ impl ChaosConfig {
                 }
             }
         }
+        (group_names, grouped_symbols)
+    }
+
+    fn validate_instrument_membership_and_hedges(
+        &self,
+        group_names: &HashSet<String>,
+        grouped_symbols: &HashSet<Symbol>,
+        errors: &mut Vec<String>,
+    ) {
         for instrument in &self.instruments {
             if !group_names.contains(&instrument.risk_group) {
                 errors.push(format!(
@@ -708,7 +727,9 @@ impl ChaosConfig {
                 ));
             }
         }
+    }
 
+    fn validate_coin_offset(&self, errors: &mut Vec<String>) {
         let risk_group_coin_offset = self
             .risk_groups
             .iter()
@@ -719,11 +740,6 @@ impl ChaosConfig {
                 "coin_offset {} must equal the sum of risk-group offsets {}",
                 self.coin_offset, risk_group_coin_offset
             ));
-        }
-
-        ConfigValidation {
-            valid: errors.is_empty(),
-            errors,
         }
     }
 }
