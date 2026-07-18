@@ -7,9 +7,10 @@ use reap_venue::{PrivateOrderState, RemoteFill, RemoteOrder};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use super::recovery::remote_order_id;
 use super::{
     FillConvergenceGuard, OrderStateConvergenceGuard, ReconcileOrderRef, ReconcileTaskCommand,
-    RuntimeEvent, remote_order_id, unix_time_ms,
+    RuntimeEvent, unix_time_ms,
 };
 
 pub(super) struct ReconciliationState {

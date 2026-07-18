@@ -16,14 +16,15 @@ use reap_order::{
 };
 use reap_risk::{InstrumentOrderLimits, InstrumentRiskModel, RiskLimits, StablecoinGuardConfig};
 use reap_storage::{
-    OrderAckStatus, StorageRuntime, StorageSink, acquire_storage_lease, recover_jsonl,
-    recover_leased_jsonl, start_jsonl_storage,
+    OrderAckStatus, RecoveredStorage, StorageRuntime, StorageSink, acquire_storage_lease,
+    recover_jsonl, recover_leased_jsonl, start_jsonl_storage,
 };
 use reap_strategy::{
     ChaosConfig, ChaosExecutionIntent, ChaosStrategy, InstrumentConfig, InstrumentKindConfig,
     ReferenceDataKind, RiskGroupConfig,
 };
 use reap_telemetry::AlertSink;
+use reap_venue::PrivateOrderState;
 use reap_venue::okx::{
     OkxAccountConfig, OkxAccountLevel, OkxApiKeyPermission, OkxFillPage, OkxInstrumentChange,
     OkxInstrumentChangeParameter, OkxInstrumentType, OkxOrderAck, OkxPositionMode,
@@ -68,6 +69,7 @@ fn production_runtime_keeps_single_owner_responsibility_state() {
         include_str!("../../src/runtime/planning.rs"),
         include_str!("../../src/runtime/readiness_safety.rs"),
         include_str!("../../src/runtime/reconciliation.rs"),
+        include_str!("../../src/runtime/recovery.rs"),
         include_str!("../../src/runtime/shutdown.rs"),
     ];
 

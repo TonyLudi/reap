@@ -457,7 +457,7 @@ fn regular_order_authority_construction_is_source_allowlisted() {
         recovered_storage_proof_mentions,
         BTreeSet::from([
             "crates/reap-live/src/coordinator.rs".to_string(),
-            "crates/reap-live/src/runtime.rs".to_string(),
+            "crates/reap-live/src/runtime/recovery.rs".to_string(),
             "crates/reap-order/src/authority.rs".to_string(),
             "crates/reap-storage/src/lib.rs".to_string(),
         ]),

@@ -20,7 +20,8 @@ use super::readiness_safety::{
     exchange_status_block_reason, rest_clock_skew_ms, verify_initial_exchange_fees,
     verify_initial_exchange_instruments,
 };
-use super::{LiveRuntimeError, remote_order_id, unix_time_ms};
+use super::recovery::remote_order_id;
+use super::{LiveRuntimeError, unix_time_ms};
 
 pub(super) struct AccountSeed {
     pub(super) account_id: String,
