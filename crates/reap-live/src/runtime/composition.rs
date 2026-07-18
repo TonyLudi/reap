@@ -1,14 +1,14 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use reap_core::OrderStatus;
+use reap_core::{OrderStatus, SystemEventKind};
 use reap_storage::{OrderAckStatus, OrderOperation, StorageRecord, StorageRuntime, StorageSink};
 
 use crate::safety_contracts::LiveCleanSoakInputs;
 
 use super::{
     LiveConfigFileEvidence, LiveFailureEvidence, LiveLatencyCollector, LiveMode, LiveRuntimeError,
-    LiveStopReason, MAX_LIVE_FAILURE_MESSAGE_BYTES, ReadinessSnapshot, SystemEventKind,
+    LiveStopReason, MAX_LIVE_FAILURE_MESSAGE_BYTES, ReadinessSnapshot,
 };
 
 pub(super) struct CompositionState {

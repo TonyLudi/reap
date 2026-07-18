@@ -19,10 +19,11 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::LiveLatencySemantics;
+use crate::coordinator::CancelAction;
 
 use super::{
-    CancelAction, ConnectionStatus, LiveRuntime, LiveRuntimeError, OperatorEnvelope,
-    OperatorService, SubmitAction, elapsed_us, unix_time_ms,
+    ConnectionStatus, LiveRuntime, LiveRuntimeError, OperatorEnvelope, OperatorService,
+    SubmitAction, elapsed_us, unix_time_ms,
 };
 
 pub(super) struct DispatchState {
