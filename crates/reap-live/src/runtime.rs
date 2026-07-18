@@ -1,33 +1,32 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 use reap_core::Venue;
-use reap_core::{Channel, FillKey, NormalizedEvent, PINNED_JAVA_REVISION, TimerEvent};
+use reap_core::{Channel, NormalizedEvent, PINNED_JAVA_REVISION, TimerEvent};
 #[cfg(test)]
 use reap_feed::ConnectionStatusKind;
-use reap_feed::{
-    ConnectionAttemptPacer, ConnectionStatus, FeedOutput, FeedProcessor, ReconnectPolicy,
-    partition_subscriptions, try_spawn_supervised_feed,
-};
-use reap_okx_live_adapter::OrderCommandWebsocketConfig;
 #[cfg(test)]
-use reap_okx_live_adapter::OrderCommandWebsocketLifecycle;
-#[cfg(test)]
-use reap_order::OkxOrderGateway;
-use reap_order::reconcile_full_state;
-use reap_storage::{
-    BootstrapRecord, SessionStartRecord, StorageConfig, StorageError, StorageRecord,
-    acquire_storage_lease, recover_leased_jsonl, start_jsonl_storage_with_lease,
+use reap_feed::FeedProcessor;
+use reap_feed::{ConnectionStatus, FeedOutput};
+use reap_okx_live_adapter::{
+    BoundRegularOrderGateway, OrderCommandWebsocketConfig, OrderCommandWebsocketLifecycle,
+    OrderCommandWebsocketStatus,
 };
-use reap_telemetry::{AlertError, AlertRuntime, AlertStats, start_webhook_alerts};
+use reap_order::{OkxOrderGateway, RegularApprovalScope};
+#[cfg(test)]
+use reap_storage::StorageConfig;
+use reap_storage::{StorageError, StorageRecord};
+use reap_telemetry::AlertError;
+#[cfg(test)]
+use reap_telemetry::{AlertRuntime, AlertStats, start_webhook_alerts};
+#[cfg(test)]
 use reap_venue::VenueAdapter;
-use reap_venue::okx::{OkxAdapter, okx_capability_registration};
 #[cfg(test)]
 use reap_venue::okx::{
-    OkxInstrument, OkxSystemEnvironment, OkxSystemServiceType, OkxSystemStatus,
+    OkxAdapter, OkxInstrument, OkxSystemEnvironment, OkxSystemServiceType, OkxSystemStatus,
     OkxSystemStatusState, OkxTradeFeeRate,
 };
 use serde::{Deserialize, Serialize};
@@ -36,9 +35,6 @@ use tokio::sync::mpsc;
 
 use crate::convergence::{FillConvergenceGuard, OrderStateConvergenceGuard};
 use crate::coordinator::SubmitAction;
-use crate::forbidden_orders::{
-    ForbiddenOrderObserverPort, ForbiddenSentinelPolicy, run_forbidden_order_sentinel,
-};
 use crate::provenance::{
     current_executable_sha256 as hash_current_executable,
     host_identity_sha256 as hash_host_identity, okx_account_identity_sha256,
@@ -46,13 +42,13 @@ use crate::provenance::{
 use crate::safety_contracts::LiveFaultFailureCode;
 use crate::{
     AccountBootstrapSnapshot, ChaosConnectivityPlan, ChaosConnectivityPlanError, CoordinatorError,
-    CoordinatorOutput, HostGuardRuntime, HostHealthError, HostHealthSnapshot, LiveConfig,
-    LiveConfigError, LiveConfigFileEvidence, LiveCoordinator, LiveLatencyCollector,
-    LiveLatencyEvidence, LiveMode, OperatorEnvelope, OperatorError, OperatorService,
-    ReadinessSnapshot, ReconciliationResult, StartupGate, TradingEnvironment,
-    alert_webhook_from_env, check_host_health, load_live_config_with_evidence,
-    operator_secret_from_env, start_host_guard, start_operator_service,
+    HostHealthError, HostHealthSnapshot, LiveConfig, LiveConfigError, LiveConfigFileEvidence,
+    LiveCoordinator, LiveLatencyCollector, LiveLatencyEvidence, LiveMode, OperatorEnvelope,
+    OperatorError, OperatorService, ReadinessSnapshot, StartupGate, TradingEnvironment,
+    load_live_config_with_evidence,
 };
+#[cfg(test)]
+use crate::{HostGuardRuntime, ReconciliationResult, start_operator_service};
 
 mod bootstrap;
 mod commit;
@@ -66,25 +62,31 @@ mod readiness_safety;
 mod reconciliation;
 mod recovery;
 mod shutdown;
+mod startup;
 
-use bootstrap::{AccountSeed, bootstrap_accounts};
+use bootstrap::AccountSeed;
 use commit::receive_alert_failure;
+#[cfg(test)]
+use composition::RuntimeEvidence;
 #[cfg(test)]
 use composition::truncate_utf8;
 use composition::{
-    CompositionState, ReadinessTracker, RunLoopFailure, RunLoopOutcome, RuntimeEvidence,
+    CompositionState, ReadinessTracker, RunLoopFailure, RunLoopOutcome,
     live_startup_failure_evidence,
 };
-use connectivity::{ConnectivityState, FeedSourceState, spawn_feed_forwarders};
+use connectivity::ConnectivityState;
+#[cfg(test)]
+use connectivity::FeedSourceState;
 #[cfg(test)]
 use dispatch::RuntimeTaskFailure;
-use dispatch::{DispatchState, RuntimeEvent, run_order_task};
+#[cfg(test)]
+use dispatch::run_order_task;
+use dispatch::{DispatchState, RuntimeEvent};
 use operator_flow::receive_operator;
 #[cfg(test)]
-use planning::validate_private_state_socket_count;
 use planning::{
     planned_order_session_counts, private_socket_plans_by_account, runtime_public_subscriptions,
-    validate_public_socket_plans, validate_runtime_connectivity_plan,
+    validate_private_state_socket_count,
 };
 #[cfg(test)]
 use readiness_safety::{
@@ -93,17 +95,26 @@ use readiness_safety::{
     exchange_status_block_reason, verify_initial_exchange_fees,
     verify_initial_exchange_instruments,
 };
-use readiness_safety::{
-    ExchangeStatusGuard, ReadinessSafetyState, receive_host_failure, run_account_safety_task,
-};
-use reconciliation::{ReconciliationState, run_reconcile_task};
+#[cfg(test)]
+use readiness_safety::{ExchangeStatusGuard, run_account_safety_task};
+use readiness_safety::{ReadinessSafetyState, receive_host_failure};
+use reconciliation::ReconciliationState;
+#[cfg(test)]
+use reconciliation::run_reconcile_task;
+#[cfg(test)]
 use recovery::{
-    private_update_from_remote, proven_active_recovered_orders, recovered_safety_latch_count,
-    restore_active_order_bindings, restore_safety_latches, validate_recovered_safety_latches,
+    proven_active_recovered_orders, recovered_safety_latch_count, restore_active_order_bindings,
+    restore_safety_latches, validate_recovered_safety_latches,
 };
 #[cfg(test)]
+use shutdown::StartupTaskGroup;
+#[cfg(test)]
 use shutdown::is_zero_order_reconciliation;
-use shutdown::{ShutdownState, StartupTaskGroup, shutdown_signal};
+use shutdown::{ShutdownState, shutdown_signal};
+use startup::{
+    AuthenticatedStartup, CoordinatorStartup, RuntimeResources, StartupPlan, StartupRecovery,
+    finish_startup,
+};
 
 pub const LIVE_RUN_REPORT_SCHEMA_VERSION: u32 = 8;
 pub const MAX_LIVE_FAILURE_CODE_BYTES: usize = 64;
@@ -571,6 +582,48 @@ struct LiveRuntime {
     shutdown: ShutdownState,
 }
 
+fn take_regular_approval_scopes(
+    seeds: &mut [AccountSeed],
+) -> Result<HashMap<String, RegularApprovalScope>, LiveRuntimeError> {
+    let mut approval_scopes = HashMap::new();
+    for seed in seeds {
+        let Some(gateway) = seed.bound_order_gateway.as_mut() else {
+            continue;
+        };
+        let scope =
+            gateway
+                .take_approval_scope()
+                .map_err(|error| LiveRuntimeError::GatewaySetup {
+                    account_id: seed.account_id.clone(),
+                    message: format!("failed to take regular approval scope: {error}"),
+                })?;
+        approval_scopes.insert(seed.account_id.clone(), scope);
+    }
+    Ok(approval_scopes)
+}
+
+fn start_regular_order_lane(
+    bound_order_gateway: BoundRegularOrderGateway,
+    order_ws_config: OrderCommandWebsocketConfig,
+    account_id: &str,
+) -> Result<
+    (
+        OkxOrderGateway,
+        OrderCommandWebsocketLifecycle,
+        mpsc::Receiver<OrderCommandWebsocketStatus>,
+    ),
+    LiveRuntimeError,
+> {
+    bound_order_gateway
+        .start_and_install(order_ws_config)
+        .map_err(|error| LiveRuntimeError::GatewaySetup {
+            account_id: account_id.to_string(),
+            message: format!(
+                "failed to start and install regular order command websocket: {error}"
+            ),
+        })
+}
+
 impl LiveRuntime {
     async fn build(
         config: LiveConfig,
@@ -579,636 +632,13 @@ impl LiveRuntime {
         mode: LiveMode,
         run_duration: Option<Duration>,
     ) -> Result<Self, LiveRuntimeError> {
-        validate_runtime_connectivity_plan(&config, &connectivity_plan, mode)?;
-        let maintenance_relevance = connectivity_plan.maintenance_relevance().clone();
-        let forbidden_policy = ForbiddenSentinelPolicy::from_plan(
-            connectivity_plan.forbidden_proof_policy(),
-            config.runtime.max_order_reconciliation_pages,
-            config.runtime.pacing_policy(),
-        )
-        .map_err(LiveRuntimeError::Subscription)?;
-        let planned_public_subscriptions = runtime_public_subscriptions(&connectivity_plan)?;
-        let public_subscriptions = planned_public_subscriptions
-            .iter()
-            .map(|planned| planned.subscription.clone())
-            .collect::<Vec<_>>();
-        let public_plans = partition_subscriptions(
-            &public_subscriptions,
-            config.runtime.max_subscriptions_per_socket,
-        )
-        .map_err(|error| LiveRuntimeError::Subscription(error.to_string()))?;
-        validate_public_socket_plans(&planned_public_subscriptions, &public_plans)?;
-        let mut private_plans_by_account = private_socket_plans_by_account(&connectivity_plan)?;
-        let mut order_session_counts = planned_order_session_counts(&connectivity_plan)?;
-        let planned_order_accounts = order_session_counts.keys().cloned().collect::<HashSet<_>>();
-        let LiveRunAttemptEvidence {
-            session_started_at_ms,
-            config_source,
-            config_fingerprint,
-            evidence_config_fingerprint,
-            executable_sha256,
-            host_identity_sha256,
-        } = attempt;
-        let mut storage_lease = acquire_storage_lease(&config.storage.path)?;
-        let journal_path = storage_lease.journal_path().to_path_buf();
-        let host_preflight = if config.host_guard.enabled {
-            Some(check_host_health(&config.host_guard, &journal_path)?)
-        } else {
-            None
-        };
-        let connection_attempt_interval =
-            Duration::from_millis(config.runtime.connection_attempt_interval_ms);
-        let connection_attempt_pacer = match (
-            &config.runtime.connection_attempt_pacer_path,
-            connection_attempt_interval.is_zero(),
-        ) {
-            (Some(path), false) => {
-                ConnectionAttemptPacer::process_shared(connection_attempt_interval, path)?
-            }
-            _ => ConnectionAttemptPacer::new(connection_attempt_interval),
-        };
-        let mut alert_runtime = alert_webhook_from_env(&config.alerts)?
-            .map(start_webhook_alerts)
-            .transpose()?;
-        let alert_sink = alert_runtime.as_ref().map(AlertRuntime::sink);
-        let alert_failures = alert_runtime.as_mut().map(AlertRuntime::take_failures);
-        let operator_config = config.operator.clone();
-        let operator_secret = operator_secret_from_env(&operator_config)?;
-        let fill_convergence = FillConvergenceGuard::new(&config);
-        let order_convergence =
-            OrderStateConvergenceGuard::new(config.runtime.order_state_convergence_timeout_ms);
-        let mut recovered = recover_leased_jsonl(&mut storage_lease)?;
-        validate_recovered_safety_latches(&config, &recovered)?;
-        let restored_safety_latches = recovered_safety_latch_count(&recovered);
-        for (account_id, (strategy_name, fingerprint)) in &recovered.bootstrap_identities {
-            if config.account(account_id).is_none() {
-                return Err(LiveRuntimeError::CheckpointIdentity {
-                    account_id: account_id.clone(),
-                    message: "checkpoint account is not present in the live config".to_string(),
-                });
-            }
-            if strategy_name != &config.strategy.strategy_name || fingerprint != &config_fingerprint
-            {
-                return Err(LiveRuntimeError::CheckpointIdentity {
-                    account_id: account_id.clone(),
-                    message: "strategy name or live config fingerprint changed; rotate the storage path after reconciling all orders".to_string(),
-                });
-            }
-        }
-        let recovered_orders = proven_active_recovered_orders(&config, &mut recovered);
-        let mut restored_by_account: HashMap<String, Vec<reap_core::OrderUpdate>> = HashMap::new();
-        for (update, _) in &recovered_orders {
-            let account_id = config
-                .account_for_symbol(&update.symbol)
-                .map(|account| account.id.clone())
-                .ok_or_else(|| {
-                    LiveRuntimeError::BootstrapVerification(format!(
-                        "recovered order {} has unmapped symbol {}",
-                        update.order_id, update.symbol
-                    ))
-                })?;
-            restored_by_account
-                .entry(account_id)
-                .or_default()
-                .push(update.clone());
-        }
-        let (mut verified, mut seeds, snapshots) = bootstrap_accounts(
-            &config,
-            &restored_by_account,
-            mode,
-            &planned_order_accounts,
-            &maintenance_relevance,
-        )
-        .await?;
-        let mut approval_scopes = HashMap::new();
-        for seed in &mut seeds {
-            let Some(gateway) = seed.bound_order_gateway.as_mut() else {
-                continue;
-            };
-            let scope =
-                gateway
-                    .take_approval_scope()
-                    .map_err(|error| LiveRuntimeError::GatewaySetup {
-                        account_id: seed.account_id.clone(),
-                        message: format!("failed to take regular approval scope: {error}"),
-                    })?;
-            approval_scopes.insert(seed.account_id.clone(), scope);
-        }
-        let account_identity_sha256s = account_identity_sha256s(&config, &snapshots)?;
-        let session_id = format!("{:x}", unix_time_ns());
-        let mut startup_records = Vec::new();
-        for account in &config.accounts {
-            let exchange_baseline = verified
-                .baseline_fill_ids
-                .get(&account.id)
-                .cloned()
-                .unwrap_or_default();
-            let mut fill_ids = recovered
-                .baseline_fill_ids
-                .get(&account.id)
-                .cloned()
-                .unwrap_or_else(|| exchange_baseline.clone());
-            for fill in &recovered.fills {
-                let fill_account_id = fill.account_id.as_deref().or_else(|| {
-                    config
-                        .account_for_symbol(&fill.symbol)
-                        .map(|owner| owner.id.as_str())
-                });
-                if fill_account_id == Some(account.id.as_str()) {
-                    fill_ids.insert(FillKey::new(fill.symbol.clone(), fill.fill_id.clone()));
-                }
-            }
-            verified
-                .baseline_fill_ids
-                .insert(account.id.clone(), fill_ids);
-            if !recovered.baseline_fill_ids.contains_key(&account.id) {
-                let mut baseline_fill_ids = exchange_baseline.into_iter().collect::<Vec<_>>();
-                baseline_fill_ids.sort();
-                startup_records.push(StorageRecord::Bootstrap(BootstrapRecord {
-                    ts_ms: unix_time_ms(),
-                    account_id: account.id.clone(),
-                    strategy_name: config.strategy.strategy_name.clone(),
-                    config_fingerprint: config_fingerprint.clone(),
-                    baseline_fill_ids,
-                }));
-            }
-            let account_identity_sha256 = account_identity_sha256s
-                .get(&account.id)
-                .cloned()
-                .ok_or_else(|| {
-                    LiveRuntimeError::Provenance(format!(
-                        "missing account identity for runtime session account {}",
-                        account.id
-                    ))
-                })?;
-            startup_records.push(StorageRecord::SessionStart(SessionStartRecord {
-                ts_ms: session_started_at_ms,
-                session_id: session_id.clone(),
-                account_id: account.id.clone(),
-                strategy_name: config.strategy.strategy_name.clone(),
-                config_fingerprint: config_fingerprint.clone(),
-                account_identity_sha256,
-            }));
-        }
-        let mut coordinator = LiveCoordinator::new_with_order_transports(
-            config.clone(),
-            verified,
-            approval_scopes,
-            session_id.clone(),
-        )?;
-        // Apply recovered halt state before replaying anything that can produce an intent.
-        // Reapplying it after reconciliation below generates cancels for restored live orders.
-        let _ = restore_safety_latches(&mut coordinator, &recovered)?;
-        let mut initial_outputs = vec![CoordinatorOutput {
-            actions: Vec::new(),
-            records: startup_records,
-        }];
-        for (update, proof) in recovered_orders {
-            initial_outputs.push(coordinator.restore_owned_order(proof, update)?);
-        }
-        restore_active_order_bindings(&mut coordinator, &mut recovered)?;
-        for account in &config.accounts {
-            let snapshot = snapshots.get(&account.id).ok_or_else(|| {
-                LiveRuntimeError::BootstrapVerification(format!(
-                    "missing reconciliation snapshot for {}",
-                    account.id
-                ))
-            })?;
-            for fill in &snapshot.recent_fills {
-                let should_apply = coordinator.private_state(&account.id).is_some_and(|state| {
-                    let order_id =
-                        state.resolve_order_id(&fill.client_order_id, &fill.exchange_order_id);
-                    state.order_reducer().contains_order(&order_id)
-                        && !state.has_seen_fill(&fill.symbol, &fill.fill_id)
-                });
-                if should_apply {
-                    initial_outputs.push(coordinator.process_feed(FeedOutput::PrivateFill {
-                        account_id: Some(account.id.clone()),
-                        fill: fill.clone(),
-                    })?);
-                }
-            }
-            for remote in &snapshot.open_orders {
-                let known = coordinator.private_state(&account.id).is_some_and(|state| {
-                    let order_id =
-                        state.resolve_order_id(&remote.client_order_id, &remote.exchange_order_id);
-                    state.order_reducer().contains_order(&order_id)
-                });
-                if known {
-                    initial_outputs.push(coordinator.process_feed(FeedOutput::PrivateOrder {
-                        account_id: Some(account.id.clone()),
-                        update: private_update_from_remote(remote.clone()),
-                    })?);
-                }
-            }
-            let account_snapshot = snapshot.scoped_account_update(&account.id);
-            initial_outputs.push(
-                coordinator
-                    .apply_authoritative_account_snapshot(&account.id, account_snapshot.clone())?,
-            );
-            let state = coordinator
-                .private_state(&account.id)
-                .ok_or_else(|| CoordinatorError::UnknownAccount(account.id.clone()))?;
-            let report = reconcile_full_state(
-                state,
-                &snapshot.open_orders,
-                &snapshot.recent_fills,
-                &account_snapshot,
-            );
-            initial_outputs.push(coordinator.on_reconciliation(ReconciliationResult {
-                account_id: account.id.clone(),
-                ts_ms: unix_time_ms(),
-                clean: report.is_clean(),
-                local_live_orders: report.local_live_orders,
-                remote_live_orders: report.remote_live_orders,
-                remote_recent_fills: report.remote_fills,
-                reason: if report.is_clean() {
-                    "startup REST reconciliation is clean".to_string()
-                } else {
-                    format!("startup reconciliation drift: {:?}", report.issues)
-                },
-            })?);
-        }
-        initial_outputs.extend(restore_safety_latches(&mut coordinator, &recovered)?);
-        let storage = start_jsonl_storage_with_lease(
-            StorageConfig {
-                path: config.storage.path.clone(),
-                channel_capacity: config.storage.channel_capacity,
-                flush_every_records: config.storage.flush_every_records,
-            },
-            storage_lease,
-        )
-        .await?;
-        let storage_sink = storage.sink();
-        coordinator.mark_storage_ready(true, "storage file opened");
-
-        let (control_tx, control_rx) = mpsc::channel(config.runtime.event_channel_capacity);
-        let (feed_tx, feed_rx) = mpsc::channel(config.runtime.event_channel_capacity);
-        let (forbidden_tx, forbidden_rx) = mpsc::channel(config.runtime.event_channel_capacity);
-        let mut host_guard = config
-            .host_guard
-            .enabled
-            .then(|| start_host_guard(config.host_guard.clone(), journal_path));
-        let host_failures = host_guard.as_mut().map(HostGuardRuntime::take_failures);
-        let mut feeds = Vec::new();
-        let mut feed_tasks = StartupTaskGroup::default();
-        let mut sources = Vec::new();
-
-        let public_adapter: Arc<dyn VenueAdapter> = Arc::new(OkxAdapter::new(
-            &config.venue.public_ws_url,
-            &config.venue.private_ws_url,
-        ));
-        let _public_connection_capability = okx_capability_registration("OKX-CONNECTION-PUBLIC")
-            .expect("live public connection must remain in the OKX capability registry");
-        let mut public_feed = try_spawn_supervised_feed(
-            Arc::clone(&public_adapter),
-            public_plans.clone(),
-            reap_feed::no_bootstrap(),
-            config.runtime.feed_channel_capacity,
-            connection_attempt_pacer.clone(),
-            ReconnectPolicy::default(),
-        )
-        .map_err(|error| LiveRuntimeError::Subscription(error.to_string()))?;
-        let public_source_id = sources.len();
-        sources.push(FeedSourceState::public(public_adapter, &public_plans));
-        spawn_feed_forwarders(
-            public_source_id,
-            &mut public_feed,
-            &feed_tx,
-            &mut feed_tasks,
-        );
-        feeds.push(public_feed);
-        let public_feed_index = 0;
-
-        let mut order_senders = HashMap::new();
-        let mut order_tasks = StartupTaskGroup::default();
-        let mut reconcile_senders = HashMap::new();
-        let mut reconcile_tasks = StartupTaskGroup::default();
-        let mut order_ws_runtimes = Vec::new();
-        let mut order_ws_status_tasks = StartupTaskGroup::default();
-        let mut safety_senders = HashMap::new();
-        let mut safety_tasks = StartupTaskGroup::default();
-        let mut forbidden_tasks = StartupTaskGroup::default();
-        for (seed_index, seed) in seeds.into_iter().enumerate() {
-            let AccountSeed {
-                account_id,
-                readiness,
-                reconciliation,
-                forbidden_observer,
-                private_state_sessions,
-                bound_order_gateway,
-                safety,
-                instrument_guard,
-            } = seed;
-            let private_plans = private_plans_by_account
-                .remove(&account_id)
-                .ok_or_else(|| {
-                    LiveRuntimeError::Subscription(format!(
-                        "connectivity plan has no private state session for account {account_id}"
-                    ))
-                })?;
-            if private_plans.len() != 1 {
-                return Err(LiveRuntimeError::Subscription(format!(
-                    "connectivity plan must provide exactly one private state socket plan for account {account_id}, received {}",
-                    private_plans.len()
-                )));
-            }
-            let planned_session_count = order_session_counts.remove(&account_id);
-            let mutation_role_count =
-                usize::from(bound_order_gateway.is_some()) + usize::from(safety.is_some());
-            let expected_mutation_role_count = if planned_session_count.is_some() {
-                2
-            } else {
-                0
-            };
-            if mutation_role_count != expected_mutation_role_count {
-                return Err(LiveRuntimeError::GatewaySetup {
-                    account_id,
-                    message: format!(
-                        "planned order-lane authority requires exactly {expected_mutation_role_count} mutation roles, bootstrap produced {mutation_role_count}"
-                    ),
-                });
-            }
-            let deadman_timeout_secs = planned_session_count.and(
-                safety
-                    .as_ref()
-                    .map(|_| config.runtime.cancel_all_after_timeout_secs),
-            );
-            if let (Some(timeout_secs), Some(safety)) = (deadman_timeout_secs, safety.as_ref()) {
-                safety
-                    .cancel_all_after(timeout_secs)
-                    .await
-                    .map_err(|error| LiveRuntimeError::GatewaySetup {
-                        account_id: account_id.clone(),
-                        message: format!("failed to arm Cancel All After: {error}"),
-                    })?;
-            }
-            let (safety_tx, safety_rx) = mpsc::channel(8);
-            safety_senders.insert(account_id.clone(), safety_tx);
-            let expected_account_config = snapshots
-                .get(&account_id)
-                .expect("bootstrap snapshot must exist for every account seed")
-                .account_config
-                .clone();
-            safety_tasks.push(tokio::spawn(run_account_safety_task(
-                account_id.clone(),
-                readiness,
-                safety,
-                expected_account_config,
-                safety_rx,
-                control_tx.clone(),
-                deadman_timeout_secs,
-                config.runtime.cancel_all_after_heartbeat_ms,
-                config.runtime.exchange_clock_check_interval_ms,
-                config.runtime.max_exchange_clock_skew_ms,
-                ExchangeStatusGuard {
-                    enabled: seed_index == 0,
-                    relevance: maintenance_relevance.clone(),
-                    check_interval_ms: config.runtime.exchange_status_check_interval_ms,
-                    lead_ms: config.runtime.exchange_status_lead_ms,
-                },
-                instrument_guard,
-            )));
-            forbidden_tasks.push(tokio::spawn(run_forbidden_order_sentinel(
-                account_id.clone(),
-                Arc::new(forbidden_observer) as Arc<dyn ForbiddenOrderObserverPort>,
-                forbidden_policy.clone(),
-                forbidden_tx.clone(),
-            )));
-            let private_adapter: Arc<dyn VenueAdapter> = Arc::new(
-                OkxAdapter::new(&config.venue.public_ws_url, &config.venue.private_ws_url)
-                    .with_account_id(&account_id),
-            );
-            let _private_connection_capability =
-                okx_capability_registration("OKX-CONNECTION-PRIVATE-STATE")
-                    .expect("private state connection must remain in the OKX capability registry");
-            let private_bootstrap = private_state_sessions
-                .bootstrap_factory(
-                    account_id.clone(),
-                    private_plans[0].clone(),
-                    &config.venue.private_ws_url,
-                )
-                .map_err(|error| LiveRuntimeError::GatewaySetup {
-                    account_id: account_id.clone(),
-                    message: format!(
-                        "failed to bind private state bootstrap to its websocket destination: {error}"
-                    ),
-                })?;
-            let mut private_feed = try_spawn_supervised_feed(
-                Arc::clone(&private_adapter),
-                private_plans.clone(),
-                private_bootstrap,
-                config.runtime.feed_channel_capacity,
-                connection_attempt_pacer.clone(),
-                ReconnectPolicy::default(),
-            )
-            .map_err(|error| LiveRuntimeError::Subscription(error.to_string()))?;
-            let source_id = sources.len();
-            sources.push(FeedSourceState::private(
-                private_adapter,
-                account_id.clone(),
-                &private_plans,
-            ));
-            spawn_feed_forwarders(source_id, &mut private_feed, &feed_tx, &mut feed_tasks);
-            feeds.push(private_feed);
-
-            match (planned_session_count, bound_order_gateway) {
-                (Some(session_count), Some(bound_order_gateway)) => {
-                    if session_count != 1 {
-                        return Err(LiveRuntimeError::GatewaySetup {
-                            account_id: account_id.clone(),
-                            message: format!(
-                                "regular order command plan must contain exactly one session, found {session_count}"
-                            ),
-                        });
-                    }
-                    let order_ws_config = OrderCommandWebsocketConfig::new(
-                        account_id.clone(),
-                        config.venue.order_ws_url().to_string(),
-                        config.runtime.order_channel_capacity,
-                        Duration::from_millis(config.runtime.order_request_expiry_ms),
-                        Duration::from_millis(config.runtime.order_websocket_ack_timeout_ms),
-                        connection_attempt_pacer.clone(),
-                        ReconnectPolicy::default(),
-                    )
-                    .map_err(|error| LiveRuntimeError::GatewaySetup {
-                        account_id: account_id.clone(),
-                        message: format!(
-                            "invalid regular order command websocket configuration: {error}"
-                        ),
-                    })?;
-                    let (gateway, order_ws_runtime, mut order_ws_status) = bound_order_gateway
-                        .start_and_install(order_ws_config)
-                        .map_err(|error| LiveRuntimeError::GatewaySetup {
-                            account_id: account_id.clone(),
-                            message: format!(
-                                "failed to start and install regular order command websocket: {error}"
-                            ),
-                        })?;
-                    let order_status_events = control_tx.clone();
-                    order_ws_status_tasks.push(tokio::spawn(async move {
-                        while let Some(status) = order_ws_status.recv().await {
-                            if order_status_events
-                                .send(RuntimeEvent::OrderTransport(status))
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                    }));
-                    order_ws_runtimes.push(order_ws_runtime);
-                    let (order_tx, order_rx) = mpsc::channel(config.runtime.order_channel_capacity);
-                    order_senders.insert(account_id.clone(), order_tx);
-                    order_tasks.push(tokio::spawn(run_order_task(
-                        account_id.clone(),
-                        gateway,
-                        order_rx,
-                        control_tx.clone(),
-                        session_count,
-                        config.runtime.order_channel_capacity,
-                    )));
-                }
-                (Some(_), _) => {
-                    return Err(LiveRuntimeError::GatewaySetup {
-                        account_id,
-                        message: "planned regular order lane has no bound gateway authority"
-                            .to_string(),
-                    });
-                }
-                (None, _) => {}
-            }
-
-            let (reconcile_tx, reconcile_rx) = mpsc::channel(8);
-            reconcile_senders.insert(account_id.clone(), reconcile_tx);
-            reconcile_tasks.push(tokio::spawn(run_reconcile_task(
-                account_id,
-                reconciliation,
-                reconcile_rx,
-                control_tx.clone(),
-                config.runtime.ambiguous_submit_grace_ms,
-                config.runtime.max_order_reconciliation_pages,
-                config.runtime.max_fill_reconciliation_pages,
-            )));
-        }
-        if let Some(account_id) = private_plans_by_account.keys().next() {
-            return Err(LiveRuntimeError::Subscription(format!(
-                "connectivity plan private state session has no runtime account seed: {account_id}"
-            )));
-        }
-        if let Some(account_id) = order_session_counts.keys().next() {
-            return Err(LiveRuntimeError::Subscription(format!(
-                "connectivity plan order command lane has no runtime account seed: {account_id}"
-            )));
-        }
-
-        let mut runtime = Self {
-            coordinator,
-            composition: CompositionState {
-                session_id,
-                session_started_at_ms,
-                config_source,
-                config_fingerprint,
-                evidence_config_fingerprint,
-                executable_sha256,
-                host_identity_sha256,
-                account_identity_sha256s,
-                mode,
-                run_duration,
-                storage: Some(storage),
-                storage_sink,
-                evidence: RuntimeEvidence::default(),
-                latency: LiveLatencyCollector::default(),
-            },
-            connectivity: ConnectivityState {
-                processor: FeedProcessor::new(
-                    config.runtime.dedup_capacity_per_stream,
-                    config.runtime.max_sequence_buffer,
-                ),
-                feed_rx,
-                order_ws_runtimes,
-                order_ws_status_tasks: order_ws_status_tasks.take(),
-                feeds,
-                feed_tasks: feed_tasks.take(),
-                sources,
-                public_feed_index,
-                max_feed_age_ms: config.risk.max_feed_age_ms,
-            },
-            dispatch: DispatchState {
-                control_rx,
-                order_senders,
-                order_tasks: order_tasks.take(),
-                operator_service: None,
-                operator_rx: None,
-                operator_shutdown_reason: None,
-                alert_runtime,
-                alert_sink,
-                alert_failures,
-                alert_shutdown_timeout_ms: config.alerts.shutdown_timeout_ms,
-                alert_delivery_failure_is_fatal: config.alerts.delivery_failure_is_fatal,
-                observed_alert_delivery_failures: 0,
-                alert_stats: AlertStats::default(),
-            },
-            readiness_safety: ReadinessSafetyState {
-                forbidden_rx,
-                safety_senders,
-                safety_tasks: safety_tasks.take(),
-                forbidden_tasks: forbidden_tasks.take(),
-                readiness_timeout_ms: config.runtime.readiness_timeout_ms,
-                timer_interval_ms: config.runtime.timer_interval_ms,
-                host_guard,
-                host_failures,
-                host_checks: u64::from(host_preflight.is_some()),
-                host_last_snapshot: host_preflight.clone(),
-                host_preflight,
-            },
-            reconciliation: ReconciliationState {
-                senders: reconcile_senders,
-                tasks: reconcile_tasks.take(),
-                inflight: HashSet::new(),
-                cancel_inflight: HashSet::new(),
-                last_attempt: HashMap::new(),
-                fill_convergence: FillConvergenceGuard::default(),
-                order_convergence,
-            },
-            shutdown: ShutdownState {
-                timeout_ms: config.runtime.shutdown_timeout_ms,
-                teardown_timeout_ms: config.runtime.teardown_timeout_ms,
-                safety_latch_sync_timeout_ms: config.runtime.safety_latch_sync_timeout_ms,
-                in_progress: false,
-                storage_error: None,
-                preserve_deadman: false,
-                reconciliation_requested: HashSet::new(),
-                reconciled_accounts: HashSet::new(),
-            },
-        };
-        for output in initial_outputs {
-            if let Err(primary) = runtime.commit_output(output).await {
-                let context = format!("runtime initialization failure: {primary}");
-                return Err(runtime.close_after_error(primary, &context).await);
-            }
-        }
-        runtime
-            .composition
-            .evidence
-            .begin_live_session(restored_safety_latches);
-        runtime.reconciliation.fill_convergence = fill_convergence;
-        if let Some(secret) = operator_secret {
-            let (operator_tx, operator_rx) =
-                mpsc::channel(operator_config.command_channel_capacity);
-            match start_operator_service(&operator_config, secret, operator_tx).await {
-                Ok(service) => {
-                    runtime.dispatch.operator_service = Some(service);
-                    runtime.dispatch.operator_rx = Some(operator_rx);
-                }
-                Err(error) => {
-                    let primary = LiveRuntimeError::Operator(error);
-                    let context = format!("operator service startup failure: {primary}");
-                    return Err(runtime.close_after_error(primary, &context).await);
-                }
-            }
-        }
-        Ok(runtime)
+        let plan = StartupPlan::resolve(config, attempt, connectivity_plan, mode, run_duration)?;
+        let recovered = StartupRecovery::open(plan)?;
+        let authenticated = AuthenticatedStartup::bootstrap(recovered).await?;
+        let restored = CoordinatorStartup::restore(authenticated)?;
+        let resources = RuntimeResources::start(restored).await?;
+        let (runtime, finalization) = resources.into_runtime();
+        finish_startup(runtime, finalization).await
     }
 
     async fn run_loop(&mut self) -> Result<RunLoopOutcome, RunLoopFailure> {

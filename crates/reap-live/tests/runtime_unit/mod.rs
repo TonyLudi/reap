@@ -81,6 +81,7 @@ fn production_runtime_keeps_single_owner_responsibility_state() {
         include_str!("../../src/runtime/reconciliation.rs"),
         include_str!("../../src/runtime/recovery.rs"),
         include_str!("../../src/runtime/shutdown.rs"),
+        include_str!("../../src/runtime/startup.rs"),
     ];
 
     assert_eq!(

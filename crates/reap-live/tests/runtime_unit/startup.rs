@@ -10,6 +10,118 @@ impl Drop for TaskDropSignal {
     }
 }
 
+#[test]
+fn staged_startup_preserves_ordered_construction_and_infallible_task_transfer() {
+    let runtime_source = include_str!("../../src/runtime.rs");
+    let startup_source = include_str!("../../src/runtime/startup.rs");
+    let build = runtime_source
+        .split_once("    async fn build(")
+        .expect("LiveRuntime::build")
+        .1
+        .split_once("    async fn run_loop(")
+        .expect("run_loop follows build")
+        .0;
+    let mut previous = 0;
+    for marker in [
+        "StartupPlan::resolve(",
+        "StartupRecovery::open(",
+        "AuthenticatedStartup::bootstrap(",
+        "CoordinatorStartup::restore(",
+        "RuntimeResources::start(",
+        ".into_runtime()",
+        "finish_startup(",
+    ] {
+        let position = build
+            .find(marker)
+            .unwrap_or_else(|| panic!("build is missing ordered stage marker {marker}"));
+        assert!(
+            position >= previous,
+            "startup stage marker {marker} moved out of order"
+        );
+        previous = position;
+    }
+
+    let resource_start = startup_source
+        .split_once("    pub(super) async fn start(")
+        .expect("RuntimeResources::start")
+        .1
+        .split_once("    pub(super) fn into_runtime(")
+        .expect("into_runtime follows resource start")
+        .0;
+    let mut previous = 0;
+    for marker in [
+        "for (seed_index, seed) in seeds.into_iter().enumerate()",
+        ".cancel_all_after(timeout_secs)",
+        "run_account_safety_task(",
+        "run_forbidden_order_sentinel(",
+        ".bootstrap_factory(",
+        "let (gateway, order_ws_runtime, mut order_ws_status)",
+        "order_ws_status_tasks.push(",
+        "order_ws_runtimes.push(",
+        "run_order_task(",
+        "run_reconcile_task(",
+    ] {
+        let position = resource_start
+            .find(marker)
+            .unwrap_or_else(|| panic!("resource startup is missing ordered marker {marker}"));
+        assert!(
+            position >= previous,
+            "per-account resource marker {marker} moved out of order"
+        );
+        previous = position;
+    }
+
+    let transfer = startup_source
+        .split_once("    pub(super) fn into_runtime(")
+        .expect("RuntimeResources::into_runtime")
+        .1
+        .split_once("pub(super) async fn finish_startup(")
+        .expect("finish_startup follows transfer")
+        .0;
+    assert_eq!(
+        transfer.matches(".take()").count(),
+        6,
+        "exactly six guarded startup task groups must transfer"
+    );
+    let mut previous = 0;
+    for marker in [
+        "order_ws_status_tasks.take()",
+        "feed_tasks.take()",
+        "order_tasks.take()",
+        "safety_tasks.take()",
+        "forbidden_tasks.take()",
+        "reconcile_tasks.take()",
+    ] {
+        let position = transfer
+            .find(marker)
+            .unwrap_or_else(|| panic!("task transfer is missing {marker}"));
+        assert!(
+            position >= previous,
+            "guarded task transfer {marker} moved out of order"
+        );
+        previous = position;
+    }
+    for forbidden in [
+        ".await",
+        "?",
+        "expect(",
+        "unwrap(",
+        "tokio::spawn(",
+        "mpsc::channel(",
+        "return ",
+        "Result<",
+    ] {
+        assert!(
+            !transfer.contains(forbidden),
+            "infallible task transfer contains forbidden token {forbidden}"
+        );
+    }
+    assert!(
+        !startup_source.contains("ProvenRegularSubmitRequest"),
+        "startup must not acquire or name recovered submit-proof authority"
+    );
+}
+
 #[tokio::test]
 async fn bounded_run_rejects_zero_duration_before_credentials() {
     let error = run_live(

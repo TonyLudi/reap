@@ -1,4 +1,6 @@
-use reap_core::{NormalizedEvent, OrderStatus, SystemEvent, SystemEventKind};
+use std::collections::HashMap;
+
+use reap_core::{NormalizedEvent, OrderStatus, OrderUpdate, SystemEvent, SystemEventKind};
 use reap_storage::{RecoveredStorage, SafetyLatchRecord, SafetyLatchSource};
 use reap_venue::{PrivateOrderState, PrivateOrderUpdate, RemoteOrder};
 
@@ -100,6 +102,53 @@ pub(super) fn proven_active_recovered_orders(
         .collect::<Vec<_>>();
     orders.sort_by(|(left, _), (right, _)| left.order_id.cmp(&right.order_id));
     orders
+}
+
+pub(super) struct RecoveredActiveOrders(
+    Vec<(
+        reap_core::OrderUpdate,
+        reap_storage::ProvenRegularSubmitRequest,
+    )>,
+);
+
+impl RecoveredActiveOrders {
+    pub(super) fn take(config: &LiveConfig, recovered: &mut RecoveredStorage) -> Self {
+        Self(proven_active_recovered_orders(config, recovered))
+    }
+
+    pub(super) fn restored_by_account(
+        &self,
+        config: &LiveConfig,
+    ) -> Result<HashMap<String, Vec<OrderUpdate>>, LiveRuntimeError> {
+        let mut restored_by_account: HashMap<String, Vec<OrderUpdate>> = HashMap::new();
+        for (update, _) in &self.0 {
+            let account_id = config
+                .account_for_symbol(&update.symbol)
+                .map(|account| account.id.clone())
+                .ok_or_else(|| {
+                    LiveRuntimeError::BootstrapVerification(format!(
+                        "recovered order {} has unmapped symbol {}",
+                        update.order_id, update.symbol
+                    ))
+                })?;
+            restored_by_account
+                .entry(account_id)
+                .or_default()
+                .push(update.clone());
+        }
+        Ok(restored_by_account)
+    }
+
+    pub(super) fn restore_into(
+        self,
+        coordinator: &mut LiveCoordinator,
+        outputs: &mut Vec<CoordinatorOutput>,
+    ) -> Result<(), LiveRuntimeError> {
+        for (update, proof) in self.0 {
+            outputs.push(coordinator.restore_owned_order(proof, update)?);
+        }
+        Ok(())
+    }
 }
 
 pub(super) fn restore_active_order_bindings(
