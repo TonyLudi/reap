@@ -1,5 +1,9 @@
+mod approval_subject;
 mod bindings;
 mod fault_proxy;
 mod manifest;
+mod ordering;
+mod paths;
 mod policy_time;
+mod schema;
 mod support;

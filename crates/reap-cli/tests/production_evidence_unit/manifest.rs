@@ -92,3 +92,35 @@ fn manifest_rejects_weak_reconciliation_and_invalid_identity() {
     legacy.schema_version = 3;
     assert!(validate_manifest(&legacy).is_err());
 }
+
+#[test]
+fn manifest_validation_preserves_fail_first_error_order_and_text() {
+    let mut manifest: ProductionEvidenceManifest = toml::from_str(&manifest_toml("")).unwrap();
+    manifest.schema_version = 7;
+    manifest.freshness.future_tolerance_ms = MAX_FUTURE_TOLERANCE_MS + 1;
+    manifest.latency_source_reports.clear();
+    manifest.fill_reconciliations[0].fee_tolerance = f64::EPSILON;
+
+    assert_eq!(
+        validate_manifest(&manifest).unwrap_err().to_string(),
+        "production evidence manifest schema must be 8, got 7"
+    );
+
+    manifest.schema_version = PRODUCTION_EVIDENCE_MANIFEST_SCHEMA_VERSION;
+    assert_eq!(
+        validate_manifest(&manifest).unwrap_err().to_string(),
+        "freshness.future_tolerance_ms must be at most 300000"
+    );
+
+    manifest.freshness.future_tolerance_ms = 60_000;
+    assert_eq!(
+        validate_manifest(&manifest).unwrap_err().to_string(),
+        "latency_source_reports must contain 1..=128 entries, got 0"
+    );
+
+    manifest.latency_source_reports = vec![PathBuf::from("latency-source.json")];
+    assert_eq!(
+        validate_manifest(&manifest).unwrap_err().to_string(),
+        "production fill reconciliation requires exact zero tolerances"
+    );
+}
