@@ -12,16 +12,24 @@ use super::{
 };
 
 #[derive(Debug, Clone)]
+struct FillHistoryState {
+    buy_fill_qty: Quantity,
+    buy_fill_notional: f64,
+    sell_fill_qty: Quantity,
+    sell_fill_notional: f64,
+    last_aggressive_fill_ms: TimeMs,
+    last_normal_fill_ms: TimeMs,
+    aggressive_fill_count: u32,
+}
+
+#[derive(Debug, Clone)]
 pub struct InstrumentState {
     pub config: InstrumentConfig,
     pub(super) symbol_key: Arc<str>,
     pub book: Option<OrderBook>,
     pub position_qty: Quantity,
     pub position_avg_price: Price,
-    pub(super) buy_fill_qty: Quantity,
-    pub(super) buy_fill_notional: f64,
-    pub(super) sell_fill_qty: Quantity,
-    pub(super) sell_fill_notional: f64,
+    fills: FillHistoryState,
     pub funding_rate: f64,
     pub funding_time_ms: TimeMs,
     pub funding_rate_updated_ms: Option<TimeMs>,
@@ -62,9 +70,6 @@ pub struct InstrumentState {
     pub(super) full_quote_balance_debouncer: DebouncedCondition,
     pub(super) take_buy_rate: f64,
     pub(super) take_sell_rate: f64,
-    pub(super) last_aggressive_fill_ms: TimeMs,
-    pub(super) last_normal_fill_ms: TimeMs,
-    pub(super) aggressive_fill_count: u32,
     pub buy_theo: Option<TheoQuote>,
     pub sell_theo: Option<TheoQuote>,
 }
@@ -79,10 +84,15 @@ impl InstrumentState {
             book: None,
             position_qty: 0.0,
             position_avg_price: 0.0,
-            buy_fill_qty: 0.0,
-            buy_fill_notional: 0.0,
-            sell_fill_qty: 0.0,
-            sell_fill_notional: 0.0,
+            fills: FillHistoryState {
+                buy_fill_qty: 0.0,
+                buy_fill_notional: 0.0,
+                sell_fill_qty: 0.0,
+                sell_fill_notional: 0.0,
+                last_aggressive_fill_ms: 0,
+                last_normal_fill_ms: 0,
+                aggressive_fill_count: 0,
+            },
             funding_rate,
             funding_time_ms: 0,
             funding_rate_updated_ms: None,
@@ -126,9 +136,6 @@ impl InstrumentState {
             full_quote_balance_debouncer: DebouncedCondition::default(),
             take_buy_rate: f64::NAN,
             take_sell_rate: f64::NAN,
-            last_aggressive_fill_ms: 0,
-            last_normal_fill_ms: 0,
-            aggressive_fill_count: 0,
             buy_theo: None,
             sell_theo: None,
         }
@@ -813,12 +820,12 @@ impl InstrumentState {
     ) {
         match side {
             Side::Buy => {
-                self.buy_fill_qty += qty;
-                self.buy_fill_notional += qty * px;
+                self.fills.buy_fill_qty += qty;
+                self.fills.buy_fill_notional += qty * px;
             }
             Side::Sell => {
-                self.sell_fill_qty += qty;
-                self.sell_fill_notional += qty * px;
+                self.fills.sell_fill_qty += qty;
+                self.fills.sell_fill_notional += qty * px;
             }
         }
     }
@@ -842,21 +849,21 @@ impl InstrumentState {
         let target_ratio = 1.0 - side.factor() * 0.01;
         let anomalous_to_target = side.is_more_passive(fill_price, order_price * target_ratio);
         if !(anomalous_to_market || anomalous_to_target) {
-            self.last_normal_fill_ms = now_ms;
+            self.fills.last_normal_fill_ms = now_ms;
             return false;
         }
 
-        if now_ms.saturating_sub(self.last_aggressive_fill_ms) < 1_000
-            && now_ms.saturating_sub(self.last_normal_fill_ms) > 2_000
-            && self.aggressive_fill_count >= 5
+        if now_ms.saturating_sub(self.fills.last_aggressive_fill_ms) < 1_000
+            && now_ms.saturating_sub(self.fills.last_normal_fill_ms) > 2_000
+            && self.fills.aggressive_fill_count >= 5
         {
             return true;
         }
-        if now_ms.saturating_sub(self.last_aggressive_fill_ms) > 600_000 {
-            self.aggressive_fill_count = 0;
+        if now_ms.saturating_sub(self.fills.last_aggressive_fill_ms) > 600_000 {
+            self.fills.aggressive_fill_count = 0;
         }
-        self.last_aggressive_fill_ms = now_ms;
-        self.aggressive_fill_count += 1;
+        self.fills.last_aggressive_fill_ms = now_ms;
+        self.fills.aggressive_fill_count += 1;
         false
     }
 
@@ -880,49 +887,55 @@ impl InstrumentState {
 
     pub(super) fn trading_pnl_usd(&self, ref_mid: f64) -> f64 {
         let mark = self.mid().unwrap_or(ref_mid);
-        let buy_avg_px = if self.buy_fill_qty > 0.0 {
-            self.buy_fill_notional / self.buy_fill_qty
+        let buy_avg_px = if self.fills.buy_fill_qty > 0.0 {
+            self.fills.buy_fill_notional / self.fills.buy_fill_qty
         } else {
             0.0
         };
-        let sell_avg_px = if self.sell_fill_qty > 0.0 {
-            self.sell_fill_notional / self.sell_fill_qty
+        let sell_avg_px = if self.fills.sell_fill_qty > 0.0 {
+            self.fills.sell_fill_notional / self.fills.sell_fill_qty
         } else {
             0.0
         };
         let average_fee_rate = (self.config.maker_fee + self.config.taker_fee) * 0.5;
         if self.config.kind.is_spot() {
-            let gross_quote =
-                (mark - buy_avg_px) * self.buy_fill_qty + (sell_avg_px - mark) * self.sell_fill_qty;
-            let fees_quote = (self.buy_fill_notional + self.sell_fill_notional) * average_fee_rate;
+            let gross_quote = (mark - buy_avg_px) * self.fills.buy_fill_qty
+                + (sell_avg_px - mark) * self.fills.sell_fill_qty;
+            let fees_quote =
+                (self.fills.buy_fill_notional + self.fills.sell_fill_notional) * average_fee_rate;
             (gross_quote - fees_quote) / mark.max(EPS) * ref_mid
         } else if self.config.kind.is_inverse() {
             let mut pnl_coin = 0.0;
-            if self.buy_fill_qty > 0.0 {
+            if self.fills.buy_fill_qty > 0.0 {
                 pnl_coin -= self.config.contract_value
-                    * (self.buy_fill_qty / mark.max(EPS) - self.buy_fill_qty / buy_avg_px.max(EPS));
-                pnl_coin -= average_fee_rate * self.config.contract_value * self.buy_fill_qty
+                    * (self.fills.buy_fill_qty / mark.max(EPS)
+                        - self.fills.buy_fill_qty / buy_avg_px.max(EPS));
+                pnl_coin -= average_fee_rate * self.config.contract_value * self.fills.buy_fill_qty
                     / buy_avg_px.max(EPS);
             }
-            if self.sell_fill_qty > 0.0 {
+            if self.fills.sell_fill_qty > 0.0 {
                 pnl_coin += self.config.contract_value
-                    * (self.sell_fill_qty / mark.max(EPS)
-                        - self.sell_fill_qty / sell_avg_px.max(EPS));
-                pnl_coin -= average_fee_rate * self.config.contract_value * self.sell_fill_qty
-                    / sell_avg_px.max(EPS);
+                    * (self.fills.sell_fill_qty / mark.max(EPS)
+                        - self.fills.sell_fill_qty / sell_avg_px.max(EPS));
+                pnl_coin -=
+                    average_fee_rate * self.config.contract_value * self.fills.sell_fill_qty
+                        / sell_avg_px.max(EPS);
             }
             pnl_coin * ref_mid
         } else {
             let mut pnl_coin = 0.0;
-            if self.buy_fill_qty > 0.0 {
-                pnl_coin += self.config.contract_value * self.buy_fill_qty * (mark - buy_avg_px)
-                    / mark.max(EPS);
-                pnl_coin -= average_fee_rate * self.config.contract_value * self.buy_fill_qty;
+            if self.fills.buy_fill_qty > 0.0 {
+                pnl_coin +=
+                    self.config.contract_value * self.fills.buy_fill_qty * (mark - buy_avg_px)
+                        / mark.max(EPS);
+                pnl_coin -= average_fee_rate * self.config.contract_value * self.fills.buy_fill_qty;
             }
-            if self.sell_fill_qty > 0.0 {
-                pnl_coin -= self.config.contract_value * self.sell_fill_qty * (mark - sell_avg_px)
-                    / mark.max(EPS);
-                pnl_coin -= average_fee_rate * self.config.contract_value * self.sell_fill_qty;
+            if self.fills.sell_fill_qty > 0.0 {
+                pnl_coin -=
+                    self.config.contract_value * self.fills.sell_fill_qty * (mark - sell_avg_px)
+                        / mark.max(EPS);
+                pnl_coin -=
+                    average_fee_rate * self.config.contract_value * self.fills.sell_fill_qty;
             }
             pnl_coin * ref_mid
         }
