@@ -328,7 +328,7 @@ impl ChaosStrategy {
             {
                 total_balance_usd += entity.base_balance * ref_mid;
             }
-            if let Some(base) = &entity.base_coin_config {
+            if let Some(base) = &entity.trade.base_coin_config {
                 let borrow_limit = base.borrow_limit(ref_mid);
                 if !entity.base_liability.is_finite() || entity.base_liability > borrow_limit {
                     self.halt_reason = Some(format!(
@@ -341,7 +341,7 @@ impl ChaosStrategy {
                     return false;
                 }
             }
-            if let Some(quote) = &entity.quote_coin_config {
+            if let Some(quote) = &entity.trade.quote_coin_config {
                 let quote_rate = if is_usd_equivalent(&entity.config.quote_currency) {
                     1.0
                 } else {

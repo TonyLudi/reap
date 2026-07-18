@@ -93,19 +93,19 @@ impl ChaosStrategy {
                 if group.config.kind == RiskGroupKindConfig::RefOnly {
                     state.config.halted = true;
                 }
-                state.base_coin_config = group
+                state.trade.base_coin_config = group
                     .config
                     .coins
                     .iter()
                     .find(|coin| coin.currency == inst.base_currency)
                     .cloned();
-                state.quote_coin_config = group
+                state.trade.quote_coin_config = group
                     .config
                     .coins
                     .iter()
                     .find(|coin| coin.currency == inst.quote_currency)
                     .cloned();
-                state.margin_coin_config = group
+                state.trade.margin_coin_config = group
                     .config
                     .coins
                     .iter()
@@ -590,8 +590,8 @@ mod tests {
             Level::new(49_999.0, 10.0),
             Level::new(50_001.0, 10.0),
         ));
-        state.base_coin_config = Some(base_coin_config);
-        state.quote_coin_config = Some(quote_coin_config);
+        state.trade.base_coin_config = Some(base_coin_config);
+        state.trade.quote_coin_config = Some(quote_coin_config);
         state.base_balance = base_balance;
         state.base_available = base_balance.max(0.0);
         state.quote_balance = quote_balance;
@@ -2270,14 +2270,14 @@ mod tests {
             Level::new(99.0, 10.0),
             Level::new(101.0, 10.0),
         ));
-        entity.base_coin_config = Some(CoinConfig {
+        entity.trade.base_coin_config = Some(CoinConfig {
             currency: "BTC".to_string(),
             min_balance: 0.0,
             max_balance: 100.0,
             safety_multiplier: 1.0,
             ..CoinConfig::default()
         });
-        entity.quote_coin_config = Some(CoinConfig {
+        entity.trade.quote_coin_config = Some(CoinConfig {
             currency: "USDT".to_string(),
             min_balance: 0.0,
             max_balance: 10_000.0,
@@ -2326,13 +2326,13 @@ mod tests {
         ));
         entity.position_qty = 99.0;
         entity.refresh_trade_permissions(100);
-        assert!(!entity.can_trade[&Side::Buy]);
+        assert!(!entity.trade.can_trade[&Side::Buy]);
 
         entity.position_qty = 0.0;
         entity.refresh_trade_permissions(600);
-        assert!(!entity.can_trade[&Side::Buy]);
+        assert!(!entity.trade.can_trade[&Side::Buy]);
         entity.refresh_trade_permissions(601);
-        assert!(entity.can_trade[&Side::Buy]);
+        assert!(entity.trade.can_trade[&Side::Buy]);
     }
 
     #[test]
@@ -2816,7 +2816,7 @@ mod tests {
         ));
         entity.margin_initialized = true;
         entity.margin_balance = 30_000.0;
-        entity.margin_coin_config = Some(CoinConfig {
+        entity.trade.margin_coin_config = Some(CoinConfig {
             currency: "USDT".to_string(),
             ..CoinConfig::default()
         });

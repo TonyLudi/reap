@@ -23,6 +23,19 @@ struct FillHistoryState {
 }
 
 #[derive(Debug, Clone)]
+pub(super) struct TradeControlState {
+    pub(super) base_coin_config: Option<CoinConfig>,
+    pub(super) quote_coin_config: Option<CoinConfig>,
+    pub(super) margin_coin_config: Option<CoinConfig>,
+    pub(super) can_trade: HashMap<Side, bool>,
+    pub(super) can_trade_debouncers: HashMap<Side, DebouncedCondition>,
+    pub(super) reduced_quote_level_side: Option<Side>,
+    pub(super) full_quote_balance_debouncer: DebouncedCondition,
+    pub(super) take_buy_rate: f64,
+    pub(super) take_sell_rate: f64,
+}
+
+#[derive(Debug, Clone)]
 pub struct InstrumentState {
     pub config: InstrumentConfig,
     pub(super) symbol_key: Arc<str>,
@@ -61,15 +74,7 @@ pub struct InstrumentState {
     pub(super) interval_halted: bool,
     pub(super) system_halted: bool,
     pub(super) feed_stale: bool,
-    pub(super) base_coin_config: Option<CoinConfig>,
-    pub(super) quote_coin_config: Option<CoinConfig>,
-    pub(super) margin_coin_config: Option<CoinConfig>,
-    pub(super) can_trade: HashMap<Side, bool>,
-    pub(super) can_trade_debouncers: HashMap<Side, DebouncedCondition>,
-    pub(super) reduced_quote_level_side: Option<Side>,
-    pub(super) full_quote_balance_debouncer: DebouncedCondition,
-    pub(super) take_buy_rate: f64,
-    pub(super) take_sell_rate: f64,
+    pub(super) trade: TradeControlState,
     pub buy_theo: Option<TheoQuote>,
     pub sell_theo: Option<TheoQuote>,
 }
@@ -124,18 +129,20 @@ impl InstrumentState {
             interval_halted: false,
             system_halted: false,
             feed_stale: false,
-            base_coin_config: None,
-            quote_coin_config: None,
-            margin_coin_config: None,
-            can_trade: HashMap::from([(Side::Buy, false), (Side::Sell, false)]),
-            can_trade_debouncers: HashMap::from([
-                (Side::Buy, DebouncedCondition::default()),
-                (Side::Sell, DebouncedCondition::default()),
-            ]),
-            reduced_quote_level_side: None,
-            full_quote_balance_debouncer: DebouncedCondition::default(),
-            take_buy_rate: f64::NAN,
-            take_sell_rate: f64::NAN,
+            trade: TradeControlState {
+                base_coin_config: None,
+                quote_coin_config: None,
+                margin_coin_config: None,
+                can_trade: HashMap::from([(Side::Buy, false), (Side::Sell, false)]),
+                can_trade_debouncers: HashMap::from([
+                    (Side::Buy, DebouncedCondition::default()),
+                    (Side::Sell, DebouncedCondition::default()),
+                ]),
+                reduced_quote_level_side: None,
+                full_quote_balance_debouncer: DebouncedCondition::default(),
+                take_buy_rate: f64::NAN,
+                take_sell_rate: f64::NAN,
+            },
             buy_theo: None,
             sell_theo: None,
         }
@@ -185,7 +192,7 @@ impl InstrumentState {
     pub(super) fn refresh_trade_permissions(&mut self, now_ms: TimeMs) {
         for side in [Side::Buy, Side::Sell] {
             if !self.is_valid_and_not_halted(now_ms) {
-                self.can_trade.insert(side, false);
+                self.trade.can_trade.insert(side, false);
                 continue;
             }
             let raw = if self.config.kind.is_spot() {
@@ -193,12 +200,13 @@ impl InstrumentState {
             } else {
                 self.max_trade_size(side, false) >= self.config.min_trade_size
             };
-            let allowed = self.can_trade_debouncers.entry(side).or_default().check(
-                raw,
-                now_ms,
-                CAN_TRADE_DEBOUNCE_MS,
-            );
-            self.can_trade.insert(side, allowed);
+            let allowed = self
+                .trade
+                .can_trade_debouncers
+                .entry(side)
+                .or_default()
+                .check(raw, now_ms, CAN_TRADE_DEBOUNCE_MS);
+            self.trade.can_trade.insert(side, allowed);
         }
     }
 
@@ -272,8 +280,8 @@ impl InstrumentState {
             return true;
         }
         let (Some(base), Some(quote), Some(mid)) = (
-            self.base_coin_config.clone(),
-            self.quote_coin_config.clone(),
+            self.trade.base_coin_config.clone(),
+            self.trade.quote_coin_config.clone(),
             self.mid(),
         ) else {
             return true;
@@ -289,7 +297,7 @@ impl InstrumentState {
                     quote.min_balance,
                 );
                 if !full_sufficient {
-                    self.reduced_quote_level_side = Some(side);
+                    self.trade.reduced_quote_level_side = Some(side);
                     if !self.quote_balance_sufficient(
                         self.config.max_order_size,
                         1,
@@ -299,7 +307,7 @@ impl InstrumentState {
                     ) {
                         return false;
                     }
-                } else if self.reduced_quote_level_side == Some(side) {
+                } else if self.trade.reduced_quote_level_side == Some(side) {
                     let can_restore = self.quote_balance_sufficient(
                         self.config.max_order_size,
                         full_levels,
@@ -307,12 +315,12 @@ impl InstrumentState {
                         2.0,
                         quote.min_balance,
                     );
-                    if self.full_quote_balance_debouncer.check(
+                    if self.trade.full_quote_balance_debouncer.check(
                         can_restore,
                         now_ms,
                         CAN_QUOTE_FULL_SIZE_DEBOUNCE_MS,
                     ) {
-                        self.reduced_quote_level_side = None;
+                        self.trade.reduced_quote_level_side = None;
                     }
                 }
                 self.quote_balance >= quote.min_balance
@@ -331,7 +339,7 @@ impl InstrumentState {
                     base.min_balance,
                 );
                 if !full_sufficient {
-                    self.reduced_quote_level_side = Some(side);
+                    self.trade.reduced_quote_level_side = Some(side);
                     if !self.trade_balance_sufficient(
                         self.config.max_order_size,
                         1,
@@ -341,7 +349,7 @@ impl InstrumentState {
                     ) {
                         return false;
                     }
-                } else if self.reduced_quote_level_side == Some(side) {
+                } else if self.trade.reduced_quote_level_side == Some(side) {
                     let can_restore = self.trade_balance_sufficient(
                         self.config.max_order_size,
                         full_levels,
@@ -349,12 +357,12 @@ impl InstrumentState {
                         2.0,
                         base.min_balance,
                     );
-                    if self.full_quote_balance_debouncer.check(
+                    if self.trade.full_quote_balance_debouncer.check(
                         can_restore,
                         now_ms,
                         CAN_QUOTE_FULL_SIZE_DEBOUNCE_MS,
                     ) {
-                        self.reduced_quote_level_side = None;
+                        self.trade.reduced_quote_level_side = None;
                     }
                 }
                 quote.max_balance <= 0.0 || self.quote_balance < quote.max_balance
@@ -396,7 +404,7 @@ impl InstrumentState {
     }
 
     pub(super) fn quote_level_count(&self, side: Side) -> usize {
-        if self.reduced_quote_level_side == Some(side) {
+        if self.trade.reduced_quote_level_side == Some(side) {
             1
         } else {
             self.config.num_quote_levels
@@ -404,17 +412,18 @@ impl InstrumentState {
     }
 
     pub(super) fn can_quote(&self, side: Side) -> bool {
-        self.quote_profit_margin() < 1.0 && self.can_trade.get(&side).copied().unwrap_or(false)
+        self.quote_profit_margin() < 1.0
+            && self.trade.can_trade.get(&side).copied().unwrap_or(false)
     }
 
     pub(super) fn can_take(&self, side: Side) -> bool {
         self.hedge_profit_margin() < 1.0
-            && self.can_trade.get(&side).copied().unwrap_or(false)
+            && self.trade.can_trade.get(&side).copied().unwrap_or(false)
             && self.can_take_within_price_limit(side)
     }
 
     pub(super) fn update_take_rate(&mut self, side: Side, ref_mid: f64) {
-        let rate = if self.can_trade.get(&side).copied().unwrap_or(false) {
+        let rate = if self.trade.can_trade.get(&side).copied().unwrap_or(false) {
             self.effective_levels(side.reverse())
                 .first()
                 .map(|level| {
@@ -433,15 +442,15 @@ impl InstrumentState {
             f64::NAN
         };
         match side {
-            Side::Buy => self.take_buy_rate = rate,
-            Side::Sell => self.take_sell_rate = rate,
+            Side::Buy => self.trade.take_buy_rate = rate,
+            Side::Sell => self.trade.take_sell_rate = rate,
         }
     }
 
     pub(super) fn take_rate(&self, side: Side) -> f64 {
         match side {
-            Side::Buy => self.take_buy_rate,
-            Side::Sell => self.take_sell_rate,
+            Side::Buy => self.trade.take_buy_rate,
+            Side::Sell => self.trade.take_sell_rate,
         }
     }
 
@@ -449,7 +458,8 @@ impl InstrumentState {
         let size_limit = self.config.max_order_size * if is_hedge { 10.0 } else { 1.0 };
         if self.config.kind.is_spot()
             && self.balances_initialized
-            && let (Some(base), Some(quote)) = (&self.base_coin_config, &self.quote_coin_config)
+            && let (Some(base), Some(quote)) =
+                (&self.trade.base_coin_config, &self.trade.quote_coin_config)
         {
             let mid = self.mid().unwrap_or(0.0);
             if mid <= 0.0 {
@@ -493,7 +503,7 @@ impl InstrumentState {
         let available_by_margin = if side.factor() * self.position_qty < 0.0 {
             f64::MAX
         } else if self.margin_initialized
-            && let Some(margin_coin) = &self.margin_coin_config
+            && let Some(margin_coin) = &self.trade.margin_coin_config
         {
             let mid = self.mid().unwrap_or(0.0);
             if mid <= 0.0 {
@@ -626,7 +636,8 @@ impl InstrumentState {
         };
 
         if self.config.kind.is_spot()
-            && let (Some(base), Some(quote)) = (&self.base_coin_config, &self.quote_coin_config)
+            && let (Some(base), Some(quote)) =
+                (&self.trade.base_coin_config, &self.trade.quote_coin_config)
         {
             let mid = self.mid().unwrap_or(ref_mid);
             let quote_skew = mid * quote.buy_skew;
@@ -943,7 +954,8 @@ impl InstrumentState {
 
     pub(super) fn posn_skew(&self) -> f64 {
         if self.config.kind.is_spot()
-            && let (Some(base), Some(quote)) = (&self.base_coin_config, &self.quote_coin_config)
+            && let (Some(base), Some(quote)) =
+                (&self.trade.base_coin_config, &self.trade.quote_coin_config)
         {
             let base_skew = -base.integrated_skew(self.inventory_position());
             let quote_skew = -(self.quote_balance - quote.skew_offset) * quote.buy_skew;
@@ -1029,7 +1041,8 @@ impl InstrumentState {
 
     pub(super) fn average_skew_rate_to(&self, target_pos: f64) -> f64 {
         if self.config.kind.is_spot()
-            && let (Some(base), Some(quote)) = (&self.base_coin_config, &self.quote_coin_config)
+            && let (Some(base), Some(quote)) =
+                (&self.trade.base_coin_config, &self.trade.quote_coin_config)
         {
             return base.average_skew_rate(self.inventory_position(), target_pos)
                 + self.mid().unwrap_or(0.0) * quote.buy_skew;
