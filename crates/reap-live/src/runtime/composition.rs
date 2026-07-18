@@ -1,16 +1,10 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::Duration;
 
-use reap_okx_live_adapter::{
-    BoundRegularOrderGateway, ForbiddenOrderObserver, PrivateStateSessionFactory,
-};
-use reap_order::OkxReconciliationClient;
 use reap_storage::{OrderAckStatus, OrderOperation, StorageRecord, StorageRuntime, StorageSink};
 
 use crate::safety_contracts::LiveCleanSoakInputs;
 
-use super::readiness_safety::{ExchangeInstrumentGuard, ReadinessPort, SafetyPort};
 use super::{
     LiveConfigFileEvidence, LiveFailureEvidence, LiveLatencyCollector, LiveMode, LiveRuntimeError,
     LiveStopReason, MAX_LIVE_FAILURE_MESSAGE_BYTES, OrderStatus, ReadinessSnapshot,
@@ -32,17 +26,6 @@ pub(super) struct CompositionState {
     pub(super) storage_sink: StorageSink,
     pub(super) evidence: RuntimeEvidence,
     pub(super) latency: LiveLatencyCollector,
-}
-
-pub(super) struct AccountSeed {
-    pub(super) account_id: String,
-    pub(super) readiness: Arc<dyn ReadinessPort>,
-    pub(super) reconciliation: OkxReconciliationClient,
-    pub(super) forbidden_observer: ForbiddenOrderObserver,
-    pub(super) private_state_sessions: PrivateStateSessionFactory,
-    pub(super) bound_order_gateway: Option<BoundRegularOrderGateway>,
-    pub(super) safety: Option<Arc<dyn SafetyPort>>,
-    pub(super) instrument_guard: ExchangeInstrumentGuard,
 }
 
 #[derive(Debug, Clone, Copy, Default)]

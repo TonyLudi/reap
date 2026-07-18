@@ -42,7 +42,7 @@ use tokio::task::JoinHandle;
 use crate::forbidden_orders::ForbiddenOrderState;
 use crate::{
     LiveAccountConfig, LiveStorageConfig, OkxTradeModeConfig, OkxVenueConfig, RuntimeConfig,
-    VerifiedInstrument,
+    VerifiedBootstrap, VerifiedInstrument,
 };
 
 use super::*;
@@ -61,6 +61,7 @@ fn production_runtime_keeps_single_owner_responsibility_state() {
         .split_once("#[cfg(test)]\n#[path = \"../tests/runtime_unit/mod.rs\"]\nmod tests")
         .expect("runtime test module marker");
     let responsibility_modules = [
+        include_str!("../../src/runtime/bootstrap.rs"),
         include_str!("../../src/runtime/composition.rs"),
         include_str!("../../src/runtime/connectivity.rs"),
         include_str!("../../src/runtime/dispatch.rs"),
