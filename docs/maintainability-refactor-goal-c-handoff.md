@@ -1,7 +1,7 @@
 # Maintainability Refactor Goal C Handoff
 
-Status: active. Phases 0–4 are complete and green. Phase 5 and final global
-verification remain pending. Nothing in this document approves demo
+Status: complete. Phases 0–5 and final global verification are green. Nothing
+in this document approves demo
 trading, production order entry, authenticated exchange activity, target-host
 deployment, or a low-latency runtime redesign.
 
@@ -24,8 +24,8 @@ verified starting structure remains the completed
 | Phase 2: live runtime decomposition | Complete | Green; source through `05ac08382e4251f7c627cd7ac3f0cc1fc89fade2`; the handoff commit is the documentation commit containing this record |
 | Phase 3: coordinator reductions | Complete | Green; source through `81df4f303f8e7814ba0c390404190a8628eddfe1`; the handoff commit is the documentation commit containing this record |
 | Phase 4: backtest runner decomposition | Complete | Green; source through `99928badaad578773c96047c72616c5d3c60efe9`; the handoff commit is the documentation commit containing this record |
-| Phase 5: assurance decomposition | Pending | Not started |
-| Final global verification | Pending | Not started |
+| Phase 5: assurance decomposition | Complete | Green; source and structural guards through `ec13782f5839c011b4a7961e727acb368427f756` |
+| Final global verification | Complete | Green; the handoff commit is the documentation commit containing this record |
 
 ## Phase 0 Reference And Clean State
 
@@ -1049,14 +1049,168 @@ performance gate remains scheduled after Phase 5.
 Chaos behavior reference; Phase 4 did not import generic gateway, `ExecAlgo`,
 unrelated strategy, or session-pool behavior.
 
-## Pending Completion Evidence
+## Phase 5: Offline Assurance Decomposition
 
-Each remaining phase must append:
+Phase 5 is complete and green through
+`ec13782f5839c011b4a7961e727acb368427f756`. The economic-statement and
+production-evidence validators remain single serial, fail-closed offline
+pipelines, but their artifact, policy, binding, calculation, and report
+responsibilities now live in named private modules. No schema, public
+re-export, dependency, authority, validation order, error text, source
+freshness rule, or canonical output changed.
 
-- exact phase commits and before/after responsibility measurements;
-- focused commands and results;
-- public-surface, dependency, deterministic, source-policy, and compile-fail
-  comparisons;
-- required post-phase benchmark runs;
-- any justified structural exception or explicit deferral; and
-- the final full-workspace verification and clean-tree evidence.
+### Phase 5 Structure
+
+The economic statement started at 5,034 physical lines: 4,001 production and
+1,033 test lines. Its final production layout is:
+
+| Production source | Lines | Responsibility |
+| --- | ---: | --- |
+| `economic_statement.rs` | 761 | Public schemas, private shared records, source binding, journal recovery, and the sole reconciliation entry |
+| `economic_statement/artifacts.rs` | 333 | Exact artifact loading and identity/manifest binding |
+| `economic_statement/cash_continuity.rs` | 584 | Account-boundary and per-currency cash-chain validation |
+| `economic_statement/position_basis.rs` | 545 | Runtime sessions, authoritative position basis, and journal trade evidence |
+| `economic_statement/trade_bills.rs` | 717 | Normal-trade, journal-fill, fee/balance, and derivative-PnL validation |
+| `economic_statement/funding_bills.rs` | 973 | Settlement, mark, position, payment, and funding-formula validation |
+| `economic_statement/report.rs` | 426 | Ordered evidence assembly, bill dispatch, completeness, and report construction |
+| `economic_statement/support.rs` | 235 | Narrow comparison, issue, instrument, and naming helpers |
+
+The external economic test tree contains 1,511 lines across seven
+responsibility tests, shared support, and a 440-line structural regression.
+No production module exceeds 1,500 lines. `build_report` is 149 lines,
+`validate_trade_bill` is 73, `validate_funding_bill` is below 150,
+`validate_account_balance_continuity` is 64, and
+`build_journal_trade_evidence` is 47; every economic production function is at
+most 250 lines.
+
+The economic structural guard requires the exact seven child modules, the
+terminal external-test marker, files below 1,500 lines, brace-scanned
+functions no longer than 250 lines, `pub(super)`-only child visibility,
+explicit sequential dependencies, and no include, glob, async, task, channel,
+lock, or trait-object decomposition. It also pins the sole public
+reconciliation entry, exact lease acquisition -> journal read -> recovery ->
+report construction -> lease drop -> return order, report stage order, the
+ordered `"2"` trade / `"8"` funding / unknown fail-closed dispatch, and the
+exact `"173" | "174"` funding subtype boundary.
+
+The production-evidence file started at 3,887 physical lines: 3,436 production
+and 451 test lines. Its final production layout is:
+
+| Production source | Lines | Responsibility |
+| --- | ---: | --- |
+| `production_evidence.rs` | 689 | Serialized schemas, sole verifier entry, ordered top-level stages, and authority-false result |
+| `production_evidence/manifest.rs` | 657 | Strict manifest validation, loading, path resolution, and uniqueness |
+| `production_evidence/canonical.rs` | 25 | Canonical hashes, scenario names, and failure sort keys |
+| `production_evidence/policy_time.rs` | 334 | Freshness policy and the sole wall-clock implementation |
+| `production_evidence/bindings.rs` | 1,315 | Ordered cross-artifact identity, account, and gate bindings |
+| `production_evidence/source_verifiers.rs` | 526 | Serial source reconstruction, before/after checks, and exact config reopen |
+| `production_evidence/report.rs` | 272 | Expected identity, summaries, and ordered gate reports |
+
+The verifier entry is 121 lines and `evaluate_bindings` is 17. The largest
+binding helper is 225 lines, the largest report helper is approximately 168,
+and every production function is at most 250 lines. The external evidence
+tests total 1,477 lines and include a 523-line structural regression. That
+guard requires the exact six child modules, bounded file/function sizes,
+narrow visibility, no parallel/concurrent decomposition, the exact verifier
+and binding stage order, one wall-clock sample, and exactly one
+`production_order_entry_authorized: false` assignment with no true or later
+mutation.
+
+### Phase 5 Compatibility Evidence
+
+The focused economic suite grew from 30 to 34 tests and remained green. The
+canonical economic report SHA-256 remains
+`da1607a6459af0f6c9f30a963a335cd6aeb96d0896b7e7df7b6fd2eee8d7595e`.
+The evidence suite grew from 18 to 22 tests; all 22 and all three production
+approval tests pass. The fixed compact synthetic report and approval-subject
+hashes remain respectively
+`ca0e09a2e2f741d72a2497904abd592f8266255ebc34f2365ac24bdb5f3ee706`
+and
+`483e676610b0d5104bfa6b35af1e2ba90b2bb12f6d36a2f7e0edd9397d141104`.
+
+Every extraction ran its focused package tests, formatting and diff checks,
+and relevant Clippy gate. The final affected suites included 237
+`reap-live` unit tests, both live compile-fail cases, four dependency-policy
+tests, one runtime-config compatibility test, 41 `reap-cli` tests, and all
+affected documentation tests. Unknown fields remain denied, before/after
+artifact equality checks remain ordered around reconciliation, the evidence
+manifest and all configs are reopened after expensive verification, and the
+verifier still samples wall time exactly once only after source reconstruction.
+
+The focused Phase 5 commits, in order, are:
+
+```text
+c0b26a1  split economic statement tests
+124ae02  split production evidence unit tests
+1601c57  pin economic report canonical hash
+c61f861  characterize production evidence contracts
+3c04ee5  extract economic statement support
+362e71c  extract production evidence manifest
+50a2a1c  pin production evidence canonical hashes
+5e0b10d  keep economic tests outside production scans
+80f6e19  extract evidence policy and hashing
+8bad36f  extract economic artifact validation
+1120720  extract production evidence bindings
+fb2630e  extract economic cash continuity
+82ac09b  extract production evidence source verifiers
+7103dae  extract production evidence report helpers
+43c5b2e  extract economic position basis
+3eb6658  split evidence binding evaluation
+35f91b5  extract economic trade bills
+981f79e  stage production evidence verification
+c156804  shorten economic continuity validators
+be595ac  extract economic funding bills
+1802ce6  guard production evidence structure
+56334cd  extract economic report construction
+deb459d  shorten economic funding validation
+6e04ad5  shorten economic trade validation
+5e39faa  bound economic report construction
+ec13782  guard economic statement structure
+```
+
+## Final Global Verification
+
+The completion command ran formatting, workspace all-target Clippy with
+warnings denied, the full locked workspace test suite without fail-fast, a
+locked release workspace build, systemd unit verification, locked metadata,
+and `git diff --check`; every command exited `0`. `cargo audit --deny warnings`
+also exited `0` after scanning all 249 locked dependencies. The three checked
+systemd units each retained an exposure score of `2.9 OK`.
+
+The canonical CLI backtest ran twice; `cmp` exited `0` and both outputs retained
+SHA-256
+`38acf9f5e0c310f2ec5528974beffadf4c1a7f84d46efa8d9664ee7051e84691`.
+`Cargo.lock`, all three deterministic fixtures, and both example
+configurations retained every normative SHA-256 recorded in Phase 0.
+
+One unrecorded warm-up and three recorded completion benchmark runs produced:
+
+| Engine run | ns/event | Intents |
+| --- | ---: | ---: |
+| Warm-up | 11,114.2 | 999,996 |
+| Recorded 1 | 11,148.4 | 999,996 |
+| Recorded 2 | 11,054.4 | 999,996 |
+| Recorded 3 | 11,058.7 | 999,996 |
+| Recorded median | 11,058.7 | 999,996 |
+
+The engine completion median is 3.49% below the Phase 0 median.
+
+| Live run | ns/raw frame | Allocation calls | Requested bytes | Parsed | Feed outputs | Records | Actions |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Warm-up | 17,627.1 | 4,193,771 | 1,871,951,969 | 50,204 | 70,208 | 65,130 | 0 |
+| Recorded 1 | 17,192.1 | 4,193,771 | 1,871,951,969 | 50,204 | 70,208 | 65,130 | 0 |
+| Recorded 2 | 17,076.3 | 4,193,771 | 1,871,951,969 | 50,204 | 70,208 | 65,130 | 0 |
+| Recorded 3 | 17,082.6 | 4,193,771 | 1,871,951,969 | 50,204 | 70,208 | 65,130 | 0 |
+| Recorded median | 17,082.6 | 4,193,771 | 1,871,951,969 | 50,204 | 70,208 | 65,130 | 0 |
+
+The live completion median is 0.02% above the Phase 0 median. Allocation calls,
+requested bytes, and every logical counter are exact. No performance
+investigation threshold was crossed.
+
+`../imm-strategy` is clean at
+`b6b120c7b7c466d8431bf082f3229328c5d7b2ae`, and its bounded Chaos path
+remains the behavioral reference. No generic gateway, `ExecAlgo`, unrelated
+strategy, or session-pool behavior entered Reap's supported scope. Goal C
+therefore completes the maintainability milestone only; it does not make a
+production-readiness, authenticated-trading, deployment, or colocated-HFT
+claim.
