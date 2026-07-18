@@ -1,6 +1,6 @@
 # Maintainability Refactor Goal C Handoff
 
-Status: active. Phases 0–3 are complete and green. Phases 4–5 and final global
+Status: active. Phases 0–4 are complete and green. Phase 5 and final global
 verification remain pending. Nothing in this document approves demo
 trading, production order entry, authenticated exchange activity, target-host
 deployment, or a low-latency runtime redesign.
@@ -23,7 +23,7 @@ verified starting structure remains the completed
 | Phase 1: Chaos strategy decomposition | Complete | Green; the handoff commit is the documentation commit containing this record and is identified by Git history because a commit cannot self-reference its own SHA |
 | Phase 2: live runtime decomposition | Complete | Green; source through `05ac08382e4251f7c627cd7ac3f0cc1fc89fade2`; the handoff commit is the documentation commit containing this record |
 | Phase 3: coordinator reductions | Complete | Green; source through `81df4f303f8e7814ba0c390404190a8628eddfe1`; the handoff commit is the documentation commit containing this record |
-| Phase 4: backtest runner decomposition | Pending | Not started |
+| Phase 4: backtest runner decomposition | Complete | Green; source through `99928badaad578773c96047c72616c5d3c60efe9`; the handoff commit is the documentation commit containing this record |
 | Phase 5: assurance decomposition | Pending | Not started |
 | Final global verification | Pending | Not started |
 
@@ -886,6 +886,168 @@ crossed. Phase 3 therefore satisfies its structural, transition-order,
 authority, dependency, deterministic, allocation, and timing gates without
 broadening the plan-derived Quote, Hedge, and CancelOwned capability boundary
 or the behavioral reference to `../imm-strategy`.
+
+## Phase 4: Backtest Runner Decomposition
+
+Phase 4 is complete and green through
+`99928badaad578773c96047c72616c5d3c60efe9`. `BacktestRunner` remains the
+single public deterministic facade and mutable owner. Its replay, scheduler,
+order lifecycle, valuation, funding, accounting, metrics, carry, and report
+behavior now live in named private responsibility modules. The refactor did
+not route backtest through `reap-live`, change the partial live/backtest parity
+boundary, add a dependency, or change a public schema.
+
+### Phase 4 Structure
+
+Before Phase 4, `crates/reap-backtest/src/lib.rs` contained 3,544 physical
+lines: 2,280 production lines and 1,264 co-located test lines under the Phase
+0 counting convention. The final root facade contains 331 physical lines,
+including its three-line test-module declaration. The production
+responsibilities are:
+
+| Production source | Physical lines | Responsibility |
+| --- | ---: | --- |
+| `lib.rs` | 331 | Public exports and schemas, private action/observation types, sole runner aggregate, and narrow shared retiming helpers |
+| `runner/construction.rs` | 285 | Constructors, carry restoration, execution configuration, and coverage validation |
+| `runner/input.rs` | 331 | Normalized/raw replay loading, input-clock handling, replay transitions, horizon advancement, and carry handoff |
+| `runner/schedule.rs` | 139 | Deterministic scheduled-action insertion, inclusive/exclusive drains, and action execution |
+| `runner/orders.rs` | 135 | Exchange-update routing, FIFO strategy intent acceptance, matching lookup, and open-order discovery |
+| `runner/accounting.rs` | 149 | Initial and periodic account publication, balances, positions, and margin snapshots |
+| `runner/valuation.rs` | 204 | Currency rates, valuation marks, readiness, and active-order notional |
+| `runner/funding.rs` | 131 | Funding-rate registration, preload, settlement, and settlement watermarking |
+| `runner/metrics.rs` | 97 | Metric-clock integration and risk sampling |
+| `runner/carry.rs` | 425 | Carry validation/rebinding, close checks, and settled carry construction |
+| `runner/report.rs` | 249 | Final drain, completeness calculations, carry result, metrics, and report construction |
+| `runner/state.rs` | 93 | Private behavior-free by-value state bags |
+
+Every production file is below the 1,500-line ceiling. The largest production
+function remains the unchanged 246-line
+`BacktestCarryState::validate_for`; the grouped-field formatting makes
+`BacktestRunner::finish_report` 244 physical lines. No runner production
+function exceeds 250 lines.
+
+The 28 original runner tests remain 28 tests and are split into seven
+responsibility files plus their shared module. The test files contain 1,642
+physical lines; the largest is `valuation.rs` at 402 lines. The strengthened
+structural regression is 365 lines and checks the complete production module
+set rather than treating an extracted monolith as success.
+
+### Phase 4 Ownership And Determinism
+
+The approximately 67-field aggregate is now exactly 11 by-value root fields:
+
+```text
+strategy_config
+strategy
+execution
+latency_sampler
+replay
+schedule
+orders
+valuation
+funding
+accounting
+metrics
+```
+
+The four direct dependencies remain direct leaves. The seven private state
+bags contain respectively 9, 2, 18, 8, 4, 8, and 14 leaves, for exactly 67
+original leaves declared once. They have no behavioral implementations,
+independent mutation APIs, locks, channels, trait objects, or cloned shadow
+state. All mutation still occurs through inherent methods on the one
+`BacktestRunner`.
+
+The structural guard scans the facade and every runner production module. It
+requires the exact 11-field root, exact leaf signatures, by-value grouping,
+behavior-free bags, explicit imports, files below 1,500 lines, and no
+`Arc`, mutex/RwLock, channel, spawn, or dynamic-dispatch ownership. It also
+reasserts the absence of a normal `reap-backtest -> reap-live` dependency.
+
+Mechanical extraction preserved:
+
+- the `BTreeMap<(due_ns, sequence)>` scheduler, sequence starting at one,
+  saturating sequence increment, and time-then-sequence tie breaking;
+- exclusive `drain_before`, inclusive `drain_through`, input-before-existing
+  equal-time work, and pop-first then `max(now, due)` execution;
+- raw preload/boundary/replay/horizon order and normalized
+  collect/preload/chronological order;
+- latency sampling sites, FIFO recursive intent processing, synchronous
+  `PendingNew`, order-before-account delivery, activation, and cancel
+  deduplication;
+- exchange-mark precedence, source-time currency freshness, stable map
+  traversal and explicit sorts;
+- funding failure/counter/watermark order, floating-point reduction order,
+  carry construction, and report field order; and
+- constructor collection creation order:
+  `pending_cancels`, `depth_marks`, `exchange_marks`,
+  `currency_rate_observations`, `realized_funding_rates`,
+  `scheduled_funding`, then `settled_funding`.
+
+An independent audit compared all 58 pre/post production functions. After
+normalizing only grouped-field qualification, 57 non-constructor bodies were
+token-identical to baseline apart from two rustfmt-only syntactic changes.
+The constructor retained its validation/local creation sequence and the
+randomized collection order above. The audit found no code, authority,
+visibility, dependency, schema, ordering, or size issue.
+
+### Phase 4 Commits
+
+The focused Phase 4 commits, in order, are:
+
+```text
+3bb4eac9274bef7c61943766412d7157d86cb0e8  split runner unit tests
+f83427e99490287bb5aee51988c46849562ebf23  extract carry validation
+bdecf3794fcabc4facc2d752854a5b13478178ab  extract runner construction
+6ac3b54815f7f326a61cc6368961b62471076d93  extract replay input flow
+c49e93b238c208e1dff97e76dc21513863ad74ce  extract funding settlement
+7f3e547d2bb6f0b0ee8cdfc053f0237f7fd68a5d  extract account publication
+6121f46155518bd0709309bea1c77010987932f0  extract order lifecycle
+b98fffdaab8dfc22e4a92c1608eaab9947847069  extract deterministic scheduler
+6dc1a07b4282d2246e9ac5ce7a6c8337b1c99ae2  extract valuation flow
+dc17c568c361473da79fd5a96f5e2fd62b98fe2a  extract risk metrics
+75a5616e20e0f654cb0746e3eeb1d728bbd97c82  extract carry construction
+a23d2a26310695d787f6acc39eb47a00dced33de  extract report construction
+469167d88365bb22ad04f7ffa0b8a596b5ac65f1  group replay and schedule state
+24020a0b1b8a1f490e025e59b0ef59d549a1ea35  group order lifecycle state
+7c125d69b10d95dcb81830f216350b87df835fc1  group valuation state
+bb0951dcf841f0aa970b017c95c440edea626b76  group funding state
+bc03d8d32ee1d8da976e2111dbca552754966514  group accounting state
+99928badaad578773c96047c72616c5d3c60efe9  group metric state and strengthen structural guards
+```
+
+### Phase 4 Test And Compatibility Evidence
+
+The final Phase 4 gates passed:
+
+- 118 `reap-backtest` tests;
+- all three `reap-live` dependency-policy tests;
+- five `reap-engine` tests;
+- 74 `reap-strategy` tests, its compile-fail cases, and the exact normalized
+  fixture intent-order test;
+- `cargo clippy -p reap-backtest --all-targets --locked -- -D warnings`;
+- `cargo fmt --all -- --check`, `git diff --check`, and locked metadata; and
+- the focused tests after every responsibility extraction and state-grouping
+  commit.
+
+The public re-export block remains byte-exact at SHA-256
+`bdedd9c258b714e550d10fa74e768abcd846708cab51b165f9fef7041988b527`.
+The carry/report schema block remains byte-exact at SHA-256
+`61dbf500ff6974f1c25c65ad06cd48fc072e8e050fef88ceaf836f365472459e`.
+The backtest manifest remains
+`41ae4335cda079b7e9af92cdeb8777cc77318324d636106a8f16c9e9d4c33f93`;
+`Cargo.lock`, deterministic fixtures, and both example configurations retain
+their normative hashes.
+
+The canonical CLI backtest was run twice after the final state grouping.
+`cmp` exited `0`, and both outputs have SHA-256
+`38acf9f5e0c310f2ec5528974beffadf4c1a7f84d46efa8d9664ee7051e84691`.
+No Phase 4 change touched the engine or live hot path; the required completion
+performance gate remains scheduled after Phase 5.
+
+`../imm-strategy` remains clean at
+`b6b120c7b7c466d8431bf082f3229328c5d7b2ae`. Its role remains the bounded
+Chaos behavior reference; Phase 4 did not import generic gateway, `ExecAlgo`,
+unrelated strategy, or session-pool behavior.
 
 ## Pending Completion Evidence
 
