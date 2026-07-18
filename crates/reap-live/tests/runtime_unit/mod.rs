@@ -23,7 +23,7 @@ use reap_strategy::{
     ChaosConfig, ChaosExecutionIntent, ChaosStrategy, InstrumentConfig, InstrumentKindConfig,
     ReferenceDataKind, RiskGroupConfig,
 };
-use reap_telemetry::AlertSink;
+use reap_telemetry::{AlertDeliveryFailure, AlertSink};
 use reap_venue::PrivateOrderState;
 use reap_venue::okx::{
     OkxAccountConfig, OkxAccountLevel, OkxApiKeyPermission, OkxFillPage, OkxInstrumentChange,
@@ -46,6 +46,7 @@ use crate::{
     VerifiedBootstrap, VerifiedInstrument,
 };
 
+use super::commit::alert_for_storage_record;
 use super::*;
 
 mod dispatch;
@@ -63,6 +64,7 @@ fn production_runtime_keeps_single_owner_responsibility_state() {
         .expect("runtime test module marker");
     let responsibility_modules = [
         include_str!("../../src/runtime/bootstrap.rs"),
+        include_str!("../../src/runtime/commit.rs"),
         include_str!("../../src/runtime/composition.rs"),
         include_str!("../../src/runtime/connectivity.rs"),
         include_str!("../../src/runtime/dispatch.rs"),
