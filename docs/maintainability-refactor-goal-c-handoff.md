@@ -1,7 +1,7 @@
 # Maintainability Refactor Goal C Handoff
 
-Status: active. Phases 0 and 1 are complete and green. Phases 2–5 and final
-global verification remain pending. Nothing in this document approves demo
+Status: active. Phases 0–2 are complete and green. Phases 3–5 and final global
+verification remain pending. Nothing in this document approves demo
 trading, production order entry, authenticated exchange activity, target-host
 deployment, or a low-latency runtime redesign.
 
@@ -21,7 +21,7 @@ verified starting structure remains the completed
 | Goal C execution contract | Complete | Commit `8fe5fad86ed29fcab5ba80ec3c7ac30e2332bfe0` |
 | Phase 0: baseline and inventory | Complete | Green; commit is the documentation commit containing this record and is identified by Git history because a commit cannot self-reference its own SHA |
 | Phase 1: Chaos strategy decomposition | Complete | Green; the handoff commit is the documentation commit containing this record and is identified by Git history because a commit cannot self-reference its own SHA |
-| Phase 2: live runtime decomposition | Pending | Not started |
+| Phase 2: live runtime decomposition | Complete | Green; source through `05ac08382e4251f7c627cd7ac3f0cc1fc89fade2`; the handoff commit is the documentation commit containing this record |
 | Phase 3: coordinator reductions | Pending | Not started |
 | Phase 4: backtest runner decomposition | Pending | Not started |
 | Phase 5: assurance decomposition | Pending | Not started |
@@ -475,9 +475,219 @@ authority, dependency, allocation, and timing gates. It does not broaden the
 plan-derived Quote, Hedge, and CancelOwned capability boundary or the
 behavioral reference to `../imm-strategy`.
 
+## Phase 2: Live Runtime Decomposition
+
+Phase 2 is complete and green. The one private `LiveRuntime` and one
+`LiveCoordinator` mutation owner remain explicit, while startup, dispatch,
+readiness/safety, reconciliation, commit, shutdown, and lifecycle
+responsibilities now have named modules.
+
+### Phase 2 Structure
+
+The original 8,992-line runtime facade contained 4,784 production lines and
+4,208 test lines. The final facade is 960 physical lines, including its
+three-line external test-module declaration. Its 4,319 test lines and 62 test
+cases are split across seven responsibility files under
+`crates/reap-live/tests/runtime_unit/`.
+
+| Production source | Physical lines | Responsibility |
+| --- | ---: | --- |
+| `runtime.rs` | 960 | Private aggregate, public preparation/run surface, biased event loop, and narrow event-family dispatch |
+| `runtime/bootstrap.rs` | 327 | Authenticated account bootstrap |
+| `runtime/commit.rs` | 300 | Storage-first output commit, alerting, and action dispatch |
+| `runtime/composition.rs` | 265 | Evidence, lifecycle outcome, and failure composition |
+| `runtime/connectivity.rs` | 379 | Feed source state, connectivity events, and latency observation |
+| `runtime/dispatch.rs` | 685 | Order transport events and bounded order task |
+| `runtime/lifecycle.rs` | 186 | Run, close-after-error, and report construction |
+| `runtime/operator_flow.rs` | 245 | Operator command handling |
+| `runtime/planning.rs` | 401 | Exact public/private/order connectivity planning |
+| `runtime/readiness_safety.rs` | 734 | Readiness ports, exchange guards, and safety task |
+| `runtime/reconciliation.rs` | 617 | Convergence, remote recovery, and reconciliation task |
+| `runtime/recovery.rs` | 226 | Durable recovery proof validation and restored state |
+| `runtime/shutdown.rs` | 574 | Guarded startup tasks and ordered teardown |
+| `runtime/startup.rs` | 967 | Ordered startup stages, resource ownership, and final transfer |
+
+No production runtime module exceeds 1,500 lines. No facade was recreated
+under a different name.
+
+| Structural item | Before | After |
+| --- | ---: | ---: |
+| `LiveRuntime::build` | 638 lines | 15 lines (`runtime.rs:585-599`) |
+| `handle_runtime_event` | 332 lines | 104 lines |
+| `run_loop` | 188 lines | 188 lines, byte-identical |
+| Raw market-data event arm | 85 lines | 85 lines, byte-identical |
+| `LiveRuntime` responsibility fields | 7 | 7 |
+| Runtime facade total lines | 8,992 | 960 |
+| Co-located runtime test cases | 61 | 0 |
+| Responsibility-split runtime test cases | 0 | 62 |
+
+`LiveRuntime::build` now performs only this ordered orchestration:
+
+```text
+StartupPlan::resolve
+StartupRecovery::open
+AuthenticatedStartup::bootstrap
+CoordinatorStartup::restore
+RuntimeResources::start
+RuntimeResources::into_runtime
+finish_startup
+```
+
+The startup stages preserve first-error precedence and the original single
+per-account sequence. The storage lease, alert runtime, host guard, supervised
+feeds, order websocket lifecycles, and six task groups remain owned across
+every early return. All raw task handles stay in abort-on-drop
+`StartupTaskGroup` values until `into_runtime`. That transfer has exactly six
+`take` operations and contains no `await`, error propagation, panic accessor,
+spawn, channel construction, or fallible return. An already armed exchange
+deadman remains armed on startup failure, as before.
+
+The source regression test checks the seven stage markers, per-account
+deadman/safety/forbidden/private-feed/order/reconciliation order, immediate
+order-status and websocket-lifecycle retention, and the infallible six-group
+transfer.
+
+### Phase 2 Event And Ownership Invariants
+
+The biased `run_loop` body remained byte-identical, with SHA-256
+`aa19defca2a9fbb9530c4feb544c59a0bac2141c991a7ebc19a69aa09c73f04f`.
+The raw market-data arm also remained byte-identical, with SHA-256
+`f32649dcc19e169f52de19513ebf85aa0f2a72f7bc3c1e51dfafeb49dfe9d1b4`.
+It still contains:
+
+- two `.await` calls;
+- four `.clone()` calls plus one `Arc::clone`;
+- four error `to_string` conversions; and
+- zero `format!`, collection, vector, box, or `Arc` allocation constructors.
+
+Normal market-data processing therefore gained no await, blocking call,
+clone, allocation, or dynamic dispatch. Storage/action order, bounded-channel
+behavior, event priority, reconciliation, and shutdown order are unchanged.
+
+The runtime source scanner now covers the facade and all 13 production
+responsibility modules. It finds exactly one
+`coordinator: LiveCoordinator`, all six responsibility-state fields, no
+canonical `Arc<Mutex<_>>`, and no production `use super::*`. The temporary
+startup carrier uses the affine field `owner: LiveCoordinator`; it is consumed
+into the final runtime and cannot create a second mutable owner.
+
+### Phase 2 Authority Moves
+
+Each sensitive lexical owner move was isolated and reviewed separately.
+
+| Seam | Before | After | Cardinality |
+| --- | --- | --- | ---: |
+| `ProvenRegularSubmitRequest` live owner | `runtime.rs` | `runtime/recovery.rs` | Four workspace owners before and after |
+| `.take_approval_scope(` live owner | `runtime.rs` | `runtime/startup.rs` | Three workspace owners before and after |
+| `.start_and_install(` live call | `runtime.rs: 1` | `runtime/startup.rs: 1` | One live file and one call before and after |
+| `.take_command_dispatcher(` live owner | `runtime/dispatch.rs` | Unchanged | Two workspace owners |
+
+The expected sets name exact files. No directory, wildcard, additional owner,
+visibility increase, public transport seam, or changed diagnostic was
+accepted. The live, order, feed, adapter, and venue compile-fail boundaries
+remain green.
+
+### Phase 2 Commits
+
+The focused Phase 2 commits, in order, are:
+
+```text
+4c251e32393194a90d4e45563a523fdfc17f800e  extract runtime unit tests
+5e1eb195bdf8e772a94c67df60573442902a020b  extract runtime planning
+81c6f301c0927cf10a712e7ac53be78d922839ad  extract readiness safety
+5c01fb470bdda370d9627bd43f59a32ea9e1a916  split runtime tests by responsibility
+b7af5e4d5cec6c64bbcd7f19288e90d31ecbfc9f  extract account bootstrap
+94cfd10c50884bdf770efcf050de242049c0fdda  extract runtime recovery
+a3afba5a6ee35345a9f44b0e70a50ac1a52e6df3  split runtime event families
+40942b665260ff78e9aabdcc645b30b3675bcd5f  extract runtime commit path
+0764e824ab28b7b9753e3ce783114b20cd0aed44  extract runtime reconciliation
+b2e25f8dbaa21c1c38aaf5d4f45238d18d208241  split operator and readiness flows
+39c942de5b4c5059ae68c793f86848fac27e1e9e  extract runtime shutdown
+5503bcdb686381c7241ff637f27404b686f9ac35  extract runtime lifecycle
+7f91b945f33ac41828ec11d7d442690e30f5cf95  stage runtime startup
+1d354ecf181c190c0c70568eacf2189e520c57a6  move approval scope startup seam
+05ac08382e4251f7c627cd7ac3f0cc1fc89fade2  move order lane startup seam
+```
+
+### Phase 2 Test And Policy Evidence
+
+The final affected-package command was:
+
+```bash
+TMPDIR=/home/ubuntu/code/reap/target/tmp \
+  cargo test \
+    -p reap-live \
+    -p reap-feed \
+    -p reap-order \
+    -p reap-okx-live-adapter \
+    -p reap-storage \
+    -p reap-fault \
+    --locked --no-fail-fast
+```
+
+It passed:
+
+- 231 live unit tests, two live UI cases, three dependency-policy tests, and
+  one runtime-configuration compatibility test;
+- 70 feed tests and four feed UI cases;
+- 60 order tests and five order UI cases;
+- 37 live-adapter tests and six adapter UI cases;
+- 24 storage tests;
+- 25 fault tests; and
+- all affected doc tests.
+
+The independent Phase 2 audit additionally passed all three venue UI cases,
+the exact single-owner test, staged-startup order/transfer test, startup task
+rollback test, `cargo fmt --all -- --check`, and `git diff --check`.
+`cargo clippy -p reap-live --all-targets --locked -- -D warnings` also passed
+after the final source change.
+
+All four recorded public root-source hashes, all four target manifest hashes,
+`Cargo.lock`, deterministic fixtures, example configurations, and trybuild
+diagnostics remain exact. `../imm-strategy` remains clean at
+`b6b120c7b7c466d8431bf082f3229328c5d7b2ae`.
+
+### Phase 2 Determinism And Performance
+
+The canonical CLI backtest was run twice after `05ac083`; `cmp` exited `0`.
+Both outputs have SHA-256
+`38acf9f5e0c310f2ec5528974beffadf4c1a7f84d46efa8d9664ee7051e84691`.
+
+One unrecorded warm-up and three recorded benchmark runs used the Phase 0 host
+and toolchain.
+
+| Engine run | ns/event | Intents |
+| --- | ---: | ---: |
+| Warm-up | 11,037.3 | 999,996 |
+| Recorded 1 | 13,822.1 | 999,996 |
+| Recorded 2 | 11,067.4 | 999,996 |
+| Recorded 3 | 11,105.9 | 999,996 |
+| Recorded median | 11,105.9 | 999,996 |
+
+The engine median is 3.08% below the Phase 0 median. The first recorded run was
+a timing outlier; logical work remained exact and the required three-run
+median did not cross the investigation threshold.
+
+| Live run | ns/raw frame | Allocation calls/raw | Requested bytes/raw | Parsed | Feed outputs | Records | Actions |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Warm-up | 17,056.7 | 83.53 | 37,286.9 | 50,204 | 70,208 | 65,130 | 0 |
+| Recorded 1 | 17,064.6 | 83.53 | 37,286.9 | 50,204 | 70,208 | 65,130 | 0 |
+| Recorded 2 | 17,319.9 | 83.53 | 37,286.9 | 50,204 | 70,208 | 65,130 | 0 |
+| Recorded 3 | 17,021.5 | 83.53 | 37,286.9 | 50,204 | 70,208 | 65,130 | 0 |
+| Recorded median | 17,064.6 | 83.53 | 37,286.9 | 50,204 | 70,208 | 65,130 | 0 |
+
+The live median is 0.09% below the Phase 0 median. Every run retained exactly
+`4,193,771` allocation calls and `1,871,951,969` requested bytes. Recorded
+stage medians were 2,932.3 ns/unit for wire parse and raw record, 7,722.9 for
+deduplication/sequence/book, and 4,024.4 for
+coordinator/strategy/risk/storage.
+
+Phase 2 therefore satisfies its structural, rollback, event-order, authority,
+dependency, deterministic, allocation, and timing gates.
+
 ## Pending Completion Evidence
 
-Each later phase must append:
+Each remaining phase must append:
 
 - exact phase commits and before/after responsibility measurements;
 - focused commands and results;
