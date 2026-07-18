@@ -97,6 +97,22 @@ struct AccountBalanceState {
 
 impl ChaosStrategy {
     pub(super) fn check_risk_limits(&mut self) -> bool {
+        if !self.check_strategy_risk_limits() {
+            return false;
+        }
+        if !self.check_risk_group_limits() {
+            return false;
+        }
+        let Some(ref_mid) = self.ref_mid() else {
+            return true;
+        };
+        if !self.check_trading_pnl_limit(ref_mid) {
+            return false;
+        }
+        self.check_liabilities_and_balance_sheet(ref_mid)
+    }
+
+    fn check_strategy_risk_limits(&mut self) -> bool {
         if self.halt_reason.is_some() {
             return false;
         }
@@ -133,6 +149,10 @@ impl ChaosStrategy {
             ));
             return false;
         }
+        true
+    }
+
+    fn check_risk_group_limits(&mut self) -> bool {
         for group in self.risk_groups.values() {
             if !group.delta_usd.is_finite() || !group.pending_delta_usd.is_finite() {
                 self.halt_reason = Some(format!(
@@ -217,10 +237,10 @@ impl ChaosStrategy {
                 }
             }
         }
+        true
+    }
 
-        let Some(ref_mid) = self.ref_mid() else {
-            return true;
-        };
+    fn check_trading_pnl_limit(&mut self, ref_mid: f64) -> bool {
         let trading_pnl = self
             .entities
             .values()
@@ -241,6 +261,10 @@ impl ChaosStrategy {
             ));
             return false;
         }
+        true
+    }
+
+    fn check_liabilities_and_balance_sheet(&mut self, ref_mid: f64) -> bool {
         let mut total_balance_usd = 0.0;
         let mut seen_balances = HashSet::new();
         for group in self.risk_groups.values() {
