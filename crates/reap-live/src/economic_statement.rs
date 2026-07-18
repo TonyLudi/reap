@@ -751,7 +751,9 @@ pub fn reconcile_okx_economics_paths(
     };
     let executable_sha256 =
         current_executable_sha256().map_err(EconomicReconciliationError::ExecutableHash)?;
-    Ok(build_report(sources, options, executable_sha256))
+    let report = build_report(sources, options, executable_sha256);
+    drop(lease);
+    Ok(report)
 }
 
 #[cfg(test)]
