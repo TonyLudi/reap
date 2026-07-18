@@ -1,5 +1,5 @@
 use reap_core::{FillFee, FillLiquidity};
-use reap_venue::okx::{OkxBillExecutionType, OkxBillMarginMode};
+use reap_venue::okx::{OkxBillExecutionType, OkxBillMarginMode, OkxInstrumentType};
 
 use super::super::*;
 use super::support::*;
