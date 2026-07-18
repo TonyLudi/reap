@@ -15,7 +15,10 @@ fn runner_requires_explicit_rates_for_non_usd_accounting_currencies() {
 fn delivered_currency_index_values_portfolio_and_report_evidence() {
     let mut runner =
         BacktestRunner::with_execution_config(usdt_config(), usdt_execution(0, 1_000)).unwrap();
-    runner.depth_marks.insert("BTC-USDT".to_string(), 110.0);
+    runner
+        .valuation
+        .depth_marks
+        .insert("BTC-USDT".to_string(), 110.0);
     let events = vec![
         NormalizedEvent::Market(MarketEvent::IndexPrice {
             ts_ms: 1,
@@ -241,7 +244,10 @@ fn configured_opening_portfolio_keeps_order_entry_blocked_without_valuation() {
 fn stale_currency_index_makes_final_accounting_incomplete() {
     let mut runner =
         BacktestRunner::with_execution_config(usdt_config(), usdt_execution(0, 1)).unwrap();
-    runner.depth_marks.insert("BTC-USDT".to_string(), 110.0);
+    runner
+        .valuation
+        .depth_marks
+        .insert("BTC-USDT".to_string(), 110.0);
     let events = vec![
         NormalizedEvent::Market(MarketEvent::IndexPrice {
             ts_ms: 1,
@@ -270,7 +276,10 @@ fn stale_currency_index_makes_final_accounting_incomplete() {
 fn fill_before_delayed_currency_index_records_conversion_failure() {
     let mut runner =
         BacktestRunner::with_execution_config(usdt_config(), usdt_execution(10, 1_000)).unwrap();
-    runner.depth_marks.insert("BTC-USDT".to_string(), 110.0);
+    runner
+        .valuation
+        .depth_marks
+        .insert("BTC-USDT".to_string(), 110.0);
     let events = vec![
         NormalizedEvent::Market(MarketEvent::IndexPrice {
             ts_ms: 1,

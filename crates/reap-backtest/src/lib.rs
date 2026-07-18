@@ -240,7 +240,7 @@ mod runner_state;
 #[path = "runner/valuation.rs"]
 mod runner_valuation;
 use runner_construction::validate_currency_rate_coverage;
-use runner_state::{OrderLifecycleState, ReplayState, ScheduleState};
+use runner_state::{OrderLifecycleState, ReplayState, ScheduleState, ValuationState};
 
 #[derive(Debug)]
 enum ScheduledAction {
@@ -280,10 +280,7 @@ pub struct BacktestRunner {
     replay: ReplayState,
     schedule: ScheduleState,
     orders: OrderLifecycleState,
-    depth_marks: HashMap<Symbol, f64>,
-    exchange_marks: HashMap<Symbol, f64>,
-    currency_by_index_symbol: HashMap<Symbol, String>,
-    currency_rate_observations: HashMap<String, CurrencyRateObservation>,
+    valuation: ValuationState,
     realized_funding_rates: HashMap<(Symbol, u64), f64>,
     scheduled_funding: HashSet<(Symbol, u64)>,
     settled_funding: HashSet<(Symbol, u64)>,
@@ -294,10 +291,6 @@ pub struct BacktestRunner {
     invalid_funding_rate_events: u64,
     missed_funding_settlements: u64,
     funding_settlement_failures: u64,
-    currency_rate_events: u64,
-    invalid_currency_rate_events: u64,
-    opening_equity_usd: Option<f64>,
-    opening_valuation_at_ns: Option<u64>,
     peak_equity_usd: f64,
     max_drawdown_usd: f64,
     max_abs_delta_usd: f64,

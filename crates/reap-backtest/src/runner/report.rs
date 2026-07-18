@@ -36,9 +36,10 @@ impl BacktestRunner {
             && final_pending_delta_usd.is_finite();
         let final_equity_usd = checked_final_equity
             .unwrap_or_else(|| self.portfolio.equity_usd(&marks, &fallback_currency_rates));
-        let opening_valuation_complete = self.opening_equity_usd.is_some();
+        let opening_valuation_complete = self.valuation.opening_equity_usd.is_some();
         let net_pnl_usd = if final_valuation_complete {
-            self.opening_equity_usd
+            self.valuation
+                .opening_equity_usd
                 .zip(checked_final_equity)
                 .map(|(opening, final_equity)| final_equity - opening)
         } else {
@@ -83,7 +84,7 @@ impl BacktestRunner {
             && self.invalid_funding_rate_events == 0
             && self.missed_funding_settlements == 0
             && self.funding_settlement_failures == 0
-            && self.invalid_currency_rate_events == 0
+            && self.valuation.invalid_currency_rate_events == 0
             && self.portfolio.currency_conversion_failures() == 0
             && self.portfolio.invalid_accounting_events() == 0
             && self.invalid_risk_metric_samples == 0
@@ -160,8 +161,8 @@ impl BacktestRunner {
             final_delta_usd,
             final_pending_delta_usd,
             final_active_order_notional_usd,
-            opening_equity_usd: self.opening_equity_usd,
-            opening_valuation_at_ns: self.opening_valuation_at_ns,
+            opening_equity_usd: self.valuation.opening_equity_usd,
+            opening_valuation_at_ns: self.valuation.opening_valuation_at_ns,
             opening_valuation_complete,
             final_equity_usd,
             net_pnl_usd,
@@ -186,8 +187,8 @@ impl BacktestRunner {
             estimated_fee_fills: self.portfolio.estimated_fee_fills(),
             funding_pnl_usd: self.portfolio.funding_pnl_usd(),
             turnover_usd: self.portfolio.turnover_usd(),
-            currency_rate_events: self.currency_rate_events,
-            invalid_currency_rate_events: self.invalid_currency_rate_events,
+            currency_rate_events: self.valuation.currency_rate_events,
+            invalid_currency_rate_events: self.valuation.invalid_currency_rate_events,
             currency_conversion_failures: self.portfolio.currency_conversion_failures(),
             invalid_accounting_events: self.portfolio.invalid_accounting_events(),
             currency_rate_coverage_complete,

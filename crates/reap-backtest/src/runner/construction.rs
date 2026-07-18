@@ -9,6 +9,7 @@ use crate::{
     BacktestCarryState, BacktestConfig, BacktestExecutionConfig, BacktestInitialPortfolioConfig,
     BacktestRunner, BacktestTimeBasis, CurrencyRateObservation, MatchingAssumptions,
     MatchingEngine, OrderLifecycleState, ReplayState, ScheduleState, ScheduledAction,
+    ValuationState,
 };
 
 impl BacktestRunner {
@@ -51,12 +52,12 @@ impl BacktestRunner {
         let mut runner =
             Self::with_initial_portfolio_config(config, execution, carry.portfolio.clone())?;
         runner.replay.now_ns = carry.settled_at_ns;
-        runner.opening_equity_usd = Some(carry.terminal_equity_usd);
-        runner.opening_valuation_at_ns = Some(carry.settled_at_ns);
+        runner.valuation.opening_equity_usd = Some(carry.terminal_equity_usd);
+        runner.valuation.opening_valuation_at_ns = Some(carry.settled_at_ns);
         runner.peak_equity_usd = carry.terminal_equity_usd;
-        runner.depth_marks = carry.terminal_depth_marks.into_iter().collect();
-        runner.exchange_marks = carry.terminal_exchange_marks.into_iter().collect();
-        runner.currency_rate_observations = carry
+        runner.valuation.depth_marks = carry.terminal_depth_marks.into_iter().collect();
+        runner.valuation.exchange_marks = carry.terminal_exchange_marks.into_iter().collect();
+        runner.valuation.currency_rate_observations = carry
             .currency_rates
             .into_iter()
             .map(|rate| {
@@ -173,10 +174,16 @@ impl BacktestRunner {
                 maker_fills: 0,
                 taker_fills: 0,
             },
-            depth_marks: HashMap::new(),
-            exchange_marks: HashMap::new(),
-            currency_by_index_symbol,
-            currency_rate_observations: HashMap::new(),
+            valuation: ValuationState {
+                depth_marks: HashMap::new(),
+                exchange_marks: HashMap::new(),
+                currency_by_index_symbol,
+                currency_rate_observations: HashMap::new(),
+                currency_rate_events: 0,
+                invalid_currency_rate_events: 0,
+                opening_equity_usd,
+                opening_valuation_at_ns,
+            },
             realized_funding_rates: HashMap::new(),
             scheduled_funding: HashSet::new(),
             settled_funding: HashSet::new(),
@@ -187,10 +194,6 @@ impl BacktestRunner {
             invalid_funding_rate_events: 0,
             missed_funding_settlements: 0,
             funding_settlement_failures: 0,
-            currency_rate_events: 0,
-            invalid_currency_rate_events: 0,
-            opening_equity_usd,
-            opening_valuation_at_ns,
             peak_equity_usd: 0.0,
             max_drawdown_usd: 0.0,
             max_abs_delta_usd: 0.0,

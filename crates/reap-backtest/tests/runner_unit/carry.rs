@@ -91,7 +91,10 @@ fn settled_carry_round_trips_portfolio_margin_and_raw_handoff() {
     });
     let carried =
         BacktestRunner::with_carry_state(strategy.clone(), execution.clone(), carry).unwrap();
-    assert_eq!(carried.opening_equity_usd, report.opening_equity_usd);
+    assert_eq!(
+        carried.valuation.opening_equity_usd,
+        report.opening_equity_usd
+    );
     carried
         .validate_carry_handoff(&RawReplayBoundary {
             capture_session_id: "session-a".to_string(),

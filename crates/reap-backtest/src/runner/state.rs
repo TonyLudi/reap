@@ -1,8 +1,10 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use reap_core::Symbol;
 
-use crate::{BacktestTimeBasis, MatchingEngine, RawReplayBoundary, ScheduledAction};
+use crate::{
+    BacktestTimeBasis, CurrencyRateObservation, MatchingEngine, RawReplayBoundary, ScheduledAction,
+};
 
 pub(super) struct ReplayState {
     pub(super) time_basis: BacktestTimeBasis,
@@ -40,4 +42,15 @@ pub(super) struct OrderLifecycleState {
     pub(super) fills: usize,
     pub(super) maker_fills: usize,
     pub(super) taker_fills: usize,
+}
+
+pub(super) struct ValuationState {
+    pub(super) depth_marks: HashMap<Symbol, f64>,
+    pub(super) exchange_marks: HashMap<Symbol, f64>,
+    pub(super) currency_by_index_symbol: HashMap<Symbol, String>,
+    pub(super) currency_rate_observations: HashMap<String, CurrencyRateObservation>,
+    pub(super) currency_rate_events: u64,
+    pub(super) invalid_currency_rate_events: u64,
+    pub(super) opening_equity_usd: Option<f64>,
+    pub(super) opening_valuation_at_ns: Option<u64>,
 }

@@ -6,7 +6,10 @@ fn realized_funding_rate_settles_signed_linear_swap_position() {
     cfg.instruments[1].kind = InstrumentKindConfig::LinearSwap;
     cfg.instruments[1].taker_fee = 0.0;
     let mut runner = BacktestRunner::new(cfg).unwrap();
-    runner.depth_marks.insert("BTC-PERP".to_string(), 50_000.0);
+    runner
+        .valuation
+        .depth_marks
+        .insert("BTC-PERP".to_string(), 50_000.0);
     runner.portfolio.apply_fill(
         &OrderUpdate {
             ts_ms: 0,

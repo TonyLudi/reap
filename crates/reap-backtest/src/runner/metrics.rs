@@ -21,7 +21,7 @@ impl BacktestRunner {
             .positions()
             .values()
             .any(|quantity| *quantity != 0.0);
-        if self.opening_equity_usd.is_none() {
+        if self.valuation.opening_equity_usd.is_none() {
             return;
         }
         self.risk_metric_samples = self.risk_metric_samples.saturating_add(1);

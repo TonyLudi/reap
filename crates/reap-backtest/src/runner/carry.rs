@@ -336,6 +336,7 @@ impl BacktestRunner {
             let mut carry_rates = Vec::with_capacity(self.execution.currency_rates.len());
             for route in &self.execution.currency_rates {
                 let observation = self
+                    .valuation
                     .currency_rate_observations
                     .get(&route.currency)
                     .with_context(|| {
@@ -393,12 +394,14 @@ impl BacktestRunner {
                 source_raw_boundary: self.replay.raw_replay_boundary.clone(),
                 portfolio,
                 terminal_depth_marks: self
+                    .valuation
                     .depth_marks
                     .iter()
                     .filter(|(_, mark)| mark.is_finite() && **mark > 0.0)
                     .map(|(symbol, mark)| (symbol.clone(), *mark))
                     .collect(),
                 terminal_exchange_marks: self
+                    .valuation
                     .exchange_marks
                     .iter()
                     .filter(|(_, mark)| mark.is_finite() && **mark > 0.0)

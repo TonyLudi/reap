@@ -25,7 +25,7 @@ fn collect_runner_module_sources(directory: &Path, sources: &mut Vec<(String, St
 fn production_runner_keeps_single_owner_responsibility_state() {
     const TEST_MODULE_MARKER: &str =
         "#[cfg(test)]\n#[path = \"../tests/runner_unit/mod.rs\"]\nmod tests";
-    const ROOT_FIELDS: [&str; 41] = [
+    const ROOT_FIELDS: [&str; 34] = [
         "strategy_config: ChaosConfig",
         "strategy: ChaosStrategy",
         "orders: OrderLifecycleState",
@@ -35,10 +35,7 @@ fn production_runner_keeps_single_owner_responsibility_state() {
         "latency_sampler: BacktestLatencySampler",
         "replay: ReplayState",
         "schedule: ScheduleState",
-        "depth_marks: HashMap<Symbol, f64>",
-        "exchange_marks: HashMap<Symbol, f64>",
-        "currency_by_index_symbol: HashMap<Symbol, String>",
-        "currency_rate_observations: HashMap<String, CurrencyRateObservation>",
+        "valuation: ValuationState",
         "realized_funding_rates: HashMap<(Symbol, u64), f64>",
         "scheduled_funding: HashSet<(Symbol, u64)>",
         "settled_funding: HashSet<(Symbol, u64)>",
@@ -49,10 +46,6 @@ fn production_runner_keeps_single_owner_responsibility_state() {
         "invalid_funding_rate_events: u64",
         "missed_funding_settlements: u64",
         "funding_settlement_failures: u64",
-        "currency_rate_events: u64",
-        "invalid_currency_rate_events: u64",
-        "opening_equity_usd: Option<f64>",
-        "opening_valuation_at_ns: Option<u64>",
         "peak_equity_usd: f64",
         "max_drawdown_usd: f64",
         "max_abs_delta_usd: f64",

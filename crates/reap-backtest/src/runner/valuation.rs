@@ -11,15 +11,23 @@ impl BacktestRunner {
         usd_per_unit: f64,
         source_ts_ms: u64,
     ) {
-        let Some(currency) = self.currency_by_index_symbol.get(index_symbol).cloned() else {
+        let Some(currency) = self
+            .valuation
+            .currency_by_index_symbol
+            .get(index_symbol)
+            .cloned()
+        else {
             return;
         };
-        self.currency_rate_events = self.currency_rate_events.saturating_add(1);
+        self.valuation.currency_rate_events = self.valuation.currency_rate_events.saturating_add(1);
         if !usd_per_unit.is_finite() || usd_per_unit <= 0.0 {
-            self.invalid_currency_rate_events = self.invalid_currency_rate_events.saturating_add(1);
+            self.valuation.invalid_currency_rate_events = self
+                .valuation
+                .invalid_currency_rate_events
+                .saturating_add(1);
             return;
         }
-        self.currency_rate_observations.insert(
+        self.valuation.currency_rate_observations.insert(
             currency,
             CurrencyRateObservation {
                 usd_per_unit,
@@ -32,7 +40,11 @@ impl BacktestRunner {
     pub(super) fn fresh_currency_rates(&self) -> HashMap<String, f64> {
         let mut rates = HashMap::from([("USD".to_string(), 1.0)]);
         for route in &self.execution.currency_rates {
-            let Some(observation) = self.currency_rate_observations.get(&route.currency) else {
+            let Some(observation) = self
+                .valuation
+                .currency_rate_observations
+                .get(&route.currency)
+            else {
                 continue;
             };
             let maximum_age_ns = route.max_age_ms.saturating_mul(NS_PER_MS);
@@ -48,6 +60,7 @@ impl BacktestRunner {
         let mut rates = HashMap::from([("USD".to_string(), 1.0)]);
         for route in &self.execution.currency_rates {
             let rate = self
+                .valuation
                 .currency_rate_observations
                 .get(&route.currency)
                 .map(|observation| observation.usd_per_unit)
@@ -63,7 +76,10 @@ impl BacktestRunner {
             .currency_rates
             .iter()
             .map(|route| {
-                let observation = self.currency_rate_observations.get(&route.currency);
+                let observation = self
+                    .valuation
+                    .currency_rate_observations
+                    .get(&route.currency);
                 let age_ns = observation.map(|observation| {
                     self.replay
                         .now_ns
@@ -127,7 +143,7 @@ impl BacktestRunner {
     }
 
     pub(super) fn order_entry_ready(&self) -> bool {
-        self.valuation_inputs_ready() && self.opening_equity_usd.is_some()
+        self.valuation_inputs_ready() && self.valuation.opening_equity_usd.is_some()
     }
 
     fn valuation_inputs_ready(&self) -> bool {
@@ -136,7 +152,11 @@ impl BacktestRunner {
             .values()
             .all(|matcher| matcher.depth().is_some())
             && self.execution.currency_rates.iter().all(|route| {
-                let Some(observation) = self.currency_rate_observations.get(&route.currency) else {
+                let Some(observation) = self
+                    .valuation
+                    .currency_rate_observations
+                    .get(&route.currency)
+                else {
                     return false;
                 };
                 observation.usd_per_unit.is_finite()
@@ -150,14 +170,14 @@ impl BacktestRunner {
     }
 
     pub(super) fn observe_order_entry_readiness(&mut self) {
-        if self.opening_equity_usd.is_none() && self.valuation_inputs_ready() {
+        if self.valuation.opening_equity_usd.is_none() && self.valuation_inputs_ready() {
             let marks = self.valuation_marks();
             let currency_rates = self.fresh_currency_rates();
             if let Some(opening_equity_usd) =
                 self.portfolio.equity_usd_checked(&marks, &currency_rates)
             {
-                self.opening_equity_usd = Some(opening_equity_usd);
-                self.opening_valuation_at_ns = Some(self.replay.now_ns);
+                self.valuation.opening_equity_usd = Some(opening_equity_usd);
+                self.valuation.opening_valuation_at_ns = Some(self.replay.now_ns);
                 self.peak_equity_usd = opening_equity_usd;
             }
         }
@@ -173,8 +193,8 @@ impl BacktestRunner {
             .iter()
             .filter_map(|(symbol, matcher)| Some((symbol.clone(), matcher.depth()?.mid()?)))
             .collect::<HashMap<_, _>>();
-        marks.extend(self.depth_marks.clone());
-        marks.extend(self.exchange_marks.clone());
+        marks.extend(self.valuation.depth_marks.clone());
+        marks.extend(self.valuation.exchange_marks.clone());
         marks
     }
 }

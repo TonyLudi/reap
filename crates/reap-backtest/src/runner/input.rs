@@ -138,7 +138,7 @@ impl BacktestRunner {
                     .latency_sampler
                     .sample(BacktestLatencyClass::MarketDepth, &book.symbol);
                 if let Some(mid) = book.mid().filter(|mid| mid.is_finite() && *mid > 0.0) {
-                    self.depth_marks.insert(book.symbol.clone(), mid);
+                    self.valuation.depth_marks.insert(book.symbol.clone(), mid);
                 }
                 let updates = self
                     .matcher_mut(&book.symbol)?
@@ -216,7 +216,9 @@ impl BacktestRunner {
                     .latency_sampler
                     .sample(BacktestLatencyClass::ReferenceData, symbol);
                 if mark_price.is_finite() && *mark_price > 0.0 {
-                    self.exchange_marks.insert(symbol.clone(), *mark_price);
+                    self.valuation
+                        .exchange_marks
+                        .insert(symbol.clone(), *mark_price);
                 }
                 self.drain_through(now_ns)?;
                 self.schedule_after(

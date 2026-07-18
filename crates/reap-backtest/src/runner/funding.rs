@@ -91,14 +91,15 @@ impl BacktestRunner {
             self.funding_settlement_failures += 1;
             return;
         };
-        if self.opening_equity_usd.is_none() {
+        if self.valuation.opening_equity_usd.is_none() {
             self.funding_settlement_failures += 1;
             return;
         }
         let mark = self
+            .valuation
             .exchange_marks
             .get(&symbol)
-            .or_else(|| self.depth_marks.get(&symbol))
+            .or_else(|| self.valuation.depth_marks.get(&symbol))
             .copied()
             .unwrap_or(f64::NAN);
         let currency_rates = self.fresh_currency_rates();

@@ -19,7 +19,7 @@ impl BacktestRunner {
             }
 
             let account_update = if update.has_fill() {
-                if self.opening_equity_usd.is_none() {
+                if self.valuation.opening_equity_usd.is_none() {
                     bail!(
                         "fill for {} arrived before the configured opening portfolio could be valued",
                         update.symbol
