@@ -94,7 +94,8 @@ impl BacktestRunner {
         &self,
         currency_rates: &HashMap<String, f64>,
     ) -> Option<f64> {
-        self.matchers
+        self.orders
+            .matchers
             .iter()
             .try_fold(0.0, |total, (symbol, matcher)| {
                 let notional = matcher.active_order_notional_checked()?;
@@ -111,7 +112,8 @@ impl BacktestRunner {
     }
 
     pub(super) fn active_order_notional_usd(&self, currency_rates: &HashMap<String, f64>) -> f64 {
-        self.matchers
+        self.orders
+            .matchers
             .iter()
             .filter_map(|(symbol, matcher)| {
                 matcher.active_order_notional_checked().map(|notional| {
@@ -129,7 +131,8 @@ impl BacktestRunner {
     }
 
     fn valuation_inputs_ready(&self) -> bool {
-        self.matchers
+        self.orders
+            .matchers
             .values()
             .all(|matcher| matcher.depth().is_some())
             && self.execution.currency_rates.iter().all(|route| {
@@ -158,13 +161,14 @@ impl BacktestRunner {
                 self.peak_equity_usd = opening_equity_usd;
             }
         }
-        if self.order_entry_ready_at_ns.is_none() && self.order_entry_ready() {
-            self.order_entry_ready_at_ns = Some(self.replay.now_ns);
+        if self.orders.order_entry_ready_at_ns.is_none() && self.order_entry_ready() {
+            self.orders.order_entry_ready_at_ns = Some(self.replay.now_ns);
         }
     }
 
     pub(super) fn valuation_marks(&self) -> HashMap<Symbol, f64> {
         let mut marks = self
+            .orders
             .matchers
             .iter()
             .filter_map(|(symbol, matcher)| Some((symbol.clone(), matcher.depth()?.mid()?)))

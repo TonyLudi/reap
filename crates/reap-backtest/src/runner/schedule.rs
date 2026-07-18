@@ -19,7 +19,7 @@ impl BacktestRunner {
                     }
                     matcher.activate(&order_id, now_ms)
                 };
-                self.exchange_activations += 1;
+                self.orders.exchange_activations += 1;
                 self.route_exchange_updates(updates)?;
             }
             ScheduledAction::CancelOrder {
@@ -27,7 +27,7 @@ impl BacktestRunner {
                 order_id,
                 reason,
             } => {
-                self.pending_cancels.remove(&order_id);
+                self.orders.pending_cancels.remove(&order_id);
                 let now_ms = time_ms(self.replay.now_ns);
                 let updates = self
                     .matcher_mut(&symbol)?
@@ -40,14 +40,14 @@ impl BacktestRunner {
                 self.accept_intents(commands)?;
             }
             ScheduledAction::DeliverAccount(update) => {
-                self.pending_fill_account_updates =
-                    self.pending_fill_account_updates.saturating_sub(1);
+                self.orders.pending_fill_account_updates =
+                    self.orders.pending_fill_account_updates.saturating_sub(1);
                 let event = retime_strategy_event(
                     StrategyEvent::Account(update),
                     time_ms(self.replay.now_ns),
                 );
                 let commands = self.strategy.on_event(&event);
-                self.last_account_publish_ns = Some(self.replay.now_ns);
+                self.orders.last_account_publish_ns = Some(self.replay.now_ns);
                 self.accept_intents(commands)?;
             }
             ScheduledAction::DeliverStrategy(event) => {
@@ -64,21 +64,21 @@ impl BacktestRunner {
                     self.register_currency_rate(&symbol, price, source_ts_ms);
                 }
                 if matches!(event, StrategyEvent::Account(_)) {
-                    self.last_account_publish_ns = Some(self.replay.now_ns);
+                    self.orders.last_account_publish_ns = Some(self.replay.now_ns);
                 }
                 let commands = self.strategy.on_event(&event);
                 self.accept_intents(commands)?;
             }
             ScheduledAction::RefreshAccount => {
-                let due = self.last_account_publish_ns.is_some_and(|last| {
+                let due = self.orders.last_account_publish_ns.is_some_and(|last| {
                     self.replay.now_ns.saturating_sub(last) >= ACCOUNT_REFRESH_INTERVAL_NS
                 });
-                if due && self.pending_fill_account_updates == 0 {
+                if due && self.orders.pending_fill_account_updates == 0 {
                     let update = self.current_account_update(None);
                     let commands = self.strategy.on_event(&StrategyEvent::Account(update));
-                    self.last_account_publish_ns = Some(self.replay.now_ns);
-                    self.periodic_account_refreshes =
-                        self.periodic_account_refreshes.saturating_add(1);
+                    self.orders.last_account_publish_ns = Some(self.replay.now_ns);
+                    self.orders.periodic_account_refreshes =
+                        self.orders.periodic_account_refreshes.saturating_add(1);
                     self.accept_intents(commands)?;
                 }
                 self.schedule_next_account_refresh();

@@ -52,11 +52,13 @@ impl BacktestRunner {
                 .unwrap_or(0.0)
         });
         let pending_orders = self
+            .orders
             .matchers
             .values()
             .map(MatchingEngine::pending_order_count)
             .sum();
         let live_orders = self
+            .orders
             .matchers
             .values()
             .map(MatchingEngine::live_order_count)
@@ -131,30 +133,30 @@ impl BacktestRunner {
             last_arrival_ns: self.replay.last_arrival_ns,
             input_clock_regressions: self.replay.input_clock_regressions,
             max_input_clock_regression_ns: self.replay.max_input_clock_regression_ns,
-            order_entry_ready_at_ns: self.order_entry_ready_at_ns,
+            order_entry_ready_at_ns: self.orders.order_entry_ready_at_ns,
             order_entry_ready_at_end,
-            new_orders_blocked_not_ready: self.new_orders_blocked_not_ready,
+            new_orders_blocked_not_ready: self.orders.new_orders_blocked_not_ready,
             strategy_halt_reason: self.strategy.halt_reason().map(str::to_string),
-            orders_sent: self.orders_sent,
-            cancel_requests: self.cancel_requests,
-            deduplicated_cancel_requests: self.deduplicated_cancel_requests,
-            ignored_cancel_requests: self.ignored_cancel_requests,
-            exchange_activations: self.exchange_activations,
-            cancelled_orders: self.cancelled_orders,
-            rejected_orders: self.rejected_orders,
-            fills: self.fills,
-            maker_fills: self.maker_fills,
-            taker_fills: self.taker_fills,
+            orders_sent: self.orders.orders_sent,
+            cancel_requests: self.orders.cancel_requests,
+            deduplicated_cancel_requests: self.orders.deduplicated_cancel_requests,
+            ignored_cancel_requests: self.orders.ignored_cancel_requests,
+            exchange_activations: self.orders.exchange_activations,
+            cancelled_orders: self.orders.cancelled_orders,
+            rejected_orders: self.orders.rejected_orders,
+            fills: self.orders.fills,
+            maker_fills: self.orders.maker_fills,
+            taker_fills: self.orders.taker_fills,
             pending_scheduled_actions: self.schedule.scheduled.len(),
             pending_activation_actions,
             pending_cancel_actions,
             pending_order_update_actions,
             pending_strategy_event_actions,
             pending_funding_actions,
-            periodic_account_refreshes: self.periodic_account_refreshes,
+            periodic_account_refreshes: self.orders.periodic_account_refreshes,
             pending_orders,
             live_orders,
-            pending_cancel_requests: self.pending_cancels.len(),
+            pending_cancel_requests: self.orders.pending_cancels.len(),
             final_delta_usd,
             final_pending_delta_usd,
             final_active_order_notional_usd,

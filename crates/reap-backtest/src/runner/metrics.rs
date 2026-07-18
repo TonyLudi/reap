@@ -58,6 +58,7 @@ impl BacktestRunner {
             valid = false;
         }
         let active_orders = self
+            .orders
             .matchers
             .values()
             .map(|matcher| matcher.pending_order_count() + matcher.live_order_count())

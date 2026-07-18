@@ -240,7 +240,7 @@ mod runner_state;
 #[path = "runner/valuation.rs"]
 mod runner_valuation;
 use runner_construction::validate_currency_rate_coverage;
-use runner_state::{ReplayState, ScheduleState};
+use runner_state::{OrderLifecycleState, ReplayState, ScheduleState};
 
 #[derive(Debug)]
 enum ScheduledAction {
@@ -273,18 +273,13 @@ struct CurrencyRateObservation {
 pub struct BacktestRunner {
     strategy_config: ChaosConfig,
     strategy: ChaosStrategy,
-    matchers: BTreeMap<Symbol, MatchingEngine>,
     portfolio: Portfolio,
     initial_portfolio: BacktestInitialPortfolioConfig,
-    initial_account_snapshot_delivered: bool,
     execution: BacktestExecutionConfig,
     latency_sampler: BacktestLatencySampler,
     replay: ReplayState,
     schedule: ScheduleState,
-    pending_cancels: HashSet<String>,
-    pending_fill_account_updates: usize,
-    last_account_publish_ns: Option<u64>,
-    periodic_account_refreshes: u64,
+    orders: OrderLifecycleState,
     depth_marks: HashMap<Symbol, f64>,
     exchange_marks: HashMap<Symbol, f64>,
     currency_by_index_symbol: HashMap<Symbol, String>,
@@ -293,18 +288,6 @@ pub struct BacktestRunner {
     scheduled_funding: HashSet<(Symbol, u64)>,
     settled_funding: HashSet<(Symbol, u64)>,
     last_settled_funding_time_ms: BTreeMap<Symbol, u64>,
-    order_entry_ready_at_ns: Option<u64>,
-    new_orders_blocked_not_ready: usize,
-    orders_sent: usize,
-    cancel_requests: usize,
-    deduplicated_cancel_requests: usize,
-    ignored_cancel_requests: usize,
-    exchange_activations: usize,
-    cancelled_orders: usize,
-    rejected_orders: usize,
-    fills: usize,
-    maker_fills: usize,
-    taker_fills: usize,
     funding_rate_events: u64,
     funding_settlements: u64,
     late_funding_rate_events: u64,

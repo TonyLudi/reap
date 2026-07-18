@@ -8,7 +8,7 @@ use crate::{ACCOUNT_REFRESH_INTERVAL_NS, BacktestRunner, ScheduledAction, time_m
 
 impl BacktestRunner {
     pub(super) fn deliver_initial_account_snapshot(&mut self) -> Result<()> {
-        if self.initial_account_snapshot_delivered {
+        if self.orders.initial_account_snapshot_delivered {
             return Ok(());
         }
         let commands = self.strategy.on_event(&StrategyEvent::Account(
@@ -18,8 +18,8 @@ impl BacktestRunner {
         if !commands.is_empty() {
             bail!("initial portfolio unexpectedly produced strategy order intents");
         }
-        self.initial_account_snapshot_delivered = true;
-        self.last_account_publish_ns = Some(self.replay.now_ns);
+        self.orders.initial_account_snapshot_delivered = true;
+        self.orders.last_account_publish_ns = Some(self.replay.now_ns);
         self.schedule_next_account_refresh();
         Ok(())
     }

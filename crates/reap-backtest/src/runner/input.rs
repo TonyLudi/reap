@@ -311,6 +311,7 @@ impl BacktestRunner {
 
     pub(super) fn require_all_configured_books(&self) -> Result<()> {
         let mut missing = self
+            .orders
             .matchers
             .iter()
             .filter(|(_, matcher)| matcher.depth().is_none())

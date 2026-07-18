@@ -8,7 +8,7 @@ use crate::portfolio::{Portfolio, required_accounting_currencies};
 use crate::{
     BacktestCarryState, BacktestConfig, BacktestExecutionConfig, BacktestInitialPortfolioConfig,
     BacktestRunner, BacktestTimeBasis, CurrencyRateObservation, MatchingAssumptions,
-    MatchingEngine, ReplayState, ScheduleState, ScheduledAction,
+    MatchingEngine, OrderLifecycleState, ReplayState, ScheduleState, ScheduledAction,
 };
 
 impl BacktestRunner {
@@ -128,15 +128,14 @@ impl BacktestRunner {
             .any(|quantity| *quantity != 0.0);
         let opening_equity_usd = initial_portfolio.is_empty().then_some(0.0);
         let opening_valuation_at_ns = initial_portfolio.is_empty().then_some(0);
+        let initial_account_snapshot_delivered = initial_portfolio.is_empty();
         let strategy =
             ChaosStrategy::new(config.clone()).context("invalid chaos/iarb2 configuration")?;
         Ok(Self {
             strategy_config: config,
             portfolio,
-            initial_account_snapshot_delivered: initial_portfolio.is_empty(),
             initial_portfolio,
             strategy,
-            matchers,
             execution,
             latency_sampler,
             replay: ReplayState {
@@ -154,10 +153,26 @@ impl BacktestRunner {
                 scheduled: BTreeMap::new(),
                 next_action_seq: 1,
             },
-            pending_cancels: HashSet::new(),
-            pending_fill_account_updates: 0,
-            last_account_publish_ns: None,
-            periodic_account_refreshes: 0,
+            orders: OrderLifecycleState {
+                matchers,
+                initial_account_snapshot_delivered,
+                pending_cancels: HashSet::new(),
+                pending_fill_account_updates: 0,
+                last_account_publish_ns: None,
+                periodic_account_refreshes: 0,
+                order_entry_ready_at_ns: None,
+                new_orders_blocked_not_ready: 0,
+                orders_sent: 0,
+                cancel_requests: 0,
+                deduplicated_cancel_requests: 0,
+                ignored_cancel_requests: 0,
+                exchange_activations: 0,
+                cancelled_orders: 0,
+                rejected_orders: 0,
+                fills: 0,
+                maker_fills: 0,
+                taker_fills: 0,
+            },
             depth_marks: HashMap::new(),
             exchange_marks: HashMap::new(),
             currency_by_index_symbol,
@@ -166,18 +181,6 @@ impl BacktestRunner {
             scheduled_funding: HashSet::new(),
             settled_funding: HashSet::new(),
             last_settled_funding_time_ms: BTreeMap::new(),
-            order_entry_ready_at_ns: None,
-            new_orders_blocked_not_ready: 0,
-            orders_sent: 0,
-            cancel_requests: 0,
-            deduplicated_cancel_requests: 0,
-            ignored_cancel_requests: 0,
-            exchange_activations: 0,
-            cancelled_orders: 0,
-            rejected_orders: 0,
-            fills: 0,
-            maker_fills: 0,
-            taker_fills: 0,
             funding_rate_events: 0,
             funding_settlements: 0,
             late_funding_rate_events: 0,

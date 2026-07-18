@@ -199,8 +199,11 @@ fn settled_carry_preserves_pending_funding_and_settlement_watermark() {
 
     let carry_settled_at_ns = carry.settled_at_ns;
     let mut second = BacktestRunner::with_carry_state(strategy, execution, carry).unwrap();
-    assert!(second.initial_account_snapshot_delivered);
-    assert_eq!(second.last_account_publish_ns, Some(carry_settled_at_ns));
+    assert!(second.orders.initial_account_snapshot_delivered);
+    assert_eq!(
+        second.orders.last_account_publish_ns,
+        Some(carry_settled_at_ns)
+    );
     let second_report = second
         .run([NormalizedEvent::from(MarketEvent::FundingRate {
             ts_ms: 101,
