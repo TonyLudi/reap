@@ -15,7 +15,7 @@ use reap_okx_live_adapter::{
     BoundRegularOrderGateway, OrderCommandWebsocketConfig, OrderCommandWebsocketLifecycle,
     OrderCommandWebsocketStatus,
 };
-use reap_order::{OkxOrderGateway, RegularApprovalScope};
+use reap_order::OkxOrderGateway;
 #[cfg(test)]
 use reap_storage::StorageConfig;
 use reap_storage::{StorageError, StorageRecord};
@@ -64,7 +64,6 @@ mod recovery;
 mod shutdown;
 mod startup;
 
-use bootstrap::AccountSeed;
 use commit::receive_alert_failure;
 #[cfg(test)]
 use composition::RuntimeEvidence;
@@ -580,26 +579,6 @@ struct LiveRuntime {
     readiness_safety: ReadinessSafetyState,
     reconciliation: ReconciliationState,
     shutdown: ShutdownState,
-}
-
-fn take_regular_approval_scopes(
-    seeds: &mut [AccountSeed],
-) -> Result<HashMap<String, RegularApprovalScope>, LiveRuntimeError> {
-    let mut approval_scopes = HashMap::new();
-    for seed in seeds {
-        let Some(gateway) = seed.bound_order_gateway.as_mut() else {
-            continue;
-        };
-        let scope =
-            gateway
-                .take_approval_scope()
-                .map_err(|error| LiveRuntimeError::GatewaySetup {
-                    account_id: seed.account_id.clone(),
-                    message: format!("failed to take regular approval scope: {error}"),
-                })?;
-        approval_scopes.insert(seed.account_id.clone(), scope);
-    }
-    Ok(approval_scopes)
 }
 
 fn start_regular_order_lane(

@@ -279,7 +279,7 @@ impl AuthenticatedStartup {
             &foundation.maintenance_relevance,
         )
         .await?;
-        let approval_scopes = super::take_regular_approval_scopes(&mut seeds)?;
+        let approval_scopes = take_regular_approval_scopes(&mut seeds)?;
         Ok(Self {
             foundation,
             recovered_orders,
@@ -289,6 +289,26 @@ impl AuthenticatedStartup {
             approval_scopes,
         })
     }
+}
+
+fn take_regular_approval_scopes(
+    seeds: &mut [AccountSeed],
+) -> Result<HashMap<String, RegularApprovalScope>, LiveRuntimeError> {
+    let mut approval_scopes = HashMap::new();
+    for seed in seeds {
+        let Some(gateway) = seed.bound_order_gateway.as_mut() else {
+            continue;
+        };
+        let scope =
+            gateway
+                .take_approval_scope()
+                .map_err(|error| LiveRuntimeError::GatewaySetup {
+                    account_id: seed.account_id.clone(),
+                    message: format!("failed to take regular approval scope: {error}"),
+                })?;
+        approval_scopes.insert(seed.account_id.clone(), scope);
+    }
+    Ok(approval_scopes)
 }
 
 pub(super) struct CoordinatorStartup {

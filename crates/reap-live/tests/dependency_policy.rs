@@ -466,7 +466,7 @@ fn regular_order_authority_construction_is_source_allowlisted() {
     assert_eq!(
         approval_scope_takes,
         BTreeSet::from([
-            "crates/reap-live/src/runtime.rs".to_string(),
+            "crates/reap-live/src/runtime/startup.rs".to_string(),
             "crates/reap-okx-live-adapter/src/lib.rs".to_string(),
             "crates/reap-order/src/gateway.rs".to_string(),
         ]),
