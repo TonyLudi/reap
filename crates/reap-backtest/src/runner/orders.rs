@@ -72,7 +72,7 @@ impl BacktestRunner {
                     }
                     self.orders_sent += 1;
                     let symbol = order.symbol.clone();
-                    let now_ms = time_ms(self.now_ns);
+                    let now_ms = time_ms(self.replay.now_ns);
                     let (order_id, pending) =
                         self.matcher_mut(&symbol)?.prepare_submit(order, now_ms);
                     let order_entry_delay_ms = self

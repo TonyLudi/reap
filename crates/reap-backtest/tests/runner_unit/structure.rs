@@ -25,7 +25,7 @@ fn collect_runner_module_sources(directory: &Path, sources: &mut Vec<(String, St
 fn production_runner_keeps_single_owner_responsibility_state() {
     const TEST_MODULE_MARKER: &str =
         "#[cfg(test)]\n#[path = \"../tests/runner_unit/mod.rs\"]\nmod tests";
-    const ROOT_FIELDS: [&str; 67] = [
+    const ROOT_FIELDS: [&str; 58] = [
         "strategy_config: ChaosConfig",
         "strategy: ChaosStrategy",
         "matchers: BTreeMap<Symbol, MatchingEngine>",
@@ -34,11 +34,8 @@ fn production_runner_keeps_single_owner_responsibility_state() {
         "initial_account_snapshot_delivered: bool",
         "execution: BacktestExecutionConfig",
         "latency_sampler: BacktestLatencySampler",
-        "time_basis: BacktestTimeBasis",
-        "raw_replay_boundary: Option<RawReplayBoundary>",
-        "carry_source_boundary: Option<RawReplayBoundary>",
-        "scheduled: BTreeMap<(u64, u64), ScheduledAction>",
-        "next_action_seq: u64",
+        "replay: ReplayState",
+        "schedule: ScheduleState",
         "pending_cancels: HashSet<String>",
         "pending_fill_account_updates: usize",
         "last_account_publish_ns: Option<u64>",
@@ -51,12 +48,6 @@ fn production_runner_keeps_single_owner_responsibility_state() {
         "scheduled_funding: HashSet<(Symbol, u64)>",
         "settled_funding: HashSet<(Symbol, u64)>",
         "last_settled_funding_time_ms: BTreeMap<Symbol, u64>",
-        "now_ns: u64",
-        "first_arrival_ns: Option<u64>",
-        "last_arrival_ns: Option<u64>",
-        "input_events: u64",
-        "input_clock_regressions: u64",
-        "max_input_clock_regression_ns: u64",
         "order_entry_ready_at_ns: Option<u64>",
         "new_orders_blocked_not_ready: usize",
         "orders_sent: usize",
@@ -127,7 +118,7 @@ fn production_runner_keeps_single_owner_responsibility_state() {
             .filter(|line| !line.trim().is_empty())
             .count(),
         ROOT_FIELDS.len(),
-        "test-only extraction must retain the exact 67-field root owner",
+        "BacktestRunner must retain the exact grouped root owner",
     );
     for field in ROOT_FIELDS {
         assert!(

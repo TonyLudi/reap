@@ -8,7 +8,7 @@ use crate::portfolio::{Portfolio, required_accounting_currencies};
 use crate::{
     BacktestCarryState, BacktestConfig, BacktestExecutionConfig, BacktestInitialPortfolioConfig,
     BacktestRunner, BacktestTimeBasis, CurrencyRateObservation, MatchingAssumptions,
-    MatchingEngine, ScheduledAction,
+    MatchingEngine, ReplayState, ScheduleState, ScheduledAction,
 };
 
 impl BacktestRunner {
@@ -50,7 +50,7 @@ impl BacktestRunner {
         carry.validate_for(&config, &execution)?;
         let mut runner =
             Self::with_initial_portfolio_config(config, execution, carry.portfolio.clone())?;
-        runner.now_ns = carry.settled_at_ns;
+        runner.replay.now_ns = carry.settled_at_ns;
         runner.opening_equity_usd = Some(carry.terminal_equity_usd);
         runner.opening_valuation_at_ns = Some(carry.settled_at_ns);
         runner.peak_equity_usd = carry.terminal_equity_usd;
@@ -85,7 +85,7 @@ impl BacktestRunner {
             );
         }
         runner.last_settled_funding_time_ms = carry.last_settled_funding_time_ms;
-        runner.carry_source_boundary = carry.source_raw_boundary;
+        runner.replay.carry_source_boundary = carry.source_raw_boundary;
         runner.deliver_initial_account_snapshot()?;
         Ok(runner)
     }
@@ -139,11 +139,21 @@ impl BacktestRunner {
             matchers,
             execution,
             latency_sampler,
-            time_basis: BacktestTimeBasis::EventTimestampMs,
-            raw_replay_boundary: None,
-            carry_source_boundary: None,
-            scheduled: BTreeMap::new(),
-            next_action_seq: 1,
+            replay: ReplayState {
+                time_basis: BacktestTimeBasis::EventTimestampMs,
+                raw_replay_boundary: None,
+                carry_source_boundary: None,
+                now_ns: 0,
+                first_arrival_ns: None,
+                last_arrival_ns: None,
+                input_events: 0,
+                input_clock_regressions: 0,
+                max_input_clock_regression_ns: 0,
+            },
+            schedule: ScheduleState {
+                scheduled: BTreeMap::new(),
+                next_action_seq: 1,
+            },
             pending_cancels: HashSet::new(),
             pending_fill_account_updates: 0,
             last_account_publish_ns: None,
@@ -156,12 +166,6 @@ impl BacktestRunner {
             scheduled_funding: HashSet::new(),
             settled_funding: HashSet::new(),
             last_settled_funding_time_ms: BTreeMap::new(),
-            now_ns: 0,
-            first_arrival_ns: None,
-            last_arrival_ns: None,
-            input_events: 0,
-            input_clock_regressions: 0,
-            max_input_clock_regression_ns: 0,
             order_entry_ready_at_ns: None,
             new_orders_blocked_not_ready: 0,
             orders_sent: 0,

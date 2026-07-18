@@ -4,7 +4,7 @@ use crate::{BacktestReport, BacktestRunner, MatchingEngine, ScheduledAction};
 
 impl BacktestRunner {
     pub(super) fn finish_report(&mut self) -> Result<BacktestReport> {
-        let now_ns = self.now_ns;
+        let now_ns = self.replay.now_ns;
         self.drain_through(now_ns)?;
         self.observe_order_entry_readiness();
         self.advance_metric_clock(now_ns);
@@ -66,7 +66,7 @@ impl BacktestRunner {
         let mut pending_order_update_actions = 0;
         let mut pending_strategy_event_actions = 0;
         let mut pending_funding_actions = 0;
-        for action in self.scheduled.values() {
+        for action in self.schedule.scheduled.values() {
             match action {
                 ScheduledAction::ActivateOrder { .. } => pending_activation_actions += 1,
                 ScheduledAction::CancelOrder { .. } => pending_cancel_actions += 1,
@@ -97,6 +97,7 @@ impl BacktestRunner {
         );
         let order_entry_ready_at_end = self.order_entry_ready();
         let observed_duration_ns = self
+            .replay
             .first_arrival_ns
             .zip(self.metric_clock_ns)
             .map(|(first, metric_horizon)| metric_horizon.saturating_sub(first))
@@ -123,13 +124,13 @@ impl BacktestRunner {
             execution: self.execution.clone(),
             initial_portfolio: self.initial_portfolio.clone(),
             latency_usage: self.latency_sampler.usage(),
-            time_basis: self.time_basis,
-            raw_replay_boundary: self.raw_replay_boundary.clone(),
-            input_events: self.input_events,
-            first_arrival_ns: self.first_arrival_ns,
-            last_arrival_ns: self.last_arrival_ns,
-            input_clock_regressions: self.input_clock_regressions,
-            max_input_clock_regression_ns: self.max_input_clock_regression_ns,
+            time_basis: self.replay.time_basis,
+            raw_replay_boundary: self.replay.raw_replay_boundary.clone(),
+            input_events: self.replay.input_events,
+            first_arrival_ns: self.replay.first_arrival_ns,
+            last_arrival_ns: self.replay.last_arrival_ns,
+            input_clock_regressions: self.replay.input_clock_regressions,
+            max_input_clock_regression_ns: self.replay.max_input_clock_regression_ns,
             order_entry_ready_at_ns: self.order_entry_ready_at_ns,
             order_entry_ready_at_end,
             new_orders_blocked_not_ready: self.new_orders_blocked_not_ready,
@@ -144,7 +145,7 @@ impl BacktestRunner {
             fills: self.fills,
             maker_fills: self.maker_fills,
             taker_fills: self.taker_fills,
-            pending_scheduled_actions: self.scheduled.len(),
+            pending_scheduled_actions: self.schedule.scheduled.len(),
             pending_activation_actions,
             pending_cancel_actions,
             pending_order_update_actions,

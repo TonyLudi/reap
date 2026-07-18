@@ -25,16 +25,16 @@ impl BacktestRunner {
         }
 
         let funding_time_ns = funding_time_ms.saturating_mul(NS_PER_MS);
-        if funding_time_ns.saturating_add(FUNDING_LATE_TOLERANCE_NS) < self.now_ns {
+        if funding_time_ns.saturating_add(FUNDING_LATE_TOLERANCE_NS) < self.replay.now_ns {
             self.scheduled_funding.remove(&key);
             self.settled_funding.insert(key.clone());
             self.record_settled_funding(&key.0, key.1);
             self.missed_funding_settlements += 1;
             return;
         }
-        let due_ns = if funding_time_ns < self.now_ns {
+        let due_ns = if funding_time_ns < self.replay.now_ns {
             self.late_funding_rate_events += 1;
-            self.now_ns
+            self.replay.now_ns
         } else {
             funding_time_ns
         };

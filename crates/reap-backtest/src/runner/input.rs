@@ -33,14 +33,14 @@ impl BacktestRunner {
 
     pub fn run_raw_capture_path(mut self, path: impl AsRef<Path>) -> Result<BacktestReport> {
         let path = path.as_ref();
-        self.time_basis = BacktestTimeBasis::CaptureReceiveTimestampNs;
+        self.replay.time_basis = BacktestTimeBasis::CaptureReceiveTimestampNs;
         let preload_boundary = replay_raw_capture_timed_path_with_boundary(path, |timed| {
             self.preload_funding_settlement(&timed.event)
         })
         .with_context(|| format!("failed to preload realized funding from {}", path.display()))?;
         if let Some(boundary) = &preload_boundary {
             self.validate_carry_handoff(boundary)?;
-        } else if self.carry_source_boundary.is_some() {
+        } else if self.replay.carry_source_boundary.is_some() {
             bail!("settled raw carry requires sequenced raw replay input");
         }
         let boundary = replay_raw_capture_timed_path_with_boundary(path, |timed| {
@@ -53,7 +53,7 @@ impl BacktestRunner {
         if let Some(boundary) = &boundary {
             self.advance_raw_horizon(boundary.maximum_recv_ts_ns)?;
         }
-        self.raw_replay_boundary = boundary;
+        self.replay.raw_replay_boundary = boundary;
         self.require_all_configured_books()?;
         self.finish_report()
     }
@@ -64,7 +64,7 @@ impl BacktestRunner {
         range: RawCaptureRecordRange,
     ) -> Result<BacktestReport> {
         let path = path.as_ref();
-        self.time_basis = BacktestTimeBasis::CaptureReceiveTimestampNs;
+        self.replay.time_basis = BacktestTimeBasis::CaptureReceiveTimestampNs;
         let preload_boundary = replay_raw_capture_timed_range_path(path, range, |timed| {
             self.preload_funding_settlement(&timed.event)
         })
@@ -92,7 +92,7 @@ impl BacktestRunner {
             bail!("raw capture range boundary changed between preload and replay passes");
         }
         self.advance_raw_horizon(replay_boundary.maximum_recv_ts_ns)?;
-        self.raw_replay_boundary = Some(replay_boundary);
+        self.replay.raw_replay_boundary = Some(replay_boundary);
         self.require_all_configured_books()?;
         self.finish_report()
     }
@@ -101,7 +101,7 @@ impl BacktestRunner {
     where
         I: IntoIterator<Item = NormalizedEvent>,
     {
-        self.time_basis = BacktestTimeBasis::EventTimestampMs;
+        self.replay.time_basis = BacktestTimeBasis::EventTimestampMs;
         let events = events.into_iter().collect::<Vec<_>>();
         for event in &events {
             self.preload_funding_settlement(event)?;
@@ -128,12 +128,12 @@ impl BacktestRunner {
         let arrival_ns = self.register_input_arrival(candidate_arrival_ns);
         self.drain_before(arrival_ns)?;
         self.advance_metric_clock(arrival_ns);
-        self.now_ns = arrival_ns;
+        self.replay.now_ns = arrival_ns;
         self.deliver_initial_account_snapshot()?;
 
         match &event {
             NormalizedEvent::Market(MarketEvent::Depth(book)) => {
-                let now_ns = self.now_ns;
+                let now_ns = self.replay.now_ns;
                 let latency_ms = self
                     .latency_sampler
                     .sample(BacktestLatencyClass::MarketDepth, &book.symbol);
@@ -158,7 +158,7 @@ impl BacktestRunner {
                 taker_side,
                 ..
             }) => {
-                let now_ns = self.now_ns;
+                let now_ns = self.replay.now_ns;
                 let latency_ms = self
                     .latency_sampler
                     .sample(BacktestLatencyClass::HistoricalTrade, symbol);
@@ -179,7 +179,7 @@ impl BacktestRunner {
             NormalizedEvent::Market(
                 MarketEvent::IndexPrice { symbol, .. } | MarketEvent::BurstSignal { symbol, .. },
             ) => {
-                let now_ns = self.now_ns;
+                let now_ns = self.replay.now_ns;
                 let latency_ms = self
                     .latency_sampler
                     .sample(BacktestLatencyClass::ReferenceData, symbol);
@@ -196,7 +196,7 @@ impl BacktestRunner {
                 funding_time_ms,
                 ..
             }) => {
-                let now_ns = self.now_ns;
+                let now_ns = self.replay.now_ns;
                 let latency_ms = self
                     .latency_sampler
                     .sample(BacktestLatencyClass::ReferenceData, symbol);
@@ -211,7 +211,7 @@ impl BacktestRunner {
             NormalizedEvent::Market(MarketEvent::PriceLimits {
                 symbol, mark_price, ..
             }) => {
-                let now_ns = self.now_ns;
+                let now_ns = self.replay.now_ns;
                 let latency_ms = self
                     .latency_sampler
                     .sample(BacktestLatencyClass::ReferenceData, symbol);
@@ -226,7 +226,7 @@ impl BacktestRunner {
                 self.drain_through(now_ns)?;
             }
             NormalizedEvent::Order(update) => {
-                let now_ns = self.now_ns;
+                let now_ns = self.replay.now_ns;
                 self.route_exchange_updates(vec![update.clone()])?;
                 self.drain_through(now_ns)?;
             }
@@ -234,7 +234,7 @@ impl BacktestRunner {
             | NormalizedEvent::Timer(_)
             | NormalizedEvent::Control(_)
             | NormalizedEvent::System(_) => {
-                let now_ns = self.now_ns;
+                let now_ns = self.replay.now_ns;
                 self.schedule_at(
                     now_ns,
                     ScheduledAction::DeliverStrategy(event.into_strategy_event()),
@@ -248,29 +248,29 @@ impl BacktestRunner {
     }
 
     fn register_input_arrival(&mut self, candidate_ns: u64) -> u64 {
-        self.input_events += 1;
-        let arrival_ns = match self.last_arrival_ns {
+        self.replay.input_events += 1;
+        let arrival_ns = match self.replay.last_arrival_ns {
             Some(last_ns) if candidate_ns < last_ns => {
                 let regression_ns = last_ns - candidate_ns;
-                self.input_clock_regressions += 1;
-                self.max_input_clock_regression_ns =
-                    self.max_input_clock_regression_ns.max(regression_ns);
+                self.replay.input_clock_regressions += 1;
+                self.replay.max_input_clock_regression_ns =
+                    self.replay.max_input_clock_regression_ns.max(regression_ns);
                 last_ns
             }
             _ => candidate_ns,
         };
-        self.first_arrival_ns.get_or_insert(arrival_ns);
-        self.last_arrival_ns = Some(arrival_ns);
+        self.replay.first_arrival_ns.get_or_insert(arrival_ns);
+        self.replay.last_arrival_ns = Some(arrival_ns);
         arrival_ns
     }
 
     pub(super) fn advance_raw_horizon(&mut self, horizon_ns: u64) -> Result<()> {
-        if horizon_ns <= self.now_ns {
+        if horizon_ns <= self.replay.now_ns {
             return Ok(());
         }
         self.drain_through(horizon_ns)?;
         self.advance_metric_clock(horizon_ns);
-        self.now_ns = horizon_ns;
+        self.replay.now_ns = horizon_ns;
         self.observe_order_entry_readiness();
         self.sample_risk_metrics();
         Ok(())
@@ -278,7 +278,7 @@ impl BacktestRunner {
 
     pub(super) fn validate_carry_handoff(&self, current: &RawReplayBoundary) -> Result<()> {
         current.validate()?;
-        let Some(previous) = &self.carry_source_boundary else {
+        let Some(previous) = &self.replay.carry_source_boundary else {
             return Ok(());
         };
         previous.validate()?;
@@ -299,10 +299,10 @@ impl BacktestRunner {
                 current.first_capture_record_seq
             );
         }
-        if current.first_recv_ts_ns < self.now_ns {
+        if current.first_recv_ts_ns < self.replay.now_ns {
             bail!(
                 "settled carry receive time regresses: settled_at_ns={}, current_first_recv_ts_ns={}",
-                self.now_ns,
+                self.replay.now_ns,
                 current.first_recv_ts_ns
             );
         }

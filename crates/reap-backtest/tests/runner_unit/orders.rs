@@ -7,7 +7,7 @@ fn order_remains_fillable_until_delayed_cancel_is_effective() {
         ..BacktestExecutionConfig::default()
     };
     let mut runner = BacktestRunner::with_execution_config(config(), execution).unwrap();
-    runner.now_ns = NS_PER_MS;
+    runner.replay.now_ns = NS_PER_MS;
     runner.matcher_mut("BTC-USDT").unwrap().on_depth_at(
         OrderBook::one_level(
             "BTC-USDT",
@@ -75,7 +75,7 @@ fn nanosecond_arrival_clock_preserves_cancel_before_next_market_event() {
         ..BacktestExecutionConfig::default()
     };
     let mut runner = BacktestRunner::with_execution_config(config(), execution).unwrap();
-    runner.now_ns = 100_100_000;
+    runner.replay.now_ns = 100_100_000;
     runner.matcher_mut("BTC-USDT").unwrap().on_depth_at(
         OrderBook::one_level(
             "BTC-USDT",

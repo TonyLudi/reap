@@ -361,6 +361,7 @@ impl BacktestRunner {
             carry_rates.sort_by(|left, right| left.currency.cmp(&right.currency));
 
             let mut pending_funding = self
+                .schedule
                 .scheduled
                 .iter()
                 .filter_map(|(&(due_at_ns, _), action)| {
@@ -386,10 +387,10 @@ impl BacktestRunner {
 
             let state = BacktestCarryState {
                 schema_version: BACKTEST_CARRY_STATE_SCHEMA_VERSION,
-                settled_at_ns: self.now_ns,
+                settled_at_ns: self.replay.now_ns,
                 terminal_equity_usd: terminal_equity_usd
                     .context("terminal equity disappeared while building settled carry")?,
-                source_raw_boundary: self.raw_replay_boundary.clone(),
+                source_raw_boundary: self.replay.raw_replay_boundary.clone(),
                 portfolio,
                 terminal_depth_marks: self
                     .depth_marks

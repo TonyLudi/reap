@@ -235,9 +235,12 @@ mod runner_orders;
 mod runner_report;
 #[path = "runner/schedule.rs"]
 mod runner_schedule;
+#[path = "runner/state.rs"]
+mod runner_state;
 #[path = "runner/valuation.rs"]
 mod runner_valuation;
 use runner_construction::validate_currency_rate_coverage;
+use runner_state::{ReplayState, ScheduleState};
 
 #[derive(Debug)]
 enum ScheduledAction {
@@ -276,11 +279,8 @@ pub struct BacktestRunner {
     initial_account_snapshot_delivered: bool,
     execution: BacktestExecutionConfig,
     latency_sampler: BacktestLatencySampler,
-    time_basis: BacktestTimeBasis,
-    raw_replay_boundary: Option<RawReplayBoundary>,
-    carry_source_boundary: Option<RawReplayBoundary>,
-    scheduled: BTreeMap<(u64, u64), ScheduledAction>,
-    next_action_seq: u64,
+    replay: ReplayState,
+    schedule: ScheduleState,
     pending_cancels: HashSet<String>,
     pending_fill_account_updates: usize,
     last_account_publish_ns: Option<u64>,
@@ -293,12 +293,6 @@ pub struct BacktestRunner {
     scheduled_funding: HashSet<(Symbol, u64)>,
     settled_funding: HashSet<(Symbol, u64)>,
     last_settled_funding_time_ms: BTreeMap<Symbol, u64>,
-    now_ns: u64,
-    first_arrival_ns: Option<u64>,
-    last_arrival_ns: Option<u64>,
-    input_events: u64,
-    input_clock_regressions: u64,
-    max_input_clock_regression_ns: u64,
     order_entry_ready_at_ns: Option<u64>,
     new_orders_blocked_not_ready: usize,
     orders_sent: usize,

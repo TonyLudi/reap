@@ -12,13 +12,14 @@ impl BacktestRunner {
             return Ok(());
         }
         let commands = self.strategy.on_event(&StrategyEvent::Account(
-            self.initial_portfolio.account_update(time_ms(self.now_ns)),
+            self.initial_portfolio
+                .account_update(time_ms(self.replay.now_ns)),
         ));
         if !commands.is_empty() {
             bail!("initial portfolio unexpectedly produced strategy order intents");
         }
         self.initial_account_snapshot_delivered = true;
-        self.last_account_publish_ns = Some(self.now_ns);
+        self.last_account_publish_ns = Some(self.replay.now_ns);
         self.schedule_next_account_refresh();
         Ok(())
     }
@@ -48,7 +49,7 @@ impl BacktestRunner {
             position_symbols.push(source);
         }
         AccountUpdate {
-            ts_ms: time_ms(self.now_ns),
+            ts_ms: time_ms(self.replay.now_ns),
             balances: if self.initial_portfolio.is_empty() {
                 Vec::new()
             } else {
@@ -101,8 +102,11 @@ impl BacktestRunner {
         if self.initial_portfolio.is_empty() {
             return;
         }
-        let due_ns = self.now_ns.saturating_add(ACCOUNT_REFRESH_INTERVAL_NS);
-        if due_ns > self.now_ns {
+        let due_ns = self
+            .replay
+            .now_ns
+            .saturating_add(ACCOUNT_REFRESH_INTERVAL_NS);
+        if due_ns > self.replay.now_ns {
             self.schedule_at(due_ns, ScheduledAction::RefreshAccount);
         }
     }

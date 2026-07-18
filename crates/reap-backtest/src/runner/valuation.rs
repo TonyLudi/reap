@@ -24,7 +24,7 @@ impl BacktestRunner {
             CurrencyRateObservation {
                 usd_per_unit,
                 source_ts_ms,
-                effective_at_ns: self.now_ns,
+                effective_at_ns: self.replay.now_ns,
             },
         );
     }
@@ -37,7 +37,7 @@ impl BacktestRunner {
             };
             let maximum_age_ns = route.max_age_ms.saturating_mul(NS_PER_MS);
             let source_ns = observation.source_ts_ms.saturating_mul(NS_PER_MS);
-            if self.now_ns.saturating_sub(source_ns) <= maximum_age_ns {
+            if self.replay.now_ns.saturating_sub(source_ns) <= maximum_age_ns {
                 rates.insert(route.currency.clone(), observation.usd_per_unit);
             }
         }
@@ -65,7 +65,8 @@ impl BacktestRunner {
             .map(|route| {
                 let observation = self.currency_rate_observations.get(&route.currency);
                 let age_ns = observation.map(|observation| {
-                    self.now_ns
+                    self.replay
+                        .now_ns
                         .saturating_sub(observation.source_ts_ms.saturating_mul(NS_PER_MS))
                 });
                 let usable = observation.is_some_and(|observation| {
@@ -138,6 +139,7 @@ impl BacktestRunner {
                 observation.usd_per_unit.is_finite()
                     && observation.usd_per_unit > 0.0
                     && self
+                        .replay
                         .now_ns
                         .saturating_sub(observation.source_ts_ms.saturating_mul(NS_PER_MS))
                         <= route.max_age_ms.saturating_mul(NS_PER_MS)
@@ -152,12 +154,12 @@ impl BacktestRunner {
                 self.portfolio.equity_usd_checked(&marks, &currency_rates)
             {
                 self.opening_equity_usd = Some(opening_equity_usd);
-                self.opening_valuation_at_ns = Some(self.now_ns);
+                self.opening_valuation_at_ns = Some(self.replay.now_ns);
                 self.peak_equity_usd = opening_equity_usd;
             }
         }
         if self.order_entry_ready_at_ns.is_none() && self.order_entry_ready() {
-            self.order_entry_ready_at_ns = Some(self.now_ns);
+            self.order_entry_ready_at_ns = Some(self.replay.now_ns);
         }
     }
 

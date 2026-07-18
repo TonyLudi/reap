@@ -4,7 +4,7 @@ impl BacktestRunner {
     pub(super) fn advance_metric_clock(&mut self, target_ns: u64) {
         if let Some(previous_ns) = self.metric_clock_ns {
             // Carry actions may run before the first input in the next replay segment.
-            let observation_start_ns = self.first_arrival_ns.unwrap_or(target_ns);
+            let observation_start_ns = self.replay.first_arrival_ns.unwrap_or(target_ns);
             let elapsed_ns = target_ns.saturating_sub(previous_ns.max(observation_start_ns));
             self.abs_delta_time_integral += self.current_abs_delta_usd * elapsed_ns as f64;
             if self.current_inventory_open {
