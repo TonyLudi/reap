@@ -22,9 +22,9 @@ use reap_okx_live_adapter::OrderCommandWebsocketLifecycle;
 use reap_order::OkxOrderGateway;
 use reap_order::reconcile_full_state;
 use reap_storage::{
-    BootstrapRecord, OrderOperation, OrderRequestRecord, SafetyLatchRecord, SafetyLatchScope,
-    SafetyLatchSource, SessionStartRecord, StorageConfig, StorageError, StorageRecord,
-    acquire_storage_lease, recover_leased_jsonl, start_jsonl_storage_with_lease,
+    BootstrapRecord, OrderOperation, OrderRequestRecord, SessionStartRecord, StorageConfig,
+    StorageError, StorageRecord, acquire_storage_lease, recover_leased_jsonl,
+    start_jsonl_storage_with_lease,
 };
 use reap_telemetry::{
     AlertError, AlertEvent, AlertRuntime, AlertSeverity, AlertStats, start_webhook_alerts,
@@ -43,8 +43,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::convergence::{FillConvergenceGuard, OrderStateConvergenceGuard};
 use crate::coordinator::{CancelAction, LiveAction, SubmitAction};
 use crate::forbidden_orders::{
-    ForbiddenOrderEvent, ForbiddenOrderObserverPort, ForbiddenSentinelPolicy,
-    run_forbidden_order_sentinel,
+    ForbiddenOrderObserverPort, ForbiddenSentinelPolicy, run_forbidden_order_sentinel,
 };
 use crate::provenance::{
     current_executable_sha256 as hash_current_executable,
@@ -55,11 +54,10 @@ use crate::{
     AccountBootstrapSnapshot, ChaosConnectivityPlan, ChaosConnectivityPlanError, CoordinatorError,
     CoordinatorOutput, HostGuardRuntime, HostHealthError, HostHealthSnapshot, LiveConfig,
     LiveConfigError, LiveConfigFileEvidence, LiveCoordinator, LiveLatencyCollector,
-    LiveLatencyEvidence, LiveMode, OperatorCommand, OperatorEnvelope, OperatorError,
-    OperatorResponse, OperatorService, OperatorStatus, ReadinessSnapshot, ReconciliationResult,
-    StartupGate, TradingEnvironment, alert_webhook_from_env, check_host_health,
-    load_live_config_with_evidence, operator_secret_from_env, start_host_guard,
-    start_operator_service,
+    LiveLatencyEvidence, LiveMode, OperatorEnvelope, OperatorError, OperatorService,
+    ReadinessSnapshot, ReconciliationResult, StartupGate, TradingEnvironment,
+    alert_webhook_from_env, check_host_health, load_live_config_with_evidence,
+    operator_secret_from_env, start_host_guard, start_operator_service,
 };
 
 mod bootstrap;
@@ -67,6 +65,7 @@ mod commit;
 mod composition;
 mod connectivity;
 mod dispatch;
+mod operator_flow;
 mod planning;
 mod readiness_safety;
 mod reconciliation;
@@ -89,6 +88,7 @@ use dispatch::{
     DispatchState, OrderTaskCommand, ReconcileTaskCommand, RuntimeEvent, SafetyTaskCommand,
     run_order_task,
 };
+use operator_flow::receive_operator;
 #[cfg(test)]
 use planning::validate_private_state_socket_count;
 use planning::{
@@ -102,7 +102,9 @@ use readiness_safety::{
     exchange_status_block_reason, verify_initial_exchange_fees,
     verify_initial_exchange_instruments,
 };
-use readiness_safety::{ExchangeStatusGuard, ReadinessSafetyState, run_account_safety_task};
+use readiness_safety::{
+    ExchangeStatusGuard, ReadinessSafetyState, receive_host_failure, run_account_safety_task,
+};
 use reconciliation::{ReconciliationState, run_reconcile_task};
 use recovery::{
     private_update_from_remote, proven_active_recovered_orders, recovered_safety_latch_count,
@@ -1750,266 +1752,6 @@ impl LiveRuntime {
         Ok(())
     }
 
-    async fn handle_operator_envelope(
-        &mut self,
-        envelope: OperatorEnvelope,
-    ) -> Result<(), LiveRuntimeError> {
-        let OperatorEnvelope {
-            request_id,
-            command,
-            response,
-        } = envelope;
-        self.composition.evidence.operator_commands = self
-            .composition
-            .evidence
-            .operator_commands
-            .saturating_add(1);
-        let result = self.execute_operator_command(&request_id, command).await;
-        match result {
-            Ok(operator_response) => {
-                let _ = response.send(operator_response);
-                Ok(())
-            }
-            Err(error) => {
-                let _ = response.send(OperatorResponse::rejected(
-                    request_id,
-                    format!("operator command failed: {error}"),
-                ));
-                Err(error)
-            }
-        }
-    }
-
-    async fn execute_operator_command(
-        &mut self,
-        request_id: &str,
-        command: OperatorCommand,
-    ) -> Result<OperatorResponse, LiveRuntimeError> {
-        match command {
-            OperatorCommand::Status => Ok(OperatorResponse::accepted(
-                request_id,
-                "runtime status",
-                Some(self.operator_status()),
-            )),
-            OperatorCommand::KillSwitch { reason } => {
-                self.coordinator.set_order_entry_enabled(false);
-                self.commit_operator_system_event(
-                    request_id,
-                    SystemEventKind::KillSwitchActivated,
-                    None,
-                    SafetyLatchScope::Global,
-                    true,
-                    reason,
-                )
-                .await?;
-                self.composition.evidence.operator_mutations = self
-                    .composition
-                    .evidence
-                    .operator_mutations
-                    .saturating_add(1);
-                Ok(OperatorResponse::accepted(
-                    request_id,
-                    "kill switch activated",
-                    Some(self.operator_status()),
-                ))
-            }
-            OperatorCommand::KillAccount { account_id, reason } => {
-                if !self.coordinator.manages_account(&account_id) {
-                    return Ok(OperatorResponse::rejected(
-                        request_id,
-                        format!("account {account_id} is not managed by this runtime"),
-                    ));
-                }
-                let now_ms = unix_time_ms();
-                let reason = format!("authenticated operator request {request_id}: {reason}");
-                let mut output =
-                    self.coordinator
-                        .halt_account(now_ms, &account_id, reason.clone())?;
-                output.records.insert(
-                    0,
-                    StorageRecord::SafetyLatch(SafetyLatchRecord {
-                        ts_ms: now_ms,
-                        scope: SafetyLatchScope::Account {
-                            account_id: account_id.clone(),
-                        },
-                        active: true,
-                        source: SafetyLatchSource::Operator,
-                        request_id: Some(request_id.to_string()),
-                        reason,
-                    }),
-                );
-                self.commit_output(output).await?;
-                self.composition.evidence.operator_mutations = self
-                    .composition
-                    .evidence
-                    .operator_mutations
-                    .saturating_add(1);
-                Ok(OperatorResponse::accepted(
-                    request_id,
-                    format!("account {account_id} halted"),
-                    Some(self.operator_status()),
-                ))
-            }
-            OperatorCommand::HaltSymbol { symbol, reason } => {
-                if !self.coordinator.manages_symbol(&symbol) {
-                    return Ok(OperatorResponse::rejected(
-                        request_id,
-                        format!("symbol {symbol} is not managed by this runtime"),
-                    ));
-                }
-                self.commit_operator_system_event(
-                    request_id,
-                    SystemEventKind::SymbolHalted,
-                    Some(symbol.clone()),
-                    SafetyLatchScope::Symbol { symbol },
-                    true,
-                    reason,
-                )
-                .await?;
-                self.composition.evidence.operator_mutations = self
-                    .composition
-                    .evidence
-                    .operator_mutations
-                    .saturating_add(1);
-                Ok(OperatorResponse::accepted(
-                    request_id,
-                    "symbol halted",
-                    Some(self.operator_status()),
-                ))
-            }
-            OperatorCommand::ResumeSymbol { symbol, reason } => {
-                if !self.coordinator.manages_symbol(&symbol) {
-                    return Ok(OperatorResponse::rejected(
-                        request_id,
-                        format!("symbol {symbol} is not managed by this runtime"),
-                    ));
-                }
-                if let Some(account_id) = self.coordinator.halted_account_for_symbol(&symbol) {
-                    return Ok(OperatorResponse::rejected(
-                        request_id,
-                        format!(
-                            "symbol {symbol} belongs to halted account {account_id}; account kills cannot be reset live"
-                        ),
-                    ));
-                }
-                self.commit_operator_system_event(
-                    request_id,
-                    SystemEventKind::SymbolResumed,
-                    Some(symbol.clone()),
-                    SafetyLatchScope::Symbol { symbol },
-                    false,
-                    reason,
-                )
-                .await?;
-                self.composition.evidence.operator_mutations = self
-                    .composition
-                    .evidence
-                    .operator_mutations
-                    .saturating_add(1);
-                Ok(OperatorResponse::accepted(
-                    request_id,
-                    "symbol resumed",
-                    Some(self.operator_status()),
-                ))
-            }
-            OperatorCommand::Shutdown { reason } => {
-                self.coordinator.set_order_entry_enabled(false);
-                self.composition.evidence.operator_mutations = self
-                    .composition
-                    .evidence
-                    .operator_mutations
-                    .saturating_add(1);
-                self.dispatch.operator_shutdown_reason = Some(format!(
-                    "authenticated operator shutdown {request_id}: {reason}"
-                ));
-                Ok(OperatorResponse::accepted(
-                    request_id,
-                    "graceful shutdown accepted",
-                    Some(self.operator_status()),
-                ))
-            }
-        }
-    }
-
-    async fn commit_operator_system_event(
-        &mut self,
-        request_id: &str,
-        kind: SystemEventKind,
-        symbol: Option<String>,
-        scope: SafetyLatchScope,
-        active: bool,
-        reason: String,
-    ) -> Result<(), LiveRuntimeError> {
-        let now_ms = unix_time_ms();
-        let reason = format!("authenticated operator request {request_id}: {reason}");
-        let mut output = self
-            .coordinator
-            .process_event(NormalizedEvent::System(SystemEvent {
-                ts_ms: now_ms,
-                kind,
-                venue: None,
-                account_id: None,
-                symbol,
-                reason: reason.clone(),
-            }));
-        output.records.insert(
-            0,
-            StorageRecord::SafetyLatch(SafetyLatchRecord {
-                ts_ms: now_ms,
-                scope,
-                active,
-                source: SafetyLatchSource::Operator,
-                request_id: Some(request_id.to_string()),
-                reason,
-            }),
-        );
-        self.commit_output(output).await
-    }
-
-    fn operator_status(&self) -> OperatorStatus {
-        OperatorStatus {
-            readiness: self.coordinator.readiness(),
-            active_orders: self.coordinator.active_order_count(),
-            kill_switch_active: self.coordinator.kill_switch_active(),
-            halted_accounts: self.coordinator.halted_accounts().clone(),
-            shutdown_in_progress: self.shutdown.in_progress
-                || self.dispatch.operator_shutdown_reason.is_some(),
-        }
-    }
-
-    async fn handle_forbidden_order_event(
-        &mut self,
-        mut event: ForbiddenOrderEvent,
-    ) -> Result<(), LiveRuntimeError> {
-        event.expire_delayed_zero_proof(unix_time_ms());
-        let alert = event.state.alert_code().map(|code| {
-            let reason = event
-                .state
-                .failure_reason()
-                .expect("nonzero forbidden state must have a failure reason");
-            let mut alert = AlertEvent::new(
-                AlertSeverity::Critical,
-                "forbidden_order_sentinel",
-                code,
-                format!(
-                    "account {}: {reason}; run the separate reap-emergency executable",
-                    event.account_id
-                ),
-            )
-            .with_attribute("account_id", &event.account_id);
-            alert.ts_ms = event.observed_at_ms;
-            alert
-        });
-        let output = self.coordinator.on_forbidden_order_event(event)?;
-        // Canonical regular cancellation/reconciliation dispatch stays ahead of
-        // telemetry work when the proof becomes invalid.
-        self.commit_output(output).await?;
-        if let Some(alert) = alert {
-            self.emit_alert(alert)?;
-        }
-        Ok(())
-    }
-
     async fn handle_runtime_event(&mut self, event: RuntimeEvent) -> Result<(), LiveRuntimeError> {
         match event {
             RuntimeEvent::Raw {
@@ -2501,24 +2243,6 @@ fn elapsed_us(started: Instant) -> u64 {
 
 fn duration_us_ceil(duration: Duration) -> u64 {
     (duration.as_nanos().saturating_add(999) / 1_000).min(u64::MAX as u128) as u64
-}
-
-async fn receive_operator(
-    receiver: &mut Option<mpsc::Receiver<OperatorEnvelope>>,
-) -> Option<OperatorEnvelope> {
-    match receiver {
-        Some(receiver) => receiver.recv().await,
-        None => std::future::pending().await,
-    }
-}
-
-async fn receive_host_failure(
-    receiver: &mut Option<mpsc::Receiver<HostHealthError>>,
-) -> Option<HostHealthError> {
-    match receiver {
-        Some(receiver) => receiver.recv().await,
-        None => std::future::pending().await,
-    }
 }
 
 #[cfg(test)]

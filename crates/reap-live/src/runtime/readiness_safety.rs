@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use reap_okx_live_adapter::{LiveReadiness, LiveSafety};
+use reap_telemetry::{AlertEvent, AlertSeverity};
 use reap_venue::okx::{
     OKX_MIN_TRADE_FEE_REQUEST_INTERVAL_MS, OkxInstrument, OkxInstrumentType, OkxSystemEnvironment,
     OkxSystemServiceType, OkxSystemStatus, OkxSystemStatusState, OkxTradeFeeRate, RestError,
@@ -19,7 +20,7 @@ use crate::{
 };
 
 use super::dispatch::{RuntimeEvent, RuntimeTaskFailure, SafetyTaskCommand};
-use super::{LiveRuntimeError, unix_time_ms};
+use super::{LiveRuntime, LiveRuntimeError, unix_time_ms};
 
 pub(super) struct ReadinessSafetyState {
     pub(super) forbidden_rx: mpsc::Receiver<ForbiddenOrderEvent>,
@@ -33,6 +34,50 @@ pub(super) struct ReadinessSafetyState {
     pub(super) host_preflight: Option<HostHealthSnapshot>,
     pub(super) host_checks: u64,
     pub(super) host_last_snapshot: Option<HostHealthSnapshot>,
+}
+
+impl LiveRuntime {
+    pub(super) async fn handle_forbidden_order_event(
+        &mut self,
+        mut event: ForbiddenOrderEvent,
+    ) -> Result<(), LiveRuntimeError> {
+        event.expire_delayed_zero_proof(unix_time_ms());
+        let alert = event.state.alert_code().map(|code| {
+            let reason = event
+                .state
+                .failure_reason()
+                .expect("nonzero forbidden state must have a failure reason");
+            let mut alert = AlertEvent::new(
+                AlertSeverity::Critical,
+                "forbidden_order_sentinel",
+                code,
+                format!(
+                    "account {}: {reason}; run the separate reap-emergency executable",
+                    event.account_id
+                ),
+            )
+            .with_attribute("account_id", &event.account_id);
+            alert.ts_ms = event.observed_at_ms;
+            alert
+        });
+        let output = self.coordinator.on_forbidden_order_event(event)?;
+        // Canonical regular cancellation/reconciliation dispatch stays ahead of
+        // telemetry work when the proof becomes invalid.
+        self.commit_output(output).await?;
+        if let Some(alert) = alert {
+            self.emit_alert(alert)?;
+        }
+        Ok(())
+    }
+}
+
+pub(super) async fn receive_host_failure(
+    receiver: &mut Option<mpsc::Receiver<HostHealthError>>,
+) -> Option<HostHealthError> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 #[async_trait]

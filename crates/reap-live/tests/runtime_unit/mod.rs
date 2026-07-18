@@ -16,8 +16,9 @@ use reap_order::{
 };
 use reap_risk::{InstrumentOrderLimits, InstrumentRiskModel, RiskLimits, StablecoinGuardConfig};
 use reap_storage::{
-    OrderAckStatus, RecoveredStorage, StorageRuntime, StorageSink, acquire_storage_lease,
-    recover_jsonl, recover_leased_jsonl, start_jsonl_storage,
+    OrderAckStatus, RecoveredStorage, SafetyLatchRecord, SafetyLatchScope, SafetyLatchSource,
+    StorageRuntime, StorageSink, acquire_storage_lease, recover_jsonl, recover_leased_jsonl,
+    start_jsonl_storage,
 };
 use reap_strategy::{
     ChaosConfig, ChaosExecutionIntent, ChaosStrategy, InstrumentConfig, InstrumentKindConfig,
@@ -40,10 +41,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Notify, Semaphore, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::forbidden_orders::ForbiddenOrderState;
+use crate::forbidden_orders::{ForbiddenOrderEvent, ForbiddenOrderState};
 use crate::{
-    LiveAccountConfig, LiveStorageConfig, OkxTradeModeConfig, OkxVenueConfig, RuntimeConfig,
-    VerifiedBootstrap, VerifiedInstrument,
+    LiveAccountConfig, LiveStorageConfig, OkxTradeModeConfig, OkxVenueConfig, OperatorCommand,
+    RuntimeConfig, VerifiedBootstrap, VerifiedInstrument,
 };
 
 use super::commit::alert_for_storage_record;
@@ -68,6 +69,7 @@ fn production_runtime_keeps_single_owner_responsibility_state() {
         include_str!("../../src/runtime/composition.rs"),
         include_str!("../../src/runtime/connectivity.rs"),
         include_str!("../../src/runtime/dispatch.rs"),
+        include_str!("../../src/runtime/operator_flow.rs"),
         include_str!("../../src/runtime/planning.rs"),
         include_str!("../../src/runtime/readiness_safety.rs"),
         include_str!("../../src/runtime/reconciliation.rs"),
