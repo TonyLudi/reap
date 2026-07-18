@@ -1,3 +1,4 @@
+use reap_core::PositionMarginMode;
 use reap_strategy::InstrumentKindConfig;
 
 use super::super::*;
