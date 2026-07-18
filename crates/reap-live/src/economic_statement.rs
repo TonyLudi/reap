@@ -9,15 +9,17 @@ use reap_storage::{
     FillRecord, RecoveredStorage, StorageError, StorageRecord, acquire_storage_lease,
     recover_jsonl_bytes_with_visitor,
 };
-use reap_strategy::{InstrumentConfig, InstrumentKindConfig};
+use reap_strategy::InstrumentConfig;
 use reap_venue::RemoteFill;
 use reap_venue::okx::{
     OkxAccountBalanceSnapshot, OkxBalanceDetail, OkxBill, OkxBillExecutionType, OkxBillMarginMode,
-    OkxInstrumentType, OkxTradeMode, parse_okx_account_balance_response_json,
+    OkxInstrumentType, parse_okx_account_balance_response_json,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+mod support;
 
 use crate::provenance::current_executable_sha256;
 use crate::{
@@ -26,6 +28,11 @@ use crate::{
     MAX_ACCOUNT_CERTIFICATION_ARTIFACT_BYTES, TradingEnvironment,
     verify_account_certification_artifact_path, verify_bill_collection_manifest_path,
     verify_fill_collection_manifest_path,
+};
+use support::{
+    close_abs, compare_number, compare_number_value, compare_text, execution_name,
+    expected_bill_margin_mode, instrument, instrument_type, is_lower_sha256, issue, issue_for_bill,
+    margin_mode_name, push_bill_issue, side_name, trade_subtype_side,
 };
 
 pub const ECONOMIC_RECONCILIATION_SCHEMA_VERSION: u32 = 5;
@@ -3707,230 +3714,6 @@ fn funding_pnl_at_mark(
         -(signed_position * contract_value * rate / mark_price)
     } else {
         -(signed_position * contract_value * rate * mark_price)
-    }
-}
-
-fn instrument<'a>(config: &'a LiveConfig, symbol: &str) -> Option<&'a InstrumentConfig> {
-    config
-        .strategy
-        .instruments
-        .iter()
-        .find(|instrument| instrument.symbol == symbol)
-}
-
-fn instrument_type(kind: InstrumentKindConfig) -> OkxInstrumentType {
-    match kind {
-        InstrumentKindConfig::Spot => OkxInstrumentType::Spot,
-        InstrumentKindConfig::Future
-        | InstrumentKindConfig::LinearFuture
-        | InstrumentKindConfig::InverseFuture => OkxInstrumentType::Futures,
-        InstrumentKindConfig::LinearSwap | InstrumentKindConfig::InverseSwap => {
-            OkxInstrumentType::Swap
-        }
-    }
-}
-
-fn expected_bill_margin_mode(
-    config: &LiveConfig,
-    account_id: &str,
-    symbol: &str,
-) -> Option<OkxBillMarginMode> {
-    let account = config.account(account_id)?;
-    match account.trade_mode(symbol)? {
-        OkxTradeMode::Cash => Some(OkxBillMarginMode::Cash),
-        OkxTradeMode::Cross => Some(OkxBillMarginMode::Cross),
-        OkxTradeMode::Isolated => Some(OkxBillMarginMode::Isolated),
-    }
-}
-
-fn trade_subtype_side(sub_type: &str) -> Option<Side> {
-    match sub_type {
-        "1" | "3" | "6" => Some(Side::Buy),
-        "2" | "4" | "5" => Some(Side::Sell),
-        _ => None,
-    }
-}
-
-fn compare_text(
-    bill: &OkxBill,
-    field: &str,
-    expected: &str,
-    observed: &str,
-    failures: &mut BTreeSet<EconomicReconciliationFailure>,
-    issues: &mut IssueSink,
-) {
-    if expected != observed {
-        push_bill_issue(
-            failures,
-            issues,
-            EconomicReconciliationFailure::InvalidTradeBills,
-            bill,
-            field,
-            expected,
-            observed,
-            "trade bill field does not match the verified fill",
-        );
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn compare_number(
-    bill: &OkxBill,
-    field: &str,
-    expected: f64,
-    observed: Option<f64>,
-    tolerance: f64,
-    failures: &mut BTreeSet<EconomicReconciliationFailure>,
-    issues: &mut IssueSink,
-) {
-    let Some(observed) = observed else {
-        push_bill_issue(
-            failures,
-            issues,
-            EconomicReconciliationFailure::InvalidTradeBills,
-            bill,
-            field,
-            &expected.to_string(),
-            "missing",
-            "trade bill omits a required numeric field",
-        );
-        return;
-    };
-    compare_number_value(
-        bill,
-        field,
-        expected,
-        observed,
-        tolerance,
-        EconomicReconciliationFailure::InvalidTradeBills,
-        failures,
-        issues,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn compare_number_value(
-    bill: &OkxBill,
-    field: &str,
-    expected: f64,
-    observed: f64,
-    tolerance: f64,
-    failure: EconomicReconciliationFailure,
-    failures: &mut BTreeSet<EconomicReconciliationFailure>,
-    issues: &mut IssueSink,
-) {
-    if !close_abs(expected, observed, tolerance) {
-        push_bill_issue(
-            failures,
-            issues,
-            failure,
-            bill,
-            field,
-            &expected.to_string(),
-            &observed.to_string(),
-            &format!("absolute difference exceeds {tolerance}"),
-        );
-    }
-}
-
-fn close_abs(left: f64, right: f64, tolerance: f64) -> bool {
-    left.is_finite() && right.is_finite() && (left - right).abs() <= tolerance
-}
-
-fn is_lower_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn push_bill_issue(
-    failures: &mut BTreeSet<EconomicReconciliationFailure>,
-    issues: &mut IssueSink,
-    failure: EconomicReconciliationFailure,
-    bill: &OkxBill,
-    field: &str,
-    expected: &str,
-    observed: &str,
-    message: &str,
-) {
-    issues.push(
-        failure,
-        issue_for_bill(
-            EconomicIssueSource::BillCollection,
-            bill,
-            field,
-            expected,
-            observed,
-            message,
-        ),
-        failures,
-    );
-}
-
-fn issue_for_bill(
-    source: EconomicIssueSource,
-    bill: &OkxBill,
-    field: &str,
-    expected: &str,
-    observed: &str,
-    message: &str,
-) -> EconomicIssue {
-    issue(
-        source,
-        Some(&bill.bill_id),
-        (!bill.symbol.is_empty()).then_some(bill.symbol.as_str()),
-        (!bill.trade_id.is_empty()).then_some(bill.trade_id.as_str()),
-        field,
-        expected,
-        observed,
-        message,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn issue(
-    source: EconomicIssueSource,
-    bill_id: Option<&str>,
-    symbol: Option<&str>,
-    trade_id: Option<&str>,
-    field: &str,
-    expected: &str,
-    observed: &str,
-    message: &str,
-) -> EconomicIssue {
-    EconomicIssue {
-        source,
-        bill_id: bill_id.map(str::to_string),
-        symbol: symbol.map(str::to_string),
-        trade_id: trade_id.map(str::to_string),
-        field: field.to_string(),
-        expected: expected.to_string(),
-        observed: observed.to_string(),
-        message: message.to_string(),
-    }
-}
-
-fn side_name(side: Side) -> &'static str {
-    match side {
-        Side::Buy => "buy",
-        Side::Sell => "sell",
-    }
-}
-
-fn execution_name(execution: OkxBillExecutionType) -> &'static str {
-    match execution {
-        OkxBillExecutionType::Maker => "maker",
-        OkxBillExecutionType::Taker => "taker",
-    }
-}
-
-fn margin_mode_name(mode: OkxBillMarginMode) -> &'static str {
-    match mode {
-        OkxBillMarginMode::Cash => "cash",
-        OkxBillMarginMode::Cross => "cross",
-        OkxBillMarginMode::Isolated => "isolated",
     }
 }
 

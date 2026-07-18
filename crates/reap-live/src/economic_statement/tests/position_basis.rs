@@ -1,3 +1,5 @@
+use reap_strategy::InstrumentKindConfig;
+
 use super::super::*;
 use super::support::*;
 
