@@ -1,6 +1,6 @@
 # Maintainability Refactor Goal C Handoff
 
-Status: active. Phases 0–2 are complete and green. Phases 3–5 and final global
+Status: active. Phases 0–3 are complete and green. Phases 4–5 and final global
 verification remain pending. Nothing in this document approves demo
 trading, production order entry, authenticated exchange activity, target-host
 deployment, or a low-latency runtime redesign.
@@ -22,7 +22,7 @@ verified starting structure remains the completed
 | Phase 0: baseline and inventory | Complete | Green; commit is the documentation commit containing this record and is identified by Git history because a commit cannot self-reference its own SHA |
 | Phase 1: Chaos strategy decomposition | Complete | Green; the handoff commit is the documentation commit containing this record and is identified by Git history because a commit cannot self-reference its own SHA |
 | Phase 2: live runtime decomposition | Complete | Green; source through `05ac08382e4251f7c627cd7ac3f0cc1fc89fade2`; the handoff commit is the documentation commit containing this record |
-| Phase 3: coordinator reductions | Pending | Not started |
+| Phase 3: coordinator reductions | Complete | Green; source through `81df4f303f8e7814ba0c390404190a8628eddfe1`; the handoff commit is the documentation commit containing this record |
 | Phase 4: backtest runner decomposition | Pending | Not started |
 | Phase 5: assurance decomposition | Pending | Not started |
 | Final global verification | Pending | Not started |
@@ -684,6 +684,208 @@ coordinator/strategy/risk/storage.
 
 Phase 2 therefore satisfies its structural, rollback, event-order, authority,
 dependency, deterministic, allocation, and timing gates.
+
+## Phase 3: Coordinator Reductions
+
+Phase 3 is complete and green. `LiveCoordinator` remains the sole aggregate
+that owns the engine, startup gate, private reducers, regular-execution
+policy, owned-order proofs, client-ID generators, account halts, journal fill
+keys, session identity, and decision sequence. The refactor gives its private
+account/reconciliation, private-feed, normalized-reduction, and typed-routing
+decisions named modules without introducing another mutable owner.
+
+### Phase 3 Structure
+
+Before Phase 3, `coordinator.rs` contained 4,068 physical lines: 1,630
+production lines and 2,438 co-located test lines under the Phase 0 counting
+convention. The final root facade is 676 physical lines. Its four private
+responsibility modules are:
+
+| Production source | Physical lines | Responsibility |
+| --- | ---: | --- |
+| `coordinator.rs` | 676 | Sole aggregate and all 13 fields, public transition entry points, recovered-ownership proof handling, and narrow shared policy checks |
+| `coordinator/account_reconciliation.rs` | 317 | Account snapshots, reconciliation results, remote-state application, and reconciliation faults |
+| `coordinator/private_feed.rs` | 230 | Private account/order/fill validation, canonicalization, journal deduplication, and ordered record construction |
+| `coordinator/reduction.rs` | 291 | Normalized event transitions, startup/readiness synchronization, engine output records, and safety routing calls |
+| `coordinator/routing.rs` | 260 | Typed Quote/Hedge/CancelOwned routing, owned cancellation, policy rejection, and fail-closed account cancellation |
+
+Every coordinator production file is below 1,500 lines. The root remains a
+real aggregate facade rather than moving the monolith under another name.
+The responsibility modules only add private inherent implementations on
+`LiveCoordinator`; they define no helper service or second state carrier.
+
+The test-only module remains outside production source through the exact
+`#[path = "../tests/coordinator_unit/mod.rs"]` declaration. Its current
+responsibility split is:
+
+| Test source | Physical lines | Responsibility |
+| --- | ---: | --- |
+| `coordinator_unit/mod.rs` | 696 | Shared fixtures, test authority construction, and structural/source-policy regressions |
+| `coordinator_unit/execution_recovery.rs` | 258 | Durable recovery, order binding, and execution outcomes |
+| `coordinator_unit/private_feed.rs` | 589 | Private account, order, fill, identity, and deduplication transitions |
+| `coordinator_unit/readiness_reconciliation.rs` | 578 | Readiness, account policy, reconciliation, and connectivity failures |
+| `coordinator_unit/routing_safety.rs` | 384 | Typed routing, cancellation, halts, risk, and fail-closed safety |
+
+These five files contain 2,505 physical lines and 27 coordinator tests. No
+coordinator test case remains co-located in the production facade.
+
+The largest affected transition functions now have these inclusive sizes:
+
+| Function | Before | After | Result |
+| --- | ---: | ---: | --- |
+| `LiveCoordinator::process_feed` | 230 lines | 25 lines | Ordered feed-family dispatch only |
+| `process_private_order` | Embedded in `process_feed` | 125 lines | Private canonical identity, proof, journal, and record transition stays cohesive |
+| `process_normalized_at` | 124 lines | 124 lines | Mechanically moved with event and fail-closed ordering intact |
+| `route_chaos_intent` | 112 lines | 112 lines | Mechanically moved with typed routing, approval, reservation, and record ordering intact |
+
+All production functions are below the 250-line limit. The asymmetric private
+order/fill record order, reconciliation-before-canonical handling, normalized
+record-before-engine order, post-engine fail-closed cancellation order, and
+submit reservation/PendingNew order remain unchanged.
+
+### Phase 3 Ownership And Authority
+
+All 13 mutable state families remain by value on the root
+`LiveCoordinator`:
+
+```text
+config
+engine
+startup
+private_states
+regular_execution
+owned_regular_orders
+client_ids
+gateway_action_accounts
+order_entry_enabled
+halted_accounts
+journal_fill_keys_by_account
+session_id
+decision_sequence
+```
+
+The structural regression scans the root plus all four child modules. It
+requires exactly one `pub struct LiveCoordinator`, requires every listed field
+on that root, and rejects a duplicate field in every child. It also rejects
+`Arc<Mutex<_>>`, production `use super::*`, and any child declaration,
+parameter, or construction of the authority-bearing engine, startup, private
+reducer, execution-policy, owned-order, client-ID, recovered-proof,
+reservation, or approved-cancel types.
+
+The routing module still operates as an inherent method of that same
+aggregate, using its private fields transiently; it is not a lower-level
+authority owner. Moving `.reserve_local(` required an exact one-for-one source
+allowlist replacement:
+
+| Seam | Before live owner | After live owner | Workspace cardinality |
+| --- | --- | --- | ---: |
+| `.reserve_local(` | `coordinator.rs` | `coordinator/routing.rs` | Two before and after, including `reap-order/src/authority.rs` |
+
+No directory, wildcard, or additional owner was admitted.
+`.register_recovered(` and `ProvenRegularSubmitRequest` remain in the root
+coordinator alongside durable proof validation. No child can register or
+recover owned-order authority. The test-only local-order seam and its durable
+proof helper also remain in the root.
+
+An independent Phase 3 audit found that the test-only
+`register_local_order` seam was still declared `pub`. Commit `81df4f3`
+narrowed it to `pub(crate)` and added a regression that forbids a public
+test-only coordinator seam. The independent audit was otherwise green, and
+the post-fix focused, policy, formatting, and clippy gates were green.
+
+### Phase 3 Commits
+
+The focused Phase 3 commits, in order, are:
+
+```text
+4a42bf0ede488625522cad7355e2f9c2285cddc5  split coordinator unit tests
+3215deb68ef7afa843c04c4b9c502d161868eca9  extract private feed reduction
+3b70af67e9ddb91c0a811ca87cee0dd39ee28a5c  delegate private feed families
+2958db61890cfa968670751d14563114393d1fb5  extract account reconciliation transitions
+fdd12e469ecafd5d472e13ebc2d96b0f6c5ae1d6  extract normalized event reduction
+7d906e93a223ef4355d7276a3654ee6fb0316736  extract typed intent routing
+699d0df6c8ba00f41ebd4be120bcd095a4b2ed3e  move reservation owner allowlist
+f17fa9ee86e687d43f047a876305f24e2ab070f0  guard coordinator authority ownership
+81df4f303f8e7814ba0c390404190a8628eddfe1  narrow coordinator test seam
+```
+
+### Phase 3 Test And Policy Evidence
+
+The final affected-package command was:
+
+```bash
+TMPDIR=/home/ubuntu/code/reap/target/tmp \
+  cargo test \
+    -p reap-live \
+    -p reap-feed \
+    -p reap-order \
+    -p reap-okx-live-adapter \
+    -p reap-storage \
+    -p reap-fault \
+    --locked --no-fail-fast
+```
+
+It passed:
+
+- 232 live unit tests, two live UI cases, three dependency-policy tests, and
+  one runtime-configuration compatibility test;
+- 70 feed tests and four feed UI cases;
+- 60 order tests and five order UI cases;
+- 37 live-adapter tests and six adapter UI cases;
+- 24 storage tests;
+- 25 fault tests; and
+- all affected doc tests.
+
+After the audit fix, the 27 focused coordinator tests and all three
+dependency-policy tests were rerun and passed.
+`cargo clippy -p reap-live --all-targets --locked -- -D warnings`,
+`cargo fmt --all -- --check`, and `git diff --check` all exited `0`.
+
+All four recorded public root-source hashes, all four target manifest hashes,
+`Cargo.lock`, deterministic fixtures, example configurations, and trybuild
+diagnostics remain exact. The reservation owner move is the only changed
+source allowlist entry, and its exact cardinality is unchanged.
+`../imm-strategy` remains clean at
+`b6b120c7b7c466d8431bf082f3229328c5d7b2ae`.
+
+### Phase 3 Determinism And Performance
+
+The canonical CLI backtest was run twice after `81df4f3`; `cmp` exited `0`.
+Both outputs have SHA-256
+`38acf9f5e0c310f2ec5528974beffadf4c1a7f84d46efa8d9664ee7051e84691`.
+
+One unrecorded warm-up and three recorded benchmark runs used the Phase 0 host
+and toolchain.
+
+| Engine run | ns/event | Intents |
+| --- | ---: | ---: |
+| Warm-up | 11,106.8 | 999,996 |
+| Recorded 1 | 11,112.5 | 999,996 |
+| Recorded 2 | 11,040.7 | 999,996 |
+| Recorded 3 | 11,270.1 | 999,996 |
+| Recorded median | 11,112.5 | 999,996 |
+
+The engine median is 3.02% below the Phase 0 median.
+
+| Live run | ns/raw frame | Allocation calls/raw | Requested bytes/raw | Parsed | Feed outputs | Records | Actions |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Warm-up | 17,285.7 | 83.53 | 37,286.9 | 50,204 | 70,208 | 65,130 | 0 |
+| Recorded 1 | 18,169.0 | 83.53 | 37,286.9 | 50,204 | 70,208 | 65,130 | 0 |
+| Recorded 2 | 16,916.8 | 83.53 | 37,286.9 | 50,204 | 70,208 | 65,130 | 0 |
+| Recorded 3 | 16,958.4 | 83.53 | 37,286.9 | 50,204 | 70,208 | 65,130 | 0 |
+| Recorded median | 16,958.4 | 83.53 | 37,286.9 | 50,204 | 70,208 | 65,130 | 0 |
+
+The live median is 0.71% below the Phase 0 median. Every run retained exactly
+`4,193,771` allocation calls and `1,871,951,969` requested bytes. Recorded
+stage medians were 2,911.9 ns/unit for wire parse and raw record, 7,704.3 for
+deduplication/sequence/book, and 3,994.8 for
+coordinator/strategy/risk/storage.
+
+No timing, allocation, or logical-counter investigation threshold was
+crossed. Phase 3 therefore satisfies its structural, transition-order,
+authority, dependency, deterministic, allocation, and timing gates without
+broadening the plan-derived Quote, Hedge, and CancelOwned capability boundary
+or the behavioral reference to `../imm-strategy`.
 
 ## Pending Completion Evidence
 
