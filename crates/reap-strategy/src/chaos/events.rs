@@ -70,11 +70,12 @@ impl ChaosStrategy {
                 price,
             } => {
                 self.advance_time(*ts_ms);
-                if !self.index_symbols.contains(symbol) {
+                if !self.reference_health.index_symbols.contains(symbol) {
                     return Vec::new();
                 }
                 if price.is_finite() && *price > 0.0 {
-                    self.index_prices
+                    self.reference_health
+                        .index_prices
                         .entry(symbol.clone())
                         .and_modify(|value| {
                             if *ts_ms >= value.updated_ms {

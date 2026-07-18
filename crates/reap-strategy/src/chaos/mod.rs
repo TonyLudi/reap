@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, DefaultHasher};
 
 use crate::ChaosExecutionIntent;
@@ -28,7 +28,8 @@ use execution_state::{ActiveHedge, ActiveQuote};
 use hedging::HedgeCandidate;
 use pricing::{JavaRandom, QuoteTargetState, round_passive_to_tick};
 use reference_health::{
-    DebouncedCondition, TimedPrice, should_accept_timestamp, timestamp_is_fresh,
+    DebouncedCondition, ReferenceHealthState, TimedPrice, should_accept_timestamp,
+    timestamp_is_fresh,
 };
 
 pub use config::{
@@ -48,12 +49,7 @@ pub struct ChaosStrategy {
     entities: StableMap<Symbol, InstrumentState>,
     risk_groups: StableMap<String, RiskGroupState>,
     symbol_to_group: HashMap<Symbol, String>,
-    index_symbols: HashSet<Symbol>,
-    index_prices: HashMap<Symbol, TimedPrice>,
-    index_debouncers: HashMap<String, DebouncedCondition>,
-    basis_debouncers: HashMap<String, DebouncedCondition>,
-    basis_breaches: HashMap<String, (Symbol, f64)>,
-    startup_basis_checked: bool,
+    reference_health: ReferenceHealthState,
     halt_reason: Option<String>,
     burst: f64,
     burst_symbol: Option<Symbol>,
@@ -76,7 +72,6 @@ pub struct ChaosStrategy {
     no_hedge_found_since: Option<TimeMs>,
     hedge_not_found_since: Option<TimeMs>,
     all_hedges_halted_since: Option<TimeMs>,
-    insufficient_valid_since: Option<TimeMs>,
     missed_hedges: Vec<MissedHedge>,
 }
 
@@ -192,12 +187,15 @@ impl ChaosStrategy {
             entities,
             risk_groups,
             symbol_to_group,
-            index_symbols,
-            index_prices: HashMap::new(),
-            index_debouncers,
-            basis_debouncers,
-            basis_breaches: HashMap::new(),
-            startup_basis_checked: false,
+            reference_health: ReferenceHealthState {
+                index_symbols,
+                index_prices: HashMap::new(),
+                index_debouncers,
+                basis_debouncers,
+                basis_breaches: HashMap::new(),
+                startup_basis_checked: false,
+                insufficient_valid_since: None,
+            },
             halt_reason: None,
             burst: 0.0,
             burst_symbol: None,
@@ -220,7 +218,6 @@ impl ChaosStrategy {
             no_hedge_found_since: None,
             hedge_not_found_since: None,
             all_hedges_halted_since: None,
-            insufficient_valid_since: None,
             missed_hedges: Vec::new(),
         })
     }
@@ -260,7 +257,7 @@ impl ChaosStrategy {
     }
 
     pub fn basis_breaches(&self) -> &HashMap<String, (Symbol, f64)> {
-        &self.basis_breaches
+        &self.reference_health.basis_breaches
     }
 
     fn refresh_quotes(&mut self) -> Vec<ChaosExecutionIntent> {
@@ -271,20 +268,21 @@ impl ChaosStrategy {
         let risk_healthy = validity_healthy && self.check_risk_limits();
         self.update_best_hedges();
         let hedge_healthy = self.check_hedge_availability();
-        let startup_basis_healthy = if !self.startup_basis_checked && self.pricing_ready() {
-            self.startup_basis_checked = true;
-            if self.check_basis(true) {
-                true
+        let startup_basis_healthy =
+            if !self.reference_health.startup_basis_checked && self.pricing_ready() {
+                self.reference_health.startup_basis_checked = true;
+                if self.check_basis(true) {
+                    true
+                } else {
+                    self.halt_reason = Some("startup basis limit breached".to_string());
+                    false
+                }
             } else {
-                self.halt_reason = Some("startup basis limit breached".to_string());
-                false
-            }
-        } else {
-            if self.startup_basis_checked {
-                let _ = self.check_basis(false);
-            }
-            true
-        };
+                if self.reference_health.startup_basis_checked {
+                    let _ = self.check_basis(false);
+                }
+                true
+            };
         self.update_theo_quotes();
         let reference_healthy = self.configured_indexes_ready_at(self.now_ms);
         let pricing_healthy = risk_healthy
@@ -1717,7 +1715,12 @@ mod tests {
         });
 
         assert!(intents.is_empty());
-        assert!(!strategy.index_prices.contains_key("USDT-USD"));
+        assert!(
+            !strategy
+                .reference_health
+                .index_prices
+                .contains_key("USDT-USD")
+        );
         assert_eq!(strategy.now_ms, 10);
     }
 
@@ -2752,7 +2755,7 @@ mod tests {
     fn healthy_feed_heartbeat_does_not_recalculate_quotes() {
         let mut strategy = ChaosStrategy::new(java_calculator_config()).unwrap();
         seed_java_calculator_books(&mut strategy);
-        assert!(!strategy.startup_basis_checked);
+        assert!(!strategy.reference_health.startup_basis_checked);
 
         let intents = strategy.on_system_event(&SystemEvent {
             ts_ms: 2,
@@ -2764,7 +2767,7 @@ mod tests {
         });
 
         assert!(intents.is_empty());
-        assert!(!strategy.startup_basis_checked);
+        assert!(!strategy.reference_health.startup_basis_checked);
         assert_eq!(strategy.now_ms, 2);
     }
 
@@ -2795,7 +2798,7 @@ mod tests {
 
         assert!(intents.is_empty());
         assert!(!strategy.entities[symbol].feed_stale);
-        assert!(!strategy.startup_basis_checked);
+        assert!(!strategy.reference_health.startup_basis_checked);
     }
 
     #[test]

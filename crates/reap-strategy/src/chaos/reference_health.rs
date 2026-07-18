@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use reap_core::{Price, Side, Symbol, SystemEvent, SystemEventKind, TimeMs};
 
@@ -28,6 +28,17 @@ impl DebouncedCondition {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct ReferenceHealthState {
+    pub(super) index_symbols: HashSet<Symbol>,
+    pub(super) index_prices: HashMap<Symbol, TimedPrice>,
+    pub(super) index_debouncers: HashMap<String, DebouncedCondition>,
+    pub(super) basis_debouncers: HashMap<String, DebouncedCondition>,
+    pub(super) basis_breaches: HashMap<String, (Symbol, f64)>,
+    pub(super) startup_basis_checked: bool,
+    pub(super) insufficient_valid_since: Option<TimeMs>,
+}
+
 impl ChaosStrategy {
     pub(super) fn check_validity(&mut self) -> bool {
         if self.halt_reason.is_some() {
@@ -39,7 +50,10 @@ impl ChaosStrategy {
             .filter(|entity| entity.market_data_is_valid_at(self.now_ms) && !entity.feed_stale)
             .count();
         if valid_count < 2 {
-            let since = self.insufficient_valid_since.get_or_insert(self.now_ms);
+            let since = self
+                .reference_health
+                .insufficient_valid_since
+                .get_or_insert(self.now_ms);
             if self.now_ms.saturating_sub(*since) > self.config.insufficient_valid_stop_ms {
                 self.halt_reason = Some(format!(
                     "fewer than two instruments valid for more than {}ms",
@@ -48,7 +62,7 @@ impl ChaosStrategy {
                 return false;
             }
         } else {
-            self.insufficient_valid_since = None;
+            self.reference_health.insufficient_valid_since = None;
         }
         true
     }
@@ -107,7 +121,10 @@ impl ChaosStrategy {
                     };
                     let (Some(spot_mid), Some(index_price)) = (
                         entity.mid(),
-                        self.index_prices.get(index_symbol).map(|value| value.price),
+                        self.reference_health
+                            .index_prices
+                            .get(index_symbol)
+                            .map(|value| value.price),
                     ) else {
                         continue;
                     };
@@ -122,11 +139,16 @@ impl ChaosStrategy {
                     }
                 }
             }
-            let should_stop = self.index_debouncers.entry(group_name).or_default().check(
-                worst.is_some(),
-                self.now_ms,
-                self.config.index_deviation_debounce_ms,
-            );
+            let should_stop = self
+                .reference_health
+                .index_debouncers
+                .entry(group_name)
+                .or_default()
+                .check(
+                    worst.is_some(),
+                    self.now_ms,
+                    self.config.index_deviation_debounce_ms,
+                );
             if should_stop && let Some((symbol, index_symbol, deviation)) = worst {
                 self.halt_reason = Some(format!(
                     "{} index deviation {} versus {} exceeds {}",
@@ -142,8 +164,9 @@ impl ChaosStrategy {
         let Some(max_age_ms) = self.config.reference_data_stale_threshold_ms else {
             return true;
         };
-        self.index_symbols.iter().all(|symbol| {
-            self.index_prices
+        self.reference_health.index_symbols.iter().all(|symbol| {
+            self.reference_health
+                .index_prices
                 .get(symbol)
                 .is_some_and(|value| timestamp_is_fresh(value.updated_ms, now_ms, max_age_ms))
         })
@@ -160,7 +183,7 @@ impl ChaosStrategy {
     pub(super) fn check_basis(&mut self, first_run: bool) -> bool {
         let mut group_names = self.risk_groups.keys().cloned().collect::<Vec<_>>();
         group_names.sort();
-        self.basis_breaches.clear();
+        self.reference_health.basis_breaches.clear();
         for group_name in group_names {
             let Some(group) = self.risk_groups.get(&group_name) else {
                 continue;
@@ -187,6 +210,7 @@ impl ChaosStrategy {
                 group.config.basis_limit
             };
             let breached = self
+                .reference_health
                 .basis_debouncers
                 .entry(group_name.clone())
                 .or_default()
@@ -196,7 +220,8 @@ impl ChaosStrategy {
                     self.config.basis_breach_debounce_ms,
                 );
             if breached {
-                self.basis_breaches
+                self.reference_health
+                    .basis_breaches
                     .insert(group_name, (max_symbol, max_basis));
                 return false;
             }
