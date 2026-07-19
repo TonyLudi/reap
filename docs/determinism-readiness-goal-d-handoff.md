@@ -1,6 +1,6 @@
 # Determinism And Measured Runtime Goal D Handoff
 
-Status: Phase 0 in progress. This is an evidence ledger, not a trading
+Status: Phase 0 green; Phase 1 is next. This is an evidence ledger, not a trading
 authorization. Until every required Goal D phase and global gate below is
 recorded green, the active execution contract remains
 [determinism-readiness-goal-d-prompt.md](determinism-readiness-goal-d-prompt.md).
@@ -28,7 +28,7 @@ runtime concurrency redesign.
 | Phase | Status | Result commit |
 | --- | --- | --- |
 | Prompt-only execution contract | Green | `b4a3752` |
-| 0. Baseline, call-path audit, and measurement contract | In progress | Pending |
+| 0. Baseline, call-path audit, and measurement contract | Green | `768ee0a` |
 | 1. Deterministic fail-closed cancellation | Pending | Pending |
 | 2. Pinned-Java public-trade parity | Pending | Pending |
 | 3. Explicit decision/risk replay parity | Pending | Pending |
@@ -818,6 +818,7 @@ No Goal D production behavior has changed.
 Phase 0 changes only documentation, `#[cfg(test)]`/ignored test support, and a
 bench-only target. Review of the complete diff found no production control
 flow, authority, connectivity, schema, or serialized-output change.
+The gated phase implementation/evidence commit is `768ee0a`.
 
 Green commands and results:
 
