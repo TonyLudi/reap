@@ -7,6 +7,10 @@ edition.workspace = true
 name = "live_loop"
 harness = false
 
+[[bench]]
+name = "action_path"
+harness = false
+
 [dependencies]
 async-trait.workspace = true
 base64.workspace = true

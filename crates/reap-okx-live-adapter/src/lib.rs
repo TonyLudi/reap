@@ -2402,8 +2402,7 @@ mod tests {
         assert_trace(&wire, &[]);
     }
 
-    #[test]
-    fn typed_strategy_authority_is_serialized_only_after_gateway_preparation() {
+    fn typed_strategy_prepared_submit() -> (PreparedRegularSubmit, Arc<FakeWire>, String) {
         let mut strategy = ChaosStrategy::new(ChaosConfig {
             ref_symbol: "BTC-USDT".to_string(),
             delta_limit_usd: 50_000.0,
@@ -2516,10 +2515,16 @@ mod tests {
         else {
             panic!("fresh typed decision must require transport");
         };
+        (prepared, wire, expected_client_order_id)
+    }
+
+    #[test]
+    fn typed_strategy_authority_is_serialized_only_after_gateway_preparation() {
+        let (prepared, wire, expected_client_order_id) = typed_strategy_prepared_submit();
         assert_eq!(prepared.account_id(), "main");
 
         let factory = RegularOrderSessionFactory {
-            wire: Arc::clone(&role),
+            wire: role_wire(&wire),
             expected_account_id: "main".to_string(),
             demo_trading: true,
         };
@@ -2533,6 +2538,14 @@ mod tests {
         assert_eq!(request["args"][0]["ordType"], "post_only");
         assert!(request["args"][0].get("account_id").is_none());
         assert_trace(&wire, &[]);
+    }
+
+    mod goal_d_serializer_benchmark;
+
+    #[test]
+    #[ignore = "release-only Goal D prepared-request serialization benchmark"]
+    fn goal_d_prepared_serializer_benchmark() {
+        goal_d_serializer_benchmark::run();
     }
 
     #[test]

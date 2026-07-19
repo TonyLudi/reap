@@ -254,6 +254,9 @@ fn system_requires_cancel(event: &SystemEvent) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::process::Command;
+
     use reap_core::{
         AccountUpdate, FillLiquidity, Level, MarketEvent, NewOrder, NormalizedEvent, OrderBook,
         OrderEvent, OrderStatus, OrderUpdate, Position, Side, StrategyEvent, SystemEvent,
@@ -593,6 +596,178 @@ mod tests {
             reason: "differential fail-closed check".to_string(),
         });
         assert_chaos_outputs_match(generic.on_event(kill.clone()), typed.on_chaos_event(kill));
+    }
+
+    #[test]
+    fn goal_d_fail_closed_process_order_probe() {
+        const CHILD_ENV: &str = "REAP_GOAL_D_CANCEL_PROBE_CHILD";
+        const MARKER: &str = "REAP_GOAL_D_CANCEL_PROBE=";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            println!("{MARKER}{}", fail_closed_process_projection());
+            return;
+        }
+
+        let executable = std::env::current_exe().expect("current test executable");
+        let mut projections = BTreeSet::new();
+        for _ in 0..24 {
+            let output = Command::new(&executable)
+                .args([
+                    "--exact",
+                    "tests::goal_d_fail_closed_process_order_probe",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .expect("spawn independent fail-closed probe process");
+            assert!(
+                output.status.success(),
+                "child probe failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).expect("probe output is UTF-8");
+            let projection = stdout
+                .lines()
+                .find_map(|line| line.strip_prefix(MARKER))
+                .expect("child probe marker")
+                .to_string();
+            projections.insert(projection);
+        }
+
+        eprintln!(
+            "Goal D Phase 0 independent-process fail-closed projections ({} distinct):",
+            projections.len()
+        );
+        for projection in &projections {
+            eprintln!("{projection}");
+        }
+        assert!(!projections.is_empty());
+    }
+
+    fn fail_closed_process_projection() -> String {
+        let insertion_cases: [(&str, &[usize]); 4] = [
+            ("forward", &[0, 1, 2, 3, 4, 5]),
+            ("reverse", &[5, 4, 3, 2, 1, 0]),
+            ("interleaved", &[2, 5, 0, 4, 1, 3]),
+            ("rotated", &[3, 4, 5, 0, 1, 2]),
+        ];
+        let cases = insertion_cases
+            .into_iter()
+            .map(|(name, insertion)| {
+                let (generic_ids, typed_ids) = fail_closed_insertion_projection(insertion);
+                format!(
+                    "{{\"insertion\":\"{name}\",\"generic\":[{}],\"typed\":[{}]}}",
+                    quoted_ids(&generic_ids),
+                    quoted_ids(&typed_ids)
+                )
+            })
+            .collect::<Vec<_>>();
+        format!("{{\"cases\":[{}]}}", cases.join(","))
+    }
+
+    fn fail_closed_insertion_projection(insertion: &[usize]) -> (Vec<String>, Vec<String>) {
+        let config: ChaosConfig =
+            toml::from_str(include_str!("../../../examples/iarb2-basic.toml")).unwrap();
+        let limits = RiskLimits {
+            require_feed_health: false,
+            require_private_health: false,
+            ..RiskLimits::default()
+        };
+        let mut generic = TradingEngine::new(
+            ChaosStrategy::new(config.clone()).unwrap(),
+            RiskGate::new(limits.clone()),
+        );
+        let mut typed =
+            TradingEngine::new(ChaosStrategy::new(config).unwrap(), RiskGate::new(limits));
+        let registrations = [
+            ("reap-z0", "BTC-USDT"),
+            ("reap-a1", "BTC-USDT"),
+            ("reap-02", "BTC-USDT"),
+            ("reap-10", "BTC-USDT"),
+            ("reap-2", "BTC-USDT"),
+            ("reap-perp", "BTC-PERP"),
+        ];
+        let expected = [
+            "reap-02",
+            "reap-10",
+            "reap-2",
+            "reap-a1",
+            "reap-perp",
+            "reap-z0",
+        ];
+        assert_eq!(insertion.len(), registrations.len());
+        let mut seen = BTreeSet::new();
+        for &index in insertion {
+            assert!(seen.insert(index), "insertion index must be unique");
+            let (order_id, symbol) = registrations[index];
+            let event = NormalizedEvent::Order(OrderUpdate {
+                ts_ms: 1,
+                order_id: order_id.to_string(),
+                symbol: symbol.to_string(),
+                side: Side::Buy,
+                event: OrderEvent::New,
+                status: OrderStatus::Live,
+                price: 100.0,
+                time_in_force: Some(TimeInForce::PostOnly),
+                qty: 1.0,
+                open_qty: 1.0,
+                filled_qty: 0.0,
+                avg_fill_price: 0.0,
+                last_fill_qty: 0.0,
+                last_fill_price: 0.0,
+                last_fill_liquidity: None,
+                last_fill_fee: None,
+                reason: "external baseline observation".to_string(),
+            });
+            let generic_output = generic.on_event(event.clone());
+            let typed_output = typed.on_chaos_event(event);
+            assert!(generic_output.intents.is_empty());
+            assert!(typed_output.intents.is_empty());
+            assert!(typed_output.safety_cancel_candidates.is_empty());
+        }
+        let kill = NormalizedEvent::System(SystemEvent {
+            ts_ms: 2,
+            kind: SystemEventKind::KillSwitchActivated,
+            venue: None,
+            account_id: None,
+            symbol: None,
+            reason: "Goal D Phase 0 ordering probe".to_string(),
+        });
+        let generic_output = generic.on_event(kill.clone());
+        let typed_output = typed.on_chaos_event(kill);
+        assert!(typed_output.intents.is_empty());
+        let generic_ids = generic_output
+            .intents
+            .iter()
+            .filter_map(|intent| match intent {
+                OrderIntent::CancelOrder { order_id, reason } => {
+                    assert_eq!(reason, "fail_closed");
+                    Some(order_id.clone())
+                }
+                OrderIntent::NewOrder(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let typed_ids = typed_output
+            .safety_cancel_candidates
+            .iter()
+            .map(|candidate| {
+                assert_eq!(candidate.reason(), "fail_closed");
+                candidate.order_id().to_string()
+            })
+            .collect::<Vec<_>>();
+        for ids in [&generic_ids, &typed_ids] {
+            let mut sorted = ids.iter().map(String::as_str).collect::<Vec<_>>();
+            sorted.sort_unstable();
+            assert_eq!(sorted, expected);
+        }
+        (generic_ids, typed_ids)
+    }
+
+    fn quoted_ids(ids: &[String]) -> String {
+        ids.iter()
+            .map(|id| format!("\"{id}\""))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     fn assert_chaos_outputs_match(generic: EngineOutput, typed: ChaosEngineOutput) {
