@@ -113,7 +113,7 @@ where
                     OrderIntent::NewOrder(_) => None,
                 })
                 .collect::<HashSet<_>>();
-            let order_ids = if self.risk.is_killed() {
+            let mut order_ids = if self.risk.is_killed() {
                 self.risk.live_order_ids().collect::<Vec<_>>()
             } else {
                 match halted_symbol.as_deref() {
@@ -121,9 +121,9 @@ where
                     None => self.risk.live_order_ids().collect::<Vec<_>>(),
                 }
             };
+            retain_and_sort_synthesized_cancel_ids(&mut order_ids, &existing_cancels);
             let cancels = order_ids
                 .into_iter()
-                .filter(|order_id| !existing_cancels.contains(*order_id))
                 .map(|order_id| OrderIntent::CancelOrder {
                     order_id: order_id.to_string(),
                     reason: "fail_closed".to_string(),
@@ -186,7 +186,7 @@ impl TradingEngine<ChaosStrategy> {
                         .map(|cancel| cancel.order_id().to_string())
                 })
                 .collect::<HashSet<_>>();
-            let order_ids = if self.risk.is_killed() {
+            let mut order_ids = if self.risk.is_killed() {
                 self.risk.live_order_ids().collect::<Vec<_>>()
             } else {
                 match halted_symbol.as_deref() {
@@ -194,10 +194,8 @@ impl TradingEngine<ChaosStrategy> {
                     None => self.risk.live_order_ids().collect::<Vec<_>>(),
                 }
             };
-            for order_id in order_ids
-                .into_iter()
-                .filter(|order_id| !existing_cancels.contains(*order_id))
-            {
+            retain_and_sort_synthesized_cancel_ids(&mut order_ids, &existing_cancels);
+            for order_id in order_ids {
                 let intent = OrderIntent::CancelOrder {
                     order_id: order_id.to_string(),
                     reason: "fail_closed".to_string(),
@@ -231,6 +229,15 @@ impl TradingEngine<ChaosStrategy> {
             }
         }
     }
+}
+
+fn retain_and_sort_synthesized_cancel_ids(
+    order_ids: &mut Vec<&str>,
+    existing_cancels: &HashSet<String>,
+) {
+    order_ids.retain(|order_id| !existing_cancels.contains(*order_id));
+    order_ids.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    order_ids.dedup();
 }
 
 fn event_requires_cancel(event: &NormalizedEvent) -> bool {
@@ -599,9 +606,139 @@ mod tests {
     }
 
     #[test]
+    fn symbol_fail_closed_keeps_strategy_cancel_order_then_sorts_synthesized_ids() {
+        let config: ChaosConfig =
+            toml::from_str(include_str!("../../../examples/iarb2-basic.toml")).unwrap();
+        let limits = RiskLimits {
+            require_feed_health: false,
+            require_private_health: false,
+            ..RiskLimits::default()
+        };
+        let mut generic = TradingEngine::new(
+            ChaosStrategy::new(config.clone()).unwrap(),
+            RiskGate::new(limits.clone()),
+        );
+        let mut typed =
+            TradingEngine::new(ChaosStrategy::new(config).unwrap(), RiskGate::new(limits));
+        let registrations = [
+            ("synth-2", "BTC-USDT", "external", 97.0),
+            ("strategy-a", "BTC-USDT", "quote:1", 99.0),
+            ("perp-only", "BTC-PERP", "external", 96.0),
+            ("synth-10", "BTC-USDT", "external", 98.0),
+            ("strategy-z", "BTC-USDT", "quote", 100.0),
+            ("synth-02", "BTC-USDT", "external", 95.0),
+        ];
+        for (order_id, symbol, reason, price) in registrations {
+            let update = NormalizedEvent::Order(OrderUpdate {
+                ts_ms: 1,
+                order_id: order_id.to_string(),
+                symbol: symbol.to_string(),
+                side: Side::Buy,
+                event: OrderEvent::New,
+                status: OrderStatus::Live,
+                price,
+                time_in_force: Some(TimeInForce::PostOnly),
+                qty: 1.0,
+                open_qty: 1.0,
+                filled_qty: 0.0,
+                avg_fill_price: 0.0,
+                last_fill_qty: 0.0,
+                last_fill_price: 0.0,
+                last_fill_liquidity: None,
+                last_fill_fee: None,
+                reason: reason.to_string(),
+            });
+            assert_chaos_outputs_match(
+                generic.on_event(update.clone()),
+                typed.on_chaos_event(update),
+            );
+        }
+
+        let halt = NormalizedEvent::System(SystemEvent {
+            ts_ms: 2,
+            kind: SystemEventKind::SymbolHalted,
+            venue: None,
+            account_id: None,
+            symbol: Some("BTC-USDT".to_string()),
+            reason: "Goal D exact symbol scope".to_string(),
+        });
+        let generic_output = generic.on_event(halt.clone());
+        let typed_output = typed.on_chaos_event(halt);
+
+        let generic_projection = generic_output
+            .intents
+            .iter()
+            .filter_map(project_cancel)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            generic_projection,
+            [
+                ("strategy-z", "quote_disabled"),
+                ("strategy-a", "quote_disabled"),
+                ("synth-02", "fail_closed"),
+                ("synth-10", "fail_closed"),
+                ("synth-2", "fail_closed"),
+            ]
+        );
+        let strategy_projection = typed_output
+            .intents
+            .iter()
+            .filter_map(|intent| {
+                intent
+                    .as_cancel_owned()
+                    .map(|cancel| (cancel.order_id(), cancel.reason()))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            strategy_projection,
+            [
+                ("strategy-z", "quote_disabled"),
+                ("strategy-a", "quote_disabled"),
+            ]
+        );
+        let synthesized_projection = typed_output
+            .safety_cancel_candidates
+            .iter()
+            .map(|candidate| (candidate.order_id(), candidate.reason()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            synthesized_projection,
+            [
+                ("synth-02", "fail_closed"),
+                ("synth-10", "fail_closed"),
+                ("synth-2", "fail_closed"),
+            ]
+        );
+        assert_chaos_outputs_match(generic_output, typed_output);
+    }
+
+    fn project_cancel(intent: &OrderIntent) -> Option<(&str, &str)> {
+        match intent {
+            OrderIntent::CancelOrder { order_id, reason } => Some((order_id, reason)),
+            OrderIntent::NewOrder(_) => None,
+        }
+    }
+
+    #[test]
     fn goal_d_fail_closed_process_order_probe() {
         const CHILD_ENV: &str = "REAP_GOAL_D_CANCEL_PROBE_CHILD";
         const MARKER: &str = "REAP_GOAL_D_CANCEL_PROBE=";
+        const EXPECTED: &str = concat!(
+            "{\"cases\":[",
+            "{\"insertion\":\"forward\",\"generic\":[\"reap-02\",\"reap-10\",\"reap-2\",",
+            "\"reap-a1\",\"reap-perp\",\"reap-z0\"],\"typed\":[\"reap-02\",\"reap-10\",",
+            "\"reap-2\",\"reap-a1\",\"reap-perp\",\"reap-z0\"]},",
+            "{\"insertion\":\"reverse\",\"generic\":[\"reap-02\",\"reap-10\",\"reap-2\",",
+            "\"reap-a1\",\"reap-perp\",\"reap-z0\"],\"typed\":[\"reap-02\",\"reap-10\",",
+            "\"reap-2\",\"reap-a1\",\"reap-perp\",\"reap-z0\"]},",
+            "{\"insertion\":\"interleaved\",\"generic\":[\"reap-02\",\"reap-10\",\"reap-2\",",
+            "\"reap-a1\",\"reap-perp\",\"reap-z0\"],\"typed\":[\"reap-02\",\"reap-10\",",
+            "\"reap-2\",\"reap-a1\",\"reap-perp\",\"reap-z0\"]},",
+            "{\"insertion\":\"rotated\",\"generic\":[\"reap-02\",\"reap-10\",\"reap-2\",",
+            "\"reap-a1\",\"reap-perp\",\"reap-z0\"],\"typed\":[\"reap-02\",\"reap-10\",",
+            "\"reap-2\",\"reap-a1\",\"reap-perp\",\"reap-z0\"]}",
+            "]}"
+        );
 
         if std::env::var_os(CHILD_ENV).is_some() {
             println!("{MARKER}{}", fail_closed_process_projection());
@@ -635,13 +772,13 @@ mod tests {
         }
 
         eprintln!(
-            "Goal D Phase 0 independent-process fail-closed projections ({} distinct):",
+            "Goal D independent-process fail-closed projections ({} distinct):",
             projections.len()
         );
         for projection in &projections {
             eprintln!("{projection}");
         }
-        assert!(!projections.is_empty());
+        assert_eq!(projections, BTreeSet::from([EXPECTED.to_string()]));
     }
 
     fn fail_closed_process_projection() -> String {
@@ -755,11 +892,8 @@ mod tests {
                 candidate.order_id().to_string()
             })
             .collect::<Vec<_>>();
-        for ids in [&generic_ids, &typed_ids] {
-            let mut sorted = ids.iter().map(String::as_str).collect::<Vec<_>>();
-            sorted.sort_unstable();
-            assert_eq!(sorted, expected);
-        }
+        assert_eq!(generic_ids, expected);
+        assert_eq!(typed_ids, expected);
         (generic_ids, typed_ids)
     }
 

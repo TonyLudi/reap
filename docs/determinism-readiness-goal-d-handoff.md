@@ -1,6 +1,6 @@
 # Determinism And Measured Runtime Goal D Handoff
 
-Status: Phase 0 green; Phase 1 is next. This is an evidence ledger, not a trading
+Status: Phase 0 green; Phase 1 gate in progress. This is an evidence ledger, not a trading
 authorization. Until every required Goal D phase and global gate below is
 recorded green, the active execution contract remains
 [determinism-readiness-goal-d-prompt.md](determinism-readiness-goal-d-prompt.md).
@@ -29,7 +29,7 @@ runtime concurrency redesign.
 | --- | --- | --- |
 | Prompt-only execution contract | Green | `b4a3752` |
 | 0. Baseline, call-path audit, and measurement contract | Green | `768ee0a` |
-| 1. Deterministic fail-closed cancellation | Pending | Pending |
+| 1. Deterministic fail-closed cancellation | In progress | Pending |
 | 2. Pinned-Java public-trade parity | Pending | Pending |
 | 3. Explicit decision/risk replay parity | Pending | Pending |
 | 4. Exact regular order-to-wire numeric boundary | Pending | Pending |
@@ -801,11 +801,11 @@ proves byte-identical `px` and `sz` fields between both serializers.
 
 ## Authorized Output-Change Ledger
 
-No Goal D production behavior has changed.
+Only the narrowly authorized Phase 1 production behavior has changed.
 
 | Phase | Authorized change | Before evidence | After evidence |
 | --- | --- | --- | --- |
-| 1 | Stable risk-derived cancellation order only | Pending | Pending |
+| 1 | Stable risk-derived cancellation order only | Four insertion orders across 24 child processes produced distinct generic/typed traversal bytes | Every child and insertion order produces `reap-02,reap-10,reap-2,reap-a1,reap-perp,reap-z0`; strategy cancels remain first |
 | 2 | Pinned public-trade implied depth and private 100-microsecond reprice only | Pending | Pending |
 | 3 | No default behavior change; new credential-free decision trace | Pending | Pending |
 | 4 | Canonical exact numeric identity and `px`/`sz` bytes only | Pending | Pending |
@@ -866,6 +866,127 @@ and the authority declaration baseline hash is
 No stop condition was reached. The only observed Phase 0 semantic gap is the
 one intentionally demonstrated by the public-trade zero-action row, which
 Phase 2 is authorized to close.
+
+### Phase 1
+
+The focused regression was made red before the production change:
+
+```text
+TMPDIR=/home/ubuntu/code/reap/target/tmp \
+  cargo test -p reap-engine --locked --lib \
+  tests::goal_d_fail_closed_process_order_probe -- --exact --nocapture
+```
+
+The strengthened child required the exact bytewise target but observed, for
+example:
+
+```text
+left:  ["reap-10", "reap-2", "reap-02", "reap-a1", "reap-z0", "reap-perp"]
+right: ["reap-02", "reap-10", "reap-2", "reap-a1", "reap-perp", "reap-z0"]
+```
+
+The implementation adds one private helper in `reap-engine`. It retains only
+risk-live IDs not already emitted by the strategy, sorts that remaining
+borrowed slice with `left.as_bytes().cmp(right.as_bytes())`, and deduplicates
+adjacent IDs in place. Both generic and typed Chaos fail-closed branches call
+the helper only inside their existing `if fail_closed` block. It does not
+replace `RiskGate`'s maps, sort any ordinary path, allocate a sort key, change
+risk scope selection, or reorder strategy intents.
+
+The now-green 24-child exact golden is identical for forward, reverse,
+interleaved, and rotated registration:
+
+```text
+generic = typed =
+["reap-02","reap-10","reap-2","reap-a1","reap-perp","reap-z0"]
+```
+
+A second exact paired generic/typed test registers strategy quotes and
+risk-only observations in a deliberately mixed order. On
+`SymbolHalted(BTC-USDT)`, the legacy projection is exactly:
+
+```text
+strategy-z/quote_disabled
+strategy-a/quote_disabled
+synth-02/fail_closed
+synth-10/fail_closed
+synth-2/fail_closed
+```
+
+The first two remain ordered strategy `CancelOwned` intents. Only the final
+three become typed safety-cancel candidates; the duplicate risk observations
+for the first two are suppressed, and the BTC-PERP observation is excluded.
+Global kill continues to select all symbols.
+
+The coordinator authority boundary remains unchanged. The exact live test
+`unproven_private_orders_are_observed_but_never_become_cancel_authority`
+passes after engine ordering: a candidate still has to traverse
+`route_safety_cancel -> route_cancel_owned ->
+RegularExecutionPolicy::authorize_cancel`, where canonical owned-regular proof
+is required. `RiskGate` intentionally continues to allow cancellations, as
+proved by `stale_private_stream_blocks_new_orders_but_not_cancels`. Account,
+readiness, reconciliation, and shutdown cancellation paths are not
+risk-derived and were not changed.
+
+Green focused/full gates:
+
+```text
+cargo test -p reap-engine --locked
+cargo test -p reap-risk --locked
+cargo test -p reap-live --locked --no-fail-fast
+cargo clippy -p reap-engine -p reap-live --all-targets --locked -- -D warnings
+cargo fmt --all -- --check
+git diff --check
+```
+
+Results: engine 7/7, risk 29/29, live 237/237, both live compile-fail
+authority fixtures, four dependency/source-policy tests, and all doc tests
+passed. Clippy passed with warnings denied.
+
+The required same-host benchmark gate used one warm-up plus three recorded
+runs for the existing engine and live benchmarks:
+
+| Benchmark | Warm-up | Recorded runs | Median | Phase 0 median | Delta |
+| --- | ---: | --- | ---: | ---: | ---: |
+| Engine event loop (ns/event) | 11,225.4 | 11,945.5; 11,218.0; 11,272.2 | 11,272.2 | 11,314.5 | -0.37% |
+| Complete live parity (ns/raw) | 17,059.5 | 17,008.4; 17,421.0; 17,318.2 | 17,318.2 | 17,880.3 | -3.14% |
+
+Every engine run retained 250,000 events and 999,996 intents. Every live run
+retained 50,204 raw frames, 70,208 feed outputs, 65,130 records, zero actions,
+4,193,771 allocation calls, and 1,871,951,969 requested bytes.
+
+The action benchmark also used one warm-up and three required recorded runs.
+Two initial p99.9 comparisons crossed the investigation threshold, so two
+additional complete recorded runs were retained. The table compares the
+five-run median Phase 1 distributions with the five-run Phase 0 baseline:
+
+| Workload | p50 Phase 0 -> 1 | p99 Phase 0 -> 1 | p99.9 Phase 0 -> 1 |
+| --- | ---: | ---: | ---: |
+| Queue storm | 140 -> 140 (0.00%) | 7,615 -> 7,581 (-0.45%) | 7,688 -> 7,639 (-0.64%) |
+| Coordinator reduction | 5,620 -> 5,563 (-1.01%) | 8,845 -> 7,893 (-10.76%) | 13,603 -> 11,839 (-12.97%) |
+| Global fail-close | 763 -> 779 (+2.10%) | 821 -> 845 (+2.92%) | 2,289 -> 1,846 (-19.35%) |
+| IOC hedge | 23,942 -> 23,672 (-1.13%) | 34,715 -> 32,270 (-7.04%) | 77,660 -> 42,961 (-44.68%) |
+| Public trade | 148 -> 148 (0.00%) | 172 -> 164 (-4.65%) | 181 -> 181 (0.00%) |
+| Quote creation | 19,175 -> 18,806 (-1.92%) | 30,605 -> 30,063 (-1.77%) | 89,541 -> 86,776 (-3.09%) |
+| Quote replacement | 12,980 -> 12,882 (-0.76%) | 18,273 -> 17,903 (-2.02%) | 23,212 -> 22,293 (-3.96%) |
+| Raw recovery action | 26,724 -> 26,461 (-0.98%) | 37,522 -> 35,658 (-4.97%) | 54,169 -> 50,986 (-5.88%) |
+| Risk rejection | 11,865 -> 11,913 (+0.40%) | 16,787 -> 16,853 (+0.39%) | 21,874 -> 24,475 (+11.89%) |
+| Symbol fail-close | 640 -> 640 (0.00%) | 665 -> 665 (0.00%) | 1,337 -> 1,075 (-19.60%) |
+
+Risk rejection's p99.9 moved by 2,601 ns while its p50 and p99 remained
+within 0.4%. That workload never enters the new fail-closed branch; its exact
+logical/allocation projection is unchanged. Its five individual p99.9 values
+were 19,463, 24,475, 34,050, 19,396, and 36,618 ns, showing the shared-host
+scheduler tail rather than a reachable sort-path cost. No optimization or
+retry-based sample removal was performed.
+
+All five Phase 1 action runs retained the exact Phase 0 logical/allocation
+projection hash
+`19c1740a4e9113e12c0bc1215cbd62d3dd78c1a53d37f334e35a2fc6f42455ab`.
+In particular, ordinary non-action rows and both fail-closed rows retained
+their exact allocation totals. The workspace adjacency, version inventory,
+authority declaration, `Cargo.lock`, and canonical no-trade backtest anchors
+remain unchanged. No stop condition was reached.
 
 ## Remaining Operational Blockers
 
