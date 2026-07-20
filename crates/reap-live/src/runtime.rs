@@ -55,6 +55,8 @@ mod commit;
 mod composition;
 mod connectivity;
 mod dispatch;
+#[cfg_attr(not(test), allow(dead_code))]
+mod health;
 mod lifecycle;
 mod operator_flow;
 mod planning;
