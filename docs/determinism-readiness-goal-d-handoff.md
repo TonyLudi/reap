@@ -1,6 +1,6 @@
 # Determinism And Measured Runtime Goal D Handoff
 
-Status: Phases 0 through 3 green; Phase 4 is next. This is an evidence ledger,
+Status: Phases 0 through 4 green; Phase 5 is next. This is an evidence ledger,
 not a trading authorization. Until every required Goal D phase and global gate
 below is recorded green, the active execution contract remains
 [determinism-readiness-goal-d-prompt.md](determinism-readiness-goal-d-prompt.md).
@@ -32,7 +32,7 @@ runtime concurrency redesign.
 | 1. Deterministic fail-closed cancellation | Green | `4c49cae` |
 | 2. Pinned-Java public-trade parity | Green | `6d446da` |
 | 3. Explicit decision/risk replay parity | Green | `e167c63` |
-| 4. Exact regular order-to-wire numeric boundary | Pending | Pending |
+| 4. Exact regular order-to-wire numeric boundary | Green | `85af455` |
 | 5. Action-path performance and runtime health | Pending | Pending |
 | 6. Global verification and documentation | Pending | Pending |
 
@@ -805,15 +805,15 @@ proves byte-identical `px` and `sz` fields between both serializers.
 
 ## Authorized Output-Change Ledger
 
-Only the narrowly authorized Phase 1 and Phase 2 production behaviors have
-changed.
+Only the narrowly authorized Phase 1, Phase 2, and Phase 4 production
+behaviors have changed.
 
 | Phase | Authorized change | Before evidence | After evidence |
 | --- | --- | --- | --- |
 | 1 | Stable risk-derived cancellation order only | Four insertion orders across 24 child processes produced distinct generic/typed traversal bytes | Every child and insertion order produces `reap-02,reap-10,reap-2,reap-a1,reap-perp,reap-z0`; strategy cancels remain first |
 | 2 | Pinned public-trade implied depth and private 100-microsecond reprice only | Phase 0 public-trade workload produced zero trade-reprice actions and Rust retained no reached implied-depth trade state | Java-bound fixtures now produce exact implied-depth state, one private callback per qualifying trade, shared five-millisecond worker behavior, and identical ordered live/replay projections |
 | 3 | No default behavior change; new credential-free decision trace | Backtest has no production risk/live dependency and the live decision boundary was only documented | A strict shared test harness now proves identical production strategy/risk batches and separately goldens the genuine coordinator reduction; all production tracing is `#[cfg(test)]` |
-| 4 | Canonical exact numeric identity and `px`/`sz` bytes only | Pending | Pending |
+| 4 | Canonical exact numeric identity and `px`/`sz` bytes only | Exact exchange decimals were discarded after `f64` parsing; accepted order identity used raw `f64` bits; normal submit lowering derived `px`/`sz` with direct `f64::to_string()` | Exact tick/lot/min metadata now survives privately through bootstrap and policy; accepted adjacent `f64` values with one canonical wire value reuse idempotency identity, wire-distinct values conflict, and the REST-shaped body and websocket `args[0]` use identical canonical plain-decimal bytes |
 | 5 | No decisions; bounded metrics/health snapshots only | Pending | Pending |
 
 ## Phase Gate Ledger
@@ -1454,6 +1454,368 @@ an observation and no target-host latency claim is made.
 
 The exact decision/risk boundary and exclusions are recorded in
 `backtest-live-decision-parity.md`. No Goal D stop condition was reached.
+
+### Phase 4
+
+The gated Phase 4 implementation commit is `85af455`. It replaces the
+regular-submit numeric representation only after the existing policy has
+accepted an order. Strategy/model arithmetic, risk notional, `NewOrder`, the
+economic backtest, and pinned-Java parity remain `f64`.
+
+#### Exact metadata and canonical representation
+
+`OkxExactDecimal` is a normalized checked `u128` coefficient and bounded
+base-ten exponent. Its parser accepts ordinary and scientific notation,
+normalizes leading/trailing decimal zeroes, limits source input to 512 bytes
+and the absolute exponent to 400, and rejects empty, malformed, negative,
+zero, coefficient-overflowing, underflowing, or overflowing values. It has
+`Copy`, exact equality/hash, and canonical plain-decimal `Display`, but no
+Serde implementation. `OkxRegularOrderRules` binds exact tick, lot, and
+minimum-size values and rejects a minimum that is not an integral number of
+lots.
+
+The account-instrument parser now constructs those rules directly from the
+exchange `tickSz`, `lotSz`, and `minSz` strings while retaining the existing
+`f64` companions. The rules are a private, skipped/defaulted
+`OkxInstrument` sidecar. Serializing and deserializing an instrument therefore
+does not persist or recreate exact metadata. Bootstrap fails closed when the
+sidecar is absent, requires each exact value's `f64` projection to have the
+same bits as its parsed companion, and copies the rules into a private skipped
+`VerifiedInstrument` sidecar. Its checked serialized key set remains exactly:
+
+```text
+account_id
+contract_value
+instrument_type
+lot_size
+min_size
+order_limits
+risk_model
+symbol
+tick_size
+trade_mode
+```
+
+Deserializing that schema intentionally yields no exact rules and cannot
+recreate live numeric authority. Periodic instrument drift now compares the
+exact rules in addition to all prior fields; missing exact metadata is fatal.
+A fixture proves that `0.1` and `0.10000000000000001`, whose `f64`
+projections have the same bits, remain distinct drift metadata.
+
+`VerifiedInstrument::new` replaces external struct-literal construction now
+that the sidecar is private; it requires exact rules, while its rules accessor
+is crate-private. `RegularExecutionProfile::new` likewise requires the rules.
+Neither constructor mints the take-once `RegularApprovalScope` or its private
+binding, so these inspectable data values cannot enter the one-shot submit
+chain on their own.
+
+The sole live composition seam requires these rules when it creates a
+`RegularExecutionProfile`. Profile validation requires exact tick/lot/min
+projections to match the authenticated floats bit-for-bit and proves the exact
+minimum is an integral lot multiple. For each submit, the previous validation
+order remains:
+
+1. finite and positive quantity/price;
+2. minimum quantity;
+3. the existing ULP/alignment predicate;
+4. exchange quantity limit;
+5. risk-model notional limit; and then
+6. exact lowering.
+
+Lowering computes the nearest integral unit count only after those checks,
+requires a positive exactly representable `u64` no larger than
+`2^53 - 1`, and checked-multiplies it by the authenticated exact increment.
+Zero, non-finite, misaligned, underflowed, overflowed, or otherwise
+unrepresentable values cannot create prepared authority.
+
+`CanonicalRegularOrderNumbers` is crate-private, non-Clone, and non-Serde.
+It moves with the existing one-shot
+`ApprovedRegularSubmit -> ReservedRegularSubmit -> PreparedRegularSubmit`
+chain, so it exists before same-turn canonical `PendingNew` registration and
+gateway idempotency. Prepared values expose only read-only references to the
+canonical price and quantity. The idempotency registry and its reservation
+result were tightened from public to crate-private. `OrderFingerprint` now
+compares normalized canonical decimals: bit-distinct model floats that lower
+to the same `px`/`sz` reuse an identity even if metadata expresses that value
+with a different unit count, while `0.3` and `0.4` conflict.
+
+The venue exact-decimal/rules types are public inspectable metadata values,
+not send capabilities. Their lack of Serde does not by itself establish
+authority; they cannot construct the private canonical payload, approval
+binding, reservation, or prepared command. The adapter transport, request
+builder, serializer, and command installation seam remain private.
+
+#### Adapter and wire seam
+
+`OkxPlaceOrder.price` and `.qty` now hold `OkxExactDecimal`.
+`regular_place_order` assigns them exactly from
+`PreparedRegularSubmit::canonical_price()` and `canonical_qty()`. The private
+REST-shaped inner serializer uses one local `Serialize::collect_str` wrapper
+over the canonical type. The websocket builder continues to place that same
+serialized inner body in `args[0]`, so both paths receive byte-identical
+plain-decimal `px` and `sz`.
+
+The negative source-policy test rejects direct
+`order.price.to_string()`, `order.qty.to_string()`,
+`prepared.order().{price,qty}.to_string()`, and raw
+`price: order.price`/`qty: order.qty` assignments. It also pins the exact
+canonical assignments at the only normal submit lowering seam.
+
+This did not add REST placement. The regular REST execution allowlist remains
+only `POST /api/v5/trade/cancel-order`; the order websocket operation
+allowlist remains exactly `order` and `cancel-order`. Algo/spread submit,
+amend, and normal-live cancellation remain absent, and the emergency
+authority boundary is unchanged.
+
+#### Canonical behavior and regressions
+
+The checked fixtures cover:
+
+- integers, trailing-zero forms, `0.1`, `0.05`, `0.0001`, `1e-12`,
+  scientific notation, and `9007199254740991`;
+- malformed, negative, zero, too-long, coefficient-overflowing,
+  decimal-underflowing, and decimal-overflowing metadata;
+- exact minimum-in-lot divisibility and checked unit multiplication;
+- the existing positive/finite, minimum, alignment, quantity-limit, and
+  notional-limit policy results;
+- two adjacent accepted `f64` price bit patterns lowering to canonical
+  `0.3`, two-sided values 64 bit patterns outside the accepted tolerance,
+  and a wire-distinct `0.4` idempotency conflict;
+- the maximum `2^53 - 1` units, rejection above that bound, and
+  multiplication overflow;
+- 50,000 bounded exhaustive unit round trips: 10,000 counts for each of
+  `1`, `0.1`, `0.05`, `0.0001`, and `1e-12`;
+- exact REST-shaped/websocket field equality for all required numeric shapes;
+  and
+- compile-fail opacity of regular authority fields and constructors.
+
+The inherited alignment predicate is intentionally unchanged:
+
+```text
+abs(value / increment - round(value / increment))
+    <= 8 * EPSILON * max(abs(value / increment), 1)
+```
+
+At unit ratios above roughly `2^48`, that compatibility tolerance can admit a
+wider fractional-unit offset than it does at ordinary magnitudes. Phase 4
+does not tighten an existing acceptance rule. It only selects the nearest
+bounded unit for a value that the predicate already accepted; this is not new
+discretionary strategy rounding. Changing that large-unit acceptance edge
+would be a separately reviewed policy change.
+
+The authorized wire change is correspondingly narrow: an accepted value now
+emits the canonical exchange increment multiple without scientific notation
+or insignificant zeroes. Two accepted binary representations with one
+canonical value can therefore change from distinct direct-`f64` strings to
+one identical `px`/`sz`. No rejected order becomes accepted, and no
+strategy/risk/backtest arithmetic changes.
+
+#### Red/green and compatibility gates
+
+The retained staged red gate is
+`target/tmp/goal-d-phase4-live-red.txt`. Before the exact types were
+implemented, it failed compilation with unresolved
+`OkxExactDecimal`, `OkxExactDecimalError`, and `OkxRegularOrderRules`
+imports. The subsequently added metadata, policy, idempotency, wire-equality,
+source-policy, and opacity regressions are green. Diagnostic fixtures were
+reviewed individually; no suite-wide `TRYBUILD=overwrite` was used.
+
+Final-tree commands included:
+
+```text
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo check -p reap-live -p reap-okx-live-adapter --all-targets --locked
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo test -p reap-venue --locked
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo test -p reap-order --locked
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo test -p reap-okx-live-adapter --locked
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo test -p reap-live --locked
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo test -p reap-live --test dependency_policy --locked
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo clippy -p reap-venue -p reap-order -p reap-okx-live-adapter \
+    -p reap-live --all-targets --locked -- -D warnings
+cargo fmt --all -- --check
+cargo metadata --locked --format-version 1 >/dev/null
+git diff --check
+```
+
+Results: venue 36 tests plus compile-fail/doc tests; order 66 tests plus
+compile-fail/doc tests; live adapter 38 passed, one ignored benchmark, and six
+compile-fail fixtures; live 251 passed and one ignored helper, plus two
+compile-fail boundaries, five dependency/source-policy tests, and the runtime
+compatibility test. The focused exact-number, two-sided near-miss,
+idempotency, serializer-equality, source-policy, bootstrap, and drift tests
+passed. Check, relevant four-package all-target clippy with warnings denied,
+formatting, metadata, and diff gates passed.
+
+The canonical CLI backtest ran twice from the Phase 4 source. The outputs were
+byte-identical and retained the immutable SHA-256:
+
+```text
+38acf9f5e0c310f2ec5528974beffadf4c1a7f84d46efa8d9664ee7051e84691
+```
+
+#### Dependency, schema, and authority inventories
+
+No dependency was added. `Cargo.lock` remains:
+
+```text
+319268c86f94883e19668aa4835da615bbecbabfe32902019129e6e40caf894d
+```
+
+| Guard | Phase 4 result |
+| --- | --- |
+| Workspace adjacency, 23 lines | `fe98cedfaa2653e09afd57293eb71372ea476c1997e56b5ce9f27b314f5a432b` |
+| Public authority declaration guard, 358 lines | `d40d247e8354f7fbca63df24a503017e2d9328250a7308181bcde174f8604cd8` |
+| Version/revision inventory, 46 lines | `a6201c31ccbd802fbd7b915eea2200b30fd3ade5df6a09662be35ac01363ab2c` |
+| Literal `AlertEvent` schema guard, one line | `b7038321dbc71e3d8c3f41f6adae0fce53221cd4fc701cc76b173aefb2f48b41` |
+
+The declaration guard moved from 356 to 358 because it counts crate-private
+declarations as well as public ones: Phase 4 adds the crate-private canonical
+numeric struct/test constructor while converting `IdempotencyRegistry` and
+`Reservation` from public to crate-private. Review found no new public
+constructor for prepared authority, signer, raw request serializer, or
+transport. There is still no `reap-backtest -> reap-live` edge, schema-version
+change, new normal-live operation, or emergency reachability.
+
+The sibling Java checkout remained clean at
+`b6b120c7b7c466d8431bf082f3229328c5d7b2ae`.
+
+#### Existing whole-program benchmark gate
+
+The required existing benchmarks used one warm-up and three retained,
+otherwise-idle runs:
+
+| Benchmark | Warm-up | Recorded runs | Median | Phase 3 median | Delta |
+| --- | ---: | --- | ---: | ---: | ---: |
+| Engine event loop (ns/event) | 11,691.5 | 11,638.4; 11,775.6; 11,768.2 | 11,768.2 | 11,843.7 | -0.64% |
+| Complete live parity (ns/raw) | 17,549.1 | 17,339.3; 17,327.8; 17,393.2 | 17,339.3 | 17,251.9 | +0.51% |
+
+Every engine run retained 250,000 events and 999,996 intents. Every live run
+retained 50,204 raw frames, 70,208 feed outputs, 65,130 records, zero actions,
+4,193,771 allocation calls, and 1,871,951,969 requested bytes. The ordinary
+non-action path therefore has exactly zero allocation drift from Phase 3.
+
+#### Action-path benchmark and tail investigation
+
+The formal action-path warm-up was followed by the three mandated runs.
+Correlated p99/p99.9 excursions crossed the investigation threshold, so those
+runs were retained and two more warm recorded runs were added rather than
+replacing an observation. Each tuple below is
+`p50/p95/p99/p99.9/max` nanoseconds for runs 1 through 5:
+
+| Workload | Five recorded distributions (ns) |
+| --- | --- |
+| Quote creation | `19626/24632/30613/82057/83053950`; `19586/25066/31557/126684/85185540`; `19765/25780/33526/97967/83916942`; `19626/24114/30538/88212/84181857`; `19560/23778/30637/67026/83616930` |
+| Quote replacement/owned cancel | `13177/13637/18256/22342/104671`; `13645/19823/23376/30925/482846`; `13201/13702/19634/127431/4782154`; `13251/13850/18322/21842/84331`; `13227/13670/18576/24336/89089` |
+| IOC hedge | `24968/27577/33878/91157/45960682`; `27453/36085/42583/124929/50958133`; `24812/28061/35601/76979/47148833`; `24788/26929/33189/46900/45705898`; `24869/27158/33485/48680/45922872` |
+| Risk rejection | `11922/12447/16918/23688/357072`; `12250/18010/21579/28972/181165`; `11946/12415/16730/20463/96769`; `11987/12447/16952/31565/2064663`; `12291/12742/17157/20324/82632` |
+| Symbol fail-close | `632/640/665/1034/80146`; `632/681/3061/5498/137302`; `624/632/640/1133/11561`; `632/640/657/1173/26051`; `632/640/656/1083/53915` |
+| Global fail-close | `763/788/813/3110/285410`; `772/820/3068/5226/17321`; `763/788/813/1814/15130`; `763/788/812/1903/22038`; `771/796/820/2002/28652` |
+| Coordinator reduction | `5677/5924/7934/12603/76790`; `5744/10002/12570/18042/186638`; `5670/5973/9649/17756/63711`; `5662/5949/9296/14990/44750`; `5670/5973/9009/13104/38506` |
+| Raw recovery action | `26584/31884/42067/175504/6179024`; `26854/34108/41435/140239/6362856`; `27035/32550/37694/63490/6405210`; `26649/32163/38965/92707/6229829`; `27043/29021/35371/49164/6384927` |
+| Public-trade reprice | `12184/12627/17222/24623/175825`; `11979/14293/17411/44717/2670648`; `12135/12923/17287/22670/286640`; `11963/12496/16821/20751/623093`; `12045/12488/17328/34322/3228417` |
+| Bounded control/feed storm | `140/189/7581/7639/18871`; `140/197/7614/7688/16853`; `140/189/7614/7713/17378`; `140/205/7606/7672/49255`; `140/205/7622/10076/15418` |
+
+The five storm queue-age tuples were
+`11914/16090/16574/20413/24106`,
+`11946/16115/17370/22235/30514`,
+`12143/16615/19117/21588/24319`,
+`11939/16147/17198/24919/57549`, and
+`12767/18576/21579/26436/38735` ns. Timer-read-overhead tuples were
+`33/41/41/42/28069`, `33/41/41/42/5342`,
+`33/41/41/42/41099`, `33/41/41/42/9091`, and
+`33/41/41/42/30293` ns.
+
+Component-wise five-run medians and their Phase 3 comparisons are:
+
+| Workload | p50 | Delta | p99 | Delta | p99.9 | Delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Quote creation | 19,626 | +3.46% | 30,637 | -2.12% | 88,212 | -58.03% |
+| Quote replacement/owned cancel | 13,227 | +0.32% | 18,576 | +0.05% | 24,336 | -4.41% |
+| IOC hedge | 24,869 | +2.46% | 33,878 | +0.29% | 76,979 | +55.67% |
+| Risk rejection | 11,987 | -0.14% | 16,952 | -0.24% | 23,688 | +13.04% |
+| Symbol fail-close | 632 | 0.00% | 657 | -2.23% | 1,133 | -16.32% |
+| Global fail-close | 763 | -3.17% | 813 | -3.90% | 2,002 | -43.91% |
+| Coordinator reduction | 5,670 | -1.13% | 9,296 | +13.41% | 14,990 | +15.56% |
+| Raw recovery action | 26,854 | +0.18% | 38,965 | +5.67% | 92,707 | +61.32% |
+| Public-trade reprice | 12,045 | -1.74% | 17,287 | +0.66% | 24,623 | +18.06% |
+| Bounded control/feed storm | 140 | 0.00% | 7,614 | -0.55% | 7,688 | -0.75% |
+
+The investigation found a correlated shared-host tail signature rather than a
+numeric-path throughput regression. Run 2 simultaneously inflated hedge,
+risk, symbol/global cancel, coordinator, raw, and public-trade tails,
+including paths whose Phase 4 production logic did not change. Runs 4 and 5
+returned most p99 values toward the prior range. On the two exact-preparation
+paths, quote/hedge p50 changed only +3.46%/+2.46% and p99
+-2.12%/+0.29%; the quote p99.9 improved while the hedge p99.9 moved with the
+same broad tail noise. Unchanged coordinator, raw, risk, and public-trade
+rows also retained component p99.9 medians above 10%, which prevents
+attributing those tails to canonical lowering. All samples, including
+outliers, remain recorded; this shared-host regression gate is not a
+target-host claim.
+
+Every recorded action run retained exact logical counters and allocation
+totals at:
+
+```text
+aa7eaa6e9bb6727b4d52e6f1488591904c4d823a45e31e6829f23d938def4ce6
+```
+
+Allocation changes from Phase 3 are:
+
+| Workload | Calls delta | Requested-byte delta | Interpretation |
+| --- | ---: | ---: | --- |
+| Quote creation | +400,000 | +15,345,056 | +4 calls and about +153.45 bytes per prepared submit |
+| IOC hedge | +400,000 | +15,145,056 | +4 calls and about +151.45 bytes per prepared submit |
+| Raw recovery action | 0 | +8,000,000 | unchanged call count; +80 requested bytes per input |
+| All other action rows | 0 | 0 | Exact |
+
+Source review accounts for the submit-call increase in the checked decimal
+product/display and finite-projection path: two canonical products are formed
+per prepared submit. It is confined to action-producing preparation; the
+complete non-action live benchmark proves no allocation increase. The raw
+row's byte-only delta is retained rather than hidden. Its call count,
+decisions, actions, records, and median remain exact/stable. Phase 5 may
+profile these measured costs before considering an optimization; Phase 4 made
+no speculative performance rewrite.
+
+#### Prepared serializer benchmark
+
+The adapter-private ignored release benchmark used one warm-up and three
+recorded runs after canonical serialization. Each tuple is
+`p50/p95/p99/p99.9/max` nanoseconds:
+
+| Serializer workload | Warm-up | Three recorded runs | Median p50/p99/p99.9 |
+| --- | --- | --- | --- |
+| Prepared -> REST-shaped inner body | `681/698/706/1230/274661` | `640/649/657/1099/329536`; `648/657/673/4668/480639`; `665/673/681/1067/292581` | `648/673/1099` |
+| Prepared -> websocket order request | `2354/2380/2412/7303/199265` | `2207/2232/2249/6564/350212`; `2207/2232/2256/7507/2071597`; `2216/2240/2257/6769/241833` | `2207/2256/6769` |
+
+Against the Phase 0 five-run serializer medians, REST-shaped p50/p99/p99.9
+changed -9.24%/-9.91%/-26.39%; websocket changed
+-0.76%/-0.70%/-3.06%. Allocation calls remain exactly 6 per REST-shaped
+body and 24 per websocket request. Requested bytes fell by exactly seven per
+input/action: REST-shaped from 436 to 429, websocket from 1,557 to 1,550.
+Serialized output remains exactly 142 bytes and 204 bytes per observation,
+respectively.
+
+Every recorded serializer run retained 100,000 prepared inputs/actions and
+the exact logical/allocation projection SHA-256:
+
+```text
+1d4633a2d2634573a2d3cc790ed67b49427ef530ff3b115126e26e5199f3a0bb
+```
+
+Fixture assertions still compare `px` and `sz` bytes directly between both
+serializers. Credentials, signing, transport queues, network IO, exchange
+acknowledgement, and cancel/algo/spread operations remain outside this
+benchmark and outside the newly changed numeric seam.
+
+No Goal D stop condition was reached.
 
 ## Remaining Operational Blockers
 
