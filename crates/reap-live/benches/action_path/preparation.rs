@@ -42,6 +42,10 @@ impl PreparationRig {
                 0.1,
                 0.0001,
                 0.0001,
+                reap_venue::okx::OkxRegularOrderRules::from_exchange_decimals(
+                    "0.1", "0.0001", "0.0001",
+                )
+                .expect("spot exact order rules"),
                 true,
                 true,
                 true,
@@ -59,6 +63,8 @@ impl PreparationRig {
                 0.1,
                 1.0,
                 1.0,
+                reap_venue::okx::OkxRegularOrderRules::from_exchange_decimals("0.1", "1", "1")
+                    .expect("derivative exact order rules"),
                 true,
                 true,
                 true,

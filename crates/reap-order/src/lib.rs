@@ -13,7 +13,6 @@ pub use authority::{
 };
 pub use client_id::{
     ClientIdError, ClientOrderIdGenerator, GeneratedClientOrderId, IdempotencyError,
-    IdempotencyRegistry, Reservation,
 };
 pub use gateway::{
     CancelOutcome, GatewayError, OkxOrderGateway, OkxReconciliationClient, PreparedRegularCancel,

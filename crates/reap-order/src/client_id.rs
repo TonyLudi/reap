@@ -2,9 +2,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use reap_core::{NewOrder, Side, TimeInForce};
+use reap_venue::okx::OkxExactDecimal;
 use thiserror::Error;
 
-use crate::authority::RegularApprovalBinding;
+use crate::authority::{CanonicalRegularOrderNumbers, RegularApprovalBinding};
 
 const COUNTER_MODULUS: u64 = 2_176_782_336;
 const SESSION_MODULUS: u64 = 1_679_616;
@@ -131,7 +132,7 @@ fn padded_base36(value: u64, width: usize) -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Reservation {
+pub(crate) enum Reservation {
     New {
         client_order_id: String,
     },
@@ -153,19 +154,20 @@ pub enum IdempotencyError {
 }
 
 #[derive(Debug, Default)]
-pub struct IdempotencyRegistry {
+pub(crate) struct IdempotencyRegistry {
     entries: HashMap<String, IdempotencyEntry>,
 }
 
 impl IdempotencyRegistry {
-    pub fn reserve(
+    pub(crate) fn reserve(
         &mut self,
         key: impl Into<String>,
         order: &NewOrder,
+        canonical_numbers: &CanonicalRegularOrderNumbers,
         new_client_order_id: String,
     ) -> Result<Reservation, IdempotencyError> {
         let key = key.into();
-        let fingerprint = OrderFingerprint::from(order);
+        let fingerprint = OrderFingerprint::new(order, canonical_numbers);
         if let Some(existing) = self.entries.get(&key) {
             if existing.fingerprint != fingerprint {
                 return Err(IdempotencyError::Conflict { key });
@@ -193,7 +195,7 @@ impl IdempotencyRegistry {
         })
     }
 
-    pub fn mark_accepted(
+    pub(crate) fn mark_accepted(
         &mut self,
         key: &str,
         exchange_order_id: impl Into<String>,
@@ -206,7 +208,7 @@ impl IdempotencyRegistry {
         Ok(())
     }
 
-    pub fn release_pending(&mut self, key: &str) -> Result<(), IdempotencyError> {
+    pub(crate) fn release_pending(&mut self, key: &str) -> Result<(), IdempotencyError> {
         let entry = self
             .entries
             .get(key)
@@ -229,21 +231,21 @@ struct IdempotencyEntry {
 struct OrderFingerprint {
     symbol: String,
     side: u8,
-    qty: u64,
-    price: u64,
+    qty: OkxExactDecimal,
+    price: OkxExactDecimal,
     time_in_force: u8,
 }
 
-impl From<&NewOrder> for OrderFingerprint {
-    fn from(order: &NewOrder) -> Self {
+impl OrderFingerprint {
+    fn new(order: &NewOrder, canonical_numbers: &CanonicalRegularOrderNumbers) -> Self {
         Self {
             symbol: order.symbol.clone(),
             side: match order.side {
                 Side::Buy => 1,
                 Side::Sell => 2,
             },
-            qty: order.qty.to_bits(),
-            price: order.price.to_bits(),
+            qty: *canonical_numbers.qty(),
+            price: *canonical_numbers.price(),
             time_in_force: match order.time_in_force {
                 TimeInForce::Gtc => 1,
                 TimeInForce::Ioc => 2,
@@ -256,6 +258,7 @@ impl From<&NewOrder> for OrderFingerprint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authority::canonical_regular_order_numbers_for_test;
 
     fn order(price: f64) -> NewOrder {
         NewOrder {
@@ -268,6 +271,15 @@ mod tests {
             self_trade_prevention: None,
             reason: "quote".to_string(),
         }
+    }
+
+    fn canonical(price: &str, price_units: u64) -> CanonicalRegularOrderNumbers {
+        canonical_regular_order_numbers_for_test(
+            1,
+            price_units,
+            OkxExactDecimal::parse("1").unwrap(),
+            OkxExactDecimal::parse(price).unwrap(),
+        )
     }
 
     #[test]
@@ -291,24 +303,82 @@ mod tests {
     fn idempotency_reuses_pending_and_accepted_ids() {
         let mut registry = IdempotencyRegistry::default();
         assert_eq!(
-            registry.reserve("decision-1", &order(100.0), "client-1".to_string()),
+            registry.reserve(
+                "decision-1",
+                &order(100.0),
+                &canonical("100", 100),
+                "client-1".to_string()
+            ),
             Ok(Reservation::New {
                 client_order_id: "client-1".to_string()
             })
         );
         assert_eq!(
-            registry.reserve("decision-1", &order(100.0), "unused".to_string()),
+            registry.reserve(
+                "decision-1",
+                &order(100.0),
+                &canonical("100", 100),
+                "unused".to_string()
+            ),
             Ok(Reservation::Pending {
                 client_order_id: "client-1".to_string()
             })
         );
         registry.mark_accepted("decision-1", "exchange-1").unwrap();
         assert!(matches!(
-            registry.reserve("decision-1", &order(100.0), "unused".to_string()),
+            registry.reserve(
+                "decision-1",
+                &order(100.0),
+                &canonical("100", 100),
+                "unused".to_string()
+            ),
             Ok(Reservation::Accepted { .. })
         ));
         assert!(matches!(
-            registry.reserve("decision-1", &order(101.0), "unused".to_string()),
+            registry.reserve(
+                "decision-1",
+                &order(101.0),
+                &canonical("101", 101),
+                "unused".to_string()
+            ),
+            Err(IdempotencyError::Conflict { .. })
+        ));
+    }
+
+    #[test]
+    fn idempotency_uses_canonical_wire_identity_instead_of_f64_bits() {
+        let mut registry = IdempotencyRegistry::default();
+        let base = 0.3_f64;
+        let adjacent = f64::from_bits(base.to_bits() + 1);
+        assert_ne!(base.to_bits(), adjacent.to_bits());
+
+        assert!(matches!(
+            registry.reserve(
+                "decision-1",
+                &order(base),
+                &canonical("0.3", 3),
+                "client-1".to_string(),
+            ),
+            Ok(Reservation::New { .. })
+        ));
+        assert!(matches!(
+            registry.reserve(
+                "decision-1",
+                &order(adjacent),
+                // A metadata revision could express the same canonical wire
+                // value in different units. Wire identity remains unchanged.
+                &canonical("0.3", 30),
+                "unused".to_string(),
+            ),
+            Ok(Reservation::Pending { .. })
+        ));
+        assert!(matches!(
+            registry.reserve(
+                "decision-1",
+                &order(0.4),
+                &canonical("0.4", 4),
+                "unused".to_string(),
+            ),
             Err(IdempotencyError::Conflict { .. })
         ));
     }

@@ -29,18 +29,18 @@ use reap_order::{
 };
 use reap_venue::okx::{
     OkxAccountBalanceSnapshot, OkxAccountConfig, OkxAccountPositionsSnapshot, OkxAlgoOrderPage,
-    OkxAlgoOrderQuery, OkxCancelOrder, OkxFillPage, OkxInstrument, OkxInstrumentType, OkxOrderAck,
-    OkxPlaceOrder, OkxRegularOrderPage, OkxSpreadOrderPage, OkxSystemStatus, OkxTradeFeeRate,
-    OkxTradeMode, OkxWsOrderProtocolError, RestError, parse_okx_account_balance_response_json,
-    parse_okx_account_config_response_json, parse_okx_account_instruments_response_json,
-    parse_okx_account_positions_response_json, parse_okx_algo_order_page_response_json,
-    parse_okx_cancel_all_after_response_json, parse_okx_fill_page_response_json,
-    parse_okx_order_ack_response_json, parse_okx_order_details_response_json,
-    parse_okx_regular_order_page_response_json, parse_okx_server_time_response_json,
-    parse_okx_spread_order_page_response_json, parse_okx_system_status_response_json,
-    parse_okx_trade_fee_response_json,
+    OkxAlgoOrderQuery, OkxCancelOrder, OkxExactDecimal, OkxFillPage, OkxInstrument,
+    OkxInstrumentType, OkxOrderAck, OkxPlaceOrder, OkxRegularOrderPage, OkxSpreadOrderPage,
+    OkxSystemStatus, OkxTradeFeeRate, OkxTradeMode, OkxWsOrderProtocolError, RestError,
+    parse_okx_account_balance_response_json, parse_okx_account_config_response_json,
+    parse_okx_account_instruments_response_json, parse_okx_account_positions_response_json,
+    parse_okx_algo_order_page_response_json, parse_okx_cancel_all_after_response_json,
+    parse_okx_fill_page_response_json, parse_okx_order_ack_response_json,
+    parse_okx_order_details_response_json, parse_okx_regular_order_page_response_json,
+    parse_okx_server_time_response_json, parse_okx_spread_order_page_response_json,
+    parse_okx_system_status_response_json, parse_okx_trade_fee_response_json,
 };
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use thiserror::Error;
 
 const PUBLIC_TIME_PATH: &str = "/api/v5/public/time";
@@ -1140,8 +1140,8 @@ fn regular_place_order(prepared: &PreparedRegularSubmit) -> OkxPlaceOrder {
         trade_mode: prepared.trade_mode(),
         side: order.side,
         time_in_force: order.time_in_force,
-        price: order.price,
-        qty: order.qty,
+        price: *prepared.canonical_price(),
+        qty: *prepared.canonical_qty(),
         client_order_id: prepared.client_order_id().to_string(),
         reduce_only: order.reduce_only,
         self_trade_prevention: order.self_trade_prevention,
@@ -1254,6 +1254,17 @@ fn serialize_cancel(order: &OkxCancelOrder) -> Result<String, RestError> {
 }
 
 fn serialize_place(order: &OkxPlaceOrder) -> Result<String, RestError> {
+    struct CanonicalDecimal<'a>(&'a OkxExactDecimal);
+
+    impl Serialize for CanonicalDecimal<'_> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            serializer.collect_str(self.0)
+        }
+    }
+
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct Body<'a> {
@@ -1264,8 +1275,8 @@ fn serialize_place(order: &OkxPlaceOrder) -> Result<String, RestError> {
         side: &'static str,
         #[serde(rename = "ordType")]
         order_type: &'static str,
-        px: String,
-        sz: String,
+        px: CanonicalDecimal<'a>,
+        sz: CanonicalDecimal<'a>,
         #[serde(rename = "clOrdId")]
         client_order_id: &'a str,
         #[serde(rename = "reduceOnly", skip_serializing_if = "Option::is_none")]
@@ -1298,8 +1309,8 @@ fn serialize_place(order: &OkxPlaceOrder) -> Result<String, RestError> {
         trade_mode,
         side,
         order_type,
-        px: order.price.to_string(),
-        sz: order.qty.to_string(),
+        px: CanonicalDecimal(&order.price),
+        sz: CanonicalDecimal(&order.qty),
         client_order_id: &order.client_order_id,
         reduce_only: order.reduce_only.then_some(true),
         self_trade_prevention,
@@ -2493,6 +2504,10 @@ mod tests {
                     0.1,
                     0.0001,
                     0.0001,
+                    reap_venue::okx::OkxRegularOrderRules::from_exchange_decimals(
+                        "0.1", "0.0001", "0.0001",
+                    )
+                    .unwrap(),
                     true,
                     false,
                     true,
@@ -2522,6 +2537,9 @@ mod tests {
     fn typed_strategy_authority_is_serialized_only_after_gateway_preparation() {
         let (prepared, wire, expected_client_order_id) = typed_strategy_prepared_submit();
         assert_eq!(prepared.account_id(), "main");
+        let rest_shaped: serde_json::Value =
+            serde_json::from_str(&serialize_place(&regular_place_order(&prepared)).unwrap())
+                .unwrap();
 
         let factory = RegularOrderSessionFactory {
             wire: role_wire(&wire),
@@ -2536,6 +2554,8 @@ mod tests {
         assert_eq!(request["args"][0]["tdMode"], "cash");
         assert_eq!(request["args"][0]["clOrdId"], expected_client_order_id);
         assert_eq!(request["args"][0]["ordType"], "post_only");
+        assert_eq!(request["args"][0]["px"], rest_shaped["px"]);
+        assert_eq!(request["args"][0]["sz"], rest_shaped["sz"]);
         assert!(request["args"][0].get("account_id").is_none());
         assert_trace(&wire, &[]);
     }
@@ -2546,6 +2566,51 @@ mod tests {
     #[ignore = "release-only Goal D prepared-request serialization benchmark"]
     fn goal_d_prepared_serializer_benchmark() {
         goal_d_serializer_benchmark::run();
+    }
+
+    #[test]
+    fn exact_regular_numbers_are_byte_identical_in_rest_shaped_and_websocket_fields() {
+        let cases = [
+            ("1", "1"),
+            ("0.10", "0.1"),
+            ("0.05", "0.05"),
+            ("1e-4", "0.0001"),
+            ("1e-12", "0.000000000001"),
+            ("9007199254740991", "9007199254740991"),
+        ];
+
+        for (source, canonical) in cases {
+            let order = OkxPlaceOrder {
+                symbol: "BTC-USDT".to_string(),
+                trade_mode: OkxTradeMode::Cash,
+                side: Side::Buy,
+                time_in_force: TimeInForce::PostOnly,
+                price: OkxExactDecimal::parse(source).unwrap(),
+                qty: OkxExactDecimal::parse(source).unwrap(),
+                client_order_id: "client-1".to_string(),
+                reduce_only: false,
+                self_trade_prevention: None,
+            };
+            let rest_shaped: serde_json::Value =
+                serde_json::from_str(&serialize_place(&order).unwrap()).unwrap();
+            let websocket: serde_json::Value =
+                serde_json::from_str(&build_ws_place_request("exact1", 1, &order).unwrap())
+                    .unwrap();
+            let websocket_argument = &websocket["args"][0];
+
+            assert_eq!(rest_shaped["px"], canonical, "{source}");
+            assert_eq!(rest_shaped["sz"], canonical, "{source}");
+            assert_eq!(
+                rest_shaped["px"].as_str().unwrap().as_bytes(),
+                websocket_argument["px"].as_str().unwrap().as_bytes(),
+                "{source}"
+            );
+            assert_eq!(
+                rest_shaped["sz"].as_str().unwrap().as_bytes(),
+                websocket_argument["sz"].as_str().unwrap().as_bytes(),
+                "{source}"
+            );
+        }
     }
 
     #[test]
@@ -2569,8 +2634,8 @@ mod tests {
                 trade_mode: OkxTradeMode::Cash,
                 side: Side::Buy,
                 time_in_force: TimeInForce::PostOnly,
-                price: 100.5,
-                qty: 0.25,
+                price: OkxExactDecimal::parse("100.5").unwrap(),
+                qty: OkxExactDecimal::parse("0.25").unwrap(),
                 client_order_id: "client-1".to_string(),
                 reduce_only: false,
                 self_trade_prevention: Some(SelfTradePrevention::CancelMaker),

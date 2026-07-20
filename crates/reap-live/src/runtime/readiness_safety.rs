@@ -250,6 +250,12 @@ pub(super) fn exchange_instrument_expectations(
                     configured.symbol, metadata.instrument_type, expected_type
                 )));
             }
+            if metadata.regular_order_rules().is_none() {
+                return Err(LiveRuntimeError::ExchangeInstrumentDrift(format!(
+                    "account {account_id} {} metadata has no exact tick/lot/min regular-order rules",
+                    configured.symbol
+                )));
+            }
             let group_id = metadata.trade_fee_group_id.trim();
             if group_id.is_empty() {
                 return Err(LiveRuntimeError::ExchangeFeeCheck(format!(
@@ -402,6 +408,11 @@ pub(super) fn exchange_instrument_drift_reason(
     check_field!("tick size", expected.tick_size, current.tick_size);
     check_field!("lot size", expected.lot_size, current.lot_size);
     check_field!("minimum size", expected.min_size, current.min_size);
+    check_field!(
+        "exact regular-order rules",
+        expected.regular_order_rules(),
+        current.regular_order_rules()
+    );
     check_field!(
         "maximum limit-order size",
         expected.max_limit_size,

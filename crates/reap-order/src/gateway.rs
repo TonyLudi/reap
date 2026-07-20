@@ -4,17 +4,20 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use reap_core::{AccountUpdate, NewOrder};
 use reap_venue::okx::{
-    OkxFillPage, OkxFillPagination, OkxOrderAck, OkxRegularOrderPage, OkxRegularOrderPagination,
-    OkxTradeMode, RestError,
+    OkxExactDecimal, OkxFillPage, OkxFillPagination, OkxOrderAck, OkxRegularOrderPage,
+    OkxRegularOrderPagination, OkxTradeMode, RestError,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::authority::{RegularApprovalBinding, RegularApprovalScope};
+use crate::authority::{
+    CanonicalRegularOrderNumbers, RegularApprovalBinding, RegularApprovalScope,
+};
+use crate::client_id::{IdempotencyRegistry, Reservation};
 use crate::{
-    ApprovedRegularCancel, CancelOrderTransportError, IdempotencyError, IdempotencyRegistry,
-    OrderTransportError, PacingPolicy, PrivateStateReducer, ReconciliationSnapshot, RequestKind,
-    RequestPacer, Reservation, ReservedRegularSubmit, reconcile_full_state,
+    ApprovedRegularCancel, CancelOrderTransportError, IdempotencyError, OrderTransportError,
+    PacingPolicy, PrivateStateReducer, ReconciliationSnapshot, RequestKind, RequestPacer,
+    ReservedRegularSubmit, reconcile_full_state,
 };
 
 #[derive(Debug, Error)]
@@ -87,6 +90,7 @@ pub struct PreparedRegularSubmit {
     idempotency_key: String,
     client_order_id: String,
     order: NewOrder,
+    canonical_numbers: CanonicalRegularOrderNumbers,
     trade_mode: OkxTradeMode,
 }
 
@@ -101,6 +105,16 @@ impl PreparedRegularSubmit {
 
     pub fn order(&self) -> &NewOrder {
         &self.order
+    }
+
+    /// Canonical exchange quantity lowered by the execution policy.
+    pub fn canonical_qty(&self) -> &OkxExactDecimal {
+        self.canonical_numbers.qty()
+    }
+
+    /// Canonical exchange price lowered by the execution policy.
+    pub fn canonical_price(&self) -> &OkxExactDecimal {
+        self.canonical_numbers.price()
     }
 
     pub fn trade_mode(&self) -> OkxTradeMode {
@@ -372,10 +386,13 @@ impl OkxOrderGateway {
         trade_mode: OkxTradeMode,
     ) -> Result<SubmitPreparation, GatewayError> {
         let idempotency_key = idempotency_key.into();
-        let (account_id, generated_id, order, binding) = approved.into_parts();
-        let reservation =
-            self.idempotency
-                .reserve(idempotency_key.clone(), &order, generated_id)?;
+        let (account_id, generated_id, order, canonical_numbers, binding) = approved.into_parts();
+        let reservation = self.idempotency.reserve(
+            idempotency_key.clone(),
+            &order,
+            &canonical_numbers,
+            generated_id,
+        )?;
         let client_order_id = match reservation {
             Reservation::Accepted {
                 client_order_id,
@@ -401,6 +418,7 @@ impl OkxOrderGateway {
             idempotency_key,
             client_order_id,
             order,
+            canonical_numbers,
             trade_mode,
         }))
     }
@@ -794,7 +812,10 @@ mod tests {
 
     use super::*;
     use crate::CancelOrderTransportError;
-    use crate::authority::{approved_regular_cancel_for_test, reserved_regular_submit_for_test};
+    use crate::authority::{
+        approved_regular_cancel_for_test, canonical_regular_order_numbers_for_test,
+        reserved_regular_submit_for_test,
+    };
 
     #[derive(Clone)]
     struct HttpResponse {
@@ -1004,7 +1025,18 @@ mod tests {
     }
 
     fn approved_order(gateway: &OkxOrderGateway) -> ReservedRegularSubmit {
-        reserved_regular_submit_for_test("main", "reap1", order(), gateway.binding.clone())
+        reserved_regular_submit_for_test(
+            "main",
+            "reap1",
+            order(),
+            canonical_regular_order_numbers_for_test(
+                1,
+                200,
+                OkxExactDecimal::parse("0.1").unwrap(),
+                OkxExactDecimal::parse("100").unwrap(),
+            ),
+            gateway.binding.clone(),
+        )
     }
 
     fn approved_cancel(gateway: &OkxOrderGateway, client_order_id: &str) -> ApprovedRegularCancel {
@@ -1238,6 +1270,8 @@ mod tests {
 
         assert_eq!(*order_calls.lock().unwrap(), 0);
         assert_eq!(*rest_calls.lock().unwrap(), 0);
+        assert_eq!(prepared.canonical_qty().to_string(), "0.1");
+        assert_eq!(prepared.canonical_price().to_string(), "100");
         state.register_local_order(prepared.client_order_id(), prepared.order().clone());
         let client_order_id = prepared.client_order_id().to_string();
 

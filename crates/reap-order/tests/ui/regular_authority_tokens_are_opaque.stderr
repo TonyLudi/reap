@@ -138,13 +138,19 @@ error[E0624]: method `into_parts` is private
 error[E0624]: method `into_parts` is private
   --> tests/ui/regular_authority_tokens_are_opaque.rs:30:22
    |
-30 |     let _ = reserved.into_parts();
-   |                      ^^^^^^^^^^ private method
+30 |       let _ = reserved.into_parts();
+   |                        ^^^^^^^^^^ private method
    |
   ::: src/authority.rs
    |
-   |     pub(crate) fn into_parts(self) -> (String, String, NewOrder, RegularApprovalBinding) {
-   |     ------------------------------------------------------------------------------------ private method defined here
+   | /     pub(crate) fn into_parts(
+   | |         self,
+   | |     ) -> (
+   | |         String,
+...  |
+   | |         RegularApprovalBinding,
+   | |     ) {
+   | |_____- private method defined here
 
 error[E0277]: the trait bound `PreparedRegularSubmit: From<reap_core::NewOrder>` is not satisfied
   --> tests/ui/regular_authority_tokens_are_opaque.rs:34:42

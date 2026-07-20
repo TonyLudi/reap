@@ -7,6 +7,7 @@ fn approved_fields_are_private(submit: ApprovedRegularSubmit, cancel: ApprovedRe
     let ApprovedRegularSubmit {
         account_id: _,
         order: _,
+        canonical_numbers: _,
         origin: _,
     } = submit;
     let ApprovedRegularCancel {
@@ -23,6 +24,7 @@ fn prepared_fields_are_private(submit: PreparedRegularSubmit, cancel: PreparedRe
         idempotency_key: _,
         client_order_id: _,
         order: _,
+        canonical_numbers: _,
         trade_mode: _,
     } = submit;
     let PreparedRegularCancel {
@@ -38,6 +40,7 @@ fn reserved_fields_are_private(reserved: ReservedRegularSubmit) {
         account_id: _,
         client_order_id: _,
         order: _,
+        canonical_numbers: _,
     } = reserved;
 }
 

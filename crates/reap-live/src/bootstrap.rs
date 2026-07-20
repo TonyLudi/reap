@@ -6,7 +6,7 @@ use reap_risk::{InstrumentOrderLimits, InstrumentRiskModel};
 use reap_strategy::{InstrumentConfig, InstrumentKindConfig};
 use reap_venue::okx::{
     OkxAccountBalanceSnapshot, OkxAccountConfig, OkxAccountPositionsSnapshot, OkxContractType,
-    OkxInstrument, OkxInstrumentType,
+    OkxInstrument, OkxInstrumentType, OkxRegularOrderRules,
 };
 use reap_venue::{RemoteFill, RemoteOrder};
 use serde::{Deserialize, Serialize};
@@ -58,6 +58,45 @@ pub struct VerifiedInstrument {
     pub lot_size: f64,
     pub min_size: f64,
     pub contract_value: Option<f64>,
+    /// Exact authenticated order increments are live bootstrap state, not
+    /// serialized configuration or replay authority.
+    #[serde(skip)]
+    regular_order_rules: Option<OkxRegularOrderRules>,
+}
+
+impl VerifiedInstrument {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        account_id: impl Into<String>,
+        symbol: impl Into<String>,
+        instrument_type: OkxInstrumentType,
+        trade_mode: OkxTradeModeConfig,
+        risk_model: InstrumentRiskModel,
+        order_limits: InstrumentOrderLimits,
+        tick_size: f64,
+        lot_size: f64,
+        min_size: f64,
+        contract_value: Option<f64>,
+        regular_order_rules: OkxRegularOrderRules,
+    ) -> Self {
+        Self {
+            account_id: account_id.into(),
+            symbol: symbol.into(),
+            instrument_type,
+            trade_mode,
+            risk_model,
+            order_limits,
+            tick_size,
+            lot_size,
+            min_size,
+            contract_value,
+            regular_order_rules: Some(regular_order_rules),
+        }
+    }
+
+    pub(crate) fn regular_order_rules(&self) -> Option<&OkxRegularOrderRules> {
+        self.regular_order_rules.as_ref()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -202,23 +241,27 @@ pub fn verify_bootstrap(
             };
             verify_instrument(instrument, metadata, trade_mode, &account.id, &mut errors);
             if instrument_errors(instrument, metadata, trade_mode).is_empty() {
+                let regular_order_rules = metadata
+                    .regular_order_rules()
+                    .expect("instrument validation proved exact regular-order rules");
                 verified.insert(
                     instrument.symbol.clone(),
-                    VerifiedInstrument {
-                        account_id: account.id.clone(),
-                        symbol: instrument.symbol.clone(),
-                        instrument_type: metadata.instrument_type,
+                    VerifiedInstrument::new(
+                        account.id.clone(),
+                        instrument.symbol.clone(),
+                        metadata.instrument_type,
                         trade_mode,
-                        risk_model: risk_model(instrument),
-                        order_limits: InstrumentOrderLimits {
+                        risk_model(instrument),
+                        InstrumentOrderLimits {
                             max_limit_quantity: metadata.max_limit_size,
                             max_limit_notional_usd: metadata.max_limit_amount_usd,
                         },
-                        tick_size: metadata.tick_size,
-                        lot_size: metadata.lot_size,
-                        min_size: metadata.min_size,
-                        contract_value: metadata.contract_value,
-                    },
+                        metadata.tick_size,
+                        metadata.lot_size,
+                        metadata.min_size,
+                        metadata.contract_value,
+                        regular_order_rules,
+                    ),
                 );
             }
         }
@@ -296,6 +339,24 @@ fn instrument_errors(
     }
     if configured.kind.is_derivative() && exchange.instrument_family.trim().is_empty() {
         errors.push("exchange returned no derivative instFamily".to_string());
+    }
+    match exchange.regular_order_rules() {
+        Some(rules) => {
+            for (name, exact, parsed) in [
+                ("tick_size", rules.tick_size(), exchange.tick_size),
+                ("lot_size", rules.lot_size(), exchange.lot_size),
+                ("min_size", rules.min_size(), exchange.min_size),
+            ] {
+                if exact.as_f64().to_bits() != parsed.to_bits() {
+                    errors.push(format!(
+                        "{name} exact decimal {} does not match parsed exchange value {parsed}",
+                        exact
+                    ));
+                }
+            }
+        }
+        None => errors
+            .push("exchange metadata has no exact tick/lot/min regular-order rules".to_string()),
     }
     compare_number(
         "tick_size",
@@ -505,6 +566,19 @@ mod tests {
         }
     }
 
+    fn instrument_metadata() -> HashMap<String, OkxInstrument> {
+        reap_venue::okx::parse_okx_account_instruments_response_json(
+            br#"{"code":"0","msg":"","data":[
+                {"instId":"BTC-USDT","instType":"SPOT","instFamily":"","groupId":"1","uly":"","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"","ctType":"","ctVal":"","ctValCcy":"","tickSz":"0.1","lotSz":"0.0001","minSz":"0.0001","maxLmtSz":"100","maxMktSz":"1000000","maxLmtAmt":"1000000","maxMktAmt":"1000000","state":"live","upcChg":[]},
+                {"instId":"BTC-USDT-SWAP","instType":"SWAP","instFamily":"BTC-USDT","groupId":"2","uly":"BTC-USDT","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"USDT","ctType":"linear","ctVal":"0.001","ctValCcy":"BTC","tickSz":"0.1","lotSz":"1","minSz":"1","maxLmtSz":"1000000","maxMktSz":"1000000","maxLmtAmt":"","maxMktAmt":"","state":"live","upcChg":[]}
+            ]}"#,
+        )
+        .expect("bootstrap instrument fixtures must parse")
+        .into_iter()
+        .map(|instrument| (instrument.symbol.clone(), instrument))
+        .collect()
+    }
+
     fn snapshot() -> AccountBootstrapSnapshot {
         AccountBootstrapSnapshot {
             account_config: OkxAccountConfig {
@@ -523,58 +597,7 @@ mod tests {
                 auto_loan: Some(false),
                 spot_borrow_auto_repay: Some(false),
             },
-            instruments: HashMap::from([
-                (
-                    "BTC-USDT".to_string(),
-                    OkxInstrument {
-                        symbol: "BTC-USDT".to_string(),
-                        instrument_type: OkxInstrumentType::Spot,
-                        instrument_family: "".to_string(),
-                        trade_fee_group_id: "1".to_string(),
-                        underlying: "".to_string(),
-                        base_currency: "BTC".to_string(),
-                        quote_currency: "USDT".to_string(),
-                        settle_currency: "".to_string(),
-                        contract_type: None,
-                        contract_value: None,
-                        contract_value_currency: "".to_string(),
-                        tick_size: 0.1,
-                        lot_size: 0.0001,
-                        min_size: 0.0001,
-                        max_limit_size: 100.0,
-                        max_market_size: 1_000_000.0,
-                        max_limit_amount_usd: Some(1_000_000.0),
-                        max_market_amount_usd: Some(1_000_000.0),
-                        state: "live".to_string(),
-                        upcoming_changes: Vec::new(),
-                    },
-                ),
-                (
-                    "BTC-USDT-SWAP".to_string(),
-                    OkxInstrument {
-                        symbol: "BTC-USDT-SWAP".to_string(),
-                        instrument_type: OkxInstrumentType::Swap,
-                        instrument_family: "BTC-USDT".to_string(),
-                        trade_fee_group_id: "2".to_string(),
-                        underlying: "BTC-USDT".to_string(),
-                        base_currency: "BTC".to_string(),
-                        quote_currency: "USDT".to_string(),
-                        settle_currency: "USDT".to_string(),
-                        contract_type: Some(OkxContractType::Linear),
-                        contract_value: Some(0.001),
-                        contract_value_currency: "BTC".to_string(),
-                        tick_size: 0.1,
-                        lot_size: 1.0,
-                        min_size: 1.0,
-                        max_limit_size: 1_000_000.0,
-                        max_market_size: 1_000_000.0,
-                        max_limit_amount_usd: None,
-                        max_market_amount_usd: None,
-                        state: "live".to_string(),
-                        upcoming_changes: Vec::new(),
-                    },
-                ),
-            ]),
+            instruments: instrument_metadata(),
             balance_economics: OkxAccountBalanceSnapshot {
                 update_time_ms: 1,
                 total_equity_usd: Some(10_000.0),
@@ -766,6 +789,56 @@ mod tests {
         let error = verify_bootstrap(&config, &HashMap::from([("main".to_string(), snapshot)]))
             .unwrap_err();
         assert!(error.to_string().contains("tick_size mismatch"));
+    }
+
+    #[test]
+    fn rejects_exchange_metadata_that_lost_exact_order_rules() {
+        let config = config();
+        let mut snapshot = snapshot();
+        let serialized = serde_json::to_vec(snapshot.instruments.get("BTC-USDT").unwrap()).unwrap();
+        let without_internal_rules: OkxInstrument = serde_json::from_slice(&serialized).unwrap();
+        snapshot
+            .instruments
+            .insert("BTC-USDT".to_string(), without_internal_rules);
+
+        let error = verify_bootstrap(&config, &HashMap::from([("main".to_string(), snapshot)]))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("no exact tick/lot/min regular-order rules"));
+    }
+
+    #[test]
+    fn verified_instrument_schema_excludes_exact_order_rules_and_drops_authority_on_parse() {
+        let config = config();
+        let verified =
+            verify_bootstrap(&config, &HashMap::from([("main".to_string(), snapshot())])).unwrap();
+        let instrument = verified.instruments.get("BTC-USDT").unwrap();
+        assert!(instrument.regular_order_rules().is_some());
+
+        let value = serde_json::to_value(instrument).unwrap();
+        assert_eq!(
+            value
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![
+                "account_id",
+                "contract_value",
+                "instrument_type",
+                "lot_size",
+                "min_size",
+                "order_limits",
+                "risk_model",
+                "symbol",
+                "tick_size",
+                "trade_mode",
+            ]
+        );
+        let parsed: VerifiedInstrument = serde_json::from_value(value).unwrap();
+        assert!(parsed.regular_order_rules().is_none());
     }
 
     #[test]

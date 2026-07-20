@@ -8,6 +8,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::{OkxExactDecimal, OkxRegularOrderRules};
 use crate::{PrivateOrderState, RemoteFill, RemoteOrder};
 
 mod pending_orders;
@@ -571,6 +572,17 @@ pub struct OkxInstrument {
     pub max_market_amount_usd: Option<f64>,
     pub state: String,
     pub upcoming_changes: Vec<OkxInstrumentChange>,
+    #[serde(skip, default)]
+    regular_order_rules: Option<OkxRegularOrderRules>,
+}
+
+impl OkxInstrument {
+    /// Exact trusted-exchange increments, when this value came directly from
+    /// the OKX instrument parser rather than a persisted legacy schema.
+    #[must_use]
+    pub fn regular_order_rules(&self) -> Option<OkxRegularOrderRules> {
+        self.regular_order_rules
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -765,8 +777,8 @@ pub struct OkxPlaceOrder {
     pub trade_mode: OkxTradeMode,
     pub side: Side,
     pub time_in_force: TimeInForce,
-    pub price: f64,
-    pub qty: f64,
+    pub price: OkxExactDecimal,
+    pub qty: OkxExactDecimal,
     pub client_order_id: String,
     pub reduce_only: bool,
     pub self_trade_prevention: Option<SelfTradePrevention>,
@@ -1325,6 +1337,8 @@ impl TryFrom<OkxInstrumentWire> for OkxInstrument {
 
     fn try_from(value: OkxInstrumentWire) -> Result<Self, Self::Error> {
         let min_size = parse_positive_number("minSz", &value.min_size)?;
+        let tick_size = parse_positive_number("tickSz", &value.tick_size)?;
+        let lot_size = parse_positive_number("lotSz", &value.lot_size)?;
         let max_limit_size = parse_positive_number("maxLmtSz", &value.max_limit_size)?;
         if max_limit_size < min_size {
             return Err(RestError::InvalidField {
@@ -1335,6 +1349,16 @@ impl TryFrom<OkxInstrumentWire> for OkxInstrument {
                 ),
             });
         }
+        let regular_order_rules = OkxRegularOrderRules::from_exchange_decimals(
+            &value.tick_size,
+            &value.lot_size,
+            &value.min_size,
+        )
+        .map_err(|error| RestError::InvalidField {
+            field: "tickSz/lotSz/minSz",
+            value: format!("{}/{}/{}", value.tick_size, value.lot_size, value.min_size),
+            message: error.to_string(),
+        })?;
         Ok(Self {
             symbol: value.symbol,
             instrument_type: parse_instrument_type(&value.instrument_type)?,
@@ -1347,8 +1371,8 @@ impl TryFrom<OkxInstrumentWire> for OkxInstrument {
             contract_type: parse_contract_type(&value.contract_type)?,
             contract_value: parse_nullable_number("ctVal", &value.contract_value)?,
             contract_value_currency: value.contract_value_currency,
-            tick_size: parse_positive_number("tickSz", &value.tick_size)?,
-            lot_size: parse_positive_number("lotSz", &value.lot_size)?,
+            tick_size,
+            lot_size,
             min_size,
             max_limit_size,
             max_market_size: parse_positive_number("maxMktSz", &value.max_market_size)?,
@@ -1366,6 +1390,7 @@ impl TryFrom<OkxInstrumentWire> for OkxInstrument {
                 .into_iter()
                 .map(OkxInstrumentChange::try_from)
                 .collect::<Result<_, _>>()?,
+            regular_order_rules: Some(regular_order_rules),
         })
     }
 }
@@ -2408,6 +2433,41 @@ mod tests {
             instruments[0].upcoming_changes[0].parameter,
             OkxInstrumentChangeParameter::TickSize
         );
+        let rules = instruments[0].regular_order_rules().unwrap();
+        assert_eq!(rules.tick_size().to_string(), "0.1");
+        assert_eq!(rules.lot_size().to_string(), "1");
+        assert_eq!(rules.min_size().to_string(), "1");
+    }
+
+    #[test]
+    fn account_instrument_exact_rules_preserve_scientific_wire_values_off_schema() {
+        let instrument = parse_okx_account_instruments_response_json(
+            br#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","instFamily":"","groupId":"1","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"","ctType":"","ctVal":"","ctValCcy":"","tickSz":"1e-4","lotSz":"0.0500","minSz":"1e-1","maxLmtSz":"1000000","maxMktSz":"1000000","maxLmtAmt":"","maxMktAmt":"","state":"live","upcChg":[]}]}"#,
+        )
+        .unwrap()
+        .remove(0);
+        let rules = instrument.regular_order_rules().unwrap();
+        assert_eq!(rules.tick_size().to_string(), "0.0001");
+        assert_eq!(rules.lot_size().to_string(), "0.05");
+        assert_eq!(rules.min_size().to_string(), "0.1");
+
+        let serialized = serde_json::to_value(&instrument).unwrap();
+        assert!(serialized.get("regular_order_rules").is_none());
+        let restored: OkxInstrument = serde_json::from_value(serialized).unwrap();
+        assert!(restored.regular_order_rules().is_none());
+    }
+
+    #[test]
+    fn account_instrument_parser_rejects_non_integral_exact_minimum_lots() {
+        assert!(matches!(
+            parse_okx_account_instruments_response_json(
+                br#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","instFamily":"","groupId":"1","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"","ctType":"","ctVal":"","ctValCcy":"","tickSz":"0.1","lotSz":"0.05","minSz":"0.06","maxLmtSz":"1000000","maxMktSz":"1000000","maxLmtAmt":"","maxMktAmt":"","state":"live","upcChg":[]}]}"#
+            ),
+            Err(RestError::InvalidField {
+                field: "tickSz/lotSz/minSz",
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -7,6 +7,7 @@ use reap_core::{
 use reap_risk::{InstrumentOrderLimits, InstrumentRiskModel};
 use reap_storage::ProvenRegularSubmitRequest;
 use reap_strategy::ChaosExecutionIntent;
+use reap_venue::okx::{OkxExactDecimal, OkxRegularOrderRules};
 use thiserror::Error;
 
 use crate::{ClientIdError, ClientOrderIdGenerator, GeneratedClientOrderId, PrivateStateReducer};
@@ -191,6 +192,7 @@ impl OwnedRegularOrders {
                 account_id: approved.account_id,
                 client_order_id,
                 order: approved.order,
+                canonical_numbers: approved.canonical_numbers,
                 binding: approved.binding,
             },
         ))
@@ -281,10 +283,49 @@ impl OwnedRegularOrders {
     }
 }
 
+/// Canonical exchange numeric identity lowered once at the policy boundary.
+///
+/// This is deliberately non-`Clone`, non-serializable, and private. Only the
+/// one-shot regular-submit authority chain can carry it to an adapter.
+#[derive(Debug)]
+pub(crate) struct CanonicalRegularOrderNumbers {
+    qty_units: u64,
+    price_units: u64,
+    qty: OkxExactDecimal,
+    price: OkxExactDecimal,
+}
+
+impl CanonicalRegularOrderNumbers {
+    fn from_lowered(
+        qty_units: u64,
+        price_units: u64,
+        qty: OkxExactDecimal,
+        price: OkxExactDecimal,
+    ) -> Self {
+        Self {
+            qty_units,
+            price_units,
+            qty,
+            price,
+        }
+    }
+
+    pub(crate) fn qty(&self) -> &OkxExactDecimal {
+        debug_assert!(self.qty_units > 0);
+        &self.qty
+    }
+
+    pub(crate) fn price(&self) -> &OkxExactDecimal {
+        debug_assert!(self.price_units > 0);
+        &self.price
+    }
+}
+
 #[derive(Debug)]
 pub struct ApprovedRegularSubmit {
     account_id: String,
     order: NewOrder,
+    canonical_numbers: CanonicalRegularOrderNumbers,
     origin: OwnedRegularOrderOrigin,
     binding: RegularApprovalBinding,
 }
@@ -307,6 +348,7 @@ pub struct ReservedRegularSubmit {
     account_id: String,
     client_order_id: String,
     order: NewOrder,
+    canonical_numbers: CanonicalRegularOrderNumbers,
     binding: RegularApprovalBinding,
 }
 
@@ -327,11 +369,20 @@ impl ReservedRegularSubmit {
         &self.binding
     }
 
-    pub(crate) fn into_parts(self) -> (String, String, NewOrder, RegularApprovalBinding) {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        String,
+        String,
+        NewOrder,
+        CanonicalRegularOrderNumbers,
+        RegularApprovalBinding,
+    ) {
         (
             self.account_id,
             self.client_order_id,
             self.order,
+            self.canonical_numbers,
             self.binding,
         )
     }
@@ -383,14 +434,26 @@ pub(crate) fn reserved_regular_submit_for_test(
     account_id: impl Into<String>,
     client_order_id: impl Into<String>,
     order: NewOrder,
+    canonical_numbers: CanonicalRegularOrderNumbers,
     binding: RegularApprovalBinding,
 ) -> ReservedRegularSubmit {
     ReservedRegularSubmit {
         account_id: account_id.into(),
         client_order_id: client_order_id.into(),
         order,
+        canonical_numbers,
         binding,
     }
+}
+
+#[cfg(test)]
+pub(crate) fn canonical_regular_order_numbers_for_test(
+    qty_units: u64,
+    price_units: u64,
+    qty: OkxExactDecimal,
+    price: OkxExactDecimal,
+) -> CanonicalRegularOrderNumbers {
+    CanonicalRegularOrderNumbers::from_lowered(qty_units, price_units, qty, price)
 }
 
 #[cfg(test)]
@@ -419,6 +482,7 @@ pub struct RegularExecutionProfile {
     tick_size: f64,
     lot_size: f64,
     min_size: f64,
+    regular_order_rules: OkxRegularOrderRules,
     quote_allowed: bool,
     hedge_allowed: bool,
     quote_stp_verified: bool,
@@ -434,6 +498,7 @@ impl RegularExecutionProfile {
         tick_size: f64,
         lot_size: f64,
         min_size: f64,
+        regular_order_rules: OkxRegularOrderRules,
         quote_allowed: bool,
         hedge_allowed: bool,
         quote_stp_verified: bool,
@@ -446,6 +511,7 @@ impl RegularExecutionProfile {
             tick_size,
             lot_size,
             min_size,
+            regular_order_rules,
             quote_allowed,
             hedge_allowed,
             quote_stp_verified,
@@ -511,6 +577,15 @@ pub enum RegularExecutionPolicyError {
     },
     #[error("regular order {field} {value} for {symbol} is not aligned to {increment}")]
     Misaligned {
+        symbol: String,
+        field: &'static str,
+        value: f64,
+        increment: f64,
+    },
+    #[error(
+        "regular order {field} {value} for {symbol} cannot be represented by bounded exact units of {increment}"
+    )]
+    UnrepresentableNumber {
         symbol: String,
         field: &'static str,
         value: f64,
@@ -661,7 +736,7 @@ impl RegularExecutionPolicy {
         if !enabled {
             return Err(RegularExecutionPolicyError::PurposeUnavailable { purpose, symbol });
         }
-        self.validate_numeric(&symbol, qty, price, profile)?;
+        let canonical_numbers = self.validate_numeric(&symbol, qty, price, profile)?;
         let (time_in_force, self_trade_prevention) = match origin {
             OwnedRegularOrderOrigin::Quote => (TimeInForce::PostOnly, None),
             OwnedRegularOrderOrigin::Hedge => {
@@ -681,6 +756,7 @@ impl RegularExecutionPolicy {
                 self_trade_prevention,
                 reason: reason.to_string(),
             },
+            canonical_numbers,
             origin,
             binding: binding.clone(),
         })
@@ -692,7 +768,7 @@ impl RegularExecutionPolicy {
         qty: f64,
         price: f64,
         profile: &RegularExecutionProfile,
-    ) -> Result<(), RegularExecutionPolicyError> {
+    ) -> Result<CanonicalRegularOrderNumbers, RegularExecutionPolicyError> {
         for (field, value) in [("quantity", qty), ("price", price)] {
             if !value.is_finite() || value <= 0.0 {
                 return Err(RegularExecutionPolicyError::InvalidNumber {
@@ -738,7 +814,34 @@ impl RegularExecutionPolicy {
                 });
             }
         }
-        Ok(())
+        let qty_units = exact_units(symbol, "quantity", qty, profile.lot_size)?;
+        let price_units = exact_units(symbol, "price", price, profile.tick_size)?;
+        let canonical_qty = profile
+            .regular_order_rules
+            .lot_size()
+            .checked_mul_units(qty_units)
+            .map_err(|_| RegularExecutionPolicyError::UnrepresentableNumber {
+                symbol: symbol.to_string(),
+                field: "quantity",
+                value: qty,
+                increment: profile.lot_size,
+            })?;
+        let canonical_price = profile
+            .regular_order_rules
+            .tick_size()
+            .checked_mul_units(price_units)
+            .map_err(|_| RegularExecutionPolicyError::UnrepresentableNumber {
+                symbol: symbol.to_string(),
+                field: "price",
+                value: price,
+                increment: profile.tick_size,
+            })?;
+        Ok(CanonicalRegularOrderNumbers::from_lowered(
+            qty_units,
+            price_units,
+            canonical_qty,
+            canonical_price,
+        ))
     }
 
     /// Binds storage's opaque durable-submit proof to this gateway-scoped
@@ -875,6 +978,26 @@ fn validate_profile(profile: &RegularExecutionProfile) -> Result<(), RegularExec
             });
         }
     }
+    let rules = profile.regular_order_rules;
+    let exact_floats_match = [
+        (rules.tick_size().as_f64(), profile.tick_size),
+        (rules.lot_size().as_f64(), profile.lot_size),
+        (rules.min_size().as_f64(), profile.min_size),
+    ]
+    .into_iter()
+    .all(|(exact, authenticated)| exact.to_bits() == authenticated.to_bits());
+    let exact_minimum_is_lot_aligned = bounded_units(profile.min_size, profile.lot_size)
+        .and_then(|units| rules.lot_size().checked_mul_units(units).ok())
+        .is_some_and(|minimum| minimum == rules.min_size());
+    if !exact_floats_match
+        || !aligned(profile.min_size, profile.lot_size)
+        || !exact_minimum_is_lot_aligned
+    {
+        return Err(RegularExecutionPolicyError::InvalidProfile {
+            symbol: profile.symbol.clone(),
+            field: "regular_order_rules",
+        });
+    }
     if profile.quote_allowed && !profile.quote_stp_verified {
         return Err(RegularExecutionPolicyError::QuoteStpUnverified {
             account_id: profile.account_id.clone(),
@@ -910,12 +1033,45 @@ fn aligned(value: f64, increment: f64) -> bool {
     (units - units.round()).abs() <= 8.0 * f64::EPSILON * units.abs().max(1.0)
 }
 
+const MAX_EXACT_UNITS: u64 = (1_u64 << 53) - 1;
+
+fn bounded_units(value: f64, increment: f64) -> Option<u64> {
+    let rounded = (value / increment).round();
+    if !rounded.is_finite() || rounded < 1.0 || rounded > MAX_EXACT_UNITS as f64 {
+        return None;
+    }
+    let units = rounded as u64;
+    (units as f64 == rounded).then_some(units)
+}
+
+fn exact_units(
+    symbol: &str,
+    field: &'static str,
+    value: f64,
+    increment: f64,
+) -> Result<u64, RegularExecutionPolicyError> {
+    bounded_units(value, increment).ok_or_else(|| {
+        RegularExecutionPolicyError::UnrepresentableNumber {
+            symbol: symbol.to_string(),
+            field,
+            value,
+            increment,
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reap_venue::okx::OkxRegularOrderRules;
 
     const ACCOUNT_ID: &str = "regular-account";
     const SYMBOL: &str = "BTC-USDT";
+
+    fn exact_rules(tick_size: &str, lot_size: &str, min_size: &str) -> OkxRegularOrderRules {
+        OkxRegularOrderRules::from_exchange_decimals(tick_size, lot_size, min_size)
+            .expect("test exact regular-order rules must be valid")
+    }
 
     fn valid_profile() -> RegularExecutionProfile {
         RegularExecutionProfile {
@@ -929,10 +1085,29 @@ mod tests {
             tick_size: 0.5,
             lot_size: 0.1,
             min_size: 0.2,
+            regular_order_rules: exact_rules("0.5", "0.1", "0.2"),
             quote_allowed: true,
             hedge_allowed: true,
             quote_stp_verified: true,
         }
+    }
+
+    fn policy_for_exact_rules(
+        tick_size: &str,
+        lot_size: &str,
+        min_size: &str,
+    ) -> RegularExecutionPolicy {
+        let mut profile = valid_profile();
+        profile.tick_size = tick_size.parse().unwrap();
+        profile.lot_size = lot_size.parse().unwrap();
+        profile.min_size = min_size.parse().unwrap();
+        profile.regular_order_rules = exact_rules(tick_size, lot_size, min_size);
+        profile.order_limits.max_limit_quantity = f64::MAX;
+        profile.order_limits.max_limit_notional_usd = None;
+        let scope =
+            RegularApprovalScope::new(ACCOUNT_ID.to_string(), RegularApprovalBinding::new());
+        let profiles = scope.bind_profiles([profile]).unwrap();
+        RegularExecutionPolicy::from_profile_sets([profiles]).unwrap()
     }
 
     fn test_policy(quote_allowed: bool, hedge_allowed: bool) -> RegularExecutionPolicy {
@@ -1369,6 +1544,215 @@ mod tests {
                 value: 500_000_000.25,
                 increment: 0.5,
             }) if symbol == SYMBOL
+        ));
+    }
+
+    #[test]
+    fn approved_orders_carry_exchange_exact_numbers_for_required_increment_shapes() {
+        let cases = [
+            ("1", "1", "1", 2.0, 100.0, "2", "100"),
+            ("0.1", "0.1", "0.1", 0.3, 100.3, "0.3", "100.3"),
+            ("0.05", "0.05", "0.05", 0.15, 100.15, "0.15", "100.15"),
+            (
+                "0.0001", "0.0001", "0.0001", 0.0003, 0.0012, "0.0003", "0.0012",
+            ),
+            (
+                "1e-12",
+                "1e-12",
+                "1e-12",
+                3e-12,
+                7e-12,
+                "0.000000000003",
+                "0.000000000007",
+            ),
+        ];
+
+        for (tick, lot, minimum, qty, price, expected_qty, expected_price) in cases {
+            let policy = policy_for_exact_rules(tick, lot, minimum);
+            let approved = authorize(
+                &policy,
+                SYMBOL,
+                Side::Buy,
+                qty,
+                price,
+                "exact-shape",
+                OwnedRegularOrderOrigin::Quote,
+            )
+            .unwrap();
+
+            assert_eq!(approved.canonical_numbers.qty().to_string(), expected_qty);
+            assert_eq!(
+                approved.canonical_numbers.price().to_string(),
+                expected_price
+            );
+        }
+    }
+
+    #[test]
+    fn adjacent_accepted_f64_values_lower_to_one_canonical_exchange_identity() {
+        let policy = policy_for_exact_rules("0.1", "0.1", "0.1");
+        let base = 0.3_f64;
+        let adjacent = f64::from_bits(base.to_bits() + 1);
+        assert_ne!(base.to_bits(), adjacent.to_bits());
+        assert!(aligned(base, 0.1));
+        assert!(aligned(adjacent, 0.1));
+
+        let base = authorize(
+            &policy,
+            SYMBOL,
+            Side::Buy,
+            0.2,
+            base,
+            "base",
+            OwnedRegularOrderOrigin::Quote,
+        )
+        .unwrap();
+        let adjacent = authorize(
+            &policy,
+            SYMBOL,
+            Side::Buy,
+            0.2,
+            adjacent,
+            "adjacent",
+            OwnedRegularOrderOrigin::Quote,
+        )
+        .unwrap();
+
+        assert_eq!(
+            base.canonical_numbers.price(),
+            adjacent.canonical_numbers.price()
+        );
+        assert_eq!(base.canonical_numbers.price().to_string(), "0.3");
+
+        for outside_tolerance in [
+            f64::from_bits(0.3_f64.to_bits() - 64),
+            f64::from_bits(0.3_f64.to_bits() + 64),
+        ] {
+            assert!(matches!(
+                authorize(
+                    &policy,
+                    SYMBOL,
+                    Side::Buy,
+                    0.2,
+                    outside_tolerance,
+                    "outside-tolerance",
+                    OwnedRegularOrderOrigin::Quote,
+                ),
+                Err(RegularExecutionPolicyError::Misaligned {
+                    symbol,
+                    field: "price",
+                    ..
+                }) if symbol == SYMBOL
+            ));
+        }
+    }
+
+    #[test]
+    fn accepted_numeric_units_are_bounded_and_multiplication_must_be_representable() {
+        let policy = policy_for_exact_rules("1", "1", "1");
+        let maximum = ((1_u64 << 53) - 1) as f64;
+        let approved = authorize(
+            &policy,
+            SYMBOL,
+            Side::Buy,
+            1.0,
+            maximum,
+            "maximum-units",
+            OwnedRegularOrderOrigin::Quote,
+        )
+        .unwrap();
+        assert_eq!(
+            approved.canonical_numbers.price().to_string(),
+            "9007199254740991"
+        );
+
+        for price in [f64::from_bits(1), (1_u64 << 53) as f64] {
+            assert!(matches!(
+                authorize(
+                    &policy,
+                    SYMBOL,
+                    Side::Buy,
+                    1.0,
+                    price,
+                    "unrepresentable-units",
+                    OwnedRegularOrderOrigin::Quote,
+                ),
+                Err(RegularExecutionPolicyError::UnrepresentableNumber {
+                    symbol,
+                    field: "price",
+                    ..
+                }) if symbol == SYMBOL
+            ));
+        }
+
+        let overflowing_tick = "340282366920938463463374607431768211455";
+        let overflow_policy = policy_for_exact_rules(overflowing_tick, "1", "1");
+        let price = overflowing_tick.parse::<f64>().unwrap() * 3.0;
+        assert!(matches!(
+            authorize(
+                &overflow_policy,
+                SYMBOL,
+                Side::Buy,
+                1.0,
+                price,
+                "decimal-overflow",
+                OwnedRegularOrderOrigin::Quote,
+            ),
+            Err(RegularExecutionPolicyError::UnrepresentableNumber {
+                symbol,
+                field: "price",
+                ..
+            }) if symbol == SYMBOL
+        ));
+    }
+
+    #[test]
+    fn exact_unit_lowering_roundtrips_over_a_bounded_exhaustive_range() {
+        for increment in ["1", "0.1", "0.05", "0.0001", "1e-12"] {
+            let policy = policy_for_exact_rules(increment, increment, increment);
+            let increment_f64 = increment.parse::<f64>().unwrap();
+            for units in 1..=10_000_u64 {
+                let value = increment_f64 * units as f64;
+                let approved = authorize(
+                    &policy,
+                    SYMBOL,
+                    Side::Buy,
+                    value,
+                    value,
+                    "bounded-roundtrip",
+                    OwnedRegularOrderOrigin::Quote,
+                )
+                .unwrap();
+                let expected = exact_rules(increment, increment, increment)
+                    .tick_size()
+                    .checked_mul_units(units)
+                    .unwrap();
+                assert_eq!(approved.canonical_numbers.qty(), &expected);
+                assert_eq!(approved.canonical_numbers.price(), &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn profile_rejects_exact_rules_that_disagree_with_authenticated_floats() {
+        let mut mismatch = valid_profile();
+        mismatch.regular_order_rules = exact_rules("0.25", "0.1", "0.2");
+        assert!(matches!(
+            RegularExecutionPolicy::from_profiles_and_profile_sets([mismatch], []),
+            Err(RegularExecutionPolicyError::InvalidProfile {
+                field: "regular_order_rules",
+                ..
+            })
+        ));
+
+        let mut misaligned_minimum = valid_profile();
+        misaligned_minimum.min_size = 0.25;
+        assert!(matches!(
+            RegularExecutionPolicy::from_profiles_and_profile_sets([misaligned_minimum], []),
+            Err(RegularExecutionPolicyError::InvalidProfile {
+                field: "regular_order_rules",
+                ..
+            })
         ));
     }
 

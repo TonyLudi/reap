@@ -255,28 +255,13 @@ fn exchange_instrument_expectation(
 }
 
 fn spot_instrument(upcoming_changes: Vec<OkxInstrumentChange>) -> OkxInstrument {
-    OkxInstrument {
-        symbol: "BTC-USDT".to_string(),
-        instrument_type: OkxInstrumentType::Spot,
-        instrument_family: String::new(),
-        trade_fee_group_id: "1".to_string(),
-        underlying: String::new(),
-        base_currency: "BTC".to_string(),
-        quote_currency: "USDT".to_string(),
-        settle_currency: String::new(),
-        contract_type: None,
-        contract_value: None,
-        contract_value_currency: String::new(),
-        tick_size: 0.1,
-        lot_size: 0.001,
-        min_size: 0.001,
-        max_limit_size: 100.0,
-        max_market_size: 1_000_000.0,
-        max_limit_amount_usd: Some(1_000_000.0),
-        max_market_amount_usd: Some(1_000_000.0),
-        state: "live".to_string(),
-        upcoming_changes,
-    }
+    let mut instrument =
+        parse_okx_account_instruments_response_json(spot_instrument_response().as_bytes())
+            .expect("spot instrument fixture must parse")
+            .pop()
+            .expect("spot instrument fixture must contain one row");
+    instrument.upcoming_changes = upcoming_changes;
+    instrument
 }
 
 fn spot_instrument_response() -> &'static str {
@@ -691,6 +676,25 @@ fn exchange_instrument_guard_detects_rule_drift_and_announced_changes() {
     current.tick_size = 0.01;
     let reason = exchange_instrument_drift_reason(&expectation, &current, 1_000, 100).unwrap();
     assert!(reason.contains("tick size changed"));
+
+    let exact_drift_response = spot_instrument_response()
+        .replace(r#""tickSz":"0.1""#, r#""tickSz":"0.10000000000000001""#);
+    current = parse_okx_account_instruments_response_json(exact_drift_response.as_bytes())
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        current.tick_size.to_bits(),
+        expectation.expected_instrument.tick_size.to_bits(),
+        "the binary float companion deliberately cannot distinguish this drift"
+    );
+    let reason = exchange_instrument_drift_reason(&expectation, &current, 1_000, 100).unwrap();
+    assert!(reason.contains("exact regular-order rules changed"));
+
+    current =
+        serde_json::from_value(serde_json::to_value(&expectation.expected_instrument).unwrap())
+            .unwrap();
+    let reason = exchange_instrument_drift_reason(&expectation, &current, 1_000, 100).unwrap();
+    assert!(reason.contains("exact regular-order rules changed"));
 
     current = expectation.expected_instrument.clone();
     current.max_limit_size = 0.5;

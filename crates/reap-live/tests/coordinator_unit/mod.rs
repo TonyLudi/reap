@@ -131,6 +131,47 @@ fn restore_test_owned_order(
     coordinator.restore_owned_order(proof, update)
 }
 
+fn verified_spot(account_id: &str) -> VerifiedInstrument {
+    VerifiedInstrument::new(
+        account_id,
+        "BTC-USDT",
+        OkxInstrumentType::Spot,
+        OkxTradeModeConfig::Cash,
+        InstrumentRiskModel::Spot,
+        InstrumentOrderLimits {
+            max_limit_quantity: 100.0,
+            max_limit_notional_usd: Some(1_000_000.0),
+        },
+        0.1,
+        0.0001,
+        0.0001,
+        None,
+        reap_venue::okx::OkxRegularOrderRules::from_exchange_decimals("0.1", "0.0001", "0.0001")
+            .unwrap(),
+    )
+}
+
+fn verified_perpetual(account_id: &str) -> VerifiedInstrument {
+    VerifiedInstrument::new(
+        account_id,
+        "BTC-PERP",
+        OkxInstrumentType::Futures,
+        OkxTradeModeConfig::Cross,
+        InstrumentRiskModel::LinearDerivative {
+            contract_value: 0.001,
+        },
+        InstrumentOrderLimits {
+            max_limit_quantity: 1_000_000.0,
+            max_limit_notional_usd: None,
+        },
+        0.1,
+        1.0,
+        1.0,
+        Some(0.001),
+        reap_venue::okx::OkxRegularOrderRules::from_exchange_decimals("0.1", "1", "1").unwrap(),
+    )
+}
+
 fn coordinator_with_gateway_actions(gateway_actions_enabled: bool) -> LiveCoordinator {
     coordinator_with_risk(
         gateway_actions_enabled,
@@ -182,44 +223,8 @@ fn coordinator_with_strategy_and_risk(
     };
     let verified = VerifiedBootstrap {
         instruments: HashMap::from([
-            (
-                "BTC-USDT".to_string(),
-                VerifiedInstrument {
-                    account_id: "main".to_string(),
-                    symbol: "BTC-USDT".to_string(),
-                    instrument_type: OkxInstrumentType::Spot,
-                    trade_mode: OkxTradeModeConfig::Cash,
-                    risk_model: InstrumentRiskModel::Spot,
-                    order_limits: InstrumentOrderLimits {
-                        max_limit_quantity: 100.0,
-                        max_limit_notional_usd: Some(1_000_000.0),
-                    },
-                    tick_size: 0.1,
-                    lot_size: 0.0001,
-                    min_size: 0.0001,
-                    contract_value: None,
-                },
-            ),
-            (
-                "BTC-PERP".to_string(),
-                VerifiedInstrument {
-                    account_id: "main".to_string(),
-                    symbol: "BTC-PERP".to_string(),
-                    instrument_type: OkxInstrumentType::Futures,
-                    trade_mode: OkxTradeModeConfig::Cross,
-                    risk_model: InstrumentRiskModel::LinearDerivative {
-                        contract_value: 0.001,
-                    },
-                    order_limits: InstrumentOrderLimits {
-                        max_limit_quantity: 1_000_000.0,
-                        max_limit_notional_usd: None,
-                    },
-                    tick_size: 0.1,
-                    lot_size: 1.0,
-                    min_size: 1.0,
-                    contract_value: Some(0.001),
-                },
-            ),
+            ("BTC-USDT".to_string(), verified_spot("main")),
+            ("BTC-PERP".to_string(), verified_perpetual("main")),
         ]),
         account_updates: HashMap::from([(
             "main".to_string(),
@@ -278,44 +283,8 @@ fn two_account_coordinator() -> LiveCoordinator {
     });
     let verified = VerifiedBootstrap {
         instruments: HashMap::from([
-            (
-                "BTC-USDT".to_string(),
-                VerifiedInstrument {
-                    account_id: "main".to_string(),
-                    symbol: "BTC-USDT".to_string(),
-                    instrument_type: OkxInstrumentType::Spot,
-                    trade_mode: OkxTradeModeConfig::Cash,
-                    risk_model: InstrumentRiskModel::Spot,
-                    order_limits: InstrumentOrderLimits {
-                        max_limit_quantity: 100.0,
-                        max_limit_notional_usd: Some(1_000_000.0),
-                    },
-                    tick_size: 0.1,
-                    lot_size: 0.0001,
-                    min_size: 0.0001,
-                    contract_value: None,
-                },
-            ),
-            (
-                "BTC-PERP".to_string(),
-                VerifiedInstrument {
-                    account_id: "hedge".to_string(),
-                    symbol: "BTC-PERP".to_string(),
-                    instrument_type: OkxInstrumentType::Futures,
-                    trade_mode: OkxTradeModeConfig::Cross,
-                    risk_model: InstrumentRiskModel::LinearDerivative {
-                        contract_value: 0.001,
-                    },
-                    order_limits: InstrumentOrderLimits {
-                        max_limit_quantity: 1_000_000.0,
-                        max_limit_notional_usd: None,
-                    },
-                    tick_size: 0.1,
-                    lot_size: 1.0,
-                    min_size: 1.0,
-                    contract_value: Some(0.001),
-                },
-            ),
+            ("BTC-USDT".to_string(), verified_spot("main")),
+            ("BTC-PERP".to_string(), verified_perpetual("hedge")),
         ]),
         account_updates: HashMap::from([
             ("main".to_string(), account_update("main", 1)),

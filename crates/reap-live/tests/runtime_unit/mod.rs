@@ -563,6 +563,8 @@ fn execution_profile(symbol: &str) -> RegularExecutionProfile {
         0.1,
         0.0001,
         0.0001,
+        reap_venue::okx::OkxRegularOrderRules::from_exchange_decimals("0.1", "0.0001", "0.0001")
+            .unwrap(),
         true,
         false,
         true,
@@ -908,26 +910,33 @@ fn verified(config: &LiveConfig, update: AccountUpdate) -> VerifiedBootstrap {
                     contract_value: instrument.contract_value,
                 }
             };
+            let tick_size = instrument.tick_size.to_string();
+            let lot_size = instrument.lot_size.to_string();
+            let min_size = instrument.min_trade_size.to_string();
             (
                 instrument.symbol.clone(),
-                VerifiedInstrument {
-                    account_id: account.id.clone(),
-                    symbol: instrument.symbol.clone(),
+                VerifiedInstrument::new(
+                    account.id.clone(),
+                    instrument.symbol.clone(),
                     instrument_type,
-                    trade_mode: account.trade_modes[&instrument.symbol],
+                    account.trade_modes[&instrument.symbol],
                     risk_model,
-                    order_limits: InstrumentOrderLimits {
+                    InstrumentOrderLimits {
                         max_limit_quantity: 1_000_000.0,
                         max_limit_notional_usd: instrument.kind.is_spot().then_some(1_000_000.0),
                     },
-                    tick_size: instrument.tick_size,
-                    lot_size: instrument.lot_size,
-                    min_size: instrument.min_trade_size,
-                    contract_value: instrument
+                    instrument.tick_size,
+                    instrument.lot_size,
+                    instrument.min_trade_size,
+                    instrument
                         .kind
                         .is_derivative()
                         .then_some(instrument.contract_value),
-                },
+                    reap_venue::okx::OkxRegularOrderRules::from_exchange_decimals(
+                        &tick_size, &lot_size, &min_size,
+                    )
+                    .unwrap(),
+                ),
             )
         })
         .collect();

@@ -191,32 +191,47 @@ fn build_live_coordinator(artifact: &InitializationArtifactV1) -> Result<LiveCoo
         .instruments
         .iter()
         .map(|instrument| {
+            let instrument_type = match instrument.instrument_type.as_str() {
+                "spot" => OkxInstrumentType::Spot,
+                "margin" => OkxInstrumentType::Margin,
+                "swap" => OkxInstrumentType::Swap,
+                "futures" => OkxInstrumentType::Futures,
+                "option" => OkxInstrumentType::Option,
+                other => {
+                    return Err(format!(
+                        "instrument {} has unsupported type {other}",
+                        instrument.symbol
+                    ));
+                }
+            };
+            let tick_size = instrument.tick_size.to_string();
+            let lot_size = instrument.lot_size.to_string();
+            let min_size = instrument.min_size.to_string();
+            let regular_order_rules =
+                reap_venue::okx::OkxRegularOrderRules::from_exchange_decimals(
+                    &tick_size, &lot_size, &min_size,
+                )
+                .map_err(|error| {
+                    format!(
+                        "instrument {} has invalid exact order rules: {error}",
+                        instrument.symbol
+                    )
+                })?;
             Ok((
                 instrument.symbol.clone(),
-                VerifiedInstrument {
-                    account_id: instrument.account_id.clone(),
-                    symbol: instrument.symbol.clone(),
-                    instrument_type: match instrument.instrument_type.as_str() {
-                        "spot" => OkxInstrumentType::Spot,
-                        "margin" => OkxInstrumentType::Margin,
-                        "swap" => OkxInstrumentType::Swap,
-                        "futures" => OkxInstrumentType::Futures,
-                        "option" => OkxInstrumentType::Option,
-                        other => {
-                            return Err(format!(
-                                "instrument {} has unsupported type {other}",
-                                instrument.symbol
-                            ));
-                        }
-                    },
-                    trade_mode: parse_enum(&instrument.trade_mode, "instrument.trade_mode")?,
-                    risk_model: instrument.risk_model,
-                    order_limits: instrument.order_limits,
-                    tick_size: instrument.tick_size,
-                    lot_size: instrument.lot_size,
-                    min_size: instrument.min_size,
-                    contract_value: instrument.contract_value,
-                },
+                VerifiedInstrument::new(
+                    instrument.account_id.clone(),
+                    instrument.symbol.clone(),
+                    instrument_type,
+                    parse_enum(&instrument.trade_mode, "instrument.trade_mode")?,
+                    instrument.risk_model,
+                    instrument.order_limits,
+                    instrument.tick_size,
+                    instrument.lot_size,
+                    instrument.min_size,
+                    instrument.contract_value,
+                    regular_order_rules,
+                ),
             ))
         })
         .collect::<Result<HashMap<_, _>, String>>()?;

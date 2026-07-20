@@ -66,6 +66,12 @@ pub(crate) fn regular_execution_policy(
                 verified_instrument.tick_size,
                 verified_instrument.lot_size,
                 verified_instrument.min_size,
+                *verified_instrument.regular_order_rules().ok_or_else(|| {
+                    RegularExecutionPolicyError::InvalidProfile {
+                        symbol: configured.symbol.clone(),
+                        field: "regular_order_rules",
+                    }
+                })?,
                 quote_allowed,
                 hedge_allowed,
                 verified

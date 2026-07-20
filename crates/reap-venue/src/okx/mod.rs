@@ -1,8 +1,11 @@
 mod capabilities;
 mod connectivity;
+mod exact_decimal;
 mod public;
 mod rest;
 mod ws_order;
+
+pub use exact_decimal::{OkxExactDecimal, OkxExactDecimalError, OkxRegularOrderRules};
 
 pub use capabilities::{
     OKX_CAPABILITY_REGISTRY, OkxCapabilityAccess, OkxCapabilityClass, OkxCapabilityRegistration,

@@ -663,6 +663,41 @@ fn raw_regular_order_dtos_are_constructed_only_by_the_live_adapter() {
     );
 }
 
+#[test]
+fn normal_regular_submit_numeric_lowering_uses_only_prepared_canonical_values() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("reap-live must be inside the workspace crates directory");
+    let adapter_path = workspace.join("crates/reap-okx-live-adapter/src/lib.rs");
+    let source = fs::read_to_string(&adapter_path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", adapter_path.display()));
+    let compact = production_rust_source(&source)
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+
+    for forbidden in [
+        "order.price.to_string()",
+        "order.qty.to_string()",
+        "prepared.order().price.to_string()",
+        "prepared.order().qty.to_string()",
+        "price:order.price",
+        "qty:order.qty",
+    ] {
+        assert!(
+            !compact.contains(forbidden),
+            "normal regular-submit px/sz lowering derives bytes from raw f64 via {forbidden}"
+        );
+    }
+    assert!(
+        compact.contains(
+            "price:*prepared.canonical_price(),qty:*prepared.canonical_qty(),client_order_id:"
+        ),
+        "regular_place_order must assign both numeric fields directly from the opaque prepared canonical payload"
+    );
+}
+
 fn resolved_production_edges(
     metadata: &Value,
     packages: &BTreeMap<String, Package>,
