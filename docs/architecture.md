@@ -35,6 +35,16 @@ Its exact structural gates are recorded in its handoff. Production order entry
 remains unavailable, and target-host and credentialed exchange evidence remain
 operational gates after structural completion.
 
+Goal D completes deterministic fail-closed ordering, the reached pinned-Java
+public-trade implied-depth/deferred-reprice behavior, an executable
+strategy/risk parity boundary, exact regular-submit numbers, and bounded
+runtime-health evidence. The exact equality and exclusion boundary is
+[backtest-live-decision-parity.md](backtest-live-decision-parity.md); phase
+commits and evidence are in
+[determinism-readiness-goal-d-handoff.md](determinism-readiness-goal-d-handoff.md).
+These are deterministic, structural, and local measurement results, not
+credentialed exchange or production evidence.
+
 ## Goals
 
 - Replicate the important `imm-strategy/chaos` decision logic in Rust.
@@ -79,8 +89,14 @@ The final regular-order authority chain is intentionally monotonic and
 asymmetric:
 
 ```text
+authenticated tickSz/lotSz/minSz text
+  -> OkxExactDecimal + OkxRegularOrderRules
+  -> verified instrument/profile exact sidecar
+
 Quote | Hedge
-  -> RegularExecutionPolicy -> ApprovedRegularSubmit
+  -> RegularExecutionPolicy
+  -> checked canonical unit counts + CanonicalRegularOrderNumbers
+  -> ApprovedRegularSubmit
   + gateway-bound GeneratedClientOrderId
   -> OwnedRegularOrders::reserve_local
   -> canonical PendingNew + ownership -> ReservedRegularSubmit
@@ -92,7 +108,9 @@ CancelOwned
 
 PreparedRegularSubmit | PreparedRegularCancel
   -> adapter-owned order-command websocket
-  -> private OKX DTO / JSON
+  -> adapter-private serialization
+     (one canonical decimal formatter for submits)
+  -> private OKX DTO / REST-shaped or websocket JSON
 ```
 
 The strategy and coordinator never construct venue requests.
@@ -110,6 +128,42 @@ reuse, or recover an opaque authority token outside the documented
 local-reservation or leased-journal path. Private-feed bootstrap likewise
 admits exactly one opaque validated login frame and requires subscription bytes
 to match trusted canonical serialization of the exact packed socket plan.
+
+## Executable Decision And Risk Parity Boundary
+
+Backtest/live parity is not a claim that the two products share one runtime.
+The credential-free Goal D harness makes only the following bounded equality
+claim:
+
+| Layer | Equality |
+| --- | --- |
+| Normalized inputs and declared schedule | The fixture supplies identical ordered normalized events, explicit timers/controls, local arrival nanoseconds, and private due-wake service. |
+| Strategy | Both projections execute production `ChaosStrategy` through `TradingEngine<ChaosStrategy>` and produce byte-identical ordered typed purposes and legacy projections. |
+| Risk | Both projections execute the production `RiskGate`, including staleness, rejection, system-event, and deterministic fail-closed cancellation transitions. |
+| Live logical reduction | The genuine `LiveCoordinator` continues from the shared engine batch through policy, same-turn canonical `PendingNew` reservation, and pre-dispatch records/actions; that reduction is separately goldened, not called equal to simulated execution. |
+| Economic backtest and live IO | Deliberately different. Matching, latency, portfolio/accounting, durable enqueue/fsync, pacing, preparation/dispatch, acknowledgement, reconciliation, ambiguity, emergency behavior, credentials, sockets, and network IO are excluded. |
+
+The harness is test-only support under `reap-engine` and is path-included by a
+`reap-live` test. It creates no public replay mode and no
+`reap-backtest -> reap-live` dependency. The default economic backtest remains
+byte-identical.
+
+At the regular wire boundary, exactness begins only after the existing policy
+acceptance checks. Authenticated decimal tick/lot/minimum text is retained as
+bounded, non-Serde exact metadata through the instrument/profile sidecars.
+Deserialized configuration or evidence cannot recreate that authority, and
+each exact value's `f64` projection must match its authenticated companion
+bits. After the unchanged finite, positive, minimum, alignment, exchange-limit,
+and risk-notional checks, accepted model `f64` price/quantity values are mapped
+to nearest positive integral units bounded by `2^53 - 1` and checked exact
+increment products. A private, non-Clone canonical payload then moves through
+`ApprovedRegularSubmit -> ReservedRegularSubmit -> PreparedRegularSubmit`.
+Gateway idempotency binds canonical price/quantity values rather than raw
+`f64` bits, and the adapter's one narrow formatter supplies byte-identical
+`px`/`sz` to its REST-shaped inner body and websocket request. This is
+representation canonicalization, not discretionary order rounding or a
+workspace-wide fixed-point conversion; strategy, risk, backtest, and
+pinned-Java arithmetic remain `f64`. Normal live REST placement remains absent.
 
 ## Runtime Model
 
@@ -133,6 +187,20 @@ The strategy loop should not perform network IO, file IO, blocking logging, or
 unbounded allocation. It receives normalized events, updates owned state, emits
 order intents, and returns.
 
+`LiveRuntime` also owns one private schema-version-1 health projection. Fixed
+feed/private/order connectivity, runtime/order-task heartbeats, bounded queue
+state, readiness/latches, order counters, and storage progress are updated with
+predeclared numeric/enum state. Per-event updates take no lock, dynamically
+register no label, and allocate no memory. JSON construction occurs only on
+the existing structured-log path every fixed five seconds and once at
+finalization. The snapshot has no listener, configuration, control, or order
+authority and is diagnostic rather than production evidence. Its source-pinned
+select branch follows the ordinary periodic timer and precedes the private
+due-reprice/feed branches without changing the relative priority of any
+pre-existing branches. Tracked channels leave Tokio mpsc as the sole
+capacity/order boundary; lock-free queue snapshots are conservative bounded
+diagnostics, never synchronization or readiness state.
+
 Recommended initial stack:
 
 - `tokio` for websocket/REST IO, timers, supervision, and async channels.
@@ -145,7 +213,7 @@ Recommended initial stack:
 
 ## Workspace Layout
 
-Target structure:
+Current 23-crate structure:
 
 ```text
 reap/
@@ -155,6 +223,7 @@ reap/
     reap-feed/
     reap-book/
     reap-order/
+    reap-okx-wire/
     reap-risk/
     reap-strategy/
     reap-engine/
@@ -165,6 +234,7 @@ reap/
     reap-telemetry/
     reap-live/
     reap-okx-live-adapter/
+    reap-evidence-core/
     reap-okx-evidence-adapter/
     reap-emergency-core/
     reap-okx-emergency-adapter/
@@ -172,6 +242,32 @@ reap/
     reap-fault/
     reap-cli/
 ```
+
+| Crate | Current responsibility and authority boundary |
+| --- | --- |
+| `reap-core` | Shared primitive types, normalized events, clocks, and pure host/pacing policy; no IO authority. |
+| `reap-venue` | Credential-free venue protocol/parsing, exact OKX metadata, and connectivity keys; no signer or authenticated client. |
+| `reap-feed` | Public/private socket supervision, subscription readiness, deduplication, sequencing, book arbitration, and recovery. |
+| `reap-fault` | Separate loopback-only deterministic demo fault proxy; never a live strategy sidecar or production gateway. |
+| `reap-book` | Single-owner book reduction and quality state usable by live and backtest. |
+| `reap-order` | Linear regular-order policy, canonical reservation/ownership, idempotent preparation, pacing, and order reduction; no raw transport. |
+| `reap-okx-wire` | Low-level OKX credentials/signature/login and HTTP/websocket transport primitives for role adapters; it owns no endpoint policy and is not a strategy API. |
+| `reap-okx-live-adapter` | Normal-live authenticated role factories, exact allowlists, private/reconciliation/safety clients, and adapter-owned regular command websocket/serialization. |
+| `reap-emergency-core` | Credential-free emergency configuration, report, evidence, and verification contracts; no OKX client or signer. |
+| `reap-emergency-runner` | Separate `reap-emergency` composition and independent domain workflows; absent from `reap-live`. |
+| `reap-evidence-core` | Credential-free read-only evidence ports, allowlists, and response contracts; no transport or mutation method. |
+| `reap-okx-evidence-adapter` | Authenticated read-only OKX evidence implementation composed outside live; no submit, cancel, or arbitrary request method. |
+| `reap-okx-emergency-adapter` | Separate account-wide regular/algo/spread stop and deadman roles; no submit, amend, transfer, withdrawal, or arbitrary path. |
+| `reap-risk` | Deterministic pre/post-trade risk, readiness, exposure, and fail-closed transitions. |
+| `reap-strategy` | Pure Chaos/iarb2 state and decision logic, including private deterministic scheduled actions; no IO or global state. |
+| `reap-engine` | Production strategy/risk decision owner plus test-only initialized parity harness support. |
+| `reap-backtest` | Deterministic replay, scheduling, matching, accounting, and research; depends on pure live contracts, not the live runtime. |
+| `reap-capture` | Credential-free raw capture, normalization, analysis, and evidence ownership. |
+| `reap-storage` | Exclusively leased JSONL journal, recovery proofs, bounded writer, and observation-only writer progress. |
+| `reap-telemetry` | Alerts, metrics, host observations, and report support; it does not own canonical trading state. |
+| `reap-live-contracts` | Pure serialized live configuration/connectivity/account evidence contracts below the runtime. |
+| `reap-live` | One `LiveRuntime`/`LiveCoordinator` canonical mutation owner and the normal live composition/lifecycle. |
+| `reap-cli` | User-facing composition root for validate, observe/demo, capture/research, evidence, and verification commands. |
 
 ### `reap-core`
 
@@ -824,8 +920,10 @@ unmapped, or truncated recovered state fails closed. This path provides causal
 demo evidence for already-armed Cancel All After; it cannot arm or refresh the
 timer and must never delay incident cancellation.
 
-Later, if the strategy loop becomes latency-critical, replace the async receive
-with a pinned OS thread and a bounded SPSC queue.
+Pinned trading threads, SPSC/ring buffers, busy spinning, custom allocators,
+and deeper runtime changes are deferred. Consider them only in a separately
+reviewed goal if target-host decision-to-wire p99.9 evidence identifies a
+concrete threshold breach.
 
 ### `reap-fault`
 
@@ -1361,7 +1459,9 @@ Responsibilities:
 - Metrics: feed lag, duplicate rate, gap count, reconnect count, book age,
   command latency, ack latency, fill latency, queue depth.
 - Structured logs.
-- Health endpoints.
+- In-process non-hot-path health/metric aggregation. The private live
+  schema-version-1 heartbeat is emitted only through structured logs; production
+  progress paths do not call the allocating generic `HealthRegistry`.
 - Panic and task death reporting.
 - Bounded webhook alert delivery with timeout/retry limits and delivery-failure
   feedback to the live coordinator.
@@ -1612,7 +1712,8 @@ Acceptable first implementation:
 - Bounded `tokio::mpsc`.
 - Normal Rust collections.
 
-Optimize only after measurement:
+Optimize only after production-shaped target-host measurement and a separately
+reviewed decision:
 
 - Pinned threads for strategy/order loops.
 - `rtrb` or custom SPSC queues.

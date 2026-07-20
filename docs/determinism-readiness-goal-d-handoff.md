@@ -1,10 +1,9 @@
 # Determinism And Measured Runtime Goal D Handoff
 
-Status: Phases 0 through 5 green; Phase 6 global verification and documentation
-is next. This is an evidence ledger, not a trading authorization. Until every
-required Goal D phase and global gate below is recorded green, the active
-execution contract remains
-[determinism-readiness-goal-d-prompt.md](determinism-readiness-goal-d-prompt.md).
+Status: complete. Phases 0 through 6 and final global verification are green.
+This remains an evidence ledger, not a trading authorization. The
+[Goal D prompt](determinism-readiness-goal-d-prompt.md) is retained as the
+historical execution contract.
 
 ## Scope
 
@@ -26,16 +25,16 @@ runtime concurrency redesign.
 
 ## Phase Status
 
-| Phase | Status | Result commit |
-| --- | --- | --- |
-| Prompt-only execution contract | Green | `b4a3752` |
-| 0. Baseline, call-path audit, and measurement contract | Green | `768ee0a` |
-| 1. Deterministic fail-closed cancellation | Green | `4c49cae` |
-| 2. Pinned-Java public-trade parity | Green | `6d446da` |
-| 3. Explicit decision/risk replay parity | Green | `e167c63` |
-| 4. Exact regular order-to-wire numeric boundary | Green | `85af455` |
-| 5. Action-path performance and runtime health | Green | `80a38fe` |
-| 6. Global verification and documentation | Pending | Pending |
+| Phase | Status | Gated source/implementation | Gate close |
+| --- | --- | --- | --- |
+| Prompt-only execution contract | Green | `b4a37522171b44d75162a3fff842384456b58062` | Same commit |
+| 0. Baseline, call-path audit, and measurement contract | Green | `768ee0a6b4a3eecf00731efdf5cce57cafa23b5c` | `50b7ebe031d431031e7796a788528c1ec05f12ad` |
+| 1. Deterministic fail-closed cancellation | Green | `4c49cae7a1febb3a40974f0bf2e2f8dc34130bd1` | `b81b909b765b511fb6cc6fc4f1f0c25a4b428738` |
+| 2. Pinned-Java public-trade parity | Green | `6d446da2cb590ccfe127c6a6ff53423a5d19ea91` | `1d35c02cd74892ec0cadb7d60c2839827fff3e3b` |
+| 3. Explicit decision/risk replay parity | Green | `e167c63fe02888784ae6e1032ef9c2f50941b4bd` | `dff673743584c541629c3cc9db9ff25726f1623c` |
+| 4. Exact regular order-to-wire numeric boundary | Green | `85af45571eb486f03c46fd2a3086d4f0ac8f101e` | `1008d4aca306eceb109adb651a51448a5d898a37` |
+| 5. Action-path performance and runtime health | Green | `f7de633a1f68ee8e607aaf7c6c7e0839155af38e`; `97a9970a8977ebccc46f4a7de3175da537adcfec`; `80a38fe3544c5d8ff9aa79c4c98d3ad39ea94103` | `65d65e7fe2022e838919cd1909da4797757c884c` |
+| 6. Global verification and documentation | Green | The gated Phase 6 documentation/global-verification commit is the commit containing this record | The final handoff close commit is the commit containing the completed ledger |
 
 ## Phase 0 Baseline Identity
 
@@ -2090,6 +2089,219 @@ decision-to-wire evidence. Phase 5 introduced no trading behavior,
 connectivity, normal/emergency reachability, schema migration, or dependency
 change. No Goal D stop condition was reached.
 
+### Phase 6: Global Verification And Completion
+
+#### Documentation closure
+
+Phase 6 updates the required current contracts:
+
+- `architecture.md` now records the exact test-only decision/risk equality
+  boundary and exclusions, exact regular numeric authority chain,
+  observation-only health boundary, and all 23 workspace crates;
+- `chaos-connectivity-boundary.md` records the completed reached public-trade
+  result and exact-number representation while retaining the same inputs,
+  three executable purposes, read-only algo/spread proof, and separate
+  emergency plane;
+- `performance.md` separates the authoritative Goal C comparison baseline,
+  historical attribution, final Goal D local action/serializer results, exact
+  exclusions, and missing target-host evidence;
+- `trading-readiness.md` records the new deterministic/code/evidence state while
+  leaving every credentialed, target-host, economic, soak, and approval gate
+  open; and
+- this handoff closes every phase with commands, hashes, distributions,
+  allocation counts, and deferrals.
+
+Phase 6 changes documentation/evidence only. The production source, manifests,
+fixtures, examples, deployment files, and lockfile remain exactly the tree
+measured at `80a38fe3544c5d8ff9aa79c4c98d3ad39ea94103`, proven by:
+
+```text
+git diff --quiet 80a38fe -- \
+  Cargo.toml Cargo.lock crates fixtures examples deploy
+```
+
+The command exited `0`.
+
+#### Completion command matrix
+
+All Cargo commands used
+`TMPDIR=/home/ubuntu/code/reap/target/tmp`, `CARGO_BUILD_JOBS=1`, and the
+documented low-memory linker shim where linking was required.
+
+| Gate | Exact command | Result |
+| --- | --- | --- |
+| Formatting | `cargo fmt --all -- --check` | Exit `0` |
+| Workspace lint | `cargo clippy --workspace --all-targets --locked -- -D warnings` | Exit `0`; all 23 crates/all targets checked, zero warnings, 1m57s |
+| Workspace tests | `cargo test --workspace --locked --no-fail-fast` | Exit `0`; 57 result groups summed to 1,061 passed, 5 intentionally ignored, 0 failed |
+| Locked optimized build | `cargo build --release --workspace --locked` | Exit `0`; full optimized workspace finished in 9m36s |
+| Deployment templates | `deploy/systemd/verify-units.sh target/release/reap` | Exit `0`; observe, demo, and capture each reported exposure `2.9 OK` |
+| Supply chain | `cargo audit --deny warnings` | Exit `0`; RustSec database loaded 1,166 advisories and scanned 249 locked dependencies with no vulnerability/warning |
+| Dependency graph | `cargo metadata --locked --format-version 1 >/dev/null` | Exit `0` |
+| Patch hygiene | `git diff --check` | Exit `0` |
+
+Generated `target/tests/trybuild` output was removed only after the complete
+workspace suite passed; no source, fixture, benchmark, or evidence file was
+deleted.
+
+#### Explicit package and invariant gates
+
+The prompt's explicit package commands were also run:
+
+| Package command | Result |
+| --- | --- |
+| `cargo test -p reap-strategy --locked` | 107 unit tests plus one compile-fail harness covering three UI boundaries; all green |
+| `cargo test -p reap-engine --locked` | 7 unit tests; decision replay 4 passed/3 fixture-authoring helpers ignored; all green |
+| `cargo test -p reap-risk --locked` (run twice) | 29 tests on each execution; all green |
+| `cargo test -p reap-backtest --locked` | 131 tests; all green |
+| `cargo test -p reap-order --locked` | 66 tests plus one compile-fail harness covering five authority UI boundaries; all green |
+| `cargo test -p reap-okx-live-adapter --locked` | 38 passed/one release benchmark ignored, plus one compile-fail harness covering six adapter UI boundaries; all green |
+| `cargo test -p reap-live --locked` | 271 passed/one fixture helper ignored, two compile-fail UI cases, seven dependency/source-policy tests, one runtime compatibility test; all green |
+| `cargo test -p reap-live --test dependency_policy --locked` | 7 tests; all green when run explicitly after the package suite |
+
+These suites cover the pinned-Java trade truth/worker/RNG fixtures,
+cross-process fail-closed cancellation, initialized engine/live decision
+replay, exact REST-shaped/websocket numeric fields, authority opacity,
+adapter allowlists, storage proofs/progress, durable latch ordering,
+cancel-before-reconcile shutdown, runtime health cadence/cardinality/no
+hot-path allocation, and source-policy guards.
+
+The final dependency and source audits retain:
+
+- no normal reachability to emergency mutation, a signer, raw wire authority,
+  arbitrary authenticated requests, algo/spread placement or cancellation,
+  amend, or unsupported regular profiles;
+- no `reap-backtest -> reap-live` dependency;
+- exactly one `LiveRuntime`/`LiveCoordinator` canonical mutation owner;
+- unchanged pairwise priority among all pre-existing select branches. The only
+  decision-producing inserted branch is the Phase 2 private due-reprice branch;
+  the Phase 5 health tick is observation-only at its source-pinned location;
+- the same storage-first commit, durable latch, pacing-before-IO, same-turn
+  reservation, and shutdown ordering; and
+- no persisted/configuration/evidence schema migration. Private runtime-health
+  schema version 1 is a structured-log payload only.
+
+No `TRYBUILD=overwrite` command was used.
+
+#### Completion determinism and benchmark evidence
+
+The canonical CLI backtest ran twice from the completion tree:
+
+```text
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo run --locked -q -p reap-cli -- backtest \
+  --format normalized-jsonl \
+  --config examples/iarb2-basic.toml \
+  --data fixtures/normalized/chaos_quote_hedge.jsonl \
+  --pretty
+cmp target/tmp/goal-d-final-backtest-1.json \
+  target/tmp/goal-d-final-backtest-2.json
+```
+
+`cmp` exited `0`; both outputs retained:
+
+```text
+38acf9f5e0c310f2ec5528974beffadf4c1a7f84d46efa8d9664ee7051e84691
+```
+
+Phase 6 changed docs only, and the source-equality command above binds the
+completion source to `80a38fe`. Therefore Phase 5's one-warm-up/five-recorded
+engine, live, action-path, and adapter-private serializer sets are the final
+completion measurement sets. Their full distributions, host/toolchain,
+percentile precision, queue ages, timer overheads, logical counts, allocation
+tables, and exclusions are recorded in Phase 5 above and in `performance.md`.
+The exact repeated projections remain:
+
+```text
+action:
+aa7eaa6e9bb6727b4d52e6f1488591904c4d823a45e31e6829f23d938def4ce6
+serializer:
+1d4633a2d2634573a2d3cc790ed67b49427ef530ff3b115126e26e5199f3a0bb
+```
+
+No local result is relabeled as a target-host SLO, capacity certification, or
+decision-to-wire/exchange-acknowledgement measurement.
+
+#### Final inventories and immutable anchors
+
+| Inventory | Final result |
+| --- | --- |
+| `Cargo.lock` (2,524 lines) | `319268c86f94883e19668aa4835da615bbecbabfe32902019129e6e40caf894d` |
+| Workspace adjacency (23 lines) | `fe98cedfaa2653e09afd57293eb71372ea476c1997e56b5ce9f27b314f5a432b` |
+| Scoped authority declarations (382 lines) | `2498196fe4c66425d343bc70c5fb42839c1475cc4bc32a5149e398283c0bde4a` |
+| Version/revision constants (47 lines) | `9aa8a21c5a8678508c3933de738e26232d0b7ba60882d75cb49c6e25b4bb211f` |
+| Literal `AlertEvent` schema guard (one line) | `b7038321dbc71e3d8c3f41f6adae0fce53221cd4fc701cc76b173aefb2f48b41` |
+| Canonical no-trade backtest | `38acf9f5e0c310f2ec5528974beffadf4c1a7f84d46efa8d9664ee7051e84691` |
+| Pinned Java checkout/Rust/evidence binding | `b6b120c7b7c466d8431bf082f3229328c5d7b2ae` |
+
+The authority projection grew from Phase 4's 358 lines to 382 only because
+Phase 5 adds 24 private `pub(super)` health declarations; this projection
+counts crate-private declarations and no new exported authority. The version
+inventory grew from 46 to 47 only for private
+`RUNTIME_HEALTH_SCHEMA_VERSION = 1`; persisted journal, report, evidence,
+configuration, fixture, and public CLI schemas did not migrate.
+
+The five Phase 2 pinned-trade fixtures were rehashed at completion and remain:
+
+```text
+e878270db08f223e3a70da58030953724d42e4a84bfb87ed5bd80397e17b858e
+af97ac1c237b433af5762d9b286006696c1fe0bc03dc96a28a92171e0b78344b
+76cfa935b47835add52ccbfb668d198195e10cb92802e1c45fd9d807004fe3f0
+d447ad85a3e31bc35b73d844029068e68ee89cc6eaf04dfef27f5ab8ba670cf8
+de11a8d56534bfc10d6da598e5fc6cfd717227d45a777220759454f9b3a624de
+```
+
+The four Phase 3 parity artifacts remain:
+
+```text
+7e0951c41f447b9f46a73b24a3fe85bdc8f2bb8a623385dab0c3655926e73780
+dede17a546d4d717c78dc2b3b7aa7c3f3f785d552404160407c78fb87cec9101
+140c268619b889a19d779e1bdfd340c11901d2eb1d9e4d216d976ba3d8b0d37a
+aa66cc09bba29cde25ab2df66c018517b2c900f83373f95580150e8bcd442b60
+```
+
+Their separately computed live projection binding remains
+`847c6f8ba5177cf456d0dc2c7c31df74a9b189c107e7167d06dd48bf09b7762b`.
+All earlier Phase 0 fixture/config hashes remain recorded and unchanged.
+
+#### Explicit deferrals and authorization
+
+- Production order entry remains unavailable, and every evidence/approval path
+  retains `production_order_entry_authorized: false`; a source audit found no
+  true assignment.
+- Normal algo/spread access remains read-only forbidden-domain zero proof, not
+  strategy connectivity or mutation authority.
+- Emergency account-wide regular/algo/spread mutation remains a separate crate,
+  adapter, executable, and composition absent from normal live.
+- Goal D used no credentials, made no authenticated exchange request, ran no
+  credentialed demo/soak/fault campaign, and created no demo or production
+  evidence.
+- No target-host decision-to-wire, queue, paging, supervision, deadman,
+  process-death, latency, or capacity evidence was created.
+- No target-account instrument, fee, position, cash, fill/bill, economic, or
+  profitability evidence was created.
+- Production approval, demo campaign approval, and human operations/risk
+  approval remain open.
+- Pinned threads, SPSC/ring buffers, custom allocators, kernel bypass, and
+  deeper runtime work remain conditional on the separately queued
+  `target-host-runtime-decision-goal-e-prompt.md`; Goal E was not executed here.
+- CLI/catalog splitting and wildcard re-export cleanup remain separate
+  maintainability follow-ups.
+
+#### Clean completion
+
+After the completion handoff commit, `git status --porcelain=v1` emitted no
+lines in Reap. `git -C ../imm-strategy status --porcelain=v1` also emitted no
+lines, and `git -C ../imm-strategy rev-parse HEAD` remained
+`b6b120c7b7c466d8431bf082f3229328c5d7b2ae`. The Goal D completion commit is
+the commit containing this record and is identified by Git history because a
+commit cannot self-reference its own SHA.
+
+Every Goal D completion condition is met. This means the bounded Chaos decision
+path is more deterministic, closes the reached public-trade gap, is exact at
+the regular order wire representation, and has sufficient local measurement
+to inform a later target-host runtime decision. It does not authorize demo or
+production trading.
+
 ## Remaining Operational Blockers Outside Goal D
 
 Goal D does not and cannot clear:
@@ -2098,5 +2310,8 @@ Goal D does not and cannot clear:
 - target-host latency, queue, paging, supervision, deadman, and process-death
   evidence;
 - target-account instrument/fee/position/cash/economic evidence;
-- production approval or production order entry; or
-- any future pinned-thread/SPSC/kernel-bypass decision.
+- production approval or production order entry;
+- human operations/risk approval;
+- CLI/catalog splitting or wildcard re-export cleanup; or
+- any pinned-thread/SPSC/allocator/kernel-bypass decision before Goal E's
+  target-host threshold is measured.

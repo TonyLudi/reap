@@ -21,6 +21,9 @@ The completed Goal A record is
 [chaos-connectivity-goal-a-handoff.md](chaos-connectivity-goal-a-handoff.md);
 the completed Goal B verification record is
 [chaos-connectivity-goal-b-handoff.md](chaos-connectivity-goal-b-handoff.md).
+Goal D's pinned-trade parity, exact numeric boundary, unchanged authority
+audit, and deterministic evidence are recorded in
+[determinism-readiness-goal-d-handoff.md](determinism-readiness-goal-d-handoff.md).
 The words MUST, MUST NOT, SHOULD, and MAY are normative.
 
 ## Pinned Java Reference
@@ -199,6 +202,12 @@ identical typed and legacy projections through direct, production-backtest,
 and production-live reduction paths. The private action has no serialized or
 public event representation.
 
+This closes the previously documented reached public-trade behavior gap. It
+uses the already-required `CHAOS-MD-TRADE` input and adds no socket,
+subscription family, public event, exchange operation, command lane, or
+normal-live algo/spread authority. Raw trades remain distinct from
+`BurstSignal`.
+
 Backtest activation is causal: before a qualifying aggressive crossing is
 reached, depths update a private compatibility timing worker without emitting
 worker-derived actions, so the frozen no-trade economic replay remains
@@ -254,7 +263,9 @@ The normal regular-order authority chain is linear:
 
 ```text
 Quote | Hedge
-  -> RegularExecutionPolicy -> ApprovedRegularSubmit
+  -> RegularExecutionPolicy
+  -> checked canonical tick/lot units + exact decimal values
+  -> ApprovedRegularSubmit
   + gateway-bound GeneratedClientOrderId
   -> OwnedRegularOrders::reserve_local
   -> canonical PendingNew + ownership -> ReservedRegularSubmit
@@ -266,6 +277,8 @@ CancelOwned
 
 PreparedRegularSubmit | PreparedRegularCancel
   -> reap-okx-live-adapter
+  -> adapter-private serialization
+     (one canonical decimal formatter for submits)
   -> private OKX DTO / authenticated command bytes
 ```
 
@@ -279,6 +292,16 @@ adapter alone owns normal-live command websocket connect, login, write,
 acknowledgement correlation, reconnect, shutdown, and prepared-to-DTO
 conversion. No layer returns a raw transport, signer, request DTO, or reusable
 mutation token to its caller.
+
+Authenticated `tickSz`, `lotSz`, and `minSz` decimal text is retained as exact
+bounded metadata through bootstrap and policy. Only after the existing
+acceptance checks pass does policy derive checked integral units and move one
+private, non-Clone canonical numeric payload through the approved, reserved,
+and prepared submit chain. The adapter's single private formatter turns those
+same canonical values into byte-identical `px`/`sz` in its REST-shaped inner
+serializer and websocket request; it never derives either field from raw model
+`f64`. This does not add normal-live REST placement, change strategy/risk
+arithmetic, or broaden the three-purpose output contract.
 
 Normal live safety MAY cancel a regular order reconstructed from durable state
 or authoritative reconciliation only when a separately retained local or
@@ -544,8 +567,9 @@ The boundary is structurally enforced when all of the following are true:
 - the Java checkout and Rust pin agree on the full SHA;
 - every live connection, subscription, read, and mutation resolves from a
   requirement identifier;
-- the normalized ordered Chaos intents and deterministic backtest fixtures are
-  unchanged;
+- the frozen canonical no-trade replay remains byte-identical, while separate
+  pinned-Java trade fixtures prove exact ordered typed/legacy outputs through
+  direct, production-backtest, and production-live reduction paths;
 - only Quote, Hedge, and CancelOwned can reach regular execution;
 - only a synchronous gateway-bound reservation or one-shot leased recovery can
   establish canonical mutation ownership;

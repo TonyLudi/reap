@@ -18,6 +18,15 @@ completed structural gates are recorded in the
 baseline. Both goals are design, authority, and structural milestones only:
 neither grants demo trading approval nor production approval.
 
+Goal D makes the reached Chaos path more deterministic and measurable: stable
+fail-closed cancellation order, pinned public-trade/deferred-reprice behavior,
+a test-only production engine/risk equality proof, exact regular-submit
+numbers, action-producing local benchmark evidence, and private structured-log
+runtime health. Its evidence is recorded in the
+[Goal D handoff](determinism-readiness-goal-d-handoff.md). It grants no
+credentials, exchange access, demo approval, production approval, new
+connectivity, or new order authority.
+
 ## Capability Disposition
 
 | Scope | Readiness disposition |
@@ -37,16 +46,18 @@ This scope remains pinned to the supported call path in the clean
 
 | Area | Current state | Trading impact |
 | --- | --- | --- |
-| Iarb2 decision model | Covered for the documented OKX parity boundary | Not a blocker |
+| Iarb2 decision/risk boundary | The supported Chaos/iarb2 normalized decision path is covered. A credential-free, fully initialized test harness proves byte-identical production `TradingEngine<ChaosStrategy>`/`RiskGate` batches; the genuine live coordinator reduction is separately goldened and the default economic backtest is unchanged. Matching/accounting, durable commit, pacing/dispatch, reconciliation/ambiguity, network/acknowledgement, emergency behavior, and credentials are excluded. | The bounded strategy/risk decision gap is closed; this is not full live/backtest execution parity or exchange evidence |
+| Pinned public-trade behavior | The reached `OkEntity.onPublicTrade`/iarb2 implied-depth transition and private monotonic 100-microsecond deferred reprice are implemented with pinned fixtures and identical ordered live/replay projections. | Not a connectivity blocker: it reuses the required trade input and adds no socket, subscription, operation, lane, or `BurstSignal` substitution |
+| Deterministic fail-close | Risk-derived generic and typed Chaos cancellations retain strategy cancels first, deduplicate, then sort only synthesized canonical IDs bytewise. | Local determinism gate passed; target-account incident behavior still requires credentialed fault evidence |
 | Connectivity authority | Goal A resolves a secret-free mode-specific Chaos plan; all modes construct only plan-owned observation, Demo adds exactly one nonempty command lane per executing account and typed regular execution, and emergency mutation remains separately composed. Goal B lowered pure contracts, split responsibilities, bound regular authority linearly, gated recovery through the exact leased journal, moved command websocket ownership to the adapter, and sealed private-feed bootstrap/subscriptions to the exact plan. | Least-authority boundary and Goal B structural gate passed; this is not credentialed exchange evidence, demo approval, or production approval |
 | Deterministic backtest/data | Shared strategy code, immediate pending-order registration, arrival-time scheduler, Java-mapped class/symbol empirical latency profiles with sampled-usage reporting, versioned target-host/live collectors, deterministic calibration artifacts bound into production research, conservative depth/queue/trade capacity controls, event-clock drawdown/exposure/inventory metrics, per-currency depeg-sensitive valuation, exact private-fill fee currency plus explicit simulated-fee counts, fee/turnover attribution, authenticated recent-fill and account-wide bill collection with verified offline trade/fee/funding reconciliation, journal-backed derivative close-PnL reconstruction, bracketed bill-to-cash continuity, authenticated point-in-time cash/zero-liability/equity-conversion collection and offline verification, forecast/realized funding separation with event-time linear/inverse settlement, manifest-driven chronological walk-forward selection and stress gates with exact independent report reconstruction, credential-free redundant public capture, exact provenance, streaming analysis, and raw/normalized replay | The evidence pipeline is implemented but execution/accounting assumptions remain uncalibrated; needs sustained full-depth and currency-index capture, a passing credentialed target-host/demo latency artifact, complete funding intervals, target-tier fee calibration, real passing target-account and fill/bill economic artifacts including authoritative position-basis/close and opening/closing cash samples, empirical cash-spot bill semantics, reviewed total-equity attribution, and production-candidate reports before capital decisions |
 | Feed components | Plan-derived redundant books and single-replica trade/reference feeds, one packed private-state socket per account, exact-plan sealed login/subscription bootstrap, transport/state freshness separation, independently aged index/funding/mark/price-limit sources, account-plus-positions health rounds, ping/idle supervision, epoch-safe deduplication, reset-aware predecessor sequencing, and recovery are composed | Needs credentialed soak evidence |
-| Order components | `RegularExecutionPolicy` alone emits opaque approved regular submit/cancel values. For submit, a gateway-bound generated client ID and approval are consumed by `OwnedRegularOrders::reserve_local`, which creates canonical `PendingNew` ownership and one `ReservedRegularSubmit`; `OkxOrderGateway` consumes that reservation with idempotency/trade-mode checks. An owned cancel approval goes directly through the gateway. The dispatcher reserves pacing before adapter IO. `reap-okx-live-adapter` alone owns normal-live command websocket login/lifecycle/ack correlation/reconnect/shutdown and prepared-to-wire serialization. Its account-bound nonseparable bundle validates the supplied destination/account during consuming startup, installs the private matching slot before spawn, and then returns the now-bound gateway plus typed lifecycle/status observation. Event-loop registration, exchange/client binding, immutable private identity, deduplication, request expiry, exactly one current-plan Demo lane per executing account, independent REST reconciliation, convergence deadlines, and ambiguity handling remain; Validate and Observe construct no command lane. | Goal B structural gates passed; target demo exchange fault evidence is still required |
+| Order components | `RegularExecutionPolicy` alone emits opaque approved regular submit/cancel values. Authenticated exact tick/lot/minimum metadata is retained through policy; an accepted submit receives checked integral units and canonical decimal values before approval. For submit, a gateway-bound generated client ID and approval are consumed by `OwnedRegularOrders::reserve_local`, which creates canonical `PendingNew` ownership and one `ReservedRegularSubmit`; `OkxOrderGateway` consumes that reservation with idempotency/trade-mode checks. The private canonical numbers move through approval/reservation/preparation, and the adapter's one private formatter turns those same values into byte-identical `px`/`sz` in its REST-shaped inner serializer and websocket request. This is not live REST submit. An owned cancel approval goes directly through the gateway. The dispatcher reserves pacing before adapter IO. `reap-okx-live-adapter` alone owns normal-live command websocket login/lifecycle/ack correlation/reconnect/shutdown and prepared-to-wire serialization. Its account-bound nonseparable bundle validates the supplied destination/account during consuming startup, installs the private matching slot before spawn, and then returns the now-bound gateway plus typed lifecycle/status observation. Event-loop registration, exchange/client binding, immutable private identity, deduplication, request expiry, exactly one current-plan Demo lane per executing account, independent REST reconciliation, convergence deadlines, and ambiguity handling remain; Validate and Observe construct no command lane. | Goal B/Goal D structural and exact-number gates passed; target demo exchange fault/economic evidence is still required |
 | Runtime risk | Instrument models, authoritative startup positions, authenticated current instrument-rule, hard single-order maximum, and fee-group checks, final pre-trade exchange-limit enforcement, typed upcoming-change lead, active-order count/notional ceilings, rolling submit-rejection and zero-fill IOC-cancel circuits, terminal strategy-halt promotion, position scope/mode enforcement, zero-liability enforcement, periodic authenticated account-config drift detection, forced-repayment blocking, account-scoped health, per-fill state-convergence deadlines, redundant stablecoin guards, durable safety latches, exchange-clock and plan-relevant maintenance checks, a per-account read-only seven-algo-family plus spread zero sentinel, Cancel All After, and all-exit fail-closed cancellation/reconciliation are wired | Needs target-account limits review and credentialed instrument/fee/deadman/depeg/convergence/sentinel evidence |
-| Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, strict bounded soak reports, documented region/environment endpoint tuples, an exact demo-to-production config transition verifier, and a source-rebuilding cross-gate production evidence bundle | Controlled demo mechanics exist, but neither Goal A nor Goal B approves a demo campaign; production entry remains unavailable and no passing target-host bundle exists |
+| Live process | `live` supports config-only `validate`, read-only `observe`, explicitly confirmed demo order entry, strict bounded soak reports, documented region/environment endpoint tuples, an exact demo-to-production config transition verifier, and a source-rebuilding cross-gate production evidence bundle. One private schema-version-1 health snapshot reports fixed connectivity/heartbeat/queue/readiness/order/storage state through existing structured logs every five seconds and at finalization; it has no listener, configuration, control, or order authority. | Controlled demo mechanics and diagnostic health exist, but no completed structural/determinism goal approves a demo campaign; production entry remains unavailable and no passing target-host bundle exists |
 | Instrument/account bootstrap | Account instruments/config/balance/positions are typed; authenticating API-key permissions and IP bindings are retained; exact configured scope is enforced with `withdraw` forbidden and production trade keys IP-bound; economic snapshots preserve borrowing flags, liabilities, interest, and margin-loan fields; live spot and borrow limits are cash-only/zero; enabled borrowing, missing applicable evidence, nonzero liabilities, margin positions, and nonzero positions outside configured ownership/mode fail before strategy/risk application | Needs a passing artifact from the real target account and host; tooling alone is not evidence |
 | Startup/restart gate | Executable phase state, engine-consumed account-snapshot invariant, mandatory independently fresh strategy references, immediate canonical cancellation on reference-readiness loss, fingerprinted JSONL checkpoint restore, missed-fill/terminal-order recovery, durable latch restore, authoritative account repair, second-pass clean REST reconciliation, and read-only journal-bound deadman-expiry certification | Needs process-kill demo evidence; tooling alone is not evidence |
-| Event-loop profile | Allocation-aware raw OKX parity benchmark covers redundant wire input through strategy/risk and storage-record construction | Needs target-host capture and exchange-latency validation |
+| Event-loop profile | Local engine/live regression runs plus 100,000-observation action, bounded queue-age, allocation, timer-overhead, and adapter-private serializer distributions are recorded with exact boundaries and machine-readable output. They do not time one end-to-end socket-to-ack path, and runtime-health snapshot cost is not inferred from them. | Needs production-shaped target-host decision-to-wire, queue, storage, network, acknowledgement, and exchange-latency validation; local tails are not an SLO |
 | Operator control and alerts | HMAC-authenticated local controls use fsynced write-ahead latches; OKX Cancel All After is maintained independently; typed forbidden-state events direct an enabled alert sink to a separate CLI whose regular-first, independently paced regular/algo/spread workflows each enforce the shared absolute per-account deadline and prove every domain zero with conjunctive `all_clear`; another read-only CLI can prove regular-order source `20` after controlled process death | Must exercise target alert routing, sentinel failure/recovery, regular-order deadman expiry, and the account-wide independent cancel procedure on the target account |
 | Process/host controls | Canonical journal ownership is exclusively locked before recovery or network setup; live and public capture share Linux disk, memory, and kernel-clock preflight/periodic checks; all official WebSocket handshakes on one host reserve through one owner-only process-shared pacer; capture schema 5 binds binary/host evidence and an exact process-global persisted-frame ordinal; hardened systemd templates encode mode-specific restart policy and bounded evidence capture | Must be installed, enabled, thresholded, monitored, and fault-tested on the target host; hosts sharing a NAT need isolated egress or an external IP-wide pacer |
 | Demo fault injection | A loopback-only proxy independently routes OKX demo REST, public, private-state, and order-command traffic; strict owner-local commands inject disconnects, matched frame drops, and matched REST responses; create-new injector/run artifacts bind proxy config and pinned Java provenance, and the live fault matrix validates supported typed roles | Tooling is implemented and credential-free forwarding smokes passed, but no credentialed isolated campaign or target-host acceptance evidence exists |
@@ -59,7 +70,9 @@ This scope remains pinned to the supported call path in the clean
    risk, storage, and gateway events without concurrent strategy mutation.
 2. Bootstrap verifies exchange instrument metadata and maps every symbol to
    spot, linear, or inverse risk valuation; tick/lot/min size; contract value;
-   settle currency; trade mode; and position mode.
+   settle currency; trade mode; and position mode. Authenticated tick/lot/min
+   decimal text is retained as a bounded exact sidecar and must project to the
+   same validated floats; it is not reconstructed from serialized config.
 3. The runtime starts all public and account-scoped private sockets, obtains
    sequenced books, fetches initial balances and positions, and reconciles open
    orders and recent fills before declaring readiness. It also rejects excessive
@@ -75,8 +88,14 @@ This scope remains pinned to the supported call path in the clean
    `OwnedRegularOrders::reserve_local`, which synchronously creates canonical
    `PendingNew` ownership and one opaque `ReservedRegularSubmit`.
    `OkxOrderGateway` validates the reservation, idempotency, account, and trade
-   mode and consumes it to produce `PreparedRegularSubmit`. An
-   `ApprovedRegularCancel` already carries canonical ownership and goes
+   mode and consumes it to produce `PreparedRegularSubmit`. Checked canonical
+   units/decimal values are created only after the existing policy acceptance
+   checks pass, then move take-once through approval, reservation, and
+   preparation.
+   The adapter's one private formatter turns the same canonical values into
+   byte-identical `px`/`sz` in its REST-shaped inner serializer and websocket
+   request; normal live REST placement remains absent.
+   An `ApprovedRegularCancel` already carries canonical ownership and goes
    directly through the gateway to `PreparedRegularCancel`; the dispatcher
    reserves pacing before adapter IO.
    Command websocket login/session/write/ack/reconnect/shutdown lifecycle and
@@ -95,10 +114,15 @@ This scope remains pinned to the supported call path in the clean
 6. Component and coordinator tests cover disconnect, duplicate, gap,
    delayed-private-stream, partial-fill, IOC-miss, rate-limit, and process-restart
    behavior.
-7. The production-shaped live benchmark covers raw-record cloning, OKX JSON
-   adaptation, redundant-feed deduplication, sequencing, 400-level books,
-   strategy/risk evaluation, and coordinator record construction. The measured
-   optimizations and exclusions are recorded in `docs/performance.md`.
+7. The local performance gate includes engine/live whole-program regressions;
+   action-producing quote, replacement, hedge, risk, fail-close, coordinator,
+   raw-recovery, and public-trade workloads; a bounded control/feed queue-age
+   stress; and adapter-private REST-shaped/websocket serialization. It reports
+   exact all-sample tails, logical actions, allocations, timer overhead, and
+   included/excluded stages. These measurements omit at least some production
+   socket, select/channel, storage-disk, network, or exchange-ack stages and are
+   not a target-host SLO. Exact results are recorded in
+   `docs/performance.md`.
 8. Normal stops and runtime failures share one bounded shutdown path. New
    submits are disabled independently from cancel permission; every account
    must return a post-cancel REST reconciliation result before teardown.
@@ -1055,6 +1079,26 @@ This scope remains pinned to the supported call path in the clean
     serialization of the exact packed socket plan. Goal B is a completed
     structural milestone. It adds neither a strategy capability nor operational
     evidence, and it closes no demo or production gate.
+70. Goal D makes risk-derived fail-closed cancellation bytewise deterministic,
+    closes the reached pinned-Java public-trade implied-depth/deferred-reprice
+    gap, adds a test-only completely initialized production engine/risk replay
+    with separately goldened live reduction, and carries exact tick/lot/minimum
+    metadata into canonical regular-submit `px`/`sz`. It also records local
+    action-producing, queue-age, allocation, and adapter-serializer
+    distributions and emits a private schema-version-1 runtime-health snapshot
+    through existing structured logs every five seconds and at finalization.
+    These changes add no input, socket, subscription, operation, command lane,
+    normal algo/spread authority, emergency reachability, listener,
+    configuration, control authority, or production evidence.
+
+    No credentials or authenticated exchange requests were used, no
+    target-host campaign or credentialed soak was run, and
+    `production_order_entry_authorized: false` remains unchanged. All
+    target-host decision-to-wire, queue, paging, supervision, deadman,
+    process-death, target-account instrument/fee/position/cash/economic,
+    sustained-soak, and human-approval gates below remain open. Pinned-thread,
+    SPSC, allocator, kernel-bypass, or deeper runtime redesign remains
+    conditional on measured target-host tail evidence.
 
 ## Remaining Demo Gate
 
@@ -1071,8 +1115,10 @@ This scope remains pinned to the supported call path in the clean
    --require-clean-soak` so the result is machine-verifiable. Confirm both
    stablecoin references remain fresh, every account obtains its initial
    forbidden-domain zero proof, and the recurring proof stays inside its
-   30-second age. Inject a transient guard failure without creating a durable
-   latch.
+   30-second age. Inspect the periodic and final runtime-health log snapshots
+   for bounded progress, but do not treat those diagnostics as `clean_soak` or
+   production evidence. Inject a transient guard failure without creating a
+   durable latch.
 3. Run minimal-size `demo` orders, then inject public, private, and order-command
    socket disconnects, process kill,
    deadman expiry, exchange-clock skew, IOC miss, partial fill, and REST
