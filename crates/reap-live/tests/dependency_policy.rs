@@ -760,18 +760,13 @@ fn storage_progress_telemetry_is_a_narrow_read_only_contract() {
         "StorageSink must expose exactly one immutable progress reader"
     );
     let public_reader = compact_rust_item(&storage, public_reader_marker);
-    assert_eq!(
-        public_reader,
-        concat!(
-            "pubfnprogress_snapshot(&self)->StorageProgressSnapshot{",
-            "self.progress.snapshot()",
-            "}"
-        ),
-        "StorageSink::progress_snapshot must remain a parameter-free read-only delegation"
+    assert!(
+        public_reader.contains("letsnapshot=self.inner.progress_snapshot();")
+            && public_reader.contains("StorageProgressSnapshot{")
+            && public_reader.ends_with("}}"),
+        "StorageSink::progress_snapshot must remain a parameter-free read-only facade over neutral writer progress"
     );
 
-    let progress_reader =
-        compact_rust_item(&storage, "fnsnapshot(&self)->StorageProgressSnapshot{");
     for forbidden_mutation_or_authority in [
         ".store(",
         ".swap(",
@@ -788,7 +783,7 @@ fn storage_progress_telemetry_is_a_narrow_read_only_contract() {
         "unsafe{",
     ] {
         assert!(
-            !progress_reader.contains(forbidden_mutation_or_authority),
+            !public_reader.contains(forbidden_mutation_or_authority),
             "storage progress reader contains mutation/control operation `{forbidden_mutation_or_authority}`"
         );
     }

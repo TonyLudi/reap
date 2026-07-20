@@ -1,0 +1,12 @@
+[package]
+name = "reap-pm-live-contracts"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+reap-pm-core.workspace = true
+reap-pm-strategy.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+trybuild.workspace = true

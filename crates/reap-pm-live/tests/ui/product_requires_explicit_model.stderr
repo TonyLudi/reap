@@ -1,0 +1,8 @@
+error[E0599]: the function or associated item `new` exists for struct `PmProduct<()>`, but its trait bounds were not satisfied
+ --> tests/ui/product_requires_explicit_model.rs:4:30
+  |
+4 |     let _ = PmProduct::<()>::new;
+  |                              ^^^ function or associated item cannot be called on `PmProduct<()>` due to unsatisfied trait bounds
+  |
+  = note: the following trait bounds were not satisfied:
+          `(): reap_pm_strategy::model::PmQuoteModelRequirements`

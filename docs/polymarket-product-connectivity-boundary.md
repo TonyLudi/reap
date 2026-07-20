@@ -110,7 +110,7 @@ The configured maxima for Goal F are:
 | PM markets | 32 |
 | PM outcome tokens | 64 |
 | PM account scopes | 4 |
-| Required allowance spenders per account/asset | 8 |
+| Required allowance spenders per configured market/account scope | 8 |
 | Exact book levels per PM token | 2,048 |
 | Live plus unresolved/ambiguous orders per account | 1,024 |
 | Retained recent fill IDs per account | 8,192 |
@@ -247,11 +247,24 @@ The typed product plan is the exact union of three sources:
 3. mandatory safety, private lifecycle, reconciliation, account, allowance,
    position, persistence, and readiness dependencies implied by that profile.
 
-Every requirement has one stable ID, one consumer, one plan entry, one
-constructed role, one queue lane, and one readiness dependency. Extra
-configuration, plan entries, roles, channels, instruments, accounts, or
-spenders are errors. Model requirements cannot request a private read or mint
-mutation authority.
+The reached connectivity inventory has exactly 16 stable purpose IDs. Fifteen
+produce one plan entry each. `PM-ACCOUNT-ALLOWANCE` produces one independently
+scoped plan entry for each of the configured required spenders, so with
+`N = 1..=8` spenders there are `15 + N` connectivity entries. Every resulting
+`(stable ID, exact scope)` requirement has one consumer, one constructed role
+binding derived from its concrete connectivity role, one queue lane, one
+readiness dependency, and, where applicable, one exact source/connection
+route. The six reached concrete connectivity role kinds may each emit several
+purpose-specific bindings.
+
+The model-declared quote-evaluation timer adds one internal plan entry. It is
+owned by the product quote schedule, maps to the scheduled lane, and has
+neither a connectivity role nor a source/connection route. A product plan
+therefore has exactly `16 + N` entries. The plan-to-construction bijection
+covers every scoped binding/owner without pretending the internal timer is an
+exchange endpoint. Extra configuration, plan entries, roles, channels,
+instruments, accounts, or spenders are errors. Model requirements cannot
+request a private read or mint mutation authority.
 
 Three composition roots remain independent:
 
@@ -283,7 +296,7 @@ network construction in Goal F.
 | `PM-PRIVATE-FILL` | Individual trade/fill identity and exact delta | Fill/order/position reducers | Fixture/fake |
 | `PM-RECON-OPEN` | Atomic complete open-order snapshot | Ownership/reservation convergence | Fixture/fake |
 | `PM-RECON-ORDER` | Exact order detail by known ID | Ambiguity repair | Fixture/fake |
-| `PM-RECON-FILLS` | Fill page set with completeness/watermark | Dedup and cumulative convergence | Fixture/fake |
+| `PM-RECON-FILLS` | Complete bounded fill page with a full-account-scoped opaque fixture watermark; no cursor/last-fill ordering is invented | Dedup and cumulative convergence | Fixture/fake |
 | `PM-ACCOUNT-COLLATERAL` | Complete exact collateral balance/revision | Buy readiness/risk | Fixture/fake |
 | `PM-ACCOUNT-TOKEN` | Complete exact outcome-token inventory/revision | Sell readiness/risk | Fixture/fake |
 | `PM-ACCOUNT-ALLOWANCE` | Exact allowance per required spender and asset | Entry readiness | Fixture/fake |
@@ -511,6 +524,13 @@ side_rank, local_action_sequence)`. Replay uses the captured receive/deadline
 values and never depends on service time, Tokio selection, hash-map traversal,
 task completion race, or wall time.
 
+The generic bounded lane container is not a connectivity authorizer. Phase 3
+public producers and Phase 4 private producers must bind each delivery to the
+configured role-issued source/connection route before enqueue. A caller-stamped
+source or `PmIngressOrder` alone is not route proof. The Phase 2 seam preserves
+the typed connection and ordering facts but deliberately does not make lanes
+own the capability plan.
+
 Stable variant ranks are:
 
 | Lane | Variant order |
@@ -582,12 +602,16 @@ reap-storage -> reap-core + reap-durable-writer
 reap-venue -> reap-core + reap-okx-public-source
 ```
 
-`reap-feed` adopts `reap-transport` for extracted supervision mechanics, and
-`reap-venue` wraps/re-exports the extracted OKX public behavior byte-identically
-to preserve its API. `reap-okx-public-source` owns only public OKX session,
-subscription, parser, integrity, and normalized reference behavior; it has no
-dependency on authenticated `reap-okx-wire`, broad `reap-venue`, or any
-private/order adapter. No existing dependency is removed in Goal F.
+`reap-feed` adopts `reap-transport` for extracted supervision mechanics.
+`reap-venue` keeps its existing public API and normalized event construction,
+delegating only exact index-ticker field extraction to
+`reap-okx-public-source`; it does not re-export the new session or subscription
+surface. `reap-okx-public-source` owns only public OKX session, subscription,
+parser, integrity, and exact reference behavior; it has no dependency on
+authenticated `reap-okx-wire`, broad `reap-venue`, or any private/order
+adapter. No existing workspace-crate edge is removed. The direct `libc`
+mechanics dependency moves from `reap-feed` to the neutral transport crate
+that now owns the process-shared pacer.
 
 Goal F mechanically extracts two already required neutral mechanisms:
 
@@ -595,6 +619,12 @@ Goal F mechanically extracts two already required neutral mechanisms:
   accumulation, trailing-record detection, and byte/record verification.
   Existing `reap-capture` wraps it with the unchanged Chaos `RawCapture` and
   normalized schemas; `reap-pm-live` wraps it with PM raw-capture schema 1.
+  Default framing APIs reserve a tracked worst-case byte slab before a capped
+  counting pass and fixed-capacity serialization pass. Only `reap-capture`
+  enables the explicitly named `legacy-reap-capture` compatibility feature;
+  the workspace root and every other crate are denied that feature and its
+  uncapped writer, encoder, and scanner symbols by an exact recursive
+  allowlist.
 - `reap-durable-writer` owns canonical path/lease locking, bounded
   enqueue/progress, static record-codec invocation on the writer task,
   flush/`sync_data`, durable result delivery, and deterministic shutdown.
@@ -622,7 +652,7 @@ The responsibility/module DAG is also frozen:
 | `reap-polymarket-adapter` | `public`, `private_fixture`, `reconcile_fixture`, `account_fixture`, `fake_execution` |
 | `reap-pm-strategy` | `model`, `quote_policy`; pure/static only |
 | `reap-pm-live-contracts` | `config`, `requirements`, `plan` |
-| `reap-pm-live` | `coordinator`, `lanes`, `schedule`, `journal`, `capture`, `replay`, `fake_effect`, `composition` |
+| `reap-pm-live` | `coordinator`, `lanes` with private `lanes::{bounded,policy,scheduled}`, `schedule`, `journal`, `capture`, `replay`, `fake_effect`, `composition` |
 
 No production module may absorb another row's responsibility to evade the
 1,500-line file or 250-line function review.
@@ -634,16 +664,16 @@ changes. Untouched existing internal edges remain the Phase 0 baseline:
 ```text
 reap-transport::supervisor -> bounded + backoff + health + shutdown
 reap-transport::bounded -> reap-core::types
-reap-transport::backoff -> reap-core::pacing
-reap-transport::health -> reap-core::host_guard
 reap-capture-framing::bounded_writer -> frame + hash
 reap-capture-framing::verify -> frame + hash
+reap-durable-writer::bounded -> progress
 reap-durable-writer::writer -> bounded + lease + progress
 reap-feed::supervisor -> reap-transport::{backoff,bounded,health,shutdown,supervisor}
-reap-venue::okx::public -> reap-okx-public-source::{public_wire,reference,session,subscription}
-reap-capture::writer -> reap-capture-framing::{bounded_writer,frame,hash}
-reap-capture::verification -> reap-capture-framing::{frame,hash,verify}
-reap-storage::lib -> reap-durable-writer::{lease,progress,writer}
+reap-venue::okx::public -> reap-okx-public-source::reference
+reap-capture::hashing -> reap-capture-framing::hash
+reap-capture::writer -> reap-capture-framing::bounded_writer
+reap-capture::verification -> hashing + reap-capture-framing::{frame,verify}
+reap-storage::lib -> reap-durable-writer::{bounded,lease,progress,writer}
 reap-okx-public-source::session -> public_wire + reference + subscription + reap-transport::{backoff,bounded,health,shutdown,supervisor}
 reap-okx-public-source::public_wire -> reap-core::types
 reap-okx-public-source::reference -> public_wire + reap-core::types
@@ -673,10 +703,13 @@ reap-pm-strategy::quote_policy -> model + reap-pm-core::numeric + reap-pm-state:
 reap-pm-live-contracts::config -> reap-pm-core::{identity,mapping,numeric}
 reap-pm-live-contracts::requirements -> config + reap-pm-strategy::model
 reap-pm-live-contracts::plan -> config + requirements
-reap-pm-live::lanes -> reap-pm-core::event + reap-transport::bounded
-reap-pm-live::schedule -> reap-pm-core::{identity,numeric}
+reap-pm-live::lanes -> lanes::{bounded,policy,scheduled} + reap-pm-core::{envelope,event,identity} + reap-polymarket-adapter::reconcile_fixture + reap-transport::bounded
+reap-pm-live::lanes::bounded -> policy
+reap-pm-live::lanes::policy -> reap-pm-live-contracts::requirements
+reap-pm-live::lanes::scheduled -> policy + reap-pm-core::identity
+reap-pm-live::schedule -> reap-pm-core::identity + reap-pm-live-contracts::plan
 reap-pm-live::journal -> reap-durable-writer::{lease,progress,writer} + reap-pm-core::{event,identity,numeric}
-reap-pm-live::capture -> reap-capture-framing::{bounded_writer,frame,hash,verify} + reap-okx-public-source::session + reap-pm-core::envelope + reap-polymarket-adapter::public
+reap-pm-live::capture -> reap-capture-framing::{bounded_writer,frame,hash,verify} + reap-okx-public-source::session + reap-pm-core::{envelope,event,identity,numeric} + reap-polymarket-adapter::public
 reap-pm-live::coordinator -> lanes + schedule + reap-pm-state::{book,order,position,readiness,reservation,risk} + reap-pm-strategy::{model,quote_policy}
 reap-pm-live::fake_effect -> coordinator + journal + reap-polymarket-adapter::fake_execution
 reap-pm-live::replay -> capture + coordinator + journal
@@ -697,8 +730,9 @@ full static dependency set:
 | `PmProduct<Model>` | `capture`, the three fixture-only read roles, coordinator/model, journal, and `fake_effect`; fake effect alone constructs `reap-polymarket-adapter::fake_execution` |
 
 Source-policy and compile-fail tests pin these three constructor call graphs
-and prove every constructed role is named by exactly one validated plan entry.
-The composition module cannot access raw wire DTO modules directly.
+and prove every plan entry has exactly one validated constructed-role binding
+and every concrete role emits only the exact bindings assigned to it. The
+composition module cannot access raw wire DTO modules directly.
 
 Responsibilities:
 
@@ -716,7 +750,11 @@ Responsibilities:
   no OKX/PM subscription, ACK, heartbeat, integrity, DTO, or execution rule.
 - `reap-okx-public-source`: the only PM-product-facing OKX dependency. It
   exports configured public reference observation and no OKX private,
-  account, reconciliation, signer, order, or emergency/evidence role.
+  account, reconciliation, signer, order, or emergency/evidence role. Its
+  venue-owned session binds every raw delivery to the configured connection,
+  advances a checked epoch on every reconnect, treats epoch overflow as
+  terminal, and lets only the exact subscription acknowledgement establish
+  readiness; heartbeat is liveness evidence, not subscription readiness.
 - `reap-pm-strategy`: static pure quote-model and quote-policy boundary.
 - `reap-pm-live-contracts`: secret-free config validation and typed capability
   plan.
@@ -762,9 +800,12 @@ Authorized shared public change:
   requirements/events and the public-session constructor; no credentials,
   login, private DTO, raw client, arbitrary subscription, account,
   reconciliation, or order role.
-- export from `reap-capture-framing` only schema-neutral bounded frame/writer
-  configuration, immutable frame evidence, hash/verification results, and the
-  statically typed writer runtime. It exports no OKX or PM DTO and no parser.
+- export from `reap-capture-framing` by default only schema-neutral bounded
+  frame/writer configuration, immutable frame evidence, hash/verification
+  results, and the statically typed writer runtime. It exports no OKX or PM DTO
+  and no parser. Explicitly named uncapped compatibility symbols exist only
+  behind `legacy-reap-capture` and are source-allowlisted solely to the existing
+  Chaos capture facade.
 - export from `reap-durable-writer` only lease identity/configuration, the
   static `JournalCodec<Record>` contract, bounded sink/runtime, durability
   result, and numeric progress snapshot. It exports no domain record enum,

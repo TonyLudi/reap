@@ -1,0 +1,11 @@
+error[E0599]: no method named `execution` found for reference `&PmReadOnlyMonitor` in the current scope
+ --> tests/ui/read_only_monitor_has_no_mutation.rs:4:18
+  |
+4 |     let _ = root.execution();
+  |                  ^^^^^^^^^ method not found in `&PmReadOnlyMonitor`
+
+error[E0599]: no method named `place` found for reference `&PmReadOnlyMonitor` in the current scope
+ --> tests/ui/read_only_monitor_has_no_mutation.rs:5:10
+  |
+5 |     root.place();
+  |          ^^^^^ method not found in `&PmReadOnlyMonitor`

@@ -1,0 +1,23 @@
+error[E0599]: no method named `execution` found for reference `&PmPublicCapture` in the current scope
+ --> tests/ui/public_capture_has_no_mutation.rs:4:18
+  |
+4 |     let _ = root.execution();
+  |                  ^^^^^^^^^ method not found in `&PmPublicCapture`
+
+error[E0599]: no method named `place` found for reference `&PmPublicCapture` in the current scope
+ --> tests/ui/public_capture_has_no_mutation.rs:5:10
+  |
+5 |     root.place();
+  |          ^^^^^ method not found in `&PmPublicCapture`
+
+error[E0599]: no method named `cancel_owned` found for reference `&PmPublicCapture` in the current scope
+ --> tests/ui/public_capture_has_no_mutation.rs:6:10
+  |
+6 |     root.cancel_owned();
+  |          ^^^^^^^^^^^^
+  |
+help: there is a method `to_owned` with a similar name
+  |
+6 -     root.cancel_owned();
+6 +     root.to_owned();
+  |

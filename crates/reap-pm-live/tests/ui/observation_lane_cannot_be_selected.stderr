@@ -1,0 +1,42 @@
+error[E0277]: the trait bound `PmIngressOrder: PmObservedEvent` is not satisfied
+  --> tests/ui/observation_lane_cannot_be_selected.rs:10:58
+   |
+10 |     lanes.enqueue_observation(PmLaneKind::Public, clock, ingress, order);
+   |           -------------------                            ^^^^^^^ the trait `PmObservedEvent` is not implemented for `PmIngressOrder`
+   |           |
+   |           required by a bound introduced by this call
+   |
+   = help: the following other types implement trait `PmObservedEvent`:
+             OkxReferenceEvent
+             PmAllowanceEvent
+             PmBalanceEvent
+             PmBookEvent
+             PmFillEvent
+             PmMarketEvent
+             PmOrderEvent
+             PmPositionEvent
+           and $N others
+note: required by a bound in `PmLaneSet::enqueue_observation`
+  --> src/lanes.rs
+   |
+   |     pub fn enqueue_observation<E: PmObservedEvent>(
+   |                                   ^^^^^^^^^^^^^^^ required by this bound in `PmLaneSet::enqueue_observation`
+
+error[E0061]: this method takes 3 arguments but 4 arguments were supplied
+  --> tests/ui/observation_lane_cannot_be_selected.rs:10:11
+   |
+10 |     lanes.enqueue_observation(PmLaneKind::Public, clock, ingress, order);
+   |           ^^^^^^^^^^^^^^^^^^^ ------------------                  ----- expected `PmIngressOrder`, found `PmOrderEvent`
+   |                               |
+   |                               unexpected argument #1 of type `PmLaneKind`
+   |
+note: method defined here
+  --> src/lanes.rs
+   |
+   |     pub fn enqueue_observation<E: PmObservedEvent>(
+   |            ^^^^^^^^^^^^^^^^^^^
+help: remove the extra argument
+   |
+10 -     lanes.enqueue_observation(PmLaneKind::Public, clock, ingress, order);
+10 +     lanes.enqueue_observation(, clock, /* PmIngressOrder */, order);
+   |

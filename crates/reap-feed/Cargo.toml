@@ -6,9 +6,9 @@ edition.workspace = true
 [dependencies]
 anyhow.workspace = true
 futures-util.workspace = true
-libc.workspace = true
 reap-book.workspace = true
 reap-core.workspace = true
+reap-transport.workspace = true
 reap-venue.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -1,7 +1,15 @@
 [workspace]
 members = [
     "crates/reap-core",
+    "crates/reap-transport",
+    "crates/reap-capture-framing",
+    "crates/reap-durable-writer",
     "crates/reap-pm-core",
+    "crates/reap-pm-strategy",
+    "crates/reap-polymarket-adapter",
+    "crates/reap-pm-live-contracts",
+    "crates/reap-pm-live",
+    "crates/reap-okx-public-source",
     "crates/reap-venue",
     "crates/reap-feed",
     "crates/reap-fault",
@@ -49,7 +57,9 @@ libc = "0.2"
 reap-backtest = { path = "crates/reap-backtest" }
 reap-book = { path = "crates/reap-book" }
 reap-capture = { path = "crates/reap-capture" }
+reap-capture-framing = { path = "crates/reap-capture-framing" }
 reap-core = { path = "crates/reap-core" }
+reap-durable-writer = { path = "crates/reap-durable-writer" }
 reap-feed = { path = "crates/reap-feed" }
 reap-fault = { path = "crates/reap-fault" }
 reap-emergency-core = { path = "crates/reap-emergency-core" }
@@ -59,6 +69,11 @@ reap-live-contracts = { path = "crates/reap-live-contracts" }
 reap-engine = { path = "crates/reap-engine" }
 reap-order = { path = "crates/reap-order" }
 reap-pm-core = { path = "crates/reap-pm-core" }
+reap-pm-live = { path = "crates/reap-pm-live" }
+reap-pm-live-contracts = { path = "crates/reap-pm-live-contracts" }
+reap-pm-strategy = { path = "crates/reap-pm-strategy" }
+reap-polymarket-adapter = { path = "crates/reap-polymarket-adapter" }
+reap-okx-public-source = { path = "crates/reap-okx-public-source" }
 reap-okx-wire = { path = "crates/reap-okx-wire" }
 reap-okx-live-adapter = { path = "crates/reap-okx-live-adapter" }
 reap-evidence-core = { path = "crates/reap-evidence-core" }
@@ -68,6 +83,7 @@ reap-risk = { path = "crates/reap-risk" }
 reap-storage = { path = "crates/reap-storage" }
 reap-strategy = { path = "crates/reap-strategy" }
 reap-telemetry = { path = "crates/reap-telemetry" }
+reap-transport = { path = "crates/reap-transport" }
 reap-venue = { path = "crates/reap-venue" }
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1.14"

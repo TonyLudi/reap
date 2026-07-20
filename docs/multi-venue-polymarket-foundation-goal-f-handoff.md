@@ -1,9 +1,10 @@
 # Multi-Venue Polymarket Foundation Goal F Handoff
 
 Status: in progress. Phase 0 is green at
-`8d6581270b82f39293ccdb0cbeaead42d717e81c`; Phase 1 is in progress. This
-ledger is architecture and deterministic local evidence, not
-authenticated-connectivity evidence or trading authorization.
+`8d6581270b82f39293ccdb0cbeaead42d717e81c`; Phase 1 is green at
+`eb71bc1b84cef6152dc010922641e9d5bb019e43`; Phase 2 is green with its gate
+commit pending. This ledger is architecture and deterministic local evidence,
+not authenticated-connectivity evidence or trading authorization.
 
 The historical execution contract is the
 [Goal F prompt](multi-venue-polymarket-foundation-goal-f-prompt.md). The
@@ -34,8 +35,8 @@ deployed PM binary, target-host qualification, or production trading approval.
 | --- | --- | --- |
 | Prompt-only execution contract | Green | `d2593f6d85ce868b46e3c1f16b5a48f221e5e480` |
 | 0. Baseline, product contract, dependency and measurement plan | Green | `8d6581270b82f39293ccdb0cbeaead42d717e81c` |
-| 1. Exact PM domain and venue-aware envelopes | In progress | — |
-| 2. Capability-specific venue framework seams | Pending | — |
+| 1. Exact PM domain and venue-aware envelopes | Green | `eb71bc1b84cef6152dc010922641e9d5bb019e43` |
+| 2. Capability-specific venue framework seams | Green | This phase gate commit |
 | 3. PM public market data, integrity, capture, replay | Pending | — |
 | 4. Read-only private lifecycle and position monitor | Pending | — |
 | 5. Passive quote lifecycle and fake execution | Pending | — |
@@ -1042,3 +1043,386 @@ runtime byte was read or changed.
 
 The independent final diff audit found no remaining blocker. Phase 1 is ready
 for its gate commit.
+
+## Phase 2: Capability-Specific Venue Framework Seams
+
+Phase 2 is green in the working tree and awaits its gate commit. It adds
+capability-specific framework seams and compatibility-preserving mechanical
+extractions only. It does not add a Polymarket wire client, authenticated
+session, signer, credential, live order method, production quote model, or
+network-enabled PM binary.
+
+### Neutral mechanics and existing-product compatibility
+
+Eight workspace packages are added:
+
+- `reap-transport` owns bounded delivery, reconnect/backoff, connection
+  health, monotonic opaque shutdown, and process-shared connection pacing;
+- `reap-capture-framing` owns schema-neutral bounded JSONL framing, hashing,
+  verification, and writer mechanics;
+- `reap-durable-writer` owns a schema-neutral exclusive lease, bounded
+  admission, numeric progress, writer-task codec, flush/`sync_data`, and
+  durable-result mechanics;
+- `reap-okx-public-source` owns only configured OKX `index-tickers` public
+  subscription/session/reference behavior;
+- `reap-pm-strategy` owns the static pure Goal F model-requirement seam;
+- `reap-polymarket-adapter` owns distinct public, private-read,
+  reconciliation, account/position, and fake-owned-execution role types;
+- `reap-pm-live-contracts` owns secret-free checked connectivity
+  configuration, model-requirement translation, and exact capability plans;
+  and
+- `reap-pm-live` owns the Phase 2 composition roots and deterministic bounded
+  lane seam.
+
+The existing facades remain product-specific:
+
+- `reap-feed` delegates only neutral supervision/pacing to `reap-transport`.
+  Its public `watch::Receiver<bool>` compatibility API is bridged one-way into
+  an opaque monotonic shutdown signal, and sender loss fails closed.
+- `reap-venue` delegates only exact legacy index-ticker field extraction to
+  `reap-okx-public-source`. It does not expose the new session or subscription
+  role, and its legacy normalized value and serialized bytes remain frozen.
+- `reap-capture` alone enables the feature-gated
+  `legacy-reap-capture` compatibility surface. Default framing reserves a
+  tracked worst-case byte slab before serialization, performs a capped
+  zero-frame-allocation counting pass and a fixed-capacity second pass, retains
+  the exact actual byte charge until the encoded frame is hashed and dropped,
+  and decrements evidence before releasing permits. Whole-file verification
+  opens one regular-file handle and reads at most `limit + 1`. The workspace
+  root and every other crate are denied the explicitly named uncapped legacy
+  writer, encoder, and scanner symbols.
+- `reap-storage` retains schema 7, its legacy lock bytes, recovery and
+  authority rules, and its public error facade while delegating only leased
+  writer mechanics to `reap-durable-writer`. The neutral writer acknowledges
+  durability only after complete write, flush, and `sync_data`; progress is a
+  read-only numeric snapshot and cannot expose recovery or mutation authority.
+
+The OKX public session validates and binds one expected `ConnId`. Every raw
+delivery must carry that identity. Only the exact successful subscription ACK
+establishes readiness; heartbeat is liveness evidence only. Malformed,
+unknown, unsubscribe, zero-count, wrong-connection, and invalid data controls
+invalidate readiness. Every reconnect advances a checked connection epoch and
+uses session-owned ACK history for backoff. Epoch overflow is terminal and
+cannot be cleared by later ACK, data, invalidation, or another failure.
+
+### Exact PM capability and plan boundary
+
+The three roots remain least-authority compositions:
+
+| Root | Reached concrete role kinds | Plan entries |
+| --- | ---: | ---: |
+| `PmPublicCapture` | 2 | 5 |
+| `PmReadOnlyMonitor` | 3 | `8 + N` for `N = 1..=8` exact spenders |
+| `PmProduct<Model>` | 6 plus one internal schedule owner | `16 + N`: `15 + N` connectivity plus one internal timer |
+
+The endpoint inventory has exactly 16 stable connectivity purpose IDs.
+Fifteen are singleton entries; `PM-ACCOUNT-ALLOWANCE` expands to one exact
+entry for each configured spender/asset scope. `QuoteEvaluationTimer` adds one
+internal entry owned by `PmPlanOwner::QuoteSchedule`, mapped to the scheduled
+lane, with no connectivity role or source/connection route. The product
+cardinality is therefore exactly `16 + N`, not a fixed 17. An independent
+explicit full-table oracle uses both a collateral ERC-20 requirement and an
+outcome ERC-1155 requirement under the same market-selected Standard
+domain/exchange (`N = 2`, 18 rows) and checks every
+requirement key, full scope, origin, consumer, owner, lane, readiness
+dependency, and route. Production positive bindings are derived from the
+fields of actually constructed roles; self-attested binding factories are
+used only to exercise negative validation.
+
+Public configuration requires one checked `PmReferenceMapping` and two exact
+routes: the configured OKX reference source/connection and the configured PM
+token source/connection. Account configuration retains the complete
+environment, Polygon chain 137, signer, funder, compact handle, instrument,
+account source/connection, and sorted exact spender set. Goal F requires the
+EOA signer address to equal the funder address. Spenders are bounded by
+`MAX_REQUIRED_SPENDERS`, deduplicated, and checked against the full account and
+chain. Public capture takes neither a model nor a private/mutation capability.
+
+The explicit model requirements are translated rather than bypassed. The
+fixture model names exactly OKX reference, PM metadata, PM book, and
+quote-evaluation timer inputs. PM public trade remains absent.
+
+Reconciliation shapes are distinct and bounded:
+
+- atomic complete open orders: at most 1,024 events;
+- one exact known-order detail;
+- one complete fill page: at most 8,192 events; and
+- requested/resulting opaque 32-byte fixture watermarks bound to the complete
+  `PmAccountScope`.
+
+No cursor/last-fill ordering is invented. A regression proves that a watermark
+with the same compact account handle but a different funder scope is rejected.
+
+`ConstructedRoleBinding::account_snapshot` rejects an adversarial spender slice
+before allocation when it exceeds the domain bound. Binding validation rejects
+short or long slices before cloning and clones only the exact bounded plan
+cardinality.
+
+### Deterministic bounded lane seam
+
+`PmLaneSet` contains 11 actual private bounded containers, each implemented as
+a preallocated `BinaryHeap` plus a preallocated key `HashSet`. Telemetry is the
+only coalescing lane. An independent 11-row oracle pins, for every plan lane,
+the exact runtime mapping, capacity, nominal high-water, maximum age,
+saturation action, and service burst.
+
+Received-event ordering is exactly:
+
+```text
+(monotonic_receive_ns, source_handle, connection_epoch,
+ local_ingress_sequence, variant_rank)
+```
+
+The observation lane, source, and variant rank are derived by sealed concrete
+event implementations. Callers cannot select a lane, construct a service key,
+or replay a key from one serviced event onto another event. The latter path
+was found by independent audit and closed by removing caller-supplied keys from
+the trait dispatch method.
+
+Scheduled ordering is a separate exact key:
+
+```text
+(monotonic_deadline_ns, action_variant_rank, account_handle,
+ token_handle, side_rank, local_action_sequence)
+```
+
+Only due scheduled actions are serviced. Age is checked immediately before
+each service rank, after all already-higher safety work, so aged lower-priority
+input cannot prevent higher-priority service. Static generic callbacks retain
+concrete payload types and use no trait object or owner-loop allocation.
+
+The lane container is deterministic storage, not a connectivity authorizer.
+Phase 3 public producers and Phase 4 private producers must bind adapter
+deliveries to their configured role-issued source/connection route before
+enqueue. A caller-created `PmIngressOrder` is not route proof. Auxiliary
+capture, journal, and fake-effect lane markers must likewise be replaced by
+their typed worker payloads in the phases that connect those workers.
+
+### Authority and source-policy evidence
+
+Fifteen new Phase 2 compile-fail cases prove:
+
+1. public capture and read-only monitoring cannot obtain mutation;
+2. PM role families are not interchangeable and external implementations are
+   sealed;
+3. the fake owned-execution marker is linear;
+4. a product cannot reach OKX private/order authority and requires an explicit
+   model;
+5. model requirements cannot request private or mutation inputs;
+6. all real `PmPlanEntry` fields and fake-profile feature selection are
+   private;
+7. callers cannot select an observation lane, forge a service key/rank, or
+   replay a serviced key into another event; and
+8. raw/auth clients and arbitrary venue commands do not escape their owner.
+
+The PM dependency policy checks all four Phase 2 PM crates recursively for
+dynamic-dispatch, unbounded-channel, shared-mutation, credential, raw-client,
+and broad existing-authority escape tokens. No PM crate reaches
+`reap-order`, `reap-live`, `reap-live-contracts`, broad `reap-venue`,
+`reap-okx-wire`, any authenticated OKX adapter, `reqwest`, `hmac`, or
+`base64`.
+
+Conversely, all 23 Phase 0 packages are checked against acquiring a PM
+dependency. The production-source Polymarket occurrence scan recursively
+covers all 22 non-core Phase 0 `src` roots and permits exactly the 19
+fail-closed legacy feed matches. The six foundational `reap-core` common-venue
+identity occurrences are separately and exactly pinned.
+
+Independent audits found and closed:
+
+- reversible/sender-loss shutdown behavior;
+- heartbeat-derived readiness and caller-selected reconnect history;
+- detachable raw-delivery evidence, permissive controls, unbound connection
+  identity, unchecked reconnect epoch, and a nonterminal fatal state;
+- frame allocation before byte admission, frame lifetime after permit
+  release, evidence/permit races, unbounded verification, and uncapped default
+  encoder/scanner escape hatches;
+- self-attested positive plan bindings, incomplete plan tables, fake timer and
+  constructor ownership, dropped account/source/connection scopes, and
+  incomplete reconciliation shapes;
+- compact-handle-only fill watermarks;
+- forgeable lane/service keys and weak compile-fail fixtures; and
+- incomplete legacy source scans and adversarially unbounded public binding
+  helpers.
+
+The final independent transport, capture/storage, PM authority, and PM
+mechanical re-audits reported no remaining Phase 2 blocker.
+
+### Dependency and structural inventory
+
+Locked metadata reports 32 workspace packages: the 23-package Phase 0 graph,
+`reap-pm-core`, and the eight Phase 2 packages. The canonical sorted direct
+workspace adjacency has SHA-256
+`554a688b3d27f495a9638766f298c2f53a49e399084f181bd5744cad9c4f6f49`:
+
+```text
+reap-backtest -> reap-book + reap-capture + reap-core + reap-feed + reap-live-contracts + reap-order + reap-strategy + reap-venue
+reap-book -> reap-core
+reap-capture -> reap-book + reap-capture-framing + reap-core + reap-feed + reap-telemetry + reap-venue
+reap-capture-framing -> -
+reap-cli -> reap-backtest + reap-capture + reap-core + reap-emergency-core + reap-fault + reap-feed + reap-live + reap-okx-evidence-adapter + reap-strategy + reap-telemetry
+reap-core -> -
+reap-durable-writer -> -
+reap-emergency-core -> reap-core
+reap-emergency-runner -> reap-core + reap-emergency-core + reap-okx-emergency-adapter + reap-order + reap-telemetry
+reap-engine -> reap-core + reap-risk + reap-strategy
+reap-evidence-core -> -
+reap-fault -> reap-core + reap-feed + reap-live
+reap-feed -> reap-book + reap-core + reap-transport + reap-venue
+reap-live -> reap-core + reap-engine + reap-evidence-core + reap-feed + reap-live-contracts + reap-okx-live-adapter + reap-order + reap-risk + reap-storage + reap-strategy + reap-telemetry + reap-venue
+reap-live-contracts -> reap-core + reap-risk + reap-strategy + reap-venue
+reap-okx-emergency-adapter -> reap-emergency-core + reap-okx-wire + reap-venue
+reap-okx-evidence-adapter -> reap-evidence-core + reap-okx-wire + reap-venue
+reap-okx-live-adapter -> reap-core + reap-feed + reap-okx-wire + reap-order + reap-risk + reap-strategy + reap-venue
+reap-okx-public-source -> reap-core + reap-transport
+reap-okx-wire -> -
+reap-order -> reap-core + reap-risk + reap-storage + reap-strategy + reap-venue
+reap-pm-core -> reap-core
+reap-pm-live -> reap-pm-core + reap-pm-live-contracts + reap-pm-strategy + reap-polymarket-adapter + reap-transport
+reap-pm-live-contracts -> reap-pm-core + reap-pm-strategy
+reap-pm-strategy -> reap-pm-core
+reap-polymarket-adapter -> reap-pm-core
+reap-risk -> reap-core
+reap-storage -> reap-core + reap-durable-writer
+reap-strategy -> reap-core
+reap-telemetry -> reap-core
+reap-transport -> reap-core
+reap-venue -> reap-core + reap-okx-public-source
+```
+
+The graph is acyclic. No path dependency points outside the workspace.
+`Cargo.lock` changes only in local workspace-package stanzas: it adds the
+eight local `0.1.0` packages, records the intended new local edges, and moves
+the already locked `libc` mechanics edge from feed to transport. No external
+version or checksum changes. Its Phase 2 SHA-256 is
+`b1ec49a141b2dfa38ba32f1d76c49031da84eceb360b76007545df632aa20bdd`.
+
+The public-declaration inventory command from Phase 0 now reports 1,711 lines
+with SHA-256
+`fa7a786967e49825c0c5b5943c9387375ed538f9ab66e511d90060439f6a6dde`.
+The schema/version inventory remains exactly 47 lines. Its line-number-bearing
+stream now has SHA-256
+`22a6987684040d291967cce7f81d5b4c0dcbfe22183de6bb914efbbee7a78583`;
+all 47 values are unchanged. The line-number-bearing stream changes because
+`CURRENT_SCHEMA_VERSION: u16 = 7` moves within the mechanically extracted
+storage facade and unchanged
+`CAPTURE_VERIFICATION_FORMAT_VERSION: u16 = 3` shifts from line 20 to line 19.
+
+The sorted production Rust path inventory:
+
+```text
+find crates -path '*/src/*.rs' -type f -print | LC_ALL=C sort
+```
+
+contains 219 files and has SHA-256
+`61e67e21200b51b94a67c28542baf7767a51eff5c830bc95c2cb7a26a93d68c9`.
+Hashing the corresponding sorted `sha256sum` manifest yields
+`fab339a262a57179888ec61210c465a67cf1809173046af4508bb1a6a98572c7`.
+
+Largest Phase 2 production modules are:
+
+| Lines | Module |
+| ---: | --- |
+| 1,396 | `reap-capture-framing/src/bounded_writer.rs` |
+| 1,025 | `reap-pm-live/src/lanes.rs` |
+| 749 | `reap-pm-live-contracts/src/plan.rs` |
+| 656 | `reap-transport/src/supervisor.rs` |
+| 421 | `reap-pm-live-contracts/src/requirements.rs` |
+| 389 | `reap-okx-public-source/src/session.rs` |
+| 383 | `reap-durable-writer/src/writer.rs` |
+| 352 | `reap-polymarket-adapter/src/reconcile_fixture.rs` |
+| 324 | `reap-capture-framing/src/verify.rs` |
+| 286 | `reap-okx-public-source/src/public_wire.rs` |
+| 260 | `reap-pm-live/src/composition.rs` |
+| 260 | `reap-durable-writer/src/bounded.rs` |
+
+No Phase 2 production file exceeds 1,500 lines and no reviewed production
+function exceeds 250 lines. The largest PM lane function span is 104 lines.
+
+The normative boundary SHA-256 advances from the Phase 1 gate value
+`14b9316460388cde6aa8c4787e2aba23d91176bc7f1275d51487ea819fb739c2`
+to
+`5007e54a945a969f0b759788ec4d40130e714b23b1280cab0b2c401a66cca65d`.
+The audited corrections record the actual transport/capture/storage/venue
+delegation edges, the private lane submodules and their real imports, the
+16-stable-purpose plan with one allowance entry per exact spender plus one
+internal timer, exact OKX connection/epoch semantics, default-bounded versus
+feature-gated legacy capture APIs, and the later-phase configured-route
+admission gate. They add no authenticated connectivity, mutation authority,
+endpoint, or product scope.
+
+### Phase 2 verification
+
+The focused implementation gate passed:
+
+```text
+cargo fmt --all -- --check
+cargo clippy -p reap-core -p reap-pm-core -p reap-transport -p reap-feed \
+  -p reap-okx-public-source -p reap-venue -p reap-capture-framing \
+  -p reap-capture -p reap-durable-writer -p reap-storage \
+  -p reap-pm-strategy -p reap-polymarket-adapter \
+  -p reap-pm-live-contracts -p reap-pm-live \
+  --all-targets --all-features --locked -- -D warnings
+cargo test -p reap-core -p reap-pm-core -p reap-transport -p reap-feed \
+  -p reap-okx-public-source -p reap-venue -p reap-capture-framing \
+  -p reap-capture -p reap-durable-writer -p reap-storage \
+  -p reap-pm-strategy -p reap-polymarket-adapter \
+  -p reap-pm-live-contracts -p reap-pm-live \
+  --all-features --locked --no-fail-fast
+```
+
+Notable focused results were:
+
+- transport: 16 runtime/structural tests;
+- OKX public source: 17 exact session/source/subscription tests;
+- framing: 17 feature-enabled tests; capture: 50 tests;
+- durable writer: nine tests; storage facade: 24 tests;
+- PM live contracts: six plan tests plus three compile-fail cases;
+- PM adapter: three role tests plus five compile-fail cases;
+- PM live: one composition, five dependency-policy, nine lane, and seven
+  compile-fail cases; and
+- existing feed and venue suites: 71 and 36 unit tests respectively, plus
+  compatibility and compile-fail suites.
+
+All 23 legacy UI cases and all seven existing live dependency-policy checks
+passed. The first combined legacy UI attempt completed feed, live, and
+OKX-live-adapter successfully, then exhausted the approximately 874 MiB free
+filesystem while building additional independent trybuild workspaces. The
+remaining order, strategy, and venue suites were rerun individually after
+removing only `target/tests/trybuild`; all passed. This was a build-artifact
+capacity event, not a test or code failure.
+
+Deterministic compatibility checks passed:
+
+```text
+cargo test -p reap-engine --test decision_replay --locked
+cargo test -p reap-live --lib coordinator::tests --locked
+cargo test -p reap-storage -p reap-capture --lib --locked --no-fail-fast
+```
+
+The engine replay passed four tests with three authoring helpers ignored; the
+existing live coordinator passed 37 with one authoring helper ignored; capture
+passed 50; storage passed 24, with nine extracted neutral-writer tests passing
+separately.
+
+The canonical CLI backtest ran twice, `cmp` returned zero, and both outputs
+retained:
+
+```text
+38acf9f5e0c310f2ec5528974beffadf4c1a7f84d46efa8d9664ee7051e84691
+```
+
+All Phase 0 examples, normalized fixtures, decision-parity fixtures, and the
+raw OKX reset/gap fixtures retain their exact hashes. The latter two are:
+
+```text
+e3475b91fb89040452165d7ba53d0370326fa10a0ff840979b24ad4491018a2b  fixtures/raw/okx/depth-reset.jsonl
+90c153851ec63452465eef0e0c6e9c8e718aa70ae49be69e13679fbd529f7fa2  fixtures/raw/okx/depth-gap.jsonl
+```
+
+Locked metadata, `git diff --check`, the required baseline-ancestor check, and
+the no-outside-path check pass. `../imm-strategy` remains clean at
+`b6b120c7b7c466d8431bf082f3229328c5d7b2ae`; `../predarb` remains at
+`8222273a9c72033b760e1d2fec813bc77144556d` with only its pre-existing
+modified dashboard and untracked `.predarb/`. No sibling file or untracked
+runtime byte was read or changed.

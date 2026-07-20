@@ -1,0 +1,26 @@
+error[E0277]: the trait bound `PmPublicRole: PmPrivateLifecycleRole` is not satisfied
+ --> tests/ui/roles_are_not_interchangeable.rs:6:21
+  |
+6 |     require_private(public);
+  |     --------------- ^^^^^^ the trait `PmPrivateLifecycleRole` is not implemented for `PmPublicRole`
+  |     |
+  |     required by a bound introduced by this call
+  |
+help: the trait `PmPrivateLifecycleRole` is implemented for `PmFixturePrivateLifecycle`
+ --> src/private_fixture.rs
+  |
+  | impl PmPrivateLifecycleRole for PmFixturePrivateLifecycle {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `require_private`
+ --> tests/ui/roles_are_not_interchangeable.rs:3:23
+  |
+3 | fn require_private<R: PmPrivateLifecycleRole>(_role: R) {}
+  |                       ^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `require_private`
+
+error[E0277]: the trait bound `PmPublicRole: From<PmFixtureOwnedExecution>` is not satisfied
+ --> tests/ui/roles_are_not_interchangeable.rs:7:37
+  |
+7 |     let _: PmPublicRole = execution.into();
+  |                                     ^^^^ the trait `From<PmFixtureOwnedExecution>` is not implemented for `PmPublicRole`
+  |
+  = note: required for `PmFixtureOwnedExecution` to implement `Into<PmPublicRole>`

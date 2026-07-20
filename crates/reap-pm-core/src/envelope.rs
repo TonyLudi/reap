@@ -31,7 +31,71 @@ impl VenueEventHash {
     }
 }
 
-/// Distinct wall, venue, receive, and service clocks for one input.
+/// Clocks known at ingress, before bounded-queue service begins.
+///
+/// Service time is deliberately absent so a producer cannot stamp queue age
+/// before the consumer actually selects the event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReceivedEventClock {
+    venue_event_timestamp_ns: Option<u64>,
+    local_wall_receive_ns: u64,
+    monotonic_receive_ns: u64,
+}
+
+impl ReceivedEventClock {
+    pub fn new(
+        venue_event_timestamp_ns: Option<u64>,
+        local_wall_receive_ns: u64,
+        monotonic_receive_ns: u64,
+    ) -> Result<Self, EnvelopeError> {
+        if venue_event_timestamp_ns == Some(0) {
+            return Err(EnvelopeError::ZeroVenueTimestamp);
+        }
+        if local_wall_receive_ns == 0 {
+            return Err(EnvelopeError::ZeroWallReceiveTimestamp);
+        }
+        if monotonic_receive_ns == 0 {
+            return Err(EnvelopeError::ZeroMonotonicReceiveTimestamp);
+        }
+        Ok(Self {
+            venue_event_timestamp_ns,
+            local_wall_receive_ns,
+            monotonic_receive_ns,
+        })
+    }
+
+    #[must_use]
+    pub const fn venue_event_timestamp_ns(self) -> Option<u64> {
+        self.venue_event_timestamp_ns
+    }
+
+    #[must_use]
+    pub const fn local_wall_receive_ns(self) -> u64 {
+        self.local_wall_receive_ns
+    }
+
+    #[must_use]
+    pub const fn monotonic_receive_ns(self) -> u64 {
+        self.monotonic_receive_ns
+    }
+
+    pub fn service_at(self, monotonic_service_ns: u64) -> Result<EventClock, EnvelopeError> {
+        if monotonic_service_ns == 0 {
+            return Err(EnvelopeError::ZeroMonotonicServiceTimestamp);
+        }
+        if monotonic_service_ns < self.monotonic_receive_ns {
+            return Err(EnvelopeError::ServiceBeforeReceive);
+        }
+        Ok(EventClock {
+            venue_event_timestamp_ns: self.venue_event_timestamp_ns,
+            local_wall_receive_ns: self.local_wall_receive_ns,
+            monotonic_receive_ns: self.monotonic_receive_ns,
+            monotonic_service_ns,
+        })
+    }
+}
+
+/// Distinct wall, venue, receive, and service clocks for one serviced input.
 ///
 /// Venue time is optional because not every source supplies it. Wall time is
 /// evidence only. The monotonic pair is the only pair used to measure queue
@@ -51,27 +115,12 @@ impl EventClock {
         monotonic_receive_ns: u64,
         monotonic_service_ns: u64,
     ) -> Result<Self, EnvelopeError> {
-        if venue_event_timestamp_ns == Some(0) {
-            return Err(EnvelopeError::ZeroVenueTimestamp);
-        }
-        if local_wall_receive_ns == 0 {
-            return Err(EnvelopeError::ZeroWallReceiveTimestamp);
-        }
-        if monotonic_receive_ns == 0 {
-            return Err(EnvelopeError::ZeroMonotonicReceiveTimestamp);
-        }
-        if monotonic_service_ns == 0 {
-            return Err(EnvelopeError::ZeroMonotonicServiceTimestamp);
-        }
-        if monotonic_service_ns < monotonic_receive_ns {
-            return Err(EnvelopeError::ServiceBeforeReceive);
-        }
-        Ok(Self {
+        ReceivedEventClock::new(
             venue_event_timestamp_ns,
             local_wall_receive_ns,
             monotonic_receive_ns,
-            monotonic_service_ns,
-        })
+        )?
+        .service_at(monotonic_service_ns)
     }
 
     #[must_use]

@@ -1,0 +1,7 @@
+[package]
+name = "reap-pm-strategy"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+reap-pm-core.workspace = true

@@ -1,0 +1,19 @@
+error[E0451]: fields `key`, `origin`, `consumer`, `owner`, `lane`, `readiness` and `route` of struct `PmPlanEntry` are private
+  --> tests/ui/plan_entries_cannot_be_forged.rs:16:9
+   |
+15 |     PmPlanEntry {
+   |     ----------- in this type
+16 |         key,
+   |         ^^^ private field
+17 |         origin,
+   |         ^^^^^^ private field
+18 |         consumer,
+   |         ^^^^^^^^ private field
+19 |         owner,
+   |         ^^^^^ private field
+20 |         lane,
+   |         ^^^^ private field
+21 |         readiness,
+   |         ^^^^^^^^^ private field
+22 |         route,
+   |         ^^^^^ private field

@@ -1,20 +1,17 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
 
 use reap_core::{
     AccountUpdate, FillFee, FillKey, FillLiquidity, NormalizedEvent, OrderIntent, OrderUpdate,
     Price, Quantity, RawEnvelope, Side, Symbol, SystemEvent, SystemEventKind, TimeMs,
 };
+use reap_durable_writer::{
+    BoundedSink, DeliveryClass, DurableLease, DurableWriterConfig, DurableWriterRuntime,
+    EnqueueError, EnqueueOutcome, JournalCodec, LeaseError, WriterError,
+    start_durable_writer_with_lease,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
@@ -369,439 +366,118 @@ pub enum StorageError {
     Join(#[from] tokio::task::JoinError),
 }
 
-struct StorageProgress {
-    records_enqueued: AtomicU64,
-    records_written: AtomicU64,
-    durable_sync_completions: AtomicU64,
-    write_failures: AtomicU64,
-    sync_failures: AtomicU64,
-    dropped_records: AtomicU64,
-    records_outstanding: AtomicUsize,
-    queue_capacity: usize,
-    queue_depth: AtomicUsize,
-    queue_high_water: AtomicUsize,
-    last_writer_progress_ns: AtomicU64,
-}
-
-impl StorageProgress {
-    fn new(queue_capacity: usize) -> Self {
-        let queue_capacity = queue_capacity.max(1);
-        let _ = process_monotonic_ns();
-        Self {
-            records_enqueued: AtomicU64::new(0),
-            records_written: AtomicU64::new(0),
-            durable_sync_completions: AtomicU64::new(0),
-            write_failures: AtomicU64::new(0),
-            sync_failures: AtomicU64::new(0),
-            dropped_records: AtomicU64::new(0),
-            records_outstanding: AtomicUsize::new(0),
-            queue_capacity,
-            queue_depth: AtomicUsize::new(0),
-            queue_high_water: AtomicUsize::new(0),
-            last_writer_progress_ns: AtomicU64::new(0),
-        }
-    }
-
-    fn record_enqueued(&self) {
-        saturating_increment(&self.records_enqueued);
-        self.records_outstanding.fetch_add(1, Ordering::Relaxed);
-        let depth = self.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
-        // Tokio releases channel capacity immediately before `recv` returns.
-        // Clamp that sub-instruction accounting handoff without introducing a
-        // second capacity gate that could perturb producer ordering.
-        self.queue_high_water
-            .fetch_max(depth.min(self.queue_capacity), Ordering::Relaxed);
-    }
-
-    fn record_received(&self) {
-        let previous = self.queue_depth.fetch_sub(1, Ordering::Relaxed);
-        debug_assert!(previous > 0);
-    }
-
-    fn record_completed(&self) {
-        let previous = self.records_outstanding.fetch_sub(1, Ordering::Relaxed);
-        debug_assert!(previous > 0);
-    }
-
-    fn record_dropped(&self) {
-        saturating_increment(&self.dropped_records);
-    }
-
-    fn record_written(&self) {
-        saturating_increment(&self.records_written);
-        self.record_writer_progress();
-    }
-
-    fn record_durable_sync_completion(&self) {
-        saturating_increment(&self.durable_sync_completions);
-        self.record_writer_progress();
-    }
-
-    fn record_write_failure(&self) {
-        saturating_increment(&self.write_failures);
-    }
-
-    fn record_sync_failure(&self) {
-        saturating_increment(&self.sync_failures);
-    }
-
-    fn record_writer_progress(&self) {
-        self.last_writer_progress_ns
-            .store(process_monotonic_ns(), Ordering::Relaxed);
-    }
-
-    fn snapshot(&self) -> StorageProgressSnapshot {
-        let last_writer_progress_ns = self.last_writer_progress_ns.load(Ordering::Relaxed);
-        let last_writer_progress_age_ns = if last_writer_progress_ns == 0 {
-            0
-        } else {
-            process_monotonic_ns().saturating_sub(last_writer_progress_ns)
-        };
-        StorageProgressSnapshot {
-            records_enqueued: self.records_enqueued.load(Ordering::Relaxed),
-            records_written: self.records_written.load(Ordering::Relaxed),
-            durable_sync_completions: self.durable_sync_completions.load(Ordering::Relaxed),
-            write_failures: self.write_failures.load(Ordering::Relaxed),
-            sync_failures: self.sync_failures.load(Ordering::Relaxed),
-            dropped_records: self.dropped_records.load(Ordering::Relaxed),
-            records_outstanding: self.records_outstanding.load(Ordering::Relaxed),
-            queue_capacity: self.queue_capacity,
-            queue_depth: self
-                .queue_depth
-                .load(Ordering::Relaxed)
-                .min(self.queue_capacity),
-            queue_high_water: self
-                .queue_high_water
-                .load(Ordering::Relaxed)
-                .min(self.queue_capacity),
-            last_writer_progress_ns,
-            last_writer_progress_age_ns,
-        }
-    }
-}
-
-fn saturating_increment(counter: &AtomicU64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-        Some(value.saturating_add(1))
-    });
-}
-
-fn process_monotonic_ns() -> u64 {
-    static ORIGIN: OnceLock<Instant> = OnceLock::new();
-    let elapsed = ORIGIN.get_or_init(Instant::now).elapsed().as_nanos();
-    elapsed.min(u64::MAX.saturating_sub(1) as u128) as u64 + 1
-}
-
 #[derive(Clone)]
 pub struct StorageSink {
-    sender: mpsc::Sender<PendingRecord>,
-    progress: Arc<StorageProgress>,
-}
-
-struct PendingRecord {
-    record: StorageRecord,
-    durable_ack: Option<oneshot::Sender<Result<(), String>>>,
-    queue_drop_guard: Option<StorageQueueDropGuard>,
-}
-
-impl PendingRecord {
-    fn queued(
-        record: StorageRecord,
-        durable_ack: Option<oneshot::Sender<Result<(), String>>>,
-        progress: Arc<StorageProgress>,
-    ) -> Self {
-        Self {
-            record,
-            durable_ack,
-            queue_drop_guard: Some(StorageQueueDropGuard {
-                progress,
-                armed: true,
-            }),
-        }
-    }
-
-    fn mark_received(&mut self) {
-        if let Some(guard) = &mut self.queue_drop_guard
-            && guard.armed
-        {
-            guard.progress.record_received();
-            guard.armed = false;
-        }
-    }
-}
-
-struct StorageQueueDropGuard {
-    progress: Arc<StorageProgress>,
-    armed: bool,
-}
-
-impl Drop for StorageQueueDropGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            self.progress.record_received();
-            self.progress.record_dropped();
-        }
-    }
+    inner: BoundedSink<StorageRecord>,
 }
 
 impl StorageSink {
     pub async fn record(&self, record: StorageRecord) -> Result<StorageWriteOutcome, StorageError> {
-        if record.is_critical() {
-            let permit = self
-                .sender
-                .reserve()
-                .await
-                .map_err(|_| StorageError::Closed)?;
-            self.progress.record_enqueued();
-            permit.send(PendingRecord::queued(
-                record,
-                None,
-                Arc::clone(&self.progress),
-            ));
-            return Ok(StorageWriteOutcome::Queued);
-        }
-        match self.sender.try_reserve() {
-            Ok(permit) => {
-                self.progress.record_enqueued();
-                permit.send(PendingRecord::queued(
-                    record,
-                    None,
-                    Arc::clone(&self.progress),
-                ));
-                Ok(StorageWriteOutcome::Queued)
-            }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.progress.record_dropped();
-                Ok(StorageWriteOutcome::DroppedBestEffort)
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(StorageError::Closed),
-        }
+        let class = if record.is_critical() {
+            DeliveryClass::Critical
+        } else {
+            DeliveryClass::BestEffort
+        };
+        self.inner
+            .enqueue(record, class)
+            .await
+            .map(map_enqueue_outcome)
+            .map_err(map_enqueue_error)
     }
 
     pub async fn record_durable(&self, record: StorageRecord) -> Result<(), StorageError> {
-        let (durable_ack, ack) = oneshot::channel();
-        let permit = self
-            .sender
-            .reserve()
+        self.inner
+            .enqueue_durable(record)
             .await
-            .map_err(|_| StorageError::Closed)?;
-        self.progress.record_enqueued();
-        permit.send(PendingRecord::queued(
-            record,
-            Some(durable_ack),
-            Arc::clone(&self.progress),
-        ));
-        match ack.await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(message)) => Err(StorageError::Durability(message)),
-            Err(_) => Err(StorageError::Closed),
-        }
+            .map_err(map_enqueue_error)
     }
 
     pub fn try_record(&self, record: StorageRecord) -> Result<StorageWriteOutcome, StorageError> {
-        let critical = record.is_critical();
-        match self.sender.try_reserve() {
-            Ok(permit) => {
-                self.progress.record_enqueued();
-                permit.send(PendingRecord::queued(
-                    record,
-                    None,
-                    Arc::clone(&self.progress),
-                ));
-                Ok(StorageWriteOutcome::Queued)
-            }
-            Err(mpsc::error::TrySendError::Full(_)) if critical => Err(StorageError::Backpressure),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.progress.record_dropped();
-                Ok(StorageWriteOutcome::DroppedBestEffort)
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(StorageError::Closed),
-        }
+        let class = if record.is_critical() {
+            DeliveryClass::Critical
+        } else {
+            DeliveryClass::BestEffort
+        };
+        self.inner
+            .try_enqueue(record, class)
+            .map(map_enqueue_outcome)
+            .map_err(map_enqueue_error)
     }
 
     pub fn dropped_records(&self) -> u64 {
-        self.progress.dropped_records.load(Ordering::Relaxed)
+        self.inner.dropped_records()
     }
 
     pub fn queue_depth(&self) -> usize {
-        self.progress.records_outstanding.load(Ordering::Relaxed)
+        self.inner.records_outstanding()
     }
 
     /// Returns a numeric, observation-only snapshot of storage writer progress.
     pub fn progress_snapshot(&self) -> StorageProgressSnapshot {
-        self.progress.snapshot()
+        let snapshot = self.inner.progress_snapshot();
+        StorageProgressSnapshot {
+            records_enqueued: snapshot.records_enqueued,
+            records_written: snapshot.records_written,
+            durable_sync_completions: snapshot.durable_sync_completions,
+            write_failures: snapshot.write_failures,
+            sync_failures: snapshot.sync_failures,
+            dropped_records: snapshot.dropped_records,
+            records_outstanding: snapshot.records_outstanding,
+            queue_capacity: snapshot.queue_capacity,
+            queue_depth: snapshot.queue_depth,
+            queue_high_water: snapshot.queue_high_water,
+            last_writer_progress_ns: snapshot.last_writer_progress_ns,
+            last_writer_progress_age_ns: snapshot.last_writer_progress_age_ns,
+        }
     }
 }
 
 pub struct StorageRuntime {
-    sink: StorageSink,
-    shutdown: Option<oneshot::Sender<()>>,
-    task: Option<JoinHandle<Result<(), StorageError>>>,
-    _lease: Arc<StorageLease>,
+    inner: DurableWriterRuntime<StorageRecord, Schema7Codec>,
 }
 
 impl StorageRuntime {
     pub fn sink(&self) -> StorageSink {
-        self.sink.clone()
+        StorageSink {
+            inner: self.inner.sink(),
+        }
     }
 
     pub fn request_shutdown(&mut self) {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
+        self.inner.request_shutdown();
     }
 
     pub async fn stop_writer(&mut self) -> Result<(), StorageError> {
-        self.request_shutdown();
-        let result = match self.task.as_mut() {
-            Some(task) => Some(task.await),
-            None => None,
-        };
-        self.task.take();
-        if let Some(result) = result {
-            result??;
-        }
-        Ok(())
+        self.inner.stop_writer().await.map_err(map_writer_error)
     }
 
     pub async fn shutdown(mut self) -> Result<(), StorageError> {
-        self.stop_writer().await?;
-        Ok(())
-    }
-}
-
-impl Drop for StorageRuntime {
-    fn drop(&mut self) {
-        self.request_shutdown();
-        if let Some(task) = &self.task {
-            task.abort();
-        }
+        self.stop_writer().await
     }
 }
 
 #[derive(Debug)]
 pub struct StorageLease {
-    journal_path: PathBuf,
-    lock_path: PathBuf,
-    lock_file: std::fs::File,
+    inner: DurableLease,
     authority_recovered: bool,
 }
 
 impl StorageLease {
     pub fn journal_path(&self) -> &Path {
-        &self.journal_path
+        self.inner.journal_path()
     }
 
     pub fn lock_path(&self) -> &Path {
-        &self.lock_path
-    }
-}
-
-impl Drop for StorageLease {
-    fn drop(&mut self) {
-        let _ = self.lock_file.unlock();
+        self.inner.lock_path()
     }
 }
 
 pub fn acquire_storage_lease(path: impl AsRef<Path>) -> Result<StorageLease, StorageError> {
-    let journal_path = normalize_journal_path(path.as_ref())?;
-    let lock_path = lock_path_for(&journal_path)?;
-    validate_regular_file_if_present(&lock_path, "lock path")?;
-
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).read(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut lock_file = options.open(&lock_path)?;
-    match lock_file.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => {
-            return Err(StorageError::AlreadyLocked {
-                path: journal_path,
-                lock_path,
-            });
-        }
-        Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
-    }
-    #[cfg(unix)]
-    std::fs::set_permissions(&lock_path, unix_private_permissions())?;
-    lock_file.set_len(0)?;
-    lock_file.seek(SeekFrom::Start(0))?;
-    writeln!(
-        lock_file,
-        "pid={} acquired_at_ms={}",
-        std::process::id(),
-        unix_time_ms()
-    )?;
-    lock_file.sync_data()?;
-
+    let inner = DurableLease::acquire(path).map_err(map_lease_error)?;
     Ok(StorageLease {
-        journal_path,
-        lock_path,
-        lock_file,
+        inner,
         authority_recovered: false,
     })
-}
-
-fn normalize_journal_path(path: &Path) -> Result<PathBuf, StorageError> {
-    let file_name = path.file_name().ok_or_else(|| StorageError::InvalidPath {
-        path: path.to_path_buf(),
-        message: "journal path must name a file".to_string(),
-    })?;
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let canonical_parent = std::fs::canonicalize(parent)?;
-    let journal_path = canonical_parent.join(file_name);
-    validate_regular_file_if_present(&journal_path, "journal path")?;
-    Ok(journal_path)
-}
-
-fn lock_path_for(journal_path: &Path) -> Result<PathBuf, StorageError> {
-    let file_name = journal_path
-        .file_name()
-        .ok_or_else(|| StorageError::InvalidPath {
-            path: journal_path.to_path_buf(),
-            message: "journal path must name a file".to_string(),
-        })?;
-    let mut lock_name = file_name.to_os_string();
-    lock_name.push(".lock");
-    Ok(journal_path.with_file_name(lock_name))
-}
-
-fn validate_regular_file_if_present(path: &Path, label: &str) -> Result<(), StorageError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(StorageError::InvalidPath {
-            path: path.to_path_buf(),
-            message: format!("{label} must not be a symbolic link"),
-        }),
-        Ok(metadata) if !metadata.is_file() => Err(StorageError::InvalidPath {
-            path: path.to_path_buf(),
-            message: format!("{label} must be a regular file"),
-        }),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
-}
-
-#[cfg(unix)]
-fn unix_private_permissions() -> std::fs::Permissions {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::Permissions::from_mode(0o600)
-}
-
-fn unix_time_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(u64::MAX as u128) as u64
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -811,6 +487,77 @@ struct StoredEnvelope {
 }
 
 const CURRENT_SCHEMA_VERSION: u16 = 7;
+
+struct Schema7Codec;
+
+#[derive(Serialize)]
+struct StoredEnvelopeRef<'a> {
+    schema_version: u16,
+    record: &'a StorageRecord,
+}
+
+impl JournalCodec<StorageRecord> for Schema7Codec {
+    type Error = serde_json::Error;
+
+    fn encode(&self, record: &StorageRecord, output: &mut Vec<u8>) -> Result<(), Self::Error> {
+        serde_json::to_writer(
+            output,
+            &StoredEnvelopeRef {
+                schema_version: CURRENT_SCHEMA_VERSION,
+                record,
+            },
+        )
+    }
+
+    fn durability_error(&self, error: &WriterError<Self::Error>) -> String {
+        match error {
+            WriterError::Io(error) => format!("storage IO failed: {error}"),
+            WriterError::Codec(error) => format!("storage serialization failed: {error}"),
+            other => other.to_string(),
+        }
+    }
+}
+
+fn map_enqueue_outcome(outcome: EnqueueOutcome) -> StorageWriteOutcome {
+    match outcome {
+        EnqueueOutcome::Queued => StorageWriteOutcome::Queued,
+        EnqueueOutcome::DroppedBestEffort => StorageWriteOutcome::DroppedBestEffort,
+    }
+}
+
+fn map_enqueue_error(error: EnqueueError) -> StorageError {
+    match error {
+        EnqueueError::Closed => StorageError::Closed,
+        EnqueueError::Full => StorageError::Backpressure,
+        EnqueueError::Durability(message) => StorageError::Durability(message),
+    }
+}
+
+fn map_lease_error(error: LeaseError) -> StorageError {
+    match error {
+        LeaseError::Io(error) => StorageError::Io(error),
+        LeaseError::InvalidPath { path, message } => StorageError::InvalidPath { path, message },
+        LeaseError::AlreadyLocked { path, lock_path } => {
+            StorageError::AlreadyLocked { path, lock_path }
+        }
+    }
+}
+
+fn map_writer_error(error: WriterError<serde_json::Error>) -> StorageError {
+    match error {
+        WriterError::Lease(error) => map_lease_error(error),
+        WriterError::Io(error) => StorageError::Io(error),
+        WriterError::Codec(error) => StorageError::Serialization(error),
+        WriterError::LeaseMismatch {
+            config_path,
+            lease_path,
+        } => StorageError::LeaseMismatch {
+            config_path,
+            lease_path,
+        },
+        WriterError::Join(error) => StorageError::Join(error),
+    }
+}
 
 pub fn recover_jsonl(path: impl AsRef<Path>) -> Result<RecoveredStorage, StorageError> {
     let path = path.as_ref();
@@ -833,7 +580,7 @@ pub fn recover_jsonl(path: impl AsRef<Path>) -> Result<RecoveredStorage, Storage
 pub fn recover_leased_jsonl(lease: &mut StorageLease) -> Result<RecoveredStorage, StorageError> {
     if std::mem::replace(&mut lease.authority_recovered, true) {
         return Err(StorageError::AuthorityAlreadyRecovered {
-            path: lease.journal_path.clone(),
+            path: lease.journal_path().to_path_buf(),
         });
     }
     let bytes = match std::fs::read(lease.journal_path()) {
@@ -1259,165 +1006,22 @@ pub async fn start_jsonl_storage(config: StorageConfig) -> Result<StorageRuntime
 }
 
 pub async fn start_jsonl_storage_with_lease(
-    mut config: StorageConfig,
+    config: StorageConfig,
     lease: StorageLease,
 ) -> Result<StorageRuntime, StorageError> {
-    let normalized_config_path = normalize_journal_path(&config.path)?;
-    if normalized_config_path != lease.journal_path {
-        return Err(StorageError::LeaseMismatch {
-            config_path: normalized_config_path,
-            lease_path: lease.journal_path.clone(),
-        });
-    }
-    config.path = lease.journal_path.clone();
-    let file = open_storage_file(&config).await?;
-    let lease = Arc::new(lease);
-    let channel_capacity = config.channel_capacity.max(1);
-    let (sender, receiver) = mpsc::channel(channel_capacity);
-    let (shutdown, shutdown_rx) = oneshot::channel();
-    let progress = Arc::new(StorageProgress::new(channel_capacity));
-    let sink = StorageSink {
-        sender,
-        progress: Arc::clone(&progress),
-    };
-    let writer_lease = Arc::clone(&lease);
-    let task = tokio::spawn(async move {
-        let _lease = writer_lease;
-        run_writer_with_file(config, file, receiver, shutdown_rx, progress).await
-    });
-    Ok(StorageRuntime {
-        sink,
-        shutdown: Some(shutdown),
-        task: Some(task),
-        _lease: lease,
-    })
-}
-
-async fn open_storage_file(config: &StorageConfig) -> Result<tokio::fs::File, StorageError> {
-    if let Some(parent) = config.path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&config.path)
-        .await?;
-    #[cfg(unix)]
-    tokio::fs::set_permissions(&config.path, unix_private_permissions()).await?;
-    Ok(file)
-}
-
-async fn run_writer_with_file(
-    config: StorageConfig,
-    mut file: tokio::fs::File,
-    mut receiver: mpsc::Receiver<PendingRecord>,
-    mut shutdown: oneshot::Receiver<()>,
-    progress: Arc<StorageProgress>,
-) -> Result<(), StorageError> {
-    let flush_every = config.flush_every_records.max(1);
-    let mut since_flush = 0_usize;
-
-    loop {
-        tokio::select! {
-            biased;
-            _ = &mut shutdown => {
-                receiver.close();
-                while let Some(mut pending) = receiver.recv().await {
-                    pending.mark_received();
-                    let result = write_pending(&mut file, pending, &progress).await;
-                    progress.record_completed();
-                    result?;
-                }
-                break;
-            }
-            pending = receiver.recv() => {
-                let Some(mut pending) = pending else { break; };
-                pending.mark_received();
-                let result = write_pending(&mut file, pending, &progress).await;
-                progress.record_completed();
-                let durable = result?;
-                if durable {
-                    since_flush = 0;
-                } else {
-                    since_flush += 1;
-                }
-                if !durable && since_flush >= flush_every {
-                    if let Err(error) = file.flush().await {
-                        progress.record_sync_failure();
-                        return Err(error.into());
-                    }
-                    progress.record_writer_progress();
-                    since_flush = 0;
-                }
-            }
-        }
-    }
-    if let Err(error) = file.flush().await {
-        progress.record_sync_failure();
-        return Err(error.into());
-    }
-    progress.record_writer_progress();
-    if let Err(error) = file.sync_data().await {
-        progress.record_sync_failure();
-        return Err(error.into());
-    }
-    progress.record_writer_progress();
-    Ok(())
-}
-
-async fn write_pending(
-    file: &mut tokio::fs::File,
-    pending: PendingRecord,
-    progress: &StorageProgress,
-) -> Result<bool, StorageError> {
-    let PendingRecord {
-        record,
-        durable_ack,
-        queue_drop_guard: _,
-    } = pending;
-    let durable = durable_ack.is_some();
-    let result = async {
-        if let Err(error) = write_record(file, record).await {
-            progress.record_write_failure();
-            return Err(error);
-        }
-        progress.record_written();
-        if durable {
-            if let Err(error) = file.flush().await {
-                progress.record_sync_failure();
-                return Err(error.into());
-            }
-            progress.record_writer_progress();
-            if let Err(error) = file.sync_data().await {
-                progress.record_sync_failure();
-                return Err(error.into());
-            }
-            progress.record_durable_sync_completion();
-        }
-        Ok::<(), StorageError>(())
-    }
-    .await;
-    if let Some(ack) = durable_ack {
-        let acknowledgement = match &result {
-            Ok(()) => Ok(()),
-            Err(error) => Err(error.to_string()),
-        };
-        let _ = ack.send(acknowledgement);
-    }
-    result.map(|()| durable)
-}
-
-async fn write_record(
-    file: &mut tokio::fs::File,
-    record: StorageRecord,
-) -> Result<(), StorageError> {
-    let mut line = serde_json::to_vec(&StoredEnvelope {
-        schema_version: CURRENT_SCHEMA_VERSION,
-        record,
-    })?;
-    line.push(b'\n');
-    file.write_all(&line).await?;
-    Ok(())
+    let StorageLease { inner, .. } = lease;
+    let inner = start_durable_writer_with_lease(
+        DurableWriterConfig {
+            path: config.path,
+            channel_capacity: config.channel_capacity,
+            flush_every_records: config.flush_every_records,
+        },
+        inner,
+        Schema7Codec,
+    )
+    .await
+    .map_err(map_writer_error)?;
+    Ok(StorageRuntime { inner })
 }
 
 #[cfg(test)]
@@ -1442,6 +1046,16 @@ mod tests {
                 payload: "{}".to_string(),
             },
         }
+    }
+
+    #[test]
+    fn schema_seven_codec_preserves_the_frozen_raw_envelope_bytes() {
+        let mut encoded = Vec::new();
+        Schema7Codec.encode(&raw(), &mut encoded).unwrap();
+        assert_eq!(
+            encoded,
+            br#"{"schema_version":7,"record":{"kind":"raw","data":{"account_id":null,"envelope":{"venue":"okx","conn_id":"test","channel":"books","symbol":"BTC-USDT","recv_ts_ns":1,"raw_hash":2,"payload":"{}"}}}}"#
+        );
     }
 
     fn journal_bytes(records: impl IntoIterator<Item = StorageRecord>) -> Vec<u8> {
@@ -1526,52 +1140,6 @@ mod tests {
                 reason: "private order update".to_string(),
             },
         }
-    }
-
-    #[tokio::test]
-    async fn best_effort_records_drop_when_bounded_queue_is_full() {
-        let (sender, _receiver) = mpsc::channel(1);
-        let sink = StorageSink {
-            sender,
-            progress: Arc::new(StorageProgress::new(1)),
-        };
-        assert_eq!(
-            sink.record(raw()).await.unwrap(),
-            StorageWriteOutcome::Queued
-        );
-        assert_eq!(
-            sink.record(raw()).await.unwrap(),
-            StorageWriteOutcome::DroppedBestEffort
-        );
-        assert_eq!(sink.dropped_records(), 1);
-    }
-
-    #[test]
-    fn critical_record_backpressure_is_fail_stop_not_drop() {
-        let (sender, _receiver) = mpsc::channel(1);
-        let sink = StorageSink {
-            sender,
-            progress: Arc::new(StorageProgress::new(1)),
-        };
-        sink.try_record(StorageRecord::Intent {
-            ts_ms: 1,
-            intent: OrderIntent::CancelOrder {
-                order_id: "one".to_string(),
-                reason: "test".to_string(),
-            },
-        })
-        .unwrap();
-        assert!(matches!(
-            sink.try_record(StorageRecord::Intent {
-                ts_ms: 2,
-                intent: OrderIntent::CancelOrder {
-                    order_id: "two".to_string(),
-                    reason: "test".to_string(),
-                },
-            }),
-            Err(StorageError::Backpressure)
-        ));
-        assert_eq!(sink.dropped_records(), 0);
     }
 
     #[test]
@@ -2013,185 +1581,6 @@ mod tests {
         assert!(progress.last_writer_progress_age_ns < 1_000_000_000);
 
         runtime.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn storage_progress_keeps_queue_and_drop_accounting_bounded() {
-        let (sender, _receiver) = mpsc::channel(1);
-        let progress = Arc::new(StorageProgress::new(1));
-        let sink = StorageSink { sender, progress };
-
-        assert_eq!(
-            sink.record(raw()).await.unwrap(),
-            StorageWriteOutcome::Queued
-        );
-        assert_eq!(
-            sink.record(raw()).await.unwrap(),
-            StorageWriteOutcome::DroppedBestEffort
-        );
-
-        let snapshot = sink.progress_snapshot();
-        assert_eq!(snapshot.queue_capacity, 1);
-        assert_eq!(snapshot.queue_depth, 1);
-        assert_eq!(snapshot.queue_high_water, 1);
-        assert_eq!(snapshot.records_enqueued, 1);
-        assert_eq!(snapshot.dropped_records, 1);
-        assert_eq!(snapshot.records_outstanding, 1);
-        assert_eq!(snapshot.records_written, 0);
-        assert_eq!(sink.queue_depth(), 1);
-    }
-
-    #[tokio::test]
-    async fn storage_progress_separates_channel_depth_from_outstanding_writes() {
-        let (sender, mut receiver) = mpsc::channel(1);
-        let progress = Arc::new(StorageProgress::new(1));
-        let sink = StorageSink {
-            sender,
-            progress: Arc::clone(&progress),
-        };
-
-        sink.record(raw()).await.unwrap();
-        let mut first = receiver.recv().await.unwrap();
-        sink.record(raw()).await.unwrap();
-
-        let snapshot = sink.progress_snapshot();
-        assert_eq!(snapshot.queue_capacity, 1);
-        assert_eq!(snapshot.queue_depth, 1);
-        assert_eq!(snapshot.queue_high_water, 1);
-        assert_eq!(snapshot.records_outstanding, 2);
-        assert_eq!(sink.queue_depth(), 2);
-
-        first.mark_received();
-        drop(first);
-        progress.record_completed();
-        let mut second = receiver.recv().await.unwrap();
-        second.mark_received();
-        drop(second);
-        progress.record_completed();
-        assert_eq!(sink.queue_depth(), 0);
-        assert_eq!(sink.progress_snapshot().queue_depth, 0);
-    }
-
-    #[tokio::test]
-    async fn storage_progress_accounts_for_records_discarded_with_the_receiver() {
-        let (sender, receiver) = mpsc::channel(1);
-        let progress = Arc::new(StorageProgress::new(1));
-        let sink = StorageSink {
-            sender,
-            progress: Arc::clone(&progress),
-        };
-
-        sink.record(raw()).await.unwrap();
-        drop(receiver);
-
-        let snapshot = sink.progress_snapshot();
-        assert_eq!(snapshot.queue_depth, 0);
-        assert_eq!(snapshot.queue_high_water, 1);
-        assert_eq!(snapshot.records_outstanding, 1);
-        assert_eq!(snapshot.dropped_records, 1);
-    }
-
-    #[test]
-    fn storage_progress_updates_are_atomic_numeric_only() {
-        let source = include_str!("lib.rs");
-        let progress_source = source
-            .split_once("struct StorageProgress {")
-            .unwrap()
-            .1
-            .split_once("#[derive(Clone)]\npub struct StorageSink")
-            .unwrap()
-            .0;
-
-        for forbidden in [
-            "Mutex",
-            "RwLock",
-            "String",
-            "Vec<",
-            "HashMap",
-            "Box<",
-            "format!",
-            ".to_string(",
-            "serde_json",
-        ] {
-            assert!(
-                !progress_source.contains(forbidden),
-                "storage progress path must not contain {forbidden}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn storage_progress_records_write_failure_without_claiming_failed_record_completion() {
-        let directory = tempfile::tempdir().unwrap();
-        let read_only = std::fs::File::open(directory.path()).unwrap();
-        let mut file = tokio::fs::File::from_std(read_only);
-        let progress = StorageProgress::new(1);
-
-        assert!(
-            !write_pending(
-                &mut file,
-                PendingRecord {
-                    record: raw(),
-                    durable_ack: None,
-                    queue_drop_guard: None,
-                },
-                &progress,
-            )
-            .await
-            .unwrap()
-        );
-        let error = write_pending(
-            &mut file,
-            PendingRecord {
-                record: raw(),
-                durable_ack: None,
-                queue_drop_guard: None,
-            },
-            &progress,
-        )
-        .await
-        .unwrap_err();
-
-        assert!(matches!(error, StorageError::Io(_)));
-        let snapshot = progress.snapshot();
-        assert_eq!(snapshot.records_written, 1);
-        assert_eq!(snapshot.durable_sync_completions, 0);
-        assert_eq!(snapshot.write_failures, 1);
-        assert_eq!(snapshot.sync_failures, 0);
-        assert!(snapshot.last_writer_progress_ns > 0);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn storage_progress_records_sync_failure_after_successful_write() {
-        let write_only = std::fs::OpenOptions::new()
-            .write(true)
-            .open("/dev/null")
-            .unwrap();
-        let mut file = tokio::fs::File::from_std(write_only);
-        let progress = StorageProgress::new(1);
-        let (durable_ack, ack) = oneshot::channel();
-
-        let error = write_pending(
-            &mut file,
-            PendingRecord {
-                record: raw(),
-                durable_ack: Some(durable_ack),
-                queue_drop_guard: None,
-            },
-            &progress,
-        )
-        .await
-        .unwrap_err();
-
-        assert!(matches!(error, StorageError::Io(_)));
-        assert!(ack.await.unwrap().is_err());
-        let snapshot = progress.snapshot();
-        assert_eq!(snapshot.records_written, 1);
-        assert_eq!(snapshot.durable_sync_completions, 0);
-        assert_eq!(snapshot.write_failures, 0);
-        assert_eq!(snapshot.sync_failures, 1);
-        assert!(snapshot.last_writer_progress_ns > 0);
     }
 
     #[tokio::test]

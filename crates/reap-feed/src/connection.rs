@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use reap_core::{Channel, ConnId, RawEnvelope, Venue};
+use reap_transport::{ShutdownReceiver, shutdown_requested};
 use reap_venue::{VenueAdapter, VenueError, okx::OkxAdapter};
 use serde::Deserialize;
 use thiserror::Error;
@@ -77,13 +78,7 @@ pub enum ConnectionError {
     UnsupportedVenue(Venue),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectionStatusKind {
-    Ready,
-    Heartbeat,
-    Disconnected,
-    Fatal,
-}
+pub use reap_transport::ConnectionStatusKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionStatus {
@@ -184,14 +179,14 @@ impl std::fmt::Debug for PrivateLoginBootstrap {
 
 async fn await_websocket_connection<F, T>(
     connection: F,
-    shutdown: &mut watch::Receiver<bool>,
+    shutdown: &mut ShutdownReceiver,
     recovery: &mut watch::Receiver<u64>,
     timeout: Duration,
 ) -> Result<T, ConnectionError>
 where
     F: Future<Output = Result<T, tokio_tungstenite::tungstenite::Error>>,
 {
-    if *shutdown.borrow() {
+    if shutdown_requested(shutdown) {
         return Err(ConnectionError::ShutdownRequested);
     }
     let deadline = tokio::time::sleep(timeout);
@@ -202,7 +197,7 @@ where
             result = &mut connection => return result.map_err(ConnectionError::from),
             _ = &mut deadline => return Err(ConnectionError::ConnectionTimeout),
             changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
+                if changed.is_err() || shutdown_requested(shutdown) {
                     return Err(ConnectionError::ShutdownRequested);
                 }
             }
@@ -278,7 +273,7 @@ pub(crate) async fn run_connection_once_with_readiness(
     prepared_subscription: PreparedSubscription,
     output: &mpsc::Sender<RawEnvelope>,
     status: &mpsc::Sender<ConnectionStatus>,
-    shutdown: &mut watch::Receiver<bool>,
+    shutdown: &mut ShutdownReceiver,
     recovery: &mut watch::Receiver<u64>,
 ) -> ConnectionRunOutcome {
     let mut reached_ready = false;
@@ -337,7 +332,7 @@ pub(crate) async fn run_connection_once_with_readiness(
                 "subscriptions acknowledged",
             ) => result?,
             changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
+                if changed.is_err() || shutdown_requested(shutdown) {
                     return Err(ConnectionError::ShutdownRequested);
                 }
             }
@@ -358,7 +353,7 @@ pub(crate) async fn run_connection_once_with_readiness(
                     send_message(&mut writer, Message::Text("ping".into()), "ping").await?;
                 }
                 changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
+                    if changed.is_err() || shutdown_requested(shutdown) {
                         let _ = send_message(&mut writer, Message::Close(None), "close").await;
                         return Ok(());
                     }
@@ -412,7 +407,7 @@ async fn await_subscriptions<S>(
     mut readiness: SubscriptionReadiness,
     plan: &SocketPlan,
     output: &mpsc::Sender<RawEnvelope>,
-    shutdown: &mut watch::Receiver<bool>,
+    shutdown: &mut ShutdownReceiver,
     recovery: &mut watch::Receiver<u64>,
 ) -> Result<(), ConnectionError>
 where
@@ -427,7 +422,7 @@ where
         tokio::select! {
             _ = &mut deadline => return Err(ConnectionError::SubscriptionTimeout),
             changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
+                if changed.is_err() || shutdown_requested(shutdown) {
                     return Err(ConnectionError::ShutdownRequested);
                 }
             }
@@ -694,7 +689,7 @@ async fn send_status(
 async fn await_private_login<S>(
     writer: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>,
     reader: &mut futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<S>>,
-    shutdown: &mut watch::Receiver<bool>,
+    shutdown: &mut ShutdownReceiver,
     recovery: &mut watch::Receiver<u64>,
 ) -> Result<(), ConnectionError>
 where
@@ -706,7 +701,7 @@ where
         tokio::select! {
             _ = &mut deadline => return Err(ConnectionError::LoginTimeout),
             changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
+                if changed.is_err() || shutdown_requested(shutdown) {
                     return Err(ConnectionError::ShutdownRequested);
                 }
             }
@@ -894,7 +889,7 @@ mod tests {
 
     #[tokio::test]
     async fn connection_establishment_is_bounded_cancellable_and_rejects_closed_recovery() {
-        let (_shutdown_tx, mut shutdown) = watch::channel(false);
+        let (_shutdown_tx, mut shutdown) = reap_transport::shutdown_channel();
         let (_recovery_tx, mut recovery) = watch::channel(0_u64);
         let timeout = await_websocket_connection(
             std::future::pending::<Result<(), tokio_tungstenite::tungstenite::Error>>(),
@@ -906,7 +901,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(timeout, ConnectionError::ConnectionTimeout));
 
-        let (shutdown_tx, mut shutdown) = watch::channel(false);
+        let (shutdown_tx, mut shutdown) = reap_transport::shutdown_channel();
         let (_recovery_tx, mut recovery) = watch::channel(0_u64);
         let connecting = tokio::spawn(async move {
             await_websocket_connection(
@@ -918,7 +913,7 @@ mod tests {
             .await
         });
         tokio::task::yield_now().await;
-        shutdown_tx.send(true).unwrap();
+        assert!(reap_transport::request_shutdown(&shutdown_tx));
         let stopped = tokio::time::timeout(Duration::from_millis(100), connecting)
             .await
             .unwrap()
@@ -926,7 +921,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(stopped, ConnectionError::ShutdownRequested));
 
-        let (_shutdown_tx, mut shutdown) = watch::channel(false);
+        let (_shutdown_tx, mut shutdown) = reap_transport::shutdown_channel();
         let (recovery_tx, mut recovery) = watch::channel(0_u64);
         drop(recovery_tx);
         let closed = await_websocket_connection(
@@ -1134,7 +1129,7 @@ mod tests {
         let adapter = reap_venue::okx::OkxAdapter::new(&url, &url);
         let (output_tx, _output_rx) = mpsc::channel(8);
         let (status_tx, mut status_rx) = mpsc::channel(8);
-        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (shutdown_tx, mut shutdown_rx) = reap_transport::shutdown_channel();
         let (_recovery_tx, mut recovery_rx) = watch::channel(0_u64);
         let prepared_subscription = prepare_connection_subscription(&adapter, &plan).unwrap();
         let client = tokio::spawn(async move {
@@ -1165,7 +1160,7 @@ mod tests {
         assert_eq!(ready.kind, ConnectionStatusKind::Ready);
         assert_eq!(ready.reason, "subscriptions acknowledged");
 
-        shutdown_tx.send(true).unwrap();
+        assert!(reap_transport::request_shutdown(&shutdown_tx));
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), client)
             .await
             .unwrap()

@@ -1,0 +1,23 @@
+error[E0599]: no method named `place` found for struct `PmPublicRole` in the current scope
+ --> tests/ui/public_role_has_no_mutation.rs:4:10
+  |
+4 |     role.place();
+  |          ^^^^^ method not found in `PmPublicRole`
+
+error[E0599]: no method named `cancel_owned` found for struct `PmPublicRole` in the current scope
+ --> tests/ui/public_role_has_no_mutation.rs:5:10
+  |
+5 |     role.cancel_owned();
+  |          ^^^^^^^^^^^^
+  |
+help: there is a method `to_owned` with a similar name
+  |
+5 -     role.cancel_owned();
+5 +     role.to_owned();
+  |
+
+error[E0599]: no method named `execution` found for struct `PmPublicRole` in the current scope
+ --> tests/ui/public_role_has_no_mutation.rs:6:18
+  |
+6 |     let _ = role.execution();
+  |                  ^^^^^^^^^ method not found in `PmPublicRole`

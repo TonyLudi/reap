@@ -3,6 +3,7 @@ use reap_core::{
     FundingSettlement, Level, MarginSnapshot, MarketEvent, NormalizedEvent, Position,
     PositionMarginMode, RawEnvelope, SequencedBookUpdate, Side, Subscription, Venue,
 };
+use reap_okx_public_source::extract_legacy_index_ticker_fields;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -202,12 +203,16 @@ impl OkxAdapter {
             .map(|value| {
                 let data: OkxIndexTicker = serde_json::from_value(value)
                     .map_err(|error| Self::invalid(error.to_string()))?;
-                let symbol = data
-                    .inst_id
-                    .or_else(|| arg.inst_id.clone())
-                    .or_else(|| envelope.symbol.clone())
-                    .ok_or_else(|| Self::invalid("index-tickers message has no instId"))?;
-                let ts_ms = parse_u64("ts", &data.ts)?;
+                let fields = extract_legacy_index_ticker_fields(
+                    data.inst_id,
+                    arg.inst_id.as_deref(),
+                    envelope.symbol.as_deref(),
+                    data.index_price,
+                    &data.ts,
+                )
+                .map_err(|error| Self::invalid(error.to_string()))?;
+                let symbol = fields.instrument().to_string();
+                let ts_ms = fields.venue_ts_ms();
                 Ok(normalized_market_event(
                     envelope,
                     arg,
@@ -216,7 +221,7 @@ impl OkxAdapter {
                     MarketEvent::IndexPrice {
                         ts_ms,
                         symbol,
-                        price: parse_f64("idxPx", &data.index_price)?,
+                        price: parse_f64("idxPx", fields.index_price_lexeme())?,
                     },
                 ))
             })

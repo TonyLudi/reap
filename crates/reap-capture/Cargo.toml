@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 reap-book.workspace = true
+reap-capture-framing = { workspace = true, features = ["legacy-reap-capture"] }
 reap-core.workspace = true
 reap-feed.workspace = true
 reap-telemetry.workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "reap-okx-public-source"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+reap-core.workspace = true
+reap-transport.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

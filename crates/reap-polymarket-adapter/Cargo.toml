@@ -1,0 +1,11 @@
+[package]
+name = "reap-polymarket-adapter"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+reap-pm-core.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+trybuild.workspace = true

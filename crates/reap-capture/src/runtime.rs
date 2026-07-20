@@ -1109,6 +1109,8 @@ mod tests {
                     records: 1,
                     bytes: 1,
                     max_queue_depth: 1,
+                    max_queue_bytes: None,
+                    max_reserved_bytes: None,
                     sha256: "0".repeat(64),
                 },
                 normalized: JsonlWriterStats::default(),

@@ -1,0 +1,16 @@
+[package]
+name = "reap-pm-live"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+reap-pm-core.workspace = true
+reap-pm-live-contracts.workspace = true
+reap-pm-strategy.workspace = true
+reap-polymarket-adapter.workspace = true
+reap-transport.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+trybuild.workspace = true

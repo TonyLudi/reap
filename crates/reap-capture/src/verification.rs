@@ -1,16 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+use reap_capture_framing::{JsonlVerifyError, VerifyIoOperation};
 use reap_core::{NormalizedEvent, PINNED_JAVA_REVISION};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::cleanliness::{CaptureCleanRunInputs, capture_run_is_clean};
 use crate::error::MAX_CAPTURE_FAILURE_MESSAGE_BYTES;
-use crate::hashing::{digest_hex, sha256_hex};
+use crate::hashing::sha256_hex;
 use crate::{
     CAPTURE_RUN_REPORT_FORMAT_VERSION, CaptureAnalysisBookHealth, CaptureAnalysisReport,
     CaptureConfig, CaptureError, CaptureRunReport, CaptureStopReason, MAX_CAPTURE_CONFIG_BYTES,
@@ -764,71 +763,32 @@ struct NormalizedScan {
 }
 
 fn scan_normalized_jsonl(path: &Path) -> Result<NormalizedScan, CaptureVerificationError> {
-    let source_path = canonical_regular_file(path, "normalized capture")?;
-    let file = File::open(&source_path).map_err(|source| CaptureVerificationError::ReadInput {
-        label: "normalized capture",
-        path: source_path.clone(),
-        source,
-    })?;
-    let initial_bytes = file
-        .metadata()
-        .map_err(|source| CaptureVerificationError::ReadInput {
-            label: "normalized capture metadata",
-            path: source_path.clone(),
-            source,
-        })?
-        .len();
-    let mut reader = BufReader::new(file);
-    let mut buffer = Vec::new();
-    let mut hasher = Sha256::new();
-    let mut records = 0_u64;
-    let mut bytes = 0_u64;
-    let mut invalid_records = 0_u64;
-    let mut first_error = None;
-
-    loop {
-        buffer.clear();
-        let read = reader.read_until(b'\n', &mut buffer).map_err(|source| {
-            CaptureVerificationError::ReadInput {
-                label: "normalized capture",
-                path: source_path.clone(),
-                source,
-            }
-        })?;
-        if read == 0 {
-            break;
-        }
-        records = records.saturating_add(1);
-        bytes = bytes.saturating_add(read as u64);
-        hasher.update(&buffer);
-        let canonical = serde_json::from_slice::<NormalizedEvent>(trim_newline(&buffer))
+    // This compatibility verifier predates a configurable normalized-record
+    // ceiling. Preserve its exact accepted input set; new capture paths use
+    // `scan_jsonl_file_bounded`.
+    let scan = reap_capture_framing::scan_jsonl_file_legacy_unbounded(path, |frame| {
+        serde_json::from_slice::<NormalizedEvent>(reap_capture_framing::jsonl_payload(frame))
             .ok()
             .and_then(|event| {
-                let mut encoded = serde_json::to_vec(&event).ok()?;
-                encoded.push(b'\n');
-                Some(encoded == buffer)
+                reap_capture_framing::encode_jsonl_frame_legacy_unbounded(&event)
+                    .ok()
+                    .map(|encoded| encoded == frame)
             })
-            .unwrap_or(false);
-        if !canonical {
-            invalid_records = invalid_records.saturating_add(1);
-            if first_error.is_none() {
-                first_error = Some(format!("line {records} is not canonical normalized JSONL"));
-            }
-        }
-    }
-    Ok(NormalizedScan {
-        source_path,
-        records,
-        bytes,
-        sha256: digest_hex(hasher.finalize()),
-        invalid_records,
-        first_error,
-        stable_while_reading: bytes == initial_bytes,
+            .unwrap_or(false)
     })
-}
-
-fn trim_newline(bytes: &[u8]) -> &[u8] {
-    bytes.strip_suffix(b"\n").unwrap_or(bytes)
+    .map_err(|error| map_verify_error("normalized capture", error))?;
+    let first_error = scan
+        .first_invalid_record
+        .map(|line| format!("line {line} is not canonical normalized JSONL"));
+    Ok(NormalizedScan {
+        source_path: scan.source_path,
+        records: scan.records,
+        bytes: scan.bytes,
+        sha256: scan.sha256,
+        invalid_records: scan.invalid_records,
+        first_error,
+        stable_while_reading: scan.stable_while_reading,
+    })
 }
 
 fn read_bounded_regular_file(
@@ -836,61 +796,71 @@ fn read_bounded_regular_file(
     label: &'static str,
     limit: u64,
 ) -> Result<(PathBuf, Vec<u8>), CaptureVerificationError> {
-    let canonical = canonical_regular_file(path, label)?;
-    let metadata =
-        std::fs::metadata(&canonical).map_err(|source| CaptureVerificationError::ReadInput {
-            label,
-            path: canonical.clone(),
-            source,
-        })?;
-    if metadata.len() > limit {
-        return Err(CaptureVerificationError::InputTooLarge {
-            label,
-            path: canonical,
-            actual: metadata.len(),
-            limit,
-        });
-    }
-    let bytes =
-        std::fs::read(&canonical).map_err(|source| CaptureVerificationError::ReadInput {
-            label,
-            path: canonical.clone(),
-            source,
-        })?;
-    if bytes.len() as u64 > limit {
-        return Err(CaptureVerificationError::InputTooLarge {
-            label,
-            path: canonical,
-            actual: bytes.len() as u64,
-            limit,
-        });
-    }
-    Ok((canonical, bytes))
+    reap_capture_framing::read_bounded_regular_file(path, limit)
+        .map_err(|error| map_verify_error(label, error))
 }
 
 fn canonical_regular_file(
     path: &Path,
     label: &'static str,
 ) -> Result<PathBuf, CaptureVerificationError> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
-        CaptureVerificationError::InvalidInputPath {
-            label,
-            path: path.to_path_buf(),
-            message: error.to_string(),
+    reap_capture_framing::canonical_regular_file(path)
+        .map_err(|error| map_verify_error(label, error))
+}
+
+fn map_verify_error(label: &'static str, error: JsonlVerifyError) -> CaptureVerificationError {
+    match error {
+        JsonlVerifyError::InvalidInputPath { path, message } => {
+            CaptureVerificationError::InvalidInputPath {
+                label,
+                path,
+                message,
+            }
         }
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(CaptureVerificationError::InvalidInputPath {
+        JsonlVerifyError::InputTooLarge {
+            path,
+            actual,
+            limit,
+        } => CaptureVerificationError::InputTooLarge {
             label,
-            path: path.to_path_buf(),
-            message: "must be a regular file and not a symbolic link".to_string(),
-        });
+            path,
+            actual,
+            limit,
+        },
+        JsonlVerifyError::InvalidFrameLimit { path } => {
+            CaptureVerificationError::InvalidInputPath {
+                label,
+                path,
+                message: "JSONL frame limit must be positive".to_string(),
+            }
+        }
+        JsonlVerifyError::FrameTooLarge {
+            path,
+            observed_at_least,
+            limit,
+            ..
+        } => CaptureVerificationError::InputTooLarge {
+            label,
+            path,
+            actual: observed_at_least as u64,
+            limit: limit as u64,
+        },
+        JsonlVerifyError::ReadInput {
+            path,
+            operation,
+            source,
+        } => CaptureVerificationError::ReadInput {
+            label: if matches!(operation, VerifyIoOperation::InspectMetadata)
+                && label == "normalized capture"
+            {
+                "normalized capture metadata"
+            } else {
+                label
+            },
+            path,
+            source,
+        },
     }
-    std::fs::canonicalize(path).map_err(|error| CaptureVerificationError::InvalidInputPath {
-        label,
-        path: path.to_path_buf(),
-        message: error.to_string(),
-    })
 }
 
 fn is_sha256(value: &str) -> bool {

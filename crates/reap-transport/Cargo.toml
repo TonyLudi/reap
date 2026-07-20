@@ -1,0 +1,13 @@
+[package]
+name = "reap-transport"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+libc.workspace = true
+reap-core.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

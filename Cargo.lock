@@ -1038,6 +1038,7 @@ name = "reap-capture"
 version = "0.1.0"
 dependencies = [
  "reap-book",
+ "reap-capture-framing",
  "reap-core",
  "reap-feed",
  "reap-telemetry",
@@ -1052,6 +1053,18 @@ dependencies = [
  "toml 0.9.12+spec-1.1.0",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "reap-capture-framing"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -1087,6 +1100,17 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "reap-durable-writer"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -1172,9 +1196,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures-util",
- "libc",
  "reap-book",
  "reap-core",
+ "reap-transport",
  "reap-venue",
  "serde",
  "serde_json",
@@ -1289,6 +1313,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "reap-okx-public-source"
+version = "0.1.0"
+dependencies = [
+ "reap-core",
+ "reap-transport",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "reap-okx-wire"
 version = "0.1.0"
 dependencies = [
@@ -1335,6 +1370,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "reap-pm-live"
+version = "0.1.0"
+dependencies = [
+ "reap-pm-core",
+ "reap-pm-live-contracts",
+ "reap-pm-strategy",
+ "reap-polymarket-adapter",
+ "reap-transport",
+ "serde_json",
+ "thiserror",
+ "trybuild",
+]
+
+[[package]]
+name = "reap-pm-live-contracts"
+version = "0.1.0"
+dependencies = [
+ "reap-pm-core",
+ "reap-pm-strategy",
+ "thiserror",
+ "trybuild",
+]
+
+[[package]]
+name = "reap-pm-strategy"
+version = "0.1.0"
+dependencies = [
+ "reap-pm-core",
+]
+
+[[package]]
+name = "reap-polymarket-adapter"
+version = "0.1.0"
+dependencies = [
+ "reap-pm-core",
+ "thiserror",
+ "trybuild",
+]
+
+[[package]]
 name = "reap-risk"
 version = "0.1.0"
 dependencies = [
@@ -1347,6 +1422,7 @@ name = "reap-storage"
 version = "0.1.0"
 dependencies = [
  "reap-core",
+ "reap-durable-writer",
  "serde",
  "serde_json",
  "tempfile",
@@ -1380,10 +1456,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "reap-transport"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "reap-core",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "reap-venue"
 version = "0.1.0"
 dependencies = [
  "reap-core",
+ "reap-okx-public-source",
  "serde",
  "serde_json",
  "thiserror",

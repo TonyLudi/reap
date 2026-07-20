@@ -2,7 +2,7 @@ use reap_core::Venue;
 use reap_pm_core::{
     ConnectionEpoch, EnvelopeError, EventClock, EventEnvelope, EventOrdering, IngressSequence,
     OkxReferenceHandle, PmAccountHandle, PmConnectionId, PmProductSource, PmSourceBound,
-    PmSourceHandle, PmTokenHandle, SnapshotRevision, VenueEventHash,
+    PmSourceHandle, PmTokenHandle, ReceivedEventClock, SnapshotRevision, VenueEventHash,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -205,6 +205,25 @@ fn clocks_reject_zero_and_backwards_ordering() {
         Err(EnvelopeError::ServiceBeforeReceive)
     );
     assert!(EventClock::new(None, 2, 3, 3).is_ok());
+}
+
+#[test]
+fn ingress_clock_cannot_claim_service_time_before_dequeue() {
+    let received = ReceivedEventClock::new(Some(10), 20, 30).unwrap();
+    assert_eq!(received.venue_event_timestamp_ns(), Some(10));
+    assert_eq!(received.local_wall_receive_ns(), 20);
+    assert_eq!(received.monotonic_receive_ns(), 30);
+    assert_eq!(
+        received.service_at(29),
+        Err(EnvelopeError::ServiceBeforeReceive)
+    );
+    assert_eq!(
+        received.service_at(0),
+        Err(EnvelopeError::ZeroMonotonicServiceTimestamp)
+    );
+    let serviced = received.service_at(45).unwrap();
+    assert_eq!(serviced.monotonic_service_ns(), 45);
+    assert_eq!(serviced.queue_age_ns(), 15);
 }
 
 #[test]

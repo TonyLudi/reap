@@ -1,0 +1,11 @@
+error[E0599]: no method named `set_order_type` found for struct `PmFakeExecutionProfile` in the current scope
+ --> tests/ui/fake_profile_cannot_select_order_features.rs:5:13
+  |
+5 |     profile.set_order_type("market");
+  |             ^^^^^^^^^^^^^^ method not found in `PmFakeExecutionProfile`
+
+error[E0599]: no method named `enable_cancel_all` found for struct `PmFakeExecutionProfile` in the current scope
+ --> tests/ui/fake_profile_cannot_select_order_features.rs:6:13
+  |
+6 |     profile.enable_cancel_all();
+  |             ^^^^^^^^^^^^^^^^^ method not found in `PmFakeExecutionProfile`

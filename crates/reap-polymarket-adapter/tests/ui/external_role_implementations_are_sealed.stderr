@@ -1,0 +1,24 @@
+error[E0277]: the trait bound `ForgedPublicRole: reap_polymarket_adapter::public::sealed::Sealed` is not satisfied
+ --> tests/ui/external_role_implementations_are_sealed.rs:8:34
+  |
+8 | impl PmPublicObservationRole for ForgedPublicRole {
+  |                                  ^^^^^^^^^^^^^^^^ unsatisfied trait bound
+  |
+help: the trait `reap_polymarket_adapter::public::sealed::Sealed` is not implemented for `ForgedPublicRole`
+ --> tests/ui/external_role_implementations_are_sealed.rs:6:1
+  |
+6 | struct ForgedPublicRole;
+  | ^^^^^^^^^^^^^^^^^^^^^^^
+help: the trait `reap_polymarket_adapter::public::sealed::Sealed` is implemented for `PmPublicRole`
+ --> src/public.rs
+  |
+  | impl sealed::Sealed for PmPublicRole {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `PmPublicObservationRole`
+ --> src/public.rs
+  |
+  | pub trait PmPublicObservationRole: sealed::Sealed {
+  |                                    ^^^^^^^^^^^^^^ required by this bound in `PmPublicObservationRole`
+  = note: `PmPublicObservationRole` is a "sealed trait", because to implement it you also need to implement `reap_polymarket_adapter::public::sealed::Sealed`, which is not accessible; this is usually done to force you to use one of the provided types that already implement it
+  = help: the following type implements the trait:
+            reap_polymarket_adapter::PmPublicRole

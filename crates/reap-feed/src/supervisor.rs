@@ -1,20 +1,25 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
-
-#[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(test)]
+use std::fs::OpenOptions;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 use reap_core::{ConnId, RawEnvelope, Symbol, Venue};
+use reap_transport::{
+    ConnectionAttemptPacer as TransportConnectionAttemptPacer, ShutdownReceiver, ShutdownSender,
+    SupervisorState, request_shutdown as signal_shutdown, shutdown_channel, shutdown_requested,
+    supervision_channels,
+};
+pub use reap_transport::{ConnectionAttemptPacerError, ReconnectPolicy};
 use reap_venue::VenueAdapter;
 pub use reap_venue::okx::{
     DEFAULT_OKX_CONNECTION_ATTEMPT_PACER_PATH, OKX_MIN_CONNECTION_ATTEMPT_INTERVAL_MS,
 };
 use thiserror::Error;
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -28,89 +33,22 @@ type RecoveryRoute = (ConnId, watch::Sender<u64>);
 type RecoveryRoutes = HashMap<RecoveryStreamKey, Vec<RecoveryRoute>>;
 
 const SHARED_PACER_STATE_MAGIC: &str = "reap-okx-connect-pacer-v1";
-const MAX_SHARED_PACER_STATE_BYTES: u64 = 128;
-const SHARED_PACER_TIMESTAMP_WIDTH: usize = 39;
+#[cfg(test)]
 const MAX_SHARED_RESERVATION_AHEAD: Duration = Duration::from_secs(15 * 60);
+#[cfg(test)]
 const MAX_SHARED_PACER_LOCK_WAIT: Duration = Duration::from_secs(1);
-const SHARED_PACER_LOCK_RETRY: Duration = Duration::from_millis(5);
-
-#[derive(Debug, Clone)]
-pub struct ReconnectPolicy {
-    pub initial_delay: Duration,
-    pub max_delay: Duration,
-    pub multiplier: u32,
-}
 
 /// Pacing for connection handshakes across independent feed groups and, when
 /// configured, every Reap process using the same state file.
 #[derive(Debug, Clone)]
 pub struct ConnectionAttemptPacer {
-    interval: Duration,
-    state: Arc<Mutex<ConnectionAttemptPacerState>>,
-    shared: Option<Arc<SharedConnectionAttemptPacer>>,
-}
-
-#[derive(Debug, Default)]
-struct ConnectionAttemptPacerState {
-    next_attempt: Option<Instant>,
-}
-
-#[derive(Debug)]
-struct SharedConnectionAttemptPacer {
-    path: PathBuf,
-    file: File,
-    local_lock: StdMutex<()>,
-    clock_id: String,
-}
-
-#[derive(Debug)]
-struct SharedPacerState {
-    clock_id: String,
-    next_attempt_ns: u128,
-}
-
-#[derive(Debug, Error)]
-pub enum ConnectionAttemptPacerError {
-    #[error("failed to {operation} process-shared connection pacer {path}: {source}")]
-    Io {
-        operation: &'static str,
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("unsafe process-shared connection pacer {path}: {reason}")]
-    UnsafeFile { path: PathBuf, reason: String },
-    #[error("invalid process-shared connection pacer state in {path}: {reason}")]
-    InvalidState { path: PathBuf, reason: String },
-    #[error("process-shared connection pacer clock failed: {0}")]
-    Clock(String),
-    #[error("process-shared connection pacing requires Linux CLOCK_BOOTTIME")]
-    UnsupportedPlatform,
-    #[error(
-        "process-shared connection pacer {path} reserved {ahead_ms}ms ahead; maximum is {maximum_ms}ms"
-    )]
-    ReservationTooFar {
-        path: PathBuf,
-        ahead_ms: u128,
-        maximum_ms: u128,
-    },
-    #[error("process-shared connection pacer lock is poisoned")]
-    LockPoisoned,
-    #[error("process-shared connection pacer {path} lock remained busy for {maximum_wait_ms}ms")]
-    LockTimeout {
-        path: PathBuf,
-        maximum_wait_ms: u128,
-    },
-    #[error("process-shared connection pacer task failed: {0}")]
-    Task(String),
+    inner: TransportConnectionAttemptPacer,
 }
 
 impl ConnectionAttemptPacer {
     pub fn new(interval: Duration) -> Self {
         Self {
-            interval,
-            state: Arc::new(Mutex::new(ConnectionAttemptPacerState::default())),
-            shared: None,
+            inner: TransportConnectionAttemptPacer::new(interval),
         }
     }
 
@@ -118,428 +56,57 @@ impl ConnectionAttemptPacer {
         interval: Duration,
         path: impl AsRef<Path>,
     ) -> Result<Self, ConnectionAttemptPacerError> {
-        ensure_process_shared_pacing_supported()?;
         Ok(Self {
-            interval,
-            state: Arc::new(Mutex::new(ConnectionAttemptPacerState::default())),
-            shared: Some(Arc::new(SharedConnectionAttemptPacer::open(path.as_ref())?)),
+            inner: TransportConnectionAttemptPacer::process_shared(
+                interval,
+                path,
+                SHARED_PACER_STATE_MAGIC,
+            )?,
         })
     }
 
     pub fn interval(&self) -> Duration {
-        self.interval
+        self.inner.interval()
     }
 
     pub fn is_process_shared(&self) -> bool {
-        self.shared.is_some()
+        self.inner.is_process_shared()
     }
 
     pub async fn wait_for_turn(
         &self,
         shutdown: &mut watch::Receiver<bool>,
     ) -> Result<bool, ConnectionAttemptPacerError> {
-        if self.interval.is_zero() {
-            return Ok(!*shutdown.borrow());
+        let (shutdown_sender, mut monotonic_shutdown) = shutdown_channel();
+        if legacy_shutdown_requested(shutdown) {
+            let _ = signal_shutdown(&shutdown_sender);
         }
-        if *shutdown.borrow() {
-            return Ok(false);
-        }
-        if let Some(shared) = &self.shared {
-            let shared = Arc::clone(shared);
-            let interval = self.interval;
-            let delay = tokio::task::spawn_blocking(move || shared.reserve(interval))
-                .await
-                .map_err(|error| ConnectionAttemptPacerError::Task(error.to_string()))??;
-            if !delay.is_zero() {
-                tokio::select! {
-                    _ = tokio::time::sleep(delay) => {}
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() {
-                            return Ok(false);
-                        }
-                    }
-                }
-            }
-            return Ok(!*shutdown.borrow());
-        }
-        'wait: loop {
-            let mut state = tokio::select! {
-                state = self.state.lock() => state,
+        let wait = self.inner.wait_for_turn(&mut monotonic_shutdown);
+        tokio::pin!(wait);
+        loop {
+            tokio::select! {
+                biased;
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
-                        return Ok(false);
-                    }
-                    continue 'wait;
-                }
-            };
-            if *shutdown.borrow() {
-                return Ok(false);
-            }
-            let delay = state.delay_at(Instant::now());
-            if !delay.is_zero() {
-                tokio::select! {
-                    _ = tokio::time::sleep(delay) => {}
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() {
-                            return Ok(false);
-                        }
-                        continue 'wait;
+                        let _ = signal_shutdown(&shutdown_sender);
+                        return (&mut wait).await;
                     }
                 }
+                result = &mut wait => return result,
             }
-            if *shutdown.borrow() {
-                return Ok(false);
-            }
-            state.record_attempt_at(Instant::now(), self.interval);
-            return Ok(true);
         }
     }
-}
 
-impl SharedConnectionAttemptPacer {
-    fn open(path: &Path) -> Result<Self, ConnectionAttemptPacerError> {
-        if path.as_os_str().is_empty() {
-            return Err(ConnectionAttemptPacerError::UnsafeFile {
-                path: path.to_path_buf(),
-                reason: "path must not be empty".to_string(),
-            });
-        }
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
-        #[cfg(unix)]
-        options
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-        let file = options
-            .open(path)
-            .map_err(|source| ConnectionAttemptPacerError::Io {
-                operation: "open",
-                path: path.to_path_buf(),
-                source,
-            })?;
-        let metadata = file
-            .metadata()
-            .map_err(|source| ConnectionAttemptPacerError::Io {
-                operation: "inspect",
-                path: path.to_path_buf(),
-                source,
-            })?;
-        if !metadata.file_type().is_file() {
-            return Err(ConnectionAttemptPacerError::UnsafeFile {
-                path: path.to_path_buf(),
-                reason: "path is not a regular file".to_string(),
-            });
-        }
-        #[cfg(unix)]
-        {
-            let effective_uid = unsafe { libc::geteuid() };
-            if metadata.uid() != effective_uid {
-                return Err(ConnectionAttemptPacerError::UnsafeFile {
-                    path: path.to_path_buf(),
-                    reason: format!(
-                        "file owner uid {} differs from effective uid {effective_uid}",
-                        metadata.uid()
-                    ),
-                });
-            }
-            if metadata.nlink() != 1 {
-                return Err(ConnectionAttemptPacerError::UnsafeFile {
-                    path: path.to_path_buf(),
-                    reason: format!("file has {} hard links; expected one", metadata.nlink()),
-                });
-            }
-            let mode = metadata.mode() & 0o777;
-            if mode & 0o077 != 0 {
-                return Err(ConnectionAttemptPacerError::UnsafeFile {
-                    path: path.to_path_buf(),
-                    reason: format!("file mode {mode:03o} permits group or other access"),
-                });
-            }
-        }
-        let shared = Self {
-            path: path.to_path_buf(),
-            file,
-            local_lock: StdMutex::new(()),
-            clock_id: shared_clock_identity()?,
-        };
-        shared.with_locked(|file| {
-            shared.read_next_attempt_ns(file)?;
-            Ok(())
-        })?;
-        Ok(shared)
-    }
-
-    fn reserve(&self, interval: Duration) -> Result<Duration, ConnectionAttemptPacerError> {
-        self.with_locked(|file| {
-            let now_ns = shared_clock_ns()?;
-            let next_ns = self
-                .read_next_attempt_ns(file)?
-                .filter(|state| state.clock_id == self.clock_id)
-                .map(|state| state.next_attempt_ns)
-                .unwrap_or(now_ns);
-            let reserved_ns = next_ns.max(now_ns);
-            let ahead_ns = reserved_ns.saturating_sub(now_ns);
-            if ahead_ns > MAX_SHARED_RESERVATION_AHEAD.as_nanos() {
-                return Err(ConnectionAttemptPacerError::ReservationTooFar {
-                    path: self.path.clone(),
-                    ahead_ms: ahead_ns / 1_000_000,
-                    maximum_ms: MAX_SHARED_RESERVATION_AHEAD.as_millis(),
-                });
-            }
-            let following_ns = reserved_ns
-                .checked_add(interval.as_nanos())
-                .ok_or_else(|| ConnectionAttemptPacerError::InvalidState {
-                    path: self.path.clone(),
-                    reason: "next reservation timestamp overflowed".to_string(),
-                })?;
-            self.write_next_attempt_ns(file, following_ns)?;
-            let ahead_ns =
-                u64::try_from(ahead_ns).map_err(|_| ConnectionAttemptPacerError::InvalidState {
-                    path: self.path.clone(),
-                    reason: "reservation delay does not fit Duration".to_string(),
-                })?;
-            Ok(Duration::from_nanos(ahead_ns))
-        })
-    }
-
-    fn with_locked<T>(
+    async fn wait_for_turn_monotonic(
         &self,
-        operation: impl FnOnce(&File) -> Result<T, ConnectionAttemptPacerError>,
-    ) -> Result<T, ConnectionAttemptPacerError> {
-        let _local = self
-            .local_lock
-            .lock()
-            .map_err(|_| ConnectionAttemptPacerError::LockPoisoned)?;
-        let lock_started = Instant::now();
-        loop {
-            match self.file.try_lock() {
-                Ok(()) => break,
-                Err(std::fs::TryLockError::WouldBlock)
-                    if lock_started.elapsed() < MAX_SHARED_PACER_LOCK_WAIT =>
-                {
-                    std::thread::sleep(SHARED_PACER_LOCK_RETRY);
-                }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    return Err(ConnectionAttemptPacerError::LockTimeout {
-                        path: self.path.clone(),
-                        maximum_wait_ms: MAX_SHARED_PACER_LOCK_WAIT.as_millis(),
-                    });
-                }
-                Err(std::fs::TryLockError::Error(source)) => {
-                    return Err(ConnectionAttemptPacerError::Io {
-                        operation: "lock",
-                        path: self.path.clone(),
-                        source,
-                    });
-                }
-            }
-        }
-        let result = operation(&self.file);
-        let unlock = self
-            .file
-            .unlock()
-            .map_err(|source| ConnectionAttemptPacerError::Io {
-                operation: "unlock",
-                path: self.path.clone(),
-                source,
-            });
-        match (result, unlock) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
-        }
-    }
-
-    fn read_next_attempt_ns(
-        &self,
-        file: &File,
-    ) -> Result<Option<SharedPacerState>, ConnectionAttemptPacerError> {
-        let mut handle = file;
-        handle
-            .seek(SeekFrom::Start(0))
-            .map_err(|source| ConnectionAttemptPacerError::Io {
-                operation: "seek",
-                path: self.path.clone(),
-                source,
-            })?;
-        let mut bytes = Vec::new();
-        handle
-            .take(MAX_SHARED_PACER_STATE_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|source| ConnectionAttemptPacerError::Io {
-                operation: "read",
-                path: self.path.clone(),
-                source,
-            })?;
-        if bytes.len() as u64 > MAX_SHARED_PACER_STATE_BYTES {
-            return Err(ConnectionAttemptPacerError::InvalidState {
-                path: self.path.clone(),
-                reason: format!("state exceeds {MAX_SHARED_PACER_STATE_BYTES} bytes"),
-            });
-        }
-        if bytes.is_empty() {
-            return Ok(None);
-        }
-        let text = std::str::from_utf8(&bytes).map_err(|error| {
-            ConnectionAttemptPacerError::InvalidState {
-                path: self.path.clone(),
-                reason: format!("state is not UTF-8: {error}"),
-            }
-        })?;
-        let mut fields = text.split_whitespace();
-        if fields.next() != Some(SHARED_PACER_STATE_MAGIC) {
-            return Err(ConnectionAttemptPacerError::InvalidState {
-                path: self.path.clone(),
-                reason: "state magic does not match".to_string(),
-            });
-        }
-        let clock_id = fields
-            .next()
-            .ok_or_else(|| ConnectionAttemptPacerError::InvalidState {
-                path: self.path.clone(),
-                reason: "clock identity is missing".to_string(),
-            })?;
-        if !valid_clock_identity(clock_id) {
-            return Err(ConnectionAttemptPacerError::InvalidState {
-                path: self.path.clone(),
-                reason: "clock identity is invalid".to_string(),
-            });
-        }
-        let timestamp_text =
-            fields
-                .next()
-                .ok_or_else(|| ConnectionAttemptPacerError::InvalidState {
-                    path: self.path.clone(),
-                    reason: "next-attempt timestamp is missing".to_string(),
-                })?;
-        if timestamp_text.len() != SHARED_PACER_TIMESTAMP_WIDTH
-            || !timestamp_text.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            return Err(ConnectionAttemptPacerError::InvalidState {
-                path: self.path.clone(),
-                reason: format!(
-                    "next-attempt timestamp must contain exactly {SHARED_PACER_TIMESTAMP_WIDTH} decimal digits"
-                ),
-            });
-        }
-        let timestamp = timestamp_text.parse::<u128>().map_err(|error| {
-            ConnectionAttemptPacerError::InvalidState {
-                path: self.path.clone(),
-                reason: format!("next-attempt timestamp is invalid: {error}"),
-            }
-        })?;
-        if fields.next().is_some() {
-            return Err(ConnectionAttemptPacerError::InvalidState {
-                path: self.path.clone(),
-                reason: "state has trailing fields".to_string(),
-            });
-        }
-        Ok(Some(SharedPacerState {
-            clock_id: clock_id.to_string(),
-            next_attempt_ns: timestamp,
-        }))
-    }
-
-    fn write_next_attempt_ns(
-        &self,
-        file: &File,
-        next_ns: u128,
-    ) -> Result<(), ConnectionAttemptPacerError> {
-        let payload = format!(
-            "{SHARED_PACER_STATE_MAGIC} {} {next_ns:0SHARED_PACER_TIMESTAMP_WIDTH$}\n",
-            self.clock_id
-        );
-        let mut handle = file;
-        handle
-            .seek(SeekFrom::Start(0))
-            .and_then(|_| handle.write_all(payload.as_bytes()))
-            .and_then(|_| handle.flush())
-            .and_then(|_| file.set_len(payload.len() as u64))
-            .map_err(|source| ConnectionAttemptPacerError::Io {
-                operation: "write",
-                path: self.path.clone(),
-                source,
-            })
+        shutdown: &mut ShutdownReceiver,
+    ) -> Result<bool, ConnectionAttemptPacerError> {
+        self.inner.wait_for_turn(shutdown).await
     }
 }
 
-fn valid_clock_identity(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-}
-
-#[cfg(target_os = "linux")]
-fn ensure_process_shared_pacing_supported() -> Result<(), ConnectionAttemptPacerError> {
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn ensure_process_shared_pacing_supported() -> Result<(), ConnectionAttemptPacerError> {
-    Err(ConnectionAttemptPacerError::UnsupportedPlatform)
-}
-
-#[cfg(target_os = "linux")]
-fn shared_clock_identity() -> Result<String, ConnectionAttemptPacerError> {
-    let value = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .map_err(|error| ConnectionAttemptPacerError::Clock(error.to_string()))?;
-    let value = value.trim();
-    let valid = value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
-            }
-        });
-    if !valid {
-        return Err(ConnectionAttemptPacerError::Clock(
-            "Linux boot_id is not a canonical lowercase UUID".to_string(),
-        ));
-    }
-    Ok(value.to_string())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn shared_clock_identity() -> Result<String, ConnectionAttemptPacerError> {
-    Err(ConnectionAttemptPacerError::UnsupportedPlatform)
-}
-
-#[cfg(target_os = "linux")]
-fn shared_clock_ns() -> Result<u128, ConnectionAttemptPacerError> {
-    let mut timestamp = std::mem::MaybeUninit::<libc::timespec>::uninit();
-    let result = unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, timestamp.as_mut_ptr()) };
-    if result != 0 {
-        return Err(ConnectionAttemptPacerError::Clock(
-            std::io::Error::last_os_error().to_string(),
-        ));
-    }
-    let timestamp = unsafe { timestamp.assume_init() };
-    if timestamp.tv_sec < 0 || !(0..1_000_000_000).contains(&timestamp.tv_nsec) {
-        return Err(ConnectionAttemptPacerError::Clock(
-            "CLOCK_BOOTTIME returned an invalid timespec".to_string(),
-        ));
-    }
-    Ok((timestamp.tv_sec as u128) * 1_000_000_000 + timestamp.tv_nsec as u128)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn shared_clock_ns() -> Result<u128, ConnectionAttemptPacerError> {
-    Err(ConnectionAttemptPacerError::UnsupportedPlatform)
-}
-
-impl ConnectionAttemptPacerState {
-    fn delay_at(&self, now: Instant) -> Duration {
-        self.next_attempt
-            .map(|next| next.saturating_duration_since(now))
-            .unwrap_or_default()
-    }
-
-    fn record_attempt_at(&mut self, now: Instant, interval: Duration) {
-        self.next_attempt = Some(now.checked_add(interval).unwrap_or(now));
-    }
+fn legacy_shutdown_requested(shutdown: &watch::Receiver<bool>) -> bool {
+    shutdown.has_changed().is_err() || *shutdown.borrow()
 }
 
 type BootstrapGenerator =
@@ -603,53 +170,10 @@ pub fn no_bootstrap() -> BootstrapFactory {
     }
 }
 
-impl Default for ReconnectPolicy {
-    fn default() -> Self {
-        Self {
-            initial_delay: Duration::from_millis(250),
-            max_delay: Duration::from_secs(30),
-            multiplier: 2,
-        }
-    }
-}
-
-impl ReconnectPolicy {
-    pub fn next_delay(&self, current: Duration) -> Duration {
-        current
-            .saturating_mul(self.multiplier.max(1))
-            .min(self.max_delay)
-    }
-}
-
-struct ReconnectBackoff {
-    policy: ReconnectPolicy,
-    next_delay: Duration,
-}
-
-impl ReconnectBackoff {
-    fn new(policy: ReconnectPolicy) -> Self {
-        let next_delay = policy.initial_delay;
-        Self { policy, next_delay }
-    }
-
-    fn reset(&mut self) {
-        self.next_delay = self.policy.initial_delay;
-    }
-
-    fn after_failure(&mut self, reached_ready: bool) -> Duration {
-        if reached_ready {
-            self.reset();
-        }
-        let delay = self.next_delay;
-        self.next_delay = self.policy.next_delay(delay);
-        delay
-    }
-}
-
 pub struct SupervisedFeed {
     pub raw: mpsc::Receiver<RawEnvelope>,
     pub status: mpsc::Receiver<ConnectionStatus>,
-    shutdown: watch::Sender<bool>,
+    shutdown: ShutdownSender,
     recovery_routes: RecoveryRoutes,
     // Non-book plans have no entry in `recovery_routes`, but their receiver
     // still needs an owner for the entire supervised-feed lifetime.
@@ -659,12 +183,12 @@ pub struct SupervisedFeed {
 
 impl SupervisedFeed {
     pub fn take_raw(&mut self) -> mpsc::Receiver<RawEnvelope> {
-        let (_sender, replacement) = mpsc::channel(1);
+        let (_sender, replacement) = reap_transport::bounded_channel(1);
         std::mem::replace(&mut self.raw, replacement)
     }
 
     pub fn take_status(&mut self) -> mpsc::Receiver<ConnectionStatus> {
-        let (_sender, replacement) = mpsc::channel(1);
+        let (_sender, replacement) = reap_transport::bounded_channel(1);
         std::mem::replace(&mut self.status, replacement)
     }
 
@@ -692,7 +216,7 @@ impl SupervisedFeed {
     }
 
     pub fn request_shutdown(&self) {
-        let _ = self.shutdown.send(true);
+        let _ = signal_shutdown(&self.shutdown);
     }
 
     pub async fn shutdown(mut self) {
@@ -754,9 +278,14 @@ pub fn try_spawn_supervised_feed(
             });
         }
     }
-    let (raw_tx, raw_rx) = mpsc::channel(channel_capacity.max(1));
-    let (status_tx, status_rx) = mpsc::channel(channel_capacity.max(1));
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let reap_transport::SupervisionChannels {
+        output_sender: raw_tx,
+        output_receiver: raw_rx,
+        health_sender: status_tx,
+        health_receiver: status_rx,
+        shutdown_sender: shutdown_tx,
+        shutdown_receiver: shutdown_rx,
+    } = supervision_channels(channel_capacity);
     let mut tasks = Vec::new();
     let mut recovery_routes = RecoveryRoutes::new();
     let mut recovery_guards = Vec::new();
@@ -815,7 +344,7 @@ pub fn try_spawn_supervised_feed(
 struct ConnectionChannels {
     output: mpsc::Sender<RawEnvelope>,
     status: mpsc::Sender<ConnectionStatus>,
-    shutdown: watch::Receiver<bool>,
+    shutdown: ShutdownReceiver,
     recovery: watch::Receiver<u64>,
 }
 
@@ -843,15 +372,19 @@ async fn supervise_connection(
         mut shutdown,
         mut recovery,
     } = channels;
-    let mut backoff = ReconnectBackoff::new(reconnect);
+    let mut supervision = SupervisorState::new(reconnect);
     loop {
-        if *shutdown.borrow() {
+        if supervision.should_stop(&shutdown) {
             return;
         }
-        match connection_attempt_pacer.wait_for_turn(&mut shutdown).await {
+        match connection_attempt_pacer
+            .wait_for_turn_monotonic(&mut shutdown)
+            .await
+        {
             Ok(true) => {}
             Ok(false) => return,
             Err(error) => {
+                supervision.mark_fatal();
                 tracing::error!(conn_id = %plan.conn_id, %error, "feed connection pacer failed");
                 let _ = status
                     .send(ConnectionStatus {
@@ -885,6 +418,7 @@ async fn supervise_connection(
                     })
                     .await;
                 if fatal {
+                    supervision.mark_fatal();
                     tracing::error!(
                         conn_id = %plan.conn_id,
                         ?error,
@@ -892,7 +426,7 @@ async fn supervise_connection(
                     );
                     return;
                 }
-                let delay = backoff.after_failure(false);
+                let delay = supervision.after_failure(false);
                 tracing::warn!(
                     conn_id = %plan.conn_id,
                     ?error,
@@ -902,7 +436,7 @@ async fn supervise_connection(
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
                     changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() {
+                        if changed.is_err() || shutdown_requested(&shutdown) {
                             return;
                         }
                     }
@@ -914,6 +448,7 @@ async fn supervise_connection(
         let private_login = match bootstrap.generate(&plan, &websocket_url) {
             Ok(private_login) => private_login,
             Err(error) if is_fatal_connection_error(&error) => {
+                supervision.mark_fatal();
                 tracing::error!(
                     conn_id = %plan.conn_id,
                     ?error,
@@ -932,12 +467,12 @@ async fn supervise_connection(
                 return;
             }
             Err(error) => {
-                let delay = backoff.after_failure(false);
+                let delay = supervision.after_failure(false);
                 tracing::warn!(conn_id = %plan.conn_id, ?error, ?delay, "feed bootstrap generation failed");
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
                     changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() {
+                        if changed.is_err() || shutdown_requested(&shutdown) {
                             return;
                         }
                     }
@@ -958,7 +493,7 @@ async fn supervise_connection(
         .await;
         let reached_ready = outcome.reached_ready;
         let result = outcome.result;
-        if *shutdown.borrow() || matches!(result, Ok(())) {
+        if shutdown_requested(&shutdown) || matches!(result, Ok(())) {
             return;
         }
         let error = result.expect_err("non-success result must contain an error");
@@ -982,21 +517,22 @@ async fn supervise_connection(
                 }
             }
             changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
+                if changed.is_err() || shutdown_requested(&shutdown) {
                     return;
                 }
             }
         }
         if fatal {
+            supervision.mark_fatal();
             tracing::error!(conn_id = %plan.conn_id, ?error, "feed connection cannot recover");
             return;
         }
         if matches!(error, ConnectionError::RecoveryRequested) {
-            backoff.reset();
+            supervision.reset_for_recovery();
             tracing::info!(conn_id = %plan.conn_id, "feed connection restarting for snapshot recovery");
             continue;
         }
-        let delay = backoff.after_failure(reached_ready);
+        let delay = supervision.after_failure(reached_ready);
         tracing::warn!(conn_id = %plan.conn_id, ?error, ?delay, "feed connection restarting");
         if matches!(error, ConnectionError::OutputClosed) {
             return;
@@ -1004,7 +540,7 @@ async fn supervise_connection(
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
             changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
+                if changed.is_err() || shutdown_requested(&shutdown) {
                     return;
                 }
             }
@@ -1017,6 +553,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use reap_core::{Channel, FeedPriority, Subscription};
+    use reap_transport::ReconnectBackoff;
     use reap_venue::okx::OkxAdapter;
 
     use super::*;
@@ -1092,7 +629,7 @@ mod tests {
         };
         let (output, _output_rx) = mpsc::channel(1);
         let (status, mut status_rx) = mpsc::channel(1);
-        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let (_shutdown_tx, shutdown) = shutdown_channel();
         let (_recovery_tx, recovery) = watch::channel(0_u64);
 
         supervise_connection(
@@ -1186,7 +723,7 @@ mod tests {
         };
         let (output, _output_rx) = mpsc::channel(1);
         let (status, mut status_rx) = mpsc::channel(1);
-        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let (_shutdown_tx, shutdown) = shutdown_channel();
         let (_recovery_tx, recovery) = watch::channel(0_u64);
 
         supervise_connection(
@@ -1263,26 +800,6 @@ mod tests {
             Err(SupervisedFeedSpawnError::DuplicateConnectionId { conn_id })
                 if conn_id == reap_core::ConnId::new("private-account-r0")
         ));
-    }
-
-    #[test]
-    fn connection_attempt_pacer_state_spaces_attempts_and_recovers_after_idle_time() {
-        let interval = Duration::from_millis(400);
-        let mut state = ConnectionAttemptPacerState::default();
-        let start = Instant::now();
-
-        assert_eq!(state.delay_at(start), Duration::ZERO);
-        state.record_attempt_at(start, interval);
-        assert_eq!(state.delay_at(start), interval);
-        assert_eq!(
-            state.delay_at(start + Duration::from_millis(100)),
-            Duration::from_millis(300)
-        );
-        state.record_attempt_at(start + interval, interval);
-        assert_eq!(
-            state.delay_at(start + Duration::from_secs(2)),
-            Duration::ZERO
-        );
     }
 
     #[tokio::test]
@@ -1390,8 +907,15 @@ mod tests {
         let path = directory.path().join("connect.pacer");
         let pacer =
             ConnectionAttemptPacer::process_shared(Duration::from_millis(400), &path).unwrap();
-        let clock_id = pacer.shared.as_ref().unwrap().clock_id.clone();
-        let distant = shared_clock_ns().unwrap()
+        let (_initial_shutdown_tx, mut initial_shutdown_rx) = watch::channel(false);
+        assert!(pacer.wait_for_turn(&mut initial_shutdown_rx).await.unwrap());
+        let state = std::fs::read_to_string(&path).unwrap();
+        let mut fields = state.split_whitespace();
+        assert_eq!(fields.next(), Some(SHARED_PACER_STATE_MAGIC));
+        let clock_id = fields.next().unwrap();
+        let next_attempt_ns = fields.next().unwrap().parse::<u128>().unwrap();
+        assert!(fields.next().is_none());
+        let distant = next_attempt_ns
             + MAX_SHARED_RESERVATION_AHEAD.as_nanos()
             + Duration::from_secs(1).as_nanos();
         std::fs::write(
@@ -1464,7 +988,7 @@ mod tests {
         let (second_route, mut second_rx) = watch::channel(0_u64);
         let (_raw_tx, raw_rx) = mpsc::channel(1);
         let (_status_tx, status_rx) = mpsc::channel(1);
-        let (shutdown, _shutdown_rx) = watch::channel(false);
+        let (shutdown, _shutdown_rx) = shutdown_channel();
         let feed = SupervisedFeed {
             raw: raw_rx,
             status: status_rx,
@@ -1504,7 +1028,7 @@ mod tests {
         let (second_route, mut second_rx) = watch::channel(0_u64);
         let (_raw_tx, raw_rx) = mpsc::channel(1);
         let (_status_tx, status_rx) = mpsc::channel(1);
-        let (shutdown, _shutdown_rx) = watch::channel(false);
+        let (shutdown, _shutdown_rx) = shutdown_channel();
         let failed_source = ConnId::new("book-1");
         let feed = SupervisedFeed {
             raw: raw_rx,
@@ -1608,7 +1132,7 @@ mod tests {
         };
         let (output, _output_rx) = mpsc::channel(1);
         let (status, mut status_rx) = mpsc::channel(1);
-        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let (_shutdown_tx, shutdown) = shutdown_channel();
         let (_recovery_tx, recovery) = watch::channel(0_u64);
 
         supervise_connection(
@@ -1669,7 +1193,7 @@ mod tests {
         };
         let (output, _output_rx) = mpsc::channel(1);
         let (status, mut status_rx) = mpsc::channel(1);
-        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let (_shutdown_tx, shutdown) = shutdown_channel();
         let (_recovery_tx, recovery) = watch::channel(0_u64);
 
         supervise_connection(

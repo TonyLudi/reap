@@ -7,7 +7,9 @@ mod mapping;
 mod metadata;
 mod numeric;
 
-pub use envelope::{EnvelopeError, EventClock, EventEnvelope, EventOrdering, VenueEventHash};
+pub use envelope::{
+    EnvelopeError, EventClock, EventEnvelope, EventOrdering, ReceivedEventClock, VenueEventHash,
+};
 pub use event::{
     MAX_PM_BOOK_LEVELS, OkxReferenceEvent, OkxReferenceEventError, PmAllowanceEvent,
     PmAllowanceValue, PmBalanceEvent, PmBookEvent, PmBookLevel, PmBookPoint, PmBookSide, PmBookTop,
