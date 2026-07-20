@@ -1,7 +1,9 @@
 # Target-Host Runtime Qualification Goal E Execution Prompt
 
-Status: queued follow-up. Do not execute until Goal D is complete and its
-handoff records every phase and global gate green.
+Status: deferred. Goal D is complete, but no target host or target-host
+acceptance contract is declared. Do not execute this goal until both exist and
+the candidate baseline is re-reviewed. Goal F may run first; Goal E remains a
+Chaos-only qualification and does not qualify Polymarket.
 
 Use this document as the complete instruction set. The short invocation is:
 
@@ -37,9 +39,17 @@ The required outcomes are:
 
 ## Normative Baseline
 
-Goal E starts from the clean Goal D completion commit. Phase 0 MUST resolve and
-record its full SHA rather than naming a moving branch. The Goal D handoff must
-state that Phases 0 through 6 and the global verification gate are green.
+The immutable semantic reference for Goal E is the clean Goal D completion
+commit `8258deb4b6e3a52e7c58c792da913210e0877fbb`. Phase 0 MUST record that
+full SHA and verify that the Goal D handoff states Phases 0 through 6 and the
+global verification gate are green.
+
+The measured candidate may be a later clean descendant containing separately
+reviewed architecture work such as Goal F. Phase 0 MUST record both the Goal D
+semantic-reference SHA and the exact candidate SHA, rerun the canonical Goal D
+Chaos hashes and deterministic gates, and prove that Polymarket connectivity
+and PM product work are absent from Goal E's measured workload. Goal E does
+not qualify PM behavior, PM connectivity, or the PM runtime.
 
 Treat these documents as normative:
 
@@ -60,7 +70,8 @@ cardinality do not broaden Reap's scope.
 Before any target-host run, create
 `docs/target-host-runtime-decision-goal-e-handoff.md` and record:
 
-- the Goal D completion commit and handoff status;
+- the Goal D semantic-reference commit and handoff status, plus the exact
+  candidate source commit;
 - the Reap and pinned-Java clean-state checks;
 - target-host identity without secrets: provider/site label, CPU model and
   count, SMT/NUMA topology, memory, kernel, clock source, time service,
@@ -146,7 +157,9 @@ The measurement contract MUST define, before the final recorded runs:
 - decision-to-prepared-wire and due-action-lateness budgets;
 - bounded-queue age, high-water, saturation, and loss budgets;
 - CPU/memory headroom requirements;
-- same-host regression thresholds against the unmodified Goal D candidate;
+- same-host regression thresholds against the exact unoptimized candidate
+  selected in Phase 0, while retaining Goal D local distributions only as
+  historical comparison;
 - run invalidation criteria for throttling, host contention, clock changes, or
   background maintenance; and
 - the rule used to choose Keep, Optimize, or Propose Redesign.
@@ -367,9 +380,11 @@ Stop and report the exact conflict when:
 - Goal D is incomplete or Reap/`../imm-strategy` has unexplained changes;
 - no declared target host or predeclared acceptance contract exists;
 - a required workload needs credentials or authenticated exchange access;
-- an output, decision, RNG draw, floating-point result, timer order, authority,
-  schema, dependency, or canonical hash changes outside a separately reviewed
-  narrow optimization;
+- the selected pre-optimization candidate fails the recorded Goal D canonical
+  Chaos gates or changes their measured-workload decisions/outputs;
+- a change introduced during Goal E alters an output, decision, RNG draw,
+  floating-point result, timer order, authority, schema, dependency, or
+  canonical hash outside a separately reviewed narrow optimization;
 - observability allocates, formats, clones dynamic labels, or locks on the
   per-event path;
 - a source-policy guard passes only by broadening an authority allowlist;
