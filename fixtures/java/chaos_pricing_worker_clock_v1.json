@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "java_revision": "b6b120c7b7c466d8431bf082f3229328c5d7b2ae",
+  "java_call_path": [
+    "chaos/chaos-iarb2/src/main/java/app/metcoin/chaos/iarb2/Iarb2Strategy.java:205-214",
+    "chaos/chaos-iarb2/src/main/java/app/metcoin/chaos/iarb2/Iarb2Strategy.java:399-405",
+    "chaos/chaos-core/src/main/java/app/metcoin/chaos/worker/ChaosTimedConflationWorker.java:45-53",
+    "chaos/chaos-core/src/main/java/app/metcoin/chaos/worker/ChaosConflationWorker.java:46-103"
+  ],
+  "derivation": "ChaosConflationWorker.runWork samples decision_ms at line 47. An immediate path calls runWork(false, decision_ms), which independently samples work_start_ms at line 72 and clamps lastWorkTimeMs to max(work_start_ms, decision_ms); line 78 then clamps lastWorkFinishTimeMs to max(finish_ms, lastWorkTimeMs). A scheduled timer instead enters runWork(true, scheduledTimeMs) directly at line 101, so its line-72 sample is already the work start and only the finish clock remains.",
+  "immediate_depth": {
+    "id": "depth_decision_start_finish_regression",
+    "decision_ns": 10000000000,
+    "decision_ms": 2000,
+    "work_start_ms": 2001,
+    "finish_ms": 2000,
+    "next_decision_ns": 10005000000,
+    "next_decision_ms": 2005,
+    "expected_next_due_ns": 10006000000,
+    "expected_worker_clock_reads": 2,
+    "expected_last_work_ms": 2001,
+    "expected_last_finish_ms": 2001,
+    "expected_next_disposition": "scheduled_for_one_millisecond",
+    "expected_output": {
+      "typed": [],
+      "legacy": []
+    }
+  },
+  "immediate_callback": {
+    "id": "trade_callback_decision_start_finish_regression",
+    "seed_decision_ns": 1000000000,
+    "seed_ms": 1000,
+    "trade_receipt_ns": 2000000000,
+    "trade_processing_ns": 2000010000,
+    "trade_processing_ms": 1004,
+    "callback_decision_ms": 1005,
+    "work_start_ms": 1006,
+    "finish_ms": 1005,
+    "next_decision_ns": 3000000000,
+    "next_decision_ms": 1010,
+    "expected_next_due_ns": 3001000000,
+    "expected_worker_clock_reads": 2,
+    "expected_last_work_ms": 1006,
+    "expected_last_finish_ms": 1006,
+    "expected_next_disposition": "scheduled_for_one_millisecond",
+    "expected_output": {
+      "typed": [],
+      "legacy": []
+    }
+  },
+  "direct_timer": {
+    "id": "scheduled_timer_start_finish_only",
+    "seed_decision_ns": 4000000000,
+    "seed_ms": 4000,
+    "throttled_decision_ns": 4001000000,
+    "throttled_decision_ms": 4001,
+    "timer_due_ns": 4005000000,
+    "scheduled_time_ms": 4005,
+    "work_start_ms": 4005,
+    "finish_ms": 4006,
+    "post_timer_decision_ns": 5000000000,
+    "post_timer_decision_ms": 4010,
+    "expected_next_due_ns": 5001000000,
+    "expected_worker_clock_reads": 1,
+    "expected_last_work_ms": 4005,
+    "expected_last_finish_ms": 4006,
+    "expected_next_disposition": "scheduled_for_one_millisecond",
+    "expected_output": {
+      "typed": [],
+      "legacy": []
+    }
+  },
+  "scope_note": "These cases isolate the reached Iarb2 pricing-worker clock and debounce boundary. They add no exchange connectivity, public timer/action type, configuration knob, journal field, or serialized schema. The existing implied-depth and RNG fixtures remain byte-identical and carry the non-empty intent/RNG parity evidence."
+}

@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[cfg(test)]
@@ -16,6 +17,8 @@ use reap_risk::RiskGate;
 #[cfg(test)]
 use reap_storage::{OrderOperation, SafetyLatchScope, SafetyLatchSource};
 use reap_storage::{ProvenRegularOrderBinding, ProvenRegularSubmitRequest, StorageRecord};
+#[cfg(test)]
+use reap_strategy::ChaosExecutionPurpose;
 use reap_strategy::ChaosStrategy;
 use thiserror::Error;
 
@@ -219,6 +222,8 @@ pub struct LiveCoordinator {
     journal_fill_keys_by_account: HashMap<String, HashSet<FillKey>>,
     session_id: String,
     decision_sequence: u64,
+    #[cfg(test)]
+    chaos_intent_trace: Vec<(ChaosExecutionPurpose, OrderIntent)>,
 }
 
 impl LiveCoordinator {
@@ -283,6 +288,8 @@ impl LiveCoordinator {
             journal_fill_keys_by_account,
             session_id,
             decision_sequence: 0,
+            #[cfg(test)]
+            chaos_intent_trace: Vec::new(),
         })
     }
 
@@ -491,12 +498,153 @@ impl LiveCoordinator {
     ) -> Result<CoordinatorOutput, CoordinatorError> {
         match output {
             FeedOutput::Event(event) => Ok(self.process_normalized_at(event, observed_now_ms)),
-            output => self.process_feed(output),
+            FeedOutput::System(event) => {
+                Ok(self.process_normalized_at(NormalizedEvent::System(event), observed_now_ms))
+            }
+            FeedOutput::PrivateAccount { account_id, update } => {
+                self.process_private_account_at(account_id, update, observed_now_ms)
+            }
+            FeedOutput::PrivateOrder { account_id, update } => {
+                self.process_private_order_at(account_id, update, observed_now_ms)
+            }
+            FeedOutput::PrivateFill { account_id, fill } => {
+                self.process_private_fill_at(account_id, fill, observed_now_ms)
+            }
+            FeedOutput::Duplicate(_) => Ok(CoordinatorOutput::default()),
+            FeedOutput::RecoveryRequired(request) => Ok(CoordinatorOutput {
+                actions: vec![LiveAction::RecoverBook(request)],
+                records: Vec::new(),
+            }),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn process_feed_arrived_at(
+        &mut self,
+        output: FeedOutput,
+        observed_now_ms: TimeMs,
+        arrival_ns: u64,
+    ) -> Result<CoordinatorOutput, CoordinatorError> {
+        match output {
+            FeedOutput::Event(event) => {
+                Ok(self.process_normalized_arrived_at(event, observed_now_ms, arrival_ns))
+            }
+            output => self.process_feed_at(output, observed_now_ms),
+        }
+    }
+
+    pub(crate) fn process_feed_received_at(
+        &mut self,
+        output: FeedOutput,
+        observed_now_ms: TimeMs,
+        receipt_ns: u64,
+        processing_clock: impl FnOnce() -> (u64, TimeMs),
+        mut finish_clock: impl FnMut() -> TimeMs,
+    ) -> Result<CoordinatorOutput, CoordinatorError> {
+        match output {
+            FeedOutput::Event(event) => Ok(self.process_normalized_received_at(
+                event,
+                observed_now_ms,
+                receipt_ns,
+                processing_clock,
+                finish_clock,
+            )),
+            FeedOutput::System(event) => Ok(self.process_normalized_at_with_clock(
+                NormalizedEvent::System(event),
+                observed_now_ms,
+                &mut finish_clock,
+            )),
+            FeedOutput::PrivateAccount { account_id, update } => self
+                .process_private_account_at_with_clock(
+                    account_id,
+                    update,
+                    observed_now_ms,
+                    &mut finish_clock,
+                ),
+            FeedOutput::PrivateOrder { account_id, update } => self
+                .process_private_order_at_with_clock(
+                    account_id,
+                    update,
+                    observed_now_ms,
+                    &mut finish_clock,
+                ),
+            FeedOutput::PrivateFill { account_id, fill } => self
+                .process_private_fill_at_with_clock(
+                    account_id,
+                    fill,
+                    observed_now_ms,
+                    &mut finish_clock,
+                ),
+            FeedOutput::Duplicate(_) => Ok(CoordinatorOutput::default()),
+            FeedOutput::RecoveryRequired(request) => Ok(CoordinatorOutput {
+                actions: vec![LiveAction::RecoverBook(request)],
+                records: Vec::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn next_trade_reprice_due_ns(&self) -> Option<u64> {
+        self.engine.next_chaos_trade_reprice_due_ns()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn service_one_due_trade_reprice(
+        &mut self,
+        now_ns: u64,
+        observed_now_ms: TimeMs,
+    ) -> CoordinatorOutput {
+        self.service_one_due_trade_reprice_with_finish_clock(now_ns, observed_now_ms, || {
+            observed_now_ms
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn service_one_due_trade_reprice_with_finish_clock(
+        &mut self,
+        now_ns: u64,
+        observed_now_ms: TimeMs,
+        finish_clock: impl FnMut() -> TimeMs,
+    ) -> CoordinatorOutput {
+        self.service_one_due_trade_reprice_with_clocks(|| (now_ns, observed_now_ms), finish_clock)
+    }
+
+    pub(crate) fn service_one_due_trade_reprice_with_clocks(
+        &mut self,
+        start_clock: impl FnOnce() -> (u64, TimeMs),
+        mut finish_clock: impl FnMut() -> TimeMs,
+    ) -> CoordinatorOutput {
+        let strategy_is_live = self.strategy_is_live();
+        let sampled_start = Cell::new(None);
+        let engine_output = self.engine.service_one_due_chaos_trade_reprice_with_clocks(
+            || {
+                let start = start_clock();
+                sampled_start.set(Some(start));
+                start
+            },
+            strategy_is_live,
+            &mut finish_clock,
+        );
+        let (_, observed_now_ms) = sampled_start
+            .get()
+            .expect("due trade-reprice start clock must be sampled");
+        let mut output = CoordinatorOutput::default();
+        let routing_observed_now_ms = finish_clock();
+        self.handle_engine_output(
+            observed_now_ms,
+            routing_observed_now_ms,
+            engine_output,
+            &mut finish_clock,
+            &mut output,
+        );
+        output
     }
 
     pub fn process_event(&mut self, event: NormalizedEvent) -> CoordinatorOutput {
         self.process_normalized(event)
+    }
+
+    fn strategy_is_live(&self) -> bool {
+        self.startup.can_submit_new(self.order_entry_enabled) && !self.engine.risk().is_killed()
     }
 
     fn ensure_account_state_policy(

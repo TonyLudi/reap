@@ -19,19 +19,23 @@ mod config;
 mod events;
 mod execution_state;
 mod hedging;
+mod implied_depth;
 mod instrument;
 mod pricing;
 mod reference_health;
 mod risk;
+mod trade_reprice;
 
 use execution_state::ExecutionTrackingState;
 use hedging::{HedgeCandidate, HedgingState};
+use implied_depth::ImpliedDepthState;
 use pricing::{JavaRandom, PricingState, round_passive_to_tick};
 use reference_health::{
     DebouncedCondition, ReferenceHealthState, TimedPrice, should_accept_timestamp,
     timestamp_is_fresh,
 };
 use risk::AggregateRiskState;
+use trade_reprice::TradeRepriceState;
 
 pub use config::{
     ChaosConfig, CoinConfig, ConfigValidation, HaltIntervalConfig, InstrumentConfig,
@@ -55,6 +59,7 @@ pub struct ChaosStrategy {
     pricing: PricingState,
     hedging: HedgingState,
     execution: ExecutionTrackingState,
+    trade_reprice: TradeRepriceState,
     now_ms: TimeMs,
     risk: AggregateRiskState,
 }
@@ -201,6 +206,7 @@ impl ChaosStrategy {
                 last_quote_fill_ms: HashMap::new(),
                 missed_hedges: Vec::new(),
             },
+            trade_reprice: TradeRepriceState::default(),
             now_ms: 0,
             risk: AggregateRiskState {
                 delta_usd: 0.0,

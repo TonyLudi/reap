@@ -1,0 +1,5 @@
+error[E0432]: unresolved import `reap_strategy::ChaosHedgeCommit`
+ --> tests/ui/no_public_hedge_commit.rs:1:5
+  |
+1 | use reap_strategy::ChaosHedgeCommit;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `ChaosHedgeCommit` in the root

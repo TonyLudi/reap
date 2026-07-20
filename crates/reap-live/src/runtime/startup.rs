@@ -32,6 +32,7 @@ use crate::{
     start_host_guard, start_operator_service,
 };
 
+use super::SchedulingState;
 use super::bootstrap::{AccountSeed, bootstrap_accounts};
 use super::composition::{CompositionState, RuntimeEvidence};
 use super::connectivity::{ConnectivityState, FeedSourceState, spawn_feed_forwarders};
@@ -546,6 +547,7 @@ impl RuntimeResources {
             recovered: _,
             restored_safety_latches,
         } = foundation;
+        let scheduling = SchedulingState::new();
         let storage = start_jsonl_storage_with_lease(
             StorageConfig {
                 path: config.storage.path.clone(),
@@ -865,6 +867,7 @@ impl RuntimeResources {
                 observed_alert_delivery_failures: 0,
                 alert_stats: AlertStats::default(),
             },
+            scheduling,
             readiness_safety: ReadinessSafetyState {
                 forbidden_rx,
                 safety_senders,

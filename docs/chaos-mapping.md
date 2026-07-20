@@ -75,8 +75,8 @@ gateway-processor, or eight-session-pool code widens the supported call path.
 | Exchange funding forecast and funding overwrite precedence | `FundingRate.rate` and `funding_override` | Exact; OKX `fundingRate` remains the Java-parity strategy input |
 | Earliest active funding window | `update_funding_window` | Exact |
 | Ignore-best, quote-only, burst, price limit, and UTC halt behavior | Normalized market events and instrument state | Exact |
-| OKX public trades invalidate implied depth levels and can schedule repricing | `MarketEvent::Trade` currently advances time only | Partial; live trade input is retained, but trade-driven implied depth is a documented behavior gap |
-| Multi-level top/trailing quote targets and Java `Random(1)` sequence | `desired_quote_levels` and `JavaRandom` | Equivalent; optimizer churn differs |
+| OKX public trades invalidate implied depth levels and can schedule repricing | Instrument-owned implied depth plus a private 100-microsecond callback and one real five-millisecond Live depth/trade worker | Exact for the reached pinned OKX/iarb2 public-trade path; replay activates the shared worker only when the first qualifying crossing is reached and causally promotes its accumulated timing state, while no-trade economic replay retains its frozen immediate-depth decisions |
+| Multi-level top/trailing quote targets and Java `Random(1)` sequence | `desired_quote_levels`, `JavaRandom`, and the RNG-interleaving companion fixture | Equivalent target decisions and exact cursor preservation for the scoped interleaving; physical trailing-order optimizer churn remains outside this scheduler change |
 | Quote debounce, force refresh, and top-level refill delay | Quote target state and fill timestamps | Exact for target decisions |
 | Risk-group soft/hard/stop delta behavior | `RiskGroupState` quote and hedge permissions | Exact |
 | Spot cash, equity, liability, loan, and borrow limits | Account-scoped balance state | Exact decision model; Rust live is intentionally stricter and rejects configured or observed borrowing until interest accounting exists |
@@ -580,9 +580,11 @@ map strategy and connectivity behavior to those sources while treating
 Decision parity depends on delivering all required normalized events. For each
 configured account and instrument, live composition must provide:
 
-- Sequenced books and public trades. Pinned Java consumes trades for OKX
-  implied-depth invalidation and repricing; current Rust only advances time, so
-  the subscription is retained while that behavior remains explicitly partial.
+- Sequenced books and public trades. Rust reproduces the reached pinned-Java
+  OKX implied-depth invalidation, 100-microsecond callback, and shared
+  depth/trade worker timing without broadening the plan-derived subscription.
+  Backtest reaches this path causally: it does not inspect future input to
+  decide how an earlier depth is processed.
 - Funding rate, index ticker, mark price, and price-limit updates where used.
 - Redundant stablecoin/USD index tickers for every configured live risk guard.
 - Account balances, margin snapshots, positions, orders, and fills.
@@ -642,7 +644,11 @@ currencies appear in instrument metadata or symbols. See the current
 Parity tests are in `crates/reap-strategy/tests/chaos_unit/`, included as the
 private `chaos::tests` module. They include the Java calculator fixture values
 for spot, linear, and inverse pricing; hedge summaries; risk multiplier
-behavior; funding; skew; account risk; debounce; and stop conditions.
+behavior; funding; skew; account risk; debounce; stop conditions; and the
+`chaos_trade_rng_interleaving_v1.json` proof that dense callbacks and the
+trailing worker preserve the pinned Java `Random(1)` cursor. That proof scopes
+multi-level symbols to cursor stability; the pre-existing physical
+trailing-order retention/optimizer difference is not claimed as exact parity.
 Transport, deduplication, reconciliation, and fail-closed tests live in their
 owning crates.
 

@@ -36,7 +36,7 @@ fn state_field_signatures<'a>(source: &'a str, state: &str) -> Vec<&'a str> {
     struct_field_body(source, "pub(super)", state)
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty())
+        .filter(|line| !line.is_empty() && !line.starts_with("//"))
         .map(|line| {
             line.strip_prefix("pub(super) ")
                 .and_then(|field| field.strip_suffix(','))
@@ -85,7 +85,7 @@ fn production_runner_keeps_single_owner_responsibility_state() {
         "accounting: AccountingState",
         "metrics: MetricState",
     ];
-    const REPLAY_FIELDS: [&str; 9] = [
+    const REPLAY_FIELDS: [&str; 10] = [
         "time_basis: BacktestTimeBasis",
         "raw_replay_boundary: Option<RawReplayBoundary>",
         "carry_source_boundary: Option<RawReplayBoundary>",
@@ -95,6 +95,7 @@ fn production_runner_keeps_single_owner_responsibility_state() {
         "input_events: u64",
         "input_clock_regressions: u64",
         "max_input_clock_regression_ns: u64",
+        "trade_reprice_active: bool",
     ];
     const SCHEDULE_FIELDS: [&str; 2] = [
         "scheduled: BTreeMap<(u64, u64), ScheduledAction>",
@@ -238,11 +239,11 @@ fn production_runner_keeps_single_owner_responsibility_state() {
         + FUNDING_FIELDS.len()
         + ACCOUNTING_FIELDS.len()
         + METRIC_FIELDS.len();
-    assert_eq!(grouped_leaf_count, 63, "grouped runner leaf count");
+    assert_eq!(grouped_leaf_count, 64, "grouped runner leaf count");
     assert_eq!(
         4 + grouped_leaf_count,
-        67,
-        "four direct dependencies plus grouped state must preserve all 67 leaves",
+        68,
+        "four direct dependencies plus grouped state must preserve all 68 leaves",
     );
 
     let mut actual_leaf_fields = actual_root_fields[..DIRECT_LEAF_FIELDS.len()].to_vec();
@@ -260,8 +261,8 @@ fn production_runner_keeps_single_owner_responsibility_state() {
         .chain(METRIC_FIELDS.iter())
         .copied()
         .collect::<Vec<_>>();
-    assert_eq!(expected_leaf_fields.len(), 67, "enumerated leaf fields");
-    assert_eq!(actual_leaf_fields.len(), 67, "declared leaf fields");
+    assert_eq!(expected_leaf_fields.len(), 68, "enumerated leaf fields");
+    assert_eq!(actual_leaf_fields.len(), 68, "declared leaf fields");
     for field in expected_leaf_fields {
         assert_eq!(
             actual_leaf_fields

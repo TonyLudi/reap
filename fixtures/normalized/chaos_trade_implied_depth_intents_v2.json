@@ -1,0 +1,340 @@
+{ "schema_version": 2,
+  "java_revision": "b6b120c7b7c466d8431bf082f3229328c5d7b2ae",
+  "scenario_fixture": "chaos_trade_implied_depth.jsonl",
+  "lifecycle": {
+    "strategy_is_live": true,
+    "event_arrival_ns": [
+      900000000,
+      905000000,
+      905000000,
+      905000000,
+      905000000,
+      905000000,
+      1000000000
+    ],
+    "event_observed_now_ms": [
+      900,
+      905,
+      905,
+      905,
+      905,
+      905,
+      1000
+    ],
+    "service_horizon_ns": 1000100000,
+    "service_points": [
+      {
+        "now_ns": 1000099999,
+        "observed_now_ms": 1000,
+        "expected_next_due_ns": 1000100000,
+        "output": {
+          "typed": [],
+          "legacy": []
+        }
+      },
+      {
+        "now_ns": 1000100000,
+        "observed_now_ms": 1000,
+        "expected_next_due_ns": null,
+        "output": {
+          "typed": [
+            {
+              "purpose": "cancel_owned",
+              "legacy": {
+                "CancelOrder": {
+                  "order_id": "q-3",
+                  "reason": "replace_quote"
+                }
+              }
+            },
+            {
+              "purpose": "quote",
+              "legacy": {
+                "NewOrder": {
+                  "symbol": "BTC-USDT",
+                  "side": "sell",
+                  "qty": 0.0999,
+                  "price": 50056.200000000004,
+                  "time_in_force": "post_only",
+                  "reduce_only": false,
+                  "self_trade_prevention": null,
+                  "reason": "quote"
+                }
+              }
+            }
+          ],
+          "legacy": [
+            {
+              "CancelOrder": {
+                "order_id": "q-3",
+                "reason": "replace_quote"
+              }
+            },
+            {
+              "NewOrder": {
+                "symbol": "BTC-USDT",
+                "side": "sell",
+                "qty": 0.0999,
+                "price": 50056.200000000004,
+                "time_in_force": "post_only",
+                "reduce_only": false,
+                "self_trade_prevention": null,
+                "reason": "quote"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "event_outputs": [
+    {
+      "typed": [],
+      "legacy": []
+    },
+    {
+      "typed": [
+        {
+          "purpose": "quote",
+          "legacy": {
+            "NewOrder": {
+              "symbol": "BTC-PERP",
+              "side": "buy",
+              "qty": 99.0,
+              "price": 49949.9,
+              "time_in_force": "post_only",
+              "reduce_only": false,
+              "self_trade_prevention": null,
+              "reason": "quote"
+            }
+          }
+        },
+        {
+          "purpose": "quote",
+          "legacy": {
+            "NewOrder": {
+              "symbol": "BTC-PERP",
+              "side": "sell",
+              "qty": 99.0,
+              "price": 50051.200000000004,
+              "time_in_force": "post_only",
+              "reduce_only": false,
+              "self_trade_prevention": null,
+              "reason": "quote"
+            }
+          }
+        },
+        {
+          "purpose": "quote",
+          "legacy": {
+            "NewOrder": {
+              "symbol": "BTC-USDT",
+              "side": "buy",
+              "qty": 0.0999,
+              "price": 49952.9,
+              "time_in_force": "post_only",
+              "reduce_only": false,
+              "self_trade_prevention": null,
+              "reason": "quote"
+            }
+          }
+        },
+        {
+          "purpose": "quote",
+          "legacy": {
+            "NewOrder": {
+              "symbol": "BTC-USDT",
+              "side": "sell",
+              "qty": 0.0999,
+              "price": 50054.200000000004,
+              "time_in_force": "post_only",
+              "reduce_only": false,
+              "self_trade_prevention": null,
+              "reason": "quote"
+            }
+          }
+        }
+      ],
+      "legacy": [
+        {
+          "NewOrder": {
+            "symbol": "BTC-PERP",
+            "side": "buy",
+            "qty": 99.0,
+            "price": 49949.9,
+            "time_in_force": "post_only",
+            "reduce_only": false,
+            "self_trade_prevention": null,
+            "reason": "quote"
+          }
+        },
+        {
+          "NewOrder": {
+            "symbol": "BTC-PERP",
+            "side": "sell",
+            "qty": 99.0,
+            "price": 50051.200000000004,
+            "time_in_force": "post_only",
+            "reduce_only": false,
+            "self_trade_prevention": null,
+            "reason": "quote"
+          }
+        },
+        {
+          "NewOrder": {
+            "symbol": "BTC-USDT",
+            "side": "buy",
+            "qty": 0.0999,
+            "price": 49952.9,
+            "time_in_force": "post_only",
+            "reduce_only": false,
+            "self_trade_prevention": null,
+            "reason": "quote"
+          }
+        },
+        {
+          "NewOrder": {
+            "symbol": "BTC-USDT",
+            "side": "sell",
+            "qty": 0.0999,
+            "price": 50054.200000000004,
+            "time_in_force": "post_only",
+            "reduce_only": false,
+            "self_trade_prevention": null,
+            "reason": "quote"
+          }
+        }
+      ]
+    },
+    {
+      "typed": [],
+      "legacy": []
+    },
+    {
+      "typed": [],
+      "legacy": []
+    },
+    {
+      "typed": [],
+      "legacy": []
+    },
+    {
+      "typed": [],
+      "legacy": []
+    },
+    {
+      "typed": [],
+      "legacy": []
+    }
+  ],
+  "final_state": {
+    "effective_sell_price": 50006.0,
+    "next_due_ns": null
+  },
+  "burst_conflation": {
+    "first_arrival_ns": 1000000000,
+    "first_due_ns": 1000100000,
+    "second_arrival_ns": 1000200000,
+    "second_due_ns": 1000300000,
+    "third_arrival_ns": 1000250000,
+    "third_due_ns": 1000350000,
+    "trailing_due_ns": 1005300000,
+    "latest_effective_sell_price": 50005.0,
+    "first_due_output": {
+      "typed": [
+        {
+          "purpose": "cancel_owned",
+          "legacy": {
+            "CancelOrder": {
+              "order_id": "q-3",
+              "reason": "replace_quote"
+            }
+          }
+        },
+        {
+          "purpose": "quote",
+          "legacy": {
+            "NewOrder": {
+              "symbol": "BTC-USDT",
+              "side": "sell",
+              "qty": 0.0999,
+              "price": 50056.200000000004,
+              "time_in_force": "post_only",
+              "reduce_only": false,
+              "self_trade_prevention": null,
+              "reason": "quote"
+            }
+          }
+        }
+      ],
+      "legacy": [
+        {
+          "CancelOrder": {
+            "order_id": "q-3",
+            "reason": "replace_quote"
+          }
+        },
+        {
+          "NewOrder": {
+            "symbol": "BTC-USDT",
+            "side": "sell",
+            "qty": 0.0999,
+            "price": 50056.200000000004,
+            "time_in_force": "post_only",
+            "reduce_only": false,
+            "self_trade_prevention": null,
+            "reason": "quote"
+          }
+        }
+      ]
+    },
+    "trailing_due_output": {
+      "typed": [
+        {
+          "purpose": "cancel_owned",
+          "legacy": {
+            "CancelOrder": {
+              "order_id": "q-3",
+              "reason": "replace_quote"
+            }
+          }
+        },
+        {
+          "purpose": "quote",
+          "legacy": {
+            "NewOrder": {
+              "symbol": "BTC-USDT",
+              "side": "sell",
+              "qty": 0.0999,
+              "price": 50055.200000000004,
+              "time_in_force": "post_only",
+              "reduce_only": false,
+              "self_trade_prevention": null,
+              "reason": "quote"
+            }
+          }
+        }
+      ],
+      "legacy": [
+        {
+          "CancelOrder": {
+            "order_id": "q-3",
+            "reason": "replace_quote"
+          }
+        },
+        {
+          "NewOrder": {
+            "symbol": "BTC-USDT",
+            "side": "sell",
+            "qty": 0.0999,
+            "price": 50055.200000000004,
+            "time_in_force": "post_only",
+            "reduce_only": false,
+            "self_trade_prevention": null,
+            "reason": "quote"
+          }
+        }
+      ]
+    }
+  }
+}

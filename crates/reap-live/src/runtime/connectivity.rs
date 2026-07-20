@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use reap_core::{
     BacktestLatencyClass, Channel, ConnId, MarketEvent, NormalizedEvent, SystemEvent,
@@ -351,10 +352,12 @@ pub(super) fn spawn_feed_forwarders(
     let raw_events = events.clone();
     tasks.push(tokio::spawn(async move {
         while let Some(envelope) = raw.recv().await {
+            let received_at = Instant::now();
             if raw_events
                 .send(RuntimeEvent::Raw {
                     source_id,
                     envelope,
+                    received_at,
                 })
                 .await
                 .is_err()

@@ -127,6 +127,7 @@ fn seed_perp_matcher(runner: &mut BacktestRunner, ts_ms: u64) {
 mod carry;
 mod funding;
 mod orders;
+mod public_trade;
 mod replay;
 mod structure;
 mod valuation;

@@ -12,8 +12,10 @@ impl LiveCoordinator {
     pub(super) fn route_chaos_intent(
         &mut self,
         now_ms: TimeMs,
+        observed_now_ms: TimeMs,
         intent: ChaosExecutionIntent,
         legacy: OrderIntent,
+        local_send_clock: &mut dyn FnMut() -> TimeMs,
         output: &mut CoordinatorOutput,
     ) {
         match intent {
@@ -63,45 +65,47 @@ impl LiveCoordinator {
                     });
                     return;
                 }
-                let approved = match self.regular_execution.authorize_submit(intent) {
-                    Ok(approved) => approved,
-                    Err(error) => {
-                        self.reject_execution_policy(now_ms, legacy, error, output);
-                        return;
-                    }
-                };
-                if approved.account_id() != account_id {
-                    self.reject_execution_policy(
-                        now_ms,
-                        legacy,
-                        RegularExecutionPolicyError::OwnerMismatch {
-                            symbol: approved.order().symbol.clone(),
-                            actual: approved.account_id().to_string(),
-                            expected: account_id,
+                let reservation = {
+                    let regular_execution = &self.regular_execution;
+                    let decision_sequence = &mut self.decision_sequence;
+                    let strategy_name = &self.config.strategy.strategy_name;
+                    let session_id = &self.session_id;
+                    let client_ids = &self.client_ids;
+                    let owned_regular_orders = &mut self.owned_regular_orders;
+                    let private_states = &mut self.private_states;
+                    self.engine.with_locally_sent_chaos_intent(
+                        intent,
+                        &mut *local_send_clock,
+                        |intent| {
+                            let approved = regular_execution.authorize_submit(intent)?;
+                            if approved.account_id() != account_id {
+                                return Err(RegularExecutionPolicyError::OwnerMismatch {
+                                    symbol: approved.order().symbol.clone(),
+                                    actual: approved.account_id().to_string(),
+                                    expected: account_id.clone(),
+                                });
+                            }
+                            *decision_sequence = decision_sequence.wrapping_add(1);
+                            let idempotency_key =
+                                format!("{strategy_name}:{session_id}:{}", *decision_sequence);
+                            let client_order_id = client_ids
+                                .get(&account_id)
+                                .expect("validated account must have a client id generator")
+                                .next(now_ms);
+                            let (pending, reserved) = owned_regular_orders.reserve_local(
+                                approved,
+                                client_order_id,
+                                private_states
+                                    .get_mut(&account_id)
+                                    .expect("validated account must have private state"),
+                                now_ms,
+                            )?;
+                            Ok((pending, reserved, idempotency_key))
                         },
-                        output,
-                    );
-                    return;
-                }
-                self.decision_sequence = self.decision_sequence.wrapping_add(1);
-                let idempotency_key = format!(
-                    "{}:{}:{}",
-                    self.config.strategy.strategy_name, self.session_id, self.decision_sequence
-                );
-                let client_order_id = self
-                    .client_ids
-                    .get(&account_id)
-                    .expect("validated account must have a client id generator")
-                    .next(now_ms);
-                let (pending, reserved) = match self.owned_regular_orders.reserve_local(
-                    approved,
-                    client_order_id,
-                    self.private_states
-                        .get_mut(&account_id)
-                        .expect("validated account must have private state"),
-                    now_ms,
-                ) {
-                    Ok(pending) => pending,
+                    )
+                };
+                let (pending, reserved, idempotency_key) = match reservation {
+                    Ok(reservation) => reservation,
                     Err(error) => {
                         self.reject_execution_policy(now_ms, legacy, error, output);
                         return;
@@ -112,7 +116,11 @@ impl LiveCoordinator {
                     idempotency_key,
                     reserved,
                 )));
-                output.extend(self.process_normalized(NormalizedEvent::Order(pending)));
+                output.extend(self.process_normalized_at_with_clock(
+                    NormalizedEvent::Order(pending),
+                    observed_now_ms,
+                    &mut *local_send_clock,
+                ));
             }
             ChaosExecutionIntent::CancelOwned(cancel) => {
                 let order_id = cancel.order_id().to_string();

@@ -80,6 +80,7 @@ fn production_runtime_keeps_single_owner_responsibility_state() {
         include_str!("../../src/runtime/readiness_safety.rs"),
         include_str!("../../src/runtime/reconciliation.rs"),
         include_str!("../../src/runtime/recovery.rs"),
+        include_str!("../../src/runtime/scheduling.rs"),
         include_str!("../../src/runtime/shutdown.rs"),
         include_str!("../../src/runtime/startup.rs"),
     ];
@@ -95,6 +96,7 @@ fn production_runtime_keeps_single_owner_responsibility_state() {
         "composition: CompositionState",
         "connectivity: ConnectivityState",
         "dispatch: DispatchState",
+        "scheduling: SchedulingState",
         "readiness_safety: ReadinessSafetyState",
         "reconciliation: ReconciliationState",
         "shutdown: ShutdownState",
@@ -121,6 +123,66 @@ fn production_runtime_keeps_single_owner_responsibility_state() {
             "responsibility modules must declare explicit dependencies",
         );
     }
+}
+
+#[test]
+fn trade_reprice_branch_preserves_live_priority_and_one_arrival_per_raw_frame() {
+    let source = include_str!("../../src/runtime.rs");
+    let select_start = source
+        .find("tokio::select! {\n                    biased;")
+        .expect("live biased select");
+    let select_source = &source[select_start..];
+    let markers = [
+        "signal = &mut shutdown",
+        "event = self.dispatch.control_rx.recv()",
+        "event = self.readiness_safety.forbidden_rx.recv()",
+        "operator = receive_operator",
+        "_ = timer.tick()",
+        "_ = &mut trade_reprice_wait",
+        "event = self.connectivity.feed_rx.recv()",
+    ];
+    let positions = markers.map(|marker| {
+        select_source
+            .find(marker)
+            .unwrap_or_else(|| panic!("missing live priority marker `{marker}`"))
+    });
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "shutdown/control/safety/operator/timer/trade-reprice/feed priority changed",
+    );
+    let due_service = select_source
+        .find(".service_one_due_trade_reprice_with_clocks(")
+        .expect("due worker must use deferred start and finish clocks");
+    let due_source = &select_source[due_service..];
+    let due_start_clock = due_source
+        .find("(monotonic_now_ns(scheduling_origin), unix_time_ms())")
+        .expect("deferred due-worker start clock");
+    let feed_after_due = due_source
+        .find("event = self.connectivity.feed_rx.recv()")
+        .expect("ordinary feed branch after due worker");
+    assert!(due_start_clock < feed_after_due);
+
+    let raw_arm = source
+        .find("RuntimeEvent::Raw {\n                source_id,\n                envelope,\n                received_at,")
+        .expect("raw runtime arm");
+    let raw_source = &source[raw_arm..];
+    let arrival = raw_source
+        .find("let arrival_ns = self.scheduling.captured_receipt_ns(received_at);")
+        .expect("one exact captured receipt per raw frame");
+    let parsed_loop = raw_source
+        .find("for event in parsed {")
+        .expect("parsed-event loop");
+    let coordinator = raw_source
+        .find(".process_feed_received_at(")
+        .expect("receipt-and-processing-aware coordinator reduction");
+    let processing_clock = raw_source
+        .find("move || (monotonic_now_ns(scheduling_origin), unix_time_ms())")
+        .expect("deferred depth-worker processing clock");
+    assert!(arrival < parsed_loop && parsed_loop < coordinator);
+    assert!(
+        coordinator < processing_clock,
+        "depth-worker clock must be sampled by the coordinator immediately before strategy work"
+    );
 }
 
 struct TestRuntimeParts {
@@ -235,6 +297,7 @@ impl TestRuntimeParts {
                 observed_alert_delivery_failures: self.observed_alert_delivery_failures,
                 alert_stats: self.alert_stats,
             },
+            scheduling: SchedulingState::new(),
             readiness_safety: ReadinessSafetyState {
                 forbidden_rx: self.forbidden_rx,
                 safety_senders: self.safety_senders,

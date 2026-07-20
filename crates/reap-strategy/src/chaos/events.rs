@@ -4,6 +4,13 @@ use crate::{ChaosExecutionIntent, Strategy};
 
 use super::{ChaosStrategy, TimedPrice, should_accept_timestamp};
 
+#[derive(Debug, Clone, Copy)]
+struct LocalDeliveryClocks {
+    receipt_ns: u64,
+    processing_ns: u64,
+    observed_now_ms: TimeMs,
+}
+
 impl ChaosStrategy {
     pub(super) fn advance_time(&mut self, ts_ms: TimeMs) {
         self.now_ms = self.now_ms.max(ts_ms);
@@ -13,16 +20,44 @@ impl ChaosStrategy {
         self.advance_time(book.ts_ms);
         if let Some(entity) = self.entities.get_mut(&book.symbol) {
             entity.book = Some(book.clone());
+            entity.implied_depth.on_depth(book.ts_ms);
         }
         self.refresh_quotes()
     }
 
-    fn on_owned_depth(&mut self, book: OrderBook) -> Vec<ChaosExecutionIntent> {
+    fn on_owned_depth_at(
+        &mut self,
+        book: OrderBook,
+        arrival_ns: u64,
+        observed_now_ms: TimeMs,
+        strategy_is_live: bool,
+        refresh_when_inactive: bool,
+        mut worker_clock: impl FnMut() -> TimeMs,
+    ) -> Vec<ChaosExecutionIntent> {
         self.advance_time(book.ts_ms);
         if let Some(entity) = self.entities.get_mut(book.symbol.as_str()) {
+            entity.implied_depth.on_depth(observed_now_ms);
             entity.book = Some(book);
         }
-        self.refresh_quotes()
+        if strategy_is_live {
+            if self.trigger_live_depth_pricing_worker(arrival_ns, observed_now_ms) {
+                let work_start_ms = worker_clock();
+                self.start_immediate_live_pricing_worker(work_start_ms);
+                self.advance_time(work_start_ms);
+                let intents = self.refresh_quotes();
+                self.finish_live_pricing_worker(worker_clock());
+                intents
+            } else {
+                Vec::new()
+            }
+        } else {
+            if refresh_when_inactive {
+                self.observe_compatibility_depth_worker(arrival_ns, observed_now_ms);
+                self.refresh_quotes()
+            } else {
+                Vec::new()
+            }
+        }
     }
 }
 
@@ -51,17 +86,212 @@ impl ChaosStrategy {
 
     /// Owned-event counterpart of [`Self::on_execution_event`] for the single-writer engine.
     pub fn on_owned_execution_event(&mut self, event: StrategyEvent) -> Vec<ChaosExecutionIntent> {
+        let observed_now_ms = strategy_event_ts_ms(&event);
+        // This compatibility-only seam has no captured local arrival. Give
+        // its private worker shadow a causal deterministic timeline rather
+        // than pinning every depth to nanosecond zero, which would retain
+        // already-due Java timers indefinitely.
+        let Some(processing_ns) = observed_now_ms.checked_mul(1_000_000) else {
+            self.halt_reason =
+                Some("compatibility strategy timestamp exceeds nanosecond range".to_string());
+            return Vec::new();
+        };
+        self.on_owned_execution_event_at(
+            event,
+            processing_ns,
+            processing_ns,
+            observed_now_ms,
+            false,
+        )
+    }
+
+    /// Receipt/processing-aware counterpart used only by deterministic replay
+    /// and the existing live single writer. Neither local clock is written
+    /// into the public event or strategy time.
+    pub fn on_owned_execution_event_at(
+        &mut self,
+        event: StrategyEvent,
+        receipt_ns: u64,
+        processing_ns: u64,
+        observed_now_ms: TimeMs,
+        strategy_is_live: bool,
+    ) -> Vec<ChaosExecutionIntent> {
+        self.on_owned_execution_event_at_with_finish_clock(
+            event,
+            receipt_ns,
+            processing_ns,
+            observed_now_ms,
+            strategy_is_live,
+            || observed_now_ms,
+        )
+    }
+
+    /// Live-clock counterpart that samples pricing completion after the
+    /// synchronous worker finishes. Replay callers use the deterministic
+    /// zero-duration wrapper above.
+    pub fn on_owned_execution_event_at_with_finish_clock(
+        &mut self,
+        event: StrategyEvent,
+        receipt_ns: u64,
+        processing_ns: u64,
+        observed_now_ms: TimeMs,
+        strategy_is_live: bool,
+        worker_clock: impl FnMut() -> TimeMs,
+    ) -> Vec<ChaosExecutionIntent> {
+        self.on_owned_execution_event_at_inner(
+            event,
+            LocalDeliveryClocks {
+                receipt_ns,
+                processing_ns,
+                observed_now_ms,
+            },
+            strategy_is_live,
+            true,
+            worker_clock,
+        )
+    }
+
+    /// Live-runtime counterpart. A reached depth still updates entity state
+    /// while a closed Live gate suppresses Java's pricing-worker invocation.
+    pub fn on_owned_live_execution_event_at_with_finish_clock(
+        &mut self,
+        event: StrategyEvent,
+        receipt_ns: u64,
+        processing_ns: u64,
+        observed_now_ms: TimeMs,
+        strategy_is_live: bool,
+        worker_clock: impl FnMut() -> TimeMs,
+    ) -> Vec<ChaosExecutionIntent> {
+        self.on_owned_execution_event_at_inner(
+            event,
+            LocalDeliveryClocks {
+                receipt_ns,
+                processing_ns,
+                observed_now_ms,
+            },
+            strategy_is_live,
+            false,
+            worker_clock,
+        )
+    }
+
+    fn on_owned_execution_event_at_inner(
+        &mut self,
+        event: StrategyEvent,
+        clocks: LocalDeliveryClocks,
+        strategy_is_live: bool,
+        refresh_when_inactive: bool,
+        worker_clock: impl FnMut() -> TimeMs,
+    ) -> Vec<ChaosExecutionIntent> {
         match event {
-            StrategyEvent::Market(MarketEvent::Depth(book)) => self.on_owned_depth(book),
+            StrategyEvent::Market(MarketEvent::Depth(book)) => self.on_owned_depth_at(
+                book,
+                clocks.processing_ns,
+                clocks.observed_now_ms,
+                strategy_is_live,
+                refresh_when_inactive,
+                worker_clock,
+            ),
+            StrategyEvent::Market(MarketEvent::Trade {
+                ts_ms,
+                symbol,
+                price,
+                qty,
+                taker_side,
+            }) => {
+                self.advance_time(ts_ms);
+                let crossed = self.entities.get_mut(&symbol).is_some_and(|entity| {
+                    entity.implied_depth.on_public_trade(
+                        entity.book.as_ref(),
+                        price,
+                        qty,
+                        taker_side,
+                    )
+                });
+                if crossed && strategy_is_live {
+                    self.schedule_trade_reprice(clocks.receipt_ns, clocks.processing_ns);
+                }
+                Vec::new()
+            }
             event => self.on_execution_event(&event),
+        }
+    }
+
+    /// Borrowed counterpart of [`Self::on_owned_execution_event_at`].
+    pub fn on_execution_event_at(
+        &mut self,
+        event: &StrategyEvent,
+        receipt_ns: u64,
+        processing_ns: u64,
+        observed_now_ms: TimeMs,
+        strategy_is_live: bool,
+    ) -> Vec<ChaosExecutionIntent> {
+        match event {
+            StrategyEvent::Market(MarketEvent::Depth(book)) => {
+                self.advance_time(book.ts_ms);
+                if let Some(entity) = self.entities.get_mut(&book.symbol) {
+                    entity.implied_depth.on_depth(observed_now_ms);
+                    entity.book = Some(book.clone());
+                }
+                if strategy_is_live {
+                    if self.trigger_live_depth_pricing_worker(processing_ns, observed_now_ms) {
+                        self.start_immediate_live_pricing_worker(observed_now_ms);
+                        self.advance_time(observed_now_ms);
+                        let intents = self.refresh_quotes();
+                        self.finish_live_pricing_worker(observed_now_ms);
+                        intents
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    self.observe_compatibility_depth_worker(processing_ns, observed_now_ms);
+                    self.refresh_quotes()
+                }
+            }
+            StrategyEvent::Market(MarketEvent::Trade {
+                ts_ms,
+                symbol,
+                price,
+                qty,
+                taker_side,
+            }) => {
+                self.advance_time(*ts_ms);
+                let crossed = self.entities.get_mut(symbol).is_some_and(|entity| {
+                    entity.implied_depth.on_public_trade(
+                        entity.book.as_ref(),
+                        *price,
+                        *qty,
+                        *taker_side,
+                    )
+                });
+                if crossed && strategy_is_live {
+                    self.schedule_trade_reprice(receipt_ns, processing_ns);
+                }
+                Vec::new()
+            }
+            event => self.on_execution_event(event),
         }
     }
 
     pub(super) fn on_market_event(&mut self, event: &MarketEvent) -> Vec<ChaosExecutionIntent> {
         match event {
             MarketEvent::Depth(book) => self.on_depth(book),
-            MarketEvent::Trade { ts_ms, .. } => {
+            MarketEvent::Trade {
+                ts_ms,
+                symbol,
+                price,
+                qty,
+                taker_side,
+            } => {
                 self.advance_time(*ts_ms);
+                if let Some(entity) = self.entities.get_mut(symbol) {
+                    entity.implied_depth.on_public_trade(
+                        entity.book.as_ref(),
+                        *price,
+                        *qty,
+                        *taker_side,
+                    );
+                }
                 Vec::new()
             }
             MarketEvent::IndexPrice {
@@ -172,6 +402,17 @@ impl ChaosStrategy {
                 self.refresh_quotes()
             }
         }
+    }
+}
+
+fn strategy_event_ts_ms(event: &StrategyEvent) -> TimeMs {
+    match event {
+        StrategyEvent::Market(event) => event.ts_ms(),
+        StrategyEvent::Order(update) => update.ts_ms,
+        StrategyEvent::Account(update) => update.ts_ms,
+        StrategyEvent::Timer(event) => event.ts_ms,
+        StrategyEvent::Control(event) => event.ts_ms,
+        StrategyEvent::System(event) => event.ts_ms,
     }
 }
 

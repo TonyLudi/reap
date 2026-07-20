@@ -226,6 +226,7 @@ fn seed_java_calculator_books(strategy: &mut ChaosStrategy) {
 mod configuration;
 mod execution_lifecycle;
 mod hedge_selection;
+mod public_trade;
 mod quote_pricing;
 mod reference_inputs;
 mod risk_controls;

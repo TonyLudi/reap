@@ -172,7 +172,10 @@ impl BacktestRunner {
                 self.drain_through(now_ns)?;
                 self.schedule_after(
                     latency_ms,
-                    ScheduledAction::DeliverStrategy(event.into_strategy_event()),
+                    ScheduledAction::DeliverTradeStrategy {
+                        event: event.into_strategy_event(),
+                        arrival_ns,
+                    },
                 );
                 self.drain_through(now_ns)?;
             }

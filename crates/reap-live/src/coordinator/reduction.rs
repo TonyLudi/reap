@@ -1,4 +1,4 @@
-use reap_core::{NormalizedEvent, SystemEvent, SystemEventKind, TimeMs};
+use reap_core::{MarketEvent, NormalizedEvent, SystemEvent, SystemEventKind, TimeMs};
 use reap_engine::ChaosEngineOutput;
 use reap_risk::RiskDecision;
 use reap_storage::{SafetyLatchRecord, SafetyLatchScope, SafetyLatchSource, StorageRecord};
@@ -15,6 +15,60 @@ impl LiveCoordinator {
         &mut self,
         event: NormalizedEvent,
         observed_now_ms: TimeMs,
+    ) -> CoordinatorOutput {
+        let mut local_clock = || observed_now_ms;
+        self.process_normalized_at_with_clock(event, observed_now_ms, &mut local_clock)
+    }
+
+    pub(super) fn process_normalized_at_with_clock(
+        &mut self,
+        event: NormalizedEvent,
+        observed_now_ms: TimeMs,
+        local_clock: &mut dyn FnMut() -> TimeMs,
+    ) -> CoordinatorOutput {
+        self.process_normalized_inner(event, observed_now_ms, None, || None, local_clock)
+    }
+
+    #[cfg(test)]
+    pub(super) fn process_normalized_arrived_at(
+        &mut self,
+        event: NormalizedEvent,
+        observed_now_ms: TimeMs,
+        arrival_ns: u64,
+    ) -> CoordinatorOutput {
+        self.process_normalized_inner(
+            event,
+            observed_now_ms,
+            Some(arrival_ns),
+            || Some((arrival_ns, observed_now_ms)),
+            || observed_now_ms,
+        )
+    }
+
+    pub(super) fn process_normalized_received_at(
+        &mut self,
+        event: NormalizedEvent,
+        observed_now_ms: TimeMs,
+        receipt_ns: u64,
+        processing_clock: impl FnOnce() -> (u64, TimeMs),
+        finish_clock: impl FnMut() -> TimeMs,
+    ) -> CoordinatorOutput {
+        self.process_normalized_inner(
+            event,
+            observed_now_ms,
+            Some(receipt_ns),
+            || Some(processing_clock()),
+            finish_clock,
+        )
+    }
+
+    fn process_normalized_inner(
+        &mut self,
+        event: NormalizedEvent,
+        observed_now_ms: TimeMs,
+        receipt_ns: Option<u64>,
+        processing_clock: impl FnOnce() -> Option<(u64, TimeMs)>,
+        mut finish_clock: impl FnMut() -> TimeMs,
     ) -> CoordinatorOutput {
         let strategy_references_were_ready = self.startup.strategy_references_ready();
         let account_halt = match &event {
@@ -82,7 +136,40 @@ impl LiveCoordinator {
             _ => {}
         }
         let sync_stablecoin_readiness = self.event_updates_stablecoin_readiness(&event);
-        let engine_output = self.engine.on_chaos_event(event);
+        let strategy_is_live = self.strategy_is_live();
+        let uses_depth_processing_clock =
+            matches!(&event, NormalizedEvent::Market(MarketEvent::Depth(_)))
+                && receipt_ns.is_some();
+        let uses_trade_processing_clock =
+            matches!(&event, NormalizedEvent::Market(MarketEvent::Trade { .. }))
+                && receipt_ns.is_some();
+        let engine_output = if uses_depth_processing_clock {
+            self.engine.on_chaos_event_with_strategy_clock(
+                event,
+                strategy_is_live,
+                || processing_clock().expect("received depth must provide a processing clock"),
+                &mut finish_clock,
+            )
+        } else if let Some(receipt_ns) = receipt_ns {
+            self.engine.on_chaos_event_at_with_finish_clock(
+                event,
+                receipt_ns,
+                observed_now_ms,
+                strategy_is_live,
+                || {
+                    if uses_trade_processing_clock {
+                        processing_clock()
+                            .expect("received trade must provide a processing clock")
+                            .0
+                    } else {
+                        receipt_ns
+                    }
+                },
+                &mut finish_clock,
+            )
+        } else {
+            self.engine.on_chaos_event(event)
+        };
         if sync_stablecoin_readiness {
             self.sync_stablecoin_readiness(now_ms);
         }
@@ -90,7 +177,18 @@ impl LiveCoordinator {
             actions: Vec::new(),
             records,
         };
-        self.handle_engine_output(now_ms, engine_output, &mut output);
+        let routing_observed_now_ms = if uses_depth_processing_clock {
+            finish_clock()
+        } else {
+            observed_now_ms
+        };
+        self.handle_engine_output(
+            now_ms,
+            routing_observed_now_ms,
+            engine_output,
+            &mut finish_clock,
+            &mut output,
+        );
         if let Some((account_id, reason)) = account_halt {
             self.ensure_account_cancels(
                 now_ms,
@@ -172,12 +270,21 @@ impl LiveCoordinator {
         }
     }
 
-    fn handle_engine_output(
+    pub(super) fn handle_engine_output(
         &mut self,
         now_ms: TimeMs,
+        observed_now_ms: TimeMs,
         engine_output: ChaosEngineOutput,
+        local_send_clock: &mut dyn FnMut() -> TimeMs,
         output: &mut CoordinatorOutput,
     ) {
+        #[cfg(test)]
+        self.chaos_intent_trace.extend(
+            engine_output
+                .intents
+                .iter()
+                .map(|intent| (intent.purpose(), intent.to_order_intent())),
+        );
         for system in engine_output.system_events {
             if system.kind == SystemEventKind::RiskBreach {
                 output
@@ -210,7 +317,14 @@ impl LiveCoordinator {
                 ts_ms: now_ms,
                 intent: legacy.clone(),
             });
-            self.route_chaos_intent(now_ms, intent, legacy, output);
+            self.route_chaos_intent(
+                now_ms,
+                observed_now_ms,
+                intent,
+                legacy,
+                local_send_clock,
+                output,
+            );
         }
         for candidate in engine_output.safety_cancel_candidates {
             let legacy = candidate.to_order_intent();

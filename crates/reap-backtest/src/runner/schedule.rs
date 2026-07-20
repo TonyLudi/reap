@@ -1,6 +1,5 @@
 use anyhow::{Result, bail};
 use reap_core::{MarketEvent, StrategyEvent};
-use reap_strategy::Strategy;
 
 use crate::{
     ACCOUNT_REFRESH_INTERVAL_NS, BacktestRunner, MAX_ACTIONS_PER_DRAIN, NS_PER_MS, ScheduledAction,
@@ -36,8 +35,10 @@ impl BacktestRunner {
             }
             ScheduledAction::DeliverOrder(update) => {
                 let update = retime_order_update(update, time_ms(self.replay.now_ns));
-                let commands = self.strategy.on_event(&StrategyEvent::Order(update));
-                self.accept_intents(commands)?;
+                let intents = self
+                    .strategy
+                    .on_execution_event(&StrategyEvent::Order(update));
+                self.accept_chaos_intents(intents)?;
             }
             ScheduledAction::DeliverAccount(update) => {
                 self.orders.pending_fill_account_updates =
@@ -46,9 +47,9 @@ impl BacktestRunner {
                     StrategyEvent::Account(update),
                     time_ms(self.replay.now_ns),
                 );
-                let commands = self.strategy.on_event(&event);
+                let intents = self.strategy.on_execution_event(&event);
                 self.orders.last_account_publish_ns = Some(self.replay.now_ns);
-                self.accept_intents(commands)?;
+                self.accept_chaos_intents(intents)?;
             }
             ScheduledAction::DeliverStrategy(event) => {
                 let currency_rate = match &event {
@@ -66,8 +67,42 @@ impl BacktestRunner {
                 if matches!(event, StrategyEvent::Account(_)) {
                     self.orders.last_account_publish_ns = Some(self.replay.now_ns);
                 }
-                let commands = self.strategy.on_event(&event);
-                self.accept_intents(commands)?;
+                let intents = if matches!(event, StrategyEvent::Market(MarketEvent::Depth(_))) {
+                    let intents = self.strategy.on_owned_execution_event_at(
+                        event,
+                        self.replay.now_ns,
+                        self.replay.now_ns,
+                        time_ms(self.replay.now_ns),
+                        self.replay.trade_reprice_active,
+                    );
+                    self.schedule_new_trade_reprice_wake();
+                    intents
+                } else {
+                    self.strategy.on_execution_event(&event)
+                };
+                self.accept_chaos_intents(intents)?;
+            }
+            ScheduledAction::DeliverTradeStrategy { event, arrival_ns } => {
+                let event = retime_strategy_event(event, time_ms(self.replay.now_ns));
+                let intents = self.strategy.on_owned_execution_event_at(
+                    event,
+                    arrival_ns,
+                    self.replay.now_ns,
+                    time_ms(self.replay.now_ns),
+                    true,
+                );
+                self.replay.trade_reprice_active |= self.schedule_new_trade_reprice_wake();
+                self.accept_chaos_intents(intents)?;
+            }
+            ScheduledAction::TradeRepriceWake { deadline_ns } => {
+                debug_assert!(deadline_ns <= self.replay.now_ns);
+                let intents = self.strategy.service_one_due_trade_reprice(
+                    self.replay.now_ns,
+                    time_ms(self.replay.now_ns),
+                    self.replay.trade_reprice_active,
+                );
+                self.schedule_new_trade_reprice_wake();
+                self.accept_chaos_intents(intents)?;
             }
             ScheduledAction::RefreshAccount => {
                 let due = self.orders.last_account_publish_ns.is_some_and(|last| {
@@ -75,11 +110,13 @@ impl BacktestRunner {
                 });
                 if due && self.orders.pending_fill_account_updates == 0 {
                     let update = self.current_account_update(None);
-                    let commands = self.strategy.on_event(&StrategyEvent::Account(update));
+                    let intents = self
+                        .strategy
+                        .on_execution_event(&StrategyEvent::Account(update));
                     self.orders.last_account_publish_ns = Some(self.replay.now_ns);
                     self.orders.periodic_account_refreshes =
                         self.orders.periodic_account_refreshes.saturating_add(1);
-                    self.accept_intents(commands)?;
+                    self.accept_chaos_intents(intents)?;
                 }
                 self.schedule_next_account_refresh();
             }
@@ -100,6 +137,18 @@ impl BacktestRunner {
         let seq = self.schedule.next_action_seq;
         self.schedule.next_action_seq = self.schedule.next_action_seq.saturating_add(1);
         self.schedule.scheduled.insert((due_ns, seq), action);
+    }
+
+    fn schedule_new_trade_reprice_wake(&mut self) -> bool {
+        let mut inserted = false;
+        while let Some(deadline_ns) = self.strategy.take_new_trade_reprice_wake_deadline_ns() {
+            inserted = true;
+            self.schedule_at(
+                deadline_ns.max(self.replay.now_ns),
+                ScheduledAction::TradeRepriceWake { deadline_ns },
+            );
+        }
+        inserted
     }
 
     pub(super) fn drain_before(&mut self, cutoff_ns: u64) -> Result<()> {

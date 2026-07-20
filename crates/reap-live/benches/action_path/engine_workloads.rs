@@ -307,37 +307,56 @@ struct TradeRepriceBaselineScenario {
     aggressive_trade: NormalizedEvent,
 }
 
-pub(super) fn trade_reprice_zero_baseline_workload() -> WorkloadResult {
+pub(super) fn public_trade_reprice_workload() -> WorkloadResult {
+    const BASE_TS_MS: u64 = 1_000;
     let result = run_workload(
-        "public_trade_reprice_zero_baseline",
+        "public_trade_implied_depth_reprice",
         "bench-declared monotonic replay arrival and arrival+100,000ns deadline; production \
          TradingEngine<ChaosStrategy>/RiskGate delivery of a taker-Buy trade that strictly \
          crosses a three-level raw ask book and whose exact-half quantity moves Java's implied \
-         first-valid level from 50,001 to 50,003",
-        "wire parsing; feed dedup/reduction; private deferred-action scheduling and due-action \
-         service (the missing Phase 0 behavior); live runtime queues; coordinator/storage; \
-         gateway preparation; adapter serialization; disk/network/acknowledgement",
+         first-valid level from 50,001 to 50,003; private bounded callback scheduling and exact-due \
+         service through the production strategy/engine/risk path",
+        "wire parsing; feed dedup/reduction; live runtime queues and select; \
+         coordinator/storage; gateway preparation; adapter serialization; \
+        disk/network/acknowledgement",
         || {
-            let mut engine = benchmark_engine(permissive_risk_limits());
+            let mut engine = benchmark_engine_with_config(permissive_risk_limits(), |config| {
+                // The synthetic clock advances for 100,000 independent
+                // observations without replaying depth. Disable only that
+                // benchmark artifact so the workload continues to time
+                // public-trade scheduling and repricing rather than
+                // manufactured book staleness.
+                for instrument in &mut config.instruments {
+                    instrument.depth_stale_threshold_ms = u64::MAX;
+                }
+            });
             black_box(
-                engine.on_chaos_event(NormalizedEvent::Market(MarketEvent::Depth(OrderBook {
-                    symbol: "BTC-USDT".to_string(),
-                    ts_ms: 1,
-                    bids: [50_000.0, 49_999.0, 49_998.0]
-                        .map(|px| Level::new(px, 10.0))
-                        .to_vec(),
-                    asks: [50_001.0, 50_002.0, 50_003.0]
-                        .map(|px| Level::new(px, 10.0))
-                        .to_vec(),
-                }))),
+                engine.on_chaos_event_at(
+                    NormalizedEvent::Market(MarketEvent::Depth(OrderBook {
+                        symbol: "BTC-USDT".to_string(),
+                        ts_ms: BASE_TS_MS,
+                        bids: [50_000.0, 49_999.0, 49_998.0]
+                            .map(|px| Level::new(px, 10.0))
+                            .to_vec(),
+                        asks: [50_001.0, 50_002.0, 50_003.0]
+                            .map(|px| Level::new(px, 10.0))
+                            .to_vec(),
+                    })),
+                    900_000_000,
+                    BASE_TS_MS,
+                    true,
+                ),
             );
-            black_box(
-                engine.on_chaos_event(depth_event("BTC-PERP", 1, 50_003.0, 50_004.0, 10_000.0)),
-            );
+            black_box(engine.on_chaos_event_at(
+                depth_event("BTC-PERP", BASE_TS_MS + 5, 50_003.0, 50_004.0, 10_000.0),
+                905_000_000,
+                BASE_TS_MS + 5,
+                true,
+            ));
             TradeRepriceBaselineScenario {
                 engine,
                 aggressive_trade: NormalizedEvent::Market(MarketEvent::Trade {
-                    ts_ms: 2,
+                    ts_ms: BASE_TS_MS + 6,
                     symbol: "BTC-USDT".to_string(),
                     price: 50_002.0,
                     qty: 5.0,
@@ -347,27 +366,52 @@ pub(super) fn trade_reprice_zero_baseline_workload() -> WorkloadResult {
         },
         |scenario, index| {
             let arrival_ns = 1_000_000_000_u64
-                .checked_add((index as u64).saturating_mul(1_000_000))
+                .checked_add((index as u64).saturating_mul(10_000_000))
                 .expect("benchmark arrival timeline");
             let expected_due_ns = arrival_ns
                 .checked_add(100_000)
                 .expect("trade-reprice deadline");
-            black_box((arrival_ns, expected_due_ns));
-            let output = scenario
-                .engine
-                .on_chaos_event(scenario.aggressive_trade.clone());
-            let counters = count_engine_output(&output);
-            black_box(output);
+            let observed_now_ms = BASE_TS_MS
+                .checked_add(10)
+                .and_then(|base| base.checked_add((index as u64).saturating_mul(10)))
+                .expect("benchmark millisecond timeline");
+            let delivered = scenario.engine.on_chaos_event_at(
+                scenario.aggressive_trade.clone(),
+                arrival_ns,
+                observed_now_ms,
+                true,
+            );
+            assert!(delivered.intents.is_empty());
+            assert_eq!(
+                scenario.engine.next_chaos_trade_reprice_due_ns(),
+                Some(expected_due_ns)
+            );
+
+            let repriced = scenario.engine.service_one_due_chaos_trade_reprice(
+                expected_due_ns,
+                observed_now_ms,
+                true,
+            );
+            let mut counters = count_engine_output(&delivered);
+            let mut reprice_counters = count_engine_output(&repriced);
+            reprice_counters.inputs = 0;
+            reprice_counters.normalized_outputs = 0;
+            counters.merge(reprice_counters);
+            counters.trade_reprice_actions = 1;
+            black_box((delivered, repriced));
             Observation {
                 counters,
                 queue_age_ns: None,
             }
         },
     );
-    assert_eq!(result.counters.typed_intents, 0);
     assert_eq!(
-        result.counters.trade_reprice_actions, 0,
-        "Phase 0 must preserve and record the missing due trade-reprice action"
+        result.counters.trade_reprice_actions, TIMED_OBSERVATIONS as u64,
+        "Phase 2 must service exactly one due trade-reprice action per input"
+    );
+    assert!(
+        result.counters.typed_intents >= TIMED_OBSERVATIONS as u64,
+        "the pinned crossing fixture must produce a nonzero reprice result"
     );
     result
 }

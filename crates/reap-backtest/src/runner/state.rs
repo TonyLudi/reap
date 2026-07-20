@@ -18,6 +18,11 @@ pub(super) struct ReplayState {
     pub(super) input_events: u64,
     pub(super) input_clock_regressions: u64,
     pub(super) max_input_clock_regression_ns: u64,
+    // Causal private replay state. The established economic depth path stays
+    // unchanged until a reached aggressive public trade schedules the pinned
+    // Java callback; from that point forward, depth and callbacks share the
+    // worker. No future input is inspected to choose earlier behavior.
+    pub(super) trade_reprice_active: bool,
 }
 
 pub(super) struct ScheduleState {

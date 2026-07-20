@@ -143,8 +143,16 @@ fn coordinator_with_gateway_actions(gateway_actions_enabled: bool) -> LiveCoordi
 }
 
 fn coordinator_with_risk(gateway_actions_enabled: bool, risk: RiskLimits) -> LiveCoordinator {
-    let mut strategy: ChaosConfig =
+    let strategy: ChaosConfig =
         toml::from_str(include_str!("../../../../examples/iarb2-basic.toml")).unwrap();
+    coordinator_with_strategy_and_risk(gateway_actions_enabled, risk, strategy)
+}
+
+fn coordinator_with_strategy_and_risk(
+    gateway_actions_enabled: bool,
+    risk: RiskLimits,
+    mut strategy: ChaosConfig,
+) -> LiveCoordinator {
     strategy.reference_data_stale_threshold_ms = Some(120_000);
     strategy.risk_groups[0].account_id = Some("main".to_string());
     let config = LiveConfig {
@@ -551,8 +559,10 @@ fn cancelled_private_order(
 
 mod execution_recovery;
 mod private_feed;
+mod public_trade_reprice;
 mod readiness_reconciliation;
 mod routing_safety;
+mod trade_fixture_replay;
 
 fn collect_coordinator_module_sources(
     directory: &std::path::Path,

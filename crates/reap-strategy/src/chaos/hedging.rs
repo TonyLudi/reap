@@ -4,6 +4,7 @@ use std::sync::Arc;
 use reap_core::{Price, Quantity, Side, Symbol, TimeMs, round_down_to_lot};
 
 use crate::ChaosExecutionIntent;
+use crate::execution::ChaosHedgeCommit;
 
 use super::{ChaosStrategy, EPS, RiskGroupKindConfig, approx_eq};
 
@@ -345,22 +346,29 @@ impl ChaosStrategy {
             self.hedging.last_hedge_ms = self.now_ms;
         }
         let source_label = source_symbol.unwrap_or("timer");
-        targets
-            .into_iter()
-            .filter_map(|target| {
-                let entity = self.entities.get(&target.symbol)?;
-                if target.qty < entity.config.min_trade_size {
-                    return None;
-                }
-                Some(ChaosExecutionIntent::hedge(
-                    target.symbol,
+        let mut intents = Vec::with_capacity(targets.len());
+        for target in targets {
+            let Some(entity) = self.entities.get(&target.symbol) else {
+                continue;
+            };
+            if target.qty < entity.config.min_trade_size {
+                continue;
+            }
+            intents.push(ChaosExecutionIntent::hedge(
+                target.symbol,
+                hedge_side,
+                target.qty,
+                target.hedge_px,
+                format!("hedge:{}:{}", source_label, target.orig_px),
+                ChaosHedgeCommit::new(
+                    Arc::clone(&entity.symbol_key),
                     hedge_side,
-                    target.qty,
-                    target.hedge_px,
-                    format!("hedge:{}:{}", source_label, target.orig_px),
-                ))
-            })
-            .collect()
+                    target.orig_px,
+                    target.cur_level_acc_qty,
+                ),
+            ));
+        }
+        intents
     }
 
     pub(super) fn delta_to_hedge(&self) -> f64 {
@@ -450,9 +458,13 @@ impl ChaosStrategy {
                 .and_modify(|target| {
                     target.qty += qty;
                     target.notional_usd += notional;
+                    target.cur_level_acc_qty = if target.orig_px == level.px {
+                        target.cur_level_acc_qty + qty
+                    } else {
+                        qty
+                    };
                     target.orig_px = level.px;
                     target.hedge_px = hedge_px;
-                    target.cur_level_acc_qty = qty;
                 })
                 .or_insert_with(|| HedgeTarget {
                     symbol: level.symbol.clone(),

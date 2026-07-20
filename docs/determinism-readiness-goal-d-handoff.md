@@ -1,8 +1,8 @@
 # Determinism And Measured Runtime Goal D Handoff
 
-Status: Phases 0 and 1 green; Phase 2 is next. This is an evidence ledger, not a trading
-authorization. Until every required Goal D phase and global gate below is
-recorded green, the active execution contract remains
+Status: Phases 0 and 1 green; the Phase 2 gate is in progress. This is an
+evidence ledger, not a trading authorization. Until every required Goal D
+phase and global gate below is recorded green, the active execution contract remains
 [determinism-readiness-goal-d-prompt.md](determinism-readiness-goal-d-prompt.md).
 
 ## Scope
@@ -30,7 +30,7 @@ runtime concurrency redesign.
 | Prompt-only execution contract | Green | `b4a3752` |
 | 0. Baseline, call-path audit, and measurement contract | Green | `768ee0a` |
 | 1. Deterministic fail-closed cancellation | Green | `4c49cae` |
-| 2. Pinned-Java public-trade parity | Pending | Pending |
+| 2. Pinned-Java public-trade parity | In progress | Pending |
 | 3. Explicit decision/risk replay parity | Pending | Pending |
 | 4. Exact regular order-to-wire numeric boundary | Pending | Pending |
 | 5. Action-path performance and runtime health | Pending | Pending |
@@ -801,12 +801,13 @@ proves byte-identical `px` and `sz` fields between both serializers.
 
 ## Authorized Output-Change Ledger
 
-Only the narrowly authorized Phase 1 production behavior has changed.
+Only the narrowly authorized Phase 1 and Phase 2 production behaviors have
+changed.
 
 | Phase | Authorized change | Before evidence | After evidence |
 | --- | --- | --- | --- |
 | 1 | Stable risk-derived cancellation order only | Four insertion orders across 24 child processes produced distinct generic/typed traversal bytes | Every child and insertion order produces `reap-02,reap-10,reap-2,reap-a1,reap-perp,reap-z0`; strategy cancels remain first |
-| 2 | Pinned public-trade implied depth and private 100-microsecond reprice only | Pending | Pending |
+| 2 | Pinned public-trade implied depth and private 100-microsecond reprice only | Phase 0 public-trade workload produced zero trade-reprice actions and Rust retained no reached implied-depth trade state | Java-bound fixtures now produce exact implied-depth state, one private callback per qualifying trade, shared five-millisecond worker behavior, and identical ordered live/replay projections |
 | 3 | No default behavior change; new credential-free decision trace | Pending | Pending |
 | 4 | Canonical exact numeric identity and `px`/`sz` bytes only | Pending | Pending |
 | 5 | No decisions; bounded metrics/health snapshots only | Pending | Pending |
@@ -989,6 +990,243 @@ In particular, ordinary non-action rows and both fail-closed rows retained
 their exact allocation totals. The workspace adjacency, version inventory,
 authority declaration, `Cargo.lock`, and canonical no-trade backtest anchors
 remain unchanged. No stop condition was reached.
+
+### Phase 2
+
+The Phase 2 implementation and evidence are green locally. The exact result
+commit is bound by the following documentation-only gate-close commit.
+
+The regression was established before the production path existed. The
+Phase 0 `public_trade_implied_depth_reprice` workload consumed 100,000 public
+trades but recorded zero trade-reprice actions, zero typed intents, and the
+exact Phase 0/1 logical projection. The new focused tests then required the
+checked-in Java truth tables, a private receipt-time-plus-100,000-nanosecond
+callback, causal live/backtest service, and exact typed/legacy output; those
+requirements could not pass against the Phase 1 parent, which ignored trades
+for strategy repricing.
+
+#### Pinned Java evidence and implemented boundary
+
+Every Phase 2 Java fixture binds the clean sibling checkout at
+`b6b120c7b7c466d8431bf082f3229328c5d7b2ae`. The reached call path remains:
+
+```text
+ChaosStrategyBase.onPublicTrade
+  -> OkEntity.onPublicTrade / isDepthUpdatedOnTrade
+  -> Iarb2Strategy.onPublicTrade
+  -> TimerResource.scheduleWithMicro(() -> pricingWorker.work(), 100L)
+  -> ChaosTimedConflationWorker.work
+  -> ChaosConflationWorker.runWork
+  -> Iarb2Strategy.updatePricingAndQuote
+  -> Iarb2Strategy.updatePricing(false)
+```
+
+The fixtures also bind the reached `OkEntity`/`ExchEntityBase` implied-depth
+selection, `ChaosEntity.updateOurHedge`, `NumberUtil` fuzzy comparisons,
+`FakeRandomProviderImpl`, and `ChaosMassQuoter` RNG consumption. Their exact
+hashes are:
+
+| Fixture | SHA-256 |
+| --- | --- |
+| `fixtures/java/chaos_trade_implied_depth_v2.json` | `e878270db08f223e3a70da58030953724d42e4a84bfb87ed5bd80397e17b858e` |
+| `fixtures/java/chaos_pricing_worker_clock_v1.json` | `af97ac1c237b433af5762d9b286006696c1fe0bc03dc96a28a92171e0b78344b` |
+| `fixtures/java/chaos_trade_rng_interleaving_v1.json` | `76cfa935b47835add52ccbfb668d198195e10cb92802e1c45fd9d807004fe3f0` |
+| `fixtures/normalized/chaos_trade_implied_depth.jsonl` | `d447ad85a3e31bc35b73d844029068e68ee89cc6eaf04dfef27f5ab8ba670cf8` |
+| `fixtures/normalized/chaos_trade_implied_depth_intents_v2.json` | `de11a8d56534bfc10d6da598e5fc6cfd717227d45a777220759454f9b3a624de` |
+
+The implied-depth fixture has 10 atomic and 11 sequence cases. It fixes the
+reversed taker-to-book side, strict aggressive crossing, equality and exact
+half-level-quantity boundaries, arrival-order rather than exchange-timestamp
+state, depth clearing, repeated and alternating trades, ignored-best and
+pending-own-hedge interactions, the 30-millisecond pending-hedge expiry, the
+100-microsecond callback, and the shared five-millisecond pricing worker. The
+clock fixture separately fixes Java's decision, actual work-start, and finish
+clock reads for immediate depth, immediate callback, and direct scheduled
+timer paths. The RNG fixture fixes a 13-step interleaving, five service points,
+and five exact draws.
+
+The implementation is deliberately private to the existing ownership tree:
+
+- `InstrumentState` owns the reached implied-depth cache, last-trade state,
+  and pending locally sent hedge state.
+- A qualifying public trade updates that state, reverses taker side to raw
+  book side, and schedules one private callback from captured local receipt
+  time plus exactly 100,000 nanoseconds only while the existing live gate is
+  open. Exchange timestamps remain input data.
+- The callback queue and shared pricing-worker timer queue are bounded at
+  65,536. Common one/two-wake and one-timer cases are inline; the rare overlap
+  is FIFO. Multiple qualifying trades retain callback multiplicity while
+  pricing work follows Java's five-millisecond trailing conflation.
+- Live uses one captured monotonic origin and services one due private action
+  after shutdown, safety/control, operator, reconciliation, and periodic timer
+  branches, immediately before ordinary feed receive. It does not add a
+  socket, channel, subscription, public event, timer, configuration, journal,
+  capture, or report field.
+- Backtest uses its existing nanosecond scheduler and global sequence
+  tie-breaker. It activates the shared worker only when the first qualifying
+  trade makes the Java behavior reachable, promotes only causally accumulated
+  depth timing state, and never scans future input.
+- The live and replay paths distinguish receipt, processing, Java decision,
+  actual work-start, finish, and post-local-reservation send clocks exactly.
+  The ordinary compatibility wrapper derives a causal deterministic
+  nanosecond clock from its event timestamp and fails closed on overflow.
+- A hedge's implied-depth transition is compact, crate-private, non-Clone,
+  non-serializable, and committed only after the genuine typed intent is
+  accepted by the existing local reservation seam. A compile-fail fixture
+  prevents public extraction. `ChaosExecutionIntent` remains exactly 80 bytes.
+
+No public trade is reinterpreted as `BurstSignal`. Raw trade
+matching/calibration remains separate from the strategy reaction. The
+plan-derived trade subscription was already mandatory, and no connectivity,
+exchange operation, dependency, command lane, public authority token, or
+schema version was added.
+
+#### Deterministic and authority gates
+
+The final-tree focused/full commands were:
+
+```text
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo test -p reap-strategy --locked
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo test -p reap-engine --locked
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo test -p reap-backtest --locked
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo test -p reap-live --locked --no-fail-fast
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo clippy -p reap-strategy -p reap-engine -p reap-backtest -p reap-live \
+  --all-targets --locked -- -D warnings
+cargo fmt --all -- --check
+cargo metadata --locked --format-version 1 >/dev/null
+git diff --check
+```
+
+Results: strategy 107/107 plus three compile-fail boundary fixtures; engine
+7/7; backtest 131/131; live 248/248 plus two compile-fail authority fixtures,
+four dependency/source-policy tests, its runtime compatibility test, and all
+doc tests. Clippy passed with warnings denied; formatting, metadata, and diff
+checks passed.
+
+The canonical no-trade CLI backtest was rerun twice. The two outputs compare
+byte-identically with one another and with Phase 0, all at:
+
+```text
+38acf9f5e0c310f2ec5528974beffadf4c1a7f84d46efa8d9664ee7051e84691
+```
+
+The five new fixture files parse completely and bind the exact Java SHA.
+Existing immutable anchors remain:
+
+| Guard | Phase 2 result |
+| --- | --- |
+| Workspace adjacency, 23 lines | `fe98cedfaa2653e09afd57293eb71372ea476c1997e56b5ce9f27b314f5a432b` |
+| Version inventory, 42 lines | `496653f1bba2b859a12ede28067a44a76935789d9cae7f39b4a59f95270333de` |
+| Literal `AlertEvent` schema guard, one line | `b7038321dbc71e3d8c3f41f6adae0fce53221cd4fc701cc76b173aefb2f48b41` |
+| `Cargo.lock` | `d8a19fb100aeb4e542a2135d546edfb5ae24629717f5ab65e285cf9bfe483b02` |
+
+The scoped authority-declaration projection moves from 355 declarations and
+`8254498e...` to 356 declarations and
+`bf7af463d3c92836d58682d518942c1e2e3c52c62235fcd59eb3333f0a62e144`.
+The sole addition is
+`crates/reap-live/src/runtime/scheduling.rs: pub(super) fn
+monotonic_now_ns(...)`, a parent-module-only clock helper with no execution
+authority. The sibling checkout is still clean at the pinned full SHA.
+
+#### Same-host benchmark gate
+
+The existing benchmarks used one warm-up and three retained recorded runs:
+
+| Benchmark | Warm-up | Recorded runs | Median | Phase 1 median | Delta |
+| --- | ---: | --- | ---: | ---: | ---: |
+| Engine event loop (ns/event) | 11,815.8 | 11,847.3; 11,795.9; 11,786.4 | 11,795.9 | 11,272.2 | +4.65% |
+| Complete live parity (ns/raw) | 17,448.0 | 17,264.0; 18,651.7; 17,288.6 | 17,288.6 | 17,318.2 | -0.17% |
+
+Every engine run retained 250,000 events and 999,996 intents. Every live run
+retained 50,204 raw frames, 70,208 feed outputs, 65,130 records, zero actions,
+4,193,771 allocation calls, and 1,871,951,969 requested bytes. Ordinary live
+allocation counts therefore remain byte-for-byte at the Phase 1 baseline. The
+18,651.7 ns/raw run is retained as a shared-host outlier.
+
+The final-source action benchmark used a successful formal warm-up and five
+retained recorded runs. Each workload has 10,000 internal warm-up and 100,000
+timed observations, exact all-sample nearest-rank percentiles, a separate
+fresh allocation pass, and zero dropped/overflowed samples. The tuple order
+below is `p50/p95/p99/p99.9/max` nanoseconds:
+
+| Workload | Runs 1 through 5 |
+| --- | --- |
+| Quote creation | `19035/24229/31450/182617/77816689`; `19224/26026/32311/94709/80280945`; `18937/23540/30465/74830/78265782`; `20176/24574/31088/118718/79603493`; `19093/23704/29940/105565/84602577` |
+| Quote replacement/cancel | `13300/16565/19568/28233/304675`; `13235/16483/19159/24066/71990`; `13177/13645/18650/24442/99920`; `13957/14433/19151/24279/507952`; `13341/14540/19413/56270/5262242` |
+| IOC hedge | `24311/29743/34289/47014/47045629`; `24352/30137/34330/46218/47933054`; `24180/26493/33328/47056/46194506`; `25624/27896/33485/43946/44986219`; `24410/27363/34149/65976/50051295` |
+| Risk rejection | `12119/12726/17025/21341/78226`; `14720/21858/26797/44454/153646`; `11995/12390/17288/25862/2606872`; `12668/13128/17542/23951/84298`; `12021/12488/16976/22662/170245` |
+| Symbol fail-close | `640/657/673/1518/32959`; `640/2601/4078/6917/17164`; `632/657/665/1354/16844`; `714/730/739/1690/48836`; `632/664/673/1075/12160` |
+| Global fail-close | `796/829/853/4324/10461`; `796/2798/4250/7269/85307`; `787/813/829/1887/56007`; `878/911/936/4267/26649`; `788/829/853/3356/145285` |
+| Coordinator reduction | `5736/5981/9617/16360/86038`; `5982/11749/15442/24213/108018`; `5727/5891/9231/14835/47974`; `5883/6088/7450/12808/104597`; `5751/5981/8853/13096/130870` |
+| Raw recovery action | `26732/30309/36504/51568/6150388`; `28906/42026/48991/65680/6370634`; `26494/28758/37127/63104/6393116`; `27462/32853/41066/95801/6289881`; `26518/28906/35298/50026/6272511` |
+| Public-trade reprice | `12283/12808/17124/21275/82730`; `12095/12529/16902/20275/79613`; `12160/12578/17246/21300/81000`; `12947/13579/17771/21111/76733`; `12201/12628/17198/22580/106722` |
+| Bounded control/feed storm | `140/189/7622/7738/33033`; `140/197/7696/7762/13604`; `140/189/7655/7746/13637`; `140/205/7589/7704/15524`; `140/189/7672/7762/79678` |
+
+The control/feed queue-age tuples were
+`11954/16098/16968/43396/50985`,
+`11938/15984/16476/20767/26535`,
+`11971/16098/16706/21037/27413`,
+`11930/16197/16886/21908/27676`, and
+`11980/16172/17304/24910/96359` ns. Every run retained 20,000 control and
+80,000 feed dequeues, 20,000 control preemptions, capacity/high-water 80, and
+30,000 saturated offers.
+
+The new public-trade workload is now a real action path: every run has 100,000
+inputs, 100,000 private trade-reprice actions, and 400,000 ordered quote
+intents/produced actions. Its five-run medians are
+`12,201/12,628/17,198/21,275/81,000` ns for
+`p50/p95/p99/p99.9/max` by independently taking the median of each statistic.
+Its allocation projection is exactly 15,000,264 calls and 615,207,392
+requested bytes, or 37.50066 calls and 1,538.01848 bytes per produced action.
+
+All five runs and the final formal warm-up have the exact logical/allocation
+projection SHA-256:
+
+```text
+451af08d7fa061f55f16b099faf85ca934d577fdf5fb8b219668716f9fc1015c
+```
+
+The projection includes every workload name, complete logical counters, and
+total allocation calls/bytes. All ordinary rows retain their Phase 1
+allocations. The IOC row adds exactly one allocation per authorized hedge
+action (23,033,342 calls versus 22,933,342) because its compact private
+transition retains an `Arc<str>` symbol while legacy lowering still creates
+the unchanged public `String`; requested bytes fall by exactly 22,000,000
+(1,228,030,376 versus 1,250,030,376). The permanent 80-byte intent-size guard
+prevents this proof from inflating every quote/rejection row.
+
+The five-run Phase 2 medians against Phase 1 were:
+
+| Workload | p50 delta | p99 delta | p99.9 delta |
+| --- | ---: | ---: | ---: |
+| Queue storm | 0.00% | +0.98% | +1.40% |
+| Coordinator reduction | +3.38% | +16.95% | +25.31% |
+| Global fail-close | +2.18% | +0.95% | +131.15% |
+| IOC hedge | +2.87% | +5.82% | +9.43% |
+| Quote creation | +1.53% | +3.41% | +21.65% |
+| Quote replacement | +3.24% | +7.02% | +9.64% |
+| Raw recovery action | +1.02% | +4.12% | +23.77% |
+| Risk rejection | +1.73% | +2.58% | -2.14% |
+| Symbol fail-close | 0.00% | +1.20% | +41.21% |
+
+The over-10% tails are explained shared-host noise rather than an unreviewed
+reachable cost. Run 2 degraded unrelated paths together (for example risk
+rejection p50 rose about 22% and fail-close p95 rose roughly fourfold), and
+run 4 also showed broad unrelated slowing. During investigation the two-vCPU
+host reported 96-97% idle CPU and zero steal but continuing swap-in activity
+and concurrent Codex/Alloy processes. The affected ordinary source paths and
+their exact allocations/logical counters are unchanged; the new trade row's
+own p99/p99.9 is stable. Every run is retained, no retry is substituted, and
+no target-host latency claim is made.
+
+The updated connectivity/mapping documents now state the exact reached trade
+behavior and retain all exclusions. Independent final fixture/guard review is
+green. No Goal D stop condition was reached.
 
 ## Remaining Operational Blockers
 

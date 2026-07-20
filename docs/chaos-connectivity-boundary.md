@@ -129,7 +129,7 @@ mandate for a particular Rust type layout.
 | Requirement | Input | When required | Consumer |
 | --- | --- | --- | --- |
 | `CHAOS-MD-BOOK` | Sequenced full book for each configured instrument | Always | Quote and hedge calculations |
-| `CHAOS-MD-TRADE` | Public trades for each configured instrument | Always in the pinned live scope | Java OKX implied-depth invalidation and repricing; known Rust behavior gap |
+| `CHAOS-MD-TRADE` | Public trades for each configured instrument | Always in the pinned live scope | Pinned-Java OKX implied-depth invalidation and private deferred repricing |
 | `CHAOS-REF-INDEX` | Configured instrument index ticker | Only for configured index symbols | Index deviation, valuation, and pricing |
 | `CHAOS-REF-FUNDING` | Funding rate | Only for configured swaps | Funding-aware pricing and risk |
 | `CHAOS-REF-MARK` | Mark price | Only for configured derivatives | Derivative valuation and safety |
@@ -150,17 +150,74 @@ mandate for a particular Rust type layout.
 Raw public trades are part of capture and backtest matching/calibration. They
 are also a pinned live Chaos input. `ChaosStrategyBase.doInit` delivers them to
 `OkEntity.onPublicTrade` and `Iarb2Strategy.onPublicTrade`; an aggressive
-trade can invalidate implied depth and schedule repricing. Current Rust
-`MarketEvent::Trade` only advances strategy time, so trade-driven implied
-depth is a documented parity gap.
+trade can invalidate implied depth and schedule repricing.
 
-This no-semantic-change refactor MUST retain the plan-derived live trade
-subscription for every configured instrument. Removing it requires a separate
-parity decision that either implements the reached Java behavior or explicitly
-narrows the parity claim with new fixtures and approval. Capture keeps its
-explicit public-trade subscriptions, and backtest keeps its offline trade
-matching/data requirements; neither is folded into a generic live connectivity
-framework. A normalized full book satisfies the current Rust BBO use.
+Reap implements that reached public-trade path without adding connectivity or
+changing a public event schema:
+
+- every trade first updates the instrument-owned implied-depth state, including
+  the pinned taker-side-to-book-side reversal;
+- crossing uses the raw best level with the pinned fuzzy comparison, while
+  first-valid selection preserves raw price equality, the strict
+  below-half-level quantity boundary, fuzzy passive ordering, ignored-best
+  behavior, and the opposite pending-hedge constraint;
+- source timestamps do not suppress later arrivals; any following depth
+  replacement clears last-trade/cache state even when its source timestamp is
+  older;
+- only the reached Live state schedules repricing, while a non-Live trade still
+  mutates implied-depth state;
+- each qualifying arrival owns a bounded private callback at monotonic
+  arrival plus exactly 100 microseconds. Live services it after
+  shutdown/safety/control/operator/reconciliation/periodic-timer work and
+  immediately before ordinary feed. Backtest uses its nanosecond scheduler and
+  global sequence tie-breaker after raw matching;
+- Live depth and qualifying trade callbacks share the checked-in iarb2
+  five-millisecond worker clock. The implementation retains Java's
+  `lastWork`, `lastFinish`, and `nextRunTime` boundaries, integer-millisecond
+  comparison, clock-regression guard, trailing conflation, and one
+  100-microsecond callback per qualifying trade;
+- timed Live depth and deferred callbacks use the same real private worker
+  action. The first eligible trigger can refresh synchronously; triggers
+  inside the interval join the one pending worker, which refreshes from the
+  latest depth and implied-trade state at its actual service time. If a worker
+  deadline precedes a trade callback, the worker remains ordered first; and
+- a pending implied-depth hedge is committed only after risk, regular policy,
+  and canonical local reservation accept the hedge, using local send time.
+  The strategy privately detaches the transition, moves the genuine non-Clone
+  intent through policy and reservation, and applies the transition only when
+  that one-shot reservation returns success. No hedge-commit value crosses a
+  public crate boundary or has a public type, constructor, Clone, or serialized
+  representation. A depth at exactly 30 milliseconds retains it; a later
+  depth clears it.
+
+The Java-bound v2 fixtures and RNG-interleaving companion under
+`fixtures/java/` and `fixtures/normalized/` bind the full pinned revision, the
+four checked-in five-millisecond iarb2 configurations, raw/fuzzy/half-quantity
+boundaries, depth/trade shared-worker interleavings, arrival and local clocks,
+repeated callbacks, explicit service horizon, the Java `Random(1)` cursor, and
+identical typed and legacy projections through direct, production-backtest,
+and production-live reduction paths. The private action has no serialized or
+public event representation.
+
+Backtest activation is causal: before a qualifying aggressive crossing is
+reached, depths update a private compatibility timing worker without emitting
+worker-derived actions, so the frozen no-trade economic replay remains
+unchanged. The first reached qualifying crossing promotes that accumulated
+timing state and schedules both any inherited pending worker and its own
+100-microsecond callback. From then on, depth and trade triggers share the exact
+worker. A later passive or irrelevant trade therefore cannot change an earlier
+decision. There is no future-input scan, public configuration flag, or schema
+branch. Direct non-Live strategy calls likewise retain their established
+immediate behavior.
+
+No BBO worker interaction is claimed: on the supported OKX entity
+`OkEntity.isDepthUpdatedOnBBO()` is hard false at the pinned revision.
+
+The plan-derived live trade subscription remains required for every configured
+instrument. Capture keeps its explicit public-trade subscriptions, and
+backtest keeps its offline raw matching/data requirements; neither is folded
+into a generic live connectivity framework. A normalized full book satisfies
+the current Rust BBO use.
 
 `act_on_burst = true` requires a real, explicitly modeled `BurstSignal`
 provider. Raw trades are not a substitute. Live configuration MUST reject that

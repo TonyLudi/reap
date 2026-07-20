@@ -84,6 +84,8 @@ impl BacktestRunner {
                 ScheduledAction::DeliverOrder(_) => pending_order_update_actions += 1,
                 ScheduledAction::DeliverAccount(_)
                 | ScheduledAction::DeliverStrategy(_)
+                | ScheduledAction::DeliverTradeStrategy { .. }
+                | ScheduledAction::TradeRepriceWake { .. }
                 | ScheduledAction::RefreshAccount => pending_strategy_event_actions += 1,
                 ScheduledAction::SettleFunding { .. } => pending_funding_actions += 1,
             }

@@ -260,6 +260,13 @@ enum ScheduledAction {
     DeliverOrder(OrderUpdate),
     DeliverAccount(AccountUpdate),
     DeliverStrategy(StrategyEvent),
+    DeliverTradeStrategy {
+        event: StrategyEvent,
+        arrival_ns: u64,
+    },
+    TradeRepriceWake {
+        deadline_ns: u64,
+    },
     RefreshAccount,
     SettleFunding {
         symbol: Symbol,

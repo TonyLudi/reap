@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use anyhow::{Result, bail};
 use reap_core::{AccountUpdate, Balance, MarginSnapshot, Position, StrategyEvent, Symbol};
-use reap_strategy::Strategy;
 
 use crate::{ACCOUNT_REFRESH_INTERVAL_NS, BacktestRunner, ScheduledAction, time_ms};
 
@@ -11,12 +10,12 @@ impl BacktestRunner {
         if self.orders.initial_account_snapshot_delivered {
             return Ok(());
         }
-        let commands = self.strategy.on_event(&StrategyEvent::Account(
+        let intents = self.strategy.on_execution_event(&StrategyEvent::Account(
             self.accounting
                 .initial_portfolio
                 .account_update(time_ms(self.replay.now_ns)),
         ));
-        if !commands.is_empty() {
+        if !intents.is_empty() {
             bail!("initial portfolio unexpectedly produced strategy order intents");
         }
         self.orders.initial_account_snapshot_delivered = true;

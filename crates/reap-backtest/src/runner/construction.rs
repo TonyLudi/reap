@@ -150,6 +150,7 @@ impl BacktestRunner {
                 input_events: 0,
                 input_clock_regressions: 0,
                 max_input_clock_regression_ns: 0,
+                trade_reprice_active: false,
             },
             schedule: ScheduleState {
                 scheduled: BTreeMap::new(),

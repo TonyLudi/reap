@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use reap_core::{
     NewOrder, OrderIntent, Price, Quantity, SelfTradePrevention, Side, Symbol, TimeInForce,
 };
@@ -66,6 +68,13 @@ impl ChaosExecutionIntent {
         }
     }
 
+    pub(crate) fn take_hedge_commit(&mut self) -> Option<ChaosHedgeCommit> {
+        match self {
+            Self::Hedge(hedge) => hedge.take_commit(),
+            Self::Quote(_) | Self::CancelOwned(_) => None,
+        }
+    }
+
     /// Lowers trusted typed output to the unchanged journal/backtest record.
     ///
     /// This conversion is deliberately one-way: there is no `From<OrderIntent>` implementation.
@@ -108,13 +117,21 @@ impl ChaosExecutionIntent {
         qty: Quantity,
         price: Price,
         reason: String,
+        commit: ChaosHedgeCommit,
     ) -> Self {
+        debug_assert_eq!(symbol, commit.symbol.as_ref());
+        debug_assert_eq!(side, commit.side);
         Self::Hedge(ChaosHedge {
-            symbol,
+            symbol: commit.symbol,
             side,
             qty,
             price,
-            reason,
+            reason: reason.into_boxed_str(),
+            transition: ChaosHedgeTransition {
+                price: commit.price,
+                qty: commit.qty,
+            },
+            transition_pending: true,
         })
     }
 
@@ -184,11 +201,13 @@ impl ChaosQuote {
 /// The venue-neutral fields of a Chaos hedge purpose.
 #[derive(Debug)]
 pub struct ChaosHedge {
-    symbol: Symbol,
+    symbol: Arc<str>,
     side: Side,
     qty: Quantity,
     price: Price,
-    reason: String,
+    reason: Box<str>,
+    transition: ChaosHedgeTransition,
+    transition_pending: bool,
 }
 
 impl ChaosHedge {
@@ -212,30 +231,77 @@ impl ChaosHedge {
         &self.reason
     }
 
+    fn take_commit(&mut self) -> Option<ChaosHedgeCommit> {
+        if !self.transition_pending {
+            return None;
+        }
+        self.transition_pending = false;
+        Some(ChaosHedgeCommit {
+            symbol: Arc::clone(&self.symbol),
+            side: self.side,
+            price: self.transition.price,
+            qty: self.transition.qty,
+        })
+    }
+
     fn to_order_intent(&self) -> OrderIntent {
         OrderIntent::NewOrder(NewOrder {
-            symbol: self.symbol.clone(),
+            symbol: self.symbol.to_string(),
             side: self.side,
             qty: self.qty,
             price: self.price,
             time_in_force: TimeInForce::Ioc,
             reduce_only: false,
             self_trade_prevention: Some(SelfTradePrevention::CancelMaker),
-            reason: self.reason.clone(),
+            reason: self.reason.to_string(),
         })
     }
 
     fn into_order_intent(self) -> OrderIntent {
         OrderIntent::NewOrder(NewOrder {
-            symbol: self.symbol,
+            symbol: self.symbol.to_string(),
             side: self.side,
             qty: self.qty,
             price: self.price,
             time_in_force: TimeInForce::Ioc,
             reduce_only: false,
             self_trade_prevention: Some(SelfTradePrevention::CancelMaker),
-            reason: self.reason,
+            reason: self.reason.into_string(),
         })
+    }
+}
+
+#[derive(Debug)]
+struct ChaosHedgeTransition {
+    price: Price,
+    qty: Quantity,
+}
+
+/// Opaque proof that a strategy-created hedge carries a deferred
+/// implied-depth state transition.
+///
+/// It remains crate-private and can be consumed only by the strategy after the
+/// genuine [`ChaosExecutionIntent::Hedge`] reaches the local-send boundary.
+#[derive(Debug)]
+pub(crate) struct ChaosHedgeCommit {
+    symbol: Arc<str>,
+    side: Side,
+    price: Price,
+    qty: Quantity,
+}
+
+impl ChaosHedgeCommit {
+    pub(crate) fn new(symbol: Arc<str>, side: Side, price: Price, qty: Quantity) -> Self {
+        Self {
+            symbol,
+            side,
+            price,
+            qty,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (Arc<str>, Side, Price, Quantity) {
+        (self.symbol, self.side, self.price, self.qty)
     }
 }
 
@@ -275,6 +341,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn private_hedge_transition_does_not_enlarge_the_typed_intent() {
+        assert_eq!(std::mem::size_of::<ChaosExecutionIntent>(), 80);
+    }
+
+    #[test]
     fn typed_purposes_lower_to_exact_legacy_profiles() {
         let quote = ChaosExecutionIntent::quote(
             "BTC-USDT".to_string(),
@@ -289,6 +360,12 @@ mod tests {
             125.0,
             49_999.5,
             "hedge:BTC-USDT:50000".to_string(),
+            ChaosHedgeCommit::new(
+                Arc::<str>::from("BTC-USDT-SWAP"),
+                Side::Sell,
+                50_000.0,
+                125.0,
+            ),
         );
         let cancel = ChaosExecutionIntent::cancel_owned(
             "canonical-order-id".to_string(),

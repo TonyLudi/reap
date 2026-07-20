@@ -89,8 +89,17 @@ pub(super) fn permissive_risk_limits() -> RiskLimits {
 }
 
 pub(super) fn benchmark_engine(limits: RiskLimits) -> TradingEngine<ChaosStrategy> {
-    let config: ChaosConfig = toml::from_str(include_str!("../../../../examples/iarb2-basic.toml"))
-        .expect("benchmark strategy configuration");
+    benchmark_engine_with_config(limits, |_| {})
+}
+
+pub(super) fn benchmark_engine_with_config(
+    limits: RiskLimits,
+    configure: impl FnOnce(&mut ChaosConfig),
+) -> TradingEngine<ChaosStrategy> {
+    let mut config: ChaosConfig =
+        toml::from_str(include_str!("../../../../examples/iarb2-basic.toml"))
+            .expect("benchmark strategy configuration");
+    configure(&mut config);
     let strategy = ChaosStrategy::new(config).expect("benchmark strategy must validate");
     let mut risk = RiskGate::new(limits);
     assert!(risk.set_instrument_model("BTC-USDT", InstrumentRiskModel::Spot));

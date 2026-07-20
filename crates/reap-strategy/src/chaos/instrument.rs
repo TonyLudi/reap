@@ -7,8 +7,8 @@ use reap_core::{
 
 use super::{
     CAN_QUOTE_FULL_SIZE_DEBOUNCE_MS, CAN_TRADE_DEBOUNCE_MS, CoinConfig, DebouncedCondition, EPS,
-    EXTRA_MARGIN_BPS, HedgeCandidate, InstrumentConfig, SkewTypeConfig, TheoQuote, approx_eq,
-    timestamp_is_fresh,
+    EXTRA_MARGIN_BPS, HedgeCandidate, ImpliedDepthState, InstrumentConfig, SkewTypeConfig,
+    TheoQuote, approx_eq, timestamp_is_fresh,
 };
 
 #[derive(Debug, Clone)]
@@ -74,6 +74,7 @@ pub struct InstrumentState {
     pub(super) interval_halted: bool,
     pub(super) system_halted: bool,
     pub(super) feed_stale: bool,
+    pub(super) implied_depth: ImpliedDepthState,
     pub(super) trade: TradeControlState,
     pub buy_theo: Option<TheoQuote>,
     pub sell_theo: Option<TheoQuote>,
@@ -129,6 +130,7 @@ impl InstrumentState {
             interval_halted: false,
             system_halted: false,
             feed_stale: false,
+            implied_depth: ImpliedDepthState::default(),
             trade: TradeControlState {
                 base_coin_config: None,
                 quote_coin_config: None,
@@ -806,11 +808,10 @@ impl InstrumentState {
             return &[];
         };
         let levels = book.levels(side);
-        if self.ignore_best_level && levels.len() > 1 {
-            &levels[1..]
-        } else {
-            levels
-        }
+        let first = self
+            .implied_depth
+            .first_valid_level(book, side, self.ignore_best_level);
+        levels.get(first..).unwrap_or(&[])
     }
 
     pub(super) fn quote_qty_from_usd(&self, usd: f64, ref_mid: f64) -> f64 {

@@ -1,0 +1,860 @@
+{ "schema_version": 2,
+  "java_revision": "b6b120c7b7c466d8431bf082f3229328c5d7b2ae",
+  "java_call_path": [
+    "chaos/chaos-core/src/main/java/app/metcoin/chaos/ChaosStrategyBase.java:302-331",
+    "chaos/chaos-core/src/main/java/app/metcoin/chaos/model/entity/OkEntity.java:62-67,94-115,166-213",
+    "chaos/chaos-core/src/main/java/app/metcoin/chaos/model/entity/ExchEntityBase.java:137-145,157-166",
+    "chaos/chaos-iarb2/src/main/java/app/metcoin/chaos/iarb2/Iarb2Strategy.java:180-182,204-215,399-405,846-869",
+    "chaos/chaos-core/src/main/java/app/metcoin/chaos/model/ChaosEntity.java:240-262",
+    "chaos/chaos-core/src/main/java/app/metcoin/chaos/worker/ChaosTimedConflationWorker.java:15-59",
+    "chaos/chaos-core/src/main/java/app/metcoin/chaos/worker/ChaosConflationWorker.java:46-103",
+    "metcoin-parent/metcoin-utils/metcoin-base-utils/src/main/java/app/metcoin/util/number/NumberUtil.java:26-46,156-207,281-308"
+  ],
+  "callback_delay_ns": 100000,
+  "worker_interval_ns": 5000000,
+  "worker_interval_sources": [
+    "chaos/chaos-iarb2/src/test/resources/Iarb2CalcCoinSkewTestConfig.json:6",
+    "chaos/chaos-iarb2/src/test/resources/Iarb2CalcTestConfig.json:6",
+    "chaos/chaos-iarb2/src/test/resources/Iarb2CalcTestConfig2.json:6",
+    "chaos/chaos-iarb2/src/test/resources/SampleIarb2Config.json:5"
+  ],
+  "pending_hedge_expiry_ms": 30,
+  "base_depth": {
+    "symbol": "BTC-PERP",
+    "ts_ms": 1,
+    "bids": [
+      { "px": 99.0, "qty": 10.0 },
+      { "px": 98.0, "qty": 10.0 },
+      { "px": 97.0, "qty": 10.0 }
+    ],
+    "asks": [
+      { "px": 101.0, "qty": 10.0 },
+      { "px": 102.0, "qty": 10.0 },
+      { "px": 103.0, "qty": 10.0 }
+    ]
+  },
+  "atomic_cases": [
+    {
+      "id": "passive_buy_maps_to_ask",
+      "ignore_best_level": false,
+      "trade": { "source_ts_ms": 2, "price": 100.0, "qty": 1.0, "taker_side": "buy" },
+      "expected": { "book_side": "sell", "crossed_raw_best": false, "first_valid_price": 101.0, "due_offset_ns": null }
+    },
+    {
+      "id": "passive_sell_maps_to_bid",
+      "ignore_best_level": false,
+      "trade": { "source_ts_ms": 2, "price": 100.0, "qty": 1.0, "taker_side": "sell" },
+      "expected": { "book_side": "buy", "crossed_raw_best": false, "first_valid_price": 99.0, "due_offset_ns": null }
+    },
+    {
+      "id": "raw_top_equal_below_half",
+      "ignore_best_level": false,
+      "trade": { "source_ts_ms": 2, "price": 101.0, "qty": 4.0, "taker_side": "buy" },
+      "expected": { "book_side": "sell", "crossed_raw_best": false, "first_valid_price": 101.0, "due_offset_ns": null }
+    },
+    {
+      "id": "raw_top_equal_exact_half",
+      "ignore_best_level": false,
+      "trade": { "source_ts_ms": 2, "price": 101.0, "qty": 5.0, "taker_side": "buy" },
+      "expected": { "book_side": "sell", "crossed_raw_best": false, "first_valid_price": 102.0, "due_offset_ns": null }
+    },
+    {
+      "id": "aggressive_buy_below_half",
+      "ignore_best_level": false,
+      "trade": { "source_ts_ms": 2, "price": 102.0, "qty": 4.999999999999999, "taker_side": "buy" },
+      "expected": { "book_side": "sell", "crossed_raw_best": true, "first_valid_price": 102.0, "due_offset_ns": 100000 }
+    },
+    {
+      "id": "aggressive_buy_exact_half",
+      "ignore_best_level": false,
+      "trade": { "source_ts_ms": 2, "price": 102.0, "qty": 5.0, "taker_side": "buy" },
+      "expected": { "book_side": "sell", "crossed_raw_best": true, "first_valid_price": 103.0, "due_offset_ns": 100000 }
+    },
+    {
+      "id": "aggressive_sell_exact_half",
+      "ignore_best_level": false,
+      "trade": { "source_ts_ms": 2, "price": 98.0, "qty": 5.0, "taker_side": "sell" },
+      "expected": { "book_side": "buy", "crossed_raw_best": true, "first_valid_price": 97.0, "due_offset_ns": 100000 }
+    },
+    {
+      "id": "fuzzy_equal_but_raw_unequal",
+      "ignore_best_level": false,
+      "trade": { "source_ts_ms": 2, "price": 101.0000000000005, "qty": 1.0, "taker_side": "buy" },
+      "expected": { "book_side": "sell", "crossed_raw_best": false, "first_valid_price": 102.0, "due_offset_ns": null }
+    },
+    {
+      "id": "ignore_best_below_half",
+      "ignore_best_level": true,
+      "trade": { "source_ts_ms": 2, "price": 102.0, "qty": 4.999999999999999, "taker_side": "buy" },
+      "expected": { "book_side": "sell", "crossed_raw_best": true, "first_valid_price": 102.0, "due_offset_ns": 100000 }
+    },
+    {
+      "id": "ignore_best_exact_half",
+      "ignore_best_level": true,
+      "trade": { "source_ts_ms": 2, "price": 102.0, "qty": 5.0, "taker_side": "buy" },
+      "expected": { "book_side": "sell", "crossed_raw_best": true, "first_valid_price": 103.0, "due_offset_ns": 100000 }
+    }
+  ],
+  "sequence_cases": [
+    {
+      "id": "pending_hedge_exact_and_fuzzy_boundaries",
+      "ignore_best_level": false,
+      "steps": [
+        {
+          "op": "depth",
+          "source_ts_ms": 1,
+          "arrival_ns": 1,
+          "local_now_ms": 1,
+          "strategy_is_live": false,
+          "expect": {
+            "effective_buy_px": 99.0,
+            "effective_sell_px": 101.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "trade",
+          "source_ts_ms": 2,
+          "price": 102.0,
+          "qty": 4.0,
+          "taker_side": "buy",
+          "arrival_ns": 2,
+          "local_now_ms": 2,
+          "strategy_is_live": false,
+          "expect": {
+            "effective_buy_px": 99.0,
+            "effective_sell_px": 102.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "pending_hedge",
+          "hedge_side": "buy",
+          "price": 102.0000000000005,
+          "qty": 1.0,
+          "local_now_ms": 100,
+          "expect": {
+            "effective_sell_px": 102.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0,
+            "pending_debug_contains": [
+              "price: 102.0000000000005, qty: 2.0, updated_ms: 100"
+            ]
+          }
+        },
+        {
+          "op": "pending_hedge",
+          "hedge_side": "buy",
+          "price": 103.0,
+          "qty": 1.0,
+          "local_now_ms": 101,
+          "expect": {
+            "effective_sell_px": 103.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0,
+            "pending_debug_contains": [
+              "price: 103.0, qty: 2.0, updated_ms: 101"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "same_price_pending_quantity_accumulates_and_depth_expiry_resets",
+      "ignore_best_level": false,
+      "steps": [
+        {
+          "op": "depth",
+          "source_ts_ms": 1,
+          "arrival_ns": 1,
+          "local_now_ms": 1,
+          "strategy_is_live": false,
+          "expect": {
+            "effective_buy_px": 99.0,
+            "effective_sell_px": 101.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "pending_hedge",
+          "hedge_side": "buy",
+          "price": 103.0,
+          "qty": 1.0,
+          "local_now_ms": 100,
+          "expect": {
+            "next_due": { "state": "none" },
+            "intent_count": 0,
+            "pending_debug_contains": [
+              "price: 103.0, qty: 2.0, updated_ms: 100"
+            ]
+          }
+        },
+        {
+          "op": "pending_hedge",
+          "hedge_side": "buy",
+          "price": 103.0,
+          "qty": 3.0,
+          "local_now_ms": 101,
+          "expect": {
+            "next_due": { "state": "none" },
+            "intent_count": 0,
+            "pending_debug_contains": [
+              "price: 103.0, qty: 5.0, updated_ms: 101"
+            ]
+          }
+        },
+        {
+          "op": "depth",
+          "source_ts_ms": 0,
+          "arrival_ns": 2,
+          "local_now_ms": 131,
+          "strategy_is_live": false,
+          "expect": {
+            "next_due": { "state": "none" },
+            "intent_count": 0,
+            "pending_debug_contains": [
+              "price: 103.0, qty: 5.0, updated_ms: 101"
+            ]
+          }
+        },
+        {
+          "op": "depth",
+          "source_ts_ms": 0,
+          "arrival_ns": 3,
+          "local_now_ms": 132,
+          "strategy_is_live": false,
+          "expect": {
+            "next_due": { "state": "none" },
+            "intent_count": 0,
+            "pending_debug_contains": [
+              "PendingHedge { price: 0.0, qty: 0.0, updated_ms: 0 }"
+            ]
+          }
+        },
+        {
+          "op": "pending_hedge",
+          "hedge_side": "buy",
+          "price": 103.0,
+          "qty": 2.0,
+          "local_now_ms": 133,
+          "expect": {
+            "next_due": { "state": "none" },
+            "intent_count": 0,
+            "pending_debug_contains": [
+              "price: 103.0, qty: 4.0, updated_ms: 133"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "pending_hedge_strict_local_depth_expiry",
+      "ignore_best_level": false,
+      "steps": [
+        {
+          "op": "depth",
+          "source_ts_ms": 1,
+          "arrival_ns": 1,
+          "local_now_ms": 1,
+          "strategy_is_live": false,
+          "expect": {
+            "effective_sell_px": 101.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "pending_hedge",
+          "hedge_side": "buy",
+          "price": 103.0,
+          "qty": 1.0,
+          "local_now_ms": 100,
+          "expect": {
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "advance_time",
+          "local_now_ms": 10000,
+          "expect": {
+            "next_due": { "state": "none" },
+            "intent_count": 0,
+            "pending_debug_contains": [
+              "price: 103.0, qty: 2.0, updated_ms: 100"
+            ]
+          }
+        },
+        {
+          "op": "trade",
+          "source_ts_ms": 2,
+          "price": 102.0,
+          "qty": 4.0,
+          "taker_side": "buy",
+          "arrival_ns": 2,
+          "local_now_ms": 10000,
+          "strategy_is_live": false,
+          "expect": {
+            "effective_sell_px": 103.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "depth",
+          "source_ts_ms": 0,
+          "arrival_ns": 3,
+          "local_now_ms": 130,
+          "strategy_is_live": false,
+          "expect": {
+            "effective_sell_px": 101.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0,
+            "pending_debug_contains": [
+              "price: 103.0, qty: 2.0, updated_ms: 100"
+            ]
+          }
+        },
+        {
+          "op": "trade",
+          "source_ts_ms": 1,
+          "price": 102.0,
+          "qty": 4.0,
+          "taker_side": "buy",
+          "arrival_ns": 4,
+          "local_now_ms": 130,
+          "strategy_is_live": false,
+          "expect": {
+            "effective_sell_px": 103.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "depth",
+          "source_ts_ms": 0,
+          "arrival_ns": 5,
+          "local_now_ms": 131,
+          "strategy_is_live": false,
+          "expect": {
+            "effective_sell_px": 101.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0,
+            "pending_debug_contains": [
+              "PendingHedge { price: 0.0, qty: 0.0, updated_ms: 0 }"
+            ]
+          }
+        },
+        {
+          "op": "trade",
+          "source_ts_ms": 0,
+          "price": 102.0,
+          "qty": 4.0,
+          "taker_side": "buy",
+          "arrival_ns": 6,
+          "local_now_ms": 131,
+          "strategy_is_live": false,
+          "expect": {
+            "effective_sell_px": 102.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "alternating_passive_then_crossing_trade_clears_opposite",
+      "ignore_best_level": false,
+      "steps": [
+        {
+          "op": "depth",
+          "source_ts_ms": 1,
+          "arrival_ns": 1,
+          "local_now_ms": 1,
+          "strategy_is_live": false,
+          "expect": {
+            "effective_buy_px": 99.0,
+            "effective_sell_px": 101.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "trade",
+          "source_ts_ms": 2,
+          "price": 101.0,
+          "qty": 5.0,
+          "taker_side": "buy",
+          "arrival_ns": 2,
+          "local_now_ms": 2,
+          "strategy_is_live": false,
+          "expect": {
+            "effective_buy_px": 99.0,
+            "effective_sell_px": 102.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "trade",
+          "source_ts_ms": 3,
+          "price": 99.0,
+          "qty": 5.0,
+          "taker_side": "sell",
+          "arrival_ns": 3,
+          "local_now_ms": 3,
+          "strategy_is_live": false,
+          "expect": {
+            "effective_buy_px": 98.0,
+            "effective_sell_px": 102.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "trade",
+          "source_ts_ms": 4,
+          "price": 102.0,
+          "qty": 5.0,
+          "taker_side": "buy",
+          "arrival_ns": 4,
+          "local_now_ms": 4,
+          "strategy_is_live": false,
+          "expect": {
+            "effective_buy_px": 99.0,
+            "effective_sell_px": 103.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "stale_source_timestamp_latest_arrival_wins",
+      "ignore_best_level": false,
+      "steps": [
+        {
+          "op": "depth",
+          "source_ts_ms": 10,
+          "arrival_ns": 1,
+          "local_now_ms": 10,
+          "strategy_is_live": false,
+          "expect": {
+            "effective_sell_px": 101.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "trade",
+          "source_ts_ms": 1000,
+          "price": 102.0,
+          "qty": 5.0,
+          "taker_side": "buy",
+          "arrival_ns": 2,
+          "local_now_ms": 1000,
+          "strategy_is_live": false,
+          "expect": {
+            "effective_sell_px": 103.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "trade",
+          "source_ts_ms": 1,
+          "price": 101.0,
+          "qty": 4.0,
+          "taker_side": "buy",
+          "arrival_ns": 3,
+          "local_now_ms": 1001,
+          "strategy_is_live": false,
+          "expect": {
+            "effective_sell_px": 101.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "depth",
+          "source_ts_ms": 0,
+          "arrival_ns": 4,
+          "local_now_ms": 1002,
+          "strategy_is_live": false,
+          "expect": {
+            "effective_sell_px": 101.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "trade_before_depth_is_retained_then_cleared",
+      "ignore_best_level": false,
+      "steps": [
+        {
+          "op": "trade",
+          "source_ts_ms": 1,
+          "price": 102.0,
+          "qty": 5.0,
+          "taker_side": "buy",
+          "arrival_ns": 1,
+          "local_now_ms": 1,
+          "strategy_is_live": true,
+          "expect": {
+            "buy_levels_empty": true,
+            "sell_levels_empty": true,
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "install_base_book_without_depth",
+          "source_ts_ms": 1,
+          "expect": {
+            "effective_buy_px": 99.0,
+            "effective_sell_px": 103.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "depth",
+          "source_ts_ms": 1,
+          "arrival_ns": 2,
+          "local_now_ms": 2,
+          "strategy_is_live": false,
+          "expect": {
+            "effective_buy_px": 99.0,
+            "effective_sell_px": 101.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "older_depth_clears_state_without_cancelling_callback",
+      "ignore_best_level": false,
+      "steps": [
+        {
+          "op": "depth",
+          "source_ts_ms": 10,
+          "arrival_ns": 1,
+          "local_now_ms": 10,
+          "strategy_is_live": true,
+          "expect": {
+            "effective_sell_px": 101.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "trade",
+          "source_ts_ms": 10,
+          "price": 102.0,
+          "qty": 5.0,
+          "taker_side": "buy",
+          "arrival_ns": 1000000000,
+          "local_now_ms": 10,
+          "strategy_is_live": true,
+          "expect": {
+            "effective_sell_px": 103.0,
+            "next_due": { "state": "at", "ns": 1000100000 },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "depth",
+          "source_ts_ms": 1,
+          "arrival_ns": 1000000001,
+          "local_now_ms": 11,
+          "strategy_is_live": true,
+          "expect": {
+            "effective_sell_px": 101.0,
+            "next_due": { "state": "at", "ns": 1000100000 },
+            "intent_count": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "repeated_callbacks_and_inclusive_deadline",
+      "ignore_best_level": false,
+      "steps": [
+        {
+          "op": "depth",
+          "source_ts_ms": 1,
+          "arrival_ns": 1,
+          "local_now_ms": 1,
+          "strategy_is_live": true,
+          "expect": {
+            "effective_sell_px": 101.0,
+            "next_due": { "state": "at", "ns": 4000001 },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "service",
+          "now_ns": 4000001,
+          "local_now_ms": 5,
+          "strategy_is_live": true,
+          "expect": {
+            "effective_sell_px": 101.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "trade",
+          "source_ts_ms": 2,
+          "price": 102.0,
+          "qty": 5.0,
+          "taker_side": "buy",
+          "arrival_ns": 1000000000,
+          "local_now_ms": 2,
+          "strategy_is_live": true,
+          "expect": {
+            "effective_sell_px": 103.0,
+            "next_due": { "state": "at", "ns": 1000100000 },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "trade",
+          "source_ts_ms": 1,
+          "price": 102.0,
+          "qty": 5.0,
+          "taker_side": "buy",
+          "arrival_ns": 1000020000,
+          "local_now_ms": 3,
+          "strategy_is_live": true,
+          "expect": {
+            "effective_sell_px": 103.0,
+            "next_due": { "state": "at", "ns": 1000100000 },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "service",
+          "now_ns": 1000099999,
+          "local_now_ms": 5,
+          "strategy_is_live": false,
+          "expect": {
+            "next_due": { "state": "at", "ns": 1000100000 },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "service",
+          "now_ns": 1000100000,
+          "local_now_ms": 5,
+          "strategy_is_live": false,
+          "expect": {
+            "next_due": { "state": "at", "ns": 1000120000 },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "service",
+          "now_ns": 1000120000,
+          "local_now_ms": 5,
+          "strategy_is_live": false,
+          "expect": {
+            "next_due": { "state": "at", "ns": 1005100000 },
+            "intent_count": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "shared_worker_trade_joins_depth_timer",
+      "ignore_best_level": false,
+      "steps": [
+        {
+          "op": "depth",
+          "source_ts_ms": 1,
+          "arrival_ns": 1000000000,
+          "local_now_ms": 1000,
+          "strategy_is_live": true,
+          "expect": {
+            "effective_sell_px": 101.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "depth",
+          "source_ts_ms": 0,
+          "arrival_ns": 1001000000,
+          "local_now_ms": 1001,
+          "strategy_is_live": true,
+          "expect": {
+            "effective_sell_px": 101.0,
+            "next_due": { "state": "at", "ns": 1005000000 },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "trade",
+          "source_ts_ms": 2,
+          "price": 102.0,
+          "qty": 5.0,
+          "taker_side": "buy",
+          "arrival_ns": 1001000000,
+          "local_now_ms": 1001,
+          "strategy_is_live": true,
+          "expect": {
+            "effective_sell_px": 103.0,
+            "next_due": { "state": "at", "ns": 1001100000 },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "service",
+          "now_ns": 1001100000,
+          "local_now_ms": 1001,
+          "strategy_is_live": true,
+          "expect": {
+            "effective_sell_px": 103.0,
+            "next_due": { "state": "at", "ns": 1005000000 },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "service",
+          "now_ns": 1004999999,
+          "local_now_ms": 1004,
+          "strategy_is_live": true,
+          "expect": {
+            "next_due": { "state": "at", "ns": 1005000000 },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "service",
+          "now_ns": 1005000000,
+          "local_now_ms": 1005,
+          "strategy_is_live": true,
+          "expect": {
+            "effective_sell_px": 103.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "shared_worker_depth_timer_fires_before_trade",
+      "ignore_best_level": false,
+      "steps": [
+        {
+          "op": "depth",
+          "source_ts_ms": 1,
+          "arrival_ns": 1000000000,
+          "local_now_ms": 1000,
+          "strategy_is_live": true,
+          "expect": {
+            "effective_sell_px": 101.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "depth",
+          "source_ts_ms": 0,
+          "arrival_ns": 1001000000,
+          "local_now_ms": 1001,
+          "strategy_is_live": true,
+          "expect": {
+            "next_due": { "state": "at", "ns": 1005000000 },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "service",
+          "now_ns": 1005000000,
+          "local_now_ms": 1005,
+          "strategy_is_live": true,
+          "expect": {
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "trade",
+          "source_ts_ms": 2,
+          "price": 102.0,
+          "qty": 5.0,
+          "taker_side": "buy",
+          "arrival_ns": 1006000000,
+          "local_now_ms": 1006,
+          "strategy_is_live": true,
+          "expect": {
+            "effective_sell_px": 103.0,
+            "next_due": { "state": "at", "ns": 1006100000 },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "service",
+          "now_ns": 1006100000,
+          "local_now_ms": 1006,
+          "strategy_is_live": true,
+          "expect": {
+            "next_due": { "state": "at", "ns": 1010100000 },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "service",
+          "now_ns": 1010100000,
+          "local_now_ms": 1010,
+          "strategy_is_live": true,
+          "expect": {
+            "effective_sell_px": 103.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "non_live_crossing_mutates_without_schedule",
+      "ignore_best_level": false,
+      "steps": [
+        {
+          "op": "depth",
+          "source_ts_ms": 1,
+          "arrival_ns": 1,
+          "local_now_ms": 1,
+          "strategy_is_live": false,
+          "expect": {
+            "effective_sell_px": 101.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        },
+        {
+          "op": "trade",
+          "source_ts_ms": 2,
+          "price": 102.0,
+          "qty": 5.0,
+          "taker_side": "buy",
+          "arrival_ns": 1000000000,
+          "local_now_ms": 2,
+          "strategy_is_live": false,
+          "expect": {
+            "effective_sell_px": 103.0,
+            "next_due": { "state": "none" },
+            "intent_count": 0
+          }
+        }
+      ]
+    }
+  ]
+}

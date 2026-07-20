@@ -1,4 +1,4 @@
-use reap_core::{AccountUpdate, FillKey, NormalizedEvent, OrderStatus};
+use reap_core::{AccountUpdate, FillKey, NormalizedEvent, OrderStatus, TimeMs};
 use reap_storage::{FillRecord, StorageRecord};
 use reap_venue::{PrivateOrderUpdate, RemoteFill};
 
@@ -10,6 +10,32 @@ impl LiveCoordinator {
         account_id: Option<String>,
         update: AccountUpdate,
     ) -> Result<CoordinatorOutput, CoordinatorError> {
+        let observed_now_ms = update.ts_ms;
+        self.process_private_account_at(account_id, update, observed_now_ms)
+    }
+
+    pub(super) fn process_private_account_at(
+        &mut self,
+        account_id: Option<String>,
+        update: AccountUpdate,
+        observed_now_ms: TimeMs,
+    ) -> Result<CoordinatorOutput, CoordinatorError> {
+        let mut local_send_clock = || observed_now_ms;
+        self.process_private_account_at_with_clock(
+            account_id,
+            update,
+            observed_now_ms,
+            &mut local_send_clock,
+        )
+    }
+
+    pub(super) fn process_private_account_at_with_clock(
+        &mut self,
+        account_id: Option<String>,
+        update: AccountUpdate,
+        observed_now_ms: TimeMs,
+        local_send_clock: &mut dyn FnMut() -> TimeMs,
+    ) -> Result<CoordinatorOutput, CoordinatorError> {
         let account_id = self.require_account_id(account_id)?;
         self.ensure_account_state_policy(&account_id, &update)?;
         let mut update = update;
@@ -17,7 +43,11 @@ impl LiveCoordinator {
         let Some(update) = self.private_state_mut(&account_id)?.reduce_account(update) else {
             return Ok(CoordinatorOutput::default());
         };
-        let output = self.process_normalized(NormalizedEvent::Account(update));
+        let output = self.process_normalized_at_with_clock(
+            NormalizedEvent::Account(update),
+            observed_now_ms,
+            local_send_clock,
+        );
         self.startup.mark_account_snapshot(
             &account_id,
             true,
@@ -30,6 +60,32 @@ impl LiveCoordinator {
         &mut self,
         account_id: Option<String>,
         update: PrivateOrderUpdate,
+    ) -> Result<CoordinatorOutput, CoordinatorError> {
+        let observed_now_ms = update.ts_ms;
+        self.process_private_order_at(account_id, update, observed_now_ms)
+    }
+
+    pub(super) fn process_private_order_at(
+        &mut self,
+        account_id: Option<String>,
+        update: PrivateOrderUpdate,
+        observed_now_ms: TimeMs,
+    ) -> Result<CoordinatorOutput, CoordinatorError> {
+        let mut local_send_clock = || observed_now_ms;
+        self.process_private_order_at_with_clock(
+            account_id,
+            update,
+            observed_now_ms,
+            &mut local_send_clock,
+        )
+    }
+
+    pub(super) fn process_private_order_at_with_clock(
+        &mut self,
+        account_id: Option<String>,
+        update: PrivateOrderUpdate,
+        observed_now_ms: TimeMs,
+        local_send_clock: &mut dyn FnMut() -> TimeMs,
     ) -> Result<CoordinatorOutput, CoordinatorError> {
         let account_id = self.require_account_id(account_id)?;
         let reported_order_id =
@@ -140,7 +196,11 @@ impl LiveCoordinator {
             }
         });
         if let Some(update) = canonical {
-            output.extend(self.process_normalized(NormalizedEvent::Order(update)));
+            output.extend(self.process_normalized_at_with_clock(
+                NormalizedEvent::Order(update),
+                observed_now_ms,
+                local_send_clock,
+            ));
         }
         if let Some(fill_record) = canonical_fill_record.or(raw_fill_record) {
             self.journal_fill_keys_by_account
@@ -156,6 +216,32 @@ impl LiveCoordinator {
         &mut self,
         account_id: Option<String>,
         fill: RemoteFill,
+    ) -> Result<CoordinatorOutput, CoordinatorError> {
+        let observed_now_ms = fill.ts_ms;
+        self.process_private_fill_at(account_id, fill, observed_now_ms)
+    }
+
+    pub(super) fn process_private_fill_at(
+        &mut self,
+        account_id: Option<String>,
+        fill: RemoteFill,
+        observed_now_ms: TimeMs,
+    ) -> Result<CoordinatorOutput, CoordinatorError> {
+        let mut local_send_clock = || observed_now_ms;
+        self.process_private_fill_at_with_clock(
+            account_id,
+            fill,
+            observed_now_ms,
+            &mut local_send_clock,
+        )
+    }
+
+    pub(super) fn process_private_fill_at_with_clock(
+        &mut self,
+        account_id: Option<String>,
+        fill: RemoteFill,
+        observed_now_ms: TimeMs,
+        local_send_clock: &mut dyn FnMut() -> TimeMs,
     ) -> Result<CoordinatorOutput, CoordinatorError> {
         let account_id = self.require_account_id(account_id)?;
         let reported_order_id = if fill.client_order_id.is_empty() || fill.client_order_id == "0" {
@@ -223,7 +309,11 @@ impl LiveCoordinator {
             )?);
         }
         if let Some(update) = canonical {
-            output.extend(self.process_normalized(NormalizedEvent::Order(update)));
+            output.extend(self.process_normalized_at_with_clock(
+                NormalizedEvent::Order(update),
+                observed_now_ms,
+                local_send_clock,
+            ));
         }
         Ok(output)
     }

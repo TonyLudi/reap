@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::HashSet;
 
 use reap_core::{NormalizedEvent, OrderIntent, SystemEvent, SystemEventKind, TimeMs};
@@ -148,6 +149,75 @@ impl TradingEngine<ChaosStrategy> {
     /// Processes one event without erasing the authority provenance of Chaos
     /// Quote, Hedge, and CancelOwned purposes.
     pub fn on_chaos_event(&mut self, event: NormalizedEvent) -> ChaosEngineOutput {
+        self.on_chaos_event_inner(event, || None, false, false, || 0)
+    }
+
+    /// Arrival-aware live/replay seam for the private public-trade callback.
+    pub fn on_chaos_event_at(
+        &mut self,
+        event: NormalizedEvent,
+        arrival_ns: u64,
+        observed_now_ms: TimeMs,
+        strategy_is_live: bool,
+    ) -> ChaosEngineOutput {
+        self.on_chaos_event_inner(
+            event,
+            || Some((arrival_ns, arrival_ns, observed_now_ms)),
+            strategy_is_live,
+            false,
+            || observed_now_ms,
+        )
+    }
+
+    /// Live-clock counterpart that samples pricing completion after the
+    /// strategy worker returns.
+    pub fn on_chaos_event_at_with_finish_clock(
+        &mut self,
+        event: NormalizedEvent,
+        receipt_ns: u64,
+        observed_now_ms: TimeMs,
+        strategy_is_live: bool,
+        processing_clock: impl FnOnce() -> u64,
+        worker_clock: impl FnMut() -> TimeMs,
+    ) -> ChaosEngineOutput {
+        self.on_chaos_event_inner(
+            event,
+            || Some((receipt_ns, processing_clock(), observed_now_ms)),
+            strategy_is_live,
+            false,
+            worker_clock,
+        )
+    }
+
+    /// Samples a depth worker's start immediately before entering strategy
+    /// code, after the engine's input-risk reduction has completed.
+    pub fn on_chaos_event_with_strategy_clock(
+        &mut self,
+        event: NormalizedEvent,
+        strategy_is_live: bool,
+        strategy_clock: impl FnOnce() -> (u64, TimeMs),
+        worker_clock: impl FnMut() -> TimeMs,
+    ) -> ChaosEngineOutput {
+        self.on_chaos_event_inner(
+            event,
+            || {
+                let (processing_ns, observed_now_ms) = strategy_clock();
+                Some((processing_ns, processing_ns, observed_now_ms))
+            },
+            strategy_is_live,
+            true,
+            worker_clock,
+        )
+    }
+
+    fn on_chaos_event_inner(
+        &mut self,
+        event: NormalizedEvent,
+        arrival_clock: impl FnOnce() -> Option<(u64, u64, TimeMs)>,
+        strategy_is_live: bool,
+        live_depth_delivery: bool,
+        worker_clock: impl FnMut() -> TimeMs,
+    ) -> ChaosEngineOutput {
         let now_ms = event.ts_ms();
         let mut output = ChaosEngineOutput::default();
         let post_trade = self.risk.on_normalized_event(&event);
@@ -164,7 +234,125 @@ impl TradingEngine<ChaosStrategy> {
             _ => None,
         };
         let strategy_event = event.into_strategy_event();
-        let strategy_intents = self.strategy.on_owned_execution_event(strategy_event);
+        let strategy_is_live = strategy_is_live && !self.risk.is_killed();
+        let strategy_intents = match arrival_clock() {
+            Some((receipt_ns, processing_ns, observed_now_ms)) if live_depth_delivery => self
+                .strategy
+                .on_owned_live_execution_event_at_with_finish_clock(
+                    strategy_event,
+                    receipt_ns,
+                    processing_ns,
+                    observed_now_ms,
+                    strategy_is_live,
+                    worker_clock,
+                ),
+            Some((receipt_ns, processing_ns, observed_now_ms)) => {
+                self.strategy.on_owned_execution_event_at_with_finish_clock(
+                    strategy_event,
+                    receipt_ns,
+                    processing_ns,
+                    observed_now_ms,
+                    strategy_is_live,
+                    worker_clock,
+                )
+            }
+            None => self.strategy.on_owned_execution_event(strategy_event),
+        };
+        self.finish_chaos_output(
+            now_ms,
+            strategy_intents,
+            input_requires_cancel,
+            halted_symbol.as_deref(),
+            &mut output,
+        );
+        output
+    }
+
+    /// Returns only the primitive deadline; the private action remains owned
+    /// by `ChaosStrategy`.
+    pub fn next_chaos_trade_reprice_due_ns(&self) -> Option<u64> {
+        self.strategy.next_trade_reprice_due_ns()
+    }
+
+    /// Services at most one due private action through the same risk path as
+    /// an event-produced Chaos intent.
+    pub fn service_one_due_chaos_trade_reprice(
+        &mut self,
+        now_ns: u64,
+        now_ms: TimeMs,
+        strategy_is_live: bool,
+    ) -> ChaosEngineOutput {
+        self.service_one_due_chaos_trade_reprice_with_finish_clock(
+            now_ns,
+            now_ms,
+            strategy_is_live,
+            || now_ms,
+        )
+    }
+
+    /// Live-clock counterpart that samples pricing completion after the due
+    /// worker returns.
+    pub fn service_one_due_chaos_trade_reprice_with_finish_clock(
+        &mut self,
+        now_ns: u64,
+        now_ms: TimeMs,
+        strategy_is_live: bool,
+        worker_clock: impl FnMut() -> TimeMs,
+    ) -> ChaosEngineOutput {
+        self.service_one_due_chaos_trade_reprice_with_clocks(
+            || (now_ns, now_ms),
+            strategy_is_live,
+            worker_clock,
+        )
+    }
+
+    /// Samples the due callback/direct-timer boundary and subsequent worker
+    /// start/finish reads at the strategy boundary.
+    pub fn service_one_due_chaos_trade_reprice_with_clocks(
+        &mut self,
+        start_clock: impl FnOnce() -> (u64, TimeMs),
+        strategy_is_live: bool,
+        worker_clock: impl FnMut() -> TimeMs,
+    ) -> ChaosEngineOutput {
+        let strategy_is_live = strategy_is_live && !self.risk.is_killed();
+        let sampled_start = Cell::new(None);
+        let strategy_intents = self.strategy.service_one_due_trade_reprice_with_clocks(
+            || {
+                let start = start_clock();
+                sampled_start.set(Some(start));
+                start
+            },
+            strategy_is_live,
+            worker_clock,
+        );
+        let (_, now_ms) = sampled_start
+            .get()
+            .expect("due trade-reprice start clock must be sampled");
+        let mut output = ChaosEngineOutput::default();
+        self.finish_chaos_output(now_ms, strategy_intents, false, None, &mut output);
+        output
+    }
+
+    /// Runs live policy/local reservation with a genuine Chaos intent and
+    /// applies any private hedge-side transition only after success.
+    pub fn with_locally_sent_chaos_intent<T, E>(
+        &mut self,
+        intent: ChaosExecutionIntent,
+        local_send_clock: impl FnOnce() -> TimeMs,
+        reserve: impl FnOnce(ChaosExecutionIntent) -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.strategy
+            .with_locally_sent_intent(intent, local_send_clock, reserve)
+    }
+
+    fn finish_chaos_output(
+        &mut self,
+        now_ms: TimeMs,
+        strategy_intents: Vec<ChaosExecutionIntent>,
+        input_requires_cancel: bool,
+        halted_symbol: Option<&str>,
+        output: &mut ChaosEngineOutput,
+    ) {
         if !self.risk.is_killed()
             && let Some(reason) = self.strategy.safety_halt_reason()
         {
@@ -172,7 +360,7 @@ impl TradingEngine<ChaosStrategy> {
                 .system_events
                 .extend(self.risk.on_strategy_halt(now_ms, reason).events);
         }
-        self.apply_chaos_risk(now_ms, strategy_intents, &mut output);
+        self.apply_chaos_risk(now_ms, strategy_intents, output);
         let fail_closed = self.risk.is_killed()
             || input_requires_cancel
             || output.system_events.iter().any(system_requires_cancel);
@@ -189,7 +377,7 @@ impl TradingEngine<ChaosStrategy> {
             let mut order_ids = if self.risk.is_killed() {
                 self.risk.live_order_ids().collect::<Vec<_>>()
             } else {
-                match halted_symbol.as_deref() {
+                match halted_symbol {
                     Some(symbol) => self.risk.live_order_ids_for(symbol).collect::<Vec<_>>(),
                     None => self.risk.live_order_ids().collect::<Vec<_>>(),
                 }
@@ -213,7 +401,6 @@ impl TradingEngine<ChaosStrategy> {
                 }
             }
         }
-        output
     }
 
     fn apply_chaos_risk(

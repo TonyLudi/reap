@@ -58,6 +58,7 @@ pub(super) enum RuntimeEvent {
     Raw {
         source_id: usize,
         envelope: reap_core::RawEnvelope,
+        received_at: Instant,
     },
     Connection {
         source_id: usize,

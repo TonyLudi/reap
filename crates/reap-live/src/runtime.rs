@@ -119,6 +119,13 @@ pub const LIVE_RUN_REPORT_SCHEMA_VERSION: u32 = 8;
 pub const MAX_LIVE_FAILURE_CODE_BYTES: usize = 64;
 pub const MAX_LIVE_FAILURE_MESSAGE_BYTES: usize = 4_096;
 
+mod scheduling;
+use scheduling::{monotonic_now_ns, wait_until_monotonic_ns};
+
+struct SchedulingState {
+    origin: Instant,
+}
+
 #[derive(Debug, Clone)]
 pub struct LiveRunOptions {
     pub mode: LiveMode,
@@ -576,6 +583,7 @@ struct LiveRuntime {
     composition: CompositionState,
     connectivity: ConnectivityState,
     dispatch: DispatchState,
+    scheduling: SchedulingState,
     readiness_safety: ReadinessSafetyState,
     reconciliation: ReconciliationState,
     shutdown: ShutdownState,
@@ -620,6 +628,11 @@ impl LiveRuntime {
         tokio::pin!(duration_elapsed);
 
         loop {
+            let trade_reprice_wait = wait_until_monotonic_ns(
+                self.scheduling.origin(),
+                self.coordinator.next_trade_reprice_due_ns(),
+            );
+            tokio::pin!(trade_reprice_wait);
             let iteration: Result<Option<RunLoopOutcome>, LiveRuntimeError> = async {
                 tokio::select! {
                     biased;
@@ -723,6 +736,19 @@ impl LiveRuntime {
                         self.retry_reconciliation(now_ms)?;
                         Ok(None)
                     }
+                    _ = &mut trade_reprice_wait => {
+                        let scheduling_origin = self.scheduling.origin();
+                        let output = self
+                            .coordinator
+                            .service_one_due_trade_reprice_with_clocks(
+                                move || {
+                                    (monotonic_now_ns(scheduling_origin), unix_time_ms())
+                                },
+                                unix_time_ms,
+                            );
+                        self.commit_output(output).await?;
+                        Ok(None)
+                    }
                     event = self.connectivity.feed_rx.recv() => {
                         let event = event.ok_or(LiveRuntimeError::EventChannelClosed)?;
                         self.handle_runtime_event(event).await?;
@@ -796,7 +822,9 @@ impl LiveRuntime {
             RuntimeEvent::Raw {
                 source_id,
                 envelope,
+                received_at,
             } => {
+                let arrival_ns = self.scheduling.captured_receipt_ns(received_at);
                 let (account_id, adapter, private_source) = {
                     let source = self.connectivity.sources.get(source_id).ok_or_else(|| {
                         LiveRuntimeError::FeedAdapter("unknown feed source".to_string())
@@ -849,9 +877,14 @@ impl LiveRuntime {
                                 ..
                             }
                         );
-                        let output = self
-                            .coordinator
-                            .process_feed_at(output, envelope.recv_ts_ns / 1_000_000)?;
+                        let scheduling_origin = self.scheduling.origin();
+                        let output = self.coordinator.process_feed_received_at(
+                            output,
+                            envelope.recv_ts_ns / 1_000_000,
+                            arrival_ns,
+                            move || (monotonic_now_ns(scheduling_origin), unix_time_ms()),
+                            unix_time_ms,
+                        )?;
                         let convergence_visible_ns = unix_time_ns();
                         if let Some(account_id) = private_account_id {
                             self.observe_account_convergence(

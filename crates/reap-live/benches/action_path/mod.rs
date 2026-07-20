@@ -295,7 +295,7 @@ pub(crate) fn run() {
         global_fail_close_workload(),
         coordinator_reduction_workload(),
         raw_sequence_gap_action_record_workload(),
-        trade_reprice_zero_baseline_workload(),
+        public_trade_reprice_workload(),
         bounded_biased_control_feed_storm_workload(),
     ];
     for result in &workloads {
