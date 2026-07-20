@@ -81,6 +81,10 @@ fn private_account_requires_every_transport_and_state_data_round() {
     ];
     let adapter: Arc<dyn VenueAdapter> = Arc::new(OkxAdapter::default());
     let mut source = FeedSourceState::private(adapter, "main".to_string(), &plans);
+    assert_eq!(
+        source.private_connectivity_health_state(),
+        Some(ConnectivityHealthState::Connecting)
+    );
 
     assert!(
         source
@@ -102,6 +106,10 @@ fn private_account_requires_every_transport_and_state_data_round() {
             .on_status(status("positions", ConnectionStatusKind::Ready))
             .is_empty()
     );
+    assert_eq!(
+        source.private_connectivity_health_state(),
+        Some(ConnectivityHealthState::Connecting)
+    );
     assert!(
         source
             .on_status(status("orders", ConnectionStatusKind::Heartbeat))
@@ -115,6 +123,10 @@ fn private_account_requires_every_transport_and_state_data_round() {
     );
     let ready = source.on_private_data(Channel::Positions, 3);
     assert_eq!(ready[0].kind, SystemEventKind::PrivateStreamRecovered);
+    assert_eq!(
+        source.private_connectivity_health_state(),
+        Some(ConnectivityHealthState::Ready)
+    );
 
     assert!(source.on_private_data(Channel::Account, 4).is_empty());
     assert!(source.on_private_data(Channel::Account, 5).is_empty());
@@ -129,14 +141,26 @@ fn private_account_requires_every_transport_and_state_data_round() {
     let stale = source.on_status(status("fills", ConnectionStatusKind::Disconnected));
     assert_eq!(stale[0].kind, SystemEventKind::PrivateStreamStale);
     assert!(stale[0].reason.ends_with(": test"));
+    assert_eq!(
+        source.private_connectivity_health_state(),
+        Some(ConnectivityHealthState::Disconnected)
+    );
     assert!(
         source
             .on_status(status("fills", ConnectionStatusKind::Ready))
             .is_empty()
     );
+    assert_eq!(
+        source.private_connectivity_health_state(),
+        Some(ConnectivityHealthState::Connecting)
+    );
     assert!(source.on_private_data(Channel::Positions, 7).is_empty());
     let recovered = source.on_private_data(Channel::Account, 8);
     assert_eq!(recovered[0].kind, SystemEventKind::PrivateStreamRecovered);
+    assert_eq!(
+        source.private_connectivity_health_state(),
+        Some(ConnectivityHealthState::Ready)
+    );
 }
 
 #[test]

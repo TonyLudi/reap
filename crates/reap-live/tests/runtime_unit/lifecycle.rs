@@ -89,8 +89,8 @@ async fn bounded_ready_runtime_completes_with_clean_soak_report() {
             "test alert",
         ))
         .unwrap();
-    let (control_tx, control_rx) = mpsc::channel(16);
-    let (feed_tx, feed_rx) = mpsc::channel(16);
+    let (control_tx, control_rx) = test_runtime_event_channel(16);
+    let (feed_tx, feed_rx) = test_tracked_channel(QueueId::FeedIngress, 16);
     let (_forbidden_tx, forbidden_rx) = mpsc::channel(16);
     let runtime = TestRuntimeParts {
         session_id: "test-alert-session".to_string(),
@@ -103,6 +103,7 @@ async fn bounded_ready_runtime_completes_with_clean_soak_report() {
         account_identity_sha256s: BTreeMap::new(),
         mode: LiveMode::Observe,
         run_duration: Some(Duration::from_millis(25)),
+        live_config: config.clone(),
         coordinator,
         processor: FeedProcessor::new(16, 16),
         storage: Some(storage),
@@ -209,8 +210,8 @@ async fn stalled_teardown_is_aborted_and_reported_within_the_deadline() {
     .await
     .unwrap();
     let storage_sink = storage.sink();
-    let (control_tx, control_rx) = mpsc::channel(16);
-    let (feed_tx, feed_rx) = mpsc::channel(16);
+    let (control_tx, control_rx) = test_runtime_event_channel(16);
+    let (feed_tx, feed_rx) = test_tracked_channel(QueueId::FeedIngress, 16);
     let (_forbidden_tx, forbidden_rx) = mpsc::channel(16);
     let (aborted_tx, aborted_rx) = oneshot::channel();
     let stalled_task = tokio::spawn(async move {
@@ -228,6 +229,7 @@ async fn stalled_teardown_is_aborted_and_reported_within_the_deadline() {
         account_identity_sha256s: BTreeMap::new(),
         mode: LiveMode::Observe,
         run_duration: Some(Duration::from_millis(5)),
+        live_config: config.clone(),
         coordinator,
         processor: FeedProcessor::new(16, 16),
         storage: Some(storage),
@@ -343,8 +345,8 @@ async fn authenticated_operator_commands_run_on_event_loop_and_shutdown_cleanly(
     .await
     .unwrap();
     let storage_sink = storage.sink();
-    let (control_tx, control_rx) = mpsc::channel(16);
-    let (feed_tx, feed_rx) = mpsc::channel(16);
+    let (control_tx, control_rx) = test_runtime_event_channel(16);
+    let (feed_tx, feed_rx) = test_tracked_channel(QueueId::FeedIngress, 16);
     let (_forbidden_tx, forbidden_rx) = mpsc::channel(16);
     let (operator_tx, operator_rx) = mpsc::channel(16);
     let operator_service = start_operator_service(&operator_config, SECRET.to_vec(), operator_tx)
@@ -361,6 +363,7 @@ async fn authenticated_operator_commands_run_on_event_loop_and_shutdown_cleanly(
         account_identity_sha256s: BTreeMap::new(),
         mode: LiveMode::Observe,
         run_duration: None,
+        live_config: config.clone(),
         coordinator,
         processor: FeedProcessor::new(16, 16),
         storage: Some(storage),
@@ -570,10 +573,10 @@ async fn fatal_runtime_error_with_closed_storage_still_resolves_live_orders() {
     .unwrap();
     let storage_sink = storage.sink();
     storage.shutdown().await.unwrap();
-    let (control_tx, control_rx) = mpsc::channel(16);
-    let (feed_tx, feed_rx) = mpsc::channel(16);
+    let (control_tx, control_rx) = test_runtime_event_channel(16);
+    let (feed_tx, feed_rx) = test_tracked_channel(QueueId::FeedIngress, 16);
     let (_forbidden_tx, forbidden_rx) = mpsc::channel(16);
-    let (order_tx, mut order_rx) = mpsc::channel(16);
+    let (order_tx, mut order_rx) = test_tracked_channel(QueueId::OrderCommand, 16);
     let (reconcile_tx, mut reconcile_rx) = mpsc::channel(16);
     let cancel_observed = Arc::new(AtomicBool::new(false));
     let reconcile_received = Arc::new(Notify::new());
@@ -655,6 +658,7 @@ async fn fatal_runtime_error_with_closed_storage_still_resolves_live_orders() {
         account_identity_sha256s: BTreeMap::new(),
         mode: LiveMode::Demo,
         run_duration: None,
+        live_config: config.clone(),
         coordinator,
         processor: FeedProcessor::new(16, 16),
         storage: None,
@@ -713,6 +717,45 @@ async fn fatal_runtime_error_with_closed_storage_still_resolves_live_orders() {
 
     let (_authority_gateway, cancel_policy, client_order_ids) =
         runtime_order_gateway(&["BTC-USDT"], Vec::new());
+    assert_eq!(runtime.durable_latches.active_count(), 0);
+    assert!(
+        matches!(
+            runtime
+                .record_durable_storage(StorageRecord::SafetyLatch(latch(
+                    SafetyLatchScope::Account {
+                        account_id: "not-predeclared".to_string(),
+                    },
+                    SafetyLatchSource::Risk,
+                )))
+                .await,
+            Err(LiveRuntimeError::Storage(StorageError::Closed))
+        ),
+        "unknown health scopes must still reach authoritative storage"
+    );
+    assert!(matches!(
+        runtime
+            .record_durable_storage(StorageRecord::SafetyLatch(latch(
+                SafetyLatchScope::Global,
+                SafetyLatchSource::Risk,
+            )))
+            .await,
+        Err(LiveRuntimeError::Storage(StorageError::Closed))
+    ));
+    assert_eq!(
+        runtime.durable_latches.active_count(),
+        0,
+        "a failed durable write must not advance the latch tracker"
+    );
+    let health =
+        serde_json::to_value(runtime.health.periodic_snapshot(Default::default())).unwrap();
+    assert_eq!(
+        health["readiness"]["active_durable_safety_latches"], 0,
+        "a failed durable write must not advance latch health"
+    );
+    // Keep the remainder of this lifecycle test focused on its original
+    // fail-closed cleanup behavior after proving the durable failure boundary.
+    runtime.shutdown.preserve_deadman = false;
+
     assert!(matches!(
         runtime.dispatch_action(LiveAction::Cancel(cancel_action(
             &cancel_policy,
@@ -724,6 +767,51 @@ async fn fatal_runtime_error_with_closed_storage_still_resolves_live_orders() {
         Err(LiveRuntimeError::Storage(StorageError::Closed))
     ));
     assert!(runtime.reconciliation.cancel_inflight.is_empty());
+    let health =
+        serde_json::to_value(runtime.health.periodic_snapshot(Default::default())).unwrap();
+    assert_eq!(
+        health["orders"]["cancel_requests"], 0,
+        "a closed non-durable OrderRequest enqueue must not advance health"
+    );
+
+    runtime
+        .health
+        .set_connectivity_expected(ConnectivityId::Feed, true);
+    runtime
+        .health
+        .set_connectivity_state(ConnectivityId::Feed, ConnectivityHealthState::Ready);
+    runtime
+        .health
+        .set_connectivity_expected(ConnectivityId::Private, true);
+    runtime
+        .health
+        .set_connectivity_state(ConnectivityId::Private, ConnectivityHealthState::Failed);
+    runtime
+        .health
+        .set_connectivity_expected(ConnectivityId::OrderCommand, false);
+    assert!(runtime.emit_final_health_snapshot());
+    assert!(
+        !runtime.emit_final_health_snapshot(),
+        "one runtime may emit its final health snapshot only once"
+    );
+    let final_health =
+        serde_json::to_value(runtime.health.final_snapshot(Default::default())).unwrap();
+    assert_eq!(final_health["readiness"]["state"], "stopping");
+    assert_eq!(
+        final_health["connectivity"][0]["state"], "disconnected",
+        "ready required connectivity finalizes as disconnected"
+    );
+    assert_eq!(
+        final_health["connectivity"][1]["state"], "failed",
+        "a terminal connectivity failure is preserved"
+    );
+    assert_eq!(
+        final_health["connectivity"][2]["state"], "not_required",
+        "optional connectivity remains explicitly not required"
+    );
+    // Restore the guard so this fixture can continue exercising the original
+    // production close path, which must perform its own post-teardown emission.
+    runtime.health_final_emitted = false;
 
     let error = runtime.run().await.unwrap_err();
     drop(control_tx);

@@ -1,5 +1,92 @@
 use super::*;
 
+#[test]
+fn durable_latch_health_is_seeded_idempotent_and_changes_only_when_applied() {
+    let config = config();
+    let record = |scope, active| {
+        StorageRecord::SafetyLatch(SafetyLatchRecord {
+            ts_ms: 1,
+            scope,
+            active,
+            source: SafetyLatchSource::Operator,
+            request_id: None,
+            reason: "health latch fixture".to_string(),
+        })
+    };
+    let global = record(SafetyLatchScope::Global, true);
+    let account = record(
+        SafetyLatchScope::Account {
+            account_id: "main".to_string(),
+        },
+        true,
+    );
+    let symbol = record(
+        SafetyLatchScope::Symbol {
+            symbol: "BTC-USDT".to_string(),
+        },
+        true,
+    );
+    let mut recovered = RecoveredStorage::default();
+    let StorageRecord::SafetyLatch(global_record) = global.clone() else {
+        unreachable!()
+    };
+    recovered.global_safety_latch = Some(global_record);
+    let StorageRecord::SafetyLatch(account_record) = account.clone() else {
+        unreachable!()
+    };
+    recovered
+        .account_safety_latches
+        .insert("main".to_string(), account_record);
+    let StorageRecord::SafetyLatch(symbol_record) = symbol.clone() else {
+        unreachable!()
+    };
+    recovered
+        .symbol_safety_latches
+        .insert("BTC-USDT".to_string(), symbol_record);
+
+    let mut tracker = DurableLatchTracker::from_recovered(&config, &recovered);
+    assert_eq!(tracker.active_count(), 3);
+
+    let duplicate = tracker.resolve(&global).unwrap();
+    assert_eq!(tracker.active_count(), 3, "resolution is observation-only");
+    assert_eq!(
+        tracker.apply(duplicate),
+        3,
+        "duplicate activation is idempotent"
+    );
+
+    let resume = record(
+        SafetyLatchScope::Symbol {
+            symbol: "BTC-USDT".to_string(),
+        },
+        false,
+    );
+    let resume = tracker.resolve(&resume).unwrap();
+    assert_eq!(
+        tracker.active_count(),
+        3,
+        "pre-durability count is unchanged"
+    );
+    assert_eq!(tracker.apply(resume), 2);
+    assert_eq!(tracker.apply(resume), 2, "duplicate resume is idempotent");
+
+    let unknown = record(
+        SafetyLatchScope::Account {
+            account_id: "not-predeclared".to_string(),
+        },
+        true,
+    );
+    assert!(
+        tracker.resolve(&unknown).is_none(),
+        "unknown scopes are durable-storage concerns, not health gates"
+    );
+    assert_eq!(
+        tracker.active_count(),
+        2,
+        "unknown scopes do not mutate bounded health state"
+    );
+}
+
 struct TaskDropSignal(Option<oneshot::Sender<()>>);
 
 impl Drop for TaskDropSignal {

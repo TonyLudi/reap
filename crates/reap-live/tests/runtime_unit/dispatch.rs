@@ -111,13 +111,14 @@ async fn order_task_is_bounded_and_serializes_each_underlying() {
     let (transport, mut started, gates, max_active) = gated_order_transport(&symbols);
     let (gateway, policy, client_order_ids) =
         runtime_order_gateway_with_execution(&symbols, Vec::new(), Box::new(transport));
-    let (command_tx, command_rx) = mpsc::channel(16);
-    let (event_tx, mut event_rx) = mpsc::channel(16);
+    let (command_tx, command_rx) = test_tracked_channel(QueueId::OrderCommand, 16);
+    let (event_tx, mut event_rx) = test_runtime_event_channel(16);
     let task = tokio::spawn(run_order_task(
         "main".to_string(),
         gateway,
         command_rx,
         event_tx,
+        OrderTaskHealth::new(Arc::new(RuntimeHealthState::with_order_task_count(1)), 0),
         2,
         16,
     ));
@@ -197,13 +198,14 @@ async fn order_task_rejects_authority_for_a_different_account_before_preparation
     let (transport, mut started, _gates, _) = gated_order_transport(&[symbol]);
     let (gateway, policy, client_order_ids) =
         runtime_order_gateway_with_execution(&[symbol], Vec::new(), Box::new(transport));
-    let (command_tx, command_rx) = mpsc::channel(2);
-    let (event_tx, mut event_rx) = mpsc::channel(2);
+    let (command_tx, command_rx) = test_tracked_channel(QueueId::OrderCommand, 2);
+    let (event_tx, mut event_rx) = test_runtime_event_channel(2);
     let task = tokio::spawn(run_order_task(
         "other-account".to_string(),
         gateway,
         command_rx,
         event_tx,
+        OrderTaskHealth::new(Arc::new(RuntimeHealthState::with_order_task_count(1)), 0),
         1,
         2,
     ));
@@ -257,14 +259,15 @@ async fn reconciliation_completes_while_an_order_command_is_blocked() {
     let (gateway, policy, client_order_ids) =
         runtime_order_gateway_with_execution(&[symbol], responses, Box::new(transport));
     let io = gateway.reconciliation_client();
-    let (command_tx, command_rx) = mpsc::channel(8);
+    let (command_tx, command_rx) = test_tracked_channel(QueueId::OrderCommand, 8);
     let (reconcile_tx, reconcile_rx) = mpsc::channel(2);
-    let (event_tx, mut event_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = test_runtime_event_channel(8);
     let order_task = tokio::spawn(run_order_task(
         "main".to_string(),
         gateway,
         command_rx,
         event_tx.clone(),
+        OrderTaskHealth::new(Arc::new(RuntimeHealthState::with_order_task_count(1)), 0),
         1,
         8,
     ));

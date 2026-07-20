@@ -53,6 +53,11 @@ use super::composition::{
     combine_lifecycle_errors, live_failure_evidence, qualifies_as_clean_soak,
 };
 use super::dispatch::{OrderTaskCommand, ReconcileTaskCommand, SafetyTaskCommand};
+use super::health::{
+    ConnectivityHealthState, ConnectivityId, OrderTaskHealth, QueueId, RuntimeHealthState,
+    TrackedReceiver, TrackedSender, tracked_channel,
+};
+use super::startup::DurableLatchTracker;
 use super::*;
 
 mod dispatch;
@@ -61,6 +66,21 @@ mod planning;
 mod recovery;
 mod safety;
 mod startup;
+
+fn test_tracked_channel<T>(id: QueueId, capacity: usize) -> (TrackedSender<T>, TrackedReceiver<T>) {
+    let health = if id == QueueId::OrderCommand {
+        RuntimeHealthState::with_order_task_count(1)
+    } else {
+        RuntimeHealthState::new()
+    };
+    tracked_channel(Arc::new(health), id, capacity)
+}
+
+fn test_runtime_event_channel(
+    capacity: usize,
+) -> (TrackedSender<RuntimeEvent>, TrackedReceiver<RuntimeEvent>) {
+    test_tracked_channel(QueueId::ControlIngress, capacity)
+}
 
 #[test]
 fn production_runtime_keeps_single_owner_responsibility_state() {
@@ -134,10 +154,14 @@ fn trade_reprice_branch_preserves_live_priority_and_one_arrival_per_raw_frame() 
     let select_source = &source[select_start..];
     let markers = [
         "signal = &mut shutdown",
+        "_ = &mut duration_elapsed",
+        "failure = receive_alert_failure",
+        "failure = receive_host_failure",
         "event = self.dispatch.control_rx.recv()",
         "event = self.readiness_safety.forbidden_rx.recv()",
         "operator = receive_operator",
         "_ = timer.tick()",
+        "_ = health_timer.tick()",
         "_ = &mut trade_reprice_wait",
         "event = self.connectivity.feed_rx.recv()",
     ];
@@ -148,7 +172,34 @@ fn trade_reprice_branch_preserves_live_priority_and_one_arrival_per_raw_frame() 
     });
     assert!(
         positions.windows(2).all(|pair| pair[0] < pair[1]),
-        "shutdown/control/safety/operator/timer/trade-reprice/feed priority changed",
+        "shutdown/duration/alert/host/control/safety/operator/timer/health/trade-reprice/feed priority changed",
+    );
+    let health_branch = select_source
+        .split_once("_ = health_timer.tick() => {")
+        .expect("periodic health select branch")
+        .1
+        .split_once("_ = &mut trade_reprice_wait")
+        .expect("trade-reprice branch after periodic health")
+        .0;
+    assert!(
+        health_branch.contains("self.emit_periodic_health_snapshot();"),
+        "the health timer branch must emit the periodic health snapshot"
+    );
+    let health_timer = source
+        .find("let mut health_timer = tokio::time::interval_at(")
+        .expect("fixed delayed health timer");
+    let health_timer_source = &source[health_timer..select_start];
+    assert!(
+        health_timer_source
+            .matches("Duration::from_nanos(health::HEALTH_EMISSION_INTERVAL_NS)")
+            .count()
+            >= 2,
+        "health cadence must use the same fixed five-second delay and interval"
+    );
+    assert!(
+        health_timer_source.contains(
+            "health_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip)"
+        )
     );
     let due_service = select_source
         .find(".service_one_due_trade_reprice_with_clocks(")
@@ -185,6 +236,69 @@ fn trade_reprice_branch_preserves_live_priority_and_one_arrival_per_raw_frame() 
     );
 }
 
+#[test]
+fn health_finalization_and_truthful_commit_order_are_source_pinned() {
+    let lifecycle = include_str!("../../src/runtime/lifecycle.rs");
+    assert_eq!(
+        lifecycle.matches(".emit_final_health_snapshot();").count(),
+        2,
+        "normal and error close paths must each contain one final emission"
+    );
+    for prefix in lifecycle.split(".emit_final_health_snapshot();").take(2) {
+        let shutdown = prefix
+            .rfind("let shutdown_result = self.shutdown().await;")
+            .expect("final health emission must follow runtime teardown");
+        let stop = prefix
+            .rfind("let stop_result = self.graceful_stop")
+            .expect("final health emission must follow fail-closed cleanup");
+        assert!(stop < shutdown);
+    }
+
+    let health = include_str!("../../src/runtime/health.rs");
+    let final_emission = health
+        .split_once("pub(super) fn emit_final_health_snapshot")
+        .expect("final health method")
+        .1
+        .split_once("fn emit_health_snapshot")
+        .expect("final health guard body")
+        .0;
+    let guard = final_emission
+        .find("if self.health_final_emitted")
+        .expect("exactly-once final guard");
+    let set = final_emission
+        .find("self.health_final_emitted = true;")
+        .expect("final guard state update");
+    let emit = final_emission
+        .find("self.emit_health_snapshot(true);")
+        .expect("guarded final assembly");
+    assert!(guard < set && set < emit);
+
+    let commit = include_str!("../../src/runtime/commit.rs");
+    let ordinary = commit
+        .split_once("pub(super) fn record_storage")
+        .expect("ordinary storage commit")
+        .1
+        .split_once("pub(super) async fn record_durable_storage")
+        .expect("durable storage boundary")
+        .0;
+    assert!(
+        ordinary.find(".try_record(record)").unwrap()
+            < ordinary
+                .find(".apply_counter_updates(health_updates)")
+                .unwrap(),
+        "order counters may advance only after journal enqueue succeeds"
+    );
+    let durable = commit
+        .split_once("pub(super) async fn record_durable_storage")
+        .expect("durable storage commit")
+        .1;
+    assert!(
+        durable.find(".record_durable(record)").unwrap()
+            < durable.find(".durable_latches.apply(update)").unwrap(),
+        "latch health may advance only after durable storage acknowledgement"
+    );
+}
+
 struct TestRuntimeParts {
     session_id: String,
     session_started_at_ms: u64,
@@ -196,14 +310,15 @@ struct TestRuntimeParts {
     account_identity_sha256s: BTreeMap<String, String>,
     mode: LiveMode,
     run_duration: Option<Duration>,
+    live_config: LiveConfig,
     coordinator: LiveCoordinator,
     processor: FeedProcessor,
     storage: Option<StorageRuntime>,
     storage_sink: StorageSink,
-    control_rx: mpsc::Receiver<RuntimeEvent>,
-    feed_rx: mpsc::Receiver<RuntimeEvent>,
+    control_rx: TrackedReceiver<RuntimeEvent>,
+    feed_rx: TrackedReceiver<RuntimeEvent>,
     forbidden_rx: mpsc::Receiver<ForbiddenOrderEvent>,
-    order_senders: HashMap<String, mpsc::Sender<OrderTaskCommand>>,
+    order_senders: HashMap<String, TrackedSender<OrderTaskCommand>>,
     order_tasks: Vec<JoinHandle<()>>,
     reconcile_senders: HashMap<String, mpsc::Sender<ReconcileTaskCommand>>,
     reconcile_tasks: Vec<JoinHandle<()>>,
@@ -253,8 +368,13 @@ struct TestRuntimeParts {
 
 impl TestRuntimeParts {
     fn into_runtime(self) -> LiveRuntime {
+        let durable_latches =
+            DurableLatchTracker::from_recovered(&self.live_config, &RecoveredStorage::default());
         LiveRuntime {
             coordinator: self.coordinator,
+            health: Arc::new(RuntimeHealthState::new()),
+            health_final_emitted: false,
+            durable_latches,
             composition: CompositionState {
                 session_id: self.session_id,
                 session_started_at_ms: self.session_started_at_ms,

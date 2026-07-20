@@ -55,7 +55,6 @@ mod commit;
 mod composition;
 mod connectivity;
 mod dispatch;
-#[cfg_attr(not(test), allow(dead_code))]
 mod health;
 mod lifecycle;
 mod operator_flow;
@@ -83,6 +82,7 @@ use dispatch::RuntimeTaskFailure;
 #[cfg(test)]
 use dispatch::run_order_task;
 use dispatch::{DispatchState, RuntimeEvent};
+use health::RuntimeHealthState;
 use operator_flow::receive_operator;
 #[cfg(test)]
 use planning::{
@@ -582,6 +582,9 @@ pub async fn run_live(
 
 struct LiveRuntime {
     coordinator: LiveCoordinator,
+    health: Arc<RuntimeHealthState>,
+    health_final_emitted: bool,
+    durable_latches: startup::DurableLatchTracker,
     composition: CompositionState,
     connectivity: ConnectivityState,
     dispatch: DispatchState,
@@ -610,6 +613,11 @@ impl LiveRuntime {
 
     async fn run_loop(&mut self) -> Result<RunLoopOutcome, RunLoopFailure> {
         let started = Instant::now();
+        let _heartbeat_guard = health::HeartbeatGuard::start(
+            Arc::clone(&self.health),
+            health::HeartbeatId::RuntimeEventLoop,
+            0,
+        );
         let mut readiness_tracker = ReadinessTracker::default();
         let initial_readiness = self.coordinator.readiness();
         readiness_tracker.observe(0, &initial_readiness);
@@ -618,6 +626,11 @@ impl LiveRuntime {
             self.readiness_safety.timer_interval_ms,
         ));
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut health_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_nanos(health::HEALTH_EMISSION_INTERVAL_NS),
+            Duration::from_nanos(health::HEALTH_EMISSION_INTERVAL_NS),
+        );
+        health_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let shutdown = shutdown_signal();
         tokio::pin!(shutdown);
         let run_duration = self.composition.run_duration;
@@ -738,6 +751,12 @@ impl LiveRuntime {
                         self.retry_reconciliation(now_ms)?;
                         Ok(None)
                     }
+                    _ = health_timer.tick() => {
+                        self.health
+                            .mark_heartbeat(health::HeartbeatId::RuntimeEventLoop);
+                        self.emit_periodic_health_snapshot();
+                        Ok(None)
+                    }
                     _ = &mut trade_reprice_wait => {
                         let scheduling_origin = self.scheduling.origin();
                         let output = self
@@ -774,6 +793,8 @@ impl LiveRuntime {
                     });
                 }
             }
+            self.health
+                .mark_heartbeat(health::HeartbeatId::RuntimeEventLoop);
 
             let readiness = self.coordinator.readiness();
             let elapsed_ms = elapsed_ms(&started);
@@ -837,6 +858,11 @@ impl LiveRuntime {
                         source.account_id.is_some(),
                     )
                 };
+                self.health.mark_connectivity_progress(if private_source {
+                    health::ConnectivityId::Private
+                } else {
+                    health::ConnectivityId::Feed
+                });
                 self.record_storage(StorageRecord::Raw {
                     account_id,
                     envelope: envelope.clone(),

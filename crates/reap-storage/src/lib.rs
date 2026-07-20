@@ -406,8 +406,11 @@ impl StorageProgress {
         saturating_increment(&self.records_enqueued);
         self.records_outstanding.fetch_add(1, Ordering::Relaxed);
         let depth = self.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
-        debug_assert!(depth <= self.queue_capacity);
-        self.queue_high_water.fetch_max(depth, Ordering::Relaxed);
+        // Tokio releases channel capacity immediately before `recv` returns.
+        // Clamp that sub-instruction accounting handoff without introducing a
+        // second capacity gate that could perturb producer ordering.
+        self.queue_high_water
+            .fetch_max(depth.min(self.queue_capacity), Ordering::Relaxed);
     }
 
     fn record_received(&self) {
@@ -463,8 +466,14 @@ impl StorageProgress {
             dropped_records: self.dropped_records.load(Ordering::Relaxed),
             records_outstanding: self.records_outstanding.load(Ordering::Relaxed),
             queue_capacity: self.queue_capacity,
-            queue_depth: self.queue_depth.load(Ordering::Relaxed),
-            queue_high_water: self.queue_high_water.load(Ordering::Relaxed),
+            queue_depth: self
+                .queue_depth
+                .load(Ordering::Relaxed)
+                .min(self.queue_capacity),
+            queue_high_water: self
+                .queue_high_water
+                .load(Ordering::Relaxed)
+                .min(self.queue_capacity),
             last_writer_progress_ns,
             last_writer_progress_age_ns,
         }
@@ -492,28 +501,73 @@ pub struct StorageSink {
 struct PendingRecord {
     record: StorageRecord,
     durable_ack: Option<oneshot::Sender<Result<(), String>>>,
+    queue_drop_guard: Option<StorageQueueDropGuard>,
+}
+
+impl PendingRecord {
+    fn queued(
+        record: StorageRecord,
+        durable_ack: Option<oneshot::Sender<Result<(), String>>>,
+        progress: Arc<StorageProgress>,
+    ) -> Self {
+        Self {
+            record,
+            durable_ack,
+            queue_drop_guard: Some(StorageQueueDropGuard {
+                progress,
+                armed: true,
+            }),
+        }
+    }
+
+    fn mark_received(&mut self) {
+        if let Some(guard) = &mut self.queue_drop_guard
+            && guard.armed
+        {
+            guard.progress.record_received();
+            guard.armed = false;
+        }
+    }
+}
+
+struct StorageQueueDropGuard {
+    progress: Arc<StorageProgress>,
+    armed: bool,
+}
+
+impl Drop for StorageQueueDropGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.progress.record_received();
+            self.progress.record_dropped();
+        }
+    }
 }
 
 impl StorageSink {
     pub async fn record(&self, record: StorageRecord) -> Result<StorageWriteOutcome, StorageError> {
-        let pending = PendingRecord {
-            record,
-            durable_ack: None,
-        };
-        if pending.record.is_critical() {
+        if record.is_critical() {
             let permit = self
                 .sender
                 .reserve()
                 .await
                 .map_err(|_| StorageError::Closed)?;
             self.progress.record_enqueued();
-            permit.send(pending);
+            permit.send(PendingRecord::queued(
+                record,
+                None,
+                Arc::clone(&self.progress),
+            ));
             return Ok(StorageWriteOutcome::Queued);
         }
         match self.sender.try_reserve() {
             Ok(permit) => {
                 self.progress.record_enqueued();
-                permit.send(pending);
+                permit.send(PendingRecord::queued(
+                    record,
+                    None,
+                    Arc::clone(&self.progress),
+                ));
                 Ok(StorageWriteOutcome::Queued)
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -532,10 +586,11 @@ impl StorageSink {
             .await
             .map_err(|_| StorageError::Closed)?;
         self.progress.record_enqueued();
-        permit.send(PendingRecord {
+        permit.send(PendingRecord::queued(
             record,
-            durable_ack: Some(durable_ack),
-        });
+            Some(durable_ack),
+            Arc::clone(&self.progress),
+        ));
         match ack.await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(message)) => Err(StorageError::Durability(message)),
@@ -548,10 +603,11 @@ impl StorageSink {
         match self.sender.try_reserve() {
             Ok(permit) => {
                 self.progress.record_enqueued();
-                permit.send(PendingRecord {
+                permit.send(PendingRecord::queued(
                     record,
-                    durable_ack: None,
-                });
+                    None,
+                    Arc::clone(&self.progress),
+                ));
                 Ok(StorageWriteOutcome::Queued)
             }
             Err(mpsc::error::TrySendError::Full(_)) if critical => Err(StorageError::Backpressure),
@@ -1266,8 +1322,8 @@ async fn run_writer_with_file(
             biased;
             _ = &mut shutdown => {
                 receiver.close();
-                while let Some(pending) = receiver.recv().await {
-                    progress.record_received();
+                while let Some(mut pending) = receiver.recv().await {
+                    pending.mark_received();
                     let result = write_pending(&mut file, pending, &progress).await;
                     progress.record_completed();
                     result?;
@@ -1275,8 +1331,8 @@ async fn run_writer_with_file(
                 break;
             }
             pending = receiver.recv() => {
-                let Some(pending) = pending else { break; };
-                progress.record_received();
+                let Some(mut pending) = pending else { break; };
+                pending.mark_received();
                 let result = write_pending(&mut file, pending, &progress).await;
                 progress.record_completed();
                 let durable = result?;
@@ -1317,6 +1373,7 @@ async fn write_pending(
     let PendingRecord {
         record,
         durable_ack,
+        queue_drop_guard: _,
     } = pending;
     let durable = durable_ack.is_some();
     let result = async {
@@ -1994,8 +2051,7 @@ mod tests {
         };
 
         sink.record(raw()).await.unwrap();
-        let first = receiver.recv().await.unwrap();
-        progress.record_received();
+        let mut first = receiver.recv().await.unwrap();
         sink.record(raw()).await.unwrap();
 
         let snapshot = sink.progress_snapshot();
@@ -2005,14 +2061,34 @@ mod tests {
         assert_eq!(snapshot.records_outstanding, 2);
         assert_eq!(sink.queue_depth(), 2);
 
+        first.mark_received();
         drop(first);
         progress.record_completed();
-        let second = receiver.recv().await.unwrap();
-        progress.record_received();
+        let mut second = receiver.recv().await.unwrap();
+        second.mark_received();
         drop(second);
         progress.record_completed();
         assert_eq!(sink.queue_depth(), 0);
         assert_eq!(sink.progress_snapshot().queue_depth, 0);
+    }
+
+    #[tokio::test]
+    async fn storage_progress_accounts_for_records_discarded_with_the_receiver() {
+        let (sender, receiver) = mpsc::channel(1);
+        let progress = Arc::new(StorageProgress::new(1));
+        let sink = StorageSink {
+            sender,
+            progress: Arc::clone(&progress),
+        };
+
+        sink.record(raw()).await.unwrap();
+        drop(receiver);
+
+        let snapshot = sink.progress_snapshot();
+        assert_eq!(snapshot.queue_depth, 0);
+        assert_eq!(snapshot.queue_high_water, 1);
+        assert_eq!(snapshot.records_outstanding, 1);
+        assert_eq!(snapshot.dropped_records, 1);
     }
 
     #[test]
@@ -2057,6 +2133,7 @@ mod tests {
                 PendingRecord {
                     record: raw(),
                     durable_ack: None,
+                    queue_drop_guard: None,
                 },
                 &progress,
             )
@@ -2068,6 +2145,7 @@ mod tests {
             PendingRecord {
                 record: raw(),
                 durable_ack: None,
+                queue_drop_guard: None,
             },
             &progress,
         )
@@ -2099,6 +2177,7 @@ mod tests {
             PendingRecord {
                 record: raw(),
                 durable_ack: Some(durable_ack),
+                queue_drop_guard: None,
             },
             &progress,
         )

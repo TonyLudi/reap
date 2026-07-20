@@ -20,6 +20,7 @@ use crate::{
 };
 
 use super::dispatch::{RuntimeEvent, RuntimeTaskFailure, SafetyTaskCommand};
+use super::health::TrackedSender;
 use super::{LiveRuntime, LiveRuntimeError, unix_time_ms};
 
 pub(super) struct ReadinessSafetyState {
@@ -622,7 +623,7 @@ pub(super) async fn run_account_safety_task(
     safety: Option<Arc<dyn SafetyPort>>,
     expected_account_config: reap_venue::okx::OkxAccountConfig,
     mut commands: mpsc::Receiver<SafetyTaskCommand>,
-    events: mpsc::Sender<RuntimeEvent>,
+    events: TrackedSender<RuntimeEvent>,
     mut deadman_timeout_secs: Option<u64>,
     deadman_heartbeat_ms: u64,
     clock_check_interval_ms: u64,

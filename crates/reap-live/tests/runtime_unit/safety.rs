@@ -274,7 +274,7 @@ async fn safety_task_disables_deadman_only_on_explicit_command() {
         r#"{"code":"0","msg":"","data":[{"triggerTime":"0","tag":"","ts":"1"}]}"#,
     )]);
     let (command_tx, command_rx) = mpsc::channel(2);
-    let (event_tx, _event_rx) = mpsc::channel(2);
+    let (event_tx, _event_rx) = test_runtime_event_channel(2);
     let task = tokio::spawn(run_account_safety_task(
         "main".to_string(),
         client.clone(),
@@ -310,7 +310,7 @@ async fn deadman_heartbeat_failure_is_fatal() {
         "injected heartbeat failure".to_string(),
     ))]);
     let (_command_tx, command_rx) = mpsc::channel(2);
-    let (event_tx, mut event_rx) = mpsc::channel(2);
+    let (event_tx, mut event_rx) = test_runtime_event_channel(2);
     let task = tokio::spawn(run_account_safety_task(
         "main".to_string(),
         client.clone(),
@@ -349,7 +349,7 @@ async fn blocked_exchange_fee_check_does_not_delay_deadman_heartbeat() {
         deadman_seen: Arc::clone(&deadman_seen),
     });
     let (command_tx, command_rx) = mpsc::channel(2);
-    let (event_tx, mut event_rx) = mpsc::channel(2);
+    let (event_tx, mut event_rx) = test_runtime_event_channel(2);
     let task = tokio::spawn(run_account_safety_task(
         "main".to_string(),
         readiness,
@@ -388,7 +388,7 @@ async fn blocked_exchange_instrument_check_does_not_delay_deadman_heartbeat() {
         deadman_seen: Arc::clone(&deadman_seen),
     });
     let (command_tx, command_rx) = mpsc::channel(2);
-    let (event_tx, mut event_rx) = mpsc::channel(2);
+    let (event_tx, mut event_rx) = test_runtime_event_channel(2);
     let task = tokio::spawn(run_account_safety_task(
         "main".to_string(),
         readiness,
@@ -421,7 +421,7 @@ async fn periodic_exchange_clock_skew_has_a_typed_failure() {
     let (client, requests) =
         safety_client(vec![Ok(r#"{"code":"0","msg":"","data":[{"ts":"0"}]}"#)]);
     let (_command_tx, command_rx) = mpsc::channel(2);
-    let (event_tx, mut event_rx) = mpsc::channel(2);
+    let (event_tx, mut event_rx) = test_runtime_event_channel(2);
     let task = tokio::spawn(run_account_safety_task(
         "main".to_string(),
         client,
@@ -459,7 +459,7 @@ async fn account_configuration_drift_is_fatal() {
         ),
     ]);
     let (_command_tx, command_rx) = mpsc::channel(2);
-    let (event_tx, mut event_rx) = mpsc::channel(2);
+    let (event_tx, mut event_rx) = test_runtime_event_channel(2);
     let task = tokio::spawn(run_account_safety_task(
         "main".to_string(),
         client,
@@ -497,7 +497,7 @@ async fn account_stp_mode_drift_is_fatal() {
         ),
     ]);
     let (_command_tx, command_rx) = mpsc::channel(2);
-    let (event_tx, mut event_rx) = mpsc::channel(2);
+    let (event_tx, mut event_rx) = test_runtime_event_channel(2);
     let task = tokio::spawn(run_account_safety_task(
         "main".to_string(),
         client,
@@ -778,7 +778,7 @@ async fn periodic_exchange_fee_understatement_is_fatal() {
         ),
     ]);
     let (_command_tx, command_rx) = mpsc::channel(2);
-    let (event_tx, mut event_rx) = mpsc::channel(2);
+    let (event_tx, mut event_rx) = test_runtime_event_channel(2);
     let task = tokio::spawn(run_account_safety_task(
         "main".to_string(),
         client,
@@ -823,7 +823,7 @@ async fn periodic_exchange_fee_check_failure_is_typed() {
         Err(RestError::Transport("injected fee failure".to_string())),
     ]);
     let (_command_tx, command_rx) = mpsc::channel(2);
-    let (event_tx, mut event_rx) = mpsc::channel(2);
+    let (event_tx, mut event_rx) = test_runtime_event_channel(2);
     let task = tokio::spawn(run_account_safety_task(
         "main".to_string(),
         client,
@@ -856,7 +856,7 @@ async fn periodic_exchange_instrument_maximum_drift_is_fatal() {
     let changed = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","instType":"SPOT","instFamily":"","groupId":"1","baseCcy":"BTC","quoteCcy":"USDT","settleCcy":"","ctType":"","ctVal":"","ctValCcy":"","tickSz":"0.1","lotSz":"0.001","minSz":"0.001","maxLmtSz":"99","maxMktSz":"1000000","maxLmtAmt":"1000000","maxMktAmt":"1000000","state":"live","upcChg":[]}]}"#;
     let (client, requests) = safety_client(vec![Ok(changed)]);
     let (_command_tx, command_rx) = mpsc::channel(2);
-    let (event_tx, mut event_rx) = mpsc::channel(2);
+    let (event_tx, mut event_rx) = test_runtime_event_channel(2);
     let task = tokio::spawn(run_account_safety_task(
         "main".to_string(),
         client,
@@ -891,7 +891,7 @@ async fn periodic_exchange_instrument_check_failure_is_typed() {
         "injected instrument failure".to_string(),
     ))]);
     let (_command_tx, command_rx) = mpsc::channel(2);
-    let (event_tx, mut event_rx) = mpsc::channel(2);
+    let (event_tx, mut event_rx) = test_runtime_event_channel(2);
     let task = tokio::spawn(run_account_safety_task(
         "main".to_string(),
         client,
@@ -925,7 +925,7 @@ async fn periodic_relevant_exchange_status_is_fatal() {
         r#"{"code":"0","msg":"","data":[{"begin":"1","end":"60001","env":"2","maintType":"2","serviceType":"5","state":"ongoing","system":"unified","title":"Trading maintenance"}]}"#,
     )]);
     let (_command_tx, command_rx) = mpsc::channel(2);
-    let (event_tx, mut event_rx) = mpsc::channel(2);
+    let (event_tx, mut event_rx) = test_runtime_event_channel(2);
     let task = tokio::spawn(run_account_safety_task(
         "main".to_string(),
         client,
@@ -962,7 +962,7 @@ async fn periodic_exchange_status_check_failure_is_typed() {
         "injected status failure".to_string(),
     ))]);
     let (_command_tx, command_rx) = mpsc::channel(2);
-    let (event_tx, mut event_rx) = mpsc::channel(2);
+    let (event_tx, mut event_rx) = test_runtime_event_channel(2);
     let task = tokio::spawn(run_account_safety_task(
         "main".to_string(),
         client,

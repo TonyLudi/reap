@@ -13,7 +13,7 @@ pub(super) fn quote_creation_workload() -> WorkloadResult {
          TradingEngine<ChaosStrategy>; RiskGate decisions; typed intent traversal; regular \
          policy; canonical reservation; gateway idempotency; PreparedRegularSubmit for the first \
          production-emitted quote purpose",
-        ENGINE_EXCLUDED,
+        PREPARED_ACTION_EXCLUDED,
         || {
             let mut engine = benchmark_engine(RiskLimits {
                 require_feed_health: false,
@@ -60,7 +60,7 @@ pub(super) fn quote_replacement_workload() -> WorkloadResult {
          TradingEngine<ChaosStrategy>; RiskGate decisions; typed intent traversal; a \
          production-created quote registered PendingNew; typed CancelOwned replacement; \
          ownership policy proof; PreparedRegularCancel",
-        ENGINE_EXCLUDED,
+        PREPARED_ACTION_EXCLUDED,
         || {
             let mut engine = benchmark_engine(permissive_risk_limits());
             black_box(engine.on_chaos_event(depth_event("BTC-USDT", 1, 50_000.0, 50_001.0, 2.0)));
@@ -127,7 +127,7 @@ pub(super) fn ioc_hedge_workload() -> WorkloadResult {
          TradingEngine<ChaosStrategy>; RiskGate decisions; typed intent traversal; alternating \
          production account-position reductions; IOC CancelMaker hedge purpose; regular policy; \
          canonical reservation; gateway idempotency; PreparedRegularSubmit",
-        ENGINE_EXCLUDED,
+        PREPARED_ACTION_EXCLUDED,
         || {
             let mut engine = benchmark_engine(permissive_risk_limits());
             black_box(engine.on_chaos_event(depth_event("BTC-USDT", 1, 50_000.0, 50_001.0, 2.0)));
@@ -246,7 +246,7 @@ fn fail_close_workload(
          TradingEngine<ChaosStrategy>; RiskGate decisions; typed intent traversal; canonical \
          live-order risk state; risk-synthesized safety-cancel candidates; ownership proof; \
          PreparedRegularCancel",
-        ENGINE_EXCLUDED,
+        PREPARED_ACTION_EXCLUDED,
         move || {
             let mut engine = benchmark_engine(permissive_risk_limits());
             black_box(engine.on_chaos_event(depth_event("BTC-USDT", 1, 50_000.0, 50_001.0, 2.0)));

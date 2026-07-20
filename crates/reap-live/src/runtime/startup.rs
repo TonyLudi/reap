@@ -11,8 +11,9 @@ use reap_feed::{
 use reap_okx_live_adapter::OrderCommandWebsocketConfig;
 use reap_order::{RegularApprovalScope, reconcile_full_state};
 use reap_storage::{
-    BootstrapRecord, RecoveredStorage, SessionStartRecord, StorageConfig, StorageLease,
-    StorageRecord, acquire_storage_lease, recover_leased_jsonl, start_jsonl_storage_with_lease,
+    BootstrapRecord, RecoveredStorage, SafetyLatchScope, SessionStartRecord, StorageConfig,
+    StorageLease, StorageRecord, acquire_storage_lease, recover_leased_jsonl,
+    start_jsonl_storage_with_lease,
 };
 use reap_telemetry::{
     AlertDeliveryFailure, AlertRuntime, AlertSink, AlertStats, start_webhook_alerts,
@@ -37,6 +38,7 @@ use super::bootstrap::{AccountSeed, bootstrap_accounts};
 use super::composition::{CompositionState, RuntimeEvidence};
 use super::connectivity::{ConnectivityState, FeedSourceState, spawn_feed_forwarders};
 use super::dispatch::{DispatchState, RuntimeEvent, run_order_task};
+use super::health::{OrderTaskHealth, QueueId, RuntimeHealthState, tracked_channel};
 use super::planning::{
     planned_order_session_counts, private_socket_plans_by_account, runtime_public_subscriptions,
     validate_public_socket_plans, validate_runtime_connectivity_plan,
@@ -64,6 +66,110 @@ pub(super) struct StartupPlan {
     private_plans_by_account: BTreeMap<String, Vec<SocketPlan>>,
     order_session_counts: BTreeMap<String, usize>,
     planned_order_accounts: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum DurableLatchSlot {
+    Global,
+    Account(usize),
+    Symbol(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct DurableLatchUpdate {
+    slot: DurableLatchSlot,
+    active: bool,
+}
+
+pub(super) struct DurableLatchTracker {
+    global_active: bool,
+    account_slots: BTreeMap<String, usize>,
+    account_active: Vec<bool>,
+    symbol_slots: BTreeMap<String, usize>,
+    symbol_active: Vec<bool>,
+    active_count: u64,
+}
+
+impl DurableLatchTracker {
+    pub(super) fn from_recovered(config: &LiveConfig, recovered: &RecoveredStorage) -> Self {
+        let account_slots = config
+            .accounts
+            .iter()
+            .enumerate()
+            .map(|(index, account)| (account.id.clone(), index))
+            .collect::<BTreeMap<_, _>>();
+        let mut account_active = vec![false; account_slots.len()];
+        for account_id in recovered.account_safety_latches.keys() {
+            if let Some(index) = account_slots.get(account_id) {
+                account_active[*index] = true;
+            }
+        }
+        let symbol_slots = config
+            .strategy
+            .instruments
+            .iter()
+            .enumerate()
+            .map(|(index, instrument)| (instrument.symbol.clone(), index))
+            .collect::<BTreeMap<_, _>>();
+        let mut symbol_active = vec![false; symbol_slots.len()];
+        for symbol in recovered.symbol_safety_latches.keys() {
+            if let Some(index) = symbol_slots.get(symbol) {
+                symbol_active[*index] = true;
+            }
+        }
+        let global_active = recovered.global_safety_latch.is_some();
+        let active_count = usize::from(global_active)
+            .saturating_add(account_active.iter().filter(|active| **active).count())
+            .saturating_add(symbol_active.iter().filter(|active| **active).count());
+        Self {
+            global_active,
+            account_slots,
+            account_active,
+            symbol_slots,
+            symbol_active,
+            active_count: u64::try_from(active_count).unwrap_or(u64::MAX),
+        }
+    }
+
+    pub(super) fn resolve(&self, record: &StorageRecord) -> Option<DurableLatchUpdate> {
+        let StorageRecord::SafetyLatch(latch) = record else {
+            return None;
+        };
+        let slot = match &latch.scope {
+            SafetyLatchScope::Global => DurableLatchSlot::Global,
+            SafetyLatchScope::Account { account_id } => {
+                DurableLatchSlot::Account(*self.account_slots.get(account_id)?)
+            }
+            SafetyLatchScope::Symbol { symbol } => {
+                DurableLatchSlot::Symbol(*self.symbol_slots.get(symbol)?)
+            }
+        };
+        Some(DurableLatchUpdate {
+            slot,
+            active: latch.active,
+        })
+    }
+
+    pub(super) fn apply(&mut self, update: DurableLatchUpdate) -> u64 {
+        let state = match update.slot {
+            DurableLatchSlot::Global => &mut self.global_active,
+            DurableLatchSlot::Account(index) => &mut self.account_active[index],
+            DurableLatchSlot::Symbol(index) => &mut self.symbol_active[index],
+        };
+        if *state != update.active {
+            *state = update.active;
+            self.active_count = if update.active {
+                self.active_count.saturating_add(1)
+            } else {
+                self.active_count.saturating_sub(1)
+            };
+        }
+        self.active_count
+    }
+
+    pub(super) fn active_count(&self) -> u64 {
+        self.active_count
+    }
 }
 
 impl StartupPlan {
@@ -518,6 +624,10 @@ impl RuntimeResources {
             account_identity_sha256s,
             session_id,
         } = startup;
+        let order_connectivity_expected = !foundation.order_session_counts.is_empty();
+        let order_task_count = foundation.order_session_counts.len();
+        let durable_latches =
+            DurableLatchTracker::from_recovered(&foundation.config, &foundation.recovered);
         let StartupFoundation {
             config,
             mode,
@@ -560,8 +670,27 @@ impl RuntimeResources {
         let storage_sink = storage.sink();
         owner.mark_storage_ready(true, "storage file opened");
 
-        let (control_tx, control_rx) = mpsc::channel(config.runtime.event_channel_capacity);
-        let (feed_tx, feed_rx) = mpsc::channel(config.runtime.event_channel_capacity);
+        let health = Arc::new(RuntimeHealthState::with_order_task_count(order_task_count));
+        health.set_connectivity_expected(super::health::ConnectivityId::Feed, true);
+        health.set_connectivity_expected(
+            super::health::ConnectivityId::Private,
+            !config.accounts.is_empty(),
+        );
+        health.set_connectivity_expected(
+            super::health::ConnectivityId::OrderCommand,
+            order_connectivity_expected,
+        );
+        health.set_active_durable_safety_latches(durable_latches.active_count());
+        let (control_tx, control_rx) = tracked_channel(
+            Arc::clone(&health),
+            QueueId::ControlIngress,
+            config.runtime.event_channel_capacity,
+        );
+        let (feed_tx, feed_rx) = tracked_channel(
+            Arc::clone(&health),
+            QueueId::FeedIngress,
+            config.runtime.event_channel_capacity,
+        );
         let (forbidden_tx, forbidden_rx) = mpsc::channel(config.runtime.event_channel_capacity);
         let mut host_guard = config
             .host_guard
@@ -776,13 +905,19 @@ impl RuntimeResources {
                         }
                     }));
                     order_ws_runtimes.push(order_ws_runtime);
-                    let (order_tx, order_rx) = mpsc::channel(config.runtime.order_channel_capacity);
+                    let (order_tx, order_rx) = tracked_channel(
+                        Arc::clone(&health),
+                        QueueId::OrderCommand,
+                        config.runtime.order_channel_capacity,
+                    );
                     order_senders.insert(account_id.clone(), order_tx);
+                    let heartbeat_lane_index = order_tasks.len();
                     order_tasks.push(tokio::spawn(run_order_task(
                         account_id.clone(),
                         gateway,
                         order_rx,
                         control_tx.clone(),
+                        OrderTaskHealth::new(Arc::clone(&health), heartbeat_lane_index),
                         session_count,
                         config.runtime.order_channel_capacity,
                     )));
@@ -822,6 +957,9 @@ impl RuntimeResources {
 
         let runtime = LiveRuntime {
             coordinator: owner,
+            health,
+            health_final_emitted: false,
+            durable_latches,
             composition: CompositionState {
                 session_id,
                 session_started_at_ms,

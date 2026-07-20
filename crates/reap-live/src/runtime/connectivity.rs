@@ -11,17 +11,17 @@ use reap_feed::{
 };
 use reap_okx_live_adapter::OrderCommandWebsocketLifecycle;
 use reap_venue::VenueAdapter;
-use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::LiveLatencySemantics;
 
 use super::dispatch::RuntimeEvent;
+use super::health::{ConnectivityHealthState, ConnectivityId, TrackedReceiver, TrackedSender};
 use super::{LiveRuntime, LiveRuntimeError};
 
 pub(super) struct ConnectivityState {
     pub(super) processor: FeedProcessor,
-    pub(super) feed_rx: mpsc::Receiver<RuntimeEvent>,
+    pub(super) feed_rx: TrackedReceiver<RuntimeEvent>,
     pub(super) order_ws_runtimes: Vec<OrderCommandWebsocketLifecycle>,
     pub(super) order_ws_status_tasks: Vec<JoinHandle<()>>,
     pub(super) feeds: Vec<SupervisedFeed>,
@@ -40,6 +40,7 @@ pub(super) struct FeedSourceState {
     required_private_data_channels: HashSet<Channel>,
     private_data_round: HashSet<Channel>,
     private_ready: bool,
+    private_disconnected: bool,
 }
 
 struct PublicSubscriptionRoute {
@@ -76,6 +77,7 @@ impl FeedSourceState {
             required_private_data_channels: HashSet::new(),
             private_data_round: HashSet::new(),
             private_ready: false,
+            private_disconnected: false,
         }
     }
 
@@ -101,6 +103,7 @@ impl FeedSourceState {
             required_private_data_channels,
             private_data_round: HashSet::new(),
             private_ready: false,
+            private_disconnected: false,
         }
     }
 
@@ -114,6 +117,18 @@ impl FeedSourceState {
         })
     }
 
+    pub(super) fn private_connectivity_health_state(&self) -> Option<ConnectivityHealthState> {
+        self.account_id.is_some().then_some(
+            if self.private_ready && self.expected_connections.is_subset(&self.ready_connections) {
+                ConnectivityHealthState::Ready
+            } else if self.private_disconnected {
+                ConnectivityHealthState::Disconnected
+            } else {
+                ConnectivityHealthState::Connecting
+            },
+        )
+    }
+
     pub(super) fn on_status(&mut self, status: ConnectionStatus) -> Vec<SystemEvent> {
         let disconnected = matches!(
             status.kind,
@@ -123,10 +138,14 @@ impl FeedSourceState {
         match status.kind {
             ConnectionStatusKind::Ready | ConnectionStatusKind::Heartbeat => {
                 self.ready_connections.insert(status.conn_id.clone());
+                if self.expected_connections.is_subset(&self.ready_connections) {
+                    self.private_disconnected = false;
+                }
             }
             ConnectionStatusKind::Disconnected | ConnectionStatusKind::Fatal => {
                 self.ready_connections.remove(&status.conn_id);
                 self.private_ready = false;
+                self.private_disconnected = self.account_id.is_some();
                 self.private_data_round.clear();
             }
         }
@@ -220,13 +239,46 @@ impl FeedSourceState {
     }
 }
 
+fn aggregate_private_connectivity_health(
+    sources: &[FeedSourceState],
+) -> Option<ConnectivityHealthState> {
+    let mut private_sources = 0_usize;
+    let mut all_ready = true;
+    let mut any_disconnected = false;
+    for state in sources
+        .iter()
+        .filter_map(FeedSourceState::private_connectivity_health_state)
+    {
+        private_sources = private_sources.saturating_add(1);
+        all_ready &= state == ConnectivityHealthState::Ready;
+        any_disconnected |= state == ConnectivityHealthState::Disconnected;
+    }
+    (private_sources > 0).then_some(if all_ready {
+        ConnectivityHealthState::Ready
+    } else if any_disconnected {
+        ConnectivityHealthState::Disconnected
+    } else {
+        ConnectivityHealthState::Connecting
+    })
+}
+
 pub(super) async fn handle_runtime_event(
     runtime: &mut LiveRuntime,
     event: RuntimeEvent,
 ) -> Result<(), LiveRuntimeError> {
     match event {
         RuntimeEvent::Connection { source_id, status } => {
+            let status_private = status.private;
+            let health_id = if status_private {
+                ConnectivityId::Private
+            } else {
+                ConnectivityId::Feed
+            };
+            runtime.health.mark_connectivity_progress(health_id);
             if status.kind == ConnectionStatusKind::Fatal {
+                runtime
+                    .health
+                    .set_connectivity_state(health_id, ConnectivityHealthState::Failed);
                 return Err(LiveRuntimeError::ConnectionPacerRuntime(format!(
                     "{}: {}",
                     status.conn_id, status.reason
@@ -250,6 +302,14 @@ pub(super) async fn handle_runtime_event(
                 (events, source.public_connectivity_ready())
             };
             if let Some(ready) = public_connectivity {
+                runtime.health.set_connectivity_state(
+                    ConnectivityId::Feed,
+                    if ready {
+                        ConnectivityHealthState::Ready
+                    } else {
+                        ConnectivityHealthState::Disconnected
+                    },
+                );
                 runtime.coordinator.mark_public_connectivity(
                     ready,
                     if ready {
@@ -258,6 +318,14 @@ pub(super) async fn handle_runtime_event(
                         "one or more public subscriptions has no acknowledged connection"
                     },
                 );
+            }
+            if status_private
+                && let Some(state) =
+                    aggregate_private_connectivity_health(&runtime.connectivity.sources)
+            {
+                runtime
+                    .health
+                    .set_connectivity_state(ConnectivityId::Private, state);
             }
             runtime.handle_feed_source_events(events).await?;
         }
@@ -289,6 +357,10 @@ impl LiveRuntime {
                 .coordinator
                 .process_event(NormalizedEvent::System(event));
             self.commit_output(output).await?;
+        }
+        if let Some(state) = aggregate_private_connectivity_health(&self.connectivity.sources) {
+            self.health
+                .set_connectivity_state(ConnectivityId::Private, state);
         }
         Ok(())
     }
@@ -345,7 +417,7 @@ impl LiveRuntime {
 pub(super) fn spawn_feed_forwarders(
     source_id: usize,
     feed: &mut SupervisedFeed,
-    events: &mpsc::Sender<RuntimeEvent>,
+    events: &TrackedSender<RuntimeEvent>,
     tasks: &mut Vec<JoinHandle<()>>,
 ) {
     let mut raw = feed.take_raw();

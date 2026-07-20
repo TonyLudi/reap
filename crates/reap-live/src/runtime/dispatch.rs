@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
@@ -21,14 +21,17 @@ use tokio::task::JoinHandle;
 use crate::LiveLatencySemantics;
 use crate::coordinator::CancelAction;
 
+use super::health::{
+    ConnectivityHealthState, ConnectivityId, OrderTaskHealth, TrackedReceiver, TrackedSender,
+};
 use super::{
     ConnectionStatus, LiveRuntime, LiveRuntimeError, OperatorEnvelope, OperatorService,
     SubmitAction, elapsed_us, unix_time_ms,
 };
 
 pub(super) struct DispatchState {
-    pub(super) control_rx: mpsc::Receiver<RuntimeEvent>,
-    pub(super) order_senders: HashMap<String, mpsc::Sender<OrderTaskCommand>>,
+    pub(super) control_rx: TrackedReceiver<RuntimeEvent>,
+    pub(super) order_senders: HashMap<String, TrackedSender<OrderTaskCommand>>,
     pub(super) order_tasks: Vec<JoinHandle<()>>,
     pub(super) operator_service: Option<OperatorService>,
     pub(super) operator_rx: Option<mpsc::Receiver<OperatorEnvelope>>,
@@ -46,7 +49,7 @@ impl LiveRuntime {
     pub(super) fn order_sender(
         &self,
         account_id: &str,
-    ) -> Result<&mpsc::Sender<OrderTaskCommand>, LiveRuntimeError> {
+    ) -> Result<&TrackedSender<OrderTaskCommand>, LiveRuntimeError> {
         self.dispatch
             .order_senders
             .get(account_id)
@@ -154,6 +157,20 @@ pub(super) async fn handle_runtime_event(
 ) -> Result<(), LiveRuntimeError> {
     match event {
         RuntimeEvent::OrderTransport(status) => {
+            runtime
+                .health
+                .mark_connectivity_progress(ConnectivityId::OrderCommand);
+            runtime.health.set_connectivity_state(
+                ConnectivityId::OrderCommand,
+                match status.kind {
+                    OrderCommandWebsocketStatusKind::Ready
+                    | OrderCommandWebsocketStatusKind::Heartbeat => ConnectivityHealthState::Ready,
+                    OrderCommandWebsocketStatusKind::Disconnected => {
+                        ConnectivityHealthState::Disconnected
+                    }
+                    OrderCommandWebsocketStatusKind::Fatal => ConnectivityHealthState::Failed,
+                },
+            );
             let kind = match status.kind {
                 OrderCommandWebsocketStatusKind::Ready => SystemEventKind::OrderTransportRecovered,
                 OrderCommandWebsocketStatusKind::Heartbeat => {
@@ -340,11 +357,18 @@ impl OrderTaskCompletion {
 pub(super) async fn run_order_task(
     account_id: String,
     mut gateway: OkxOrderGateway,
-    mut commands: mpsc::Receiver<OrderTaskCommand>,
-    events: mpsc::Sender<RuntimeEvent>,
+    mut commands: TrackedReceiver<OrderTaskCommand>,
+    events: TrackedSender<RuntimeEvent>,
+    health: OrderTaskHealth,
     max_inflight: usize,
     max_pending: usize,
 ) {
+    let _heartbeat_guard = health.start();
+    let mut heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        Duration::from_secs(1),
+    );
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let io = match gateway.take_command_dispatcher() {
         Ok(io) => Arc::new(io),
         Err(error) => {
@@ -367,6 +391,7 @@ pub(super) async fn run_order_task(
     let mut shutting_down = false;
 
     loop {
+        health.mark();
         while inflight.len() < max_inflight {
             let Some(dispatch_key) = ready_dispatch_keys.pop_front() else {
                 break;
@@ -594,6 +619,9 @@ pub(super) async fn run_order_task(
                     Some(OrderTaskCommand::Shutdown) | None => shutting_down = true,
                 }
             }
+            _ = heartbeat.tick() => {
+                health.mark();
+            }
         }
     }
 }
@@ -616,7 +644,7 @@ fn make_dispatch_key_ready(
 async fn emit_order_task_completion(
     account_id: &str,
     gateway: &mut OkxOrderGateway,
-    events: &mpsc::Sender<RuntimeEvent>,
+    events: &TrackedSender<RuntimeEvent>,
     completion: OrderTaskCompletion,
 ) -> bool {
     let event = match completion {

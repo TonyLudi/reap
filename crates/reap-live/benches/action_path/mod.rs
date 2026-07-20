@@ -59,8 +59,13 @@ const ACCOUNT_ID: &str = "main";
 const ENGINE_INCLUDED: &str = "owned normalized event delivery; production ChaosStrategy; \
     TradingEngine<ChaosStrategy>; RiskGate post/pre-trade decisions; typed intent traversal";
 const ENGINE_EXCLUDED: &str = "socket receive; websocket frame decoding; OKX wire parsing; feed \
-    deduplication/book reduction; production runtime channel scheduling; storage enqueue and disk \
-    IO; network IO; exchange acknowledgement; adapter REST/websocket serialization";
+    deduplication/book reduction; LiveCoordinator reduction; production runtime channel \
+    scheduling; regular execution policy/gateway preparation; storage enqueue and disk IO; \
+    network IO; exchange acknowledgement; adapter REST/websocket serialization";
+const PREPARED_ACTION_EXCLUDED: &str = "socket receive; websocket frame decoding; OKX wire \
+    parsing; feed deduplication/book reduction; LiveCoordinator reduction; production runtime \
+    channel scheduling; adapter REST/websocket serialization; storage enqueue and disk IO; \
+    network IO; exchange acknowledgement";
 const PREPARED_BOUNDARY: &str = "regular execution policy authorization; generated canonical \
     client-order identity; same-turn PrivateStateReducer and OwnedRegularOrders reservation; \
     OkxOrderGateway idempotency and lowering through PreparedRegularSubmit/PreparedRegularCancel; \
@@ -258,8 +263,10 @@ struct BenchmarkReport {
     schema_version: u32,
     benchmark: &'static str,
     rustc: String,
+    cargo: String,
     host: HostDescription,
     monotonic_clock: &'static str,
+    sample_precision: &'static str,
     percentile_algorithm: &'static str,
     measurement_passes: &'static str,
     timer_read_overhead: Distribution,
@@ -306,6 +313,7 @@ pub(crate) fn run() {
         schema_version: 1,
         benchmark: "reap-live/action_path",
         rustc: command_output("rustc", &["--version"]),
+        cargo: command_output("cargo", &["--version"]),
         host: HostDescription {
             os: std::env::consts::OS,
             architecture: std::env::consts::ARCH,
@@ -318,6 +326,8 @@ pub(crate) fn run() {
                 .unwrap_or(1),
         },
         monotonic_clock: "std::time::Instant (process-local monotonic clock)",
+        sample_precision: "one u64 nanosecond sample retained per timed observation; no histogram, \
+            reservoir, downsampling, or interpolation",
         percentile_algorithm: "exact nearest-rank over all post-warmup observations",
         measurement_passes: "elapsed distributions are collected with allocation tracking off; \
             allocation calls/bytes are collected in a separate freshly initialized pass after \

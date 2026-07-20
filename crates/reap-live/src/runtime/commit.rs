@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use reap_core::SystemEventKind;
-use reap_storage::{OrderOperation, OrderRequestRecord, StorageRecord};
+use reap_storage::{OrderOperation, OrderRequestRecord, StorageRecord, StorageWriteOutcome};
 use reap_telemetry::{AlertDeliveryFailure, AlertEvent, AlertSeverity};
 use tokio::sync::mpsc;
 
@@ -9,6 +9,7 @@ use crate::CoordinatorOutput;
 use crate::coordinator::LiveAction;
 
 use super::dispatch::OrderTaskCommand;
+use super::health::HealthCounterUpdates;
 use super::{LiveRuntime, LiveRuntimeError, unix_time_ms};
 
 pub(super) fn alert_for_storage_record(record: &StorageRecord) -> Option<AlertEvent> {
@@ -150,16 +151,23 @@ impl LiveRuntime {
     }
 
     pub(super) fn record_storage(&mut self, record: StorageRecord) -> Result<(), LiveRuntimeError> {
+        let health_updates = HealthCounterUpdates::from_storage_record(&record);
         self.composition.evidence.observe_record(&record);
-        if let Err(error) = self.composition.storage_sink.try_record(record) {
-            if !self.shutdown.in_progress {
-                return Err(error.into());
+        let outcome = match self.composition.storage_sink.try_record(record) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if !self.shutdown.in_progress {
+                    return Err(error.into());
+                }
+                tracing::error!(%error, "storage unavailable during fail-closed shutdown");
+                self.shutdown
+                    .storage_error
+                    .get_or_insert_with(|| error.to_string());
+                return Ok(());
             }
-            tracing::error!(%error, "storage unavailable during fail-closed shutdown");
-            self.shutdown
-                .storage_error
-                .get_or_insert_with(|| error.to_string());
-            return Ok(());
+        };
+        if outcome == StorageWriteOutcome::Queued {
+            self.health.apply_counter_updates(health_updates);
         }
         self.composition.evidence.max_storage_queue_depth = self
             .composition
@@ -173,6 +181,9 @@ impl LiveRuntime {
         &mut self,
         record: StorageRecord,
     ) -> Result<(), LiveRuntimeError> {
+        // Health derivation is observation-only: an unknown configured scope
+        // must never prevent the authoritative durable write.
+        let latch_update = self.durable_latches.resolve(&record);
         self.composition.evidence.observe_record(&record);
         self.composition.evidence.max_storage_queue_depth =
             self.composition.evidence.max_storage_queue_depth.max(
@@ -187,7 +198,13 @@ impl LiveRuntime {
         )
         .await;
         match result {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => {
+                if let Some(update) = latch_update {
+                    let active = self.durable_latches.apply(update);
+                    self.health.set_active_durable_safety_latches(active);
+                }
+                Ok(())
+            }
             Ok(Err(error)) => {
                 self.shutdown.preserve_deadman = true;
                 Err(error.into())

@@ -19,6 +19,7 @@ impl LiveRuntime {
         let elapsed_ms = unix_time_ms().saturating_sub(self.composition.session_started_at_ms);
         let stop_result = self.graceful_stop(context).await;
         let shutdown_result = self.shutdown().await;
+        self.emit_final_health_snapshot();
         let mut additional = Vec::new();
         if let Err(error) = stop_result {
             additional.push(("fail-closed cleanup", error));
@@ -67,6 +68,7 @@ impl LiveRuntime {
         };
         let stop_result = self.graceful_stop(&stop_context).await;
         let shutdown_result = self.shutdown().await;
+        self.emit_final_health_snapshot();
         let (mut outcome, failure) = match loop_result {
             Ok(outcome) => {
                 let failure = match stop_result {

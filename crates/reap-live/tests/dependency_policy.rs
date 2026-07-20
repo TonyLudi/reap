@@ -698,6 +698,365 @@ fn normal_regular_submit_numeric_lowering_uses_only_prepared_canonical_values() 
     );
 }
 
+#[test]
+fn storage_progress_telemetry_is_a_narrow_read_only_contract() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("reap-live must be inside the workspace crates directory");
+    let storage_path = workspace.join("crates/reap-storage/src/lib.rs");
+    let storage = compact_production_rust_source(
+        &fs::read_to_string(&storage_path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", storage_path.display())),
+    );
+
+    let snapshot_marker = "pubstructStorageProgressSnapshot{";
+    assert_eq!(
+        storage.matches(snapshot_marker).count(),
+        1,
+        "storage progress must expose exactly one public snapshot type"
+    );
+    let snapshot = compact_rust_item(&storage, snapshot_marker);
+    assert_eq!(
+        snapshot,
+        concat!(
+            "pubstructStorageProgressSnapshot{",
+            "pubrecords_enqueued:u64,",
+            "pubrecords_written:u64,",
+            "pubdurable_sync_completions:u64,",
+            "pubwrite_failures:u64,",
+            "pubsync_failures:u64,",
+            "pubdropped_records:u64,",
+            "pubrecords_outstanding:usize,",
+            "pubqueue_capacity:usize,",
+            "pubqueue_depth:usize,",
+            "pubqueue_high_water:usize,",
+            "publast_writer_progress_ns:u64,",
+            "publast_writer_progress_age_ns:u64,",
+            "}"
+        ),
+        "storage telemetry must remain a fixed numeric observation payload"
+    );
+
+    let snapshot_start = storage.find(snapshot_marker).expect("snapshot declaration");
+    let derive_start = storage[..snapshot_start]
+        .rfind("#[derive(")
+        .expect("snapshot derive");
+    assert_eq!(
+        &storage[derive_start..snapshot_start],
+        "#[derive(Debug,Clone,Copy,PartialEq,Eq)]",
+        "storage telemetry must not acquire Serialize, Deserialize, or another behavioral derive"
+    );
+    assert!(
+        !storage.contains("implStorageProgressSnapshot")
+            && !storage.contains("forStorageProgressSnapshot"),
+        "the storage snapshot must remain a passive data value without methods or trait authority"
+    );
+
+    let public_reader_marker = "pubfnprogress_snapshot(&self)->StorageProgressSnapshot{";
+    assert_eq!(
+        storage.matches(public_reader_marker).count(),
+        1,
+        "StorageSink must expose exactly one immutable progress reader"
+    );
+    let public_reader = compact_rust_item(&storage, public_reader_marker);
+    assert_eq!(
+        public_reader,
+        concat!(
+            "pubfnprogress_snapshot(&self)->StorageProgressSnapshot{",
+            "self.progress.snapshot()",
+            "}"
+        ),
+        "StorageSink::progress_snapshot must remain a parameter-free read-only delegation"
+    );
+
+    let progress_reader =
+        compact_rust_item(&storage, "fnsnapshot(&self)->StorageProgressSnapshot{");
+    for forbidden_mutation_or_authority in [
+        ".store(",
+        ".swap(",
+        ".fetch_",
+        ".compare_exchange",
+        ".send(",
+        ".try_send(",
+        ".reserve(",
+        ".try_reserve(",
+        "request_shutdown",
+        "stop_writer",
+        "tokio::spawn",
+        ".await",
+        "unsafe{",
+    ] {
+        assert!(
+            !progress_reader.contains(forbidden_mutation_or_authority),
+            "storage progress reader contains mutation/control operation `{forbidden_mutation_or_authority}`"
+        );
+    }
+}
+
+#[test]
+fn runtime_health_stays_private_observation_only_and_bounded() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("reap-live must be inside the workspace crates directory");
+    let runtime_path = workspace.join("crates/reap-live/src/runtime.rs");
+    let health_path = workspace.join("crates/reap-live/src/runtime/health.rs");
+    let lib_path = workspace.join("crates/reap-live/src/lib.rs");
+
+    let runtime = compact_production_rust_source(
+        &fs::read_to_string(&runtime_path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", runtime_path.display())),
+    );
+    let health = compact_production_rust_source(
+        &fs::read_to_string(&health_path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", health_path.display())),
+    );
+    let live_lib = compact_production_rust_source(
+        &fs::read_to_string(&lib_path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", lib_path.display())),
+    );
+
+    assert_eq!(
+        runtime.matches("modhealth;").count(),
+        1,
+        "runtime health must remain one private runtime responsibility module"
+    );
+    for public_module in [
+        "pubmodhealth;",
+        "pub(crate)modhealth;",
+        "pub(super)modhealth;",
+    ] {
+        assert!(
+            !runtime.contains(public_module),
+            "runtime health module visibility broadened through `{public_module}`"
+        );
+    }
+    assert!(
+        health.contains("pub(super)structRuntimeHealthSnapshot{"),
+        "the private schema payload must remain visible only to its parent runtime"
+    );
+    for public_snapshot in [
+        "pubstructRuntimeHealthSnapshot{",
+        "pub(crate)structRuntimeHealthSnapshot{",
+    ] {
+        assert!(
+            !health.contains(public_snapshot),
+            "runtime health snapshot visibility broadened through `{public_snapshot}`"
+        );
+    }
+    for public_api in ["RuntimeHealthSnapshot", "RuntimeHealthState"] {
+        assert!(
+            !live_lib.contains(public_api),
+            "reap-live public exports must not expose private health type `{public_api}`"
+        );
+    }
+
+    let report = compact_rust_item(&runtime, "pubstructLiveRunReport{");
+    for forbidden_report_field in [
+        "RuntimeHealthSnapshot",
+        "runtime_health:",
+        "runtime_health_snapshot:",
+        "health_snapshot:",
+        "health_heartbeat:",
+    ] {
+        assert!(
+            !report.contains(forbidden_report_field),
+            "runtime health must not change the public LiveRunReport schema via `{forbidden_report_field}`"
+        );
+    }
+
+    let mut contract_sources = Vec::new();
+    collect_rust_sources(
+        &workspace.join("crates/reap-live-contracts/src"),
+        &mut contract_sources,
+    );
+    for path in contract_sources {
+        let relative = workspace_relative(workspace, &path);
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        let compact = compact_production_rust_source(&source);
+        for forbidden_config_surface in [
+            "RuntimeHealthSnapshot",
+            "RuntimeHealthState",
+            "runtime_health:",
+            "health_emission_interval",
+            "health_interval",
+            "health_cadence",
+            "health_listener",
+            "health_endpoint",
+            "health_socket",
+            "health_server",
+            "health_port",
+            "heartbeat_output",
+        ] {
+            assert!(
+                !compact.contains(forbidden_config_surface),
+                "{relative} adds forbidden runtime-health config/API surface `{forbidden_config_surface}`"
+            );
+        }
+    }
+
+    for forbidden_io_or_authority in [
+        "TcpListener",
+        "UnixListener",
+        "UdpSocket",
+        "TcpStream",
+        "UnixStream",
+        "hyper::",
+        "axum::",
+        "warp::",
+        "tonic::",
+        "oneshot::Sender",
+        "watch::Sender",
+        "broadcast::Sender",
+        "OrderIntent",
+        "ChaosExecutionIntent",
+        "LiveAction",
+        "SubmitAction",
+        "CancelAction",
+        "ApprovedRegular",
+        "ReservedRegular",
+        "PreparedRegular",
+        "RegularApprovalScope",
+        "OwnedRegularOrders",
+        "OkxOrderGateway",
+        "OrderTaskCommand",
+        "OkxPlaceOrder",
+        "OkxCancelOrder",
+        "RawEnvelope",
+        "reap_okx_wire",
+        "Emergency",
+        "emergency::",
+        "Signer",
+        "Credential",
+        "SecretKey",
+        "Deserialize",
+        "LiveConfig",
+        "RuntimeConfig",
+    ] {
+        assert!(
+            !health.contains(forbidden_io_or_authority),
+            "runtime health must remain observation-only and contains `{forbidden_io_or_authority}`"
+        );
+    }
+
+    let progress_start = health
+        .find("pub(super)fnset_connectivity_expected(")
+        .expect("health progress methods must begin at fixed connectivity setup");
+    let snapshot_start = health
+        .find("pub(super)fnperiodic_snapshot(")
+        .expect("snapshot assembly must remain separate from progress updates");
+    assert!(
+        progress_start < snapshot_start,
+        "health snapshot assembly moved into the progress-update section"
+    );
+    let progress_updates = &health[progress_start..snapshot_start];
+    let progress_clock_update = compact_rust_item(&health, "fnobserve_at(");
+    let saturating_counter_update = compact_rust_item(&health, "fnatomic_saturating_add(");
+    let saturating_depth_increment = compact_rust_item(&health, "fnatomic_saturating_increment(");
+    let saturating_depth_decrement = compact_rust_item(&health, "fnatomic_saturating_sub(");
+    let counter_classification = compact_rust_item(&health, "pub(super)fnfrom_storage_record(");
+    let queue_lane_state = compact_rust_item(&health, "fnstate(&self)->&QueueLaneState{");
+    let queue_enqueue = compact_rust_item(&health, "fnenqueue(&self)->u64{");
+    let queue_enqueue_at = compact_rust_item(&health, "fnenqueue_at(&self,enqueued_at_ns:u64){");
+    let queue_begin_remove = compact_rust_item(&health, "fnbegin_remove(&self)->QueueRemoval{");
+    let queue_finish_remove =
+        compact_rust_item(&health, "fnfinish_remove(&self,removal:QueueRemoval){");
+    let queue_dequeue = compact_rust_item(&health, "fndequeue(&self,enqueued_at_ns:u64){");
+    let queue_discard = compact_rust_item(&health, "fndiscard(&self){");
+    let queue_full_attempt = compact_rust_item(&health, "fnobserve_full_attempt(&self){");
+    let queued_new = compact_rust_item(&health, "fnnew(value:T,lane:Arc<QueueLane>)->Self{");
+    let queued_consume = compact_rust_item(&health, "fnconsume(mutself)->T{");
+    let queued_drop = compact_rust_item(&health, "impl<T>DropforQueued<T>{");
+    let sender_send = compact_rust_item(&health, "pub(super)asyncfnsend(&self,value:T)");
+    let sender_try_send = compact_rust_item(&health, "pub(super)fntry_send(&self,value:T)");
+    let receiver_recv = compact_rust_item(&health, "pub(super)asyncfnrecv(&mutself)");
+    let receiver_try_recv = compact_rust_item(&health, "pub(super)fntry_recv(&mutself)");
+    let receiver_consume = compact_rust_item(&health, "fnconsume(&self,queued:Queued<T>)->T{");
+    for production_progress in [
+        progress_updates,
+        progress_clock_update,
+        saturating_counter_update,
+        saturating_depth_increment,
+        saturating_depth_decrement,
+        counter_classification,
+        queue_lane_state,
+        queue_enqueue,
+        queue_enqueue_at,
+        queue_begin_remove,
+        queue_finish_remove,
+        queue_dequeue,
+        queue_discard,
+        queue_full_attempt,
+        queued_new,
+        queued_consume,
+        queued_drop,
+        sender_send,
+        sender_try_send,
+        receiver_recv,
+        receiver_try_recv,
+        receiver_consume,
+    ] {
+        for forbidden_progress_operation in [
+            "HealthRegistry",
+            ".set(",
+            "Mutex",
+            "RwLock",
+            "parking_lot",
+            ".lock(",
+            ".read(",
+            ".write(",
+            "HashMap",
+            "BTreeMap",
+            "HashSet",
+            "BTreeSet",
+            ".register(",
+            "register(",
+            ".insert(",
+            ".entry(",
+            "String",
+            "&str",
+            "format!",
+            "format_args!",
+            "write!",
+            ".to_string(",
+            ".to_owned(",
+            ".clone(",
+            "Symbol",
+            "Vec<",
+            "Vec::",
+            "vec![",
+            "Box<",
+            "Box::",
+            "Arc::new(",
+            "Rc::new(",
+            ".collect(",
+            "collect::<",
+            "serde_json",
+            "tracing::",
+        ] {
+            assert!(
+                !production_progress.contains(forbidden_progress_operation),
+                "runtime health progress path contains forbidden operation `{forbidden_progress_operation}`"
+            );
+        }
+    }
+
+    let mut live_sources = Vec::new();
+    collect_rust_sources(&workspace.join("crates/reap-live/src"), &mut live_sources);
+    for path in live_sources {
+        let relative = workspace_relative(workspace, &path);
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        let compact = compact_production_rust_source(&source);
+        assert!(
+            !compact.contains("HealthRegistry"),
+            "{relative} routes production progress through the allocating HealthRegistry"
+        );
+    }
+}
+
 fn resolved_production_edges(
     metadata: &Value,
     packages: &BTreeMap<String, Package>,
@@ -821,6 +1180,43 @@ fn production_rust_source(source: &str) -> &str {
         }
     }
     source
+}
+
+fn compact_production_rust_source(source: &str) -> String {
+    production_rust_source(source)
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
+fn compact_rust_item<'a>(compact_source: &'a str, marker: &str) -> &'a str {
+    let item_start = compact_source
+        .find(marker)
+        .unwrap_or_else(|| panic!("missing compact Rust item marker `{marker}`"));
+    let body_start = compact_source[item_start..]
+        .find('{')
+        .map(|offset| item_start + offset)
+        .unwrap_or_else(|| panic!("compact Rust item `{marker}` has no body"));
+    let mut depth = 0_usize;
+    for (offset, byte) in compact_source.as_bytes()[body_start..]
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1).unwrap_or_else(|| {
+                    panic!("compact Rust item `{marker}` has unbalanced braces")
+                });
+                if depth == 0 {
+                    return &compact_source[item_start..=body_start + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("compact Rust item `{marker}` has no closing brace")
 }
 
 #[test]

@@ -13,6 +13,7 @@ use crate::coordinator::ReconcileAction;
 use crate::{CoordinatorError, CoordinatorOutput, LiveLatencySemantics, ReconciliationResult};
 
 use super::dispatch::{OrderTaskCommand, ReconcileOrderRef, ReconcileTaskCommand, RuntimeEvent};
+use super::health::TrackedSender;
 use super::recovery::{private_update_from_remote, remote_order_id};
 use super::shutdown::is_zero_order_reconciliation;
 use super::{
@@ -496,7 +497,7 @@ pub(super) async fn run_reconcile_task(
     account_id: String,
     io: OkxReconciliationClient,
     mut commands: mpsc::Receiver<ReconcileTaskCommand>,
-    events: mpsc::Sender<RuntimeEvent>,
+    events: TrackedSender<RuntimeEvent>,
     ambiguous_submit_grace_ms: u64,
     max_order_reconciliation_pages: usize,
     max_fill_reconciliation_pages: usize,
