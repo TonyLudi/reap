@@ -1,8 +1,9 @@
 # Determinism And Measured Runtime Goal D Handoff
 
-Status: Phases 0 through 4 green; Phase 5 is next. This is an evidence ledger,
-not a trading authorization. Until every required Goal D phase and global gate
-below is recorded green, the active execution contract remains
+Status: Phases 0 through 5 green; Phase 6 global verification and documentation
+is next. This is an evidence ledger, not a trading authorization. Until every
+required Goal D phase and global gate below is recorded green, the active
+execution contract remains
 [determinism-readiness-goal-d-prompt.md](determinism-readiness-goal-d-prompt.md).
 
 ## Scope
@@ -33,7 +34,7 @@ runtime concurrency redesign.
 | 2. Pinned-Java public-trade parity | Green | `6d446da` |
 | 3. Explicit decision/risk replay parity | Green | `e167c63` |
 | 4. Exact regular order-to-wire numeric boundary | Green | `85af455` |
-| 5. Action-path performance and runtime health | Pending | Pending |
+| 5. Action-path performance and runtime health | Green | `80a38fe` |
 | 6. Global verification and documentation | Pending | Pending |
 
 ## Phase 0 Baseline Identity
@@ -754,11 +755,11 @@ same-best-price no-op: BTC-USDT asks are 50,001/50,002/50,003 with quantity 10,
 then a taker Buy arrives at 50,002 with quantity 5. It strictly crosses the raw
 best and, under the pinned Java exact-half rule, moves the first-valid ask from
 50,001 to 50,003. Each observation declares a process-monotonic replay arrival
-and the exact `arrival_ns + 100,000` deadline. Phase 0 delivers the trade
-through the production engine and records zero immediate intents and zero due
-actions because private due scheduling/service does not yet exist. Phase 2
-must extend this same row to service the private due action and assert a
-nonzero reprice result.
+and the exact `arrival_ns + 100,000` deadline. At the Phase 0 baseline, the
+production engine recorded zero immediate intents and zero due actions because
+private due scheduling/service did not yet exist. Phase 2 subsequently
+extended this same row to service the private due action and assert a nonzero
+reprice result.
 
 The adapter-owned serializers remain excluded from the action-path binary
 rather than being exposed. They are measured by this private ignored release
@@ -805,8 +806,9 @@ proves byte-identical `px` and `sz` fields between both serializers.
 
 ## Authorized Output-Change Ledger
 
-Only the narrowly authorized Phase 1, Phase 2, and Phase 4 production
-behaviors have changed.
+Only the narrowly authorized Phase 1, Phase 2, and Phase 4 trading behaviors
+have changed. Phase 5 adds observation-only progress and structured health
+output without changing decisions or authority.
 
 | Phase | Authorized change | Before evidence | After evidence |
 | --- | --- | --- | --- |
@@ -814,7 +816,7 @@ behaviors have changed.
 | 2 | Pinned public-trade implied depth and private 100-microsecond reprice only | Phase 0 public-trade workload produced zero trade-reprice actions and Rust retained no reached implied-depth trade state | Java-bound fixtures now produce exact implied-depth state, one private callback per qualifying trade, shared five-millisecond worker behavior, and identical ordered live/replay projections |
 | 3 | No default behavior change; new credential-free decision trace | Backtest has no production risk/live dependency and the live decision boundary was only documented | A strict shared test harness now proves identical production strategy/risk batches and separately goldens the genuine coordinator reduction; all production tracing is `#[cfg(test)]` |
 | 4 | Canonical exact numeric identity and `px`/`sz` bytes only | Exact exchange decimals were discarded after `f64` parsing; accepted order identity used raw `f64` bits; normal submit lowering derived `px`/`sz` with direct `f64::to_string()` | Exact tick/lot/min metadata now survives privately through bootstrap and policy; accepted adjacent `f64` values with one canonical wire value reuse idempotency identity, wire-distinct values conflict, and the REST-shaped body and websocket `args[0]` use identical canonical plain-decimal bytes |
-| 5 | No decisions; bounded metrics/health snapshots only | Pending | Pending |
+| 5 | No decisions; bounded metrics/health snapshots only | No versioned runtime snapshot; storage writer and live queue/connectivity/order progress were not available as one bounded record | Private schema-version-1 snapshots are emitted through the existing structured log every fixed five seconds and once during finalization; predeclared numeric/enum progress is observation-only and does not allocate or lock per event |
 
 ## Phase Gate Ledger
 
@@ -1817,9 +1819,280 @@ benchmark and outside the newly changed numeric seam.
 
 No Goal D stop condition was reached.
 
-## Remaining Operational Blockers
+### Phase 5
 
-Goal D cannot clear:
+The gated Phase 5 implementation is split into three reviewable commits:
+
+| Commit | Scope |
+| --- | --- |
+| `f7de633` | Read-only, bounded storage-writer progress |
+| `97a9970` | Private schema-version-1 runtime-health model and focused tests |
+| `80a38fe` | Live integration, tracked bounded queues, source-policy guards, and final benchmark-boundary correction |
+
+#### Runtime-health contract
+
+`RuntimeHealthSnapshot` is private, `Serialize`-only, and grants no control,
+configuration, transport, or order authority. `LiveRuntime` assembles it only
+at the existing structured-log boundary every fixed five seconds with Tokio
+`MissedTickBehavior::Skip`, and once after normal/error finalization. There is
+no listener, socket, HTTP endpoint, supervisor protocol, configuration field,
+new input, subscription, connection, exchange operation, or dynamic component
+registration.
+
+The schema-version-1 payload has fixed cardinality:
+
+- feed, private, and order-command connectivity state and last-progress age,
+  including an explicit `not_required` state while retaining `failed`;
+- runtime-event-loop and per-order-task heartbeat instance/progress state;
+- feed-ingress, control-ingress, and per-order-command-lane capacity, depth,
+  high-water mark, continuous-backlog age, residence age, saturation, and
+  saturation-event state;
+- live readiness and active durable-safety-latch count;
+- submit/cancel request and accepted-ack counts, local/exchange rejection,
+  ambiguity, and total/clean reconciliation counts; and
+- storage queue, enqueue/write/outstanding/durable-sync progress, writer age,
+  drop count, and write/sync failures.
+
+Progress paths use only predeclared enum IDs, fixed arrays, bounded
+per-command-lane slices, monotonic timer reads, and numeric/enum atomics or
+single-writer fields. They do not take a mutex/RwLock, format a string, clone a
+symbol, allocate, or call the allocating `HealthRegistry::set`. JSON/string
+construction happens only when a periodic or final snapshot is emitted.
+Order counters advance only after the corresponding `StorageRecord` was
+successfully queued, so telemetry cannot claim an uncommitted action.
+
+Tracked queues retain Tokio mpsc as the sole capacity/ordering authority; no
+second semaphore or gate was added. Drop guards account for messages discarded
+with a receiver. Predeclared per-lane state prevents an order lane from hiding
+saturation behind capacity in another lane. A nonzero `backlog_token` prevents
+an equal-monotonic-timestamp drain/refill ABA from clearing the replacement
+backlog's age. Snapshot assembly is explicitly a bounded, conservative fold of
+adjacent lock-free lane states, never a synchronization, readiness, or control
+boundary.
+
+`StorageProgressSnapshot` is read-only numeric observation state. Its queue
+depth counts channel residency separately from outstanding writer work; its
+high-water, write, sync, durable, drop, and writer-progress counters are
+saturating atomics. Receiver-drop, write-failure, and sync-failure tests keep
+the counts truthful. Durable-latch resolution is nonfallible after its durable
+ack and health-counter application follows that resolution, so observability
+cannot block or reorder a safety commit.
+
+The existing single writer, pre-existing select priorities, same-turn
+reservation, storage-first action ordering, durable latches, shutdown order,
+normal/emergency separation, exact connectivity plan, and regular-only
+authority remain unchanged. Source-policy tests pin all eleven select
+branches, placing the health tick after the existing ordinary timer and before
+the private due-reprice/feed branches, and pin the actual snapshot emission
+call and finalization sites.
+
+#### Red/green and focused gates
+
+The staged red evidence is retained as
+`target/tmp/goal-d-phase5-storage-progress-red.txt` and
+`target/tmp/goal-d-phase5-health-integration-red.txt`. The final-tree commands
+included:
+
+```text
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo check -p reap-live --lib --locked
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo test -p reap-live --lib --locked runtime::health::tests
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo test -p reap-storage --locked
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo test -p reap-live --lib --locked
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo test -p reap-live --locked
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo test -p reap-live --test dependency_policy --locked
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo clippy -p reap-storage -p reap-live --all-targets --locked -- \
+  -D warnings
+cargo fmt --all -- --check
+git diff --check
+```
+
+Results: all 18 focused health tests passed; storage passed 31 tests plus doc
+tests; the live library passed 271 tests with one explicitly ignored helper;
+the complete live package also passed both compile-fail UI fixtures, seven
+dependency/source-policy tests, the compatibility test, and doc tests. The
+focused all-target clippy, check, formatting, and diff gates passed. Independent
+read-only audits of queue accounting/ABA, storage truthfulness/durable ordering,
+and the completed health architecture were green. No suite-wide
+`TRYBUILD=overwrite` was used.
+
+#### Existing whole-program benchmark gate
+
+The final existing benchmarks used one warm-up and five retained runs on the
+otherwise-idle shared host:
+
+| Benchmark | Warm-up | Five recorded runs | Median | Phase 4 median | Delta |
+| --- | ---: | --- | ---: | ---: | ---: |
+| Engine event loop (ns/event) | 11,972.2 | 12,298.8; 11,590.1; 11,618.3; 11,654.1; 11,674.7 | 11,654.1 | 11,768.2 | -0.97% |
+| Complete live parity (ns/raw) | 17,783.1 | 17,198.2; 17,249.2; 17,929.8; 17,309.3; 17,361.3 | 17,309.3 | 17,339.3 | -0.17% |
+
+Every engine run retained exactly 250,000 events and 999,996 intents. Every
+live run retained exactly 50,204 raw frames, 70,208 feed outputs, 65,130
+storage records, zero actions, 4,193,771 allocation calls, and
+1,871,951,969 requested bytes. The ordinary non-action path therefore has zero
+logical or allocation drift. These benches exercise the engine/coordinator
+paths, not the production `LiveRuntime` select loop or snapshot assembly.
+
+#### Action-path distributions and regression investigation
+
+One warm-up and five recorded `reap-live/action_path` runs are retained in
+`target/tmp/goal-d-phase5-action-{warmup,1,2,3,4,5}.txt`, with their
+schema-version-1 JSON records beside them. Each workload has 10,000 warm-up and
+100,000 post-warm-up observations. Every monotonic nanosecond sample is
+retained and exact nearest-rank p50/p95/p99/p99.9/max is used; there is no
+histogram, interpolation, reservoir, downsampling, drop, or overflow. Each
+tuple is `p50/p95/p99/p99.9/max` nanoseconds, runs 1 through 5:
+
+| Workload | Five recorded distributions |
+| --- | --- |
+| Quote creation | `19388/25886/43831/101815/84997355`; `19487/24968/32172/120359/85459483`; `19478/23909/30957/105008/91031430`; `19766/27897/34748/205345/121484156`; `19322/24188/31343/94587/84933455` |
+| Quote replacement/owned cancel | `13013/13251/18083/21809/116855`; `15827/23114/27905/43470/164772`; `12947/13160/17821/21374/79990`; `16148/23794/28808/44504/293787`; `13013/13227/18043/21316/64278` |
+| IOC hedge | `24574/26962/34124/46817/46812882`; `27085/39162/46769/85200/59094222`; `24984/28454/36381/107912/49965794`; `24557/26797/33952/49197/44897287`; `24771/31286/37726/66296/45531260` |
+| Risk rejection | `12020/12348/16845/21661/384624`; `11897/12225/16616/20586/82796`; `11905/12233/16615/20332/403380`; `12119/12382/16828/20898/84298`; `12570/18830/22268/29957/135284` |
+| Symbol fail-close | `632/640/648/1428/306439`; `632/640/656/1058/14334`; `640/640/649/1075/271281`; `648/657/665/1223/34986`; `640/640/649/1568/301384` |
+| Global fail-close | `763/788/812/1977/303707`; `771/796/821/3389/39277`; `771/804/821/1863/285024`; `772/796/813/3980/44102`; `763/788/804/1920/2077234` |
+| Coordinator reduction | `5596/5711/6130/12825/256503`; `5596/5703/6154/12964/100199`; `5595/5702/6096/11898/234301`; `5596/5702/6137/12792/75830`; `5571/7852/9977/14827/1445697` |
+| Raw recovery action | `26010/28233/36685/56500/6211597`; `25961/29432/36635/57804/6147173`; `26535/33649/39819/96465/6273554`; `26478/31302/39679/84298/6135522`; `26403/28759/36938/57213/6186934` |
+| Public-trade reprice | `12012/12324/17001/24377/6489787`; `12200/12472/17157/26675/2150298`; `12135/14917/17328/22202/149929`; `12078/12390/16730/19774/63195`; `12045/12332/16681/19741/79670` |
+| Bounded control/feed storm | `140/189/7623/7860/30900`; `140/189/7589/7647/15688`; `140/197/7589/7688/16516`; `140/189/7614/7680/19683`; `140/197/7606/7697/13407` |
+
+Component-wise medians and Phase 4 comparisons are:
+
+| Workload | p50 / delta | p95 / delta | p99 / delta | p99.9 / delta | Highest max |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Quote creation | 19,478 / -0.75% | 24,968 / +1.36% | 32,172 / +5.01% | 105,008 / +19.04% | 121,484,156 |
+| Quote replacement | 13,013 / -1.62% | 13,251 / -3.29% | 18,083 / -2.65% | 21,809 / -10.38% | 293,787 |
+| IOC hedge | 24,771 / -0.39% | 28,454 / +3.18% | 36,381 / +7.39% | 66,296 / -13.88% | 59,094,222 |
+| Risk rejection | 12,020 / +0.28% | 12,348 / -0.80% | 16,828 / -0.73% | 20,898 / -11.78% | 403,380 |
+| Symbol fail-close | 640 / +1.27% | 640 / 0.00% | 649 / -1.22% | 1,223 / +7.94% | 306,439 |
+| Global fail-close | 771 / +1.05% | 796 / +1.02% | 813 / 0.00% | 1,977 / -1.25% | 2,077,234 |
+| Coordinator reduction | 5,596 / -1.31% | 5,703 / -4.52% | 6,137 / -33.98% | 12,825 / -14.44% | 1,445,697 |
+| Raw recovery | 26,403 / -1.68% | 29,432 / -8.49% | 36,938 / -5.20% | 57,804 / -37.65% | 6,273,554 |
+| Public-trade reprice | 12,078 / +0.27% | 12,390 / -1.88% | 17,001 / -1.65% | 22,202 / -9.83% | 6,489,787 |
+| Control/feed storm | 140 / 0.00% | 189 / -4.06% | 7,606 / -0.11% | 7,688 / 0.00% | 30,900 |
+
+Storm queue-age tuples were
+`11946/16057/16713/20898/47244`,
+`11914/16090/16746/20964/27479`,
+`12004/16205/18896/21973/27331`,
+`11922/16066/16672/21046/26182`, and
+`11921/16032/16590/20766/25123` ns. Their component-wise median was
+`11922/16066/16713/20964 ns`, stable or improved from Phase 4. Timer-read
+tuples were
+`33/33/41/42/22662`,
+`33/33/41/42/160670`,
+`33/41/41/42/18289`,
+`33/41/41/50/43010`, and
+`33/41/41/42/151299` ns; the p50/p95/p99/p99.9 median remained exactly
+`33/41/41/42 ns`.
+
+Every recorded run had the same canonical name/counter/allocation projection:
+
+```text
+aa7eaa6e9bb6727b4d52e6f1488591904c4d823a45e31e6829f23d938def4ce6
+```
+
+That is exactly the Phase 4 hash:
+
+| Workload | Total allocation calls / requested bytes | Core logical counts |
+| --- | ---: | --- |
+| Quote creation | 19,733,342 / 836,475,432 | 100,000 inputs; 400,000 intents/actions; 100,000 prepared submits |
+| Quote replacement | 16,600,000 / 773,500,000 | 100,000 inputs; 500,000 intents/actions; 100,000 prepared cancels |
+| IOC hedge | 23,433,342 / 1,243,175,432 | 100,000 inputs; 500,000 intents/actions; 100,000 hedges/prepared submits |
+| Risk rejection | 15,300,000 / 622,400,000 | 100,000 inputs; 400,000 rejections; zero produced actions |
+| Symbol fail-close | 1,300,000 / 46,000,000 | 100,000 safety candidates/cancels/actions |
+| Global fail-close | 1,600,000 / 52,600,000 | 200,000 safety candidates/cancels/actions |
+| Coordinator reduction | 3,900,000 / 158,800,000 | 100,000 inputs/storage records; zero actions |
+| Raw recovery | 21,980,027 / 1,777,312,151 | 200,000 frames/parses; 600,000 feed outputs; 500,000 normalized outputs; 100,000 actions; 900,003 records |
+| Public-trade reprice | 15,000,264 / 615,207,392 | 100,000 inputs/reprices; 400,000 intents/actions |
+| Control/feed storm | 0 / 0 | 20,000 control and 80,000 feed dequeues; 20,000 preemptions; capacity/high-water 80; 30,000 saturations |
+
+The only positive Phase 4 comparisons over 5% were quote p99/p99.9
+`+5.01%/+19.04%`, hedge p99 `+7.39%`, and symbol p99.9 `+7.94%` (90 ns).
+The Phase 4-to-5 benchmark diff changes only reported tool/sample metadata and
+corrects the declared preparation boundary; no timed workload body executes
+the new runtime-health code. All p50 changes are within 1.68%, no p95
+regression exceeds 3.19%, exact work/allocation hashes match, queue age is
+stable or improved, and unrelated tails move in both directions while timer
+maxima show host interruptions. All samples remain retained. The evidence
+supports shared-host tail variation rather than an unexplained Phase 5
+production-path regression; it is not a target-host latency claim.
+
+The preparation rows explicitly use `PREPARED_ACTION_EXCLUDED` for quote,
+replacement, hedge, and fail-close workloads; risk rejection retains
+`ENGINE_EXCLUDED`. The raw/coordinator/public-trade/storm rows carry their own
+actual boundaries. No benchmark row silently claims parsing, production
+channel scheduling, storage enqueue/disk, adapter serialization, network IO,
+or exchange acknowledgement that it does not include.
+
+#### Prepared serializer distributions
+
+The adapter-private release test used one warm-up and five recorded runs:
+
+```text
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo test --release -p reap-okx-live-adapter --locked \
+  tests::goal_d_prepared_serializer_benchmark -- \
+  --ignored --exact --nocapture
+```
+
+Each tuple is `p50/p95/p99/p99.9/max` nanoseconds:
+
+| Serializer workload | Five recorded distributions |
+| --- | --- |
+| Prepared submit to REST-shaped inner body | `665/673/681/1132/315079`; `681/697/705/1124/140445`; `664/672/681/5628/54834`; `673/689/697/1469/1293914`; `657/673/681/4505/188263` |
+| Prepared submit to websocket order request | `2248/2347/2626/6745/272339`; `2272/2363/2568/6826/81861`; `2232/2314/2617/10182/53415`; `2256/2355/2732/9082/1054436`; `2224/2355/3052/7130/126110` |
+
+Component-wise medians are REST `665/673/681/1469 ns` and websocket
+`2248/2355/2626/7130 ns` at p50/p95/p99/p99.9. Timer-read tuples were
+`33/41/41/42/18289`,
+`33/41/41/42/15269`,
+`33/41/41/42/16574`,
+`33/41/41/42/10798`, and
+`33/41/41/42/12791` ns.
+
+All five retained exactly 100,000 inputs/actions, 14,200,000 or 20,400,000
+serialized bytes, and the same logical/allocation projection:
+
+```text
+1d4633a2d2634573a2d3cc790ed67b49427ef530ff3b115126e26e5199f3a0bb
+```
+
+REST remained exactly six allocation calls/429 requested bytes per action;
+websocket remained exactly 24/1,550. Against Phase 4, REST p50/p99/p99.9
+moved `+2.62%/+1.19%/+33.67%`, and websocket moved
+`+1.86%/+16.40%/+5.33%`. Phase 5 changed neither the adapter source nor the
+reachable serializer body. Exact work and central percentiles remained stable;
+the two-vCPU shared host retained scheduling/code-layout tails. No observation
+was discarded or retried away, and these upper-tail movements are explicitly
+local variance rather than a target-host or decision-to-wire claim.
+
+The measured boundary starts from an already-created
+`PreparedRegularSubmit`, uses adapter-private `regular_place_order`, and ends
+after the actual REST-shaped inner-body or websocket order-request serializer.
+Typed strategy/policy/reservation/gateway preparation is untimed fixture setup.
+Credentials, signing, transport queues, network IO, exchange acknowledgement,
+and cancel/algo/spread operations remain excluded. No serializer, signer,
+transport, prepared value, or authority constructor became public.
+
+#### Phase conclusion
+
+`performance.md` now separates the authoritative Goal C baseline, historical
+attribution results, final Goal D local action/serializer evidence, exact
+included/excluded boundaries, and the still-missing target-host
+decision-to-wire evidence. Phase 5 introduced no trading behavior,
+connectivity, normal/emergency reachability, schema migration, or dependency
+change. No Goal D stop condition was reached.
+
+## Remaining Operational Blockers Outside Goal D
+
+Goal D does not and cannot clear:
 
 - credentialed OKX demo observation/trading soak;
 - target-host latency, queue, paging, supervision, deadman, and process-death

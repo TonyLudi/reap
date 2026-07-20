@@ -1,11 +1,148 @@
 # Performance Evidence
 
-## Strategy-Only Baseline
+## Current Authoritative Regression Baselines
+
+The completed Goal C handoff is the authoritative pre-Goal-D comparison
+baseline. Measurements retained below are historical attribution evidence,
+not the current regression numbers.
+
+| Benchmark | Goal C median | Logical/allocation identity |
+| --- | ---: | --- |
+| Engine event loop | 11,058.7 ns/event | 250,000 events; 999,996 intents |
+| Complete live parity | 17,082.6 ns/raw | 50,204 raw frames; 70,208 feed outputs; 65,130 storage records; zero actions |
+
+The Goal C complete-live path made 4,193,771 allocation calls requesting
+1,871,951,969 bytes per run.
+
+## Goal D Phase 5 Local Final Measurements
+
+The final Goal D local gate ran on 2026-07-20 on the same two-vCPU Arm
+Neoverse-N1 host with `rustc 1.95.0 (59807616e 2026-04-14)`. Each benchmark
+had one warm-up followed by five retained runs:
+
+| Benchmark | Warm-up | Five recorded runs | Median | Phase 4 delta |
+| --- | ---: | --- | ---: | ---: |
+| Engine event loop (ns/event) | 11,972.2 | 12,298.8; 11,590.1; 11,618.3; 11,654.1; 11,674.7 | 11,654.1 | -0.97% |
+| Complete live parity (ns/raw) | 17,783.1 | 17,198.2; 17,249.2; 17,929.8; 17,309.3; 17,361.3 | 17,309.3 | -0.17% |
+
+Every engine run retained exactly 250,000 events and 999,996 intents. Every
+live run retained exactly 50,204 raw frames, 70,208 feed outputs, 65,130
+storage records, zero actions, 4,193,771 allocation calls, and
+1,871,951,969 requested bytes. Runtime-health snapshot assembly and the
+production `LiveRuntime` select loop are not part of either synthetic
+benchmark. Their no-lock/no-allocation progress contract is source- and
+state-transition-tested; it is not inferred from these elapsed times.
+
+### Action-producing tail baseline
+
+`reap-live/action_path` uses 10,000 warm-up and 100,000 post-warm-up
+observations per workload. It retains every process-monotonic
+`std::time::Instant` sample and computes exact nearest-rank percentiles with no
+histogram, reservoir, interpolation, downsampling, drop, or overflow. Timing
+and allocation use separate freshly initialized passes whose logical counters
+must match. The table reports component-wise five-run medians and the highest
+maximum retained across the five runs:
+
+| Workload | p50 | p95 | p99 | p99.9 | Highest max |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Quote creation through prepared submit | 19,478 | 24,968 | 32,172 | 105,008 | 121,484,156 |
+| Quote replacement through prepared cancel | 13,013 | 13,251 | 18,083 | 21,809 | 293,787 |
+| IOC hedge through prepared submit | 24,771 | 28,454 | 36,381 | 66,296 | 59,094,222 |
+| Risk rejection | 12,020 | 12,348 | 16,828 | 20,898 | 403,380 |
+| Symbol fail-close through prepared cancel | 640 | 640 | 649 | 1,223 | 306,439 |
+| Global fail-close through prepared cancels | 771 | 796 | 813 | 1,977 | 2,077,234 |
+| Coordinator normalized/storage reduction | 5,596 | 5,703 | 6,137 | 12,825 | 1,445,697 |
+| Raw gap recovery/action record | 26,403 | 29,432 | 36,938 | 57,804 | 6,273,554 |
+| Public-trade implied-depth reprice | 12,078 | 12,390 | 17,001 | 22,202 | 6,489,787 |
+| Bounded biased control/feed storm | 140 | 189 | 7,606 | 7,688 | 30,900 |
+
+All values are nanoseconds. The storm's queue-age medians were
+`11,922/16,066/16,713/20,964 ns` at p50/p95/p99/p99.9, with a highest
+retained maximum of 47,244 ns. It processed exactly 20,000 control and 80,000
+feed dequeues, observed 20,000 control preemptions, reached its capacity and
+high-water mark of 80, and recorded 30,000 full-queue attempts. Its queues are
+bench-private and do not claim to time the production runtime select loop.
+
+The timer-read-overhead median remained `33/41/41/42 ns` at
+p50/p95/p99/p99.9. All action runs had the same logical/allocation projection
+SHA-256:
+
+```text
+aa7eaa6e9bb6727b4d52e6f1488591904c4d823a45e31e6829f23d938def4ce6
+```
+
+That is also the Phase 4 hash, so Phase 5 changed no action-workload counter or
+allocation total. The full per-run distributions, counters, allocation bytes,
+and regression deltas are recorded in the Goal D handoff.
+
+The positive Phase 4-to-Phase-5 movements over 5% were quote p99
+`+5.01%`, quote p99.9 `+19.04%`, hedge p99 `+7.39%`, and symbol fail-close
+p99.9 `+7.94%` (90 ns). The timed workload bodies did not change, p50 stayed
+within 1.68%, no p95 regression exceeded 3.19%, logical/allocation work was
+exact, unrelated tails moved in both directions, and timer maxima showed host
+interruptions. The retained results therefore support a shared-host
+tail-variance classification, not a Phase 5 hot-path regression or target-host
+claim.
+
+### Prepared-request serialization
+
+Adapter-private serialization is measured separately so serializers and
+authority constructors remain private. Each workload again used 10,000
+warm-up and 100,000 timed observations, exact nearest-rank percentiles, no
+dropped samples, and a separate allocation pass:
+
+| Workload | p50 | p95 | p99 | p99.9 | Highest max | Calls/bytes per action |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Prepared submit to REST-shaped inner body | 665 | 673 | 681 | 1,469 | 1,293,914 | 6 / 429 |
+| Prepared submit to websocket order request | 2,248 | 2,355 | 2,626 | 7,130 | 1,054,436 | 24 / 1,550 |
+
+The exact serializer logical/allocation projection SHA-256 was
+`1d4633a2d2634573a2d3cc790ed67b49427ef530ff3b115126e26e5199f3a0bb`
+in all five runs. Relative to Phase 4, REST p50/p99/p99.9 moved
+`+2.62%/+1.19%/+33.67%`; websocket moved
+`+1.86%/+16.40%/+5.33%`. The measured adapter source and reachable
+serializer body did not change in Phase 5, while central percentiles and exact
+work remained stable. These upper-tail observations are retained as
+shared-host scheduling/code-layout variance rather than discarded or presented
+as production latency.
+
+### Included and excluded boundaries
+
+The quote, replacement, and hedge rows include the production Chaos strategy,
+engine/risk decisions, typed intent traversal, policy authorization, same-turn
+reservation/ownership, gateway idempotency, and preparation. Risk rejection
+ends at the engine/risk boundary. Coordinator reduction includes canonical
+storage-record construction; raw recovery additionally includes actual
+credential-free OKX parsing and feed reduction. Public-trade reprice includes
+the private monotonic 100-microsecond schedule and due service. The storm is a
+bench-only bounded-channel harness. The serializer rows begin with an already
+prepared submit and include the actual adapter-private REST-shaped or
+websocket serializer.
+
+No one row is an end-to-end exchange measurement. Depending on the row,
+excluded stages include socket receive, production Tokio/channel scheduling,
+the production select loop, storage enqueue and disk IO, signing, transport
+queues, network IO, and exchange acknowledgement. The machine-readable
+schema-version-1 output carries the exact row-specific boundary.
+
+## Missing Target-Host Decision-To-Wire Evidence
+
+These local results are reproducible regression and allocation evidence, not a
+latency SLO, capacity certification, production-readiness claim, or
+colocated-HFT claim. Reap still lacks target-host, production-shaped evidence
+across actual socket receipt, queueing, decision, gateway preparation,
+serialization, network transmission, and exchange acknowledgement. Any
+pinned-thread, SPSC/ring-buffer, allocator, kernel-bypass, or custom-runtime
+decision remains conditional on that evidence.
+
+## Historical Measurements (Non-Authoritative)
+
+### Strategy-Only Baseline
 
 The first profiling gate was run on 2026-07-10 before introducing pinned
 threads, custom queues, CPU affinity, or specialized allocators.
 
-### Workload
+#### Workload
 
 `cargo bench -p reap-engine --bench event_loop` sends 250,000 alternating spot
 and perpetual depth events through:
@@ -19,7 +156,7 @@ optimization, normal Rust collections, and the same strategy and risk code used
 by the engine. It excludes websocket IO, gateway HTTP latency, telemetry, and
 storage.
 
-### Environment
+#### Environment
 
 - CPU: 2 vCPU Arm Neoverse-N1, one thread per core
 - Architecture: `aarch64`
@@ -27,7 +164,7 @@ storage.
 - Events per run: 250,000
 - Intents produced per run: 999,996
 
-### Result
+#### Result
 
 Three consecutive runs measured:
 
@@ -56,13 +193,13 @@ next optimization gate should use production-shaped captures and sampling or
 hardware counters to attribute allocation, strategy, reducer, and channel
 costs separately.
 
-### Decision
+#### Decision
 
 Keep Tokio at the IO edges, bounded channels at ownership handoffs, and the
 single-writer event loop. The production-shaped follow-up profile and the
 resulting collection changes are recorded below.
 
-## Live Parity Profile
+### Live Parity Profile
 
 The live-path profiling gate was run on 2026-07-12 with:
 
@@ -70,7 +207,7 @@ The live-path profiling gate was run on 2026-07-12 with:
 cargo bench -p reap-live --bench live_loop
 ```
 
-### Workload
+#### Workload
 
 The benchmark prebuilds a deterministic raw OKX workload outside the measured
 interval and runs the same adapters, feed processor, coordinator, Chaos
@@ -93,7 +230,7 @@ The custom single-thread allocator counter records allocation calls and bytes
 requested by `alloc`, `alloc_zeroed`, and `realloc`. Requested bytes are not
 resident or peak memory.
 
-### Attribution
+#### Attribution
 
 The first attribution run used 50-level snapshots. It is retained here to show
 why the coordinator/strategy path was changed, but it is not the final
@@ -141,7 +278,7 @@ two depth-scaling changes above, that corrected workload measured:
 | Coordinator, strategy, and risk | 36,416.5 ns/feed output | 41.10 | 63,857.9 B |
 | Complete live parity | 54,303.6 ns/raw frame | 97.03 | 103,333.7 B |
 
-### Result
+#### Result
 
 Three consecutive post-build runs on the same 2 vCPU Arm Neoverse-N1 host
 measured:
@@ -160,7 +297,7 @@ pre-change checkpoint, this is 4.8 times faster. Allocation calls fell from
 faster than the original unoptimized 50-level attribution run, although those
 different workloads are not used for a percentage comparison.
 
-### Boundary
+#### Boundary
 
 This benchmark includes raw-record cloning, JSON adaptation, redundant-input
 deduplication, sequence/book reduction, strategy/risk evaluation, and storage
@@ -169,13 +306,13 @@ latency, storage serialization and disk IO, REST latency, and exchange
 round-trip time. It is a regression and allocation gate, not a latency SLO or
 capacity claim.
 
-The local profiling gate is complete. Before production tuning, rerun this
-benchmark with recorded target-market captures on the deployment host and add
-end-to-end timestamping around the actual sockets and gateway. The immediate
-trading-readiness blocker remains the credentialed OKX demo soak, not a queue or
-runtime rewrite.
+At that profiling gate, the next evidence step was to rerun the benchmark with
+recorded target-market captures on the deployment host and add end-to-end
+timestamping around the actual sockets and gateway. The current operational
+blockers and runtime decision threshold are stated in the authoritative
+sections above.
 
-## Determinism Regression Gate
+### Determinism Regression Gate
 
 The research-verification determinism audit was profiled on 2026-07-14 against
 pre-change commit `bacd132`. Stable quote and hedge traversal is precomputed at
