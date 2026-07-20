@@ -1,0 +1,11 @@
+error[E0451]: fields `target`, `references` and `reference_count` of struct `PmReferenceMapping` are private
+ --> tests/ui/reference_mapping_fields_are_private.rs:5:9
+  |
+4 |     let _ = PmReferenceMapping {
+  |             ------------------ in this type
+5 |         target,
+  |         ^^^^^^ private field
+6 |         references: [None; 16],
+  |         ^^^^^^^^^^ private field
+7 |         reference_count: 0,
+  |         ^^^^^^^^^^^^^^^ private field

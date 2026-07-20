@@ -1,0 +1,13 @@
+[package]
+name = "reap-pm-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+reap-core.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+trybuild.workspace = true

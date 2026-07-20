@@ -73,6 +73,8 @@ pub enum ConnectionError {
     SubscriptionFailed(String),
     #[error("invalid websocket subscription plan: {0}")]
     InvalidSubscriptionPlan(String),
+    #[error("the existing feed connection does not support venue {0:?}")]
+    UnsupportedVenue(Venue),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,11 +255,13 @@ pub(crate) fn prepare_connection_subscription(
     adapter: &dyn VenueAdapter,
     plan: &SocketPlan,
 ) -> Result<PreparedSubscription, ConnectionError> {
+    let canonical_adapter = match plan.venue {
+        Venue::Okx => OkxAdapter::default(),
+        Venue::Polymarket => return Err(ConnectionError::UnsupportedVenue(Venue::Polymarket)),
+    };
     let payload = adapter.subscription_message(&plan.subscriptions)?;
     let readiness = SubscriptionReadiness::from_request(&payload, plan.subscriptions.len())?;
-    let canonical_payload = match plan.venue {
-        Venue::Okx => OkxAdapter::default().subscription_message(&plan.subscriptions)?,
-    };
+    let canonical_payload = canonical_adapter.subscription_message(&plan.subscriptions)?;
     if payload != canonical_payload {
         return Err(ConnectionError::InvalidSubscriptionPlan(
             "subscription request does not exactly match the bound socket plan".to_string(),
@@ -824,6 +828,31 @@ mod tests {
         let adapter = reap_venue::okx::OkxAdapter::default();
         let request = adapter.subscription_message(subscriptions).unwrap();
         SubscriptionReadiness::from_request(&request, subscriptions.len())
+    }
+
+    #[test]
+    fn old_connection_path_rejects_polymarket_explicitly() {
+        let subscription = Subscription::public(
+            Venue::Polymarket,
+            Channel::Books,
+            "123",
+            FeedPriority::Critical,
+        );
+        let plan = SocketPlan {
+            conn_id: ConnId::new("unsupported-polymarket"),
+            venue: Venue::Polymarket,
+            private: false,
+            subscriptions: vec![subscription],
+        };
+        let adapter = reap_venue::okx::OkxAdapter::default();
+
+        let Err(error) = prepare_connection_subscription(&adapter, &plan) else {
+            panic!("the old OKX feed path admitted a Polymarket socket plan");
+        };
+        assert!(matches!(
+            error,
+            ConnectionError::UnsupportedVenue(Venue::Polymarket)
+        ));
     }
 
     #[test]

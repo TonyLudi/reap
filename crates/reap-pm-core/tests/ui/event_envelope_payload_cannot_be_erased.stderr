@@ -1,0 +1,28 @@
+error[E0308]: mismatched types
+ --> tests/ui/event_envelope_payload_cannot_be_erased.rs:9:5
+  |
+8 | ) -> EventEnvelope<OrderPayload> {
+  |      --------------------------- expected `EventEnvelope<OrderPayload>` because of return type
+9 |     envelope
+  |     ^^^^^^^^ expected `EventEnvelope<OrderPayload>`, found `EventEnvelope<MarketPayload>`
+  |
+  = note: expected struct `EventEnvelope<OrderPayload>`
+             found struct `EventEnvelope<MarketPayload>`
+
+error[E0599]: no method named `erase` found for struct `EventEnvelope<P>` in the current scope
+  --> tests/ui/event_envelope_payload_cannot_be_erased.rs:13:22
+   |
+13 |     let _ = envelope.erase();
+   |                      ^^^^^ method not found in `EventEnvelope<MarketPayload>`
+
+error[E0599]: no method named `map_payload` found for struct `EventEnvelope<P>` in the current scope
+  --> tests/ui/event_envelope_payload_cannot_be_erased.rs:17:22
+   |
+17 |     let _ = envelope.map_payload(|_| OrderPayload);
+   |                      ^^^^^^^^^^^
+   |
+help: there is a method `payload` with a similar name, but with different arguments
+  --> src/envelope.rs
+   |
+   |     pub const fn payload(&self) -> &P {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

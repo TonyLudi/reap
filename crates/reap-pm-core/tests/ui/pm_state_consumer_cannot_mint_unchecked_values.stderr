@@ -1,0 +1,43 @@
+error[E0624]: associated function `from_units_unchecked` is private
+ --> tests/ui/pm_state_consumer_cannot_mint_unchecked_values.rs:5:26
+  |
+5 |         let _ = PmPrice::from_units_unchecked(400_000);
+  |                          ^^^^^^^^^^^^^^^^^^^^ private associated function
+  |
+ ::: src/numeric.rs
+  |
+  |     const fn from_units_unchecked(units: u32) -> Self {
+  |     ------------------------------------------------- private associated function defined here
+
+error[E0624]: associated function `from_protocol_units_unchecked` is private
+ --> tests/ui/pm_state_consumer_cannot_mint_unchecked_values.rs:6:29
+  |
+6 |         let _ = PmQuantity::from_protocol_units_unchecked(U256::ONE);
+  |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private associated function
+  |
+ ::: src/numeric.rs
+  |
+  |     const fn from_protocol_units_unchecked(protocol_units: U256) -> Self {
+  |     -------------------------------------------------------------------- private associated function defined here
+
+error[E0616]: field `units` of struct `PmPrice` is private
+  --> tests/ui/pm_state_consumer_cannot_mint_unchecked_values.rs:13:23
+   |
+13 |         let _ = price.units;
+   |                       ^^^^^ private field
+   |
+help: a method `units` also exists, call it with parentheses
+   |
+13 |         let _ = price.units();
+   |                            ++
+
+error[E0616]: field `protocol_units` of struct `PmQuantity` is private
+  --> tests/ui/pm_state_consumer_cannot_mint_unchecked_values.rs:14:26
+   |
+14 |         let _ = quantity.protocol_units;
+   |                          ^^^^^^^^^^^^^^ private field
+   |
+help: a method `protocol_units` also exists, call it with parentheses
+   |
+14 |         let _ = quantity.protocol_units();
+   |                                        ++

@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/reap-core",
+    "crates/reap-pm-core",
     "crates/reap-venue",
     "crates/reap-feed",
     "crates/reap-fault",
@@ -57,6 +58,7 @@ reap-live = { path = "crates/reap-live" }
 reap-live-contracts = { path = "crates/reap-live-contracts" }
 reap-engine = { path = "crates/reap-engine" }
 reap-order = { path = "crates/reap-order" }
+reap-pm-core = { path = "crates/reap-pm-core" }
 reap-okx-wire = { path = "crates/reap-okx-wire" }
 reap-okx-live-adapter = { path = "crates/reap-okx-live-adapter" }
 reap-evidence-core = { path = "crates/reap-evidence-core" }

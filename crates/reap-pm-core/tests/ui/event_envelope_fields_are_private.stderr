@@ -1,0 +1,17 @@
+error[E0451]: fields `venue`, `source`, `connection_id`, `clock`, `ordering` and `payload` of struct `EventEnvelope` are private
+  --> tests/ui/event_envelope_fields_are_private.rs:15:9
+   |
+14 |     let _ = EventEnvelope {
+   |             ------------- in this type
+15 |         venue,
+   |         ^^^^^ private field
+16 |         source,
+   |         ^^^^^^ private field
+17 |         connection_id,
+   |         ^^^^^^^^^^^^^ private field
+18 |         clock,
+   |         ^^^^^ private field
+19 |         ordering,
+   |         ^^^^^^^^ private field
+20 |         payload,
+   |         ^^^^^^^ private field

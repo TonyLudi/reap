@@ -20,6 +20,8 @@ pub enum PartitionError {
     ZeroConnections,
     #[error("duplicate subscription {channel}/{symbol}")]
     DuplicateSubscription { channel: String, symbol: String },
+    #[error("the existing feed subscription partitioner does not support venue {0:?}")]
+    UnsupportedVenue(Venue),
 }
 
 pub fn partition_subscriptions(
@@ -51,7 +53,7 @@ pub fn partition_subscriptions(
         }
         for replica in 0..subscription.connections {
             let key = GroupKey {
-                venue: venue_key(subscription.venue),
+                venue: venue_key(subscription.venue)?,
                 channel: channel_key(&subscription.channel),
                 priority: priority_key(subscription.priority),
                 replica,
@@ -68,10 +70,11 @@ pub fn partition_subscriptions(
         for (chunk_index, chunk) in group.chunks(chunk_size).enumerate() {
             let venue = chunk[0].venue;
             let channel = channel_label(&chunk[0].channel);
+            let venue_label = venue_label(venue)?;
             plans.push(SocketPlan {
                 conn_id: ConnId::new(format!(
                     "{}-{channel}-{}-r{}-{chunk_index}",
-                    venue_label(venue),
+                    venue_label,
                     priority_label(chunk[0].priority),
                     key.replica
                 )),
@@ -93,9 +96,10 @@ struct GroupKey {
     private: bool,
 }
 
-fn venue_key(venue: Venue) -> u8 {
+fn venue_key(venue: Venue) -> Result<u8, PartitionError> {
     match venue {
-        Venue::Okx => 1,
+        Venue::Okx => Ok(1),
+        Venue::Polymarket => Err(PartitionError::UnsupportedVenue(Venue::Polymarket)),
     }
 }
 
@@ -112,9 +116,10 @@ fn channel_key(channel: &Channel) -> String {
     channel_label(channel)
 }
 
-fn venue_label(venue: Venue) -> &'static str {
+fn venue_label(venue: Venue) -> Result<&'static str, PartitionError> {
     match venue {
-        Venue::Okx => "okx",
+        Venue::Okx => Ok("okx"),
+        Venue::Polymarket => Err(PartitionError::UnsupportedVenue(Venue::Polymarket)),
     }
 }
 
@@ -149,6 +154,31 @@ mod tests {
 
     fn book(symbol: &str) -> Subscription {
         Subscription::public(Venue::Okx, Channel::Books, symbol, FeedPriority::Critical)
+    }
+
+    #[test]
+    fn old_subscription_partitioning_rejects_polymarket_explicitly() {
+        assert_eq!(venue_key(Venue::Okx), Ok(1));
+        assert_eq!(venue_label(Venue::Okx), Ok("okx"));
+        assert_eq!(
+            venue_key(Venue::Polymarket),
+            Err(PartitionError::UnsupportedVenue(Venue::Polymarket))
+        );
+        assert_eq!(
+            venue_label(Venue::Polymarket),
+            Err(PartitionError::UnsupportedVenue(Venue::Polymarket))
+        );
+
+        let subscription = Subscription::public(
+            Venue::Polymarket,
+            Channel::Books,
+            "123",
+            FeedPriority::Critical,
+        );
+        assert_eq!(
+            partition_subscriptions(&[subscription], 10),
+            Err(PartitionError::UnsupportedVenue(Venue::Polymarket))
+        );
     }
 
     #[test]

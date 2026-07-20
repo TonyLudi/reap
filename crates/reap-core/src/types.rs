@@ -49,9 +49,11 @@ impl BacktestLatencyClass {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum Venue {
+    #[serde(rename = "okx")]
     Okx,
+    #[serde(rename = "polymarket")]
+    Polymarket,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -757,7 +759,26 @@ pub fn round_down_to_lot(qty: Quantity, lot_size: f64) -> Quantity {
 
 #[cfg(test)]
 mod tests {
-    use super::{Balance, Channel, FillKey, MarketEvent, NormalizedEvent, OrderUpdate, Position};
+    use super::{
+        Balance, Channel, FillKey, MarketEvent, NormalizedEvent, OrderUpdate, Position, Venue,
+    };
+
+    #[test]
+    fn venue_wire_names_are_stable_and_explicit() {
+        assert_eq!(serde_json::to_string(&Venue::Okx).unwrap(), r#""okx""#);
+        assert_eq!(
+            serde_json::from_str::<Venue>(r#""okx""#).unwrap(),
+            Venue::Okx
+        );
+        assert_eq!(
+            serde_json::to_string(&Venue::Polymarket).unwrap(),
+            r#""polymarket""#
+        );
+        assert_eq!(
+            serde_json::from_str::<Venue>(r#""polymarket""#).unwrap(),
+            Venue::Polymarket
+        );
+    }
 
     #[test]
     fn okx_depth_variants_are_book_channels() {

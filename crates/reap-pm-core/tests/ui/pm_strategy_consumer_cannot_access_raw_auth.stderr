@@ -1,0 +1,29 @@
+error[E0432]: unresolved import `reap_pm_core::auth`
+ --> tests/ui/pm_strategy_consumer_cannot_access_raw_auth.rs:1:19
+  |
+1 | use reap_pm_core::auth::PmAuth;
+  |                   ^^^^ could not find `auth` in `reap_pm_core`
+
+error[E0432]: unresolved import `reap_pm_core::credential`
+ --> tests/ui/pm_strategy_consumer_cannot_access_raw_auth.rs:2:19
+  |
+2 | use reap_pm_core::credential::PmCredential;
+  |                   ^^^^^^^^^^ could not find `credential` in `reap_pm_core`
+
+error[E0432]: unresolved import `reap_pm_core::private_client`
+ --> tests/ui/pm_strategy_consumer_cannot_access_raw_auth.rs:3:19
+  |
+3 | use reap_pm_core::private_client::PmPrivateClient;
+  |                   ^^^^^^^^^^^^^^ could not find `private_client` in `reap_pm_core`
+
+error[E0432]: unresolved import `reap_pm_core::raw_wire`
+ --> tests/ui/pm_strategy_consumer_cannot_access_raw_auth.rs:4:19
+  |
+4 | use reap_pm_core::raw_wire::PmRawWireClient;
+  |                   ^^^^^^^^ could not find `raw_wire` in `reap_pm_core`
+
+error[E0432]: unresolved import `reap_pm_core::signer`
+ --> tests/ui/pm_strategy_consumer_cannot_access_raw_auth.rs:5:19
+  |
+5 | use reap_pm_core::signer::PmSigner;
+  |                   ^^^^^^ could not find `signer` in `reap_pm_core`

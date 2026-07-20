@@ -1,9 +1,9 @@
 # Multi-Venue Polymarket Foundation Goal F Handoff
 
-Status: in progress. Phase 0 is documentation-complete and awaits its
-documentation-only gate commit. No production code has changed. This ledger is
-architecture and deterministic local evidence, not authenticated-connectivity
-evidence or trading authorization.
+Status: in progress. Phase 0 is green at
+`8d6581270b82f39293ccdb0cbeaead42d717e81c`; Phase 1 is in progress. This
+ledger is architecture and deterministic local evidence, not
+authenticated-connectivity evidence or trading authorization.
 
 The historical execution contract is the
 [Goal F prompt](multi-venue-polymarket-foundation-goal-f-prompt.md). The
@@ -33,8 +33,8 @@ deployed PM binary, target-host qualification, or production trading approval.
 | Phase | Status | Gate commit |
 | --- | --- | --- |
 | Prompt-only execution contract | Green | `d2593f6d85ce868b46e3c1f16b5a48f221e5e480` |
-| 0. Baseline, product contract, dependency and measurement plan | Documentation complete; gate commit pending | The documentation-only commit containing this ledger and boundary |
-| 1. Exact PM domain and venue-aware envelopes | Pending | — |
+| 0. Baseline, product contract, dependency and measurement plan | Green | `8d6581270b82f39293ccdb0cbeaead42d717e81c` |
+| 1. Exact PM domain and venue-aware envelopes | In progress | — |
 | 2. Capability-specific venue framework seams | Pending | — |
 | 3. PM public market data, integrity, capture, replay | Pending | — |
 | 4. Read-only private lifecycle and position monitor | Pending | — |
@@ -42,8 +42,9 @@ deployed PM binary, target-host qualification, or production trading approval.
 | 6. PM coordinator, quote-model seam, local evidence | Pending | — |
 | 7. Documentation, global verification, final audit | Pending | — |
 
-The Phase 0 commit hash will be written into this table by the first later
-phase commit, avoiding a self-referential commit hash.
+The Phase 0 boundary document has SHA-256
+`861af08783076b5aec2a52f5a351c8a707971902cc58d7f0f1a6ba1795a58a05`
+at its green gate.
 
 ## Phase 0 Baseline Identity
 
@@ -789,7 +790,7 @@ constants, bytes, fingerprints, fixtures, and readers remain unchanged.
 
 ## Phase 0 Gate
 
-Phase 0 is green when this handoff and the boundary document pass:
+Phase 0 passed:
 
 ```text
 git add docs/multi-venue-polymarket-foundation-goal-f-handoff.md \
@@ -799,5 +800,245 @@ all relative Markdown links resolve
 only the two Goal F documentation files differ from HEAD
 ```
 
-The gate commit is documentation-only. Production edits begin only from its
-clean committed state.
+The documentation-only gate commit is
+`8d6581270b82f39293ccdb0cbeaead42d717e81c`.
+
+## Phase 1: Exact PM Domain And Venue-Aware Envelopes
+
+Phase 1 adds one pure leaf package, `reap-pm-core`, and the minimum common
+venue-identity change. It does not add a PM adapter, strategy, state reducer,
+runtime, transport, credential, signer, authenticated client, or mutation
+authority.
+
+### Common identity and legacy fail-close
+
+`reap-core::Venue` now has explicit stable encodings:
+
+```text
+Okx        -> "okx"
+Polymarket -> "polymarket"
+```
+
+The old feed connection and partitioning paths reject
+`Venue::Polymarket` with typed `UnsupportedVenue` errors before OKX
+subscription serialization or task construction. They contain no PM DTO,
+configuration, session, or execution behavior. Golden tests prove the
+pre-existing OKX `Venue`, `Subscription`, `RawEnvelope`, and `SystemEvent`
+bytes are unchanged.
+
+### Pure PM domain
+
+`reap-pm-core` contains:
+
+- fixed-width structural condition, market, outcome-token, environment,
+  chain, signer, funder, account, spender, account-scoped client-order,
+  venue-order and fill keys, connection, source, snapshot, and compact
+  configured-handle identities;
+- an explicit OKX `index-tickers` reference instrument identity with no
+  `.PM`/`.PF` suffix parsing and no mutable venue discriminator;
+- a checked, sorted, nonempty mapping from one configured PM instrument
+  handle to at most 16 configured OKX reference handles, with no pricing
+  formula;
+- exact heap-free `PmPrice`, `PmTick`, `PmQuantity`, `U256`, signed units,
+  tagged ERC-1155 approval, explicit book deletion, JSON-safe order salt, and
+  exact side-specific maker/taker amount conversion;
+- checked metadata facts for condition/market/token membership, outcome
+  label, lifecycle, tick, minimum/lot, chain/domain/exchange identity, and up
+  to eight sorted, deduplicated exact spender/asset requirements whose
+  outcome-token asset must match the configured metadata token;
+- typed market, book, order, fill, balance, allowance, and position events;
+- an exact, positive, canonical OKX reference price represented as a U256
+  coefficient and decimal scale, plus a source-bound OKX reference event; and
+- a statically typed `EventEnvelope<P>` retaining exact source, venue,
+  connection, distinct venue/wall/monotonic clocks, connection epoch,
+  optional real venue sequence/hash, snapshot revision, and separate local
+  ingress sequence.
+
+`PmPrice` represents an exact unapproved candidate in `1..=999_999`
+millionths. It becomes tick-valid only through an explicit check against one
+of the frozen ticks: `100_000`, `10_000`, `5_000`, `2_500`, `1_000`, or
+`100` millionths. Consequently the minimum and maximum supported
+tick-aligned prices are `0.0001` and `0.9999`; raw range tests also retain
+`0.000001` and `0.999999` as non-executable candidates until checked against
+market tick. Quantities are positive U256 protocol micro-units; the fixed lot
+is 10,000 units. Decimal parsing rejects signs, exponent notation,
+non-representable sub-units, underflow, and overflow. `PmPrice` deliberately
+does not implement `Deserialize`, because a wire value has no metadata/tick
+context with which to mint an executable price. `0.1`, `0.10`, and
+`0.1000000` produce one unit/hash/serialized identity.
+
+The OKX reference value is not a PM probability and carries no quote formula.
+It accepts at most 128 input bytes and at most 18 significant fractional
+digits, rejects zero/sign/exponent/rounding/overflow, removes coefficient
+trailing zeroes, and serializes only as its canonical decimal string. This
+closes the exact public-reference handoff needed by the frozen
+`reap-okx-public-source` seam without adding another PM-core module.
+
+The maker/taker calculation splits quantity into whole and fractional shares
+before checked multiplication. It therefore distinguishes a true
+non-integral half-unit from U256 overflow: `U256::MAX * 0.5` is rejected as
+non-integral, while `(U256::MAX - 1) * 0.5` succeeds exactly. No lowering
+operation rounds.
+
+Unchecked price, tick, and quantity constructors are private.
+`PmOrderAmounts` fields are private and the type implements neither raw-tuple
+promotion nor `Deserialize`. Domain events themselves are not deserializable;
+wire parsing in a later crate must call their checked constructors. The
+generic envelope requires the static `PmSourceBound: Sized` contract and
+checks exact payload/envelope source equality, including same-venue token and
+account mismatches. Order and fill identity cannot be represented by a bare
+venue ID: client-order, venue-order, and fill keys retain their exact account
+scope, and event constructors reject cross-account combinations. There is no
+payload erase/map operation or trait-object source-binding path.
+
+### Dependency and source boundary
+
+Locked metadata reports 24 workspace packages. The only new production
+workspace edge is:
+
+```text
+reap-pm-core -> reap-core
+```
+
+All 23 Phase 0 package edges are unchanged. The complete sorted adjacency has
+SHA-256
+`7dab46fcdb8a906d541710c44104af6ac51a52e89f136f1460f99f246e9208b8`.
+`reap-pm-core` has exactly `reap-core`, `serde`, and `thiserror` as production
+dependencies and no binary. Every pre-existing Chaos/OKX package is tested
+against acquiring a `reap-pm-core` dependency.
+
+The PM core production-source policy rejects float state, JSON value escape,
+filesystem/network/time/runtime clients, credentials/keys/signed requests,
+dynamic dispatch, growing containers, shared mutation, unchecked wrapping or
+saturating arithmetic, and unsafe code. Ten individually reviewed
+compile-fail fixtures prove:
+
+1. unchecked numeric constructors and float promotion are inaccessible;
+2. exact maker/taker amounts cannot be forged, deserialized, or field-built;
+3. client-order identity representation is private;
+4. reference-mapping representation is private;
+5. envelope fields and payload types cannot be forged, interchanged, mapped,
+   or erased;
+6. a modeled external PM-state consumer cannot mint unchecked values;
+7. a modeled external PM-strategy consumer cannot import raw/auth types; and
+8. Serde cannot mint an off-grid `PmPrice` candidate.
+
+The modeled consumer tests prove the Phase 1 absence claims before the actual
+state and strategy crates exist. Their owning phases must repeat the same
+dependency, visibility, and authority checks against the real crates.
+
+### Compatibility and structural evidence
+
+The schema/version inventory remains exactly 47 lines with its Phase 0
+SHA-256
+`9aa8a21c5a8678508c3933de738e26232d0b7ba60882d75cb49c6e25b4bb211f`.
+The public declaration inventory grows from 1,433 to 1,517 lines solely for
+the authorized common venue/error additions and new PM leaf API; its Phase 1
+SHA-256 is
+`200fd43e6abd01709838aaf8ea6dbd1aaf746a5a8549004a2a30fcd25881614f`.
+
+The production-source inventory grows from 170 to 177 files and has SHA-256
+`b01c0a23fca1fe5015c95c81d1469bdb3693c8e5db9f2d28a532f6bcf3d9e143`.
+New production module sizes are:
+
+| Lines | Module |
+| ---: | --- |
+| 989 | `reap-pm-core/src/numeric.rs` |
+| 936 | `reap-pm-core/src/event.rs` |
+| 871 | `reap-pm-core/src/identity.rs` |
+| 380 | `reap-pm-core/src/metadata.rs` |
+| 329 | `reap-pm-core/src/envelope.rs` |
+| 95 | `reap-pm-core/src/mapping.rs` |
+| 37 | `reap-pm-core/src/lib.rs` |
+
+No new production file exceeds 1,500 lines and no new production function
+exceeds 250 lines. Exact-value sizes are 32 bytes for `U256` and
+`PmQuantity`, four bytes for `PmPrice`, and require no drop.
+
+The lockfile changes only by adding the new local package with its already
+locked normal/dev dependencies. Its Phase 1 SHA-256 is
+`4e3e3a8883e5c8b2a057eeb25fc418adca4ac5ad0ca44f923f249ac563782128`.
+Every frozen example and Chaos fixture hash remains equal to Phase 0. The
+Phase 0 boundary gate remains identified by
+`861af08783076b5aec2a52f5a351c8a707971902cc58d7f0f1a6ba1795a58a05`.
+Its current Phase 1 SHA-256 is
+`14b9316460388cde6aa8c4787e2aba23d91176bc7f1275d51487ea819fb739c2`.
+The only boundary-text change is an audited correction of the frozen
+module-level edge from:
+
+```text
+reap-pm-core::identity -> reap-core::types
+```
+
+to:
+
+```text
+reap-pm-core::identity -> numeric + reap-core::types
+```
+
+`PmTokenId` must own the same exact 256-bit value defined by `numeric`; the
+old diagram omitted that real dependency. The correction adds no crate,
+capability, module, or runtime edge, and avoids duplicating or weakening the
+exact token representation merely to preserve an inaccurate diagram.
+
+### Phase 1 verification
+
+The focused gate passed:
+
+```text
+cargo fmt --all -- --check
+cargo clippy -p reap-core -p reap-feed -p reap-pm-core \
+  --all-targets --locked -- -D warnings
+cargo test -p reap-core -p reap-feed --locked --no-fail-fast
+cargo test -p reap-pm-core --locked --no-fail-fast
+cargo test -p reap-pm-core --test dependency_policy --locked
+```
+
+Results were 13 `reap-core` tests, 72 `reap-feed` tests plus its four-case
+trybuild suite, and 60 `reap-pm-core` Rust test functions, including one
+harness test that passed all ten individually reviewed compile-fail cases and
+two dependency/source-policy tests. All passed.
+
+Every pre-existing authority boundary was rerun:
+
+```text
+cargo test -p reap-strategy -p reap-venue -p reap-feed -p reap-order \
+  -p reap-okx-live-adapter -p reap-live \
+  --test compile_fail_boundaries --locked --no-fail-fast
+cargo test -p reap-live --test dependency_policy --locked
+```
+
+All 23 legacy UI cases and all seven live dependency/source-policy checks
+passed.
+
+Deterministic compatibility checks passed:
+
+```text
+cargo test -p reap-engine --test decision_replay --locked
+cargo test -p reap-live --lib coordinator::tests --locked
+cargo test -p reap-storage -p reap-capture --lib --locked --no-fail-fast
+```
+
+The engine decision replay passed four tests with three fixture-authoring
+helpers ignored; the live coordinator passed 37 tests with one authoring
+helper ignored; capture passed 50 tests; and storage passed 31 tests. An
+initial attempted integration target named `coordinator_unit` was rejected
+because those tests are a path-mounted library test module; the corrected
+library filter above exercised the intended suite.
+
+The canonical CLI backtest ran twice. `cmp` returned zero and both outputs
+retained the required SHA-256:
+
+```text
+38acf9f5e0c310f2ec5528974beffadf4c1a7f84d46efa8d9664ee7051e84691
+```
+
+Locked `cargo metadata`, `git diff --check`, the baseline-ancestor check, and
+the Phase 0 fixture hash comparison passed. `../imm-strategy` remains clean at
+`b6b120c7b7c466d8431bf082f3229328c5d7b2ae`; `../predarb` remains at
+`8222273a9c72033b760e1d2fec813bc77144556d` with only its pre-existing
+modified dashboard and untracked `.predarb/`. No sibling file or untracked
+runtime byte was read or changed.
+
+The independent final diff audit found no remaining blocker. Phase 1 is ready
+for its gate commit.

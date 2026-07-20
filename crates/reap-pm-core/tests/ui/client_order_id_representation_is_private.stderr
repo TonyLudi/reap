@@ -1,0 +1,5 @@
+error[E0616]: field `0` of struct `PmClientOrderId` is private
+ --> tests/ui/client_order_id_representation_is_private.rs:4:29
+  |
+4 |     let _ = client_order_id.0;
+  |                             ^ private field

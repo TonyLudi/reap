@@ -648,7 +648,7 @@ reap-okx-public-source::session -> public_wire + reference + subscription + reap
 reap-okx-public-source::public_wire -> reap-core::types
 reap-okx-public-source::reference -> public_wire + reap-core::types
 reap-okx-public-source::subscription -> reap-core::types
-reap-pm-core::identity -> reap-core::types
+reap-pm-core::identity -> numeric + reap-core::types
 reap-pm-core::metadata -> identity + numeric
 reap-pm-core::mapping -> identity
 reap-pm-core::event -> identity + metadata + numeric

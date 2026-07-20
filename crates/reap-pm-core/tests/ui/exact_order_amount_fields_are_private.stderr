@@ -1,0 +1,9 @@
+error[E0451]: fields `maker` and `taker` of struct `PmOrderAmounts` are private
+ --> tests/ui/exact_order_amount_fields_are_private.rs:5:9
+  |
+4 |     let _ = PmOrderAmounts {
+  |             -------------- in this type
+5 |         maker: U256::ONE,
+  |         ^^^^^ private field
+6 |         taker: U256::ONE,
+  |         ^^^^^ private field

@@ -1,0 +1,48 @@
+error[E0624]: associated function `from_units_unchecked` is private
+ --> tests/ui/unchecked_numeric_constructors_are_private.rs:4:22
+  |
+4 |     let _ = PmPrice::from_units_unchecked(1);
+  |                      ^^^^^^^^^^^^^^^^^^^^ private associated function
+  |
+ ::: src/numeric.rs
+  |
+  |     const fn from_units_unchecked(units: u32) -> Self {
+  |     ------------------------------------------------- private associated function defined here
+
+error[E0624]: associated function `from_units_unchecked` is private
+ --> tests/ui/unchecked_numeric_constructors_are_private.rs:5:21
+  |
+5 |     let _ = PmTick::from_units_unchecked(100);
+  |                     ^^^^^^^^^^^^^^^^^^^^ private associated function
+  |
+ ::: src/numeric.rs
+  |
+  |     const fn from_units_unchecked(units: u32) -> Self {
+  |     ------------------------------------------------- private associated function defined here
+
+error[E0624]: associated function `from_protocol_units_unchecked` is private
+ --> tests/ui/unchecked_numeric_constructors_are_private.rs:6:25
+  |
+6 |     let _ = PmQuantity::from_protocol_units_unchecked(U256::ONE);
+  |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private associated function
+  |
+ ::: src/numeric.rs
+  |
+  |     const fn from_protocol_units_unchecked(protocol_units: U256) -> Self {
+  |     -------------------------------------------------------------------- private associated function defined here
+
+error[E0277]: the trait bound `PmPrice: From<f64>` is not satisfied
+  --> tests/ui/unchecked_numeric_constructors_are_private.rs:10:12
+   |
+10 |     (price.into(), quantity.into())
+   |            ^^^^ the trait `From<f64>` is not implemented for `PmPrice`
+   |
+   = note: required for `f64` to implement `Into<PmPrice>`
+
+error[E0277]: the trait bound `PmQuantity: From<f64>` is not satisfied
+  --> tests/ui/unchecked_numeric_constructors_are_private.rs:10:29
+   |
+10 |     (price.into(), quantity.into())
+   |                             ^^^^ the trait `From<f64>` is not implemented for `PmQuantity`
+   |
+   = note: required for `f64` to implement `Into<PmQuantity>`

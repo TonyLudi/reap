@@ -1324,6 +1324,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "reap-pm-core"
+version = "0.1.0"
+dependencies = [
+ "reap-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "trybuild",
+]
+
+[[package]]
 name = "reap-risk"
 version = "0.1.0"
 dependencies = [
