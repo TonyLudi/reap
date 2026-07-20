@@ -34,7 +34,7 @@ runtime concurrency redesign.
 | 3. Explicit decision/risk replay parity | Green | `e167c63fe02888784ae6e1032ef9c2f50941b4bd` | `dff673743584c541629c3cc9db9ff25726f1623c` |
 | 4. Exact regular order-to-wire numeric boundary | Green | `85af45571eb486f03c46fd2a3086d4f0ac8f101e` | `1008d4aca306eceb109adb651a51448a5d898a37` |
 | 5. Action-path performance and runtime health | Green | `f7de633a1f68ee8e607aaf7c6c7e0839155af38e`; `97a9970a8977ebccc46f4a7de3175da537adcfec`; `80a38fe3544c5d8ff9aa79c4c98d3ad39ea94103` | `65d65e7fe2022e838919cd1909da4797757c884c` |
-| 6. Global verification and documentation | Green | The gated Phase 6 documentation/global-verification commit is the commit containing this record | The final handoff close commit is the commit containing the completed ledger |
+| 6. Global verification and documentation | Green | `9b655bd615101542695c2c0f1b71551a93318361` | The final handoff close commit is the commit containing the completed ledger |
 
 ## Phase 0 Baseline Identity
 
