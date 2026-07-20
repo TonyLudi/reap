@@ -224,6 +224,17 @@ pub struct LiveCoordinator {
     decision_sequence: u64,
     #[cfg(test)]
     chaos_intent_trace: Vec<(ChaosExecutionPurpose, OrderIntent)>,
+    #[cfg(test)]
+    chaos_decision_trace: Vec<ChaosDecisionTraceBatch>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct ChaosDecisionTraceBatch {
+    typed_intents: Vec<(ChaosExecutionPurpose, OrderIntent)>,
+    rejected: Vec<reap_risk::RiskDecision>,
+    system_events: Vec<SystemEvent>,
+    safety_cancel_candidates: Vec<(String, String)>,
 }
 
 impl LiveCoordinator {
@@ -290,6 +301,8 @@ impl LiveCoordinator {
             decision_sequence: 0,
             #[cfg(test)]
             chaos_intent_trace: Vec::new(),
+            #[cfg(test)]
+            chaos_decision_trace: Vec::new(),
         })
     }
 

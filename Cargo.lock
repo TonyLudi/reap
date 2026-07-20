@@ -1129,6 +1129,8 @@ dependencies = [
  "reap-core",
  "reap-risk",
  "reap-strategy",
+ "serde",
+ "serde_json",
  "toml 0.9.12+spec-1.1.0",
 ]
 

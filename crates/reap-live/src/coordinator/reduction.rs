@@ -279,6 +279,27 @@ impl LiveCoordinator {
         output: &mut CoordinatorOutput,
     ) {
         #[cfg(test)]
+        self.chaos_decision_trace
+            .push(super::ChaosDecisionTraceBatch {
+                typed_intents: engine_output
+                    .intents
+                    .iter()
+                    .map(|intent| (intent.purpose(), intent.to_order_intent()))
+                    .collect(),
+                rejected: engine_output.rejected.clone(),
+                system_events: engine_output.system_events.clone(),
+                safety_cancel_candidates: engine_output
+                    .safety_cancel_candidates
+                    .iter()
+                    .map(|candidate| {
+                        (
+                            candidate.order_id().to_string(),
+                            candidate.reason().to_string(),
+                        )
+                    })
+                    .collect(),
+            });
+        #[cfg(test)]
         self.chaos_intent_trace.extend(
             engine_output
                 .intents

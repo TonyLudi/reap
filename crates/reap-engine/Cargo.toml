@@ -13,4 +13,6 @@ reap-risk.workspace = true
 reap-strategy.workspace = true
 
 [dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
 toml.workspace = true

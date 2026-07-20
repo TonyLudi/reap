@@ -99,8 +99,8 @@ impl RegularReconciliation for ScopeOnlyGatewayRoles {
     }
 }
 
-fn approval_scopes(
-    account_ids: impl IntoIterator<Item = &'static str>,
+fn approval_scopes<'a>(
+    account_ids: impl IntoIterator<Item = &'a str>,
 ) -> HashMap<String, RegularApprovalScope> {
     let roles = Arc::new(ScopeOnlyGatewayRoles);
     account_ids
@@ -557,6 +557,7 @@ fn cancelled_private_order(
     }
 }
 
+mod decision_parity;
 mod execution_recovery;
 mod private_feed;
 mod public_trade_reprice;
