@@ -1,6 +1,6 @@
 # Determinism And Measured Runtime Goal D Handoff
 
-Status: Phases 0 through 2 green; Phase 3 is next. This is an evidence ledger,
+Status: Phases 0 through 3 green; Phase 4 is next. This is an evidence ledger,
 not a trading authorization. Until every required Goal D phase and global gate
 below is recorded green, the active execution contract remains
 [determinism-readiness-goal-d-prompt.md](determinism-readiness-goal-d-prompt.md).
@@ -31,7 +31,7 @@ runtime concurrency redesign.
 | 0. Baseline, call-path audit, and measurement contract | Green | `768ee0a` |
 | 1. Deterministic fail-closed cancellation | Green | `4c49cae` |
 | 2. Pinned-Java public-trade parity | Green | `6d446da` |
-| 3. Explicit decision/risk replay parity | Pending | Pending |
+| 3. Explicit decision/risk replay parity | Green | `e167c63` |
 | 4. Exact regular order-to-wire numeric boundary | Pending | Pending |
 | 5. Action-path performance and runtime health | Pending | Pending |
 | 6. Global verification and documentation | Pending | Pending |
@@ -500,9 +500,9 @@ affect the immediate or a later decision:
   including explicit missing-rate state; and
 - source event milliseconds plus local arrival nanoseconds.
 
-Missing models currently default to Spot and missing instrument limits skip the
-cap. The Goal D replay validator must reject either omission; it cannot call
-those permissive fallbacks evidence.
+Production fallback behavior still treats a missing model as Spot and skips a
+missing instrument cap. The Phase 3 replay validator rejects either omission;
+it never calls those permissive fallbacks evidence.
 
 Live startup initializes risk in an ordered sequence: authenticated
 models/limits, durable latches, recovered active owned orders sorted by ID,
@@ -511,21 +511,25 @@ latch reapplication, then explicit feed/private health events. Replay must
 drive production transitions in a fixed order instead of directly assigning
 copied risk logic.
 
-Planned checked-in fixture family:
+Completed checked-in fixture family:
 
 ```text
 fixtures/decision_parity/risk_initialization_v1.json
 fixtures/decision_parity/replay_events_v1.jsonl
 fixtures/decision_parity/expected_engine_v1.jsonl
-fixtures/decision_parity/expected_live_reduction_v1.jsonl
+fixtures/decision_parity/expected_live_reduction_v1.json
 ```
 
-The initialization artifact will bind schema 1, Reap/Java/config hashes,
-fully expanded risk inputs, `seed_now_ms`, and ordered seed events. Replay
-envelopes use `{sequence, arrival_ns, event}`. Expected engine rows use
-structured typed purpose, legacy projection, rejection, system-event, and
+The initialization artifact binds schema 1, Reap/Java revisions, the complete
+embedded effective configuration, fully expanded risk inputs, source clocks,
+and ordered seed events. The whole-artifact SHA is the exact configuration
+binding; embedding and fixed-point validation are stronger than the tentative
+Phase 0 plan for a bare config digest. Replay envelopes use canonical
+contiguous case blocks with exact sequences and typed normalized,
+PendingFeedback, or due-reprice inputs. Expected engine rows use structured
+typed purpose, legacy projection, rejection, system-event, and
 safety-candidate fields rather than Debug text. The live projection is taken
-after coordinator reduction but before dispatch/commit; it must retain
+after coordinator reduction but before dispatch/commit and retains genuine
 same-turn PendingNew behavior.
 
 Generated client IDs contain process-time/PID state. The expected logical live
@@ -808,7 +812,7 @@ changed.
 | --- | --- | --- | --- |
 | 1 | Stable risk-derived cancellation order only | Four insertion orders across 24 child processes produced distinct generic/typed traversal bytes | Every child and insertion order produces `reap-02,reap-10,reap-2,reap-a1,reap-perp,reap-z0`; strategy cancels remain first |
 | 2 | Pinned public-trade implied depth and private 100-microsecond reprice only | Phase 0 public-trade workload produced zero trade-reprice actions and Rust retained no reached implied-depth trade state | Java-bound fixtures now produce exact implied-depth state, one private callback per qualifying trade, shared five-millisecond worker behavior, and identical ordered live/replay projections |
-| 3 | No default behavior change; new credential-free decision trace | Pending | Pending |
+| 3 | No default behavior change; new credential-free decision trace | Backtest has no production risk/live dependency and the live decision boundary was only documented | A strict shared test harness now proves identical production strategy/risk batches and separately goldens the genuine coordinator reduction; all production tracing is `#[cfg(test)]` |
 | 4 | Canonical exact numeric identity and `px`/`sz` bytes only | Pending | Pending |
 | 5 | No decisions; bounded metrics/health snapshots only | Pending | Pending |
 
@@ -1226,6 +1230,230 @@ no target-host latency claim is made.
 The updated connectivity/mapping documents now state the exact reached trade
 behavior and retain all exclusions. Independent final fixture/guard review is
 green. No Goal D stop condition was reached.
+
+### Phase 3
+
+The gated Phase 3 implementation/evidence commit is `e167c63`.
+
+Phase 3 changes no production decision, connectivity, authority, storage, or
+wire behavior. It adds a strict credential-free test harness, checked
+fixtures, and a `#[cfg(test)]` trace at the existing
+`LiveCoordinator::handle_engine_output` boundary. The trace is compiled out
+of normal and release builds.
+
+#### Executable equality boundary
+
+The engine and live fixtures start each independent case from the same clean,
+fully specified schema-1 initialization. They execute the production
+`TradingEngine<ChaosStrategy>` and `RiskGate`; the live side additionally
+continues through the genuine `LiveCoordinator`, `RegularExecutionPolicy`,
+client-ID generator, owned-order reservation, canonical private
+`PendingNew`, storage-record projection, and logical action projection.
+
+Equality is exact for:
+
+1. the canonical normalized or private due-reprice input and its declared
+   scheduling clocks;
+2. ordered typed Chaos purposes and their one-way legacy projections;
+3. ordered engine/risk rejections, system events, and safety-cancel
+   candidates; and
+4. the engine batches captured before live routing.
+
+The downstream live reduction is separately deterministic and golden. It is
+not equated with simulated matching/accounting, and the default economic
+backtest remains untouched. Raw private-feed identity, durable commit,
+dispatch, reconciliation, exchange ambiguity, emergency behavior, network IO,
+and credentials remain excluded.
+
+The replay has eight contiguous, bytewise lexicographically ordered cases and
+41 exact sequence rows. It covers quote, IOC hedge, public-trade reprice,
+risk rejection, symbol halt, global kill, normalized fill/order state, and a
+forced-repayment system-event path. A post-fill halt makes the filled
+`client#1` absence visible in the exact cancellation set. The quote case
+separates source/reservation time at 10 ms from observed/local-send time at
+12 ms, proving that same-turn `PendingNew` and the private post-send strategy
+transition use their distinct production clocks.
+
+Generated client IDs are produced by the real generator and alpha-renamed
+only in the evidence projection. Every identity link, ownership field,
+record/action field, and order remains exact. The live test runs the entire
+129,098-byte projection twice and compares bytes; the checked artifact is a
+strict digest manifest rather than a duplicate large JSONL file.
+
+#### Strict initialization and fixture hashes
+
+The initialization artifact embeds the complete effective `ChaosConfig`,
+every `RiskLimits` field, exact instrument models/limits, account/bootstrap
+state, declared decision state, live readiness, and the ordered transitions
+that produce it. The whole artifact hash is the exact configuration binding:
+the authoring test reconstructs the embedded config from the checked source
+plus explicit replay-only adjustments, calls `effective()`, and requires
+structural equality; the parser separately requires the embedded config to be
+an effective fixed point.
+
+Unknown fields, emitted-field omissions, non-canonical replay case order,
+sequence gaps, non-clean transition history, incomplete coverage, invalid
+market/account numerics, duplicate identity rows, unscoped or extra private
+snapshots, bootstrap/seed disagreement, stale health/reference state, and
+readiness/seed contradictions all fail before construction.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `fixtures/decision_parity/risk_initialization_v1.json` | `7e0951c41f447b9f46a73b24a3fe85bdc8f2bb8a623385dab0c3655926e73780` |
+| `fixtures/decision_parity/replay_events_v1.jsonl` | `dede17a546d4d717c78dc2b3b7aa7c3f3f785d552404160407c78fb87cec9101` |
+| `fixtures/decision_parity/expected_engine_v1.jsonl` | `140c268619b889a19d779e1bdfd340c11901d2eb1d9e4d216d976ba3d8b0d37a` |
+| `fixtures/decision_parity/expected_live_reduction_v1.json` | `aa66cc09bba29cde25ab2df66c018517b2c900f83373f95580150e8bcd442b60` |
+
+The live manifest binds 41 rows, 129,098 canonical bytes, and full-projection
+SHA-256
+`847c6f8ba5177cf456d0dc2c7c31df74a9b189c107e7167d06dd48bf09b7762b`.
+
+#### Determinism, authority, and dependency gates
+
+The final-tree commands included:
+
+```text
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo test -p reap-engine --test decision_replay --locked
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo test -p reap-live --lib \
+  coordinator::tests::decision_parity::initialized_live_reduction_matches_engine_decisions_and_is_byte_stable \
+  --locked -- --exact
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo test -p reap-live --lib \
+  coordinator::tests::production_coordinator_keeps_single_owner_responsibility_state \
+  --locked -- --exact
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo test -p reap-strategy --locked
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo test -p reap-engine --locked
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo test -p reap-risk --locked
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo test -p reap-backtest --locked
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo test -p reap-live --locked --no-fail-fast
+TMPDIR=/home/ubuntu/code/reap/target/tmp CARGO_BUILD_JOBS=1 \
+  cargo clippy -p reap-engine -p reap-live --all-targets --locked -- -D warnings
+cargo fmt --all -- --check
+cargo metadata --locked --format-version 1 >/dev/null
+git diff --check
+```
+
+Results: strategy 107/107 plus three compile-fail fixtures; engine 7/7 plus
+four decision-replay tests and three ignored authoring helpers; risk 29/29;
+backtest 131/131; live 249/249 with one ignored authoring helper, two
+compile-fail boundaries, four dependency/source-policy tests, one runtime
+compatibility test, and doc tests. Focused parity and single-owner tests,
+clippy with warnings denied, formatting, metadata, and diff checks passed.
+
+The canonical CLI backtest ran twice from the final source. Both outputs were
+byte-identical at the immutable hash:
+
+```text
+38acf9f5e0c310f2ec5528974beffadf4c1a7f84d46efa8d9664ee7051e84691
+```
+
+The Phase 3 `Cargo.lock` hash is
+`319268c86f94883e19668aa4835da615bbecbabfe32902019129e6e40caf894d`.
+Its only delta adds already locked `serde` and `serde_json` as direct
+`reap-engine` dev dependencies for strict fixture parsing/canonical JSONL. No
+package/version or normal dependency edge was added.
+
+The version inventory intentionally moves from 42 lines at `496653...` to 46
+lines at
+`a6201c31ccbd802fbd7b915eea2200b30fd3ade5df6a09662be35ac01363ab2c`.
+The four additions are test-only schema-1 constants for initialization,
+replay, engine projection, and live projection; this is not a production
+schema migration.
+
+Existing guards remain:
+
+| Guard | Phase 3 result |
+| --- | --- |
+| Workspace adjacency, 23 lines | `fe98cedfaa2653e09afd57293eb71372ea476c1997e56b5ce9f27b314f5a432b` |
+| Public authority surface, 356 declarations | `bf7af463d3c92836d58682d518942c1e2e3c52c62235fcd59eb3333f0a62e144` |
+| Literal `AlertEvent` schema guard, one line | `b7038321dbc71e3d8c3f41f6adae0fce53221cd4fc701cc76b173aefb2f48b41` |
+
+There is still no `reap-backtest -> reap-live` edge, public replay/runtime
+mode, normal emergency reachability, or added exchange operation. The sibling
+checkout remained clean at
+`b6b120c7b7c466d8431bf082f3229328c5d7b2ae`.
+
+#### Same-host benchmark gate
+
+The existing whole-program benchmarks used a final warm-up and three retained
+runs:
+
+| Benchmark | Warm-up | Recorded runs | Median | Phase 2 median | Delta |
+| --- | ---: | --- | ---: | ---: | ---: |
+| Engine event loop (ns/event) | 11,754.7 | 13,432.3; 11,843.7; 11,773.4 | 11,843.7 | 11,795.9 | +0.41% |
+| Complete live parity (ns/raw) | 17,489.4 | 17,356.6; 17,251.9; 17,180.6 | 17,251.9 | 17,288.6 | -0.21% |
+
+Every engine run retained 250,000 events and 999,996 intents. Every live run
+retained 50,204 raw frames, 70,208 feed outputs, 65,130 records, zero actions,
+4,193,771 allocation calls, and 1,871,951,969 requested bytes.
+
+The action benchmark used one formal warm-up and three initially required
+runs. Quote-creation p99.9 crossed the investigation threshold, so all three
+runs were retained and the series was extended to five warm recorded runs.
+Each workload has 10,000 internal warm-up and 100,000 timed observations, a
+separate fresh allocation pass, exact nearest-rank percentiles, and zero
+dropped/overflowed samples. Tuple order is
+`p50/p95/p99/p99.9/max` nanoseconds:
+
+| Workload | Runs 1 through 5 |
+| --- | --- |
+| Quote creation | `19011/25075/32016/261246/80599598`; `19158/25279/34001/227736/79489079`; `18929/24180/31031/115238/76062930`; `18970/24065/31302/210170/75676798`; `18920/23876/31014/182905/75683112` |
+| Quote replacement/cancel | `13424/15089/20176/61479/9582118`; `13161/13653/18559/22933/102480`; `13185/13563/18453/25460/118750`; `13210/14228/18683/24007/618924`; `13177/13858/18567/27831/132543` |
+| IOC hedge | `24271/29932/34248/56139/46047190`; `24172/27093/33649/49451/45266432`; `24295/26510/32401/40327/45516702`; `24320/29038/37324/79162/46160141`; `24238/28217/33780/45759/50048759` |
+| Risk rejection | `12004/12479/16812/20200/78193`; `12029/12439/16993/20956/120071`; `11971/12397/16779/20299/89196`; `12176/12775/17189/21268/91206`; `11955/13227/23343/26666/108331` |
+| Symbol fail-close | `632/656/665/3093/28365`; `632/656/664/1354/11093`; `632/657/672/1263/11109`; `632/657/672/3224/8812`; `632/657/672/1312/11438` |
+| Global fail-close | `788/813/829/3569/9788`; `788/829/846/4004/59068`; `788/821/845/1986/33468`; `788/829/853/3610/63399`; `788/821/862/1887/33172` |
+| Coordinator reduction | `5735/5940/8197/12840/55868`; `5727/5940/8058/12972/79719`; `5719/5956/8705/13227/77291`; `5735/5990/8992/13070/87162`; `5768/5965/7877/12422/32426` |
+| Raw recovery action | `26928/30325/37234/57467/6221903`; `26650/28726/36561/47638/6229697`; `26822/30169/37373/59412/6198494`; `26494/29472/36873/68783/6268063`; `26806/28996/36479/49615/6103480` |
+| Public-trade reprice | `12193/12710/17058/20857/79334`; `12258/12685/17469/23746/2137605`; `12168/12561/16820/20127/86866`; `12275/12726/17173/20833/1231278`; `12291/13251/17920/25419/2494127` |
+| Bounded control/feed storm | `140/205/7590/7664/36529`; `140/189/7623/7721/26543`; `140/196/7656/7746/12890`; `140/197/7680/7746/16565`; `140/189/7672/7746/20052` |
+
+Queue-age tuples were
+`11971/16328/16960/21710/53390`,
+`11996/16263/16903/21300/43544`,
+`11955/16155/16984/20882/26970`,
+`11946/16081/16796/20766/26108`, and
+`11954/16090/16829/21054/26461` ns.
+
+Every warm-up and recorded action run retained exact logical counters and
+allocation totals at:
+
+```text
+451af08d7fa061f55f16b099faf85ca934d577fdf5fb8b219668716f9fc1015c
+```
+
+The five-run medians are:
+
+| Workload | p50 | p99 | p99.9 |
+| --- | ---: | ---: | ---: |
+| Quote creation | 18,970 | 31,302 | 210,170 |
+| Quote replacement/cancel | 13,185 | 18,567 | 25,460 |
+| IOC hedge | 24,271 | 33,780 | 49,451 |
+| Risk rejection | 12,004 | 16,993 | 20,956 |
+| Symbol fail-close | 632 | 672 | 1,354 |
+| Global fail-close | 788 | 846 | 3,569 |
+| Coordinator reduction | 5,735 | 8,197 | 12,972 |
+| Raw recovery action | 26,806 | 36,873 | 57,467 |
+| Public-trade reprice | 12,258 | 17,173 | 20,857 |
+| Bounded control/feed storm | 140 | 7,656 | 7,746 |
+
+Medians and p99 values are stable against Phase 2. Quote-creation p99.9 is
+about 99% higher, while its p50 is 0.64% lower and p99 only 0.69% higher.
+This isolated tail is retained as shared-host noise evidence: Phase 3 changes
+no release production path, every allocation/logical count is exact, and the
+investigation observed 91-97% idle CPU but active swap-in with about 3.48 GiB
+swapped plus multiple unrelated Codex and Alloy processes. No retry replaced
+an observation and no target-host latency claim is made.
+
+The exact decision/risk boundary and exclusions are recorded in
+`backtest-live-decision-parity.md`. No Goal D stop condition was reached.
 
 ## Remaining Operational Blockers
 
