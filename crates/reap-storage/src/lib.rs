@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
 
 use reap_core::{
     AccountUpdate, FillFee, FillKey, FillLiquidity, NormalizedEvent, OrderIntent, OrderUpdate,
@@ -314,6 +316,30 @@ pub enum StorageWriteOutcome {
     DroppedBestEffort,
 }
 
+/// A read-only, process-local view of bounded storage-writer progress.
+///
+/// `records_outstanding` counts accepted records until their write attempt
+/// completes, preserving the historical [`StorageSink::queue_depth`] metric.
+/// `queue_depth` counts records currently held by the bounded channel and is
+/// therefore never greater than `queue_capacity`. The monotonic timestamp uses
+/// a private process-local origin and must not be compared across processes.
+/// Its corresponding age is computed against that same origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageProgressSnapshot {
+    pub records_enqueued: u64,
+    pub records_written: u64,
+    pub durable_sync_completions: u64,
+    pub write_failures: u64,
+    pub sync_failures: u64,
+    pub dropped_records: u64,
+    pub records_outstanding: usize,
+    pub queue_capacity: usize,
+    pub queue_depth: usize,
+    pub queue_high_water: usize,
+    pub last_writer_progress_ns: u64,
+    pub last_writer_progress_age_ns: u64,
+}
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("storage writer is closed")]
@@ -343,11 +369,124 @@ pub enum StorageError {
     Join(#[from] tokio::task::JoinError),
 }
 
+struct StorageProgress {
+    records_enqueued: AtomicU64,
+    records_written: AtomicU64,
+    durable_sync_completions: AtomicU64,
+    write_failures: AtomicU64,
+    sync_failures: AtomicU64,
+    dropped_records: AtomicU64,
+    records_outstanding: AtomicUsize,
+    queue_capacity: usize,
+    queue_depth: AtomicUsize,
+    queue_high_water: AtomicUsize,
+    last_writer_progress_ns: AtomicU64,
+}
+
+impl StorageProgress {
+    fn new(queue_capacity: usize) -> Self {
+        let queue_capacity = queue_capacity.max(1);
+        let _ = process_monotonic_ns();
+        Self {
+            records_enqueued: AtomicU64::new(0),
+            records_written: AtomicU64::new(0),
+            durable_sync_completions: AtomicU64::new(0),
+            write_failures: AtomicU64::new(0),
+            sync_failures: AtomicU64::new(0),
+            dropped_records: AtomicU64::new(0),
+            records_outstanding: AtomicUsize::new(0),
+            queue_capacity,
+            queue_depth: AtomicUsize::new(0),
+            queue_high_water: AtomicUsize::new(0),
+            last_writer_progress_ns: AtomicU64::new(0),
+        }
+    }
+
+    fn record_enqueued(&self) {
+        saturating_increment(&self.records_enqueued);
+        self.records_outstanding.fetch_add(1, Ordering::Relaxed);
+        let depth = self.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+        debug_assert!(depth <= self.queue_capacity);
+        self.queue_high_water.fetch_max(depth, Ordering::Relaxed);
+    }
+
+    fn record_received(&self) {
+        let previous = self.queue_depth.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0);
+    }
+
+    fn record_completed(&self) {
+        let previous = self.records_outstanding.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0);
+    }
+
+    fn record_dropped(&self) {
+        saturating_increment(&self.dropped_records);
+    }
+
+    fn record_written(&self) {
+        saturating_increment(&self.records_written);
+        self.record_writer_progress();
+    }
+
+    fn record_durable_sync_completion(&self) {
+        saturating_increment(&self.durable_sync_completions);
+        self.record_writer_progress();
+    }
+
+    fn record_write_failure(&self) {
+        saturating_increment(&self.write_failures);
+    }
+
+    fn record_sync_failure(&self) {
+        saturating_increment(&self.sync_failures);
+    }
+
+    fn record_writer_progress(&self) {
+        self.last_writer_progress_ns
+            .store(process_monotonic_ns(), Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> StorageProgressSnapshot {
+        let last_writer_progress_ns = self.last_writer_progress_ns.load(Ordering::Relaxed);
+        let last_writer_progress_age_ns = if last_writer_progress_ns == 0 {
+            0
+        } else {
+            process_monotonic_ns().saturating_sub(last_writer_progress_ns)
+        };
+        StorageProgressSnapshot {
+            records_enqueued: self.records_enqueued.load(Ordering::Relaxed),
+            records_written: self.records_written.load(Ordering::Relaxed),
+            durable_sync_completions: self.durable_sync_completions.load(Ordering::Relaxed),
+            write_failures: self.write_failures.load(Ordering::Relaxed),
+            sync_failures: self.sync_failures.load(Ordering::Relaxed),
+            dropped_records: self.dropped_records.load(Ordering::Relaxed),
+            records_outstanding: self.records_outstanding.load(Ordering::Relaxed),
+            queue_capacity: self.queue_capacity,
+            queue_depth: self.queue_depth.load(Ordering::Relaxed),
+            queue_high_water: self.queue_high_water.load(Ordering::Relaxed),
+            last_writer_progress_ns,
+            last_writer_progress_age_ns,
+        }
+    }
+}
+
+fn saturating_increment(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_add(1))
+    });
+}
+
+fn process_monotonic_ns() -> u64 {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    let elapsed = ORIGIN.get_or_init(Instant::now).elapsed().as_nanos();
+    elapsed.min(u64::MAX.saturating_sub(1) as u128) as u64 + 1
+}
+
 #[derive(Clone)]
 pub struct StorageSink {
     sender: mpsc::Sender<PendingRecord>,
-    dropped: Arc<AtomicU64>,
-    queued: Arc<AtomicUsize>,
+    progress: Arc<StorageProgress>,
 }
 
 struct PendingRecord {
@@ -362,43 +501,41 @@ impl StorageSink {
             durable_ack: None,
         };
         if pending.record.is_critical() {
-            self.queued.fetch_add(1, Ordering::Relaxed);
-            if self.sender.send(pending).await.is_err() {
-                self.queued.fetch_sub(1, Ordering::Relaxed);
-                return Err(StorageError::Closed);
-            }
+            let permit = self
+                .sender
+                .reserve()
+                .await
+                .map_err(|_| StorageError::Closed)?;
+            self.progress.record_enqueued();
+            permit.send(pending);
             return Ok(StorageWriteOutcome::Queued);
         }
-        self.queued.fetch_add(1, Ordering::Relaxed);
-        match self.sender.try_send(pending) {
-            Ok(()) => Ok(StorageWriteOutcome::Queued),
+        match self.sender.try_reserve() {
+            Ok(permit) => {
+                self.progress.record_enqueued();
+                permit.send(pending);
+                Ok(StorageWriteOutcome::Queued)
+            }
             Err(mpsc::error::TrySendError::Full(_)) => {
-                self.queued.fetch_sub(1, Ordering::Relaxed);
-                self.dropped.fetch_add(1, Ordering::Relaxed);
+                self.progress.record_dropped();
                 Ok(StorageWriteOutcome::DroppedBestEffort)
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.queued.fetch_sub(1, Ordering::Relaxed);
-                Err(StorageError::Closed)
-            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(StorageError::Closed),
         }
     }
 
     pub async fn record_durable(&self, record: StorageRecord) -> Result<(), StorageError> {
         let (durable_ack, ack) = oneshot::channel();
-        self.queued.fetch_add(1, Ordering::Relaxed);
-        if self
+        let permit = self
             .sender
-            .send(PendingRecord {
-                record,
-                durable_ack: Some(durable_ack),
-            })
+            .reserve()
             .await
-            .is_err()
-        {
-            self.queued.fetch_sub(1, Ordering::Relaxed);
-            return Err(StorageError::Closed);
-        }
+            .map_err(|_| StorageError::Closed)?;
+        self.progress.record_enqueued();
+        permit.send(PendingRecord {
+            record,
+            durable_ack: Some(durable_ack),
+        });
         match ack.await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(message)) => Err(StorageError::Durability(message)),
@@ -408,34 +545,35 @@ impl StorageSink {
 
     pub fn try_record(&self, record: StorageRecord) -> Result<StorageWriteOutcome, StorageError> {
         let critical = record.is_critical();
-        self.queued.fetch_add(1, Ordering::Relaxed);
-        match self.sender.try_send(PendingRecord {
-            record,
-            durable_ack: None,
-        }) {
-            Ok(()) => Ok(StorageWriteOutcome::Queued),
-            Err(mpsc::error::TrySendError::Full(_)) if critical => {
-                self.queued.fetch_sub(1, Ordering::Relaxed);
-                Err(StorageError::Backpressure)
+        match self.sender.try_reserve() {
+            Ok(permit) => {
+                self.progress.record_enqueued();
+                permit.send(PendingRecord {
+                    record,
+                    durable_ack: None,
+                });
+                Ok(StorageWriteOutcome::Queued)
             }
+            Err(mpsc::error::TrySendError::Full(_)) if critical => Err(StorageError::Backpressure),
             Err(mpsc::error::TrySendError::Full(_)) => {
-                self.queued.fetch_sub(1, Ordering::Relaxed);
-                self.dropped.fetch_add(1, Ordering::Relaxed);
+                self.progress.record_dropped();
                 Ok(StorageWriteOutcome::DroppedBestEffort)
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.queued.fetch_sub(1, Ordering::Relaxed);
-                Err(StorageError::Closed)
-            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(StorageError::Closed),
         }
     }
 
     pub fn dropped_records(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
+        self.progress.dropped_records.load(Ordering::Relaxed)
     }
 
     pub fn queue_depth(&self) -> usize {
-        self.queued.load(Ordering::Relaxed)
+        self.progress.records_outstanding.load(Ordering::Relaxed)
+    }
+
+    /// Returns a numeric, observation-only snapshot of storage writer progress.
+    pub fn progress_snapshot(&self) -> StorageProgressSnapshot {
+        self.progress.snapshot()
     }
 }
 
@@ -1078,19 +1216,18 @@ pub async fn start_jsonl_storage_with_lease(
     config.path = lease.journal_path.clone();
     let file = open_storage_file(&config).await?;
     let lease = Arc::new(lease);
-    let (sender, receiver) = mpsc::channel(config.channel_capacity.max(1));
+    let channel_capacity = config.channel_capacity.max(1);
+    let (sender, receiver) = mpsc::channel(channel_capacity);
     let (shutdown, shutdown_rx) = oneshot::channel();
-    let dropped = Arc::new(AtomicU64::new(0));
-    let queued = Arc::new(AtomicUsize::new(0));
+    let progress = Arc::new(StorageProgress::new(channel_capacity));
     let sink = StorageSink {
         sender,
-        dropped,
-        queued: Arc::clone(&queued),
+        progress: Arc::clone(&progress),
     };
     let writer_lease = Arc::clone(&lease);
     let task = tokio::spawn(async move {
         let _lease = writer_lease;
-        run_writer_with_file(config, file, receiver, shutdown_rx, queued).await
+        run_writer_with_file(config, file, receiver, shutdown_rx, progress).await
     });
     Ok(StorageRuntime {
         sink,
@@ -1119,7 +1256,7 @@ async fn run_writer_with_file(
     mut file: tokio::fs::File,
     mut receiver: mpsc::Receiver<PendingRecord>,
     mut shutdown: oneshot::Receiver<()>,
-    queued: Arc<AtomicUsize>,
+    progress: Arc<StorageProgress>,
 ) -> Result<(), StorageError> {
     let flush_every = config.flush_every_records.max(1);
     let mut since_flush = 0_usize;
@@ -1130,16 +1267,18 @@ async fn run_writer_with_file(
             _ = &mut shutdown => {
                 receiver.close();
                 while let Some(pending) = receiver.recv().await {
-                    let result = write_pending(&mut file, pending).await;
-                    queued.fetch_sub(1, Ordering::Relaxed);
+                    progress.record_received();
+                    let result = write_pending(&mut file, pending, &progress).await;
+                    progress.record_completed();
                     result?;
                 }
                 break;
             }
             pending = receiver.recv() => {
                 let Some(pending) = pending else { break; };
-                let result = write_pending(&mut file, pending).await;
-                queued.fetch_sub(1, Ordering::Relaxed);
+                progress.record_received();
+                let result = write_pending(&mut file, pending, &progress).await;
+                progress.record_completed();
                 let durable = result?;
                 if durable {
                     since_flush = 0;
@@ -1147,20 +1286,33 @@ async fn run_writer_with_file(
                     since_flush += 1;
                 }
                 if !durable && since_flush >= flush_every {
-                    file.flush().await?;
+                    if let Err(error) = file.flush().await {
+                        progress.record_sync_failure();
+                        return Err(error.into());
+                    }
+                    progress.record_writer_progress();
                     since_flush = 0;
                 }
             }
         }
     }
-    file.flush().await?;
-    file.sync_data().await?;
+    if let Err(error) = file.flush().await {
+        progress.record_sync_failure();
+        return Err(error.into());
+    }
+    progress.record_writer_progress();
+    if let Err(error) = file.sync_data().await {
+        progress.record_sync_failure();
+        return Err(error.into());
+    }
+    progress.record_writer_progress();
     Ok(())
 }
 
 async fn write_pending(
     file: &mut tokio::fs::File,
     pending: PendingRecord,
+    progress: &StorageProgress,
 ) -> Result<bool, StorageError> {
     let PendingRecord {
         record,
@@ -1168,10 +1320,22 @@ async fn write_pending(
     } = pending;
     let durable = durable_ack.is_some();
     let result = async {
-        write_record(file, record).await?;
+        if let Err(error) = write_record(file, record).await {
+            progress.record_write_failure();
+            return Err(error);
+        }
+        progress.record_written();
         if durable {
-            file.flush().await?;
-            file.sync_data().await?;
+            if let Err(error) = file.flush().await {
+                progress.record_sync_failure();
+                return Err(error.into());
+            }
+            progress.record_writer_progress();
+            if let Err(error) = file.sync_data().await {
+                progress.record_sync_failure();
+                return Err(error.into());
+            }
+            progress.record_durable_sync_completion();
         }
         Ok::<(), StorageError>(())
     }
@@ -1312,8 +1476,7 @@ mod tests {
         let (sender, _receiver) = mpsc::channel(1);
         let sink = StorageSink {
             sender,
-            dropped: Arc::new(AtomicU64::new(0)),
-            queued: Arc::new(AtomicUsize::new(0)),
+            progress: Arc::new(StorageProgress::new(1)),
         };
         assert_eq!(
             sink.record(raw()).await.unwrap(),
@@ -1331,8 +1494,7 @@ mod tests {
         let (sender, _receiver) = mpsc::channel(1);
         let sink = StorageSink {
             sender,
-            dropped: Arc::new(AtomicU64::new(0)),
-            queued: Arc::new(AtomicUsize::new(0)),
+            progress: Arc::new(StorageProgress::new(1)),
         };
         sink.try_record(StorageRecord::Intent {
             ts_ms: 1,
@@ -1741,6 +1903,216 @@ mod tests {
         assert!(text.contains("safety_latch"));
         assert!(text.contains("request-1"));
         runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn storage_progress_counts_enqueue_write_and_durable_sync() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let runtime = start_jsonl_storage(StorageConfig {
+            path,
+            channel_capacity: 2,
+            flush_every_records: 1_000,
+        })
+        .await
+        .unwrap();
+        let sink = runtime.sink();
+
+        let initial = sink.progress_snapshot();
+        assert_eq!(initial.queue_capacity, 2);
+        assert_eq!(initial.queue_depth, 0);
+        assert_eq!(initial.queue_high_water, 0);
+        assert_eq!(initial.records_enqueued, 0);
+        assert_eq!(initial.records_written, 0);
+        assert_eq!(initial.durable_sync_completions, 0);
+        assert_eq!(initial.write_failures, 0);
+        assert_eq!(initial.sync_failures, 0);
+        assert_eq!(initial.records_outstanding, 0);
+        assert_eq!(initial.last_writer_progress_ns, 0);
+        assert_eq!(initial.last_writer_progress_age_ns, 0);
+
+        sink.record_durable(StorageRecord::SafetyLatch(SafetyLatchRecord {
+            ts_ms: 1,
+            scope: SafetyLatchScope::Global,
+            active: true,
+            source: SafetyLatchSource::Operator,
+            request_id: Some("progress-test".to_string()),
+            reason: "operator".to_string(),
+        }))
+        .await
+        .unwrap();
+
+        let progress = sink.progress_snapshot();
+        assert_eq!(progress.queue_capacity, 2);
+        assert_eq!(progress.queue_depth, 0);
+        assert_eq!(progress.queue_high_water, 1);
+        assert_eq!(progress.records_enqueued, 1);
+        assert_eq!(progress.records_written, 1);
+        assert_eq!(progress.durable_sync_completions, 1);
+        assert_eq!(progress.write_failures, 0);
+        assert_eq!(progress.sync_failures, 0);
+        assert_eq!(progress.records_outstanding, 0);
+        assert!(progress.last_writer_progress_ns > 0);
+        assert!(progress.last_writer_progress_age_ns < 1_000_000_000);
+
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn storage_progress_keeps_queue_and_drop_accounting_bounded() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let progress = Arc::new(StorageProgress::new(1));
+        let sink = StorageSink { sender, progress };
+
+        assert_eq!(
+            sink.record(raw()).await.unwrap(),
+            StorageWriteOutcome::Queued
+        );
+        assert_eq!(
+            sink.record(raw()).await.unwrap(),
+            StorageWriteOutcome::DroppedBestEffort
+        );
+
+        let snapshot = sink.progress_snapshot();
+        assert_eq!(snapshot.queue_capacity, 1);
+        assert_eq!(snapshot.queue_depth, 1);
+        assert_eq!(snapshot.queue_high_water, 1);
+        assert_eq!(snapshot.records_enqueued, 1);
+        assert_eq!(snapshot.dropped_records, 1);
+        assert_eq!(snapshot.records_outstanding, 1);
+        assert_eq!(snapshot.records_written, 0);
+        assert_eq!(sink.queue_depth(), 1);
+    }
+
+    #[tokio::test]
+    async fn storage_progress_separates_channel_depth_from_outstanding_writes() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let progress = Arc::new(StorageProgress::new(1));
+        let sink = StorageSink {
+            sender,
+            progress: Arc::clone(&progress),
+        };
+
+        sink.record(raw()).await.unwrap();
+        let first = receiver.recv().await.unwrap();
+        progress.record_received();
+        sink.record(raw()).await.unwrap();
+
+        let snapshot = sink.progress_snapshot();
+        assert_eq!(snapshot.queue_capacity, 1);
+        assert_eq!(snapshot.queue_depth, 1);
+        assert_eq!(snapshot.queue_high_water, 1);
+        assert_eq!(snapshot.records_outstanding, 2);
+        assert_eq!(sink.queue_depth(), 2);
+
+        drop(first);
+        progress.record_completed();
+        let second = receiver.recv().await.unwrap();
+        progress.record_received();
+        drop(second);
+        progress.record_completed();
+        assert_eq!(sink.queue_depth(), 0);
+        assert_eq!(sink.progress_snapshot().queue_depth, 0);
+    }
+
+    #[test]
+    fn storage_progress_updates_are_atomic_numeric_only() {
+        let source = include_str!("lib.rs");
+        let progress_source = source
+            .split_once("struct StorageProgress {")
+            .unwrap()
+            .1
+            .split_once("#[derive(Clone)]\npub struct StorageSink")
+            .unwrap()
+            .0;
+
+        for forbidden in [
+            "Mutex",
+            "RwLock",
+            "String",
+            "Vec<",
+            "HashMap",
+            "Box<",
+            "format!",
+            ".to_string(",
+            "serde_json",
+        ] {
+            assert!(
+                !progress_source.contains(forbidden),
+                "storage progress path must not contain {forbidden}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_progress_records_write_failure_without_claiming_failed_record_completion() {
+        let directory = tempfile::tempdir().unwrap();
+        let read_only = std::fs::File::open(directory.path()).unwrap();
+        let mut file = tokio::fs::File::from_std(read_only);
+        let progress = StorageProgress::new(1);
+
+        assert!(
+            !write_pending(
+                &mut file,
+                PendingRecord {
+                    record: raw(),
+                    durable_ack: None,
+                },
+                &progress,
+            )
+            .await
+            .unwrap()
+        );
+        let error = write_pending(
+            &mut file,
+            PendingRecord {
+                record: raw(),
+                durable_ack: None,
+            },
+            &progress,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, StorageError::Io(_)));
+        let snapshot = progress.snapshot();
+        assert_eq!(snapshot.records_written, 1);
+        assert_eq!(snapshot.durable_sync_completions, 0);
+        assert_eq!(snapshot.write_failures, 1);
+        assert_eq!(snapshot.sync_failures, 0);
+        assert!(snapshot.last_writer_progress_ns > 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn storage_progress_records_sync_failure_after_successful_write() {
+        let write_only = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let mut file = tokio::fs::File::from_std(write_only);
+        let progress = StorageProgress::new(1);
+        let (durable_ack, ack) = oneshot::channel();
+
+        let error = write_pending(
+            &mut file,
+            PendingRecord {
+                record: raw(),
+                durable_ack: Some(durable_ack),
+            },
+            &progress,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, StorageError::Io(_)));
+        assert!(ack.await.unwrap().is_err());
+        let snapshot = progress.snapshot();
+        assert_eq!(snapshot.records_written, 1);
+        assert_eq!(snapshot.durable_sync_completions, 0);
+        assert_eq!(snapshot.write_failures, 0);
+        assert_eq!(snapshot.sync_failures, 1);
+        assert!(snapshot.last_writer_progress_ns > 0);
     }
 
     #[tokio::test]
