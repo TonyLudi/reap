@@ -3,8 +3,8 @@
 Status: in progress overall. Phase 0 is green at
 `8d6581270b82f39293ccdb0cbeaead42d717e81c`; Phase 1 is green at
 `eb71bc1b84cef6152dc010922641e9d5bb019e43`; Phase 2 is green at
-`7014a611f997e0bec8e86051d56f333d57776fc1`; Phase 3 is green in the current
-working tree and awaits its gate commit. This ledger is architecture and
+`7014a611f997e0bec8e86051d56f333d57776fc1`; Phase 3 is green at
+`dd54297aaa35600171904524a7b43adc3948a724`. This ledger is architecture and
 deterministic local evidence, not authenticated-connectivity evidence or
 trading authorization.
 
@@ -39,7 +39,7 @@ deployed PM binary, target-host qualification, or production trading approval.
 | 0. Baseline, product contract, dependency and measurement plan | Green | `8d6581270b82f39293ccdb0cbeaead42d717e81c` |
 | 1. Exact PM domain and venue-aware envelopes | Green | `eb71bc1b84cef6152dc010922641e9d5bb019e43` |
 | 2. Capability-specific venue framework seams | Green | `7014a611f997e0bec8e86051d56f333d57776fc1` |
-| 3. PM public market data, integrity, capture, replay | Green (working tree) | Commit pending |
+| 3. PM public market data, integrity, capture, replay | Green | `dd54297aaa35600171904524a7b43adc3948a724` |
 | 4. Read-only private lifecycle and position monitor | Pending | — |
 | 5. Passive quote lifecycle and fake execution | Pending | — |
 | 6. PM coordinator, quote-model seam, local evidence | Pending | — |
@@ -1064,12 +1064,12 @@ the Phase 0 fixture hash comparison passed. `../imm-strategy` remains clean at
 modified dashboard and untracked `.predarb/`. No sibling file or untracked
 runtime byte was read or changed.
 
-The independent final diff audit found no remaining blocker. Phase 1 is ready
-for its gate commit.
+The independent final diff audit found no remaining blocker. The Phase 1 gate
+is recorded at `eb71bc1b84cef6152dc010922641e9d5bb019e43`.
 
 ## Phase 2: Capability-Specific Venue Framework Seams
 
-Phase 2 is green in the working tree and awaits its gate commit. It adds
+Phase 2 is green at `7014a611f997e0bec8e86051d56f333d57776fc1`. It adds
 capability-specific framework seams and compatibility-preserving mechanical
 extractions only. It does not add a Polymarket wire client, authenticated
 session, signer, credential, live order method, production quote model, or
@@ -1508,8 +1508,8 @@ runtime byte was read or changed.
 
 ## Phase 3: Public Capture And Deterministic Replay
 
-The Phase 3 capture/replay implementation is green in the current working tree
-and awaits its gate commit. The complete all-target test gate, 27-case
+The Phase 3 capture/replay implementation is green at
+`dd54297aaa35600171904524a7b43adc3948a724`. The complete all-target test gate, 27-case
 compile-fail boundary, clippy, check, formatting, source inventory, and
 independent authority/obligation audit are recorded below. This is still
 deterministic local and fake/loopback evidence only; it adds no authenticated
