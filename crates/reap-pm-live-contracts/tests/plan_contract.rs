@@ -15,6 +15,10 @@ use reap_pm_live_contracts::{
 };
 use reap_pm_strategy::PmModelInputRequirements;
 
+const GOAL_F_PUSD: &str = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
+const GOAL_F_CTF: &str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
+const GOAL_F_STANDARD_EXCHANGE: &str = "0xE111180000d2663C0091e4f400237545B87B996B";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProductPlanRow {
     requirement: PmPlanRequirementId,
@@ -64,24 +68,25 @@ fn reference_mapping() -> PmReferenceMapping {
 }
 
 fn required_spenders(account: PmAccountScope) -> Vec<PmSpenderId> {
+    let exchange = EvmAddress::parse(GOAL_F_STANDARD_EXCHANGE).unwrap();
     vec![
         PmSpenderId::new(
             account.handle(),
             PmSpenderRequirement::new(
                 PmChainId::new(137).unwrap(),
-                EvmAddress::from_bytes([2; 20]).unwrap(),
+                exchange,
                 PmSpenderDomain::Standard,
-                PmAssetId::collateral(EvmAddress::from_bytes([1; 20]).unwrap()),
+                PmAssetId::collateral(EvmAddress::parse(GOAL_F_PUSD).unwrap()),
             ),
         ),
         PmSpenderId::new(
             account.handle(),
             PmSpenderRequirement::new(
                 PmChainId::new(137).unwrap(),
-                EvmAddress::from_bytes([2; 20]).unwrap(),
+                exchange,
                 PmSpenderDomain::Standard,
                 PmAssetId::outcome(
-                    EvmAddress::from_bytes([5; 20]).unwrap(),
+                    EvmAddress::parse(GOAL_F_CTF).unwrap(),
                     PmTokenId::new(U256::from_u64(11)).unwrap(),
                 ),
             ),
@@ -90,6 +95,21 @@ fn required_spenders(account: PmAccountScope) -> Vec<PmSpenderId> {
 }
 
 fn expected_metadata() -> PmMarketMetadata {
+    expected_metadata_for_market(
+        PmMarketId::parse("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .unwrap(),
+    )
+}
+
+fn expected_metadata_for_market(market: PmMarketId) -> PmMarketMetadata {
+    expected_metadata_contract(market, "0.01", "1")
+}
+
+fn expected_metadata_contract(
+    market: PmMarketId,
+    tick: &str,
+    minimum_order_size: &str,
+) -> PmMarketMetadata {
     let spenders = required_spenders(account_scope());
     let mut required = [None; MAX_REQUIRED_SPENDERS];
     for (slot, spender) in required.iter_mut().zip(&spenders) {
@@ -98,18 +118,17 @@ fn expected_metadata() -> PmMarketMetadata {
     PmMarketMetadata::new(
         PmConditionId::parse("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
             .unwrap(),
-        PmMarketId::parse("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
-            .unwrap(),
+        market,
         PmOutcomeMetadata::new(
             PmTokenId::new(U256::from_u64(11)).unwrap(),
             PmOutcomeLabel::new("Yes").unwrap(),
         ),
         PmMarketLifecycle::new(true, false, false, true, true),
-        PmTick::parse_decimal("0.01").unwrap(),
-        PmQuantity::parse_decimal("1").unwrap(),
+        PmTick::parse_decimal(tick).unwrap(),
+        PmQuantity::parse_decimal(minimum_order_size).unwrap(),
         false,
         PmChainId::new(137).unwrap(),
-        EvmAddress::from_bytes([2; 20]).unwrap(),
+        EvmAddress::parse(GOAL_F_STANDARD_EXCHANGE).unwrap(),
         required,
         spenders.len() as u8,
     )
@@ -138,14 +157,13 @@ fn fixture() -> (
         ),
     )
     .unwrap();
-    let account = PmAccountConnectivityConfig::new(
-        instrument(),
+    let account = PmAccountConnectivityConfig::derive_goal_f(
+        &public,
         account,
         route(
             PmProductSource::polymarket_account(PmSourceHandle::from_ordinal(3), account.handle()),
             "pm-account",
         ),
-        required_spenders(account),
     )
     .unwrap();
     (
@@ -170,16 +188,22 @@ fn self_attested_bindings_for_negative_validation(
     ));
     bindings.extend(ConstructedRoleBinding::private_lifecycle(
         account.account_scope(),
+        account.instrument(),
+        account.instrument_id(),
         account.account_route(),
     ));
     bindings.extend(ConstructedRoleBinding::reconciliation(
         account.account_scope(),
+        account.instrument(),
+        account.instrument_id(),
         account.account_route(),
     ));
     bindings.extend(
         ConstructedRoleBinding::account_snapshot(
             account.account_scope(),
             account.instrument(),
+            account.instrument_id(),
+            account.collateral_asset(),
             account.required_spenders(),
             account.account_route(),
         )
@@ -188,6 +212,7 @@ fn self_attested_bindings_for_negative_validation(
     bindings.extend(ConstructedRoleBinding::owned_execution(
         account.account_scope(),
         account.instrument(),
+        account.instrument_id(),
     ));
     bindings.push(ConstructedRoleBinding::quote_schedule(public.instrument()));
     bindings
@@ -310,6 +335,7 @@ fn product_plan_matches_the_independent_full_entry_table() {
     let account_instrument = PmRequirementScope::AccountInstrument {
         account,
         instrument,
+        instrument_id: config.account().instrument_id(),
     };
 
     let expected = [
@@ -365,7 +391,7 @@ fn product_plan_matches_the_independent_full_entry_table() {
         },
         ProductPlanRow {
             requirement: PmPlanRequirementId::Connectivity(PrivateOrder),
-            scope: PmRequirementScope::Account(account),
+            scope: account_instrument,
             origin: MandatorySafetyAndReadiness,
             consumer: CanonicalOrderState,
             owner: ConnectivityRole(PmPrivateLifecycle),
@@ -375,7 +401,7 @@ fn product_plan_matches_the_independent_full_entry_table() {
         },
         ProductPlanRow {
             requirement: PmPlanRequirementId::Connectivity(PrivateFill),
-            scope: PmRequirementScope::Account(account),
+            scope: account_instrument,
             origin: MandatorySafetyAndReadiness,
             consumer: FillAndPositionState,
             owner: ConnectivityRole(PmPrivateLifecycle),
@@ -385,7 +411,7 @@ fn product_plan_matches_the_independent_full_entry_table() {
         },
         ProductPlanRow {
             requirement: PmPlanRequirementId::Connectivity(ReconcileOpenOrders),
-            scope: PmRequirementScope::Account(account),
+            scope: account_instrument,
             origin: MandatorySafetyAndReadiness,
             consumer: OrderReconciliation,
             owner: ConnectivityRole(PmOrderReconciliation),
@@ -395,7 +421,7 @@ fn product_plan_matches_the_independent_full_entry_table() {
         },
         ProductPlanRow {
             requirement: PmPlanRequirementId::Connectivity(ReconcileOrder),
-            scope: PmRequirementScope::Account(account),
+            scope: account_instrument,
             origin: MandatorySafetyAndReadiness,
             consumer: OrderReconciliation,
             owner: ConnectivityRole(PmOrderReconciliation),
@@ -405,7 +431,7 @@ fn product_plan_matches_the_independent_full_entry_table() {
         },
         ProductPlanRow {
             requirement: PmPlanRequirementId::Connectivity(ReconcileFills),
-            scope: PmRequirementScope::Account(account),
+            scope: account_instrument,
             origin: MandatorySafetyAndReadiness,
             consumer: OrderReconciliation,
             owner: ConnectivityRole(PmOrderReconciliation),
@@ -415,7 +441,10 @@ fn product_plan_matches_the_independent_full_entry_table() {
         },
         ProductPlanRow {
             requirement: PmPlanRequirementId::Connectivity(AccountCollateral),
-            scope: PmRequirementScope::Account(account),
+            scope: PmRequirementScope::AccountAsset {
+                account,
+                asset: config.account().collateral_asset(),
+            },
             origin: MandatorySafetyAndReadiness,
             consumer: PositionReadiness,
             owner: ConnectivityRole(PmAccountPositionSnapshot),
@@ -563,6 +592,8 @@ fn binding_validator_rejects_missing_duplicate_and_wrong_route() {
         ConstructedRoleBinding::account_snapshot(
             account.account_scope(),
             account.instrument(),
+            account.instrument_id(),
+            account.collateral_asset(),
             &too_many_spenders,
             account.account_route(),
         ),
@@ -744,8 +775,8 @@ fn fixed_account_profile_rejects_wrong_chain_and_split_signer_funder() {
     let other = EvmAddress::from_bytes([5; 20]).unwrap();
 
     assert_eq!(
-        PmAccountConnectivityConfig::new(
-            account.instrument(),
+        PmAccountConnectivityConfig::derive_goal_f(
+            config.public(),
             account.account_scope(),
             route(
                 PmProductSource::polymarket_account(
@@ -754,7 +785,6 @@ fn fixed_account_profile_rejects_wrong_chain_and_split_signer_funder() {
                 ),
                 "wrong-pm-account",
             ),
-            account.required_spenders().to_vec(),
         ),
         Err(PmConnectivityConfigError::AccountRouteMismatch)
     );
@@ -767,11 +797,10 @@ fn fixed_account_profile_rejects_wrong_chain_and_split_signer_funder() {
         account.account(),
     );
     assert_eq!(
-        PmAccountConnectivityConfig::new(
-            account.instrument(),
+        PmAccountConnectivityConfig::derive_goal_f(
+            config.public(),
             wrong_chain,
             account.account_route(),
-            account.required_spenders().to_vec(),
         ),
         Err(PmConnectivityConfigError::WrongGoalFChain)
     );
@@ -784,12 +813,58 @@ fn fixed_account_profile_rejects_wrong_chain_and_split_signer_funder() {
         account.account(),
     );
     assert_eq!(
-        PmAccountConnectivityConfig::new(
-            account.instrument(),
-            split,
-            account.account_route(),
-            account.required_spenders().to_vec(),
-        ),
+        PmAccountConnectivityConfig::derive_goal_f(config.public(), split, account.account_route(),),
         Err(PmConnectivityConfigError::SignerFunderMismatch)
+    );
+}
+
+#[test]
+fn combined_scope_rejects_a_structurally_different_market_with_the_same_compact_handle() {
+    let (config, _, _) = fixture();
+    let public = config.public().clone();
+    let account = config.account();
+    let different_market = PmMarketId::from_bytes([91; 32]).unwrap();
+    let other_public = PmPublicConnectivityConfig::derive_goal_f(
+        reference_instrument(),
+        expected_metadata_for_market(different_market),
+        public.okx_route(),
+        public.polymarket_route(),
+    )
+    .unwrap();
+    let other_account = PmAccountConnectivityConfig::derive_goal_f(
+        &other_public,
+        account.account_scope(),
+        account.account_route(),
+    )
+    .unwrap();
+    assert_eq!(
+        PmConnectivityConfig::new(public.clone(), other_account),
+        Err(PmConnectivityConfigError::InstrumentScopeMismatch)
+    );
+    assert_eq!(public.instrument(), account.instrument());
+}
+
+#[test]
+fn combined_scope_rejects_private_grid_drift_for_the_same_structural_instrument() {
+    let (config, _, _) = fixture();
+    let public = config.public().clone();
+    let account = config.account();
+    let other_public = PmPublicConnectivityConfig::derive_goal_f(
+        reference_instrument(),
+        expected_metadata_contract(public.expected_metadata().market(), "0.005", "1"),
+        public.okx_route(),
+        public.polymarket_route(),
+    )
+    .unwrap();
+    let other_account = PmAccountConnectivityConfig::derive_goal_f(
+        &other_public,
+        account.account_scope(),
+        account.account_route(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        PmConnectivityConfig::new(public, other_account),
+        Err(PmConnectivityConfigError::AccountInstrumentScopeMismatch)
     );
 }

@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 mod support;
 
 use futures_util::{SinkExt, StreamExt};

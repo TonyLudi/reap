@@ -1,4 +1,4 @@
-use reap_pm_core::{PmAccountScope, PmInstrumentHandle};
+use reap_pm_core::{PmAccountScope, PmInstrumentHandle, PmInstrumentId};
 use reap_pm_live_contracts::ConstructedRoleBinding;
 use reap_polymarket_adapter::PmFixtureOwnedExecution;
 
@@ -6,12 +6,18 @@ use reap_polymarket_adapter::PmFixtureOwnedExecution;
 #[derive(Debug)]
 pub(crate) struct PmFakeEffectRole {
     execution: PmFixtureOwnedExecution,
+    instrument_id: PmInstrumentId,
 }
 
 impl PmFakeEffectRole {
-    pub(crate) const fn new(account_scope: PmAccountScope, instrument: PmInstrumentHandle) -> Self {
+    pub(crate) const fn new(
+        account_scope: PmAccountScope,
+        instrument: PmInstrumentHandle,
+        instrument_id: PmInstrumentId,
+    ) -> Self {
         Self {
             execution: PmFixtureOwnedExecution::new(account_scope, instrument),
+            instrument_id,
         }
     }
 
@@ -19,6 +25,7 @@ impl PmFakeEffectRole {
         ConstructedRoleBinding::owned_execution(
             self.execution.account_scope(),
             self.execution.instrument(),
+            self.instrument_id,
         )
     }
 

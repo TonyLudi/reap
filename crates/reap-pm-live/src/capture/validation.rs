@@ -97,7 +97,7 @@ pub(super) fn validate_scope(scope: &PmCaptureScope) -> Result<(), PmCaptureVeri
     }
     PmPrice::from_units(scope.tick.units())
         .map_err(|_| PmCaptureVerifyError::InvalidHeader("tick is outside (0,1)"))?;
-    scope.authoritative_metadata()?;
+    scope.recorded_metadata()?;
     scope.observation_grant()?;
     Ok(())
 }

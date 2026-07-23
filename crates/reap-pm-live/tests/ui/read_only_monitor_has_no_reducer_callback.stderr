@@ -1,0 +1,5 @@
+error[E0599]: no method named `reduce_private_delivery` found for mutable reference `&mut PmReadOnlyMonitor` in the current scope
+ --> tests/ui/read_only_monitor_has_no_reducer_callback.rs:4:10
+  |
+4 |     root.reduce_private_delivery(|_, _| ());
+  |          ^^^^^^^^^^^^^^^^^^^^^^^ method not found in `&mut PmReadOnlyMonitor`

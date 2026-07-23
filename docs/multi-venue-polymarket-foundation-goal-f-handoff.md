@@ -45,6 +45,18 @@ deployed PM binary, target-host qualification, or production trading approval.
 | 6. PM coordinator, quote-model seam, local evidence | Pending | — |
 | 7. Documentation, global verification, final audit | Pending | — |
 
+## Phase 4 Private-Lifecycle Protocol And Fixture Provenance
+
+The selected official user-channel lifecycle evidence is Polymarket's
+[User Channel documentation](https://docs.polymarket.com/market-data/websocket/user-channel),
+retrieved 2026-07-23: order events use `PLACEMENT`, `UPDATE`, and
+`CANCELLATION`; trade events use `MATCHED`, `MINED`, `CONFIRMED`, `RETRYING`,
+and `FAILED`. The pinned `../predarb` reference remains commit
+`8222273a9c72033b760e1d2fec813bc77144556d`. New adversarial Phase 4 fixtures
+are independently authored unless they are explicitly identified as exact
+tracked bytes from that pinned object; resemblance to its response shapes does
+not make them pinned-reference fixtures.
+
 ## Phase 3 Public-Wire Boundary Clarification
 
 The configured one-token Polymarket market WebSocket is multiplexed. A raw
@@ -1926,13 +1938,12 @@ file. Before any production growth, its role/session, route, reducer, and
 outcome responsibilities must be split into narrower modules while preserving
 the private authority boundary.
 
-### Required Phase 4 and Phase 6 continuation
+### Required Phase 5 and Phase 6 continuation
 
-Phase 4 remains a read-only PM private lifecycle and position monitor. It must
-retain complete account/funder scope, bounded reconciliation shapes, fixture
-or fake-only connectivity, and no order mutation. Its typed producers may not
-leak an unqueued capability or be attached to ad hoc containers that bypass
-the frozen lane policy.
+Phase 5 must add only the take-once passive quote/cancel lifecycle, the first
+explicit PM journal schema, durable-storage-before-effect evidence, and the
+in-process fake dispatcher. It must reuse the Phase 4 canonical private state
+instead of constructing a second account/order owner.
 
 Phase 6 must introduce the complete scheduler atomically with the remaining
 typed private/account/position/reconciliation/model/timer/scheduled-action
@@ -1940,6 +1951,224 @@ producers. It must enact the prospective 11-row lane policy and seven-rank
 priority as one coherent Run-owned design, preserve non-expiring safety
 notifications and exact partial-progress semantics, and prove that all
 mandatory callbacks make a total deterministic transition in the sealed
-coordinator. Phase 3 proves authenticated ordering and exact occurrence
-transfer; it deliberately does not claim the later strategy-state consumption
-proof, model behavior, fake quote lifecycle, or production authorization.
+coordinator. Phases 3 and 4 prove public and private occurrence transfer and
+canonical read-only convergence; they deliberately do not claim the later
+model behavior, fake quote lifecycle, or production authorization.
+
+## Phase 4: Read-Only Private Lifecycle And Position Monitor
+
+Status: implementation candidate green. The exact gate commit and final
+inventory hashes are recorded by the immediate follow-up ledger commit after
+the Phase 4 code-and-documentation commit.
+
+### Exact private and reconciliation carriers
+
+`reap-pm-core::reconciliation` adds exact complete-snapshot carriers. A
+request boundary contains distinct nonzero request and completion sequences
+and proves completion is causally later. Complete open-order rows require
+venue identity; exact order detail represents authoritative absence with
+`None`; a full-account fill query has an opaque cursor and terminal whole-query
+watermark; and one account snapshot carries collateral, every required
+allowance, outcome-token balance, and position under one exact revision and
+scope.
+
+Individual rows cannot assert completeness. Core constructors validate source,
+account, instrument, revision, expected scope, duplicates, and bounds before
+constructing a complete aggregate. Production monitor ingress additionally
+requires the terminal adapter delivery issued by the exact owner-bound role.
+The fixed bounds are 1,024 open orders, 8,192 exact fill legs, eight configured
+assets/spenders/instruments, eight additional diagnostic rows per account
+family, and 128 pages per query.
+
+### Exact lifecycle and linkage
+
+`PmFillKey` is structurally `(PmVenueOrderKey, PmFillId)`, and every
+`PmFillEvent` contains the same venue-order leg. It has no unversioned Serde
+representation. Unknown order status, event kind, trade role, settlement
+status, side, grid, minimum, lot, account, token, or linkage is rejected rather
+than defaulted.
+
+TAKER observations select the exact local taker/direct order reference even
+when maker counterparty references coexist. MAKER observations produce one
+fact per maker leg. A canonical configured `maker_address` and exact local
+order proof create a linked fill; a missing address or an external address
+creates a typed unresolved observation. Roleless, ambiguous, and unlinked
+facts remain in bounded quarantine.
+
+The accepted settlement graph is exact:
+
+```text
+MATCHED -> MINED -> CONFIRMED
+MATCHED | MINED -> RETRYING
+RETRYING -> MINED | FAILED
+```
+
+A same-state observation is idempotent. `CONFIRMED` and `FAILED` are terminal;
+an invalid regression neither rolls back nor reapplies principal.
+
+### Fixture read authority
+
+One move-only `PmFixtureReadOwnerGrant` splits exactly once into private
+lifecycle, reconciliation, and account/position grants with one opaque process
+owner. The instrument scope is derived from complete metadata and the exact
+Goal F trading domain. Deliveries are move-only, owner-bound,
+receive-then-service values; only the issuing role can open them.
+
+Role requests advance lexicographically by connection epoch and local ingress.
+Terminal completion must match the request epoch, snapshot, causal boundary,
+account, source, connection, and instrument. Wire parsing denies unknown
+fields, bounds a private frame to 1 MiB and 64 top-level observations/maker
+legs, and bounds normalized expansion to 4,096 observations. Legacy scalar
+allowance evidence remains unscoped and grants no authority.
+
+### Canonical private state and convergence
+
+`PmPrivateState` owns by value the exact account, order, fill, unresolved-fill,
+refresh, risk, epoch, and readiness state. It depends only on
+`reap-pm-core` and `thiserror`; it contains no IO, async runtime, Serde,
+adapter, network, shared mutable state, or dynamic dispatch. Its canonical
+collections are preallocated and never evict: 1,024 orders, 8,192 fills, 8,192
+unresolved fills, and 128 refresh obligations.
+
+Private occurrence ordering is `(ConnectionEpoch, IngressSequence)`. A
+reconnect advances both the fixture role and state transactionally, makes old
+order freshness unavailable, and rejects old-epoch input. Read-only account or
+reconciliation input cannot create or advance private epoch evidence.
+Rejected normalization, service, scope, or contract ingress latches a typed
+fail-closed reason and increments fixed-cardinality counters. If a multi-fact
+private frame fails after a valid prefix, its typed error exposes the exact
+partial progress; no applied fact is hidden behind an all-or-error result.
+
+Absence means zero only inside an explicit complete exact snapshot. Extra
+diagnostic rows grant no authority. Every metadata-required spender is checked
+independently after canonical address normalization. Open-snapshot absence
+retains an existing reservation; only a proven terminal transition or exact
+detail absence releases it.
+
+Unknown or unmanaged live orders are retained and never claimed as owned.
+Exact sell remaining quantity reserves token inventory; an unprovable buy
+requirement blocks readiness. Client-only and venue-only observations that are
+later bridged by one exact event coalesce into one canonical order and one
+reservation. Complete open-order replacement is staged atomically.
+
+Fill principal applies once. Unknown/incomplete-to-known fee enrichment applies
+only the fee delta. A known collateral fee changes collateral; a known
+outcome-token fee changes only that token. A wrong asset, unknown fee,
+retrying/failed settlement, or unresolved fill keeps the affected state
+unready. One atomic account-plus-fill reconciliation cut covers only facts at
+or before its request boundary, preserves later websocket facts, requires the
+same source and connection, and never infers convergence from numeric equality
+alone. Resolved/unredeemed inventory and disagreeing balance/position evidence
+remain explicitly unavailable.
+
+### Risk, readiness, and refresh
+
+The PM risk gate uses exact quantity, collateral, and token units. It checks
+order size, both candidate resources, market/account exposure, current
+reservations, live-order and unresolved cardinality, freshness, and
+market/account/global halt state before approval. It never substitutes zero
+for unavailable inventory. Deterministic cancel-owned projections contain only
+proven owned venue-order identities in canonical order.
+
+Readiness exposes typed account, allowance, reservation, position, fee,
+settlement, convergence, freshness, capacity, and ingress-fault reasons.
+Refresh tickets are opaque, owner-bound, deduplicated, superseding, and
+bounded; their immutable projection exposes exact typed keys/reasons.
+Saturation retains a coarse full-reconciliation requirement and fails closed.
+
+### Read-only composition boundary
+
+`PmReadOnlyMonitor` owns one connectivity plan, the exact three fixture roles,
+and one `PmPrivateState` by value. Public methods accept only owner-issued
+fixture bytes or typed bounded rows and return immutable results/projections.
+There is no role/state accessor, reducer callback, raw core aggregate injection,
+wire DTO, model, journal, scheduler, signer, authenticated client, or order
+mutation path. `PmRecordedMetadataEvidence` remains offline-only; only a
+non-clone live metadata join can start a public capture session.
+
+Phase 4 intentionally adds no runtime private queue or alternate scheduler.
+Phase 6 remains responsible for materializing all eleven lane-policy rows and
+the seven-rank owner loop together.
+
+### Phase 4 evidence and limitations
+
+Focused suites cover strict private wire fixtures; owner-bound adapter role
+separation; bounded and transactional account/open-order/fill pagination;
+maker/taker/multi-leg linkage; incomplete and explicit-absence snapshots;
+allowance kinds and exact spender scope; reconnect and occurrence ordering;
+order identity bridging; state capacities; fee/settlement progression;
+unresolved quarantine; cut-safe reconciliation; exact two-resource risk;
+refresh ownership; read-only monitor composition; and compile-fail authority
+boundaries. The final gate commands and exact counts are recorded with the
+Phase 4 gate commit.
+
+The Phase 4 candidate gate ran:
+
+```text
+cargo test -p reap-pm-core --all-targets --locked
+cargo clippy -p reap-pm-core --all-targets --locked -- -D warnings
+cargo test -p reap-polymarket-wire --all-targets --locked
+cargo clippy -p reap-polymarket-wire --all-targets --locked -- -D warnings
+cargo test -p reap-polymarket-adapter --all-targets --locked
+cargo clippy -p reap-polymarket-adapter --all-targets --locked -- -D warnings
+cargo test -p reap-pm-state --all-targets --locked
+cargo clippy -p reap-pm-state --all-targets --locked -- -D warnings
+cargo test -p reap-pm-live-contracts --all-targets --locked
+cargo clippy -p reap-pm-live-contracts --all-targets --locked -- -D warnings
+cargo test -p reap-pm-strategy --all-targets --locked
+cargo clippy -p reap-pm-strategy --all-targets --locked -- -D warnings
+cargo test -p reap-pm-live --all-targets --locked
+cargo clippy -p reap-pm-live --all-targets --locked -- -D warnings
+cargo fmt --all -- --check
+git diff --check
+```
+
+All commands passed. State ran 17 unit, 18 book, 30 private, and two
+source-policy tests. The live crate ran 11 unit tests and 83 integration tests,
+plus 33 UI rejection cases under its compile-fail harness. The adapter ran 50
+integration/unit tests plus seven UI rejection cases. Core and wire retained
+their exact numeric, carrier, dependency, fixture, integrity, and parser
+suites.
+
+The full live all-target run exposed one replay-only authority regression that
+the focused monitor suite could not: an offline recorded-metadata session used
+the live subscription transition. Replay now consumes the dedicated recorded
+transition, while live construction still rejects recorded metadata. The
+adversarial monitor review also closed transactional reconnect, pre-service
+sequence consumption, unmetered ingress failures, and hidden private-batch
+prefix progress before this gate was accepted.
+
+The exact tracked Predarb fixture bytes admitted in this phase are:
+
+| Fixture | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `predarb_balance_allowance_seed.json` | 53 | `7e1f683ac5032b137d8a2afdfafccce389198bb5d3a33ba6eb3cb478455fab96` |
+| `predarb_open_order_seed.json` | 247 | `d0998ca29cf47ce4bcb1fb4d7183d1e895a044d859235230a6ebef464295baf2` |
+| `predarb_user_order_seed.json` | 295 | `e4c3cd7975b7dc16c4c8d014444fc2a96d927cf1b9089b33875a5450b4ff99fa` |
+| `predarb_user_trade_seed.json` | 278 | `042998055ec5dec2c69065d002b2619d8497faabd9bfcc36c27a1bcf7cfe224c` |
+
+The final candidate-tree structural inventory is:
+
+| Inventory | Count | SHA-256 |
+| --- | ---: | --- |
+| Workspace packages / outside-workspace path dependencies | 34 / 0 | — |
+| Goal F changed/new production source set since the prompt baseline | 112 files / 47,856 production-extent lines / 0 files above 1,500 | — |
+| Goal F direct workspace dependency edges | 20 | `556719df2e183422a487aaafcf80b48a1de06e8ea56e8a4d57cd375725802f28` |
+| Sorted workspace public declarations | 2,171 lines | `beb233620f2e674627084862a2e7e9c238f87b263366d4d64939bed879e3d61a` |
+| Sorted schema/version declarations | 48 lines | `16c869757b02f0c8d3249edcdccda1e282537a14e046d94c54be957786180c1f` |
+| Sorted production Rust paths | 272 files | `4251ebe853b55ce099995bb9f7f3e1382baeaf78362f9c4313b4038c38c61697` |
+| Sorted production `sha256sum` manifest | 272 files | `95de9fcaab1edded73a9e3218198c26ffbd7730a0b5e43216a18abd90a1afc90` |
+| Sorted production-source extent stream | 272 files | `c2bbf04a9f34c25e410fd87ef07def99bfd83bf50c593e95e23007939cde208c` |
+| Public-wire fixture manifest | schema 1 / 36 payloads | `765b5f2229215871c9bdc2c941601de5968a4e48633873b10c5d12d96a091306` |
+| Public-wire tracked provenance | seven tracked sources | `cdd669d67fa10457dc0b2e5b832572c66616ef5b6f08634c6d9ca95c8b4a435e` |
+| `Cargo.lock` | unchanged | `fcca183e6d1eea4aeb977d4d03232710e98fe56594371d3fdb953854a1a4daf1` |
+| Normative connectivity-boundary document | — | `5d31251b0d4442042467c126d8a5ba7fc9fc5b278748ef770c00541469059b91` |
+
+The three largest Goal F production extents remain
+`capture_roles.rs` at 1,490 lines, adapter `public_session.rs` at 1,440, and
+live `replay.rs` at 1,327. The new `private_monitor.rs` is 1,073 production
+lines. No reviewed new production function exceeds 250 lines.
+
+This phase remains fixture/fake only. It adds no private network, credential,
+signer, authenticated request, mutation, PM journal schema, settlement,
+redemption, split, or merge behavior.

@@ -3,8 +3,8 @@ use std::time::Duration;
 use reap_pm_core::{
     ConnectionEpoch, EnvelopeError, EventOrdering, IngressSequence, PmBookDeltaBatch, PmBookEvent,
     PmBookSnapshot as CoreBookSnapshot, PmBookTopCheck, PmBookUpdate, PmConfigurationFingerprint,
-    PmEventError, PmVenueChangeHash, ReceivedEventClock, ReceivedEventEnvelope, SnapshotRevision,
-    VenueEventHash,
+    PmEventError, PmMarketEvent, PmVenueChangeHash, ReceivedEventClock, ReceivedEventEnvelope,
+    SnapshotRevision, VenueEventHash,
 };
 use reap_polymarket_wire::{
     MAX_WS_EVENTS_PER_FRAME, PmIgnoredEvent, PmMarketSubscription, PmWireError, PmWsEvent,
@@ -13,7 +13,13 @@ use reap_polymarket_wire::{
 use reap_transport::{ConnectionStatusKind, ReconnectPolicy, SupervisorState};
 use thiserror::Error;
 
-use crate::{PmAuthoritativeMetadata, PmPublicRole};
+use crate::{PmAuthoritativeMetadata, PmPublicRole, PmRecordedMetadataEvidence};
+
+mod session_state;
+
+use session_state::{
+    AttemptState, HeartbeatState, PmPublicSessionMetadata, TranslationState, venue_timestamp_ns,
+};
 
 pub const PM_PUBLIC_PING_BYTES: &[u8] = b"PING";
 pub const PM_PUBLIC_PONG_BYTES: &[u8] = b"PONG";
@@ -343,54 +349,10 @@ impl PmPublicMetadataOccurrence {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct HeartbeatState {
-    next_ping_ns: Option<u64>,
-    pong_deadline_ns: Option<u64>,
-}
-
-impl HeartbeatState {
-    const fn disconnected() -> Self {
-        Self {
-            next_ping_ns: None,
-            pong_deadline_ns: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct AttemptState {
-    subscription_sent: bool,
-    requires_reconnect: bool,
-    flow_open: bool,
-    reached_flow_open: bool,
-    local_ingress_sequence: u64,
-    current_snapshot_revision: Option<SnapshotRevision>,
-    pending_snapshot_flow: Option<PmSnapshotFlowToken>,
-    last_monotonic_ns: Option<u64>,
-    heartbeat: HeartbeatState,
-}
-
-impl AttemptState {
-    const fn new() -> Self {
-        Self {
-            subscription_sent: false,
-            requires_reconnect: false,
-            flow_open: false,
-            reached_flow_open: false,
-            local_ingress_sequence: 0,
-            current_snapshot_revision: None,
-            pending_snapshot_flow: None,
-            last_monotonic_ns: None,
-            heartbeat: HeartbeatState::disconnected(),
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct PmPublicSession {
     role: PmPublicRole,
-    authoritative_metadata: PmAuthoritativeMetadata,
+    metadata: PmPublicSessionMetadata,
     subscription: Vec<u8>,
     connection_epoch: ConnectionEpoch,
     last_snapshot_revision: u64,
@@ -413,20 +375,60 @@ impl PmPublicSession {
         reconnect_policy: ReconnectPolicy,
         heartbeat_config: PmPublicHeartbeatConfig,
     ) -> Result<Self, PmPublicSessionError> {
+        Self::from_metadata(
+            role,
+            PmPublicSessionMetadata::Live(authoritative_metadata),
+            connection_epoch,
+            last_snapshot_revision,
+            reconnect_policy,
+            heartbeat_config,
+        )
+    }
+
+    /// Constructs an offline/replay session from fully revalidated recorded
+    /// evidence. This session cannot execute the live subscription-start path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_recorded(
+        role: PmPublicRole,
+        recorded_metadata: PmRecordedMetadataEvidence,
+        connection_epoch: ConnectionEpoch,
+        last_snapshot_revision: Option<SnapshotRevision>,
+        reconnect_policy: ReconnectPolicy,
+        heartbeat_config: PmPublicHeartbeatConfig,
+    ) -> Result<Self, PmPublicSessionError> {
+        Self::from_metadata(
+            role,
+            PmPublicSessionMetadata::Recorded(recorded_metadata),
+            connection_epoch,
+            last_snapshot_revision,
+            reconnect_policy,
+            heartbeat_config,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_metadata(
+        role: PmPublicRole,
+        metadata: PmPublicSessionMetadata,
+        connection_epoch: ConnectionEpoch,
+        last_snapshot_revision: Option<SnapshotRevision>,
+        reconnect_policy: ReconnectPolicy,
+        heartbeat_config: PmPublicHeartbeatConfig,
+    ) -> Result<Self, PmPublicSessionError> {
         if connection_epoch.value() == 0 {
             return Err(PmPublicSessionError::ZeroConnectionEpoch);
         }
         if last_snapshot_revision.is_some_and(|revision| revision.value() == 0) {
             return Err(PmPublicSessionError::ZeroLastSnapshotRevision);
         }
-        let metadata_event = authoritative_metadata.event();
+        let metadata_event = metadata.event();
         if metadata_event.instrument() != role.instrument() {
             return Err(PmPublicSessionError::MetadataInstrumentMismatch);
         }
         if metadata_event.source() != role.source() {
             return Err(PmPublicSessionError::MetadataSourceMismatch);
         }
-        if authoritative_metadata.parser_config() != role.parser_config() {
+        if metadata.parser_config() != role.parser_config() {
             return Err(PmPublicSessionError::MetadataParserConfigMismatch);
         }
         let subscription = PmMarketSubscription::new(role.wire_scope().token())
@@ -435,7 +437,7 @@ impl PmPublicSession {
             .into_bytes();
         Ok(Self {
             role,
-            authoritative_metadata,
+            metadata,
             subscription,
             connection_epoch,
             last_snapshot_revision: last_snapshot_revision.map_or(0, SnapshotRevision::value),
@@ -455,13 +457,45 @@ impl PmPublicSession {
     }
 
     #[must_use]
-    pub const fn authoritative_metadata(&self) -> PmAuthoritativeMetadata {
-        self.authoritative_metadata
+    pub const fn authoritative_metadata(&self) -> Option<&PmAuthoritativeMetadata> {
+        match &self.metadata {
+            PmPublicSessionMetadata::Live(metadata) => Some(metadata),
+            PmPublicSessionMetadata::Recorded(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn recorded_metadata(&self) -> Option<&PmRecordedMetadataEvidence> {
+        match &self.metadata {
+            PmPublicSessionMetadata::Live(_) => None,
+            PmPublicSessionMetadata::Recorded(metadata) => Some(metadata),
+        }
+    }
+
+    #[must_use]
+    pub const fn metadata_event(&self) -> PmMarketEvent {
+        self.metadata.event()
+    }
+
+    #[must_use]
+    pub const fn metadata_fingerprint(&self) -> [u8; 32] {
+        match &self.metadata {
+            PmPublicSessionMetadata::Live(metadata) => metadata.metadata_fingerprint(),
+            PmPublicSessionMetadata::Recorded(metadata) => metadata.metadata_fingerprint(),
+        }
+    }
+
+    #[must_use]
+    pub const fn domain_fingerprint(&self) -> [u8; 32] {
+        match &self.metadata {
+            PmPublicSessionMetadata::Live(metadata) => metadata.domain_fingerprint(),
+            PmPublicSessionMetadata::Recorded(metadata) => metadata.domain_fingerprint(),
+        }
     }
 
     #[must_use]
     pub const fn metadata_revision(&self) -> SnapshotRevision {
-        self.authoritative_metadata.event().metadata_revision()
+        self.metadata.event().metadata_revision()
     }
 
     #[must_use]
@@ -531,6 +565,7 @@ impl PmPublicSession {
         &mut self,
         local_wall_receive_ns: u64,
     ) -> Result<PmPublicMetadataOccurrence, PmPublicSessionError> {
+        self.ensure_live_metadata()?;
         self.ensure_live_attempt()?;
         if self.metadata_occurrence_issued {
             return Err(PmPublicSessionError::MetadataOccurrenceAlreadyIssued);
@@ -543,7 +578,7 @@ impl PmPublicSession {
         let clock = ReceivedEventClock::new(
             None,
             local_wall_receive_ns,
-            self.authoritative_metadata.monotonic_receive_ns(),
+            self.metadata.monotonic_receive_ns(),
         )
         .map_err(PmPublicSessionError::Envelope)?;
         let ordering = EventOrdering::new(
@@ -586,6 +621,22 @@ impl PmPublicSession {
         result
     }
 
+    /// Applies a subscription-start occurrence already present in a verified
+    /// capture. It is unavailable to live-authority sessions.
+    pub fn restore_recorded_subscription_sent(
+        &mut self,
+        monotonic_now_ns: u64,
+    ) -> Result<(), PmPublicSessionError> {
+        if self.metadata.is_live() {
+            return Err(PmPublicSessionError::ReplayOperationRequiresRecordedMetadata);
+        }
+        let result = self.try_mark_subscription_sent_common(monotonic_now_ns);
+        if let Err(error) = result {
+            self.invalidate_for_error(error);
+        }
+        result
+    }
+
     pub fn preflight_mark_subscription_sent(
         &self,
         monotonic_now_ns: u64,
@@ -597,7 +648,15 @@ impl PmPublicSession {
         &mut self,
         monotonic_now_ns: u64,
     ) -> Result<(), PmPublicSessionError> {
-        self.validate_mark_subscription_sent(monotonic_now_ns)?;
+        self.ensure_live_metadata()?;
+        self.try_mark_subscription_sent_common(monotonic_now_ns)
+    }
+
+    fn try_mark_subscription_sent_common(
+        &mut self,
+        monotonic_now_ns: u64,
+    ) -> Result<(), PmPublicSessionError> {
+        self.validate_mark_subscription_sent_common(monotonic_now_ns)?;
         let next_ping_ns = monotonic_now_ns
             .checked_add(self.heartbeat_config.ping_interval_ns())
             .ok_or(PmPublicSessionError::HeartbeatDeadlineOverflow)?;
@@ -611,6 +670,14 @@ impl PmPublicSession {
         &self,
         monotonic_now_ns: u64,
     ) -> Result<(), PmPublicSessionError> {
+        self.ensure_live_metadata()?;
+        self.validate_mark_subscription_sent_common(monotonic_now_ns)
+    }
+
+    fn validate_mark_subscription_sent_common(
+        &self,
+        monotonic_now_ns: u64,
+    ) -> Result<(), PmPublicSessionError> {
         self.ensure_live_attempt()?;
         if self.attempt.subscription_sent {
             return Err(PmPublicSessionError::SubscriptionAlreadySent);
@@ -618,13 +685,21 @@ impl PmPublicSession {
         if monotonic_now_ns == 0 {
             return Err(PmPublicSessionError::ZeroMonotonicTimestamp);
         }
-        if monotonic_now_ns < self.authoritative_metadata.monotonic_receive_ns() {
+        if monotonic_now_ns < self.metadata.monotonic_receive_ns() {
             return Err(PmPublicSessionError::MonotonicClockRegression);
         }
         monotonic_now_ns
             .checked_add(self.heartbeat_config.ping_interval_ns())
             .ok_or(PmPublicSessionError::HeartbeatDeadlineOverflow)?;
         Ok(())
+    }
+
+    fn ensure_live_metadata(&self) -> Result<(), PmPublicSessionError> {
+        if self.metadata.is_live() {
+            Ok(())
+        } else {
+            Err(PmPublicSessionError::RecordedMetadataCannotStartLiveSession)
+        }
     }
 
     pub fn classify(
@@ -1267,115 +1342,6 @@ impl PmPublicSession {
             self.supervisor.mark_disconnected();
         }
     }
-
-    fn invalidate_for_error(&mut self, error: PmPublicSessionError) {
-        if matches!(
-            error,
-            PmPublicSessionError::SessionFatal | PmPublicSessionError::ReconnectRequired
-        ) {
-            return;
-        }
-        self.invalidate(error.fault());
-    }
-
-    fn invalidate_for_error_with_receive_evidence(
-        &mut self,
-        error: PmPublicSessionError,
-        local_wall_receive_ns: u64,
-        monotonic_receive_ns: u64,
-    ) {
-        if matches!(
-            error,
-            PmPublicSessionError::SessionFatal | PmPublicSessionError::ReconnectRequired
-        ) {
-            return;
-        }
-        let fault = error.fault();
-        if self
-            .invalidate_with_receive_evidence(fault, local_wall_receive_ns, monotonic_receive_ns)
-            .is_err()
-        {
-            self.invalidate(fault);
-        }
-    }
-
-    fn ensure_live_attempt(&self) -> Result<(), PmPublicSessionError> {
-        if self.health() == ConnectionStatusKind::Fatal {
-            return Err(PmPublicSessionError::SessionFatal);
-        }
-        if self.attempt.requires_reconnect {
-            return Err(PmPublicSessionError::ReconnectRequired);
-        }
-        Ok(())
-    }
-
-    fn ensure_subscribed(&self) -> Result<(), PmPublicSessionError> {
-        self.ensure_live_attempt()?;
-        if !self.attempt.subscription_sent {
-            return Err(PmPublicSessionError::SubscriptionNotSent);
-        }
-        Ok(())
-    }
-
-    fn validate_receive_clock(
-        &self,
-        local_wall_receive_ns: u64,
-        monotonic_receive_ns: u64,
-    ) -> Result<(), PmPublicSessionError> {
-        if local_wall_receive_ns == 0 {
-            return Err(PmPublicSessionError::ZeroWallReceiveTimestamp);
-        }
-        self.validate_monotonic(monotonic_receive_ns)
-    }
-
-    fn validate_monotonic(&self, monotonic_ns: u64) -> Result<(), PmPublicSessionError> {
-        if monotonic_ns == 0 {
-            return Err(PmPublicSessionError::ZeroMonotonicTimestamp);
-        }
-        if self
-            .attempt
-            .last_monotonic_ns
-            .is_some_and(|previous| monotonic_ns < previous)
-        {
-            return Err(PmPublicSessionError::MonotonicClockRegression);
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TranslationState {
-    last_snapshot_revision: u64,
-    local_ingress_sequence: u64,
-    current_snapshot_revision: Option<SnapshotRevision>,
-    pending_snapshot_flow: Option<PmSnapshotFlowToken>,
-    flow_open: bool,
-}
-
-impl TranslationState {
-    const fn new(session: &PmPublicSession) -> Self {
-        Self {
-            last_snapshot_revision: session.last_snapshot_revision,
-            local_ingress_sequence: session.attempt.local_ingress_sequence,
-            current_snapshot_revision: session.attempt.current_snapshot_revision,
-            pending_snapshot_flow: session.attempt.pending_snapshot_flow,
-            flow_open: session.attempt.flow_open,
-        }
-    }
-
-    fn flow_revision(self) -> Result<SnapshotRevision, PmPublicSessionError> {
-        if !self.flow_open || self.pending_snapshot_flow.is_some() {
-            return Err(PmPublicSessionError::DataBeforeSnapshotFlowOpen);
-        }
-        self.current_snapshot_revision
-            .ok_or(PmPublicSessionError::DataBeforeSnapshotFlowOpen)
-    }
-}
-
-fn venue_timestamp_ns(timestamp_millis: u64) -> Result<u64, PmPublicSessionError> {
-    timestamp_millis
-        .checked_mul(1_000_000)
-        .ok_or(PmPublicSessionError::VenueTimestampOverflow)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -1390,6 +1356,10 @@ pub enum PmPublicSessionError {
     MetadataSourceMismatch,
     #[error("authoritative metadata parser contract does not match the public role")]
     MetadataParserConfigMismatch,
+    #[error("recorded metadata evidence cannot start a live public session attempt")]
+    RecordedMetadataCannotStartLiveSession,
+    #[error("recorded replay transitions require recorded metadata evidence")]
+    ReplayOperationRequiresRecordedMetadata,
     #[error("the authoritative metadata occurrence was already issued")]
     MetadataOccurrenceAlreadyIssued,
     #[error("heartbeat ping interval must be nonzero")]

@@ -1,0 +1,5 @@
+error[E0599]: no method named `completeness` found for struct `PmSnapshotEvidence` in the current scope
+ --> tests/ui/snapshot_rows_cannot_claim_completeness.rs:5:26
+  |
+5 |     let _ = row_evidence.completeness();
+  |                          ^^^^^^^^^^^^ method not found in `PmSnapshotEvidence`

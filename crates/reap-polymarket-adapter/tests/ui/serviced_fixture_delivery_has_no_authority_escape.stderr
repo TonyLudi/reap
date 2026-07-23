@@ -1,0 +1,17 @@
+error[E0599]: no method named `payload` found for struct `PmFixtureServicedAggregate<P>` in the current scope
+ --> tests/ui/serviced_fixture_delivery_has_no_authority_escape.rs:5:22
+  |
+5 |     let _ = delivery.payload();
+  |                      ^^^^^^^ method not found in `PmFixtureServicedAggregate<PmCompleteOpenOrdersSnapshot>`
+
+error[E0599]: no method named `owner_id` found for struct `PmFixtureServicedAggregate<P>` in the current scope
+ --> tests/ui/serviced_fixture_delivery_has_no_authority_escape.rs:6:22
+  |
+6 |     let _ = delivery.owner_id();
+  |                      ^^^^^^^^ private field, not a method
+
+error[E0599]: no method named `into_envelope` found for struct `PmFixtureServicedAggregate<P>` in the current scope
+ --> tests/ui/serviced_fixture_delivery_has_no_authority_escape.rs:7:22
+  |
+7 |     let _ = delivery.into_envelope();
+  |                      ^^^^^^^^^^^^^ method not found in `PmFixtureServicedAggregate<PmCompleteOpenOrdersSnapshot>`

@@ -3,9 +3,9 @@ use std::hash::{Hash, Hasher};
 
 use reap_pm_core::{
     EvmAddress, OkxInstrumentId, OkxReferenceHandle, OkxReferenceInstrument, PmAssetId, PmChainId,
-    PmConditionId, PmInstrumentHandle, PmInstrumentId, PmMarketHandle, PmMarketId,
-    PmMarketLifecycle, PmMarketMetadata, PmMetadataError, PmOutcomeLabel, PmOutcomeMetadata,
-    PmPublicObservationGrant, PmQuantity, PmReferenceMapping, PmSpenderDomain,
+    PmConditionId, PmGoalFTradingDomain, PmInstrumentHandle, PmInstrumentId, PmMarketHandle,
+    PmMarketId, PmMarketLifecycle, PmMarketMetadata, PmMetadataError, PmOutcomeLabel,
+    PmOutcomeMetadata, PmPublicObservationGrant, PmQuantity, PmReferenceMapping, PmSpenderDomain,
     PmSpenderRequirement, PmTick, PmTokenHandle, PmTokenId, U256,
 };
 
@@ -14,6 +14,10 @@ const MARKET: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 const COLLATERAL: &str = "0x1111111111111111111111111111111111111111";
 const SPENDER: &str = "0x2222222222222222222222222222222222222222";
 const OUTCOME_CONTRACT: &str = "0x3333333333333333333333333333333333333333";
+const GOAL_F_PUSD: &str = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
+const GOAL_F_CTF: &str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
+const GOAL_F_STANDARD_EXCHANGE: &str = "0xE111180000d2663C0091e4f400237545B87B996B";
+const GOAL_F_NEGATIVE_RISK_EXCHANGE: &str = "0xe2222d279d744050d28e00520010520000310F59";
 
 fn requirement(domain: PmSpenderDomain) -> PmSpenderRequirement {
     PmSpenderRequirement::new(
@@ -57,6 +61,49 @@ fn metadata(negative_risk: bool) -> PmMarketMetadata {
     metadata_with_spenders(negative_risk, spenders, 1).unwrap()
 }
 
+fn goal_f_metadata(negative_risk: bool) -> PmMarketMetadata {
+    let chain = PmChainId::new(137).unwrap();
+    let exchange = EvmAddress::parse(if negative_risk {
+        GOAL_F_NEGATIVE_RISK_EXCHANGE
+    } else {
+        GOAL_F_STANDARD_EXCHANGE
+    })
+    .unwrap();
+    let domain = if negative_risk {
+        PmSpenderDomain::NegativeRisk
+    } else {
+        PmSpenderDomain::Standard
+    };
+    let token = PmTokenId::new(U256::from_u64(123)).unwrap();
+    let mut spenders = [None; 8];
+    spenders[0] = Some(PmSpenderRequirement::new(
+        chain,
+        exchange,
+        domain,
+        PmAssetId::collateral(EvmAddress::parse(GOAL_F_PUSD).unwrap()),
+    ));
+    spenders[1] = Some(PmSpenderRequirement::new(
+        chain,
+        exchange,
+        domain,
+        PmAssetId::outcome(EvmAddress::parse(GOAL_F_CTF).unwrap(), token),
+    ));
+    PmMarketMetadata::new(
+        PmConditionId::parse(CONDITION).unwrap(),
+        PmMarketId::parse(MARKET).unwrap(),
+        PmOutcomeMetadata::new(token, PmOutcomeLabel::new("YES").unwrap()),
+        PmMarketLifecycle::new(true, false, false, true, true),
+        PmTick::parse_decimal("0.0001").unwrap(),
+        PmQuantity::parse_decimal("0.01").unwrap(),
+        negative_risk,
+        chain,
+        exchange,
+        spenders,
+        2,
+    )
+    .unwrap()
+}
+
 fn hash_of<T: Hash>(value: &T) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
@@ -81,6 +128,40 @@ fn metadata_retains_structural_membership_and_exact_market_facts() {
     assert_eq!(metadata.lot_units(), 10_000);
     assert!(!metadata.negative_risk());
     assert_eq!(metadata.required_spenders().collect::<Vec<_>>().len(), 1);
+}
+
+#[test]
+fn goal_f_trading_domain_is_exact_and_never_selected_from_an_arbitrary_spender() {
+    for negative_risk in [false, true] {
+        let metadata = goal_f_metadata(negative_risk);
+        let contract = PmGoalFTradingDomain::from_metadata(metadata).unwrap();
+        assert_eq!(
+            contract.instrument(),
+            PmInstrumentId::new(metadata.market(), metadata.outcome().token())
+        );
+        assert_eq!(contract.chain(), metadata.chain());
+        assert_eq!(contract.exchange(), metadata.exchange());
+        assert_eq!(
+            contract.collateral(),
+            PmAssetId::collateral(EvmAddress::parse(GOAL_F_PUSD).unwrap())
+        );
+        assert_eq!(
+            contract.outcome(),
+            PmAssetId::outcome(
+                EvmAddress::parse(GOAL_F_CTF).unwrap(),
+                metadata.outcome().token()
+            )
+        );
+        assert_eq!(
+            contract.required_spenders(),
+            metadata.required_spenders().collect::<Vec<_>>().as_slice()
+        );
+    }
+
+    assert_eq!(
+        PmGoalFTradingDomain::from_metadata(metadata(false)),
+        Err(PmMetadataError::UnsupportedGoalFExchange)
+    );
 }
 
 #[test]

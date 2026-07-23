@@ -1,0 +1,11 @@
+error[E0599]: no method named `observe_order` found for mutable reference `&mut PmReadOnlyMonitor` in the current scope
+  --> tests/ui/read_only_monitor_rejects_raw_core_injection.rs:11:10
+   |
+11 |     root.observe_order(order);
+   |          ^^^^^^^^^^^^^ method not found in `&mut PmReadOnlyMonitor`
+
+error[E0599]: no method named `apply_account_snapshot` found for mutable reference `&mut PmReadOnlyMonitor` in the current scope
+  --> tests/ui/read_only_monitor_rejects_raw_core_injection.rs:12:10
+   |
+12 |     root.apply_account_snapshot(account);
+   |          ^^^^^^^^^^^^^^^^^^^^^^ method not found in `&mut PmReadOnlyMonitor`

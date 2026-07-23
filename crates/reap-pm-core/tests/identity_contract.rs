@@ -199,17 +199,22 @@ fn order_and_fill_keys_scope_identical_raw_components_by_account() {
     );
 
     let fill_id = PmFillId::new("shared-fill").unwrap();
-    let first_fill = PmFillKey::new(first_account, fill_id);
-    let second_fill = PmFillKey::new(second_account, fill_id);
+    let first_fill = PmFillKey::new(first_venue, fill_id);
+    let second_fill = PmFillKey::new(second_venue, fill_id);
     assert_ne!(first_fill, second_fill);
     assert_eq!(first_fill.id(), second_fill.id());
-    assert_eq!(
-        serde_json::from_str::<PmFillKey>(&serde_json::to_string(&second_fill).unwrap()).unwrap(),
-        second_fill
+    assert_eq!(first_fill.account(), first_account);
+    assert_eq!(second_fill.venue_order(), second_venue);
+    let second_leg = PmFillKey::new(
+        PmVenueOrderKey::new(
+            first_account,
+            PmVenueOrderId::new("another-order-leg").unwrap(),
+        ),
+        fill_id,
     );
-    let mut ambiguous_fill = serde_json::to_value(second_fill).unwrap();
-    ambiguous_fill["venue"] = serde_json::json!("polymarket");
-    assert!(serde_json::from_value::<PmFillKey>(ambiguous_fill).is_err());
+    assert_ne!(first_fill, second_leg);
+    assert_eq!(second_fill.venue_order(), second_venue);
+    assert_eq!(second_fill.id(), fill_id);
 }
 
 #[test]

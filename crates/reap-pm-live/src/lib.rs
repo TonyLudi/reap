@@ -5,6 +5,7 @@ mod capture_roles;
 mod composition;
 mod fake_effect;
 mod lanes;
+mod private_monitor;
 mod public_routes;
 mod replay;
 mod schedule;
@@ -32,12 +33,17 @@ pub use composition::{
     PmPublicCaptureTerminalCause, PmPublicDataPipelineError, PmPublicLaneAdmissionError,
     PmPublicLaneEnactError, PmPublicLaneFaultEnactment, PmPublicNotificationAdmissionFailure,
     PmPublicReadyBookView, PmPublicTerminalTickApplyError, PmPublicTerminalTickCleanupStatus,
-    PmReadOnlyMonitor,
 };
 pub use lanes::{
     PM_INPUT_SERVICE_PRIORITY, PmAgedDeliveryEvidence, PmLaneKind, PmLaneMetrics, PmLanePolicy,
     PmPublicLaneEnqueueError, PmPublicLaneService, PmServiceKey, PmServiceSourceKind,
     PmServiceTurnError, SaturationAction, ServicedLaneItem,
+};
+pub use private_monitor::{
+    PmAccountFixtureInput, PmFixtureQueryOccurrence, PmOpenOrdersFixtureInput,
+    PmOrderDetailFixtureInput, PmPrivateBatchApply, PmPrivateMonitorError,
+    PmPrivateMonitorInputError, PmReadOnlyMonitor, PmReadOnlyPrivateProjection,
+    PmReconciliationFixtureInput,
 };
 pub use public_routes::{
     OkxPublicReferenceDelivery, OkxPublicUnavailable, OkxPublicUnavailableDelivery,

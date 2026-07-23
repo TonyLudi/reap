@@ -4,13 +4,14 @@ use reap_pm_core::{
     PmBalanceEvent, PmBookDeltaBatch, PmBookEvent, PmBookLevel, PmBookPoint, PmBookQuantity,
     PmBookSide, PmBookSnapshot, PmBookTop, PmBookTopCheck, PmBookUpdate, PmChainId,
     PmClientOrderId, PmClientOrderKey, PmConditionId, PmErc1155OperatorApproval, PmEventError,
-    PmFillEvent, PmFillExecution, PmFillFee, PmFillId, PmFillKey, PmFillRole, PmInstrumentHandle,
-    PmMarketEvent, PmMarketHandle, PmMarketId, PmMarketLifecycle, PmMarketMetadata, PmOrderEvent,
-    PmOrderIdentity, PmOrderProgress, PmOrderSide, PmOrderStatus, PmOutcomeLabel,
-    PmOutcomeMetadata, PmPositionAvailability, PmPositionEvent, PmPrice, PmProductSource,
-    PmQuantity, PmSign, PmSignedUnits, PmSnapshotCompleteness, PmSnapshotEvidence, PmSourceHandle,
-    PmSpenderDomain, PmSpenderId, PmSpenderRequirement, PmTick, PmTokenHandle, PmTokenId,
-    PmVenueChangeHash, PmVenueOrderId, PmVenueOrderKey, SnapshotRevision, U256,
+    PmFillEvent, PmFillExecution, PmFillFee, PmFillId, PmFillKey, PmFillRole,
+    PmFillSettlementStatus, PmInstrumentHandle, PmMarketEvent, PmMarketHandle, PmMarketId,
+    PmMarketLifecycle, PmMarketMetadata, PmOrderEvent, PmOrderIdentity, PmOrderProgress,
+    PmOrderSide, PmOrderStatus, PmOutcomeLabel, PmOutcomeMetadata, PmPositionAvailability,
+    PmPositionEvent, PmPrice, PmProductSource, PmQuantity, PmSign, PmSignedUnits,
+    PmSnapshotEvidence, PmSourceHandle, PmSpenderDomain, PmSpenderId, PmSpenderRequirement, PmTick,
+    PmTokenHandle, PmTokenId, PmVenueChangeHash, PmVenueOrderId, PmVenueOrderKey, SnapshotRevision,
+    U256,
 };
 
 const CONDITION: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -84,7 +85,7 @@ fn metadata() -> PmMarketMetadata {
 }
 
 fn complete_snapshot() -> PmSnapshotEvidence {
-    PmSnapshotEvidence::new(SnapshotRevision::new(12), PmSnapshotCompleteness::Complete).unwrap()
+    PmSnapshotEvidence::new(SnapshotRevision::new(12)).unwrap()
 }
 
 fn order_identity() -> PmOrderIdentity {
@@ -393,6 +394,7 @@ fn order_and_fill_events_retain_account_token_and_both_order_identities() {
     let execution = PmFillExecution::new(
         PmOrderSide::Buy,
         PmFillRole::Maker,
+        PmFillSettlementStatus::Confirmed,
         PmPrice::parse_decimal("0.4").unwrap(),
         PmQuantity::parse_decimal("0.5").unwrap(),
         PmFillFee::Known {
@@ -400,7 +402,10 @@ fn order_and_fill_events_retain_account_token_and_both_order_identities() {
             delta: fee_delta,
         },
     );
-    let fill_key = PmFillKey::new(account(), PmFillId::new("fill-1").unwrap());
+    let fill_key = PmFillKey::new(
+        order_identity().venue_order_key().unwrap(),
+        PmFillId::new("fill-1").unwrap(),
+    );
     let fill = PmFillEvent::new(
         account_source(),
         instrument(),
@@ -411,10 +416,18 @@ fn order_and_fill_events_retain_account_token_and_both_order_identities() {
     .unwrap();
     assert_eq!(fill.fill_key(), fill_key);
     assert_eq!(fill.fill_key().id().as_str(), "fill-1");
+    assert_eq!(
+        fill.fill_key().venue_order(),
+        order_identity().venue_order_key().unwrap()
+    );
     assert_eq!(fill.account(), account());
     assert_eq!(fill.instrument(), instrument());
     assert_eq!(fill.order(), order_identity());
     assert_eq!(fill.execution().role(), PmFillRole::Maker);
+    assert_eq!(
+        fill.execution().settlement(),
+        PmFillSettlementStatus::Confirmed
+    );
     assert_eq!(fill.execution().side(), PmOrderSide::Buy);
     assert_eq!(
         fill.execution().quantity().protocol_units(),
@@ -428,7 +441,10 @@ fn order_and_fill_events_retain_account_token_and_both_order_identities() {
         }
     );
     let other_account = PmAccountHandle::from_ordinal(4);
-    let other_fill_key = PmFillKey::new(other_account, PmFillId::new("fill-1").unwrap());
+    let other_fill_key = PmFillKey::new(
+        order_identity_for(other_account).venue_order_key().unwrap(),
+        PmFillId::new("fill-1").unwrap(),
+    );
     assert_ne!(fill_key, other_fill_key);
     assert_eq!(
         PmFillEvent::new(
@@ -438,7 +454,53 @@ fn order_and_fill_events_retain_account_token_and_both_order_identities() {
             order_identity_for(other_account),
             execution,
         ),
-        Err(PmEventError::FillOrderAccountMismatch)
+        Err(PmEventError::FillVenueOrderMismatch)
+    );
+
+    let client_only = PmOrderIdentity::new(
+        Some(PmClientOrderKey::new(
+            account(),
+            PmClientOrderId::parse("ffeeddccbbaa99887766554433221100").unwrap(),
+        )),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        PmFillEvent::new(
+            account_source(),
+            instrument(),
+            fill_key,
+            client_only,
+            execution,
+        ),
+        Err(PmEventError::MissingFillVenueOrderIdentity)
+    );
+
+    let second_leg_identity = PmOrderIdentity::new(
+        None,
+        Some(PmVenueOrderKey::new(
+            account(),
+            PmVenueOrderId::new("venue-order-2").unwrap(),
+        )),
+    )
+    .unwrap();
+    let second_leg_key = PmFillKey::new(
+        second_leg_identity.venue_order_key().unwrap(),
+        PmFillId::new("fill-1").unwrap(),
+    );
+    assert_ne!(
+        fill_key, second_leg_key,
+        "one trade ID on two maker-order legs must retain two fill identities"
+    );
+    assert!(
+        PmFillEvent::new(
+            account_source(),
+            instrument(),
+            second_leg_key,
+            second_leg_identity,
+            execution,
+        )
+        .is_ok()
     );
 
     let wrong_account_source = PmProductSource::polymarket_account(
@@ -459,18 +521,9 @@ fn order_and_fill_events_retain_account_token_and_both_order_identities() {
 }
 
 #[test]
-fn snapshots_keep_completeness_and_zero_balances_explicit() {
-    let incomplete = PmSnapshotEvidence::new(
-        SnapshotRevision::new(13),
-        PmSnapshotCompleteness::Incomplete,
-    )
-    .unwrap();
+fn snapshot_rows_keep_only_revision_and_zero_balances_explicit() {
     assert_eq!(
-        incomplete.completeness(),
-        PmSnapshotCompleteness::Incomplete
-    );
-    assert_eq!(
-        PmSnapshotEvidence::new(SnapshotRevision::new(0), PmSnapshotCompleteness::Complete,),
+        PmSnapshotEvidence::new(SnapshotRevision::new(0)),
         Err(PmEventError::ZeroRevision)
     );
 
@@ -613,11 +666,15 @@ fn every_normalized_family_rejects_a_wrong_source_scope() {
         PmFillEvent::new(
             market_source(),
             instrument(),
-            PmFillKey::new(account(), PmFillId::new("fill-wrong-source").unwrap(),),
+            PmFillKey::new(
+                order_identity().venue_order_key().unwrap(),
+                PmFillId::new("fill-wrong-source").unwrap(),
+            ),
             order_identity(),
             PmFillExecution::new(
                 PmOrderSide::Sell,
                 PmFillRole::Taker,
+                PmFillSettlementStatus::Matched,
                 PmPrice::parse_decimal("0.6").unwrap(),
                 PmQuantity::parse_decimal("1").unwrap(),
                 PmFillFee::Unknown,

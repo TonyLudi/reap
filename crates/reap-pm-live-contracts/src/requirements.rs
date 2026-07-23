@@ -1,6 +1,8 @@
 use std::cmp::Ordering;
 
-use reap_pm_core::{OkxReferenceHandle, PmAccountScope, PmInstrumentHandle, PmSpenderId};
+use reap_pm_core::{
+    OkxReferenceHandle, PmAccountScope, PmAssetId, PmInstrumentHandle, PmInstrumentId, PmSpenderId,
+};
 use reap_pm_strategy::{PmModelInputRequirement, PmModelInputRequirements};
 use thiserror::Error;
 
@@ -75,10 +77,14 @@ impl PmCapabilityRequirementId {
 pub enum PmRequirementScope {
     OkxReference(OkxReferenceHandle),
     Instrument(PmInstrumentHandle),
-    Account(PmAccountScope),
+    AccountAsset {
+        account: PmAccountScope,
+        asset: PmAssetId,
+    },
     AccountInstrument {
         account: PmAccountScope,
         instrument: PmInstrumentHandle,
+        instrument_id: PmInstrumentId,
     },
     Spender {
         account: PmAccountScope,
@@ -91,7 +97,7 @@ impl PmRequirementScope {
         match self {
             Self::OkxReference(_) => 0,
             Self::Instrument(_) => 1,
-            Self::Account(_) => 2,
+            Self::AccountAsset { .. } => 2,
             Self::AccountInstrument { .. } => 3,
             Self::Spender { .. } => 4,
         }
@@ -107,20 +113,38 @@ impl Ord for PmRequirementScope {
         match (*self, *other) {
             (Self::OkxReference(left), Self::OkxReference(right)) => left.cmp(&right),
             (Self::Instrument(left), Self::Instrument(right)) => left.cmp(&right),
-            (Self::Account(left), Self::Account(right)) => {
-                account_scope_key(left).cmp(&account_scope_key(right))
-            }
+            (
+                Self::AccountAsset {
+                    account: left_account,
+                    asset: left_asset,
+                },
+                Self::AccountAsset {
+                    account: right_account,
+                    asset: right_asset,
+                },
+            ) => (account_scope_key(left_account), left_asset)
+                .cmp(&(account_scope_key(right_account), right_asset)),
             (
                 Self::AccountInstrument {
                     account: left_account,
                     instrument: left_instrument,
+                    instrument_id: left_instrument_id,
                 },
                 Self::AccountInstrument {
                     account: right_account,
                     instrument: right_instrument,
+                    instrument_id: right_instrument_id,
                 },
-            ) => (account_scope_key(left_account), left_instrument)
-                .cmp(&(account_scope_key(right_account), right_instrument)),
+            ) => (
+                account_scope_key(left_account),
+                left_instrument,
+                left_instrument_id,
+            )
+                .cmp(&(
+                    account_scope_key(right_account),
+                    right_instrument,
+                    right_instrument_id,
+                )),
             (
                 Self::Spender {
                     account: left_account,

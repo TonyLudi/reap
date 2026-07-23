@@ -326,23 +326,23 @@ fn build_runtime(
 ) -> Result<(PmPublicSession, PmBookReducer, OkxPublicSession), PmReplayError> {
     let scope = header.scope();
     let policy = header.session_policy();
-    let authoritative = scope.authoritative_metadata()?;
+    let recorded = scope.recorded_metadata()?;
+    let metadata_fingerprint = PmMetadataFingerprint::new(recorded.metadata_fingerprint())?;
+    let domain_fingerprint = PmDomainFingerprint::new(recorded.domain_fingerprint())?;
     let role = PmPublicRole::from_expected_metadata(
         scope.observation_grant()?,
         scope.metadata(),
         scope.source(),
         scope.connection_id(),
     )?;
-    let session = PmPublicSession::new(
+    let session = PmPublicSession::from_recorded(
         role,
-        authoritative,
+        recorded,
         policy.pm_initial_epoch(),
         policy.pm_last_snapshot_revision(),
         policy.pm_reconnect().as_transport(),
         policy.pm_heartbeat()?,
     )?;
-    let metadata_fingerprint = PmMetadataFingerprint::new(authoritative.metadata_fingerprint())?;
-    let domain_fingerprint = PmDomainFingerprint::new(authoritative.domain_fingerprint())?;
     let contract = PmMetadataContract::goal_f_clob_v2(scope.metadata(), domain_fingerprint);
     let mut reducer = PmBookReducer::new(
         scope.instrument(),
@@ -1135,7 +1135,7 @@ impl ReplayState {
                 self.push_logical(PmReplayLogicalEvent::ConnectionStarted { epoch })?;
             }
             PmCaptureLifecycle::SubscriptionSent => {
-                session.mark_subscription_sent(monotonic_ns)?;
+                session.restore_recorded_subscription_sent(monotonic_ns)?;
                 self.push_logical(PmReplayLogicalEvent::SubscriptionSent { epoch })?;
             }
             PmCaptureLifecycle::HeartbeatPingSent => {

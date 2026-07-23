@@ -12,10 +12,10 @@ use reap_polymarket_adapter::{
     PM_PUBLIC_PING_BYTES, PM_PUBLIC_PONG_BYTES, PmAuthoritativeMetadata, PmMetadataRevisionInput,
     PmPublicHeartbeatAction, PmPublicHeartbeatConfig, PmPublicRole, PmPublicRoleError,
     PmPublicSession, PmPublicSessionError, PmPublicSessionFault, PmPublicSessionIgnored,
+    PmRecordedMetadataEvidence,
 };
 use reap_polymarket_wire::{
-    PmBookParserConfig, PmWireScope, compute_snapshot_hash, parse_clob_metadata,
-    parse_lifecycle_metadata, parse_ws_frame,
+    PmBookParserConfig, PmWireScope, compute_snapshot_hash, parse_ws_frame,
 };
 use reap_transport::{ConnectionStatusKind, ReconnectPolicy};
 
@@ -91,29 +91,18 @@ fn expected_metadata() -> PmMarketMetadata {
 }
 
 fn authoritative_metadata() -> PmAuthoritativeMetadata {
-    let scope = parser_config().scope();
-    let lifecycle = parse_lifecycle_metadata(
-        format!(
-            r#"{{"condition_id":"{CONDITION}","market_id":"{MARKET}","active":true,"closed":false,"archived":false,"accepting_orders":true,"enable_order_book":true}}"#
-        )
-        .as_bytes(),
-        scope,
-    )
-    .unwrap();
-    let clob = parse_clob_metadata(
-        format!(
-            r#"{{"condition_id":"{CONDITION}","market_id":"{MARKET}","minimum_tick_size":"0.01","minimum_order_size":"5","neg_risk":false,"tokens":[{{"token_id":"123","outcome":"Yes"}},{{"token_id":"456","outcome":"No"}}]}}"#
-        )
-        .as_bytes(),
-        scope,
-    )
-    .unwrap();
-    PmAuthoritativeMetadata::join(
+    let lifecycle = format!(
+        r#"{{"condition_id":"{CONDITION}","market_id":"{MARKET}","active":true,"closed":false,"archived":false,"accepting_orders":true,"enable_order_book":true}}"#
+    );
+    let clob = format!(
+        r#"{{"condition_id":"{CONDITION}","market_id":"{MARKET}","minimum_tick_size":"0.01","minimum_order_size":"5","neg_risk":false,"tokens":[{{"token_id":"123","outcome":"Yes"}},{{"token_id":"456","outcome":"No"}}]}}"#
+    );
+    PmAuthoritativeMetadata::join_raw(
         instrument(),
         PmProductSource::polymarket_market(PmSourceHandle::from_ordinal(4), instrument().token()),
         expected_metadata(),
-        lifecycle,
-        &clob,
+        lifecycle.as_bytes(),
+        clob.as_bytes(),
         PmMetadataRevisionInput::new(SnapshotRevision::new(7), 50).unwrap(),
     )
     .unwrap()
@@ -401,7 +390,7 @@ fn construction_requires_the_exact_authoritative_metadata_join_for_the_role() {
     assert_eq!(derived_role.parser_config(), parser_config());
     assert_eq!(
         new_session().authoritative_metadata(),
-        authority,
+        Some(&authority),
         "session retains the complete checked metadata observation"
     );
 
@@ -464,7 +453,7 @@ fn construction_requires_the_exact_authoritative_metadata_join_for_the_role() {
     assert!(matches!(
         PmPublicSession::new(
             wrong_source_role,
-            authority,
+            authoritative_metadata(),
             ConnectionEpoch::new(1),
             None,
             reconnect_policy(),
@@ -489,7 +478,7 @@ fn construction_requires_the_exact_authoritative_metadata_join_for_the_role() {
     assert!(matches!(
         PmPublicSession::new(
             wrong_parser_role,
-            authority,
+            authoritative_metadata(),
             ConnectionEpoch::new(1),
             None,
             reconnect_policy(),
@@ -504,6 +493,47 @@ fn construction_requires_the_exact_authoritative_metadata_join_for_the_role() {
         Err(PmPublicSessionError::MonotonicClockRegression)
     );
     assert!(session.requires_reconnect());
+}
+
+#[test]
+fn recorded_metadata_is_replay_evidence_not_live_session_authority() {
+    let authority = authoritative_metadata();
+    let recorded = PmRecordedMetadataEvidence::verify(
+        instrument(),
+        role().source(),
+        expected_metadata(),
+        PmMetadataRevisionInput::new(SnapshotRevision::new(7), 50).unwrap(),
+        authority.metadata_fingerprint(),
+        authority.domain_fingerprint(),
+    )
+    .unwrap();
+    let mut replay = PmPublicSession::from_recorded(
+        role(),
+        recorded,
+        ConnectionEpoch::new(11),
+        None,
+        reconnect_policy(),
+        heartbeat(),
+    )
+    .unwrap();
+
+    assert_eq!(replay.authoritative_metadata(), None);
+    assert_eq!(replay.recorded_metadata(), Some(&recorded));
+    assert_eq!(
+        replay.issue_metadata_occurrence(1_700_000_000_000_000_050),
+        Err(PmPublicSessionError::RecordedMetadataCannotStartLiveSession)
+    );
+    replay.restore_recorded_subscription_sent(100).unwrap();
+    assert_eq!(
+        replay.mark_subscription_sent(101),
+        Err(PmPublicSessionError::RecordedMetadataCannotStartLiveSession)
+    );
+
+    let mut live = new_session();
+    assert_eq!(
+        live.restore_recorded_subscription_sent(100),
+        Err(PmPublicSessionError::ReplayOperationRequiresRecordedMetadata)
+    );
 }
 
 #[test]

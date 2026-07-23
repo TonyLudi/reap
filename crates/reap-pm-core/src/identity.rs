@@ -600,11 +600,39 @@ account_scoped_key!(
     PmVenueOrderKey,
     PmVenueOrderId
 );
-account_scoped_key!(
-    /// The canonical account-scoped key for a fill identity.
-    PmFillKey,
-    PmFillId
-);
+
+/// The canonical identity of one exact fill leg.
+///
+/// Polymarket can report one venue trade with multiple maker-order legs. The
+/// venue-order key is therefore part of fill identity rather than merely
+/// adjacent event data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PmFillKey {
+    venue_order: PmVenueOrderKey,
+    id: PmFillId,
+}
+
+impl PmFillKey {
+    #[must_use]
+    pub const fn new(venue_order: PmVenueOrderKey, id: PmFillId) -> Self {
+        Self { venue_order, id }
+    }
+
+    #[must_use]
+    pub const fn account(self) -> PmAccountHandle {
+        self.venue_order.account()
+    }
+
+    #[must_use]
+    pub const fn venue_order(self) -> PmVenueOrderKey {
+        self.venue_order
+    }
+
+    #[must_use]
+    pub const fn id(self) -> PmFillId {
+        self.id
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PmInstrumentHandle {

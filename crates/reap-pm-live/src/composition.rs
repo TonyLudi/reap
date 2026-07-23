@@ -10,24 +10,25 @@ use std::time::Duration;
 use reap_capture_framing::JsonlWriterError;
 use reap_okx_public_source::OkxPublicSessionError;
 use reap_pm_core::{
-    EventOrdering, IngressSequence, PmBookLevel, PmConnectionId, PmProductSource,
+    EventOrdering, IngressSequence, PmBookLevel, PmConnectionId, PmMetadataError, PmProductSource,
     ReceivedEventClock,
 };
 use reap_pm_live_contracts::{
-    ConstructedRoleBinding, PmAccountConnectivityConfig, PmConnectionRoute, PmConnectivityConfig,
-    PmConnectivityPlan, PmFakeExecutionProfile, PmPlanError, PmPublicConnectivityConfig,
-    PmRoleKind,
+    ConstructedRoleBinding, PmConnectionRoute, PmConnectivityConfig, PmConnectivityPlan,
+    PmFakeExecutionProfile, PmPlanError, PmPublicConnectivityConfig, PmRoleKind,
 };
 use reap_pm_state::{
     PmBookCounters, PmBookReducer, PmBookTransition, PmDomainFingerprint, PmExternalBookFault,
     PmMetadataContract, PmMetadataFingerprint, PmMetadataObservation,
-    PmPendingExternalBookFaultAuthority, PmPublicReadinessReason,
+    PmPendingExternalBookFaultAuthority, PmPrivateConfigError, PmPrivateStateError,
+    PmPublicReadinessReason,
 };
 use reap_pm_strategy::PmQuoteModelRequirements;
 use reap_polymarket_adapter::{
-    PmAccountPositionRoleError, PmFixtureAccountPositionSnapshot, PmFixturePrivateLifecycle,
-    PmFixtureReconciliation, PmPrivateLifecycleRoleError, PmPublicHeartbeatAction,
-    PmPublicRoleError, PmPublicSessionError, PmReconciliationContractError,
+    PmAccountPositionRoleError, PmFixtureAccountPositionSnapshot, PmFixtureInstrumentScope,
+    PmFixturePrivateLifecycle, PmFixtureReadOwnerGrant, PmFixtureReconciliation,
+    PmPrivateLifecycleRoleError, PmPublicHeartbeatAction, PmPublicRoleError, PmPublicSessionError,
+    PmReconciliationContractError,
 };
 use thiserror::Error;
 
@@ -49,6 +50,7 @@ use crate::lanes::{
     PmAgedDeliveryEvidence, PmAuthenticatedPublicLaneFailure, PmLaneMetrics, PmPublicAgedHead,
     PmPublicLaneService, PmPublicLaneState, PmServiceTurnError, SaturationAction,
 };
+use crate::private_monitor::monitor_bindings;
 use crate::public_routes::{
     OkxPublicReferenceDelivery, OkxPublicUnavailableDelivery, PmPublicBookDelivery,
     PmPublicMetadataDelivery, PmPublicRouteAuthorityId, PmPublicRouteError,
@@ -98,6 +100,12 @@ pub enum PmCompositionError {
     PrivateRole(#[from] PmPrivateLifecycleRoleError),
     #[error(transparent)]
     ReconciliationRole(#[from] PmReconciliationContractError),
+    #[error(transparent)]
+    InstrumentScope(#[from] PmMetadataError),
+    #[error(transparent)]
+    PrivateConfig(#[from] PmPrivateConfigError),
+    #[error(transparent)]
+    PrivateState(#[from] PmPrivateStateError),
 }
 
 #[derive(Debug)]
@@ -161,8 +169,8 @@ impl PmPublicCapture {
             .public_config()
             .expect("public plan carries public config")
             .clone();
-        let pm_reducer = prepare_pm_reducer(&config, authoritative, session_policy)?;
-        let scope = PmCaptureScope::new(&config, authoritative)?;
+        let pm_reducer = prepare_pm_reducer(&config, &authoritative, session_policy)?;
+        let scope = PmCaptureScope::new(&config, &authoritative)?;
         let header = PmCaptureHeader::new(scope, session_policy, provenance)?;
         let roles = PmCaptureRoles::start(self.capture, &config, authoritative, session_policy)
             .map_err(PmPublicCaptureRunError::from_role_start)?;
@@ -208,7 +216,7 @@ impl PmPublicCapture {
 
 fn prepare_pm_reducer(
     config: &PmPublicConnectivityConfig,
-    authoritative: reap_polymarket_adapter::PmAuthoritativeMetadata,
+    authoritative: &reap_polymarket_adapter::PmAuthoritativeMetadata,
     session_policy: PmCaptureSessionPolicy,
 ) -> Result<PmBookReducer, PmPublicCaptureRunError> {
     let fingerprint =
@@ -874,73 +882,6 @@ impl PmPublicCaptureRun {
 }
 
 #[derive(Debug)]
-pub struct PmReadOnlyMonitor {
-    plan: PmConnectivityPlan,
-    bindings: Vec<ConstructedRoleBinding>,
-    private: PmFixturePrivateLifecycle,
-    reconciliation: PmFixtureReconciliation,
-    account: PmFixtureAccountPositionSnapshot,
-}
-
-impl PmReadOnlyMonitor {
-    pub fn new(config: PmAccountConnectivityConfig) -> Result<Self, PmCompositionError> {
-        let plan = PmConnectivityPlan::read_only_monitor(config)?;
-        Self::from_plan(plan)
-    }
-
-    fn from_plan(plan: PmConnectivityPlan) -> Result<Self, PmCompositionError> {
-        let config = plan
-            .account_config()
-            .expect("monitor plan carries account config");
-        let route = config.account_route();
-        let private = PmFixturePrivateLifecycle::new(
-            config.account_scope(),
-            route.source(),
-            route.connection(),
-        )?;
-        let reconciliation = PmFixtureReconciliation::new(
-            config.account_scope(),
-            route.source(),
-            route.connection(),
-        )?;
-        let account = PmFixtureAccountPositionSnapshot::new(
-            config.account_scope(),
-            config.instrument(),
-            route.source(),
-            route.connection(),
-            config.required_spenders().to_vec(),
-        )?;
-        let bindings = monitor_bindings(&private, &reconciliation, &account)?;
-        plan.validate_bindings(&bindings)?;
-        Ok(Self {
-            plan,
-            bindings,
-            private,
-            reconciliation,
-            account,
-        })
-    }
-
-    #[must_use]
-    pub fn reached_roles(&self) -> &[PmRoleKind] {
-        self.plan.reached_roles()
-    }
-
-    #[must_use]
-    pub fn binding_count(&self) -> usize {
-        let config = self
-            .plan
-            .account_config()
-            .expect("monitor plan carries account config");
-        debug_assert_eq!(self.private.account_scope(), config.account_scope());
-        debug_assert_eq!(self.reconciliation.account_scope(), config.account_scope());
-        debug_assert_eq!(self.account.account_scope(), config.account_scope());
-        debug_assert_eq!(self.account.instrument(), config.instrument());
-        self.bindings.len()
-    }
-}
-
-#[derive(Debug)]
 pub struct PmProduct<M> {
     model: M,
     plan: PmConnectivityPlan,
@@ -969,28 +910,46 @@ impl<M: PmQuoteModelRequirements> PmProduct<M> {
             .expect("product plan carries account config");
         let capture = PmCaptureBlueprint::new(public)?;
         let route = account_config.account_route();
+        let (private_grant, reconciliation_grant, account_grant) =
+            PmFixtureReadOwnerGrant::allocate().split();
+        let instrument_scope = PmFixtureInstrumentScope::from_metadata(
+            account_config.instrument(),
+            account_config.expected_metadata(),
+        )?;
         let private = PmFixturePrivateLifecycle::new(
+            private_grant,
             account_config.account_scope(),
+            instrument_scope,
             route.source(),
             route.connection(),
         )?;
         let reconciliation = PmFixtureReconciliation::new(
+            reconciliation_grant,
             account_config.account_scope(),
+            instrument_scope,
             route.source(),
             route.connection(),
         )?;
         let account = PmFixtureAccountPositionSnapshot::new(
+            account_grant,
             account_config.account_scope(),
-            account_config.instrument(),
+            instrument_scope,
             route.source(),
             route.connection(),
-            account_config.required_spenders().to_vec(),
         )?;
-        let fake_effect =
-            PmFakeEffectRole::new(account_config.account_scope(), account_config.instrument());
+        let fake_effect = PmFakeEffectRole::new(
+            account_config.account_scope(),
+            account_config.instrument(),
+            account_config.instrument_id(),
+        );
         let schedule = PmQuoteScheduleRole::new(public.instrument());
         let mut bindings = capture.bindings(public);
-        bindings.extend(monitor_bindings(&private, &reconciliation, &account)?);
+        bindings.extend(monitor_bindings(
+            account_config,
+            &private,
+            &reconciliation,
+            &account,
+        )?);
         bindings.extend(fake_effect.bindings());
         bindings.push(schedule.binding());
         plan.validate_bindings(&bindings)?;
@@ -1034,27 +993,4 @@ impl<M: PmQuoteModelRequirements> PmProduct<M> {
         debug_assert_eq!(self.schedule.instrument(), public.instrument());
         self.bindings.len()
     }
-}
-
-fn monitor_bindings(
-    private: &PmFixturePrivateLifecycle,
-    reconciliation: &PmFixtureReconciliation,
-    account: &PmFixtureAccountPositionSnapshot,
-) -> Result<Vec<ConstructedRoleBinding>, PmPlanError> {
-    let mut bindings = Vec::with_capacity(16);
-    bindings.extend(ConstructedRoleBinding::private_lifecycle(
-        private.account_scope(),
-        PmConnectionRoute::new(private.source(), private.connection()),
-    ));
-    bindings.extend(ConstructedRoleBinding::reconciliation(
-        reconciliation.account_scope(),
-        PmConnectionRoute::new(reconciliation.source(), reconciliation.connection()),
-    ));
-    bindings.extend(ConstructedRoleBinding::account_snapshot(
-        account.account_scope(),
-        account.instrument(),
-        account.required_spenders(),
-        PmConnectionRoute::new(account.source(), account.connection()),
-    )?);
-    Ok(bindings)
 }

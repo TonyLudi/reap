@@ -1,22 +1,27 @@
+#![allow(dead_code)]
+
 use std::time::Duration;
 
 use reap_okx_public_source::OkxPublicSession;
 use reap_pm_core::{
     ConnectionEpoch, EvmAddress, MAX_OKX_REFERENCES_PER_MAPPING, MAX_REQUIRED_SPENDERS,
     OkxInstrumentId, OkxReferenceHandle, OkxReferenceInstrument, PmAssetId, PmChainId,
-    PmConditionId, PmConnectionId, PmInstrumentHandle, PmMarketHandle, PmMarketId,
-    PmMarketLifecycle, PmMarketMetadata, PmOutcomeLabel, PmOutcomeMetadata, PmProductSource,
-    PmQuantity, PmReferenceMapping, PmSourceHandle, PmSpenderDomain, PmSpenderRequirement, PmTick,
-    PmTokenHandle, PmTokenId, SnapshotRevision, U256,
+    PmConditionId, PmConnectionId, PmEnvironmentId, PmFunderId, PmInstrumentHandle, PmMarketHandle,
+    PmMarketId, PmMarketLifecycle, PmMarketMetadata, PmOutcomeLabel, PmOutcomeMetadata,
+    PmProductSource, PmQuantity, PmReferenceMapping, PmSignerId, PmSourceHandle, PmSpenderDomain,
+    PmSpenderRequirement, PmTick, PmTokenHandle, PmTokenId, SnapshotRevision, U256,
 };
 use reap_pm_live::{
     PmCaptureHeader, PmCaptureProvenance, PmCaptureReconnectPolicy, PmCaptureScope,
     PmCaptureSessionPolicy,
 };
-use reap_pm_live_contracts::{PmConnectionRoute, PmPublicConnectivityConfig};
+use reap_pm_live_contracts::{
+    PmAccountConnectivityConfig, PmConnectionRoute, PmPublicConnectivityConfig,
+};
 use reap_pm_state::{
-    PmBookFreshness, PmBookReducer, PmBookTransition, PmDomainFingerprint, PmMetadataContract,
-    PmMetadataFingerprint, PmMetadataObservation,
+    PmBookFreshness, PmBookReducer, PmBookTransition, PmCardinalityRiskLimits, PmDomainFingerprint,
+    PmExposureRiskLimits, PmFreshnessRiskLimits, PmMetadataContract, PmMetadataFingerprint,
+    PmMetadataObservation, PmOrderRiskLimits, PmRiskLimits,
 };
 use reap_polymarket_adapter::{
     PmAuthoritativeMetadata, PmMetadataRevisionInput, PmPublicHeartbeatConfig, PmPublicRole,
@@ -28,19 +33,12 @@ pub const MARKET: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 pub const TOKEN: u64 = 123;
 pub const PM_CONNECTION: &str = "pm-public-0";
 pub const OKX_CONNECTION: &str = "okx-reference-0";
+pub const PM_ACCOUNT_CONNECTION: &str = "pm-account-0";
+pub const PM_FUNDER: &str = "0xabababababababababababababababababababab";
 
 const PUSD: &str = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
 const CONDITIONAL_TOKENS: &str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
 const STANDARD_EXCHANGE: &str = "0xE111180000d2663C0091e4f400237545B87B996B";
-
-const METADATA_FINGERPRINT: [u8; 32] = [
-    0x56, 0xe6, 0x3e, 0x42, 0x68, 0x0b, 0x3a, 0x09, 0xf3, 0xd9, 0x08, 0x1a, 0xbb, 0x74, 0x0a, 0x3c,
-    0x12, 0x16, 0x70, 0xed, 0xc6, 0xa1, 0x2e, 0xf1, 0xbe, 0x5d, 0x42, 0x47, 0xb5, 0x29, 0x1e, 0x8f,
-];
-const DOMAIN_FINGERPRINT: [u8; 32] = [
-    0x7f, 0xea, 0xda, 0xb5, 0xff, 0x07, 0xd5, 0xcd, 0x98, 0x19, 0xe9, 0xd6, 0xfd, 0x89, 0xe5, 0xc4,
-    0x05, 0x0f, 0x1e, 0xce, 0xfd, 0x74, 0x89, 0x48, 0x4e, 0xf7, 0x03, 0xd6, 0xf0, 0x9f, 0x0c, 0x62,
-];
 
 pub fn instrument() -> PmInstrumentHandle {
     PmInstrumentHandle::new(
@@ -97,13 +95,19 @@ pub fn market_metadata() -> PmMarketMetadata {
 }
 
 pub fn authoritative() -> PmAuthoritativeMetadata {
-    PmAuthoritativeMetadata::verify_recorded(
+    let lifecycle = format!(
+        r#"{{"condition_id":"{CONDITION}","market_id":"{MARKET}","active":true,"closed":false,"archived":false,"accepting_orders":true,"enable_order_book":true}}"#
+    );
+    let clob = format!(
+        r#"{{"condition_id":"{CONDITION}","market_id":"{MARKET}","minimum_tick_size":"0.01","minimum_order_size":"5","neg_risk":false,"tokens":[{{"token_id":"{TOKEN}","outcome":"Yes"}},{{"token_id":"456","outcome":"No"}}]}}"#
+    );
+    PmAuthoritativeMetadata::join_raw(
         instrument(),
         pm_source(),
         market_metadata(),
+        lifecycle.as_bytes(),
+        clob.as_bytes(),
         PmMetadataRevisionInput::new(SnapshotRevision::new(7), 50).unwrap(),
-        METADATA_FINGERPRINT,
-        DOMAIN_FINGERPRINT,
     )
     .unwrap()
 }
@@ -120,6 +124,60 @@ pub fn public_config() -> PmPublicConnectivityConfig {
         PmConnectionRoute::new(pm_source(), PmConnectionId::new(PM_CONNECTION).unwrap()),
     )
     .unwrap()
+}
+
+pub fn account_scope() -> reap_pm_core::PmAccountScope {
+    let eoa = address(PM_FUNDER);
+    reap_pm_core::PmAccountScope::new(
+        PmEnvironmentId::new("phase4-fixture").unwrap(),
+        PmChainId::new(137).unwrap(),
+        PmSignerId::new(eoa),
+        PmFunderId::new(eoa),
+        reap_pm_core::PmAccountHandle::from_ordinal(7),
+    )
+}
+
+pub fn account_source() -> PmProductSource {
+    PmProductSource::polymarket_account(PmSourceHandle::from_ordinal(4), account_scope().handle())
+}
+
+pub fn account_config() -> PmAccountConnectivityConfig {
+    PmAccountConnectivityConfig::derive_goal_f(
+        &public_config(),
+        account_scope(),
+        PmConnectionRoute::new(
+            account_source(),
+            PmConnectionId::new(PM_ACCOUNT_CONNECTION).unwrap(),
+        ),
+    )
+    .unwrap()
+}
+
+pub fn private_risk_limits() -> PmRiskLimits {
+    PmRiskLimits::new(
+        PmOrderRiskLimits::new(
+            PmQuantity::parse_decimal("100").unwrap(),
+            U256::from_u64(100_000_000),
+        )
+        .unwrap(),
+        PmExposureRiskLimits::new(
+            U256::from_u64(1_000_000_000),
+            U256::from_u64(1_000_000_000),
+            U256::from_u64(1_000_000_000),
+            U256::from_u64(1_000_000_000),
+        )
+        .unwrap(),
+        PmCardinalityRiskLimits::new(128, 128, 128).unwrap(),
+        PmFreshnessRiskLimits::new(
+            1_000_000_000,
+            1_000_000_000,
+            1_000_000_000,
+            1_000_000_000,
+            1_000_000_000,
+            1_000_000_000,
+        )
+        .unwrap(),
+    )
 }
 
 pub fn session_policy() -> PmCaptureSessionPolicy {
@@ -149,7 +207,8 @@ pub fn provenance() -> PmCaptureProvenance {
 }
 
 pub fn capture_header() -> PmCaptureHeader {
-    let scope = PmCaptureScope::new(&public_config(), authoritative()).unwrap();
+    let authority = authoritative();
+    let scope = PmCaptureScope::new(&public_config(), &authority).unwrap();
     PmCaptureHeader::new(scope, session_policy(), provenance()).unwrap()
 }
 

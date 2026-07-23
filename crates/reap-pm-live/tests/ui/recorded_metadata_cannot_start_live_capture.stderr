@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+  --> tests/ui/recorded_metadata_cannot_start_live_capture.rs:15:48
+   |
+15 |         .start(PathBuf::from("capture.jsonl"), recorded, policy, provenance)
+   |          -----                                 ^^^^^^^^ expected `PmAuthoritativeMetadata`, found `PmRecordedMetadataEvidence`
+   |          |
+   |          arguments to this method are incorrect
+   |
+note: method defined here
+  --> src/composition.rs
+   |
+   |     pub async fn start(
+   |                  ^^^^^

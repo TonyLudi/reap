@@ -44,8 +44,10 @@ pub enum PmEventError {
     MissingOrderIdentity,
     #[error("client and venue order identifiers belong to different accounts")]
     OrderIdentityAccountMismatch,
-    #[error("fill and order identifiers belong to different accounts")]
-    FillOrderAccountMismatch,
+    #[error("fill requires an exact venue-order identity on its order")]
+    MissingFillVenueOrderIdentity,
+    #[error("fill key and order identity name different venue-order legs")]
+    FillVenueOrderMismatch,
     #[error("cumulative fill exceeds original order quantity")]
     CumulativeFillExceedsOriginal,
     #[error("order status is inconsistent with cumulative fill")]
@@ -629,6 +631,20 @@ pub enum PmFillRole {
     Taker,
 }
 
+/// Exact Polymarket trade-settlement lifecycle.
+///
+/// A matched trade affects provisional inventory immediately, but only
+/// authoritative reconciliation may clear retry/failure uncertainty. This
+/// value never implies that a balance or position snapshot changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PmFillSettlementStatus {
+    Matched,
+    Mined,
+    Confirmed,
+    Retrying,
+    Failed,
+}
+
 /// A fee is never collapsed to zero when the venue response is absent or
 /// partial. Known deltas retain the exact affected asset and sign.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -645,6 +661,7 @@ pub enum PmFillFee {
 pub struct PmFillExecution {
     side: PmOrderSide,
     role: PmFillRole,
+    settlement: PmFillSettlementStatus,
     price: PmPrice,
     quantity: PmQuantity,
     fee: PmFillFee,
@@ -655,6 +672,7 @@ impl PmFillExecution {
     pub const fn new(
         side: PmOrderSide,
         role: PmFillRole,
+        settlement: PmFillSettlementStatus,
         price: PmPrice,
         quantity: PmQuantity,
         fee: PmFillFee,
@@ -662,6 +680,7 @@ impl PmFillExecution {
         Self {
             side,
             role,
+            settlement,
             price,
             quantity,
             fee,
@@ -676,6 +695,11 @@ impl PmFillExecution {
     #[must_use]
     pub const fn role(self) -> PmFillRole {
         self.role
+    }
+
+    #[must_use]
+    pub const fn settlement(self) -> PmFillSettlementStatus {
+        self.settlement
     }
 
     #[must_use]
@@ -711,8 +735,11 @@ impl PmFillEvent {
         order: PmOrderIdentity,
         execution: PmFillExecution,
     ) -> Result<Self, PmEventError> {
-        if fill_key.account() != order.account() {
-            return Err(PmEventError::FillOrderAccountMismatch);
+        let order_venue = order
+            .venue_order_key()
+            .ok_or(PmEventError::MissingFillVenueOrderIdentity)?;
+        if fill_key.venue_order() != order_venue {
+            return Err(PmEventError::FillVenueOrderMismatch);
         }
         validate_account_source(source, fill_key.account())?;
         Ok(Self {
@@ -755,40 +782,25 @@ impl PmFillEvent {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PmSnapshotCompleteness {
-    Complete,
-    Incomplete,
-}
-
-/// Version and completeness travel together so a partial page cannot carry
-/// the same type as an asserted complete snapshot.
+/// Validated nonzero revision shared by rows from one snapshot response.
+///
+/// This row-level value carries no completeness authority. Only a checked
+/// aggregate reconciliation/account carrier can assert whole-query
+/// completeness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PmSnapshotEvidence {
     revision: SnapshotRevision,
-    completeness: PmSnapshotCompleteness,
 }
 
 impl PmSnapshotEvidence {
-    pub fn new(
-        revision: SnapshotRevision,
-        completeness: PmSnapshotCompleteness,
-    ) -> Result<Self, PmEventError> {
+    pub fn new(revision: SnapshotRevision) -> Result<Self, PmEventError> {
         validate_revision(revision)?;
-        Ok(Self {
-            revision,
-            completeness,
-        })
+        Ok(Self { revision })
     }
 
     #[must_use]
     pub const fn revision(self) -> SnapshotRevision {
         self.revision
-    }
-
-    #[must_use]
-    pub const fn completeness(self) -> PmSnapshotCompleteness {
-        self.completeness
     }
 }
 

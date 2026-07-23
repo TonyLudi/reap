@@ -1,0 +1,12 @@
+{
+  "event_type": "trade",
+  "id": "0xtrade",
+  "market": "0xbd31",
+  "asset_id": "5211431950123",
+  "side": "BUY",
+  "size": "10.0",
+  "price": "0.40",
+  "status": "MATCHED",
+  "maker_address": "0x1111111111111111111111111111111111111111",
+  "transaction_hash": "0xdeadbeef"
+}

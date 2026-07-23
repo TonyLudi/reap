@@ -1,115 +1,79 @@
+mod support;
+
 use reap_pm_core::{
-    EvmAddress, OkxInstrumentId, OkxReferenceInstrument, PmAccountHandle, PmAccountScope,
-    PmChainId, PmConnectionId, PmEnvironmentId, PmFunderId, PmInstrumentHandle, PmInstrumentId,
-    PmMarketHandle, PmMarketId, PmProductSource, PmPublicObservationGrant, PmQuantity, PmSignerId,
-    PmSnapshotCompleteness, PmSnapshotEvidence, PmSourceHandle, PmSpenderId, PmTick, PmTokenHandle,
-    PmTokenId, SnapshotRevision, U256,
+    ConnectionEpoch, IngressSequence, OkxInstrumentId, OkxReferenceInstrument, PmAccountHandle,
+    PmInstrumentHandle, PmProductSource, PmPublicObservationGrant, PmQuantity, PmSourceHandle,
+    PmTick,
 };
 use reap_polymarket_adapter::{
-    PmAccountPositionSnapshotRole, PmCompleteFillPage, PmCompleteOpenOrdersSnapshot,
-    PmFixtureAccountPositionSnapshot, PmFixtureFillWatermark, PmFixtureOwnedExecution,
-    PmFixturePrivateLifecycle, PmFixtureReconciliation, PmOwnedExecutionRole,
-    PmPrivateLifecycleRole, PmPublicObservationRole, PmPublicRole, PmReconciliationContractError,
-    PmReconciliationRole,
+    PmAccountPositionSnapshotRole, PmFixtureOwnedExecution, PmPrivateLifecycleRole,
+    PmPublicObservationRole, PmPublicRole, PmReconciliationRole,
 };
 use reap_polymarket_wire::{PmBookParserConfig, PmWireScope};
 
-fn instrument() -> PmInstrumentHandle {
-    PmInstrumentHandle::new(
-        PmMarketHandle::from_ordinal(0),
-        PmTokenHandle::from_ordinal(0),
-    )
-}
-
-fn account_scope() -> PmAccountScope {
-    let eoa = EvmAddress::from_bytes([7; 20]).unwrap();
-    PmAccountScope::new(
-        PmEnvironmentId::new("fixture").unwrap(),
-        PmChainId::new(137).unwrap(),
-        PmSignerId::new(eoa),
-        PmFunderId::new(eoa),
-        PmAccountHandle::from_ordinal(7),
-    )
-}
-
-fn connection() -> PmConnectionId {
-    PmConnectionId::new("fixture-connection").unwrap()
-}
-
-fn account_source(scope: PmAccountScope) -> PmProductSource {
-    PmProductSource::polymarket_account(PmSourceHandle::from_ordinal(4), scope.handle())
-}
+use support::{
+    CONDITION, account_scope, account_source, account_with, completion, connection, grants,
+    instrument, instrument_scope, private_with, reconciliation_role, reconciliation_with, snapshot,
+};
 
 fn market_source() -> PmProductSource {
-    PmProductSource::polymarket_market(PmSourceHandle::from_ordinal(3), instrument().token())
+    PmProductSource::polymarket_market(
+        PmSourceHandle::from_ordinal(3),
+        observation_grant().instrument().token(),
+    )
 }
 
 fn parser_config() -> PmBookParserConfig {
+    let metadata = instrument_scope().metadata();
     PmBookParserConfig::new(
         PmWireScope::new(
-            reap_pm_core::PmConditionId::parse(
-                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            )
-            .unwrap(),
-            PmMarketId::parse("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
-                .unwrap(),
-            PmTokenId::new(U256::from_u64(11)).unwrap(),
+            metadata.condition(),
+            metadata.market(),
+            metadata.outcome().token(),
         ),
         PmTick::parse_decimal("0.01").unwrap(),
-        PmQuantity::parse_decimal("1").unwrap(),
+        PmQuantity::parse_decimal("5").unwrap(),
         false,
     )
 }
 
 fn observation_grant() -> PmPublicObservationGrant {
-    let scope = parser_config().scope();
     PmPublicObservationGrant::derive_goal_f(
         OkxReferenceInstrument::index(OkxInstrumentId::new("BTC-USDT").unwrap()),
-        PmInstrumentId::new(scope.market(), scope.token()),
+        instrument_scope().id(),
     )
 }
 
 #[test]
-fn five_role_types_retain_exact_scope_source_and_connection() {
-    let scope = account_scope();
-    let source = account_source(scope);
-    let public = PmPublicRole::new(
-        observation_grant(),
-        instrument(),
-        parser_config(),
-        market_source(),
-        connection(),
-    )
-    .unwrap();
-    let private = PmFixturePrivateLifecycle::new(scope, source, connection()).unwrap();
-    let reconciliation = PmFixtureReconciliation::new(scope, source, connection()).unwrap();
-    let snapshots = PmFixtureAccountPositionSnapshot::new(
-        scope,
-        instrument(),
-        source,
-        connection(),
-        Vec::<PmSpenderId>::new(),
-    )
-    .expect("empty spender set is structurally valid at the role seam");
-    let execution = PmFixtureOwnedExecution::new(scope, instrument());
+fn read_grant_builds_exact_three_roles_and_scope_is_metadata_derived() {
+    let (private_grant, reconciliation_grant, account_grant) = grants();
+    let private = private_with(private_grant);
+    let reconciliation = reconciliation_with(reconciliation_grant);
+    let account = account_with(account_grant);
 
-    assert_eq!(public.instrument(), instrument());
-    assert_eq!(public.observation_grant(), observation_grant());
-    assert_eq!(public.parser_config(), parser_config());
-    assert_eq!(public.source(), market_source());
-    assert_eq!(private.account_scope(), scope);
-    assert_eq!(private.source(), source);
-    assert_eq!(reconciliation.account_scope(), scope);
+    assert_eq!(private.account_scope(), account_scope());
+    assert_eq!(private.instrument_scope(), instrument_scope());
+    assert_eq!(private.source(), account_source());
+    assert_eq!(reconciliation.account_scope(), account_scope());
     assert_eq!(reconciliation.connection(), connection());
-    assert_eq!(snapshots.account_scope(), scope);
-    assert_eq!(snapshots.instrument(), instrument());
-    assert_eq!(snapshots.required_spenders(), &[]);
-    assert_eq!(execution.account_scope(), scope);
-    assert_eq!(execution.instrument(), instrument());
+    assert_eq!(account.instrument_scope(), instrument_scope());
+    assert_eq!(
+        account.trading_domain(),
+        instrument_scope().trading_domain()
+    );
+    assert_eq!(account.required_spenders().len(), 2);
+    assert_eq!(
+        instrument_scope().tick(),
+        PmTick::parse_decimal("0.01").unwrap()
+    );
+    assert_eq!(
+        instrument_scope().minimum_order_size(),
+        PmQuantity::parse_decimal("5").unwrap()
+    );
 }
 
 #[test]
-fn role_traits_are_static_and_expose_only_their_exact_scope() {
+fn public_and_owned_execution_roles_remain_disjoint_from_read_grants() {
     fn public<R: PmPublicObservationRole>(role: &R) -> PmInstrumentHandle {
         role.instrument()
     }
@@ -122,104 +86,76 @@ fn role_traits_are_static_and_expose_only_their_exact_scope() {
     fn snapshots<R: PmAccountPositionSnapshotRole>(role: &R) -> PmAccountHandle {
         role.account()
     }
-    fn execution<R: PmOwnedExecutionRole>(role: &R) -> (PmAccountScope, PmInstrumentHandle) {
-        (role.account_scope(), role.instrument())
-    }
 
-    let scope = account_scope();
-    let source = account_source(scope);
+    let (private_grant, reconciliation_grant, account_grant) = grants();
+    let private_role = private_with(private_grant);
+    let reconciliation_role = reconciliation_with(reconciliation_grant);
+    let account_role = account_with(account_grant);
+    let public_instrument = observation_grant().instrument();
+    let public_role = PmPublicRole::new(
+        observation_grant(),
+        public_instrument,
+        parser_config(),
+        market_source(),
+        connection(),
+    )
+    .unwrap();
+    let execution = PmFixtureOwnedExecution::new(account_scope(), instrument());
+
+    assert_eq!(public(&public_role), public_instrument);
+    assert_eq!(private(&private_role), account_scope().handle());
     assert_eq!(
-        public(
-            &PmPublicRole::new(
-                observation_grant(),
-                instrument(),
-                parser_config(),
-                market_source(),
-                connection(),
-            )
-            .unwrap()
-        ),
-        instrument()
+        reconciliation(&reconciliation_role),
+        account_scope().handle()
     );
+    assert_eq!(snapshots(&account_role), account_scope().handle());
+    assert_eq!(execution.account_scope(), account_scope());
+    assert_eq!(execution.instrument(), instrument());
     assert_eq!(
-        private(&PmFixturePrivateLifecycle::new(scope, source, connection()).unwrap()),
-        scope.handle()
-    );
-    assert_eq!(
-        reconciliation(&PmFixtureReconciliation::new(scope, source, connection()).unwrap()),
-        scope.handle()
-    );
-    assert_eq!(
-        snapshots(
-            &PmFixtureAccountPositionSnapshot::new(
-                scope,
-                instrument(),
-                source,
-                connection(),
-                Vec::new(),
-            )
-            .unwrap()
-        ),
-        scope.handle()
-    );
-    assert_eq!(
-        execution(&PmFixtureOwnedExecution::new(scope, instrument())),
-        (scope, instrument())
+        parser_config().scope().condition(),
+        reap_pm_core::PmConditionId::parse(CONDITION).unwrap()
     );
 }
 
 #[test]
-fn reconciliation_outputs_are_atomic_complete_and_watermark_opaque() {
-    let scope = account_scope();
-    let source = account_source(scope);
-    let complete =
-        PmSnapshotEvidence::new(SnapshotRevision::new(1), PmSnapshotCompleteness::Complete)
-            .unwrap();
-    let incomplete =
-        PmSnapshotEvidence::new(SnapshotRevision::new(2), PmSnapshotCompleteness::Incomplete)
-            .unwrap();
+fn sibling_equal_config_role_cannot_open_another_owner_delivery() {
+    let mut producer = reconciliation_role();
+    let sibling = reconciliation_role();
+    let delivery = producer
+        .request_open_orders(ConnectionEpoch::new(1), IngressSequence::new(10))
+        .unwrap()
+        .complete(completion(1, 11, Some(1)), snapshot(1), &[])
+        .unwrap()
+        .service_at(30_000)
+        .unwrap();
 
-    let open = PmCompleteOpenOrdersSnapshot::new(source, scope, complete, Vec::new()).unwrap();
-    assert_eq!(open.account_scope(), scope);
-    assert!(open.orders().is_empty());
-    assert_eq!(
-        PmCompleteOpenOrdersSnapshot::new(source, scope, incomplete, Vec::new()),
-        Err(PmReconciliationContractError::IncompleteSnapshot)
+    let delivery = sibling
+        .reduce_open_orders_delivery(delivery, |_, _| ())
+        .expect_err("equal configuration is not owner authority");
+    let boundary = producer
+        .reduce_open_orders_delivery(*delivery, |scope, envelope| {
+            assert_eq!(scope.account_scope(), account_scope());
+            assert_eq!(scope.instrument_scope(), instrument_scope());
+            envelope.payload().boundary()
+        })
+        .unwrap();
+    assert_eq!(boundary.request_sequence(), IngressSequence::new(10));
+    assert_eq!(boundary.completion_sequence(), IngressSequence::new(11));
+}
+
+#[test]
+fn request_order_is_lexicographic_across_reconnect_epochs_and_query_kinds() {
+    let mut role = reconciliation_role();
+    role.request_open_orders(ConnectionEpoch::new(1), IngressSequence::new(100))
+        .unwrap();
+    assert!(
+        role.request_fills(ConnectionEpoch::new(1), IngressSequence::new(100), None)
+            .is_err()
     );
-
-    let requested = PmFixtureFillWatermark::new(scope, [1; 32]);
-    let next = PmFixtureFillWatermark::new(scope, [9; 32]);
-    let page = PmCompleteFillPage::new(
-        source,
-        scope,
-        complete,
-        Some(requested),
-        Some(next),
-        Vec::new(),
-    )
-    .unwrap();
-    assert_eq!(page.requested_after(), Some(requested));
-    assert_eq!(page.next_after(), Some(next));
-    assert!(page.fills().is_empty());
-
-    let different_scope_with_same_handle = PmAccountScope::new(
-        scope.environment(),
-        scope.chain(),
-        scope.signer(),
-        PmFunderId::new(EvmAddress::from_bytes([8; 20]).unwrap()),
-        scope.handle(),
-    );
-    let wrong_scope_watermark =
-        PmFixtureFillWatermark::new(different_scope_with_same_handle, [1; 32]);
-    assert_eq!(
-        PmCompleteFillPage::new(
-            source,
-            scope,
-            complete,
-            Some(wrong_scope_watermark),
-            None,
-            Vec::new(),
-        ),
-        Err(PmReconciliationContractError::WatermarkAccountMismatch)
+    role.request_fills(ConnectionEpoch::new(2), IngressSequence::new(1), None)
+        .expect("a later epoch resets its ingress sequence");
+    assert!(
+        role.request_open_orders(ConnectionEpoch::new(1), IngressSequence::new(101))
+            .is_err()
     );
 }

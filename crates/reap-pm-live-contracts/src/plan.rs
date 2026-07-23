@@ -1,5 +1,6 @@
 use reap_pm_core::{
-    MAX_REQUIRED_SPENDERS, OkxReferenceHandle, PmAccountScope, PmInstrumentHandle, PmSpenderId,
+    MAX_REQUIRED_SPENDERS, OkxReferenceHandle, PmAccountScope, PmAssetId, PmInstrumentHandle,
+    PmInstrumentId, PmSpenderId,
 };
 use reap_pm_strategy::{PmModelInputRequirement, PmModelInputRequirements};
 use thiserror::Error;
@@ -147,17 +148,27 @@ impl ConstructedRoleBinding {
     }
 
     #[must_use]
-    pub const fn private_lifecycle(account: PmAccountScope, route: PmConnectionRoute) -> [Self; 2] {
+    pub const fn private_lifecycle(
+        account: PmAccountScope,
+        instrument: PmInstrumentHandle,
+        instrument_id: PmInstrumentId,
+        route: PmConnectionRoute,
+    ) -> [Self; 2] {
+        let scope = Scope::AccountInstrument {
+            account,
+            instrument,
+            instrument_id,
+        };
         [
             binding(
                 Id::PrivateOrder,
-                Scope::Account(account),
+                scope,
                 Role::PmPrivateLifecycle,
                 Some(route),
             ),
             binding(
                 Id::PrivateFill,
-                Scope::Account(account),
+                scope,
                 Role::PmPrivateLifecycle,
                 Some(route),
             ),
@@ -165,23 +176,33 @@ impl ConstructedRoleBinding {
     }
 
     #[must_use]
-    pub const fn reconciliation(account: PmAccountScope, route: PmConnectionRoute) -> [Self; 3] {
+    pub const fn reconciliation(
+        account: PmAccountScope,
+        instrument: PmInstrumentHandle,
+        instrument_id: PmInstrumentId,
+        route: PmConnectionRoute,
+    ) -> [Self; 3] {
+        let scope = Scope::AccountInstrument {
+            account,
+            instrument,
+            instrument_id,
+        };
         [
             binding(
                 Id::ReconcileOpenOrders,
-                Scope::Account(account),
+                scope,
                 Role::PmOrderReconciliation,
                 Some(route),
             ),
             binding(
                 Id::ReconcileOrder,
-                Scope::Account(account),
+                scope,
                 Role::PmOrderReconciliation,
                 Some(route),
             ),
             binding(
                 Id::ReconcileFills,
-                Scope::Account(account),
+                scope,
                 Role::PmOrderReconciliation,
                 Some(route),
             ),
@@ -191,6 +212,8 @@ impl ConstructedRoleBinding {
     pub fn account_snapshot(
         account: PmAccountScope,
         instrument: PmInstrumentHandle,
+        instrument_id: PmInstrumentId,
+        collateral_asset: PmAssetId,
         spenders: &[PmSpenderId],
         route: PmConnectionRoute,
     ) -> Result<Vec<Self>, PmPlanError> {
@@ -200,11 +223,15 @@ impl ConstructedRoleBinding {
         let scope = Scope::AccountInstrument {
             account,
             instrument,
+            instrument_id,
         };
         let mut bindings = Vec::with_capacity(3 + spenders.len());
         bindings.push(binding(
             Id::AccountCollateral,
-            Scope::Account(account),
+            Scope::AccountAsset {
+                account,
+                asset: collateral_asset,
+            },
             Role::PmAccountPositionSnapshot,
             Some(route),
         ));
@@ -238,10 +265,12 @@ impl ConstructedRoleBinding {
     pub const fn owned_execution(
         account: PmAccountScope,
         instrument: PmInstrumentHandle,
+        instrument_id: PmInstrumentId,
     ) -> [Self; 2] {
         let scope = Scope::AccountInstrument {
             account,
             instrument,
+            instrument_id,
         };
         [
             binding(
@@ -622,14 +651,18 @@ fn product_public_entries(
 
 fn read_entries(config: &PmAccountConnectivityConfig) -> Vec<PmPlanEntry> {
     let account_scope = config.account_scope();
-    let account = Scope::Account(account_scope);
     let account_instrument = Scope::AccountInstrument {
         account: account_scope,
         instrument: config.instrument(),
+        instrument_id: config.instrument_id(),
+    };
+    let collateral = Scope::AccountAsset {
+        account: account_scope,
+        asset: config.collateral_asset(),
     };
     let mut entries = vec![
         entry(
-            PmRequirementKey::new(Id::PrivateOrder, account),
+            PmRequirementKey::new(Id::PrivateOrder, account_instrument),
             Origin::MandatorySafetyAndReadiness,
             Consumer::CanonicalOrderState,
             Role::PmPrivateLifecycle,
@@ -638,7 +671,7 @@ fn read_entries(config: &PmAccountConnectivityConfig) -> Vec<PmPlanEntry> {
             Some(config.account_route()),
         ),
         entry(
-            PmRequirementKey::new(Id::PrivateFill, account),
+            PmRequirementKey::new(Id::PrivateFill, account_instrument),
             Origin::MandatorySafetyAndReadiness,
             Consumer::FillAndPositionState,
             Role::PmPrivateLifecycle,
@@ -647,7 +680,7 @@ fn read_entries(config: &PmAccountConnectivityConfig) -> Vec<PmPlanEntry> {
             Some(config.account_route()),
         ),
         entry(
-            PmRequirementKey::new(Id::ReconcileOpenOrders, account),
+            PmRequirementKey::new(Id::ReconcileOpenOrders, account_instrument),
             Origin::MandatorySafetyAndReadiness,
             Consumer::OrderReconciliation,
             Role::PmOrderReconciliation,
@@ -656,7 +689,7 @@ fn read_entries(config: &PmAccountConnectivityConfig) -> Vec<PmPlanEntry> {
             Some(config.account_route()),
         ),
         entry(
-            PmRequirementKey::new(Id::ReconcileOrder, account),
+            PmRequirementKey::new(Id::ReconcileOrder, account_instrument),
             Origin::MandatorySafetyAndReadiness,
             Consumer::OrderReconciliation,
             Role::PmOrderReconciliation,
@@ -665,7 +698,7 @@ fn read_entries(config: &PmAccountConnectivityConfig) -> Vec<PmPlanEntry> {
             Some(config.account_route()),
         ),
         entry(
-            PmRequirementKey::new(Id::ReconcileFills, account),
+            PmRequirementKey::new(Id::ReconcileFills, account_instrument),
             Origin::MandatorySafetyAndReadiness,
             Consumer::OrderReconciliation,
             Role::PmOrderReconciliation,
@@ -674,7 +707,7 @@ fn read_entries(config: &PmAccountConnectivityConfig) -> Vec<PmPlanEntry> {
             Some(config.account_route()),
         ),
         entry(
-            PmRequirementKey::new(Id::AccountCollateral, account),
+            PmRequirementKey::new(Id::AccountCollateral, collateral),
             Origin::MandatorySafetyAndReadiness,
             Consumer::PositionReadiness,
             Role::PmAccountPositionSnapshot,
@@ -725,6 +758,7 @@ fn execution_entries(config: &PmAccountConnectivityConfig) -> [PmPlanEntry; 2] {
     let scope = Scope::AccountInstrument {
         account: config.account_scope(),
         instrument: config.instrument(),
+        instrument_id: config.instrument_id(),
     };
     [
         entry(

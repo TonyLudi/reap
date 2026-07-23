@@ -1,7 +1,7 @@
 use reap_pm_core::{
-    MAX_OKX_REFERENCES_PER_MAPPING, MAX_REQUIRED_SPENDERS, OkxReferenceHandle,
-    OkxReferenceInstrument, PmAccountHandle, PmAccountScope, PmConfigurationFingerprint,
-    PmConnectionId, PmInstrumentHandle, PmInstrumentId, PmMarketMetadata, PmProductSource,
+    MAX_OKX_REFERENCES_PER_MAPPING, OkxReferenceHandle, OkxReferenceInstrument, PmAccountHandle,
+    PmAccountScope, PmAssetId, PmConfigurationFingerprint, PmConnectionId, PmGoalFTradingDomain,
+    PmInstrumentHandle, PmInstrumentId, PmMarketMetadata, PmProductSource,
     PmPublicObservationGrant, PmReferenceMapping, PmSpenderId,
 };
 use thiserror::Error;
@@ -18,18 +18,14 @@ pub enum PmConnectivityConfigError {
     WrongGoalFChain,
     #[error("the fixed PM profile requires the EOA signer and funder to match")]
     SignerFunderMismatch,
-    #[error("the fixed PM profile requires at least one exact allowance spender")]
-    MissingRequiredSpender,
-    #[error("configured required-spender count exceeds the domain bound")]
-    TooManyRequiredSpenders,
-    #[error("configured required spender belongs to another account")]
-    SpenderAccountMismatch,
     #[error("configured required spender belongs to another chain")]
     SpenderChainMismatch,
-    #[error("configured required spender occurs more than once")]
-    DuplicateRequiredSpender,
     #[error("public and account scopes name different PM instruments")]
     InstrumentScopeMismatch,
+    #[error("the account market/grid contract differs from the configured public PM instrument")]
+    AccountInstrumentScopeMismatch,
+    #[error("metadata does not prove the exact Goal F Polygon trading domain")]
+    UnsupportedGoalFTradingDomain,
     #[error("OKX route does not name the checked reference")]
     OkxRouteMismatch,
     #[error("PM public route does not name the checked outcome token")]
@@ -71,6 +67,7 @@ pub struct PmPublicConnectivityConfig {
     mapping: PmReferenceMapping,
     okx_reference_instrument: OkxReferenceInstrument,
     expected_metadata: PmMarketMetadata,
+    trading_domain: PmGoalFTradingDomain,
     okx_route: PmConnectionRoute,
     polymarket_route: PmConnectionRoute,
 }
@@ -109,6 +106,8 @@ impl PmPublicConnectivityConfig {
         okx_route: PmConnectionRoute,
         polymarket_route: PmConnectionRoute,
     ) -> Result<Self, PmConnectivityConfigError> {
+        let trading_domain = PmGoalFTradingDomain::from_metadata(expected_metadata)
+            .map_err(|_| PmConnectivityConfigError::UnsupportedGoalFTradingDomain)?;
         if mapping.reference_count() != 1 {
             return Err(PmConnectivityConfigError::ExpectedSingleReference);
         }
@@ -150,6 +149,7 @@ impl PmPublicConnectivityConfig {
             mapping,
             okx_reference_instrument,
             expected_metadata,
+            trading_domain,
             okx_route,
             polymarket_route,
         })
@@ -186,6 +186,11 @@ impl PmPublicConnectivityConfig {
     }
 
     #[must_use]
+    pub const fn trading_domain(&self) -> PmGoalFTradingDomain {
+        self.trading_domain
+    }
+
+    #[must_use]
     pub const fn polymarket_instrument_id(&self) -> PmInstrumentId {
         PmInstrumentId::new(
             self.expected_metadata.market(),
@@ -212,17 +217,22 @@ impl PmPublicConnectivityConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PmAccountConnectivityConfig {
     instrument: PmInstrumentHandle,
+    instrument_id: PmInstrumentId,
+    expected_metadata: PmMarketMetadata,
+    trading_domain: PmGoalFTradingDomain,
     account_scope: PmAccountScope,
     account_route: PmConnectionRoute,
-    required_spenders: Vec<PmSpenderId>,
+    required_spenders: [PmSpenderId; 2],
 }
 
 impl PmAccountConnectivityConfig {
-    pub fn new(
-        instrument: PmInstrumentHandle,
+    /// Derives the private/account scope from the already checked public
+    /// market contract so tick, minimum, structural identity, chain, assets,
+    /// and spenders cannot drift across the two capability roots.
+    pub fn derive_goal_f(
+        public: &PmPublicConnectivityConfig,
         account_scope: PmAccountScope,
         account_route: PmConnectionRoute,
-        mut required_spenders: Vec<PmSpenderId>,
     ) -> Result<Self, PmConnectivityConfigError> {
         if account_scope.chain().value() != 137 {
             return Err(PmConnectivityConfigError::WrongGoalFChain);
@@ -237,30 +247,19 @@ impl PmAccountConnectivityConfig {
         ) {
             return Err(PmConnectivityConfigError::AccountRouteMismatch);
         }
-        if required_spenders.is_empty() {
-            return Err(PmConnectivityConfigError::MissingRequiredSpender);
-        }
-        if required_spenders.len() > MAX_REQUIRED_SPENDERS {
-            return Err(PmConnectivityConfigError::TooManyRequiredSpenders);
-        }
-        if required_spenders
-            .iter()
-            .any(|spender| spender.account() != account_scope.handle())
-        {
-            return Err(PmConnectivityConfigError::SpenderAccountMismatch);
-        }
-        if required_spenders
-            .iter()
-            .any(|spender| spender.requirement().chain() != account_scope.chain())
-        {
+        if public.trading_domain().chain() != account_scope.chain() {
             return Err(PmConnectivityConfigError::SpenderChainMismatch);
         }
+        let mut required_spenders = public
+            .trading_domain()
+            .required_spenders()
+            .map(|requirement| PmSpenderId::new(account_scope.handle(), requirement));
         required_spenders.sort_by_key(|spender| spender.requirement());
-        if required_spenders.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err(PmConnectivityConfigError::DuplicateRequiredSpender);
-        }
         Ok(Self {
-            instrument,
+            instrument: public.instrument(),
+            instrument_id: public.polymarket_instrument_id(),
+            expected_metadata: public.expected_metadata(),
+            trading_domain: public.trading_domain(),
             account_scope,
             account_route,
             required_spenders,
@@ -270,6 +269,26 @@ impl PmAccountConnectivityConfig {
     #[must_use]
     pub const fn instrument(&self) -> PmInstrumentHandle {
         self.instrument
+    }
+
+    #[must_use]
+    pub const fn instrument_id(&self) -> PmInstrumentId {
+        self.instrument_id
+    }
+
+    #[must_use]
+    pub const fn expected_metadata(&self) -> PmMarketMetadata {
+        self.expected_metadata
+    }
+
+    #[must_use]
+    pub const fn trading_domain(&self) -> PmGoalFTradingDomain {
+        self.trading_domain
+    }
+
+    #[must_use]
+    pub const fn collateral_asset(&self) -> PmAssetId {
+        self.trading_domain.collateral()
     }
 
     #[must_use]
@@ -309,8 +328,16 @@ impl PmConnectivityConfig {
         public: PmPublicConnectivityConfig,
         account: PmAccountConnectivityConfig,
     ) -> Result<Self, PmConnectivityConfigError> {
-        if public.instrument() != account.instrument() {
+        if public.instrument() != account.instrument()
+            || public.polymarket_instrument_id() != account.instrument_id()
+        {
             return Err(PmConnectivityConfigError::InstrumentScopeMismatch);
+        }
+        if public.expected_metadata() != account.expected_metadata() {
+            return Err(PmConnectivityConfigError::AccountInstrumentScopeMismatch);
+        }
+        if public.trading_domain() != account.trading_domain() {
+            return Err(PmConnectivityConfigError::RequiredSpenderSetMismatch);
         }
         if public.expected_metadata().chain() != account.account_scope().chain() {
             return Err(PmConnectivityConfigError::AccountMarketChainMismatch);

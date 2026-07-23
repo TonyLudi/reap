@@ -8,13 +8,7 @@ error[E0599]: no method named `cancel_owned` found for struct `PmFixtureReconcil
   --> tests/ui/private_read_roles_have_no_mutation.rs:11:20
    |
 11 |     reconciliation.cancel_owned();
-   |                    ^^^^^^^^^^^^
-   |
-help: there is a method `to_owned` with a similar name
-   |
-11 -     reconciliation.cancel_owned();
-11 +     reconciliation.to_owned();
-   |
+   |                    ^^^^^^^^^^^^ method not found in `PmFixtureReconciliation`
 
 error[E0599]: no method named `execution` found for struct `PmFixtureAccountPositionSnapshot` in the current scope
   --> tests/ui/private_read_roles_have_no_mutation.rs:12:13

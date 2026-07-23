@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 mod support;
 
 use reap_pm_live::{

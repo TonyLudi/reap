@@ -1,0 +1,47 @@
+error[E0277]: the trait bound `PmFixtureReadOwnerGrant: Clone` is not satisfied
+ --> tests/ui/fixture_read_authority_is_linear.rs:9:21
+  |
+9 |     require_clone::<PmFixtureReadOwnerGrant>();
+  |                     ^^^^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `PmFixtureReadOwnerGrant`
+  |
+note: required by a bound in `require_clone`
+ --> tests/ui/fixture_read_authority_is_linear.rs:6:21
+  |
+6 | fn require_clone<T: Clone>() {}
+  |                     ^^^^^ required by this bound in `require_clone`
+
+error[E0277]: the trait bound `PmFixturePrivateRoleGrant: Clone` is not satisfied
+  --> tests/ui/fixture_read_authority_is_linear.rs:10:21
+   |
+10 |     require_clone::<PmFixturePrivateRoleGrant>();
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `PmFixturePrivateRoleGrant`
+   |
+note: required by a bound in `require_clone`
+  --> tests/ui/fixture_read_authority_is_linear.rs:6:21
+   |
+ 6 | fn require_clone<T: Clone>() {}
+   |                     ^^^^^ required by this bound in `require_clone`
+
+error[E0277]: the trait bound `PmFixtureReconciliationRoleGrant: Clone` is not satisfied
+  --> tests/ui/fixture_read_authority_is_linear.rs:11:21
+   |
+11 |     require_clone::<PmFixtureReconciliationRoleGrant>();
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `PmFixtureReconciliationRoleGrant`
+   |
+note: required by a bound in `require_clone`
+  --> tests/ui/fixture_read_authority_is_linear.rs:6:21
+   |
+ 6 | fn require_clone<T: Clone>() {}
+   |                     ^^^^^ required by this bound in `require_clone`
+
+error[E0277]: the trait bound `PmFixtureAccountRoleGrant: Clone` is not satisfied
+  --> tests/ui/fixture_read_authority_is_linear.rs:12:21
+   |
+12 |     require_clone::<PmFixtureAccountRoleGrant>();
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `PmFixtureAccountRoleGrant`
+   |
+note: required by a bound in `require_clone`
+  --> tests/ui/fixture_read_authority_is_linear.rs:6:21
+   |
+ 6 | fn require_clone<T: Clone>() {}
+   |                     ^^^^^ required by this bound in `require_clone`

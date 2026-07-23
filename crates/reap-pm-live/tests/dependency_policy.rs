@@ -193,6 +193,33 @@ fn pm_state_remains_a_pure_reducer_crate() {
 }
 
 #[test]
+fn read_only_private_monitor_has_no_lane_model_mutation_or_wire_escape() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/private_monitor.rs");
+    let source = std::fs::read_to_string(&path).unwrap();
+    for forbidden in [
+        "crate::lanes",
+        "crate::capture",
+        "crate::fake_effect",
+        "crate::schedule",
+        "PmQuoteModel",
+        "journal",
+        "reap_polymarket_wire",
+        "tokio",
+        "reqwest",
+        "Authenticated",
+        "PrivateKey",
+        "ApiKey",
+        "arbitrary_command",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "{} contains forbidden monitor token {forbidden}",
+            path.display()
+        );
+    }
+}
+
+#[test]
 fn base64_is_confined_to_capture_schema_and_replay_modules() {
     let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let capture = source_root.join("capture.rs");

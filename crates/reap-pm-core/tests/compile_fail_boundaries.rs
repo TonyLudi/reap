@@ -11,4 +11,6 @@ fn pm_core_checked_values_and_typed_envelopes_cannot_be_bypassed() {
     tests.compile_fail("tests/ui/pm_state_consumer_cannot_mint_unchecked_values.rs");
     tests.compile_fail("tests/ui/pm_strategy_consumer_cannot_access_raw_auth.rs");
     tests.compile_fail("tests/ui/price_deserialization_cannot_mint_off_grid_candidate.rs");
+    tests.compile_fail("tests/ui/snapshot_rows_cannot_claim_completeness.rs");
+    tests.compile_fail("tests/ui/fill_key_has_no_unversioned_serde_schema.rs");
 }

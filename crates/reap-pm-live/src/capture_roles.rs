@@ -106,6 +106,12 @@ impl PmCaptureRoles {
         authoritative: PmAuthoritativeMetadata,
         policy: PmCaptureSessionPolicy,
     ) -> Result<Self, PmCaptureRoleStartError> {
+        let expected_metadata_fingerprint =
+            PmMetadataFingerprint::new(authoritative.metadata_fingerprint())?;
+        let expected_metadata_contract = PmMetadataContract::goal_f_clob_v2(
+            config.expected_metadata(),
+            PmDomainFingerprint::new(authoritative.domain_fingerprint())?,
+        );
         let pm = PmPublicSession::new(
             blueprint.polymarket,
             authoritative,
@@ -120,12 +126,6 @@ impl PmCaptureRoles {
             policy.okx_initial_epoch(),
             policy.okx_reconnect().as_transport(),
         )?;
-        let expected_metadata_fingerprint =
-            PmMetadataFingerprint::new(authoritative.metadata_fingerprint())?;
-        let expected_metadata_contract = PmMetadataContract::goal_f_clob_v2(
-            config.expected_metadata(),
-            PmDomainFingerprint::new(authoritative.domain_fingerprint())?,
-        );
         let routes = PmPublicRoutes::new(config, &pm, &okx)?;
         Ok(Self {
             pm,

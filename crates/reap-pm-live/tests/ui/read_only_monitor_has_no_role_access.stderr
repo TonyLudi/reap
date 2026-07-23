@@ -1,0 +1,23 @@
+error[E0599]: no method named `private_role` found for reference `&PmReadOnlyMonitor` in the current scope
+ --> tests/ui/read_only_monitor_has_no_role_access.rs:4:18
+  |
+4 |     let _ = root.private_role();
+  |                  ^^^^^^^^^^^^
+  |
+help: there is a method `private_projection` with a similar name
+  |
+4 -     let _ = root.private_role();
+4 +     let _ = root.private_projection();
+  |
+
+error[E0599]: no method named `reconciliation_role` found for reference `&PmReadOnlyMonitor` in the current scope
+ --> tests/ui/read_only_monitor_has_no_role_access.rs:5:18
+  |
+5 |     let _ = root.reconciliation_role();
+  |                  ^^^^^^^^^^^^^^^^^^^ method not found in `&PmReadOnlyMonitor`
+
+error[E0599]: no method named `account_role` found for reference `&PmReadOnlyMonitor` in the current scope
+ --> tests/ui/read_only_monitor_has_no_role_access.rs:6:18
+  |
+6 |     let _ = root.account_role();
+  |                  ^^^^^^^^^^^^ method not found in `&PmReadOnlyMonitor`

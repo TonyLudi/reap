@@ -19,6 +19,7 @@ use reap_pm_state::PmBookFreshness;
 use reap_polymarket_adapter::{
     MAX_PM_PUBLIC_RAW_FRAME_BYTES, PmAuthoritativeMetadata, PmMetadataJoinError,
     PmMetadataRevisionInput, PmPublicHeartbeatConfig, PmPublicSessionFault,
+    PmRecordedMetadataEvidence,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -88,7 +89,7 @@ pub struct PmCaptureScope {
 impl PmCaptureScope {
     pub fn new(
         config: &PmPublicConnectivityConfig,
-        authoritative: PmAuthoritativeMetadata,
+        authoritative: &PmAuthoritativeMetadata,
     ) -> Result<Self, PmCaptureVerifyError> {
         let event = authoritative.event();
         if event.instrument() != config.instrument()
@@ -224,7 +225,7 @@ impl PmCaptureScope {
         &self.domain_sha256
     }
 
-    pub fn authoritative_metadata(&self) -> Result<PmAuthoritativeMetadata, PmCaptureVerifyError> {
+    pub fn recorded_metadata(&self) -> Result<PmRecordedMetadataEvidence, PmCaptureVerifyError> {
         let metadata_fingerprint = decode_digest(&self.metadata_sha256)?;
         let domain_fingerprint = decode_digest(&self.domain_sha256)?;
         let revision = PmMetadataRevisionInput::new(
@@ -232,7 +233,7 @@ impl PmCaptureScope {
             self.metadata_monotonic_receive_ns,
         )
         .map_err(PmCaptureVerifyError::Metadata)?;
-        PmAuthoritativeMetadata::verify_recorded(
+        PmRecordedMetadataEvidence::verify(
             self.instrument,
             self.source,
             self.metadata,

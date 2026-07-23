@@ -1,0 +1,11 @@
+error[E0599]: no method named `private_state` found for mutable reference `&mut PmReadOnlyMonitor` in the current scope
+ --> tests/ui/read_only_monitor_has_no_state_access.rs:4:18
+  |
+4 |     let _ = root.private_state();
+  |                  ^^^^^^^^^^^^^ method not found in `&mut PmReadOnlyMonitor`
+
+error[E0599]: no method named `state_mut` found for mutable reference `&mut PmReadOnlyMonitor` in the current scope
+ --> tests/ui/read_only_monitor_has_no_state_access.rs:5:18
+  |
+5 |     let _ = root.state_mut();
+  |                  ^^^^^^^^^ method not found in `&mut PmReadOnlyMonitor`

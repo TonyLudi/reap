@@ -4,13 +4,18 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 use crate::identity::{
-    EvmAddress, PmAssetId, PmChainId, PmConditionId, PmMarketId, PmSpenderDomain,
+    EvmAddress, PmAssetId, PmChainId, PmConditionId, PmInstrumentId, PmMarketId, PmSpenderDomain,
     PmSpenderRequirement, PmTokenId,
 };
 use crate::numeric::{CLOB_V2_LOT_UNITS, PmQuantity, PmTick};
 
 pub const MAX_REQUIRED_SPENDERS: usize = 8;
 const OUTCOME_LABEL_CAPACITY: usize = 96;
+const GOAL_F_POLYGON_CHAIN_ID: u64 = 137;
+const GOAL_F_PUSD: &str = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
+const GOAL_F_CONDITIONAL_TOKENS: &str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
+const GOAL_F_STANDARD_EXCHANGE: &str = "0xE111180000d2663C0091e4f400237545B87B996B";
+const GOAL_F_NEGATIVE_RISK_EXCHANGE: &str = "0xe2222d279d744050d28e00520010520000310F59";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum PmMetadataError {
@@ -36,6 +41,12 @@ pub enum PmMetadataError {
     SpenderAddressMismatch,
     #[error("required spender outcome token does not match the market outcome")]
     SpenderOutcomeTokenMismatch,
+    #[error("Goal F supports only the exact Polygon CLOB V2 chain")]
+    UnsupportedGoalFChain,
+    #[error("Goal F metadata names an unsupported CLOB V2 exchange/domain")]
+    UnsupportedGoalFExchange,
+    #[error("Goal F metadata does not contain the exact collateral and outcome spender set")]
+    UnsupportedGoalFSpenderSet,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -339,6 +350,110 @@ impl PmMarketMetadata {
     pub const fn required_spender_count(self) -> u8 {
         self.required_spender_count
     }
+}
+
+/// Exact non-secret chain, asset, exchange, and spender contract reached by
+/// the Goal F CLOB V2 product.
+///
+/// This is deliberately distinct from a general metadata row. Account and
+/// reservation state may use it without selecting a first map value or
+/// inferring a collateral contract from an arbitrary configured spender.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PmGoalFTradingDomain {
+    instrument: PmInstrumentId,
+    chain: PmChainId,
+    collateral: PmAssetId,
+    outcome: PmAssetId,
+    exchange: EvmAddress,
+    spender_domain: PmSpenderDomain,
+    required_spenders: [PmSpenderRequirement; 2],
+}
+
+impl PmGoalFTradingDomain {
+    pub fn from_metadata(metadata: PmMarketMetadata) -> Result<Self, PmMetadataError> {
+        if metadata.chain().value() != GOAL_F_POLYGON_CHAIN_ID {
+            return Err(PmMetadataError::UnsupportedGoalFChain);
+        }
+        let exchange = goal_f_address(if metadata.negative_risk() {
+            GOAL_F_NEGATIVE_RISK_EXCHANGE
+        } else {
+            GOAL_F_STANDARD_EXCHANGE
+        });
+        if metadata.exchange() != exchange {
+            return Err(PmMetadataError::UnsupportedGoalFExchange);
+        }
+
+        let spender_domain = if metadata.negative_risk() {
+            PmSpenderDomain::NegativeRisk
+        } else {
+            PmSpenderDomain::Standard
+        };
+        let collateral = PmAssetId::collateral(goal_f_address(GOAL_F_PUSD));
+        let outcome = PmAssetId::outcome(
+            goal_f_address(GOAL_F_CONDITIONAL_TOKENS),
+            metadata.outcome().token(),
+        );
+        let required_spenders = [
+            PmSpenderRequirement::new(metadata.chain(), exchange, spender_domain, collateral),
+            PmSpenderRequirement::new(metadata.chain(), exchange, spender_domain, outcome),
+        ];
+        if usize::from(metadata.required_spender_count()) != required_spenders.len()
+            || required_spenders
+                .iter()
+                .any(|required| !metadata.required_spenders().any(|value| value == *required))
+        {
+            return Err(PmMetadataError::UnsupportedGoalFSpenderSet);
+        }
+
+        Ok(Self {
+            instrument: PmInstrumentId::new(metadata.market(), metadata.outcome().token()),
+            chain: metadata.chain(),
+            collateral,
+            outcome,
+            exchange,
+            spender_domain,
+            required_spenders,
+        })
+    }
+
+    #[must_use]
+    pub const fn instrument(self) -> PmInstrumentId {
+        self.instrument
+    }
+
+    #[must_use]
+    pub const fn chain(self) -> PmChainId {
+        self.chain
+    }
+
+    #[must_use]
+    pub const fn collateral(self) -> PmAssetId {
+        self.collateral
+    }
+
+    #[must_use]
+    pub const fn outcome(self) -> PmAssetId {
+        self.outcome
+    }
+
+    #[must_use]
+    pub const fn exchange(self) -> EvmAddress {
+        self.exchange
+    }
+
+    #[must_use]
+    pub const fn spender_domain(self) -> PmSpenderDomain {
+        self.spender_domain
+    }
+
+    #[must_use]
+    pub const fn required_spenders(self) -> [PmSpenderRequirement; 2] {
+        self.required_spenders
+    }
+}
+
+fn goal_f_address(input: &'static str) -> EvmAddress {
+    EvmAddress::parse(input).expect("frozen Goal F address")
 }
 
 impl<'de> Deserialize<'de> for PmMarketMetadata {

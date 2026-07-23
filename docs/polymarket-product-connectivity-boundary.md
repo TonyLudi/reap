@@ -110,7 +110,7 @@ The structural identities are:
 | Allowance spender | chain, exact spender address/domain, asset class, and account scope | One state entry per required spender; never “first map value” |
 | PM client order | account scope plus fixed-width locally generated ID | Identity is bound to the approved canonical order fields |
 | PM venue order | account scope plus exact venue order/hash ID | Remote IDs do not establish local ownership |
-| PM fill/trade | account scope plus exact venue fill/trade ID | Deduplicated independently of order cumulative progress |
+| PM fill/trade | account scope plus the exact venue-order leg plus exact trade ID | A trade with multiple maker legs produces one distinct fill identity per exact venue-order leg; deduplicated independently of order cumulative progress |
 | Connection/snapshot | source, connection epoch, snapshot revision, and local ingress sequence | Epoch/revision changes invalidate dependent readiness |
 | Reference mapping | one PM market handle plus a fixed bounded list of OKX reference handles | Declared by the explicit model requirements |
 
@@ -391,13 +391,26 @@ The coordinator maintains two distinct facts:
 1. authoritative state from atomic complete snapshots; and
 2. a fill-derived provisional ledger between complete snapshots.
 
-An individual fill contributes its own positive exact delta once, keyed by fill
-identity. It is never interpreted as the order's cumulative filled quantity.
-Order cumulative progress is monotonic and bounded by original quantity.
-Duplicate, out-of-order, websocket-only, REST-only, terminal-reconcile, and
-journal-replay paths must converge to the same state. A regression,
-overfill, unknown terminal status, wrong account/token, or inconsistent
-cumulative value fails closed and forces reconciliation.
+An individual fill contributes its own positive exact delta once, keyed by
+account scope, exact venue-order leg, and exact trade ID. It is never
+interpreted as the order's cumulative filled quantity. One venue trade may
+contain multiple maker legs; each exact venue-order leg is a separate fill,
+even when the trade ID is shared. `PmFillKey` has no unversioned Serde
+representation: any durable or wire encoding requires an explicit versioned
+schema and migration contract. Order cumulative progress is monotonic and
+bounded by original quantity. Duplicate, out-of-order, websocket-only,
+REST-only, terminal-reconcile, and journal-replay paths must converge to the
+same state. A regression, overfill, unknown terminal status, wrong
+account/token, or inconsistent cumulative value fails closed and forces
+reconciliation.
+
+Fixture private settlement follows only the proven graph
+`MATCHED -> MINED -> CONFIRMED`, `MATCHED|MINED -> RETRYING`, and
+`RETRYING -> MINED|FAILED`. Same-state delivery is idempotent; confirmed and
+failed facts are terminal. A regression never rolls back or reapplies
+principal. Missing, ambiguous, roleless, or externally owned maker linkage is
+retained as a bounded unresolved fill. Only a complete exact reconciliation
+cut may clear that quarantine; numeric coincidence cannot.
 
 Unmanaged remote orders are never claimed as local. A complete snapshot must
 either reserve their exact remaining amount conservatively or make the
@@ -493,11 +506,13 @@ observable; it is not one boolean that erases which dependency failed.
 ## Canonical Owner And Event Ordering
 
 The complete coordinator and seven-rank scheduler described first in this
-section are the frozen target for Phases 4-6, not runtime state already
-materialized by Phase 3. Through Phase 3, the only scheduler state is one
-private public lane owned by one active capture Run; the account, persistence,
-private, scheduled, reconciliation, telemetry, journal, and fake-effect
-producers remain prospective.
+section are the frozen target for Phases 5-6. Through Phase 4, the only
+materialized runtime queue remains the private public lane owned by one active
+capture Run. Phase 4 separately materializes a synchronous fixture-only
+read-monitor owner containing the private/account/reconciliation roles and
+canonical private state by value. That monitor is not a scheduler or an
+alternate producer lane. Persistence, scheduled work, telemetry, journal, and
+fake-effect producers remain prospective.
 
 The future `PmCoordinator<Model>` owns by value:
 
@@ -550,11 +565,12 @@ the captured receive/deadline values and never depends on service time, Tokio
 selection, hash-map traversal, task completion race, or wall time.
 
 The eleven `PmLaneKind`/`PmLanePolicy` rows and the seven service ranks are a
-prospective frozen oracle. Phase 3 materializes only the `Public` row. It has
-no auxiliary/nonpublic scheduler, no public general lane container, and no
-auxiliary/nonpublic service path. Later phases must introduce their typed
-producers and the complete by-value scheduler atomically rather than exposing
-part of that oracle as a separately mutable service.
+prospective frozen oracle. Through Phase 4 only the `Public` row is a runtime
+queue. The read-only monitor has no lane, service selector, or producer
+capability. There is no auxiliary/nonpublic scheduler, public general lane
+container, or auxiliary/nonpublic service path. Phase 6 must introduce the
+remaining typed producers and complete by-value scheduler atomically rather
+than exposing part of that oracle as a separately mutable service.
 
 The generic bounded policy seam is not a connectivity authorizer. Phase 3
 public producers and later private producers bind each delivery to the
@@ -873,8 +889,7 @@ existing capture/journal fixtures, existing public API compatibility, and the
 canonical Chaos hashes before either PM wrapper is admitted. PM code never
 depends on broad `reap-capture` or `reap-storage`.
 
-The actual frozen production-module inventory in `reap-pm-live` through
-Phase 3 is:
+The actual production-module inventory in `reap-pm-live` through Phase 4 is:
 
 | Root module | Present private children |
 | --- | --- |
@@ -882,13 +897,26 @@ Phase 3 is:
 | `capture_roles` | `capture_roles::reducer_freshness` |
 | `composition` | `composition::{lane_enact,run_capture,run_lane_aged,run_lane_full,run_lane_service,run_lifecycle,run_reduce,run_state,run_terminal_tick,run_types}` |
 | `lanes` | `lanes::{bounded,failure,policy,public,service}` |
-| `fake_effect`, `public_routes`, `replay`, `schedule` | No child production modules |
+| `fake_effect`, `private_monitor`, `public_routes`, `replay`, `schedule` | No child production modules |
 
 Only `lanes::public` is materialized queue state. `lanes::policy` retains the
 prospective eleven-row oracle, but there is no `lanes::scheduled`, general lane
-set, auxiliary scheduler, or nonpublic service path in Phase 3. Prospective
-Phase 4-7 modules remain in the final Goal F responsibility table below and
+set, auxiliary scheduler, or nonpublic service path. `private_monitor` owns its
+fixture roles and canonical state synchronously; it is not a queue. Prospective
+Phase 5-7 modules remain in the final Goal F responsibility table below and
 are not claimed to be implemented by this inventory.
+
+The supporting Phase 4 inventory is also concrete:
+
+- `reap-pm-core` adds `reconciliation`;
+- `reap-pm-state` contains `account`, `book`, `fill_state`, `order_state`,
+  `private`, `private_config`, `private_ingress`, `private_occurrence`,
+  `private_readiness`, `readiness`, `refresh`, `risk`, and `unresolved_fill`;
+- `reap-polymarket-wire` adds strict `private_fixture` DTO/parsing;
+- `reap-polymarket-adapter` adds `fixture_delivery`, `fixture_scope`, and
+  bounded private/account/reconciliation fixture roles; and
+- `reap-pm-live` adds the read-only `private_monitor` without adding
+  responsibility to the frozen `capture_roles.rs`.
 
 ### Frozen Phase 3 implementation evidence
 
@@ -923,13 +951,13 @@ The prospective final Goal F responsibility/module DAG remains frozen:
 | `reap-capture-framing` | `frame`, `bounded_writer`, `hash`, `verify`; no venue/schema DTO |
 | `reap-durable-writer` | `lease`, `bounded`, `progress`, `writer`; no product record/recovery module |
 | `reap-okx-public-source` | `session`, `subscription`, `public_wire`, `reference`; no private/auth/order module |
-| `reap-pm-core` | `identity`, `numeric`, `metadata`, `mapping`, `event`, `envelope` |
-| `reap-pm-state` | `book`, `order`, `reservation`, `position`, `readiness`, `risk` |
+| `reap-pm-core` | `identity`, `numeric`, `metadata`, `mapping`, `event`, `envelope`, `reconciliation` |
+| `reap-pm-state` | focused `book`, account/position, order/reservation, fill, unresolved-fill, private occurrence/ingress/readiness, refresh, and risk modules |
 | `reap-polymarket-wire` | `public_rest`, `public_ws`, `private_fixture`, `unsigned_order`; no auth/signing |
 | `reap-polymarket-adapter` | `public`, `private_fixture`, `reconcile_fixture`, `account_fixture`, `fake_execution` |
 | `reap-pm-strategy` | `model`, `quote_policy`; pure/static only |
 | `reap-pm-live-contracts` | `config`, `requirements`, `plan` |
-| `reap-pm-live` | `coordinator`; `lanes` retaining current `public` plus prospective `scheduled` and other focused scheduler children; `schedule`; `journal`; `capture` with private `capture::{writer,validation,verify}`; `capture_roles` with private `capture_roles::reducer_freshness`; `public_routes`; `replay`; `fake_effect`; `composition` with private `composition::{lane_enact,run_capture,run_lane_aged,run_lane_full,run_lane_service,run_lifecycle,run_reduce,run_state,run_terminal_tick,run_types}` |
+| `reap-pm-live` | `private_monitor`; prospective `coordinator`; `lanes` retaining current `public` plus prospective `scheduled` and other focused scheduler children; `schedule`; `journal`; `capture` with private `capture::{writer,validation,verify}`; `capture_roles` with private `capture_roles::reducer_freshness`; `public_routes`; `replay`; `fake_effect`; `composition` with private `composition::{lane_enact,run_capture,run_lane_aged,run_lane_full,run_lane_service,run_lifecycle,run_reduce,run_state,run_terminal_tick,run_types}` |
 
 No production module may absorb another row's responsibility to evade the
 1,500-line file or 250-line function review.
@@ -996,6 +1024,7 @@ reap-pm-live::capture::writer -> validation + reap-capture-framing::{bounded_wri
 reap-pm-live::capture::verify -> validation + reap-capture-framing::{hash,verify}
 reap-pm-live::capture_roles -> capture + capture_roles::reducer_freshness + public_routes + reap-okx-public-source::session + reap-pm-core::{envelope,event,identity} + reap-pm-state::book + reap-polymarket-adapter::public
 reap-pm-live::capture_roles::reducer_freshness -> reap-pm-state::book + reap-polymarket-adapter::public
+reap-pm-live::private_monitor -> reap-pm-state::{account,order,fill,private,readiness,refresh,risk} + reap-polymarket-adapter::{account_fixture,private_fixture,reconcile_fixture} + reap-pm-live-contracts::plan
 reap-pm-live::public_routes -> reap-okx-public-source::session + reap-pm-core::{envelope,event,identity,numeric} + reap-pm-live-contracts::config + reap-polymarket-adapter::public
 reap-pm-live::coordinator -> lanes + schedule + reap-pm-state::{book,order,position,readiness,reservation,risk} + reap-pm-strategy::{model,quote_policy}
 reap-pm-live::fake_effect -> coordinator + journal + reap-polymarket-adapter::fake_execution
@@ -1309,9 +1338,12 @@ implementation and must not be copied:
 The official Polymarket protocol pages retrieved on 2026-07-20 close the Phase
 0 GTC/post-only, canonical-field, tick/minimum, CLOB V2 domain, and exact
 trading-spender evidence gate when combined with the independently specified
-goldens in the Goal F handoff. They are recorded there with retrieval hashes.
-They do not authorize copying an SDK, adding authentication, or assuming that
-future protocol revisions are compatible.
+goldens in the Goal F handoff. The official
+[user-channel lifecycle page](https://docs.polymarket.com/market-data/websocket/user-channel),
+retrieved on 2026-07-23, supplies the reached order and trade status vocabulary
+used by the strict Phase 4 fixture parser. These sources are recorded in the
+handoff. They do not authorize copying an SDK, adding authentication, or
+assuming that future protocol revisions are compatible.
 
 ## Explicit Exclusions And Stop Conditions
 

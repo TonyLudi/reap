@@ -12,8 +12,8 @@ use reap_pm_core::{
 };
 use reap_pm_live_contracts::PmPublicConnectivityConfig;
 use reap_polymarket_adapter::{
-    PmAuthoritativeMetadata, PmPublicBookDelivery as AdapterPmPublicBookDelivery, PmPublicRole,
-    PmPublicSession, PmPublicSessionError, PmPublicSessionFault, PmPublicUnavailableOccurrence,
+    PmPublicBookDelivery as AdapterPmPublicBookDelivery, PmPublicRole, PmPublicSession,
+    PmPublicSessionError, PmPublicSessionFault, PmPublicUnavailableOccurrence,
 };
 use thiserror::Error;
 
@@ -27,7 +27,8 @@ use thiserror::Error;
 pub(crate) struct PmPublicRoutes {
     authority_id: PmPublicRouteAuthorityId,
     pm_role: PmPublicRole,
-    pm_authority: PmAuthoritativeMetadata,
+    pm_metadata_event: PmMarketEvent,
+    pm_metadata_monotonic_receive_ns: u64,
     pm_metadata_issued: bool,
     okx_reference: OkxReferenceHandle,
     okx_instrument: OkxReferenceInstrument,
@@ -89,7 +90,9 @@ impl PmPublicRoutes {
         {
             return Err(PmPublicRouteError::PmRoleMismatch);
         }
-        let pm_authority = pm_session.authoritative_metadata();
+        let pm_authority = pm_session
+            .authoritative_metadata()
+            .ok_or(PmPublicRouteError::PmSessionMismatch)?;
         let metadata_event = pm_authority.event();
         if metadata_event.source() != pm_role.source()
             || metadata_event.instrument() != pm_role.instrument()
@@ -112,7 +115,8 @@ impl PmPublicRoutes {
         Ok(Self {
             authority_id: PmPublicRouteAuthorityId::allocate()?,
             pm_role,
-            pm_authority,
+            pm_metadata_event: metadata_event,
+            pm_metadata_monotonic_receive_ns: pm_authority.monotonic_receive_ns(),
             pm_metadata_issued: false,
             okx_reference: config.okx_reference(),
             okx_instrument: config.okx_reference_instrument(),
@@ -147,11 +151,10 @@ impl PmPublicRoutes {
         {
             return Err(PmPublicRouteError::PmSessionMismatch);
         }
-        let authority = self.pm_authority;
-        let event = authority.event();
+        let event = self.pm_metadata_event;
         let clock = occurrence.received_clock();
         if clock.venue_event_timestamp_ns().is_some()
-            || clock.monotonic_receive_ns() != authority.monotonic_receive_ns()
+            || clock.monotonic_receive_ns() != self.pm_metadata_monotonic_receive_ns
         {
             return Err(PmPublicRouteError::PmSessionMismatch);
         }
@@ -183,8 +186,7 @@ impl PmPublicRoutes {
             || envelope.connection_id() != self.pm_role.connection()
             || envelope.payload().source() != self.pm_role.source()
             || envelope.payload().instrument() != self.pm_role.instrument()
-            || envelope.payload().metadata_revision()
-                != self.pm_authority.event().metadata_revision()
+            || envelope.payload().metadata_revision() != self.pm_metadata_event.metadata_revision()
         {
             return Err(PmPublicRouteError::PmDeliveryScopeMismatch);
         }
@@ -193,8 +195,7 @@ impl PmPublicRoutes {
         {
             return Err(PmPublicRouteError::ConnectionEpochMismatch);
         }
-        if envelope.received_clock().monotonic_receive_ns()
-            < self.pm_authority.monotonic_receive_ns()
+        if envelope.received_clock().monotonic_receive_ns() < self.pm_metadata_monotonic_receive_ns
         {
             return Err(PmPublicRouteError::ReceiveClockRegression);
         }
@@ -370,13 +371,13 @@ impl PmPublicRoutes {
     }
 
     fn validate_pm_session(&self, session: &PmPublicSession) -> Result<(), PmPublicRouteError> {
-        let authority = session.authoritative_metadata();
-        let event = authority.event();
+        let event = session.metadata_event();
         if session.role() != self.pm_role
+            || session.authoritative_metadata().is_none()
             || event.source() != self.pm_role.source()
             || event.instrument() != self.pm_role.instrument()
             || event.metadata() != self.expected_metadata()
-            || event.metadata_revision() != self.pm_authority.event().metadata_revision()
+            || event.metadata_revision() != self.pm_metadata_event.metadata_revision()
         {
             return Err(PmPublicRouteError::PmSessionMismatch);
         }
@@ -384,7 +385,7 @@ impl PmPublicRoutes {
     }
 
     fn expected_metadata(&self) -> reap_pm_core::PmMarketMetadata {
-        self.pm_authority.event().metadata()
+        self.pm_metadata_event.metadata()
     }
 
     fn validate_okx_session(&self, session: &OkxPublicSession) -> Result<(), PmPublicRouteError> {

@@ -1,17 +1,23 @@
 use reap_pm_core::{
-    EvmAddress, PmAssetId, PmEventError, PmInstrumentHandle, PmMarketEvent, PmMarketMetadata,
-    PmProductSource, PmSpenderDomain, SnapshotRevision,
+    PmEventError, PmGoalFTradingDomain, PmInstrumentHandle, PmMarketEvent, PmMarketMetadata,
+    PmMetadataError, PmProductSource, SnapshotRevision,
 };
-use reap_polymarket_wire::{PmBookParserConfig, PmClobMetadata, PmLifecycleMetadata, PmWireScope};
+use reap_polymarket_wire::{
+    PmBookParserConfig, PmClobMetadata, PmLifecycleMetadata, PmWireError, PmWireScope,
+    parse_clob_metadata, parse_lifecycle_metadata,
+};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const METADATA_FINGERPRINT_PREFIX: &[u8] = b"reap.pm.public-metadata.v1\0";
 const DOMAIN_FINGERPRINT_PREFIX: &[u8] = b"reap.pm.clob-v2-domain.v1\0";
-const POLYGON_CHAIN_ID: u64 = 137;
+#[cfg(test)]
 const PUSD: &str = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
+#[cfg(test)]
 const CONDITIONAL_TOKENS: &str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
+#[cfg(test)]
 const STANDARD_EXCHANGE: &str = "0xE111180000d2663C0091e4f400237545B87B996B";
+#[cfg(test)]
 const NEGATIVE_RISK_EXCHANGE: &str = "0xe2222d279d744050d28e00520010520000310F59";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,8 +55,21 @@ impl PmMetadataRevisionInput {
 }
 
 /// One atomic, checked public metadata observation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// This live-joined authority is deliberately non-clone. Recorded metadata
+/// verification returns [`PmRecordedMetadataEvidence`] instead.
+#[derive(Debug, PartialEq, Eq)]
 pub struct PmAuthoritativeMetadata {
+    projection: PmMetadataProjection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmRecordedMetadataEvidence {
+    projection: PmMetadataProjection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PmMetadataProjection {
     event: PmMarketEvent,
     parser_config: PmBookParserConfig,
     metadata_fingerprint: [u8; 32],
@@ -59,7 +78,26 @@ pub struct PmAuthoritativeMetadata {
 }
 
 impl PmAuthoritativeMetadata {
-    pub fn join(
+    pub fn join_raw(
+        instrument: PmInstrumentHandle,
+        source: PmProductSource,
+        expected: PmMarketMetadata,
+        lifecycle_bytes: &[u8],
+        clob_bytes: &[u8],
+        revision: PmMetadataRevisionInput,
+    ) -> Result<Self, PmMetadataJoinError> {
+        let scope = PmWireScope::new(
+            expected.condition(),
+            expected.market(),
+            expected.outcome().token(),
+        );
+        let lifecycle =
+            parse_lifecycle_metadata(lifecycle_bytes, scope).map_err(PmMetadataJoinError::Wire)?;
+        let clob = parse_clob_metadata(clob_bytes, scope).map_err(PmMetadataJoinError::Wire)?;
+        Self::join(instrument, source, expected, lifecycle, &clob, revision)
+    }
+
+    fn join(
         instrument: PmInstrumentHandle,
         source: PmProductSource,
         expected: PmMarketMetadata,
@@ -69,17 +107,46 @@ impl PmAuthoritativeMetadata {
     ) -> Result<Self, PmMetadataJoinError> {
         validate_wire_join(expected, lifecycle, clob)?;
         validate_goal_f_domain(expected)?;
-        Self::from_validated_contract(instrument, source, expected, revision)
+        Ok(Self {
+            projection: build_projection(instrument, source, expected, revision)?,
+        })
     }
 
+    #[must_use]
+    pub const fn event(&self) -> PmMarketEvent {
+        self.projection.event
+    }
+
+    #[must_use]
+    pub const fn parser_config(&self) -> PmBookParserConfig {
+        self.projection.parser_config
+    }
+
+    #[must_use]
+    pub const fn metadata_fingerprint(&self) -> [u8; 32] {
+        self.projection.metadata_fingerprint
+    }
+
+    #[must_use]
+    pub const fn domain_fingerprint(&self) -> [u8; 32] {
+        self.projection.domain_fingerprint
+    }
+
+    #[must_use]
+    pub const fn monotonic_receive_ns(&self) -> u64 {
+        self.projection.monotonic_receive_ns
+    }
+}
+
+impl PmRecordedMetadataEvidence {
     /// Verifies and reconstructs authority from a recorded capture header.
     ///
     /// This path is exclusively for offline capture verification and replay.
-    /// Live observation must use [`Self::join`] with freshly parsed lifecycle
-    /// and CLOB metadata. The recorded path revalidates the complete typed
+    /// Live observation must use [`PmAuthoritativeMetadata::join_raw`] with
+    /// freshly received lifecycle and CLOB bytes. The recorded path revalidates the complete typed
     /// contract and both claimed fingerprints; it never treats persisted
     /// fingerprint bytes as authority by themselves.
-    pub fn verify_recorded(
+    pub fn verify(
         instrument: PmInstrumentHandle,
         source: PmProductSource,
         recorded: PmMarketMetadata,
@@ -89,67 +156,67 @@ impl PmAuthoritativeMetadata {
     ) -> Result<Self, PmMetadataJoinError> {
         validate_ready_lifecycle(recorded.lifecycle())?;
         validate_goal_f_domain(recorded)?;
-        let authority = Self::from_validated_contract(instrument, source, recorded, revision)?;
-        if authority.metadata_fingerprint != claimed_metadata_fingerprint {
+        let projection = build_projection(instrument, source, recorded, revision)?;
+        if projection.metadata_fingerprint != claimed_metadata_fingerprint {
             return Err(PmMetadataJoinError::MetadataFingerprintMismatch);
         }
-        if authority.domain_fingerprint != claimed_domain_fingerprint {
+        if projection.domain_fingerprint != claimed_domain_fingerprint {
             return Err(PmMetadataJoinError::DomainFingerprintMismatch);
         }
-        Ok(authority)
-    }
-
-    fn from_validated_contract(
-        instrument: PmInstrumentHandle,
-        source: PmProductSource,
-        expected: PmMarketMetadata,
-        revision: PmMetadataRevisionInput,
-    ) -> Result<Self, PmMetadataJoinError> {
-        let event = PmMarketEvent::new(source, instrument, revision.revision(), expected)
-            .map_err(PmMetadataJoinError::Event)?;
-        let parser_config = PmBookParserConfig::new(
-            PmWireScope::new(
-                expected.condition(),
-                expected.market(),
-                expected.outcome().token(),
-            ),
-            expected.tick(),
-            expected.minimum_order_size(),
-            expected.negative_risk(),
-        );
-        Ok(Self {
-            event,
-            parser_config,
-            metadata_fingerprint: metadata_fingerprint(expected)?,
-            domain_fingerprint: domain_fingerprint(expected)?,
-            monotonic_receive_ns: revision.monotonic_receive_ns(),
-        })
+        Ok(Self { projection })
     }
 
     #[must_use]
-    pub const fn event(self) -> PmMarketEvent {
-        self.event
+    pub const fn event(&self) -> PmMarketEvent {
+        self.projection.event
     }
 
     #[must_use]
-    pub const fn parser_config(self) -> PmBookParserConfig {
-        self.parser_config
+    pub const fn parser_config(&self) -> PmBookParserConfig {
+        self.projection.parser_config
     }
 
     #[must_use]
-    pub const fn metadata_fingerprint(self) -> [u8; 32] {
-        self.metadata_fingerprint
+    pub const fn metadata_fingerprint(&self) -> [u8; 32] {
+        self.projection.metadata_fingerprint
     }
 
     #[must_use]
-    pub const fn domain_fingerprint(self) -> [u8; 32] {
-        self.domain_fingerprint
+    pub const fn domain_fingerprint(&self) -> [u8; 32] {
+        self.projection.domain_fingerprint
     }
 
     #[must_use]
-    pub const fn monotonic_receive_ns(self) -> u64 {
-        self.monotonic_receive_ns
+    pub const fn monotonic_receive_ns(&self) -> u64 {
+        self.projection.monotonic_receive_ns
     }
+}
+
+fn build_projection(
+    instrument: PmInstrumentHandle,
+    source: PmProductSource,
+    expected: PmMarketMetadata,
+    revision: PmMetadataRevisionInput,
+) -> Result<PmMetadataProjection, PmMetadataJoinError> {
+    let event = PmMarketEvent::new(source, instrument, revision.revision(), expected)
+        .map_err(PmMetadataJoinError::Event)?;
+    let parser_config = PmBookParserConfig::new(
+        PmWireScope::new(
+            expected.condition(),
+            expected.market(),
+            expected.outcome().token(),
+        ),
+        expected.tick(),
+        expected.minimum_order_size(),
+        expected.negative_risk(),
+    );
+    Ok(PmMetadataProjection {
+        event,
+        parser_config,
+        metadata_fingerprint: metadata_fingerprint(expected)?,
+        domain_fingerprint: domain_fingerprint(expected)?,
+        monotonic_receive_ns: revision.monotonic_receive_ns(),
+    })
 }
 
 #[derive(Debug, Error)]
@@ -198,6 +265,8 @@ pub enum PmMetadataJoinError {
     MetadataFingerprintMismatch,
     #[error("recorded public domain fingerprint does not match the complete typed contract")]
     DomainFingerprintMismatch,
+    #[error("strict public metadata wire parsing failed: {0}")]
+    Wire(PmWireError),
     #[error("normalized market event is inconsistent with its configured source")]
     Event(PmEventError),
 }
@@ -276,46 +345,17 @@ fn validate_ready_lifecycle(
 }
 
 fn validate_goal_f_domain(expected: PmMarketMetadata) -> Result<(), PmMetadataJoinError> {
-    if expected.chain().value() != POLYGON_CHAIN_ID {
-        return Err(PmMetadataJoinError::UnsupportedChain);
+    match PmGoalFTradingDomain::from_metadata(expected) {
+        Ok(_) => Ok(()),
+        Err(PmMetadataError::UnsupportedGoalFChain) => Err(PmMetadataJoinError::UnsupportedChain),
+        Err(PmMetadataError::UnsupportedGoalFExchange) => {
+            Err(PmMetadataJoinError::UnsupportedExchange)
+        }
+        Err(PmMetadataError::UnsupportedGoalFSpenderSet) => {
+            Err(PmMetadataJoinError::UnsupportedSpenderSet)
+        }
+        Err(_) => Err(PmMetadataJoinError::UnsupportedSpenderSet),
     }
-    let exchange = parse_address(if expected.negative_risk() {
-        NEGATIVE_RISK_EXCHANGE
-    } else {
-        STANDARD_EXCHANGE
-    });
-    if expected.exchange() != exchange {
-        return Err(PmMetadataJoinError::UnsupportedExchange);
-    }
-
-    let domain = if expected.negative_risk() {
-        PmSpenderDomain::NegativeRisk
-    } else {
-        PmSpenderDomain::Standard
-    };
-    let collateral = PmAssetId::collateral(parse_address(PUSD));
-    let outcome = PmAssetId::outcome(
-        parse_address(CONDITIONAL_TOKENS),
-        expected.outcome().token(),
-    );
-    let requirements = expected.required_spenders().collect::<Vec<_>>();
-    if requirements.len() != 2
-        || !requirements.iter().any(|requirement| {
-            requirement.chain() == expected.chain()
-                && requirement.spender() == exchange
-                && requirement.domain() == domain
-                && requirement.asset() == collateral
-        })
-        || !requirements.iter().any(|requirement| {
-            requirement.chain() == expected.chain()
-                && requirement.spender() == exchange
-                && requirement.domain() == domain
-                && requirement.asset() == outcome
-        })
-    {
-        return Err(PmMetadataJoinError::UnsupportedSpenderSet);
-    }
-    Ok(())
 }
 
 fn metadata_fingerprint(expected: PmMarketMetadata) -> Result<[u8; 32], PmMetadataJoinError> {
@@ -345,16 +385,17 @@ fn domain_fingerprint(expected: PmMarketMetadata) -> Result<[u8; 32], PmMetadata
     Ok(digest.finalize().into())
 }
 
-fn parse_address(value: &str) -> EvmAddress {
-    EvmAddress::parse(value).expect("Goal F pinned contract address is valid")
+#[cfg(test)]
+fn parse_address(value: &str) -> reap_pm_core::EvmAddress {
+    reap_pm_core::EvmAddress::parse(value).expect("test contract address is valid")
 }
 
 #[cfg(test)]
 mod tests {
     use reap_pm_core::{
-        MAX_REQUIRED_SPENDERS, PmChainId, PmConditionId, PmMarketHandle, PmMarketId,
+        MAX_REQUIRED_SPENDERS, PmAssetId, PmChainId, PmConditionId, PmMarketHandle, PmMarketId,
         PmMarketLifecycle, PmOutcomeLabel, PmOutcomeMetadata, PmQuantity, PmSourceHandle,
-        PmSpenderRequirement, PmTick, PmTokenHandle, PmTokenId, U256,
+        PmSpenderDomain, PmSpenderRequirement, PmTick, PmTokenHandle, PmTokenId, U256,
     };
     use reap_polymarket_wire::{PmWireScope, parse_clob_metadata, parse_lifecycle_metadata};
 
@@ -641,7 +682,7 @@ mod tests {
         .unwrap();
         let revision = PmMetadataRevisionInput::new(SnapshotRevision::new(1), 10).unwrap();
 
-        let replay = PmAuthoritativeMetadata::verify_recorded(
+        let replay = PmRecordedMetadataEvidence::verify(
             instrument(),
             source(),
             expected,
@@ -650,10 +691,13 @@ mod tests {
             live.domain_fingerprint(),
         )
         .unwrap();
-        assert_eq!(replay, live);
+        assert_eq!(replay.event(), live.event());
+        assert_eq!(replay.parser_config(), live.parser_config());
+        assert_eq!(replay.metadata_fingerprint(), live.metadata_fingerprint());
+        assert_eq!(replay.domain_fingerprint(), live.domain_fingerprint());
 
         assert!(matches!(
-            PmAuthoritativeMetadata::verify_recorded(
+            PmRecordedMetadataEvidence::verify(
                 instrument(),
                 source(),
                 metadata_with_lifecycle(PmMarketLifecycle::new(false, false, false, true, true)),
@@ -664,7 +708,7 @@ mod tests {
             Err(PmMetadataJoinError::Inactive)
         ));
         assert!(matches!(
-            PmAuthoritativeMetadata::verify_recorded(
+            PmRecordedMetadataEvidence::verify(
                 instrument(),
                 source(),
                 metadata_on_unsupported_chain(),
@@ -675,7 +719,7 @@ mod tests {
             Err(PmMetadataJoinError::UnsupportedChain)
         ));
         assert!(matches!(
-            PmAuthoritativeMetadata::verify_recorded(
+            PmRecordedMetadataEvidence::verify(
                 instrument(),
                 source(),
                 expected,
@@ -686,7 +730,7 @@ mod tests {
             Err(PmMetadataJoinError::MetadataFingerprintMismatch)
         ));
         assert!(matches!(
-            PmAuthoritativeMetadata::verify_recorded(
+            PmRecordedMetadataEvidence::verify(
                 instrument(),
                 source(),
                 expected,

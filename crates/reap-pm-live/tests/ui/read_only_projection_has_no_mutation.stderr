@@ -1,0 +1,11 @@
+error[E0599]: no method named `register_owned_order` found for mutable reference `&mut PmReadOnlyPrivateProjection<'_>` in the current scope
+  --> tests/ui/read_only_projection_has_no_mutation.rs:10:16
+   |
+10 |     projection.register_owned_order(registration);
+   |                ^^^^^^^^^^^^^^^^^^^^ method not found in `&mut PmReadOnlyPrivateProjection<'_>`
+
+error[E0599]: no method named `require_refresh` found for mutable reference `&mut PmReadOnlyPrivateProjection<'_>` in the current scope
+  --> tests/ui/read_only_projection_has_no_mutation.rs:11:16
+   |
+11 |     projection.require_refresh(PmRefreshReason::FillObserved);
+   |                ^^^^^^^^^^^^^^^ method not found in `&mut PmReadOnlyPrivateProjection<'_>`

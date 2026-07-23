@@ -1,0 +1,13 @@
+{
+  "event_type": "order",
+  "id": "0xorder",
+  "market": "0xbd31",
+  "asset_id": "5211431950123",
+  "side": "BUY",
+  "original_size": "100.0",
+  "size_matched": "0",
+  "price": "0.40",
+  "status": "LIVE",
+  "maker_address": "0x1111111111111111111111111111111111111111",
+  "type": "PLACEMENT"
+}

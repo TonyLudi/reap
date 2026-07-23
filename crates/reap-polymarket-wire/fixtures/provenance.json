@@ -7,7 +7,13 @@
       "source": "crates/venue-polymarket/tests/fixtures/market_book.json",
       "source_git_blob": "bbb5bc143a914ba8c96d84342321b3dba30ec0fc",
       "source_sha256": "8e671f14c4b1e8137b1dc1b0bd7d39c79d9c8f961a8483daa32151df99cbdf81",
+      "source_bytes": 190,
       "use": "parser seed only; intentionally incomplete and not a readiness fixture"
+    },
+    {
+      "fixture": "market_subscription.json",
+      "source": "crates/venue-polymarket/src/ws/market.rs::market_subscribe_message",
+      "use": "exact single-configured-token market subscription"
     },
     {
       "fixture": "official_snapshot_hash_vector.json",
@@ -16,9 +22,36 @@
       "use": "pinned snapshot SHA-1 canonicalization vector; exact lexical strings and received bid/ask array order are hash-significant"
     },
     {
-      "fixture": "market_subscription.json",
-      "source": "crates/venue-polymarket/src/ws/market.rs::market_subscribe_message",
-      "use": "exact single-configured-token market subscription"
+      "fixture": "predarb_balance_allowance_seed.json",
+      "source": "crates/venue-polymarket/tests/fixtures/balance_allowance.json",
+      "source_git_blob": "2f5fd6cd5d447d988d6eecd854afee5ae7196810",
+      "source_sha256": "7e1f683ac5032b137d8a2afdfafccce389198bb5d3a33ba6eb3cb478455fab96",
+      "source_bytes": 53,
+      "use": "strict legacy scalar balance/allowance parser seed; allowance remains explicitly unscoped evidence"
+    },
+    {
+      "fixture": "predarb_open_order_seed.json",
+      "source": "crates/venue-polymarket/tests/fixtures/open_order.json",
+      "source_git_blob": "a544ba4378c8cd5fdbf6fafc890846746906867f",
+      "source_sha256": "d0998ca29cf47ce4bcb1fb4d7183d1e895a044d859235230a6ebef464295baf2",
+      "source_bytes": 247,
+      "use": "strict fixture-only open-order parser seed"
+    },
+    {
+      "fixture": "predarb_user_order_seed.json",
+      "source": "crates/venue-polymarket/tests/fixtures/user_order.json",
+      "source_git_blob": "a4e89e7dada536937e1e8c8f77fac82d9d4bbb24",
+      "source_sha256": "e4c3cd7975b7dc16c4c8d014444fc2a96d927cf1b9089b33875a5450b4ff99fa",
+      "source_bytes": 295,
+      "use": "strict fixture-only private user-order parser seed"
+    },
+    {
+      "fixture": "predarb_user_trade_seed.json",
+      "source": "crates/venue-polymarket/tests/fixtures/user_trade.json",
+      "source_git_blob": "d8084942ba3a5fa88518d18b8f06e26c9d0422ad",
+      "source_sha256": "042998055ec5dec2c69065d002b2619d8497faabd9bfcc36c27a1bcf7cfe224c",
+      "source_bytes": 278,
+      "use": "strict fixture-only private user-trade parser seed; no order-linkage field is present"
     }
   ]
 }

@@ -205,9 +205,37 @@
       "expected": "token_mismatch"
     },
     {
+      "path": "predarb_balance_allowance_seed.json",
+      "sha256": "7e1f683ac5032b137d8a2afdfafccce389198bb5d3a33ba6eb3cb478455fab96",
+      "provenance": "../predarb revision 8222273a9c72033b760e1d2fec813bc77144556d, Git blob 2f5fd6cd5d447d988d6eecd854afee5ae7196810",
+      "purpose": "Retain the tracked legacy scalar response without inventing asset, token, or spender allowance scope.",
+      "expected": "valid_unscoped_legacy_balance_allowance"
+    },
+    {
+      "path": "predarb_open_order_seed.json",
+      "sha256": "d0998ca29cf47ce4bcb1fb4d7183d1e895a044d859235230a6ebef464295baf2",
+      "provenance": "../predarb revision 8222273a9c72033b760e1d2fec813bc77144556d, Git blob a544ba4378c8cd5fdbf6fafc890846746906867f",
+      "purpose": "Retain the tracked open-order response as strict fixture-only parsing evidence.",
+      "expected": "valid_open_order_fixture"
+    },
+    {
+      "path": "predarb_user_order_seed.json",
+      "sha256": "e4c3cd7975b7dc16c4c8d014444fc2a96d927cf1b9089b33875a5450b4ff99fa",
+      "provenance": "../predarb revision 8222273a9c72033b760e1d2fec813bc77144556d, Git blob a4e89e7dada536937e1e8c8f77fac82d9d4bbb24",
+      "purpose": "Retain the tracked private user-order event as strict fixture-only parsing evidence.",
+      "expected": "valid_private_user_order_fixture"
+    },
+    {
+      "path": "predarb_user_trade_seed.json",
+      "sha256": "042998055ec5dec2c69065d002b2619d8497faabd9bfcc36c27a1bcf7cfe224c",
+      "provenance": "../predarb revision 8222273a9c72033b760e1d2fec813bc77144556d, Git blob d8084942ba3a5fa88518d18b8f06e26c9d0422ad",
+      "purpose": "Retain the tracked private user-trade event while preserving its lack of order-linkage evidence.",
+      "expected": "valid_unlinked_private_user_trade_fixture"
+    },
+    {
       "path": "provenance.json",
-      "sha256": "3b85d5d1e891136f085c72c5691380f8bd7f3c37f83f3b316ef546b4576ff343",
-      "provenance": "Goal F Phase 3 predecessor-source declaration",
+      "sha256": "cdd669d67fa10457dc0b2e5b832572c66616ef5b6f08634c6d9ca95c8b4a435e",
+      "provenance": "Goal F predecessor-source declaration",
       "purpose": "Pin the tracked predecessor revision, blob, and qualified uses.",
       "expected": "valid_provenance_declaration"
     },
