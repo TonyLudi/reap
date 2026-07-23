@@ -1,5 +1,5 @@
 use reap_pm_core::{PmOrderEvent, ReceivedEventClock};
-use reap_pm_live::{PmIngressOrder, PmLaneSet, PmObservedEvent, PmServiceKey};
+use reap_pm_live::{PmIngressOrder, PmLaneSet, PmServiceKey};
 
 fn replay_key(
     lanes: &mut PmLaneSet,
@@ -8,7 +8,7 @@ fn replay_key(
     ingress: PmIngressOrder,
     clock: ReceivedEventClock,
 ) {
-    PmObservedEvent::enqueue_into(event, lanes, key, ingress, clock);
+    lanes.enqueue_observation(key, clock, ingress, event);
 }
 
 fn main() {}

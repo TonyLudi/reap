@@ -2,9 +2,10 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use reap_pm_core::{
-    EvmAddress, OkxReferenceHandle, PmAssetId, PmChainId, PmConditionId, PmInstrumentHandle,
-    PmMarketHandle, PmMarketId, PmMarketLifecycle, PmMarketMetadata, PmMetadataError,
-    PmOutcomeLabel, PmOutcomeMetadata, PmQuantity, PmReferenceMapping, PmSpenderDomain,
+    EvmAddress, OkxInstrumentId, OkxReferenceHandle, OkxReferenceInstrument, PmAssetId, PmChainId,
+    PmConditionId, PmInstrumentHandle, PmInstrumentId, PmMarketHandle, PmMarketId,
+    PmMarketLifecycle, PmMarketMetadata, PmMetadataError, PmOutcomeLabel, PmOutcomeMetadata,
+    PmPublicObservationGrant, PmQuantity, PmReferenceMapping, PmSpenderDomain,
     PmSpenderRequirement, PmTick, PmTokenHandle, PmTokenId, U256,
 };
 
@@ -300,4 +301,42 @@ fn reference_mapping_deserialization_sorts_and_rejects_ambiguous_arrays() {
         "reference_count": 1
     });
     assert!(serde_json::from_value::<PmReferenceMapping>(noncanonical_tail).is_err());
+}
+
+#[test]
+fn goal_f_public_identity_tables_assign_zero_ordinals_and_one_fingerprint() {
+    let raw_pm = PmInstrumentId::new(
+        PmMarketId::parse(MARKET).unwrap(),
+        PmTokenId::new(U256::from_u64(123)).unwrap(),
+    );
+    let raw_okx = OkxReferenceInstrument::index(OkxInstrumentId::new("BTC-USDT").unwrap());
+    let first = PmPublicObservationGrant::derive_goal_f(raw_okx, raw_pm);
+    let second = PmPublicObservationGrant::derive_goal_f(raw_okx, raw_pm);
+
+    assert_eq!(first.okx_reference().ordinal(), 0);
+    assert_eq!(first.instrument().market().ordinal(), 0);
+    assert_eq!(first.instrument().token().ordinal(), 0);
+    assert_eq!(first.okx_instrument(), raw_okx);
+    assert_eq!(first.polymarket_instrument(), raw_pm);
+    assert_eq!(
+        first.configuration_fingerprint(),
+        second.configuration_fingerprint()
+    );
+    assert_eq!(
+        first.configuration_fingerprint().bytes(),
+        [
+            0x97, 0xde, 0xc7, 0x0d, 0xd8, 0x4d, 0x86, 0x79, 0x88, 0x68, 0xd3, 0xbf, 0x9c, 0x93,
+            0x9c, 0xc1, 0x5a, 0x76, 0xcd, 0x0d, 0x0a, 0x66, 0xe1, 0xc2, 0x02, 0x88, 0x87, 0x7f,
+            0xde, 0xb8, 0x27, 0xb0,
+        ]
+    );
+
+    let changed = PmPublicObservationGrant::derive_goal_f(
+        OkxReferenceInstrument::index(OkxInstrumentId::new("ETH-USDT").unwrap()),
+        raw_pm,
+    );
+    assert_ne!(
+        first.configuration_fingerprint(),
+        changed.configuration_fingerprint()
+    );
 }

@@ -1,6 +1,8 @@
 use reap_pm_core::{
-    MAX_REQUIRED_SPENDERS, OkxReferenceHandle, PmAccountHandle, PmAccountScope, PmConnectionId,
-    PmInstrumentHandle, PmProductSource, PmReferenceMapping, PmSpenderId,
+    MAX_OKX_REFERENCES_PER_MAPPING, MAX_REQUIRED_SPENDERS, OkxReferenceHandle,
+    OkxReferenceInstrument, PmAccountHandle, PmAccountScope, PmConfigurationFingerprint,
+    PmConnectionId, PmInstrumentHandle, PmInstrumentId, PmMarketMetadata, PmProductSource,
+    PmPublicObservationGrant, PmReferenceMapping, PmSpenderId,
 };
 use thiserror::Error;
 
@@ -8,6 +10,10 @@ use thiserror::Error;
 pub enum PmConnectivityConfigError {
     #[error("the fixed PM profile requires exactly one checked OKX reference mapping")]
     ExpectedSingleReference,
+    #[error("Goal F OKX reference handle must be canonical zero-based ordinal 0")]
+    NonCanonicalReferenceHandle,
+    #[error("Goal F PM market/token handles must be canonical zero-based ordinals 0/0")]
+    NonCanonicalInstrumentHandle,
     #[error("the fixed PM profile is restricted to Polygon chain 137")]
     WrongGoalFChain,
     #[error("the fixed PM profile requires the EOA signer and funder to match")]
@@ -30,6 +36,10 @@ pub enum PmConnectivityConfigError {
     PublicRouteMismatch,
     #[error("PM account route does not name the checked account")]
     AccountRouteMismatch,
+    #[error("configured PM account chain differs from authoritative market metadata")]
+    AccountMarketChainMismatch,
+    #[error("account allowance spenders differ from the authoritative exact market spender set")]
+    RequiredSpenderSetMismatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -57,14 +67,45 @@ impl PmConnectionRoute {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PmPublicConnectivityConfig {
+    observation_grant: PmPublicObservationGrant,
     mapping: PmReferenceMapping,
+    okx_reference_instrument: OkxReferenceInstrument,
+    expected_metadata: PmMarketMetadata,
     okx_route: PmConnectionRoute,
     polymarket_route: PmConnectionRoute,
 }
 
 impl PmPublicConnectivityConfig {
+    pub fn derive_goal_f(
+        okx_reference_instrument: OkxReferenceInstrument,
+        expected_metadata: PmMarketMetadata,
+        okx_route: PmConnectionRoute,
+        polymarket_route: PmConnectionRoute,
+    ) -> Result<Self, PmConnectivityConfigError> {
+        let observation_grant = PmPublicObservationGrant::derive_goal_f(
+            okx_reference_instrument,
+            PmInstrumentId::new(
+                expected_metadata.market(),
+                expected_metadata.outcome().token(),
+            ),
+        );
+        let mut references = [None; MAX_OKX_REFERENCES_PER_MAPPING];
+        references[0] = Some(observation_grant.okx_reference());
+        let mapping = PmReferenceMapping::new(observation_grant.instrument(), references, 1)
+            .expect("one canonical Goal-F reference");
+        Self::new(
+            mapping,
+            okx_reference_instrument,
+            expected_metadata,
+            okx_route,
+            polymarket_route,
+        )
+    }
+
     pub fn new(
         mapping: PmReferenceMapping,
+        okx_reference_instrument: OkxReferenceInstrument,
+        expected_metadata: PmMarketMetadata,
         okx_route: PmConnectionRoute,
         polymarket_route: PmConnectionRoute,
     ) -> Result<Self, PmConnectivityConfigError> {
@@ -75,6 +116,19 @@ impl PmPublicConnectivityConfig {
             .references()
             .next()
             .expect("checked single-reference mapping");
+        let observation_grant = PmPublicObservationGrant::derive_goal_f(
+            okx_reference_instrument,
+            PmInstrumentId::new(
+                expected_metadata.market(),
+                expected_metadata.outcome().token(),
+            ),
+        );
+        if reference != observation_grant.okx_reference() {
+            return Err(PmConnectivityConfigError::NonCanonicalReferenceHandle);
+        }
+        if mapping.target() != observation_grant.instrument() {
+            return Err(PmConnectivityConfigError::NonCanonicalInstrumentHandle);
+        }
         if !matches!(
             okx_route.source(),
             PmProductSource::OkxReference {
@@ -92,10 +146,23 @@ impl PmPublicConnectivityConfig {
             return Err(PmConnectivityConfigError::PublicRouteMismatch);
         }
         Ok(Self {
+            observation_grant,
             mapping,
+            okx_reference_instrument,
+            expected_metadata,
             okx_route,
             polymarket_route,
         })
+    }
+
+    #[must_use]
+    pub const fn observation_grant(&self) -> PmPublicObservationGrant {
+        self.observation_grant
+    }
+
+    #[must_use]
+    pub const fn configuration_fingerprint(&self) -> PmConfigurationFingerprint {
+        self.observation_grant.configuration_fingerprint()
     }
 
     #[must_use]
@@ -105,15 +172,30 @@ impl PmPublicConnectivityConfig {
 
     #[must_use]
     pub fn okx_reference(&self) -> OkxReferenceHandle {
-        self.mapping
-            .references()
-            .next()
-            .expect("checked single-reference mapping")
+        self.observation_grant.okx_reference()
+    }
+
+    #[must_use]
+    pub const fn okx_reference_instrument(&self) -> OkxReferenceInstrument {
+        self.okx_reference_instrument
+    }
+
+    #[must_use]
+    pub const fn expected_metadata(&self) -> PmMarketMetadata {
+        self.expected_metadata
+    }
+
+    #[must_use]
+    pub const fn polymarket_instrument_id(&self) -> PmInstrumentId {
+        PmInstrumentId::new(
+            self.expected_metadata.market(),
+            self.expected_metadata.outcome().token(),
+        )
     }
 
     #[must_use]
     pub const fn instrument(&self) -> PmInstrumentHandle {
-        self.mapping.target()
+        self.observation_grant.instrument()
     }
 
     #[must_use]
@@ -229,6 +311,21 @@ impl PmConnectivityConfig {
     ) -> Result<Self, PmConnectivityConfigError> {
         if public.instrument() != account.instrument() {
             return Err(PmConnectivityConfigError::InstrumentScopeMismatch);
+        }
+        if public.expected_metadata().chain() != account.account_scope().chain() {
+            return Err(PmConnectivityConfigError::AccountMarketChainMismatch);
+        }
+        let expected = public
+            .expected_metadata()
+            .required_spenders()
+            .collect::<Vec<_>>();
+        let actual = account
+            .required_spenders()
+            .iter()
+            .map(|spender| spender.requirement())
+            .collect::<Vec<_>>();
+        if expected != actual {
+            return Err(PmConnectivityConfigError::RequiredSpenderSetMismatch);
         }
         Ok(Self { public, account })
     }

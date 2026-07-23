@@ -1,0 +1,9 @@
+{
+  "event_type": "last_trade_price",
+  "market": {"not": "a market identity"},
+  "asset_id": ["not", "a", "token"],
+  "price": "NaN",
+  "size": "-1",
+  "side": {"not": "a side"},
+  "timestamp": null
+}

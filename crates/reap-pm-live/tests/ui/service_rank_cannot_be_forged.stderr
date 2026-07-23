@@ -1,15 +1,28 @@
-error[E0451]: fields `monotonic_receive_ns`, `source`, `connection_epoch`, `local_ingress_sequence` and `variant_rank` of struct `PmServiceKey` are private
-  --> tests/ui/service_rank_cannot_be_forged.rs:6:9
+error: cannot construct `PmServiceKey` with struct literal syntax due to private fields
+  --> tests/ui/service_rank_cannot_be_forged.rs:5:13
    |
  5 |     let _ = PmServiceKey {
-   |             ------------ in this type
+   |             ^^^^^^^^^^^^
  6 |         monotonic_receive_ns: 1,
-   |         ^^^^^^^^^^^^^^^^^^^^ private field
+   |         ----------------------- private field
  7 |         source: PmSourceHandle::from_ordinal(0),
-   |         ^^^^^^ private field
+   |         --------------------------------------- private field
  8 |         connection_epoch: ConnectionEpoch::new(1),
-   |         ^^^^^^^^^^^^^^^^ private field
+   |         ----------------------------------------- private field
  9 |         local_ingress_sequence: IngressSequence::new(1),
-   |         ^^^^^^^^^^^^^^^^^^^^^^ private field
+   |         ----------------------------------------------- private field
 10 |         variant_rank: 255,
-   |         ^^^^^^^^^^^^ private field
+   |         ----------------- private field
+   |
+   = note: ...and other private fields `source_kind_rank` and `source_scope_ordinal` that were not provided
+help: you might have meant to use the `derived` associated function
+   |
+ 5 -     let _ = PmServiceKey {
+ 6 -         monotonic_receive_ns: 1,
+ 7 -         source: PmSourceHandle::from_ordinal(0),
+ 8 -         connection_epoch: ConnectionEpoch::new(1),
+ 9 -         local_ingress_sequence: IngressSequence::new(1),
+10 -         variant_rank: 255,
+11 -     };
+ 5 +     let _ = PmServiceKey::derived(_, _, _, _);
+   |

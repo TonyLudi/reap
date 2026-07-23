@@ -88,6 +88,7 @@ fn pm_core_is_a_pure_leaf_domain_crate() {
         BTreeSet::from([
             "reap-core".to_string(),
             "serde".to_string(),
+            "sha2".to_string(),
             "thiserror".to_string(),
         ])
     );

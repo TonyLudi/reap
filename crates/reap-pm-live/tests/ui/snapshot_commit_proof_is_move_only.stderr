@@ -1,0 +1,5 @@
+error[E0599]: no method named `clone` found for struct `PmSnapshotCommitProof` in the current scope
+ --> tests/ui/snapshot_commit_proof_is_move_only.rs:4:24
+  |
+4 |     let _first = proof.clone();
+  |                        ^^^^^ method not found in `PmSnapshotCommitProof`

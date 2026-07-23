@@ -1,0 +1,11 @@
+{
+  "event_type": "book",
+  "market": "0xbd31",
+  "asset_id": "5211431950123",
+  "bids": [
+    { "price": "0.40", "size": "50" }
+  ],
+  "asks": [
+    { "price": "0.41", "size": "75" }
+  ]
+}

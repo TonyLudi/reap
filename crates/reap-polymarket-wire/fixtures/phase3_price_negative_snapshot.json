@@ -1,0 +1,13 @@
+{
+  "event_type": "book",
+  "market": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "asset_id": "123",
+  "timestamp": "123456789",
+  "hash": "0000000000000000000000000000000000000001",
+  "bids": [{"price": "-0.01", "size": "100"}],
+  "asks": [{"price": "0.60", "size": "75"}],
+  "min_order_size": "5",
+  "tick_size": "0.01",
+  "neg_risk": false,
+  "last_trade_price": "0.50"
+}

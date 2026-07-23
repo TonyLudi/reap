@@ -1,8 +1,10 @@
 use reap_pm_core::{
-    EvmAddress, OkxReferenceHandle, PmAccountHandle, PmAccountScope, PmAssetId, PmChainId,
-    PmConnectionId, PmEnvironmentId, PmFunderId, PmInstrumentHandle, PmMarketHandle,
-    PmProductSource, PmReferenceMapping, PmSignerId, PmSourceHandle, PmSpenderDomain, PmSpenderId,
-    PmSpenderRequirement, PmTokenHandle, PmTokenId, U256,
+    EvmAddress, MAX_REQUIRED_SPENDERS, OkxInstrumentId, OkxReferenceHandle, OkxReferenceInstrument,
+    PmAccountHandle, PmAccountScope, PmAssetId, PmChainId, PmConditionId, PmConnectionId,
+    PmEnvironmentId, PmFunderId, PmInstrumentHandle, PmInstrumentId, PmMarketHandle, PmMarketId,
+    PmMarketLifecycle, PmMarketMetadata, PmOutcomeLabel, PmOutcomeMetadata, PmProductSource,
+    PmQuantity, PmReferenceMapping, PmSignerId, PmSourceHandle, PmSpenderDomain, PmSpenderId,
+    PmSpenderRequirement, PmTick, PmTokenHandle, PmTokenId, U256,
 };
 use reap_pm_live_contracts::{
     ConstructedRoleBinding, PmAccountConnectivityConfig, PmCapabilityLane,
@@ -27,13 +29,17 @@ struct ProductPlanRow {
 
 fn instrument() -> PmInstrumentHandle {
     PmInstrumentHandle::new(
-        PmMarketHandle::from_ordinal(1),
-        PmTokenHandle::from_ordinal(2),
+        PmMarketHandle::from_ordinal(0),
+        PmTokenHandle::from_ordinal(0),
     )
 }
 
 fn reference() -> OkxReferenceHandle {
-    OkxReferenceHandle::from_ordinal(3)
+    OkxReferenceHandle::from_ordinal(0)
+}
+
+fn reference_instrument() -> OkxReferenceInstrument {
+    OkxReferenceInstrument::index(OkxInstrumentId::new("BTC-USDT").unwrap())
 }
 
 fn account_scope() -> PmAccountScope {
@@ -83,14 +89,42 @@ fn required_spenders(account: PmAccountScope) -> Vec<PmSpenderId> {
     ]
 }
 
+fn expected_metadata() -> PmMarketMetadata {
+    let spenders = required_spenders(account_scope());
+    let mut required = [None; MAX_REQUIRED_SPENDERS];
+    for (slot, spender) in required.iter_mut().zip(&spenders) {
+        *slot = Some(spender.requirement());
+    }
+    PmMarketMetadata::new(
+        PmConditionId::parse("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap(),
+        PmMarketId::parse("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .unwrap(),
+        PmOutcomeMetadata::new(
+            PmTokenId::new(U256::from_u64(11)).unwrap(),
+            PmOutcomeLabel::new("Yes").unwrap(),
+        ),
+        PmMarketLifecycle::new(true, false, false, true, true),
+        PmTick::parse_decimal("0.01").unwrap(),
+        PmQuantity::parse_decimal("1").unwrap(),
+        false,
+        PmChainId::new(137).unwrap(),
+        EvmAddress::from_bytes([2; 20]).unwrap(),
+        required,
+        spenders.len() as u8,
+    )
+    .unwrap()
+}
+
 fn fixture() -> (
     PmConnectivityConfig,
     PmModelInputRequirements,
     PmFakeExecutionProfile,
 ) {
     let account = account_scope();
-    let public = PmPublicConnectivityConfig::new(
-        reference_mapping(),
+    let public = PmPublicConnectivityConfig::derive_goal_f(
+        reference_instrument(),
+        expected_metadata(),
         route(
             PmProductSource::okx_reference(PmSourceHandle::from_ordinal(1), reference()),
             "okx-public",
@@ -537,6 +571,102 @@ fn binding_validator_rejects_missing_duplicate_and_wrong_route() {
 }
 
 #[test]
+fn goal_f_public_config_derives_one_canonical_table_and_checked_grant() {
+    let (config, _, _) = fixture();
+    let public = config.public();
+    let grant = public.observation_grant();
+    let expected = expected_metadata();
+
+    assert_eq!(grant.okx_reference().ordinal(), 0);
+    assert_eq!(grant.instrument().market().ordinal(), 0);
+    assert_eq!(grant.instrument().token().ordinal(), 0);
+    assert_eq!(grant.okx_instrument(), reference_instrument());
+    assert_eq!(
+        grant.polymarket_instrument(),
+        PmInstrumentId::new(expected.market(), expected.outcome().token())
+    );
+    assert_eq!(public.mapping().target(), grant.instrument());
+    assert_eq!(
+        public.mapping().references().collect::<Vec<_>>(),
+        vec![grant.okx_reference()]
+    );
+    assert_eq!(
+        public.configuration_fingerprint(),
+        grant.configuration_fingerprint()
+    );
+
+    let independently_derived = PmPublicConnectivityConfig::derive_goal_f(
+        reference_instrument(),
+        expected,
+        public.okx_route(),
+        public.polymarket_route(),
+    )
+    .unwrap();
+    assert_eq!(
+        independently_derived.configuration_fingerprint(),
+        public.configuration_fingerprint(),
+        "the same ordered raw identity tables must produce the same fingerprint"
+    );
+}
+
+#[test]
+fn goal_f_public_config_rejects_arbitrary_compact_handle_associations() {
+    let mut noncanonical_references = [None; 16];
+    let arbitrary_reference = OkxReferenceHandle::from_ordinal(8);
+    noncanonical_references[0] = Some(arbitrary_reference);
+    let mapping = PmReferenceMapping::new(instrument(), noncanonical_references, 1).unwrap();
+    assert_eq!(
+        PmPublicConnectivityConfig::new(
+            mapping,
+            reference_instrument(),
+            expected_metadata(),
+            route(
+                PmProductSource::okx_reference(
+                    PmSourceHandle::from_ordinal(1),
+                    arbitrary_reference,
+                ),
+                "arbitrary-okx-handle",
+            ),
+            route(
+                PmProductSource::polymarket_market(
+                    PmSourceHandle::from_ordinal(2),
+                    instrument().token(),
+                ),
+                "pm-public",
+            ),
+        ),
+        Err(PmConnectivityConfigError::NonCanonicalReferenceHandle)
+    );
+
+    let arbitrary_instrument = PmInstrumentHandle::new(
+        PmMarketHandle::from_ordinal(7),
+        PmTokenHandle::from_ordinal(9),
+    );
+    let mut references = [None; 16];
+    references[0] = Some(reference());
+    let mapping = PmReferenceMapping::new(arbitrary_instrument, references, 1).unwrap();
+    assert_eq!(
+        PmPublicConnectivityConfig::new(
+            mapping,
+            reference_instrument(),
+            expected_metadata(),
+            route(
+                PmProductSource::okx_reference(PmSourceHandle::from_ordinal(1), reference(),),
+                "okx-public",
+            ),
+            route(
+                PmProductSource::polymarket_market(
+                    PmSourceHandle::from_ordinal(2),
+                    arbitrary_instrument.token(),
+                ),
+                "arbitrary-pm-handle",
+            ),
+        ),
+        Err(PmConnectivityConfigError::NonCanonicalInstrumentHandle)
+    );
+}
+
+#[test]
 fn public_config_rejects_extra_references_and_unbound_routes() {
     let mut references = [None; 16];
     references[0] = Some(reference());
@@ -545,6 +675,8 @@ fn public_config_rejects_extra_references_and_unbound_routes() {
     assert_eq!(
         PmPublicConnectivityConfig::new(
             multiple,
+            reference_instrument(),
+            expected_metadata(),
             route(
                 PmProductSource::okx_reference(PmSourceHandle::from_ordinal(1), reference()),
                 "okx-public",
@@ -563,6 +695,8 @@ fn public_config_rejects_extra_references_and_unbound_routes() {
     assert_eq!(
         PmPublicConnectivityConfig::new(
             reference_mapping(),
+            reference_instrument(),
+            expected_metadata(),
             route(
                 PmProductSource::okx_reference(
                     PmSourceHandle::from_ordinal(1),
@@ -584,6 +718,8 @@ fn public_config_rejects_extra_references_and_unbound_routes() {
     assert_eq!(
         PmPublicConnectivityConfig::new(
             reference_mapping(),
+            reference_instrument(),
+            expected_metadata(),
             route(
                 PmProductSource::okx_reference(PmSourceHandle::from_ordinal(1), reference()),
                 "okx-public",

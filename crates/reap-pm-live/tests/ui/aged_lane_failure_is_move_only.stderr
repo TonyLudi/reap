@@ -1,0 +1,9 @@
+error[E0382]: use of moved value: `failure`
+ --> tests/ui/aged_lane_failure_is_move_only.rs:5:19
+  |
+3 | fn replay(failure: PmServiceTurnError) {
+  |           ------- move occurs because `failure` has type `PmServiceTurnError`, which does not implement the `Copy` trait
+4 |     let _first = failure;
+  |                  ------- value moved here
+5 |     let _second = failure;
+  |                   ^^^^^^^ value used here after move

@@ -15,6 +15,36 @@ pub enum PmLaneKind {
     FakeEffect,
 }
 
+/// Frozen input-lane service order for the future complete scheduler.
+///
+/// Phase 3 materializes only `Public`; later phases must introduce the other
+/// typed producers and the complete scheduler atomically in this order.
+pub const PM_INPUT_SERVICE_PRIORITY: [PmLaneKind; 7] = [
+    PmLaneKind::Critical,
+    PmLaneKind::Persistence,
+    PmLaneKind::Private,
+    PmLaneKind::Scheduled,
+    PmLaneKind::Public,
+    PmLaneKind::Reconciliation,
+    PmLaneKind::Telemetry,
+];
+
+impl PmLaneKind {
+    #[must_use]
+    pub const fn service_priority_rank(self) -> Option<u8> {
+        match self {
+            Self::Critical => Some(0),
+            Self::Persistence => Some(1),
+            Self::Private => Some(2),
+            Self::Scheduled => Some(3),
+            Self::Public => Some(4),
+            Self::Reconciliation => Some(5),
+            Self::Telemetry => Some(6),
+            Self::ReconciliationRequest | Self::Capture | Self::Journal | Self::FakeEffect => None,
+        }
+    }
+}
+
 impl From<PmCapabilityLane> for PmLaneKind {
     fn from(lane: PmCapabilityLane) -> Self {
         match lane {
@@ -184,6 +214,7 @@ pub struct PmLaneMetrics {
     high_water: usize,
     rejected_full: u64,
     coalesced: u64,
+    invalidated_purged: u64,
 }
 
 impl PmLaneMetrics {
@@ -192,12 +223,14 @@ impl PmLaneMetrics {
         high_water: usize,
         rejected_full: u64,
         coalesced: u64,
+        invalidated_purged: u64,
     ) -> Self {
         Self {
             depth,
             high_water,
             rejected_full,
             coalesced,
+            invalidated_purged,
         }
     }
 
@@ -219,5 +252,33 @@ impl PmLaneMetrics {
     #[must_use]
     pub const fn coalesced(self) -> u64 {
         self.coalesced
+    }
+
+    #[must_use]
+    pub const fn invalidated_purged(self) -> u64 {
+        self.invalidated_purged
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frozen_input_priority_is_total_and_output_lanes_are_unranked() {
+        for (expected, lane) in PM_INPUT_SERVICE_PRIORITY.into_iter().enumerate() {
+            assert_eq!(
+                lane.service_priority_rank(),
+                Some(u8::try_from(expected).expect("seven ranks fit u8"))
+            );
+        }
+        for lane in [
+            PmLaneKind::ReconciliationRequest,
+            PmLaneKind::Capture,
+            PmLaneKind::Journal,
+            PmLaneKind::FakeEffect,
+        ] {
+            assert_eq!(lane.service_priority_rank(), None);
+        }
     }
 }

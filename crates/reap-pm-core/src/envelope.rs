@@ -8,26 +8,83 @@ use crate::identity::{
     SnapshotRevision,
 };
 
-/// A venue-supplied integrity hash, retained as exact bytes when one exists.
-///
-/// Absence is represented by `None` in [`EventOrdering`]. The all-zero value
-/// is not a venue hash and is rejected instead of becoming a sentinel.
-#[repr(transparent)]
+pub const MAX_VENUE_EVENT_HASH_BYTES: usize = 64;
+
+/// The algorithm identity supplied or proven at the venue boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct VenueEventHash([u8; 32]);
+pub enum VenueEventHashAlgorithm {
+    Sha1,
+    Sha256,
+    Opaque,
+}
+
+/// A venue-supplied integrity hash retained with its exact algorithm and
+/// byte length.
+///
+/// Absence is represented by `None` in [`EventOrdering`]. Hashes are never
+/// padded, truncated, or re-hashed merely to fit a shared envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VenueEventHash {
+    algorithm: VenueEventHashAlgorithm,
+    length: u8,
+    bytes: [u8; MAX_VENUE_EVENT_HASH_BYTES],
+}
 
 impl VenueEventHash {
+    /// Compatibility constructor for an explicitly 32-byte venue hash.
     pub fn new(bytes: [u8; 32]) -> Result<Self, EnvelopeError> {
-        if bytes == [0; 32] {
-            Err(EnvelopeError::ZeroVenueHash)
-        } else {
-            Ok(Self(bytes))
+        Self::sha256(bytes)
+    }
+
+    pub fn sha1(bytes: [u8; 20]) -> Result<Self, EnvelopeError> {
+        Self::from_slice(VenueEventHashAlgorithm::Sha1, &bytes)
+    }
+
+    pub fn sha256(bytes: [u8; 32]) -> Result<Self, EnvelopeError> {
+        Self::from_slice(VenueEventHashAlgorithm::Sha256, &bytes)
+    }
+
+    pub fn opaque(bytes: &[u8]) -> Result<Self, EnvelopeError> {
+        Self::from_slice(VenueEventHashAlgorithm::Opaque, bytes)
+    }
+
+    fn from_slice(algorithm: VenueEventHashAlgorithm, input: &[u8]) -> Result<Self, EnvelopeError> {
+        if input.is_empty() {
+            return Err(EnvelopeError::EmptyVenueHash);
         }
+        if input.len() > MAX_VENUE_EVENT_HASH_BYTES {
+            return Err(EnvelopeError::VenueHashTooLong);
+        }
+        if input.iter().all(|byte| *byte == 0) {
+            return Err(EnvelopeError::ZeroVenueHash);
+        }
+        let mut bytes = [0_u8; MAX_VENUE_EVENT_HASH_BYTES];
+        bytes[..input.len()].copy_from_slice(input);
+        Ok(Self {
+            algorithm,
+            length: input.len() as u8,
+            bytes,
+        })
     }
 
     #[must_use]
-    pub const fn bytes(self) -> [u8; 32] {
-        self.0
+    pub const fn algorithm(self) -> VenueEventHashAlgorithm {
+        self.algorithm
+    }
+
+    #[must_use]
+    pub const fn len(self) -> usize {
+        self.length as usize
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.length == 0
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.length)]
     }
 }
 
@@ -235,6 +292,89 @@ pub struct EventEnvelope<P> {
     payload: P,
 }
 
+/// A normalized payload before bounded-queue service.
+///
+/// Producers can stamp receive facts but cannot claim a service timestamp.
+/// The single consumer turns this into [`EventEnvelope`] at dequeue.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ReceivedEventEnvelope<P> {
+    venue: Venue,
+    source: PmProductSource,
+    connection_id: PmConnectionId,
+    received_clock: ReceivedEventClock,
+    ordering: EventOrdering,
+    payload: P,
+}
+
+impl<P: PmSourceBound> ReceivedEventEnvelope<P> {
+    pub fn new(
+        venue: Venue,
+        source: PmProductSource,
+        connection_id: PmConnectionId,
+        received_clock: ReceivedEventClock,
+        ordering: EventOrdering,
+        payload: P,
+    ) -> Result<Self, EnvelopeError> {
+        validate_envelope_scope(venue, source, payload.source())?;
+        Ok(Self {
+            venue,
+            source,
+            connection_id,
+            received_clock,
+            ordering,
+            payload,
+        })
+    }
+}
+
+impl<P> ReceivedEventEnvelope<P> {
+    #[must_use]
+    pub const fn venue(&self) -> Venue {
+        self.venue
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> PmProductSource {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn connection_id(&self) -> PmConnectionId {
+        self.connection_id
+    }
+
+    #[must_use]
+    pub const fn received_clock(&self) -> ReceivedEventClock {
+        self.received_clock
+    }
+
+    #[must_use]
+    pub const fn ordering(&self) -> EventOrdering {
+        self.ordering
+    }
+
+    #[must_use]
+    pub const fn payload(&self) -> &P {
+        &self.payload
+    }
+
+    pub fn service_at(self, monotonic_service_ns: u64) -> Result<EventEnvelope<P>, EnvelopeError> {
+        Ok(EventEnvelope {
+            venue: self.venue,
+            source: self.source,
+            connection_id: self.connection_id,
+            clock: self.received_clock.service_at(monotonic_service_ns)?,
+            ordering: self.ordering,
+            payload: self.payload,
+        })
+    }
+
+    #[must_use]
+    pub fn into_payload(self) -> P {
+        self.payload
+    }
+}
+
 impl<P: PmSourceBound> EventEnvelope<P> {
     pub fn new(
         venue: Venue,
@@ -244,20 +384,7 @@ impl<P: PmSourceBound> EventEnvelope<P> {
         ordering: EventOrdering,
         payload: P,
     ) -> Result<Self, EnvelopeError> {
-        let source_venue = source.venue();
-        if venue != source_venue {
-            return Err(EnvelopeError::VenueSourceMismatch {
-                venue,
-                source_venue,
-            });
-        }
-        let payload_source = payload.source();
-        if source != payload_source {
-            return Err(EnvelopeError::PayloadSourceMismatch {
-                envelope_source: source,
-                payload_source,
-            });
-        }
+        validate_envelope_scope(venue, source, payload.source())?;
         Ok(Self {
             venue,
             source,
@@ -267,6 +394,27 @@ impl<P: PmSourceBound> EventEnvelope<P> {
             payload,
         })
     }
+}
+
+fn validate_envelope_scope(
+    venue: Venue,
+    source: PmProductSource,
+    payload_source: PmProductSource,
+) -> Result<(), EnvelopeError> {
+    let source_venue = source.venue();
+    if venue != source_venue {
+        return Err(EnvelopeError::VenueSourceMismatch {
+            venue,
+            source_venue,
+        });
+    }
+    if source != payload_source {
+        return Err(EnvelopeError::PayloadSourceMismatch {
+            envelope_source: source,
+            payload_source,
+        });
+    }
+    Ok(())
 }
 
 impl<P> EventEnvelope<P> {
@@ -324,6 +472,8 @@ pub enum EnvelopeError {
     ZeroConnectionEpoch,
     ZeroSnapshotRevision,
     ZeroVenueSequence,
+    EmptyVenueHash,
+    VenueHashTooLong,
     ZeroVenueHash,
     ZeroIngressSequence,
 }
@@ -366,6 +516,10 @@ impl fmt::Display for EnvelopeError {
             }
             Self::ZeroVenueSequence => {
                 formatter.write_str("venue sequence must be nonzero when present")
+            }
+            Self::EmptyVenueHash => formatter.write_str("venue event hash must not be empty"),
+            Self::VenueHashTooLong => {
+                formatter.write_str("venue event hash exceeds the fixed exact-byte bound")
             }
             Self::ZeroVenueHash => formatter.write_str("venue event hash must not be all zeroes"),
             Self::ZeroIngressSequence => {

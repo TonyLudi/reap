@@ -619,6 +619,11 @@ impl SupervisorState {
         self.health = ConnectionStatusKind::Disconnected;
     }
 
+    #[must_use]
+    pub fn preview_after_failure(&self, reached_ready: bool) -> Duration {
+        self.backoff.preview_after_failure(reached_ready)
+    }
+
     pub fn after_failure(&mut self, reached_ready: bool) -> Duration {
         self.health = ConnectionStatusKind::Disconnected;
         self.backoff.after_failure(reached_ready)

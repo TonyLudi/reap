@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "predarb_revision": "8222273a9c72033b760e1d2fec813bc77144556d",
+  "tracked_sources": [
+    {
+      "fixture": "market_book_predarb_seed.json",
+      "source": "crates/venue-polymarket/tests/fixtures/market_book.json",
+      "source_git_blob": "bbb5bc143a914ba8c96d84342321b3dba30ec0fc",
+      "source_sha256": "8e671f14c4b1e8137b1dc1b0bd7d39c79d9c8f961a8483daa32151df99cbdf81",
+      "use": "parser seed only; intentionally incomplete and not a readiness fixture"
+    },
+    {
+      "fixture": "official_snapshot_hash_vector.json",
+      "source": "src/market_monitor.rs::polymarket_orderbook_hash_matches_official_client_vector",
+      "expected_sha1": "0458ea5755c9f73d64a14636fa5c36ed460ec394",
+      "use": "pinned snapshot SHA-1 canonicalization vector; exact lexical strings and received bid/ask array order are hash-significant"
+    },
+    {
+      "fixture": "market_subscription.json",
+      "source": "crates/venue-polymarket/src/ws/market.rs::market_subscribe_message",
+      "use": "exact single-configured-token market subscription"
+    }
+  ]
+}

@@ -67,7 +67,19 @@ The only concrete model used to prove Goal F composition is
 The fixture model declares no OKX book, ticker-last, trade, mark, funding,
 private, account, order, or reconciliation input. It declares no PM public
 trade/`last_trade_price` input, so Goal F constructs and tests no PM public
-trade role.
+trade role. The one-token `/ws/market` stream is multiplexed and may still
+carry a `last_trade_price` object. The bounded raw-frame discriminator may read
+only that object's `event_type` and discard it. It does not deserialize or
+validate trade fields, construct typed trade data, create a normalized event,
+or widen plan/model/subscription scope.
+
+Snapshot `last_trade_price` is a separate integrity-only checksum field. It is
+validated as exact unsigned decimal evidence in the closed interval `[0, 1]`,
+including terminal `0` and `1`, and its original lexical form remains in the
+snapshot hash. It never constructs an executable `PmPrice`. Optional standalone
+BBO `bid_size`/`ask_size` fields must be absent together or present together as
+exact positive quantities; they are validation-only and the normalized BBO
+remains a price-only top check.
 
 To prove that OKX value—not merely event arrival—crosses the model seam, the
 test-only model returns fair probability `0.60` when exact `idxPx >=
@@ -291,7 +303,7 @@ network construction in Goal F.
 | `PM-META-CLOB` | Public `GET /clob-markets/{condition_id}` for only the configured condition: token, tick, minimum, units, neg-risk/domain | Metadata readiness | Public fixture/REST parser |
 | `PM-MD-BOOK-SNAPSHOT` | Exact configured token snapshot, hash/revision, levels | PM book integrity | Public observe/capture/replay |
 | `PM-MD-BOOK-DELTA` | Exact configured token changes with real venue integrity fields | PM book integrity | Public observe/capture/replay |
-| `PM-MD-TRADE` | Public trade/`last_trade_price` | No Goal F consumer | Absent; no plan entry, role, parser reach, or subscription |
+| `PM-MD-TRADE` | Public trade/`last_trade_price` | No Goal F consumer | Absent as a capability: no plan entry, role, trade-field parser, typed/normalized trade event, model input, or trade-specific subscription; multiplexed raw `event_type` discrimination may discard the object |
 | `PM-PRIVATE-ORDER` | User order lifecycle and connection epoch | Order reducer/readiness | Fixture/fake |
 | `PM-PRIVATE-FILL` | Individual trade/fill identity and exact delta | Fill/order/position reducers | Fixture/fake |
 | `PM-RECON-OPEN` | Atomic complete open-order snapshot | Ownership/reservation convergence | Fixture/fake |
@@ -480,7 +492,14 @@ observable; it is not one boolean that erases which dependency failed.
 
 ## Canonical Owner And Event Ordering
 
-One `PmCoordinator<Model>` owns by value:
+The complete coordinator and seven-rank scheduler described first in this
+section are the frozen target for Phases 4-6, not runtime state already
+materialized by Phase 3. Through Phase 3, the only scheduler state is one
+private public lane owned by one active capture Run; the account, persistence,
+private, scheduled, reconciliation, telemetry, journal, and fake-effect
+producers remain prospective.
+
+The future `PmCoordinator<Model>` owns by value:
 
 - compact identity/config tables;
 - exact PM books and OKX reference state;
@@ -507,7 +526,7 @@ assigns compact handles as the zero-based `u16` ordinal. The configuration
 fingerprint binds those ordered tables. Handle assignment never depends on
 input declaration order, hash-map iteration, discovery order, or arrival.
 
-Ready inputs use this stable service rank:
+The prospective complete scheduler uses this stable seven-input service rank:
 
 1. stop/safety/control and fake effect results;
 2. persistence acknowledgements required to release or reject an effect;
@@ -518,20 +537,234 @@ Ready inputs use this stable service rank:
 7. telemetry.
 
 Within an input rank, ordering is `(monotonic_receive_ns, source_handle,
-connection_epoch, local_ingress_sequence, variant_rank)`. Scheduled work uses
-`(monotonic_deadline_ns, action_variant_rank, account_handle, token_handle,
-side_rank, local_action_sequence)`. Replay uses the captured receive/deadline
-values and never depends on service time, Tokio selection, hash-map traversal,
-task completion race, or wall time.
+source_kind_rank, source_scope_ordinal, connection_epoch,
+local_ingress_sequence, variant_rank)`. Source-kind ranks are stable:
+OKX reference `0`, Polymarket market `1`, Polymarket account `2`, and internal
+signal `3`. The scope ordinal is the configured reference, token, or account
+handle, and is zero for an internal signal. The full source discriminator is
+required because handle ordinals are canonical only within an identity class;
+an OKX reference and a Polymarket token may both legitimately have ordinal
+zero. Scheduled work uses `(monotonic_deadline_ns, action_variant_rank,
+account_handle, token_handle, side_rank, local_action_sequence)`. Replay uses
+the captured receive/deadline values and never depends on service time, Tokio
+selection, hash-map traversal, task completion race, or wall time.
 
-The generic bounded lane container is not a connectivity authorizer. Phase 3
-public producers and Phase 4 private producers must bind each delivery to the
-configured role-issued source/connection route before enqueue. A caller-stamped
-source or `PmIngressOrder` alone is not route proof. The Phase 2 seam preserves
-the typed connection and ordering facts but deliberately does not make lanes
-own the capability plan.
+The eleven `PmLaneKind`/`PmLanePolicy` rows and the seven service ranks are a
+prospective frozen oracle. Phase 3 materializes only the `Public` row. It has
+no auxiliary/nonpublic scheduler, no public general lane container, and no
+auxiliary/nonpublic service path. Later phases must introduce their typed
+producers and the complete by-value scheduler atomically rather than exposing
+part of that oracle as a separately mutable service.
 
-Stable variant ranks are:
+The generic bounded policy seam is not a connectivity authorizer. Phase 3
+public producers and later private producers bind each delivery to the
+configured role-issued source/connection route before enqueue. A
+caller-stamped source or ordering tuple alone is not route proof. The Phase 2
+seam preserves typed connection and ordering facts without granting
+capability-plan or queue authority.
+
+`PmPublicCaptureRun` is the sole active owner of its PM session, OKX session,
+writer, per-epoch raw ingress counters, crate-private route converter, and
+canonical PM book reducer. At start it constructs a pristine
+`PmBookReducer` from the validated product configuration, authoritative
+metadata and fingerprints, initial epoch, and exact freshness policy; the
+reducer remains private for the run's lifetime. Classification and route
+conversion are one owner operation: raw adapter/session deliveries and route
+converters never escape through public APIs, and no caller may substitute an
+equivalent sibling session or reducer.
+
+Each run allocates one process-unique, opaque route-authority seal. The route
+seal is stamped onto all five final move-only route-delivery types,
+snapshot-flow evidence, and the route portion of retained public-lane age
+evidence. It answers only which active run issued the delivery. The run checks
+exact route-seal identity at every public admission, snapshot commit, and
+lane-fault enactment, so even a same-configuration sibling root cannot donate
+a delivery.
+
+Each Run owns exactly one crate-private `PmPublicLaneState`. That state owns
+one process-unique opaque lane-instance seal, one checked generation, and the
+one bounded public queue. It cannot be constructed, serviced, or paired with a
+sibling Run by a caller. The lane seal answers which exact Run-owned queue
+observed a rejection or aged head; it is not derived from, and cannot replace,
+the route seal. Both seals are runtime structural authority only: their values
+are redacted from diagnostics and excluded from capture serialization,
+artifact hashes, replay projection, and logical ordering.
+
+Public production APIs do not return a successfully routed occurrence that a
+caller may silently drop before admission. PM metadata issue plus enqueue and
+OKX capture/route plus enqueue are single Run operations. PM snapshot and
+delta production APIs require both the exact reducer transition and public
+admission; the commit-only helpers are non-public. Disconnect and PM heartbeat
+timeout likewise perform lifecycle transition, issue their exact unavailable
+occurrence, and admit that occurrence as one operation.
+
+Unavailable occurrences are session-sequenced, one-shot, carry no venue
+timestamp, and are must-deliver control facts. Reconnect and successful finish
+remain blocked until the matching queued occurrence is consumed. If its
+bounded admission cannot succeed even after the invalidated exact route is
+purged, the Run retains a copied
+`PmPublicNotificationAdmissionFailure`, becomes terminal, and cannot report
+normal continuation or successful finish. The authoritative PM metadata
+occurrence is also session-minted and consumes the same connection-local
+ingress counter as PM websocket deliveries, so a caller cannot choose a
+colliding metadata sequence.
+
+Opening PM delta flow is one atomic composition-owner operation. It consumes
+the exact route-issued snapshot delivery and correlated snapshot-flow value,
+applies that payload to the privately Run-owned `PmBookReducer`, and accepts
+the reducer's move-only commit proof only when instrument, complete metadata
+contract and fingerprint, epoch, metadata/snapshot revisions, ingress, and
+verified venue hash all match. Only then may the owned session open delta
+flow. No active API accepts a caller-created reducer. The reducer proof alone
+grants no protocol, route, or product authority.
+
+Quote consumers use the typed composite `PmPublicBookReadiness`, which is
+broader than reducer readiness alone. Artifact terminality, unavailable
+lifecycle, any pending ordinary book reduction, pending terminal-tick cleanup,
+any typed Full/Aged lane obligation, reducer unavailability, or
+session/reducer disagreement suppresses its positive `is_ready()` result.
+Diagnostic revisions may remain visible, but book levels are exposed only by
+the borrowed `PmPublicReadyBookView` returned from
+`PmPublicCaptureRun::ready_pm_book_view()`. The view cannot outlive or be
+mutated independently of its owning run.
+
+Public-lane service is likewise Run authority. The only public service entry
+point is `PmPublicCaptureRun::service_lane_turn`; the
+`PmPublicLaneState::service_turn` implementation is crate-private. There is no
+`PmLaneSet`, general `PmLaneService`, nonpublic turn, or other scheduler path
+in the Phase 3 runtime. Before any current Run-issued Full or Aged evidence
+escapes as an enactable obligation, the Run records the exact typed pending
+obligation. For a state-bearing PM Full/Aged fault it also begins the matching
+pending reducer external fault synchronously, so readiness is unavailable
+while lifecycle enactment is outstanding.
+
+`PmPublicLaneService` has five mandatory typed callbacks. Service pops one
+exact item, marks consumer transfer in flight, and calls the matching callback
+synchronously. Normal return commits that transfer and clears the marker. If
+the callback unwinds and an outer caller catches it, the marker remains
+poisoned: readiness, later mutation, later service, and successful finish all
+fail closed. An unavailable item is non-expiring, bypasses the ordinary age
+check, and is serviced alone; one normal callback therefore returns exactly
+`Ok(1)` and consumes exactly that one control occurrence.
+
+### Phase 3 artifact and recovery boundary
+
+A terminal artifact fault closes both sessions owned by
+`PmPublicCaptureRun`, requires a fresh run/artifact, and cannot be repaired by
+same-artifact reconnect. Terminal faults are:
+
+- any capture/writer admission, backpressure, byte/count-capacity, storage, or
+  lifecycle-write failure;
+- raw PM or OKX classification, parser, or session-admission failure, and any
+  live route-conversion failure;
+- any snapshot-commit, reducer-configuration, reducer-proof, or correlated-flow
+  invariant failure;
+- hash mismatch, invalid transition, or reducer rejection; and
+- tick-size metadata drift, which requires refreshed authoritative metadata in
+  a new artifact.
+
+After a terminal fault, every ordinary mutating run API is closed: raw
+capture/classification, lifecycle transition, reconnect, metadata occurrence,
+snapshot commit, public-lane admission/enactment, and timer recording all
+reject. Read-only path/header/subscription inspection and terminal shutdown may
+remain reachable. The sole mutation exception is one exact authenticated
+terminal-tick cleanup described below; it cannot reopen the run. Shutdown
+still drains/closes the writer, but `finish` must return a typed non-success
+and must never return a normal verified/replayed outcome for that artifact.
+
+Same-artifact recovery is limited to explicit disconnect, public-lane
+overflow, public-lane stale/aged backlog, PM heartbeat timeout, and an explicit
+externally proved PM gap. OKX has only disconnect, public-lane overflow, and
+public-lane stale/aged recovery in this set. The pure PM reducer may permit
+same-epoch snapshot repair after `InvalidTransition` or `HashMismatch`, but the
+active capture composition deliberately makes either fault artifact-terminal:
+continuing would leave live accepted history that normal verified replay could
+not reproduce. A raw-frame or writer capacity failure is likewise terminal
+even though a public service-lane `Full` is recoverable.
+
+Lifecycle phase, connection epoch, route seal, lane proof, source, saturation
+action, and applicable reducer identity/configuration are validated before the
+lifecycle record is written. The exact disconnect reasons are PM `Disconnect`,
+`Gap`, `Overflow`, `Stale`, and `HeartbeatTimeout`, and OKX `Disconnect`,
+`Overflow`, and `Stale`. A reconnect-scheduled record is legal only after the
+matching typed disconnect record. If the write fails, or a subsequent session
+transition fails after the record was written, the artifact is terminal
+because its durable history can no longer describe a normal live reduction.
+No missing wall clock is synthesized.
+
+`HeartbeatTimeout` may be emitted only by the owned PM session's heartbeat
+poll after it proves an outstanding ping and the exact deadline has expired,
+using real receive evidence; a caller cannot stamp that reason. Semantic
+replay must reconstruct the same proof: no outstanding ping and a timeout
+before the deadline are rejected, while the exact deadline is accepted. A
+structural file verification alone does not authenticate that heartbeat
+history. `Gap` is reserved schema/replay vocabulary for a sealed external
+detector. A jump in local ingress sequence is legal and is not venue gap
+evidence. Until such a detector is present, active composition exposes no
+caller-selected gap authority and omits the event rather than inventing it.
+
+A saturated public-lane admission returns the exact unconsumed delivery inside
+a private, move-only Full proof. That proof binds the independent lane seal,
+checked generation, configured capacity, rejected key, and action. The active
+run registers the corresponding typed pending Full obligation before returning
+the proof. Before any lifecycle write, the same Run-owned
+`PmPublicLaneState` consumes it and proves that the generation is still
+current, the lane is still Full at the same capacity, the rejected key is
+still absent, and the action still matches policy.
+Successful enactment consumes the retained delivery and private proof inside
+the Run. Its public success value exposes only copied ordering, unavailable
+fault, reducer reason, and purge-count facts; it cannot return or reconstruct
+the route delivery or lane proof.
+
+An age failure retains a separate private, move-only proof of the offending
+typed head, key, route seal/source, connection, ordering, receive clock,
+original observation time, lane seal, and generation without popping it.
+For evidence issued by the exact current Run,
+`PmPublicCaptureRun::service_lane_turn` registers its typed pending Aged
+obligation before returning it. Before any lifecycle write, the same lane
+instance consumes it and rechecks the current generation, exact current head,
+route facts, policy action, and that the head was genuinely over-age at the
+recorded observation. Sibling-Run evidence, a mismatched internal lane seal,
+altered route facts, and other failed authentication return the untouched
+proof/delivery and perform no Run, lane, session, reducer, or lifecycle
+mutation. An already registered exact obligation remains pending for its own
+evidence.
+
+After both the lane proof and current owned route/epoch are authenticated,
+Full/Aged enactment uses explicit detection wall/monotonic clocks. PM `Full`
+applies session `Overflow` and finalizes the exact pending reducer `Overflow`;
+PM `Aged` applies session `Stale` and finalizes the exact pending reducer
+`BacklogAged`. OKX applies the corresponding session `Overflow` or `Stale`.
+After invalidation the owner performs a bounded exact-route purge by `(route
+seal, source, connection, epoch)`, preserving sibling, unrelated, and
+later-epoch work. An already-unavailable head is purged without minting a
+duplicate occurrence and retains its original typed fault.
+
+Lane metrics distinguish `rejected_full` from `invalidated_purged`. PM reducer
+metrics distinguish `overflows`, `heartbeat_timeouts`, and
+`backlog_aged_faults`; a queue-age fault increments `backlog_aged_faults` and
+`stale_invalidations`, while timer-derived metadata/book staleness increments
+`stale_invalidations` without pretending it was a backlog-age fault.
+
+A tick-size-change delivery always retains exact `old` and `new` values and is
+terminal for its artifact. Capture returns that exact move-only delivery,
+retains its pending reduction identity inside the Run, and marks cleanup
+`Pending`; terminalization does not claim product-state invalidation has
+already occurred. The sole post-terminal mutation,
+`PmPublicCaptureRun::apply_terminal_tick_invalidation`, accepts only that
+authenticated move-only delivery, applies its values to the private reducer,
+and marks cleanup `Applied` without reopening capture or delta flow.
+Mismatched cleanup evidence is returned without mutation. `finish` drains the
+writer but returns `TerminalTickCleanupIncomplete` while cleanup remains
+pending; after cleanup it still returns the typed terminal non-success. Tick
+drift must never be downgraded to recoverable overflow or staleness.
+
+The following variant rows, service bursts, and capacities are the prospective
+complete-scheduler oracle. Phase 3 implements only the public row, its 256-item
+ordinary burst, and the must-deliver one-at-a-time unavailable rule described
+above.
+
+Stable prospective variant ranks are:
 
 | Lane | Variant order |
 | --- | --- |
@@ -542,16 +775,18 @@ Stable variant ranks are:
 | Public | connection unavailable; market metadata/lifecycle; PM book snapshot; PM book delta/price change; PM BBO; OKX reference |
 | Reconciliation | open orders; order detail; fill page/watermark; collateral; authorization; position |
 
-One service turn admits at most 512 critical, 512 persistence, 64 private, 16
-due scheduled, 256 public, eight reconciliation, and one telemetry item in
-that fixed rank order. If critical work remains after its 512-item bounded
-burst, the product globally stops before servicing lower ranks. Any backlog
-that breaches its age limit takes the lane's fail-closed action rather than
-changing ordering opportunistically.
+The future complete scheduler's service turn admits at most 512 critical, 512
+persistence, 64 private, 16 due scheduled, 256 public, eight reconciliation,
+and one telemetry item in that fixed rank order. If critical work remains
+after its 512-item bounded burst, the future product globally stops before
+servicing lower ranks. Any backlog that breaches its age limit takes the
+lane's fail-closed action rather than changing ordering opportunistically.
 
 ## Bounded Lanes And Saturation
 
-Capacities are compile-time/config-validation ceilings for Goal F:
+These eleven policy rows are compile-time/config-validation ceilings frozen
+for Goal F. Only the public row is instantiated as scheduler state in Phase 3;
+the other ten remain construction requirements for later phases:
 
 | Lane/state | Capacity | Nominal high-water ceiling | Nominal maximum age | Saturation/age action |
 | --- | ---: | ---: | ---: | --- |
@@ -561,7 +796,7 @@ Capacities are compile-time/config-validation ceilings for Goal F:
 | Integrity-bearing public snapshot/delta | 8,192 | 256 | 500 ms | Mark stream unavailable, invalidate epoch/readiness, explicit snapshot and resubscribe |
 | Complete reconciliation/account snapshots | 128 | 16 | 5 s | Keep account unready and retry; partial pages never enter |
 | Outbound reconciliation/refresh requests | 128 | 16 | 1 s | Keep affected account/token unready, retain one bounded pending-required bit, and retry; never declare a lost request complete |
-| Raw capture frames | 8,192 entries / 32 MiB / 1 MiB each | 256 entries / 8 MiB | 500 ms | Mark capture invalid and resynchronize the source |
+| Raw capture frames | 8,192 entries / 32 MiB / 1 MiB each | 256 entries / 8 MiB | 500 ms | Terminally close the shared capture artifact and rotate to a fresh run |
 | PM journal/effect records awaiting durable acknowledgement | 1,024 | 128 | 1 s | Suppress dispatch and halt new quote creation |
 | Fake place/cancel effects | 256 | 32 | 250 ms | Do not journal or dispatch the new effect; halt quoting; retain already scheduled owned cancels |
 | Scheduled actions | 4,096 | 64 | 100 ms lateness | Suppress quote, deterministically schedule owned cancellation, globally halt if safety cannot be represented |
@@ -638,7 +873,49 @@ existing capture/journal fixtures, existing public API compatibility, and the
 canonical Chaos hashes before either PM wrapper is admitted. PM code never
 depends on broad `reap-capture` or `reap-storage`.
 
-The responsibility/module DAG is also frozen:
+The actual frozen production-module inventory in `reap-pm-live` through
+Phase 3 is:
+
+| Root module | Present private children |
+| --- | --- |
+| `capture` | `capture::{validation,verify,writer}` |
+| `capture_roles` | `capture_roles::reducer_freshness` |
+| `composition` | `composition::{lane_enact,run_capture,run_lane_aged,run_lane_full,run_lane_service,run_lifecycle,run_reduce,run_state,run_terminal_tick,run_types}` |
+| `lanes` | `lanes::{bounded,failure,policy,public,service}` |
+| `fake_effect`, `public_routes`, `replay`, `schedule` | No child production modules |
+
+Only `lanes::public` is materialized queue state. `lanes::policy` retains the
+prospective eleven-row oracle, but there is no `lanes::scheduled`, general lane
+set, auxiliary scheduler, or nonpublic service path in Phase 3. Prospective
+Phase 4-7 modules remain in the final Goal F responsibility table below and
+are not claimed to be implemented by this inventory.
+
+### Frozen Phase 3 implementation evidence
+
+The final local Phase 3 audit records:
+
+| Evidence | Exact result |
+| --- | --- |
+| Workspace packages / outside-workspace path dependencies | 34 / 0 |
+| Goal F production Rust files / physical lines / files above 1,500 | 85 / 31,059 / 0 |
+| Largest production file | `reap-pm-live/src/capture_roles.rs`, 1,490 lines |
+| Largest reviewed production function | `PmPublicCaptureRun::enact_okx_reference_lane_failure`, 239 lines; 0 above 250 |
+| Workspace production Rust path inventory | 255 paths; SHA-256 `c01ef82cde5603c676a4c802edd6edba61c739b76f21111f4646e9f42784c77e` |
+| Workspace production content-manifest SHA-256 | `4db8efc7316dd70b496769df5728c8f48402d77c9c808fb30af5dc2fa2cf10bb` |
+| Goal F direct workspace dependency edges | 20; SHA-256 `556719df2e183422a487aaafcf80b48a1de06e8ea56e8a4d57cd375725802f28` |
+| Workspace public-declaration inventory | 1,951 lines; SHA-256 `94c443da52fb2db1fa517b1b0bc0a9addbdd82e5d7936411cdbcba78b97efc4a` |
+| `reap-pm-live` crate-root exports | 80 names; canonical name/module SHA-256 `2c27493eb22cf195cad1f0c2c6beadd9c187da1e67f13b5f2788e4b26591a898` |
+| Schema/version inventory | 48 lines; SHA-256 `4bbde207bc0279ef90e9a88365567f49332665cafd11f192964483a89a5c6940` |
+| Public-wire fixture manifest | schema 1; 32 payloads; SHA-256 `356d787167b3e2e86c63197eec3738761b5979fcf760796e0f7c68ebb9ef7c94` |
+| Public-wire provenance | pinned Predarb `8222273a9c72033b760e1d2fec813bc77144556d`; SHA-256 `3b85d5d1e891136f085c72c5691380f8bd7f3c37f83f3b316ef546b4576ff343` |
+| Runtime / compile-fail gates | 86 / 27 passed; zero failed |
+| Static gates | all targets, Clippy `-D warnings`, formatting, and `git diff --check` green |
+
+The 1,500-line source-policy gate includes `reap-pm-core`. The 1,490-line
+`capture_roles.rs` has only ten lines of policy headroom and is frozen after
+Phase 3; it must be split by responsibility before any later-phase growth.
+
+The prospective final Goal F responsibility/module DAG remains frozen:
 
 | Crate | Production modules admitted in Goal F |
 | --- | --- |
@@ -652,14 +929,16 @@ The responsibility/module DAG is also frozen:
 | `reap-polymarket-adapter` | `public`, `private_fixture`, `reconcile_fixture`, `account_fixture`, `fake_execution` |
 | `reap-pm-strategy` | `model`, `quote_policy`; pure/static only |
 | `reap-pm-live-contracts` | `config`, `requirements`, `plan` |
-| `reap-pm-live` | `coordinator`, `lanes` with private `lanes::{bounded,policy,scheduled}`, `schedule`, `journal`, `capture`, `replay`, `fake_effect`, `composition` |
+| `reap-pm-live` | `coordinator`; `lanes` retaining current `public` plus prospective `scheduled` and other focused scheduler children; `schedule`; `journal`; `capture` with private `capture::{writer,validation,verify}`; `capture_roles` with private `capture_roles::reducer_freshness`; `public_routes`; `replay`; `fake_effect`; `composition` with private `composition::{lane_enact,run_capture,run_lane_aged,run_lane_full,run_lane_service,run_lifecycle,run_reduce,run_state,run_terminal_tick,run_types}` |
 
 No production module may absorb another row's responsibility to evade the
 1,500-line file or 250-line function review.
 
-The exact candidate production-module dependency edges below are complete for
-all new modules and every existing module whose direct workspace dependency
-changes. Untouched existing internal edges remain the Phase 0 baseline:
+The exact prospective final Goal F production-module dependency edges below
+cover all new modules and every existing module whose direct workspace
+dependency changes. They deliberately include later-phase target edges in
+addition to the actual-through-Phase-3 inventory above. Untouched existing
+internal edges remain the Phase 0 baseline:
 
 ```text
 reap-transport::supervisor -> bounded + backoff + health + shutdown
@@ -703,17 +982,35 @@ reap-pm-strategy::quote_policy -> model + reap-pm-core::numeric + reap-pm-state:
 reap-pm-live-contracts::config -> reap-pm-core::{identity,mapping,numeric}
 reap-pm-live-contracts::requirements -> config + reap-pm-strategy::model
 reap-pm-live-contracts::plan -> config + requirements
-reap-pm-live::lanes -> lanes::{bounded,policy,scheduled} + reap-pm-core::{envelope,event,identity} + reap-polymarket-adapter::reconcile_fixture + reap-transport::bounded
+reap-pm-live::lanes -> lanes::{bounded,failure,policy,public,scheduled,service} + reap-pm-core::{envelope,event,identity} + reap-polymarket-adapter::reconcile_fixture + reap-transport::bounded
 reap-pm-live::lanes::bounded -> policy
+reap-pm-live::lanes::failure -> policy + public_routes + reap-pm-core::{envelope,identity} + reap-transport::bounded
 reap-pm-live::lanes::policy -> reap-pm-live-contracts::requirements
+reap-pm-live::lanes::public -> bounded + failure + policy + public_routes + reap-pm-core::{envelope,event,identity}
 reap-pm-live::lanes::scheduled -> policy + reap-pm-core::identity
+reap-pm-live::lanes::service -> lanes::{bounded,failure,policy,public,scheduled} + public_routes + reap-pm-core::{envelope,event,identity} + reap-polymarket-adapter::reconcile_fixture
 reap-pm-live::schedule -> reap-pm-core::identity + reap-pm-live-contracts::plan
 reap-pm-live::journal -> reap-durable-writer::{lease,progress,writer} + reap-pm-core::{event,identity,numeric}
-reap-pm-live::capture -> reap-capture-framing::{bounded_writer,frame,hash,verify} + reap-okx-public-source::session + reap-pm-core::{envelope,event,identity,numeric} + reap-polymarket-adapter::public
+reap-pm-live::capture -> capture::{writer,validation,verify} + reap-capture-framing::{bounded_writer,frame,hash,verify} + reap-okx-public-source::session + reap-pm-core::{envelope,event,identity,numeric} + reap-polymarket-adapter::public
+reap-pm-live::capture::writer -> validation + reap-capture-framing::{bounded_writer,frame} + reap-pm-core::{envelope,identity}
+reap-pm-live::capture::verify -> validation + reap-capture-framing::{hash,verify}
+reap-pm-live::capture_roles -> capture + capture_roles::reducer_freshness + public_routes + reap-okx-public-source::session + reap-pm-core::{envelope,event,identity} + reap-pm-state::book + reap-polymarket-adapter::public
+reap-pm-live::capture_roles::reducer_freshness -> reap-pm-state::book + reap-polymarket-adapter::public
+reap-pm-live::public_routes -> reap-okx-public-source::session + reap-pm-core::{envelope,event,identity,numeric} + reap-pm-live-contracts::config + reap-polymarket-adapter::public
 reap-pm-live::coordinator -> lanes + schedule + reap-pm-state::{book,order,position,readiness,reservation,risk} + reap-pm-strategy::{model,quote_policy}
 reap-pm-live::fake_effect -> coordinator + journal + reap-polymarket-adapter::fake_execution
 reap-pm-live::replay -> capture + coordinator + journal
-reap-pm-live::composition -> capture + coordinator + fake_effect + journal + lanes + replay + schedule + reap-pm-live-contracts::plan + reap-pm-state::{order,position,readiness,reservation} + reap-polymarket-adapter::{account_fixture,private_fixture,reconcile_fixture}
+reap-pm-live::composition -> composition::{lane_enact,run_capture,run_lane_aged,run_lane_full,run_lane_service,run_lifecycle,run_reduce,run_state,run_terminal_tick,run_types} + capture + capture_roles + coordinator + fake_effect + journal + lanes + public_routes + replay + schedule + reap-pm-live-contracts::plan + reap-pm-state::{book,order,position,readiness,reservation} + reap-polymarket-adapter::{account_fixture,private_fixture,reconcile_fixture}
+reap-pm-live::composition::run_capture -> capture + capture_roles + public_routes
+reap-pm-live::composition::run_lifecycle -> capture + capture_roles + public_routes + replay + reap-pm-state::book
+reap-pm-live::composition::run_lane_full -> capture + capture_roles + lanes + public_routes + reap-pm-state::book + reap-polymarket-adapter::public
+reap-pm-live::composition::run_lane_aged -> capture + capture_roles + lanes + public_routes + reap-pm-state::book + reap-polymarket-adapter::public
+reap-pm-live::composition::run_lane_service -> lanes + public_routes + reap-pm-state::book
+reap-pm-live::composition::run_reduce -> capture_roles + lanes + public_routes + reap-pm-state::book
+reap-pm-live::composition::run_state -> capture_roles + public_routes + reap-pm-state::book
+reap-pm-live::composition::run_terminal_tick -> capture_roles + public_routes + reap-pm-state::book
+reap-pm-live::composition::run_types -> capture + capture_roles + public_routes + replay
+reap-pm-live::composition::lane_enact -> capture_roles + lanes + public_routes + reap-pm-state::book + reap-polymarket-adapter::public
 ```
 
 Modules with no listed outgoing production edge are leaves. `reap-storage` and
@@ -815,6 +1112,20 @@ Authorized new APIs are capability-bearing types exported only by the PM crate
 that owns them. Executable constructors, approval minting, ownership binding,
 prepared fake effects, and fake transport consumption remain private or
 crate-private and are protected by compile-fail/source-policy tests.
+
+The PM public-capture schema/header/record types and bounded verification and
+replay functions remain public for deterministic offline inspection. They
+prove structural consistency, configured-scope equality against a
+caller-supplied expected header, bounded byte/record integrity, and replay
+semantics. They are explicitly unauthenticated offline evidence: callers can
+construct schema values, and successful verification does not prove that
+`PmPublicCaptureRun` produced the file or that any runtime route/lane/session
+authority existed. The pinned `PmCaptureProvenance` fields are structurally
+validated reference metadata, not active-run provenance.
+
+`PmPublicCaptureWriter` is crate-private and is not re-exported from the crate
+root. Only `PmPublicCaptureRun` may construct or mutate the active artifact;
+offline schema/verify/replay access cannot recover that authority.
 
 PM persistence uses a new PM-specific journal/schema and scoped lease. Its
 non-secret lease identity binds product `reap-pm`, environment, chain,

@@ -45,6 +45,15 @@ impl ReconnectBackoff {
         self.next_delay = self.policy.initial_delay;
     }
 
+    #[must_use]
+    pub fn preview_after_failure(&self, reached_ready: bool) -> Duration {
+        if reached_ready {
+            self.policy.initial_delay
+        } else {
+            self.next_delay
+        }
+    }
+
     /// Records one failed attempt and returns the delay before the next one.
     ///
     /// A session that reached ready state resets historical startup failures

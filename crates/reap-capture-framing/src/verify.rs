@@ -1,6 +1,12 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+#[cfg(unix)]
+use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -80,6 +86,37 @@ pub struct JsonlFileScan {
     pub stable_while_reading: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileSnapshot {
+    bytes: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    change_seconds: i64,
+    #[cfg(unix)]
+    change_nanoseconds: i64,
+}
+
+impl FileSnapshot {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            bytes: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            change_seconds: metadata.ctime(),
+            #[cfg(unix)]
+            change_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+}
+
 /// Scans a regular non-symlink JSONL file with a strict per-frame memory bound.
 ///
 /// `max_frame_bytes` includes the trailing newline when present. The validator
@@ -90,12 +127,32 @@ pub fn scan_jsonl_file_bounded(
     max_frame_bytes: usize,
     mut validate_frame: impl FnMut(&[u8]) -> bool,
 ) -> Result<JsonlFileScan, JsonlVerifyError> {
+    scan_jsonl_file_bounded_total(path, max_frame_bytes, u64::MAX, |frame| {
+        validate_frame(frame)
+    })
+}
+
+/// Scans a regular non-symlink JSONL file with strict per-frame and whole-file
+/// byte bounds enforced against the same open file.
+pub fn scan_jsonl_file_bounded_total(
+    path: &Path,
+    max_frame_bytes: usize,
+    max_total_bytes: u64,
+    mut validate_frame: impl FnMut(&[u8]) -> bool,
+) -> Result<JsonlFileScan, JsonlVerifyError> {
     if max_frame_bytes == 0 {
         return Err(JsonlVerifyError::InvalidFrameLimit {
             path: path.to_path_buf(),
         });
     }
-    let (source_path, file, initial_bytes) = open_jsonl_file(path)?;
+    let (source_path, file, initial) = open_jsonl_file(path)?;
+    if initial.bytes > max_total_bytes {
+        return Err(JsonlVerifyError::InputTooLarge {
+            path: source_path,
+            actual: initial.bytes,
+            limit: max_total_bytes,
+        });
+    }
     let mut reader = BufReader::new(file);
     let mut frame = Vec::with_capacity(max_frame_bytes.min(64 * 1024));
     let mut hasher = Sha256::new();
@@ -118,7 +175,15 @@ pub fn scan_jsonl_file_bounded(
             break;
         }
         records = records.saturating_add(1);
-        bytes = bytes.saturating_add(read as u64);
+        let next_bytes = bytes.saturating_add(read as u64);
+        if next_bytes > max_total_bytes {
+            return Err(JsonlVerifyError::InputTooLarge {
+                path: source_path,
+                actual: next_bytes,
+                limit: max_total_bytes,
+            });
+        }
+        bytes = next_bytes;
         hasher.update(&frame);
         has_trailing_partial_record = !frame.ends_with(b"\n");
         if !validate_frame(&frame) {
@@ -126,6 +191,7 @@ pub fn scan_jsonl_file_bounded(
             first_invalid_record.get_or_insert(records);
         }
     }
+    let final_snapshot = inspect_file(reader.get_ref(), &source_path)?;
 
     Ok(JsonlFileScan {
         source_path,
@@ -135,7 +201,7 @@ pub fn scan_jsonl_file_bounded(
         invalid_records,
         first_invalid_record,
         has_trailing_partial_record,
-        stable_while_reading: bytes == initial_bytes,
+        stable_while_reading: bytes == initial.bytes && final_snapshot == initial,
     })
 }
 
@@ -149,7 +215,7 @@ pub fn scan_jsonl_file_legacy_unbounded(
     path: &Path,
     mut validate_frame: impl FnMut(&[u8]) -> bool,
 ) -> Result<JsonlFileScan, JsonlVerifyError> {
-    let (source_path, file, initial_bytes) = open_jsonl_file(path)?;
+    let (source_path, file, initial) = open_jsonl_file(path)?;
     let mut reader = BufReader::new(file);
     let mut frame = Vec::new();
     let mut hasher = Sha256::new();
@@ -181,6 +247,7 @@ pub fn scan_jsonl_file_legacy_unbounded(
             first_invalid_record.get_or_insert(records);
         }
     }
+    let final_snapshot = inspect_file(reader.get_ref(), &source_path)?;
 
     Ok(JsonlFileScan {
         source_path,
@@ -190,7 +257,7 @@ pub fn scan_jsonl_file_legacy_unbounded(
         invalid_records,
         first_invalid_record,
         has_trailing_partial_record,
-        stable_while_reading: bytes == initial_bytes,
+        stable_while_reading: bytes == initial.bytes && final_snapshot == initial,
     })
 }
 
@@ -236,42 +303,26 @@ fn read_frame_bounded(
     }
 }
 
-fn open_jsonl_file(path: &Path) -> Result<(PathBuf, File, u64), JsonlVerifyError> {
-    let source_path = canonical_regular_file(path)?;
-    let file = File::open(&source_path).map_err(|source| JsonlVerifyError::ReadInput {
-        path: source_path.clone(),
-        operation: VerifyIoOperation::Open,
-        source,
-    })?;
-    let initial_bytes = file
-        .metadata()
+fn open_jsonl_file(path: &Path) -> Result<(PathBuf, File, FileSnapshot), JsonlVerifyError> {
+    open_verified_regular_file(path)
+}
+
+fn inspect_file(file: &File, source_path: &Path) -> Result<FileSnapshot, JsonlVerifyError> {
+    file.metadata()
+        .map(|metadata| FileSnapshot::from_metadata(&metadata))
         .map_err(|source| JsonlVerifyError::ReadInput {
-            path: source_path.clone(),
+            path: source_path.to_path_buf(),
             operation: VerifyIoOperation::InspectMetadata,
             source,
-        })?
-        .len();
-    Ok((source_path, file, initial_bytes))
+        })
 }
 
 pub fn read_bounded_regular_file(
     path: &Path,
     limit: u64,
 ) -> Result<(PathBuf, Vec<u8>), JsonlVerifyError> {
-    let canonical = canonical_regular_file(path)?;
-    let file = File::open(&canonical).map_err(|source| JsonlVerifyError::ReadInput {
-        path: canonical.clone(),
-        operation: VerifyIoOperation::Open,
-        source,
-    })?;
-    let initial_bytes = file
-        .metadata()
-        .map_err(|source| JsonlVerifyError::ReadInput {
-            path: canonical.clone(),
-            operation: VerifyIoOperation::InspectMetadata,
-            source,
-        })?
-        .len();
+    let (canonical, file, initial) = open_verified_regular_file(path)?;
+    let initial_bytes = initial.bytes;
     if initial_bytes > limit {
         return Err(JsonlVerifyError::InputTooLarge {
             path: canonical,
@@ -300,6 +351,43 @@ pub fn read_bounded_regular_file(
 }
 
 pub fn canonical_regular_file(path: &Path) -> Result<PathBuf, JsonlVerifyError> {
+    regular_path_metadata(path)?;
+    canonicalize_input_path(path)
+}
+
+fn open_verified_regular_file(
+    path: &Path,
+) -> Result<(PathBuf, File, FileSnapshot), JsonlVerifyError> {
+    let target_before_open = regular_path_metadata(path)?;
+    let source_path = canonicalize_input_path(path)?;
+    let file = open_read_only_no_follow(path).map_err(|source| JsonlVerifyError::ReadInput {
+        path: source_path.clone(),
+        operation: VerifyIoOperation::Open,
+        source,
+    })?;
+    let opened_metadata = file
+        .metadata()
+        .map_err(|source| JsonlVerifyError::ReadInput {
+            path: source_path.clone(),
+            operation: VerifyIoOperation::InspectMetadata,
+            source,
+        })?;
+    let target_after_open = regular_path_metadata(path)?;
+    if !opened_metadata.is_file()
+        || !same_file_identity(&target_before_open, &opened_metadata)
+        || !same_file_identity(&target_after_open, &opened_metadata)
+    {
+        return Err(JsonlVerifyError::InvalidInputPath {
+            path: path.to_path_buf(),
+            message: "changed while opening or did not resolve to the expected regular file"
+                .to_string(),
+        });
+    }
+    let initial = FileSnapshot::from_metadata(&opened_metadata);
+    Ok((source_path, file, initial))
+}
+
+fn regular_path_metadata(path: &Path) -> Result<std::fs::Metadata, JsonlVerifyError> {
     let metadata =
         std::fs::symlink_metadata(path).map_err(|error| JsonlVerifyError::InvalidInputPath {
             path: path.to_path_buf(),
@@ -311,10 +399,38 @@ pub fn canonical_regular_file(path: &Path) -> Result<PathBuf, JsonlVerifyError> 
             message: "must be a regular file and not a symbolic link".to_string(),
         });
     }
+    Ok(metadata)
+}
+
+fn canonicalize_input_path(path: &Path) -> Result<PathBuf, JsonlVerifyError> {
     std::fs::canonicalize(path).map_err(|error| JsonlVerifyError::InvalidInputPath {
         path: path.to_path_buf(),
         message: error.to_string(),
     })
+}
+
+#[cfg(unix)]
+fn open_read_only_no_follow(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    options.open(path)
+}
+
+#[cfg(not(unix))]
+fn open_read_only_no_follow(path: &Path) -> std::io::Result<File> {
+    File::open(path)
+}
+
+#[cfg(unix)]
+fn same_file_identity(expected: &std::fs::Metadata, actual: &std::fs::Metadata) -> bool {
+    expected.dev() == actual.dev() && expected.ino() == actual.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(_: &std::fs::Metadata, _: &std::fs::Metadata) -> bool {
+    true
 }
 
 /// Returns the JSON payload bytes for a validator that does not care whether

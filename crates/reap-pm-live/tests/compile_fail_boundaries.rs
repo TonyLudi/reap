@@ -8,4 +8,24 @@ fn composition_boundaries_are_enforced_by_the_type_system() {
     tests.compile_fail("tests/ui/observation_lane_cannot_be_selected.rs");
     tests.compile_fail("tests/ui/service_rank_cannot_be_forged.rs");
     tests.compile_fail("tests/ui/observation_key_cannot_be_replayed.rs");
+    tests.compile_fail("tests/ui/public_route_delivery_cannot_be_forged.rs");
+    tests.compile_fail("tests/ui/public_routes_are_internal.rs");
+    tests.compile_fail("tests/ui/raw_pm_book_delivery_cannot_enter_lane.rs");
+    tests.compile_fail("tests/ui/raw_pm_book_delivery_is_move_only.rs");
+    tests.compile_fail("tests/ui/public_observed_event_cannot_enqueue_directly.rs");
+    tests.compile_fail("tests/ui/public_route_delivery_is_move_only.rs");
+    tests.compile_fail("tests/ui/public_route_delivery_cannot_bypass_run.rs");
+    tests.compile_fail("tests/ui/snapshot_commit_proof_is_move_only.rs");
+    tests.compile_fail("tests/ui/snapshot_commit_proof_cannot_be_forged.rs");
+    tests.compile_fail("tests/ui/public_lane_failure_cannot_be_forged.rs");
+    tests.compile_fail("tests/ui/public_lane_failure_is_move_only.rs");
+    tests.compile_fail("tests/ui/aged_delivery_evidence_cannot_be_forged.rs");
+    tests.compile_fail("tests/ui/aged_delivery_evidence_is_move_only.rs");
+    tests.compile_fail("tests/ui/aged_lane_failure_cannot_be_forged.rs");
+    tests.compile_fail("tests/ui/aged_lane_failure_is_move_only.rs");
+    tests.compile_fail("tests/ui/public_capture_writer_is_internal.rs");
+    tests.compile_fail("tests/ui/raw_public_lane_service_is_internal.rs");
+    tests.compile_fail("tests/ui/public_run_reducer_is_private.rs");
+    tests.compile_fail("tests/ui/public_lane_service_requires_all_callbacks.rs");
+    tests.compile_fail("tests/ui/commit_only_book_apis_are_not_public.rs");
 }

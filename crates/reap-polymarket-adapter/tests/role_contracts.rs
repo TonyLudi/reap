@@ -1,8 +1,9 @@
 use reap_pm_core::{
-    EvmAddress, PmAccountHandle, PmAccountScope, PmChainId, PmConnectionId, PmEnvironmentId,
-    PmFunderId, PmInstrumentHandle, PmMarketHandle, PmProductSource, PmSignerId,
-    PmSnapshotCompleteness, PmSnapshotEvidence, PmSourceHandle, PmSpenderId, PmTokenHandle,
-    SnapshotRevision,
+    EvmAddress, OkxInstrumentId, OkxReferenceInstrument, PmAccountHandle, PmAccountScope,
+    PmChainId, PmConnectionId, PmEnvironmentId, PmFunderId, PmInstrumentHandle, PmInstrumentId,
+    PmMarketHandle, PmMarketId, PmProductSource, PmPublicObservationGrant, PmQuantity, PmSignerId,
+    PmSnapshotCompleteness, PmSnapshotEvidence, PmSourceHandle, PmSpenderId, PmTick, PmTokenHandle,
+    PmTokenId, SnapshotRevision, U256,
 };
 use reap_polymarket_adapter::{
     PmAccountPositionSnapshotRole, PmCompleteFillPage, PmCompleteOpenOrdersSnapshot,
@@ -11,11 +12,12 @@ use reap_polymarket_adapter::{
     PmPrivateLifecycleRole, PmPublicObservationRole, PmPublicRole, PmReconciliationContractError,
     PmReconciliationRole,
 };
+use reap_polymarket_wire::{PmBookParserConfig, PmWireScope};
 
 fn instrument() -> PmInstrumentHandle {
     PmInstrumentHandle::new(
-        PmMarketHandle::from_ordinal(2),
-        PmTokenHandle::from_ordinal(3),
+        PmMarketHandle::from_ordinal(0),
+        PmTokenHandle::from_ordinal(0),
     )
 }
 
@@ -42,11 +44,43 @@ fn market_source() -> PmProductSource {
     PmProductSource::polymarket_market(PmSourceHandle::from_ordinal(3), instrument().token())
 }
 
+fn parser_config() -> PmBookParserConfig {
+    PmBookParserConfig::new(
+        PmWireScope::new(
+            reap_pm_core::PmConditionId::parse(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap(),
+            PmMarketId::parse("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                .unwrap(),
+            PmTokenId::new(U256::from_u64(11)).unwrap(),
+        ),
+        PmTick::parse_decimal("0.01").unwrap(),
+        PmQuantity::parse_decimal("1").unwrap(),
+        false,
+    )
+}
+
+fn observation_grant() -> PmPublicObservationGrant {
+    let scope = parser_config().scope();
+    PmPublicObservationGrant::derive_goal_f(
+        OkxReferenceInstrument::index(OkxInstrumentId::new("BTC-USDT").unwrap()),
+        PmInstrumentId::new(scope.market(), scope.token()),
+    )
+}
+
 #[test]
 fn five_role_types_retain_exact_scope_source_and_connection() {
     let scope = account_scope();
     let source = account_source(scope);
-    let public = PmPublicRole::new(instrument(), market_source(), connection()).unwrap();
+    let public = PmPublicRole::new(
+        observation_grant(),
+        instrument(),
+        parser_config(),
+        market_source(),
+        connection(),
+    )
+    .unwrap();
     let private = PmFixturePrivateLifecycle::new(scope, source, connection()).unwrap();
     let reconciliation = PmFixtureReconciliation::new(scope, source, connection()).unwrap();
     let snapshots = PmFixtureAccountPositionSnapshot::new(
@@ -60,6 +94,8 @@ fn five_role_types_retain_exact_scope_source_and_connection() {
     let execution = PmFixtureOwnedExecution::new(scope, instrument());
 
     assert_eq!(public.instrument(), instrument());
+    assert_eq!(public.observation_grant(), observation_grant());
+    assert_eq!(public.parser_config(), parser_config());
     assert_eq!(public.source(), market_source());
     assert_eq!(private.account_scope(), scope);
     assert_eq!(private.source(), source);
@@ -93,7 +129,16 @@ fn role_traits_are_static_and_expose_only_their_exact_scope() {
     let scope = account_scope();
     let source = account_source(scope);
     assert_eq!(
-        public(&PmPublicRole::new(instrument(), market_source(), connection()).unwrap()),
+        public(
+            &PmPublicRole::new(
+                observation_grant(),
+                instrument(),
+                parser_config(),
+                market_source(),
+                connection(),
+            )
+            .unwrap()
+        ),
         instrument()
     );
     assert_eq!(

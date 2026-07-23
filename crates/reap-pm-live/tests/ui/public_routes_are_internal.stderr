@@ -1,0 +1,5 @@
+error[E0432]: unresolved import `reap_pm_live::PmPublicRoutes`
+ --> tests/ui/public_routes_are_internal.rs:1:5
+  |
+1 | use reap_pm_live::PmPublicRoutes;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `PmPublicRoutes` in the root

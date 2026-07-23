@@ -1,8 +1,10 @@
 use reap_pm_core::{
-    EvmAddress, OkxReferenceHandle, PmAccountHandle, PmAccountScope, PmAssetId, PmChainId,
-    PmConnectionId, PmEnvironmentId, PmFunderId, PmInstrumentHandle, PmMarketHandle,
-    PmProductSource, PmReferenceMapping, PmSignerId, PmSourceHandle, PmSpenderDomain, PmSpenderId,
-    PmSpenderRequirement, PmTokenHandle,
+    EvmAddress, MAX_REQUIRED_SPENDERS, OkxInstrumentId, OkxReferenceHandle, OkxReferenceInstrument,
+    PmAccountHandle, PmAccountScope, PmAssetId, PmChainId, PmConditionId, PmConnectionId,
+    PmEnvironmentId, PmFunderId, PmInstrumentHandle, PmMarketHandle, PmMarketId, PmMarketLifecycle,
+    PmMarketMetadata, PmOutcomeLabel, PmOutcomeMetadata, PmProductSource, PmQuantity,
+    PmReferenceMapping, PmSignerId, PmSourceHandle, PmSpenderDomain, PmSpenderId,
+    PmSpenderRequirement, PmTick, PmTokenHandle, PmTokenId, U256,
 };
 use reap_pm_live::{PmProduct, PmPublicCapture, PmReadOnlyMonitor};
 use reap_pm_live_contracts::{
@@ -22,10 +24,10 @@ impl PmQuoteModelRequirements for FixtureModel {
 
 fn fixture() -> (PmConnectivityConfig, PmModelInputRequirements) {
     let instrument = PmInstrumentHandle::new(
-        PmMarketHandle::from_ordinal(1),
-        PmTokenHandle::from_ordinal(2),
+        PmMarketHandle::from_ordinal(0),
+        PmTokenHandle::from_ordinal(0),
     );
-    let reference = OkxReferenceHandle::from_ordinal(3);
+    let reference = OkxReferenceHandle::from_ordinal(0);
     let eoa = EvmAddress::from_bytes([4; 20]).unwrap();
     let account_scope = PmAccountScope::new(
         PmEnvironmentId::new("fixture").unwrap(),
@@ -46,8 +48,31 @@ fn fixture() -> (PmConnectivityConfig, PmModelInputRequirements) {
     let mut references = [None; 16];
     references[0] = Some(reference);
     let mapping = PmReferenceMapping::new(instrument, references, 1).unwrap();
+    let mut required_spenders = [None; MAX_REQUIRED_SPENDERS];
+    required_spenders[0] = Some(spender.requirement());
+    let expected_metadata = PmMarketMetadata::new(
+        PmConditionId::parse("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap(),
+        PmMarketId::parse("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .unwrap(),
+        PmOutcomeMetadata::new(
+            PmTokenId::new(U256::from_u64(11)).unwrap(),
+            PmOutcomeLabel::new("Yes").unwrap(),
+        ),
+        PmMarketLifecycle::new(true, false, false, true, true),
+        PmTick::parse_decimal("0.01").unwrap(),
+        PmQuantity::parse_decimal("1").unwrap(),
+        false,
+        PmChainId::new(137).unwrap(),
+        EvmAddress::from_bytes([2; 20]).unwrap(),
+        required_spenders,
+        1,
+    )
+    .unwrap();
     let public = PmPublicConnectivityConfig::new(
         mapping,
+        OkxReferenceInstrument::index(OkxInstrumentId::new("BTC-USDT").unwrap()),
+        expected_metadata,
         PmConnectionRoute::new(
             PmProductSource::okx_reference(PmSourceHandle::from_ordinal(1), reference),
             PmConnectionId::new("okx-public").unwrap(),

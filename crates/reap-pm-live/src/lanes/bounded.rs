@@ -46,6 +46,8 @@ pub(super) struct BoundedHeap<K, T> {
     high_water: usize,
     rejected_full: u64,
     coalesced: u64,
+    invalidated_purged: u64,
+    generation: u64,
 }
 
 impl<K: Copy + Eq + Hash + Ord, T> BoundedHeap<K, T> {
@@ -58,6 +60,8 @@ impl<K: Copy + Eq + Hash + Ord, T> BoundedHeap<K, T> {
             high_water: 0,
             rejected_full: 0,
             coalesced: 0,
+            invalidated_purged: 0,
+            generation: 0,
         }
     }
 
@@ -72,6 +76,7 @@ impl<K: Copy + Eq + Hash + Ord, T> BoundedHeap<K, T> {
             let discarded = self.heap.pop().expect("full heap is nonempty");
             assert!(self.keys.remove(&discarded.key));
             increment_counter(&mut self.coalesced);
+            increment_counter(&mut self.generation);
             Admission::Coalesced
         } else {
             increment_counter(&mut self.rejected_full);
@@ -83,6 +88,7 @@ impl<K: Copy + Eq + Hash + Ord, T> BoundedHeap<K, T> {
         assert!(self.keys.insert(key));
         self.heap.push(HeapEntry { key, value });
         self.high_water = self.high_water.max(self.heap.len());
+        increment_counter(&mut self.generation);
     }
 
     pub(super) fn peek(&self) -> Option<&HeapEntry<K, T>> {
@@ -92,11 +98,46 @@ impl<K: Copy + Eq + Hash + Ord, T> BoundedHeap<K, T> {
     pub(super) fn pop(&mut self) -> Option<HeapEntry<K, T>> {
         let entry = self.heap.pop()?;
         assert!(self.keys.remove(&entry.key));
+        increment_counter(&mut self.generation);
         Some(entry)
+    }
+
+    pub(super) fn purge_where(&mut self, mut should_purge: impl FnMut(&K, &T) -> bool) -> usize {
+        let before = self.heap.len();
+        self.heap
+            .retain(|entry| !should_purge(&entry.key, &entry.value));
+        let purged_count = before - self.heap.len();
+        if purged_count == 0 {
+            return 0;
+        }
+        self.keys.clear();
+        self.keys.extend(self.heap.iter().map(|entry| entry.key));
+        let purged = u64::try_from(purged_count).expect("bounded lane depth fits u64");
+        self.invalidated_purged = self
+            .invalidated_purged
+            .checked_add(purged)
+            .expect("lane invalidated-purge counter overflow");
+        increment_counter(&mut self.generation);
+        purged_count
+    }
+
+    pub(super) fn count_where(&self, mut matches: impl FnMut(&K, &T) -> bool) -> usize {
+        self.heap
+            .iter()
+            .filter(|entry| matches(&entry.key, &entry.value))
+            .count()
     }
 
     pub(super) fn len(&self) -> usize {
         self.heap.len()
+    }
+
+    pub(super) fn contains_key(&self, key: K) -> bool {
+        self.keys.contains(&key)
+    }
+
+    pub(super) const fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub(super) const fn policy(&self) -> PmLanePolicy {
@@ -109,6 +150,7 @@ impl<K: Copy + Eq + Hash + Ord, T> BoundedHeap<K, T> {
             self.high_water,
             self.rejected_full,
             self.coalesced,
+            self.invalidated_purged,
         )
     }
 }

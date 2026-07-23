@@ -1,0 +1,11 @@
+error[E0432]: unresolved import `reap_pm_live::PmPublicCaptureWriter`
+ --> tests/ui/public_capture_writer_is_internal.rs:1:5
+  |
+1 | use reap_pm_live::PmPublicCaptureWriter;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `PmPublicCaptureWriter` in the root
+  |
+help: a similar name exists in the module
+  |
+1 - use reap_pm_live::PmPublicCaptureWriter;
+1 + use reap_pm_live::PmPublicCaptureBatch;
+  |

@@ -50,23 +50,7 @@ pub fn encode_jsonl_frame_bounded<T>(
 where
     T: Serialize,
 {
-    let mut counter = CountingWriter::new(max_frame_bytes.saturating_sub(1));
-    if let Err(source) = serde_json::to_writer(&mut counter, value) {
-        if counter.overflowed {
-            return Err(BoundedJsonlFrameError::FrameTooLarge {
-                observed_at_least_bytes: max_frame_bytes.saturating_add(1),
-                limit_bytes: max_frame_bytes,
-            });
-        }
-        return Err(BoundedJsonlFrameError::Serialization(source));
-    }
-    let measured_bytes = counter.bytes.saturating_add(1);
-    if measured_bytes > max_frame_bytes {
-        return Err(BoundedJsonlFrameError::FrameTooLarge {
-            observed_at_least_bytes: measured_bytes,
-            limit_bytes: max_frame_bytes,
-        });
-    }
+    let measured_bytes = measure_jsonl_frame_bounded(value, max_frame_bytes)?;
 
     let mut bounded = FixedCapacityWriter::new(measured_bytes);
     let serialization = serde_json::to_writer(&mut bounded, value);
@@ -87,6 +71,39 @@ where
         });
     }
     Ok(bounded.bytes)
+}
+
+/// Measures compact JSON plus its trailing newline without allocating a frame.
+///
+/// This is the admission-only half of [`encode_jsonl_frame_bounded`]. Callers
+/// that must enforce an aggregate byte ceiling before handing the value to a
+/// bounded writer can use the same exact first pass without constructing and
+/// immediately discarding a full frame.
+pub fn measure_jsonl_frame_bounded<T>(
+    value: &T,
+    max_frame_bytes: usize,
+) -> Result<usize, BoundedJsonlFrameError>
+where
+    T: Serialize,
+{
+    let mut counter = CountingWriter::new(max_frame_bytes.saturating_sub(1));
+    if let Err(source) = serde_json::to_writer(&mut counter, value) {
+        if counter.overflowed {
+            return Err(BoundedJsonlFrameError::FrameTooLarge {
+                observed_at_least_bytes: max_frame_bytes.saturating_add(1),
+                limit_bytes: max_frame_bytes,
+            });
+        }
+        return Err(BoundedJsonlFrameError::Serialization(source));
+    }
+    let measured_bytes = counter.bytes.saturating_add(1);
+    if measured_bytes > max_frame_bytes {
+        return Err(BoundedJsonlFrameError::FrameTooLarge {
+            observed_at_least_bytes: measured_bytes,
+            limit_bytes: max_frame_bytes,
+        });
+    }
+    Ok(measured_bytes)
 }
 
 /// Returns the JSON payload of one frame while accepting a trailing partial

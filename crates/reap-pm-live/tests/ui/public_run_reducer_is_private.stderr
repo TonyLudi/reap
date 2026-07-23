@@ -1,0 +1,5 @@
+error[E0616]: field `pm_reducer` of struct `PmPublicCaptureRun` is private
+ --> tests/ui/public_run_reducer_is_private.rs:4:22
+  |
+4 |     let _ = &mut run.pm_reducer;
+  |                      ^^^^^^^^^^ private field

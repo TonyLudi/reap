@@ -2,7 +2,8 @@ use reap_core::Venue;
 use reap_pm_core::{
     ConnectionEpoch, EnvelopeError, EventClock, EventEnvelope, EventOrdering, IngressSequence,
     OkxReferenceHandle, PmAccountHandle, PmConnectionId, PmProductSource, PmSourceBound,
-    PmSourceHandle, PmTokenHandle, ReceivedEventClock, SnapshotRevision, VenueEventHash,
+    PmSourceHandle, PmTokenHandle, ReceivedEventClock, ReceivedEventEnvelope, SnapshotRevision,
+    VenueEventHash, VenueEventHashAlgorithm,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -26,7 +27,7 @@ fn ordering() -> EventOrdering {
         ConnectionEpoch::new(2),
         Some(SnapshotRevision::new(3)),
         Some(4),
-        Some(VenueEventHash::new([5; 32]).unwrap()),
+        Some(VenueEventHash::sha256([5; 32]).unwrap()),
         IngressSequence::new(6),
     )
     .unwrap()
@@ -65,7 +66,9 @@ fn envelope_retains_concrete_payload_and_all_distinct_ordering_facts() {
     assert_eq!(envelope.ordering().connection_epoch().value(), 2);
     assert_eq!(envelope.ordering().snapshot_revision().unwrap().value(), 3);
     assert_eq!(envelope.ordering().venue_sequence(), Some(4));
-    assert_eq!(envelope.ordering().venue_hash().unwrap().bytes(), [5; 32]);
+    let event_hash = envelope.ordering().venue_hash().unwrap();
+    assert_eq!(event_hash.algorithm(), VenueEventHashAlgorithm::Sha256);
+    assert_eq!(event_hash.as_bytes(), &[5; 32]);
     assert_eq!(envelope.ordering().local_ingress_sequence().value(), 6);
     assert_eq!(
         *envelope.payload(),
@@ -82,6 +85,33 @@ fn envelope_retains_concrete_payload_and_all_distinct_ordering_facts() {
             value: 9,
         }
     );
+}
+
+#[test]
+fn received_envelope_adds_service_time_only_when_the_consumer_services_it() {
+    let payload = Payload {
+        source: pm_source(),
+        value: 12,
+    };
+    let received = ReceivedEventEnvelope::new(
+        Venue::Polymarket,
+        pm_source(),
+        PmConnectionId::new("pm-public-1").unwrap(),
+        ReceivedEventClock::new(Some(10), 20, 30).unwrap(),
+        ordering(),
+        payload,
+    )
+    .unwrap();
+
+    assert_eq!(received.received_clock().monotonic_receive_ns(), 30);
+    assert_eq!(received.ordering(), ordering());
+    assert_eq!(received.payload(), &payload);
+
+    let serviced = received.service_at(45).unwrap();
+    assert_eq!(serviced.clock().monotonic_service_ns(), 45);
+    assert_eq!(serviced.clock().queue_age_ns(), 15);
+    assert_eq!(serviced.ordering(), ordering());
+    assert_eq!(serviced.into_payload(), payload);
 }
 
 #[test]
@@ -269,7 +299,7 @@ fn ordering_rejects_zero_identifiers_without_synthesizing_a_predecessor() {
         Err(EnvelopeError::ZeroIngressSequence)
     );
     assert_eq!(
-        VenueEventHash::new([0; 32]),
+        VenueEventHash::sha256([0; 32]),
         Err(EnvelopeError::ZeroVenueHash)
     );
 
@@ -285,5 +315,27 @@ fn ordering_rejects_zero_identifiers_without_synthesizing_a_predecessor() {
     assert_eq!(
         pm_without_venue_sequence.local_ingress_sequence().value(),
         3
+    );
+}
+
+#[test]
+fn venue_hash_retains_exact_algorithm_and_length_without_padding() {
+    let sha1 = VenueEventHash::sha1([0x45; 20]).unwrap();
+    assert_eq!(sha1.algorithm(), VenueEventHashAlgorithm::Sha1);
+    assert_eq!(sha1.len(), 20);
+    assert_eq!(sha1.as_bytes(), &[0x45; 20]);
+
+    let opaque = VenueEventHash::opaque(&[1, 2, 3, 4]).unwrap();
+    assert_eq!(opaque.algorithm(), VenueEventHashAlgorithm::Opaque);
+    assert_eq!(opaque.len(), 4);
+    assert_eq!(opaque.as_bytes(), &[1, 2, 3, 4]);
+
+    assert_eq!(
+        VenueEventHash::opaque(&[]),
+        Err(EnvelopeError::EmptyVenueHash)
+    );
+    assert_eq!(
+        VenueEventHash::opaque(&[1; 65]),
+        Err(EnvelopeError::VenueHashTooLong)
     );
 }

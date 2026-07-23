@@ -5,6 +5,8 @@ members = [
     "crates/reap-capture-framing",
     "crates/reap-durable-writer",
     "crates/reap-pm-core",
+    "crates/reap-pm-state",
+    "crates/reap-polymarket-wire",
     "crates/reap-pm-strategy",
     "crates/reap-polymarket-adapter",
     "crates/reap-pm-live-contracts",
@@ -69,6 +71,8 @@ reap-live-contracts = { path = "crates/reap-live-contracts" }
 reap-engine = { path = "crates/reap-engine" }
 reap-order = { path = "crates/reap-order" }
 reap-pm-core = { path = "crates/reap-pm-core" }
+reap-pm-state = { path = "crates/reap-pm-state" }
+reap-polymarket-wire = { path = "crates/reap-polymarket-wire" }
 reap-pm-live = { path = "crates/reap-pm-live" }
 reap-pm-live-contracts = { path = "crates/reap-pm-live-contracts" }
 reap-pm-strategy = { path = "crates/reap-pm-strategy" }
@@ -88,6 +92,7 @@ reap-venue = { path = "crates/reap-venue" }
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1.14"
 serde_json = { version = "1", features = ["float_roundtrip"] }
+sha1 = "0.10"
 sha2 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 ring = "0.17"

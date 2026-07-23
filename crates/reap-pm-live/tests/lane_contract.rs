@@ -1,155 +1,260 @@
+#[allow(dead_code)]
+mod support;
+
 use reap_pm_core::{
-    ConnectionEpoch, EvmAddress, IngressSequence, PmAccountHandle, PmAccountScope, PmChainId,
-    PmConnectionId, PmEnvironmentId, PmFillEvent, PmFillExecution, PmFillFee, PmFillId, PmFillKey,
-    PmFillRole, PmFunderId, PmInstrumentHandle, PmMarketHandle, PmOrderEvent, PmOrderIdentity,
-    PmOrderProgress, PmOrderSide, PmOrderStatus, PmPrice, PmProductSource, PmQuantity, PmSignerId,
-    PmSnapshotCompleteness, PmSnapshotEvidence, PmSourceHandle, PmTokenHandle, PmVenueOrderId,
-    PmVenueOrderKey, ReceivedEventClock, SnapshotRevision, U256,
+    OkxReferenceEvent, PmBookEvent, PmMarketEvent, SnapshotRevision, VenueEventHashAlgorithm,
 };
 use reap_pm_live::{
-    LaneEnqueueError, PmIngressOrder, PmLaneKind, PmLanePolicy, PmLaneService, PmLaneSet,
-    PmLaneSignal, PmLaneSignalKind, PmObservedEvent, PmScheduledAction, PmScheduledActionKind,
-    PmScheduledSide, PmServiceTurnError, SaturationAction, ServicedLaneItem,
-    ServicedScheduledAction,
+    OkxPublicUnavailable, PM_INPUT_SERVICE_PRIORITY, PmLaneKind, PmLanePolicy,
+    PmPublicBookReadinessReason, PmPublicCapture, PmPublicCaptureRun, PmPublicCaptureRunError,
+    PmPublicLaneService, PmPublicUnavailable, PmServiceTurnError, SaturationAction,
+    ServicedLaneItem,
 };
 use reap_pm_live_contracts::PmCapabilityLane;
-use reap_polymarket_adapter::PmCompleteOpenOrdersSnapshot;
 
-fn clock(receive: u64) -> ReceivedEventClock {
-    ReceivedEventClock::new(None, receive + 1_000, receive).unwrap()
-}
+use support::{authoritative, provenance, public_config, session_policy, snapshot_one};
 
-fn ingress(sequence: u64) -> PmIngressOrder {
-    PmIngressOrder::new(
-        PmConnectionId::new("fixture-connection").unwrap(),
-        ConnectionEpoch::new(1),
-        IngressSequence::new(sequence),
-    )
-    .unwrap()
-}
-
-fn signal(kind: PmLaneSignalKind) -> PmLaneSignal {
-    PmLaneSignal::new(kind, PmSourceHandle::from_ordinal(1))
-}
-
-fn instrument() -> PmInstrumentHandle {
-    PmInstrumentHandle::new(
-        PmMarketHandle::from_ordinal(1),
-        PmTokenHandle::from_ordinal(2),
-    )
-}
-
-fn account_scope() -> PmAccountScope {
-    let eoa = EvmAddress::from_bytes([7; 20]).unwrap();
-    PmAccountScope::new(
-        PmEnvironmentId::new("fixture").unwrap(),
-        PmChainId::new(137).unwrap(),
-        PmSignerId::new(eoa),
-        PmFunderId::new(eoa),
-        PmAccountHandle::from_ordinal(4),
-    )
-}
-
-fn account_source() -> PmProductSource {
-    PmProductSource::polymarket_account(PmSourceHandle::from_ordinal(2), account_scope().handle())
-}
-
-fn order_identity() -> PmOrderIdentity {
-    PmOrderIdentity::new(
-        None,
-        Some(PmVenueOrderKey::new(
-            account_scope().handle(),
-            PmVenueOrderId::new("order-1").unwrap(),
-        )),
-    )
-    .unwrap()
-}
-
-fn order() -> PmOrderEvent {
-    PmOrderEvent::new(
-        account_source(),
-        instrument(),
-        order_identity(),
-        PmOrderSide::Buy,
-        PmPrice::parse_decimal("0.4").unwrap(),
-        PmOrderProgress::new(
-            PmQuantity::parse_decimal("1").unwrap(),
-            U256::ZERO,
-            PmOrderStatus::Open,
+async fn live_pm_run(name: &str) -> (tempfile::TempDir, PmPublicCaptureRun) {
+    let directory = tempfile::tempdir().unwrap();
+    let mut run = PmPublicCapture::new(public_config())
+        .unwrap()
+        .start(
+            directory.path().join(name),
+            authoritative(),
+            session_policy(),
+            provenance(),
         )
-        .unwrap(),
-    )
-    .unwrap()
-}
-
-fn fill() -> PmFillEvent {
-    PmFillEvent::new(
-        account_source(),
-        instrument(),
-        PmFillKey::new(account_scope().handle(), PmFillId::new("fill-1").unwrap()),
-        order_identity(),
-        PmFillExecution::new(
-            PmOrderSide::Buy,
-            PmFillRole::Maker,
-            PmPrice::parse_decimal("0.4").unwrap(),
-            PmQuantity::parse_decimal("0.1").unwrap(),
-            PmFillFee::Unknown,
-        ),
-    )
-    .unwrap()
-}
-
-fn open_orders() -> PmCompleteOpenOrdersSnapshot {
-    PmCompleteOpenOrdersSnapshot::new(
-        account_source(),
-        account_scope(),
-        PmSnapshotEvidence::new(SnapshotRevision::new(1), PmSnapshotCompleteness::Complete)
-            .unwrap(),
-        Vec::new(),
-    )
-    .unwrap()
+        .await
+        .unwrap();
+    run.record_pm_connection_started(60).await.unwrap();
+    run.record_pm_subscription_sent(100).await.unwrap();
+    (directory, run)
 }
 
 #[derive(Default)]
-struct Recorder {
-    signals: Vec<(PmLaneKind, PmLaneSignalKind, u8, u64)>,
-    scheduled: Vec<(PmScheduledActionKind, u8)>,
-    orders: Vec<(PmLaneKind, u8)>,
-    fills: Vec<(PmLaneKind, u8)>,
+struct TransferRecorder {
+    metadata: usize,
+    books: Vec<(u64, u64, Option<u64>, VenueEventHashAlgorithm, usize, u64)>,
 }
 
-impl PmLaneService for Recorder {
-    fn on_signal(&mut self, item: ServicedLaneItem<PmLaneSignal>) {
-        let lane = item.lane();
-        let rank = item.key().variant_rank();
-        let age = item.clock().queue_age_ns();
-        let kind = item.into_value().kind();
-        self.signals.push((lane, kind, rank, age));
+impl PmPublicLaneService for TransferRecorder {
+    fn on_pm_public_unavailable(&mut self, _item: ServicedLaneItem<PmPublicUnavailable>) {}
+
+    fn on_okx_public_unavailable(&mut self, _item: ServicedLaneItem<OkxPublicUnavailable>) {}
+
+    fn on_market(&mut self, _item: ServicedLaneItem<PmMarketEvent>) {
+        self.metadata += 1;
     }
 
-    fn on_scheduled(&mut self, item: ServicedScheduledAction) {
-        self.scheduled
-            .push((item.action().kind(), item.key().action_variant_rank()));
+    fn on_book(&mut self, item: ServicedLaneItem<PmBookEvent>) {
+        let ordering = item.ordering();
+        let venue_hash = ordering
+            .venue_hash()
+            .expect("the admitted snapshot retains its verified venue hash");
+        self.books.push((
+            ordering.connection_epoch().value(),
+            ordering.local_ingress_sequence().value(),
+            ordering.snapshot_revision().map(SnapshotRevision::value),
+            venue_hash.algorithm(),
+            venue_hash.len(),
+            item.clock().queue_age_ns(),
+        ));
     }
 
-    fn on_order(&mut self, item: ServicedLaneItem<PmOrderEvent>) {
-        self.orders.push((item.lane(), item.key().variant_rank()));
-    }
-
-    fn on_fill(&mut self, item: ServicedLaneItem<PmFillEvent>) {
-        self.fills.push((item.lane(), item.key().variant_rank()));
-    }
+    fn on_reference(&mut self, _item: ServicedLaneItem<OkxReferenceEvent>) {}
 }
 
-#[test]
-fn every_plan_lane_maps_to_exact_bounded_runtime_storage() {
-    let lanes = PmLaneSet::new();
-    for plan_lane in PmCapabilityLane::ALL {
-        let lane = PmLaneKind::from(plan_lane);
-        let policy = PmLanePolicy::for_lane(lane);
-        assert!(policy.capacity() > 0);
-        assert_eq!(lanes.metrics(lane).depth(), 0);
+struct PanicOnMarket;
+
+impl PmPublicLaneService for PanicOnMarket {
+    fn on_pm_public_unavailable(&mut self, _item: ServicedLaneItem<PmPublicUnavailable>) {}
+
+    fn on_okx_public_unavailable(&mut self, _item: ServicedLaneItem<OkxPublicUnavailable>) {}
+
+    fn on_market(&mut self, _item: ServicedLaneItem<PmMarketEvent>) {
+        panic!("consumer failed during exact occurrence transfer");
     }
+
+    fn on_book(&mut self, _item: ServicedLaneItem<PmBookEvent>) {}
+
+    fn on_reference(&mut self, _item: ServicedLaneItem<OkxReferenceEvent>) {}
+}
+
+#[tokio::test]
+async fn run_owned_snapshot_service_preserves_route_ordering_and_service_clock() {
+    let (_directory, mut run) = live_pm_run("lane-snapshot.jsonl").await;
+    let mut batch = run
+        .capture_pm_public(1_700_000_000_123_456_789, 110, snapshot_one().as_bytes())
+        .await
+        .unwrap();
+    let flow = batch.take_snapshot_flow().expect("snapshot flow");
+    let delivery = batch
+        .into_books()
+        .into_iter()
+        .next()
+        .expect("snapshot delivery");
+    run.commit_then_enqueue_pm_snapshot(delivery, flow).unwrap();
+
+    let mut recorder = TransferRecorder::default();
+    assert_eq!(run.service_lane_turn(115, &mut recorder).unwrap(), 1);
+    assert_eq!(
+        recorder.books,
+        vec![(11, 1, Some(1), VenueEventHashAlgorithm::Sha1, 20, 5)]
+    );
+    run.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn fresh_sibling_cannot_service_the_owners_public_item() {
+    let (_owner_directory, mut owner) = live_pm_run("owner.jsonl").await;
+    let (_sibling_directory, mut sibling) = live_pm_run("sibling.jsonl").await;
+    owner
+        .issue_and_enqueue_pm_metadata(1_700_000_000_000_000_050)
+        .unwrap();
+
+    let mut sibling_recorder = TransferRecorder::default();
+    assert_eq!(
+        sibling
+            .service_lane_turn(101, &mut sibling_recorder)
+            .unwrap(),
+        0
+    );
+    assert_eq!(sibling_recorder.metadata, 0);
+    assert_eq!(owner.public_lane_metrics().depth(), 1);
+
+    let mut owner_recorder = TransferRecorder::default();
+    assert_eq!(
+        owner.service_lane_turn(101, &mut owner_recorder).unwrap(),
+        1
+    );
+    assert_eq!(owner_recorder.metadata, 1);
+    assert_eq!(owner.public_lane_metrics().depth(), 0);
+    owner.finish().await.unwrap();
+    sibling.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn dropping_the_owner_destroys_its_queued_public_state() {
+    let (owner_directory, mut owner) = live_pm_run("drop-owner.jsonl").await;
+    owner
+        .issue_and_enqueue_pm_metadata(1_700_000_000_000_000_050)
+        .unwrap();
+    assert_eq!(owner.public_lane_metrics().depth(), 1);
+    drop(owner);
+    drop(owner_directory);
+
+    let (_sibling_directory, mut sibling) = live_pm_run("after-drop.jsonl").await;
+    assert_eq!(
+        sibling
+            .service_lane_turn(101, &mut TransferRecorder::default())
+            .unwrap(),
+        0
+    );
+    sibling.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn finish_rejects_an_unserviced_public_obligation() {
+    let (_directory, mut run) = live_pm_run("queued-finish.jsonl").await;
+    run.issue_and_enqueue_pm_metadata(1_700_000_000_000_000_050)
+        .unwrap();
+
+    assert!(matches!(
+        run.finish().await,
+        Err(PmPublicCaptureRunError::QueuedPublicLaneFinish {
+            pending: 1,
+            shutdown_error: None,
+        })
+    ));
+}
+
+#[tokio::test]
+async fn callback_unwind_poison_blocks_service_readiness_mutation_and_finish() {
+    let (_directory, mut run) = live_pm_run("callback-poison.jsonl").await;
+    run.issue_and_enqueue_pm_metadata(1_700_000_000_000_000_050)
+        .unwrap();
+
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = run.service_lane_turn(101, &mut PanicOnMarket);
+    }));
+    assert!(unwind.is_err());
+    assert_eq!(run.public_lane_metrics().depth(), 0);
+    assert!(matches!(
+        run.service_lane_turn(102, &mut TransferRecorder::default()),
+        Err(PmServiceTurnError::ConsumerTransferPoisoned)
+    ));
+    assert_eq!(
+        run.pm_book_readiness().reason(),
+        Some(PmPublicBookReadinessReason::ConsumerTransferPoisoned)
+    );
+    assert!(run.ready_pm_book_view().is_none());
+    assert!(matches!(
+        run.record_okx_connection_started(103).await,
+        Err(PmPublicCaptureRunError::PublicConsumerTransferPoisoned)
+    ));
+    assert!(matches!(
+        run.finish().await,
+        Err(
+            PmPublicCaptureRunError::PublicConsumerTransferPoisonedFinish {
+                shutdown_error: None,
+            }
+        )
+    ));
+}
+
+#[tokio::test]
+async fn later_clock_failure_reports_prior_progress_and_leaves_the_head_for_retry() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut run = PmPublicCapture::new(public_config())
+        .unwrap()
+        .start(
+            directory.path().join("partial-clock-progress.jsonl"),
+            authoritative(),
+            session_policy(),
+            provenance(),
+        )
+        .await
+        .unwrap();
+    run.record_pm_connection_started(60).await.unwrap();
+    run.record_okx_connection_started(61).await.unwrap();
+    run.record_pm_subscription_sent(99).await.unwrap();
+    run.record_okx_subscription_sent(100).await.unwrap();
+    run.issue_and_enqueue_pm_metadata(1_700_000_000_000_000_050)
+        .unwrap();
+    run.capture_okx_public(
+        1_700_000_000_000_000_105,
+        105,
+        support::okx_ack().as_bytes(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        run.capture_okx_public(
+            1_700_000_000_000_000_106,
+            106,
+            support::okx_reference().as_bytes(),
+        )
+        .await
+        .unwrap(),
+        reap_pm_live::OkxPublicCaptureEvent::ReferenceEnqueued
+    );
+
+    let mut recorder = TransferRecorder::default();
+    assert_eq!(run.service_lane_turn(100, &mut recorder).unwrap(), 1);
+    assert_eq!(recorder.metadata, 1);
+    assert_eq!(run.public_lane_metrics().depth(), 1);
+    assert!(matches!(
+        run.service_lane_turn(100, &mut recorder),
+        Err(PmServiceTurnError::DeliveryClock(_) | PmServiceTurnError::EventClock(_))
+    ));
+    assert_eq!(
+        run.public_lane_metrics().depth(),
+        1,
+        "a failed service-clock preflight must not pop the retained head"
+    );
+    assert_eq!(run.service_lane_turn(107, &mut recorder).unwrap(), 1);
+    assert_eq!(run.public_lane_metrics().depth(), 0);
+    run.finish().await.unwrap();
 }
 
 #[test]
@@ -259,192 +364,28 @@ fn all_eleven_lane_policies_match_the_frozen_oracle() {
 }
 
 #[test]
-fn all_eleven_lanes_have_typed_admission() {
-    let mut lanes = PmLaneSet::new();
-    let signals = [
-        PmLaneSignalKind::Shutdown,
-        PmLaneSignalKind::DurableFailure,
-        PmLaneSignalKind::PrivateConnectionUnavailable,
-        PmLaneSignalKind::PublicConnectionUnavailable,
-        PmLaneSignalKind::Telemetry,
-        PmLaneSignalKind::ReconciliationRequest,
-        PmLaneSignalKind::CaptureFrame,
-        PmLaneSignalKind::JournalRecord,
-        PmLaneSignalKind::FakePlaceGtcPostOnly,
-    ];
-    for (index, kind) in signals.into_iter().enumerate() {
-        let sequence = u64::try_from(index).unwrap() + 1;
-        lanes
-            .enqueue_signal(clock(sequence), ingress(sequence), signal(kind))
-            .unwrap();
-        assert_eq!(lanes.metrics(kind.lane()).depth(), 1);
-    }
-
-    lanes
-        .enqueue_scheduled(
-            10,
-            1,
-            PmScheduledAction::new(
-                PmScheduledActionKind::QuoteEvaluation,
-                account_scope().handle(),
-                instrument().token(),
-                PmScheduledSide::NotApplicable,
-            ),
-        )
-        .unwrap();
-    lanes
-        .enqueue_observation(clock(20), ingress(20), open_orders())
-        .unwrap();
-    assert_eq!(lanes.metrics(PmLaneKind::Scheduled).depth(), 1);
-    assert_eq!(lanes.metrics(PmLaneKind::Reconciliation).depth(), 1);
-}
-
-#[test]
-fn full_private_lane_returns_unconsumed_signal_and_reports_metrics() {
-    let mut lanes = PmLaneSet::new();
-    for sequence in 1..=4_096 {
-        lanes
-            .enqueue_signal(
-                clock(sequence),
-                ingress(sequence),
-                signal(PmLaneSignalKind::PrivateConnectionUnavailable),
-            )
-            .unwrap();
-    }
-    let rejected = signal(PmLaneSignalKind::PrivateConnectionUnavailable);
+fn future_input_service_priority_is_an_explicit_policy_oracle_only() {
     assert_eq!(
-        lanes.enqueue_signal(clock(4_097), ingress(4_097), rejected),
-        Err(LaneEnqueueError::Full {
-            value: rejected,
-            action: SaturationAction::HaltAccountAndRequireReconciliation,
-        })
-    );
-    let metrics = lanes.metrics(PmLaneKind::Private);
-    assert_eq!(metrics.depth(), 4_096);
-    assert_eq!(metrics.high_water(), 4_096);
-    assert_eq!(metrics.rejected_full(), 1);
-    assert_eq!(metrics.coalesced(), 0);
-}
-
-#[test]
-fn telemetry_alone_coalesces_at_its_exact_bound() {
-    let mut lanes = PmLaneSet::new();
-    for sequence in 1..=129 {
-        lanes
-            .enqueue_signal(
-                clock(sequence),
-                ingress(sequence),
-                signal(PmLaneSignalKind::Telemetry),
-            )
-            .unwrap();
-    }
-    let metrics = lanes.metrics(PmLaneKind::Telemetry);
-    assert_eq!(metrics.depth(), 128);
-    assert_eq!(metrics.high_water(), 128);
-    assert_eq!(metrics.rejected_full(), 0);
-    assert_eq!(metrics.coalesced(), 1);
-}
-
-#[test]
-fn order_and_fill_derive_private_lane_and_frozen_ranks() {
-    assert_eq!(PmObservedEvent::lane(&order()), PmLaneKind::Private);
-    assert_eq!(PmObservedEvent::variant_rank(&order()), 2);
-    assert_eq!(PmObservedEvent::lane(&fill()), PmLaneKind::Private);
-    assert_eq!(PmObservedEvent::variant_rank(&fill()), 1);
-
-    let mut lanes = PmLaneSet::new();
-    lanes
-        .enqueue_observation(clock(2), ingress(2), order())
-        .unwrap();
-    lanes
-        .enqueue_observation(clock(1), ingress(1), fill())
-        .unwrap();
-    let mut recorder = Recorder::default();
-    lanes.service_turn(3, &mut recorder).unwrap();
-    assert_eq!(recorder.fills, vec![(PmLaneKind::Private, 1)]);
-    assert_eq!(recorder.orders, vec![(PmLaneKind::Private, 2)]);
-}
-
-#[test]
-fn scheduled_key_is_distinct_and_only_due_actions_are_serviced() {
-    let mut lanes = PmLaneSet::new();
-    let cancel = PmScheduledAction::new(
-        PmScheduledActionKind::CancelOwned,
-        account_scope().handle(),
-        instrument().token(),
-        PmScheduledSide::Bid,
-    );
-    let quote = PmScheduledAction::new(
-        PmScheduledActionKind::QuoteEvaluation,
-        account_scope().handle(),
-        instrument().token(),
-        PmScheduledSide::NotApplicable,
-    );
-    lanes.enqueue_scheduled(10, 2, quote).unwrap();
-    lanes.enqueue_scheduled(10, 1, cancel).unwrap();
-    lanes.enqueue_scheduled(30, 3, quote).unwrap();
-
-    let mut recorder = Recorder::default();
-    assert_eq!(lanes.service_turn(20, &mut recorder).unwrap(), 2);
-    assert_eq!(
-        recorder.scheduled,
-        vec![
-            (PmScheduledActionKind::CancelOwned, 0),
-            (PmScheduledActionKind::QuoteEvaluation, 3),
+        PM_INPUT_SERVICE_PRIORITY,
+        [
+            PmLaneKind::Critical,
+            PmLaneKind::Persistence,
+            PmLaneKind::Private,
+            PmLaneKind::Scheduled,
+            PmLaneKind::Public,
+            PmLaneKind::Reconciliation,
+            PmLaneKind::Telemetry,
         ]
     );
-    assert_eq!(lanes.metrics(PmLaneKind::Scheduled).depth(), 1);
-}
-
-#[test]
-fn lower_rank_age_failure_does_not_prevent_critical_service() {
-    let mut lanes = PmLaneSet::new();
-    lanes
-        .enqueue_signal(
-            clock(1),
-            ingress(1),
-            signal(PmLaneSignalKind::PublicConnectionUnavailable),
-        )
-        .unwrap();
-    lanes
-        .enqueue_signal(
-            clock(500_000_001),
-            ingress(2),
-            signal(PmLaneSignalKind::Shutdown),
-        )
-        .unwrap();
-
-    let mut recorder = Recorder::default();
-    assert_eq!(
-        lanes.service_turn(500_000_002, &mut recorder),
-        Err(PmServiceTurnError::Aged {
-            lane: PmLaneKind::Public,
-            action: SaturationAction::InvalidateStreamAndResync,
-        })
-    );
-    assert_eq!(recorder.signals.len(), 1);
-    assert_eq!(recorder.signals[0].0, PmLaneKind::Critical);
-}
-
-#[test]
-fn consumer_stamps_service_time_after_priority_selection() {
-    let mut lanes = PmLaneSet::new();
-    lanes
-        .enqueue_signal(
-            clock(7),
-            ingress(1),
-            signal(PmLaneSignalKind::PublicConnectionUnavailable),
-        )
-        .unwrap();
-    let mut recorder = Recorder::default();
-    lanes.service_turn(19, &mut recorder).unwrap();
-    assert_eq!(
-        recorder.signals,
-        vec![(
-            PmLaneKind::Public,
-            PmLaneSignalKind::PublicConnectionUnavailable,
-            0,
-            12,
-        )]
-    );
+    for (rank, lane) in PM_INPUT_SERVICE_PRIORITY.into_iter().enumerate() {
+        assert_eq!(lane.service_priority_rank(), Some(rank as u8));
+    }
+    for lane in [
+        PmLaneKind::ReconciliationRequest,
+        PmLaneKind::Capture,
+        PmLaneKind::Journal,
+        PmLaneKind::FakeEffect,
+    ] {
+        assert_eq!(lane.service_priority_rank(), None);
+    }
 }

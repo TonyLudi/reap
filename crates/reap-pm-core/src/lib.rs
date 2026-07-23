@@ -8,14 +8,16 @@ mod metadata;
 mod numeric;
 
 pub use envelope::{
-    EnvelopeError, EventClock, EventEnvelope, EventOrdering, ReceivedEventClock, VenueEventHash,
+    EnvelopeError, EventClock, EventEnvelope, EventOrdering, MAX_VENUE_EVENT_HASH_BYTES,
+    ReceivedEventClock, ReceivedEventEnvelope, VenueEventHash, VenueEventHashAlgorithm,
 };
 pub use event::{
-    MAX_PM_BOOK_LEVELS, OkxReferenceEvent, OkxReferenceEventError, PmAllowanceEvent,
-    PmAllowanceValue, PmBalanceEvent, PmBookEvent, PmBookLevel, PmBookPoint, PmBookSide, PmBookTop,
+    MAX_PM_BOOK_LEVELS, MAX_PM_VENUE_CHANGE_HASH_BYTES, OkxReferenceEvent, OkxReferenceEventError,
+    PmAllowanceEvent, PmAllowanceValue, PmBalanceEvent, PmBookDeltaBatch, PmBookDeltaParts,
+    PmBookEvent, PmBookLevel, PmBookPoint, PmBookSide, PmBookSnapshot, PmBookTop, PmBookTopCheck,
     PmBookUpdate, PmEventError, PmFillEvent, PmFillExecution, PmFillFee, PmFillRole, PmMarketEvent,
     PmOrderEvent, PmOrderIdentity, PmOrderProgress, PmOrderStatus, PmPositionAvailability,
-    PmPositionEvent, PmSnapshotCompleteness, PmSnapshotEvidence,
+    PmPositionEvent, PmSnapshotCompleteness, PmSnapshotEvidence, PmVenueChangeHash,
 };
 pub use identity::{
     ConnectionEpoch, EvmAddress, IngressSequence, OkxInstrumentId, OkxReferenceHandle,
@@ -26,7 +28,10 @@ pub use identity::{
     PmSpenderDomain, PmSpenderHandle, PmSpenderId, PmSpenderRequirement, PmTokenHandle, PmTokenId,
     PmVenueOrderId, PmVenueOrderKey, SnapshotRevision,
 };
-pub use mapping::{MAX_OKX_REFERENCES_PER_MAPPING, PmMappingError, PmReferenceMapping};
+pub use mapping::{
+    MAX_OKX_REFERENCES_PER_MAPPING, PmConfigurationFingerprint, PmMappingError,
+    PmPublicObservationGrant, PmReferenceMapping,
+};
 pub use metadata::{
     MAX_REQUIRED_SPENDERS, PmMarketLifecycle, PmMarketMetadata, PmMetadataError, PmOutcomeLabel,
     PmOutcomeMetadata,

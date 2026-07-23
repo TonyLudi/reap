@@ -1,0 +1,13 @@
+error[E0432]: unresolved imports `reap_pm_live::PmLaneService`, `reap_pm_live::PmLaneSet`
+ --> tests/ui/raw_public_lane_service_is_internal.rs:1:20
+  |
+1 | use reap_pm_live::{PmLaneService, PmLaneSet};
+  |                    ^^^^^^^^^^^^^  ^^^^^^^^^ no `PmLaneSet` in the root
+  |                    |
+  |                    no `PmLaneService` in the root
+  |
+help: a similar name exists in the module
+  |
+1 - use reap_pm_live::{PmLaneService, PmLaneSet};
+1 + use reap_pm_live::{PmLaneMetrics, PmLaneSet};
+  |

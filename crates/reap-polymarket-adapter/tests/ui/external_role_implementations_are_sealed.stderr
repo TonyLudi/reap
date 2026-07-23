@@ -1,3 +1,11 @@
+error[E0046]: not all trait items implemented, missing: `wire_scope`
+ --> tests/ui/external_role_implementations_are_sealed.rs:8:1
+  |
+8 | impl PmPublicObservationRole for ForgedPublicRole {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `wire_scope` in implementation
+  |
+  = help: implement the missing item: `fn wire_scope(&self) -> reap_polymarket_wire::scope::PmWireScope { todo!() }`
+
 error[E0277]: the trait bound `ForgedPublicRole: reap_polymarket_adapter::public::sealed::Sealed` is not satisfied
  --> tests/ui/external_role_implementations_are_sealed.rs:8:34
   |

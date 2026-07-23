@@ -26,12 +26,27 @@ fn pm_contracts_do_not_import_existing_okx_authority_or_raw_clients() {
     let live_dependencies = edges.get("reap-pm-live").unwrap();
     assert!(live_dependencies.contains("reap-pm-core"));
     assert!(live_dependencies.contains("reap-transport"));
+    assert!(live_dependencies.contains("reap-pm-state"));
+    assert!(live_dependencies.contains("reap-capture-framing"));
+    assert!(live_dependencies.contains("reap-okx-public-source"));
+    assert!(live_dependencies.contains("base64"));
+    assert!(!live_dependencies.contains("reap-core"));
+    assert!(!live_dependencies.contains("reap-polymarket-wire"));
+
+    let state_dependencies = edges.get("reap-pm-state").unwrap();
+    assert_eq!(
+        state_dependencies,
+        &BTreeSet::from(["reap-pm-core".to_owned(), "thiserror".to_owned()]),
+        "the pure PM reducer crate has exactly core types plus typed errors"
+    );
 
     for source in [
         "reap-pm-strategy",
         "reap-pm-live-contracts",
         "reap-polymarket-adapter",
         "reap-pm-live",
+        "reap-pm-state",
+        "reap-polymarket-wire",
     ] {
         for forbidden in [
             "reap-order",
@@ -44,13 +59,25 @@ fn pm_contracts_do_not_import_existing_okx_authority_or_raw_clients() {
             "reap-okx-emergency-adapter",
             "reqwest",
             "hmac",
-            "base64",
         ] {
             assert!(
                 !reachable(&edges, source, forbidden),
                 "{source} reaches forbidden dependency {forbidden}"
             );
         }
+    }
+
+    for source in [
+        "reap-pm-strategy",
+        "reap-pm-live-contracts",
+        "reap-polymarket-adapter",
+        "reap-polymarket-wire",
+        "reap-pm-state",
+    ] {
+        assert!(
+            !reachable(&edges, source, "base64"),
+            "{source} reaches capture-only base64 schema encoding"
+        );
     }
 
     for legacy in [
@@ -99,6 +126,8 @@ fn pm_contract_sources_have_no_dynamic_or_authority_escape_hatch() {
         "../reap-pm-strategy/src",
         "../reap-pm-live-contracts/src",
         "../reap-polymarket-adapter/src",
+        "../reap-pm-state/src",
+        "../reap-polymarket-wire/src",
         "src",
     ];
     for relative in crates {
@@ -127,6 +156,71 @@ fn pm_contract_sources_have_no_dynamic_or_authority_escape_hatch() {
                     path.display()
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn pm_state_remains_a_pure_reducer_crate() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../reap-pm-state/src");
+    for path in rust_sources(&root) {
+        let source = std::fs::read_to_string(&path).unwrap();
+        for forbidden in [
+            "async fn",
+            ".await",
+            "std::fs",
+            "std::io",
+            "std::net",
+            "std::process",
+            "std::thread",
+            "tokio",
+            "reqwest",
+            "tungstenite",
+            "serde",
+            "base64",
+            "reap_polymarket",
+            "reap_transport",
+            "reap_pm_live",
+            "reap_pm_strategy",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{} contains non-reducer dependency token {forbidden}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn base64_is_confined_to_capture_schema_and_replay_modules() {
+    let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let capture = source_root.join("capture.rs");
+    let replay = source_root.join("replay.rs");
+    for path in rust_sources(&source_root) {
+        let source = std::fs::read_to_string(&path).unwrap();
+        if source.contains("base64") {
+            assert!(
+                path == capture || path == replay,
+                "{} uses capture-only base64 outside schema/replay",
+                path.display()
+            );
+        }
+    }
+    for relative in [
+        "../reap-pm-strategy/src",
+        "../reap-pm-live-contracts/src",
+        "../reap-polymarket-adapter/src",
+        "../reap-polymarket-wire/src",
+        "../reap-pm-state/src",
+    ] {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+        for path in rust_sources(&root) {
+            assert!(
+                !std::fs::read_to_string(&path).unwrap().contains("base64"),
+                "{} uses capture-only base64",
+                path.display()
+            );
         }
     }
 }
@@ -242,27 +336,132 @@ fn legacy_polymarket_mentions_are_an_exact_fail_closed_allowlist() {
 #[test]
 fn constructor_ownership_and_preallocated_lane_shape_are_pinned() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let composition = std::fs::read_to_string(root.join("composition.rs")).unwrap();
-    let capture = std::fs::read_to_string(root.join("capture.rs")).unwrap();
+    let composition = rust_module_source(&root, "composition");
+    let capture_roles = std::fs::read_to_string(root.join("capture_roles.rs")).unwrap();
+    let replay = std::fs::read_to_string(root.join("replay.rs")).unwrap();
     let fake_effect = std::fs::read_to_string(root.join("fake_effect.rs")).unwrap();
-    let lanes = std::fs::read_to_string(root.join("lanes.rs")).unwrap();
+    let lane_entry = std::fs::read_to_string(root.join("lanes.rs")).unwrap();
+    let lane_service = std::fs::read_to_string(root.join("lanes/service.rs")).unwrap();
+    let lanes = rust_module_source(&root, "lanes");
     let bounded = std::fs::read_to_string(root.join("lanes/bounded.rs")).unwrap();
 
-    assert!(!composition.contains("PmPublicRole::new"));
+    assert!(!composition.contains("PmPublicRole::from_expected_metadata"));
+    assert!(!composition.contains(".observation_grant()"));
     assert!(!composition.contains("PmFixtureOwnedExecution::new"));
-    assert!(capture.contains("PmPublicRole::new"));
+    assert!(capture_roles.contains("PmPublicRole::from_expected_metadata"));
+    assert!(capture_roles.contains("config.observation_grant()"));
+    assert!(replay.contains("PmPublicRole::from_expected_metadata"));
+    assert!(replay.contains("scope.observation_grant()?"));
     assert!(fake_effect.contains("PmFixtureOwnedExecution::new"));
     assert!(bounded.contains("BinaryHeap::with_capacity"));
     assert!(bounded.contains("HashSet::with_capacity"));
     assert!(!lanes.contains("Vec::new"));
+    assert!(lane_entry.contains("mod service;"));
+    assert!(!lane_entry.contains("pub trait PmLaneService"));
+    assert!(lane_service.contains("pub trait PmPublicLaneService"));
+    assert!(lane_service.contains("impl PmPublicLaneState"));
+    assert!(!lanes.contains("pub struct PmLaneSet"));
+    assert!(!lane_service.contains("pub trait PmLaneService"));
+}
+
+#[test]
+fn public_lane_requires_capability_specific_route_deliveries() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let routes = std::fs::read_to_string(root.join("public_routes.rs")).unwrap();
+    let lanes = rust_module_source(&root, "lanes");
+    let composition = rust_module_source(&root, "composition");
+    let capture_roles = std::fs::read_to_string(root.join("capture_roles.rs")).unwrap();
+    let adapter_session =
+        std::fs::read_to_string(root.join("../../reap-polymarket-adapter/src/public_session.rs"))
+            .unwrap();
+
+    for delivery in [
+        "PmPublicMetadataDelivery",
+        "PmPublicBookDelivery",
+        "OkxPublicReferenceDelivery",
+        "PmPublicUnavailableDelivery",
+        "OkxPublicUnavailableDelivery",
+    ] {
+        assert!(routes.contains(&format!("opaque_delivery!({delivery},")));
+    }
+    assert!(!routes.contains("pub fn into_envelope"));
+    assert!(routes.contains("pub(crate) struct PmPublicRoutes"));
+    assert!(!routes.contains("#[derive(Debug, Clone, PartialEq, Eq)]"));
+    assert!(
+        !std::fs::read_to_string(root.join("lib.rs"))
+            .unwrap()
+            .contains("PmPublicRouteError, PmPublicRoutes")
+    );
+    assert!(!routes.contains("ConfiguredPublicRouteProof"));
+    assert!(!routes.contains("PublicRouteProof<"));
+    assert!(routes.contains("session.issue_metadata_occurrence(local_wall_receive_ns)?"));
+    assert!(adapter_session.contains("pub struct PmPublicMetadataOccurrence"));
+    assert!(adapter_session.contains("pub fn issue_metadata_occurrence"));
+    assert!(
+        !adapter_session
+            .contains("#[derive(Debug, Clone, PartialEq, Eq)]\npub struct PmPublicBookDelivery")
+    );
+    assert!(!capture_roles.contains("pm_and_routes"));
+    assert!(!capture_roles.contains("okx_and_routes"));
+    assert!(capture_roles.contains("classify_and_route_pm"));
+    assert!(capture_roles.contains("classify_and_route_okx"));
+
+    for admission in [
+        "enqueue_pm_metadata",
+        "enqueue_okx_reference",
+        "enqueue_pm_unavailable",
+        "enqueue_okx_unavailable",
+    ] {
+        assert!(lanes.contains(&format!("pub(crate) fn {admission}")));
+        assert!(composition.contains(&format!("pub(crate) fn {admission}")));
+        assert!(!composition.contains(&format!("pub fn {admission}")));
+    }
+    assert!(lanes.contains("pub(crate) fn enqueue_pm_book"));
+    assert!(!composition.contains("pub fn enqueue_pm_book"));
+    assert!(composition.contains("pub fn issue_and_enqueue_pm_metadata"));
+    assert!(composition.contains("pub async fn capture_okx_public"));
+    assert!(composition.contains("pub fn reduce_then_enqueue_pm_book"));
+    assert!(composition.contains("pub fn commit_then_enqueue_pm_snapshot"));
+    assert!(composition.contains("fn issue_pm_metadata"));
+    assert!(!composition.contains("pub fn issue_pm_metadata"));
+    assert!(composition.contains("async fn capture_okx_public_routed"));
+    assert!(!composition.contains("pub async fn capture_okx_public_routed"));
+    assert!(!composition.contains("pub fn commit_pm_snapshot"));
+    assert!(!composition.contains("pub fn commit_pm_book_update"));
+    assert!(lanes.contains("enum PmPublicInput"));
+    assert!(!lanes.contains("PmPublicInput::Signal"));
+    assert!(lanes.contains("pub struct PmPublicLaneEnqueueError"));
+    assert!(lanes.contains("struct PmPublicLaneFailureProof"));
+    assert!(lanes.contains("PmLaneAuthorityId(<opaque>)"));
+    assert!(lanes.contains("lane_generation: u64"));
+    assert!(lanes.contains("lane_capacity: usize"));
+    assert!(lanes.contains("pub(crate) fn authenticate_lane_failure"));
+    assert!(lanes.contains("pub(crate) fn authenticate_aged_failure"));
+    assert!(lanes.contains("delivery: D"));
+    assert!(lanes.contains("pub struct PmAgedLaneFailure"));
+    assert!(lanes.contains("pub struct PmAgedDeliveryEvidence"));
+    assert!(lanes.contains("observed_now_ns: u64"));
+    assert!(lanes.contains("source_kind_rank: u8"));
+    assert!(lanes.contains("source_scope_ordinal: u16"));
+    assert!(lanes.contains("pub enum PmServiceSourceKind"));
+    assert!(lanes.contains("pub fn source_kind(self) -> PmServiceSourceKind"));
+    assert!(lanes.contains("trait PmObservedEvent"));
+    assert!(!lanes.contains("pub trait PmObservedEvent"));
 }
 
 #[test]
 fn pm_production_modules_stay_below_the_review_size_limit() {
     for relative in [
+        "../reap-capture-framing/src",
+        "../reap-durable-writer/src",
+        "../reap-okx-public-source/src",
+        "../reap-pm-core/src",
         "../reap-pm-strategy/src",
         "../reap-pm-live-contracts/src",
         "../reap-polymarket-adapter/src",
+        "../reap-pm-state/src",
+        "../reap-polymarket-wire/src",
+        "../reap-transport/src",
         "src",
     ] {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
@@ -275,6 +474,66 @@ fn pm_production_modules_stay_below_the_review_size_limit() {
             );
         }
     }
+}
+
+#[test]
+fn only_the_active_run_can_construct_or_mutate_capture_artifacts() {
+    let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let library = std::fs::read_to_string(crate_root.join("src/lib.rs")).unwrap();
+    let writer = std::fs::read_to_string(crate_root.join("src/capture/writer.rs")).unwrap();
+
+    assert!(
+        !library.contains("PmPublicCaptureWriter"),
+        "the low-level writer must not be re-exported"
+    );
+    assert!(writer.contains("pub(crate) struct PmPublicCaptureWriter"));
+    for method in [
+        "pub(crate) async fn start",
+        "pub(crate) async fn capture_raw_before_parse",
+        "pub(crate) async fn capture_okx_raw_before_parse",
+        "pub(crate) async fn record_lifecycle",
+        "pub(crate) async fn record_okx_lifecycle",
+        "pub(crate) async fn record_freshness_timer",
+        "pub(crate) async fn finish",
+    ] {
+        assert!(
+            writer.contains(method),
+            "capture writer authority widened or method disappeared: {method}"
+        );
+    }
+}
+
+#[test]
+fn active_run_never_accepts_or_returns_a_raw_book_reducer() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let composition = rust_module_source(&root, "composition");
+    assert!(composition.contains("pm_reducer: PmBookReducer"));
+    assert!(!composition.contains("pub pm_reducer: PmBookReducer"));
+
+    let mut public_signature = String::new();
+    let mut collecting = false;
+    for line in composition.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("pub fn ")
+            || trimmed.starts_with("pub async fn ")
+            || trimmed.starts_with("pub const fn ")
+        {
+            public_signature.clear();
+            collecting = true;
+        }
+        if collecting {
+            public_signature.push_str(trimmed);
+            public_signature.push(' ');
+            if trimmed.contains('{') || trimmed.ends_with(';') {
+                assert!(
+                    !public_signature.contains("PmBookReducer"),
+                    "raw reducer escaped through public signature: {public_signature}"
+                );
+                collecting = false;
+            }
+        }
+    }
+    assert!(!collecting, "unterminated public signature source scan");
 }
 
 fn rust_sources(root: &Path) -> Vec<std::path::PathBuf> {
@@ -292,6 +551,16 @@ fn rust_sources(root: &Path) -> Vec<std::path::PathBuf> {
     }
     sources.sort();
     sources
+}
+
+fn rust_module_source(root: &Path, module: &str) -> String {
+    let mut paths = vec![root.join(format!("{module}.rs"))];
+    paths.extend(rust_sources(&root.join(module)));
+    paths
+        .into_iter()
+        .map(|path| std::fs::read_to_string(path).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn workspace_edges(metadata: &Value) -> BTreeMap<String, BTreeSet<String>> {

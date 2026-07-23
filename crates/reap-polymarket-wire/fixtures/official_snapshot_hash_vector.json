@@ -1,0 +1,18 @@
+{
+  "market": "0xaabbcc",
+  "asset_id": "100",
+  "bids": [
+    {"price": "0.3", "size": "100"},
+    {"price": "0.4", "size": "100"}
+  ],
+  "asks": [
+    {"price": "0.6", "size": "100"},
+    {"price": "0.7", "size": "100"}
+  ],
+  "hash": "0458ea5755c9f73d64a14636fa5c36ed460ec394",
+  "timestamp": "123456789",
+  "min_order_size": "100",
+  "neg_risk": false,
+  "tick_size": "0.01",
+  "last_trade_price": "0.5"
+}

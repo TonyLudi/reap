@@ -8,10 +8,11 @@ use crate::identity::{
 use crate::metadata::PmMarketMetadata;
 use crate::numeric::{
     OkxReferencePrice, PmBookQuantity, PmErc1155OperatorApproval, PmOrderSide, PmPrice, PmQuantity,
-    PmSignedUnits, U256,
+    PmSignedUnits, PmTick, U256,
 };
 
 pub const MAX_PM_BOOK_LEVELS: u16 = 2_048;
+pub const MAX_PM_VENUE_CHANGE_HASH_BYTES: usize = 96;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum PmEventError {
@@ -29,6 +30,14 @@ pub enum PmEventError {
     SnapshotLevelIsDelete,
     #[error("book snapshot exceeds the fixed normalized level bound")]
     TooManyBookLevels,
+    #[error("venue change hash must not be empty")]
+    EmptyVenueChangeHash,
+    #[error("venue change hash exceeds the fixed normalized byte bound")]
+    VenueChangeHashTooLong,
+    #[error("venue change hash must contain only ASCII bytes")]
+    NonAsciiVenueChangeHash,
+    #[error("delta level and venue change-hash counts do not match")]
+    ChangeHashCountMismatch,
     #[error("best bid is not strictly below best ask")]
     CrossedBookTop,
     #[error("order identity must contain a client or venue order identifier")]
@@ -133,6 +142,53 @@ impl PmBookLevel {
     }
 }
 
+/// Exact bounded venue evidence attached to one public price change.
+///
+/// Polymarket calls this field `hash`, but observed values are not guaranteed
+/// to be a fixed-width cryptographic digest. The normalized boundary therefore
+/// preserves the exact nonempty ASCII lexeme without assigning stronger
+/// semantics.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PmVenueChangeHash {
+    length: u8,
+    bytes: [u8; MAX_PM_VENUE_CHANGE_HASH_BYTES],
+}
+
+impl PmVenueChangeHash {
+    pub fn new(value: &str) -> Result<Self, PmEventError> {
+        if value.is_empty() {
+            return Err(PmEventError::EmptyVenueChangeHash);
+        }
+        if value.len() > MAX_PM_VENUE_CHANGE_HASH_BYTES {
+            return Err(PmEventError::VenueChangeHashTooLong);
+        }
+        if !value.is_ascii() {
+            return Err(PmEventError::NonAsciiVenueChangeHash);
+        }
+        let mut bytes = [0_u8; MAX_PM_VENUE_CHANGE_HASH_BYTES];
+        bytes[..value.len()].copy_from_slice(value.as_bytes());
+        Ok(Self {
+            length: value.len() as u8,
+            bytes,
+        })
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..usize::from(self.length)])
+            .expect("checked ASCII venue change hash")
+    }
+}
+
+impl std::fmt::Debug for PmVenueChangeHash {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("PmVenueChangeHash")
+            .field(&self.as_str())
+            .finish()
+    }
+}
+
 /// A positive level suitable for a reduced best-bid/ask observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PmBookPoint {
@@ -184,21 +240,144 @@ impl PmBookTop {
     }
 }
 
-/// Normalized book framing keeps an atomic snapshot distinct from deltas.
-///
-/// Snapshot start/level/complete events are staged by the later book reducer;
-/// canonical state is not replaced until the matching complete marker. The
-/// envelope supplies the snapshot revision and ordering evidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PmBookUpdate {
-    SnapshotStart { expected_levels: u16 },
-    SnapshotLevel(PmBookLevel),
-    SnapshotComplete { observed_levels: u16 },
-    Delta(PmBookLevel),
-    Top(PmBookTop),
+/// One whole normalized snapshot. Construction preserves the venue frame as
+/// one bounded unit so queue admission cannot expose a partial snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PmBookSnapshot {
+    levels: Box<[PmBookLevel]>,
 }
 
+impl PmBookSnapshot {
+    pub fn new(levels: Box<[PmBookLevel]>) -> Result<Self, PmEventError> {
+        if levels.len() > usize::from(MAX_PM_BOOK_LEVELS) {
+            return Err(PmEventError::TooManyBookLevels);
+        }
+        if levels
+            .iter()
+            .any(|level| level.quantity() == PmBookQuantity::Delete)
+        {
+            return Err(PmEventError::SnapshotLevelIsDelete);
+        }
+        Ok(Self { levels })
+    }
+
+    #[must_use]
+    pub fn levels(&self) -> &[PmBookLevel] {
+        &self.levels
+    }
+
+    #[must_use]
+    pub fn into_levels(self) -> Box<[PmBookLevel]> {
+        self.levels
+    }
+}
+
+/// One whole normalized `price_change` frame.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PmBookDeltaBatch {
+    changes: Box<[PmBookLevel]>,
+    venue_change_hashes: Box<[Option<PmVenueChangeHash>]>,
+    expected_top: PmBookTopCheck,
+}
+
+/// Owned components of one atomic venue `price_change` frame.
+pub type PmBookDeltaParts = (
+    Box<[PmBookLevel]>,
+    Box<[Option<PmVenueChangeHash>]>,
+    PmBookTopCheck,
+);
+
+impl PmBookDeltaBatch {
+    pub fn new(
+        changes: Box<[PmBookLevel]>,
+        expected_top: PmBookTopCheck,
+    ) -> Result<Self, PmEventError> {
+        let venue_change_hashes = vec![None; changes.len()].into_boxed_slice();
+        Self::new_with_venue_hashes(changes, venue_change_hashes, expected_top)
+    }
+
+    pub fn new_with_venue_hashes(
+        changes: Box<[PmBookLevel]>,
+        venue_change_hashes: Box<[Option<PmVenueChangeHash>]>,
+        expected_top: PmBookTopCheck,
+    ) -> Result<Self, PmEventError> {
+        if changes.len() > usize::from(MAX_PM_BOOK_LEVELS) {
+            return Err(PmEventError::TooManyBookLevels);
+        }
+        if changes.len() != venue_change_hashes.len() {
+            return Err(PmEventError::ChangeHashCountMismatch);
+        }
+        Ok(Self {
+            changes,
+            venue_change_hashes,
+            expected_top,
+        })
+    }
+
+    #[must_use]
+    pub fn changes(&self) -> &[PmBookLevel] {
+        &self.changes
+    }
+
+    /// Ordered optional venue `hash` lexemes, one-for-one with `changes`.
+    #[must_use]
+    pub fn venue_change_hashes(&self) -> &[Option<PmVenueChangeHash>] {
+        &self.venue_change_hashes
+    }
+
+    /// Venue-supplied final best prices for the whole delta frame.
+    ///
+    /// The state reducer validates this against the post-delta candidate
+    /// before committing any level, so frame integrity cannot be split across
+    /// independently admitted queue items.
+    #[must_use]
+    pub const fn expected_top(&self) -> PmBookTopCheck {
+        self.expected_top
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> PmBookDeltaParts {
+        (self.changes, self.venue_change_hashes, self.expected_top)
+    }
+}
+
+/// Venue-supplied best prices used only to check the reduced book.
+///
+/// Empty, locked, or crossed values remain representable here so the state
+/// boundary can invalidate readiness with the exact typed reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PmBookTopCheck {
+    bid: Option<PmPrice>,
+    ask: Option<PmPrice>,
+}
+
+impl PmBookTopCheck {
+    #[must_use]
+    pub const fn new(bid: Option<PmPrice>, ask: Option<PmPrice>) -> Self {
+        Self { bid, ask }
+    }
+
+    #[must_use]
+    pub const fn bid(self) -> Option<PmPrice> {
+        self.bid
+    }
+
+    #[must_use]
+    pub const fn ask(self) -> Option<PmPrice> {
+        self.ask
+    }
+}
+
+/// Normalized book messages retain venue-frame atomicity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PmBookUpdate {
+    Snapshot(PmBookSnapshot),
+    DeltaBatch(PmBookDeltaBatch),
+    TopCheck(PmBookTopCheck),
+    TickSizeChanged { old: PmTick, new: PmTick },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PmBookEvent {
     source: PmProductSource,
     instrument: PmInstrumentHandle,
@@ -215,24 +394,6 @@ impl PmBookEvent {
     ) -> Result<Self, PmEventError> {
         validate_market_source(source, instrument)?;
         validate_revision(metadata_revision)?;
-        if matches!(
-            update,
-            PmBookUpdate::SnapshotStart { expected_levels }
-                | PmBookUpdate::SnapshotComplete {
-                    observed_levels: expected_levels
-                } if expected_levels > MAX_PM_BOOK_LEVELS
-        ) {
-            return Err(PmEventError::TooManyBookLevels);
-        }
-        if matches!(
-            update,
-            PmBookUpdate::SnapshotLevel(PmBookLevel {
-                quantity: PmBookQuantity::Delete,
-                ..
-            })
-        ) {
-            return Err(PmEventError::SnapshotLevelIsDelete);
-        }
         Ok(Self {
             source,
             instrument,
@@ -242,23 +403,23 @@ impl PmBookEvent {
     }
 
     #[must_use]
-    pub const fn source(self) -> PmProductSource {
+    pub const fn source(&self) -> PmProductSource {
         self.source
     }
 
     #[must_use]
-    pub const fn instrument(self) -> PmInstrumentHandle {
+    pub const fn instrument(&self) -> PmInstrumentHandle {
         self.instrument
     }
 
     #[must_use]
-    pub const fn metadata_revision(self) -> SnapshotRevision {
+    pub const fn metadata_revision(&self) -> SnapshotRevision {
         self.metadata_revision
     }
 
     #[must_use]
-    pub const fn update(self) -> PmBookUpdate {
-        self.update
+    pub const fn update(&self) -> &PmBookUpdate {
+        &self.update
     }
 }
 
@@ -890,7 +1051,11 @@ macro_rules! source_bound_event {
 }
 
 source_bound_event!(PmMarketEvent);
-source_bound_event!(PmBookEvent);
+impl PmSourceBound for PmBookEvent {
+    fn source(&self) -> PmProductSource {
+        self.source()
+    }
+}
 source_bound_event!(PmOrderEvent);
 source_bound_event!(PmFillEvent);
 source_bound_event!(PmBalanceEvent);

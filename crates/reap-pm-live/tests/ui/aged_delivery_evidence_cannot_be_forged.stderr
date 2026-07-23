@@ -1,0 +1,8 @@
+error[E0308]: mismatched types
+  --> tests/ui/aged_delivery_evidence_cannot_be_forged.rs:16:23
+   |
+16 |         public_route: None,
+   |                       ^^^^ expected `PmPublicRouteLaneEvidence`, found `Option<_>`
+   |
+   = note: expected struct `reap_pm_live::lanes::failure::PmPublicRouteLaneEvidence`
+                found enum `Option<_>`

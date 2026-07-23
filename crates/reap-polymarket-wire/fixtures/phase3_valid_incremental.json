@@ -1,0 +1,25 @@
+{
+  "event_type": "price_change",
+  "market": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "timestamp": "123456790",
+  "price_changes": [
+    {
+      "asset_id": "123",
+      "price": "0.40",
+      "size": "0",
+      "side": "BUY",
+      "hash": "tx-delete",
+      "best_bid": "0.30",
+      "best_ask": "0.60"
+    },
+    {
+      "asset_id": "123",
+      "price": "0.50",
+      "size": "12.5",
+      "side": "BUY",
+      "hash": "tx-add",
+      "best_bid": "0.50",
+      "best_ask": "0.60"
+    }
+  ]
+}

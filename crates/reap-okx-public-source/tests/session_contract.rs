@@ -3,7 +3,7 @@ use std::time::Duration;
 use reap_core::{Channel, ConnId, EventKey, RawEnvelope, Venue};
 use reap_okx_public_source::{
     MAX_OKX_PUBLIC_CONNECTION_ID_BYTES, OkxPublicEventEvidence, OkxPublicSession,
-    OkxPublicSessionError, OkxPublicSessionEvent,
+    OkxPublicSessionError, OkxPublicSessionEvent, OkxPublicSessionFault,
 };
 use reap_transport::{ConnectionStatusKind, RawDelivery, ReconnectPolicy};
 
@@ -60,6 +60,24 @@ fn acknowledge(session: &mut OkxPublicSession) {
     };
     assert_protocol_evidence(evidence, expected_epoch);
     assert_eq!(classified.monotonic_receive_ns(), 90);
+}
+
+fn consume_unavailable_and_reconnect(session: &mut OkxPublicSession) -> Duration {
+    assert!(matches!(
+        session.after_failure(),
+        Err(OkxPublicSessionError::UnavailableOccurrencePending)
+    ));
+    let occurrence = session
+        .take_unavailable()
+        .expect("invalid protocol input emits one unavailable occurrence");
+    assert_eq!(occurrence.connection_id(), "okx-public-reference-1");
+    assert_eq!(occurrence.connection_epoch(), session.connection_epoch());
+    assert_eq!(occurrence.fault(), OkxPublicSessionFault::InvalidTransition);
+    assert!(occurrence.wall_receive_ts_ns() > 0);
+    assert!(occurrence.monotonic_receive_ns() > 0);
+    assert!(occurrence.local_ingress_sequence() > 0);
+    assert_eq!(session.take_unavailable(), None);
+    session.after_failure().unwrap()
 }
 
 #[test]
@@ -197,6 +215,11 @@ fn data_requires_the_exact_acknowledged_session() {
         session.classify(delivery(payload, 100)),
         Err(OkxPublicSessionError::DataBeforeAcknowledgement)
     ));
+    assert!(matches!(
+        session.classify(delivery(payload, 101)),
+        Err(OkxPublicSessionError::ReconnectRequired)
+    ));
+    consume_unavailable_and_reconnect(&mut session);
 
     acknowledge(&mut session);
     assert!(matches!(
@@ -249,6 +272,76 @@ fn reference_delivery_preserves_exact_lexical_and_source_evidence() {
 }
 
 #[test]
+fn captured_text_api_reconstructs_the_exact_configured_route() {
+    let mut session = new_session();
+    let acknowledgement = session
+        .classify_captured_payload(
+            r#"{"event":"subscribe","arg":{"channel":"index-tickers","instId":"BTC-USDT"}}"#,
+            1_700_000_000_123_456_789,
+            90,
+            0xfeed_beef,
+        )
+        .unwrap();
+    let OkxPublicSessionEvent::SubscriptionAcknowledged(evidence) = acknowledgement.payload()
+    else {
+        panic!("configured acknowledgement");
+    };
+    assert_protocol_evidence(evidence, 7);
+    assert_eq!(acknowledgement.connection_id(), "okx-public-reference-1");
+    assert_eq!(acknowledgement.connection_epoch(), 7);
+
+    let reference = session
+        .classify_captured_payload(
+            r#"{"arg":{"channel":"index-tickers","instId":"BTC-USDT"},"data":[{"instId":"BTC-USDT","idxPx":"00050000.125000","ts":"1700000000123"}]}"#,
+            1_700_000_000_123_456_790,
+            91,
+            0x1234_5678,
+        )
+        .unwrap();
+    let OkxPublicSessionEvent::Reference(reference) = reference.payload() else {
+        panic!("configured reference");
+    };
+    assert_eq!(reference.instrument(), "BTC-USDT");
+    assert_eq!(reference.wall_receive_ts_ns(), 1_700_000_000_123_456_790);
+    assert_eq!(reference.connection_epoch(), 7);
+    assert_eq!(reference.raw_hash(), 0x1234_5678);
+}
+
+#[test]
+fn captured_text_wrong_scope_malformed_and_invalid_clock_fail_closed() {
+    for payload in [
+        "{",
+        r#"{"arg":{"channel":"books","instId":"BTC-USDT"},"data":[{"instId":"BTC-USDT","idxPx":"1","ts":"1"}]}"#,
+        r#"{"arg":{"channel":"index-tickers","instId":"ETH-USDT"},"data":[{"instId":"ETH-USDT","idxPx":"1","ts":"1"}]}"#,
+    ] {
+        let mut session = new_session();
+        acknowledge(&mut session);
+        assert!(
+            session
+                .classify_captured_payload(payload, 1_700_000_000_123_456_789, 100, 0xfeed_beef,)
+                .is_err()
+        );
+        assert!(!session.subscription_ready());
+        assert!(session.requires_reconnect());
+        assert_eq!(session.health(), ConnectionStatusKind::Disconnected);
+        consume_unavailable_and_reconnect(&mut session);
+        assert!(!session.requires_reconnect());
+        assert_eq!(session.last_fault(), None);
+    }
+
+    let mut invalid_clock = new_session();
+    acknowledge(&mut invalid_clock);
+    assert!(
+        invalid_clock
+            .classify_captured_payload("pong", 1_700_000_000_123_456_789, 0, 0xfeed_beef,)
+            .is_err()
+    );
+    assert!(!invalid_clock.subscription_ready());
+    assert!(invalid_clock.requires_reconnect());
+    assert_eq!(invalid_clock.health(), ConnectionStatusKind::Disconnected);
+}
+
+#[test]
 fn malformed_wrong_scope_and_nonpositive_data_fail_closed() {
     let mut session = new_session();
     acknowledge(&mut session);
@@ -270,6 +363,7 @@ fn malformed_wrong_scope_and_nonpositive_data_fail_closed() {
             session.classify(delivery(payload, 200)).is_err(),
             "{payload}"
         );
+        consume_unavailable_and_reconnect(&mut session);
         acknowledge(&mut session);
     }
 
@@ -278,6 +372,7 @@ fn malformed_wrong_scope_and_nonpositive_data_fail_closed() {
         r#"{{"arg":{{"channel":"index-tickers","instId":"BTC-USDT"}},"data":[{{"instId":"BTC-USDT","idxPx":"{oversized_price}","ts":"1"}}]}}"#
     );
     assert!(session.classify(delivery(&oversized_payload, 200)).is_err());
+    consume_unavailable_and_reconnect(&mut session);
     acknowledge(&mut session);
 
     let mut wrong_channel = envelope(
@@ -288,6 +383,7 @@ fn malformed_wrong_scope_and_nonpositive_data_fail_closed() {
         session.classify(RawDelivery::new(wrong_channel, 201).unwrap()),
         Err(OkxPublicSessionError::WrongEnvelopeChannel)
     ));
+    consume_unavailable_and_reconnect(&mut session);
     acknowledge(&mut session);
 
     let mut wrong_instrument = envelope(
@@ -324,6 +420,7 @@ fn only_exact_non_mutating_control_is_allowed_and_every_rejection_clears_readine
             ConnectionStatusKind::Disconnected,
             "{payload}"
         );
+        consume_unavailable_and_reconnect(&mut session);
     }
 
     let data = r#"{"arg":{"channel":"index-tickers","instId":"BTC-USDT"},"data":[{"instId":"BTC-USDT","idxPx":"1","ts":"1"}]}"#;
@@ -356,6 +453,10 @@ fn reconnect_backoff_uses_only_ack_history_owned_by_the_session() {
             .classify(delivery(r#"{"event":"unsubscribe"}"#, 400))
             .is_err()
     );
+    let occurrence = session
+        .take_unavailable()
+        .expect("state-changing control emits unavailable evidence");
+    assert_eq!(occurrence.connection_epoch(), 10);
     assert_eq!(
         session.after_failure().unwrap(),
         Duration::from_millis(10),
@@ -377,6 +478,33 @@ fn reconnect_advances_epoch_for_subsequent_ack_and_reference_evidence() {
         panic!("expected reference after reconnect");
     };
     assert_eq!(reference.connection_epoch(), 8);
+}
+
+#[test]
+fn disconnect_cannot_reconnect_without_one_consumed_receive_occurrence() {
+    let mut session = new_session();
+    session.invalidate(OkxPublicSessionFault::Disconnect);
+    assert!(matches!(
+        session.after_failure(),
+        Err(OkxPublicSessionError::UnavailableOccurrenceMissing)
+    ));
+
+    session
+        .invalidate_with_receive_evidence(
+            OkxPublicSessionFault::Disconnect,
+            1_700_000_000_123_456_789,
+            100,
+        )
+        .unwrap();
+    assert!(matches!(
+        session.after_failure(),
+        Err(OkxPublicSessionError::UnavailableOccurrencePending)
+    ));
+    let occurrence = session.take_unavailable().expect("disconnect occurrence");
+    assert_eq!(occurrence.fault(), OkxPublicSessionFault::Disconnect);
+    assert_eq!(session.take_unavailable(), None);
+    session.after_failure().unwrap();
+    assert_eq!(session.connection_epoch(), 8);
 }
 
 #[test]

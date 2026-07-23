@@ -1,0 +1,9 @@
+{
+  "condition_id": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "market_id": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "active": false,
+  "closed": false,
+  "archived": false,
+  "accepting_orders": true,
+  "enable_order_book": true
+}

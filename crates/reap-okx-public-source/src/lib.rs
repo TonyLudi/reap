@@ -10,7 +10,7 @@ pub use reference::{
 pub use session::{
     MAX_OKX_PUBLIC_CONNECTION_ID_BYTES, OkxPublicControlEvidence, OkxPublicEventEvidence,
     OkxPublicSession, OkxPublicSessionChannels, OkxPublicSessionDelivery, OkxPublicSessionError,
-    OkxPublicSessionEvent,
+    OkxPublicSessionEvent, OkxPublicSessionFault, OkxPublicUnavailableOccurrence,
 };
 pub use subscription::{
     MAX_OKX_INDEX_INSTRUMENT_BYTES, OKX_INDEX_TICKERS_CHANNEL, OkxIndexTickerSubscription,

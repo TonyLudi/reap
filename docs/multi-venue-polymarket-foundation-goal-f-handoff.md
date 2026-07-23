@@ -1,10 +1,12 @@
 # Multi-Venue Polymarket Foundation Goal F Handoff
 
-Status: in progress. Phase 0 is green at
+Status: in progress overall. Phase 0 is green at
 `8d6581270b82f39293ccdb0cbeaead42d717e81c`; Phase 1 is green at
-`eb71bc1b84cef6152dc010922641e9d5bb019e43`; Phase 2 is green with its gate
-commit pending. This ledger is architecture and deterministic local evidence,
-not authenticated-connectivity evidence or trading authorization.
+`eb71bc1b84cef6152dc010922641e9d5bb019e43`; Phase 2 is green at
+`7014a611f997e0bec8e86051d56f333d57776fc1`; Phase 3 is green in the current
+working tree and awaits its gate commit. This ledger is architecture and
+deterministic local evidence, not authenticated-connectivity evidence or
+trading authorization.
 
 The historical execution contract is the
 [Goal F prompt](multi-venue-polymarket-foundation-goal-f-prompt.md). The
@@ -36,12 +38,33 @@ deployed PM binary, target-host qualification, or production trading approval.
 | Prompt-only execution contract | Green | `d2593f6d85ce868b46e3c1f16b5a48f221e5e480` |
 | 0. Baseline, product contract, dependency and measurement plan | Green | `8d6581270b82f39293ccdb0cbeaead42d717e81c` |
 | 1. Exact PM domain and venue-aware envelopes | Green | `eb71bc1b84cef6152dc010922641e9d5bb019e43` |
-| 2. Capability-specific venue framework seams | Green | This phase gate commit |
-| 3. PM public market data, integrity, capture, replay | Pending | — |
+| 2. Capability-specific venue framework seams | Green | `7014a611f997e0bec8e86051d56f333d57776fc1` |
+| 3. PM public market data, integrity, capture, replay | Green (working tree) | Commit pending |
 | 4. Read-only private lifecycle and position monitor | Pending | — |
 | 5. Passive quote lifecycle and fake execution | Pending | — |
 | 6. PM coordinator, quote-model seam, local evidence | Pending | — |
 | 7. Documentation, global verification, final audit | Pending | — |
+
+## Phase 3 Public-Wire Boundary Clarification
+
+The configured one-token Polymarket market WebSocket is multiplexed. A raw
+object with `event_type = "last_trade_price"` may therefore arrive even though
+Goal F has no public-trade requirement. Phase 3 recognizes only that outer
+discriminator and drops the object. It has no trade-field DTO/parser, typed
+trade value, normalized trade event, plan entry, model input, role, or
+trade-specific subscription. Raw capture may preserve the original multiplexed
+frame, but replay produces only an ignored discriminator result.
+
+The snapshot field also named `last_trade_price` is not a public-trade input. It
+is lexical checksum evidence required by the venue snapshot hash. Phase 3
+accepts exact unsigned decimal evidence throughout `[0, 1]`, including terminal
+`0` and `1`, without constructing executable `PmPrice`; malformed or
+out-of-range evidence fails closed.
+
+Standalone `best_bid_ask` remains a price-only normalized integrity check. Its
+optional `bid_size` and `ask_size` wire fields must be absent as a pair or both
+validate as exact positive quantities. They are not retained, normalized, or
+made into model input.
 
 The Phase 0 boundary document has SHA-256
 `861af08783076b5aec2a52f5a351c8a707971902cc58d7f0f1a6ba1795a58a05`
@@ -1160,24 +1183,73 @@ cardinality.
 
 ### Deterministic bounded lane seam
 
-`PmLaneSet` contains 11 actual private bounded containers, each implemented as
-a preallocated `BinaryHeap` plus a preallocated key `HashSet`. Telemetry is the
-only coalescing lane. An independent 11-row oracle pins, for every plan lane,
-the exact runtime mapping, capacity, nominal high-water, maximum age,
-saturation action, and service burst.
+Phase 3 materializes exactly one scheduler container: the private
+`PmPublicLaneState` owned by `PmPublicCaptureRun`. It is one preallocated
+`BinaryHeap` plus one preallocated key `HashSet`. There is no production
+`PmLaneSet`, no `lanes/scheduled.rs`, and no materialized private, account,
+position, reconciliation, model, timer, scheduled-action, journal, or
+fake-effect lane.
+
+The independent 11-row lane oracle and seven-rank service priority remain
+frozen prospective policy for the later atomic scheduler. They pin the
+eventual plan-lane mapping, capacity, nominal high-water, maximum age,
+saturation action, service burst, and the rule that telemetry alone may
+coalesce; they do not claim that 11 runtime containers exist in Phase 3.
 
 Received-event ordering is exactly:
 
 ```text
-(monotonic_receive_ns, source_handle, connection_epoch,
- local_ingress_sequence, variant_rank)
+(monotonic_receive_ns, source_handle, source_kind_rank,
+ source_scope_ordinal, connection_epoch, local_ingress_sequence,
+ variant_rank)
 ```
 
-The observation lane, source, and variant rank are derived by sealed concrete
-event implementations. Callers cannot select a lane, construct a service key,
-or replay a key from one serviced event onto another event. The latter path
-was found by independent audit and closed by removing caller-supplied keys from
-the trait dispatch method.
+Source-kind rank is stable (`OKX reference = 0`, `Polymarket market = 1`,
+`Polymarket account = 2`, `internal signal = 3`) and the scope ordinal is the
+configured reference, token, or account handle. This prevents identity-class
+ordinal collisions. The observation lane, full source, and variant rank are
+derived by sealed concrete event implementations. Callers cannot select a
+lane, construct a service key, invoke lane mutation through the public
+observation trait, or replay a key from one serviced event onto another event.
+
+Public route conversion is owned atomically with the configured PM and OKX
+sessions; raw adapter deliveries, session getters, and the route converter do
+not escape that owner. Final capability-specific route deliveries are
+move-only. Every lane-facing public producer owns its final
+authority-forming transition and lane admission as one operation:
+authoritative PM metadata is issued and enqueued with no delivery on success,
+and an OKX reference reports only `ReferenceEnqueued`. Raw PM capture may
+return sealed book/flow obligations, but the Run records their exact order as
+pending; callers can discharge them only through
+`commit_then_enqueue_pm_snapshot` or `reduce_then_enqueue_pm_book`, which
+commit or reduce before enqueuing that same capability. The former commit-only
+book APIs are not public.
+
+Public `Full` still returns the exact unconsumed delivery inside a private
+move-only proof while the Run retains the matching pending obligation. An age
+failure reports non-consuming evidence for the exact current oldest delivery.
+The active Run maps authenticated `Full` to the matching owned session's
+`Overflow` transition and authenticated `Aged` to `Stale`, using real
+detection wall/monotonic evidence and exact current-epoch checks. Before a PM
+obligation can escape, the Run begins the matching pending reducer `Overflow`
+or `BacklogAged` fault, making composite book readiness unavailable.
+
+Successful Full/Aged enactment performs lifecycle transition, exact-route
+purge, reducer finalization where applicable, and admission of the one
+must-deliver unavailable occurrence internally. Its public result contains
+only copied completion facts: Full retains the rejected ordering, and both
+paths retain the venue fault, reducer reason where applicable, and purge
+count. It exposes neither the rejected delivery, spent proof/evidence, nor the
+newly admitted unavailable delivery.
+If that must-deliver notification cannot enter the lane even after the exact
+invalidated route is purged, the Run terminalizes and retains a copied
+notification-admission failure that `finish` must report.
+
+Explicit disconnect and authenticated PM heartbeat-timeout paths likewise
+admit their one unavailable occurrence before returning copied facts.
+Unavailable notifications are non-expiring. When one is at the head,
+`service_lane_turn` transfers exactly that one occurrence and returns
+`Ok(1)`, independent of the ordinary public burst.
 
 Scheduled ordering is a separate exact key:
 
@@ -1186,17 +1258,24 @@ Scheduled ordering is a separate exact key:
  token_handle, side_rank, local_action_sequence)
 ```
 
-Only due scheduled actions are serviced. Age is checked immediately before
-each service rank, after all already-higher safety work, so aged lower-priority
-input cannot prevent higher-priority service. Static generic callbacks retain
-concrete payload types and use no trait object or owner-loop allocation.
+This scheduled ordering and the seven-rank cross-lane service rule are
+prospective until the later scheduler is introduced atomically with all of
+its typed producers. Phase 3 services only its public lane. Its static generic
+consumer has five mandatory concrete callbacks and no trait object or
+owner-loop allocation. A callback's normal synchronous return commits transfer
+of that exact occurrence. An unwind leaves a Run-owned poison flag set;
+readiness, later mutation, service, and normal finish then fail closed. A
+preflight or per-pop clock failure after earlier successful callbacks returns
+the exact prior `Ok(count)` and leaves the failing head for retry.
 
 The lane container is deterministic storage, not a connectivity authorizer.
-Phase 3 public producers and Phase 4 private producers must bind adapter
-deliveries to their configured role-issued source/connection route before
-enqueue. A caller-created `PmIngressOrder` is not route proof. Auxiliary
-capture, journal, and fake-effect lane markers must likewise be replaced by
-their typed worker payloads in the phases that connect those workers.
+Phase 3 public producers bind adapter deliveries to their configured
+role-issued source/connection route before enqueue; a caller-created
+`PmIngressOrder` is not route proof. Phase 4 and Phase 6 must introduce their
+private/account/position/reconciliation/model/timer/scheduled-action producers
+and the complete scheduler together, preserving the 11-row/seven-rank oracle.
+Auxiliary journal and fake-effect markers must likewise be replaced by typed
+worker payloads only in the phases that connect those workers.
 
 ### Authority and source-policy evidence
 
@@ -1426,3 +1505,441 @@ the no-outside-path check pass. `../imm-strategy` remains clean at
 `8222273a9c72033b760e1d2fec813bc77144556d` with only its pre-existing
 modified dashboard and untracked `.predarb/`. No sibling file or untracked
 runtime byte was read or changed.
+
+## Phase 3: Public Capture And Deterministic Replay
+
+The Phase 3 capture/replay implementation is green in the current working tree
+and awaits its gate commit. The complete all-target test gate, 27-case
+compile-fail boundary, clippy, check, formatting, source inventory, and
+independent authority/obligation audit are recorded below. This is still
+deterministic local and fake/loopback evidence only; it adds no authenticated
+connectivity or trading authorization.
+
+### Capture contract
+
+`reap-pm-live` owns a version-1, secret-free
+`okx_reference_polymarket` JSONL schema. Its required first record binds:
+
+- the exact raw-to-compact observation grant and its configuration
+  fingerprint;
+- the configured OKX reference and one-token Polymarket identities, sources,
+  connections, and routes;
+- complete checked PM market metadata, metadata revision/receive clock, and
+  recomputable metadata and EIP-712 domain fingerprints;
+- initial epochs, last snapshot revision, reconnect, heartbeat, and freshness
+  policies; and
+- the tracked Predarb provenance commit
+  `8222273a9c72033b760e1d2fec813bc77144556d`, seed blob
+  `bbb5bc143a914ba8c96d84342321b3dba30ec0fc`, seed SHA-256
+  `8e671f14c4b1e8137b1dc1b0bd7d39c79d9c8f961a8483daa32151df99cbdf81`,
+  and exact fixture SHA-256.
+
+Both `authenticated` and `production_order_entry_authorized` are fixed false.
+The remaining record kinds are exact PM raw frames, exact OKX raw frames, PM
+and OKX connection lifecycle events, and deterministic freshness-timer
+firings. Raw bytes are captured before parsing and are preserved byte-for-byte
+with length, SHA-256, and base64 encoding. The OKX legacy-compatible
+`raw_hash` is derived internally from the first eight SHA-256 bytes and cannot
+be supplied by a caller. Base64 is a capture-schema-only dependency; the
+dependency policy rejects it from PM strategy, contracts, adapter, wire, and
+state crates.
+
+The independent limits are:
+
+| Resource | Bound |
+| --- | ---: |
+| Raw PM or OKX frame | 1 MiB |
+| Encoded JSONL record | 1.5 MiB |
+| Combined PM and OKX raw-frame count | 8,192 |
+| Total record count | 16,384 |
+| Cumulative decoded raw payload | 32 MiB |
+| Encoded artifact and writer byte queue | 48 MiB |
+| Writer record queue | 8,192 |
+
+Every record is measured before admission. The writer separately accounts for
+encoded bytes, decoded raw bytes, raw-frame count, and total record count. The
+verifier rechecks the exact expected header, recomputes all authoritative
+metadata and identity fingerprints, requires contiguous artifact sequence and
+per-epoch PM/OKX ingress, validates route/token scope and raw length/hash,
+enforces every count and byte bound, rejects partial tails, and requires the
+file to remain stable while it is scanned. The neutral scanner opens a
+no-follow, nonblocking descriptor, verifies that descriptor is the intended
+regular file, enforces the total cap against the same open file, and compares
+size, identity, modification, and change-time evidence after the scan.
+Deserialized session and reconnect policies are revalidated to the same
+invariants as their constructors.
+
+These public schema, verification, and replay APIs are deterministic
+unauthenticated offline evidence. They validate bounds, hashes, ordering,
+scope equality against the caller-supplied expected header, and semantic
+replay; they do not prove that the active composition produced the bytes.
+Public `PmCaptureProvenance` is checked pinned-reference metadata, not
+active-run provenance. The low-level `PmPublicCaptureWriter` is now
+crate-private and absent from the crate-root exports, so only
+`PmPublicCaptureRun` owns active artifact construction/mutation. A caller that
+constructs public schema values and obtains a successful offline verification
+does not gain route, lane, session, or active-run authority.
+
+`PmPublicCaptureRun` is the sole active owner of both venue sessions, writer,
+per-epoch raw ingress counters, route authority, and its canonical PM book
+reducer. Its PM and OKX ingress paths admit raw bytes to bounded capture before
+session parsing and live route conversion. A caller cannot parse an unrecorded
+frame or substitute a same-shaped session or reducer through these paths.
+
+Each constructed run allocates a process-unique opaque route-authority seal.
+All five move-only public route deliveries, the correlated PM snapshot-flow
+value, and the route portion of retained public age evidence carry that exact
+seal. It proves which active run issued a delivery. Admission, snapshot commit,
+and lane-fault enactment compare it with the owning run, so a
+same-configuration sibling run is not interchangeable.
+
+The one private `PmPublicLaneState` owned by the Run allocates its own
+process-unique opaque lane-instance seal and maintains a checked generation
+that changes on queue mutation. This second seal proves which exact public
+lane state observed Full or Aged; it is not derived from the route seal and
+cannot stand in for one. No second Phase 3 scheduler container exists. Both
+opaque identities are runtime-only authority and are deliberately excluded
+from serialization, artifact hashing, canonical replay projection, and
+logical ordering.
+
+Raw capture/writer admission, backpressure, byte/count capacity, or storage
+failure terminally closes the shared artifact; it is not the recoverable
+public-lane `Overflow` path. Raw classification/session parsing and live route
+conversion failures are terminal as well. Where exact receive clocks exist,
+the run may retain typed unavailable evidence, but normal mutation cannot
+continue in the artifact.
+
+The current schema records lifecycle state for both PM and OKX, including
+connection start, subscription, disconnect, and reconnect scheduling.
+Lifecycle phase and exact epoch are checked before a record is written. The
+typed disconnect reasons are:
+
+| Venue | Exact same-artifact disconnect reasons |
+| --- | --- |
+| PM | `Disconnect`, `Gap`, `Overflow`, `Stale`, `HeartbeatTimeout` |
+| OKX | `Disconnect`, `Overflow`, `Stale` |
+
+Reconnect scheduling is admitted only after the matching disconnect record,
+and verifier/replay require the exact next epoch and a fresh subscription
+before later raw frames. A lifecycle write failure is terminal; a session
+transition failure after a successful write is also terminal because the
+artifact has already recorded a transition it cannot enact.
+
+PM `HeartbeatTimeout` is accepted only from the owned session's heartbeat
+poll after it proves an outstanding ping and expiration of the exact session
+deadline, with real receive evidence. It cannot be caller-stamped. Replay
+reconstructs that session state: a structurally valid timeout record is
+rejected when no ping is outstanding or when it occurs one nanosecond before
+the deadline, while the exact deadline is accepted and projects exactly one
+`heartbeat_timeouts` and one `external_faults` count. Although schema and
+replay retain an explicit PM `Gap` reason, active composition must expose no
+caller-selected gap operation. The reducer's ingress is local occurrence
+ordering, so a forward jump is legal and does not prove a venue gap. Active
+Gap emission remains absent unless a later sealed external detector supplies
+real gap evidence.
+
+### Active snapshot and lane authority
+
+`PmPublicCaptureRun::start` constructs a pristine canonical `PmBookReducer`
+from the validated product configuration, authoritative metadata, exact
+metadata/domain fingerprints, initial epoch, and capture freshness policy.
+The run owns that reducer privately for its full lifetime. No constructor or
+mutator on the active Run accepts a caller-created reducer, and callers cannot
+replace it with a same-configuration sibling.
+
+One atomic `PmPublicCaptureRun` operation consumes the exact sealed snapshot
+route delivery and its correlated move-only flow value, applies the snapshot
+to that privately owned reducer, and checks the reducer's move-only commit
+proof. Instrument, full metadata contract and fingerprint, connection epoch,
+metadata/snapshot revisions, local ingress, and exact verified snapshot hash
+must all agree before the owned session opens protocol delta flow. The reducer
+proof alone is intentionally insufficient authority.
+
+The public readiness boundary is the copied, typed
+`PmPublicBookReadiness`, not the reducer's readiness in isolation. It combines
+artifact terminality, lifecycle availability, pending book reduction or
+terminal-tick cleanup, pending Full/Aged lane faults, reducer readiness, and
+session/reducer agreement. Diagnostic revisions remain visible while
+`is_ready()` is the only positive readiness signal. Book levels are available
+only through `ready_pm_book_view()`, which returns a borrowed
+`PmPublicReadyBookView` that cannot outlive or be mutated independently of the
+run. Any ordinary captured book reduction, retained terminal-tick cleanup, or
+typed Full/Aged obligation suppresses that view even if the reducer retains a
+previously valid book.
+
+A public-lane `Full` result retains the exact rejected delivery inside a
+private, move-only proof of lane-instance seal, generation, capacity, rejected
+key, and policy action. Before that result escapes, the owning run records the
+exact typed pending lane obligation; state-bearing PM Full additionally begins
+the reducer's matching pending external fault. The Run-owned
+`PmPublicLaneState` must consume and authenticate that proof while it is still
+the same generation, still Full at the same capacity, and still lacks the
+rejected key.
+
+An `Aged` result is non-consuming and retains a separate private, move-only
+proof of the typed oldest head, service key, route facts, connection, ordering,
+receive clock, original observation time, lane seal, and generation. The
+only service path that may inspect a nonempty public lane is
+`PmPublicCaptureRun::service_lane_turn`. For evidence issued by that exact
+current Run, it registers the typed pending Aged obligation before returning
+the evidence and, for a PM metadata/book head, begins the reducer's matching
+pending external fault first. The lane state and its raw service operation are
+crate-private. Exact enactment consumes Aged evidence and rechecks the same
+generation, exact current head, policy action, and original over-age fact.
+
+Sibling-run or sibling-lane evidence, altered route facts, and other
+nonmatching Full/Aged evidence are returned untouched. Rejection performs no
+lifecycle write and no run, queue, session, or reducer mutation; an already
+registered exact obligation remains pending until its own evidence is enacted
+or the run terminalizes.
+
+Only after lane-proof authentication does the active-run sequence check the
+owned route seal/source, current epoch, detection clocks, and, for PM, reducer
+instrument/fingerprint/full-metadata contract. It then records the matching
+typed disconnect using the real detection wall/monotonic clocks, applies the
+session transition, finalizes the exact pending PM reducer fault where
+applicable, and performs a bounded exact purge of only `(route seal, source,
+connection, epoch)`. Sibling, unrelated, and later-epoch deliveries remain
+queued. It then admits the one routed unavailable notification itself.
+Successful Full/Aged results expose only copied completion facts; Full
+includes the rejected ordering, while both include fault/reducer/purge facts
+as applicable. The new unavailable delivery and consumed proof/evidence do
+not escape. An already-unavailable notification retains its original fault
+and is re-admitted after the exact purge without minting a second occurrence.
+Failure to admit a must-deliver unavailable notification terminalizes the Run,
+retains the copied admission failure, and forces
+`NotificationAdmissionTerminalFinish` after writer shutdown.
+
+Unavailable notifications bypass age rejection. If one is the current head,
+the service turn transfers exactly that notification and returns `Ok(1)`.
+Every callback is mandatory and receives a concrete typed occurrence. Normal
+synchronous return commits consumption; unwind preserves the Run-owned
+consumer-transfer poison, which suppresses readiness and blocks later
+mutation, service, and successful finish.
+
+The exact recoverable mappings are:
+
+| Condition | Session transition | PM reducer transition |
+| --- | --- | --- |
+| PM public-lane `Full` | `Overflow` | `Overflow` |
+| PM public-lane `Aged` | `Stale` | `BacklogAged` |
+| OKX public-lane `Full` | `Overflow` | Not applicable |
+| OKX public-lane `Aged` | `Stale` | Not applicable |
+
+Lane counters separate `rejected_full` and `invalidated_purged`. PM state
+separately counts `overflows`, `heartbeat_timeouts`, and
+`backlog_aged_faults`. A backlog-age fault increments
+`backlog_aged_faults` plus `stale_invalidations`; a deterministic freshness
+timer may increment `stale_invalidations` but never
+`backlog_aged_faults`.
+
+Tick-size drift remains terminal even if its route delivery would otherwise
+be a Full/Aged head. Capture returns the exact move-only delivery, retains its
+exact pending reduction identity inside the Run, and marks terminal cleanup
+`Pending`; terminalization does not pretend reducer invalidation already
+happened. The sole permitted post-terminal mutation,
+`apply_terminal_tick_invalidation`, accepts only that exact authenticated
+delivery, applies its preserved `old` and `new` values to the run-owned
+reducer, and marks cleanup `Applied` without reopening capture or protocol
+flow. Mismatched cleanup evidence is returned without mutation. `finish`
+drains the writer but reports `TerminalTickCleanupIncomplete` while cleanup is
+pending; after cleanup it still returns the ordinary typed terminal
+non-success. Tick drift cannot be normalized into a recoverable `Overflow` or
+`Stale` transition.
+
+### Artifact fault taxonomy
+
+The shared run/artifact is terminal and must rotate on:
+
+- capture/writer admission, backpressure, byte/count cap, storage, shutdown
+  evidence, or lifecycle-write failure;
+- raw PM/OKX classification, parser, or session-admission failure;
+- live route conversion failure;
+- snapshot commit, reducer configuration, correlated-flow, or reducer-proof
+  mismatch;
+- hash mismatch, invalid transition, or reducer rejection; and
+- tick metadata drift requiring refreshed authoritative metadata.
+
+Same-artifact recovery is limited to explicit disconnect, public-lane
+Full/Overflow, public-lane Aged/Stale, PM heartbeat timeout, and an explicit
+externally proved PM Gap. The pure PM reducer can represent same-epoch snapshot
+repair after `InvalidTransition` or `HashMismatch`; this is not active capture
+authority. `PmPublicCaptureRun` makes those faults artifact-terminal because a
+continued live history would not be reproducible by normal verified replay.
+The active Run gates all later mutators after a terminal fault:
+capture/classify, lifecycle, reconnect, metadata, snapshot commit, lane
+admission/enactment, and timer recording. Read-only path/header/subscription
+inspection and terminal shutdown remain possible. The only mutation exception
+is the one exact authenticated terminal-tick cleanup described above; it
+cannot resume the run. `finish` must drain/close the writer but return typed
+non-success; it cannot return a normal verified/replayed outcome.
+
+`reap-pm-live` depends directly on neither legacy `reap-core` nor
+`reap-polymarket-wire`. Narrow production helpers in the PM adapter and OKX
+public source expose only the parser/session behavior needed by capture and
+replay. Tokio Tungstenite is a test-only dependency for the local fake server.
+
+### Replay contract
+
+Replay first verifies the artifact against the caller-supplied expected header,
+then reconstructs its PM role, authoritative metadata, session, reducer,
+freshness policy, and configured OKX public session from that same header. It
+processes records in exact artifact order through the production PM and OKX
+parsers and the production PM reducer. The replay scan independently rechecks
+the header and must match the verification scan's SHA-256, byte count, record
+count, complete tail, and stability evidence before its events can be
+attributed to the verified artifact.
+
+During live capture, a PM snapshot opens protocol delta flow only through the
+atomic `PmPublicCaptureRun` operation described above. Replay does not consume
+the runtime-only route seal; from the verified artifact it performs the
+equivalent reducer-before-flow validation. In both paths, synchronous reducer
+application must prove all of:
+
+- reducer readiness;
+- exact connection epoch and metadata/snapshot revisions;
+- the exact snapshot transition ingress; and
+- the exact last verified venue snapshot hash.
+
+Protocol flow state is not treated as product readiness. Recoverable
+disconnect invalidates the reducer, reconnect advances the epoch, and a new
+exact snapshot is required before deltas resume. Tick-size drift projects its
+exact `old`/`new` invalidation and terminally requires a new authoritative
+metadata artifact; later PM frames or freshness timers fail closed instead of
+silently resuming the old grid.
+
+The canonical projection contains ordered PM lifecycle, heartbeat,
+snapshot/delta/top, ignored public-trade discriminator, OKX ACK/reference, tick
+invalidation, and freshness events plus exact counters and a projection
+SHA-256. Replay performs no batch coalescing; the
+`integrity_batches_coalesced` counter is pinned to zero.
+
+Current focused assertions pin exact replay counts rather than merely checking
+nonzero activity. They are retained by the green Phase 3 gate:
+
+| Scenario | Exact asserted replay/verification counters |
+| --- | --- |
+| Loopback PM disconnect/resnapshot | verification: PM raw `5`, OKX raw `0`, PM lifecycle `7`, freshness timers `1`; replay: snapshots `2`, resync snapshots `1`, delta batches `1`, delta changes `2`, delta-top confirmations `1`, top confirmations `1`, disconnects `1`, reconnects `1`, coalesced `0` |
+| Interleaved PM+OKX | OKX raw `4`, OKX lifecycle `6`, subscription ACKs `2`, references `2`, OKX disconnects/reconnects `1`/`1`; PM snapshots `2`, delta batches `2`, delta changes `4`, coalesced `0` |
+| Authenticated heartbeat deadline | heartbeat timeouts `1`, external faults `1` |
+| Tick drift | tick invalidations `1`, metadata refresh required `true` |
+| Ignored multiplexed trade stress | public trades ignored `64`, coalesced `0`; reserved projection bytes equal event-capacity plus payload-capacity bytes and remain at most `16 MiB` |
+
+The reconnect/local-ingress contract also pins PM and OKX
+disconnects/reconnects at `1`/`1`, snapshots at `2`, and PM gaps at `0`, proving
+that forward local-ingress jumps do not fabricate a gap.
+
+### Phase 3 evidence gate
+
+The final local gate is green:
+
+| Command | Final result |
+| --- | --- |
+| `cargo test -p reap-pm-live --all-targets --locked` | Green: 86 Rust tests, 0 failures; the trybuild harness passed all 27 UI cases |
+| `cargo test -p reap-pm-state --locked` | Green: 20 tests, 0 failures |
+| `cargo test -p reap-capture-framing --locked` | Green |
+| `cargo clippy -p reap-pm-live --all-targets --locked -- -D warnings` | Green |
+| `cargo check -p reap-pm-live --lib --locked` | Green |
+| `cargo metadata --locked --format-version 1` | Green |
+| `cargo fmt --all -- --check` | Green |
+| `git diff --check` | Green |
+
+The combined suite reaches the required loopback PM subscription,
+`PING`/`PONG`, disconnect/reconnect/resnapshot, interleaved PM+OKX capture,
+deterministic replay, raw-capture overflow, exact boundary capacities, tick
+drift, partial-tail/hash/policy rejection, heartbeat-deadline authentication,
+legal ingress jumps without invented Gap, distinct delta-batch evidence, zero
+coalescing, and typed terminal finish paths. Same-configuration sibling runs
+and sibling lane authority cannot substitute route, snapshot-flow, Full, or
+Aged proof. Changed generations, noncurrent heads, altered route facts, and
+wrong epochs fail before lifecycle mutation.
+
+The final obligation tests additionally pin the boundary that was previously
+implicit:
+
+- metadata issue, OKX reference capture, PM snapshot commit, and PM delta/top
+  reduction admit their successful data delivery internally;
+- public Full retains the exact rejected delivery only on its move-only
+  failure/proof path, while successful Full/Aged enactment exposes copied
+  completion facts only;
+- explicit disconnect, authenticated heartbeat timeout, Full enactment, and
+  Aged enactment admit the must-deliver unavailable occurrence internally;
+- unavailable notifications do not expire and a head unavailable notification
+  is the sole transfer in an `Ok(1)` turn;
+- partial service returns exact prior progress and leaves the failing head;
+- normal callback return commits exact transfer, while unwind poisons the
+  Run-owned lane and blocks readiness, mutation, service, and successful
+  finish; and
+- failed must-deliver notification admission terminalizes, retains its copied
+  reason, and is reported by terminal finish.
+
+Dependency/source-policy coverage retains direct-dependency and legacy-DAG
+rules, base64 confinement, PM-state purity, constructor ownership, and
+authority non-escape. Compile-fail coverage keeps raw route/lane/service
+authority and `PmPublicCaptureWriter` private, proves every public callback is
+mandatory, and proves the former commit-only PM book APIs are not public,
+while offline schema/verification/replay remain public.
+
+### Final Phase 3 structural inventory
+
+The reproducible inventories at the green working-tree gate are:
+
+| Inventory | Count | SHA-256 |
+| --- | ---: | --- |
+| Goal F source-set size audit | 85 files / 31,059 physical lines / 0 files above 1,500 | — |
+| Goal F direct dependency edges | 20 edges | `556719df2e183422a487aaafcf80b48a1de06e8ea56e8a4d57cd375725802f28` |
+| Sorted workspace public declarations | 1,951 lines | `94c443da52fb2db1fa517b1b0bc0a9addbdd82e5d7936411cdbcba78b97efc4a` |
+| Sorted schema/version declarations | 48 lines | `4bbde207bc0279ef90e9a88365567f49332665cafd11f192964483a89a5c6940` |
+| Sorted production Rust paths | 255 files | `c01ef82cde5603c676a4c802edd6edba61c739b76f21111f4646e9f42784c77e` |
+| Sorted production `sha256sum` manifest | 255 files | `4db8efc7316dd70b496769df5728c8f48402d77c9c808fb30af5dc2fa2cf10bb` |
+| Sorted production-source extent stream | 255 files | `373d56ea4842a9a5c30d64ac619e897a3c788d14c6748e0b67288d4caf41cd51` |
+| `Cargo.lock` | — | `fcca183e6d1eea4aeb977d4d03232710e98fe56594371d3fdb953854a1a4daf1` |
+| Normative connectivity-boundary document | — | `3c756ecfbd3dddce6caf93529ae950a3d72e7f60b2f83d546a7192e85a2e004b` |
+
+These use the Phase 0 public/schema commands, the Phase 2 sorted production
+path and content-manifest commands, and the production-extent command recorded
+above. The 85-file source-set and 20-edge rows match the canonical boundary
+audit; the extent stream and lock hash are supplemental handoff inventories.
+Existing pre-Goal-F files above 1,500 lines remain baseline exceptions; no
+Goal F production file exceeds 1,500 lines.
+
+The actual `reap-pm-live` production tree has 28 Rust files. Its root contains
+`capture`, `capture_roles`, `composition`, `fake_effect`, `lanes`,
+`public_routes`, `replay`, and `schedule`, plus the crate facade. Its private
+children are:
+
+- `capture::{validation,verify,writer}`;
+- `capture_roles::reducer_freshness`;
+- `lanes::{bounded,failure,policy,public,service}`; and
+- `composition::{lane_enact,run_capture,run_lane_aged,run_lane_full,
+  run_lane_service,run_lifecycle,run_reduce,run_state,run_terminal_tick,
+  run_types}`.
+
+`lanes::public` contains the sole materialized Phase 3 queue,
+`PmPublicLaneState`; there is no `lanes::scheduled` and no aggregate
+`PmLaneSet`. `schedule` retains policy types/oracle data, not a scheduled
+runtime container.
+
+`capture_roles.rs` is exactly 1,490 production lines, ten below the Goal F
+ceiling. It is frozen: Phase 4 and Phase 6 must add no responsibility to that
+file. Before any production growth, its role/session, route, reducer, and
+outcome responsibilities must be split into narrower modules while preserving
+the private authority boundary.
+
+### Required Phase 4 and Phase 6 continuation
+
+Phase 4 remains a read-only PM private lifecycle and position monitor. It must
+retain complete account/funder scope, bounded reconciliation shapes, fixture
+or fake-only connectivity, and no order mutation. Its typed producers may not
+leak an unqueued capability or be attached to ad hoc containers that bypass
+the frozen lane policy.
+
+Phase 6 must introduce the complete scheduler atomically with the remaining
+typed private/account/position/reconciliation/model/timer/scheduled-action
+producers. It must enact the prospective 11-row lane policy and seven-rank
+priority as one coherent Run-owned design, preserve non-expiring safety
+notifications and exact partial-progress semantics, and prove that all
+mandatory callbacks make a total deterministic transition in the sealed
+coordinator. Phase 3 proves authenticated ordering and exact occurrence
+transfer; it deliberately does not claim the later strategy-state consumption
+proof, model behavior, fake quote lifecycle, or production authorization.

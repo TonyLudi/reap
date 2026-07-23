@@ -1,0 +1,16 @@
+error[E0599]: no method named `commit_pm_snapshot` found for mutable reference `&mut PmPublicCaptureRun` in the current scope
+ --> tests/ui/commit_only_book_apis_are_not_public.rs:8:17
+  |
+8 |     let _ = run.commit_pm_snapshot(delivery, flow);
+  |                 ^^^^^^^^^^^^^^^^^^
+  |
+help: there is a method `commit_then_enqueue_pm_snapshot` with a similar name
+  |
+8 |     let _ = run.commit_then_enqueue_pm_snapshot(delivery, flow);
+  |                        +++++++++++++
+
+error[E0599]: no method named `commit_pm_book_update` found for mutable reference `&mut PmPublicCaptureRun` in the current scope
+  --> tests/ui/commit_only_book_apis_are_not_public.rs:12:17
+   |
+12 |     let _ = run.commit_pm_book_update(delivery);
+   |                 ^^^^^^^^^^^^^^^^^^^^^ method not found in `&mut PmPublicCaptureRun`

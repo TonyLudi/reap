@@ -1,0 +1,5 @@
+error[E0432]: unresolved import `reap_pm_live::PmAgedLaneFailure`
+ --> tests/ui/aged_lane_failure_cannot_be_forged.rs:1:20
+  |
+1 | use reap_pm_live::{PmAgedLaneFailure, PmLaneKind, PmServiceTurnError, SaturationAction};
+  |                    ^^^^^^^^^^^^^^^^^ no `PmAgedLaneFailure` in the root

@@ -1,0 +1,8 @@
+error[E0432]: unresolved imports `reap_pm_live::PmIngressOrder`, `reap_pm_live::PmLaneSet`, `reap_pm_live::PmObservedEvent`
+ --> tests/ui/public_observed_event_cannot_enqueue_directly.rs:2:20
+  |
+2 | use reap_pm_live::{PmIngressOrder, PmLaneSet, PmObservedEvent};
+  |                    ^^^^^^^^^^^^^^  ^^^^^^^^^  ^^^^^^^^^^^^^^^ no `PmObservedEvent` in the root
+  |                    |               |
+  |                    |               no `PmLaneSet` in the root
+  |                    no `PmIngressOrder` in the root

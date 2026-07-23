@@ -1,0 +1,11 @@
+error[E0451]: field `failure` of struct `PmPublicLaneEnqueueError` is private
+ --> tests/ui/public_lane_failure_cannot_be_forged.rs:9:32
+  |
+9 |     PmPublicLaneEnqueueError { failure: value() }
+  |                                ^^^^^^^ private field
+
+error: type `reap_pm_live::lanes::failure::PmPublicLaneFailure<PmPublicBookDelivery>` is private
+ --> tests/ui/public_lane_failure_cannot_be_forged.rs:9:41
+  |
+9 |     PmPublicLaneEnqueueError { failure: value() }
+  |                                         ^^^^^^^ private type

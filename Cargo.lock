@@ -1059,6 +1059,7 @@ dependencies = [
 name = "reap-capture-framing"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "sha2",
@@ -1365,6 +1366,7 @@ dependencies = [
  "reap-core",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "trybuild",
 ]
@@ -1373,13 +1375,23 @@ dependencies = [
 name = "reap-pm-live"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "futures-util",
+ "reap-capture-framing",
+ "reap-okx-public-source",
  "reap-pm-core",
  "reap-pm-live-contracts",
+ "reap-pm-state",
  "reap-pm-strategy",
  "reap-polymarket-adapter",
  "reap-transport",
+ "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror",
+ "tokio",
+ "tokio-tungstenite",
  "trybuild",
 ]
 
@@ -1394,6 +1406,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "reap-pm-state"
+version = "0.1.0"
+dependencies = [
+ "reap-pm-core",
+ "thiserror",
+]
+
+[[package]]
 name = "reap-pm-strategy"
 version = "0.1.0"
 dependencies = [
@@ -1405,8 +1425,24 @@ name = "reap-polymarket-adapter"
 version = "0.1.0"
 dependencies = [
  "reap-pm-core",
+ "reap-polymarket-wire",
+ "reap-transport",
+ "serde_json",
+ "sha2",
  "thiserror",
  "trybuild",
+]
+
+[[package]]
+name = "reap-polymarket-wire"
+version = "0.1.0"
+dependencies = [
+ "reap-pm-core",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]

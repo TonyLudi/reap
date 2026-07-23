@@ -1,0 +1,10 @@
+{
+  "event_type": "best_bid_ask",
+  "market": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "asset_id": "123",
+  "timestamp": "123456791",
+  "best_bid": "0.50",
+  "best_ask": "0.60",
+  "bid_size": "12.5",
+  "ask_size": "75"
+}

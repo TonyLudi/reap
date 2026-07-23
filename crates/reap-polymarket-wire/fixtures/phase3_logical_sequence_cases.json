@@ -1,0 +1,64 @@
+{
+  "schema": 1,
+  "provenance": "Canonical logical reducer cases authored from the Goal F Phase 3 contract; they are not claimed venue wire captures.",
+  "cases": [
+    {
+      "name": "stale",
+      "observations": [
+        {"kind": "snapshot", "epoch": 1, "ingress": 1, "snapshot_revision": 1, "monotonic_ns": 100},
+        {"kind": "freshness_timer", "epoch": 1, "ingress": 1, "snapshot_revision": 1, "monotonic_ns": 1101}
+      ],
+      "freshness_limit_ns": 1000,
+      "expected": "book_stale_until_explicit_snapshot"
+    },
+    {
+      "name": "duplicate",
+      "observations": [
+        {"kind": "snapshot", "epoch": 1, "ingress": 1, "snapshot_revision": 1, "monotonic_ns": 100},
+        {"kind": "delta", "epoch": 1, "ingress": 2, "snapshot_revision": 1, "monotonic_ns": 200},
+        {"kind": "delta", "epoch": 1, "ingress": 2, "snapshot_revision": 1, "monotonic_ns": 300}
+      ],
+      "freshness_limit_ns": 1000,
+      "expected": "duplicate_ingress_until_explicit_snapshot"
+    },
+    {
+      "name": "reordered",
+      "observations": [
+        {"kind": "snapshot", "epoch": 1, "ingress": 1, "snapshot_revision": 1, "monotonic_ns": 100},
+        {"kind": "delta", "epoch": 1, "ingress": 3, "snapshot_revision": 1, "monotonic_ns": 200},
+        {"kind": "delta", "epoch": 1, "ingress": 2, "snapshot_revision": 1, "monotonic_ns": 300}
+      ],
+      "freshness_limit_ns": 1000,
+      "expected": "reordered_ingress_until_explicit_snapshot"
+    },
+    {
+      "name": "gap",
+      "observations": [
+        {"kind": "snapshot", "epoch": 1, "ingress": 1, "snapshot_revision": 1, "monotonic_ns": 100},
+        {"kind": "external_gap_fault", "epoch": 1, "ingress": 2, "snapshot_revision": 1, "monotonic_ns": 200}
+      ],
+      "freshness_limit_ns": 1000,
+      "expected": "gap_until_explicit_snapshot"
+    },
+    {
+      "name": "reconnect",
+      "observations": [
+        {"kind": "snapshot", "epoch": 1, "ingress": 1, "snapshot_revision": 1, "monotonic_ns": 100},
+        {"kind": "disconnect", "epoch": 1, "ingress": 2, "snapshot_revision": 1, "monotonic_ns": 200},
+        {"kind": "begin_epoch", "epoch": 2, "ingress": 0, "snapshot_revision": 1, "monotonic_ns": 300}
+      ],
+      "freshness_limit_ns": 1000,
+      "expected": "awaiting_snapshot_in_new_epoch"
+    },
+    {
+      "name": "resync",
+      "observations": [
+        {"kind": "external_gap_fault", "epoch": 1, "ingress": 2, "snapshot_revision": 1, "monotonic_ns": 200},
+        {"kind": "begin_epoch", "epoch": 2, "ingress": 0, "snapshot_revision": 1, "monotonic_ns": 300},
+        {"kind": "snapshot", "epoch": 2, "ingress": 1, "snapshot_revision": 2, "monotonic_ns": 400}
+      ],
+      "freshness_limit_ns": 1000,
+      "expected": "ready_after_explicit_snapshot"
+    }
+  ]
+}

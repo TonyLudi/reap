@@ -184,10 +184,20 @@ fn bounded_verifier_never_uses_the_unbounded_read_primitive() {
         .map(|offset| read_start + offset)
         .expect("canonical reader boundary exists");
     let bounded_read = &VERIFY[read_start..canonical_start];
-    assert_eq!(bounded_read.matches("File::open").count(), 1);
-    assert!(bounded_read.contains(".metadata()"));
+    assert!(bounded_read.contains("open_verified_regular_file(path)?"));
     assert!(bounded_read.contains("file.take(read_limit)"));
     assert!(!bounded_read.contains("std::fs::read"));
+
+    let secure_open = VERIFY
+        .split_once("fn open_verified_regular_file")
+        .and_then(|(_, source)| source.split_once("fn regular_path_metadata"))
+        .map(|(source, _)| source)
+        .expect("descriptor-bound regular-file open exists");
+    assert!(secure_open.contains("open_read_only_no_follow(path)"));
+    assert!(secure_open.contains("opened_metadata.is_file()"));
+    assert!(secure_open.contains("same_file_identity(&target_before_open, &opened_metadata)"));
+    assert!(secure_open.contains("same_file_identity(&target_after_open, &opened_metadata)"));
+    assert!(VERIFY.contains("libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC"));
 }
 
 #[test]

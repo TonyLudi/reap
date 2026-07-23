@@ -1,0 +1,9 @@
+[package]
+name = "reap-pm-state"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+reap-pm-core.workspace = true
+thiserror.workspace = true
+

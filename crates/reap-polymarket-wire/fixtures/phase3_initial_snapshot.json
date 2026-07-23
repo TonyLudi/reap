@@ -1,0 +1,19 @@
+{
+  "event_type": "book",
+  "market": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "asset_id": "123",
+  "timestamp": "123456789",
+  "hash": "6ac95ffad569774202496c914c0753fc43279c4c",
+  "bids": [
+    {"price": "0.30", "size": "100"},
+    {"price": "0.40", "size": "50"}
+  ],
+  "asks": [
+    {"price": "0.60", "size": "75"},
+    {"price": "0.70", "size": "100"}
+  ],
+  "min_order_size": "5",
+  "tick_size": "0.01",
+  "neg_risk": false,
+  "last_trade_price": "0.50"
+}

@@ -1,0 +1,11 @@
+error[E0046]: not all trait items implemented, missing: `on_pm_public_unavailable`, `on_okx_public_unavailable`, `on_market`, `on_book`, `on_reference`
+ --> tests/ui/public_lane_service_requires_all_callbacks.rs:5:1
+  |
+5 | impl PmPublicLaneService for IncompleteConsumer {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `on_pm_public_unavailable`, `on_okx_public_unavailable`, `on_market`, `on_book`, `on_reference` in implementation
+  |
+  = help: implement the missing item: `fn on_pm_public_unavailable(&mut self, _: ServicedLaneItem<PmPublicUnavailable>) { todo!() }`
+  = help: implement the missing item: `fn on_okx_public_unavailable(&mut self, _: ServicedLaneItem<OkxPublicUnavailable>) { todo!() }`
+  = help: implement the missing item: `fn on_market(&mut self, _: ServicedLaneItem<reap_pm_core::event::PmMarketEvent>) { todo!() }`
+  = help: implement the missing item: `fn on_book(&mut self, _: ServicedLaneItem<reap_pm_core::event::PmBookEvent>) { todo!() }`
+  = help: implement the missing item: `fn on_reference(&mut self, _: ServicedLaneItem<reap_pm_core::event::OkxReferenceEvent>) { todo!() }`

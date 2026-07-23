@@ -1,0 +1,229 @@
+{
+  "schema": 1,
+  "fixtures": [
+    {
+      "path": "ignored_last_trade_unparsed_fields.json",
+      "sha256": "e9b549d921f289d3425ea845f70a7230893b25a7f7db3176c19a031dab78cba8",
+      "provenance": "Goal F public-trade exclusion contract",
+      "purpose": "Prove a multiplexed public trade discriminator cannot expose or validate trade fields.",
+      "expected": "ignored_public_trade"
+    },
+    {
+      "path": "market_book_predarb_seed.json",
+      "sha256": "8e671f14c4b1e8137b1dc1b0bd7d39c79d9c8f961a8483daa32151df99cbdf81",
+      "provenance": "../predarb revision 8222273a9c72033b760e1d2fec813bc77144556d, Git blob bbb5bc143a914ba8c96d84342321b3dba30ec0fc",
+      "purpose": "Retain the tracked predecessor parser seed without treating its incomplete identity as readiness evidence.",
+      "expected": "invalid_market_identity"
+    },
+    {
+      "path": "market_subscription.json",
+      "sha256": "253f800d03bcee800aad014e068d164fba48bd8b03b993fb0528e8ca0636621b",
+      "provenance": "../predarb revision 8222273a9c72033b760e1d2fec813bc77144556d market subscription test",
+      "purpose": "Pin the exact one-configured-token public market subscription.",
+      "expected": "exact_subscription_bytes"
+    },
+    {
+      "path": "official_snapshot_hash_vector.json",
+      "sha256": "aca0221387a45e0ab0eec76adfb3dce8e7d3c0cbcb32187167dd5c556c459eeb",
+      "provenance": "../predarb revision 8222273a9c72033b760e1d2fec813bc77144556d official-client hash vector",
+      "purpose": "Pin exact snapshot lexical order and SHA-1 integrity behavior.",
+      "expected": "valid_rest_snapshot_hash"
+    },
+    {
+      "path": "phase3_clob_grid_drift.json",
+      "sha256": "f2a678c3e6745d584eefdf912acd07defde59b85d132d7a53306c0750d56a73b",
+      "provenance": "Goal F Phase 3 metadata drift contract",
+      "purpose": "Preserve exact observed tick drift for the authoritative metadata join to reject.",
+      "expected": "parsed_tick_drift_evidence"
+    },
+    {
+      "path": "phase3_clob_minimum_drift.json",
+      "sha256": "14413e7209f457268f7e68da405025c22e9d410db82d5f40447bbfdb71738956",
+      "provenance": "Goal F Phase 3 metadata drift contract",
+      "purpose": "Preserve exact observed minimum-order drift for the authoritative metadata join to reject.",
+      "expected": "parsed_minimum_drift_evidence"
+    },
+    {
+      "path": "phase3_clob_negative_risk_drift.json",
+      "sha256": "165f9cdaa84b0a3ca60e843eeb51a7d1d3bf07f236ef8500e2c7e1a0ed463c00",
+      "provenance": "Goal F Phase 3 metadata drift contract",
+      "purpose": "Preserve exact observed negative-risk drift for the authoritative metadata join to reject.",
+      "expected": "parsed_negative_risk_drift_evidence"
+    },
+    {
+      "path": "phase3_clob_wrong_membership.json",
+      "sha256": "f64dbe4e9be67b4b192f3111fcc9673c1dca7833ee2a2aaa98c30dd8cc8595f2",
+      "provenance": "Goal F Phase 3 metadata membership contract",
+      "purpose": "Prove configured outcome-token absence fails at the wire boundary.",
+      "expected": "configured_token_missing"
+    },
+    {
+      "path": "phase3_crossed_snapshot.json",
+      "sha256": "bff5e1d5d0d3782e44398602f8516aceb98c6ff51e5d2f75b86ff7c6084083a7",
+      "provenance": "Goal F Phase 3 public-book negative contract",
+      "purpose": "Prove a locked/crossed snapshot cannot become live state.",
+      "expected": "crossed_book"
+    },
+    {
+      "path": "phase3_domain_authority_injection.json",
+      "sha256": "6fae37f341785bb74c0a561ce07d419060d4bc6e0739dfcabc115b8bb2d42bd8",
+      "provenance": "Goal F Phase 3 authority-boundary negative contract",
+      "purpose": "Prove unreviewed wire chain/exchange fields cannot mint or override configured domain authority.",
+      "expected": "unknown_clob_fields_rejected"
+    },
+    {
+      "path": "phase3_empty_snapshot.json",
+      "sha256": "1b5be3f4b3b94c4014f83d7da5eabea6ac29652eef443f25feaec691422fbb1c",
+      "provenance": "Goal F Phase 3 public-book negative contract",
+      "purpose": "Prove an empty book side cannot become live state.",
+      "expected": "empty_book"
+    },
+    {
+      "path": "phase3_initial_snapshot.json",
+      "sha256": "2a767c5b0c7eab87c70c2969d282b1374a19b6da37d286f372ed5dd9b0d0fcd4",
+      "provenance": "Goal F Phase 3 canonical public snapshot authored from the reached wire contract",
+      "purpose": "Exercise a complete initial WebSocket snapshot through the production parser and SHA-1 verifier.",
+      "expected": "valid_book_snapshot"
+    },
+    {
+      "path": "phase3_lifecycle_archived.json",
+      "sha256": "6ad6d76fdae70763af5b16a13a0cd6f1accdcbb45f73e48ad9e9e4400699f6ef",
+      "provenance": "Goal F Phase 3 lifecycle drift contract",
+      "purpose": "Preserve archived lifecycle evidence for the authoritative metadata join to reject.",
+      "expected": "parsed_archived_lifecycle_evidence"
+    },
+    {
+      "path": "phase3_lifecycle_book_disabled.json",
+      "sha256": "d31c82562f9111471b5f10f7f58d4299bf001fd855591ffa9dbb95778cfd4d22",
+      "provenance": "Goal F Phase 3 lifecycle drift contract",
+      "purpose": "Preserve disabled-order-book evidence for the authoritative metadata join to reject.",
+      "expected": "parsed_book_disabled_evidence"
+    },
+    {
+      "path": "phase3_lifecycle_closed.json",
+      "sha256": "e33f7dc915610af1e0629f3c17c10b28dd72fd3fbc05a96898c8d91752aa0d6b",
+      "provenance": "Goal F Phase 3 lifecycle drift contract",
+      "purpose": "Preserve closed lifecycle evidence for the authoritative metadata join to reject.",
+      "expected": "parsed_closed_lifecycle_evidence"
+    },
+    {
+      "path": "phase3_lifecycle_inactive.json",
+      "sha256": "a6974c0ef818a3a7880da133759d6e42f6e9252a796c2fa424eacc0a0b790beb",
+      "provenance": "Goal F Phase 3 lifecycle drift contract",
+      "purpose": "Preserve inactive lifecycle evidence for the authoritative metadata join to reject.",
+      "expected": "parsed_inactive_lifecycle_evidence"
+    },
+    {
+      "path": "phase3_lifecycle_not_accepting.json",
+      "sha256": "c0e95dc29f1b43cbf121ef86f9deb2594739e992b3eacd75456bece48344d26a",
+      "provenance": "Goal F Phase 3 lifecycle drift contract",
+      "purpose": "Preserve not-accepting lifecycle evidence for the authoritative metadata join to reject.",
+      "expected": "parsed_not_accepting_evidence"
+    },
+    {
+      "path": "phase3_lifecycle_unknown_field.json",
+      "sha256": "f0780e24dd4971b4d634b41fd5dc13fcce5400a2753b24a1238c391ba1cdc6c7",
+      "provenance": "Goal F Phase 3 strict lifecycle DTO negative contract",
+      "purpose": "Prove an unreviewed lifecycle field is denied rather than silently ignored.",
+      "expected": "unknown_lifecycle_field_rejected"
+    },
+    {
+      "path": "phase3_logical_sequence_cases.json",
+      "sha256": "3a384994ed786d39aa739ee1417a568d6453644cf403c789f9842aad9079babb",
+      "provenance": "Goal F Phase 3 canonical logical reducer contract; explicitly not a venue capture",
+      "purpose": "Pin stale, duplicate, reordered, explicit-gap, reconnect, and explicit-resync representations without calling local ingress jumps venue gaps.",
+      "expected": "six_logical_sequence_cases"
+    },
+    {
+      "path": "phase3_malformed_ws.json",
+      "sha256": "a6fb08fda1acb957b6116bd37811a1fe41a01611c0631edbf786d6889a27a55c",
+      "provenance": "Goal F Phase 3 malformed-frame negative contract",
+      "purpose": "Prove malformed JSON fails before normalization.",
+      "expected": "malformed_json"
+    },
+    {
+      "path": "phase3_price_above_one_snapshot.json",
+      "sha256": "87b568fe8b596a2a0054604d8c9899b96308d4ef30f9ffab9ea8c7230b75c769",
+      "provenance": "Goal F Phase 3 bounded-price negative contract",
+      "purpose": "Prove a book level above one cannot become executable state.",
+      "expected": "invalid_executable_price"
+    },
+    {
+      "path": "phase3_price_negative_snapshot.json",
+      "sha256": "1b99a6cd29afeceb0d4575ab4c7d84af151ac4e7a6f5c2288e7c52bcef62d2a0",
+      "provenance": "Goal F Phase 3 bounded-price negative contract",
+      "purpose": "Prove a negative book level cannot become executable state.",
+      "expected": "invalid_executable_price"
+    },
+    {
+      "path": "phase3_price_one_snapshot.json",
+      "sha256": "5f21802c0c80b186e463220e533c42aae690a94c08862d5fb6aa52cef7b5d7b8",
+      "provenance": "Goal F Phase 3 bounded-price negative contract",
+      "purpose": "Prove terminal one may remain hash evidence but cannot become an executable ask.",
+      "expected": "invalid_executable_price"
+    },
+    {
+      "path": "phase3_price_zero_snapshot.json",
+      "sha256": "c8d645f77b84991c4f04c356613d2e2aa0297463b5dfe011cf91acc2f57e4917",
+      "provenance": "Goal F Phase 3 bounded-price negative contract",
+      "purpose": "Prove terminal zero may remain hash evidence but cannot become an executable bid.",
+      "expected": "invalid_executable_price"
+    },
+    {
+      "path": "phase3_spender_authority_injection.json",
+      "sha256": "badd470ba6c741c071cbe0bf74f8a7598839a60186e165248af66f04fef909d0",
+      "provenance": "Goal F Phase 3 authority-boundary negative contract",
+      "purpose": "Prove an unreviewed wire spender set cannot mint or override configured allowance authority.",
+      "expected": "unknown_clob_fields_rejected"
+    },
+    {
+      "path": "phase3_token_unknown_field.json",
+      "sha256": "b536eded7b2ed88eaa118f76825c9330bf2edb16685749b788c109401306e4f4",
+      "provenance": "Goal F Phase 3 strict outcome-token DTO negative contract",
+      "purpose": "Prove an unreviewed token authority field is denied rather than silently ignored.",
+      "expected": "unknown_token_field_rejected"
+    },
+    {
+      "path": "phase3_valid_bbo.json",
+      "sha256": "28d2aaeb3af168ceb203c8410917423af698910c3e0ed391af3c84fa6966e4d2",
+      "provenance": "Goal F Phase 3 canonical public BBO authored from the reached wire contract",
+      "purpose": "Exercise an exact best-bid/ask observation through the production parser.",
+      "expected": "valid_best_bid_ask"
+    },
+    {
+      "path": "phase3_valid_incremental.json",
+      "sha256": "414bad64c25aaa3681823b43798aa49bcdd33fb7a10ed1fe2bc54ba8885427fa",
+      "provenance": "Goal F Phase 3 canonical public incremental authored from the reached wire contract",
+      "purpose": "Exercise an atomic delete/add incremental with final BBO through the production parser.",
+      "expected": "valid_price_change_batch"
+    },
+    {
+      "path": "phase3_wrong_token_incremental.json",
+      "sha256": "54579b3b5e6638298674b9aa12c496a13a236fb0b5bf8e978e2ac32361a9ad4f",
+      "provenance": "Goal F Phase 3 token-scope negative contract",
+      "purpose": "Prove an incremental for another outcome token rejects the entire batch.",
+      "expected": "token_mismatch"
+    },
+    {
+      "path": "provenance.json",
+      "sha256": "3b85d5d1e891136f085c72c5691380f8bd7f3c37f83f3b316ef546b4576ff343",
+      "provenance": "Goal F Phase 3 predecessor-source declaration",
+      "purpose": "Pin the tracked predecessor revision, blob, and qualified uses.",
+      "expected": "valid_provenance_declaration"
+    },
+    {
+      "path": "valid_clob_market.json",
+      "sha256": "1f5daabe1b1c50b0a3497479a5690a620de987b8a087a29e120fcb0fbdb2bc14",
+      "provenance": "Goal F Phase 3 canonical CLOB metadata authored from the reached REST contract",
+      "purpose": "Exercise exact membership, tick, minimum, and negative-risk parsing.",
+      "expected": "valid_clob_metadata"
+    },
+    {
+      "path": "valid_lifecycle.json",
+      "sha256": "70593921cb77b99b11673b30afdd3719e005aeaf60e7aaea5fe25cc5b23a6079",
+      "provenance": "Goal F Phase 3 canonical lifecycle metadata authored from the reached REST contract",
+      "purpose": "Exercise exact active, open, accepting, and order-book-enabled lifecycle parsing.",
+      "expected": "valid_lifecycle_metadata"
+    }
+  ]
+}

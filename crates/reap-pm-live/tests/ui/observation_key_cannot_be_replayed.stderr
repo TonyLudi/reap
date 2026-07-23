@@ -1,16 +1,7 @@
-error[E0061]: this function takes 4 arguments but 5 arguments were supplied
-  --> tests/ui/observation_key_cannot_be_replayed.rs:11:5
-   |
-11 |     PmObservedEvent::enqueue_into(event, lanes, key, ingress, clock);
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^               --- unexpected argument #3 of type `PmServiceKey`
-   |
-note: method defined here
-  --> src/lanes.rs
-   |
-   |     fn enqueue_into(
-   |        ^^^^^^^^^^^^
-help: remove the extra argument
-   |
-11 -     PmObservedEvent::enqueue_into(event, lanes, key, ingress, clock);
-11 +     PmObservedEvent::enqueue_into(event, lanes, ingress, clock);
-   |
+error[E0432]: unresolved imports `reap_pm_live::PmIngressOrder`, `reap_pm_live::PmLaneSet`
+ --> tests/ui/observation_key_cannot_be_replayed.rs:2:20
+  |
+2 | use reap_pm_live::{PmIngressOrder, PmLaneSet, PmServiceKey};
+  |                    ^^^^^^^^^^^^^^  ^^^^^^^^^ no `PmLaneSet` in the root
+  |                    |
+  |                    no `PmIngressOrder` in the root

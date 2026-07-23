@@ -91,9 +91,28 @@ fn raw_receive_evidence_and_public_exports_cannot_be_detached_or_widened() {
     assert!(session.contains("OkxPublicEventEvidence"));
     assert!(session.contains("connection_id: ConnId"));
     assert!(session.contains("envelope.conn_id != self.connection_id"));
+    assert!(session.contains("pub struct OkxPublicSessionDelivery"));
+    assert!(session.contains("connection_id: ConnId"));
+    assert!(session.contains("connection_epoch: u64"));
+    assert!(session.contains("local_ingress_sequence: u64"));
+    assert!(
+        !session.contains(
+            "pub type OkxPublicSessionDelivery = ImmutableDelivery<OkxPublicSessionEvent>"
+        )
+    );
     assert!(session.contains("self.connection_epoch.checked_add(1)"));
+    assert!(session.contains("pub const fn requires_reconnect"));
+    assert!(session.contains("return Err(OkxPublicSessionError::ReconnectRequired)"));
+    assert!(session.contains("pub struct OkxPublicUnavailableOccurrence"));
+    assert!(session.contains("pub fn take_unavailable"));
+    assert!(session.contains("pub fn invalidate_with_receive_evidence"));
+    assert!(session.contains("OkxPublicSessionError::UnavailableOccurrencePending"));
     assert!(session.contains("Result<Duration, OkxPublicSessionError>"));
-    assert!(!session.contains("monotonic_receive_ns: u64"));
+    assert!(session.contains("pub fn classify_captured_payload"));
+    assert!(session.contains("venue: Venue::Okx"));
+    assert!(session.contains("conn_id: self.connection_id.clone()"));
+    assert!(session.contains("channel: Channel::Custom(OKX_INDEX_TICKERS_CHANNEL.to_string())"));
+    assert!(session.contains("symbol: Some(self.subscription.instrument().to_string())"));
 
     let library = std::fs::read_to_string(source.join("lib.rs")).unwrap();
     assert!(!library.contains("pub use reference::*"));

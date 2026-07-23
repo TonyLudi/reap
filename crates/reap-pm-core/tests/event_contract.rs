@@ -1,16 +1,16 @@
 use reap_core::Venue;
 use reap_pm_core::{
     EvmAddress, MAX_PM_BOOK_LEVELS, PmAccountHandle, PmAllowanceEvent, PmAllowanceValue, PmAssetId,
-    PmBalanceEvent, PmBookEvent, PmBookLevel, PmBookPoint, PmBookQuantity, PmBookSide, PmBookTop,
-    PmBookUpdate, PmChainId, PmClientOrderId, PmClientOrderKey, PmConditionId,
-    PmErc1155OperatorApproval, PmEventError, PmFillEvent, PmFillExecution, PmFillFee, PmFillId,
-    PmFillKey, PmFillRole, PmInstrumentHandle, PmMarketEvent, PmMarketHandle, PmMarketId,
-    PmMarketLifecycle, PmMarketMetadata, PmOrderEvent, PmOrderIdentity, PmOrderProgress,
-    PmOrderSide, PmOrderStatus, PmOutcomeLabel, PmOutcomeMetadata, PmPositionAvailability,
-    PmPositionEvent, PmPrice, PmProductSource, PmQuantity, PmSign, PmSignedUnits,
-    PmSnapshotCompleteness, PmSnapshotEvidence, PmSourceHandle, PmSpenderDomain, PmSpenderId,
-    PmSpenderRequirement, PmTick, PmTokenHandle, PmTokenId, PmVenueOrderId, PmVenueOrderKey,
-    SnapshotRevision, U256,
+    PmBalanceEvent, PmBookDeltaBatch, PmBookEvent, PmBookLevel, PmBookPoint, PmBookQuantity,
+    PmBookSide, PmBookSnapshot, PmBookTop, PmBookTopCheck, PmBookUpdate, PmChainId,
+    PmClientOrderId, PmClientOrderKey, PmConditionId, PmErc1155OperatorApproval, PmEventError,
+    PmFillEvent, PmFillExecution, PmFillFee, PmFillId, PmFillKey, PmFillRole, PmInstrumentHandle,
+    PmMarketEvent, PmMarketHandle, PmMarketId, PmMarketLifecycle, PmMarketMetadata, PmOrderEvent,
+    PmOrderIdentity, PmOrderProgress, PmOrderSide, PmOrderStatus, PmOutcomeLabel,
+    PmOutcomeMetadata, PmPositionAvailability, PmPositionEvent, PmPrice, PmProductSource,
+    PmQuantity, PmSign, PmSignedUnits, PmSnapshotCompleteness, PmSnapshotEvidence, PmSourceHandle,
+    PmSpenderDomain, PmSpenderId, PmSpenderRequirement, PmTick, PmTokenHandle, PmTokenId,
+    PmVenueChangeHash, PmVenueOrderId, PmVenueOrderKey, SnapshotRevision, U256,
 };
 
 const CONDITION: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -153,23 +153,25 @@ fn market_events_retain_metadata_source_and_structural_instrument() {
 }
 
 #[test]
-fn book_events_keep_snapshot_framing_distinct_from_exact_deltas() {
+fn book_events_keep_whole_snapshots_and_delta_frames_atomic() {
     let bid = PmBookLevel::new(
         PmBookSide::Bid,
         PmPrice::parse_decimal("0.42").unwrap(),
         PmBookQuantity::from_protocol_units(U256::from_u64(2_000_000)),
     );
+    let snapshot = PmBookSnapshot::new(vec![bid].into_boxed_slice()).unwrap();
     let event = PmBookEvent::new(
         market_source(),
         instrument(),
         SnapshotRevision::new(6),
-        PmBookUpdate::SnapshotLevel(bid),
+        PmBookUpdate::Snapshot(snapshot.clone()),
     )
     .unwrap();
     assert_eq!(event.source(), market_source());
     assert_eq!(event.instrument(), instrument());
     assert_eq!(event.metadata_revision().value(), 6);
-    assert_eq!(event.update(), PmBookUpdate::SnapshotLevel(bid));
+    assert_eq!(event.update(), &PmBookUpdate::Snapshot(snapshot.clone()));
+    assert_eq!(snapshot.levels(), &[bid]);
     assert_eq!(bid.side(), PmBookSide::Bid);
     assert_eq!(bid.price().units(), 420_000);
 
@@ -179,51 +181,76 @@ fn book_events_keep_snapshot_framing_distinct_from_exact_deltas() {
         PmBookQuantity::Delete,
     );
     assert_eq!(
-        PmBookEvent::new(
-            market_source(),
-            instrument(),
-            SnapshotRevision::new(6),
-            PmBookUpdate::SnapshotLevel(delete),
-        ),
+        PmBookSnapshot::new(vec![delete].into_boxed_slice()),
         Err(PmEventError::SnapshotLevelIsDelete)
     );
-    assert!(
-        PmBookEvent::new(
-            market_source(),
-            instrument(),
-            SnapshotRevision::new(6),
-            PmBookUpdate::Delta(delete),
-        )
-        .is_ok()
+    let top = PmBookTopCheck::new(
+        Some(PmPrice::parse_decimal("0.42").unwrap()),
+        Some(PmPrice::parse_decimal("0.58").unwrap()),
     );
-    assert!(
-        PmBookEvent::new(
-            market_source(),
-            instrument(),
-            SnapshotRevision::new(6),
-            PmBookUpdate::SnapshotStart { expected_levels: 0 },
-        )
-        .is_ok()
-    );
-    assert!(
-        PmBookEvent::new(
-            market_source(),
-            instrument(),
-            SnapshotRevision::new(6),
-            PmBookUpdate::SnapshotComplete { observed_levels: 0 },
-        )
-        .is_ok()
+    let deltas = PmBookDeltaBatch::new(vec![delete].into_boxed_slice(), top).unwrap();
+    assert_eq!(deltas.changes(), &[delete]);
+    assert_eq!(deltas.venue_change_hashes(), &[None]);
+    assert_eq!(deltas.expected_top(), top);
+    let change_hash = PmVenueChangeHash::new("tx-delete").unwrap();
+    let evidenced = PmBookDeltaBatch::new_with_venue_hashes(
+        vec![delete].into_boxed_slice(),
+        vec![Some(change_hash)].into_boxed_slice(),
+        top,
+    )
+    .unwrap();
+    assert_eq!(evidenced.venue_change_hashes(), &[Some(change_hash)]);
+    assert_eq!(
+        evidenced.venue_change_hashes()[0].unwrap().as_str(),
+        "tx-delete"
     );
     assert_eq!(
+        PmBookDeltaBatch::new_with_venue_hashes(
+            vec![delete].into_boxed_slice(),
+            Box::default(),
+            top,
+        ),
+        Err(PmEventError::ChangeHashCountMismatch)
+    );
+    assert_eq!(
+        PmVenueChangeHash::new(""),
+        Err(PmEventError::EmptyVenueChangeHash)
+    );
+    assert_eq!(
+        PmVenueChangeHash::new(&"a".repeat(97)),
+        Err(PmEventError::VenueChangeHashTooLong)
+    );
+    assert_eq!(
+        PmVenueChangeHash::new("é"),
+        Err(PmEventError::NonAsciiVenueChangeHash)
+    );
+    assert!(PmBookSnapshot::new(Box::default()).is_ok());
+    assert!(PmBookDeltaBatch::new(Box::default(), top).is_ok());
+    assert_eq!(
+        PmBookSnapshot::new(vec![bid; usize::from(MAX_PM_BOOK_LEVELS) + 1].into_boxed_slice()),
+        Err(PmEventError::TooManyBookLevels)
+    );
+    assert_eq!(
+        PmBookDeltaBatch::new(
+            vec![delete; usize::from(MAX_PM_BOOK_LEVELS) + 1].into_boxed_slice(),
+            top,
+        ),
+        Err(PmEventError::TooManyBookLevels)
+    );
+
+    assert_eq!(top.bid().unwrap().units(), 420_000);
+    assert_eq!(top.ask().unwrap().units(), 580_000);
+    assert!(
         PmBookEvent::new(
             market_source(),
             instrument(),
             SnapshotRevision::new(6),
-            PmBookUpdate::SnapshotStart {
-                expected_levels: MAX_PM_BOOK_LEVELS + 1,
+            PmBookUpdate::TickSizeChanged {
+                old: PmTick::parse_decimal("0.01").unwrap(),
+                new: PmTick::parse_decimal("0.001").unwrap(),
             },
-        ),
-        Err(PmEventError::TooManyBookLevels)
+        )
+        .is_ok()
     );
 }
 
@@ -551,7 +578,7 @@ fn every_normalized_family_rejects_a_wrong_source_scope() {
             wrong_market_source,
             instrument(),
             SnapshotRevision::new(1),
-            PmBookUpdate::SnapshotStart { expected_levels: 1 },
+            PmBookUpdate::Snapshot(PmBookSnapshot::new(Box::default()).unwrap()),
         ),
         Err(PmEventError::MarketSourceTokenMismatch)
     );
@@ -560,7 +587,7 @@ fn every_normalized_family_rejects_a_wrong_source_scope() {
             account_source(),
             instrument(),
             SnapshotRevision::new(1),
-            PmBookUpdate::SnapshotStart { expected_levels: 1 },
+            PmBookUpdate::Snapshot(PmBookSnapshot::new(Box::default()).unwrap()),
         ),
         Err(PmEventError::WrongMarketSource)
     );

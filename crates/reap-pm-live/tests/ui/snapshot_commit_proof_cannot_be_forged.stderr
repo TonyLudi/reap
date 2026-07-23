@@ -1,0 +1,19 @@
+error[E0451]: fields `instrument`, `metadata_fingerprint`, `connection_epoch`, `metadata_revision`, `snapshot_revision`, `local_ingress_sequence` and `venue_hash` of struct `PmSnapshotCommitProof` are private
+  --> tests/ui/snapshot_commit_proof_cannot_be_forged.rs:16:9
+   |
+15 |     PmSnapshotCommitProof {
+   |     --------------------- in this type
+16 |         instrument,
+   |         ^^^^^^^^^^ private field
+17 |         metadata_fingerprint,
+   |         ^^^^^^^^^^^^^^^^^^^^ private field
+18 |         connection_epoch,
+   |         ^^^^^^^^^^^^^^^^ private field
+19 |         metadata_revision,
+   |         ^^^^^^^^^^^^^^^^^ private field
+20 |         snapshot_revision,
+   |         ^^^^^^^^^^^^^^^^^ private field
+21 |         local_ingress_sequence,
+   |         ^^^^^^^^^^^^^^^^^^^^^^ private field
+22 |         venue_hash,
+   |         ^^^^^^^^^^ private field

@@ -1,0 +1,11 @@
+{
+  "condition_id": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "market_id": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "minimum_order_size": "6",
+  "minimum_tick_size": "0.01",
+  "neg_risk": false,
+  "tokens": [
+    {"token_id": "123", "outcome": "Yes"},
+    {"token_id": "456", "outcome": "No"}
+  ]
+}
