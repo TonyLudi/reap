@@ -4,7 +4,8 @@ Status: in progress overall. Phase 0 is green at
 `8d6581270b82f39293ccdb0cbeaead42d717e81c`; Phase 1 is green at
 `eb71bc1b84cef6152dc010922641e9d5bb019e43`; Phase 2 is green at
 `7014a611f997e0bec8e86051d56f333d57776fc1`; Phase 3 is green at
-`dd54297aaa35600171904524a7b43adc3948a724`. This ledger is architecture and
+`dd54297aaa35600171904524a7b43adc3948a724`; Phase 4 is green at
+`6737653a2c8dd3211db35b6b7259edc5fab38360`. This ledger is architecture and
 deterministic local evidence, not authenticated-connectivity evidence or
 trading authorization.
 
@@ -40,7 +41,7 @@ deployed PM binary, target-host qualification, or production trading approval.
 | 1. Exact PM domain and venue-aware envelopes | Green | `eb71bc1b84cef6152dc010922641e9d5bb019e43` |
 | 2. Capability-specific venue framework seams | Green | `7014a611f997e0bec8e86051d56f333d57776fc1` |
 | 3. PM public market data, integrity, capture, replay | Green | `dd54297aaa35600171904524a7b43adc3948a724` |
-| 4. Read-only private lifecycle and position monitor | Pending | — |
+| 4. Read-only private lifecycle and position monitor | Green | `6737653a2c8dd3211db35b6b7259edc5fab38360` |
 | 5. Passive quote lifecycle and fake execution | Pending | — |
 | 6. PM coordinator, quote-model seam, local evidence | Pending | — |
 | 7. Documentation, global verification, final audit | Pending | — |
@@ -1957,9 +1958,7 @@ model behavior, fake quote lifecycle, or production authorization.
 
 ## Phase 4: Read-Only Private Lifecycle And Position Monitor
 
-Status: implementation candidate green. The exact gate commit and final
-inventory hashes are recorded by the immediate follow-up ledger commit after
-the Phase 4 code-and-documentation commit.
+Status: green at `6737653a2c8dd3211db35b6b7259edc5fab38360`.
 
 ### Exact private and reconciliation carriers
 
@@ -2102,7 +2101,7 @@ refresh ownership; read-only monitor composition; and compile-fail authority
 boundaries. The final gate commands and exact counts are recorded with the
 Phase 4 gate commit.
 
-The Phase 4 candidate gate ran:
+The Phase 4 gate ran:
 
 ```text
 cargo test -p reap-pm-core --all-targets --locked
@@ -2147,7 +2146,7 @@ The exact tracked Predarb fixture bytes admitted in this phase are:
 | `predarb_user_order_seed.json` | 295 | `e4c3cd7975b7dc16c4c8d014444fc2a96d927cf1b9089b33875a5450b4ff99fa` |
 | `predarb_user_trade_seed.json` | 278 | `042998055ec5dec2c69065d002b2619d8497faabd9bfcc36c27a1bcf7cfe224c` |
 
-The final candidate-tree structural inventory is:
+The final green-tree structural inventory is:
 
 | Inventory | Count | SHA-256 |
 | --- | ---: | --- |
