@@ -51,7 +51,12 @@ fn phase6_real_mutation_artifacts_recover_to_the_same_bounded_projection() {
         std::env::current_exe().expect("combined-replay test executable is available"),
     )
     .env(PHASE6_RECOVERY_CHILD, "1")
-    .args(["--exact", PHASE6_RECOVERY_TEST, "--test-threads=1"])
+    .args([
+        "--exact",
+        PHASE6_RECOVERY_TEST,
+        "--test-threads=1",
+        "--nocapture",
+    ])
     .status()
     .expect("isolated recovery evidence subprocess starts");
     assert!(
@@ -64,12 +69,10 @@ async fn run_phase6_recovery_evidence() {
     let directory = tempfile::tempdir().unwrap();
     let first_path = directory.path().join("phase6-first.jsonl");
     let second_path = directory.path().join("phase6-second.jsonl");
-    let first_report: serde_json::Value = serde_json::from_str(
-        &reap_pm_live::run_pm_combined_replay_evidence(first_path.clone())
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let first_encoded = reap_pm_live::run_pm_combined_replay_evidence(first_path.clone())
+        .await
+        .unwrap();
+    let first_report: serde_json::Value = serde_json::from_str(&first_encoded).unwrap();
     let second_report: serde_json::Value = serde_json::from_str(
         &reap_pm_live::run_pm_combined_replay_evidence(second_path.clone())
             .await
@@ -172,6 +175,7 @@ async fn run_phase6_recovery_evidence() {
             assert!(recovery["peak_working_bytes"].as_u64().unwrap() <= 16 * 1_024 * 1_024);
         }
     }
+    println!("{first_encoded}");
 }
 
 struct ConsumePublic;
