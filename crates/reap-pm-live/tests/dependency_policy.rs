@@ -310,6 +310,9 @@ fn legacy_polymarket_mentions_are_an_exact_fail_closed_allowlist() {
         "crates/reap-feed/src/connection.rs|fn old_connection_path_rejects_polymarket_explicitly() {",
         "crates/reap-feed/src/connection.rs|panic!(\"the old OKX feed path admitted a Polymarket socket plan\");",
         "crates/reap-feed/src/connection.rs|venue: Venue::Polymarket,",
+        "crates/reap-feed/src/replay.rs|.contains(\"unsupported legacy capture venue Polymarket\")",
+        "crates/reap-feed/src/replay.rs|fn legacy_raw_envelope_rejects_a_polymarket_capture() {",
+        "crates/reap-feed/src/replay.rs|venue: Venue::Polymarket,",
         "crates/reap-feed/src/subscription.rs|Err(PartitionError::UnsupportedVenue(Venue::Polymarket))",
         "crates/reap-feed/src/subscription.rs|Err(PartitionError::UnsupportedVenue(Venue::Polymarket))",
         "crates/reap-feed/src/subscription.rs|Err(PartitionError::UnsupportedVenue(Venue::Polymarket))",
@@ -321,6 +324,13 @@ fn legacy_polymarket_mentions_are_an_exact_fail_closed_allowlist() {
         "crates/reap-feed/src/subscription.rs|fn old_subscription_partitioning_rejects_polymarket_explicitly() {",
         "crates/reap-feed/src/subscription.rs|venue_key(Venue::Polymarket),",
         "crates/reap-feed/src/subscription.rs|venue_label(Venue::Polymarket),",
+        "crates/reap-risk/src/lib.rs|fn polymarket_health_cannot_ready_the_legacy_okx_risk_gate() {",
+        "crates/reap-risk/src/lib.rs|fn polymarket_stale_events_cannot_mutate_legacy_okx_health() {",
+        "crates/reap-risk/src/lib.rs|gate.mark_feed_ready(Venue::Polymarket, \"BTC-USDT\", 100);",
+        "crates/reap-risk/src/lib.rs|gate.mark_private_ready(Venue::Polymarket, 100);",
+        "crates/reap-risk/src/lib.rs|venue: Some(Venue::Polymarket),",
+        "crates/reap-risk/src/lib.rs|venue: Some(Venue::Polymarket),",
+        "crates/reap-risk/src/lib.rs|venue: Some(Venue::Polymarket),",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -347,6 +357,9 @@ fn legacy_polymarket_mentions_are_an_exact_fail_closed_allowlist() {
         r#"crates/reap-core/src/types.rs|#[serde(rename = "polymarket")]"#,
         "crates/reap-core/src/types.rs|Polymarket,",
         "crates/reap-core/src/types.rs|Venue::Polymarket",
+        "crates/reap-core/src/types.rs|Venue::Polymarket => Err(<D::Error as serde::de::Error>::custom(",
+        "crates/reap-core/src/types.rs|Venue::Polymarket => Err(Venue::Polymarket),",
+        "crates/reap-core/src/types.rs|Venue::Polymarket => Err(Venue::Polymarket),",
         r##"crates/reap-core/src/types.rs|r#""polymarket""#"##,
         r##"crates/reap-core/src/types.rs|serde_json::from_str::<Venue>(r#""polymarket""#).unwrap(),"##,
         "crates/reap-core/src/types.rs|serde_json::to_string(&Venue::Polymarket).unwrap(),",
