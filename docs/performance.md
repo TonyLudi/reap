@@ -125,6 +125,122 @@ the production select loop, storage enqueue and disk IO, signing, transport
 queues, network IO, and exchange acknowledgement. The machine-readable
 schema-version-1 output carries the exact row-specific boundary.
 
+## Goal F Phase 6 Local PM And Chaos Evidence
+
+Goal F Phase 6 is green on local structural and regression evidence. The PM
+artifacts were built from
+`e11d51bfebe157b31d6f6d8ee8a8c4981f6c8768` on a two-vCPU Arm Neoverse-N1
+host running Linux `7.0.0-1004-aws`, Rust
+`1.95.0 (59807616e 2026-04-14)`, and LLVM `22.1.2`. The Phase 6 acceptance
+commit `c76ccbd22cb4d25e121ac5bb3bc9b6dcd9e16f47` modifies only a test
+allowlist.
+
+### PM replay identity and bounds
+
+The combined replay gate uses the real filesystem writer for one complete
+nominal artifact and performs two independent read-only recoveries:
+
+| Evidence boundary | Exact accepted result |
+| --- | --- |
+| Artifact | 35,012 lines; 22,791,589 bytes; SHA-256 `83ced509c9ea180e66d957853f9ff7762ef3c0babc316c9251c12d4d1a5224eb` |
+| Independent recovery | Byte-identical projections; both canonical SHA-256 `f98bf8a88f34fb6e3c4dcfd1919a2c1d4577b2da3960375e216e596d0746cd35` |
+| Recovery memory | 2,959,343 peak working bytes, below the fixed 16-MiB bound |
+| Recovered terminal state | 35,012 records; last sequence 35,011; zero retained owned orders, fill keys, or unresolved orders |
+| Action determinism | Journal SHA-256 `389887a2d044867c6ad1f7b7b9ad52aa58c792864846fc42f220759fac111b85`; logical SHA-256 `4931af3e39ee291db82ba40da7a5e73473431801606565b5ad625c69beb70475` |
+| Parser identity | Fixture SHA-256 `985332384ae2e7b2535c0fa2c214b40862997b0f80c450be87ac108fff9b550b`; projection SHA-256 `588e14caac0d5a38c94f9ee121b0238f084a4e2c57dbcd1c7f8f5f052210e885` |
+| Authorization | `production_order_entry_authorized = false` |
+
+The PM action-path gate used one discarded warm-up and three recorded runs.
+Each run retained 15,000 exact nearest-rank latency samples:
+
+| Recorded run | p50 | p95 | p99 | p99.9 | max |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 22,909 ns | 42,173 ns | 53,660 ns | 75,625 ns | 123,091 ns |
+| 2 | 23,524 ns | 44,463 ns | 56,614 ns | 83,067 ns | 175,758 ns |
+| 3 | 23,467 ns | 43,995 ns | 55,302 ns | 73,943 ns | 158,003 ns |
+
+Every run was below the frozen local regression bounds of `25,000 ns` at p50
+and `250,000 ns` at p99.9. The normalized owner interval requested exactly
+zero allocation calls and zero allocated bytes. It used 58,858,352 reserved
+bytes, below its fixed 64-MiB bound. All five repeated passes returned owned
+orders, fill identities, queues, schedules, and other terminal cardinalities
+to zero. Queue high-water was at most one, with zero drops and zero saturation.
+
+Every recorded run also retained exactly:
+
+- 100,000 external observations;
+- 20,010 internal fact acknowledgements and 120,010 owner reductions;
+- 35,010 measured mutation records;
+- 15,000 quote evaluations, 10,000 quote intents, and 5,000 cancel intents;
+- 5,000 unique fills, 10,000 suppressed duplicate fill rows, and ten watermark
+  advances; and
+- 27,309 overload attempts: 14,633 through nine product-reached rows and
+  12,676 through four sealed mechanism-capacity rows.
+
+The same journal, logical, parser-fixture, and parser-projection hashes were
+present in every run. `production_order_entry_authorized` remained `false`.
+
+### Post-Phase 6 Chaos regression
+
+The Chaos regression campaign used one warm-up followed by three recorded
+runs from `29aefe3348a406da9b00154d61413722b11882ee`:
+
+| Benchmark/component | Recorded median | Phase 0 median | Delta |
+| --- | ---: | ---: | ---: |
+| Engine event loop | 11,827.0 ns/event | 11,783.5 ns/event | +0.37% |
+| Live wire parse/raw record | 2,923.5 ns/unit | 2,948.6 ns/unit | -0.85% |
+| Live dedup/sequence/book | 7,723.4 ns/unit | 7,712.6 ns/unit | +0.14% |
+| Live coordinator/strategy/risk/storage | 4,111.2 ns/unit | 4,137.7 ns/unit | -0.64% |
+| Complete live parity | 17,427.5 ns/unit | 17,635.5 ns/unit | -1.18% |
+
+Every engine run retained exactly 250,000 events and 999,996 intents. Every
+live run retained exactly 50,204 parsed frames, 70,208 feed outputs, 65,130
+storage records, and zero actions. Allocation calls/requested bytes were exact
+in every run: wire `1,673,504 / 158,570,992`; dedup
+`670,868 / 1,349,274,641`; coordinator
+`1,849,399 / 364,106,336`; and complete parity
+`4,193,771 / 1,871,951,969`.
+
+An initially noisy coordinator tail was resolved with a same-host, same-toolchain
+comparison: five warm recorded Phase 0 runs from
+`8d6581270b82f39293ccdb0cbeaead42d717e81c`, immediately followed by five
+warm recorded current runs. The final current results were:
+
+| Action workload | Current p50 | p50 delta | Current p99.9 | p99.9 delta | Exact allocation calls / requested bytes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Quote creation | 19,175 ns | -0.64% | 89,155 ns | -30.60% | 19,733,342 / 836,475,432 |
+| Quote replacement | 12,922 ns | -0.45% | 21,571 ns | -49.34% | 16,600,000 / 773,500,000 |
+| IOC hedge | 24,295 ns | -2.63% | 62,899 ns | -69.92% | 23,433,342 / 1,243,175,432 |
+| Risk rejection | 11,856 ns | -0.96% | 21,308 ns | -35.04% | 15,300,000 / 622,400,000 |
+| Symbol fail-close | 664 ns | +3.75% | 1,509 ns | -49.62% | 1,300,000 / 46,000,000 |
+| Global fail-close | 788 ns | +2.20% | 4,283 ns | +8.76% | 1,600,000 / 52,600,000 |
+| Coordinator reduction | 5,546 ns | -1.18% | 12,644 ns | -1.53% | 3,900,000 / 158,800,000 |
+| Raw recovery | 26,223 ns | +0.25% | 84,437 ns | -9.74% | 21,980,027 / 1,777,312,151 |
+| Trade reprice | 11,905 ns | -0.48% | 21,751 ns | +1.73% | 15,000,264 / 615,207,392 |
+| Bounded storm | 140 ns | 0.00% | 7,713 ns | 0.00% | 0 / 0 |
+
+Every action run preserved its exact logical counters. No median or supported
+tail regressed by more than 10%; the largest positive comparison was global
+fail-close p99.9 at `+8.76%`.
+
+### Evidence exclusions
+
+The PM action timer covers the normalized single-owner path through sealed
+durable-ack evidence and fake prepared quote or cancel effects. Parser work is
+measured separately; filesystem serialization and `fsync` are untimed. The
+combined replay gate exercises local file writing and recovery, not a live PM
+endpoint or account. Neither PM target includes credentials, request signing,
+production network IO, exchange service time, acknowledgement round trips,
+real fills, settlement, or a production quote model.
+
+The Chaos rows retain the row-specific synthetic boundaries described above
+and do not become PM evidence. The overload tests prove fixed local mechanism
+bounds; they are not throughput or deployment-capacity measurements. These
+Phase 6 results establish local structural identity, determinism, allocation
+bounds, and regression control only. They are not a target-host measurement,
+latency SLO, capacity certification, economic validation, production-readiness
+claim, or authorization to enter orders.
+
 ## Missing Target-Host Decision-To-Wire Evidence
 
 These local results are reproducible regression and allocation evidence, not a

@@ -3012,3 +3012,33 @@ legacy fail-close occurrences that were not yet pinned. Test-only commit
 rejection lines to the allowlist; the rerun passed 13/13. This is the accepted
 Phase 6 structural tree. Phase 7 documentation and final workspace gates
 remain pending.
+
+## Phase 7 Checkpoint: Global Test Gate Red
+
+The first Phase 7 global verification attempt on 2026-07-24 is not an
+acceptance gate:
+
+- `cargo fmt --all -- --check` and workspace all-target Clippy with
+  `-D warnings` passed.
+- `cargo test --workspace --locked --no-fail-fast` remained red in eight aged
+  paths across four `reap-pm-live` integration-test binaries:
+  `phase3_active_lane_enactment_contract`,
+  `phase3_reducer_ownership_contract`,
+  `phase3_socket_terminal_evidence`, and `public_route_contract`.
+- Each failure occurs after a synthetic monotonic-clock jump while an earlier
+  asynchronous capture record can still be pending. The new Phase 6
+  500,000,000-ns writer-age policy correctly returns
+  `PmCaptureWriteError::CaptureAged` before the test reaches its intended
+  lane-staleness assertion. The intended correction is a deterministic
+  test-only capture-drain barrier before those clock jumps; the production
+  fail-closed age bound must not be weakened.
+- The same run initially found one transport source-policy wording violation.
+  Comment-only commit `1aa8dc4` removes the venue-protocol term from the
+  generic transport source, and its isolated source-policy target now passes
+  3/3.
+
+The full workspace test has not been rerun or accepted after that correction.
+The locked release build, systemd verification, RustSec audit, final PM
+evidence rerun, deterministic Chaos backtest, and final Chaos benchmark
+campaign also remain pending. Phase 7 is not green, Goal F is not complete,
+and `production_order_entry_authorized` remains `false`.

@@ -505,16 +505,15 @@ observable; it is not one boolean that erases which dependency failed.
 
 ## Canonical Owner And Event Ordering
 
-The complete coordinator and seven-rank scheduler described first in this
-section are the frozen target for Phases 5-6. Through Phase 4, the only
-materialized runtime queue remains the private public lane owned by one active
-capture Run. Phase 4 separately materializes a synchronous fixture-only
-read-monitor owner containing the private/account/reconciliation roles and
-canonical private state by value. That monitor is not a scheduler or an
-alternate producer lane. Persistence, scheduled work, telemetry, journal, and
-fake-effect producers remain prospective.
+The Phase 6 product materializes the complete coordinator and bounded
+seven-rank scheduler. Starting `PmProduct<Model>` moves the active public
+capture/session owner, fixture-only private/account/reconciliation roles,
+canonical PM state, scheduler, journal, and fake-effect boundary under one
+`PmCoordinator<Model>`. The independently constructible public-capture and
+read-only-monitor roots remain non-mutating capability subsets; neither is an
+alternate canonical owner or a path to execution authority.
 
-The future `PmCoordinator<Model>` owns by value:
+`PmCoordinator<Model>` owns by value:
 
 - compact identity/config tables;
 - exact PM books and OKX reference state;
@@ -541,7 +540,7 @@ assigns compact handles as the zero-based `u16` ordinal. The configuration
 fingerprint binds those ordered tables. Handle assignment never depends on
 input declaration order, hash-map iteration, discovery order, or arrival.
 
-The prospective complete scheduler uses this stable seven-input service rank:
+The complete scheduler uses this stable seven-input service rank:
 
 1. stop/safety/control and fake effect results;
 2. persistence acknowledgements required to release or reject an effect;
@@ -564,16 +563,17 @@ account_handle, token_handle, side_rank, local_action_sequence)`. Replay uses
 the captured receive/deadline values and never depends on service time, Tokio
 selection, hash-map traversal, task completion race, or wall time.
 
-The eleven `PmLaneKind`/`PmLanePolicy` rows and the seven service ranks are a
-prospective frozen oracle. Through Phase 4 only the `Public` row is a runtime
-queue. The read-only monitor has no lane, service selector, or producer
-capability. There is no auxiliary/nonpublic scheduler, public general lane
-container, or auxiliary/nonpublic service path. Phase 6 must introduce the
-remaining typed producers and complete by-value scheduler atomically rather
-than exposing part of that oracle as a separately mutable service.
+The eleven `PmLaneKind`/`PmLanePolicy` rows and seven service ranks are
+materialized as the accepted bounded policy. The complete scheduler owns the
+critical, persistence, private, scheduled, public, reconciliation, and
+telemetry lanes by value; the other fixed-capacity rows are retained
+obligation, capture, persistence, effect, and schedule mechanisms owned by the
+same product. The read-only monitor has no lane, service selector, producer
+capability, journal, or fake-effect access. No general lane container or raw
+service selector is exposed to callers.
 
-The generic bounded policy seam is not a connectivity authorizer. Phase 3
-public producers and later private producers bind each delivery to the
+The generic bounded policy seam is not a connectivity authorizer. Public and
+private producers bind each delivery to the
 configured role-issued source/connection route before enqueue. A
 caller-stamped source or ordering tuple alone is not route proof. The Phase 2
 seam preserves typed connection and ordering facts without granting
@@ -644,15 +644,15 @@ the borrowed `PmPublicReadyBookView` returned from
 `PmPublicCaptureRun::ready_pm_book_view()`. The view cannot outlive or be
 mutated independently of its owning run.
 
-Public-lane service is likewise Run authority. The only public service entry
-point is `PmPublicCaptureRun::service_lane_turn`; the
-`PmPublicLaneState::service_turn` implementation is crate-private. There is no
-`PmLaneSet`, general `PmLaneService`, nonpublic turn, or other scheduler path
-in the Phase 3 runtime. Before any current Run-issued Full or Aged evidence
-escapes as an enactable obligation, the Run records the exact typed pending
-obligation. For a state-bearing PM Full/Aged fault it also begins the matching
-pending reducer external fault synchronously, so readiness is unavailable
-while lifecycle enactment is outstanding.
+Public-lane service remains Run authority.
+`PmPublicCaptureRun::service_lane_turn` and the coordinator's sealed product
+ingress are the only reached composition paths;
+`PmPublicLaneState::service_turn` and the complete scheduler internals are
+crate-private. Before any current Run-issued Full or Aged evidence escapes as
+an enactable obligation, the Run records the exact typed pending obligation.
+For a state-bearing PM Full/Aged fault it also begins the matching pending
+reducer external fault synchronously, so readiness is unavailable while
+lifecycle enactment is outstanding.
 
 `PmPublicLaneService` has five mandatory typed callbacks. Service pops one
 exact item, marks consumer transfer in flight, and calls the matching callback
@@ -775,12 +775,11 @@ writer but returns `TerminalTickCleanupIncomplete` while cleanup remains
 pending; after cleanup it still returns the typed terminal non-success. Tick
 drift must never be downgraded to recoverable overflow or staleness.
 
-The following variant rows, service bursts, and capacities are the prospective
-complete-scheduler oracle. Phase 3 implements only the public row, its 256-item
-ordinary burst, and the must-deliver one-at-a-time unavailable rule described
-above.
+The following variant rows, service bursts, and capacities are the implemented
+complete-scheduler contract. The public row retains its 256-item ordinary
+burst and must-deliver one-at-a-time unavailable rule described above.
 
-Stable prospective variant ranks are:
+Stable variant ranks are:
 
 | Lane | Variant order |
 | --- | --- |
@@ -791,18 +790,17 @@ Stable prospective variant ranks are:
 | Public | connection unavailable; market metadata/lifecycle; PM book snapshot; PM book delta/price change; PM BBO; OKX reference |
 | Reconciliation | open orders; order detail; fill page/watermark; collateral; authorization; position |
 
-The future complete scheduler's service turn admits at most 512 critical, 512
+The complete scheduler's service turn admits at most 512 critical, 512
 persistence, 64 private, 16 due scheduled, 256 public, eight reconciliation,
 and one telemetry item in that fixed rank order. If critical work remains
-after its 512-item bounded burst, the future product globally stops before
+after its 512-item bounded burst, the product globally stops before
 servicing lower ranks. Any backlog that breaches its age limit takes the
 lane's fail-closed action rather than changing ordering opportunistically.
 
 ## Bounded Lanes And Saturation
 
-These eleven policy rows are compile-time/config-validation ceilings frozen
-for Goal F. Only the public row is instantiated as scheduler state in Phase 3;
-the other ten remain construction requirements for later phases:
+These eleven policy rows are the implemented compile-time/config-validation
+ceilings frozen for Goal F:
 
 | Lane/state | Capacity | Nominal high-water ceiling | Nominal maximum age | Saturation/age action |
 | --- | ---: | ---: | ---: | --- |
@@ -832,21 +830,22 @@ are derived observations and cannot repair or conceal a raw gap.
 
 ## Target Crate And Dependency Shape
 
-Every existing workspace edge remains unchanged. The exact candidate
-direct-workspace adjacency added by Goal F is:
+No pre-existing dependency edge is removed. The implemented direct-workspace
+adjacency added or mechanically affected by Goal F is:
 
 ```text
 reap-transport -> reap-core
 reap-capture-framing -> -
+reap-benchmark-allocator -> -
 reap-durable-writer -> -
 reap-pm-core -> reap-core
 reap-pm-state -> reap-pm-core
 reap-polymarket-wire -> reap-pm-core
 reap-polymarket-adapter -> reap-pm-core + reap-polymarket-wire + reap-transport
 reap-okx-public-source -> reap-core + reap-transport
-reap-pm-strategy -> reap-pm-core + reap-pm-state
+reap-pm-strategy -> reap-pm-core
 reap-pm-live-contracts -> reap-pm-core + reap-pm-strategy
-reap-pm-live -> reap-capture-framing + reap-durable-writer + reap-okx-public-source + reap-pm-core + reap-pm-live-contracts + reap-pm-state + reap-pm-strategy + reap-polymarket-adapter + reap-transport
+reap-pm-live -> reap-benchmark-allocator + reap-capture-framing + reap-durable-writer + reap-okx-public-source + reap-pm-core + reap-pm-live-contracts + reap-pm-state + reap-pm-strategy + reap-polymarket-adapter + reap-transport
 reap-capture -> reap-book + reap-capture-framing + reap-core + reap-feed + reap-telemetry + reap-venue
 reap-feed -> reap-book + reap-core + reap-transport + reap-venue
 reap-storage -> reap-core + reap-durable-writer
@@ -889,7 +888,16 @@ existing capture/journal fixtures, existing public API compatibility, and the
 canonical Chaos hashes before either PM wrapper is admitted. PM code never
 depends on broad `reap-capture` or `reap-storage`.
 
-The actual production-module inventory in `reap-pm-live` through Phase 4 is:
+`reap-benchmark-allocator` is transparent process-local evidence
+instrumentation. The fixed, zero-input PM evidence runner may read its
+counters, but product composition cannot install, select, or configure an
+allocator. Global installation is confined to the benchmark, combined-replay
+target, and explicit tests.
+
+### Historical Phase 4 module inventory
+
+At the Phase 4 checkpoint, the production-module inventory in
+`reap-pm-live` was:
 
 | Root module | Present private children |
 | --- | --- |
@@ -899,12 +907,11 @@ The actual production-module inventory in `reap-pm-live` through Phase 4 is:
 | `lanes` | `lanes::{bounded,failure,policy,public,service}` |
 | `fake_effect`, `private_monitor`, `public_routes`, `replay`, `schedule` | No child production modules |
 
-Only `lanes::public` is materialized queue state. `lanes::policy` retains the
-prospective eleven-row oracle, but there is no `lanes::scheduled`, general lane
-set, auxiliary scheduler, or nonpublic service path. `private_monitor` owns its
-fixture roles and canonical state synchronously; it is not a queue. Prospective
-Phase 5-7 modules remain in the final Goal F responsibility table below and
-are not claimed to be implemented by this inventory.
+Only `lanes::public` was materialized queue state at that checkpoint.
+`lanes::policy` retained the then-prospective eleven-row oracle, while
+`private_monitor` owned its fixture roles and canonical state synchronously.
+This inventory is retained as phase history, not as the final implementation
+claim.
 
 The supporting Phase 4 inventory is also concrete:
 
@@ -918,7 +925,7 @@ The supporting Phase 4 inventory is also concrete:
 - `reap-pm-live` adds the read-only `private_monitor` without adding
   responsibility to the frozen `capture_roles.rs`.
 
-### Frozen Phase 3 implementation evidence
+### Historical frozen Phase 3 implementation evidence
 
 The final local Phase 3 audit records:
 
@@ -940,10 +947,11 @@ The final local Phase 3 audit records:
 | Static gates | all targets, Clippy `-D warnings`, formatting, and `git diff --check` green |
 
 The 1,500-line source-policy gate includes `reap-pm-core`. The 1,490-line
-`capture_roles.rs` has only ten lines of policy headroom and is frozen after
-Phase 3; it must be split by responsibility before any later-phase growth.
+`capture_roles.rs` had only ten lines of policy headroom and remained frozen
+while later responsibilities were split into focused modules.
 
-The prospective final Goal F responsibility/module DAG remains frozen:
+The then-prospective final Goal F responsibility/module DAG is retained as
+planning history:
 
 | Crate | Production modules admitted in Goal F |
 | --- | --- |
@@ -962,11 +970,9 @@ The prospective final Goal F responsibility/module DAG remains frozen:
 No production module may absorb another row's responsibility to evade the
 1,500-line file or 250-line function review.
 
-The exact prospective final Goal F production-module dependency edges below
-cover all new modules and every existing module whose direct workspace
-dependency changes. They deliberately include later-phase target edges in
-addition to the actual-through-Phase-3 inventory above. Untouched existing
-internal edges remain the Phase 0 baseline:
+The following were the prospective production-module dependency edges at that
+checkpoint. They are planning history rather than an assertion that every
+final file kept the proposed name:
 
 ```text
 reap-transport::supervisor -> bounded + backoff + health + shutdown
@@ -1042,9 +1048,49 @@ reap-pm-live::composition::run_types -> capture + capture_roles + public_routes 
 reap-pm-live::composition::lane_enact -> capture_roles + lanes + public_routes + reap-pm-state::book + reap-polymarket-adapter::public
 ```
 
-Modules with no listed outgoing production edge are leaves. `reap-storage` and
-`reap-capture` retain their existing internal domain/module shape and wrap only
-the corresponding neutral mechanism; their old schemas remain above it.
+In that planning graph, modules with no listed outgoing production edge were
+leaves. `reap-storage` and `reap-capture` retained their existing internal
+domain/module shape and wrapped only the corresponding neutral mechanism;
+their old schemas remained above it.
+
+### Final Phase 6 implementation inventory
+
+The accepted implementation keeps the same responsibility boundaries while
+splitting the large coordinator and evidence work into focused children:
+
+| Root | Final responsibility split |
+| --- | --- |
+| `capture`, `capture_roles` | PM capture schema/validation/writer/verification, venue sessions, reducer freshness, and the sole public capture owner |
+| `composition` | Existing public-capture run plus `composition::product::{public_ingress,run}` for the sibling full product |
+| `coordinator` | Typed input/reduction, private reduction, persistence, take-once authority, bounded effects, recovery, terminal safety, refresh obligations, and product service |
+| `lanes` | Legacy public-lane proof plus complete bounded queue set, deterministic service ordering, failure proofs, and policy |
+| `journal` | PM schema, writer, independent recovery, and deterministic evidence hash |
+| `evidence` | Fixed fixture, workload, parser segment, report, overload cases, and zero-input sealed runner |
+| `private_monitor` | Read-only batch validation, maintenance, canonical fixture state, and projections |
+| `fake_effect`, `public_routes`, `replay`, `schedule` | Narrow fake execution, sealed public routing, combined recovery/replay, and deterministic action scheduling |
+
+The accepted Phase 6 structural inventory on acceptance tree
+`c76ccbd22cb4d25e121ac5bb3bc9b6dcd9e16f47` is:
+
+| Inventory | Final result |
+| --- | --- |
+| Workspace packages / outside-workspace path dependencies | 35 / 0 |
+| Goal F changed/new production sources since `d2593f6d85ce868b46e3c1f16b5a48f221e5e480` | 210 files / 91,664 production-extent lines / 0 files above 1,500 |
+| Goal F normal workspace edges | 22; SHA-256 `8944276c9572f6cb00b7db0830e2189199e979eba57d7189973ea62fc281b29f` |
+| Complete normal workspace adjacency | SHA-256 `63cca672bf23690d042779967d2cb2c12414633924b20d296a269f2e63554c06` |
+| Public declarations | 2,670 lines; SHA-256 `dd59af9df9125e01ab4e58eaa712dd18a8915ea81c8400f038548bb5c3434969` |
+| Schema/version declarations | 48 lines; SHA-256 `e71cc793d56e5ba63199b6c341c97e04ac1ca18e8f68adf3742083de434a3d25` |
+| Production Rust paths | 366; SHA-256 `2a091f16d8e8107bd61f6529fb785581c2e6cd43a509feb9f248d0b78c6a2ee6` |
+| Production content manifest | SHA-256 `387bc4ee0e39ae5ed50438dd8c3cd067002ee3f2ca75170b8726c0a6d345d065` |
+| Production extent stream | SHA-256 `878ee3d325f439891e5cbd0188e5365246e7f3b0b117ebd314fa1bfe6c1847c0` |
+| `Cargo.lock` | SHA-256 `2673d055c943c3bd5444531b67df280026c145cbbbc99b68a06f4ac0c2dbb0ff` |
+
+The largest Goal-F production extent remains `capture_roles.rs` at 1,490
+lines; the next largest are coordinator mutation at 1,466, private monitor at
+1,447, and the PM public-session adapter at 1,440. The source-policy gate keeps
+every Goal-F production file at or below 1,500 lines. Exact replay,
+performance, and gate evidence is in the Goal F handoff rather than duplicated
+as authority here.
 
 The exact constructor reach inside `composition` is narrower than its module's
 full static dependency set:
@@ -1103,10 +1149,13 @@ composition. The narrow OKX public-source crate keeps transitive raw parsing
 private and exposes only the configured reference role.
 
 Allowed shared work is limited to genuinely identical mechanics: common
-venue/source identity, untrusted raw envelopes, bounded transport supervision,
-capture/replay framing, monotonic queue-age carriers, and leased writer
-mechanics. Venue-owned subscription bytes, ACK/login/heartbeat rules, parsing,
-integrity, and capability constructors stay venue-specific.
+venue/source identity, product-specific untrusted raw capture envelopes over
+shared framing, bounded transport supervision, monotonic queue-age carriers,
+and leased writer mechanics. Shared `Venue` does not widen the legacy
+`RawEnvelope`, `EventId`, `FeedStreamId`, or Chaos risk-health keys: those are
+sealed to zero-sized `OkxVenue`, and checked outer bridges reject Polymarket.
+Venue-owned subscription bytes, ACK/login/heartbeat rules, parsing, integrity,
+and capability constructors stay venue-specific.
 
 Do not genericize the f64 Chaos `BookReducer`, OKX gateway, Chaos live config or
 connectivity plan, `LiveCoordinator`, `LiveRuntime`, or the existing
@@ -1119,6 +1168,10 @@ Authorized shared public change:
 - add `Polymarket` to common venue/source identity while preserving the exact
   existing serialized OKX representation and adding explicit fail-closed old-
   product matches.
+- retain common `Venue` at outer `Subscription`, `RawCapture`, and
+  `SystemEvent` boundaries while keeping legacy Chaos `RawEnvelope`,
+  `EventId`, `FeedStreamId`, and risk-health keys statically `OkxVenue`-only.
+  Checked conversion rejects Polymarket before the legacy feed.
 - export from `reap-transport` only the concrete bounded supervision,
   backoff/health, shutdown, and typed immutable-delivery mechanics needed by
   both venue-owned protocols.
@@ -1443,6 +1496,26 @@ unbounded retry or state growth. Every state-bearing case reaches exactly one
 declared fail-closed/resync transition; telemetry reaches none. Synthetic
 monotonic-time tests exercise every state-bearing declared age boundary with
 the same fail-closed outcome as capacity saturation.
+
+### Accepted local measurement result
+
+Phase 6 accepted this contract on the credential-free local evidence tree
+`e11d51bfebe157b31d6f6d8ee8a8c4981f6c8768`; the structural acceptance tree
+`c76ccbd22cb4d25e121ac5bb3bc9b6dcd9e16f47` changes only an exact
+source-policy allowlist.
+
+| Evidence | Accepted result |
+| --- | --- |
+| `combined_replay` | 13/13; 35,012 lines and 22,791,589 bytes; artifact SHA-256 `83ced509c9ea180e66d957853f9ff7762ef3c0babc316c9251c12d4d1a5224eb`; two recovery projections byte-identical at `f98bf8a88f34fb6e3c4dcfd1919a2c1d4577b2da3960375e216e596d0746cd35` |
+| Recovery memory | 2,959,343 peak working bytes, below 16 MiB; zero terminal orders, fill keys, or unresolved orders |
+| `pm_action_path` | One warm-up plus three recorded runs; p50 `22,909 / 23,524 / 23,467 ns`; p99.9 `75,625 / 83,067 / 73,943 ns` |
+| Owner/memory | Zero owner allocation calls/bytes; 58,858,352 reserved bytes, below 64 MiB; five repeated passes return all terminal cardinalities to zero |
+| Safety/determinism | Exact nominal and 27,309 overload counters; zero nominal drops/saturation; journal SHA-256 `389887a2d044867c6ad1f7b7b9ad52aa58c792864846fc42f220759fac111b85`; logical SHA-256 `4931af3e39ee291db82ba40da7a5e73473431801606565b5ad625c69beb70475` |
+| Authorization | `production_order_entry_authorized = false` |
+
+These results are same-host structural and regression evidence. They are not a
+latency SLO, venue-capacity certification, target-host result, live
+connectivity proof, production economics validation, or trading authorization.
 
 ## Provenance And Known Reference Defects
 

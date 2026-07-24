@@ -64,12 +64,14 @@ This scope remains pinned to the supported call path in the clean
 | Build/supply chain | Rust `1.95.0` is pinned; least-privilege CI checks formatting, all-target lint, all workspace tests, a locked release build, and RustSec advisories; Cargo and Actions updates are proposed weekly | CI must remain green and dependency updates reviewed, but this does not replace credentialed exchange or target-host evidence |
 | Exchange certification | Point-in-time account certification, journal-bound process-death deadman replay, exact fill/bill collection, and offline normal-trade/funding economics are implemented, but no passing target-account artifact, OKX demo soak, economic artifact, deadman artifact, or broader fault campaign is recorded | Production blocker |
 
-## Polymarket Foundation Status (Goal F In Progress)
+## Polymarket Foundation Status (Goal F Phase 6 Green)
 
-Goal F is still being executed. Its Phase 6 evidence and Phase 7 global
-verification/handoff have not been accepted at this review point. The status
-below classifies the currently implemented PM mechanics; it is not a Goal F
-completion claim and grants no demo, live, or production trading authority.
+Goal F Phase 6 is **GREEN** on accepted local structural, deterministic replay,
+allocation, memory-bound, and performance-regression evidence. Phase 7
+documentation, global workspace verification, and final handoff remain a
+separate completion gate. The status below classifies the implemented PM
+mechanics and the accepted Phase 6 evidence; it grants no credentialed access,
+demo trading, live trading, or production trading authority.
 
 ### Implemented credential-free and offline mechanics
 
@@ -81,14 +83,20 @@ completion claim and grants no demo, live, or production trading authority.
 | Private and account mechanics | Private order/fill lifecycle, open-order and order-detail reconciliation, fill-watermark handling, collateral, outcome-token inventory, allowance, position, and snapshot convergence are implemented through owner-bound fixture/fake deliveries. | This is offline convergence evidence only. No authenticated private stream, account endpoint, or real Polymarket snapshot has entered the product. |
 | Quote-model seam | A statically supplied pure model consumes exact OKX reference state and PM readiness state, and quote policy performs the checked side-aware conversion to an exact passive candidate. The only concrete model is explicitly a deterministic fixture model. | The dataflow seam is implemented. There is no default or approved production fair-probability, spread, size, inventory, fee, liquidity, or risk model. |
 | Order lifecycle | Exact candidate approval, reservation, durable intent/fact journaling, recovery, ownership proof, prepared effects, results, fills, duplicate suppression, and owned cancellation are represented for one fixed GTC post-only profile. Only the in-process `PmFixtureOwnedExecution` fake consumes place or cancel effects. | PM order mutation is fake-only. `ApprovedPmQuote` and `ApprovedPmCancel` are local invariant proofs, not exchange credentials or trading approval. |
-| Coordinator and evidence | One mutation owner, bounded lanes, deterministic priority, fail-closed saturation/age behavior, local replay, and action-path evidence machinery are present. Phase 6 validation remains in progress and its timing boundary excludes network, authentication, exchange service, and other target-host effects. | This can establish local structural and regression properties only; it cannot establish live latency, venue behavior, or operational readiness. |
-| Authorization | PM evidence fixes `production_order_entry_authorized` to `false`, and the PM product exposes no live mutation constructor. | No PM demo, live, or production order entry is authorized. |
+| Coordinator and evidence | One mutation owner, bounded lanes, deterministic priority, fail-closed saturation/age behavior, exact local replay, and action-path evidence are Phase 6 green. Three recorded action runs met the local `25,000 ns` p50 and `250,000 ns` p99.9 regression bounds with zero owner allocations, 58,858,352 reserved bytes below 64 MiB, exact logical/hash identity, and zero drops or saturation. | This establishes local structural, determinism, bounded-memory, and regression properties only. It does not establish live latency, venue behavior, economics, deployment capacity, or operational readiness. |
+| Authorization | Both accepted PM evidence targets fix `production_order_entry_authorized = false`, and the PM product exposes no live mutation constructor. | No PM demo, live, or production order entry is authorized. |
 
 ### PM trading gates that remain open
 
+The remaining blockers are intentionally explicit: credentialed identity and
+signing, live connectivity, a production quote/order model, calibrated
+economics and risk, settlement, operations, target-account evidence, controlled
+live trials, and independent approval all remain absent.
+
 | Required gate | Missing implementation or evidence |
 | --- | --- |
-| Production quote and order model | Define, review, backtest, and independently validate the fair-probability transformation from OKX reference state and PM market state; passive spread and size policy; inventory and concentration limits; fees/rebates; queue, fill, adverse-selection, and slippage assumptions; resolution/settlement value treatment; stale/reference-failure behavior; and capital-at-risk limits. The fixture threshold/model is not economic evidence. |
+| Production quote and order model | Define, review, backtest, and independently validate the fair-probability transformation from OKX reference state and PM market state; exact supported order semantics; passive spread and size policy; inventory response; quote replacement/cancellation behavior; and stale/reference-failure behavior. The deterministic fixture threshold/model and fixed fake GTC post-only profile are not a production strategy or order model. |
+| Economics and risk calibration | Establish fees/rebates, queue and fill assumptions, adverse selection, slippage, liquidity and market-impact limits, inventory and concentration limits, capital-at-risk limits, collateral utilization, loss limits, and resolution-value treatment from representative data. Require reproducible backtests, stress tests, and a reviewed acceptance decision. No current local replay or latency artifact is economic evidence. |
 | Authentication and signer boundary | Add a separately reviewed least-authority key-custody and signing design, current CLOB domain/order-signature rules, API credential derivation/use, authenticated-session construction, secret redaction/rotation, and signer/funder/signature-type verification. Existing signer and funder identities are non-secret scope values only; there is no signer implementation, key loader, authentication-header builder, or signed-request path. |
 | Live connectivity | Add and qualify the exact required PM public, private, account, reconciliation, place, and owned-cancel endpoint connectors without introducing a broad client escape. There is no production PM REST/WS client, authenticated private session, live execution gateway, deployed PM binary, or service composition. Public parser/session state does not by itself prove an endpoint connection. |
 | Settlement and on-chain operations | Define and implement the supported fill-settlement and market-resolution lifecycle, then separately review any required collateral allowance or ERC-1155 operator-approval mutation, transfers, split/merge, redemption, bridge, or withdrawal behavior. The current fill settlement-state reducer is observational only and performs none of these operations. |
@@ -100,6 +108,7 @@ completion claim and grants no demo, live, or production trading authority.
 The safe current interpretation is public-protocol/capture/replay and offline
 fixture validation plus in-process fake execution only. Real credentials,
 authenticated PM access, and real order mutation must remain disconnected.
+`production_order_entry_authorized = false` is mandatory.
 The existing Chaos/OKX readiness material and its separate gates are unchanged
 and do not transfer approval to the PM product.
 

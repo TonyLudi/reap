@@ -53,9 +53,9 @@ phase status and evidence are recorded separately in
 The PM wire and fixture reference is only the reached tracked source at
 `../predarb` commit `8222273a9c72033b760e1d2fec813bc77144556d`; Reap neither
 depends on that checkout nor adopts its application/runtime architecture.
-This section records architecture and authority boundaries, not a claim that
-the Phase 6 evidence gate, authenticated PM connectivity, a production quote
-model, or trading approval is complete.
+The Phase 6 local architecture/evidence gate is green. This section does not
+claim authenticated PM connectivity, an approved production quote model,
+target-host qualification, venue capacity, or trading approval.
 
 ## Goals
 
@@ -149,7 +149,7 @@ exchange interface.
 
 | Layer | Current crates | Boundary |
 | --- | --- | --- |
-| Venue-neutral substrate | `reap-core`, `reap-transport`, `reap-capture-framing`, `reap-durable-writer` | Common source identity and typed envelopes, bounded delivery/supervision, JSONL framing/verification, and leased bounded-writer mechanics. These crates do not define PM economics, venue lifecycle, credentials, or order authority. |
+| Shared substrate mechanics | `reap-core`, `reap-transport`, `reap-capture-framing`, `reap-durable-writer` | Common source identity, product-specific typed envelopes, bounded delivery/supervision, JSONL framing/verification, and leased bounded-writer mechanics. These crates do not make every legacy carrier multi-venue or define PM economics, venue lifecycle, credentials, or order authority. |
 | Chaos/OKX product | `reap-strategy`, `reap-engine`, `reap-order`, `reap-live-contracts`, `reap-live`, and the role-specific OKX crates | The existing Chaos/iarb2 strategy, `f64` model state, regular-order profiles, authenticated OKX roles, and normal/evidence/emergency authority planes remain governed by the Chaos boundary. |
 | Polymarket product | `reap-pm-core`, `reap-pm-state`, `reap-polymarket-wire`, `reap-polymarket-adapter`, `reap-pm-strategy`, `reap-pm-live-contracts`, and `reap-pm-live` | Exact PM identity/numerics, PM protocol semantics, sealed capability roles, a static quote-model seam, PM reducers, and a sibling composition root. The existing Chaos live, contract, and order crates do not depend on these crates. |
 | PM use of OKX public data | `reap-okx-public-source` | One narrow credential-free `index-tickers` source for configured reference instruments. It exposes no OKX private, account, reconciliation, signer, submit, or cancel capability. |
@@ -159,6 +159,12 @@ Venue-specific sequence rules, metadata, exact numbers, order lifecycles,
 readiness, and wire types stay in their concrete product crates. In particular,
 the existing `VenueAdapter`-shaped Chaos/OKX surface is not the template for
 Polymarket.
+
+Shared `Venue` and framing mechanics do not make every envelope multi-venue.
+`RawCapture` and PM typed envelopes preserve common venue identity. Legacy
+Chaos `RawEnvelope`, `EventId`, `FeedStreamId`, and feed/private-health state
+are statically sealed to the zero-sized `OkxVenue`; conversion from a common
+capture or health event is checked and fails closed for Polymarket.
 
 There is no universal exchange adapter, dynamic venue/plugin registry, broad
 command union, or runtime-selected venue object. PM roles are concrete or
@@ -380,7 +386,7 @@ reap/
 
 | Crate | Current responsibility and authority boundary |
 | --- | --- |
-| `reap-core` | Shared primitive types, common venue/source identity, normalized Chaos events, clocks, and pure host/pacing policy; no PM executable numerics or IO authority. |
+| `reap-core` | Shared primitive types and common `Venue`/source identity, plus normalized Chaos events and the zero-sized `OkxVenue` used by legacy OKX-only carriers; no PM executable numerics or IO authority. |
 | `reap-transport` | Venue-neutral bounded delivery, reconnect/backoff, supervision, health, and cooperative shutdown mechanics; no venue protocol, parser, or command authority. |
 | `reap-capture-framing` | Shared bounded JSONL framing, hashing, regular-file checks, and verification mechanics used beneath product capture schemas. |
 | `reap-benchmark-allocator` | Process-local allocation accounting for explicit evidence and benchmark entry points; no venue, strategy, or mutation authority. |
@@ -394,7 +400,7 @@ reap/
 | `reap-pm-live` | Sibling PM public capture/replay, read-only monitor, deterministic lanes, one-owner coordinator, exact journal, and fake-only quote/cancel lifecycle. |
 | `reap-okx-public-source` | Narrow credential-free OKX index-ticker source used by the PM product; no OKX private/account/order role. |
 | `reap-venue` | Existing credential-free Chaos/OKX protocol/parsing, exact OKX metadata, and connectivity keys; no signer or authenticated client, and not a universal PM adapter. |
-| `reap-feed` | Public/private socket supervision, subscription readiness, deduplication, sequencing, book arbitration, and recovery. |
+| `reap-feed` | Legacy Chaos/OKX public/private socket supervision, subscription readiness, deduplication, sequencing, book arbitration, and recovery; checked outer planning/capture bridges reject PM input. |
 | `reap-fault` | Separate loopback-only deterministic demo fault proxy; never a live strategy sidecar or production gateway. |
 | `reap-book` | Single-owner book reduction and quality state usable by live and backtest. |
 | `reap-order` | Chaos/OKX linear regular-order policy, canonical reservation/ownership, idempotent preparation, pacing, and order reduction; no PM profile or raw transport. |
@@ -405,7 +411,7 @@ reap/
 | `reap-evidence-core` | Credential-free read-only evidence ports, allowlists, and response contracts; no transport or mutation method. |
 | `reap-okx-evidence-adapter` | Authenticated read-only OKX evidence implementation composed outside live; no submit, cancel, or arbitrary request method. |
 | `reap-okx-emergency-adapter` | Separate account-wide regular/algo/spread stop and deadman roles; no submit, amend, transfer, withdrawal, or arbitrary path. |
-| `reap-risk` | Deterministic pre/post-trade risk, readiness, exposure, and fail-closed transitions. |
+| `reap-risk` | Deterministic Chaos pre/post-trade risk, readiness, exposure, and fail-closed transitions; legacy feed/private-health keys are `OkxVenue`-sealed and PM health cannot mutate them. |
 | `reap-strategy` | Pure Chaos/iarb2 state and decision logic, including private deterministic scheduled actions; no IO or global state. |
 | `reap-engine` | Production strategy/risk decision owner plus test-only initialized parity harness support. |
 | `reap-backtest` | Deterministic replay, scheduling, matching, accounting, and research; depends on pure live contracts, not the live runtime. |
@@ -460,8 +466,8 @@ not widen its legacy `VenueAdapter` surface.
 
 Responsibilities:
 
-- Venue traits and raw websocket envelopes already required by the Chaos/OKX
-  call path.
+- Venue traits and legacy OKX-only raw websocket envelopes already required by
+  the Chaos/OKX call path.
 - OKX protocol parsing and normalized Chaos event construction.
 - Normalization from exchange payloads into `reap-core` events.
 - Venue-specific sequence, checksum, and channel semantics.
@@ -1690,9 +1696,10 @@ actual rollout governance remain outside this composition. Funding's bill-report
 checked against same-session public observations, but the exact internal
 assessment tick cannot be reproduced externally.
 
-## Multi-Websocket Design
+## Legacy Chaos/OKX Multi-Websocket Design
 
-Each exchange adapter should describe its channels:
+The legacy Chaos/OKX adapter describes its channels at the common outer
+planning boundary:
 
 ```rust
 pub struct Subscription {
@@ -1720,19 +1727,24 @@ acknowledgement for another instrument. This follows pinned Java
 selected by the returned `WsSubArg`, while making malformed and unexpected
 success frames explicitly fail closed.
 
-Every raw message gets an envelope:
+After checked OKX narrowing, every raw message entering the legacy feed gets
+this envelope:
 
 ```rust
 pub struct RawEnvelope {
-    pub venue: Venue,
+    pub venue: OkxVenue,
     pub conn_id: ConnId,
     pub channel: Channel,
     pub symbol: Option<Symbol>,
-    pub recv_ts_ns: i64,
+    pub recv_ts_ns: u64,
     pub raw_hash: u64,
-    pub payload: Bytes,
+    pub payload: String,
 }
 ```
+
+This envelope belongs to the legacy Chaos/OKX feed pipeline. A venue-tagged
+`RawCapture` must pass a checked OKX conversion before entering it; PM uses its
+own typed event and capture schemas.
 
 The adapter parses raw payloads into normalized candidate events. Global dedup
 classifies exact redundant images for reporting, but every book image also passes
