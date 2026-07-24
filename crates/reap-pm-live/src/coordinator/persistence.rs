@@ -269,6 +269,10 @@ impl PmPersistenceQueue {
         self.push_retaining(pending).map_err(|(error, _)| error)
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "fail-closed admission returns the exact move-only pending record without heap allocation"
+    )]
     pub(crate) fn push_retaining(
         &mut self,
         pending: PmPendingPersistence,

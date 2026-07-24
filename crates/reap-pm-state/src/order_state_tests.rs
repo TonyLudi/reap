@@ -256,15 +256,15 @@ fn canonical_entries(state: &PmOrderState) -> Vec<OrderEntry> {
     state.canonical_entries().copied().collect()
 }
 
-fn canonical_decision_oracle(
-    state: &PmOrderState,
-) -> (
+type CanonicalDecisionProjection = (
     bool,
     Option<PmOrderIdentity>,
     Result<(U256, U256), PmReservationTotalsError>,
     u16,
     u16,
-) {
+);
+
+fn canonical_decision_oracle(state: &PmOrderState) -> CanonicalDecisionProjection {
     let mut unmanaged_ambiguity = false;
     let mut first_unknown = None;
     let mut totals = Ok((U256::ZERO, U256::ZERO));

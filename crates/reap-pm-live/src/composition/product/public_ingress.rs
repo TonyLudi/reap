@@ -24,6 +24,10 @@ pub enum PmProductPublicIngressOutcome<T, U> {
 
 /// Failure while normalizing/reducing public ingress or enacting the exact
 /// authenticated lane failure returned by that same operation.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "public ingress retains exact move-only run and enactment failures without a hidden allocation"
+)]
 #[derive(Debug)]
 pub enum PmProductPublicIngressError<D> {
     Run(PmPublicCaptureRunError),

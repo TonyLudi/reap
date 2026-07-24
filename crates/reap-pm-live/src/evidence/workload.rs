@@ -606,7 +606,7 @@ impl EvidenceRun {
                 venue,
                 durability,
                 allocation.as_deref_mut(),
-                action_latencies.as_deref_mut(),
+                action_latencies,
                 effects,
                 input_mix,
                 excluded_elapsed_ns,
@@ -616,7 +616,7 @@ impl EvidenceRun {
             self.run_fill_cycle(
                 venue,
                 durability,
-                allocation.as_deref_mut(),
+                allocation,
                 effects,
                 input_mix,
                 excluded_elapsed_ns,
@@ -632,6 +632,10 @@ impl EvidenceRun {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the evidence cycle keeps allocation, latency, effects, counters, and excluded-time accounting explicit"
+    )]
     async fn run_cancel_cycle(
         &mut self,
         venue: PmVenueOrderKey,
@@ -732,7 +736,7 @@ impl EvidenceRun {
         input_mix.fill_order_detail_absences =
             input_mix.fill_order_detail_absences.saturating_add(1);
         let watermark_advanced =
-            self.apply_paired_fill(allocation.as_deref_mut(), effects, excluded_elapsed_ns)?;
+            self.apply_paired_fill(allocation, effects, excluded_elapsed_ns)?;
         input_mix.paired_reconciliations = input_mix.paired_reconciliations.saturating_add(1);
         if watermark_advanced {
             let acknowledgement_ns = self.cursor.next_time();

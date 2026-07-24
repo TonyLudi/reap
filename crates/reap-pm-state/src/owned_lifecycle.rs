@@ -1010,6 +1010,10 @@ impl PmOwnedQuoteAdmissionPlan {
     }
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "owned-order admission carries the prebuilt entry inline to keep the owner loop allocation-free"
+)]
 enum PmOwnedQuoteAdmissionAction {
     None,
     CountDuplicateQuote,

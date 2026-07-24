@@ -87,7 +87,7 @@ fn order_envelope(
     sequence: u64,
     ordinal: usize,
 ) -> EventEnvelope<PmOrderEvent> {
-    let identity = if ordinal % 2 == 0 {
+    let identity = if ordinal.is_multiple_of(2) {
         PmOrderIdentity::new(Some(client_order(account, ordinal)), None)
             .expect("fixed client-only identity")
     } else {
@@ -150,7 +150,7 @@ fn measure_owned_lifecycle_indexes(window: &mut MeasurementWindow) {
                 instrument,
                 client,
                 intent,
-                if index % 2 == 0 {
+                if index.is_multiple_of(2) {
                     PmOrderSide::Buy
                 } else {
                     PmOrderSide::Sell

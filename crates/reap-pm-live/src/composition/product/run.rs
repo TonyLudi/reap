@@ -552,6 +552,10 @@ pub enum PmProductPublicAgedRetryReason {
 ///
 /// `NotPublicAged` and `Retryable` retain the exact move-only scheduler error.
 /// Call [`PmProductPublicAgedEnactError::into_run_failure`] to recover it.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "public-age enactment retains exact move-only retry and lane failures without a hidden allocation"
+)]
 #[derive(Debug)]
 pub enum PmProductPublicAgedEnactError {
     NotPublicAged {

@@ -24,7 +24,7 @@ pub(crate) const MAX_REPLAY_WORKING_BYTES: usize = 16 * 1_024 * 1_024;
 pub(crate) const FIXTURE_REVISION: &str = "goal-f-phase6-option1-v1";
 
 pub(crate) const fn is_cancel_cycle(cycle: usize) -> bool {
-    cycle % 2 == 1
+    !cycle.is_multiple_of(2)
 }
 
 #[cfg(test)]
@@ -38,7 +38,7 @@ pub(crate) const fn fill_ordinal(cycle: usize) -> Option<usize> {
 
 #[cfg(test)]
 pub(crate) const fn advances_watermark(cycle: usize) -> bool {
-    cycle % 1_000 == 0
+    cycle.is_multiple_of(1_000)
 }
 
 #[cfg(test)]

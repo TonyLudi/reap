@@ -414,27 +414,6 @@ impl Phase6RefreshAllocationProbe {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::PmRefreshObligations;
-
-    #[test]
-    fn empty_age_observation_keeps_age_metrics_stable_without_a_ticket_scan() {
-        let mut obligations = PmRefreshObligations::new();
-        obligations.oldest_in_flight_age_ns = 7;
-        obligations.maximum_observed_age_ns = 11;
-
-        assert_eq!(
-            obligations
-                .observe_age_and_expired_index(1)
-                .expect("an empty refresh set cannot regress a retained ticket clock"),
-            None
-        );
-        assert_eq!(obligations.oldest_in_flight_age_ns, 0);
-        assert_eq!(obligations.maximum_observed_age_ns, 11);
-    }
-}
-
 impl<M: PmQuoteModel> PmCoordinator<M> {
     pub(crate) fn refresh_obligation_metrics(&self) -> PmRefreshObligationMetrics {
         let counters = self.mutation.refresh_counters();
@@ -582,5 +561,26 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
             .record_retry(index, monotonic_service_ns);
         self.counters.refresh_effects = self.counters.refresh_effects.saturating_add(1);
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PmRefreshObligations;
+
+    #[test]
+    fn empty_age_observation_keeps_age_metrics_stable_without_a_ticket_scan() {
+        let mut obligations = PmRefreshObligations::new();
+        obligations.oldest_in_flight_age_ns = 7;
+        obligations.maximum_observed_age_ns = 11;
+
+        assert_eq!(
+            obligations
+                .observe_age_and_expired_index(1)
+                .expect("an empty refresh set cannot regress a retained ticket clock"),
+            None
+        );
+        assert_eq!(obligations.oldest_in_flight_age_ns, 0);
+        assert_eq!(obligations.maximum_observed_age_ns, 11);
     }
 }
