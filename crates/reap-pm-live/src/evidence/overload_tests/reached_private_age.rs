@@ -24,6 +24,9 @@ fn separate_private_age_episodes_retain_and_complete_the_newer_refresh_requireme
             super::super::ReachedOverloadProfile::Standard,
         )
         .await;
+        let initial_gate = run.telemetry_overload_state();
+        assert!(!initial_gate.reconciliation_gate());
+        assert!(!initial_gate.reconciliation_recovered());
         let maximum_age_ns = PmLanePolicy::for_lane(PmLaneKind::Private)
             .maximum_age_ns()
             .expect("private lane has a fixed age");
@@ -102,6 +105,9 @@ fn separate_private_age_episodes_retain_and_complete_the_newer_refresh_requireme
         assert_eq!(superseded.duplicate_or_superseded_admissions(), 1);
         assert_eq!(run.halt(), None);
         assert_eq!(run.mutation_halt(), None);
+        let awaiting_reconciliation = run.telemetry_overload_state();
+        assert!(awaiting_reconciliation.reconciliation_gate());
+        assert!(!awaiting_reconciliation.reconciliation_recovered());
 
         let second_drain = run
             .service_turn(second_fault_ns)
@@ -118,6 +124,15 @@ fn separate_private_age_episodes_retain_and_complete_the_newer_refresh_requireme
         assert_eq!(advanced.external_ingress_admissions(), 2);
         assert_eq!(advanced.external_ingress_effects(), 2);
         assert_eq!(advanced.external_ingress_completions(), 1);
+        let recovered_with_newer_refresh_pending = run.telemetry_overload_state();
+        assert!(
+            recovered_with_newer_refresh_pending.reconciliation_gate(),
+            "the first recovery must not clear the gate while the newer refresh remains in flight"
+        );
+        assert!(
+            recovered_with_newer_refresh_pending.reconciliation_recovered(),
+            "the first applied reconciliation records recovery while the gate remains closed"
+        );
 
         super::super::complete_reached_overload_reconciliation(&mut run, 2, &[])
             .await
@@ -128,6 +143,9 @@ fn separate_private_age_episodes_retain_and_complete_the_newer_refresh_requireme
         assert_eq!(completed.external_ingress_admissions(), 2);
         assert_eq!(completed.external_ingress_effects(), 2);
         assert_eq!(completed.external_ingress_completions(), 2);
+        let cleared_gate = run.telemetry_overload_state();
+        assert!(!cleared_gate.reconciliation_gate());
+        assert!(!cleared_gate.reconciliation_recovered());
         assert_eq!(run.halt(), None);
         assert_eq!(run.mutation_halt(), None);
         let _ = run.shutdown().await;

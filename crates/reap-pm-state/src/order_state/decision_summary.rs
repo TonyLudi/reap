@@ -41,6 +41,15 @@ impl PmOrderDecisionSummary {
 
 impl PmOrderState {
     pub(crate) fn decision_summary(&self) -> PmOrderDecisionSummary {
+        if self.live_count == 0 {
+            return PmOrderDecisionSummary {
+                unmanaged_ambiguity: false,
+                first_unknown_reservation: None,
+                reservation_totals: Ok((U256::ZERO, U256::ZERO)),
+                live_count: 0,
+                unresolved_count: 0,
+            };
+        }
         let (dense_summary, canonical_required) = summarize(self.entries.iter());
         if canonical_required {
             summarize(self.canonical_entries()).0

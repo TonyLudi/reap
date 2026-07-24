@@ -1,19 +1,152 @@
 use reap_pm_core::{
-    PmAccountHandle, PmClientOrderId, PmClientOrderKey, PmInstrumentHandle, PmMarketHandle,
-    PmOrderIdentity, PmOrderSide, PmPrice, PmQuantity, PmTokenHandle, PmVenueOrderId,
-    PmVenueOrderKey, U256,
+    ConnectionEpoch, EventClock, EventEnvelope, EventOrdering, EvmAddress, IngressSequence,
+    MAX_REQUIRED_SPENDERS, PmAccountHandle, PmAccountScope, PmAssetId, PmChainId, PmClientOrderId,
+    PmClientOrderKey, PmConditionId, PmConnectionId, PmEnvironmentId, PmExactOrderDetail,
+    PmFunderId, PmInstrumentHandle, PmMarketHandle, PmMarketId, PmMarketLifecycle,
+    PmMarketMetadata, PmOrderEvent, PmOrderIdentity, PmOrderProgress, PmOrderSide, PmOrderStatus,
+    PmOutcomeLabel, PmOutcomeMetadata, PmPrice, PmProductSource, PmQuantity,
+    PmReconciliationRequestBoundary, PmSignerId, PmSnapshotEvidence, PmSourceHandle,
+    PmSpenderDomain, PmSpenderRequirement, PmTick, PmTokenHandle, PmTokenId, PmVenueOrderId,
+    PmVenueOrderKey, SnapshotRevision, U256,
 };
 
 use super::{
-    MAX_PM_PRIVATE_ORDERS, OrderEntry, OrderOverlap, OwnershipState, PmOrderState,
+    MAX_PM_PRIVATE_ORDERS, OrderEntry, OrderOverlap, OwnershipState, PmOrderApply, PmOrderState,
     PmOrderStateError, PmReservationKnowledge, PmReservationTotalsError, compare_entries,
 };
+use crate::private_config::PmPrivateStateConfig;
 
 const ACCOUNT: PmAccountHandle = PmAccountHandle::from_ordinal(7);
 const INSTRUMENT: PmInstrumentHandle = PmInstrumentHandle::new(
     PmMarketHandle::from_ordinal(11),
     PmTokenHandle::from_ordinal(13),
 );
+
+fn detail_test_address(byte: u8) -> EvmAddress {
+    EvmAddress::from_bytes([byte; 20]).unwrap()
+}
+
+fn detail_test_scope() -> PmAccountScope {
+    PmAccountScope::new(
+        PmEnvironmentId::new("order-state-test").unwrap(),
+        PmChainId::new(137).unwrap(),
+        PmSignerId::new(detail_test_address(1)),
+        PmFunderId::new(detail_test_address(2)),
+        ACCOUNT,
+    )
+}
+
+fn detail_test_source() -> PmProductSource {
+    PmProductSource::polymarket_account(PmSourceHandle::from_ordinal(4), ACCOUNT)
+}
+
+fn detail_test_config() -> PmPrivateStateConfig {
+    let chain = PmChainId::new(137).unwrap();
+    let exchange = EvmAddress::parse("0xE111180000d2663C0091e4f400237545B87B996B").unwrap();
+    let token = PmTokenId::new(U256::from_u64(123)).unwrap();
+    let collateral = PmAssetId::collateral(
+        EvmAddress::parse("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB").unwrap(),
+    );
+    let outcome = PmAssetId::outcome(
+        EvmAddress::parse("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045").unwrap(),
+        token,
+    );
+    let mut spenders = [None; MAX_REQUIRED_SPENDERS];
+    spenders[0] = Some(PmSpenderRequirement::new(
+        chain,
+        exchange,
+        PmSpenderDomain::Standard,
+        collateral,
+    ));
+    spenders[1] = Some(PmSpenderRequirement::new(
+        chain,
+        exchange,
+        PmSpenderDomain::Standard,
+        outcome,
+    ));
+    let metadata = PmMarketMetadata::new(
+        PmConditionId::parse("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap(),
+        PmMarketId::parse("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .unwrap(),
+        PmOutcomeMetadata::new(token, PmOutcomeLabel::new("YES").unwrap()),
+        PmMarketLifecycle::new(true, false, false, true, true),
+        PmTick::parse_decimal("0.01").unwrap(),
+        PmQuantity::parse_decimal("1").unwrap(),
+        false,
+        chain,
+        exchange,
+        spenders,
+        2,
+    )
+    .unwrap();
+    PmPrivateStateConfig::new(
+        detail_test_source(),
+        detail_test_scope(),
+        INSTRUMENT,
+        metadata,
+    )
+    .unwrap()
+}
+
+fn detail_test_boundary(request: u64, completion: u64) -> PmReconciliationRequestBoundary {
+    PmReconciliationRequestBoundary::new(
+        IngressSequence::new(request),
+        IngressSequence::new(completion),
+    )
+    .unwrap()
+}
+
+fn detail_test_envelope(
+    revision: u64,
+    request: u64,
+    completion: u64,
+    requested_order: PmVenueOrderKey,
+    order: Option<PmOrderEvent>,
+) -> EventEnvelope<PmExactOrderDetail> {
+    let detail = PmExactOrderDetail::new(
+        detail_test_source(),
+        detail_test_scope(),
+        PmSnapshotEvidence::new(SnapshotRevision::new(revision)).unwrap(),
+        detail_test_boundary(request, completion),
+        requested_order,
+        order,
+    )
+    .unwrap();
+    EventEnvelope::new(
+        detail_test_source().venue(),
+        detail_test_source(),
+        PmConnectionId::new("order-state-detail-test").unwrap(),
+        EventClock::new(None, 1_000 + completion, completion, completion).unwrap(),
+        EventOrdering::new(
+            ConnectionEpoch::new(1),
+            Some(SnapshotRevision::new(revision)),
+            None,
+            None,
+            IngressSequence::new(completion),
+        )
+        .unwrap(),
+        detail,
+    )
+    .unwrap()
+}
+
+fn detail_test_open_order(venue_order: PmVenueOrderKey) -> PmOrderEvent {
+    PmOrderEvent::new(
+        detail_test_source(),
+        INSTRUMENT,
+        PmOrderIdentity::new(None, Some(venue_order)).unwrap(),
+        PmOrderSide::Buy,
+        PmPrice::parse_decimal("0.40").unwrap(),
+        PmOrderProgress::new(
+            PmQuantity::parse_decimal("1").unwrap(),
+            U256::ZERO,
+            PmOrderStatus::Open,
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
 
 fn client(ordinal: usize) -> PmClientOrderKey {
     let mut bytes = [0_u8; 16];
@@ -112,6 +245,11 @@ fn assert_strictly_ordered(state: &PmOrderState) {
             entry.identity.client_order_key().is_some()
         );
     }
+    assert_eq!(
+        usize::from(state.live_count),
+        state.entries.iter().filter(|entry| entry.is_live()).count(),
+        "the exact live-row scalar must match the dense rows"
+    );
 }
 
 fn canonical_entries(state: &PmOrderState) -> Vec<OrderEntry> {
@@ -178,6 +316,109 @@ fn assert_decision_summary_matches_canonical_oracle(state: &PmOrderState) {
     assert_eq!(summary.reservation_totals(), totals);
     assert_eq!(summary.live_count(), live_count);
     assert_eq!(summary.unresolved_count(), unresolved_count);
+}
+
+#[test]
+fn exact_live_count_tracks_insert_replace_and_remove_transitions() {
+    let mut state = PmOrderState::new();
+    let live = entry(client_only(1));
+    state.insert(live).unwrap();
+    assert_eq!(state.live_count, 1);
+    assert_decision_summary_matches_canonical_oracle(&state);
+
+    let live_slot = state.find(live.identity).unwrap();
+    let mut terminal = live;
+    terminal.terminal_by_detail_absence = true;
+    state.replace_ordered(live_slot, terminal).unwrap();
+    assert_eq!(state.live_count, 0);
+    let zero = state.decision_summary();
+    assert!(!zero.has_unmanaged_ambiguity());
+    assert_eq!(zero.first_unknown_reservation(), None);
+    assert_eq!(zero.reservation_totals(), Ok((U256::ZERO, U256::ZERO)));
+    assert_eq!(zero.live_count(), 0);
+    assert_eq!(zero.unresolved_count(), 0);
+    assert_decision_summary_matches_canonical_oracle(&state);
+
+    state.replace_ordered(live_slot, live).unwrap();
+    assert_eq!(state.live_count, 1);
+
+    let already_terminal = proven_owned_terminal_entry(2);
+    state.insert(already_terminal).unwrap();
+    assert_eq!(state.live_count, 1);
+    assert_decision_summary_matches_canonical_oracle(&state);
+
+    let live_slot = state.find(live.identity).unwrap();
+    assert_eq!(state.remove_dense(live_slot), live);
+    assert_eq!(state.live_count, 0);
+    assert_decision_summary_matches_canonical_oracle(&state);
+
+    let terminal_slot = state.find(already_terminal.identity).unwrap();
+    assert_eq!(state.remove_dense(terminal_slot), already_terminal);
+    assert_eq!(state.live_count, 0);
+    assert_strictly_ordered(&state);
+    assert_decision_summary_matches_canonical_oracle(&state);
+}
+
+#[test]
+fn detail_absence_duplicate_and_reactivation_preserve_exact_live_count() {
+    let config = detail_test_config();
+    let venue_order = venue(700);
+    let identity = PmOrderIdentity::new(None, Some(venue_order)).unwrap();
+    let mut state = PmOrderState::new();
+    state.insert(entry(identity)).unwrap();
+    assert_eq!(state.live_count, 1);
+
+    assert_eq!(
+        state
+            .apply_detail(
+                detail_test_envelope(1, 10, 11, venue_order, None),
+                PmReservationKnowledge::Unknown,
+                &config,
+            )
+            .unwrap(),
+        PmOrderApply::DetailAbsenceTerminalized
+    );
+    assert_eq!(state.live_count, 0);
+    assert_decision_summary_matches_canonical_oracle(&state);
+
+    assert_eq!(
+        state
+            .apply_detail(
+                detail_test_envelope(1, 10, 11, venue_order, None),
+                PmReservationKnowledge::Unknown,
+                &config,
+            )
+            .unwrap(),
+        PmOrderApply::DetailAbsenceIgnoredAfterLaterEvent
+    );
+    assert_eq!(state.live_count, 0);
+
+    assert_eq!(
+        state
+            .apply_detail(
+                detail_test_envelope(2, 12, 13, venue_order, None),
+                PmReservationKnowledge::Unknown,
+                &config,
+            )
+            .unwrap(),
+        PmOrderApply::Duplicate
+    );
+    assert_eq!(state.live_count, 0);
+
+    let open = detail_test_open_order(venue_order);
+    assert_eq!(
+        state
+            .apply_detail(
+                detail_test_envelope(3, 14, 15, venue_order, Some(open)),
+                PmReservationKnowledge::Unknown,
+                &config,
+            )
+            .unwrap(),
+        PmOrderApply::Updated
+    );
+    assert_eq!(state.live_count, 1);
+    assert_strictly_ordered(&state);
+    assert_decision_summary_matches_canonical_oracle(&state);
 }
 
 fn shuffle(ordinals: &mut [usize]) {

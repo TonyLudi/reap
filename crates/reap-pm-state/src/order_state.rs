@@ -394,6 +394,7 @@ pub(crate) struct PmOrderState {
     entries: Vec<OrderEntry>,
     canonical_index: Vec<u16>,
     client_index: Vec<u16>,
+    live_count: u16,
     latest_snapshot_revision: Option<reap_pm_core::SnapshotRevision>,
     latest_snapshot_completion: Option<PmPrivateOccurrence>,
     observed_monotonic_ns: Option<u64>,
@@ -406,6 +407,7 @@ impl PmOrderState {
             entries: Vec::with_capacity(MAX_PM_PRIVATE_ORDERS),
             canonical_index: Vec::with_capacity(MAX_PM_PRIVATE_ORDERS),
             client_index: Vec::with_capacity(MAX_PM_PRIVATE_ORDERS),
+            live_count: 0,
             latest_snapshot_revision: None,
             latest_snapshot_completion: None,
             observed_monotonic_ns: None,
@@ -729,6 +731,10 @@ impl PmOrderState {
         if !self.entries[index].is_live() {
             return Ok(PmOrderApply::Duplicate);
         }
+        self.live_count = self
+            .live_count
+            .checked_sub(1)
+            .expect("a live detail row contributes to the exact live count");
         self.entries[index].reservation = None;
         self.entries[index].terminal_by_detail_absence = true;
         self.entries[index].last_occurrence = Some(PmPrivateOccurrence::new(

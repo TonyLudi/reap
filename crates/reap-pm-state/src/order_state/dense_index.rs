@@ -68,6 +68,12 @@ impl PmOrderState {
         let dense_slot =
             u16::try_from(self.entries.len()).expect("configured order capacity fits u16");
         self.entries.push(entry);
+        if entry.is_live() {
+            self.live_count = self
+                .live_count
+                .checked_add(1)
+                .expect("configured order capacity fits u16");
+        }
         self.canonical_index.insert(canonical_position, dense_slot);
         if let Some(position) = client_position {
             self.client_index.insert(position, dense_slot);
@@ -121,6 +127,21 @@ impl PmOrderState {
         }
 
         self.entries[dense_slot] = replacement;
+        match (current.is_live(), replacement.is_live()) {
+            (false, true) => {
+                self.live_count = self
+                    .live_count
+                    .checked_add(1)
+                    .expect("configured order capacity fits u16");
+            }
+            (true, false) => {
+                self.live_count = self
+                    .live_count
+                    .checked_sub(1)
+                    .expect("a replaced live row contributes to the exact live count");
+            }
+            (false, false) | (true, true) => {}
+        }
         if canonical_key_changed && new_canonical_position != old_canonical_position {
             let encoded_slot = self.canonical_index.remove(old_canonical_position);
             self.canonical_index
@@ -165,6 +186,12 @@ impl PmOrderState {
             .len()
             .checked_sub(1)
             .expect("dense removal requires one retained order");
+        if removed_entry.is_live() {
+            self.live_count = self
+                .live_count
+                .checked_sub(1)
+                .expect("a removed live row contributes to the exact live count");
+        }
         let removed = self.entries.swap_remove(dense_slot);
         if dense_slot != old_last {
             let moved_reference = self

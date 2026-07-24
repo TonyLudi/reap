@@ -5,13 +5,14 @@ use reap_pm_core::{
 use sha2::{Digest, Sha256};
 
 use super::PM_SEALED_JOURNAL_RECORD_KINDS;
+use super::PmValidatedJournalRecord;
 use super::schema::{
     PmJournalCancelOutcomeV1, PmJournalCancelReasonV1, PmJournalCancelRejectReasonV1,
     PmJournalFillDeliveryV1, PmJournalFillFeeV1, PmJournalFillKeyV1, PmJournalFillOccurrenceV1,
     PmJournalFillRoleV1, PmJournalFillSettlementV1, PmJournalFillSourceV1, PmJournalFingerprintV1,
     PmJournalOrderProgressSourceV1, PmJournalPlaceOutcomeV1, PmJournalPlaceRejectReasonV1,
     PmJournalQuoteProfileV1, PmJournalRecordV1, PmJournalSafetyReasonV1, PmJournalSideV1,
-    PmJournalSignV1, PmJournalTerminalStatusV1, derive_pm_journal_client_order_from_fingerprint,
+    PmJournalSignV1, PmJournalTerminalStatusV1,
 };
 
 const SEALED_SEGMENT_HASH_DOMAIN_V1: &[u8] = b"reap-pm-live/sealed-journal-segment/v1";
@@ -40,7 +41,15 @@ impl PmSealedJournalSegment {
         *self = Self::new(self.normalizer.account, self.normalizer.fingerprint);
     }
 
-    pub(super) fn observe(&mut self, sequence: u64, kind_index: usize, record: &PmJournalRecordV1) {
+    pub(super) fn observe(
+        &mut self,
+        sequence: u64,
+        kind_index: usize,
+        validated: PmValidatedJournalRecord<'_>,
+    ) {
+        let record = validated.record();
+        self.normalizer.valid &=
+            validated.matches_scope(self.normalizer.account, self.normalizer.fingerprint);
         self.record_count = self.record_count.saturating_add(1);
         self.records_by_kind[kind_index] = self.records_by_kind[kind_index].saturating_add(1);
         self.hasher.update([kind_index as u8]);
@@ -116,12 +125,10 @@ impl Normalizer {
                 let normalized_intent =
                     relative(&mut self.intent_base, intent.intent_id, &mut self.valid);
                 self.valid &= normalized_intent == self.quote_ordinal;
-                self.valid &= derive_pm_journal_client_order_from_fingerprint(
-                    self.account,
-                    self.fingerprint,
-                    intent.intent_id,
-                )
-                .is_ok_and(|expected| expected == intent.client_order);
+                // Journal admission already proved the client key's
+                // scope-bound SHA-256 derivation before constructing the
+                // private validated-record proof. Repeating it here would
+                // duplicate schema work inside the measured evidence path.
                 self.current_client = Some(intent.client_order);
                 hasher.update(self.quote_ordinal.to_be_bytes());
                 self.hash_client(hasher, intent.client_order);
@@ -593,11 +600,20 @@ mod tests {
         PmJournalCancelIntentV1, PmJournalCancelResultV1, PmJournalFillAppliedV1,
         PmJournalFillCursorV1, PmJournalFillV1, PmJournalFillWatermarkV1, PmJournalHeaderV1,
         PmJournalImmediateFillsV1, PmJournalOrderTerminalV1, PmJournalPlaceResultV1,
-        PmJournalQuoteIntentV1, PmJournalSafetyHaltV1, PmJournalScopeV1,
+        PmJournalQuoteIntentV1, PmJournalSafetyHaltV1, PmJournalSchemaError, PmJournalScopeV1,
         derive_pm_journal_client_order, test_scope,
     };
+    use crate::journal::{PmJournalError, PmMutationJournal};
 
     const WALL_BASE_NS: u64 = 1_700_000_000_000_000_000;
+
+    fn validated<'a>(
+        scope: &PmJournalScopeV1,
+        record: &'a PmJournalRecordV1,
+    ) -> PmValidatedJournalRecord<'a> {
+        PmValidatedJournalRecord::try_new(scope, record)
+            .expect("fixed evidence-hash record passes journal schema validation")
+    }
 
     fn normalized_records(scope: &PmJournalScopeV1, base: u64) -> Vec<PmJournalRecordV1> {
         let intent_id = base + 1;
@@ -722,7 +738,7 @@ mod tests {
             segment.observe(
                 sequence_base + offset as u64,
                 crate::journal::sealed_record_index(record),
-                record,
+                validated(scope, record),
             );
         }
         assert!(segment.valid(), "fixed normalized corpus must remain valid");
@@ -878,19 +894,108 @@ mod tests {
         });
 
         let mut contiguous = PmSealedJournalSegment::new(scope.account(), scope.fingerprint());
-        contiguous.observe(100, crate::journal::sealed_record_index(&record), &record);
-        contiguous.observe(101, crate::journal::sealed_record_index(&record), &record);
+        contiguous.observe(
+            100,
+            crate::journal::sealed_record_index(&record),
+            validated(&scope, &record),
+        );
+        contiguous.observe(
+            101,
+            crate::journal::sealed_record_index(&record),
+            validated(&scope, &record),
+        );
         assert!(contiguous.valid());
 
         let mut gap = PmSealedJournalSegment::new(scope.account(), scope.fingerprint());
-        gap.observe(100, crate::journal::sealed_record_index(&record), &record);
-        gap.observe(102, crate::journal::sealed_record_index(&record), &record);
+        gap.observe(
+            100,
+            crate::journal::sealed_record_index(&record),
+            validated(&scope, &record),
+        );
+        gap.observe(
+            102,
+            crate::journal::sealed_record_index(&record),
+            validated(&scope, &record),
+        );
         assert!(!gap.valid());
 
         let mut duplicate = PmSealedJournalSegment::new(scope.account(), scope.fingerprint());
-        duplicate.observe(100, crate::journal::sealed_record_index(&record), &record);
-        duplicate.observe(100, crate::journal::sealed_record_index(&record), &record);
+        duplicate.observe(
+            100,
+            crate::journal::sealed_record_index(&record),
+            validated(&scope, &record),
+        );
+        duplicate.observe(
+            100,
+            crate::journal::sealed_record_index(&record),
+            validated(&scope, &record),
+        );
         assert!(!duplicate.valid());
+    }
+
+    #[test]
+    fn validated_record_is_bound_to_the_exact_sealed_segment_scope() {
+        let scope = test_scope();
+        let record = PmJournalRecordV1::SafetyHalt(PmJournalSafetyHaltV1 {
+            account: scope.account(),
+            reason: PmJournalSafetyReasonV1::StaleDependency,
+        });
+        let mut wrong_scope = PmSealedJournalSegment::new(
+            scope.account(),
+            PmJournalFingerprintV1::from_bytes([0x44; 32]),
+        );
+
+        wrong_scope.observe(
+            1,
+            crate::journal::sealed_record_index(&record),
+            validated(&scope, &record),
+        );
+
+        assert!(
+            !wrong_scope.valid(),
+            "a record validated for another scope cannot become valid sealed evidence"
+        );
+    }
+
+    #[test]
+    fn sealed_journal_rejects_an_invalid_client_without_advancing_evidence() {
+        let scope = test_scope();
+        let records = normalized_records(&scope, 10);
+        let PmJournalRecordV1::QuoteIntent(valid) = &records[1] else {
+            unreachable!("fixed corpus carries a quote intent");
+        };
+        let valid = *valid;
+        let mut invalid = valid;
+        invalid.client_order =
+            derive_pm_journal_client_order(&scope, valid.intent_id + 1).expect("other client");
+        let mut journal = PmMutationJournal::start_sealed_evidence(scope);
+        let before = journal
+            .sealed_evidence_projection()
+            .expect("sealed evidence projection");
+
+        assert!(matches!(
+            journal.try_quote_intent(invalid),
+            Err(PmJournalError::Schema(
+                PmJournalSchemaError::ClientOrderDerivationMismatch
+            ))
+        ));
+        assert_eq!(
+            journal.sealed_evidence_projection(),
+            Some(before),
+            "failed validation cannot advance sequence, counts, or sealed hash"
+        );
+
+        journal
+            .try_quote_intent(valid)
+            .expect("the exact valid quote remains admissible");
+        let after = journal
+            .sealed_evidence_projection()
+            .expect("sealed evidence projection");
+        assert_eq!(after.record_count(), 2);
+        assert_eq!(after.records_by_kind().headers, 1);
+        assert_eq!(after.records_by_kind().quote_intents, 1);
+        assert_eq!(after.last_sequence(), 1);
+        assert!(after.segment_valid());
     }
 
     #[test]
@@ -901,7 +1006,11 @@ mod tests {
             .iter()
             .map(|record| {
                 let mut segment = PmSealedJournalSegment::new(scope.account(), scope.fingerprint());
-                segment.observe(1, crate::journal::sealed_record_index(record), record);
+                segment.observe(
+                    1,
+                    crate::journal::sealed_record_index(record),
+                    validated(&scope, record),
+                );
                 segment.hash()
             })
             .collect::<HashSet<_>>();
@@ -914,12 +1023,38 @@ mod tests {
         let baseline = normalized_records(&scope, 10);
         let expected = hash_records(&scope, 100, &baseline);
 
-        let mut changed_quote = baseline.clone();
-        let PmJournalRecordV1::QuoteIntent(intent) = &mut changed_quote[1] else {
+        let mut changed_price = baseline.clone();
+        let PmJournalRecordV1::QuoteIntent(intent) = &mut changed_price[1] else {
             unreachable!("fixed quote record");
         };
         intent.price_units += 1;
-        assert_ne!(hash_records(&scope, 100, &changed_quote), expected);
+        let changed_amounts = exact_order_amounts(
+            PmOrderSide::Buy,
+            PmPrice::from_units(intent.price_units).expect("changed exact price"),
+            intent.quantity,
+        )
+        .expect("changed exact order amounts");
+        intent.reserved_collateral = changed_amounts.maker();
+        intent.maker_amount = changed_amounts.maker();
+        intent.taker_amount = changed_amounts.taker();
+        assert_ne!(hash_records(&scope, 100, &changed_price), expected);
+
+        let mut changed_quantity = baseline.clone();
+        let PmJournalRecordV1::QuoteIntent(intent) = &mut changed_quantity[1] else {
+            unreachable!("fixed quote record");
+        };
+        let quantity = PmQuantity::parse_decimal("2").expect("changed exact quantity");
+        let changed_amounts = exact_order_amounts(
+            PmOrderSide::Buy,
+            PmPrice::from_units(intent.price_units).expect("fixed exact price"),
+            quantity,
+        )
+        .expect("changed exact order amounts");
+        intent.quantity = quantity;
+        intent.reserved_collateral = changed_amounts.maker();
+        intent.maker_amount = changed_amounts.maker();
+        intent.taker_amount = changed_amounts.taker();
+        assert_ne!(hash_records(&scope, 100, &changed_quantity), expected);
 
         let mut changed_fill = baseline.clone();
         let PmJournalRecordV1::FillApplied(applied) = &mut changed_fill[5] else {

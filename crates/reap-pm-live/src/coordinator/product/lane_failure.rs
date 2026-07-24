@@ -259,6 +259,9 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
     }
 
     pub(super) fn clear_reconciliation_gate_if_drained(&mut self) {
+        if !self.reconciliation_gate {
+            return;
+        }
         let lanes_drained = self
             .lanes
             .as_deref()
@@ -270,8 +273,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
             || self
                 .refresh_obligations
                 .has_reason(PmRefreshReason::ExternalIngressFault);
-        if self.reconciliation_gate
-            && self.reconciliation_recovered
+        if self.reconciliation_recovered
             && lanes_drained
             && self.retained_private_admission.is_none()
             && self.retained_reconciliation_admission.is_none()

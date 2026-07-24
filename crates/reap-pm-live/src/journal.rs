@@ -44,6 +44,41 @@ use writer::{PmJournalCodec, PmJournalCodecError};
 pub(crate) const PM_JOURNAL_PENDING_CAPACITY: usize = 1_024;
 const PM_SEALED_JOURNAL_RECORD_KINDS: usize = 9;
 
+/// Borrowed proof that the exact record passed schema validation for one
+/// exact journal scope before entering the sealed evidence ledger.
+#[derive(Clone, Copy)]
+struct PmValidatedJournalRecord<'a> {
+    record: &'a PmJournalRecordV1,
+    account: reap_pm_core::PmAccountHandle,
+    fingerprint: PmJournalFingerprintV1,
+}
+
+impl<'a> PmValidatedJournalRecord<'a> {
+    fn try_new(
+        scope: &PmJournalScopeV1,
+        record: &'a PmJournalRecordV1,
+    ) -> Result<Self, PmJournalSchemaError> {
+        record.validate(scope)?;
+        Ok(Self {
+            record,
+            account: scope.account(),
+            fingerprint: scope.fingerprint(),
+        })
+    }
+
+    const fn record(self) -> &'a PmJournalRecordV1 {
+        self.record
+    }
+
+    fn matches_scope(
+        self,
+        account: reap_pm_core::PmAccountHandle,
+        fingerprint: PmJournalFingerprintV1,
+    ) -> bool {
+        self.account == account && self.fingerprint == fingerprint
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum PmJournalError {
     #[error("PM mutation journal IO failed: {0}")]
@@ -168,7 +203,6 @@ impl PmMutationJournal {
         ) {
             return Err(schema::PmJournalSchemaError::WrongRecordPath.into());
         }
-        record.validate(&self.scope)?;
         self.try_record_inner(record)
     }
 
@@ -192,30 +226,36 @@ impl PmMutationJournal {
         &mut self,
         record: PmJournalRecordV1,
     ) -> Result<PmPendingJournalRecord, PmJournalError> {
-        record.validate(&self.scope)?;
-        if usize::try_from(self.next_sequence)
-            .map_or(true, |sequence| sequence >= MAX_PM_JOURNAL_RECORDS)
-        {
-            return Err(PmJournalError::RecordLimit);
-        }
-        let sequence = self.next_sequence;
         let receipt = match &mut self.runtime {
             PmJournalRuntime::Durable(runtime) => {
+                record.validate(&self.scope)?;
+                if usize::try_from(self.next_sequence)
+                    .map_or(true, |sequence| sequence >= MAX_PM_JOURNAL_RECORDS)
+                {
+                    return Err(PmJournalError::RecordLimit);
+                }
                 let reservation = runtime
                     .sink()
                     .try_reserve_durable()
                     .map_err(map_enqueue_error)?;
                 PmJournalPendingReceipt::Durable(reservation.commit(PmJournalLineV1::new(
                     self.scope.fingerprint(),
-                    sequence,
+                    self.next_sequence,
                     record,
                 )))
             }
             PmJournalRuntime::SealedEvidence(ledger) => {
-                ledger.commit(sequence, &record);
+                let validated = PmValidatedJournalRecord::try_new(&self.scope, &record)?;
+                if usize::try_from(self.next_sequence)
+                    .map_or(true, |sequence| sequence >= MAX_PM_JOURNAL_RECORDS)
+                {
+                    return Err(PmJournalError::RecordLimit);
+                }
+                ledger.commit(self.next_sequence, validated);
                 PmJournalPendingReceipt::SealedEvidence(PmSealedJournalReceipt { _private: () })
             }
         };
+        let sequence = self.next_sequence;
         self.next_sequence = next_sequence(sequence)?;
         Ok(PmPendingJournalRecord { sequence, receipt })
     }
@@ -440,10 +480,10 @@ impl PmSealedJournalLedger {
             last_sequence: 0,
             segment: PmSealedJournalSegment::new(scope.account(), scope.fingerprint()),
         };
-        ledger.commit(
-            0,
-            &PmJournalRecordV1::Header(PmJournalHeaderV1::new(scope.clone())),
-        );
+        let header = PmJournalRecordV1::Header(PmJournalHeaderV1::new(scope.clone()));
+        let validated = PmValidatedJournalRecord::try_new(scope, &header)
+            .expect("the sealed ledger header uses its exact validated scope");
+        ledger.commit(0, validated);
         ledger
     }
 
@@ -451,12 +491,13 @@ impl PmSealedJournalLedger {
         self.segment.reset();
     }
 
-    fn commit(&mut self, sequence: u64, record: &PmJournalRecordV1) {
+    fn commit(&mut self, sequence: u64, validated: PmValidatedJournalRecord<'_>) {
+        let record = validated.record();
         let index = sealed_record_index(record);
         self.record_count = self.record_count.saturating_add(1);
         self.records_by_kind[index] = self.records_by_kind[index].saturating_add(1);
         self.last_sequence = sequence;
-        self.segment.observe(sequence, index, record);
+        self.segment.observe(sequence, index, validated);
     }
 
     fn projection(&self) -> PmSealedJournalProjection {
