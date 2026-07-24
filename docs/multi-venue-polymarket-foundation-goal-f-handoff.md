@@ -2569,8 +2569,53 @@ Phase 0/2 commands recorded earlier in this handoff.
 Status: the documented stop was **RESOLVED on 2026-07-24 by explicit selection
 of amendment option 1** after the green Phase 5 gate. The stop evidence below
 is retained as decision history. It was a source/contract proof, not a failed
-benchmark run. Phase 6 implementation, replay, benchmark, counter, latency,
-allocation, and hash fields remain **PENDING** until measured.
+benchmark run. Phase 6 now has an implementation checkpoint at
+`97be73004e71504622d0f3aac3132cd11abecbed`, but the phase gate remains
+**PENDING** until the full replay, recorded benchmark, counter, latency,
+allocation, and hash evidence is green.
+
+### Phase 6 implementation checkpoint
+
+The checkpoint implements the complete deterministic scheduler and lane
+policies, retained reconciliation and refresh obligations, durable
+watermark-gated compaction, restart/recovery behavior, bounded capture and
+persistence failure handling, dense preallocated PM order/lifecycle indexes,
+the sealed zero-input evidence runner, and exact evidence for all thirteen
+overload mechanisms. Allocator/process authority is confined to the evidence
+harness; `reap-pm-state` remains a pure reducer crate. The transparent
+`System`-delegating counting allocator is evidence instrumentation only and is
+not installed, selected, or configurable by production composition.
+
+The exact checkpoint tree passed:
+
+```text
+cargo check -p reap-pm-live --all-targets --locked
+cargo test -p reap-pm-live --lib --locked -- --test-threads=1
+  164 passed
+cargo check -p reap-pm-state --all-targets --locked
+cargo test -p reap-pm-state --all-targets --locked -- --test-threads=1
+  113 passed
+cargo test -p reap-benchmark-allocator --all-targets --locked
+  7 passed
+cargo test -p reap-pm-live --test dependency_policy --locked -- --test-threads=1
+  13 passed
+cargo test -p reap-pm-live --test phase6_evidence_policy --locked -- --test-threads=1
+  2 passed
+cargo test -p reap-pm-live --test compile_fail_boundaries --locked -- --test-threads=1
+  41 trybuild cases passed
+cargo fmt --all -- --check
+git diff --check
+```
+
+The thirteen-mechanism zero-allocation evidence passed six consecutive
+isolated invocations with the frozen 27,309 attempts. The last single-run
+diagnostic before temporary component timers were removed reported action
+latency p50 `25.689 us` and p99.9 `81.926 us`; it is not acceptance evidence.
+The frozen p50 gate is at most `25 us`, so latency remains red by `0.689 us`
+even though the p99.9 gate of at most `250 us` has substantial margin. The
+required post-commit warm-up plus three recorded action runs, full
+`combined_replay` artifact/hash evidence, and global/Chaos gates have not yet
+run.
 
 ### Frozen requirements and reached product semantics
 
@@ -2822,8 +2867,8 @@ under the exact replacement contract above.
 | Phase 6 stop/gate evidence | Value |
 | --- | --- |
 | Selected contract amendment | **Option 1, selected 2026-07-24** |
-| Phase 6 implementation commit | **PENDING** |
-| `combined_replay` command/result/hash | **PENDING** |
-| `pm_action_path` command/result/runs | **PENDING** |
-| Allocation, memory, latency, and host/toolchain evidence | **PENDING** |
-| Final formatting, diff, source-policy, and structural gates | **PENDING** |
+| Phase 6 implementation commit | **CHECKPOINT** `97be73004e71504622d0f3aac3132cd11abecbed`; phase gate not claimed |
+| `combined_replay` command/result/hash | Target implemented; full post-commit run and hash evidence **PENDING** |
+| `pm_action_path` command/result/runs | Target implemented; required warm-up plus three recorded runs **PENDING** |
+| Allocation, memory, latency, and host/toolchain evidence | Thirteen-mechanism allocation evidence green; official action/replay reports **PENDING**; last non-gate p50 diagnostic red |
+| Final formatting, diff, source-policy, and structural gates | Checkpoint-local gates green; Phase 6 acceptance and final global gates **PENDING** |
