@@ -61,10 +61,10 @@ impl<T> ImmutableDelivery<T> {
     }
 }
 
-/// Legacy OKX raw-ingress alias.
+/// Compatibility raw-ingress alias for the pre-existing feed product.
 ///
 /// [`ImmutableDelivery`] remains venue-neutral; sibling products carry their
-/// own statically typed payload rather than widening this OKX wire boundary.
+/// own statically typed payload rather than widening this legacy wire boundary.
 pub type RawDelivery = ImmutableDelivery<RawEnvelope>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
