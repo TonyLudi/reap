@@ -15,9 +15,10 @@ async fn ready_owner_with_risk_limits(
         account.instrument(),
         account.instrument_id(),
     );
-    let (mut owner, recovery) = PmMutationOwner::start(&config, private, fake, journal_path)
-        .await
-        .unwrap();
+    let (mut owner, recovery) =
+        PmMutationOwner::start(&config, Box::new(private), fake, journal_path)
+            .await
+            .unwrap();
     assert_eq!(recovery.record_count(), 0);
     make_private_ready(&mut owner, &config);
     drain_persistence(&mut owner, 111).await;
@@ -116,4 +117,79 @@ async fn recovered_operational_capacity_admits_cancel_while_quotes_stay_halted()
     assert_operational_halt_keeps_exact_cancel_available(PmMutationHalt::PersistenceSaturated)
         .await;
     assert_operational_halt_keeps_exact_cancel_available(PmMutationHalt::FakeEffectSaturated).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn recovered_canonical_live_order_is_cancelable_before_reconciliation() {
+    let config = fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let journal_path = directory.path().join("recovered-live-cancel.ndjson");
+    let (client, venue) = Box::pin(write_recovered_live_order(&config, &journal_path)).await;
+    Box::pin(assert_recovered_live_order_cancelable(
+        &config,
+        &journal_path,
+        client,
+        venue,
+    ))
+    .await;
+}
+
+async fn write_recovered_live_order(
+    config: &PmConnectivityConfig,
+    journal_path: &Path,
+) -> (
+    reap_pm_core::PmClientOrderKey,
+    reap_pm_core::PmVenueOrderKey,
+) {
+    let mut owner = Box::new(Box::pin(start_owner(config, journal_path)).await);
+    let reserved = owner.reserved_capacity_bytes();
+    let private_reserved = owner.private_mut().reserved_capacity_bytes();
+    assert!(private_reserved > 0);
+    assert!(reserved >= private_reserved);
+    make_private_ready(&mut owner, config);
+    drain_persistence(&mut owner, 111).await;
+    let _watermark = owner.pop_durable_consequence();
+    let venue = venue_order(config, "recovered-live-cancel");
+    let client = Box::pin(place_resting_quote(
+        &mut owner,
+        config,
+        PmOrderSide::Buy,
+        1,
+        venue,
+    ))
+    .await;
+    drain_persistence(&mut owner, 123).await;
+    assert_eq!(owner.reserved_capacity_bytes(), reserved);
+    Box::pin((*owner).shutdown()).await.unwrap();
+    (client, venue)
+}
+
+async fn assert_recovered_live_order_cancelable(
+    config: &PmConnectivityConfig,
+    journal_path: &Path,
+    client: reap_pm_core::PmClientOrderKey,
+    venue: reap_pm_core::PmVenueOrderKey,
+) {
+    let (restarted, recovery) = Box::pin(restart_owner(config, journal_path)).await;
+    let mut restarted = Box::new(restarted);
+    assert!(recovery.requires_reconciliation());
+    assert_eq!(
+        restarted.halt(),
+        Some(PmMutationHalt::RecoveryReconciliationRequired)
+    );
+    let candidate = restarted
+        .owned_cancel_candidate(PmOrderSide::Buy)
+        .expect("recovered canonical lifecycle is the cancel source");
+    assert_eq!(candidate.client_order(), client);
+    assert_eq!(candidate.venue_order(), Some(venue));
+
+    assert!(matches!(
+        restarted.begin_cancel(cancel_request(client)).unwrap(),
+        PmCancelMutationAdmission::JournalPending {
+            client_order,
+            venue_order,
+        } if client_order == client && venue_order == venue
+    ));
+    wait_for_prepared_cancel(&mut restarted, 131).await;
+    Box::pin((*restarted).shutdown()).await.unwrap();
 }

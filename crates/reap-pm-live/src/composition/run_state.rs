@@ -329,6 +329,11 @@ impl PmPublicCaptureRun {
         self.pm_reducer.counters()
     }
 
+    #[cfg(test)]
+    pub(crate) const fn accepted_pm_raw_frames_for_evidence(&self) -> u64 {
+        self.pm_raw_ingress.sequence
+    }
+
     #[must_use]
     pub const fn pm_book_last_ingress_sequence(&self) -> Option<IngressSequence> {
         self.pm_reducer.last_ingress_sequence()

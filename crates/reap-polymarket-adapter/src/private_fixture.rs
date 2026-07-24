@@ -38,6 +38,10 @@ pub enum PmPrivateLifecycleRoleError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PmFixtureFeeEvidence {
+    Known {
+        asset: reap_pm_core::PmAssetId,
+        delta: reap_pm_core::PmSignedUnits,
+    },
     Unknown,
     Incomplete,
 }
@@ -45,6 +49,7 @@ pub enum PmFixtureFeeEvidence {
 impl PmFixtureFeeEvidence {
     const fn into_core(self) -> PmFillFee {
         match self {
+            Self::Known { asset, delta } => PmFillFee::Known { asset, delta },
             Self::Unknown => PmFillFee::Unknown,
             Self::Incomplete => PmFillFee::Incomplete,
         }

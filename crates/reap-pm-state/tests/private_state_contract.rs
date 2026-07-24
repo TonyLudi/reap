@@ -17,18 +17,18 @@ use reap_pm_state::{
     PmAccountSnapshotApply, PmCardinalityRiskLimits, PmExactReservation, PmExposureRiskLimits,
     PmFillApply, PmFillFeeState, PmFreshnessRiskLimits, PmOpenOrderReservation, PmOpenOrdersApply,
     PmOrderApply, PmOrderOwnership, PmOrderRiskLimits, PmOwnedCancelOutcome,
-    PmOwnedCancelRequestApply, PmOwnedFillApply, PmOwnedIntentId, PmOwnedObservationOccurrence,
-    PmOwnedObservationSource, PmOwnedOrderLifecycleError, PmOwnedOrderRegistration,
-    PmOwnedProgressApply, PmOwnedQuoteAdmission, PmOwnedQuoteIntent, PmOwnedQuoteSlotKey,
-    PmOwnedRecoveryFill, PmOwnedReductionSequence, PmOwnedRemoteOrderApply, PmOwnedSubmitResult,
-    PmPositionKnowledge, PmPrivateConvergence, PmPrivateDependency,
-    PmPrivateExternalIngressFailure, PmPrivateExternalIngressFault, PmPrivateExternalIngressLane,
-    PmPrivateHaltReason, PmPrivateOccurrence, PmPrivateQuoteRequest, PmPrivateReadiness,
-    PmPrivateReadinessReason, PmPrivateState, PmPrivateStateConfig, PmPrivateStateError,
-    PmReconciliationFillDisposition, PmReconciliationReductions, PmRefreshAdmission,
-    PmRefreshReason, PmRefreshRequired, PmRemoteOrderKnowledge, PmReservationKnowledge,
-    PmRiskDecision, PmRiskDependency, PmRiskLimits, PmRiskReason, PmUnresolvedFillApply,
-    PmUnresolvedFillObservation, PmUnresolvedFillReason,
+    PmOwnedCancelRequestApply, PmOwnedCancelState, PmOwnedFillApply, PmOwnedIntentId,
+    PmOwnedObservationOccurrence, PmOwnedObservationSource, PmOwnedOrderLifecycleError,
+    PmOwnedOrderRegistration, PmOwnedProgressApply, PmOwnedQuoteAdmission, PmOwnedQuoteIntent,
+    PmOwnedQuoteSlotKey, PmOwnedRecoveryFill, PmOwnedReductionSequence, PmOwnedRemoteOrderApply,
+    PmOwnedSubmitApply, PmOwnedSubmitResult, PmPositionKnowledge, PmPrivateConvergence,
+    PmPrivateDependency, PmPrivateExternalIngressFailure, PmPrivateExternalIngressFault,
+    PmPrivateExternalIngressLane, PmPrivateHaltReason, PmPrivateOccurrence,
+    PmPrivateQuoteEvaluation, PmPrivateQuoteRequest, PmPrivateReadiness, PmPrivateReadinessReason,
+    PmPrivateState, PmPrivateStateConfig, PmPrivateStateError, PmReconciliationFillDisposition,
+    PmReconciliationReductions, PmRefreshAdmission, PmRefreshReason, PmRefreshRequired,
+    PmRemoteOrderKnowledge, PmReservationKnowledge, PmRiskDecision, PmRiskDependency, PmRiskLimits,
+    PmRiskReason, PmUnresolvedFillApply, PmUnresolvedFillObservation, PmUnresolvedFillReason,
 };
 
 const CONDITION: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -548,6 +548,194 @@ fn make_ready(state: &mut PmPrivateState) {
     assert!(matches!(
         state.quote_readiness(quote(120)),
         PmPrivateReadiness::Ready(_)
+    ));
+}
+
+#[test]
+fn combined_quote_evaluation_matches_legacy_ready_and_risk_effects() {
+    let reference = PmRiskDependency::available(120);
+    let book = PmRiskDependency::available(120);
+    let mut legacy = new_state();
+    make_ready(&mut legacy);
+    let legacy_ready = match legacy.quote_readiness(quote(120)) {
+        PmPrivateReadiness::Ready(ready) => ready,
+        PmPrivateReadiness::Blocked(reason) => panic!("ready fixture blocked: {reason:?}"),
+    };
+    let legacy_risk = legacy
+        .evaluate_risk_candidate(quote(120), reference, book)
+        .unwrap();
+    let legacy_counters = legacy.risk_counters();
+
+    let mut combined = new_state();
+    make_ready(&mut combined);
+    assert_eq!(
+        combined
+            .evaluate_quote_candidate(quote(120), reference, book)
+            .unwrap(),
+        PmPrivateQuoteEvaluation::Evaluated {
+            ready: legacy_ready,
+            risk: legacy_risk,
+        }
+    );
+    assert_eq!(combined.risk_counters(), legacy_counters);
+
+    let mut legacy_rejection = new_state();
+    make_ready(&mut legacy_rejection);
+    let rejected_ready = match legacy_rejection.quote_readiness(quote(120)) {
+        PmPrivateReadiness::Ready(ready) => ready,
+        PmPrivateReadiness::Blocked(reason) => panic!("ready fixture blocked: {reason:?}"),
+    };
+    let rejected_risk = legacy_rejection
+        .evaluate_risk_candidate(quote(120), PmRiskDependency::unavailable(), book)
+        .unwrap();
+    let rejected_counters = legacy_rejection.risk_counters();
+
+    let mut combined_rejection = new_state();
+    make_ready(&mut combined_rejection);
+    assert_eq!(
+        combined_rejection
+            .evaluate_quote_candidate(quote(120), PmRiskDependency::unavailable(), book)
+            .unwrap(),
+        PmPrivateQuoteEvaluation::Evaluated {
+            ready: rejected_ready,
+            risk: rejected_risk,
+        }
+    );
+    assert_eq!(combined_rejection.risk_counters(), rejected_counters);
+}
+
+#[test]
+fn combined_quote_evaluation_preserves_readiness_precedence_without_risk_effects() {
+    let mut state = new_state();
+    make_ready(&mut state);
+    let unknown = order(
+        1,
+        "unknown-before-ambiguity",
+        PmOrderSide::Buy,
+        PmOrderStatus::Open,
+        0,
+    );
+    state
+        .observe_order(
+            envelope(unknown, 1, 30, None, 120),
+            PmRemoteOrderKnowledge::Unmanaged(PmReservationKnowledge::Unknown),
+        )
+        .unwrap();
+    let ambiguous = order(
+        2,
+        "later-global-ambiguity",
+        PmOrderSide::Buy,
+        PmOrderStatus::Open,
+        0,
+    );
+    state
+        .observe_order(
+            envelope(ambiguous, 1, 31, None, 121),
+            PmRemoteOrderKnowledge::Ambiguous,
+        )
+        .unwrap();
+    let before = state.risk_counters();
+
+    assert_eq!(
+        state
+            .evaluate_quote_candidate(
+                quote(122),
+                PmRiskDependency::available(121),
+                PmRiskDependency::available(121),
+            )
+            .unwrap(),
+        PmPrivateQuoteEvaluation::Blocked(PmPrivateReadinessReason::UnmanagedOwnershipAmbiguous)
+    );
+    assert_eq!(state.risk_counters(), before);
+
+    let mut unknown_only = new_state();
+    make_ready(&mut unknown_only);
+    unknown_only
+        .observe_order(
+            envelope(unknown, 1, 30, None, 120),
+            PmRemoteOrderKnowledge::Unmanaged(PmReservationKnowledge::Unknown),
+        )
+        .unwrap();
+    let PmPrivateQuoteEvaluation::Blocked(PmPrivateReadinessReason::UnknownReservation(identity)) =
+        unknown_only
+            .evaluate_quote_candidate(
+                quote(121),
+                PmRiskDependency::available(120),
+                PmRiskDependency::available(120),
+            )
+            .unwrap()
+    else {
+        panic!("canonical unknown reservation must block before risk");
+    };
+    assert_eq!(identity, unknown.order());
+    assert!(matches!(
+        unknown_only.evaluate_risk_candidate(
+            quote(121),
+            PmRiskDependency::available(120),
+            PmRiskDependency::available(120),
+        ),
+        Err(PmPrivateStateError::CanonicalExposureUnavailable)
+    ));
+}
+
+#[test]
+fn combined_quote_evaluation_preserves_invalid_and_overflow_error_mapping() {
+    let mut invalid = new_state();
+    make_ready(&mut invalid);
+    let invalid_request = PmPrivateQuoteRequest::new(
+        120,
+        PmOrderSide::Buy,
+        PmPrice::parse_decimal("0.40").unwrap(),
+        PmQuantity::parse_decimal("1").unwrap(),
+        PmExactReservation::policy_approved(U256::ONE, U256::ZERO).unwrap(),
+    );
+    assert_eq!(
+        invalid
+            .evaluate_quote_candidate(
+                invalid_request,
+                PmRiskDependency::available(120),
+                PmRiskDependency::available(120),
+            )
+            .unwrap(),
+        PmPrivateQuoteEvaluation::Blocked(PmPrivateReadinessReason::ArithmeticInvalid)
+    );
+    assert_eq!(invalid.risk_counters().evaluations(), 0);
+
+    let mut overflow = new_state();
+    make_ready(&mut overflow);
+    for client in [10_u8, 11_u8] {
+        overflow
+            .register_owned_order(
+                PmOwnedOrderRegistration::new(
+                    client_order(client),
+                    instrument(),
+                    PmOrderSide::Buy,
+                    PmPrice::parse_decimal("0.40").unwrap(),
+                    PmQuantity::parse_decimal("1").unwrap(),
+                    PmExactReservation::policy_approved(U256::MAX, U256::ZERO).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        overflow
+            .evaluate_quote_candidate(
+                quote(121),
+                PmRiskDependency::available(120),
+                PmRiskDependency::available(120),
+            )
+            .unwrap(),
+        PmPrivateQuoteEvaluation::Blocked(PmPrivateReadinessReason::ArithmeticInvalid)
+    );
+    assert_eq!(overflow.risk_counters().evaluations(), 0);
+    assert!(matches!(
+        overflow.evaluate_risk_candidate(
+            quote(121),
+            PmRiskDependency::available(120),
+            PmRiskDependency::available(120),
+        ),
+        Err(PmPrivateStateError::ArithmeticOverflow)
     ));
 }
 
@@ -3106,6 +3294,120 @@ fn exact_private_progress_cancel_detail_and_compaction_share_one_owned_aggregate
     assert_eq!(
         state.owned_order(client).unwrap().status(),
         Some(PmOrderStatus::Filled)
+    );
+}
+
+#[test]
+fn ambiguous_owned_submit_requires_exactly_one_canonical_refresh() {
+    let mut state = new_state();
+    let quote = owned_quote_intent(1, 70, PmOrderSide::Buy);
+    let client = quote.client_order();
+    assert_eq!(
+        state.admit_owned_quote(quote).unwrap(),
+        PmOwnedQuoteAdmission::Admitted(client)
+    );
+    let requirements_before = state.refresh_counters().requirements();
+
+    assert_eq!(
+        state
+            .apply_owned_submit_result(client, PmOwnedSubmitResult::Ambiguous)
+            .unwrap(),
+        PmOwnedSubmitApply::MarkedAmbiguous
+    );
+    assert_eq!(
+        state
+            .pending_refresh_keys()
+            .filter(|key| key.reason() == PmRefreshReason::AmbiguousOrder)
+            .count(),
+        1
+    );
+    assert_eq!(
+        state.refresh_counters().requirements(),
+        requirements_before + 1
+    );
+
+    assert_eq!(
+        state
+            .apply_owned_submit_result(client, PmOwnedSubmitResult::Ambiguous)
+            .unwrap(),
+        PmOwnedSubmitApply::Duplicate
+    );
+    assert_eq!(
+        state
+            .pending_refresh_keys()
+            .filter(|key| key.reason() == PmRefreshReason::AmbiguousOrder)
+            .count(),
+        1
+    );
+    assert_eq!(
+        state.refresh_counters().requirements(),
+        requirements_before + 1
+    );
+}
+
+#[test]
+fn canonical_private_reserved_capacity_is_nonzero_and_stable_across_mutation() {
+    let mut state = new_state();
+    let reserved = state.reserved_capacity_bytes();
+    assert!(reserved > 0);
+
+    let quote = owned_quote_intent(1, 71, PmOrderSide::Buy);
+    let client = quote.client_order();
+    assert_eq!(
+        state.admit_owned_quote(quote).unwrap(),
+        PmOwnedQuoteAdmission::Admitted(client)
+    );
+    assert_eq!(
+        state
+            .apply_owned_submit_result(client, PmOwnedSubmitResult::Ambiguous)
+            .unwrap(),
+        PmOwnedSubmitApply::MarkedAmbiguous
+    );
+    assert_eq!(state.reserved_capacity_bytes(), reserved);
+}
+
+#[test]
+fn replacement_preflight_leaves_cancel_mutation_to_the_explicit_owner_path() {
+    let mut state = new_state();
+    let current = owned_quote_intent(1, 71, PmOrderSide::Buy);
+    let client = current.client_order();
+    let venue = venue_order("replacement-preflight");
+    assert_eq!(
+        state.admit_owned_quote(current).unwrap(),
+        PmOwnedQuoteAdmission::Admitted(client)
+    );
+    state
+        .apply_owned_submit_result(client, PmOwnedSubmitResult::Accepted(venue))
+        .unwrap();
+
+    let replacement = PmOwnedQuoteIntent::new(
+        PmOwnedIntentId::new(2).unwrap(),
+        PmOwnedQuoteSlotKey::new(scope(), instrument(), PmOrderSide::Buy),
+        client_order(72),
+        PmPrice::parse_decimal("0.41").unwrap(),
+        PmQuantity::parse_decimal("1").unwrap(),
+        PmExactReservation::policy_approved(U256::from_u64(410_000), U256::ZERO).unwrap(),
+    )
+    .unwrap();
+    let projected_cancel = match state.preflight_owned_quote(replacement).unwrap() {
+        PmOwnedQuoteAdmission::CancelBeforeReplace(cancel) => cancel,
+        other => panic!("expected cancel-before-replace preflight, got {other:?}"),
+    };
+    assert_eq!(projected_cancel.client_order(), client);
+    assert_eq!(projected_cancel.venue_order(), venue);
+    assert_eq!(
+        state.owned_order(client).unwrap().cancel(),
+        PmOwnedCancelState::None
+    );
+
+    let issued_cancel = match state.request_owned_cancel(client).unwrap() {
+        PmOwnedCancelRequestApply::Issued(cancel) => cancel,
+        other => panic!("expected explicit cancel mutation, got {other:?}"),
+    };
+    assert_eq!(issued_cancel, projected_cancel);
+    assert_eq!(
+        state.owned_order(client).unwrap().cancel(),
+        PmOwnedCancelState::Pending
     );
 }
 

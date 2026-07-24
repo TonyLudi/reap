@@ -13,6 +13,7 @@ use crate::public_routes::{OkxPublicUnavailableDelivery, PmPublicUnavailableDeli
 #[derive(Debug)]
 pub struct PmPublicLaneFaultEnactment<U> {
     pub(super) rejected_ordering: reap_pm_core::EventOrdering,
+    pub(super) action: SaturationAction,
     pub(super) unavailable_fault: U,
     pub(super) reducer_reason: Option<PmPublicReadinessReason>,
     pub(super) purged_queued_deliveries: usize,
@@ -22,6 +23,11 @@ impl<U: Copy> PmPublicLaneFaultEnactment<U> {
     #[must_use]
     pub const fn rejected_ordering(&self) -> reap_pm_core::EventOrdering {
         self.rejected_ordering
+    }
+
+    #[must_use]
+    pub const fn action(&self) -> SaturationAction {
+        self.action
     }
 
     #[must_use]
@@ -44,12 +50,14 @@ impl<U: Copy> PmPublicLaneFaultEnactment<U> {
         self,
     ) -> (
         reap_pm_core::EventOrdering,
+        SaturationAction,
         U,
         Option<PmPublicReadinessReason>,
         usize,
     ) {
         (
             self.rejected_ordering,
+            self.action,
             self.unavailable_fault,
             self.reducer_reason,
             self.purged_queued_deliveries,

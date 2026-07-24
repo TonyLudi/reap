@@ -45,6 +45,18 @@ commits and evidence are in
 These are deterministic, structural, and local measurement results, not
 credentialed exchange or production evidence.
 
+Goal F adds a credential-free Polymarket foundation as a sibling product, not
+as an extension of the Chaos runtime or OKX order gateway. Its exact product
+scope is [polymarket-product-connectivity-boundary.md](polymarket-product-connectivity-boundary.md);
+phase status and evidence are recorded separately in
+[multi-venue-polymarket-foundation-goal-f-handoff.md](multi-venue-polymarket-foundation-goal-f-handoff.md).
+The PM wire and fixture reference is only the reached tracked source at
+`../predarb` commit `8222273a9c72033b760e1d2fec813bc77144556d`; Reap neither
+depends on that checkout nor adopts its application/runtime architecture.
+This section records architecture and authority boundaries, not a claim that
+the Phase 6 evidence gate, authenticated PM connectivity, a production quote
+model, or trading approval is complete.
+
 ## Goals
 
 - Replicate the important `imm-strategy/chaos` decision logic in Rust.
@@ -128,6 +140,117 @@ reuse, or recover an opaque authority token outside the documented
 local-reservation or leased-journal path. Private-feed bootstrap likewise
 admits exactly one opaque validated login frame and requires subscription bytes
 to match trusted canonical serialization of the exact packed socket plan.
+
+## Multi-Venue Substrate And Concrete Products
+
+“Multi-venue” in Reap means that independently composed products reuse a small
+set of mechanics. It does not mean that all venue behavior is erased behind one
+exchange interface.
+
+| Layer | Current crates | Boundary |
+| --- | --- | --- |
+| Venue-neutral substrate | `reap-core`, `reap-transport`, `reap-capture-framing`, `reap-durable-writer` | Common source identity and typed envelopes, bounded delivery/supervision, JSONL framing/verification, and leased bounded-writer mechanics. These crates do not define PM economics, venue lifecycle, credentials, or order authority. |
+| Chaos/OKX product | `reap-strategy`, `reap-engine`, `reap-order`, `reap-live-contracts`, `reap-live`, and the role-specific OKX crates | The existing Chaos/iarb2 strategy, `f64` model state, regular-order profiles, authenticated OKX roles, and normal/evidence/emergency authority planes remain governed by the Chaos boundary. |
+| Polymarket product | `reap-pm-core`, `reap-pm-state`, `reap-polymarket-wire`, `reap-polymarket-adapter`, `reap-pm-strategy`, `reap-pm-live-contracts`, and `reap-pm-live` | Exact PM identity/numerics, PM protocol semantics, sealed capability roles, a static quote-model seam, PM reducers, and a sibling composition root. The existing Chaos live, contract, and order crates do not depend on these crates. |
+| PM use of OKX public data | `reap-okx-public-source` | One narrow credential-free `index-tickers` source for configured reference instruments. It exposes no OKX private, account, reconciliation, signer, submit, or cancel capability. |
+
+Shared code is extracted only for an invariant already used by both products.
+Venue-specific sequence rules, metadata, exact numbers, order lifecycles,
+readiness, and wire types stay in their concrete product crates. In particular,
+the existing `VenueAdapter`-shaped Chaos/OKX surface is not the template for
+Polymarket.
+
+There is no universal exchange adapter, dynamic venue/plugin registry, broad
+command union, or runtime-selected venue object. PM roles are concrete or
+sealed, the product graph is checked statically, and hot-path event payloads
+are not erased behind trait objects. Adding another venue means defining its
+product semantics and narrow roles, then reusing only the substrate invariants
+that actually match.
+
+### Polymarket ownership and event flow
+
+The PM product has one canonical mutation owner. Starting `PmProduct<M>` moves
+the public capture/session reducer, deterministic input scheduler, private and
+reconciliation reducers, schedule, model, journal/effect state, and fake
+execution role under one `PmCoordinator<M>`. The pieces remain responsibility-
+focused modules, but callers cannot recover a second mutable owner or place
+canonical state behind shared `Arc<Mutex<_>>`/`RwLock` ownership.
+
+```text
+configured OKX index-ticker session
+  -> exact typed public reference delivery ----------------------+
+                                                                  |
+configured PM metadata + snapshot/delta sessions                  |
+  -> integrity/readiness reduction -> exact book projection ------+
+                                                                  |
+fixture-only PM private order/fill role                            |
+fixture-only reconciliation role                                  |
+fixture-only account/allowance/position role                       |
+  -> typed complete observations ---------------------------------+
+                                                                  v
+bounded deterministic lanes
+  (critical -> persistence -> private -> scheduled
+   -> public -> reconciliation -> telemetry)
+                                                                  |
+                                                                  v
+PmCoordinator<M>
+  -> current reference + PM metadata/book/readiness gate
+  -> statically supplied pure M: PmQuoteModel
+  -> side-aware exact passive-quote policy
+  -> private readiness/risk + same-turn owned reservation
+  -> bounded journal intent -> durable acknowledgement
+  -> take-once prepared fake place/cancel
+  -> in-process fake result -> canonical order/fill reduction
+```
+
+OKX is an input source in this product, never its execution venue. The model
+receives the configured exact OKX reference and its revision; the coordinator
+requires current PM metadata and book state before evaluation, and the quote
+policy combines model output with exact PM metadata and BBO state. An OKX
+crypto price is therefore neither copied into a PM price nor treated as a
+probability.
+
+`PmQuoteModelRequirements` declares only the configured OKX reference, PM
+metadata/book, and quote-evaluation timer. `PmProduct<M>` requires the model
+type explicitly and uses static dispatch. The model returns fair probability,
+quantity, and sides but cannot access private state, reconciliation, a signer,
+or mutation authority. `validate_passive_quote_candidate` performs the one
+side-aware conversion into exact `PmPrice` units strictly inside `(0, 1)` and
+checks the current grid, minimum, exact amounts, and passivity. The checked-in
+fixture model proves composition only; there is no default or approved
+production probability model.
+
+The Polymarket adapter exposes separate sealed roles for public observation,
+private lifecycle, order reconciliation, account/allowance/position snapshots,
+and owned execution. `PmConnectivityPlan` joins model requirements, mandatory
+safety/read requirements, and the fixed fake profile, then validates a
+one-to-one scoped binding for every constructed role. None of those roles
+provides an arbitrary HTTP method, signer, authenticated session, raw command
+executor, cancel-all, or order-type selector.
+
+The composition roots preserve the same separation: `PmPublicCapture` builds
+only public roles, `PmReadOnlyMonitor` builds only fixture/read roles, and the
+full `PmProduct<M>` exists only with an explicit model. Neither independent
+root can be converted into mutation authority.
+
+Mutation is deliberately fake-only. The sole `PmOwnedExecutionRole`
+implementation reachable by the product is the in-process fixture executor,
+limited to exact GTC post-only placement and cancellation carrying proven
+local ownership. Reservation occurs before dispatch, an intent must be durably
+acknowledged before a prepared effect exists, and prepared authority is
+take-once. Goal F contains no PM credential, signing implementation,
+authenticated private network session, or live submit constructor.
+
+Network parsing, capture, durable writing, and telemetry remain at bounded
+edges. Typed queues have fixed capacities, deterministic ordering/age rules,
+and semantic saturation actions: critical or persistence failure stops,
+private saturation halts the account and requires reconciliation, public
+saturation invalidates readiness and resynchronizes, scheduled saturation
+suppresses quotes and cancels owned quotes, reconciliation remains unready and
+retries, and telemetry alone may coalesce. The coordinator consumes immutable
+typed deliveries and completed receipts; it performs no socket IO, raw JSON
+parsing, credential access, or blocking file/log work in its canonical
+reduction path.
 
 ## Executable Decision And Risk Parity Boundary
 
@@ -213,14 +336,27 @@ Recommended initial stack:
 
 ## Workspace Layout
 
-Current 23-crate structure:
+Current 35-crate structure:
 
 ```text
 reap/
   crates/
     reap-core/
+    reap-transport/
+    reap-capture-framing/
+    reap-benchmark-allocator/
+    reap-durable-writer/
+    reap-pm-core/
+    reap-pm-state/
+    reap-polymarket-wire/
+    reap-pm-strategy/
+    reap-polymarket-adapter/
+    reap-pm-live-contracts/
+    reap-pm-live/
+    reap-okx-public-source/
     reap-venue/
     reap-feed/
+    reap-fault/
     reap-book/
     reap-order/
     reap-okx-wire/
@@ -239,18 +375,29 @@ reap/
     reap-emergency-core/
     reap-okx-emergency-adapter/
     reap-emergency-runner/
-    reap-fault/
     reap-cli/
 ```
 
 | Crate | Current responsibility and authority boundary |
 | --- | --- |
-| `reap-core` | Shared primitive types, normalized events, clocks, and pure host/pacing policy; no IO authority. |
-| `reap-venue` | Credential-free venue protocol/parsing, exact OKX metadata, and connectivity keys; no signer or authenticated client. |
+| `reap-core` | Shared primitive types, common venue/source identity, normalized Chaos events, clocks, and pure host/pacing policy; no PM executable numerics or IO authority. |
+| `reap-transport` | Venue-neutral bounded delivery, reconnect/backoff, supervision, health, and cooperative shutdown mechanics; no venue protocol, parser, or command authority. |
+| `reap-capture-framing` | Shared bounded JSONL framing, hashing, regular-file checks, and verification mechanics used beneath product capture schemas. |
+| `reap-benchmark-allocator` | Process-local allocation accounting for explicit evidence and benchmark entry points; no venue, strategy, or mutation authority. |
+| `reap-durable-writer` | Generic leased, bounded, typed-codec writer and durable acknowledgement mechanics; it knows no product record schema or order semantics. |
+| `reap-pm-core` | Structural PM identity, exact heap-free numeric values, typed event clocks/envelopes, metadata, and lifecycle facts; no IO or executable approval constructor. |
+| `reap-pm-state` | Pure bounded PM book, private order/fill, reservation, account/allowance/position, readiness, refresh, and risk reducers. |
+| `reap-polymarket-wire` | Public and fixture-only PM DTO parsing plus canonical unsigned-order fields; no signer, authentication header, private key, or signed request. |
+| `reap-pm-strategy` | Statically dispatched pure quote-model requirements/output and the exact side-aware passive quote-policy boundary. |
+| `reap-polymarket-adapter` | Separate sealed PM public, fixture-private, read-only reconciliation/account, and in-process fake-execution roles; no broad client escape. |
+| `reap-pm-live-contracts` | Secret-free scoped PM configuration, exact capability plan, role bindings, lanes, and readiness dependencies. |
+| `reap-pm-live` | Sibling PM public capture/replay, read-only monitor, deterministic lanes, one-owner coordinator, exact journal, and fake-only quote/cancel lifecycle. |
+| `reap-okx-public-source` | Narrow credential-free OKX index-ticker source used by the PM product; no OKX private/account/order role. |
+| `reap-venue` | Existing credential-free Chaos/OKX protocol/parsing, exact OKX metadata, and connectivity keys; no signer or authenticated client, and not a universal PM adapter. |
 | `reap-feed` | Public/private socket supervision, subscription readiness, deduplication, sequencing, book arbitration, and recovery. |
 | `reap-fault` | Separate loopback-only deterministic demo fault proxy; never a live strategy sidecar or production gateway. |
 | `reap-book` | Single-owner book reduction and quality state usable by live and backtest. |
-| `reap-order` | Linear regular-order policy, canonical reservation/ownership, idempotent preparation, pacing, and order reduction; no raw transport. |
+| `reap-order` | Chaos/OKX linear regular-order policy, canonical reservation/ownership, idempotent preparation, pacing, and order reduction; no PM profile or raw transport. |
 | `reap-okx-wire` | Low-level OKX credentials/signature/login and HTTP/websocket transport primitives for role adapters; it owns no endpoint policy and is not a strategy API. |
 | `reap-okx-live-adapter` | Normal-live authenticated role factories, exact allowlists, private/reconciliation/safety clients, and adapter-owned regular command websocket/serialization. |
 | `reap-emergency-core` | Credential-free emergency configuration, report, evidence, and verification contracts; no OKX client or signer. |
@@ -265,8 +412,8 @@ reap/
 | `reap-capture` | Credential-free raw capture, normalization, analysis, and evidence ownership. |
 | `reap-storage` | Exclusively leased JSONL journal, recovery proofs, bounded writer, and observation-only writer progress. |
 | `reap-telemetry` | Alerts, metrics, host observations, and report support; it does not own canonical trading state. |
-| `reap-live-contracts` | Pure serialized live configuration/connectivity/account evidence contracts below the runtime. |
-| `reap-live` | One `LiveRuntime`/`LiveCoordinator` canonical mutation owner and the normal live composition/lifecycle. |
+| `reap-live-contracts` | Pure serialized Chaos/OKX live configuration/connectivity/account evidence contracts below that runtime; no PM product configuration. |
+| `reap-live` | One `LiveRuntime`/`LiveCoordinator` canonical mutation owner and the existing Chaos/OKX normal live composition/lifecycle; no PM product dependency. |
 | `reap-cli` | User-facing composition root for validate, observe/demo, capture/research, evidence, and verification commands. |
 
 ### `reap-core`
@@ -307,13 +454,15 @@ pub enum NormalizedEvent {
 
 ### `reap-venue`
 
-Venue abstraction and exchange-specific adapters.
+Existing Chaos/OKX venue protocol and legacy venue-facing contracts.
+`reap-venue` is not the cross-product exchange interface, and adding PM does
+not widen its legacy `VenueAdapter` surface.
 
 Responsibilities:
 
-- Venue trait definitions.
-- Raw websocket message envelopes.
-- Exchange parser modules such as OKX, Binance, Hyperliquid, etc.
+- Venue traits and raw websocket envelopes already required by the Chaos/OKX
+  call path.
+- OKX protocol parsing and normalized Chaos event construction.
 - Normalization from exchange payloads into `reap-core` events.
 - Venue-specific sequence, checksum, and channel semantics.
 - Venue-specific public order protocol types and response parsing; authenticated
@@ -333,11 +482,6 @@ reap-venue/
     lib.rs
     traits.rs
     okx/
-      ws.rs
-      rest.rs
-      parse.rs
-      order.rs
-    binance/
       ws.rs
       rest.rs
       parse.rs

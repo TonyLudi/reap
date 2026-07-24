@@ -1026,6 +1026,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "reap-benchmark-allocator"
+version = "0.1.0"
+
+[[package]]
 name = "reap-book"
 version = "0.1.0"
 dependencies = [
@@ -1378,6 +1382,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "futures-util",
+ "reap-benchmark-allocator",
  "reap-capture-framing",
  "reap-durable-writer",
  "reap-okx-public-source",

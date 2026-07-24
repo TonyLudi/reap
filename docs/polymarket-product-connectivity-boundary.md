@@ -1338,6 +1338,16 @@ The benchmark installs the workspace counting allocator immediately after
 preallocation. It reports call/byte deltas for the timed owner path.
 `reserved_capacity_bytes()` deterministically sums every canonical container,
 queue, slab, schedule, and retained-ID allocation and must be at most 64 MiB.
+Parser/input boxes constructed and parsed in the excluded ingress interval are
+consumed and dropped by the owner path. Their deallocation calls and bytes,
+including a negative signed live-byte delta, therefore remain inside the
+measurement; they are not retained owner growth. Every normalized owner
+interval must still report exactly zero allocation calls and zero allocated
+bytes. All five same-owner passes and all three fresh recorded invocations must
+match the complete allocation report, including deallocation calls,
+deallocated bytes, signed live-byte delta, and peak live bytes; any positive
+signed live-byte delta is red.
+
 Replay runs from a fresh process/state and reports allocator peak-live minus
 post-construction live bytes, which must be at most 16 MiB. Five repeated
 nominal passes run through the same preallocated owner and sealed rolling

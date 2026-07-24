@@ -246,6 +246,7 @@ pub(crate) struct PmFillState {
     query_keys: Vec<PmFillKey>,
     provisional: PmProvisionalDeltas,
     watermark: Option<PmFillQueryCursor>,
+    reconciliation_completion: Option<PmPrivateOccurrence>,
     observed_monotonic_ns: Option<u64>,
     counters: PmFillCounters,
 }
@@ -257,9 +258,21 @@ impl PmFillState {
             query_keys: Vec::with_capacity(MAX_PM_PRIVATE_FILLS),
             provisional: empty_deltas(),
             watermark: None,
+            reconciliation_completion: None,
             observed_monotonic_ns: None,
             counters: PmFillCounters::default(),
         }
+    }
+
+    pub(crate) fn reserved_capacity_bytes(&self) -> usize {
+        self.entries
+            .capacity()
+            .saturating_mul(std::mem::size_of::<FillEntry>())
+            .saturating_add(
+                self.query_keys
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<PmFillKey>()),
+            )
     }
 
     pub(crate) fn observe(
@@ -445,6 +458,7 @@ impl PmFillState {
             }
         }
         self.watermark = Some(query.resulting_watermark());
+        self.reconciliation_completion = Some(completion);
         self.observed_monotonic_ns = Some(envelope.clock().monotonic_service_ns());
         self.provisional = recompute_provisional(&self.entries, config)?;
         self.counters.reconciliation_queries =
@@ -462,6 +476,25 @@ impl PmFillState {
 
     pub(crate) const fn watermark(&self) -> Option<PmFillQueryCursor> {
         self.watermark
+    }
+
+    pub(crate) const fn reconciliation_completion(&self) -> Option<PmPrivateOccurrence> {
+        self.reconciliation_completion
+    }
+
+    pub(crate) fn compact_covered_through(&mut self, through: PmPrivateOccurrence) -> usize {
+        let prior = self.entries.len();
+        self.entries.retain(|entry| {
+            let covered = entry
+                .covered_by_reconciliation
+                .is_some_and(|covered| covered <= through);
+            let no_later_private_fact = entry
+                .last_occurrence
+                .private_occurrence()
+                .is_none_or(|occurrence| occurrence <= through);
+            !(covered && no_later_private_fact)
+        });
+        prior - self.entries.len()
     }
 
     pub(crate) const fn observed_monotonic_ns(&self) -> Option<u64> {

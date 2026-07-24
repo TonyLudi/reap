@@ -101,6 +101,8 @@ async fn fill_watermark_records_every_cursor_advance_and_never_an_unchanged_curs
         .reduce_serviced_reconciliation(account, fills)
         .unwrap();
     assert_eq!(owner.counters().fact_records(), after_fill + 1);
+    drain_persistence(&mut owner, 151).await;
+    assert!(!owner.private_mut().fill_watermark_compaction_pending());
 
     let (account, fills) = reconciliation_pair(&config, 5, 160, 161, Some(2), 3, 160);
     owner

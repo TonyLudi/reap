@@ -700,6 +700,33 @@ pub(crate) enum PmFakeEffectQueueError {
 }
 
 #[cfg(test)]
+pub(crate) struct Phase6FakeEffectAllocationProbe {
+    queue: PmFakeEffectQueue,
+}
+
+#[cfg(test)]
+impl Phase6FakeEffectAllocationProbe {
+    pub(crate) fn new() -> Result<Self, PmFakeEffectQueueError> {
+        Ok(Self {
+            queue: PmFakeEffectQueue::new()?,
+        })
+    }
+
+    pub(crate) fn attempt(&mut self, monotonic_ns: u64) -> Result<(), PmFakeEffectQueueError> {
+        let permit = self.queue.try_reserve()?;
+        self.queue.commit(
+            permit,
+            PmPreparedFakeEffect::synthetic(PmPreparedFakeEffectKind::Quote),
+            monotonic_ns,
+        )
+    }
+
+    pub(crate) fn metrics(&self) -> PmFakeEffectMetrics {
+        self.queue.projection()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use reap_pm_core::SnapshotRevision;
 
@@ -946,7 +973,7 @@ mod tests {
     }
 
     #[test]
-    fn saturation_latches_suppression_and_no_queued_quote_dispatches() {
+    fn phase6_fake_effect_row_is_257_attempts_after_256_durable_records() {
         let mut queue = PmFakeEffectQueue::new().unwrap();
         let reserved_capacity_bytes = queue.reserved_capacity_bytes();
         for ordinal in 0..PM_FAKE_EFFECT_CAPACITY {
@@ -959,11 +986,20 @@ mod tests {
         }
 
         assert_eq!(queue.depth(), PM_FAKE_EFFECT_CAPACITY);
+        assert_eq!(queue.queued_len(), PM_FAKE_EFFECT_CAPACITY);
         assert_eq!(queue.metrics().high_water(), 256);
+        assert_eq!(queue.metrics().committed_after_durability(), 256);
+        let committed_before_rejection = queue.metrics().committed_after_durability();
         assert_eq!(
             queue.try_reserve().unwrap_err(),
             PmFakeEffectQueueError::Full
         );
+        assert_eq!(
+            queue.metrics().committed_after_durability(),
+            committed_before_rejection,
+            "the 257th attempt is rejected before any record can claim dispatch"
+        );
+        assert_eq!(queue.metrics().serviced(), 0);
         assert!(queue.quote_suppressed());
 
         for _ in 0..PM_FAKE_EFFECT_CAPACITY {

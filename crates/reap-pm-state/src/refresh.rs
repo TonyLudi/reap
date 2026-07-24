@@ -272,6 +272,10 @@ impl PmRefreshState {
         }
     }
 
+    pub(crate) fn reserved_capacity_bytes(&self) -> usize {
+        std::mem::size_of_val(&self.entries)
+    }
+
     pub(crate) fn require(
         &mut self,
         key: PmRefreshKey,
@@ -397,6 +401,10 @@ impl PmRefreshState {
         self.full_reconcile_required
     }
 
+    pub(crate) fn complete_full_reconciliation(&mut self) {
+        self.full_reconcile_required = false;
+    }
+
     pub(crate) const fn counters(&self) -> PmRefreshCounters {
         self.counters
     }
@@ -518,26 +526,40 @@ mod tests {
     }
 
     #[test]
-    fn saturation_retains_a_coarse_full_reconciliation_requirement() {
+    fn phase6_refresh_mechanism_row_is_exactly_129_attempts_until_full_reconciliation() {
         let mut state = PmRefreshState::new(owner());
+        let mut inserted = 0;
         for index in 0..MAX_PM_REFRESH_OBLIGATIONS {
             let index = u16::try_from(index).unwrap();
             assert!(matches!(
                 state
-                    .require(key(index, PmRefreshReason::UnmanagedOrder))
+                    .require(key(index, PmRefreshReason::FillObserved))
                     .unwrap(),
                 PmRefreshRequired::Inserted { .. }
             ));
+            inserted += 1;
         }
-        let rejected_key = key(900, PmRefreshReason::RiskBreach);
+        let rejected_key = key(900, PmRefreshReason::FillObserved);
         assert_eq!(
             state.require(rejected_key).unwrap(),
             PmRefreshRequired::Saturated { key: rejected_key }
         );
+        assert_eq!(inserted, 128);
         assert_eq!(state.len(), MAX_PM_REFRESH_OBLIGATIONS);
-        assert!(state.full_reconcile_required());
+        assert_eq!(state.pending().count(), MAX_PM_REFRESH_OBLIGATIONS);
+        assert!(!state.pending_keys().any(|key| key == rejected_key));
+        // The one coarse bit is the mechanism's fail-closed readiness result
+        // for the exact rejected scope; no public constructor or runtime
+        // authority is introduced for this test.
+        let rejected_scope_is_unready = state.full_reconcile_required();
+        assert!(rejected_scope_is_unready);
         assert_eq!(state.counters().high_water(), MAX_PM_REFRESH_OBLIGATIONS);
         assert_eq!(state.counters().saturations(), 1);
+        assert_eq!(state.counters().requirements(), 129);
+        state.complete_full_reconciliation();
+        assert!(!state.full_reconcile_required());
+        assert_eq!(state.len(), MAX_PM_REFRESH_OBLIGATIONS);
+        assert_eq!(state.pending().count(), MAX_PM_REFRESH_OBLIGATIONS);
     }
 
     #[test]

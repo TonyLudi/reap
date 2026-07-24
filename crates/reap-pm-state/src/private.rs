@@ -15,9 +15,10 @@ use crate::fill_state::{
     PmProvisionalDeltas,
 };
 use crate::order_state::{
-    PmOpenOrderReservation, PmOpenOrdersApply, PmOrderApply, PmOrderCounters, PmOrderOwnership,
-    PmOrderProjection, PmOrderState, PmOrderStateError, PmOwnedOrderRegistration,
-    PmRemoteOrderKnowledge, PmReservationBasis, PmReservationKnowledge, PmReservationTotalsError,
+    PmOpenOrderReservation, PmOpenOrdersApply, PmOrderApply, PmOrderCounters,
+    PmOrderDecisionSummary, PmOrderOwnership, PmOrderProjection, PmOrderState, PmOrderStateError,
+    PmOwnedOrderRegistration, PmRemoteOrderKnowledge, PmReservationBasis, PmReservationKnowledge,
+    PmReservationTotalsError,
 };
 use crate::owned_lifecycle::{
     PmOwnedOrderLifecycle, PmOwnedOrderLifecycleError, PmOwnedReductionSequence,
@@ -26,9 +27,11 @@ use crate::private_config::{PmPrivateConfigError, PmPrivateStateConfig};
 use crate::private_ingress::{PmPrivateExternalIngressCounters, PmPrivateExternalIngressFault};
 use crate::private_occurrence::PmPrivateOccurrence;
 use crate::private_readiness::{
-    PmPrivateConvergence, PmPrivateHaltReason, PmPrivateQuoteRequest, PmPrivateReadiness,
-    PmReadinessContext,
+    PmPrivateConvergence, PmPrivateHaltReason, PmPrivateQuoteEvaluation, PmPrivateQuoteRequest,
+    PmPrivateReadiness, PmReadinessContext,
 };
+#[cfg(test)]
+use crate::refresh::MAX_PM_REFRESH_OBLIGATIONS;
 use crate::refresh::{
     PmRefreshAdmission, PmRefreshCompletion, PmRefreshCounters, PmRefreshError, PmRefreshKey,
     PmRefreshOwnerId, PmRefreshReason, PmRefreshRequired, PmRefreshState, PmRefreshTicket,
@@ -44,7 +47,8 @@ use crate::unresolved_fill::{
 
 mod owned_lifecycle;
 pub use owned_lifecycle::{
-    PmOwnedFillReduction, PmOwnedImmediateAckTicket, PmOwnedOrderReduction, PmPrivateFillReduction,
+    PmFillCompaction, PmOwnedFillReduction, PmOwnedImmediateAckTicket, PmOwnedOrderReduction,
+    PmPreparedFillCompaction, PmPreparedOwnedQuoteAdmission, PmPrivateFillReduction,
     PmPrivateOrderReduction, PmReconciliationFillDisposition, PmReconciliationFillReduction,
     PmReconciliationReductions,
 };
@@ -76,6 +80,21 @@ pub struct PmPrivateState {
     external_ingress_counters: PmPrivateExternalIngressCounters,
     owned_reduction_high_watermark: u64,
     outstanding_owned_immediate: Option<PmOwnedReductionSequence>,
+    next_fill_compaction_generation: u64,
+    pending_fill_compaction_generation: Option<u64>,
+}
+
+/// Read-only cardinalities for bounded canonical private-owner containers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PmPrivateCardinalities {
+    pub canonical_orders: usize,
+    pub owned_orders: usize,
+    pub owned_quote_slots: usize,
+    pub canonical_fills: usize,
+    pub owned_fill_keys: usize,
+    pub unresolved_fills: usize,
+    pub pending_refresh: usize,
+    pub fill_compaction_pending: bool,
 }
 
 impl PmPrivateState {
@@ -111,6 +130,8 @@ impl PmPrivateState {
             external_ingress_counters: PmPrivateExternalIngressCounters::default(),
             owned_reduction_high_watermark: 0,
             outstanding_owned_immediate: None,
+            next_fill_compaction_generation: 1,
+            pending_fill_compaction_generation: None,
         })
     }
 
@@ -483,16 +504,23 @@ impl PmPrivateState {
             .apply_detail(envelope, reservation, &self.config);
         match result {
             Ok(outcome) => {
+                let mut owned_ambiguity = false;
                 if let Some(event) = detail.order() {
-                    bridge_owned_order_event(
+                    owned_ambiguity = bridge_owned_order_event(
                         &mut self.owned_lifecycle,
                         event,
                         occurrence,
                         crate::owned_lifecycle::PmOwnedObservationSource::RestReconciliation,
-                    )?;
+                    )?
+                        == crate::owned_lifecycle::PmOwnedRemoteOrderApply::AmbiguousRemote
+                        && self.orders.ownership(event.order())
+                            == Some(PmOrderOwnership::ProvenOwned);
                 } else if outcome == PmOrderApply::DetailAbsenceTerminalized {
                     self.owned_lifecycle
                         .observe_detail_absence(detail.requested_order(), occurrence)?;
+                }
+                if owned_ambiguity {
+                    let _required = self.require_refresh(PmRefreshReason::AmbiguousOrder)?;
                 }
                 Ok(outcome)
             }
@@ -647,6 +675,9 @@ impl PmPrivateState {
                 uncovered_fills: uncovered,
             }
         };
+        if uncovered == 0 {
+            self.refresh.complete_full_reconciliation();
+        }
         if uncovered > 0
             && let Err(error) = self.require_refresh(PmRefreshReason::AccountDivergence)
         {
@@ -671,6 +702,14 @@ impl PmPrivateState {
 
     #[must_use]
     pub fn quote_readiness(&self, request: PmPrivateQuoteRequest) -> PmPrivateReadiness {
+        self.quote_readiness_with_order_summary(request, self.orders.decision_summary())
+    }
+
+    fn quote_readiness_with_order_summary(
+        &self,
+        request: PmPrivateQuoteRequest,
+        order_summary: PmOrderDecisionSummary,
+    ) -> PmPrivateReadiness {
         if request
             .reservation()
             .validate_for(request.side(), request.price(), request.quantity())
@@ -697,7 +736,30 @@ impl PmPrivateState {
                 freshness: self.risk_limits.freshness(),
             },
             request,
+            order_summary,
         )
+    }
+
+    pub fn evaluate_quote_candidate(
+        &mut self,
+        request: PmPrivateQuoteRequest,
+        reference: PmRiskDependency,
+        book: PmRiskDependency,
+    ) -> Result<PmPrivateQuoteEvaluation, PmPrivateStateError> {
+        let order_summary = self.orders.decision_summary();
+        let ready = match self.quote_readiness_with_order_summary(request, order_summary) {
+            PmPrivateReadiness::Ready(ready) => ready,
+            PmPrivateReadiness::Blocked(reason) => {
+                return Ok(PmPrivateQuoteEvaluation::Blocked(reason));
+            }
+        };
+        let risk = self.evaluate_risk_candidate_with_order_summary(
+            request,
+            reference,
+            book,
+            order_summary,
+        )?;
+        Ok(PmPrivateQuoteEvaluation::Evaluated { ready, risk })
     }
 
     pub fn evaluate_risk_candidate(
@@ -706,6 +768,17 @@ impl PmPrivateState {
         reference: PmRiskDependency,
         book: PmRiskDependency,
     ) -> Result<PmRiskDecision, PmPrivateStateError> {
+        let order_summary = self.orders.decision_summary();
+        self.evaluate_risk_candidate_with_order_summary(request, reference, book, order_summary)
+    }
+
+    fn evaluate_risk_candidate_with_order_summary(
+        &mut self,
+        request: PmPrivateQuoteRequest,
+        reference: PmRiskDependency,
+        book: PmRiskDependency,
+        order_summary: PmOrderDecisionSummary,
+    ) -> Result<PmRiskDecision, PmPrivateStateError> {
         request
             .reservation()
             .validate_for(request.side(), request.price(), request.quantity())?;
@@ -713,7 +786,7 @@ impl PmPrivateState {
             return Err(PmOrderStateError::OwnedReservationRequiresPolicy.into());
         }
         let (reserved_collateral, reserved_outcome) =
-            self.orders
+            order_summary
                 .reservation_totals()
                 .map_err(|error| match error {
                     PmReservationTotalsError::Unknown(_) => {
@@ -748,8 +821,8 @@ impl PmPrivateState {
             reserved_collateral,
             reserved_collateral,
             reserved_outcome,
-            self.orders.live_count(),
-            self.orders.unresolved_count(),
+            order_summary.live_count(),
+            order_summary.unresolved_count(),
             self.unresolved_risk_count(),
         );
         let decision = self.risk.evaluate(crate::risk::PmRiskInput::new(
@@ -828,6 +901,39 @@ impl PmPrivateState {
         self.fills.watermark()
     }
 
+    #[must_use]
+    pub const fn fill_watermark_compaction_pending(&self) -> bool {
+        self.pending_fill_compaction_generation.is_some()
+    }
+
+    /// Returns the bytes reserved by every bounded canonical private-state
+    /// container. The total depends on configured capacities, never current
+    /// row counts.
+    #[must_use]
+    pub fn reserved_capacity_bytes(&self) -> usize {
+        self.account
+            .reserved_capacity_bytes()
+            .saturating_add(self.orders.reserved_capacity_bytes())
+            .saturating_add(self.owned_lifecycle.reserved_capacity_bytes())
+            .saturating_add(self.fills.reserved_capacity_bytes())
+            .saturating_add(self.unresolved_fills.reserved_capacity_bytes())
+            .saturating_add(self.refresh.reserved_capacity_bytes())
+    }
+
+    #[must_use]
+    pub fn cardinalities(&self) -> PmPrivateCardinalities {
+        PmPrivateCardinalities {
+            canonical_orders: self.orders.projections().count(),
+            owned_orders: self.owned_lifecycle.order_count(),
+            owned_quote_slots: self.owned_lifecycle.occupied_slot_count(),
+            canonical_fills: self.fills.projections().count(),
+            owned_fill_keys: self.owned_lifecycle.fill_key_count(),
+            unresolved_fills: usize::from(self.unresolved_fills.active_count()),
+            pending_refresh: self.refresh.len(),
+            fill_compaction_pending: self.fill_watermark_compaction_pending(),
+        }
+    }
+
     pub fn require_refresh(
         &mut self,
         reason: PmRefreshReason,
@@ -835,6 +941,23 @@ impl PmPrivateState {
         Ok(self
             .refresh
             .require(PmRefreshKey::new(self.account(), self.instrument(), reason))?)
+    }
+
+    #[cfg(test)]
+    fn phase6_fill_refresh_capacity(&mut self) {
+        let mut ordinal = 0_u16;
+        while self.refresh.len() < MAX_PM_REFRESH_OBLIGATIONS {
+            let account = reap_pm_core::PmAccountHandle::from_ordinal(ordinal);
+            let _required = self
+                .refresh
+                .require(PmRefreshKey::new(
+                    account,
+                    self.instrument(),
+                    PmRefreshReason::FillObserved,
+                ))
+                .unwrap();
+            ordinal = ordinal.checked_add(1).unwrap();
+        }
     }
 
     pub fn mark_refresh_admitted(
@@ -1208,6 +1331,16 @@ pub enum PmPrivateStateError {
     OwnedReductionSequenceExhausted,
     #[error("journal recovery owned reduction sequence did not advance")]
     OwnedRecoverySequenceDidNotAdvance,
+    #[error("a fill-watermark compaction proof is already pending")]
+    FillCompactionPending,
+    #[error("no complete fill reconciliation exists for compaction")]
+    MissingFillCompactionCut,
+    #[error("fill-watermark compaction generation exhausted")]
+    FillCompactionGenerationExhausted,
+    #[error("fill-watermark compaction proof belongs to another owner or generation")]
+    FillCompactionTicketMismatch,
+    #[error("canonical refresh-obligation storage is saturated")]
+    RefreshObligationSaturated,
     #[error(transparent)]
     Config(#[from] PmPrivateConfigError),
     #[error(transparent)]
@@ -1257,3 +1390,6 @@ const fn convergence_observed(convergence: PmPrivateConvergence) -> Option<u64> 
         PmPrivateConvergence::Uninitialized | PmPrivateConvergence::Divergent { .. } => None,
     }
 }
+
+#[cfg(test)]
+mod post_apply_refresh_tests;

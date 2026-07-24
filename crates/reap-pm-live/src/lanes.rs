@@ -56,6 +56,8 @@ pub use service::PmPublicLaneService;
 
 #[cfg(test)]
 mod complete_tests;
+#[cfg(test)]
+mod phase6_overload_tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PmIngressOrder {

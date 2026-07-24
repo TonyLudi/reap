@@ -1,0 +1,5 @@
+error[E0599]: no method named `service_lane_turn` found for struct `PmProductPublicIngress<'a>` in the current scope
+ --> tests/ui/product_public_ingress_cannot_service_lane.rs:6:21
+  |
+6 |     let _ = ingress.service_lane_turn(1, consumer);
+  |                     ^^^^^^^^^^^^^^^^^ method not found in `PmProductPublicIngress<'_>`

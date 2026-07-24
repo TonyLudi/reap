@@ -38,6 +38,22 @@ impl PmOkxReferenceInput {
         })
     }
 
+    /// Fixed local-evidence ingress after construction by the sealed runner.
+    /// No public caller can stamp this occurrence or obtain the constructor.
+    pub(crate) const fn from_evidence(
+        connection: PmConnectionId,
+        ordering: EventOrdering,
+        clock: EventClock,
+        event: OkxReferenceEvent,
+    ) -> Self {
+        Self {
+            connection,
+            ordering,
+            clock,
+            event,
+        }
+    }
+
     /// Configured route connection carried by the serviced occurrence.
     #[must_use]
     pub const fn connection(self) -> PmConnectionId {
@@ -84,6 +100,20 @@ impl PmMarketInput {
             clock: item.clock(),
             event: item.into_value(),
         })
+    }
+
+    pub(crate) const fn from_evidence(
+        connection: PmConnectionId,
+        ordering: EventOrdering,
+        clock: EventClock,
+        event: PmMarketEvent,
+    ) -> Self {
+        Self {
+            connection,
+            ordering,
+            clock,
+            event,
+        }
     }
 
     #[must_use]
@@ -245,6 +275,30 @@ impl PmBookInput {
             return Err(PmProductInputError::BookProjectionMismatch);
         }
         if projection.is_ready() && ordering.snapshot_revision() != projection.snapshot_revision() {
+            return Err(PmProductInputError::BookProjectionMismatch);
+        }
+        Ok(Self {
+            connection,
+            ordering,
+            clock,
+            event,
+            projection,
+        })
+    }
+
+    pub(crate) fn from_evidence(
+        connection: PmConnectionId,
+        ordering: EventOrdering,
+        clock: EventClock,
+        event: PmBookEvent,
+        projection: PmBookDecisionProjection,
+    ) -> Result<Self, PmProductInputError> {
+        if event.instrument() != projection.instrument()
+            || event.metadata_revision() != projection.metadata_revision()
+            || projection.observed_monotonic_ns() != clock.monotonic_receive_ns()
+            || (projection.is_ready()
+                && ordering.snapshot_revision() != projection.snapshot_revision())
+        {
             return Err(PmProductInputError::BookProjectionMismatch);
         }
         Ok(Self {

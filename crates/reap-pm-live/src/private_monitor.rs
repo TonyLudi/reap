@@ -18,14 +18,14 @@ use reap_pm_state::{
     PmOwnedImmediateAckTicket, PmOwnedOrderProgressObservation, PmOwnedOrderProjection,
     PmOwnedProgressApply, PmOwnedQuoteAdmission, PmOwnedQuoteIntent, PmOwnedRecoveryFill,
     PmOwnedReductionSequence, PmOwnedSubmitApply, PmOwnedSubmitResult, PmOwnedTerminalCompaction,
-    PmPrivateConvergence, PmPrivateExternalIngressCounters, PmPrivateExternalIngressFailure,
-    PmPrivateExternalIngressFault, PmPrivateExternalIngressLane, PmPrivateFillReduction,
-    PmPrivateHaltReason, PmPrivateOrderReduction, PmPrivateQuoteRequest, PmPrivateReadiness,
-    PmPrivateState, PmPrivateStateConfig, PmPrivateStateError, PmProvisionalDeltas,
-    PmReconciliationApply, PmReconciliationReductions, PmRefreshCounters, PmRefreshKey,
-    PmRemoteOrderKnowledge, PmReservationKnowledge, PmRiskCounters, PmRiskDecision,
-    PmRiskDependency, PmRiskLimits, PmUnresolvedFillApply, PmUnresolvedFillCounters,
-    PmUnresolvedFillKey, PmUnresolvedFillObservation, PmUnresolvedFillProjection,
+    PmPreparedOwnedQuoteAdmission, PmPrivateConvergence, PmPrivateExternalIngressCounters,
+    PmPrivateExternalIngressFailure, PmPrivateExternalIngressFault, PmPrivateExternalIngressLane,
+    PmPrivateFillReduction, PmPrivateHaltReason, PmPrivateOrderReduction, PmPrivateQuoteEvaluation,
+    PmPrivateQuoteRequest, PmPrivateReadiness, PmPrivateState, PmPrivateStateConfig,
+    PmPrivateStateError, PmProvisionalDeltas, PmReconciliationApply, PmReconciliationReductions,
+    PmRefreshCounters, PmRefreshKey, PmRemoteOrderKnowledge, PmReservationKnowledge,
+    PmRiskCounters, PmRiskDependency, PmRiskLimits, PmUnresolvedFillApply,
+    PmUnresolvedFillCounters, PmUnresolvedFillObservation, PmUnresolvedFillProjection,
     PmUnresolvedFillReason, PmUnresolvedFillStateError,
 };
 use reap_polymarket_adapter::{
@@ -40,8 +40,13 @@ use thiserror::Error;
 
 use crate::composition::PmCompositionError;
 
+mod batch_validation;
+mod maintenance;
 mod product_fixture;
 
+use batch_validation::PmPrivateBatchIdentityScratch;
+#[cfg(test)]
+pub(crate) use batch_validation::PmPrivateBatchValidationProbe;
 pub(crate) use product_fixture::PmFixturePairedReconciliationDelivery;
 
 /// One validated request/completion cut for a fixture-only read.
@@ -476,6 +481,22 @@ pub(crate) struct PmPrivateMonitorRuntime {
     account: PmFixtureAccountPositionSnapshot,
     state: PmPrivateState,
     open_order_reservation_scratch: Vec<PmOpenOrderReservation>,
+    private_batch_identity_scratch: PmPrivateBatchIdentityScratch,
+}
+
+#[must_use = "dropping a prepared private quote admission aborts it without mutation"]
+pub(crate) struct PmPreparedPrivateQuoteAdmission<'a> {
+    prepared: PmPreparedOwnedQuoteAdmission<'a>,
+}
+
+impl PmPreparedPrivateQuoteAdmission<'_> {
+    pub(crate) fn outcome(&self) -> PmOwnedQuoteAdmission {
+        self.prepared.outcome()
+    }
+
+    pub(crate) fn commit(self) -> PmOwnedQuoteAdmission {
+        self.prepared.commit()
+    }
 }
 
 /// Exact canonical result of one complete-scheduler private observation.
@@ -548,6 +569,7 @@ impl PmPrivateMonitorRuntime {
             open_order_reservation_scratch: Vec::with_capacity(
                 reap_pm_core::MAX_PM_RECONCILIATION_ORDERS,
             ),
+            private_batch_identity_scratch: PmPrivateBatchIdentityScratch::new(),
         })
     }
 
@@ -556,6 +578,31 @@ impl PmPrivateMonitorRuntime {
         config: &PmAccountConnectivityConfig,
     ) -> Result<Vec<ConstructedRoleBinding>, PmPlanError> {
         monitor_bindings(config, &self.private, &self.reconciliation, &self.account)
+    }
+
+    pub(crate) fn cardinalities(&self) -> reap_pm_state::PmPrivateCardinalities {
+        self.state.cardinalities()
+    }
+
+    pub(crate) fn reserved_capacity_bytes(&self) -> usize {
+        self.state
+            .reserved_capacity_bytes()
+            .saturating_add(
+                self.open_order_reservation_scratch
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<PmOpenOrderReservation>()),
+            )
+            .saturating_add(
+                self.private_batch_identity_scratch
+                    .reserved_capacity_bytes(),
+            )
+    }
+
+    pub(crate) fn validate_private_batch(
+        &mut self,
+        observations: &[PmPrivateLifecycleObservation],
+    ) -> Result<(), PmPrivateMonitorError> {
+        self.private_batch_identity_scratch.validate(observations)
     }
 
     pub(crate) const fn account_scope(&self) -> PmAccountScope {
@@ -568,6 +615,10 @@ impl PmPrivateMonitorRuntime {
 
     pub(crate) const fn active_epoch(&self) -> Option<ConnectionEpoch> {
         self.private.active_epoch()
+    }
+
+    pub(crate) fn contains_owned_fill(&self, key: PmFillKey) -> bool {
+        self.state.owned_fills().any(|fill| fill.key() == key)
     }
 
     pub(crate) fn owned_fill_event(
@@ -602,17 +653,14 @@ impl PmPrivateMonitorRuntime {
             .observe_owned_immediate_fill(ticket, event, reported_cumulative)
     }
 
-    pub(crate) fn quote_readiness(&self, request: PmPrivateQuoteRequest) -> PmPrivateReadiness {
-        self.state.quote_readiness(request)
-    }
-
-    pub(crate) fn evaluate_risk_candidate(
+    pub(crate) fn evaluate_quote_candidate(
         &mut self,
         request: PmPrivateQuoteRequest,
         reference: PmRiskDependency,
         book: PmRiskDependency,
-    ) -> Result<PmRiskDecision, PmPrivateStateError> {
-        self.state.evaluate_risk_candidate(request, reference, book)
+    ) -> Result<PmPrivateQuoteEvaluation, PmPrivateStateError> {
+        self.state
+            .evaluate_quote_candidate(request, reference, book)
     }
 
     pub(crate) fn admit_owned_quote(
@@ -620,6 +668,15 @@ impl PmPrivateMonitorRuntime {
         intent: PmOwnedQuoteIntent,
     ) -> Result<PmOwnedQuoteAdmission, PmPrivateStateError> {
         self.state.admit_owned_quote(intent)
+    }
+
+    pub(crate) fn prepare_owned_quote(
+        &mut self,
+        intent: PmOwnedQuoteIntent,
+    ) -> Result<PmPreparedPrivateQuoteAdmission<'_>, PmPrivateStateError> {
+        Ok(PmPreparedPrivateQuoteAdmission {
+            prepared: self.state.prepare_owned_quote(intent)?,
+        })
     }
 
     pub(crate) fn apply_owned_submit_result(
@@ -909,11 +966,12 @@ impl PmPrivateMonitorRuntime {
         let expected_account = self.private.account_scope();
         let expected_instrument = self.private.instrument_scope();
         let state = &mut self.state;
+        let validation_scratch = &mut self.private_batch_identity_scratch;
         match self
             .private
             .reduce_private_delivery(serviced, |scope, envelope| {
                 validate_scope(scope, expected_account, expected_instrument)?;
-                reduce_private_batch(state, envelope)
+                reduce_private_batch(state, validation_scratch, envelope)
             }) {
             Ok(result) => result,
             Err(_) => Err(PmPrivateMonitorError::PrivateDeliveryOwnerMismatch),
@@ -1151,9 +1209,10 @@ fn validate_private_role_reconnect(
 
 fn reduce_private_batch(
     state: &mut PmPrivateState,
+    validation_scratch: &mut PmPrivateBatchIdentityScratch,
     envelope: EventEnvelope<reap_polymarket_adapter::PmFixturePrivateBatch>,
 ) -> Result<PmPrivateBatchApply, PmPrivateMonitorError> {
-    validate_private_batch(envelope.payload().observations())?;
+    validation_scratch.validate(envelope.payload().observations())?;
     let mut applied = PmPrivateBatchApply::default();
     for observation in envelope.payload().observations().iter().copied() {
         if let Err(source_error) =
@@ -1232,55 +1291,6 @@ fn reduce_private_observation(
         }
     }
     Ok(())
-}
-
-pub(crate) fn validate_private_batch(
-    observations: &[PmPrivateLifecycleObservation],
-) -> Result<(), PmPrivateMonitorError> {
-    let mut client_orders = Vec::<PmClientOrderKey>::with_capacity(observations.len());
-    let mut venue_orders = Vec::<PmVenueOrderKey>::with_capacity(observations.len());
-    let mut fills = Vec::<PmFillKey>::with_capacity(observations.len());
-    let mut unresolved = Vec::<PmUnresolvedFillKey>::with_capacity(observations.len());
-    for observation in observations {
-        match *observation {
-            PmPrivateLifecycleObservation::Order(order) => {
-                client_orders.extend(order.order().client_order_key());
-                venue_orders.extend(order.order().venue_order_key());
-            }
-            PmPrivateLifecycleObservation::Fill(fill) => fills.push(fill.fill_key()),
-            PmPrivateLifecycleObservation::UnresolvedTrade(trade) => {
-                unresolved.push(PmUnresolvedFillKey::new(
-                    trade.fill_id(),
-                    trade.order(),
-                    trade.candidate_order(),
-                ));
-            }
-        }
-    }
-    client_orders.sort_unstable();
-    venue_orders.sort_unstable();
-    fills.sort_unstable();
-    unresolved.sort_unstable();
-    if has_adjacent_duplicate(&client_orders)
-        || has_adjacent_duplicate(&venue_orders)
-        || has_adjacent_duplicate(&fills)
-        || has_adjacent_duplicate(&unresolved)
-        || unresolved.iter().any(|unresolved| {
-            unresolved.exact_order().is_some_and(|order| {
-                fills
-                    .binary_search(&PmFillKey::new(order, unresolved.fill_id()))
-                    .is_ok()
-            })
-        })
-    {
-        Err(PmPrivateMonitorError::DuplicateBatchIdentity)
-    } else {
-        Ok(())
-    }
-}
-
-fn has_adjacent_duplicate<T: Eq>(values: &[T]) -> bool {
-    values.windows(2).any(|pair| pair[0] == pair[1])
 }
 
 fn open_order_reservations_into(

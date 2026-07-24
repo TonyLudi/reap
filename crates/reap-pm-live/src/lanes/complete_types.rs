@@ -122,6 +122,10 @@ impl PmCompleteIngress {
     pub(crate) const fn source(self) -> PmCompleteInputSource {
         self.source
     }
+
+    pub(crate) const fn monotonic_receive_ns(self) -> u64 {
+        self.clock.monotonic_receive_ns()
+    }
 }
 
 /// Stable exact ordering key for one non-public product input.
@@ -252,10 +256,10 @@ pub(crate) struct PmPersistenceInput {
 impl PmPersistenceInput {
     pub(crate) fn from_poll(poll: PmPersistencePoll) -> Result<Self, PmPersistenceCarrierError> {
         let variant_rank = match poll {
-            PmPersistencePoll::IntentFailed { .. } | PmPersistencePoll::FactFailed(_) => 0,
+            PmPersistencePoll::IntentFailed { .. } | PmPersistencePoll::FactFailed { .. } => 0,
             PmPersistencePoll::QuoteAcknowledged { .. }
             | PmPersistencePoll::CancelAcknowledged { .. }
-            | PmPersistencePoll::FactAcknowledged(_) => 1,
+            | PmPersistencePoll::FactAcknowledged { .. } => 1,
             PmPersistencePoll::Empty => return Err(PmPersistenceCarrierError::Empty),
             PmPersistencePoll::Pending => return Err(PmPersistenceCarrierError::Pending),
         };

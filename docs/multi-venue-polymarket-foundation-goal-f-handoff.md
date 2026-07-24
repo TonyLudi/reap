@@ -2688,8 +2688,9 @@ prompt now record the following exact replacement contract:
   durably acknowledged, never on enqueue, failure, an unchanged cursor, or a
   partial/unpaired result;
 - five repeated passes use the same preallocated owner and a fixed rolling
-  evidence ledger and must return all cycle-terminal container lengths and
-  allocator-live bytes to the first terminal baseline;
+  evidence ledger and must return all cycle-terminal container lengths to the
+  first terminal baseline; every pass must request zero allocations and report
+  the same non-positive signed allocator-live delta;
 - one fixed opaque evidence runner may invoke a crate-private sealed
   benchmark-only acknowledgement backend, but accepts no caller-supplied
   record, sequence, scope, acknowledgement, prepared effect, schedule key, or
@@ -2709,6 +2710,23 @@ represented in the 100,000-input mix and does not add logical observations.
 The active filesystem writer/recovery segment is likewise separate and
 untimed. Neither segment may be folded into the primary action latency or
 represented by the sealed acknowledgement backend.
+
+`reap-benchmark-allocator` is evidence instrumentation linked by the fixed
+runner, not a production allocator choice. No production source installs it
+as `#[global_allocator]`, no runtime or composition API accepts it or selects
+it, and its only installations are the action bench, the combined-replay
+integration target, or explicitly `cfg(test)` mechanism tests. The ordinary
+library dependency exists solely because the frozen zero-input public runner
+must read the counters installed by those external evidence targets.
+
+The normalized owner interval requires exactly zero allocation calls and zero
+allocated bytes. It deliberately keeps deallocations inside the measured
+interval: parser-built boxed payloads are created in an excluded parser/input
+construction interval but are consumed and dropped by the owner. Therefore a
+deterministic negative signed live-byte delta is valid evidence, not owner
+growth. All repeated passes must have the same non-positive delta, and all
+three fresh recorded invocations must match the complete allocation report,
+including deallocation calls, deallocated bytes, raw signed delta, and peak.
 
 The discarded warm-up's cycle-only totals are 10,000 external observations,
 2,001 internal fact acknowledgements, 12,001 owner reductions, 3,501 mutation

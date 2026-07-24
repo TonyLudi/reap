@@ -1,0 +1,7 @@
+error[E0432]: unresolved imports `reap_pm_live::PmJournalRuntime`, `reap_pm_live::PmSealedJournalProjection`
+ --> tests/ui/sealed_evidence_backend_is_internal.rs:1:20
+  |
+1 | use reap_pm_live::{PmJournalRuntime, PmSealedJournalProjection};
+  |                    ^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^ no `PmSealedJournalProjection` in the root
+  |                    |
+  |                    no `PmJournalRuntime` in the root

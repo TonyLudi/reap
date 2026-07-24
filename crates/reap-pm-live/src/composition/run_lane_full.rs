@@ -9,6 +9,7 @@ enum PendingPmOverflowAuthority {
 struct EnactedFull<D, U> {
     rejected_delivery: D,
     rejected_ordering: reap_pm_core::EventOrdering,
+    action: SaturationAction,
     unavailable: U,
     reducer_reason: Option<PmPublicReadinessReason>,
     purged_queued_deliveries: usize,
@@ -129,6 +130,7 @@ impl PmPublicCaptureRun {
                 };
                 Ok(PmPublicLaneFaultEnactment {
                     rejected_ordering: enacted.rejected_ordering,
+                    action: enacted.action,
                     unavailable_fault: fault,
                     reducer_reason: enacted.reducer_reason,
                     purged_queued_deliveries: enacted.purged_queued_deliveries,
@@ -382,6 +384,7 @@ impl PmPublicCaptureRun {
                 };
                 Ok(PmPublicLaneFaultEnactment {
                     rejected_ordering: enacted.rejected_ordering,
+                    action: enacted.action,
                     unavailable_fault: fault,
                     reducer_reason: enacted.reducer_reason,
                     purged_queued_deliveries: enacted.purged_queued_deliveries,
@@ -595,6 +598,7 @@ impl PmPublicCaptureRun {
                 Ok(EnactedFull {
                     rejected_ordering: ordering,
                     rejected_delivery: delivery,
+                    action,
                     unavailable,
                     reducer_reason: Some(reducer_reason),
                     purged_queued_deliveries,
@@ -838,6 +842,7 @@ impl PmPublicCaptureRun {
                 };
                 Ok(PmPublicLaneFaultEnactment {
                     rejected_ordering: ordering,
+                    action,
                     unavailable_fault: fault,
                     reducer_reason: None,
                     purged_queued_deliveries,
@@ -965,6 +970,7 @@ impl PmPublicCaptureRun {
                 };
                 Ok(PmPublicLaneFaultEnactment {
                     rejected_ordering: ordering,
+                    action,
                     unavailable_fault: fault,
                     reducer_reason: Some(reducer_reason),
                     purged_queued_deliveries,
@@ -1086,6 +1092,7 @@ impl PmPublicCaptureRun {
                 };
                 Ok(PmPublicLaneFaultEnactment {
                     rejected_ordering: ordering,
+                    action,
                     unavailable_fault: fault,
                     reducer_reason: None,
                     purged_queued_deliveries,

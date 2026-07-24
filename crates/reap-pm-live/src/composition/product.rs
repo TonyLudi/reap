@@ -11,9 +11,16 @@ use crate::fake_effect::PmFakeEffectRole;
 use crate::private_monitor::PmPrivateMonitorRuntime;
 use crate::schedule::PmQuoteScheduleRole;
 
+mod public_ingress;
 mod run;
 
-pub use run::{PmProductRun, PmProductRunError, PmProductStartError};
+pub use public_ingress::{
+    PmProductPublicIngress, PmProductPublicIngressError, PmProductPublicIngressOutcome,
+};
+pub use run::{
+    PmProductPublicAgedEnactError, PmProductPublicAgedRetryReason, PmProductRun, PmProductRunError,
+    PmProductStartError,
+};
 
 /// Secret-free sibling PM product composition.
 ///
@@ -27,7 +34,7 @@ pub struct PmProduct<M> {
     pub(super) plan: PmConnectivityPlan,
     pub(super) bindings: Vec<ConstructedRoleBinding>,
     pub(super) capture: PmCaptureBlueprint,
-    pub(super) private: PmPrivateMonitorRuntime,
+    pub(super) private: Box<PmPrivateMonitorRuntime>,
     pub(super) fake_effect: PmFakeEffectRole,
     pub(super) schedule: PmQuoteScheduleRole,
 }
@@ -48,7 +55,7 @@ impl<M: PmQuoteModelRequirements> PmProduct<M> {
             .account_config()
             .expect("product plan carries account config");
         let capture = PmCaptureBlueprint::new(public)?;
-        let private = PmPrivateMonitorRuntime::new(account_config, risk_limits)?;
+        let private = Box::new(PmPrivateMonitorRuntime::new(account_config, risk_limits)?);
         let fake_effect = PmFakeEffectRole::new(
             account_config.account_scope(),
             account_config.instrument(),

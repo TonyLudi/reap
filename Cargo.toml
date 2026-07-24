@@ -3,6 +3,7 @@ members = [
     "crates/reap-core",
     "crates/reap-transport",
     "crates/reap-capture-framing",
+    "crates/reap-benchmark-allocator",
     "crates/reap-durable-writer",
     "crates/reap-pm-core",
     "crates/reap-pm-state",
@@ -56,6 +57,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
+reap-benchmark-allocator = { path = "crates/reap-benchmark-allocator" }
 reap-backtest = { path = "crates/reap-backtest" }
 reap-book = { path = "crates/reap-book" }
 reap-capture = { path = "crates/reap-capture" }

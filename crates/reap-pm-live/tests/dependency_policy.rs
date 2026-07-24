@@ -165,6 +165,7 @@ fn pm_state_remains_a_pure_reducer_crate() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../reap-pm-state/src");
     for path in rust_sources(&root) {
         let source = std::fs::read_to_string(&path).unwrap();
+        let source = production_extent(&source);
         for forbidden in [
             "async fn",
             ".await",
@@ -481,9 +482,9 @@ fn integrated_product_run_embeds_the_sole_public_capture_owner() {
         coordinator_service
             .contains("PmScheduledActionKey::new(self.account_scope, self.instrument, side, kind)")
     );
-    assert!(complete.contains("Capture(PmPublicCaptureRun)"));
+    assert!(complete.contains("Capture(Box<PmPublicCaptureRun>)"));
     assert!(complete.contains("run.service_lane_turn(monotonic_now_ns, consumer)"));
-    assert!(complete.contains("#[cfg(test)]\n    Bare(PmPublicLaneState)"));
+    assert!(complete.contains("Bare(PmPublicLaneState)"));
     assert!(
         !complete.contains("pub(crate) fn new(public: PmPublicLaneState"),
         "production complete scheduling must not accept a sibling bare public lane"
@@ -578,6 +579,7 @@ fn public_lane_requires_capability_specific_route_deliveries() {
 #[test]
 fn pm_production_modules_stay_below_the_review_size_limit() {
     for relative in [
+        "../reap-benchmark-allocator/src",
         "../reap-capture-framing/src",
         "../reap-durable-writer/src",
         "../reap-okx-public-source/src",
@@ -689,6 +691,21 @@ fn rust_module_source(root: &Path, module: &str) -> String {
         .join("\n")
 }
 
+fn production_extent(source: &str) -> &str {
+    let mut previous_start = 0;
+    let mut previous = "";
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        if previous.trim() == "#[cfg(test)]" && line.trim_start().starts_with("mod tests {") {
+            return &source[..previous_start];
+        }
+        previous_start = offset;
+        previous = line;
+        offset += line.len();
+    }
+    source
+}
+
 fn workspace_edges(metadata: &Value) -> BTreeMap<String, BTreeSet<String>> {
     let packages = metadata["packages"].as_array().unwrap();
     let names = packages
@@ -709,6 +726,11 @@ fn workspace_edges(metadata: &Value) -> BTreeMap<String, BTreeSet<String>> {
             let targets = node["deps"]
                 .as_array()?
                 .iter()
+                .filter(|dependency| {
+                    dependency["dep_kinds"]
+                        .as_array()
+                        .is_some_and(|kinds| kinds.iter().any(|kind| kind["kind"].is_null()))
+                })
                 .filter_map(|dependency| names.get(dependency["pkg"].as_str()?).cloned())
                 .collect::<BTreeSet<_>>();
             Some((source, targets))

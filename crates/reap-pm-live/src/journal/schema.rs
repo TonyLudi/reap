@@ -247,12 +247,20 @@ pub fn derive_pm_journal_client_order(
     scope: &PmJournalScopeV1,
     intent_id: u64,
 ) -> Result<PmClientOrderKey, PmJournalSchemaError> {
+    derive_pm_journal_client_order_from_fingerprint(scope.account(), scope.fingerprint(), intent_id)
+}
+
+pub(crate) fn derive_pm_journal_client_order_from_fingerprint(
+    account: PmAccountHandle,
+    fingerprint: PmJournalFingerprintV1,
+    intent_id: u64,
+) -> Result<PmClientOrderKey, PmJournalSchemaError> {
     if intent_id == 0 {
         return Err(PmJournalSchemaError::ZeroIntentId);
     }
     let mut hasher = Sha256::new();
     hasher.update(CLIENT_ORDER_HASH_PREFIX);
-    hasher.update(scope.fingerprint().bytes());
+    hasher.update(fingerprint.bytes());
     hasher.update(intent_id.to_be_bytes());
     let digest: [u8; 32] = hasher.finalize().into();
     let mut bytes = [0_u8; 16];
@@ -264,7 +272,7 @@ pub fn derive_pm_journal_client_order(
     }
     let id = PmClientOrderId::from_bytes(bytes)
         .expect("the deterministic all-zero digest case is canonicalized");
-    Ok(PmClientOrderKey::new(scope.account(), id))
+    Ok(PmClientOrderKey::new(account, id))
 }
 
 struct HashWriter<'a>(&'a mut Sha256);

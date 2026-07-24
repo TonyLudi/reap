@@ -113,6 +113,16 @@ pub struct QueueByteEvidence {
     pub limit_bytes: usize,
 }
 
+/// Read-only entry-depth evidence for a bounded writer.
+///
+/// The current depth includes an item while the writer task is writing it,
+/// because its entry permit is released only after the write completes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueEntryEvidence {
+    pub current_depth: usize,
+    pub high_water_depth: usize,
+}
+
 #[derive(Debug)]
 pub struct AdditionalWriterError {
     pub label: &'static str,
@@ -471,6 +481,13 @@ where
                 .expect("byte-bounded writer has reservation evidence")
                 .load(Ordering::Acquire),
             limit_bytes: self.max_queued_bytes,
+        }
+    }
+
+    pub fn queue_entry_evidence(&self) -> QueueEntryEvidence {
+        QueueEntryEvidence {
+            current_depth: self.core.queued.load(Ordering::Acquire),
+            high_water_depth: self.core.max_queue_depth.load(Ordering::Acquire),
         }
     }
 
@@ -1150,6 +1167,13 @@ mod tests {
                 current_reserved_bytes: QUEUE_BYTES,
                 reservation_high_water_bytes: QUEUE_BYTES,
                 limit_bytes: QUEUE_BYTES,
+            }
+        );
+        assert_eq!(
+            writer.queue_entry_evidence(),
+            QueueEntryEvidence {
+                current_depth: 32,
+                high_water_depth: 32,
             }
         );
 

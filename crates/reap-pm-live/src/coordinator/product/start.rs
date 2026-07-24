@@ -20,13 +20,13 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
     pub(crate) async fn start(
         config: &PmConnectivityConfig,
         model: M,
-        private: PmPrivateMonitorRuntime,
+        private: Box<PmPrivateMonitorRuntime>,
         fake: PmFakeEffectRole,
-        public: PmPublicCaptureRun,
+        public: Box<PmPublicCaptureRun>,
         schedule: PmQuoteScheduleRole,
         journal_path: PathBuf,
         policy: PmCoordinatorPolicy,
-    ) -> Result<(Self, PmJournalRecovery), PmCoordinatorStartError> {
+    ) -> Result<(Box<Self>, PmJournalRecovery), PmCoordinatorStartError> {
         let decision = match PmDecisionState::new(config, model, policy) {
             Ok(decision) => decision,
             Err(source) => {
@@ -54,14 +54,14 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
             counters.control_halts = 1;
         }
         Ok((
-            Self {
+            Box::new(Self {
                 decision,
                 account_source: account_route.source(),
                 account_connection: account_route.connection(),
                 account_scope: config.account().account_scope(),
                 instrument: config.public().instrument(),
-                mutation,
-                lanes: Some(lanes),
+                mutation: Box::new(mutation),
+                lanes: Some(Box::new(lanes)),
                 outputs: PmProductEffectOutput::new(),
                 private_readiness_revision: 1,
                 last_action_sequence: 0,
@@ -76,33 +76,36 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
                 retained_private_admission: None,
                 retained_reconciliation_admission: None,
                 pending_schedules: PendingSchedules::new(),
-            },
+                refresh_obligations: refresh_obligations::PmRefreshObligations::new(),
+                reconciliation_gate: false,
+                reconciliation_recovered: false,
+            }),
             recovery,
         ))
     }
 
     pub(crate) fn public_capture(&self) -> &PmPublicCaptureRun {
         self.lanes
-            .as_ref()
+            .as_deref()
             .and_then(PmCompleteInputLanes::public_capture)
             .expect("a started product coordinator owns its sole public capture run")
     }
 
     pub(crate) fn public_capture_mut(&mut self) -> &mut PmPublicCaptureRun {
         self.lanes
-            .as_mut()
+            .as_deref_mut()
             .and_then(PmCompleteInputLanes::public_capture_mut)
             .expect("a started product coordinator owns its sole public capture run")
     }
 
     pub(crate) async fn shutdown(
-        self,
+        self: Box<Self>,
     ) -> Result<PmPublicCaptureOutcome, PmCoordinatorShutdownError> {
         let Self {
             mutation, lanes, ..
-        } = self;
-        let mutation_result = mutation.shutdown().await;
-        let Some(public) = lanes.and_then(PmCompleteInputLanes::into_public_capture) else {
+        } = *self;
+        let mutation_result = (*mutation).shutdown().await;
+        let Some(public) = lanes.and_then(|lanes| (*lanes).into_public_capture()) else {
             return match mutation_result {
                 Ok(()) => Err(PmCoordinatorShutdownError::MissingPublicOwner),
                 Err(source) => Err(PmCoordinatorShutdownError::Mutation(source)),

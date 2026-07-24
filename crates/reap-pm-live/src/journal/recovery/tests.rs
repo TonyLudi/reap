@@ -7,11 +7,12 @@ use reap_pm_core::{
 
 use super::*;
 use crate::journal::schema::{
-    PmJournalCancelIntentV1, PmJournalCancelReasonV1, PmJournalCancelResultV1,
-    PmJournalFillDeliveryV1, PmJournalFillFeeV1, PmJournalFillOccurrenceV1, PmJournalFillRoleV1,
-    PmJournalFillSettlementV1, PmJournalFillSourceV1, PmJournalFillV1, PmJournalFillWatermarkV1,
-    PmJournalFingerprintV1, PmJournalHeaderV1, PmJournalPlaceRejectReasonV1,
-    PmJournalPlaceResultV1, PmJournalQuoteProfileV1, derive_pm_journal_client_order, test_scope,
+    MAX_PM_ACKNOWLEDGEMENT_FILL_LEGS, PmJournalCancelIntentV1, PmJournalCancelReasonV1,
+    PmJournalCancelResultV1, PmJournalFillDeliveryV1, PmJournalFillFeeV1,
+    PmJournalFillOccurrenceV1, PmJournalFillRoleV1, PmJournalFillSettlementV1,
+    PmJournalFillSourceV1, PmJournalFillV1, PmJournalFillWatermarkV1, PmJournalFingerprintV1,
+    PmJournalHeaderV1, PmJournalPlaceRejectReasonV1, PmJournalPlaceResultV1,
+    PmJournalQuoteProfileV1, derive_pm_journal_client_order, test_scope,
 };
 
 mod negative;
@@ -325,6 +326,89 @@ fn acknowledgement_fill_stays_deduplicable_until_explicit_watermark() {
     assert_eq!(recovery.fill_key_count(), 0);
     assert_eq!(recovery.compacted_intent_id(), 1);
     assert!(!recovery.requires_reconciliation());
+}
+
+#[test]
+fn multi_order_immediate_fills_share_one_global_bound_and_resolve_once() {
+    let scope = test_scope();
+    let buy = quote(&scope, 1, PmOrderSide::Buy, "1");
+    let sell = quote(&scope, 2, PmOrderSide::Sell, "1");
+    let buy_venue = venue_order(&scope, "multi-ack-buy");
+    let sell_venue = venue_order(&scope, "multi-ack-sell");
+    let buy_key = fill_key(buy_venue, "multi-buy-fill");
+    let sell_key = fill_key(sell_venue, "multi-sell-fill");
+    let mut recovery = PmJournalRecovery::empty(scope);
+
+    apply(&mut recovery, PmJournalRecordV1::QuoteIntent(buy)).expect("buy quote");
+    apply(&mut recovery, PmJournalRecordV1::QuoteIntent(sell)).expect("sell quote");
+    for (intent, venue, key) in [(buy, buy_venue, buy_key), (sell, sell_venue, sell_key)] {
+        apply(
+            &mut recovery,
+            PmJournalRecordV1::PlaceResult(PmJournalPlaceResultV1 {
+                client_order: intent.client_order,
+                outcome: PmJournalPlaceOutcomeV1::AcceptedWithImmediateFill,
+                reject_reason: None,
+                venue_order: Some(venue),
+                immediate_fills: PmJournalImmediateFillsV1::from_slice(&[key])
+                    .expect("one immediate fill"),
+            }),
+        )
+        .expect("place acknowledgement");
+    }
+
+    assert_eq!(recovery.pending_ack_fill_keys, 2);
+    assert_eq!(
+        recovery
+            .recovered_orders()
+            .map(PmJournalRecoveredOrderV1::pending_ack_fill_count)
+            .sum::<u8>(),
+        2
+    );
+    assert!(
+        ensure_fill_key_capacity(&recovery, MAX_PM_JOURNAL_FILL_KEYS - 2).is_ok(),
+        "the shared applied-plus-pending limit admits exactly its remaining capacity"
+    );
+    assert!(matches!(
+        ensure_fill_key_capacity(&recovery, MAX_PM_JOURNAL_FILL_KEYS - 1),
+        Err(PmJournalRecoveryError::TooManyFillKeys)
+    ));
+
+    let buy_applied = PmJournalRecordV1::FillApplied(applied_fill(
+        buy,
+        buy_key,
+        fill_progress("1", Some(units("1")), units("1"), U256::ZERO),
+        PmJournalFillSourceV1::PlaceAcknowledgement,
+        acknowledgement_occurrence(1, 10),
+    ));
+    apply(&mut recovery, buy_applied.clone()).expect("resolve buy acknowledgement fill");
+    assert_eq!(recovery.pending_ack_fill_keys, 1);
+    assert_eq!(recovery.fill_key_count(), 1);
+    assert!(matches!(
+        apply(&mut recovery, buy_applied),
+        Err(PmJournalRecoveryError::DuplicateFill)
+    ));
+    assert_eq!(recovery.pending_ack_fill_keys, 1);
+
+    apply(
+        &mut recovery,
+        PmJournalRecordV1::FillApplied(applied_fill(
+            sell,
+            sell_key,
+            fill_progress("1", Some(units("1")), units("1"), U256::ZERO),
+            PmJournalFillSourceV1::PlaceAcknowledgement,
+            acknowledgement_occurrence(2, 20),
+        )),
+    )
+    .expect("resolve sell acknowledgement fill");
+    assert_eq!(recovery.pending_ack_fill_keys, 0);
+    assert_eq!(recovery.fill_key_count(), 2);
+    assert_eq!(
+        recovery
+            .recovered_orders()
+            .map(PmJournalRecoveredOrderV1::pending_ack_fill_count)
+            .sum::<u8>(),
+        0
+    );
 }
 
 #[test]
@@ -664,8 +748,9 @@ fn bootstrap_rows_preserve_intent_and_fill_owner_order() {
 }
 
 #[test]
-fn compacted_cut_never_jumps_over_an_older_live_order() {
+fn terminal_cancel_and_replacement_remain_retained_until_the_fill_watermark_cut() {
     let scope = test_scope();
+    let account_scope = scope.account_scope();
     let buy = quote(&scope, 1, PmOrderSide::Buy, "1");
     let sell = quote(&scope, 2, PmOrderSide::Sell, "1");
     let buy_venue = venue_order(&scope, "live-buy");
@@ -703,13 +788,41 @@ fn compacted_cut_never_jumps_over_an_older_live_order() {
         }),
     )
     .expect("cancel accepted");
-    assert_eq!(recovery.owned_order_count(), 1);
+    assert_eq!(recovery.owned_order_count(), 2);
 
     let replacement = quote(&recovery.scope, 3, PmOrderSide::Buy, "1");
     apply(&mut recovery, PmJournalRecordV1::QuoteIntent(replacement))
         .expect("same-slot replacement");
+    assert_eq!(recovery.compacted_intent_id(), 0);
+    assert_eq!(recovery.owned_order_count(), 3);
+    assert_eq!(
+        recovery
+            .recovered_orders()
+            .map(|order| order.intent().intent_id)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+
+    apply(
+        &mut recovery,
+        PmJournalRecordV1::FillWatermarkAdvanced(PmJournalFillWatermarkV1 {
+            cursor: PmJournalFillCursorV1 {
+                account_scope,
+                opaque: PmJournalFingerprintV1::from_bytes([0x43; 32]),
+            },
+        }),
+    )
+    .expect("authoritative compaction cut");
     assert_eq!(recovery.compacted_intent_id(), 2);
     assert_eq!(recovery.owned_order_count(), 1);
+    assert_eq!(
+        recovery
+            .recovered_orders()
+            .next()
+            .expect("replacement remains live")
+            .intent(),
+        replacement
+    );
 }
 
 #[test]

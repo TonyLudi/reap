@@ -166,7 +166,7 @@ async fn start_owner(config: &PmConnectivityConfig, journal_path: &Path) -> PmMu
         account.instrument_id(),
     );
     let (owner, recovery) =
-        PmMutationOwner::start(config, private, fake, journal_path.to_path_buf())
+        PmMutationOwner::start(config, Box::new(private), fake, journal_path.to_path_buf())
             .await
             .unwrap();
     assert_eq!(recovery.record_count(), 0);
@@ -661,6 +661,8 @@ async fn rest_unique_and_duplicate_dispositions_have_exact_fill_and_watermark_co
     let venue = venue_order(&config, "rest-order");
     let client = place_quote(&mut owner, &config, venue, Box::new([])).await;
     drain_persistence(&mut owner, 123).await;
+    let compactions_before = owner.counters().fill_watermark_compactions();
+    let compacted_fills_before = owner.counters().canonical_fill_rows_compacted();
     let fill = fill_event(&config, None, venue, "rest-fill", "0.25");
 
     let (account, fills) = reconciliation_pair(
@@ -679,11 +681,28 @@ async fn rest_unique_and_duplicate_dispositions_have_exact_fill_and_watermark_co
     assert_eq!(owner.counters().unique_fills(), 1);
     assert_eq!(owner.counters().duplicate_fills(), 0);
     assert_eq!(owner.pending_persistence(), 2);
-    assert!(matches!(
-        owner.reconciliation_reduction(0).unwrap().disposition(),
-        PmReconciliationFillDisposition::OwnedApplied(_)
-    ));
+    assert_eq!(
+        owner.reconciliation_reduction_count(),
+        0,
+        "successful durable consequence projection clears reconciliation scratch"
+    );
+    assert_eq!(
+        owner.counters().fill_watermark_compactions(),
+        compactions_before
+    );
+    assert_eq!(
+        owner.counters().canonical_fill_rows_compacted(),
+        compacted_fills_before
+    );
     drain_persistence(&mut owner, 141).await;
+    assert_eq!(
+        owner.counters().fill_watermark_compactions(),
+        compactions_before + 1
+    );
+    assert_eq!(
+        owner.counters().canonical_fill_rows_compacted(),
+        compacted_fills_before + 1
+    );
 
     let (account, fills) = reconciliation_pair(&config, 4, 50, 51, Some(2), 3, vec![fill], 150);
     owner
@@ -694,10 +713,11 @@ async fn rest_unique_and_duplicate_dispositions_have_exact_fill_and_watermark_co
     // The duplicate fill creates no second FillApplied record. The changed
     // complete cursor creates exactly one watermark record.
     assert_eq!(owner.pending_persistence(), 1);
-    assert!(matches!(
-        owner.reconciliation_reduction(0).unwrap().disposition(),
-        PmReconciliationFillDisposition::OwnedDuplicate(_)
-    ));
+    assert_eq!(
+        owner.reconciliation_reduction_count(),
+        0,
+        "duplicate consequence projection also clears reconciliation scratch"
+    );
     assert_eq!(
         owner
             .private_mut()
@@ -708,6 +728,106 @@ async fn rest_unique_and_duplicate_dispositions_have_exact_fill_and_watermark_co
     );
 
     drain_persistence(&mut owner, 151).await;
+    owner.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reconciliation_scratch_clears_after_forced_consequence_error() {
+    let (config, _directory, _path, mut owner) = ready_owner().await;
+    let venue = venue_order(&config, "rest-projection-error-order");
+    let _client = place_quote(&mut owner, &config, venue, Box::new([])).await;
+    drain_persistence(&mut owner, 123).await;
+    let fill = fill_event(&config, None, venue, "rest-projection-error-fill", "0.25");
+    let (account, fills) = reconciliation_pair(
+        &config,
+        3,
+        40,
+        41,
+        Some(INITIAL_CURSOR_BYTE),
+        2,
+        vec![fill],
+        140,
+    );
+    assert!(matches!(
+        owner.reduce_private_reconciliation(account, fills).unwrap(),
+        PmReconciliationApply::Applied { .. }
+    ));
+    assert_eq!(owner.reconciliation_reduction_count(), 1);
+
+    let error = super::project_reconciliation_consequences(
+        &mut owner,
+        super::ExpectedOccurrence {
+            source: reap_pm_state::PmOwnedObservationSource::RestReconciliation,
+            connection: config.account().account_route().connection(),
+            epoch: ConnectionEpoch::new(1),
+            ingress: IngressSequence::new(42),
+            snapshot: Some(SnapshotRevision::new(3)),
+        },
+        140,
+    )
+    .expect_err("mismatched occurrence must fail consequence projection");
+    assert!(matches!(
+        error,
+        PmMutationError::PrivateReduction(super::PmPrivateReductionError::OccurrenceMismatch)
+    ));
+    assert_eq!(
+        owner.reconciliation_reduction_count(),
+        0,
+        "failed durable consequence projection clears reconciliation scratch"
+    );
+    owner.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn aged_watermark_fact_aborts_compaction_without_removing_state() {
+    let (config, _directory, _path, mut owner) = ready_owner().await;
+    let compactions_before = owner.counters().fill_watermark_compactions();
+    let compacted_orders_before = owner.counters().canonical_order_rows_compacted();
+    let compacted_fills_before = owner.counters().canonical_fill_rows_compacted();
+    let (account, fills) = reconciliation_pair(
+        &config,
+        3,
+        40,
+        41,
+        Some(INITIAL_CURSOR_BYTE),
+        2,
+        Vec::new(),
+        140,
+    );
+    assert!(matches!(
+        owner
+            .reduce_serviced_reconciliation(account, fills)
+            .unwrap(),
+        PmReconciliationApply::Applied { .. }
+    ));
+    assert_eq!(owner.pending_persistence(), 1);
+    assert_eq!(
+        owner.counters().fill_watermark_compactions(),
+        compactions_before
+    );
+
+    assert_eq!(
+        owner
+            .service_persistence(
+                140 + crate::coordinator::persistence::PM_PENDING_PERSISTENCE_MAX_AGE_NS + 1
+            )
+            .unwrap(),
+        PmPersistenceService::FactFailed
+    );
+    assert_eq!(owner.halt(), Some(PmMutationHalt::PersistenceAgeExceeded));
+    assert_eq!(
+        owner.counters().fill_watermark_compactions(),
+        compactions_before
+    );
+    assert_eq!(
+        owner.counters().canonical_order_rows_compacted(),
+        compacted_orders_before
+    );
+    assert_eq!(
+        owner.counters().canonical_fill_rows_compacted(),
+        compacted_fills_before
+    );
+    assert!(!owner.private_mut().fill_watermark_compaction_pending());
     owner.shutdown().await.unwrap();
 }
 
@@ -828,7 +948,7 @@ async fn assert_restarted_history(
         account.instrument_id(),
     );
     let (mut restarted, recovery) =
-        PmMutationOwner::start(config, private, fake, path.to_path_buf())
+        PmMutationOwner::start(config, Box::new(private), fake, path.to_path_buf())
             .await
             .unwrap();
     let mut recovered = recovery.recovered_fills();
@@ -958,7 +1078,7 @@ async fn assert_partial_expired_restart(
         account.instrument_id(),
     );
     let (mut restarted, recovery) =
-        PmMutationOwner::start(config, private, fake, path.to_path_buf())
+        PmMutationOwner::start(config, Box::new(private), fake, path.to_path_buf())
             .await
             .unwrap();
     {
@@ -1082,7 +1202,7 @@ async fn assert_cancelled_fill_race_restart(
         account.instrument_id(),
     );
     let (mut restarted, recovery) =
-        PmMutationOwner::start(config, private, fake, path.to_path_buf())
+        PmMutationOwner::start(config, Box::new(private), fake, path.to_path_buf())
             .await
             .unwrap();
     {

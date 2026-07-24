@@ -925,6 +925,7 @@ struct OwnedOrderEntry {
     known_fill_total: U256,
     cancel: PmOwnedCancelState,
     reconciliation_required: bool,
+    compaction_generation: Option<u64>,
     last_occurrence: Option<PmOwnedObservationOccurrence>,
     last_progress: Option<(PmOwnedObservationOccurrence, PmOrderProgress)>,
 }
@@ -986,10 +987,42 @@ pub struct PmOwnedOrderLifecycle {
     instrument: PmInstrumentHandle,
     slots: [Option<PmClientOrderKey>; 2],
     entries: Vec<OwnedOrderEntry>,
+    client_order_index: Vec<u16>,
+    intent_index: Vec<u16>,
     fills: Vec<OwnedFillEntry>,
     compacted_intent_high_watermark: Option<PmOwnedIntentId>,
     current_epoch: Option<ConnectionEpoch>,
     counters: PmOwnedLifecycleCounters,
 }
 
+pub(crate) struct PmOwnedQuoteAdmissionPlan {
+    outcome: PmOwnedQuoteAdmission,
+    action: PmOwnedQuoteAdmissionAction,
+}
+
+impl PmOwnedQuoteAdmissionPlan {
+    const fn new(outcome: PmOwnedQuoteAdmission, action: PmOwnedQuoteAdmissionAction) -> Self {
+        Self { outcome, action }
+    }
+
+    pub(crate) const fn outcome(&self) -> PmOwnedQuoteAdmission {
+        self.outcome
+    }
+}
+
+enum PmOwnedQuoteAdmissionAction {
+    None,
+    CountDuplicateQuote,
+    MarkCancelBeforeReplace {
+        index: usize,
+    },
+    Insert {
+        client_position: usize,
+        intent_position: usize,
+        slot_index: usize,
+        entry: OwnedOrderEntry,
+    },
+}
+
+mod dense_index;
 mod reducer;

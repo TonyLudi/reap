@@ -32,19 +32,11 @@ impl PmPublicCaptureRun {
             )
             .await
         {
-            let (unavailable, okx_unavailable) = self.terminalize_with_receive_evidence(
-                PmPublicCaptureTerminalCause::CaptureWriter,
-                source.session_fault(),
-                source.okx_session_fault(),
+            return Err(self.reject_pm_capture_write(
+                source,
                 local_wall_receive_ns,
                 monotonic_receive_ns,
-            );
-            self.terminal_pm_unavailable = unavailable;
-            self.terminal_okx_unavailable = okx_unavailable;
-            return Err(PmPublicCaptureRunError::PmCaptureRejected {
-                source,
-                unavailable: self.terminal_pm_unavailable.take(),
-            });
+            ));
         }
         self.pm_raw_ingress.commit(epoch, ingress);
         match self
@@ -110,6 +102,37 @@ impl PmPublicCaptureRun {
                 Err(PmPublicCaptureRunError::InternalRoleMismatch)
             }
         }
+    }
+
+    fn reject_pm_capture_write(
+        &mut self,
+        source: PmCaptureWriteError,
+        local_wall_receive_ns: u64,
+        monotonic_receive_ns: u64,
+    ) -> PmPublicCaptureRunError {
+        let (unavailable, okx_unavailable) = self.terminalize_with_receive_evidence(
+            PmPublicCaptureTerminalCause::CaptureWriter,
+            source.session_fault(),
+            source.okx_session_fault(),
+            local_wall_receive_ns,
+            monotonic_receive_ns,
+        );
+        self.terminal_pm_unavailable = unavailable;
+        self.terminal_okx_unavailable = okx_unavailable;
+        PmPublicCaptureRunError::PmCaptureRejected {
+            source,
+            unavailable: self.terminal_pm_unavailable.take(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn phase6_reject_pm_capture_write_for_evidence(
+        &mut self,
+        source: PmCaptureWriteError,
+        local_wall_receive_ns: u64,
+        monotonic_receive_ns: u64,
+    ) -> PmPublicCaptureRunError {
+        self.reject_pm_capture_write(source, local_wall_receive_ns, monotonic_receive_ns)
     }
 
     /// Captures, authenticates, and admits an OKX reference without exposing

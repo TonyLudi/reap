@@ -4,6 +4,7 @@ mod capture;
 mod capture_roles;
 mod composition;
 mod coordinator;
+mod evidence;
 mod fake_effect;
 mod journal;
 mod lanes;
@@ -14,14 +15,15 @@ mod schedule;
 
 pub use capture::{
     MAX_PM_PUBLIC_CAPTURE_BASE64_FRAME_BYTES, MAX_PM_PUBLIC_CAPTURE_ENCODED_BYTES,
-    MAX_PM_PUBLIC_CAPTURE_FRAME_BYTES, MAX_PM_PUBLIC_CAPTURE_RAW_FRAMES,
-    MAX_PM_PUBLIC_CAPTURE_RAW_PAYLOAD_BYTES, MAX_PM_PUBLIC_CAPTURE_RECORD_WORKING_BYTES,
-    MAX_PM_PUBLIC_CAPTURE_RECORDS, MAX_PM_RAW_PUBLIC_FRAME_BYTES, OkxCaptureDisconnectReason,
-    OkxCaptureLifecycle, OkxRawPublicFrame, PM_PUBLIC_CAPTURE_PRODUCT,
-    PM_PUBLIC_CAPTURE_SCHEMA_VERSION, PmCaptureDisconnectReason, PmCaptureHeader,
-    PmCaptureLifecycle, PmCaptureProvenance, PmCaptureReconnectPolicy, PmCaptureScope,
-    PmCaptureSessionPolicy, PmCaptureVerification, PmCaptureVerifyError, PmCaptureWriteError,
-    PmPublicCaptureRecord, PmRawPublicFrame, verify_pm_public_capture,
+    MAX_PM_PUBLIC_CAPTURE_FRAME_BYTES, MAX_PM_PUBLIC_CAPTURE_PENDING_AGE_NS,
+    MAX_PM_PUBLIC_CAPTURE_RAW_FRAMES, MAX_PM_PUBLIC_CAPTURE_RAW_PAYLOAD_BYTES,
+    MAX_PM_PUBLIC_CAPTURE_RECORD_WORKING_BYTES, MAX_PM_PUBLIC_CAPTURE_RECORDS,
+    MAX_PM_RAW_PUBLIC_FRAME_BYTES, OkxCaptureDisconnectReason, OkxCaptureLifecycle,
+    OkxRawPublicFrame, PM_PUBLIC_CAPTURE_PRODUCT, PM_PUBLIC_CAPTURE_SCHEMA_VERSION,
+    PmCaptureDisconnectReason, PmCaptureHeader, PmCaptureLifecycle, PmCaptureProvenance,
+    PmCaptureReconnectPolicy, PmCaptureScope, PmCaptureSessionPolicy, PmCaptureVerification,
+    PmCaptureVerifyError, PmCaptureWriteError, PmPublicCaptureRecord, PmRawPublicFrame,
+    verify_pm_public_capture,
 };
 pub use capture_roles::{
     OkxPublicCaptureEvent, PmPublicBookReduceError, PmPublicCaptureBatch,
@@ -29,13 +31,15 @@ pub use capture_roles::{
     PmPublicSnapshotFlow,
 };
 pub use composition::{
-    PmCompositionError, PmProduct, PmProductRun, PmProductRunError, PmProductStartError,
-    PmPublicAgedLaneEnactError, PmPublicAgedLaneFaultEnactment, PmPublicBookPipelineError,
-    PmPublicBookReadiness, PmPublicBookReadinessReason, PmPublicCapture, PmPublicCaptureOutcome,
-    PmPublicCaptureRun, PmPublicCaptureRunError, PmPublicCaptureTerminalCause,
-    PmPublicDataPipelineError, PmPublicLaneAdmissionError, PmPublicLaneEnactError,
-    PmPublicLaneFaultEnactment, PmPublicNotificationAdmissionFailure, PmPublicReadyBookView,
-    PmPublicTerminalTickApplyError, PmPublicTerminalTickCleanupStatus,
+    PmCompositionError, PmProduct, PmProductPublicAgedEnactError, PmProductPublicAgedRetryReason,
+    PmProductPublicIngress, PmProductPublicIngressError, PmProductPublicIngressOutcome,
+    PmProductRun, PmProductRunError, PmProductStartError, PmPublicAgedLaneEnactError,
+    PmPublicAgedLaneFaultEnactment, PmPublicBookPipelineError, PmPublicBookReadiness,
+    PmPublicBookReadinessReason, PmPublicCapture, PmPublicCaptureOutcome, PmPublicCaptureRun,
+    PmPublicCaptureRunError, PmPublicCaptureTerminalCause, PmPublicDataPipelineError,
+    PmPublicLaneAdmissionError, PmPublicLaneEnactError, PmPublicLaneFaultEnactment,
+    PmPublicNotificationAdmissionFailure, PmPublicReadyBookView, PmPublicTerminalTickApplyError,
+    PmPublicTerminalTickCleanupStatus,
 };
 pub use coordinator::{
     ApprovedPmCancel, ApprovedPmQuote, MAX_PM_EFFECTS_PER_INPUT, PmAuthorityError,
@@ -45,9 +49,11 @@ pub use coordinator::{
     PmFakeEffectMetrics, PmFakeEffectStage, PmFakeQuoteEffect, PmHealthMetricEffect,
     PmHealthMetricKind, PmMarketInput, PmMutationCounters, PmMutationHalt, PmOkxReferenceInput,
     PmPersistenceMetrics, PmProductEffect, PmProductEffectBatch, PmProductEffectMetrics,
-    PmProductInputError, PmQuoteSuppression, PmRefreshEffect, PmRefreshEffectKind, PmTimerInput,
-    PreparedPmCancel, PreparedPmQuote, ReservedPmCancel, ReservedPmQuote,
+    PmProductInputError, PmQuoteSuppression, PmRefreshEffect, PmRefreshEffectKind,
+    PmRefreshObligationMetrics, PmTimerInput, PreparedPmCancel, PreparedPmQuote, ReservedPmCancel,
+    ReservedPmQuote,
 };
+pub use evidence::{PmEvidenceError, run_pm_action_path_evidence, run_pm_combined_replay_evidence};
 pub use journal::{
     MAX_PM_JOURNAL_BYTES, MAX_PM_JOURNAL_LINE_BYTES, MAX_PM_JOURNAL_RECORDS,
     PM_MUTATION_JOURNAL_FAMILY, PM_MUTATION_JOURNAL_VERSION, PmJournalCancelIntentV1,

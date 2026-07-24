@@ -295,16 +295,35 @@ pub(crate) enum PmScheduleError {
     Full {
         attempted: PmScheduledActionKey,
         capacity: usize,
+        observed_ns: u64,
+        local_action_sequence: u64,
+        decision_wall_timestamp_ms: u64,
         action: SaturationAction,
     },
     Aged {
         pending: PmScheduledActionKey,
         deadline_ns: u64,
+        scheduled_at_ns: u64,
         observed_ns: u64,
         due_age_ns: u64,
         maximum_due_age_ns: u64,
+        local_action_sequence: u64,
+        decision_wall_timestamp_ms: u64,
         action: SaturationAction,
     },
+}
+
+impl PmScheduleError {
+    pub(crate) const fn saturation_action(&self) -> Option<SaturationAction> {
+        match self {
+            Self::Full { action, .. } | Self::Aged { action, .. } => Some(*action),
+            Self::ZeroMonotonicTimestamp
+            | Self::ZeroWallTimestamp
+            | Self::LocalActionSequenceExhausted
+            | Self::InstrumentMismatch { .. }
+            | Self::ClockRegression { .. } => None,
+        }
+    }
 }
 
 /// A due timer signal, not an order/cancel permission.
@@ -388,6 +407,7 @@ pub(crate) struct PmQuoteScheduleRole {
     maximum_due_age_ns: u64,
     last_observed_ns: u64,
     next_local_action_sequence: u64,
+    aged_pending_sequence: Option<(PmScheduledActionKey, u64)>,
     fail_closed: bool,
 }
 
@@ -413,6 +433,7 @@ impl PmQuoteScheduleRole {
             maximum_due_age_ns: 0,
             last_observed_ns: 0,
             next_local_action_sequence: 1,
+            aged_pending_sequence: None,
             fail_closed: false,
         }
     }
@@ -473,9 +494,16 @@ impl PmQuoteScheduleRole {
         if self.actions.len() == MAX_PM_SCHEDULED_ACTIONS {
             increment_counter(&mut self.rejected_full);
             self.fail_closed = true;
+            let local_action_sequence = self.next_local_action_sequence;
+            self.next_local_action_sequence = local_action_sequence
+                .checked_add(1)
+                .ok_or(PmScheduleError::LocalActionSequenceExhausted)?;
             return Err(PmScheduleError::Full {
                 attempted: key,
                 capacity: MAX_PM_SCHEDULED_ACTIONS,
+                observed_ns: scheduled_at_ns,
+                local_action_sequence,
+                decision_wall_timestamp_ms,
                 action: schedule_policy().saturation_action(),
             });
         }
@@ -516,12 +544,34 @@ impl PmQuoteScheduleRole {
         let due_age_ns = now_ns - next.deadline_ns;
         self.observe_due_age(due_age_ns);
         if due_age_ns > maximum_due_age_ns() {
+            let local_action_sequence = match self.aged_pending_sequence {
+                Some((pending, local_action_sequence)) if pending == next.key => {
+                    local_action_sequence
+                }
+                Some(_) => {
+                    self.fail_closed = true;
+                    return Err(PmScheduleError::LocalActionSequenceExhausted);
+                }
+                None => {
+                    let local_action_sequence = self.next_local_action_sequence;
+                    self.next_local_action_sequence =
+                        local_action_sequence.checked_add(1).ok_or_else(|| {
+                            self.fail_closed = true;
+                            PmScheduleError::LocalActionSequenceExhausted
+                        })?;
+                    self.aged_pending_sequence = Some((next.key, local_action_sequence));
+                    local_action_sequence
+                }
+            };
             return Err(PmScheduleError::Aged {
                 pending: next.key,
                 deadline_ns: next.deadline_ns,
+                scheduled_at_ns: next.scheduled_at_ns,
                 observed_ns: now_ns,
                 due_age_ns,
                 maximum_due_age_ns: maximum_due_age_ns(),
+                local_action_sequence,
+                decision_wall_timestamp_ms: next.decision_wall_timestamp_ms,
                 action: schedule_policy().saturation_action(),
             });
         }
@@ -542,6 +592,22 @@ impl PmQuoteScheduleRole {
             local_action_sequence,
             decision_wall_timestamp_ms: next.decision_wall_timestamp_ms,
         }))
+    }
+
+    pub(crate) fn resolve_aged(&mut self, key: PmScheduledActionKey) -> bool {
+        if !matches!(
+            self.aged_pending_sequence,
+            Some((pending, _)) if pending == key
+        ) {
+            return false;
+        }
+        let Some(index) = self.actions.iter().position(|entry| entry.key == key) else {
+            return false;
+        };
+        self.actions.remove(index);
+        self.aged_pending_sequence = None;
+        increment_counter(&mut self.removed);
+        true
     }
 
     pub(crate) fn projection(
@@ -914,9 +980,10 @@ mod tests {
     }
 
     #[test]
-    fn saturation_rejects_without_growth_and_latches_quote_halt() {
+    fn phase6_schedule_row_is_4097_attempts_without_growth_or_cancel_candidates() {
         let instrument = instrument(1, 1);
         let mut owner = PmQuoteScheduleRole::new(instrument);
+        let reserved_capacity_bytes = owner.reserved_capacity_bytes();
         for account in 0..2_048_u16 {
             for side in [PmOrderSide::Buy, PmOrderSide::Sell] {
                 owner
@@ -925,7 +992,7 @@ mod tests {
                             account,
                             instrument,
                             side,
-                            PmScheduledActionKind::CancelOwnedQuote,
+                            PmScheduledActionKind::QuoteEvaluation,
                         ),
                         10_000 + u64::from(account),
                         100,
@@ -941,22 +1008,44 @@ mod tests {
             4_000,
             instrument,
             PmOrderSide::Buy,
-            PmScheduledActionKind::QuoteEvaluation,
+            PmScheduledActionKind::Freshness,
         );
+        let full = owner
+            .schedule(attempted, 20_000, 100, 1_000)
+            .expect_err("the 4097th distinct action is rejected");
         assert_eq!(
-            owner.schedule(attempted, 20_000, 100, 1_000),
-            Err(PmScheduleError::Full {
+            full,
+            PmScheduleError::Full {
                 attempted,
                 capacity: MAX_PM_SCHEDULED_ACTIONS,
+                observed_ns: 100,
+                local_action_sequence: 1,
+                decision_wall_timestamp_ms: 1_000,
                 action: SaturationAction::SuppressQuoteAndCancelOwned,
-            })
+            }
+        );
+        assert_eq!(
+            crate::lanes::PmCompleteServiceError::Schedule(full).action(),
+            Some(SaturationAction::SuppressQuoteAndCancelOwned)
         );
         let metrics = owner.projection(100).unwrap().metrics();
         assert_eq!(metrics.depth(), MAX_PM_SCHEDULED_ACTIONS);
         assert_eq!(metrics.high_water(), MAX_PM_SCHEDULED_ACTIONS);
         assert_eq!(metrics.rejected_full(), 1);
+        assert_eq!(metrics.serviced(), 0);
+        assert_eq!(metrics.removed(), 0);
+        assert_eq!(
+            owner
+                .actions
+                .iter()
+                .filter(|entry| { entry.key.kind() == PmScheduledActionKind::CancelOwnedQuote })
+                .count(),
+            0
+        );
         assert!(metrics.fail_closed());
         assert_eq!(owner.actions.capacity(), MAX_PM_SCHEDULED_ACTIONS);
+        assert_eq!(owner.reserved_capacity_bytes(), reserved_capacity_bytes);
+        assert!(reserved_capacity_bytes <= 64 * 1024 * 1024);
     }
 
     #[test]

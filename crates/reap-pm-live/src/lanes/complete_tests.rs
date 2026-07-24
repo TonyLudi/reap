@@ -281,6 +281,113 @@ fn every_state_bearing_nonpublic_queue_faults_one_nanosecond_past_its_age_limit(
 }
 
 #[test]
+fn a_later_private_age_episode_faults_again_after_the_first_backlog_drains() {
+    let mut owner = PmCompleteInputLanes::for_instrument(instrument());
+    let maximum = PmLanePolicy::for_lane(PmLaneKind::Private)
+        .maximum_age_ns()
+        .expect("private lane age");
+    owner
+        .enqueue_private(account_ingress(1, 1), private_unavailable())
+        .expect("first private occurrence");
+
+    let first_fault_ns = 1 + maximum + 1;
+    let mut consumer = TraceConsumer::default();
+    let first = owner
+        .service_turn(first_fault_ns, &mut consumer)
+        .expect_err("the first aged head faults before transfer");
+    assert!(matches!(
+        first,
+        PmCompleteServiceError::Aged(fault)
+            if fault.lane() == PmLaneKind::Private
+                && fault.action()
+                    == SaturationAction::HaltAccountAndRequireReconciliation
+    ));
+    assert!(consumer.trace.is_empty());
+
+    let drained = owner
+        .service_turn(first_fault_ns, &mut consumer)
+        .expect("the exact faulted backlog drains on the recovery turn");
+    assert_eq!(drained.for_lane(PmLaneKind::Private), Some(1));
+    assert_eq!(consumer.trace, ["private"]);
+
+    let second_receive_ns = first_fault_ns + 1;
+    owner
+        .enqueue_private(account_ingress(2, second_receive_ns), private_unavailable())
+        .expect("later private occurrence");
+    let second = owner
+        .service_turn(second_receive_ns + maximum + 1, &mut consumer)
+        .expect_err("a new aged episode must not inherit the old drain permit");
+    assert!(matches!(
+        second,
+        PmCompleteServiceError::Aged(fault)
+            if fault.lane() == PmLaneKind::Private
+                && fault.action()
+                    == SaturationAction::HaltAccountAndRequireReconciliation
+    ));
+    let metrics = owner
+        .metrics(second_receive_ns + maximum + 1)
+        .expect("scheduler metrics");
+    assert_eq!(
+        metrics
+            .lane(PmLaneKind::Private)
+            .expect("private metrics")
+            .age_faults(),
+        2
+    );
+}
+
+#[test]
+fn private_inputs_arriving_after_an_age_fault_do_not_inherit_its_drain_authority() {
+    let mut owner = PmCompleteInputLanes::for_instrument(instrument());
+    let maximum = PmLanePolicy::for_lane(PmLaneKind::Private)
+        .maximum_age_ns()
+        .expect("private lane age");
+    owner
+        .enqueue_private(account_ingress(1, 1), private_unavailable())
+        .expect("first private occurrence");
+
+    let first_fault_ns = 1 + maximum + 1;
+    let mut consumer = TraceConsumer::default();
+    assert!(matches!(
+        owner.service_turn(first_fault_ns, &mut consumer),
+        Err(PmCompleteServiceError::Aged(fault))
+            if fault.lane() == PmLaneKind::Private
+    ));
+
+    let later_receive_ns = first_fault_ns + 1;
+    owner
+        .enqueue_private(account_ingress(2, later_receive_ns), private_unavailable())
+        .expect("later private occurrence");
+    let later_fault_ns = later_receive_ns + maximum + 1;
+    let second = owner
+        .service_turn(later_fault_ns, &mut consumer)
+        .expect_err("only the backlog present at the first fault may drain");
+    assert!(matches!(
+        second,
+        PmCompleteServiceError::Aged(fault)
+            if fault.lane() == PmLaneKind::Private
+                && fault.action()
+                    == SaturationAction::HaltAccountAndRequireReconciliation
+    ));
+    assert_eq!(consumer.trace, ["private"]);
+    let metrics = owner.metrics(later_fault_ns).expect("scheduler metrics");
+    assert_eq!(
+        metrics
+            .lane(PmLaneKind::Private)
+            .expect("private metrics")
+            .queue()
+            .depth(),
+        1
+    );
+
+    let drained = owner
+        .service_turn(later_fault_ns, &mut consumer)
+        .expect("the second exact backlog drains after its own fault");
+    assert_eq!(drained.for_lane(PmLaneKind::Private), Some(1));
+    assert_eq!(consumer.trace, ["private", "private"]);
+}
+
+#[test]
 fn scheduled_role_materializes_all_four_exact_variant_ranks_and_age_is_fail_closed() {
     assert_eq!(PmScheduledActionKind::CancelOwnedQuote.variant_rank(), 0);
     assert_eq!(

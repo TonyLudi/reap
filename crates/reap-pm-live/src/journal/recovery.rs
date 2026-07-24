@@ -7,12 +7,12 @@ use reap_pm_core::{PmClientOrderKey, PmVenueOrderKey, U256};
 use thiserror::Error;
 
 use super::schema::{
-    MAX_PM_ACKNOWLEDGEMENT_FILL_LEGS, MAX_PM_JOURNAL_BYTES, MAX_PM_JOURNAL_FILL_KEYS,
-    MAX_PM_JOURNAL_LINE_BYTES, MAX_PM_JOURNAL_OWNED_ORDERS, MAX_PM_JOURNAL_RECORDS,
-    PmJournalCancelOutcomeV1, PmJournalFillAppliedV1, PmJournalFillCursorV1, PmJournalFillKeyV1,
-    PmJournalFillOccurrenceV1, PmJournalFillSourceV1, PmJournalImmediateFillsV1, PmJournalLineV1,
-    PmJournalPlaceOutcomeV1, PmJournalQuoteIntentV1, PmJournalRecordV1, PmJournalSafetyReasonV1,
-    PmJournalScopeV1, PmJournalTerminalStatusV1, next_sequence,
+    MAX_PM_JOURNAL_BYTES, MAX_PM_JOURNAL_FILL_KEYS, MAX_PM_JOURNAL_LINE_BYTES,
+    MAX_PM_JOURNAL_OWNED_ORDERS, MAX_PM_JOURNAL_RECORDS, PmJournalCancelOutcomeV1,
+    PmJournalFillAppliedV1, PmJournalFillCursorV1, PmJournalFillKeyV1, PmJournalFillOccurrenceV1,
+    PmJournalFillSourceV1, PmJournalImmediateFillsV1, PmJournalLineV1, PmJournalPlaceOutcomeV1,
+    PmJournalQuoteIntentV1, PmJournalRecordV1, PmJournalSafetyReasonV1, PmJournalScopeV1,
+    PmJournalTerminalStatusV1, next_sequence,
 };
 
 /// Bounded deterministic projection recovered from one checked PM journal.
@@ -31,6 +31,7 @@ pub struct PmJournalRecovery {
     owned_orders: BTreeMap<PmClientOrderKey, RecoveredOwnedOrder>,
     order_order: BTreeMap<u64, PmClientOrderKey>,
     fill_keys: BTreeMap<PmJournalFillKeyV1, PmJournalFillAppliedV1>,
+    pending_ack_fill_keys: usize,
     fill_order: BTreeMap<u64, PmJournalFillKeyV1>,
     observation_order: BTreeMap<u64, PmJournalRecoveredObservationV1>,
     safety_halt: Option<PmJournalSafetyReasonV1>,
@@ -49,6 +50,7 @@ impl PmJournalRecovery {
             owned_orders: BTreeMap::new(),
             order_order: BTreeMap::new(),
             fill_keys: BTreeMap::new(),
+            pending_ack_fill_keys: 0,
             fill_order: BTreeMap::new(),
             observation_order: BTreeMap::new(),
             safety_halt: None,
@@ -166,7 +168,6 @@ impl PmJournalRecovery {
         self.observation_order.values().copied()
     }
 
-    #[cfg(test)]
     pub(crate) fn reserved_capacity_bytes(&self) -> usize {
         self.owned_orders.len() * std::mem::size_of::<RecoveredOwnedOrder>()
             + self.order_order.len()
@@ -174,6 +175,11 @@ impl PmJournalRecovery {
             + self.fill_keys.len()
                 * (std::mem::size_of::<PmJournalFillKeyV1>()
                     + std::mem::size_of::<PmJournalFillAppliedV1>())
+            + self
+                .owned_orders
+                .values()
+                .map(|order| order.pending_ack_fills.reserved_capacity_bytes())
+                .sum::<usize>()
             + self.fill_order.len()
                 * (std::mem::size_of::<u64>() + std::mem::size_of::<PmJournalFillKeyV1>())
             + self.observation_order.len()
@@ -290,58 +296,56 @@ enum RecoveredPlace {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompactionProof {
-    Automatic,
-    SlotReplacementOrTerminal,
     FillWatermark,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingAcknowledgementFills {
-    entries: [Option<PmJournalFillKeyV1>; MAX_PM_ACKNOWLEDGEMENT_FILL_LEGS],
-    count: u8,
+    entries: Vec<PmJournalFillKeyV1>,
 }
 
 impl PendingAcknowledgementFills {
-    const fn empty() -> Self {
+    fn empty() -> Self {
         Self {
-            entries: [None; MAX_PM_ACKNOWLEDGEMENT_FILL_LEGS],
-            count: 0,
+            entries: Vec::new(),
         }
     }
 
     fn replace_from(&mut self, fills: &PmJournalImmediateFillsV1) {
-        *self = Self::empty();
+        self.entries.clear();
+        self.entries.reserve_exact(fills.iter().count());
         for key in fills.iter() {
-            let index = usize::from(self.count);
-            self.entries[index] = Some(key);
-            self.count += 1;
+            self.entries.push(key);
         }
     }
 
     fn resolve(&mut self, key: PmJournalFillKeyV1) -> bool {
-        let Some(index) = self.entries.iter().position(|entry| *entry == Some(key)) else {
+        let Some(index) = self.entries.iter().position(|entry| *entry == key) else {
             return false;
         };
-        self.entries[index] = None;
-        self.count -= 1;
+        self.entries.remove(index);
         true
     }
 
     fn contains(&self, key: PmJournalFillKeyV1) -> bool {
-        self.entries.contains(&Some(key))
+        self.entries.contains(&key)
     }
 
-    const fn is_empty(self) -> bool {
-        self.count == 0
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
-    const fn len(self) -> u8 {
-        self.count
+    fn len(&self) -> u8 {
+        u8::try_from(self.entries.len()).expect("schema-bounded acknowledgement fills fit u8")
+    }
+
+    fn reserved_capacity_bytes(&self) -> usize {
+        self.entries.capacity() * std::mem::size_of::<PmJournalFillKeyV1>()
     }
 }
 
 /// Exact non-authoritative order facts retained for coordinator bootstrap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RecoveredOwnedOrder {
     intent: PmJournalQuoteIntentV1,
     known_fill_total: U256,
@@ -377,7 +381,7 @@ impl RecoveredOwnedOrder {
         }
     }
 
-    fn original(self) -> U256 {
+    fn original(&self) -> U256 {
         self.intent.quantity.protocol_units()
     }
 
@@ -389,25 +393,11 @@ impl RecoveredOwnedOrder {
             || self.known_fill_total != self.cumulative
     }
 
-    fn can_compact(self, proof: CompactionProof) -> bool {
+    fn can_compact(&self, proof: CompactionProof) -> bool {
         if self.is_unresolved() {
             return false;
         }
-        let fill_bearing = !self.known_fill_total.is_zero();
-        match self.terminal {
-            Some(PmJournalTerminalStatusV1::Filled) => {
-                !fill_bearing || proof == CompactionProof::FillWatermark
-            }
-            Some(PmJournalTerminalStatusV1::Rejected) => {
-                (self.place == RecoveredPlace::Rejected || proof != CompactionProof::Automatic)
-                    && (!fill_bearing || proof == CompactionProof::FillWatermark)
-            }
-            Some(PmJournalTerminalStatusV1::Cancelled | PmJournalTerminalStatusV1::Expired) => {
-                proof != CompactionProof::Automatic
-                    && (!fill_bearing || proof == CompactionProof::FillWatermark)
-            }
-            None => false,
-        }
+        proof == CompactionProof::FillWatermark && self.terminal.is_some()
     }
 
     fn occupies_quote_slot(&self) -> bool {
@@ -616,30 +606,6 @@ fn apply_quote_intent(
         });
     }
 
-    // A later same-slot intent is itself the documented proof that a
-    // previously accepted cancellation converged and released that slot.
-    let retired = recovery
-        .owned_orders
-        .iter()
-        .filter_map(|(client, order)| {
-            (same_slot(order.intent, intent)
-                && matches!(
-                    order.terminal,
-                    Some(
-                        PmJournalTerminalStatusV1::Cancelled
-                            | PmJournalTerminalStatusV1::Expired
-                            | PmJournalTerminalStatusV1::Rejected
-                    )
-                )
-                && order.can_compact(CompactionProof::SlotReplacementOrTerminal))
-            .then_some(*client)
-        })
-        .collect::<Vec<_>>();
-    for client in retired {
-        compact_order(recovery, client);
-    }
-    compact_proven_terminal_orders(recovery, CompactionProof::Automatic);
-
     if recovery.owned_orders.contains_key(&intent.client_order) {
         return Err(PmJournalRecoveryError::DuplicateQuoteIntent);
     }
@@ -693,6 +659,16 @@ fn apply_place_result(
     {
         return Err(PmJournalRecoveryError::DuplicateVenueBinding);
     }
+    let binds_venue = matches!(
+        result.outcome,
+        PmJournalPlaceOutcomeV1::AcceptedResting
+            | PmJournalPlaceOutcomeV1::AcceptedWithImmediateFill
+            | PmJournalPlaceOutcomeV1::LateAcknowledgement
+    );
+    let immediate_fill_count = result.immediate_fills.iter().count();
+    if binds_venue {
+        ensure_fill_key_capacity(recovery, immediate_fill_count)?;
+    }
     let order = recovery
         .owned_orders
         .get_mut(&result.client_order)
@@ -725,7 +701,28 @@ fn apply_place_result(
             bind_venue(order, result.venue_order, &result.immediate_fills)?;
         }
     }
-    compact_proven_terminal_orders(recovery, CompactionProof::Automatic);
+    if binds_venue {
+        recovery.pending_ack_fill_keys = recovery
+            .pending_ack_fill_keys
+            .checked_add(immediate_fill_count)
+            .expect("bounded pending acknowledgement fill count cannot overflow");
+    }
+    Ok(())
+}
+
+fn ensure_fill_key_capacity(
+    recovery: &PmJournalRecovery,
+    additional: usize,
+) -> Result<(), PmJournalRecoveryError> {
+    let retained = recovery
+        .fill_keys
+        .len()
+        .checked_add(recovery.pending_ack_fill_keys)
+        .and_then(|count| count.checked_add(additional))
+        .ok_or(PmJournalRecoveryError::TooManyFillKeys)?;
+    if retained > MAX_PM_JOURNAL_FILL_KEYS {
+        return Err(PmJournalRecoveryError::TooManyFillKeys);
+    }
     Ok(())
 }
 
@@ -783,7 +780,6 @@ fn apply_cancel_result(
             order.cancel_unknown = true;
         }
     }
-    compact_proven_terminal_orders(recovery, CompactionProof::Automatic);
     Ok(())
 }
 
@@ -804,9 +800,12 @@ fn apply_fill(
             },
         );
     }
-    if recovery.fill_keys.len() == MAX_PM_JOURNAL_FILL_KEYS {
-        return Err(PmJournalRecoveryError::TooManyFillKeys);
-    }
+    let order = recovery
+        .owned_orders
+        .get(&fill.client_order)
+        .ok_or(PmJournalRecoveryError::UnknownOwnedOrder)?;
+    let resolves_pending_ack = order.pending_ack_fills.contains(fill.key);
+    ensure_fill_key_capacity(recovery, usize::from(!resolves_pending_ack))?;
     let order = recovery
         .owned_orders
         .get_mut(&fill.client_order)
@@ -906,11 +905,18 @@ fn apply_fill(
     order.known_fill_total = known_fill_total;
     order.authoritative_cumulative = authoritative;
     order.cumulative = next_cumulative;
-    order.pending_ack_fills.resolve(fill.key);
+    let resolved_pending_ack = order.pending_ack_fills.resolve(fill.key);
+    debug_assert_eq!(resolved_pending_ack, resolves_pending_ack);
     if next_cumulative == original {
         order.terminal = Some(PmJournalTerminalStatusV1::Filled);
         order.cancel_pending = false;
         order.cancel_unknown = false;
+    }
+    if resolved_pending_ack {
+        recovery.pending_ack_fill_keys = recovery
+            .pending_ack_fill_keys
+            .checked_sub(1)
+            .expect("resolved acknowledgement fill must be globally pending");
     }
     recovery.fill_keys.insert(fill.key, applied);
     recovery.fill_order.insert(owner_sequence, fill.key);
@@ -919,7 +925,6 @@ fn apply_fill(
         PmJournalRecoveredObservationV1::FillApplied(applied),
     );
     recovery.last_owned_observation_sequence = owner_sequence;
-    compact_proven_terminal_orders(recovery, CompactionProof::Automatic);
     Ok(())
 }
 
@@ -1041,7 +1046,6 @@ fn apply_terminal(
         PmJournalRecoveredObservationV1::OrderTerminal(*terminal),
     );
     recovery.last_owned_observation_sequence = owner_sequence;
-    compact_order_if_safe(recovery, terminal.client_order, CompactionProof::Automatic);
     Ok(())
 }
 
@@ -1096,20 +1100,6 @@ fn compact_proven_terminal_orders(recovery: &mut PmJournalRecovery, proof: Compa
         .filter_map(|(client, order)| order.can_compact(proof).then_some(*client))
         .collect::<Vec<_>>();
     for client in clients {
-        compact_order(recovery, client);
-    }
-}
-
-fn compact_order_if_safe(
-    recovery: &mut PmJournalRecovery,
-    client: PmClientOrderKey,
-    proof: CompactionProof,
-) {
-    if recovery
-        .owned_orders
-        .get(&client)
-        .is_some_and(|order| order.can_compact(proof))
-    {
         compact_order(recovery, client);
     }
 }

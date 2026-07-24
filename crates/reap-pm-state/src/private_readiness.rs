@@ -7,10 +7,12 @@ use crate::account::{
     PmAccountState, PmAllowanceKnowledge, PmObservedAmount, PmPositionKnowledge, apply_signed,
 };
 use crate::fill_state::{PmFillFeeState, PmFillState};
-use crate::order_state::{PmExactReservation, PmOrderState, PmReservationTotalsError};
+use crate::order_state::{
+    PmExactReservation, PmOrderDecisionSummary, PmOrderState, PmReservationTotalsError,
+};
 use crate::private_config::PmPrivateStateConfig;
 use crate::private_ingress::PmPrivateExternalIngressFault;
-use crate::risk::{PmFreshnessRiskLimits, PmRiskReason};
+use crate::risk::{PmFreshnessRiskLimits, PmRiskDecision, PmRiskReason};
 use crate::unresolved_fill::{PmUnresolvedFillKey, PmUnresolvedFillReason, PmUnresolvedFillState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,6 +202,15 @@ pub enum PmPrivateReadiness {
     Blocked(PmPrivateReadinessReason),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmPrivateQuoteEvaluation {
+    Blocked(PmPrivateReadinessReason),
+    Evaluated {
+        ready: PmPrivateReady,
+        risk: PmRiskDecision,
+    },
+}
+
 pub(crate) struct PmReadinessContext<'a> {
     pub(crate) config: &'a PmPrivateStateConfig,
     pub(crate) account: &'a PmAccountState,
@@ -218,12 +229,13 @@ pub(crate) struct PmReadinessContext<'a> {
 pub(crate) fn check(
     context: PmReadinessContext<'_>,
     request: PmPrivateQuoteRequest,
+    order_summary: PmOrderDecisionSummary,
 ) -> PmPrivateReadiness {
     if let Some(reason) = precondition_reason(&context, request.monotonic_now_ns) {
         return PmPrivateReadiness::Blocked(reason);
     }
     if let Some(reason) =
-        reservation_or_fill_reason(context.orders, context.fills, context.unresolved_fills)
+        reservation_or_fill_reason(order_summary, context.fills, context.unresolved_fills)
     {
         return PmPrivateReadiness::Blocked(reason);
     }
@@ -240,7 +252,7 @@ pub(crate) fn check(
             context.config,
         ));
     };
-    let Ok((reserved_collateral, reserved_outcome)) = context.orders.reservation_totals() else {
+    let Ok((reserved_collateral, reserved_outcome)) = order_summary.reservation_totals() else {
         return PmPrivateReadiness::Blocked(PmPrivateReadinessReason::ArithmeticInvalid);
     };
     let candidate = request.reservation;
@@ -333,7 +345,7 @@ fn precondition_reason(
 }
 
 fn reservation_or_fill_reason(
-    orders: &PmOrderState,
+    orders: PmOrderDecisionSummary,
     fills: &PmFillState,
     unresolved_fills: &PmUnresolvedFillState,
 ) -> Option<PmPrivateReadinessReason> {

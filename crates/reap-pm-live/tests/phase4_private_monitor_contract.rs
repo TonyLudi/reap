@@ -89,6 +89,56 @@ fn unresolved_trade(id: &str) -> Value {
     })
 }
 
+fn exact_unresolved_trade(id: &str, order_id: &str) -> Value {
+    json!({
+        "event_type": "trade",
+        "id": id,
+        "market": support::MARKET,
+        "asset_id": support::TOKEN.to_string(),
+        "side": "BUY",
+        "size": "5",
+        "price": "0.40",
+        "status": "MATCHED",
+        "maker_address": support::PM_FUNDER,
+        "transaction_hash": "0xdead",
+        "order_id": order_id
+    })
+}
+
+fn maker_trade_with_external_leg(id: &str) -> Value {
+    json!({
+        "event_type": "trade",
+        "id": id,
+        "market": support::MARKET,
+        "asset_id": support::TOKEN.to_string(),
+        "side": "BUY",
+        "size": "5",
+        "price": "0.40",
+        "status": "MATCHED",
+        "maker_address": "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "transaction_hash": "0xbeef",
+        "trader_side": "MAKER",
+        "maker_orders": [
+            {
+                "order_id": "local-maker-order",
+                "asset_id": support::TOKEN.to_string(),
+                "side": "SELL",
+                "price": "0.40",
+                "matched_amount": "5",
+                "maker_address": support::PM_FUNDER
+            },
+            {
+                "order_id": "external-maker-order",
+                "asset_id": support::TOKEN.to_string(),
+                "side": "BUY",
+                "price": "0.60",
+                "matched_amount": "5",
+                "maker_address": "0xefefefefefefefefefefefefefefefefefefefef"
+            }
+        ]
+    })
+}
+
 fn raw(value: &Value) -> Vec<u8> {
     serde_json::to_vec(value).unwrap()
 }
@@ -400,6 +450,88 @@ fn normalization_and_service_clock_failures_never_bypass_owner_bound_reduction()
             PmPrivateHaltReason::ExternalIngressFault(fault)
         ))
     );
+}
+
+#[test]
+fn private_batch_unresolved_and_cross_fill_identities_are_exact() {
+    let mut duplicate =
+        PmReadOnlyMonitor::new(support::account_config(), support::private_risk_limits()).unwrap();
+    duplicate
+        .reconnect_private(ConnectionEpoch::new(1), 20_000)
+        .unwrap();
+    let repeated_unresolved = raw(&json!([
+        exact_unresolved_trade("same-unresolved", "same-order"),
+        exact_unresolved_trade("same-unresolved", "same-order")
+    ]));
+    assert!(matches!(
+        duplicate.ingest_private_fixture(
+            completion(1, 1, None),
+            30_001,
+            &repeated_unresolved,
+            PmFixtureFeeEvidence::Unknown,
+        ),
+        Err(PmPrivateMonitorError::DuplicateBatchIdentity)
+    ));
+    assert_eq!(duplicate.private_projection().unresolved_fills().count(), 0);
+
+    let mut distinct =
+        PmReadOnlyMonitor::new(support::account_config(), support::private_risk_limits()).unwrap();
+    distinct
+        .reconnect_private(ConnectionEpoch::new(1), 20_000)
+        .unwrap();
+    let same_fill_different_orders = raw(&json!([
+        exact_unresolved_trade("shared-fill", "first-order"),
+        exact_unresolved_trade("shared-fill", "second-order")
+    ]));
+    let applied = distinct
+        .ingest_private_fixture(
+            completion(1, 1, None),
+            30_001,
+            &same_fill_different_orders,
+            PmFixtureFeeEvidence::Unknown,
+        )
+        .unwrap();
+    assert_eq!(applied.unresolved_fill_observations(), 2);
+
+    let mut cross_kind =
+        PmReadOnlyMonitor::new(support::account_config(), support::private_risk_limits()).unwrap();
+    cross_kind
+        .reconnect_private(ConnectionEpoch::new(1), 20_000)
+        .unwrap();
+    let fill_and_exact_unresolved = raw(&json!([
+        trade("cross-fill", "cross-order"),
+        exact_unresolved_trade("cross-fill", "cross-order")
+    ]));
+    assert!(matches!(
+        cross_kind.ingest_private_fixture(
+            completion(1, 1, None),
+            30_001,
+            &fill_and_exact_unresolved,
+            PmFixtureFeeEvidence::Unknown,
+        ),
+        Err(PmPrivateMonitorError::DuplicateBatchIdentity)
+    ));
+    assert_eq!(cross_kind.private_projection().fills().count(), 0);
+    assert_eq!(
+        cross_kind.private_projection().unresolved_fills().count(),
+        0
+    );
+
+    let mut candidate_only =
+        PmReadOnlyMonitor::new(support::account_config(), support::private_risk_limits()).unwrap();
+    candidate_only
+        .reconnect_private(ConnectionEpoch::new(1), 20_000)
+        .unwrap();
+    let applied = candidate_only
+        .ingest_private_fixture(
+            completion(1, 1, None),
+            30_001,
+            &raw(&maker_trade_with_external_leg("candidate-only")),
+            PmFixtureFeeEvidence::Unknown,
+        )
+        .unwrap();
+    assert_eq!(applied.fill_observations(), 1);
+    assert_eq!(applied.unresolved_fill_observations(), 1);
 }
 
 #[test]

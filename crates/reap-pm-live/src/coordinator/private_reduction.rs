@@ -80,19 +80,25 @@ pub(super) fn reduce_reconciliation(
         ingress: fills.payload().boundary().completion_sequence(),
         snapshot: Some(fills.payload().snapshot().revision()),
     };
-    let row_count = fills.payload().fills().len();
+    let row_count = owner.reconciliation_fact_upper_bound(fills.payload().fills());
     let requested_after = fills.payload().requested_after();
     let resulting_watermark = fills.payload().resulting_watermark();
     let watermark_advanced = requested_after != Some(resulting_watermark);
     let monotonic_service_ns = fills.clock().monotonic_service_ns();
-    // The journal queue is deliberately bounded at 1,024 facts. A larger
-    // all-new owned cut is rejected before state mutation and must remain
-    // unready/retry; it cannot become partially durable.
+    // The journal queue is deliberately bounded at 1,024 facts. Known owned
+    // fill keys are duplicate/enrichment rows and cannot emit another durable
+    // FillApplied fact; every other row remains a conservative upper bound.
+    // A larger possibly-new cut is rejected before state mutation and must
+    // remain unready/retry; it cannot become partially durable.
     let possible_watermark_record = usize::from(watermark_advanced);
     owner.ensure_fact_capacity(row_count.saturating_add(possible_watermark_record))?;
+    if watermark_advanced {
+        owner.ensure_fill_watermark_compaction_available()?;
+    }
     let outcome = match owner.reduce_private_reconciliation(account, fills) {
         Ok(outcome) => outcome,
         Err(error) => {
+            owner.clear_reconciliation_reductions();
             let _transition = owner.enter_terminal_safety(
                 PmJournalSafetyReasonV1::ContractViolation,
                 monotonic_service_ns,
@@ -100,44 +106,59 @@ pub(super) fn reduce_reconciliation(
             return Err(error.into());
         }
     };
-    let reduction_count = owner.reconciliation_reduction_count();
-    for index in 0..reduction_count {
-        let row = owner.reconciliation_reduction(index).ok_or_else(|| {
-            fail(
-                owner,
-                PmPrivateReductionError::ScratchMismatch,
-                monotonic_service_ns,
-            )
-        })?;
-        match row.disposition() {
-            PmReconciliationFillDisposition::OwnedApplied(owned) => {
-                record_owned_fill(
-                    owner,
-                    row.envelope(),
-                    owned,
-                    PmJournalFillSourceV1::RestReconciliation,
-                    expected,
-                )?;
-            }
-            PmReconciliationFillDisposition::OwnedDuplicate(_)
-            | PmReconciliationFillDisposition::OwnedStale(_) => {
-                owner.count_duplicate_fill();
-            }
-            PmReconciliationFillDisposition::Unowned(_) => {}
-        }
-    }
+    project_reconciliation_consequences(owner, expected, monotonic_service_ns)?;
     if matches!(outcome, PmReconciliationApply::Applied { .. }) && watermark_advanced {
-        owner.record_fact(
+        let compaction = owner.prepare_fill_watermark_compaction()?;
+        owner.record_fill_watermark_fact(
             PmJournalRecordV1::FillWatermarkAdvanced(PmJournalFillWatermarkV1 {
                 cursor: PmJournalFillCursorV1 {
                     account_scope: resulting_watermark.account_scope(),
                     opaque: PmJournalFingerprintV1::from_bytes(resulting_watermark.opaque()),
                 },
             }),
+            compaction,
             monotonic_service_ns,
         )?;
     }
     Ok(outcome)
+}
+
+fn project_reconciliation_consequences(
+    owner: &mut PmMutationOwner,
+    expected: ExpectedOccurrence,
+    monotonic_service_ns: u64,
+) -> Result<(), PmMutationError> {
+    let reduction_count = owner.reconciliation_reduction_count();
+    let reduction_result = (|| {
+        for index in 0..reduction_count {
+            let row = owner.reconciliation_reduction(index).ok_or_else(|| {
+                fail(
+                    owner,
+                    PmPrivateReductionError::ScratchMismatch,
+                    monotonic_service_ns,
+                )
+            })?;
+            match row.disposition() {
+                PmReconciliationFillDisposition::OwnedApplied(owned) => {
+                    record_owned_fill(
+                        owner,
+                        row.envelope(),
+                        owned,
+                        PmJournalFillSourceV1::RestReconciliation,
+                        expected,
+                    )?;
+                }
+                PmReconciliationFillDisposition::OwnedDuplicate(_)
+                | PmReconciliationFillDisposition::OwnedStale(_) => {
+                    owner.count_duplicate_fill();
+                }
+                PmReconciliationFillDisposition::Unowned(_) => {}
+            }
+        }
+        Ok::<(), PmMutationError>(())
+    })();
+    owner.clear_reconciliation_reductions();
+    reduction_result
 }
 
 fn record_private_order(

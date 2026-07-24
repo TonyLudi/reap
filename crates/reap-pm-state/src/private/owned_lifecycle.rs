@@ -4,18 +4,20 @@ use reap_pm_core::{
 };
 
 use crate::fill_state::PmFillApply;
-use crate::order_state::{PmOrderApply, PmOwnedOrderRegistration, PmRemoteOrderKnowledge};
+use crate::order_state::{
+    PmOrderApply, PmOwnedOrderRegistration, PmOwnedRegistrationPlan, PmRemoteOrderKnowledge,
+};
 use crate::owned_lifecycle::{
     PmOwnedCancelApply, PmOwnedCancelIntent, PmOwnedCancelOutcome, PmOwnedCancelRequestApply,
     PmOwnedFillApply, PmOwnedFillObservation, PmOwnedFillProjection, PmOwnedLifecycleCounters,
     PmOwnedObservationOccurrence, PmOwnedObservationSource, PmOwnedOrderLifecycle,
     PmOwnedOrderLifecycleError, PmOwnedOrderProgressObservation, PmOwnedOrderProjection,
-    PmOwnedProgressApply, PmOwnedQuoteAdmission, PmOwnedQuoteIntent, PmOwnedQuoteSlotProjection,
-    PmOwnedRecoveryFill, PmOwnedReductionSequence, PmOwnedRemoteOrderApply, PmOwnedSubmitApply,
-    PmOwnedSubmitResult, PmOwnedTerminalCompaction,
+    PmOwnedProgressApply, PmOwnedQuoteAdmission, PmOwnedQuoteAdmissionPlan, PmOwnedQuoteIntent,
+    PmOwnedQuoteSlotProjection, PmOwnedRecoveryFill, PmOwnedReductionSequence,
+    PmOwnedRemoteOrderApply, PmOwnedSubmitApply, PmOwnedSubmitResult, PmOwnedTerminalCompaction,
 };
 use crate::private_occurrence::PmPrivateOccurrence;
-use crate::refresh::PmRefreshOwnerId;
+use crate::refresh::{PmRefreshOwnerId, PmRefreshReason};
 
 use super::{PmPrivateState, PmPrivateStateError};
 
@@ -273,6 +275,10 @@ impl PmReconciliationReductions {
         self.rows.get(index).copied()
     }
 
+    pub fn clear(&mut self) {
+        self.rows.clear();
+    }
+
     pub fn iter(
         &self,
     ) -> impl DoubleEndedIterator<Item = PmReconciliationFillReduction> + ExactSizeIterator + '_
@@ -360,13 +366,96 @@ impl PmOwnedImmediateAckTicket {
     }
 }
 
+/// Move-only proof of the exact live rows covered by one complete fill cut.
+///
+/// The proof must return to the issuing private-state owner only after the
+/// corresponding watermark record is durably acknowledged, or be aborted
+/// when that write fails.
+#[derive(Debug)]
+pub struct PmPreparedFillCompaction {
+    owner: PmRefreshOwnerId,
+    generation: u64,
+    through: PmPrivateOccurrence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PmFillCompaction {
+    owned_lifecycle_rows: usize,
+    canonical_order_rows: usize,
+    owned_fill_keys: usize,
+    canonical_fill_rows: usize,
+}
+
+impl PmFillCompaction {
+    #[must_use]
+    pub const fn owned_lifecycle_rows(self) -> usize {
+        self.owned_lifecycle_rows
+    }
+
+    #[must_use]
+    pub const fn canonical_order_rows(self) -> usize {
+        self.canonical_order_rows
+    }
+
+    #[must_use]
+    pub const fn owned_fill_keys(self) -> usize {
+        self.owned_fill_keys
+    }
+
+    #[must_use]
+    pub const fn canonical_fill_rows(self) -> usize {
+        self.canonical_fill_rows
+    }
+}
+
+/// Exclusive, move-only preparation for one owned quote admission.
+///
+/// Dropping this guard aborts without mutating either owned lifecycle or
+/// canonical order state. Its exclusive state borrow prevents the validated
+/// plans from becoming stale before a consuming commit.
+#[must_use = "dropping a prepared owned quote admission aborts it without mutation"]
+pub struct PmPreparedOwnedQuoteAdmission<'a> {
+    state: &'a mut PmPrivateState,
+    admission_plan: PmOwnedQuoteAdmissionPlan,
+    registration_plan: Option<PmOwnedRegistrationPlan>,
+}
+
+impl PmPreparedOwnedQuoteAdmission<'_> {
+    #[must_use]
+    pub const fn outcome(&self) -> PmOwnedQuoteAdmission {
+        self.admission_plan.outcome()
+    }
+
+    pub fn commit(self) -> PmOwnedQuoteAdmission {
+        let expected = self.admission_plan.outcome();
+        let outcome = self
+            .state
+            .owned_lifecycle
+            .commit_preflighted_admit_quote(self.admission_plan);
+        debug_assert_eq!(outcome, expected);
+        if let Some(plan) = self.registration_plan {
+            self.state
+                .orders
+                .commit_preflighted_owned_registration(plan);
+        }
+        outcome
+    }
+}
+
 impl PmPrivateState {
-    pub fn admit_owned_quote(
-        &mut self,
+    /// Validates one owned quote admission without changing lifecycle or
+    /// canonical-order state.
+    ///
+    /// In particular, a replacement candidate returns the exact
+    /// cancel-before-replace projection without marking that cancel pending.
+    /// The mutation owner can therefore route the cancel through its durable
+    /// intent boundary before any executable authority exists.
+    pub fn preflight_owned_quote(
+        &self,
         intent: PmOwnedQuoteIntent,
     ) -> Result<PmOwnedQuoteAdmission, PmPrivateStateError> {
         let expected = self.owned_lifecycle.preflight_admit_quote(intent)?;
-        let registration = if matches!(expected, PmOwnedQuoteAdmission::Admitted(_)) {
+        if matches!(expected, PmOwnedQuoteAdmission::Admitted(_)) {
             let registration = PmOwnedOrderRegistration::new(
                 intent.client_order(),
                 intent.slot().instrument(),
@@ -377,16 +466,44 @@ impl PmPrivateState {
             )?;
             self.orders
                 .preflight_register_owned(registration, &self.config)?;
-            Some(registration)
+        }
+        Ok(expected)
+    }
+
+    pub fn admit_owned_quote(
+        &mut self,
+        intent: PmOwnedQuoteIntent,
+    ) -> Result<PmOwnedQuoteAdmission, PmPrivateStateError> {
+        Ok(self.prepare_owned_quote(intent)?.commit())
+    }
+
+    pub fn prepare_owned_quote(
+        &mut self,
+        intent: PmOwnedQuoteIntent,
+    ) -> Result<PmPreparedOwnedQuoteAdmission<'_>, PmPrivateStateError> {
+        let admission_plan = self.owned_lifecycle.prepare_admit_quote(intent)?;
+        let expected = admission_plan.outcome();
+        let registration_plan = if matches!(expected, PmOwnedQuoteAdmission::Admitted(_)) {
+            let registration = PmOwnedOrderRegistration::new(
+                intent.client_order(),
+                intent.slot().instrument(),
+                intent.slot().side(),
+                intent.price(),
+                intent.quantity(),
+                intent.reservation(),
+            )?;
+            Some(
+                self.orders
+                    .prepare_owned_registration(registration, &self.config)?,
+            )
         } else {
             None
         };
-        let outcome = self.owned_lifecycle.admit_quote(intent)?;
-        debug_assert_eq!(outcome, expected);
-        if let Some(registration) = registration {
-            self.orders.register_owned(registration, &self.config)?;
-        }
-        Ok(outcome)
+        Ok(PmPreparedOwnedQuoteAdmission {
+            state: self,
+            admission_plan,
+            registration_plan,
+        })
     }
 
     pub fn apply_owned_submit_result(
@@ -408,6 +525,9 @@ impl PmPrivateState {
         if let PmOwnedSubmitResult::Accepted(venue_order) = result {
             self.orders
                 .bind_owned_venue(client_order, venue_order, &self.config)?;
+        }
+        if outcome == PmOwnedSubmitApply::MarkedAmbiguous {
+            let _required = self.require_refresh(PmRefreshReason::AmbiguousOrder)?;
         }
         Ok(outcome)
     }
@@ -660,6 +780,87 @@ impl PmPrivateState {
         let compacted = self.owned_lifecycle.compact_proven_terminal(client_order)?;
         self.orders.compact_proven_owned(client_order)?;
         Ok(compacted)
+    }
+
+    pub fn prepare_fill_watermark_compaction(
+        &mut self,
+    ) -> Result<PmPreparedFillCompaction, PmPrivateStateError> {
+        if self.pending_fill_compaction_generation.is_some() {
+            return Err(PmPrivateStateError::FillCompactionPending);
+        }
+        let through = self
+            .fills
+            .reconciliation_completion()
+            .ok_or(PmPrivateStateError::MissingFillCompactionCut)?;
+        let generation = self.next_fill_compaction_generation;
+        self.next_fill_compaction_generation = generation
+            .checked_add(1)
+            .ok_or(PmPrivateStateError::FillCompactionGenerationExhausted)?;
+        let _marked = self
+            .owned_lifecycle
+            .mark_compactable_through(generation, through);
+        self.pending_fill_compaction_generation = Some(generation);
+        Ok(PmPreparedFillCompaction {
+            owner: self.owner,
+            generation,
+            through,
+        })
+    }
+
+    pub fn commit_fill_watermark_compaction(
+        &mut self,
+        ticket: PmPreparedFillCompaction,
+    ) -> Result<PmFillCompaction, PmPrivateStateError> {
+        self.validate_fill_compaction_ticket(&ticket)?;
+        self.owned_lifecycle
+            .clear_invalid_compaction_marks(ticket.generation, ticket.through);
+        for client in self
+            .owned_lifecycle
+            .marked_compaction_clients(ticket.generation)
+        {
+            self.owned_lifecycle
+                .preflight_compact_proven_terminal(client)?;
+            self.orders.preflight_compact_proven_owned(client)?;
+        }
+
+        let mut result = PmFillCompaction::default();
+        while let Some(client) = self
+            .owned_lifecycle
+            .first_marked_compaction_client(ticket.generation)
+        {
+            let compacted = self.owned_lifecycle.compact_proven_terminal(client)?;
+            self.orders.compact_proven_owned(client)?;
+            result.owned_lifecycle_rows += 1;
+            result.canonical_order_rows += 1;
+            result.owned_fill_keys += compacted.fill_keys_removed();
+        }
+        result.canonical_fill_rows = self.fills.compact_covered_through(ticket.through);
+        self.pending_fill_compaction_generation = None;
+        Ok(result)
+    }
+
+    pub fn abort_fill_watermark_compaction(
+        &mut self,
+        ticket: PmPreparedFillCompaction,
+    ) -> Result<(), PmPrivateStateError> {
+        self.validate_fill_compaction_ticket(&ticket)?;
+        self.owned_lifecycle
+            .clear_compaction_marks(ticket.generation);
+        self.pending_fill_compaction_generation = None;
+        Ok(())
+    }
+
+    fn validate_fill_compaction_ticket(
+        &self,
+        ticket: &PmPreparedFillCompaction,
+    ) -> Result<(), PmPrivateStateError> {
+        if ticket.owner != self.owner
+            || self.pending_fill_compaction_generation != Some(ticket.generation)
+        {
+            Err(PmPrivateStateError::FillCompactionTicketMismatch)
+        } else {
+            Ok(())
+        }
     }
 
     pub fn owned_orders(&self) -> impl Iterator<Item = PmOwnedOrderProjection> + '_ {

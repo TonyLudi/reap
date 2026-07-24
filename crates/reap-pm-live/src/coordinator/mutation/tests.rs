@@ -35,19 +35,22 @@ use reap_polymarket_adapter::{
 use tempfile::TempDir;
 
 use super::{
-    PmCancelMutationAdmission, PmCancelMutationRequest, PmMutationError, PmMutationHalt,
-    PmMutationOwner, PmPersistenceService, PmQuoteMutationAdmission, PmQuoteMutationRequest,
+    PmCancelMutationAdmission, PmCancelMutationRequest, PmDurableConsequence, PmMutationError,
+    PmMutationHalt, PmMutationOwner, PmPersistenceService, PmQuoteMutationAdmission,
+    PmQuoteMutationRequest,
 };
 use crate::coordinator::PmAuthorityRevisions;
 use crate::coordinator::effect_queue::{PM_FAKE_EFFECT_CAPACITY, PmFakeEffectQueueError};
 use crate::coordinator::effects::PmDurableRecordKind;
 use crate::coordinator::persistence::{
-    PM_PENDING_PERSISTENCE_MAX_AGE_NS, PmPersistenceIntentIdentity,
+    PM_PENDING_PERSISTENCE_CAPACITY, PM_PENDING_PERSISTENCE_MAX_AGE_NS, PmPendingPersistence,
+    PmPersistenceError, PmPersistenceIntentIdentity,
 };
 use crate::fake_effect::PmFakeEffectRole;
 use crate::journal::{
-    PmJournalCancelReasonV1, PmJournalRecordV1, PmJournalRecoveredPlaceV1, PmJournalSafetyHaltV1,
-    PmJournalSafetyReasonV1, PmJournalScopeV1, recover_pm_mutation_journal,
+    PmJournalCancelReasonV1, PmJournalFillCursorV1, PmJournalFillWatermarkV1,
+    PmJournalFingerprintV1, PmJournalRecordV1, PmJournalRecoveredPlaceV1, PmJournalSafetyHaltV1,
+    PmJournalSafetyReasonV1, PmJournalScopeV1, PmPendingJournalRecord, recover_pm_mutation_journal,
 };
 use crate::private_monitor::PmPrivateMonitorRuntime;
 
@@ -187,7 +190,7 @@ async fn start_owner(config: &PmConnectivityConfig, journal_path: &Path) -> PmMu
         account.instrument_id(),
     );
     let (owner, recovery) =
-        PmMutationOwner::start(config, private, fake, journal_path.to_path_buf())
+        PmMutationOwner::start(config, Box::new(private), fake, journal_path.to_path_buf())
             .await
             .unwrap();
     assert_eq!(recovery.record_count(), 0);
@@ -221,7 +224,7 @@ async fn restart_owner(
         account.instrument(),
         account.instrument_id(),
     );
-    PmMutationOwner::start(config, private, fake, journal_path.to_path_buf())
+    PmMutationOwner::start(config, Box::new(private), fake, journal_path.to_path_buf())
         .await
         .unwrap()
 }
@@ -318,6 +321,15 @@ fn prime_restarted_private(owner: &mut PmMutationOwner, config: &PmConnectivityC
 
 fn snapshot(revision: u64) -> PmSnapshotEvidence {
     PmSnapshotEvidence::new(SnapshotRevision::new(revision)).unwrap()
+}
+
+fn fill_watermark_record(config: &PmConnectivityConfig, cursor_byte: u8) -> PmJournalRecordV1 {
+    PmJournalRecordV1::FillWatermarkAdvanced(PmJournalFillWatermarkV1 {
+        cursor: PmJournalFillCursorV1 {
+            account_scope: config.account().account_scope(),
+            opaque: PmJournalFingerprintV1::from_bytes([cursor_byte; 32]),
+        },
+    })
 }
 
 fn boundary(request: u64, completion: u64) -> PmReconciliationRequestBoundary {
@@ -504,12 +516,22 @@ fn quote_request(
     salt: u64,
     expires_at_monotonic_ns: u64,
 ) -> PmQuoteMutationRequest {
+    quote_request_at_probability(config, side, salt, expires_at_monotonic_ns, 0.40)
+}
+
+fn quote_request_at_probability(
+    config: &PmConnectivityConfig,
+    side: PmOrderSide,
+    salt: u64,
+    expires_at_monotonic_ns: u64,
+    fair_probability: f64,
+) -> PmQuoteMutationRequest {
     let metadata = config.account().expected_metadata();
     let candidate = validate_passive_quote_candidate(PmQuotePolicyInput::new(
         config.account().instrument(),
         metadata,
         side,
-        0.40,
+        fair_probability,
         PmQuantity::parse_decimal("1").unwrap(),
         Some(PmPrice::parse_decimal("0.30").unwrap()),
         Some(PmPrice::parse_decimal("0.50").unwrap()),
@@ -517,7 +539,7 @@ fn quote_request(
     .unwrap();
     let reservation = match side {
         PmOrderSide::Buy => {
-            PmExactReservation::policy_approved(U256::from_u64(400_000), U256::ZERO).unwrap()
+            PmExactReservation::policy_approved(candidate.maker_amount(), U256::ZERO).unwrap()
         }
         PmOrderSide::Sell => {
             PmExactReservation::policy_approved(U256::ZERO, U256::from_u64(1_000_000)).unwrap()
@@ -878,8 +900,12 @@ async fn fake_place_rejection_is_terminal_and_durable_without_venue_binding() {
         recovery.record_count(),
         JOURNAL_HEADER_RECORDS + READY_BASELINE_JOURNAL_RECORDS + 2
     );
-    assert_eq!(recovery.owned_order_count(), 0);
-    assert_eq!(recovery.compacted_intent_id(), 1);
+    assert_eq!(recovery.owned_order_count(), 1);
+    assert_eq!(recovery.compacted_intent_id(), 0);
+    assert_eq!(
+        recovery.recovered_orders().next().unwrap().place(),
+        PmJournalRecoveredPlaceV1::Rejected
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1034,7 +1060,10 @@ async fn assert_quote_invalidated_after_durable_intent(case: InvalidationCase) {
         owner.counters().fact_records(),
         READY_BASELINE_FACT_RECORDS + 1
     );
-    assert!(owner.private_mut().owned_order(client).is_none());
+    let retained = owner.private_mut().owned_order(client).unwrap();
+    assert_eq!(retained.submit(), PmOwnedSubmitState::Rejected);
+    assert_eq!(retained.status(), Some(PmOrderStatus::Rejected));
+    assert_eq!(retained.venue_order(), None);
     let consequence = owner.pop_durable_consequence().unwrap();
     assert_eq!(consequence.kind(), PmDurableRecordKind::PlaceResult);
     assert_eq!(consequence.client_order(), Some(client));
@@ -1055,8 +1084,12 @@ async fn assert_quote_invalidated_after_durable_intent(case: InvalidationCase) {
         recovery.record_count(),
         JOURNAL_HEADER_RECORDS + READY_BASELINE_JOURNAL_RECORDS + 2
     );
-    assert_eq!(recovery.owned_order_count(), 0);
-    assert_eq!(recovery.compacted_intent_id(), 1);
+    assert_eq!(recovery.owned_order_count(), 1);
+    assert_eq!(recovery.compacted_intent_id(), 0);
+    assert_eq!(
+        recovery.recovered_orders().next().unwrap().place(),
+        PmJournalRecoveredPlaceV1::Rejected
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1135,6 +1168,72 @@ async fn cancel_outcomes_map_to_exact_owned_states() {
         drain_persistence(&mut owner, 133).await;
         owner.shutdown().await.unwrap();
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn replacement_preflight_leaves_cancel_state_for_the_durable_cancel_owner() {
+    let (config, _directory, _journal_path, mut owner) = ready_owner().await;
+    let venue = venue_order(&config, "replacement-preflight");
+    let client = place_resting_quote(&mut owner, &config, PmOrderSide::Buy, 1, venue).await;
+    let persistence_before = owner.pending_persistence();
+    let counters_before = owner.counters();
+    assert_eq!(
+        owner.private_mut().owned_order(client).unwrap().cancel(),
+        PmOwnedCancelState::None
+    );
+
+    assert!(matches!(
+        owner
+            .begin_quote(quote_request_at_probability(
+                &config,
+                PmOrderSide::Buy,
+                2,
+                QUOTE_EXPIRES_NS,
+                0.41,
+            ))
+            .unwrap(),
+        PmQuoteMutationAdmission::CancelBeforeReplace {
+            current,
+            venue_order,
+        } if current == client && venue_order == venue
+    ));
+    assert_eq!(
+        owner.private_mut().owned_order(client).unwrap().cancel(),
+        PmOwnedCancelState::None
+    );
+    assert_eq!(owner.pending_persistence(), persistence_before);
+    assert_eq!(
+        owner.counters().cancel_before_replace(),
+        counters_before.cancel_before_replace() + 1
+    );
+    assert_eq!(
+        owner.counters().cancel_intents(),
+        counters_before.cancel_intents()
+    );
+
+    assert!(matches!(
+        owner.begin_cancel(cancel_request(client)).unwrap(),
+        PmCancelMutationAdmission::JournalPending {
+            client_order,
+            venue_order,
+        } if client_order == client && venue_order == venue
+    ));
+    assert_eq!(
+        owner.private_mut().owned_order(client).unwrap().cancel(),
+        PmOwnedCancelState::Pending
+    );
+    assert_eq!(owner.pending_persistence(), persistence_before + 1);
+    assert_eq!(
+        owner.counters().cancel_intents(),
+        counters_before.cancel_intents() + 1
+    );
+
+    wait_for_prepared_cancel(&mut owner, 131).await;
+    owner
+        .execute_next_cancel(PmFakeCancelScript::accepted(), 132)
+        .unwrap();
+    drain_persistence(&mut owner, 133).await;
+    owner.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1256,108 +1355,53 @@ async fn persistence_age_failure_retains_permit_and_never_dispatches() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn saturated_effect_queue_admits_no_order_and_no_journal_record() {
-    let (config, _directory, journal_path, mut owner) = ready_owner().await;
-    for _ in 0..PM_FAKE_EFFECT_CAPACITY {
-        let _unreachable_permit = owner.effects.try_reserve().unwrap();
-    }
-    let client = owner.scope.client_order_for_intent(1).unwrap();
+async fn invalid_fact_clock_aborts_move_only_fill_compaction_ticket() {
+    let (config, _directory, _journal_path, mut owner) = ready_owner().await;
+    let compaction = owner.prepare_fill_watermark_compaction().unwrap();
+    assert!(owner.private_mut().fill_watermark_compaction_pending());
+
     assert!(matches!(
-        owner.begin_quote(quote_request(
-            &config,
-            PmOrderSide::Buy,
-            1,
-            QUOTE_EXPIRES_NS
-        )),
-        Err(PmMutationError::EffectQueue(PmFakeEffectQueueError::Full))
+        owner.record_fill_watermark_fact(fill_watermark_record(&config, 2), compaction, 0),
+        Err(PmMutationError::Persistence(
+            PmPersistenceError::InvalidMonotonicTime
+        ))
     ));
-    assert_eq!(owner.halt(), Some(PmMutationHalt::FakeEffectSaturated));
+    assert!(!owner.private_mut().fill_watermark_compaction_pending());
+    assert!(owner.ensure_fill_watermark_compaction_available().is_ok());
     assert_eq!(owner.pending_persistence(), 0);
-    assert_eq!(owner.counters().quote_intents(), 0);
     assert_eq!(owner.counters().fact_records(), READY_BASELINE_FACT_RECORDS);
-    assert!(owner.private_mut().owned_order(client).is_none());
-
     owner.shutdown().await.unwrap();
-    let scope = PmJournalScopeV1::from_config(&config).unwrap();
-    let recovery = recover_pm_mutation_journal(journal_path, &scope).unwrap();
-    assert_eq!(
-        recovery.record_count(),
-        JOURNAL_HEADER_RECORDS + READY_BASELINE_JOURNAL_RECORDS
-    );
 }
 
-#[derive(Clone, Copy)]
-enum FinalDispatchInvalidation {
-    RevisionChanged,
-    Expired,
-}
+#[tokio::test(flavor = "current_thread")]
+async fn fact_capacity_failure_aborts_move_only_fill_compaction_ticket() {
+    let (config, _directory, _journal_path, mut owner) = ready_owner().await;
+    for correlation in 1..=PM_PENDING_PERSISTENCE_CAPACITY {
+        owner.durable_consequences.push_back(PmDurableConsequence {
+            kind: PmDurableRecordKind::SafetyHalt,
+            client_order: None,
+            correlation: u64::try_from(correlation).unwrap(),
+        });
+    }
+    let compaction = owner.prepare_fill_watermark_compaction().unwrap();
+    assert!(owner.private_mut().fill_watermark_compaction_pending());
 
-async fn assert_prepared_quote_is_invalidated_without_dispatch(case: FinalDispatchInvalidation) {
-    let (config, _directory, journal_path, mut owner) = ready_owner().await;
-    let client = admit_quote(&mut owner, &config, PmOrderSide::Buy, 1);
-    wait_for_prepared_quotes(&mut owner, 1, 121).await;
-    let service_ns = match case {
-        FinalDispatchInvalidation::RevisionChanged => {
-            owner.update_revisions(authority_revisions(2));
-            122
-        }
-        FinalDispatchInvalidation::Expired => QUOTE_EXPIRES_NS,
-    };
-    assert!(owner.invalidate_prepared_quote(client, service_ns).unwrap());
-    assert!(
-        !owner
-            .invalidate_prepared_quote(client, service_ns + 1)
-            .unwrap()
-    );
-    assert_eq!(owner.halt(), None);
-    assert_eq!(owner.pending_effects(), 0);
-    assert_eq!(owner.retained_effect_permits(), 0);
-    assert_eq!(owner.effects.metrics().invalidated_after_durability(), 1);
-    assert_eq!(owner.counters().place_results(), 0);
-    assert_eq!(
-        owner.counters().fact_records(),
-        READY_BASELINE_FACT_RECORDS + 1
-    );
-    assert!(owner.private_mut().owned_order(client).is_none());
-    let consequence = owner.pop_durable_consequence().unwrap();
-    assert_eq!(consequence.kind(), PmDurableRecordKind::PlaceResult);
-    assert_eq!(consequence.client_order(), Some(client));
     assert!(matches!(
-        owner.execute_next_quote(
-            PmFakePlaceScript::acknowledged(
-                venue_order(&config, "must-not-dispatch"),
-                Box::new([])
-            )
-            .unwrap(),
-            service_ns + 1,
-        ),
-        Err(PmMutationError::EffectKindMismatch)
+        owner.record_fill_watermark_fact(fill_watermark_record(&config, 2), compaction, 200),
+        Err(PmMutationError::DurableConsequenceSaturated)
     ));
-
-    drain_persistence(&mut owner, service_ns + 2).await;
-    owner.shutdown().await.unwrap();
-    let scope = PmJournalScopeV1::from_config(&config).unwrap();
-    let recovery = recover_pm_mutation_journal(journal_path, &scope).unwrap();
     assert_eq!(
-        recovery.record_count(),
-        JOURNAL_HEADER_RECORDS + READY_BASELINE_JOURNAL_RECORDS + 2
+        owner.halt(),
+        Some(PmMutationHalt::DurableConsequenceSaturated)
     );
-    assert_eq!(recovery.owned_order_count(), 0);
+    assert!(!owner.private_mut().fill_watermark_compaction_pending());
+    assert!(owner.ensure_fill_watermark_compaction_available().is_ok());
+    assert_eq!(owner.pending_persistence(), 0);
+    assert_eq!(owner.counters().fact_records(), READY_BASELINE_FACT_RECORDS);
+    owner.shutdown().await.unwrap();
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn prepared_quote_with_changed_revision_is_rejected_locally_without_dispatch() {
-    assert_prepared_quote_is_invalidated_without_dispatch(
-        FinalDispatchInvalidation::RevisionChanged,
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn prepared_quote_at_exact_expiry_is_rejected_locally_without_dispatch() {
-    assert_prepared_quote_is_invalidated_without_dispatch(FinalDispatchInvalidation::Expired).await;
-}
-
+mod admission_boundaries;
 mod recovery;
 mod risk_cancel;
 mod safety;

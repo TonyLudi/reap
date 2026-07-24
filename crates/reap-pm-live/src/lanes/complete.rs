@@ -1,8 +1,6 @@
-#[cfg(test)]
 use reap_pm_core::PmInstrumentHandle;
 use thiserror::Error;
 
-#[cfg(test)]
 use super::PmPublicLaneState;
 use super::{
     PM_INPUT_SERVICE_PRIORITY, PmCompleteIngress, PmCompleteLane, PmCompleteLaneAgeFault,
@@ -14,7 +12,7 @@ use super::{
 use crate::composition::PmPublicCaptureRun;
 use crate::schedule::{
     PmDueScheduledAction, PmQuoteScheduleRole, PmScheduleAdmission, PmScheduleError,
-    PmScheduledActionKey,
+    PmScheduleMetrics, PmScheduledActionKey,
 };
 
 /// Synchronous transfer boundary for the six non-public complete-scheduler
@@ -207,14 +205,9 @@ impl PmCompleteSchedulerMetrics {
 ///
 /// Construction consumes the existing public lane and quote schedule roles.
 /// It never constructs a sibling public authority or a second timer queue.
-#[allow(
-    clippy::large_enum_variant,
-    reason = "the production owner stays inline; the small alternate owner exists only in tests"
-)]
 #[derive(Debug)]
 enum PmCompletePublicOwner {
-    Capture(PmPublicCaptureRun),
-    #[cfg(test)]
+    Capture(Box<PmPublicCaptureRun>),
     Bare(PmPublicLaneState),
 }
 
@@ -226,7 +219,6 @@ impl PmCompletePublicOwner {
     ) -> Result<usize, PmServiceTurnError> {
         match self {
             Self::Capture(run) => run.service_lane_turn(monotonic_now_ns, consumer),
-            #[cfg(test)]
             Self::Bare(lane) => lane.service_turn(monotonic_now_ns, consumer),
         }
     }
@@ -234,7 +226,6 @@ impl PmCompletePublicOwner {
     fn metrics(&self) -> PmLaneMetrics {
         match self {
             Self::Capture(run) => run.public_lane_metrics(),
-            #[cfg(test)]
             Self::Bare(lane) => lane.metrics(),
         }
     }
@@ -242,39 +233,36 @@ impl PmCompletePublicOwner {
     fn consumer_transfer_poisoned(&self) -> bool {
         match self {
             Self::Capture(run) => run.public_consumer_transfer_poisoned(),
-            #[cfg(test)]
             Self::Bare(lane) => lane.consumer_transfer_poisoned(),
         }
     }
 
     fn reserved_capacity_bytes(&self) -> usize {
         match self {
-            Self::Capture(run) => run.public_lane_reserved_capacity_bytes(),
-            #[cfg(test)]
+            Self::Capture(run) => run
+                .reserved_capacity_bytes()
+                .saturating_add(std::mem::size_of::<PmPublicCaptureRun>()),
             Self::Bare(lane) => lane.reserved_capacity_bytes(),
         }
     }
 
     fn capture(&self) -> Option<&PmPublicCaptureRun> {
         match self {
-            Self::Capture(run) => Some(run),
-            #[cfg(test)]
+            Self::Capture(run) => Some(run.as_ref()),
             Self::Bare(_) => None,
         }
     }
 
     fn capture_mut(&mut self) -> Option<&mut PmPublicCaptureRun> {
         match self {
-            Self::Capture(run) => Some(run),
-            #[cfg(test)]
+            Self::Capture(run) => Some(run.as_mut()),
             Self::Bare(_) => None,
         }
     }
 
     fn into_capture(self) -> Option<PmPublicCaptureRun> {
         match self {
-            Self::Capture(run) => Some(run),
-            #[cfg(test)]
+            Self::Capture(run) => Some(*run),
             Self::Bare(_) => None,
         }
     }
@@ -290,13 +278,14 @@ pub(crate) struct PmCompleteInputLanes {
     schedule: PmQuoteScheduleRole,
     fail_closed: PmCompleteFailClosedMetrics,
     failure_latched: [bool; 7],
+    recoverable_aged_drain_remaining: [usize; 7],
     service_turns: u64,
     public_serviced: u64,
     consumer_transfer_in_flight: bool,
 }
 
 impl PmCompleteInputLanes {
-    pub(crate) fn new(public: PmPublicCaptureRun, schedule: PmQuoteScheduleRole) -> Self {
+    pub(crate) fn new(public: Box<PmPublicCaptureRun>, schedule: PmQuoteScheduleRole) -> Self {
         Self::with_public_owner(PmCompletePublicOwner::Capture(public), schedule)
     }
 
@@ -311,13 +300,13 @@ impl PmCompleteInputLanes {
             schedule,
             fail_closed: PmCompleteFailClosedMetrics::default(),
             failure_latched: [false; 7],
+            recoverable_aged_drain_remaining: [0; 7],
             service_turns: 0,
             public_serviced: 0,
             consumer_transfer_in_flight: false,
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn for_instrument(instrument: PmInstrumentHandle) -> Self {
         Self::with_public_owner(
             PmCompletePublicOwner::Bare(PmPublicLaneState::new()),
@@ -437,6 +426,10 @@ impl PmCompleteInputLanes {
         result
     }
 
+    pub(crate) fn resolve_aged_schedule(&mut self, key: PmScheduledActionKey) -> bool {
+        self.schedule.resolve_aged(key)
+    }
+
     pub(crate) fn public_capture(&self) -> Option<&PmPublicCaptureRun> {
         self.public.capture()
     }
@@ -464,6 +457,7 @@ impl PmCompleteInputLanes {
             &mut self.critical,
             monotonic_now_ns,
             &mut self.consumer_transfer_in_flight,
+            None,
             |item| {
                 consumer.on_critical(item);
                 consumer.stop_complete_service_turn()
@@ -485,6 +479,7 @@ impl PmCompleteInputLanes {
             &mut self.persistence,
             monotonic_now_ns,
             &mut self.consumer_transfer_in_flight,
+            None,
             |item| {
                 consumer.on_persistence(item);
                 consumer.stop_complete_service_turn()
@@ -496,10 +491,16 @@ impl PmCompleteInputLanes {
             return Ok(counts);
         }
 
+        let private_rank = usize::from(
+            PmLaneKind::Private
+                .service_priority_rank()
+                .expect("private is a complete scheduler rank"),
+        );
         let count = service_lane(
             &mut self.private,
             monotonic_now_ns,
             &mut self.consumer_transfer_in_flight,
+            Some(&mut self.recoverable_aged_drain_remaining[private_rank]),
             |item| {
                 consumer.on_private(item);
                 consumer.stop_complete_service_turn()
@@ -531,10 +532,16 @@ impl PmCompleteInputLanes {
             return Ok(counts);
         }
 
+        let reconciliation_rank = usize::from(
+            PmLaneKind::Reconciliation
+                .service_priority_rank()
+                .expect("reconciliation is a complete scheduler rank"),
+        );
         let count = service_lane(
             &mut self.reconciliation,
             monotonic_now_ns,
             &mut self.consumer_transfer_in_flight,
+            Some(&mut self.recoverable_aged_drain_remaining[reconciliation_rank]),
             |item| {
                 consumer.on_reconciliation(item);
                 consumer.stop_complete_service_turn()
@@ -550,6 +557,7 @@ impl PmCompleteInputLanes {
             &mut self.telemetry,
             monotonic_now_ns,
             &mut self.consumer_transfer_in_flight,
+            None,
             |item| {
                 consumer.on_telemetry(item);
                 consumer.stop_complete_service_turn()
@@ -607,6 +615,13 @@ impl PmCompleteInputLanes {
         })
     }
 
+    pub(crate) fn schedule_metrics(
+        &mut self,
+        monotonic_now_ns: u64,
+    ) -> Result<PmScheduleMetrics, PmScheduleError> {
+        Ok(self.schedule.projection(monotonic_now_ns)?.metrics())
+    }
+
     pub(crate) fn reserved_capacity_bytes(&self) -> usize {
         self.critical
             .reserved_capacity_bytes()
@@ -616,6 +631,10 @@ impl PmCompleteInputLanes {
             .saturating_add(self.telemetry.reserved_capacity_bytes())
             .saturating_add(self.schedule.reserved_capacity_bytes())
             .saturating_add(self.public.reserved_capacity_bytes())
+    }
+
+    pub(crate) fn private_and_reconciliation_empty(&self) -> bool {
+        self.private.len() == 0 && self.reconciliation.len() == 0
     }
 
     fn service_schedule<C: PmCompleteLaneService>(
@@ -667,6 +686,23 @@ impl PmCompleteInputLanes {
             PmCompleteLaneCheckError::Aged(fault) => {
                 let _ = (fault.key(), fault.observed_age_ns(), fault.maximum_age_ns());
                 self.latch_failure(fault.lane(), fault.action());
+                if matches!(
+                    fault.action(),
+                    SaturationAction::HaltAccountAndRequireReconciliation
+                        | SaturationAction::KeepUnreadyAndRetry
+                ) {
+                    let rank = usize::from(
+                        fault
+                            .lane()
+                            .service_priority_rank()
+                            .expect("aged complete lane has a scheduler rank"),
+                    );
+                    self.recoverable_aged_drain_remaining[rank] = match fault.lane() {
+                        PmLaneKind::Private => self.private.len(),
+                        PmLaneKind::Reconciliation => self.reconciliation.len(),
+                        _ => 0,
+                    };
+                }
                 PmCompleteServiceError::Aged(fault)
             }
         }
@@ -696,6 +732,7 @@ fn service_lane<T>(
     lane: &mut PmCompleteLane<T>,
     monotonic_now_ns: u64,
     transfer_in_flight: &mut bool,
+    mut recoverable_aged_drain_remaining: Option<&mut usize>,
     mut consume: impl FnMut(PmCompleteServiced<T>) -> bool,
 ) -> Result<usize, PmCompleteLaneCheckError> {
     let limit = PmLanePolicy::for_lane(lane.lane())
@@ -704,8 +741,17 @@ fn service_lane<T>(
     let count = limit.min(lane.len());
     let mut serviced = 0;
     for _ in 0..count {
-        lane.check_age(monotonic_now_ns)?;
+        match lane.check_age(monotonic_now_ns) {
+            Err(PmCompleteLaneCheckError::Aged(_))
+                if recoverable_aged_drain_remaining
+                    .as_deref()
+                    .is_some_and(|remaining| *remaining != 0) => {}
+            result => result?,
+        }
         let item = lane.pop().expect("bounded count proves a queued item");
+        if let Some(remaining) = recoverable_aged_drain_remaining.as_deref_mut() {
+            *remaining = remaining.saturating_sub(1);
+        }
         let serviced_item = item
             .into_serviced(lane.lane(), monotonic_now_ns)
             .map_err(PmCompleteLaneCheckError::EventClock)?;
@@ -740,6 +786,30 @@ pub(crate) enum PmCompleteServiceError {
     Public(PmServiceTurnError),
     #[error("complete scheduler internal aged evidence")]
     Aged(PmCompleteLaneAgeFault),
+}
+
+impl PmCompleteServiceError {
+    pub(crate) const fn action(&self) -> Option<SaturationAction> {
+        match self {
+            Self::Aged(fault) => Some(fault.action()),
+            Self::Public(PmServiceTurnError::Aged(failure)) => Some(failure.action()),
+            Self::Schedule(
+                PmScheduleError::Full { action, .. } | PmScheduleError::Aged { action, .. },
+            ) => Some(*action),
+            Self::ConsumerTransferPoisoned
+            | Self::CriticalBurstExhausted { .. }
+            | Self::DeliveryClock(_)
+            | Self::EventClock(_)
+            | Self::Schedule(
+                PmScheduleError::ZeroMonotonicTimestamp
+                | PmScheduleError::ZeroWallTimestamp
+                | PmScheduleError::LocalActionSequenceExhausted
+                | PmScheduleError::InstrumentMismatch { .. }
+                | PmScheduleError::ClockRegression { .. },
+            )
+            | Self::Public(_) => Some(SaturationAction::GlobalStop),
+        }
+    }
 }
 
 const fn action_index(action: SaturationAction) -> usize {

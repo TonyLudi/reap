@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use reap_pm_core::{PmClientOrderKey, PmVenueOrderKey};
-use reap_pm_state::{PmOwnedCancelIntent, PmOwnedIntentId};
+use reap_pm_state::{PmOwnedCancelIntent, PmOwnedIntentId, PmPreparedFillCompaction};
 use thiserror::Error;
 
 use super::effect_queue::PmFakeEffectPermit;
@@ -43,6 +43,7 @@ pub(crate) enum PmPendingPersistence {
     },
     Fact {
         receipt: PmPendingJournalRecord,
+        compaction: Option<PmPreparedFillCompaction>,
         enqueued_monotonic_ns: u64,
     },
 }
@@ -104,13 +105,19 @@ pub(crate) enum PmPersistencePoll {
         effect_permit: PmFakeEffectPermit,
         acknowledgement: PmCancelIntentDurablyAcknowledged,
     },
-    FactAcknowledged(PmJournalAcknowledged),
+    FactAcknowledged {
+        acknowledgement: PmJournalAcknowledged,
+        compaction: Option<PmPreparedFillCompaction>,
+    },
     IntentFailed {
         identity: PmPersistenceIntentIdentity,
         effect_permit: PmFakeEffectPermit,
         reason: PmPersistenceFailure,
     },
-    FactFailed(PmPersistenceFailure),
+    FactFailed {
+        reason: PmPersistenceFailure,
+        compaction: Option<PmPreparedFillCompaction>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -259,10 +266,19 @@ impl PmPersistenceQueue {
     }
 
     pub(crate) fn push(&mut self, pending: PmPendingPersistence) -> Result<(), PmPersistenceError> {
-        self.ensure_capacity(1)?;
+        self.push_retaining(pending).map_err(|(error, _)| error)
+    }
+
+    pub(crate) fn push_retaining(
+        &mut self,
+        pending: PmPendingPersistence,
+    ) -> Result<(), (PmPersistenceError, PmPendingPersistence)> {
+        if let Err(error) = self.ensure_capacity(1) {
+            return Err((error, pending));
+        }
         if pending.enqueued_monotonic_ns() == 0 {
             self.globally_stopped = true;
-            return Err(PmPersistenceError::InvalidMonotonicTime);
+            return Err((PmPersistenceError::InvalidMonotonicTime, pending));
         }
         self.entries.push_back(pending);
         self.metrics.admitted = self.metrics.admitted.saturating_add(1);
@@ -304,9 +320,10 @@ impl PmPersistenceQueue {
                         reason: PmPersistenceFailure::AgeExceeded,
                     }
                 }
-                PmPendingPersistence::Fact { .. } => {
-                    PmPersistencePoll::FactFailed(PmPersistenceFailure::AgeExceeded)
-                }
+                PmPendingPersistence::Fact { compaction, .. } => PmPersistencePoll::FactFailed {
+                    reason: PmPersistenceFailure::AgeExceeded,
+                    compaction,
+                },
             });
         }
 
@@ -420,29 +437,40 @@ impl PmPersistenceQueue {
             }
             PmPendingPersistence::Fact {
                 receipt,
+                compaction,
                 enqueued_monotonic_ns,
             } => match receipt.poll() {
                 PmJournalReceiptPoll::Pending(receipt) => {
                     self.entries.push_back(PmPendingPersistence::Fact {
                         receipt,
+                        compaction,
                         enqueued_monotonic_ns,
                     });
                     PmPersistencePoll::Pending
                 }
                 PmJournalReceiptPoll::Acknowledged(acknowledgement) => {
                     self.metrics.acknowledged = self.metrics.acknowledged.saturating_add(1);
-                    PmPersistencePoll::FactAcknowledged(acknowledgement)
+                    PmPersistencePoll::FactAcknowledged {
+                        acknowledgement,
+                        compaction,
+                    }
                 }
                 PmJournalReceiptPoll::Failed(message) => {
                     self.metrics.durability_failures =
                         self.metrics.durability_failures.saturating_add(1);
                     self.globally_stopped = true;
-                    PmPersistencePoll::FactFailed(PmPersistenceFailure::Durability(message))
+                    PmPersistencePoll::FactFailed {
+                        reason: PmPersistenceFailure::Durability(message),
+                        compaction,
+                    }
                 }
                 PmJournalReceiptPoll::Closed => {
                     self.metrics.closed_failures = self.metrics.closed_failures.saturating_add(1);
                     self.globally_stopped = true;
-                    PmPersistencePoll::FactFailed(PmPersistenceFailure::Closed)
+                    PmPersistencePoll::FactFailed {
+                        reason: PmPersistenceFailure::Closed,
+                        compaction,
+                    }
                 }
             },
         })
@@ -503,8 +531,45 @@ pub(crate) enum PmPersistenceError {
 }
 
 #[cfg(test)]
+pub(crate) struct Phase6StorageAllocationProbe {
+    queue: PmPersistenceQueue,
+}
+
+#[cfg(test)]
+impl Phase6StorageAllocationProbe {
+    pub(crate) fn new() -> Self {
+        Self {
+            queue: PmPersistenceQueue::new(),
+        }
+    }
+
+    pub(crate) fn push_fact(
+        &mut self,
+        enqueued_monotonic_ns: u64,
+    ) -> Result<(), PmPersistenceError> {
+        self.queue.push(PmPendingPersistence::Fact {
+            receipt: PmPendingJournalRecord::phase6_pending_for_age_evidence(),
+            compaction: None,
+            enqueued_monotonic_ns,
+        })
+    }
+
+    pub(crate) fn metrics(&self) -> PmPersistenceMetrics {
+        self.queue.projection()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pending_fact(enqueued_monotonic_ns: u64) -> PmPendingPersistence {
+        PmPendingPersistence::Fact {
+            receipt: PmPendingJournalRecord::phase6_pending_for_age_evidence(),
+            compaction: None,
+            enqueued_monotonic_ns,
+        }
+    }
 
     #[test]
     fn capacity_preflight_is_exact_and_latches_global_stop() {
@@ -521,5 +586,56 @@ mod tests {
         assert!(queue.globally_stopped());
         assert_eq!(queue.metrics().saturations(), 1);
         assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn pending_journal_age_is_inclusive_and_fails_closed_one_nanosecond_late() {
+        let policy = crate::PmLanePolicy::for_lane(crate::PmLaneKind::Journal);
+        assert_eq!(
+            policy.maximum_age_ns(),
+            Some(PM_PENDING_PERSISTENCE_MAX_AGE_NS)
+        );
+        assert_eq!(
+            policy.saturation_action(),
+            crate::SaturationAction::SuppressDispatchAndHaltQuotes
+        );
+
+        let enqueued = 100;
+        let mut inclusive = PmPersistenceQueue::new();
+        inclusive.push(pending_fact(enqueued)).expect("one fact");
+        assert!(matches!(
+            inclusive
+                .poll_one(enqueued + PM_PENDING_PERSISTENCE_MAX_AGE_NS)
+                .expect("the exact age boundary remains serviceable"),
+            PmPersistencePoll::FactAcknowledged {
+                compaction: None,
+                ..
+            }
+        ));
+        assert!(!inclusive.globally_stopped());
+        assert_eq!(inclusive.metrics().age_faults(), 0);
+        assert_eq!(
+            inclusive.metrics().maximum_observed_age_ns(),
+            PM_PENDING_PERSISTENCE_MAX_AGE_NS
+        );
+
+        let mut exceeded = PmPersistenceQueue::new();
+        exceeded.push(pending_fact(enqueued)).expect("one fact");
+        assert!(matches!(
+            exceeded
+                .poll_one(enqueued + PM_PENDING_PERSISTENCE_MAX_AGE_NS + 1)
+                .expect("an aged fact returns its fail-closed outcome"),
+            PmPersistencePoll::FactFailed {
+                reason: PmPersistenceFailure::AgeExceeded,
+                compaction: None,
+            }
+        ));
+        assert!(exceeded.globally_stopped());
+        assert_eq!(exceeded.len(), 0);
+        assert_eq!(exceeded.metrics().age_faults(), 1);
+        assert_eq!(
+            exceeded.metrics().maximum_observed_age_ns(),
+            PM_PENDING_PERSISTENCE_MAX_AGE_NS + 1
+        );
     }
 }

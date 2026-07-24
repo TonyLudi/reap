@@ -302,6 +302,12 @@ impl PmUnresolvedFillState {
         }
     }
 
+    pub(crate) fn reserved_capacity_bytes(&self) -> usize {
+        self.entries
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Entry>())
+    }
+
     pub(crate) fn observe(
         &mut self,
         envelope: EventEnvelope<PmUnresolvedFillObservation>,

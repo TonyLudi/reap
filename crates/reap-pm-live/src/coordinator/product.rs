@@ -48,13 +48,27 @@ use crate::lanes::{
     PmCompleteIngress, PmCompleteInputLanes, PmCompleteServiced, PmCriticalInput,
     PmPersistenceInput as PmLanePersistenceInput, PmPrivateInput, PmReconciliationInput,
 };
-use crate::schedule::{PmScheduledActionKey, PmScheduledActionKind};
+use crate::schedule::{PmScheduleMetrics, PmScheduledActionKey, PmScheduledActionKind};
 
-const MAX_COPIED_EFFECT_CORRELATIONS: usize = 256;
+pub(crate) const MAX_COPIED_EFFECT_CORRELATIONS: usize = 256;
 
+mod cancel;
+mod evidence;
+mod helpers;
+mod lane_failure;
+#[cfg(test)]
+mod overload_evidence;
+mod refresh_obligations;
 mod service;
 mod start;
 
+pub(crate) use evidence::PmEvidenceTerminalLengths;
+use helpers::*;
+#[cfg(test)]
+pub(crate) use overload_evidence::PmTelemetryOverloadState;
+#[cfg(test)]
+pub(crate) use refresh_obligations::Phase6RefreshAllocationProbe;
+pub use refresh_obligations::PmRefreshObligationMetrics;
 pub(crate) use start::{PmCoordinatorShutdownError, PmCoordinatorStartError};
 
 /// Explicit freshness and authority lifetime policy. There are no permissive
@@ -762,6 +776,10 @@ impl PendingSchedules {
             .map(|(index, _)| index)?;
         self.values[index].take()
     }
+
+    fn clear(&mut self) {
+        self.values.fill(None);
+    }
 }
 
 /// Static generic product coordinator.
@@ -769,8 +787,8 @@ pub(crate) struct PmCoordinator<M> {
     decision: PmDecisionState<M>,
     account_source: PmProductSource,
     account_connection: PmConnectionId,
-    mutation: PmMutationOwner,
-    lanes: Option<PmCompleteInputLanes>,
+    mutation: Box<PmMutationOwner>,
+    lanes: Option<Box<PmCompleteInputLanes>>,
     outputs: PmProductEffectOutput,
     account_scope: PmAccountScope,
     instrument: PmInstrumentHandle,
@@ -787,6 +805,9 @@ pub(crate) struct PmCoordinator<M> {
     retained_private_admission: Option<RetainedLaneInput<PmPrivateInput>>,
     retained_reconciliation_admission: Option<RetainedLaneInput<PmReconciliationInput>>,
     pending_schedules: PendingSchedules,
+    refresh_obligations: refresh_obligations::PmRefreshObligations,
+    reconciliation_gate: bool,
+    reconciliation_recovered: bool,
 }
 
 impl<M: PmQuoteModel> PmCoordinator<M> {
@@ -821,15 +842,45 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
     }
 
     pub(crate) fn reserved_capacity_bytes(&self) -> usize {
-        self.mutation.reserved_capacity_bytes()
-            + self
-                .lanes
-                .as_ref()
-                .map_or(0, PmCompleteInputLanes::reserved_capacity_bytes)
-            + self.outputs.reserved_capacity_bytes()
-            + self.pending_correlations.reserved_capacity_bytes()
-            + self.prepared_correlations.reserved_capacity_bytes()
-            + std::mem::size_of::<[Option<TrackedQuote>; 2]>()
+        self.transitive_reserved_capacity_bytes()
+            .saturating_add(self.inline_bounded_capacity_bytes())
+    }
+
+    pub(crate) fn boxed_reserved_capacity_bytes(&self) -> usize {
+        self.transitive_reserved_capacity_bytes()
+            .saturating_add(std::mem::size_of_val(self))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked_quote_slots_for_test(&self) -> usize {
+        self.tracked_quotes.iter().flatten().count()
+    }
+
+    fn transitive_reserved_capacity_bytes(&self) -> usize {
+        self.mutation
+            .reserved_capacity_bytes()
+            .saturating_add(std::mem::size_of::<PmMutationOwner>())
+            .saturating_add(self.lanes.as_ref().map_or(0, |lanes| {
+                lanes
+                    .reserved_capacity_bytes()
+                    .saturating_add(std::mem::size_of::<PmCompleteInputLanes>())
+            }))
+            .saturating_add(self.outputs.reserved_capacity_bytes())
+            .saturating_add(self.pending_correlations.reserved_capacity_bytes())
+            .saturating_add(self.prepared_correlations.reserved_capacity_bytes())
+    }
+
+    fn inline_bounded_capacity_bytes(&self) -> usize {
+        std::mem::size_of_val(&self.decision)
+            .saturating_add(std::mem::size_of_val(&self.tracked_quotes))
+            .saturating_add(std::mem::size_of_val(&self.pending_schedules))
+            .saturating_add(std::mem::size_of_val(&self.refresh_obligations))
+            .saturating_add(std::mem::size_of_val(&self.retained_critical))
+            .saturating_add(std::mem::size_of_val(&self.retained_persistence))
+            .saturating_add(std::mem::size_of_val(&self.retained_private_admission))
+            .saturating_add(std::mem::size_of_val(
+                &self.retained_reconciliation_admission,
+            ))
     }
 
     fn service_timer(
@@ -847,15 +898,12 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
                 effects,
             ),
             PmScheduledActionKind::ReconciliationRefresh => {
-                effects.push(PmProductEffect::ReconciliationRefresh(
-                    PmRefreshEffect::new(
-                        self.account_scope,
-                        self.instrument,
-                        PmRefreshEffectKind::CompleteReconciliation,
-                    ),
-                ))?;
-                self.counters.refresh_effects = self.counters.refresh_effects.saturating_add(1);
-                push_metric(effects, PmHealthMetricKind::RefreshRequested, 1)
+                let admitted = self.admit_next_refresh(input.monotonic_service_ns(), effects)?;
+                push_metric(
+                    effects,
+                    PmHealthMetricKind::RefreshRequested,
+                    u64::from(admitted),
+                )
             }
             PmScheduledActionKind::Freshness => self.service_freshness(input, effects),
         }
@@ -882,7 +930,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         input: PmTimerInput,
         effects: &mut PmProductEffectBatch,
     ) -> Result<(), PmCoordinatorError> {
-        if self.halt.is_some() {
+        if self.halt.is_some() || self.reconciliation_gate {
             return self.record_suppression(PmQuoteSuppression::CoordinatorHalted, effects);
         }
         self.counters.quote_evaluations = self.counters.quote_evaluations.saturating_add(1);
@@ -1047,116 +1095,6 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         }
     }
 
-    fn cancel_tracked(
-        &mut self,
-        timer: PmTimerInput,
-        reason: PmJournalCancelReasonV1,
-        control_reason: PmControlReason,
-        effects: &mut PmProductEffectBatch,
-    ) -> Result<(), PmCoordinatorError> {
-        if let Some(tracked) = self.tracked_quotes[side_index(timer.key().side())] {
-            debug_assert_eq!(tracked.side, timer.key().side());
-            if tracked.stage == TrackedQuoteStage::RemotelyLive {
-                self.begin_cancel(
-                    tracked.client_order,
-                    tracked.side,
-                    timer,
-                    reason,
-                    control_reason,
-                    effects,
-                )?;
-            } else {
-                self.clear_tracked_quote(tracked.client_order);
-            }
-        }
-        Ok(())
-    }
-
-    fn cancel_tracked_owned_orders(
-        &mut self,
-        timer: PmTimerInput,
-        reason: PmJournalCancelReasonV1,
-        control_reason: PmControlReason,
-        effects: &mut PmProductEffectBatch,
-    ) -> Result<(), PmCoordinatorError> {
-        for tracked in self.tracked_quotes.into_iter().flatten() {
-            if tracked.stage == TrackedQuoteStage::RemotelyLive {
-                self.begin_cancel(
-                    tracked.client_order,
-                    tracked.side,
-                    timer,
-                    reason,
-                    control_reason,
-                    effects,
-                )?;
-            } else {
-                self.clear_tracked_quote(tracked.client_order);
-            }
-        }
-        Ok(())
-    }
-
-    fn begin_cancel(
-        &mut self,
-        client_order: PmClientOrderKey,
-        side: PmOrderSide,
-        timer: PmTimerInput,
-        reason: PmJournalCancelReasonV1,
-        control_reason: PmControlReason,
-        effects: &mut PmProductEffectBatch,
-    ) -> Result<(), PmCoordinatorError> {
-        let request = PmCancelMutationRequest::new(
-            client_order,
-            reason,
-            salt_for(timer.local_action_sequence(), side)?,
-            timer.decision_wall_timestamp_ms(),
-            timer.decision_monotonic_ns(),
-            timer
-                .decision_monotonic_ns()
-                .checked_add(self.decision.policy.approval_lifetime_ns)
-                .ok_or(PmCoordinatorError::ClockOverflow)?,
-        );
-        match self.mutation.begin_cancel(request) {
-            Ok(PmCancelMutationAdmission::JournalPending {
-                client_order,
-                venue_order,
-            }) => {
-                let projection = PmFakeCancelEffect::new(
-                    self.account_scope,
-                    self.instrument,
-                    client_order,
-                    venue_order,
-                    PmFakeEffectStage::PreparedAfterDurability,
-                );
-                self.pending_correlations
-                    .push(CopiedEffectCorrelation::Cancel(projection))?;
-                effects.push(PmProductEffect::DurableRecord(PmDurableRecordEffect::new(
-                    PmDurableRecordKind::CancelIntent,
-                    Some(client_order),
-                    timer.local_action_sequence(),
-                )))?;
-                effects.push(PmProductEffect::FailClosedHaltOrCancel(
-                    PmFailClosedEffect::cancel(
-                        self.account_scope,
-                        self.instrument,
-                        control_reason,
-                        client_order,
-                        cancel_reason(reason),
-                    ),
-                ))?;
-                self.counters.durable_record_effects =
-                    self.counters.durable_record_effects.saturating_add(1);
-                Ok(())
-            }
-            Ok(
-                PmCancelMutationAdmission::AlreadyPending { .. }
-                | PmCancelMutationAdmission::AlreadyTerminal,
-            ) => Ok(()),
-            Err(PmMutationError::UnknownOwnedOrder) => Ok(()),
-            Err(error) => Err(error.into()),
-        }
-    }
-
     fn record_persistence_service(
         &mut self,
         service: PmPersistenceService,
@@ -1318,61 +1256,6 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
     }
 }
 
-fn reservation_for(
-    candidate: PmValidatedQuoteCandidate,
-) -> Result<PmExactReservation, PmCoordinatorError> {
-    match candidate.side() {
-        PmOrderSide::Buy => Ok(PmExactReservation::policy_approved(
-            candidate.maker_amount(),
-            U256::ZERO,
-        )?),
-        PmOrderSide::Sell => Ok(PmExactReservation::policy_approved(
-            U256::ZERO,
-            candidate.maker_amount(),
-        )?),
-    }
-}
-
-fn salt_for(sequence: u64, side: PmOrderSide) -> Result<PmOrderSalt, PmCoordinatorError> {
-    let side_rank = match side {
-        PmOrderSide::Buy => 0,
-        PmOrderSide::Sell => 1,
-    };
-    let value = sequence
-        .checked_mul(2)
-        .and_then(|value| value.checked_add(side_rank))
-        .ok_or(PmCoordinatorError::SaltOverflow)?;
-    Ok(PmOrderSalt::from_u64(value)?)
-}
-
-const fn side_index(side: PmOrderSide) -> usize {
-    match side {
-        PmOrderSide::Buy => 0,
-        PmOrderSide::Sell => 1,
-    }
-}
-
-const fn cancel_reason(reason: PmJournalCancelReasonV1) -> PmCancelIntentReason {
-    match reason {
-        PmJournalCancelReasonV1::Replacement => PmCancelIntentReason::Replacement,
-        PmJournalCancelReasonV1::StaleReference => PmCancelIntentReason::StaleReference,
-        PmJournalCancelReasonV1::StaleBook => PmCancelIntentReason::StaleBook,
-        PmJournalCancelReasonV1::SafetyHalt => PmCancelIntentReason::SafetyHalt,
-    }
-}
-
-fn push_metric(
-    effects: &mut PmProductEffectBatch,
-    kind: PmHealthMetricKind,
-    value: u64,
-) -> Result<(), PmCoordinatorError> {
-    effects
-        .push(PmProductEffect::HealthMetricAudit(
-            PmHealthMetricEffect::new(kind, value),
-        ))
-        .map_err(PmCoordinatorError::from)
-}
-
 impl From<PmEffectCapacityError> for PmCoordinatorError {
     fn from(_: PmEffectCapacityError) -> Self {
         Self::EffectProjectionSaturated
@@ -1413,6 +1296,10 @@ pub(crate) enum PmCoordinatorError {
     PreparedQuoteAuthorityMismatch,
     #[error("fixed per-input copied-effect output is saturated")]
     EffectProjectionSaturated,
+    #[error("fixed retained refresh-obligation storage is saturated")]
+    RefreshRetentionSaturated,
+    #[error("canonical refresh admission/completion disagrees with retained correlation")]
+    RefreshAdmissionMismatch,
     #[error("product service clocks must be positive")]
     ZeroServiceClock,
     #[error("captured wall receive evidence cannot represent a positive millisecond timestamp")]
@@ -1485,5 +1372,7 @@ impl PmCoordinatorError {
     }
 }
 
+#[cfg(test)]
+mod control_tests;
 #[cfg(test)]
 mod tests;

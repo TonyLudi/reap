@@ -9,16 +9,16 @@ use std::path::PathBuf;
 
 use reap_pm_core::{
     EventClock, EventEnvelope, EventOrdering, PmClientOrderKey, PmCompleteAccountSnapshot,
-    PmCompleteFillQuery, PmConnectionId, PmEventError, PmInstrumentId, PmNumericError, PmOrderSalt,
-    PmProductSource, PmVenueOrderKey,
+    PmCompleteFillQuery, PmConnectionId, PmEventError, PmFillEvent, PmInstrumentId, PmNumericError,
+    PmOrderSalt, PmProductSource, PmVenueOrderKey,
 };
 use reap_pm_live_contracts::PmConnectivityConfig;
 use reap_pm_state::{
     PmExactReservation, PmOwnedCancelIntent, PmOwnedIntentId, PmOwnedQuoteAdmission,
-    PmOwnedQuoteIntent, PmOwnedQuoteSlotKey, PmOwnedSubmitApply, PmOwnedSubmitResult,
-    PmPrivateQuoteRequest, PmPrivateReadiness, PmPrivateReadinessReason, PmPrivateStateError,
-    PmReconciliationApply, PmReconciliationFillReduction, PmReconciliationReductions,
-    PmRiskDecision, PmRiskDependency, PmRiskHaltScope, PmRiskReason,
+    PmOwnedQuoteIntent, PmOwnedQuoteSlotKey, PmPreparedFillCompaction, PmPrivateQuoteEvaluation,
+    PmPrivateQuoteRequest, PmPrivateReadinessReason, PmPrivateStateError, PmReconciliationApply,
+    PmReconciliationFillReduction, PmReconciliationReductions, PmRiskDecision, PmRiskDependency,
+    PmRiskHaltScope, PmRiskReason,
 };
 use reap_pm_strategy::PmValidatedQuoteCandidate;
 use reap_polymarket_adapter::{
@@ -48,9 +48,10 @@ use crate::journal::{
 };
 use crate::private_monitor::{
     PmPrivateMonitorError, PmPrivateMonitorRuntime, PmServicedPrivateReduction,
-    validate_private_batch,
 };
 
+mod evidence;
+mod maintenance;
 mod terminal_safety;
 #[allow(
     unused_imports,
@@ -244,6 +245,11 @@ pub struct PmMutationCounters {
     cancel_results: u64,
     unique_fills: u64,
     duplicate_fills: u64,
+    fill_watermark_compactions: u64,
+    owned_lifecycle_rows_compacted: u64,
+    canonical_order_rows_compacted: u64,
+    owned_fill_keys_compacted: u64,
+    canonical_fill_rows_compacted: u64,
 }
 
 impl PmMutationCounters {
@@ -306,6 +312,26 @@ impl PmMutationCounters {
     pub const fn duplicate_fills(self) -> u64 {
         self.duplicate_fills
     }
+
+    pub const fn fill_watermark_compactions(self) -> u64 {
+        self.fill_watermark_compactions
+    }
+
+    pub const fn owned_lifecycle_rows_compacted(self) -> u64 {
+        self.owned_lifecycle_rows_compacted
+    }
+
+    pub const fn canonical_order_rows_compacted(self) -> u64 {
+        self.canonical_order_rows_compacted
+    }
+
+    pub const fn owned_fill_keys_compacted(self) -> u64 {
+        self.owned_fill_keys_compacted
+    }
+
+    pub const fn canonical_fill_rows_compacted(self) -> u64 {
+        self.canonical_fill_rows_compacted
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,7 +360,7 @@ pub(crate) struct PmMutationOwner {
     scope: PmJournalScopeV1,
     instrument_scope: PmFixtureInstrumentScope,
     instrument_id: PmInstrumentId,
-    private: PmPrivateMonitorRuntime,
+    private: Box<PmPrivateMonitorRuntime>,
     fake: PmFakeEffectRole,
     journal: PmMutationJournal,
     persistence: PmPersistenceQueue,
@@ -350,7 +376,7 @@ pub(crate) struct PmMutationOwner {
 impl PmMutationOwner {
     pub(crate) async fn start(
         config: &PmConnectivityConfig,
-        mut private: PmPrivateMonitorRuntime,
+        mut private: Box<PmPrivateMonitorRuntime>,
         fake: PmFakeEffectRole,
         journal_path: PathBuf,
     ) -> Result<(Self, PmJournalRecovery), PmMutationError> {
@@ -369,7 +395,8 @@ impl PmMutationOwner {
             return Err(PmMutationError::CompositionScopeMismatch);
         }
         let (journal, recovery) = PmMutationJournal::start(journal_path, scope.clone()).await?;
-        if let Err(error) = super::mutation_recovery::recover_private_owner(&mut private, &recovery)
+        if let Err(error) =
+            super::mutation_recovery::recover_private_owner(private.as_mut(), &recovery)
         {
             let _ = journal.shutdown().await;
             return Err(error);
@@ -415,6 +442,13 @@ impl PmMutationOwner {
         self.current_revisions = None;
     }
 
+    #[cfg(test)]
+    pub(crate) const fn current_revisions_for_overload_evidence(
+        &self,
+    ) -> Option<PmAuthorityRevisions> {
+        self.current_revisions
+    }
+
     /// Durably abandons one prepared but never-dispatched quote after an
     /// authority-bearing dependency changed.
     ///
@@ -446,9 +480,6 @@ impl PmMutationOwner {
         self.ensure_quote_available()?;
         self.counters.quote_attempts = self.counters.quote_attempts.saturating_add(1);
         Self::validate_persistence_time(request.approved_at_monotonic_ns)?;
-        self.persistence
-            .ensure_capacity(1)
-            .map_err(|error| self.persistence_failure(error))?;
 
         let candidate = request.candidate;
         let quote_request = PmPrivateQuoteRequest::new(
@@ -458,17 +489,16 @@ impl PmMutationOwner {
             candidate.quantity(),
             request.reservation,
         );
-        let ready = match self.private.quote_readiness(quote_request) {
-            PmPrivateReadiness::Ready(ready) => ready,
-            PmPrivateReadiness::Blocked(reason) => {
-                return Err(PmMutationError::PrivateNotReady(reason));
-            }
-        };
-        let risk = self.private.evaluate_risk_candidate(
+        let (ready, risk) = match self.private.evaluate_quote_candidate(
             quote_request,
             PmRiskDependency::available(request.reference_observed_monotonic_ns),
             PmRiskDependency::available(request.book_observed_monotonic_ns),
-        )?;
+        )? {
+            PmPrivateQuoteEvaluation::Evaluated { ready, risk } => (ready, risk),
+            PmPrivateQuoteEvaluation::Blocked(reason) => {
+                return Err(PmMutationError::PrivateNotReady(reason));
+            }
+        };
         if let PmRiskDecision::Rejected { reason, halt } = risk {
             return Err(PmMutationError::RiskRejected { reason, halt });
         }
@@ -508,34 +538,23 @@ impl PmMutationOwner {
             candidate.quantity(),
             request.reservation,
         )?;
-        let effect_permit = self.reserve_effect_capacity()?;
-        let admission = match self.private.admit_owned_quote(owned_intent) {
-            Ok(admission) => admission,
-            Err(error) => {
-                self.effects.release_before_journal(effect_permit)?;
-                return Err(error.into());
+        let prepared_admission = self.private.prepare_owned_quote(owned_intent)?;
+        let preflight = prepared_admission.outcome();
+        match preflight {
+            PmOwnedQuoteAdmission::Admitted(preflight_client)
+                if preflight_client == client_order => {}
+            PmOwnedQuoteAdmission::Admitted(_) => {
+                self.halt = Some(PmMutationHalt::InternalInvariant);
+                return Err(PmMutationError::QuoteAdmissionChanged);
             }
-        };
-        let reserved = match admission {
-            PmOwnedQuoteAdmission::Admitted(_) => match approved.reserve(owned_intent, admission) {
-                Ok(reserved) => reserved,
-                Err(error) => {
-                    self.effects.release_before_journal(effect_permit)?;
-                    self.reject_never_dispatched_quote(client_order);
-                    self.halt = Some(PmMutationHalt::InternalInvariant);
-                    return Err(error.into());
-                }
-            },
             PmOwnedQuoteAdmission::DuplicateIntent(client)
             | PmOwnedQuoteAdmission::DuplicateQuote(client) => {
-                self.effects.release_before_journal(effect_permit)?;
                 self.counters.quote_duplicates = self.counters.quote_duplicates.saturating_add(1);
                 return Ok(PmQuoteMutationAdmission::Duplicate {
                     client_order: client,
                 });
             }
             PmOwnedQuoteAdmission::CancelBeforeReplace(cancel) => {
-                self.effects.release_before_journal(effect_permit)?;
                 self.counters.cancel_before_replace =
                     self.counters.cancel_before_replace.saturating_add(1);
                 return Ok(PmQuoteMutationAdmission::CancelBeforeReplace {
@@ -544,11 +563,33 @@ impl PmMutationOwner {
                 });
             }
             PmOwnedQuoteAdmission::ReplacementBlocked { current, .. } => {
-                self.effects.release_before_journal(effect_permit)?;
                 return Ok(PmQuoteMutationAdmission::ReplacementBlocked { current });
             }
-        };
+        }
 
+        let effect_permit = match self.effects.try_reserve() {
+            Ok(permit) => permit,
+            Err(error) => {
+                self.halt = Some(PmMutationHalt::FakeEffectSaturated);
+                return Err(PmMutationError::EffectQueue(error));
+            }
+        };
+        if let Err(error) = self.persistence.ensure_capacity(1) {
+            self.effects.release_before_journal(effect_permit)?;
+            self.halt = Some(PmMutationHalt::PersistenceSaturated);
+            return Err(PmMutationError::Persistence(error));
+        }
+        let admission = prepared_admission.commit();
+        debug_assert_eq!(admission, preflight);
+        let reserved = match approved.reserve(owned_intent, admission) {
+            Ok(reserved) => reserved,
+            Err(error) => {
+                self.effects.release_before_journal(effect_permit)?;
+                self.reject_never_dispatched_quote(client_order);
+                self.halt = Some(PmMutationHalt::InternalInvariant);
+                return Err(error.into());
+            }
+        };
         let journal_intent = reserved.journal_intent();
         let pending = match self.journal.try_quote_intent(journal_intent) {
             Ok(pending) => pending,
@@ -799,8 +840,21 @@ impl PmMutationOwner {
                     }
                 }
             }
-            PmPersistencePoll::FactAcknowledged(acknowledged) => {
-                let sequence = acknowledged.consume();
+            PmPersistencePoll::FactAcknowledged {
+                acknowledgement,
+                compaction,
+            } => {
+                let sequence = acknowledgement.consume();
+                if let Some(ticket) = compaction {
+                    let compacted = self
+                        .private
+                        .commit_fill_watermark_compaction(ticket)
+                        .map_err(|error| {
+                            self.halt = Some(PmMutationHalt::InternalInvariant);
+                            PmMutationError::State(error)
+                        })?;
+                    self.count_compaction(compacted);
+                }
                 Ok(PmPersistenceService::FactAcknowledged { sequence })
             }
             PmPersistencePoll::IntentFailed {
@@ -813,7 +867,15 @@ impl PmMutationOwner {
                 self.record_persistence_failure(&reason);
                 Ok(PmPersistenceService::IntentFailed { identity })
             }
-            PmPersistencePoll::FactFailed(reason) => {
+            PmPersistencePoll::FactFailed { reason, compaction } => {
+                if let Some(ticket) = compaction {
+                    self.private
+                        .abort_fill_watermark_compaction(ticket)
+                        .map_err(|error| {
+                            self.halt = Some(PmMutationHalt::InternalInvariant);
+                            PmMutationError::State(error)
+                        })?;
+                }
                 self.halt = Some(Self::halt_for_persistence_failure(&reason));
                 self.record_persistence_failure(&reason);
                 Ok(PmPersistenceService::FactFailed)
@@ -962,7 +1024,8 @@ impl PmMutationOwner {
         let envelope = self
             .private
             .open_product_private_fixture(delivery, monotonic_service_ns)?;
-        validate_private_batch(envelope.payload().observations())?;
+        self.private
+            .validate_private_batch(envelope.payload().observations())?;
         let observation_count = envelope.payload().observations().len();
         self.ensure_fact_capacity(observation_count)?;
         let source = envelope.source();
@@ -1019,10 +1082,18 @@ impl PmMutationOwner {
     }
 
     pub(crate) fn reserved_capacity_bytes(&self) -> usize {
-        self.persistence.reserved_capacity_bytes()
-            + self.effects.reserved_capacity_bytes()
-            + self.reconciliation_reductions.reserved_capacity_bytes()
-            + self.durable_consequences.capacity() * std::mem::size_of::<PmDurableConsequence>()
+        self.persistence
+            .reserved_capacity_bytes()
+            .saturating_add(self.journal.reserved_capacity_bytes())
+            .saturating_add(self.effects.reserved_capacity_bytes())
+            .saturating_add(self.reconciliation_reductions.reserved_capacity_bytes())
+            .saturating_add(
+                self.durable_consequences
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<PmDurableConsequence>()),
+            )
+            .saturating_add(self.private.reserved_capacity_bytes())
+            .saturating_add(std::mem::size_of::<PmPrivateMonitorRuntime>())
     }
 
     #[cfg(test)]
@@ -1054,7 +1125,7 @@ impl PmMutationOwner {
     }
 
     pub(super) fn private_mut(&mut self) -> &mut PmPrivateMonitorRuntime {
-        &mut self.private
+        self.private.as_mut()
     }
 
     pub(super) fn reduce_private_reconciliation(
@@ -1069,6 +1140,13 @@ impl PmMutationOwner {
         )
     }
 
+    pub(super) fn reconciliation_fact_upper_bound(&self, fills: &[PmFillEvent]) -> usize {
+        fills
+            .iter()
+            .filter(|fill| !self.private.contains_owned_fill(fill.fill_key()))
+            .count()
+    }
+
     pub(super) fn reconciliation_reduction_count(&self) -> usize {
         self.reconciliation_reductions.len()
     }
@@ -1078,6 +1156,10 @@ impl PmMutationOwner {
         index: usize,
     ) -> Option<PmReconciliationFillReduction> {
         self.reconciliation_reductions.get(index)
+    }
+
+    pub(super) fn clear_reconciliation_reductions(&mut self) {
+        self.reconciliation_reductions.clear();
     }
 
     pub(super) const fn instrument_id(&self) -> PmInstrumentId {
@@ -1108,20 +1190,61 @@ impl PmMutationOwner {
         record: PmJournalRecordV1,
         monotonic_now_ns: u64,
     ) -> Result<(), PmMutationError> {
-        Self::validate_persistence_time(monotonic_now_ns)?;
-        self.ensure_fact_capacity(1)?;
-        let (kind, client_order) = durable_consequence_projection(&record)?;
+        self.record_fact_with_compaction(record, None, monotonic_now_ns)
+    }
+
+    pub(super) fn record_fill_watermark_fact(
+        &mut self,
+        record: PmJournalRecordV1,
+        compaction: PmPreparedFillCompaction,
+        monotonic_now_ns: u64,
+    ) -> Result<(), PmMutationError> {
+        self.record_fact_with_compaction(record, Some(compaction), monotonic_now_ns)
+    }
+
+    fn record_fact_with_compaction(
+        &mut self,
+        record: PmJournalRecordV1,
+        mut compaction: Option<PmPreparedFillCompaction>,
+        monotonic_now_ns: u64,
+    ) -> Result<(), PmMutationError> {
+        if let Err(error) = Self::validate_persistence_time(monotonic_now_ns) {
+            self.abort_fill_compaction_if_present(&mut compaction)?;
+            return Err(error);
+        }
+        if let Err(error) = self.ensure_fact_capacity(1) {
+            self.abort_fill_compaction_if_present(&mut compaction)?;
+            return Err(error);
+        }
+        let (kind, client_order) = match durable_consequence_projection(&record) {
+            Ok(projection) => projection,
+            Err(error) => {
+                self.abort_fill_compaction_if_present(&mut compaction)?;
+                return Err(error);
+            }
+        };
         let pending = match self.journal.try_record(record) {
             Ok(pending) => pending,
             Err(error) => {
                 self.halt = Some(PmMutationHalt::JournalAdmissionFailed);
+                self.abort_fill_compaction_if_present(&mut compaction)?;
                 return Err(error.into());
             }
         };
-        if let Err(error) = self.persistence.push(PmPendingPersistence::Fact {
+        if let Err((error, pending)) = self.persistence.push_retaining(PmPendingPersistence::Fact {
             receipt: pending,
+            compaction,
             enqueued_monotonic_ns: monotonic_now_ns,
         }) {
+            if let PmPendingPersistence::Fact {
+                compaction: Some(ticket),
+                ..
+            } = pending
+            {
+                let mut rejected = Some(ticket);
+                self.halt = Some(PmMutationHalt::InternalInvariant);
+                self.abort_fill_compaction_if_present(&mut rejected)?;
+            }
             self.halt = Some(PmMutationHalt::InternalInvariant);
             return Err(error.into());
         }
@@ -1132,6 +1255,21 @@ impl PmMutationOwner {
             correlation: self.counters.fact_records,
         });
         Ok(())
+    }
+
+    fn abort_fill_compaction_if_present(
+        &mut self,
+        compaction: &mut Option<PmPreparedFillCompaction>,
+    ) -> Result<(), PmMutationError> {
+        let Some(ticket) = compaction.take() else {
+            return Ok(());
+        };
+        self.private
+            .abort_fill_watermark_compaction(ticket)
+            .map_err(|error| {
+                self.halt = Some(PmMutationHalt::InternalInvariant);
+                PmMutationError::State(error)
+            })
     }
 
     pub(super) fn count_place_result(&mut self) {
@@ -1177,65 +1315,6 @@ impl PmMutationOwner {
                 | PmMutationHalt::FakeEffectSaturated,
             ) => Ok(()),
             Some(halt) => Err(PmMutationError::Halted(halt)),
-        }
-    }
-
-    fn invalidate_durable_quote(
-        &mut self,
-        identity: PmPersistenceIntentIdentity,
-        effect_permit: PmFakeEffectPermit,
-        monotonic_service_ns: u64,
-    ) -> Result<PmPersistenceService, PmMutationError> {
-        let PmPersistenceIntentIdentity::Quote { client_order, .. } = identity else {
-            self.halt = Some(PmMutationHalt::InternalInvariant);
-            return Err(PmMutationError::InvalidPersistenceIdentity);
-        };
-        self.ensure_fact_capacity(1)?;
-        self.reject_durable_never_dispatched_quote(client_order, monotonic_service_ns)?;
-        self.effects
-            .invalidate_after_durability(effect_permit)
-            .map_err(|error| {
-                self.halt = Some(PmMutationHalt::InternalInvariant);
-                PmMutationError::EffectQueue(error)
-            })?;
-        Ok(PmPersistenceService::QuoteInvalidated { identity })
-    }
-
-    fn reject_durable_never_dispatched_quote(
-        &mut self,
-        client_order: PmClientOrderKey,
-        monotonic_service_ns: u64,
-    ) -> Result<(), PmMutationError> {
-        let apply = self
-            .private
-            .apply_owned_submit_result(client_order, PmOwnedSubmitResult::Rejected)?;
-        if apply != PmOwnedSubmitApply::Rejected {
-            self.halt = Some(PmMutationHalt::InternalInvariant);
-            return Err(PmMutationError::InvalidLocalInvalidation);
-        }
-        self.record_fact(
-            PmJournalRecordV1::PlaceResult(PmJournalPlaceResultV1 {
-                client_order,
-                outcome: PmJournalPlaceOutcomeV1::Rejected,
-                reject_reason: Some(
-                    PmJournalPlaceRejectReasonV1::AuthorityInvalidatedBeforeDispatch,
-                ),
-                venue_order: None,
-                immediate_fills: PmJournalImmediateFillsV1::empty(),
-            }),
-            monotonic_service_ns,
-        )?;
-        self.private.compact_proven_owned_terminal(client_order)?;
-        Ok(())
-    }
-
-    fn reject_never_dispatched_quote(&mut self, client_order: PmClientOrderKey) {
-        if self
-            .private
-            .apply_owned_submit_result(client_order, PmOwnedSubmitResult::Rejected)
-            .is_ok()
-        {
-            let _ = self.private.compact_proven_owned_terminal(client_order);
         }
     }
 
@@ -1351,6 +1430,8 @@ pub(crate) enum PmMutationError {
     InvalidLocalInvalidation,
     #[error("PM journal recovery could not reproduce canonical owned state")]
     RecoveryProjectionMismatch,
+    #[error("PM owned quote admission changed after its sole-owner preflight")]
+    QuoteAdmissionChanged,
     #[error(transparent)]
     PrivateReduction(#[from] PmPrivateReductionError),
     #[error("PM mutation owner is halted: {0:?}")]

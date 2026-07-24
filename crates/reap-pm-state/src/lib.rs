@@ -45,10 +45,11 @@ pub use owned_lifecycle::{
     PmOwnedSubmitState, PmOwnedTerminalCompaction,
 };
 pub use private::{
-    PmCancelOwnedIntent, PmCancelOwnedReason, PmOwnedFillReduction, PmOwnedImmediateAckTicket,
-    PmOwnedOrderReduction, PmPrivateFillReduction, PmPrivateOrderReduction, PmPrivateState,
-    PmPrivateStateError, PmReconciliationApply, PmReconciliationFillDisposition,
-    PmReconciliationFillReduction, PmReconciliationReductions,
+    PmCancelOwnedIntent, PmCancelOwnedReason, PmFillCompaction, PmOwnedFillReduction,
+    PmOwnedImmediateAckTicket, PmOwnedOrderReduction, PmPreparedFillCompaction,
+    PmPreparedOwnedQuoteAdmission, PmPrivateCardinalities, PmPrivateFillReduction,
+    PmPrivateOrderReduction, PmPrivateState, PmPrivateStateError, PmReconciliationApply,
+    PmReconciliationFillDisposition, PmReconciliationFillReduction, PmReconciliationReductions,
 };
 pub use private_config::{PmPrivateConfigError, PmPrivateStateConfig};
 pub use private_ingress::{
@@ -57,8 +58,8 @@ pub use private_ingress::{
 };
 pub use private_occurrence::PmPrivateOccurrence;
 pub use private_readiness::{
-    PmPrivateConvergence, PmPrivateDependency, PmPrivateHaltReason, PmPrivateQuoteRequest,
-    PmPrivateReadiness, PmPrivateReadinessReason, PmPrivateReady,
+    PmPrivateConvergence, PmPrivateDependency, PmPrivateHaltReason, PmPrivateQuoteEvaluation,
+    PmPrivateQuoteRequest, PmPrivateReadiness, PmPrivateReadinessReason, PmPrivateReady,
 };
 pub use readiness::{
     PmBookFreshness, PmBookReadiness, PmDomainFingerprint, PmMetadataContract,

@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 base64.workspace = true
+reap-benchmark-allocator.workspace = true
 reap-capture-framing.workspace = true
 reap-durable-writer.workspace = true
 reap-okx-public-source.workspace = true
@@ -26,3 +27,7 @@ serde_json.workspace = true
 tempfile = "3"
 tokio-tungstenite.workspace = true
 trybuild.workspace = true
+
+[[bench]]
+name = "pm_action_path"
+harness = false

@@ -4,6 +4,7 @@ use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
 use futures_util::{SinkExt, StreamExt};
+use reap_benchmark_allocator::TrackingAllocator;
 use reap_capture_framing::sha256_hex;
 use reap_okx_public_source::OkxPublicSessionFault;
 use reap_pm_core::ConnectionEpoch;
@@ -27,6 +28,151 @@ use support::{
     okx_reference, provenance, public_config, session_policy, snapshot_one, snapshot_two,
     tick_change,
 };
+
+#[global_allocator]
+static ALLOCATOR: TrackingAllocator = TrackingAllocator;
+
+const PHASE6_RECOVERY_CHILD: &str = "REAP_PHASE6_RECOVERY_EVIDENCE_CHILD";
+const PHASE6_RECOVERY_TEST: &str =
+    "phase6_real_mutation_artifacts_recover_to_the_same_bounded_projection";
+
+#[test]
+fn phase6_real_mutation_artifacts_recover_to_the_same_bounded_projection() {
+    if std::env::var_os(PHASE6_RECOVERY_CHILD).is_some() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread recovery evidence runtime builds")
+            .block_on(Box::pin(run_phase6_recovery_evidence()));
+        return;
+    }
+
+    let status = std::process::Command::new(
+        std::env::current_exe().expect("combined-replay test executable is available"),
+    )
+    .env(PHASE6_RECOVERY_CHILD, "1")
+    .args(["--exact", PHASE6_RECOVERY_TEST, "--test-threads=1"])
+    .status()
+    .expect("isolated recovery evidence subprocess starts");
+    assert!(
+        status.success(),
+        "isolated recovery evidence subprocess failed with {status}"
+    );
+}
+
+async fn run_phase6_recovery_evidence() {
+    let directory = tempfile::tempdir().unwrap();
+    let first_path = directory.path().join("phase6-first.jsonl");
+    let second_path = directory.path().join("phase6-second.jsonl");
+    let first_report: serde_json::Value = serde_json::from_str(
+        &reap_pm_live::run_pm_combined_replay_evidence(first_path.clone())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let second_report: serde_json::Value = serde_json::from_str(
+        &reap_pm_live::run_pm_combined_replay_evidence(second_path.clone())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read(first_path).unwrap(),
+        std::fs::read(second_path).unwrap()
+    );
+    for field in [
+        "schema_version",
+        "target",
+        "fixture_revision",
+        "build_revision",
+        "rustc",
+        "host",
+        "replay_working_limit_bytes",
+        "artifact_bytes",
+        "artifact_lines",
+        "artifact_sha256",
+        "setup",
+        "input_mix",
+        "measured",
+        "byte_identical_projection",
+        "production_order_entry_authorized",
+    ] {
+        assert_eq!(
+            first_report[field], second_report[field],
+            "deterministic combined field {field} differs"
+        );
+    }
+    assert_eq!(first_report["artifact_lines"], 35_012);
+    assert_eq!(first_report["setup"]["journal_header_records"], 1);
+    assert_eq!(first_report["setup"]["w0_external_observations"], 1);
+    assert_eq!(
+        first_report["setup"]["w0_internal_fact_acknowledgements"],
+        1
+    );
+    assert_eq!(first_report["setup"]["w0_owner_reductions"], 2);
+    assert_eq!(first_report["setup"]["w0_journal_records"], 1);
+    assert_eq!(first_report["setup"]["w0_watermark_advances"], 1);
+    assert_eq!(first_report["setup"]["physical_journal_lines"], 2);
+    assert_eq!(first_report["input_mix"]["pm_book_observations"], 10_000);
+    assert_eq!(
+        first_report["input_mix"]["okx_reference_observations"],
+        10_000
+    );
+    assert_eq!(first_report["input_mix"]["private_unique_fills"], 5_000);
+    assert_eq!(first_report["input_mix"]["private_duplicate_fills"], 5_000);
+    assert_eq!(first_report["measured"]["watermark_advances"], 10);
+    assert_eq!(first_report["measured"]["journal_records"], 35_010);
+    assert_eq!(first_report["production_order_entry_authorized"], false);
+    let logical_fields = [
+        "record_count",
+        "last_sequence",
+        "last_intent_id",
+        "last_owned_observation_sequence",
+        "compacted_intent_id",
+        "owned_orders",
+        "fill_keys",
+        "unresolved_orders",
+        "safety_halted",
+        "requires_reconciliation",
+        "fill_watermark",
+        "canonical_sha256",
+    ];
+    let baseline_recovery = &first_report["first_recovery"];
+    for report in [&first_report, &second_report] {
+        assert_eq!(report["byte_identical_projection"], true);
+        for field in ["first_recovery", "second_recovery"] {
+            let recovery = &report[field];
+            for logical_field in logical_fields {
+                assert_eq!(
+                    recovery[logical_field], baseline_recovery[logical_field],
+                    "logical recovery field {logical_field} differs"
+                );
+            }
+            assert_eq!(recovery["record_count"], 35_012);
+            assert_eq!(recovery["last_intent_id"], 10_000);
+            assert_eq!(recovery["compacted_intent_id"], 10_000);
+            assert_eq!(recovery["owned_orders"], 0);
+            assert_eq!(recovery["fill_keys"], 0);
+            assert_eq!(recovery["unresolved_orders"], 0);
+            assert_eq!(recovery["requires_reconciliation"], false);
+            assert_eq!(
+                recovery["allocator_measurement"],
+                "recovery-window peak live delta minus the post-input-construction window baseline"
+            );
+            let baseline_live_delta = recovery["allocator_window_baseline_live_delta_bytes"]
+                .as_i64()
+                .unwrap();
+            assert_eq!(
+                recovery["peak_working_bytes"],
+                recovery["allocator_window_peak_live_delta_bytes"]
+                    .as_u64()
+                    .unwrap()
+                    .saturating_sub(u64::try_from(baseline_live_delta).unwrap_or_default())
+            );
+            assert!(recovery["peak_working_bytes"].as_u64().unwrap() <= 16 * 1_024 * 1_024);
+        }
+    }
+}
 
 struct ConsumePublic;
 

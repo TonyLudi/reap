@@ -31,6 +31,8 @@ mod writer;
 
 use validation::{validate_header, validate_provenance, validate_scope};
 pub use verify::verify_pm_public_capture;
+#[cfg(test)]
+pub(crate) use writer::Phase6RawCapacityProbe;
 pub(crate) use writer::PmPublicCaptureWriter;
 
 pub const PM_PUBLIC_CAPTURE_SCHEMA_VERSION: u16 = 1;
@@ -39,6 +41,7 @@ pub const MAX_PM_PUBLIC_CAPTURE_RAW_FRAMES: u64 = 8_192;
 pub const MAX_PM_PUBLIC_CAPTURE_RECORDS: u64 = 16_384;
 pub const MAX_PM_PUBLIC_CAPTURE_RAW_PAYLOAD_BYTES: u64 = 32 * 1024 * 1024;
 pub const MAX_PM_PUBLIC_CAPTURE_ENCODED_BYTES: u64 = 48 * 1024 * 1024;
+pub const MAX_PM_PUBLIC_CAPTURE_PENDING_AGE_NS: u64 = 500_000_000;
 /// The compact JSONL envelope bound. A one-MiB raw frame expands to at most
 /// 1,398,104 base64 bytes; the remaining margin covers fixed typed fields.
 pub const MAX_PM_PUBLIC_CAPTURE_FRAME_BYTES: usize = 3 * 512 * 1024;
@@ -800,11 +803,32 @@ pub enum PmCaptureWriteError {
     Frame(#[from] BoundedJsonlFrameError),
     #[error(transparent)]
     Contract(#[from] PmCaptureVerifyError),
+    #[error("oldest pending capture record age {observed_age_ns}ns exceeded {maximum_age_ns}ns")]
+    CaptureAged {
+        observed_age_ns: u64,
+        maximum_age_ns: u64,
+    },
+    #[error(
+        "capture writer entry evidence exceeded its tracked timestamp FIFO: writer depth {writer_depth}, tracked depth {tracked_depth}"
+    )]
+    CaptureQueueEvidenceMismatch {
+        writer_depth: usize,
+        tracked_depth: usize,
+    },
+    #[error(
+        "capture writer service clock {observed_monotonic_ns}ns regressed behind oldest pending record {oldest_monotonic_ns}ns"
+    )]
+    CaptureQueueClockRegression {
+        observed_monotonic_ns: u64,
+        oldest_monotonic_ns: u64,
+    },
 }
 
 impl PmCaptureWriteError {
     pub(crate) fn session_fault(&self) -> PmPublicSessionFault {
-        if self.is_capacity_failure() {
+        if matches!(self, Self::CaptureAged { .. }) {
+            PmPublicSessionFault::Stale
+        } else if self.is_capacity_failure() {
             PmPublicSessionFault::Overflow
         } else {
             PmPublicSessionFault::InvalidTransition
@@ -812,7 +836,9 @@ impl PmCaptureWriteError {
     }
 
     pub(crate) fn okx_session_fault(&self) -> OkxPublicSessionFault {
-        if self.is_capacity_failure() {
+        if matches!(self, Self::CaptureAged { .. }) {
+            OkxPublicSessionFault::Stale
+        } else if self.is_capacity_failure() {
             OkxPublicSessionFault::Overflow
         } else {
             OkxPublicSessionFault::InvalidTransition

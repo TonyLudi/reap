@@ -1,5 +1,8 @@
 use reap_pm_core::{EventClock, PmOrderSide, PmProductSource};
-use reap_pm_state::{PmPrivateExternalIngressFault, PmRiskHaltScope};
+use reap_pm_state::{
+    PmOpenOrdersApply, PmPrivateExternalIngressFault, PmReconciliationApply, PmRefreshReason,
+    PmRiskHaltScope,
+};
 use reap_polymarket_adapter::{
     PmFakeCancelScript, PmFakePlaceScript, PmFixtureCompletionOccurrence, PmFixtureFeeEvidence,
 };
@@ -59,6 +62,23 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         }
     }
 
+    pub(crate) fn evidence_schedule_metrics(
+        &mut self,
+        monotonic_now_ns: u64,
+    ) -> Result<PmScheduleMetrics, PmCoordinatorError> {
+        if monotonic_now_ns == 0 {
+            return Err(PmCoordinatorError::ZeroServiceClock);
+        }
+        let result = self.lanes_mut()?.schedule_metrics(monotonic_now_ns);
+        match result {
+            Ok(metrics) => Ok(metrics),
+            Err(error) => {
+                self.latch_scheduler_failure(PmControlReason::SchedulerOverload);
+                Err(error.into())
+            }
+        }
+    }
+
     pub(crate) fn service_turn(
         &mut self,
         monotonic_now_ns: u64,
@@ -73,6 +93,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         self.outputs
             .ensure_capacity(MAX_PM_EFFECTS_PER_INPUT)
             .map_err(PmCoordinatorError::from)?;
+        let _retried = self.retry_expired_refresh(monotonic_now_ns)?;
         let mut lanes = self
             .lanes
             .take()
@@ -84,6 +105,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
             Ok(())
         };
         self.lanes = Some(lanes);
+        self.clear_reconciliation_gate_if_drained();
 
         let schedule_result = self.flush_pending_schedules();
         if let Some(error) = self.callback_error.take() {
@@ -92,7 +114,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         let serviced = match serviced {
             Ok(serviced) => serviced,
             Err(error) => {
-                self.latch_scheduler_failure(PmControlReason::SchedulerOverload);
+                self.observe_complete_service_failure(&error, monotonic_now_ns);
                 return Err(error.into());
             }
         };
@@ -119,7 +141,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         match result {
             Ok(admission) => Ok(admission),
             Err(error) => {
-                self.latch_scheduler_failure(PmControlReason::SchedulerOverload);
+                self.observe_schedule_failure(&error, scheduled_at_ns);
                 Err(error.into())
             }
         }
@@ -414,8 +436,14 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         match self.lanes_mut()?.enqueue_private(ingress, input) {
             Ok(()) => Ok(()),
             Err(error) => {
+                let action = error.action();
+                let monotonic_service_ns = ingress.monotonic_receive_ns();
                 self.retained_private_admission = retain_retryable_admission(ingress, error);
-                self.latch_scheduler_failure(PmControlReason::SchedulerOverload);
+                self.observe_scheduler_action(
+                    action,
+                    PmControlReason::SchedulerOverload,
+                    Some(monotonic_service_ns),
+                );
                 Err(PmCoordinatorError::PrivateLaneRejected)
             }
         }
@@ -432,8 +460,14 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         match self.lanes_mut()?.enqueue_reconciliation(ingress, input) {
             Ok(()) => Ok(()),
             Err(error) => {
+                let action = error.action();
+                let monotonic_service_ns = ingress.monotonic_receive_ns();
                 self.retained_reconciliation_admission = retain_retryable_admission(ingress, error);
-                self.latch_scheduler_failure(PmControlReason::SchedulerOverload);
+                self.observe_scheduler_action(
+                    action,
+                    PmControlReason::SchedulerOverload,
+                    Some(monotonic_service_ns),
+                );
                 Err(PmCoordinatorError::ReconciliationLaneRejected)
             }
         }
@@ -487,7 +521,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
 
     fn lanes_mut(&mut self) -> Result<&mut PmCompleteInputLanes, PmCoordinatorError> {
         self.lanes
-            .as_mut()
+            .as_deref_mut()
             .ok_or(PmCoordinatorError::SchedulerReentrant)
     }
 
@@ -523,7 +557,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         Ok(())
     }
 
-    fn flush_pending_schedules(&mut self) -> Result<(), PmCoordinatorError> {
+    pub(super) fn flush_pending_schedules(&mut self) -> Result<(), PmCoordinatorError> {
         while let Some(pending) = self.pending_schedules.take_next() {
             let result = self.lanes_mut()?.schedule(
                 pending.key,
@@ -532,13 +566,8 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
                 pending.decision_wall_timestamp_ms,
             );
             if let Err(error) = result {
-                self.pending_schedules.insert(
-                    pending.key,
-                    pending.deadline_ns,
-                    pending.scheduled_at_ns,
-                    pending.decision_wall_timestamp_ms,
-                )?;
-                self.latch_scheduler_failure(PmControlReason::SchedulerOverload);
+                self.pending_schedules.clear();
+                self.observe_schedule_failure(&error, pending.scheduled_at_ns);
                 return Err(error.into());
             }
         }
@@ -580,7 +609,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         )
     }
 
-    fn complete_callback(
+    pub(super) fn complete_callback(
         &mut self,
         mut effects: PmProductEffectBatch,
         result: Result<(), PmCoordinatorError>,
@@ -612,12 +641,6 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         }
         self.halt = Some(reason);
         self.counters.control_halts = self.counters.control_halts.saturating_add(1);
-    }
-
-    fn latch_scheduler_failure(&mut self, reason: PmControlReason) {
-        self.mutation.invalidate_revisions();
-        self.mutation.halt_contract();
-        self.latch_halt(reason);
     }
 
     fn append_durable_consequences(
@@ -673,7 +696,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         Ok(())
     }
 
-    fn service_reference(
+    pub(super) fn service_reference(
         &mut self,
         input: PmOkxReferenceInput,
         effects: &mut PmProductEffectBatch,
@@ -684,7 +707,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
             push_metric(effects, PmHealthMetricKind::InputObserved, 1)?;
             let clock = input.clock();
             self.schedule_quote_evaluation(
-                clock.monotonic_receive_ns(),
+                clock.monotonic_service_ns(),
                 captured_wall_timestamp_ms(clock.local_wall_receive_ns())?,
             )
         } else {
@@ -693,7 +716,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         }
     }
 
-    fn service_market(
+    pub(super) fn service_market(
         &mut self,
         input: PmMarketInput,
         effects: &mut PmProductEffectBatch,
@@ -707,7 +730,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
                 captured_wall_timestamp_ms(clock.local_wall_receive_ns())?;
             if tradable {
                 self.schedule_quote_evaluation(
-                    clock.monotonic_receive_ns(),
+                    clock.monotonic_service_ns(),
                     decision_wall_timestamp_ms,
                 )?;
             } else {
@@ -720,7 +743,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
                 ))?;
                 self.schedule_both_sides(
                     PmScheduledActionKind::CancelOwnedQuote,
-                    clock.monotonic_receive_ns(),
+                    clock.monotonic_service_ns(),
                     decision_wall_timestamp_ms,
                 )?;
             }
@@ -728,7 +751,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         push_metric(effects, PmHealthMetricKind::InputObserved, 1)
     }
 
-    fn service_book(
+    pub(super) fn service_book(
         &mut self,
         input: PmBookInput,
         effects: &mut PmProductEffectBatch,
@@ -738,7 +761,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
             self.invalidate_quote_authority_at(clock.monotonic_service_ns())?;
             self.counters.books_applied = self.counters.books_applied.saturating_add(1);
             self.schedule_quote_evaluation(
-                clock.monotonic_receive_ns(),
+                clock.monotonic_service_ns(),
                 captured_wall_timestamp_ms(clock.local_wall_receive_ns())?,
             )?;
         }
@@ -765,7 +788,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         ))?;
         self.schedule_both_sides(
             PmScheduledActionKind::CancelOwnedQuote,
-            clock.monotonic_receive_ns(),
+            clock.monotonic_service_ns(),
             captured_wall_timestamp_ms(clock.local_wall_receive_ns())?,
         )
     }
@@ -773,25 +796,32 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
     fn service_critical(
         &mut self,
         input: PmCriticalInput,
-        monotonic_service_ns: u64,
+        local_action_sequence: u64,
+        clock: EventClock,
         effects: &mut PmProductEffectBatch,
     ) -> Result<(), PmCoordinatorError> {
+        let monotonic_service_ns = clock.monotonic_service_ns();
         match input {
-            PmCriticalInput::Stop(PmStopControl::Shutdown) => {
-                self.invalidate_quote_authority_at(monotonic_service_ns)?;
-                self.latch_halt(PmControlReason::RequestedShutdown);
-                Ok(())
-            }
-            PmCriticalInput::Stop(PmStopControl::GlobalStop) => {
-                self.invalidate_quote_authority_at(monotonic_service_ns)?;
-                self.latch_halt(PmControlReason::ContractViolation);
-                Ok(())
-            }
+            PmCriticalInput::Stop(PmStopControl::Shutdown) => self.service_stop_control(
+                local_action_sequence,
+                clock,
+                PmControlReason::RequestedShutdown,
+                effects,
+            ),
+            PmCriticalInput::Stop(PmStopControl::GlobalStop) => self.service_stop_control(
+                local_action_sequence,
+                clock,
+                PmControlReason::ContractViolation,
+                effects,
+            ),
             PmCriticalInput::ScopedHalt(halt) => {
                 let _scope = halt.scope();
-                self.invalidate_quote_authority_at(monotonic_service_ns)?;
-                self.latch_halt(PmControlReason::ContractViolation);
-                Ok(())
+                self.service_stop_control(
+                    local_action_sequence,
+                    clock,
+                    PmControlReason::ContractViolation,
+                    effects,
+                )
             }
             PmCriticalInput::FakePlaceResult(result) => {
                 let prepared = self
@@ -799,6 +829,11 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
                     .remove_quote(result.client_order())?;
                 self.mutation
                     .reduce_serviced_fake_place(result, monotonic_service_ns)?;
+                let _refresh = self.admit_refresh_reason(
+                    PmRefreshReason::AmbiguousOrder,
+                    monotonic_service_ns,
+                    effects,
+                )?;
                 self.advance_private_readiness_revision()?;
                 let executed = PmFakeQuoteEffect::new(
                     prepared.account_scope(),
@@ -838,6 +873,36 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         }
     }
 
+    fn service_stop_control(
+        &mut self,
+        local_action_sequence: u64,
+        clock: EventClock,
+        reason: PmControlReason,
+        effects: &mut PmProductEffectBatch,
+    ) -> Result<(), PmCoordinatorError> {
+        let cancel_result = (|| {
+            self.invalidate_quote_authority_at(clock.monotonic_service_ns())?;
+            let context = super::cancel::PmCancelDecisionContext::new(
+                local_action_sequence,
+                captured_wall_timestamp_ms(clock.local_wall_receive_ns())?,
+                clock.monotonic_receive_ns(),
+            );
+            self.cancel_owned_orders(
+                context,
+                PmJournalCancelReasonV1::SafetyHalt,
+                reason,
+                effects,
+            )
+        })();
+        let halt_projection = effects
+            .push(PmProductEffect::FailClosedHaltOrCancel(
+                PmFailClosedEffect::halt(self.account_scope, self.instrument, reason),
+            ))
+            .map_err(PmCoordinatorError::from);
+        self.latch_halt(reason);
+        cancel_result.and(halt_projection)
+    }
+
     fn service_private(
         &mut self,
         item: PmCompleteServiced<PmPrivateInput>,
@@ -848,6 +913,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         let ordering = item.ordering();
         let clock = item.clock();
         let input = item.into_value();
+        self.note_private_reduction_while_gated();
         self.invalidate_quote_authority_at(clock.monotonic_service_ns())?;
         match input {
             PmPrivateInput::ConnectionAvailable => {
@@ -859,9 +925,14 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
                         ordering.connection_epoch(),
                         clock.monotonic_receive_ns(),
                     )?;
+                let _refresh = self.admit_refresh_reason(
+                    PmRefreshReason::PrivateReconnect,
+                    clock.monotonic_service_ns(),
+                    effects,
+                )?;
                 self.advance_private_readiness_revision()?;
                 self.schedule_quote_evaluation(
-                    clock.monotonic_receive_ns(),
+                    clock.monotonic_service_ns(),
                     captured_wall_timestamp_ms(clock.local_wall_receive_ns())?,
                 )?;
                 push_metric(effects, PmHealthMetricKind::InputObserved, 1)
@@ -880,15 +951,26 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
                 ))?;
                 self.schedule_both_sides(
                     PmScheduledActionKind::CancelOwnedQuote,
-                    clock.monotonic_receive_ns(),
+                    clock.monotonic_service_ns(),
                     captured_wall_timestamp_ms(clock.local_wall_receive_ns())?,
                 )?;
                 push_metric(effects, PmHealthMetricKind::InputObserved, 1)
             }
             PmPrivateInput::FixtureBatch(delivery) => {
+                let unique_before = self.mutation.counters().unique_fills();
                 let _observations = self
                     .mutation
                     .reduce_serviced_private_fixture(delivery, clock.monotonic_service_ns())?;
+                if self.mutation.counters().unique_fills() != unique_before {
+                    let _refresh = self.admit_refresh_reason(
+                        PmRefreshReason::FillObserved,
+                        clock.monotonic_service_ns(),
+                        effects,
+                    )?;
+                    for tracked in self.tracked_quotes.into_iter().flatten() {
+                        self.refresh_tracked_quote(tracked.client_order);
+                    }
+                }
                 self.advance_private_readiness_revision()?;
                 push_metric(effects, PmHealthMetricKind::InputObserved, 1)
             }
@@ -914,13 +996,20 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
                 let connection = envelope.connection_id();
                 let clock = envelope.clock();
                 let ordering = envelope.ordering();
-                self.mutation.private_mut().reduce_serviced_open_orders(
+                let apply = self.mutation.private_mut().reduce_serviced_open_orders(
                     source,
                     connection,
                     clock,
                     ordering,
                     envelope.into_payload(),
                 )?;
+                if matches!(apply, PmOpenOrdersApply::Applied { .. }) {
+                    let _completed = self.complete_reconciled_refresh_reason(
+                        PmRefreshReason::AmbiguousOrder,
+                        monotonic_service_ns,
+                        effects,
+                    )?;
+                }
             }
             PmReconciliationInput::OrderDetailFixture(delivery) => {
                 let envelope = self
@@ -964,9 +1053,23 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
                     .private_mut()
                     .open_product_reconciliation_fixture(delivery, monotonic_service_ns)?;
                 let unique_before = self.mutation.counters().unique_fills();
-                let _apply = self
+                let apply = self
                     .mutation
                     .reduce_serviced_reconciliation(account, fills)?;
+                if matches!(apply, PmReconciliationApply::Applied { .. }) {
+                    self.note_complete_reconciliation();
+                    for reason in [
+                        PmRefreshReason::PrivateReconnect,
+                        PmRefreshReason::FillObserved,
+                        PmRefreshReason::ExternalIngressFault,
+                    ] {
+                        let _completed = self.complete_reconciled_refresh_reason(
+                            reason,
+                            monotonic_service_ns,
+                            effects,
+                        )?;
+                    }
+                }
                 if self.mutation.counters().unique_fills() != unique_before {
                     for tracked in self.tracked_quotes.into_iter().flatten() {
                         self.refresh_tracked_quote(tracked.client_order);
@@ -996,11 +1099,11 @@ impl<M: PmQuoteModel> PmCompleteLaneService for PmCoordinator<M> {
 
     fn on_critical(&mut self, item: PmCompleteServiced<PmCriticalInput>) {
         debug_assert_eq!(item.lane(), crate::lanes::PmLaneKind::Critical);
-        let _key = item.key();
-        let monotonic_service_ns = item.clock().monotonic_service_ns();
+        let local_action_sequence = item.key().local_ingress_sequence().value();
+        let clock = item.clock();
         let input = item.into_value();
         let mut effects = PmProductEffectBatch::new();
-        let result = self.service_critical(input, monotonic_service_ns, &mut effects);
+        let result = self.service_critical(input, local_action_sequence, clock, &mut effects);
         self.complete_callback(effects, result);
     }
 

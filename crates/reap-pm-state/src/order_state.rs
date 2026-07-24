@@ -10,6 +10,11 @@ use thiserror::Error;
 use crate::private_config::PmPrivateStateConfig;
 use crate::private_occurrence::PmPrivateOccurrence;
 
+mod admission;
+mod decision_summary;
+mod dense_index;
+pub(crate) use decision_summary::PmOrderDecisionSummary;
+
 pub const MAX_PM_PRIVATE_ORDERS: usize = reap_pm_core::MAX_PM_RECONCILIATION_ORDERS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +116,19 @@ pub struct PmOwnedOrderRegistration {
     price: PmPrice,
     quantity: PmQuantity,
     reservation: PmExactReservation,
+}
+
+pub(crate) struct PmOwnedRegistrationPlan {
+    entry: OrderEntry,
+    action: PmOwnedRegistrationAction,
+}
+
+enum PmOwnedRegistrationAction {
+    Existing,
+    Insert {
+        canonical_position: usize,
+        client_position: usize,
+    },
 }
 
 impl PmOwnedOrderRegistration {
@@ -374,6 +392,8 @@ impl OrderEntry {
 
 pub(crate) struct PmOrderState {
     entries: Vec<OrderEntry>,
+    canonical_index: Vec<u16>,
+    client_index: Vec<u16>,
     latest_snapshot_revision: Option<reap_pm_core::SnapshotRevision>,
     latest_snapshot_completion: Option<PmPrivateOccurrence>,
     observed_monotonic_ns: Option<u64>,
@@ -384,11 +404,29 @@ impl PmOrderState {
     pub(crate) fn new() -> Self {
         Self {
             entries: Vec::with_capacity(MAX_PM_PRIVATE_ORDERS),
+            canonical_index: Vec::with_capacity(MAX_PM_PRIVATE_ORDERS),
+            client_index: Vec::with_capacity(MAX_PM_PRIVATE_ORDERS),
             latest_snapshot_revision: None,
             latest_snapshot_completion: None,
             observed_monotonic_ns: None,
             counters: PmOrderCounters::default(),
         }
+    }
+
+    pub(crate) fn reserved_capacity_bytes(&self) -> usize {
+        self.entries
+            .capacity()
+            .saturating_mul(std::mem::size_of::<OrderEntry>())
+            .saturating_add(
+                self.canonical_index
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u16>()),
+            )
+            .saturating_add(
+                self.client_index
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u16>()),
+            )
     }
 
     pub(crate) fn register_owned(
@@ -429,29 +467,8 @@ impl PmOrderState {
         registration: PmOwnedOrderRegistration,
         config: &PmPrivateStateConfig,
     ) -> Result<(), PmOrderStateError> {
-        validate_registration(registration, config)?;
-        let identity = PmOrderIdentity::new(Some(registration.client_order), None)
-            .expect("registration always carries a client key");
-        if let Some(index) = self.find(identity) {
-            let entry = self.entries[index];
-            if entry.ownership != OwnershipState::ProvenOwned || entry.event.is_some() {
-                return Err(PmOrderStateError::OwnershipRegisteredTooLate);
-            }
-            return if entry.reservation
-                == Some(PmReservationKnowledge::Known(registration.reservation))
-                && entry.registered_terms
-                    == Some((registration.side, registration.price, registration.quantity))
-            {
-                Ok(())
-            } else {
-                Err(PmOrderStateError::IdentityConflict)
-            };
-        }
-        if self.entries.len() == MAX_PM_PRIVATE_ORDERS {
-            Err(PmOrderStateError::Capacity)
-        } else {
-            Ok(())
-        }
+        self.prepare_owned_registration(registration, config)
+            .map(drop)
     }
 
     pub(crate) fn bind_owned_venue(
@@ -478,8 +495,9 @@ impl PmOrderState {
             return Err(PmOrderStateError::OwnershipRegisteredTooLate);
         }
         ensure_identity_merge(entry.identity, identity)?;
-        self.entries[index].identity = merge_identity(entry.identity, identity);
-        self.entries.sort_by(compare_entries);
+        let mut bound = entry;
+        bound.identity = merge_identity(entry.identity, identity);
+        self.replace_ordered(index, bound)?;
         Ok(())
     }
 
@@ -520,7 +538,7 @@ impl PmOrderState {
         if entry.ownership != OwnershipState::ProvenOwned || entry.registered_terms.is_none() {
             return Err(PmOrderStateError::OwnershipRegisteredTooLate);
         }
-        self.entries.remove(index);
+        self.remove_dense(index);
         Ok(())
     }
 
@@ -722,7 +740,9 @@ impl PmOrderState {
     }
 
     pub(crate) fn projections(&self) -> impl Iterator<Item = PmOrderProjection> + '_ {
-        self.entries.iter().copied().map(OrderEntry::projection)
+        self.canonical_entries()
+            .copied()
+            .map(OrderEntry::projection)
     }
 
     pub(crate) fn ownership(&self, identity: PmOrderIdentity) -> Option<PmOrderOwnership> {
@@ -735,67 +755,9 @@ impl PmOrderState {
     }
 
     pub(crate) fn owned_live_venue_orders(&self) -> impl Iterator<Item = PmVenueOrderKey> + '_ {
-        self.entries
-            .iter()
+        self.canonical_entries()
             .filter(|entry| entry.ownership == OwnershipState::ProvenOwned && entry.is_live())
             .filter_map(|entry| entry.identity.venue_order_key())
-    }
-
-    pub(crate) fn reservation_totals(&self) -> Result<(U256, U256), PmReservationTotalsError> {
-        let mut collateral_total = U256::ZERO;
-        let mut outcome_total = U256::ZERO;
-        for entry in self.entries.iter().filter(|entry| entry.is_live()) {
-            let Some(knowledge) = entry.reservation else {
-                continue;
-            };
-            let PmReservationKnowledge::Known(reservation) = knowledge else {
-                return Err(PmReservationTotalsError::Unknown(entry.identity));
-            };
-            collateral_total = collateral_total
-                .checked_add(reservation.collateral())
-                .map_err(|_| PmReservationTotalsError::Overflow)?;
-            outcome_total = outcome_total
-                .checked_add(reservation.outcome())
-                .map_err(|_| PmReservationTotalsError::Overflow)?;
-        }
-        Ok((collateral_total, outcome_total))
-    }
-
-    pub(crate) fn first_unknown_reservation(&self) -> Option<PmOrderIdentity> {
-        self.entries
-            .iter()
-            .find(|entry| {
-                entry.is_live()
-                    && (entry.ownership == OwnershipState::Ambiguous
-                        || entry.reservation == Some(PmReservationKnowledge::Unknown))
-            })
-            .map(|entry| entry.identity)
-    }
-
-    pub(crate) fn has_unmanaged_ambiguity(&self) -> bool {
-        self.entries
-            .iter()
-            .any(|entry| entry.is_live() && entry.ownership == OwnershipState::Ambiguous)
-    }
-
-    pub(crate) fn live_count(&self) -> u16 {
-        u16::try_from(self.entries.iter().filter(|entry| entry.is_live()).count())
-            .expect("order capacity fits u16")
-    }
-
-    pub(crate) fn unresolved_count(&self) -> u16 {
-        u16::try_from(
-            self.entries
-                .iter()
-                .filter(|entry| {
-                    entry.is_live()
-                        && (entry.ownership == OwnershipState::Ambiguous
-                            || entry.event.is_none()
-                            || entry.missing_from_complete_open_snapshot)
-                })
-                .count(),
-        )
-        .expect("order capacity fits u16")
     }
 
     pub(crate) const fn observed_monotonic_ns(&self) -> Option<u64> {
@@ -815,36 +777,7 @@ impl PmOrderState {
             self.counters.capacity_failures = self.counters.capacity_failures.saturating_add(1);
             return Err(PmOrderStateError::Capacity);
         }
-        self.entries.push(entry);
-        self.entries.sort_by(compare_entries);
-        Ok(())
-    }
-
-    fn find(&self, identity: PmOrderIdentity) -> Option<usize> {
-        self.entries
-            .iter()
-            .position(|entry| identities_overlap(entry.identity, identity))
-    }
-
-    fn overlaps(&self, identity: PmOrderIdentity) -> Result<OrderOverlap, PmOrderStateError> {
-        let mut first = None;
-        let mut second = None;
-        for (index, entry) in self.entries.iter().enumerate() {
-            if !identities_overlap(entry.identity, identity) {
-                continue;
-            }
-            match (first, second) {
-                (None, _) => first = Some(index),
-                (Some(_), None) => second = Some(index),
-                (Some(_), Some(_)) => return Err(PmOrderStateError::IdentityConflict),
-            }
-        }
-        Ok(match (first, second) {
-            (None, None) => OrderOverlap::None,
-            (Some(index), None) => OrderOverlap::One(index),
-            (Some(first), Some(second)) => OrderOverlap::Bridge(first, second),
-            (None, Some(_)) => unreachable!("second overlap requires a first"),
-        })
+        self.insert_ordered(entry)
     }
 
     fn coalesce_entries(&mut self, first: usize, second: usize) -> Result<(), PmOrderStateError> {
@@ -856,10 +789,23 @@ impl PmOrderState {
         } else {
             (second, first)
         };
-        self.entries.remove(upper);
-        self.entries[lower] = merged;
-        self.entries.sort_by(compare_entries);
-        Ok(())
+        if self.entries.iter().enumerate().any(|(index, entry)| {
+            index != lower && index != upper && compare_entries(entry, &merged) == Ordering::Equal
+        }) {
+            return Err(PmOrderStateError::IdentityConflict);
+        }
+        if let Some(merged_client) = merged.identity.client_order_key()
+            && self.entries.iter().enumerate().any(|(index, entry)| {
+                index != lower
+                    && index != upper
+                    && entry.identity.client_order_key() == Some(merged_client)
+            })
+        {
+            return Err(PmOrderStateError::IdentityConflict);
+        }
+        self.remove_dense(upper);
+        self.remove_dense(lower);
+        self.insert_ordered(merged)
     }
 
     fn update_existing(
@@ -901,7 +847,7 @@ impl PmOrderState {
         }
         let was_live = prior.is_live();
         let terminal = event.progress().status().is_terminal();
-        let entry = &mut self.entries[index];
+        let mut entry = prior;
         entry.identity = merge_identity(entry.identity, event.order());
         entry.event = Some(event);
         entry.last_occurrence = Some(occurrence);
@@ -913,7 +859,7 @@ impl PmOrderState {
         } else if terminal {
             entry.reservation = None;
         }
-        self.entries.sort_by(compare_entries);
+        self.replace_ordered(index, entry)?;
         if was_live && terminal {
             self.counters.terminal_releases = self.counters.terminal_releases.saturating_add(1);
             Ok(PmOrderApply::TerminalReservationReleased)
@@ -1412,3 +1358,7 @@ fn validate_detail(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "order_state_tests.rs"]
+mod tests;

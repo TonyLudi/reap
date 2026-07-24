@@ -1,0 +1,11 @@
+error[E0599]: no method named `public_capture_mut` found for mutable reference `&mut PmProductRun<M>` in the current scope
+ --> tests/ui/product_has_no_mutable_capture_escape.rs:5:17
+  |
+5 |     let _ = run.public_capture_mut();
+  |                 ^^^^^^^^^^^^^^^^^^
+  |
+help: there is a method `public_capture` with a similar name
+  |
+5 -     let _ = run.public_capture_mut();
+5 +     let _ = run.public_capture();
+  |

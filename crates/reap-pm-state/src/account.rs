@@ -251,6 +251,27 @@ impl PmAccountState {
         }
     }
 
+    pub(crate) fn reserved_capacity_bytes(&self) -> usize {
+        self.allowances
+            .capacity()
+            .saturating_mul(std::mem::size_of::<AllowanceEntry>())
+            .saturating_add(
+                self.diagnostic_balances
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<PmBalanceEvent>()),
+            )
+            .saturating_add(
+                self.diagnostic_allowances
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<PmAllowanceEvent>()),
+            )
+            .saturating_add(
+                self.diagnostic_positions
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<PmPositionEvent>()),
+            )
+    }
+
     pub(crate) fn apply(
         &mut self,
         envelope: &EventEnvelope<PmCompleteAccountSnapshot>,

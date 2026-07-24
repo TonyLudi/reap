@@ -70,7 +70,11 @@ pub use lane_enact::{
     PmPublicAgedLaneEnactError, PmPublicAgedLaneFaultEnactment, PmPublicLaneAdmissionError,
     PmPublicLaneEnactError, PmPublicLaneFaultEnactment,
 };
-pub use product::{PmProduct, PmProductRun, PmProductRunError, PmProductStartError};
+pub use product::{
+    PmProduct, PmProductPublicAgedEnactError, PmProductPublicAgedRetryReason,
+    PmProductPublicIngress, PmProductPublicIngressError, PmProductPublicIngressOutcome,
+    PmProductRun, PmProductRunError, PmProductStartError,
+};
 use run_state::{
     MAX_PENDING_PM_BOOK_REDUCTIONS, PendingOtherAgedLaneFault, PendingPmAgedLaneFault,
     PendingPmBookKind, PendingPmBookLaneFault, PendingPmBookReduction, PendingPmMetadataLaneFault,
@@ -441,6 +445,20 @@ impl PmPublicCaptureRun {
 
     pub(crate) fn public_lane_reserved_capacity_bytes(&self) -> usize {
         self.public_lane.reserved_capacity_bytes()
+    }
+
+    pub(crate) fn capture_writer_reserved_capacity_bytes(&self) -> usize {
+        self.writer.reserved_capacity_bytes()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_capture_record_depth_for_evidence(&self) -> usize {
+        self.writer.pending_record_depth_for_evidence()
+    }
+
+    pub(crate) fn reserved_capacity_bytes(&self) -> usize {
+        self.public_lane_reserved_capacity_bytes()
+            .saturating_add(self.capture_writer_reserved_capacity_bytes())
     }
 
     #[must_use]

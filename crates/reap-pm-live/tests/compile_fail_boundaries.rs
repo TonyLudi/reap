@@ -38,4 +38,8 @@ fn composition_boundaries_are_enforced_by_the_type_system() {
     tests.compile_fail("tests/ui/pm_mutation_authorities_cannot_be_forged.rs");
     tests.compile_fail("tests/ui/pm_mutation_authorities_are_take_once.rs");
     tests.compile_fail("tests/ui/product_has_no_live_mutation_authority.rs");
+    tests.compile_fail("tests/ui/product_has_no_mutable_capture_escape.rs");
+    tests.compile_fail("tests/ui/product_public_ingress_cannot_service_lane.rs");
+    tests.compile_fail("tests/ui/sealed_evidence_backend_is_internal.rs");
+    tests.compile_fail("tests/ui/fixed_evidence_runner_rejects_backend_selection.rs");
 }

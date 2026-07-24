@@ -8,11 +8,49 @@ impl PmOwnedOrderLifecycle {
             instrument,
             slots: [None; 2],
             entries: Vec::with_capacity(MAX_PM_OWNED_ORDER_HISTORY),
+            client_order_index: Vec::with_capacity(MAX_PM_OWNED_ORDER_HISTORY),
+            intent_index: Vec::with_capacity(MAX_PM_OWNED_ORDER_HISTORY),
             fills: Vec::with_capacity(MAX_PM_OWNED_FILL_KEYS),
             compacted_intent_high_watermark: None,
             current_epoch: None,
             counters: PmOwnedLifecycleCounters::default(),
         }
+    }
+
+    pub(crate) fn reserved_capacity_bytes(&self) -> usize {
+        std::mem::size_of_val(&self.slots)
+            .saturating_add(
+                self.entries
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<OwnedOrderEntry>()),
+            )
+            .saturating_add(
+                self.client_order_index
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u16>()),
+            )
+            .saturating_add(
+                self.intent_index
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u16>()),
+            )
+            .saturating_add(
+                self.fills
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<OwnedFillEntry>()),
+            )
+    }
+
+    pub(crate) fn order_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(crate) fn fill_key_count(&self) -> usize {
+        self.fills.len()
+    }
+
+    pub(crate) fn occupied_slot_count(&self) -> usize {
+        self.slots.iter().flatten().count()
     }
 
     pub fn validate_epoch(&self, epoch: ConnectionEpoch) -> Result<(), PmOwnedOrderLifecycleError> {
@@ -59,27 +97,32 @@ impl PmOwnedOrderLifecycle {
         &self,
         intent: PmOwnedQuoteIntent,
     ) -> Result<PmOwnedQuoteAdmission, PmOwnedOrderLifecycleError> {
+        self.prepare_admit_quote(intent).map(|plan| plan.outcome())
+    }
+
+    pub(crate) fn prepare_admit_quote(
+        &self,
+        intent: PmOwnedQuoteIntent,
+    ) -> Result<PmOwnedQuoteAdmissionPlan, PmOwnedOrderLifecycleError> {
         self.validate_intent_scope(intent)?;
-        if let Some(entry) = self
-            .entries
-            .iter()
-            .find(|entry| entry.intent.client_order() == intent.client_order())
-        {
-            return if entry.intent == intent {
-                Ok(PmOwnedQuoteAdmission::DuplicateIntent(
-                    intent.client_order(),
-                ))
-            } else {
-                Err(PmOwnedOrderLifecycleError::ClientIdentityConflict)
-            };
-        }
-        if self
-            .entries
-            .iter()
-            .any(|entry| entry.intent.intent() == intent.intent())
-        {
-            return Err(PmOwnedOrderLifecycleError::IntentIdentityConflict);
-        }
+        let client_position = match self.search_client(intent.client_order()) {
+            Ok((_, dense_index)) => {
+                let entry = self.entries[dense_index];
+                return if entry.intent == intent {
+                    Ok(PmOwnedQuoteAdmissionPlan::new(
+                        PmOwnedQuoteAdmission::DuplicateIntent(intent.client_order()),
+                        PmOwnedQuoteAdmissionAction::None,
+                    ))
+                } else {
+                    Err(PmOwnedOrderLifecycleError::ClientIdentityConflict)
+                };
+            }
+            Err(client_position) => client_position,
+        };
+        let intent_position = match self.search_intent(intent.intent()) {
+            Ok(_) => return Err(PmOwnedOrderLifecycleError::IntentIdentityConflict),
+            Err(intent_position) => intent_position,
+        };
         if self
             .compacted_intent_high_watermark
             .is_some_and(|high_watermark| intent.intent() <= high_watermark)
@@ -94,15 +137,79 @@ impl PmOwnedOrderLifecycle {
             let current = self.entries[current_index];
             if current.is_live() {
                 if same_quote(current.intent, intent) {
-                    return Ok(PmOwnedQuoteAdmission::DuplicateQuote(current_client));
+                    return Ok(PmOwnedQuoteAdmissionPlan::new(
+                        PmOwnedQuoteAdmission::DuplicateQuote(current_client),
+                        PmOwnedQuoteAdmissionAction::CountDuplicateQuote,
+                    ));
                 }
-                return self.preflight_cancel_before_replace(current_index);
+                let outcome = self.preflight_cancel_before_replace(current_index)?;
+                let action = if matches!(outcome, PmOwnedQuoteAdmission::CancelBeforeReplace(_)) {
+                    PmOwnedQuoteAdmissionAction::MarkCancelBeforeReplace {
+                        index: current_index,
+                    }
+                } else {
+                    PmOwnedQuoteAdmissionAction::None
+                };
+                return Ok(PmOwnedQuoteAdmissionPlan::new(outcome, action));
             }
         }
         if self.entries.len() == MAX_PM_OWNED_ORDER_HISTORY {
             return Err(PmOwnedOrderLifecycleError::OrderCapacity);
         }
-        Ok(PmOwnedQuoteAdmission::Admitted(intent.client_order()))
+        let client = intent.client_order();
+        Ok(PmOwnedQuoteAdmissionPlan::new(
+            PmOwnedQuoteAdmission::Admitted(client),
+            PmOwnedQuoteAdmissionAction::Insert {
+                client_position,
+                intent_position,
+                slot_index,
+                entry: OwnedOrderEntry {
+                    intent,
+                    venue_order: None,
+                    submit: PmOwnedSubmitState::Pending,
+                    status: None,
+                    cumulative_filled: U256::ZERO,
+                    known_fill_total: U256::ZERO,
+                    cancel: PmOwnedCancelState::None,
+                    reconciliation_required: false,
+                    compaction_generation: None,
+                    last_occurrence: None,
+                    last_progress: None,
+                },
+            },
+        ))
+    }
+
+    pub(crate) fn commit_preflighted_admit_quote(
+        &mut self,
+        plan: PmOwnedQuoteAdmissionPlan,
+    ) -> PmOwnedQuoteAdmission {
+        match plan.action {
+            PmOwnedQuoteAdmissionAction::None => {}
+            PmOwnedQuoteAdmissionAction::CountDuplicateQuote => {
+                self.counters.duplicate_quotes = self.counters.duplicate_quotes.saturating_add(1);
+            }
+            PmOwnedQuoteAdmissionAction::MarkCancelBeforeReplace { index } => {
+                debug_assert!(index < self.entries.len());
+                self.entries[index].cancel = PmOwnedCancelState::Pending;
+                self.counters.cancel_before_replace =
+                    self.counters.cancel_before_replace.saturating_add(1);
+            }
+            PmOwnedQuoteAdmissionAction::Insert {
+                client_position,
+                intent_position,
+                slot_index,
+                entry,
+            } => {
+                debug_assert!(self.entries.len() < MAX_PM_OWNED_ORDER_HISTORY);
+                debug_assert!(slot_index < self.slots.len());
+                let client = entry.intent.client_order();
+                self.insert_dense_order(client_position, intent_position, entry);
+                self.slots[slot_index] = Some(client);
+                self.counters.admissions = self.counters.admissions.saturating_add(1);
+            }
+        }
+        plan.outcome
     }
 
     pub fn admit_quote(
@@ -110,25 +217,22 @@ impl PmOwnedOrderLifecycle {
         intent: PmOwnedQuoteIntent,
     ) -> Result<PmOwnedQuoteAdmission, PmOwnedOrderLifecycleError> {
         self.validate_intent_scope(intent)?;
-        if let Some(entry) = self
-            .entries
-            .iter()
-            .find(|entry| entry.intent.client_order() == intent.client_order())
-        {
-            if entry.intent == intent {
-                return Ok(PmOwnedQuoteAdmission::DuplicateIntent(
-                    intent.client_order(),
-                ));
+        let client_position = match self.search_client(intent.client_order()) {
+            Ok((_, dense_index)) => {
+                let entry = self.entries[dense_index];
+                if entry.intent == intent {
+                    return Ok(PmOwnedQuoteAdmission::DuplicateIntent(
+                        intent.client_order(),
+                    ));
+                }
+                return self.fail(PmOwnedOrderLifecycleError::ClientIdentityConflict);
             }
-            return self.fail(PmOwnedOrderLifecycleError::ClientIdentityConflict);
-        }
-        if self
-            .entries
-            .iter()
-            .any(|entry| entry.intent.intent() == intent.intent())
-        {
-            return self.fail(PmOwnedOrderLifecycleError::IntentIdentityConflict);
-        }
+            Err(client_position) => client_position,
+        };
+        let intent_position = match self.search_intent(intent.intent()) {
+            Ok(_) => return self.fail(PmOwnedOrderLifecycleError::IntentIdentityConflict),
+            Err(intent_position) => intent_position,
+        };
         if self
             .compacted_intent_high_watermark
             .is_some_and(|high_watermark| intent.intent() <= high_watermark)
@@ -156,12 +260,9 @@ impl PmOwnedOrderLifecycle {
             return Err(PmOwnedOrderLifecycleError::OrderCapacity);
         }
         let client = intent.client_order();
-        let index = self
-            .entries
-            .binary_search_by_key(&client, |entry| entry.intent.client_order())
-            .unwrap_or_else(|index| index);
-        self.entries.insert(
-            index,
+        self.insert_dense_order(
+            client_position,
+            intent_position,
             OwnedOrderEntry {
                 intent,
                 venue_order: None,
@@ -171,6 +272,7 @@ impl PmOwnedOrderLifecycle {
                 known_fill_total: U256::ZERO,
                 cancel: PmOwnedCancelState::None,
                 reconciliation_required: false,
+                compaction_generation: None,
                 last_occurrence: None,
                 last_progress: None,
             },
@@ -784,9 +886,13 @@ impl PmOwnedOrderLifecycle {
         &mut self,
         client_order: PmClientOrderKey,
     ) -> Result<PmOwnedTerminalCompaction, PmOwnedOrderLifecycleError> {
-        let index = self
-            .find_client(client_order)
-            .ok_or(PmOwnedOrderLifecycleError::UnknownClientOrder)?;
+        let (canonical_position, index) = self
+            .search_client(client_order)
+            .map_err(|_| PmOwnedOrderLifecycleError::UnknownClientOrder)?;
+        let (intent_position, intent_index) = self
+            .search_intent(self.entries[index].intent.intent())
+            .expect("retained owned order remains indexed by intent");
+        debug_assert_eq!(intent_index, index);
         let entry = self.entries[index];
         if !entry.is_terminal()
             || entry.reconciliation_required
@@ -806,7 +912,8 @@ impl PmOwnedOrderLifecycle {
         if self.slots[slot] == Some(client_order) {
             self.slots[slot] = None;
         }
-        self.entries.remove(index);
+        let removed = self.swap_remove_dense_order(canonical_position, intent_position, index);
+        debug_assert_eq!(removed, entry);
         let prior_fill_count = self.fills.len();
         self.fills.retain(|fill| fill.client_order != client_order);
         let fill_keys_removed = prior_fill_count - self.fills.len();
@@ -822,6 +929,63 @@ impl PmOwnedOrderLifecycle {
             intent: entry.intent.intent(),
             fill_keys_removed,
         })
+    }
+
+    pub(crate) fn mark_compactable_through(
+        &mut self,
+        generation: u64,
+        through: PmPrivateOccurrence,
+    ) -> usize {
+        let mut marked = 0;
+        for entry in &mut self.entries {
+            if entry_compactable_through(*entry, through) {
+                entry.compaction_generation = Some(generation);
+                marked += 1;
+            }
+        }
+        marked
+    }
+
+    pub(crate) fn marked_compaction_clients(
+        &self,
+        generation: u64,
+    ) -> impl Iterator<Item = PmClientOrderKey> + '_ {
+        self.client_order_index
+            .iter()
+            .filter_map(move |dense_index| {
+                let entry = self.entries[usize::from(*dense_index)];
+                (entry.compaction_generation == Some(generation))
+                    .then_some(entry.intent.client_order())
+            })
+    }
+
+    pub(crate) fn first_marked_compaction_client(
+        &self,
+        generation: u64,
+    ) -> Option<PmClientOrderKey> {
+        self.marked_compaction_clients(generation).next()
+    }
+
+    pub(crate) fn clear_compaction_marks(&mut self, generation: u64) {
+        for entry in &mut self.entries {
+            if entry.compaction_generation == Some(generation) {
+                entry.compaction_generation = None;
+            }
+        }
+    }
+
+    pub(crate) fn clear_invalid_compaction_marks(
+        &mut self,
+        generation: u64,
+        through: PmPrivateOccurrence,
+    ) {
+        for entry in &mut self.entries {
+            if entry.compaction_generation == Some(generation)
+                && !entry_compactable_through(*entry, through)
+            {
+                entry.compaction_generation = None;
+            }
+        }
     }
 
     pub(crate) fn preflight_compact_proven_terminal(
@@ -850,10 +1014,9 @@ impl PmOwnedOrderLifecycle {
     }
 
     pub fn orders(&self) -> impl Iterator<Item = PmOwnedOrderProjection> + '_ {
-        self.entries
+        self.client_order_index
             .iter()
-            .copied()
-            .map(OwnedOrderEntry::projection)
+            .map(|dense_index| self.entries[usize::from(*dense_index)].projection())
     }
 
     #[must_use]
@@ -1064,12 +1227,6 @@ impl PmOwnedOrderLifecycle {
         Ok(())
     }
 
-    fn find_client(&self, client: PmClientOrderKey) -> Option<usize> {
-        self.entries
-            .binary_search_by_key(&client, |entry| entry.intent.client_order())
-            .ok()
-    }
-
     fn find_venue(&self, venue: PmVenueOrderKey) -> Option<usize> {
         self.entries
             .iter()
@@ -1087,6 +1244,24 @@ impl PmOwnedOrderLifecycle {
         self.counters.contract_violations = self.counters.contract_violations.saturating_add(1);
         Err(error)
     }
+}
+
+fn entry_compactable_through(entry: OwnedOrderEntry, through: PmPrivateOccurrence) -> bool {
+    let observed_after_cut = entry
+        .last_occurrence
+        .and_then(PmOwnedObservationOccurrence::private_occurrence)
+        .is_some_and(|occurrence| occurrence > through);
+    entry.is_terminal()
+        && !entry.reconciliation_required
+        && !observed_after_cut
+        && !matches!(
+            entry.submit,
+            PmOwnedSubmitState::Pending | PmOwnedSubmitState::Ambiguous
+        )
+        && !matches!(
+            entry.cancel,
+            PmOwnedCancelState::Pending | PmOwnedCancelState::Ambiguous
+        )
 }
 
 fn same_quote(left: PmOwnedQuoteIntent, right: PmOwnedQuoteIntent) -> bool {

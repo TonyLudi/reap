@@ -10,18 +10,23 @@ use reap_polymarket_adapter::{
     PmFakeCancelScript, PmFakePlaceScript, PmFixtureCompletionOccurrence, PmFixtureFeeEvidence,
 };
 
-use super::PmProduct;
+use super::{PmProduct, PmProductPublicIngress};
 use crate::capture::{PmCaptureProvenance, PmCaptureSessionPolicy};
 use crate::composition::{
-    PmPublicCapture, PmPublicCaptureOutcome, PmPublicCaptureRun, PmPublicCaptureRunError,
+    PmPublicAgedLaneEnactError, PmPublicAgedLaneFaultEnactment, PmPublicCapture,
+    PmPublicCaptureOutcome, PmPublicCaptureRun, PmPublicCaptureRunError,
 };
 use crate::coordinator::{
     PmControlReason, PmCoordinator, PmCoordinatorCounters, PmCoordinatorError, PmCoordinatorPolicy,
     PmCoordinatorShutdownError, PmCoordinatorStartError, PmFakeEffectMetrics, PmMutationCounters,
     PmMutationHalt, PmPersistenceMetrics, PmProductEffect, PmProductEffectMetrics,
+    PmRefreshObligationMetrics,
 };
 use crate::journal::PmJournalRecovery;
-use crate::lanes::{PmCompleteSchedulerMetrics, PmCompleteServiceCounts, PmTelemetryKind};
+use crate::lanes::{
+    PmCompleteSchedulerMetrics, PmCompleteServiceCounts, PmServiceTurnError, PmTelemetryKind,
+    SaturationAction,
+};
 use crate::private_monitor::{
     PmAccountFixtureInput, PmOpenOrdersFixtureInput, PmOrderDetailFixtureInput,
     PmReconciliationFixtureInput,
@@ -82,7 +87,7 @@ impl<M: PmQuoteModel> PmProduct<M> {
             model,
             private,
             fake_effect,
-            public,
+            Box::new(public),
             schedule,
             journal_path,
             coordinator_policy,
@@ -95,10 +100,33 @@ impl<M: PmQuoteModel> PmProduct<M> {
 
 /// Active, sole-owner PM product run.
 pub struct PmProductRun<M: PmQuoteModel> {
-    coordinator: PmCoordinator<M>,
+    coordinator: Box<PmCoordinator<M>>,
 }
 
 impl<M: PmQuoteModel> PmProductRun<M> {
+    #[cfg(test)]
+    pub(crate) fn phase6_reach_schedule_full(
+        &mut self,
+        observed_ns: u64,
+        decision_wall_timestamp_ms: u64,
+    ) -> Option<(usize, SaturationAction)> {
+        self.coordinator
+            .phase6_reach_schedule_full(observed_ns, decision_wall_timestamp_ms)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn phase6_enact_next_schedule_failure_with_observer_clock(
+        &mut self,
+        schedule_observed_ns: u64,
+        observer_service_ns: u64,
+    ) -> Option<SaturationAction> {
+        self.coordinator
+            .phase6_enact_next_schedule_failure_with_observer_clock(
+                schedule_observed_ns,
+                observer_service_ns,
+            )
+    }
+
     /// Borrows the sole capture/session/reducer owner used by the complete
     /// scheduler's public rank.
     #[must_use]
@@ -106,9 +134,13 @@ impl<M: PmQuoteModel> PmProductRun<M> {
         self.coordinator.public_capture()
     }
 
-    /// Mutably borrows that same sole owner for socket/capture ingress.
-    pub fn public_capture_mut(&mut self) -> &mut PmPublicCaptureRun {
-        self.coordinator.public_capture_mut()
+    /// Borrows only the socket/capture ingress capabilities of the sole
+    /// public owner.
+    ///
+    /// The returned handle cannot service or age the public lane. Those
+    /// operations remain exclusively owned by the complete product scheduler.
+    pub fn public_ingress(&mut self) -> PmProductPublicIngress<'_> {
+        PmProductPublicIngress::new(self.coordinator.public_capture_mut())
     }
 
     /// Admits one fixture-private connection occurrence. Source and
@@ -290,6 +322,35 @@ impl<M: PmQuoteModel> PmProductRun<M> {
             .map_err(PmProductRunError::service)
     }
 
+    /// Authenticates and enacts the exact public-age failure returned by this
+    /// product's complete scheduler.
+    ///
+    /// The consumed failure carries the private lane and route seals. A
+    /// sibling product cannot donate authority: rejection returns the same
+    /// move-only run error so the caller can retry it against the owning run.
+    pub async fn enact_public_lane_aged(
+        &mut self,
+        failure: PmProductRunError,
+        local_wall_now_ns: u64,
+        monotonic_now_ns: u64,
+    ) -> Result<PmPublicAgedLaneFaultEnactment, PmProductPublicAgedEnactError> {
+        let public_failure = match failure.failure {
+            PmProductRunFailure::Service(PmCoordinatorError::CompleteScheduler(
+                crate::lanes::PmCompleteServiceError::Public(failure @ PmServiceTurnError::Aged(_)),
+            )) => failure,
+            failure => {
+                return Err(PmProductPublicAgedEnactError::NotPublicAged {
+                    failure: PmProductRunError { failure },
+                });
+            }
+        };
+        self.coordinator
+            .public_capture_mut()
+            .enact_public_lane_aged(public_failure, local_wall_now_ns, monotonic_now_ns)
+            .await
+            .map_err(PmProductPublicAgedEnactError::from_capture)
+    }
+
     pub fn pop_effect(&mut self) -> Option<PmProductEffect> {
         self.coordinator.pop_effect()
     }
@@ -329,6 +390,23 @@ impl<M: PmQuoteModel> PmProductRun<M> {
         self.coordinator.product_effect_metrics()
     }
 
+    #[must_use]
+    pub fn refresh_obligation_metrics(&self) -> PmRefreshObligationMetrics {
+        self.coordinator.refresh_obligation_metrics()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn telemetry_overload_state(
+        &self,
+    ) -> crate::coordinator::PmTelemetryOverloadState {
+        self.coordinator.telemetry_overload_state()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked_quote_slots_for_test(&self) -> usize {
+        self.coordinator.tracked_quote_slots_for_test()
+    }
+
     pub fn scheduler_metrics(
         &mut self,
         monotonic_now_ns: u64,
@@ -345,7 +423,7 @@ impl<M: PmQuoteModel> PmProductRun<M> {
 
     #[must_use]
     pub fn reserved_capacity_bytes(&self) -> usize {
-        self.coordinator.reserved_capacity_bytes()
+        self.coordinator.boxed_reserved_capacity_bytes()
     }
 
     /// Shuts down both durable owners even if either one reports a failure.
@@ -448,6 +526,109 @@ impl PmProductRunError {
     fn shutdown(source: PmCoordinatorShutdownError) -> Self {
         Self {
             failure: PmProductRunFailure::Shutdown(source),
+        }
+    }
+
+    #[must_use]
+    pub const fn saturation_action(&self) -> Option<SaturationAction> {
+        match &self.failure {
+            PmProductRunFailure::Service(PmCoordinatorError::CompleteScheduler(error)) => {
+                error.action()
+            }
+            PmProductRunFailure::Service(_) | PmProductRunFailure::Shutdown(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmProductPublicAgedRetryReason {
+    TargetRunTerminal,
+    PendingBookFault,
+    PendingBookReduction,
+    FailureNotOwnedOrStale,
+}
+
+/// Product-level public-age enactment failure.
+///
+/// `NotPublicAged` and `Retryable` retain the exact move-only scheduler error.
+/// Call [`PmProductPublicAgedEnactError::into_run_failure`] to recover it.
+#[derive(Debug)]
+pub enum PmProductPublicAgedEnactError {
+    NotPublicAged {
+        failure: PmProductRunError,
+    },
+    Retryable {
+        reason: PmProductPublicAgedRetryReason,
+        failure: PmProductRunError,
+    },
+    Enact(PmPublicAgedLaneEnactError),
+}
+
+impl PmProductPublicAgedEnactError {
+    fn from_capture(error: PmPublicAgedLaneEnactError) -> Self {
+        let (reason, failure) = match error {
+            PmPublicAgedLaneEnactError::RunTerminal { failure } => {
+                (PmProductPublicAgedRetryReason::TargetRunTerminal, failure)
+            }
+            PmPublicAgedLaneEnactError::PendingBookFault { failure } => {
+                (PmProductPublicAgedRetryReason::PendingBookFault, failure)
+            }
+            PmPublicAgedLaneEnactError::PendingBookReduction { failure } => (
+                PmProductPublicAgedRetryReason::PendingBookReduction,
+                failure,
+            ),
+            PmPublicAgedLaneEnactError::InvalidFailure { failure } => (
+                PmProductPublicAgedRetryReason::FailureNotOwnedOrStale,
+                failure,
+            ),
+            error => return Self::Enact(error),
+        };
+        Self::Retryable {
+            reason,
+            failure: PmProductRunError::service(PmCoordinatorError::CompleteScheduler(
+                crate::lanes::PmCompleteServiceError::Public(failure),
+            )),
+        }
+    }
+
+    #[must_use]
+    pub const fn retry_reason(&self) -> Option<PmProductPublicAgedRetryReason> {
+        match self {
+            Self::Retryable { reason, .. } => Some(*reason),
+            Self::NotPublicAged { .. } | Self::Enact(_) => None,
+        }
+    }
+
+    pub fn into_run_failure(self) -> Option<PmProductRunError> {
+        match self {
+            Self::NotPublicAged { failure } | Self::Retryable { failure, .. } => Some(failure),
+            Self::Enact(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for PmProductPublicAgedEnactError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotPublicAged { .. } => {
+                formatter.write_str("product failure is not an evidenced public-lane age fault")
+            }
+            Self::Retryable { reason, .. } => {
+                write!(
+                    formatter,
+                    "public-lane age fault was not consumed and may be retried: {reason:?}"
+                )
+            }
+            Self::Enact(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for PmProductPublicAgedEnactError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::NotPublicAged { failure } | Self::Retryable { failure, .. } => Some(failure),
+            Self::Enact(source) => Some(source),
         }
     }
 }
