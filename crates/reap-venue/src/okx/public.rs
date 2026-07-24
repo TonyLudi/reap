@@ -211,8 +211,7 @@ impl OkxAdapter {
                     &data.ts,
                 )
                 .map_err(|error| Self::invalid(error.to_string()))?;
-                let symbol = fields.instrument().to_string();
-                let ts_ms = fields.venue_ts_ms();
+                let (symbol, index_price_lexeme, ts_ms) = fields.into_parts();
                 Ok(normalized_market_event(
                     envelope,
                     arg,
@@ -221,7 +220,7 @@ impl OkxAdapter {
                     MarketEvent::IndexPrice {
                         ts_ms,
                         symbol,
-                        price: parse_f64("idxPx", fields.index_price_lexeme())?,
+                        price: parse_f64("idxPx", &index_price_lexeme)?,
                     },
                 ))
             })

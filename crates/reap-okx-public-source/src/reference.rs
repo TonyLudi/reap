@@ -33,6 +33,11 @@ impl LegacyOkxIndexTickerFields {
     pub const fn venue_ts_ms(&self) -> u64 {
         self.venue_ts_ms
     }
+
+    #[must_use]
+    pub fn into_parts(self) -> (String, String, u64) {
+        (self.instrument, self.index_price_lexeme, self.venue_ts_ms)
+    }
 }
 
 /// Preserves the legacy adapter's `instId` fallback order and timestamp
