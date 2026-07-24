@@ -6,10 +6,11 @@ Status: in progress overall. Phase 0 is green at
 `7014a611f997e0bec8e86051d56f333d57776fc1`; Phase 3 is green at
 `dd54297aaa35600171904524a7b43adc3948a724`; Phase 4 is green at
 `6737653a2c8dd3211db35b6b7259edc5fab38360`; and Phase 5 is green at
-`22044267eb2f9b675471858c0488f1f89de102fa`. Phase 6 is stopped on the
-documented measurement-contract contradiction below. This ledger is
-architecture and deterministic local evidence, not authenticated-connectivity
-evidence or trading authorization.
+`22044267eb2f9b675471858c0488f1f89de102fa`. The Phase 6 stop was resolved on
+2026-07-24 when the goal owner selected amendment option 1; implementation and
+evidence are now in progress under the exact replacement contract below. This
+ledger is architecture and deterministic local evidence, not
+authenticated-connectivity evidence or trading authorization.
 
 The historical execution contract is the
 [Goal F prompt](multi-venue-polymarket-foundation-goal-f-prompt.md). The
@@ -45,7 +46,7 @@ deployed PM binary, target-host qualification, or production trading approval.
 | 3. PM public market data, integrity, capture, replay | Green | `dd54297aaa35600171904524a7b43adc3948a724` |
 | 4. Read-only private lifecycle and position monitor | Green | `6737653a2c8dd3211db35b6b7259edc5fab38360` |
 | 5. Passive quote lifecycle and fake execution | Green | `22044267eb2f9b675471858c0488f1f89de102fa` |
-| 6. PM coordinator, quote-model seam, local evidence | Stopped: contract amendment required | — |
+| 6. PM coordinator, quote-model seam, local evidence | In progress: amendment option 1 selected | — |
 | 7. Documentation, global verification, final audit | Pending | — |
 
 ## Phase 4 Private-Lifecycle Protocol And Fixture Provenance
@@ -783,11 +784,13 @@ cargo test -p reap-pm-live --test combined_replay --locked
 cargo bench -p reap-pm-live --bench pm_action_path --locked
 ```
 
-The boundary document predeclares the exact 100,000-observation nominal
-workload, 10,000 quote/5,000 cancel lifecycle, 35,000 journal records, fill and
-duplicate counts, zero state drops/saturations/steady-state allocations,
-64 MiB canonical+queue and 16 MiB replay bounds, exact per-lane high-water and
-age rules, and thirteen fresh-state overload cases totaling 27,309 attempts.
+The amended boundary document predeclares the exact 100,000-observation
+nominal workload, 10,000 quote/5,000 cancel lifecycle, ten authoritative
+watermark cuts, 35,010 journal records, 20,010 internal fact
+acknowledgements, 120,010 total owner reductions, fill and duplicate counts,
+zero state drops/saturations/steady-state allocations, 64 MiB canonical+queue
+and 16 MiB replay bounds, exact per-lane high-water and age rules, and thirteen
+fresh-state overload cases totaling 27,309 attempts.
 The local regression gates
 are p50 at most 25 microseconds and p99.9 at most 250 microseconds for every
 recorded normalized-event-to-prepared-effect run. This is same-host regression
@@ -2561,13 +2564,13 @@ Line counts and hashes use that stream with `wc -l` and `sha256sum`. Public,
 schema, production-path, content-manifest, and extent hashes use the unchanged
 Phase 0/2 commands recorded earlier in this handoff.
 
-## Phase 6: Documented Contract Stop Before Local Architecture Evidence
+## Phase 6: Resolved Contract Stop And Local Architecture Evidence
 
-Status: **STOPPED pending an explicit measurement-contract amendment** after
-the green Phase 5 gate. This is a source/contract proof, not a failed benchmark
-run. No Phase 6 replay result, benchmark result, counter, latency, allocation
-result, or hash has been fabricated. Phase 6 commit and gate fields remain
-**PENDING**.
+Status: the documented stop was **RESOLVED on 2026-07-24 by explicit selection
+of amendment option 1** after the green Phase 5 gate. The stop evidence below
+is retained as decision history. It was a source/contract proof, not a failed
+benchmark run. Phase 6 implementation, replay, benchmark, counter, latency,
+allocation, and hash fields remain **PENDING** until measured.
 
 ### Frozen requirements and reached product semantics
 
@@ -2650,6 +2653,73 @@ or define a separate active-writer segment and precise timing/accounting rule.
 It must not expose forgeable durable acknowledgement authority to product
 callers.
 
+### Selected option 1 and exact replacement contract
+
+The goal owner replied `1` on 2026-07-24. The normative boundary and execution
+prompt now record the following exact replacement contract:
+
+- the measured pass remains 10,000 alternating cancel-then-fill cycles and
+  100,000 external observations;
+- every fresh artifact contains one schema header and one untimed,
+  durably-acknowledged empty `None -> W0` setup cut before its cycles, so the
+  35,010 measured records occupy 35,012 physical lines;
+- each terminal order receives an exact order-detail-absent result rather than
+  an insufficient empty-open-orders snapshot, releasing its separate canonical
+  reservation;
+- each fill cycle contains its explicit private duplicate and then one paired
+  complete account plus one-row fill query, whose already-known row supplies
+  the second duplicate and restores complete private convergence;
+- for the first 499 fills of a block, the complete query returns the same
+  opaque cursor it requested; every 500th fill returns one different opaque
+  cursor, with equality carrying no ordering or compaction meaning;
+- exact totals are 10,000 quote paths, 5,000 cancel paths, 5,000 unique fills,
+  10,000 suppressed duplicate fill rows, 5,000 paired refresh
+  requests/responses, ten watermark advances, 35,010 measured mutation
+  records, 20,010 internal fact acknowledgements, 120,010 total owner
+  reductions, and 15,000 action spans;
+- every unique fill creates exactly one retained `FillObserved` ticket, one
+  admitted refresh effect, and one completion in that cycle; ticket high-water
+  is one with zero duplicate or superseded admissions;
+- quote and cancel-intent acknowledgements remain in the 100,000 external
+  observations; the 20,010 successful non-authority fact acknowledgements are
+  drained as bounded internal maintenance before the next external input;
+- each block's 1,000 terminal orders and 500 owned/canonical fill identities
+  compact only after the exact changed `FillWatermarkAdvanced` record is
+  durably acknowledged, never on enqueue, failure, an unchanged cursor, or a
+  partial/unpaired result;
+- five repeated passes use the same preallocated owner and a fixed rolling
+  evidence ledger and must return all cycle-terminal container lengths and
+  allocator-live bytes to the first terminal baseline;
+- one fixed opaque evidence runner may invoke a crate-private sealed
+  benchmark-only acknowledgement backend, but accepts no caller-supplied
+  record, sequence, scope, acknowledgement, prepared effect, schedule key, or
+  mutation authority;
+- `combined_replay` uses the real filesystem writer for one full nominal
+  artifact and compares two independent read-only recovery projections and
+  hashes; and
+- all thirteen overload rows and 27,309 attempts remain exact: nine reached
+  product rows contain 14,633 attempts, while refresh effects, raw-capture
+  entries, fake effects, and scheduled actions are explicitly labeled
+  crate-private mechanism-capacity evidence totaling 12,676 attempts.
+
+The complete parser execution segment is separate from the normalized owner
+path: 1,000 PM plus 1,000 OKX warm-up frames and 10,000 PM plus 10,000 OKX
+frames per recorded run. It uses the same canonical 20,000 values already
+represented in the 100,000-input mix and does not add logical observations.
+The active filesystem writer/recovery segment is likewise separate and
+untimed. Neither segment may be folded into the primary action latency or
+represented by the sealed acknowledgement backend.
+
+The discarded warm-up's cycle-only totals are 10,000 external observations,
+2,001 internal fact acknowledgements, 12,001 owner reductions, 3,501 mutation
+records, 500 unique fills, 1,000 suppressed duplicates, and one
+changed-cursor cut. Its header and setup watermark remain separately reported.
+
+The earlier stop discussion named the 5,000 `FillApplied` acknowledgements as
+the minimum contradiction. The comprehensive replacement count is 20,010
+because 10,000 place results, 5,000 fills, 5,000 cancel results, and ten
+watermark records are all non-intent facts with take-once durable receipts.
+
 ### Additional uncompleted coordinator semantics
 
 Read-only source review also found the following incomplete coordinator
@@ -2727,12 +2797,13 @@ declared `pm_action_path` target does not yet exist and was not run.
    late-fill deduplication proof. Label harness rows and acknowledgement spans
    as mechanism evidence rather than end-to-end reached-product evidence.
 
-No option is selected here. Implementation and measurement remain stopped
-until the goal owner amends the frozen contract explicitly.
+Option 1 was selected explicitly on 2026-07-24. The alternatives remain
+recorded only as decision history; implementation and measurement resumed
+under the exact replacement contract above.
 
 | Phase 6 stop/gate evidence | Value |
 | --- | --- |
-| Selected contract amendment | **PENDING** |
+| Selected contract amendment | **Option 1, selected 2026-07-24** |
 | Phase 6 implementation commit | **PENDING** |
 | `combined_replay` command/result/hash | **PENDING** |
 | `pm_action_path` command/result/runs | **PENDING** |

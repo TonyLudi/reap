@@ -1168,8 +1168,8 @@ recovery. Complete account/order/position snapshot payloads belong to the PM
 capture/replay schema, not the mutation journal. Restart begins snapshot
 readiness as unknown and requires a fresh complete reconciliation before
 quoting. A reconciled fill-ID eviction watermark is journaled only when it
-actually advances; the nominal benchmark advances none. The journal is
-backwards-readable from its first checked-in version.
+actually advances; the amended nominal benchmark below advances exactly ten
+times. The journal is backwards-readable from its first checked-in version.
 
 The existing Chaos `StorageRecord` and schema 7 bytes are unchanged.
 `reap-storage` retains its existing lease/public facade and legacy lock-file
@@ -1205,9 +1205,29 @@ into or used to hide owner-loop allocations.
 
 ### Nominal workload
 
+On 2026-07-24 the goal owner selected measurement-contract amendment option 1:
+bounded authoritative compaction cuts, separate reached-product and
+mechanism-capacity evidence, internal fact-acknowledgement accounting, and a
+sealed benchmark acknowledgement source. This section is the resulting
+normative contract and supersedes the original zero-watermark wording.
+
 Warm-up is 1,000 ten-observation cycles (10,000 observations). The measured
 pass is 10,000 ten-observation cycles (100,000 observations), alternating
-5,000 fill cycles and 5,000 cancel/replace cycles.
+5,000 cancel/replace cycles and 5,000 fill cycles, with the cancel cycle first.
+
+Every fresh warm-up or recorded artifact first writes its schema header and
+performs one untimed empty paired reconciliation from no cursor to `W0`. The
+`W0` watermark record is durably acknowledged before the first cycle. That
+setup observation, record, and fact acknowledgement are reported separately
+and excluded from every measured counter below. A fresh recorded artifact
+therefore contains 35,012 physical lines: one header, one `W0` setup record,
+and 35,010 measured records.
+
+The warm-up uses a fresh owner/artifact and is discarded before a recorded run.
+Its cycle-only totals are exactly 10,000 external observations, 2,001 internal
+fact acknowledgements, 12,001 owner reductions, 3,501 mutation records, 500
+unique fills, 1,000 suppressed duplicates, and one changed-cursor cut. Its
+header and `W0` setup row remain excluded from those totals.
 
 Every cycle includes:
 
@@ -1218,38 +1238,95 @@ Every cycle includes:
 4. durable quote-intent acknowledgement; and
 5. fake place acceptance.
 
-A fill cycle then includes one full fill, the same duplicate fill, one complete
-position snapshot, one complete empty-open-orders snapshot, and one freshness
-timer. A cancel cycle instead includes one replace timer, durable cancel-intent
-acknowledgement, fake cancel acceptance, one complete empty-open-orders
-snapshot, and one complete account snapshot.
+A fill cycle then includes one full private fill, the same private duplicate,
+one exact order-detail-absent result for that proven owned terminal order, one
+atomic paired complete account snapshot plus full-account fill query containing
+that exact fill, and one freshness timer. The query row is the second duplicate
+delivery for that fill and restores complete private convergence.
+
+A cancel cycle instead includes one replace timer, durable cancel-intent
+acknowledgement, fake cancel acceptance, one exact order-detail-absent result
+for that proven owned terminal order, and one freshness timer. Exact
+order-detail absence releases the separate canonical reservation; an
+empty-open-orders snapshot alone does not. The prior paired account/fill state
+remains converged through this terminal cancel path.
+
+All 5,000 fill cycles therefore contain one paired account/fill
+reconciliation.
+For the first 499 fills of each 1,000-cycle block, the complete one-row fill
+query returns the same opaque cursor it requested. The 500th fill returns one
+different opaque cursor and creates the block's authoritative compaction cut.
+Equality has only equality semantics: it neither invents cursor ordering nor
+grants compaction. There are exactly ten changed cursors, at overall cycles
+1,000, 2,000, ..., 10,000.
 
 The exact measured counters are:
 
 | Counter | Required |
 | --- | ---: |
 | Input observations | 100,000 |
-| Quote decisions / durable quote intents / fake place effects | 10,000 each |
-| Cancel decisions / durable cancel intents / fake cancel effects | 5,000 each |
-| Refresh/reconciliation requests | 5,000 |
-| PM journal records | 35,000 |
+| Quote decisions / durable quote intents / fake place commands | 10,000 each |
+| Copied quote projections: prepared / fixture-executed | 10,000 / 10,000 |
+| Cancel decisions / durable cancel intents / fake cancel commands | 5,000 each |
+| Copied cancel projections: prepared / fixture-executed | 5,000 / 5,000 |
+| `FillObserved` tickets inserted / admitted / effects / completed | 5,000 each |
+| Refresh-ticket high-water / duplicate-or-superseded admissions | 1 / 0 |
+| Paired account/fill reconciliations | 5,000 |
+| Authoritative changed-cursor cuts / watermark advances | 10 each |
+| PM journal records | 35,010 |
 | Unique fills applied | 5,000 |
-| Duplicate fills suppressed | 5,000 |
+| Duplicate fills suppressed | 10,000 |
 | Terminal filled orders | 5,000 |
 | Terminal cancelled orders | 5,000 |
+| Terminal orders compacted after durable watermark proof | 10,000 |
+| Owned and canonical fill IDs compacted after durable watermark proof | 5,000 each |
+| Successful internal fact acknowledgements | 20,010 |
+| Total coordinator reductions, including internal fact maintenance | 120,010 |
 | State-bearing drops | 0 |
 | Queue saturations | 0 |
 
-The 35,000 journal records derive exactly as follows:
+The 35,010 journal records derive exactly as follows:
 
 | Cycle | Count | Records per cycle | Total |
 | --- | ---: | --- | ---: |
 | Fill | 5,000 | quote intent, place acknowledgement, unique fill | 15,000 |
 | Cancel | 5,000 | quote intent, place acknowledgement, cancel intent, cancel acknowledgement | 20,000 |
+| Advancing fill cut | 10 | fill-watermark advance | 10 |
 
-Duplicate fills and complete snapshot inputs are captured/replayed but do not
-create mutation-journal records. No fill-eviction watermark advances in this
-workload.
+The 5,000 explicit repeated private fills and 5,000 already-known rows in the
+complete fill queries account for the 10,000 suppressed duplicates and create
+no second fill record. Each of the ten changed cursors creates exactly one
+`FillWatermarkAdvanced` record.
+
+Each unique fill inserts one canonical retained `FillObserved` refresh ticket.
+Exactly one copied refresh effect admits that ticket, and the same cycle's
+paired account/fill reconciliation completes it. Duplicate private or query
+rows insert and emit none. Nominal refresh-ticket high-water is one with zero
+deduplication, supersession, loss, or retry.
+
+Every non-intent mutation record has a move-only durable receipt. The 10,000
+place results, 5,000 unique fills, 5,000 cancel results, and ten watermark
+records therefore create exactly 20,010 successful fact acknowledgements.
+They are bounded internal maintenance, not caller observations and not part of
+the 100,000-input mix. Each is drained before the next external observation,
+so nominal persistence depth and high-water are exactly one. The 10,000 quote
+intent and 5,000 cancel-intent acknowledgements remain explicit observations
+inside the 100,000. Reports must state both 100,000-observation external
+throughput and 120,010-reduction total owner throughput.
+
+An advancing cut is not compaction authority until its exact watermark record
+is durably acknowledged. Before that acknowledgement, all 1,000 terminal
+orders and 500 fill identities accumulated in the block remain present. After
+it, the owner compacts exactly 1,000 owned lifecycle rows, 1,000 canonical
+order rows, 500 owned fill keys, and 500 canonical fill rows. The same cut and
+compaction rule is used by live state and journal recovery. Compaction on
+enqueue, writer failure, an unchanged cursor, a partial query, or an unpaired
+account/query result is forbidden. At every 1,000-cycle block boundary the
+retained owned-order, canonical-order, owned-fill-key, canonical-fill-row,
+quote-slot, pending-persistence, prepared-effect, pending/prepared-correlation,
+copied-output, schedule, and refresh-obligation lengths are zero. Their
+capacities do not change; monotonic identities, sequence numbers, counters,
+and compacted high-water scalars may advance.
 
 After construction and ingress parsing, normalized-event-to-record/effect
 owner-loop work must allocate zero heap calls and zero bytes. Preallocated
@@ -1263,16 +1340,48 @@ preallocation. It reports call/byte deltas for the timed owner path.
 queue, slab, schedule, and retained-ID allocation and must be at most 64 MiB.
 Replay runs from a fresh process/state and reports allocator peak-live minus
 post-construction live bytes, which must be at most 16 MiB. Five repeated
-nominal passes compare exact container capacities, lengths, retained IDs,
-orders, schedules, and allocator live bytes with the first reconciled-terminal
-baseline.
+nominal passes run through the same preallocated owner and sealed rolling
+benchmark ledger after one `W0` setup cut. They compare exact container
+capacities, block-terminal lengths, retained identities, orders, schedules,
+rolling logical projections, and allocator live bytes with the first
+reconciled-terminal baseline. The ledger retains only fixed counters and
+rolling hashes rather than storing an unbounded copy of every record.
+
+The primary benchmark may expose one fixed, opaque, read-only evidence runner
+to the Cargo bench target. It accepts no caller-supplied record, sequence,
+scope, acknowledgement, prepared effect, or mutation authority. Its
+acknowledgement backend is private to that fixed benchmark runner: it commits
+the exact record and sequence into a preallocated rolling ledger before
+minting the same move-only, FIFO, take-once receipt result. Production
+`PmProductRun`, normal composition, integration tests, and public callers
+cannot select that backend or construct an acknowledgement. Source-policy and
+compile-fail tests must prove this boundary.
+
+`combined_replay` constructs the full nominal workload once through the active
+filesystem writer, then performs two independent read-only recoveries and
+requires byte-identical logical projections and hashes. Serialization, flush,
+and `fsync` are untimed. Their results may not be used as primary action
+latency, and the sealed backend may not be used by this target or to claim
+filesystem durability.
+
+The parser segment is also separate: after an unrecorded warm-up of 1,000 PM
+book frames and 1,000 OKX reference frames, each recorded run normalizes
+exactly 10,000 canonical PM book frames and 10,000 canonical OKX reference
+frames through the real parsers. It reports its own counters, allocations,
+bytes, latency distribution, and canonical fixture/projection hash. These
+20,000 parser executions use the same canonical corpus as the 10,000 PM and
+10,000 OKX normalized values already present in the primary 100,000-observation
+mix; they do not add 20,000 logical inputs. They do not enter the shared
+8,192-entry live raw-capture artifact. Parser projections and hashes must match
+the corresponding owner-fed values exactly.
 
 Each nominal lane's high-water mark must remain at or below the exact ceiling
 in the lane table. Raw capture reports and enforces both entry and byte
 high-water. Each recorded run reports exact nearest-rank
 p50/p95/p99/p99.9/max latency, timer-read overhead, queue age, allocations,
-bytes, counters, total elapsed nanoseconds, and observations/second over all
-100,000 reductions. The 15,000 action-latency samples are correlation spans:
+bytes, counters, total elapsed nanoseconds, observations/second over the
+100,000 external observations, and reductions/second over all 120,010 owner
+reductions. The 15,000 action-latency samples are correlation spans:
 10,000 quote-evaluation receive times through durable quote ack to prepared
 fake-place enqueue, plus 5,000 replace-timer receive times through durable
 cancel ack to prepared fake-cancel enqueue. On the Phase 0 local host, every
@@ -1303,7 +1412,20 @@ Each case starts from fresh preallocated state:
 | Telemetry | 129 | 128 retained, one coalesced, zero readiness/recovery transition |
 
 The overload suite therefore makes exactly 27,309 attempts across thirteen
-fresh cases.
+fresh cases. The reached product path supplies 14,633 attempts: public
+integrity, private lifecycle, critical, persistence acknowledgements, complete
+snapshots, raw-capture bytes, oversize raw frame, storage, and telemetry. The
+four cardinalities that one configured account/instrument cannot reach remain
+exact fixed-capacity mechanism evidence totaling 12,676 attempts:
+reconciliation/refresh effects, raw-capture entries, fake effect, and
+scheduled actions.
+
+Those four mechanism cases may use only crate-private, test/bench-sealed typed
+preseeding. They may not add a public constructor, arbitrary product scope,
+prepared-effect injection, raw mutation handle, schedule-key authority, or
+runtime backend selector. Their output must be labeled mechanism-capacity
+evidence rather than reached end-to-end product evidence.
+
 Allowed state-bearing drops are zero. The only allowed coalescing count is the
 single telemetry item in its overload case. Every case remains within the same
 64 MiB bound, has no post-construction owner-loop allocations, and performs no

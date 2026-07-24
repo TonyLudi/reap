@@ -913,6 +913,54 @@ mutation constructor is reachable from the PM composition.
 
 ## Phase 6: PM Coordinator, Quote-Model Seam, And Local Architecture Evidence
 
+### Selected measurement-contract amendment
+
+On 2026-07-24 the goal owner explicitly selected the handoff's amendment
+option 1. Phase 6 is resumed under the amended normative contract in
+`docs/polymarket-product-connectivity-boundary.md`; the earlier
+zero-fill-watermark contract is superseded.
+
+The measured pass remains exactly 100,000 external observations and 10,000
+alternating cancel/fill cycles. Every terminal order receives exact
+order-detail absence so its canonical reservation is released. Every fill
+cycle then uses a paired complete account plus one-row fill query to restore
+private convergence before the next quote. One-row fill queries and explicit
+private repeats provide 10,000 suppressed duplicates. Only every 500th fill
+query changes its opaque cursor. The exact amended totals are ten authoritative
+watermark cuts, 35,010 measured PM journal records, 5,000 unique fills, 20,010
+successful internal fact acknowledgements, 120,010 total owner reductions,
+and the original 15,000 quote/cancel action spans. Fact acknowledgements are
+bounded internal maintenance outside the 100,000-observation input mix.
+Compaction occurs only after the corresponding changed-watermark record is
+durably acknowledged and must return block-terminal owned order/fill identity
+cardinality to baseline.
+
+Each fresh artifact first writes its header and performs one untimed,
+durably-acknowledged empty `None -> W0` setup cut. The measured 35,010 records
+exclude both setup lines; a fresh recorded artifact has 35,012 physical lines.
+Warm-up state and artifacts are discarded before recorded runs. Each unique
+fill owns one retained `FillObserved` refresh ticket, one admitted effect, and
+one completion; nominal refresh high-water is one with no duplicate or
+superseded ticket.
+
+The thirteen overload cases and 27,309 attempts remain exact. Nine
+product-reached rows total 14,633 attempts. The four unreachable cardinalities
+for refresh effects, raw-capture entries, fake effects, and scheduled actions
+total 12,676 attempts and are fixed crate-private mechanism-capacity evidence.
+They MUST NOT widen `PmProductRun` or expose arbitrary scope, identity,
+prepared-effect, record, acknowledgement, or schedule authority.
+
+The action benchmark may use a private sealed acknowledgement backend through
+one fixed opaque read-only evidence runner. The runner accepts no
+caller-supplied mutation material; normal composition and `PmProductRun`
+cannot select the backend. `combined_replay` MUST instead run one full nominal
+artifact through the real filesystem writer and compare two independent
+read-only recovery projections and hashes. Parser work uses the same 20,000
+PM/OKX values as the normalized workload in a separate execution segment; it
+does not add logical inputs. Real writer durability/recovery and parser work
+are never represented as part of the primary action latency. Source-policy and
+compile-fail tests MUST enforce that boundary.
+
 Compose the sibling PM product without changing the existing Chaos product.
 
 The coordinator owns:
