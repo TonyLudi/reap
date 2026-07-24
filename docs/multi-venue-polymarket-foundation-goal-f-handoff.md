@@ -6,10 +6,11 @@ Status: in progress overall. Phase 0 is green at
 `7014a611f997e0bec8e86051d56f333d57776fc1`; Phase 3 is green at
 `dd54297aaa35600171904524a7b43adc3948a724`; Phase 4 is green at
 `6737653a2c8dd3211db35b6b7259edc5fab38360`; and Phase 5 is green at
-`22044267eb2f9b675471858c0488f1f89de102fa`. The Phase 6 stop was resolved on
-2026-07-24 when the goal owner selected amendment option 1; implementation and
-evidence are now in progress under the exact replacement contract below. This
-ledger is architecture and deterministic local evidence, not
+`22044267eb2f9b675471858c0488f1f89de102fa`; and Phase 6 is green on acceptance
+tree `c76ccbd22cb4d25e121ac5bb3bc9b6dcd9e16f47`. Official PM replay/action
+evidence was recorded from `e11d51bfebe157b31d6f6d8ee8a8c4981f6c8768`;
+`c76ccbd` changes only the exact dependency-policy allowlist. Phase 7 remains
+pending. This ledger is architecture and deterministic local evidence, not
 authenticated-connectivity evidence or trading authorization.
 
 The historical execution contract is the
@@ -46,7 +47,7 @@ deployed PM binary, target-host qualification, or production trading approval.
 | 3. PM public market data, integrity, capture, replay | Green | `dd54297aaa35600171904524a7b43adc3948a724` |
 | 4. Read-only private lifecycle and position monitor | Green | `6737653a2c8dd3211db35b6b7259edc5fab38360` |
 | 5. Passive quote lifecycle and fake execution | Green | `22044267eb2f9b675471858c0488f1f89de102fa` |
-| 6. PM coordinator, quote-model seam, local evidence | In progress: amendment option 1 selected | — |
+| 6. PM coordinator, quote-model seam, local evidence | Green | `c76ccbd22cb4d25e121ac5bb3bc9b6dcd9e16f47` |
 | 7. Documentation, global verification, final audit | Pending | — |
 
 ## Phase 4 Private-Lifecycle Protocol And Fixture Provenance
@@ -209,7 +210,9 @@ Phase 0 found:
 - `reap-core` currently wildcard-exports f64 `Price`/`Quantity`, `String`
   `Symbol`, and `Venue::Okx`. Only common venue/source identity is eligible for
   a mechanical `Polymarket` addition; PM exact types live in `reap-pm-core`.
-- `Subscription` and `RawEnvelope` are useful untrusted edge carriers.
+- `Subscription` and `RawCapture` are useful common untrusted edge carriers.
+  `RawEnvelope`, `EventId`, and feed-stream identity remain legacy OKX-only
+  carriers behind checked narrowing from common `Venue`.
 - the current public `VenueAdapter` combines URL, parse, frame classification,
   and subscription serialization, so it must not become a universal PM
   adapter.
@@ -865,8 +868,9 @@ The old feed connection and partitioning paths reject
 `Venue::Polymarket` with typed `UnsupportedVenue` errors before OKX
 subscription serialization or task construction. They contain no PM DTO,
 configuration, session, or execution behavior. Golden tests prove the
-pre-existing OKX `Venue`, `Subscription`, `RawEnvelope`, and `SystemEvent`
-bytes are unchanged.
+pre-existing OKX encodings for common `Venue`, `Subscription`, and
+`SystemEvent`, plus the legacy OKX-only `RawEnvelope` and `EventId`, are
+unchanged.
 
 ### Pure PM domain
 
@@ -2566,17 +2570,15 @@ Phase 0/2 commands recorded earlier in this handoff.
 
 ## Phase 6: Resolved Contract Stop And Local Architecture Evidence
 
-Status: the documented stop was **RESOLVED on 2026-07-24 by explicit selection
-of amendment option 1** after the green Phase 5 gate. The stop evidence below
-is retained as decision history. It was a source/contract proof, not a failed
-benchmark run. Phase 6 now has an implementation checkpoint at
-`97be73004e71504622d0f3aac3132cd11abecbed`, but the phase gate remains
-**PENDING** until the full replay, recorded benchmark, counter, latency,
-allocation, and hash evidence is green.
+Status: **GREEN on 2026-07-24**. The documented stop was resolved by explicit
+selection of amendment option 1 after the green Phase 5 gate. The stop and
+initial-checkpoint evidence below is retained as decision history; it was a
+source/contract proof, not a failed benchmark run. The accepted implementation
+and evidence chain is recorded after that history.
 
-### Phase 6 implementation checkpoint
+### Historical Phase 6 implementation checkpoint
 
-The checkpoint implements the complete deterministic scheduler and lane
+The initial checkpoint implements the complete deterministic scheduler and lane
 policies, retained reconciliation and refresh obligations, durable
 watermark-gated compaction, restart/recovery behavior, bounded capture and
 persistence failure handling, dense preallocated PM order/lifecycle indexes,
@@ -2586,7 +2588,7 @@ harness; `reap-pm-state` remains a pure reducer crate. The transparent
 `System`-delegating counting allocator is evidence instrumentation only and is
 not installed, selected, or configurable by production composition.
 
-The exact checkpoint tree passed:
+That exact checkpoint tree passed:
 
 ```text
 cargo check -p reap-pm-live --all-targets --locked
@@ -2607,19 +2609,18 @@ cargo fmt --all -- --check
 git diff --check
 ```
 
-The thirteen-mechanism zero-allocation evidence passed six consecutive
-isolated invocations with the frozen 27,309 attempts. The last single-run
+At that checkpoint, the thirteen-mechanism zero-allocation evidence passed six
+consecutive isolated invocations with the frozen 27,309 attempts. The last single-run
 diagnostic before temporary component timers were removed reported action
 latency p50 `25.689 us` and p99.9 `81.926 us`; it is not acceptance evidence.
 The frozen p50 gate is at most `25 us`, so latency remains red by `0.689 us`
 even though the p99.9 gate of at most `250 us` has substantial margin. The
-required post-commit warm-up plus three recorded action runs, full
-`combined_replay` artifact/hash evidence, and global/Chaos gates have not yet
-run.
+then-required post-commit action, replay, and Chaos evidence had not yet run.
+Those historical pending items are resolved in the acceptance record below.
 
-### Frozen requirements and reached product semantics
+### Historical superseded frozen requirements
 
-The frozen nominal contract requires 100,000 product observations, 10,000
+The superseded nominal contract required 100,000 product observations, 10,000
 quote paths, 5,000 fill paths, 5,000 cancel paths, exactly 35,000 mutation
 journal records, 5,000 unique fills, 5,000 suppressed duplicate fills, zero
 drops/saturations, and **zero fill-watermark advances**. It also requires
@@ -2644,7 +2645,7 @@ not reachable through the least-authority product scope, and the nominal
 cardinality and acknowledgement requirements are not simultaneously defined
 well enough to implement or measure without inventing authority or evidence.
 
-### Why zero-watermark fill compaction is unsafe
+### Historical reason zero-watermark fill compaction was unsafe
 
 The current owner and journal recovery retain fill-bearing terminal orders and
 their structural fill keys until an authoritative full-account watermark
@@ -2661,7 +2662,7 @@ would invent venue ordering. Therefore a zero-watermark shortcut would violate
 the frozen deduplication/replay boundary and is not a safe implementation
 choice.
 
-### Frozen overload rows unreachable through the product boundary
+### Historical frozen overload rows unreachable through the product boundary
 
 | Frozen overload row | Required result | Reachability conflict |
 | --- | --- | --- |
@@ -2677,7 +2678,7 @@ be tested directly, but the frozen contract currently says the overload suite
 must remain within the same reached product path and does not authorize that
 split.
 
-### Fact-acknowledgement and `fsync` accounting ambiguities
+### Historical fact-acknowledgement and `fsync` accounting ambiguities
 
 Each of the nominal workload's 5,000 `FillApplied` records produces a
 successful non-authority fact receipt. Draining those receipts through the
@@ -2783,31 +2784,31 @@ the minimum contradiction. The comprehensive replacement count is 20,010
 because 10,000 place results, 5,000 fills, 5,000 cancel results, and ten
 watermark records are all non-intent facts with take-once durable receipts.
 
-### Additional uncompleted coordinator semantics
+### Historical coordinator findings resolved by the Phase 6 implementation
 
-Read-only source review also found the following incomplete coordinator
-semantics. These are findings to implement and prove with focused tests, not
-claims that a test currently demonstrates them:
+At the stopped tree, read-only source review also found the following
+incomplete coordinator semantics. The accepted Phase 6 implementation resolves
+them with focused tests; this list is retained as the original review record:
 
-- reconciliation-required state can currently be promoted into an
+- reconciliation-required state could be promoted into an
   irreversible coordinator halt;
-- recovered or reconciled live owned orders are absent from the lossy
+- recovered or reconciled live owned orders were absent from the lossy
   `tracked_quotes` scan used to derive safety cancels;
-- an ambiguous submit does not retain its required reconciliation request;
-- lane-specific overload policies can collapse into one global outcome, and an
-  aged private-lane obligation can starve a scheduled owned cancel;
-- mutable `public_capture` access exposes a service-path bypass while the
+- an ambiguous submit did not retain its required reconciliation request;
+- lane-specific overload policies could collapse into one global outcome, and
+  an aged private-lane obligation could starve a scheduled owned cancel;
+- mutable `public_capture` access exposed a service-path bypass while the
   corresponding aged-service authority remains opaque;
-- emitted refresh effects are copied observations rather than retained
+- emitted refresh effects were copied observations rather than retained
   obligations; and
-- stop controls do not establish an ordering that dispatches required owned
+- stop controls did not establish an ordering that dispatched required owned
   cancels before stopping.
 
-Each item is independently implementable after the measurement contract is
-amended. None is the basis of the Phase 6 stop condition documented above, and
-none authorizes widening the least-authority product boundary.
+The accepted implementation resolves each item without widening the
+least-authority product boundary. None was the basis of the original Phase 6
+stop condition documented above.
 
-### Evidence used
+### Evidence available at the original stop
 
 This stop was established by contract and source inspection:
 
@@ -2825,13 +2826,13 @@ rg --files crates/reap-pm-live | \
   rg '(^|/)(pm_action_path|combined_replay)(\.rs)?$'
 ```
 
-The existing focused package gates do not resolve these contract
-contradictions. The named `combined_replay` target passed its twelve existing
-Phase 3 capture/replay tests as part of the Phase 5 all-target gate, but it
-contains no Phase 6 nominal product workload or measurement counters. The
-declared `pm_action_path` target does not yet exist and was not run.
+At the stopped tree, the existing focused package gates did not resolve these
+contract contradictions. The named `combined_replay` target passed its twelve
+existing Phase 3 capture/replay tests as part of the Phase 5 all-target gate,
+but it contained no Phase 6 nominal product workload or measurement counters.
+The declared `pm_action_path` target did not yet exist and was not run.
 
-### Smallest safe amendment options
+### Historical amendment options
 
 1. **Permit bounded authoritative compaction cuts and split product from
    mechanism evidence.** Replace a fixed complete-snapshot observation at
@@ -2864,11 +2865,150 @@ Option 1 was selected explicitly on 2026-07-24. The alternatives remain
 recorded only as decision history; implementation and measurement resumed
 under the exact replacement contract above.
 
-| Phase 6 stop/gate evidence | Value |
+### Phase 6 accepted implementation chain
+
+The accepted Phase 6 tree separates semantics, architecture, performance, and
+policy bookkeeping:
+
+| Commit | Responsibility |
 | --- | --- |
-| Selected contract amendment | **Option 1, selected 2026-07-24** |
-| Phase 6 implementation commit | **CHECKPOINT** `97be73004e71504622d0f3aac3132cd11abecbed`; phase gate not claimed |
-| `combined_replay` command/result/hash | Target implemented; full post-commit run and hash evidence **PENDING** |
-| `pm_action_path` command/result/runs | Target implemented; required warm-up plus three recorded runs **PENDING** |
-| Allocation, memory, latency, and host/toolchain evidence | Thirteen-mechanism allocation evidence green; official action/replay reports **PENDING**; last non-gate p50 diagnostic red |
-| Final formatting, diff, source-policy, and structural gates | Checkpoint-local gates green; Phase 6 acceptance and final global gates **PENDING** |
+| `97be73004e71504622d0f3aac3132cd11abecbed` | Initial bounded coordinator checkpoint |
+| `a16cd319ea25b90e71581b26eba3562db1b2e520` | Bound nominal coordinator work |
+| `1d3e9817934dad8cf799429b7809871ed1949437` | Emit combined-replay evidence |
+| `4e2eaaad7cdf697a4c5c632be803629ed9405915` | Restore the legacy OKX-only feed and Chaos-risk boundary |
+| `29aefe3348a406da9b00154d61413722b11882ee` | Move already-owned legacy ticker identity without mixing the optimization into the architecture commit |
+| `e11d51bfebe157b31d6f6d8ee8a8c4981f6c8768` | Satisfy the strict PM lint gate without changing runtime allocation policy |
+| `c76ccbd22cb4d25e121ac5bb3bc9b6dcd9e16f47` | Pin the resulting exact fail-closed source-policy surface |
+
+The `OkxVenue` marker is zero-sized and preserves the original legacy debug,
+hash, and `"okx"` wire behavior. `RawEnvelope`, `EventId`, `FeedStreamId`, and
+Chaos feed/private-health keys are now statically OKX-only. Common
+`RawCapture` and `SystemEvent` values cross that boundary only through checked
+conversion; Polymarket capture is rejected and PM health cannot ready or
+mutate the Chaos risk gate. PM continues to use its own typed generic event
+envelopes and capture schema.
+
+### Stable PM acceptance evidence
+
+The official performance artifacts were built from `e11d51b` on a two-vCPU
+Arm Neoverse-N1 host running Linux `7.0.0-1004-aws`, Rust
+`1.95.0 (59807616e 2026-04-14)`, and LLVM `22.1.2`. The later `c76ccbd`
+acceptance-tree change modifies only a test allowlist.
+
+```text
+cargo test -p reap-pm-live --test combined_replay --locked
+  13 passed
+cargo bench -p reap-pm-live --bench pm_action_path --locked
+  one discarded warm-up plus three recorded runs
+```
+
+| Evidence | Accepted result |
+| --- | --- |
+| Real-writer artifact | 35,012 lines; 22,791,589 bytes; SHA-256 `83ced509c9ea180e66d957853f9ff7762ef3c0babc316c9251c12d4d1a5224eb` |
+| Independent recoveries | Byte-identical; both canonical SHA-256 `f98bf8a88f34fb6e3c4dcfd1919a2c1d4577b2da3960375e216e596d0746cd35` |
+| Recovery bound | 2,959,343 peak working bytes, below the 16-MiB limit; 35,012 records; last sequence 35,011; zero retained owned orders, fill keys, or unresolved orders |
+| Owner allocation/memory | Zero owner allocation calls and zero allocated bytes; 58,858,352 reserved bytes, below 64 MiB; all five repeated passes return every terminal cardinality to zero |
+| Determinism | Journal SHA-256 `389887a2d044867c6ad1f7b7b9ad52aa58c792864846fc42f220759fac111b85`; logical SHA-256 `4931af3e39ee291db82ba40da7a5e73473431801606565b5ad625c69beb70475` |
+| Parser corpus | Fixture SHA-256 `985332384ae2e7b2535c0fa2c214b40862997b0f80c450be87ac108fff9b550b`; projection SHA-256 `588e14caac0d5a38c94f9ee121b0238f084a4e2c57dbcd1c7f8f5f052210e885`; exact match to the owner corpus |
+| Nominal safety | Exact amended counters; zero drops and saturation; refresh, persistence, fake-effect, schedule, and serviced lane high-water at most one |
+| Authorization | `production_order_entry_authorized = false` in both evidence targets |
+
+The action-path latency rows, in nanoseconds, were:
+
+| Recorded run | p50 | p95 | p99 | p99.9 | max |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 22,909 | 42,173 | 53,660 | 75,625 | 123,091 |
+| 2 | 23,524 | 44,463 | 56,614 | 83,067 | 175,758 |
+| 3 | 23,467 | 43,995 | 55,302 | 73,943 | 158,003 |
+
+Every run is below the frozen 25,000-ns p50 and 250,000-ns p99.9 bounds. Each
+has 15,000 samples, the same exact logical and hash projections, five repeated
+terminal passes, zero owner allocations, zero drops/saturation, refresh
+high-water one, and `production_order_entry_authorized = false`. The measured
+pass retains exactly 100,000 external observations, 20,010 internal fact
+acknowledgements, 120,010 owner reductions, 35,010 mutation records, 15,000
+quote evaluations, 10,000 quote intents, 5,000 cancel intents, 5,000 unique
+fills, 10,000 suppressed duplicates, ten watermark advances, and the exact
+declared compactions. The overload suite reaches all thirteen rows and exactly
+27,309 attempts: 14,633 through nine product-reached rows and 12,676 through
+four sealed mechanism-capacity rows.
+
+### Post-Phase 6 Chaos regression
+
+The post-phase campaign ran one warm-up and three recorded runs from
+`29aefe3`:
+
+| Benchmark/component | Recorded median | Phase 0 median | Delta |
+| --- | ---: | ---: | ---: |
+| Engine event loop, ns/event | 11,827.0 | 11,783.5 | +0.37% |
+| Live wire parse/raw record, ns/unit | 2,923.5 | 2,948.6 | -0.85% |
+| Live dedup/sequence/book, ns/unit | 7,723.4 | 7,712.6 | +0.14% |
+| Live coordinator/strategy/risk/storage, ns/unit | 4,111.2 | 4,137.7 | -0.64% |
+| Complete live parity, ns/unit | 17,427.5 | 17,635.5 | -1.18% |
+
+Every engine run retained exactly 250,000 events and 999,996 intents. Every
+live run retained exactly 50,204 parsed frames, 70,208 feed outputs, 65,130
+records, and zero actions. Exact allocation calls/bytes were restored in every
+run: wire `1,673,504 / 158,570,992`; dedup
+`670,868 / 1,349,274,641`; coordinator `1,849,399 / 364,106,336`; and
+complete live parity `4,193,771 / 1,871,951,969`.
+
+The first action-path sample showed a noisy coordinator upper tail. The exact
+Phase 0 commit `8d6581270b82f39293ccdb0cbeaead42d717e81c` was therefore rebuilt with
+the same host/toolchain, followed by five warm recorded Phase 0 runs and five
+immediate warm recorded current runs. Final current p50/p99.9 deltas were:
+
+| Action workload | p50 delta | p99.9 delta |
+| --- | ---: | ---: |
+| Quote creation | -0.64% | -30.60% |
+| Quote replacement | -0.45% | -49.34% |
+| IOC hedge | -2.63% | -69.92% |
+| Risk rejection | -0.96% | -35.04% |
+| Symbol fail-close | +3.75% | -49.62% |
+| Global fail-close | +2.20% | +8.76% |
+| Coordinator reduction | -1.18% | -1.53% |
+| Raw recovery | +0.25% | -9.74% |
+| Trade reprice | -0.48% | +1.73% |
+| Bounded storm | 0.00% | 0.00% |
+
+Every action run preserved its exact logical counters. Exact allocation
+calls/bytes were quote `19,733,342 / 836,475,432`; replacement
+`16,600,000 / 773,500,000`; IOC `23,433,342 / 1,243,175,432`; risk
+`15,300,000 / 622,400,000`; symbol `1,300,000 / 46,000,000`; global
+`1,600,000 / 52,600,000`; coordinator `3,900,000 / 158,800,000`; raw
+`21,980,027 / 1,777,312,151`; trade `15,000,264 / 615,207,392`; and storm
+`0 / 0`. The explained same-host rerun leaves no median or supported tail
+regression above 10%; the worst remaining positive comparison is the global
+fail-close p99.9 at `+8.76%`.
+
+Raw evidence logs are retained under the ignored `target/tmp` paths beginning
+`goal-f-pm-{combined-replay,action}-e11d51b`,
+`goal-f-chaos-{event-loop,live-loop,action-path}-`, and
+`goal-f-chaos-action-path-{phase0-currenthost,currenthost-recheck}-`.
+
+### Phase 6 structural acceptance
+
+The final focused structural gates are green:
+
+```text
+cargo test -p reap-pm-state --locked
+  115 tests passed
+cargo test -p reap-pm-live --test dependency_policy --locked
+  13 passed
+cargo test -p reap-pm-live --test phase6_evidence_policy --locked
+  2 passed
+cargo test -p reap-pm-live --test compile_fail_boundaries --locked
+  harness green; all 41 UI cases passed
+cargo clippy -p reap-pm-state -p reap-pm-live --all-targets --locked -- -D warnings
+  green
+cargo fmt --all -- --check
+git diff --check
+  green
+```
+
+The first dependency-policy run on `e11d51b` correctly rejected newly added
+legacy fail-close occurrences that were not yet pinned. Test-only commit
+`c76ccbd` added only the exact `OkxVenue`, replay-rejection, and Chaos-risk
+rejection lines to the allowlist; the rerun passed 13/13. This is the accepted
+Phase 6 structural tree. Phase 7 documentation and final workspace gates
+remain pending.
