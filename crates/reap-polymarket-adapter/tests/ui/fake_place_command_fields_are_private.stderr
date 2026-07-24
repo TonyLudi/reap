@@ -1,0 +1,21 @@
+error[E0451]: fields `account_scope`, `instrument_scope`, `client_order`, `side`, `price`, `quantity`, `unsigned_order` and `profile` of struct `PmFakePlaceCommand` are private
+  --> tests/ui/fake_place_command_fields_are_private.rs:7:9
+   |
+ 6 |     let _ = PmFakePlaceCommand {
+   |             ------------------ in this type
+ 7 |         account_scope: todo::<PmAccountScope>(),
+   |         ^^^^^^^^^^^^^ private field
+ 8 |         instrument_scope: todo::<PmFixtureInstrumentScope>(),
+   |         ^^^^^^^^^^^^^^^^ private field
+ 9 |         client_order: todo::<PmClientOrderKey>(),
+   |         ^^^^^^^^^^^^ private field
+10 |         side: PmOrderSide::Buy,
+   |         ^^^^ private field
+11 |         price: todo::<PmPrice>(),
+   |         ^^^^^ private field
+12 |         quantity: todo::<PmQuantity>(),
+   |         ^^^^^^^^ private field
+13 |         unsigned_order: todo::<PmUnsignedClobV2Order>(),
+   |         ^^^^^^^^^^^^^^ private field
+14 |         profile: todo::<PmGtcPostOnlyProfile>(),
+   |         ^^^^^^^ private field

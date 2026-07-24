@@ -148,6 +148,7 @@ fn roots_construct_exact_connectivity_roles_and_product_schedule_binding() {
         config,
         FixtureModel(requirements),
         PmFakeExecutionProfile::goal_f(),
+        risk_limits(),
     )
     .unwrap();
 

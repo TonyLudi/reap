@@ -1,0 +1,95 @@
+error[E0599]: no method named `signer` found for reference `&PmProduct<M>` in the current scope
+ --> tests/ui/product_has_no_live_mutation_authority.rs:5:21
+  |
+5 |     let _ = product.signer();
+  |                     ^^^^^^ method not found in `&PmProduct<M>`
+
+error[E0599]: no method named `authenticated_http_session` found for reference `&PmProduct<M>` in the current scope
+ --> tests/ui/product_has_no_live_mutation_authority.rs:6:21
+  |
+6 |     let _ = product.authenticated_http_session();
+  |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `&PmProduct<M>`
+
+error[E0599]: no method named `authenticated_ws_session` found for reference `&PmProduct<M>` in the current scope
+ --> tests/ui/product_has_no_live_mutation_authority.rs:7:21
+  |
+7 |     let _ = product.authenticated_ws_session();
+  |                     ^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `&PmProduct<M>`
+
+error[E0599]: no method named `request_executor` found for reference `&PmProduct<M>` in the current scope
+ --> tests/ui/product_has_no_live_mutation_authority.rs:8:21
+  |
+8 |     let _ = product.request_executor();
+  |                     ^^^^^^^^^^^^^^^^ method not found in `&PmProduct<M>`
+
+error[E0599]: no method named `mutation_owner` found for reference `&PmProduct<M>` in the current scope
+ --> tests/ui/product_has_no_live_mutation_authority.rs:9:21
+  |
+9 |     let _ = product.mutation_owner();
+  |                     ^^^^^^^^^^^^^^
+  |
+help: there is a method `to_owned` with a similar name
+  |
+9 -     let _ = product.mutation_owner();
+9 +     let _ = product.to_owned();
+  |
+
+error[E0599]: no method named `quote_mutation_request` found for reference `&PmProduct<M>` in the current scope
+  --> tests/ui/product_has_no_live_mutation_authority.rs:10:21
+   |
+10 |     let _ = product.quote_mutation_request();
+   |                     ^^^^^^^^^^^^^^^^^^^^^^ method not found in `&PmProduct<M>`
+
+error[E0599]: no method named `cancel_mutation_request` found for reference `&PmProduct<M>` in the current scope
+  --> tests/ui/product_has_no_live_mutation_authority.rs:11:21
+   |
+11 |     let _ = product.cancel_mutation_request();
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^ method not found in `&PmProduct<M>`
+
+error[E0599]: no method named `signer` found for reference `&PmProductRun<M>` in the current scope
+  --> tests/ui/product_has_no_live_mutation_authority.rs:15:17
+   |
+15 |     let _ = run.signer();
+   |                 ^^^^^^ method not found in `&PmProductRun<M>`
+
+error[E0599]: no method named `authenticated_http_session` found for reference `&PmProductRun<M>` in the current scope
+  --> tests/ui/product_has_no_live_mutation_authority.rs:16:17
+   |
+16 |     let _ = run.authenticated_http_session();
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `&PmProductRun<M>`
+
+error[E0599]: no method named `authenticated_ws_session` found for reference `&PmProductRun<M>` in the current scope
+  --> tests/ui/product_has_no_live_mutation_authority.rs:17:17
+   |
+17 |     let _ = run.authenticated_ws_session();
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `&PmProductRun<M>`
+
+error[E0599]: no method named `request_executor` found for reference `&PmProductRun<M>` in the current scope
+  --> tests/ui/product_has_no_live_mutation_authority.rs:18:17
+   |
+18 |     let _ = run.request_executor();
+   |                 ^^^^^^^^^^^^^^^^ method not found in `&PmProductRun<M>`
+
+error[E0599]: no method named `mutation_owner` found for reference `&PmProductRun<M>` in the current scope
+  --> tests/ui/product_has_no_live_mutation_authority.rs:19:17
+   |
+19 |     let _ = run.mutation_owner();
+   |                 ^^^^^^^^^^^^^^
+   |
+help: there is a method `mutation_counters` with a similar name
+   |
+19 -     let _ = run.mutation_owner();
+19 +     let _ = run.mutation_counters();
+   |
+
+error[E0599]: no method named `quote_mutation_request` found for reference `&PmProductRun<M>` in the current scope
+  --> tests/ui/product_has_no_live_mutation_authority.rs:20:17
+   |
+20 |     let _ = run.quote_mutation_request();
+   |                 ^^^^^^^^^^^^^^^^^^^^^^ method not found in `&PmProductRun<M>`
+
+error[E0599]: no method named `cancel_mutation_request` found for reference `&PmProductRun<M>` in the current scope
+  --> tests/ui/product_has_no_live_mutation_authority.rs:21:17
+   |
+21 |     let _ = run.cancel_mutation_request();
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^ method not found in `&PmProductRun<M>`

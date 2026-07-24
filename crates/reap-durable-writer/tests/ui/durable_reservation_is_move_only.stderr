@@ -1,0 +1,5 @@
+error[E0599]: no method named `clone` found for struct `DurableReservation<Record>` in the current scope
+ --> tests/ui/durable_reservation_is_move_only.rs:4:30
+  |
+4 |     let _first = reservation.clone();
+  |                              ^^^^^ method not found in `DurableReservation<u8>`

@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 base64.workspace = true
 reap-capture-framing.workspace = true
+reap-durable-writer.workspace = true
 reap-okx-public-source.workspace = true
 reap-pm-core.workspace = true
 reap-pm-live-contracts.workspace = true

@@ -392,6 +392,105 @@ fn constructor_ownership_and_preallocated_lane_shape_are_pinned() {
 }
 
 #[test]
+fn pm_mutation_authority_remains_internal_and_composition_confined() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let library = std::fs::read_to_string(root.join("lib.rs")).unwrap();
+    let product = rust_module_source(&root, "composition/product");
+    let authority = std::fs::read_to_string(root.join("coordinator/authority.rs")).unwrap();
+
+    for hidden in [
+        "PmMutationOwner",
+        "PmQuoteMutationRequest",
+        "PmCancelMutationRequest",
+        "PmFakeEffectRole",
+        "PmFixtureOwnedExecution",
+        "PmFakePlaceCommand",
+        "PmFakeCancelCommand",
+    ] {
+        assert!(
+            !library.contains(hidden),
+            "crate root exports internal PM mutation authority {hidden}"
+        );
+    }
+
+    for forbidden in [
+        "AuthenticatedClient",
+        "AuthenticatedHttpSession",
+        "AuthenticatedWsSession",
+        "LiveSigner",
+        "RequestExecutor",
+        "arbitrary_request",
+        "pub signer:",
+        "pub authenticated_client:",
+        "pub authenticated_http_session:",
+        "pub authenticated_ws_session:",
+        "pub request_executor:",
+        "pub mutation:",
+        "pub fake_effect:",
+        "pub fn signer(",
+        "pub fn authenticated_http_session(",
+        "pub fn authenticated_ws_session(",
+        "pub fn request_executor(",
+        "pub fn mutation_owner(",
+        "pub fn quote_mutation_request(",
+        "pub fn cancel_mutation_request(",
+    ] {
+        assert!(
+            !product.contains(forbidden),
+            "PmProduct exposes forbidden live authority token {forbidden}"
+        );
+    }
+
+    for gate in [
+        "approve_pm_quote",
+        "prepare_pm_quote",
+        "consume_prepared_quote",
+        "approve_pm_cancel",
+        "prepare_pm_cancel",
+        "consume_prepared_cancel",
+    ] {
+        assert!(
+            authority.contains(&format!("pub(crate) fn {gate}")),
+            "PM mutation gate {gate} is no longer crate-confined"
+        );
+        assert!(
+            !authority.contains(&format!("pub fn {gate}")),
+            "PM mutation gate {gate} became publicly constructible"
+        );
+    }
+}
+
+#[test]
+fn integrated_product_run_embeds_the_sole_public_capture_owner() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let product = rust_module_source(&root, "composition/product");
+    let complete = std::fs::read_to_string(root.join("lanes/complete.rs")).unwrap();
+    let coordinator_service =
+        std::fs::read_to_string(root.join("coordinator/product/service.rs")).unwrap();
+
+    assert!(product.contains("pub async fn start("));
+    assert!(product.contains("PmCoordinator::start("));
+    assert!(product.contains("pub struct PmProductRun"));
+    assert!(
+        !product.contains("key: PmScheduledActionKey"),
+        "the public product Run must not accept caller-stamped account/instrument schedule scope"
+    );
+    assert!(product.contains("side: PmOrderSide"));
+    assert!(product.contains("kind: PmScheduledActionKind"));
+    assert!(
+        coordinator_service
+            .contains("PmScheduledActionKey::new(self.account_scope, self.instrument, side, kind)")
+    );
+    assert!(complete.contains("Capture(PmPublicCaptureRun)"));
+    assert!(complete.contains("run.service_lane_turn(monotonic_now_ns, consumer)"));
+    assert!(complete.contains("#[cfg(test)]\n    Bare(PmPublicLaneState)"));
+    assert!(
+        !complete.contains("pub(crate) fn new(public: PmPublicLaneState"),
+        "production complete scheduling must not accept a sibling bare public lane"
+    );
+}
+
+#[test]
 fn public_lane_requires_capability_specific_route_deliveries() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let routes = std::fs::read_to_string(root.join("public_routes.rs")).unwrap();

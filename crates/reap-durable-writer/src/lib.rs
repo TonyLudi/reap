@@ -5,7 +5,10 @@ mod lease;
 mod progress;
 mod writer;
 
-pub use bounded::{BoundedSink, DeliveryClass, EnqueueError, EnqueueOutcome};
+pub use bounded::{
+    BoundedSink, DeliveryClass, DurableAcknowledgement, DurableReceipt, DurableReceiptPoll,
+    DurableReservation, EnqueueError, EnqueueOutcome,
+};
 pub use lease::{DurableLease, LeaseError};
 pub use progress::WriterProgressSnapshot;
 pub use writer::{

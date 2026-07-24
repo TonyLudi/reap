@@ -1,0 +1,5 @@
+error[E0599]: no method named `clone` found for struct `DurableAcknowledgement` in the current scope
+ --> tests/ui/durable_acknowledgement_is_move_only.rs:4:34
+  |
+4 |     let _first = acknowledgement.clone();
+  |                                  ^^^^^ method not found in `DurableAcknowledgement`

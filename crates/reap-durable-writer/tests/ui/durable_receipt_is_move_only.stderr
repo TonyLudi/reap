@@ -1,0 +1,5 @@
+error[E0599]: no method named `clone` found for struct `DurableReceipt` in the current scope
+ --> tests/ui/durable_receipt_is_move_only.rs:4:26
+  |
+4 |     let _first = receipt.clone();
+  |                          ^^^^^ method not found in `DurableReceipt`

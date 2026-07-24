@@ -6,6 +6,7 @@ use super::{
     BoundedHeap, LaneItem, PmAgedDeliveryEvidence, PmLaneKind, PmLanePolicy, PmPublicInput,
     PmPublicLaneState, PmPublicUnavailable, PmServiceKey, PmServiceTurnError, ServicedLaneItem,
 };
+use crate::coordinator::PmBookDecisionProjection;
 use crate::public_routes::OkxPublicUnavailable;
 
 /// Reached Phase-3 public callbacks; no trait object or erased event payload.
@@ -22,7 +23,24 @@ pub trait PmPublicLaneService {
     fn on_okx_public_unavailable(&mut self, item: ServicedLaneItem<OkxPublicUnavailable>);
     fn on_market(&mut self, item: ServicedLaneItem<PmMarketEvent>);
     fn on_book(&mut self, item: ServicedLaneItem<PmBookEvent>);
+    /// Product consumers receive the copied post-reduction view emitted by
+    /// the sole canonical PM book owner. Phase-3 consumers retain their
+    /// original callback through this default forwarding implementation.
+    fn on_reduced_book(
+        &mut self,
+        item: ServicedLaneItem<PmBookEvent>,
+        _projection: PmBookDecisionProjection,
+    ) {
+        self.on_book(item);
+    }
     fn on_reference(&mut self, item: ServicedLaneItem<OkxReferenceEvent>);
+
+    /// Fail-closed product consumers may stop the current burst after the
+    /// exact callback that latched an error. Existing Phase-3 consumers keep
+    /// the original full-burst behavior.
+    fn stop_public_service_turn(&self) -> bool {
+        false
+    }
 }
 
 impl PmPublicLaneState {
@@ -181,8 +199,11 @@ fn service_public_lane<C: PmPublicLaneService>(
             PmPublicInput::Market(value) => {
                 consumer.on_market(map_serviced(key, connection, ordering, clock, value));
             }
-            PmPublicInput::Book(value) => {
-                consumer.on_book(map_serviced(key, connection, ordering, clock, value));
+            PmPublicInput::Book { event, projection } => {
+                consumer.on_reduced_book(
+                    map_serviced(key, connection, ordering, clock, event),
+                    projection,
+                );
             }
             PmPublicInput::Reference(value) => {
                 consumer.on_reference(map_serviced(key, connection, ordering, clock, value));
@@ -190,6 +211,9 @@ fn service_public_lane<C: PmPublicLaneService>(
         }
         public.consumer_transfer_in_flight = false;
         serviced += 1;
+        if consumer.stop_public_service_turn() {
+            break;
+        }
     }
     Ok(serviced)
 }

@@ -1,0 +1,20 @@
+warning: unreachable statement
+ --> tests/ui/unsigned_order_has_no_signature_method.rs:5:5
+  |
+4 |     let order: PmUnsignedClobV2Order = unreachable!();
+  |                                        -------------- any code following this expression is unreachable
+5 |     let _ = order.signature();
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^ unreachable statement
+  |
+  = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+error[E0599]: no method named `signature` found for struct `PmUnsignedClobV2Order` in the current scope
+ --> tests/ui/unsigned_order_has_no_signature_method.rs:5:19
+  |
+5 |     let _ = order.signature();
+  |                   ^^^^^^^^^
+  |
+help: there is a method `signature_type` with a similar name
+  |
+5 |     let _ = order.signature_type();
+  |                            +++++

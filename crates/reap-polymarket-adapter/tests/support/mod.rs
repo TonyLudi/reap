@@ -88,6 +88,10 @@ pub fn completion(
 }
 
 pub fn market_metadata() -> PmMarketMetadata {
+    market_metadata_with_lifecycle(PmMarketLifecycle::new(true, false, false, true, true))
+}
+
+pub fn market_metadata_with_lifecycle(lifecycle: PmMarketLifecycle) -> PmMarketMetadata {
     let chain = PmChainId::new(137).unwrap();
     let exchange = address(STANDARD_EXCHANGE);
     let collateral = PmAssetId::collateral(address(PUSD));
@@ -109,7 +113,7 @@ pub fn market_metadata() -> PmMarketMetadata {
         PmConditionId::parse(CONDITION).unwrap(),
         PmMarketId::parse(MARKET).unwrap(),
         PmOutcomeMetadata::new(token(), PmOutcomeLabel::new("Yes").unwrap()),
-        PmMarketLifecycle::new(true, false, false, true, true),
+        lifecycle,
         PmTick::parse_decimal("0.01").unwrap(),
         PmQuantity::parse_decimal("5").unwrap(),
         false,

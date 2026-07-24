@@ -4,6 +4,7 @@ mod account;
 mod book;
 mod fill_state;
 mod order_state;
+mod owned_lifecycle;
 mod private;
 mod private_config;
 mod private_ingress;
@@ -32,9 +33,22 @@ pub use order_state::{
     PmOrderApply, PmOrderCounters, PmOrderOwnership, PmOrderProjection, PmOrderStateError,
     PmOwnedOrderRegistration, PmRemoteOrderKnowledge, PmReservationBasis, PmReservationKnowledge,
 };
+pub use owned_lifecycle::{
+    MAX_PM_OWNED_FILL_KEYS, MAX_PM_OWNED_ORDER_HISTORY, PmOwnedCancelApply, PmOwnedCancelIntent,
+    PmOwnedCancelOutcome, PmOwnedCancelRequestApply, PmOwnedCancelState, PmOwnedFillApply,
+    PmOwnedFillObservation, PmOwnedFillProjection, PmOwnedIntentId, PmOwnedLifecycleCounters,
+    PmOwnedObservationOccurrence, PmOwnedObservationSource, PmOwnedOrderLifecycle,
+    PmOwnedOrderLifecycleError, PmOwnedOrderProgressObservation, PmOwnedOrderProjection,
+    PmOwnedProgressApply, PmOwnedQuoteAdmission, PmOwnedQuoteIntent, PmOwnedQuoteSlotKey,
+    PmOwnedQuoteSlotProjection, PmOwnedRecoveryFill, PmOwnedReductionSequence,
+    PmOwnedRemoteOrderApply, PmOwnedReplacementBlock, PmOwnedSubmitApply, PmOwnedSubmitResult,
+    PmOwnedSubmitState, PmOwnedTerminalCompaction,
+};
 pub use private::{
-    PmCancelOwnedIntent, PmCancelOwnedReason, PmPrivateState, PmPrivateStateError,
-    PmReconciliationApply,
+    PmCancelOwnedIntent, PmCancelOwnedReason, PmOwnedFillReduction, PmOwnedImmediateAckTicket,
+    PmOwnedOrderReduction, PmPrivateFillReduction, PmPrivateOrderReduction, PmPrivateState,
+    PmPrivateStateError, PmReconciliationApply, PmReconciliationFillDisposition,
+    PmReconciliationFillReduction, PmReconciliationReductions,
 };
 pub use private_config::{PmPrivateConfigError, PmPrivateStateConfig};
 pub use private_ingress::{

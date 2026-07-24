@@ -105,8 +105,14 @@ impl PmPublicCaptureRun {
         {
             return Err(PmPublicLaneAdmissionError::RouteScopeMismatch { delivery });
         }
+        let projection = crate::coordinator::PmBookDecisionProjection::from_reduced_owner(
+            &self.pm_reducer,
+            envelope.payload(),
+            ordering,
+            envelope.received_clock().monotonic_receive_ns(),
+        );
         let pending = PendingPmBookReduction::from_delivery(&delivery);
-        match self.public_lane.enqueue_pm_book(delivery) {
+        match self.public_lane.enqueue_pm_book(delivery, projection) {
             Ok(()) => Ok(()),
             Err(failure) => {
                 if failure.is_full() {

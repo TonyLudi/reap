@@ -1,0 +1,35 @@
+error[E0599]: no method named `clone` found for struct `ApprovedPmQuote` in the current scope
+ --> tests/ui/pm_mutation_authorities_are_not_cloneable.rs:7:23
+  |
+7 |     let _ = authority.clone();
+  |                       ^^^^^ method not found in `ApprovedPmQuote`
+
+error[E0599]: no method named `clone` found for struct `ReservedPmQuote` in the current scope
+  --> tests/ui/pm_mutation_authorities_are_not_cloneable.rs:11:23
+   |
+11 |     let _ = authority.clone();
+   |                       ^^^^^ method not found in `ReservedPmQuote`
+
+error[E0599]: no method named `clone` found for struct `PreparedPmQuote` in the current scope
+  --> tests/ui/pm_mutation_authorities_are_not_cloneable.rs:15:23
+   |
+15 |     let _ = authority.clone();
+   |                       ^^^^^ method not found in `PreparedPmQuote`
+
+error[E0599]: no method named `clone` found for struct `ApprovedPmCancel` in the current scope
+  --> tests/ui/pm_mutation_authorities_are_not_cloneable.rs:19:23
+   |
+19 |     let _ = authority.clone();
+   |                       ^^^^^ method not found in `ApprovedPmCancel`
+
+error[E0599]: no method named `clone` found for struct `ReservedPmCancel` in the current scope
+  --> tests/ui/pm_mutation_authorities_are_not_cloneable.rs:23:23
+   |
+23 |     let _ = authority.clone();
+   |                       ^^^^^ method not found in `ReservedPmCancel`
+
+error[E0599]: no method named `clone` found for struct `PreparedPmCancel` in the current scope
+  --> tests/ui/pm_mutation_authorities_are_not_cloneable.rs:27:23
+   |
+27 |     let _ = authority.clone();
+   |                       ^^^^^ method not found in `PreparedPmCancel`

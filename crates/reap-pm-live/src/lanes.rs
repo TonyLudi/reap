@@ -10,6 +10,7 @@ use reap_pm_core::{
 };
 use reap_transport::{DeliveryClockError, ImmutableDelivery};
 
+use crate::coordinator::PmBookDecisionProjection;
 use crate::public_routes::{
     OkxPublicReferenceDelivery, OkxPublicUnavailable, OkxPublicUnavailableDelivery,
     PmPublicBookDelivery, PmPublicMetadataDelivery, PmPublicRouteAuthorityId, PmPublicUnavailable,
@@ -17,12 +18,33 @@ use crate::public_routes::{
 };
 
 mod bounded;
+mod complete;
+mod complete_queue;
+mod complete_types;
 mod failure;
 mod policy;
 mod public;
 mod service;
 
 use bounded::{Admission, BoundedHeap};
+pub use complete::{
+    PmCompleteFailClosedMetrics, PmCompleteSchedulerMetrics, PmCompleteServiceCounts,
+};
+pub(crate) use complete::{PmCompleteInputLanes, PmCompleteLaneService, PmCompleteServiceError};
+pub use complete_queue::PmCompleteLaneMetrics;
+pub(crate) use complete_queue::{
+    PmCompleteLane, PmCompleteLaneAgeFault, PmCompleteLaneBuildError, PmCompleteLaneCheckError,
+    PmCompleteLaneEnqueueError,
+};
+pub(crate) use complete_types::{
+    PmCompleteIngress, PmCompleteInputSource, PmCompleteLaneItem, PmCompleteServiced,
+    PmCriticalInput, PmPersistenceCarrierError, PmPersistenceInput, PmPrivateInput,
+    PmReconciliationInput, PmScopedHalt, PmStopControl, PmTelemetryInput,
+};
+pub use complete_types::{
+    PmCompleteServiceKey, PmCompleteSourceKind, PmPairedReconciliationCut,
+    PmPairedReconciliationCutError, PmTelemetryKind,
+};
 pub use failure::{PmAgedDeliveryEvidence, PmPublicLaneEnqueueError, PmServiceTurnError};
 pub(crate) use failure::{PmAuthenticatedPublicLaneFailure, PmPublicAgedHead};
 use failure::{PmLaneAuthorityId, PmPublicRouteLaneEvidence};
@@ -31,6 +53,9 @@ pub use policy::{
 };
 pub(crate) use public::PmPublicLaneState;
 pub use service::PmPublicLaneService;
+
+#[cfg(test)]
+mod complete_tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PmIngressOrder {
@@ -306,7 +331,10 @@ enum PmPublicInput {
     PmUnavailable(PmPublicUnavailable),
     OkxUnavailable(OkxPublicUnavailable),
     Market(PmMarketEvent),
-    Book(PmBookEvent),
+    Book {
+        event: PmBookEvent,
+        projection: PmBookDecisionProjection,
+    },
     Reference(OkxReferenceEvent),
 }
 

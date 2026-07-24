@@ -48,20 +48,28 @@ pub(super) struct BoundedHeap<K, T> {
     coalesced: u64,
     invalidated_purged: u64,
     generation: u64,
+    reserved_capacity_bytes: usize,
 }
 
 impl<K: Copy + Eq + Hash + Ord, T> BoundedHeap<K, T> {
     pub(super) fn new(lane: PmLaneKind) -> Self {
         let policy = PmLanePolicy::for_lane(lane);
+        let heap = BinaryHeap::with_capacity(policy.capacity());
+        let keys = HashSet::with_capacity(policy.capacity());
+        let reserved_capacity_bytes = heap
+            .capacity()
+            .saturating_mul(std::mem::size_of::<HeapEntry<K, T>>())
+            .saturating_add(keys.capacity().saturating_mul(std::mem::size_of::<K>()));
         Self {
             policy,
-            heap: BinaryHeap::with_capacity(policy.capacity()),
-            keys: HashSet::with_capacity(policy.capacity()),
+            heap,
+            keys,
             high_water: 0,
             rejected_full: 0,
             coalesced: 0,
             invalidated_purged: 0,
             generation: 0,
+            reserved_capacity_bytes,
         }
     }
 
@@ -152,6 +160,10 @@ impl<K: Copy + Eq + Hash + Ord, T> BoundedHeap<K, T> {
             self.coalesced,
             self.invalidated_purged,
         )
+    }
+
+    pub(super) fn reserved_capacity_bytes(&self) -> usize {
+        self.reserved_capacity_bytes
     }
 }
 

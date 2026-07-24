@@ -16,6 +16,7 @@ mod raw;
 mod rest;
 mod scope;
 mod subscription;
+mod unsigned_order;
 mod ws;
 
 pub use error::PmWireError;
@@ -37,6 +38,10 @@ pub use rest::{
 };
 pub use scope::{PmBookParserConfig, PmWireScope};
 pub use subscription::PmMarketSubscription;
+pub use unsigned_order::{
+    PM_CLOB_V2_EMPTY_BYTES32, PM_CLOB_V2_EOA_SIGNATURE_TYPE, PmUnsignedClobV2Order,
+    PmUnsignedOrderError,
+};
 pub use ws::{
     PmBestBidAsk, PmBestPrices, PmBookSnapshot, PmExactBookLevel, PmExactPriceChange,
     PmIgnoredEvent, PmPriceChangeBatch, PmTickSizeChange, PmWsEvent, PmWsFrame, parse_ws_frame,

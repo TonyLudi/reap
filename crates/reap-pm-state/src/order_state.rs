@@ -372,7 +372,6 @@ impl OrderEntry {
     }
 }
 
-#[derive(Clone)]
 pub(crate) struct PmOrderState {
     entries: Vec<OrderEntry>,
     latest_snapshot_revision: Option<reap_pm_core::SnapshotRevision>,
@@ -425,6 +424,123 @@ impl PmOrderState {
         Ok(())
     }
 
+    pub(crate) fn preflight_register_owned(
+        &self,
+        registration: PmOwnedOrderRegistration,
+        config: &PmPrivateStateConfig,
+    ) -> Result<(), PmOrderStateError> {
+        validate_registration(registration, config)?;
+        let identity = PmOrderIdentity::new(Some(registration.client_order), None)
+            .expect("registration always carries a client key");
+        if let Some(index) = self.find(identity) {
+            let entry = self.entries[index];
+            if entry.ownership != OwnershipState::ProvenOwned || entry.event.is_some() {
+                return Err(PmOrderStateError::OwnershipRegisteredTooLate);
+            }
+            return if entry.reservation
+                == Some(PmReservationKnowledge::Known(registration.reservation))
+                && entry.registered_terms
+                    == Some((registration.side, registration.price, registration.quantity))
+            {
+                Ok(())
+            } else {
+                Err(PmOrderStateError::IdentityConflict)
+            };
+        }
+        if self.entries.len() == MAX_PM_PRIVATE_ORDERS {
+            Err(PmOrderStateError::Capacity)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn bind_owned_venue(
+        &mut self,
+        client_order: PmClientOrderKey,
+        venue_order: PmVenueOrderKey,
+        config: &PmPrivateStateConfig,
+    ) -> Result<(), PmOrderStateError> {
+        if client_order.account() != config.account() || venue_order.account() != config.account() {
+            return Err(PmOrderStateError::ScopeMismatch);
+        }
+        let identity = PmOrderIdentity::new(Some(client_order), Some(venue_order))
+            .expect("validated same-account owned identity");
+        match self.overlaps(identity)? {
+            OrderOverlap::None => return Err(PmOrderStateError::OwnershipRegisteredTooLate),
+            OrderOverlap::Bridge(first, second) => self.coalesce_entries(first, second)?,
+            OrderOverlap::One(_) => {}
+        }
+        let index = self
+            .find(identity)
+            .ok_or(PmOrderStateError::OwnershipRegisteredTooLate)?;
+        let entry = self.entries[index];
+        if entry.ownership != OwnershipState::ProvenOwned || entry.registered_terms.is_none() {
+            return Err(PmOrderStateError::OwnershipRegisteredTooLate);
+        }
+        ensure_identity_merge(entry.identity, identity)?;
+        self.entries[index].identity = merge_identity(entry.identity, identity);
+        self.entries.sort_by(compare_entries);
+        Ok(())
+    }
+
+    pub(crate) fn preflight_bind_owned_venue(
+        &self,
+        client_order: PmClientOrderKey,
+        venue_order: PmVenueOrderKey,
+        config: &PmPrivateStateConfig,
+    ) -> Result<(), PmOrderStateError> {
+        if client_order.account() != config.account() || venue_order.account() != config.account() {
+            return Err(PmOrderStateError::ScopeMismatch);
+        }
+        let identity = PmOrderIdentity::new(Some(client_order), Some(venue_order))
+            .expect("validated same-account owned identity");
+        let entry = match self.overlaps(identity)? {
+            OrderOverlap::None => return Err(PmOrderStateError::OwnershipRegisteredTooLate),
+            OrderOverlap::One(index) => self.entries[index],
+            OrderOverlap::Bridge(first, second) => {
+                merge_entries(self.entries[first], self.entries[second])?
+            }
+        };
+        if entry.ownership != OwnershipState::ProvenOwned || entry.registered_terms.is_none() {
+            return Err(PmOrderStateError::OwnershipRegisteredTooLate);
+        }
+        ensure_identity_merge(entry.identity, identity)
+    }
+
+    pub(crate) fn compact_proven_owned(
+        &mut self,
+        client_order: PmClientOrderKey,
+    ) -> Result<(), PmOrderStateError> {
+        let identity = PmOrderIdentity::new(Some(client_order), None)
+            .expect("client order is a complete structural identity");
+        let index = self
+            .find(identity)
+            .ok_or(PmOrderStateError::OwnershipRegisteredTooLate)?;
+        let entry = self.entries[index];
+        if entry.ownership != OwnershipState::ProvenOwned || entry.registered_terms.is_none() {
+            return Err(PmOrderStateError::OwnershipRegisteredTooLate);
+        }
+        self.entries.remove(index);
+        Ok(())
+    }
+
+    pub(crate) fn preflight_compact_proven_owned(
+        &self,
+        client_order: PmClientOrderKey,
+    ) -> Result<(), PmOrderStateError> {
+        let identity = PmOrderIdentity::new(Some(client_order), None)
+            .expect("client order is a complete structural identity");
+        let index = self
+            .find(identity)
+            .ok_or(PmOrderStateError::OwnershipRegisteredTooLate)?;
+        let entry = self.entries[index];
+        if entry.ownership != OwnershipState::ProvenOwned || entry.registered_terms.is_none() {
+            Err(PmOrderStateError::OwnershipRegisteredTooLate)
+        } else {
+            Ok(())
+        }
+    }
+
     pub(crate) fn observe(
         &mut self,
         envelope: EventEnvelope<PmOrderEvent>,
@@ -465,44 +581,59 @@ impl PmOrderState {
                 self.update_existing(index, event, occurrence, knowledge, reservation)
             }
             OrderOverlap::Bridge(first, second) => {
-                let mut candidate = self.clone();
-                candidate.coalesce_entries(first, second)?;
-                let index = candidate
+                let merged = merge_entries(self.entries[first], self.entries[second])?;
+                preflight_existing_update(merged, event, occurrence)?;
+                self.coalesce_entries(first, second)?;
+                let index = self
                     .find(event.order())
                     .expect("coalesced order retains the bridge identity");
-                let outcome =
-                    candidate.update_existing(index, event, occurrence, knowledge, reservation)?;
-                *self = candidate;
-                Ok(outcome)
+                self.update_existing(index, event, occurrence, knowledge, reservation)
             }
         }
     }
 
     pub(crate) fn apply_open_snapshot(
         &mut self,
-        envelope: EventEnvelope<PmCompleteOpenOrdersSnapshot>,
+        envelope: &EventEnvelope<PmCompleteOpenOrdersSnapshot>,
         reservations: &[PmOpenOrderReservation],
         config: &PmPrivateStateConfig,
     ) -> Result<PmOpenOrdersApply, PmOrderStateError> {
-        validate_open_snapshot(&envelope, reservations, config)?;
+        validate_open_snapshot(envelope, reservations, config)?;
         let snapshot = envelope.payload();
         let epoch = envelope.ordering().connection_epoch();
         if let Some(outcome) = self.snapshot_stale_or_duplicate(snapshot, epoch) {
             return Ok(outcome);
         }
-        let mut candidate = self.clone();
-        let outcome = candidate.apply_fresh_open_snapshot(&envelope, reservations, config);
-        match outcome {
-            Ok(outcome) => {
-                *self = candidate;
-                Ok(outcome)
+        self.preflight_fresh_open_snapshot(envelope, reservations, config)?;
+        self.apply_fresh_open_snapshot(envelope, reservations, config)
+    }
+
+    fn preflight_fresh_open_snapshot(
+        &mut self,
+        envelope: &EventEnvelope<PmCompleteOpenOrdersSnapshot>,
+        reservations: &[PmOpenOrderReservation],
+        config: &PmPrivateStateConfig,
+    ) -> Result<(), PmOrderStateError> {
+        let snapshot = envelope.payload();
+        let epoch = envelope.ordering().connection_epoch();
+        self.preflight_snapshot_capacity(snapshot)?;
+        let request = PmPrivateOccurrence::new(epoch, snapshot.boundary().request_sequence());
+        for event in snapshot.orders().iter().copied() {
+            let reservation = companion_knowledge(event, reservations);
+            validate_event(event, config.source(), config)?;
+            validate_reservation(event, reservation, config)?;
+            match self.overlaps(event.order())? {
+                OrderOverlap::None => {}
+                OrderOverlap::One(index) => {
+                    preflight_existing_update(self.entries[index], event, request)?;
+                }
+                OrderOverlap::Bridge(first, second) => {
+                    let merged = merge_entries(self.entries[first], self.entries[second])?;
+                    preflight_existing_update(merged, event, request)?;
+                }
             }
-            Err(PmOrderStateError::Capacity) => {
-                self.counters.capacity_failures = self.counters.capacity_failures.saturating_add(1);
-                Err(PmOrderStateError::Capacity)
-            }
-            Err(error) => Err(error),
         }
+        Ok(())
     }
 
     fn apply_fresh_open_snapshot(
@@ -933,6 +1064,35 @@ fn validate_registration(
         || registration.instrument != config.instrument()
     {
         return Err(PmOrderStateError::ScopeMismatch);
+    }
+    Ok(())
+}
+
+fn preflight_existing_update(
+    prior: OrderEntry,
+    event: PmOrderEvent,
+    occurrence: PmPrivateOccurrence,
+) -> Result<(), PmOrderStateError> {
+    if prior
+        .last_occurrence
+        .is_some_and(|prior_occurrence| occurrence < prior_occurrence)
+        || (prior.last_occurrence == Some(occurrence) && prior.event == Some(event))
+    {
+        return Ok(());
+    }
+    if prior.last_occurrence == Some(occurrence) {
+        return Err(PmOrderStateError::ObservationConflict);
+    }
+    ensure_identity_merge(prior.identity, event.order())?;
+    if let Some(previous) = prior.event {
+        validate_lifecycle(previous, event)?;
+    }
+    if let Some((side, price, quantity)) = prior.registered_terms
+        && (event.side() != side
+            || event.price() != price
+            || event.progress().original_quantity() != quantity)
+    {
+        return Err(PmOrderStateError::ObservationConflict);
     }
     Ok(())
 }

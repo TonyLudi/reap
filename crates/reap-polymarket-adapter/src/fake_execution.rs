@@ -1,14 +1,25 @@
-use reap_pm_core::{PmAccountHandle, PmAccountScope, PmInstrumentHandle};
+mod command;
+mod outcome;
+
+pub use command::{PmFakeCancelCommand, PmFakeOrderType, PmFakePlaceCommand};
+pub use outcome::{
+    MAX_PM_FAKE_ACK_FILL_LEGS, PmFakeAckImmediateFillLeg, PmFakeCancelOutcome,
+    PmFakeCancelRejectReason, PmFakeCancelResult, PmFakeCancelScript, PmFakeImmediateFill,
+    PmFakePlaceAck, PmFakePlaceOutcome, PmFakePlaceRejectReason, PmFakePlaceResult,
+    PmFakePlaceScript,
+};
+use reap_pm_core::{PmAccountHandle, PmAccountScope, PmInstrumentHandle, PmNumericError};
+use reap_polymarket_wire::PmUnsignedOrderError;
+use thiserror::Error;
 
 mod sealed {
     pub trait Sealed {}
 }
 
-/// In-process fake owned-execution capability marker.
+/// In-process fake owned-execution capability.
 ///
-/// Phase 2 intentionally provides no place/cancel method and no prepared
-/// command. Phase 5 adds the take-once prepared-value transition without
-/// widening this role to arbitrary commands.
+/// It is scoped to one exact account and instrument, and accepts only the
+/// fixed Goal F command shapes.
 pub trait PmOwnedExecutionRole: sealed::Sealed {
     type PlaceProfile;
     type CancelPurpose;
@@ -37,6 +48,26 @@ impl PmGtcPostOnlyProfile {
     #[must_use]
     pub(crate) const fn goal_f() -> Self {
         Self { private: () }
+    }
+
+    #[must_use]
+    pub const fn order_type(self) -> PmFakeOrderType {
+        PmFakeOrderType::Gtc
+    }
+
+    #[must_use]
+    pub const fn post_only(self) -> bool {
+        true
+    }
+
+    #[must_use]
+    pub const fn defer_exec(self) -> bool {
+        false
+    }
+
+    #[must_use]
+    pub const fn expiration(self) -> u64 {
+        0
     }
 }
 
@@ -114,4 +145,32 @@ impl PmOwnedExecutionRole for PmFixtureOwnedExecution {
     fn cancel_purpose(&self) -> Self::CancelPurpose {
         self.cancel_purpose
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum PmFakeExecutionError {
+    #[error("fake command account does not match the execution role")]
+    AccountMismatch,
+    #[error("fake command instrument does not match the execution role")]
+    InstrumentMismatch,
+    #[error("fake command account chain does not match market metadata")]
+    ChainMismatch,
+    #[error("fixed fake execution profile requires one EOA funder identity")]
+    EoaIdentityMismatch,
+    #[error("market lifecycle is not quote-ready")]
+    MarketNotReady,
+    #[error("fake acknowledgement venue order belongs to another account")]
+    VenueOrderAccountMismatch,
+    #[error("fake acknowledgement immediate-fill leg count exceeds its fixed bound")]
+    TooManyImmediateFillLegs,
+    #[error("fake acknowledgement repeats an immediate-fill identity")]
+    DuplicateImmediateFill,
+    #[error("fake acknowledgement immediate fill violates the order limit")]
+    ImmediateFillOutsideLimit,
+    #[error("fake acknowledgement immediate fills exceed the original order quantity")]
+    ImmediateFillExceedsOrder,
+    #[error(transparent)]
+    Numeric(#[from] PmNumericError),
+    #[error(transparent)]
+    UnsignedOrder(#[from] PmUnsignedOrderError),
 }

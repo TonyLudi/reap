@@ -36,6 +36,10 @@ impl PmPublicLaneState {
         self.consumer_transfer_in_flight
     }
 
+    pub(crate) fn reserved_capacity_bytes(&self) -> usize {
+        self.queue.reserved_capacity_bytes()
+    }
+
     /// Admits only configured, role-issued PM metadata.
     #[allow(
         clippy::result_large_err,
@@ -58,6 +62,7 @@ impl PmPublicLaneState {
     pub(crate) fn enqueue_pm_book(
         &mut self,
         delivery: PmPublicBookDelivery,
+        projection: PmBookDecisionProjection,
     ) -> Result<(), PmPublicLaneEnqueueError<PmPublicBookDelivery>> {
         let head = match delivery.envelope().payload().update() {
             PmBookUpdate::TickSizeChanged { old, new } => PmPublicAgedHead::PmTickSizeChanged {
@@ -71,7 +76,7 @@ impl PmPublicLaneState {
             head,
             PmPublicBookDelivery::into_parts,
             PmPublicBookDelivery::from_parts,
-            PmPublicInput::Book,
+            move |event| PmPublicInput::Book { event, projection },
         )
     }
 

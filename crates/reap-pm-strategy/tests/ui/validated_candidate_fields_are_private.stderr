@@ -1,0 +1,19 @@
+error[E0451]: fields `instrument`, `instrument_id`, `side`, `price`, `quantity`, `maker_amount` and `taker_amount` of struct `PmValidatedQuoteCandidate` are private
+  --> tests/ui/validated_candidate_fields_are_private.rs:6:9
+   |
+ 5 |     let _ = PmValidatedQuoteCandidate {
+   |             ------------------------- in this type
+ 6 |         instrument: todo::<PmInstrumentHandle>(),
+   |         ^^^^^^^^^^ private field
+ 7 |         instrument_id: todo::<PmInstrumentId>(),
+   |         ^^^^^^^^^^^^^ private field
+ 8 |         side: PmOrderSide::Buy,
+   |         ^^^^ private field
+ 9 |         price: todo::<PmPrice>(),
+   |         ^^^^^ private field
+10 |         quantity: todo::<PmQuantity>(),
+   |         ^^^^^^^^ private field
+11 |         maker_amount: U256::ONE,
+   |         ^^^^^^^^^^^^ private field
+12 |         taker_amount: U256::ONE,
+   |         ^^^^^^^^^^^^ private field

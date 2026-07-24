@@ -1,0 +1,107 @@
+error[E0382]: use of moved value: `authority`
+  --> tests/ui/pm_mutation_authorities_are_take_once.rs:10:13
+   |
+ 8 | fn approved_quote(authority: ApprovedPmQuote) {
+   |                   --------- move occurs because `authority` has type `ApprovedPmQuote`, which does not implement the `Copy` trait
+ 9 |     consume(authority);
+   |             --------- value moved here
+10 |     consume(authority);
+   |             ^^^^^^^^^ value used here after move
+   |
+note: consider changing this parameter type in function `consume` to borrow instead if owning the value isn't necessary
+  --> tests/ui/pm_mutation_authorities_are_take_once.rs:6:27
+   |
+ 6 | fn consume<T>(_authority: T) {}
+   |    -------                ^ this parameter takes ownership of the value
+   |    |
+   |    in this function
+
+error[E0382]: use of moved value: `authority`
+  --> tests/ui/pm_mutation_authorities_are_take_once.rs:15:13
+   |
+13 | fn reserved_quote(authority: ReservedPmQuote) {
+   |                   --------- move occurs because `authority` has type `ReservedPmQuote`, which does not implement the `Copy` trait
+14 |     consume(authority);
+   |             --------- value moved here
+15 |     consume(authority);
+   |             ^^^^^^^^^ value used here after move
+   |
+note: consider changing this parameter type in function `consume` to borrow instead if owning the value isn't necessary
+  --> tests/ui/pm_mutation_authorities_are_take_once.rs:6:27
+   |
+ 6 | fn consume<T>(_authority: T) {}
+   |    -------                ^ this parameter takes ownership of the value
+   |    |
+   |    in this function
+
+error[E0382]: use of moved value: `authority`
+  --> tests/ui/pm_mutation_authorities_are_take_once.rs:20:13
+   |
+18 | fn prepared_quote(authority: PreparedPmQuote) {
+   |                   --------- move occurs because `authority` has type `PreparedPmQuote`, which does not implement the `Copy` trait
+19 |     consume(authority);
+   |             --------- value moved here
+20 |     consume(authority);
+   |             ^^^^^^^^^ value used here after move
+   |
+note: consider changing this parameter type in function `consume` to borrow instead if owning the value isn't necessary
+  --> tests/ui/pm_mutation_authorities_are_take_once.rs:6:27
+   |
+ 6 | fn consume<T>(_authority: T) {}
+   |    -------                ^ this parameter takes ownership of the value
+   |    |
+   |    in this function
+
+error[E0382]: use of moved value: `authority`
+  --> tests/ui/pm_mutation_authorities_are_take_once.rs:25:13
+   |
+23 | fn approved_cancel(authority: ApprovedPmCancel) {
+   |                    --------- move occurs because `authority` has type `ApprovedPmCancel`, which does not implement the `Copy` trait
+24 |     consume(authority);
+   |             --------- value moved here
+25 |     consume(authority);
+   |             ^^^^^^^^^ value used here after move
+   |
+note: consider changing this parameter type in function `consume` to borrow instead if owning the value isn't necessary
+  --> tests/ui/pm_mutation_authorities_are_take_once.rs:6:27
+   |
+ 6 | fn consume<T>(_authority: T) {}
+   |    -------                ^ this parameter takes ownership of the value
+   |    |
+   |    in this function
+
+error[E0382]: use of moved value: `authority`
+  --> tests/ui/pm_mutation_authorities_are_take_once.rs:30:13
+   |
+28 | fn reserved_cancel(authority: ReservedPmCancel) {
+   |                    --------- move occurs because `authority` has type `ReservedPmCancel`, which does not implement the `Copy` trait
+29 |     consume(authority);
+   |             --------- value moved here
+30 |     consume(authority);
+   |             ^^^^^^^^^ value used here after move
+   |
+note: consider changing this parameter type in function `consume` to borrow instead if owning the value isn't necessary
+  --> tests/ui/pm_mutation_authorities_are_take_once.rs:6:27
+   |
+ 6 | fn consume<T>(_authority: T) {}
+   |    -------                ^ this parameter takes ownership of the value
+   |    |
+   |    in this function
+
+error[E0382]: use of moved value: `authority`
+  --> tests/ui/pm_mutation_authorities_are_take_once.rs:35:13
+   |
+33 | fn prepared_cancel(authority: PreparedPmCancel) {
+   |                    --------- move occurs because `authority` has type `PreparedPmCancel`, which does not implement the `Copy` trait
+34 |     consume(authority);
+   |             --------- value moved here
+35 |     consume(authority);
+   |             ^^^^^^^^^ value used here after move
+   |
+note: consider changing this parameter type in function `consume` to borrow instead if owning the value isn't necessary
+  --> tests/ui/pm_mutation_authorities_are_take_once.rs:6:27
+   |
+ 6 | fn consume<T>(_authority: T) {}
+   |    -------                ^ this parameter takes ownership of the value
+   |    |
+   |    in this function

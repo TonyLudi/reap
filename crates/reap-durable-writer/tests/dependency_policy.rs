@@ -4,6 +4,28 @@ use std::process::Command;
 
 use serde_json::Value;
 
+fn rust_item<'a>(source: &'a str, marker: &str) -> &'a str {
+    let start = source
+        .find(marker)
+        .expect("item marker must remain present");
+    let source = &source[start..];
+    let open = source.find('{').expect("item must have a body");
+    let mut depth = 0_usize;
+    for (offset, byte) in source.as_bytes()[open..].iter().copied().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &source[..=open + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("item body must be balanced");
+}
+
 #[test]
 fn durable_writer_is_schema_and_product_neutral() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -81,6 +103,31 @@ fn durable_writer_is_schema_and_product_neutral() {
                 !production_source.contains(forbidden),
                 "{} contains forbidden product/schema token {forbidden}",
                 path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn durable_reservation_commit_and_receipt_poll_never_block_the_caller() {
+    let source = include_str!("../src/bounded.rs");
+    for marker in [
+        "pub fn try_reserve_durable(",
+        "pub fn commit(self, record: Record) -> DurableReceipt",
+        "pub fn try_result(mut self) -> DurableReceiptPoll",
+    ] {
+        let item = rust_item(source, marker);
+        for forbidden in [
+            ".await",
+            "block_on(",
+            "spawn(",
+            "sleep(",
+            "reserve().",
+            "send().await",
+        ] {
+            assert!(
+                !item.contains(forbidden),
+                "{marker} must not contain blocking operation {forbidden}"
             );
         }
     }

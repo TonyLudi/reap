@@ -1,0 +1,21 @@
+error[E0451]: fields `salt`, `maker`, `signer`, `token_id`, `maker_amount`, `taker_amount`, `side` and `timestamp_ms` of struct `PmUnsignedClobV2Order` are private
+  --> tests/ui/unsigned_order_fields_are_private.rs:6:9
+   |
+ 5 |     let _ = PmUnsignedClobV2Order {
+   |             --------------------- in this type
+ 6 |         salt: todo::<PmOrderSalt>(),
+   |         ^^^^ private field
+ 7 |         maker: todo::<EvmAddress>(),
+   |         ^^^^^ private field
+ 8 |         signer: todo::<EvmAddress>(),
+   |         ^^^^^^ private field
+ 9 |         token_id: todo::<PmTokenId>(),
+   |         ^^^^^^^^ private field
+10 |         maker_amount: U256::ONE,
+   |         ^^^^^^^^^^^^ private field
+11 |         taker_amount: U256::ONE,
+   |         ^^^^^^^^^^^^ private field
+12 |         side: PmOrderSide::Buy,
+   |         ^^^^ private field
+13 |         timestamp_ms: 1,
+   |         ^^^^^^^^^^^^ private field

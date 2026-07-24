@@ -11,3 +11,4 @@ tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile = "3"
+trybuild.workspace = true

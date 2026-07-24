@@ -1,7 +1,10 @@
 use reap_pm_core::{
-    ConnectionEpoch, EnvelopeError, EventEnvelope, IngressSequence, PmAccountScope,
-    PmAggregateError, PmClientOrderKey, PmFillKey, PmFillQueryCursor, PmOrderEvent, PmOrderSide,
-    PmReconciliationRequestBoundary, PmSnapshotEvidence, PmSpenderId, PmVenueOrderKey,
+    ConnectionEpoch, EnvelopeError, EventClock, EventEnvelope, EventOrdering, IngressSequence,
+    PmAccountScope, PmAggregateError, PmClientOrderKey, PmCompleteAccountSnapshot,
+    PmCompleteFillQuery, PmCompleteOpenOrdersSnapshot, PmConnectionId, PmExactOrderDetail,
+    PmFillEvent, PmFillExecution, PmFillKey, PmFillQueryCursor, PmOrderEvent, PmOrderIdentity,
+    PmOrderSide, PmProductSource, PmReconciliationRequestBoundary, PmSnapshotEvidence, PmSpenderId,
+    PmVenueOrderKey, U256,
 };
 use reap_pm_live_contracts::{
     ConstructedRoleBinding, PmAccountConnectivityConfig, PmConnectionRoute, PmConnectivityPlan,
@@ -10,15 +13,20 @@ use reap_pm_live_contracts::{
 use reap_pm_state::{
     PmAccountCounters, PmAccountSnapshotApply, PmAccountSnapshotProjection, PmAllowanceKnowledge,
     PmExactReservation, PmFillApply, PmFillCounters, PmFillProjection, PmOpenOrderReservation,
-    PmOpenOrdersApply, PmOrderApply, PmOrderCounters, PmOrderProjection, PmPrivateConvergence,
-    PmPrivateExternalIngressCounters, PmPrivateExternalIngressFailure,
-    PmPrivateExternalIngressFault, PmPrivateExternalIngressLane, PmPrivateHaltReason,
-    PmPrivateQuoteRequest, PmPrivateReadiness, PmPrivateState, PmPrivateStateConfig,
-    PmPrivateStateError, PmProvisionalDeltas, PmReconciliationApply, PmRefreshCounters,
-    PmRefreshKey, PmRemoteOrderKnowledge, PmReservationKnowledge, PmRiskCounters, PmRiskLimits,
-    PmUnresolvedFillApply, PmUnresolvedFillCounters, PmUnresolvedFillKey,
-    PmUnresolvedFillObservation, PmUnresolvedFillProjection, PmUnresolvedFillReason,
-    PmUnresolvedFillStateError,
+    PmOpenOrdersApply, PmOrderApply, PmOrderCounters, PmOrderProjection, PmOwnedCancelApply,
+    PmOwnedCancelIntent, PmOwnedCancelOutcome, PmOwnedCancelRequestApply, PmOwnedFillApply,
+    PmOwnedImmediateAckTicket, PmOwnedOrderProgressObservation, PmOwnedOrderProjection,
+    PmOwnedProgressApply, PmOwnedQuoteAdmission, PmOwnedQuoteIntent, PmOwnedRecoveryFill,
+    PmOwnedReductionSequence, PmOwnedSubmitApply, PmOwnedSubmitResult, PmOwnedTerminalCompaction,
+    PmPrivateConvergence, PmPrivateExternalIngressCounters, PmPrivateExternalIngressFailure,
+    PmPrivateExternalIngressFault, PmPrivateExternalIngressLane, PmPrivateFillReduction,
+    PmPrivateHaltReason, PmPrivateOrderReduction, PmPrivateQuoteRequest, PmPrivateReadiness,
+    PmPrivateState, PmPrivateStateConfig, PmPrivateStateError, PmProvisionalDeltas,
+    PmReconciliationApply, PmReconciliationReductions, PmRefreshCounters, PmRefreshKey,
+    PmRemoteOrderKnowledge, PmReservationKnowledge, PmRiskCounters, PmRiskDecision,
+    PmRiskDependency, PmRiskLimits, PmUnresolvedFillApply, PmUnresolvedFillCounters,
+    PmUnresolvedFillKey, PmUnresolvedFillObservation, PmUnresolvedFillProjection,
+    PmUnresolvedFillReason, PmUnresolvedFillStateError,
 };
 use reap_polymarket_adapter::{
     PmAccountPositionRoleError, PmFixtureAccountPositionSnapshot, PmFixtureAllowanceRow,
@@ -31,6 +39,10 @@ use reap_polymarket_adapter::{
 use thiserror::Error;
 
 use crate::composition::PmCompositionError;
+
+mod product_fixture;
+
+pub(crate) use product_fixture::PmFixturePairedReconciliationDelivery;
 
 /// One validated request/completion cut for a fixture-only read.
 ///
@@ -348,12 +360,7 @@ impl PmReadOnlyMonitor {
             .account_config()
             .expect("monitor plan carries account config");
         let runtime = PmPrivateMonitorRuntime::new(config, risk_limits)?;
-        let bindings = monitor_bindings(
-            config,
-            &runtime.private,
-            &runtime.reconciliation,
-            &runtime.account,
-        )?;
+        let bindings = runtime.bindings(config)?;
         plan.validate_bindings(&bindings)?;
         Ok(Self {
             plan,
@@ -463,15 +470,38 @@ impl PmReadOnlyMonitor {
     }
 }
 
-struct PmPrivateMonitorRuntime {
+pub(crate) struct PmPrivateMonitorRuntime {
     private: PmFixturePrivateLifecycle,
     reconciliation: PmFixtureReconciliation,
     account: PmFixtureAccountPositionSnapshot,
     state: PmPrivateState,
+    open_order_reservation_scratch: Vec<PmOpenOrderReservation>,
+}
+
+/// Exact canonical result of one complete-scheduler private observation.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "canonical private reductions remain copy-only and allocation-free on the owner loop"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PmServicedPrivateReduction {
+    Order(PmPrivateOrderReduction),
+    Fill(PmPrivateFillReduction),
+    Unresolved(PmUnresolvedFillApply),
+}
+
+impl std::fmt::Debug for PmPrivateMonitorRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PmPrivateMonitorRuntime")
+            .field("account_scope", &self.account_scope())
+            .field("instrument", &self.instrument())
+            .finish_non_exhaustive()
+    }
 }
 
 impl PmPrivateMonitorRuntime {
-    fn new(
+    pub(crate) fn new(
         config: &PmAccountConnectivityConfig,
         risk_limits: PmRiskLimits,
     ) -> Result<Self, PmCompositionError> {
@@ -515,7 +545,337 @@ impl PmPrivateMonitorRuntime {
             reconciliation,
             account,
             state,
+            open_order_reservation_scratch: Vec::with_capacity(
+                reap_pm_core::MAX_PM_RECONCILIATION_ORDERS,
+            ),
         })
+    }
+
+    pub(crate) fn bindings(
+        &self,
+        config: &PmAccountConnectivityConfig,
+    ) -> Result<Vec<ConstructedRoleBinding>, PmPlanError> {
+        monitor_bindings(config, &self.private, &self.reconciliation, &self.account)
+    }
+
+    pub(crate) const fn account_scope(&self) -> PmAccountScope {
+        self.private.account_scope()
+    }
+
+    pub(crate) const fn instrument(&self) -> reap_pm_core::PmInstrumentHandle {
+        self.account.instrument()
+    }
+
+    pub(crate) const fn active_epoch(&self) -> Option<ConnectionEpoch> {
+        self.private.active_epoch()
+    }
+
+    pub(crate) fn owned_fill_event(
+        &self,
+        key: PmFillKey,
+        client_order: PmClientOrderKey,
+        execution: PmFillExecution,
+    ) -> Result<PmFillEvent, reap_pm_core::PmEventError> {
+        let order = PmOrderIdentity::new(Some(client_order), Some(key.venue_order()))?;
+        PmFillEvent::new(
+            self.state.source(),
+            self.state.instrument(),
+            key,
+            order,
+            execution,
+        )
+    }
+
+    pub(crate) fn issue_owned_immediate_ack_ticket(
+        &mut self,
+    ) -> Result<PmOwnedImmediateAckTicket, PmPrivateStateError> {
+        self.state.issue_owned_immediate_ack_ticket()
+    }
+
+    pub(crate) fn observe_owned_immediate_fill(
+        &mut self,
+        ticket: PmOwnedImmediateAckTicket,
+        event: PmFillEvent,
+        reported_cumulative: Option<U256>,
+    ) -> Result<PmOwnedFillApply, PmPrivateStateError> {
+        self.state
+            .observe_owned_immediate_fill(ticket, event, reported_cumulative)
+    }
+
+    pub(crate) fn quote_readiness(&self, request: PmPrivateQuoteRequest) -> PmPrivateReadiness {
+        self.state.quote_readiness(request)
+    }
+
+    pub(crate) fn evaluate_risk_candidate(
+        &mut self,
+        request: PmPrivateQuoteRequest,
+        reference: PmRiskDependency,
+        book: PmRiskDependency,
+    ) -> Result<PmRiskDecision, PmPrivateStateError> {
+        self.state.evaluate_risk_candidate(request, reference, book)
+    }
+
+    pub(crate) fn admit_owned_quote(
+        &mut self,
+        intent: PmOwnedQuoteIntent,
+    ) -> Result<PmOwnedQuoteAdmission, PmPrivateStateError> {
+        self.state.admit_owned_quote(intent)
+    }
+
+    pub(crate) fn apply_owned_submit_result(
+        &mut self,
+        client_order: PmClientOrderKey,
+        result: PmOwnedSubmitResult,
+    ) -> Result<PmOwnedSubmitApply, PmPrivateStateError> {
+        self.state.apply_owned_submit_result(client_order, result)
+    }
+
+    pub(crate) fn recover_owned_fill(
+        &mut self,
+        recovery: PmOwnedRecoveryFill,
+    ) -> Result<PmOwnedFillApply, PmPrivateStateError> {
+        self.state.recover_owned_fill(recovery)
+    }
+
+    pub(crate) fn recover_owned_progress(
+        &mut self,
+        observation: PmOwnedOrderProgressObservation,
+    ) -> Result<PmOwnedProgressApply, PmPrivateStateError> {
+        self.state.recover_owned_progress(observation)
+    }
+
+    pub(crate) fn finish_owned_recovery(
+        &mut self,
+        high_watermark: PmOwnedReductionSequence,
+    ) -> Result<(), PmPrivateStateError> {
+        self.state.finish_owned_recovery(high_watermark)
+    }
+
+    pub(crate) fn request_owned_cancel(
+        &mut self,
+        client_order: PmClientOrderKey,
+    ) -> Result<PmOwnedCancelRequestApply, PmPrivateStateError> {
+        self.state.request_owned_cancel(client_order)
+    }
+
+    pub(crate) fn apply_owned_cancel_result(
+        &mut self,
+        intent: PmOwnedCancelIntent,
+        outcome: PmOwnedCancelOutcome,
+    ) -> Result<PmOwnedCancelApply, PmPrivateStateError> {
+        self.state.apply_owned_cancel_result(intent, outcome)
+    }
+
+    pub(crate) fn compact_proven_owned_terminal(
+        &mut self,
+        client_order: PmClientOrderKey,
+    ) -> Result<PmOwnedTerminalCompaction, PmPrivateStateError> {
+        self.state.compact_proven_owned_terminal(client_order)
+    }
+
+    pub(crate) fn owned_order(
+        &self,
+        client_order: PmClientOrderKey,
+    ) -> Option<PmOwnedOrderProjection> {
+        self.state
+            .owned_orders()
+            .find(|order| order.client_order() == client_order)
+    }
+
+    pub(crate) fn reduce_serviced_connection_available(
+        &mut self,
+        source: PmProductSource,
+        connection: PmConnectionId,
+        connection_epoch: ConnectionEpoch,
+        monotonic_observed_ns: u64,
+    ) -> Result<(), PmPrivateMonitorError> {
+        if source != self.private.source() || connection != self.private.connection() {
+            return Err(PmPrivateMonitorError::DeliveryScopeMismatch);
+        }
+        if self.private.active_epoch() != Some(connection_epoch) {
+            return Err(PmPrivateMonitorError::PrivateEpochMismatch);
+        }
+        self.state
+            .validate_reconnect(connection_epoch, monotonic_observed_ns)?;
+        self.state
+            .observe_reconnect(connection_epoch, monotonic_observed_ns)?;
+        Ok(())
+    }
+
+    pub(crate) fn reduce_serviced_connection_unavailable(
+        &mut self,
+        source: PmProductSource,
+        connection: PmConnectionId,
+        fault: PmPrivateExternalIngressFault,
+    ) -> Result<(), PmPrivateMonitorError> {
+        if source != self.private.source() || connection != self.private.connection() {
+            return Err(PmPrivateMonitorError::DeliveryScopeMismatch);
+        }
+        self.state.record_external_ingress_fault(fault);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reduce_serviced_private_observation(
+        &mut self,
+        source: PmProductSource,
+        connection: PmConnectionId,
+        clock: EventClock,
+        ordering: EventOrdering,
+        observation: PmPrivateLifecycleObservation,
+    ) -> Result<PmServicedPrivateReduction, PmPrivateMonitorError> {
+        self.validate_serviced_account_scope(source, connection, ordering)?;
+        match observation {
+            PmPrivateLifecycleObservation::Order(order) => {
+                let knowledge = PmRemoteOrderKnowledge::Unmanaged(remote_reservation(order)?);
+                let envelope =
+                    EventEnvelope::new(source.venue(), source, connection, clock, ordering, order)?;
+                Ok(PmServicedPrivateReduction::Order(
+                    self.state.observe_order_reduction(envelope, knowledge)?,
+                ))
+            }
+            PmPrivateLifecycleObservation::Fill(fill) => {
+                let envelope =
+                    EventEnvelope::new(source.venue(), source, connection, clock, ordering, fill)?;
+                Ok(PmServicedPrivateReduction::Fill(
+                    self.state.observe_fill_reduction(envelope)?,
+                ))
+            }
+            PmPrivateLifecycleObservation::UnresolvedTrade(unresolved) => {
+                let observation = PmUnresolvedFillObservation::new(
+                    source,
+                    unresolved.account(),
+                    unresolved.instrument(),
+                    unresolved.fill_id(),
+                    unresolved.order(),
+                    unresolved.candidate_order(),
+                    unresolved_reason(unresolved.reason()),
+                    unresolved.settlement(),
+                )?;
+                let envelope = EventEnvelope::new(
+                    source.venue(),
+                    source,
+                    connection,
+                    clock,
+                    ordering,
+                    observation,
+                )?;
+                Ok(PmServicedPrivateReduction::Unresolved(
+                    self.state.observe_unresolved_fill(envelope)?,
+                ))
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reduce_serviced_open_orders(
+        &mut self,
+        source: PmProductSource,
+        connection: PmConnectionId,
+        clock: EventClock,
+        ordering: EventOrdering,
+        snapshot: PmCompleteOpenOrdersSnapshot,
+    ) -> Result<PmOpenOrdersApply, PmPrivateMonitorError> {
+        self.validate_serviced_account_scope(source, connection, ordering)?;
+        let envelope = EventEnvelope::new(
+            source.venue(),
+            source,
+            connection,
+            clock,
+            ordering,
+            snapshot,
+        )?;
+        open_order_reservations_into(
+            envelope.payload().orders(),
+            &mut self.open_order_reservation_scratch,
+        )?;
+        Ok(self
+            .state
+            .apply_open_orders_snapshot(envelope, &self.open_order_reservation_scratch)?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reduce_serviced_order_detail(
+        &mut self,
+        source: PmProductSource,
+        connection: PmConnectionId,
+        clock: EventClock,
+        ordering: EventOrdering,
+        detail: PmExactOrderDetail,
+    ) -> Result<PmOrderApply, PmPrivateMonitorError> {
+        self.validate_serviced_account_scope(source, connection, ordering)?;
+        let reservation = detail
+            .order()
+            .map(remote_reservation)
+            .transpose()?
+            .unwrap_or(PmReservationKnowledge::Unknown);
+        let envelope =
+            EventEnvelope::new(source.venue(), source, connection, clock, ordering, detail)?;
+        Ok(self.state.apply_order_detail(envelope, reservation)?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reduce_serviced_account_snapshot(
+        &mut self,
+        source: PmProductSource,
+        connection: PmConnectionId,
+        clock: EventClock,
+        ordering: EventOrdering,
+        snapshot: PmCompleteAccountSnapshot,
+    ) -> Result<PmAccountSnapshotApply, PmPrivateMonitorError> {
+        self.validate_serviced_account_scope(source, connection, ordering)?;
+        let envelope = EventEnvelope::new(
+            source.venue(),
+            source,
+            connection,
+            clock,
+            ordering,
+            snapshot,
+        )?;
+        Ok(self.state.apply_account_snapshot(envelope)?)
+    }
+
+    /// Reduces a paired, complete account-plus-fill cut through the sole
+    /// canonical private owner and exposes exact REST owned-fill consequences
+    /// in caller-owned bounded scratch.
+    pub(crate) fn reduce_serviced_reconciliation(
+        &mut self,
+        account: EventEnvelope<PmCompleteAccountSnapshot>,
+        fills: EventEnvelope<PmCompleteFillQuery>,
+        reductions: &mut PmReconciliationReductions,
+    ) -> Result<PmReconciliationApply, PmPrivateMonitorError> {
+        self.validate_serviced_account_scope(
+            account.source(),
+            account.connection_id(),
+            account.ordering(),
+        )?;
+        self.validate_serviced_account_scope(
+            fills.source(),
+            fills.connection_id(),
+            fills.ordering(),
+        )?;
+        Ok(self
+            .state
+            .apply_reconciliation_with_reductions(account, fills, reductions)?)
+    }
+
+    fn validate_serviced_account_scope(
+        &self,
+        source: PmProductSource,
+        connection: PmConnectionId,
+        ordering: EventOrdering,
+    ) -> Result<(), PmPrivateMonitorError> {
+        if source != self.private.source()
+            || connection != self.private.connection()
+            || ordering.connection_epoch()
+                != self
+                    .private
+                    .active_epoch()
+                    .ok_or(PmPrivateMonitorError::PrivateEpochMismatch)?
+        {
+            return Err(PmPrivateMonitorError::DeliveryScopeMismatch);
+        }
+        Ok(())
     }
 
     fn reconnect_private(
@@ -607,12 +967,13 @@ impl PmPrivateMonitorRuntime {
         let expected_account = self.reconciliation.account_scope();
         let expected_instrument = self.reconciliation.instrument_scope();
         let state = &mut self.state;
+        let reservations = &mut self.open_order_reservation_scratch;
         match self
             .reconciliation
             .reduce_open_orders_delivery(serviced, |scope, envelope| {
                 validate_scope(scope, expected_account, expected_instrument)?;
-                let reservations = open_order_reservations(envelope.payload().orders())?;
-                Ok(state.apply_open_orders_snapshot(envelope, &reservations)?)
+                open_order_reservations_into(envelope.payload().orders(), reservations)?;
+                Ok(state.apply_open_orders_snapshot(envelope, reservations)?)
             }) {
             Ok(result) => result,
             Err(_) => Err(PmPrivateMonitorError::ReconciliationDeliveryOwnerMismatch),
@@ -873,7 +1234,7 @@ fn reduce_private_observation(
     Ok(())
 }
 
-fn validate_private_batch(
+pub(crate) fn validate_private_batch(
     observations: &[PmPrivateLifecycleObservation],
 ) -> Result<(), PmPrivateMonitorError> {
     let mut client_orders = Vec::<PmClientOrderKey>::with_capacity(observations.len());
@@ -922,22 +1283,25 @@ fn has_adjacent_duplicate<T: Eq>(values: &[T]) -> bool {
     values.windows(2).any(|pair| pair[0] == pair[1])
 }
 
-fn open_order_reservations(
+fn open_order_reservations_into(
     orders: &[PmOrderEvent],
-) -> Result<Vec<PmOpenOrderReservation>, PmPrivateMonitorError> {
-    orders
-        .iter()
-        .map(|order| {
-            let venue_order = order
-                .order()
-                .venue_order_key()
-                .ok_or(PmPrivateMonitorError::OpenOrderMissingVenueIdentity)?;
-            Ok(PmOpenOrderReservation::new(
-                venue_order,
-                remote_reservation(*order)?,
-            ))
-        })
-        .collect()
+    reservations: &mut Vec<PmOpenOrderReservation>,
+) -> Result<(), PmPrivateMonitorError> {
+    reservations.clear();
+    if orders.len() > reservations.capacity() {
+        return Err(PmPrivateMonitorError::BatchCounterOverflow);
+    }
+    for order in orders {
+        let venue_order = order
+            .order()
+            .venue_order_key()
+            .ok_or(PmPrivateMonitorError::OpenOrderMissingVenueIdentity)?;
+        reservations.push(PmOpenOrderReservation::new(
+            venue_order,
+            remote_reservation(*order)?,
+        ));
+    }
+    Ok(())
 }
 
 fn remote_reservation(

@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use reap_pm_core::{
     EventEnvelope, PmAssetId, PmCompleteFillQuery, PmFillEvent, PmFillExecution, PmFillFee,
     PmFillKey, PmFillQueryCursor, PmFillSettlementStatus, PmOrderSide, PmSign, PmSignedUnits, U256,
@@ -5,6 +7,7 @@ use reap_pm_core::{
 };
 use thiserror::Error;
 
+use crate::PmOwnedObservationOccurrence;
 use crate::private_config::PmPrivateStateConfig;
 use crate::private_occurrence::PmPrivateOccurrence;
 
@@ -27,8 +30,8 @@ pub enum PmFillFeeState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PmFillProjection {
     key: PmFillKey,
-    first_occurrence: PmPrivateOccurrence,
-    last_occurrence: PmPrivateOccurrence,
+    first_occurrence: PmOwnedObservationOccurrence,
+    last_occurrence: PmOwnedObservationOccurrence,
     covered_by_reconciliation: Option<PmPrivateOccurrence>,
     fee: PmFillFeeState,
     settlement: PmFillSettlementStatus,
@@ -41,12 +44,12 @@ impl PmFillProjection {
     }
 
     #[must_use]
-    pub const fn first_occurrence(self) -> PmPrivateOccurrence {
+    pub const fn first_occurrence(self) -> PmOwnedObservationOccurrence {
         self.first_occurrence
     }
 
     #[must_use]
-    pub const fn last_occurrence(self) -> PmPrivateOccurrence {
+    pub const fn last_occurrence(self) -> PmOwnedObservationOccurrence {
         self.last_occurrence
     }
 
@@ -186,6 +189,8 @@ pub enum PmFillStateError {
     Capacity,
     #[error("fill-query envelope revision differs from aggregate revision")]
     EnvelopeRevisionMismatch,
+    #[error("owner occurrence differs from the exact envelope or acknowledgement evidence")]
+    OccurrenceEvidenceMismatch,
     #[error("fill-query envelope ingress differs from reconciliation completion")]
     CompletionSequenceMismatch,
     #[error("fill query does not continue from the exact prior opaque watermark")]
@@ -197,8 +202,8 @@ pub enum PmFillStateError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FillEntry {
     event: PmFillEvent,
-    first_occurrence: PmPrivateOccurrence,
-    last_occurrence: PmPrivateOccurrence,
+    first_occurrence: PmOwnedObservationOccurrence,
+    last_occurrence: PmOwnedObservationOccurrence,
     covered_by_reconciliation: Option<PmPrivateOccurrence>,
     fee: PmFillFeeState,
     covered_fee: Option<PmFillFeeState>,
@@ -219,8 +224,11 @@ impl FillEntry {
     }
 
     fn needs_reconciliation(self) -> bool {
-        self.covered_by_reconciliation
-            .is_none_or(|covered| self.last_occurrence > covered)
+        self.covered_by_reconciliation.is_none_or(|covered| {
+            self.last_occurrence
+                .private_occurrence()
+                .is_none_or(|private| private > covered)
+        })
     }
 
     fn fee_needs_reconciliation(self) -> bool {
@@ -257,15 +265,50 @@ impl PmFillState {
     pub(crate) fn observe(
         &mut self,
         envelope: EventEnvelope<PmFillEvent>,
+        occurrence: PmOwnedObservationOccurrence,
         config: &PmPrivateStateConfig,
     ) -> Result<PmFillApply, PmFillStateError> {
         let event = *envelope.payload();
         validate_fill(event, envelope.source(), config)?;
-        let occurrence = PmPrivateOccurrence::new(
+        let expected_private = PmPrivateOccurrence::new(
             envelope.ordering().connection_epoch(),
             envelope.ordering().local_ingress_sequence(),
         );
+        if occurrence.private_occurrence() != Some(expected_private)
+            || occurrence.snapshot_revision() != envelope.ordering().snapshot_revision()
+        {
+            return Err(PmFillStateError::OccurrenceEvidenceMismatch);
+        }
         self.observed_monotonic_ns = Some(envelope.clock().monotonic_service_ns());
+        match self.search(event.fill_key()) {
+            Ok(index) => self.enrich(index, event, occurrence, config),
+            Err(index) => self.insert_observed(index, event, occurrence, config),
+        }
+    }
+
+    pub(crate) fn observe_owned_immediate(
+        &mut self,
+        event: PmFillEvent,
+        occurrence: PmOwnedObservationOccurrence,
+        config: &PmPrivateStateConfig,
+    ) -> Result<PmFillApply, PmFillStateError> {
+        if occurrence.private_occurrence().is_some() || occurrence.snapshot_revision().is_some() {
+            return Err(PmFillStateError::OccurrenceEvidenceMismatch);
+        }
+        validate_fill(event, event.source(), config)?;
+        match self.search(event.fill_key()) {
+            Ok(index) => self.enrich(index, event, occurrence, config),
+            Err(index) => self.insert_observed(index, event, occurrence, config),
+        }
+    }
+
+    pub(crate) fn observe_owned_recovery(
+        &mut self,
+        event: PmFillEvent,
+        occurrence: PmOwnedObservationOccurrence,
+        config: &PmPrivateStateConfig,
+    ) -> Result<PmFillApply, PmFillStateError> {
+        validate_fill(event, event.source(), config)?;
         match self.search(event.fill_key()) {
             Ok(index) => self.enrich(index, event, occurrence, config),
             Err(index) => self.insert_observed(index, event, occurrence, config),
@@ -304,7 +347,7 @@ impl PmFillState {
             if let Ok(index) = self.search(fill.fill_key()) {
                 let entry = self.entries[index];
                 validate_same_principal(entry.event, fill)?;
-                if entry.last_occurrence > request {
+                if occurrence_after_private_cut(entry.last_occurrence, request) {
                     validate_historical_fill_compatibility(fill, entry.event, config)?;
                 } else {
                     validate_fee_progression(entry.fee, fill.execution().fee(), config)?;
@@ -314,7 +357,7 @@ impl PmFillState {
         }
         if self.entries.iter().any(|entry| {
             entry.needs_reconciliation()
-                && entry.last_occurrence <= request
+                && !occurrence_after_private_cut(entry.last_occurrence, request)
                 && self
                     .query_keys
                     .binary_search(&entry.event.fill_key())
@@ -325,7 +368,7 @@ impl PmFillState {
         let mut prospective = empty_deltas();
         for entry in self.entries.iter().filter(|entry| {
             entry.needs_reconciliation()
-                && (entry.last_occurrence > request
+                && (occurrence_after_private_cut(entry.last_occurrence, request)
                     || self
                         .query_keys
                         .binary_search(&entry.event.fill_key())
@@ -338,18 +381,42 @@ impl PmFillState {
 
     pub(crate) fn apply_preflighted_query(
         &mut self,
-        envelope: EventEnvelope<PmCompleteFillQuery>,
+        envelope: &EventEnvelope<PmCompleteFillQuery>,
+        occurrence: PmOwnedObservationOccurrence,
         config: &PmPrivateStateConfig,
     ) -> Result<(), PmFillStateError> {
         let query = envelope.payload();
         let epoch = envelope.ordering().connection_epoch();
         let request = PmPrivateOccurrence::new(epoch, query.boundary().request_sequence());
         let completion = PmPrivateOccurrence::new(epoch, query.boundary().completion_sequence());
-        for fill in query.fills().iter().copied() {
+        if occurrence.private_occurrence() != Some(completion)
+            || occurrence.snapshot_revision() != Some(query.snapshot().revision())
+        {
+            return Err(PmFillStateError::OccurrenceEvidenceMismatch);
+        }
+        for (index, fill) in query.fills().iter().copied().enumerate() {
+            let offset = u64::try_from(index).expect("bounded PM fill count fits u64");
+            let row_sequence = occurrence
+                .reduction_sequence()
+                .value()
+                .checked_add(offset)
+                .expect("owned occurrence range was preflighted");
+            let row_occurrence = occurrence.with_reduction_sequence(
+                crate::owned_lifecycle::PmOwnedReductionSequence::new(row_sequence)
+                    .expect("preflighted owned occurrence is nonzero"),
+            );
+            let request_occurrence =
+                row_occurrence.with_private_context(request, Some(query.snapshot().revision()));
+            let completion_occurrence =
+                row_occurrence.with_private_context(completion, Some(query.snapshot().revision()));
             match self.search(fill.fill_key()) {
                 Ok(index) => {
                     let entry = &mut self.entries[index];
-                    if entry.last_occurrence > request {
+                    if entry
+                        .last_occurrence
+                        .private_occurrence()
+                        .is_some_and(|private| private > request)
+                    {
                         continue;
                     }
                     entry.event = merge_event(entry.event, fill, config)?;
@@ -358,15 +425,15 @@ impl PmFillState {
                     entry.covered_by_reconciliation = Some(completion);
                     entry.covered_fee = Some(entry.fee);
                     entry.covered_settlement = Some(entry.settlement);
-                    entry.last_occurrence = completion;
+                    entry.last_occurrence = completion_occurrence;
                 }
                 Err(index) => {
                     self.entries.insert(
                         index,
                         FillEntry {
                             event: fill,
-                            first_occurrence: request,
-                            last_occurrence: completion,
+                            first_occurrence: request_occurrence,
+                            last_occurrence: completion_occurrence,
                             covered_by_reconciliation: Some(completion),
                             fee: fee_state(fill.execution().fee(), config),
                             covered_fee: Some(fee_state(fill.execution().fee(), config)),
@@ -464,7 +531,7 @@ impl PmFillState {
         &mut self,
         index: usize,
         event: PmFillEvent,
-        occurrence: PmPrivateOccurrence,
+        occurrence: PmOwnedObservationOccurrence,
         config: &PmPrivateStateConfig,
     ) -> Result<PmFillApply, PmFillStateError> {
         if self.entries.len() == MAX_PM_PRIVATE_FILLS {
@@ -499,15 +566,15 @@ impl PmFillState {
         &mut self,
         index: usize,
         event: PmFillEvent,
-        occurrence: PmPrivateOccurrence,
+        occurrence: PmOwnedObservationOccurrence,
         config: &PmPrivateStateConfig,
     ) -> Result<PmFillApply, PmFillStateError> {
         let prior = self.entries[index];
-        if occurrence < prior.last_occurrence {
+        if occurrence.causal_cmp(prior.last_occurrence) == Ordering::Less {
             self.counters.stale = self.counters.stale.saturating_add(1);
             return Ok(PmFillApply::IgnoredStale);
         }
-        if occurrence == prior.last_occurrence {
+        if occurrence.same_source_occurrence(prior.last_occurrence) {
             if event == prior.event {
                 self.counters.duplicates = self.counters.duplicates.saturating_add(1);
                 return Ok(PmFillApply::Duplicate);
@@ -536,7 +603,7 @@ impl PmFillState {
         let next_settlement = settlement_update.unwrap_or(prior.settlement);
         let entry = &mut self.entries[index];
         entry.event = merge_event(prior.event, event, config)?;
-        entry.last_occurrence = occurrence;
+        entry.last_occurrence = prior.last_occurrence.causal_max(occurrence);
         entry.fee = next_fee;
         entry.settlement = next_settlement;
         self.provisional = recompute_provisional(&self.entries, config)?;
@@ -595,6 +662,15 @@ fn validate_fill(
         })
         .map_err(|_| PmFillStateError::MarketContractMismatch)?;
     Ok(())
+}
+
+fn occurrence_after_private_cut(
+    occurrence: PmOwnedObservationOccurrence,
+    cut: PmPrivateOccurrence,
+) -> bool {
+    occurrence
+        .private_occurrence()
+        .is_some_and(|private| private > cut)
 }
 
 fn validate_query_envelope(

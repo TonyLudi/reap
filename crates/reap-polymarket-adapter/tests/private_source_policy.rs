@@ -75,3 +75,39 @@ fn ownership_metadata_and_linkage_authority_do_not_escape_as_scalar_fallbacks() 
     assert!(metadata.contains("PmRecordedMetadataEvidence"));
     assert!(metadata.contains("PmGoalFTradingDomain::from_metadata"));
 }
+
+#[test]
+fn fake_execution_is_fixed_bounded_and_in_process_only() {
+    let fake = [
+        read("src/fake_execution.rs"),
+        read("src/fake_execution/command.rs"),
+        read("src/fake_execution/outcome.rs"),
+    ]
+    .join("\n");
+
+    for forbidden in [
+        "async fn",
+        ".await",
+        "TcpStream",
+        "connect_async",
+        "reqwest",
+        "Credentials",
+        "PrivateKey",
+        "ApiKey",
+        "cancel_all",
+        "PreparedPm",
+        "ApprovedPm",
+        "ReservedPm",
+        "Deserialize",
+    ] {
+        assert!(
+            !fake.contains(forbidden),
+            "fake execution contains forbidden capability: {forbidden}"
+        );
+    }
+    assert!(fake.contains("MAX_PM_FAKE_ACK_FILL_LEGS"));
+    assert!(fake.contains("PmFakeOrderType::Gtc"));
+    assert!(fake.contains("post_only"));
+    assert!(fake.contains("defer_exec"));
+    assert!(fake.contains("expiration"));
+}

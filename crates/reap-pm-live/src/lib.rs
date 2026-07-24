@@ -3,7 +3,9 @@
 mod capture;
 mod capture_roles;
 mod composition;
+mod coordinator;
 mod fake_effect;
+mod journal;
 mod lanes;
 mod private_monitor;
 mod public_routes;
@@ -27,17 +29,46 @@ pub use capture_roles::{
     PmPublicSnapshotFlow,
 };
 pub use composition::{
-    PmCompositionError, PmProduct, PmPublicAgedLaneEnactError, PmPublicAgedLaneFaultEnactment,
-    PmPublicBookPipelineError, PmPublicBookReadiness, PmPublicBookReadinessReason, PmPublicCapture,
-    PmPublicCaptureOutcome, PmPublicCaptureRun, PmPublicCaptureRunError,
-    PmPublicCaptureTerminalCause, PmPublicDataPipelineError, PmPublicLaneAdmissionError,
-    PmPublicLaneEnactError, PmPublicLaneFaultEnactment, PmPublicNotificationAdmissionFailure,
-    PmPublicReadyBookView, PmPublicTerminalTickApplyError, PmPublicTerminalTickCleanupStatus,
+    PmCompositionError, PmProduct, PmProductRun, PmProductRunError, PmProductStartError,
+    PmPublicAgedLaneEnactError, PmPublicAgedLaneFaultEnactment, PmPublicBookPipelineError,
+    PmPublicBookReadiness, PmPublicBookReadinessReason, PmPublicCapture, PmPublicCaptureOutcome,
+    PmPublicCaptureRun, PmPublicCaptureRunError, PmPublicCaptureTerminalCause,
+    PmPublicDataPipelineError, PmPublicLaneAdmissionError, PmPublicLaneEnactError,
+    PmPublicLaneFaultEnactment, PmPublicNotificationAdmissionFailure, PmPublicReadyBookView,
+    PmPublicTerminalTickApplyError, PmPublicTerminalTickCleanupStatus,
+};
+pub use coordinator::{
+    ApprovedPmCancel, ApprovedPmQuote, MAX_PM_EFFECTS_PER_INPUT, PmAuthorityError,
+    PmAuthorityRevisions, PmBookDecisionProjection, PmBookInput, PmCancelIntentReason,
+    PmControlReason, PmCoordinatorCounters, PmCoordinatorPolicy, PmCoordinatorPolicyError,
+    PmDurableRecordEffect, PmDurableRecordKind, PmFailClosedEffect, PmFakeCancelEffect,
+    PmFakeEffectMetrics, PmFakeEffectStage, PmFakeQuoteEffect, PmHealthMetricEffect,
+    PmHealthMetricKind, PmMarketInput, PmMutationCounters, PmMutationHalt, PmOkxReferenceInput,
+    PmPersistenceMetrics, PmProductEffect, PmProductEffectBatch, PmProductEffectMetrics,
+    PmProductInputError, PmQuoteSuppression, PmRefreshEffect, PmRefreshEffectKind, PmTimerInput,
+    PreparedPmCancel, PreparedPmQuote, ReservedPmCancel, ReservedPmQuote,
+};
+pub use journal::{
+    MAX_PM_JOURNAL_BYTES, MAX_PM_JOURNAL_LINE_BYTES, MAX_PM_JOURNAL_RECORDS,
+    PM_MUTATION_JOURNAL_FAMILY, PM_MUTATION_JOURNAL_VERSION, PmJournalCancelIntentV1,
+    PmJournalCancelOutcomeV1, PmJournalCancelReasonV1, PmJournalCancelRejectReasonV1,
+    PmJournalCancelResultV1, PmJournalError, PmJournalFillAppliedV1, PmJournalFillCursorV1,
+    PmJournalFillDeliveryV1, PmJournalFillFeeV1, PmJournalFillKeyV1, PmJournalFillOccurrenceV1,
+    PmJournalFillRoleV1, PmJournalFillSettlementV1, PmJournalFillSourceV1, PmJournalFillV1,
+    PmJournalFillWatermarkV1, PmJournalFingerprintV1, PmJournalHeaderV1, PmJournalImmediateFillsV1,
+    PmJournalOrderProgressSourceV1, PmJournalOrderTerminalV1, PmJournalPlaceOutcomeV1,
+    PmJournalPlaceRejectReasonV1, PmJournalPlaceResultV1, PmJournalQuoteIntentV1,
+    PmJournalQuoteProfileV1, PmJournalRecordV1, PmJournalRecovery, PmJournalSafetyHaltV1,
+    PmJournalSafetyReasonV1, PmJournalSchemaError, PmJournalScopeV1, PmJournalSideV1,
+    PmJournalTerminalStatusV1, recover_pm_mutation_journal,
 };
 pub use lanes::{
-    PM_INPUT_SERVICE_PRIORITY, PmAgedDeliveryEvidence, PmLaneKind, PmLaneMetrics, PmLanePolicy,
-    PmPublicLaneEnqueueError, PmPublicLaneService, PmServiceKey, PmServiceSourceKind,
-    PmServiceTurnError, SaturationAction, ServicedLaneItem,
+    PM_INPUT_SERVICE_PRIORITY, PmAgedDeliveryEvidence, PmCompleteFailClosedMetrics,
+    PmCompleteLaneMetrics, PmCompleteSchedulerMetrics, PmCompleteServiceCounts,
+    PmCompleteServiceKey, PmCompleteSourceKind, PmLaneKind, PmLaneMetrics, PmLanePolicy,
+    PmPairedReconciliationCut, PmPairedReconciliationCutError, PmPublicLaneEnqueueError,
+    PmPublicLaneService, PmServiceKey, PmServiceSourceKind, PmServiceTurnError, PmTelemetryKind,
+    SaturationAction, ServicedLaneItem,
 };
 pub use private_monitor::{
     PmAccountFixtureInput, PmFixtureQueryOccurrence, PmOpenOrdersFixtureInput,
@@ -53,4 +84,8 @@ pub use public_routes::{
 pub use replay::{
     PmReplayCounters, PmReplayError, PmReplayFreshnessInvalidation, PmReplayLogicalEvent,
     PmReplayProjection, replay_pm_public_capture,
+};
+pub use schedule::{
+    MAX_PM_SCHEDULED_ACTIONS, PmScheduleMetrics, PmScheduleProjection, PmScheduledActionKey,
+    PmScheduledActionKind, PmScheduledActionView,
 };

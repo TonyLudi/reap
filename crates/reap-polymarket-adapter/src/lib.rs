@@ -19,7 +19,11 @@ pub use account_fixture::{
     PmFixturePositionRow,
 };
 pub use fake_execution::{
-    PmCancelOwnedPurpose, PmFixtureOwnedExecution, PmGtcPostOnlyProfile, PmOwnedExecutionRole,
+    MAX_PM_FAKE_ACK_FILL_LEGS, PmCancelOwnedPurpose, PmFakeAckImmediateFillLeg,
+    PmFakeCancelCommand, PmFakeCancelOutcome, PmFakeCancelRejectReason, PmFakeCancelResult,
+    PmFakeCancelScript, PmFakeExecutionError, PmFakeImmediateFill, PmFakeOrderType, PmFakePlaceAck,
+    PmFakePlaceCommand, PmFakePlaceOutcome, PmFakePlaceRejectReason, PmFakePlaceResult,
+    PmFakePlaceScript, PmFixtureOwnedExecution, PmGtcPostOnlyProfile, PmOwnedExecutionRole,
 };
 pub use fixture_delivery::{
     PmFixtureAggregateDelivery, PmFixtureCompletionOccurrence, PmFixtureDeliveryError,

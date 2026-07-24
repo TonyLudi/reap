@@ -34,4 +34,8 @@ fn composition_boundaries_are_enforced_by_the_type_system() {
     tests.compile_fail("tests/ui/public_run_reducer_is_private.rs");
     tests.compile_fail("tests/ui/public_lane_service_requires_all_callbacks.rs");
     tests.compile_fail("tests/ui/commit_only_book_apis_are_not_public.rs");
+    tests.compile_fail("tests/ui/pm_mutation_authorities_are_not_cloneable.rs");
+    tests.compile_fail("tests/ui/pm_mutation_authorities_cannot_be_forged.rs");
+    tests.compile_fail("tests/ui/pm_mutation_authorities_are_take_once.rs");
+    tests.compile_fail("tests/ui/product_has_no_live_mutation_authority.rs");
 }

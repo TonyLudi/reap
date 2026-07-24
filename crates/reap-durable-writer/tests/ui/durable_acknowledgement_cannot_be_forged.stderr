@@ -1,0 +1,5 @@
+error[E0451]: field `_private` of struct `DurableAcknowledgement` is private
+ --> tests/ui/durable_acknowledgement_cannot_be_forged.rs:4:30
+  |
+4 |     DurableAcknowledgement { _private: () }
+  |                              ^^^^^^^^ private field

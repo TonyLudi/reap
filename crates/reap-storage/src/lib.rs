@@ -1058,6 +1058,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn chaos_recovery_rejects_the_separate_pm_tuple_family() {
+        let pm_header = br#"["reap-pm-mutation-journal",1,"0000000000000000000000000000000000000000000000000000000000000000",0,{"kind":"header","body":{}}]
+"#;
+        assert!(matches!(
+            recover_jsonl_bytes(pm_header),
+            Err(StorageError::Corrupt { line: 1, .. })
+        ));
+    }
+
     fn journal_bytes(records: impl IntoIterator<Item = StorageRecord>) -> Vec<u8> {
         let journal = records
             .into_iter()

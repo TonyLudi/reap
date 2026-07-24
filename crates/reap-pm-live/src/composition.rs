@@ -14,8 +14,8 @@ use reap_pm_core::{
     ReceivedEventClock,
 };
 use reap_pm_live_contracts::{
-    ConstructedRoleBinding, PmConnectionRoute, PmConnectivityConfig, PmConnectivityPlan,
-    PmFakeExecutionProfile, PmPlanError, PmPublicConnectivityConfig, PmRoleKind,
+    ConstructedRoleBinding, PmConnectionRoute, PmConnectivityPlan, PmPlanError,
+    PmPublicConnectivityConfig, PmRoleKind,
 };
 use reap_pm_state::{
     PmBookCounters, PmBookReducer, PmBookTransition, PmDomainFingerprint, PmExternalBookFault,
@@ -23,12 +23,9 @@ use reap_pm_state::{
     PmPendingExternalBookFaultAuthority, PmPrivateConfigError, PmPrivateStateError,
     PmPublicReadinessReason,
 };
-use reap_pm_strategy::PmQuoteModelRequirements;
 use reap_polymarket_adapter::{
-    PmAccountPositionRoleError, PmFixtureAccountPositionSnapshot, PmFixtureInstrumentScope,
-    PmFixturePrivateLifecycle, PmFixtureReadOwnerGrant, PmFixtureReconciliation,
-    PmPrivateLifecycleRoleError, PmPublicHeartbeatAction, PmPublicRoleError, PmPublicSessionError,
-    PmReconciliationContractError,
+    PmAccountPositionRoleError, PmPrivateLifecycleRoleError, PmPublicHeartbeatAction,
+    PmPublicRoleError, PmPublicSessionError, PmReconciliationContractError,
 };
 use thiserror::Error;
 
@@ -45,21 +42,19 @@ use crate::capture_roles::{
     PmPublicFreshnessTimerOutcome, PmPublicReducerSyncError, PmPublicSnapshotCommitError,
     PmPublicSnapshotFlow,
 };
-use crate::fake_effect::PmFakeEffectRole;
 use crate::lanes::{
     PmAgedDeliveryEvidence, PmAuthenticatedPublicLaneFailure, PmLaneMetrics, PmPublicAgedHead,
     PmPublicLaneService, PmPublicLaneState, PmServiceTurnError, SaturationAction,
 };
-use crate::private_monitor::monitor_bindings;
 use crate::public_routes::{
     OkxPublicReferenceDelivery, OkxPublicUnavailableDelivery, PmPublicBookDelivery,
     PmPublicMetadataDelivery, PmPublicRouteAuthorityId, PmPublicRouteError,
     PmPublicUnavailableDelivery,
 };
 use crate::replay::{PmReplayError, PmReplayProjection, replay_pm_public_capture};
-use crate::schedule::PmQuoteScheduleRole;
 
 mod lane_enact;
+mod product;
 mod run_capture;
 mod run_lane_aged;
 mod run_lane_full;
@@ -75,6 +70,7 @@ pub use lane_enact::{
     PmPublicAgedLaneEnactError, PmPublicAgedLaneFaultEnactment, PmPublicLaneAdmissionError,
     PmPublicLaneEnactError, PmPublicLaneFaultEnactment,
 };
+pub use product::{PmProduct, PmProductRun, PmProductRunError, PmProductStartError};
 use run_state::{
     MAX_PENDING_PM_BOOK_REDUCTIONS, PendingOtherAgedLaneFault, PendingPmAgedLaneFault,
     PendingPmBookKind, PendingPmBookLaneFault, PendingPmBookReduction, PendingPmMetadataLaneFault,
@@ -437,6 +433,14 @@ impl PmPublicCaptureRun {
     #[must_use]
     pub fn public_lane_metrics(&self) -> PmLaneMetrics {
         self.public_lane.metrics()
+    }
+
+    pub(crate) const fn public_consumer_transfer_poisoned(&self) -> bool {
+        self.public_lane.consumer_transfer_poisoned()
+    }
+
+    pub(crate) fn public_lane_reserved_capacity_bytes(&self) -> usize {
+        self.public_lane.reserved_capacity_bytes()
     }
 
     #[must_use]
@@ -878,119 +882,5 @@ impl PmPublicCaptureRun {
                 Err(failure.into())
             }
         }
-    }
-}
-
-#[derive(Debug)]
-pub struct PmProduct<M> {
-    model: M,
-    plan: PmConnectivityPlan,
-    bindings: Vec<ConstructedRoleBinding>,
-    capture: PmCaptureBlueprint,
-    private: PmFixturePrivateLifecycle,
-    reconciliation: PmFixtureReconciliation,
-    account: PmFixtureAccountPositionSnapshot,
-    fake_effect: PmFakeEffectRole,
-    schedule: PmQuoteScheduleRole,
-}
-
-impl<M: PmQuoteModelRequirements> PmProduct<M> {
-    pub fn new(
-        config: PmConnectivityConfig,
-        model: M,
-        profile: PmFakeExecutionProfile,
-    ) -> Result<Self, PmCompositionError> {
-        let requirements = model.input_requirements();
-        let plan = PmConnectivityPlan::product(config, requirements, profile)?;
-        let public = plan
-            .public_config()
-            .expect("product plan carries public config");
-        let account_config = plan
-            .account_config()
-            .expect("product plan carries account config");
-        let capture = PmCaptureBlueprint::new(public)?;
-        let route = account_config.account_route();
-        let (private_grant, reconciliation_grant, account_grant) =
-            PmFixtureReadOwnerGrant::allocate().split();
-        let instrument_scope = PmFixtureInstrumentScope::from_metadata(
-            account_config.instrument(),
-            account_config.expected_metadata(),
-        )?;
-        let private = PmFixturePrivateLifecycle::new(
-            private_grant,
-            account_config.account_scope(),
-            instrument_scope,
-            route.source(),
-            route.connection(),
-        )?;
-        let reconciliation = PmFixtureReconciliation::new(
-            reconciliation_grant,
-            account_config.account_scope(),
-            instrument_scope,
-            route.source(),
-            route.connection(),
-        )?;
-        let account = PmFixtureAccountPositionSnapshot::new(
-            account_grant,
-            account_config.account_scope(),
-            instrument_scope,
-            route.source(),
-            route.connection(),
-        )?;
-        let fake_effect = PmFakeEffectRole::new(
-            account_config.account_scope(),
-            account_config.instrument(),
-            account_config.instrument_id(),
-        );
-        let schedule = PmQuoteScheduleRole::new(public.instrument());
-        let mut bindings = capture.bindings(public);
-        bindings.extend(monitor_bindings(
-            account_config,
-            &private,
-            &reconciliation,
-            &account,
-        )?);
-        bindings.extend(fake_effect.bindings());
-        bindings.push(schedule.binding());
-        plan.validate_bindings(&bindings)?;
-        Ok(Self {
-            model,
-            plan,
-            bindings,
-            capture,
-            private,
-            reconciliation,
-            account,
-            fake_effect,
-            schedule,
-        })
-    }
-
-    #[must_use]
-    pub fn reached_roles(&self) -> &[PmRoleKind] {
-        self.plan.reached_roles()
-    }
-
-    #[must_use]
-    pub fn binding_count(&self) -> usize {
-        let requirements = self.model.input_requirements();
-        let public = self
-            .plan
-            .public_config()
-            .expect("product plan carries public config");
-        let account = self
-            .plan
-            .account_config()
-            .expect("product plan carries account config");
-        debug_assert_eq!(requirements.reference(), self.capture.reference(public));
-        debug_assert_eq!(self.capture.instrument(), public.instrument());
-        debug_assert_eq!(self.private.account_scope(), account.account_scope());
-        debug_assert_eq!(self.reconciliation.account_scope(), account.account_scope());
-        debug_assert_eq!(self.account.account_scope(), account.account_scope());
-        debug_assert_eq!(self.account.instrument(), account.instrument());
-        debug_assert_eq!(self.fake_effect.account_scope(), account.account_scope());
-        debug_assert_eq!(self.fake_effect.instrument(), account.instrument());
-        debug_assert_eq!(self.schedule.instrument(), public.instrument());
-        self.bindings.len()
     }
 }

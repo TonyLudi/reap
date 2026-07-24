@@ -152,6 +152,16 @@ impl<P> PmFixtureAggregateDelivery<P> {
         self.envelope.ordering()
     }
 
+    /// Receive-time evidence retained by this exact owner-bound delivery.
+    ///
+    /// This is an observation-only projection used by the product scheduler
+    /// to derive its ordering key before the role instance opens the delivery
+    /// at service time.
+    #[must_use]
+    pub const fn received_clock(&self) -> ReceivedEventClock {
+        self.envelope.received_clock()
+    }
+
     pub fn service_at(
         self,
         monotonic_service_ns: u64,

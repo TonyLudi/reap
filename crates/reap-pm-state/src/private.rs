@@ -19,6 +19,9 @@ use crate::order_state::{
     PmOrderProjection, PmOrderState, PmOrderStateError, PmOwnedOrderRegistration,
     PmRemoteOrderKnowledge, PmReservationBasis, PmReservationKnowledge, PmReservationTotalsError,
 };
+use crate::owned_lifecycle::{
+    PmOwnedOrderLifecycle, PmOwnedOrderLifecycleError, PmOwnedReductionSequence,
+};
 use crate::private_config::{PmPrivateConfigError, PmPrivateStateConfig};
 use crate::private_ingress::{PmPrivateExternalIngressCounters, PmPrivateExternalIngressFault};
 use crate::private_occurrence::PmPrivateOccurrence;
@@ -39,6 +42,17 @@ use crate::unresolved_fill::{
     PmUnresolvedFillProjection, PmUnresolvedFillState, PmUnresolvedFillStateError,
 };
 
+mod owned_lifecycle;
+pub use owned_lifecycle::{
+    PmOwnedFillReduction, PmOwnedImmediateAckTicket, PmOwnedOrderReduction, PmPrivateFillReduction,
+    PmPrivateOrderReduction, PmReconciliationFillDisposition, PmReconciliationFillReduction,
+    PmReconciliationReductions,
+};
+use owned_lifecycle::{
+    bridge_owned_order_event, preflight_owned_fill_batch, preflight_owned_fill_event,
+    preflight_owned_order_event, reduce_owned_fill_event, reduce_owned_order_event,
+};
+
 /// The sole by-value owner of canonical PM private/account state.
 ///
 /// It exposes immutable projections and narrow transitions, never mutable
@@ -48,6 +62,7 @@ pub struct PmPrivateState {
     config: PmPrivateStateConfig,
     account: PmAccountState,
     orders: PmOrderState,
+    owned_lifecycle: PmOwnedOrderLifecycle,
     fills: PmFillState,
     unresolved_fills: PmUnresolvedFillState,
     refresh: PmRefreshState,
@@ -59,6 +74,8 @@ pub struct PmPrivateState {
     convergence: PmPrivateConvergence,
     halt: Option<PmPrivateHaltReason>,
     external_ingress_counters: PmPrivateExternalIngressCounters,
+    owned_reduction_high_watermark: u64,
+    outstanding_owned_immediate: Option<PmOwnedReductionSequence>,
 }
 
 impl PmPrivateState {
@@ -69,6 +86,8 @@ impl PmPrivateState {
         let owner = PmRefreshOwnerId::allocate()?;
         let account = PmAccountState::new(&config);
         let orders = PmOrderState::new();
+        let owned_lifecycle =
+            PmOwnedOrderLifecycle::new(config.account_scope(), config.instrument());
         let fills = PmFillState::new();
         let unresolved_fills = PmUnresolvedFillState::new();
         let refresh = PmRefreshState::new(owner);
@@ -78,6 +97,7 @@ impl PmPrivateState {
             config,
             account,
             orders,
+            owned_lifecycle,
             fills,
             unresolved_fills,
             refresh,
@@ -89,6 +109,8 @@ impl PmPrivateState {
             convergence: PmPrivateConvergence::Uninitialized,
             halt: None,
             external_ingress_counters: PmPrivateExternalIngressCounters::default(),
+            owned_reduction_high_watermark: 0,
+            outstanding_owned_immediate: None,
         })
     }
 
@@ -169,20 +191,50 @@ impl PmPrivateState {
         envelope: EventEnvelope<PmOrderEvent>,
         knowledge: PmRemoteOrderKnowledge,
     ) -> Result<PmOrderApply, PmPrivateStateError> {
-        let identity = envelope.payload().order();
+        Ok(self
+            .observe_order_reduction(envelope, knowledge)?
+            .canonical_apply())
+    }
+
+    pub fn observe_order_reduction(
+        &mut self,
+        envelope: EventEnvelope<PmOrderEvent>,
+        knowledge: PmRemoteOrderKnowledge,
+    ) -> Result<PmPrivateOrderReduction, PmPrivateStateError> {
+        let event = *envelope.payload();
+        let identity = event.order();
+        let private_occurrence = PmPrivateOccurrence::new(
+            envelope.ordering().connection_epoch(),
+            envelope.ordering().local_ingress_sequence(),
+        );
+        let snapshot_revision = envelope.ordering().snapshot_revision();
         self.prepare_private_event_epoch(
             envelope.ordering().connection_epoch(),
             envelope.clock().monotonic_service_ns(),
         )?;
+        let occurrence =
+            self.mint_owned_private_occurrence(private_occurrence, snapshot_revision)?;
+        preflight_owned_order_event(
+            &self.owned_lifecycle,
+            event,
+            occurrence,
+            crate::owned_lifecycle::PmOwnedObservationSource::PrivateWebSocket,
+        )?;
         let result = self.orders.observe(envelope, knowledge, &self.config);
         match result {
             Ok(outcome) => {
+                let (owned_match, owned) = reduce_owned_order_event(
+                    &mut self.owned_lifecycle,
+                    event,
+                    occurrence,
+                    crate::owned_lifecycle::PmOwnedObservationSource::PrivateWebSocket,
+                )?;
                 self.private_observed_ns = self.orders.observed_monotonic_ns();
-                match self
+                let ownership = self
                     .orders
                     .ownership(identity)
-                    .expect("successful observation retains canonical order")
-                {
+                    .expect("successful observation retains canonical order");
+                match ownership {
                     PmOrderOwnership::ProvenOwned => {}
                     PmOrderOwnership::Unmanaged => {
                         self.require_refresh(PmRefreshReason::UnmanagedOrder)?;
@@ -191,7 +243,22 @@ impl PmPrivateState {
                         self.require_refresh(PmRefreshReason::AmbiguousOrder)?;
                     }
                 }
-                Ok(outcome)
+                if ownership == PmOrderOwnership::ProvenOwned
+                    && owned_match
+                        == crate::owned_lifecycle::PmOwnedRemoteOrderApply::AmbiguousRemote
+                    && identity
+                        .client_order_key()
+                        .is_some_and(|client| self.owned_lifecycle.order(client).is_some())
+                {
+                    self.require_refresh(PmRefreshReason::AmbiguousOrder)?;
+                }
+                Ok(PmPrivateOrderReduction::new(
+                    envelope,
+                    knowledge,
+                    outcome,
+                    owned_match,
+                    owned,
+                ))
             }
             Err(error) => {
                 self.record_order_error(error)?;
@@ -204,13 +271,42 @@ impl PmPrivateState {
         &mut self,
         envelope: EventEnvelope<PmFillEvent>,
     ) -> Result<PmFillApply, PmPrivateStateError> {
+        Ok(self.observe_fill_reduction(envelope)?.canonical_apply())
+    }
+
+    pub fn observe_fill_reduction(
+        &mut self,
+        envelope: EventEnvelope<PmFillEvent>,
+    ) -> Result<PmPrivateFillReduction, PmPrivateStateError> {
+        let event = *envelope.payload();
+        let private_occurrence = PmPrivateOccurrence::new(
+            envelope.ordering().connection_epoch(),
+            envelope.ordering().local_ingress_sequence(),
+        );
+        let snapshot_revision = envelope.ordering().snapshot_revision();
         self.prepare_private_event_epoch(
             envelope.ordering().connection_epoch(),
             envelope.clock().monotonic_service_ns(),
         )?;
-        let result = self.fills.observe(envelope, &self.config);
+        let occurrence =
+            self.mint_owned_private_occurrence(private_occurrence, snapshot_revision)?;
+        preflight_owned_fill_event(
+            &self.owned_lifecycle,
+            event,
+            occurrence,
+            crate::owned_lifecycle::PmOwnedObservationSource::PrivateWebSocket,
+            None,
+        )?;
+        let result = self.fills.observe(envelope, occurrence, &self.config);
         match result {
             Ok(outcome) => {
+                let (owned_match, owned) = reduce_owned_fill_event(
+                    &mut self.owned_lifecycle,
+                    event,
+                    occurrence,
+                    crate::owned_lifecycle::PmOwnedObservationSource::PrivateWebSocket,
+                    None,
+                )?;
                 self.private_observed_ns = self.fills.observed_monotonic_ns();
                 if matches!(outcome, PmFillApply::PrincipalApplied { .. }) {
                     self.convergence = PmPrivateConvergence::Divergent {
@@ -226,7 +322,12 @@ impl PmPrivateState {
                     }
                     PmFillApply::Duplicate | PmFillApply::IgnoredStale => {}
                 }
-                Ok(outcome)
+                Ok(PmPrivateFillReduction::new(
+                    envelope,
+                    outcome,
+                    owned_match,
+                    owned,
+                ))
             }
             Err(error) => {
                 self.record_fill_error(error)?;
@@ -300,11 +401,36 @@ impl PmPrivateState {
         reservations: &[PmOpenOrderReservation],
     ) -> Result<PmOpenOrdersApply, PmPrivateStateError> {
         self.require_private_epoch(envelope.ordering().connection_epoch())?;
+        let epoch = envelope.ordering().connection_epoch();
+        let request =
+            PmPrivateOccurrence::new(epoch, envelope.payload().boundary().request_sequence());
+        let revision = Some(envelope.payload().snapshot().revision());
+        let occurrence = self.mint_owned_private_occurrence(request, revision)?;
+        for event in envelope.payload().orders().iter().copied() {
+            preflight_owned_order_event(
+                &self.owned_lifecycle,
+                event,
+                occurrence,
+                crate::owned_lifecycle::PmOwnedObservationSource::RestReconciliation,
+            )?;
+        }
         let result = self
             .orders
-            .apply_open_snapshot(envelope, reservations, &self.config);
+            .apply_open_snapshot(&envelope, reservations, &self.config);
         match result {
             Ok(outcome) => {
+                let mut owned_ambiguity = false;
+                for event in envelope.payload().orders().iter().copied() {
+                    owned_ambiguity |= bridge_owned_order_event(
+                        &mut self.owned_lifecycle,
+                        event,
+                        occurrence,
+                        crate::owned_lifecycle::PmOwnedObservationSource::RestReconciliation,
+                    )?
+                        == crate::owned_lifecycle::PmOwnedRemoteOrderApply::AmbiguousRemote
+                        && self.orders.ownership(event.order())
+                            == Some(PmOrderOwnership::ProvenOwned);
+                }
                 if matches!(
                     outcome,
                     PmOpenOrdersApply::Applied {
@@ -313,6 +439,9 @@ impl PmPrivateState {
                     }
                 ) {
                     self.require_refresh(PmRefreshReason::MissingOrderDetail)?;
+                }
+                if owned_ambiguity {
+                    self.require_refresh(PmRefreshReason::AmbiguousOrder)?;
                 }
                 Ok(outcome)
             }
@@ -329,11 +458,44 @@ impl PmPrivateState {
         reservation: PmReservationKnowledge,
     ) -> Result<PmOrderApply, PmPrivateStateError> {
         self.require_private_epoch(envelope.ordering().connection_epoch())?;
+        let detail = *envelope.payload();
+        let epoch = envelope.ordering().connection_epoch();
+        let revision = Some(detail.snapshot().revision());
+        let private_occurrence = if detail.order().is_some() {
+            PmPrivateOccurrence::new(epoch, detail.boundary().request_sequence())
+        } else {
+            PmPrivateOccurrence::new(epoch, detail.boundary().completion_sequence())
+        };
+        let occurrence = self.mint_owned_private_occurrence(private_occurrence, revision)?;
+        if let Some(event) = detail.order() {
+            preflight_owned_order_event(
+                &self.owned_lifecycle,
+                event,
+                occurrence,
+                crate::owned_lifecycle::PmOwnedObservationSource::RestReconciliation,
+            )?;
+        } else {
+            self.owned_lifecycle
+                .preflight_detail_absence(detail.requested_order(), occurrence)?;
+        }
         let result = self
             .orders
             .apply_detail(envelope, reservation, &self.config);
         match result {
-            Ok(outcome) => Ok(outcome),
+            Ok(outcome) => {
+                if let Some(event) = detail.order() {
+                    bridge_owned_order_event(
+                        &mut self.owned_lifecycle,
+                        event,
+                        occurrence,
+                        crate::owned_lifecycle::PmOwnedObservationSource::RestReconciliation,
+                    )?;
+                } else if outcome == PmOrderApply::DetailAbsenceTerminalized {
+                    self.owned_lifecycle
+                        .observe_detail_absence(detail.requested_order(), occurrence)?;
+                }
+                Ok(outcome)
+            }
             Err(error) => {
                 self.record_order_error(error)?;
                 Err(error.into())
@@ -346,6 +508,33 @@ impl PmPrivateState {
         account: EventEnvelope<PmCompleteAccountSnapshot>,
         fills: EventEnvelope<PmCompleteFillQuery>,
     ) -> Result<PmReconciliationApply, PmPrivateStateError> {
+        self.apply_reconciliation_inner(account, fills, None)
+    }
+
+    /// Applies one exact account-plus-fill cut and exposes its per-fill owned
+    /// consequences in caller-owned, reusable bounded scratch.
+    ///
+    /// The scratch is cleared before validation. It is populated only from the
+    /// same reduction that commits canonical state; no second reducer or
+    /// projection reconstruction is involved.
+    pub fn apply_reconciliation_with_reductions(
+        &mut self,
+        account: EventEnvelope<PmCompleteAccountSnapshot>,
+        fills: EventEnvelope<PmCompleteFillQuery>,
+        reductions: &mut PmReconciliationReductions,
+    ) -> Result<PmReconciliationApply, PmPrivateStateError> {
+        self.apply_reconciliation_inner(account, fills, Some(reductions))
+    }
+
+    fn apply_reconciliation_inner(
+        &mut self,
+        account: EventEnvelope<PmCompleteAccountSnapshot>,
+        fills: EventEnvelope<PmCompleteFillQuery>,
+        mut reductions: Option<&mut PmReconciliationReductions>,
+    ) -> Result<PmReconciliationApply, PmPrivateStateError> {
+        if let Some(output) = reductions.as_deref_mut() {
+            output.prepare(fills.payload().fills().len());
+        }
         if let Err(error) = validate_reconciliation_pair(&account, &fills) {
             self.record_account_error()?;
             return Err(error);
@@ -370,19 +559,79 @@ impl PmPrivateState {
             self.record_fill_error(error)?;
             return Err(error.into());
         }
-        if let Err(error) = self.fills.apply_preflighted_query(fills, &self.config) {
-            self.record_fill_error(error)?;
-            return Err(error.into());
-        }
-        let account_outcome = match self.account.apply(&account, &self.config) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                self.record_account_error()?;
-                return Err(error.into());
+        let private_occurrence =
+            PmPrivateOccurrence::new(epoch, fills.payload().boundary().completion_sequence());
+        let request_occurrence =
+            PmPrivateOccurrence::new(epoch, fills.payload().boundary().request_sequence());
+        let revision = Some(fills.payload().snapshot().revision());
+        let occurrences = self.preflight_owned_private_range(
+            fills.payload().fills().len(),
+            private_occurrence,
+            revision,
+        )?;
+        preflight_owned_fill_batch(
+            &self.owned_lifecycle,
+            fills.payload().fills(),
+            occurrences,
+            crate::owned_lifecycle::PmOwnedObservationSource::RestReconciliation,
+        )?;
+        self.fills
+            .apply_preflighted_query(&fills, occurrences.occurrence(0), &self.config)
+            .expect("complete fill cut commit was exhaustively preflighted");
+        let account_outcome = self
+            .account
+            .apply(&account, &self.config)
+            .expect("complete account cut commit was exhaustively previewed");
+        for (index, fill) in fills.payload().fills().iter().copied().enumerate() {
+            let occurrence = occurrences.occurrence(index);
+            let stale_before_cut = self
+                .owned_lifecycle
+                .fills()
+                .find(|prior| prior.key() == fill.fill_key())
+                .and_then(|prior| prior.last_occurrence().private_occurrence())
+                .is_some_and(|prior| prior > request_occurrence);
+            let (owned_remote_apply, owned) = reduce_owned_fill_event(
+                &mut self.owned_lifecycle,
+                fill,
+                occurrence,
+                crate::owned_lifecycle::PmOwnedObservationSource::RestReconciliation,
+                None,
+            )
+            .expect("owned REST fill commit was exhaustively preflighted");
+            if let Some(output) = reductions.as_deref_mut() {
+                let disposition = match owned {
+                    Some(reduction) => match reduction.apply() {
+                        crate::owned_lifecycle::PmOwnedFillApply::Applied { .. } => {
+                            PmReconciliationFillDisposition::OwnedApplied(reduction)
+                        }
+                        crate::owned_lifecycle::PmOwnedFillApply::Duplicate { .. }
+                            if stale_before_cut =>
+                        {
+                            PmReconciliationFillDisposition::OwnedStale(reduction)
+                        }
+                        crate::owned_lifecycle::PmOwnedFillApply::Duplicate { .. } => {
+                            PmReconciliationFillDisposition::OwnedDuplicate(reduction)
+                        }
+                        crate::owned_lifecycle::PmOwnedFillApply::IgnoredOldEpoch => {
+                            PmReconciliationFillDisposition::OwnedStale(reduction)
+                        }
+                    },
+                    None => PmReconciliationFillDisposition::Unowned(owned_remote_apply),
+                };
+                let envelope = EventEnvelope::new(
+                    fills.venue(),
+                    fills.source(),
+                    fills.connection_id(),
+                    fills.clock(),
+                    fills.ordering(),
+                    fill,
+                )
+                .expect("complete fill query already proved every row source");
+                output.push(PmReconciliationFillReduction::new(envelope, disposition));
             }
-        };
+        }
+        self.commit_owned_private_range(occurrences);
         let boundary = account.payload().boundary();
-        let request_occurrence = PmPrivateOccurrence::new(epoch, boundary.request_sequence());
         let completion_occurrence = PmPrivateOccurrence::new(epoch, boundary.completion_sequence());
         self.unresolved_fills
             .cover_through(request_occurrence, completion_occurrence);
@@ -398,10 +647,20 @@ impl PmPrivateState {
                 uncovered_fills: uncovered,
             }
         };
-        if uncovered > 0 {
-            self.require_refresh(PmRefreshReason::AccountDivergence)?;
+        if uncovered > 0
+            && let Err(error) = self.require_refresh(PmRefreshReason::AccountDivergence)
+        {
+            if let Some(output) = reductions.as_deref_mut() {
+                output.prepare(0);
+            }
+            return Err(error);
         }
-        self.require_for_account_state()?;
+        if let Err(error) = self.require_for_account_state() {
+            if let Some(output) = reductions {
+                output.prepare(0);
+            }
+            return Err(error);
+        }
         self.risk.recover_after_complete_reconciliation();
         Ok(PmReconciliationApply::Applied {
             boundary,
@@ -689,7 +948,9 @@ impl PmPrivateState {
         epoch: ConnectionEpoch,
         monotonic_ns: u64,
     ) -> Result<(), PmPrivateStateError> {
+        self.owned_lifecycle.validate_epoch(epoch)?;
         self.require_refresh(PmRefreshReason::PrivateReconnect)?;
+        self.owned_lifecycle.begin_epoch(epoch)?;
         self.current_epoch = Some(epoch);
         self.private_available = false;
         self.private_observed_ns = Some(monotonic_ns);
@@ -939,6 +1200,14 @@ pub enum PmPrivateStateError {
     CanonicalInventoryUnavailable,
     #[error("canonical exact exposure arithmetic overflowed")]
     ArithmeticOverflow,
+    #[error("an immediate owned acknowledgement ticket is still pending reduction")]
+    OwnedImmediateAckPending,
+    #[error("the immediate owned acknowledgement ticket belongs to another owner or occurrence")]
+    OwnedImmediateAckTicketMismatch,
+    #[error("the owner-local owned reduction sequence exhausted")]
+    OwnedReductionSequenceExhausted,
+    #[error("journal recovery owned reduction sequence did not advance")]
+    OwnedRecoverySequenceDidNotAdvance,
     #[error(transparent)]
     Config(#[from] PmPrivateConfigError),
     #[error(transparent)]
@@ -947,6 +1216,8 @@ pub enum PmPrivateStateError {
     Account(#[from] PmAccountStateError),
     #[error(transparent)]
     Order(#[from] PmOrderStateError),
+    #[error(transparent)]
+    OwnedLifecycle(#[from] PmOwnedOrderLifecycleError),
     #[error(transparent)]
     Fill(#[from] PmFillStateError),
     #[error(transparent)]

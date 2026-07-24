@@ -15,14 +15,19 @@ use reap_pm_core::{
 };
 use reap_pm_state::{
     PmAccountSnapshotApply, PmCardinalityRiskLimits, PmExactReservation, PmExposureRiskLimits,
-    PmFillApply, PmFillFeeState, PmFreshnessRiskLimits, PmOpenOrdersApply, PmOrderApply,
-    PmOrderOwnership, PmOrderRiskLimits, PmOwnedOrderRegistration, PmPositionKnowledge,
-    PmPrivateConvergence, PmPrivateDependency, PmPrivateExternalIngressFailure,
-    PmPrivateExternalIngressFault, PmPrivateExternalIngressLane, PmPrivateHaltReason,
-    PmPrivateQuoteRequest, PmPrivateReadiness, PmPrivateReadinessReason, PmPrivateState,
-    PmPrivateStateConfig, PmPrivateStateError, PmRefreshAdmission, PmRefreshReason,
-    PmRefreshRequired, PmRemoteOrderKnowledge, PmReservationKnowledge, PmRiskDecision,
-    PmRiskDependency, PmRiskLimits, PmRiskReason, PmUnresolvedFillApply,
+    PmFillApply, PmFillFeeState, PmFreshnessRiskLimits, PmOpenOrderReservation, PmOpenOrdersApply,
+    PmOrderApply, PmOrderOwnership, PmOrderRiskLimits, PmOwnedCancelOutcome,
+    PmOwnedCancelRequestApply, PmOwnedFillApply, PmOwnedIntentId, PmOwnedObservationOccurrence,
+    PmOwnedObservationSource, PmOwnedOrderLifecycleError, PmOwnedOrderRegistration,
+    PmOwnedProgressApply, PmOwnedQuoteAdmission, PmOwnedQuoteIntent, PmOwnedQuoteSlotKey,
+    PmOwnedRecoveryFill, PmOwnedReductionSequence, PmOwnedRemoteOrderApply, PmOwnedSubmitResult,
+    PmPositionKnowledge, PmPrivateConvergence, PmPrivateDependency,
+    PmPrivateExternalIngressFailure, PmPrivateExternalIngressFault, PmPrivateExternalIngressLane,
+    PmPrivateHaltReason, PmPrivateOccurrence, PmPrivateQuoteRequest, PmPrivateReadiness,
+    PmPrivateReadinessReason, PmPrivateState, PmPrivateStateConfig, PmPrivateStateError,
+    PmReconciliationFillDisposition, PmReconciliationReductions, PmRefreshAdmission,
+    PmRefreshReason, PmRefreshRequired, PmRemoteOrderKnowledge, PmReservationKnowledge,
+    PmRiskDecision, PmRiskDependency, PmRiskLimits, PmRiskReason, PmUnresolvedFillApply,
     PmUnresolvedFillObservation, PmUnresolvedFillReason,
 };
 
@@ -351,6 +356,33 @@ fn fill_query(
 
 fn venue_order(id: &str) -> PmVenueOrderKey {
     PmVenueOrderKey::new(account(), PmVenueOrderId::new(id).unwrap())
+}
+
+fn client_order(id: u8) -> PmClientOrderKey {
+    PmClientOrderKey::new(account(), PmClientOrderId::from_bytes([id; 16]).unwrap())
+}
+
+fn owned_quote_intent(intent: u64, client: u8, side: PmOrderSide) -> PmOwnedQuoteIntent {
+    let price = PmPrice::parse_decimal("0.40").unwrap();
+    let quantity = PmQuantity::parse_decimal("1").unwrap();
+    let reservation = match side {
+        PmOrderSide::Buy => {
+            PmExactReservation::policy_approved(U256::from_u64(400_000), U256::ZERO)
+        }
+        PmOrderSide::Sell => {
+            PmExactReservation::policy_approved(U256::ZERO, quantity.protocol_units())
+        }
+    }
+    .unwrap();
+    PmOwnedQuoteIntent::new(
+        PmOwnedIntentId::new(intent).unwrap(),
+        PmOwnedQuoteSlotKey::new(scope(), instrument(), side),
+        client_order(client),
+        price,
+        quantity,
+        reservation,
+    )
+    .unwrap()
 }
 
 fn order(
@@ -840,7 +872,11 @@ fn a_reconciliation_row_cannot_cover_or_overwrite_a_later_ws_fill() {
         .unwrap();
     assert_eq!(projection.settlement(), PmFillSettlementStatus::Mined);
     assert_eq!(
-        projection.last_occurrence().ingress(),
+        projection
+            .last_occurrence()
+            .private_occurrence()
+            .unwrap()
+            .ingress(),
         IngressSequence::new(45)
     );
     assert_eq!(projection.covered_by_reconciliation(), None);
@@ -2390,4 +2426,798 @@ fn fill_capacity_deduplicates_before_saturation_and_never_evicts() {
         state.halt(),
         Some(reap_pm_state::PmPrivateHaltReason::FillCapacity)
     );
+}
+
+#[test]
+fn immediate_owned_fill_changes_exposure_and_ws_rest_duplicates_apply_principal_once() {
+    let mut state = new_state();
+    make_ready(&mut state);
+    let quote = owned_quote_intent(1, 71, PmOrderSide::Buy);
+    let client = quote.client_order();
+    let venue = venue_order("owned-immediate");
+    assert_eq!(
+        state.admit_owned_quote(quote).unwrap(),
+        PmOwnedQuoteAdmission::Admitted(client)
+    );
+    state
+        .apply_owned_submit_result(client, PmOwnedSubmitResult::Accepted(venue))
+        .unwrap();
+
+    let event = fill(
+        "owned-immediate",
+        "owned-fill-1",
+        PmOrderSide::Buy,
+        "0.25",
+        PmFillFee::Unknown,
+    );
+    let ticket = state.issue_owned_immediate_ack_ticket().unwrap();
+    let ticket_occurrence = ticket.occurrence();
+    state
+        .observe_owned_immediate_fill(ticket, event, Some(U256::from_u64(250_000)))
+        .unwrap();
+    assert_eq!(state.provisional_deltas().uncovered_fills(), 1);
+    assert_eq!(state.fill_counters().principal_applications(), 1);
+    let immediate = state.owned_fills().next().unwrap();
+    assert_eq!(immediate.first_occurrence(), ticket_occurrence);
+    assert!(immediate.observed_from(PmOwnedObservationSource::ImmediateAcknowledgement));
+
+    assert_eq!(
+        state
+            .observe_fill(envelope(event, 1, 30, None, 120))
+            .unwrap(),
+        PmFillApply::Duplicate
+    );
+    assert_eq!(state.fill_counters().principal_applications(), 1);
+    assert!(
+        state
+            .owned_fills()
+            .next()
+            .unwrap()
+            .observed_from(PmOwnedObservationSource::PrivateWebSocket)
+    );
+
+    let prior_watermark = state.fill_watermark().unwrap();
+    let cut = boundary(40, 41);
+    let account = envelope(
+        account_snapshot(
+            3,
+            cut,
+            AccountFacts {
+                collateral: Some(9_900_000),
+                outcome: Some(5_250_000),
+                position: Some((5_250_000, PmPositionAvailability::Tradable)),
+                collateral_allowance: Some(10_000_000),
+                outcome_approval: Some(true),
+                unknown_extra: false,
+            },
+        ),
+        1,
+        41,
+        Some(3),
+        130,
+    );
+    let fills = envelope(
+        fill_query(3, cut, Some(prior_watermark), 2, vec![event]),
+        1,
+        41,
+        Some(3),
+        130,
+    );
+    state.apply_reconciliation(account, fills).unwrap();
+    assert_eq!(state.fill_counters().principal_applications(), 1);
+    let owned_fill = state.owned_fills().next().unwrap();
+    assert!(owned_fill.observed_from(PmOwnedObservationSource::ImmediateAcknowledgement));
+    assert!(owned_fill.observed_from(PmOwnedObservationSource::PrivateWebSocket));
+    assert!(owned_fill.observed_from(PmOwnedObservationSource::RestReconciliation));
+}
+
+#[test]
+fn reconciliation_reductions_expose_each_unique_owned_maker_leg_in_input_order() {
+    let mut state = new_state();
+    make_ready(&mut state);
+    let buy = owned_quote_intent(1, 81, PmOrderSide::Buy);
+    let sell = owned_quote_intent(2, 82, PmOrderSide::Sell);
+    let buy_client = buy.client_order();
+    let sell_client = sell.client_order();
+    let buy_venue = venue_order("rest-multi-buy");
+    let sell_venue = venue_order("rest-multi-sell");
+    state.admit_owned_quote(buy).unwrap();
+    state
+        .apply_owned_submit_result(buy_client, PmOwnedSubmitResult::Accepted(buy_venue))
+        .unwrap();
+    state.admit_owned_quote(sell).unwrap();
+    state
+        .apply_owned_submit_result(sell_client, PmOwnedSubmitResult::Accepted(sell_venue))
+        .unwrap();
+
+    // One trade can contain more than one maker leg. Fill identity is the
+    // venue-order/fill-id pair, so equal trade ids on distinct maker orders
+    // remain two exact principal applications.
+    let buy_leg = fill(
+        "rest-multi-buy",
+        "shared-maker-trade",
+        PmOrderSide::Buy,
+        "0.25",
+        PmFillFee::Unknown,
+    );
+    let sell_leg = fill(
+        "rest-multi-sell",
+        "shared-maker-trade",
+        PmOrderSide::Sell,
+        "0.25",
+        PmFillFee::Unknown,
+    );
+    let unowned = fill(
+        "rest-multi-external",
+        "shared-maker-trade",
+        PmOrderSide::Buy,
+        "0.25",
+        PmFillFee::Unknown,
+    );
+    let prior_watermark = state.fill_watermark();
+    let cut = boundary(40, 41);
+    let account = envelope(
+        account_snapshot(3, cut, AccountFacts::ready()),
+        1,
+        41,
+        Some(3),
+        130,
+    );
+    let fills = envelope(
+        fill_query(3, cut, prior_watermark, 2, vec![buy_leg, sell_leg, unowned]),
+        1,
+        41,
+        Some(3),
+        130,
+    );
+    let mut reductions = PmReconciliationReductions::new();
+    state
+        .apply_reconciliation_with_reductions(account, fills, &mut reductions)
+        .unwrap();
+
+    assert_eq!(reductions.len(), 3);
+    assert_eq!(reductions.unique_owned().count(), 2);
+    let mut rows = reductions.iter();
+    let first = rows.next().unwrap();
+    assert_eq!(reductions.get(0), Some(first));
+    assert_eq!(reductions.get(3), None);
+    let second = rows.next().unwrap();
+    let third = rows.next().unwrap();
+    assert_eq!(*first.envelope().payload(), buy_leg);
+    assert_eq!(*second.envelope().payload(), sell_leg);
+    assert_eq!(*third.envelope().payload(), unowned);
+
+    let PmReconciliationFillDisposition::OwnedApplied(first_owned) = first.disposition() else {
+        panic!("first maker leg must be a unique owned fill");
+    };
+    let PmReconciliationFillDisposition::OwnedApplied(second_owned) = second.disposition() else {
+        panic!("second maker leg must be a unique owned fill");
+    };
+    assert_eq!(
+        first_owned.source(),
+        PmOwnedObservationSource::RestReconciliation
+    );
+    assert_eq!(
+        second_owned.source(),
+        PmOwnedObservationSource::RestReconciliation
+    );
+    assert_eq!(first_owned.observation().key(), buy_leg.fill_key());
+    assert_eq!(second_owned.observation().key(), sell_leg.fill_key());
+    assert_eq!(
+        second_owned.occurrence().reduction_sequence().value(),
+        first_owned.occurrence().reduction_sequence().value() + 1
+    );
+    assert_eq!(
+        first_owned.occurrence().private_occurrence(),
+        Some(PmPrivateOccurrence::new(
+            ConnectionEpoch::new(1),
+            IngressSequence::new(41),
+        ))
+    );
+    assert_eq!(
+        first_owned.occurrence().snapshot_revision(),
+        Some(SnapshotRevision::new(3))
+    );
+    assert_eq!(
+        state
+            .fills()
+            .find(|fill| fill.key() == buy_leg.fill_key())
+            .unwrap()
+            .last_occurrence(),
+        first_owned.occurrence()
+    );
+    assert_eq!(
+        state
+            .fills()
+            .find(|fill| fill.key() == sell_leg.fill_key())
+            .unwrap()
+            .last_occurrence(),
+        second_owned.occurrence()
+    );
+    assert!(matches!(
+        third.disposition(),
+        PmReconciliationFillDisposition::Unowned(PmOwnedRemoteOrderApply::AmbiguousRemote)
+    ));
+    assert_eq!(
+        state.owned_order(buy_client).unwrap().known_fill_total(),
+        U256::from_u64(250_000)
+    );
+    assert_eq!(
+        state.owned_order(sell_client).unwrap().known_fill_total(),
+        U256::from_u64(250_000)
+    );
+}
+
+#[test]
+fn reconciliation_reductions_separate_ws_duplicates_from_rows_stale_to_the_cut() {
+    let mut state = new_state();
+    make_ready(&mut state);
+    let quote = owned_quote_intent(1, 83, PmOrderSide::Buy);
+    let client = quote.client_order();
+    let venue = venue_order("rest-duplicate");
+    state.admit_owned_quote(quote).unwrap();
+    state
+        .apply_owned_submit_result(client, PmOwnedSubmitResult::Accepted(venue))
+        .unwrap();
+    let event = fill(
+        "rest-duplicate",
+        "rest-duplicate-fill",
+        PmOrderSide::Buy,
+        "0.25",
+        PmFillFee::Unknown,
+    );
+    state
+        .observe_fill_reduction(envelope(event, 1, 30, None, 120))
+        .unwrap();
+
+    let cut = boundary(40, 41);
+    let mut reductions = PmReconciliationReductions::new();
+    state
+        .apply_reconciliation_with_reductions(
+            envelope(
+                account_snapshot(3, cut, AccountFacts::ready()),
+                1,
+                41,
+                Some(3),
+                130,
+            ),
+            envelope(
+                fill_query(3, cut, state.fill_watermark(), 2, vec![event]),
+                1,
+                41,
+                Some(3),
+                130,
+            ),
+            &mut reductions,
+        )
+        .unwrap();
+    let duplicate = reductions.iter().next().unwrap();
+    let PmReconciliationFillDisposition::OwnedDuplicate(duplicate_owned) = duplicate.disposition()
+    else {
+        panic!("REST observation after the WS occurrence must be a duplicate");
+    };
+    assert!(matches!(
+        duplicate_owned.apply(),
+        PmOwnedFillApply::Duplicate {
+            source_added: true,
+            ..
+        }
+    ));
+    assert_eq!(reductions.unique_owned().count(), 0);
+
+    // A later WS occurrence followed by a cut whose request boundary predates
+    // that occurrence is an explicitly stale REST row, not another durable
+    // application.
+    assert_eq!(
+        state
+            .observe_fill(envelope(event, 1, 50, None, 140))
+            .unwrap(),
+        PmFillApply::Duplicate
+    );
+    let stale_cut = boundary(45, 51);
+    state
+        .apply_reconciliation_with_reductions(
+            envelope(
+                account_snapshot(4, stale_cut, AccountFacts::ready()),
+                1,
+                51,
+                Some(4),
+                150,
+            ),
+            envelope(
+                fill_query(4, stale_cut, state.fill_watermark(), 3, vec![event]),
+                1,
+                51,
+                Some(4),
+                150,
+            ),
+            &mut reductions,
+        )
+        .unwrap();
+    assert!(matches!(
+        reductions.iter().next().unwrap().disposition(),
+        PmReconciliationFillDisposition::OwnedStale(_)
+    ));
+    assert_eq!(state.owned_fills().count(), 1);
+}
+
+#[test]
+fn reconciliation_owned_preflight_failure_commits_neither_cut_nor_sequence_range() {
+    let mut seed = new_state();
+    make_ready(&mut seed);
+    let seed_cut = boundary(40, 41);
+    let mut reductions = PmReconciliationReductions::new();
+    seed.apply_reconciliation_with_reductions(
+        envelope(
+            account_snapshot(3, seed_cut, AccountFacts::ready()),
+            1,
+            41,
+            Some(3),
+            130,
+        ),
+        envelope(
+            fill_query(
+                3,
+                seed_cut,
+                seed.fill_watermark(),
+                2,
+                vec![fill(
+                    "seed-unowned",
+                    "seed-fill",
+                    PmOrderSide::Buy,
+                    "0.25",
+                    PmFillFee::Unknown,
+                )],
+            ),
+            1,
+            41,
+            Some(3),
+            130,
+        ),
+        &mut reductions,
+    )
+    .unwrap();
+    assert_eq!(reductions.len(), 1);
+
+    let mut state = new_state();
+    make_ready(&mut state);
+    let quote = owned_quote_intent(1, 84, PmOrderSide::Buy);
+    let client = quote.client_order();
+    let venue = venue_order("rest-atomic");
+    state.admit_owned_quote(quote).unwrap();
+    state
+        .apply_owned_submit_result(client, PmOwnedSubmitResult::Accepted(venue))
+        .unwrap();
+    let prior_snapshot = state.account_projection().snapshot();
+    let prior_watermark = state.fill_watermark();
+    let cut = boundary(40, 41);
+    let result = state.apply_reconciliation_with_reductions(
+        envelope(
+            account_snapshot(
+                3,
+                cut,
+                AccountFacts {
+                    collateral: Some(1),
+                    ..AccountFacts::ready()
+                },
+            ),
+            1,
+            41,
+            Some(3),
+            130,
+        ),
+        envelope(
+            fill_query(
+                3,
+                cut,
+                prior_watermark,
+                2,
+                vec![
+                    fill(
+                        "rest-atomic",
+                        "overfill-leg-a",
+                        PmOrderSide::Buy,
+                        "0.75",
+                        PmFillFee::Unknown,
+                    ),
+                    fill(
+                        "rest-atomic",
+                        "overfill-leg-b",
+                        PmOrderSide::Buy,
+                        "0.75",
+                        PmFillFee::Unknown,
+                    ),
+                ],
+            ),
+            1,
+            41,
+            Some(3),
+            130,
+        ),
+        &mut reductions,
+    );
+    assert!(matches!(
+        result,
+        Err(PmPrivateStateError::OwnedLifecycle(
+            PmOwnedOrderLifecycleError::Overfill
+        ))
+    ));
+    assert!(reductions.is_empty());
+    assert_eq!(state.account_projection().snapshot(), prior_snapshot);
+    assert_eq!(state.fill_watermark(), prior_watermark);
+    assert_eq!(state.fills().count(), 0);
+    assert_eq!(state.owned_fills().count(), 0);
+    assert_eq!(
+        state.owned_order(client).unwrap().known_fill_total(),
+        U256::ZERO
+    );
+
+    let mut control = new_state();
+    make_ready(&mut control);
+    let control_quote = owned_quote_intent(1, 84, PmOrderSide::Buy);
+    let control_client = control_quote.client_order();
+    control.admit_owned_quote(control_quote).unwrap();
+    control
+        .apply_owned_submit_result(
+            control_client,
+            PmOwnedSubmitResult::Accepted(venue_order("rest-atomic")),
+        )
+        .unwrap();
+    let failed_next = state.issue_owned_immediate_ack_ticket().unwrap();
+    let control_next = control.issue_owned_immediate_ack_ticket().unwrap();
+    assert_eq!(
+        failed_next.occurrence().reduction_sequence(),
+        control_next.occurrence().reduction_sequence()
+    );
+}
+
+#[test]
+fn private_reduction_results_retain_exact_inputs_and_owned_transition_facts() {
+    let mut state = new_state();
+    let quote = owned_quote_intent(1, 76, PmOrderSide::Buy);
+    let client = quote.client_order();
+    let venue = venue_order("owned-reduction");
+    state.admit_owned_quote(quote).unwrap();
+    state
+        .apply_owned_submit_result(client, PmOwnedSubmitResult::Accepted(venue))
+        .unwrap();
+
+    let order_event = order(
+        76,
+        "owned-reduction",
+        PmOrderSide::Buy,
+        PmOrderStatus::PartiallyFilled,
+        250_000,
+    );
+    let order_input = envelope(order_event, 1, 30, None, 120);
+    let order_reduction = state
+        .observe_order_reduction(order_input, PmRemoteOrderKnowledge::Ambiguous)
+        .unwrap();
+    assert_eq!(order_reduction.envelope(), order_input);
+    assert_eq!(
+        order_reduction.knowledge(),
+        PmRemoteOrderKnowledge::Ambiguous
+    );
+    assert_eq!(
+        order_reduction.owned_remote_apply(),
+        PmOwnedRemoteOrderApply::Matched(client)
+    );
+    let owned_order = order_reduction.owned().unwrap();
+    assert_eq!(
+        owned_order.source(),
+        PmOwnedObservationSource::PrivateWebSocket
+    );
+    assert_eq!(
+        owned_order.occurrence().private_occurrence(),
+        Some(PmPrivateOccurrence::new(
+            ConnectionEpoch::new(1),
+            IngressSequence::new(30),
+        ))
+    );
+    assert!(matches!(
+        owned_order.apply(),
+        PmOwnedProgressApply::Applied { .. }
+    ));
+    assert_eq!(owned_order.observation().client_order(), client);
+    assert_eq!(owned_order.observation().venue_order(), venue);
+
+    let fill_event = fill(
+        "owned-reduction",
+        "owned-reduction-fill",
+        PmOrderSide::Buy,
+        "0.25",
+        PmFillFee::Unknown,
+    );
+    let fill_input = envelope(fill_event, 1, 31, None, 121);
+    let fill_reduction = state.observe_fill_reduction(fill_input).unwrap();
+    assert_eq!(fill_reduction.envelope(), fill_input);
+    assert!(matches!(
+        fill_reduction.canonical_apply(),
+        PmFillApply::PrincipalApplied { .. }
+    ));
+    assert_eq!(
+        fill_reduction.owned_remote_apply(),
+        PmOwnedRemoteOrderApply::Matched(client)
+    );
+    let owned_fill = fill_reduction.owned().unwrap();
+    assert_eq!(
+        owned_fill.source(),
+        PmOwnedObservationSource::PrivateWebSocket
+    );
+    assert_eq!(
+        owned_fill.occurrence().private_occurrence(),
+        Some(PmPrivateOccurrence::new(
+            ConnectionEpoch::new(1),
+            IngressSequence::new(31),
+        ))
+    );
+    assert!(matches!(
+        owned_fill.apply(),
+        PmOwnedFillApply::Applied { .. }
+    ));
+    assert_eq!(owned_fill.observation().key(), fill_event.fill_key());
+    assert_eq!(
+        owned_fill.observation().quantity(),
+        fill_event.execution().quantity()
+    );
+    assert_eq!(owned_fill.observation().reported_cumulative(), None);
+}
+
+#[test]
+fn typed_fill_recovery_preserves_original_source_and_exact_principal() {
+    let mut state = new_state();
+    let quote = owned_quote_intent(1, 77, PmOrderSide::Buy);
+    let client = quote.client_order();
+    let venue = venue_order("owned-recovery");
+    state.admit_owned_quote(quote).unwrap();
+    state
+        .apply_owned_submit_result(client, PmOwnedSubmitResult::Accepted(venue))
+        .unwrap();
+
+    let event = fill(
+        "owned-recovery",
+        "owned-recovery-fill",
+        PmOrderSide::Buy,
+        "0.25",
+        PmFillFee::Unknown,
+    );
+    let sequence = PmOwnedReductionSequence::new(10).unwrap();
+    let occurrence = PmOwnedObservationOccurrence::new(
+        sequence,
+        Some(PmPrivateOccurrence::new(
+            ConnectionEpoch::new(1),
+            IngressSequence::new(30),
+        )),
+        None,
+    )
+    .unwrap();
+    assert!(matches!(
+        state
+            .recover_owned_fill(PmOwnedRecoveryFill::new(
+                event,
+                Some(U256::from_u64(250_000)),
+                occurrence,
+                PmOwnedObservationSource::PrivateWebSocket,
+            ))
+            .unwrap(),
+        PmOwnedFillApply::Applied {
+            client_order,
+            cumulative_filled,
+            ..
+        } if client_order == client && cumulative_filled == U256::from_u64(250_000)
+    ));
+    assert_eq!(state.fill_counters().principal_applications(), 1);
+    assert_eq!(state.provisional_deltas().uncovered_fills(), 1);
+    let recovered = state.owned_fills().next().unwrap();
+    assert_eq!(recovered.first_occurrence(), occurrence);
+    assert!(recovered.observed_from(PmOwnedObservationSource::PrivateWebSocket));
+    state
+        .finish_owned_recovery(PmOwnedReductionSequence::new(11).unwrap())
+        .unwrap();
+}
+
+#[test]
+fn exact_private_progress_cancel_detail_and_compaction_share_one_owned_aggregate() {
+    let mut state = new_state();
+    let quote = owned_quote_intent(1, 72, PmOrderSide::Buy);
+    let client = quote.client_order();
+    let venue = venue_order("owned-progress");
+    state.admit_owned_quote(quote).unwrap();
+    state
+        .apply_owned_submit_result(client, PmOwnedSubmitResult::Accepted(venue))
+        .unwrap();
+
+    let partial = order(
+        72,
+        "owned-progress",
+        PmOrderSide::Buy,
+        PmOrderStatus::PartiallyFilled,
+        250_000,
+    );
+    state
+        .observe_order(
+            envelope(partial, 1, 30, None, 120),
+            PmRemoteOrderKnowledge::Ambiguous,
+        )
+        .unwrap();
+    assert_eq!(
+        state.owned_order(client).unwrap().cumulative_filled(),
+        U256::from_u64(250_000)
+    );
+
+    state
+        .apply_open_orders_snapshot(
+            envelope(
+                open_orders(1, boundary(35, 36), vec![partial]),
+                1,
+                36,
+                Some(1),
+                125,
+            ),
+            &[PmOpenOrderReservation::new(
+                venue,
+                PmReservationKnowledge::Known(
+                    PmExactReservation::policy_approved(U256::from_u64(400_000), U256::ZERO)
+                        .unwrap(),
+                ),
+            )],
+        )
+        .unwrap();
+    assert_eq!(
+        state.owned_order(client).unwrap().cumulative_filled(),
+        U256::from_u64(250_000)
+    );
+
+    let cancel = match state.request_owned_cancel(client).unwrap() {
+        PmOwnedCancelRequestApply::Issued(intent) => intent,
+        other => panic!("expected cancel intent, got {other:?}"),
+    };
+    state
+        .apply_owned_cancel_result(cancel, PmOwnedCancelOutcome::Accepted)
+        .unwrap();
+    let detail = PmExactOrderDetail::new(
+        source(),
+        scope(),
+        snapshot(2),
+        boundary(40, 41),
+        venue,
+        None,
+    )
+    .unwrap();
+    state
+        .apply_order_detail(
+            envelope(detail, 1, 41, Some(2), 130),
+            PmReservationKnowledge::Unknown,
+        )
+        .unwrap();
+    assert!(state.owned_order(client).unwrap().reconciliation_required());
+    assert!(state.compact_proven_owned_terminal(client).is_err());
+
+    let remaining = fill(
+        "owned-progress",
+        "owned-fill-final",
+        PmOrderSide::Buy,
+        "1",
+        PmFillFee::Unknown,
+    );
+    state
+        .observe_fill(envelope(remaining, 1, 42, None, 131))
+        .unwrap();
+    assert_eq!(
+        state.owned_order(client).unwrap().status(),
+        Some(PmOrderStatus::Filled)
+    );
+}
+
+#[test]
+fn accepted_zero_fill_cancel_can_be_settled_by_exact_detail_and_compacted() {
+    let mut state = new_state();
+    let quote = owned_quote_intent(1, 73, PmOrderSide::Buy);
+    let client = quote.client_order();
+    let venue = venue_order("owned-cancelled");
+    state.admit_owned_quote(quote).unwrap();
+    state
+        .apply_owned_submit_result(client, PmOwnedSubmitResult::Accepted(venue))
+        .unwrap();
+    let cancel = match state.request_owned_cancel(client).unwrap() {
+        PmOwnedCancelRequestApply::Issued(intent) => intent,
+        other => panic!("expected cancel intent, got {other:?}"),
+    };
+    state
+        .apply_owned_cancel_result(cancel, PmOwnedCancelOutcome::Accepted)
+        .unwrap();
+    let detail = PmExactOrderDetail::new(
+        source(),
+        scope(),
+        snapshot(1),
+        boundary(40, 41),
+        venue,
+        None,
+    )
+    .unwrap();
+    state
+        .apply_order_detail(
+            envelope(detail, 1, 41, Some(1), 130),
+            PmReservationKnowledge::Unknown,
+        )
+        .unwrap();
+    assert!(!state.owned_order(client).unwrap().reconciliation_required());
+    state.compact_proven_owned_terminal(client).unwrap();
+    assert_eq!(state.owned_orders().count(), 0);
+    assert_eq!(state.orders().count(), 0);
+}
+
+#[test]
+fn private_aggregate_compaction_reuses_canonical_registration_for_ten_thousand_cycles() {
+    let mut state = new_state();
+    let price = PmPrice::parse_decimal("0.40").unwrap();
+    let quantity = PmQuantity::parse_decimal("1").unwrap();
+    let reservation =
+        PmExactReservation::policy_approved(U256::from_u64(400_000), U256::ZERO).unwrap();
+    for id in 1_u64..=10_000 {
+        let mut bytes = [0_u8; 16];
+        bytes[8..].copy_from_slice(&id.to_be_bytes());
+        let client = PmClientOrderKey::new(account(), PmClientOrderId::from_bytes(bytes).unwrap());
+        let quote = PmOwnedQuoteIntent::new(
+            PmOwnedIntentId::new(id).unwrap(),
+            PmOwnedQuoteSlotKey::new(scope(), instrument(), PmOrderSide::Buy),
+            client,
+            price,
+            quantity,
+            reservation,
+        )
+        .unwrap();
+        state.admit_owned_quote(quote).unwrap();
+        state
+            .apply_owned_submit_result(client, PmOwnedSubmitResult::Rejected)
+            .unwrap();
+        state.compact_proven_owned_terminal(client).unwrap();
+    }
+    assert_eq!(state.owned_orders().count(), 0);
+    assert_eq!(state.orders().count(), 0);
+    assert_eq!(
+        state.owned_lifecycle_counters().terminal_compactions(),
+        10_000
+    );
+    assert_eq!(state.order_counters().capacity_failures(), 0);
+}
+
+#[test]
+fn reconnect_marks_owned_order_unknown_until_exact_new_epoch_progress() {
+    let mut state = new_state();
+    let quote = owned_quote_intent(1, 74, PmOrderSide::Buy);
+    let client = quote.client_order();
+    let venue = venue_order("owned-reconnect");
+    state.admit_owned_quote(quote).unwrap();
+    state
+        .apply_owned_submit_result(client, PmOwnedSubmitResult::Accepted(venue))
+        .unwrap();
+    state
+        .observe_reconnect(ConnectionEpoch::new(2), 200)
+        .unwrap();
+    assert!(state.owned_order(client).unwrap().reconciliation_required());
+
+    let open = order(
+        74,
+        "owned-reconnect",
+        PmOrderSide::Buy,
+        PmOrderStatus::Open,
+        0,
+    );
+    assert!(matches!(
+        state.observe_order(
+            envelope(open, 1, 30, None, 201),
+            PmRemoteOrderKnowledge::Ambiguous,
+        ),
+        Err(PmPrivateStateError::OldConnectionEpoch)
+    ));
+    assert!(state.owned_order(client).unwrap().reconciliation_required());
+
+    state
+        .observe_order(
+            envelope(open, 2, 1, None, 202),
+            PmRemoteOrderKnowledge::Ambiguous,
+        )
+        .unwrap();
+    assert!(!state.owned_order(client).unwrap().reconciliation_required());
 }
