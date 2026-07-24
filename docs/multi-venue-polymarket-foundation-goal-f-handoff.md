@@ -5,9 +5,11 @@ Status: in progress overall. Phase 0 is green at
 `eb71bc1b84cef6152dc010922641e9d5bb019e43`; Phase 2 is green at
 `7014a611f997e0bec8e86051d56f333d57776fc1`; Phase 3 is green at
 `dd54297aaa35600171904524a7b43adc3948a724`; Phase 4 is green at
-`6737653a2c8dd3211db35b6b7259edc5fab38360`. This ledger is architecture and
-deterministic local evidence, not authenticated-connectivity evidence or
-trading authorization.
+`6737653a2c8dd3211db35b6b7259edc5fab38360`; and Phase 5 is green at
+`22044267eb2f9b675471858c0488f1f89de102fa`. Phase 6 is stopped on the
+documented measurement-contract contradiction below. This ledger is
+architecture and deterministic local evidence, not authenticated-connectivity
+evidence or trading authorization.
 
 The historical execution contract is the
 [Goal F prompt](multi-venue-polymarket-foundation-goal-f-prompt.md). The
@@ -42,8 +44,8 @@ deployed PM binary, target-host qualification, or production trading approval.
 | 2. Capability-specific venue framework seams | Green | `7014a611f997e0bec8e86051d56f333d57776fc1` |
 | 3. PM public market data, integrity, capture, replay | Green | `dd54297aaa35600171904524a7b43adc3948a724` |
 | 4. Read-only private lifecycle and position monitor | Green | `6737653a2c8dd3211db35b6b7259edc5fab38360` |
-| 5. Passive quote lifecycle and fake execution | Pending | — |
-| 6. PM coordinator, quote-model seam, local evidence | Pending | — |
+| 5. Passive quote lifecycle and fake execution | Green | `22044267eb2f9b675471858c0488f1f89de102fa` |
+| 6. PM coordinator, quote-model seam, local evidence | Stopped: contract amendment required | — |
 | 7. Documentation, global verification, final audit | Pending | — |
 
 ## Phase 4 Private-Lifecycle Protocol And Fixture Provenance
@@ -2171,3 +2173,568 @@ lines. No reviewed new production function exceeds 250 lines.
 This phase remains fixture/fake only. It adds no private network, credential,
 signer, authenticated request, mutation, PM journal schema, settlement,
 redemption, split, or merge behavior.
+
+## Phase 5: Passive Quote Lifecycle And Fake Execution
+
+Status: **GREEN** at implementation commit
+`22044267eb2f9b675471858c0488f1f89de102fa`. The gate covered the combined
+tree because bounded complete-scheduler and product-coordinator groundwork was
+already present. That groundwork does not claim the Phase 6 replay or
+measurement gate.
+
+### Product-neutral durability and separate PM journal
+
+`reap-durable-writer` remains the shared product-neutral lease, bounded queue,
+writer, flush, and sync layer. Its durable edge now exposes three take-once
+values: a nonblocking queue reservation, the exact committed record's
+nonblocking receipt, and an unforgeable acknowledgement produced only after
+the writer reports durable completion. Dropping an uncommitted reservation
+releases capacity; dropping a committed receipt does not cancel the accepted
+write.
+
+The PM product does not add a variant to the Chaos/OKX `StorageRecord` union.
+`reap-pm-live::journal` defines its own tuple family
+`reap-pm-mutation-journal`, schema version 1, codec, lease-scoped writer, and
+recovery reducer over these records:
+
+```text
+Header
+QuoteIntent
+PlaceResult
+CancelIntent
+CancelResult
+FillApplied
+OrderTerminal
+SafetyHalt
+FillWatermarkAdvanced
+```
+
+The journal scope fingerprint binds the PM product and schema identity, the
+full account scope (environment, chain, signer, funder, and account handle),
+the one configured instrument, and the public configuration fingerprint. The
+scope also fixes both `authentication_enabled` and `production_authorized` to
+false. A deterministic client-order identity is derived from that checked
+scope fingerprint and the monotonic local intent identity.
+
+The implemented bounds are evidence-bearing contract values:
+
+| Boundary | Fixed value |
+| --- | ---: |
+| Journal line | 64 KiB |
+| Journal file | 512 MiB |
+| Journal records | 262,144 |
+| Recovered owned orders | 1,024 |
+| Recovered fill keys | 8,192 |
+| Immediate acknowledgement fill legs | 64 |
+| Pending journal/persistence entries | 1,024 |
+
+Recovery requires one header at sequence zero, contiguous sequences, matching
+line and header scope fingerprints, newline-complete bounded JSONL, and valid
+record transitions. It retains the intent high-water independently of
+compaction. Fill and terminal observations replay through one
+owner-sequenced stream while preserving their original acknowledgement,
+private-WebSocket, or REST-reconciliation occurrence evidence. Exact fill
+keys remain deduplicable until a complete account fill watermark supplies the
+explicit compaction cut.
+
+The existing Chaos schema-7 recovery has a negative PM-family case, and PM
+recovery has a negative Chaos-envelope case. PM recovery also tests malformed
+JSON, a truncated tail, duplicate and noncontiguous sequences, a wrong line
+scope, and a tampered header scope. All ran green in the final combined gate.
+
+### Take-once mutation authority
+
+Quote and cancel authority follow distinct move-only state machines:
+
+```text
+ApprovedPmQuote -> ReservedPmQuote -> PreparedPmQuote
+ApprovedPmCancel -> ReservedPmCancel -> PreparedPmCancel
+```
+
+Constructors and transitions are crate-confined. Quote authority binds the
+exact account scope, instrument handle and venue identity, local intent and
+client order, side, exact price and quantity, exact maker/taker amounts,
+policy-approved reservation, passive profile, salt, timestamp, metadata/book/
+model/book-readiness/private-readiness revisions, and monotonic approval
+window. Approval consumes exact private-readiness and risk approval evidence;
+reservation consumes the canonical quote-slot admission; preparation consumes
+the exact durable intent acknowledgement.
+
+Quote preparation checks every approved revision and strict monotonic expiry.
+The bounded effect queue checks those facts again at the final fake-dispatch
+boundary. A durable intent whose quote authority has changed or expired is
+closed locally with an exact journaled rejection and never dispatched.
+
+Cancel authority is deliberately independent of later quote-model and public
+book revisions. It instead requires the canonical owned order, its exact
+venue-order identity, the fixture-only cancel purpose, and an unexpired
+approval. This preserves a safety-cancel path when quote revisions have become
+unavailable or changed, while still preventing an unowned or cross-scope
+cancel.
+
+Risk rejection preserves its exact typed reason and `None`/market/account/
+global halt scope across the mutation boundary. Candidate-only rejection
+suppresses only that quote. A scoped breach causes the product to emit ordered
+cancel-owned effects for its tracked canonical orders. Persistence or fake-
+effect saturation keeps new quotes halted, while a proven owned cancel becomes
+admissible again only after its required queue capacity is actually available.
+
+`PmUnsignedClobV2Order` is checked output-only data. Exact buy/sell amounts are
+lowered without floating point and construction revalidates the fixed EOA,
+grid, lot, minimum, and timestamp rules. It has no signature, deserialization,
+request, or transport capability.
+
+### One canonical mutation and lifecycle owner
+
+`PmMutationOwner` is crate-private and owns by value the existing
+`PmPrivateMonitorRuntime`, the fixture execution role, the PM journal,
+persistence queue, fake-effect queue, reconciliation scratch, and exact
+durable-consequence queue. It is the only object that joins readiness/risk,
+local reservation, durable intent ownership, prepared fake execution, result
+reduction, and restart recovery. Public capture and the Phase 4 read-only
+monitor still expose no mutation escalation.
+
+The canonical owned lifecycle is in `reap-pm-state`, rather than in a second
+gateway-side order map. Quote slots are structurally keyed by account,
+instrument/token, and side. They suppress exact duplicates, prevent
+overlapping ownership, and return an exact cancel-before-replace requirement
+when a bound resting order occupies the slot. Reservations release only after
+a proven terminal transition. The lifecycle retains fixed bounds of 1,024
+owned-order history entries and 8,192 owned fill keys, and supports bounded
+terminal compaction without reusing the local intent high-water.
+
+Submit reduction distinguishes an accepted resting order, accepted immediate
+fill, explicit rejection, ambiguous acknowledgement timeout, and a late
+acknowledgement after ambiguity. A timeout never causes a blind retry.
+Cancellation distinguishes accepted, rejected, already filled, and ambiguous
+acknowledgement outcomes. Late fills and cancel/fill races converge through
+the same owned lifecycle without terminal resurrection.
+
+### Exact fake outcomes and durable consequence bridge
+
+The adapter fake execution role is synchronous, in-process, credential-free,
+and fixed-profile. The only place profile is EOA `GTC`, post-only,
+non-deferred, with zero expiration. Place scripts can produce a resting
+acknowledgement, bounded immediate full or multipart fills, explicit fixture/
+post-only rejection, or acknowledgement-unknown. Cancel scripts can produce
+accepted, explicit rejection, already-filled, or acknowledgement-unknown.
+Commands and execution roles are move-only and scope-bound.
+
+An accepted place acknowledgement binds the exact venue-order key and every
+immediate fill key. Immediate acknowledgement fills, private WebSocket fills,
+REST reconciliation fills, reconnect delivery, and recovery all reduce
+through the same structural `PmFillKey`. A duplicate may enrich canonical
+source evidence, but it does not apply principal or append a second
+`FillApplied` fact.
+
+Private order/fill and paired account-plus-fill reconciliation reductions use
+the Phase 4 canonical state. They preflight the maximum possible journal and
+copied-consequence capacity before canonical mutation. Each newly applied
+owned fill records its exact source, connection, epoch, ingress/snapshot
+evidence, owner sequence, service time, delta, optional authoritative
+cumulative, canonical cumulative, and remaining quantity. A terminal order
+fact is admitted only when the known exact fill legs equal its canonical
+cumulative principal. A complete REST fill query may advance the explicit
+full-account watermark; individual REST rows never invent
+`cumulative_filled = size` or `remaining = 0`.
+
+Mutation recovery bootstraps those same owned state reducers. Pending intent
+or ambiguous submit/cancel tails reopen as reconciliation-required, while a
+durable safety halt remains halted. Recovered fill and terminal observations
+retain their one owner order, so partial-fill/terminal and cancel/fill
+interleavings can be replayed without source invention.
+
+### Bounded queues and failure policy
+
+The persistence queue is preallocated for 1,024 pending entries and has a
+1-second maximum service age. Each quote/cancel entry retains its exact
+identity across nonblocking receipt polling, including failure. A fake-effect
+capacity permit is reserved before journal admission, then converted to a
+prepared effect only after the exact durable acknowledgement. Failed or
+missing durability never exposes a fake command.
+
+The fake-effect queue is preallocated for 256 reservations, queued effects,
+and bounded quarantine entries, with a 250-millisecond quote age limit.
+Saturation, clock regression, stale quote authority, and durable/preparation
+failure suppress new quotes and retain exact accounting. An aged or
+revision-invalid quote is quarantined and cannot dispatch; an already-owned
+safety cancel remains serviceable.
+
+A separate 1,024-entry copied consequence queue is populated only after a
+journal fact and its pending persistence record have both been admitted. It
+contains observation-only record kind, optional client-order identity, and
+local correlation; it carries no receipt or execution authority. Capacity is
+preflighted together with persistence before canonical private,
+reconciliation, or fake-result mutation. Saturation is typed and fail-closed.
+
+The 4,096-entry copied product-effect store and both 256-entry correlation
+stores use fixed boxed slices allocated only at cold construction. They cannot
+grow or reallocate after start, and reserved-memory accounting includes their
+heap payloads. This changed the concrete fixture-model coordinator layout from
+1,040,376 inline bytes to 45,088 without changing any capacity or output
+ordering. The effect-output header is 32 bytes and each correlation-ring header
+is 24 bytes; focused tests fill, reject beyond, drain, and prove stable backing
+addresses and reserved-byte counts.
+
+### Green test and source-policy evidence
+
+The following evidence ran in the final Phase 5 gate:
+
+| Evidence area | Representative source | Inventory status |
+| --- | --- | --- |
+| Durable reservation/receipt/ack and lease | `reap-durable-writer/tests/durable_contract.rs` | Green |
+| Durable values are move-only/unforgeable | `reap-durable-writer/tests/ui/` | Four UI cases green |
+| PM journal transition/recovery/compaction | `reap-pm-live/src/journal/recovery/tests.rs` | Green |
+| PM journal corruption and cross-family rejection | `reap-pm-live/src/journal/recovery/negative.rs` | Seven negative cases green |
+| Owned slot, fill, ambiguity, race, restart, compaction | `reap-pm-state/tests/owned_lifecycle_contract.rs` | Eight tests green |
+| Fake place/cancel profiles and outcomes | `reap-polymarket-adapter/tests/fake_execution_contract.rs` | Nine tests green |
+| Unsigned exact lowering | `reap-polymarket-wire/tests/unsigned_order_contract.rs` | Four tests green |
+| Mutation durability, fake results, cancellation, saturation | `reap-pm-live/src/coordinator/mutation/tests.rs` | Green |
+| WS/REST deduplication and restart bridge | `reap-pm-live/src/coordinator/private_reduction/tests.rs` | Green |
+| Quote/cancel authority cannot clone, forge, or replay | `reap-pm-live/tests/ui/pm_mutation_authorities_*.rs` | Three UI cases green |
+| Product cannot obtain live mutation authority | `reap-pm-live/tests/ui/product_has_no_live_mutation_authority.rs` | Green |
+| Fake commands are private and move-only | `reap-polymarket-adapter/tests/ui/fake_*.rs` | Two UI cases green |
+| No network/auth/signer capability | PM live, adapter, wire, and durable-writer dependency/source-policy tests | Green |
+
+The source-policy guards keep `reap-durable-writer` schema/product-neutral;
+keep PM wire and fake execution free of network, authentication, signer, and
+secret dependencies; confine all mutation gates and the fixture execution role
+inside PM live composition; and prevent the product API from exposing a
+signer, authenticated session, arbitrary request executor, raw fake command,
+or mutation owner.
+
+### Decisions, limitations, and gate
+
+- Phase 5 remains fixture/fake only. It does not add PM credentials, signing,
+  authenticated HTTP/WS, a general request executor, a live order gateway, or
+  production trading authorization.
+- The PM journal is a separate exact product schema over shared writer
+  mechanics. Neither PM nor Chaos bytes grant authority to the other recovery
+  path.
+- Public/model revisions can invalidate quote creation and dispatch, but they
+  do not remove the ability to cancel a proven owned venue order.
+- A reconciliation cut that could exceed the 1,024 pending fact capacity is
+  rejected before canonical mutation. This conservative Phase 5 bound avoids
+  partially durable reconciliation; later work may chunk only if it preserves
+  one explicit atomic cut.
+- Fill-bearing terminal compaction requires exact fill coverage and the
+  complete-account fill watermark. Cancelled or expired no-fill state remains
+  until a later same-slot intent proves release; a locally rejected no-fill
+  intent may compact automatically. Recovery prefers retained bounded evidence
+  over inferred completion.
+- Phase 6 owns completed product replay and performance evidence. Its
+  in-progress coordinator source and the Phase 5 gate are not evidence that
+  the Phase 6 measurement contract is satisfiable.
+
+The adversarial closeout fixed five defects before accepting the gate:
+
+1. reducer and private-reducer contract failures now enter one exact terminal
+   safety transition that records the first safety cause before latching the
+   live halt when durability is available, and exposes a typed unjournalable
+   halt when it is not;
+2. fill-watermark facts now record every successful cursor advance, including
+   the first `None -> cursor` transition, but never an unchanged cursor;
+3. risk reason/scope is no longer collapsed to a bare rejection, and
+   cancel-required scopes route to owned cancellation;
+4. exact owned cancellation remains available after recovered persistence or
+   fake-effect capacity while new quoting remains halted; and
+5. large fixed output/correlation storage moved out of inline owner moves
+   without introducing post-start allocation or changing its fixed bounds.
+
+One full all-target attempt correctly exposed a stale trybuild suggestion in
+`product_has_no_live_mutation_authority.stderr`; the expected diagnostic was
+updated without weakening the rejection. A later rerun was interrupted before
+tests by filesystem exhaustion caused by duplicate compiler-layout artifacts.
+Only `target/` build artifacts were removed with `cargo clean`; the complete
+clean-cache gate below then exited zero.
+
+The final Phase 5 gate evidence is:
+
+| Gate evidence | Value |
+| --- | --- |
+| Implementation commit | `22044267eb2f9b675471858c0488f1f89de102fa` |
+| Selected-package all-target tests | Green; command and counts below |
+| Selected-package strict Clippy | Green |
+| Shared Chaos compatibility | Green: capture 50; engine 7 plus deterministic replay 4 passed/3 ignored; live 271 passed/1 ignored; storage 25 |
+| `cargo fmt --all -- --check` / `git diff --check` | Green / green |
+| Dependency, source-policy, authority, and size guards | Green |
+| `Cargo.lock` SHA-256 | `75e542896913e386bdb2e4c2f995f5d0023f9e18bd96bb5b31e7f5b2944c87d4` |
+| Largest Goal F physical production files | `capture_roles.rs` 1,490; `coordinator/product.rs` 1,489; adapter `public_session.rs` 1,440; `private_monitor.rs` 1,437; `journal/schema.rs` 1,422 |
+| Largest Goal F production functions | 239 and 234 lines; none above 250 |
+| Concrete fixture-model coordinator inline size | 45,088 bytes; guarded at 64 KiB |
+
+The exact selected-package commands were:
+
+```text
+cargo test -p reap-durable-writer -p reap-storage -p reap-pm-state \
+  -p reap-pm-strategy -p reap-polymarket-wire \
+  -p reap-polymarket-adapter -p reap-pm-live \
+  --all-targets --locked --no-fail-fast
+cargo clippy -p reap-durable-writer -p reap-storage -p reap-pm-state \
+  -p reap-pm-strategy -p reap-polymarket-wire \
+  -p reap-polymarket-adapter -p reap-pm-live \
+  --all-targets --locked -- -D warnings
+cargo test -p reap-engine --test decision_replay -p reap-live --lib \
+  -p reap-capture -p reap-storage --locked --no-fail-fast
+cargo fmt --all -- --check
+git diff --check
+```
+
+All exited zero on the accepted code tree. The selected-package test command
+ran 437 Rust test functions; its five trybuild harnesses passed all 54
+individually reviewed UI cases. Per package, the Rust-function/UI counts were
+durable writer 18/4, PM state 85/0, PM strategy 12/1, PM wire 40/3, PM adapter
+60/9, PM live 197/37, and storage 25/0.
+
+The final stable-tree structural inventory is:
+
+| Inventory | Count | SHA-256 |
+| --- | ---: | --- |
+| Workspace packages / outside-workspace path dependencies | 34 / 0 | — |
+| Goal F changed/new production source set since prompt commit `d2593f6d85ce868b46e3c1f16b5a48f221e5e480` | 153 files / 72,878 production-extent lines / 0 files above 1,500 | — |
+| Goal F direct normal workspace dependency edges | 21 | `3ebd3a091f07b8a4fa3b429a09f2a327f4557b74f1ed8de7ed3375c7220bc8aa` |
+| Sorted workspace public declarations | 2,491 lines | `31016c5ff9e16bdd948f0b2136a7fbfe03fd97d95affb76b95e64716592e2c68` |
+| Sorted schema/version declarations | 48 lines | `16c869757b02f0c8d3249edcdccda1e282537a14e046d94c54be957786180c1f` |
+| Sorted production Rust paths | 313 files | `d06ec5c5836e55512bc091e4a73d707bc75688da3af390f31acd521836cfa52d` |
+| Sorted production `sha256sum` manifest | 313 files | `0cc9f4c7289c873ecc46efb0260f0ba60bd5562d64c01001246a944c12f71b10` |
+| Sorted production-source extent stream | 313 files | `d62b7c3aa70381cb628da01db9968dbc7aa19dd52172a8ac738351b28ca5ea3b` |
+| `Cargo.lock` | — | `75e542896913e386bdb2e4c2f995f5d0023f9e18bd96bb5b31e7f5b2944c87d4` |
+| Normative connectivity-boundary document | — | `5d31251b0d4442042467c126d8a5ba7fc9fc5b278748ef770c00541469059b91` |
+
+The twenty-first Goal F dependency edge is the deliberate
+`reap-pm-live -> reap-durable-writer` use of product-neutral durable mechanics.
+There is still no outside-workspace path dependency. Production extent uses
+the Phase 0 adjacent terminal `#[cfg(test)]` / `mod tests` cutoff. The largest
+such extents are `capture_roles.rs` 1,490, `coordinator/product.rs` 1,489,
+adapter `public_session.rs` 1,440, `private_monitor.rs` 1,437, and PM-state
+`order_state.rs` 1,414. The largest reviewed Goal-F-added production function
+is 239 lines; none exceeds 250.
+
+The changed-source inventory used:
+
+```bash
+baseline=d2593f6d85ce868b46e3c1f16b5a48f221e5e480
+goal_f_sources() {
+  git diff --name-only --diff-filter=ACMRT "$baseline" HEAD -- crates |
+    LC_ALL=C sort -u |
+    rg '^crates/.+/src/.+\.rs$'
+}
+extent_stream() {
+  while IFS= read -r file; do
+    awk -v file="$file" \
+      'previous == "#[cfg(test)]" && $0 ~ /^mod tests[[:space:]]*\{/ \
+         { count -= 1; exit }
+       { count += 1; previous = $0 }
+       END { printf "%d\t%s\n", count, file }' "$file"
+  done
+}
+goal_f_sources | wc -l
+goal_f_sources | extent_stream | awk '{ total += $1 } END { print total }'
+goal_f_sources | extent_stream |
+  awk '$1 > 1500 { count++ } END { print count + 0 }'
+```
+
+The dependency-edge stream was the sorted set of normal path dependencies
+originating from the eleven Goal-F-created packages:
+
+```bash
+cargo metadata --locked --no-deps --format-version 1 |
+jq -r '
+  [
+    "reap-capture-framing", "reap-durable-writer",
+    "reap-okx-public-source", "reap-pm-core", "reap-pm-live",
+    "reap-pm-live-contracts", "reap-pm-state", "reap-pm-strategy",
+    "reap-polymarket-adapter", "reap-polymarket-wire", "reap-transport"
+  ] as $goal |
+  .packages[] |
+  select(.name as $name | $goal | index($name)) |
+  .name as $name |
+  .dependencies[] |
+  select(.kind == null or .kind == "normal") |
+  select(.path != null) |
+  "\($name) -> \(.name)"
+' |
+LC_ALL=C sort
+```
+
+Line counts and hashes use that stream with `wc -l` and `sha256sum`. Public,
+schema, production-path, content-manifest, and extent hashes use the unchanged
+Phase 0/2 commands recorded earlier in this handoff.
+
+## Phase 6: Documented Contract Stop Before Local Architecture Evidence
+
+Status: **STOPPED pending an explicit measurement-contract amendment** after
+the green Phase 5 gate. This is a source/contract proof, not a failed benchmark
+run. No Phase 6 replay result, benchmark result, counter, latency, allocation
+result, or hash has been fabricated. Phase 6 commit and gate fields remain
+**PENDING**.
+
+### Frozen requirements and reached product semantics
+
+The frozen nominal contract requires 100,000 product observations, 10,000
+quote paths, 5,000 fill paths, 5,000 cancel paths, exactly 35,000 mutation
+journal records, 5,000 unique fills, 5,000 suppressed duplicate fills, zero
+drops/saturations, and **zero fill-watermark advances**. It also requires
+completed cycles and five repeated passes not to grow orders, fill identities,
+queues, schedules, or allocator-live bytes. Its 15,000 action spans end only
+after a durable acknowledgement prepares the corresponding fake quote or
+cancel, while filesystem serialization and `fsync` are excluded from the
+timed boundary. The thirteen fresh overload cases require exactly 27,309
+attempts and their declared high-water/fail-closed results.
+
+The reached product deliberately owns one configured account and instrument,
+two side-keyed quote slots, four scheduled-action kinds, and no caller-supplied
+scope or mutation authority. Current fixed mechanism bounds include 1,024
+owned-order rows, 8,192 owned fill keys, 1,024 pending persistence entries,
+256 fake-effect entries, 128 refresh obligations, 4,096 scheduled entries,
+8,192 raw-capture entries, and a 32-MiB raw-capture slab. A completed
+full-account fill query journals `FillWatermarkAdvanced` exactly when its
+opaque cursor changes; an unchanged cursor journals none.
+
+These facts create a stop condition: several frozen overload cardinalities are
+not reachable through the least-authority product scope, and the nominal
+cardinality and acknowledgement requirements are not simultaneously defined
+well enough to implement or measure without inventing authority or evidence.
+
+### Why zero-watermark fill compaction is unsafe
+
+The current owner and journal recovery retain fill-bearing terminal orders and
+their structural fill keys until an authoritative full-account watermark
+proves the compaction cut. `compact_proven_terminal` removes both the owned row
+and its fill keys, while `RecoveredOwnedOrder::can_compact` permits
+fill-bearing terminal recovery rows only with `FillWatermark` proof.
+
+The nominal workload creates 5,000 terminal fill-bearing orders and then
+requires no watermark advance plus stable completed-cycle cardinality.
+Compacting those rows merely because an open-order or position snapshot is
+complete would discard the identities needed to suppress a later duplicate
+fill or replay. Treating a missing or unchanged cursor as an advancing cut
+would invent venue ordering. Therefore a zero-watermark shortcut would violate
+the frozen deduplication/replay boundary and is not a safe implementation
+choice.
+
+### Frozen overload rows unreachable through the product boundary
+
+| Frozen overload row | Required result | Reachability conflict |
+| --- | --- | --- |
+| 6. Reconciliation/refresh effects | 128 accepted, then one rejected | The one-account/one-instrument product and its closed reason set cannot create 128 distinct simultaneous pending obligations through reached inputs. |
+| 7. Raw capture entries | 8,192 accepted one-byte frames, then one rejected | A one-byte frame is not a valid reached PM/OKX parser input. The active product terminalizes the first invalid frame instead of accumulating 8,192 capture entries. |
+| 11. Fake effect | 256 queued, then one rejected | One configured instrument has only two side-keyed quote slots. It cannot produce 256 concurrent prepared effects without bypassing canonical ownership. |
+| 12. Scheduled actions | 4,096 inserted, then one rejected | Reached scheduling derives one fixed account/instrument key and exposes two sides by four kinds, for eight semantic keys. Repeated keys reschedule or suppress; they cannot fill 4,096 distinct entries. |
+
+Widening `PmProductRun` with arbitrary scope, identity, prepared-effect, or
+queue-seeding authority solely to hit those rows would violate the product
+boundary this goal is meant to prove. The fixed-capacity mechanisms may still
+be tested directly, but the frozen contract currently says the overload suite
+must remain within the same reached product path and does not authorize that
+split.
+
+### Fact-acknowledgement and `fsync` accounting ambiguities
+
+Each of the nominal workload's 5,000 `FillApplied` records produces a
+successful non-authority fact receipt. Draining those receipts through the
+complete scheduler adds 5,000 `FactAcknowledged` inputs, producing 105,000
+rather than the frozen 100,000 observations. Withholding them instead fills
+the 1,024-entry persistence queue before the workload completes. The contract
+must state whether successful fact acknowledgements are internal maintenance
+outside the observation count or are counted inputs, and adjust the exact
+total accordingly.
+
+Likewise, the 15,000 receive-to-prepared action spans require consumption of
+real durable receipt evidence. The reached product polls the active durable
+writer; it has no sealed injected-ack backend. A span through that receipt
+therefore observes writer serialization/flush/`fsync` delay, even though the
+frozen timed boundary excludes that work. The contract must either authorize a
+sealed deterministic acknowledgement evidence source for the local benchmark
+or define a separate active-writer segment and precise timing/accounting rule.
+It must not expose forgeable durable acknowledgement authority to product
+callers.
+
+### Additional uncompleted coordinator semantics
+
+Read-only source review also found the following incomplete coordinator
+semantics. These are findings to implement and prove with focused tests, not
+claims that a test currently demonstrates them:
+
+- reconciliation-required state can currently be promoted into an
+  irreversible coordinator halt;
+- recovered or reconciled live owned orders are absent from the lossy
+  `tracked_quotes` scan used to derive safety cancels;
+- an ambiguous submit does not retain its required reconciliation request;
+- lane-specific overload policies can collapse into one global outcome, and an
+  aged private-lane obligation can starve a scheduled owned cancel;
+- mutable `public_capture` access exposes a service-path bypass while the
+  corresponding aged-service authority remains opaque;
+- emitted refresh effects are copied observations rather than retained
+  obligations; and
+- stop controls do not establish an ordering that dispatches required owned
+  cancels before stopping.
+
+Each item is independently implementable after the measurement contract is
+amended. None is the basis of the Phase 6 stop condition documented above, and
+none authorizes widening the least-authority product boundary.
+
+### Evidence used
+
+This stop was established by contract and source inspection:
+
+```bash
+sed -n '1160,1335p' docs/polymarket-product-connectivity-boundary.md
+rg -n "MAX_PM_OWNED_ORDER|MAX_PM_JOURNAL_OWNED|MAX_PM_OWNED_FILL" \
+  crates/reap-pm-state/src crates/reap-pm-live/src \
+  docs/polymarket-product-connectivity-boundary.md
+rg -n "compact_proven_terminal|can_compact" \
+  crates/reap-pm-state/src/owned_lifecycle/reducer.rs \
+  crates/reap-pm-live/src/journal/recovery.rs
+sed -n '1,125p' crates/reap-pm-live/src/schedule.rs
+sed -n '97,355p' crates/reap-pm-live/src/composition/product/run.rs
+rg --files crates/reap-pm-live | \
+  rg '(^|/)(pm_action_path|combined_replay)(\.rs)?$'
+```
+
+The existing focused package gates do not resolve these contract
+contradictions. The named `combined_replay` target passed its twelve existing
+Phase 3 capture/replay tests as part of the Phase 5 all-target gate, but it
+contains no Phase 6 nominal product workload or measurement counters. The
+declared `pm_action_path` target does not yet exist and was not run.
+
+### Smallest safe amendment options
+
+1. **Permit bounded authoritative compaction cuts and split product from
+   mechanism evidence.** Replace a fixed complete-snapshot observation at
+   each declared batch boundary with a real full-account fill query whose
+   changed watermark proves compaction before retained terminal rows reach
+   1,024. Freeze the exact number of cuts, observations, watermark records,
+   and resulting journal total. Keep the least-authority product API
+   unchanged, allow fixed crate-private mechanism tests for the four
+   unreachable overload rows, classify successful fact acknowledgements as
+   bounded internal maintenance, and authorize a sealed benchmark-only
+   durable-ack evidence source.
+2. **Reduce or shard the nominal workload and replace unreachable overload
+   rows.** Freeze a product-reachable number of unique orders per independently
+   scoped artifact, including how identity, journal continuity, late-fill
+   deduplication, and aggregate counters compose across shards. Derive new
+   overload counts from one scope: valid parser frames, the reachable refresh
+   set, two quote slots, and eight schedule keys. Preserve direct tests for
+   larger mechanism capacities and explicitly revise fact-ack and timing
+   accounting.
+3. **Authorize a narrowly sealed evidence harness plus explicit compaction
+   proof.** Permit source-policy-guarded crate-private pre-seeding of valid
+   typed obligations/effects/schedule entries and injected durable evidence,
+   with no public constructor or runtime capability. Keep the original
+   mechanism-capacity counts, but separately amend the nominal workload to
+   include an authoritative watermark or another fully specified durable
+   late-fill deduplication proof. Label harness rows and acknowledgement spans
+   as mechanism evidence rather than end-to-end reached-product evidence.
+
+No option is selected here. Implementation and measurement remain stopped
+until the goal owner amends the frozen contract explicitly.
+
+| Phase 6 stop/gate evidence | Value |
+| --- | --- |
+| Selected contract amendment | **PENDING** |
+| Phase 6 implementation commit | **PENDING** |
+| `combined_replay` command/result/hash | **PENDING** |
+| `pm_action_path` command/result/runs | **PENDING** |
+| Allocation, memory, latency, and host/toolchain evidence | **PENDING** |
+| Final formatting, diff, source-policy, and structural gates | **PENDING** |
