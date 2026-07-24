@@ -1,6 +1,6 @@
 use reap_core::{
     AccountUpdate, Balance, BookAction, Channel, EventId, EventKey, FillFee, FillLiquidity,
-    FundingSettlement, Level, MarginSnapshot, MarketEvent, NormalizedEvent, Position,
+    FundingSettlement, Level, MarginSnapshot, MarketEvent, NormalizedEvent, OkxVenue, Position,
     PositionMarginMode, RawEnvelope, SequencedBookUpdate, Side, Subscription, Venue,
 };
 use reap_okx_public_source::extract_legacy_index_ticker_fields;
@@ -91,7 +91,7 @@ impl OkxAdapter {
                 };
                 Ok(ParsedEvent {
                     id: EventId {
-                        venue: Venue::Okx,
+                        venue: OkxVenue,
                         channel: Channel::Books,
                         symbol: Some(symbol.clone()),
                         key: EventKey::BookSequence {
@@ -138,7 +138,7 @@ impl OkxAdapter {
                 });
                 Ok(ParsedEvent {
                     id: EventId {
-                        venue: Venue::Okx,
+                        venue: OkxVenue,
                         channel: Channel::Trades,
                         symbol: Some(symbol),
                         key: if trade_id.is_empty() {
@@ -308,7 +308,7 @@ impl OkxAdapter {
                 let state = format!("{:?}", update.state).to_lowercase();
                 Ok(ParsedEvent {
                     id: EventId {
-                        venue: Venue::Okx,
+                        venue: OkxVenue,
                         channel: Channel::Orders,
                         symbol: Some(scoped_private_symbol(
                             self.account_id.as_deref(),
@@ -392,7 +392,7 @@ impl OkxAdapter {
                 };
                 Ok(ParsedEvent {
                     id: EventId {
-                        venue: Venue::Okx,
+                        venue: OkxVenue,
                         channel: Channel::Account,
                         symbol: self.account_id.clone(),
                         key: if ts_ms == 0 {
@@ -421,7 +421,7 @@ impl OkxAdapter {
                 let symbol = data.symbol;
                 Ok(ParsedEvent {
                     id: EventId {
-                        venue: Venue::Okx,
+                        venue: OkxVenue,
                         channel: Channel::Positions,
                         symbol: Some(match &self.account_id {
                             Some(account_id) => format!("{account_id}:{symbol}"),
@@ -458,7 +458,7 @@ impl OkxAdapter {
                 let fill = data.into_remote_fill()?;
                 Ok(ParsedEvent {
                     id: EventId {
-                        venue: Venue::Okx,
+                        venue: OkxVenue,
                         channel: Channel::Fills,
                         symbol: Some(scoped_private_symbol(
                             self.account_id.as_deref(),
@@ -494,7 +494,7 @@ fn normalized_market_event(
 ) -> ParsedEvent {
     ParsedEvent {
         id: EventId {
-            venue: Venue::Okx,
+            venue: OkxVenue,
             channel: Channel::Custom(arg.channel.clone()),
             symbol: Some(symbol),
             key: if ts_ms == 0 {
@@ -525,9 +525,6 @@ impl VenueAdapter for OkxAdapter {
     }
 
     fn parse(&self, envelope: &RawEnvelope) -> Result<Vec<ParsedEvent>, VenueError> {
-        if envelope.venue != Venue::Okx {
-            return Err(Self::invalid("envelope venue is not okx"));
-        }
         let push: OkxPush = serde_json::from_str(&envelope.payload)
             .map_err(|error| Self::invalid(error.to_string()))?;
         let OkxPush {
@@ -587,9 +584,6 @@ impl VenueAdapter for OkxAdapter {
     }
 
     fn is_data_frame(&self, envelope: &RawEnvelope) -> Result<bool, VenueError> {
-        if envelope.venue != Venue::Okx {
-            return Err(Self::invalid("envelope venue is not okx"));
-        }
         let value: Value = serde_json::from_str(&envelope.payload)
             .map_err(|error| Self::invalid(error.to_string()))?;
         Ok(value.get("event").is_none()
@@ -1059,7 +1053,7 @@ mod tests {
 
     fn envelope(channel: Channel, payload: &str) -> RawEnvelope {
         RawEnvelope {
-            venue: Venue::Okx,
+            venue: OkxVenue,
             conn_id: ConnId::new("test"),
             channel,
             symbol: Some("BTC-USDT".to_string()),

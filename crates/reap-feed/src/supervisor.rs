@@ -195,7 +195,7 @@ impl SupervisedFeed {
     pub fn request_recovery(&self, request: &RecoveryRequest) -> usize {
         let Some(routes) = self
             .recovery_routes
-            .get(&(request.stream.venue, request.stream.symbol.clone()))
+            .get(&(request.stream.venue.into(), request.stream.symbol.clone()))
         else {
             return 0;
         };
@@ -552,7 +552,7 @@ async fn supervise_connection(
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use reap_core::{Channel, FeedPriority, Subscription};
+    use reap_core::{Channel, FeedPriority, OkxVenue, Subscription};
     use reap_transport::ReconnectBackoff;
     use reap_venue::okx::OkxAdapter;
 
@@ -1005,7 +1005,7 @@ mod tests {
         };
         let request = RecoveryRequest {
             stream: crate::FeedStreamId {
-                venue: Venue::Okx,
+                venue: OkxVenue,
                 channel: Channel::Books,
                 symbol: "BTC-USDT".to_string(),
             },
@@ -1046,7 +1046,7 @@ mod tests {
         };
         let request = RecoveryRequest {
             stream: crate::FeedStreamId {
-                venue: Venue::Okx,
+                venue: OkxVenue,
                 channel: Channel::Books,
                 symbol: "BTC-USDT".to_string(),
             },

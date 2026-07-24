@@ -1,4 +1,4 @@
-use reap_core::{Channel, EventKey, RawEnvelope, Venue};
+use reap_core::{Channel, EventKey, RawEnvelope};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -126,9 +126,6 @@ pub(crate) fn configured_reference_from_wire(
     argument: WireArg,
     mut values: Vec<WireIndexTicker>,
 ) -> Result<OkxIndexTickerReference, OkxIndexTickerReferenceError> {
-    if envelope.venue != Venue::Okx {
-        return Err(OkxIndexTickerReferenceError::WrongVenue);
-    }
     if !matches!(
         &envelope.channel,
         Channel::Custom(channel) if channel == "index-tickers"

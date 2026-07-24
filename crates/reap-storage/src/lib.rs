@@ -1027,8 +1027,8 @@ pub async fn start_jsonl_storage_with_lease(
 #[cfg(test)]
 mod tests {
     use reap_core::{
-        ConnId, ControlEvent, FundingSettlement, MarketEvent, OrderEvent, OrderStatus, OrderUpdate,
-        Venue,
+        ConnId, ControlEvent, FundingSettlement, MarketEvent, OkxVenue, OrderEvent, OrderStatus,
+        OrderUpdate,
     };
 
     use super::*;
@@ -1037,7 +1037,7 @@ mod tests {
         StorageRecord::Raw {
             account_id: None,
             envelope: RawEnvelope {
-                venue: Venue::Okx,
+                venue: OkxVenue,
                 conn_id: ConnId::new("test"),
                 channel: reap_core::Channel::Books,
                 symbol: Some("BTC-USDT".to_string()),

@@ -109,7 +109,7 @@ fn raw_receive_evidence_and_public_exports_cannot_be_detached_or_widened() {
     assert!(session.contains("OkxPublicSessionError::UnavailableOccurrencePending"));
     assert!(session.contains("Result<Duration, OkxPublicSessionError>"));
     assert!(session.contains("pub fn classify_captured_payload"));
-    assert!(session.contains("venue: Venue::Okx"));
+    assert!(session.contains("venue: OkxVenue"));
     assert!(session.contains("conn_id: self.connection_id.clone()"));
     assert!(session.contains("channel: Channel::Custom(OKX_INDEX_TICKERS_CHANNEL.to_string())"));
     assert!(session.contains("symbol: Some(self.subscription.instrument().to_string())"));

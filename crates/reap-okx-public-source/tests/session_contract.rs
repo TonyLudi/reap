@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use reap_core::{Channel, ConnId, EventKey, RawEnvelope, Venue};
+use reap_core::{Channel, ConnId, EventKey, OkxVenue, RawEnvelope};
 use reap_okx_public_source::{
     MAX_OKX_PUBLIC_CONNECTION_ID_BYTES, OkxPublicEventEvidence, OkxPublicSession,
     OkxPublicSessionError, OkxPublicSessionEvent, OkxPublicSessionFault,
@@ -9,7 +9,7 @@ use reap_transport::{ConnectionStatusKind, RawDelivery, ReconnectPolicy};
 
 fn envelope(payload: &str) -> RawEnvelope {
     RawEnvelope {
-        venue: Venue::Okx,
+        venue: OkxVenue,
         conn_id: ConnId::new("okx-public-reference-1"),
         channel: Channel::Custom("index-tickers".to_string()),
         symbol: Some("BTC-USDT".to_string()),

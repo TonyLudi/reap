@@ -3,7 +3,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use reap_core::{Channel, ConnId, RawEnvelope, Venue};
+use reap_core::{Channel, ConnId, OkxVenue, RawEnvelope, Venue};
 use reap_transport::{ShutdownReceiver, shutdown_requested};
 use reap_venue::{VenueAdapter, VenueError, okx::OkxAdapter};
 use serde::Deserialize;
@@ -782,8 +782,9 @@ async fn forward_payload_with_timeout(
     let symbol = (plan.subscriptions.len() == 1)
         .then(|| plan.subscriptions[0].symbol.clone())
         .flatten();
+    let venue = OkxVenue::try_from(plan.venue).map_err(ConnectionError::UnsupportedVenue)?;
     let envelope = RawEnvelope {
-        venue: plan.venue,
+        venue,
         conn_id: plan.conn_id.clone(),
         channel,
         symbol,
@@ -1175,7 +1176,7 @@ mod tests {
         let (output, mut output_rx) = mpsc::channel(1);
         output
             .send(RawEnvelope {
-                venue: Venue::Okx,
+                venue: OkxVenue,
                 conn_id: ConnId::new("existing"),
                 channel: Channel::Orders,
                 symbol: None,

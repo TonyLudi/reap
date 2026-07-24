@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use reap_core::{Channel, ConnId, EventId, EventKey, Symbol, Venue};
+use reap_core::{Channel, ConnId, EventId, EventKey, OkxVenue, Symbol};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DedupDecision {
@@ -65,7 +65,7 @@ impl Deduplicator {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct StreamKey {
-    venue: Venue,
+    venue: OkxVenue,
     channel: Channel,
     symbol: Option<Symbol>,
     source: Option<ConnId>,
@@ -96,7 +96,7 @@ mod tests {
 
     fn id(prev_seq_id: i64, seq_id: i64, ts_ms: u64, raw_hash: u64) -> EventId {
         EventId {
-            venue: Venue::Okx,
+            venue: OkxVenue,
             channel: Channel::Books,
             symbol: Some("BTC-USDT".to_string()),
             key: EventKey::BookSequence {

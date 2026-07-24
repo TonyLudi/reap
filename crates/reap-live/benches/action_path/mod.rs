@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use reap_core::{
     AccountUpdate, Balance, Channel, ConnId, Level, MarketEvent, NewOrder, NormalizedEvent,
-    OrderBook, OrderEvent, OrderStatus, OrderUpdate, Position, RawEnvelope, Side, SystemEvent,
-    SystemEventKind, TimeInForce, Venue,
+    OkxVenue, OrderBook, OrderEvent, OrderStatus, OrderUpdate, Position, RawEnvelope, Side,
+    SystemEvent, SystemEventKind, TimeInForce, Venue,
 };
 use reap_engine::{ChaosEngineOutput, TradingEngine};
 use reap_feed::{FeedOutput, FeedProcessor, payload_hash};

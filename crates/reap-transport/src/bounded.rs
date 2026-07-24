@@ -61,8 +61,10 @@ impl<T> ImmutableDelivery<T> {
     }
 }
 
-/// Common raw-ingress carrier. Venue-specific parsing remains outside this
-/// crate.
+/// Legacy OKX raw-ingress alias.
+///
+/// [`ImmutableDelivery`] remains venue-neutral; sibling products carry their
+/// own statically typed payload rather than widening this OKX wire boundary.
 pub type RawDelivery = ImmutableDelivery<RawEnvelope>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]

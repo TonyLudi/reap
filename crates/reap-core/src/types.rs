@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub type Price = f64;
 pub type Quantity = f64;
@@ -54,6 +54,62 @@ pub enum Venue {
     Okx,
     #[serde(rename = "polymarket")]
     Polymarket,
+}
+
+/// Type-level venue marker for the pre-existing OKX-only feed pipeline.
+///
+/// The legacy feed carriers cannot represent another venue, so keeping a
+/// multi-variant [`Venue`] inside them would both broaden their authority and
+/// change their in-memory layout. This zero-sized marker preserves the
+/// original `"okx"` wire identity and hash/debug behavior while common and PM
+/// envelopes continue to use [`Venue`].
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct OkxVenue;
+
+impl std::fmt::Debug for OkxVenue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Venue::Okx.fmt(formatter)
+    }
+}
+
+impl Serialize for OkxVenue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        Venue::Okx.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for OkxVenue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match Venue::deserialize(deserializer)? {
+            Venue::Okx => Ok(Self),
+            Venue::Polymarket => Err(<D::Error as serde::de::Error>::custom(
+                "legacy OKX feed venue must be \"okx\"",
+            )),
+        }
+    }
+}
+
+impl From<OkxVenue> for Venue {
+    fn from(_: OkxVenue) -> Self {
+        Self::Okx
+    }
+}
+
+impl TryFrom<Venue> for OkxVenue {
+    type Error = Venue;
+
+    fn try_from(venue: Venue) -> Result<Self, Self::Error> {
+        match venue {
+            Venue::Okx => Ok(Self),
+            Venue::Polymarket => Err(Venue::Polymarket),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -156,7 +212,7 @@ impl Subscription {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawEnvelope {
-    pub venue: Venue,
+    pub venue: OkxVenue,
     pub conn_id: ConnId,
     pub channel: Channel,
     pub symbol: Option<Symbol>,
@@ -167,7 +223,7 @@ pub struct RawEnvelope {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct EventId {
-    pub venue: Venue,
+    pub venue: OkxVenue,
     pub channel: Channel,
     pub symbol: Option<Symbol>,
     pub key: EventKey,

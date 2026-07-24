@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use reap_core::{Channel, ConnId, RawEnvelope, Venue};
+use reap_core::{Channel, ConnId, OkxVenue, RawEnvelope};
 use reap_transport::{
     ConnectionStatusKind, ImmutableDelivery, RawDelivery, ReconnectPolicy, SupervisionChannels,
     SupervisorState, supervision_channels,
@@ -360,7 +360,7 @@ impl OkxPublicSession {
         raw_hash: u64,
     ) -> Result<OkxPublicSessionDelivery, OkxPublicSessionError> {
         let envelope = RawEnvelope {
-            venue: Venue::Okx,
+            venue: OkxVenue,
             conn_id: self.connection_id.clone(),
             channel: Channel::Custom(OKX_INDEX_TICKERS_CHANNEL.to_string()),
             symbol: Some(self.subscription.instrument().to_string()),
@@ -611,9 +611,6 @@ impl OkxPublicSession {
     }
 
     fn validate_envelope(&self, envelope: &RawEnvelope) -> Result<(), OkxPublicSessionError> {
-        if envelope.venue != Venue::Okx {
-            return Err(OkxPublicSessionError::WrongEnvelopeVenue);
-        }
         if envelope.conn_id != self.connection_id {
             return Err(OkxPublicSessionError::WrongEnvelopeConnectionId);
         }

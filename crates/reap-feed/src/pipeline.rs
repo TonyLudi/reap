@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use reap_book::{BookReducer, BookStatus};
 use reap_core::{
-    AccountUpdate, BookAction, Channel, ConnId, EventId, MarketEvent, NormalizedEvent, OrderBook,
-    SequencedBookUpdate, Symbol, SystemEvent, SystemEventKind, TimeMs, Venue,
+    AccountUpdate, BookAction, Channel, ConnId, EventId, MarketEvent, NormalizedEvent, OkxVenue,
+    OrderBook, SequencedBookUpdate, Symbol, SystemEvent, SystemEventKind, TimeMs,
 };
 use reap_venue::{ParsedEvent, PrivateOrderUpdate, RemoteFill, VenueEvent};
 
@@ -11,7 +11,7 @@ use crate::{DedupDecision, Deduplicator, SequenceOutcome, SequenceStatus, Sequen
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FeedStreamId {
-    pub venue: Venue,
+    pub venue: OkxVenue,
     pub channel: Channel,
     pub symbol: Symbol,
 }
@@ -216,7 +216,7 @@ impl FeedProcessor {
                 (before != BookStatus::Stale && after == BookStatus::Stale).then(|| SystemEvent {
                     ts_ms: now_ms,
                     kind: SystemEventKind::FeedStale,
-                    venue: Some(stream.venue),
+                    venue: Some(stream.venue.into()),
                     account_id: None,
                     symbol: Some(stream.symbol.clone()),
                     reason: format!("book exceeded max age of {max_age_ms}ms"),
@@ -226,7 +226,7 @@ impl FeedProcessor {
     }
     fn process_book(
         &mut self,
-        venue: Venue,
+        venue: OkxVenue,
         source: &ConnId,
         update: SequencedBookUpdate,
     ) -> Vec<FeedOutput> {
@@ -334,7 +334,7 @@ fn process_source_book(
                         outputs.push(FeedOutput::System(SystemEvent {
                             ts_ms,
                             kind: SystemEventKind::FeedRecovered,
-                            venue: Some(stream_id.venue),
+                            venue: Some(stream_id.venue.into()),
                             account_id: None,
                             symbol: Some(stream_id.symbol.clone()),
                             reason: if aggregate_was_recovering {
@@ -347,7 +347,7 @@ fn process_source_book(
                     outputs.push(FeedOutput::System(SystemEvent {
                         ts_ms,
                         kind: SystemEventKind::FeedHeartbeat,
-                        venue: Some(stream_id.venue),
+                        venue: Some(stream_id.venue.into()),
                         account_id: None,
                         symbol: Some(stream_id.symbol.clone()),
                         reason: "source-sequenced canonical book update accepted".to_string(),
@@ -462,7 +462,7 @@ fn source_recovery_outputs(
     let mut outputs = vec![FeedOutput::System(SystemEvent {
         ts_ms: recovery.ts_ms,
         kind,
-        venue: Some(stream_id.venue),
+        venue: Some(stream_id.venue.into()),
         account_id: None,
         symbol: Some(stream_id.symbol.clone()),
         reason: format!("source {}: {}", recovery.source_conn_id, recovery.reason),
@@ -471,7 +471,7 @@ fn source_recovery_outputs(
         outputs.push(FeedOutput::System(SystemEvent {
             ts_ms: recovery.ts_ms,
             kind: SystemEventKind::BookRecoveryStarted,
-            venue: Some(stream_id.venue),
+            venue: Some(stream_id.venue.into()),
             account_id: None,
             symbol: Some(stream_id.symbol.clone()),
             reason: format!(
@@ -503,7 +503,7 @@ fn replica_conflict_outputs(
         FeedOutput::System(SystemEvent {
             ts_ms,
             kind: SystemEventKind::FeedGap,
-            venue: Some(stream_id.venue),
+            venue: Some(stream_id.venue.into()),
             account_id: None,
             symbol: Some(stream_id.symbol.clone()),
             reason: format!(
@@ -514,7 +514,7 @@ fn replica_conflict_outputs(
         FeedOutput::System(SystemEvent {
             ts_ms,
             kind: SystemEventKind::BookRecoveryStarted,
-            venue: Some(stream_id.venue),
+            venue: Some(stream_id.venue.into()),
             account_id: None,
             symbol: Some(stream_id.symbol.clone()),
             reason: "request fresh snapshots from every conflicting source".to_string(),
@@ -686,7 +686,7 @@ mod tests {
         };
         ParsedEvent {
             id: EventId {
-                venue: Venue::Okx,
+                venue: OkxVenue,
                 channel: Channel::Books,
                 symbol: Some("BTC-USDT".to_string()),
                 key: EventKey::BookSequence {
@@ -707,7 +707,7 @@ mod tests {
         let mut processor = FeedProcessor::new(16, 16);
         let outputs = processor.process(ParsedEvent {
             id: EventId {
-                venue: Venue::Okx,
+                venue: OkxVenue,
                 channel: Channel::Account,
                 symbol: Some("main".to_string()),
                 key: EventKey::Timestamp(1),

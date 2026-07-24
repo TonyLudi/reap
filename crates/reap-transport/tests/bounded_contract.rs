@@ -1,9 +1,9 @@
-use reap_core::{Channel, ConnId, RawEnvelope, Venue};
+use reap_core::{Channel, ConnId, OkxVenue, RawEnvelope};
 use reap_transport::{DeliveryClockError, ImmutableDelivery, RawDelivery, bounded_channel};
 
 fn raw() -> RawEnvelope {
     RawEnvelope {
-        venue: Venue::Okx,
+        venue: OkxVenue,
         conn_id: ConnId::new("public"),
         channel: Channel::Books,
         symbol: Some("BTC-USDT".to_string()),

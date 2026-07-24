@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use reap_core::{
-    AccountUpdate, MarketEvent, NormalizedEvent, OrderIntent, OrderStatus, OrderUpdate, Symbol,
-    SystemEvent, SystemEventKind, TimeInForce, TimeMs, Venue,
+    AccountUpdate, MarketEvent, NormalizedEvent, OkxVenue, OrderIntent, OrderStatus, OrderUpdate,
+    Symbol, SystemEvent, SystemEventKind, TimeInForce, TimeMs, Venue,
 };
 use serde::{Deserialize, Serialize};
 
@@ -319,8 +319,8 @@ pub struct RiskGate {
     limits: RiskLimits,
     kill_switch: Option<String>,
     halted_symbols: HashMap<Symbol, String>,
-    feed_health: HashMap<(Venue, Symbol), StreamHealth>,
-    private_health: HashMap<(Venue, Option<String>), StreamHealth>,
+    feed_health: HashMap<(OkxVenue, Symbol), StreamHealth>,
+    private_health: HashMap<(OkxVenue, Option<String>), StreamHealth>,
     marks: HashMap<Symbol, f64>,
     instrument_models: HashMap<Symbol, InstrumentRiskModel>,
     instrument_order_limits: HashMap<Symbol, InstrumentOrderLimits>,
@@ -508,6 +508,9 @@ impl RiskGate {
     }
 
     pub fn mark_feed_ready(&mut self, venue: Venue, symbol: impl Into<Symbol>, ts_ms: TimeMs) {
+        let Ok(venue) = OkxVenue::try_from(venue) else {
+            return;
+        };
         self.feed_health.insert(
             (venue, symbol.into()),
             StreamHealth {
@@ -527,6 +530,9 @@ impl RiskGate {
         account_id: Option<String>,
         ts_ms: TimeMs,
     ) {
+        let Ok(venue) = OkxVenue::try_from(venue) else {
+            return;
+        };
         self.private_health.insert(
             (venue, account_id),
             StreamHealth {
@@ -840,7 +846,9 @@ impl RiskGate {
             | SystemEventKind::FeedGap
             | SystemEventKind::BookRecoveryStarted
             | SystemEventKind::BookRecoveryFailed => {
-                if let (Some(venue), Some(symbol)) = (event.venue, event.symbol.clone()) {
+                if let (Some(Ok(venue)), Some(symbol)) =
+                    (event.venue.map(OkxVenue::try_from), event.symbol.clone())
+                {
                     self.feed_health.entry((venue, symbol)).or_default().stale = true;
                 }
             }
@@ -850,27 +858,31 @@ impl RiskGate {
                 }
             }
             SystemEventKind::PrivateStreamStale | SystemEventKind::ReconcileDrift => {
-                if let Some(venue) = event.venue {
-                    if event.account_id.is_some() {
-                        self.private_health
-                            .entry((venue, event.account_id.clone()))
-                            .or_default()
-                            .stale = true;
-                    } else {
-                        let mut matched = false;
-                        for ((health_venue, _), health) in &mut self.private_health {
-                            if *health_venue == venue {
-                                health.stale = true;
-                                matched = true;
+                match event.venue.map(OkxVenue::try_from) {
+                    Some(Ok(venue)) => {
+                        if event.account_id.is_some() {
+                            self.private_health
+                                .entry((venue, event.account_id.clone()))
+                                .or_default()
+                                .stale = true;
+                        } else {
+                            let mut matched = false;
+                            for ((health_venue, _), health) in &mut self.private_health {
+                                if *health_venue == venue {
+                                    health.stale = true;
+                                    matched = true;
+                                }
+                            }
+                            if !matched {
+                                self.private_health.entry((venue, None)).or_default().stale = true;
                             }
                         }
-                        if !matched {
-                            self.private_health.entry((venue, None)).or_default().stale = true;
-                        }
                     }
-                } else {
-                    for health in self.private_health.values_mut() {
-                        health.stale = true;
+                    Some(Err(_)) => {}
+                    None => {
+                        for health in self.private_health.values_mut() {
+                            health.stale = true;
+                        }
                     }
                 }
             }
@@ -919,7 +931,7 @@ impl RiskGate {
                 events.push(SystemEvent {
                     ts_ms: now_ms,
                     kind: SystemEventKind::FeedStale,
-                    venue: Some(*venue),
+                    venue: Some((*venue).into()),
                     account_id: None,
                     symbol: Some(symbol.clone()),
                     reason: format!("feed age exceeded {}ms", self.limits.max_feed_age_ms),
@@ -934,7 +946,7 @@ impl RiskGate {
                 events.push(SystemEvent {
                     ts_ms: now_ms,
                     kind: SystemEventKind::PrivateStreamStale,
-                    venue: Some(*venue),
+                    venue: Some((*venue).into()),
                     account_id: account_id.clone(),
                     symbol: None,
                     reason: format!(
@@ -1498,6 +1510,63 @@ mod tests {
         let gate = ready_gate();
         assert!(matches!(
             gate.pre_trade(100, order()),
+            RiskDecision::Allowed(_)
+        ));
+    }
+
+    #[test]
+    fn polymarket_health_cannot_ready_the_legacy_okx_risk_gate() {
+        let mut gate = RiskGate::new(RiskLimits::default());
+        gate.mark_feed_ready(Venue::Polymarket, "BTC-USDT", 100);
+        gate.mark_private_ready(Venue::Polymarket, 100);
+        gate.apply_system_event(&SystemEvent {
+            ts_ms: 101,
+            kind: SystemEventKind::FeedHeartbeat,
+            venue: Some(Venue::Polymarket),
+            account_id: None,
+            symbol: Some("BTC-USDT".to_string()),
+            reason: "unsupported sibling venue".to_string(),
+        });
+        gate.apply_system_event(&SystemEvent {
+            ts_ms: 101,
+            kind: SystemEventKind::PrivateStreamHeartbeat,
+            venue: Some(Venue::Polymarket),
+            account_id: None,
+            symbol: None,
+            reason: "unsupported sibling venue".to_string(),
+        });
+
+        assert!(gate.feed_health.is_empty());
+        assert!(gate.private_health.is_empty());
+        assert!(matches!(
+            gate.pre_trade(101, order()),
+            RiskDecision::Rejected {
+                reason: RiskRejectReason::FeedNotReady,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn polymarket_stale_events_cannot_mutate_legacy_okx_health() {
+        let mut gate = ready_gate();
+        for kind in [
+            SystemEventKind::FeedStale,
+            SystemEventKind::PrivateStreamStale,
+            SystemEventKind::ReconcileDrift,
+        ] {
+            gate.apply_system_event(&SystemEvent {
+                ts_ms: 101,
+                kind,
+                venue: Some(Venue::Polymarket),
+                account_id: None,
+                symbol: Some("BTC-USDT".to_string()),
+                reason: "unsupported sibling venue".to_string(),
+            });
+        }
+
+        assert!(matches!(
+            gate.pre_trade(101, order()),
             RiskDecision::Allowed(_)
         ));
     }

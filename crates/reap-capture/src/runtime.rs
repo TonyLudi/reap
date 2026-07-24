@@ -17,7 +17,7 @@ use crate::report::{
 use crate::writer::{JsonlWriter, JsonlWriterShutdown, JsonlWriterStats};
 use reap_book::BookStatus;
 use reap_core::{
-    Channel, NormalizedEvent, PINNED_JAVA_REVISION, RawEnvelope, SystemEventKind, Venue,
+    Channel, NormalizedEvent, OkxVenue, PINNED_JAVA_REVISION, RawEnvelope, SystemEventKind,
 };
 use reap_feed::{
     ConnectionAttemptPacer, ConnectionStatus, ConnectionStatusKind, FeedOutput, FeedProcessor,
@@ -509,9 +509,16 @@ async fn run_capture_loop(
                 for event in state.processor.mark_stale(now_ms, runtime.max_book_age_ms) {
                     state.stale_book_events += 1;
                     if let Some(symbol) = event.symbol {
+                        let Ok(venue) = event
+                            .venue
+                            .map_or(Ok(OkxVenue), OkxVenue::try_from)
+                        else {
+                            state.missing_recovery_routes += 1;
+                            continue;
+                        };
                         let request = RecoveryRequest {
                             stream: reap_feed::FeedStreamId {
-                                venue: event.venue.unwrap_or(Venue::Okx),
+                                venue,
                                 channel: Channel::Books,
                                 symbol,
                             },
@@ -938,7 +945,7 @@ fn raw_capture(
     RawCapture {
         capture_session_id: Some(capture_session_id.to_string()),
         capture_record_seq: Some(capture_record_seq),
-        venue: envelope.venue,
+        venue: envelope.venue.into(),
         conn_id: envelope.conn_id.clone(),
         channel: envelope.channel.clone(),
         symbol: envelope.symbol.clone(),

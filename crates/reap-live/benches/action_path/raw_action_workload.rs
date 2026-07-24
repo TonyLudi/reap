@@ -131,7 +131,7 @@ fn book_payload(action: &'static str, ts_ms: u64, previous_sequence: i64, sequen
 
 fn raw_book_envelope(ts_ms: u64, payload: String) -> RawEnvelope {
     RawEnvelope {
-        venue: Venue::Okx,
+        venue: OkxVenue,
         conn_id: ConnId::new("action-gap-primary"),
         channel: Channel::Books,
         symbol: Some("BTC-USDT".to_string()),

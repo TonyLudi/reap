@@ -1,11 +1,11 @@
-use reap_core::{Channel, ConnId, EventKey, MarketEvent, NormalizedEvent, RawEnvelope, Venue};
+use reap_core::{Channel, ConnId, EventKey, MarketEvent, NormalizedEvent, OkxVenue, RawEnvelope};
 use reap_venue::{VenueAdapter, VenueEvent, okx::OkxAdapter};
 
 #[test]
 fn legacy_index_ticker_value_identity_and_serialized_bytes_stay_frozen() {
     let payload = r#"{"arg":{"channel":"index-tickers","instId":"BTC-USDT"},"data":[{"instId":"BTC-USDT","idxPx":"00050000.125000","ts":"1001"}]}"#;
     let envelope = RawEnvelope {
-        venue: Venue::Okx,
+        venue: OkxVenue,
         conn_id: ConnId::new("legacy-okx"),
         channel: Channel::Custom("index-tickers".to_string()),
         symbol: Some("BTC-USDT".to_string()),

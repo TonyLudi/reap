@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use reap_core::{
-    AccountUpdate, Balance, Channel, ConnId, NormalizedEvent, RawEnvelope, SystemEvent,
+    AccountUpdate, Balance, Channel, ConnId, NormalizedEvent, OkxVenue, RawEnvelope, SystemEvent,
     SystemEventKind, Venue,
 };
 use reap_feed::{FeedOutput, FeedProcessor, payload_hash};
@@ -679,7 +679,7 @@ fn envelope(
     payload: String,
 ) -> RawEnvelope {
     RawEnvelope {
-        venue: Venue::Okx,
+        venue: OkxVenue,
         conn_id: ConnId::new(connection),
         channel,
         symbol,

@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use reap_core::{Channel, ConnId, RawEnvelope, Venue};
+use reap_core::{Channel, ConnId, OkxVenue, RawEnvelope, Venue};
 use reap_venue::{VenueAdapter, okx::OkxAdapter};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -28,9 +28,11 @@ pub struct RawCapture {
 
 impl RawCapture {
     pub fn into_envelope(self) -> Result<RawEnvelope> {
+        let venue = OkxVenue::try_from(self.venue)
+            .map_err(|venue| anyhow::anyhow!("unsupported legacy capture venue {venue:?}"))?;
         let payload = serde_json::to_string(&self.payload)?;
         Ok(RawEnvelope {
-            venue: self.venue,
+            venue,
             conn_id: self.conn_id,
             channel: self.channel,
             symbol: self.symbol,
@@ -161,7 +163,7 @@ pub fn replay_check<R: Read>(reader: R) -> Result<ReplayCheckReport> {
             let envelope = capture.into_envelope()?;
             let adapter = adapters
                 .iter()
-                .find(|adapter| adapter.venue() == envelope.venue)
+                .find(|adapter| adapter.venue() == Venue::from(envelope.venue))
                 .context("no adapter registered for capture venue")?;
             for parsed in adapter.parse(&envelope)? {
                 for output in processor.process_from(&envelope.conn_id, parsed) {
@@ -232,6 +234,28 @@ pub fn replay_check<R: Read>(reader: R) -> Result<ReplayCheckReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_raw_envelope_rejects_a_polymarket_capture() {
+        let capture = RawCapture {
+            capture_session_id: None,
+            capture_record_seq: None,
+            venue: Venue::Polymarket,
+            conn_id: ConnId::new("pm-public"),
+            channel: Channel::Books,
+            symbol: Some("outcome-token".to_string()),
+            recv_ts_ns: 1,
+            raw_hash: Some(2),
+            payload: Value::Null,
+        };
+
+        let error = capture.into_envelope().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported legacy capture venue Polymarket")
+        );
+    }
 
     #[test]
     fn checker_reports_duplicate_gap_and_recovery() {

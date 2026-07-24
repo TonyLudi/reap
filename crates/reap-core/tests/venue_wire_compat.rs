@@ -1,5 +1,6 @@
 use reap_core::{
-    Channel, ConnId, FeedPriority, RawEnvelope, Subscription, SystemEvent, SystemEventKind, Venue,
+    Channel, ConnId, EventId, EventKey, FeedPriority, OkxVenue, RawEnvelope, Subscription,
+    SystemEvent, SystemEventKind, Venue,
 };
 
 #[test]
@@ -21,7 +22,7 @@ fn existing_okx_venue_and_envelope_bytes_are_unchanged() {
     assert_eq!(serde_json::to_vec(&decoded).unwrap(), subscription_bytes);
 
     let envelope = RawEnvelope {
-        venue: Venue::Okx,
+        venue: OkxVenue,
         conn_id: ConnId::new("public-1"),
         channel: Channel::Books,
         symbol: Some("BTC-USDT".to_string()),
@@ -33,6 +34,51 @@ fn existing_okx_venue_and_envelope_bytes_are_unchanged() {
     assert_eq!(serde_json::to_vec(&envelope).unwrap(), envelope_bytes);
     let decoded: RawEnvelope = serde_json::from_slice(envelope_bytes).unwrap();
     assert_eq!(serde_json::to_vec(&decoded).unwrap(), envelope_bytes);
+}
+
+#[test]
+fn legacy_okx_feed_identity_is_zero_sized_and_rejects_polymarket() {
+    #[derive(Hash)]
+    enum OriginalSingleVenue {
+        Okx,
+    }
+
+    assert_eq!(std::mem::size_of::<OkxVenue>(), 0);
+    assert_eq!(format!("{OkxVenue:?}"), format!("{:?}", Venue::Okx));
+    assert_eq!(
+        serde_json::to_vec(&OkxVenue).unwrap(),
+        serde_json::to_vec(&Venue::Okx).unwrap()
+    );
+
+    let mut okx_hash = std::hash::DefaultHasher::new();
+    let mut marker_hash = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(&OriginalSingleVenue::Okx, &mut okx_hash);
+    std::hash::Hash::hash(&OkxVenue, &mut marker_hash);
+    assert_eq!(
+        std::hash::Hasher::finish(&marker_hash),
+        std::hash::Hasher::finish(&okx_hash)
+    );
+
+    assert!(OkxVenue::try_from(Venue::Polymarket).is_err());
+    assert!(serde_json::from_slice::<OkxVenue>(br#""polymarket""#).is_err());
+
+    let polymarket_envelope = br#"{"venue":"polymarket","conn_id":"public-1","channel":"books","symbol":"BTC-USDT","recv_ts_ns":123456789,"raw_hash":42,"payload":"{}"}"#;
+    assert!(serde_json::from_slice::<RawEnvelope>(polymarket_envelope).is_err());
+
+    let polymarket_event_id =
+        br#"{"venue":"polymarket","channel":"books","symbol":"BTC-USDT","key":{"raw_hash":42}}"#;
+    assert!(serde_json::from_slice::<EventId>(polymarket_event_id).is_err());
+
+    let okx_event_id = EventId {
+        venue: OkxVenue,
+        channel: Channel::Books,
+        symbol: Some("BTC-USDT".to_string()),
+        key: EventKey::RawHash(42),
+    };
+    assert_eq!(
+        serde_json::to_vec(&okx_event_id).unwrap(),
+        br#"{"venue":"okx","channel":"books","symbol":"BTC-USDT","key":{"raw_hash":42}}"#
+    );
 }
 
 #[test]
