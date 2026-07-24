@@ -343,6 +343,7 @@ async fn aged_lane_writer_preflight_failure_applies_only_terminal_invalid_transi
         .next()
         .unwrap();
     run.reduce_then_enqueue_pm_book(delivery).unwrap();
+    support::wait_for_capture_sequence(run.path(), 7).await;
 
     // Advance only the writer clock beyond the otherwise valid aged-lane
     // observation. This makes the disconnect lifecycle record fail in its
@@ -354,6 +355,7 @@ async fn aged_lane_writer_preflight_failure_applies_only_terminal_invalid_transi
     )
     .await
     .unwrap();
+    support::wait_for_capture_sequence(run.path(), 8).await;
     let observed_now_ns = 200 + PUBLIC_MAX_AGE_NS + 1;
     let baseline_counters = run.pm_book_counters();
     let baseline_ingress = run.pm_book_last_ingress_sequence();

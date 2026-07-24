@@ -257,6 +257,7 @@ async fn pre_snapshot_metadata_aged_latches_without_false_transition_and_recover
     let directory = tempfile::tempdir().unwrap();
     let mut run = start_live_run(directory.path().join("metadata-aged.jsonl")).await;
     run.issue_and_enqueue_pm_metadata(WALL + 50).unwrap();
+    support::wait_for_capture_sequence(run.path(), 5).await;
     let before = run.pm_book_counters();
     let observed_now_ns = 50 + PUBLIC_MAX_AGE_NS + 1;
     let failure = run
@@ -323,6 +324,8 @@ async fn sibling_run_cannot_latch_or_terminalize_another_runs_aged_head() {
         .next()
         .unwrap();
     owner.reduce_then_enqueue_pm_book(delivery).unwrap();
+    support::wait_for_capture_sequence(owner.path(), 7).await;
+    support::wait_for_capture_sequence(sibling.path(), 6).await;
     let observed_now_ns = 120 + PUBLIC_MAX_AGE_NS + 1;
     let sibling_counters = sibling.pm_book_counters();
     let sibling_readiness = sibling.pm_book_readiness();
@@ -393,6 +396,7 @@ async fn timer_stale_book_can_still_latch_exact_aged_delivery_and_resync() {
             PmPublicReadinessReason::BookStale
         ))
     );
+    support::wait_for_capture_sequence(run.path(), 8).await;
 
     let observed_now_ns = 120 + PUBLIC_MAX_AGE_NS + 1;
     let failure = run

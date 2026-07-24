@@ -212,6 +212,44 @@ pub fn capture_header() -> PmCaptureHeader {
     PmCaptureHeader::new(scope, session_policy(), provenance()).unwrap()
 }
 
+pub async fn wait_for_capture_sequence(path: &std::path::Path, expected_sequence: u64) {
+    let path = path.to_path_buf();
+    let expected_records =
+        usize::try_from(expected_sequence).expect("capture sequence fits the test host");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let bytes = tokio::fs::read(&path)
+            .await
+            .expect("active capture artifact remains readable");
+        let records = bytes.iter().filter(|byte| **byte == b'\n').count();
+        assert!(
+            records <= expected_records,
+            "capture artifact advanced past the expected deterministic prefix: \
+             observed {records}, expected {expected_records}"
+        );
+        if records == expected_records && bytes.ends_with(b"\n") {
+            let last_line = bytes[..bytes.len() - 1]
+                .rsplit(|byte| *byte == b'\n')
+                .next()
+                .expect("expected capture prefix has a final record");
+            let last: serde_json::Value =
+                serde_json::from_slice(last_line).expect("final capture record remains valid JSON");
+            assert_eq!(
+                last.get("sequence").and_then(serde_json::Value::as_u64),
+                Some(expected_sequence),
+                "capture prefix must end at its exact contiguous sequence"
+            );
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "capture writer did not flush the expected deterministic prefix: \
+             observed {records}, expected {expected_records}"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
 pub fn book_reducer(epoch: u64) -> PmBookReducer {
     let authority = authoritative();
     let fingerprint = PmMetadataFingerprint::new(authority.metadata_fingerprint()).unwrap();

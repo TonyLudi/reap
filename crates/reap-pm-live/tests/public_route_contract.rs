@@ -245,6 +245,7 @@ async fn old_pm_unavailable_services_once_before_a_stale_okx_sibling_faults() {
             .unwrap(),
         OkxPublicCaptureEvent::ReferenceEnqueued
     );
+    support::wait_for_capture_sequence(run.path(), 8).await;
 
     let observed_now_ns = 1_001 + 500_000_000 + 1;
     let mut recorder = PublicRecorder::default();
@@ -315,6 +316,7 @@ async fn old_okx_unavailable_services_once_before_a_stale_pm_sibling_faults() {
     let flow = batch.take_snapshot_flow().unwrap();
     let snapshot = batch.into_books().into_iter().next().unwrap();
     run.commit_then_enqueue_pm_snapshot(snapshot, flow).unwrap();
+    support::wait_for_capture_sequence(run.path(), 7).await;
 
     let observed_now_ns = 1_001 + 500_000_000 + 1;
     let mut recorder = PublicRecorder::default();

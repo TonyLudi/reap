@@ -680,6 +680,7 @@ async fn active_pm_aged_maps_to_backlog_aged_and_preserves_the_okx_route() {
         capture_okx_reference(&mut run, 1_001).await.unwrap(),
         OkxPublicCaptureEvent::ReferenceEnqueued
     ));
+    support::wait_for_capture_sequence(run.path(), 9).await;
 
     let observed_now_ns = 1_000 + PUBLIC_MAX_AGE_NS + 1;
     let failure = run
@@ -789,6 +790,7 @@ async fn active_okx_aged_maps_to_stale_and_preserves_the_pm_route() {
         capture_okx_reference(&mut run, 1_002).await.unwrap(),
         OkxPublicCaptureEvent::ReferenceEnqueued
     ));
+    support::wait_for_capture_sequence(run.path(), 10).await;
 
     let reducer_before = run.pm_book_counters();
     let observed_now_ns = 1_000 + PUBLIC_MAX_AGE_NS + 1;
