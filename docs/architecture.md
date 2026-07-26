@@ -53,9 +53,12 @@ phase status and evidence are recorded separately in
 The PM wire and fixture reference is only the reached tracked source at
 `../predarb` commit `8222273a9c72033b760e1d2fec813bc77144556d`; Reap neither
 depends on that checkout nor adopts its application/runtime architecture.
-The Phase 6 local architecture/evidence gate is green. This section does not
-claim authenticated PM connectivity, an approved production quote model,
-target-host qualification, venue capacity, or trading approval.
+Goal F's credential-free architecture, deterministic replay, bounded-memory,
+authority, local regression, and global workspace gates are green on the final
+code/evidence tree
+`d16c3cbdac97fb43944e3a97d4f9b56e92206747`. This section does not claim
+authenticated PM connectivity, an approved production quote model, target-host
+qualification, venue capacity, or trading approval.
 
 ## Goals
 

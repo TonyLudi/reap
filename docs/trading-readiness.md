@@ -64,14 +64,13 @@ This scope remains pinned to the supported call path in the clean
 | Build/supply chain | Rust `1.95.0` is pinned; least-privilege CI checks formatting, all-target lint, all workspace tests, a locked release build, and RustSec advisories; Cargo and Actions updates are proposed weekly | CI must remain green and dependency updates reviewed, but this does not replace credentialed exchange or target-host evidence |
 | Exchange certification | Point-in-time account certification, journal-bound process-death deadman replay, exact fill/bill collection, and offline normal-trade/funding economics are implemented, but no passing target-account artifact, OKX demo soak, economic artifact, deadman artifact, or broader fault campaign is recorded | Production blocker |
 
-## Polymarket Foundation Status (Goal F Phase 6 Green)
+## Polymarket Foundation Status (Goal F Complete; Phase 7 Green)
 
-Goal F Phase 6 is **GREEN** on accepted local structural, deterministic replay,
-allocation, memory-bound, and performance-regression evidence. Phase 7
-documentation, global workspace verification, and final handoff remain a
-separate completion gate. The status below classifies the implemented PM
-mechanics and the accepted Phase 6 evidence; it grants no credentialed access,
-demo trading, live trading, or production trading authority.
+Goal F is **GREEN** on its credential-free structural, deterministic replay,
+allocation, memory-bound, local performance-regression, and global workspace
+gates. The status below classifies the implemented PM mechanics and final local
+evidence; it grants no credentialed access, demo trading, live trading, or
+production trading authority.
 
 ### Implemented credential-free and offline mechanics
 
@@ -83,7 +82,7 @@ demo trading, live trading, or production trading authority.
 | Private and account mechanics | Private order/fill lifecycle, open-order and order-detail reconciliation, fill-watermark handling, collateral, outcome-token inventory, allowance, position, and snapshot convergence are implemented through owner-bound fixture/fake deliveries. | This is offline convergence evidence only. No authenticated private stream, account endpoint, or real Polymarket snapshot has entered the product. |
 | Quote-model seam | A statically supplied pure model consumes exact OKX reference state and PM readiness state, and quote policy performs the checked side-aware conversion to an exact passive candidate. The only concrete model is explicitly a deterministic fixture model. | The dataflow seam is implemented. There is no default or approved production fair-probability, spread, size, inventory, fee, liquidity, or risk model. |
 | Order lifecycle | Exact candidate approval, reservation, durable intent/fact journaling, recovery, ownership proof, prepared effects, results, fills, duplicate suppression, and owned cancellation are represented for one fixed GTC post-only profile. Only the in-process `PmFixtureOwnedExecution` fake consumes place or cancel effects. | PM order mutation is fake-only. `ApprovedPmQuote` and `ApprovedPmCancel` are local invariant proofs, not exchange credentials or trading approval. |
-| Coordinator and evidence | One mutation owner, bounded lanes, deterministic priority, fail-closed saturation/age behavior, exact local replay, and action-path evidence are Phase 6 green. Three recorded action runs met the local `25,000 ns` p50 and `250,000 ns` p99.9 regression bounds with zero owner allocations, 58,858,352 reserved bytes below 64 MiB, exact logical/hash identity, and zero drops or saturation. | This establishes local structural, determinism, bounded-memory, and regression properties only. It does not establish live latency, venue behavior, economics, deployment capacity, or operational readiness. |
+| Coordinator and evidence | One mutation owner, bounded lanes, deterministic priority, fail-closed saturation/age behavior, exact local replay, and action-path evidence are Goal F green. The final three recorded action runs met the local `25,000 ns` p50 and `250,000 ns` p99.9 regression bounds with zero owner allocations, 58,858,352 reserved bytes below 64 MiB, exact logical/hash identity, and zero drops or saturation. | This establishes local structural, determinism, bounded-memory, and regression properties only. It does not establish live latency, venue behavior, economics, deployment capacity, or operational readiness. |
 | Authorization | Both accepted PM evidence targets fix `production_order_entry_authorized = false`, and the PM product exposes no live mutation constructor. | No PM demo, live, or production order entry is authorized. |
 
 ### PM trading gates that remain open

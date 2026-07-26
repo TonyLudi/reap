@@ -1,6 +1,7 @@
 # Multi-Venue Polymarket Foundation Goal F Handoff
 
-Status: in progress overall. Phase 0 is green at
+Status: complete for Goal F's credential-free architecture and local evidence
+scope. Phase 0 is green at
 `8d6581270b82f39293ccdb0cbeaead42d717e81c`; Phase 1 is green at
 `eb71bc1b84cef6152dc010922641e9d5bb019e43`; Phase 2 is green at
 `7014a611f997e0bec8e86051d56f333d57776fc1`; Phase 3 is green at
@@ -9,9 +10,12 @@ Status: in progress overall. Phase 0 is green at
 `22044267eb2f9b675471858c0488f1f89de102fa`; and Phase 6 is green on acceptance
 tree `c76ccbd22cb4d25e121ac5bb3bc9b6dcd9e16f47`. Official PM replay/action
 evidence was recorded from `e11d51bfebe157b31d6f6d8ee8a8c4981f6c8768`;
-`c76ccbd` changes only the exact dependency-policy allowlist. Phase 7 remains
-pending. This ledger is architecture and deterministic local evidence, not
-authenticated-connectivity evidence or trading authorization.
+`c76ccbd` changes only the exact dependency-policy allowlist. Phase 7 is green
+on final code/evidence tree
+`d16c3cbdac97fb43944e3a97d4f9b56e92206747`, with the final documentation in
+the commit containing this handoff. This ledger is architecture and
+deterministic local evidence, not authenticated-connectivity evidence or
+trading authorization.
 
 The historical execution contract is the
 [Goal F prompt](multi-venue-polymarket-foundation-goal-f-prompt.md). The
@@ -48,7 +52,7 @@ deployed PM binary, target-host qualification, or production trading approval.
 | 4. Read-only private lifecycle and position monitor | Green | `6737653a2c8dd3211db35b6b7259edc5fab38360` |
 | 5. Passive quote lifecycle and fake execution | Green | `22044267eb2f9b675471858c0488f1f89de102fa` |
 | 6. PM coordinator, quote-model seam, local evidence | Green | `c76ccbd22cb4d25e121ac5bb3bc9b6dcd9e16f47` |
-| 7. Documentation, global verification, final audit | Pending | — |
+| 7. Documentation, global verification, final audit | Green | `d16c3cbdac97fb43944e3a97d4f9b56e92206747` code/evidence tree; containing handoff commit |
 
 ## Phase 4 Private-Lifecycle Protocol And Fixture Provenance
 
@@ -1862,7 +1866,7 @@ The final local gate is green:
 | `cargo test -p reap-capture-framing --locked` | Green |
 | `cargo clippy -p reap-pm-live --all-targets --locked -- -D warnings` | Green |
 | `cargo check -p reap-pm-live --lib --locked` | Green |
-| `cargo metadata --locked --format-version 1` | Green |
+| `cargo metadata --locked --format-version 1 >/dev/null` | Green |
 | `cargo fmt --all -- --check` | Green |
 | `git diff --check` | Green |
 
@@ -2879,6 +2883,10 @@ policy bookkeeping:
 | `29aefe3348a406da9b00154d61413722b11882ee` | Move already-owned legacy ticker identity without mixing the optimization into the architecture commit |
 | `e11d51bfebe157b31d6f6d8ee8a8c4981f6c8768` | Satisfy the strict PM lint gate without changing runtime allocation policy |
 | `c76ccbd22cb4d25e121ac5bb3bc9b6dcd9e16f47` | Pin the resulting exact fail-closed source-policy surface |
+| `ed7120b4b5b1b4a46646e1303edf527391eb1c14` | Record the green Phase 6 gate and accepted local evidence |
+| `1aa8dc4e6319ca243a8c7184b5a1df036edc3bf1` | Clarify generic transport comment wording without changing behavior |
+| `afefd8feaf046556ca60b5c064ffb41851c3d9e8` | Record the first Phase 7 verification checkpoint and exact aged-test diagnosis |
+| `d16c3cbdac97fb43944e3a97d4f9b56e92206747` | Add the deterministic test-only capture-drain barrier and close the global gate |
 
 The `OkxVenue` marker is zero-sized and preserves the original legacy debug,
 hash, and `"okx"` wire behavior. `RawEnvelope`, `EventId`, `FeedStreamId`, and
@@ -3010,35 +3018,247 @@ The first dependency-policy run on `e11d51b` correctly rejected newly added
 legacy fail-close occurrences that were not yet pinned. Test-only commit
 `c76ccbd` added only the exact `OkxVenue`, replay-rejection, and Chaos-risk
 rejection lines to the allowlist; the rerun passed 13/13. This is the accepted
-Phase 6 structural tree. Phase 7 documentation and final workspace gates
-remain pending.
+Phase 6 structural tree. The final Phase 7 resolution and acceptance follow.
 
-## Phase 7 Checkpoint: Global Test Gate Red
+## Phase 7: Documentation, Global Verification, And Handoff
 
-The first Phase 7 global verification attempt on 2026-07-24 is not an
+Status: **GREEN on 2026-07-26** on code/evidence tree
+`d16c3cbdac97fb43944e3a97d4f9b56e92206747`.
+
+### Historical first global attempt and deterministic resolution
+
+The first Phase 7 global verification attempt on 2026-07-24 was not an
 acceptance gate:
 
-- `cargo fmt --all -- --check` and workspace all-target Clippy with
-  `-D warnings` passed.
-- `cargo test --workspace --locked --no-fail-fast` remained red in eight aged
-  paths across four `reap-pm-live` integration-test binaries:
+- formatting and workspace all-target Clippy passed;
+- the complete workspace test found eight aged paths across
   `phase3_active_lane_enactment_contract`,
   `phase3_reducer_ownership_contract`,
-  `phase3_socket_terminal_evidence`, and `public_route_contract`.
-- Each failure occurs after a synthetic monotonic-clock jump while an earlier
-  asynchronous capture record can still be pending. The new Phase 6
-  500,000,000-ns writer-age policy correctly returns
-  `PmCaptureWriteError::CaptureAged` before the test reaches its intended
-  lane-staleness assertion. The intended correction is a deterministic
-  test-only capture-drain barrier before those clock jumps; the production
-  fail-closed age bound must not be weakened.
-- The same run initially found one transport source-policy wording violation.
-  Comment-only commit `1aa8dc4` removes the venue-protocol term from the
-  generic transport source, and its isolated source-policy target now passes
-  3/3.
+  `phase3_socket_terminal_evidence`, and `public_route_contract`; and
+- a synthetic monotonic-clock jump could overtake an earlier asynchronous
+  capture record, causing the correct 500,000,000-ns production writer-age
+  failure before the test reached the later lane-age assertion.
 
-The full workspace test has not been rerun or accepted after that correction.
-The locked release build, systemd verification, RustSec audit, final PM
-evidence rerun, deterministic Chaos backtest, and final Chaos benchmark
-campaign also remain pending. Phase 7 is not green, Goal F is not complete,
-and `production_order_entry_authorized` remains `false`.
+Commit `d16c3cb` adds one deterministic integration-test support barrier. It
+reads the active capture artifact until the exact expected complete JSONL line
+count and final sequence are visible before advancing the synthetic clock.
+There is no sleep, production API, runtime policy, or production age-bound
+change. The four affected targets then passed 16/16, 7/7, 3/3, and 6/6,
+respectively. Dedicated inclusive capture-age and one-nanosecond-late failure
+tests also remained green.
+
+The same historical attempt found one generic transport source-policy wording
+violation. Comment-only commit `1aa8dc4` removed the venue-protocol term from
+the neutral transport comment; its source-policy target passed 3/3. Neither
+correction changes product behavior or authority.
+
+### Final global gate
+
+All required completion commands exited zero:
+
+| Gate | Final result |
+| --- | --- |
+| `mkdir -p /home/ubuntu/code/reap/target/tmp` | Green; retained evidence directory |
+| `cargo fmt --all -- --check` | Green |
+| `TMPDIR=/home/ubuntu/code/reap/target/tmp cargo clippy --workspace --all-targets --locked -- -D warnings` | Green |
+| `TMPDIR=/home/ubuntu/code/reap/target/tmp cargo test --workspace --locked --no-fail-fast` | Green complete rerun; no failed unit, integration, trybuild, or doc suite |
+| `TMPDIR=/home/ubuntu/code/reap/target/tmp cargo build --release --workspace --locked` | Green in 6m 51s |
+| `TMPDIR=/home/ubuntu/code/reap/target/tmp deploy/systemd/verify-units.sh target/release/reap` | Observe, demo, and capture all exposure `2.9 OK` |
+| `TMPDIR=/home/ubuntu/code/reap/target/tmp cargo audit --deny warnings` | Green; 1,169 advisories loaded and 261 locked dependencies scanned |
+| `cargo metadata --locked --format-version 1` | Green |
+| `git diff --check` | Green |
+
+The successful workspace-test log is
+`target/tmp/goal-f-phase7-workspace-test-d16c3cb-rerun1.log`; the earlier
+tool-interrupted invocation is not acceptance evidence. Clippy, release-build,
+and audit logs are retained beside it under `target/tmp`.
+
+Focused existing-product proofs also passed:
+
+| Proof | Result |
+| --- | --- |
+| Goal D decision replay | 4 passed; three fixture-authoring helpers ignored |
+| Initialized live/engine decision parity | 1/1 |
+| Live single-owner responsibility state | 1/1 |
+| `reap-strategy` | 107 unit tests plus all three compile-fail cases |
+| `reap-engine` | 7 unit tests plus the same 4/3 decision-replay result |
+| `reap-risk` | 31/31 |
+| Canonical Chaos backtest twice | Byte-identical; SHA-256 `38acf9f5e0c310f2ec5528974beffadf4c1a7f84d46efa8d9664ee7051e84691` |
+
+The complete workspace run additionally covers the existing Chaos/Java parity,
+exact-order, source-policy, authority, compile-fail, dependency, schema,
+capture/replay, storage, and emergency suites.
+
+### Final PM replay and action evidence
+
+The dedicated `combined_replay` rerun passed 13/13:
+
+| Evidence | Final result |
+| --- | --- |
+| Real-writer artifact | 35,012 lines; 22,791,589 bytes; SHA-256 `83ced509c9ea180e66d957853f9ff7762ef3c0babc316c9251c12d4d1a5224eb` |
+| Two independent recoveries | Byte-identical; canonical SHA-256 `f98bf8a88f34fb6e3c4dcfd1919a2c1d4577b2da3960375e216e596d0746cd35` |
+| Recovery memory/state | 2,959,343 peak bytes; 35,012 records; last sequence 35,011; zero terminal owned orders, fill keys, or unresolved orders |
+| Journal/logical identity | `389887a2d044867c6ad1f7b7b9ad52aa58c792864846fc42f220759fac111b85` / `4931af3e39ee291db82ba40da7a5e73473431801606565b5ad625c69beb70475` |
+| Parser fixture/projection | `985332384ae2e7b2535c0fa2c214b40862997b0f80c450be87ac108fff9b550b` / `588e14caac0d5a38c94f9ee121b0238f084a4e2c57dbcd1c7f8f5f052210e885` |
+| Authorization | `production_order_entry_authorized = false` |
+
+The PM action harness retained one discarded warm-up and three recorded runs:
+
+| Run | p50 | p95 | p99 | p99.9 | max |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 22,638 ns | 41,377 ns | 51,872 ns | 64,876 ns | 90,878 ns |
+| 2 | 23,466 ns | 43,814 ns | 55,400 ns | 72,893 ns | 125,995 ns |
+| 3 | 23,483 ns | 43,995 ns | 56,319 ns | 73,861 ns | 216,595 ns |
+
+Every run has 15,000 exact samples, zero owner allocation calls/bytes,
+58,858,352 reserved bytes below 64 MiB, the exact counters and hashes above,
+zero nominal drops/saturation, and zero terminal cardinalities after each of
+five repeated passes. The outer suite and every run fix production order-entry
+authorization false.
+
+The eleven bounded policy rows map exactly to thirteen overload cases and
+27,309 attempts: nine reached-product cases / 14,633 attempts and four sealed
+mechanism cases / 12,676 attempts. Every state-bearing capacity and synthetic
+age boundary reaches its declared fail-closed or resync transition. Telemetry
+is the only coalescing lane; allowed state-bearing drops are zero.
+
+### Final Chaos performance regression
+
+Each target used one discarded warm-up and three recorded same-host runs.
+Engine and live results were:
+
+| Benchmark/component | Final median | Phase 0 median | Delta |
+| --- | ---: | ---: | ---: |
+| Engine event loop | 11,593.0 ns/event | 11,783.5 ns/event | -1.62% |
+| Live wire parse/raw record | 2,938.2 ns/unit | 2,948.6 ns/unit | -0.35% |
+| Live dedup/sequence/book | 7,745.8 ns/unit | 7,712.6 ns/unit | +0.43% |
+| Live coordinator/strategy/risk/storage | 4,108.8 ns/unit | 4,137.7 ns/unit | -0.70% |
+| Complete live parity | 17,275.1 ns/unit | 17,635.5 ns/unit | -2.04% |
+
+Every engine run retained 250,000 events and 999,996 intents. Every live run
+retained 50,204 parsed frames, 70,208 feed outputs, 65,130 records, zero
+actions, and the exact Phase 0 allocation calls/requested bytes.
+
+Action-path medians were:
+
+| Workload | Final p50 | p50 delta | Final p99.9 | p99.9 delta |
+| --- | ---: | ---: | ---: | ---: |
+| Quote creation | 19,569 ns | +1.40% | 79,055 ns | -38.47% |
+| Quote replacement | 13,062 ns | +0.63% | 22,539 ns | -47.07% |
+| IOC hedge | 24,673 ns | -1.11% | 49,501 ns | -76.33% |
+| Risk rejection | 12,012 ns | +0.34% | 21,218 ns | -35.32% |
+| Symbol fail-close | 664 ns | +3.75% | 1,412 ns | -52.85% |
+| Global fail-close | 788 ns | +2.20% | 4,094 ns | +3.96% |
+| Coordinator reduction | 5,678 ns | +1.18% | 12,866 ns | +0.19% |
+| Raw recovery | 26,477 ns | +1.22% | 54,325 ns | -41.93% |
+| Trade reprice | 12,111 ns | +1.25% | 21,390 ns | +0.04% |
+| Bounded storm | 140 ns | 0.00% | 7,672 ns | -0.53% |
+
+All final and Phase 0 action runs have the same non-timing
+boundary/counter/allocation projection SHA-256
+`b8ca78c26029813726af7cd628ad5392405ddea1c5ce6a70a34c6142ed90bb77`.
+No final median or supported tail crosses the 5% investigation threshold.
+
+The first discarded live-loop warm-up exposed a stale bench-profile
+`reap-core` artifact from before `OkxVenue` existed. Current source, dev check,
+and the already-fresh locked workspace release build were green. Only generated
+`reap-core` release artifacts were invalidated with
+`cargo clean -p reap-core --release`; a fresh discarded warm-up compiled from
+current source, followed by the three recorded runs above. No source or
+acceptance invariant changed.
+
+### Final structural, state, authority, and provenance audit
+
+| Inventory | Final result |
+| --- | --- |
+| Workspace packages / outside-workspace path dependencies | 35 / 0 |
+| Complete normal workspace adjacency | 35 rows; SHA-256 `63cca672bf23690d042779967d2cb2c12414633924b20d296a269f2e63554c06` |
+| All normal workspace edges | 102; SHA-256 `a798f2c320e364782d0dbb3b0d0cc4ffc248896adad3ee502a9ec9e87d59c28e` |
+| Goal F normal workspace edges | 22; SHA-256 `8944276c9572f6cb00b7db0830e2189199e979eba57d7189973ea62fc281b29f` |
+| Goal F changed-source extent | 210 files / 91,664 lines / 0 above 1,500; SHA-256 `e1b17a6a6efbcb5829a9aedb62df494b4534eb6329c950958afbf90e3946bdaa` |
+| Public declarations | 2,671 lines; SHA-256 `0bb94c4dce0e896ce08e30d4fb3d4380e59a00e64a4ceaa04997d200f86bf1fc` |
+| Schema/version declarations | 48 lines; SHA-256 `e71cc793d56e5ba63199b6c341c97e04ac1ca18e8f68adf3742083de434a3d25` |
+| Production Rust paths | 366; SHA-256 `2a091f16d8e8107bd61f6529fb785581c2e6cd43a509feb9f248d0b78c6a2ee6` |
+| Production content manifest | 366 files; SHA-256 `ebdec7ad2706d6753ed8ea76df4f04838b8fd167ebc890e064de66577cfbc632` |
+| Production extent stream | 366 files; SHA-256 `878ee3d325f439891e5bcd0188e5365246e7f3b0b117ebd314fa1bfe6c1847c0` |
+| `Cargo.lock` | SHA-256 `2673d055c943c3bd5444531b67df280026c145cbbbc99b68a06f4ac0c2dbb0ff` |
+| Final normative boundary | SHA-256 `5284d480adf578cc3a368acda37810cc0be21cc40c3e40bcfd5566c3370b999c` |
+
+The one public-declaration increase after Phase 6 is the integration-test
+capture barrier. The production-content change is comment-only transport
+wording. Package count, dependency graph, schemas, paths, extent, lock,
+behavior, and authority are unchanged.
+
+Largest Goal-F production extents are `capture_roles.rs` 1,490,
+`coordinator/mutation.rs` 1,466, `private_monitor.rs` 1,447, adapter
+`public_session.rs` 1,440, and `reap-pm-state/private.rs` 1,395. The largest
+Goal-F-added production functions are 240 and 235 lines; none exceeds 250.
+
+The Phase 0 seven-row legacy state-aggregate inventory remains exact and
+unchanged at SHA-256
+`ac71cac3d1828682292b0d2e8199c4b4271420d2753850cde60b92c7526e528c`:
+`InstrumentState` 41 fields, `LiveCoordinator` 13, `ChaosStrategy` 12,
+`BacktestRunner` 11, `LiveRuntime` 11, `OkxOrderGateway` 8, and
+`FeedProcessor` 5. The final PM aggregates are:
+
+| PM aggregate | Root fields / layout evidence |
+| --- | --- |
+| `PmPublicCaptureRun` | 27 fields |
+| `PmCoordinator<Model>` | 24 fields; concrete fixture-model inline size 45,088 bytes, guarded below 64 KiB |
+| `PmPrivateState` | 20 fields |
+| `PmAccountState` | 17 fields |
+| `PmMutationOwner` | 14 fields; guarded below 32 KiB |
+| `PmCompleteInputLanes` | 13 fields |
+| `PmPrivateMonitorRuntime` | 6 fields; guarded below 32 KiB |
+| `PmProduct` / `PmProductRun` | 7 cold-composition fields / one boxed coordinator field |
+
+No new aggregate exceeds the existing 41-field `InstrumentState`. The
+single-owner evidence reserves 58,858,352 bounded bytes and returns all
+terminal cardinalities to zero; it does not hide shared mutation or unbounded
+state behind the smaller inline layout.
+
+Final dependency and authority checks prove:
+
+- no Cargo path points outside Reap and no manifest refers to either sibling;
+- `reap-live`, `reap-live-contracts`, and `reap-order` have no PM dependency
+  or PM product surface;
+- among OKX-specific crates, PM reaches only `reap-okx-public-source`, whose
+  dependencies and exports are public-reference-only; PM has no OKX
+  wire/private/account/order/evidence/emergency role;
+- the fixed 16-capability plan has no public-trade or arbitrary endpoint;
+  execution is only route-less in-process fake GTC post-only place and
+  cancel-owned;
+- no PM production source provides credentials, key loading, signing,
+  authenticated clients, arbitrary requests/commands, or live mutation; and
+- compile-fail/source-policy suites seal role ownership, plan construction,
+  raw types, and live authority.
+
+The public-wire fixture manifest is schema 1 / 36 payloads with SHA-256
+`765b5f2229215871c9bdc2c941601de5968a4e48633873b10c5d12d96a091306`;
+its provenance stream is
+`cdd669d67fa10457dc0b2e5b832572c66616ef5b6f08634c6d9ca95c8b4a435e`.
+All 36 fixture hashes and all five copied Predarb seeds match exact tracked
+bytes at the pinned object.
+
+### Final repository and scope audit
+
+- Reap contains required ancestors
+  `8258deb4b6e3a52e7c58c792da913210e0877fbb` and
+  `d2593f6d85ce868b46e3c1f16b5a48f221e5e480`.
+- `../imm-strategy` is clean and exactly
+  `b6b120c7b7c466d8431bf082f3229328c5d7b2ae`.
+- `../predarb` is exactly
+  `8222273a9c72033b760e1d2fec813bc77144556d`; its pinned object is a commit.
+  Its status names remain exactly
+  ` M resources/grafana/pf-maker-v2-dashboard.json` and `?? .predarb/`.
+  Neither dirty path was read, interpreted, cleaned, or modified.
+
+Goal F is complete only for the specified credential-free architecture,
+deterministic behavior, bounded-memory/authority evidence, and local regression
+scope. It still supplies no production probability or order model, PM
+credentials, signer implementation or signing capability, authenticated
+exchange session/request, live request, real private/account observation,
+settlement/redemption, target-host result, economic validation, operational
+deployment, controlled trial, or trading approval.
+`production_order_entry_authorized` remains false in source, capture,
+verification, replay, PM action evidence, and the final product boundary.

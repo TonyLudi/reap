@@ -223,6 +223,78 @@ Every action run preserved its exact logical counters. No median or supported
 tail regressed by more than 10%; the largest positive comparison was global
 fail-close p99.9 at `+8.76%`.
 
+## Goal F Phase 7 Final Local Rerun
+
+The final campaign ran on code/evidence tree
+`d16c3cbdac97fb43944e3a97d4f9b56e92206747`, using the same two-vCPU Arm
+Neoverse-N1 host and locked Rust toolchain. It retained one discarded warm-up
+and three recorded runs for each benchmark target.
+
+The PM combined replay remained exact: 13/13 tests passed; the real-writer
+artifact retained 35,012 lines, 22,791,589 bytes, and SHA-256
+`83ced509c9ea180e66d957853f9ff7762ef3c0babc316c9251c12d4d1a5224eb`.
+Both independent recoveries were byte-identical at canonical SHA-256
+`f98bf8a88f34fb6e3c4dcfd1919a2c1d4577b2da3960375e216e596d0746cd35`
+with 2,959,343 peak working bytes.
+
+The final PM action distributions were:
+
+| Recorded run | p50 | p95 | p99 | p99.9 | max |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 22,638 ns | 41,377 ns | 51,872 ns | 64,876 ns | 90,878 ns |
+| 2 | 23,466 ns | 43,814 ns | 55,400 ns | 72,893 ns | 125,995 ns |
+| 3 | 23,483 ns | 43,995 ns | 56,319 ns | 73,861 ns | 216,595 ns |
+
+Each run retained 15,000 samples, zero owner allocation calls and bytes,
+58,858,352 reserved bytes, exact logical counters, zero nominal drops or
+saturation, and zero terminal cardinalities after all five passes. Journal,
+logical, parser-fixture, and parser-projection SHA-256 values remained,
+respectively,
+`389887a2d044867c6ad1f7b7b9ad52aa58c792864846fc42f220759fac111b85`,
+`4931af3e39ee291db82ba40da7a5e73473431801606565b5ad625c69beb70475`,
+`985332384ae2e7b2535c0fa2c214b40862997b0f80c450be87ac108fff9b550b`,
+and
+`588e14caac0d5a38c94f9ee121b0238f084a4e2c57dbcd1c7f8f5f052210e885`.
+Production order-entry authorization remained false in the suite and every
+recorded run.
+
+The final Chaos engine/live medians were:
+
+| Benchmark/component | Final median | Phase 0 median | Delta |
+| --- | ---: | ---: | ---: |
+| Engine event loop | 11,593.0 ns/event | 11,783.5 ns/event | -1.62% |
+| Live wire parse/raw record | 2,938.2 ns/unit | 2,948.6 ns/unit | -0.35% |
+| Live dedup/sequence/book | 7,745.8 ns/unit | 7,712.6 ns/unit | +0.43% |
+| Live coordinator/strategy/risk/storage | 4,108.8 ns/unit | 4,137.7 ns/unit | -0.70% |
+| Complete live parity | 17,275.1 ns/unit | 17,635.5 ns/unit | -2.04% |
+
+Every engine run retained 250,000 events and 999,996 intents. Every live run
+retained the exact Phase 0 logical and allocation counts: 50,204 parsed
+frames, 70,208 feed outputs, 65,130 records, zero actions, and allocation
+calls/requested bytes of `1,673,504 / 158,570,992`,
+`670,868 / 1,349,274,641`, `1,849,399 / 364,106,336`, and
+`4,193,771 / 1,871,951,969` for the four rows.
+
+The final action-path medians were:
+
+| Action workload | Final p50 | p50 delta | Final p99.9 | p99.9 delta |
+| --- | ---: | ---: | ---: | ---: |
+| Quote creation | 19,569 ns | +1.40% | 79,055 ns | -38.47% |
+| Quote replacement | 13,062 ns | +0.63% | 22,539 ns | -47.07% |
+| IOC hedge | 24,673 ns | -1.11% | 49,501 ns | -76.33% |
+| Risk rejection | 12,012 ns | +0.34% | 21,218 ns | -35.32% |
+| Symbol fail-close | 664 ns | +3.75% | 1,412 ns | -52.85% |
+| Global fail-close | 788 ns | +2.20% | 4,094 ns | +3.96% |
+| Coordinator reduction | 5,678 ns | +1.18% | 12,866 ns | +0.19% |
+| Raw recovery | 26,477 ns | +1.22% | 54,325 ns | -41.93% |
+| Trade reprice | 12,111 ns | +1.25% | 21,390 ns | +0.04% |
+| Bounded storm | 140 ns | 0.00% | 7,672 ns | -0.53% |
+
+All three final action runs and all five retained Phase 0 comparison runs have
+the same non-timing boundary/counter/allocation projection SHA-256
+`b8ca78c26029813726af7cd628ad5392405ddea1c5ce6a70a34c6142ed90bb77`.
+No final median or supported tail crosses the 5% investigation threshold.
+
 ### Evidence exclusions
 
 The PM action timer covers the normalized single-owner path through sealed
@@ -236,7 +308,7 @@ real fills, settlement, or a production quote model.
 The Chaos rows retain the row-specific synthetic boundaries described above
 and do not become PM evidence. The overload tests prove fixed local mechanism
 bounds; they are not throughput or deployment-capacity measurements. These
-Phase 6 results establish local structural identity, determinism, allocation
+Goal F results establish local structural identity, determinism, allocation
 bounds, and regression control only. They are not a target-host measurement,
 latency SLO, capacity certification, economic validation, production-readiness
 claim, or authorization to enter orders.

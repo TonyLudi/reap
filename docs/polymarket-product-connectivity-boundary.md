@@ -1053,7 +1053,7 @@ leaves. `reap-storage` and `reap-capture` retained their existing internal
 domain/module shape and wrapped only the corresponding neutral mechanism;
 their old schemas remained above it.
 
-### Final Phase 6 implementation inventory
+### Final Goal F implementation inventory
 
 The accepted implementation keeps the same responsibility boundaries while
 splitting the large coordinator and evidence work into focused children:
@@ -1069,8 +1069,8 @@ splitting the large coordinator and evidence work into focused children:
 | `private_monitor` | Read-only batch validation, maintenance, canonical fixture state, and projections |
 | `fake_effect`, `public_routes`, `replay`, `schedule` | Narrow fake execution, sealed public routing, combined recovery/replay, and deterministic action scheduling |
 
-The accepted Phase 6 structural inventory on acceptance tree
-`c76ccbd22cb4d25e121ac5bb3bc9b6dcd9e16f47` is:
+The final structural inventory on verified code/evidence tree
+`d16c3cbdac97fb43944e3a97d4f9b56e92206747` is:
 
 | Inventory | Final result |
 | --- | --- |
@@ -1078,10 +1078,10 @@ The accepted Phase 6 structural inventory on acceptance tree
 | Goal F changed/new production sources since `d2593f6d85ce868b46e3c1f16b5a48f221e5e480` | 210 files / 91,664 production-extent lines / 0 files above 1,500 |
 | Goal F normal workspace edges | 22; SHA-256 `8944276c9572f6cb00b7db0830e2189199e979eba57d7189973ea62fc281b29f` |
 | Complete normal workspace adjacency | SHA-256 `63cca672bf23690d042779967d2cb2c12414633924b20d296a269f2e63554c06` |
-| Public declarations | 2,670 lines; SHA-256 `dd59af9df9125e01ab4e58eaa712dd18a8915ea81c8400f038548bb5c3434969` |
+| Public declarations | 2,671 lines; SHA-256 `0bb94c4dce0e896ce08e30d4fb3d4380e59a00e64a4ceaa04997d200f86bf1fc` |
 | Schema/version declarations | 48 lines; SHA-256 `e71cc793d56e5ba63199b6c341c97e04ac1ca18e8f68adf3742083de434a3d25` |
 | Production Rust paths | 366; SHA-256 `2a091f16d8e8107bd61f6529fb785581c2e6cd43a509feb9f248d0b78c6a2ee6` |
-| Production content manifest | SHA-256 `387bc4ee0e39ae5ed50438dd8c3cd067002ee3f2ca75170b8726c0a6d345d065` |
+| Production content manifest | SHA-256 `ebdec7ad2706d6753ed8ea76df4f04838b8fd167ebc890e064de66577cfbc632` |
 | Production extent stream | SHA-256 `878ee3d325f439891e5cbd0188e5365246e7f3b0b117ebd314fa1bfe6c1847c0` |
 | `Cargo.lock` | SHA-256 `2673d055c943c3bd5444531b67df280026c145cbbbc99b68a06f4ac0c2dbb0ff` |
 
@@ -1091,6 +1091,11 @@ lines; the next largest are coordinator mutation at 1,466, private monitor at
 every Goal-F production file at or below 1,500 lines. Exact replay,
 performance, and gate evidence is in the Goal F handoff rather than duplicated
 as authority here.
+
+Relative to the Phase 6 acceptance tree, the one additional public declaration
+is a test-support JSONL drain barrier. The only production-source content
+change is generic transport comment wording; production paths, extents,
+schemas, dependencies, behavior, and authority are unchanged.
 
 The exact constructor reach inside `composition` is narrower than its module's
 full static dependency set:
@@ -1516,6 +1521,22 @@ source-policy allowlist.
 These results are same-host structural and regression evidence. They are not a
 latency SLO, venue-capacity certification, target-host result, live
 connectivity proof, production economics validation, or trading authorization.
+
+### Final Goal F local confirmation
+
+The final rerun on
+`d16c3cbdac97fb43944e3a97d4f9b56e92206747` retained the exact combined-replay
+artifact, recovery, memory, counter, and hash values above. Its three PM
+action runs reported p50 `22,638 / 23,466 / 23,483 ns` and p99.9
+`64,876 / 72,893 / 73,861 ns`; all stayed below the frozen local bounds.
+Every run retained zero owner allocations, 58,858,352 reserved bytes, zero
+nominal drops/saturation, terminal cardinalities zero after all five passes,
+and `production_order_entry_authorized = false`.
+
+The exact thirteen-case overload suite and synthetic age-boundary tests cover
+every bounded state-bearing lane and its declared fail-closed or resync
+transition. Telemetry remains the sole coalescing lane; allowed state-bearing
+drops remain zero.
 
 ## Provenance And Known Reference Defects
 
