@@ -2,10 +2,11 @@
 
 ## Status
 
-Goal G-R Phase 0 is initialized. No replay, test, bench, build, clippy, or
-backtest command has run under Goal G-R. Goal G remains stopped on its
-immutable valid-red Amendment 2 evidence; this repair goal neither resumes nor
-amends Goal G.
+Goal G-R is stopped at the first Phase 1 runner invocation. No replay, test,
+bench, build, clippy, or backtest command ran. The frozen runner exited during
+its own storage preflight before it created an attempt directory or launched
+Cargo. Goal G remains stopped on its immutable valid-red Amendment 2
+evidence; this repair goal neither resumes nor amends Goal G.
 
 Recorded at `2026-07-27T17:07:23Z`.
 
@@ -106,6 +107,67 @@ transition-level causal proof:
 ```text
 goal_g_r_regression_contract_status=pending
 ```
+
+## Phase 1 Bootstrap Stop
+
+At `2026-07-27T17:09:49Z`, the first and only Phase 1 invocation was:
+
+```text
+target/tmp/goal-g-replay-repair/run-attempt.sh e992363c6aa75680b3479bb0a805db813355acbc phase1-diagnostic 01 mutation-exact
+```
+
+It exited `65` before Cargo launch with:
+
+```text
+target/tmp/goal-g-replay-repair/run-attempt.sh: line 26: root: readonly variable
+Goal G-R storage gate failed before attempt creation
+```
+
+The failure is deterministic. The runner assigns and freezes its repository
+path as a top-level readonly shell variable:
+
+```bash
+root=$(git rev-parse --show-toplevel)
+readonly root
+```
+
+Its exact storage-preflight subshell later assigns the same identifier:
+
+```bash
+storage_preflight() (
+  set -euo pipefail
+  root=$(git rev-parse --show-toplevel)
+  # ...
+)
+```
+
+Bash propagates the readonly attribute into the subshell, so the assignment
+fails before the filesystem check. Available repository bytes were
+`3689611264`, above the required floor; capacity was not the cause.
+
+Post-failure checks proved:
+
+- no candidate or attempt directory was created;
+- the goal-owned runtime directory remained empty;
+- no Cargo, rustc, combined-replay, or Reap process remained;
+- the tracked worktree remained clean at
+  `e992363c6aa75680b3479bb0a805db813355acbc`;
+- the frozen runner and Phase 0 attestation hashes remained exact; and
+- all four Goal G files, both complete-tree streams, `11594` files, and
+  `12253` entries remained exact.
+
+The runner cannot be repaired inside the current contract. It was reviewed,
+hashed, made immutable, recorded in the committed handoff, and then invoked;
+the Goal G-R prompt says it must never change after the first invocation.
+Rerunning it would reproduce the same pre-attempt failure, while changing it
+would silently violate the frozen evidence contract.
+
+The smallest next owner is a user-reviewed Goal G-R runner amendment. It
+should preserve this bootstrap record, authorize one replacement runner and
+new hash before any Cargo launch, remove the readonly-name collision without
+changing the fixed matrices or validators, and state whether the unused
+candidate path may remain absent. Goal G-R must not resume until that
+amendment is committed.
 
 ## Non-Claims
 
