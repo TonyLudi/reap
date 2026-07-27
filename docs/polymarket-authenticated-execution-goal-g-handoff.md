@@ -1,18 +1,23 @@
 # Polymarket Authenticated Execution Goal G Handoff
 
-Status: **restarted Phase 0 in progress under user-authorized Amendments 1 and
-2**. The historical stopped run correctly proved that
-an authenticated CLOB `CONDITIONAL` numeric value cannot become the boolean
-ERC-1155 operator approval required by Reap's typed core. Amendment 1 does not
-reinterpret it: it adds a separate closed finalized-block Polygon source,
-authorizes a strict source-tagged lifecycle/time compatibility union, and
-replaces the host-specific PM latency ceiling with a paired local relative
-gate. Amendment 2 incorporates the fresh restarted-run route/lifecycle audit,
-including a distinct REST-only matched-before-broadcast settlement state,
-single-lane requirement IDs, explicit HTTP no-retry construction, and exact
-source/vector/dependency tables. The benchmark-policy tranche is committed;
-Phase 0 is not yet green until its fresh benchmark, replay, and byte-level
-source re-attestation gates complete.
+Status: **stopped at the amended Phase 0 replay gate under user-authorized
+Amendments 1 and 2**. The clean current-HEAD replay selected immutable attempt
+1 as valid evidence with `gate_pass=false`: 11 of 13 tests passed and two
+existing Goal F semantic/non-timing tests failed. The amended contract forbids
+discarding or retrying that valid red result, so Phase 0 is not green and no
+Phase 1 implementation began. The source byte re-attestation and all 16
+baseline benchmark invocations were green before the replay stop.
+
+The historical stopped run correctly proved that an authenticated CLOB
+`CONDITIONAL` numeric value cannot become the boolean ERC-1155 operator
+approval required by Reap's typed core. Amendment 1 does not reinterpret it:
+it adds a separate closed finalized-block Polygon source, authorizes a strict
+source-tagged lifecycle/time compatibility union, and replaces the
+host-specific PM latency ceiling with a paired local relative gate. Amendment
+2 incorporates the restarted-run route/lifecycle audit, including a distinct
+REST-only matched-before-broadcast settlement state, single-lane requirement
+IDs, explicit HTTP no-retry construction, and exact source/vector/dependency
+tables.
 
 The reviewed design candidate is
 [polymarket-authenticated-execution-boundary.md](polymarket-authenticated-execution-boundary.md).
@@ -39,7 +44,7 @@ or run.
 
 | Phase | Status | Commit |
 | --- | --- | --- |
-| 0. Baseline, protocol freeze, threat model | Restarted; policy tranche and Amendment 2 contract/source freeze complete; byte re-attestation/benchmarks/replays pending; phase gate not green | Amendment 2 documentation-only pre-gate commit is identified by subject in Git history; supporting policy commit `facd3a616fc20e7bc1abc627235588b7532ff8b1` |
+| 0. Baseline, protocol freeze, threat model | Stopped; source re-attestation and 16-invocation baseline green; clean replay valid red at 11/13; phase gate not green | Pre-gate contract `66a6213301f9c9677f8137f545c11cfc0ff3c065`; supporting policy `facd3a616fc20e7bc1abc627235588b7532ff8b1`; stop record committed separately |
 | 1. Backend-neutral prepared effects | Not started | None |
 | 2. Secret custody/auth/signing | Not started | None |
 | 3. Public/chain/authenticated read-only transports | Not started | None |
@@ -53,9 +58,10 @@ The original prompt required Phase 0 to map the CLOB response into numeric
 only safe result. The amended prompt removes that invalid requirement and
 instead obtains both typed facts directly from the closed chain cut. The
 historical Phase 0 result is not green and is not retroactively relabeled.
-The active run restarted Phase 0, completed the benchmark-policy tranche and
-Amendment 2 source/contract freeze, and continues only after the remaining
-benchmark, replay, evidence, and documentation gates are green.
+The amended run restarted Phase 0, completed the benchmark-policy tranche and
+Amendment 2 source/contract freeze, passed source and benchmark gates, and
+then stopped at the replay gate. It cannot continue under the current frozen
+campaign.
 
 ## User-Authorized Amendment 1 — 2026-07-27
 
@@ -107,9 +113,9 @@ The amendment freezes these decisions:
    role. Phase 5 only composes that proven foundation.
 
 The amendment design was checked against these primary official contracts.
-The restarted Phase 0 already retrieved, pinned, and hashed the exact
-bytes/revisions recorded by the 128-row manifest; the active gate verifies
-those bytes and does not retrieve moving replacements:
+The restarted Phase 0 retrieved, pinned, hashed, and successfully re-attested
+the exact bytes/revisions recorded by the 128-row manifest; the gate did not
+substitute moving replacements:
 
 | Source | Amendment contract |
 | --- | --- |
@@ -241,39 +247,117 @@ near-cap files `capture_roles.rs` (1,490),
 `coordinator/mutation.rs` (1,466), `private_monitor.rs` (1,447), or
 `public_session.rs` (1,440); they must be split before relevant growth.
 
-The filesystem is 100% reported full with `317,001,728` bytes available at
-the latest pre-gate check. The amended helpers require `268,435,456` bytes
-before each Phase 0 execution; Phase 1 and every later build/global gate
-require `2,147,483,648` bytes. Falling below either threshold is a documented
-stop, not permission to remove user/sibling data, `target/tmp`, or invalid
-evidence. Additional storage or explicit approval for a
-retained-evidence-preserving build-cache cleanup is required before resuming.
+The filesystem is 100% reported full with `313,618,432` bytes available after
+the replay stop. The amended helpers require `268,435,456` bytes before each
+Phase 0 execution; Phase 1 and every later build/global gate require
+`2,147,483,648` bytes. Phase 1 therefore has an independent storage stop even
+if the replay defect is later resolved. Falling below either threshold is a
+documented stop, not permission to remove user/sibling data, `target/tmp`, or
+valid or invalid evidence. Additional storage or explicit approval for a
+retained-evidence-preserving build-cache cleanup is required before a later
+implementation campaign.
 
-### Remaining Phase 0 green gates
+### Amended Phase 0 Gate Results And Stop
 
-Phase 0 is deliberately still in progress. Before any Phase 1 implementation:
+The Amendment 2 documentation-only pre-gate commit is:
 
-- verify and preserve the user-authorized Amendment 2 runnable contract's
-  documentation-only pre-gate commit with subject
-  `docs: freeze goal g amendment 2 contract`; it does not mark Phase 0 green
-  and must not be recreated or amended;
-- complete one process-warmup plus three retained separate serial
-  overlap-controlled shared-host Cargo invocations for engine event loop,
-  live loop, Chaos action path, and PM action path, with the exact commands,
-  attempt selectors, process-tree overlap checks, and PM JQ comparator frozen
-  in the boundary;
-- rerun current-HEAD combined replay and canonical Chaos backtest twice and
-  confirm the Goal D anchors;
-- re-attest every retained document/Git body byte and every addendum blob at
-  its pinned revision, then rebuild the finalized 128-row authoritative
-  manifest without widening the cutoff;
-- review the final documentation diff, route/state tables, dependency DAG,
-  vector specification, source-policy claims, and workspace cleanliness; and
-- commit the completed Phase 0 documents/evidence as a focused
-  documentation-only gate.
+```text
+66a6213301f9c9677f8137f545c11cfc0ff3c065 docs: freeze goal g amendment 2 contract
+```
+
+It preserved the clean tree and frozen `Cargo.lock` SHA-256
+`2673d055c943c3bd5444531b67df280026c145cbbbc99b68a06f4ac0c2dbb0ff`.
+The ignored evidence root is
+`target/tmp/goal-g-phase0-amended`; it must remain intact.
+
+The exact source re-attestation passed:
+
+```text
+verified retained document bodies: 33
+verified retained Git bodies: 60
+verified pinned addendum blobs by credential-free fetch: 28
+verified cached crate archives: 3
+verified authoritative source manifest: 128 rows
+```
+
+The re-attestation log SHA-256 is
+`649a510599c591963c37dd1aaea579b9eefa2aba641a4dd155c5e70e21a4d9be`;
+the checksum-file SHA-256 is
+`e408e41fe6130d8ea1e3db739d196a83b5c8ad486fd3af6b2a2af37a37881709`.
+
+All engine, live, Chaos action, and PM action warm-up plus three retained
+invocations selected attempt 1: 16 of 16 had `evidence_valid=true` and
+`gate_pass=true`, with no process overlap. The retained medians were:
+
+| Baseline | Retained median |
+| --- | ---: |
+| Engine | 11,676.6 ns/event |
+| Live wire / feed / coordinator / parity | 2,927.8 / 7,782.1 / 4,072.4 / 17,351.7 ns/unit |
+| PM p50 / p95 / p99 / p99.9 / max | 23,565 / 45,021 / 57,418 / 78,546 / 176,300 ns |
+
+`baseline-summary.json` retains the ten Chaos action workload latency
+medians. The selected raw reports/logs retain the exact counters, allocations,
+hashes, cardinalities, queue gates, and all other non-timing evidence; their
+paths and hashes are covered by `baseline-campaign.sha256`. SHA-256 values
+are:
+
+| Baseline artifact | SHA-256 |
+| --- | --- |
+| `baseline-campaign.sha256` | `009a2faeaf2e6c777c3959d4cd92607f095036b42dcba2b90ea45a428b047a79` |
+| `baseline-summary.json` | `3de85bbd7145d6692cc383ea60783f072af243981c09902d26aac9c1668929e6` |
+| `pm-retained.json` | `8384d7637819107bae1bacabd580c09a19c185f2416f5f1e5bf6ff2d0741bac5` |
+| `summarizer.log.sha256` | `f0619cf256ef8cc856db2c80b9f5184d1d8f8321eb9b86ef63ad73f9d2a95c96` |
+
+The clean replay began at `2026-07-27T07:20:37Z` and ended at
+`2026-07-27T07:21:26Z`. Its pre/post HEAD, tree, status, and `Cargo.lock`
+were identical. Attempt 1 exited 101 and was selected with:
+
+```text
+schema=goal-g-phase0-replay-v2
+evidence_valid=true
+gate_pass=false
+reason=combined-replay command exited 101
+```
+
+The test result was 11 passed and two failed:
+
+- `phase6_real_mutation_artifacts_recover_to_the_same_bounded_projection`
+  failed in its isolated recovery subprocess with
+  `Invariant("PM fake-effect script does not match the next prepared effect")`;
+- `raw_frame_and_raw_count_bounds_are_exact` failed when the capture verifier
+  returned `InvalidRecords`.
+
+The command stopped before its decision/backtest subsections and emitted no
+new combined-replay report. The selector SHA-256 is
+`4168ac456d70361429967d7457e0d5850cd014c0b0ea7b8e45e3183372ec766d`;
+the combined log, metadata, and process-snapshot SHA-256 values are,
+respectively,
+`fe3e8c7323c52163345e6330ebd7587858990a49d1bc436a1a669792f6473cd9`,
+`b2dc689182ea8c02fd340669b2b0f142b6cafd15d5ec38a04cda221f3aaa8f56`,
+and
+`fd77e0c1db9970bbe2c20eea70dc8836091a81e77d9bd66491c4d8150f4bf0c3`.
+
+A read-only comparison from the known passing Goal F commit
+`d16c3cbdac97fb43944e3a97d4f9b56e92206747` to the replayed HEAD found only
+the three authorized PM latency-policy paths changed under
+`crates/reap-pm-live`: `benches/pm_action_path.rs`,
+`src/evidence/runner.rs`, and `tests/phase6_evidence_policy.rs`.
+`combined_replay.rs`, its capture verifier, and coordinator mutation logic are
+byte-unchanged. This supports, but does not prove, a pre-existing test
+isolation or durability race exposed by the clean run; it is not evidence of
+a Goal G semantic implementation regression.
+
+The clean nonzero replay is valid red evidence. The frozen selector and
+evidence must not be deleted, replaced, or retried. The smallest separately
+scoped next goal is to diagnose and fix the combined-replay
+isolation/durability failure without changing Goal F's frozen artifact,
+semantic, or non-timing hashes. It must preserve this red campaign. A reviewed
+Amendment 3 with a new evidence root is required before Goal G can attempt a
+new replay; adequate Phase 1 storage is separately required before
+implementation.
 
 No production endpoint, authenticated call, real Polygon call, credential,
-or order is needed for those gates.
+or order was used by these gates.
 
 ## Historical Stopped-Run Evidence — 2026-07-26 To 2026-07-27
 
@@ -795,10 +879,12 @@ provider-reported finalized-block consistency, freshness, failure behavior,
 bounded non-generic dependency edge, origin deferral, strict lifecycle/time
 union, and paired benchmark policy. No CLOB conditional encoding is guessed.
 
-Goal G is no longer blocked by the three historical findings. The fresh run
-is now active and has completed the narrowly authorized benchmark-policy
-tranche plus the Amendment 2 source/contract review. Its next action is the
-fresh serial Phase 0 benchmark/replay campaign and documentation gate recorded
-above. Neither amendment claims that Phase 0, an implementation phase,
-production origin, account qualification, or trading authorization is
-complete.
+Goal G is no longer blocked by the three historical findings. The amended run
+completed the narrowly authorized benchmark-policy tranche, Amendment 2
+source/contract review, source re-attestation, and baseline campaign. It then
+stopped correctly on the current clean replay's immutable valid red result.
+Goal G may not resume by retrying or discarding that result. The separately
+scoped replay-isolation/durability diagnosis, a reviewed Amendment 3 with a
+new evidence root, and the Phase 1 storage gate are the current next actions.
+Neither amendment claims that Phase 0, an implementation phase, production
+origin, account qualification, or trading authorization is complete.
