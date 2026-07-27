@@ -349,12 +349,18 @@ a Goal G semantic implementation regression.
 
 The clean nonzero replay is valid red evidence. The frozen selector and
 evidence must not be deleted, replaced, or retried. The smallest separately
-scoped next goal is to diagnose and fix the combined-replay
-isolation/durability failure without changing Goal F's frozen artifact,
-semantic, or non-timing hashes. It must preserve this red campaign. A reviewed
-Amendment 3 with a new evidence root is required before Goal G can attempt a
-new replay; adequate Phase 1 storage is separately required before
-implementation.
+scoped next goal is the proposed
+[Goal G-R combined-replay repair](goal-g-replay-repair-prompt.md). It permits
+only a causally proven repair within the closed evidence-harness/test
+allowlist and stops if live-product or other source changes are required. It
+must preserve this red campaign and Goal F's frozen artifact, semantic, and
+non-timing hashes. At proposal time the repository filesystem had
+`310,030,336` bytes available. Goal G-R avoids the undersized `/tmp` tmpfs
+with a private repository-filesystem runtime directory and requires at least
+`2,147,483,648` repository bytes before any edit or execution, so it is not
+currently runnable. A reviewed Amendment 3 with a new evidence root is
+required before Goal G can attempt a new replay; adequate Phase 1 storage is
+separately required before implementation.
 
 No production endpoint, authenticated call, real Polygon call, credential,
 or order was used by these gates.
@@ -884,7 +890,8 @@ completed the narrowly authorized benchmark-policy tranche, Amendment 2
 source/contract review, source re-attestation, and baseline campaign. It then
 stopped correctly on the current clean replay's immutable valid red result.
 Goal G may not resume by retrying or discarding that result. The separately
-scoped replay-isolation/durability diagnosis, a reviewed Amendment 3 with a
-new evidence root, and the Phase 1 storage gate are the current next actions.
-Neither amendment claims that Phase 0, an implementation phase, production
-origin, account qualification, or trading authorization is complete.
+scoped [Goal G-R](goal-g-replay-repair-prompt.md), a reviewed Amendment 3 with
+a new evidence root, and the Phase 1 storage gate are the current next
+actions. Neither amendment claims that Phase 0, an implementation phase,
+production origin, account qualification, or trading authorization is
+complete.
