@@ -1,13 +1,18 @@
 # Polymarket Authenticated Execution Goal G Handoff
 
-Status: **historical Phase 0 stop superseded by user-authorized Amendment 1;
-Goal G is runnable from Phase 0 again**. The stopped run correctly proved that
+Status: **restarted Phase 0 in progress under user-authorized Amendments 1 and
+2**. The historical stopped run correctly proved that
 an authenticated CLOB `CONDITIONAL` numeric value cannot become the boolean
 ERC-1155 operator approval required by Reap's typed core. Amendment 1 does not
 reinterpret it: it adds a separate closed finalized-block Polygon source,
 authorizes a strict source-tagged lifecycle/time compatibility union, and
 replaces the host-specific PM latency ceiling with a paired local relative
-gate. No implementation phase has yet run under the amended contract.
+gate. Amendment 2 incorporates the fresh restarted-run route/lifecycle audit,
+including a distinct REST-only matched-before-broadcast settlement state,
+single-lane requirement IDs, explicit HTTP no-retry construction, and exact
+source/vector/dependency tables. The benchmark-policy tranche is committed;
+Phase 0 is not yet green until its fresh benchmark, replay, and byte-level
+source re-attestation gates complete.
 
 The reviewed design candidate is
 [polymarket-authenticated-execution-boundary.md](polymarket-authenticated-execution-boundary.md).
@@ -26,14 +31,15 @@ real_order_submitted: false
 
 No real secret, authenticated request, Polygon RPC request, allowance update,
 order, cancel, or external mutation was used. Only public documentation,
-public official Git objects, owner-local repository tests, and local
-benchmarks were read or run.
+public official Git/dependency/package source, the local public Node/viem
+vector oracle, owner-local repository tests, and local benchmarks were read
+or run.
 
 ## Phase Status
 
 | Phase | Status | Commit |
 | --- | --- | --- |
-| 0. Baseline, protocol freeze, threat model | Historical run stopped; Amendment 1 adopted; **restart Phase 0 under amended contract** | None |
+| 0. Baseline, protocol freeze, threat model | Restarted; policy tranche and Amendment 2 contract/source freeze complete; byte re-attestation/benchmarks/replays pending; phase gate not green | Amendment 2 documentation-only pre-gate commit is identified by subject in Git history; supporting policy commit `facd3a616fc20e7bc1abc627235588b7532ff8b1` |
 | 1. Backend-neutral prepared effects | Not started | None |
 | 2. Secret custody/auth/signing | Not started | None |
 | 3. Public/chain/authenticated read-only transports | Not started | None |
@@ -47,9 +53,9 @@ The original prompt required Phase 0 to map the CLOB response into numeric
 only safe result. The amended prompt removes that invalid requirement and
 instead obtains both typed facts directly from the closed chain cut. The
 historical Phase 0 result is not green and is not retroactively relabeled.
-The next run starts Phase 0 again, applies the benchmark-policy tranche,
-refreshes the source freeze/evidence, and continues only after the amended
-gate is green.
+The active run restarted Phase 0, completed the benchmark-policy tranche and
+Amendment 2 source/contract freeze, and continues only after the remaining
+benchmark, replay, evidence, and documentation gates are green.
 
 ## User-Authorized Amendment 1 — 2026-07-27
 
@@ -81,9 +87,10 @@ The amendment freezes these decisions:
    out-of-profile input is quarantined and fails closed, never promoted to
    success.
 6. The PM action benchmark's absolute `25,000 ns` p50 and `250,000 ns` p99.9
-   exits are superseded. Phase 0 may change only the exact latency branch in
-   `src/evidence/runner.rs`, the bench validator, and their policy tests, not
-   the workload/report schema/non-timing gates. Each side retains three Cargo
+   exits are superseded. The completed policy tranche changed only the exact
+   latency branch in `src/evidence/runner.rs`, the bench validator, and their
+   policy tests, not the workload/report schema/non-timing gates; Goal G does
+   not edit it again. Each side retains three Cargo
    invocation reports after one process-warmup invocation; each retained
    invocation already has three internal recorded distributions. Compare the
    median of each invocation's internal three, then the median of those three
@@ -99,9 +106,10 @@ The amendment freezes these decisions:
    projection land as the first Phase 4 tranche before any live place/cancel
    role. Phase 5 only composes that proven foundation.
 
-The amendment design was checked against these primary official contracts;
-the fresh Phase 0 run must retrieve, pin, and hash the exact bytes/revisions it
-actually implements:
+The amendment design was checked against these primary official contracts.
+The restarted Phase 0 already retrieved, pinned, and hashed the exact
+bytes/revisions recorded by the 128-row manifest; the active gate verifies
+those bytes and does not retrieve moving replacements:
 
 | Source | Amendment contract |
 | --- | --- |
@@ -115,11 +123,166 @@ actually implements:
 
 These decisions are normative in the amended
 [execution prompt](polymarket-authenticated-execution-goal-g-prompt.md) and
-[boundary](polymarket-authenticated-execution-boundary.md). The sections below
-headed as stops/audits describe the pre-amendment run and remain evidence, not
-active instructions.
+[boundary](polymarket-authenticated-execution-boundary.md). The entire
+“Historical Stopped-Run Evidence” section below remains evidence, not active
+instructions.
 
-## Baseline And Workspace Identity
+## User-Authorized Amendment 2 And Restarted Phase 0 — 2026-07-27
+
+The restarted run began from clean `master` at
+`facd3a616fc20e7bc1abc627235588b7532ff8b1`, two commits ahead of the
+locally recorded `origin/master` tracking ref; no fetch was performed.
+Required baseline
+`43970849267c0282d118a369a792066c4655deae` and Goal F tree
+`d16c3cbdac97fb43944e3a97d4f9b56e92206747` are ancestors. `Cargo.lock`
+still hashes to
+`2673d055c943c3bd5444531b67df280026c145cbbbc99b68a06f4ac0c2dbb0ff`.
+Rust/Cargo are 1.95.0 on Linux aarch64 with two CPUs.
+
+`../imm-strategy` remains clean at
+`b6b120c7b7c466d8431bf082f3229328c5d7b2ae`. Predarb's pinned object
+`8222273a9c72033b760e1d2fec813bc77144556d` remains available. Only its
+dirty path names were observed: modified
+`resources/grafana/pf-maker-v2-dashboard.json` and untracked `.predarb/`.
+Neither path nor any dirty/runtime/secret byte was opened.
+
+The authorized benchmark-policy tranche is the focused commit:
+
+```text
+facd3a616fc20e7bc1abc627235588b7532ff8b1 bench: use relative pm action latency policy
+```
+
+It removed only the two obsolete PM absolute-latency exits, preserved the
+15,000-sample and all logical/hash/allocation/memory/cardinality/queue gates,
+and passed:
+
+```text
+cargo fmt --all -- --check
+cargo test -p reap-pm-live --test phase6_evidence_policy --locked
+cargo bench -p reap-pm-live --bench pm_action_path --locked
+```
+
+The precommit benchmark log is diagnostic only: it reports build revision
+`205ecca...` while exercising the later-committed diff, so it is not the
+Phase 0 comparator.
+
+Fresh public official captures and Git-source review found one additional
+normal state: a credential-visible account trade may be
+`MATCHED_NOT_BROADCASTED`, meaning the orders matched before an on-chain
+transaction was broadcast. Current official Python SDK source states that
+the value presently appears on account trade listings, not user-stream trade
+events. Amendment 2 therefore:
+
+1. adds a distinct nonterminal canonical `MatchedNotBroadcast` live fact;
+2. accepts its prefixed/unprefixed compatibility spellings only on the
+   account-trade REST family;
+3. quarantines either spelling on raw user WS and repairs through the complete
+   REST cut;
+4. keeps POST/order/trade `MATCHED` namespaces distinct;
+5. freezes every reached timestamp form per field rather than guessing by
+   magnitude;
+6. gives every stable requirement ID one lane and adds only the three
+   responsibility-split dispatch/reconciliation child IDs;
+7. explicitly disables reqwest retry, redirect, and ambient proxy behavior;
+   and
+8. freezes an acyclic five-new-crate edge/journal shape with only exact
+   `k256 =0.13.4` and `sha3 =0.10.9` external additions.
+
+The final implementability pass also froze details that may not be chosen
+during coding:
+
+- canonical padded base64url credential/output, exact application HTTP
+  headers, and strict no-content-encoding behavior;
+- one byte-once POST/cancel request contract and an exhaustive mutation
+  HTTP/body/cross-field classification union;
+- canonical increasing base64 offset cursors and exact one-pass query
+  encoding;
+- a Reap-local `/time` projection with exact order/L2 pre-write checks, no
+  invented timestamp high-water, and a five-second geoblock permit;
+- all five compact Polygon JSON-RPC request templates and result shapes;
+- the raw user-order occurrence/status/quantity compatibility table;
+- literal deterministic PM/OKX initial frames; and
+- the exact Phase 0 command/log/overlap/comparator and byte-revalidation
+  procedures.
+
+The current V2 OpenAPI, unified TypeScript SDK, and current Rust client agree
+that the signed/wire order has no `taker`, `nonce`, or `feeRateBps`. The older
+`clob-client-v2` extra `taker` is rejected. Current type-0 EOA source proves
+the fixed `maker == signer == funder == POLY_ADDRESS` profile and outer owner
+as the L2 key UUID. No current auth/signing/body/identity/route stop remains.
+
+The authoritative restarted source manifest has 128 rows and SHA-256
+`f38625a6f2bb0a2c8e13598acf6ab7dc1eccc57f97a7f4a8c45fdb810e8fcb4d`;
+its exact official revisions, critical blob/content hashes, dependency pins,
+and full vector values are recorded in the boundary. The independently
+authored vector candidate covers
+standard/negative-risk BUY/SELL domain separator, struct hash, digest/order
+ID, recoverable signature, exact POST/cancel bytes, GET query exclusion, and
+L2 HMAC. Phase 2 must check in immutable literals and reproduce them with the
+narrow Rust implementation; Node/viem remains evidence-only.
+
+### Restarted inventory cutoff
+
+| Inventory | Current result |
+| --- | --- |
+| Workspace packages / normal edges | 35 / 102 |
+| Outside-workspace Cargo path dependencies | 0 |
+| Adjacency / edge-list SHA-256 | `63cca672bf23690d042779967d2cb2c12414633924b20d296a269f2e63554c06` / `a798f2c320e364782d0dbb3b0d0cc4ffc248896adad3ee502a9ec9e87d59c28e` |
+| Public declarations | 2,671; `0bb94c4dce0e896ce08e30d4fb3d4380e59a00e64a4ceaa04997d200f86bf1fc` |
+| Schema declarations | 48; `e71cc793d56e5ba63199b6c341c97e04ac1ca18e8f68adf3742083de434a3d25` |
+| Production Rust paths | 366; `2a091f16d8e8107bd61f6529fb785581c2e6cd43a509feb9f248d0b78c6a2ee6` |
+| Crate-root public declarations | 143; `36fbdc52d7e688557a50aee1055216cba388450215ac04acc4c5ce9aff7ad673` |
+| Current production-content manifest | `b17bc622c7c1cb09139deeb1ddc9509b87b88a70857dc383d666cdfc86e7e648` |
+| Goal F fixture manifest/provenance | `765b5f2229215871c9bdc2c941601de5968a4e48633873b10c5d12d96a091306` / `cdd669d67fa10457dc0b2e5b832572c66616ef5b6f08634c6d9ca95c8b4a435e` |
+
+The current production extent is 366 files and 172,503 lines. Existing
+legacy files over 1,500 lines are unchanged. Goal G may not grow current
+near-cap files `capture_roles.rs` (1,490),
+`coordinator/mutation.rs` (1,466), `private_monitor.rs` (1,447), or
+`public_session.rs` (1,440); they must be split before relevant growth.
+
+The filesystem is 100% reported full with `317,001,728` bytes available at
+the latest pre-gate check. The amended helpers require `268,435,456` bytes
+before each Phase 0 execution; Phase 1 and every later build/global gate
+require `2,147,483,648` bytes. Falling below either threshold is a documented
+stop, not permission to remove user/sibling data, `target/tmp`, or invalid
+evidence. Additional storage or explicit approval for a
+retained-evidence-preserving build-cache cleanup is required before resuming.
+
+### Remaining Phase 0 green gates
+
+Phase 0 is deliberately still in progress. Before any Phase 1 implementation:
+
+- verify and preserve the user-authorized Amendment 2 runnable contract's
+  documentation-only pre-gate commit with subject
+  `docs: freeze goal g amendment 2 contract`; it does not mark Phase 0 green
+  and must not be recreated or amended;
+- complete one process-warmup plus three retained separate serial
+  overlap-controlled shared-host Cargo invocations for engine event loop,
+  live loop, Chaos action path, and PM action path, with the exact commands,
+  attempt selectors, process-tree overlap checks, and PM JQ comparator frozen
+  in the boundary;
+- rerun current-HEAD combined replay and canonical Chaos backtest twice and
+  confirm the Goal D anchors;
+- re-attest every retained document/Git body byte and every addendum blob at
+  its pinned revision, then rebuild the finalized 128-row authoritative
+  manifest without widening the cutoff;
+- review the final documentation diff, route/state tables, dependency DAG,
+  vector specification, source-policy claims, and workspace cleanliness; and
+- commit the completed Phase 0 documents/evidence as a focused
+  documentation-only gate.
+
+No production endpoint, authenticated call, real Polygon call, credential,
+or order is needed for those gates.
+
+## Historical Stopped-Run Evidence — 2026-07-26 To 2026-07-27
+
+Everything in this section through “Predarb Lessons And Rejections” preserves
+the pre-amendment stopped run. Its HEAD/remote state, source cutoff, absolute
+PM latency thresholds, red gates, and stop conclusions are historical only
+and do not override the current Amendment 2 section above.
+
+### Baseline And Workspace Identity
 
 The baseline inventory was taken on 2026-07-26 UTC. The current date at this
 stop record is 2026-07-27 UTC.
@@ -155,7 +318,7 @@ The root filesystem was 99% used with approximately 633 MiB free. Goal G's
 public-source captures and raw benchmark logs use approximately 22 MiB under
 ignored `target/tmp/goal-g-phase0`; no user or sibling data was cleaned.
 
-## Repository Inventory
+### Repository Inventory
 
 | Inventory | Baseline result |
 | --- | --- |
@@ -197,7 +360,7 @@ Current compile-fail case counts are 12 PM-core, 3 live-contracts, 1 strategy,
 `product_has_no_live_mutation_authority` guard may later be replaced only by
 stronger backend-mixing and authority guards; it may not simply be deleted.
 
-### File And Function Stops
+#### File And Function Stops
 
 These production files are already at or above 1,400 lines and cannot grow
 under Goal G before a responsibility split:
@@ -214,7 +377,7 @@ functions are `enact_okx_reference_lane_failure` (240 lines) and
 `enact_pm_lane_failure` (235 lines) in `run_lane_full.rs`; both already
 require decomposition review and are below the 250-line hard stop.
 
-## Focused Baseline Verification
+### Focused Baseline Verification
 
 | Command | Result |
 | --- | --- |
@@ -247,7 +410,7 @@ Existing Goal D decision anchors remain:
 | `expected_engine_v1.jsonl` | `140c268619b889a19d779e1bdfd340c11901d2eb1d9e4d216d976ba3d8b0d37a` |
 | `expected_live_reduction_v1.json` | `aa66cc09bba29cde25ab2df66c018517b2c900f83373f95580150e8bcd442b60` |
 
-## Benchmark Baseline And Red Gate
+### Benchmark Baseline And Red Gate
 
 Raw logs are retained under `target/tmp/goal-g-phase0`. Every command was a
 separate process. The engine, live, and Chaos action campaigns completed one
@@ -281,7 +444,7 @@ warm-up failed, Phase 0 has no valid three-run idle PM baseline and its
 performance gate is independently red. This is host-local evidence, not proof
 of a code regression: the source tree was unchanged.
 
-## Official Documentation Capture
+### Official Documentation Capture
 
 All sources below were fetched credential-free. The documentation batch was
 retrieved at `2026-07-26T16:56:50Z`; requested and final URL are shown relative
@@ -345,7 +508,7 @@ Interpretation was limited by role:
 - the OKX page establishes the public `/ws/v5/public` `index-tickers`
   subscription/acknowledgement contract for one configured `instId`.
 
-## Pinned Official Git Sources
+### Pinned Official Git Sources
 
 | Repository | Pinned current revision |
 | --- | --- |
@@ -388,7 +551,7 @@ Relevant immutable Git blob IDs:
 These clients are differential-vector oracles only. None was added as a Reap
 dependency.
 
-## Frozen Protocol Decisions That Did Resolve
+### Frozen Protocol Decisions That Did Resolve
 
 | Contract | Phase 0 decision |
 | --- | --- |
@@ -402,7 +565,7 @@ dependency.
 | Private reads | `/data/orders`, `/data/order/{id}`, `/data/trades`, `/balance-allowance`; path only is HMAC-signed |
 | Pagination | Start `MA==`, terminal `LTE=` from current V2 client consensus; cycles/malformed/overflow are incomplete |
 | Visibility | Credential-visible only; no funder-wide absence claim |
-| User WS | One credential-bearing initial frame; later market updates; object/array event envelopes; no documented subscription ACK; REST reconciliation gates readiness |
+| User WS | One credential-bearing initial frame per epoch; no later subscribe/update capability; configuration change closes/reconnects; object/array event envelopes; no documented subscription ACK; REST reconciliation gates readiness |
 | Position API | Exact lexical numerics, `sizeThreshold=0`, bounded offset/limit; monitored non-atomic projection only |
 | Heartbeat | Excluded; official route/body/ID sources conflict |
 
@@ -421,9 +584,9 @@ It is public synthetic test data. The upstream method is deliberately not an
 HTTP method, so it proves the HMAC primitive/encoding only; Phase 2 would
 still need independently authored GET and POST vectors.
 
-## Exact Stop Conditions
+### Exact Stop Conditions
 
-### A. Conditional Allowance Cannot Become Typed Operator Approval
+#### A. Conditional Allowance Cannot Become Typed Operator Approval
 
 The OpenAPI `BalanceAllowanceResponse` defines:
 
@@ -463,7 +626,7 @@ This exactly triggers:
 > exact ERC20 allowance versus ERC1155 operator-approval semantics cannot be
 > proven without weakening the typed core.
 
-### B. Lifecycle And Timestamp Sources Conflict
+#### B. Lifecycle And Timestamp Sources Conflict
 
 The current OpenAPI REST order enum uses
 `ORDER_STATUS_LIVE|INVALID|CANCELED_MARKET_RESOLVED|CANCELED|MATCHED`;
@@ -481,7 +644,7 @@ status and time contracts rather than silently choose or probe with a real
 credential. This is a second documented stop unless the prompt explicitly
 authorizes a compatibility union with no success promotion.
 
-### C. Phase 0 Performance Gate Is Not Green
+#### C. Phase 0 Performance Gate Is Not Green
 
 The existing PM benchmark failed its own frozen threshold on all three
 attempts, including a clean no-overlap warm-up. The result cannot be hidden or
@@ -489,7 +652,7 @@ weakened. Because source was unchanged and no valid warm-up exists, this is
 an unstable same-host baseline rather than proof of a regression, but the
 required one-warm-up/three-run Phase 0 campaign is not green.
 
-## Second Blocked Audit — 2026-07-27
+### Second Blocked Audit — 2026-07-27
 
 A second independent, credential-free audit searched additional official
 Polymarket Python clients, the Python SDK, the CLI, example repositories, and
@@ -519,7 +682,7 @@ The numeric fact cannot authorize the boolean fact. The pre-amendment Goal G
 demanded the conversion but did not authorize the closed Polygon RPC read that
 would obtain the boolean independently.
 
-### Supplemental Official Documentation Capture
+#### Supplemental Official Documentation Capture
 
 The following pages were fetched without credentials at response dates from
 `2026-07-27T02:03:49Z` through `2026-07-27T02:03:51Z`. Every response was
@@ -538,7 +701,7 @@ request metadata are retained in ignored Phase 0 evidence under
 
 These pages add no asset-dependent allowance encoding.
 
-### Supplemental Official Git Evidence
+#### Supplemental Official Git Evidence
 
 | Repository | Revision | Relevant path | Blob |
 | --- | --- | --- | --- |
@@ -592,7 +755,7 @@ credentials were loaded, no authenticated request was made, no external
 mutation was sent, and no Reap production or dependency file was changed.
 The active Goal G objective is not complete.
 
-## Predarb Lessons And Rejections
+### Predarb Lessons And Rejections
 
 Useful pinned historical concepts:
 
@@ -623,7 +786,7 @@ The five historical parser fixture hashes remain exactly:
 
 They are parser seeds only.
 
-## Unblock Adopted And Next Action
+## Historical Unblock And Current Next Action
 
 The user selected the closed Polygon-read option and authorized the complete
 Amendment 1 contract recorded near the top of this handoff. The prompt and
@@ -632,16 +795,10 @@ provider-reported finalized-block consistency, freshness, failure behavior,
 bounded non-generic dependency edge, origin deferral, strict lifecycle/time
 union, and paired benchmark policy. No CLOB conditional encoding is guessed.
 
-Goal G is therefore no longer blocked by the three historical findings. The
-next action is to start a fresh Goal G run at Phase 0 using:
-
-> /goal Execute Goal G exactly as specified in
-> `docs/polymarket-authenticated-execution-goal-g-prompt.md`. Continue phase by
-> phase through every green gate and stop only at completion or a documented
-> stop condition.
-
-The fresh run must preserve this stop evidence, implement the narrowly
-authorized benchmark-policy tranche, refresh Phase 0 sources and inventories,
-and earn a new green Phase 0 gate. This amendment itself does not claim that
-any implementation phase, benchmark gate, production origin, account
-qualification, or trading authorization is complete.
+Goal G is no longer blocked by the three historical findings. The fresh run
+is now active and has completed the narrowly authorized benchmark-policy
+tranche plus the Amendment 2 source/contract review. Its next action is the
+fresh serial Phase 0 benchmark/replay campaign and documentation gate recorded
+above. Neither amendment claims that Phase 0, an implementation phase,
+production origin, account qualification, or trading authorization is
+complete.

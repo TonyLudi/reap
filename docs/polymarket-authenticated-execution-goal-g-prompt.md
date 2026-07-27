@@ -1,11 +1,13 @@
 # Polymarket Authenticated Execution Goal G Execution Prompt
 
-Status: **amended and runnable**. Goal F is complete. Goal E remains deferred
+Status: **amended and runnable under Amendments 1 and 2**. Goal F is complete. Goal E remains deferred
 because no target host or target-host acceptance contract is declared. Goal G
 may run before Goal E and does not complete or requalify it. The original
 Phase 0 stop and its evidence remain in the
 [Goal G handoff](polymarket-authenticated-execution-goal-g-handoff.md), but
-the three stopped contracts are superseded by Amendment 1 below.
+the three stopped contracts are superseded by Amendment 1 below. Amendment 2
+incorporates the fresh restarted-Phase-0 source audit without broadening the
+product.
 
 Use this document as the complete instruction set. The exact invocation is:
 
@@ -43,6 +45,65 @@ Polygon request. It implements the closed protocol and loopback-proven source;
 Goal H must inject and qualify one exact deployment origin before that role is
 constructible in a production composition. Absence of a target host, provider,
 or provider credential is therefore not a Goal G stop.
+
+## Amendment 2 — 2026-07-27
+
+This amendment is user-authorized and normative wherever the prompt,
+boundary, or handoff conflicts with it. Fresh public official documentation
+and pinned current official client source exposed one normal settlement state
+and several source-family distinctions that the first amendment did not
+enumerate precisely:
+
+1. Account trade reconciliation admits a distinct canonical
+   `MatchedNotBroadcast` settlement fact for raw
+   `TRADE_STATUS_MATCHED_NOT_BROADCASTED` and its separately tagged current
+   guide/client compatibility spelling `MATCHED_NOT_BROADCASTED`. It means
+   that orders matched before an on-chain transaction was broadcast. It is
+   nonterminal and is never aliased to trade `Matched`, an order `MATCHED`, a
+   POST `matched`, mined, confirmed, or placement success. Provisional fill
+   exposure is retained, any open remainder stays reserved, and no transaction
+   or finality fact is invented.
+2. That sixth state is currently proven for account trade listings only.
+   Direct raw user-WS trade input accepts the five ordinary settlement states
+   in their exact prefixed or unprefixed current-client spellings. Either
+   not-broadcast spelling on the raw user WS is a source-family violation:
+   quarantine it, invalidate the private epoch, and force a complete REST
+   reconciliation cut. SDK-normalized `topic/type/payload`, camel-case, and
+   RFC-3339 objects are differential oracles, not additional wire envelopes.
+3. The exact per-route lifecycle and field-local timestamp compatibility
+   tables in the boundary are closed. There is no global status alias set,
+   timestamp magnitude guesser, or SDK-output parser. Goal F's existing five
+   settlement meanings and every fake/journal V1 byte stay unchanged. The new
+   state is live-authenticated-only; the distinct authenticated journal V1
+   represents it, while the frozen fake journal V1 remains unable to encode
+   it.
+4. Every stable requirement ID has exactly one canonical lane. Mutation
+   result IDs use `Critical`; separately named child IDs own persistence
+   dispatch barriers and recovery reconciliation. A row may not name two
+   lanes.
+5. Every Goal G `reqwest` client explicitly uses
+   `reqwest::retry::never()`, `redirect::Policy::none()`, and `no_proxy()`.
+   Read refreshes are the boundary's capped coordinator-owned fresh-attempt
+   cycles. A mutation grant gets one application dispatch and is never
+   replayed by the HTTP client, including the default protocol-NACK policy
+   configured by locked `reqwest 0.12.28` when a relevant protocol feature is
+   enabled. A later exact-owned recovery cancel is a separately journaled
+   operation after a complete cut, never reuse of the prior request/grant.
+6. The boundary's exact route/query/body/pagination table, dependency/feature
+   table, request-header/mutation-response union, outbound-clock/geoblock
+   policy, five literal JSON-RPC templates, dependency/feature table,
+   source-manifest hashes, benchmark campaign, and independently authored
+   protocol-vector specification are the Phase 0 implementation contract. A
+   source conflict is resolved only by its listed narrow acceptance or
+   fail-closed behavior; it does not authorize a live probe.
+
+`PmFillSettlementStatus` may therefore gain `MatchedNotBroadcast`, with exact
+transition/readiness tests, without changing the serialized fake journal V1.
+Any formerly total fake-journal conversion must become a checked conversion
+that proves this live-only state cannot enter the fake family. Skipped
+settlement observations may be covered only by a complete authoritative
+reconciliation cut; an ordinary event cannot silently jump, regress, or
+collapse lifecycle states.
 
 ## Objective
 
@@ -143,7 +204,12 @@ The starting Reap implementation baseline is commit
 `43970849267c0282d118a369a792066c4655deae`. Starting `HEAD` MUST contain that
 commit. A reviewed documentation-only Goal G contract commit containing this
 prompt, its boundary, and its handoff may also be present, provided it changes
-no production or dependency file. The prompt-creation `Cargo.lock` SHA-256 is
+no production or dependency file. The authorized Phase 0 benchmark-policy
+commit `facd3a616fc20e7bc1abc627235588b7532ff8b1`, a documentation-only
+Amendment 2 runnable-contract commit that explicitly does not claim Phase 0
+green, and the later completed Phase 0 evidence/gate commit may also be
+present. None changes the behavioral comparison baseline. The prompt-creation
+`Cargo.lock` SHA-256 is
 `2673d055c943c3bd5444531b67df280026c145cbbbc99b68a06f4ac0c2dbb0ff`;
 Phase 0 records and reviews any dependency delta from it.
 
@@ -151,6 +217,13 @@ Goal F's final code/evidence tree is
 `d16c3cbdac97fb43944e3a97d4f9b56e92206747`. Treat these Reap documents as
 normative, in this order:
 
+- this prompt, including its dated amendments;
+- [polymarket-authenticated-execution-boundary.md](polymarket-authenticated-execution-boundary.md)
+  for Amendment 2's exact route, lifecycle, time, dependency, vector, lane,
+  and resource contracts;
+- [polymarket-authenticated-execution-goal-g-handoff.md](polymarket-authenticated-execution-goal-g-handoff.md)
+  for the current run state and explicitly labeled historical stopped-run
+  evidence;
 - [multi-venue-polymarket-foundation-goal-f-handoff.md](multi-venue-polymarket-foundation-goal-f-handoff.md)
   for the completed implementation and exact final evidence;
 - [polymarket-product-connectivity-boundary.md](polymarket-product-connectivity-boundary.md)
@@ -271,6 +344,7 @@ prompt design on 2026-07-26 UTC is:
 - `https://docs.polymarket.com/api-reference/core/get-current-positions-for-a-user`;
 - `https://docs.polymarket.com/api-reference/geoblock`;
 - `https://docs.polymarket.com/api-reference/rate-limits`;
+- `https://docs.polymarket.com/api-reference/trading-rate-limits`;
 - `https://docs.polymarket.com/resources/contracts`;
 - `https://docs.polymarket.com/resources/error-codes`;
 - `https://docs.polymarket.com/concepts/order-lifecycle`;
@@ -285,8 +359,17 @@ prompt design on 2026-07-26 UTC is:
 - `https://github.com/Polymarket/ts-sdk`;
 - `https://github.com/Polymarket/clob-client-v2`;
 - `https://github.com/Polymarket/polymarket-cli`;
-- `https://github.com/Polymarket/py-clob-client`; and
+- `https://github.com/Polymarket/py-clob-client`;
+- `https://github.com/Polymarket/py-clob-client-v2`;
+- `https://github.com/Polymarket/py-sdk`;
+- `https://github.com/Polymarket/polymarket-sdk`; and
 - `https://github.com/Polymarket/rs-clob-client-v2`.
+
+The boundary's 128-row authoritative source manifest is the exact
+Amendment 2 cutoff, including every selected path, revision, blob/content
+hash, dependency-source pin, and differential-oracle identity. This minimum
+URL/repository list is only a retrieval checklist; it cannot widen or
+override that manifest or the boundary's explicit conflict resolutions.
 
 Do not treat a mutable documentation URL or an unpinned package version as a
 permanent contract. Prefer and hash the documented Markdown endpoints
@@ -544,10 +627,18 @@ Phase 0 must freeze and Phase 2 must prove:
   and outer-body field, including outer `owner == L2 API-key UUID`;
 - exact L2 message
   `timestamp + UPPERCASE_METHOD + signed_route_path + exact_body_bytes`;
-- exact base64 decode, HMAC-SHA256, URL-safe base64 encoding, and padding;
+- exact canonical padded base64url credential grammar, strict
+  decode/re-encode equality, local decoded-size cap, HMAC-SHA256, and exact
+  44-byte padded base64url output;
+- exact lowercase 36-byte UUID grammar with no invented version/variant
+  restriction, the Reap-local passphrase grammar/cap and raw-header/
+  compact-JSON lowering, and canonical lowercase prefixed 32-byte private-key
+  text with scalar/range/re-encode/configured-address checks;
 - whether and how query parameters are excluded from the signed route for
   each reached read;
 - the same timestamp and exact body bytes in the HMAC, headers, and transport;
+  exact `Accept`, `Accept-Encoding`, body `Content-Type`, five `POLY_*`
+  application headers, and absence of auth/JSON-body headers where forbidden;
   and
 - that the exact final serialized HTTP body byte slice HMAC-signed by L2 is
   the byte slice transported, not a second serialization of an equivalent
@@ -602,18 +693,31 @@ The authenticated product must maintain:
 
 Do not derive salt solely from wall time. Audit Goal F's current salt and
 action-sequence recovery before reusing it. The durable salt/intent identity
-must be strictly unique across retained history. Choose the order timestamp
-from checked current/server-offset time; require it to be current and
-nondecreasing according to the Phase 0-frozen protocol. Persist a timestamp
-high-water mark only if the current venue contract proves one is required.
-Reject overflow, rollback, excessive future skew, or an unprovable salt
-uniqueness transition.
+must be strictly unique across retained history. The boundary's outbound PM
+clock algorithm is exact and normative: a fresh checked `/time` seconds anchor
+plus floored monotonic elapsed milliseconds creates the conservative
+`pm_now_ms`; one new order persists its exact canonical 13-digit millisecond
+timestamp, while each final authenticated request uses canonical ten-digit
+`floor(pm_now_ms/1000)` in both HMAC and header. The immediate pre-write check
+requires the same-second L2 value, a signed-order value no more than 30
+seconds old/five seconds future, and every earlier grant/geoblock deadline.
 
-L2 request timestamps use the exact official unit and a bounded server-time
-offset. They are distinct from order timestamps and monotonic elapsed-time
-clocks. Clock skew or an unavailable/expired offset disables new placement;
-owned cancellation and reconciliation retain only the authority proven safe
-by the frozen protocol.
+Current pinned sources prove no venue timestamp monotonicity/high-water rule.
+Goal G therefore persists no timestamp high-water and never clamps or bumps a
+timestamp. Within one in-memory clock epoch, compare a candidate at receipt
+against the old live anchor projected to that same monotonic instant: reject
+only when the candidate second is less than
+`floor(old_pm_now_ms(receipt_m)/1000)`; equal seconds are allowed. A process
+restart or clock transport/configuration epoch change discards comparison
+state. Rollback rejection discards both anchors. Overflow, seconds-boundary
+crossing, unavailable/expired anchor, or excessive skew makes clock readiness
+false and sends no byte. The signed-order timestamp/body is never
+regenerated. For mutations, a new L2 timestamp requires a separately
+committed mutation commitment/grant. For reads, the unsent attempt is
+discarded and only the capped coordinator read cycle may construct a wholly
+fresh timestamp/HMAC attempt. Owned cancellation and reconciliation
+obligations remain durable, but no authenticated request can be constructed
+until the clock is ready.
 
 Amendment 1's compatibility union applies only to inbound venue fields. It
 does not change the fixed millisecond signed-order timestamp or seconds L2
@@ -647,7 +751,8 @@ The adapter cannot send before the coordinator consumes the exact durable
 dispatch grant and invokes its closed effect port. "One dispatch attempt"
 means Reap performs no second application-level mutation send; TCP/TLS/HTTP
 may partially write or retransmit below that boundary, and Phase 0 must audit
-the selected client's automatic retry behavior.
+the selected client's lower transport behavior while explicitly configuring
+zero HTTP-layer retries.
 The coordinator never receives the private key, credentials, auth headers, or
 a raw signed request. The journal records only the minimum non-secret identity
 and commitments required for recovery; it never records replayable auth
@@ -655,10 +760,13 @@ headers, user-WS credentials, a private key, L2 secret/passphrase, or a full
 signed order body.
 
 The dispatch grant binds the exact method, route, query contract, body
-commitment, auth timestamp, and a monotonic send-before deadline. If pacing,
-fsync, queueing, or scheduling makes it stale before the first application
-write, the edge MUST NOT send or regenerate headers under the same grant. It
-returns a typed definitely-not-dispatched result for durable reduction.
+commitment, auth timestamp, expected order identity, and, for placement, the
+geoblock permit identity/epochs. Its monotonic send-before is the earliest of
+the 250-millisecond dispatch deadline, five-second geoblock lease, and other
+frozen deadlines. If pacing, fsync, queueing, clock seconds-boundary,
+geoblock, or scheduling makes it stale before the first application write,
+the edge MUST NOT send or regenerate headers under the same grant. It returns
+a typed definitely-not-dispatched result for durable reduction.
 Recovery conservatively classifies every consumed or durably granted
 dispatch-authorized/may-have-sent barrier without a conclusive post-result
 fact as acknowledgement-unknown.
@@ -669,55 +777,78 @@ write may have occurred.
 
 Classify at least:
 
-- accepted live;
-- a Phase 0-proven reachable immediate maker match, retaining returned trade
-  and transaction identities, if the fixed profile can produce it;
+- accepted-live POST result;
+- known but out-of-profile POST `matched`, `delayed`, and `unmatched`
+  results, retaining all bounded returned identities and forcing
+  reconciliation without success promotion;
+- separately tagged ordinary order and trade lifecycle facts from their exact
+  REST/user-WS source families;
 - definite rejection with a typed bounded reason;
 - authentication failure;
 - rate limited/too early/cancel-only/unavailable;
 - protocol violation; and
 - acknowledgement unknown.
 
+The boundary's mutation table is exhaustive for HTTP status, exact JSON
+shape, duplicate/unknown keys, POST cross-field combinations, expected order
+identity, cancel `canceled` array/`not_canceled` map, documented duplicate and
+timeout cases, and every unexpected `2xx`/`3xx`/`4xx`/`5xx`. Implementation
+and tests may not replace it with a generic success/error deserializer or
+infer success from HTTP status alone.
+
 Parse a closed source/message-family-tagged union at the edge. At minimum,
 keep these namespaces non-interchangeable:
 
-- lowercase POST results `live|matched|delayed`;
+- lowercase POST results `live|matched|delayed|unmatched`;
 - REST order tokens, including the reached prefixed
-  `ORDER_STATUS_*` family and reached unprefixed aliases;
+  `ORDER_STATUS_*` family and the exact reached unprefixed `LIVE` alias;
 - user-WS order occurrence types `PLACEMENT|UPDATE|CANCELLATION`; and
 - REST/WS trade-settlement tokens, including reached `TRADE_STATUS_*` and
-  unprefixed `MATCHED|MINED|CONFIRMED|RETRYING|FAILED` families.
+  unprefixed
+  `MATCHED|MATCHED_NOT_BROADCASTED|MINED|CONFIRMED|RETRYING|FAILED`
+  families, subject to Amendment 2's exact route-specific table.
 
 Phase 0 records the exact allowed token for every route/envelope and each
 explicitly proven semantic equivalence. Raw family, raw token, and timestamp
 unit provenance remain available to bounded diagnostic/quarantine evidence.
 `MATCHED` in a POST response, order state, and trade settlement is never one
-implicit enum value. Normalize as success only statuses proven reachable for
-the fixed GTC post-only profile. A locally owned response/event with
-`DELAYED` or `UNMATCHED` -- and `MATCHED` unless an after-accept maker race is
-proven reachable -- is an out-of-profile protocol violation that halts
-placement and forces reconciliation. Unknown, malformed, cross-family, or
-ambiguous values are boundedly quarantined; they are never mapped to pending,
-open, zero, or success. Only a complete source-compatible reconciliation cut
-may clear a quarantine. Capacity exhaustion or permanently ambiguous identity
+implicit enum value. Only POST `live` is ordinary fixed-profile placement
+acceptance. POST `matched|delayed|unmatched` and user-WS order
+`DELAYED|UNMATCHED` are known but out-of-profile and halt placement while
+retaining authority/reservations and forcing reconciliation. REST/user-WS
+trade `Matched` is instead an ordinary provisional settlement fact, and the
+REST-only `MatchedNotBroadcast` is its distinct earlier settlement fact;
+neither is a POST acceptance. Unknown, malformed, cross-family, or ambiguous
+values are boundedly quarantined; they are never mapped to pending, open,
+zero, or success. Only a complete source-compatible reconciliation cut may
+clear a quarantine. Capacity exhaustion or permanently ambiguous identity
 becomes a durable operator-required halt. Quarantine stores only sanitized
 bounded field/family/identity evidence, never a credential-bearing raw frame,
 auth header, secret, or unbounded raw error body. Do not add marketable-order
 execution semantics merely because the venue vocabulary contains them.
 
+Raw user-WS order occurrence/status/quantity combinations use the exact
+four-row live-only table in the boundary. Occurrence is authority, optional
+status only corroborates, and omission remains omission. Any mismatched
+cross-product invalidates the private epoch and reconciles; it does not widen
+Goal F's fake parser or fixture schema.
+
 An HTTP timeout, disconnect, partial response, malformed success, process
 death after durable dispatch grant, or response loss after server acceptance
 is acknowledgement-unknown. It is never ordinary rejection.
 
-Mutation retry rules are:
+Fresh-attempt and mutation rules are:
 
-- authenticated reads may use bounded classified retry and pacing;
-- placement is never blindly retried after bytes may have reached the venue;
+- every HTTP client has zero retries;
+- eligible reads use only the boundary's coordinator-owned three-attempt,
+  30-second fresh-cycle/cooldown contract and route pacing;
+- placement is never reissued after bytes may have reached the venue;
 - an ambiguous place locks the quote slot and forces exact order/open-order/
   trade reconciliation;
 - cancellation may be reissued only for the identical proven-owned venue
-  order after read-only reconciliation still proves it live and the frozen
-  protocol proves the repeated cancel safe;
+  order after a complete read-only reconciliation still proves it live, under
+  a separately durable request commitment, fresh HMAC/timestamp, and new
+  take-once grant;
 - a duplicate-order response triggers exact identity reconciliation, never a
   new timestamp/body; and
 - if expected venue identity or an unambiguous exact match cannot be proven,
@@ -748,11 +879,14 @@ treated as already complete.
 
 The user-WS role:
 
-- sends only the exact credential-bearing initial and update subscription
-  frames, in the ordering proven in Phase 0;
+- sends exactly one credential-bearing initial frame per connection epoch and
+  no dynamic subscribe/unsubscribe/update frame; a configuration lifecycle
+  change closes the session and reconnects with a new epoch;
 - subscribes only to the configured condition/account scope;
-- parses both reached current official event-envelope families without
-  treating their fields as interchangeable;
+- parses only the raw `/ws/user` wire family, framed as either one event
+  object or a bounded array of event objects, with exact inner
+  `event_type = order|trade`; SDK-normalized `topic/type/payload`,
+  camel-case, and RFC-3339 projections remain differential oracles only;
 - never invents a subscription acknowledgement; if the frozen protocol has
   none, authenticated readiness requires the exact protocol-proven evidence
   plus complete REST reconciliation;
@@ -854,11 +988,17 @@ negative-risk exchanges are the two Goal F V2 addresses already frozen above.
 Each transport request is one bounded JSON-RPC `2.0` POST object with a
 deterministic nonzero integer ID and no notification or batch; the response
 must carry `jsonrpc = "2.0"` and the exact matching ID.
+The boundary's five compact request templates, member order, lowercase
+quantity/address/calldata grammar, `word(address)` construction, exact
+request-body reuse, application headers, top-level response union, and
+per-call result shapes are normative. No generic serializer choice or
+provider-specific request extension is left to implementation.
 
-Each call result must be exactly one 32-byte ABI word. ERC-20 allowance is an
-unscaled `U256`. ERC-1155 approval is canonical ABI boolean: all zero for
-false, or all zero except a final byte of one for true. Empty, short, long,
-trailing, non-hex, overflowed, or noncanonical-boolean results are rejected.
+Each `eth_call` result must be exactly one 32-byte ABI word. ERC-20 allowance
+is an unscaled `U256`. ERC-1155 approval is canonical ABI boolean: all zero
+for false, or all zero except a final byte of one for true. Empty, short,
+long, trailing, non-hex, overflowed, or noncanonical-boolean results are
+rejected.
 The complete fact binds chain, finalized block number/hash/timestamp, local
 monotonic observation time, transport epoch, account/configuration epoch,
 owner, exchange, both token contracts, typed allowance, and typed approval.
@@ -950,6 +1090,11 @@ Use this responsibility shape:
   response parsing, CLOB account/reconciliation roles, GTC-post-only place,
   owned cancel, and no chain/public-market duplication, economic model, or
   canonical state;
+- `reap-pm-authenticated-mutation-journal`:
+  distinct non-secret authenticated schema V1, lease, durable barriers,
+  request commitments, typed post-results, and recovery projection on
+  `reap-durable-writer`/`reap-pm-core`; it has no credential, signer, network,
+  request-construction, Goal F journal-reuse, or canonical-state role;
 - existing `reap-polymarket-wire`:
   remains credential-free; it may gain strict real public/private/order
   response DTO parsing and non-secret unsigned values, but no full signed
@@ -984,8 +1129,15 @@ reap-pm-live
   -> reap-okx-public-source -> core/transport
   -> reap-polymarket-chain-source -> core/transport
   -> reap-polymarket-live-adapter -> auth/wire/core/transport
+  -> reap-pm-authenticated-mutation-journal -> durable-writer/pm-core
   -> reap-polymarket-adapter -> wire/core/transport
 ```
+
+To preserve that DAG, edge crates do not depend on
+`reap-pm-live-contracts`. They emit only closed untagged typed facts/results;
+`reap-pm-live` alone attaches the stable requirement ID and its one canonical
+lane at composition. An edge cannot select, alias, or multiply requirement
+identity.
 
 The authenticated adapter never receives `PreparedPmQuote`,
 `PreparedPmCancel`, or a coordinator dispatch-grant type. `reap-pm-live`
@@ -1135,6 +1287,11 @@ Work phase by phase. For each phase:
 8. commit the phase only when its gate is green; and
 9. continue automatically while green.
 
+The user-authorized, documentation-only Amendment 2 runnable-contract commit
+is the sole pre-gate exception to item 8. It freezes instructions needed to
+run the remaining Phase 0 gates and explicitly does not claim that Phase 0 is
+green. The later Phase 0 evidence/gate commit remains mandatory.
+
 Do not push or change a remote branch unless the user separately requests it.
 Do not run another overlapping code-writing goal concurrently.
 
@@ -1150,20 +1307,26 @@ the constrained non-default `local-evidence` feature only.
 ## Phase 0: Baseline, Protocol Freeze, And Threat Model
 
 Phase 0 changes documentation plus one narrowly authorized benchmark-policy
-tranche. Before collecting the PM baseline it may change only:
+tranche. That tranche is already complete at
+`facd3a616fc20e7bc1abc627235588b7532ff8b1`; the restarted run must verify it
+but MUST NOT change its workload, timed boundary, report schema, counters,
+hashes, production runtime code, or policy again. Its historical authorized
+edit scope was only:
 
 - the latency-validation branch at
   `crates/reap-pm-live/src/evidence/runner.rs:81`;
 - `crates/reap-pm-live/benches/pm_action_path.rs`; and
 - their benchmark-policy tests.
 
-Remove only the legacy absolute p50/p99.9 exits, retain the exact
+The completed tranche removed only the legacy absolute p50/p99.9 exits,
+retained the exact
 `15,000`-sample check and every logical/hash/allocation/memory/cardinality/
-queue assertion, and emit the full existing report. The workload, timed
+queue assertion, and emitted the full existing report. The workload, timed
 boundary, report schema, counters, hashes, and production runtime code MUST
-NOT change in this tranche. Record and review that exact diff separately.
+remain unchanged after that tranche. Its exact diff and focused gate stay
+recorded separately.
 
-Create:
+Maintain and complete:
 
 - `docs/polymarket-authenticated-execution-goal-g-handoff.md`; and
 - `docs/polymarket-authenticated-execution-boundary.md`.
@@ -1184,6 +1347,8 @@ Record:
 - one discarded process-warmup Cargo invocation plus three retained same-host
   Cargo invocations of the existing engine, live, Chaos action, and PM action
   benchmarks;
+- exact available-storage preflight values and any storage stop without
+  deleting retained evidence or user/sibling data;
 - the mandated target crate/module DAG above and exact dependency additions;
 - a purpose-by-purpose capability/endpoint/channel/closed-JSON-RPC matrix;
 - exact Polygon chain, ABI selectors/arguments/results, fixed contracts,
@@ -1192,6 +1357,9 @@ Record:
 - the secret lifecycle and threat model;
 - request, response, frame, page, lane, retry, timeout, clock-skew, and pacing
   bounds;
+- exact application headers, canonical cursor encoding/progression, outbound
+  PM clock/geoblock leases, mutation status/body/cross-field union, and all
+  five compact Polygon request/response shapes;
 - a distinct authenticated journal scope/family and recovery-state plan;
 - stable live requirement IDs, closed routes/channels, role ownership, and
   lane assignments that do not reuse any Goal F `PM-FAKE-*`/`FakeEffect`
@@ -1200,8 +1368,9 @@ Record:
   provenance, artifact/schema byte, and semantic evidence anchor remains
   frozen; global dependency/public-export/source-policy/content inventories
   are expected to change and must be recomputed before and after Goal G;
-- exact benchmark workloads, four separate serial idle-host Cargo invocations
-  (one complete process-warmup suite plus three retained invocation reports),
+- exact benchmark workloads, four separate serial overlap-controlled
+  shared-host Cargo invocations (one complete process-warmup suite plus three
+  retained invocation reports),
   per-invocation raw-log retention, timed
   boundaries, logical counters, allocation/byte/cardinality/queue-age bounds,
   p50/p95/p99/p99.9/max reporting, and acceptance rules;
@@ -1210,6 +1379,14 @@ Record:
   meaning, retained provenance, quarantine behavior, and clearing authority;
 - every known protocol conflict and its exact resolution; and
 - all deferrals and non-claims.
+
+The boundary supplies the exact runnable Phase 0 command/log layout, overlap
+monitoring rule, PM JSON extraction/JQ comparator, and byte-verifying
+128-row source re-attestation procedure. Phase 0 executes those contracts
+verbatim rather than inventing an evidence script or comparator during the
+run. Its exact storage thresholds are stop conditions: no phase may infer
+permission to delete `target/tmp`, invalid evidence, user data, or
+sibling-repository data.
 
 At minimum, freeze these distinct stable live requirement IDs:
 
@@ -1228,8 +1405,11 @@ PM-LIVE-OPEN-ORDERS
 PM-LIVE-ORDER-DETAIL
 PM-LIVE-TRADES
 PM-LIVE-PLACE-GTC-POST-ONLY
+PM-LIVE-PLACE-GTC-POST-ONLY-DISPATCH
 PM-LIVE-CANCEL-OWNED
+PM-LIVE-CANCEL-OWNED-DISPATCH
 PM-LIVE-RECOVERY-CANCEL
+PM-LIVE-RECOVERY-CANCEL-RECONCILIATION
 ```
 
 Phase 0 maps each ID to exactly one role, route/channel, lane, readiness use,
@@ -1250,7 +1430,8 @@ must resolve:
   acknowledgement/readiness, liveness, and reconnect contract;
 - exact `POST order`, owned `DELETE order`, open-orders, exact-order, trades,
   balance/allowance, user-WS, positions, server-time, and geoblock
-  method/path/query/body/response contracts;
+  method/path/query/application-header/body/response contracts, including the
+  exhaustive mutation status/cross-field union;
 - exact visibility scope of every private feed/read (API-key,
   condition-filtered, EOA/funder, or another proven scope), with no promotion
   from credential-visible absence to funder-wide absence;
@@ -1265,13 +1446,17 @@ must resolve:
   selectors/arguments, canonical `U256`/boolean results, freshness, epoch, and
   all fail-closed cases;
 - query inclusion/exclusion in every L2 signature;
-- fixed milliseconds for signed orders, fixed seconds for L2 auth, and the
-  exact source/field-tagged inbound seconds/milliseconds compatibility union
-  with no magnitude guessing;
+- canonical padded base64url secret/output and every rejected alias;
+- fixed milliseconds for signed orders, fixed seconds for L2 auth, the exact
+  outbound anchor/rounding/pre-write policy, geoblock receipt lease, and the
+  source/field-tagged inbound seconds/milliseconds/nanoseconds
+  compatibility union, pair-consistency rules, and history/future bounds from
+  the boundary, with no magnitude guessing;
 - the closed source/message-family-tagged POST, REST order/trade, and user-WS
   vocabulary union plus explicit equivalences and quarantine behavior;
-- user-WS initial-auth/update-subscription ordering, absence or presence of
-  acknowledgement, and both reached current event-envelope families;
+- user-WS one-initial-auth-frame lifecycle, absence or presence of
+  acknowledgement, configuration-change close/reconnect, and its exact raw
+  single-object-or-bounded-array framing;
 - position endpoint pagination and its lack or presence of atomic completeness;
   and
 - current rate-limit/error classes used only to set stricter Reap bounds.
@@ -1282,6 +1467,19 @@ differential vector oracles only, not production dependencies: their broad
 clients/credential access, automatic mutation/heartbeat behavior,
 rounding/truncation paths, or lag handling do not satisfy this boundary. Do
 not add unused Data/Gamma/bridge/CTF/RFQ/relayer features.
+
+Locked `reqwest 0.12.28` configures a default protocol-NACK retry policy
+(effective when a relevant protocol feature is enabled) and follows up to ten
+redirects. The current workspace feature set does not enable HTTP/2 or
+HTTP/3, but capability safety must not depend on that incidental fact. Every
+new Goal G client construction must instead set
+`retry(reqwest::retry::never())`,
+`redirect(reqwest::redirect::Policy::none())`, and `no_proxy()`. Source-policy
+and loopback tests must prove those calls remain present. Reads may be retried
+only through the exact capped fresh-attempt cycle after typed classification;
+mutation bytes may receive only the one application dispatch authorized by
+the durable grant. A separately reconciled recovery cancel receives a new
+commitment/grant and does not reuse the old request.
 
 Freeze these stable acceptance targets for later phases:
 
@@ -1352,9 +1550,14 @@ Stop in Phase 0 if:
 - the mandated dependency graph cannot be implemented without a broad adapter
   or cycle.
 
-Gate the benchmark-policy tranche with a focused evidence-policy-only commit,
-then gate
-the completed Phase 0 documents/evidence with a documentation-only commit.
+The focused evidence-policy commit already gates the benchmark-policy
+tranche. Before execution, verify that the user-authorized Amendment 2
+runnable-contract documentation-only pre-gate commit (subject
+`docs: freeze goal g amendment 2 contract`) is an ancestor of `HEAD`; it does
+not mark Phase 0 green and Goal G must not recreate or amend it. If it is
+absent, stop because the reviewed prompt package is incomplete. After the
+remaining benchmark/replay and evidence checks pass, gate the completed
+Phase 0 documents/evidence with a separate documentation-only commit.
 
 ## Phase 1: Backend-Neutral Prepared Effects And Fake Parity
 
@@ -1413,7 +1616,8 @@ Implement:
 - exact expected venue-order identity;
 - exact canonical signed order and outer request bytes;
 - exact outer `owner == L2 API-key UUID` binding;
-- exact L2 HMAC preimage, URL-safe base64 signature, and five headers;
+- exact L2 HMAC preimage, canonical padded base64url input/output, application
+  HTTP headers, and five auth headers;
 - a single-use non-secret request commitment;
 - a redacted, typed, bounded error taxonomy;
 - durable unique salt/intent identity and validated timestamp inputs supplied
@@ -1437,8 +1641,8 @@ Required tests include:
   test sink;
 - repeated identical canonical inputs produce identical digest/signature/body;
 - different material inputs change commitments;
-- salt collision/rollback/overflow and order/auth timestamp
-  freshness/skew/overflow rejection;
+- salt collision/rollback/overflow and the exact outbound anchor,
+  same-second auth, order-age, geoblock, freshness/skew/overflow rejection;
 - secret types cannot Clone, Copy, Debug, Display, Serialize, or expose bytes;
 - canary secrets are absent from all formatted errors, tracing, journal,
   capture, evidence, and panic-safe test output;
@@ -1503,19 +1707,33 @@ Required loopback cases include:
   subscribe/readiness/resync/reconnect behavior;
 - exact configured OKX `index-tickers`
   subscribe/readiness/liveness/reconnect behavior;
-- exact headers/path/query/body on every reached read;
-- terminal and multi-page pagination, cursor repetition, page cap, partial
-  page, duplicate row, out-of-scope row, and response-size cap;
-- user-WS initial auth/update ordering, both frozen event-envelope families,
-  auth rejection, protocol-proven readiness without an invented ack, initial
-  dump if specified, ping/pong, idle, typed close, reconnect epoch,
+- exact application/auth headers/path/query/body on every reached read,
+  including identity encoding and wrong/extra/content-encoded failures;
+- terminal and multi-page pagination, canonical base64 offset
+  decode/re-encode, strictly increasing cursor, exact one-pass query encoding,
+  repetition/rollback, page cap, partial page, duplicate row, out-of-scope
+  row, and response-size cap;
+- user-WS one initial auth frame per epoch, rejection of every later outbound
+  subscription/update frame, configuration-change close/reconnect, exact raw
+  single-event-object and bounded-array framing with
+  `event_type = order|trade`, rejection of
+  SDK-normalized envelopes, auth rejection, protocol-proven readiness without
+  an invented ack, initial dump if specified, ping/pong, idle, typed close,
+  reconnect epoch,
   malformed/unknown frame, pre-mapping event, multi-maker-leg fill, and
   slow/full downstream lane;
-- every exact source-tagged lifecycle token and inbound seconds/milliseconds
-  lexical form frozen in Phase 0, including family-preserving `MATCHED`
-  meanings, checked conversion, unknown/cross-family/out-of-profile
-  quarantine, retained reservations, complete-reconciliation clearing, and
-  bounded-quarantine exhaustion to durable halt;
+- every exact source-tagged lifecycle token and field-local inbound
+  seconds/milliseconds/nanoseconds lexical form frozen in Phase 0, including
+  `match_time_nano` pair consistency and retained remainder, the REST-only
+  distinct `MatchedNotBroadcast` state, family-preserving `MATCHED` meanings,
+  checked conversion, history/future bounds,
+  unknown/cross-family/out-of-profile quarantine, retained reservations,
+  complete-reconciliation clearing, and bounded-quarantine exhaustion to
+  durable halt;
+- outbound `/time` anchor projection, exact lexical order/auth times,
+  same-second first-write check, rollback/expiry/overflow, and geoblock permit
+  age `4.999s` pass versus `5.000s` expiry plus blocked/IP/epoch/queued-grant
+  invalidation;
 - connection/read/write/total timeout and bounded reconnect backoff;
 - per-route frozen semantics for 401, 404, 425, 429, 5xx, cancel-only,
   redirect, wrong origin, TLS/proxy configuration rejection, and malformed
@@ -1526,10 +1744,11 @@ Required loopback cases include:
   from default/production constructors and features, and that
   `local-evidence` accepts only numeric loopback addresses and is enabled by
   no deployable root;
-- exact per-cut `eth_chainId == 0x89`, finalized anchor, explicit same-block calls,
+- exact byte vectors for all five compact JSON-RPC requests, per-cut
+  `eth_chainId == 0x89`, finalized anchor, explicit same-block calls,
   anchor-hash recheck, deterministic request IDs/order, ABI selectors/address
-  padding, fixed owner/exchange/contracts, and canonical 32-byte
-  `U256`/boolean decoding;
+  padding, fixed owner/exchange/contracts, top-level result union, and
+  canonical 32-byte `U256`/boolean decoding;
 - Polygon false/zero/maximum, wrong chain/owner/exchange/contract, null or
   stale/future block, changed hash/reorg, revert/error/ID mismatch, empty,
   short, long, trailing, non-hex/noncanonical boolean, timeout, redirect,
@@ -1602,8 +1821,11 @@ Implement:
 - secret-side signed-request preparation and non-secret commitment return;
 - durable commitment/dispatch handshake;
 - one application-level dispatch attempt of the exact committed bytes, with
-  selected HTTP/TLS retry behavior audited and disabled where configurable;
-- strict bounded placement and cancellation response parsing;
+  every Goal G `reqwest` builder explicitly using
+  `retry(reqwest::retry::never())`,
+  `redirect(reqwest::redirect::Policy::none())`, and `no_proxy()`;
+- strict bounded placement/cancellation parsing implementing the boundary's
+  exhaustive HTTP/body/duplicate-key/cross-field tables exactly;
 - the fixed-profile accepted/rejected/unknown classification and fail-closed
   parsing of every other frozen venue status;
 - expected-order-ID and body-commitment correlation;
@@ -1619,15 +1841,20 @@ Required tests include process/network failure at every transition:
 - after commitment fsync and before durable dispatch grant;
 - after dispatch grant and before socket write;
 - dispatch grant expiry immediately before socket write and expiry caused by
-  pacing/fsync/queue delay, proving typed definitely-not-dispatched handling
-  with no auth regeneration under that grant;
+  pacing/fsync/queue/clock-seconds/geoblock delay, proving typed
+  definitely-not-dispatched handling with no auth regeneration under that
+  grant;
 - partial/full write followed by disconnect;
 - venue accept followed by lost response;
 - response received followed by result-lane loss/process death;
-- accepted live, a Phase 0-proven immediate maker match if reachable,
-  out-of-profile delayed/unmatched/matched statuses, definite post-only-cross,
+- accepted POST `live`, known out-of-profile POST
+  `matched|delayed|unmatched`, ordinary separately tagged trade settlement
+  `Matched`/REST-only `MatchedNotBroadcast`, definite post-only-cross,
   duplicate, invalid signature, insufficient balance/allowance, cancel-only,
   425, 429, 5xx, oversized/malformed/unknown response;
+- every POST `success/orderID/status/errorMsg/amount/ID/hash` cross-product in
+  the closed union, cancel arrays/maps with both/neither/unrelated/duplicate
+  IDs, unexpected status classes, and duplicate/unknown JSON keys;
 - every frozen source/message-family spelling and inbound timestamp encoding
   for those cases, proving identical semantics only where explicitly mapped
   and quarantine rather than widening success everywhere else;
@@ -1640,7 +1867,10 @@ Required tests include process/network failure at every transition:
   and permanently ambiguous during repair.
 
 Prove zero blind placement retries and zero cancellation of an unmanaged
-remote order in every workload.
+remote order in every workload. Also prove that one recovery cancel after a
+fresh complete cut has an identical body/ID but a new durable commitment,
+fresh L2 timestamp/HMAC, and new take-once grant; it never reuses the prior
+request.
 
 Gate the place/cancel tranche with a second focused Phase 4 commit.
 
@@ -1731,11 +1961,11 @@ persisted. Goal F V1 remains byte-identical and
 readable by its existing readers, but authenticated runtime MUST refuse to
 open V1 directly as a live journal or reinterpret V1 fake provenance as live.
 No V1 pending intent, fake venue-order ID, fake dispatch fact, or recovered
-fake ownership becomes live place/cancel authority. If Phase 0 proves that any
-non-authorizing high-water/state can be imported, import it explicitly under
-a new authenticated header and quarantine/close every V1 mutation tail.
-Live salt/timestamp high-water fields exist only in this authenticated family.
-No persisted fact reconstructs executable authority or causes automatic
+fake ownership becomes live place/cancel authority. Salt uniqueness state is
+new authenticated-family state and is never inferred from fake provenance.
+The frozen current protocol requires no timestamp high-water, so none is
+persisted or imported. Every V1 mutation tail remains quarantined/closed. No
+persisted fact reconstructs executable authority or causes automatic
 resubmission.
 
 On reconnect/restart:
@@ -1840,12 +2070,12 @@ hashes, and pass the Phase 0 paired relative rule. Existing engine/live/Chaos
 benchmarks retain their recorded relative methodology. Report every frozen
 quantile and max from every recorded invocation.
 
-Run every affected benchmark as four separate serial, idle-host Cargo
-invocations: one complete process-warmup suite followed by three retained
-invocation reports, retaining the raw log from each. For PM action use the
-specified median-of-three-internal-runs then median-of-three-invocations
-comparator. Investigate host noise; do not discard a valid bad result or raise
-a threshold merely to finish.
+Run every affected benchmark as four separate serial overlap-controlled
+shared-host Cargo invocations: one complete process-warmup suite followed by
+three retained invocation reports, retaining the raw log from each. For PM
+action use the specified median-of-three-internal-runs then
+median-of-three-invocations comparator. Investigate host noise; do not discard
+a valid bad result or raise a threshold merely to finish.
 
 Gate Phase 6 with a focused code/evidence commit.
 
