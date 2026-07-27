@@ -1,0 +1,647 @@
+# Polymarket Authenticated Execution Goal G Handoff
+
+Status: **historical Phase 0 stop superseded by user-authorized Amendment 1;
+Goal G is runnable from Phase 0 again**. The stopped run correctly proved that
+an authenticated CLOB `CONDITIONAL` numeric value cannot become the boolean
+ERC-1155 operator approval required by Reap's typed core. Amendment 1 does not
+reinterpret it: it adds a separate closed finalized-block Polygon source,
+authorizes a strict source-tagged lifecycle/time compatibility union, and
+replaces the host-specific PM latency ceiling with a paired local relative
+gate. No implementation phase has yet run under the amended contract.
+
+The reviewed design candidate is
+[polymarket-authenticated-execution-boundary.md](polymarket-authenticated-execution-boundary.md).
+It is now the amended runnable implementation boundary. The evidence below
+remains the immutable history explaining why the amendment was necessary.
+
+## Safety Attestation
+
+```text
+production_order_entry_authorized: false
+real_credentials_loaded: false
+authenticated_external_request_sent: false
+real_polygon_rpc_request_sent: false
+real_order_submitted: false
+```
+
+No real secret, authenticated request, Polygon RPC request, allowance update,
+order, cancel, or external mutation was used. Only public documentation,
+public official Git objects, owner-local repository tests, and local
+benchmarks were read or run.
+
+## Phase Status
+
+| Phase | Status | Commit |
+| --- | --- | --- |
+| 0. Baseline, protocol freeze, threat model | Historical run stopped; Amendment 1 adopted; **restart Phase 0 under amended contract** | None |
+| 1. Backend-neutral prepared effects | Not started | None |
+| 2. Secret custody/auth/signing | Not started | None |
+| 3. Public/chain/authenticated read-only transports | Not started | None |
+| 4. Authenticated journal, then place/cancel | Not started | None |
+| 5. Product/recovery/shutdown | Not started | None |
+| 6. Fault/security/performance evidence | Not started | None |
+| 7. Global verification/handoff | Not started | None |
+
+The original prompt required Phase 0 to map the CLOB response into numeric
+`Erc20Allowance` versus boolean `Erc1155OperatorApproval`; stopping was the
+only safe result. The amended prompt removes that invalid requirement and
+instead obtains both typed facts directly from the closed chain cut. The
+historical Phase 0 result is not green and is not retroactively relabeled.
+The next run starts Phase 0 again, applies the benchmark-policy tranche,
+refreshes the source freeze/evidence, and continues only after the amended
+gate is green.
+
+## User-Authorized Amendment 1 — 2026-07-27
+
+The amendment freezes these decisions:
+
+1. `PM-LIVE-ACCOUNT-CUT` retains CLOB collateral/token balances and numeric
+   per-selected-spender cache/spendability evidence only.
+2. `PM-LIVE-POLYGON-AUTHORIZATION-CUT`, owned by the new
+   `reap-polymarket-chain-source`, obtains direct ERC-20
+   `allowance(configuredEoa, selectedExchange)` and ERC-1155
+   `isApprovedForAll(configuredEoa, selectedExchange)` at one
+   provider-reported finalized Polygon block. Chain, contracts, owner,
+   selected standard/negative-risk exchange, ABI, block/freshness, and result
+   types are closed; arbitrary RPC and every mutation are impossible.
+3. Every chain cut starts with `eth_chainId == 0x89`, then a finalized block
+   anchor, two exact `eth_call`s at its explicit block number, and an
+   exact-number block-hash recheck. The block may be at most five seconds
+   future/thirty seconds old, and the complete cut expires after five
+   monotonic seconds or an epoch change. Any partial, malformed, stale,
+   reverted, wrong-chain, or hash-changing sequence is discarded as a unit.
+4. CLOB numeric values never become boolean approval. The CLOB, Polygon, and
+   Data API replies are non-atomic and join only through matching
+   account/market/configuration epochs and independent freshness.
+   An unproved CLOB conditional comparison unit leaves the bounded numeric
+   value diagnostic-only and does not stop the goal.
+5. Inbound lifecycle/time parsing is a closed source/message-family-tagged
+   union. Exact raw provenance is retained; only enumerated semantic
+   equivalences normalize. Unknown, ambiguous, cross-family, malformed, and
+   out-of-profile input is quarantined and fails closed, never promoted to
+   success.
+6. The PM action benchmark's absolute `25,000 ns` p50 and `250,000 ns` p99.9
+   exits are superseded. Phase 0 may change only the exact latency branch in
+   `src/evidence/runner.rs`, the bench validator, and their policy tests, not
+   the workload/report schema/non-timing gates. Each side retains three Cargo
+   invocation reports after one process-warmup invocation; each retained
+   invocation already has three internal recorded distributions. Compare the
+   median of each invocation's internal three, then the median of those three
+   invocation medians. Phase 0/final p50 and p95 compare at `≤1.10×`, p99 at
+   `≤1.20×`; p99.9/max are retained but not shared-host gates. Every
+   logical/hash/allocation/memory/cardinality/queue gate remains exact.
+7. Goal G chooses no production Polygon provider/origin or provider
+   credential, exposes only the constrained non-default `local-evidence`
+   loopback construction, and sends no real chain request. Goal H must inject
+   one exact HTTPS origin and prove chain/finality/history/bounds/provider-
+   credential and target-host clock assumptions before construction.
+8. The distinct authenticated journal schema/lease/durable barriers/recovery
+   projection land as the first Phase 4 tranche before any live place/cancel
+   role. Phase 5 only composes that proven foundation.
+
+The amendment design was checked against these primary official contracts;
+the fresh Phase 0 run must retrieve, pin, and hash the exact bytes/revisions it
+actually implements:
+
+| Source | Amendment contract |
+| --- | --- |
+| `https://ethereum.org/developers/docs/apis/json-rpc/` | `eth_chainId`, provider-reported `finalized` block tag, exact-number `eth_getBlockByNumber`, and read-only `eth_call` |
+| `https://docs.polygon.technology/pos/concepts/finality/finality` | Polygon milestone-finalized block semantics |
+| `https://docs.polygon.technology/pos/reference/rpc-endpoints` | Polygon mainnet chain ID `137`; no provider selected |
+| `https://eips.ethereum.org/EIPS/eip-20` | `allowance(owner, spender) -> uint256` |
+| `https://eips.ethereum.org/EIPS/eip-1155` | `isApprovedForAll(owner, operator) -> bool` |
+| `https://docs.soliditylang.org/en/latest/abi-spec.html` | selector, address-word, `uint256`, and canonical boolean ABI encoding |
+| `https://docs.polymarket.com/resources/contracts` | Current Polygon pUSD, Conditional Tokens, standard exchange, and negative-risk exchange addresses |
+
+These decisions are normative in the amended
+[execution prompt](polymarket-authenticated-execution-goal-g-prompt.md) and
+[boundary](polymarket-authenticated-execution-boundary.md). The sections below
+headed as stops/audits describe the pre-amendment run and remain evidence, not
+active instructions.
+
+## Baseline And Workspace Identity
+
+The baseline inventory was taken on 2026-07-26 UTC. The current date at this
+stop record is 2026-07-27 UTC.
+
+| Check | Result |
+| --- | --- |
+| Reap `HEAD` / branch | `43970849267c0282d118a369a792066c4655deae` on `master` |
+| Remote relation | `HEAD == origin/master`; zero ahead, zero behind |
+| Initial worktree | Only untracked `docs/polymarket-authenticated-execution-goal-g-prompt.md` |
+| Required Goal G baseline | `43970849267c0282d118a369a792066c4655deae` is an ancestor |
+| Goal F final tree | `d16c3cbdac97fb43944e3a97d4f9b56e92206747` is an ancestor |
+| `Cargo.lock` SHA-256 | `2673d055c943c3bd5444531b67df280026c145cbbbc99b68a06f4ac0c2dbb0ff` |
+| Existing Chaos reference | `../imm-strategy` clean at `b6b120c7b7c466d8431bf082f3229328c5d7b2ae` |
+| Historical PM reference | Predarb commit object `8222273a9c72033b760e1d2fec813bc77144556d` is available and is checkout `HEAD` |
+| Predarb dirty path names | Modified `resources/grafana/pf-maker-v2-dashboard.json`; untracked `.predarb/` |
+| Worktree/index safety | One Reap worktree; no `index.lock`; neither sibling changed |
+
+Predarb was inspected only through pinned Git-object commands (`git show`,
+`git grep`, `git ls-tree`, `git cat-file`, and an isolated archive of that
+object). Neither dirty path was opened. No `.env`, `.env_bk`, runtime state,
+dashboard contents, private key, credential, tracked operational value, or
+other untracked byte was read, moved, interpreted, reset, cleaned, or copied.
+
+At the initial process check there was no overlapping Cargo/Rust process.
+During the benchmark campaign, another Reap session later started two
+CPU-saturating `combined_replay` processes on this two-vCPU host. Those
+processes made the first PM benchmark attempts invalid as idle-host evidence.
+They did not change the worktree. The overlap was allowed to finish; it was
+not stopped or modified. A later no-overlap PM warm-up still failed the
+frozen p50 limit, as recorded below.
+
+The root filesystem was 99% used with approximately 633 MiB free. Goal G's
+public-source captures and raw benchmark logs use approximately 22 MiB under
+ignored `target/tmp/goal-g-phase0`; no user or sibling data was cleaned.
+
+## Repository Inventory
+
+| Inventory | Baseline result |
+| --- | --- |
+| Workspace packages | 35 |
+| Outside-workspace Cargo path dependencies | 0 |
+| Canonical 35-row normal adjacency SHA-256 | `63cca672bf23690d042779967d2cb2c12414633924b20d296a269f2e63554c06` |
+| 102 individual normal workspace edges SHA-256 | `a798f2c320e364782d0dbb3b0d0cc4ffc248896adad3ee502a9ec9e87d59c28e` |
+| 22 Goal F edges SHA-256 | `8944276c9572f6cb00b7db0830e2189199e979eba57d7189973ea62fc281b29f` |
+| Public declarations | 2,671 lines; SHA-256 `0bb94c4dce0e896ce08e30d4fb3d4380e59a00e64a4ceaa04997d200f86bf1fc` |
+| Schema/version inventory | 48 lines; SHA-256 `e71cc793d56e5ba63199b6c341c97e04ac1ca18e8f68adf3742083de434a3d25` |
+| Production Rust paths | 366; SHA-256 `2a091f16d8e8107bd61f6529fb785581c2e6cd43a509feb9f248d0b78c6a2ee6` |
+| Production content manifest SHA-256 | `ebdec7ad2706d6753ed8ea76df4f04838b8fd167ebc890e064de66577cfbc632` |
+| Production extent stream SHA-256 | `878ee3d325f439891e5cbd0188e5365246e7f3b0b117ebd314fa1bfe6c1847c0` |
+| Public wire fixtures | Manifest schema 1; 36 payloads |
+| Fixture manifest / provenance SHA-256 | `765b5f2229215871c9bdc2c941601de5968a4e48633873b10c5d12d96a091306` / `cdd669d67fa10457dc0b2e5b832572c66616ef5b6f08634c6d9ca95c8b4a435e` |
+| PM capture/journal/report schemas | PM public capture v1; `reap-pm-mutation-journal` v1; action and combined-replay schema 1 |
+| Goal F capability surface | All 16 IDs unchanged, including `PM-FAKE-PLACE-GTC-PO` and `PM-FAKE-CANCEL-OWNED` |
+
+The current public PM source implementation is still in
+`reap-polymarket-adapter`; `reap-polymarket-wire` is pure bounded parsing and
+fixture DTOs; `reap-okx-public-source` has the strict index
+reference/session/subscription state but no endpoint-connected transport;
+`reap-pm-live` exposes the fixture product, prepared fake effects, read-only
+private monitor, and v1 journal. That is the exact mechanical extraction and
+backend-neutral seam a resumed Goal G would change.
+
+The existing structural guard families remain:
+
+- `reap-pm-core/tests/dependency_policy.rs`;
+- `reap-pm-state/tests/source_policy.rs`;
+- `reap-pm-strategy/tests/source_policy.rs`;
+- `reap-polymarket-wire/tests/dependency_policy.rs`;
+- `reap-polymarket-adapter/tests/private_source_policy.rs`;
+- `reap-okx-public-source/tests/source_policy.rs`; and
+- `reap-pm-live/tests/dependency_policy.rs`.
+
+Current compile-fail case counts are 12 PM-core, 3 live-contracts, 1 strategy,
+3 wire, 9 adapter, and 41 PM-live. The existing
+`product_has_no_live_mutation_authority` guard may later be replaced only by
+stronger backend-mixing and authority guards; it may not simply be deleted.
+
+### File And Function Stops
+
+These production files are already at or above 1,400 lines and cannot grow
+under Goal G before a responsibility split:
+
+| File | Lines |
+| --- | ---: |
+| `capture_roles.rs` | 1,490 |
+| `coordinator/mutation.rs` | 1,466 |
+| `private_monitor.rs` | 1,447 |
+| `reap-polymarket-adapter/public_session.rs` | 1,440 |
+
+`reap-pm-state/private.rs` is next at 1,395 lines. The largest production
+functions are `enact_okx_reference_lane_failure` (240 lines) and
+`enact_pm_lane_failure` (235 lines) in `run_lane_full.rs`; both already
+require decomposition review and are below the 250-line hard stop.
+
+## Focused Baseline Verification
+
+| Command | Result |
+| --- | --- |
+| `cargo test -p reap-pm-live-contracts --test plan_contract --locked` | 10 passed |
+| `cargo test -p reap-polymarket-wire --test fixture_provenance --locked` | 2 passed |
+| `cargo test -p reap-pm-live --test dependency_policy --locked` | 13 passed |
+| `cargo test -p reap-pm-live --test combined_replay --locked` | Serial idle rerun: 13 passed |
+
+One earlier combined-replay attempt overlapped another benchmark and failed
+one durability timing point. It is retained as a contaminated result, not
+acceptance evidence. The idle rerun produced the frozen Goal F evidence:
+
+| Evidence | Value |
+| --- | --- |
+| Combined writer | 35,012 lines; 22,791,589 bytes |
+| Writer SHA-256 | `83ced509c9ea180e66d957853f9ff7762ef3c0babc316c9251c12d4d1a5224eb` |
+| Canonical recovery SHA-256 | `f98bf8a88f34fb6e3c4dcfd1919a2c1d4577b2da3960375e216e596d0746cd35` |
+| Peak bounded bytes | 2,959,343 |
+| Production order entry | false |
+
+The frozen canonical Chaos backtest output remains
+`38acf9f5e0c310f2ec5528974beffadf4c1a7f84d46efa8d9664ee7051e84691`.
+Phase 0 stopped before claiming a new two-run global backtest campaign.
+Existing Goal D decision anchors remain:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `risk_initialization_v1.json` | `7e0951c41f447b9f46a73b24a3fe85bdc8f2bb8a623385dab0c3655926e73780` |
+| `replay_events_v1.jsonl` | `dede17a546d4d717c78dc2b3b7aa7c3f3f785d552404160407c78fb87cec9101` |
+| `expected_engine_v1.jsonl` | `140c268619b889a19d779e1bdfd340c11901d2eb1d9e4d216d976ba3d8b0d37a` |
+| `expected_live_reduction_v1.json` | `aa66cc09bba29cde25ab2df66c018517b2c900f83373f95580150e8bcd442b60` |
+
+## Benchmark Baseline And Red Gate
+
+Raw logs are retained under `target/tmp/goal-g-phase0`. Every command was a
+separate process. The engine, live, and Chaos action campaigns completed one
+warm-up and three runs:
+
+| Target | Raw log SHA-256: warm-up / run 1 / run 2 / run 3 | Stable logical counts |
+| --- | --- | --- |
+| `reap-engine/event_loop` | `51556d6f27ffb8d7c125f5765458c772af17ca70a1c236aed7d12406f4b84efd` / `3ca222b7d327be83f2607f8969e6b3f0c3c867b8db8f28d316b1ddef543910d9` / `7bad542f3251be6e5c775d2bd5563c07d07f4ed6c0c8ce452ea1594669e58f0b` / `7911b4f1ce2316c37d250a02795d28945bb9fd3ae5b23435c863082a781da322` | 250,000 events; 999,996 intents |
+| `reap-live/live_loop` | `5f4580444720bac739428ac7b8935e3589428e76ad3f241e6ce6897dbf7c6efa` / `49dc601dca46d2ad12552fe20d85190428ac05fb1331dd32df22e618b12f10a8` / `d6fa9c7ef47eaa85e75b902635a8909dc83620c8169e6bd1495979af12ca6ef1` / `4e386b07237d160eb7d881ed2c0bed35ed5a279890febd0e3084b774a7dde69f` | 50,204 parsed; 70,208 feed outputs; 65,130 records; zero actions |
+| `reap-live/action_path` | `8956217dcd1e9946aaf6557dfbd98f827edc513a17f96460b3195335e4375513` / `35899810805ef52ad58cbec423e7add896969d9f4d57fb8bc17c19f2cea64ba4` / `001c38f8e8e0c4b148ba5b6bd3d0f9bd3c98418d8cef3adb7f2f970607cce8f4` / `89ab50e49a26f46820e64e64df813fa26045e85c3e019337c2c4ffabaa57fa5b` | 100,000 observations per workload; exact workload counters and allocation pass matched |
+
+The action-path raw JSON reports p50, p95, p99, p99.9, max, exact logical
+counters, allocation calls/bytes, queue capacity/high water/saturation, and
+queue age for every workload. These logs are the retained evidence; no
+percentile was inferred from a smaller sample.
+
+The required PM campaign could not pass its warm-up binary:
+
+| Attempt | Overlap state | p50 / p95 / p99 / p99.9 / max (ns) | Failed contract | Raw log SHA-256 |
+| --- | --- | --- | --- | --- |
+| Initial warm-up | Two competing `combined_replay` processes appeared after campaign start | 24,877 / 52,315 / 138,967 / 2,093,766 / 4,087,400 | p99.9 <= 250,000 | `8731695ee4f570876f433fe2bc861bf4df9a282a98d26be9e3c835532fcc345c` |
+| Diagnostic retry | Competing replay still present | 23,811 / 46,325 / 59,478 / 270,066 / 2,590,782 | p99.9 <= 250,000 | `f813842821f0b7dbe7c6103c463f1e4e02ad834ae0e135fe0994f3b6afd468b8` |
+| Fresh idle warm-up | No Cargo/Rust overlap | 27,495 / 55,908 / 70,891 / 90,870 / 420,053 | p50 <= 25,000 | `f0cda3c604542a1f3e012a59dcce6086535c8cb1e53ff42326e73328be6fec41` |
+
+Each PM invocation internally uses 15,000 samples, one internal warm-up and
+three recorded runs, exact nearest-rank percentiles, zero owner-loop
+allocations, and frozen logical/hash checks. All three application processes
+exited `101` at the benchmark's existing latency invariant. No result was
+discarded, threshold weakened, or cherry-picked. Since the first clean
+warm-up failed, Phase 0 has no valid three-run idle PM baseline and its
+performance gate is independently red. This is host-local evidence, not proof
+of a code regression: the source tree was unchanged.
+
+## Official Documentation Capture
+
+All sources below were fetched credential-free. The documentation batch was
+retrieved at `2026-07-26T16:56:50Z`; requested and final URL are shown relative
+to `https://docs.polymarket.com/` except the labeled OKX row. Every response
+was HTTP 200. Exact response headers and bodies are retained under
+`target/tmp/goal-g-phase0/docs`.
+
+`https://docs.polymarket.com/llms.txt` was retrieved at the response date
+`2026-07-26T16:56:26Z`, content type `text/plain; charset=utf-8`, 44,511
+bytes, SHA-256
+`2ead7fcd7730b7978969c577430c4dd1218faaf4e1594fca34afde09f4b50adb`.
+
+`https://docs.polymarket.com/api-spec/clob-openapi.yaml` was retrieved at the
+response date `2026-07-26T16:52:46Z`, content type
+`application/octet-stream, text/yaml`, 218,860 bytes, SHA-256
+`0f56ba4f6459d586636a18687fe05d3b5675bd7e707c7160f1a7aeb3306de070`,
+ETag `"c8ba9373a2c2ec63e1fb062fd21e0b4f"`, and Last-Modified
+`2026-06-16T22:55:17Z`.
+
+| Requested path | Final path | Status | Content type | Bytes | SHA-256 |
+| --- | --- | ---: | --- | ---: | --- |
+| `getting-started/api.md` | `getting-started/api.md` | 200 | `text/markdown; charset=utf-8` | 9,391 | `6c397c66109852220b3f5d8033ea274061b3fc44b426edc9faa60673ecbef8fc` |
+| `v2-migration.md` | `v2-migration.md` | 200 | `text/markdown; charset=utf-8` | 25,625 | `8dc52780b87a85faa22a030174cb28a2ee7bfd3c2797712527e3a83147452c7b` |
+| `trading/wallets-auth.md` | `trading/wallets-auth.md` | 200 | `text/markdown; charset=utf-8` | 54,259 | `34095970a28c384375127aa481b3f928c3e3c2337414aa3d3af4a8b8bd43e8f5` |
+| `trading/matching-engine.md` | `trading/matching-engine.md` | 200 | `text/markdown; charset=utf-8` | 6,864 | `f0d718b69509593654cb0085bb94fb96447c9b8d5ece6ddb990003d1e1f6f36c` |
+| `trading/place-orders.md` | `trading/place-orders.md` | 200 | `text/markdown; charset=utf-8` | 59,742 | `057a19e82957de35c08ac9199230a4c9affcade06ad5186499ad9aa31ba291ea` |
+| `trading/manage-orders.md` | `trading/manage-orders.md` | 200 | `text/markdown; charset=utf-8` | 52,401 | `e4a0238db31d5137b4d0da0d4333b1fb90be8f7c7b47d92968edfd993c8c4482` |
+| `trading/realtime-order-updates.md` | same | 200 | `text/markdown; charset=utf-8` | 15,782 | `b5fde86d9fd5c63f5148b55af5357bcaafd67d090e08f054a2b0774ffc55b741` |
+| `api-reference/trade/post-a-new-order.md` | same | 200 | `text/markdown; charset=utf-8` | 13,429 | `6c1924f515da4d960337a2db67b37c3d43965dbaa5b8616bd02d95a0a789e8f5` |
+| `api-reference/trade/cancel-single-order.md` | same | 200 | `text/markdown; charset=utf-8` | 5,932 | `a12f96e0772df0b68d4fa194504e9778fd073a3cc64a4c2adcb7f67862ac0285` |
+| `api-reference/trade/get-single-order-by-id.md` | same | 200 | `text/markdown; charset=utf-8` | 7,718 | `9644f4b22b029b486c2d6803720c9619c0ff3fd63d2b07310c3d8d35298ec1c1` |
+| `api-reference/trade/get-user-orders.md` | same | 200 | `text/markdown; charset=utf-8` | 10,089 | `12f5e45ec908866cf8b1ebba687ad61458be79bcef75f7e3aa5d11cf4cdffb91` |
+| `api-reference/trade/get-trades.md` | same | 200 | `text/markdown; charset=utf-8` | 11,928 | `a7b88859fbca99a55bb5c2d43fc21dedf1a44701dba9abc5383478df8883e3fb` |
+| `api-reference/wss/user.md` | same | 200 | `text/markdown; charset=utf-8` | 27,402 | `9b6935e7ee56ec5a4f3e433d668e27c730cc6ea117d79fadb9eca5f4c9893c88` |
+| `api-reference/wss/market.md` | same | 200 | `text/markdown; charset=utf-8` | 44,794 | `92a02634755fd92cc1c4a3f798ea64f050f76670e677003a9a595d8a8f4c616a` |
+| `api-reference/markets/get-clob-market-info.md` | same | 200 | `text/markdown; charset=utf-8` | 5,703 | `b6e72949b7dc1c8c6cf97a1657a3dcd0f7aa145ca4ca9c82d9f9f77110b4e1a4` |
+| `api-reference/market-data/get-order-book.md` | same | 200 | `text/markdown; charset=utf-8` | 5,690 | `fd98e9bea50208a07d4ea51a8d03e2048cb6cbf4db70149fb17deda8770815f7` |
+| `api-reference/data/get-server-time.md` | same | 200 | `text/markdown; charset=utf-8` | 2,293 | `513b26c2d9237bd6ce641da1de738ecf99106665b149e298c6b658dc8a0571ec` |
+| `api-reference/core/get-current-positions-for-a-user.md` | same | 200 | `text/markdown; charset=utf-8` | 5,424 | `ff5ae34274c305970f85741997f70149ed284350229a8d417386c3986a62db57` |
+| `api-reference/geoblock.md` | same | 200 | `text/markdown; charset=utf-8` | 7,169 | `271b25f80b2a1c244afaab1396babf7196fb3e88f5e6ac7886e499b3f37a7172` |
+| `api-reference/rate-limits.md` | same | 200 | `text/markdown; charset=utf-8` | 4,124 | `7ba9bdb5df4bfd12199349220dd3c0d0923f6fcc5352385d038ea4eb69ec051a` |
+| `api-reference/trading-rate-limits.md` | same | 200 | `text/markdown; charset=utf-8` | 7,729 | `18851dde8fdbc782bd04d56a6eeb36523fef030daf61e98874c5d5c94c508f69` |
+| `resources/contracts.md` | same | 200 | `text/markdown; charset=utf-8` | 7,987 | `ed59020bd28a24cbca9dbd2f92624a2a8ad7e403f0f08b6ff1529e33860c99a6` |
+| `resources/error-codes.md` | same | 200 | `text/markdown; charset=utf-8` | 19,541 | `a0a93df3e5644349748692815cc9833319ccae3c829d218312df1a6771d08af3` |
+| `concepts/order-lifecycle.md` | same | 200 | `text/markdown; charset=utf-8` | 8,341 | `854236c2602d4268c72d61f3c568f85ffb3f5e58071486abe8c88cecde9d8e76` |
+| `market-data/websocket/overview.md` | `market-data/realtime-data.md` | 200 | `text/markdown; charset=utf-8` | 68,528 | `9347182b68b10e97bc587f30d206545c00b34e28d4c13d0afb316b8d76fabe3d` |
+| `market-data/websocket/market-channel.md` | `market-data/realtime-data#market-stream.md` | 200 | `text/html; charset=utf-8` | 1,802,116 | `3da4c4537af0e3eaea64e14a25b62cd550e2127b33c79b61a74b7021bce6fc39` |
+| `market-data/websocket/user-channel.md` | `trading/realtime-order-updates.md` | 200 | `text/markdown; charset=utf-8` | 15,782 | `b5fde86d9fd5c63f5148b55af5357bcaafd67d090e08f054a2b0774ffc55b741` |
+| `OKX#public-data-websocket-index-tickers-channel` | same | 200 | `text/html; charset=UTF-8` | 5,207,183 | `c75edd5b041b36fc33f981b4c71b29f12f45104efd1e9c4e276881b84864b494` |
+
+Interpretation was limited by role:
+
+- authentication/signing sources establish EOA/type-0, L2 HMAC, request
+  byte, outer owner, domain, field, and contract rules;
+- trade/order/user-WS sources establish the candidate route and lifecycle
+  unions but expose the conflicts recorded below;
+- market/book sources retain Goal F's strict configured public contract;
+- position sources prove pagination but no atomic complete cut;
+- server-time/geoblock sources are readiness observations only;
+- rate limits are ceilings, not Reap target throughput; and
+- the OKX page establishes the public `/ws/v5/public` `index-tickers`
+  subscription/acknowledgement contract for one configured `instId`.
+
+## Pinned Official Git Sources
+
+| Repository | Pinned current revision |
+| --- | --- |
+| `Polymarket/ctf-exchange-v2` | `ccc0596074f4dfd62c944fbca4de252893b82b4b` |
+| `Polymarket/clob-client-v2` | `f3e1a05f868a1fd0c34ef85dfc45c6ce78f5bb69` |
+| `Polymarket/rs-clob-client-v2` | `222143d321eba97d5711a848265eb9aab3bc7ff4` |
+| `Polymarket/ts-sdk` | `0760f99f04e879164fafe79d8277395bb200cee9` |
+
+Relevant immutable Git blob IDs:
+
+| Repository/path | Blob |
+| --- | --- |
+| `ctf-exchange-v2/src/exchange/libraries/Structs.sol` | `0bbcd991063772a864bfe4c51679b7d589559d76` |
+| `ctf-exchange-v2/src/exchange/mixins/Hashing.sol` | `a3dac60d83eef73893441bee174284d071346aa5` |
+| `clob-client-v2/src/client.ts` | `19d9ed8e7515770db6868dae6ffd9438c672ec28` |
+| `clob-client-v2/src/headers/index.ts` | `3b93d2a12b8019a4e2b2d0c6562c0f93fc33fbfc` |
+| `clob-client-v2/src/order-utils/model/ctfExchangeV2TypedData.ts` | `99ab28242caf4a93385471b433832c0cb8a23aa3` |
+| `clob-client-v2/src/signing/eip712.ts` | `1deaf4ff6e95b857dbc5689444815c30380c4472` |
+| `clob-client-v2/src/types/ordersV2.ts` | `34c2977494274e121293f4cd5ed9548b49275288` |
+| `clob-client-v2/src/types/clob.ts` | `3d87ab8c5d25078eae96d620470eabee7021086b` |
+| `clob-client-v2/tests/signing/hmac.test.ts` | `84867e618c0c1699a9c9993c201c8556d2d0c1d1` |
+| `clob-client-v2/tests/headers/index.test.ts` | `cc6379882f77d8ca39d624fab79fcd5346290ac0` |
+| `rs-clob-client-v2/src/auth.rs` | `c99ff3f68cb35752716ff322ce3f6b717e6b1390` |
+| `rs-clob-client-v2/src/clob/client.rs` | `3976d8c4daa85a2879ea55cb35dcd0f22609b2e9` |
+| `rs-clob-client-v2/src/clob/order_builder.rs` | `56db923f56a42c3a3f55e101a66cb39db614632a` |
+| `rs-clob-client-v2/src/clob/types/response.rs` | `80be8d09c26373c2af3b96068ab2a4742dbdce4e` |
+| `rs-clob-client-v2/tests/clob.rs` | `321417692cd1e33ff776476f107975abb545c3d3` |
+| `rs-clob-client-v2/tests/common/mod.rs` | `65df3341b506908c1f319e7f73cae46559718d71` |
+| `ts-sdk/packages/client/src/authentication.ts` | `4d2b6b835ae4b0d7432638db4681122e5dcf9f9c` |
+| `ts-sdk/packages/client/src/actions/orders/typed-data.test.ts` | `1bf793696ddbf3899bf1e39b0f8ff34e3299bcb1` |
+| `ts-sdk/packages/client/src/actions/orders/prepare.ts` | `aaec7845f95fda01ca936d0f39739e60ff6d3532` |
+| `ts-sdk/packages/client/src/actions/orders/post.ts` | `228db2114018d374cdbdff6e66e2ecee9b70c2a2` |
+| `ts-sdk/packages/client/src/actions/orders/types.ts` | `cf7d21884e64b7822823db77b04ef2b925b57e71` |
+| `ts-sdk/packages/client/src/exchange.ts` | `dad00e63d8456ad50de06c5009db16804225847c` |
+| `ts-sdk/packages/bindings/src/clob/account.ts` | `962704ef41f7f5879d5a18c1e7664f27eb37182f` |
+| `ts-sdk/packages/client/src/actions/orders/allowance.ts` | `dd66e53acb298bb0142af343674ee9f48c97a4b6` |
+| `ts-sdk/packages/client/src/actions/orders/trade.ts` | `90adbd04f3784c68d623d05fa3f8e570636f82b3` |
+| `ts-sdk/packages/client/src/actions/approvals.ts` | `d41f1f103f5d4cc805de0355549153be8d49d565` |
+
+These clients are differential-vector oracles only. None was added as a Reap
+dependency.
+
+## Frozen Protocol Decisions That Did Resolve
+
+| Contract | Phase 0 decision |
+| --- | --- |
+| Account profile | Current docs support type-0 EOA only when the EOA is allowlisted; library shape is `maker == signer == funder == POLY_ADDRESS`; Goal H must certify a real allowlisted/funded account |
+| EIP-712 | Domain `Polymarket CTF Exchange`, version 2, chain 137; standard and neg-risk contracts recorded in the boundary |
+| Signed order | Exact 11-field V2 type and type hash; `BUY=0`, `SELL=1`, `signatureType=0`, timestamp milliseconds |
+| Expected venue ID | Contract `hashOrder` / EIP-712 digest, compared as 32-byte identity |
+| Outer owner | L2 API-key UUID, not maker/funder address |
+| L2 | Unix seconds; uppercase method; path without query; exact body bytes; base64-decoded secret; HMAC-SHA256; padded base64url |
+| Place/cancel | `POST /order`; exact-owned `DELETE /order` with `orderID`; one serialization and one application dispatch attempt |
+| Private reads | `/data/orders`, `/data/order/{id}`, `/data/trades`, `/balance-allowance`; path only is HMAC-signed |
+| Pagination | Start `MA==`, terminal `LTE=` from current V2 client consensus; cycles/malformed/overflow are incomplete |
+| Visibility | Credential-visible only; no funder-wide absence claim |
+| User WS | One credential-bearing initial frame; later market updates; object/array event envelopes; no documented subscription ACK; REST reconciliation gates readiness |
+| Position API | Exact lexical numerics, `sizeThreshold=0`, bounded offset/limit; monitored non-atomic projection only |
+| Heartbeat | Excluded; official route/body/ID sources conflict |
+
+The current official L2 regression vector is:
+
+```text
+secret: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+timestamp: 1000000
+method: test-sign
+path: /orders
+body: {"hash": "0x123"}
+signature: ZwAdJKvoYRlEKDkNMwd5BuwNNtg93kNaR_oU2HrfVvc=
+```
+
+It is public synthetic test data. The upstream method is deliberately not an
+HTTP method, so it proves the HMAC primitive/encoding only; Phase 2 would
+still need independently authored GET and POST vectors.
+
+## Exact Stop Conditions
+
+### A. Conditional Allowance Cannot Become Typed Operator Approval
+
+The OpenAPI `BalanceAllowanceResponse` defines:
+
+```text
+balance: string
+allowances: map<address, string>
+```
+
+for both `COLLATERAL` and `CONDITIONAL`. It gives amount examples and no
+asset-kind-specific encoding. At the pinned official revisions:
+
+1. the unified TypeScript SDK parses both kinds into
+   `Record<Address,bigint>`;
+2. its order path compares even a conditional value to `makerAmount`;
+3. its separate on-chain approval path correctly models ERC-20 allowance as
+   `uint256` and ERC-1155 `isApprovedForAll` as `bool`;
+4. the legacy TypeScript client exposes only `Record<string,string>`;
+5. the Rust client preserves `HashMap<Address,String>`; and
+6. its only mock allowance `"1"` is a `COLLATERAL` request, not a
+   conditional approval vector.
+
+No source states whether conditional false/true is `0/1`,
+`0/max_uint256`, another sentinel, or something else. SDK threshold behavior
+is not a versioned server contract. Mapping arbitrary positive text to true
+would reproduce the exact unsafe behavior prohibited by Goal G.
+
+The pinned Predarb fixture
+`balance_allowance.json` has SHA-256
+`7e1f683ac5032b137d8a2afdfafccce389198bb5d3a33ba6eb3cb478455fab96`
+and contains only scalar strings `"1000.00"` for balance/allowance, with no
+asset kind, token, spender, or map. Predarb can divide a selected or arbitrary
+first map value by one million and use `> 0` as approval. That is historical
+code-path arithmetic, not fixture provenance or current protocol authority.
+
+This exactly triggers:
+
+> exact ERC20 allowance versus ERC1155 operator-approval semantics cannot be
+> proven without weakening the typed core.
+
+### B. Lifecycle And Timestamp Sources Conflict
+
+The current OpenAPI REST order enum uses
+`ORDER_STATUS_LIVE|INVALID|CANCELED_MARKET_RESOLVED|CANCELED|MATCHED`;
+guides/WS use unprefixed `LIVE|MATCHED|CANCELED`; the current Rust SDK also
+models `DELAYED|UNMATCHED` and aliases. OpenAPI trade statuses use
+`TRADE_STATUS_*`; WS/guides/SDKs use
+`MATCHED|MINED|CONFIRMED|RETRYING|FAILED`. POST response status is a third,
+lowercase namespace (`live|matched|delayed`).
+
+User-WS prose labels timestamp as milliseconds while examples include
+10-digit seconds-shaped values; current TypeScript schemas/tests use
+millisecond-shaped values. A strict union parser can preserve and quarantine
+these families, but current Goal G requires Phase 0 to resolve exact reached
+status and time contracts rather than silently choose or probe with a real
+credential. This is a second documented stop unless the prompt explicitly
+authorizes a compatibility union with no success promotion.
+
+### C. Phase 0 Performance Gate Is Not Green
+
+The existing PM benchmark failed its own frozen threshold on all three
+attempts, including a clean no-overlap warm-up. The result cannot be hidden or
+weakened. Because source was unchanged and no valid warm-up exists, this is
+an unstable same-host baseline rather than proof of a regression, but the
+required one-warm-up/three-run Phase 0 campaign is not green.
+
+## Second Blocked Audit — 2026-07-27
+
+A second independent, credential-free audit searched additional official
+Polymarket Python clients, the Python SDK, the CLI, example repositories, and
+the public schema/client history. It independently reproduced the same
+mandatory Phase 0 stop. It found no versioned false/true encoding for
+`CONDITIONAL` values and found positive evidence that the CLOB value is not
+modeled as an ERC-1155 boolean:
+
+- the official Python SDK's SELL/`CONDITIONAL` unit vector supplies `"777"`
+  and expects the parsed integer `777`;
+- its placement action compares that numeric CLOB value with maker amount,
+  then invokes ERC-1155 approval as a separate boolean operation;
+- the official CLI emits the authenticated CLOB allowance map unchanged,
+  while its separate approval command reads `IERC20.allowance` as `U256` and
+  `IERC1155.isApprovedForAll` as `bool`; and
+- official Python, TypeScript, Rust, and example code either preserves the
+  CLOB response or performs the direct on-chain boolean call. None defines a
+  conversion between them.
+
+The safe amended contract must preserve two separately sourced facts:
+
+1. numeric, per-selected-spender CLOB-reported conditional spendability; and
+2. boolean, on-chain ERC-1155 operator approval for the same owner and
+   selected standard or neg-risk exchange.
+
+The numeric fact cannot authorize the boolean fact. The pre-amendment Goal G
+demanded the conversion but did not authorize the closed Polygon RPC read that
+would obtain the boolean independently.
+
+### Supplemental Official Documentation Capture
+
+The following pages were fetched without credentials at response dates from
+`2026-07-27T02:03:49Z` through `2026-07-27T02:03:51Z`. Every response was
+HTTP 200 with content type `text/markdown; charset=utf-8`. Exact bodies and
+request metadata are retained in ignored Phase 0 evidence under
+`target/tmp/goal-g-phase0/official-extra`.
+
+| Requested path | Final path | Bytes | SHA-256 |
+| --- | --- | ---: | --- |
+| `trading/clients/l2.md` | `trading/manage-orders.md` | 52,401 | `e4a0238db31d5137b4d0da0d4333b1fb90be8f7c7b47d92968edfd993c8c4482` |
+| `getting-started/python.md` | same | 10,363 | `bb1e8cc105eeccdb927a3591a16ddfd697699c2171f3d391aa31ce45b6af3cef` |
+| `getting-started/typescript.md` | same | 9,733 | `aed3099526bf5f981d08cbb54abf4915898bb7b573b7301c6bc2793c9e327a80` |
+| `getting-started/migrate-from-previous-sdks.md` | same | 60,918 | `7f35be1847b3f399e8bea8fedc9846f7a7b882aa9cd775a6f5740881a526eff9` |
+| `trading/positions/how-positions-work.md` | same | 6,268 | `ab5ba581884ee412beaff60ab7203ebd0963faabf5c1880cb305c75a0196e99f` |
+| `concepts/positions-tokens.md` | same | 4,127 | `bb131a3894d52149058f8554edaa6fafdd9ad72ab2351efbec605d4b3a6e2cc5` |
+
+These pages add no asset-dependent allowance encoding.
+
+### Supplemental Official Git Evidence
+
+| Repository | Revision | Relevant path | Blob |
+| --- | --- | --- | --- |
+| `Polymarket/py-clob-client-v2` | `215fc63a8fd6ec3a10c7edb73997c9772d8686d3` | `py_clob_client_v2/client.py` | `e0a7e6e3a8916222ddeb9c765ff4f1dbe2771b60` |
+| same | same | `examples/account/approve_allowances.py` | `580127660affe09f7653e56ce38b3a91f57a5743` |
+| `Polymarket/py-sdk` | `6a8f73267f3e776c1d2e8abed538dd5f3fbcda00` | `src/polymarket/models/clob/account.py` | `d29be8a8d14d2dd340e250f567df3c6c87a1e089` |
+| same | same | `tests/unit/test_order_allowance.py` | `54aaa40a5448fef2dc4bbfd2f214cecea89e1335` |
+| same | same | `src/polymarket/_internal/actions/orders/place.py` | `a995fbb025f7e20c2c97cec1f70d01c4e1b129d1` |
+| `Polymarket/polymarket-sdk` | `a8401892976b3cbff0acfaf1c277aaddb241d5a4` | `src/utils/approveErc1155.ts` | `f014da58b71297c6e63bfa83a218f753fe0a8b21` |
+| same | same | `src/abi/ERC1155.json` | `3918e0e587d9e059433a895f3b122d4f1f6b0714` |
+| `Polymarket/py-clob-client` | `b076b04d61135657e25dccc1bbd6866a96bd8c6e` | `py_clob_client/client.py` | `e6be3c56c807b860d46bfbf0f23875f0c370cc08` |
+| `Polymarket/polymarket-cli` | `9b18b5faf5493b945c48ca22efaf9645f0c69ab8` | `src/output/clob/account.rs` | `6c07b1f541ff59e2faa569a04026f651c4a6a9f9` |
+| same | same | `src/commands/approve.rs` | `6de94be8b7a453891d6c9a1db7b66563f3a873f6` |
+| `Polymarket/ts-sdk` | `0760f99f04e879164fafe79d8277395bb200cee9` | `packages/bindings/src/clob/account.ts` | `962704ef41f7f5879d5a18c1e7664f27eb37182f` |
+| same | same | `packages/client/src/actions/orders/allowance.ts` | `dd66e53acb298bb0142af343674ee9f48c97a4b6` |
+| same | same | `packages/client/src/actions/approvals.ts` | `d41f1f103f5d4cc805de0355549153be8d49d565` |
+
+Additional official approval examples were pinned at these revisions:
+
+| Repository | Revision | Relevant behavior |
+| --- | --- | --- |
+| `Polymarket/magic-safe-builder-example` | `479ca38fff10c72e3b9aafb83becfaaa44ae2216` | Direct on-chain `isApprovedForAll` |
+| `Polymarket/wagmi-safe-builder-example` | `e16d88ec0cd6fa67eda5f4156c2db14a221eb9af` | Direct on-chain `isApprovedForAll` |
+| `Polymarket/safe-wallet-integration` | `49ec9991b7f3e95197a4d53910f6086bf3ff2294` | Direct on-chain `isApprovedForAll` |
+| `Polymarket/turnkey-safe-builder-example` | `df5dd8a5a149bdbe3e23179853ff5eabfcc93675` | Direct on-chain `isApprovedForAll` |
+
+The public client history also fails to supply the missing contract:
+
+- current `clob-client-v2` revision
+  `f3e1a05f868a1fd0c34ef85dfc45c6ce78f5bb69` retains response-type blob
+  `3d87ab8c5d25078eae96d620470eabee7021086b`;
+- the map-shape transition at commit
+  `e4bdef890c10322bd059b42314a634beed6d4ac4`, blob
+  `b2f3a5cf77e2190e49a6a4a08f0c71e058b7310b`, says only that it matches
+  the new server payload;
+- the original endpoint commit
+  `b7045899d4e55c629b58aeae4975e9679091512b`, blob
+  `190b30e0afa4ab3f103d74895f335795c2625e78`, used one string field for
+  both asset kinds; and
+- the public Polymarket organization exposes clients and contracts but no
+  CLOB server/backend or documentation-source repository that defines the
+  server value semantics.
+
+The current OpenAPI capture remains SHA-256
+`0f56ba4f6459d586636a18687fe05d3b5675bd7e707c7160f1a7aeb3306de070`
+and still supplies one `map<address,string>` shape with no asset-dependent
+encoding. No exact `0/1`, `0/max_uint256`, or other encoding was found.
+
+This was a second blocked audit, not an implementation phase. No real
+credentials were loaded, no authenticated request was made, no external
+mutation was sent, and no Reap production or dependency file was changed.
+The active Goal G objective is not complete.
+
+## Predarb Lessons And Rejections
+
+Useful pinned historical concepts:
+
+- sign and dispatch the same exact body bytes;
+- keep mutation and reconciliation lanes separate;
+- persist intent/dispatch state before effect;
+- reconcile acknowledgement-unknown instead of blind placement retry;
+- structurally deduplicate fills; and
+- separate published, balance, reservation, and fill-derived position
+  evidence.
+
+Rejected Predarb patterns include cloneable/debuggable credentials, arbitrary
+hosts, create-then-derive provisioning fallback, generic venue commands,
+cancel-all, allowance mutation, heartbeat, broad account/runtime ownership,
+timestamp-only salt, rounded/floating amounts, raw body logging, weak journal
+durability, arbitrary allowance selection, `f64` positions, unbounded/unsafe
+WS delivery, dropped pre-mapping events, and tuple-based ownership inference.
+
+The five historical parser fixture hashes remain exactly:
+
+| Fixture | SHA-256 |
+| --- | --- |
+| `balance_allowance.json` | `7e1f683ac5032b137d8a2afdfafccce389198bb5d3a33ba6eb3cb478455fab96` |
+| `market_book.json` | `8e671f14c4b1e8137b1dc1b0bd7d39c79d9c8f961a8483daa32151df99cbdf81` |
+| `open_order.json` | `d0998ca29cf47ce4bcb1fb4d7183d1e895a044d859235230a6ebef464295baf2` |
+| `user_order.json` | `e4c3cd7975b7dc16c4c8d014444fc2a96d927cf1b9089b33875a5450b4ff99fa` |
+| `user_trade.json` | `042998055ec5dec2c69065d002b2619d8497faabd9bfcc36c27a1bcf7cfe224c` |
+
+They are parser seeds only.
+
+## Unblock Adopted And Next Action
+
+The user selected the closed Polygon-read option and authorized the complete
+Amendment 1 contract recorded near the top of this handoff. The prompt and
+boundary now freeze the ABI, standard/negative-risk exchange selection,
+provider-reported finalized-block consistency, freshness, failure behavior,
+bounded non-generic dependency edge, origin deferral, strict lifecycle/time
+union, and paired benchmark policy. No CLOB conditional encoding is guessed.
+
+Goal G is therefore no longer blocked by the three historical findings. The
+next action is to start a fresh Goal G run at Phase 0 using:
+
+> /goal Execute Goal G exactly as specified in
+> `docs/polymarket-authenticated-execution-goal-g-prompt.md`. Continue phase by
+> phase through every green gate and stop only at completion or a documented
+> stop condition.
+
+The fresh run must preserve this stop evidence, implement the narrowly
+authorized benchmark-policy tranche, refresh Phase 0 sources and inventories,
+and earn a new green Phase 0 gate. This amendment itself does not claim that
+any implementation phase, benchmark gate, production origin, account
+qualification, or trading authorization is complete.
