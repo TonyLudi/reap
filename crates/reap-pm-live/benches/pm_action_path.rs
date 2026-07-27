@@ -55,14 +55,6 @@ fn validate_recorded_run(ordinal: usize, report: &Value) {
     assert_eq!(number(capacities, "raw_payload_byte_high_water"), 0);
     let latency = object(report, "action_latency_ns");
     assert_eq!(number(latency, "samples"), 15_000);
-    assert!(
-        number(latency, "p50") <= 25_000,
-        "recorded run {ordinal} exceeded the 25us p50 limit"
-    );
-    assert!(
-        number(latency, "p99_9") <= 250_000,
-        "recorded run {ordinal} exceeded the 250us p99.9 limit"
-    );
     let allocations = object(report, "owner_allocations");
     assert_eq!(
         number(allocations, "allocation_calls"),

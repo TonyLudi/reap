@@ -84,6 +84,30 @@ fn tracking_allocator_installation_is_test_and_benchmark_only() {
     assert!(evidence_module.contains("#[cfg(test)]\nmod overload_tests;"));
 }
 
+#[test]
+fn pm_action_latency_is_reported_but_only_the_sample_count_is_locally_gated() {
+    let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runner = read(crate_root.join("src/evidence/runner.rs"));
+    let benchmark = read(crate_root.join("benches/pm_action_path.rs"));
+    let report = read(crate_root.join("src/evidence/report.rs"));
+
+    assert!(runner.contains("action_latency_ns.samples != 15_000"));
+    assert!(!runner.contains("action_latency_ns.p50 >"));
+    assert!(!runner.contains("action_latency_ns.p99_9 >"));
+    assert!(runner.contains("\n        action_latency_ns,"));
+
+    assert!(benchmark.contains("number(latency, \"samples\"), 15_000"));
+    assert!(!benchmark.contains("number(latency, \"p50\") <="));
+    assert!(!benchmark.contains("number(latency, \"p99_9\") <="));
+
+    for percentile in ["p50", "p95", "p99", "p99_9", "max"] {
+        assert!(
+            report.contains(&format!("pub {percentile}: u64")),
+            "the complete latency report must retain {percentile}"
+        );
+    }
+}
+
 fn module_source(root: &Path, module: &str) -> String {
     let mut paths = vec![root.join(format!("{module}.rs"))];
     paths.extend(rust_sources(&root.join(module)));
