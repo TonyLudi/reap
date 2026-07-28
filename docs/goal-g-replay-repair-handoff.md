@@ -2,13 +2,23 @@
 
 ## Status
 
-Goal G-R is stopped at the first Phase 1 runner invocation. No replay, test,
-bench, build, clippy, or backtest command ran. The frozen runner exited during
-its own storage preflight before it created an attempt directory or launched
-Cargo. Goal G remains stopped on its immutable valid-red Amendment 2
+Goal G-R is stopped at its Phase 1 causal-proof gate. Amendment 4's separately
+hashed v5 runner passed its retained no-Cargo bootstrap, and the original
+six-attempt diagnostic matrix then completed. All six Cargo commands exited
+`0`; the two original failures did not recur. Source analysis proves two
+places where the harness can mask a primary asynchronous failure, but the
+frozen Goal G log did not retain the exact persistence transition or
+writer/shutdown error variant. Goal G-R therefore cannot create the required
+deterministic historical regressions without manufacturing missing evidence,
+which its prompt expressly forbids.
+
+No repair source, regression runner, Phase 2 regression, Phase 3 campaign,
+bench, clippy, workspace gate, backtest, external request, or order was
+started. Goal G remains stopped on its immutable valid-red Amendment 2
 evidence; this repair goal neither resumes nor amends Goal G.
 
-Recorded at `2026-07-27T17:07:23Z`.
+Current terminal status recorded at `2026-07-28T17:55:06Z`. The earlier
+runner stops and their timestamps remain below as immutable history.
 
 ## Frozen Starting Identity
 
@@ -786,4 +796,199 @@ goal_g_r_amendment_4_activation_workload_invoked_between_a4_and_b4=false
 goal_g_r_amendment_4_activation_first_campaign=phase1-diagnostic
 goal_g_r_amendment_4_activation_first_ordinal=01
 goal_g_r_amendment_4_activation_first_label=mutation-exact
+```
+
+## Phase 1 Diagnostic Matrix And Causal Stop
+
+The original six-attempt matrix completed at committed Amendment 4 activation
+revision:
+
+```text
+goal_g_r_phase1_status=stopped
+goal_g_r_phase1_schema=goal-g-r-phase1-causal-stop-v1
+goal_g_r_phase1_head=ef231e049312b34c4b3527784afe86b4ac1595ce
+goal_g_r_phase1_tree=c2d4cca03bbaad26e6c9dabbf47602f59c922792
+goal_g_r_phase1_parent=18137ad595278478ed2cb0989e4352292157fe25
+goal_g_r_phase1_subject=docs: activate goal g-r amendment 4 runner
+goal_g_r_phase1_branch=master
+goal_g_r_phase1_origin_ahead=6
+goal_g_r_phase1_origin_behind=0
+goal_g_r_phase1_cargo_lock_sha256=2673d055c943c3bd5444531b67df280026c145cbbbc99b68a06f4ac0c2dbb0ff
+goal_g_r_phase1_evidence_root=target/tmp/goal-g-replay-repair/ef231e049312b34c4b3527784afe86b4ac1595ce/phase1-diagnostic
+goal_g_r_phase1_evidence_file_count=37
+goal_g_r_phase1_evidence_entry_count=43
+goal_g_r_phase1_evidence_file_stream_sha256=1f79f73503bec5e329dffc72ae70936a832005d4aca405ed50fbc6a6dae5d091
+goal_g_r_phase1_evidence_inventory_sha256=f2184d540cc03b6cd37f92c2671bbfc65a206bbc62ab3645584bfa807e79c68a
+goal_g_r_phase1_runtime_root_empty=true
+goal_g_r_phase1_process_overlap=false
+```
+
+The aggregate file stream is defined by:
+
+```bash
+(
+  cd target/tmp/goal-g-replay-repair/ef231e049312b34c4b3527784afe86b4ac1595ce/phase1-diagnostic
+  find . -type f -print0 |
+    LC_ALL=C sort -z |
+    xargs -0 sha256sum |
+    sha256sum
+)
+```
+
+The aggregate inventory is defined by:
+
+```bash
+(
+  cd target/tmp/goal-g-replay-repair/ef231e049312b34c4b3527784afe86b4ac1595ce/phase1-diagnostic
+  find . -mindepth 1 -printf '%y\t%m\t%s\t%P\t%l\n' |
+    LC_ALL=C sort |
+    sha256sum
+)
+```
+
+Every attempt retained clean, identical pre/post repository identity,
+unchanged `Cargo.lock`, no external process overlap, and an empty runtime
+root. The attempt seals and outcomes are:
+
+| Ordinal | Attempt path / label | SHA-256 of `attempt.sha256` | Command exit | Validation result | Evidence valid | Gate |
+| --- | --- | --- | ---: | --- | --- | --- |
+| 01 | `01-mutation-exact` / `mutation-exact` | `3e928880e4862b24cb2615c6560be36d5e002a489e866dc74a45ad6275c844e4` | 0 | `mutation-test-or-report-invalid` | true | false |
+| 02 | `02-capture-exact` / `capture-exact` | `e5653eb300c1b1d109be55c9ca3164d434170b3c90b16b5293428323fe2ea625` | 0 | `capture-test-exact` | true | true |
+| 03 | `03-combined-serial` / `combined-serial` | `983277a04f7814c7630e06fc77057234a9ffca082f3d39561f5d172e6cca3673` | 0 | `combined-report-invalid` | true | false |
+| 04 | `04-combined-parallel` / `combined-parallel` | `7ff65d744942babac57b348531f24b82d47beda5c73e54b240e8c3a63f4742d6` | 0 | `combined-report-exact` | true | true |
+| 05 | `05-combined-parallel` / `combined-parallel` | `8dc36a76184f7c655b76e0e4ea9719d1d594f015894dec4c256c344b35714224` | 0 | `combined-report-exact` | true | true |
+| 06 | `06-combined-parallel` / `combined-parallel` | `b38fd6e9a724ccef161e3d800f708d35a2b1b3154979581995ac100be2ce6c7a` | 0 | `combined-report-exact` | true | true |
+
+Attempts 01 and 03 are not test failures. Their Cargo processes exited `0`.
+The frozen v5 validator requires the report JSON and named-test result to
+start at column one, while the isolated recovery child writes its report
+between libtest's `test <name> ... ` prefix and final `ok`. Consequently the
+extractor sees zero column-one report lines. This is retained runner
+validation evidence, not a reason to discard, replace, or relabel either
+attempt.
+
+### Failure 1: prepared fake-effect mismatch
+
+Frozen source anchors used for this trace are:
+
+```text
+crates/reap-pm-live/src/evidence/workload.rs=891948103fa26c4d555f2e462be981a433c374f4d803c8115dc74d461b3cf05d
+crates/reap-pm-live/src/coordinator/mutation.rs=dd9fcd0b9bbfffa6a0e5da59468674985bdc83707abc02baaff344ecae2c4b4a
+crates/reap-pm-live/src/coordinator/product.rs=63dddd505091dccba46a0620f8d99f19339022b5fbe87cda8164024cfb673177
+crates/reap-pm-live/src/coordinator/persistence.rs=e4f96e740eeb74d66e406847b6eb71e29559e29c7b56d94858061bccd468c052
+```
+
+| Field | Finding |
+| --- | --- |
+| Observed state | The frozen child reached either the Quote or Cancel fixture-dispatch path and returned the shared `EffectKindMismatch`. The pre-pop guards return that error when `next_effect_kind()` is not the requested kind; identical defensive post-pop guards also use the same error. Without a backtrace, the log does not identify Quote versus Cancel, the exact guard, an empty queue versus another front kind, or the preceding persistence-service variant. |
+| Expected state | The acknowledgement immediately before fixture execution must correspond to that exact pending intent and must commit exactly one matching prepared Quote or Cancel effect. A fact acknowledgement must commit no prepared fake effect. |
+| Divergence | `acknowledge_one_undrained` returns after `poll_persistence_fixture == true` and an ensuing service turn, while its callers accept any positive aggregate `service_turn().total()` as the requested acknowledgement. Neither observation carries the reduced `PmPersistenceService` variant, intent identity, nor resulting prepared-effect identity. The fixture guard is the first retained classifier of the mismatch; the frozen evidence does not identify which earlier transition left the matching effect absent or displaced. |
+| Shared resource | The persistence queue, pending correlations, and prepared fake-effect queue are owned by the one product inside the isolated recovery child. The child runtime and temporary journal path are unique; there is no cross-test object or path collision. |
+| Scheduling dependence | Real-writer receipt readiness is asynchronous. If more than one persistence record is pending, `poll_one` moves a polled-yet-pending front entry to the back of the product-local persistence queue, so readiness and task scheduling can affect which typed poll is admitted next. The frozen evidence does not prove that this multi-entry prerequisite existed in the historical run. |
+| Deterministic trigger | No exact historical trigger is authenticated. A fixed fact-before-intent sequence would demonstrate the generic-count defect class, but the retained log cannot prove that `FactAcknowledged`, another intent, an invalidated quote, or a failed intent was the historical transition. Manufacturing one of those states would not meet the prompt's historical-cause requirement. |
+| Repair owner | If a separately reviewed goal authorizes defect-class hardening without claiming historical equivalence, the smallest owner is only `crates/reap-pm-live/src/evidence/workload.rs`: retain and validate the exact prepared-stage product-effect kind and identity produced by each intent acknowledgement, and fail before fixture dispatch when it is missing or wrong. No coordinator or live-product semantic change is justified by current evidence. |
+
+The source-level defect class is concrete: `IntentFailed`,
+`QuoteInvalidated`, `FactAcknowledged`, and a matching `PreparedQuote` or
+`PreparedCancel` can all produce a serviced owner transition, but only the
+matching prepared cases authorize the next fake-effect fixture. What remains
+unknown is which concrete transition occurred in the frozen failure.
+
+### Failure 2: secondary `InvalidRecords`
+
+Frozen source anchors used for this trace are:
+
+```text
+crates/reap-pm-live/tests/combined_replay.rs=cf151a8372eddc9765f19c793d5f449f81e2633de509fc0ddbe1722da691c6dc
+crates/reap-pm-live/src/composition/run_lifecycle.rs=916f53f8b843486545dc7c3ad480142640197b0ba8df7fd17c5b7fd1f9c9c548
+crates/reap-pm-live/src/composition/run_types.rs=8737fb07635d393e60db1839a436d876e131b1057968b80eb1900160ba853c31
+crates/reap-pm-live/src/capture/writer.rs=967b89c62dd6a2121561e6332ad7baacf32143129aba3553d8d695abf2c0658d
+crates/reap-capture-framing/src/bounded_writer.rs=d3b339d5863db405bb039df98cc35c31ef80987bda90d97530b66092b5d5d6b3
+crates/reap-pm-live/src/capture/verify.rs=7efafe34248231e092d84e9f4ef7aecb40d2f5e6b081a2363ff663df856737dd
+```
+
+| Field | Finding |
+| --- | --- |
+| Observed state | The aggregate subcase accepted 32 one-MiB raw frames, rejected the next byte with `RawPayloadTooLarge`, broadly accepted any `Err(TerminalFinish { .. })`, and then the independent verifier returned `InvalidRecords` at the frozen failing line. The exact `TerminalFinish.shutdown_error` was discarded. |
+| Expected state | The capacity rejection should terminalize with `cause == CaptureWriter`; `finish()` must complete with `shutdown_error == None`; only then may the test verify the accepted 32-MiB prefix and its exact counters. |
+| Divergence | Each successful `capture_pm_public` awaits bounded queue admission, not physical file durability. `finish()` does preserve writer-task I/O, join, timeout, and lifecycle/scan failures in `shutdown_error`, but four broad matches in the named test discard that field before verification. A truncated or otherwise invalid on-disk artifact can consequently surface later as secondary `InvalidRecords`. |
+| Shared resource | The capture run owns a test-local tempfile path, bounded writer queue, and async writer task; source inspection shows no shared filename. Relevant shared host resources include filesystem capacity/throughput and task/runtime scheduling, but retained evidence does not identify which, if any, caused the historical shutdown failure. |
+| Scheduling dependence | The aggregate admits roughly 44.8 MB (about 42.7 MiB) of encoded frames; the writer may drain concurrently, and `finish()` is the barrier that waits for any remaining writes under a 30-second shutdown timeout. The historical full binary lasted 39.86 seconds on a two-CPU host, but that whole-suite duration does not measure this writer's shutdown and therefore neither proves nor rules out a timeout. Writer I/O, join, timeout, and lifecycle/scan errors remain indistinguishable after the broad match. |
+| Deterministic trigger | None is established in retained or currently allowlisted evidence. No historical tempdir artifact is retained, the exact `shutdown_error` was never logged, all five current executions containing this test passed, and the allowlisted support can observe an exact flushed sequence but cannot pause, stall, or inject a failure into the already-open private writer. |
+| Repair owner | Unassigned under the current goal. A generic test hardening can assert `cause == CaptureWriter` and `shutdown_error == None` at the four sites before verification, but an exact primary-fault regression requires either a separately reviewed defect-class goal or a narrowly authorized test-only writer fault/barrier hook outside this allowlist. |
+
+`JsonlWriterError::ShutdownTimeout` is a hypothesis, not a finding.
+`InvalidRecords` is proven to be secondary-capable, but the retained evidence
+does not distinguish shutdown timeout from writer I/O, join, or
+lifecycle/evidence-scan failure. Goal G-R lines 410–419 explicitly prohibit
+equating a newly manufactured I/O fault with this historical result.
+
+### Stop decision and next owner
+
+Phase 1 requires both exact causal explanations and deterministic pre-repair
+triggers. Both defect classes are narrowed, but neither frozen failure retains
+the exact transition needed by that gate. The stop condition is therefore:
+
+```text
+goal_g_r_phase1_stop_condition=historical-primary-state-not-retained-and-no-exact-in-allowlist-trigger
+goal_g_r_phase1_historical_mutation_transition=unknown
+goal_g_r_phase1_historical_capture_shutdown_error_variant=unknown
+goal_g_r_phase1_shutdown_timeout_claimed=false
+goal_g_r_phase1_manufactured_io_fault_equated=false
+goal_g_r_phase1_regression_runner_created=false
+goal_g_r_phase1_repair_source_edited=false
+goal_g_r_phase1_phase2_started=false
+goal_g_r_phase1_phase3_started=false
+goal_g_r_phase1_goal_g_resumed=false
+goal_g_r_phase1_goal_g_modified=false
+goal_g_r_phase1_product_semantics_changed=false
+goal_g_r_phase1_live_product_semantics_changed=false
+```
+
+The smallest next owner is a separately user-reviewed goal or amendment with
+one of two explicit meanings:
+
+1. Recommended: authorize an observability/defect-class hardening only in
+   `workload.rs` and `combined_replay.rs`. It would validate exact
+   acknowledgement/prepared-effect counter cuts and assert a clean writer
+   terminal finish before prefix verification, while explicitly not claiming
+   to reproduce the erased historical variants.
+2. If exact fault reproduction remains mandatory: additionally authorize a
+   private, test-only capture-writer barrier/fault hook and its colocated
+   library regression. This widens the current allowlist and still requires
+   the reviewed goal to name the injected primary variant rather than
+   retroactively claiming it was historical.
+
+Until one of those scopes is reviewed, the single pending regression-contract
+field in the Phase 1 contract above remains authoritative. No regression
+name, target, runner hash, or repair candidate is frozen by this stop record.
+
+### Preservation and non-claims at stop
+
+Immediately before this record, the fixed runtime root was empty, no matching
+Cargo/rustc/combined-replay/Reap process remained, the tracked tree was clean,
+and repository available bytes were `3416379392`, above the exact
+`2147483648`-byte floor. The Goal G evidence anchors remained:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `replay.selected` | `4168ac456d70361429967d7457e0d5850cd014c0b0ea7b8e45e3183372ec766d` |
+| `replay/attempt-1/combined-replay.log` | `fe3e8c7323c52163345e6330ebd7587858990a49d1bc436a1a669792f6473cd9` |
+| `replay/attempt-1/replay.meta` | `b2dc689182ea8c02fd340669b2b0f142b6cafd15d5ec38a04cda221f3aaa8f56` |
+| `replay/attempt-1/replay.ps.tsv` | `fd77e0c1db9970bbe2c20eea70dc8836091a81e77d9bd66491c4d8150f4bf0c3` |
+
+The complete Goal G file-hash and inventory streams remain
+`35a99a10c133fd680cef1f4e411dbc55490f4e41199411aae907cd348aced340`
+and
+`23c4b85375e2d27e657c38b4560c3ee1bfecae1c1b5c98baf4cf1462dc05f7b2`,
+with `11594` files and `12253` entries.
+
+```text
+production_order_entry_authorized=false
+real_credentials_loaded=false
+authenticated_external_request_sent=false
+real_polygon_rpc_request_sent=false
+real_order_submitted=false
+goal_g_red_evidence_modified=false
+goal_g_resumed=false
 ```
