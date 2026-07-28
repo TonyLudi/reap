@@ -343,3 +343,108 @@ goal_g_r_amendment_2_bootstrap_status=pending
 goal_g_r_amendment_2_cargo_authorized_before_activation=false
 goal_g_r_amendment_2_phase1_matrix=original-goal-g-r-six-attempt-v1
 ```
+
+## Amendment 2 Bootstrap Stop
+
+The independently reviewed v3 runner was frozen before its first invocation:
+
+| Artifact | SHA-256 | Mode |
+| --- | --- | --- |
+| `target/tmp/goal-g-replay-repair/amendment-2-v3/run-attempt.sh` | `a2e5a7f77feffc8832616dd3c13d06eba80fb5fd2082dda7bf8d5c504d0ab8ec` | `500` |
+| `target/tmp/goal-g-replay-repair/amendment-2-v3/run-attempt.sha256` | `de1b58342678678b92fa610380d5707554cd4530c468969878c2ecfbfe3e45bc` | `400` |
+
+Its first and only Amendment 2 bootstrap invocation was:
+
+```text
+target/tmp/goal-g-replay-repair/amendment-2-v3/run-attempt.sh e9dd15017f15a6853513a517dcf41d80bdc8cf7f runner-bootstrap-v3 00 no-cargo
+```
+
+It exited `65`. The captured stderr contained exactly five transient
+process-enumeration diagnostics followed by the terminal stop:
+
+```text
+/home/ubuntu/code/reap/target/tmp/goal-g-replay-repair/amendment-2-v3/run-attempt.sh: line 698: /proc/195950/stat: No such file or directory
+/home/ubuntu/code/reap/target/tmp/goal-g-replay-repair/amendment-2-v3/run-attempt.sh: line 698: /proc/196014/stat: No such file or directory
+/home/ubuntu/code/reap/target/tmp/goal-g-replay-repair/amendment-2-v3/run-attempt.sh: line 698: /proc/196081/stat: No such file or directory
+/home/ubuntu/code/reap/target/tmp/goal-g-replay-repair/amendment-2-v3/run-attempt.sh: line 698: /proc/196145/stat: No such file or directory
+/home/ubuntu/code/reap/target/tmp/goal-g-replay-repair/amendment-2-v3/run-attempt.sh: line 698: /proc/196211/stat: No such file or directory
+Amendment 2 no-Cargo bootstrap failed and may not be retried
+```
+
+Those five diagnostics are benign PID-exit races: the sampler globbed a live
+`/proc/<pid>/stat` path and the process exited before Bash opened it. Input
+redirection is installed before the following stderr redirection, so the open
+failure remained visible; `|| continue` kept the sampler alive. The sealed
+process log has a pre row, 17 clear sampler rows, and one seal-tail-start row.
+Every data row is `sample-ok`, with no overlap.
+
+The durable failure envelope is narrower than the exact cause. The retained
+pending directory reached mode `500`; its seven files reached mode `400`;
+and its six-entry manifest verifies:
+
+| Pending artifact | SHA-256 |
+| --- | --- |
+| `bootstrap.meta` | `9dab6c18e2715356572d174cfd0d65acbb37f6e3435c326599762d1d1f3a5a37` |
+| `bootstrap.sha256` | `71ca7b6807f808a07b545325e59efc07deceef7144ea3f2d6a5920fcb96d07b7` |
+| `goal-g-preservation.meta` | `588a37b4a7f0425a8de5bf1a4cb0498f7da9fb4f7c195524ab925bde33722dbb` |
+| `matrix.tsv` | `7dfd76a33829817ba3cd9aa9ec2035e3fa6e08f1db62346175a022bdbf502edc` |
+| `no-cargo.meta` | `b2dd67acc729cd4fa685cb2a7fd098dec96a2a76e30a6f72db357fec4489a19e` |
+| `process.ps.tsv` | `f338cb3f8dcaaac866552a598364b1d37da259bb6f9d3b19479cc422172825f4` |
+| `v1-preservation.tsv` | `584df2493aa7b47d3fef32475d34e5cd9872d516fad5c8b205bb12d2d46180c8` |
+
+The final `runner-bootstrap-v3` path is absent, so atomic publication did not
+succeed. The failure occurred after pending seal/chmod and before successful
+`mv -nT`. V3 did not persist the last completed post-seal gate, so the
+evidence cannot distinguish its silent inventory/hash, identity, process,
+reserve-deadline, storage, and other pre-publication checks. Metadata records
+last sample `1785236520379204000`, seal-tail start
+`1785236520601642101`, and deadline `1785236521379204000`; from seal-tail
+start, `527561899` nanoseconds remained before the `250000000`-nanosecond
+publication reserve. The reserve-deadline checks are the leading hypothesis,
+not a proven failed predicate. The prepublication `bootstrap_pass=true`
+metadata does not override exit `65`, retained pending, or absent final.
+
+Frozen v3 control flow and retained metadata prove that this invocation
+reached no Cargo probe, Cargo workload, `setsid`, candidate directory,
+campaign directory, or attempt directory. Activation commit D was not
+created and Phase 1 did not resume.
+Post-stop checks found an empty runtime root, no matching process, a clean
+tracked tree at authorization commit
+`e9dd15017f15a6853513a517dcf41d80bdc8cf7f`, and the exact frozen
+`Cargo.lock`.
+
+All v1 and v2 artifacts remain frozen. Goal G still has `11594` files and
+`12253` entries, file stream
+`35a99a10c133fd680cef1f4e411dbc55490f4e41199411aae907cd348aced340`,
+and inventory
+`23c4b85375e2d27e657c38b4560c3ee1bfecae1c1b5c98baf4cf1462dc05f7b2`.
+
+Recorded after the stop at `2026-07-28T11:10:00Z`.
+
+The execution booleans below are scoped to this single v3 invocation; they do
+not claim continuous system-wide process absence after sampler shutdown.
+
+```text
+goal_g_r_amendment_2_execution_status=stopped
+goal_g_r_amendment_2_execution_schema=goal-g-r-runner-amendment-2-stop-v1
+goal_g_r_amendment_2_execution_authorization_commit=e9dd15017f15a6853513a517dcf41d80bdc8cf7f
+goal_g_r_amendment_2_execution_v3_runner_sha256=a2e5a7f77feffc8832616dd3c13d06eba80fb5fd2082dda7bf8d5c504d0ab8ec
+goal_g_r_amendment_2_execution_v3_hash_file_sha256=de1b58342678678b92fa610380d5707554cd4530c468969878c2ecfbfe3e45bc
+goal_g_r_amendment_2_execution_bootstrap_exit=65
+goal_g_r_amendment_2_execution_failure_envelope=sealed-pending-before-atomic-publication
+goal_g_r_amendment_2_execution_exact_subgate=not-durably-recorded
+goal_g_r_amendment_2_execution_pending_state=sealed-retained
+goal_g_r_amendment_2_execution_pending_mode=500
+goal_g_r_amendment_2_execution_pending_manifest_sha256=71ca7b6807f808a07b545325e59efc07deceef7144ea3f2d6a5920fcb96d07b7
+goal_g_r_amendment_2_execution_pending_manifest_valid=true
+goal_g_r_amendment_2_execution_final_state=absent
+goal_g_r_amendment_2_execution_cargo_invoked=false
+goal_g_r_amendment_2_execution_setsid_invoked=false
+goal_g_r_amendment_2_execution_workload_invoked=false
+goal_g_r_amendment_2_execution_candidate_created=false
+goal_g_r_amendment_2_execution_attempt_created=false
+goal_g_r_amendment_2_execution_activation_created=false
+goal_g_r_amendment_2_execution_phase1_resumed=false
+goal_g_r_amendment_2_execution_goal_g_modified=false
+goal_g_r_amendment_2_execution_next_authority=separately-user-reviewed-amendment-3
+```
