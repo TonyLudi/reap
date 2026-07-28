@@ -514,3 +514,122 @@ goal_g_r_amendment_3_v4_bootstrap_status=pending
 goal_g_r_amendment_3_cargo_authorized_before_activation=false
 goal_g_r_amendment_3_phase1_matrix=original-goal-g-r-six-attempt-v1
 ```
+
+## Amendment 3 Bootstrap Stop
+
+The independently reviewed v4 runner was frozen before its first invocation:
+
+| Artifact | SHA-256 | Mode |
+| --- | --- | --- |
+| `target/tmp/goal-g-replay-repair/amendment-3-v4/run-attempt.sh` | `f2d0c9761ecee3084bd8711a1c372ad4d939ab27e1960ca8d59810ad587cfe08` | `500` |
+| `target/tmp/goal-g-replay-repair/amendment-3-v4/run-attempt.sha256` | `3516def3e27206f214957eed103af41d91171bb3f6db80932239bdad191a6eb6` | `400` |
+
+Its first and only Amendment 3 bootstrap invocation was:
+
+```text
+target/tmp/goal-g-replay-repair/amendment-3-v4/run-attempt.sh 7582d9fd92dbf67e54d02320307de4435cb52136 runner-bootstrap-v4 00 no-cargo
+```
+
+It exited `65` and emitted exactly:
+
+```text
+Amendment 3 v4 bootstrap failed at publish-reserve; retained state is immutable and may not be retried
+```
+
+The closed failure gate makes the cause exact. V4 completed and validated a
+writable pending bundle but could not prove the required
+`250000000`-nanosecond publication reserve before the unchanged deadline.
+The retained pending directory is mode `700`; its seven nonsymlink regular
+files are mode `600`; and the six-entry manifest verifies:
+
+| Pending artifact | SHA-256 |
+| --- | --- |
+| `bootstrap.meta` | `926ff4f5665322b3147e89e1d8ac03b664535774cbef33a99626e98812a6d95d` |
+| `bootstrap.sha256` | `3df5cf16715e849ed332bf6f24d25f2822175c2ef26a533047de25c7abc02003` |
+| `goal-g-preservation.meta` | `cbdc7792311e06b45a8d56d9bbdc5d66ffdcdcf8b121c8bd6981c36bfd1c7675` |
+| `matrix.tsv` | `7dfd76a33829817ba3cd9aa9ec2035e3fa6e08f1db62346175a022bdbf502edc` |
+| `no-cargo.meta` | `6edd5bb1da6f2da3110d244d7b356fa4ed792ec0659d7d701af17e10fe4af8ee` |
+| `process.ps.tsv` | `2a4aa0cc914115131482849d816767240f8d9a96040785728e09c8e5cedf17ac` |
+| `v1-preservation.tsv` | `db82b18fa3795f4d482747cd2602dabe09f64f02d5cc48a126f4b3f4fc92964f` |
+
+The process log has a header, one pre row, 16 clear sampler rows, and one
+seal-tail-start row. Every data row is `sample-ok`, and both independent
+post-stop process checks are recorded `true`.
+
+The final sampler timestamp was `1785242873256426000`; the unchanged
+deadline was `1785242874256426000`; and the latest valid reserve check was
+therefore `1785242874006426000`. The manifest completed at
+`1785242874193507264`, already `187081264` nanoseconds after the reserve
+cutoff, with only `62918736` nanoseconds left before the hard deadline. Full
+writable verification occurred later. This proves the `publish-reserve`
+failure independently of the terminal diagnostic. The collective post-tail
+schedule exhausted the reserve; the evidence does not attribute all elapsed
+time to any one verifier.
+
+Because the directory and files remain mode `700`/`600`, the runner never
+entered its mode-`500`/`400` seal. The final `runner-bootstrap-v4` path is
+absent, and atomic publication was never attempted. Despite their physical
+writability, both the v4 runner and its pending directory are frozen retained
+evidence: they must not be retried, invoked, changed, renamed, deleted,
+cleaned, promoted, or copied as success. During this single v4 invocation,
+no Cargo probe, Cargo workload, `setsid`, candidate directory, campaign
+directory, attempt directory, activation tail, or B3 commit was created.
+HEAD remained clean A3, the runtime root remained empty, and all Goal G and
+v1-v3 anchors remained exact.
+
+The narrow next design is a separately reviewed Amendment 4 with a separately
+hashed v5 runner. It must preserve v4 and this complete writable pending
+evidence, keep the one-second deadline and 250-millisecond reserve unchanged,
+and move the expensive static semantic validation under the active sampler.
+V5 can capture hashes of the validated static files before sampler shutdown,
+then retain after shutdown the final process-log validation, both process
+scans, cheap static-hash stability checks, metadata and manifest rendering,
+complete seven-file writable verification, reserve gate, seal, and atomic
+publication. This is a recommendation only and grants no Amendment 4
+authority.
+
+Recorded after the stop at `2026-07-28T12:56:01Z`.
+
+```text
+goal_g_r_amendment_3_execution_status=stopped
+goal_g_r_amendment_3_execution_schema=goal-g-r-runner-amendment-3-stop-v1
+goal_g_r_amendment_3_execution_authorization_commit=7582d9fd92dbf67e54d02320307de4435cb52136
+goal_g_r_amendment_3_execution_v4_runner_sha256=f2d0c9761ecee3084bd8711a1c372ad4d939ab27e1960ca8d59810ad587cfe08
+goal_g_r_amendment_3_execution_v4_hash_file_sha256=3516def3e27206f214957eed103af41d91171bb3f6db80932239bdad191a6eb6
+goal_g_r_amendment_3_execution_bootstrap_exit=65
+goal_g_r_amendment_3_execution_failure_envelope=complete-writable-pending-before-seal
+goal_g_r_amendment_3_execution_exact_subgate=publish-reserve
+goal_g_r_amendment_3_execution_pending_state=complete-writable-retained
+goal_g_r_amendment_3_execution_pending_mode=700
+goal_g_r_amendment_3_execution_pending_files_mode=600
+goal_g_r_amendment_3_execution_pending_inventory=bootstrap.meta,bootstrap.sha256,goal-g-preservation.meta,matrix.tsv,no-cargo.meta,process.ps.tsv,v1-preservation.tsv
+goal_g_r_amendment_3_execution_pending_bootstrap_meta_sha256=926ff4f5665322b3147e89e1d8ac03b664535774cbef33a99626e98812a6d95d
+goal_g_r_amendment_3_execution_pending_manifest_sha256=3df5cf16715e849ed332bf6f24d25f2822175c2ef26a533047de25c7abc02003
+goal_g_r_amendment_3_execution_pending_goal_g_sha256=cbdc7792311e06b45a8d56d9bbdc5d66ffdcdcf8b121c8bd6981c36bfd1c7675
+goal_g_r_amendment_3_execution_pending_matrix_sha256=7dfd76a33829817ba3cd9aa9ec2035e3fa6e08f1db62346175a022bdbf502edc
+goal_g_r_amendment_3_execution_pending_no_cargo_sha256=6edd5bb1da6f2da3110d244d7b356fa4ed792ec0659d7d701af17e10fe4af8ee
+goal_g_r_amendment_3_execution_pending_process_sha256=2a4aa0cc914115131482849d816767240f8d9a96040785728e09c8e5cedf17ac
+goal_g_r_amendment_3_execution_pending_preservation_sha256=db82b18fa3795f4d482747cd2602dabe09f64f02d5cc48a126f4b3f4fc92964f
+goal_g_r_amendment_3_execution_pending_manifest_valid=true
+goal_g_r_amendment_3_execution_prepublication_evidence_complete=true
+goal_g_r_amendment_3_execution_last_sample_epoch_ns=1785242873256426000
+goal_g_r_amendment_3_execution_seal_tail_start_epoch_ns=1785242873531854187
+goal_g_r_amendment_3_execution_seal_tail_deadline_epoch_ns=1785242874256426000
+goal_g_r_amendment_3_execution_publish_reserve_ns=250000000
+goal_g_r_amendment_3_execution_reserve_cutoff_epoch_ns=1785242874006426000
+goal_g_r_amendment_3_execution_manifest_mtime_epoch_ns=1785242874193507264
+goal_g_r_amendment_3_execution_reserve_miss_minimum_ns=187081264
+goal_g_r_amendment_3_execution_seal_attempted=false
+goal_g_r_amendment_3_execution_atomic_publication_attempted=false
+goal_g_r_amendment_3_execution_final_state=absent
+goal_g_r_amendment_3_execution_cargo_invoked=false
+goal_g_r_amendment_3_execution_cargo_version_probe_invoked=false
+goal_g_r_amendment_3_execution_setsid_invoked=false
+goal_g_r_amendment_3_execution_workload_invoked=false
+goal_g_r_amendment_3_execution_candidate_created=false
+goal_g_r_amendment_3_execution_attempt_created=false
+goal_g_r_amendment_3_execution_activation_created=false
+goal_g_r_amendment_3_execution_phase1_resumed=false
+goal_g_r_amendment_3_execution_goal_g_modified=false
+goal_g_r_amendment_3_execution_next_authority=separately-user-reviewed-amendment-4
+```
