@@ -992,3 +992,40 @@ real_order_submitted=false
 goal_g_red_evidence_modified=false
 goal_g_resumed=false
 ```
+
+## Amendment 5 Authorization
+
+The user authorized the recommended defect-class hardening track on
+`2026-07-28` after identifying the target as an uncommitted repair summary
+from a second agent. The controlling scope is
+`docs/goal-g-replay-repair-amendment-5.md`.
+
+Amendment 5 is separate from the stopped Goal G-R Phase 1 contract. It leaves
+the single existing `goal_g_r_regression_contract_status=pending` field
+unchanged, never invokes or mutates the frozen v5 runner, and cannot claim
+Goal G-R or Goal G completion.
+
+```text
+goal_g_r_amendment_5_status=authorized
+goal_g_r_amendment_5_schema=goal-g-r-amendment-5-v1
+goal_g_r_amendment_5_base_commit=06b8948c8b3a2982ba9898c5215abc17e4f95893
+goal_g_r_amendment_5_base_tree=d6cb7845616bec8d480c6c199956a79b58619687
+goal_g_r_amendment_5_base_subject=docs: record goal g-r phase 1 causal stop
+goal_g_r_amendment_5_cargo_lock_sha256=2673d055c943c3bd5444531b67df280026c145cbbbc99b68a06f4ac0c2dbb0ff
+goal_g_r_amendment_5_regression_contract_schema=goal-g-r-amendment-5-regression-contract-v1
+goal_g_r_amendment_5_regression_1_name=evidence::workload::tests::real_writer_acknowledgement_is_bound_to_expected_prepared_effect
+goal_g_r_amendment_5_regression_1_target=lib
+goal_g_r_amendment_5_regression_2_name=terminal_capture_finish_preserves_primary_shutdown_error_before_prefix_verification
+goal_g_r_amendment_5_regression_2_target=combined_replay
+goal_g_r_amendment_5_v5_invocation_authorized=false
+goal_g_r_amendment_5_v5_mutation_authorized=false
+goal_g_r_amendment_5_v5_regression_runner_creation_authorized=false
+goal_g_r_amendment_5_historical_mutation_transition_claimed=false
+goal_g_r_amendment_5_historical_capture_shutdown_variant_claimed=false
+goal_g_r_amendment_5_goal_g_r_completion_claimed=false
+goal_g_r_amendment_5_goal_g_resumed=false
+goal_g_r_amendment_5_production_order_entry_authorized=false
+goal_g_r_amendment_5_real_credentials_loaded=false
+goal_g_r_amendment_5_external_request_authorized=false
+goal_g_r_amendment_5_push_authorized=false
+```
