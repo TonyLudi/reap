@@ -214,3 +214,87 @@ goal_g_r_amendment_1_bootstrap_status=pending
 goal_g_r_amendment_1_cargo_authorized_before_activation=false
 goal_g_r_amendment_1_phase1_matrix=original-goal-g-r-six-attempt-v1
 ```
+
+## Amendment 1 Bootstrap Stop
+
+The separately reviewed v2 runner was frozen before its first invocation:
+
+| Artifact | SHA-256 | Mode |
+| --- | --- | --- |
+| `target/tmp/goal-g-replay-repair/amendment-1-v2/run-attempt.sh` | `221ab5f04f3a72047b0ff66ec70a827b608978baa99ba0f266f8cb30b99dd37c` | `500` |
+| `target/tmp/goal-g-replay-repair/amendment-1-v2/run-attempt.sha256` | `b2ef7aa095142dbc693fa6d45d62c81105d30bc9e19e6bab600d8fc3860520ff` | `400` |
+
+Its first and only Amendment 1 bootstrap invocation was:
+
+```text
+target/tmp/goal-g-replay-repair/amendment-1-v2/run-attempt.sh d23107df29ad318972a2ad8b869845cbf8fd3252 runner-bootstrap-v2 00 no-cargo
+```
+
+It exited `65` with exact stderr:
+
+```text
+Amendment 1 no-Cargo bootstrap failed and may not be retried
+```
+
+The deterministic cause is the top-level bundle-inventory predicate at
+frozen runner line `941`. Its `LC_ALL=C sort` produces:
+
+```text
+f	run-attempt.sh
+f	run-attempt.sha256
+```
+
+but the frozen literal expects:
+
+```text
+f	run-attempt.sha256
+f	run-attempt.sh
+```
+
+`run-attempt.sh` is a complete prefix of `run-attempt.sha256`, so the shorter
+name sorts first. Every preceding identity, authorization, v1, named Goal G,
+and path-absence gate revalidated. The predicate is before bootstrap
+timestamps, the process-overlap scan, the storage preflight, and pending
+directory creation. The pending and final bootstrap paths therefore remain
+absent; the frozen runner has no bootstrap delete path.
+
+Control flow proves that no Cargo probe, Cargo workload, `setsid`, candidate
+directory, campaign directory, or attempt directory was reachable. Activation
+commit B was not created, and the original Phase 1 matrix did not resume.
+Post-stop checks found the runtime root empty and no matching process. The
+tracked worktree remained clean at authorization commit
+`d23107df29ad318972a2ad8b869845cbf8fd3252`.
+
+All four v1 files retain their frozen hashes and modes. The v1 failed
+candidate and the authorization-commit candidate paths remain absent. Goal G
+retains `11594` files and `12253` entries, file stream
+`35a99a10c133fd680cef1f4e411dbc55490f4e41199411aae907cd348aced340`,
+and inventory
+`23c4b85375e2d27e657c38b4560c3ee1bfecae1c1b5c98baf4cf1462dc05f7b2`.
+
+Static review also found the same reversed filename order in the unreachable
+pending-bundle and activation-bundle predicates at frozen lines `1108`–`1109`
+and `1275`–`1276`. A successor must correct all three expected literals, not
+only line `941`.
+
+Recorded after the stop at `2026-07-28T03:13:21Z`.
+
+```text
+goal_g_r_amendment_1_execution_status=stopped
+goal_g_r_amendment_1_execution_schema=goal-g-r-runner-amendment-1-stop-v1
+goal_g_r_amendment_1_execution_authorization_commit=d23107df29ad318972a2ad8b869845cbf8fd3252
+goal_g_r_amendment_1_execution_v2_runner_sha256=221ab5f04f3a72047b0ff66ec70a827b608978baa99ba0f266f8cb30b99dd37c
+goal_g_r_amendment_1_execution_v2_hash_file_sha256=b2ef7aa095142dbc693fa6d45d62c81105d30bc9e19e6bab600d8fc3860520ff
+goal_g_r_amendment_1_execution_bootstrap_exit=65
+goal_g_r_amendment_1_execution_failed_gate=bundle-inventory-lexical-order
+goal_g_r_amendment_1_execution_pending_state=absent
+goal_g_r_amendment_1_execution_final_state=absent
+goal_g_r_amendment_1_execution_cargo_invoked=false
+goal_g_r_amendment_1_execution_setsid_invoked=false
+goal_g_r_amendment_1_execution_candidate_created=false
+goal_g_r_amendment_1_execution_attempt_created=false
+goal_g_r_amendment_1_execution_activation_created=false
+goal_g_r_amendment_1_execution_phase1_resumed=false
+goal_g_r_amendment_1_execution_goal_g_modified=false
+goal_g_r_amendment_1_execution_next_authority=separately-user-reviewed-amendment
+```
