@@ -565,7 +565,8 @@ async fn raw_frame_and_raw_count_bounds_are_exact() {
 
 #[test]
 fn terminal_capture_finish_preserves_primary_shutdown_error_before_prefix_verification() {
-    let directory = tempfile::tempdir().unwrap();
+    let executable = std::env::current_exe().unwrap();
+    let directory = tempfile::tempdir_in(executable.parent().unwrap()).unwrap();
     let path = directory.path().join("secondary-invalid-records.jsonl");
     std::fs::write(&path, b"{}\n").unwrap();
     assert!(matches!(
