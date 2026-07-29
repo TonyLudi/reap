@@ -1474,7 +1474,13 @@ mod tests {
     async fn real_writer_acknowledgement_is_bound_to_expected_prepared_effect() {
         let directory = tempfile::tempdir_in(std::env::current_exe().unwrap().parent().unwrap()).unwrap();
         let mut run = EvidenceRun::start_real(directory.path().join("ack.jsonl")).await.unwrap();
-        run.run_pass(2, DurabilityMode::RealWriter, None, None).await.unwrap();
+        run.cursor.align_pass_start().unwrap();
+        let mut effects = EffectProjection::new(); let mut input_mix = InputMixReport::default();
+        let mut public = Sha256::new(); let mut excluded = 0;
+        for cycle in 1..=2 {
+            run.run_cycle(cycle, DurabilityMode::RealWriter, None, None, &mut effects,
+                &mut input_mix, &mut public, &mut excluded).await.unwrap();
+        }
         let nominal = AckPolicy { primary: None, service: true, durable: true, prepared: true, identity: true, queue: true };
         assert_eq!(ack_class(nominal), None);
         assert_eq!(ack_class(AckPolicy { prepared: false, ..nominal }), Some("prepared_effect_identity_mismatch"));
