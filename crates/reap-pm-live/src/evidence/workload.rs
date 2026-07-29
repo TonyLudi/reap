@@ -4,9 +4,9 @@ use std::time::{Duration, Instant};
 
 use reap_benchmark_allocator::{AllocationSnapshot, MeasurementWindow};
 use reap_pm_core::{
-    ConnectionEpoch, EventClock, EventOrdering, IngressSequence, OkxReferencePrice,
-    PmFillQueryCursor, PmMarketEvent, PmOrderSide, PmVenueOrderId, PmVenueOrderKey,
-    SnapshotRevision, VenueEventHash,
+    ConnectionEpoch, EventClock, EventOrdering, IngressSequence, OkxReferencePrice, PmAccountScope,
+    PmFillQueryCursor, PmInstrumentHandle, PmMarketEvent, PmOrderSide, PmVenueOrderId,
+    PmVenueOrderKey, SnapshotRevision, VenueEventHash,
 };
 use reap_polymarket_adapter::{
     PmFakeCancelScript, PmFakePlaceScript, PmFixtureCompletionOccurrence, PmFixtureFeeEvidence,
@@ -26,10 +26,13 @@ use super::report::{
     SetupCounters, TerminalStateLengths, hex,
 };
 use crate::coordinator::{
-    PmBookDecisionProjection, PmCoordinator, PmCoordinatorCounters, PmMarketInput,
-    PmMutationCounters, PmRefreshObligationMetrics,
+    PmBookDecisionProjection, PmCoordinator, PmCoordinatorCounters, PmDurableRecordEffect,
+    PmDurableRecordKind as RecordKind, PmFakeEffectMetrics, PmFakeEffectStage, PmHealthMetricKind,
+    PmMarketInput, PmMutationCounters, PmPersistenceMetrics, PmProductEffect,
+    PmRefreshObligationMetrics,
 };
 use crate::journal::{PmJournalScopeV1, PmSealedJournalProjection, PmSealedJournalRecordCounts};
+use crate::lanes::{PmCompleteServiceCounts, PmLaneKind};
 use crate::private_monitor::{
     PmOpenOrdersFixtureInput, PmOrderDetailFixtureInput, PmReconciliationFixtureInput,
 };
@@ -81,6 +84,11 @@ enum DurabilityMode {
     RealWriter,
 }
 
+#[rustfmt::skip]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpectedAck { Quote, Cancel { venue_order: PmVenueOrderKey },
+    Fact { kind: RecordKind, record: Option<PmDurableRecordEffect> } }
+
 #[derive(Debug, Clone, Copy)]
 struct PassRawProjection {
     input_mix: InputMixReport,
@@ -105,6 +113,8 @@ struct EvidenceRun {
     raw_fill: String,
     venue_id: String,
     setup: SetupCounters,
+    pending_fact: Option<PmDurableRecordEffect>,
+    fact_conflict: bool,
 }
 
 pub(crate) fn run_benchmark_warmup() -> Result<BenchmarkWarmup, PmEvidenceError> {
@@ -116,7 +126,7 @@ pub(crate) fn run_benchmark_warmup() -> Result<BenchmarkWarmup, PmEvidenceError>
 }
 
 async fn run_benchmark_warmup_async() -> Result<BenchmarkWarmup, PmEvidenceError> {
-    let mut warmup = EvidenceRun::start_sealed()?;
+    let mut warmup = EvidenceRun::start_sealed().await?;
     let warmup_result = warmup
         .run_pass(WARMUP_CYCLES, DurabilityMode::Sealed, None, None)
         .await?;
@@ -142,7 +152,7 @@ async fn run_benchmark_workload_async(
     warmup: BenchmarkWarmup,
 ) -> Result<BenchmarkOutcome, PmEvidenceError> {
     verify_tracking_allocator()?;
-    let mut measured = EvidenceRun::start_sealed()?;
+    let mut measured = EvidenceRun::start_sealed().await?;
     let mut action_latencies = Vec::with_capacity(ACTION_SAMPLES);
     let mut raw_passes = Vec::with_capacity(REPEATED_NOMINAL_PASSES);
     let mut allocation_window = reap_benchmark_allocator::start_measurement().map_err(invariant)?;
@@ -266,7 +276,7 @@ pub(crate) fn journal_scope() -> Result<PmJournalScopeV1, PmEvidenceError> {
 }
 
 impl EvidenceRun {
-    fn start_sealed() -> Result<Self, PmEvidenceError> {
+    async fn start_sealed() -> Result<Self, PmEvidenceError> {
         let config = connectivity_config();
         let owner = PmCoordinator::start_sealed_evidence(
             &config,
@@ -276,7 +286,7 @@ impl EvidenceRun {
         )
         .map_err(PmEvidenceError::invariant)?;
         let mut run = Self::new(owner, &config)?;
-        run.prepare_private_sealed()?;
+        run.prepare_private(DurabilityMode::Sealed).await?;
         run.prepare_public()?;
         validate_setup(run.setup, None)?;
         Ok(run)
@@ -299,7 +309,7 @@ impl EvidenceRun {
             ));
         }
         let mut run = Self::new(owner, &config)?;
-        run.prepare_private_real().await?;
+        run.prepare_private(DurabilityMode::RealWriter).await?;
         run.prepare_public()?;
         validate_setup(run.setup, Some(2))?;
         Ok(run)
@@ -328,23 +338,21 @@ impl EvidenceRun {
                 physical_journal_lines: sealed.is_none().then_some(2),
                 ..SetupCounters::default()
             },
+            pending_fact: None,
+            fact_conflict: false,
         })
     }
 
-    fn prepare_private_sealed(&mut self) -> Result<(), PmEvidenceError> {
-        self.prepare_private_inputs()?;
-        let reductions = self.acknowledge_one_sealed(150)?;
-        self.observe_setup_ack(reductions)?;
-        self.drain_effects(&mut EffectProjection::new());
-        self.validate_sealed_setup()?;
-        Ok(())
-    }
-
-    async fn prepare_private_real(&mut self) -> Result<(), PmEvidenceError> {
+    #[rustfmt::skip]
+    async fn prepare_private(&mut self, durability: DurabilityMode) -> Result<(), PmEvidenceError> {
         self.prepare_private_inputs()?;
         let mut effects = EffectProjection::new();
-        let reductions = self.acknowledge_setup_real(150, &mut effects).await?;
+        let expected = self.take_fact(RecordKind::FillWatermarkAdvanced, durability)?;
+        let (reductions, _) = self.ack_expected(150, durability, expected, &mut effects).await?;
         self.observe_setup_ack(reductions)?;
+        if durability == DurabilityMode::Sealed {
+            self.validate_sealed_setup()?;
+        }
         Ok(())
     }
 
@@ -571,15 +579,12 @@ impl EvidenceRun {
         let quote_started = Instant::now();
         let service_ns = self.cursor.next_time();
         let quote_service_count = self.service_one_undrained(service_ns)?;
-        let acknowledgement_ns = self.cursor.next_time();
-        self.validate_pending_acknowledgement(false)?;
-        let quote_acknowledgement_count = self
-            .acknowledge_one_undrained(acknowledgement_ns, durability)
-            .await?;
-        let quote_action_ns = elapsed_ns(quote_started);
         Self::validate_service_count(quote_service_count)?;
-        Self::validate_service_count(quote_acknowledgement_count)?;
-        self.drain_effects(effects);
+        let ack_ns = self.cursor.next_time();
+        let (_, completed_at) = self
+            .ack_expected(ack_ns, durability, ExpectedAck::Quote, effects)
+            .await?;
+        let quote_action_ns = elapsed_between(quote_started, completed_at);
         input_mix.quote_evaluation_timers = input_mix.quote_evaluation_timers.saturating_add(1);
         input_mix.quote_intent_acknowledgements =
             input_mix.quote_intent_acknowledgements.saturating_add(1);
@@ -597,8 +602,7 @@ impl EvidenceRun {
         let service_ns = self.cursor.next_time();
         self.service_one(service_ns, effects)?;
         input_mix.fake_place_acceptances = input_mix.fake_place_acceptances.saturating_add(1);
-        let acknowledgement_ns = self.cursor.next_time();
-        self.acknowledge_one(acknowledgement_ns, durability, true, effects)
+        self.ack_fact(durability, RecordKind::PlaceResult, effects)
             .await?;
 
         if is_cancel_cycle(cycle) {
@@ -659,15 +663,17 @@ impl EvidenceRun {
             .map_err(invariant)?;
         let replace_started = Instant::now();
         let cancel_service_count = self.service_one_undrained(deadline)?;
-        let acknowledgement_ns = self.cursor.next_time();
-        self.validate_pending_acknowledgement(false)?;
-        let cancel_acknowledgement_count = self
-            .acknowledge_one_undrained(acknowledgement_ns, durability)
-            .await?;
-        let cancel_action_ns = elapsed_ns(replace_started);
         Self::validate_service_count(cancel_service_count)?;
-        Self::validate_service_count(cancel_acknowledgement_count)?;
-        self.drain_effects(effects);
+        let ack_ns = self.cursor.next_time();
+        let (_, completed_at) = self
+            .ack_expected(
+                ack_ns,
+                durability,
+                ExpectedAck::Cancel { venue_order: venue },
+                effects,
+            )
+            .await?;
+        let cancel_action_ns = elapsed_between(replace_started, completed_at);
         let mutation_after = self.owner.mutation_counters();
         let cancel_before_replace = delta(
             mutation_after.cancel_before_replace(),
@@ -698,8 +704,7 @@ impl EvidenceRun {
         let service_ns = self.cursor.next_time();
         self.service_one(service_ns, effects)?;
         input_mix.fake_cancel_acceptances = input_mix.fake_cancel_acceptances.saturating_add(1);
-        let acknowledgement_ns = self.cursor.next_time();
-        self.acknowledge_one(acknowledgement_ns, durability, true, effects)
+        self.ack_fact(durability, RecordKind::CancelResult, effects)
             .await?;
 
         self.apply_order_detail_absence(venue, allocation, effects, excluded_elapsed_ns)?;
@@ -721,8 +726,7 @@ impl EvidenceRun {
         let mut allocation = allocation;
         self.ingest_private_fill(allocation.as_deref_mut(), effects, excluded_elapsed_ns)?;
         input_mix.private_unique_fills = input_mix.private_unique_fills.saturating_add(1);
-        let acknowledgement_ns = self.cursor.next_time();
-        self.acknowledge_one(acknowledgement_ns, durability, true, effects)
+        self.ack_fact(durability, RecordKind::FillApplied, effects)
             .await?;
 
         self.ingest_private_fill(allocation.as_deref_mut(), effects, excluded_elapsed_ns)?;
@@ -739,8 +743,7 @@ impl EvidenceRun {
             self.apply_paired_fill(allocation, effects, excluded_elapsed_ns)?;
         input_mix.paired_reconciliations = input_mix.paired_reconciliations.saturating_add(1);
         if watermark_advanced {
-            let acknowledgement_ns = self.cursor.next_time();
-            self.acknowledge_one(acknowledgement_ns, durability, true, effects)
+            self.ack_fact(durability, RecordKind::FillWatermarkAdvanced, effects)
                 .await?;
         }
         effects.filled_orders = effects.filled_orders.saturating_add(1);
@@ -862,18 +865,10 @@ impl EvidenceRun {
         monotonic_ns: u64,
         effects: &mut EffectProjection,
     ) -> Result<(), PmEvidenceError> {
-        self.service_one_count(monotonic_ns, effects).map(|_| ())
-    }
-
-    fn service_one_count(
-        &mut self,
-        monotonic_ns: u64,
-        effects: &mut EffectProjection,
-    ) -> Result<u64, PmEvidenceError> {
         let serviced = self.service_one_undrained(monotonic_ns)?;
         Self::validate_service_count(serviced)?;
         self.drain_effects(effects);
-        Ok(serviced)
+        Ok(())
     }
 
     fn service_one_undrained(&mut self, monotonic_ns: u64) -> Result<u64, PmEvidenceError> {
@@ -881,13 +876,13 @@ impl EvidenceRun {
         u64::try_from(serviced.total()).map_err(invariant)
     }
 
+    #[rustfmt::skip]
     fn validate_service_count(serviced: u64) -> Result<(), PmEvidenceError> {
         if serviced == 0 {
-            return Err(PmEvidenceError::invariant(
-                "fixed workload expected one owner reduction",
-            ));
+            Err(PmEvidenceError::invariant("fixed workload expected one owner reduction"))
+        } else {
+            Ok(())
         }
-        Ok(())
     }
 
     fn settle(
@@ -918,71 +913,25 @@ impl EvidenceRun {
         ))
     }
 
-    fn acknowledge_one_sealed(&mut self, monotonic_ns: u64) -> Result<u64, PmEvidenceError> {
-        let occurrence = self.cursor.completion_at(None, monotonic_ns);
-        if !self
-            .owner
-            .poll_persistence_fixture(occurrence, monotonic_ns)
-            .map_err(invariant)?
-        {
-            return Err(PmEvidenceError::invariant(
-                "sealed persistence acknowledgement was not immediate",
-            ));
-        }
-        self.service_one_count(monotonic_ns + 1, &mut EffectProjection::new())
-    }
-
-    async fn acknowledge_setup_real(
-        &mut self,
-        monotonic_ns: u64,
-        effects: &mut EffectProjection,
-    ) -> Result<u64, PmEvidenceError> {
-        let started = Instant::now();
-        let occurrence = self.cursor.completion_at(None, monotonic_ns);
-        let received_clock = occurrence.received_clock();
-        let ordering = occurrence.ordering();
-        loop {
-            let occurrence = PmFixtureCompletionOccurrence::new(received_clock, ordering);
-            if self
-                .owner
-                .poll_persistence_fixture(occurrence, monotonic_ns)
-                .map_err(invariant)?
-            {
-                return self.service_one_count(monotonic_ns + 1, effects);
-            }
-            if started.elapsed() >= DURABILITY_TIMEOUT {
-                return Err(PmEvidenceError::invariant(
-                    "real setup journal acknowledgement timed out",
-                ));
-            }
-            tokio::task::yield_now().await;
-        }
-    }
-
+    #[rustfmt::skip]
     fn observe_setup_ack(&mut self, reductions: u64) -> Result<(), PmEvidenceError> {
-        self.setup.w0_internal_fact_acknowledgements = self
-            .setup
-            .w0_internal_fact_acknowledgements
-            .saturating_add(1);
+        self.setup.w0_internal_fact_acknowledgements =
+            self.setup.w0_internal_fact_acknowledgements.saturating_add(1);
         self.setup.w0_owner_reductions = self.setup.w0_owner_reductions.saturating_add(reductions);
         self.setup.w0_journal_records = self.setup.w0_journal_records.saturating_add(1);
         self.setup.w0_watermark_advances = self.setup.w0_watermark_advances.saturating_add(1);
         if reductions != 1 {
-            return Err(PmEvidenceError::invariant(format!(
-                "setup fact acknowledgement reduced {reductions} inputs, expected 1"
-            )));
+            return Err(PmEvidenceError::invariant(format!("setup fact acknowledgement reduced {reductions} inputs, expected 1")));
         }
         Ok(())
     }
 
+    #[rustfmt::skip]
     fn validate_sealed_setup(&self) -> Result<(), PmEvidenceError> {
-        let projection = self.owner.sealed_journal_projection().ok_or_else(|| {
-            PmEvidenceError::invariant("sealed setup omitted its journal projection")
-        })?;
+        let projection = self.owner.sealed_journal_projection()
+            .ok_or_else(|| PmEvidenceError::invariant("sealed setup omitted its journal projection"))?;
         let expected = PmSealedJournalRecordCounts {
-            headers: 1,
-            fill_watermark_advances: 1,
-            ..PmSealedJournalRecordCounts::default()
+            headers: 1, fill_watermark_advances: 1, ..PmSealedJournalRecordCounts::default()
         };
         if projection.record_count() != 2
             || projection.last_sequence() != 1
@@ -991,102 +940,253 @@ impl EvidenceRun {
             || projection.segment_records_by_kind() != expected
             || !projection.segment_valid()
         {
-            return Err(PmEvidenceError::invariant(format!(
-                "sealed header/W0 setup differs: projection={projection:?}, expected kinds={expected:?}"
-            )));
+            return Err(PmEvidenceError::invariant(format!("sealed header/W0 setup differs: projection={projection:?}, expected kinds={expected:?}")));
         }
         Ok(())
     }
 
-    async fn acknowledge_one(
-        &mut self,
-        monotonic_ns: u64,
-        durability: DurabilityMode,
-        fact: bool,
-        effects: &mut EffectProjection,
-    ) -> Result<(), PmEvidenceError> {
-        self.validate_pending_acknowledgement(fact)?;
-        let serviced = self
-            .acknowledge_one_undrained(monotonic_ns, durability)
+    #[rustfmt::skip]
+    async fn ack_fact(&mut self, durability: DurabilityMode, kind: RecordKind, effects: &mut EffectProjection) -> Result<(), PmEvidenceError> {
+        let expected = self.take_fact(kind, durability)?;
+        let monotonic_ns = self.cursor.next_time();
+        self.ack_expected(monotonic_ns, durability, expected, effects)
             .await?;
-        Self::validate_service_count(serviced)?;
-        self.drain_effects(effects);
-        if fact {
-            self.cursor.internal_fact_acks = self.cursor.internal_fact_acks.saturating_add(1);
-        }
+        self.cursor.internal_fact_acks = self.cursor.internal_fact_acks.saturating_add(1);
         Ok(())
     }
 
-    fn validate_pending_acknowledgement(&self, fact: bool) -> Result<(), PmEvidenceError> {
-        let persistence = self.owner.persistence_metrics();
-        if persistence.depth() == 0 {
-            return Err(PmEvidenceError::invariant(format!(
-                "cycle {} expected a pending {} record before acknowledgement polling; persistence={persistence:?}",
-                self.cursor.absolute_cycle,
-                if fact { "fact" } else { "intent" },
-            )));
+    #[rustfmt::skip]
+    fn take_fact(&mut self, kind: RecordKind, durability: DurabilityMode) -> Result<ExpectedAck, PmEvidenceError> {
+        let record = self.pending_fact.take();
+        let conflict = std::mem::take(&mut self.fact_conflict);
+        let expected = ExpectedAck::Fact { kind, record };
+        if conflict || record.is_none_or(|record| record.kind() != kind
+            || record.client_order().is_some_and(|key| key.account() != self.account.scope.handle())) {
+            let cut = CounterCut::capture(&self.owner, self.cursor.internal_fact_acks);
+            return Err(ack_error(self.cursor.absolute_cycle, durability, expected, "fact_record_identity_mismatch",
+                AckDelta::between(cut, cut), cut, cut, AckEffects::default(), format!("record={record:?} conflict={conflict}")));
         }
-        Ok(())
+        Ok(expected)
     }
 
-    async fn acknowledge_one_undrained(
-        &mut self,
-        monotonic_ns: u64,
-        durability: DurabilityMode,
-    ) -> Result<u64, PmEvidenceError> {
+    #[rustfmt::skip]
+    fn ack_cut(&self, durability: DurabilityMode, expected: ExpectedAck) -> Result<CounterCut, PmEvidenceError> {
+        let before = CounterCut::capture(&self.owner, self.cursor.internal_fact_acks);
+        if before.persistence.depth() != 1 {
+            return Err(self.ack_failure(durability, expected, "pending_record_identity_mismatch",
+                before, AckEffects::default(), "expected exactly one pending record"));
+        }
+        Ok(before)
+    }
+
+    #[rustfmt::skip]
+    async fn ack_expected(&mut self, monotonic_ns: u64, durability: DurabilityMode, expected: ExpectedAck, effects: &mut EffectProjection) -> Result<(u64, Instant), PmEvidenceError> {
+        let before = self.ack_cut(durability, expected)?;
         let started = Instant::now();
         let occurrence = self.cursor.completion_at(None, monotonic_ns);
         let received_clock = occurrence.received_clock();
         let ordering = occurrence.ordering();
         loop {
             let occurrence = PmFixtureCompletionOccurrence::new(received_clock, ordering);
-            let admitted = self
-                .owner
+            let admitted = self.owner
                 .poll_persistence_fixture(occurrence, monotonic_ns)
-                .map_err(invariant)?;
+                .map_err(|error| self.ack_failure(durability, expected, "persistence_poll_error",
+                    before, AckEffects::default(), error))?;
             if admitted {
-                return self.service_one_undrained(monotonic_ns + 1);
+                return self.finish_ack(monotonic_ns + 1, durability, expected, before, effects);
             }
             if durability == DurabilityMode::Sealed {
-                return Err(PmEvidenceError::invariant(
-                    "sealed acknowledgement unexpectedly remained pending",
-                ));
+                return Err(self.ack_failure(durability, expected, "sealed_acknowledgement_pending",
+                    before, AckEffects::default(), "record remained pending"));
             }
             if started.elapsed() >= DURABILITY_TIMEOUT {
-                return Err(PmEvidenceError::invariant(
-                    "real journal acknowledgement timed out",
-                ));
+                return Err(self.ack_failure(durability, expected, "real_writer_acknowledgement_timeout",
+                    before, AckEffects::default(), "durability timeout elapsed"));
             }
             tokio::task::yield_now().await;
         }
     }
 
-    fn drain_effects(&mut self, projection: &mut EffectProjection) {
+    #[rustfmt::skip]
+    fn finish_ack(&mut self, monotonic_ns: u64, durability: DurabilityMode, expected: ExpectedAck,
+        before: CounterCut, effects: &mut EffectProjection) -> Result<(u64, Instant), PmEvidenceError> {
+        let service = self.owner.service_turn(monotonic_ns);
+        let completed_at = Instant::now();
+        let after = CounterCut::capture(&self.owner, self.cursor.internal_fact_acks);
+        let observed = self.drain_effects(effects);
+        let delta = AckDelta::between(before, after);
+        let counts = match service {
+            Ok(counts) => counts,
+            Err(error) => {
+                let class = delta.primary_failure().unwrap_or("owner_service_error");
+                return Err(ack_error(self.cursor.absolute_cycle, durability, expected, class,
+                    delta, before, after, observed, error));
+            }
+        };
+        validate_ack(self.cursor.absolute_cycle, durability, expected, counts, delta, before, after,
+            observed, self.account.scope, self.public.instrument)?;
+        Ok((u64::try_from(counts.total()).map_err(invariant)?, completed_at))
+    }
+
+    #[rustfmt::skip]
+    fn ack_failure(&self, durability: DurabilityMode, expected: ExpectedAck, class: &'static str,
+        before: CounterCut, observed: AckEffects, detail: impl std::fmt::Display) -> PmEvidenceError {
+        let after = CounterCut::capture(&self.owner, self.cursor.internal_fact_acks);
+        let delta = AckDelta::between(before, after);
+        ack_error(self.cursor.absolute_cycle, durability, expected, delta.primary_failure().unwrap_or(class),
+            delta, before, after, observed, detail)
+    }
+
+    #[rustfmt::skip]
+    fn drain_effects(&mut self, projection: &mut EffectProjection) -> AckEffects {
+        let mut observed = AckEffects::default();
         while let Some(effect) = self.owner.pop_effect() {
+            if let PmProductEffect::DurableRecord(record) = effect
+                && !matches!(record.kind(), RecordKind::QuoteIntent | RecordKind::CancelIntent)
+            {
+                self.fact_conflict |= self.pending_fact.replace(record).is_some();
+            }
+            observed.observe(effect);
             projection.observe(effect);
         }
+        observed
     }
 }
 
-#[derive(Clone, Copy)]
-struct CounterCut {
-    mutation: PmMutationCounters,
-    coordinator: PmCoordinatorCounters,
-    refresh: PmRefreshObligationMetrics,
-    persistence_saturations: u64,
-    fake_saturations: u64,
-    output_saturations: u64,
-    internal_fact_acks: u64,
+#[rustfmt::skip]
+#[derive(Debug, Clone, Copy, Default)]
+struct AckEffects { values: [Option<PmProductEffect>; 3], len: u8 }
+
+#[rustfmt::skip]
+impl AckEffects {
+    fn observe(&mut self, effect: PmProductEffect) {
+        let relevant = matches!(effect, PmProductEffect::DurableRecord(_) | PmProductEffect::FakePassiveQuote(_) | PmProductEffect::FakeCancelOwned(_))
+            || matches!(effect, PmProductEffect::HealthMetricAudit(metric) if metric.kind() == PmHealthMetricKind::PersistenceAcknowledged);
+        if !relevant { return; }
+        if let Some(slot) = self.values.get_mut(usize::from(self.len)) { *slot = Some(effect); }
+        self.len = self.len.saturating_add(1);
+    }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AckDelta(Option<[u64; 11]>);
+
+#[rustfmt::skip]
+impl AckDelta {
+    fn between(before: CounterCut, after: CounterCut) -> Self { Self(checked_deltas(ack_values(after), ack_values(before))) }
+    fn primary_failure(self) -> Option<&'static str> {
+        let Some(v) = self.0 else { return Some("counter_regression"); };
+        [(v[2], "persistence_durability_failure"), (v[3], "persistence_closed_failure"),
+         (v[4], "persistence_age_fault"), (v[7], "mutation_durable_failure"),
+         (v[8], "mutation_preparation_failure")].into_iter()
+            .find_map(|(count, class)| (count != 0).then_some(class))
+    }
+}
+
+#[rustfmt::skip]
+fn ack_values(c: CounterCut) -> [u64; 11] {
+    [c.persistence.admitted(), c.persistence.acknowledged(), c.persistence.durability_failures(),
+     c.persistence.closed_failures(), c.persistence.age_faults(), c.mutation.prepared_quotes(),
+     c.mutation.prepared_cancels(), c.mutation.durable_failures(), c.mutation.preparation_failures(),
+     c.coordinator.inputs(), c.coordinator.durable_record_effects()]
+}
+
+fn checked_deltas(after: [u64; 11], before: [u64; 11]) -> Option<[u64; 11]> {
+    let mut values = [0; 11];
+    for (index, (after, before)) in after.into_iter().zip(before).enumerate() {
+        values[index] = after.checked_sub(before)?;
+    }
+    Some(values)
+}
+
+#[rustfmt::skip]
+#[allow(clippy::too_many_arguments, reason = "the immutable before/after acknowledgement proof stays explicit")]
+fn validate_ack(cycle: u64, durability: DurabilityMode, expected: ExpectedAck, counts: PmCompleteServiceCounts, delta: AckDelta, before: CounterCut, after: CounterCut, effects: AckEffects, scope: PmAccountScope, instrument: PmInstrumentHandle) -> Result<(), PmEvidenceError> {
+    let prepared = match expected { ExpectedAck::Quote => [1, 0], ExpectedAck::Cancel { .. } => [0, 1], ExpectedAck::Fact { .. } => [0, 0] };
+    let policy = AckPolicy {
+        primary: delta.primary_failure(),
+        service: counts.total() == 1 && counts.for_lane(PmLaneKind::Persistence) == Some(1),
+        durable: before.persistence.depth() == 1 && after.persistence.depth() == 0
+            && delta.0.is_some_and(|v| v[..5] == [0, 1, 0, 0, 0] && v[9..] == [1, 0]),
+        prepared: delta.0.is_some_and(|v| v[5..7] == prepared),
+        identity: effects_match(expected, effects, scope, instrument, before.persistence.admitted()),
+        queue: fake_ack_matches(expected, before.fake, after.fake),
+    };
+    let class = ack_class(policy);
+    if let Some(class) = class {
+        return Err(ack_error(cycle, durability, expected, class, delta, before, after, effects, "acknowledgement contract mismatch"));
+    }
+    Ok(())
+}
+
+#[rustfmt::skip]
+fn effects_match(expected: ExpectedAck, effects: AckEffects, scope: PmAccountScope, instrument: PmInstrumentHandle, fact_sequence: u64) -> bool {
+    match (expected, effects.len, effects.values) {
+        (ExpectedAck::Quote, 3, [Some(PmProductEffect::DurableRecord(r)), Some(PmProductEffect::FakePassiveQuote(q)), Some(PmProductEffect::HealthMetricAudit(h))]) =>
+            r.kind() == RecordKind::QuoteIntent && r.client_order() == Some(q.client_order()) && q.account_scope() == scope && q.instrument() == instrument
+                && q.stage() == PmFakeEffectStage::PreparedAfterDurability && h.kind() == PmHealthMetricKind::PersistenceAcknowledged && h.value() == 1,
+        (ExpectedAck::Cancel { venue_order }, 3, [Some(PmProductEffect::DurableRecord(r)), Some(PmProductEffect::FakeCancelOwned(c)), Some(PmProductEffect::HealthMetricAudit(h))]) =>
+            r.kind() == RecordKind::CancelIntent && r.client_order() == Some(c.client_order()) && c.account_scope() == scope && c.instrument() == instrument
+                && c.venue_order() == venue_order && c.stage() == PmFakeEffectStage::PreparedAfterDurability && h.kind() == PmHealthMetricKind::PersistenceAcknowledged && h.value() == 1,
+        (ExpectedAck::Fact { kind, record: Some(record) }, 1, [Some(PmProductEffect::HealthMetricAudit(h)), None, None]) =>
+            record.kind() == kind && !matches!(kind, RecordKind::QuoteIntent | RecordKind::CancelIntent)
+                && record.client_order().is_none_or(|key| key.account() == scope.handle())
+                && h.kind() == PmHealthMetricKind::PersistenceAcknowledged && h.value() == fact_sequence,
+        _ => false,
+    }
+}
+
+#[rustfmt::skip]
+#[derive(Debug, Clone, Copy)]
+struct AckPolicy { primary: Option<&'static str>, service: bool, durable: bool, prepared: bool, identity: bool, queue: bool }
+
+#[rustfmt::skip]
+fn ack_class(policy: AckPolicy) -> Option<&'static str> {
+    policy.primary
+        .or((!policy.service).then_some("owner_service_identity_mismatch"))
+        .or((!policy.durable).then_some("durable_acknowledgement_mismatch"))
+        .or((!policy.prepared || !policy.identity).then_some("prepared_effect_identity_mismatch"))
+        .or((!policy.queue).then_some("fake_queue_identity_mismatch"))
+}
+
+#[rustfmt::skip]
+fn fake_faults(m: PmFakeEffectMetrics) -> [u64; 11] {
+    [m.released_before_journal(), m.retained_after_durable_failure(), m.invalidated_after_durability(), m.retained_after_commit_failure(),
+     m.retained_after_age(), m.retained_after_suppression(), m.retained_after_revision_change(), m.aged_safety_services(),
+     m.saturations(), m.age_faults(), m.clock_regressions()]
+}
+
+#[rustfmt::skip]
+fn fake_ack_matches(expected: ExpectedAck, before: PmFakeEffectMetrics, after: PmFakeEffectMetrics) -> bool {
+    match expected {
+        ExpectedAck::Quote | ExpectedAck::Cancel { .. } =>
+            [before.depth(), before.queued(), before.blocked(), before.retained()] == [1, 0, 0, 1]
+                && [after.depth(), after.queued(), after.blocked(), after.retained()] == [1, 1, 0, 0]
+                && after.committed_after_durability().checked_sub(before.committed_after_durability()) == Some(1)
+                && after.serviced() == before.serviced() && fake_faults(after) == fake_faults(before),
+        ExpectedAck::Fact { .. } => before.depth() == 0 && before == after,
+    }
+}
+
+#[rustfmt::skip]
+#[allow(clippy::too_many_arguments, reason = "the failure retains every immutable diagnostic cut")]
+fn ack_error(cycle: u64, durability: DurabilityMode, expected: ExpectedAck, class: &'static str, delta: AckDelta, before: CounterCut, after: CounterCut, effects: AckEffects, detail: impl std::fmt::Display) -> PmEvidenceError {
+    PmEvidenceError::invariant(format!("acknowledgement boundary failed: cycle={cycle} durability={durability:?} expected={expected:?} primary_failure_class={class} delta_order=[admitted,acknowledged,persistence_durability,persistence_closed,persistence_age,prepared_quote,prepared_cancel,mutation_durable,mutation_preparation,coordinator_inputs,durable_record_effects] delta={delta:?} before={before:?} after={after:?} effects={effects:?} detail={detail}"))
+}
+
+#[rustfmt::skip]
+#[derive(Debug, Clone, Copy)]
+struct CounterCut { mutation: PmMutationCounters, coordinator: PmCoordinatorCounters,
+    refresh: PmRefreshObligationMetrics, persistence: PmPersistenceMetrics, fake: PmFakeEffectMetrics,
+    output_saturations: u64, internal_fact_acks: u64 }
+
+#[rustfmt::skip]
 impl CounterCut {
     fn capture(owner: &PmCoordinator<Phase6Model>, internal_fact_acks: u64) -> Self {
         Self {
-            mutation: owner.mutation_counters(),
-            coordinator: owner.counters(),
-            refresh: owner.refresh_obligation_metrics(),
-            persistence_saturations: owner.persistence_metrics().saturations(),
-            fake_saturations: owner.fake_effect_metrics().saturations(),
+            mutation: owner.mutation_counters(), coordinator: owner.counters(),
+            refresh: owner.refresh_obligation_metrics(), persistence: owner.persistence_metrics(),
+            fake: owner.fake_effect_metrics(),
             output_saturations: owner.product_effect_metrics().rejected_full(),
             internal_fact_acks,
         }
@@ -1200,12 +1300,14 @@ fn nominal_delta(
         ),
         queue_saturations: delta(
             after
-                .persistence_saturations
-                .saturating_add(after.fake_saturations)
+                .persistence
+                .saturations()
+                .saturating_add(after.fake.saturations())
                 .saturating_add(after.output_saturations),
             before
-                .persistence_saturations
-                .saturating_add(before.fake_saturations)
+                .persistence
+                .saturations()
+                .saturating_add(before.fake.saturations())
                 .saturating_add(before.output_saturations),
         ),
         state_bearing_drops: 0,
@@ -1277,47 +1379,28 @@ fn journal_delta(
     }
 }
 
+#[rustfmt::skip]
 fn validate_sealed_header(projection: PmSealedJournalProjection) -> Result<(), PmEvidenceError> {
-    let expected = PmSealedJournalRecordCounts {
-        headers: 1,
-        ..PmSealedJournalRecordCounts::default()
-    };
-    if projection.record_count() != 1
-        || projection.last_sequence() != 0
-        || projection.records_by_kind() != expected
-        || projection.segment_record_count() != 1
-        || projection.segment_records_by_kind() != expected
-        || !projection.segment_valid()
+    let expected = PmSealedJournalRecordCounts { headers: 1, ..PmSealedJournalRecordCounts::default() };
+    if projection.record_count() != 1 || projection.last_sequence() != 0
+        || projection.records_by_kind() != expected || projection.segment_record_count() != 1
+        || projection.segment_records_by_kind() != expected || !projection.segment_valid()
     {
-        return Err(PmEvidenceError::invariant(format!(
-            "sealed journal did not start from one real sequence-0 header: {projection:?}"
-        )));
+        return Err(PmEvidenceError::invariant(format!("sealed journal did not start from one real sequence-0 header: {projection:?}")));
     }
     Ok(())
 }
 
-fn hash_book_projection(
-    projection: &mut Sha256,
-    book: PmBookDecisionProjection,
-) -> Result<(), PmEvidenceError> {
+#[rustfmt::skip]
+fn hash_book_projection(projection: &mut Sha256, book: PmBookDecisionProjection) -> Result<(), PmEvidenceError> {
     let top = book
         .top()
         .ok_or_else(|| PmEvidenceError::invariant("owner PM book projection omitted its top"))?;
     projection.update(b"pm");
-    projection.update(
-        top.bid()
-            .ok_or_else(|| PmEvidenceError::invariant("owner PM top omitted bid"))?
-            .price()
-            .units()
-            .to_be_bytes(),
-    );
-    projection.update(
-        top.ask()
-            .ok_or_else(|| PmEvidenceError::invariant("owner PM top omitted ask"))?
-            .price()
-            .units()
-            .to_be_bytes(),
-    );
+    let bid = top.bid().ok_or_else(|| PmEvidenceError::invariant("owner PM top omitted bid"))?;
+    let ask = top.ask().ok_or_else(|| PmEvidenceError::invariant("owner PM top omitted ask"))?;
+    projection.update(bid.price().units().to_be_bytes());
+    projection.update(ask.price().units().to_be_bytes());
     Ok(())
 }
 
@@ -1348,17 +1431,11 @@ fn with_paused<T>(
     }
 }
 
-fn ordering(
-    snapshot_revision: Option<u64>,
-    ingress: u64,
-    hash: Option<VenueEventHash>,
-) -> Result<EventOrdering, PmEvidenceError> {
+#[rustfmt::skip]
+fn ordering(snapshot_revision: Option<u64>, ingress: u64, hash: Option<VenueEventHash>) -> Result<EventOrdering, PmEvidenceError> {
     EventOrdering::new(
-        ConnectionEpoch::new(1),
-        snapshot_revision.map(SnapshotRevision::new),
-        None,
-        hash,
-        IngressSequence::new(ingress),
+        ConnectionEpoch::new(1), snapshot_revision.map(SnapshotRevision::new),
+        None, hash, IngressSequence::new(ingress),
     )
     .map_err(invariant)
 }
@@ -1377,8 +1454,8 @@ const fn wall(monotonic_ns: u64) -> u64 {
     WALL_BASE.saturating_add(monotonic_ns)
 }
 
-fn elapsed_ns(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+fn elapsed_between(started: Instant, completed: Instant) -> u64 {
+    u64::try_from(completed.duration_since(started).as_nanos()).unwrap_or(u64::MAX)
 }
 
 fn invariant(error: impl std::fmt::Display) -> PmEvidenceError {
@@ -1387,4 +1464,24 @@ fn invariant(error: impl std::fmt::Display) -> PmEvidenceError {
 
 const fn delta(after: u64, before: u64) -> u64 {
     after.saturating_sub(before)
+}
+
+#[cfg(test)]
+#[rustfmt::skip]
+mod tests {
+    use super::*;
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_writer_acknowledgement_is_bound_to_expected_prepared_effect() {
+        let directory = tempfile::tempdir().unwrap(); let mut run = EvidenceRun::start_real(directory.path().join("ack.jsonl")).await.unwrap();
+        run.run_pass(2, DurabilityMode::RealWriter, None, None).await.unwrap();
+        let nominal = AckPolicy { primary: None, service: true, durable: true, prepared: true, identity: true, queue: true };
+        assert_eq!(ack_class(nominal), None);
+        assert_eq!(ack_class(AckPolicy { prepared: false, ..nominal }), Some("prepared_effect_identity_mismatch"));
+        assert_eq!(ack_class(AckPolicy { identity: false, ..nominal }), Some("prepared_effect_identity_mismatch"));
+        assert_eq!(ack_class(AckPolicy { primary: Some("persistence_durability_failure"), identity: false, ..nominal }), Some("persistence_durability_failure"));
+        let cut = CounterCut::capture(&run.owner, run.cursor.internal_fact_acks); let error = ack_error(73, DurabilityMode::RealWriter, ExpectedAck::Quote, "prepared_effect_identity_mismatch",
+            AckDelta(Some([0; 11])), cut, cut, AckEffects::default(), "injected classifier seam").to_string();
+        assert!(error.contains("cycle=73") && error.contains("expected=Quote") && error.contains("delta_order=") && error.contains("primary_failure_class=prepared_effect_identity_mismatch"));
+        run.owner.shutdown_evidence().await.unwrap();
+    }
 }

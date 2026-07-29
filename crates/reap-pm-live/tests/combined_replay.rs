@@ -1,11 +1,12 @@
 mod support;
 
+use std::cell::Cell;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
 use futures_util::{SinkExt, StreamExt};
 use reap_benchmark_allocator::TrackingAllocator;
-use reap_capture_framing::sha256_hex;
+use reap_capture_framing::{JsonlWriterError, sha256_hex};
 use reap_okx_public_source::OkxPublicSessionFault;
 use reap_pm_core::ConnectionEpoch;
 use reap_pm_live::{
@@ -35,6 +36,35 @@ static ALLOCATOR: TrackingAllocator = TrackingAllocator;
 const PHASE6_RECOVERY_CHILD: &str = "REAP_PHASE6_RECOVERY_EVIDENCE_CHILD";
 const PHASE6_RECOVERY_TEST: &str =
     "phase6_real_mutation_artifacts_recover_to_the_same_bounded_projection";
+
+#[allow(
+    clippy::result_large_err,
+    reason = "the helper must preserve the complete typed terminal error"
+)]
+fn assert_capture_writer_terminal_finish<T>(
+    finish: Result<T, PmPublicCaptureRunError>,
+) -> Result<(), PmPublicCaptureRunError> {
+    match finish {
+        Err(PmPublicCaptureRunError::TerminalFinish {
+            cause: PmPublicCaptureTerminalCause::CaptureWriter,
+            shutdown_error: None,
+        }) => Ok(()),
+        Err(error) => Err(error),
+        Ok(_) => panic!("capture-writer terminal run unexpectedly produced a normal outcome"),
+    }
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "the helper must preserve the complete typed terminal error"
+)]
+fn verify_after_capture_writer_terminal_finish<T, V>(
+    finish: Result<T, PmPublicCaptureRunError>,
+    verify: impl FnOnce() -> V,
+) -> Result<V, PmPublicCaptureRunError> {
+    assert_capture_writer_terminal_finish(finish)?;
+    Ok(verify())
+}
 
 #[test]
 fn phase6_real_mutation_artifacts_recover_to_the_same_bounded_projection() {
@@ -428,10 +458,8 @@ async fn raw_frame_and_raw_count_bounds_are_exact() {
         ),
         "unexpected oversize-frame error: {error:?}"
     );
-    assert!(matches!(
-        oversize.finish().await,
-        Err(PmPublicCaptureRunError::TerminalFinish { .. })
-    ));
+    assert_capture_writer_terminal_finish(oversize.finish().await)
+        .expect("oversize rejection finishes with a clean capture-writer terminal");
 
     let count_path = directory.path().join("raw-count.jsonl");
     let mut count_run = start_capture_run(count_path.clone()).await;
@@ -455,11 +483,11 @@ async fn raw_frame_and_raw_count_bounds_are_exact() {
             ..
         }
     ));
-    assert!(matches!(
-        count_run.finish().await,
-        Err(PmPublicCaptureRunError::TerminalFinish { .. })
-    ));
-    let verified = verify_pm_public_capture(&count_path, &capture_header()).unwrap();
+    let verified = verify_after_capture_writer_terminal_finish(count_run.finish().await, || {
+        verify_pm_public_capture(&count_path, &capture_header())
+    })
+    .expect("raw-count rejection finishes with a clean capture-writer terminal")
+    .unwrap();
     assert_eq!(verified.raw_public_frames, 8_192);
 
     let record_path = directory.path().join("record-count.jsonl");
@@ -493,11 +521,11 @@ async fn raw_frame_and_raw_count_bounds_are_exact() {
             PmCaptureVerifyError::TooManyRecords
         ))
     ));
-    assert!(matches!(
-        record_run.finish().await,
-        Err(PmPublicCaptureRunError::TerminalFinish { .. })
-    ));
-    let verified = verify_pm_public_capture(&record_path, &capture_header()).unwrap();
+    let verified = verify_after_capture_writer_terminal_finish(record_run.finish().await, || {
+        verify_pm_public_capture(&record_path, &capture_header())
+    })
+    .expect("record-count rejection finishes with a clean capture-writer terminal")
+    .unwrap();
     assert_eq!(verified.raw_public_frames, 8_192);
     assert_eq!(verified.freshness_timers, 8_189);
     assert_eq!(verified.records, MAX_PM_PUBLIC_CAPTURE_RECORDS);
@@ -524,14 +552,55 @@ async fn raw_frame_and_raw_count_bounds_are_exact() {
             ..
         }
     ));
-    assert!(matches!(
-        aggregate.finish().await,
-        Err(PmPublicCaptureRunError::TerminalFinish { .. })
-    ));
-    let verified = verify_pm_public_capture(&aggregate_path, &capture_header()).unwrap();
+    let verified = verify_after_capture_writer_terminal_finish(aggregate.finish().await, || {
+        verify_pm_public_capture(&aggregate_path, &capture_header())
+    })
+    .expect("raw-aggregate rejection finishes with a clean capture-writer terminal")
+    .unwrap();
     assert_eq!(
         verified.raw_payload_bytes,
         MAX_PM_PUBLIC_CAPTURE_RAW_PAYLOAD_BYTES
+    );
+}
+
+#[test]
+fn terminal_capture_finish_preserves_primary_shutdown_error_before_prefix_verification() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("secondary-invalid-records.jsonl");
+    std::fs::write(&path, b"{}\n").unwrap();
+    assert!(matches!(
+        verify_pm_public_capture(&path, &capture_header()),
+        Err(PmCaptureVerifyError::InvalidRecords)
+    ));
+
+    let finish = Err::<(), _>(PmPublicCaptureRunError::TerminalFinish {
+        cause: PmPublicCaptureTerminalCause::CaptureWriter,
+        shutdown_error: Some(
+            JsonlWriterError::Io(std::io::Error::other("goal-g-r injected durability fault"))
+                .into(),
+        ),
+    });
+    let verification_called = Cell::new(false);
+    let error = verify_after_capture_writer_terminal_finish(finish, || {
+        verification_called.set(true);
+        verify_pm_public_capture(&path, &capture_header())
+    })
+    .expect_err("the primary shutdown error must precede secondary verification");
+
+    assert!(!verification_called.get());
+    assert!(matches!(
+        &error,
+        PmPublicCaptureRunError::TerminalFinish {
+            cause: PmPublicCaptureTerminalCause::CaptureWriter,
+            shutdown_error: Some(_),
+        }
+    ));
+    assert_eq!(
+        error
+            .terminal_shutdown_error()
+            .expect("typed shutdown error is retained")
+            .to_string(),
+        "writer IO failed: goal-g-r injected durability fault"
     );
 }
 
