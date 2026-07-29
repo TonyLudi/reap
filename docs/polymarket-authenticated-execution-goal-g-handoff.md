@@ -1,9 +1,10 @@
 # Polymarket Authenticated Execution Goal G Handoff
 
 Status: **stopped at the amended Phase 0 replay gate under user-authorized
-Amendments 1 and 2**. The clean current-HEAD replay selected immutable attempt
-1 as valid evidence with `gate_pass=false`: 11 of 13 tests passed and two
-existing Goal F semantic/non-timing tests failed. The amended contract forbids
+Amendments 1 and 2; Amendment 3 is authorized but inactive pending Goal G-R
+Amendment 6**. The clean current-HEAD replay selected immutable attempt 1 as
+valid evidence with `gate_pass=false`: 11 of 13 tests passed and two existing
+Goal F semantic/non-timing tests failed. The amended contract forbids
 discarding or retrying that valid red result, so Phase 0 is not green and no
 Phase 1 implementation began. The source byte re-attestation and all 16
 baseline benchmark invocations were green before the replay stop.
@@ -895,3 +896,71 @@ a new evidence root, and the Phase 1 storage gate are the current next
 actions. Neither amendment claims that Phase 0, an implementation phase,
 production origin, account qualification, or trading authorization is
 complete.
+
+## User-Authorized Amendment 3 — 2026-07-29
+
+The user authorized the conditional return contract in
+`docs/polymarket-authenticated-execution-goal-g-amendment-3.md` together with
+its exact pre-activation runner/command contract at
+`docs/polymarket-authenticated-execution-goal-g-amendment-3-runner-contract.md`,
+Goal G-R Amendment 6 and the combined runnable prompt
+`docs/polymarket-authenticated-execution-goal-g-resume-prompt.md`.
+
+Amendment 3 is not active at authorization. It may activate only after Goal
+G-R Amendment 6 commits a sealed green defect-class campaign while retaining
+the original historical-causality stop and every old evidence hash.
+
+The amendment:
+
+1. preserves `target/tmp/goal-g-phase0-amended` byte-for-byte as immutable red
+   evidence;
+2. adopts only the exact two-file Amendment 5 repair without a historical
+   equivalence claim;
+3. supersedes the stale pre-repair PM workload cutoff and requires a fresh
+   current-revision baseline;
+4. authorizes a separate pre-activation recorder bundle and a distinct
+   post-activation append-only evidence root;
+5. requires the repeated defect-class confidence campaign, source/inventory
+   re-attestation, a complete new 16-invocation baseline, and one fresh Goal G
+   replay;
+6. permits the original Goal G Phases 1-7 only after a separate green Phase 0
+   gate commit; and
+7. preserves every original product, capability, security, no-production,
+   and completion boundary.
+
+```text
+goal_g_amendment_3_status=authorized-inactive
+goal_g_amendment_3_schema=goal-g-amendment-3-v1
+goal_g_amendment_3_repair_tip=77ad6f30f79eb0b6d99881da97ec94e550364d1a
+goal_g_amendment_3_repair_tree=9273cead973ecdd687ae11fa51d666f638e4a426
+goal_g_amendment_3_authorization_parent=77ad6f30f79eb0b6d99881da97ec94e550364d1a
+goal_g_amendment_3_authorization_subject=docs: authorize goal g-r closure and conditional goal g return
+goal_g_amendment_3_contract_path=docs/polymarket-authenticated-execution-goal-g-amendment-3.md
+goal_g_amendment_3_contract_sha256=7a1303d54c3210568c2e631bf3a2c6f0ab738f62f16cc40f9be9a4d84da4fa1c
+goal_g_amendment_3_runner_contract_path=docs/polymarket-authenticated-execution-goal-g-amendment-3-runner-contract.md
+goal_g_amendment_3_runner_contract_sha256=fbc09553c2418a61f04066754842db1d60464dbdd42e12d9cf809e3e6ae48165
+goal_g_amendment_3_resume_prompt=docs/polymarket-authenticated-execution-goal-g-resume-prompt.md
+goal_g_amendment_3_resume_prompt_sha256=e7a3a49b27fcaf0b46c94d3329fb09ada54acc23073d401cb0b08443461d9c44
+goal_g_amendment_3_boundary_sha256=0e20d022f80c09eae223c5ef950b90f2ed3b903c6e7aeaefcb3f8e8d7cb81512
+goal_g_amendment_3_authorization_path_count=8
+goal_g_amendment_3_activation_tracked_allowlist=docs/polymarket-authenticated-execution-goal-g-handoff.md
+goal_g_amendment_3_phase0_gate_tracked_allowlist=docs/polymarket-authenticated-execution-goal-g-handoff.md
+goal_g_amendment_3_activation_subject=docs: activate goal g amendment 3
+goal_g_amendment_3_phase0_gate_subject=docs: qualify goal g amendment 3 phase 0
+goal_g_amendment_3_bundle_root=target/tmp/goal-g-amendment-3-recorder-bundle
+goal_g_amendment_3_evidence_root=target/tmp/goal-g-phase0-amendment-3
+goal_g_amendment_3_runtime_root=target/tmp/goal-g-amendment-3-runtime
+goal_g_amendment_3_old_evidence_modified=false
+goal_g_amendment_3_old_attempt_relabelled=false
+goal_g_amendment_3_new_pm_baseline_required=true
+goal_g_amendment_3_full_sixteen_invocation_baseline_required=true
+goal_g_amendment_3_phase1_authorized_before_green_phase0=false
+goal_g_amendment_3_goal_g_r_historical_equivalence_claimed=false
+goal_g_amendment_3_goal_g_resumed=false
+goal_g_amendment_3_production_order_entry_authorized=false
+goal_g_amendment_3_real_credentials_loaded=false
+goal_g_amendment_3_authenticated_external_request_sent=false
+goal_g_amendment_3_real_polygon_rpc_request_sent=false
+goal_g_amendment_3_real_order_submitted=false
+goal_g_amendment_3_push_authorized=false
+```

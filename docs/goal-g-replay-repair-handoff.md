@@ -1029,3 +1029,49 @@ goal_g_r_amendment_5_real_credentials_loaded=false
 goal_g_r_amendment_5_external_request_authorized=false
 goal_g_r_amendment_5_push_authorized=false
 ```
+
+## Amendment 6 Authorization
+
+The user authorized a validation-and-closure overlay on `2026-07-29` after
+the Amendment 5 two-file repair and its fixed one-pass matrix completed
+successfully. The interactive results were not retained as a sealed
+repository-owned campaign, so this authorization does not mark Amendment 5,
+Goal G-R, or Goal G complete.
+
+The controlling contract is
+`docs/goal-g-replay-repair-amendment-6.md`. It preserves the original
+historical-causality contract as stopped and may close only the prospective
+defect-class repair. It must never invoke or reinterpret v5 or the original
+Goal G Phase 0 helper.
+
+```text
+goal_g_r_amendment_6_status=authorized
+goal_g_r_amendment_6_schema=goal-g-r-amendment-6-v1
+goal_g_r_amendment_6_repair_tip=77ad6f30f79eb0b6d99881da97ec94e550364d1a
+goal_g_r_amendment_6_repair_tree=9273cead973ecdd687ae11fa51d666f638e4a426
+goal_g_r_amendment_6_repair_subject=test(pm): anchor capture regression tempdir
+goal_g_r_amendment_6_authorization_parent=77ad6f30f79eb0b6d99881da97ec94e550364d1a
+goal_g_r_amendment_6_authorization_subject=docs: authorize goal g-r closure and conditional goal g return
+goal_g_r_amendment_6_contract_path=docs/goal-g-replay-repair-amendment-6.md
+goal_g_r_amendment_6_contract_sha256=167a0b58d53d1c0463c727a458f87d29de16126dafb5b9a96e83be319739d19e
+goal_g_r_amendment_6_authorization_path_count=8
+goal_g_r_amendment_6_authorization_paths=docs/goal-g-replay-repair-amendment-6.md,docs/goal-g-replay-repair-handoff.md,docs/polymarket-authenticated-execution-boundary.md,docs/polymarket-authenticated-execution-goal-g-amendment-3.md,docs/polymarket-authenticated-execution-goal-g-amendment-3-runner-contract.md,docs/polymarket-authenticated-execution-goal-g-handoff.md,docs/polymarket-authenticated-execution-goal-g-prompt.md,docs/polymarket-authenticated-execution-goal-g-resume-prompt.md
+goal_g_r_amendment_6_cargo_lock_sha256=2673d055c943c3bd5444531b67df280026c145cbbbc99b68a06f4ac0c2dbb0ff
+goal_g_r_amendment_6_prior_g_r_regular_files=70
+goal_g_r_amendment_6_prior_g_r_entries=85
+goal_g_r_amendment_6_prior_g_r_file_stream_sha256=54d59957045444e32488a9dda0619440e983b5be779e3004045aac3e68662246
+goal_g_r_amendment_6_prior_g_r_inventory_sha256=32c47a75092a8a0598f0205e53f495023e80ee6d7279d406059c685401d83171
+goal_g_r_amendment_6_evidence_root=target/tmp/goal-g-r-amendment-6
+goal_g_r_amendment_6_runtime_root=target/tmp/goal-g-replay-repair-runtime
+goal_g_r_amendment_6_validation_scope=fixed-ten-command-defect-class-campaign
+goal_g_r_amendment_6_source_edit_authorized=false
+goal_g_r_amendment_6_v5_invocation_authorized=false
+goal_g_r_amendment_6_goal_g_phase0_helper_invocation_authorized=false
+goal_g_r_amendment_6_historical_equivalence_claimed=false
+goal_g_r_amendment_6_goal_g_resumed=false
+goal_g_r_amendment_6_goal_g_return_requires_amendment_3=true
+goal_g_r_amendment_6_production_order_entry_authorized=false
+goal_g_r_amendment_6_real_credentials_loaded=false
+goal_g_r_amendment_6_external_request_authorized=false
+goal_g_r_amendment_6_push_authorized=false
+```

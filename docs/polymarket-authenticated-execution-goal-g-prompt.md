@@ -1,20 +1,23 @@
 # Polymarket Authenticated Execution Goal G Execution Prompt
 
-Status: **amended and runnable under Amendments 1 and 2**. Goal F is complete. Goal E remains deferred
-because no target host or target-host acceptance contract is declared. Goal G
-may run before Goal E and does not complete or requalify it. The original
-Phase 0 stop and its evidence remain in the
-[Goal G handoff](polymarket-authenticated-execution-goal-g-handoff.md), but
-the three stopped contracts are superseded by Amendment 1 below. Amendment 2
-incorporates the fresh restarted-Phase-0 source audit without broadening the
-product.
+Authorization snapshot (`2026-07-29`): **stopped under Amendments 1 and 2;
+Amendment 3 authorized but inactive pending Goal G-R Amendment 6**. Runtime
+status is recorded only in the Goal G handoff, which `G3` and `P0` may update.
+Goal F is complete. Goal E remains deferred because no target host or
+target-host acceptance contract is declared. Goal G may run before Goal E
+and does not complete or requalify it. The original Phase 0 stop and its
+evidence remain in the
+[Goal G handoff](polymarket-authenticated-execution-goal-g-handoff.md).
+Amendment 3 conditionally authorizes a fresh evidence root, current-revision
+baseline, and replay without altering that history.
 
-Use this document as the complete instruction set. The exact invocation is:
+For the currently stopped state, use the complete return-sequence prompt. The
+exact invocation is:
 
-> /goal Execute Goal G exactly as specified in
-> `docs/polymarket-authenticated-execution-goal-g-prompt.md`. Continue phase by
-> phase through every green gate and stop only at completion or a documented
-> stop condition.
+> /goal Execute the Goal G return sequence exactly as specified in
+> `docs/polymarket-authenticated-execution-goal-g-resume-prompt.md`. First
+> validate Goal G-R Amendment 6; only if it is green, activate Goal G
+> Amendment 3 and continue through every original Goal G phase and gate.
 
 ## Amendment 1 — 2026-07-27
 
@@ -104,6 +107,39 @@ that proves this live-only state cannot enter the fake family. Skipped
 settlement observations may be covered only by a complete authoritative
 reconciliation cut; an ordinary event cannot silently jump, regress, or
 collapse lifecycle states.
+
+## Amendment 3 — 2026-07-29
+
+This user-authorized amendment is defined completely in
+[polymarket-authenticated-execution-goal-g-amendment-3.md](polymarket-authenticated-execution-goal-g-amendment-3.md)
+and its exact
+[runner/command contract](polymarket-authenticated-execution-goal-g-amendment-3-runner-contract.md).
+It is inactive until Goal G-R Amendment 6 validates the prospective
+two-defect-class repair and commits its completion record.
+
+When activated, Amendment 3:
+
+1. leaves the original selected Phase 0 attempt permanently red and
+   byte-identical;
+2. adopts only the exact Amendment 5 changes to `workload.rs` and
+   `combined_replay.rs`, without claiming either injected regression is the
+   historical primary failure;
+3. seals a separate no-Cargo-reviewed recorder bundle before activation, then
+   creates a new append-only Phase 0 root only after activation;
+4. re-attests sources/inventories and runs a fixed repeated confidence
+   campaign;
+5. replaces the stale pre-repair PM comparator with a complete fresh
+   16-invocation current-revision baseline;
+6. runs one fresh immutable Goal G replay; and
+7. resumes Phases 1-7 only after a separate green Phase 0 gate commit.
+
+All product, protocol, capability, secret, transport, recovery, security,
+performance, exclusion, and no-production boundaries below remain
+unchanged. The current `workload.rs` is 1,494 lines and may not grow; any later
+required change must begin with a separately gated mechanical responsibility
+split that leaves it below 1,400 lines, keeps new production files at or
+below 1,000 lines and functions within the original 200/250-line limits, and
+preserves the exact workload and timed boundary.
 
 ## Objective
 

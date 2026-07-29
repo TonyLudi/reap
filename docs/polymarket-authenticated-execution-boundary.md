@@ -1,7 +1,8 @@
 # Polymarket Authenticated Execution Boundary
 
-Status: **amended runnable implementation contract for Goal G under
-Amendments 1 and 2**. The original
+Status: **amended implementation contract for Goal G under Amendments 1-3;
+Amendment 3 is authorized but inactive until Goal G-R Amendment 6
+completes**. The original
 Phase 0 stop remains historical evidence in the
 [Goal G handoff](polymarket-authenticated-execution-goal-g-handoff.md).
 Amendment 1 resolves it without weakening the typed core: CLOB numeric
@@ -14,6 +15,22 @@ route-specific union discovered by the restarted Phase 0 audit, including the
 REST-only `MatchedNotBroadcast` settlement state, one canonical lane per
 requirement ID, explicit no-retry HTTP construction, and the exact dependency
 and protocol-vector plan.
+
+## Amendment 3 Phase 0 Supersession — 2026-07-29
+
+The old runnable Phase 0 helper/root instructions later in this file are
+historical-only and must not be invoked. After Goal G-R Amendment 6 closes
+prospectively, the exact activation, separate recorder bundle, fresh evidence
+and runtime roots, source successor, current baseline, and one fresh replay
+are controlled by:
+
+- [Goal G Amendment 3](polymarket-authenticated-execution-goal-g-amendment-3.md);
+- its [runner and command contract](polymarket-authenticated-execution-goal-g-amendment-3-runner-contract.md);
+- and the [return-sequence prompt](polymarket-authenticated-execution-goal-g-resume-prompt.md).
+
+The historical `target/tmp/goal-g-phase0-amended` root remains immutable and
+red. This supersession changes no product, authentication, secret, Polygon,
+order-entry, deployment, capability, or connectivity boundary below.
 
 This document is subordinate to the
 [Goal G execution prompt](polymarket-authenticated-execution-goal-g-prompt.md),
