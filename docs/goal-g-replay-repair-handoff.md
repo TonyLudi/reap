@@ -1075,3 +1075,156 @@ goal_g_r_amendment_6_real_credentials_loaded=false
 goal_g_r_amendment_6_external_request_authorized=false
 goal_g_r_amendment_6_push_authorized=false
 ```
+
+## Amendment 6 Completion
+
+The fixed Amendment 6 defect-class campaign completed successfully on
+`2026-07-29`. This closes only the prospective two-file repair. The original
+historical-causality contract remains stopped because the historical
+persistence transition and capture shutdown variant were not retained.
+Historical equivalence is not claimed, the old Goal G evidence is unchanged,
+and Goal G has not resumed.
+
+The committed authorization candidate and its direct parent are:
+
+```text
+authorization_candidate=5aaa6c622f0880d6f5ff473f1674cb1f7418cf1f
+authorization_candidate_tree=e5a19042befae9dae3647bff455cb54e3bb71e48
+authorization_candidate_parent=77ad6f30f79eb0b6d99881da97ec94e550364d1a
+authorization_candidate_subject=docs: authorize goal g-r closure and conditional goal g return
+repair_tip=77ad6f30f79eb0b6d99881da97ec94e550364d1a
+repair_tree=9273cead973ecdd687ae11fa51d666f638e4a426
+repair_subject=test(pm): anchor capture regression tempdir
+amendment_6_contract_sha256=167a0b58d53d1c0463c727a458f87d29de16126dafb5b9a96e83be319739d19e
+```
+
+The exact authorization delta from the repair tip to the candidate remained:
+
+```text
+A	docs/goal-g-replay-repair-amendment-6.md
+M	docs/goal-g-replay-repair-handoff.md
+M	docs/polymarket-authenticated-execution-boundary.md
+A	docs/polymarket-authenticated-execution-goal-g-amendment-3-runner-contract.md
+A	docs/polymarket-authenticated-execution-goal-g-amendment-3.md
+M	docs/polymarket-authenticated-execution-goal-g-handoff.md
+M	docs/polymarket-authenticated-execution-goal-g-prompt.md
+A	docs/polymarket-authenticated-execution-goal-g-resume-prompt.md
+```
+
+The sealed recorder is
+`target/tmp/goal-g-r-amendment-6/5aaa6c622f0880d6f5ff473f1674cb1f7418cf1f/recorder`.
+Its final bindings are:
+
+```text
+run_validation_sha256=969d2f325fc1b4666c33f91e6f68d2a34cd9a0a31c6d04212597d92d73b933d3
+validators_sha256=c0b8b9937163800cd7f06aacc8ab7bdf7cf4d0437189365e712b20b8578a0e69
+commands_sha256=3a9433d794aa60973fd17244c6874f0ff7bb871a3e0dff0cb004bd983ad64148
+candidate_meta_sha256=6a589b2f6e545f9edbbcd3b811f2776a99b3615078fbe7e764c88c16e621a40e
+self_test_version=19
+self_test_case_count=121
+self_test_result=passed
+self_test_sha256=ab33cd1867f4399128867f5435501313250daa97ed2dca843b6fe97b14f53d17
+self_test_results_sha256=9c0ec42e42e730f214f9e94625a4a7d858e2eb906141cc886a16ce545169577c
+self_test_meta_sha256=762ba019ad0b3fc16b80e5505934a56b0acc6eb73159ed729fc81a7c2a26331c
+self_test_cargo_rustc_processes=0
+self_test_validation_attempt_directories=0
+```
+
+The two independent reviews bound those exact bytes and passed every
+checklist:
+
+| Review | Reviewer | Session | Result | Review file SHA-256 |
+| --- | --- | --- | --- | --- |
+| 1 | `codex-static-reviewer-1` | `runner-validator-review-v19` | pass | `2c3a8ad1a9fd3d3cb68420a0c25c8ddd4c73838b40d4d851693096e90cfe6105` |
+| 2 | `codex-bash-lifecycle-reviewer-v19` | `runner-validator-review-bash-lifecycle-v19` | pass | `80eb89ed0e64162a795fb07ed06ffd4fe0ec1826efd588e306b70b3ce8071853` |
+
+The closed map then ran exactly once in ordinal order. Every child exited
+zero, every semantic validator returned `passed`, every attempt recorded
+`evidence_valid=true` and `gate_pass=true`, and every listed value is the
+SHA-256 of that attempt's `attempt.sha256`:
+
+| Ordinal | Attempt path | Exact command | Exit | Validator | Attempt hash |
+| ---: | --- | --- | ---: | --- | --- |
+| 01 | `01-fmt-check` | `cargo fmt --all -- --check` | 0 | `passed` | `083e005eb3fc73c16b1630a3facab3f9eab39defedd719a8ba3369f4d8f5084c` |
+| 02 | `02-ack-regression-exact` | `cargo test --locked -p reap-pm-live --lib evidence::workload::tests::real_writer_acknowledgement_is_bound_to_expected_prepared_effect -- --exact --test-threads=1 --nocapture` | 0 | `passed` | `85ea8ea476b6cba9526b75fe003d7c353ad460eb4c80d89b25f75d8cd42632e3` |
+| 03 | `03-capture-regression-exact` | `cargo test --locked -p reap-pm-live --test combined_replay terminal_capture_finish_preserves_primary_shutdown_error_before_prefix_verification -- --exact --test-threads=1 --nocapture` | 0 | `passed` | `f6832fe929dc8c6c6713633f2abcd06870d2f35f96aa80871dbb9ada005ec943` |
+| 04 | `04-mutation-original-exact` | `cargo test --locked -p reap-pm-live --test combined_replay phase6_real_mutation_artifacts_recover_to_the_same_bounded_projection -- --exact --test-threads=1 --nocapture` | 0 | `passed` | `0d219d65a6a40dbeb216180a681fb1c7d74c1afa1833d2fd34adca9a7c1ca19d` |
+| 05 | `05-capture-original-exact` | `cargo test --locked -p reap-pm-live --test combined_replay raw_frame_and_raw_count_bounds_are_exact -- --exact --test-threads=1 --nocapture` | 0 | `passed` | `142b3f082157182efe02cd722dd04309902c41eb3acd7517500dd5c32e6857c2` |
+| 06 | `06-combined-default` | `cargo test --locked -p reap-pm-live --test combined_replay -- --nocapture` | 0 | `passed` | `66449827285de52ec9c7a55ef060e3ccac18582cda29e33ebc3e60238a10c9c8` |
+| 07 | `07-pm-live-lib` | `cargo test --locked -p reap-pm-live --lib` | 0 | `passed` | `d90d8a809a7ebb6d848f5f14cb70cefb6be2246187646b88103949d931d75443` |
+| 08 | `08-pm-live-all-targets` | `cargo test --locked -p reap-pm-live --all-targets` | 0 | `passed` | `865bb2738ce24f08b3544d7bef11d550288ba3ac285915021f3e2e7bb6c28c02` |
+| 09 | `09-pm-live-clippy` | `cargo clippy --locked -p reap-pm-live --all-targets -- -D warnings` | 0 | `passed` | `8a25f027d8e07df7527ad24b3a5d8e737434fa2c2cbbc67988370d696da03d34` |
+| 10 | `10-compile-fail-boundaries` | `cargo test --locked -p reap-pm-live --test compile_fail_boundaries -- --test-threads=1` | 0 | `passed` | `88e38c4c0098820acfe9dcc9ad34e844234161e9bd36873676d0300ea35ed89d` |
+
+The campaign ran from `2026-07-29T12:29:02Z` through
+`2026-07-29T13:00:38Z`. Its final files and semantic reports are:
+
+```text
+campaign_tsv_sha256=b1aa37984c968020e88d959170d26f4ea4a203d856a8032f181d62b1f19f7bd9
+campaign_tsv_sidecar_sha256=442dfaee34c90ef27af0d67c4a449c1c664b01881d154e8956d681c04e954108
+campaign_meta_sha256=39b86b623490f9a672c66a3e7d3509f1ef9c4f094d804b40487925ab2f07a3bc
+campaign_meta_sidecar_sha256=27022b2bb30b662728b89a9724434a9e4832f5c612f00845782fc4439abd25d9
+combined_report_04_sha256=5e2b3b060a3daca62873a6fc85da0ece2191eb3a1680a09a614f5dab3de6cee8
+combined_report_06_sha256=5e2b3b060a3daca62873a6fc85da0ece2191eb3a1680a09a614f5dab3de6cee8
+combined_report_08_sha256=5e2b3b060a3daca62873a6fc85da0ece2191eb3a1680a09a614f5dab3de6cee8
+combined_report_normalized_projection_sha256=3fb6c3c24f2995f57d71be9ba5a4fd36c13ffe956d0ab91bc497370f6259b91a
+pm_action_path_report_sha256=321bc496a00d66fcd583d757739285b7723437cd8737921b39d93f36f9c905dd
+pm_action_path_non_timing_projection_sha256=cc90806d19c5d2a252acbd64f3439ece2a0cb1b9d44566b84aa421d8c37b708c
+```
+
+The implementation delta remained exactly:
+
+```text
+M	crates/reap-pm-live/src/evidence/workload.rs
+M	crates/reap-pm-live/tests/combined_replay.rs
+```
+
+Final preservation checks passed:
+
+| Preserved state | Final result |
+| --- | --- |
+| `Cargo.lock` | unchanged, SHA-256 `2673d055c943c3bd5444531b67df280026c145cbbbc99b68a06f4ac0c2dbb0ff` |
+| Goal F combined-report anchors | exact; three retained reports are byte-identical |
+| Goal G amended Phase 0 root | 11,594 regular files; 12,253 entries; file stream `35a99a10c133fd680cef1f4e411dbc55490f4e41199411aae907cd348aced340`; inventory `23c4b85375e2d27e657c38b4560c3ee1bfecae1c1b5c98baf4cf1462dc05f7b2` |
+| Historical Goal G Phase 0 root | 4,158 regular files; 5,038 entries; file stream `ad921fc06db0a68b6e0822208106df2d8c6d276b24d0f4bb342a84f8b738b8d9`; inventory `4ba698c8804850eeafd3eaef333cf9a6b419d0a66df78a8bd001808eb4d30a4d` |
+| Prior Goal G-R root | 70 regular files; 85 entries; file stream `54d59957045444e32488a9dda0619440e983b5be779e3004045aac3e68662246`; inventory `32c47a75092a8a0598f0205e53f495023e80ee6d7279d406059c685401d83171` |
+| Repository/runtime | candidate HEAD/tree and tracked status unchanged; runtime root empty |
+| Processes | no Cargo, rustc, combined replay, PM benchmark, Reap, or Reap CLI process remained |
+| Storage after closure audit | `2673360896` available bytes, above the exact floor |
+| Siblings | `../imm-strategy` clean at `b6b120c7b7c466d8431bf082f3229328c5d7b2ae`; ordinary `../predarb` status remained the authorized dashboard modification plus `.predarb/` |
+
+After final modes were applied, the completed Amendment 6 evidence root had
+the following exact aggregate record:
+
+```text
+goal_g_r_amendment_6_execution_status=complete
+goal_g_r_amendment_6_campaign_status=passed
+goal_g_r_amendment_6_candidate_head=5aaa6c622f0880d6f5ff473f1674cb1f7418cf1f
+goal_g_r_amendment_6_candidate_tree=e5a19042befae9dae3647bff455cb54e3bb71e48
+goal_g_r_amendment_6_completed_evidence_root=target/tmp/goal-g-r-amendment-6
+goal_g_r_amendment_6_completed_evidence_regular_files=1576
+goal_g_r_amendment_6_completed_evidence_entries_excluding_root=2202
+goal_g_r_amendment_6_completed_evidence_file_stream_sha256=e30bbd0dae57ace2c058000cd0fdfa9edf074073cabf0a928a721258ede9b6a7
+goal_g_r_amendment_6_completed_evidence_inventory_sha256=98fd0c9df82eba47f056be427b7c45513ca2a191bc60000426cf02510f8a7964
+goal_g_r_original_historical_contract_status=stopped
+goal_g_r_historical_mutation_transition_status=unknown-not-retained
+goal_g_r_historical_capture_shutdown_variant_status=unknown-not-retained
+goal_g_r_resolution_scope=defect-class-only
+goal_g_r_amendment_5_validation_status=passed
+goal_g_r_defect_class_resolution_status=complete
+goal_g_r_historical_equivalence_claimed=false
+goal_g_r_goal_g_return_status=eligible-for-separately-reviewed-amendment-3
+goal_g_r_goal_g_resumed=false
+production_order_entry_authorized=false
+real_credentials_loaded=false
+authenticated_external_request_sent=false
+real_polygon_rpc_request_sent=false
+real_order_submitted=false
+goal_g_red_evidence_modified=false
+goal_g_resumed=false
+```
+
+The single historical
+`goal_g_r_regression_contract_status=pending` field remains unchanged.
+Amendment 6 completion makes Goal G eligible only for its separately reviewed
+Amendment 3 activation; it does not itself activate or resume Goal G.
