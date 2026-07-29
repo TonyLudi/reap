@@ -1472,7 +1472,8 @@ mod tests {
     use super::*;
     #[tokio::test(flavor = "current_thread")]
     async fn real_writer_acknowledgement_is_bound_to_expected_prepared_effect() {
-        let directory = tempfile::tempdir().unwrap(); let mut run = EvidenceRun::start_real(directory.path().join("ack.jsonl")).await.unwrap();
+        let directory = tempfile::tempdir_in(std::env::current_exe().unwrap().parent().unwrap()).unwrap();
+        let mut run = EvidenceRun::start_real(directory.path().join("ack.jsonl")).await.unwrap();
         run.run_pass(2, DurabilityMode::RealWriter, None, None).await.unwrap();
         let nominal = AckPolicy { primary: None, service: true, durable: true, prepared: true, identity: true, queue: true };
         assert_eq!(ack_class(nominal), None);
