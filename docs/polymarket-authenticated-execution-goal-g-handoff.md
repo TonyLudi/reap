@@ -1,13 +1,15 @@
 # Polymarket Authenticated Execution Goal G Handoff
 
-Status: **stopped at the amended Phase 0 replay gate under user-authorized
-Amendments 1 and 2; Amendment 3 is authorized but inactive pending Goal G-R
-Amendment 6**. The clean current-HEAD replay selected immutable attempt 1 as
-valid evidence with `gate_pass=false`: 11 of 13 tests passed and two existing
-Goal F semantic/non-timing tests failed. The amended contract forbids
-discarding or retrying that valid red result, so Phase 0 is not green and no
-Phase 1 implementation began. The source byte re-attestation and all 16
-baseline benchmark invocations were green before the replay stop.
+Status: **the historical amended Phase 0 replay remains stopped under
+user-authorized Amendments 1 and 2; Goal G-R Amendment 6 completed at `R6`;
+Amendment 3 remains inactive after its preactivation storage stop; Amendment
+4 is authorized and awaits its `S4` commit**. The historical clean replay
+selected immutable attempt 1 as valid evidence with `gate_pass=false`: 11 of
+13 tests passed and two existing Goal F semantic/non-timing tests failed. The
+amended contract forbids discarding or retrying that valid red result, so
+Phase 0 is not green and no Phase 1 implementation began. The source byte
+re-attestation and all 16 baseline benchmark invocations were green before
+the replay stop.
 
 The historical stopped run correctly proved that an authenticated CLOB
 `CONDITIONAL` numeric value cannot become the boolean ERC-1155 operator
@@ -963,4 +965,88 @@ goal_g_amendment_3_authenticated_external_request_sent=false
 goal_g_amendment_3_real_polygon_rpc_request_sent=false
 goal_g_amendment_3_real_order_submitted=false
 goal_g_amendment_3_push_authorized=false
+```
+
+## User-Authorized Amendment 4 Storage Reset — 2026-07-30
+
+The user authorized the narrow storage-reset contract in
+`docs/polymarket-authenticated-execution-goal-g-amendment-4.md` after
+Amendment 3's mandatory preactivation storage check stopped with
+`1035091968` available bytes against a `2147483648`-byte minimum.
+
+The stop occurred at clean Goal G-R closeout commit
+`fc1ceba88fc91bc5c55d34fb639a4b575e584844`. The official Amendment 3 bundle,
+Phase 0 evidence, and runtime paths were all absent; no tracked edit, index
+edit, commit, or push had occurred. The user authorized removal of exactly
+`/home/ubuntu/app/predarb/target` and
+`/home/ubuntu/app/predarb-flatness-fix/target`. Both disposable build-cache
+paths were removed and verified absent, leaving `11308576768` available
+bytes. Source, captures, retained/non-cache artifacts, credentials, and
+historical evidence were not modified.
+
+For only the activation-parent/direct-child lineage and the procedure for
+returning from this recorded preactivation storage stop, Amendment 4 has
+precedence over conflicting clauses in the Goal G return-sequence prompt,
+Amendment 3, and its runner contract. The revised immutable chain is:
+
+```text
+A -> R6 -> S4 -> G3 -> P0
+```
+
+`S4` must be the direct child of `R6`; `G3` must be the direct child of `S4`;
+and `P0`, if authorized, must be the direct child of `G3`. Amendment 3's full
+no-Cargo bootstrap suite, two independent static reviews, official bundle
+construction and sealing, fresh evidence, runtime-absence gates, safety
+boundaries, and no-retry rules remain mandatory.
+
+Files under `/tmp/reap-g3-draft` remain non-authoritative previews, not an
+official bundle or evidence attempt. They may inform fresh, fully reviewed
+construction but must not be blindly copied or relabeled.
+
+The return-sequence prompt's Stage R6 is complete and must not be rerun.
+Stage G3 now begins only from clean `S4`. A post-`S4` preactivation failure
+before bundle creation keeps bundle, evidence, and runtime absent, records
+`bundle_state=absent-not-created`, and—when storage permits—commits only this
+handoff directly after `S4` with exact subject
+`docs: record goal g amendment 3 activation stop`. If bundle creation began,
+the existing `partial-unsealed` or `sealed` states apply instead. No
+activation stop or physical no-write exception permits a later `G3` without
+a new reviewed, user-authorized amendment.
+
+After `S4` is committed, the executor must re-authenticate its exact commit,
+tree, parent, subject, two-path delta, contract hash, clean worktree, and hash
+of this handoff at `S4`. The future `G3` handoff must record those immutable
+`S4` identities before activation is committed.
+
+```text
+goal_g_amendment_4_status=authorized-for-s4-commit
+goal_g_amendment_4_schema=goal-g-amendment-4-v1
+goal_g_amendment_4_parent=fc1ceba88fc91bc5c55d34fb639a4b575e584844
+goal_g_amendment_4_parent_tree=6a198862a26c210ab1af68f5133a2f935fd4e6bb
+goal_g_amendment_4_contract_path=docs/polymarket-authenticated-execution-goal-g-amendment-4.md
+goal_g_amendment_4_contract_sha256=c4e08583fd51b9bbd5e18d17fe26390e3cdac489915cda43a68286307fb121ea
+goal_g_amendment_4_subject=docs: authorize goal g amendment 3 storage reset
+goal_g_amendment_4_tracked_allowlist=docs/polymarket-authenticated-execution-goal-g-amendment-4.md,docs/polymarket-authenticated-execution-goal-g-handoff.md
+goal_g_amendment_4_stage_r6_rerun_authorized=false
+goal_g_amendment_4_required_available_bytes=2147483648
+goal_g_amendment_4_stop_available_bytes=1035091968
+goal_g_amendment_4_stop_shortfall_bytes=1112391680
+goal_g_amendment_4_reset_available_bytes=11308576768
+goal_g_amendment_4_official_bundle_at_stop=absent-not-created
+goal_g_amendment_4_official_evidence_at_stop=absent-not-created
+goal_g_amendment_4_official_runtime_at_stop=absent-not-created
+goal_g_amendment_4_cleanup_source_modified=false
+goal_g_amendment_4_cleanup_captures_modified=false
+goal_g_amendment_4_cleanup_retained_non_cache_artifacts_modified=false
+goal_g_amendment_4_cleanup_historical_evidence_modified=false
+goal_g_amendment_4_cleanup_authority_exhausted=true
+goal_g_amendment_4_goal_g3_resumed=false
+goal_g_amendment_4_production_order_entry_authorized=false
+goal_g_amendment_4_real_credentials_loaded=false
+goal_g_amendment_4_authenticated_external_request_sent=false
+goal_g_amendment_4_real_polygon_rpc_request_sent=false
+goal_g_amendment_4_real_order_submitted=false
+goal_g_amendment_4_historical_goal_g_attempt_relabelled=false
+goal_g_amendment_4_historical_goal_g_r_equivalence_claimed=false
+goal_g_amendment_4_push_authorized=false
 ```
