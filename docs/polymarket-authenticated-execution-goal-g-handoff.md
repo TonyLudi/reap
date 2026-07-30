@@ -2,8 +2,9 @@
 
 Status: **the historical amended Phase 0 replay remains stopped under
 user-authorized Amendments 1 and 2; Goal G-R Amendment 6 completed at `R6`;
-Amendment 3 remains inactive after its preactivation storage stop; Amendment
-4 is authorized and awaits its `S4` commit**. The historical clean replay
+Amendment 4 committed `S4`; Amendment 3 is terminally inactive after its
+declared post-`S4`, pre-official-bundle preview failed; neither `G3` nor `P0`
+was created**. The historical clean replay
 selected immutable attempt 1 as valid evidence with `gate_pass=false`: 11 of
 13 tests passed and two existing Goal F semantic/non-timing tests failed. The
 amended contract forbids discarding or retrying that valid red result, so
@@ -879,7 +880,7 @@ The five historical parser fixture hashes remain exactly:
 
 They are parser seeds only.
 
-## Historical Unblock And Current Next Action
+## Historical Unblock And Then-Current Next Action
 
 The user selected the closed Polygon-read option and authorized the complete
 Amendment 1 contract recorded near the top of this handoff. The prompt and
@@ -888,16 +889,17 @@ provider-reported finalized-block consistency, freshness, failure behavior,
 bounded non-generic dependency edge, origin deferral, strict lifecycle/time
 union, and paired benchmark policy. No CLOB conditional encoding is guessed.
 
-Goal G is no longer blocked by the three historical findings. The amended run
-completed the narrowly authorized benchmark-policy tranche, Amendment 2
-source/contract review, source re-attestation, and baseline campaign. It then
-stopped correctly on the current clean replay's immutable valid red result.
-Goal G may not resume by retrying or discarding that result. The separately
-scoped [Goal G-R](goal-g-replay-repair-prompt.md), a reviewed Amendment 3 with
-a new evidence root, and the Phase 1 storage gate are the current next
-actions. Neither amendment claims that Phase 0, an implementation phase,
-production origin, account qualification, or trading authorization is
-complete.
+At that point, Goal G was no longer blocked by the three historical findings.
+The amended run completed the narrowly authorized benchmark-policy tranche,
+Amendment 2 source/contract review, source re-attestation, and baseline
+campaign. It then stopped correctly on the clean replay's immutable valid red
+result. Goal G could not resume by retrying or discarding that result. The
+separately scoped [Goal G-R](goal-g-replay-repair-prompt.md), a reviewed
+Amendment 3 with a new evidence root, and the Phase 1 storage gate were the
+then-current next actions. Later sections record Goal G-R's completion,
+Amendment 3's conditional authorization, and its terminal activation stop.
+Neither amendment claimed that Phase 0, an implementation phase, production
+origin, account qualification, or trading authorization was complete.
 
 ## User-Authorized Amendment 3 — 2026-07-29
 
@@ -931,7 +933,7 @@ The amendment:
    and completion boundary.
 
 ```text
-goal_g_amendment_3_status=authorized-inactive
+goal_g_amendment_3_status=activation-stopped-inactive
 goal_g_amendment_3_schema=goal-g-amendment-3-v1
 goal_g_amendment_3_repair_tip=77ad6f30f79eb0b6d99881da97ec94e550364d1a
 goal_g_amendment_3_repair_tree=9273cead973ecdd687ae11fa51d666f638e4a426
@@ -987,25 +989,28 @@ historical evidence were not modified.
 For only the activation-parent/direct-child lineage and the procedure for
 returning from this recorded preactivation storage stop, Amendment 4 has
 precedence over conflicting clauses in the Goal G return-sequence prompt,
-Amendment 3, and its runner contract. The revised immutable chain is:
+Amendment 3, and its runner contract. The conditional lineage authorized
+before `S4` was:
 
 ```text
 A -> R6 -> S4 -> G3 -> P0
 ```
 
-`S4` must be the direct child of `R6`; `G3` must be the direct child of `S4`;
-and `P0`, if authorized, must be the direct child of `G3`. Amendment 3's full
-no-Cargo bootstrap suite, two independent static reviews, official bundle
-construction and sealing, fresh evidence, runtime-absence gates, safety
-boundaries, and no-retry rules remain mandatory.
+Under that authorization, `S4` had to be the direct child of `R6`; `G3`
+would have had to be the direct child of `S4`; and `P0`, if authorized, would
+have had to be the direct child of `G3`. Amendment 3's full no-Cargo bootstrap
+suite, two independent static reviews, official bundle construction and
+sealing, fresh evidence, runtime-absence gates, safety boundaries, and
+no-retry rules remained mandatory.
 
 Files under `/tmp/reap-g3-draft` remain non-authoritative previews, not an
 official bundle or evidence attempt. They may inform fresh, fully reviewed
 construction but must not be blindly copied or relabeled.
 
 The return-sequence prompt's Stage R6 is complete and must not be rerun.
-Stage G3 now begins only from clean `S4`. A post-`S4` preactivation failure
-before bundle creation keeps bundle, evidence, and runtime absent, records
+The conditional Stage G3 path began only from clean `S4`; the terminal stop
+below has now closed it. A post-`S4` preactivation failure before bundle
+creation keeps bundle, evidence, and runtime absent, records
 `bundle_state=absent-not-created`, and—when storage permits—commits only this
 handoff directly after `S4` with exact subject
 `docs: record goal g amendment 3 activation stop`. If bundle creation began,
@@ -1015,11 +1020,12 @@ a new reviewed, user-authorized amendment.
 
 After `S4` is committed, the executor must re-authenticate its exact commit,
 tree, parent, subject, two-path delta, contract hash, clean worktree, and hash
-of this handoff at `S4`. The future `G3` handoff must record those immutable
-`S4` identities before activation is committed.
+of this handoff at `S4`. Any activation handoff would have had to record those
+immutable `S4` identities before activation was committed. None was created;
+the terminal stop below supersedes that conditional path.
 
 ```text
-goal_g_amendment_4_status=authorized-for-s4-commit
+goal_g_amendment_4_status=s4-committed-terminal-activation-stop
 goal_g_amendment_4_schema=goal-g-amendment-4-v1
 goal_g_amendment_4_parent=fc1ceba88fc91bc5c55d34fb639a4b575e584844
 goal_g_amendment_4_parent_tree=6a198862a26c210ab1af68f5133a2f935fd4e6bb
@@ -1049,4 +1055,118 @@ goal_g_amendment_4_real_order_submitted=false
 goal_g_amendment_4_historical_goal_g_attempt_relabelled=false
 goal_g_amendment_4_historical_goal_g_r_equivalence_claimed=false
 goal_g_amendment_4_push_authorized=false
+```
+
+## Amendment 3 Terminal Activation Stop — 2026-07-30
+
+After both independent static reviews passed the separately hashed
+constructor, the executor ran the declared non-authoritative preview exactly
+once. The preview failed during `construct_combined_fixtures`, before any
+self-test case, finalization, official bundle construction, or sealing.
+The preview tree is retained byte-for-byte and must not be modified, retried,
+promoted, or relabelled.
+
+The retained combined fixture contains exactly one valid `combined_replay`
+JSON report. The frozen constructor nevertheless rejected it because line
+1210 contains two backslash bytes before `{`; its Awk expression therefore
+looks for a leading literal backslash and reports zero matches. This is a
+deterministic constructor/parser defect, not a fixture, replay, load, or host
+failure.
+
+The preview is not the official recorder bundle or evidence. Official bundle
+creation never began, and the official bundle, Phase 0 evidence, and runtime
+roots remain absent. The normative official state is therefore
+`bundle_state=absent-not-created`; the retained preview is separately
+identified as non-authoritative partial-unsealed diagnostic evidence. This
+stop terminates the `S4` lineage. A retry, repaired constructor, later `G3`,
+or Phase 0 attempt requires a new reviewed, user-authorized amendment.
+
+The forensic inventory hash below covers records ordered by raw relative-path
+bytes in the form
+`rel\0type\0mode4\0uid\0gid\0nlink\0size\0payload\n`. The root is `.`;
+`type` is exactly `d` or `f`; `mode4` is the zero-padded four-digit octal
+mode; `size` is `lstat.st_size` for every entry, including directories; and
+`payload` is the file SHA-256 or `-` for a directory. The regular-file
+manifest hash covers
+`<sha256>  <relative-path>\n` records ordered by the relative-path bytes.
+The argv stream concatenates all five displayed process arguments, each
+followed by one NUL byte. The terminal-stderr and failed-constructor-line
+hashes and byte counts include their terminating LF.
+
+```text
+goal_g_amendment_3_activation_stop_status=stopped
+goal_g_amendment_3_activation_stop_schema=goal-g-amendment-3-activation-stop-v1
+goal_g_amendment_3_activation_stop_stage=post-s4-preofficial-bundle-declared-preview
+goal_g_amendment_3_activation_stop_s4_commit=706c4bd763647054264cdf3cb52d2355e0aa1b75
+goal_g_amendment_3_activation_stop_s4_tree=415dc504849a5aa22704688fe348307f5938fbf4
+goal_g_amendment_3_activation_stop_s4_parent=fc1ceba88fc91bc5c55d34fb639a4b575e584844
+goal_g_amendment_3_activation_stop_s4_subject=docs: authorize goal g amendment 3 storage reset
+goal_g_amendment_3_activation_stop_s4_path_count=2
+goal_g_amendment_3_activation_stop_s4_paths=docs/polymarket-authenticated-execution-goal-g-amendment-4.md,docs/polymarket-authenticated-execution-goal-g-handoff.md
+goal_g_amendment_3_activation_stop_s4_amendment_4_sha256=c4e08583fd51b9bbd5e18d17fe26390e3cdac489915cda43a68286307fb121ea
+goal_g_amendment_3_activation_stop_s4_handoff_sha256=e14a753907296daded8d1334b1c9306342d8f6509322cdccff00a88ffda49a1a
+goal_g_amendment_3_activation_stop_parent=706c4bd763647054264cdf3cb52d2355e0aa1b75
+goal_g_amendment_3_activation_stop_subject=docs: record goal g amendment 3 activation stop
+goal_g_amendment_3_activation_stop_tracked_allowlist=docs/polymarket-authenticated-execution-goal-g-handoff.md
+goal_g_amendment_3_activation_stop_failed_gate=declared-preview-construct-combined-fixtures-report-extraction
+goal_g_amendment_3_activation_stop_constructor_path=/var/tmp/reap-g3-draft-v2/construct-self-test.preview.sh
+goal_g_amendment_3_activation_stop_constructor_sha256=2fe07168369ca726f17328b3d9142522ab2540d057b5d95dd9586a6ded952ee6
+goal_g_amendment_3_activation_stop_constructor_bytes=362479
+goal_g_amendment_3_activation_stop_constructor_review_1_result=pass
+goal_g_amendment_3_activation_stop_constructor_review_1_reviewer=codex-root-g3-static-audit-a3
+goal_g_amendment_3_activation_stop_constructor_review_1_session=stable-review-a3-20260730T091458Z
+goal_g_amendment_3_activation_stop_constructor_review_2_result=pass
+goal_g_amendment_3_activation_stop_constructor_review_2_reviewer=codex-g3-static-audit-b3
+goal_g_amendment_3_activation_stop_constructor_review_2_session=root-g3-static-audit-b3-20260730
+goal_g_amendment_3_activation_stop_command=/bin/busybox sh /var/tmp/reap-g3-draft-v2/construct-self-test.preview.sh preview /home/ubuntu/code/reap/target/tmp/goal-g-amendment-3-preview-v1
+goal_g_amendment_3_activation_stop_preview_invocation_count=1
+goal_g_amendment_3_activation_stop_argv_count=5
+goal_g_amendment_3_activation_stop_argv_nul_sha256=97e00ee37bd12278536a903c246fa75af8ddb93691cfa7e06407594c844ffc52
+goal_g_amendment_3_activation_stop_argv_nul_bytes=145
+goal_g_amendment_3_activation_stop_exit=1
+goal_g_amendment_3_activation_stop_terminal_stderr=goal-g-a3-constructor: could not extract exactly one combined fixture report
+goal_g_amendment_3_activation_stop_terminal_stderr_sha256=e9f3c933894eae42d5ea7ef3364291e9e1ccea2ed2f2317f836500002e496ded
+goal_g_amendment_3_activation_stop_terminal_stderr_bytes=77
+goal_g_amendment_3_activation_stop_constructor_failed_line=1210
+goal_g_amendment_3_activation_stop_constructor_failed_line_sha256=c9162b045263a9404e4d81cce87a4afbf9875cdaa37e4515953717fe0c5cc7e6
+goal_g_amendment_3_activation_stop_parser_match_status=1
+goal_g_amendment_3_activation_stop_preview_root=target/tmp/goal-g-amendment-3-preview-v1
+goal_g_amendment_3_activation_stop_preview_official=false
+goal_g_amendment_3_activation_stop_preview_state=partial-unsealed-retained-non-authoritative
+goal_g_amendment_3_activation_stop_preview_dev=66305
+goal_g_amendment_3_activation_stop_preview_inode=808763
+goal_g_amendment_3_activation_stop_preview_uid=1000
+goal_g_amendment_3_activation_stop_preview_gid=1000
+goal_g_amendment_3_activation_stop_preview_root_mode=0700
+goal_g_amendment_3_activation_stop_preview_entry_count_including_root=21
+goal_g_amendment_3_activation_stop_preview_descendant_count=20
+goal_g_amendment_3_activation_stop_preview_directory_count=13
+goal_g_amendment_3_activation_stop_preview_regular_file_count=8
+goal_g_amendment_3_activation_stop_preview_regular_bytes=615138
+goal_g_amendment_3_activation_stop_preview_directory_modes=13x0700
+goal_g_amendment_3_activation_stop_preview_regular_file_modes=6x0700,2x0600
+goal_g_amendment_3_activation_stop_preview_link_or_other_type_count=0
+goal_g_amendment_3_activation_stop_preview_bundle_and_self_test_seals=absent
+goal_g_amendment_3_activation_stop_preview_trace_state=empty
+goal_g_amendment_3_activation_stop_preview_result_parts_state=empty
+goal_g_amendment_3_activation_stop_preview_forensic_inventory_sha256=82ac222e4932320ad14ce7ef7800bd8e39a373deaf6ce8205a9ab9ccbfd11747
+goal_g_amendment_3_activation_stop_preview_regular_manifest_sha256=a86c192658af2e4edef79c70ae4f89e842ac9f57ba278f1b8c0ff835defe2df9
+goal_g_amendment_3_activation_stop_preview_report_path=self-test/fixtures/reports/10-combined-valid.log
+goal_g_amendment_3_activation_stop_preview_report_sha256=bbea695789a6c13ef3095f55622c0c9cf9108a1965f5010485f01628369a3d67
+goal_g_amendment_3_activation_stop_preview_report_bytes=5347
+goal_g_amendment_3_activation_stop_preview_report_lines=27
+goal_g_amendment_3_activation_stop_preview_report_valid_json_count=1
+goal_g_amendment_3_activation_stop_preview_report_valid_json_line=19
+bundle_state=absent-not-created
+goal_g_amendment_3_activation_stop_official_bundle_creation_started=false
+goal_g_amendment_3_activation_stop_official_bundle_state=absent-not-created
+goal_g_amendment_3_activation_stop_official_evidence_state=absent-not-created
+goal_g_amendment_3_activation_stop_official_runtime_state=absent-not-created
+goal_g_amendment_3_activation_stop_g3_created=false
+goal_g_amendment_3_activation_stop_phase0_started=false
+goal_g_amendment_3_activation_stop_cargo_invoked=false
+goal_g_amendment_3_activation_stop_public_fetch_invoked=false
+goal_g_amendment_3_activation_stop_preview_retry_authorized=false
+goal_g_amendment_3_activation_stop_next_authority=new-reviewed-user-authorized-amendment
+goal_g_amendment_3_activation_stop_push_authorized=false
 ```
