@@ -2,9 +2,9 @@
 
 Status: **the historical amended Phase 0 replay remains stopped under
 user-authorized Amendments 1 and 2; Goal G-R Amendment 6 completed at `R6`;
-Amendment 4 committed `S4`; Amendment 3 is terminally inactive after its
-declared post-`S4`, pre-official-bundle preview failed; neither `G3` nor `P0`
-was created**. The historical clean replay
+Amendment 4 committed `S4`; Amendment 3's failed activation lineage remains
+terminally preserved; Amendment 5 is authorized but inactive; neither `G3`
+nor `P0` has been created**. The historical clean replay
 selected immutable attempt 1 as valid evidence with `gate_pass=false`: 11 of
 13 tests passed and two existing Goal F semantic/non-timing tests failed. The
 amended contract forbids discarding or retrying that valid red result, so
@@ -1169,4 +1169,141 @@ goal_g_amendment_3_activation_stop_public_fetch_invoked=false
 goal_g_amendment_3_activation_stop_preview_retry_authorized=false
 goal_g_amendment_3_activation_stop_next_authority=new-reviewed-user-authorized-amendment
 goal_g_amendment_3_activation_stop_push_authorized=false
+```
+
+## User-Authorized Amendment 5 — 2026-08-02
+
+The user authorized the narrow constructor recovery contract in
+`docs/polymarket-authenticated-execution-goal-g-amendment-5.md`. The failed
+preview and frozen v2 draft remain immutable. Amendment 5 authorizes a fresh,
+separately hashed v3 draft and a different one-shot preview root.
+
+The original recommendation described a one-byte-only v3. Static boundary
+review found that such a file could not run after a new authorization commit:
+v2 also hard-binds preactivation and Phase 0 to the old `S4` parent. The sole
+behavioral correction remains deletion of the excess Awk backslash. The
+contract separately permits only the mechanical provenance work needed to
+bind `A5 -> T -> S4 -> R6`, require `G3` as `A5`'s direct child, and document
+and validate those facts. It permits no product, command, workload,
+dependency, credential, network, or trading change.
+
+The existing Amendment 3 activation-stop block remains unchanged historical
+evidence. This new authorization does not relabel that stopped lineage or
+permit reuse of its preview. A green successor must pass the parser regression,
+the full retained no-Cargo suite, two independent v3 reviews, one fresh
+preview invocation and its reviews, fresh official construction, two fresh
+official reviews, and sealing before `G3` can exist.
+
+```text
+goal_g_amendment_5_status=authorized-inactive
+goal_g_amendment_5_schema=goal-g-amendment-5-v1
+goal_g_amendment_5_parent_commit=ed7d34ea504cae9d7dbb4524f6f6ebf494f5648d
+goal_g_amendment_5_parent_tree=bb98356880d8f088aa179e9fb8a84c1af068c7ef
+goal_g_amendment_5_parent_parent=706c4bd763647054264cdf3cb52d2355e0aa1b75
+goal_g_amendment_5_parent_subject=docs: record goal g amendment 3 activation stop
+goal_g_amendment_5_parent_path_count=1
+goal_g_amendment_5_parent_paths=docs/polymarket-authenticated-execution-goal-g-handoff.md
+goal_g_amendment_5_parent_handoff_sha256=ed031f2465e5d4684ac4101b9be2e5fd54c68e1ea3632bf2657062abbc4a9032
+goal_g_amendment_5_contract_path=docs/polymarket-authenticated-execution-goal-g-amendment-5.md
+goal_g_amendment_5_contract_sha256=f1a2f5d2cdb5d0f9999ac365652608d1c0a5d42768b84e05abd42b62e5b97675
+goal_g_amendment_5_authorization_subject=docs: authorize goal g amendment 5 constructor repair
+goal_g_amendment_5_authorization_path_count=2
+goal_g_amendment_5_authorization_paths=docs/polymarket-authenticated-execution-goal-g-amendment-5.md,docs/polymarket-authenticated-execution-goal-g-handoff.md
+goal_g_amendment_5_activation_subject=docs: activate goal g amendment 3
+goal_g_amendment_5_activation_tracked_allowlist=docs/polymarket-authenticated-execution-goal-g-handoff.md
+goal_g_amendment_5_activation_a3_status_from=activation-stopped-inactive
+goal_g_amendment_5_activation_a3_status_to=active-phase0
+goal_g_amendment_5_activation_a5_status_from=authorized-inactive
+goal_g_amendment_5_activation_a5_status_to=activation-complete-phase0-active
+goal_g_amendment_5_phase0_subject=docs: qualify goal g amendment 3 phase 0
+goal_g_amendment_5_activation_stop_subject=docs: record goal g amendment 5 activation stop
+goal_g_amendment_5_lineage=S4->T->A5->G3->P0
+goal_g_amendment_5_stage_r6_rerun_authorized=false
+goal_g_amendment_5_failed_preview_root=target/tmp/goal-g-amendment-3-preview-v1
+goal_g_amendment_5_failed_preview_state=partial-unsealed-retained-non-authoritative
+goal_g_amendment_5_failed_preview_dev=66305
+goal_g_amendment_5_failed_preview_inode=808763
+goal_g_amendment_5_failed_preview_forensic_inventory_sha256=82ac222e4932320ad14ce7ef7800bd8e39a373deaf6ce8205a9ab9ccbfd11747
+goal_g_amendment_5_failed_preview_regular_manifest_sha256=a86c192658af2e4edef79c70ae4f89e842ac9f57ba278f1b8c0ff835defe2df9
+goal_g_amendment_5_failed_preview_report_path=self-test/fixtures/reports/10-combined-valid.log
+goal_g_amendment_5_failed_preview_report_sha256=bbea695789a6c13ef3095f55622c0c9cf9108a1965f5010485f01628369a3d67
+goal_g_amendment_5_failed_preview_retry_authorized=false
+goal_g_amendment_5_failed_preview_promotion_authorized=false
+goal_g_amendment_5_v2_root=/var/tmp/reap-g3-draft-v2
+goal_g_amendment_5_v2_constructor_sha256=2fe07168369ca726f17328b3d9142522ab2540d057b5d95dd9586a6ded952ee6
+goal_g_amendment_5_v2_constructor_bytes=362479
+goal_g_amendment_5_v2_component_manifest_schema=sha256-tab-bytes-tab-basename-lf-ordered-by-basename-bytes
+goal_g_amendment_5_v2_component_manifest_rows=10
+goal_g_amendment_5_v2_component_manifest_bytes=933
+goal_g_amendment_5_v2_component_manifest_sha256=82fa2de7bc468a5a60fa3f795f336d621515557a5ee21b9828b09d1d526cf4a8
+goal_g_amendment_5_v2_root_dev=66305
+goal_g_amendment_5_v2_root_inode=305347
+goal_g_amendment_5_v2_root_mode=0700
+goal_g_amendment_5_v2_root_uid=1000
+goal_g_amendment_5_v2_root_gid=1000
+goal_g_amendment_5_v2_root_nlink=2
+goal_g_amendment_5_v2_entry_count_including_root=11
+goal_g_amendment_5_v2_regular_file_count=10
+goal_g_amendment_5_v2_regular_bytes=1038407
+goal_g_amendment_5_v2_regular_file_modes=9x0664,1x0700
+goal_g_amendment_5_v2_forensic_inventory_sha256=062c306df0e3a5b331be79df841dc98eefeed1a9d1a5b899968bae662d59f0cb
+goal_g_amendment_5_v2_mutation_authorized=false
+goal_g_amendment_5_v2_invocation_or_promotion_authorized=false
+goal_g_amendment_5_provenance_control_root=/var/tmp/reap-g3-draft-v3-provenance-control
+goal_g_amendment_5_provenance_patch=/var/tmp/reap-g3-draft-v3-provenance.patch
+goal_g_amendment_5_provenance_patch_file_sections=5
+goal_g_amendment_5_provenance_control_invocation_authorized=false
+goal_g_amendment_5_provenance_patch_bundle_input=false
+goal_g_amendment_5_review_1_scratch_root=/var/tmp/reap-g3-draft-v3-review-1-scratch
+goal_g_amendment_5_review_2_scratch_root=/var/tmp/reap-g3-draft-v3-review-2-scratch
+goal_g_amendment_5_review_scratch_create_limit_each=1
+goal_g_amendment_5_review_scratch_remove_authorized_after_pass=true
+goal_g_amendment_5_review_scratch_preserve_on_failure=true
+goal_g_amendment_5_v3_root=/var/tmp/reap-g3-draft-v3
+goal_g_amendment_5_v3_changed_file_count=5
+goal_g_amendment_5_v3_changed_files=SELF-TEST-DESIGN.md,SELF-TEST-SCHEMA.md,construct-self-test.preview.sh,run-attempt.sh,validators.sh
+goal_g_amendment_5_v3_unchanged_file_count=5
+goal_g_amendment_5_v3_unchanged_files=commands.tsv,inventory.preview.sh,run-phase0-replay.preview.sh,source-reattest.preview.sh,summarize-baseline.preview.sh
+goal_g_amendment_5_repository_fact_fields=candidate_parent,t_commit,t_tree,t_parent,t_subject,t_handoff_sha256,a5_commit,a5_tree,a5_parent,a5_subject,a5_contract_sha256,a5_handoff_sha256
+goal_g_amendment_5_phase0_meta_fields=t_commit,t_tree,t_parent,t_subject,t_handoff_sha256,a5_commit,a5_tree,a5_parent,a5_subject,a5_contract_sha256,a5_handoff_sha256
+goal_g_amendment_5_activation_handoff_t_fields=goal_g_amendment_5_t_commit,goal_g_amendment_5_t_tree,goal_g_amendment_5_t_parent,goal_g_amendment_5_t_subject,goal_g_amendment_5_t_handoff_sha256
+goal_g_amendment_5_activation_handoff_a5_fields=goal_g_amendment_5_a5_commit,goal_g_amendment_5_a5_tree,goal_g_amendment_5_a5_parent,goal_g_amendment_5_a5_subject,goal_g_amendment_5_a5_contract_sha256,goal_g_amendment_5_a5_handoff_sha256
+goal_g_amendment_5_parser_deleted_byte=0x5c
+goal_g_amendment_5_parser_deleted_offset_zero_based=51826
+goal_g_amendment_5_parser_old_line_sha256=c9162b045263a9404e4d81cce87a4afbf9875cdaa37e4515953717fe0c5cc7e6
+goal_g_amendment_5_parser_corrected_line_sha256=107cbbb11918f7bf6144f32a718ca10b6eabb328100721dc42dfbef0248393e1
+goal_g_amendment_5_parser_only_constructor_bytes=362478
+goal_g_amendment_5_parser_only_constructor_sha256=c6722bb7936564b427baa7822ba4a491166416f4dccfa5b5aa44d6f0a1051b45
+goal_g_amendment_5_parser_regression_old_status=1
+goal_g_amendment_5_parser_regression_old_output_bytes=0
+goal_g_amendment_5_parser_regression_new_status=0
+goal_g_amendment_5_parser_regression_new_output_count=1
+goal_g_amendment_5_parser_regression_new_output_bytes=3790
+goal_g_amendment_5_parser_regression_new_output_sha256=9e89454c35c52a823506f4f77d070d410ca5f504007754d7d0258944fa7a9f5d
+goal_g_amendment_5_new_preview_root=target/tmp/goal-g-amendment-3-preview-v2
+goal_g_amendment_5_new_preview_invocation_limit=1
+goal_g_amendment_5_new_preview_argv_count=5
+goal_g_amendment_5_new_preview_argv_nul_bytes=145
+goal_g_amendment_5_new_preview_argv_nul_sha256=545ea1c137866eb41949219d931a8a4f8ef785992b68514045e0b1f407d0d4f2
+goal_g_amendment_5_new_preview_review_count=2
+goal_g_amendment_5_new_preview_distinct_reviewers_required=true
+goal_g_amendment_5_new_preview_distinct_sessions_required=true
+goal_g_amendment_5_official_bundle_root=target/tmp/goal-g-amendment-3-recorder-bundle
+goal_g_amendment_5_official_evidence_root=target/tmp/goal-g-phase0-amendment-3
+goal_g_amendment_5_official_runtime_root=target/tmp/goal-g-amendment-3-runtime
+goal_g_amendment_5_official_bundle_state=absent-not-created
+goal_g_amendment_5_official_evidence_state=absent-not-created
+goal_g_amendment_5_official_runtime_state=absent-not-created
+goal_g_amendment_5_production_order_entry_authorized=false
+goal_g_amendment_5_real_credentials_loaded=false
+goal_g_amendment_5_authenticated_external_request_sent=false
+goal_g_amendment_5_real_polygon_rpc_request_sent=false
+goal_g_amendment_5_real_order_submitted=false
+goal_g_amendment_5_historical_goal_g_attempt_relabelled=false
+goal_g_amendment_5_historical_goal_g_r_equivalence_claimed=false
+goal_g_amendment_5_pre_g3_cargo_authorized=false
+goal_g_amendment_5_pre_g3_test_or_benchmark_authorized=false
+goal_g_amendment_5_pre_g3_public_fetch_authorized=false
+goal_g_amendment_5_pre_g3_network_authorized=false
+goal_g_amendment_5_push_authorized=false
 ```
