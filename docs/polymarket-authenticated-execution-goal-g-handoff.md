@@ -2181,7 +2181,7 @@ closed v7 construction, review, preview, official, activation, and Phase 0
 sequence in the Amendment 9 contract. Retained v5 and v6 remain immutable.
 
 ```text
-goal_g_amendment_9_status=authorized-inactive
+goal_g_amendment_9_status=activation-stopped-inactive
 goal_g_amendment_9_schema=goal-g-amendment-9-authorization-v1
 goal_g_amendment_9_authorization_date=2026-08-03
 goal_g_amendment_9_user_authorization=push-the-change-and-proceed-with-amendment-9
@@ -2324,4 +2324,120 @@ goal_g_amendment_9_historical_goal_g_r_equivalence_claimed=false
 goal_g_amendment_9_v5_mutation_or_promotion_authorized=false
 goal_g_amendment_9_v6_mutation_or_promotion_authorized=false
 goal_g_amendment_9_push_authorized=false
+```
+
+## Amendment 9 Terminal Activation Stop — 2026-08-03
+
+Both corrected preauthorization reviews passed exact Amendment 9, and exact
+`G9_AUTH` was committed. The canonical 17-child launcher authenticated the
+repository, exact v3, retained v5, and retained v6; copied exact v3 to fresh
+v7; post-verified the copy; rebound the contract and handoff hashes; and
+rechecked final HEAD, tree, and clean status. The first authorized v7 edit
+then applied only the frozen constructor-bootstrap repair.
+
+Before any other v7 edit or candidate invocation, static mapping found the
+same uncovered-bootstrap defect in `run-attempt.sh`. Its BusyBox identity
+probes launch `stat`, `stat`, and `sha256sum` before any storage preflight.
+Its later bootstrap helper launches BusyBox `env` and Bash before the helper's
+inner `git`/`df`/`awk` preflight, and its final clean re-exec is not freshly
+guarded. The retained no-Cargo bootstrap is not an execution-boundary
+exception. Amendment 9 authorizes a behavior hunk only in the constructor;
+the runner remains within the provenance-only allowlist. Preview necessarily
+invokes the runner, so no lawful A9 construction can reach preview.
+
+An independent read-only mapper also reported an executor boundary violation:
+a backticked `v4` token inside a double-quoted search pattern expanded into
+one unintended failing `v4` child, followed by the intended `rg` child under
+the same single preflight. Both children were read-only and no candidate or
+artifact was mutated, but the second child reused the first child's preflight.
+That violation is independently terminal under Amendments 8 and 9.
+
+Fresh v7 is preserved in its honest partial state. Only
+`construct-self-test.preview.sh` differs from the authenticated v3 copy, and
+only by the authorized bootstrap edit already applied. No post-failure hash
+child was run, so no unmeasured constructor identity is invented here. No
+provenance edit, patch, static-review scratch, preview, official artifact,
+constructor invocation, runner invocation, Cargo command, test, network
+child, credential load, authenticated request, Polygon RPC, or order entry
+followed either failure. A later attempt requires a new reviewed,
+user-authorized amendment.
+
+```text
+goal_g_amendment_9_activation_stop_status=stopped
+goal_g_amendment_9_activation_stop_schema=goal-g-amendment-9-activation-stop-v1
+goal_g_amendment_9_activation_stop_stage=post-g9-auth-post-copy-post-constructor-bootstrap-edit-pre-provenance-construction
+goal_g_amendment_9_activation_stop_parent_commit=ed2948232dc433d5af48352206f7a7b8046f9278
+goal_g_amendment_9_activation_stop_parent_tree=5c6ef7a138bfc7f9ffca1b5e93233a356bbedc9a
+goal_g_amendment_9_activation_stop_parent_parent=e4312e6ce93d411c69a0602dca0014fc41a1467e
+goal_g_amendment_9_activation_stop_parent_subject=docs: authorize goal g amendment 9 constructor bootstrap and review schema recovery
+goal_g_amendment_9_activation_stop_parent_path_count=2
+goal_g_amendment_9_activation_stop_parent_paths=docs/polymarket-authenticated-execution-goal-g-amendment-9.md,docs/polymarket-authenticated-execution-goal-g-handoff.md
+goal_g_amendment_9_activation_stop_parent_contract_sha256=95c313c2c9ebe605ecf3f9d6e5395dba4f3dcfce3d51b13863708c7885ea24cb
+goal_g_amendment_9_activation_stop_parent_handoff_sha256=9e767561029a1bb458b85d12eb5780af97dc43a73cd81b9e827c20771bde069e
+goal_g_amendment_9_activation_stop_tracked_allowlist=docs/polymarket-authenticated-execution-goal-g-handoff.md
+goal_g_amendment_9_activation_stop_primary_failed_gate=runner-descendant-per-external-child-storage-preflight-boundary
+goal_g_amendment_9_activation_stop_primary_failure_class=authorized-edit-surface-cannot-satisfy-runner-bootstrap-boundary
+goal_g_amendment_9_activation_stop_first_nonconforming_script=/var/tmp/reap-g3-draft-v7/run-attempt.sh
+goal_g_amendment_9_activation_stop_first_nonconforming_child=/bin/busybox-stat
+goal_g_amendment_9_activation_stop_first_nonconforming_source_line=13
+goal_g_amendment_9_activation_stop_additional_nonconforming_source_lines=16,19
+goal_g_amendment_9_activation_stop_runner_bootstrap_edit_authorized=false
+goal_g_amendment_9_activation_stop_no_cargo_is_child_boundary_exception=false
+goal_g_amendment_9_activation_stop_preview_requires_runner_invocation=true
+goal_g_amendment_9_activation_stop_secondary_failed_gate=executor-one-preflight-per-external-child-boundary
+goal_g_amendment_9_activation_stop_secondary_failure_class=unintended-command-substitution-child-and-preflight-reuse
+goal_g_amendment_9_activation_stop_secondary_actor=g9-provenance-readonly-mapper
+goal_g_amendment_9_activation_stop_secondary_preflight_count=1
+goal_g_amendment_9_activation_stop_secondary_external_child_count=2
+goal_g_amendment_9_activation_stop_secondary_first_child=v4
+goal_g_amendment_9_activation_stop_secondary_first_child_result=nonzero
+goal_g_amendment_9_activation_stop_secondary_second_child=/usr/bin/rg
+goal_g_amendment_9_activation_stop_secondary_children_mutating=false
+goal_g_amendment_9_activation_stop_secondary_candidate_invoked=false
+goal_g_amendment_9_activation_stop_canonical_authentication_result=pass
+goal_g_amendment_9_activation_stop_launcher_external_child_count=17
+goal_g_amendment_9_activation_stop_launcher_storage_preflight_count=17
+goal_g_amendment_9_activation_stop_g9_auth_commit=ed2948232dc433d5af48352206f7a7b8046f9278
+goal_g_amendment_9_activation_stop_g9_auth_tree=5c6ef7a138bfc7f9ffca1b5e93233a356bbedc9a
+goal_g_amendment_9_activation_stop_g9_auth_parent=e4312e6ce93d411c69a0602dca0014fc41a1467e
+goal_g_amendment_9_activation_stop_g9_auth_subject=docs: authorize goal g amendment 9 constructor bootstrap and review schema recovery
+goal_g_amendment_9_activation_stop_g9_auth_contract_sha256=95c313c2c9ebe605ecf3f9d6e5395dba4f3dcfce3d51b13863708c7885ea24cb
+goal_g_amendment_9_activation_stop_g9_auth_handoff_sha256=9e767561029a1bb458b85d12eb5780af97dc43a73cd81b9e827c20771bde069e
+goal_g_amendment_9_activation_stop_copy_invoked=true
+goal_g_amendment_9_activation_stop_copy_exit=0
+goal_g_amendment_9_activation_stop_copy_argv_nul_sha256=4cb778859b673a5f5a3d2f03b6325f2f2decad82d2dbf4039fbb41a9040141e4
+goal_g_amendment_9_activation_stop_v7_root=/var/tmp/reap-g3-draft-v7
+goal_g_amendment_9_activation_stop_v7_root_dev=66305
+goal_g_amendment_9_activation_stop_v7_root_inode=310087
+goal_g_amendment_9_activation_stop_v7_state=retained-non-authoritative-partially-constructed-bootstrap-only-not-invoked
+goal_g_amendment_9_activation_stop_v7_changed_file_count=1
+goal_g_amendment_9_activation_stop_v7_changed_files=construct-self-test.preview.sh
+goal_g_amendment_9_activation_stop_v7_constructor_bootstrap_edit_applied=true
+goal_g_amendment_9_activation_stop_v7_constructor_post_edit_sha256_recorded=false
+goal_g_amendment_9_activation_stop_v7_other_nine_files_equal_v3=true
+goal_g_amendment_9_activation_stop_v7_patch_state=absent-not-created
+goal_g_amendment_9_activation_stop_v7_review_1_scratch_state=absent-not-created
+goal_g_amendment_9_activation_stop_v7_review_2_scratch_state=absent-not-created
+goal_g_amendment_9_activation_stop_preview_v6_state=absent-not-created
+goal_g_amendment_9_activation_stop_preview_invocation_count=0
+goal_g_amendment_9_activation_stop_official_bundle_state=absent-not-created
+goal_g_amendment_9_activation_stop_official_evidence_state=absent-not-created
+goal_g_amendment_9_activation_stop_official_runtime_state=absent-not-created
+goal_g_amendment_9_activation_stop_g3_created=false
+goal_g_amendment_9_activation_stop_phase0_started=false
+goal_g_amendment_9_activation_stop_constructor_invoked=false
+goal_g_amendment_9_activation_stop_runner_invoked=false
+goal_g_amendment_9_activation_stop_cargo_invoked=false
+goal_g_amendment_9_activation_stop_test_or_benchmark_invoked=false
+goal_g_amendment_9_activation_stop_public_fetch_invoked=false
+goal_g_amendment_9_activation_stop_network_invoked=false
+goal_g_amendment_9_activation_stop_real_credentials_loaded=false
+goal_g_amendment_9_activation_stop_authenticated_external_request_sent=false
+goal_g_amendment_9_activation_stop_real_polygon_rpc_request_sent=false
+goal_g_amendment_9_activation_stop_real_order_submitted=false
+goal_g_amendment_9_activation_stop_production_order_entry_authorized=false
+goal_g_amendment_9_activation_stop_historical_attempt_relabelled=false
+goal_g_amendment_9_activation_stop_retry_authorized=false
+goal_g_amendment_9_activation_stop_next_authority=new-reviewed-user-authorized-amendment
+goal_g_amendment_9_activation_stop_push_authorized=false
 ```
