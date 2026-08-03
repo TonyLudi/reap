@@ -2460,7 +2460,7 @@ no-scratch review, retained no-Cargo preview, official construction,
 activation, and Phase 0 sequence.
 
 ```text
-goal_g_amendment_10_status=authorized-inactive
+goal_g_amendment_10_status=activation-stopped-inactive
 goal_g_amendment_10_schema=goal-g-amendment-10-authorization-v1
 goal_g_amendment_10_authorization_date=2026-08-03
 goal_g_amendment_10_user_authorization=proceed
@@ -2660,4 +2660,84 @@ goal_g_amendment_10_v5_mutation_or_promotion_authorized=false
 goal_g_amendment_10_v6_mutation_or_promotion_authorized=false
 goal_g_amendment_10_v7_mutation_or_promotion_authorized=false
 goal_g_amendment_10_push_authorized=false
+```
+
+## Amendment 10 Terminal Activation Stop — 2026-08-03
+
+Both corrected preauthorization reviews passed exact Amendment 10, and exact
+`G10_AUTH` was committed. The canonical bootstrap authenticated its own bytes
+and the frozen launcher, then transferred control without a new PID. The
+launcher authenticated repository root, branch, clean state, `G10_AUTH`, its
+tree, parent, subject, two-path delta, exact `G9_STOP`, exact `G9_AUTH`, and
+the full first-parent lineage.
+
+The pre-copy verifier then rejected the authorization handoff before any v8
+copy or candidate invocation. The authorization suffix contains
+`goal_g_amendment_10_source_review_count=2`. That key begins with the closed
+`goal_g_amendment_10_source_review_` prefix but is not one of the exact twelve
+per-review fields allowed by the verifier. It therefore failed deterministically
+at `source-review-evidence:exact-review-namespace` with exit class 67.
+
+This is an authorization-schema defect, not a candidate or Goal G-R semantic
+failure. Amendment 10 forbids retry or repair in place after any nonzero gate,
+so no retry was made. Fresh v8 and every v8 auxiliary, review, preview,
+official, evidence, and runtime path remain absent. v3 and retained v5, v6,
+and v7 remain unchanged and were not invoked or promoted. A later attempt
+requires a new reviewed, user-authorized amendment.
+
+```text
+goal_g_amendment_10_activation_stop_status=stopped
+goal_g_amendment_10_activation_stop_schema=goal-g-amendment-10-activation-stop-v1
+goal_g_amendment_10_activation_stop_stage=post-g10-auth-pre-copy-pre-v8
+goal_g_amendment_10_activation_stop_parent_commit=a3c85ff186dfca1b27c96d59b018848fe4a10563
+goal_g_amendment_10_activation_stop_parent_tree=682e01042034f48986797117daf0b4ed9b75ff76
+goal_g_amendment_10_activation_stop_parent_parent=6e04e60fa8f2412c87d51d28136cc23546ad8805
+goal_g_amendment_10_activation_stop_parent_subject=docs: authorize goal g amendment 10 complete entrypoint bootstrap recovery
+goal_g_amendment_10_activation_stop_parent_path_count=2
+goal_g_amendment_10_activation_stop_parent_paths=docs/polymarket-authenticated-execution-goal-g-amendment-10.md,docs/polymarket-authenticated-execution-goal-g-handoff.md
+goal_g_amendment_10_activation_stop_parent_contract_sha256=355094e66d1648a202a9ccb2bc874bf9575a469b67d4f5daf3abe9486b3577a6
+goal_g_amendment_10_activation_stop_parent_handoff_sha256=a9120ebd045c0df20842d55b359e844a75ebf6b24fc49b8d32505a183779a258
+goal_g_amendment_10_activation_stop_tracked_allowlist=docs/polymarket-authenticated-execution-goal-g-handoff.md
+goal_g_amendment_10_activation_stop_failed_gate=pre-copy-verifier-source-review-evidence
+goal_g_amendment_10_activation_stop_failure_class=closed-source-review-namespace-extra-field
+goal_g_amendment_10_activation_stop_failure_detail=source-review-evidence:exact-review-namespace
+goal_g_amendment_10_activation_stop_unexpected_field=goal_g_amendment_10_source_review_count
+goal_g_amendment_10_activation_stop_unexpected_field_value=2
+goal_g_amendment_10_activation_stop_exit=67
+goal_g_amendment_10_activation_stop_bootstrap_result=pass
+goal_g_amendment_10_activation_stop_launcher_result=failure-before-copy
+goal_g_amendment_10_activation_stop_completed_launcher_child_count=12
+goal_g_amendment_10_activation_stop_completed_storage_preflight_count=12
+goal_g_amendment_10_activation_stop_last_child=pre-copy-verifier
+goal_g_amendment_10_activation_stop_copy_invoked=false
+goal_g_amendment_10_activation_stop_v8_state=absent-not-created
+goal_g_amendment_10_activation_stop_v8_patch_state=absent-not-created
+goal_g_amendment_10_activation_stop_v8_review_1_scratch_state=absent-not-created
+goal_g_amendment_10_activation_stop_v8_review_2_scratch_state=absent-not-created
+goal_g_amendment_10_activation_stop_preview_v7_state=absent-not-created
+goal_g_amendment_10_activation_stop_official_bundle_state=absent-not-created
+goal_g_amendment_10_activation_stop_official_evidence_state=absent-not-created
+goal_g_amendment_10_activation_stop_official_runtime_state=absent-not-created
+goal_g_amendment_10_activation_stop_g3_created=false
+goal_g_amendment_10_activation_stop_phase0_started=false
+goal_g_amendment_10_activation_stop_candidate_invoked=false
+goal_g_amendment_10_activation_stop_constructor_invoked=false
+goal_g_amendment_10_activation_stop_runner_invoked=false
+goal_g_amendment_10_activation_stop_cargo_invoked=false
+goal_g_amendment_10_activation_stop_test_or_benchmark_invoked=false
+goal_g_amendment_10_activation_stop_public_fetch_invoked=false
+goal_g_amendment_10_activation_stop_network_invoked=false
+goal_g_amendment_10_activation_stop_real_credentials_loaded=false
+goal_g_amendment_10_activation_stop_authenticated_external_request_sent=false
+goal_g_amendment_10_activation_stop_real_polygon_rpc_request_sent=false
+goal_g_amendment_10_activation_stop_real_order_submitted=false
+goal_g_amendment_10_activation_stop_production_order_entry_authorized=false
+goal_g_amendment_10_activation_stop_v3_mutated=false
+goal_g_amendment_10_activation_stop_v5_mutated=false
+goal_g_amendment_10_activation_stop_v6_mutated=false
+goal_g_amendment_10_activation_stop_v7_mutated=false
+goal_g_amendment_10_activation_stop_historical_attempt_relabelled=false
+goal_g_amendment_10_activation_stop_retry_authorized=false
+goal_g_amendment_10_activation_stop_next_authority=new-reviewed-user-authorized-amendment
+goal_g_amendment_10_activation_stop_push_authorized=false
 ```
