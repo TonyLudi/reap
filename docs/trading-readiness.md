@@ -64,13 +64,14 @@ This scope remains pinned to the supported call path in the clean
 | Build/supply chain | Rust `1.95.0` is pinned; least-privilege CI checks formatting, all-target lint, all workspace tests, a locked release build, and RustSec advisories; Cargo and Actions updates are proposed weekly | CI must remain green and dependency updates reviewed, but this does not replace credentialed exchange or target-host evidence |
 | Exchange certification | Point-in-time account certification, journal-bound process-death deadman replay, exact fill/bill collection, and offline normal-trade/funding economics are implemented, but no passing target-account artifact, OKX demo soak, economic artifact, deadman artifact, or broader fault campaign is recorded | Production blocker |
 
-## Polymarket Foundation Status (Goal F Complete; Phase 7 Green)
+## Historical Polymarket Foundation Status (Goal F Complete; Phase 7 Green)
 
-Goal F is **GREEN** on its credential-free structural, deterministic replay,
-allocation, memory-bound, local performance-regression, and global workspace
-gates. The status below classifies the implemented PM mechanics and final local
-evidence; it grants no credentialed access, demo trading, live trading, or
-production trading authority.
+The Goal F baseline is **GREEN** on its credential-free structural,
+deterministic replay, allocation, memory-bound, local performance-regression,
+and global workspace gates. This table records that accepted baseline; the
+PM-T1 overlay immediately below is the current connectivity implementation.
+Neither grants credentialed access, demo trading, live trading, or production
+trading authority.
 
 ### Implemented credential-free and offline mechanics
 
@@ -83,30 +84,82 @@ production trading authority.
 | Quote-model seam | A statically supplied pure model consumes exact OKX reference state and PM readiness state, and quote policy performs the checked side-aware conversion to an exact passive candidate. The only concrete model is explicitly a deterministic fixture model. | The dataflow seam is implemented. There is no default or approved production fair-probability, spread, size, inventory, fee, liquidity, or risk model. |
 | Order lifecycle | Exact candidate approval, reservation, durable intent/fact journaling, recovery, ownership proof, prepared effects, results, fills, duplicate suppression, and owned cancellation are represented for one fixed GTC post-only profile. Only the in-process `PmFixtureOwnedExecution` fake consumes place or cancel effects. | PM order mutation is fake-only. `ApprovedPmQuote` and `ApprovedPmCancel` are local invariant proofs, not exchange credentials or trading approval. |
 | Coordinator and evidence | One mutation owner, bounded lanes, deterministic priority, fail-closed saturation/age behavior, exact local replay, and action-path evidence are Goal F green. The final three recorded action runs met the local `25,000 ns` p50 and `250,000 ns` p99.9 regression bounds with zero owner allocations, 58,858,352 reserved bytes below 64 MiB, exact logical/hash identity, and zero drops or saturation. | This establishes local structural, determinism, bounded-memory, and regression properties only. It does not establish live latency, venue behavior, economics, deployment capacity, or operational readiness. |
-| Authorization | Both accepted PM evidence targets fix `production_order_entry_authorized = false`, and the PM product exposes no live mutation constructor. | No PM demo, live, or production order entry is authorized. |
+| Authorization | Both accepted Goal F evidence targets fix `production_order_entry_authorized = false`; the baseline exposes only its fake mutation constructor. | No PM demo, live, or production order entry is authorized. |
+
+## PM-T1 Local Connectivity Status
+
+PM-T1 adds the production-shaped edge architecture that Goal F intentionally
+omitted. The implementation includes fixed EOA CLOB V2 signing, fixed L2
+request authentication, exact public/private/account/reconciliation roles,
+two durability barriers before a mutation write, a second Goal F result
+bridge, and cross-journal recovery. The authenticated mutation root is limited
+to synthetic credentials and numeric owner-local loopback endpoints under the
+non-default `loopback-evidence` feature; there is no production constructor or
+deployed process.
+
+One owned read supervisor drives the public market socket, authenticated user
+socket, book reads, and complete account/reconciliation reads into the sole
+coordinator. One split product clock supplies all public/private/read,
+actor/control, OKX-reference, and mutation-time observations. Controlled
+shutdown disables placement, joins post-dispatch mutation tasks without abort,
+keeps servicing admitted reads and durability, and drives a bound live owned
+order through exact cancel and reconciliation when possible while retaining
+typed primary, secondary, and unresolved evidence.
+
+Focused deterministic tests have exercised exact GTC post-only and
+journal-owned-cancel shapes, redaction, the two durability-before-write
+barriers, single-send/ambiguity behavior, cross-journal recovery, heartbeat
+rebasing, and live-cut admission. The complete authenticated
+place/fill/reconcile/exact-cancel/restart vertical, aggregate feature gates, and
+standard workspace gates are green. This closes PM-T1's local implementation
+acceptance only. No result here certifies target credentials, account state,
+external venue behavior, economics, capacity, deployment, or capital safety.
+
+Fee readiness remains deliberately narrow. Only an explicit live
+`fee_rate_bps = "0"` proves an exact zero collateral-fee delta. An omitted rate
+remains `Unknown`; a nonzero rate remains `Incomplete`. Both retain the
+unresolved canonical fill and block affected readiness and new placement.
+PM-T1 does not calculate a nonzero fee from rate/notional arithmetic and is not
+a production fee model.
+
+A recovered authenticated `GrantTail` is also deliberately not readiness: it
+is may-have-sent, suppresses placement, requires reconciliation, and is never
+resent. With no accepted venue-order ID, restart cannot issue an exact-owned
+cancel for that tail. Reconciliation can inform operator recovery, but it does
+not bind the tail or mint ownership from remote evidence.
+
+With PM-T1's local acceptance and standard gates green, the next permissible
+external step remains a separately scoped, explicitly authorized credentialed
+**read-only** smoke test. It must verify signer/funder, credential owner,
+market/token, collateral, every required allowance, position, open orders,
+trades, user stream, and complete reconciliation without mutation. A
+minimal-capital place/cancel smoke is a later authorization and remains
+prohibited now. `production_order_entry_authorized = false` remains mandatory.
 
 ### PM trading gates that remain open
 
-The remaining blockers are intentionally explicit: credentialed identity and
-signing, live connectivity, a production quote/order model, calibrated
-economics and risk, settlement, operations, target-account evidence, controlled
-live trials, and independent approval all remain absent.
+The remaining blockers are intentionally explicit: accepted credential
+custody/rotation and target-account identity evidence, external connectivity
+qualification, a production quote/order model, calibrated economics and risk,
+settlement, operations, controlled live trials, and independent approval all
+remain absent.
 
 | Required gate | Missing implementation or evidence |
 | --- | --- |
 | Production quote and order model | Define, review, backtest, and independently validate the fair-probability transformation from OKX reference state and PM market state; exact supported order semantics; passive spread and size policy; inventory response; quote replacement/cancellation behavior; and stale/reference-failure behavior. The deterministic fixture threshold/model and fixed fake GTC post-only profile are not a production strategy or order model. |
 | Economics and risk calibration | Establish fees/rebates, queue and fill assumptions, adverse selection, slippage, liquidity and market-impact limits, inventory and concentration limits, capital-at-risk limits, collateral utilization, loss limits, and resolution-value treatment from representative data. Require reproducible backtests, stress tests, and a reviewed acceptance decision. No current local replay or latency artifact is economic evidence. |
-| Authentication and signer boundary | Add a separately reviewed least-authority key-custody and signing design, current CLOB domain/order-signature rules, API credential derivation/use, authenticated-session construction, secret redaction/rotation, and signer/funder/signature-type verification. Existing signer and funder identities are non-secret scope values only; there is no signer implementation, key loader, authentication-header builder, or signed-request path. |
-| Live connectivity | Add and qualify the exact required PM public, private, account, reconciliation, place, and owned-cancel endpoint connectors without introducing a broad client escape. There is no production PM REST/WS client, authenticated private session, live execution gateway, deployed PM binary, or service composition. Public parser/session state does not by itself prove an endpoint connection. |
+| Credential custody and signer qualification | PM-T1 implements the fixed signer and L2 algorithms with non-Clone, zeroizing, redacted holders and synthetic vectors. Still define and review the real secret loader/provider, operator credential-slot rotation, access control, process isolation, audit procedure, and target signer/funder/signature-type verification. No real key or credential has entered Reap. |
+| External connectivity qualification | PM-T1 implements allowlisted public/private/read transports and a local authenticated-loopback composition. Still build the separately authorized read-only smoke, validate current endpoint behavior and target account evidence, then qualify reconnect, rate/capacity, latency, and sustained operation. There is no deployed PM binary/service, no accepted external authenticated run, and no production mutation constructor. |
 | Settlement and on-chain operations | Define and implement the supported fill-settlement and market-resolution lifecycle, then separately review any required collateral allowance or ERC-1155 operator-approval mutation, transfers, split/merge, redemption, bridge, or withdrawal behavior. The current fill settlement-state reducer is observational only and performs none of these operations. |
 | Operations and target host | Declare a target host and deployment profile; add PM-specific configuration/secrets handling, supervision, health/alerts, storage and recovery procedures, emergency owned-order cleanup, incident response, rollout/rollback, and operator runbooks; then exercise them under bounded failure. No target host is currently declared. |
 | Target-account certification | On the exact intended account, verify signer/funder/account identity, chain and current protocol/domain addresses, market/token membership, lifecycle/tick/minimum/lot rules, required spenders and allowances, collateral and token balances, positions, fees and limits, open orders, fills, ownership, cancellation, and complete reconciliation. Fixture account state is not target-account evidence. |
 | Demo or controlled trial evidence | First define an acceptable PM test environment or tightly bounded minimal-capital equivalent and its safety envelope. Then obtain credentialed smoke, reconnect/restart, partial/immediate/multiple/duplicate fill, ambiguous-order, cancellation-race, reconciliation, fault, sustained-soak, latency, and economic evidence. None has been run or accepted. |
 | Approval evidence | Build a source-bound evidence bundle and obtain explicit independent strategy/model, risk, security/key-custody, and operations approval for the exact binary, configuration, host, account, limits, and rollout/rollback plan. No current PM artifact or existing Chaos/OKX approval grants that authority. `production_order_entry_authorized: false` remains mandatory. |
 
-The safe current interpretation is public-protocol/capture/replay and offline
-fixture validation plus in-process fake execution only. Real credentials,
-authenticated PM access, and real order mutation must remain disconnected.
+The safe current interpretation is public-protocol/capture/replay, offline
+fixture/fake validation, and synthetic owner-local authenticated-loopback
+validation only. Real credentials, external authenticated PM access, and real
+order mutation must remain disconnected.
 `production_order_entry_authorized = false` is mandatory.
 The existing Chaos/OKX readiness material and its separate gates are unchanged
 and do not transfer approval to the PM product.

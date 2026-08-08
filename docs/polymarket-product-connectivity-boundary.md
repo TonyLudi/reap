@@ -1,22 +1,82 @@
 # Polymarket Product And Connectivity Boundary
 
-Status: normative for Goal F. This is a credential-free architecture and fake-
-execution contract, not a production model, authenticated connectivity plan,
-deployment specification, or trading authorization.
+Status: normative for the Goal F product/state baseline and the PM-T1 overlay
+below. It is not a production model, deployment specification, credential
+authorization, or trading authorization.
+
+## PM-T1 Connectivity Overlay
+
+For PM-T1, this Goal F document remains the canonical product/state/numeric
+baseline, while
+[the PM-T1 goal](polymarket-trading-connectivity-goal.md) is the higher-priority
+authority for authenticated connectivity. Statements below that say PM is
+fixture-backed refer to the explicitly historical Goal F baseline. Current
+capability and operating statements include this overlay.
+
+PM-T1 keeps the exact same closed product boundary and adds only these edge
+capabilities:
+
+| Capability | Implemented PM-T1 boundary |
+| --- | --- |
+| Public market source | Fixed metadata pair, `/time`, `/book`, and configured-token market WebSocket; bounded bodies/frames and one shared product clock |
+| Private lifecycle source | Fixed authenticated user WebSocket whose top-level credential owners are bound before a move-only normalized frame reaches the sole product occurrence issuer |
+| Reconciliation source | Unfiltered, bounded complete open-order and trade cuts plus exact local-order detail; incomplete pagination exposes no canonical rows |
+| Account source | Exact collateral and configured conditional-token balance/allowance observations; no allowance mutation |
+| Place edge | One exact EOA/type-0 CLOB V2 GTC post-only order derived from a take-once, Goal-F-durable prepared quote |
+| Cancel edge | One exact venue-order ID carried by a take-once, Goal-F-journal-owned cancel; private/reconciliation observation alone cannot mint ownership |
+
+The strategy and PM state crates remain network-, signer-, and secret-free.
+There is no `ExchangeClient`, runtime backend selector, arbitrary route/method,
+generic signer/HMAC operation, batch/amend/cancel-all, allowance mutation,
+settlement, redemption, or OKX private/order capability in the PM graph.
+
+Authenticated mutation has two additional durability barriers before the sole
+HTTP write: secret-free `Prepared` and `DispatchAuthorized`. The serialized
+body, signature, L2 headers, authenticated frame, and runtime exact-body digest
+never enter either journal. After a send, timeout/disconnect/partial response is
+`AcknowledgementUnknown`: the worker remains unavailable, placement is halted,
+and restart requires reconciliation without automatic resend. A separately
+durable Goal F bridge is applied before canonical lifecycle state changes.
+A recovered `GrantTail` (durable `DispatchAuthorized`, no Result) is
+may-have-sent: it is fail-closed, reconciliation-required, and never resent.
+Because it carries no accepted venue-order ID, restart cannot cancel it through
+the exact-owned path. Reconciliation may inform operator recovery, but remote
+observations alone never bind the tail or mint ownership.
+
+One owned read-ingress supervisor connects the public market WebSocket,
+authenticated user WebSocket, public book reads, and complete authenticated
+account/reconciliation reads to the sole coordinator. All of those edges,
+including separate place/cancel server-time reads, derive timestamps from one
+split product clock. Controlled shutdown disables placement, gracefully joins
+post-dispatch mutation tasks without aborting them, continues servicing reads
+and Goal F durability, drives an accepted owned order through exact cancel and
+reconciliation when possible, and preserves every typed primary/secondary
+failure plus unresolved counts.
+
+The authenticated mutation owner and transports exist only for tests or the
+explicit non-default `loopback-evidence` feature, accept numeric owner-local
+loopback origins, disable redirects/proxies/retries, and expose no production
+constructor. Synthetic local proof does not authorize real credentials or any
+external request. `production_order_entry_authorized = false` is mandatory.
 
 The governing rule is:
 
 > OKX contributes only declared public reference observations. Polymarket
 > contributes the configured market, account, and order state and is the only
-> venue represented by the fake mutation path. A capability exists only when a
-> named consumer in this product requires it.
+> execution venue represented by either the fake or feature-gated authenticated
+> loopback mutation path. A capability exists only when a named consumer in this
+> product requires it.
 
-This document is governed by the
-[Goal F execution prompt](multi-venue-polymarket-foundation-goal-f-prompt.md).
+The baseline sections are governed by the
+[Goal F execution prompt](multi-venue-polymarket-foundation-goal-f-prompt.md);
+the PM-T1 overlay is governed by
+[the PM-T1 goal](polymarket-trading-connectivity-goal.md).
 The existing [Chaos connectivity boundary](chaos-connectivity-boundary.md)
 continues to govern the separate Chaos/OKX product and is not broadened here.
 
 ## Product Topology
+
+The Goal F fake root remains a first-class deterministic composition:
 
 ```text
 configured OKX public reference observations
@@ -39,6 +99,21 @@ fixture/fake PM order/fill + complete account/position snapshots
                          |
                          v
  durable PM journal acknowledgement before fake place/cancel
+```
+
+PM-T1 adds a separate feature-gated authenticated-loopback root; it does not
+replace the fake root or add a runtime backend selector:
+
+```text
+PM public/user sockets + complete PM REST reads
+  -> one owned read supervisor + one shared product clock
+  -> owner-bound deliveries -> the same PmCoordinator<Model>
+  -> durable Goal F intent
+  -> durable authenticated Prepared
+  -> durable authenticated DispatchAuthorized
+  -> at most one owner-local loopback write
+  -> durable authenticated Result -> durable Goal F bridge
+  -> canonical lifecycle/reconciliation/exact-owned cancel
 ```
 
 Polymarket is treated as one first-class venue, not as a special hedge attached
@@ -244,18 +319,18 @@ a venue sequence.
 The roles below are separate concrete capabilities. They are not methods on one
 exchange client and cannot be recovered from a common adapter escape hatch.
 
-| Role | OKX | Polymarket | Goal F transport | Mutation |
+| Role | OKX | Polymarket | Implemented transport | Mutation |
 | --- | --- | --- | --- | --- |
-| Public observation | Declared reference instruments/channels only | Declared metadata, snapshot, and book channels; trades only if the model declares them | Public parser/capture/replay; public network edge may be credential-free | None |
-| Private lifecycle observation | None | Order, fill/trade, session/epoch events | Fixture/fake only | None |
-| Order reconciliation | None | Complete open-order snapshot, exact order detail, fills since watermark | Fixture/fake only | None |
-| Account/position snapshot | None | Collateral, token inventory, every required spender allowance, complete position revision | Fixture/fake only | None |
-| Owned passive execution | None | One GTC post-only place profile and cancel by proven local ownership | In-process fake only | Fake place/cancel |
+| Public observation | Declared `index-tickers` reference only | Declared metadata, time, snapshot, and configured-token book channels | Goal F parser/capture/replay plus PM-T1 owner-local HTTP/WebSocket role | None |
+| Private lifecycle observation | None | Order, fill/trade, session/epoch events | Goal F fixture role or PM-T1 authenticated user WebSocket, selected only by a static root | None |
+| Order reconciliation | None | Complete unfiltered open-order/trade cuts and exact order detail | Goal F fixture role or PM-T1 bounded authenticated read role | None |
+| Account/position snapshot | None | Collateral, configured-token inventory, every required spender allowance, complete position revision | Goal F fixture role or PM-T1 bounded authenticated read role | None |
+| Owned passive execution | None | One GTC post-only place profile and cancel by proven journal ownership | Goal F in-process fake or PM-T1 fixed owner-local loopback roles | Fixed place/exact-owned cancel only |
 
 The typed product plan is the exact union of three sources:
 
 1. public/time/model inputs declared by the explicit quote-model type;
-2. the fixed passive quote and owned-cancel fake execution profile; and
+2. the backend-neutral fixed passive quote and exact-owned-cancel profile; and
 3. mandatory safety, private lifecycle, reconciliation, account, allowance,
    position, persistence, and readiness dependencies implied by that profile.
 
@@ -278,18 +353,22 @@ exchange endpoint. Extra configuration, plan entries, roles, channels,
 instruments, accounts, or spenders are errors. Model requirements cannot
 request a private read or mint mutation authority.
 
-Three composition roots remain independent:
+The composition roots remain statically independent:
 
 - `PmPublicCapture` constructs only the exact OKX/PM public roles, raw capture,
   verification, and replay. It takes no model, private, account, reconciliation,
   journal, or mutation role.
-- `PmReadOnlyMonitor` is an explicitly requested least-authority fixture/fake
+- `PmReadOnlyMonitor` is an explicitly requested least-authority fixture
   composition of PM private lifecycle, reconciliation, collateral,
   authorization, and position roles. It takes no quote model, OKX source,
-  journal, or mutation role. Goal F provides no authenticated implementation.
+  journal, or mutation role.
 - `PmProduct<Model>` constructs the full deterministic fake-quote product only
   when the explicit model is supplied. With no model, normal product
   construction creates no private or mutation role.
+- The non-default `loopback-evidence` root consumes a `PmProduct<Model>`,
+  destroys its fixture executor, retains only neutral preparation, and owns the
+  authenticated public/private/read/place/cancel roles and read supervisor. It
+  accepts only numeric owner-local origins and has no production constructor.
 
 ### Reached endpoint/channel classifications
 
@@ -320,7 +399,7 @@ There is no PM cancel-all, cancel-market, arbitrary raw request, arbitrary
 order-type selector, authenticated session factory, signer, API-key builder,
 private-key type, or generic HTTP client in this composition.
 
-## Frozen Fake Execution Profile
+## Frozen Goal F Fake Execution Profile
 
 The only place profile in Goal F is:
 
@@ -350,10 +429,10 @@ Goal F fake wire representation:
 struct. The outer request adds `owner`, `orderType`, `postOnly`, and
 `deferExec`.
 
-Goal F models canonical unsigned fields only. It deliberately implements no
-signature, EIP-712 domain hashing, key access, authentication header, signed
-request, or live body dispatch. The later authenticated-execution goal must
-revalidate the protocol revision before introducing any of those.
+The Goal F fake models canonical unsigned fields only. PM-T1 retains those
+exact fields and adds fixed EIP-712/domain signing, purpose-specific L2 headers,
+once-only body serialization, and owner-local loopback dispatch in the two edge
+crates; none of that authority enters the fake root, strategy, or PM state.
 
 CLOB V2 exposes no client-order-ID field in this reached order request. The PM
 client ID is a journal-local ownership/idempotency identity and must not be
@@ -361,9 +440,10 @@ invented as a wire field. A successful fake acknowledgement binds its returned
 venue order ID to that local proof.
 
 The authenticated outer API `owner` value is not part of the fake unsigned
-DTO. Fake effects bind a compact local account handle instead. Proxy, Safe,
-deposit-wallet, nonzero builder/metadata, or another signature profile is
-deferred to the authenticated-execution goal.
+DTO. Fake effects bind a compact local account handle instead. PM-T1 supports
+only the fixed EOA/type-0 `maker == signer == funder` profile; proxy, Safe,
+deposit-wallet, nonzero builder/metadata, or another signature profile remains
+excluded.
 
 Before fake dispatch, approval is bound to the account, funder, market/token,
 side, exact units, metadata/grid revision, quote profile, model input revision,
@@ -404,13 +484,16 @@ same state. A regression, overfill, unknown terminal status, wrong
 account/token, or inconsistent cumulative value fails closed and forces
 reconciliation.
 
-Fixture private settlement follows only the proven graph
-`MATCHED -> MINED -> CONFIRMED`, `MATCHED|MINED -> RETRYING`, and
-`RETRYING -> MINED|FAILED`. Same-state delivery is idempotent; confirmed and
-failed facts are terminal. A regression never rolls back or reapplies
-principal. Missing, ambiguous, roleless, or externally owned maker linkage is
-retained as a bounded unresolved fill. Only a complete exact reconciliation
-cut may clear that quarantine; numeric coincidence cannot.
+Settlement follows forward reachability through the proven graph
+`MATCHED_NOT_BROADCASTED -> MATCHED -> MINED -> CONFIRMED`, with retry/failure
+branches from nonterminal states and `RETRYING -> MINED|CONFIRMED|FAILED`.
+Authoritative reconciliation may therefore advance across an omitted
+intermediate observation (for example `MATCHED -> CONFIRMED`), while same-state
+delivery is idempotent and confirmed/failed facts are terminal. A regression
+never rolls back or reapplies principal. Missing, ambiguous, roleless, or
+externally owned maker linkage is retained as a bounded unresolved fill. Only
+a complete exact reconciliation cut may clear that quarantine; numeric
+coincidence cannot.
 
 Unmanaged remote orders are never claimed as local. A complete snapshot must
 either reserve their exact remaining amount conservatively or make the
@@ -483,6 +566,15 @@ account, asset, and fee convention:
 Goal F does not infer a fee from gross/notional arithmetic when the represented
 event does not prove it.
 
+PM-T1 preserves that rule. A live trade proves an exact zero collateral-fee
+delta only when its applicable wire field explicitly says
+`fee_rate_bps = "0"`. An omitted rate remains `Unknown`; a nonzero rate remains
+`Incomplete`. Neither proves the exact signed delta, so the canonical fill
+remains unresolved and uncompactable, affected position/balance readiness stays
+unknown, and new placement stays blocked. Later exact fee evidence may enrich
+that same fill. PM-T1 deliberately implements no nonzero rate-to-amount
+calculation and no production fee model.
+
 ## PM-Specific Readiness And Risk
 
 The PM risk gate is separate from the existing Chaos risk gate and uses exact
@@ -505,13 +597,17 @@ observable; it is not one boolean that erases which dependency failed.
 
 ## Canonical Owner And Event Ordering
 
-The Phase 6 product materializes the complete coordinator and bounded
-seven-rank scheduler. Starting `PmProduct<Model>` moves the active public
-capture/session owner, fixture-only private/account/reconciliation roles,
-canonical PM state, scheduler, journal, and fake-effect boundary under one
-`PmCoordinator<Model>`. The independently constructible public-capture and
-read-only-monitor roots remain non-mutating capability subsets; neither is an
-alternate canonical owner or a path to execution authority.
+The product materializes the complete coordinator and bounded seven-rank
+scheduler. Starting the Goal F fake root moves the public capture/session
+owner, fixture private/account/reconciliation roles, canonical PM state,
+scheduler, journal, and fake-effect boundary under one `PmCoordinator<Model>`.
+Starting the PM-T1 root instead consumes that construction, destroys the fake
+executor, and moves one authenticated read-ingress supervisor, one shared
+split product clock, the second journal, cross-journal recovery, and the fixed
+place/exact-owned-cancel workers around the same canonical coordinator. The
+independently constructible public-capture and read-only-monitor roots remain
+non-mutating capability subsets; neither is an alternate canonical owner or a
+path to execution authority.
 
 `PmCoordinator<Model>` owns by value:
 
@@ -783,8 +879,8 @@ Stable variant ranks are:
 
 | Lane | Variant order |
 | --- | --- |
-| Critical | shutdown/global stop; market/account halt; fake cancel result; fake place result |
-| Persistence | durable failure; durable success |
+| Critical | shutdown/global stop; market/account halt; fake cancel result; fake place result; live cancel result; live place result |
+| Persistence | intent/fact/live-bridge durable failure; corresponding durable success |
 | Private | connection unavailable; fill/trade; order lifecycle |
 | Scheduled | cancel-owned; reconciliation/refresh; freshness; quote evaluation |
 | Public | connection unavailable; market metadata/lifecycle; PM book snapshot; PM book delta/price change; PM BBO; OKX reference |
@@ -804,15 +900,15 @@ ceilings frozen for Goal F:
 
 | Lane/state | Capacity | Nominal high-water ceiling | Nominal maximum age | Saturation/age action |
 | --- | ---: | ---: | ---: | --- |
-| Critical safety and effect result | 512 | 32 | 250 ms | Reject producer, globally stop, no new fake dispatch |
-| Persistence acknowledgement | 512 | 32 | 250 ms | Reject producer, globally stop, retain the effect permit, no fake dispatch |
+| Critical safety and effect result | 512 | 32 | 250 ms | Reject producer, globally stop, no new dispatch |
+| Persistence acknowledgement | 512 | 32 | 250 ms | Reject producer, globally stop, retain the effect/bridge evidence, no dispatch |
 | PM private lifecycle | 4,096 | 64 | 250 ms | Halt account, close epoch, require complete reconciliation |
 | Integrity-bearing public snapshot/delta | 8,192 | 256 | 500 ms | Mark stream unavailable, invalidate epoch/readiness, explicit snapshot and resubscribe |
 | Complete reconciliation/account snapshots | 128 | 16 | 5 s | Keep account unready and retry; partial pages never enter |
 | Outbound reconciliation/refresh requests | 128 | 16 | 1 s | Keep affected account/token unready, retain one bounded pending-required bit, and retry; never declare a lost request complete |
 | Raw capture frames | 8,192 entries / 32 MiB / 1 MiB each | 256 entries / 8 MiB | 500 ms | Terminally close the shared capture artifact and rotate to a fresh run |
 | PM journal/effect records awaiting durable acknowledgement | 1,024 | 128 | 1 s | Suppress dispatch and halt new quote creation |
-| Fake place/cancel effects | 256 | 32 | 250 ms | Do not journal or dispatch the new effect; halt quoting; retain already scheduled owned cancels |
+| Goal F fake place/cancel effects | 256 | 32 | 250 ms | Do not journal or dispatch the new fake effect; halt quoting; retain already scheduled owned cancels |
 | Scheduled actions | 4,096 | 64 | 100 ms lateness | Suppress quote, deterministically schedule owned cancellation, globally halt if safety cannot be represented |
 | Telemetry | 128 | 32 | Not readiness-bearing | Latest/coalesce allowed; never changes state or recovery |
 
@@ -1069,12 +1165,12 @@ splitting the large coordinator and evidence work into focused children:
 | `private_monitor` | Read-only batch validation, maintenance, canonical fixture state, and projections |
 | `fake_effect`, `public_routes`, `replay`, `schedule` | Narrow fake execution, sealed public routing, combined recovery/replay, and deterministic action scheduling |
 
-The final structural inventory on verified code/evidence tree
+The historical Goal F structural inventory on verified code/evidence tree
 `d16c3cbdac97fb43944e3a97d4f9b56e92206747` is:
 
 | Inventory | Final result |
 | --- | --- |
-| Workspace packages / outside-workspace path dependencies | 35 / 0 |
+| Goal F workspace packages / outside-workspace path dependencies | 35 / 0 |
 | Goal F changed/new production sources since `d2593f6d85ce868b46e3c1f16b5a48f221e5e480` | 210 files / 91,664 production-extent lines / 0 files above 1,500 |
 | Goal F normal workspace edges | 22; SHA-256 `8944276c9572f6cb00b7db0830e2189199e979eba57d7189973ea62fc281b29f` |
 | Complete normal workspace adjacency | SHA-256 `63cca672bf23690d042779967d2cb2c12414633924b20d296a269f2e63554c06` |
@@ -1092,6 +1188,14 @@ every Goal-F production file at or below 1,500 lines. Exact replay,
 performance, and gate evidence is in the Goal F handoff rather than duplicated
 as authority here.
 
+The current PM-T1 workspace has 37 packages: the Goal F set plus
+`reap-polymarket-auth` and `reap-polymarket-live-adapter`. The historical Goal
+F hashes and package counts above remain snapshot evidence; they are not
+relabelled as PM-T1 verification. PM-T1's final local workspace gates are
+green. Its handoff records the accepted atomic implementation commit and the
+explicitly authorized historical phase-ledger exception; no retroactive phase
+hash is invented.
+
 Relative to the Phase 6 acceptance tree, the one additional public declaration
 is a test-support JSONL drain barrier. The only production-source content
 change is generic transport comment wording; production paths, extents,
@@ -1105,11 +1209,13 @@ full static dependency set:
 | `PmPublicCapture` | `capture`, which alone constructs `reap-okx-public-source::session` and `reap-polymarket-adapter::public` |
 | `PmReadOnlyMonitor` | `reap-polymarket-adapter::{private_fixture,reconcile_fixture,account_fixture}` plus PM order/position/reservation/readiness reducers; no `capture`, model, journal, or fake effect |
 | `PmProduct<Model>` | `capture`, the three fixture-only read roles, coordinator/model, journal, and `fake_effect`; fake effect alone constructs `reap-polymarket-adapter::fake_execution` |
+| Feature-gated authenticated loopback | Consumes `PmProduct<Model>`, destroys `fake_execution`, and owns `reap-polymarket-live-adapter` public/user/read/fixed-place/exact-cancel roles, one read supervisor, one shared split product clock, both journals, and cross-journal recovery; no runtime backend selector or production origin |
 
-Source-policy and compile-fail tests pin these three constructor call graphs
-and prove every plan entry has exactly one validated constructed-role binding
-and every concrete role emits only the exact bindings assigned to it. The
-composition module cannot access raw wire DTO modules directly.
+Goal F source-policy and compile-fail tests pin its three constructor call
+graphs and prove every plan entry has exactly one validated constructed-role
+binding. PM-T1 source-policy/compile-fail tests separately pin the consuming
+authenticated root, take-once dispatch, and lack of an OKX private/order path.
+The composition module cannot access raw wire DTO modules directly.
 
 Responsibilities:
 
@@ -1117,11 +1223,17 @@ Responsibilities:
   metadata/lifecycle types; no IO.
 - `reap-pm-state`: pure exact book/order/reservation/position/readiness
   reducers.
-- `reap-polymarket-wire`: public DTO/parser, fixture-only private DTO/parser,
-  canonical unsigned order fields; no auth, signer, key, session, or network
-  client.
-- `reap-polymarket-adapter`: public observation and fixture/fake narrow roles;
-  no broad client.
+- `reap-polymarket-wire`: strict public/live-private DTO parsing and canonical
+  unsigned order fields; no auth, signer, key, session, or network client.
+- `reap-polymarket-auth`: fixed EOA/type-0 signing and purpose-specific L2
+  authentication with redacted, zeroizing holders; no network or canonical
+  state.
+- `reap-polymarket-adapter`: public observation, fixture/fake roles, and sealed
+  live normalization/account/reconciliation transforms; no broad client or
+  credential owner.
+- `reap-polymarket-live-adapter`: bounded allowlisted public/authenticated
+  transports and the owner-local fixed place/exact-owned-cancel edges; no
+  strategy, canonical PM state, generic request, or production constructor.
 - `reap-transport`: bounded transport supervision, reconnect/backoff,
   timestamp/queue-age delivery, shutdown and health mechanics only. It knows
   no OKX/PM subscription, ACK, heartbeat, integrity, DTO, or execution rule.
@@ -1135,8 +1247,9 @@ Responsibilities:
 - `reap-pm-strategy`: static pure quote-model and quote-policy boundary.
 - `reap-pm-live-contracts`: secret-free config validation and typed capability
   plan.
-- `reap-pm-live`: PM coordinator, replay/composition root, fake effects,
-  PM-specific journal, stable integration test and benchmark targets.
+- `reap-pm-live`: PM coordinator, replay/composition roots, fake effects,
+  Goal F/authenticated journals, cross-journal recovery, owned read ingress,
+  controlled shutdown, and stable integration test/benchmark targets.
 - `reap-capture-framing`: schema-neutral bounded framing, writer evidence,
   hashing, and verification mechanics used by both capture wrappers.
 - `reap-durable-writer`: statically typed leased writer mechanics used by both

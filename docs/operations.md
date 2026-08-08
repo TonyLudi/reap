@@ -33,6 +33,76 @@ Operators must keep these scopes distinct:
 All operational scope derives from the supported pinned Chaos/iarb2 call path,
 not the broader Java gateway or generic OKX API surface.
 
+## Polymarket PM-T1 Operating Boundary
+
+PM-T1 is a library-level, owner-local loopback connectivity proof. It does not
+add a CLI, deployment unit, production endpoint configuration, credential
+loader, or operator switch for PM mutation. Do not place PM credentials in an
+existing Reap configuration, environment, journal, capture path, or command
+line, and do not adapt the `loopback-evidence` feature into an external-origin
+transport. `production_order_entry_authorized = false` is mandatory.
+
+The implemented capability cut is deliberately narrow:
+
+- OKX supplies only the configured public `index-tickers` reference;
+- PM supplies fixed public metadata/time/book/market data, authenticated user
+  lifecycle, complete open-order/trade reconciliation, exact order detail, and
+  exact collateral/configured-token balance, allowance, and position reads;
+- mutation is one fixed GTC post-only place or one exact journal-owned cancel;
+  and
+- batch, amend, cancel-all, allowance mutation, settlement, redemption,
+  arbitrary signing, arbitrary requests, and production origins are absent.
+
+Local mutation recovery has two journals. The Goal F journal owns the canonical
+intent/lifecycle; the authenticated journal owns the secret-free semantic
+request identity and its Prepared, DispatchAuthorized, and Result barriers.
+Never delete, truncate, copy between configurations, or independently repair
+one journal. Startup must validate both exact scopes and repair only a missing
+Goal F result bridge from a durable authenticated Result before exposing a
+worker.
+
+The authenticated root owns one read-ingress supervisor for the public market
+WebSocket, authenticated user WebSocket, public book worker, and bounded
+complete authenticated HTTP reads. All read, actor/control, OKX-reference, and
+place/cancel time roles are split from one product clock; an endpoint must not
+introduce an independent wall or monotonic clock domain.
+
+Interpret recovery states conservatively:
+
+| Durable tail | Operator meaning |
+| --- | --- |
+| Goal F intent plus authenticated Prepared only | Transport was definitely not authorized, but automatic retry remains forbidden; reconcile before any future decision. |
+| `GrantTail`: DispatchAuthorized without Result | Request may have been sent. Never resend; keep placement halted and reconcile the exact account/order. No accepted venue-order ID exists, so restart cannot manufacture or dispatch an exact-owned cancel. Remote observations inform operator recovery but cannot mint ownership; the tail remains unbound. |
+| `AcknowledgementUnknown` or out-of-profile Result | Request may have been accepted. Never infer success or rejection; preserve evidence and reconcile. |
+| Exact authenticated Result without Goal F bridge | Startup may append the one deterministic bridge; it must not send again. |
+| Exact bridge present in both recoveries | Bootstrap canonical state from Goal F; do not append or dispatch again. |
+| Any scope, prior-intent, identity, sequence, or duplicate contradiction | Terminal configuration/evidence failure. Preserve both files and stop. |
+
+Controlled shutdown stops new placement and gracefully joins any post-dispatch
+place/cancel task; mutation tasks have no abort path. It continues servicing
+the owned read ingress and Goal F durability, bridges accepted results, issues
+one stop occurrence, and drives a bound live owned order through exact cancel
+and reconciliation before closing the read supervisor, mutation-time owners,
+and coordinator/journals. A may-have-sent unbound place remains an explicit
+unresolved failure, not a successful shutdown. The aggregate preserves the
+chronological typed primary, secondary cleanup failures, and fixed unresolved
+counts. Forced task or process death is a recovery event, never permission to
+resend.
+
+For live fill readiness, accept exact zero fee only when the applicable trade
+wire fact explicitly carries `fee_rate_bps = "0"`. An omitted rate remains
+`Unknown`; a nonzero rate remains `Incomplete`. In either case, retain the
+canonical fill, keep the affected position/balance readiness unknown, and block
+new placement. Never infer a nonzero fee from rate/notional arithmetic. PM-T1
+implements no production fee model.
+
+With PM-T1's local acceptance and standard gates green, the next external
+procedure still must be defined in a new, explicitly authorized goal and must
+be read-only: load one reviewed credential bundle, verify exact
+EOA/funder/condition/token/account/allowance/position/open-order/trade/user-stream
+identity, and shut down without constructing mutation roles. A later
+minimal-capital place/cancel trial requires a second explicit authorization.
+
 ## Public Data Capture
 
 `reap capture` is a separate composition root. It opens only the configured

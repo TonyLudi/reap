@@ -60,6 +60,17 @@ code/evidence tree
 authenticated PM connectivity, an approved production quote model, target-host
 qualification, venue capacity, or trading approval.
 
+PM-T1 builds a separate, production-shaped connectivity edge on that Goal F
+foundation. `reap-polymarket-auth` owns the fixed EOA/L2 cryptographic
+authorities, `reap-polymarket-live-adapter` owns the allowlisted public and
+authenticated transports, and `reap-pm-live` remains the sole coordinator and
+durability owner. Authenticated mutation is constructible only under the
+explicit non-default `loopback-evidence` feature (and tests), uses synthetic
+credentials and owner-local endpoints, and has no production constructor.
+The fixed profile remains GTC post-only place plus exact journal-owned cancel;
+`production_order_entry_authorized = false` is unchanged. PM-T1 is local
+connectivity and recovery proof, not a production strategy or trading approval.
+
 ## Goals
 
 - Replicate the important `imm-strategy/chaos` decision logic in Rust.
@@ -154,7 +165,7 @@ exchange interface.
 | --- | --- | --- |
 | Shared substrate mechanics | `reap-core`, `reap-transport`, `reap-capture-framing`, `reap-durable-writer` | Common source identity, product-specific typed envelopes, bounded delivery/supervision, JSONL framing/verification, and leased bounded-writer mechanics. These crates do not make every legacy carrier multi-venue or define PM economics, venue lifecycle, credentials, or order authority. |
 | Chaos/OKX product | `reap-strategy`, `reap-engine`, `reap-order`, `reap-live-contracts`, `reap-live`, and the role-specific OKX crates | The existing Chaos/iarb2 strategy, `f64` model state, regular-order profiles, authenticated OKX roles, and normal/evidence/emergency authority planes remain governed by the Chaos boundary. |
-| Polymarket product | `reap-pm-core`, `reap-pm-state`, `reap-polymarket-wire`, `reap-polymarket-adapter`, `reap-pm-strategy`, `reap-pm-live-contracts`, and `reap-pm-live` | Exact PM identity/numerics, PM protocol semantics, sealed capability roles, a static quote-model seam, PM reducers, and a sibling composition root. The existing Chaos live, contract, and order crates do not depend on these crates. |
+| Polymarket product | `reap-pm-core`, `reap-pm-state`, `reap-polymarket-wire`, `reap-polymarket-auth`, `reap-polymarket-adapter`, `reap-polymarket-live-adapter`, `reap-pm-strategy`, `reap-pm-live-contracts`, and `reap-pm-live` | Exact PM identity/numerics, fixed-purpose signing and request authentication, sealed public/private/read/mutation roles, a static quote-model seam, PM reducers, two durable mutation barriers, and sibling fake/authenticated-loopback composition roots. The existing Chaos live, contract, and order crates do not depend on these crates. |
 | PM use of OKX public data | `reap-okx-public-source` | One narrow credential-free `index-tickers` source for configured reference instruments. It exposes no OKX private, account, reconciliation, signer, submit, or cancel capability. |
 
 Shared code is extracted only for an invariant already used by both products.
@@ -212,6 +223,49 @@ PmCoordinator<M>
   -> in-process fake result -> canonical order/fill reduction
 ```
 
+PM-T1 adds an alternate static outer root without changing those canonical
+reducers or giving the strategy a gateway:
+
+```text
+configured PM public HTTP + market WebSocket
+configured authenticated user WebSocket
+complete authenticated account/reconciliation reads
+  -> one owned read-ingress supervisor
+  -> bounded wire parsing -> owner-bound sealed live occurrences --+
+                                                                  |
+OKX configured public index reference ----------------------------+
+                                                                  v
+one shared product clock -> the same PmCoordinator<M>
+                         -> exact readiness/risk/lifecycle state
+  -> durable Goal-F QuoteIntent | CancelIntent
+  -> take-once prepared place | exact-owned cancel
+  -> secret-free authenticated Prepared record (durable)
+  -> secret-free DispatchAuthorized record (durable)
+  -> exactly one loopback HTTP write
+  -> durable authenticated Result
+  -> durable Goal-F AuthenticatedResult bridge
+  -> canonical lifecycle reduction and restart/reconciliation
+```
+
+The full serialized place body and its exact-body digest remain in memory only.
+Durable records carry a separately domain-separated semantic request
+commitment that excludes API keys, signatures, HMACs, passphrases, authenticated
+frames, and all hashes derived from them. A prepared-only restart is definitely
+unsent but is never automatically retried; a durable grant tail or unknown
+acknowledgement is may-have-sent, suppresses placement, and requires exact
+reconciliation without resend. A grant tail has no accepted venue-order ID, so
+restart cannot manufacture an exact-owned cancel for it. Current
+reconciliation may classify the account/order for operator recovery, but it
+cannot mint ownership or a cancel capability from remote evidence alone; the
+tail remains unbound and fail-closed.
+
+Live trade normalization treats only an explicitly carried
+`fee_rate_bps = "0"` as proof of an exact zero collateral-fee delta. An omitted
+rate remains `Unknown`; a nonzero rate remains `Incomplete`. Both retain the
+canonical fill and block affected position/balance readiness and new placement.
+Reap does not derive a nonzero fee from rate/notional arithmetic; PM-T1 contains
+no production fee model.
+
 OKX is an input source in this product, never its execution venue. The model
 receives the configured exact OKX reference and its revision; the coordinator
 requires current PM metadata and book state before evaluation, and the quote
@@ -229,26 +283,33 @@ checks the current grid, minimum, exact amounts, and passivity. The checked-in
 fixture model proves composition only; there is no default or approved
 production probability model.
 
-The Polymarket adapter exposes separate sealed roles for public observation,
+The Polymarket edges expose separate sealed roles for public observation,
 private lifecycle, order reconciliation, account/allowance/position snapshots,
-and owned execution. `PmConnectivityPlan` joins model requirements, mandatory
-safety/read requirements, and the fixed fake profile, then validates a
-one-to-one scoped binding for every constructed role. None of those roles
-provides an arbitrary HTTP method, signer, authenticated session, raw command
-executor, cancel-all, or order-type selector.
+fixed placement, and exact-owned cancellation. `PmConnectivityPlan` joins model
+requirements, mandatory safety/read requirements, and the backend-neutral fixed
+profile, then validates a one-to-one scoped binding for every constructed role.
+Authentication can sign only those fixed purposes; transport can call only the
+reviewed routes. No role provides an arbitrary HTTP method, generic signer,
+raw command executor, cancel-all, or order-type selector.
 
 The composition roots preserve the same separation: `PmPublicCapture` builds
 only public roles, `PmReadOnlyMonitor` builds only fixture/read roles, and the
-full `PmProduct<M>` exists only with an explicit model. Neither independent
-root can be converted into mutation authority.
+full fake `PmProduct<M>` exists only with an explicit model. Neither independent
+root can be converted into mutation authority. The feature-gated authenticated
+loopback root is a distinct consuming construction: it destroys the fixture
+executor, owns public/user WebSocket and complete REST-read supervision, and
+cannot be selected through a runtime backend switch.
 
-Mutation is deliberately fake-only. The sole `PmOwnedExecutionRole`
-implementation reachable by the product is the in-process fixture executor,
-limited to exact GTC post-only placement and cancellation carrying proven
-local ownership. Reservation occurs before dispatch, an intent must be durably
-acknowledged before a prepared effect exists, and prepared authority is
-take-once. Goal F contains no PM credential, signing implementation,
-authenticated private network session, or live submit constructor.
+The normal product remains fixture-backed. PM-T1 adds a distinct static
+authenticated-loopback root that destroys the fixture executor at construction
+and retains only the neutral preparation capability. It is limited to exact GTC
+post-only placement and cancellation carrying proven local ownership.
+Reservation occurs before dispatch, the Goal F intent must be durably
+acknowledged before a prepared effect exists, and authenticated transport cannot
+write before its own Prepared and DispatchAuthorized records are durable.
+Prepared/send/result/bridge authorities are move-only and correlated to one
+journal runtime. No public runtime backend selector or production mutation
+constructor exists.
 
 Network parsing, capture, durable writing, and telemetry remain at bounded
 edges. Typed queues have fixed capacities, deterministic ordering/age rules,
@@ -345,7 +406,7 @@ Recommended initial stack:
 
 ## Workspace Layout
 
-Current 35-crate structure:
+Current 37-crate structure:
 
 ```text
 reap/
@@ -358,8 +419,10 @@ reap/
     reap-pm-core/
     reap-pm-state/
     reap-polymarket-wire/
+    reap-polymarket-auth/
     reap-pm-strategy/
     reap-polymarket-adapter/
+    reap-polymarket-live-adapter/
     reap-pm-live-contracts/
     reap-pm-live/
     reap-okx-public-source/
@@ -396,11 +459,13 @@ reap/
 | `reap-durable-writer` | Generic leased, bounded, typed-codec writer and durable acknowledgement mechanics; it knows no product record schema or order semantics. |
 | `reap-pm-core` | Structural PM identity, exact heap-free numeric values, typed event clocks/envelopes, metadata, and lifecycle facts; no IO or executable approval constructor. |
 | `reap-pm-state` | Pure bounded PM book, private order/fill, reservation, account/allowance/position, readiness, refresh, and risk reducers. |
-| `reap-polymarket-wire` | Public and fixture-only PM DTO parsing plus canonical unsigned-order fields; no signer, authentication header, private key, or signed request. |
+| `reap-polymarket-wire` | Strict bounded public/live-private PM DTO parsing plus canonical unsigned-order fields; no signer, authentication header, private key, socket, or request authority. |
+| `reap-polymarket-auth` | Redacted, zeroizing fixed EOA/type-0 CLOB V2 signing and purpose-specific L2 request authentication; no strategy, canonical state, socket, generic signing, or arbitrary-request authority. |
 | `reap-pm-strategy` | Statically dispatched pure quote-model requirements/output and the exact side-aware passive quote-policy boundary. |
-| `reap-polymarket-adapter` | Separate sealed PM public, fixture-private, read-only reconciliation/account, and in-process fake-execution roles; no broad client escape. |
+| `reap-polymarket-adapter` | Separate sealed PM public, fixture/live normalization, read-only reconciliation/account, fill-cut, and in-process fake-execution roles; no broad client escape or credential owner. |
+| `reap-polymarket-live-adapter` | Allowlisted, bounded PM public/authenticated HTTP and WebSocket transports plus fixed place/exact-owned cancel roles; no strategy decisions, canonical PM state, generic request, or production-origin constructor. |
 | `reap-pm-live-contracts` | Secret-free scoped PM configuration, exact capability plan, role bindings, lanes, and readiness dependencies. |
-| `reap-pm-live` | Sibling PM public capture/replay, read-only monitor, deterministic lanes, one-owner coordinator, exact journal, and fake-only quote/cancel lifecycle. |
+| `reap-pm-live` | Sibling PM public capture/replay, read-only monitor, deterministic lanes, one-owner coordinator, Goal F and authenticated journals, cross-journal recovery, fake product root, and feature-gated authenticated-loopback root with owned read supervision and controlled live-order shutdown. |
 | `reap-okx-public-source` | Narrow credential-free OKX index-ticker source used by the PM product; no OKX private/account/order role. |
 | `reap-venue` | Existing credential-free Chaos/OKX protocol/parsing, exact OKX metadata, and connectivity keys; no signer or authenticated client, and not a universal PM adapter. |
 | `reap-feed` | Legacy Chaos/OKX public/private socket supervision, subscription readiness, deduplication, sequencing, book arbitration, and recovery; checked outer planning/capture bridges reject PM input. |
