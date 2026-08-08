@@ -77,7 +77,7 @@ fn ownership_metadata_and_linkage_authority_do_not_escape_as_scalar_fallbacks() 
 }
 
 #[test]
-fn fake_execution_is_fixed_bounded_and_in_process_only() {
+fn fixed_requests_are_backend_neutral_and_fake_execution_stays_in_process_only() {
     let fake = [
         read("src/fake_execution.rs"),
         read("src/fake_execution/command.rs"),
@@ -106,7 +106,9 @@ fn fake_execution_is_fixed_bounded_and_in_process_only() {
         );
     }
     assert!(fake.contains("MAX_PM_FAKE_ACK_FILL_LEGS"));
-    assert!(fake.contains("PmFakeOrderType::Gtc"));
+    assert!(fake.contains("PmFixedOrderType::Gtc"));
+    assert!(fake.contains("PmGtcPostOnlyPlaceRequest"));
+    assert!(fake.contains("PmExactOwnedCancelRequest"));
     assert!(fake.contains("post_only"));
     assert!(fake.contains("defer_exec"));
     assert!(fake.contains("expiration"));

@@ -514,7 +514,9 @@ impl PmPrivateState {
         let expected = self
             .owned_lifecycle
             .preflight_submit_result(client_order, result)?;
-        if let PmOwnedSubmitResult::Accepted(venue_order) = result {
+        if let PmOwnedSubmitResult::Accepted(venue_order)
+        | PmOwnedSubmitResult::AmbiguousOwned(venue_order) = result
+        {
             self.orders
                 .preflight_bind_owned_venue(client_order, venue_order, &self.config)?;
         }
@@ -522,7 +524,9 @@ impl PmPrivateState {
             .owned_lifecycle
             .apply_submit_result(client_order, result)?;
         debug_assert_eq!(outcome, expected);
-        if let PmOwnedSubmitResult::Accepted(venue_order) = result {
+        if let PmOwnedSubmitResult::Accepted(venue_order)
+        | PmOwnedSubmitResult::AmbiguousOwned(venue_order) = result
+        {
             self.orders
                 .bind_owned_venue(client_order, venue_order, &self.config)?;
         }
@@ -530,6 +534,25 @@ impl PmPrivateState {
             let _required = self.require_refresh(PmRefreshReason::AmbiguousOrder)?;
         }
         Ok(outcome)
+    }
+
+    /// Validates an owned submit transition without changing canonical state,
+    /// counters, readiness, or venue-order bindings.
+    pub fn preflight_owned_submit_result(
+        &self,
+        client_order: PmClientOrderKey,
+        result: PmOwnedSubmitResult,
+    ) -> Result<PmOwnedSubmitApply, PmPrivateStateError> {
+        let expected = self
+            .owned_lifecycle
+            .preflight_submit_result(client_order, result)?;
+        if let PmOwnedSubmitResult::Accepted(venue_order)
+        | PmOwnedSubmitResult::AmbiguousOwned(venue_order) = result
+        {
+            self.orders
+                .preflight_bind_owned_venue(client_order, venue_order, &self.config)?;
+        }
+        Ok(expected)
     }
 
     pub fn issue_owned_immediate_ack_ticket(
@@ -768,6 +791,18 @@ impl PmPrivateState {
         outcome: PmOwnedCancelOutcome,
     ) -> Result<PmOwnedCancelApply, PmPrivateStateError> {
         Ok(self.owned_lifecycle.apply_cancel_result(intent, outcome)?)
+    }
+
+    /// Validates an exact-owned cancel transition without changing lifecycle
+    /// state, counters, or reconciliation readiness.
+    pub fn preflight_owned_cancel_result(
+        &self,
+        intent: PmOwnedCancelIntent,
+        outcome: PmOwnedCancelOutcome,
+    ) -> Result<PmOwnedCancelApply, PmPrivateStateError> {
+        Ok(self
+            .owned_lifecycle
+            .preflight_cancel_result(intent, outcome)?)
     }
 
     pub fn compact_proven_owned_terminal(

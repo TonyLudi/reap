@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use super::PM_SEALED_JOURNAL_RECORD_KINDS;
 use super::PmValidatedJournalRecord;
 use super::schema::{
+    PmJournalAuthenticatedClassificationV1, PmJournalAuthenticatedResultV1,
     PmJournalCancelOutcomeV1, PmJournalCancelReasonV1, PmJournalCancelRejectReasonV1,
     PmJournalFillDeliveryV1, PmJournalFillFeeV1, PmJournalFillKeyV1, PmJournalFillOccurrenceV1,
     PmJournalFillRoleV1, PmJournalFillSettlementV1, PmJournalFillSourceV1, PmJournalFingerprintV1,
@@ -222,6 +223,52 @@ impl Normalizer {
                 self.previous_watermark = Some(watermark.cursor.opaque);
                 hash_account_scope(hasher, watermark.cursor.account_scope);
                 hasher.update(self.watermark_ordinal.to_be_bytes());
+            }
+            PmJournalRecordV1::AuthenticatedResult(result) => {
+                self.hash_authenticated_result(hasher, *result);
+            }
+        }
+    }
+
+    fn hash_authenticated_result(
+        &mut self,
+        hasher: &mut Sha256,
+        result: PmJournalAuthenticatedResultV1,
+    ) {
+        match result {
+            PmJournalAuthenticatedResultV1::Place(result) => {
+                hasher.update([0]);
+                hasher.update(result.auth_prepared_sequence().to_be_bytes());
+                hasher.update(result.auth_grant_sequence().to_be_bytes());
+                hasher.update(result.auth_result_sequence().to_be_bytes());
+                hasher.update(result.prior_goal_f_sequence().to_be_bytes());
+                hash_instrument(hasher, result.instrument());
+                hasher.update(result.request_commitment());
+                hasher.update(result.expected_order_id());
+                hash_optional_hash(hasher, result.observed_order_id());
+                hash_authenticated_classification(hasher, result.classification());
+                let canonical = result.canonical();
+                self.hash_client(hasher, canonical.client_order);
+                hash_place_outcome(hasher, canonical.outcome);
+                hash_place_reject_reason(hasher, canonical.reject_reason);
+                self.hash_optional_venue(hasher, canonical.venue_order);
+            }
+            PmJournalAuthenticatedResultV1::Cancel(result) => {
+                hasher.update([1]);
+                hasher.update(result.auth_prepared_sequence().to_be_bytes());
+                hasher.update(result.auth_grant_sequence().to_be_bytes());
+                hasher.update(result.auth_result_sequence().to_be_bytes());
+                hasher.update(result.prior_goal_f_sequence().to_be_bytes());
+                hash_instrument(hasher, result.instrument());
+                hasher.update(result.request_commitment());
+                hasher.update(result.fixed_order_id());
+                hash_optional_hash(hasher, result.observed_order_id());
+                hash_authenticated_classification(hasher, result.classification());
+                let canonical = result.canonical();
+                self.hash_client(hasher, canonical.client_order);
+                self.hash_venue(hasher, canonical.venue_order);
+                hash_cancel_outcome(hasher, canonical.outcome);
+                hash_cancel_reject_reason(hasher, canonical.reject_reason);
             }
         }
     }
@@ -456,6 +503,8 @@ fn hash_place_reject_reason(hasher: &mut Sha256, value: Option<PmJournalPlaceRej
         Some(PmJournalPlaceRejectReasonV1::FixtureRejected) => 1,
         Some(PmJournalPlaceRejectReasonV1::PostOnlyWouldTake) => 2,
         Some(PmJournalPlaceRejectReasonV1::AuthorityInvalidatedBeforeDispatch) => 3,
+        Some(PmJournalPlaceRejectReasonV1::AuthenticatedVenueRejected) => 4,
+        Some(PmJournalPlaceRejectReasonV1::AuthenticatedDefinitelyNotDispatched) => 5,
     }]);
 }
 
@@ -481,7 +530,32 @@ fn hash_cancel_reject_reason(hasher: &mut Sha256, value: Option<PmJournalCancelR
     hasher.update([match value {
         None => 0,
         Some(PmJournalCancelRejectReasonV1::FixtureRejected) => 1,
+        Some(PmJournalCancelRejectReasonV1::AuthenticatedVenueRejected) => 2,
+        Some(PmJournalCancelRejectReasonV1::AuthenticatedDefinitelyNotDispatched) => 3,
     }]);
+}
+
+fn hash_authenticated_classification(
+    hasher: &mut Sha256,
+    value: PmJournalAuthenticatedClassificationV1,
+) {
+    hasher.update([match value {
+        PmJournalAuthenticatedClassificationV1::Accepted => 0,
+        PmJournalAuthenticatedClassificationV1::Rejected => 1,
+        PmJournalAuthenticatedClassificationV1::DefinitelyNotDispatched => 2,
+        PmJournalAuthenticatedClassificationV1::OutOfProfile => 3,
+        PmJournalAuthenticatedClassificationV1::AcknowledgementUnknown => 4,
+    }]);
+}
+
+fn hash_optional_hash(hasher: &mut Sha256, value: Option<[u8; 32]>) {
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update(value);
+        }
+        None => hasher.update([0]),
+    }
 }
 
 fn hash_fill_role(hasher: &mut Sha256, value: PmJournalFillRoleV1) {
@@ -498,6 +572,7 @@ fn hash_fill_settlement(hasher: &mut Sha256, value: PmJournalFillSettlementV1) {
         PmJournalFillSettlementV1::Confirmed => 2,
         PmJournalFillSettlementV1::Retrying => 3,
         PmJournalFillSettlementV1::Failed => 4,
+        PmJournalFillSettlementV1::MatchedNotBroadcasted => 5,
     }]);
 }
 

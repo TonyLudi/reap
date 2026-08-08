@@ -1,0 +1,21 @@
+error[E0382]: use of moved value: `timestamp`
+  --> tests/ui/pagination_authority_is_take_once.rs:11:39
+   |
+ 7 |     timestamp: PmReadServerTime,
+   |     --------- move occurs because `timestamp` has type `PmReadServerTime`, which does not implement the `Copy` trait
+...
+10 |     let _ = role.continue_open_orders(timestamp, assembly).await;
+   |                                       --------- value moved here
+11 |     let _ = role.continue_open_orders(timestamp, assembly).await;
+   |                                       ^^^^^^^^^ value used here after move
+
+error[E0382]: use of moved value: `assembly`
+  --> tests/ui/pagination_authority_is_take_once.rs:11:50
+   |
+ 8 |     assembly: PmOpenOrdersAssembly,
+   |     -------- move occurs because `assembly` has type `PmOpenOrdersAssembly`, which does not implement the `Copy` trait
+ 9 | ) {
+10 |     let _ = role.continue_open_orders(timestamp, assembly).await;
+   |                                                  -------- value moved here
+11 |     let _ = role.continue_open_orders(timestamp, assembly).await;
+   |                                                  ^^^^^^^^ value used here after move

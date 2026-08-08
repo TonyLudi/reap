@@ -15,6 +15,10 @@ use crate::public_routes::{
     OkxPublicReferenceDelivery, PmPublicBookDelivery, PmPublicMetadataDelivery,
 };
 
+mod rest_book;
+
+pub use rest_book::{PmCapturedRestBook, PmProductRestBookCaptureSink};
+
 /// Result of one integrated public ingress operation.
 #[derive(Debug)]
 pub enum PmProductPublicIngressOutcome<T, U> {
@@ -121,6 +125,16 @@ impl<'a> PmProductPublicIngress<'a> {
         self.capture
             .capture_pm_public(local_wall_receive_ns, monotonic_receive_ns, raw)
             .await
+    }
+
+    /// Binds one native REST-book response to its receive-edge clocks and the
+    /// sole durable public-capture owner.
+    ///
+    /// The returned sink does not expose the capture run or raw bytes. Its
+    /// async delivery only releases a move-only classified batch after the
+    /// raw REST response has crossed the durability barrier.
+    pub fn rest_book_capture_sink(&mut self) -> PmProductRestBookCaptureSink<'_> {
+        PmProductRestBookCaptureSink::new(self.capture)
     }
 
     #[cfg(test)]
@@ -234,9 +248,9 @@ impl<'a> PmProductPublicIngress<'a> {
     pub async fn record_pm_reconnect_scheduled(
         &mut self,
         monotonic_ns: u64,
-    ) -> Result<Duration, PmPublicCaptureRunError> {
+    ) -> Result<crate::composition::PmPublicReconnectAuthorization, PmPublicCaptureRunError> {
         self.capture
-            .record_pm_reconnect_scheduled(monotonic_ns)
+            .record_pm_reconnect_authorized(monotonic_ns)
             .await
     }
 

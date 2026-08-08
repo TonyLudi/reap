@@ -7,6 +7,39 @@ impl PmPublicCaptureRun {
         monotonic_receive_ns: u64,
         raw: &[u8],
     ) -> Result<PmPublicCaptureBatch, PmPublicCaptureRunError> {
+        self.capture_pm_public_transport(
+            crate::capture::PmPublicRawTransport::MarketWebSocket,
+            local_wall_receive_ns,
+            monotonic_receive_ns,
+            raw,
+        )
+        .await
+    }
+
+    /// Capture one native CLOB REST `/book` response before classifying it as
+    /// a configured-token snapshot in the same canonical public session.
+    pub async fn capture_pm_rest_book(
+        &mut self,
+        local_wall_receive_ns: u64,
+        monotonic_receive_ns: u64,
+        raw: &[u8],
+    ) -> Result<PmPublicCaptureBatch, PmPublicCaptureRunError> {
+        self.capture_pm_public_transport(
+            crate::capture::PmPublicRawTransport::BookRest,
+            local_wall_receive_ns,
+            monotonic_receive_ns,
+            raw,
+        )
+        .await
+    }
+
+    async fn capture_pm_public_transport(
+        &mut self,
+        transport: crate::capture::PmPublicRawTransport,
+        local_wall_receive_ns: u64,
+        monotonic_receive_ns: u64,
+        raw: &[u8],
+    ) -> Result<PmPublicCaptureBatch, PmPublicCaptureRunError> {
         self.ensure_active()?;
         self.ensure_no_pending_pm_book_reductions()?;
         if !self.pm_lifecycle.accepts_live_input() {
@@ -21,17 +54,31 @@ impl PmPublicCaptureRun {
                 return Err(source);
             }
         };
-        if let Err(source) = self
-            .writer
-            .capture_raw_before_parse(
-                reap_pm_core::ConnectionEpoch::new(epoch),
-                IngressSequence::new(ingress),
-                local_wall_receive_ns,
-                monotonic_receive_ns,
-                raw,
-            )
-            .await
-        {
+        let capture_result = match transport {
+            crate::capture::PmPublicRawTransport::MarketWebSocket => {
+                self.writer
+                    .capture_raw_before_parse(
+                        reap_pm_core::ConnectionEpoch::new(epoch),
+                        IngressSequence::new(ingress),
+                        local_wall_receive_ns,
+                        monotonic_receive_ns,
+                        raw,
+                    )
+                    .await
+            }
+            crate::capture::PmPublicRawTransport::BookRest => {
+                self.writer
+                    .capture_rest_book_raw_before_parse(
+                        reap_pm_core::ConnectionEpoch::new(epoch),
+                        IngressSequence::new(ingress),
+                        local_wall_receive_ns,
+                        monotonic_receive_ns,
+                        raw,
+                    )
+                    .await
+            }
+        };
+        if let Err(source) = capture_result {
             return Err(self.reject_pm_capture_write(
                 source,
                 local_wall_receive_ns,
@@ -39,10 +86,15 @@ impl PmPublicCaptureRun {
             ));
         }
         self.pm_raw_ingress.commit(epoch, ingress);
-        match self
-            .roles
-            .classify_and_route_pm(raw, local_wall_receive_ns, monotonic_receive_ns)
-        {
+        let classified = match transport {
+            crate::capture::PmPublicRawTransport::MarketWebSocket => self
+                .roles
+                .classify_and_route_pm(raw, local_wall_receive_ns, monotonic_receive_ns),
+            crate::capture::PmPublicRawTransport::BookRest => self
+                .roles
+                .classify_and_route_pm_rest_book(raw, local_wall_receive_ns, monotonic_receive_ns),
+        };
+        match classified {
             Ok(batch) => {
                 self.register_pm_book_reductions(&batch)?;
                 let terminal_tick_clock = batch.books().iter().find_map(|delivery| {

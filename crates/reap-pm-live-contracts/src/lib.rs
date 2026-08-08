@@ -10,7 +10,7 @@ pub use config::{
 };
 pub use plan::{
     ConstructedRoleBinding, PmCompositionRoot, PmConnectivityPlan, PmFakeExecutionProfile,
-    PmPlanEntry, PmPlanError,
+    PmFixedExecutionProfile, PmPlanEntry, PmPlanError,
 };
 pub use requirements::{
     PmCapabilityLane, PmCapabilityRequirementId, PmModelPlanRequirement, PmModelRequirementError,

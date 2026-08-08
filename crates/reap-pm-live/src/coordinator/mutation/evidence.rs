@@ -28,7 +28,8 @@ impl PmMutationOwner {
         config: &PmConnectivityConfig,
         private: Box<PmPrivateMonitorRuntime>,
         fake: PmFakeEffectRole,
-    ) -> Result<Self, PmMutationError> {
+    ) -> Result<(Self, PmFixtureEffectExecutor), PmMutationError> {
+        let (preparation, executor) = fake.split();
         let scope = PmJournalScopeV1::from_config(config)?;
         let instrument_scope = PmFixtureInstrumentScope::from_metadata(
             config.account().instrument(),
@@ -37,28 +38,35 @@ impl PmMutationOwner {
         let instrument_id = config.account().instrument_id();
         if private.account_scope() != scope.account_scope()
             || private.instrument() != config.account().instrument()
-            || fake.account_scope() != scope.account_scope()
-            || fake.instrument() != config.account().instrument()
-            || fake.instrument_id() != instrument_id
+            || preparation.account_scope() != scope.account_scope()
+            || preparation.instrument() != config.account().instrument()
+            || preparation.instrument_id() != instrument_id
         {
             return Err(PmMutationError::CompositionScopeMismatch);
         }
-        Ok(Self {
-            scope: scope.clone(),
-            instrument_scope,
-            instrument_id,
-            private,
-            fake,
-            journal: PmMutationJournal::start_sealed_evidence(scope),
-            persistence: PmPersistenceQueue::new(),
-            effects: PmFakeEffectQueue::new()?,
-            durable_consequences: VecDeque::with_capacity(PM_PENDING_PERSISTENCE_CAPACITY),
-            reconciliation_reductions: PmReconciliationReductions::new(),
-            next_intent_id: 1,
-            current_revisions: None,
-            halt: None,
-            counters: PmMutationCounters::default(),
-        })
+        Ok((
+            Self {
+                scope: scope.clone(),
+                instrument_scope,
+                instrument_id,
+                private,
+                preparation,
+                journal: PmMutationJournal::start_sealed_evidence(scope),
+                persistence: PmPersistenceQueue::new(),
+                quarantined_live_bridges: VecDeque::with_capacity(2),
+                applied_live_bridges: VecDeque::with_capacity(2),
+                failed_live_bridges: VecDeque::with_capacity(2),
+                failed_goal_f_write: None,
+                effects: PmMutationDispatchQueue::new()?,
+                durable_consequences: VecDeque::with_capacity(PM_PENDING_PERSISTENCE_CAPACITY),
+                reconciliation_reductions: PmReconciliationReductions::new(),
+                next_intent_id: 1,
+                current_revisions: None,
+                halt: None,
+                counters: PmMutationCounters::default(),
+            },
+            executor,
+        ))
     }
 
     pub(crate) fn sealed_evidence_projection(&self) -> Option<PmMutationEvidenceProjection> {

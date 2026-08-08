@@ -3,7 +3,13 @@
     reason = "capture-role failures retain exact move-only routed and unavailable evidence on the bounded fail-closed path without heap allocation"
 )]
 
+mod failures;
 mod reducer_freshness;
+
+pub(crate) use failures::{
+    PmCaptureBookReduceFailure, PmCaptureRoleIngressError, PmCaptureRoleStartError,
+    PmCaptureSnapshotCommitFailure,
+};
 
 use std::time::Duration;
 
@@ -24,9 +30,9 @@ use reap_pm_state::{
     PmPublicReadinessReason,
 };
 use reap_polymarket_adapter::{
-    PmAuthoritativeMetadata, PmPublicHeartbeatAction, PmPublicHeartbeatEvidence, PmPublicRole,
-    PmPublicRoleError, PmPublicSession, PmPublicSessionError, PmPublicSessionFault,
-    PmSnapshotFlowToken,
+    PmAuthoritativeMetadata, PmPublicHeartbeatAction, PmPublicHeartbeatEvidence,
+    PmPublicReconnectTransition, PmPublicRole, PmPublicRoleError, PmPublicSession,
+    PmPublicSessionBatch, PmPublicSessionError, PmPublicSessionFault, PmSnapshotFlowToken,
 };
 use thiserror::Error;
 
@@ -112,8 +118,20 @@ impl PmCaptureRoles {
             config.expected_metadata(),
             PmDomainFingerprint::new(authoritative.domain_fingerprint())?,
         );
+        let polymarket = PmPublicRole::new(
+            blueprint.polymarket.observation_grant(),
+            blueprint.polymarket.instrument(),
+            authoritative.parser_config(),
+            blueprint.polymarket.source(),
+            blueprint.polymarket.connection(),
+        )
+        .map_err(|_| {
+            crate::capture::PmCaptureVerifyError::InvalidHeader(
+                "authoritative parser binding differs from the configured PM role",
+            )
+        })?;
         let pm = PmPublicSession::new(
-            blueprint.polymarket,
+            polymarket,
             authoritative,
             policy.pm_initial_epoch(),
             policy.pm_last_snapshot_revision(),
@@ -690,6 +708,27 @@ impl PmCaptureRoles {
         let batch = self
             .pm
             .classify(raw, local_wall_receive_ns, monotonic_receive_ns)?;
+        self.route_pm_batch(batch)
+    }
+
+    pub(crate) fn classify_and_route_pm_rest_book(
+        &mut self,
+        raw: &[u8],
+        local_wall_receive_ns: u64,
+        monotonic_receive_ns: u64,
+    ) -> Result<PmPublicCaptureBatch, PmCaptureRoleIngressError> {
+        let batch = self.pm.classify_rest_book_snapshot(
+            raw,
+            local_wall_receive_ns,
+            monotonic_receive_ns,
+        )?;
+        self.route_pm_batch(batch)
+    }
+
+    fn route_pm_batch(
+        &mut self,
+        batch: PmPublicSessionBatch,
+    ) -> Result<PmPublicCaptureBatch, PmCaptureRoleIngressError> {
         let ignored_public_trades =
             u8::try_from(batch.ignored().len()).expect("wire frame event count is bounded at 64");
         let snapshot_flow = batch
@@ -1124,16 +1163,14 @@ impl PmCaptureRoles {
 
     pub(crate) fn after_pm_failure(
         &mut self,
-    ) -> Result<(u64, u64, Duration), PmPublicSessionError> {
-        let prior_epoch = self.pm_epoch();
-        let delay = self.pm.after_failure()?;
-        Ok((prior_epoch, self.pm_epoch(), delay))
+    ) -> Result<PmPublicReconnectTransition, PmPublicSessionError> {
+        self.pm.after_failure_transition()
     }
 
-    pub(crate) fn preview_pm_failure(&self) -> Result<(u64, u64, Duration), PmPublicSessionError> {
-        let prior_epoch = self.pm_epoch();
-        let (next_epoch, delay) = self.pm.preview_after_failure()?;
-        Ok((prior_epoch, next_epoch.value(), delay))
+    pub(crate) fn preview_pm_failure(
+        &self,
+    ) -> Result<PmPublicReconnectTransition, PmPublicSessionError> {
+        self.pm.preview_after_failure_transition()
     }
 
     pub(crate) fn after_okx_failure(
@@ -1421,70 +1458,6 @@ pub enum PmPublicLaneFaultError {
     PmSession(#[from] PmPublicSessionError),
     #[error(transparent)]
     OkxSession(#[from] OkxPublicSessionError),
-    #[error(transparent)]
-    Route(#[from] PmPublicRouteError),
-}
-
-#[derive(Debug, Error)]
-#[allow(
-    clippy::large_enum_variant,
-    reason = "snapshot failure retains exact move-only unavailable evidence on the bounded fail-closed path"
-)]
-pub(crate) enum PmCaptureSnapshotCommitFailure {
-    #[error("PM snapshot commit failed: {source}")]
-    Commit {
-        #[source]
-        source: PmPublicSnapshotCommitError,
-        unavailable: Option<PmPublicUnavailableDelivery>,
-    },
-    #[error(transparent)]
-    Route(#[from] PmPublicRouteError),
-}
-
-#[derive(Debug, Error)]
-#[allow(
-    clippy::large_enum_variant,
-    reason = "book-reduce failure retains exact move-only unavailable evidence on the bounded fail-closed path"
-)]
-pub(crate) enum PmCaptureBookReduceFailure {
-    #[error("PM routed book update reduction failed: {source}")]
-    Reduce {
-        #[source]
-        source: PmPublicBookReduceError,
-        unavailable: Option<PmPublicUnavailableDelivery>,
-    },
-    #[error(transparent)]
-    Route(#[from] PmPublicRouteError),
-}
-
-#[derive(Debug, Error)]
-#[allow(
-    clippy::large_enum_variant,
-    reason = "classification failure retains exact move-only unavailable evidence on the bounded fail-closed path"
-)]
-pub(crate) enum PmCaptureRoleIngressError {
-    #[error(transparent)]
-    PmSession(#[from] PmPublicSessionError),
-    #[error(transparent)]
-    OkxSession(#[from] OkxPublicSessionError),
-    #[error("captured OKX public payload is not UTF-8 text")]
-    OkxRawNotUtf8 {
-        unavailable: Option<OkxPublicUnavailableDelivery>,
-    },
-    #[error(transparent)]
-    Route(#[from] PmPublicRouteError),
-}
-
-#[derive(Debug, Error)]
-pub(crate) enum PmCaptureRoleStartError {
-    #[error(transparent)]
-    Header(#[from] crate::capture::PmCaptureVerifyError),
-    #[error(transparent)]
-    PmSession(#[from] PmPublicSessionError),
-    #[error(transparent)]
-    OkxSession(#[from] OkxPublicSessionError),
-    #[error(transparent)]
-    MetadataContract(#[from] reap_pm_state::PmMetadataContractError),
     #[error(transparent)]
     Route(#[from] PmPublicRouteError),
 }

@@ -29,6 +29,13 @@ pub(crate) trait PmCompleteLaneService: PmPublicLaneService {
     fn stop_complete_service_turn(&self) -> bool {
         false
     }
+
+    /// Holds all canonical lanes below persistence while an ordered durable
+    /// transition is awaiting its exact acknowledgement. Critical and
+    /// persistence still run so the barrier can make progress.
+    fn block_below_persistence(&self) -> bool {
+        false
+    }
 }
 
 /// Fixed-cardinality service counts in the frozen seven-rank order.
@@ -230,6 +237,11 @@ impl PmCompletePublicOwner {
         }
     }
 
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    fn depth(&self) -> usize {
+        self.metrics().depth()
+    }
+
     fn consumer_transfer_poisoned(&self) -> bool {
         match self {
             Self::Capture(run) => run.public_consumer_transfer_poisoned(),
@@ -365,7 +377,7 @@ impl PmCompleteInputLanes {
         ingress: PmCompleteIngress,
         input: PmPrivateInput,
     ) -> Result<(), PmCompleteLaneEnqueueError<PmPrivateInput>> {
-        let ingress = input.fixture_ingress().unwrap_or(ingress);
+        let ingress = input.ingress().unwrap_or(ingress);
         let rank = input.variant_rank();
         let result = self.private.enqueue(
             ingress,
@@ -379,10 +391,10 @@ impl PmCompleteInputLanes {
 
     pub(crate) fn enqueue_reconciliation(
         &mut self,
-        _ingress: PmCompleteIngress,
+        ingress: PmCompleteIngress,
         input: PmReconciliationInput,
     ) -> Result<(), PmCompleteLaneEnqueueError<PmReconciliationInput>> {
-        let ingress = input.fixture_ingress();
+        let ingress = input.ingress().unwrap_or(ingress);
         let rank = input.variant_rank();
         let result = self.reconciliation.enqueue(
             ingress,
@@ -488,6 +500,9 @@ impl PmCompleteInputLanes {
         .map_err(|error| self.observe_service_error(error))?;
         counts.record(PmLaneKind::Persistence, count);
         if consumer.stop_complete_service_turn() {
+            return Ok(counts);
+        }
+        if consumer.block_below_persistence() {
             return Ok(counts);
         }
 
@@ -634,7 +649,36 @@ impl PmCompleteInputLanes {
     }
 
     pub(crate) fn private_and_reconciliation_empty(&self) -> bool {
-        self.private.len() == 0 && self.reconciliation.len() == 0
+        self.private_and_reconciliation_depths() == (0, 0)
+    }
+
+    /// Fixed-order depths for the two authenticated read ranks. These remain
+    /// bounded by their static lane policies and contain no event payloads.
+    pub(crate) fn private_and_reconciliation_depths(&self) -> (usize, usize) {
+        (self.private.len(), self.reconciliation.len())
+    }
+
+    /// Fixed-order depths for all three canonical ranks fed by authenticated
+    /// read transports: public, private, and reconciliation.
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub(crate) fn read_input_lane_depths(&self) -> (usize, usize, usize) {
+        (
+            self.public.depth(),
+            self.private.len(),
+            self.reconciliation.len(),
+        )
+    }
+
+    /// Reports whether the two ranks that can carry an authenticated
+    /// mutation completion or a Goal-F writer acknowledgement are empty.
+    ///
+    /// This is deliberately narrower than a whole-scheduler idle test: the
+    /// authenticated shutdown owner uses it only after socket/read producers
+    /// have been joined, while proving that no mutation durability work can
+    /// be abandoned with the coordinator.
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub(crate) fn goal_f_input_lane_depths(&self) -> (usize, usize) {
+        (self.critical.len(), self.persistence.len())
     }
 
     fn service_schedule<C: PmCompleteLaneService>(

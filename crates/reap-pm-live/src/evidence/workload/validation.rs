@@ -102,7 +102,7 @@ pub(super) fn validate_nominal(
         canonical_order_rows_compacted: cycles,
         owned_fill_keys_compacted: fills,
         canonical_fill_rows_compacted: fills,
-        refresh_tickets_inserted: fills,
+        refresh_tickets_inserted: fills.saturating_add(cancels),
         refresh_tickets_admitted: fills,
         refresh_effects: fills,
         refresh_tickets_completed: fills,

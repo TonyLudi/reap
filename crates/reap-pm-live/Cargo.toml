@@ -3,7 +3,12 @@ name = "reap-pm-live"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+loopback-evidence = ["reap-polymarket-live-adapter/loopback-evidence"]
+
 [dependencies]
+async-trait.workspace = true
 base64.workspace = true
 reap-benchmark-allocator.workspace = true
 reap-capture-framing.workspace = true
@@ -14,6 +19,8 @@ reap-pm-live-contracts.workspace = true
 reap-pm-state.workspace = true
 reap-pm-strategy.workspace = true
 reap-polymarket-adapter.workspace = true
+reap-polymarket-auth.workspace = true
+reap-polymarket-live-adapter.workspace = true
 reap-transport.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -23,6 +30,8 @@ tokio.workspace = true
 
 [dev-dependencies]
 futures-util.workspace = true
+reap-polymarket-live-adapter = { workspace = true, features = ["test-support", "loopback-evidence"] }
+reap-polymarket-wire.workspace = true
 serde_json.workspace = true
 tempfile = "3"
 tokio-tungstenite.workspace = true

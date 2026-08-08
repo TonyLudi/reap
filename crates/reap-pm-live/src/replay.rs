@@ -27,7 +27,8 @@ use crate::capture::{
     MAX_PM_PUBLIC_CAPTURE_ENCODED_BYTES, MAX_PM_PUBLIC_CAPTURE_FRAME_BYTES,
     MAX_PM_PUBLIC_CAPTURE_RAW_FRAMES, MAX_PM_PUBLIC_CAPTURE_RECORDS, OkxCaptureDisconnectReason,
     OkxCaptureLifecycle, PmCaptureDisconnectReason, PmCaptureHeader, PmCaptureLifecycle,
-    PmCaptureVerification, PmPublicCaptureRecord, PmRawPublicFrame, verify_pm_public_capture,
+    PmCaptureVerification, PmPublicCaptureRecord, PmPublicRawTransport, PmRawPublicFrame,
+    verify_pm_public_capture,
 };
 
 const MAX_PM_REPLAY_PROJECTION_BYTES: usize = 16 * 1024 * 1024;
@@ -329,9 +330,10 @@ fn build_runtime(
     let recorded = scope.recorded_metadata()?;
     let metadata_fingerprint = PmMetadataFingerprint::new(recorded.metadata_fingerprint())?;
     let domain_fingerprint = PmDomainFingerprint::new(recorded.domain_fingerprint())?;
-    let role = PmPublicRole::from_expected_metadata(
+    let role = PmPublicRole::new(
         scope.observation_grant()?,
-        scope.metadata(),
+        scope.instrument(),
+        recorded.parser_config(),
         scope.source(),
         scope.connection_id(),
     )?;
@@ -811,11 +813,18 @@ impl ReplayState {
             return Err(PmReplayError::EpochMismatch);
         }
         let raw = frame.decode_raw()?;
-        let batch = session.classify(
-            &raw,
-            frame.local_wall_receive_ns(),
-            frame.monotonic_receive_ns(),
-        )?;
+        let batch = match frame.transport() {
+            PmPublicRawTransport::MarketWebSocket => session.classify(
+                &raw,
+                frame.local_wall_receive_ns(),
+                frame.monotonic_receive_ns(),
+            )?,
+            PmPublicRawTransport::BookRest => session.classify_rest_book_snapshot(
+                &raw,
+                frame.local_wall_receive_ns(),
+                frame.monotonic_receive_ns(),
+            )?,
+        };
         if let Some(heartbeat) = batch.heartbeat() {
             self.counters.heartbeat_pongs = self.counters.heartbeat_pongs.saturating_add(1);
             self.push_logical(PmReplayLogicalEvent::HeartbeatPong {

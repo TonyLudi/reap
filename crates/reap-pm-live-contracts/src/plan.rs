@@ -23,18 +23,25 @@ pub enum PmCompositionRoot {
     Product,
 }
 
-/// The fixed Goal F mutation profile.
+/// The fixed PM mutation profile shared by fake and authenticated backends.
 ///
-/// There is no order-type selector, live endpoint, cancel-all flag, or signer.
+/// There is no backend selector, order-type selector, endpoint, cancel-all
+/// flag, or signer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PmFakeExecutionProfile {
+pub struct PmFixedExecutionProfile {
     private: (),
 }
 
-impl PmFakeExecutionProfile {
+impl PmFixedExecutionProfile {
+    #[must_use]
+    pub const fn gtc_post_only_owned_cancel() -> Self {
+        Self { private: () }
+    }
+
+    /// Compatibility constructor for the completed Goal F fake composition.
     #[must_use]
     pub const fn goal_f() -> Self {
-        Self { private: () }
+        Self::gtc_post_only_owned_cancel()
     }
 
     #[must_use]
@@ -42,6 +49,11 @@ impl PmFakeExecutionProfile {
         true
     }
 }
+
+/// Compatibility name for callers that construct the Goal F fake backend.
+///
+/// The plan itself is backend-neutral; this alias does not select a backend.
+pub type PmFakeExecutionProfile = PmFixedExecutionProfile;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PmPlanEntry {
@@ -273,13 +285,8 @@ impl ConstructedRoleBinding {
             instrument_id,
         };
         [
-            binding(
-                Id::FakePlaceGtcPostOnly,
-                scope,
-                Role::PmOwnedExecution,
-                None,
-            ),
-            binding(Id::FakeCancelOwned, scope, Role::PmOwnedExecution, None),
+            binding(Id::PlaceGtcPostOnly, scope, Role::PmOwnedExecution, None),
+            binding(Id::CancelOwned, scope, Role::PmOwnedExecution, None),
         ]
     }
 
@@ -368,7 +375,7 @@ impl PmConnectivityPlan {
     pub fn product(
         config: PmConnectivityConfig,
         model: PmModelInputRequirements,
-        _profile: PmFakeExecutionProfile,
+        _profile: PmFixedExecutionProfile,
     ) -> Result<Self, PmPlanError> {
         let model_requirements = translate_model_requirements(
             config.public().okx_reference(),
@@ -762,20 +769,20 @@ fn execution_entries(config: &PmAccountConnectivityConfig) -> [PmPlanEntry; 2] {
     };
     [
         entry(
-            PmRequirementKey::new(Id::FakePlaceGtcPostOnly, scope),
-            Origin::FixedFakeExecutionProfile,
-            Consumer::FakeEffectWorker,
+            PmRequirementKey::new(Id::PlaceGtcPostOnly, scope),
+            Origin::FixedExecutionProfile,
+            Consumer::EffectDispatcher,
             Role::PmOwnedExecution,
-            PmCapabilityLane::FakeEffect,
+            PmCapabilityLane::EffectDispatch,
             Readiness::OwnedExecution,
             None,
         ),
         entry(
-            PmRequirementKey::new(Id::FakeCancelOwned, scope),
-            Origin::FixedFakeExecutionProfile,
+            PmRequirementKey::new(Id::CancelOwned, scope),
+            Origin::FixedExecutionProfile,
             Consumer::OwnedCancellation,
             Role::PmOwnedExecution,
-            PmCapabilityLane::FakeEffect,
+            PmCapabilityLane::EffectDispatch,
             Readiness::OwnedExecution,
             None,
         ),

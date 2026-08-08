@@ -8,8 +8,13 @@ fn strategy_slice_stays_pure_and_capability_narrow() {
     for forbidden_dependency in [
         "reap-polymarket-wire",
         "reap-polymarket-adapter",
+        "reap-polymarket-auth",
+        "reap-polymarket-live-adapter",
         "reap-pm-live",
         "reap-pm-state",
+        "reap-transport",
+        "reap-okx-public-source",
+        "reap-okx-live-adapter",
         "serde",
         "tokio",
         "reqwest",

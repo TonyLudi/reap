@@ -378,6 +378,7 @@ fn reservation_or_fill_reason(
             }
             PmFillSettlementStatus::Failed => PmPrivateReadinessReason::FillSettlementFailed(fill),
             PmFillSettlementStatus::Matched
+            | PmFillSettlementStatus::MatchedNotBroadcasted
             | PmFillSettlementStatus::Mined
             | PmFillSettlementStatus::Confirmed => {
                 unreachable!("resolved settlement was filtered")

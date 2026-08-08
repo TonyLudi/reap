@@ -15,8 +15,8 @@ use reap_pm_core::{
 };
 use reap_pm_state::{
     PmAccountSnapshotApply, PmCardinalityRiskLimits, PmExactReservation, PmExposureRiskLimits,
-    PmFillApply, PmFillFeeState, PmFreshnessRiskLimits, PmOpenOrderReservation, PmOpenOrdersApply,
-    PmOrderApply, PmOrderOwnership, PmOrderRiskLimits, PmOwnedCancelOutcome,
+    PmFillApply, PmFillFeeState, PmFillStateError, PmFreshnessRiskLimits, PmOpenOrderReservation,
+    PmOpenOrdersApply, PmOrderApply, PmOrderOwnership, PmOrderRiskLimits, PmOwnedCancelOutcome,
     PmOwnedCancelRequestApply, PmOwnedCancelState, PmOwnedFillApply, PmOwnedIntentId,
     PmOwnedObservationOccurrence, PmOwnedObservationSource, PmOwnedOrderLifecycleError,
     PmOwnedOrderRegistration, PmOwnedProgressApply, PmOwnedQuoteAdmission, PmOwnedQuoteIntent,
@@ -552,6 +552,59 @@ fn make_ready(state: &mut PmPrivateState) {
 }
 
 #[test]
+fn recovered_fill_cursor_initializes_fresh_state_exactly_once() {
+    let cursor = PmFillQueryCursor::new(scope(), [0x71; 32]);
+    let mut state = unstarted_state();
+
+    state.initialize_recovered_fill_watermark(cursor).unwrap();
+    assert_eq!(state.fill_watermark(), Some(cursor));
+    assert_eq!(state.convergence(), PmPrivateConvergence::Uninitialized);
+    assert!(matches!(
+        state.initialize_recovered_fill_watermark(cursor),
+        Err(PmPrivateStateError::Fill(
+            PmFillStateError::RecoveryCursorAlreadyInitialized
+        ))
+    ));
+}
+
+#[test]
+fn recovered_fill_cursor_rejects_foreign_scope_and_nonfresh_fill_state() {
+    let foreign_scope = PmAccountScope::new(
+        scope().environment(),
+        scope().chain(),
+        scope().signer(),
+        scope().funder(),
+        PmAccountHandle::from_ordinal(99),
+    );
+    let mut foreign = unstarted_state();
+    assert!(matches!(
+        foreign
+            .initialize_recovered_fill_watermark(PmFillQueryCursor::new(foreign_scope, [0x72; 32])),
+        Err(PmPrivateStateError::Fill(
+            PmFillStateError::RecoveryCursorScopeMismatch
+        ))
+    ));
+
+    let mut nonfresh = new_state();
+    let observed = fill(
+        "recovery-seed-order",
+        "recovery-seed-fill",
+        PmOrderSide::Buy,
+        "0.25",
+        PmFillFee::Unknown,
+    );
+    nonfresh
+        .observe_fill(envelope(observed, 1, 10, None, 10))
+        .unwrap();
+    assert!(matches!(
+        nonfresh.initialize_recovered_fill_watermark(PmFillQueryCursor::new(scope(), [0x73; 32])),
+        Err(PmPrivateStateError::Fill(
+            PmFillStateError::RecoveryCursorStateNotFresh
+        ))
+    ));
+}
+
+#[test]
 fn combined_quote_evaluation_matches_legacy_ready_and_risk_effects() {
     let reference = PmRiskDependency::available(120);
     let book = PmRiskDependency::available(120);
@@ -1076,6 +1129,389 @@ fn a_reconciliation_row_cannot_cover_or_overwrite_a_later_ws_fill() {
 }
 
 #[test]
+fn complete_cut_can_skip_unobserved_settlement_steps_without_reapplying_principal() {
+    let mut state = new_state();
+    make_ready(&mut state);
+    let fee = PmFillFee::Known {
+        asset: domain().collateral(),
+        delta: PmSignedUnits::ZERO,
+    };
+    let matched = fill_with_settlement(
+        "settlement-skip",
+        "trade-settlement-skip",
+        PmOrderSide::Buy,
+        "0.25",
+        PmFillSettlementStatus::Matched,
+        fee,
+    );
+    state
+        .observe_fill(envelope(matched, 1, 30, None, 120))
+        .unwrap();
+    let first_occurrence = state.fills().next().unwrap().first_occurrence();
+    let confirmed = fill_with_settlement(
+        "settlement-skip",
+        "trade-settlement-skip",
+        PmOrderSide::Buy,
+        "0.25",
+        PmFillSettlementStatus::Confirmed,
+        fee,
+    );
+    let cut = boundary(40, 41);
+    state
+        .apply_reconciliation(
+            envelope(
+                account_snapshot(3, cut, AccountFacts::ready()),
+                1,
+                41,
+                Some(3),
+                130,
+            ),
+            envelope(
+                fill_query(3, cut, state.fill_watermark(), 2, vec![confirmed]),
+                1,
+                41,
+                Some(3),
+                130,
+            ),
+        )
+        .unwrap();
+
+    let projection = state.fills().next().unwrap();
+    assert_eq!(projection.key(), matched.fill_key());
+    assert_eq!(projection.first_occurrence(), first_occurrence);
+    assert_eq!(
+        projection.last_occurrence().private_occurrence(),
+        Some(PmPrivateOccurrence::new(
+            ConnectionEpoch::new(1),
+            IngressSequence::new(41),
+        ))
+    );
+    assert_eq!(
+        projection.last_occurrence().snapshot_revision(),
+        Some(SnapshotRevision::new(3))
+    );
+    assert_eq!(
+        projection.covered_by_reconciliation(),
+        Some(PmPrivateOccurrence::new(
+            ConnectionEpoch::new(1),
+            IngressSequence::new(41),
+        ))
+    );
+    assert_eq!(projection.settlement(), PmFillSettlementStatus::Confirmed);
+    assert_eq!(state.fill_counters().principal_applications(), 1);
+    assert_eq!(state.provisional_deltas().uncovered_fills(), 0);
+}
+
+#[test]
+fn complete_cut_keeps_unresolved_fee_facts_blocking_and_uncompacted() {
+    let cases = [
+        ("unknown", PmFillFee::Unknown),
+        ("incomplete", PmFillFee::Incomplete),
+        (
+            "unmapped",
+            PmFillFee::Known {
+                asset: PmAssetId::collateral(address(99)),
+                delta: PmSignedUnits::ZERO,
+            },
+        ),
+    ];
+    for (index, (label, fee)) in cases.into_iter().enumerate() {
+        let mut state = new_state();
+        make_ready(&mut state);
+        let observed = fill_with_settlement(
+            &format!("unresolved-fee-order-{label}"),
+            &format!("unresolved-fee-fill-{label}"),
+            PmOrderSide::Buy,
+            "0.25",
+            PmFillSettlementStatus::Confirmed,
+            fee,
+        );
+        state
+            .observe_fill(envelope(observed, 1, 30, None, 120))
+            .unwrap();
+        let ordinal = u64::try_from(index).unwrap();
+        let cut = boundary(40 + ordinal * 10, 41 + ordinal * 10);
+        state
+            .apply_reconciliation(
+                envelope(
+                    account_snapshot(3 + ordinal, cut, AccountFacts::ready()),
+                    1,
+                    cut.completion_sequence().value(),
+                    Some(3 + ordinal),
+                    130 + ordinal,
+                ),
+                envelope(
+                    fill_query(
+                        3 + ordinal,
+                        cut,
+                        state.fill_watermark(),
+                        2 + u8::try_from(index).unwrap(),
+                        vec![observed],
+                    ),
+                    1,
+                    cut.completion_sequence().value(),
+                    Some(3 + ordinal),
+                    130 + ordinal,
+                ),
+            )
+            .unwrap();
+
+        let projection = state.fills().next().unwrap();
+        assert_eq!(projection.key(), observed.fill_key());
+        assert!(projection.covered_by_reconciliation().is_some());
+        assert!(matches!(
+            state.quote_readiness(quote(140 + ordinal)),
+            PmPrivateReadiness::Blocked(
+                PmPrivateReadinessReason::FillFeeUnknown(_)
+                    | PmPrivateReadinessReason::FillFeeIncomplete(_)
+                    | PmPrivateReadinessReason::FillFeeAssetUnmapped { .. }
+            )
+        ));
+        let compaction = state.prepare_fill_watermark_compaction().unwrap();
+        let compacted = state.commit_fill_watermark_compaction(compaction).unwrap();
+        assert_eq!(compacted.canonical_fill_rows(), 0);
+        assert_eq!(state.fills().next().unwrap().key(), observed.fill_key());
+    }
+}
+
+#[test]
+fn later_exact_zero_fee_enrichment_becomes_compactable_without_reapplying_principal() {
+    let mut state = new_state();
+    make_ready(&mut state);
+    let unknown = fill_with_settlement(
+        "fee-enrichment-order",
+        "fee-enrichment-fill",
+        PmOrderSide::Buy,
+        "0.25",
+        PmFillSettlementStatus::Confirmed,
+        PmFillFee::Unknown,
+    );
+    state
+        .observe_fill(envelope(unknown, 1, 30, None, 120))
+        .unwrap();
+    let first_cut = boundary(40, 41);
+    state
+        .apply_reconciliation(
+            envelope(
+                account_snapshot(3, first_cut, AccountFacts::ready()),
+                1,
+                41,
+                Some(3),
+                130,
+            ),
+            envelope(
+                fill_query(3, first_cut, state.fill_watermark(), 2, vec![unknown]),
+                1,
+                41,
+                Some(3),
+                130,
+            ),
+        )
+        .unwrap();
+    let unresolved = state
+        .pending_refreshes()
+        .find(|ticket| ticket.key().reason() == PmRefreshReason::FillFeeUnknown)
+        .unwrap();
+    assert_eq!(
+        state.mark_refresh_admitted(unresolved).unwrap(),
+        PmRefreshAdmission::Admitted(unresolved)
+    );
+    let first_compaction = state.prepare_fill_watermark_compaction().unwrap();
+    assert_eq!(
+        state
+            .commit_fill_watermark_compaction(first_compaction)
+            .unwrap()
+            .canonical_fill_rows(),
+        0
+    );
+
+    let known = fill_with_settlement(
+        "fee-enrichment-order",
+        "fee-enrichment-fill",
+        PmOrderSide::Buy,
+        "0.25",
+        PmFillSettlementStatus::Confirmed,
+        PmFillFee::Known {
+            asset: domain().collateral(),
+            delta: PmSignedUnits::ZERO,
+        },
+    );
+    let second_cut = boundary(50, 51);
+    state
+        .apply_reconciliation(
+            envelope(
+                account_snapshot(4, second_cut, AccountFacts::ready()),
+                1,
+                51,
+                Some(4),
+                140,
+            ),
+            envelope(
+                fill_query(4, second_cut, state.fill_watermark(), 3, vec![known]),
+                1,
+                51,
+                Some(4),
+                140,
+            ),
+        )
+        .unwrap();
+    assert!(matches!(
+        state.fills().next().unwrap().fee(),
+        PmFillFeeState::Known { asset, delta }
+            if asset == domain().collateral() && delta == PmSignedUnits::ZERO
+    ));
+    assert_eq!(state.fill_counters().principal_applications(), 1);
+    assert!(matches!(
+        state.complete_refresh(unresolved).unwrap(),
+        reap_pm_state::PmRefreshCompletion::Cleared(completed) if completed == unresolved
+    ));
+    assert!(matches!(
+        state.quote_readiness(quote(150)),
+        PmPrivateReadiness::Ready(_)
+    ));
+    let second_compaction = state.prepare_fill_watermark_compaction().unwrap();
+    assert_eq!(
+        state
+            .commit_fill_watermark_compaction(second_compaction)
+            .unwrap()
+            .canonical_fill_rows(),
+        1
+    );
+    assert!(state.fills().next().is_none());
+}
+
+#[test]
+fn complete_cut_keeps_retrying_and_failed_settlement_uncompacted() {
+    for (index, settlement) in [
+        PmFillSettlementStatus::Retrying,
+        PmFillSettlementStatus::Failed,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut state = new_state();
+        make_ready(&mut state);
+        let suffix = if settlement == PmFillSettlementStatus::Retrying {
+            "retrying"
+        } else {
+            "failed"
+        };
+        let observed = fill_with_settlement(
+            &format!("unresolved-settlement-order-{suffix}"),
+            &format!("unresolved-settlement-fill-{suffix}"),
+            PmOrderSide::Buy,
+            "0.25",
+            settlement,
+            PmFillFee::Known {
+                asset: domain().collateral(),
+                delta: PmSignedUnits::ZERO,
+            },
+        );
+        state
+            .observe_fill(envelope(observed, 1, 30, None, 120))
+            .unwrap();
+        let ordinal = u64::try_from(index).unwrap();
+        let cut = boundary(40 + ordinal * 10, 41 + ordinal * 10);
+        state
+            .apply_reconciliation(
+                envelope(
+                    account_snapshot(3 + ordinal, cut, AccountFacts::ready()),
+                    1,
+                    cut.completion_sequence().value(),
+                    Some(3 + ordinal),
+                    130 + ordinal,
+                ),
+                envelope(
+                    fill_query(
+                        3 + ordinal,
+                        cut,
+                        state.fill_watermark(),
+                        2 + u8::try_from(index).unwrap(),
+                        vec![observed],
+                    ),
+                    1,
+                    cut.completion_sequence().value(),
+                    Some(3 + ordinal),
+                    130 + ordinal,
+                ),
+            )
+            .unwrap();
+        assert!(matches!(
+            state.quote_readiness(quote(140 + ordinal)),
+            PmPrivateReadiness::Blocked(
+                PmPrivateReadinessReason::FillSettlementRetrying(_)
+                    | PmPrivateReadinessReason::FillSettlementFailed(_)
+            )
+        ));
+        let compaction = state.prepare_fill_watermark_compaction().unwrap();
+        assert_eq!(
+            state
+                .commit_fill_watermark_compaction(compaction)
+                .unwrap()
+                .canonical_fill_rows(),
+            0
+        );
+        assert_eq!(state.fills().next().unwrap().key(), observed.fill_key());
+    }
+}
+
+#[test]
+fn complete_cut_settlement_progress_still_rejects_changed_principal() {
+    let mut state = new_state();
+    make_ready(&mut state);
+    let fee = PmFillFee::Known {
+        asset: domain().collateral(),
+        delta: PmSignedUnits::ZERO,
+    };
+    let matched = fill_with_settlement(
+        "settlement-principal",
+        "trade-settlement-principal",
+        PmOrderSide::Buy,
+        "0.25",
+        PmFillSettlementStatus::Matched,
+        fee,
+    );
+    state
+        .observe_fill(envelope(matched, 1, 30, None, 120))
+        .unwrap();
+    let contradictory = fill_with_settlement(
+        "settlement-principal",
+        "trade-settlement-principal",
+        PmOrderSide::Sell,
+        "0.25",
+        PmFillSettlementStatus::Confirmed,
+        fee,
+    );
+    let prior_watermark = state.fill_watermark();
+    let cut = boundary(40, 41);
+    assert!(matches!(
+        state.apply_reconciliation(
+            envelope(
+                account_snapshot(3, cut, AccountFacts::ready()),
+                1,
+                41,
+                Some(3),
+                130,
+            ),
+            envelope(
+                fill_query(3, cut, prior_watermark, 2, vec![contradictory],),
+                1,
+                41,
+                Some(3),
+                130,
+            ),
+        ),
+        Err(PmPrivateStateError::Fill(PmFillStateError::Conflict))
+    ));
+    let projection = state.fills().next().unwrap();
+    assert_eq!(projection.key(), matched.fill_key());
+    assert_eq!(projection.settlement(), PmFillSettlementStatus::Matched);
+    assert_eq!(projection.covered_by_reconciliation(), None);
+    assert_eq!(state.fill_watermark(), prior_watermark);
+    assert_eq!(state.fill_counters().principal_applications(), 1);
+}
+
+#[test]
 fn conflicting_fill_at_the_same_occurrence_is_rejected_without_double_principal() {
     let mut state = new_state();
     let fee = PmFillFee::Known {
@@ -1293,16 +1729,23 @@ fn canonical_owned_order_does_not_emit_an_unmanaged_refresh_requirement() {
         PmOrderStatus::Open,
         0,
     );
+    let refresh_requirements_before = state.refresh_counters().requirements();
     state
         .observe_order(
             envelope(observed, 1, 30, None, 120),
             PmRemoteOrderKnowledge::Unmanaged(PmReservationKnowledge::Known(reservation)),
         )
         .unwrap();
-    assert!(state.pending_refresh_keys().all(|key| !matches!(
-        key.reason(),
-        PmRefreshReason::UnmanagedOrder | PmRefreshReason::AmbiguousOrder
-    )));
+    assert_eq!(
+        state.refresh_counters().requirements(),
+        refresh_requirements_before,
+        "canonical owned observation must not add a refresh requirement"
+    );
+    assert!(
+        state
+            .pending_refresh_keys()
+            .all(|key| key.reason() != PmRefreshReason::UnmanagedOrder)
+    );
 }
 
 #[test]
@@ -2105,7 +2548,7 @@ fn account_snapshot_duplicate_is_idempotent_and_does_not_zero_later_state() {
 }
 
 #[test]
-fn fill_settlement_progression_is_idempotent_and_retry_failure_needs_a_new_cut() {
+fn fill_settlement_progression_is_idempotent_and_failed_settlement_remains_unresolved() {
     let mut state = new_state();
     make_ready(&mut state);
     let known_fee = PmFillFee::Known {
@@ -2168,7 +2611,7 @@ fn fill_settlement_progression_is_idempotent_and_retry_failure_needs_a_new_cut()
         "trade-settlement-b",
         PmOrderSide::Buy,
         "0.25",
-        PmFillSettlementStatus::Matched,
+        PmFillSettlementStatus::MatchedNotBroadcasted,
         known_fee,
     );
     state
@@ -2204,6 +2647,24 @@ fn fill_settlement_progression_is_idempotent_and_retry_failure_needs_a_new_cut()
     assert!(matches!(
         state.quote_readiness(quote(131)),
         PmPrivateReadiness::Ready(_)
+    ));
+
+    let broadcast = fill_with_settlement(
+        "settlement-b",
+        "trade-settlement-b",
+        PmOrderSide::Buy,
+        "0.25",
+        PmFillSettlementStatus::Matched,
+        known_fee,
+    );
+    assert!(matches!(
+        state
+            .observe_fill(envelope(broadcast, 1, 49, None, 139))
+            .unwrap(),
+        PmFillApply::Enriched {
+            settlement: PmFillSettlementStatus::Matched,
+            ..
+        }
     ));
 
     let retrying = fill_with_settlement(
@@ -2269,10 +2730,14 @@ fn fill_settlement_progression_is_idempotent_and_retry_failure_needs_a_new_cut()
         )
         .unwrap();
     assert_eq!(state.provisional_deltas().uncovered_fills(), 0);
-    assert!(matches!(
+    // The complete cut covers the fill principal, but it cannot turn a terminal
+    // failed settlement into authoritative settlement evidence.
+    assert_eq!(
         state.quote_readiness(quote(151)),
-        PmPrivateReadiness::Ready(_)
-    ));
+        PmPrivateReadiness::Blocked(PmPrivateReadinessReason::FillSettlementFailed(
+            failed.fill_key()
+        ))
+    );
 }
 
 #[test]

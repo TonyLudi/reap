@@ -23,8 +23,9 @@ use reap_pm_live_contracts::{
 };
 use reap_pm_state::{
     PmCardinalityRiskLimits, PmExactReservation, PmExposureRiskLimits, PmFreshnessRiskLimits,
-    PmOpenOrdersApply, PmOrderRiskLimits, PmOwnedCancelState, PmOwnedSubmitState,
-    PmReconciliationApply, PmRiskLimits,
+    PmOpenOrdersApply, PmOrderOwnership, PmOrderRiskLimits, PmOwnedCancelState, PmOwnedSubmitState,
+    PmPrivateQuoteRequest, PmPrivateReadiness, PmReconciliationApply, PmRefreshReason,
+    PmRiskLimits,
 };
 use reap_pm_strategy::{PmQuotePolicyInput, validate_passive_quote_candidate};
 use reap_polymarket_adapter::{
@@ -35,18 +36,18 @@ use reap_polymarket_adapter::{
 use tempfile::TempDir;
 
 use super::{
-    PmCancelMutationAdmission, PmCancelMutationRequest, PmDurableConsequence, PmMutationError,
-    PmMutationHalt, PmMutationOwner, PmPersistenceService, PmQuoteMutationAdmission,
-    PmQuoteMutationRequest,
+    PmCancelMutationAdmission, PmCancelMutationRequest, PmDurableConsequence, PmGoalFWriterFailure,
+    PmGoalFWriterFailureIdentity, PmGoalFWriterFailureReason, PmMutationError, PmMutationHalt,
+    PmMutationOwner, PmPersistenceService, PmQuoteMutationAdmission, PmQuoteMutationRequest,
 };
 use crate::coordinator::PmAuthorityRevisions;
 use crate::coordinator::effect_queue::{PM_FAKE_EFFECT_CAPACITY, PmFakeEffectQueueError};
 use crate::coordinator::effects::PmDurableRecordKind;
 use crate::coordinator::persistence::{
     PM_PENDING_PERSISTENCE_CAPACITY, PM_PENDING_PERSISTENCE_MAX_AGE_NS, PmPendingPersistence,
-    PmPersistenceError, PmPersistenceIntentIdentity,
+    PmPersistenceError, PmPersistenceFailure, PmPersistenceIntentIdentity,
 };
-use crate::fake_effect::PmFakeEffectRole;
+use crate::fake_effect::{PmFakeEffectRole, PmFixtureEffectExecutor};
 use crate::journal::{
     PmJournalCancelReasonV1, PmJournalFillCursorV1, PmJournalFillWatermarkV1,
     PmJournalFingerprintV1, PmJournalRecordV1, PmJournalRecoveredPlaceV1, PmJournalSafetyHaltV1,
@@ -65,12 +66,15 @@ const READY_BASELINE_FACT_RECORDS: u64 = 1;
 const READY_BASELINE_JOURNAL_RECORDS: usize = 1;
 
 fn fixture() -> PmConnectivityConfig {
+    fixture_for_eoa(EvmAddress::from_bytes([4; 20]).unwrap())
+}
+
+fn fixture_for_eoa(eoa: EvmAddress) -> PmConnectivityConfig {
     let instrument = PmInstrumentHandle::new(
         PmMarketHandle::from_ordinal(0),
         PmTokenHandle::from_ordinal(0),
     );
     let reference = OkxReferenceHandle::from_ordinal(0);
-    let eoa = EvmAddress::from_bytes([4; 20]).unwrap();
     let account_scope = PmAccountScope::new(
         PmEnvironmentId::new("mutation-owner-test").unwrap(),
         PmChainId::new(137).unwrap(),
@@ -181,6 +185,15 @@ fn authority_revisions(value: u64) -> PmAuthorityRevisions {
     .unwrap()
 }
 
+fn fixture_executor(config: &PmConnectivityConfig) -> PmFixtureEffectExecutor {
+    let account = config.account();
+    PmFixtureEffectExecutor::new(
+        account.account_scope(),
+        account.instrument(),
+        account.instrument_id(),
+    )
+}
+
 async fn start_owner(config: &PmConnectivityConfig, journal_path: &Path) -> PmMutationOwner {
     let account = config.account();
     let private = PmPrivateMonitorRuntime::new(account, risk_limits()).unwrap();
@@ -189,7 +202,7 @@ async fn start_owner(config: &PmConnectivityConfig, journal_path: &Path) -> PmMu
         account.instrument(),
         account.instrument_id(),
     );
-    let (owner, recovery) =
+    let (owner, recovery, _fake_executor) =
         PmMutationOwner::start(config, Box::new(private), fake, journal_path.to_path_buf())
             .await
             .unwrap();
@@ -224,9 +237,11 @@ async fn restart_owner(
         account.instrument(),
         account.instrument_id(),
     );
-    PmMutationOwner::start(config, Box::new(private), fake, journal_path.to_path_buf())
-        .await
-        .unwrap()
+    let (owner, recovery, _fake_executor) =
+        PmMutationOwner::start(config, Box::new(private), fake, journal_path.to_path_buf())
+            .await
+            .unwrap();
+    (owner, recovery)
 }
 
 fn make_private_ready(owner: &mut PmMutationOwner, config: &PmConnectivityConfig) {
@@ -281,18 +296,26 @@ fn make_private_ready(owner: &mut PmMutationOwner, config: &PmConnectivityConfig
 }
 
 fn prime_restarted_private(owner: &mut PmMutationOwner, config: &PmConnectivityConfig) {
+    prime_restarted_private_on_epoch(owner, config, 1);
+}
+
+fn prime_restarted_private_on_epoch(
+    owner: &mut PmMutationOwner,
+    config: &PmConnectivityConfig,
+    epoch: u64,
+) {
     let account = config.account();
     let route = account.account_route();
     owner
         .private_mut()
-        .prepare_product_private_reconnect(ConnectionEpoch::new(1))
+        .prepare_product_private_reconnect(ConnectionEpoch::new(epoch))
         .unwrap();
     owner
         .private_mut()
         .reduce_serviced_connection_available(
             route.source(),
             route.connection(),
-            ConnectionEpoch::new(1),
+            ConnectionEpoch::new(epoch),
             200,
         )
         .unwrap();
@@ -311,7 +334,7 @@ fn prime_restarted_private(owner: &mut PmMutationOwner, config: &PmConnectivityC
                 route.source(),
                 route.connection(),
                 clock(201),
-                ordering(1, 211, Some(1)),
+                ordering(epoch, 211, Some(1)),
                 open_orders,
             )
             .unwrap(),
@@ -413,6 +436,34 @@ fn reconciliation_pair_with_fills(
     EventEnvelope<PmCompleteAccountSnapshot>,
     EventEnvelope<PmCompleteFillQuery>,
 ) {
+    reconciliation_pair_with_fills_on_epoch(
+        config,
+        1,
+        revision,
+        request,
+        completion,
+        requested_after,
+        resulting,
+        fills,
+        monotonic_ns,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconciliation_pair_with_fills_on_epoch(
+    config: &PmConnectivityConfig,
+    epoch: u64,
+    revision: u64,
+    request: u64,
+    completion: u64,
+    requested_after: Option<u8>,
+    resulting: u8,
+    fills: Vec<PmFillEvent>,
+    monotonic_ns: u64,
+) -> (
+    EventEnvelope<PmCompleteAccountSnapshot>,
+    EventEnvelope<PmCompleteFillQuery>,
+) {
     let cut = boundary(request, completion);
     let account = account_snapshot(config, revision, cut);
     let scope = config.account().account_scope();
@@ -427,11 +478,18 @@ fn reconciliation_pair_with_fills(
     )
     .unwrap();
     (
-        envelope(config, account, 1, completion, Some(revision), monotonic_ns),
+        envelope(
+            config,
+            account,
+            epoch,
+            completion,
+            Some(revision),
+            monotonic_ns,
+        ),
         envelope(
             config,
             fill_query,
-            1,
+            epoch,
             completion,
             Some(revision),
             monotonic_ns,
@@ -584,6 +642,24 @@ fn owned_fill(
     id: &str,
     quantity: &str,
 ) -> PmFillEvent {
+    owned_fill_with_settlement(
+        config,
+        client_order,
+        venue_order,
+        id,
+        quantity,
+        PmFillSettlementStatus::Matched,
+    )
+}
+
+fn owned_fill_with_settlement(
+    config: &PmConnectivityConfig,
+    client_order: reap_pm_core::PmClientOrderKey,
+    venue_order: PmVenueOrderKey,
+    id: &str,
+    quantity: &str,
+    settlement: PmFillSettlementStatus,
+) -> PmFillEvent {
     PmFillEvent::new(
         config.account().account_route().source(),
         config.account().instrument(),
@@ -592,7 +668,7 @@ fn owned_fill(
         PmFillExecution::new(
             PmOrderSide::Buy,
             PmFillRole::Maker,
-            PmFillSettlementStatus::Matched,
+            settlement,
             PmPrice::parse_decimal("0.40").unwrap(),
             PmQuantity::parse_decimal(quantity).unwrap(),
             PmFillFee::Unknown,
@@ -733,6 +809,7 @@ async fn place_resting_quote(
     wait_for_prepared_quotes(owner, 1, 121).await;
     owner
         .execute_next_quote(
+            &fixture_executor(config),
             PmFakePlaceScript::acknowledged(venue, Box::new([])).unwrap(),
             122,
         )
@@ -778,6 +855,7 @@ async fn quote_intent_is_durable_before_first_fake_dispatch() {
     );
     assert!(matches!(
         owner.execute_next_quote(
+            &fixture_executor(&config),
             PmFakePlaceScript::rejected(PmFakePlaceRejectReason::FixtureRejected),
             121,
         ),
@@ -791,6 +869,7 @@ async fn quote_intent_is_durable_before_first_fake_dispatch() {
     let venue = venue_order(&config, "storage-before-dispatch");
     owner
         .execute_next_quote(
+            &fixture_executor(&config),
             PmFakePlaceScript::acknowledged(venue, Box::new([])).unwrap(),
             122,
         )
@@ -827,6 +906,7 @@ async fn immediate_full_fill_reduces_exact_principal_and_two_durable_facts() {
     );
     owner
         .execute_next_quote(
+            &fixture_executor(&config),
             PmFakePlaceScript::acknowledged(venue, vec![immediate].into_boxed_slice()).unwrap(),
             122,
         )
@@ -877,6 +957,7 @@ async fn fake_place_rejection_is_terminal_and_durable_without_venue_binding() {
     wait_for_prepared_quotes(&mut owner, 1, 121).await;
     owner
         .execute_next_quote(
+            &fixture_executor(&config),
             PmFakePlaceScript::rejected(PmFakePlaceRejectReason::PostOnlyWouldTake),
             122,
         )
@@ -914,7 +995,11 @@ async fn ambiguous_timeout_then_late_fake_ack_converges_and_replays_bound() {
     let client = admit_quote(&mut owner, &config, PmOrderSide::Buy, 1);
     wait_for_prepared_quotes(&mut owner, 1, 121).await;
     owner
-        .execute_next_quote(PmFakePlaceScript::acknowledgement_unknown(), 122)
+        .execute_next_quote(
+            &fixture_executor(&config),
+            PmFakePlaceScript::acknowledgement_unknown(),
+            122,
+        )
         .unwrap();
     let ambiguous = owner.private_mut().owned_order(client).unwrap();
     assert_eq!(ambiguous.submit(), PmOwnedSubmitState::Ambiguous);
@@ -983,6 +1068,7 @@ async fn both_sides_admitted_under_one_revision_remain_dispatchable_in_owner_ord
     );
     owner
         .execute_next_quote(
+            &fixture_executor(&config),
             PmFakePlaceScript::acknowledged(first_venue, vec![first_fill].into_boxed_slice())
                 .unwrap(),
             122,
@@ -1003,6 +1089,7 @@ async fn both_sides_admitted_under_one_revision_remain_dispatchable_in_owner_ord
     let second_venue = venue_order(&config, "paired-sell");
     owner
         .execute_next_quote(
+            &fixture_executor(&config),
             PmFakePlaceScript::acknowledged(second_venue, Box::new([])).unwrap(),
             123,
         )
@@ -1070,6 +1157,7 @@ async fn assert_quote_invalidated_after_durable_intent(case: InvalidationCase) {
     assert!(owner.pop_durable_consequence().is_none());
     assert!(matches!(
         owner.execute_next_quote(
+            &fixture_executor(&config),
             PmFakePlaceScript::rejected(PmFakePlaceRejectReason::FixtureRejected),
             service_ns.saturating_add(1),
         ),
@@ -1149,12 +1237,23 @@ async fn cancel_outcomes_map_to_exact_owned_states() {
             } if client_order == client && venue_order == venue
         ));
         wait_for_prepared_cancel(&mut owner, 131).await;
-        owner.execute_next_cancel(script, 132).unwrap();
+        owner
+            .execute_next_cancel(&fixture_executor(&config), script, 132)
+            .unwrap();
 
         let order = owner.private_mut().owned_order(client).unwrap();
         assert_eq!(order.status(), status);
         assert_eq!(order.cancel(), cancel);
         assert_eq!(order.reconciliation_required(), reconciliation_required);
+        let expects_missing_detail = index == 0;
+        assert_eq!(owner.has_missing_order_detail(), expects_missing_detail);
+        assert_eq!(
+            owner
+                .pending_refresh(PmRefreshReason::MissingOrderDetail)
+                .is_some(),
+            expects_missing_detail,
+            "only a conclusive accepted cancel may create the exact missing-detail refresh"
+        );
         assert_eq!(owner.counters().cancel_results(), 1);
         assert_eq!(
             owner.pop_durable_consequence().unwrap().kind(),
@@ -1230,7 +1329,11 @@ async fn replacement_preflight_leaves_cancel_state_for_the_durable_cancel_owner(
 
     wait_for_prepared_cancel(&mut owner, 131).await;
     owner
-        .execute_next_cancel(PmFakeCancelScript::accepted(), 132)
+        .execute_next_cancel(
+            &fixture_executor(&config),
+            PmFakeCancelScript::accepted(),
+            132,
+        )
         .unwrap();
     drain_persistence(&mut owner, 133).await;
     owner.shutdown().await.unwrap();
@@ -1254,7 +1357,11 @@ async fn fill_winning_cancel_race_converges_for_late_cancel_result() {
     assert_eq!(filled.cancel(), PmOwnedCancelState::FilledRace);
 
     owner
-        .execute_next_cancel(PmFakeCancelScript::accepted(), 133)
+        .execute_next_cancel(
+            &fixture_executor(&config),
+            PmFakeCancelScript::accepted(),
+            133,
+        )
         .unwrap();
     let converged = owner.private_mut().owned_order(client).unwrap();
     assert_eq!(converged.status(), Some(PmOrderStatus::Filled));
@@ -1298,7 +1405,11 @@ async fn safety_cancel_remains_serviceable_after_quote_revision_invalidation() {
     ));
     wait_for_prepared_cancel(&mut owner, 131).await;
     owner
-        .execute_next_cancel(PmFakeCancelScript::accepted(), 132)
+        .execute_next_cancel(
+            &fixture_executor(&config),
+            PmFakeCancelScript::accepted(),
+            132,
+        )
         .unwrap();
     let cancelled = owner.private_mut().owned_order(resting).unwrap();
     assert_eq!(cancelled.status(), Some(PmOrderStatus::Cancelled));
@@ -1311,7 +1422,7 @@ async fn safety_cancel_remains_serviceable_after_quote_revision_invalidation() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn persistence_age_failure_retains_permit_and_never_dispatches() {
+async fn quote_intent_writer_failure_is_primary_to_later_failure_and_never_dispatches() {
     let (config, _directory, journal_path, mut owner) = ready_owner().await;
     let client = admit_quote(&mut owner, &config, PmOrderSide::Buy, 1);
     let failed_at = QUOTE_APPROVED_NS + PM_PENDING_PERSISTENCE_MAX_AGE_NS + 1;
@@ -1325,6 +1436,18 @@ async fn persistence_age_failure_retains_permit_and_never_dispatches() {
             }
         } if client_order == client
     ));
+    retain_later_closed_writer_failure(&mut owner);
+    let failure = owner
+        .take_failed_goal_f_write()
+        .expect("quote writer failure projection");
+    assert!(matches!(
+        failure.identity(),
+        PmGoalFWriterFailureIdentity::Intent(PmPersistenceIntentIdentity::Quote {
+            client_order,
+            ..
+        }) if client_order == client
+    ));
+    assert_eq!(failure.reason(), PmGoalFWriterFailureReason::AgeExceeded);
     assert_eq!(owner.halt(), Some(PmMutationHalt::PersistenceAgeExceeded));
     assert_eq!(owner.pending_effects(), 0);
     assert_eq!(owner.retained_effect_permits(), 1);
@@ -1334,6 +1457,7 @@ async fn persistence_age_failure_retains_permit_and_never_dispatches() {
     assert!(owner.pop_durable_consequence().is_none());
     assert!(matches!(
         owner.execute_next_quote(
+            &fixture_executor(&config),
             PmFakePlaceScript::rejected(PmFakePlaceRejectReason::FixtureRejected),
             failed_at + 1,
         ),
@@ -1352,6 +1476,101 @@ async fn persistence_age_failure_retains_permit_and_never_dispatches() {
         recovery.recovered_orders().next().unwrap().place(),
         PmJournalRecoveredPlaceV1::Unknown
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancel_intent_writer_failure_is_primary_to_later_failure() {
+    let (config, _directory, _journal_path, mut owner) = ready_owner().await;
+    let venue = venue_order(&config, "cancel-writer-failure");
+    let client = place_resting_quote(&mut owner, &config, PmOrderSide::Buy, 1, venue).await;
+    drain_persistence(&mut owner, 123).await;
+    assert!(matches!(
+        owner.begin_cancel(cancel_request(client)).unwrap(),
+        PmCancelMutationAdmission::JournalPending {
+            client_order,
+            venue_order,
+        } if client_order == client && venue_order == venue
+    ));
+    let failed_at = 130 + PM_PENDING_PERSISTENCE_MAX_AGE_NS + 1;
+    assert!(matches!(
+        owner.service_persistence(failed_at).unwrap(),
+        PmPersistenceService::IntentFailed {
+            identity: PmPersistenceIntentIdentity::Cancel {
+                client_order,
+                venue_order,
+            }
+        } if client_order == client && venue_order == venue
+    ));
+    retain_later_closed_writer_failure(&mut owner);
+    let failure = owner
+        .take_failed_goal_f_write()
+        .expect("cancel writer failure projection");
+    assert_eq!(
+        failure.identity(),
+        PmGoalFWriterFailureIdentity::Intent(PmPersistenceIntentIdentity::Cancel {
+            client_order: client,
+            venue_order: venue,
+        })
+    );
+    assert_eq!(failure.reason(), PmGoalFWriterFailureReason::AgeExceeded);
+    owner.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fact_writer_failure_is_primary_to_later_failure() {
+    let (config, _directory, _journal_path, mut owner) = ready_owner().await;
+    let enqueued_at = 200;
+    owner
+        .record_fact(
+            PmJournalRecordV1::SafetyHalt(PmJournalSafetyHaltV1 {
+                account: config.account().account(),
+                reason: PmJournalSafetyReasonV1::ContractViolation,
+            }),
+            enqueued_at,
+        )
+        .unwrap();
+    let failed_at = enqueued_at + PM_PENDING_PERSISTENCE_MAX_AGE_NS + 1;
+    let failed_poll = owner.poll_persistence(failed_at).unwrap();
+    assert_eq!(
+        owner.pending_persistence(),
+        0,
+        "the final poll has already removed the failed fact from the mutation queue",
+    );
+    assert!(
+        owner.take_failed_goal_f_write().is_none(),
+        "the secret-free failure projection must not exist before lane reduction",
+    );
+    assert!(matches!(
+        owner
+            .reduce_persistence_poll(failed_poll, failed_at)
+            .unwrap(),
+        PmPersistenceService::FactFailed
+    ));
+    retain_later_closed_writer_failure(&mut owner);
+    let failure = owner
+        .take_failed_goal_f_write()
+        .expect("fact writer failure projection");
+    assert_eq!(
+        failure.identity(),
+        PmGoalFWriterFailureIdentity::Fact {
+            kind: PmDurableRecordKind::SafetyHalt,
+            client_order: None,
+            correlation: READY_BASELINE_FACT_RECORDS + 1,
+        }
+    );
+    assert_eq!(failure.reason(), PmGoalFWriterFailureReason::AgeExceeded);
+    owner.shutdown().await.unwrap();
+}
+
+fn retain_later_closed_writer_failure(owner: &mut PmMutationOwner) {
+    owner.retain_goal_f_writer_failure(PmGoalFWriterFailure::new(
+        PmGoalFWriterFailureIdentity::Fact {
+            kind: PmDurableRecordKind::SafetyHalt,
+            client_order: None,
+            correlation: u64::MAX,
+        },
+        &PmPersistenceFailure::Closed,
+    ));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1402,6 +1621,7 @@ async fn fact_capacity_failure_aborts_move_only_fill_compaction_ticket() {
 }
 
 mod admission_boundaries;
+mod authenticated_execution;
 mod recovery;
 mod risk_cancel;
 mod safety;

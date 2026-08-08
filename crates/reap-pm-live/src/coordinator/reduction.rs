@@ -13,7 +13,7 @@ use reap_pm_core::{IngressSequence, PmClientOrderKey, PmFillExecution, PmFillKey
 use reap_pm_state::{
     PmOwnedCancelApply, PmOwnedCancelIntent, PmOwnedCancelOutcome, PmOwnedFillApply,
     PmOwnedObservationOccurrence, PmOwnedOrderProjection, PmOwnedSubmitApply, PmOwnedSubmitResult,
-    PmOwnedSubmitState,
+    PmOwnedSubmitState, PmRefreshReason,
 };
 use reap_polymarket_adapter::{
     MAX_PM_FAKE_ACK_FILL_LEGS, PmFakeAckImmediateFillLeg, PmFakeCancelOutcome,
@@ -347,7 +347,8 @@ pub(super) fn reduce_fake_cancel(
     validate_cancel_result_scope(owner, intent, &result, monotonic_service_ns)?;
     owner.ensure_fact_capacity(1)?;
 
-    let (state_outcome, journal_outcome, reject_reason) = cancel_outcomes(result.outcome());
+    let outcome = result.outcome();
+    let (state_outcome, journal_outcome, reject_reason) = cancel_outcomes(outcome);
     let apply = match owner
         .private_mut()
         .apply_owned_cancel_result(intent, state_outcome)
@@ -372,6 +373,9 @@ pub(super) fn reduce_fake_cancel(
         }),
         monotonic_service_ns,
     )?;
+    if matches!(outcome, PmFakeCancelOutcome::Accepted) && apply == PmOwnedCancelApply::Cancelled {
+        let _required = owner.require_refresh(PmRefreshReason::MissingOrderDetail)?;
+    }
     owner.count_cancel_result();
     Ok(())
 }

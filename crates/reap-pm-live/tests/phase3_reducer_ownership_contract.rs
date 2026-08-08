@@ -108,7 +108,26 @@ async fn reconnect_and_open_first_snapshot(run: &mut PmPublicCaptureRun, receive
         1,
         "the internally admitted unavailable occurrence must be consumed before reconnect"
     );
-    run.record_pm_reconnect_scheduled(receive_ns).await.unwrap();
+    let authorization = run
+        .record_pm_reconnect_authorized(receive_ns)
+        .await
+        .unwrap();
+    assert_eq!(authorization.retired_epoch().value(), 11);
+    assert_eq!(authorization.replacement_epoch().value(), 12);
+    assert_eq!(authorization.reconnect_attempt(), 1);
+    assert_eq!(authorization.delay(), std::time::Duration::from_nanos(10));
+    let directive = authorization.into_transport_directive();
+    assert!(matches!(
+        directive,
+        reap_polymarket_live_adapter::PmPublicWsReconnectDirective::Reconnect {
+            retired_epoch,
+            replacement_epoch,
+            reconnect_attempt: 1,
+            backoff,
+        } if retired_epoch.value() == 11
+            && replacement_epoch.value() == 12
+            && backoff == std::time::Duration::from_nanos(10)
+    ));
     run.record_pm_connection_started(receive_ns + 1)
         .await
         .unwrap();

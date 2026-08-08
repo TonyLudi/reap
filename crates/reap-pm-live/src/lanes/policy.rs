@@ -12,7 +12,7 @@ pub enum PmLaneKind {
     ReconciliationRequest,
     Capture,
     Journal,
-    FakeEffect,
+    EffectDispatch,
 }
 
 /// Frozen input-lane service order for the future complete scheduler.
@@ -40,7 +40,9 @@ impl PmLaneKind {
             Self::Public => Some(4),
             Self::Reconciliation => Some(5),
             Self::Telemetry => Some(6),
-            Self::ReconciliationRequest | Self::Capture | Self::Journal | Self::FakeEffect => None,
+            Self::ReconciliationRequest | Self::Capture | Self::Journal | Self::EffectDispatch => {
+                None
+            }
         }
     }
 }
@@ -58,7 +60,7 @@ impl From<PmCapabilityLane> for PmLaneKind {
             PmCapabilityLane::ReconciliationRequest => Self::ReconciliationRequest,
             PmCapabilityLane::Capture => Self::Capture,
             PmCapabilityLane::Journal => Self::Journal,
-            PmCapabilityLane::FakeEffect => Self::FakeEffect,
+            PmCapabilityLane::EffectDispatch => Self::EffectDispatch,
         }
     }
 }
@@ -156,7 +158,7 @@ impl PmLanePolicy {
                 SaturationAction::SuppressDispatchAndHaltQuotes,
                 None,
             ),
-            PmLaneKind::FakeEffect => Self::new(
+            PmLaneKind::EffectDispatch => Self::new(
                 256,
                 32,
                 Some(250_000_000),
@@ -276,7 +278,7 @@ mod tests {
             PmLaneKind::ReconciliationRequest,
             PmLaneKind::Capture,
             PmLaneKind::Journal,
-            PmLaneKind::FakeEffect,
+            PmLaneKind::EffectDispatch,
         ] {
             assert_eq!(lane.service_priority_rank(), None);
         }

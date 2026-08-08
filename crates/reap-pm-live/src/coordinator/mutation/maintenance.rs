@@ -1,4 +1,4 @@
-use reap_pm_core::PmOrderSide;
+use reap_pm_core::{PmOrderSide, PmVenueOrderKey};
 use reap_pm_state::{
     PmFillCompaction, PmOwnedCancelState, PmOwnedOrderProjection, PmOwnedSubmitState,
     PmPreparedFillCompaction, PmRefreshAdmission, PmRefreshCompletion, PmRefreshCounters,
@@ -6,8 +6,8 @@ use reap_pm_state::{
 };
 
 use super::{
-    PmFakeEffectPermit, PmJournalImmediateFillsV1, PmJournalPlaceOutcomeV1,
-    PmJournalPlaceRejectReasonV1, PmJournalPlaceResultV1, PmJournalRecordV1, PmMutationHalt,
+    PmJournalImmediateFillsV1, PmJournalPlaceOutcomeV1, PmJournalPlaceRejectReasonV1,
+    PmJournalPlaceResultV1, PmJournalRecordV1, PmMutationDispatchPermit, PmMutationHalt,
     PmPersistenceIntentIdentity, PmPersistenceService,
 };
 use super::{PmMutationError, PmMutationOwner};
@@ -18,7 +18,7 @@ impl PmMutationOwner {
     pub(super) fn invalidate_durable_quote(
         &mut self,
         identity: PmPersistenceIntentIdentity,
-        effect_permit: PmFakeEffectPermit,
+        effect_permit: PmMutationDispatchPermit,
         monotonic_service_ns: u64,
     ) -> Result<PmPersistenceService, PmMutationError> {
         let PmPersistenceIntentIdentity::Quote { client_order, .. } = identity else {
@@ -91,13 +91,40 @@ impl PmMutationOwner {
         self.private.owned_orders().find(|order| {
             order.slot().side() == side
                 && order.venue_order().is_some()
-                && order.submit() == PmOwnedSubmitState::Accepted
+                && matches!(
+                    order.submit(),
+                    PmOwnedSubmitState::Accepted | PmOwnedSubmitState::Ambiguous
+                )
                 && !order.is_terminal()
                 && matches!(
                     order.cancel(),
                     PmOwnedCancelState::None | PmOwnedCancelState::Rejected
                 )
         })
+    }
+
+    pub(crate) fn next_missing_order_detail(&self) -> Option<PmVenueOrderKey> {
+        let canonical_missing = self
+            .private
+            .orders()
+            .filter(|order| is_unsettled_missing_order(*order));
+        let canonical_missing =
+            canonical_missing.filter_map(|order| order.identity().venue_order_key());
+        let accepted_cancel = self
+            .private
+            .owned_orders()
+            .filter(|order| is_unsettled_accepted_cancel(*order));
+        canonical_missing
+            .chain(accepted_cancel.filter_map(|order| order.venue_order()))
+            .min()
+    }
+
+    pub(crate) fn has_missing_order_detail(&self) -> bool {
+        self.private.orders().any(is_unsettled_missing_order)
+            || self
+                .private
+                .owned_orders()
+                .any(is_unsettled_accepted_cancel)
     }
 
     pub(crate) fn next_pending_refresh(&self) -> Option<PmRefreshTicket> {
@@ -170,4 +197,14 @@ impl PmMutationOwner {
                     .expect("bounded PM canonical fills fit u64"),
             );
     }
+}
+
+fn is_unsettled_missing_order(order: reap_pm_state::PmOrderProjection) -> bool {
+    order.missing_from_complete_open_snapshot()
+        && !order.terminal_by_detail_absence()
+        && order.status().is_none_or(|status| !status.is_terminal())
+}
+
+fn is_unsettled_accepted_cancel(order: PmOwnedOrderProjection) -> bool {
+    order.cancel() == PmOwnedCancelState::Accepted && order.reconciliation_required()
 }

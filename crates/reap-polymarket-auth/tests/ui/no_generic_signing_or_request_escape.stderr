@@ -1,0 +1,50 @@
+error[E0599]: no method named `sign_bytes` found for reference `&FixedEoaSigner` in the current scope
+  --> tests/ui/no_generic_signing_or_request_escape.rs:12:20
+   |
+12 |     let _ = signer.sign_bytes(b"arbitrary");
+   |                    ^^^^^^^^^^ method not found in `&FixedEoaSigner`
+
+error[E0599]: no method named `sign_digest` found for reference `&FixedEoaSigner` in the current scope
+  --> tests/ui/no_generic_signing_or_request_escape.rs:13:20
+   |
+13 |     let _ = signer.sign_digest([0_u8; 32]);
+   |                    ^^^^^^^^^^^ method not found in `&FixedEoaSigner`
+
+error[E0599]: no method named `hmac` found for reference `&L2Credentials` in the current scope
+  --> tests/ui/no_generic_signing_or_request_escape.rs:14:25
+   |
+14 |     let _ = credentials.hmac(b"arbitrary");
+   |                         ^^^^ method not found in `&L2Credentials`
+
+error[E0599]: no method named `authenticate_request` found for reference `&L2Credentials` in the current scope
+  --> tests/ui/no_generic_signing_or_request_escape.rs:15:25
+   |
+15 |     let _ = credentials.authenticate_request(timestamp, "PATCH", "/anything", b"{}");
+   |                         ^^^^^^^^^^^^^^^^^^^^
+   |
+help: there is a method `authenticate_trades` with a similar name, but with different arguments
+  --> src/l2.rs
+   |
+   | /     pub fn authenticate_trades(
+   | |         &self,
+   | |         timestamp: L2Timestamp,
+   | |     ) -> Result<AuthenticatedL2Headers, PmAuthError> {
+   | |____________________________________________________^
+
+error[E0599]: no method named `secret` found for reference `&L2Credentials` in the current scope
+  --> tests/ui/no_generic_signing_or_request_escape.rs:16:25
+   |
+16 |     let _ = credentials.secret();
+   |                         ^^^^^^ private field, not a method
+
+error[E0599]: no method named `signature` found for reference `&SignedClobV2Order` in the current scope
+  --> tests/ui/no_generic_signing_or_request_escape.rs:17:20
+   |
+17 |     let _ = signed.signature();
+   |                    ^^^^^^^^^ private field, not a method
+
+error[E0599]: no method named `as_bytes` found for reference `&SerializedPlaceRequest` in the current scope
+  --> tests/ui/no_generic_signing_or_request_escape.rs:18:18
+   |
+18 |     let _ = body.as_bytes();
+   |                  ^^^^^^^^ method not found in `&SerializedPlaceRequest`

@@ -7,20 +7,17 @@ const WS: &str = include_str!("../src/ws.rs");
 
 #[test]
 fn wire_crate_has_no_network_auth_signer_or_order_entry_dependency() {
-    for forbidden_dependency in [
-        "reqwest",
-        "tokio",
-        "tungstenite",
-        "hyper",
-        "hmac",
-        "ring",
-        "zeroize",
-    ] {
+    for forbidden_dependency in ["reqwest", "tokio", "tungstenite", "hyper", "hmac", "ring"] {
         assert!(
             !MANIFEST.contains(forbidden_dependency),
             "forbidden dependency: {forbidden_dependency}"
         );
     }
+
+    assert!(
+        MANIFEST.contains("zeroize.workspace = true"),
+        "live private owner evidence must be zeroized without adding auth capability"
+    );
 
     let production = [LIB, PRIVATE_FIXTURE, REST, UNSIGNED_ORDER, WS].join("\n");
     for forbidden_symbol in [

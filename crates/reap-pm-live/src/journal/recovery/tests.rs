@@ -7,8 +7,8 @@ use reap_pm_core::{
 
 use super::*;
 use crate::journal::schema::{
-    MAX_PM_ACKNOWLEDGEMENT_FILL_LEGS, PmJournalCancelIntentV1, PmJournalCancelReasonV1,
-    PmJournalCancelResultV1, PmJournalFillDeliveryV1, PmJournalFillFeeV1,
+    MAX_PM_ACKNOWLEDGEMENT_FILL_LEGS, PmJournalAuthenticatedPlaceResultV1, PmJournalCancelIntentV1,
+    PmJournalCancelReasonV1, PmJournalCancelResultV1, PmJournalFillDeliveryV1, PmJournalFillFeeV1,
     PmJournalFillOccurrenceV1, PmJournalFillRoleV1, PmJournalFillSettlementV1,
     PmJournalFillSourceV1, PmJournalFillV1, PmJournalFillWatermarkV1, PmJournalFingerprintV1,
     PmJournalHeaderV1, PmJournalPlaceRejectReasonV1, PmJournalPlaceResultV1,
@@ -258,6 +258,57 @@ fn tail_intent_and_pending_cancel_recover_as_unresolved() {
     assert_eq!(recovery.owned_order_count(), 2);
     assert_eq!(recovery.unresolved_order_count(), 2);
     assert!(recovery.requires_reconciliation());
+}
+
+#[test]
+fn authenticated_ambiguous_result_binds_only_its_durable_expected_order_id() {
+    let scope = test_scope();
+    let intent = quote(&scope, 1, PmOrderSide::Buy, "1");
+    let expected_bytes = [0x55; 32];
+    let expected = venue_order(&scope, &format!("0x{}", "55".repeat(32)));
+    let authenticated = PmJournalAuthenticatedPlaceResultV1::new(
+        1,
+        2,
+        3,
+        1,
+        intent.client_order,
+        scope.instrument(),
+        [0x33; 32],
+        expected_bytes,
+        None,
+        None,
+        PmJournalAuthenticatedClassificationV1::AcknowledgementUnknown,
+    )
+    .expect("shape-valid authenticated ambiguity");
+    let mut recovered = PmJournalRecovery::empty(scope.clone());
+    apply(&mut recovered, PmJournalRecordV1::QuoteIntent(intent)).expect("quote");
+    apply(
+        &mut recovered,
+        PmJournalRecordV1::AuthenticatedResult(PmJournalAuthenticatedResultV1::Place(
+            authenticated,
+        )),
+    )
+    .expect("authenticated ambiguity");
+    let row = recovered.recovered_orders().next().expect("owned row");
+    assert_eq!(row.place(), PmJournalRecoveredPlaceV1::Unknown);
+    assert_eq!(row.venue_order(), Some(expected));
+
+    let mut fixture = PmJournalRecovery::empty(scope);
+    apply(&mut fixture, PmJournalRecordV1::QuoteIntent(intent)).expect("fixture quote");
+    apply(
+        &mut fixture,
+        PmJournalRecordV1::PlaceResult(PmJournalPlaceResultV1 {
+            client_order: intent.client_order,
+            outcome: PmJournalPlaceOutcomeV1::AmbiguousTimeout,
+            reject_reason: None,
+            venue_order: None,
+            immediate_fills: PmJournalImmediateFillsV1::empty(),
+        }),
+    )
+    .expect("fixture ambiguity");
+    let row = fixture.recovered_orders().next().expect("fixture row");
+    assert_eq!(row.place(), PmJournalRecoveredPlaceV1::Unknown);
+    assert_eq!(row.venue_order(), None);
 }
 
 #[test]

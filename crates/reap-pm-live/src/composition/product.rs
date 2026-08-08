@@ -1,5 +1,5 @@
 use reap_pm_live_contracts::{
-    ConstructedRoleBinding, PmConnectivityConfig, PmConnectivityPlan, PmFakeExecutionProfile,
+    ConstructedRoleBinding, PmConnectivityConfig, PmConnectivityPlan, PmFixedExecutionProfile,
     PmRoleKind,
 };
 use reap_pm_state::PmRiskLimits;
@@ -11,11 +11,14 @@ use crate::fake_effect::PmFakeEffectRole;
 use crate::private_monitor::PmPrivateMonitorRuntime;
 use crate::schedule::PmQuoteScheduleRole;
 
+#[cfg(any(test, feature = "loopback-evidence"))]
+mod authenticated_loopback;
 mod public_ingress;
 mod run;
 
 pub use public_ingress::{
-    PmProductPublicIngress, PmProductPublicIngressError, PmProductPublicIngressOutcome,
+    PmCapturedRestBook, PmProductPublicIngress, PmProductPublicIngressError,
+    PmProductPublicIngressOutcome, PmProductRestBookCaptureSink,
 };
 pub use run::{
     PmProductPublicAgedEnactError, PmProductPublicAgedRetryReason, PmProductRun, PmProductRunError,
@@ -43,7 +46,7 @@ impl<M: PmQuoteModelRequirements> PmProduct<M> {
     pub fn new(
         config: PmConnectivityConfig,
         model: M,
-        profile: PmFakeExecutionProfile,
+        profile: PmFixedExecutionProfile,
         risk_limits: PmRiskLimits,
     ) -> Result<Self, PmCompositionError> {
         let requirements = model.input_requirements();

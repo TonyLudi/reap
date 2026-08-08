@@ -1,0 +1,11 @@
+error[E0599]: no method named `collateral_balance_allowance` found for struct `PmReconciliationHttpRole<'a>` in the current scope
+ --> tests/ui/authenticated_roles_cannot_cross_call.rs:8:28
+  |
+8 |     let _ = reconciliation.collateral_balance_allowance(timestamp).await;
+  |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `PmReconciliationHttpRole<'_>`
+
+error[E0599]: no method named `begin_open_orders` found for struct `PmAccountHttpRole<'a>` in the current scope
+ --> tests/ui/authenticated_roles_cannot_cross_call.rs:9:21
+  |
+9 |     let _ = account.begin_open_orders(timestamp).await;
+  |                     ^^^^^^^^^^^^^^^^^ method not found in `PmAccountHttpRole<'_>`

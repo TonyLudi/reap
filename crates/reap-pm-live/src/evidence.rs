@@ -41,10 +41,12 @@ pub async fn run_pm_combined_replay_evidence(
 
 #[cfg(test)]
 pub(crate) use fixture::{
-    ReachedOverloadProfile, account_scope, allowance_row, complete_reached_overload_reconciliation,
-    completion, connectivity_config, instrument, market_metadata, prepare_reached_overload_product,
-    query_occurrence, reconcile_reached_overload_fills_without_watermark_advance, risk_limits,
-    start_reached_overload_product, start_reached_overload_product_for,
+    ReachedOverloadProfile, account_scope, allowance_row, authoritative,
+    complete_reached_overload_reconciliation, completion, connectivity_config, instrument,
+    loopback_public_observation_grant, market_metadata, prepare_reached_overload_product,
+    provenance, query_occurrence, reconcile_reached_overload_fills_without_watermark_advance,
+    risk_limits, session_policy, start_reached_overload_product,
+    start_reached_overload_product_for,
 };
 
 #[derive(Debug, Error)]

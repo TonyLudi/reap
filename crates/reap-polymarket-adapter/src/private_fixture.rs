@@ -18,7 +18,8 @@ use crate::fixture_scope::validate_account_source;
 use crate::{
     PmFixtureAggregateDelivery, PmFixtureCompletionOccurrence, PmFixtureDeliveryError,
     PmFixtureDeliveryScope, PmFixtureInstrumentScope, PmFixturePrivateRoleGrant,
-    PmFixtureScopeError, PmFixtureServicedAggregate,
+    PmFixtureScopeError, PmFixtureServicedAggregate, PmForeignRowDiagnostics,
+    PmLiveNormalizationError,
 };
 
 pub const MAX_PM_PRIVATE_NORMALIZED_OBSERVATIONS: usize = 4_096;
@@ -139,6 +140,7 @@ pub struct PmFixturePrivateBatch {
     source: PmProductSource,
     instrument: PmFixtureInstrumentScope,
     observations: Box<[PmPrivateLifecycleObservation]>,
+    foreign_diagnostics: PmForeignRowDiagnostics,
 }
 
 impl PmFixturePrivateBatch {
@@ -155,6 +157,27 @@ impl PmFixturePrivateBatch {
     #[must_use]
     pub fn observations(&self) -> &[PmPrivateLifecycleObservation] {
         &self.observations
+    }
+
+    #[must_use]
+    pub const fn foreign_diagnostics(&self) -> PmForeignRowDiagnostics {
+        self.foreign_diagnostics
+    }
+
+    pub(crate) fn from_live(
+        account_scope: PmAccountScope,
+        source: PmProductSource,
+        instrument: PmFixtureInstrumentScope,
+        observations: Box<[PmPrivateLifecycleObservation]>,
+        foreign_diagnostics: PmForeignRowDiagnostics,
+    ) -> Self {
+        Self {
+            account_scope,
+            source,
+            instrument,
+            observations,
+            foreign_diagnostics,
+        }
     }
 }
 
@@ -232,6 +255,8 @@ pub enum PmPrivateNormalizationError {
     UnexpectedSnapshotRevision,
     #[error("private fixture delivery construction failed: {0}")]
     Delivery(#[from] PmFixtureDeliveryError),
+    #[error("live private normalization failed: {0}")]
+    Live(#[from] PmLiveNormalizationError),
 }
 
 /// Fixture-only PM order/fill lifecycle observation capability.
@@ -379,6 +404,70 @@ impl PmFixturePrivateLifecycle {
         Ok(delivery)
     }
 
+    /// Normalize one credential-owner-bound live user frame and bind it to
+    /// this exact private role instance.
+    ///
+    /// The move-only wrapper is consumed so a bare parsed frame cannot claim
+    /// authenticated account scope at this boundary. Raw parsing and
+    /// credential verification stay upstream in `reap-polymarket-auth`.
+    pub fn receive_live_user_frame(
+        &mut self,
+        occurrence: PmFixtureCompletionOccurrence,
+        frame: reap_polymarket_auth::CredentialOwnedUserFrame,
+    ) -> Result<crate::PmLivePrivateCompletion, PmPrivateNormalizationError> {
+        let ordering = occurrence.ordering();
+        let active_epoch = self
+            .active_epoch
+            .ok_or(PmPrivateNormalizationError::NoActiveEpoch)?;
+        if ordering.connection_epoch() != active_epoch {
+            return Err(PmPrivateNormalizationError::ConnectionEpochMismatch);
+        }
+        if ordering.local_ingress_sequence() <= self.last_ingress_sequence {
+            return Err(PmPrivateNormalizationError::IngressSequenceDidNotAdvance);
+        }
+        if ordering.venue_sequence().is_some() {
+            return Err(PmPrivateNormalizationError::UnexpectedVenueSequence);
+        }
+        if ordering.snapshot_revision().is_some() {
+            return Err(PmPrivateNormalizationError::UnexpectedSnapshotRevision);
+        }
+        let batch = crate::live_private::normalize_live_user_frame(self, &frame)?;
+        let foreign_diagnostics = batch.foreign_diagnostics();
+        let delivery = checked_delivery(
+            self.owner_id,
+            self.account_scope,
+            self.instrument,
+            self.source,
+            self.connection,
+            occurrence,
+            batch,
+        )?;
+        self.last_ingress_sequence = ordering.local_ingress_sequence();
+        Ok(crate::PmLivePrivateCompletion::new(
+            delivery,
+            foreign_diagnostics,
+        ))
+    }
+
+    pub(crate) fn live_unresolved_trade(
+        &self,
+        fill_id: PmFillId,
+        reason: PmUnresolvedTradeReason,
+        settlement: PmFillSettlementStatus,
+    ) -> PmFixtureUnresolvedTrade {
+        PmFixtureUnresolvedTrade {
+            source: self.source,
+            account: self.account(),
+            instrument: self.instrument.handle(),
+            fill_id,
+            order: None,
+            candidate_order: None,
+            reason,
+            settlement,
+            fee: PmFixtureFeeEvidence::Unknown,
+        }
+    }
+
     /// Opens a serviced private delivery only for the exact role instance
     /// that produced it, while retaining its structural scope at reduction.
     pub fn reduce_private_delivery<R>(
@@ -424,6 +513,7 @@ impl PmFixturePrivateLifecycle {
             source: self.source,
             instrument: self.instrument,
             observations: observations.into_boxed_slice(),
+            foreign_diagnostics: PmForeignRowDiagnostics::fixture_empty(),
         })
     }
 }
@@ -924,6 +1014,7 @@ fn parse_order_status(
 
 fn parse_trade_status(status: &str) -> Result<PmFillSettlementStatus, PmPrivateNormalizationError> {
     match status {
+        "MATCHED_NOT_BROADCASTED" => Ok(PmFillSettlementStatus::MatchedNotBroadcasted),
         "MATCHED" => Ok(PmFillSettlementStatus::Matched),
         "MINED" => Ok(PmFillSettlementStatus::Mined),
         "CONFIRMED" => Ok(PmFillSettlementStatus::Confirmed),

@@ -71,9 +71,9 @@ pub use lane_enact::{
     PmPublicLaneEnactError, PmPublicLaneFaultEnactment,
 };
 pub use product::{
-    PmProduct, PmProductPublicAgedEnactError, PmProductPublicAgedRetryReason,
+    PmCapturedRestBook, PmProduct, PmProductPublicAgedEnactError, PmProductPublicAgedRetryReason,
     PmProductPublicIngress, PmProductPublicIngressError, PmProductPublicIngressOutcome,
-    PmProductRun, PmProductRunError, PmProductStartError,
+    PmProductRestBookCaptureSink, PmProductRun, PmProductRunError, PmProductStartError,
 };
 use run_state::{
     MAX_PENDING_PM_BOOK_REDUCTIONS, PendingOtherAgedLaneFault, PendingPmAgedLaneFault,
@@ -85,7 +85,7 @@ pub use run_types::{
     PmPublicBookPipelineError, PmPublicBookReadiness, PmPublicBookReadinessReason,
     PmPublicCaptureOutcome, PmPublicCaptureRunError, PmPublicCaptureShutdownError,
     PmPublicCaptureTerminalCause, PmPublicDataPipelineError, PmPublicNotificationAdmissionFailure,
-    PmPublicReadyBookView,
+    PmPublicReadyBookView, PmPublicReconnectAuthorization,
 };
 
 #[derive(Debug, Error)]

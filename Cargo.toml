@@ -8,8 +8,10 @@ members = [
     "crates/reap-pm-core",
     "crates/reap-pm-state",
     "crates/reap-polymarket-wire",
+    "crates/reap-polymarket-auth",
     "crates/reap-pm-strategy",
     "crates/reap-polymarket-adapter",
+    "crates/reap-polymarket-live-adapter",
     "crates/reap-pm-live-contracts",
     "crates/reap-pm-live",
     "crates/reap-okx-public-source",
@@ -56,6 +58,7 @@ hmac = "0.12"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+k256 = { version = "=0.13.4", default-features = false, features = ["ecdsa"] }
 libc = "0.2"
 reap-benchmark-allocator = { path = "crates/reap-benchmark-allocator" }
 reap-backtest = { path = "crates/reap-backtest" }
@@ -74,11 +77,13 @@ reap-engine = { path = "crates/reap-engine" }
 reap-order = { path = "crates/reap-order" }
 reap-pm-core = { path = "crates/reap-pm-core" }
 reap-pm-state = { path = "crates/reap-pm-state" }
+reap-polymarket-auth = { path = "crates/reap-polymarket-auth" }
 reap-polymarket-wire = { path = "crates/reap-polymarket-wire" }
 reap-pm-live = { path = "crates/reap-pm-live" }
 reap-pm-live-contracts = { path = "crates/reap-pm-live-contracts" }
 reap-pm-strategy = { path = "crates/reap-pm-strategy" }
 reap-polymarket-adapter = { path = "crates/reap-polymarket-adapter" }
+reap-polymarket-live-adapter = { path = "crates/reap-polymarket-live-adapter" }
 reap-okx-public-source = { path = "crates/reap-okx-public-source" }
 reap-okx-wire = { path = "crates/reap-okx-wire" }
 reap-okx-live-adapter = { path = "crates/reap-okx-live-adapter" }
@@ -93,9 +98,10 @@ reap-transport = { path = "crates/reap-transport" }
 reap-venue = { path = "crates/reap-venue" }
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1.14"
-serde_json = { version = "1", features = ["float_roundtrip"] }
+serde_json = { version = "1", features = ["float_roundtrip", "raw_value"] }
 sha1 = "0.10"
 sha2 = "0.10"
+sha3 = { version = "=0.10.9", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 ring = "0.17"
 thiserror = "2"

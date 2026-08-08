@@ -11,7 +11,7 @@ use reap_polymarket_adapter::PmPublicSessionFault;
 
 use support::{
     authoritative, okx_ack, okx_reference, provenance, public_config, session_policy, snapshot_one,
-    snapshot_two,
+    snapshot_two, wait_for_capture_sequence,
 };
 
 const WALL_BASE: u64 = 1_700_000_000_000_000_000;
@@ -319,7 +319,8 @@ async fn terminal_run_returns_move_only_inputs_and_blocks_every_mutation_without
         .clone();
 
     let mut producer = start_live_run(directory.path().join("producer.jsonl")).await;
-    let mut aged_producer = start_live_run(directory.path().join("aged-producer.jsonl")).await;
+    let aged_producer_path = directory.path().join("aged-producer.jsonl");
+    let mut aged_producer = start_live_run(aged_producer_path.clone()).await;
     aged_producer
         .capture_okx_public(WALL_BASE + 90, 90, okx_ack().as_bytes())
         .await
@@ -331,6 +332,11 @@ async fn terminal_run_returns_move_only_inputs_and_blocks_every_mutation_without
             .unwrap(),
         OkxPublicCaptureEvent::ReferenceEnqueued
     ));
+    // The synthetic lane clock jumps directly past the public age bound. Drain
+    // the independent async capture writer first so this case exercises only
+    // lane aging; otherwise a scheduler-dependent pending record correctly
+    // trips the writer's separate fail-closed age limit during enactment.
+    wait_for_capture_sequence(&aged_producer_path, 7).await;
     let aged_depth = aged_producer.public_lane_metrics().depth();
     let aged_failure = aged_producer
         .service_lane_turn(500_000_093, &mut NoopLaneService)

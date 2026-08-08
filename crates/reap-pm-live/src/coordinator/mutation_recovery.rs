@@ -5,7 +5,9 @@
     reason = "the exact inline recovery error preserves allocation-free fail-closed bootstrap"
 )]
 
-use reap_pm_core::{PmFillExecution, PmFillFee, PmFillKey, PmOrderProgress, PmPrice};
+use reap_pm_core::{
+    PmFillExecution, PmFillFee, PmFillKey, PmFillQueryCursor, PmOrderProgress, PmPrice,
+};
 use reap_pm_state::{
     PmExactReservation, PmOwnedCancelOutcome, PmOwnedCancelRequestApply, PmOwnedCancelState,
     PmOwnedFillApply, PmOwnedIntentId, PmOwnedObservationOccurrence, PmOwnedObservationSource,
@@ -16,10 +18,10 @@ use reap_pm_state::{
 
 use super::mutation::PmMutationError;
 use crate::journal::{
-    PmJournalFillAppliedV1, PmJournalFillOccurrenceV1, PmJournalFillSourceV1,
-    PmJournalOrderProgressSourceV1, PmJournalOrderTerminalV1, PmJournalRecoveredObservationV1,
-    PmJournalRecoveredOrderV1, PmJournalRecoveredPlaceV1, PmJournalRecovery,
-    PmJournalTerminalStatusV1,
+    PmJournalAuthenticatedClassificationV1, PmJournalAuthenticatedResultV1, PmJournalFillAppliedV1,
+    PmJournalFillOccurrenceV1, PmJournalFillSourceV1, PmJournalOrderProgressSourceV1,
+    PmJournalOrderTerminalV1, PmJournalRecoveredObservationV1, PmJournalRecoveredOrderV1,
+    PmJournalRecoveredPlaceV1, PmJournalRecovery, PmJournalTerminalStatusV1,
 };
 use crate::private_monitor::PmPrivateMonitorRuntime;
 
@@ -27,6 +29,12 @@ pub(super) fn recover_private_owner(
     private: &mut PmPrivateMonitorRuntime,
     recovery: &PmJournalRecovery,
 ) -> Result<(), PmMutationError> {
+    if let Some(cursor) = recovery.fill_watermark() {
+        private.initialize_recovered_fill_watermark(PmFillQueryCursor::new(
+            cursor.account_scope,
+            cursor.opaque.bytes(),
+        ))?;
+    }
     for row in recovery.recovered_orders() {
         recover_owned_order(private, row)?;
     }
@@ -48,6 +56,29 @@ pub(super) fn recover_private_owner(
     for row in recovery.recovered_orders() {
         recover_owned_cancel(private, row)?;
         validate_recovered_order(private, row)?;
+    }
+    recover_authenticated_cancel_refreshes(private, recovery)?;
+    Ok(())
+}
+
+fn recover_authenticated_cancel_refreshes(
+    private: &mut PmPrivateMonitorRuntime,
+    recovery: &PmJournalRecovery,
+) -> Result<(), PmMutationError> {
+    for result in recovery.authenticated_results() {
+        let PmJournalAuthenticatedResultV1::Cancel(cancel) = result else {
+            continue;
+        };
+        if cancel.classification() != PmJournalAuthenticatedClassificationV1::Accepted {
+            continue;
+        }
+        let order = private
+            .owned_order(cancel.canonical().client_order)
+            .ok_or(PmMutationError::RecoveryProjectionMismatch)?;
+        if order.reconciliation_required() {
+            let _required =
+                private.require_refresh(reap_pm_state::PmRefreshReason::MissingOrderDetail)?;
+        }
     }
     Ok(())
 }
@@ -74,11 +105,12 @@ fn recover_owned_order(
     match row.place() {
         PmJournalRecoveredPlaceV1::IntentOnly => {}
         PmJournalRecoveredPlaceV1::Unknown => {
-            if row.venue_order().is_some() {
-                return Err(PmMutationError::RecoveryProjectionMismatch);
-            }
-            private
-                .apply_owned_submit_result(journal.client_order, PmOwnedSubmitResult::Ambiguous)?;
+            let result = row
+                .venue_order()
+                .map_or(PmOwnedSubmitResult::Ambiguous, |venue| {
+                    PmOwnedSubmitResult::AmbiguousOwned(venue)
+                });
+            private.apply_owned_submit_result(journal.client_order, result)?;
         }
         PmJournalRecoveredPlaceV1::Bound => {
             let venue = row
@@ -122,14 +154,23 @@ fn recover_owned_fill(
         fill.delta,
         PmFillFee::try_from(fill.fee)?,
     );
-    let event = private.owned_fill_event(key, fill.client_order, execution)?;
+    let event = private.durable_recovery_fill_event(key, fill.client_order, execution, source)?;
     let result = private.recover_owned_fill(PmOwnedRecoveryFill::new(
         event,
         fill.authoritative_cumulative,
         occurrence,
         source,
     ))?;
-    if !matches!(result, PmOwnedFillApply::Applied { .. }) {
+    if !matches!(
+        result,
+        PmOwnedFillApply::Applied {
+            client_order,
+            cumulative_filled,
+            remaining,
+        } if client_order == fill.client_order
+            && cumulative_filled == fill.cumulative
+            && remaining == fill.remaining
+    ) {
         return Err(PmMutationError::RecoveryProjectionMismatch);
     }
     Ok(())
@@ -239,8 +280,15 @@ fn validate_recovered_order(
     let order = private
         .owned_order(journal.client_order)
         .ok_or(PmMutationError::RecoveryProjectionMismatch)?;
+    let exact_remote_evidence = row.venue_order().is_some()
+        && (!row.effective_cumulative().is_zero()
+            || matches!(
+                row.terminal(),
+                Some(PmJournalTerminalStatusV1::Filled | PmJournalTerminalStatusV1::Cancelled)
+            ));
     let expected_submit = match row.place() {
         PmJournalRecoveredPlaceV1::IntentOnly => PmOwnedSubmitState::Pending,
+        PmJournalRecoveredPlaceV1::Unknown if exact_remote_evidence => PmOwnedSubmitState::Accepted,
         PmJournalRecoveredPlaceV1::Unknown => PmOwnedSubmitState::Ambiguous,
         PmJournalRecoveredPlaceV1::Bound => PmOwnedSubmitState::Accepted,
         PmJournalRecoveredPlaceV1::Rejected => PmOwnedSubmitState::Rejected,

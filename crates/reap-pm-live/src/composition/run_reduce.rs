@@ -437,10 +437,10 @@ impl PmPublicCaptureRun {
 
     /// Advances the owned session and reducer to the same next PM epoch after
     /// a reducer-coupled disconnect or heartbeat timeout.
-    pub async fn record_pm_reconnect_scheduled(
+    pub async fn record_pm_reconnect_authorized(
         &mut self,
         monotonic_ns: u64,
-    ) -> Result<Duration, PmPublicCaptureRunError> {
+    ) -> Result<PmPublicReconnectAuthorization, PmPublicCaptureRunError> {
         self.ensure_active()?;
         self.ensure_no_pending_pm_book_reductions()?;
         if !self.pm_lifecycle.accepts_reconnect()
@@ -454,11 +454,11 @@ impl PmPublicCaptureRun {
             return Err(self.terminalize_reducer_sync_failure(source, 0, monotonic_ns, None));
         }
         let prior_epoch = self.roles.pm_epoch();
-        let delay = match self
+        let authorization = match self
             .record_pm_reconnect_scheduled_session(monotonic_ns)
             .await
         {
-            Ok(delay) => delay,
+            Ok(authorization) => authorization,
             Err(source) => {
                 if self.artifact_terminal() {
                     self.fail_reducer_after_terminal_write_error();
@@ -466,14 +466,26 @@ impl PmPublicCaptureRun {
                 return Err(source);
             }
         };
-        let next_epoch = self.roles.pm_epoch();
+        let next_epoch = authorization.replacement_epoch().value();
         if let Err(source) =
             self.roles
                 .synchronize_pm_reducer_epoch(prior_epoch, next_epoch, &mut self.pm_reducer)
         {
             return Err(self.terminalize_reducer_sync_failure(source, 0, monotonic_ns, None));
         }
-        Ok(delay)
+        Ok(authorization)
+    }
+
+    /// Fixture/replay compatibility wrapper for callers that do not own a
+    /// live transport. Product transport composition must retain the complete
+    /// typed authorization returned by [`Self::record_pm_reconnect_authorized`].
+    pub async fn record_pm_reconnect_scheduled(
+        &mut self,
+        monotonic_ns: u64,
+    ) -> Result<Duration, PmPublicCaptureRunError> {
+        self.record_pm_reconnect_authorized(monotonic_ns)
+            .await
+            .map(|authorization| authorization.delay())
     }
 
     pub(super) fn terminalize_reducer_sync_failure(

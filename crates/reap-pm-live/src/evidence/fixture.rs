@@ -15,7 +15,9 @@ use reap_pm_core::{
     PmTokenHandle, PmTokenId, ReceivedEventClock, SnapshotRevision, U256,
 };
 #[cfg(test)]
-use reap_pm_core::{PmFillQueryCursor, PmPositionAvailability, PmSignedUnits};
+use reap_pm_core::{
+    PmFillQueryCursor, PmPositionAvailability, PmPublicObservationGrant, PmSignedUnits,
+};
 #[cfg(test)]
 use reap_pm_live_contracts::PmFakeExecutionProfile;
 use reap_pm_live_contracts::{
@@ -281,6 +283,13 @@ pub(crate) fn session_policy() -> PmCaptureSessionPolicy {
         reconnect,
     )
     .expect("valid fixed session policy")
+}
+
+#[cfg(test)]
+pub(crate) const fn loopback_public_observation_grant(
+    config: &PmConnectivityConfig,
+) -> PmPublicObservationGrant {
+    config.public().observation_grant()
 }
 
 #[cfg(test)]

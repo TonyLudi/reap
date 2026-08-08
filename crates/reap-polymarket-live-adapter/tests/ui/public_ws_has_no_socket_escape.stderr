@@ -1,0 +1,16 @@
+error[E0599]: no method named `socket` found for reference `&PmPublicMarketWsRole` in the current scope
+ --> tests/ui/public_ws_has_no_socket_escape.rs:4:24
+  |
+4 |     let _socket = role.socket();
+  |                        ^^^^^^ method not found in `&PmPublicMarketWsRole`
+
+error[E0624]: method `endpoint` is private
+ --> tests/ui/public_ws_has_no_socket_escape.rs:5:28
+  |
+5 |     let _endpoint = config.endpoint();
+  |                            ^^^^^^^^ private method
+  |
+ ::: src/public_ws_config.rs
+  |
+  |     pub(crate) fn endpoint(&self) -> &Url {
+  |     ------------------------------------- private method defined here

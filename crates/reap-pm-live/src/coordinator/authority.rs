@@ -7,12 +7,16 @@ use reap_pm_state::{
     PmOwnedQuoteAdmission, PmOwnedQuoteIntent, PmPrivateReady, PmReservationBasis, PmRiskDecision,
 };
 use reap_pm_strategy::PmValidatedQuoteCandidate;
+#[cfg(test)]
+use reap_polymarket_adapter::PmFixtureOwnedExecution;
 use reap_polymarket_adapter::{
-    PmCancelOwnedPurpose, PmFakeCancelCommand, PmFakeExecutionError, PmFakePlaceCommand,
-    PmFixtureInstrumentScope, PmFixtureOwnedExecution, PmGtcPostOnlyProfile,
+    PmCancelOwnedPurpose, PmExactOwnedCancelRequest, PmFakeExecutionError,
+    PmFixedMutationPreparation, PmFixedOrderType, PmFixtureInstrumentScope,
+    PmGtcPostOnlyPlaceRequest, PmGtcPostOnlyProfile,
 };
 use thiserror::Error;
 
+use super::dispatch::{PmPreparedCancelDispatch, PmPreparedPlaceDispatch};
 use crate::journal::{
     PmCancelIntentDurablyAcknowledged, PmJournalCancelIntentV1, PmJournalCancelReasonV1,
     PmJournalQuoteIntentV1, PmJournalQuoteProfileV1, PmJournalSideV1,
@@ -119,15 +123,14 @@ pub struct ReservedPmQuote {
     facts: PmQuoteAuthorityFacts,
 }
 
-/// Durably journaled quote authority containing one exact fake command.
+/// Durably journaled quote authority containing one exact fixed place request.
 ///
-/// Only the crate-private fake effect role can extract and consume the
-/// command.
+/// Only the coordinator can lower this authority into a take-once dispatch.
 #[derive(Debug)]
 pub struct PreparedPmQuote {
     facts: PmQuoteAuthorityFacts,
     journal_sequence: u64,
-    command: PmFakePlaceCommand,
+    request: PmGtcPostOnlyPlaceRequest,
 }
 
 macro_rules! quote_accessors {
@@ -334,7 +337,7 @@ pub(crate) fn approve_pm_quote(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_pm_quote(
-    execution: &PmFixtureOwnedExecution,
+    execution: &PmFixedMutationPreparation,
     expected_instrument_id: PmInstrumentId,
     reserved: ReservedPmQuote,
     current_scope: PmFixtureInstrumentScope,
@@ -357,7 +360,7 @@ pub(crate) fn prepare_pm_quote(
         return Err(PmAuthorityError::DurableIntentMismatch);
     }
 
-    let command = execution.place_command(
+    let request = execution.prepare_place(
         current_scope,
         facts.client_order,
         facts.salt,
@@ -366,33 +369,38 @@ pub(crate) fn prepare_pm_quote(
         facts.quantity,
         facts.timestamp_ms,
     )?;
-    let unsigned = command.unsigned_order();
+    let unsigned = request.unsigned_order();
     if unsigned.maker_amount() != facts.maker_amount
         || unsigned.taker_amount() != facts.taker_amount
-        || command.profile() != facts.profile
+        || request.profile() != facts.profile
     {
         return Err(PmAuthorityError::LoweringMismatch);
     }
     Ok(PreparedPmQuote {
         facts,
         journal_sequence,
-        command,
+        request,
     })
 }
 
-pub(crate) fn consume_prepared_quote(
+pub(crate) fn take_prepared_place_dispatch(
     prepared: PreparedPmQuote,
     account_scope: PmAccountScope,
     instrument: PmInstrumentHandle,
     instrument_id: PmInstrumentId,
-) -> Result<PmFakePlaceCommand, PmAuthorityError> {
+) -> Result<PmPreparedPlaceDispatch, PmAuthorityError> {
     if prepared.facts.account_scope != account_scope
         || prepared.facts.instrument != instrument
         || prepared.facts.instrument_id != instrument_id
     {
         return Err(PmAuthorityError::ScopeMismatch);
     }
-    Ok(prepared.command)
+    let journal_sequence = std::num::NonZeroU64::new(prepared.journal_sequence)
+        .ok_or(PmAuthorityError::DurableIntentMismatch)?;
+    Ok(PmPreparedPlaceDispatch::new(
+        journal_sequence,
+        prepared.request,
+    ))
 }
 
 fn quote_journal_intent(facts: PmQuoteAuthorityFacts) -> PmJournalQuoteIntentV1 {
@@ -458,7 +466,7 @@ pub struct ReservedPmCancel {
 pub struct PreparedPmCancel {
     facts: PmCancelAuthorityFacts,
     journal_sequence: u64,
-    command: PmFakeCancelCommand,
+    request: PmExactOwnedCancelRequest,
 }
 
 macro_rules! cancel_accessors {
@@ -666,7 +674,7 @@ pub(crate) fn approve_pm_cancel(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_pm_cancel(
-    execution: &PmFixtureOwnedExecution,
+    execution: &PmFixedMutationPreparation,
     expected_instrument_id: PmInstrumentId,
     reserved: ReservedPmCancel,
     current_scope: PmFixtureInstrumentScope,
@@ -682,30 +690,35 @@ pub(crate) fn prepare_pm_cancel(
         return Err(PmAuthorityError::DurableIntentMismatch);
     }
 
-    let command = execution.cancel_command(current_scope, facts.client_order, facts.venue_order)?;
-    if command.purpose() != facts.cancel_purpose {
+    let request = execution.prepare_cancel(current_scope, facts.client_order, facts.venue_order)?;
+    if request.purpose() != facts.cancel_purpose {
         return Err(PmAuthorityError::LoweringMismatch);
     }
     Ok(PreparedPmCancel {
         facts,
         journal_sequence,
-        command,
+        request,
     })
 }
 
-pub(crate) fn consume_prepared_cancel(
+pub(crate) fn take_prepared_cancel_dispatch(
     prepared: PreparedPmCancel,
     account_scope: PmAccountScope,
     instrument: PmInstrumentHandle,
     instrument_id: PmInstrumentId,
-) -> Result<PmFakeCancelCommand, PmAuthorityError> {
+) -> Result<PmPreparedCancelDispatch, PmAuthorityError> {
     if prepared.facts.account_scope != account_scope
         || prepared.facts.instrument != instrument
         || prepared.facts.instrument_id != instrument_id
     {
         return Err(PmAuthorityError::ScopeMismatch);
     }
-    Ok(prepared.command)
+    let journal_sequence = std::num::NonZeroU64::new(prepared.journal_sequence)
+        .ok_or(PmAuthorityError::DurableIntentMismatch)?;
+    Ok(PmPreparedCancelDispatch::new(
+        journal_sequence,
+        prepared.request,
+    ))
 }
 
 fn cancel_journal_intent(facts: PmCancelAuthorityFacts) -> PmJournalCancelIntentV1 {
@@ -729,7 +742,7 @@ fn consume_cancel_acknowledgement(
 }
 
 fn validate_profile(profile: PmGtcPostOnlyProfile) -> Result<(), PmAuthorityError> {
-    if profile.order_type() != reap_polymarket_adapter::PmFakeOrderType::Gtc
+    if profile.order_type() != PmFixedOrderType::Gtc
         || !profile.post_only()
         || profile.defer_exec()
         || profile.expiration() != 0
@@ -778,7 +791,7 @@ fn validate_not_expired(
 }
 
 fn validate_execution_scope(
-    execution: &PmFixtureOwnedExecution,
+    execution: &PmFixedMutationPreparation,
     expected_instrument_id: PmInstrumentId,
     current_scope: PmFixtureInstrumentScope,
     facts: PmQuoteAuthorityFacts,
@@ -796,7 +809,7 @@ fn validate_execution_scope(
 }
 
 fn validate_cancel_execution_scope(
-    execution: &PmFixtureOwnedExecution,
+    execution: &PmFixedMutationPreparation,
     expected_instrument_id: PmInstrumentId,
     current_scope: PmFixtureInstrumentScope,
     facts: PmCancelAuthorityFacts,
@@ -820,7 +833,7 @@ pub enum PmAuthorityError {
     ZeroRevision,
     #[error("PM mutation authority scope or identity does not match")]
     ScopeMismatch,
-    #[error("PM mutation authority requires the fixed fake execution profile")]
+    #[error("PM mutation authority requires the fixed GTC post-only execution profile")]
     ProfileMismatch,
     #[error("PM mutation authority requires maker, signer, and funder to be one EOA")]
     EoaIdentityMismatch,
@@ -844,7 +857,7 @@ pub enum PmAuthorityError {
     ApprovalExpired,
     #[error("durable acknowledgement does not name the exact mutation intent")]
     DurableIntentMismatch,
-    #[error("exact command lowering differs from the approved authority")]
+    #[error("exact request lowering differs from the approved authority")]
     LoweringMismatch,
     #[error(transparent)]
     FakeExecution(#[from] PmFakeExecutionError),

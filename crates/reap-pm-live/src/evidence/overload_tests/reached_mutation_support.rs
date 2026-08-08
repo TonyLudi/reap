@@ -172,7 +172,7 @@ pub(super) fn drain_outputs(run: &mut crate::PmProductRun<Phase6Model>) -> usize
     while let Some(effect) = run.pop_effect() {
         if matches!(
             effect,
-            PmProductEffect::FakePassiveQuote(_) | PmProductEffect::FakeCancelOwned(_)
+            PmProductEffect::PlaceGtcPostOnly(_) | PmProductEffect::CancelOwned(_)
         ) {
             fake += 1;
         }

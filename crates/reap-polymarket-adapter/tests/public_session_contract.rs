@@ -202,6 +202,10 @@ fn snapshot_with(timestamp: u64) -> String {
     placeholder.replace(r#""hash":"""#, &format!(r#""hash":"{hash}""#))
 }
 
+fn rest_snapshot_with(timestamp: u64) -> String {
+    snapshot_with(timestamp).replace(r#""event_type":"book","#, "")
+}
+
 fn delta(timestamp: u64, token: u64, transaction_hash: &str) -> String {
     format!(
         r#"{{
@@ -293,7 +297,7 @@ fn subscription_is_exactly_one_token_and_snapshot_only_opens_protocol_flow() {
     let mut session = new_session();
     assert_eq!(
         session.subscription_bytes(),
-        br#"{"assets_ids":["123"],"custom_feature_enabled":true,"initial_dump":true,"operation":"subscribe","type":"market"}"#
+        br#"{"assets_ids":["123"],"custom_feature_enabled":true,"type":"market"}"#
     );
     assert_eq!(
         session.configuration_fingerprint(),
@@ -375,6 +379,76 @@ fn subscription_is_exactly_one_token_and_snapshot_only_opens_protocol_flow() {
         "the acknowledgement opens venue delta flow only; product readiness remains reducer-owned"
     );
     assert_eq!(session.health(), ConnectionStatusKind::Ready);
+}
+
+#[test]
+fn native_rest_book_uses_the_exact_websocket_snapshot_state_transition() {
+    let mut websocket_session = new_session();
+    let mut rest_session = new_session();
+    subscribe(&mut websocket_session, 100);
+    subscribe(&mut rest_session, 100);
+
+    let websocket = websocket_session
+        .classify(
+            snapshot_with(123_456_789).as_bytes(),
+            1_700_000_000_123_456_789,
+            120,
+        )
+        .unwrap();
+    let native_rest = rest_session
+        .classify_rest_book_snapshot(
+            rest_snapshot_with(123_456_789).as_bytes(),
+            1_700_000_000_123_456_789,
+            120,
+        )
+        .unwrap();
+
+    assert_eq!(native_rest, websocket);
+    assert_eq!(
+        rest_session.current_snapshot_revision(),
+        websocket_session.current_snapshot_revision()
+    );
+    assert_eq!(
+        rest_session.local_ingress_sequence(),
+        websocket_session.local_ingress_sequence()
+    );
+    assert!(!rest_session.protocol_flow_open());
+    let token = native_rest.snapshot_flow_token().unwrap();
+    rest_session
+        .open_protocol_flow_after_snapshot(token)
+        .unwrap();
+    assert!(rest_session.protocol_flow_open());
+    assert_eq!(rest_session.health(), ConnectionStatusKind::Ready);
+}
+
+#[test]
+fn malformed_native_rest_book_fails_closed_with_receive_evidence() {
+    let mut session = new_session();
+    subscribe(&mut session, 100);
+
+    assert!(matches!(
+        session.classify_rest_book_snapshot(b"{", 1_700_000_000_000_000_101, 101),
+        Err(PmPublicSessionError::Wire(_))
+    ));
+    assert!(session.requires_reconnect());
+    assert!(!session.subscription_sent());
+    assert!(!session.protocol_flow_open());
+    let unavailable = session
+        .take_unavailable()
+        .expect("REST parser failure emits one unavailable occurrence");
+    assert_eq!(unavailable.source(), role().source());
+    assert_eq!(unavailable.connection_id(), role().connection());
+    assert_eq!(
+        unavailable.ordering().connection_epoch(),
+        ConnectionEpoch::new(11)
+    );
+    assert_eq!(unavailable.ordering().local_ingress_sequence().value(), 1);
+    assert_eq!(
+        unavailable.received_clock().local_wall_receive_ns(),
+        1_700_000_000_000_000_101
+    );
+    assert_eq!(unavailable.received_clock().monotonic_receive_ns(), 101);
+    assert_eq!(session.take_unavailable(), None);
 }
 
 #[test]
@@ -804,18 +878,28 @@ fn venue_timestamps_are_evidence_and_never_invent_a_predecessor_sequence() {
 #[test]
 fn reconnect_advances_epoch_once_resets_connection_state_and_uses_commit_backoff_history() {
     let mut session = new_session();
-    assert_eq!(session.after_failure().unwrap(), Duration::from_millis(10));
+    let preview = session.preview_after_failure_transition().unwrap();
+    assert_eq!(preview.retired_epoch(), ConnectionEpoch::new(11));
+    assert_eq!(preview.replacement_epoch(), ConnectionEpoch::new(12));
+    assert_eq!(preview.reconnect_attempt(), 1);
+    assert_eq!(preview.delay(), Duration::from_millis(10));
+    assert!(!preview.reset_after_flow_open());
+    assert_eq!(session.after_failure_transition().unwrap(), preview);
     assert_eq!(session.connection_epoch(), ConnectionEpoch::new(12));
-    assert_eq!(session.after_failure().unwrap(), Duration::from_millis(20));
+    let second = session.after_failure_transition().unwrap();
+    assert_eq!(second.retired_epoch(), ConnectionEpoch::new(12));
+    assert_eq!(second.replacement_epoch(), ConnectionEpoch::new(13));
+    assert_eq!(second.reconnect_attempt(), 2);
+    assert_eq!(second.delay(), Duration::from_millis(20));
+    assert!(!second.reset_after_flow_open());
     assert_eq!(session.connection_epoch(), ConnectionEpoch::new(13));
 
     subscribe(&mut session, 100);
     commit_snapshot(&mut session, &snapshot_with(123_456_789), 110);
-    assert_eq!(
-        session.after_failure().unwrap(),
-        Duration::from_millis(10),
-        "only an acknowledged, synchronously reduced snapshot resets startup history"
-    );
+    let reset = session.after_failure_transition().unwrap();
+    assert_eq!(reset.reconnect_attempt(), 1);
+    assert_eq!(reset.delay(), Duration::from_millis(10));
+    assert!(reset.reset_after_flow_open());
     assert_eq!(session.connection_epoch(), ConnectionEpoch::new(14));
     assert!(!session.subscription_sent());
     assert!(!session.protocol_flow_open());

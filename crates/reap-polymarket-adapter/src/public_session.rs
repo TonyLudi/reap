@@ -8,13 +8,14 @@ use reap_pm_core::{
 };
 use reap_polymarket_wire::{
     MAX_WS_EVENTS_PER_FRAME, PmIgnoredEvent, PmMarketSubscription, PmWireError, PmWsEvent,
-    parse_ws_frame,
+    parse_rest_book_snapshot, parse_ws_frame,
 };
 use reap_transport::{ConnectionStatusKind, ReconnectPolicy, SupervisorState};
 use thiserror::Error;
 
 use crate::{PmAuthoritativeMetadata, PmPublicRole, PmRecordedMetadataEvidence};
 
+mod session_lifecycle;
 mod session_state;
 
 use session_state::{
@@ -59,6 +60,49 @@ impl PmPublicHeartbeatConfig {
 pub enum PmPublicHeartbeatAction {
     Idle,
     SendPing,
+}
+
+/// Pure, session-owned preview/commit of one reconnect transition.
+///
+/// The attempt counter is reset to one only when the retired attempt reached
+/// synchronously reduced snapshot flow. Callers cannot construct this value
+/// or choose epochs, attempt numbers, or delay independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmPublicReconnectTransition {
+    retired_epoch: ConnectionEpoch,
+    replacement_epoch: ConnectionEpoch,
+    reconnect_attempt: u8,
+    delay: Duration,
+    reset_after_flow_open: bool,
+}
+
+impl PmPublicReconnectTransition {
+    #[must_use]
+    pub const fn retired_epoch(self) -> ConnectionEpoch {
+        self.retired_epoch
+    }
+
+    #[must_use]
+    pub const fn replacement_epoch(self) -> ConnectionEpoch {
+        self.replacement_epoch
+    }
+
+    #[must_use]
+    pub const fn reconnect_attempt(self) -> u8 {
+        self.reconnect_attempt
+    }
+
+    #[must_use]
+    pub const fn delay(self) -> Duration {
+        self.delay
+    }
+
+    /// Whether the retired epoch had reached synchronously reduced snapshot
+    /// flow and therefore reset the session's backoff/attempt history.
+    #[must_use]
+    pub const fn reset_after_flow_open(self) -> bool {
+        self.reset_after_flow_open
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -362,6 +406,7 @@ pub struct PmPublicSession {
     pending_unavailable: Option<PmPublicUnavailableOccurrence>,
     unavailable_required: bool,
     metadata_occurrence_issued: bool,
+    reconnect_attempt: u8,
     supervisor: SupervisorState,
 }
 
@@ -447,6 +492,7 @@ impl PmPublicSession {
             pending_unavailable: None,
             unavailable_required: false,
             metadata_occurrence_issued: false,
+            reconnect_attempt: 0,
             supervisor: SupervisorState::new(reconnect_policy),
         })
     }
@@ -717,6 +763,60 @@ impl PmPublicSession {
             );
         }
         result
+    }
+
+    /// Classifies one native CLOB REST `/book` response through the same
+    /// snapshot translation and protocol-flow state machine as a WebSocket
+    /// book event.
+    ///
+    /// The raw REST body is parsed directly; callers never need to fabricate
+    /// an `event_type` field or wrap the response as WebSocket JSON.
+    pub fn classify_rest_book_snapshot(
+        &mut self,
+        raw: &[u8],
+        local_wall_receive_ns: u64,
+        monotonic_receive_ns: u64,
+    ) -> Result<PmPublicSessionBatch, PmPublicSessionError> {
+        let result = self.classify_rest_book_snapshot_inner(
+            raw,
+            local_wall_receive_ns,
+            monotonic_receive_ns,
+        );
+        if let Err(error) = result {
+            self.invalidate_for_error_with_receive_evidence(
+                error,
+                local_wall_receive_ns,
+                monotonic_receive_ns,
+            );
+        }
+        result
+    }
+
+    fn classify_rest_book_snapshot_inner(
+        &mut self,
+        raw: &[u8],
+        local_wall_receive_ns: u64,
+        monotonic_receive_ns: u64,
+    ) -> Result<PmPublicSessionBatch, PmPublicSessionError> {
+        self.ensure_subscribed()?;
+        self.validate_receive_clock(local_wall_receive_ns, monotonic_receive_ns)?;
+        if let Some(deadline_ns) = self.attempt.heartbeat.pong_deadline_ns
+            && monotonic_receive_ns >= deadline_ns
+        {
+            return Err(PmPublicSessionError::HeartbeatTimeout { deadline_ns });
+        }
+        let snapshot = parse_rest_book_snapshot(raw, self.role.parser_config())
+            .map_err(PmPublicSessionError::Wire)?;
+        let event = PmWsEvent::BookSnapshot(snapshot);
+        let translated = self.translate_frame(
+            std::slice::from_ref(&event),
+            local_wall_receive_ns,
+            monotonic_receive_ns,
+        )?;
+        if !self.attempt.requires_reconnect {
+            self.attempt.last_monotonic_ns = Some(monotonic_receive_ns);
+        }
+        Ok(translated)
     }
 
     fn classify_inner(
@@ -1105,243 +1205,6 @@ impl PmPublicSession {
         self.invalidate_with_receive_evidence(fault, local_wall_receive_ns, monotonic_receive_ns)?;
         result
     }
-
-    pub fn poll_heartbeat(
-        &mut self,
-        monotonic_now_ns: u64,
-    ) -> Result<PmPublicHeartbeatAction, PmPublicSessionError> {
-        let result = self.poll_heartbeat_inner(monotonic_now_ns);
-        if let Err(error) = result {
-            self.invalidate_for_error(error);
-        }
-        result
-    }
-
-    /// Polls heartbeat state with a local wall clock so timeout invalidation
-    /// can emit one evidence-bearing unavailable occurrence.
-    pub fn poll_heartbeat_with_receive_evidence(
-        &mut self,
-        local_wall_now_ns: u64,
-        monotonic_now_ns: u64,
-    ) -> Result<PmPublicHeartbeatAction, PmPublicSessionError> {
-        let result = self.poll_heartbeat_inner(monotonic_now_ns);
-        if let Err(error) = result {
-            self.invalidate_for_error_with_receive_evidence(
-                error,
-                local_wall_now_ns,
-                monotonic_now_ns,
-            );
-        }
-        result
-    }
-
-    /// Previews the exact heartbeat transition without mutating session state.
-    ///
-    /// Active composition owners use this to preflight and durably record the
-    /// corresponding lifecycle event before enacting the session transition.
-    /// In particular, an `Idle` preview does not advance the monotonic clock,
-    /// and a timeout preview does not invalidate the session or consume its
-    /// one unavailable occurrence.
-    pub fn preview_heartbeat(
-        &self,
-        monotonic_now_ns: u64,
-    ) -> Result<PmPublicHeartbeatAction, PmPublicSessionError> {
-        self.ensure_subscribed()?;
-        self.validate_monotonic(monotonic_now_ns)?;
-        if let Some(deadline_ns) = self.attempt.heartbeat.pong_deadline_ns {
-            return if monotonic_now_ns >= deadline_ns {
-                Err(PmPublicSessionError::HeartbeatTimeout { deadline_ns })
-            } else {
-                Ok(PmPublicHeartbeatAction::Idle)
-            };
-        }
-        let next_ping_ns = self
-            .attempt
-            .heartbeat
-            .next_ping_ns
-            .ok_or(PmPublicSessionError::InvalidHeartbeatState)?;
-        if monotonic_now_ns < next_ping_ns {
-            return Ok(PmPublicHeartbeatAction::Idle);
-        }
-        monotonic_now_ns
-            .checked_add(self.heartbeat_config.pong_timeout_ns())
-            .ok_or(PmPublicSessionError::HeartbeatDeadlineOverflow)?;
-        Ok(PmPublicHeartbeatAction::SendPing)
-    }
-
-    fn poll_heartbeat_inner(
-        &mut self,
-        monotonic_now_ns: u64,
-    ) -> Result<PmPublicHeartbeatAction, PmPublicSessionError> {
-        let action = self.preview_heartbeat(monotonic_now_ns)?;
-        self.attempt.last_monotonic_ns = Some(monotonic_now_ns);
-        if action == PmPublicHeartbeatAction::Idle {
-            return Ok(action);
-        }
-        let deadline_ns = monotonic_now_ns
-            .checked_add(self.heartbeat_config.pong_timeout_ns())
-            .ok_or(PmPublicSessionError::HeartbeatDeadlineOverflow)?;
-        self.attempt.heartbeat.next_ping_ns = None;
-        self.attempt.heartbeat.pong_deadline_ns = Some(deadline_ns);
-        Ok(action)
-    }
-
-    fn receive_pong(
-        &mut self,
-        local_wall_receive_ns: u64,
-        monotonic_receive_ns: u64,
-    ) -> Result<PmPublicSessionBatch, PmPublicSessionError> {
-        let deadline_ns = self
-            .attempt
-            .heartbeat
-            .pong_deadline_ns
-            .ok_or(PmPublicSessionError::UnexpectedPong)?;
-        if monotonic_receive_ns >= deadline_ns {
-            return Err(PmPublicSessionError::HeartbeatTimeout { deadline_ns });
-        }
-        let next_ping_ns = monotonic_receive_ns
-            .checked_add(self.heartbeat_config.ping_interval_ns())
-            .ok_or(PmPublicSessionError::HeartbeatDeadlineOverflow)?;
-        self.attempt.heartbeat.pong_deadline_ns = None;
-        self.attempt.heartbeat.next_ping_ns = Some(next_ping_ns);
-        self.attempt.last_monotonic_ns = Some(monotonic_receive_ns);
-        Ok(PmPublicSessionBatch::from_heartbeat(
-            PmPublicHeartbeatEvidence {
-                connection_epoch: self.connection_epoch,
-                local_wall_receive_ns,
-                monotonic_receive_ns,
-            },
-        ))
-    }
-
-    pub fn after_failure(&mut self) -> Result<Duration, PmPublicSessionError> {
-        if self.health() == ConnectionStatusKind::Fatal {
-            return Err(PmPublicSessionError::SessionFatal);
-        }
-        if self.attempt.requires_reconnect && self.unavailable_required {
-            return if self.pending_unavailable.is_some() {
-                Err(PmPublicSessionError::UnavailableOccurrencePending)
-            } else {
-                Err(PmPublicSessionError::UnavailableOccurrenceMissing)
-            };
-        }
-        let Some(next_epoch) = self.connection_epoch.value().checked_add(1) else {
-            self.attempt.subscription_sent = false;
-            self.attempt.requires_reconnect = true;
-            self.attempt.flow_open = false;
-            self.attempt.current_snapshot_revision = None;
-            self.attempt.pending_snapshot_flow = None;
-            self.attempt.heartbeat = HeartbeatState::disconnected();
-            self.last_fault = Some(PmPublicSessionFault::Overflow);
-            self.supervisor.mark_fatal();
-            return Err(PmPublicSessionError::ConnectionEpochOverflow);
-        };
-        let reached_flow_open = self.attempt.reached_flow_open;
-        self.connection_epoch = ConnectionEpoch::new(next_epoch);
-        self.attempt = AttemptState::new();
-        self.last_fault = None;
-        self.pending_unavailable = None;
-        self.unavailable_required = false;
-        Ok(self.supervisor.after_failure(reached_flow_open))
-    }
-
-    pub fn preview_after_failure(
-        &self,
-    ) -> Result<(ConnectionEpoch, Duration), PmPublicSessionError> {
-        if self.health() == ConnectionStatusKind::Fatal {
-            return Err(PmPublicSessionError::SessionFatal);
-        }
-        if self.attempt.requires_reconnect && self.unavailable_required {
-            return if self.pending_unavailable.is_some() {
-                Err(PmPublicSessionError::UnavailableOccurrencePending)
-            } else {
-                Err(PmPublicSessionError::UnavailableOccurrenceMissing)
-            };
-        }
-        let next_epoch = self
-            .connection_epoch
-            .value()
-            .checked_add(1)
-            .ok_or(PmPublicSessionError::ConnectionEpochOverflow)?;
-        Ok((
-            ConnectionEpoch::new(next_epoch),
-            self.supervisor
-                .preview_after_failure(self.attempt.reached_flow_open),
-        ))
-    }
-
-    pub fn preflight_invalidate_with_receive_evidence(
-        &self,
-        local_wall_receive_ns: u64,
-        monotonic_receive_ns: u64,
-    ) -> Result<(), PmPublicSessionError> {
-        if self.pending_unavailable.is_some() {
-            return Ok(());
-        }
-        ReceivedEventClock::new(None, local_wall_receive_ns, monotonic_receive_ns)
-            .map_err(PmPublicSessionError::Envelope)?;
-        self.validate_monotonic(monotonic_receive_ns)?;
-        self.attempt
-            .local_ingress_sequence
-            .checked_add(1)
-            .ok_or(PmPublicSessionError::IngressSequenceOverflow)?;
-        Ok(())
-    }
-
-    /// Invalidates the attempt and records one session-sequenced unavailable
-    /// occurrence. Connection faults never claim a venue timestamp.
-    pub fn invalidate_with_receive_evidence(
-        &mut self,
-        fault: PmPublicSessionFault,
-        local_wall_receive_ns: u64,
-        monotonic_receive_ns: u64,
-    ) -> Result<(), PmPublicSessionError> {
-        if self.pending_unavailable.is_none() {
-            let clock = ReceivedEventClock::new(None, local_wall_receive_ns, monotonic_receive_ns)
-                .map_err(PmPublicSessionError::Envelope)?;
-            self.validate_monotonic(monotonic_receive_ns)?;
-            let next_ingress = self
-                .attempt
-                .local_ingress_sequence
-                .checked_add(1)
-                .ok_or(PmPublicSessionError::IngressSequenceOverflow)?;
-            let ordering = EventOrdering::new(
-                self.connection_epoch,
-                None,
-                None,
-                None,
-                IngressSequence::new(next_ingress),
-            )
-            .map_err(PmPublicSessionError::Envelope)?;
-            self.attempt.local_ingress_sequence = next_ingress;
-            self.attempt.last_monotonic_ns = Some(monotonic_receive_ns);
-            self.pending_unavailable = Some(PmPublicUnavailableOccurrence {
-                source: self.role.source(),
-                connection_id: self.role.connection(),
-                received_clock: clock,
-                ordering,
-                fault,
-            });
-        }
-        self.invalidate(fault);
-        Ok(())
-    }
-
-    pub fn invalidate(&mut self, fault: PmPublicSessionFault) {
-        if !self.attempt.requires_reconnect {
-            self.unavailable_required = true;
-        }
-        self.last_fault = Some(fault);
-        self.attempt.subscription_sent = false;
-        self.attempt.requires_reconnect = true;
-        self.attempt.flow_open = false;
-        self.attempt.current_snapshot_revision = None;
-        self.attempt.pending_snapshot_flow = None;
-        self.attempt.heartbeat = HeartbeatState::disconnected();
-        if self.health() != ConnectionStatusKind::Fatal {
-            self.supervisor.mark_disconnected();
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -1400,6 +1263,8 @@ pub enum PmPublicSessionError {
     SnapshotRevisionOverflow,
     #[error("connection epoch overflowed")]
     ConnectionEpochOverflow,
+    #[error("reconnect attempt counter overflowed")]
+    ReconnectAttemptOverflow,
     #[error("book delta or BBO arrived before the reduced snapshot opened protocol flow")]
     DataBeforeSnapshotFlowOpen,
     #[error("a previous snapshot still awaits protocol-flow acknowledgement after reduction")]
@@ -1426,6 +1291,7 @@ impl PmPublicSessionError {
     const fn fault(self) -> PmPublicSessionFault {
         match self {
             Self::ConnectionEpochOverflow
+            | Self::ReconnectAttemptOverflow
             | Self::SnapshotRevisionOverflow
             | Self::IngressSequenceOverflow
             | Self::VenueTimestampOverflow

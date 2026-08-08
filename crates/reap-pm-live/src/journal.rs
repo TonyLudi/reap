@@ -28,21 +28,23 @@ pub(crate) use schema::derive_pm_journal_client_order_from_fingerprint;
 use schema::next_sequence;
 pub use schema::{
     MAX_PM_JOURNAL_BYTES, MAX_PM_JOURNAL_LINE_BYTES, MAX_PM_JOURNAL_RECORDS,
-    PM_MUTATION_JOURNAL_FAMILY, PM_MUTATION_JOURNAL_VERSION, PmJournalCancelIntentV1,
-    PmJournalCancelOutcomeV1, PmJournalCancelReasonV1, PmJournalCancelRejectReasonV1,
-    PmJournalCancelResultV1, PmJournalFillAppliedV1, PmJournalFillCursorV1,
-    PmJournalFillDeliveryV1, PmJournalFillFeeV1, PmJournalFillKeyV1, PmJournalFillOccurrenceV1,
-    PmJournalFillRoleV1, PmJournalFillSettlementV1, PmJournalFillSourceV1, PmJournalFillV1,
-    PmJournalFillWatermarkV1, PmJournalFingerprintV1, PmJournalHeaderV1, PmJournalImmediateFillsV1,
-    PmJournalOrderProgressSourceV1, PmJournalOrderTerminalV1, PmJournalPlaceOutcomeV1,
-    PmJournalPlaceRejectReasonV1, PmJournalPlaceResultV1, PmJournalQuoteIntentV1,
-    PmJournalQuoteProfileV1, PmJournalRecordV1, PmJournalSafetyHaltV1, PmJournalSafetyReasonV1,
-    PmJournalSchemaError, PmJournalScopeV1, PmJournalSideV1, PmJournalTerminalStatusV1,
+    PM_MUTATION_JOURNAL_FAMILY, PM_MUTATION_JOURNAL_VERSION, PmJournalAuthenticatedCancelResultV1,
+    PmJournalAuthenticatedClassificationV1, PmJournalAuthenticatedPlaceResultV1,
+    PmJournalAuthenticatedResultV1, PmJournalCancelIntentV1, PmJournalCancelOutcomeV1,
+    PmJournalCancelReasonV1, PmJournalCancelRejectReasonV1, PmJournalCancelResultV1,
+    PmJournalFillAppliedV1, PmJournalFillCursorV1, PmJournalFillDeliveryV1, PmJournalFillFeeV1,
+    PmJournalFillKeyV1, PmJournalFillOccurrenceV1, PmJournalFillRoleV1, PmJournalFillSettlementV1,
+    PmJournalFillSourceV1, PmJournalFillV1, PmJournalFillWatermarkV1, PmJournalFingerprintV1,
+    PmJournalHeaderV1, PmJournalImmediateFillsV1, PmJournalOrderProgressSourceV1,
+    PmJournalOrderTerminalV1, PmJournalPlaceOutcomeV1, PmJournalPlaceRejectReasonV1,
+    PmJournalPlaceResultV1, PmJournalQuoteIntentV1, PmJournalQuoteProfileV1, PmJournalRecordV1,
+    PmJournalSafetyHaltV1, PmJournalSafetyReasonV1, PmJournalSchemaError, PmJournalScopeV1,
+    PmJournalSideV1, PmJournalTerminalStatusV1,
 };
 use writer::{PmJournalCodec, PmJournalCodecError};
 
 pub(crate) const PM_JOURNAL_PENDING_CAPACITY: usize = 1_024;
-const PM_SEALED_JOURNAL_RECORD_KINDS: usize = 9;
+const PM_SEALED_JOURNAL_RECORD_KINDS: usize = 10;
 
 /// Borrowed proof that the exact record passed schema validation for one
 /// exact journal scope before entering the sealed evidence ledger.
@@ -447,6 +449,7 @@ pub(crate) struct PmSealedJournalRecordCounts {
     pub(crate) order_terminals: u64,
     pub(crate) safety_halts: u64,
     pub(crate) fill_watermark_advances: u64,
+    pub(crate) authenticated_results: u64,
 }
 
 impl From<[u64; PM_SEALED_JOURNAL_RECORD_KINDS]> for PmSealedJournalRecordCounts {
@@ -461,6 +464,7 @@ impl From<[u64; PM_SEALED_JOURNAL_RECORD_KINDS]> for PmSealedJournalRecordCounts
             order_terminals: counts[6],
             safety_halts: counts[7],
             fill_watermark_advances: counts[8],
+            authenticated_results: counts[9],
         }
     }
 }
@@ -524,6 +528,7 @@ const fn sealed_record_index(record: &PmJournalRecordV1) -> usize {
         PmJournalRecordV1::OrderTerminal(_) => 6,
         PmJournalRecordV1::SafetyHalt(_) => 7,
         PmJournalRecordV1::FillWatermarkAdvanced(_) => 8,
+        PmJournalRecordV1::AuthenticatedResult(_) => 9,
     }
 }
 

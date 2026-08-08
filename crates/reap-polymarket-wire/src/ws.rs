@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 
 use reap_pm_core::{
-    PmBookLevel, PmBookQuantity, PmBookSide, PmMarketId, PmPrice, PmQuantity, PmTick, PmTokenId,
+    PmBookLevel, PmBookQuantity, PmBookSide, PmConditionId, PmMarketId, PmPrice, PmQuantity,
+    PmTick, PmTokenId,
 };
 use serde_json::Value;
 
@@ -12,7 +13,7 @@ use crate::raw::{
     RawBestBidAskEvent, RawBook, RawBookLevel, RawPriceChangeEvent, RawTickSizeChangeEvent,
 };
 use crate::rest::{parse_market, parse_token};
-use crate::{PmBookParserConfig, PmWireError, SnapshotHash};
+use crate::{PmBookMarketBinding, PmBookParserConfig, PmWireError, SnapshotHash};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PmExactBookLevel {
@@ -407,9 +408,9 @@ fn parse_raw_book(
         return Err(PmWireError::TooManyBookLevels);
     }
 
-    let market = parse_market(required(&book.market, "market")?)?;
+    let market = parse_scoped_market(required(&book.market, "market")?, config)?;
     let token = parse_token(required(&book.asset_id, "asset_id")?)?;
-    validate_scope(market, token, config)?;
+    validate_token_scope(token, config)?;
     let (timestamp, timestamp_millis) = parse_timestamp(required(&book.timestamp, "timestamp")?)?;
 
     let tick_raw = required(&book.tick_size, "tick_size")?;
@@ -507,10 +508,7 @@ fn parse_price_change(
     event: RawPriceChangeEvent,
     config: PmBookParserConfig,
 ) -> Result<PmPriceChangeBatch, PmWireError> {
-    let market = parse_market(required(&event.market, "market")?)?;
-    if market != config.scope().market() {
-        return Err(PmWireError::MarketMismatch);
-    }
+    let market = parse_scoped_market(required(&event.market, "market")?, config)?;
     let (timestamp, timestamp_millis) = parse_timestamp(required(&event.timestamp, "timestamp")?)?;
     let raw_changes = event
         .price_changes
@@ -740,20 +738,39 @@ fn validate_raw_scope(
     raw_token: &Option<String>,
     config: PmBookParserConfig,
 ) -> Result<(PmMarketId, PmTokenId), PmWireError> {
-    let market = parse_market(required(raw_market, "market")?)?;
+    let market = parse_scoped_market(required(raw_market, "market")?, config)?;
     let token = parse_token(required(raw_token, "asset_id")?)?;
-    validate_scope(market, token, config)?;
+    validate_token_scope(token, config)?;
     Ok((market, token))
 }
 
-fn validate_scope(
-    market: PmMarketId,
-    token: PmTokenId,
+fn parse_scoped_market(
+    raw_market: &str,
     config: PmBookParserConfig,
-) -> Result<(), PmWireError> {
-    if market != config.scope().market() {
-        return Err(PmWireError::MarketMismatch);
+) -> Result<PmMarketId, PmWireError> {
+    match config.market_binding() {
+        PmBookMarketBinding::LegacyMarketId => {
+            let market = parse_market(raw_market)?;
+            if market != config.scope().market() {
+                return Err(PmWireError::MarketMismatch);
+            }
+            Ok(market)
+        }
+        PmBookMarketBinding::ConditionId => {
+            let condition = PmConditionId::parse(raw_market)
+                .map_err(|_| PmWireError::InvalidIdentity("condition_id"))?;
+            if condition != config.scope().condition() {
+                return Err(PmWireError::ConditionMismatch);
+            }
+            // Normalized public events retain the independently established
+            // question/market identity from the metadata scope. The raw
+            // condition-bearing frame remains available to capture evidence.
+            Ok(config.scope().market())
+        }
     }
+}
+
+fn validate_token_scope(token: PmTokenId, config: PmBookParserConfig) -> Result<(), PmWireError> {
     if token != config.scope().token() {
         return Err(PmWireError::TokenMismatch);
     }

@@ -26,8 +26,8 @@ pub enum PmCapabilityRequirementId {
     AccountToken,
     AccountAllowance,
     PositionSnapshot,
-    FakePlaceGtcPostOnly,
-    FakeCancelOwned,
+    PlaceGtcPostOnly,
+    CancelOwned,
 }
 
 impl PmCapabilityRequirementId {
@@ -46,8 +46,8 @@ impl PmCapabilityRequirementId {
         Self::AccountToken,
         Self::AccountAllowance,
         Self::PositionSnapshot,
-        Self::FakePlaceGtcPostOnly,
-        Self::FakeCancelOwned,
+        Self::PlaceGtcPostOnly,
+        Self::CancelOwned,
     ];
 
     #[must_use]
@@ -67,8 +67,8 @@ impl PmCapabilityRequirementId {
             Self::AccountToken => "PM-ACCOUNT-TOKEN",
             Self::AccountAllowance => "PM-ACCOUNT-ALLOWANCE",
             Self::PositionSnapshot => "PM-POSITION-SNAPSHOT",
-            Self::FakePlaceGtcPostOnly => "PM-FAKE-PLACE-GTC-PO",
-            Self::FakeCancelOwned => "PM-FAKE-CANCEL-OWNED",
+            Self::PlaceGtcPostOnly => "PM-PLACE-GTC-PO",
+            Self::CancelOwned => "PM-CANCEL-OWNED",
         }
     }
 }
@@ -238,7 +238,7 @@ pub enum PmRequirementOrigin {
     ModelPublicInput,
     ConfiguredPublicCapture,
     MandatorySafetyAndReadiness,
-    FixedFakeExecutionProfile,
+    FixedExecutionProfile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -251,7 +251,7 @@ pub enum PmRequirementConsumer {
     OrderReconciliation,
     PositionReadiness,
     AllowanceReadiness,
-    FakeEffectWorker,
+    EffectDispatcher,
     OwnedCancellation,
     QuoteEvaluationSchedule,
 }
@@ -284,7 +284,7 @@ pub enum PmCapabilityLane {
     ReconciliationRequest,
     Capture,
     Journal,
-    FakeEffect,
+    EffectDispatch,
 }
 
 impl PmCapabilityLane {
@@ -299,7 +299,7 @@ impl PmCapabilityLane {
         Self::ReconciliationRequest,
         Self::Capture,
         Self::Journal,
-        Self::FakeEffect,
+        Self::EffectDispatch,
     ];
 }
 

@@ -27,10 +27,11 @@ use super::report::{
 };
 use crate::coordinator::{
     PmBookDecisionProjection, PmCoordinator, PmCoordinatorCounters, PmDurableRecordEffect,
-    PmDurableRecordKind as RecordKind, PmFakeEffectMetrics, PmFakeEffectStage, PmHealthMetricKind,
-    PmMarketInput, PmMutationCounters, PmPersistenceMetrics, PmProductEffect,
+    PmDurableRecordKind as RecordKind, PmEffectDispatchStage, PmFakeEffectMetrics,
+    PmHealthMetricKind, PmMarketInput, PmMutationCounters, PmPersistenceMetrics, PmProductEffect,
     PmRefreshObligationMetrics,
 };
+use crate::fake_effect::PmFixtureEffectExecutor;
 use crate::journal::{PmJournalScopeV1, PmSealedJournalProjection, PmSealedJournalRecordCounts};
 use crate::lanes::{PmCompleteServiceCounts, PmLaneKind};
 use crate::private_monitor::{
@@ -106,6 +107,7 @@ struct PassRawProjection {
 
 struct EvidenceRun {
     owner: PmCoordinator<Phase6Model>,
+    fake_executor: PmFixtureEffectExecutor,
     public: PublicFixture,
     cursor: WorkloadCursor,
     account: AccountRows,
@@ -278,14 +280,14 @@ pub(crate) fn journal_scope() -> Result<PmJournalScopeV1, PmEvidenceError> {
 impl EvidenceRun {
     async fn start_sealed() -> Result<Self, PmEvidenceError> {
         let config = connectivity_config();
-        let owner = PmCoordinator::start_sealed_evidence(
+        let (owner, fake_executor) = PmCoordinator::start_sealed_evidence(
             &config,
             model(),
             risk_limits(),
             coordinator_policy(),
         )
         .map_err(PmEvidenceError::invariant)?;
-        let mut run = Self::new(owner, &config)?;
+        let mut run = Self::new(owner, fake_executor, &config)?;
         run.prepare_private(DurabilityMode::Sealed).await?;
         run.prepare_public()?;
         validate_setup(run.setup, None)?;
@@ -294,7 +296,7 @@ impl EvidenceRun {
 
     async fn start_real(journal_path: PathBuf) -> Result<Self, PmEvidenceError> {
         let config = connectivity_config();
-        let (owner, recovery) = PmCoordinator::start_real_writer_evidence(
+        let (owner, recovery, fake_executor) = PmCoordinator::start_real_writer_evidence(
             &config,
             model(),
             risk_limits(),
@@ -308,7 +310,7 @@ impl EvidenceRun {
                 "fresh combined replay journal recovered existing records",
             ));
         }
-        let mut run = Self::new(owner, &config)?;
+        let mut run = Self::new(owner, fake_executor, &config)?;
         run.prepare_private(DurabilityMode::RealWriter).await?;
         run.prepare_public()?;
         validate_setup(run.setup, Some(2))?;
@@ -317,6 +319,7 @@ impl EvidenceRun {
 
     fn new(
         owner: PmCoordinator<Phase6Model>,
+        fake_executor: PmFixtureEffectExecutor,
         config: &reap_pm_live_contracts::PmConnectivityConfig,
     ) -> Result<Self, PmEvidenceError> {
         let sealed = owner.sealed_journal_projection();
@@ -325,6 +328,7 @@ impl EvidenceRun {
         }
         Ok(Self {
             owner,
+            fake_executor,
             public: PublicFixture::new(config)?,
             cursor: WorkloadCursor::after_setup(),
             account: AccountRows::new(config)?,
@@ -594,6 +598,7 @@ impl EvidenceRun {
 
         self.owner
             .execute_prepared_quote_fixture(
+                &self.fake_executor,
                 self.cursor.next_completion(None),
                 PmFakePlaceScript::acknowledged(venue, Box::new([])).map_err(invariant)?,
                 self.cursor.next_time(),
@@ -699,7 +704,12 @@ impl EvidenceRun {
         let occurrence = self.cursor.next_completion(None);
         let effect_ns = self.cursor.next_time();
         self.owner
-            .execute_prepared_cancel_fixture(occurrence, PmFakeCancelScript::accepted(), effect_ns)
+            .execute_prepared_cancel_fixture(
+                &self.fake_executor,
+                occurrence,
+                PmFakeCancelScript::accepted(),
+                effect_ns,
+            )
             .map_err(invariant)?;
         let service_ns = self.cursor.next_time();
         self.service_one(service_ns, effects)?;
@@ -1060,7 +1070,7 @@ struct AckEffects { values: [Option<PmProductEffect>; 3], len: u8 }
 #[rustfmt::skip]
 impl AckEffects {
     fn observe(&mut self, effect: PmProductEffect) {
-        let relevant = matches!(effect, PmProductEffect::DurableRecord(_) | PmProductEffect::FakePassiveQuote(_) | PmProductEffect::FakeCancelOwned(_))
+        let relevant = matches!(effect, PmProductEffect::DurableRecord(_) | PmProductEffect::PlaceGtcPostOnly(_) | PmProductEffect::CancelOwned(_))
             || matches!(effect, PmProductEffect::HealthMetricAudit(metric) if metric.kind() == PmHealthMetricKind::PersistenceAcknowledged);
         if !relevant { return; }
         if let Some(slot) = self.values.get_mut(usize::from(self.len)) { *slot = Some(effect); }
@@ -1122,12 +1132,12 @@ fn validate_ack(cycle: u64, durability: DurabilityMode, expected: ExpectedAck, c
 #[rustfmt::skip]
 fn effects_match(expected: ExpectedAck, effects: AckEffects, scope: PmAccountScope, instrument: PmInstrumentHandle, fact_sequence: u64) -> bool {
     match (expected, effects.len, effects.values) {
-        (ExpectedAck::Quote, 3, [Some(PmProductEffect::DurableRecord(r)), Some(PmProductEffect::FakePassiveQuote(q)), Some(PmProductEffect::HealthMetricAudit(h))]) =>
+        (ExpectedAck::Quote, 3, [Some(PmProductEffect::DurableRecord(r)), Some(PmProductEffect::PlaceGtcPostOnly(q)), Some(PmProductEffect::HealthMetricAudit(h))]) =>
             r.kind() == RecordKind::QuoteIntent && r.client_order() == Some(q.client_order()) && q.account_scope() == scope && q.instrument() == instrument
-                && q.stage() == PmFakeEffectStage::PreparedAfterDurability && h.kind() == PmHealthMetricKind::PersistenceAcknowledged && h.value() == 1,
-        (ExpectedAck::Cancel { venue_order }, 3, [Some(PmProductEffect::DurableRecord(r)), Some(PmProductEffect::FakeCancelOwned(c)), Some(PmProductEffect::HealthMetricAudit(h))]) =>
+                && q.stage() == PmEffectDispatchStage::PreparedAfterDurability && h.kind() == PmHealthMetricKind::PersistenceAcknowledged && h.value() == 1,
+        (ExpectedAck::Cancel { venue_order }, 3, [Some(PmProductEffect::DurableRecord(r)), Some(PmProductEffect::CancelOwned(c)), Some(PmProductEffect::HealthMetricAudit(h))]) =>
             r.kind() == RecordKind::CancelIntent && r.client_order() == Some(c.client_order()) && c.account_scope() == scope && c.instrument() == instrument
-                && c.venue_order() == venue_order && c.stage() == PmFakeEffectStage::PreparedAfterDurability && h.kind() == PmHealthMetricKind::PersistenceAcknowledged && h.value() == 1,
+                && c.venue_order() == venue_order && c.stage() == PmEffectDispatchStage::PreparedAfterDurability && h.kind() == PmHealthMetricKind::PersistenceAcknowledged && h.value() == 1,
         (ExpectedAck::Fact { kind, record: Some(record) }, 1, [Some(PmProductEffect::HealthMetricAudit(h)), None, None]) =>
             record.kind() == kind && !matches!(kind, RecordKind::QuoteIntent | RecordKind::CancelIntent)
                 && record.client_order().is_none_or(|key| key.account() == scope.handle())
@@ -1358,6 +1368,7 @@ fn journal_delta(
                 order_terminals: 0,
                 safety_halts: 0,
                 fill_watermark_advances: cycles / 1_000,
+                authenticated_results: 0,
             };
             let actual_by_kind = after.segment_records_by_kind();
             if actual_by_kind != expected_by_kind {
@@ -1466,29 +1477,54 @@ const fn delta(after: u64, before: u64) -> u64 {
     after.saturating_sub(before)
 }
 
-#[cfg(test)]
 #[rustfmt::skip]
+#[cfg(test)]
 mod tests {
     use super::*;
-    #[tokio::test(flavor = "current_thread")]
-    async fn real_writer_acknowledgement_is_bound_to_expected_prepared_effect() {
-        let directory = tempfile::tempdir_in(std::env::current_exe().unwrap().parent().unwrap()).unwrap();
-        let mut run = EvidenceRun::start_real(directory.path().join("ack.jsonl")).await.unwrap();
-        run.cursor.align_pass_start().unwrap();
-        let mut effects = EffectProjection::new(); let mut input_mix = InputMixReport::default();
-        let mut public = Sha256::new(); let mut excluded = 0;
-        for cycle in 1..=2 {
-            run.run_cycle(cycle, DurabilityMode::RealWriter, None, None, &mut effects,
-                &mut input_mix, &mut public, &mut excluded).await.unwrap();
+    const WORKLOAD_TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+    #[test]
+    fn real_writer_acknowledgement_is_bound_to_expected_prepared_effect() {
+        run_workload_test("pm-evidence-real-writer-ack", || async {
+            let directory = tempfile::tempdir_in(std::env::current_exe().unwrap().parent().unwrap()).unwrap();
+            let mut run = EvidenceRun::start_real(directory.path().join("ack.jsonl")).await.unwrap();
+            run.cursor.align_pass_start().unwrap();
+            let mut effects = EffectProjection::new(); let mut input_mix = InputMixReport::default();
+            let mut public = Sha256::new(); let mut excluded = 0;
+            for cycle in 1..=2 {
+                run.run_cycle(cycle, DurabilityMode::RealWriter, None, None, &mut effects,
+                    &mut input_mix, &mut public, &mut excluded).await.unwrap();
+            }
+            let nominal = AckPolicy { primary: None, service: true, durable: true, prepared: true, identity: true, queue: true };
+            assert_eq!(ack_class(nominal), None);
+            assert_eq!(ack_class(AckPolicy { prepared: false, ..nominal }), Some("prepared_effect_identity_mismatch"));
+            assert_eq!(ack_class(AckPolicy { identity: false, ..nominal }), Some("prepared_effect_identity_mismatch"));
+            assert_eq!(ack_class(AckPolicy { primary: Some("persistence_durability_failure"), identity: false, ..nominal }), Some("persistence_durability_failure"));
+            let cut = CounterCut::capture(&run.owner, run.cursor.internal_fact_acks); let error = ack_error(73, DurabilityMode::RealWriter, ExpectedAck::Quote, "prepared_effect_identity_mismatch",
+                AckDelta(Some([0; 11])), cut, cut, AckEffects::default(), "injected classifier seam").to_string();
+            assert!(error.contains("cycle=73") && error.contains("expected=Quote") && error.contains("delta_order=") && error.contains("primary_failure_class=prepared_effect_identity_mismatch"));
+            run.owner.shutdown_evidence().await.unwrap();
+        });
+    }
+
+    fn run_workload_test<F, Fut>(name: &str, test: F)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        let handle = std::thread::Builder::new()
+            .name(name.to_owned())
+            .stack_size(WORKLOAD_TEST_STACK_BYTES)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("workload test runtime")
+                    .block_on(test());
+            })
+            .expect("spawn bounded workload test thread");
+        if let Err(panic) = handle.join() {
+            std::panic::resume_unwind(panic);
         }
-        let nominal = AckPolicy { primary: None, service: true, durable: true, prepared: true, identity: true, queue: true };
-        assert_eq!(ack_class(nominal), None);
-        assert_eq!(ack_class(AckPolicy { prepared: false, ..nominal }), Some("prepared_effect_identity_mismatch"));
-        assert_eq!(ack_class(AckPolicy { identity: false, ..nominal }), Some("prepared_effect_identity_mismatch"));
-        assert_eq!(ack_class(AckPolicy { primary: Some("persistence_durability_failure"), identity: false, ..nominal }), Some("persistence_durability_failure"));
-        let cut = CounterCut::capture(&run.owner, run.cursor.internal_fact_acks); let error = ack_error(73, DurabilityMode::RealWriter, ExpectedAck::Quote, "prepared_effect_identity_mismatch",
-            AckDelta(Some([0; 11])), cut, cut, AckEffects::default(), "injected classifier seam").to_string();
-        assert!(error.contains("cycle=73") && error.contains("expected=Quote") && error.contains("delta_order=") && error.contains("primary_failure_class=prepared_effect_identity_mismatch"));
-        run.owner.shutdown_evidence().await.unwrap();
     }
 }

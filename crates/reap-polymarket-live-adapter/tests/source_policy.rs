@@ -1,0 +1,451 @@
+const MANIFEST: &str = include_str!("../Cargo.toml");
+const LIB: &str = include_str!("../src/lib.rs");
+const CONFIG: &str = include_str!("../src/config.rs");
+const HTTP_TRANSPORT: &str = include_str!("../src/http_transport.rs");
+const LOOPBACK_MUTATION_CREDENTIALS: &str = include_str!("../src/loopback_mutation_credentials.rs");
+const METADATA_HTTP: &str = include_str!("../src/metadata_http.rs");
+const PRIVATE_HTTP: &str = include_str!("../src/private_http.rs");
+const PRIVATE_CREDENTIALS: &str = include_str!("../src/private_credentials.rs");
+const PRODUCT_CLOCK: &str = include_str!("../src/product_clock.rs");
+const PUBLIC_CONNECTIVITY: &str = include_str!("../src/public_connectivity.rs");
+const PUBLIC_HTTP: &str = include_str!("../src/public_http.rs");
+const PUBLIC_WS: &str = include_str!("../src/public_ws.rs");
+const PUBLIC_WS_CONFIG: &str = include_str!("../src/public_ws_config.rs");
+const RECONCILIATION: &str = include_str!("../src/reconciliation.rs");
+const ACCOUNT: &str = include_str!("../src/account.rs");
+const USER_WS: &str = include_str!("../src/user_ws.rs");
+const USER_WS_CONFIG: &str = include_str!("../src/user_ws_config.rs");
+const TASK_GUARD: &str = include_str!("../src/task_guard.rs");
+
+#[test]
+fn phase3_foundation_has_only_role_specific_dependencies() {
+    for required in [
+        "reap-pm-core.workspace = true",
+        "reap-polymarket-adapter.workspace = true",
+        "async-trait.workspace = true",
+        "reap-polymarket-auth.workspace = true",
+        "reap-polymarket-wire.workspace = true",
+        "reqwest.workspace = true",
+        "futures-util.workspace = true",
+        "tokio.workspace = true",
+        "tokio-tungstenite.workspace = true",
+        "zeroize.workspace = true",
+    ] {
+        assert!(
+            MANIFEST.contains(required),
+            "missing dependency: {required}"
+        );
+    }
+    for forbidden in ["reap-pm-live", "hmac.workspace", "k256.workspace"] {
+        assert!(
+            !MANIFEST.contains(forbidden),
+            "forbidden dependency: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn modules_are_separate_and_raw_transport_remains_private() {
+    for module in [
+        "mod config;",
+        "mod error;",
+        "mod http_transport;",
+        "mod metadata_http;",
+        "mod private_http;",
+        "mod private_credentials;",
+        "mod product_clock;",
+        "mod public_connectivity;",
+        "mod public_http;",
+        "mod public_ws;",
+        "mod public_ws_config;",
+        "mod reconciliation;",
+        "mod task_guard;",
+        "mod account;",
+        "mod user_ws;",
+        "mod user_ws_config;",
+    ] {
+        assert!(LIB.contains(module), "missing private module: {module}");
+    }
+    for escape in [
+        "PmHttpTransport",
+        "PmPrivateHttpTransport",
+        "PmPrivateRoute",
+        "reqwest::Client",
+        "PmPublicRoute",
+        "WebSocketStream",
+        "tokio_tungstenite::tungstenite::Message",
+    ] {
+        assert!(!LIB.contains(escape), "raw transport escape: {escape}");
+    }
+    assert!(CONFIG.contains("#[cfg(test)]\n    pub(crate) fn local_evidence"));
+    assert!(!LIB.contains("local_evidence"));
+}
+
+#[test]
+fn websocket_socket_workers_are_abort_on_outer_drop_and_explicitly_joined() {
+    for source in [PUBLIC_WS, USER_WS] {
+        assert!(source.contains("AbortOnDropTask::new(tokio::spawn"));
+        assert!(source.contains("worker.abort_and_join().await"));
+        assert!(source.contains("worker\n            .join()\n            .await"));
+        assert!(!source.contains("let worker = tokio::spawn"));
+    }
+    assert!(TASK_GUARD.contains("impl<T> Drop for AbortOnDropTask<T>"));
+    assert!(TASK_GUARD.contains("task.abort()"));
+    assert!(TASK_GUARD.contains("pub(crate) async fn join(mut self)"));
+}
+
+#[test]
+fn public_market_websocket_is_exact_scoped_bounded_and_transport_private() {
+    for required in [
+        "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+        "PM_PUBLIC_WS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10)",
+        "PmMarketSubscription::new(config.scope().token()).to_json()?",
+        "socket.send(Message::text(APPLICATION_PING))",
+        "mpsc::channel(self.config.event_channel_capacity())",
+        "sink.deliver_public_ws_event(event).await",
+        "max_message_size(Some(config.max_frame_bytes()))",
+        "max_frame_size(Some(config.max_frame_bytes()))",
+        "PmPublicWsEvent::RawData",
+        "PmPublicWsEvent::PingSent",
+        "PmPublicWsEvent::Pong",
+        "PmPublicWsEvent::ReconnectScheduled",
+        "PmPublicWsReconnectDirective",
+        "request_reconnect_authority(&events, retired).await?",
+        "PmPublicWsClockSource",
+        "observe(clock)?",
+    ] {
+        let source = [PUBLIC_WS_CONFIG, PUBLIC_WS].join("\n");
+        assert!(
+            source.contains(required),
+            "missing public-WS invariant: {required}"
+        );
+    }
+    for forbidden in [
+        "L2Credentials",
+        "AuthenticatedUserSubscription",
+        "apiKey",
+        "passphrase",
+        "authenticate_",
+        "place_order",
+        "cancel_order",
+        "pub fn socket(",
+        "pub fn client(",
+        "pub fn endpoint(",
+        "pub fn send(",
+    ] {
+        let source = [PUBLIC_WS_CONFIG, PUBLIC_WS].join("\n");
+        assert!(
+            !source.contains(forbidden),
+            "forbidden public-WS capability: {forbidden}"
+        );
+    }
+    assert!(PUBLIC_WS_CONFIG.contains("feature = \"loopback-evidence\""));
+    assert!(PUBLIC_WS_CONFIG.contains("pub fn loopback_evidence"));
+    assert!(!LIB.contains("local_evidence"));
+    assert!(LIB.contains("PRODUCTION_ORDER_ENTRY_AUTHORIZED: bool = false"));
+}
+
+#[test]
+fn rest_book_delivery_can_await_durability_before_releasing_parsed_evidence() {
+    for required in [
+        "#[async_trait::async_trait]",
+        "pub trait PmRestBookSnapshotSink: Send",
+        "async fn deliver_native_rest_book(",
+        "sink.deliver_native_rest_book(purpose, received, &raw)",
+        ".await",
+        ".observe_rest_edge()",
+    ] {
+        assert!(
+            PUBLIC_HTTP.contains(required),
+            "missing durability-first REST-book delivery invariant: {required}"
+        );
+    }
+}
+
+#[test]
+fn authenticated_public_bundle_owns_one_clock_domain_and_no_default_clock_escape() {
+    for required in [
+        "pub struct PmProductClockOwner",
+        "Arc<ProductClockDomain>",
+        "Arc::ptr_eq(&self.domain, &pending.domain)",
+        "PM_MUTATION_SERVER_TIME_MAX_AGE",
+        "pub struct PmPendingMutationServerTime",
+        "pub struct PmAuthorizedMutationServerTime",
+        "pub struct PmReadServerTime",
+        "validate_age(&domain, received)?",
+        "pub struct PmPublicConnectivityOwner",
+        "PmPublicHttpRole::with_product_clock(",
+        "PmPublicMarketWsRole::with_clock_source(public_ws_config, public_ws_clock)",
+    ] {
+        let source = [PRODUCT_CLOCK, PUBLIC_CONNECTIVITY].join("\n");
+        assert!(
+            source.contains(required),
+            "missing shared product-clock invariant: {required}"
+        );
+    }
+    for forbidden in [
+        "Arc<Mutex",
+        "pub fn into_l2_timestamp",
+        "pub const fn into_l2_timestamp",
+        "pub fn timestamp(",
+        "pub fn server_time_seconds",
+    ] {
+        let source = [PRODUCT_CLOCK, PUBLIC_HTTP].join("\n");
+        assert!(
+            !source.contains(forbidden),
+            "raw clock/time capability escape: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn loopback_mutation_custody_is_scope_bound_feature_gated_and_separate_from_read_owner() {
+    assert!(LIB.contains("#[cfg(any(test, feature = \"loopback-evidence\"))]"));
+    assert!(LIB.contains("mod loopback_mutation_credentials;"));
+    for required in [
+        "PmLoopbackMutationConnectivityOwner",
+        "PmGtcPostOnlyPlaceRequest",
+        "PmExactOwnedCancelRequest",
+        "authenticate_place(",
+        "authenticate_cancel(",
+        "request.account_scope() != binding.account",
+        "request.instrument_id() != binding.trading_domain.instrument()",
+        "request.trading_domain() != binding.trading_domain",
+        "unsigned.token_id() != binding.trading_domain.instrument().token()",
+        "request.purpose() != binding.cancel_purpose",
+        "CredentialSlotId",
+        "credentials.authenticated_journal_credential_slot(credential_slot)",
+        "AuthenticatedJournalCredentialSlotFingerprint",
+        "PmLoopbackPlaceAuthenticationFailure",
+        "PmLoopbackCancelAuthenticationFailure",
+        "Arc::clone(&request)",
+        "pub fn into_request(self)",
+        "mpsc::channel(MUTATION_AUTHORITY_CAPACITY)",
+        "PmHttpCredentialRole::from_sender(senders.read.clone())",
+        "PmUserWsCredentialRole::from_sender(senders.read)",
+        "PmCredentialAuthoritySupervisor::from_task(shutdown, task)",
+    ] {
+        assert!(
+            LOOPBACK_MUTATION_CREDENTIALS.contains(required),
+            "missing scope-bound loopback custody invariant: {required}"
+        );
+    }
+    for forbidden in [
+        "SignedClobV2Order",
+        "pub fn signer(",
+        "pub fn credentials(",
+        "pub fn token(",
+        "pub fn domain(",
+        "Arc<L2Credentials>",
+        "Option<FixedEoaSigner>",
+    ] {
+        assert!(
+            !LOOPBACK_MUTATION_CREDENTIALS.contains(forbidden),
+            "loopback mutation custody escape: {forbidden}"
+        );
+    }
+    assert!(!PRIVATE_CREDENTIALS.contains("PmLoopbackMutation"));
+    assert!(!PRIVATE_CREDENTIALS.contains("FixedEoaSigner"));
+    assert_eq!(
+        LOOPBACK_MUTATION_CREDENTIALS
+            .matches("The supervised authenticated worker MUST await this future")
+            .count(),
+        2,
+        "place/cancel cancellation contracts must stay explicit"
+    );
+    assert_eq!(
+        LOOPBACK_MUTATION_CREDENTIALS
+            .matches("Process/task stop recovers durable Goal-F intent; it must never resend.")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn authenticated_routes_are_fixed_reads_without_filter_or_mutation_escape() {
+    for required in [
+        "url.set_path(\"/data/orders\")",
+        "url.set_path(\"/data/trades\")",
+        "format!(\"/data/order/{order_id}\")",
+        "url.set_path(\"/balance-allowance\")",
+        ".append_pair(\"next_cursor\", cursor)",
+        ".append_pair(\"asset_type\", \"COLLATERAL\")",
+        ".append_pair(\"asset_type\", \"CONDITIONAL\")",
+        ".append_pair(\"signature_type\", \"0\")",
+    ] {
+        assert!(
+            PRIVATE_HTTP.contains(required),
+            "missing fixed route: {required}"
+        );
+    }
+    for forbidden_filter in [
+        "append_pair(\"market\"",
+        "append_pair(\"asset_id\"",
+        "append_pair(\"after\"",
+        "append_pair(\"maker_address\"",
+    ] {
+        assert!(
+            !PRIVATE_HTTP.contains(forbidden_filter),
+            "account-cut filter escape: {forbidden_filter}"
+        );
+    }
+    for forbidden_method in [".post(", ".put(", ".patch(", ".delete("] {
+        assert!(
+            !PRIVATE_HTTP.contains(forbidden_method),
+            "private mutation method: {forbidden_method}"
+        );
+    }
+    for forbidden_capability in [
+        "authenticate_place",
+        "authenticate_owned_cancel",
+        "serialize_place",
+        "serialize_owned_cancel",
+        "update_balance",
+        "WebSocket",
+        "connect_async",
+    ] {
+        let authenticated = [PRIVATE_HTTP, RECONCILIATION, ACCOUNT].join("\n");
+        assert!(
+            !authenticated.contains(forbidden_capability),
+            "forbidden private capability: {forbidden_capability}"
+        );
+    }
+}
+
+#[test]
+fn borrowing_roles_are_distinct_and_credentials_have_one_owner() {
+    assert!(PRIVATE_CREDENTIALS.contains("credentials: L2Credentials"));
+    assert!(!PRIVATE_CREDENTIALS.contains("Arc<L2Credentials>"));
+    assert!(PRIVATE_CREDENTIALS.contains("mpsc::channel(CREDENTIAL_AUTHORITY_CAPACITY)"));
+    assert!(PRIVATE_CREDENTIALS.contains("PmCredentialAuthoritySupervisor"));
+    assert!(PRIVATE_CREDENTIALS.contains("task.await"));
+    assert!(PRIVATE_CREDENTIALS.contains("task.abort()"));
+    assert!(PRIVATE_CREDENTIALS.contains("PmCredentialAuthoritySupervisor,"));
+    assert!(PRIVATE_CREDENTIALS.contains("PmHttpCredentialRole"));
+    assert!(PRIVATE_CREDENTIALS.contains("PmUserWsCredentialRole"));
+    assert!(!PRIVATE_CREDENTIALS.contains("SignedClobV2Order"));
+    assert!(!PRIVATE_CREDENTIALS.contains("PmMutationAuthenticationRole"));
+    assert!(PRIVATE_HTTP.contains("Found(Zeroizing<Vec<u8>>)"));
+    assert!(!PRIVATE_HTTP.contains("Found(Vec<u8>)"));
+    assert!(!PRIVATE_HTTP.contains("Clone for PmAuthenticatedHttpOwner"));
+    assert!(RECONCILIATION.contains("authority: &'a mut PmHttpCredentialRole"));
+    assert!(ACCOUNT.contains("authority: &'a mut PmHttpCredentialRole"));
+    assert!(RECONCILIATION.contains("assembly: PmOpenOrdersAssembly"));
+    assert!(!RECONCILIATION.contains("assembly: &PmOpenOrdersAssembly"));
+    assert!(RECONCILIATION.contains("PmOpenOrdersCutProgress::Complete"));
+    assert!(RECONCILIATION.contains("PaginationCursorCycle"));
+    assert!(RECONCILIATION.contains("MAX_PM_AUTHENTICATED_CUT_PAGES"));
+    assert!(RECONCILIATION.contains("MAX_PM_RECONCILIATION_ORDERS"));
+    assert!(RECONCILIATION.contains("MAX_PM_RECONCILIATION_FILLS"));
+    assert!(!RECONCILIATION.contains("balance_allowance("));
+    assert!(!ACCOUNT.contains("open_orders("));
+    assert!(!ACCOUNT.contains("trades("));
+    for source in [PRIVATE_HTTP, RECONCILIATION, ACCOUNT] {
+        assert!(!source.contains("pub fn request("));
+        assert!(!source.contains("pub fn headers("));
+        assert!(!source.contains("pub fn url("));
+        assert!(!source.contains("pub fn path("));
+    }
+}
+
+#[test]
+fn authenticated_user_websocket_is_fixed_bound_and_has_no_raw_or_mutation_escape() {
+    let source = [PRIVATE_CREDENTIALS, USER_WS_CONFIG, USER_WS].join("\n");
+    for required in [
+        "wss://ws-subscriptions-clob.polymarket.com/ws/user",
+        "PM_USER_WS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10)",
+        "fresh_subscription(config.condition()).await",
+        "parse_live_user_frame(raw.as_slice())",
+        "credentials.bind_frame(frame).await",
+        "PmUserWsEvent::BoundFrame",
+        "into_credential_owned_frame(self) -> CredentialOwnedUserFrame",
+        "Zeroizing::new(text.as_str().as_bytes().to_vec())",
+        "mpsc::channel(self.config.event_channel_capacity())",
+        "sink.deliver_user_ws_event(event).await",
+        "feature = \"loopback-evidence\"",
+    ] {
+        assert!(
+            source.contains(required),
+            "missing user-WS invariant: {required}"
+        );
+    }
+    for forbidden in [
+        "pub fn socket(",
+        "pub fn client(",
+        "pub fn endpoint(",
+        "pub fn raw",
+        "SignedClobV2Order",
+        "authenticate_place",
+        "authenticate_owned_cancel",
+        "operation: String",
+        "initial_dump: bool",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "user-WS escape/stale shape: {forbidden}"
+        );
+    }
+    assert!(LIB.contains("PmPrivateConnectivityOwner"));
+    assert!(!LIB.contains("PmMutationAuthenticationRole"));
+    assert!(!USER_WS.contains("impl Clone for PmUserWsBoundFrame"));
+    assert!(USER_WS.contains(".try_send(event)"));
+    assert!(PUBLIC_WS.contains(".try_send(WorkerEvent::Evidence(event))"));
+    assert!(USER_WS.contains("EventChannelSaturated"));
+    assert!(PUBLIC_WS.contains("EventChannelSaturated"));
+    assert!(!USER_WS.contains("SinkDeliveryCancelledByShutdown"));
+    assert!(!PUBLIC_WS.contains("SinkDeliveryCancelledByShutdown"));
+    assert!(!USER_WS.contains("wait_for_shutdown(&mut sink_shutdown)"));
+    assert!(!PUBLIC_WS.contains("wait_for_shutdown(&mut sink_shutdown)"));
+    assert!(USER_WS.contains("sink.deliver_user_ws_event(event).await"));
+    assert!(PUBLIC_WS.contains("sink.deliver_public_ws_event(event).await"));
+    assert!(PUBLIC_WS.contains("sink.authorize_public_ws_reconnect(retired).await"));
+}
+
+#[test]
+fn public_routes_are_exactly_time_book_and_the_atomic_metadata_pair() {
+    assert!(HTTP_TRANSPORT.contains("url.set_path(\"/time\")"));
+    assert!(HTTP_TRANSPORT.contains("url.set_path(\"/book\")"));
+    assert!(HTTP_TRANSPORT.contains(".append_pair(\"token_id\""));
+    assert!(HTTP_TRANSPORT.contains("format!(\"/markets/{condition}\")"));
+    assert!(HTTP_TRANSPORT.contains("format!(\"/clob-markets/{condition}\")"));
+    assert!(METADATA_HTTP.contains("PmLiveMetadataPair"));
+    assert!(METADATA_HTTP.contains("deliver_native_metadata_pair"));
+    assert!(METADATA_HTTP.contains("self.scope.condition()"));
+    for forbidden_route in ["/orders", "/trades", "/balance-allowance", "/ws/"] {
+        assert!(
+            !HTTP_TRANSPORT.contains(forbidden_route),
+            "unsupported route: {forbidden_route}"
+        );
+    }
+    for forbidden_method in [".post(", ".put(", ".patch(", ".delete("] {
+        assert!(
+            !HTTP_TRANSPORT.contains(forbidden_method),
+            "unsupported HTTP method: {forbidden_method}"
+        );
+    }
+}
+
+#[test]
+fn public_role_has_no_auth_private_ws_or_mutation_capability() {
+    let production = [CONFIG, HTTP_TRANSPORT, PUBLIC_HTTP, METADATA_HTTP].join("\n");
+    for forbidden in [
+        "L2Credentials",
+        "PrivateKey",
+        "POLY_API_KEY",
+        "POLY_SIGNATURE",
+        "authenticate_",
+        "place_order",
+        "cancel_order",
+        "WebSocket",
+        "connect_async",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "forbidden live capability: {forbidden}"
+        );
+    }
+    assert!(LIB.contains("PRODUCTION_ORDER_ENTRY_AUTHORIZED: bool = false"));
+    assert!(!LIB.contains("PRODUCTION_ORDER_ENTRY_AUTHORIZED: bool = true"));
+    assert!(PUBLIC_HTTP.contains("PmBookMarketBinding::ConditionId"));
+    assert!(!PUBLIC_HTTP.contains("PmBookMarketBinding::LegacyMarketId"));
+}

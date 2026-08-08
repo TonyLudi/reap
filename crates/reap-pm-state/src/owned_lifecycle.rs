@@ -479,6 +479,13 @@ pub enum PmOwnedSubmitResult {
     Accepted(PmVenueOrderKey),
     Rejected,
     Ambiguous,
+    /// Authenticated send evidence proves the deterministic owned venue ID,
+    /// while the venue acknowledgement remains inconclusive.
+    ///
+    /// This is distinct from fixture ambiguity: the exact venue identity may
+    /// be used for read-only reconciliation and a safety cancel, but the
+    /// submit remains ambiguous until authoritative venue evidence arrives.
+    AmbiguousOwned(PmVenueOrderKey),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

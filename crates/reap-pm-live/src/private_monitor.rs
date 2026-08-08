@@ -1,53 +1,69 @@
+use crate::composition::PmCompositionError;
 use reap_pm_core::{
-    ConnectionEpoch, EnvelopeError, EventClock, EventEnvelope, EventOrdering, IngressSequence,
-    PmAccountScope, PmAggregateError, PmClientOrderKey, PmCompleteAccountSnapshot,
-    PmCompleteFillQuery, PmCompleteOpenOrdersSnapshot, PmConnectionId, PmExactOrderDetail,
-    PmFillEvent, PmFillExecution, PmFillKey, PmFillQueryCursor, PmOrderEvent, PmOrderIdentity,
-    PmOrderSide, PmProductSource, PmReconciliationRequestBoundary, PmSnapshotEvidence, PmSpenderId,
-    PmVenueOrderKey, U256,
+    ConnectionEpoch, EventClock, EventEnvelope, EventOrdering, IngressSequence, PmAccountScope,
+    PmClientOrderKey, PmCompleteAccountSnapshot, PmCompleteFillQuery, PmCompleteOpenOrdersSnapshot,
+    PmConnectionId, PmExactOrderDetail, PmFillEvent, PmFillExecution, PmFillKey, PmFillQueryCursor,
+    PmOrderEvent, PmOrderIdentity, PmOrderSide, PmProductSource, PmReconciliationRequestBoundary,
+    PmSnapshotEvidence, PmVenueOrderKey, U256,
 };
 use reap_pm_live_contracts::{
     ConstructedRoleBinding, PmAccountConnectivityConfig, PmConnectionRoute, PmConnectivityPlan,
     PmPlanError, PmRoleKind,
 };
+#[cfg(test)]
+use reap_pm_state::PmPrivateReadiness;
 use reap_pm_state::{
-    PmAccountCounters, PmAccountSnapshotApply, PmAccountSnapshotProjection, PmAllowanceKnowledge,
-    PmExactReservation, PmFillApply, PmFillCounters, PmFillProjection, PmOpenOrderReservation,
-    PmOpenOrdersApply, PmOrderApply, PmOrderCounters, PmOrderProjection, PmOwnedCancelApply,
-    PmOwnedCancelIntent, PmOwnedCancelOutcome, PmOwnedCancelRequestApply, PmOwnedFillApply,
-    PmOwnedImmediateAckTicket, PmOwnedOrderProgressObservation, PmOwnedOrderProjection,
+    PmAccountSnapshotApply, PmExactReservation, PmFillApply, PmOpenOrderReservation,
+    PmOpenOrdersApply, PmOrderApply, PmOwnedCancelApply, PmOwnedCancelIntent, PmOwnedCancelOutcome,
+    PmOwnedCancelRequestApply, PmOwnedFillApply, PmOwnedImmediateAckTicket,
+    PmOwnedObservationSource, PmOwnedOrderProgressObservation, PmOwnedOrderProjection,
     PmOwnedProgressApply, PmOwnedQuoteAdmission, PmOwnedQuoteIntent, PmOwnedRecoveryFill,
     PmOwnedReductionSequence, PmOwnedSubmitApply, PmOwnedSubmitResult, PmOwnedTerminalCompaction,
-    PmPreparedOwnedQuoteAdmission, PmPrivateConvergence, PmPrivateExternalIngressCounters,
-    PmPrivateExternalIngressFailure, PmPrivateExternalIngressFault, PmPrivateExternalIngressLane,
-    PmPrivateFillReduction, PmPrivateHaltReason, PmPrivateOrderReduction, PmPrivateQuoteEvaluation,
-    PmPrivateQuoteRequest, PmPrivateReadiness, PmPrivateState, PmPrivateStateConfig,
-    PmPrivateStateError, PmProvisionalDeltas, PmReconciliationApply, PmReconciliationReductions,
-    PmRefreshCounters, PmRefreshKey, PmRemoteOrderKnowledge, PmReservationKnowledge,
-    PmRiskCounters, PmRiskDependency, PmRiskLimits, PmUnresolvedFillApply,
-    PmUnresolvedFillCounters, PmUnresolvedFillObservation, PmUnresolvedFillProjection,
-    PmUnresolvedFillReason, PmUnresolvedFillStateError,
+    PmPreparedOwnedQuoteAdmission, PmPrivateExternalIngressFault, PmPrivateExternalIngressLane,
+    PmPrivateFillReduction, PmPrivateOrderReduction, PmPrivateQuoteEvaluation,
+    PmPrivateQuoteRequest, PmPrivateState, PmPrivateStateConfig, PmPrivateStateError,
+    PmReconciliationApply, PmReconciliationReductions, PmRemoteOrderKnowledge,
+    PmReservationKnowledge, PmRiskDependency, PmRiskLimits, PmUnresolvedFillApply,
+    PmUnresolvedFillObservation, PmUnresolvedFillReason,
 };
+#[cfg(any(test, feature = "loopback-evidence"))]
+use reap_pm_state::{PmPrivateDependency, PmPrivateExternalIngressFailure};
 use reap_polymarket_adapter::{
-    PmAccountPositionRoleError, PmFixtureAccountPositionSnapshot, PmFixtureAllowanceRow,
-    PmFixtureBalanceRow, PmFixtureCompletionOccurrence, PmFixtureDeliveryScope,
-    PmFixtureFeeEvidence, PmFixtureInstrumentScope, PmFixturePositionRow,
-    PmFixturePrivateLifecycle, PmFixtureReadOwnerGrant, PmFixtureReconciliation,
-    PmPrivateLifecycleObservation, PmPrivateNormalizationError, PmReconciliationContractError,
-    PmUnresolvedTradeReason,
+    PmFixtureAccountPositionSnapshot, PmFixtureAllowanceRow, PmFixtureBalanceRow,
+    PmFixtureCompletionOccurrence, PmFixtureDeliveryScope, PmFixtureFeeEvidence,
+    PmFixtureInstrumentScope, PmFixturePositionRow, PmFixturePrivateLifecycle,
+    PmFixtureReadOwnerGrant, PmFixtureReconciliation, PmPrivateLifecycleObservation,
+    PmPrivateNormalizationError, PmUnresolvedTradeReason,
 };
-use thiserror::Error;
-
-use crate::composition::PmCompositionError;
 
 mod batch_validation;
+mod error;
+mod live;
 mod maintenance;
 mod product_fixture;
+mod projection;
 
 use batch_validation::PmPrivateBatchIdentityScratch;
 #[cfg(test)]
 pub(crate) use batch_validation::PmPrivateBatchValidationProbe;
-pub(crate) use product_fixture::PmFixturePairedReconciliationDelivery;
+use error::classify_monitor_error;
+pub use error::{PmPrivateMonitorError, PmPrivateMonitorInputError};
+#[allow(
+    unused_imports,
+    reason = "the sealed live occurrence issuer is consumed by the Phase 5 supervisor"
+)]
+pub(crate) use live::{
+    PmLiveAccountFailureInput, PmLiveAccountInput, PmLiveAccountQueryTicket, PmLiveConnectionInput,
+    PmLiveHttpDependencyFailure, PmLiveHttpQueryFailure, PmLiveIngressReport,
+    PmLiveInternalControlOccurrence, PmLiveMutationCompletionOccurrence, PmLiveOccurrenceError,
+    PmLiveOccurrenceIssuer, PmLiveOpenOrdersFailureInput, PmLiveOpenOrdersInput,
+    PmLiveOpenOrdersQueryTicket, PmLiveOrderDetailFailureInput, PmLiveOrderDetailInput,
+    PmLiveOrderDetailQueryTicket, PmLivePersistencePollOccurrence, PmLivePreOpenRetirement,
+    PmLivePrivateInput, PmLiveReconciliationFailureInput, PmLiveReconciliationInput,
+    PmLiveReconciliationQueryTicket, PmLiveRetirementInput, PmLiveRetirementOutcome,
+};
+pub(crate) use product_fixture::PmPairedReconciliationDelivery;
+pub use projection::PmReadOnlyPrivateProjection;
 
 /// One validated request/completion cut for a fixture-only read.
 ///
@@ -99,6 +115,22 @@ impl PmFixtureQueryOccurrence {
             self.completion.received_clock(),
             self.completion.ordering(),
         )
+    }
+
+    const fn connection_epoch(&self) -> ConnectionEpoch {
+        self.connection_epoch
+    }
+
+    const fn request_sequence(&self) -> IngressSequence {
+        self.request_sequence
+    }
+
+    const fn snapshot(&self) -> PmSnapshotEvidence {
+        self.snapshot
+    }
+
+    const fn monotonic_service_ns(&self) -> u64 {
+        self.monotonic_service_ns
     }
 }
 
@@ -244,106 +276,6 @@ impl PmPrivateBatchApply {
     }
 }
 
-/// Immutable view over the monitor-owned canonical private state.
-///
-/// There is intentionally no `Deref`, `AsRef`, mutable accessor, or way to
-/// recover the underlying state owner.
-pub struct PmReadOnlyPrivateProjection<'a> {
-    state: &'a PmPrivateState,
-}
-
-impl PmReadOnlyPrivateProjection<'_> {
-    #[must_use]
-    pub const fn account_snapshot(&self) -> PmAccountSnapshotProjection {
-        self.state.account_projection()
-    }
-
-    pub fn allowance(&self, spender: PmSpenderId) -> PmAllowanceKnowledge {
-        self.state.allowance(spender)
-    }
-
-    pub fn orders(&self) -> impl Iterator<Item = PmOrderProjection> + '_ {
-        self.state.orders()
-    }
-
-    pub fn fills(&self) -> impl Iterator<Item = PmFillProjection> + '_ {
-        self.state.fills()
-    }
-
-    pub fn unresolved_fills(&self) -> impl Iterator<Item = PmUnresolvedFillProjection> + '_ {
-        self.state.unresolved_fills()
-    }
-
-    #[must_use]
-    pub const fn provisional_deltas(&self) -> PmProvisionalDeltas {
-        self.state.provisional_deltas()
-    }
-
-    #[must_use]
-    pub const fn convergence(&self) -> PmPrivateConvergence {
-        self.state.convergence()
-    }
-
-    #[must_use]
-    pub const fn halt(&self) -> Option<PmPrivateHaltReason> {
-        self.state.halt()
-    }
-
-    #[must_use]
-    pub const fn pending_refresh_count(&self) -> usize {
-        self.state.pending_refresh_count()
-    }
-
-    pub fn pending_refresh_keys(&self) -> impl Iterator<Item = PmRefreshKey> + '_ {
-        self.state.pending_refresh_keys()
-    }
-
-    #[must_use]
-    pub const fn full_reconcile_required(&self) -> bool {
-        self.state.full_reconcile_required()
-    }
-
-    #[must_use]
-    pub const fn account_counters(&self) -> PmAccountCounters {
-        self.state.account_counters()
-    }
-
-    #[must_use]
-    pub const fn order_counters(&self) -> PmOrderCounters {
-        self.state.order_counters()
-    }
-
-    #[must_use]
-    pub const fn fill_counters(&self) -> PmFillCounters {
-        self.state.fill_counters()
-    }
-
-    #[must_use]
-    pub const fn unresolved_fill_counters(&self) -> PmUnresolvedFillCounters {
-        self.state.unresolved_fill_counters()
-    }
-
-    #[must_use]
-    pub const fn refresh_counters(&self) -> PmRefreshCounters {
-        self.state.refresh_counters()
-    }
-
-    #[must_use]
-    pub const fn risk_counters(&self) -> PmRiskCounters {
-        self.state.risk_counters()
-    }
-
-    #[must_use]
-    pub const fn external_ingress_counters(&self) -> PmPrivateExternalIngressCounters {
-        self.state.external_ingress_counters()
-    }
-
-    #[must_use]
-    pub fn quote_readiness(&self, request: PmPrivateQuoteRequest) -> PmPrivateReadiness {
-        self.state.quote_readiness(request)
-    }
-}
-
 /// Least-authority fixture-only account/private monitor.
 ///
 /// The role objects and canonical state are held by value and never exposed.
@@ -400,10 +332,7 @@ impl PmReadOnlyMonitor {
         connection_epoch: ConnectionEpoch,
         monotonic_observed_ns: u64,
     ) -> Result<(), PmPrivateMonitorError> {
-        let result = self
-            .runtime
-            .reconnect_private(connection_epoch, monotonic_observed_ns);
-        self.record_result(PmPrivateExternalIngressLane::Reconnect, result)
+        self.connect_private(connection_epoch, monotonic_observed_ns)
     }
 
     pub fn ingest_private_fixture(
@@ -453,9 +382,7 @@ impl PmReadOnlyMonitor {
 
     #[must_use]
     pub const fn private_projection(&self) -> PmReadOnlyPrivateProjection<'_> {
-        PmReadOnlyPrivateProjection {
-            state: &self.runtime.state,
-        }
+        PmReadOnlyPrivateProjection::new(&self.runtime.state)
     }
 
     fn record_result<T>(
@@ -584,6 +511,13 @@ impl PmPrivateMonitorRuntime {
         self.state.cardinalities()
     }
 
+    /// Test-only immutable view used to compare live state with its exact
+    /// restart projection. It carries no reducer or cursor authority.
+    #[cfg(test)]
+    pub(crate) const fn private_projection_for_test(&self) -> PmReadOnlyPrivateProjection<'_> {
+        PmReadOnlyPrivateProjection::new(&self.state)
+    }
+
     pub(crate) fn reserved_capacity_bytes(&self) -> usize {
         self.state
             .reserved_capacity_bytes()
@@ -628,6 +562,35 @@ impl PmPrivateMonitorRuntime {
         execution: PmFillExecution,
     ) -> Result<PmFillEvent, reap_pm_core::PmEventError> {
         let order = PmOrderIdentity::new(Some(client_order), Some(key.venue_order()))?;
+        PmFillEvent::new(
+            self.state.source(),
+            self.state.instrument(),
+            key,
+            order,
+            execution,
+        )
+    }
+
+    /// Rebuilds the canonical event shape emitted by the original durable
+    /// observation source.
+    ///
+    /// Live WS and REST normalization prove venue identity only. An immediate
+    /// acknowledgement is the one source that carries the exact local client
+    /// identity in the canonical event. The owned lifecycle still validates
+    /// every recovered row against the durable-row-retained client order.
+    pub(crate) fn durable_recovery_fill_event(
+        &self,
+        key: PmFillKey,
+        client_order: PmClientOrderKey,
+        execution: PmFillExecution,
+        source: PmOwnedObservationSource,
+    ) -> Result<PmFillEvent, reap_pm_core::PmEventError> {
+        let client_order = match source {
+            PmOwnedObservationSource::ImmediateAcknowledgement => Some(client_order),
+            PmOwnedObservationSource::PrivateWebSocket
+            | PmOwnedObservationSource::RestReconciliation => None,
+        };
+        let order = PmOrderIdentity::new(client_order, Some(key.venue_order()))?;
         PmFillEvent::new(
             self.state.source(),
             self.state.instrument(),
@@ -694,6 +657,25 @@ impl PmPrivateMonitorRuntime {
         self.state.recover_owned_fill(recovery)
     }
 
+    pub(crate) fn initialize_recovered_fill_watermark(
+        &mut self,
+        cursor: PmFillQueryCursor,
+    ) -> Result<(), PmPrivateStateError> {
+        self.state.initialize_recovered_fill_watermark(cursor)
+    }
+
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    #[must_use]
+    pub(crate) const fn fill_watermark(&self) -> Option<PmFillQueryCursor> {
+        self.state.fill_watermark()
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn quote_readiness(&self, request: PmPrivateQuoteRequest) -> PmPrivateReadiness {
+        self.state.quote_readiness(request)
+    }
+
     pub(crate) fn recover_owned_progress(
         &mut self,
         observation: PmOwnedOrderProgressObservation,
@@ -721,6 +703,23 @@ impl PmPrivateMonitorRuntime {
         outcome: PmOwnedCancelOutcome,
     ) -> Result<PmOwnedCancelApply, PmPrivateStateError> {
         self.state.apply_owned_cancel_result(intent, outcome)
+    }
+
+    pub(crate) fn preflight_owned_cancel_result(
+        &self,
+        intent: PmOwnedCancelIntent,
+        outcome: PmOwnedCancelOutcome,
+    ) -> Result<PmOwnedCancelApply, PmPrivateStateError> {
+        self.state.preflight_owned_cancel_result(intent, outcome)
+    }
+
+    pub(crate) fn preflight_owned_submit_result(
+        &self,
+        client_order: PmClientOrderKey,
+        result: PmOwnedSubmitResult,
+    ) -> Result<PmOwnedSubmitApply, PmPrivateStateError> {
+        self.state
+            .preflight_owned_submit_result(client_order, result)
     }
 
     pub(crate) fn compact_proven_owned_terminal(
@@ -769,6 +768,34 @@ impl PmPrivateMonitorRuntime {
             return Err(PmPrivateMonitorError::DeliveryScopeMismatch);
         }
         self.state.record_external_ingress_fault(fault);
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub(crate) fn reduce_serviced_http_dependency_failure(
+        &mut self,
+        source: PmProductSource,
+        connection: PmConnectionId,
+        dependency: PmPrivateDependency,
+        fault: PmPrivateExternalIngressFault,
+    ) -> Result<(), PmPrivateMonitorError> {
+        if source != self.account.source() || connection != self.account.connection() {
+            return Err(PmPrivateMonitorError::DeliveryScopeMismatch);
+        }
+        if !http_dependency_matches_lane(dependency, fault.lane()) {
+            return Err(PmPrivateMonitorError::HttpDependencyLaneMismatch);
+        }
+        match fault.failure() {
+            PmPrivateExternalIngressFailure::Scope | PmPrivateExternalIngressFailure::Contract => {
+                self.state.record_external_ingress_fault(fault);
+            }
+            PmPrivateExternalIngressFailure::Normalization
+            | PmPrivateExternalIngressFailure::Service => {
+                let _required = self
+                    .state
+                    .invalidate_external_dependency(dependency, fault)?;
+            }
+        }
         Ok(())
     }
 
@@ -1352,96 +1379,25 @@ fn checked_increment(value: u16) -> Result<u16, PmPrivateMonitorError> {
         .ok_or(PmPrivateMonitorError::BatchCounterOverflow)
 }
 
-fn classify_monitor_error(error: &PmPrivateMonitorError) -> PmPrivateExternalIngressFailure {
-    match error {
-        PmPrivateMonitorError::PrivateNormalization(_) => {
-            PmPrivateExternalIngressFailure::Normalization
-        }
-        PmPrivateMonitorError::Envelope(_) => PmPrivateExternalIngressFailure::Service,
-        PmPrivateMonitorError::Reconciliation(PmReconciliationContractError::Normalization(_)) => {
-            PmPrivateExternalIngressFailure::Normalization
-        }
-        PmPrivateMonitorError::Reconciliation(
-            PmReconciliationContractError::WrongSource
-            | PmReconciliationContractError::SourceAccountMismatch
-            | PmReconciliationContractError::RequestedOrderAccountMismatch
-            | PmReconciliationContractError::CursorAccountScopeMismatch
-            | PmReconciliationContractError::InstrumentMismatch,
+#[cfg(any(test, feature = "loopback-evidence"))]
+const fn http_dependency_matches_lane(
+    dependency: PmPrivateDependency,
+    lane: PmPrivateExternalIngressLane,
+) -> bool {
+    matches!(
+        (dependency, lane),
+        (
+            PmPrivateDependency::AccountSnapshot,
+            PmPrivateExternalIngressLane::AccountSnapshot
+        ) | (
+            PmPrivateDependency::OrderLifecycle,
+            PmPrivateExternalIngressLane::OpenOrders | PmPrivateExternalIngressLane::OrderDetail
+        ) | (
+            PmPrivateDependency::Reconciliation,
+            PmPrivateExternalIngressLane::Reconciliation
+        ) | (
+            PmPrivateDependency::PrivateLifecycle,
+            PmPrivateExternalIngressLane::PrivateLifecycle
         )
-        | PmPrivateMonitorError::Account(
-            PmAccountPositionRoleError::WrongSource
-            | PmAccountPositionRoleError::SourceAccountMismatch
-            | PmAccountPositionRoleError::DomainChainMismatch
-            | PmAccountPositionRoleError::SignerFunderMismatch
-            | PmAccountPositionRoleError::AccountScopeMismatch
-            | PmAccountPositionRoleError::SpenderAccountMismatch
-            | PmAccountPositionRoleError::SpenderChainMismatch
-            | PmAccountPositionRoleError::InstrumentMismatch,
-        )
-        | PmPrivateMonitorError::PrivateDeliveryOwnerMismatch
-        | PmPrivateMonitorError::ReconciliationDeliveryOwnerMismatch
-        | PmPrivateMonitorError::AccountDeliveryOwnerMismatch
-        | PmPrivateMonitorError::DeliveryScopeMismatch
-        | PmPrivateMonitorError::PrivateEpochMismatch => PmPrivateExternalIngressFailure::Scope,
-        PmPrivateMonitorError::PrivateBatchPartial { source, .. } => classify_monitor_error(source),
-        PmPrivateMonitorError::Reconciliation(_)
-        | PmPrivateMonitorError::Account(_)
-        | PmPrivateMonitorError::State(_)
-        | PmPrivateMonitorError::UnresolvedFill(_)
-        | PmPrivateMonitorError::OpenOrderMissingVenueIdentity
-        | PmPrivateMonitorError::BatchCounterOverflow
-        | PmPrivateMonitorError::DuplicateBatchIdentity => {
-            PmPrivateExternalIngressFailure::Contract
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-pub enum PmPrivateMonitorInputError {
-    #[error("fixture completion belongs to another requested connection epoch")]
-    CompletionEpochMismatch,
-    #[error("fixture completion snapshot differs from the requested snapshot")]
-    CompletionSnapshotMismatch,
-    #[error("fixture request/completion causal boundary is invalid: {0}")]
-    Boundary(#[from] PmAggregateError),
-    #[error("fixture completion service time is invalid: {0}")]
-    ServiceClock(#[from] EnvelopeError),
-}
-
-#[derive(Debug, Error)]
-pub enum PmPrivateMonitorError {
-    #[error("private fixture batch failed after visible partial progress {applied:?}: {source}")]
-    PrivateBatchPartial {
-        applied: PmPrivateBatchApply,
-        #[source]
-        source: Box<PmPrivateMonitorError>,
-    },
-    #[error(transparent)]
-    PrivateNormalization(#[from] PmPrivateNormalizationError),
-    #[error(transparent)]
-    Reconciliation(#[from] PmReconciliationContractError),
-    #[error(transparent)]
-    Account(#[from] PmAccountPositionRoleError),
-    #[error(transparent)]
-    Envelope(#[from] EnvelopeError),
-    #[error(transparent)]
-    State(#[from] PmPrivateStateError),
-    #[error(transparent)]
-    UnresolvedFill(#[from] PmUnresolvedFillStateError),
-    #[error("serviced private delivery belongs to another role owner")]
-    PrivateDeliveryOwnerMismatch,
-    #[error("serviced reconciliation delivery belongs to another role owner")]
-    ReconciliationDeliveryOwnerMismatch,
-    #[error("serviced account delivery belongs to another role owner")]
-    AccountDeliveryOwnerMismatch,
-    #[error("serviced delivery differs from the monitor's exact account/instrument scope")]
-    DeliveryScopeMismatch,
-    #[error("fixture read belongs to an epoch that is not active on the private role")]
-    PrivateEpochMismatch,
-    #[error("complete open-order fixture row lacks an exact venue identity")]
-    OpenOrderMissingVenueIdentity,
-    #[error("private fixture batch counter overflowed")]
-    BatchCounterOverflow,
-    #[error("one private fixture batch repeats an order or exact fill identity")]
-    DuplicateBatchIdentity,
+    )
 }

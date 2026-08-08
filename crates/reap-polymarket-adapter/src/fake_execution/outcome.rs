@@ -5,7 +5,8 @@ use reap_pm_core::{
 };
 
 use super::{
-    PmFakeCancelCommand, PmFakeExecutionError, PmFakePlaceCommand, PmFixtureOwnedExecution,
+    PmExactOwnedCancelRequest, PmFakeExecutionError, PmFixtureOwnedExecution,
+    PmGtcPostOnlyPlaceRequest,
 };
 
 pub const MAX_PM_FAKE_ACK_FILL_LEGS: usize = 64;
@@ -204,7 +205,7 @@ impl PmFakePlaceResult {
 impl PmFixtureOwnedExecution {
     pub fn execute_place(
         &self,
-        command: PmFakePlaceCommand,
+        command: PmGtcPostOnlyPlaceRequest,
         script: PmFakePlaceScript,
     ) -> Result<PmFakePlaceResult, PmFakeExecutionError> {
         validate_place_command(self, &command)?;
@@ -236,7 +237,7 @@ impl PmFixtureOwnedExecution {
 
 fn validate_place_command(
     role: &PmFixtureOwnedExecution,
-    command: &PmFakePlaceCommand,
+    command: &PmGtcPostOnlyPlaceRequest,
 ) -> Result<(), PmFakeExecutionError> {
     if command.account_scope() != role.account_scope()
         || command.client_order().account() != role.account()
@@ -253,7 +254,7 @@ fn validate_place_command(
 // value preserves the one-shot script boundary without a second input copy.
 #[allow(clippy::boxed_local)]
 fn build_ack(
-    command: &PmFakePlaceCommand,
+    command: &PmGtcPostOnlyPlaceRequest,
     venue_order: PmVenueOrderKey,
     immediate_fills: Box<[PmFakeImmediateFill]>,
 ) -> Result<PmFakePlaceAck, PmFakeExecutionError> {
@@ -393,7 +394,7 @@ impl PmFakeCancelResult {
 impl PmFixtureOwnedExecution {
     pub fn execute_cancel(
         &self,
-        command: PmFakeCancelCommand,
+        command: PmExactOwnedCancelRequest,
         script: PmFakeCancelScript,
     ) -> Result<PmFakeCancelResult, PmFakeExecutionError> {
         if command.account_scope() != self.account_scope()

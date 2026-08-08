@@ -1,6 +1,6 @@
 //! Copied product-effect projections.
 //!
-//! Mutation authorities, fake commands, journal receipts, and adapter roles
+//! Mutation authorities, backend requests, journal receipts, and adapter roles
 //! are deliberately absent. The coordinator retains and consumes those exact
 //! values internally; callers observe only these bounded projections.
 
@@ -17,23 +17,23 @@ pub const MAX_PM_EFFECTS_PER_INPUT: usize = 16;
 pub const MAX_PM_PRODUCT_EFFECT_OUTPUTS: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PmFakeEffectStage {
+pub enum PmEffectDispatchStage {
     PreparedAfterDurability,
-    ExecutedByFixture,
+    CompletedByBackend,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PmFakeQuoteEffect {
+pub struct PmPlaceDispatchEffect {
     account_scope: PmAccountScope,
     instrument: PmInstrumentHandle,
     client_order: PmClientOrderKey,
     side: PmOrderSide,
     price: PmPrice,
     quantity: PmQuantity,
-    stage: PmFakeEffectStage,
+    stage: PmEffectDispatchStage,
 }
 
-impl PmFakeQuoteEffect {
+impl PmPlaceDispatchEffect {
     pub(super) const fn new(
         account_scope: PmAccountScope,
         instrument: PmInstrumentHandle,
@@ -41,7 +41,7 @@ impl PmFakeQuoteEffect {
         side: PmOrderSide,
         price: PmPrice,
         quantity: PmQuantity,
-        stage: PmFakeEffectStage,
+        stage: PmEffectDispatchStage,
     ) -> Self {
         Self {
             account_scope,
@@ -85,27 +85,27 @@ impl PmFakeQuoteEffect {
     }
 
     #[must_use]
-    pub const fn stage(self) -> PmFakeEffectStage {
+    pub const fn stage(self) -> PmEffectDispatchStage {
         self.stage
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PmFakeCancelEffect {
+pub struct PmCancelDispatchEffect {
     account_scope: PmAccountScope,
     instrument: PmInstrumentHandle,
     client_order: PmClientOrderKey,
     venue_order: PmVenueOrderKey,
-    stage: PmFakeEffectStage,
+    stage: PmEffectDispatchStage,
 }
 
-impl PmFakeCancelEffect {
+impl PmCancelDispatchEffect {
     pub(super) const fn new(
         account_scope: PmAccountScope,
         instrument: PmInstrumentHandle,
         client_order: PmClientOrderKey,
         venue_order: PmVenueOrderKey,
-        stage: PmFakeEffectStage,
+        stage: PmEffectDispatchStage,
     ) -> Self {
         Self {
             account_scope,
@@ -137,7 +137,7 @@ impl PmFakeCancelEffect {
     }
 
     #[must_use]
-    pub const fn stage(self) -> PmFakeEffectStage {
+    pub const fn stage(self) -> PmEffectDispatchStage {
         self.stage
     }
 }
@@ -244,7 +244,7 @@ pub enum PmHealthMetricKind {
     DuplicateQuote,
     PersistencePending,
     PersistenceAcknowledged,
-    FakeEffectExecuted,
+    EffectDispatchCompleted,
     RefreshRequested,
 }
 
@@ -336,16 +336,29 @@ impl PmFailClosedEffect {
     }
 }
 
-/// Closed, copied effect union. It cannot be converted into a fake command,
+/// Closed, copied effect union. It cannot be converted into a backend request,
 /// journal receipt, prepared quote, or prepared cancel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PmProductEffect {
-    FakePassiveQuote(PmFakeQuoteEffect),
-    FakeCancelOwned(PmFakeCancelEffect),
+    PlaceGtcPostOnly(PmPlaceDispatchEffect),
+    CancelOwned(PmCancelDispatchEffect),
     ReconciliationRefresh(PmRefreshEffect),
     DurableRecord(PmDurableRecordEffect),
     HealthMetricAudit(PmHealthMetricEffect),
     FailClosedHaltOrCancel(PmFailClosedEffect),
+}
+
+/// Compatibility name for Goal F callers observing the fake backend.
+pub type PmFakeEffectStage = PmEffectDispatchStage;
+/// Compatibility name for Goal F callers observing the fake backend.
+pub type PmFakeQuoteEffect = PmPlaceDispatchEffect;
+/// Compatibility name for Goal F callers observing the fake backend.
+pub type PmFakeCancelEffect = PmCancelDispatchEffect;
+
+impl PmEffectDispatchStage {
+    /// Compatibility stage name for the Goal F fixture backend.
+    #[allow(non_upper_case_globals)]
+    pub const ExecutedByFixture: Self = Self::CompletedByBackend;
 }
 
 /// Allocation-free effects from one owner reduction.
@@ -501,6 +514,14 @@ impl PmProductEffectOutput {
         self.head = ((index + 1) % MAX_PM_PRODUCT_EFFECT_OUTPUTS) as u16;
         self.len -= 1;
         Some(effect)
+    }
+
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub(crate) fn peek(&self) -> Option<PmProductEffect> {
+        if self.len == 0 {
+            return None;
+        }
+        self.values[usize::from(self.head)]
     }
 
     pub(crate) const fn len(&self) -> usize {

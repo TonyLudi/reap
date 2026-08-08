@@ -1,0 +1,5 @@
+error[E0432]: unresolved import `reap_pm_live::PmLiveOpenOrdersInput`
+ --> tests/ui/live_occurrence_attachment_is_internal.rs:1:46
+  |
+1 | use reap_pm_live::{PmFixtureQueryOccurrence, PmLiveOpenOrdersInput};
+  |                                              ^^^^^^^^^^^^^^^^^^^^^ no `PmLiveOpenOrdersInput` in the root

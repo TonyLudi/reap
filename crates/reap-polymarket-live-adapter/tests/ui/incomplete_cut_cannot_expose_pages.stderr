@@ -1,0 +1,5 @@
+error[E0599]: no method named `pages` found for reference `&PmOpenOrdersAssembly` in the current scope
+ --> tests/ui/incomplete_cut_cannot_expose_pages.rs:4:22
+  |
+4 |     let _ = assembly.pages();
+  |                      ^^^^^ private field, not a method

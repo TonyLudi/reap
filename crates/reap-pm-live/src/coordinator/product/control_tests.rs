@@ -5,6 +5,9 @@ use reap_pm_core::{
     PmFillQueryCursor, PmOrderSide, PmPositionAvailability, PmSignedUnits, PmVenueOrderId,
     PmVenueOrderKey, U256,
 };
+use reap_pm_state::{
+    PmPrivateExternalIngressFailure, PmPrivateExternalIngressFault, PmPrivateExternalIngressLane,
+};
 use reap_pm_strategy::PmQuoteModel;
 use reap_polymarket_adapter::{
     PmFakeCancelScript, PmFakePlaceScript, PmFixtureBalanceRow, PmFixtureFeeEvidence,
@@ -16,13 +19,87 @@ use crate::evidence::{
     prepare_reached_overload_product, query_occurrence, start_reached_overload_product,
 };
 use crate::{
-    PmCancelIntentReason, PmControlReason, PmDurableRecordKind, PmFakeEffectStage, PmLaneKind,
+    PmCancelIntentReason, PmControlReason, PmDurableRecordKind, PmEffectDispatchStage, PmLaneKind,
     PmLanePolicy, PmMutationHalt, PmOpenOrdersFixtureInput, PmOrderDetailFixtureInput,
-    PmProductEffect, PmProductRun, PmReconciliationFixtureInput, PmScheduledActionKind,
-    SaturationAction,
+    PmProductEffect, PmProductRun, PmReconciliationFixtureInput, PmRefreshEffectKind,
+    PmScheduledActionKind, SaturationAction,
 };
 
 const MINIMUM_PRODUCT_STACK_BYTES: usize = 2 * 1024 * 1024;
+
+#[test]
+fn recovered_refreshes_wait_for_open_orders_before_missing_detail_admission() {
+    let source = include_str!("service.rs");
+    let connection = source
+        .split_once("PmPrivateInput::ConnectionAvailable => {")
+        .expect("connection-available service arm remains explicit")
+        .1
+        .split_once("PmPrivateInput::ConnectionUnavailable")
+        .expect("connection-available arm remains bounded")
+        .0;
+    let reconnect = connection
+        .find("PmRefreshReason::PrivateReconnect")
+        .expect("private reconnect ticket is admitted first");
+    let ambiguous = connection
+        .find("PmRefreshReason::AmbiguousOrder")
+        .expect("ambiguous-order ticket is admitted explicitly");
+    let next = connection
+        .find("let Some(next) = self.mutation.next_pending_refresh()")
+        .expect("recovered refresh admission observes the typed FIFO head");
+    let missing = connection
+        .find("next.key().reason() == PmRefreshReason::MissingOrderDetail")
+        .expect("missing detail remains pending until OpenOrders applies");
+    let recovered = connection
+        .find("self.admit_next_refresh(clock.monotonic_service_ns(), effects)?")
+        .expect("pre-existing recovery tickets use typed admission");
+    let saturation = connection
+        .find("self.mutation.next_pending_refresh().is_some_and(|ticket|")
+        .expect("an overfull recovered set fails closed");
+    assert!(
+        reconnect < ambiguous
+            && ambiguous < next
+            && next < missing
+            && missing < recovered
+            && recovered < saturation
+    );
+    assert!(
+        connection.contains("while effects.len() < MAX_PM_EFFECTS_PER_INPUT.saturating_sub(1)")
+    );
+    assert!(connection.contains("PmCoordinatorError::EffectProjectionSaturated"));
+
+    let reconciliation = include_str!("service/reconciliation.rs");
+    let open_orders = reconciliation
+        .split_once("PmReconciliationInput::OpenOrders(delivery) => {")
+        .expect("OpenOrders reconciliation arm remains explicit")
+        .1
+        .split_once("PmReconciliationInput::OrderDetail(delivery) => {")
+        .expect("OpenOrders reconciliation arm remains bounded")
+        .0;
+    let complete_ambiguous = open_orders
+        .find("PmRefreshReason::AmbiguousOrder")
+        .expect("OpenOrders completes the ambiguous-order generation first");
+    let canonical_missing = open_orders
+        .find("self.mutation.has_missing_order_detail()")
+        .expect("OpenOrders consults current canonical detail state");
+    let admit_missing = open_orders
+        .find("PmRefreshReason::MissingOrderDetail")
+        .expect("OpenOrders admits the current missing-detail generation");
+    let drain_remaining = open_orders
+        .find("self.admit_next_refresh(monotonic_service_ns, effects)?")
+        .expect("remaining recovered tickets drain after missing detail");
+    let fail_closed = open_orders
+        .find("self.mutation.next_pending_refresh().is_some()")
+        .expect("unexpected remaining recovery work fails closed");
+    assert!(
+        complete_ambiguous < canonical_missing
+            && canonical_missing < admit_missing
+            && admit_missing < drain_remaining
+            && drain_remaining < fail_closed
+    );
+    assert!(
+        open_orders.contains("while effects.len() < MAX_PM_EFFECTS_PER_INPUT.saturating_sub(1)")
+    );
+}
 
 #[test]
 fn product_start_service_and_shutdown_fit_two_mebibyte_stack() {
@@ -47,7 +124,7 @@ async fn minimum_stack_product_lifecycle_test() {
 }
 
 #[test]
-fn private_reconnect_refresh_requires_one_applied_complete_pair() {
+fn private_reconnect_requires_account_trades_and_complete_open_orders() {
     run_product_test(private_reconnect_refresh_lifecycle_test);
 }
 
@@ -68,13 +145,20 @@ async fn private_reconnect_refresh_lifecycle_test() {
     let reconnect_effects = drain_effects(&mut run);
     assert_eq!(
         reconciliation_refresh_count(&reconnect_effects),
-        1,
-        "the canonical reconnect ticket emits one complete-reconciliation request"
+        2,
+        "the canonical reconnect emits both complete-reconciliation and open-orders requests"
+    );
+    assert_eq!(
+        reconciliation_refresh_kinds(&reconnect_effects),
+        vec![
+            PmRefreshEffectKind::CompleteReconciliation,
+            PmRefreshEffectKind::OpenOrders,
+        ]
     );
     let admitted = run.refresh_obligation_metrics();
-    assert_eq!(admitted.canonical_insertions(), 1);
-    assert_eq!(admitted.total_pending(), 1);
-    assert_eq!(admitted.total_in_flight(), 1);
+    assert_eq!(admitted.canonical_insertions(), 2);
+    assert_eq!(admitted.total_pending(), 2);
+    assert_eq!(admitted.total_in_flight(), 2);
     run.service_turn(122)
         .expect("the reconnect-triggered quote check is serviced on time");
     drain_effects(&mut run);
@@ -117,6 +201,19 @@ async fn private_reconnect_refresh_lifecycle_test() {
     run.service_turn(142)
         .expect("one exact complete account-plus-fill cut applies");
     drain_effects(&mut run);
+    let after_pair = run.refresh_obligation_metrics();
+    assert_eq!(after_pair.total_pending(), 1);
+    assert_eq!(after_pair.total_in_flight(), 1);
+
+    let empty_orders: [&[u8]; 0] = [];
+    run.ingest_open_orders_fixture(PmOpenOrdersFixtureInput::new(
+        query_occurrence(1, 6, 7, 3, 143).expect("fixed reconnect open-orders occurrence"),
+        &empty_orders,
+    ))
+    .expect("the exact complete open-orders cut reaches reconciliation");
+    run.service_turn(144)
+        .expect("the exact complete open-orders cut applies");
+    drain_effects(&mut run);
     let completed = run.refresh_obligation_metrics();
     assert_eq!(completed.total_pending(), 0);
     assert_eq!(completed.total_in_flight(), 0);
@@ -145,6 +242,10 @@ async fn copied_refresh_age_test() {
     drain_effects(&mut run);
     let initial = Box::pin(place_acknowledgement_unknown_quote(&mut run)).await;
     assert_eq!(reconciliation_refresh_count(&initial), 1);
+    assert_eq!(
+        reconciliation_refresh_kinds(&initial),
+        vec![PmRefreshEffectKind::OpenOrders]
+    );
     let retained_total = run.refresh_obligation_metrics().total_pending();
 
     run.service_turn(1_000_001_454)
@@ -156,7 +257,13 @@ async fn copied_refresh_age_test() {
 
     run.service_turn(1_000_001_455)
         .expect("one nanosecond beyond the age boundary services");
-    assert_eq!(reconciliation_refresh_count(&drain_effects(&mut run)), 1);
+    let retried_effects = drain_effects(&mut run);
+    assert_eq!(reconciliation_refresh_count(&retried_effects), 1);
+    assert_eq!(
+        reconciliation_refresh_kinds(&retried_effects),
+        vec![PmRefreshEffectKind::OpenOrders],
+        "retry must preserve the originally admitted refresh purpose"
+    );
     let retried = run.refresh_obligation_metrics();
     assert_eq!(retried.total_pending(), retained_total);
     assert_eq!(retried.total_in_flight(), 1);
@@ -212,6 +319,11 @@ async fn acknowledgement_unknown_refresh_convergence_test() {
         1,
         "one copied refresh effect is retained for the ambiguous submit"
     );
+    assert_eq!(
+        reconciliation_refresh_kinds(&ambiguity_effects),
+        vec![PmRefreshEffectKind::OpenOrders],
+        "ambiguous ownership must query the authoritative open-orders purpose"
+    );
     let admitted = run.refresh_obligation_metrics();
     assert_eq!(admitted.total_pending(), baseline_total + 1);
     assert_eq!(admitted.total_in_flight(), 1);
@@ -221,7 +333,7 @@ async fn acknowledgement_unknown_refresh_convergence_test() {
     let ambiguous_client = ambiguity_effects
         .iter()
         .find_map(|effect| match effect {
-            PmProductEffect::FakePassiveQuote(quote) => Some(quote.client_order()),
+            PmProductEffect::PlaceGtcPostOnly(quote) => Some(quote.client_order()),
             _ => None,
         })
         .expect("ambiguous execution retains its client identity");
@@ -273,11 +385,10 @@ async fn acknowledgement_unknown_refresh_convergence_test() {
     run.service_turn(2_100_000_002)
         .expect("authoritative open orders reduce");
     let convergence_effects = drain_effects(&mut run);
-    assert!(
-        convergence_effects
-            .iter()
-            .all(|effect| !matches!(effect, PmProductEffect::ReconciliationRefresh(_))),
-        "a converged authoritative snapshot must not emit another refresh"
+    assert_eq!(
+        reconciliation_refresh_kinds(&convergence_effects),
+        vec![PmRefreshEffectKind::CompleteReconciliation],
+        "the authoritative open cut must immediately dispatch the newly exposed unbound missing-detail obligation"
     );
     let converged = run.refresh_obligation_metrics();
     assert_eq!(
@@ -285,7 +396,7 @@ async fn acknowledgement_unknown_refresh_convergence_test() {
         unrelated.total_pending(),
         "the complete snapshot clears ambiguity but retains its newly exposed missing-detail obligation"
     );
-    assert_eq!(converged.total_in_flight(), 0);
+    assert_eq!(converged.total_in_flight(), 1);
     assert_eq!(converged.ambiguous_order_pending(), 0);
     assert_eq!(converged.ambiguous_order_in_flight(), 0);
 
@@ -362,12 +473,15 @@ async fn recovered_live_order_control_test() {
     let prepared = drain_effects(&mut recovered)
         .into_iter()
         .find_map(|effect| match effect {
-            PmProductEffect::FakeCancelOwned(cancel) => Some(cancel),
+            PmProductEffect::CancelOwned(cancel) => Some(cancel),
             _ => None,
         })
         .expect("durability prepares the fake owned cancel after halt");
     assert_eq!(prepared.client_order(), client_order);
-    assert_eq!(prepared.stage(), PmFakeEffectStage::PreparedAfterDurability);
+    assert_eq!(
+        prepared.stage(),
+        PmEffectDispatchStage::PreparedAfterDurability
+    );
 
     recovered
         .execute_prepared_cancel_fixture(
@@ -379,15 +493,24 @@ async fn recovered_live_order_control_test() {
     recovered
         .service_turn(2_005)
         .expect("fake cancel result reaches the halted owner");
-    let executed = drain_effects(&mut recovered)
-        .into_iter()
+    let cancel_effects = drain_effects(&mut recovered);
+    let executed = cancel_effects
+        .iter()
         .find_map(|effect| match effect {
-            PmProductEffect::FakeCancelOwned(cancel) => Some(cancel),
+            PmProductEffect::CancelOwned(cancel) => Some(*cancel),
             _ => None,
         })
         .expect("fake cancel execution is projected");
     assert_eq!(executed.client_order(), client_order);
-    assert_eq!(executed.stage(), PmFakeEffectStage::ExecutedByFixture);
+    assert_eq!(executed.stage(), PmEffectDispatchStage::CompletedByBackend);
+    assert_eq!(
+        reconciliation_refresh_kinds(&cancel_effects),
+        vec![PmRefreshEffectKind::OrderDetail(prepared.venue_order())],
+        "an accepted fake cancel and an authenticated cancel share the exact missing-detail obligation"
+    );
+    let refresh = recovered.refresh_obligation_metrics();
+    assert_eq!(refresh.total_pending(), 1);
+    assert_eq!(refresh.total_in_flight(), 1);
 
     Box::pin(wait_for_persistence(&mut recovered, 23, 2_006)).await;
     recovered
@@ -506,14 +629,190 @@ async fn recovered_live_order_aged_schedule_test() {
     let prepared = drain_effects(&mut recovered)
         .into_iter()
         .find_map(|effect| match effect {
-            PmProductEffect::FakeCancelOwned(cancel) => Some(cancel),
+            PmProductEffect::CancelOwned(cancel) => Some(cancel),
             _ => None,
         })
         .expect("durability prepares the recovered owned cancel after halt");
     assert_eq!(prepared.client_order(), client_order);
-    assert_eq!(prepared.stage(), PmFakeEffectStage::PreparedAfterDurability);
+    assert_eq!(
+        prepared.stage(),
+        PmEffectDispatchStage::PreparedAfterDurability
+    );
 
     let _ = Box::pin((*recovered).shutdown()).await;
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LiveDependencyFaultCase {
+    PolymarketBookStale,
+    OkxReferenceStale,
+    PolymarketUnavailable,
+    OkxUnavailable,
+    PrivateDisconnected,
+}
+
+#[test]
+fn stale_or_unavailable_live_dependencies_suppress_place_but_preserve_exact_cancel() {
+    run_product_test(live_dependency_fault_matrix_test);
+}
+
+async fn live_dependency_fault_matrix_test() {
+    for (ordinal, case) in [
+        LiveDependencyFaultCase::PolymarketBookStale,
+        LiveDependencyFaultCase::OkxReferenceStale,
+        LiveDependencyFaultCase::PolymarketUnavailable,
+        LiveDependencyFaultCase::OkxUnavailable,
+        LiveDependencyFaultCase::PrivateDisconnected,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let directory = tempfile::tempdir().expect("temporary dependency-fault directory");
+        let mut run = Box::new(
+            Box::pin(start_reached_overload_product(
+                directory
+                    .path()
+                    .join(format!("dependency-{ordinal}-capture.jsonl")),
+                directory
+                    .path()
+                    .join(format!("dependency-{ordinal}-journal.jsonl")),
+            ))
+            .await
+            .expect("dependency-fault product starts"),
+        );
+        Box::pin(prepare_reached_overload_product(&mut run))
+            .await
+            .expect("dependency-fault product becomes ready");
+        drain_effects(&mut run);
+
+        let client_order = Box::pin(place_live_quote(&mut run)).await;
+        let venue_order = PmVenueOrderKey::new(
+            client_order.account(),
+            PmVenueOrderId::new("phase6-recovered-stop").expect("fixed accepted venue order"),
+        );
+        let quote_intents_before = run.mutation_counters().quote_intents();
+        let fault_ns = match case {
+            // The fixed PM book was observed at 103 and the OKX reference at
+            // 104. At these two exact clocks only the named dependency wins
+            // the coordinator's ordered freshness classification.
+            LiveDependencyFaultCase::PolymarketBookStale => 1_000_000_104,
+            LiveDependencyFaultCase::OkxReferenceStale => 1_000_000_105,
+            LiveDependencyFaultCase::PolymarketUnavailable
+            | LiveDependencyFaultCase::OkxUnavailable
+            | LiveDependencyFaultCase::PrivateDisconnected => 2_000 + ordinal as u64 * 100,
+        };
+
+        match case {
+            LiveDependencyFaultCase::PolymarketBookStale
+            | LiveDependencyFaultCase::OkxReferenceStale => run
+                .schedule(
+                    PmOrderSide::Buy,
+                    PmScheduledActionKind::QuoteEvaluation,
+                    fault_ns,
+                    fault_ns,
+                    1_700_000_000_000,
+                )
+                .expect("stale-dependency quote check schedules"),
+            LiveDependencyFaultCase::PolymarketUnavailable => {
+                let fault = run
+                    .public_ingress()
+                    .record_pm_disconnected(1_700_000_000_000_000_000 + fault_ns, fault_ns)
+                    .await
+                    .expect("PM disconnect produces authenticated unavailability");
+                assert_eq!(
+                    fault,
+                    reap_polymarket_adapter::PmPublicSessionFault::Disconnect
+                );
+            }
+            LiveDependencyFaultCase::OkxUnavailable => {
+                let fault = run
+                    .public_ingress()
+                    .record_okx_disconnected(1_700_000_000_000_000_000 + fault_ns, fault_ns)
+                    .await
+                    .expect("OKX disconnect produces authenticated unavailability");
+                assert_eq!(
+                    fault,
+                    reap_okx_public_source::OkxPublicSessionFault::Disconnect
+                );
+            }
+            LiveDependencyFaultCase::PrivateDisconnected => run
+                .mark_private_fixture_unavailable(
+                    completion(1, 60 + ordinal as u64, None, fault_ns),
+                    PmPrivateExternalIngressFault::new(
+                        PmPrivateExternalIngressLane::PrivateLifecycle,
+                        PmPrivateExternalIngressFailure::Service,
+                    ),
+                )
+                .expect("private disconnect reaches the product lane"),
+        }
+
+        let mut fault_effects = service_and_collect(&mut run, fault_ns, 4);
+        if !matches!(
+            case,
+            LiveDependencyFaultCase::PolymarketBookStale
+                | LiveDependencyFaultCase::OkxReferenceStale
+        ) {
+            let quote_check_ns = fault_ns + 10;
+            run.schedule(
+                PmOrderSide::Buy,
+                PmScheduledActionKind::QuoteEvaluation,
+                quote_check_ns,
+                quote_check_ns,
+                1_700_000_000_001,
+            )
+            .expect("unavailable-dependency quote check schedules");
+            fault_effects.extend(service_and_collect(&mut run, quote_check_ns, 2));
+        }
+
+        assert!(
+            fault_effects
+                .iter()
+                .all(|effect| !matches!(effect, PmProductEffect::PlaceGtcPostOnly(_))),
+            "{case:?} admitted a new place effect"
+        );
+        assert_eq!(
+            run.mutation_counters().quote_intents(),
+            quote_intents_before,
+            "{case:?} admitted a new durable quote intent"
+        );
+        let cancel_records = fault_effects
+            .iter()
+            .filter(|effect| {
+                matches!(
+                    effect,
+                    PmProductEffect::DurableRecord(record)
+                        if record.kind() == PmDurableRecordKind::CancelIntent
+                            && record.client_order() == Some(client_order)
+                )
+            })
+            .count();
+        assert_eq!(
+            cancel_records, 1,
+            "{case:?} did not preserve exactly one durable cancel intent"
+        );
+
+        Box::pin(wait_for_persistence(
+            &mut run,
+            80 + ordinal as u64,
+            fault_ns + 20,
+        ))
+        .await;
+        let prepared = service_and_collect(&mut run, fault_ns + 21, 2)
+            .into_iter()
+            .find_map(|effect| match effect {
+                PmProductEffect::CancelOwned(cancel) => Some(cancel),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{case:?} did not release its durable exact cancel"));
+        assert_eq!(prepared.client_order(), client_order);
+        assert_eq!(prepared.venue_order(), venue_order);
+        assert_eq!(
+            prepared.stage(),
+            PmEffectDispatchStage::PreparedAfterDurability
+        );
+
+        let _ = Box::pin((*run).shutdown()).await;
+    }
 }
 
 #[test]
@@ -673,12 +972,15 @@ async fn place_live_quote<M: PmQuoteModel>(
     let prepared = drain_effects(run)
         .into_iter()
         .find_map(|effect| match effect {
-            PmProductEffect::FakePassiveQuote(quote) => Some(quote),
+            PmProductEffect::PlaceGtcPostOnly(quote) => Some(quote),
             _ => None,
         })
         .expect("durability prepares a fake quote");
     assert_eq!(prepared.client_order(), client_order);
-    assert_eq!(prepared.stage(), PmFakeEffectStage::PreparedAfterDurability);
+    assert_eq!(
+        prepared.stage(),
+        PmEffectDispatchStage::PreparedAfterDurability
+    );
 
     let venue_order = PmVenueOrderKey::new(
         client_order.account(),
@@ -723,11 +1025,14 @@ async fn place_acknowledgement_unknown_quote<M: PmQuoteModel>(
     let prepared = drain_effects(run)
         .into_iter()
         .find_map(|effect| match effect {
-            PmProductEffect::FakePassiveQuote(quote) => Some(quote),
+            PmProductEffect::PlaceGtcPostOnly(quote) => Some(quote),
             _ => None,
         })
         .expect("durability prepares a fake quote");
-    assert_eq!(prepared.stage(), PmFakeEffectStage::PreparedAfterDurability);
+    assert_eq!(
+        prepared.stage(),
+        PmEffectDispatchStage::PreparedAfterDurability
+    );
 
     run.execute_prepared_quote_fixture(
         completion(1, 41, None, 1_453),
@@ -766,9 +1071,33 @@ fn drain_effects(run: &mut PmProductRun<impl PmQuoteModel>) -> Vec<PmProductEffe
     effects
 }
 
+fn service_and_collect(
+    run: &mut PmProductRun<impl PmQuoteModel>,
+    monotonic_ns: u64,
+    turns: usize,
+) -> Vec<PmProductEffect> {
+    let mut effects = Vec::new();
+    for offset in 0..turns {
+        run.service_turn(monotonic_ns + offset as u64)
+            .expect("dependency-fault service turn succeeds");
+        effects.extend(drain_effects(run));
+    }
+    effects
+}
+
 fn reconciliation_refresh_count(effects: &[PmProductEffect]) -> usize {
     effects
         .iter()
         .filter(|effect| matches!(effect, PmProductEffect::ReconciliationRefresh(_)))
         .count()
+}
+
+fn reconciliation_refresh_kinds(effects: &[PmProductEffect]) -> Vec<PmRefreshEffectKind> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            PmProductEffect::ReconciliationRefresh(refresh) => Some(refresh.kind()),
+            _ => None,
+        })
+        .collect()
 }

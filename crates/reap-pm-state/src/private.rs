@@ -27,8 +27,8 @@ use crate::private_config::{PmPrivateConfigError, PmPrivateStateConfig};
 use crate::private_ingress::{PmPrivateExternalIngressCounters, PmPrivateExternalIngressFault};
 use crate::private_occurrence::PmPrivateOccurrence;
 use crate::private_readiness::{
-    PmPrivateConvergence, PmPrivateHaltReason, PmPrivateQuoteEvaluation, PmPrivateQuoteRequest,
-    PmPrivateReadiness, PmReadinessContext,
+    PmPrivateConvergence, PmPrivateDependency, PmPrivateHaltReason, PmPrivateQuoteEvaluation,
+    PmPrivateQuoteRequest, PmPrivateReadiness, PmReadinessContext,
 };
 #[cfg(test)]
 use crate::refresh::MAX_PM_REFRESH_OBLIGATIONS;
@@ -197,6 +197,38 @@ impl PmPrivateState {
             self.instrument(),
             PmRefreshReason::ExternalIngressFault,
         ));
+    }
+
+    /// Invalidates one live read dependency without converting a recoverable
+    /// transport/partial-read failure into a permanent contract halt.
+    ///
+    /// The bounded fault is still counted and a complete reconciliation is
+    /// required. A later compatible complete cut may restore the invalidated
+    /// dependency. Scope and contract failures must continue through
+    /// [`Self::record_external_ingress_fault`] instead.
+    pub fn invalidate_external_dependency(
+        &mut self,
+        dependency: PmPrivateDependency,
+        fault: PmPrivateExternalIngressFault,
+    ) -> Result<PmRefreshRequired, PmPrivateStateError> {
+        self.external_ingress_counters.record(fault);
+        match dependency {
+            PmPrivateDependency::PrivateLifecycle => {
+                self.private_available = false;
+            }
+            PmPrivateDependency::AccountSnapshot => {
+                self.account.invalidate_freshness();
+            }
+            PmPrivateDependency::OrderLifecycle => {
+                self.orders.invalidate_freshness();
+            }
+            PmPrivateDependency::Reconciliation => {
+                self.convergence = PmPrivateConvergence::Divergent {
+                    uncovered_fills: self.uncovered_fill_count(),
+                };
+            }
+        }
+        self.require_refresh(PmRefreshReason::ExternalIngressFault)
     }
 
     pub fn register_owned_order(
@@ -901,6 +933,20 @@ impl PmPrivateState {
         self.fills.watermark()
     }
 
+    /// Restore only the opaque equality boundary from a checked durable
+    /// journal before any new private or reconciliation reduction.
+    ///
+    /// This does not establish account completeness, private convergence, or
+    /// quote readiness; those still require a fresh compatible reconciliation.
+    pub fn initialize_recovered_fill_watermark(
+        &mut self,
+        cursor: reap_pm_core::PmFillQueryCursor,
+    ) -> Result<(), PmPrivateStateError> {
+        self.fills
+            .initialize_recovered_watermark(cursor, &self.config)?;
+        Ok(())
+    }
+
     #[must_use]
     pub const fn fill_watermark_compaction_pending(&self) -> bool {
         self.pending_fill_compaction_generation.is_some()
@@ -1073,6 +1119,11 @@ impl PmPrivateState {
     ) -> Result<(), PmPrivateStateError> {
         self.owned_lifecycle.validate_epoch(epoch)?;
         self.require_refresh(PmRefreshReason::PrivateReconnect)?;
+        // An epoch gap makes the complete remote order set unknown even when
+        // no individual order is currently suspected. Account+trade
+        // reconciliation cannot restore this dependency; only a complete
+        // open-orders cut can do so.
+        self.require_refresh(PmRefreshReason::AmbiguousOrder)?;
         self.owned_lifecycle.begin_epoch(epoch)?;
         self.current_epoch = Some(epoch);
         self.private_available = false;
@@ -1113,6 +1164,7 @@ impl PmPrivateState {
                 self.require_refresh(PmRefreshReason::FillSettlementFailed)?;
             }
             PmFillSettlementStatus::Matched
+            | PmFillSettlementStatus::MatchedNotBroadcasted
             | PmFillSettlementStatus::Mined
             | PmFillSettlementStatus::Confirmed => {}
         }

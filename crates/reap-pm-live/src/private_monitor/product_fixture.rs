@@ -1,4 +1,4 @@
-//! Product-owned fixture normalization and owner-bound delivery opening.
+//! Product-owned fixture normalization and backend-neutral delivery opening.
 //!
 //! These seams are deliberately crate-private. The public product Run accepts
 //! only the narrow raw fixture inputs, and this module keeps each normalized
@@ -25,13 +25,13 @@ use super::{
 /// The two exact owner-bound deliveries that make one complete account/fill
 /// reconciliation cut.
 #[derive(Debug)]
-pub(crate) struct PmFixturePairedReconciliationDelivery {
+pub(crate) struct PmPairedReconciliationDelivery {
     account: PmCompleteAccountSnapshotDelivery,
     fills: PmCompleteFillQueryDelivery,
 }
 
-impl PmFixturePairedReconciliationDelivery {
-    fn new(
+impl PmPairedReconciliationDelivery {
+    pub(crate) fn new(
         account: PmCompleteAccountSnapshotDelivery,
         fills: PmCompleteFillQueryDelivery,
     ) -> Result<Self, PmPrivateMonitorError> {
@@ -134,7 +134,7 @@ impl PmPrivateMonitorRuntime {
     pub(crate) fn complete_product_reconciliation_fixture(
         &mut self,
         input: PmReconciliationFixtureInput<'_>,
-    ) -> Result<PmFixturePairedReconciliationDelivery, PmPrivateMonitorError> {
+    ) -> Result<PmPairedReconciliationDelivery, PmPrivateMonitorError> {
         let query = input.occurrence;
         self.validate_private_epoch(query.connection_epoch)?;
         let account_request = self
@@ -160,10 +160,10 @@ impl PmPrivateMonitorRuntime {
             input.raw_fill_frames,
             input.fee,
         )?;
-        PmFixturePairedReconciliationDelivery::new(account, fills)
+        PmPairedReconciliationDelivery::new(account, fills)
     }
 
-    pub(crate) fn open_product_private_fixture(
+    pub(crate) fn open_product_private(
         &self,
         delivery: PmFixturePrivateDelivery,
         monotonic_service_ns: u64,
@@ -185,7 +185,7 @@ impl PmPrivateMonitorRuntime {
         Ok(opened.expect("owner-opened private fixture delivery"))
     }
 
-    pub(crate) fn open_product_account_fixture(
+    pub(crate) fn open_product_account(
         &self,
         delivery: PmCompleteAccountSnapshotDelivery,
         monotonic_service_ns: u64,
@@ -207,7 +207,7 @@ impl PmPrivateMonitorRuntime {
         Ok(opened.expect("owner-opened account fixture delivery"))
     }
 
-    pub(crate) fn open_product_open_orders_fixture(
+    pub(crate) fn open_product_open_orders(
         &self,
         delivery: PmCompleteOpenOrdersDelivery,
         monotonic_service_ns: u64,
@@ -231,7 +231,7 @@ impl PmPrivateMonitorRuntime {
         Ok(opened.expect("owner-opened open-orders fixture delivery"))
     }
 
-    pub(crate) fn open_product_order_detail_fixture(
+    pub(crate) fn open_product_order_detail(
         &self,
         delivery: PmExactOrderDetailDelivery,
         monotonic_service_ns: u64,
@@ -255,9 +255,9 @@ impl PmPrivateMonitorRuntime {
         Ok(opened.expect("owner-opened order-detail fixture delivery"))
     }
 
-    pub(crate) fn open_product_reconciliation_fixture(
+    pub(crate) fn open_product_reconciliation(
         &self,
-        delivery: PmFixturePairedReconciliationDelivery,
+        delivery: PmPairedReconciliationDelivery,
         monotonic_service_ns: u64,
     ) -> Result<
         (
@@ -266,8 +266,8 @@ impl PmPrivateMonitorRuntime {
         ),
         PmPrivateMonitorError,
     > {
-        let PmFixturePairedReconciliationDelivery { account, fills } = delivery;
-        let account = self.open_product_account_fixture(account, monotonic_service_ns)?;
+        let PmPairedReconciliationDelivery { account, fills } = delivery;
+        let account = self.open_product_account(account, monotonic_service_ns)?;
         let serviced = fills.service_at(monotonic_service_ns)?;
         let expected_account = self.reconciliation.account_scope();
         let expected_instrument = self.reconciliation.instrument_scope();

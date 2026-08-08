@@ -48,7 +48,7 @@ impl EvidenceRun {
         let refresh = self.owner.refresh_obligation_metrics();
         let coordinator = self.owner.counters();
         let journal_policy = PmLanePolicy::for_lane(PmLaneKind::Journal);
-        let fake_policy = PmLanePolicy::for_lane(PmLaneKind::FakeEffect);
+        let fake_policy = PmLanePolicy::for_lane(PmLaneKind::EffectDispatch);
         let schedule_policy = PmLanePolicy::for_lane(PmLaneKind::Scheduled);
         let refresh_policy = PmLanePolicy::for_lane(PmLaneKind::ReconciliationRequest);
         let capture_policy = PmLanePolicy::for_lane(PmLaneKind::Capture);
@@ -252,7 +252,7 @@ const fn lane_label(lane: PmLaneKind) -> &'static str {
         PmLaneKind::ReconciliationRequest => "reconciliation_request",
         PmLaneKind::Capture => "capture",
         PmLaneKind::Journal => "journal",
-        PmLaneKind::FakeEffect => "fake_effect",
+        PmLaneKind::EffectDispatch => "effect_dispatch",
     }
 }
 

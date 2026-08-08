@@ -1,9 +1,13 @@
 use reap_pm_core::{
-    ConnectionEpoch, EvmAddress, IngressSequence, MAX_REQUIRED_SPENDERS, OkxReferenceHandle,
-    OkxReferencePrice, PmAssetId, PmChainId, PmConditionId, PmInstrumentHandle, PmMarketHandle,
-    PmMarketId, PmMarketLifecycle, PmMarketMetadata, PmOrderSide, PmOutcomeLabel,
-    PmOutcomeMetadata, PmPrice, PmQuantity, PmSpenderDomain, PmSpenderRequirement, PmTick,
-    PmTokenHandle, PmTokenId, SnapshotRevision, U256,
+    ConnectionEpoch, EvmAddress, IngressSequence, MAX_REQUIRED_SPENDERS, OkxInstrumentId,
+    OkxReferenceHandle, OkxReferenceInstrument, OkxReferencePrice, PmAssetId, PmChainId,
+    PmConditionId, PmInstrumentHandle, PmMarketHandle, PmMarketId, PmMarketLifecycle,
+    PmMarketMetadata, PmOrderSide, PmOutcomeLabel, PmOutcomeMetadata, PmPrice, PmQuantity,
+    PmSpenderDomain, PmSpenderRequirement, PmTick, PmTokenHandle, PmTokenId, SnapshotRevision,
+    U256,
+};
+use reap_pm_live_contracts::{
+    PmAccountConnectivityConfig, PmConnectivityConfig, PmPublicConnectivityConfig,
 };
 use reap_pm_strategy::{
     PmModelInputRequirements, PmQuoteModelOutput, PmQuoteModelRequirements, PmQuoteSides,
@@ -60,6 +64,56 @@ impl PmQuoteModel for ThresholdModel {
         )
         .expect("fixed threshold output")
     }
+}
+
+#[test]
+fn coordinator_assembly_rejects_same_account_different_configuration_scope() {
+    let base = crate::evidence::connectivity_config();
+    let alternate_public = PmPublicConnectivityConfig::derive_goal_f(
+        OkxReferenceInstrument::index(OkxInstrumentId::new("ETH-USDT").unwrap()),
+        base.public().expected_metadata(),
+        base.public().okx_route(),
+        base.public().polymarket_route(),
+    )
+    .unwrap();
+    let alternate_account = PmAccountConnectivityConfig::derive_goal_f(
+        &alternate_public,
+        base.account().account_scope(),
+        base.account().account_route(),
+    )
+    .unwrap();
+    let alternate = PmConnectivityConfig::new(alternate_public, alternate_account).unwrap();
+    let model = ThresholdModel {
+        requirements: PmModelInputRequirements::new(
+            base.public().okx_reference(),
+            base.public().instrument(),
+        ),
+        threshold: OkxReferencePrice::parse_decimal("50000").unwrap(),
+    };
+    let assembly = PmCoordinator::prepare_assembly(
+        &base,
+        model,
+        PmCoordinatorPolicy::new(20, 20, 20).unwrap(),
+    )
+    .unwrap();
+    let alternate_scope = crate::journal::PmJournalScopeV1::from_config(&alternate).unwrap();
+
+    assert_eq!(
+        base.account().account_scope(),
+        alternate.account().account_scope()
+    );
+    assert_eq!(
+        base.account().instrument_id(),
+        alternate.account().instrument_id()
+    );
+    assert_ne!(
+        base.public().configuration_fingerprint(),
+        alternate.public().configuration_fingerprint()
+    );
+    assert_eq!(
+        assembly.validate_mutation_scope(&alternate_scope),
+        Err(PmCoordinatorAssemblyError::MutationScopeMismatch)
+    );
 }
 
 #[test]

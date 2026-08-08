@@ -35,12 +35,12 @@ pub use order_state::{
 };
 pub use owned_lifecycle::{
     MAX_PM_OWNED_FILL_KEYS, MAX_PM_OWNED_ORDER_HISTORY, PmOwnedCancelApply, PmOwnedCancelIntent,
-    PmOwnedCancelOutcome, PmOwnedCancelRequestApply, PmOwnedCancelState, PmOwnedFillApply,
-    PmOwnedFillObservation, PmOwnedFillProjection, PmOwnedIntentId, PmOwnedLifecycleCounters,
-    PmOwnedObservationOccurrence, PmOwnedObservationSource, PmOwnedOrderLifecycle,
-    PmOwnedOrderLifecycleError, PmOwnedOrderProgressObservation, PmOwnedOrderProjection,
-    PmOwnedProgressApply, PmOwnedQuoteAdmission, PmOwnedQuoteIntent, PmOwnedQuoteSlotKey,
-    PmOwnedQuoteSlotProjection, PmOwnedRecoveryFill, PmOwnedReductionSequence,
+    PmOwnedCancelOutcome, PmOwnedCancelRequestApply, PmOwnedCancelState, PmOwnedDetailAbsenceApply,
+    PmOwnedFillApply, PmOwnedFillObservation, PmOwnedFillProjection, PmOwnedIntentId,
+    PmOwnedLifecycleCounters, PmOwnedObservationOccurrence, PmOwnedObservationSource,
+    PmOwnedOrderLifecycle, PmOwnedOrderLifecycleError, PmOwnedOrderProgressObservation,
+    PmOwnedOrderProjection, PmOwnedProgressApply, PmOwnedQuoteAdmission, PmOwnedQuoteIntent,
+    PmOwnedQuoteSlotKey, PmOwnedQuoteSlotProjection, PmOwnedRecoveryFill, PmOwnedReductionSequence,
     PmOwnedRemoteOrderApply, PmOwnedReplacementBlock, PmOwnedSubmitApply, PmOwnedSubmitResult,
     PmOwnedSubmitState, PmOwnedTerminalCompaction,
 };

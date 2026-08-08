@@ -7,8 +7,8 @@ use reap_pm_core::{
 };
 use reap_pm_state::{
     PmExactReservation, PmOwnedCancelApply, PmOwnedCancelOutcome, PmOwnedCancelRequestApply,
-    PmOwnedCancelState, PmOwnedFillApply, PmOwnedFillObservation, PmOwnedIntentId,
-    PmOwnedObservationOccurrence, PmOwnedObservationSource, PmOwnedOrderLifecycle,
+    PmOwnedCancelState, PmOwnedDetailAbsenceApply, PmOwnedFillApply, PmOwnedFillObservation,
+    PmOwnedIntentId, PmOwnedObservationOccurrence, PmOwnedObservationSource, PmOwnedOrderLifecycle,
     PmOwnedOrderLifecycleError, PmOwnedOrderProgressObservation, PmOwnedProgressApply,
     PmOwnedQuoteAdmission, PmOwnedQuoteIntent, PmOwnedQuoteSlotKey, PmOwnedReductionSequence,
     PmOwnedRemoteOrderApply, PmOwnedReplacementBlock, PmOwnedSubmitApply, PmOwnedSubmitResult,
@@ -428,6 +428,216 @@ fn rejection_timeout_late_ack_and_remote_ambiguity_preserve_ownership_authority(
             .apply_submit_result(second.client_order(), PmOwnedSubmitResult::Accepted(shared),)
             .unwrap_err(),
         PmOwnedOrderLifecycleError::VenueBindingConflict
+    );
+}
+
+#[test]
+fn only_journal_bound_ambiguity_can_cancel_and_exact_evidence_promotes_it() {
+    let mut fixture_ambiguity = lifecycle();
+    let fixture_quote = intent(40, 40, PmOrderSide::Buy, "0.40");
+    fixture_ambiguity.admit_quote(fixture_quote).unwrap();
+    assert_eq!(
+        fixture_ambiguity
+            .apply_submit_result(fixture_quote.client_order(), PmOwnedSubmitResult::Ambiguous,)
+            .unwrap(),
+        PmOwnedSubmitApply::MarkedAmbiguous
+    );
+    let fixture_projection = fixture_ambiguity.orders().next().unwrap();
+    assert_eq!(fixture_projection.venue_order(), None);
+    assert_eq!(fixture_projection.submit(), PmOwnedSubmitState::Ambiguous);
+    assert_eq!(
+        fixture_ambiguity
+            .request_cancel(fixture_quote.client_order())
+            .unwrap_err(),
+        PmOwnedOrderLifecycleError::CancelUnavailable,
+        "ordinary fake ambiguity must not mint an owned venue identity"
+    );
+
+    let mut cancellable = lifecycle();
+    let cancellable_quote = intent(41, 41, PmOrderSide::Buy, "0.40");
+    let expected = venue("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    cancellable.admit_quote(cancellable_quote).unwrap();
+    assert_eq!(
+        cancellable
+            .apply_submit_result(
+                cancellable_quote.client_order(),
+                PmOwnedSubmitResult::AmbiguousOwned(expected),
+            )
+            .unwrap(),
+        PmOwnedSubmitApply::MarkedAmbiguous
+    );
+    let bound = cancellable.orders().next().unwrap();
+    assert_eq!(bound.submit(), PmOwnedSubmitState::Ambiguous);
+    assert_eq!(bound.venue_order(), Some(expected));
+    assert!(bound.reconciliation_required());
+    let cancel = match cancellable
+        .request_cancel(cancellable_quote.client_order())
+        .unwrap()
+    {
+        PmOwnedCancelRequestApply::Issued(cancel) => cancel,
+        other => panic!("expected exact safety cancel, got {other:?}"),
+    };
+    assert_eq!(cancel.venue_order(), expected);
+    assert_eq!(
+        cancellable
+            .apply_cancel_result(cancel, PmOwnedCancelOutcome::Accepted)
+            .unwrap(),
+        PmOwnedCancelApply::Cancelled
+    );
+    let cancelled = cancellable.orders().next().unwrap();
+    assert_eq!(cancelled.submit(), PmOwnedSubmitState::Accepted);
+    assert_eq!(cancelled.cancel(), PmOwnedCancelState::Accepted);
+    assert!(cancelled.reconciliation_required());
+    cancellable
+        .observe_detail_absence(expected, occurrence(1, 1))
+        .unwrap();
+    assert!(
+        !cancellable
+            .orders()
+            .next()
+            .unwrap()
+            .reconciliation_required()
+    );
+    assert_eq!(
+        cancellable
+            .compact_proven_terminal(cancellable_quote.client_order())
+            .unwrap()
+            .fill_keys_removed(),
+        0
+    );
+
+    let mut filled = lifecycle();
+    let filled_quote = intent(42, 42, PmOrderSide::Buy, "0.40");
+    let filled_venue = venue("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    filled.admit_quote(filled_quote).unwrap();
+    filled
+        .apply_submit_result(
+            filled_quote.client_order(),
+            PmOwnedSubmitResult::AmbiguousOwned(filled_venue),
+        )
+        .unwrap();
+    filled
+        .observe_fill(fill_observation(
+            filled_venue,
+            "exact-fill",
+            "1",
+            Some("1"),
+            1,
+            1,
+            PmOwnedObservationSource::PrivateWebSocket,
+        ))
+        .unwrap();
+    let filled_projection = filled.orders().next().unwrap();
+    assert_eq!(filled_projection.submit(), PmOwnedSubmitState::Accepted);
+    assert_eq!(filled_projection.status(), Some(PmOrderStatus::Filled));
+    assert!(!filled_projection.reconciliation_required());
+    assert_eq!(
+        filled
+            .compact_proven_terminal(filled_quote.client_order())
+            .unwrap()
+            .fill_keys_removed(),
+        1
+    );
+
+    let mut progressed = lifecycle();
+    let progressed_quote = intent(43, 43, PmOrderSide::Buy, "0.40");
+    let progressed_venue =
+        venue("0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+    progressed.admit_quote(progressed_quote).unwrap();
+    progressed
+        .apply_submit_result(
+            progressed_quote.client_order(),
+            PmOwnedSubmitResult::AmbiguousOwned(progressed_venue),
+        )
+        .unwrap();
+    progressed
+        .observe_progress(progress(
+            progressed_quote.client_order(),
+            progressed_venue,
+            "0.25",
+            PmOrderStatus::PartiallyFilled,
+            1,
+            1,
+            PmOwnedObservationSource::RestReconciliation,
+        ))
+        .unwrap();
+    assert_eq!(
+        progressed.orders().next().unwrap().submit(),
+        PmOwnedSubmitState::Accepted
+    );
+
+    let mut conflicting = lifecycle();
+    let (_, occupied) = accepted(&mut conflicting, 50, 50, PmOrderSide::Buy, "occupied-venue");
+    let second = intent(51, 51, PmOrderSide::Sell, "0.40");
+    conflicting.admit_quote(second).unwrap();
+    assert_eq!(
+        conflicting
+            .apply_submit_result(
+                second.client_order(),
+                PmOwnedSubmitResult::AmbiguousOwned(occupied),
+            )
+            .unwrap_err(),
+        PmOwnedOrderLifecycleError::VenueBindingConflict
+    );
+}
+
+#[test]
+fn partial_accepted_cancel_requires_exact_terminal_progress_not_absence() {
+    let mut lifecycle = lifecycle();
+    let (client, venue) = accepted(&mut lifecycle, 44, 44, PmOrderSide::Buy, "partial-cancel");
+    lifecycle
+        .observe_fill(fill_observation(
+            venue,
+            "partial-fill",
+            "0.25",
+            Some("0.25"),
+            1,
+            1,
+            PmOwnedObservationSource::PrivateWebSocket,
+        ))
+        .unwrap();
+    let cancel = match lifecycle.request_cancel(client).unwrap() {
+        PmOwnedCancelRequestApply::Issued(cancel) => cancel,
+        other => panic!("expected exact partial-fill cancel, got {other:?}"),
+    };
+    assert_eq!(
+        lifecycle
+            .apply_cancel_result(cancel, PmOwnedCancelOutcome::Accepted)
+            .unwrap(),
+        PmOwnedCancelApply::Cancelled
+    );
+
+    assert_eq!(
+        lifecycle
+            .observe_detail_absence(venue, occurrence(1, 2))
+            .unwrap(),
+        PmOwnedDetailAbsenceApply::Unsafe,
+        "absence cannot prove the final cumulative quantity of a partial fill"
+    );
+    assert!(lifecycle.orders().next().unwrap().reconciliation_required());
+
+    let terminal = progress(
+        client,
+        venue,
+        "0.25",
+        PmOrderStatus::Cancelled,
+        1,
+        3,
+        PmOwnedObservationSource::RestReconciliation,
+    );
+    assert_eq!(
+        lifecycle.observe_progress(terminal).unwrap(),
+        PmOwnedProgressApply::Applied {
+            status: PmOrderStatus::Cancelled,
+            cumulative_filled: units("0.25"),
+            remaining: units("0.75"),
+        }
+    );
+    assert!(!lifecycle.orders().next().unwrap().reconciliation_required());
+    assert_eq!(
+        lifecycle.observe_progress(terminal).unwrap(),
+        PmOwnedProgressApply::Duplicate,
+        "the same exact terminal row settles the lifecycle only once"
     );
 }
 

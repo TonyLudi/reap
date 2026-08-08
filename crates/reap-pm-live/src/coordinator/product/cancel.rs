@@ -141,12 +141,12 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
                 client_order,
                 venue_order,
             }) => {
-                let projection = PmFakeCancelEffect::new(
+                let projection = PmCancelDispatchEffect::new(
                     self.account_scope,
                     self.instrument,
                     client_order,
                     venue_order,
-                    PmFakeEffectStage::PreparedAfterDurability,
+                    PmEffectDispatchStage::PreparedAfterDurability,
                 );
                 self.pending_correlations
                     .push(CopiedEffectCorrelation::Cancel(projection))?;

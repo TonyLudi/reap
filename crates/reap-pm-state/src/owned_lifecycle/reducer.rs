@@ -329,11 +329,34 @@ impl PmOwnedOrderLifecycle {
                 self.counters.submit_ambiguous = self.counters.submit_ambiguous.saturating_add(1);
                 PmOwnedSubmitApply::MarkedAmbiguous
             }
+            (PmOwnedSubmitState::Pending, PmOwnedSubmitResult::AmbiguousOwned(venue)) => {
+                self.validate_venue_binding(client_order, venue)?;
+                let entry = &mut self.entries[index];
+                entry.venue_order = Some(venue);
+                entry.submit = PmOwnedSubmitState::Ambiguous;
+                entry.reconciliation_required = true;
+                self.counters.submit_ambiguous = self.counters.submit_ambiguous.saturating_add(1);
+                PmOwnedSubmitApply::MarkedAmbiguous
+            }
             (PmOwnedSubmitState::Ambiguous, PmOwnedSubmitResult::Ambiguous)
             | (PmOwnedSubmitState::Rejected, PmOwnedSubmitResult::Rejected) => {
                 PmOwnedSubmitApply::Duplicate
             }
+            (PmOwnedSubmitState::Ambiguous, PmOwnedSubmitResult::AmbiguousOwned(venue)) => {
+                if prior.venue_order == Some(venue) {
+                    PmOwnedSubmitApply::Duplicate
+                } else {
+                    return self.fail(PmOwnedOrderLifecycleError::VenueBindingConflict);
+                }
+            }
             (PmOwnedSubmitState::Accepted, PmOwnedSubmitResult::Accepted(venue)) => {
+                if prior.venue_order == Some(venue) {
+                    PmOwnedSubmitApply::Duplicate
+                } else {
+                    return self.fail(PmOwnedOrderLifecycleError::VenueBindingConflict);
+                }
+            }
+            (PmOwnedSubmitState::Accepted, PmOwnedSubmitResult::AmbiguousOwned(venue)) => {
                 if prior.venue_order == Some(venue) {
                     PmOwnedSubmitApply::Duplicate
                 } else {
@@ -375,16 +398,36 @@ impl PmOwnedOrderLifecycle {
             (PmOwnedSubmitState::Pending, PmOwnedSubmitResult::Ambiguous) => {
                 Ok(PmOwnedSubmitApply::MarkedAmbiguous)
             }
+            (PmOwnedSubmitState::Pending, PmOwnedSubmitResult::AmbiguousOwned(venue)) => {
+                self.preflight_venue_binding(client_order, venue)?;
+                Ok(PmOwnedSubmitApply::MarkedAmbiguous)
+            }
             (PmOwnedSubmitState::Ambiguous, PmOwnedSubmitResult::Ambiguous)
             | (PmOwnedSubmitState::Rejected, PmOwnedSubmitResult::Rejected) => {
                 Ok(PmOwnedSubmitApply::Duplicate)
+            }
+            (PmOwnedSubmitState::Ambiguous, PmOwnedSubmitResult::AmbiguousOwned(venue))
+                if prior.venue_order == Some(venue) =>
+            {
+                Ok(PmOwnedSubmitApply::Duplicate)
+            }
+            (PmOwnedSubmitState::Ambiguous, PmOwnedSubmitResult::AmbiguousOwned(_)) => {
+                Err(PmOwnedOrderLifecycleError::VenueBindingConflict)
             }
             (PmOwnedSubmitState::Accepted, PmOwnedSubmitResult::Accepted(venue))
                 if prior.venue_order == Some(venue) =>
             {
                 Ok(PmOwnedSubmitApply::Duplicate)
             }
+            (PmOwnedSubmitState::Accepted, PmOwnedSubmitResult::AmbiguousOwned(venue))
+                if prior.venue_order == Some(venue) =>
+            {
+                Ok(PmOwnedSubmitApply::Duplicate)
+            }
             (PmOwnedSubmitState::Accepted, PmOwnedSubmitResult::Accepted(_)) => {
+                Err(PmOwnedOrderLifecycleError::VenueBindingConflict)
+            }
+            (PmOwnedSubmitState::Accepted, PmOwnedSubmitResult::AmbiguousOwned(_)) => {
                 Err(PmOwnedOrderLifecycleError::VenueBindingConflict)
             }
             (PmOwnedSubmitState::Accepted, _) => {
@@ -609,6 +652,14 @@ impl PmOwnedOrderLifecycle {
         }
         validate_terminal_progress(prior, observation.progress)?;
         let status = observation.progress.status();
+        if self.entries[index].submit == PmOwnedSubmitState::Ambiguous
+            && self.entries[index].venue_order.is_some()
+        {
+            // An exact remote row for the journal-bound deterministic ID is
+            // authoritative evidence that the ambiguous send became live.
+            self.entries[index].submit = PmOwnedSubmitState::Accepted;
+            self.counters.submit_accepts = self.counters.submit_accepts.saturating_add(1);
+        }
         let entry = &mut self.entries[index];
         entry.cumulative_filled = cumulative;
         entry.status = Some(status);
@@ -784,7 +835,9 @@ impl PmOwnedOrderLifecycle {
         if entry.is_terminal() {
             return Ok(PmOwnedCancelRequestApply::AlreadyTerminal);
         }
-        if entry.submit != PmOwnedSubmitState::Accepted {
+        if entry.submit != PmOwnedSubmitState::Accepted
+            && !(entry.submit == PmOwnedSubmitState::Ambiguous && entry.venue_order.is_some())
+        {
             return self.fail(PmOwnedOrderLifecycleError::CancelUnavailable);
         }
         let venue_order = entry
@@ -815,6 +868,7 @@ impl PmOwnedOrderLifecycle {
         intent: PmOwnedCancelIntent,
         outcome: PmOwnedCancelOutcome,
     ) -> Result<PmOwnedCancelApply, PmOwnedOrderLifecycleError> {
+        let expected = self.preflight_cancel_result(intent, outcome)?;
         let index = self
             .find_client(intent.client_order)
             .ok_or(PmOwnedOrderLifecycleError::UnknownClientOrder)?;
@@ -826,6 +880,7 @@ impl PmOwnedOrderLifecycle {
             && prior.cancel == PmOwnedCancelState::FilledRace
         {
             self.counters.cancel_results = self.counters.cancel_results.saturating_add(1);
+            debug_assert_eq!(expected, PmOwnedCancelApply::ConvergedFilled);
             return Ok(PmOwnedCancelApply::ConvergedFilled);
         }
         if !matches!(
@@ -833,12 +888,19 @@ impl PmOwnedOrderLifecycle {
             PmOwnedCancelState::Pending | PmOwnedCancelState::Ambiguous
         ) {
             if prior.is_terminal() {
+                debug_assert_eq!(expected, PmOwnedCancelApply::Duplicate);
                 return Ok(PmOwnedCancelApply::Duplicate);
             }
             return self.fail(PmOwnedOrderLifecycleError::CancelResultWithoutIntent);
         }
         let result = match outcome {
             PmOwnedCancelOutcome::Accepted => {
+                if prior.submit == PmOwnedSubmitState::Ambiguous && prior.venue_order.is_some() {
+                    // A conclusive response for the exact journal-bound
+                    // cancel target proves that the ambiguous place existed.
+                    self.entries[index].submit = PmOwnedSubmitState::Accepted;
+                    self.counters.submit_accepts = self.counters.submit_accepts.saturating_add(1);
+                }
                 if prior.status == Some(PmOrderStatus::Filled) {
                     self.entries[index].cancel = PmOwnedCancelState::FilledRace;
                     PmOwnedCancelApply::ConvergedFilled
@@ -878,8 +940,62 @@ impl PmOwnedOrderLifecycle {
                 }
             }
         };
+        debug_assert_eq!(result, expected);
         self.counters.cancel_results = self.counters.cancel_results.saturating_add(1);
         Ok(result)
+    }
+
+    pub(crate) fn preflight_cancel_result(
+        &self,
+        intent: PmOwnedCancelIntent,
+        outcome: PmOwnedCancelOutcome,
+    ) -> Result<PmOwnedCancelApply, PmOwnedOrderLifecycleError> {
+        let index = self
+            .find_client(intent.client_order)
+            .ok_or(PmOwnedOrderLifecycleError::UnknownClientOrder)?;
+        let prior = self.entries[index];
+        if prior.venue_order != Some(intent.venue_order) {
+            return Err(PmOwnedOrderLifecycleError::VenueBindingConflict);
+        }
+        if prior.status == Some(PmOrderStatus::Filled)
+            && prior.cancel == PmOwnedCancelState::FilledRace
+        {
+            return Ok(PmOwnedCancelApply::ConvergedFilled);
+        }
+        if !matches!(
+            prior.cancel,
+            PmOwnedCancelState::Pending | PmOwnedCancelState::Ambiguous
+        ) {
+            return if prior.is_terminal() {
+                Ok(PmOwnedCancelApply::Duplicate)
+            } else {
+                Err(PmOwnedOrderLifecycleError::CancelResultWithoutIntent)
+            };
+        }
+        Ok(match outcome {
+            PmOwnedCancelOutcome::Accepted => {
+                if prior.status == Some(PmOrderStatus::Filled) {
+                    PmOwnedCancelApply::ConvergedFilled
+                } else {
+                    PmOwnedCancelApply::Cancelled
+                }
+            }
+            PmOwnedCancelOutcome::Rejected => {
+                if prior.status == Some(PmOrderStatus::Filled) {
+                    PmOwnedCancelApply::ConvergedFilled
+                } else {
+                    PmOwnedCancelApply::Rejected
+                }
+            }
+            PmOwnedCancelOutcome::AlreadyFilled => PmOwnedCancelApply::Filled,
+            PmOwnedCancelOutcome::Ambiguous => {
+                if prior.status == Some(PmOrderStatus::Filled) {
+                    PmOwnedCancelApply::ConvergedFilled
+                } else {
+                    PmOwnedCancelApply::MarkedAmbiguous
+                }
+            }
+        })
     }
 
     pub fn compact_proven_terminal(
@@ -1193,6 +1309,14 @@ impl PmOwnedOrderLifecycle {
         let original = self.entries[order_index].intent.quantity().protocol_units();
         if cumulative > original {
             return self.fail(PmOwnedOrderLifecycleError::Overfill);
+        }
+        if self.entries[order_index].submit == PmOwnedSubmitState::Ambiguous
+            && self.entries[order_index].venue_order.is_some()
+        {
+            // An exact fill key can only match the pre-bound deterministic
+            // venue ID, so the fill itself proves that the send became live.
+            self.entries[order_index].submit = PmOwnedSubmitState::Accepted;
+            self.counters.submit_accepts = self.counters.submit_accepts.saturating_add(1);
         }
         let entry = &mut self.entries[order_index];
         entry.cumulative_filled = cumulative;

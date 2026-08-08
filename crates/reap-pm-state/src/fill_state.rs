@@ -195,6 +195,12 @@ pub enum PmFillStateError {
     CompletionSequenceMismatch,
     #[error("fill query does not continue from the exact prior opaque watermark")]
     CursorDiscontinuity,
+    #[error("recovered fill-query cursor belongs to another exact account scope")]
+    RecoveryCursorScopeMismatch,
+    #[error("recovered fill-query cursor was already initialized")]
+    RecoveryCursorAlreadyInitialized,
+    #[error("recovered fill-query cursor requires a fresh canonical fill state")]
+    RecoveryCursorStateNotFresh,
     #[error("complete fill query omits a locally observed pre-request fill")]
     CutDoesNotCoverObservedFill,
 }
@@ -273,6 +279,36 @@ impl PmFillState {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<PmFillKey>()),
             )
+    }
+
+    /// Seed equality continuity from one already checked durable journal cut.
+    ///
+    /// This initializer deliberately establishes no completeness, convergence,
+    /// or readiness authority. It is accepted exactly once on a fresh fill
+    /// owner so the first post-restart complete query must chain from the last
+    /// durable cursor rather than re-emitting it.
+    pub(crate) fn initialize_recovered_watermark(
+        &mut self,
+        cursor: PmFillQueryCursor,
+        config: &PmPrivateStateConfig,
+    ) -> Result<(), PmFillStateError> {
+        if cursor.account_scope() != config.account_scope() {
+            return Err(PmFillStateError::RecoveryCursorScopeMismatch);
+        }
+        if self.watermark.is_some() {
+            return Err(PmFillStateError::RecoveryCursorAlreadyInitialized);
+        }
+        if !self.entries.is_empty()
+            || !self.query_keys.is_empty()
+            || self.reconciliation_completion.is_some()
+            || self.observed_monotonic_ns.is_some()
+            || self.provisional != empty_deltas()
+            || self.counters != PmFillCounters::default()
+        {
+            return Err(PmFillStateError::RecoveryCursorStateNotFresh);
+        }
+        self.watermark = Some(cursor);
+        Ok(())
     }
 
     pub(crate) fn observe(
@@ -436,11 +472,13 @@ impl PmFillState {
                     entry.fee = fee_state(entry.event.execution().fee(), config);
                     entry.settlement = entry.event.execution().settlement();
                     entry.covered_by_reconciliation = Some(completion);
-                    entry.covered_fee = Some(entry.fee);
-                    entry.covered_settlement = Some(entry.settlement);
+                    entry.covered_fee = resolved_covered_fee(entry.fee);
+                    entry.covered_settlement = resolved_covered_settlement(entry.settlement);
                     entry.last_occurrence = completion_occurrence;
                 }
                 Err(index) => {
+                    let fee = fee_state(fill.execution().fee(), config);
+                    let settlement = fill.execution().settlement();
                     self.entries.insert(
                         index,
                         FillEntry {
@@ -448,10 +486,10 @@ impl PmFillState {
                             first_occurrence: request_occurrence,
                             last_occurrence: completion_occurrence,
                             covered_by_reconciliation: Some(completion),
-                            fee: fee_state(fill.execution().fee(), config),
-                            covered_fee: Some(fee_state(fill.execution().fee(), config)),
-                            settlement: fill.execution().settlement(),
-                            covered_settlement: Some(fill.execution().settlement()),
+                            fee,
+                            covered_fee: resolved_covered_fee(fee),
+                            settlement,
+                            covered_settlement: resolved_covered_settlement(settlement),
                         },
                     );
                 }
@@ -492,7 +530,9 @@ impl PmFillState {
                 .last_occurrence
                 .private_occurrence()
                 .is_none_or(|occurrence| occurrence <= through);
-            !(covered && no_later_private_fact)
+            let exact_facts_resolved =
+                !entry.fee_needs_reconciliation() && !entry.settlement_needs_reconciliation();
+            !(covered && no_later_private_fact && exact_facts_resolved)
         });
         prior - self.entries.len()
     }
@@ -664,6 +704,7 @@ impl PmFillState {
                     self.counters.failed_observations.saturating_add(1);
             }
             PmFillSettlementStatus::Matched
+            | PmFillSettlementStatus::MatchedNotBroadcasted
             | PmFillSettlementStatus::Mined
             | PmFillSettlementStatus::Confirmed => {}
         }
@@ -811,35 +852,54 @@ fn fee_state(fee: PmFillFee, config: &PmPrivateStateConfig) -> PmFillFeeState {
     }
 }
 
+const fn resolved_covered_fee(fee: PmFillFeeState) -> Option<PmFillFeeState> {
+    match fee {
+        PmFillFeeState::Known { .. } => Some(fee),
+        PmFillFeeState::Unknown
+        | PmFillFeeState::Incomplete
+        | PmFillFeeState::UnmappedAsset { .. } => None,
+    }
+}
+
+const fn resolved_covered_settlement(
+    settlement: PmFillSettlementStatus,
+) -> Option<PmFillSettlementStatus> {
+    match settlement {
+        PmFillSettlementStatus::Retrying | PmFillSettlementStatus::Failed => None,
+        PmFillSettlementStatus::MatchedNotBroadcasted
+        | PmFillSettlementStatus::Matched
+        | PmFillSettlementStatus::Mined
+        | PmFillSettlementStatus::Confirmed => Some(settlement),
+    }
+}
+
 pub(crate) fn settlement_transition(
     current: PmFillSettlementStatus,
     incoming: PmFillSettlementStatus,
 ) -> Result<Option<PmFillSettlementStatus>, PmFillStateError> {
-    use PmFillSettlementStatus::{Confirmed, Failed, Matched, Mined, Retrying};
-
-    match (current, incoming) {
-        (Matched, Matched)
-        | (Mined, Mined)
-        | (Confirmed, Confirmed)
-        | (Retrying, Retrying)
-        | (Failed, Failed) => Ok(None),
-        (Matched, Mined | Retrying)
-        | (Mined, Confirmed | Retrying)
-        | (Retrying, Mined | Failed) => Ok(Some(incoming)),
-        (Matched, Confirmed | Failed)
-        | (Mined, Matched | Failed)
-        | (Confirmed, Matched | Mined | Retrying | Failed)
-        | (Retrying, Matched | Confirmed)
-        | (Failed, Matched | Mined | Confirmed | Retrying) => Err(PmFillStateError::Conflict),
+    if current == incoming {
+        Ok(None)
+    } else if settlement_reachable(current, incoming) {
+        // Venue observations are snapshots, not a lossless transition log.
+        // Accept any forward state reachable through the exact lifecycle even
+        // when an intermediate observation (for example MINED) was not seen.
+        Ok(Some(incoming))
+    } else {
+        Err(PmFillStateError::Conflict)
     }
 }
 
 fn settlement_reachable(earlier: PmFillSettlementStatus, later: PmFillSettlementStatus) -> bool {
-    use PmFillSettlementStatus::{Confirmed, Failed, Matched, Mined, Retrying};
+    use PmFillSettlementStatus::{
+        Confirmed, Failed, Matched, MatchedNotBroadcasted, Mined, Retrying,
+    };
 
     matches!(
         (earlier, later),
-        (Matched, Matched | Mined | Confirmed | Retrying | Failed)
+        (
+            MatchedNotBroadcasted,
+            MatchedNotBroadcasted | Matched | Mined | Confirmed | Retrying | Failed
+        ) | (Matched, Matched | Mined | Confirmed | Retrying | Failed)
             | (Mined, Mined | Confirmed | Retrying | Failed)
             | (Retrying, Retrying | Mined | Confirmed | Failed)
             | (Confirmed, Confirmed)
@@ -1037,9 +1097,18 @@ mod tests {
 
     #[test]
     fn settlement_transition_graph_is_exact() {
-        use PmFillSettlementStatus::{Confirmed, Failed, Matched, Mined, Retrying};
+        use PmFillSettlementStatus::{
+            Confirmed, Failed, Matched, MatchedNotBroadcasted, Mined, Retrying,
+        };
 
-        let statuses = [Matched, Mined, Confirmed, Retrying, Failed];
+        let statuses = [
+            MatchedNotBroadcasted,
+            Matched,
+            Mined,
+            Confirmed,
+            Retrying,
+            Failed,
+        ];
         for current in statuses {
             for incoming in statuses {
                 let transition = settlement_transition(current, incoming);
@@ -1047,12 +1116,7 @@ mod tests {
                     assert_eq!(transition, Ok(None));
                     continue;
                 }
-                let allowed = matches!(
-                    (current, incoming),
-                    (Matched, Mined | Retrying)
-                        | (Mined, Confirmed | Retrying)
-                        | (Retrying, Mined | Failed)
-                );
+                let allowed = settlement_reachable(current, incoming);
                 if allowed {
                     assert_eq!(transition, Ok(Some(incoming)));
                 } else {

@@ -3,8 +3,9 @@ use reap_pm_core::{
     PmMetadataError, PmProductSource, SnapshotRevision,
 };
 use reap_polymarket_wire::{
-    PmBookParserConfig, PmClobMetadata, PmLifecycleMetadata, PmWireError, PmWireScope,
-    parse_clob_metadata, parse_lifecycle_metadata,
+    PmBookMarketBinding, PmBookParserConfig, PmClobMetadata, PmClobV2Metadata,
+    PmClobV2RequestScope, PmLifecycleMetadata, PmWireError, PmWireScope, parse_clob_metadata,
+    parse_lifecycle_metadata, parse_live_clob_market_lifecycle, parse_live_clob_v2_metadata,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -97,6 +98,48 @@ impl PmAuthoritativeMetadata {
         Self::join(instrument, source, expected, lifecycle, &clob, revision)
     }
 
+    /// Joins the two current public CLOB metadata sources without assigning
+    /// identity authority to fields they do not carry.
+    ///
+    /// `market_bytes` is the long `GET /markets/{condition}` response and
+    /// supplies lifecycle plus `question_id`. `clob_v2_bytes` is the
+    /// abbreviated `GET /clob-markets/{condition}` response and supplies
+    /// membership and exact trading numerics. The resulting book parser is
+    /// explicitly condition-bound because current `/book` and market-WS
+    /// frames carry the condition ID in their `market` field.
+    pub fn join_live_clob_v2_raw(
+        instrument: PmInstrumentHandle,
+        source: PmProductSource,
+        expected: PmMarketMetadata,
+        market_bytes: &[u8],
+        clob_v2_bytes: &[u8],
+        revision: PmMetadataRevisionInput,
+    ) -> Result<Self, PmMetadataJoinError> {
+        let scope = PmWireScope::new(
+            expected.condition(),
+            expected.market(),
+            expected.outcome().token(),
+        );
+        let lifecycle = parse_live_clob_market_lifecycle(market_bytes, scope)
+            .map_err(PmMetadataJoinError::Wire)?;
+        let clob = parse_live_clob_v2_metadata(
+            clob_v2_bytes,
+            PmClobV2RequestScope::new(expected.condition(), expected.outcome().token()),
+        )
+        .map_err(PmMetadataJoinError::Wire)?;
+        validate_live_wire_join(expected, lifecycle, &clob)?;
+        validate_goal_f_domain(expected)?;
+        Ok(Self {
+            projection: build_projection(
+                instrument,
+                source,
+                expected,
+                revision,
+                PmBookMarketBinding::ConditionId,
+            )?,
+        })
+    }
+
     fn join(
         instrument: PmInstrumentHandle,
         source: PmProductSource,
@@ -108,7 +151,13 @@ impl PmAuthoritativeMetadata {
         validate_wire_join(expected, lifecycle, clob)?;
         validate_goal_f_domain(expected)?;
         Ok(Self {
-            projection: build_projection(instrument, source, expected, revision)?,
+            projection: build_projection(
+                instrument,
+                source,
+                expected,
+                revision,
+                PmBookMarketBinding::LegacyMarketId,
+            )?,
         })
     }
 
@@ -136,15 +185,24 @@ impl PmAuthoritativeMetadata {
     pub const fn monotonic_receive_ns(&self) -> u64 {
         self.projection.monotonic_receive_ns
     }
+
+    #[must_use]
+    pub const fn uses_condition_bound_books(&self) -> bool {
+        matches!(
+            self.projection.parser_config.market_binding(),
+            PmBookMarketBinding::ConditionId
+        )
+    }
 }
 
 impl PmRecordedMetadataEvidence {
     /// Verifies and reconstructs authority from a recorded capture header.
     ///
     /// This path is exclusively for offline capture verification and replay.
-    /// Live observation must use [`PmAuthoritativeMetadata::join_raw`] with
-    /// freshly received lifecycle and CLOB bytes. The recorded path revalidates the complete typed
-    /// contract and both claimed fingerprints; it never treats persisted
+    /// Live observation must use [`PmAuthoritativeMetadata::join_raw`] or
+    /// [`PmAuthoritativeMetadata::join_live_clob_v2_raw`] with freshly received
+    /// lifecycle and CLOB bytes. The recorded path revalidates the complete
+    /// typed contract and both claimed fingerprints; it never treats persisted
     /// fingerprint bytes as authority by themselves.
     pub fn verify(
         instrument: PmInstrumentHandle,
@@ -154,9 +212,51 @@ impl PmRecordedMetadataEvidence {
         claimed_metadata_fingerprint: [u8; 32],
         claimed_domain_fingerprint: [u8; 32],
     ) -> Result<Self, PmMetadataJoinError> {
+        Self::verify_with_market_binding(
+            instrument,
+            source,
+            recorded,
+            revision,
+            claimed_metadata_fingerprint,
+            claimed_domain_fingerprint,
+            PmBookMarketBinding::LegacyMarketId,
+        )
+    }
+
+    /// Reconstructs offline evidence for captures whose public book frames use
+    /// the current CLOB condition ID in their `market` field.
+    pub fn verify_live_clob_v2(
+        instrument: PmInstrumentHandle,
+        source: PmProductSource,
+        recorded: PmMarketMetadata,
+        revision: PmMetadataRevisionInput,
+        claimed_metadata_fingerprint: [u8; 32],
+        claimed_domain_fingerprint: [u8; 32],
+    ) -> Result<Self, PmMetadataJoinError> {
+        Self::verify_with_market_binding(
+            instrument,
+            source,
+            recorded,
+            revision,
+            claimed_metadata_fingerprint,
+            claimed_domain_fingerprint,
+            PmBookMarketBinding::ConditionId,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_with_market_binding(
+        instrument: PmInstrumentHandle,
+        source: PmProductSource,
+        recorded: PmMarketMetadata,
+        revision: PmMetadataRevisionInput,
+        claimed_metadata_fingerprint: [u8; 32],
+        claimed_domain_fingerprint: [u8; 32],
+        market_binding: PmBookMarketBinding,
+    ) -> Result<Self, PmMetadataJoinError> {
         validate_ready_lifecycle(recorded.lifecycle())?;
         validate_goal_f_domain(recorded)?;
-        let projection = build_projection(instrument, source, recorded, revision)?;
+        let projection = build_projection(instrument, source, recorded, revision, market_binding)?;
         if projection.metadata_fingerprint != claimed_metadata_fingerprint {
             return Err(PmMetadataJoinError::MetadataFingerprintMismatch);
         }
@@ -190,6 +290,14 @@ impl PmRecordedMetadataEvidence {
     pub const fn monotonic_receive_ns(&self) -> u64 {
         self.projection.monotonic_receive_ns
     }
+
+    #[must_use]
+    pub const fn uses_condition_bound_books(&self) -> bool {
+        matches!(
+            self.projection.parser_config.market_binding(),
+            PmBookMarketBinding::ConditionId
+        )
+    }
 }
 
 fn build_projection(
@@ -197,19 +305,29 @@ fn build_projection(
     source: PmProductSource,
     expected: PmMarketMetadata,
     revision: PmMetadataRevisionInput,
+    market_binding: PmBookMarketBinding,
 ) -> Result<PmMetadataProjection, PmMetadataJoinError> {
     let event = PmMarketEvent::new(source, instrument, revision.revision(), expected)
         .map_err(PmMetadataJoinError::Event)?;
-    let parser_config = PmBookParserConfig::new(
-        PmWireScope::new(
-            expected.condition(),
-            expected.market(),
-            expected.outcome().token(),
-        ),
-        expected.tick(),
-        expected.minimum_order_size(),
-        expected.negative_risk(),
+    let scope = PmWireScope::new(
+        expected.condition(),
+        expected.market(),
+        expected.outcome().token(),
     );
+    let parser_config = match market_binding {
+        PmBookMarketBinding::LegacyMarketId => PmBookParserConfig::new(
+            scope,
+            expected.tick(),
+            expected.minimum_order_size(),
+            expected.negative_risk(),
+        ),
+        PmBookMarketBinding::ConditionId => PmBookParserConfig::new_condition_bound(
+            scope,
+            expected.tick(),
+            expected.minimum_order_size(),
+            expected.negative_risk(),
+        ),
+    };
     Ok(PmMetadataProjection {
         event,
         parser_config,
@@ -287,6 +405,59 @@ fn validate_wire_join(
     }
     if clob.market() != expected.market() {
         return Err(PmMetadataJoinError::ClobMarketMismatch);
+    }
+    if clob.configured_outcome() != expected.outcome() {
+        return Err(PmMetadataJoinError::OutcomeMismatch);
+    }
+
+    let observed = lifecycle.lifecycle();
+    if !observed.active() {
+        return Err(PmMetadataJoinError::Inactive);
+    }
+    if observed.closed() {
+        return Err(PmMetadataJoinError::Closed);
+    }
+    if observed.archived() {
+        return Err(PmMetadataJoinError::Archived);
+    }
+    if !observed.accepting_orders() {
+        return Err(PmMetadataJoinError::NotAcceptingOrders);
+    }
+    if !observed.order_book_enabled() {
+        return Err(PmMetadataJoinError::OrderBookDisabled);
+    }
+    if observed != expected.lifecycle() {
+        return Err(PmMetadataJoinError::LifecycleDrift);
+    }
+    if clob.tick() != expected.tick() {
+        return Err(PmMetadataJoinError::TickDrift);
+    }
+    if clob.minimum_order_size() != expected.minimum_order_size() {
+        return Err(PmMetadataJoinError::MinimumDrift);
+    }
+    if clob.negative_risk() != expected.negative_risk() {
+        return Err(PmMetadataJoinError::NegativeRiskDrift);
+    }
+    Ok(())
+}
+
+fn validate_live_wire_join(
+    expected: PmMarketMetadata,
+    lifecycle: PmLifecycleMetadata,
+    clob: &PmClobV2Metadata,
+) -> Result<(), PmMetadataJoinError> {
+    if lifecycle.condition() != expected.condition() {
+        return Err(PmMetadataJoinError::LifecycleConditionMismatch);
+    }
+    if lifecycle.market() != expected.market() {
+        return Err(PmMetadataJoinError::LifecycleMarketMismatch);
+    }
+    if clob.requested_condition() != expected.condition()
+        || clob
+            .reported_condition()
+            .is_some_and(|condition| condition != expected.condition())
+    {
+        return Err(PmMetadataJoinError::ClobConditionMismatch);
     }
     if clob.configured_outcome() != expected.outcome() {
         return Err(PmMetadataJoinError::OutcomeMismatch);

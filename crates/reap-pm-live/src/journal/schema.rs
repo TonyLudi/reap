@@ -12,6 +12,12 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+mod authenticated;
+pub use authenticated::{
+    PmJournalAuthenticatedCancelResultV1, PmJournalAuthenticatedClassificationV1,
+    PmJournalAuthenticatedPlaceResultV1, PmJournalAuthenticatedResultV1,
+};
+
 pub const PM_MUTATION_JOURNAL_FAMILY: &str = "reap-pm-mutation-journal";
 pub const PM_MUTATION_JOURNAL_VERSION: u16 = 1;
 pub const MAX_PM_JOURNAL_LINE_BYTES: usize = 64 * 1_024;
@@ -451,6 +457,8 @@ pub enum PmJournalFillSettlementV1 {
     Confirmed,
     Retrying,
     Failed,
+    // Append-only: existing V1 spellings/tags above must remain stable.
+    MatchedNotBroadcasted,
 }
 
 impl From<PmFillSettlementStatus> for PmJournalFillSettlementV1 {
@@ -461,6 +469,7 @@ impl From<PmFillSettlementStatus> for PmJournalFillSettlementV1 {
             PmFillSettlementStatus::Confirmed => Self::Confirmed,
             PmFillSettlementStatus::Retrying => Self::Retrying,
             PmFillSettlementStatus::Failed => Self::Failed,
+            PmFillSettlementStatus::MatchedNotBroadcasted => Self::MatchedNotBroadcasted,
         }
     }
 }
@@ -473,6 +482,7 @@ impl From<PmJournalFillSettlementV1> for PmFillSettlementStatus {
             PmJournalFillSettlementV1::Confirmed => Self::Confirmed,
             PmJournalFillSettlementV1::Retrying => Self::Retrying,
             PmJournalFillSettlementV1::Failed => Self::Failed,
+            PmJournalFillSettlementV1::MatchedNotBroadcasted => Self::MatchedNotBroadcasted,
         }
     }
 }
@@ -654,6 +664,8 @@ pub enum PmJournalPlaceRejectReasonV1 {
     FixtureRejected,
     PostOnlyWouldTake,
     AuthorityInvalidatedBeforeDispatch,
+    AuthenticatedVenueRejected,
+    AuthenticatedDefinitelyNotDispatched,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -721,6 +733,8 @@ pub enum PmJournalCancelOutcomeV1 {
 #[serde(rename_all = "snake_case")]
 pub enum PmJournalCancelRejectReasonV1 {
     FixtureRejected,
+    AuthenticatedVenueRejected,
+    AuthenticatedDefinitelyNotDispatched,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -926,6 +940,7 @@ pub enum PmJournalRecordV1 {
     OrderTerminal(PmJournalOrderTerminalV1),
     SafetyHalt(PmJournalSafetyHaltV1),
     FillWatermarkAdvanced(PmJournalFillWatermarkV1),
+    AuthenticatedResult(PmJournalAuthenticatedResultV1),
 }
 
 impl PmJournalRecordV1 {
@@ -983,6 +998,7 @@ impl PmJournalRecordV1 {
                 return Err(PmJournalSchemaError::RecordOutsideScope);
             }
             Self::SafetyHalt(_) | Self::FillWatermarkAdvanced(_) => {}
+            Self::AuthenticatedResult(result) => result.validate(scope)?,
         }
         Ok(())
     }
@@ -1151,6 +1167,12 @@ pub enum PmJournalSchemaError {
     InvalidPlaceResult,
     #[error("PM journal cancel-result rejection reason contradicts its outcome")]
     InvalidCancelResult,
+    #[error("PM journal authenticated result has an invalid sequence chain")]
+    InvalidAuthenticatedSequence,
+    #[error("PM journal authenticated result contradicts its canonical result")]
+    InvalidAuthenticatedResult,
+    #[error("PM journal authenticated result carries a malformed exact order identity")]
+    InvalidAuthenticatedOrderIdentity,
     #[error("PM journal fill source occurrence is incomplete or contradictory")]
     InvalidFillOccurrence,
     #[error("PM journal fill progress is invalid")]
@@ -1202,6 +1224,28 @@ mod tests {
     use reap_pm_core::{PmFillId, PmVenueOrderId, PmVenueOrderKey};
 
     use super::*;
+
+    #[test]
+    fn fill_settlement_v1_is_append_only_and_preserves_existing_spellings() {
+        let existing = [
+            (PmJournalFillSettlementV1::Matched, "\"matched\""),
+            (PmJournalFillSettlementV1::Mined, "\"mined\""),
+            (PmJournalFillSettlementV1::Confirmed, "\"confirmed\""),
+            (PmJournalFillSettlementV1::Retrying, "\"retrying\""),
+            (PmJournalFillSettlementV1::Failed, "\"failed\""),
+        ];
+        for (status, expected) in existing {
+            assert_eq!(serde_json::to_string(&status).unwrap(), expected);
+        }
+        assert_eq!(
+            serde_json::to_string(&PmJournalFillSettlementV1::MatchedNotBroadcasted).unwrap(),
+            "\"matched_not_broadcasted\""
+        );
+        assert_eq!(
+            PmFillSettlementStatus::from(PmJournalFillSettlementV1::MatchedNotBroadcasted),
+            PmFillSettlementStatus::MatchedNotBroadcasted
+        );
+    }
 
     fn fill_key(scope: &PmJournalScopeV1, ordinal: usize) -> PmJournalFillKeyV1 {
         let venue_order = PmVenueOrderKey::new(

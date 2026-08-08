@@ -1,0 +1,11 @@
+error[E0451]: fields `scope`, `market_bytes` and `clob_v2_bytes` of struct `PmLiveMetadataPair` are private
+ --> tests/ui/metadata_pair_cannot_be_forged.rs:6:9
+  |
+5 |     let _ = PmLiveMetadataPair {
+  |             ------------------ in this type
+6 |         scope,
+  |         ^^^^^ private field
+7 |         market_bytes: b"{}",
+  |         ^^^^^^^^^^^^ private field
+8 |         clob_v2_bytes: b"{}",
+  |         ^^^^^^^^^^^^^ private field

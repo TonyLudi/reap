@@ -148,6 +148,7 @@ impl PmRefreshObligationMetrics {
 #[derive(Clone, Copy)]
 struct RetainedRefresh {
     ticket: PmRefreshTicket,
+    effect_kind: PmRefreshEffectKind,
     admitted_at_ns: u64,
 }
 
@@ -207,6 +208,7 @@ impl PmRefreshObligations {
     fn retain(
         &mut self,
         ticket: PmRefreshTicket,
+        effect_kind: PmRefreshEffectKind,
         admitted_at_ns: u64,
     ) -> Result<(), PmCoordinatorError> {
         self.ensure_can_retain(ticket)?;
@@ -225,6 +227,7 @@ impl PmRefreshObligations {
             .ok_or(PmCoordinatorError::RefreshRetentionSaturated)?;
         *slot = Some(RetainedRefresh {
             ticket,
+            effect_kind,
             admitted_at_ns,
         });
         self.len += 1;
@@ -258,6 +261,14 @@ impl PmRefreshObligations {
             .iter()
             .flatten()
             .any(|retained| retained.ticket == ticket)
+    }
+
+    fn effect_kind_at(&self, index: usize) -> Option<PmRefreshEffectKind> {
+        self.tickets
+            .get(index)
+            .copied()
+            .flatten()
+            .map(|retained| retained.effect_kind)
     }
 
     fn remove(&mut self, ticket: PmRefreshTicket) -> bool {
@@ -406,7 +417,11 @@ impl Phase6RefreshAllocationProbe {
         ticket: PmRefreshTicket,
         admitted_at_ns: u64,
     ) -> Result<(), PmCoordinatorError> {
-        self.obligations.retain(ticket, admitted_at_ns)
+        self.obligations.retain(
+            ticket,
+            PmRefreshEffectKind::CompleteReconciliation,
+            admitted_at_ns,
+        )
     }
 
     pub(crate) const fn len(&self) -> usize {
@@ -464,16 +479,13 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         effects: &mut PmProductEffectBatch,
     ) -> Result<bool, PmCoordinatorError> {
         self.refresh_obligations.ensure_can_retain(ticket)?;
+        let effect_kind = self.refresh_effect_kind(ticket.key().reason())?;
         match self.mutation.mark_refresh_admitted(ticket)? {
             PmRefreshAdmission::Admitted(admitted) if admitted == ticket => {
                 self.refresh_obligations
-                    .retain(ticket, monotonic_service_ns)?;
+                    .retain(ticket, effect_kind, monotonic_service_ns)?;
                 effects.push(PmProductEffect::ReconciliationRefresh(
-                    PmRefreshEffect::new(
-                        self.account_scope,
-                        self.instrument,
-                        PmRefreshEffectKind::CompleteReconciliation,
-                    ),
+                    PmRefreshEffect::new(self.account_scope, self.instrument, effect_kind),
                 ))?;
                 self.refresh_obligations
                     .record_effect(ticket.key().reason());
@@ -491,6 +503,22 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
             | PmRefreshAdmission::AlreadyInFlight(_)
             | PmRefreshAdmission::NotRequired(_)
             | PmRefreshAdmission::Stale(_) => Err(PmCoordinatorError::RefreshAdmissionMismatch),
+        }
+    }
+
+    fn refresh_effect_kind(
+        &self,
+        reason: PmRefreshReason,
+    ) -> Result<PmRefreshEffectKind, PmCoordinatorError> {
+        match reason {
+            PmRefreshReason::AmbiguousOrder => Ok(PmRefreshEffectKind::OpenOrders),
+            PmRefreshReason::MissingOrderDetail => {
+                Ok(self.mutation.next_missing_order_detail().map_or(
+                    PmRefreshEffectKind::CompleteReconciliation,
+                    PmRefreshEffectKind::OrderDetail,
+                ))
+            }
+            _ => Ok(PmRefreshEffectKind::CompleteReconciliation),
         }
     }
 
@@ -548,13 +576,13 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         let Some(index) = expired else {
             return Ok(false);
         };
+        let effect_kind = self
+            .refresh_obligations
+            .effect_kind_at(index)
+            .ok_or(PmCoordinatorError::RefreshAdmissionMismatch)?;
         let mut effects = PmProductEffectBatch::new();
         effects.push(PmProductEffect::ReconciliationRefresh(
-            PmRefreshEffect::new(
-                self.account_scope,
-                self.instrument,
-                PmRefreshEffectKind::CompleteReconciliation,
-            ),
+            PmRefreshEffect::new(self.account_scope, self.instrument, effect_kind),
         ))?;
         self.publish_effect_batch(effects)?;
         self.refresh_obligations

@@ -59,6 +59,7 @@ fn place_command_binds_exact_identity_and_the_only_outer_profile() {
     assert_eq!(command.account_scope(), support::account_scope());
     assert_eq!(command.instrument(), support::instrument());
     assert_eq!(command.instrument_id(), support::instrument_id());
+    assert_eq!(command.trading_domain(), support::trading_domain());
     assert_eq!(command.client_order(), client_order(role.account()));
     assert_eq!(command.side(), PmOrderSide::Buy);
     assert_eq!(command.price(), PmPrice::parse_decimal("0.40").unwrap());

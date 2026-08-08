@@ -8,6 +8,11 @@ async fn full_persistence_storage_releases_reserved_quote_effect_before_journal(
             .persistence
             .push(PmPendingPersistence::Fact {
                 receipt: PmPendingJournalRecord::phase6_pending_for_age_evidence(),
+                failure_identity: PmGoalFWriterFailureIdentity::Fact {
+                    kind: PmDurableRecordKind::SafetyHalt,
+                    client_order: None,
+                    correlation: 1,
+                },
                 compaction: None,
                 enqueued_monotonic_ns: u64::try_from(attempt).unwrap(),
             })
@@ -125,6 +130,7 @@ async fn assert_prepared_quote_is_invalidated_without_dispatch(case: FinalDispat
     assert_eq!(consequence.client_order(), Some(client));
     assert!(matches!(
         owner.execute_next_quote(
+            &fixture_executor(&config),
             PmFakePlaceScript::acknowledged(
                 venue_order(&config, "must-not-dispatch"),
                 Box::new([])

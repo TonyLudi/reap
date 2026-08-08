@@ -1,9 +1,11 @@
 use reap_pm_core::{PmAccountScope, PmClientOrderKey, PmOrderSide, PmPrice, PmQuantity};
-use reap_polymarket_adapter::{PmFakePlaceCommand, PmFixtureInstrumentScope, PmGtcPostOnlyProfile};
+use reap_polymarket_adapter::{
+    PmFixtureInstrumentScope, PmGtcPostOnlyPlaceRequest, PmGtcPostOnlyProfile,
+};
 use reap_polymarket_wire::PmUnsignedClobV2Order;
 
 fn main() {
-    let _ = PmFakePlaceCommand {
+    let _ = PmGtcPostOnlyPlaceRequest {
         account_scope: todo::<PmAccountScope>(),
         instrument_scope: todo::<PmFixtureInstrumentScope>(),
         client_order: todo::<PmClientOrderKey>(),

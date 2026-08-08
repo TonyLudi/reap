@@ -15,3 +15,21 @@ error[E0599]: no method named `okx_account` found for reference `&PmProduct<M>` 
   |
 6 |     let _ = product.okx_account();
   |                     ^^^^^^^^^^^ method not found in `&PmProduct<M>`
+
+error[E0599]: no method named `okx_algo` found for reference `&PmProduct<M>` in the current scope
+ --> tests/ui/product_has_no_okx_private_or_order.rs:7:21
+  |
+7 |     let _ = product.okx_algo();
+  |                     ^^^^^^^^ method not found in `&PmProduct<M>`
+
+error[E0599]: no method named `okx_spread` found for reference `&PmProduct<M>` in the current scope
+ --> tests/ui/product_has_no_okx_private_or_order.rs:8:21
+  |
+8 |     let _ = product.okx_spread();
+  |                     ^^^^^^^^^^ method not found in `&PmProduct<M>`
+
+error[E0599]: no method named `okx_execution` found for reference `&PmProduct<M>` in the current scope
+ --> tests/ui/product_has_no_okx_private_or_order.rs:9:21
+  |
+9 |     let _ = product.okx_execution();
+  |                     ^^^^^^^^^^^^^ method not found in `&PmProduct<M>`

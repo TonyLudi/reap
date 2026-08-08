@@ -359,6 +359,10 @@ impl PmAccountState {
         self.monotonic_service_ns
     }
 
+    pub(crate) fn invalidate_freshness(&mut self) {
+        self.monotonic_service_ns = None;
+    }
+
     pub(crate) const fn collateral(&self) -> PmObservedAmount {
         self.collateral
     }

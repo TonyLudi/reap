@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/ui/bare_user_frame_has_no_private_ingress.rs:9:54
+  |
+9 |     let _ = role.receive_live_user_frame(occurrence, frame);
+  |                  -----------------------             ^^^^^ expected `CredentialOwnedUserFrame`, found `PmLiveUserFrame`
+  |                  |
+  |                  arguments to this method are incorrect
+  |
+note: method defined here
+ --> src/private_fixture.rs
+  |
+  |     pub fn receive_live_user_frame(
+  |            ^^^^^^^^^^^^^^^^^^^^^^^

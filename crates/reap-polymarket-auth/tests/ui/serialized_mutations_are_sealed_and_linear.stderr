@@ -1,0 +1,43 @@
+error[E0616]: field `body` of struct `SerializedPlaceRequest` is private
+  --> tests/ui/serialized_mutations_are_sealed_and_linear.rs:11:10
+   |
+11 |     body.body[0] ^= 1;
+   |          ^^^^ private field
+
+error[E0616]: field `body` of struct `SerializedOwnedCancelRequest` is private
+  --> tests/ui/serialized_mutations_are_sealed_and_linear.rs:28:10
+   |
+28 |     body.body[0] ^= 1;
+   |          ^^^^ private field
+
+error[E0382]: use of moved value: `body`
+  --> tests/ui/serialized_mutations_are_sealed_and_linear.rs:20:61
+   |
+17 |     body: SerializedPlaceRequest,
+   |     ---- move occurs because `body` has type `SerializedPlaceRequest`, which does not implement the `Copy` trait
+18 | ) {
+19 |     let _first = credentials.authenticate_place(timestamp, body);
+   |                                                            ---- value moved here
+20 |     let _second = credentials.authenticate_place(timestamp, body);
+   |                                                             ^^^^ value used here after move
+
+error[E0382]: use of moved value: `body`
+  --> tests/ui/serialized_mutations_are_sealed_and_linear.rs:37:68
+   |
+34 |     body: SerializedOwnedCancelRequest,
+   |     ---- move occurs because `body` has type `SerializedOwnedCancelRequest`, which does not implement the `Copy` trait
+35 | ) {
+36 |     let _first = credentials.authenticate_owned_cancel(timestamp, body);
+   |                                                                   ---- value moved here
+37 |     let _second = credentials.authenticate_owned_cancel(timestamp, body);
+   |                                                                    ^^^^ value used here after move
+
+error[E0382]: use of moved value: `signed`
+  --> tests/ui/serialized_mutations_are_sealed_and_linear.rs:42:55
+   |
+40 | fn reserialize_place(credentials: &L2Credentials, signed: SignedClobV2Order) {
+   |                                                   ------ move occurs because `signed` has type `SignedClobV2Order`, which does not implement the `Copy` trait
+41 |     let _first = credentials.serialize_gtc_post_only(signed);
+   |                                                      ------ value moved here
+42 |     let _second = credentials.serialize_gtc_post_only(signed);
+   |                                                       ^^^^^^ value used here after move

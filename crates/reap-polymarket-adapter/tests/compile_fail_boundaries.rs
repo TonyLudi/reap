@@ -10,4 +10,5 @@ fn role_boundaries_are_enforced_by_the_type_system() {
     tests.compile_fail("tests/ui/external_role_implementations_are_sealed.rs");
     tests.compile_fail("tests/ui/fake_place_command_fields_are_private.rs");
     tests.compile_fail("tests/ui/fake_commands_are_move_only.rs");
+    tests.compile_fail("tests/ui/bare_user_frame_has_no_private_ingress.rs");
 }

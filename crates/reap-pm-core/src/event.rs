@@ -643,6 +643,14 @@ pub enum PmFillSettlementStatus {
     Confirmed,
     Retrying,
     Failed,
+    /// Orders matched, but no settlement transaction has been broadcast yet.
+    ///
+    /// This is distinct from `Matched`: both contribute provisional inventory,
+    /// and—like `Matched`/`Mined`—this status does not remain a standalone
+    /// readiness blocker after an authoritative reconciliation covers it.
+    /// Appended to preserve the pre-existing variant order for downstream
+    /// encodings that assign stable tags explicitly.
+    MatchedNotBroadcasted,
 }
 
 /// A fee is never collapsed to zero when the venue response is absent or

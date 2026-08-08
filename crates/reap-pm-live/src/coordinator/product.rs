@@ -18,18 +18,20 @@ use reap_pm_core::{
     PmOrderSide, PmPrice, PmProductSource, SnapshotRevision, U256,
 };
 use reap_pm_live_contracts::PmConnectivityConfig;
-use reap_pm_state::{PmExactReservation, PmOwnedSubmitState};
+#[cfg(any(test, feature = "loopback-evidence"))]
+use reap_pm_state::PmOwnedCancelIntent;
+use reap_pm_state::{PmExactReservation, PmOwnedSubmitState, PmRefreshReason};
 use reap_pm_strategy::{
     PmQuoteModel, PmQuoteModelError, PmQuoteModelInput, PmQuotePolicyError,
     PmValidatedQuoteCandidate, validate_passive_quote_candidate,
 };
 use thiserror::Error;
 
-use super::effect_queue::PmFakeEffectMetrics;
+use super::effect_queue::{PmEffectDispatchMetrics, PmFakeEffectMetrics};
 use super::effects::{
-    MAX_PM_EFFECTS_PER_INPUT, PmCancelIntentReason, PmDurableRecordEffect, PmDurableRecordKind,
-    PmEffectCapacityError, PmFailClosedEffect, PmFakeCancelEffect, PmFakeEffectStage,
-    PmFakeQuoteEffect, PmHealthMetricEffect, PmHealthMetricKind, PmProductEffect,
+    MAX_PM_EFFECTS_PER_INPUT, PmCancelDispatchEffect, PmCancelIntentReason, PmDurableRecordEffect,
+    PmDurableRecordKind, PmEffectCapacityError, PmEffectDispatchStage, PmFailClosedEffect,
+    PmHealthMetricEffect, PmHealthMetricKind, PmPlaceDispatchEffect, PmProductEffect,
     PmProductEffectBatch, PmProductEffectMetrics, PmProductEffectOutput, PmRefreshEffect,
     PmRefreshEffectKind,
 };
@@ -43,6 +45,11 @@ use super::mutation::{
 };
 use super::persistence::{PmPersistenceError, PmPersistenceIntentIdentity, PmPersistenceMetrics};
 use super::{PmAuthorityError, PmAuthorityRevisions};
+#[cfg(any(test, feature = "loopback-evidence"))]
+use super::{
+    PmLiveCancelCompletion, PmLivePlaceCompletion, PmPreparedCancelDispatch,
+    PmPreparedPlaceDispatch,
+};
 use crate::journal::PmJournalCancelReasonV1;
 use crate::lanes::{
     PmCompleteIngress, PmCompleteInputLanes, PmCompleteServiced, PmCriticalInput,
@@ -69,6 +76,8 @@ pub(crate) use overload_evidence::PmTelemetryOverloadState;
 #[cfg(test)]
 pub(crate) use refresh_obligations::Phase6RefreshAllocationProbe;
 pub use refresh_obligations::PmRefreshObligationMetrics;
+#[cfg(any(test, feature = "loopback-evidence"))]
+pub(crate) use start::PmCoordinatorAssemblyError;
 pub(crate) use start::{PmCoordinatorShutdownError, PmCoordinatorStartError};
 
 /// Explicit freshness and authority lifetime policy. There are no permissive
@@ -566,9 +575,9 @@ const fn market_is_tradable(metadata: PmMarketMetadata) -> bool {
 enum CopiedEffectCorrelation {
     Quote {
         intent: u64,
-        effect: PmFakeQuoteEffect,
+        effect: PmPlaceDispatchEffect,
     },
-    Cancel(PmFakeCancelEffect),
+    Cancel(PmCancelDispatchEffect),
 }
 
 #[derive(Debug)]
@@ -619,7 +628,7 @@ impl CorrelationRing {
     fn remove_quote(
         &mut self,
         client_order: PmClientOrderKey,
-    ) -> Result<PmFakeQuoteEffect, PmCoordinatorError> {
+    ) -> Result<PmPlaceDispatchEffect, PmCoordinatorError> {
         match self.remove_matching(|value| {
             matches!(
                 value,
@@ -636,7 +645,7 @@ impl CorrelationRing {
         &mut self,
         client_order: PmClientOrderKey,
         venue_order: reap_pm_core::PmVenueOrderKey,
-    ) -> Result<PmFakeCancelEffect, PmCoordinatorError> {
+    ) -> Result<PmCancelDispatchEffect, PmCoordinatorError> {
         match self.remove_matching(|value| {
             matches!(
                 value,
@@ -833,8 +842,12 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         self.mutation.persistence_metrics()
     }
 
+    pub(crate) fn effect_dispatch_metrics(&self) -> PmEffectDispatchMetrics {
+        self.mutation.effect_dispatch_metrics()
+    }
+
     pub(crate) fn fake_effect_metrics(&self) -> PmFakeEffectMetrics {
-        self.mutation.fake_effect_metrics()
+        self.effect_dispatch_metrics()
     }
 
     pub(crate) const fn product_effect_metrics(&self) -> PmProductEffectMetrics {
@@ -854,6 +867,16 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
     #[cfg(test)]
     pub(crate) fn tracked_quote_slots_for_test(&self) -> usize {
         self.tracked_quotes.iter().flatten().count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn project_recovery_reconciliation_gate_for_test(&mut self) {
+        self.mutation.require_authenticated_reconciliation();
+        self.reconciliation_gate = matches!(
+            self.mutation.halt(),
+            Some(PmMutationHalt::RecoveryReconciliationRequired)
+        );
+        self.reconciliation_recovered = false;
     }
 
     fn transitive_reserved_capacity_bytes(&self) -> usize {
@@ -1020,14 +1043,14 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
                 intent_id,
                 client_order,
             } => {
-                let projection = PmFakeQuoteEffect::new(
+                let projection = PmPlaceDispatchEffect::new(
                     self.account_scope,
                     self.instrument,
                     client_order,
                     candidate.side(),
                     candidate.price(),
                     candidate.quantity(),
-                    PmFakeEffectStage::PreparedAfterDurability,
+                    PmEffectDispatchStage::PreparedAfterDurability,
                 );
                 self.pending_correlations
                     .push(CopiedEffectCorrelation::Quote {
@@ -1098,6 +1121,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
     fn record_persistence_service(
         &mut self,
         service: PmPersistenceService,
+        monotonic_service_ns: u64,
         effects: &mut PmProductEffectBatch,
     ) -> Result<(), PmCoordinatorError> {
         match service {
@@ -1119,7 +1143,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
                         effect: projection,
                     })?;
                 self.mark_tracked_prepared(projection.client_order());
-                effects.push(PmProductEffect::FakePassiveQuote(projection))?;
+                effects.push(PmProductEffect::PlaceGtcPostOnly(projection))?;
                 self.counters.fake_quote_effects =
                     self.counters.fake_quote_effects.saturating_add(1);
                 push_metric(effects, PmHealthMetricKind::PersistenceAcknowledged, 1)
@@ -1131,7 +1155,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
                 };
                 self.prepared_correlations
                     .push(CopiedEffectCorrelation::Cancel(projection))?;
-                effects.push(PmProductEffect::FakeCancelOwned(projection))?;
+                effects.push(PmProductEffect::CancelOwned(projection))?;
                 self.counters.fake_cancel_effects =
                     self.counters.fake_cancel_effects.saturating_add(1);
                 push_metric(effects, PmHealthMetricKind::PersistenceAcknowledged, 1)
@@ -1149,6 +1173,52 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
                 PmHealthMetricKind::PersistenceAcknowledged,
                 sequence,
             ),
+            PmPersistenceService::LivePlaceApplied { client_order } => {
+                let prepared = self.prepared_correlations.remove_quote(client_order)?;
+                self.advance_private_readiness_revision()?;
+                effects.push(PmProductEffect::PlaceGtcPostOnly(
+                    PmPlaceDispatchEffect::new(
+                        prepared.account_scope(),
+                        prepared.instrument(),
+                        prepared.client_order(),
+                        prepared.side(),
+                        prepared.price(),
+                        prepared.quantity(),
+                        PmEffectDispatchStage::CompletedByBackend,
+                    ),
+                ))?;
+                self.refresh_tracked_quote(prepared.client_order());
+                self.counters.fake_quote_effects =
+                    self.counters.fake_quote_effects.saturating_add(1);
+                push_metric(effects, PmHealthMetricKind::EffectDispatchCompleted, 1)
+            }
+            PmPersistenceService::LiveCancelApplied {
+                client_order,
+                venue_order,
+            } => {
+                let prepared = self
+                    .prepared_correlations
+                    .remove_cancel(client_order, venue_order)?;
+                self.advance_private_readiness_revision()?;
+                effects.push(PmProductEffect::CancelOwned(PmCancelDispatchEffect::new(
+                    prepared.account_scope(),
+                    prepared.instrument(),
+                    prepared.client_order(),
+                    prepared.venue_order(),
+                    PmEffectDispatchStage::CompletedByBackend,
+                )))?;
+                if self.mutation.has_missing_order_detail() {
+                    let _refresh = self.admit_refresh_reason(
+                        PmRefreshReason::MissingOrderDetail,
+                        monotonic_service_ns,
+                        effects,
+                    )?;
+                }
+                self.refresh_tracked_quote(prepared.client_order());
+                self.counters.fake_cancel_effects =
+                    self.counters.fake_cancel_effects.saturating_add(1);
+                push_metric(effects, PmHealthMetricKind::EffectDispatchCompleted, 1)
+            }
             PmPersistenceService::IntentFailed { identity } => {
                 let failed = self.pending_correlations.remove_identity(identity)?;
                 if let CopiedEffectCorrelation::Quote { effect, .. } = failed {
@@ -1164,7 +1234,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
                 ))?;
                 Ok(())
             }
-            PmPersistenceService::FactFailed => {
+            PmPersistenceService::FactFailed | PmPersistenceService::LiveBridgeFailed { .. } => {
                 self.latch_halt(PmControlReason::PersistenceUnavailable);
                 effects.push(PmProductEffect::FailClosedHaltOrCancel(
                     PmFailClosedEffect::halt(
@@ -1374,5 +1444,7 @@ impl PmCoordinatorError {
 
 #[cfg(test)]
 mod control_tests;
+#[cfg(test)]
+mod live_ingress_tests;
 #[cfg(test)]
 mod tests;

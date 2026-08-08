@@ -39,7 +39,7 @@ use super::super::mutation::{
     PmQuoteMutationAdmission, PmQuoteMutationRequest,
 };
 use crate::coordinator::PmAuthorityRevisions;
-use crate::fake_effect::PmFakeEffectRole;
+use crate::fake_effect::{PmFakeEffectRole, PmFixtureEffectExecutor};
 use crate::journal::{
     PmJournalFillOccurrenceV1, PmJournalFillSourceV1, PmJournalOrderProgressSourceV1,
     PmJournalRecoveredObservationV1, PmJournalScopeV1, PmJournalTerminalStatusV1,
@@ -165,12 +165,21 @@ async fn start_owner(config: &PmConnectivityConfig, journal_path: &Path) -> PmMu
         account.instrument(),
         account.instrument_id(),
     );
-    let (owner, recovery) =
+    let (owner, recovery, _fake_executor) =
         PmMutationOwner::start(config, Box::new(private), fake, journal_path.to_path_buf())
             .await
             .unwrap();
     assert_eq!(recovery.record_count(), 0);
     owner
+}
+
+fn fixture_executor(config: &PmConnectivityConfig) -> PmFixtureEffectExecutor {
+    let account = config.account();
+    PmFixtureEffectExecutor::new(
+        account.account_scope(),
+        account.instrument(),
+        account.instrument_id(),
+    )
 }
 
 #[test]
@@ -437,6 +446,24 @@ fn fill_event(
     fill_id: &str,
     quantity: &str,
 ) -> PmFillEvent {
+    fill_event_with_fee(
+        config,
+        client_order,
+        venue_order,
+        fill_id,
+        quantity,
+        PmFillFee::Unknown,
+    )
+}
+
+fn fill_event_with_fee(
+    config: &PmConnectivityConfig,
+    client_order: Option<PmClientOrderKey>,
+    venue_order: PmVenueOrderKey,
+    fill_id: &str,
+    quantity: &str,
+    fee: PmFillFee,
+) -> PmFillEvent {
     let source = config.account().account_route().source();
     PmFillEvent::new(
         source,
@@ -449,7 +476,7 @@ fn fill_event(
             PmFillSettlementStatus::Matched,
             PmPrice::parse_decimal("0.40").unwrap(),
             PmQuantity::parse_decimal(quantity).unwrap(),
-            PmFillFee::Unknown,
+            fee,
         ),
     )
     .unwrap()
@@ -515,6 +542,7 @@ async fn place_quote(
     wait_for_prepared_quote(owner, 121).await;
     owner
         .execute_next_quote(
+            &fixture_executor(config),
             PmFakePlaceScript::acknowledged(venue, immediate_fills).unwrap(),
             122,
         )
@@ -556,6 +584,9 @@ async fn drain_persistence(owner: &mut PmMutationOwner, monotonic_ns: u64) {
             PmPersistenceService::FactAcknowledged { .. } | PmPersistenceService::Empty => {}
             PmPersistenceService::IntentFailed { .. }
             | PmPersistenceService::FactFailed
+            | PmPersistenceService::LivePlaceApplied { .. }
+            | PmPersistenceService::LiveCancelApplied { .. }
+            | PmPersistenceService::LiveBridgeFailed { .. }
             | PmPersistenceService::PreparedQuote { .. }
             | PmPersistenceService::PreparedCancel { .. }
             | PmPersistenceService::QuoteInvalidated { .. } => {
@@ -663,7 +694,17 @@ async fn rest_unique_and_duplicate_dispositions_have_exact_fill_and_watermark_co
     drain_persistence(&mut owner, 123).await;
     let compactions_before = owner.counters().fill_watermark_compactions();
     let compacted_fills_before = owner.counters().canonical_fill_rows_compacted();
-    let fill = fill_event(&config, None, venue, "rest-fill", "0.25");
+    let fill = fill_event_with_fee(
+        &config,
+        None,
+        venue,
+        "rest-fill",
+        "0.25",
+        PmFillFee::Known {
+            asset: config.account().collateral_asset(),
+            delta: reap_pm_core::PmSignedUnits::ZERO,
+        },
+    );
 
     let (account, fills) = reconciliation_pair(
         &config,
@@ -947,7 +988,7 @@ async fn assert_restarted_history(
         account.instrument(),
         account.instrument_id(),
     );
-    let (mut restarted, recovery) =
+    let (mut restarted, recovery, _fake_executor) =
         PmMutationOwner::start(config, Box::new(private), fake, path.to_path_buf())
             .await
             .unwrap();
@@ -1077,7 +1118,7 @@ async fn assert_partial_expired_restart(
         account.instrument(),
         account.instrument_id(),
     );
-    let (mut restarted, recovery) =
+    let (mut restarted, recovery, _fake_executor) =
         PmMutationOwner::start(config, Box::new(private), fake, path.to_path_buf())
             .await
             .unwrap();
@@ -1201,7 +1242,7 @@ async fn assert_cancelled_fill_race_restart(
         account.instrument(),
         account.instrument_id(),
     );
-    let (mut restarted, recovery) =
+    let (mut restarted, recovery, _fake_executor) =
         PmMutationOwner::start(config, Box::new(private), fake, path.to_path_buf())
             .await
             .unwrap();

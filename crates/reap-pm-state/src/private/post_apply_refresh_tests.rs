@@ -7,13 +7,14 @@ use reap_pm_core::{
     PmOutcomeMetadata, PmPositionAvailability, PmPositionEvent, PmPrice, PmProductSource,
     PmQuantity, PmReconciliationRequestBoundary, PmSignerId, PmSnapshotEvidence, PmSourceHandle,
     PmSpenderDomain, PmSpenderRequirement, PmTick, PmTokenHandle, PmTokenId, PmVenueOrderId,
-    SnapshotRevision, U256,
+    PmVenueOrderKey, SnapshotRevision, U256,
 };
 
 use crate::{
     PmCardinalityRiskLimits, PmExactReservation, PmExposureRiskLimits, PmFreshnessRiskLimits,
-    PmOrderRiskLimits, PmOwnedIntentId, PmOwnedQuoteIntent, PmOwnedQuoteSlotKey,
-    PmOwnedSubmitApply, PmOwnedSubmitResult, PmPrivateReadinessReason,
+    PmOrderRiskLimits, PmOwnedCancelRequestApply, PmOwnedIntentId, PmOwnedQuoteIntent,
+    PmOwnedQuoteSlotKey, PmOwnedSubmitApply, PmOwnedSubmitResult, PmOwnedSubmitState,
+    PmPrivateReadinessReason,
 };
 
 fn address(byte: u8) -> EvmAddress {
@@ -227,12 +228,26 @@ fn admitted_private_reconnect(state: &mut PmPrivateState) -> PmRefreshTicket {
     let ticket = state
         .pending_refreshes()
         .find(|ticket| ticket.key().reason() == PmRefreshReason::PrivateReconnect)
-        .expect("reconnect creates one canonical refresh ticket");
+        .expect("reconnect creates the complete-reconciliation ticket");
     assert_eq!(
         state.mark_refresh_admitted(ticket).unwrap(),
         PmRefreshAdmission::Admitted(ticket)
     );
     ticket
+}
+
+#[test]
+fn reconnect_requires_both_account_trades_and_a_complete_open_order_cut() {
+    let mut state = state();
+    state.observe_reconnect(ConnectionEpoch::new(1), 1).unwrap();
+
+    let reasons = state
+        .pending_refreshes()
+        .map(|ticket| ticket.key().reason())
+        .collect::<Vec<_>>();
+    assert!(reasons.contains(&PmRefreshReason::PrivateReconnect));
+    assert!(reasons.contains(&PmRefreshReason::AmbiguousOrder));
+    assert_eq!(reasons.len(), 2);
 }
 
 #[test]
@@ -322,13 +337,73 @@ fn saturated_refresh_retains_ambiguous_submit_and_latches_coarse_reconciliation(
 }
 
 #[test]
+fn journal_bound_ambiguity_binds_the_canonical_order_store_as_proven_owned() {
+    let mut state = state();
+    let intent = quote_intent();
+    let client = intent.client_order();
+    let venue = PmVenueOrderKey::new(
+        account(),
+        PmVenueOrderId::new("0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
+            .unwrap(),
+    );
+    state.admit_owned_quote(intent).unwrap();
+
+    assert_eq!(
+        state
+            .apply_owned_submit_result(client, PmOwnedSubmitResult::AmbiguousOwned(venue))
+            .unwrap(),
+        PmOwnedSubmitApply::MarkedAmbiguous
+    );
+    let canonical = state
+        .orders()
+        .find(|order| order.identity().venue_order_key() == Some(venue))
+        .expect("journal-bound venue identity is present in the canonical order store");
+    assert_eq!(canonical.ownership(), PmOrderOwnership::ProvenOwned);
+    let owned = state.owned_order(client).expect("owned lifecycle row");
+    assert_eq!(owned.submit(), PmOwnedSubmitState::Ambiguous);
+    assert_eq!(owned.venue_order(), Some(venue));
+    assert!(owned.reconciliation_required());
+    assert!(matches!(
+        state.request_owned_cancel(client).unwrap(),
+        PmOwnedCancelRequestApply::Issued(intent) if intent.venue_order() == venue
+    ));
+}
+
+#[test]
+fn saturated_refresh_cannot_leave_failed_account_dependency_fresh() {
+    let mut state = state();
+    state.observe_reconnect(ConnectionEpoch::new(1), 1).unwrap();
+    let config = state.config.clone();
+    let (account, fills) = unavailable_account_reconciliation(&config);
+    state.apply_reconciliation(account, fills).unwrap();
+    assert!(state.account.observed_monotonic_ns().is_some());
+    state.phase6_fill_refresh_capacity();
+    let before_faults = state.external_ingress_counters().total();
+
+    let required = state
+        .invalidate_external_dependency(
+            PmPrivateDependency::AccountSnapshot,
+            PmPrivateExternalIngressFault::new(
+                crate::PmPrivateExternalIngressLane::AccountSnapshot,
+                crate::PmPrivateExternalIngressFailure::Service,
+            ),
+        )
+        .unwrap();
+
+    assert!(matches!(required, PmRefreshRequired::Saturated { .. }));
+    assert_eq!(state.account.observed_monotonic_ns(), None);
+    assert_eq!(state.external_ingress_counters().total(), before_faults + 1);
+    assert!(state.full_reconcile_required());
+}
+
+#[test]
 fn converged_reconciliation_preserves_post_cut_account_requirement_saturation() {
     let mut state = state();
     state.observe_reconnect(ConnectionEpoch::new(1), 1).unwrap();
     state.phase6_fill_refresh_capacity();
     assert!(matches!(
         state
-            .require_refresh(PmRefreshReason::AmbiguousOrder)
+            .require_refresh(PmRefreshReason::UnmanagedOrder)
             .unwrap(),
         PmRefreshRequired::Saturated { .. }
     ));
@@ -367,6 +442,19 @@ fn saturated_refresh_retains_applied_ambiguous_order_detail_fact() {
     let mut state = state();
     let epoch = ConnectionEpoch::new(1);
     state.observe_reconnect(epoch, 1).unwrap();
+    let reconnect_orders = state
+        .pending_refreshes()
+        .find(|ticket| ticket.key().reason() == PmRefreshReason::AmbiguousOrder)
+        .expect("reconnect requires an authoritative open-orders cut");
+    assert_eq!(
+        state.mark_refresh_admitted(reconnect_orders).unwrap(),
+        PmRefreshAdmission::Admitted(reconnect_orders)
+    );
+    assert_eq!(
+        state.complete_refresh(reconnect_orders).unwrap(),
+        PmRefreshCompletion::Cleared(reconnect_orders),
+        "the fixture isolates the later detail-created ambiguity from reconnect recovery"
+    );
     let intent = quote_intent();
     let client = intent.client_order();
     state.admit_owned_quote(intent).unwrap();

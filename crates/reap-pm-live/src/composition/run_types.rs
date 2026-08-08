@@ -1,5 +1,63 @@
 use super::*;
 
+/// One reconnect transition released by the capture owner only after the
+/// retirement and reconnect-scheduled evidence are durable and the public
+/// session has committed the identical previewed transition.
+///
+/// There is no public constructor: transport cannot choose an epoch, attempt,
+/// reset, or delay independently of the canonical session.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PmPublicReconnectAuthorization {
+    transition: reap_polymarket_adapter::PmPublicReconnectTransition,
+}
+
+impl PmPublicReconnectAuthorization {
+    pub(super) const fn new(
+        transition: reap_polymarket_adapter::PmPublicReconnectTransition,
+    ) -> Self {
+        Self { transition }
+    }
+
+    #[must_use]
+    pub const fn retired_epoch(&self) -> reap_pm_core::ConnectionEpoch {
+        self.transition.retired_epoch()
+    }
+
+    #[must_use]
+    pub const fn replacement_epoch(&self) -> reap_pm_core::ConnectionEpoch {
+        self.transition.replacement_epoch()
+    }
+
+    #[must_use]
+    pub const fn reconnect_attempt(&self) -> u8 {
+        self.transition.reconnect_attempt()
+    }
+
+    #[must_use]
+    pub const fn delay(&self) -> std::time::Duration {
+        self.transition.delay()
+    }
+
+    #[must_use]
+    pub const fn reset_after_flow_open(&self) -> bool {
+        self.transition.reset_after_flow_open()
+    }
+
+    /// Converts the durable session transition into the exact typed command
+    /// understood by the raw public WebSocket transport.
+    #[must_use]
+    pub const fn into_transport_directive(
+        self,
+    ) -> reap_polymarket_live_adapter::PmPublicWsReconnectDirective {
+        reap_polymarket_live_adapter::PmPublicWsReconnectDirective::reconnect(
+            self.retired_epoch(),
+            self.replacement_epoch(),
+            self.reconnect_attempt(),
+            self.delay(),
+        )
+    }
+}
+
 /// Complete active-Run reason that the PM book cannot currently authorize a
 /// quote.
 ///

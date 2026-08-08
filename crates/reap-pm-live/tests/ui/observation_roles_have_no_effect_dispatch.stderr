@@ -1,0 +1,23 @@
+error[E0599]: no method named `dispatch_place` found for mutable reference `&mut PmPublicRole` in the current scope
+ --> tests/ui/observation_roles_have_no_effect_dispatch.rs:8:10
+  |
+8 |     role.dispatch_place(dispatch);
+  |          ^^^^^^^^^^^^^^ method not found in `&mut PmPublicRole`
+
+error[E0599]: no method named `dispatch_cancel` found for mutable reference `&mut PmFixturePrivateLifecycle` in the current scope
+  --> tests/ui/observation_roles_have_no_effect_dispatch.rs:15:10
+   |
+15 |     role.dispatch_cancel(dispatch);
+   |          ^^^^^^^^^^^^^^^ method not found in `&mut PmFixturePrivateLifecycle`
+
+error[E0599]: no method named `dispatch_place` found for mutable reference `&mut PmFixtureReconciliation` in the current scope
+  --> tests/ui/observation_roles_have_no_effect_dispatch.rs:22:10
+   |
+22 |     role.dispatch_place(dispatch);
+   |          ^^^^^^^^^^^^^^ method not found in `&mut PmFixtureReconciliation`
+
+error[E0599]: no method named `dispatch_cancel` found for mutable reference `&mut PmFixtureAccountPositionSnapshot` in the current scope
+  --> tests/ui/observation_roles_have_no_effect_dispatch.rs:29:10
+   |
+29 |     role.dispatch_cancel(dispatch);
+   |          ^^^^^^^^^^^^^^^ method not found in `&mut PmFixtureAccountPositionSnapshot`

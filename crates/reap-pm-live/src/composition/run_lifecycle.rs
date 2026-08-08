@@ -158,7 +158,7 @@ impl PmPublicCaptureRun {
     pub(super) async fn record_pm_reconnect_scheduled_session(
         &mut self,
         monotonic_ns: u64,
-    ) -> Result<Duration, PmPublicCaptureRunError> {
+    ) -> Result<PmPublicReconnectAuthorization, PmPublicCaptureRunError> {
         self.ensure_active()?;
         if !self.pm_lifecycle.accepts_reconnect()
             || self.pm_disconnected_epoch != Some(self.roles.pm_epoch())
@@ -173,13 +173,16 @@ impl PmPublicCaptureRun {
                 pending,
             });
         }
-        let (prior_epoch, next_epoch, delay) = match self.roles.preview_pm_failure() {
-            Ok(schedule) => schedule,
+        let transition = match self.roles.preview_pm_failure() {
+            Ok(transition) => transition,
             Err(source) => {
                 self.terminalize_plain(PmPublicCaptureTerminalCause::Lifecycle);
                 return Err(source.into());
             }
         };
+        let prior_epoch = transition.retired_epoch().value();
+        let next_epoch = transition.replacement_epoch().value();
+        let delay = transition.delay();
         let delay_ns = match u64::try_from(delay.as_nanos()) {
             Ok(delay_ns) => delay_ns,
             Err(_) => {
@@ -218,13 +221,13 @@ impl PmPublicCaptureRun {
                 return Err(source.into());
             }
         };
-        if applied != (prior_epoch, next_epoch, delay) {
+        if applied != transition {
             self.terminalize_plain(PmPublicCaptureTerminalCause::InternalInvariant);
             return Err(PmPublicCaptureRunError::ReconnectTransitionMismatch);
         }
         self.pm_disconnected_epoch = None;
         self.pm_lifecycle = PublicLifecyclePhase::AwaitingConnection;
-        Ok(delay)
+        Ok(PmPublicReconnectAuthorization::new(applied))
     }
 
     pub async fn record_okx_reconnect_scheduled(

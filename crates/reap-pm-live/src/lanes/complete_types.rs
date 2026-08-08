@@ -10,8 +10,12 @@ use reap_polymarket_adapter::{
 use reap_transport::{DeliveryClockError, ImmutableDelivery};
 use thiserror::Error;
 
+#[cfg(any(test, feature = "loopback-evidence"))]
+use crate::coordinator::{PmLiveCancelCompletion, PmLivePlaceCompletion};
 use crate::coordinator::{PmPendingFakeCancelResult, PmPersistencePoll};
-use crate::private_monitor::PmFixturePairedReconciliationDelivery;
+#[cfg(any(test, feature = "loopback-evidence"))]
+use crate::private_monitor::PmLiveHttpDependencyFailure;
+use crate::private_monitor::PmPairedReconciliationDelivery;
 
 use super::{PmLaneKind, PmServiceSourceKind};
 
@@ -219,12 +223,20 @@ impl PmScopedHalt {
 }
 
 /// Reached critical inputs in their frozen within-lane order.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the fixed-capacity critical lane uses one bounded box for the largest live-place completion while retaining exact cancel authority inline"
+)]
 #[derive(Debug)]
 pub(crate) enum PmCriticalInput {
     Stop(PmStopControl),
     ScopedHalt(PmScopedHalt),
     FakeCancelResult(PmPendingFakeCancelResult),
     FakePlaceResult(PmFakePlaceResult),
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    LiveCancelResult(PmLiveCancelCompletion),
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    LivePlaceResult(Box<PmLivePlaceCompletion>),
 }
 
 impl PmCriticalInput {
@@ -242,6 +254,10 @@ impl PmCriticalInput {
             Self::ScopedHalt(_) => 1,
             Self::FakeCancelResult(_) => 2,
             Self::FakePlaceResult(_) => 3,
+            #[cfg(any(test, feature = "loopback-evidence"))]
+            Self::LiveCancelResult(_) => 4,
+            #[cfg(any(test, feature = "loopback-evidence"))]
+            Self::LivePlaceResult(_) => 5,
         }
     }
 }
@@ -256,10 +272,13 @@ pub(crate) struct PmPersistenceInput {
 impl PmPersistenceInput {
     pub(crate) fn from_poll(poll: PmPersistencePoll) -> Result<Self, PmPersistenceCarrierError> {
         let variant_rank = match poll {
-            PmPersistencePoll::IntentFailed { .. } | PmPersistencePoll::FactFailed { .. } => 0,
+            PmPersistencePoll::IntentFailed { .. }
+            | PmPersistencePoll::FactFailed { .. }
+            | PmPersistencePoll::LiveBridgeFailed { .. } => 0,
             PmPersistencePoll::QuoteAcknowledged { .. }
             | PmPersistencePoll::CancelAcknowledged { .. }
-            | PmPersistencePoll::FactAcknowledged { .. } => 1,
+            | PmPersistencePoll::FactAcknowledged { .. }
+            | PmPersistencePoll::LiveBridgeAcknowledged { .. } => 1,
             PmPersistencePoll::Empty => return Err(PmPersistenceCarrierError::Empty),
             PmPersistencePoll::Pending => return Err(PmPersistenceCarrierError::Pending),
         };
@@ -290,16 +309,16 @@ pub(crate) enum PmPersistenceCarrierError {
 pub(crate) enum PmPrivateInput {
     ConnectionAvailable,
     ConnectionUnavailable(PmPrivateExternalIngressFault),
-    /// One owner-bound, normalized fixture batch. It occupies the earliest
+    /// One owner-bound, normalized private batch. It occupies the earliest
     /// private lifecycle rank because a single upstream frame may atomically
     /// contain both fills/trades and order progress.
-    FixtureBatch(PmFixturePrivateDelivery),
+    Batch(PmFixturePrivateDelivery),
 }
 
 impl PmPrivateInput {
-    pub(crate) fn fixture_ingress(&self) -> Option<PmCompleteIngress> {
+    pub(crate) fn ingress(&self) -> Option<PmCompleteIngress> {
         match self {
-            Self::FixtureBatch(delivery) => Some(PmCompleteIngress::product(
+            Self::Batch(delivery) => Some(PmCompleteIngress::product(
                 delivery.source(),
                 delivery.connection(),
                 delivery.ordering(),
@@ -312,7 +331,7 @@ impl PmPrivateInput {
     pub(crate) const fn variant_rank(&self) -> u8 {
         match self {
             Self::ConnectionAvailable | Self::ConnectionUnavailable(_) => 0,
-            Self::FixtureBatch(_) => 1,
+            Self::Batch(_) => 1,
         }
     }
 }
@@ -324,60 +343,74 @@ impl PmPrivateInput {
 /// of those three frozen component ranks, and is never split into partial
 /// state-bearing messages.
 #[allow(
-    clippy::enum_variant_names,
-    reason = "the suffix records that every reached reconciliation carrier is fixture-only"
-)]
-#[allow(
     clippy::large_enum_variant,
     reason = "owner-bound reconciliation deliveries remain inline because owner-loop admission must allocate zero heap bytes"
 )]
 #[derive(Debug)]
 pub(crate) enum PmReconciliationInput {
-    OpenOrdersFixture(PmCompleteOpenOrdersDelivery),
-    OrderDetailFixture(PmExactOrderDetailDelivery),
+    /// One purpose-bound authenticated HTTP failure. It invalidates the
+    /// matching dependency and requires a later complete reconciliation; it
+    /// never impersonates a complete snapshot.
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    DependencyUnavailable(PmLiveHttpDependencyFailure),
+    OpenOrders(PmCompleteOpenOrdersDelivery),
+    OrderDetail(PmExactOrderDetailDelivery),
     /// The two exact role-owner-bound halves cannot be queued or serviced
     /// independently.
-    PairedFixture(PmFixturePairedReconciliationDelivery),
-    /// A complete account-only fixture refresh.
-    StandaloneAccountFixture(PmCompleteAccountSnapshotDelivery),
+    Paired(PmPairedReconciliationDelivery),
+    /// A complete account-only refresh.
+    StandaloneAccount(PmCompleteAccountSnapshotDelivery),
 }
 
 impl PmReconciliationInput {
-    pub(crate) const fn variant_rank(&self) -> u8 {
+    pub(crate) fn variant_rank(&self) -> u8 {
         match self {
-            Self::OpenOrdersFixture(_) => 0,
-            Self::OrderDetailFixture(_) => 1,
-            Self::PairedFixture(_) => 2,
-            Self::StandaloneAccountFixture(_) => 3,
+            #[cfg(any(test, feature = "loopback-evidence"))]
+            Self::DependencyUnavailable(failure) => match failure.fault().lane() {
+                reap_pm_state::PmPrivateExternalIngressLane::OpenOrders => 0,
+                reap_pm_state::PmPrivateExternalIngressLane::OrderDetail => 1,
+                reap_pm_state::PmPrivateExternalIngressLane::Reconciliation => 2,
+                reap_pm_state::PmPrivateExternalIngressLane::AccountSnapshot => 3,
+                reap_pm_state::PmPrivateExternalIngressLane::Reconnect
+                | reap_pm_state::PmPrivateExternalIngressLane::PrivateLifecycle => {
+                    unreachable!("HTTP failure lanes are purpose-bound at issuance")
+                }
+            },
+            Self::OpenOrders(_) => 0,
+            Self::OrderDetail(_) => 1,
+            Self::Paired(_) => 2,
+            Self::StandaloneAccount(_) => 3,
         }
     }
 
-    pub(crate) fn fixture_ingress(&self) -> PmCompleteIngress {
+    pub(crate) fn ingress(&self) -> Option<PmCompleteIngress> {
         match self {
-            Self::OpenOrdersFixture(delivery) => PmCompleteIngress::product(
+            #[cfg(any(test, feature = "loopback-evidence"))]
+            Self::DependencyUnavailable(_) => None,
+            Self::OpenOrders(delivery) => Some(PmCompleteIngress::product(
                 delivery.source(),
                 delivery.connection(),
                 delivery.ordering(),
                 delivery.received_clock(),
-            ),
-            Self::OrderDetailFixture(delivery) => PmCompleteIngress::product(
+            )),
+            Self::OrderDetail(delivery) => Some(PmCompleteIngress::product(
                 delivery.source(),
                 delivery.connection(),
                 delivery.ordering(),
                 delivery.received_clock(),
-            ),
-            Self::PairedFixture(delivery) => PmCompleteIngress::product(
+            )),
+            Self::Paired(delivery) => Some(PmCompleteIngress::product(
                 delivery.source(),
                 delivery.connection(),
                 delivery.ordering(),
                 delivery.received_clock(),
-            ),
-            Self::StandaloneAccountFixture(delivery) => PmCompleteIngress::product(
+            )),
+            Self::StandaloneAccount(delivery) => Some(PmCompleteIngress::product(
                 delivery.source(),
                 delivery.connection(),
                 delivery.ordering(),
                 delivery.received_clock(),
-            ),
+            )),
         }
     }
 }

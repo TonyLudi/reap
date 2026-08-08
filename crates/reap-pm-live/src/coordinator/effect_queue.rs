@@ -8,17 +8,21 @@ use reap_pm_state::PmOwnedCancelIntent;
 
 use super::{PmAuthorityRevisions, PreparedPmCancel, PreparedPmQuote};
 
-pub(crate) const PM_FAKE_EFFECT_CAPACITY: usize = 256;
-pub(crate) const PM_FAKE_EFFECT_MAX_AGE_NS: u64 = 250_000_000;
+pub(crate) const PM_MUTATION_DISPATCH_CAPACITY: usize = 256;
+pub(crate) const PM_MUTATION_DISPATCH_MAX_AGE_NS: u64 = 250_000_000;
 
-/// One exact prepared fake mutation waiting for deterministic owner-loop
-/// service.
+// Compatibility names retained only for the frozen Goal-F unit-test surface.
+#[cfg(test)]
+pub(crate) const PM_FAKE_EFFECT_CAPACITY: usize = PM_MUTATION_DISPATCH_CAPACITY;
+
+/// One exact prepared backend-neutral mutation waiting for deterministic
+/// owner-loop service.
 ///
 /// Prepared authority remains move-only. The queue never exposes a command or
-/// transport object; service can only move the value into the crate-private
-/// fake execution role.
+/// transport object; service can move the value only into the statically
+/// composed fixture executor or authenticated worker.
 #[derive(Debug)]
-pub(crate) enum PmPreparedFakeEffect {
+pub(crate) enum PmPreparedMutation {
     Quote {
         authority: PreparedPmQuote,
     },
@@ -28,34 +32,34 @@ pub(crate) enum PmPreparedFakeEffect {
     },
     #[cfg(test)]
     Synthetic {
-        kind: PmPreparedFakeEffectKind,
+        kind: PmPreparedMutationKind,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PmPreparedFakeEffectKind {
+pub(crate) enum PmPreparedMutationKind {
     Quote,
     Cancel,
 }
 
-impl PmPreparedFakeEffect {
-    pub(crate) const fn kind(&self) -> PmPreparedFakeEffectKind {
+impl PmPreparedMutation {
+    pub(crate) const fn kind(&self) -> PmPreparedMutationKind {
         match self {
-            Self::Quote { .. } => PmPreparedFakeEffectKind::Quote,
-            Self::Cancel { .. } => PmPreparedFakeEffectKind::Cancel,
+            Self::Quote { .. } => PmPreparedMutationKind::Quote,
+            Self::Cancel { .. } => PmPreparedMutationKind::Cancel,
             #[cfg(test)]
             Self::Synthetic { kind } => *kind,
         }
     }
 
     #[cfg(test)]
-    const fn synthetic(kind: PmPreparedFakeEffectKind) -> Self {
+    const fn synthetic(kind: PmPreparedMutationKind) -> Self {
         Self::Synthetic { kind }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct PmFakeEffectQueueMetrics {
+pub(crate) struct PmMutationDispatchQueueMetrics {
     reservations: u64,
     released_before_journal: u64,
     committed_after_durability: u64,
@@ -74,7 +78,7 @@ pub(crate) struct PmFakeEffectQueueMetrics {
     maximum_observed_age_ns: u64,
 }
 
-impl PmFakeEffectQueueMetrics {
+impl PmMutationDispatchQueueMetrics {
     pub(crate) const fn reservations(self) -> u64 {
         self.reservations
     }
@@ -140,12 +144,12 @@ impl PmFakeEffectQueueMetrics {
     }
 }
 
-/// Copied observation of the bounded fixture-effect authority queue.
+/// Copied observation of the bounded backend-neutral dispatch authority queue.
 ///
 /// Counts expose queue pressure and fail-closed retention without exposing a
 /// prepared command, permit, or mutation authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PmFakeEffectMetrics {
+pub struct PmEffectDispatchMetrics {
     capacity: usize,
     depth: usize,
     queued: usize,
@@ -170,7 +174,7 @@ pub struct PmFakeEffectMetrics {
     maximum_observed_age_ns: u64,
 }
 
-impl PmFakeEffectMetrics {
+impl PmEffectDispatchMetrics {
     #[must_use]
     pub const fn capacity(self) -> usize {
         self.capacity
@@ -289,55 +293,57 @@ impl PmFakeEffectMetrics {
 /// durable acknowledgement, or explicitly retained fail-closed after the
 /// accepted record lost its acknowledgement.
 #[derive(Debug)]
-pub(crate) struct PmFakeEffectPermit {
+pub(crate) struct PmMutationDispatchPermit {
     owner: u64,
     ordinal: u64,
 }
 
 #[derive(Debug)]
-pub(crate) struct PmFakeEffectQueue {
+pub(crate) struct PmMutationDispatchQueue {
     owner: u64,
     next_ordinal: u64,
     reserved: Vec<u64>,
-    queued: VecDeque<PmQueuedFakeEffect>,
-    blocked: VecDeque<PmQueuedFakeEffect>,
-    metrics: PmFakeEffectQueueMetrics,
+    queued: VecDeque<PmQueuedMutation>,
+    blocked: VecDeque<PmQueuedMutation>,
+    metrics: PmMutationDispatchQueueMetrics,
     quote_suppressed: bool,
 }
 
-impl PmFakeEffectQueue {
-    pub(crate) fn new() -> Result<Self, PmFakeEffectQueueError> {
+impl PmMutationDispatchQueue {
+    pub(crate) fn new() -> Result<Self, PmMutationDispatchQueueError> {
         static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
         let owner = NEXT_OWNER
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
-            .map_err(|_| PmFakeEffectQueueError::OwnerIdentityExhausted)?;
+            .map_err(|_| PmMutationDispatchQueueError::OwnerIdentityExhausted)?;
         Ok(Self {
             owner,
             next_ordinal: 1,
-            reserved: Vec::with_capacity(PM_FAKE_EFFECT_CAPACITY),
-            queued: VecDeque::with_capacity(PM_FAKE_EFFECT_CAPACITY),
-            blocked: VecDeque::with_capacity(PM_FAKE_EFFECT_CAPACITY),
-            metrics: PmFakeEffectQueueMetrics::default(),
+            reserved: Vec::with_capacity(PM_MUTATION_DISPATCH_CAPACITY),
+            queued: VecDeque::with_capacity(PM_MUTATION_DISPATCH_CAPACITY),
+            blocked: VecDeque::with_capacity(PM_MUTATION_DISPATCH_CAPACITY),
+            metrics: PmMutationDispatchQueueMetrics::default(),
             quote_suppressed: false,
         })
     }
 
-    pub(crate) fn try_reserve(&mut self) -> Result<PmFakeEffectPermit, PmFakeEffectQueueError> {
-        if self.depth() >= PM_FAKE_EFFECT_CAPACITY {
+    pub(crate) fn try_reserve(
+        &mut self,
+    ) -> Result<PmMutationDispatchPermit, PmMutationDispatchQueueError> {
+        if self.depth() >= PM_MUTATION_DISPATCH_CAPACITY {
             self.metrics.saturations = self.metrics.saturations.saturating_add(1);
             self.quote_suppressed = true;
-            return Err(PmFakeEffectQueueError::Full);
+            return Err(PmMutationDispatchQueueError::Full);
         }
         let ordinal = self.next_ordinal;
         self.next_ordinal = ordinal
             .checked_add(1)
-            .ok_or(PmFakeEffectQueueError::PermitIdentityExhausted)?;
+            .ok_or(PmMutationDispatchQueueError::PermitIdentityExhausted)?;
         self.reserved.push(ordinal);
         self.metrics.reservations = self.metrics.reservations.saturating_add(1);
         self.note_high_water();
-        Ok(PmFakeEffectPermit {
+        Ok(PmMutationDispatchPermit {
             owner: self.owner,
             ordinal,
         })
@@ -345,8 +351,8 @@ impl PmFakeEffectQueue {
 
     pub(crate) fn release_before_journal(
         &mut self,
-        permit: PmFakeEffectPermit,
-    ) -> Result<(), PmFakeEffectQueueError> {
+        permit: PmMutationDispatchPermit,
+    ) -> Result<(), PmMutationDispatchQueueError> {
         self.remove_reservation(permit)?;
         self.metrics.released_before_journal =
             self.metrics.released_before_journal.saturating_add(1);
@@ -355,8 +361,8 @@ impl PmFakeEffectQueue {
 
     pub(crate) fn retain_after_durable_failure(
         &mut self,
-        permit: PmFakeEffectPermit,
-    ) -> Result<(), PmFakeEffectQueueError> {
+        permit: PmMutationDispatchPermit,
+    ) -> Result<(), PmMutationDispatchQueueError> {
         self.validate_permit(&permit)?;
         self.metrics.retained_after_durable_failure = self
             .metrics
@@ -369,11 +375,11 @@ impl PmFakeEffectQueue {
     }
 
     /// Releases an intent permit only after its durable acknowledgement when
-    /// the still-local quote authority was invalidated before fake dispatch.
+    /// the still-local quote authority was invalidated before backend dispatch.
     pub(crate) fn invalidate_after_durability(
         &mut self,
-        permit: PmFakeEffectPermit,
-    ) -> Result<(), PmFakeEffectQueueError> {
+        permit: PmMutationDispatchPermit,
+    ) -> Result<(), PmMutationDispatchQueueError> {
         self.remove_reservation(permit)?;
         self.metrics.invalidated_after_durability =
             self.metrics.invalidated_after_durability.saturating_add(1);
@@ -382,23 +388,23 @@ impl PmFakeEffectQueue {
 
     pub(crate) fn commit(
         &mut self,
-        permit: PmFakeEffectPermit,
-        effect: PmPreparedFakeEffect,
+        permit: PmMutationDispatchPermit,
+        effect: PmPreparedMutation,
         enqueued_monotonic_ns: u64,
-    ) -> Result<(), PmFakeEffectQueueError> {
+    ) -> Result<(), PmMutationDispatchQueueError> {
         self.validate_permit(&permit)?;
-        if self.depth() > PM_FAKE_EFFECT_CAPACITY {
+        if self.depth() > PM_MUTATION_DISPATCH_CAPACITY {
             self.metrics.retained_after_commit_failure =
                 self.metrics.retained_after_commit_failure.saturating_add(1);
             self.quote_suppressed = true;
-            return Err(PmFakeEffectQueueError::InvariantCapacity);
+            return Err(PmMutationDispatchQueueError::InvariantCapacity);
         }
 
         // From this point onward the durable effect, rather than a raw
         // reservation ordinal, accounts for the capacity. Even malformed
         // service-clock evidence is retained in bounded quarantine.
         self.remove_reservation(permit)?;
-        let queued = PmQueuedFakeEffect {
+        let queued = PmQueuedMutation {
             effect,
             enqueued_monotonic_ns,
         };
@@ -408,7 +414,7 @@ impl PmFakeEffectQueue {
                 self.metrics.retained_after_commit_failure.saturating_add(1);
             self.quote_suppressed = true;
             self.note_high_water();
-            return Err(PmFakeEffectQueueError::InvalidMonotonicTime);
+            return Err(PmMutationDispatchQueueError::InvalidMonotonicTime);
         }
         self.queued.push_back(queued);
         self.metrics.committed_after_durability =
@@ -420,7 +426,7 @@ impl PmFakeEffectQueue {
     pub(crate) fn pop_at(
         &mut self,
         monotonic_now_ns: u64,
-    ) -> Result<Option<PmPreparedFakeEffect>, PmFakeEffectQueueError> {
+    ) -> Result<Option<PmPreparedMutation>, PmMutationDispatchQueueError> {
         if self.preflight_front(monotonic_now_ns)?.is_none() {
             return Ok(None);
         }
@@ -428,33 +434,33 @@ impl PmFakeEffectQueue {
     }
 
     /// Services only a quote whose approval remains current at the final
-    /// fixture-dispatch boundary.
+    /// backend-dispatch boundary.
     ///
     /// Revision change and exact approval expiry retain the move-only
-    /// authority in bounded quarantine. No command reaches the fake transport.
+    /// authority in bounded quarantine. No command reaches any backend.
     pub(crate) fn pop_quote_at(
         &mut self,
         monotonic_now_ns: u64,
         current_revisions: Option<PmAuthorityRevisions>,
-    ) -> Result<Option<PmPreparedFakeEffect>, PmFakeEffectQueueError> {
+    ) -> Result<Option<PmPreparedMutation>, PmMutationDispatchQueueError> {
         let Some(kind) = self.preflight_front(monotonic_now_ns)? else {
             return Ok(None);
         };
-        if kind != PmPreparedFakeEffectKind::Quote {
-            return Err(PmFakeEffectQueueError::EffectKindMismatch);
+        if kind != PmPreparedMutationKind::Quote {
+            return Err(PmMutationDispatchQueueError::EffectKindMismatch);
         }
         let current = self
             .queued
             .front()
             .is_some_and(|front| match &front.effect {
-                PmPreparedFakeEffect::Quote { authority } => {
+                PmPreparedMutation::Quote { authority } => {
                     current_revisions == Some(authority.revisions())
                         && monotonic_now_ns < authority.expires_at_monotonic_ns()
                 }
-                PmPreparedFakeEffect::Cancel { .. } => false,
+                PmPreparedMutation::Cancel { .. } => false,
                 #[cfg(test)]
-                PmPreparedFakeEffect::Synthetic { kind } => {
-                    *kind == PmPreparedFakeEffectKind::Quote && current_revisions.is_some()
+                PmPreparedMutation::Synthetic { kind } => {
+                    *kind == PmPreparedMutationKind::Quote && current_revisions.is_some()
                 }
             });
         if !current {
@@ -463,15 +469,51 @@ impl PmFakeEffectQueue {
                 .metrics
                 .retained_after_revision_change
                 .saturating_add(1);
-            return Err(PmFakeEffectQueueError::QuoteAuthorityInvalidated);
+            return Err(PmMutationDispatchQueueError::QuoteAuthorityInvalidated);
         }
         Ok(self.pop_front_effect())
+    }
+
+    /// Retains the head quote without dispatch when the statically selected
+    /// authenticated place worker cannot accept another operation.
+    ///
+    /// Cancels must remain serviceable while placement is suppressed. Moving
+    /// only the head quote into the existing bounded blocked queue exposes a
+    /// following cancel without cloning or discarding prepared authority.
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub(crate) fn quarantine_front_quote_for_authenticated_backpressure(
+        &mut self,
+    ) -> Result<(), PmMutationDispatchQueueError> {
+        self.suppress_front_quote_without_dispatch()
+    }
+
+    /// Retains a prepared quote during controlled shutdown without
+    /// classifying the intentional no-send transition as backend saturation.
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub(crate) fn suppress_front_quote_for_shutdown(
+        &mut self,
+    ) -> Result<(), PmMutationDispatchQueueError> {
+        self.suppress_front_quote_without_dispatch()
+    }
+
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    fn suppress_front_quote_without_dispatch(
+        &mut self,
+    ) -> Result<(), PmMutationDispatchQueueError> {
+        if self.next_kind() != Some(PmPreparedMutationKind::Quote) {
+            return Err(PmMutationDispatchQueueError::EffectKindMismatch);
+        }
+        self.quote_suppressed = true;
+        self.quarantine_front_quote();
+        self.metrics.retained_after_suppression =
+            self.metrics.retained_after_suppression.saturating_add(1);
+        Ok(())
     }
 
     fn preflight_front(
         &mut self,
         monotonic_now_ns: u64,
-    ) -> Result<Option<PmPreparedFakeEffectKind>, PmFakeEffectQueueError> {
+    ) -> Result<Option<PmPreparedMutationKind>, PmMutationDispatchQueueError> {
         let Some((kind, enqueued_monotonic_ns)) = self
             .queued
             .front()
@@ -482,28 +524,28 @@ impl PmFakeEffectQueue {
         let Some(age_ns) = monotonic_now_ns.checked_sub(enqueued_monotonic_ns) else {
             self.metrics.clock_regressions = self.metrics.clock_regressions.saturating_add(1);
             self.quote_suppressed = true;
-            return Err(PmFakeEffectQueueError::ClockRegression);
+            return Err(PmMutationDispatchQueueError::ClockRegression);
         };
         self.metrics.maximum_observed_age_ns = self.metrics.maximum_observed_age_ns.max(age_ns);
-        if age_ns > PM_FAKE_EFFECT_MAX_AGE_NS {
+        if age_ns > PM_MUTATION_DISPATCH_MAX_AGE_NS {
             self.metrics.age_faults = self.metrics.age_faults.saturating_add(1);
             self.quote_suppressed = true;
-            if kind == PmPreparedFakeEffectKind::Quote {
+            if kind == PmPreparedMutationKind::Quote {
                 self.quarantine_front_quote();
                 self.metrics.retained_after_age = self.metrics.retained_after_age.saturating_add(1);
-                return Err(PmFakeEffectQueueError::AgeExceeded);
+                return Err(PmMutationDispatchQueueError::AgeExceeded);
             }
             self.metrics.aged_safety_services = self.metrics.aged_safety_services.saturating_add(1);
-        } else if self.quote_suppressed && kind == PmPreparedFakeEffectKind::Quote {
+        } else if self.quote_suppressed && kind == PmPreparedMutationKind::Quote {
             self.quarantine_front_quote();
             self.metrics.retained_after_suppression =
                 self.metrics.retained_after_suppression.saturating_add(1);
-            return Err(PmFakeEffectQueueError::QuoteSuppressed);
+            return Err(PmMutationDispatchQueueError::QuoteSuppressed);
         }
         Ok(Some(kind))
     }
 
-    fn pop_front_effect(&mut self) -> Option<PmPreparedFakeEffect> {
+    fn pop_front_effect(&mut self) -> Option<PmPreparedMutation> {
         let effect = self
             .queued
             .pop_front()
@@ -513,7 +555,7 @@ impl PmFakeEffectQueue {
         Some(effect)
     }
 
-    pub(crate) fn next_kind(&self) -> Option<PmPreparedFakeEffectKind> {
+    pub(crate) fn next_kind(&self) -> Option<PmPreparedMutationKind> {
         self.queued.front().map(|queued| queued.effect.kind())
     }
 
@@ -522,23 +564,21 @@ impl PmFakeEffectQueue {
             .iter()
             .chain(&self.blocked)
             .any(|queued| match &queued.effect {
-                PmPreparedFakeEffect::Quote { authority } => {
-                    authority.client_order() == client_order
-                }
-                PmPreparedFakeEffect::Cancel { .. } => false,
+                PmPreparedMutation::Quote { authority } => authority.client_order() == client_order,
+                PmPreparedMutation::Cancel { .. } => false,
                 #[cfg(test)]
-                PmPreparedFakeEffect::Synthetic { .. } => false,
+                PmPreparedMutation::Synthetic { .. } => false,
             })
     }
 
     pub(crate) fn invalidate_prepared_quote(
         &mut self,
         client_order: PmClientOrderKey,
-    ) -> Result<(), PmFakeEffectQueueError> {
+    ) -> Result<(), PmMutationDispatchQueueError> {
         if let Some(index) = self.queued.iter().position(|queued| {
             matches!(
                 &queued.effect,
-                PmPreparedFakeEffect::Quote { authority }
+                PmPreparedMutation::Quote { authority }
                     if authority.client_order() == client_order
             )
         }) {
@@ -546,11 +586,11 @@ impl PmFakeEffectQueue {
                 .queued
                 .remove(index)
                 .expect("located prepared quote remains queued");
-            debug_assert_eq!(removed.effect.kind(), PmPreparedFakeEffectKind::Quote);
+            debug_assert_eq!(removed.effect.kind(), PmPreparedMutationKind::Quote);
         } else if let Some(index) = self.blocked.iter().position(|queued| {
             matches!(
                 &queued.effect,
-                PmPreparedFakeEffect::Quote { authority }
+                PmPreparedMutation::Quote { authority }
                     if authority.client_order() == client_order
             )
         }) {
@@ -558,9 +598,9 @@ impl PmFakeEffectQueue {
                 .blocked
                 .remove(index)
                 .expect("located prepared quote remains blocked");
-            debug_assert_eq!(removed.effect.kind(), PmPreparedFakeEffectKind::Quote);
+            debug_assert_eq!(removed.effect.kind(), PmPreparedMutationKind::Quote);
         } else {
-            return Err(PmFakeEffectQueueError::UnknownPreparedQuote);
+            return Err(PmMutationDispatchQueueError::UnknownPreparedQuote);
         }
         self.metrics.invalidated_after_durability =
             self.metrics.invalidated_after_durability.saturating_add(1);
@@ -587,14 +627,14 @@ impl PmFakeEffectQueue {
         self.reserved.len() + self.blocked.len()
     }
 
-    pub(crate) const fn metrics(&self) -> PmFakeEffectQueueMetrics {
+    pub(crate) const fn metrics(&self) -> PmMutationDispatchQueueMetrics {
         self.metrics
     }
 
-    pub(crate) fn projection(&self) -> PmFakeEffectMetrics {
+    pub(crate) fn projection(&self) -> PmEffectDispatchMetrics {
         let metrics = self.metrics();
-        PmFakeEffectMetrics {
-            capacity: PM_FAKE_EFFECT_CAPACITY,
+        PmEffectDispatchMetrics {
+            capacity: PM_MUTATION_DISPATCH_CAPACITY,
             depth: self.depth(),
             queued: self.queued_len(),
             blocked: self.blocked_len(),
@@ -621,24 +661,27 @@ impl PmFakeEffectQueue {
 
     pub(crate) fn reserved_capacity_bytes(&self) -> usize {
         self.reserved.capacity() * std::mem::size_of::<u64>()
-            + self.queued.capacity() * std::mem::size_of::<PmQueuedFakeEffect>()
-            + self.blocked.capacity() * std::mem::size_of::<PmQueuedFakeEffect>()
+            + self.queued.capacity() * std::mem::size_of::<PmQueuedMutation>()
+            + self.blocked.capacity() * std::mem::size_of::<PmQueuedMutation>()
     }
 
-    fn validate_permit(&self, permit: &PmFakeEffectPermit) -> Result<(), PmFakeEffectQueueError> {
+    fn validate_permit(
+        &self,
+        permit: &PmMutationDispatchPermit,
+    ) -> Result<(), PmMutationDispatchQueueError> {
         if permit.owner != self.owner {
-            return Err(PmFakeEffectQueueError::WrongOwner);
+            return Err(PmMutationDispatchQueueError::WrongOwner);
         }
         if self.reserved.binary_search(&permit.ordinal).is_err() {
-            return Err(PmFakeEffectQueueError::UnknownPermit);
+            return Err(PmMutationDispatchQueueError::UnknownPermit);
         }
         Ok(())
     }
 
     fn remove_reservation(
         &mut self,
-        permit: PmFakeEffectPermit,
-    ) -> Result<(), PmFakeEffectQueueError> {
+        permit: PmMutationDispatchPermit,
+    ) -> Result<(), PmMutationDispatchQueueError> {
         self.validate_permit(&permit)?;
         let index = self
             .reserved
@@ -658,65 +701,74 @@ impl PmFakeEffectQueue {
             .queued
             .pop_front()
             .expect("front quote remains present for bounded quarantine");
-        debug_assert_eq!(effect.effect.kind(), PmPreparedFakeEffectKind::Quote);
+        debug_assert_eq!(effect.effect.kind(), PmPreparedMutationKind::Quote);
         self.blocked.push_back(effect);
     }
 }
 
+/// Compatibility name for Goal F fake-backend metrics.
+pub type PmFakeEffectMetrics = PmEffectDispatchMetrics;
+
 #[derive(Debug)]
-struct PmQueuedFakeEffect {
-    effect: PmPreparedFakeEffect,
+struct PmQueuedMutation {
+    effect: PmPreparedMutation,
     enqueued_monotonic_ns: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-pub(crate) enum PmFakeEffectQueueError {
-    #[error("PM fake-effect queue owner identity is exhausted")]
+pub(crate) enum PmMutationDispatchQueueError {
+    #[error("PM mutation-dispatch queue owner identity is exhausted")]
     OwnerIdentityExhausted,
-    #[error("PM fake-effect permit identity is exhausted")]
+    #[error("PM mutation-dispatch permit identity is exhausted")]
     PermitIdentityExhausted,
-    #[error("PM fake-effect queue is full")]
+    #[error("PM mutation-dispatch queue is full")]
     Full,
-    #[error("PM fake-effect permit belongs to another queue")]
+    #[error("PM mutation-dispatch permit belongs to another queue")]
     WrongOwner,
-    #[error("PM fake-effect permit is no longer outstanding")]
+    #[error("PM mutation-dispatch permit is no longer outstanding")]
     UnknownPermit,
-    #[error("PM prepared fake quote is not retained by this queue")]
+    #[error("PM prepared quote is not retained by this mutation-dispatch queue")]
     UnknownPreparedQuote,
-    #[error("PM fake-effect queue violated its fixed-capacity invariant")]
+    #[error("PM mutation-dispatch queue violated its fixed-capacity invariant")]
     InvariantCapacity,
-    #[error("PM fake-effect enqueue requires nonzero monotonic time")]
+    #[error("PM mutation-dispatch enqueue requires nonzero monotonic time")]
     InvalidMonotonicTime,
-    #[error("PM fake-effect service clock regressed")]
+    #[error("PM mutation-dispatch service clock regressed")]
     ClockRegression,
-    #[error("PM prepared fake quote exceeded its maximum queue age")]
+    #[error("PM prepared quote exceeded its maximum mutation-dispatch queue age")]
     AgeExceeded,
-    #[error("PM prepared fake quote is suppressed")]
+    #[error("PM prepared quote is suppressed")]
     QuoteSuppressed,
-    #[error("PM prepared fake quote approval changed or expired before dispatch")]
+    #[error("PM prepared quote approval changed or expired before dispatch")]
     QuoteAuthorityInvalidated,
-    #[error("PM fake-effect kind does not match the requested service")]
+    #[error("PM mutation kind does not match the requested dispatch service")]
     EffectKindMismatch,
 }
 
 #[cfg(test)]
+pub(crate) type PmFakeEffectQueueError = PmMutationDispatchQueueError;
+
+#[cfg(test)]
 pub(crate) struct Phase6FakeEffectAllocationProbe {
-    queue: PmFakeEffectQueue,
+    queue: PmMutationDispatchQueue,
 }
 
 #[cfg(test)]
 impl Phase6FakeEffectAllocationProbe {
-    pub(crate) fn new() -> Result<Self, PmFakeEffectQueueError> {
+    pub(crate) fn new() -> Result<Self, PmMutationDispatchQueueError> {
         Ok(Self {
-            queue: PmFakeEffectQueue::new()?,
+            queue: PmMutationDispatchQueue::new()?,
         })
     }
 
-    pub(crate) fn attempt(&mut self, monotonic_ns: u64) -> Result<(), PmFakeEffectQueueError> {
+    pub(crate) fn attempt(
+        &mut self,
+        monotonic_ns: u64,
+    ) -> Result<(), PmMutationDispatchQueueError> {
         let permit = self.queue.try_reserve()?;
         self.queue.commit(
             permit,
-            PmPreparedFakeEffect::synthetic(PmPreparedFakeEffectKind::Quote),
+            PmPreparedMutation::synthetic(PmPreparedMutationKind::Quote),
             monotonic_ns,
         )
     }
@@ -733,20 +785,20 @@ mod tests {
     use super::*;
 
     fn commit_synthetic(
-        queue: &mut PmFakeEffectQueue,
-        kind: PmPreparedFakeEffectKind,
+        queue: &mut PmMutationDispatchQueue,
+        kind: PmPreparedMutationKind,
         enqueued_monotonic_ns: u64,
-    ) -> Result<(), PmFakeEffectQueueError> {
+    ) -> Result<(), PmMutationDispatchQueueError> {
         let permit = queue.try_reserve()?;
         queue.commit(
             permit,
-            PmPreparedFakeEffect::synthetic(kind),
+            PmPreparedMutation::synthetic(kind),
             enqueued_monotonic_ns,
         )
     }
 
-    fn expect_synthetic(effect: Option<PmPreparedFakeEffect>, expected: PmPreparedFakeEffectKind) {
-        let Some(PmPreparedFakeEffect::Synthetic { kind }) = effect else {
+    fn expect_synthetic(effect: Option<PmPreparedMutation>, expected: PmPreparedMutationKind) {
+        let Some(PmPreparedMutation::Synthetic { kind }) = effect else {
             panic!("expected one synthetic fake effect");
         };
         assert_eq!(kind, expected);
@@ -759,39 +811,39 @@ mod tests {
 
     #[test]
     fn final_quote_dispatch_requires_current_revision_evidence() {
-        let mut invalidated = PmFakeEffectQueue::new().unwrap();
-        commit_synthetic(&mut invalidated, PmPreparedFakeEffectKind::Quote, 100).unwrap();
+        let mut invalidated = PmMutationDispatchQueue::new().unwrap();
+        commit_synthetic(&mut invalidated, PmPreparedMutationKind::Quote, 100).unwrap();
         assert_eq!(
             invalidated.pop_quote_at(101, None).unwrap_err(),
-            PmFakeEffectQueueError::QuoteAuthorityInvalidated
+            PmMutationDispatchQueueError::QuoteAuthorityInvalidated
         );
         assert_eq!(invalidated.queued_len(), 0);
         assert_eq!(invalidated.blocked_len(), 1);
         assert_eq!(invalidated.metrics().serviced(), 0);
         assert_eq!(invalidated.metrics().retained_after_revision_change(), 1);
 
-        let mut current = PmFakeEffectQueue::new().unwrap();
-        commit_synthetic(&mut current, PmPreparedFakeEffectKind::Quote, 100).unwrap();
+        let mut current = PmMutationDispatchQueue::new().unwrap();
+        commit_synthetic(&mut current, PmPreparedMutationKind::Quote, 100).unwrap();
         expect_synthetic(
             current.pop_quote_at(101, Some(revisions())).unwrap(),
-            PmPreparedFakeEffectKind::Quote,
+            PmPreparedMutationKind::Quote,
         );
         assert_eq!(current.metrics().serviced(), 1);
     }
 
     #[test]
     fn reservations_are_bounded_owner_scoped_and_fail_closed() {
-        let mut queue = PmFakeEffectQueue::new().unwrap();
-        let mut permits = Vec::with_capacity(PM_FAKE_EFFECT_CAPACITY);
-        for _ in 0..PM_FAKE_EFFECT_CAPACITY {
+        let mut queue = PmMutationDispatchQueue::new().unwrap();
+        let mut permits = Vec::with_capacity(PM_MUTATION_DISPATCH_CAPACITY);
+        for _ in 0..PM_MUTATION_DISPATCH_CAPACITY {
             permits.push(queue.try_reserve().unwrap());
         }
 
-        assert_eq!(queue.depth(), PM_FAKE_EFFECT_CAPACITY);
+        assert_eq!(queue.depth(), PM_MUTATION_DISPATCH_CAPACITY);
         assert_eq!(queue.metrics().high_water(), 256);
         assert_eq!(
             queue.try_reserve().unwrap_err(),
-            PmFakeEffectQueueError::Full
+            PmMutationDispatchQueueError::Full
         );
         assert!(queue.quote_suppressed());
         assert_eq!(queue.metrics().saturations(), 1);
@@ -799,34 +851,34 @@ mod tests {
         queue
             .release_before_journal(permits.pop().unwrap())
             .unwrap();
-        assert_eq!(queue.depth(), PM_FAKE_EFFECT_CAPACITY - 1);
+        assert_eq!(queue.depth(), PM_MUTATION_DISPATCH_CAPACITY - 1);
         assert_eq!(queue.metrics().released_before_journal(), 1);
     }
 
     #[test]
     fn every_permit_transition_remains_explicitly_accounted() {
-        let mut released = PmFakeEffectQueue::new().unwrap();
+        let mut released = PmMutationDispatchQueue::new().unwrap();
         let permit = released.try_reserve().unwrap();
         released.release_before_journal(permit).unwrap();
         assert_eq!(released.depth(), 0);
         assert_eq!(released.metrics().reservations(), 1);
         assert_eq!(released.metrics().released_before_journal(), 1);
 
-        let mut serviced = PmFakeEffectQueue::new().unwrap();
-        commit_synthetic(&mut serviced, PmPreparedFakeEffectKind::Cancel, 100).unwrap();
+        let mut serviced = PmMutationDispatchQueue::new().unwrap();
+        commit_synthetic(&mut serviced, PmPreparedMutationKind::Cancel, 100).unwrap();
         expect_synthetic(
             serviced.pop_at(101).unwrap(),
-            PmPreparedFakeEffectKind::Cancel,
+            PmPreparedMutationKind::Cancel,
         );
         assert_eq!(serviced.depth(), 0);
         assert_eq!(serviced.metrics().reservations(), 1);
         assert_eq!(serviced.metrics().committed_after_durability(), 1);
         assert_eq!(serviced.metrics().serviced(), 1);
 
-        let mut invalid_clock = PmFakeEffectQueue::new().unwrap();
+        let mut invalid_clock = PmMutationDispatchQueue::new().unwrap();
         assert_eq!(
-            commit_synthetic(&mut invalid_clock, PmPreparedFakeEffectKind::Quote, 0).unwrap_err(),
-            PmFakeEffectQueueError::InvalidMonotonicTime
+            commit_synthetic(&mut invalid_clock, PmPreparedMutationKind::Quote, 0).unwrap_err(),
+            PmMutationDispatchQueueError::InvalidMonotonicTime
         );
         assert_eq!(invalid_clock.depth(), 1);
         assert_eq!(invalid_clock.queued_len(), 0);
@@ -840,7 +892,7 @@ mod tests {
 
     #[test]
     fn accepted_intent_without_ack_keeps_its_effect_permit_bound() {
-        let mut queue = PmFakeEffectQueue::new().unwrap();
+        let mut queue = PmMutationDispatchQueue::new().unwrap();
         let permit = queue.try_reserve().unwrap();
         queue.retain_after_durable_failure(permit).unwrap();
 
@@ -852,13 +904,13 @@ mod tests {
 
     #[test]
     fn a_sibling_queue_cannot_consume_an_effect_permit() {
-        let mut first = PmFakeEffectQueue::new().unwrap();
-        let mut second = PmFakeEffectQueue::new().unwrap();
+        let mut first = PmMutationDispatchQueue::new().unwrap();
+        let mut second = PmMutationDispatchQueue::new().unwrap();
         let permit = first.try_reserve().unwrap();
 
         assert_eq!(
             second.release_before_journal(permit).unwrap_err(),
-            PmFakeEffectQueueError::WrongOwner
+            PmMutationDispatchQueueError::WrongOwner
         );
         assert_eq!(first.retained_permits(), 1);
         assert_eq!(second.retained_permits(), 0);
@@ -866,13 +918,13 @@ mod tests {
 
     #[test]
     fn aged_quote_is_quarantined_and_can_never_dispatch() {
-        let mut queue = PmFakeEffectQueue::new().unwrap();
-        commit_synthetic(&mut queue, PmPreparedFakeEffectKind::Quote, 100).unwrap();
+        let mut queue = PmMutationDispatchQueue::new().unwrap();
+        commit_synthetic(&mut queue, PmPreparedMutationKind::Quote, 100).unwrap();
 
-        let observed_age = PM_FAKE_EFFECT_MAX_AGE_NS + 1;
+        let observed_age = PM_MUTATION_DISPATCH_MAX_AGE_NS + 1;
         assert_eq!(
             queue.pop_at(100 + observed_age).unwrap_err(),
-            PmFakeEffectQueueError::AgeExceeded
+            PmMutationDispatchQueueError::AgeExceeded
         );
         assert!(queue.quote_suppressed());
         assert_eq!(queue.depth(), 1);
@@ -888,16 +940,16 @@ mod tests {
 
     #[test]
     fn quote_at_the_exact_age_limit_is_still_serviceable() {
-        let mut queue = PmFakeEffectQueue::new().unwrap();
-        commit_synthetic(&mut queue, PmPreparedFakeEffectKind::Quote, 100).unwrap();
+        let mut queue = PmMutationDispatchQueue::new().unwrap();
+        commit_synthetic(&mut queue, PmPreparedMutationKind::Quote, 100).unwrap();
 
         expect_synthetic(
-            queue.pop_at(100 + PM_FAKE_EFFECT_MAX_AGE_NS).unwrap(),
-            PmPreparedFakeEffectKind::Quote,
+            queue.pop_at(100 + PM_MUTATION_DISPATCH_MAX_AGE_NS).unwrap(),
+            PmPreparedMutationKind::Quote,
         );
         assert_eq!(
             queue.metrics().maximum_observed_age_ns(),
-            PM_FAKE_EFFECT_MAX_AGE_NS
+            PM_MUTATION_DISPATCH_MAX_AGE_NS
         );
         assert_eq!(queue.metrics().age_faults(), 0);
         assert_eq!(queue.metrics().serviced(), 1);
@@ -906,19 +958,19 @@ mod tests {
 
     #[test]
     fn aged_owned_cancel_remains_serviceable_behind_a_quarantined_quote() {
-        let mut queue = PmFakeEffectQueue::new().unwrap();
-        commit_synthetic(&mut queue, PmPreparedFakeEffectKind::Quote, 100).unwrap();
-        commit_synthetic(&mut queue, PmPreparedFakeEffectKind::Cancel, 101).unwrap();
+        let mut queue = PmMutationDispatchQueue::new().unwrap();
+        commit_synthetic(&mut queue, PmPreparedMutationKind::Quote, 100).unwrap();
+        commit_synthetic(&mut queue, PmPreparedMutationKind::Cancel, 101).unwrap();
 
-        let service_time = 102 + PM_FAKE_EFFECT_MAX_AGE_NS;
+        let service_time = 102 + PM_MUTATION_DISPATCH_MAX_AGE_NS;
         assert_eq!(
             queue.pop_at(service_time).unwrap_err(),
-            PmFakeEffectQueueError::AgeExceeded
+            PmMutationDispatchQueueError::AgeExceeded
         );
-        assert_eq!(queue.next_kind(), Some(PmPreparedFakeEffectKind::Cancel));
+        assert_eq!(queue.next_kind(), Some(PmPreparedMutationKind::Cancel));
         expect_synthetic(
             queue.pop_at(service_time).unwrap(),
-            PmPreparedFakeEffectKind::Cancel,
+            PmPreparedMutationKind::Cancel,
         );
 
         assert!(queue.quote_suppressed());
@@ -931,13 +983,32 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_place_backpressure_retains_quote_and_exposes_cancel() {
+        let mut queue = PmMutationDispatchQueue::new().unwrap();
+        commit_synthetic(&mut queue, PmPreparedMutationKind::Quote, 100).unwrap();
+        commit_synthetic(&mut queue, PmPreparedMutationKind::Cancel, 101).unwrap();
+
+        queue
+            .quarantine_front_quote_for_authenticated_backpressure()
+            .unwrap();
+
+        assert_eq!(queue.next_kind(), Some(PmPreparedMutationKind::Cancel));
+        expect_synthetic(queue.pop_at(102).unwrap(), PmPreparedMutationKind::Cancel);
+        assert_eq!(queue.blocked_len(), 1);
+        assert_eq!(queue.queued_len(), 0);
+        assert_eq!(queue.metrics().serviced(), 1);
+        assert_eq!(queue.metrics().retained_after_suppression(), 1);
+        assert!(queue.quote_suppressed());
+    }
+
+    #[test]
     fn clock_regression_retains_front_and_safety_cancel_can_retry() {
-        let mut queue = PmFakeEffectQueue::new().unwrap();
-        commit_synthetic(&mut queue, PmPreparedFakeEffectKind::Cancel, 100).unwrap();
+        let mut queue = PmMutationDispatchQueue::new().unwrap();
+        commit_synthetic(&mut queue, PmPreparedMutationKind::Cancel, 100).unwrap();
 
         assert_eq!(
             queue.pop_at(99).unwrap_err(),
-            PmFakeEffectQueueError::ClockRegression
+            PmMutationDispatchQueueError::ClockRegression
         );
         assert_eq!(queue.depth(), 1);
         assert_eq!(queue.queued_len(), 1);
@@ -947,23 +1018,23 @@ mod tests {
         assert_eq!(queue.metrics().serviced(), 0);
         assert!(queue.quote_suppressed());
 
-        expect_synthetic(queue.pop_at(101).unwrap(), PmPreparedFakeEffectKind::Cancel);
+        expect_synthetic(queue.pop_at(101).unwrap(), PmPreparedMutationKind::Cancel);
         assert_eq!(queue.depth(), 0);
         assert_eq!(queue.metrics().serviced(), 1);
     }
 
     #[test]
     fn clock_regression_makes_a_quote_permanently_non_dispatchable() {
-        let mut queue = PmFakeEffectQueue::new().unwrap();
-        commit_synthetic(&mut queue, PmPreparedFakeEffectKind::Quote, 100).unwrap();
+        let mut queue = PmMutationDispatchQueue::new().unwrap();
+        commit_synthetic(&mut queue, PmPreparedMutationKind::Quote, 100).unwrap();
 
         assert_eq!(
             queue.pop_at(99).unwrap_err(),
-            PmFakeEffectQueueError::ClockRegression
+            PmMutationDispatchQueueError::ClockRegression
         );
         assert_eq!(
             queue.pop_at(101).unwrap_err(),
-            PmFakeEffectQueueError::QuoteSuppressed
+            PmMutationDispatchQueueError::QuoteSuppressed
         );
         assert_eq!(queue.depth(), 1);
         assert_eq!(queue.queued_len(), 0);
@@ -974,25 +1045,25 @@ mod tests {
 
     #[test]
     fn phase6_fake_effect_row_is_257_attempts_after_256_durable_records() {
-        let mut queue = PmFakeEffectQueue::new().unwrap();
+        let mut queue = PmMutationDispatchQueue::new().unwrap();
         let reserved_capacity_bytes = queue.reserved_capacity_bytes();
-        for ordinal in 0..PM_FAKE_EFFECT_CAPACITY {
+        for ordinal in 0..PM_MUTATION_DISPATCH_CAPACITY {
             commit_synthetic(
                 &mut queue,
-                PmPreparedFakeEffectKind::Quote,
+                PmPreparedMutationKind::Quote,
                 100 + u64::try_from(ordinal).unwrap(),
             )
             .unwrap();
         }
 
-        assert_eq!(queue.depth(), PM_FAKE_EFFECT_CAPACITY);
-        assert_eq!(queue.queued_len(), PM_FAKE_EFFECT_CAPACITY);
+        assert_eq!(queue.depth(), PM_MUTATION_DISPATCH_CAPACITY);
+        assert_eq!(queue.queued_len(), PM_MUTATION_DISPATCH_CAPACITY);
         assert_eq!(queue.metrics().high_water(), 256);
         assert_eq!(queue.metrics().committed_after_durability(), 256);
         let committed_before_rejection = queue.metrics().committed_after_durability();
         assert_eq!(
             queue.try_reserve().unwrap_err(),
-            PmFakeEffectQueueError::Full
+            PmMutationDispatchQueueError::Full
         );
         assert_eq!(
             queue.metrics().committed_after_durability(),
@@ -1002,15 +1073,15 @@ mod tests {
         assert_eq!(queue.metrics().serviced(), 0);
         assert!(queue.quote_suppressed());
 
-        for _ in 0..PM_FAKE_EFFECT_CAPACITY {
+        for _ in 0..PM_MUTATION_DISPATCH_CAPACITY {
             assert_eq!(
                 queue.pop_at(1_000).unwrap_err(),
-                PmFakeEffectQueueError::QuoteSuppressed
+                PmMutationDispatchQueueError::QuoteSuppressed
             );
         }
-        assert_eq!(queue.depth(), PM_FAKE_EFFECT_CAPACITY);
+        assert_eq!(queue.depth(), PM_MUTATION_DISPATCH_CAPACITY);
         assert_eq!(queue.queued_len(), 0);
-        assert_eq!(queue.blocked_len(), PM_FAKE_EFFECT_CAPACITY);
+        assert_eq!(queue.blocked_len(), PM_MUTATION_DISPATCH_CAPACITY);
         assert_eq!(queue.metrics().reservations(), 256);
         assert_eq!(queue.metrics().committed_after_durability(), 256);
         assert_eq!(queue.metrics().saturations(), 1);

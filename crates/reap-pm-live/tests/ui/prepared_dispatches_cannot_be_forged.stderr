@@ -1,0 +1,19 @@
+error[E0451]: fields `journal_sequence` and `request` of struct `PmPreparedPlaceDispatch` are private
+  --> tests/ui/prepared_dispatches_cannot_be_forged.rs:9:9
+   |
+ 8 |     let _ = PmPreparedPlaceDispatch {
+   |             ----------------------- in this type
+ 9 |         journal_sequence: value(),
+   |         ^^^^^^^^^^^^^^^^ private field
+10 |         request: value(),
+   |         ^^^^^^^ private field
+
+error[E0451]: fields `journal_sequence` and `request` of struct `PmPreparedCancelDispatch` are private
+  --> tests/ui/prepared_dispatches_cannot_be_forged.rs:13:9
+   |
+12 |     let _ = PmPreparedCancelDispatch {
+   |             ------------------------ in this type
+13 |         journal_sequence: value(),
+   |         ^^^^^^^^^^^^^^^^ private field
+14 |         request: value(),
+   |         ^^^^^^^ private field

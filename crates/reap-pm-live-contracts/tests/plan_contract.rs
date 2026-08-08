@@ -9,7 +9,7 @@ use reap_pm_core::{
 use reap_pm_live_contracts::{
     ConstructedRoleBinding, PmAccountConnectivityConfig, PmCapabilityLane,
     PmCapabilityRequirementId, PmCompositionRoot, PmConnectionRoute, PmConnectivityConfig,
-    PmConnectivityConfigError, PmConnectivityPlan, PmFakeExecutionProfile, PmPlanError,
+    PmConnectivityConfigError, PmConnectivityPlan, PmFixedExecutionProfile, PmPlanError,
     PmPlanOwner, PmPlanRequirementId, PmPublicConnectivityConfig, PmReadinessDependency,
     PmRequirementConsumer, PmRequirementOrigin, PmRequirementScope, PmRoleKind,
 };
@@ -138,7 +138,7 @@ fn expected_metadata_contract(
 fn fixture() -> (
     PmConnectivityConfig,
     PmModelInputRequirements,
-    PmFakeExecutionProfile,
+    PmFixedExecutionProfile,
 ) {
     let account = account_scope();
     let public = PmPublicConnectivityConfig::derive_goal_f(
@@ -169,7 +169,7 @@ fn fixture() -> (
     (
         PmConnectivityConfig::new(public, account).unwrap(),
         PmModelInputRequirements::new(reference(), instrument()),
-        PmFakeExecutionProfile::goal_f(),
+        PmFixedExecutionProfile::gtc_post_only_owned_cancel(),
     )
 }
 
@@ -242,8 +242,8 @@ fn stable_endpoint_inventory_is_exact_and_trade_is_absent() {
             "PM-ACCOUNT-TOKEN",
             "PM-ACCOUNT-ALLOWANCE",
             "PM-POSITION-SNAPSHOT",
-            "PM-FAKE-PLACE-GTC-PO",
-            "PM-FAKE-CANCEL-OWNED",
+            "PM-PLACE-GTC-PO",
+            "PM-CANCEL-OWNED",
         ]
     );
     assert!(!ids.iter().any(|id| id.contains("TRADE")));
@@ -299,12 +299,11 @@ fn roots_have_exact_role_reach_variable_spender_entries_and_product_timer() {
 
 #[test]
 fn product_plan_matches_the_independent_full_entry_table() {
-    use PmCapabilityLane::{FakeEffect, Private, Public, Reconciliation, Scheduled};
+    use PmCapabilityLane::{EffectDispatch, Private, Public, Reconciliation, Scheduled};
     use PmCapabilityRequirementId::{
-        AccountAllowance, AccountCollateral, AccountToken, BookDelta, BookSnapshot,
-        FakeCancelOwned, FakePlaceGtcPostOnly, MetadataClob, MetadataLifecycle, OkxReference,
-        PositionSnapshot, PrivateFill, PrivateOrder, ReconcileFills, ReconcileOpenOrders,
-        ReconcileOrder,
+        AccountAllowance, AccountCollateral, AccountToken, BookDelta, BookSnapshot, CancelOwned,
+        MetadataClob, MetadataLifecycle, OkxReference, PlaceGtcPostOnly, PositionSnapshot,
+        PrivateFill, PrivateOrder, ReconcileFills, ReconcileOpenOrders, ReconcileOrder,
     };
     use PmPlanOwner::{ConnectivityRole, QuoteSchedule};
     use PmReadinessDependency::{
@@ -312,12 +311,12 @@ fn product_plan_matches_the_independent_full_entry_table() {
         Position, PrivateLifecycle, QuoteEvaluationClock, TokenInventory,
     };
     use PmRequirementConsumer::{
-        AllowanceReadiness, BookIntegrity, CanonicalOrderState, FakeEffectWorker,
+        AllowanceReadiness, BookIntegrity, CanonicalOrderState, EffectDispatcher,
         FillAndPositionState, MetadataReadiness, OrderReconciliation, OwnedCancellation,
         PositionReadiness, QuoteEvaluationSchedule, QuoteModelReference,
     };
     use PmRequirementOrigin::{
-        FixedFakeExecutionProfile, MandatorySafetyAndReadiness, ModelPublicInput,
+        FixedExecutionProfile, MandatorySafetyAndReadiness, ModelPublicInput,
     };
     use PmRoleKind::{
         OkxPublicObservation, PmAccountPositionSnapshot, PmOrderReconciliation, PmOwnedExecution,
@@ -499,22 +498,22 @@ fn product_plan_matches_the_independent_full_entry_table() {
             route: Some(account_route),
         },
         ProductPlanRow {
-            requirement: PmPlanRequirementId::Connectivity(FakePlaceGtcPostOnly),
+            requirement: PmPlanRequirementId::Connectivity(PlaceGtcPostOnly),
             scope: account_instrument,
-            origin: FixedFakeExecutionProfile,
-            consumer: FakeEffectWorker,
+            origin: FixedExecutionProfile,
+            consumer: EffectDispatcher,
             owner: ConnectivityRole(PmOwnedExecution),
-            lane: FakeEffect,
+            lane: EffectDispatch,
             readiness: OwnedExecution,
             route: None,
         },
         ProductPlanRow {
-            requirement: PmPlanRequirementId::Connectivity(FakeCancelOwned),
+            requirement: PmPlanRequirementId::Connectivity(CancelOwned),
             scope: account_instrument,
-            origin: FixedFakeExecutionProfile,
+            origin: FixedExecutionProfile,
             consumer: OwnedCancellation,
             owner: ConnectivityRole(PmOwnedExecution),
-            lane: FakeEffect,
+            lane: EffectDispatch,
             readiness: OwnedExecution,
             route: None,
         },

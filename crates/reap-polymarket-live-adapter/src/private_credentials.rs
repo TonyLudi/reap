@@ -1,0 +1,557 @@
+use std::fmt;
+
+use reap_polymarket_auth::{
+    AuthenticatedL2Headers, AuthenticatedUserSubscription, AuthenticatedUserSubscriptionSink,
+    CredentialOwnedUserFrame, FixedOrderId, L2Credentials, L2Timestamp,
+};
+use reap_polymarket_wire::{PmLiveOpenOrderPage, PmLiveOrder, PmLiveTradePage, PmLiveUserFrame};
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+};
+use zeroize::Zeroizing;
+
+use crate::{
+    PmAuthenticatedHttpOwner, PmLiveAdapterError, PmPrivateHttpConfig, PmUserWsConfig,
+    private_http::PmPrivateHttpTransport, user_ws::PmAuthenticatedUserWsRole,
+};
+
+const CREDENTIAL_AUTHORITY_CAPACITY: usize = 32;
+
+/// Sole owner of one account's L2 credential bundle and its exact private
+/// transport configuration.
+///
+/// Splitting consumes this value exactly once. The resulting roles share only
+/// a bounded typed request channel; credentials never leave the authority
+/// task. The returned supervisor must be retained and explicitly joined so
+/// secret destruction is part of composition teardown evidence.
+pub struct PmPrivateConnectivityOwner {
+    http_config: PmPrivateHttpConfig,
+    user_ws_config: PmUserWsConfig,
+    credentials: L2Credentials,
+}
+
+impl PmPrivateConnectivityOwner {
+    pub fn new(
+        http_config: PmPrivateHttpConfig,
+        user_ws_config: PmUserWsConfig,
+        credentials: L2Credentials,
+    ) -> Result<Self, PmLiveAdapterError> {
+        if http_config.exact_order_scope().condition() != user_ws_config.condition() {
+            return Err(PmLiveAdapterError::InvalidConfiguration(
+                "private HTTP and user WebSocket must bind the same condition",
+            ));
+        }
+        Ok(Self {
+            http_config,
+            user_ws_config,
+            credentials,
+        })
+    }
+
+    /// Consume the sole credential owner into distinct, non-clone role
+    /// handles. A Tokio runtime must be active because the authority is an
+    /// isolated task rather than a lent secret reference.
+    pub fn split(self) -> Result<PmPrivateConnectivityRoles, PmLiveAdapterError> {
+        let address = self.credentials.address();
+        let transport = PmPrivateHttpTransport::new(&self.http_config, address)?;
+        let (sender, supervisor) = spawn_credential_authority(self.credentials)?;
+
+        let http = PmAuthenticatedHttpOwner::from_authority(
+            transport,
+            self.http_config.exact_order_scope(),
+            address,
+            PmHttpCredentialRole {
+                sender: sender.clone(),
+            },
+        );
+        let user_ws = PmAuthenticatedUserWsRole::from_authority(
+            self.user_ws_config,
+            PmUserWsCredentialRole { sender },
+        );
+        Ok(PmPrivateConnectivityRoles {
+            http,
+            user_ws,
+            supervisor,
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_http_credential_role(
+    credentials: L2Credentials,
+) -> Result<(PmHttpCredentialRole, PmCredentialAuthoritySupervisor), PmLiveAdapterError> {
+    let (sender, supervisor) = spawn_credential_authority(credentials)?;
+    Ok((PmHttpCredentialRole { sender }, supervisor))
+}
+
+impl fmt::Debug for PmPrivateConnectivityOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PmPrivateConnectivityOwner([REDACTED])")
+    }
+}
+
+/// The one-time split result. Each role and the task supervisor are move-only;
+/// they have no route, raw header, client, credential, or generic signing
+/// escape.
+pub struct PmPrivateConnectivityRoles {
+    http: PmAuthenticatedHttpOwner,
+    user_ws: PmAuthenticatedUserWsRole,
+    supervisor: PmCredentialAuthoritySupervisor,
+}
+
+impl PmPrivateConnectivityRoles {
+    #[must_use]
+    pub fn into_read_roles(
+        self,
+    ) -> (
+        PmAuthenticatedHttpOwner,
+        PmAuthenticatedUserWsRole,
+        PmCredentialAuthoritySupervisor,
+    ) {
+        (self.http, self.user_ws, self.supervisor)
+    }
+}
+
+impl fmt::Debug for PmPrivateConnectivityRoles {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PmPrivateConnectivityRoles([REDACTED])")
+    }
+}
+
+/// Move-only lifecycle owner for the sole secret-custody task.
+///
+/// Composition must retain this value alongside both read roles and await
+/// [`Self::shutdown`] during teardown. Dropping it early aborts the task so a
+/// secret-owning task can never become detached.
+pub struct PmCredentialAuthoritySupervisor {
+    shutdown: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl PmCredentialAuthoritySupervisor {
+    pub(crate) fn from_task(shutdown: oneshot::Sender<()>, task: JoinHandle<()>) -> Self {
+        Self {
+            shutdown: Some(shutdown),
+            task: Some(task),
+        }
+    }
+
+    pub async fn shutdown(mut self) -> Result<(), PmLiveAdapterError> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        let task = self
+            .task
+            .take()
+            .ok_or(PmLiveAdapterError::CredentialAuthorityClosed)?;
+        task.await
+            .map_err(|_| PmLiveAdapterError::CredentialAuthorityTaskFailed)
+    }
+}
+
+impl Drop for PmCredentialAuthoritySupervisor {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+impl fmt::Debug for PmCredentialAuthoritySupervisor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PmCredentialAuthoritySupervisor([REDACTED])")
+    }
+}
+
+pub(crate) struct PmHttpCredentialRole {
+    sender: mpsc::Sender<CredentialRequest>,
+}
+
+impl PmHttpCredentialRole {
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub(crate) const fn from_sender(sender: mpsc::Sender<CredentialRequest>) -> Self {
+        Self { sender }
+    }
+
+    pub(crate) async fn authenticate_open_orders(
+        &mut self,
+        timestamp: L2Timestamp,
+    ) -> Result<AuthenticatedL2Headers, PmLiveAdapterError> {
+        request(&self.sender, |response| CredentialRequest::OpenOrders {
+            timestamp,
+            response,
+        })
+        .await
+    }
+
+    pub(crate) async fn authenticate_trades(
+        &mut self,
+        timestamp: L2Timestamp,
+    ) -> Result<AuthenticatedL2Headers, PmLiveAdapterError> {
+        request(&self.sender, |response| CredentialRequest::Trades {
+            timestamp,
+            response,
+        })
+        .await
+    }
+
+    pub(crate) async fn authenticate_balance(
+        &mut self,
+        timestamp: L2Timestamp,
+    ) -> Result<AuthenticatedL2Headers, PmLiveAdapterError> {
+        request(&self.sender, |response| CredentialRequest::Balance {
+            timestamp,
+            response,
+        })
+        .await
+    }
+
+    pub(crate) async fn authenticate_exact_order(
+        &mut self,
+        timestamp: L2Timestamp,
+        order_id: FixedOrderId,
+    ) -> Result<AuthenticatedL2Headers, PmLiveAdapterError> {
+        request(&self.sender, |response| CredentialRequest::ExactOrder {
+            timestamp,
+            order_id,
+            response,
+        })
+        .await
+    }
+
+    pub(crate) async fn bind_open_orders(
+        &mut self,
+        page: PmLiveOpenOrderPage,
+    ) -> Result<PmLiveOpenOrderPage, PmLiveAdapterError> {
+        request(&self.sender, |response| CredentialRequest::BindOpenOrders {
+            page,
+            response,
+        })
+        .await
+    }
+
+    pub(crate) async fn bind_trades(
+        &mut self,
+        page: PmLiveTradePage,
+    ) -> Result<PmLiveTradePage, PmLiveAdapterError> {
+        request(&self.sender, |response| CredentialRequest::BindTrades {
+            page,
+            response,
+        })
+        .await
+    }
+
+    pub(crate) async fn bind_exact_order(
+        &mut self,
+        order: PmLiveOrder,
+    ) -> Result<PmLiveOrder, PmLiveAdapterError> {
+        request(&self.sender, |response| CredentialRequest::BindExactOrder {
+            order: Box::new(order),
+            response,
+        })
+        .await
+    }
+}
+
+pub(crate) struct PmUserWsCredentialRole {
+    sender: mpsc::Sender<CredentialRequest>,
+}
+
+impl PmUserWsCredentialRole {
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub(crate) const fn from_sender(sender: mpsc::Sender<CredentialRequest>) -> Self {
+        Self { sender }
+    }
+
+    pub(crate) async fn fresh_subscription(
+        &mut self,
+        condition: reap_pm_core::PmConditionId,
+    ) -> Result<PmRetainedUserSubscription, PmLiveAdapterError> {
+        request(&self.sender, |response| {
+            CredentialRequest::UserSubscription {
+                condition,
+                response,
+            }
+        })
+        .await
+    }
+
+    pub(crate) async fn bind_frame(
+        &mut self,
+        frame: PmLiveUserFrame,
+    ) -> Result<CredentialOwnedUserFrame, PmLiveAdapterError> {
+        request(&self.sender, |response| CredentialRequest::BindUserFrame {
+            frame,
+            response,
+        })
+        .await
+    }
+}
+
+pub(crate) struct PmRetainedUserSubscription(Zeroizing<Vec<u8>>);
+
+impl PmRetainedUserSubscription {
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+struct RetainSubscriptionSink;
+
+impl AuthenticatedUserSubscriptionSink for RetainSubscriptionSink {
+    type Output = PmRetainedUserSubscription;
+    type Error = PmLiveAdapterError;
+
+    fn send_user_subscription(&mut self, exact_frame: &[u8]) -> Result<Self::Output, Self::Error> {
+        if exact_frame.is_empty() || exact_frame.len() > 1_024 {
+            return Err(PmLiveAdapterError::InvalidUserSubscription);
+        }
+        Ok(PmRetainedUserSubscription(Zeroizing::new(
+            exact_frame.to_vec(),
+        )))
+    }
+}
+
+pub(crate) enum CredentialRequest {
+    OpenOrders {
+        timestamp: L2Timestamp,
+        response: oneshot::Sender<Result<AuthenticatedL2Headers, PmLiveAdapterError>>,
+    },
+    Trades {
+        timestamp: L2Timestamp,
+        response: oneshot::Sender<Result<AuthenticatedL2Headers, PmLiveAdapterError>>,
+    },
+    Balance {
+        timestamp: L2Timestamp,
+        response: oneshot::Sender<Result<AuthenticatedL2Headers, PmLiveAdapterError>>,
+    },
+    ExactOrder {
+        timestamp: L2Timestamp,
+        order_id: FixedOrderId,
+        response: oneshot::Sender<Result<AuthenticatedL2Headers, PmLiveAdapterError>>,
+    },
+    BindOpenOrders {
+        page: PmLiveOpenOrderPage,
+        response: oneshot::Sender<Result<PmLiveOpenOrderPage, PmLiveAdapterError>>,
+    },
+    BindTrades {
+        page: PmLiveTradePage,
+        response: oneshot::Sender<Result<PmLiveTradePage, PmLiveAdapterError>>,
+    },
+    BindExactOrder {
+        order: Box<PmLiveOrder>,
+        response: oneshot::Sender<Result<PmLiveOrder, PmLiveAdapterError>>,
+    },
+    UserSubscription {
+        condition: reap_pm_core::PmConditionId,
+        response: oneshot::Sender<Result<PmRetainedUserSubscription, PmLiveAdapterError>>,
+    },
+    BindUserFrame {
+        frame: PmLiveUserFrame,
+        response: oneshot::Sender<Result<CredentialOwnedUserFrame, PmLiveAdapterError>>,
+    },
+}
+
+async fn run_credential_authority(
+    credentials: L2Credentials,
+    mut requests: mpsc::Receiver<CredentialRequest>,
+    mut shutdown: oneshot::Receiver<()>,
+) {
+    loop {
+        let request = tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                requests.close();
+                return;
+            }
+            request = requests.recv() => {
+                let Some(request) = request else {
+                    return;
+                };
+                request
+            }
+        };
+        handle_credential_request(&credentials, request);
+    }
+}
+
+pub(crate) fn handle_credential_request(credentials: &L2Credentials, request: CredentialRequest) {
+    match request {
+        CredentialRequest::OpenOrders {
+            timestamp,
+            response,
+        } => respond(
+            response,
+            credentials
+                .authenticate_open_orders(timestamp)
+                .map_err(Into::into),
+        ),
+        CredentialRequest::Trades {
+            timestamp,
+            response,
+        } => respond(
+            response,
+            credentials
+                .authenticate_trades(timestamp)
+                .map_err(Into::into),
+        ),
+        CredentialRequest::Balance {
+            timestamp,
+            response,
+        } => respond(
+            response,
+            credentials
+                .authenticate_balance_allowance(timestamp)
+                .map_err(Into::into),
+        ),
+        CredentialRequest::ExactOrder {
+            timestamp,
+            order_id,
+            response,
+        } => respond(
+            response,
+            credentials
+                .authenticate_order_detail(timestamp, order_id)
+                .map_err(Into::into),
+        ),
+        CredentialRequest::BindOpenOrders { page, response } => {
+            let matches = page
+                .orders()
+                .iter()
+                .all(|order| credentials.matches_credential_owner(order.owner()));
+            respond(response, owner_match(matches).map(|()| page));
+        }
+        CredentialRequest::BindTrades { page, response } => {
+            let matches = page
+                .trades()
+                .iter()
+                .all(|trade| credentials.matches_credential_owner(trade.owner()));
+            respond(response, owner_match(matches).map(|()| page));
+        }
+        CredentialRequest::BindExactOrder { order, response } => respond(
+            response,
+            owner_match(credentials.matches_credential_owner(order.owner())).map(|()| *order),
+        ),
+        CredentialRequest::UserSubscription {
+            condition,
+            response,
+        } => {
+            let value = credentials
+                .user_subscription(condition)
+                .map_err(PmLiveAdapterError::from)
+                .and_then(retain_subscription);
+            respond(response, value);
+        }
+        CredentialRequest::BindUserFrame { frame, response } => respond(
+            response,
+            credentials
+                .bind_user_stream_frame(frame)
+                .map_err(PmLiveAdapterError::from),
+        ),
+    }
+}
+
+fn spawn_credential_authority(
+    credentials: L2Credentials,
+) -> Result<
+    (
+        mpsc::Sender<CredentialRequest>,
+        PmCredentialAuthoritySupervisor,
+    ),
+    PmLiveAdapterError,
+> {
+    let (sender, receiver) = mpsc::channel(CREDENTIAL_AUTHORITY_CAPACITY);
+    let (shutdown, shutdown_receiver) = oneshot::channel();
+    let task = tokio::runtime::Handle::try_current()
+        .map_err(|_| {
+            PmLiveAdapterError::InvalidConfiguration(
+                "private credential authority requires an active Tokio runtime",
+            )
+        })?
+        .spawn(run_credential_authority(
+            credentials,
+            receiver,
+            shutdown_receiver,
+        ));
+    Ok((
+        sender,
+        PmCredentialAuthoritySupervisor::from_task(shutdown, task),
+    ))
+}
+
+fn retain_subscription(
+    subscription: AuthenticatedUserSubscription,
+) -> Result<PmRetainedUserSubscription, PmLiveAdapterError> {
+    subscription.dispatch(&mut RetainSubscriptionSink)
+}
+
+fn owner_match(matches: bool) -> Result<(), PmLiveAdapterError> {
+    if matches {
+        Ok(())
+    } else {
+        Err(PmLiveAdapterError::CredentialOwnerMismatch)
+    }
+}
+
+fn respond<T>(
+    response: oneshot::Sender<Result<T, PmLiveAdapterError>>,
+    value: Result<T, PmLiveAdapterError>,
+) {
+    let _ = response.send(value);
+}
+
+async fn request<T>(
+    sender: &mpsc::Sender<CredentialRequest>,
+    make: impl FnOnce(oneshot::Sender<Result<T, PmLiveAdapterError>>) -> CredentialRequest,
+) -> Result<T, PmLiveAdapterError> {
+    let (response, receive) = oneshot::channel();
+    sender
+        .send(make(response))
+        .await
+        .map_err(|_| PmLiveAdapterError::CredentialAuthorityClosed)?;
+    receive
+        .await
+        .map_err(|_| PmLiveAdapterError::CredentialAuthorityClosed)?
+}
+
+#[cfg(test)]
+mod tests {
+    use reap_polymarket_auth::{L2CredentialInput, L2Timestamp};
+
+    use super::*;
+
+    const ADDRESS: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+    const API_KEY: &str = "00000000-0000-4000-8000-000000000001";
+    const API_SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    const PASSPHRASE: &str = "synthetic-passphrase";
+
+    fn credentials() -> L2Credentials {
+        L2Credentials::bind(
+            ADDRESS,
+            L2CredentialInput::new(API_KEY.into(), API_SECRET.into(), PASSPHRASE.into()),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn explicit_shutdown_joins_authority_and_closes_remaining_roles() {
+        let (sender, supervisor) = spawn_credential_authority(credentials()).unwrap();
+        let mut role = PmHttpCredentialRole { sender };
+        let debug = format!("{supervisor:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(API_KEY));
+        assert!(!debug.contains(API_SECRET));
+        assert!(!debug.contains(PASSPHRASE));
+
+        supervisor.shutdown().await.unwrap();
+        assert!(matches!(
+            role.authenticate_open_orders(L2Timestamp::from_unix_seconds(1_700_000_000).unwrap())
+                .await,
+            Err(PmLiveAdapterError::CredentialAuthorityClosed)
+        ));
+    }
+}

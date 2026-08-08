@@ -1,0 +1,23 @@
+error[E0603]: module `private_http` is private
+ --> tests/ui/private_transport_is_not_public.rs:1:35
+  |
+1 | use reap_polymarket_live_adapter::private_http::{PmPrivateHttpTransport, PmPrivateRoute};
+  |                                   ^^^^^^^^^^^^ private module
+  |
+note: the module `private_http` is defined here
+ --> src/lib.rs
+  |
+  | mod private_http;
+  | ^^^^^^^^^^^^^^^^
+
+error[E0603]: module `private_http` is private
+ --> tests/ui/private_transport_is_not_public.rs:1:35
+  |
+1 | use reap_polymarket_live_adapter::private_http::{PmPrivateHttpTransport, PmPrivateRoute};
+  |                                   ^^^^^^^^^^^^ private module            -------------- enum `PmPrivateRoute` is not publicly re-exported
+  |
+note: the module `private_http` is defined here
+ --> src/lib.rs
+  |
+  | mod private_http;
+  | ^^^^^^^^^^^^^^^^

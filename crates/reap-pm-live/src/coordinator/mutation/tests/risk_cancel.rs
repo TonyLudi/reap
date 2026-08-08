@@ -15,7 +15,7 @@ async fn ready_owner_with_risk_limits(
         account.instrument(),
         account.instrument_id(),
     );
-    let (mut owner, recovery) =
+    let (mut owner, recovery, _fake_executor) =
         PmMutationOwner::start(&config, Box::new(private), fake, journal_path)
             .await
             .unwrap();
@@ -101,7 +101,11 @@ async fn assert_operational_halt_keeps_exact_cancel_available(halt: PmMutationHa
     ));
     wait_for_prepared_cancel(&mut owner, 131).await;
     owner
-        .execute_next_cancel(PmFakeCancelScript::accepted(), 132)
+        .execute_next_cancel(
+            &fixture_executor(&config),
+            PmFakeCancelScript::accepted(),
+            132,
+        )
         .unwrap();
     assert_eq!(
         owner.private_mut().owned_order(client).unwrap().status(),

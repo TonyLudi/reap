@@ -1,0 +1,35 @@
+error[E0382]: use of moved value: `dispatch`
+ --> tests/ui/prepared_dispatches_are_take_once.rs:7:13
+  |
+5 | fn place(dispatch: PmPreparedPlaceDispatch) {
+  |          -------- move occurs because `dispatch` has type `PmPreparedPlaceDispatch`, which does not implement the `Copy` trait
+6 |     consume(dispatch);
+  |             -------- value moved here
+7 |     consume(dispatch);
+  |             ^^^^^^^^ value used here after move
+  |
+note: consider changing this parameter type in function `consume` to borrow instead if owning the value isn't necessary
+ --> tests/ui/prepared_dispatches_are_take_once.rs:3:26
+  |
+3 | fn consume<T>(_dispatch: T) {}
+  |    -------               ^ this parameter takes ownership of the value
+  |    |
+  |    in this function
+
+error[E0382]: use of moved value: `dispatch`
+  --> tests/ui/prepared_dispatches_are_take_once.rs:12:13
+   |
+10 | fn cancel(dispatch: PmPreparedCancelDispatch) {
+   |           -------- move occurs because `dispatch` has type `PmPreparedCancelDispatch`, which does not implement the `Copy` trait
+11 |     consume(dispatch);
+   |             -------- value moved here
+12 |     consume(dispatch);
+   |             ^^^^^^^^ value used here after move
+   |
+note: consider changing this parameter type in function `consume` to borrow instead if owning the value isn't necessary
+  --> tests/ui/prepared_dispatches_are_take_once.rs:3:26
+   |
+ 3 | fn consume<T>(_dispatch: T) {}
+   |    -------               ^ this parameter takes ownership of the value
+   |    |
+   |    in this function

@@ -28,19 +28,22 @@ use reap_polymarket_adapter::{
 use thiserror::Error;
 
 use super::authority::{approve_pm_cancel, approve_pm_quote};
+use super::authority::{take_prepared_cancel_dispatch, take_prepared_place_dispatch};
+use super::dispatch::{PmPreparedCancelDispatch, PmPreparedPlaceDispatch};
 use super::effect_queue::{
-    PmFakeEffectMetrics, PmFakeEffectPermit, PmFakeEffectQueue, PmFakeEffectQueueError,
-    PmPreparedFakeEffect, PmPreparedFakeEffectKind,
+    PmEffectDispatchMetrics, PmMutationDispatchPermit, PmMutationDispatchQueue,
+    PmMutationDispatchQueueError, PmPreparedMutation, PmPreparedMutationKind,
 };
 use super::effects::PmDurableRecordKind;
+use super::live_completion::PmAuthenticatedBridgeApplied;
 use super::persistence::{
-    PM_PENDING_PERSISTENCE_CAPACITY, PmPendingPersistence, PmPersistenceError,
+    PM_PENDING_PERSISTENCE_CAPACITY, PmPendingLiveBridge, PmPendingPersistence, PmPersistenceError,
     PmPersistenceFailure, PmPersistenceIntentIdentity, PmPersistenceMetrics, PmPersistencePoll,
     PmPersistenceQueue,
 };
 use super::private_reduction::PmPrivateReductionError;
 use super::{PmAuthorityError, PmAuthorityRevisions};
-use crate::fake_effect::PmFakeEffectRole;
+use crate::fake_effect::{PmFakeEffectRole, PmFixtureEffectExecutor, PmMutationPreparationRole};
 use crate::journal::{
     PmJournalCancelReasonV1, PmJournalError, PmJournalImmediateFillsV1, PmJournalPlaceOutcomeV1,
     PmJournalPlaceRejectReasonV1, PmJournalPlaceResultV1, PmJournalRecordV1, PmJournalRecovery,
@@ -50,8 +53,12 @@ use crate::private_monitor::{
     PmPrivateMonitorError, PmPrivateMonitorRuntime, PmServicedPrivateReduction,
 };
 
+#[cfg(any(test, feature = "loopback-evidence"))]
+mod authenticated_start;
+mod effect_dispatch;
 mod evidence;
 mod maintenance;
+mod persistence_service;
 mod terminal_safety;
 #[allow(
     unused_imports,
@@ -177,6 +184,16 @@ pub(crate) enum PmPersistenceService {
         identity: PmPersistenceIntentIdentity,
     },
     FactFailed,
+    LivePlaceApplied {
+        client_order: PmClientOrderKey,
+    },
+    LiveCancelApplied {
+        client_order: PmClientOrderKey,
+        venue_order: PmVenueOrderKey,
+    },
+    LiveBridgeFailed {
+        client_order: PmClientOrderKey,
+    },
 }
 
 /// Exact copied projection of one fact admitted to the mutation journal.
@@ -355,17 +372,22 @@ pub enum PmMutationHalt {
 ///
 /// Public/private observation reducers remain focused subreducers inside
 /// `PmPrivateMonitorRuntime`; this owner is the only object that can join
-/// readiness/risk, local reservation, the PM journal, and fake execution.
+/// readiness/risk, local reservation, the PM journal, and backend-neutral
+/// prepared dispatch authority.
 pub(crate) struct PmMutationOwner {
     scope: PmJournalScopeV1,
     instrument_scope: PmFixtureInstrumentScope,
     instrument_id: PmInstrumentId,
     private: Box<PmPrivateMonitorRuntime>,
-    fake: PmFakeEffectRole,
+    preparation: PmMutationPreparationRole,
     journal: PmMutationJournal,
     persistence: PmPersistenceQueue,
-    effects: PmFakeEffectQueue,
+    effects: PmMutationDispatchQueue,
     durable_consequences: VecDeque<PmDurableConsequence>,
+    quarantined_live_bridges: VecDeque<PmPendingLiveBridge>,
+    applied_live_bridges: VecDeque<PmAuthenticatedBridgeApplied>,
+    failed_live_bridges: VecDeque<PmAuthenticatedBridgeFailure>,
+    failed_goal_f_write: Option<PmGoalFWriterFailure>,
     reconciliation_reductions: PmReconciliationReductions,
     next_intent_id: u64,
     current_revisions: Option<PmAuthorityRevisions>,
@@ -379,7 +401,8 @@ impl PmMutationOwner {
         mut private: Box<PmPrivateMonitorRuntime>,
         fake: PmFakeEffectRole,
         journal_path: PathBuf,
-    ) -> Result<(Self, PmJournalRecovery), PmMutationError> {
+    ) -> Result<(Self, PmJournalRecovery, PmFixtureEffectExecutor), PmMutationError> {
+        let (preparation, executor) = fake.split();
         let scope = PmJournalScopeV1::from_config(config)?;
         let instrument_scope = PmFixtureInstrumentScope::from_metadata(
             config.account().instrument(),
@@ -388,13 +411,17 @@ impl PmMutationOwner {
         let instrument_id = config.account().instrument_id();
         if private.account_scope() != scope.account_scope()
             || private.instrument() != config.account().instrument()
-            || fake.account_scope() != scope.account_scope()
-            || fake.instrument() != config.account().instrument()
-            || fake.instrument_id() != instrument_id
+            || preparation.account_scope() != scope.account_scope()
+            || preparation.instrument() != config.account().instrument()
+            || preparation.instrument_id() != instrument_id
         {
             return Err(PmMutationError::CompositionScopeMismatch);
         }
         let (journal, recovery) = PmMutationJournal::start(journal_path, scope.clone()).await?;
+        if recovery.authenticated_results().next().is_some() {
+            let _ = journal.shutdown().await;
+            return Err(PmMutationError::UnexpectedAuthenticatedJournalBridge);
+        }
         if let Err(error) =
             super::mutation_recovery::recover_private_owner(private.as_mut(), &recovery)
         {
@@ -419,11 +446,15 @@ impl PmMutationOwner {
                 instrument_scope,
                 instrument_id,
                 private,
-                fake,
+                preparation,
                 journal,
                 persistence: PmPersistenceQueue::new(),
-                effects: PmFakeEffectQueue::new()?,
+                effects: PmMutationDispatchQueue::new()?,
                 durable_consequences: VecDeque::with_capacity(PM_PENDING_PERSISTENCE_CAPACITY),
+                quarantined_live_bridges: VecDeque::with_capacity(2),
+                applied_live_bridges: VecDeque::with_capacity(2),
+                failed_live_bridges: VecDeque::with_capacity(2),
+                failed_goal_f_write: None,
                 reconciliation_reductions: PmReconciliationReductions::new(),
                 next_intent_id,
                 current_revisions: None,
@@ -431,6 +462,7 @@ impl PmMutationOwner {
                 counters: PmMutationCounters::default(),
             },
             recovery,
+            executor,
         ))
     }
 
@@ -452,7 +484,7 @@ impl PmMutationOwner {
     /// Durably abandons one prepared but never-dispatched quote after an
     /// authority-bearing dependency changed.
     ///
-    /// The fake effect remains retained until the local rejection record is
+    /// The prepared mutation remains retained until the local rejection record is
     /// admitted, so a journal failure cannot lose executable authority.
     pub(crate) fn invalidate_prepared_quote(
         &mut self,
@@ -516,7 +548,7 @@ impl PmMutationOwner {
             client_order,
             candidate,
             request.reservation,
-            self.fake.place_profile(),
+            self.preparation.place_profile(),
             request.salt,
             request.timestamp_ms,
             self.current_revisions
@@ -635,8 +667,8 @@ impl PmMutationOwner {
             self.scope.account_scope(),
             self.instrument_id,
             order,
-            self.fake.place_profile(),
-            self.fake.cancel_purpose(),
+            self.preparation.place_profile(),
+            self.preparation.cancel_purpose(),
             request.salt,
             request.timestamp_ms,
             request.approved_at_monotonic_ns,
@@ -706,293 +738,8 @@ impl PmMutationOwner {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn service_persistence(
-        &mut self,
-        monotonic_now_ns: u64,
-    ) -> Result<PmPersistenceService, PmMutationError> {
-        let poll = self.poll_persistence(monotonic_now_ns)?;
-        self.reduce_persistence_poll(poll, monotonic_now_ns)
-    }
-
-    /// Polls the bounded durable-writer edge without consuming the exact
-    /// acknowledgement authority.
-    ///
-    /// The complete product scheduler carries non-empty/non-pending values
-    /// through its persistence lane before returning them to
-    /// [`Self::reduce_persistence_poll`]. This split keeps one mutation owner
-    /// while making cross-lane ordering explicit and replayable.
-    pub(crate) fn poll_persistence(
-        &mut self,
-        monotonic_now_ns: u64,
-    ) -> Result<PmPersistencePoll, PmMutationError> {
-        match self.persistence.poll_one(monotonic_now_ns) {
-            Ok(poll) => Ok(poll),
-            Err(PmPersistenceError::ClockRegression) => {
-                self.halt = Some(PmMutationHalt::PersistenceClockRegression);
-                Err(PmPersistenceError::ClockRegression.into())
-            }
-            Err(error) => {
-                self.halt = Some(PmMutationHalt::PersistenceSaturated);
-                Err(error.into())
-            }
-        }
-    }
-
-    /// Reduces one scheduler-serviced durable result exactly once.
-    pub(crate) fn reduce_persistence_poll(
-        &mut self,
-        poll: PmPersistencePoll,
-        monotonic_service_ns: u64,
-    ) -> Result<PmPersistenceService, PmMutationError> {
-        Self::validate_persistence_time(monotonic_service_ns)?;
-        match poll {
-            PmPersistencePoll::Empty => Ok(PmPersistenceService::Empty),
-            PmPersistencePoll::Pending => Ok(PmPersistenceService::Pending),
-            PmPersistencePoll::QuoteAcknowledged {
-                reserved,
-                effect_permit,
-                acknowledgement,
-            } => {
-                let identity = PmPersistenceIntentIdentity::Quote {
-                    intent: reserved.intent(),
-                    client_order: reserved.client_order(),
-                };
-                let Some(revisions) = self.current_revisions else {
-                    return self.invalidate_durable_quote(
-                        identity,
-                        effect_permit,
-                        monotonic_service_ns,
-                    );
-                };
-                match self.fake.prepare_quote(
-                    reserved,
-                    self.instrument_scope,
-                    revisions,
-                    monotonic_service_ns,
-                    acknowledgement,
-                ) {
-                    Ok(authority) => {
-                        self.effects.commit(
-                            effect_permit,
-                            PmPreparedFakeEffect::Quote { authority },
-                            monotonic_service_ns,
-                        )?;
-                        self.counters.prepared_quotes =
-                            self.counters.prepared_quotes.saturating_add(1);
-                        Ok(PmPersistenceService::PreparedQuote { identity })
-                    }
-                    Err(
-                        error @ (PmAuthorityError::RevisionChanged
-                        | PmAuthorityError::ApprovalExpired),
-                    ) => {
-                        let _expected_invalidation = error;
-                        self.invalidate_durable_quote(identity, effect_permit, monotonic_service_ns)
-                    }
-                    Err(error) => {
-                        self.retain_failed_effect(
-                            effect_permit,
-                            PmMutationHalt::PreparationFailed,
-                        )?;
-                        self.counters.preparation_failures =
-                            self.counters.preparation_failures.saturating_add(1);
-                        Err(error.into())
-                    }
-                }
-            }
-            PmPersistencePoll::CancelAcknowledged {
-                reserved,
-                owned_intent,
-                effect_permit,
-                acknowledgement,
-            } => {
-                let identity = PmPersistenceIntentIdentity::Cancel {
-                    client_order: owned_intent.client_order(),
-                    venue_order: owned_intent.venue_order(),
-                };
-                match self.fake.prepare_cancel(
-                    reserved,
-                    self.instrument_scope,
-                    monotonic_service_ns,
-                    acknowledgement,
-                ) {
-                    Ok(authority) => {
-                        self.effects.commit(
-                            effect_permit,
-                            PmPreparedFakeEffect::Cancel {
-                                authority,
-                                owned_intent,
-                            },
-                            monotonic_service_ns,
-                        )?;
-                        self.counters.prepared_cancels =
-                            self.counters.prepared_cancels.saturating_add(1);
-                        Ok(PmPersistenceService::PreparedCancel { identity })
-                    }
-                    Err(error) => {
-                        self.retain_failed_effect(
-                            effect_permit,
-                            PmMutationHalt::PreparationFailed,
-                        )?;
-                        self.counters.preparation_failures =
-                            self.counters.preparation_failures.saturating_add(1);
-                        Err(error.into())
-                    }
-                }
-            }
-            PmPersistencePoll::FactAcknowledged {
-                acknowledgement,
-                compaction,
-            } => {
-                let sequence = acknowledgement.consume();
-                if let Some(ticket) = compaction {
-                    let compacted = self
-                        .private
-                        .commit_fill_watermark_compaction(ticket)
-                        .map_err(|error| {
-                            self.halt = Some(PmMutationHalt::InternalInvariant);
-                            PmMutationError::State(error)
-                        })?;
-                    self.count_compaction(compacted);
-                }
-                Ok(PmPersistenceService::FactAcknowledged { sequence })
-            }
-            PmPersistencePoll::IntentFailed {
-                identity,
-                effect_permit,
-                reason,
-            } => {
-                let halt = Self::halt_for_persistence_failure(&reason);
-                self.retain_failed_effect(effect_permit, halt)?;
-                self.record_persistence_failure(&reason);
-                Ok(PmPersistenceService::IntentFailed { identity })
-            }
-            PmPersistencePoll::FactFailed { reason, compaction } => {
-                if let Some(ticket) = compaction {
-                    self.private
-                        .abort_fill_watermark_compaction(ticket)
-                        .map_err(|error| {
-                            self.halt = Some(PmMutationHalt::InternalInvariant);
-                            PmMutationError::State(error)
-                        })?;
-                }
-                self.halt = Some(Self::halt_for_persistence_failure(&reason));
-                self.record_persistence_failure(&reason);
-                Ok(PmPersistenceService::FactFailed)
-            }
-        }
-    }
-
-    pub(crate) fn next_effect_kind(&self) -> Option<PmPreparedFakeEffectKind> {
-        self.effects.next_kind()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn execute_next_quote(
-        &mut self,
-        script: PmFakePlaceScript,
-        monotonic_service_ns: u64,
-    ) -> Result<(), PmMutationError> {
-        let result = self.execute_next_quote_to_result(script, monotonic_service_ns)?;
-        self.reduce_serviced_fake_place(result, monotonic_service_ns)
-    }
-
-    /// Consumes one prepared quote only at the fixture edge and returns its
-    /// exact result for critical-lane ordering.
-    pub(crate) fn execute_next_quote_to_result(
-        &mut self,
-        script: PmFakePlaceScript,
-        monotonic_service_ns: u64,
-    ) -> Result<PmFakePlaceResult, PmMutationError> {
-        if self.next_effect_kind() != Some(PmPreparedFakeEffectKind::Quote) {
-            return Err(PmMutationError::EffectKindMismatch);
-        }
-        let effect = match self
-            .effects
-            .pop_quote_at(monotonic_service_ns, self.current_revisions)
-        {
-            Ok(effect) => effect,
-            Err(error) => {
-                self.halt = Some(
-                    if error == PmFakeEffectQueueError::QuoteAuthorityInvalidated {
-                        PmMutationHalt::PreparationFailed
-                    } else {
-                        PmMutationHalt::FakeEffectSaturated
-                    },
-                );
-                return Err(error.into());
-            }
-        };
-        let Some(PmPreparedFakeEffect::Quote { authority }) = effect else {
-            return Err(PmMutationError::EffectKindMismatch);
-        };
-        Ok(self.fake.execute_quote(authority, script)?)
-    }
-
-    /// Applies one scheduler-serviced fake place result to canonical state and
-    /// its journal.
-    pub(crate) fn reduce_serviced_fake_place(
-        &mut self,
-        result: PmFakePlaceResult,
-        monotonic_service_ns: u64,
-    ) -> Result<(), PmMutationError> {
-        super::reduction::reduce_fake_place(self, result, monotonic_service_ns)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn execute_next_cancel(
-        &mut self,
-        script: PmFakeCancelScript,
-        monotonic_service_ns: u64,
-    ) -> Result<(), PmMutationError> {
-        let result = self.execute_next_cancel_to_result(script, monotonic_service_ns)?;
-        self.reduce_serviced_fake_cancel(result, monotonic_service_ns)
-    }
-
-    /// Consumes one prepared owned cancel only at the fixture edge and returns
-    /// the paired result/ownership proof for critical-lane ordering.
-    pub(crate) fn execute_next_cancel_to_result(
-        &mut self,
-        script: PmFakeCancelScript,
-        monotonic_service_ns: u64,
-    ) -> Result<PmPendingFakeCancelResult, PmMutationError> {
-        if self.next_effect_kind() != Some(PmPreparedFakeEffectKind::Cancel) {
-            return Err(PmMutationError::EffectKindMismatch);
-        }
-        let effect = match self.effects.pop_at(monotonic_service_ns) {
-            Ok(effect) => effect,
-            Err(error) => {
-                self.halt = Some(PmMutationHalt::FakeEffectSaturated);
-                return Err(error.into());
-            }
-        };
-        let Some(PmPreparedFakeEffect::Cancel {
-            authority,
-            owned_intent,
-        }) = effect
-        else {
-            return Err(PmMutationError::EffectKindMismatch);
-        };
-        let result = self.fake.execute_cancel(authority, script)?;
-        Ok(PmPendingFakeCancelResult {
-            intent: owned_intent,
-            result,
-        })
-    }
-
-    /// Applies one scheduler-serviced fake cancel result to canonical state
-    /// and its journal.
-    pub(crate) fn reduce_serviced_fake_cancel(
-        &mut self,
-        pending: PmPendingFakeCancelResult,
-        monotonic_service_ns: u64,
-    ) -> Result<(), PmMutationError> {
-        let (intent, result) = pending.into_parts();
-        super::reduction::reduce_fake_cancel(self, intent, result, monotonic_service_ns)
-    }
-
     /// Applies one scheduled private lifecycle observation and records its
-    /// exact owned consequence before another fake effect may run.
+    /// exact owned consequence before another mutation dispatch may run.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn reduce_serviced_private_observation(
         &mut self,
@@ -1023,7 +770,7 @@ impl PmMutationOwner {
     ) -> Result<usize, PmMutationError> {
         let envelope = self
             .private
-            .open_product_private_fixture(delivery, monotonic_service_ns)?;
+            .open_product_private(delivery, monotonic_service_ns)?;
         self.private
             .validate_private_batch(envelope.payload().observations())?;
         let observation_count = envelope.payload().observations().len();
@@ -1077,7 +824,12 @@ impl PmMutationOwner {
         self.persistence.projection()
     }
 
-    pub(crate) fn fake_effect_metrics(&self) -> PmFakeEffectMetrics {
+    #[cfg(test)]
+    pub(crate) fn fake_effect_metrics(&self) -> PmEffectDispatchMetrics {
+        self.effect_dispatch_metrics()
+    }
+
+    pub(crate) fn effect_dispatch_metrics(&self) -> PmEffectDispatchMetrics {
         self.effects.projection()
     }
 
@@ -1096,9 +848,13 @@ impl PmMutationOwner {
             .saturating_add(std::mem::size_of::<PmPrivateMonitorRuntime>())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "loopback-evidence"))]
     pub(crate) fn pending_persistence(&self) -> usize {
         self.persistence.len()
+    }
+
+    pub(crate) fn has_pending_live_bridge(&self) -> bool {
+        self.persistence.has_pending_live_bridge()
     }
 
     #[cfg(test)]
@@ -1126,6 +882,10 @@ impl PmMutationOwner {
 
     pub(super) fn private_mut(&mut self) -> &mut PmPrivateMonitorRuntime {
         self.private.as_mut()
+    }
+
+    pub(super) fn private(&self) -> &PmPrivateMonitorRuntime {
+        self.private.as_ref()
     }
 
     pub(super) fn reduce_private_reconciliation(
@@ -1168,6 +928,10 @@ impl PmMutationOwner {
 
     pub(super) const fn account_scope(&self) -> reap_pm_core::PmAccountScope {
         self.scope.account_scope()
+    }
+
+    pub(super) const fn journal_scope(&self) -> &PmJournalScopeV1 {
+        &self.scope
     }
 
     pub(super) fn ensure_fact_capacity(
@@ -1231,8 +995,15 @@ impl PmMutationOwner {
                 return Err(error.into());
             }
         };
+        let correlation = self.counters.fact_records.saturating_add(1);
+        let failure_identity = PmGoalFWriterFailureIdentity::Fact {
+            kind,
+            client_order,
+            correlation,
+        };
         if let Err((error, pending)) = self.persistence.push_retaining(PmPendingPersistence::Fact {
             receipt: pending,
+            failure_identity,
             compaction,
             enqueued_monotonic_ns: monotonic_now_ns,
         }) {
@@ -1248,7 +1019,7 @@ impl PmMutationOwner {
             self.halt = Some(PmMutationHalt::InternalInvariant);
             return Err(error.into());
         }
-        self.counters.fact_records = self.counters.fact_records.saturating_add(1);
+        self.counters.fact_records = correlation;
         self.durable_consequences.push_back(PmDurableConsequence {
             kind,
             client_order,
@@ -1292,6 +1063,10 @@ impl PmMutationOwner {
         self.halt = Some(PmMutationHalt::InternalInvariant);
     }
 
+    pub(super) fn require_authenticated_reconciliation(&mut self) {
+        self.halt = Some(PmMutationHalt::RecoveryReconciliationRequired);
+    }
+
     fn ensure_quote_available(&self) -> Result<(), PmMutationError> {
         if let Some(halt) = self.halt {
             Err(PmMutationError::Halted(halt))
@@ -1320,7 +1095,7 @@ impl PmMutationOwner {
 
     fn retain_failed_effect(
         &mut self,
-        permit: PmFakeEffectPermit,
+        permit: PmMutationDispatchPermit,
         halt: PmMutationHalt,
     ) -> Result<(), PmMutationError> {
         self.effects.retain_after_durable_failure(permit)?;
@@ -1346,7 +1121,7 @@ impl PmMutationOwner {
         }
     }
 
-    fn reserve_effect_capacity(&mut self) -> Result<PmFakeEffectPermit, PmMutationError> {
+    fn reserve_effect_capacity(&mut self) -> Result<PmMutationDispatchPermit, PmMutationError> {
         self.effects.try_reserve().map_err(|error| {
             self.halt = Some(PmMutationHalt::FakeEffectSaturated);
             PmMutationError::EffectQueue(error)
@@ -1366,6 +1141,112 @@ impl PmMutationOwner {
     fn persistence_failure(&mut self, error: PmPersistenceError) -> PmMutationError {
         self.halt = Some(PmMutationHalt::PersistenceSaturated);
         PmMutationError::Persistence(error)
+    }
+}
+
+/// Bounded, secret-free projection of a failed authenticated result bridge.
+///
+/// The pending completion remains quarantined inside the mutation owner. This
+/// projection lets the authenticated run report the writer failure instead of
+/// later misclassifying it as an elapsed durability deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("authenticated result bridge failed for {client_order:?}: {reason} (place={place})")]
+pub(crate) struct PmAuthenticatedBridgeFailure {
+    place: bool,
+    client_order: PmClientOrderKey,
+    reason: PmAuthenticatedBridgeFailureReason,
+}
+
+/// Bounded, secret-free identity of the first non-bridge Goal-F writer
+/// failure retained by the mutation owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PmGoalFWriterFailureIdentity {
+    Intent(PmPersistenceIntentIdentity),
+    Fact {
+        kind: PmDurableRecordKind,
+        client_order: Option<PmClientOrderKey>,
+        correlation: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("Goal-F writer failed for {identity:?}: {reason}")]
+pub(crate) struct PmGoalFWriterFailure {
+    identity: PmGoalFWriterFailureIdentity,
+    reason: PmGoalFWriterFailureReason,
+}
+
+impl PmGoalFWriterFailure {
+    const fn new(identity: PmGoalFWriterFailureIdentity, reason: &PmPersistenceFailure) -> Self {
+        Self {
+            identity,
+            reason: PmGoalFWriterFailureReason::from_persistence(reason),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn identity(self) -> PmGoalFWriterFailureIdentity {
+        self.identity
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn reason(self) -> PmGoalFWriterFailureReason {
+        self.reason
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub(crate) enum PmGoalFWriterFailureReason {
+    #[error("durability writer rejected the record")]
+    Durability,
+    #[error("durability writer closed before acknowledgement")]
+    Closed,
+    #[error("pending record exceeded its bounded service age")]
+    AgeExceeded,
+}
+
+impl PmGoalFWriterFailureReason {
+    const fn from_persistence(reason: &PmPersistenceFailure) -> Self {
+        match reason {
+            PmPersistenceFailure::Durability(_) => Self::Durability,
+            PmPersistenceFailure::Closed => Self::Closed,
+            PmPersistenceFailure::AgeExceeded => Self::AgeExceeded,
+        }
+    }
+}
+
+impl PmAuthenticatedBridgeFailure {
+    fn from_pending(completion: &PmPendingLiveBridge, reason: &PmPersistenceFailure) -> Self {
+        Self {
+            place: completion.is_place(),
+            client_order: completion.client_order(),
+            reason: PmAuthenticatedBridgeFailureReason::from_persistence(reason),
+        }
+    }
+
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub(crate) const fn is_place(self) -> bool {
+        self.place
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+enum PmAuthenticatedBridgeFailureReason {
+    #[error("durability writer rejected the record")]
+    Durability,
+    #[error("durability writer closed before acknowledgement")]
+    Closed,
+    #[error("pending bridge exceeded its bounded service age")]
+    AgeExceeded,
+}
+
+impl PmAuthenticatedBridgeFailureReason {
+    const fn from_persistence(reason: &PmPersistenceFailure) -> Self {
+        match reason {
+            PmPersistenceFailure::Durability(_) => Self::Durability,
+            PmPersistenceFailure::Closed => Self::Closed,
+            PmPersistenceFailure::AgeExceeded => Self::AgeExceeded,
+        }
     }
 }
 
@@ -1397,6 +1278,17 @@ fn durable_consequence_projection(
         PmJournalRecordV1::FillWatermarkAdvanced(_) => {
             Ok((PmDurableRecordKind::FillWatermarkAdvanced, None))
         }
+        PmJournalRecordV1::AuthenticatedResult(result) => Ok((
+            match result {
+                crate::journal::PmJournalAuthenticatedResultV1::Place(_) => {
+                    PmDurableRecordKind::PlaceResult
+                }
+                crate::journal::PmJournalAuthenticatedResultV1::Cancel(_) => {
+                    PmDurableRecordKind::CancelResult
+                }
+            },
+            Some(result.client_order()),
+        )),
         PmJournalRecordV1::Header(_) => Err(PmMutationError::InvalidDurableConsequence),
     }
 }
@@ -1418,7 +1310,7 @@ pub(crate) enum PmMutationError {
     },
     #[error("PM canonical owned order is unknown")]
     UnknownOwnedOrder,
-    #[error("PM fake-effect script does not match the next prepared effect")]
+    #[error("PM execution outcome does not match the next prepared mutation")]
     EffectKindMismatch,
     #[error("PM copied durable-consequence queue is saturated")]
     DurableConsequenceSaturated,
@@ -1426,10 +1318,31 @@ pub(crate) enum PmMutationError {
     InvalidDurableConsequence,
     #[error("PM persistence identity did not name a quote")]
     InvalidPersistenceIdentity,
-    #[error("PM locally invalidated quote was not pending fake dispatch")]
+    #[error("PM locally invalidated quote was not pending dispatch")]
     InvalidLocalInvalidation,
     #[error("PM journal recovery could not reproduce canonical owned state")]
     RecoveryProjectionMismatch,
+    #[error("fake PM composition found an authenticated-result bridge without its auth journal")]
+    UnexpectedAuthenticatedJournalBridge,
+    #[error(transparent)]
+    AuthenticatedRecovery(#[from] super::authenticated_recovery::PmAuthenticatedRecoveryError),
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    #[error("authenticated Goal-F bridge repair durability wait is outside its fixed bound")]
+    InvalidAuthenticatedBridgeDurabilityTimeout,
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    #[error("authenticated Goal-F bridge repair timed out before exact durability")]
+    AuthenticatedBridgeDurabilityTimeout,
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    #[error("authenticated Goal-F bridge repair durability failed: {0}")]
+    AuthenticatedBridgeDurabilityFailed(String),
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    #[error("authenticated Goal-F bridge repair writer closed before acknowledgement")]
+    AuthenticatedBridgeWriterClosed,
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    #[error("authenticated Goal-F bridge repair did not converge after exact re-recovery")]
+    AuthenticatedBridgeRepairIncomplete,
+    #[error("authenticated Goal-F bridge application proof queue is saturated")]
+    AuthenticatedBridgeCompletionSaturated,
     #[error("PM owned quote admission changed after its sole-owner preflight")]
     QuoteAdmissionChanged,
     #[error(transparent)]
@@ -1453,11 +1366,13 @@ pub(crate) enum PmMutationError {
     #[error(transparent)]
     Authority(#[from] PmAuthorityError),
     #[error(transparent)]
-    EffectQueue(#[from] PmFakeEffectQueueError),
+    EffectQueue(#[from] PmMutationDispatchQueueError),
     #[error(transparent)]
     Persistence(#[from] PmPersistenceError),
     #[error(transparent)]
     Reduction(#[from] super::reduction::PmReductionError),
+    #[error(transparent)]
+    AuthenticatedReduction(#[from] super::authenticated_reduction::PmAuthenticatedReductionError),
     #[error(transparent)]
     PrivateMonitor(#[from] PmPrivateMonitorError),
 }

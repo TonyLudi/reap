@@ -8,22 +8,101 @@ use reap_polymarket_adapter::{
 };
 
 use super::*;
+#[cfg(any(test, feature = "loopback-evidence"))]
+use crate::coordinator::PmPreparedMutationKind;
+use crate::fake_effect::PmFixtureEffectExecutor;
 use crate::lanes::{
     PmCompleteInputSource, PmCompleteLaneBuildError, PmCompleteLaneEnqueueError,
     PmCompleteLaneService, PmCompleteServiceCounts, PmCompleteServiceError, PmPrivateInput,
     PmPublicLaneService, PmReconciliationInput, PmStopControl, PmTelemetryInput,
 };
 use crate::private_monitor::{
-    PmAccountFixtureInput, PmOpenOrdersFixtureInput, PmOrderDetailFixtureInput,
+    PmAccountFixtureInput, PmLiveAccountInput, PmLiveConnectionInput, PmLiveIngressReport,
+    PmLiveOpenOrdersInput, PmLiveOrderDetailInput, PmLivePrivateInput, PmLiveReconciliationInput,
+    PmLiveRetirementInput, PmOpenOrdersFixtureInput, PmOrderDetailFixtureInput,
     PmReconciliationFixtureInput,
+};
+#[cfg(any(test, feature = "loopback-evidence"))]
+use crate::private_monitor::{
+    PmLiveAccountFailureInput, PmLiveHttpDependencyFailure, PmLiveInternalControlOccurrence,
+    PmLiveMutationCompletionOccurrence, PmLiveOpenOrdersFailureInput,
+    PmLiveOrderDetailFailureInput, PmLivePersistencePollOccurrence,
+    PmLiveReconciliationFailureInput,
 };
 use crate::public_routes::{OkxPublicUnavailable, PmPublicUnavailable};
 use crate::schedule::{PmScheduleAdmission, PmScheduleError};
+
+mod live_ingress;
+mod reconciliation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublicUnavailableSource {
     Polymarket,
     Okx,
+}
+
+#[cfg(any(test, feature = "loopback-evidence"))]
+impl<M: PmQuoteModel> PmCoordinator<M> {
+    /// Reserves the authenticated completion boundary before a supervisor
+    /// moves a joined task completion out of its retaining outcome.
+    ///
+    /// The borrowed permit prevents another coordinator operation from
+    /// occupying the retained-critical slot between the check and admission.
+    /// If the lane itself rejects the subsequent input, `enqueue_critical`
+    /// retains that exact move-only input inside the coordinator.
+    pub(crate) fn reserve_authenticated_completion(
+        &mut self,
+    ) -> Result<PmAuthenticatedCompletionAdmission<'_, M>, PmCoordinatorError> {
+        if !self.critical_admission_available() {
+            return Err(PmCoordinatorError::CriticalAdmissionRetained);
+        }
+        Ok(PmAuthenticatedCompletionAdmission { coordinator: self })
+    }
+}
+
+/// Borrowed, consume-once reservation for one authenticated critical result.
+///
+/// A product supervisor obtains this value while it still owns the joined
+/// task outcome. Consequently an occupied retained-critical slot is reported
+/// before the move-only completion or its sealed occurrence is transferred.
+#[must_use = "the reserved authenticated completion must be admitted before releasing the coordinator borrow"]
+#[cfg(any(test, feature = "loopback-evidence"))]
+pub(crate) struct PmAuthenticatedCompletionAdmission<'a, M: PmQuoteModel> {
+    coordinator: &'a mut PmCoordinator<M>,
+}
+
+#[cfg(any(test, feature = "loopback-evidence"))]
+impl<M: PmQuoteModel> PmAuthenticatedCompletionAdmission<'_, M> {
+    /// Admits one already-auth-journal-durable place completion. If the lane
+    /// is full, the coordinator retains this exact input for retry. This is
+    /// the sole allocation for the live-place completion; the same box moves
+    /// through the Goal-F durability bridge without replacement.
+    pub(crate) fn admit_place(
+        self,
+        occurrence: PmLiveMutationCompletionOccurrence,
+        completion: PmLivePlaceCompletion,
+    ) -> Result<(), PmCoordinatorError> {
+        let occurrence = occurrence.into_occurrence();
+        let ingress = self.coordinator.internal_ingress(&occurrence);
+        self.coordinator.enqueue_critical(
+            ingress,
+            PmCriticalInput::LivePlaceResult(Box::new(completion)),
+        )
+    }
+
+    /// Admits one already-auth-journal-durable exact-owned cancel completion.
+    /// If the lane is full, the coordinator retains this exact input for
+    /// retry rather than returning or dropping its ownership evidence.
+    pub(crate) fn admit_cancel(
+        self,
+        occurrence: PmLiveMutationCompletionOccurrence,
+        completion: PmLiveCancelCompletion,
+    ) -> Result<(), PmCoordinatorError> {
+        let occurrence = occurrence.into_occurrence();
+        let ingress = self.coordinator.internal_ingress(&occurrence);
+        self.coordinator
+            .enqueue_critical(ingress, PmCriticalInput::LiveCancelResult(completion))
+    }
 }
 
 impl<M: PmQuoteModel> PmCoordinator<M> {
@@ -147,18 +226,25 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         }
     }
 
-    pub(crate) fn connect_private_fixture(
+    pub(crate) fn connect_private(
         &mut self,
         occurrence: PmFixtureCompletionOccurrence,
     ) -> Result<(), PmCoordinatorError> {
-        let ingress = self.account_fixture_ingress(&occurrence);
+        let ingress = self.account_ingress(&occurrence);
         self.mutation
             .private_mut()
             .prepare_product_private_reconnect(occurrence.ordering().connection_epoch())?;
         self.enqueue_private(ingress, PmPrivateInput::ConnectionAvailable)
     }
 
-    pub(crate) fn mark_private_fixture_unavailable(
+    pub(crate) fn connect_private_fixture(
+        &mut self,
+        occurrence: PmFixtureCompletionOccurrence,
+    ) -> Result<(), PmCoordinatorError> {
+        self.connect_private(occurrence)
+    }
+
+    pub(crate) fn mark_private_unavailable(
         &mut self,
         occurrence: PmFixtureCompletionOccurrence,
         fault: PmPrivateExternalIngressFault,
@@ -168,7 +254,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         {
             return Err(crate::private_monitor::PmPrivateMonitorError::PrivateEpochMismatch.into());
         }
-        let ingress = self.account_fixture_ingress(&occurrence);
+        let ingress = self.account_ingress(&occurrence);
         self.enqueue_private(ingress, PmPrivateInput::ConnectionUnavailable(fault))
     }
 
@@ -182,10 +268,10 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
             .mutation
             .private_mut()
             .receive_product_private_fixture(occurrence, raw, fee)?;
-        let input = PmPrivateInput::FixtureBatch(delivery);
+        let input = PmPrivateInput::Batch(delivery);
         let ingress = input
-            .fixture_ingress()
-            .expect("fixture batches retain exact product ingress");
+            .ingress()
+            .expect("private batches retain exact product ingress");
         self.enqueue_private(ingress, input)
     }
 
@@ -197,8 +283,10 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
             .mutation
             .private_mut()
             .complete_product_account_fixture(input)?;
-        let input = PmReconciliationInput::StandaloneAccountFixture(delivery);
-        let ingress = input.fixture_ingress();
+        let input = PmReconciliationInput::StandaloneAccount(delivery);
+        let ingress = input
+            .ingress()
+            .expect("complete account delivery carries product ingress");
         self.enqueue_reconciliation(ingress, input)
     }
 
@@ -210,8 +298,10 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
             .mutation
             .private_mut()
             .complete_product_open_orders_fixture(input)?;
-        let input = PmReconciliationInput::OpenOrdersFixture(delivery);
-        let ingress = input.fixture_ingress();
+        let input = PmReconciliationInput::OpenOrders(delivery);
+        let ingress = input
+            .ingress()
+            .expect("complete open-orders delivery carries product ingress");
         self.enqueue_reconciliation(ingress, input)
     }
 
@@ -223,8 +313,10 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
             .mutation
             .private_mut()
             .complete_product_order_detail_fixture(input)?;
-        let input = PmReconciliationInput::OrderDetailFixture(delivery);
-        let ingress = input.fixture_ingress();
+        let input = PmReconciliationInput::OrderDetail(delivery);
+        let ingress = input
+            .ingress()
+            .expect("complete order-detail delivery carries product ingress");
         self.enqueue_reconciliation(ingress, input)
     }
 
@@ -236,8 +328,10 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
             .mutation
             .private_mut()
             .complete_product_reconciliation_fixture(input)?;
-        let input = PmReconciliationInput::PairedFixture(delivery);
-        let ingress = input.fixture_ingress();
+        let input = PmReconciliationInput::Paired(delivery);
+        let ingress = input
+            .ingress()
+            .expect("complete reconciliation delivery carries product ingress");
         self.enqueue_reconciliation(ingress, input)
     }
 
@@ -245,7 +339,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         &mut self,
         occurrence: PmFixtureCompletionOccurrence,
     ) -> Result<(), PmCoordinatorError> {
-        let ingress = self.internal_fixture_ingress(&occurrence);
+        let ingress = self.internal_ingress(&occurrence);
         self.enqueue_critical(ingress, PmCriticalInput::Stop(PmStopControl::Shutdown))
     }
 
@@ -253,7 +347,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         &mut self,
         occurrence: PmFixtureCompletionOccurrence,
     ) -> Result<(), PmCoordinatorError> {
-        let ingress = self.internal_fixture_ingress(&occurrence);
+        let ingress = self.internal_ingress(&occurrence);
         self.enqueue_critical(ingress, PmCriticalInput::Stop(PmStopControl::GlobalStop))
     }
 
@@ -265,7 +359,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         let Some(halt) = crate::lanes::PmScopedHalt::new(scope) else {
             return Ok(false);
         };
-        let ingress = self.internal_fixture_ingress(&occurrence);
+        let ingress = self.internal_ingress(&occurrence);
         self.enqueue_critical(ingress, PmCriticalInput::ScopedHalt(halt))?;
         Ok(true)
     }
@@ -276,7 +370,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         kind: crate::lanes::PmTelemetryKind,
         value: u64,
     ) -> Result<(), PmCoordinatorError> {
-        let ingress = self.internal_fixture_ingress(&occurrence);
+        let ingress = self.internal_ingress(&occurrence);
         self.enqueue_telemetry(ingress, PmTelemetryInput::new(kind, value))
     }
 
@@ -285,28 +379,126 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         occurrence: PmFixtureCompletionOccurrence,
         monotonic_poll_ns: u64,
     ) -> Result<bool, PmCoordinatorError> {
-        let ingress = self.internal_fixture_ingress(&occurrence);
+        let ingress = self.internal_ingress(&occurrence);
         self.poll_persistence_into_lane(ingress, monotonic_poll_ns)
     }
 
     pub(crate) fn execute_prepared_quote_fixture(
         &mut self,
+        executor: &PmFixtureEffectExecutor,
         occurrence: PmFixtureCompletionOccurrence,
         script: PmFakePlaceScript,
         monotonic_effect_ns: u64,
     ) -> Result<(), PmCoordinatorError> {
-        let ingress = self.internal_fixture_ingress(&occurrence);
-        self.execute_prepared_quote_into_lane(ingress, script, monotonic_effect_ns)
+        let ingress = self.internal_ingress(&occurrence);
+        self.execute_prepared_quote_into_lane(executor, ingress, script, monotonic_effect_ns)
     }
 
     pub(crate) fn execute_prepared_cancel_fixture(
         &mut self,
+        executor: &PmFixtureEffectExecutor,
         occurrence: PmFixtureCompletionOccurrence,
         script: PmFakeCancelScript,
         monotonic_effect_ns: u64,
     ) -> Result<(), PmCoordinatorError> {
-        let ingress = self.internal_fixture_ingress(&occurrence);
-        self.execute_prepared_cancel_into_lane(ingress, script, monotonic_effect_ns)
+        let ingress = self.internal_ingress(&occurrence);
+        self.execute_prepared_cancel_into_lane(executor, ingress, script, monotonic_effect_ns)
+    }
+
+    /// Moves one already-durable place dispatch out to the statically selected
+    /// backend before any journal or transport await begins.
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub(crate) fn take_prepared_place_for_live(
+        &mut self,
+        monotonic_effect_ns: u64,
+    ) -> Result<PmPreparedPlaceDispatch, PmCoordinatorError> {
+        Ok(self
+            .mutation
+            .take_next_place_dispatch(monotonic_effect_ns)?)
+    }
+
+    /// Suppresses and retains the durable head quote when the authenticated
+    /// place worker cannot reserve its sole in-flight slot. This transition
+    /// deliberately occurs without producing a dispatch value, allowing a
+    /// following owned cancel to reach its independent worker.
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub(crate) fn quarantine_place_for_authenticated_backpressure(
+        &mut self,
+    ) -> Result<(), PmCoordinatorError> {
+        Ok(self
+            .mutation
+            .quarantine_next_place_for_authenticated_backpressure()?)
+    }
+
+    /// Intentionally retains the durable head quote without transport during
+    /// controlled shutdown so a following safety cancel remains serviceable.
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub(crate) fn suppress_place_for_controlled_shutdown(
+        &mut self,
+    ) -> Result<(), PmCoordinatorError> {
+        Ok(self.mutation.suppress_next_place_for_shutdown()?)
+    }
+
+    /// Moves one already-durable exact-owned cancel and its lifecycle proof to
+    /// the live worker before any await begins.
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub(crate) fn take_prepared_cancel_for_live(
+        &mut self,
+        monotonic_effect_ns: u64,
+    ) -> Result<(PmPreparedCancelDispatch, PmOwnedCancelIntent), PmCoordinatorError> {
+        Ok(self
+            .mutation
+            .take_next_cancel_dispatch(monotonic_effect_ns)?)
+    }
+
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    #[must_use]
+    pub(crate) fn next_prepared_mutation_kind(&self) -> Option<PmPreparedMutationKind> {
+        self.mutation.next_effect_kind()
+    }
+
+    #[must_use]
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub(crate) fn owned_shutdown_safety_settled(&self) -> bool {
+        self.mutation
+            .private()
+            .owned_orders()
+            .all(|order| order.is_terminal() && !order.reconciliation_required())
+    }
+
+    /// Venue-bound orders must reach terminal reconciled ownership before
+    /// credential/read teardown. A separately reported unsent prepared quote
+    /// has no venue identity and therefore cannot be cancelled or fabricated
+    /// into a backend result during shutdown.
+    #[must_use]
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub(crate) fn owned_shutdown_venue_safety_settled(&self) -> bool {
+        self.mutation.private().owned_orders().all(|order| {
+            order.venue_order().is_none()
+                || (order.is_terminal() && !order.reconciliation_required())
+        })
+    }
+
+    #[must_use]
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub(crate) fn owned_shutdown_has_unbound_nonterminal(&self) -> bool {
+        self.mutation
+            .private()
+            .owned_orders()
+            .any(|order| order.venue_order().is_none() && !order.is_terminal())
+    }
+
+    /// An ambiguous submit crossed the authentication/transport boundary and
+    /// therefore must never be described as an unsent quote merely because a
+    /// venue identifier has not yet been reconciled.
+    #[must_use]
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub(crate) fn owned_shutdown_has_may_have_sent_unbound(&self) -> bool {
+        self.mutation.private().owned_orders().any(|order| {
+            order.venue_order().is_none()
+                && order.submit() == reap_pm_state::PmOwnedSubmitState::Ambiguous
+                && !order.is_terminal()
+        })
     }
 
     pub(crate) fn poll_persistence_into_lane(
@@ -335,6 +527,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
 
     pub(crate) fn execute_prepared_quote_into_lane(
         &mut self,
+        executor: &PmFixtureEffectExecutor,
         ingress: PmCompleteIngress,
         script: PmFakePlaceScript,
         monotonic_effect_ns: u64,
@@ -351,7 +544,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
             PmCriticalInput::fake_place_result_rank(),
             || {
                 self.mutation
-                    .execute_next_quote_to_result(script, monotonic_effect_ns)
+                    .execute_next_quote_to_result(executor, script, monotonic_effect_ns)
                     .map(PmCriticalInput::FakePlaceResult)
             },
         );
@@ -372,6 +565,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
 
     pub(crate) fn execute_prepared_cancel_into_lane(
         &mut self,
+        executor: &PmFixtureEffectExecutor,
         ingress: PmCompleteIngress,
         script: PmFakeCancelScript,
         monotonic_effect_ns: u64,
@@ -388,7 +582,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
             PmCriticalInput::fake_cancel_result_rank(),
             || {
                 self.mutation
-                    .execute_next_cancel_to_result(script, monotonic_effect_ns)
+                    .execute_next_cancel_to_result(executor, script, monotonic_effect_ns)
                     .map(PmCriticalInput::FakeCancelResult)
             },
         );
@@ -423,6 +617,11 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
                 Err(PmCoordinatorError::CriticalLaneRejected)
             }
         }
+    }
+
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    const fn critical_admission_available(&self) -> bool {
+        self.retained_critical.is_none()
     }
 
     pub(crate) fn enqueue_private(
@@ -491,14 +690,74 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         self.outputs.pop()
     }
 
+    /// Drains only copied diagnostic/completion effects during authenticated
+    /// shutdown. Reconciliation refresh remains at the head for its typed HTTP
+    /// dispatcher and can never be skipped or relabelled by this method.
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub(crate) fn pop_shutdown_copied_effect(&mut self) -> Option<PmProductEffect> {
+        if matches!(
+            self.outputs.peek(),
+            Some(PmProductEffect::ReconciliationRefresh(_))
+        ) {
+            None
+        } else {
+            self.outputs.pop()
+        }
+    }
+
+    /// Takes the head read refresh without skipping or relabeling any earlier
+    /// copied effect. Other effect consumers retain exact FIFO authority.
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub(crate) fn pop_reconciliation_refresh_effect(&mut self) -> Option<PmRefreshEffect> {
+        match self.outputs.peek()? {
+            PmProductEffect::ReconciliationRefresh(_) => {
+                let PmProductEffect::ReconciliationRefresh(refresh) = self
+                    .outputs
+                    .pop()
+                    .expect("peeked copied effect remains at the queue head")
+                else {
+                    unreachable!("peeked reconciliation refresh changed before pop")
+                };
+                Some(refresh)
+            }
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub(crate) fn peek_reconciliation_refresh_effect(&self) -> Option<PmRefreshEffect> {
+        match self.outputs.peek()? {
+            PmProductEffect::ReconciliationRefresh(refresh) => Some(refresh),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub(crate) fn refresh_effect_matches_scope(&self, effect: PmRefreshEffect) -> bool {
+        effect.account_scope() == self.account_scope && effect.instrument() == self.instrument
+    }
+
+    #[must_use]
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub(crate) fn current_fill_query_cursor(&self) -> Option<reap_pm_core::PmFillQueryCursor> {
+        self.mutation.private().fill_watermark()
+    }
+
+    /// Test-only immutable canonical view for runtime-versus-restart parity.
+    #[cfg(test)]
+    pub(crate) fn private_projection_for_test(
+        &self,
+    ) -> crate::private_monitor::PmReadOnlyPrivateProjection<'_> {
+        self.mutation.private().private_projection_for_test()
+    }
+
     pub(crate) const fn pending_effect_outputs(&self) -> usize {
         self.outputs.len()
     }
 
-    fn account_fixture_ingress(
-        &self,
-        occurrence: &PmFixtureCompletionOccurrence,
-    ) -> PmCompleteIngress {
+    fn account_ingress(&self, occurrence: &PmFixtureCompletionOccurrence) -> PmCompleteIngress {
         PmCompleteIngress::product(
             self.account_source,
             self.account_connection,
@@ -507,10 +766,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         )
     }
 
-    fn internal_fixture_ingress(
-        &self,
-        occurrence: &PmFixtureCompletionOccurrence,
-    ) -> PmCompleteIngress {
+    fn internal_ingress(&self, occurrence: &PmFixtureCompletionOccurrence) -> PmCompleteIngress {
         PmCompleteIngress::internal(
             self.account_source.source(),
             self.account_connection,
@@ -835,20 +1091,20 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
                     effects,
                 )?;
                 self.advance_private_readiness_revision()?;
-                let executed = PmFakeQuoteEffect::new(
+                let executed = PmPlaceDispatchEffect::new(
                     prepared.account_scope(),
                     prepared.instrument(),
                     prepared.client_order(),
                     prepared.side(),
                     prepared.price(),
                     prepared.quantity(),
-                    PmFakeEffectStage::ExecutedByFixture,
+                    PmEffectDispatchStage::CompletedByBackend,
                 );
-                effects.push(PmProductEffect::FakePassiveQuote(executed))?;
+                effects.push(PmProductEffect::PlaceGtcPostOnly(executed))?;
                 self.refresh_tracked_quote(prepared.client_order());
                 self.counters.fake_quote_effects =
                     self.counters.fake_quote_effects.saturating_add(1);
-                push_metric(effects, PmHealthMetricKind::FakeEffectExecuted, 1)
+                push_metric(effects, PmHealthMetricKind::EffectDispatchCompleted, 1)
             }
             PmCriticalInput::FakeCancelResult(result) => {
                 let prepared = self
@@ -856,20 +1112,37 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
                     .remove_cancel(result.client_order(), result.venue_order())?;
                 self.mutation
                     .reduce_serviced_fake_cancel(result, monotonic_service_ns)?;
+                if self.mutation.has_missing_order_detail() {
+                    let _refresh = self.admit_refresh_reason(
+                        PmRefreshReason::MissingOrderDetail,
+                        monotonic_service_ns,
+                        effects,
+                    )?;
+                }
                 self.advance_private_readiness_revision()?;
-                let executed = PmFakeCancelEffect::new(
+                let executed = PmCancelDispatchEffect::new(
                     prepared.account_scope(),
                     prepared.instrument(),
                     prepared.client_order(),
                     prepared.venue_order(),
-                    PmFakeEffectStage::ExecutedByFixture,
+                    PmEffectDispatchStage::CompletedByBackend,
                 );
-                effects.push(PmProductEffect::FakeCancelOwned(executed))?;
+                effects.push(PmProductEffect::CancelOwned(executed))?;
                 self.refresh_tracked_quote(prepared.client_order());
                 self.counters.fake_cancel_effects =
                     self.counters.fake_cancel_effects.saturating_add(1);
-                push_metric(effects, PmHealthMetricKind::FakeEffectExecuted, 1)
+                push_metric(effects, PmHealthMetricKind::EffectDispatchCompleted, 1)
             }
+            #[cfg(any(test, feature = "loopback-evidence"))]
+            PmCriticalInput::LivePlaceResult(completion) => self
+                .mutation
+                .begin_serviced_live_place(completion, monotonic_service_ns)
+                .map_err(Into::into),
+            #[cfg(any(test, feature = "loopback-evidence"))]
+            PmCriticalInput::LiveCancelResult(completion) => self
+                .mutation
+                .begin_serviced_live_cancel(completion, monotonic_service_ns)
+                .map_err(Into::into),
         }
     }
 
@@ -930,6 +1203,32 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
                     clock.monotonic_service_ns(),
                     effects,
                 )?;
+                let _orders = self.admit_refresh_reason(
+                    PmRefreshReason::AmbiguousOrder,
+                    clock.monotonic_service_ns(),
+                    effects,
+                )?;
+                // Recovery reconstructs canonical refresh tickets before the
+                // product coordinator exists. Project them in causal order,
+                // but leave missing-detail work pending until the complete
+                // OpenOrders cut has established its current generation.
+                // Keep one fixed-batch slot for the health projection.
+                while effects.len() < MAX_PM_EFFECTS_PER_INPUT.saturating_sub(1) {
+                    let Some(next) = self.mutation.next_pending_refresh() else {
+                        break;
+                    };
+                    if next.key().reason() == PmRefreshReason::MissingOrderDetail {
+                        break;
+                    }
+                    if !self.admit_next_refresh(clock.monotonic_service_ns(), effects)? {
+                        break;
+                    }
+                }
+                if self.mutation.next_pending_refresh().is_some_and(|ticket| {
+                    ticket.key().reason() != PmRefreshReason::MissingOrderDetail
+                }) {
+                    return Err(PmCoordinatorError::EffectProjectionSaturated);
+                }
                 self.advance_private_readiness_revision()?;
                 self.schedule_quote_evaluation(
                     clock.monotonic_service_ns(),
@@ -956,7 +1255,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
                 )?;
                 push_metric(effects, PmHealthMetricKind::InputObserved, 1)
             }
-            PmPrivateInput::FixtureBatch(delivery) => {
+            PmPrivateInput::Batch(delivery) => {
                 let unique_before = self.mutation.counters().unique_fills();
                 let _observations = self
                     .mutation
@@ -977,111 +1276,7 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         }
     }
 
-    fn service_reconciliation(
-        &mut self,
-        item: PmCompleteServiced<PmReconciliationInput>,
-        effects: &mut PmProductEffectBatch,
-    ) -> Result<(), PmCoordinatorError> {
-        let monotonic_service_ns = item.clock().monotonic_service_ns();
-        product_source(item.source())?;
-        let clock = item.clock();
-        self.invalidate_quote_authority_at(clock.monotonic_service_ns())?;
-        match item.into_value() {
-            PmReconciliationInput::OpenOrdersFixture(delivery) => {
-                let envelope = self
-                    .mutation
-                    .private_mut()
-                    .open_product_open_orders_fixture(delivery, monotonic_service_ns)?;
-                let source = envelope.source();
-                let connection = envelope.connection_id();
-                let clock = envelope.clock();
-                let ordering = envelope.ordering();
-                let apply = self.mutation.private_mut().reduce_serviced_open_orders(
-                    source,
-                    connection,
-                    clock,
-                    ordering,
-                    envelope.into_payload(),
-                )?;
-                if matches!(apply, PmOpenOrdersApply::Applied { .. }) {
-                    let _completed = self.complete_reconciled_refresh_reason(
-                        PmRefreshReason::AmbiguousOrder,
-                        monotonic_service_ns,
-                        effects,
-                    )?;
-                }
-            }
-            PmReconciliationInput::OrderDetailFixture(delivery) => {
-                let envelope = self
-                    .mutation
-                    .private_mut()
-                    .open_product_order_detail_fixture(delivery, monotonic_service_ns)?;
-                let source = envelope.source();
-                let connection = envelope.connection_id();
-                let clock = envelope.clock();
-                let ordering = envelope.ordering();
-                self.mutation.private_mut().reduce_serviced_order_detail(
-                    source,
-                    connection,
-                    clock,
-                    ordering,
-                    envelope.into_payload(),
-                )?;
-            }
-            PmReconciliationInput::StandaloneAccountFixture(delivery) => {
-                let envelope = self
-                    .mutation
-                    .private_mut()
-                    .open_product_account_fixture(delivery, monotonic_service_ns)?;
-                let source = envelope.source();
-                let connection = envelope.connection_id();
-                let clock = envelope.clock();
-                let ordering = envelope.ordering();
-                self.mutation
-                    .private_mut()
-                    .reduce_serviced_account_snapshot(
-                        source,
-                        connection,
-                        clock,
-                        ordering,
-                        envelope.into_payload(),
-                    )?;
-            }
-            PmReconciliationInput::PairedFixture(delivery) => {
-                let (account, fills) = self
-                    .mutation
-                    .private_mut()
-                    .open_product_reconciliation_fixture(delivery, monotonic_service_ns)?;
-                let unique_before = self.mutation.counters().unique_fills();
-                let apply = self
-                    .mutation
-                    .reduce_serviced_reconciliation(account, fills)?;
-                if matches!(apply, PmReconciliationApply::Applied { .. }) {
-                    self.note_complete_reconciliation();
-                    for reason in [
-                        PmRefreshReason::PrivateReconnect,
-                        PmRefreshReason::FillObserved,
-                        PmRefreshReason::ExternalIngressFault,
-                    ] {
-                        let _completed = self.complete_reconciled_refresh_reason(
-                            reason,
-                            monotonic_service_ns,
-                            effects,
-                        )?;
-                    }
-                }
-                if self.mutation.counters().unique_fills() != unique_before {
-                    for tracked in self.tracked_quotes.into_iter().flatten() {
-                        self.refresh_tracked_quote(tracked.client_order);
-                    }
-                }
-            }
-        }
-        self.advance_private_readiness_revision()?;
-        push_metric(effects, PmHealthMetricKind::InputObserved, 1)
-    }
-
-    fn advance_private_readiness_revision(&mut self) -> Result<(), PmCoordinatorError> {
+    pub(super) fn advance_private_readiness_revision(&mut self) -> Result<(), PmCoordinatorError> {
         self.private_readiness_revision = self
             .private_readiness_revision
             .checked_add(1)
@@ -1095,6 +1290,10 @@ impl<M: PmQuoteModel> PmCompleteLaneService for PmCoordinator<M> {
         self.callback_error.is_some()
             || self.mutation.pending_durable_consequences() != 0
             || !self.outputs.can_accept(MAX_PM_EFFECTS_PER_INPUT)
+    }
+
+    fn block_below_persistence(&self) -> bool {
+        self.mutation.has_pending_live_bridge()
     }
 
     fn on_critical(&mut self, item: PmCompleteServiced<PmCriticalInput>) {
@@ -1117,7 +1316,9 @@ impl<M: PmQuoteModel> PmCompleteLaneService for PmCoordinator<M> {
             .mutation
             .reduce_persistence_poll(poll, monotonic_service_ns)
             .map_err(PmCoordinatorError::from)
-            .and_then(|service| self.record_persistence_service(service, &mut effects));
+            .and_then(|service| {
+                self.record_persistence_service(service, monotonic_service_ns, &mut effects)
+            });
         self.complete_callback(effects, result);
     }
 

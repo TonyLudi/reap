@@ -4,7 +4,9 @@ use reap_pm_core::{PmClientOrderKey, PmVenueOrderKey};
 use reap_pm_state::{PmOwnedCancelIntent, PmOwnedIntentId, PmPreparedFillCompaction};
 use thiserror::Error;
 
-use super::effect_queue::PmFakeEffectPermit;
+use super::effect_queue::PmMutationDispatchPermit;
+use super::live_completion::{PmLiveCancelCompletion, PmLivePlaceCompletion};
+use super::mutation::PmGoalFWriterFailureIdentity;
 use super::{ReservedPmCancel, ReservedPmQuote};
 use crate::journal::{
     PmCancelIntentDurablyAcknowledged, PmCancelIntentReceiptPoll, PmJournalAcknowledged,
@@ -27,25 +29,73 @@ pub(crate) enum PmPersistenceIntentIdentity {
     },
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the fixed-capacity persistence queue retains exact non-place authorities inline and reuses the live-place admission box"
+)]
 pub(crate) enum PmPendingPersistence {
     QuoteIntent {
         reserved: ReservedPmQuote,
-        effect_permit: PmFakeEffectPermit,
+        effect_permit: PmMutationDispatchPermit,
         receipt: PmPendingQuoteIntent,
         enqueued_monotonic_ns: u64,
     },
     CancelIntent {
         reserved: ReservedPmCancel,
         owned_intent: PmOwnedCancelIntent,
-        effect_permit: PmFakeEffectPermit,
+        effect_permit: PmMutationDispatchPermit,
         receipt: PmPendingCancelIntent,
         enqueued_monotonic_ns: u64,
     },
     Fact {
         receipt: PmPendingJournalRecord,
+        failure_identity: PmGoalFWriterFailureIdentity,
         compaction: Option<PmPreparedFillCompaction>,
         enqueued_monotonic_ns: u64,
     },
+    #[cfg_attr(
+        not(any(test, feature = "loopback-evidence")),
+        allow(
+            dead_code,
+            reason = "authenticated bridge retention stays represented in the shared bounded persistence carrier when that composition is disabled"
+        )
+    )]
+    LiveBridge {
+        receipt: PmPendingJournalRecord,
+        completion: PmPendingLiveBridge,
+        correlation: u64,
+        enqueued_monotonic_ns: u64,
+    },
+}
+
+#[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the bounded live-bridge carrier keeps cancel authority inline while reusing the single live-place admission box"
+)]
+#[cfg_attr(
+    not(any(test, feature = "loopback-evidence")),
+    allow(
+        dead_code,
+        reason = "the shared persistence carrier preserves its two exact authenticated completion shapes across static composition builds"
+    )
+)]
+pub(crate) enum PmPendingLiveBridge {
+    Place(Box<PmLivePlaceCompletion>),
+    Cancel(PmLiveCancelCompletion),
+}
+
+impl PmPendingLiveBridge {
+    pub(crate) fn client_order(&self) -> PmClientOrderKey {
+        match self {
+            Self::Place(completion) => completion.client_order(),
+            Self::Cancel(completion) => completion.client_order(),
+        }
+    }
+
+    pub(crate) const fn is_place(&self) -> bool {
+        matches!(self, Self::Place(_))
+    }
 }
 
 impl std::fmt::Debug for PmPendingPersistence {
@@ -54,6 +104,7 @@ impl std::fmt::Debug for PmPendingPersistence {
             Self::QuoteIntent { .. } => "PmPendingPersistence::QuoteIntent(..)",
             Self::CancelIntent { .. } => "PmPendingPersistence::CancelIntent(..)",
             Self::Fact { .. } => "PmPendingPersistence::Fact(..)",
+            Self::LiveBridge { .. } => "PmPendingPersistence::LiveBridge(..)",
         })
     }
 }
@@ -72,6 +123,10 @@ impl PmPendingPersistence {
             | Self::Fact {
                 enqueued_monotonic_ns,
                 ..
+            }
+            | Self::LiveBridge {
+                enqueued_monotonic_ns,
+                ..
             } => *enqueued_monotonic_ns,
         }
     }
@@ -86,7 +141,7 @@ impl PmPendingPersistence {
                 client_order: owned_intent.client_order(),
                 venue_order: owned_intent.venue_order(),
             }),
-            Self::Fact { .. } => None,
+            Self::Fact { .. } | Self::LiveBridge { .. } => None,
         }
     }
 }
@@ -96,13 +151,13 @@ pub(crate) enum PmPersistencePoll {
     Pending,
     QuoteAcknowledged {
         reserved: ReservedPmQuote,
-        effect_permit: PmFakeEffectPermit,
+        effect_permit: PmMutationDispatchPermit,
         acknowledgement: PmQuoteIntentDurablyAcknowledged,
     },
     CancelAcknowledged {
         reserved: ReservedPmCancel,
         owned_intent: PmOwnedCancelIntent,
-        effect_permit: PmFakeEffectPermit,
+        effect_permit: PmMutationDispatchPermit,
         acknowledgement: PmCancelIntentDurablyAcknowledged,
     },
     FactAcknowledged {
@@ -111,12 +166,22 @@ pub(crate) enum PmPersistencePoll {
     },
     IntentFailed {
         identity: PmPersistenceIntentIdentity,
-        effect_permit: PmFakeEffectPermit,
+        effect_permit: PmMutationDispatchPermit,
         reason: PmPersistenceFailure,
     },
     FactFailed {
+        identity: PmGoalFWriterFailureIdentity,
         reason: PmPersistenceFailure,
         compaction: Option<PmPreparedFillCompaction>,
+    },
+    LiveBridgeAcknowledged {
+        acknowledgement: PmJournalAcknowledged,
+        completion: PmPendingLiveBridge,
+        correlation: u64,
+    },
+    LiveBridgeFailed {
+        reason: PmPersistenceFailure,
+        completion: PmPendingLiveBridge,
     },
 }
 
@@ -324,10 +389,21 @@ impl PmPersistenceQueue {
                         reason: PmPersistenceFailure::AgeExceeded,
                     }
                 }
-                PmPendingPersistence::Fact { compaction, .. } => PmPersistencePoll::FactFailed {
+                PmPendingPersistence::Fact {
+                    failure_identity,
+                    compaction,
+                    ..
+                } => PmPersistencePoll::FactFailed {
+                    identity: failure_identity,
                     reason: PmPersistenceFailure::AgeExceeded,
                     compaction,
                 },
+                PmPendingPersistence::LiveBridge { completion, .. } => {
+                    PmPersistencePoll::LiveBridgeFailed {
+                        reason: PmPersistenceFailure::AgeExceeded,
+                        completion,
+                    }
+                }
             });
         }
 
@@ -441,12 +517,14 @@ impl PmPersistenceQueue {
             }
             PmPendingPersistence::Fact {
                 receipt,
+                failure_identity,
                 compaction,
                 enqueued_monotonic_ns,
             } => match receipt.poll() {
                 PmJournalReceiptPoll::Pending(receipt) => {
                     self.entries.push_back(PmPendingPersistence::Fact {
                         receipt,
+                        failure_identity,
                         compaction,
                         enqueued_monotonic_ns,
                     });
@@ -464,6 +542,7 @@ impl PmPersistenceQueue {
                         self.metrics.durability_failures.saturating_add(1);
                     self.globally_stopped = true;
                     PmPersistencePoll::FactFailed {
+                        identity: failure_identity,
                         reason: PmPersistenceFailure::Durability(message),
                         compaction,
                     }
@@ -472,8 +551,53 @@ impl PmPersistenceQueue {
                     self.metrics.closed_failures = self.metrics.closed_failures.saturating_add(1);
                     self.globally_stopped = true;
                     PmPersistencePoll::FactFailed {
+                        identity: failure_identity,
                         reason: PmPersistenceFailure::Closed,
                         compaction,
+                    }
+                }
+            },
+            PmPendingPersistence::LiveBridge {
+                receipt,
+                completion,
+                correlation,
+                enqueued_monotonic_ns,
+            } => match receipt.poll() {
+                PmJournalReceiptPoll::Pending(receipt) => {
+                    // Authenticated canonical transitions are ordered by their
+                    // Goal-F journal sequence. Head-block this receipt so a
+                    // later live result can never apply first.
+                    self.entries.push_front(PmPendingPersistence::LiveBridge {
+                        receipt,
+                        completion,
+                        correlation,
+                        enqueued_monotonic_ns,
+                    });
+                    PmPersistencePoll::Pending
+                }
+                PmJournalReceiptPoll::Acknowledged(acknowledgement) => {
+                    self.metrics.acknowledged = self.metrics.acknowledged.saturating_add(1);
+                    PmPersistencePoll::LiveBridgeAcknowledged {
+                        acknowledgement,
+                        completion,
+                        correlation,
+                    }
+                }
+                PmJournalReceiptPoll::Failed(message) => {
+                    self.metrics.durability_failures =
+                        self.metrics.durability_failures.saturating_add(1);
+                    self.globally_stopped = true;
+                    PmPersistencePoll::LiveBridgeFailed {
+                        reason: PmPersistenceFailure::Durability(message),
+                        completion,
+                    }
+                }
+                PmJournalReceiptPoll::Closed => {
+                    self.metrics.closed_failures = self.metrics.closed_failures.saturating_add(1);
+                    self.globally_stopped = true;
+                    PmPersistencePoll::LiveBridgeFailed {
+                        reason: PmPersistenceFailure::Closed,
+                        completion,
                     }
                 }
             },
@@ -482,6 +606,12 @@ impl PmPersistenceQueue {
 
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub(crate) fn has_pending_live_bridge(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|pending| matches!(pending, PmPendingPersistence::LiveBridge { .. }))
     }
 
     pub(crate) const fn globally_stopped(&self) -> bool {
@@ -540,6 +670,15 @@ pub(crate) struct Phase6StorageAllocationProbe {
 }
 
 #[cfg(test)]
+fn phase6_fact_identity() -> PmGoalFWriterFailureIdentity {
+    PmGoalFWriterFailureIdentity::Fact {
+        kind: super::effects::PmDurableRecordKind::SafetyHalt,
+        client_order: None,
+        correlation: 1,
+    }
+}
+
+#[cfg(test)]
 impl Phase6StorageAllocationProbe {
     pub(crate) fn new() -> Self {
         Self {
@@ -553,6 +692,7 @@ impl Phase6StorageAllocationProbe {
     ) -> Result<(), PmPersistenceError> {
         self.queue.push(PmPendingPersistence::Fact {
             receipt: PmPendingJournalRecord::phase6_pending_for_age_evidence(),
+            failure_identity: phase6_fact_identity(),
             compaction: None,
             enqueued_monotonic_ns,
         })
@@ -570,6 +710,7 @@ mod tests {
     fn pending_fact(enqueued_monotonic_ns: u64) -> PmPendingPersistence {
         PmPendingPersistence::Fact {
             receipt: PmPendingJournalRecord::phase6_pending_for_age_evidence(),
+            failure_identity: phase6_fact_identity(),
             compaction: None,
             enqueued_monotonic_ns,
         }
@@ -632,6 +773,7 @@ mod tests {
             PmPersistencePoll::FactFailed {
                 reason: PmPersistenceFailure::AgeExceeded,
                 compaction: None,
+                ..
             }
         ));
         assert!(exceeded.globally_stopped());

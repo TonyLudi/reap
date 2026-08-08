@@ -36,6 +36,7 @@ static ALLOCATOR: TrackingAllocator = TrackingAllocator;
 const PHASE6_RECOVERY_CHILD: &str = "REAP_PHASE6_RECOVERY_EVIDENCE_CHILD";
 const PHASE6_RECOVERY_TEST: &str =
     "phase6_real_mutation_artifacts_recover_to_the_same_bounded_projection";
+const PHASE6_RECOVERY_TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 #[allow(
     clippy::result_large_err,
@@ -69,11 +70,7 @@ fn verify_after_capture_writer_terminal_finish<T, V>(
 #[test]
 fn phase6_real_mutation_artifacts_recover_to_the_same_bounded_projection() {
     if std::env::var_os(PHASE6_RECOVERY_CHILD).is_some() {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("current-thread recovery evidence runtime builds")
-            .block_on(Box::pin(run_phase6_recovery_evidence()));
+        run_phase6_recovery_evidence_child();
         return;
     }
 
@@ -93,6 +90,23 @@ fn phase6_real_mutation_artifacts_recover_to_the_same_bounded_projection() {
         status.success(),
         "isolated recovery evidence subprocess failed with {status}"
     );
+}
+
+fn run_phase6_recovery_evidence_child() {
+    let handle = std::thread::Builder::new()
+        .name("phase6-recovery-evidence".to_owned())
+        .stack_size(PHASE6_RECOVERY_TEST_STACK_BYTES)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread recovery evidence runtime builds")
+                .block_on(run_phase6_recovery_evidence());
+        })
+        .expect("bounded recovery evidence test thread starts");
+    if let Err(panic) = handle.join() {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 async fn run_phase6_recovery_evidence() {

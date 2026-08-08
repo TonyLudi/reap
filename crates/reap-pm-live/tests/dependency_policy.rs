@@ -29,9 +29,22 @@ fn pm_contracts_do_not_import_existing_okx_authority_or_raw_clients() {
     assert!(live_dependencies.contains("reap-pm-state"));
     assert!(live_dependencies.contains("reap-capture-framing"));
     assert!(live_dependencies.contains("reap-okx-public-source"));
+    assert!(live_dependencies.contains("reap-polymarket-adapter"));
+    assert!(live_dependencies.contains("reap-polymarket-auth"));
+    assert!(live_dependencies.contains("reap-polymarket-live-adapter"));
     assert!(live_dependencies.contains("base64"));
     assert!(!live_dependencies.contains("reap-core"));
     assert!(!live_dependencies.contains("reap-polymarket-wire"));
+    for forbidden in [
+        "reap-okx-live-adapter",
+        "reap-okx-evidence-adapter",
+        "reap-okx-emergency-adapter",
+    ] {
+        assert!(
+            !reachable(&edges, "reap-pm-live", forbidden),
+            "the PM product reaches forbidden OKX execution dependency {forbidden}"
+        );
+    }
 
     let state_dependencies = edges.get("reap-pm-state").unwrap();
     assert_eq!(
@@ -40,11 +53,28 @@ fn pm_contracts_do_not_import_existing_okx_authority_or_raw_clients() {
         "the pure PM reducer crate has exactly core types plus typed errors"
     );
 
+    // The reviewed PM-T1 edges are deliberately acyclic: the product owner
+    // reaches live transport, while the live adapter may consume the lower
+    // canonical adapter's neutral place/cancel requests without depending
+    // back on the PM-live owner. Authentication remains below both.
+    let adapter_dependencies = edges.get("reap-polymarket-adapter").unwrap();
+    assert!(adapter_dependencies.contains("reap-polymarket-auth"));
+    assert!(!adapter_dependencies.contains("reap-polymarket-live-adapter"));
+    let auth_dependencies = edges.get("reap-polymarket-auth").unwrap();
+    assert!(auth_dependencies.contains("reap-pm-core"));
+    assert!(auth_dependencies.contains("reap-polymarket-wire"));
+    assert!(!auth_dependencies.contains("reap-polymarket-adapter"));
+    assert!(!auth_dependencies.contains("reap-pm-live"));
+    let live_adapter_dependencies = edges.get("reap-polymarket-live-adapter").unwrap();
+    assert!(live_adapter_dependencies.contains("reap-polymarket-auth"));
+    assert!(live_adapter_dependencies.contains("reap-polymarket-wire"));
+    assert!(live_adapter_dependencies.contains("reap-polymarket-adapter"));
+    assert!(!live_adapter_dependencies.contains("reap-pm-live"));
+
     for source in [
+        "reap-pm-core",
         "reap-pm-strategy",
         "reap-pm-live-contracts",
-        "reap-polymarket-adapter",
-        "reap-pm-live",
         "reap-pm-state",
         "reap-polymarket-wire",
     ] {
@@ -68,9 +98,9 @@ fn pm_contracts_do_not_import_existing_okx_authority_or_raw_clients() {
     }
 
     for source in [
+        "reap-pm-core",
         "reap-pm-strategy",
         "reap-pm-live-contracts",
-        "reap-polymarket-adapter",
         "reap-polymarket-wire",
         "reap-pm-state",
     ] {
@@ -78,6 +108,12 @@ fn pm_contracts_do_not_import_existing_okx_authority_or_raw_clients() {
             !reachable(&edges, source, "base64"),
             "{source} reaches capture-only base64 schema encoding"
         );
+        for forbidden in ["reap-polymarket-auth", "reqwest", "hmac"] {
+            assert!(
+                !reachable(&edges, source, forbidden),
+                "pure PM crate {source} reaches live edge dependency {forbidden}"
+            );
+        }
     }
 
     for legacy in [
@@ -122,17 +158,15 @@ fn pm_contracts_do_not_import_existing_okx_authority_or_raw_clients() {
 
 #[test]
 fn pm_contract_sources_have_no_dynamic_or_authority_escape_hatch() {
-    let crates = [
+    let pure_crates = [
         "../reap-pm-strategy/src",
         "../reap-pm-live-contracts/src",
-        "../reap-polymarket-adapter/src",
         "../reap-pm-state/src",
         "../reap-polymarket-wire/src",
-        "src",
     ];
-    for relative in crates {
+    for relative in pure_crates {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
-        for path in rust_sources(&root) {
+        for path in production_rust_sources(&root) {
             let source = std::fs::read_to_string(&path).unwrap();
             for forbidden in [
                 "Box<dyn",
@@ -158,6 +192,152 @@ fn pm_contract_sources_have_no_dynamic_or_authority_escape_hatch() {
             }
         }
     }
+
+    // The reviewed PM-T1 edge crates may own bounded synchronization and
+    // authenticated evidence. They still cannot expose dynamic mutation
+    // backends, raw secret material, or generic network clients.
+    let bounded_authenticated_channel_files = [
+        "src/composition/product/authenticated_loopback/mutation_time.rs",
+        "src/composition/product/authenticated_loopback/read_ingress/mod.rs",
+        "src/composition/product/authenticated_loopback/read_ingress/channel.rs",
+        "src/composition/product/authenticated_loopback/read_ingress/http.rs",
+        "src/composition/product/authenticated_loopback/read_ingress/book.rs",
+    ];
+    for relative in ["../reap-polymarket-adapter/src", "src"] {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+        for path in production_rust_sources(&root) {
+            let source = std::fs::read_to_string(&path).unwrap();
+            for forbidden in [
+                "Box<dyn",
+                "Arc<RwLock",
+                "unbounded_channel",
+                "std::sync::mpsc",
+                "tokio::sync::mpsc",
+                "reqwest",
+                "tungstenite",
+                "PrivateKey",
+                "ApiKey",
+                "SignedRequest",
+                "cancel_all",
+                "arbitrary_command",
+            ] {
+                if forbidden == "tokio::sync::mpsc"
+                    && bounded_authenticated_channel_files
+                        .iter()
+                        .any(|allowed| path.ends_with(allowed))
+                {
+                    continue;
+                }
+                assert!(
+                    !source.contains(forbidden),
+                    "{} contains forbidden edge token {forbidden}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    // These exact feature-gated edge modules may use only fixed-capacity
+    // queues; canonical coordinator ownership never crosses them.
+    let live_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for relative in bounded_authenticated_channel_files {
+        let source = std::fs::read_to_string(live_root.join(relative)).unwrap();
+        assert!(
+            !source.contains("unbounded_channel"),
+            "{relative} is unbounded"
+        );
+        assert!(
+            !source.contains("Arc<Mutex"),
+            "{relative} shares canonical ownership"
+        );
+    }
+    let read = std::fs::read_to_string(
+        live_root.join("src/composition/product/authenticated_loopback/read_ingress/mod.rs"),
+    )
+    .unwrap();
+    assert_eq!(
+        read.matches("mpsc::channel(READ_ACTOR_CHANNEL_CAPACITY)")
+            .count(),
+        2,
+    );
+    let http = std::fs::read_to_string(
+        live_root.join("src/composition/product/authenticated_loopback/read_ingress/http.rs"),
+    )
+    .unwrap();
+    assert_eq!(
+        http.matches("mpsc::channel(AUTHENTICATED_HTTP_COMMAND_CAPACITY)")
+            .count(),
+        1,
+    );
+    let book = std::fs::read_to_string(
+        live_root.join("src/composition/product/authenticated_loopback/read_ingress/book.rs"),
+    )
+    .unwrap();
+    assert_eq!(
+        book.matches("mpsc::channel(PUBLIC_BOOK_COMMAND_CAPACITY)")
+            .count(),
+        1,
+    );
+    let time = std::fs::read_to_string(
+        live_root.join("src/composition/product/authenticated_loopback/mutation_time.rs"),
+    )
+    .unwrap();
+    assert_eq!(
+        time.matches("mpsc::channel(MUTATION_TIME_COMMAND_CAPACITY)")
+            .count(),
+        1,
+        "the helper is invoked once for each independent purpose worker",
+    );
+}
+
+#[test]
+fn authenticated_journal_lock_is_released_before_durability_and_network_awaits() {
+    let root =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/coordinator/authenticated_execution");
+    let journal = std::fs::read_to_string(root.join("journal_role.rs")).unwrap();
+    assert!(journal.contains("self.shared.lock().await.try_record(record)?;"));
+    assert!(journal.contains(".try_authorize_dispatch(prepared)?;"));
+    assert!(journal.contains("match await_receipt("));
+    assert!(
+        !journal.contains("let mut journal = self.shared.lock().await"),
+        "authenticated journal guard must remain a statement temporary"
+    );
+
+    let worker = std::fs::read_to_string(root.join("worker.rs")).unwrap();
+    let place_match = worker
+        .find("grant.matches_retained_request(\n            semantic_request_commitment,\n            expected_order_id")
+        .expect("place exact-request correlation");
+    let place_send = worker
+        .find("self.transport.send(retained).await")
+        .expect("place one-send edge");
+    assert!(place_match < place_send);
+    assert_eq!(
+        worker
+            .matches("self.transport.send(retained).await")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn authenticated_completion_admission_is_reserved_before_move() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/coordinator/product/service.rs");
+    let source = std::fs::read_to_string(root).unwrap();
+    let reservation = source
+        .find("pub(crate) fn reserve_authenticated_completion")
+        .expect("authenticated completion reservation");
+    let place = source
+        .find("pub(crate) fn admit_place(")
+        .expect("consume-once place admission");
+    let cancel = source
+        .find("pub(crate) fn admit_cancel(")
+        .expect("consume-once cancel admission");
+    assert!(reservation < place && place < cancel);
+    assert!(source.contains("PmAuthenticatedCompletionAdmission { coordinator: self }"));
+    assert!(source.contains("if !self.critical_admission_available()"));
+    assert!(!source.contains("pub(crate) fn admit_authenticated_place_completion"));
+    assert!(!source.contains("pub(crate) fn admit_authenticated_cancel_completion"));
+    assert!(!source.contains("pub(crate) const fn critical_admission_available"));
 }
 
 #[test]
@@ -225,7 +405,7 @@ fn base64_is_confined_to_capture_schema_and_replay_modules() {
     let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let capture = source_root.join("capture.rs");
     let replay = source_root.join("replay.rs");
-    for path in rust_sources(&source_root) {
+    for path in production_rust_sources(&source_root) {
         let source = std::fs::read_to_string(&path).unwrap();
         if source.contains("base64") {
             assert!(
@@ -243,7 +423,7 @@ fn base64_is_confined_to_capture_schema_and_replay_modules() {
         "../reap-pm-state/src",
     ] {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
-        for path in rust_sources(&root) {
+        for path in production_rust_sources(&root) {
             assert!(
                 !std::fs::read_to_string(&path).unwrap().contains("base64"),
                 "{} uses capture-only base64",
@@ -391,7 +571,11 @@ fn constructor_ownership_and_preallocated_lane_shape_are_pinned() {
     assert!(!composition.contains("PmFixtureOwnedExecution::new"));
     assert!(capture_roles.contains("PmPublicRole::from_expected_metadata"));
     assert!(capture_roles.contains("config.observation_grant()"));
-    assert!(replay.contains("PmPublicRole::from_expected_metadata"));
+    assert!(capture_roles.contains("PmPublicRole::new("));
+    assert!(capture_roles.contains("authoritative.parser_config()"));
+    assert!(!replay.contains("PmPublicRole::from_expected_metadata"));
+    assert!(replay.contains("PmPublicRole::new("));
+    assert!(replay.contains("recorded.parser_config()"));
     assert!(replay.contains("scope.observation_grant()?"));
     assert!(fake_effect.contains("PmFixtureOwnedExecution::new"));
     assert!(bounded.contains("BinaryHeap::with_capacity"));
@@ -411,6 +595,8 @@ fn pm_mutation_authority_remains_internal_and_composition_confined() {
     let library = std::fs::read_to_string(root.join("lib.rs")).unwrap();
     let product = rust_module_source(&root, "composition/product");
     let authority = std::fs::read_to_string(root.join("coordinator/authority.rs")).unwrap();
+    let dispatch = std::fs::read_to_string(root.join("coordinator/effect_queue.rs")).unwrap();
+    let authenticated = rust_module_source(&root, "coordinator/authenticated_execution");
 
     for hidden in [
         "PmMutationOwner",
@@ -426,6 +612,32 @@ fn pm_mutation_authority_remains_internal_and_composition_confined() {
             "crate root exports internal PM mutation authority {hidden}"
         );
     }
+
+    for neutral in [
+        "enum PmPreparedMutation",
+        "enum PmPreparedMutationKind",
+        "struct PmMutationDispatchPermit",
+        "struct PmMutationDispatchQueue",
+        "enum PmMutationDispatchQueueError",
+    ] {
+        assert!(
+            dispatch.contains(neutral),
+            "backend-neutral mutation dispatch type is missing: {neutral}"
+        );
+    }
+    for stale_canonical in [
+        "enum PmPreparedFakeEffect",
+        "struct PmFakeEffectPermit",
+        "struct PmFakeEffectQueue",
+        "enum PmFakeEffectQueueError",
+    ] {
+        assert!(
+            !dispatch.contains(stale_canonical),
+            "authenticated execution still shares a fake-named canonical dispatch type: {stale_canonical}"
+        );
+    }
+    assert!(!authenticated.contains("PmFixtureEffectExecutor"));
+    assert!(!authenticated.contains("PmFakeEffectRole"));
 
     for forbidden in [
         "AuthenticatedClient",
@@ -458,10 +670,10 @@ fn pm_mutation_authority_remains_internal_and_composition_confined() {
     for gate in [
         "approve_pm_quote",
         "prepare_pm_quote",
-        "consume_prepared_quote",
+        "take_prepared_place_dispatch",
         "approve_pm_cancel",
         "prepare_pm_cancel",
-        "consume_prepared_cancel",
+        "take_prepared_cancel_dispatch",
     ] {
         assert!(
             authority.contains(&format!("pub(crate) fn {gate}")),
@@ -590,6 +802,85 @@ fn public_lane_requires_capability_specific_route_deliveries() {
 }
 
 #[test]
+fn live_occurrence_issuer_is_sealed_and_http_purposes_cannot_be_relabelled() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let occurrence =
+        std::fs::read_to_string(root.join("private_monitor/live/occurrence.rs")).unwrap();
+    for required in [
+        "pub(crate) struct PmLiveOccurrenceIssuer",
+        "pub(crate) struct PmLiveConnectionInput",
+        "pub(crate) struct PmLiveRetirementInput",
+        "pub(crate) enum PmLiveRetirementOutcome",
+        "pub(crate) type PmLiveOpenOrdersQueryTicket",
+        "pub(crate) type PmLiveOrderDetailQueryTicket",
+        "pub(crate) type PmLiveAccountQueryTicket",
+        "pub(crate) type PmLiveReconciliationQueryTicket",
+        "ticket: PmLiveOpenOrdersQueryTicket",
+        "ticket: PmLiveOrderDetailQueryTicket",
+        "ticket: PmLiveAccountQueryTicket",
+        "ticket: PmLiveReconciliationQueryTicket",
+        "last_actor_monotonic_ns: Option<u64>",
+        "last_user_monotonic_ns: Option<u64>",
+        "last_http_monotonic_ns: Option<u64>",
+        "received_clock.monotonic_receive_ns() < ticket.monotonic_request_ns",
+        "pub(crate) fn issue_user_shutdown_control(",
+        "self.active_epoch = None;",
+        "PmLiveRetirementOutcome::PreOpen",
+    ] {
+        assert!(
+            occurrence.contains(required),
+            "missing sealed live occurrence invariant: {required}"
+        );
+    }
+    for forbidden in [
+        "pub struct PmLiveOccurrenceIssuer",
+        "pub enum PmLiveHttpQueryKind",
+        "pub(crate) fn complete_http_query(",
+        "last_monotonic_ns: Option<u64>",
+    ] {
+        assert!(
+            !occurrence.contains(forbidden),
+            "live occurrence authority escape: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn authenticated_stage_validates_the_owner_configuration_before_opening_a_journal() {
+    let source = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/coordinator/authenticated_execution.rs"),
+    )
+    .unwrap();
+    let validation = source
+        .find("validate_connectivity_binding(config, &connectivity_binding)")
+        .expect("typed connectivity pairing validation");
+    let journal_open = source
+        .find("PmAuthenticatedJournalRuntime::start(")
+        .expect("authenticated journal open");
+    assert!(validation < journal_open);
+    assert!(source.contains("config.public().configuration_fingerprint()"));
+    assert!(source.contains("ConfigurationFingerprintMismatch"));
+    for exact_binding in [
+        "binding.account() != config.account().account_scope()",
+        "binding.instrument() != config.account().instrument()",
+        "binding.trading_domain() != config.account().trading_domain()",
+        "wire_scope.condition() != expected.condition()",
+        "wire_scope.market() != expected.market()",
+        "wire_scope.token() != expected.outcome().token()",
+        "ConnectivityBindingMismatch",
+    ] {
+        assert!(
+            source.contains(exact_binding),
+            "missing exact owner binding check: {exact_binding}"
+        );
+    }
+    assert!(source.contains(
+        "preserve_primary_after_credential_shutdown(error, credential_supervisor).await"
+    ));
+    assert!(source.contains("combine_shutdown_results(credential_result, journal_result)"));
+}
+
+#[test]
 fn pm_production_modules_stay_below_the_review_size_limit() {
     for relative in [
         "../reap-benchmark-allocator/src",
@@ -606,8 +897,9 @@ fn pm_production_modules_stay_below_the_review_size_limit() {
         "src",
     ] {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
-        for path in rust_sources(&root) {
-            let line_count = std::fs::read_to_string(&path).unwrap().lines().count();
+        for path in production_rust_sources(&root) {
+            let source = std::fs::read_to_string(&path).unwrap();
+            let line_count = production_extent(&source).lines().count();
             assert!(
                 line_count <= 1_500,
                 "{} has {line_count} lines; split responsibilities before it exceeds 1,500",
@@ -692,6 +984,18 @@ fn rust_sources(root: &Path) -> Vec<std::path::PathBuf> {
     }
     sources.sort();
     sources
+}
+
+fn production_rust_sources(root: &Path) -> Vec<std::path::PathBuf> {
+    rust_sources(root)
+        .into_iter()
+        .filter(|path| {
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                return false;
+            };
+            name != "tests.rs" && !name.ends_with("_tests.rs")
+        })
+        .collect()
 }
 
 fn rust_module_source(root: &Path, module: &str) -> String {

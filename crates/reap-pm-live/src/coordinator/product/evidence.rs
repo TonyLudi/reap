@@ -114,15 +114,17 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         model: M,
         risk_limits: PmRiskLimits,
         policy: PmCoordinatorPolicy,
-    ) -> Result<Self, String> {
+    ) -> Result<(Self, crate::fake_effect::PmFixtureEffectExecutor), String> {
         let private = Box::new(
             PmPrivateMonitorRuntime::new(config.account(), risk_limits)
                 .map_err(|error| error.to_string())?,
         );
         let fake = fixed_fake_role(config);
-        let mutation = PmMutationOwner::start_sealed_evidence(config, private, fake)
-            .map_err(|error| error.to_string())?;
-        Self::from_evidence_parts(config, model, mutation, policy)
+        let (mutation, fake_executor) =
+            PmMutationOwner::start_sealed_evidence(config, private, fake)
+                .map_err(|error| error.to_string())?;
+        let coordinator = Self::from_evidence_parts(config, model, mutation, policy)?;
+        Ok((coordinator, fake_executor))
     }
 
     /// Starts the same bare-lane owner with the production filesystem journal.
@@ -133,17 +135,25 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         risk_limits: PmRiskLimits,
         journal_path: PathBuf,
         policy: PmCoordinatorPolicy,
-    ) -> Result<(Self, PmJournalRecovery), String> {
+    ) -> Result<
+        (
+            Self,
+            PmJournalRecovery,
+            crate::fake_effect::PmFixtureEffectExecutor,
+        ),
+        String,
+    > {
         let private = Box::new(
             PmPrivateMonitorRuntime::new(config.account(), risk_limits)
                 .map_err(|error| error.to_string())?,
         );
         let fake = fixed_fake_role(config);
-        let (mutation, recovery) = PmMutationOwner::start(config, private, fake, journal_path)
-            .await
-            .map_err(|error| error.to_string())?;
+        let (mutation, recovery, fake_executor) =
+            PmMutationOwner::start(config, private, fake, journal_path)
+                .await
+                .map_err(|error| error.to_string())?;
         let coordinator = Self::from_evidence_parts(config, model, mutation, policy)?;
-        Ok((coordinator, recovery))
+        Ok((coordinator, recovery, fake_executor))
     }
 
     fn from_evidence_parts(

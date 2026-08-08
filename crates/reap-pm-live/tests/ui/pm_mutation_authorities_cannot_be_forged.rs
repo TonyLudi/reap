@@ -13,14 +13,14 @@ fn forge() {
     let _ = PreparedPmQuote {
         facts: value(),
         journal_sequence: 1,
-        command: value(),
+        request: value(),
     };
     let _ = ApprovedPmCancel { facts: value() };
     let _ = ReservedPmCancel { facts: value() };
     let _ = PreparedPmCancel {
         facts: value(),
         journal_sequence: 1,
-        command: value(),
+        request: value(),
     };
 }
 

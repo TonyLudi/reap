@@ -2,19 +2,35 @@ use reap_pm_core::{PmAccountScope, PmInstrumentHandle, PmInstrumentId};
 use reap_pm_live_contracts::ConstructedRoleBinding;
 use reap_polymarket_adapter::{
     PmCancelOwnedPurpose, PmFakeCancelResult, PmFakeCancelScript, PmFakePlaceResult,
-    PmFakePlaceScript, PmFixtureInstrumentScope, PmFixtureOwnedExecution, PmGtcPostOnlyProfile,
+    PmFakePlaceScript, PmFixedMutationPreparation, PmFixtureInstrumentScope,
+    PmFixtureOwnedExecution, PmGtcPostOnlyProfile,
 };
 
 use crate::coordinator::authority::{
     PmAuthorityError, PmAuthorityRevisions, PreparedPmCancel, PreparedPmQuote, ReservedPmCancel,
-    ReservedPmQuote, consume_prepared_cancel, consume_prepared_quote, prepare_pm_cancel,
-    prepare_pm_quote,
+    ReservedPmQuote, prepare_pm_cancel, prepare_pm_quote,
 };
+use crate::coordinator::{PmPreparedCancelDispatch, PmPreparedPlaceDispatch};
 use crate::journal::{PmCancelIntentDurablyAcknowledged, PmQuoteIntentDurablyAcknowledged};
 
 /// Narrow Phase 2 ownership bundle for the fixture execution role.
 #[derive(Debug)]
 pub(crate) struct PmFakeEffectRole {
+    preparation: PmMutationPreparationRole,
+    executor: PmFixtureEffectExecutor,
+}
+
+/// Backend-neutral fixed-profile preparation. It cannot execute fixture
+/// scripts and is the only half owned by an authenticated coordinator.
+#[derive(Debug)]
+pub(crate) struct PmMutationPreparationRole {
+    preparation: PmFixedMutationPreparation,
+    instrument_id: PmInstrumentId,
+}
+
+/// Fixture-only result synthesis retained solely by `PmProductRun`.
+#[derive(Debug)]
+pub(crate) struct PmFixtureEffectExecutor {
     execution: PmFixtureOwnedExecution,
     instrument_id: PmInstrumentId,
 }
@@ -26,25 +42,50 @@ impl PmFakeEffectRole {
         instrument_id: PmInstrumentId,
     ) -> Self {
         Self {
-            execution: PmFixtureOwnedExecution::new(account_scope, instrument),
-            instrument_id,
+            preparation: PmMutationPreparationRole::new(account_scope, instrument, instrument_id),
+            executor: PmFixtureEffectExecutor::new(account_scope, instrument, instrument_id),
         }
+    }
+
+    pub(crate) fn split(self) -> (PmMutationPreparationRole, PmFixtureEffectExecutor) {
+        (self.preparation, self.executor)
+    }
+
+    pub(crate) const fn account_scope(&self) -> PmAccountScope {
+        self.preparation.account_scope()
+    }
+
+    pub(crate) const fn instrument(&self) -> PmInstrumentHandle {
+        self.preparation.instrument()
     }
 
     pub(crate) const fn bindings(&self) -> [ConstructedRoleBinding; 2] {
         ConstructedRoleBinding::owned_execution(
-            self.execution.account_scope(),
-            self.execution.instrument(),
-            self.instrument_id,
+            self.preparation.account_scope(),
+            self.preparation.instrument(),
+            self.preparation.instrument_id(),
         )
+    }
+}
+
+impl PmMutationPreparationRole {
+    pub(crate) const fn new(
+        account_scope: PmAccountScope,
+        instrument: PmInstrumentHandle,
+        instrument_id: PmInstrumentId,
+    ) -> Self {
+        Self {
+            preparation: PmFixedMutationPreparation::new(account_scope, instrument),
+            instrument_id,
+        }
     }
 
     pub(crate) const fn account_scope(&self) -> PmAccountScope {
-        self.execution.account_scope()
+        self.preparation.account_scope()
     }
 
     pub(crate) const fn instrument(&self) -> PmInstrumentHandle {
-        self.execution.instrument()
+        self.preparation.instrument()
     }
 
     pub(crate) const fn instrument_id(&self) -> PmInstrumentId {
@@ -52,11 +93,11 @@ impl PmFakeEffectRole {
     }
 
     pub(crate) const fn place_profile(&self) -> PmGtcPostOnlyProfile {
-        self.execution.place_profile()
+        self.preparation.place_profile()
     }
 
     pub(crate) const fn cancel_purpose(&self) -> PmCancelOwnedPurpose {
-        self.execution.cancel_purpose()
+        self.preparation.cancel_purpose()
     }
 
     pub(crate) fn prepare_quote(
@@ -68,7 +109,7 @@ impl PmFakeEffectRole {
         acknowledged: PmQuoteIntentDurablyAcknowledged,
     ) -> Result<PreparedPmQuote, PmAuthorityError> {
         prepare_pm_quote(
-            &self.execution,
+            &self.preparation,
             self.instrument_id,
             reserved,
             current_scope,
@@ -76,20 +117,6 @@ impl PmFakeEffectRole {
             monotonic_now_ns,
             acknowledged,
         )
-    }
-
-    pub(crate) fn execute_quote(
-        &self,
-        prepared: PreparedPmQuote,
-        script: PmFakePlaceScript,
-    ) -> Result<PmFakePlaceResult, PmAuthorityError> {
-        let command = consume_prepared_quote(
-            prepared,
-            self.account_scope(),
-            self.instrument(),
-            self.instrument_id,
-        )?;
-        Ok(self.execution.execute_place(command, script)?)
     }
 
     pub(crate) fn prepare_cancel(
@@ -100,7 +127,7 @@ impl PmFakeEffectRole {
         acknowledged: PmCancelIntentDurablyAcknowledged,
     ) -> Result<PreparedPmCancel, PmAuthorityError> {
         prepare_pm_cancel(
-            &self.execution,
+            &self.preparation,
             self.instrument_id,
             reserved,
             current_scope,
@@ -108,18 +135,59 @@ impl PmFakeEffectRole {
             acknowledged,
         )
     }
+}
 
-    pub(crate) fn execute_cancel(
+impl PmFixtureEffectExecutor {
+    pub(crate) const fn new(
+        account_scope: PmAccountScope,
+        instrument: PmInstrumentHandle,
+        instrument_id: PmInstrumentId,
+    ) -> Self {
+        Self {
+            execution: PmFixtureOwnedExecution::new(account_scope, instrument),
+            instrument_id,
+        }
+    }
+
+    pub(crate) const fn account_scope(&self) -> PmAccountScope {
+        self.execution.account_scope()
+    }
+
+    pub(crate) const fn instrument(&self) -> PmInstrumentHandle {
+        self.execution.instrument()
+    }
+
+    /// Fake backend implementation of the fixed place dispatch.
+    pub(crate) fn execute_place_fixture(
         &self,
-        prepared: PreparedPmCancel,
+        dispatch: PmPreparedPlaceDispatch,
+        script: PmFakePlaceScript,
+    ) -> Result<PmFakePlaceResult, PmAuthorityError> {
+        if dispatch.account_scope() != self.account_scope()
+            || dispatch.instrument() != self.instrument()
+            || dispatch.instrument_id() != self.instrument_id
+        {
+            return Err(PmAuthorityError::ScopeMismatch);
+        }
+        Ok(self
+            .execution
+            .execute_place(dispatch.into_request(), script)?)
+    }
+
+    /// Fake backend implementation of the exact-owned cancel dispatch.
+    pub(crate) fn execute_cancel_fixture(
+        &self,
+        dispatch: PmPreparedCancelDispatch,
         script: PmFakeCancelScript,
     ) -> Result<PmFakeCancelResult, PmAuthorityError> {
-        let command = consume_prepared_cancel(
-            prepared,
-            self.account_scope(),
-            self.instrument(),
-            self.instrument_id,
-        )?;
-        Ok(self.execution.execute_cancel(command, script)?)
+        if dispatch.account_scope() != self.account_scope()
+            || dispatch.instrument() != self.instrument()
+            || dispatch.instrument_id() != self.instrument_id
+        {
+            return Err(PmAuthorityError::ScopeMismatch);
+        }
+        Ok(self
+            .execution
+            .execute_cancel(dispatch.into_request(), script)?)
     }
 }

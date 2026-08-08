@@ -1,7 +1,10 @@
 mod command;
 mod outcome;
 
-pub use command::{PmFakeCancelCommand, PmFakeOrderType, PmFakePlaceCommand};
+pub use command::{
+    PmExactOwnedCancelRequest, PmFakeCancelCommand, PmFakeOrderType, PmFakePlaceCommand,
+    PmFixedMutationPreparation, PmFixedOrderType, PmGtcPostOnlyPlaceRequest,
+};
 pub use outcome::{
     MAX_PM_FAKE_ACK_FILL_LEGS, PmFakeAckImmediateFillLeg, PmFakeCancelOutcome,
     PmFakeCancelRejectReason, PmFakeCancelResult, PmFakeCancelScript, PmFakeImmediateFill,
@@ -16,10 +19,11 @@ mod sealed {
     pub trait Sealed {}
 }
 
-/// In-process fake owned-execution capability.
+/// Scoped fixed-profile owned-execution capability.
 ///
-/// It is scoped to one exact account and instrument, and accepts only the
-/// fixed Goal F command shapes.
+/// It is scoped to one exact account and instrument and can lower only the
+/// backend-neutral GTC/post-only place and exact-owned cancel shapes. The
+/// fixture implementation below is one consumer of those take-once values.
 pub trait PmOwnedExecutionRole: sealed::Sealed {
     type PlaceProfile;
     type CancelPurpose;
@@ -51,8 +55,8 @@ impl PmGtcPostOnlyProfile {
     }
 
     #[must_use]
-    pub const fn order_type(self) -> PmFakeOrderType {
-        PmFakeOrderType::Gtc
+    pub const fn order_type(self) -> PmFixedOrderType {
+        PmFixedOrderType::Gtc
     }
 
     #[must_use]

@@ -1,11 +1,71 @@
-error[E0599]: no method named `set_order_type` found for struct `PmFakeExecutionProfile` in the current scope
+error[E0599]: no method named `set_order_type` found for struct `PmFixedExecutionProfile` in the current scope
  --> tests/ui/fake_profile_cannot_select_order_features.rs:5:13
   |
 5 |     profile.set_order_type("market");
-  |             ^^^^^^^^^^^^^^ method not found in `PmFakeExecutionProfile`
+  |             ^^^^^^^^^^^^^^ method not found in `PmFixedExecutionProfile`
 
-error[E0599]: no method named `enable_cancel_all` found for struct `PmFakeExecutionProfile` in the current scope
+error[E0599]: no method named `set_order_type` found for struct `PmFixedExecutionProfile` in the current scope
  --> tests/ui/fake_profile_cannot_select_order_features.rs:6:13
   |
-6 |     profile.enable_cancel_all();
-  |             ^^^^^^^^^^^^^^^^^ method not found in `PmFakeExecutionProfile`
+6 |     profile.set_order_type("FOK");
+  |             ^^^^^^^^^^^^^^ method not found in `PmFixedExecutionProfile`
+
+error[E0599]: no method named `set_order_type` found for struct `PmFixedExecutionProfile` in the current scope
+ --> tests/ui/fake_profile_cannot_select_order_features.rs:7:13
+  |
+7 |     profile.set_order_type("FAK");
+  |             ^^^^^^^^^^^^^^ method not found in `PmFixedExecutionProfile`
+
+error[E0599]: no method named `set_order_type` found for struct `PmFixedExecutionProfile` in the current scope
+ --> tests/ui/fake_profile_cannot_select_order_features.rs:8:13
+  |
+8 |     profile.set_order_type("IOC");
+  |             ^^^^^^^^^^^^^^ method not found in `PmFixedExecutionProfile`
+
+error[E0599]: no method named `set_order_type` found for struct `PmFixedExecutionProfile` in the current scope
+ --> tests/ui/fake_profile_cannot_select_order_features.rs:9:13
+  |
+9 |     profile.set_order_type("GTD");
+  |             ^^^^^^^^^^^^^^ method not found in `PmFixedExecutionProfile`
+
+error[E0599]: no method named `enable_batch_place` found for struct `PmFixedExecutionProfile` in the current scope
+  --> tests/ui/fake_profile_cannot_select_order_features.rs:10:13
+   |
+10 |     profile.enable_batch_place();
+   |             ^^^^^^^^^^^^^^^^^^ method not found in `PmFixedExecutionProfile`
+
+error[E0599]: no method named `enable_batch_cancel` found for struct `PmFixedExecutionProfile` in the current scope
+  --> tests/ui/fake_profile_cannot_select_order_features.rs:11:13
+   |
+11 |     profile.enable_batch_cancel();
+   |             ^^^^^^^^^^^^^^^^^^^ method not found in `PmFixedExecutionProfile`
+
+error[E0599]: no method named `enable_cancel_all` found for struct `PmFixedExecutionProfile` in the current scope
+  --> tests/ui/fake_profile_cannot_select_order_features.rs:12:13
+   |
+12 |     profile.enable_cancel_all();
+   |             ^^^^^^^^^^^^^^^^^ method not found in `PmFixedExecutionProfile`
+
+error[E0599]: no method named `enable_amend` found for struct `PmFixedExecutionProfile` in the current scope
+  --> tests/ui/fake_profile_cannot_select_order_features.rs:13:13
+   |
+13 |     profile.enable_amend();
+   |             ^^^^^^^^^^^^ method not found in `PmFixedExecutionProfile`
+
+error[E0599]: no method named `enable_allowance_mutation` found for struct `PmFixedExecutionProfile` in the current scope
+  --> tests/ui/fake_profile_cannot_select_order_features.rs:14:13
+   |
+14 |     profile.enable_allowance_mutation();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `PmFixedExecutionProfile`
+
+error[E0599]: no method named `enable_settlement` found for struct `PmFixedExecutionProfile` in the current scope
+  --> tests/ui/fake_profile_cannot_select_order_features.rs:15:13
+   |
+15 |     profile.enable_settlement();
+   |             ^^^^^^^^^^^^^^^^^ method not found in `PmFixedExecutionProfile`
+
+error[E0599]: no method named `enable_redemption` found for struct `PmFixedExecutionProfile` in the current scope
+  --> tests/ui/fake_profile_cannot_select_order_features.rs:16:13
+   |
+16 |     profile.enable_redemption();
+   |             ^^^^^^^^^^^^^^^^^ method not found in `PmFixedExecutionProfile`

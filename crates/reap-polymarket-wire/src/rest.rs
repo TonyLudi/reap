@@ -18,6 +18,18 @@ pub struct PmLifecycleMetadata {
 }
 
 impl PmLifecycleMetadata {
+    pub(crate) const fn from_parts(
+        condition: PmConditionId,
+        market: PmMarketId,
+        lifecycle: PmMarketLifecycle,
+    ) -> Self {
+        Self {
+            condition,
+            market,
+            lifecycle,
+        }
+    }
+
     #[must_use]
     pub const fn condition(self) -> PmConditionId {
         self.condition
@@ -40,6 +52,10 @@ pub struct PmClobToken {
 }
 
 impl PmClobToken {
+    pub(crate) const fn from_outcome(outcome: PmOutcomeMetadata) -> Self {
+        Self { outcome }
+    }
+
     #[must_use]
     pub const fn outcome(self) -> PmOutcomeMetadata {
         self.outcome

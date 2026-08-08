@@ -340,7 +340,7 @@ fn all_eleven_lane_policies_match_the_frozen_oracle() {
             None,
         ),
         (
-            PmLaneKind::FakeEffect,
+            PmLaneKind::EffectDispatch,
             256,
             32,
             Some(250_000_000),
@@ -383,7 +383,7 @@ fn future_input_service_priority_is_an_explicit_policy_oracle_only() {
         PmLaneKind::ReconciliationRequest,
         PmLaneKind::Capture,
         PmLaneKind::Journal,
-        PmLaneKind::FakeEffect,
+        PmLaneKind::EffectDispatch,
     ] {
         assert_eq!(lane.service_priority_rank(), None);
     }

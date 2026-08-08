@@ -18,18 +18,26 @@ use crate::composition::{
 };
 use crate::coordinator::{
     PmControlReason, PmCoordinator, PmCoordinatorCounters, PmCoordinatorError, PmCoordinatorPolicy,
-    PmCoordinatorShutdownError, PmCoordinatorStartError, PmFakeEffectMetrics, PmMutationCounters,
-    PmMutationHalt, PmPersistenceMetrics, PmProductEffect, PmProductEffectMetrics,
-    PmRefreshObligationMetrics,
+    PmCoordinatorShutdownError, PmCoordinatorStartError, PmEffectDispatchMetrics,
+    PmFakeEffectMetrics, PmMutationCounters, PmMutationHalt, PmPersistenceMetrics, PmProductEffect,
+    PmProductEffectMetrics, PmRefreshObligationMetrics,
 };
+use crate::fake_effect::PmFixtureEffectExecutor;
 use crate::journal::PmJournalRecovery;
 use crate::lanes::{
     PmCompleteSchedulerMetrics, PmCompleteServiceCounts, PmServiceTurnError, PmTelemetryKind,
     SaturationAction,
 };
 use crate::private_monitor::{
-    PmAccountFixtureInput, PmOpenOrdersFixtureInput, PmOrderDetailFixtureInput,
+    PmAccountFixtureInput, PmLiveAccountInput, PmLiveConnectionInput, PmLiveIngressReport,
+    PmLiveOpenOrdersInput, PmLiveOrderDetailInput, PmLivePrivateInput, PmLiveReconciliationInput,
+    PmLiveRetirementInput, PmOpenOrdersFixtureInput, PmOrderDetailFixtureInput,
     PmReconciliationFixtureInput,
+};
+#[cfg(test)]
+use crate::private_monitor::{
+    PmLiveAccountFailureInput, PmLiveOpenOrdersFailureInput, PmLiveOrderDetailFailureInput,
+    PmLiveReconciliationFailureInput,
 };
 use crate::schedule::PmScheduledActionKind;
 
@@ -82,7 +90,7 @@ impl<M: PmQuoteModel> PmProduct<M> {
         .start(capture_path, authoritative, session_policy, provenance)
         .await
         .map_err(PmProductStartError::public)?;
-        let (coordinator, recovery) = PmCoordinator::start(
+        let (coordinator, recovery, fake_executor) = PmCoordinator::start(
             &config,
             model,
             private,
@@ -94,13 +102,20 @@ impl<M: PmQuoteModel> PmProduct<M> {
         )
         .await
         .map_err(PmProductStartError::coordinator)?;
-        Ok((PmProductRun { coordinator }, recovery))
+        Ok((
+            PmProductRun {
+                coordinator,
+                fake_executor,
+            },
+            recovery,
+        ))
     }
 }
 
 /// Active, sole-owner PM product run.
 pub struct PmProductRun<M: PmQuoteModel> {
     coordinator: Box<PmCoordinator<M>>,
+    fake_executor: PmFixtureEffectExecutor,
 }
 
 impl<M: PmQuoteModel> PmProductRun<M> {
@@ -143,15 +158,45 @@ impl<M: PmQuoteModel> PmProductRun<M> {
         PmProductPublicIngress::new(self.coordinator.public_capture_mut())
     }
 
-    /// Admits one fixture-private connection occurrence. Source and
+    /// Admits one private connection occurrence. Source and
     /// connection identity come from the product plan; callers cannot inject
     /// either value.
-    pub fn connect_private_fixture(
+    pub(crate) fn connect_private(
         &mut self,
         occurrence: PmFixtureCompletionOccurrence,
     ) -> Result<(), PmProductRunError> {
         self.coordinator
-            .connect_private_fixture(occurrence)
+            .connect_private(occurrence)
+            .map_err(PmProductRunError::service)
+    }
+
+    pub fn connect_private_fixture(
+        &mut self,
+        occurrence: PmFixtureCompletionOccurrence,
+    ) -> Result<(), PmProductRunError> {
+        self.connect_private(occurrence)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the sealed live connection occurrence is consumed by the Phase 5 supervisor"
+    )]
+    pub(crate) fn connect_private_live(
+        &mut self,
+        input: PmLiveConnectionInput,
+    ) -> Result<(), PmProductRunError> {
+        self.coordinator
+            .connect_private_live(input)
+            .map_err(PmProductRunError::service)
+    }
+
+    pub(crate) fn mark_private_unavailable(
+        &mut self,
+        occurrence: PmFixtureCompletionOccurrence,
+        fault: PmPrivateExternalIngressFault,
+    ) -> Result<(), PmProductRunError> {
+        self.coordinator
+            .mark_private_unavailable(occurrence, fault)
             .map_err(PmProductRunError::service)
     }
 
@@ -160,8 +205,19 @@ impl<M: PmQuoteModel> PmProductRun<M> {
         occurrence: PmFixtureCompletionOccurrence,
         fault: PmPrivateExternalIngressFault,
     ) -> Result<(), PmProductRunError> {
+        self.mark_private_unavailable(occurrence, fault)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the sealed live retirement occurrence is consumed by the Phase 5 supervisor"
+    )]
+    pub(crate) fn mark_private_live_unavailable(
+        &mut self,
+        input: PmLiveRetirementInput,
+    ) -> Result<(), PmProductRunError> {
         self.coordinator
-            .mark_private_fixture_unavailable(occurrence, fault)
+            .mark_private_live_unavailable(input)
             .map_err(PmProductRunError::service)
     }
 
@@ -178,12 +234,40 @@ impl<M: PmQuoteModel> PmProductRun<M> {
             .map_err(PmProductRunError::service)
     }
 
+    /// Synchronously normalizes one credential-owner-bound private frame and
+    /// enqueues its owner-bound canonical batch in the existing private lane.
+    #[allow(
+        dead_code,
+        reason = "the sealed live ingress seam is consumed by the Phase 5 supervisor"
+    )]
+    pub(crate) fn ingest_private_live(
+        &mut self,
+        input: PmLivePrivateInput,
+    ) -> Result<PmLiveIngressReport, PmProductRunError> {
+        self.coordinator
+            .ingest_private_live(input)
+            .map_err(PmProductRunError::service)
+    }
+
     pub fn ingest_account_fixture(
         &mut self,
         input: PmAccountFixtureInput<'_>,
     ) -> Result<(), PmProductRunError> {
         self.coordinator
             .ingest_account_fixture(input)
+            .map_err(PmProductRunError::service)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the sealed live ingress seam is consumed by the Phase 5 supervisor"
+    )]
+    pub(crate) fn ingest_account_live(
+        &mut self,
+        input: PmLiveAccountInput,
+    ) -> Result<PmLiveIngressReport, PmProductRunError> {
+        self.coordinator
+            .ingest_account_live(input)
             .map_err(PmProductRunError::service)
     }
 
@@ -196,6 +280,19 @@ impl<M: PmQuoteModel> PmProductRun<M> {
             .map_err(PmProductRunError::service)
     }
 
+    #[allow(
+        dead_code,
+        reason = "the sealed live ingress seam is consumed by the Phase 5 supervisor"
+    )]
+    pub(crate) fn ingest_open_orders_live(
+        &mut self,
+        input: PmLiveOpenOrdersInput,
+    ) -> Result<PmLiveIngressReport, PmProductRunError> {
+        self.coordinator
+            .ingest_open_orders_live(input)
+            .map_err(PmProductRunError::service)
+    }
+
     pub fn ingest_order_detail_fixture(
         &mut self,
         input: PmOrderDetailFixtureInput<'_>,
@@ -205,12 +302,78 @@ impl<M: PmQuoteModel> PmProductRun<M> {
             .map_err(PmProductRunError::service)
     }
 
+    #[allow(
+        dead_code,
+        reason = "the sealed live ingress seam is consumed by the Phase 5 supervisor"
+    )]
+    pub(crate) fn ingest_order_detail_live(
+        &mut self,
+        input: PmLiveOrderDetailInput,
+    ) -> Result<PmLiveIngressReport, PmProductRunError> {
+        self.coordinator
+            .ingest_order_detail_live(input)
+            .map_err(PmProductRunError::service)
+    }
+
     pub fn ingest_reconciliation_fixture(
         &mut self,
         input: PmReconciliationFixtureInput<'_>,
     ) -> Result<(), PmProductRunError> {
         self.coordinator
             .ingest_reconciliation_fixture(input)
+            .map_err(PmProductRunError::service)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the sealed live ingress seam is consumed by the Phase 5 supervisor"
+    )]
+    pub(crate) fn ingest_reconciliation_live(
+        &mut self,
+        input: PmLiveReconciliationInput,
+    ) -> Result<PmLiveIngressReport, PmProductRunError> {
+        self.coordinator
+            .ingest_reconciliation_live(input)
+            .map_err(PmProductRunError::service)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ingest_account_live_failure(
+        &mut self,
+        input: PmLiveAccountFailureInput,
+    ) -> Result<(), PmProductRunError> {
+        self.coordinator
+            .ingest_account_live_failure(input)
+            .map_err(PmProductRunError::service)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ingest_open_orders_live_failure(
+        &mut self,
+        input: PmLiveOpenOrdersFailureInput,
+    ) -> Result<(), PmProductRunError> {
+        self.coordinator
+            .ingest_open_orders_live_failure(input)
+            .map_err(PmProductRunError::service)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ingest_order_detail_live_failure(
+        &mut self,
+        input: PmLiveOrderDetailFailureInput,
+    ) -> Result<(), PmProductRunError> {
+        self.coordinator
+            .ingest_order_detail_live_failure(input)
+            .map_err(PmProductRunError::service)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ingest_reconciliation_live_failure(
+        &mut self,
+        input: PmLiveReconciliationFailureInput,
+    ) -> Result<(), PmProductRunError> {
+        self.coordinator
+            .ingest_reconciliation_live_failure(input)
             .map_err(PmProductRunError::service)
     }
 
@@ -258,7 +421,12 @@ impl<M: PmQuoteModel> PmProductRun<M> {
         monotonic_effect_ns: u64,
     ) -> Result<(), PmProductRunError> {
         self.coordinator
-            .execute_prepared_quote_fixture(occurrence, script, monotonic_effect_ns)
+            .execute_prepared_quote_fixture(
+                &self.fake_executor,
+                occurrence,
+                script,
+                monotonic_effect_ns,
+            )
             .map_err(PmProductRunError::service)
     }
 
@@ -270,7 +438,12 @@ impl<M: PmQuoteModel> PmProductRun<M> {
         monotonic_effect_ns: u64,
     ) -> Result<(), PmProductRunError> {
         self.coordinator
-            .execute_prepared_cancel_fixture(occurrence, script, monotonic_effect_ns)
+            .execute_prepared_cancel_fixture(
+                &self.fake_executor,
+                occurrence,
+                script,
+                monotonic_effect_ns,
+            )
             .map_err(PmProductRunError::service)
     }
 
@@ -382,7 +555,13 @@ impl<M: PmQuoteModel> PmProductRun<M> {
 
     #[must_use]
     pub fn fake_effect_metrics(&self) -> PmFakeEffectMetrics {
-        self.coordinator.fake_effect_metrics()
+        self.effect_dispatch_metrics()
+    }
+
+    /// Backend-neutral pressure and retention metrics for prepared mutations.
+    #[must_use]
+    pub fn effect_dispatch_metrics(&self) -> PmEffectDispatchMetrics {
+        self.coordinator.effect_dispatch_metrics()
     }
 
     #[must_use]
@@ -405,6 +584,19 @@ impl<M: PmQuoteModel> PmProductRun<M> {
     #[cfg(test)]
     pub(crate) fn tracked_quote_slots_for_test(&self) -> usize {
         self.coordinator.tracked_quote_slots_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn project_recovery_reconciliation_gate_for_test(&mut self) {
+        self.coordinator
+            .project_recovery_reconciliation_gate_for_test();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn private_projection_for_test(
+        &self,
+    ) -> crate::private_monitor::PmReadOnlyPrivateProjection<'_> {
+        self.coordinator.private_projection_for_test()
     }
 
     pub fn scheduler_metrics(

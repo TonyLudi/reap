@@ -1,7 +1,7 @@
 use reap_pm_state::{
-    PmFillCompaction, PmOwnedOrderProjection, PmPreparedFillCompaction, PmPrivateStateError,
-    PmRefreshAdmission, PmRefreshCompletion, PmRefreshCounters, PmRefreshReason, PmRefreshRequired,
-    PmRefreshTicket,
+    PmFillCompaction, PmOrderProjection, PmOwnedOrderProjection, PmPreparedFillCompaction,
+    PmPrivateStateError, PmRefreshAdmission, PmRefreshCompletion, PmRefreshCounters,
+    PmRefreshReason, PmRefreshRequired, PmRefreshTicket,
 };
 
 use super::PmPrivateMonitorRuntime;
@@ -79,5 +79,9 @@ impl PmPrivateMonitorRuntime {
 
     pub(crate) fn owned_orders(&self) -> impl Iterator<Item = PmOwnedOrderProjection> + '_ {
         self.state.owned_orders()
+    }
+
+    pub(crate) fn orders(&self) -> impl Iterator<Item = PmOrderProjection> + '_ {
+        self.state.orders()
     }
 }

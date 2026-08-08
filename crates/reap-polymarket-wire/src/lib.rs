@@ -1,9 +1,9 @@
 //! Pure, bounded Polymarket wire parsing.
 //!
 //! This crate owns public REST/WebSocket wire shapes, exact subscription
-//! serialization, snapshot integrity verification, and fixture-only private
-//! response parsing. It has no network, authentication, signer,
-//! private-session, or order-entry capability.
+//! serialization, snapshot integrity verification, fixture-only private
+//! parsing, and secret-custody-free live response parsing. It has no network,
+//! authentication, signer, private-session, or order-entry capability.
 
 #![forbid(unsafe_code)]
 
@@ -11,6 +11,8 @@ mod error;
 mod exact;
 mod hash;
 mod limits;
+mod live_metadata;
+mod live_private;
 mod private_fixture;
 mod raw;
 mod rest;
@@ -26,6 +28,18 @@ pub use limits::{
     MAX_BOOK_LEVELS, MAX_PRIVATE_FIXTURE_BYTES, MAX_PRIVATE_FIXTURE_EVENTS,
     MAX_PUBLIC_REST_BODY_BYTES, MAX_PUBLIC_WS_FRAME_BYTES, MAX_WS_EVENTS_PER_FRAME,
 };
+pub use live_metadata::{
+    PmClobV2Metadata, PmClobV2RequestScope, parse_live_clob_market_lifecycle,
+    parse_live_clob_v2_metadata,
+};
+pub use live_private::{
+    MAX_PM_LIVE_BODY_BYTES, MAX_PM_LIVE_CURSOR_BYTES, MAX_PM_LIVE_PAGE_ITEMS, PmCredentialOwner,
+    PmLiveAllowanceEntry, PmLiveBalanceAllowance, PmLiveCancelResult, PmLiveCursor,
+    PmLiveMakerOrder, PmLiveOpenOrderPage, PmLiveOrder, PmLivePlaceResult, PmLiveTrade,
+    PmLiveTradePage, PmLiveUserEvent, PmLiveUserFrame, PmLiveUserOrder, PmLiveWireError,
+    parse_live_balance_allowance, parse_live_cancel_result, parse_live_open_order_page,
+    parse_live_order_detail, parse_live_place_result, parse_live_trade_page, parse_live_user_frame,
+};
 pub use private_fixture::{
     PmFixtureAllowanceScope, PmFixtureMakerOrder, PmFixtureOpenOrder, PmFixtureTradeLinkage,
     PmFixtureUserEvent, PmFixtureUserFrame, PmFixtureUserOrder, PmFixtureUserTrade,
@@ -36,7 +50,7 @@ pub use rest::{
     PmClobMetadata, PmClobToken, PmLifecycleMetadata, parse_clob_metadata,
     parse_lifecycle_metadata, parse_rest_book_snapshot, parse_server_time,
 };
-pub use scope::{PmBookParserConfig, PmWireScope};
+pub use scope::{PmBookMarketBinding, PmBookParserConfig, PmWireScope};
 pub use subscription::PmMarketSubscription;
 pub use unsigned_order::{
     PM_CLOB_V2_EMPTY_BYTES32, PM_CLOB_V2_EOA_SIGNATURE_TYPE, PmUnsignedClobV2Order,

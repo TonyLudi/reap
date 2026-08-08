@@ -4,7 +4,7 @@ use reap_pm_core::{
 use sha2::{Digest, Sha256};
 
 use crate::coordinator::{
-    PmCancelIntentReason, PmControlReason, PmDurableRecordKind, PmFakeEffectStage,
+    PmCancelIntentReason, PmControlReason, PmDurableRecordKind, PmEffectDispatchStage,
     PmHealthMetricKind, PmProductEffect, PmRefreshEffectKind,
 };
 use crate::evidence::PmEvidenceError;
@@ -71,7 +71,7 @@ impl EffectProjection {
 
     pub(super) fn observe(&mut self, effect: PmProductEffect) {
         match effect {
-            PmProductEffect::FakePassiveQuote(effect) => {
+            PmProductEffect::PlaceGtcPostOnly(effect) => {
                 self.logical.update([0]);
                 self.hash_scope(effect.account_scope());
                 self.hash_instrument(effect.instrument());
@@ -82,15 +82,15 @@ impl EffectProjection {
                     .update(effect.quantity().protocol_units().to_be_bytes());
                 self.logical.update([stage_tag(effect.stage())]);
                 match effect.stage() {
-                    PmFakeEffectStage::PreparedAfterDurability => {
+                    PmEffectDispatchStage::PreparedAfterDurability => {
                         self.prepared_quotes = self.prepared_quotes.saturating_add(1);
                     }
-                    PmFakeEffectStage::ExecutedByFixture => {
+                    PmEffectDispatchStage::CompletedByBackend => {
                         self.executed_quotes = self.executed_quotes.saturating_add(1);
                     }
                 }
             }
-            PmProductEffect::FakeCancelOwned(effect) => {
+            PmProductEffect::CancelOwned(effect) => {
                 self.logical.update([1]);
                 self.hash_scope(effect.account_scope());
                 self.hash_instrument(effect.instrument());
@@ -98,10 +98,10 @@ impl EffectProjection {
                 self.hash_venue(effect.venue_order());
                 self.logical.update([stage_tag(effect.stage())]);
                 match effect.stage() {
-                    PmFakeEffectStage::PreparedAfterDurability => {
+                    PmEffectDispatchStage::PreparedAfterDurability => {
                         self.prepared_cancels = self.prepared_cancels.saturating_add(1);
                     }
-                    PmFakeEffectStage::ExecutedByFixture => {
+                    PmEffectDispatchStage::CompletedByBackend => {
                         self.executed_cancels = self.executed_cancels.saturating_add(1);
                     }
                 }
@@ -257,10 +257,10 @@ const fn side_tag(side: PmOrderSide) -> u8 {
     }
 }
 
-const fn stage_tag(stage: PmFakeEffectStage) -> u8 {
+const fn stage_tag(stage: PmEffectDispatchStage) -> u8 {
     match stage {
-        PmFakeEffectStage::PreparedAfterDurability => 0,
-        PmFakeEffectStage::ExecutedByFixture => 1,
+        PmEffectDispatchStage::PreparedAfterDurability => 0,
+        PmEffectDispatchStage::CompletedByBackend => 1,
     }
 }
 
@@ -286,7 +286,7 @@ const fn metric_tag(kind: PmHealthMetricKind) -> u8 {
         PmHealthMetricKind::DuplicateQuote => 4,
         PmHealthMetricKind::PersistencePending => 5,
         PmHealthMetricKind::PersistenceAcknowledged => 6,
-        PmHealthMetricKind::FakeEffectExecuted => 7,
+        PmHealthMetricKind::EffectDispatchCompleted => 7,
         PmHealthMetricKind::RefreshRequested => 8,
     }
 }

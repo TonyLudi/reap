@@ -21,7 +21,8 @@ use crate::{
     PmFixtureAggregateDelivery, PmFixtureCompletionOccurrence, PmFixtureDeliveryError,
     PmFixtureDeliveryScope, PmFixtureFeeEvidence, PmFixtureInstrumentScope,
     PmFixturePrivateLifecycle, PmFixtureReconciliationRoleGrant, PmFixtureScopeError,
-    PmFixtureServicedAggregate, PmPrivateLifecycleObservation, PmPrivateNormalizationError,
+    PmFixtureServicedAggregate, PmLiveFillQueryCompletion, PmLiveNormalizationError,
+    PmLiveOpenOrdersCompletion, PmPrivateLifecycleObservation, PmPrivateNormalizationError,
 };
 
 pub const MAX_PM_FIXTURE_QUERY_PAGES: usize = 128;
@@ -76,6 +77,8 @@ pub enum PmReconciliationContractError {
     NonFillObservation,
     #[error("fill query contained an unresolved private trade")]
     UnresolvedTrade,
+    #[error("live reconciliation normalization failed: {0}")]
+    Live(#[from] PmLiveNormalizationError),
 }
 
 /// Fixture-only, read-only order reconciliation capability.
@@ -288,6 +291,33 @@ impl PmFixtureOpenOrdersRequest {
         assembly.push_json_page(None, None, orders)?;
         assembly.finish(completion)
     }
+
+    /// Complete this exact owner-bound request from already authenticated,
+    /// fully paginated typed live pages.
+    pub fn complete_live_pages(
+        self,
+        completion: PmFixtureCompletionOccurrence,
+        snapshot: PmSnapshotEvidence,
+        pages: &[reap_polymarket_wire::PmLiveOpenOrderPage],
+    ) -> Result<PmLiveOpenOrdersCompletion, PmReconciliationContractError> {
+        let normalized = crate::live_reconciliation::normalize_live_open_order_pages(
+            self.binding.live_scope(),
+            pages,
+        )?;
+        let mut assembler = OpenOrdersAssembler::new(self.binding, self.request, snapshot);
+        assembler.push_page(
+            assembler.request_sequence(),
+            snapshot,
+            None,
+            None,
+            Vec::from(normalized.orders),
+        )?;
+        let payload = assembler.finish(&completion)?;
+        Ok(PmLiveOpenOrdersCompletion {
+            delivery: self.binding.delivery(completion, payload)?,
+            foreign_diagnostics: normalized.foreign_diagnostics,
+        })
+    }
 }
 
 /// Move-only bounded assembly of one complete open-order cursor chain.
@@ -380,6 +410,32 @@ impl PmFixtureOrderDetailRequest {
         let payload = assembler.finish(&completion, order)?;
         self.binding.delivery(completion, payload)
     }
+
+    /// Complete one exact journal-known order lookup from a borrowed typed
+    /// live row. A foreign condition/token is never accepted as absence or as
+    /// the configured order.
+    pub fn complete_live(
+        self,
+        completion: PmFixtureCompletionOccurrence,
+        snapshot: PmSnapshotEvidence,
+        order: Option<&reap_polymarket_wire::PmLiveOrder>,
+    ) -> Result<PmExactOrderDetailDelivery, PmReconciliationContractError> {
+        let order = order
+            .map(|order| {
+                crate::live_normalization::normalize_rest_order(
+                    self.binding.live_scope(),
+                    order,
+                    false,
+                )?
+                .configured
+                .ok_or(PmReconciliationContractError::InstrumentMismatch)
+            })
+            .transpose()?;
+        let assembler =
+            OrderDetailAssembler::new(self.binding, self.request, snapshot, self.requested_order);
+        let payload = assembler.finish(&completion, order)?;
+        self.binding.delivery(completion, payload)
+    }
 }
 
 #[derive(Debug)]
@@ -421,6 +477,47 @@ impl PmFixtureFillQueryRequest {
             fee,
         )?;
         assembly.finish(completion)
+    }
+
+    /// Complete this exact owner-bound request from a fully paginated,
+    /// account-wide typed live trade cut. The resulting watermark is derived
+    /// from every proven local-account leg, including foreign instruments.
+    pub fn complete_live_trade_pages(
+        self,
+        completion: PmFixtureCompletionOccurrence,
+        snapshot: PmSnapshotEvidence,
+        pages: &[reap_polymarket_wire::PmLiveTradePage],
+    ) -> Result<PmLiveFillQueryCompletion, PmReconciliationContractError> {
+        let completion_sequence =
+            validate_completion(&self.request, &completion, snapshot.revision())?;
+        let boundary =
+            PmReconciliationRequestBoundary::new(self.request.sequence(), completion_sequence)?;
+        let evidence = crate::PmCompleteFillCutEvidence::new(
+            self.request.connection_epoch(),
+            snapshot,
+            boundary,
+        )
+        .map_err(PmLiveNormalizationError::from)?;
+        let normalized = crate::live_reconciliation::normalize_live_trade_pages(
+            self.binding.live_scope(),
+            pages,
+            self.requested_after,
+            evidence,
+        )?;
+        let payload = PmCompleteFillQuery::new(
+            self.binding.source,
+            self.binding.account_scope,
+            snapshot,
+            boundary,
+            self.requested_after,
+            normalized.resulting_watermark,
+            normalized.fills,
+        )?;
+        Ok(PmLiveFillQueryCompletion {
+            delivery: self.binding.delivery(completion, payload)?,
+            foreign_diagnostics: normalized.foreign_diagnostics,
+            full_account_digest: normalized.full_account_digest,
+        })
     }
 }
 
@@ -497,6 +594,14 @@ struct ReconciliationBinding {
 }
 
 impl ReconciliationBinding {
+    fn live_scope(self) -> crate::live_normalization::LiveNormalizationScope {
+        crate::live_normalization::LiveNormalizationScope {
+            account: self.account_scope,
+            instrument: self.instrument,
+            source: self.source,
+        }
+    }
+
     fn normalizer(self) -> PmFixturePrivateLifecycle {
         PmFixturePrivateLifecycle::new_bound(
             self.owner_id,

@@ -14,7 +14,10 @@ fn persistence_ack_row_reaches_product_513_times_and_globally_stops() {
         )
         .await;
         let reserved = run.reserved_capacity_bytes();
-        assert!(reserved <= OWNER_MEMORY_BOUND_BYTES);
+        assert!(
+            reserved <= OWNER_MEMORY_BOUND_BYTES,
+            "reserved owner storage {reserved} exceeds bound {OWNER_MEMORY_BOUND_BYTES}"
+        );
         let venue = establish_live_quote(&mut run, "phase6-persistence-owned-order").await;
         ingest_fill_batch(&mut run, venue, 513, 20, 2_100);
         assert_eq!(run.mutation_counters().unique_fills(), 513);

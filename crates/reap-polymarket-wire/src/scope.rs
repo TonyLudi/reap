@@ -38,9 +38,22 @@ impl PmWireScope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PmBookParserConfig {
     scope: PmWireScope,
+    market_binding: PmBookMarketBinding,
     tick: PmTick,
     minimum_order_size: PmQuantity,
     negative_risk: bool,
+}
+
+/// Identity carried by the public book and market-WebSocket `market` field.
+///
+/// Goal F fixtures used the question/market ID. The current live CLOB routes
+/// carry the condition ID instead. Keeping this discriminator in the parser
+/// configuration prevents two distinct 32-byte identities from being treated
+/// as interchangeable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PmBookMarketBinding {
+    LegacyMarketId,
+    ConditionId,
 }
 
 impl PmBookParserConfig {
@@ -53,6 +66,23 @@ impl PmBookParserConfig {
     ) -> Self {
         Self {
             scope,
+            market_binding: PmBookMarketBinding::LegacyMarketId,
+            tick,
+            minimum_order_size,
+            negative_risk,
+        }
+    }
+
+    #[must_use]
+    pub const fn new_condition_bound(
+        scope: PmWireScope,
+        tick: PmTick,
+        minimum_order_size: PmQuantity,
+        negative_risk: bool,
+    ) -> Self {
+        Self {
+            scope,
+            market_binding: PmBookMarketBinding::ConditionId,
             tick,
             minimum_order_size,
             negative_risk,
@@ -62,6 +92,11 @@ impl PmBookParserConfig {
     #[must_use]
     pub const fn scope(self) -> PmWireScope {
         self.scope
+    }
+
+    #[must_use]
+    pub const fn market_binding(self) -> PmBookMarketBinding {
+        self.market_binding
     }
 
     #[must_use]

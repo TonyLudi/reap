@@ -425,6 +425,47 @@ impl PmPublicCaptureWriter {
         monotonic_receive_ns: u64,
         raw_bytes: &[u8],
     ) -> Result<(), PmCaptureWriteError> {
+        self.capture_pm_raw_before_parse(
+            connection_epoch,
+            local_ingress_sequence,
+            local_wall_receive_ns,
+            monotonic_receive_ns,
+            crate::capture::PmPublicRawTransport::MarketWebSocket,
+            raw_bytes,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn capture_rest_book_raw_before_parse(
+        &mut self,
+        connection_epoch: ConnectionEpoch,
+        local_ingress_sequence: IngressSequence,
+        local_wall_receive_ns: u64,
+        monotonic_receive_ns: u64,
+        raw_bytes: &[u8],
+    ) -> Result<(), PmCaptureWriteError> {
+        self.capture_pm_raw_before_parse(
+            connection_epoch,
+            local_ingress_sequence,
+            local_wall_receive_ns,
+            monotonic_receive_ns,
+            crate::capture::PmPublicRawTransport::BookRest,
+            raw_bytes,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn capture_pm_raw_before_parse(
+        &mut self,
+        connection_epoch: ConnectionEpoch,
+        local_ingress_sequence: IngressSequence,
+        local_wall_receive_ns: u64,
+        monotonic_receive_ns: u64,
+        transport: crate::capture::PmPublicRawTransport,
+        raw_bytes: &[u8],
+    ) -> Result<(), PmCaptureWriteError> {
         self.preflight_raw_admission(raw_bytes.len())?;
         self.preflight_pm_raw(
             connection_epoch.value(),
@@ -438,6 +479,7 @@ impl PmPublicCaptureWriter {
             local_ingress_sequence,
             local_wall_receive_ns,
             monotonic_receive_ns,
+            transport,
             raw_bytes,
         )?;
         self.send_raw_record(

@@ -59,6 +59,26 @@ const PREDARB_REFERENCE_COMMIT: &str = "8222273a9c72033b760e1d2fec813bc77144556d
 const PREDARB_REFERENCE_SEED_SHA256: &str =
     "8e671f14c4b1e8137b1dc1b0bd7d39c79d9c8f961a8483daa32151df99cbdf81";
 
+/// Identity carried by captured public book and market-WebSocket `market`
+/// fields.
+///
+/// Schema-v1 artifacts created before this discriminator used the legacy
+/// question/market ID and deserialize to [`Self::LegacyMarketId`]. The default
+/// is omitted so their serialized scope bytes and fingerprints do not change.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PmCaptureBookMarketBinding {
+    #[default]
+    LegacyMarketId,
+    ConditionId,
+}
+
+impl PmCaptureBookMarketBinding {
+    const fn is_legacy_market_id(&self) -> bool {
+        matches!(self, Self::LegacyMarketId)
+    }
+}
+
 /// Exact, secret-free scope bound into every PM public capture.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -79,6 +99,11 @@ pub struct PmCaptureScope {
     domain_sha256: String,
     condition: PmConditionId,
     market: PmMarketId,
+    #[serde(
+        default,
+        skip_serializing_if = "PmCaptureBookMarketBinding::is_legacy_market_id"
+    )]
+    book_market_binding: PmCaptureBookMarketBinding,
     outcome_token: PmTokenId,
     tick: PmTick,
     minimum_order_size: PmQuantity,
@@ -125,6 +150,11 @@ impl PmCaptureScope {
             domain_sha256: bytes_to_hex(&authoritative.domain_fingerprint()),
             condition: metadata.condition(),
             market: metadata.market(),
+            book_market_binding: if authoritative.uses_condition_bound_books() {
+                PmCaptureBookMarketBinding::ConditionId
+            } else {
+                PmCaptureBookMarketBinding::LegacyMarketId
+            },
             outcome_token: metadata.outcome().token(),
             tick: metadata.tick(),
             minimum_order_size: metadata.minimum_order_size(),
@@ -184,6 +214,11 @@ impl PmCaptureScope {
     }
 
     #[must_use]
+    pub const fn book_market_binding(&self) -> PmCaptureBookMarketBinding {
+        self.book_market_binding
+    }
+
+    #[must_use]
     pub const fn outcome_token(&self) -> PmTokenId {
         self.outcome_token
     }
@@ -236,15 +271,27 @@ impl PmCaptureScope {
             self.metadata_monotonic_receive_ns,
         )
         .map_err(PmCaptureVerifyError::Metadata)?;
-        PmRecordedMetadataEvidence::verify(
-            self.instrument,
-            self.source,
-            self.metadata,
-            revision,
-            metadata_fingerprint,
-            domain_fingerprint,
-        )
-        .map_err(PmCaptureVerifyError::Metadata)
+        let verified = match self.book_market_binding {
+            PmCaptureBookMarketBinding::LegacyMarketId => PmRecordedMetadataEvidence::verify(
+                self.instrument,
+                self.source,
+                self.metadata,
+                revision,
+                metadata_fingerprint,
+                domain_fingerprint,
+            ),
+            PmCaptureBookMarketBinding::ConditionId => {
+                PmRecordedMetadataEvidence::verify_live_clob_v2(
+                    self.instrument,
+                    self.source,
+                    self.metadata,
+                    revision,
+                    metadata_fingerprint,
+                    domain_fingerprint,
+                )
+            }
+        };
+        verified.map_err(PmCaptureVerifyError::Metadata)
     }
 
     pub fn observation_grant(&self) -> Result<PmPublicObservationGrant, PmCaptureVerifyError> {
@@ -545,6 +592,25 @@ pub enum OkxCaptureDisconnectReason {
     Stale,
 }
 
+/// The closed PM public parser selected for one captured raw payload.
+///
+/// Historical schema-v1 records predate this discriminator and therefore
+/// deserialize as [`Self::MarketWebSocket`]. The default is omitted when
+/// serializing so existing WebSocket artifacts remain byte-identical.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PmPublicRawTransport {
+    #[default]
+    MarketWebSocket,
+    BookRest,
+}
+
+impl PmPublicRawTransport {
+    const fn is_market_web_socket(&self) -> bool {
+        matches!(self, Self::MarketWebSocket)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PmRawPublicFrame {
@@ -554,6 +620,11 @@ pub struct PmRawPublicFrame {
     local_ingress_sequence: IngressSequence,
     local_wall_receive_ns: u64,
     monotonic_receive_ns: u64,
+    #[serde(
+        default,
+        skip_serializing_if = "PmPublicRawTransport::is_market_web_socket"
+    )]
+    transport: PmPublicRawTransport,
     outcome_token: PmTokenId,
     raw_sha256: String,
     raw_length: u32,
@@ -568,6 +639,7 @@ impl PmRawPublicFrame {
         local_ingress_sequence: IngressSequence,
         local_wall_receive_ns: u64,
         monotonic_receive_ns: u64,
+        transport: PmPublicRawTransport,
         raw_bytes: &[u8],
     ) -> Result<Self, PmCaptureVerifyError> {
         if raw_bytes.len() > MAX_PM_RAW_PUBLIC_FRAME_BYTES {
@@ -592,6 +664,7 @@ impl PmRawPublicFrame {
             local_ingress_sequence,
             local_wall_receive_ns,
             monotonic_receive_ns,
+            transport,
             outcome_token: scope.outcome_token,
             raw_sha256: sha256_hex(raw_bytes),
             raw_length: u32::try_from(raw_bytes.len()).expect("one-MiB raw frame length"),
@@ -617,6 +690,11 @@ impl PmRawPublicFrame {
     #[must_use]
     pub const fn monotonic_receive_ns(&self) -> u64 {
         self.monotonic_receive_ns
+    }
+
+    #[must_use]
+    pub const fn transport(&self) -> PmPublicRawTransport {
+        self.transport
     }
 
     pub fn decode_raw(&self) -> Result<Vec<u8>, PmCaptureVerifyError> {

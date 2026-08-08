@@ -1,14 +1,24 @@
 use reap_pm_core::{
     ConnectionEpoch, EventOrdering, EvmAddress, IngressSequence, PmAccountHandle, PmAccountScope,
-    PmChainId, PmConnectionId, PmEnvironmentId, PmFunderId, PmInstrumentHandle, PmMarketEvent,
-    PmMarketHandle, PmOrderSide, PmSignerId, PmSourceHandle, PmTokenHandle, ReceivedEventClock,
+    PmChainId, PmClientOrderId, PmClientOrderKey, PmConditionId, PmConnectionId, PmEnvironmentId,
+    PmFunderId, PmInstrumentHandle, PmMarketEvent, PmMarketHandle, PmOrderSide, PmPrice,
+    PmQuantity, PmSignerId, PmSourceHandle, PmTokenHandle, PmVenueOrderId, PmVenueOrderKey,
+    ReceivedEventClock, U256, exact_order_amounts,
 };
 use reap_pm_state::{
+    PmExactReservation, PmOwnedCancelRequestApply, PmOwnedIntentId, PmOwnedOrderLifecycle,
+    PmOwnedQuoteAdmission, PmOwnedQuoteIntent, PmOwnedQuoteSlotKey, PmOwnedSubmitResult,
     PmPrivateExternalIngressFailure, PmPrivateExternalIngressFault, PmPrivateExternalIngressLane,
     PmRiskHaltScope,
 };
 
 use super::*;
+use crate::coordinator::{PmLiveCancelCompletion, PmLivePlaceCompletion};
+use crate::journal::{
+    PmJournalAuthenticatedCancelResultV1, PmJournalAuthenticatedClassificationV1,
+    PmJournalAuthenticatedPlaceResultV1,
+};
+use crate::private_monitor::{PmLiveHttpQueryFailure, PmLiveOccurrenceIssuer};
 use crate::public_routes::{OkxPublicUnavailable, PmPublicUnavailable};
 use crate::schedule::{
     PmQuoteScheduleRole, PmScheduleError, PmScheduledActionKey, PmScheduledActionKind,
@@ -78,18 +88,113 @@ fn private_unavailable() -> PmPrivateInput {
     ))
 }
 
+fn authenticated_place_completion() -> PmLivePlaceCompletion {
+    let config = crate::evidence::connectivity_config();
+    let client_order = PmClientOrderKey::new(
+        config.account().account_scope().handle(),
+        PmClientOrderId::from_bytes([0x21; 16]).expect("place client order"),
+    );
+    let result = PmJournalAuthenticatedPlaceResultV1::new(
+        1,
+        2,
+        3,
+        1,
+        client_order,
+        config.account().instrument_id(),
+        [0x41; 32],
+        [0x31; 32],
+        None,
+        None,
+        PmJournalAuthenticatedClassificationV1::DefinitelyNotDispatched,
+    )
+    .expect("shape-valid lane-only place bridge");
+    PmLivePlaceCompletion::from_journal_for_scheduler_test(result)
+}
+
+fn authenticated_cancel_completion() -> PmLiveCancelCompletion {
+    let config = crate::evidence::connectivity_config();
+    let client_order = PmClientOrderKey::new(
+        config.account().account_scope().handle(),
+        PmClientOrderId::from_bytes([0x22; 16]).expect("cancel client order"),
+    );
+    let venue_order = PmVenueOrderKey::new(
+        config.account().account_scope().handle(),
+        PmVenueOrderId::new("0x3333333333333333333333333333333333333333333333333333333333333333")
+            .expect("cancel venue order"),
+    );
+    let side = PmOrderSide::Buy;
+    let price = PmPrice::parse_decimal("0.50").expect("cancel price");
+    let quantity = PmQuantity::parse_decimal("5").expect("cancel quantity");
+    let maker = exact_order_amounts(side, price, quantity)
+        .expect("cancel exact amounts")
+        .maker();
+    let quote = PmOwnedQuoteIntent::new(
+        PmOwnedIntentId::new(1).expect("cancel intent"),
+        PmOwnedQuoteSlotKey::new(
+            config.account().account_scope(),
+            config.public().instrument(),
+            side,
+        ),
+        client_order,
+        price,
+        quantity,
+        PmExactReservation::policy_approved(maker, U256::ZERO).expect("cancel reservation"),
+    )
+    .expect("cancel quote intent");
+    let mut lifecycle = PmOwnedOrderLifecycle::new(
+        config.account().account_scope(),
+        config.public().instrument(),
+    );
+    assert!(matches!(
+        lifecycle.admit_quote(quote),
+        Ok(PmOwnedQuoteAdmission::Admitted(key)) if key == client_order
+    ));
+    lifecycle
+        .apply_submit_result(client_order, PmOwnedSubmitResult::Accepted(venue_order))
+        .expect("accept cancel test order");
+    let intent = match lifecycle
+        .request_cancel(client_order)
+        .expect("request cancel test order")
+    {
+        PmOwnedCancelRequestApply::Issued(intent) => intent,
+        other => panic!("expected issued cancel intent, got {other:?}"),
+    };
+    let result = PmJournalAuthenticatedCancelResultV1::new(
+        4,
+        5,
+        6,
+        2,
+        client_order,
+        config.account().instrument_id(),
+        venue_order,
+        [0x42; 32],
+        [0x33; 32],
+        Some([0x33; 32]),
+        PmJournalAuthenticatedClassificationV1::Accepted,
+    )
+    .expect("shape-valid lane-only cancel bridge");
+    PmLiveCancelCompletion::from_journal_for_scheduler_test(intent, result)
+}
+
 #[derive(Default)]
 struct TraceConsumer {
     trace: Vec<&'static str>,
+    block_below_persistence: bool,
 }
 
 impl PmCompleteLaneService for TraceConsumer {
+    fn block_below_persistence(&self) -> bool {
+        self.block_below_persistence
+    }
+
     fn on_critical(&mut self, item: PmCompleteServiced<PmCriticalInput>) {
         self.trace.push(match item.into_value() {
             PmCriticalInput::Stop(_) => "critical-stop",
             PmCriticalInput::ScopedHalt(_) => "critical-halt",
             PmCriticalInput::FakeCancelResult(_) => "critical-cancel-result",
             PmCriticalInput::FakePlaceResult(_) => "critical-place-result",
+            PmCriticalInput::LiveCancelResult(_) => "critical-live-cancel-result",
+            PmCriticalInput::LivePlaceResult(_) => "critical-live-place-result",
         });
     }
 
@@ -113,6 +218,52 @@ impl PmCompleteLaneService for TraceConsumer {
         let _ = item.into_value().value();
         self.trace.push("telemetry");
     }
+}
+
+#[test]
+fn authenticated_http_reconciliation_remains_counted_below_persistence_barrier() {
+    let mut issuer = PmLiveOccurrenceIssuer::new(
+        PmConditionId::parse("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .expect("fixed condition"),
+    );
+    issuer
+        .start_for_test(ConnectionEpoch::new(1), clock(10))
+        .expect("active authenticated read epoch");
+    let ticket = issuer
+        .begin_account_query(11)
+        .expect("account query ticket");
+    let failure = issuer
+        .fail_account_query(ticket, clock(12), PmLiveHttpQueryFailure::Transport)
+        .expect("purpose-bound completed HTTP failure")
+        .into_dependency_failure();
+
+    let mut owner = PmCompleteInputLanes::for_instrument(instrument());
+    owner
+        .enqueue_reconciliation(
+            account_ingress(2, 12),
+            PmReconciliationInput::DependencyUnavailable(failure),
+        )
+        .expect("completed authenticated HTTP result enters reconciliation");
+    let mut consumer = TraceConsumer {
+        block_below_persistence: true,
+        ..TraceConsumer::default()
+    };
+    let blocked = owner
+        .service_turn(12, &mut consumer)
+        .expect("persistence barrier is a bounded idle turn");
+    assert_eq!(blocked.for_lane(PmLaneKind::Reconciliation), Some(0));
+    assert_eq!(owner.private_and_reconciliation_depths(), (0, 1));
+    assert_eq!(owner.read_input_lane_depths(), (0, 0, 1));
+    assert!(consumer.trace.is_empty());
+
+    consumer.block_below_persistence = false;
+    let drained = owner
+        .service_turn(13, &mut consumer)
+        .expect("later actor-only turn drains the accepted HTTP result");
+    assert_eq!(drained.for_lane(PmLaneKind::Reconciliation), Some(1));
+    assert_eq!(owner.private_and_reconciliation_depths(), (0, 0));
+    assert_eq!(owner.read_input_lane_depths(), (0, 0, 0));
+    assert_eq!(consumer.trace, ["reconciliation"]);
 }
 
 impl PmPublicLaneService for TraceConsumer {
@@ -177,6 +328,102 @@ fn complete_owner_uses_frozen_rank_and_variant_order_without_a_second_public_own
     assert_eq!(counts.for_lane(PmLaneKind::Private), Some(1));
     assert_eq!(counts.for_lane(PmLaneKind::Telemetry), Some(1));
     assert_eq!(counts.total(), 4);
+}
+
+#[test]
+fn authenticated_place_and_cancel_use_the_internal_critical_source_and_service_once() {
+    let mut owner = PmCompleteInputLanes::for_instrument(instrument());
+    let same_ingress = internal_ingress(7, 100);
+    owner
+        .enqueue_critical(
+            same_ingress,
+            PmCriticalInput::LivePlaceResult(Box::new(authenticated_place_completion())),
+        )
+        .expect("authenticated place completion enters critical lane");
+    owner
+        .enqueue_critical(
+            same_ingress,
+            PmCriticalInput::LiveCancelResult(authenticated_cancel_completion()),
+        )
+        .expect("authenticated cancel completion enters critical lane");
+
+    let queued = owner.metrics(100).expect("queued critical metrics");
+    let critical = queued.lane(PmLaneKind::Critical).expect("critical lane");
+    assert_eq!(critical.policy().capacity(), 512);
+    assert_eq!(critical.queue().depth(), 2);
+    assert_eq!(critical.queue().rejected_full(), 0);
+    assert_eq!(
+        queued
+            .fail_closed()
+            .transitions(SaturationAction::GlobalStop),
+        0
+    );
+
+    let mut consumer = TraceConsumer::default();
+    let counts = owner
+        .service_turn(100, &mut consumer)
+        .expect("service authenticated completions");
+    assert_eq!(
+        consumer.trace,
+        ["critical-live-cancel-result", "critical-live-place-result"]
+    );
+    assert_eq!(counts.for_lane(PmLaneKind::Critical), Some(2));
+    assert_eq!(counts.total(), 2);
+    assert_eq!(
+        owner
+            .metrics(100)
+            .expect("drained critical metrics")
+            .lane(PmLaneKind::Critical)
+            .expect("critical lane")
+            .queue()
+            .depth(),
+        0
+    );
+}
+
+#[test]
+fn critical_lane_rejects_product_account_source_before_capacity_admission() {
+    let mut owner = PmCompleteInputLanes::for_instrument(instrument());
+    let rejected = owner.enqueue_critical(
+        account_ingress(7, 100),
+        PmCriticalInput::LivePlaceResult(Box::new(authenticated_place_completion())),
+    );
+    assert!(matches!(
+        rejected,
+        Err(PmCompleteLaneEnqueueError::WrongSource {
+            expected: PmCompleteSourceKind::InternalSignal,
+            received: PmCompleteSourceKind::PolymarketAccount,
+            ..
+        })
+    ));
+
+    let metrics = owner.metrics(100).expect("wrong-source metrics");
+    let critical = metrics.lane(PmLaneKind::Critical).expect("critical lane");
+    assert_eq!(critical.queue().depth(), 0);
+    assert_eq!(critical.queue().high_water(), 0);
+    assert_eq!(critical.queue().rejected_full(), 0);
+    assert_eq!(
+        metrics
+            .fail_closed()
+            .transitions(SaturationAction::GlobalStop),
+        0
+    );
+}
+
+#[test]
+fn authenticated_completion_admissions_derive_internal_ingress_from_the_sealed_occurrence() {
+    let source = include_str!("../coordinator/product/service.rs");
+    for method in ["admit_place", "admit_cancel"] {
+        let body = source
+            .split_once(&format!("fn {method}"))
+            .expect("authenticated completion admission method")
+            .1
+            .split_once("\n    }")
+            .expect("bounded authenticated completion method")
+            .0;
+        assert!(body.contains("internal_ingress(&occurrence)"));
+        assert!(!body.contains("account_ingress(&occurrence)"));
+    }
 }
 
 #[test]

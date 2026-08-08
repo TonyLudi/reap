@@ -16,7 +16,7 @@ use crate::fixture_scope::validate_account_source;
 use crate::{
     PmFixtureAccountRoleGrant, PmFixtureAggregateDelivery, PmFixtureCompletionOccurrence,
     PmFixtureDeliveryError, PmFixtureDeliveryScope, PmFixtureInstrumentScope, PmFixtureScopeError,
-    PmFixtureServicedAggregate,
+    PmFixtureServicedAggregate, PmLiveAccountSnapshotCompletion, PmLiveNormalizationError,
 };
 
 pub type PmCompleteAccountSnapshotDelivery = PmFixtureAggregateDelivery<PmCompleteAccountSnapshot>;
@@ -65,6 +65,8 @@ pub enum PmAccountPositionRoleError {
     MissingTerminalPage,
     #[error("account fixture query exceeds its fixed page bound")]
     TooManyPages,
+    #[error("live account normalization failed: {0}")]
+    Live(#[from] PmLiveNormalizationError),
 }
 
 /// Fixture-only collateral, allowance, inventory, and position snapshot role.
@@ -355,6 +357,40 @@ impl PmFixtureAccountSnapshotRequest {
         let mut assembly = self.begin(snapshot);
         assembly.push_page(observed_scope, None, None, balances, allowances, positions)?;
         assembly.finish(completion)
+    }
+
+    /// Complete this owner-bound account request from exact collateral and
+    /// configured-conditional typed live responses.
+    pub fn complete_live(
+        self,
+        completion: PmFixtureCompletionOccurrence,
+        snapshot: PmSnapshotEvidence,
+        collateral: &reap_polymarket_wire::PmLiveBalanceAllowance,
+        conditional: &reap_polymarket_wire::PmLiveBalanceAllowance,
+    ) -> Result<PmLiveAccountSnapshotCompletion, PmAccountPositionRoleError> {
+        let normalized = crate::live_account::normalize_live_account(
+            crate::live_normalization::LiveNormalizationScope {
+                account: self.binding.account_scope,
+                instrument: self.binding.instrument,
+                source: self.binding.source,
+            },
+            collateral,
+            conditional,
+        )?;
+        let foreign_diagnostics = normalized.foreign_diagnostics;
+        let observed_scope = self.binding.account_scope;
+        let delivery = self.complete(
+            completion,
+            snapshot,
+            observed_scope,
+            &normalized.balances,
+            &normalized.allowances,
+            &normalized.positions,
+        )?;
+        Ok(PmLiveAccountSnapshotCompletion {
+            delivery,
+            foreign_diagnostics,
+        })
     }
 }
 

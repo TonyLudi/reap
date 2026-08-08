@@ -3,16 +3,17 @@ use std::collections::BTreeMap;
 use std::io::BufRead;
 use std::path::Path;
 
-use reap_pm_core::{PmClientOrderKey, PmVenueOrderKey, U256};
+use reap_pm_core::{PmClientOrderKey, PmVenueOrderId, PmVenueOrderKey, U256};
 use thiserror::Error;
 
 use super::schema::{
     MAX_PM_JOURNAL_BYTES, MAX_PM_JOURNAL_FILL_KEYS, MAX_PM_JOURNAL_LINE_BYTES,
-    MAX_PM_JOURNAL_OWNED_ORDERS, MAX_PM_JOURNAL_RECORDS, PmJournalCancelOutcomeV1,
-    PmJournalFillAppliedV1, PmJournalFillCursorV1, PmJournalFillKeyV1, PmJournalFillOccurrenceV1,
-    PmJournalFillSourceV1, PmJournalImmediateFillsV1, PmJournalLineV1, PmJournalPlaceOutcomeV1,
-    PmJournalQuoteIntentV1, PmJournalRecordV1, PmJournalSafetyReasonV1, PmJournalScopeV1,
-    PmJournalTerminalStatusV1, next_sequence,
+    MAX_PM_JOURNAL_OWNED_ORDERS, MAX_PM_JOURNAL_RECORDS, PmJournalAuthenticatedClassificationV1,
+    PmJournalAuthenticatedResultV1, PmJournalCancelOutcomeV1, PmJournalFillAppliedV1,
+    PmJournalFillCursorV1, PmJournalFillKeyV1, PmJournalFillOccurrenceV1, PmJournalFillSourceV1,
+    PmJournalImmediateFillsV1, PmJournalLineV1, PmJournalPlaceOutcomeV1, PmJournalQuoteIntentV1,
+    PmJournalRecordV1, PmJournalSafetyReasonV1, PmJournalScopeV1, PmJournalTerminalStatusV1,
+    next_sequence,
 };
 
 /// Bounded deterministic projection recovered from one checked PM journal.
@@ -36,6 +37,7 @@ pub struct PmJournalRecovery {
     observation_order: BTreeMap<u64, PmJournalRecoveredObservationV1>,
     safety_halt: Option<PmJournalSafetyReasonV1>,
     fill_watermark: Option<PmJournalFillCursorV1>,
+    authenticated_results: BTreeMap<u64, PmJournalAuthenticatedResultV1>,
 }
 
 impl PmJournalRecovery {
@@ -55,6 +57,7 @@ impl PmJournalRecovery {
             observation_order: BTreeMap::new(),
             safety_halt: None,
             fill_watermark: None,
+            authenticated_results: BTreeMap::new(),
         }
     }
 
@@ -140,6 +143,34 @@ impl PmJournalRecovery {
         })
     }
 
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub(crate) fn recovered_order(
+        &self,
+        client_order: PmClientOrderKey,
+    ) -> Option<PmJournalRecoveredOrderV1> {
+        self.owned_orders
+            .get(&client_order)
+            .map(RecoveredOwnedOrder::bootstrap_row)
+    }
+
+    /// Internal provenance used only by authenticated cross-journal startup.
+    /// An authenticated attempt may never reuse an intent already completed
+    /// through the ordinary/fake result path, even when both recover to the
+    /// same coarse Unknown lifecycle projection.
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub(crate) fn has_ordinary_place_result(&self, client_order: PmClientOrderKey) -> bool {
+        self.owned_orders
+            .get(&client_order)
+            .is_some_and(|order| order.ordinary_place_result_recorded)
+    }
+
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub(crate) fn has_ordinary_cancel_result(&self, client_order: PmClientOrderKey) -> bool {
+        self.owned_orders
+            .get(&client_order)
+            .is_some_and(|order| order.ordinary_cancel_result_recorded)
+    }
+
     /// Coordinator-owner ordered full fill facts for canonical bootstrap.
     ///
     /// Recovery retains the exact execution, fee, settlement, source and
@@ -168,6 +199,17 @@ impl PmJournalRecovery {
         self.observation_order.values().copied()
     }
 
+    /// Auth-result-sequence ordered atomic bridges already present in Goal F.
+    ///
+    /// This is read-only restart evidence; it carries no send or reduction
+    /// authority.
+    pub(crate) fn authenticated_results(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = PmJournalAuthenticatedResultV1> + ExactSizeIterator + '_
+    {
+        self.authenticated_results.values().copied()
+    }
+
     pub(crate) fn reserved_capacity_bytes(&self) -> usize {
         self.owned_orders.len() * std::mem::size_of::<RecoveredOwnedOrder>()
             + self.order_order.len()
@@ -185,6 +227,9 @@ impl PmJournalRecovery {
             + self.observation_order.len()
                 * (std::mem::size_of::<u64>()
                     + std::mem::size_of::<PmJournalRecoveredObservationV1>())
+            + self.authenticated_results.len()
+                * (std::mem::size_of::<u64>()
+                    + std::mem::size_of::<PmJournalAuthenticatedResultV1>())
     }
 }
 
@@ -221,6 +266,7 @@ pub(crate) enum PmJournalRecoveredPlaceV1 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PmJournalRecoveredOrderV1 {
     intent: PmJournalQuoteIntentV1,
+    intent_journal_sequence: u64,
     venue_order: Option<PmVenueOrderKey>,
     place: PmJournalRecoveredPlaceV1,
     known_fill_total: U256,
@@ -228,6 +274,7 @@ pub(crate) struct PmJournalRecoveredOrderV1 {
     cumulative: U256,
     cancel_pending: bool,
     cancel_unknown: bool,
+    cancel_intent_journal_sequence: Option<u64>,
     pending_ack_fill_count: u8,
     terminal: Option<PmJournalTerminalStatusV1>,
 }
@@ -236,6 +283,12 @@ impl PmJournalRecoveredOrderV1 {
     #[must_use]
     pub(crate) const fn intent(self) -> PmJournalQuoteIntentV1 {
         self.intent
+    }
+
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    #[must_use]
+    pub(crate) const fn intent_journal_sequence(self) -> u64 {
+        self.intent_journal_sequence
     }
 
     #[must_use]
@@ -272,6 +325,12 @@ impl PmJournalRecoveredOrderV1 {
     #[must_use]
     pub(crate) const fn cancel_unknown(self) -> bool {
         self.cancel_unknown
+    }
+
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    #[must_use]
+    pub(crate) const fn cancel_intent_journal_sequence(self) -> Option<u64> {
+        self.cancel_intent_journal_sequence
     }
 
     #[must_use]
@@ -348,14 +407,18 @@ impl PendingAcknowledgementFills {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RecoveredOwnedOrder {
     intent: PmJournalQuoteIntentV1,
+    intent_journal_sequence: u64,
     known_fill_total: U256,
     authoritative_cumulative: Option<U256>,
     cumulative: U256,
     last_authoritative_occurrence: Option<RecoveredAuthoritativeOccurrence>,
     venue_order: Option<PmVenueOrderKey>,
     place: RecoveredPlace,
+    ordinary_place_result_recorded: bool,
     cancel_pending: bool,
     cancel_unknown: bool,
+    cancel_intent_journal_sequence: Option<u64>,
+    ordinary_cancel_result_recorded: bool,
     pending_ack_fills: PendingAcknowledgementFills,
     terminal: Option<PmJournalTerminalStatusV1>,
 }
@@ -364,6 +427,7 @@ impl RecoveredOwnedOrder {
     fn bootstrap_row(&self) -> PmJournalRecoveredOrderV1 {
         PmJournalRecoveredOrderV1 {
             intent: self.intent,
+            intent_journal_sequence: self.intent_journal_sequence,
             venue_order: self.venue_order,
             place: match self.place {
                 RecoveredPlace::IntentOnly => PmJournalRecoveredPlaceV1::IntentOnly,
@@ -376,6 +440,7 @@ impl RecoveredOwnedOrder {
             cumulative: self.cumulative,
             cancel_pending: self.cancel_pending,
             cancel_unknown: self.cancel_unknown,
+            cancel_intent_journal_sequence: self.cancel_intent_journal_sequence,
             pending_ack_fill_count: self.pending_ack_fills.len(),
             terminal: self.terminal,
         }
@@ -557,9 +622,11 @@ fn apply_record(
 
     match record {
         PmJournalRecordV1::Header(_) => unreachable!("header rejected above"),
-        PmJournalRecordV1::QuoteIntent(intent) => apply_quote_intent(recovery, *intent)?,
+        PmJournalRecordV1::QuoteIntent(intent) => {
+            apply_quote_intent(recovery, *intent, sequence)?;
+        }
         PmJournalRecordV1::PlaceResult(result) => {
-            apply_place_result(recovery, result)?;
+            apply_place_result(recovery, result, ResultProvenance::Ordinary)?;
         }
         PmJournalRecordV1::CancelIntent(intent) => {
             let order = checked_bound_order(
@@ -571,9 +638,10 @@ fn apply_record(
                 return Err(PmJournalRecoveryError::InvalidCancelTransition);
             }
             order.cancel_pending = true;
+            order.cancel_intent_journal_sequence = Some(sequence);
         }
         PmJournalRecordV1::CancelResult(result) => {
-            apply_cancel_result(recovery, result)?;
+            apply_cancel_result(recovery, result, ResultProvenance::Ordinary)?;
         }
         PmJournalRecordV1::FillApplied(applied) => {
             apply_fill(recovery, *applied)?;
@@ -591,6 +659,9 @@ fn apply_record(
             recovery.fill_watermark = Some(watermark.cursor);
             compact_proven_terminal_orders(recovery, CompactionProof::FillWatermark);
         }
+        PmJournalRecordV1::AuthenticatedResult(result) => {
+            apply_authenticated_result(recovery, *result)?;
+        }
     }
     Ok(())
 }
@@ -598,6 +669,7 @@ fn apply_record(
 fn apply_quote_intent(
     recovery: &mut PmJournalRecovery,
     intent: PmJournalQuoteIntentV1,
+    sequence: u64,
 ) -> Result<(), PmJournalRecoveryError> {
     if intent.intent_id <= recovery.last_intent_id {
         return Err(PmJournalRecoveryError::NonMonotonicIntentId {
@@ -623,14 +695,18 @@ fn apply_quote_intent(
         intent.client_order,
         RecoveredOwnedOrder {
             intent,
+            intent_journal_sequence: sequence,
             known_fill_total: U256::ZERO,
             authoritative_cumulative: None,
             cumulative: U256::ZERO,
             last_authoritative_occurrence: None,
             venue_order: None,
             place: RecoveredPlace::IntentOnly,
+            ordinary_place_result_recorded: false,
             cancel_pending: false,
             cancel_unknown: false,
+            cancel_intent_journal_sequence: None,
+            ordinary_cancel_result_recorded: false,
             pending_ack_fills: PendingAcknowledgementFills::empty(),
             terminal: None,
         },
@@ -648,9 +724,110 @@ fn same_slot(first: PmJournalQuoteIntentV1, second: PmJournalQuoteIntentV1) -> b
         && first.side == second.side
 }
 
+fn apply_authenticated_result(
+    recovery: &mut PmJournalRecovery,
+    result: PmJournalAuthenticatedResultV1,
+) -> Result<(), PmJournalRecoveryError> {
+    let auth_result_sequence = result.auth_result_sequence();
+    if recovery
+        .authenticated_results
+        .contains_key(&auth_result_sequence)
+    {
+        return Err(PmJournalRecoveryError::DuplicateAuthenticatedResult);
+    }
+    let expected_prior = match result {
+        PmJournalAuthenticatedResultV1::Place(place) => {
+            recovery
+                .owned_orders
+                .get(&place.canonical().client_order)
+                .ok_or(PmJournalRecoveryError::UnknownOwnedOrder)?
+                .intent_journal_sequence
+        }
+        PmJournalAuthenticatedResultV1::Cancel(cancel) => recovery
+            .owned_orders
+            .get(&cancel.canonical().client_order)
+            .ok_or(PmJournalRecoveryError::UnknownOwnedOrder)?
+            .cancel_intent_journal_sequence
+            .ok_or(PmJournalRecoveryError::InvalidCancelTransition)?,
+    };
+    if expected_prior != result.prior_goal_f_sequence() {
+        return Err(PmJournalRecoveryError::AuthenticatedPriorSequenceMismatch);
+    }
+    match result {
+        PmJournalAuthenticatedResultV1::Place(place) => {
+            apply_place_result(recovery, place.canonical(), ResultProvenance::Authenticated)?;
+            if matches!(
+                place.classification(),
+                PmJournalAuthenticatedClassificationV1::OutOfProfile
+                    | PmJournalAuthenticatedClassificationV1::AcknowledgementUnknown
+            ) {
+                bind_authenticated_ambiguous_venue(recovery, place)?;
+            }
+        }
+        PmJournalAuthenticatedResultV1::Cancel(cancel) => {
+            apply_cancel_result(
+                recovery,
+                &cancel.canonical(),
+                ResultProvenance::Authenticated,
+            )?;
+        }
+    }
+    recovery
+        .authenticated_results
+        .insert(auth_result_sequence, result);
+    Ok(())
+}
+
+fn bind_authenticated_ambiguous_venue(
+    recovery: &mut PmJournalRecovery,
+    place: super::schema::PmJournalAuthenticatedPlaceResultV1,
+) -> Result<(), PmJournalRecoveryError> {
+    let client_order = place.canonical().client_order;
+    let venue_order = exact_expected_venue_order(client_order, place.expected_order_id())?;
+    if recovery
+        .owned_orders
+        .iter()
+        .any(|(client, order)| *client != client_order && order.venue_order == Some(venue_order))
+    {
+        return Err(PmJournalRecoveryError::DuplicateVenueBinding);
+    }
+    let order = recovery
+        .owned_orders
+        .get_mut(&client_order)
+        .ok_or(PmJournalRecoveryError::UnknownOwnedOrder)?;
+    if order.place != RecoveredPlace::Unknown || order.venue_order.is_some() {
+        return Err(PmJournalRecoveryError::InvalidPlaceTransition);
+    }
+    order.venue_order = Some(venue_order);
+    Ok(())
+}
+
+fn exact_expected_venue_order(
+    client_order: PmClientOrderKey,
+    expected: [u8; 32],
+) -> Result<PmVenueOrderKey, PmJournalRecoveryError> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut identity = String::with_capacity(66);
+    identity.push_str("0x");
+    for byte in expected {
+        identity.push(char::from(HEX[usize::from(byte >> 4)]));
+        identity.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    let identity = PmVenueOrderId::new(&identity)
+        .map_err(|_| PmJournalRecoveryError::InvalidPlaceTransition)?;
+    Ok(PmVenueOrderKey::new(client_order.account(), identity))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResultProvenance {
+    Ordinary,
+    Authenticated,
+}
+
 fn apply_place_result(
     recovery: &mut PmJournalRecovery,
     result: &super::schema::PmJournalPlaceResultV1,
+    provenance: ResultProvenance,
 ) -> Result<(), PmJournalRecoveryError> {
     if let Some(venue_order) = result.venue_order
         && recovery.owned_orders.iter().any(|(client, order)| {
@@ -701,6 +878,9 @@ fn apply_place_result(
             bind_venue(order, result.venue_order, &result.immediate_fills)?;
         }
     }
+    if provenance == ResultProvenance::Ordinary {
+        order.ordinary_place_result_recorded = true;
+    }
     if binds_venue {
         recovery.pending_ack_fill_keys = recovery
             .pending_ack_fill_keys
@@ -741,6 +921,7 @@ fn bind_venue(
 fn apply_cancel_result(
     recovery: &mut PmJournalRecovery,
     result: &super::schema::PmJournalCancelResultV1,
+    provenance: ResultProvenance,
 ) -> Result<(), PmJournalRecoveryError> {
     let order = checked_bound_order(
         &mut recovery.owned_orders,
@@ -779,6 +960,9 @@ fn apply_cancel_result(
         PmJournalCancelOutcomeV1::AmbiguousTimeout => {
             order.cancel_unknown = true;
         }
+    }
+    if provenance == ResultProvenance::Ordinary {
+        order.ordinary_cancel_result_recorded = true;
     }
     Ok(())
 }
@@ -1211,6 +1395,10 @@ pub enum PmJournalRecoveryError {
     InvalidTerminalTransition,
     #[error("PM journal repeats a fill-eviction watermark")]
     DuplicateWatermark,
+    #[error("PM journal repeats an authenticated result sequence")]
+    DuplicateAuthenticatedResult,
+    #[error("PM journal authenticated result points to the wrong Goal-F intent sequence")]
+    AuthenticatedPriorSequenceMismatch,
 }
 
 #[cfg(test)]

@@ -167,7 +167,7 @@ pub(super) const OVERLOAD_CASES: [OverloadCase; 13] = [
     mechanism(
         OverloadCaseId::FakeEffect,
         ExpectedOverloadOutcome::bounded(256),
-        PolicySource::Lane(PmLaneKind::FakeEffect),
+        PolicySource::Lane(PmLaneKind::EffectDispatch),
     ),
     mechanism(
         OverloadCaseId::ScheduledActions,
