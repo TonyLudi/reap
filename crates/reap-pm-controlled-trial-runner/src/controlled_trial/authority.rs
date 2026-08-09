@@ -301,6 +301,29 @@ pub(super) struct FreshCredentialAuthorityRoles {
 }
 
 impl FreshCredentialAuthorityRoles {
+    /// Consume the unsplit authority bundle at the runner-private runtime
+    /// assembly boundary. Production composition must immediately place the
+    /// HTTP and user-WS handles into one fixed connectivity owner; this is not
+    /// a general credential-role accessor.
+    pub(super) fn into_private_read_runtime_parts(
+        self,
+    ) -> (
+        FreshPlaceAuthenticationOnce,
+        ExactOwnedCancelAuthenticationRole,
+        FixedHttpAuthenticationRole,
+        FixedUserWsAuthenticationRole,
+        FreshCredentialAuthoritySupervisor,
+    ) {
+        (
+            self.place,
+            self.cancel,
+            self.http,
+            self.user_ws,
+            self.supervisor,
+        )
+    }
+
+    #[cfg(test)]
     pub(super) fn into_roles(
         self,
     ) -> (
@@ -336,6 +359,20 @@ pub(super) struct RecoveryCredentialAuthorityRoles {
 }
 
 impl RecoveryCredentialAuthorityRoles {
+    /// Recovery consumes the complete L2-only bundle at the same fixed
+    /// read-runtime assembly boundary. No signer or place type exists here.
+    pub(super) fn into_private_read_runtime_parts(
+        self,
+    ) -> (
+        ExactOwnedCancelAuthenticationRole,
+        FixedHttpAuthenticationRole,
+        FixedUserWsAuthenticationRole,
+        RecoveryCredentialAuthoritySupervisor,
+    ) {
+        (self.cancel, self.http, self.user_ws, self.supervisor)
+    }
+
+    #[cfg(test)]
     pub(super) fn into_roles(
         self,
     ) -> (

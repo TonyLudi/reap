@@ -4,6 +4,7 @@
 //! by the secret-owning child authority. They carry no transport capability.
 
 mod authority;
+mod runtime;
 
 use std::fmt;
 
