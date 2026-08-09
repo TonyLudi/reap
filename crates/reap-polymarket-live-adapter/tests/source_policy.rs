@@ -132,6 +132,52 @@ fn production_read_only_facade_is_opaque_exact_bound_and_mutation_free() {
 }
 
 #[test]
+fn account_only_facade_releases_no_websocket_reconciliation_or_mutation_role() {
+    for required in [
+        "pub struct PmReadOnlyAccountConnectivityOwner",
+        "pub fn production(",
+        "signature_type: PmReadOnlySignatureType",
+        "conditional_token: PmTokenId",
+        "expected_signer.bytes() == [0; 20] || expected_funder.bytes() == [0; 20]",
+        "funder is therefore an operator-reviewed structural input",
+        "PmPrivateHttpTransport::for_account(&config, credentials.address())?",
+        "account_http_credential_role(self.credentials)?",
+        "pub struct PmReadOnlyAccountConnectivityRoles",
+        "pub server_time: PmReadServerTimeHttpRole",
+        "pub authenticated_account: PmReadOnlyAccountHttpOwner",
+        "pub credential_supervisor: PmCredentialAuthoritySupervisor",
+    ] {
+        assert!(
+            READ_ONLY_PRIVATE.contains(required),
+            "missing account-only facade invariant: {required}"
+        );
+    }
+
+    let roles_start = READ_ONLY_PRIVATE
+        .find("pub struct PmReadOnlyAccountConnectivityRoles")
+        .unwrap();
+    let roles_end = READ_ONLY_PRIVATE[roles_start..]
+        .find("/// Sole production-safe constructor")
+        .map(|offset| roles_start + offset)
+        .unwrap();
+    let roles = &READ_ONLY_PRIVATE[roles_start..roles_end];
+    for forbidden in [
+        "PmAuthenticatedUserWsRole",
+        "PmAuthenticatedHttpOwner",
+        "reconciliation",
+        "exact_order",
+        "mutation",
+    ] {
+        assert!(
+            !roles.contains(forbidden),
+            "account-only role escape: {forbidden}"
+        );
+    }
+    assert!(LIB.contains("PmReadOnlyAccountConnectivityOwner"));
+    assert!(LIB.contains("PmReadOnlyAccountHttpOwner"));
+}
+
+#[test]
 fn read_only_evidence_feature_cannot_enable_mutation_constructors() {
     assert!(MANIFEST.contains("read-only-evidence = []"));
     assert!(!MANIFEST.contains("read-only-evidence = [\"loopback-evidence\"]"));
@@ -341,7 +387,7 @@ fn authenticated_routes_are_fixed_reads_without_filter_or_mutation_escape() {
         ".append_pair(\"next_cursor\", cursor)",
         ".append_pair(\"asset_type\", \"COLLATERAL\")",
         ".append_pair(\"asset_type\", \"CONDITIONAL\")",
-        ".append_pair(\"signature_type\", \"0\")",
+        ".append_pair(\"signature_type\", signature_type.query_value())",
     ] {
         assert!(
             PRIVATE_HTTP.contains(required),
@@ -363,6 +409,19 @@ fn authenticated_routes_are_fixed_reads_without_filter_or_mutation_escape() {
         assert!(
             !PRIVATE_HTTP.contains(forbidden_method),
             "private mutation method: {forbidden_method}"
+        );
+    }
+    assert!(!PRIVATE_HTTP.contains("/balance-allowance/update"));
+    for required in [
+        "pub enum PmReadOnlySignatureType",
+        "Eoa = 0",
+        "Proxy = 1",
+        "impl TryFrom<u8> for PmReadOnlySignatureType",
+        "_ => Err(PmLiveAdapterError::InvalidConfiguration(",
+    ] {
+        assert!(
+            ACCOUNT.contains(required),
+            "missing account profile guard: {required}"
         );
     }
     for forbidden_capability in [

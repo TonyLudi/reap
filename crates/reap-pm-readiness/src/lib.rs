@@ -7,19 +7,35 @@
 
 #![forbid(unsafe_code)]
 
+mod account_collect;
+mod account_schema;
+mod account_verify;
 mod collect;
 mod config;
 mod credentials;
 mod schema;
 mod verify;
 
+pub use account_collect::{PmReadOnlyAccountError, collect_pm_read_only_account_path};
+pub use account_schema::{
+    PM_READ_ONLY_ACCOUNT_ARTIFACT_SCHEMA_VERSION, PmReadOnlyAccountArtifact,
+    PmReadOnlyAccountSnapshotEvidence, PmReadOnlyAccountSummary, PmReadOnlyAccountTeardownEvidence,
+};
+pub use account_verify::{
+    MAX_PM_READ_ONLY_ACCOUNT_ARTIFACT_BYTES, PM_READ_ONLY_ACCOUNT_LIMITATIONS,
+    PmReadOnlyAccountVerificationError, require_pm_read_only_account_pass,
+    verify_pm_read_only_account_artifact_bytes, verify_pm_read_only_account_path,
+    verify_pm_read_only_account_path_with_anchors,
+};
 pub use collect::{
     PmReadOnlySmokeError, collect_pm_read_only_smoke_path,
     resolve_pm_read_only_credentials_directory,
 };
 pub use config::{
-    MAX_PM_READ_ONLY_CONFIG_BYTES, PM_READ_ONLY_CONFIG_SCHEMA_VERSION, PmReadOnlyConfigEvidence,
-    PmReadOnlySmokeConfig, PmReadOnlySmokeConfigError, load_pm_read_only_smoke_config_path,
+    MAX_PM_READ_ONLY_CONFIG_BYTES, PM_READ_ONLY_CONFIG_SCHEMA_VERSION, PmReadOnlyAccountConfig,
+    PmReadOnlyAccountConfigEvidence, PmReadOnlyConfigEvidence, PmReadOnlySmokeConfig,
+    PmReadOnlySmokeConfigError, load_pm_read_only_account_config_path,
+    load_pm_read_only_smoke_config_path,
 };
 pub use credentials::{
     MAX_PM_READ_ONLY_CREDENTIAL_FILE_BYTES, PmReadOnlyCredentialBundle, PmReadOnlyCredentialError,

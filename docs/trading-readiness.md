@@ -128,13 +128,15 @@ resent. With no accepted venue-order ID, restart cannot issue an exact-owned
 cancel for that tail. Reconciliation can inform operator recovery, but it does
 not bind the tail or mint ownership from remote evidence.
 
-With PM-T1's local acceptance and standard gates green, the next permissible
-external step remains a separately scoped, explicitly authorized credentialed
-**read-only** smoke test. It must verify signer/funder, credential owner,
-market/token, collateral, every required allowance, position, open orders,
-trades, user stream, and complete reconciliation without mutation. A
-minimal-capital place/cancel smoke is a later authorization and remains
-prohibited now. `production_order_entry_authorized = false` remains mandatory.
+With PM-T1's local acceptance and standard gates green, external steps remain
+separately scoped, explicitly authorized, and credentialed **read-only** runs.
+The narrow account-only run can cover only configured-token balance and
+allowance loading. Full certification must additionally verify signer/funder,
+credential owner, market/token, collateral, every required allowance,
+position, open orders, trades, user stream, and complete reconciliation
+without mutation. A minimal-capital place/cancel smoke is a later authorization
+and remains prohibited now. `production_order_entry_authorized = false`
+remains mandatory.
 
 ### Dedicated PM read-only qualification
 
@@ -162,6 +164,55 @@ settlement, or capital-bearing trial. Any quiet user stream is a non-pass,
 even if REST returns historical owner rows, and must not be repaired by placing
 or cancelling an order.
 
+The same executable now also has a distinct `certify-account` /
+`verify-account` contract for the narrower balance-loading question. It reuses
+the full workflow's closed 24-field config and protected three-file L2 custody,
+but its validator admits exactly two account shapes: signature type 0 with the
+same signer/funder EOA, or signature type 1 with a distinct proxy funder. The
+full `certify` contract remains type 0 only; proxy support does not leak into
+its order/trade/reconciliation/user-stream surface.
+
+A passing account-only attempt proves an exact request surface of two public
+`/time` attempts followed by two authenticated balance/allowance GET attempts:
+one collateral and one for the single configured conditional token. It opens
+no WebSocket and calls no metadata, Data API position, order, trade,
+reconciliation, update, or mutation route. It accepts no private key. The
+artifact retains canonical collateral/configured-token balances and exact
+required allowance rows; zero amounts are observations, not a failure. This is
+configured-token balance loading, not account-wide position enumeration or a
+claim of sufficient capital/allowance.
+
+For a type-1 run, the funder is operator-reviewed config. The two balance
+responses do not independently return or attest that proxy address, and the
+artifact cannot turn repetition of the reviewed address into remote identity
+proof. Public market metadata is also not fetched: condition, market, outcome,
+tick, minimum size, and negative-risk inputs must be reviewed independently.
+The responses are sequential rather than atomic, raw authenticated bodies are
+not retained, and offline verification remains recomputable consistency
+checking that requires independent collection custody. The synthetic operator
+template and exact commands are documented in
+[`operations.md`](operations.md#account-only-balance-qualification-for-an-eoa-or-proxy).
+
+#### Recorded account-only production acceptance
+
+On 2026-08-09, one explicitly authorized production `certify-account` attempt
+completed with a passing account-only artifact, and the matching offline
+`verify-account --require-pass` check was green. The private key was not
+supplied to Reap. The staged runtime L2 credential copies were removed after
+the run. The private artifact remains local and ignored at
+`var/reap/pm-readiness/predarb-proxy-account-certification-20260809.json`; it
+must not be added to source control or treated as a public report.
+
+This closes only the empirical question that the reviewed proxy-profile L2
+bundle could load the collateral and configured-token conditional
+balance/allowance responses through the fixed account-only surface on that
+run. No account identity, address, credential, balance, allowance amount, or
+token value is reproduced here. The artifact does not remotely attest the
+operator-reviewed proxy funder, and it does not cover public metadata, Data
+API positions, orders, trades, user WebSocket, reconnect/soak behavior,
+strategy, economics, or mutation. No full `certify` production artifact has
+passed or been accepted.
+
 ### PM trading gates that remain open
 
 The remaining blockers are intentionally explicit: accepted credential
@@ -174,20 +225,20 @@ remain absent.
 | --- | --- |
 | Production quote and order model | Define, review, backtest, and independently validate the fair-probability transformation from OKX reference state and PM market state; exact supported order semantics; passive spread and size policy; inventory response; quote replacement/cancellation behavior; and stale/reference-failure behavior. The deterministic fixture threshold/model and fixed fake GTC post-only profile are not a production strategy or order model. |
 | Economics and risk calibration | Establish fees/rebates, queue and fill assumptions, adverse selection, slippage, liquidity and market-impact limits, inventory and concentration limits, capital-at-risk limits, collateral utilization, loss limits, and resolution-value treatment from representative data. Require reproducible backtests, stress tests, and a reviewed acceptance decision. No current local replay or latency artifact is economic evidence. |
-| Credential custody and signer qualification | PM-T1 implements the fixed signer and L2 algorithms with non-Clone, zeroizing, redacted holders and synthetic vectors. The dedicated read-only workflow adds a runtime-file L2 provider, rotation slot, process-isolation contract, and secret-free offline artifact, but the operator must still review custody/access/audit controls and accept target signer/funder/signature-type evidence. The workflow intentionally cannot prove private-key possession. No real key or credential has entered Reap. |
-| External connectivity qualification | PM-T1 implements allowlisted public/private/read transports and local authenticated-loopback evidence; `reap-pm-readiness` now supplies the separately authorized read-only certification composition. An accepted external target-account artifact, reconnect/rate/capacity/latency qualification, and sustained operation still do not exist. The certification executable is not a deployed trading service and has no production mutation constructor. |
+| Credential custody and signer qualification | PM-T1 implements the fixed signer and L2 algorithms with non-Clone, zeroizing, redacted holders and synthetic vectors. The dedicated read-only workflows add a runtime-file L2 provider, rotation slot, process-isolation contract, and secret-free offline artifacts. Account-only collection structurally admits reviewed type-0 EOA and type-1 distinct-proxy profiles, but the operator must still review custody/access/audit controls and independently accept the target signer/funder mapping; a type-1 funder is not remotely attested by its two responses. Neither workflow proves private-key possession. The 2026-08-09 account-only run supplied no private key and removed staged L2 copies, but one run does not qualify long-term custody, rotation, or access controls. |
+| External connectivity qualification | PM-T1 implements allowlisted public/private/read transports and local authenticated-loopback evidence; `reap-pm-readiness` supplies separately authorized full and account-only read-only compositions. The 2026-08-09 production account-only run passed its exact two-time/two-balance contract and offline verification. Full metadata/reconciliation/user-stream certification, reconnect/rate/capacity/latency qualification, and sustained operation still do not exist. The executable is not a deployed trading service and has no production mutation constructor. |
 | Settlement and on-chain operations | Define and implement the supported fill-settlement and market-resolution lifecycle, then separately review any required collateral allowance or ERC-1155 operator-approval mutation, transfers, split/merge, redemption, bridge, or withdrawal behavior. The current fill settlement-state reducer is observational only and performs none of these operations. |
 | Operations and target host | Declare a target host and deployment profile; add PM-specific configuration/secrets handling, supervision, health/alerts, storage and recovery procedures, emergency owned-order cleanup, incident response, rollout/rollback, and operator runbooks; then exercise them under bounded failure. No target host is currently declared. |
-| Target-account certification | On the exact intended account, verify signer/funder/account identity, chain and current protocol/domain addresses, market/token membership, lifecycle/tick/minimum/lot rules, required spenders and allowances, collateral and token balances, positions, fees and limits, open orders, fills, ownership, cancellation, and complete reconciliation. Fixture account state is not target-account evidence. |
+| Target-account certification | On the exact intended account, verify signer/funder/account identity, chain and current protocol/domain addresses, market/token membership, lifecycle/tick/minimum/lot rules, required spenders and allowances, collateral and token balances, positions, fees and limits, open orders, fills, ownership, cancellation, and complete reconciliation. A passing account-only artifact can cover only scoped balance/allowance loading; it does not remotely attest a proxy funder, inspect public metadata or Data API positions, or cover orders/trades/user events. Fixture state and narrow account-only state are not complete target-account certification. |
 | Demo or controlled trial evidence | First define an acceptable PM test environment or tightly bounded minimal-capital equivalent and its safety envelope. Then obtain credentialed smoke, reconnect/restart, partial/immediate/multiple/duplicate fill, ambiguous-order, cancellation-race, reconciliation, fault, sustained-soak, latency, and economic evidence. None has been run or accepted. |
 | Approval evidence | Build a source-bound evidence bundle and obtain explicit independent strategy/model, risk, security/key-custody, and operations approval for the exact binary, configuration, host, account, limits, and rollout/rollback plan. No current PM artifact or existing Chaos/OKX approval grants that authority. `production_order_entry_authorized: false` remains mandatory. |
 
-Absent explicit approval for one exact `reap-pm-readiness` run, the safe current
-interpretation remains public-protocol/capture/replay, offline fixture/fake
-validation, and synthetic owner-local authenticated-loopback validation only.
-The dedicated read-only certification is the sole documented exception for
-approved external authenticated PM access. Real order mutation must remain
-disconnected.
+Absent explicit approval for one exact `reap-pm-readiness` run and command, the
+safe current interpretation remains public-protocol/capture/replay, offline
+fixture/fake validation, and synthetic owner-local authenticated-loopback
+validation only. The dedicated full and account-only read-only certifications
+are the sole documented exceptions for approved external authenticated PM
+access. Real order mutation must remain disconnected.
 `production_order_entry_authorized = false` is mandatory.
 The existing Chaos/OKX readiness material and its separate gates are unchanged
 and do not transfer approval to the PM product.

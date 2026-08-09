@@ -414,8 +414,12 @@ fn strict_config_has_only_the_closed_secret_free_operator_fields() {
 
 #[test]
 fn artifact_schema_cannot_persist_raw_authenticated_or_secret_derived_material() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/schema.rs");
-    let source = fs::read_to_string(path).expect("schema source must be readable");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let source = ["schema.rs", "account_schema.rs"]
+        .into_iter()
+        .map(|name| fs::read_to_string(root.join(name)).expect("schema source must be readable"))
+        .collect::<Vec<_>>()
+        .join("\n");
     for structure in [
         "PmReadOnlyCollectionFailureEvidence",
         "PmReadOnlyAllowanceEvidence",
@@ -427,6 +431,9 @@ fn artifact_schema_cannot_persist_raw_authenticated_or_secret_derived_material()
         "PmReadOnlyUserStreamEvidence",
         "PmReadOnlyTeardownEvidence",
         "PmReadOnlySmokeArtifact",
+        "PmReadOnlyAccountSnapshotEvidence",
+        "PmReadOnlyAccountTeardownEvidence",
+        "PmReadOnlyAccountArtifact",
     ] {
         for field in struct_fields(&source, structure) {
             let lower = field.to_ascii_lowercase();
@@ -464,6 +471,29 @@ fn artifact_schema_cannot_persist_raw_authenticated_or_secret_derived_material()
             );
         }
     }
+}
+
+#[test]
+fn account_only_config_is_a_distinct_transparent_view_not_a_weakened_smoke_profile() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/config.rs");
+    let source = fs::read_to_string(path).expect("config source must be readable");
+    assert!(source.contains("pub struct PmReadOnlyAccountConfig(PmReadOnlySmokeConfig)"));
+    assert!(source.contains("account-only signature_type must be 0 (EOA) or 1 (proxy)"));
+    assert!(source.contains("the fixed read-only profile requires signature_type=0"));
+    assert!(source.contains("the fixed read-only profile requires signer=funder"));
+}
+
+#[test]
+fn account_only_collector_has_exact_closed_request_counts_and_cancellation_fail_stop() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/account_collect.rs");
+    let source = fs::read_to_string(path).expect("account collector source must be readable");
+    let compact = compact(&without_comments(&source));
+    assert_eq!(source.matches("fresh_read_server_time().await?").count(), 2);
+    assert_eq!(source.matches("balance_allowance(").count(), 2);
+    assert!(compact.contains("private_reconciliation_request_count:0"));
+    assert!(compact.contains("user_stream_connection_count:0"));
+    assert!(source.contains("CredentialShutdownCancellationFailStop"));
+    assert!(source.contains("std::process::abort()"));
 }
 
 #[test]

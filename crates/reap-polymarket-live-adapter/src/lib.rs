@@ -30,7 +30,10 @@ mod task_guard;
 mod user_ws;
 mod user_ws_config;
 
-pub use account::{PmAccountAsset, PmAccountBalanceAllowance, PmAccountHttpRole};
+pub use account::{
+    PmAccountAsset, PmAccountBalanceAllowance, PmAccountHttpRole, PmReadOnlyAccountHttpOwner,
+    PmReadOnlySignatureType,
+};
 pub use config::{PM_CLOB_PRODUCTION_ORIGIN, PmPrivateHttpConfig, PmPublicHttpConfig};
 pub use error::{PmLiveAdapterError, PmPublicMetadataDeliveryError, PmRestBookDeliveryError};
 #[cfg(any(test, feature = "loopback-evidence"))]
@@ -81,6 +84,7 @@ pub use public_ws_config::{
     PmPublicWsConfig, PmPublicWsTransportPolicy,
 };
 pub use read_only_private::{
+    PmReadOnlyAccountConnectivityOwner, PmReadOnlyAccountConnectivityRoles,
     PmReadOnlyCredentialInput, PmReadOnlyPrivateConnectivityOwner,
     PmReadOnlyPrivateConnectivityRoles,
 };

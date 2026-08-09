@@ -1,15 +1,17 @@
 use std::{fmt, fmt::Write as _, time::Duration};
 
-use reap_pm_core::EvmAddress;
+use reap_pm_core::{EvmAddress, PmTokenId};
 use reap_polymarket_auth::{L2CredentialInput, L2Credentials};
 use reap_polymarket_wire::PmWireScope;
 use sha3::{Digest as _, Keccak256};
 use zeroize::Zeroizing;
 
 use crate::{
-    PmAuthenticatedHttpOwner, PmAuthenticatedUserWsRole, PmCredentialAuthoritySupervisor,
-    PmLiveAdapterError, PmPrivateConnectivityOwner, PmPrivateHttpConfig, PmUserWsBounds,
-    PmUserWsConfig,
+    PM_CLOB_PRODUCTION_ORIGIN, PmAuthenticatedHttpOwner, PmAuthenticatedUserWsRole,
+    PmCredentialAuthoritySupervisor, PmLiveAdapterError, PmPrivateConnectivityOwner,
+    PmPrivateHttpConfig, PmPublicHttpConfig, PmReadOnlyAccountHttpOwner, PmReadOnlySignatureType,
+    PmReadServerTimeHttpRole, PmUserWsBounds, PmUserWsConfig,
+    private_credentials::account_http_credential_role, private_http::PmPrivateHttpTransport,
 };
 
 /// Move-only, zeroizing injection value for production read-only credentials.
@@ -44,6 +46,159 @@ impl PmReadOnlyCredentialInput {
 impl fmt::Debug for PmReadOnlyCredentialInput {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("PmReadOnlyCredentialInput([REDACTED])")
+    }
+}
+
+/// Sole owner of the minimal credentialed account-read composition.
+///
+/// It can release only public server time, the two fixed account GETs, and
+/// the credential supervisor. No user WebSocket, reconciliation, exact-order,
+/// signing, or mutation capability is constructed.
+///
+/// Type-1 responses prove that signer-bound L2 credentials reached the proxy
+/// balance profile, but the API does not echo the configured funder. The
+/// funder is therefore an operator-reviewed structural input, not a remotely
+/// attested response field.
+pub struct PmReadOnlyAccountConnectivityOwner {
+    server_time: PmReadServerTimeHttpRole,
+    account_transport: PmPrivateHttpTransport,
+    credentials: L2Credentials,
+    conditional_token: PmTokenId,
+    signature_type: PmReadOnlySignatureType,
+}
+
+impl PmReadOnlyAccountConnectivityOwner {
+    #[allow(clippy::too_many_arguments)]
+    pub fn production(
+        expected_signer: EvmAddress,
+        expected_funder: EvmAddress,
+        signature_type: PmReadOnlySignatureType,
+        conditional_token: PmTokenId,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        credentials: PmReadOnlyCredentialInput,
+    ) -> Result<Self, PmLiveAdapterError> {
+        let config = PmPublicHttpConfig::production(
+            PM_CLOB_PRODUCTION_ORIGIN,
+            connect_timeout,
+            request_timeout,
+        )?;
+        Self::bind(
+            expected_signer,
+            expected_funder,
+            signature_type,
+            conditional_token,
+            config,
+            credentials,
+        )
+    }
+
+    /// Construct the minimal account-only facade over a literal-loopback
+    /// endpoint for end-to-end evidence tests.
+    #[cfg(any(test, feature = "read-only-evidence"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_only_evidence(
+        expected_signer: EvmAddress,
+        expected_funder: EvmAddress,
+        signature_type: PmReadOnlySignatureType,
+        conditional_token: PmTokenId,
+        origin: &str,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        credentials: PmReadOnlyCredentialInput,
+    ) -> Result<Self, PmLiveAdapterError> {
+        let config =
+            PmPublicHttpConfig::read_only_evidence(origin, connect_timeout, request_timeout)?;
+        Self::bind(
+            expected_signer,
+            expected_funder,
+            signature_type,
+            conditional_token,
+            config,
+            credentials,
+        )
+    }
+
+    fn bind(
+        expected_signer: EvmAddress,
+        expected_funder: EvmAddress,
+        signature_type: PmReadOnlySignatureType,
+        conditional_token: PmTokenId,
+        config: PmPublicHttpConfig,
+        credentials: PmReadOnlyCredentialInput,
+    ) -> Result<Self, PmLiveAdapterError> {
+        validate_account_profile(expected_signer, expected_funder, signature_type)?;
+        let credentials =
+            L2Credentials::bind(&eip55(expected_signer), credentials.into_auth_input())?;
+        if credentials.address().as_core() != expected_signer {
+            return Err(PmLiveAdapterError::CredentialOwnerMismatch);
+        }
+        let account_transport =
+            PmPrivateHttpTransport::for_account(&config, credentials.address())?;
+        let server_time = PmReadServerTimeHttpRole::new(config)?;
+        Ok(Self {
+            server_time,
+            account_transport,
+            credentials,
+            conditional_token,
+            signature_type,
+        })
+    }
+
+    #[must_use]
+    pub const fn signature_type(&self) -> PmReadOnlySignatureType {
+        self.signature_type
+    }
+
+    #[must_use]
+    pub const fn production_order_entry_authorized(&self) -> bool {
+        false
+    }
+
+    pub fn split(self) -> Result<PmReadOnlyAccountConnectivityRoles, PmLiveAdapterError> {
+        let (authority, credential_supervisor) = account_http_credential_role(self.credentials)?;
+        let authenticated_account = PmReadOnlyAccountHttpOwner::from_authority(
+            authority,
+            self.account_transport,
+            self.conditional_token,
+            self.signature_type,
+        );
+        Ok(PmReadOnlyAccountConnectivityRoles {
+            server_time: self.server_time,
+            authenticated_account,
+            credential_supervisor,
+        })
+    }
+}
+
+impl fmt::Debug for PmReadOnlyAccountConnectivityOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PmReadOnlyAccountConnectivityOwner")
+            .field("conditional_token", &self.conditional_token)
+            .field("signature_type", &self.signature_type)
+            .field("credentials", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Minimal account-read roles. All fields are move-only and purpose-specific.
+pub struct PmReadOnlyAccountConnectivityRoles {
+    pub server_time: PmReadServerTimeHttpRole,
+    pub authenticated_account: PmReadOnlyAccountHttpOwner,
+    pub credential_supervisor: PmCredentialAuthoritySupervisor,
+}
+
+impl PmReadOnlyAccountConnectivityRoles {
+    #[must_use]
+    pub const fn production_order_entry_authorized(&self) -> bool {
+        false
+    }
+}
+
+impl fmt::Debug for PmReadOnlyAccountConnectivityRoles {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PmReadOnlyAccountConnectivityRoles([REDACTED])")
     }
 }
 
@@ -173,6 +328,18 @@ impl fmt::Debug for PmReadOnlyPrivateConnectivityOwner {
     }
 }
 
+fn validate_one_eoa(
+    expected_signer: EvmAddress,
+    expected_funder: EvmAddress,
+) -> Result<(), PmLiveAdapterError> {
+    if expected_signer != expected_funder {
+        return Err(PmLiveAdapterError::InvalidConfiguration(
+            "read-only credentials require signer and funder to be the same EOA",
+        ));
+    }
+    Ok(())
+}
+
 /// Named, move-only result of splitting the read-only credential owner.
 ///
 /// These are the only three capabilities released by the facade. In
@@ -197,14 +364,28 @@ impl fmt::Debug for PmReadOnlyPrivateConnectivityRoles {
     }
 }
 
-fn validate_one_eoa(
+fn validate_account_profile(
     expected_signer: EvmAddress,
     expected_funder: EvmAddress,
+    signature_type: PmReadOnlySignatureType,
 ) -> Result<(), PmLiveAdapterError> {
-    if expected_signer != expected_funder {
+    if expected_signer.bytes() == [0; 20] || expected_funder.bytes() == [0; 20] {
         return Err(PmLiveAdapterError::InvalidConfiguration(
-            "read-only credentials require signer and funder to be the same EOA",
+            "read-only signer and funder addresses must be nonzero",
         ));
+    }
+    match signature_type {
+        PmReadOnlySignatureType::Eoa if expected_signer != expected_funder => {
+            return Err(PmLiveAdapterError::InvalidConfiguration(
+                "signature_type 0 requires signer and funder to be the same EOA",
+            ));
+        }
+        PmReadOnlySignatureType::Proxy if expected_signer == expected_funder => {
+            return Err(PmLiveAdapterError::InvalidConfiguration(
+                "signature_type 1 requires a proxy funder distinct from the signer EOA",
+            ));
+        }
+        PmReadOnlySignatureType::Eoa | PmReadOnlySignatureType::Proxy => {}
     }
     Ok(())
 }
@@ -309,6 +490,79 @@ mod tests {
                 "read-only credentials require signer and funder to be the same EOA"
             ))
         ));
+    }
+
+    #[test]
+    fn balance_signature_type_rejects_every_unreviewed_value() {
+        assert_eq!(
+            PmReadOnlySignatureType::try_from(0).unwrap(),
+            PmReadOnlySignatureType::Eoa
+        );
+        assert_eq!(
+            PmReadOnlySignatureType::try_from(1).unwrap(),
+            PmReadOnlySignatureType::Proxy
+        );
+        for value in 2..=u8::MAX {
+            assert!(PmReadOnlySignatureType::try_from(value).is_err());
+        }
+    }
+
+    #[test]
+    fn dedicated_account_owner_accepts_only_reviewed_identity_profiles() {
+        let owner = PmReadOnlyAccountConnectivityOwner::production(
+            address(ADDRESS),
+            address(OTHER_ADDRESS),
+            PmReadOnlySignatureType::Proxy,
+            scope().token(),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            credential_input(),
+        )
+        .unwrap();
+        assert_eq!(owner.signature_type(), PmReadOnlySignatureType::Proxy);
+        assert!(!owner.production_order_entry_authorized());
+        let debug = format!("{owner:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(API_KEY));
+
+        assert!(
+            PmReadOnlyAccountConnectivityOwner::production(
+                address(ADDRESS),
+                address(OTHER_ADDRESS),
+                PmReadOnlySignatureType::Eoa,
+                scope().token(),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                credential_input(),
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn dedicated_account_split_releases_only_account_time_and_supervisor() {
+        let owner = PmReadOnlyAccountConnectivityOwner::read_only_evidence(
+            address(ADDRESS),
+            address(OTHER_ADDRESS),
+            PmReadOnlySignatureType::Proxy,
+            scope().token(),
+            "http://127.0.0.1:18080",
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            credential_input(),
+        )
+        .unwrap();
+        let roles = owner.split().unwrap();
+        assert!(!roles.production_order_entry_authorized());
+        assert!(
+            !roles
+                .authenticated_account
+                .production_order_entry_authorized()
+        );
+        let debug = format!("{roles:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(API_KEY));
+        roles.credential_supervisor.shutdown().await.unwrap();
     }
 
     #[test]

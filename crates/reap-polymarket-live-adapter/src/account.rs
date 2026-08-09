@@ -7,6 +7,48 @@ use crate::{
     private_http::{PmPrivateHttpObservation, PmPrivateHttpTransport, PmPrivateRoute},
 };
 
+/// Closed Polymarket account profile accepted by the read-only balance route.
+///
+/// This value affects only the `signature_type` query parameter on the two
+/// fixed balance/allowance GETs. It does not construct signing or mutation
+/// authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PmReadOnlySignatureType {
+    /// The L2-authenticated EOA is also the account funder.
+    Eoa = 0,
+    /// The L2-authenticated EOA reads balances held by its Polymarket proxy.
+    Proxy = 1,
+}
+
+impl PmReadOnlySignatureType {
+    #[must_use]
+    pub const fn value(self) -> u8 {
+        self as u8
+    }
+
+    pub(crate) const fn query_value(self) -> &'static str {
+        match self {
+            Self::Eoa => "0",
+            Self::Proxy => "1",
+        }
+    }
+}
+
+impl TryFrom<u8> for PmReadOnlySignatureType {
+    type Error = PmLiveAdapterError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Eoa),
+            1 => Ok(Self::Proxy),
+            _ => Err(PmLiveAdapterError::InvalidConfiguration(
+                "read-only balance signature_type must be 0 (EOA) or 1 (proxy)",
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PmAccountAsset {
     Collateral,
@@ -56,6 +98,54 @@ pub struct PmAccountHttpRole<'a> {
     authority: &'a mut PmHttpCredentialRole,
     transport: &'a PmPrivateHttpTransport,
     conditional_token: PmTokenId,
+    signature_type: PmReadOnlySignatureType,
+}
+
+/// Move-only owner for exactly the two authenticated account GETs.
+///
+/// Unlike [`crate::PmAuthenticatedHttpOwner`], this type cannot construct
+/// reconciliation or exact-order capabilities.
+pub struct PmReadOnlyAccountHttpOwner {
+    authority: PmHttpCredentialRole,
+    transport: PmPrivateHttpTransport,
+    conditional_token: PmTokenId,
+    signature_type: PmReadOnlySignatureType,
+}
+
+impl PmReadOnlyAccountHttpOwner {
+    pub(crate) const fn from_authority(
+        authority: PmHttpCredentialRole,
+        transport: PmPrivateHttpTransport,
+        conditional_token: PmTokenId,
+        signature_type: PmReadOnlySignatureType,
+    ) -> Self {
+        Self {
+            authority,
+            transport,
+            conditional_token,
+            signature_type,
+        }
+    }
+
+    pub fn account(&mut self) -> PmAccountHttpRole<'_> {
+        PmAccountHttpRole::new(
+            &mut self.authority,
+            &self.transport,
+            self.conditional_token,
+            self.signature_type,
+        )
+    }
+
+    #[must_use]
+    pub const fn production_order_entry_authorized(&self) -> bool {
+        false
+    }
+}
+
+impl std::fmt::Debug for PmReadOnlyAccountHttpOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PmReadOnlyAccountHttpOwner([REDACTED])")
+    }
 }
 
 impl<'a> PmAccountHttpRole<'a> {
@@ -63,11 +153,13 @@ impl<'a> PmAccountHttpRole<'a> {
         authority: &'a mut PmHttpCredentialRole,
         transport: &'a PmPrivateHttpTransport,
         conditional_token: PmTokenId,
+        signature_type: PmReadOnlySignatureType,
     ) -> Self {
         Self {
             authority,
             transport,
             conditional_token,
+            signature_type,
         }
     }
 
@@ -77,7 +169,7 @@ impl<'a> PmAccountHttpRole<'a> {
     ) -> Result<PmAccountBalanceAllowance, PmLiveAdapterError> {
         self.read(
             server_time,
-            PmPrivateRoute::CollateralBalanceAllowance,
+            PmPrivateRoute::CollateralBalanceAllowance(self.signature_type),
             PmAccountAsset::Collateral,
         )
         .await
@@ -89,7 +181,10 @@ impl<'a> PmAccountHttpRole<'a> {
     ) -> Result<PmAccountBalanceAllowance, PmLiveAdapterError> {
         self.read(
             server_time,
-            PmPrivateRoute::ConditionalBalanceAllowance(self.conditional_token),
+            PmPrivateRoute::ConditionalBalanceAllowance {
+                token: self.conditional_token,
+                signature_type: self.signature_type,
+            },
             PmAccountAsset::Conditional(self.conditional_token),
         )
         .await

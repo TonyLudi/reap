@@ -70,10 +70,7 @@ pub struct PmReadOnlySmokeConfig {
 
 impl PmReadOnlySmokeConfig {
     pub fn validate(&self) -> Result<(), PmReadOnlySmokeConfigError> {
-        if self.schema_version != PM_READ_ONLY_CONFIG_SCHEMA_VERSION {
-            return Err(invalid("unsupported read-only config schema version"));
-        }
-        validate_slot(&self.credential_slot_id)?;
+        self.validate_common()?;
         let signer = self.signer()?;
         let funder = self.funder()?;
         if signer != funder {
@@ -81,16 +78,24 @@ impl PmReadOnlySmokeConfig {
                 "the fixed read-only profile requires signer=funder",
             ));
         }
-        if self.chain_id != POLYGON_CHAIN_ID {
-            return Err(invalid(
-                "the fixed read-only profile requires Polygon chain 137",
-            ));
-        }
         if self.signature_type != 0 {
             return Err(invalid(
                 "the fixed read-only profile requires signature_type=0",
             ));
         }
+        Ok(())
+    }
+
+    fn validate_common(&self) -> Result<(), PmReadOnlySmokeConfigError> {
+        if self.schema_version != PM_READ_ONLY_CONFIG_SCHEMA_VERSION {
+            return Err(invalid("unsupported read-only config schema version"));
+        }
+        if self.chain_id != POLYGON_CHAIN_ID {
+            return Err(invalid(
+                "the fixed read-only profile requires Polygon chain 137",
+            ));
+        }
+        validate_slot(&self.credential_slot_id)?;
         let metadata = self.expected_metadata()?;
         let _ = reap_pm_core::PmGoalFTradingDomain::from_metadata(metadata)
             .map_err(|_| invalid("configured metadata is outside the fixed Goal-F domain"))?;
@@ -226,6 +231,67 @@ impl PmReadOnlySmokeConfig {
     }
 }
 
+/// Account-only view of the same closed operator configuration schema.
+///
+/// The wrapper deliberately has distinct validation: the full smoke remains
+/// fixed to one type-0 EOA, while account-only balance reads additionally
+/// admit one reviewed type-1 proxy profile with a distinct signer and funder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PmReadOnlyAccountConfig(PmReadOnlySmokeConfig);
+
+impl PmReadOnlyAccountConfig {
+    pub fn validate(&self) -> Result<(), PmReadOnlySmokeConfigError> {
+        self.0.validate_common()?;
+        let signer = self.signer()?;
+        let funder = self.funder()?;
+        match self.signature_type() {
+            0 if signer == funder => Ok(()),
+            0 => Err(invalid("signature_type 0 requires signer=funder")),
+            1 if signer != funder => Ok(()),
+            1 => Err(invalid("signature_type 1 requires a distinct proxy funder")),
+            _ => Err(invalid(
+                "account-only signature_type must be 0 (EOA) or 1 (proxy)",
+            )),
+        }
+    }
+
+    pub fn signer(&self) -> Result<EvmAddress, PmReadOnlySmokeConfigError> {
+        self.0.signer()
+    }
+
+    pub fn funder(&self) -> Result<EvmAddress, PmReadOnlySmokeConfigError> {
+        self.0.funder()
+    }
+
+    pub fn wire_scope(&self) -> Result<PmWireScope, PmReadOnlySmokeConfigError> {
+        self.0.wire_scope()
+    }
+
+    pub fn expected_metadata(&self) -> Result<PmMarketMetadata, PmReadOnlySmokeConfigError> {
+        self.0.expected_metadata()
+    }
+
+    #[must_use]
+    pub const fn signature_type(&self) -> u8 {
+        self.0.signature_type
+    }
+
+    pub fn fingerprint(&self) -> Result<String, PmReadOnlySmokeConfigError> {
+        self.validate()?;
+        let canonical = serde_json::to_vec(self)
+            .map_err(|_| invalid("account-only config could not be canonicalized"))?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"reap.pm.read-only-account.config.v1\0");
+        hasher.update(canonical);
+        Ok(hex_lower(&hasher.finalize()))
+    }
+
+    pub(crate) const fn smoke(&self) -> &PmReadOnlySmokeConfig {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PmReadOnlyConfigEvidence {
@@ -233,6 +299,9 @@ pub struct PmReadOnlyConfigEvidence {
     pub canonical_sha256: String,
     pub canonical_toml: String,
 }
+
+/// Canonical evidence for the account-only interpretation of the same file.
+pub type PmReadOnlyAccountConfigEvidence = PmReadOnlyConfigEvidence;
 
 #[derive(Debug, Error)]
 pub enum PmReadOnlySmokeConfigError {
@@ -262,6 +331,22 @@ pub fn load_pm_read_only_smoke_config_path(
     path: impl AsRef<Path>,
 ) -> Result<(PmReadOnlySmokeConfig, PmReadOnlyConfigEvidence), PmReadOnlySmokeConfigError> {
     let path = path.as_ref();
+    let bytes = read_config_path(path)?;
+    let text = String::from_utf8(bytes).map_err(|_| PmReadOnlySmokeConfigError::NonUtf8)?;
+    let config: PmReadOnlySmokeConfig =
+        toml::from_str(&text).map_err(|_| PmReadOnlySmokeConfigError::Parse)?;
+    config.validate()?;
+    let canonical_toml = toml::to_string(&config)
+        .map_err(|_| invalid("read-only config could not be canonicalized"))?;
+    let evidence = PmReadOnlyConfigEvidence {
+        canonical_bytes: canonical_toml.len() as u64,
+        canonical_sha256: sha256_bytes(canonical_toml.as_bytes()),
+        canonical_toml,
+    };
+    Ok((config, evidence))
+}
+
+fn read_config_path(path: &Path) -> Result<Vec<u8>, PmReadOnlySmokeConfigError> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(target_os = "linux")]
@@ -325,12 +410,20 @@ pub fn load_pm_read_only_smoke_config_path(
             message: "opened file changed while it was read".to_string(),
         });
     }
+    Ok(bytes)
+}
+
+pub fn load_pm_read_only_account_config_path(
+    path: impl AsRef<Path>,
+) -> Result<(PmReadOnlyAccountConfig, PmReadOnlyConfigEvidence), PmReadOnlySmokeConfigError> {
+    let path = path.as_ref();
+    let bytes = read_config_path(path)?;
     let text = String::from_utf8(bytes).map_err(|_| PmReadOnlySmokeConfigError::NonUtf8)?;
-    let config: PmReadOnlySmokeConfig =
+    let config: PmReadOnlyAccountConfig =
         toml::from_str(&text).map_err(|_| PmReadOnlySmokeConfigError::Parse)?;
     config.validate()?;
     let canonical_toml = toml::to_string(&config)
-        .map_err(|_| invalid("read-only config could not be canonicalized"))?;
+        .map_err(|_| invalid("account-only config could not be canonicalized"))?;
     let evidence = PmReadOnlyConfigEvidence {
         canonical_bytes: canonical_toml.len() as u64,
         canonical_sha256: sha256_bytes(canonical_toml.as_bytes()),
@@ -533,6 +626,53 @@ mod tests {
             let mut config = valid();
             mutate(&mut config);
             assert!(config.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn account_only_profile_accepts_exact_proxy_split_without_weakening_full_smoke() {
+        let mut proxy = valid();
+        proxy.signature_type = 1;
+        proxy.funder_address = format!("0x{}", "33".repeat(20));
+        assert!(proxy.validate().is_err());
+
+        let account: PmReadOnlyAccountConfig =
+            toml::from_str(&toml::to_string(&proxy).unwrap()).unwrap();
+        account.validate().unwrap();
+        assert_ne!(account.signer().unwrap(), account.funder().unwrap());
+        assert_eq!(account.signature_type(), 1);
+        assert_eq!(account.fingerprint().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn account_only_profile_rejects_ambiguous_or_unreviewed_signature_types() {
+        for (signature_type, distinct_funder) in [(0, true), (1, false), (2, true)] {
+            let mut value = valid();
+            value.signature_type = signature_type;
+            if distinct_funder {
+                value.funder_address = format!("0x{}", "33".repeat(20));
+            }
+            let account: PmReadOnlyAccountConfig =
+                toml::from_str(&toml::to_string(&value).unwrap()).unwrap();
+            assert!(account.validate().is_err());
+        }
+
+        let mut wrong_chain = valid();
+        wrong_chain.chain_id = 1;
+        let account: PmReadOnlyAccountConfig =
+            toml::from_str(&toml::to_string(&wrong_chain).unwrap()).unwrap();
+        assert!(account.validate().is_err());
+
+        for zero_field in ["signer", "funder"] {
+            let mut zero = valid();
+            if zero_field == "signer" {
+                zero.signer_address = format!("0x{}", "00".repeat(20));
+            } else {
+                zero.funder_address = format!("0x{}", "00".repeat(20));
+            }
+            let account: PmReadOnlyAccountConfig =
+                toml::from_str(&toml::to_string(&zero).unwrap()).unwrap();
+            assert!(account.validate().is_err());
         }
     }
 }

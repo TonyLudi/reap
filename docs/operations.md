@@ -98,11 +98,12 @@ canonical fill, keep the affected position/balance readiness unknown, and block
 new placement. Never infer a nonzero fee from rate/notional arithmetic. PM-T1
 implements no production fee model.
 
-With PM-T1's local acceptance and standard gates green, the next external
-procedure is the separately scoped and explicitly authorized read-only
-readiness workflow below: load one reviewed credential bundle, verify exact
-EOA/funder/condition/token/account/allowance/position/open-order/trade/user-stream
-identity, and shut down without constructing mutation roles. A later
+With PM-T1's local acceptance and standard gates green, external access is
+limited to the separately scoped and explicitly authorized read-only workflows
+below. `certify-account` can answer only the narrow configured-token
+balance/allowance-loading question; the full `certify` workflow additionally
+checks exact EOA/funder/condition/token/account/reconciliation/user-stream
+identity. Both shut down without constructing mutation roles. A later
 minimal-capital place/cancel trial requires a second explicit authorization.
 
 ## Polymarket Credentialed Read-Only Readiness
@@ -111,8 +112,9 @@ minimal-capital place/cancel trial requires a second explicit authorization.
 runtime. Its production endpoint set and read methods are fixed in the binary.
 It has no private-key input, endpoint override, order input, mutation switch,
 or environment-variable secret provider. It must always report
-`production_order_entry_authorized = false`; neither `certify` nor `verify`
-places, cancels, approves, transfers, settles, redeems, or withdraws anything.
+`production_order_entry_authorized = false`; `certify`, `verify`,
+`certify-account`, and `verify-account` never place, cancel, approve, transfer,
+settle, redeem, or withdraw anything.
 
 Run it only after an operator has explicitly approved the exact binary,
 non-secret configuration, credential slot, target EOA, market, host, output
@@ -123,10 +125,11 @@ may be observed, but never create an order merely to make the smoke pass.
 
 ### Configuration contract
 
-Copy and review
+For the full `certify`/`verify` workflow, copy and review
 [`examples/pm-read-only-smoke.toml`](../examples/pm-read-only-smoke.toml).
 The checked-in identities are synthetic placeholders and must be replaced with
-the reviewed target values. The schema is flat and closed. It accepts exactly:
+the reviewed target values. The schema is flat and closed. The full workflow
+accepts exactly:
 
 - `schema_version = 1`, `credential_slot_id`, `signer_address`,
   `funder_address`, `chain_id = 137`, and `signature_type = 0`;
@@ -279,6 +282,127 @@ sustained soak or failure campaign, validate settlement/on-chain operations,
 or make Polymarket trading production-ready. Preserve the artifact for review
 and obtain a separate explicit authorization before any later capital-bearing
 trial. `production_order_entry_authorized = false` remains mandatory.
+
+### Account-only balance qualification for an EOA or proxy
+
+`certify-account` is a second, deliberately narrower composition in the same
+executable. Use it when the authorized objective is only to prove that one L2
+bundle can load collateral and one configured conditional-token balance plus
+their exact required-spender allowance rows. It is the only readiness command
+that admits a reviewed Polymarket proxy profile. It does not widen `certify`:
+the full certification remains fixed to signature type 0 with the same signer
+and funder.
+
+Copy and independently review the synthetic
+[`examples/pm-read-only-proxy-account.toml`](../examples/pm-read-only-proxy-account.toml)
+template for a proxy run. `certify-account` consumes the same closed 24-field
+configuration schema documented above, but applies this distinct account-only
+identity validation:
+
+- signature type `0` requires `signer_address = funder_address`;
+- signature type `1` requires a proxy `funder_address` distinct from the
+  signer EOA; and
+- every other signature type, an equal-address type-1 profile, and a
+  distinct-address type-0 profile fail before credential loading.
+
+The signer is the configured L2 authentication identity. For type 1, the
+`signature_type=1` query selects the proxy balance profile, but neither balance
+response independently returns or attests the configured funder. The exact
+proxy funder and its relationship to the signer are operator-reviewed input.
+Confirm that mapping from an independently trusted account source before the
+run; do not interpret repetition of the address in the artifact as remote
+proof.
+
+The market fields remain in the same 24-field schema because they bind the one
+configured token and derive the exact standard or negative-risk spender/asset
+projection. The account-only command does **not** fetch public metadata to
+attest `condition_id`, `market_id`, `outcome`, `tick`,
+`minimum_order_size`, or `negative_risk`. Review those values independently.
+The user-stream timing fields are still parsed and validated for schema
+identity, but this composition never opens a WebSocket.
+
+A passing account-only attempt has exactly this ordered network surface:
+
+1. one public `GET /time` attempt;
+2. one authenticated collateral `GET /balance-allowance` with the configured
+   signature type;
+3. one second public `GET /time` attempt; and
+4. one authenticated conditional `GET /balance-allowance` for exactly the
+   configured `token_id` and signature type.
+
+The pass gates require exactly two public-time attempts, exactly two
+authenticated balance attempts, zero private reconciliation requests, and
+zero user-stream connections. A failed early request may leave smaller attempt
+counts and a nonpassing artifact; the collector never fills the difference
+with an order, trade, WebSocket, update, or mutation request. It does not call
+open-order, order-detail, trade, Data API position, public metadata, approval,
+cancel, place, transfer, settlement, redemption, or withdrawal routes. It
+accepts only the three protected L2 credential files and has no EOA private-key
+input.
+
+The retained account projection contains canonical decimal collateral and
+configured-token conditional balances and the two exact required allowance
+rows derived from the reviewed config. It is not account-wide position
+enumeration, and a conditional-token balance is not a Data API position row.
+Zero balances or zero allowance amounts can still be valid observations and
+pass structural collection; a pass proves successful scoped loading and
+complete response shape, not capital sufficiency, approval sufficiency, or a
+nonzero position. The two responses are sequential, not one atomic venue
+snapshot, and raw authenticated response bodies are intentionally omitted.
+
+Use the credential custody requirements above unchanged. In particular, never
+copy credentials from an `.env` file with a shell expansion and never provide
+the private key. Provision the three final runtime files out of band under the
+dedicated unprivileged run UID:
+
+```bash
+RUN_ID="pm-read-only-account-$(date -u +%Y%m%dT%H%M%SZ)"
+RUN_DIR="var/reap/pm-readiness/${RUN_ID}"
+CREDENTIALS_DIR="${XDG_RUNTIME_DIR:?set a protected user runtime directory}/reap-pm-readiness/${RUN_ID}"
+CONFIG_PATH="${RUN_DIR}/config.toml"
+ARTIFACT_PATH="${RUN_DIR}/account-certification.json"
+
+umask 077
+ulimit -c 0
+install -d -m 0700 "$RUN_DIR" "$CREDENTIALS_DIR"
+install -m 0600 examples/pm-read-only-proxy-account.toml "$CONFIG_PATH"
+
+# Replace every synthetic non-secret value and independently review the
+# signer/proxy-funder mapping and configured token. Have the approved secret
+# manager write api-key, secret, and passphrase as mode-0400/0600 files with
+# no trailing newline.
+
+target/release/reap-pm-readiness certify-account \
+  --config "$CONFIG_PATH" \
+  --credentials-dir "$CREDENTIALS_DIR" \
+  --output "$ARTIFACT_PATH" \
+  --pretty
+
+target/release/reap-pm-readiness verify-account \
+  --artifact "$ARTIFACT_PATH" \
+  --config "$CONFIG_PATH" \
+  --require-pass \
+  --pretty
+```
+
+`certify-account` uses the same create-new, private-parent, mode-`0600`, secret
+screening, bounded credential-authority shutdown, atomic persistence, and
+self-verification posture as the full collector, but emits a distinct
+account-only schema and contract. `verify-account` is its only matching offline
+verifier; do not pass an account-only artifact to `verify`, or a full artifact
+to `verify-account`. It anchors the separately reviewed canonical config and
+current executable digest and re-derives the exact request counts, account
+projection, allowance scope, teardown, and literal false/zero authorization
+facts.
+
+As with the full verifier, this is recomputable consistency evidence rather
+than cryptographic provenance or authorship. Preserve independent collection
+and artifact custody. A passing account-only artifact does not qualify public
+metadata, the Data API, positions beyond the configured token balance, orders,
+trades, a user stream, reconnect behavior, strategy, risk, economics, or
+production entry. It always records
+`production_order_entry_authorized = false`,
+`mutation_roles_constructed = false`, and `mutation_requests = 0`.
 
 ## Public Data Capture
 

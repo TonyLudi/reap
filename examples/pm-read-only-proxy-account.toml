@@ -1,0 +1,47 @@
+# Polymarket account-only proxy-balance certification template.
+#
+# Every identity below is synthetic. Copy this file to a protected per-run
+# location and replace the reviewed non-secret account and market values.
+# Secret values and an EOA private key do not belong here: the three final
+# fields are basename-only entries beneath the directory supplied with
+# --credentials-dir.
+
+schema_version = 1
+credential_slot_id = "replace-with-reviewed-pm-proxy-slot-v1"
+
+# Account-only signature type 1: the signer EOA and proxy funder must be
+# distinct canonical addresses. The funder is operator-reviewed and is not
+# independently returned or attested by the two balance responses.
+signer_address = "0x1000000000000000000000000000000000000001"
+funder_address = "0x2000000000000000000000000000000000000002"
+chain_id = 137
+signature_type = 1
+
+# This tuple determines the configured conditional token and the exact
+# required-spender projection. certify-account does not fetch or attest public
+# market metadata, so review these values independently.
+condition_id = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+market_id = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+token_id = "123"
+outcome = "Yes"
+tick = "0.01"
+minimum_order_size = "5"
+negative_risk = false
+
+# The account-only path uses only connect_timeout_ms and request_timeout_ms.
+# The remaining bounded user-stream fields stay present because this command
+# deliberately reuses the same closed 24-field schema; it opens no WebSocket.
+connect_timeout_ms = 5000
+request_timeout_ms = 10000
+user_stream_dwell_ms = 20000
+user_stream_idle_timeout_ms = 30000
+user_stream_pong_timeout_ms = 5000
+user_stream_max_reconnect_attempts = 2
+user_stream_reconnect_backoff_ms = 1000
+user_stream_event_channel_capacity = 64
+
+# Direct children of --credentials-dir: regular, non-symlink, single-link,
+# owner-owned files, mode 0400/0600, written without a trailing newline.
+api_key_file = "api-key"
+secret_file = "secret"
+passphrase_file = "passphrase"

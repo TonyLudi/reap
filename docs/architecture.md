@@ -176,7 +176,7 @@ exchange interface.
 | --- | --- | --- |
 | Shared substrate mechanics | `reap-core`, `reap-transport`, `reap-capture-framing`, `reap-durable-writer` | Common source identity, product-specific typed envelopes, bounded delivery/supervision, JSONL framing/verification, and leased bounded-writer mechanics. These crates do not make every legacy carrier multi-venue or define PM economics, venue lifecycle, credentials, or order authority. |
 | Chaos/OKX product | `reap-strategy`, `reap-engine`, `reap-order`, `reap-live-contracts`, `reap-live`, and the role-specific OKX crates | The existing Chaos/iarb2 strategy, `f64` model state, regular-order profiles, authenticated OKX roles, and normal/evidence/emergency authority planes remain governed by the Chaos boundary. |
-| Polymarket product | `reap-pm-core`, `reap-pm-state`, `reap-polymarket-wire`, `reap-polymarket-auth`, `reap-polymarket-adapter`, `reap-polymarket-live-adapter`, `reap-pm-strategy`, `reap-pm-live-contracts`, and `reap-pm-live` | Exact PM identity/numerics, fixed-purpose signing and request authentication, sealed public/private/read/mutation roles, a static quote-model seam, PM reducers, two durable mutation barriers, and sibling fake/authenticated-loopback composition roots. The existing Chaos live, contract, and order crates do not depend on these crates. |
+| Polymarket product | `reap-pm-core`, `reap-pm-state`, `reap-polymarket-wire`, `reap-polymarket-auth`, `reap-polymarket-adapter`, `reap-polymarket-live-adapter`, `reap-pm-strategy`, `reap-pm-live-contracts`, `reap-pm-live`, and `reap-pm-readiness` | Exact PM identity/numerics, fixed-purpose signing and request authentication, sealed public/private/read/mutation roles, a static quote-model seam, PM reducers, two durable mutation barriers, sibling fake/authenticated-loopback composition roots, and independent full/account-only read-only evidence roots. The existing Chaos live, contract, and order crates do not depend on these crates. |
 | PM use of OKX public data | `reap-okx-public-source` | One narrow credential-free `index-tickers` source for configured reference instruments. It exposes no OKX private, account, reconciliation, signer, submit, or cancel capability. |
 
 Shared code is extracted only for an invariant already used by both products.
@@ -258,6 +258,41 @@ one shared product clock -> the same PmCoordinator<M>
   -> canonical lifecycle reduction and restart/reconciliation
 ```
 
+The operator-runnable readiness executable is outside that coordinator and has
+two independent read-only composition roots. The full root remains a type-0
+same-EOA signer/funder smoke with metadata, reconciliation, and user-stream
+coverage. Its account-only sibling reuses the same closed 24-field config but
+has a separate validator and artifact contract:
+
+```text
+reviewed config + protected L2 credential files
+  -> account profile validation
+       type 0: signer == funder EOA
+       type 1: signer != reviewed proxy funder
+  -> fixed production GET /time ---------------------------+
+  -> authenticated collateral balance/allowance GET        |
+  -> fixed production GET /time                            |
+  -> authenticated configured-token balance/allowance GET  |
+                                                            v
+canonical collateral + configured-token balances
++ exact config-derived required allowance rows
+  -> bounded joined credential teardown
+  -> private redacted account-only artifact
+  -> separate offline verify-account consistency check
+```
+
+A passing account-only collection records exactly two public-time attempts and
+two authenticated balance attempts. It constructs no public-metadata role,
+WebSocket, private reconciliation, order/trade/update role, Data API position
+enumerator, mutation role, or private-key owner. The signature type changes
+only the fixed balance query parameter; the L2 signer remains the header
+identity. For type 1, the response does not return or independently attest the
+operator-configured proxy funder. The config still supplies the market/token
+facts used to derive exact spender rows, but this root does not remotely attest
+those metadata facts. It therefore proves scoped response loading, including
+canonical zero amounts, rather than atomic account state, capital sufficiency,
+account-wide positions, or full readiness.
+
 The full serialized place body and its exact-body digest remain in memory only.
 Durable records carry a separately domain-separated semantic request
 commitment that excludes API keys, signatures, HMACs, passphrases, authenticated
@@ -296,12 +331,15 @@ production probability model.
 
 The Polymarket edges expose separate sealed roles for public observation,
 private lifecycle, order reconciliation, account/allowance/position snapshots,
-fixed placement, and exact-owned cancellation. `PmConnectivityPlan` joins model
-requirements, mandatory safety/read requirements, and the backend-neutral fixed
-profile, then validates a one-to-one scoped binding for every constructed role.
-Authentication can sign only those fixed purposes; transport can call only the
-reviewed routes. No role provides an arbitrary HTTP method, generic signer,
-raw command executor, cancel-all, or order-type selector.
+fixed placement, and exact-owned cancellation. A narrower account-only owner
+can split only server-time, two fixed balance reads, and credential-shutdown
+roles; its closed signature-type enum contains only EOA `0` and proxy `1`.
+`PmConnectivityPlan` joins model requirements, mandatory safety/read
+requirements, and the backend-neutral fixed profile, then validates a
+one-to-one scoped binding for every constructed role. Authentication can sign
+only those fixed purposes; transport can call only the reviewed routes. No role
+provides an arbitrary HTTP method, generic signer, raw command executor,
+cancel-all, or order-type selector.
 
 The composition roots preserve the same separation: `PmPublicCapture` builds
 only public roles, `PmReadOnlyMonitor` builds only fixture/read roles, and the
@@ -475,10 +513,10 @@ reap/
 | `reap-polymarket-auth` | Redacted, zeroizing fixed EOA/type-0 CLOB V2 signing and purpose-specific L2 request authentication; no strategy, canonical state, socket, generic signing, or arbitrary-request authority. |
 | `reap-pm-strategy` | Statically dispatched pure quote-model requirements/output and the exact side-aware passive quote-policy boundary. |
 | `reap-polymarket-adapter` | Separate sealed PM public, fixture/live normalization, read-only reconciliation/account, fill-cut, and in-process fake-execution roles; no broad client escape or credential owner. |
-| `reap-polymarket-live-adapter` | Allowlisted, bounded PM public/authenticated HTTP and WebSocket transports plus fixed place/exact-owned cancel roles; no strategy decisions, canonical PM state, generic request, or production-origin constructor. |
+| `reap-polymarket-live-adapter` | Allowlisted, bounded PM public/authenticated HTTP and WebSocket transports plus fixed place/exact-owned cancel roles. A separate production-read-only account owner admits only reviewed EOA/type-0 or proxy/type-1 profiles and can expose only time, collateral/configured-token balance, and joined credential-shutdown roles; no strategy decisions, canonical PM state, generic request, or production mutation constructor. |
 | `reap-pm-live-contracts` | Secret-free scoped PM configuration, exact capability plan, role bindings, lanes, and readiness dependencies. |
 | `reap-pm-live` | Sibling PM public capture/replay, read-only monitor, deterministic lanes, one-owner coordinator, Goal F and authenticated journals, cross-journal recovery, fake product root, and feature-gated authenticated-loopback root with owned read supervision and controlled live-order shutdown. |
-| `reap-pm-readiness` | Dedicated operator-runnable PM credentialed-read-only certification and offline verification; fixed production reads, protected runtime-file credential loading, bounded redacted evidence, explicit joined teardown, and literal false/zero mutation authority. |
+| `reap-pm-readiness` | Dedicated operator-runnable PM credentialed-read-only certification and offline verification. The full type-0 composition covers metadata/reconciliation/user stream; the distinct EOA-or-proxy account-only composition makes exactly two time and two balance attempts and emits its own narrower artifact. Both use protected runtime-file credentials, bounded redacted evidence, explicit joined teardown, and literal false/zero mutation authority. |
 | `reap-okx-public-source` | Narrow credential-free OKX index-ticker source used by the PM product; no OKX private/account/order role. |
 | `reap-venue` | Existing credential-free Chaos/OKX protocol/parsing, exact OKX metadata, and connectivity keys; no signer or authenticated client, and not a universal PM adapter. |
 | `reap-feed` | Legacy Chaos/OKX public/private socket supervision, subscription readiness, deduplication, sequencing, book arbitration, and recovery; checked outer planning/capture bridges reject PM input. |

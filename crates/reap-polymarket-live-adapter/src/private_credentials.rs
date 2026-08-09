@@ -12,8 +12,8 @@ use tokio::{
 use zeroize::Zeroizing;
 
 use crate::{
-    PmAuthenticatedHttpOwner, PmLiveAdapterError, PmPrivateHttpConfig, PmUserWsConfig,
-    private_http::PmPrivateHttpTransport, user_ws::PmAuthenticatedUserWsRole,
+    PmAuthenticatedHttpOwner, PmLiveAdapterError, PmPrivateHttpConfig, PmReadOnlySignatureType,
+    PmUserWsConfig, private_http::PmPrivateHttpTransport, user_ws::PmAuthenticatedUserWsRole,
 };
 
 const CREDENTIAL_AUTHORITY_CAPACITY: usize = 32;
@@ -152,6 +152,7 @@ impl PmPrivateConnectivityOwner {
             transport,
             self.http_config.exact_order_scope(),
             address,
+            PmReadOnlySignatureType::Eoa,
             PmHttpCredentialRole {
                 sender: sender.clone(),
             },
@@ -170,6 +171,13 @@ impl PmPrivateConnectivityOwner {
 
 #[cfg(test)]
 pub(crate) fn test_http_credential_role(
+    credentials: L2Credentials,
+) -> Result<(PmHttpCredentialRole, PmCredentialAuthoritySupervisor), PmLiveAdapterError> {
+    let (sender, supervisor) = spawn_credential_authority(credentials)?;
+    Ok((PmHttpCredentialRole { sender }, supervisor))
+}
+
+pub(crate) fn account_http_credential_role(
     credentials: L2Credentials,
 ) -> Result<(PmHttpCredentialRole, PmCredentialAuthoritySupervisor), PmLiveAdapterError> {
     let (sender, supervisor) = spawn_credential_authority(credentials)?;

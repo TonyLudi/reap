@@ -11,8 +11,8 @@ use reqwest::{
 use zeroize::Zeroizing;
 
 use crate::{
-    PmAccountHttpRole, PmLiveAdapterError, PmPrivateHttpConfig, PmReconciliationHttpRole,
-    config::OriginMode, private_credentials::PmHttpCredentialRole,
+    PmAccountHttpRole, PmLiveAdapterError, PmPrivateHttpConfig, PmReadOnlySignatureType,
+    PmReconciliationHttpRole, config::OriginMode, private_credentials::PmHttpCredentialRole,
 };
 
 const FIRST_PAGE_CURSOR: &str = "MA==";
@@ -23,11 +23,18 @@ const POLY_API_KEY: HeaderName = HeaderName::from_static("poly_api_key");
 const POLY_PASSPHRASE: HeaderName = HeaderName::from_static("poly_passphrase");
 
 pub(crate) enum PmPrivateRoute<'a> {
-    OpenOrders { cursor: &'a str },
-    Trades { cursor: &'a str },
+    OpenOrders {
+        cursor: &'a str,
+    },
+    Trades {
+        cursor: &'a str,
+    },
     ExactOrder(FixedOrderId),
-    CollateralBalanceAllowance,
-    ConditionalBalanceAllowance(PmTokenId),
+    CollateralBalanceAllowance(PmReadOnlySignatureType),
+    ConditionalBalanceAllowance {
+        token: PmTokenId,
+        signature_type: PmReadOnlySignatureType,
+    },
 }
 
 impl PmPrivateRoute<'_> {
@@ -52,12 +59,41 @@ impl PmPrivateHttpTransport {
         config: &PmPrivateHttpConfig,
         configured_address: EoaAddress,
     ) -> Result<Self, PmLiveAdapterError> {
+        Self::build(
+            config.origin().clone(),
+            config.connect_timeout(),
+            config.request_timeout(),
+            config.mode(),
+            configured_address,
+        )
+    }
+
+    pub(crate) fn for_account(
+        config: &crate::PmPublicHttpConfig,
+        configured_address: EoaAddress,
+    ) -> Result<Self, PmLiveAdapterError> {
+        Self::build(
+            config.origin().clone(),
+            config.connect_timeout(),
+            config.request_timeout(),
+            config.mode(),
+            configured_address,
+        )
+    }
+
+    fn build(
+        origin: Url,
+        connect_timeout: std::time::Duration,
+        request_timeout: std::time::Duration,
+        mode: OriginMode,
+        configured_address: EoaAddress,
+    ) -> Result<Self, PmLiveAdapterError> {
         let mut builder = Client::builder()
-            .connect_timeout(config.connect_timeout())
-            .timeout(config.request_timeout())
+            .connect_timeout(connect_timeout)
+            .timeout(request_timeout)
             .redirect(Policy::none())
             .no_proxy();
-        if config.mode() == OriginMode::Production {
+        if mode == OriginMode::Production {
             builder = builder.https_only(true);
         }
         let client = builder
@@ -65,7 +101,7 @@ impl PmPrivateHttpTransport {
             .map_err(|_| PmLiveAdapterError::TransportBuild)?;
         Ok(Self {
             client,
-            origin: config.origin().clone(),
+            origin,
             configured_address,
         })
     }
@@ -144,18 +180,21 @@ impl PmPrivateHttpTransport {
                 // pin the client endpoint byte-for-byte.
                 url.set_path(&format!("/data/order/{order_id}"));
             }
-            PmPrivateRoute::CollateralBalanceAllowance => {
+            PmPrivateRoute::CollateralBalanceAllowance(signature_type) => {
                 url.set_path("/balance-allowance");
                 url.query_pairs_mut()
                     .append_pair("asset_type", "COLLATERAL")
-                    .append_pair("signature_type", "0");
+                    .append_pair("signature_type", signature_type.query_value());
             }
-            PmPrivateRoute::ConditionalBalanceAllowance(token) => {
+            PmPrivateRoute::ConditionalBalanceAllowance {
+                token,
+                signature_type,
+            } => {
                 url.set_path("/balance-allowance");
                 url.query_pairs_mut()
                     .append_pair("asset_type", "CONDITIONAL")
                     .append_pair("token_id", &token.units().to_string())
-                    .append_pair("signature_type", "0");
+                    .append_pair("signature_type", signature_type.query_value());
             }
         }
         url
@@ -171,6 +210,7 @@ pub struct PmAuthenticatedHttpOwner {
     transport: PmPrivateHttpTransport,
     exact_order_scope: PmWireScope,
     configured_address: EoaAddress,
+    balance_signature_type: PmReadOnlySignatureType,
 }
 
 impl PmAuthenticatedHttpOwner {
@@ -178,6 +218,7 @@ impl PmAuthenticatedHttpOwner {
         transport: PmPrivateHttpTransport,
         exact_order_scope: PmWireScope,
         configured_address: EoaAddress,
+        balance_signature_type: PmReadOnlySignatureType,
         authority: PmHttpCredentialRole,
     ) -> Self {
         Self {
@@ -185,6 +226,7 @@ impl PmAuthenticatedHttpOwner {
             transport,
             exact_order_scope,
             configured_address,
+            balance_signature_type,
         }
     }
 
@@ -195,13 +237,28 @@ impl PmAuthenticatedHttpOwner {
         config: PmPrivateHttpConfig,
         credentials: reap_polymarket_auth::L2Credentials,
     ) -> Result<(Self, crate::PmCredentialAuthoritySupervisor), PmLiveAdapterError> {
+        Self::new_with_signature_type(config, PmReadOnlySignatureType::Eoa, credentials)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_signature_type(
+        config: PmPrivateHttpConfig,
+        balance_signature_type: PmReadOnlySignatureType,
+        credentials: reap_polymarket_auth::L2Credentials,
+    ) -> Result<(Self, crate::PmCredentialAuthoritySupervisor), PmLiveAdapterError> {
         let exact_order_scope = config.exact_order_scope();
         let configured_address = credentials.address();
         let transport = PmPrivateHttpTransport::new(&config, configured_address)?;
         let (authority, supervisor) =
             crate::private_credentials::test_http_credential_role(credentials)?;
         Ok((
-            Self::from_authority(transport, exact_order_scope, configured_address, authority),
+            Self::from_authority(
+                transport,
+                exact_order_scope,
+                configured_address,
+                balance_signature_type,
+                authority,
+            ),
             supervisor,
         ))
     }
@@ -220,6 +277,7 @@ impl PmAuthenticatedHttpOwner {
             &mut self.authority,
             &self.transport,
             self.exact_order_scope.token(),
+            self.balance_signature_type,
         )
     }
 
@@ -462,6 +520,29 @@ mod tests {
         crate::PmAuthenticatedHttpOwner::new(config, credentials()).unwrap()
     }
 
+    fn local_owner_for_signature_type(
+        origin: &str,
+        request_timeout: Duration,
+        signature_type: PmReadOnlySignatureType,
+    ) -> (
+        crate::PmAuthenticatedHttpOwner,
+        crate::PmCredentialAuthoritySupervisor,
+    ) {
+        let config = PmPrivateHttpConfig::local_evidence(
+            origin,
+            Duration::from_millis(100),
+            request_timeout,
+            scope(),
+        )
+        .unwrap();
+        crate::PmAuthenticatedHttpOwner::new_with_signature_type(
+            config,
+            signature_type,
+            credentials(),
+        )
+        .unwrap()
+    }
+
     fn order(id: &str, condition: &str, token: &str, maker: &str, owner: &str) -> String {
         format!(
             r#"{{"id":"{id}","market":"{condition}","asset_id":"{token}","side":"BUY","original_size":"10.000000","size_matched":"0","price":"0.420000","status":"LIVE","maker_address":"{maker}","owner":"{owner}","expiration":"0","created_at":1700000000}}"#
@@ -595,6 +676,48 @@ mod tests {
         assert!(first_headers.contains(&format!("poly_timestamp: {AUTH_SECONDS}")));
         assert!(first_headers.contains(&format!("poly_api_key: {API_KEY}")));
         assert!(first_headers.contains(&format!("poly_passphrase: {PASSPHRASE}")));
+        task.await.unwrap();
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_account_reads_use_signature_type_one_and_keep_signer_headers() {
+        let (origin, mut requests, task) = mock_server(vec![
+            MockResponse::ok(balance()),
+            MockResponse::ok(balance()),
+        ])
+        .await;
+        let (mut owner, supervisor) = local_owner_for_signature_type(
+            &origin,
+            Duration::from_secs(1),
+            PmReadOnlySignatureType::Proxy,
+        );
+
+        let mut account = owner.account();
+        account
+            .collateral_balance_allowance(timestamp())
+            .await
+            .unwrap();
+        account
+            .conditional_balance_allowance(timestamp())
+            .await
+            .unwrap();
+
+        let collateral = requests.recv().await.unwrap();
+        let conditional = requests.recv().await.unwrap();
+        assert_eq!(
+            collateral.lines().next().unwrap(),
+            "GET /balance-allowance?asset_type=COLLATERAL&signature_type=1 HTTP/1.1"
+        );
+        assert_eq!(
+            conditional.lines().next().unwrap(),
+            "GET /balance-allowance?asset_type=CONDITIONAL&token_id=123&signature_type=1 HTTP/1.1"
+        );
+        for request in [collateral, conditional] {
+            let headers = request.to_ascii_lowercase();
+            assert!(headers.contains(&format!("poly_address: {}", ADDRESS.to_ascii_lowercase())));
+        }
+
         task.await.unwrap();
         supervisor.shutdown().await.unwrap();
     }

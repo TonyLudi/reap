@@ -260,6 +260,7 @@ impl PmLoopbackMutationConnectivityOwner {
             transport,
             self.http_config.exact_order_scope(),
             address,
+            crate::PmReadOnlySignatureType::Eoa,
             PmHttpCredentialRole::from_sender(senders.read.clone()),
         );
         let user_ws = PmAuthenticatedUserWsRole::from_authority(
