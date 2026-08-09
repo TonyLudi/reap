@@ -427,8 +427,10 @@ impl ProductionStatusOrigin {
 
 /// Purpose-closed current Polymarket status-announcement role.
 ///
-/// Production construction accepts only timeouts. It has no caller-selected
-/// origin, path, method, body, retry, proxy, hash, or clock. The independent
+/// The default production constructor accepts only timeouts; the selected
+/// form additionally accepts non-authoritative local socket configuration.
+/// Neither accepts a caller-selected origin, path, method, body, retry, proxy,
+/// hash, or clock. The independent
 /// status-page connection does not prove the egress used by the CLOB health
 /// role or by any authenticated connection.
 pub struct PmStatusAnnouncementHttpRole {
@@ -445,6 +447,21 @@ impl PmStatusAnnouncementHttpRole {
         Self::from_config(PmStatusHttpConfig::production(
             connect_timeout,
             request_timeout,
+        )?)
+    }
+
+    /// Construct the fixed production status-page role with a validated,
+    /// caller-provided interface name and local source IP applied to its
+    /// private client. The selection remains non-authoritative configuration.
+    pub fn production_on_selected_local_egress(
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        selected_local_egress: reap_polymarket_egress_binding::PmLocalEgressSelection,
+    ) -> Result<Self, PmLiveAdapterError> {
+        Self::from_config(PmStatusHttpConfig::production_on_selected_local_egress(
+            connect_timeout,
+            request_timeout,
+            selected_local_egress,
         )?)
     }
 

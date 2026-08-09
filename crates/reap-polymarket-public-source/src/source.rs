@@ -1,5 +1,6 @@
 use std::{collections::BTreeSet, time::Duration};
 
+use reap_polymarket_egress_binding::PmLocalEgressSelection;
 use reqwest::{
     Client, StatusCode, Url,
     header::{ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, HeaderMap, HeaderName},
@@ -134,6 +135,19 @@ impl PmDataApiPositionTransport {
             .redirect(Policy::none())
             .retry(reqwest::retry::never())
             .no_proxy();
+        if let Some(local_egress) = config.local_egress() {
+            #[cfg(target_os = "linux")]
+            {
+                builder = builder
+                    .interface(local_egress.interface_name())
+                    .local_address(local_egress.local_source_ip());
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = local_egress;
+                return Err(PmPublicPositionError::SelectedLocalEgressUnsupported);
+            }
+        }
         if config.mode() == OriginMode::Production {
             builder = builder.https_only(true);
         }
@@ -229,6 +243,26 @@ impl PmDataApiCurrentPositionSource {
         )
     }
 
+    /// Construct the same fixed credential-free production source with a
+    /// selected local interface/source IP. This adds no origin, route, query,
+    /// method, authentication, or mutation input.
+    pub fn production_on_selected_local_egress(
+        scope: PmDataApiPositionScope,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        local_egress: &PmLocalEgressSelection,
+    ) -> Result<Self, PmPublicPositionError> {
+        Self::new(
+            PmDataApiPositionConfig::production_on_selected_local_egress(
+                scope,
+                connect_timeout,
+                request_timeout,
+                local_egress,
+            )?,
+            ClockSource::System,
+        )
+    }
+
     fn new(
         config: PmDataApiPositionConfig,
         clock: ClockSource,
@@ -253,6 +287,27 @@ impl PmDataApiCurrentPositionSource {
                 scope,
                 connect_timeout,
                 request_timeout,
+            )?,
+            ClockSource::Fixed(clock),
+        )
+    }
+
+    #[cfg(test)]
+    fn numeric_loopback_evidence_on_selected_local_egress(
+        origin: &str,
+        scope: PmDataApiPositionScope,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        clock: PmDataApiReceiveClockObservation,
+        local_egress: &PmLocalEgressSelection,
+    ) -> Result<Self, PmPublicPositionError> {
+        Self::new(
+            PmDataApiPositionConfig::numeric_loopback_evidence_on_selected_local_egress(
+                origin,
+                scope,
+                connect_timeout,
+                request_timeout,
+                local_egress,
             )?,
             ClockSource::Fixed(clock),
         )
@@ -549,7 +604,7 @@ fn map_body_error(error: reqwest::Error) -> PmPublicPositionError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::{collections::VecDeque, net::IpAddr, ops::Deref};
 
     use reap_pm_core::{EvmAddress, PmConditionId, PmTokenId, U256};
     use tokio::{
@@ -571,6 +626,19 @@ mod tests {
         location: Option<&'static str>,
     }
 
+    struct RecordedRequest {
+        raw: String,
+        peer_ip: IpAddr,
+    }
+
+    impl Deref for RecordedRequest {
+        type Target = str;
+
+        fn deref(&self) -> &Self::Target {
+            &self.raw
+        }
+    }
+
     impl MockResponse {
         fn ok(body: String) -> Self {
             Self {
@@ -586,14 +654,18 @@ mod tests {
 
     async fn mock_server(
         responses: Vec<MockResponse>,
-    ) -> (String, mpsc::UnboundedReceiver<String>, JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    ) -> (
+        String,
+        mpsc::UnboundedReceiver<RecordedRequest>,
+        JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (requests_tx, requests_rx) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
             let mut responses = VecDeque::from(responses);
             while let Some(response) = responses.pop_front() {
-                let (mut stream, _) = listener.accept().await.unwrap();
+                let (mut stream, peer) = listener.accept().await.unwrap();
                 let mut raw = Vec::new();
                 let mut chunk = [0_u8; 4_096];
                 loop {
@@ -606,7 +678,10 @@ mod tests {
                         break;
                     }
                 }
-                let _ = requests_tx.send(String::from_utf8(raw).unwrap());
+                let _ = requests_tx.send(RecordedRequest {
+                    raw: String::from_utf8(raw).unwrap(),
+                    peer_ip: peer.ip(),
+                });
 
                 let reason = match response.status {
                     200 => "OK",
@@ -634,7 +709,11 @@ mod tests {
                 }
             }
         });
-        (format!("http://{address}"), requests_rx, task)
+        (
+            format!("http://127.0.0.1:{}", address.port()),
+            requests_rx,
+            task,
+        )
     }
 
     fn source(origin: &str, token: u64) -> PmDataApiCurrentPositionSource {
@@ -644,6 +723,21 @@ mod tests {
             Duration::from_secs(2),
             Duration::from_secs(5),
             PmDataApiReceiveClockObservation::for_loopback_evidence(1_700_000_000_123),
+        )
+        .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn selected_source(origin: &str, token: u64) -> PmDataApiCurrentPositionSource {
+        let selection =
+            PmLocalEgressSelection::loopback_evidence("lo", "127.0.0.2".parse().unwrap()).unwrap();
+        PmDataApiCurrentPositionSource::numeric_loopback_evidence_on_selected_local_egress(
+            origin,
+            scope(token),
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+            PmDataApiReceiveClockObservation::for_loopback_evidence(1_700_000_000_123),
+            &selection,
         )
         .unwrap()
     }
@@ -725,6 +819,71 @@ mod tests {
             assert!(!lowercase.contains("poly_"));
         }
         server.await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn selected_loopback_interface_and_source_ip_preserve_the_fixed_position_get() {
+        let (origin, mut requests, server) =
+            mock_server(vec![MockResponse::ok(format!("[{}]", row(501, "0")))]).await;
+        let observation = selected_source(&origin, 501)
+            .observe_configured_token()
+            .await
+            .unwrap();
+        assert_eq!(observation.rows_observed(), 1);
+        let request = requests.recv().await.unwrap();
+        assert!(request.starts_with("GET /positions?"));
+        assert_eq!(request.peer_ip, "127.0.0.2".parse::<IpAddr>().unwrap());
+        server.await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn selected_production_constructor_changes_no_fixed_source_authority() {
+        let selection =
+            PmLocalEgressSelection::production("pm-tunnel0", "192.0.2.10".parse().unwrap())
+                .unwrap();
+        assert!(!selection.production_order_entry_authorized());
+        PmDataApiCurrentPositionSource::production_on_selected_local_egress(
+            scope(501),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            &selection,
+        )
+        .expect("client construction does not perform network I/O");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn selected_production_and_loopback_modes_cannot_cross_source_constructors() {
+        let production =
+            PmLocalEgressSelection::production("pm0", "192.0.2.10".parse().unwrap()).unwrap();
+        assert!(matches!(
+            PmDataApiPositionConfig::numeric_loopback_evidence_on_selected_local_egress(
+                "http://127.0.0.1:9",
+                scope(501),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                &production,
+            ),
+            Err(PmPublicPositionError::LocalEgressSelection(
+                reap_polymarket_egress_binding::PmLocalEgressSelectionError::LoopbackEvidenceSelectionRequired
+            ))
+        ));
+
+        let loopback =
+            PmLocalEgressSelection::loopback_evidence("lo", "127.0.0.2".parse().unwrap()).unwrap();
+        assert!(matches!(
+            PmDataApiCurrentPositionSource::production_on_selected_local_egress(
+                scope(501),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                &loopback,
+            ),
+            Err(PmPublicPositionError::LocalEgressSelection(
+                reap_polymarket_egress_binding::PmLocalEgressSelectionError::ProductionSelectionRequired
+            ))
+        ));
     }
 
     #[tokio::test]
@@ -969,7 +1128,7 @@ mod tests {
         );
         let mut last = String::new();
         while let Ok(request) = requests.try_recv() {
-            last = request;
+            last = request.raw;
         }
         assert!(last.lines().next().unwrap().contains("offset=10000"));
         server.await.unwrap();

@@ -27,6 +27,7 @@ use crate::{
     PmAuthenticatedHttpOwner, PmAuthenticatedUserWsRole, PmAuthorizedMutationServerTime,
     PmCredentialAuthoritySupervisor, PmLiveAdapterError, PmMutationEdgeError, PmPrivateHttpConfig,
     PmRetainedOwnedCancelRequest, PmRetainedPlaceRequest, PmUserWsConfig,
+    config::OriginMode,
     private_credentials::{
         CredentialRequest, PmHttpCredentialRole, PmUserWsCredentialRole, handle_credential_request,
     },
@@ -248,6 +249,11 @@ impl PmLoopbackMutationConnectivityOwner {
         credentials: L2Credentials,
         signature_profile: PmClobV2SignatureType,
     ) -> Result<Self, PmLoopbackMutationAuthError> {
+        if http_config.mode() != OriginMode::LocalEvidence || user_ws_config.is_production() {
+            return Err(PmLoopbackMutationAuthError::InvalidConfiguration(
+                "loopback mutation authority requires loopback private HTTP and user WebSocket configurations",
+            ));
+        }
         let wire_scope = http_config.exact_order_scope();
         if wire_scope.condition() != user_ws_config.condition() {
             return Err(PmLoopbackMutationAuthError::InvalidConfiguration(

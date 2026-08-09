@@ -172,6 +172,7 @@ fn dependency_surface_is_public_read_only_and_credential_free() {
     }
     for required in [
         "reap-pm-core.workspace = true",
+        "reap-polymarket-egress-binding.workspace = true",
         "reqwest.workspace = true",
         "serde.workspace = true",
         "serde_json.workspace = true",
@@ -198,6 +199,8 @@ fn production_origin_route_query_and_transport_policy_are_closed() {
         ".redirect(Policy::none())",
         ".retry(reqwest::retry::never())",
         ".no_proxy()",
+        ".interface(local_egress.interface_name())",
+        ".local_address(local_egress.local_source_ip())",
         ".header(ACCEPT, \"application/json\")",
         ".header(ACCEPT_ENCODING, \"identity\")",
         "MAX_POSITION_PAGE_BODY_BYTES",
@@ -225,6 +228,38 @@ fn production_origin_route_query_and_transport_policy_are_closed() {
         assert!(
             !SOURCE.contains(forbidden),
             "capability escape: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn selected_local_egress_is_configuration_only_and_preserves_the_fixed_get_surface() {
+    for required in [
+        "pub fn production_on_selected_local_egress(",
+        "local_egress: &PmLocalEgressSelection",
+        "PmDataApiPositionConfig::production_on_selected_local_egress(",
+        "local_egress.require_production()?;",
+        "local_egress.require_loopback_evidence()?;",
+        ".interface(local_egress.interface_name())",
+        ".local_address(local_egress.local_source_ip())",
+        "#[cfg(target_os = \"linux\")]",
+        "SelectedLocalEgressUnsupported",
+    ] {
+        assert!(
+            CONFIG.contains(required) || SOURCE.contains(required) || ERROR.contains(required),
+            "missing selected source pin: {required}"
+        );
+    }
+    for forbidden in [
+        "pub fn client(",
+        "pub fn request(",
+        "pub fn local_egress(",
+        "PmSelectedEgressGeoblockObservation",
+        "production_order_entry_authorized: true",
+    ] {
+        assert!(
+            !CONFIG.contains(forbidden) && !SOURCE.contains(forbidden),
+            "selected egress escape: {forbidden}"
         );
     }
 }
@@ -328,7 +363,10 @@ fn arbitrary_origin_is_compile_excluded_outside_unit_tests() {
     assert!(SOURCE.contains("#[cfg(test)]\n    fn numeric_loopback_evidence("));
     assert!(CONFIG.contains("host.parse::<IpAddr>()"));
     assert!(CONFIG.contains("address.is_loopback()"));
-    assert!(!MANIFEST.contains("loopback-evidence"));
+    assert!(!MANIFEST.contains("[features]"));
+    assert!(MANIFEST.contains(
+        "reap-polymarket-egress-binding = { workspace = true, features = [\"loopback-evidence\"] }"
+    ));
 }
 
 #[test]

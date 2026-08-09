@@ -23,6 +23,7 @@ fn dependency_edges_are_exactly_the_read_only_chain_source_set() {
         production,
         BTreeSet::from([
             "reap-pm-core".to_string(),
+            "reap-polymarket-egress-binding".to_string(),
             "reqwest".to_string(),
             "serde".to_string(),
             "serde_json".to_string(),
@@ -32,7 +33,10 @@ fn dependency_edges_are_exactly_the_read_only_chain_source_set() {
         ])
     );
     assert!(manifest.contains("default = []"));
-    assert!(manifest.contains("loopback-evidence = []"));
+    assert!(
+        manifest
+            .contains("loopback-evidence = [\"reap-polymarket-egress-binding/loopback-evidence\"]")
+    );
     for forbidden in [
         "reap-polymarket-auth",
         "reap-polymarket-wire",

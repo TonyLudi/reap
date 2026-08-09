@@ -3,6 +3,7 @@ use std::time::Duration;
 #[cfg(any(test, feature = "loopback-evidence"))]
 use std::net::IpAddr;
 
+use reap_polymarket_egress_binding::{PmLocalEgressSelection, PmLocalEgressSelectionError};
 use reqwest::{Client, StatusCode, Url, redirect::Policy};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -43,6 +44,10 @@ pub enum PmPolygonChainSourceError {
     SignerFunderNotDistinct,
     #[error("failed to build the closed Polygon JSON-RPC transport")]
     TransportBuild,
+    #[error("selected local egress is supported only on Linux")]
+    SelectedLocalEgressUnsupported,
+    #[error(transparent)]
+    LocalEgressSelection(#[from] PmLocalEgressSelectionError),
     #[error("numeric-loopback evidence origin is outside the closed local origin policy")]
     InvalidLoopbackOrigin,
     #[error("numeric-loopback evidence timeout is outside its closed bound")]
@@ -210,10 +215,27 @@ pub struct PmPolygonAuthorizationSource {
 }
 
 impl PmPolygonAuthorizationSource {
-    /// Builds the only production source. Its origin, redirect/retry/proxy
-    /// policy, request methods, contracts, block selectors, and timeouts are
-    /// fixed by this crate.
+    /// Builds the default production source without an explicit local socket
+    /// selection. Its origin, redirect/retry/proxy policy, request methods,
+    /// contracts, block selectors, and timeouts are fixed by this crate.
     pub fn production() -> Result<Self, PmPolygonChainSourceError> {
+        Self::production_with_local_egress(None)
+    }
+
+    /// Builds the fixed production source with an additional non-authoritative
+    /// local interface and source-IP socket selection. The selection changes
+    /// no origin, JSON-RPC method, contract, block selector, timeout, or
+    /// production-origin proof and grants no order-entry authority.
+    pub fn production_on_selected_local_egress(
+        local_egress: &PmLocalEgressSelection,
+    ) -> Result<Self, PmPolygonChainSourceError> {
+        local_egress.require_production()?;
+        Self::production_with_local_egress(Some(local_egress))
+    }
+
+    fn production_with_local_egress(
+        local_egress: Option<&PmLocalEgressSelection>,
+    ) -> Result<Self, PmPolygonChainSourceError> {
         let origin = Url::parse(PM_POLYGON_RPC_ORIGIN).expect("frozen Polygon RPC origin");
         Ok(Self {
             transport: PmPolygonRpcTransport::build(
@@ -221,6 +243,7 @@ impl PmPolygonAuthorizationSource {
                 PRODUCTION_CONNECT_TIMEOUT,
                 PRODUCTION_REQUEST_TIMEOUT,
                 true,
+                local_egress,
             )?,
             clock: ClockSource::System,
             mode: SourceMode::Production,
@@ -236,6 +259,35 @@ impl PmPolygonAuthorizationSource {
         clock: PmPolygonSystemClockObservation,
         request_timeout: Duration,
     ) -> Result<Self, PmPolygonChainSourceError> {
+        Self::loopback_evidence_with_local_egress(origin, clock, request_timeout, None)
+    }
+
+    /// Build the same fixed loopback evidence source with a selected local
+    /// loopback interface/address. This remains unavailable in production
+    /// builds unless the dedicated evidence feature is enabled.
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub fn loopback_evidence_on_selected_local_egress(
+        origin: &str,
+        clock: PmPolygonSystemClockObservation,
+        request_timeout: Duration,
+        local_egress: &PmLocalEgressSelection,
+    ) -> Result<Self, PmPolygonChainSourceError> {
+        local_egress.require_loopback_evidence()?;
+        Self::loopback_evidence_with_local_egress(
+            origin,
+            clock,
+            request_timeout,
+            Some(local_egress),
+        )
+    }
+
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    fn loopback_evidence_with_local_egress(
+        origin: &str,
+        clock: PmPolygonSystemClockObservation,
+        request_timeout: Duration,
+        local_egress: Option<&PmLocalEgressSelection>,
+    ) -> Result<Self, PmPolygonChainSourceError> {
         if !(MIN_LOOPBACK_REQUEST_TIMEOUT..=MAX_LOOPBACK_REQUEST_TIMEOUT).contains(&request_timeout)
         {
             return Err(PmPolygonChainSourceError::InvalidLoopbackTimeout);
@@ -247,6 +299,7 @@ impl PmPolygonAuthorizationSource {
                 request_timeout.min(PRODUCTION_CONNECT_TIMEOUT),
                 request_timeout,
                 false,
+                local_egress,
             )?,
             clock: ClockSource::Fixed(clock),
             mode: SourceMode::LoopbackEvidence,
@@ -526,6 +579,7 @@ impl PmPolygonRpcTransport {
         connect_timeout: Duration,
         request_timeout: Duration,
         production: bool,
+        local_egress: Option<&PmLocalEgressSelection>,
     ) -> Result<Self, PmPolygonChainSourceError> {
         let mut builder = Client::builder()
             .connect_timeout(connect_timeout)
@@ -533,6 +587,19 @@ impl PmPolygonRpcTransport {
             .redirect(Policy::none())
             .retry(reqwest::retry::never())
             .no_proxy();
+        if let Some(local_egress) = local_egress {
+            #[cfg(target_os = "linux")]
+            {
+                builder = builder
+                    .interface(local_egress.interface_name())
+                    .local_address(local_egress.local_source_ip());
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = local_egress;
+                return Err(PmPolygonChainSourceError::SelectedLocalEgressUnsupported);
+            }
+        }
         if production {
             builder = builder.https_only(true);
         }

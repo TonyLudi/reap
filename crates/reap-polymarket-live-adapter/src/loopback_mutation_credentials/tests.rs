@@ -284,6 +284,13 @@ fn proxy_owner_with_configs(
     http: PmPrivateHttpConfig,
     user_ws: PmUserWsConfig,
 ) -> PmLoopbackMutationConnectivityOwner {
+    try_proxy_owner_with_configs(http, user_ws).unwrap()
+}
+
+fn try_proxy_owner_with_configs(
+    http: PmPrivateHttpConfig,
+    user_ws: PmUserWsConfig,
+) -> Result<PmLoopbackMutationConnectivityOwner, PmLoopbackMutationAuthError> {
     let execution = execution();
     let scope = instrument_scope(MARKET, 1_234);
     PmLoopbackMutationConnectivityOwner::new_pm_t2_proxy(
@@ -299,7 +306,23 @@ fn proxy_owner_with_configs(
         signer(),
         credentials(ADDRESS),
     )
-    .unwrap()
+}
+
+#[test]
+fn loopback_mutation_owner_rejects_production_private_http_before_hmac_roles_exist() {
+    let (loopback_http, user_ws) = configs();
+    let production_http = PmPrivateHttpConfig::production(
+        Duration::from_millis(100),
+        Duration::from_secs(1),
+        loopback_http.exact_order_scope(),
+    )
+    .unwrap();
+    assert!(matches!(
+        try_proxy_owner_with_configs(production_http, user_ws),
+        Err(PmLoopbackMutationAuthError::InvalidConfiguration(
+            "loopback mutation authority requires loopback private HTTP and user WebSocket configurations"
+        ))
+    ));
 }
 
 fn try_proxy_owner(

@@ -10,6 +10,9 @@ use reap_polymarket_wire::{
     PmLiveOpenOrderPage, PmLiveOrder, PmLiveTradePage, PmLiveUserFrame, PmWireScope,
 };
 
+#[cfg(any(test, feature = "loopback-evidence"))]
+use crate::config::OriginMode;
+
 use crate::{
     PmAuthenticatedHttpOwner, PmAuthenticatedUserWsRole, PmLiveAdapterError, PmPrivateHttpConfig,
     PmReadOnlySignatureType, PmUserWsBounds, PmUserWsConfig, private_http::PmPrivateHttpTransport,
@@ -140,6 +143,11 @@ impl PmExternalProxyReadConnectivityOwner {
         H: PmHttpReadAuthorityProvider + 'static,
         U: PmUserWsReadAuthorityProvider + 'static,
     {
+        if http_config.mode() != OriginMode::LocalEvidence || user_ws_config.is_production() {
+            return Err(PmLiveAdapterError::InvalidConfiguration(
+                "loopback external read owner requires loopback private HTTP and user WebSocket configurations",
+            ));
+        }
         Self::from_configs(
             http_config,
             user_ws_config,
@@ -281,6 +289,47 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn loopback_read_owner_rejects_production_private_http_before_roles_exist() {
+        let http_config = PmPrivateHttpConfig::production(
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            scope(),
+        )
+        .unwrap();
+        let user_ws_config = PmUserWsConfig::loopback_evidence(
+            "ws://127.0.0.1:18081/ws/user",
+            scope().condition(),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_millis(250),
+            Duration::from_millis(100),
+            4 * 1_024,
+            0,
+            Duration::from_millis(1),
+            8,
+            ConnectionEpoch::new(1),
+        )
+        .unwrap();
+        let (http_authority, user_ws_authority, supervisor) =
+            test_read_credential_roles(credentials()).unwrap();
+        let result = PmExternalProxyReadConnectivityOwner::loopback_evidence(
+            http_config,
+            user_ws_config,
+            EoaAddress::parse(SIGNER).unwrap(),
+            EvmAddress::parse(PROXY).unwrap(),
+            http_authority,
+            user_ws_authority,
+        );
+        assert!(matches!(
+            result,
+            Err(PmLiveAdapterError::InvalidConfiguration(
+                "loopback external read owner requires loopback private HTTP and user WebSocket configurations"
+            ))
+        ));
+        supervisor.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

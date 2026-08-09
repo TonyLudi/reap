@@ -10,15 +10,17 @@ use futures_util::{SinkExt, StreamExt};
 use reap_pm_core::{ConnectionEpoch, ReceivedEventClock};
 use reap_polymarket_wire::{PmMarketSubscription, PmWireScope};
 use thiserror::Error;
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, sleep_until, timeout};
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async_with_config,
-    tungstenite::{Error as WebSocketError, Message, protocol::WebSocketConfig},
-};
+use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message, protocol::WebSocketConfig};
 
-use crate::{PmLiveAdapterError, PmPublicWsConfig, task_guard::AbortOnDropTask};
+use crate::{
+    PmLiveAdapterError, PmPublicWsConfig,
+    task_guard::AbortOnDropTask,
+    ws_transport::{
+        PmDefaultWsDialer, PmFixedWsRoute, PmWsDialRequest, PmWsDialStrategy, PmWsSocket,
+    },
+};
 
 const APPLICATION_PING: &str = "PING";
 const APPLICATION_PONG: &str = "PONG";
@@ -537,7 +539,7 @@ impl PmPublicMarketWsRole {
         let subscription = self.subscription;
         let clock = self.clock;
         let activity_source = self.activity_source;
-        let mut worker = AbortOnDropTask::new(tokio::spawn(async move {
+        let worker = AbortOnDropTask::new(tokio::spawn(async move {
             run_worker(
                 config,
                 subscription,
@@ -545,54 +547,70 @@ impl PmPublicMarketWsRole {
                 activity_source,
                 shutdown.receiver,
                 event_sender,
+                PmDefaultWsDialer,
             )
             .await
         }));
 
-        while let Some(event) = event_receiver.recv().await {
-            match event {
-                WorkerEvent::Evidence(event) => {
-                    if let Err(error) = sink.deliver_public_ws_event(event).await {
+        serve_worker_events(worker, &mut event_receiver, sink).await
+    }
+}
+
+async fn serve_worker_events<S>(
+    mut worker: AbortOnDropTask<Result<(), PmPublicWsTransportError>>,
+    event_receiver: &mut mpsc::Receiver<WorkerEvent>,
+    sink: &mut S,
+) -> Result<(), PmPublicWsRunError<S::Error>>
+where
+    S: PmPublicWsEventSink,
+{
+    while let Some(event) = event_receiver.recv().await {
+        match event {
+            WorkerEvent::Evidence(event) => {
+                if let Err(error) = sink.deliver_public_ws_event(event).await {
+                    let _ = worker.abort_and_join().await;
+                    return Err(PmPublicWsRunError::Sink(error));
+                }
+            }
+            WorkerEvent::ReconnectAuthority { retired, response } => {
+                let directive = sink.authorize_public_ws_reconnect(retired).await;
+                match directive {
+                    Ok(directive) => {
+                        if response.send(directive).is_err() {
+                            let _ = worker.abort_and_join().await;
+                            return Err(PmPublicWsRunError::Transport(
+                                PmPublicWsTransportError::WorkerFailed,
+                            ));
+                        }
+                    }
+                    Err(error) => {
                         let _ = worker.abort_and_join().await;
                         return Err(PmPublicWsRunError::Sink(error));
                     }
                 }
-                WorkerEvent::ReconnectAuthority { retired, response } => {
-                    let directive = sink.authorize_public_ws_reconnect(retired).await;
-                    match directive {
-                        Ok(directive) => {
-                            if response.send(directive).is_err() {
-                                let _ = worker.abort_and_join().await;
-                                return Err(PmPublicWsRunError::Transport(
-                                    PmPublicWsTransportError::WorkerFailed,
-                                ));
-                            }
-                        }
-                        Err(error) => {
-                            let _ = worker.abort_and_join().await;
-                            return Err(PmPublicWsRunError::Sink(error));
-                        }
-                    }
-                }
             }
         }
-
-        worker
-            .join()
-            .await
-            .map_err(|_| PmPublicWsTransportError::WorkerFailed)??;
-        Ok(())
     }
+
+    worker
+        .join()
+        .await
+        .map_err(|_| PmPublicWsTransportError::WorkerFailed)??;
+    Ok(())
 }
 
-async fn run_worker(
+async fn run_worker<D>(
     config: PmPublicWsConfig,
     subscription: String,
     mut clock: Box<dyn PmPublicWsClockSource>,
     activity: PmPublicWsActivitySource,
     mut shutdown: watch::Receiver<bool>,
     events: mpsc::Sender<WorkerEvent>,
-) -> Result<(), PmPublicWsTransportError> {
+    mut dialer: D,
+) -> Result<(), PmPublicWsTransportError>
+where
+    D: PmWsDialStrategy,
+{
     let mut connection_epoch = config.initial_connection_epoch();
 
     loop {
@@ -606,8 +624,11 @@ async fn run_worker(
             connection,
             clock.as_mut(),
             &activity,
-            &mut shutdown,
-            &events,
+            AttemptControl {
+                shutdown: &mut shutdown,
+                events: &events,
+            },
+            &mut dialer,
         )
         .await?;
         let retired = match outcome {
@@ -679,23 +700,35 @@ enum AttemptOutcome {
     Retired(PmPublicWsRetirement),
 }
 
-async fn run_attempt(
+struct AttemptControl<'a> {
+    shutdown: &'a mut watch::Receiver<bool>,
+    events: &'a mpsc::Sender<WorkerEvent>,
+}
+
+async fn run_attempt<D>(
     config: &PmPublicWsConfig,
     subscription: &str,
     connection: PmPublicWsConnection,
     clock: &mut dyn PmPublicWsClockSource,
     activity: &PmPublicWsActivitySource,
-    shutdown: &mut watch::Receiver<bool>,
-    events: &mpsc::Sender<WorkerEvent>,
-) -> Result<AttemptOutcome, PmPublicWsTransportError> {
+    control: AttemptControl<'_>,
+    dialer: &mut D,
+) -> Result<AttemptOutcome, PmPublicWsTransportError>
+where
+    D: PmWsDialStrategy,
+{
+    let AttemptControl { shutdown, events } = control;
     let websocket_config = WebSocketConfig::default()
         .read_buffer_size(config.max_frame_bytes().clamp(1_024, 64 * 1_024))
         .write_buffer_size(1_024)
         .max_write_buffer_size(8 * 1_024)
         .max_message_size(Some(config.max_frame_bytes()))
         .max_frame_size(Some(config.max_frame_bytes()));
-    let connect =
-        connect_async_with_config(config.endpoint().as_str(), Some(websocket_config), true);
+    let connect = dialer.dial(PmWsDialRequest::new(
+        PmFixedWsRoute::PublicMarket,
+        config.endpoint().as_str(),
+        websocket_config,
+    ));
     let socket = tokio::select! {
         () = wait_for_shutdown(shutdown) => {
             return Ok(AttemptOutcome::Shutdown(source_observation(
@@ -707,7 +740,7 @@ async fn run_attempt(
         result = timeout(config.connect_timeout(), connect) => match result {
             Err(_) => return retired(activity, clock, connection, PmPublicWsDisconnectReason::ConnectTimeout),
             Ok(Err(_)) => return retired(activity, clock, connection, PmPublicWsDisconnectReason::ConnectFailed),
-            Ok(Ok((socket, _response))) => socket,
+            Ok(Ok(socket)) => socket,
         },
     };
 
@@ -736,7 +769,7 @@ async fn run_connected(
     connection: PmPublicWsConnection,
     clock: &mut dyn PmPublicWsClockSource,
     activity: &PmPublicWsActivitySource,
-    mut socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    mut socket: PmWsSocket,
     shutdown: &mut watch::Receiver<bool>,
     events: &mpsc::Sender<WorkerEvent>,
 ) -> Result<AttemptOutcome, PmPublicWsTransportError> {
@@ -884,6 +917,32 @@ fn classify_read_error(error: &WebSocketError) -> PmPublicWsDisconnectReason {
     }
 }
 
+#[cfg(test)]
+impl PmPublicMarketWsRole {
+    async fn run_with_test_selected_loopback<S>(
+        self,
+        shutdown: PmPublicWsShutdownSignal,
+        sink: &mut S,
+        dialer: crate::ws_transport::PmTestSelectedLoopbackWsDialer,
+    ) -> Result<(), PmPublicWsRunError<S::Error>>
+    where
+        S: PmPublicWsEventSink,
+    {
+        let (event_sender, mut event_receiver) =
+            mpsc::channel(self.config.event_channel_capacity());
+        let worker = AbortOnDropTask::new(tokio::task::spawn_local(run_worker(
+            self.config,
+            self.subscription,
+            self.clock,
+            self.activity_source,
+            shutdown.receiver,
+            event_sender,
+            dialer,
+        )));
+        serve_worker_events(worker, &mut event_receiver, sink).await
+    }
+}
+
 fn observe(
     clock: &mut dyn PmPublicWsClockSource,
 ) -> Result<PmPublicWsEdgeClock, PmPublicWsTransportError> {
@@ -1010,11 +1069,15 @@ mod tests {
     use reap_polymarket_wire::PmBookParserConfig;
     use reap_transport::ReconnectPolicy;
     use tokio::net::TcpListener;
-    use tokio::{sync::Notify, task::JoinHandle};
+    use tokio::{
+        sync::Notify,
+        task::{JoinHandle, LocalSet},
+    };
     use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-    use tokio_tungstenite::{accept_async, accept_hdr_async};
+    use tokio_tungstenite::{WebSocketStream, accept_async, accept_hdr_async};
 
     use super::*;
+    use crate::ws_transport::PmTestSelectedLoopbackWsDialer;
 
     const CURRENT_SUBSCRIPTION: &str =
         r#"{"assets_ids":["123"],"custom_feature_enabled":true,"type":"market"}"#;
@@ -1625,6 +1688,94 @@ mod tests {
         let text = message.into_text().unwrap();
         assert!(!text.contains("initial_dump"));
         assert!(!text.contains("operation"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn selected_loopback_dialer_preserves_public_worker_protocol_across_reconnect() {
+        LocalSet::new()
+            .run_until(async {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::task::spawn_local(async move {
+                    for attempt in 0..2 {
+                        let (stream, _) = listener.accept().await.unwrap();
+                        let mut socket = accept_async(stream).await.unwrap();
+                        read_subscription(&mut socket).await;
+                        if attempt == 0 {
+                            socket.send(Message::Close(None)).await.unwrap();
+                        } else {
+                            while let Some(message) = socket.next().await {
+                                match message {
+                                    Ok(Message::Close(_)) | Err(_) => break,
+                                    Ok(_) => {}
+                                }
+                            }
+                        }
+                    }
+                });
+
+                let endpoint = format!("ws://{address}/ws/market");
+                let config = standard_config(address, 1_024, 1, 91);
+                let role =
+                    PmPublicMarketWsRole::with_clock_source(config, TestClock { next: 1 }).unwrap();
+                let dialer = PmTestSelectedLoopbackWsDialer::new(
+                    PmFixedWsRoute::PublicMarket,
+                    &endpoint,
+                    address,
+                    address.ip(),
+                )
+                .unwrap();
+                let (shutdown, signal) = pm_public_ws_shutdown_channel();
+                let (sender, mut receiver) = mpsc::unbounded_channel();
+                let clocks = Arc::new(Mutex::new(Vec::new()));
+                let sink_clocks = Arc::clone(&clocks);
+                let task = tokio::task::spawn_local(async move {
+                    let mut sink = TestSink {
+                        sender,
+                        clocks: sink_clocks,
+                        fail_at: None,
+                        delivered: 0,
+                        authorized_reconnects: 0,
+                        max_authorized_reconnects: 1,
+                        authorized_backoff: Duration::from_millis(1),
+                        planned_directives: None,
+                    };
+                    role.run_with_test_selected_loopback(signal, &mut sink, dialer)
+                        .await
+                });
+
+                assert_eq!(next_seen(&mut receiver).await, Seen::Open(91));
+                assert_eq!(next_seen(&mut receiver).await, Seen::Subscription(91));
+                assert_eq!(
+                    next_seen(&mut receiver).await,
+                    Seen::Retired(91, PmPublicWsDisconnectReason::SocketClosed),
+                );
+                assert_eq!(next_seen(&mut receiver).await, Seen::Reconnect(91, 92, 1));
+                assert_eq!(next_seen(&mut receiver).await, Seen::Open(92));
+                assert_eq!(next_seen(&mut receiver).await, Seen::Subscription(92));
+                shutdown.request_shutdown();
+                assert_eq!(next_seen(&mut receiver).await, Seen::Shutdown(92));
+                task.await.unwrap().unwrap();
+                server.await.unwrap();
+                assert_eq!(
+                    clocks
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|edge| edge.edge)
+                        .collect::<Vec<_>>(),
+                    [
+                        "opened",
+                        "subscription",
+                        "retired",
+                        "reconnect",
+                        "opened",
+                        "subscription",
+                        "shutdown",
+                    ],
+                );
+            })
+            .await;
     }
 
     #[allow(clippy::result_large_err)]

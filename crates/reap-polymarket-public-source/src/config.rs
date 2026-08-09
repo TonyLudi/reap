@@ -3,6 +3,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use reap_pm_core::{EvmAddress, PmConditionId, PmTokenId};
+use reap_polymarket_egress_binding::PmLocalEgressSelection;
 use reqwest::Url;
 
 use crate::PmPublicPositionError;
@@ -65,6 +66,7 @@ pub struct PmDataApiPositionConfig {
     request_timeout: Duration,
     scope: PmDataApiPositionScope,
     mode: OriginMode,
+    local_egress: Option<PmLocalEgressSelection>,
 }
 
 impl PmDataApiPositionConfig {
@@ -81,7 +83,24 @@ impl PmDataApiPositionConfig {
             request_timeout,
             scope,
             mode: OriginMode::Production,
+            local_egress: None,
         })
+    }
+
+    /// Construct the fixed production Data API configuration with an
+    /// additional non-authoritative local interface and source-IP selection.
+    /// The selection changes no origin, route, query, method, or evidence
+    /// authority.
+    pub fn production_on_selected_local_egress(
+        scope: PmDataApiPositionScope,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        local_egress: &PmLocalEgressSelection,
+    ) -> Result<Self, PmPublicPositionError> {
+        local_egress.require_production()?;
+        let mut config = Self::production(scope, connect_timeout, request_timeout)?;
+        config.local_egress = Some(local_egress.clone());
+        Ok(config)
     }
 
     #[cfg(test)]
@@ -99,7 +118,23 @@ impl PmDataApiPositionConfig {
             request_timeout,
             scope,
             mode: OriginMode::NumericLoopback,
+            local_egress: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn numeric_loopback_evidence_on_selected_local_egress(
+        origin: &str,
+        scope: PmDataApiPositionScope,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        local_egress: &PmLocalEgressSelection,
+    ) -> Result<Self, PmPublicPositionError> {
+        local_egress.require_loopback_evidence()?;
+        let mut config =
+            Self::numeric_loopback_evidence(origin, scope, connect_timeout, request_timeout)?;
+        config.local_egress = Some(local_egress.clone());
+        Ok(config)
     }
 
     #[must_use]
@@ -126,6 +161,10 @@ impl PmDataApiPositionConfig {
 
     pub(crate) const fn mode(&self) -> OriginMode {
         self.mode
+    }
+
+    pub(crate) const fn local_egress(&self) -> Option<&PmLocalEgressSelection> {
+        self.local_egress.as_ref()
     }
 }
 
@@ -216,6 +255,25 @@ mod tests {
             PmDataApiPositionConfig::production(scope(), Duration::ZERO, Duration::from_secs(1)),
             Err(PmPublicPositionError::InvalidConfiguration)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn selected_production_config_preserves_fixed_origin_and_denied_authority() {
+        let selection =
+            PmLocalEgressSelection::production("pm-tunnel0", "192.0.2.10".parse().unwrap())
+                .unwrap();
+        let config = PmDataApiPositionConfig::production_on_selected_local_egress(
+            scope(),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            &selection,
+        )
+        .unwrap();
+        assert_eq!(config.origin().as_str(), "https://data-api.polymarket.com/");
+        assert_eq!(config.mode(), OriginMode::Production);
+        assert_eq!(config.local_egress(), Some(&selection));
+        assert!(!config.production_order_entry_authorized());
     }
 
     #[test]

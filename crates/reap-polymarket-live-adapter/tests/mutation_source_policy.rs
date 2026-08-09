@@ -8,13 +8,27 @@ const LOOPBACK_CREDENTIALS: &str = include_str!("../src/loopback_mutation_creden
 #[test]
 fn production_surface_has_no_constructible_mutation_transport() {
     assert!(MANIFEST.contains("default = []"));
-    assert!(MANIFEST.contains("loopback-evidence = []"));
-    assert!(MANIFEST.contains("read-only-evidence = []"));
+    assert!(
+        MANIFEST
+            .contains("loopback-evidence = [\"reap-polymarket-egress-binding/loopback-evidence\"]")
+    );
+    assert!(
+        MANIFEST.contains(
+            "read-only-evidence = [\"reap-polymarket-egress-binding/loopback-evidence\"]"
+        )
+    );
+    assert!(!MANIFEST.contains("read-only-evidence = [\"loopback-evidence\"]"));
     assert!(!TRANSPORT.contains("read-only-evidence"));
     assert!(!LOOPBACK_CREDENTIALS.contains("read-only-evidence"));
     assert!(TRANSPORT.contains("#[cfg(any(test, feature = \"loopback-evidence\"))]"));
     assert!(TRANSPORT.contains("pub fn loopback_evidence("));
     assert!(LOOPBACK_CREDENTIALS.contains("pub fn new_pm_t2_proxy("));
+    assert!(LOOPBACK_CREDENTIALS.contains(
+        "http_config.mode() != OriginMode::LocalEvidence || user_ws_config.is_production()"
+    ));
+    assert!(LOOPBACK_CREDENTIALS.contains(
+        "loopback mutation authority requires loopback private HTTP and user WebSocket configurations"
+    ));
     assert!(!TRANSPORT.contains("pub fn production("));
     assert!(!LOOPBACK_CREDENTIALS.contains("pub fn production("));
     assert!(!TRANSPORT.contains("pub fn new_origin("));

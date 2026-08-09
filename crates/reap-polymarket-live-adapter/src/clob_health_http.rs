@@ -128,8 +128,10 @@ impl ProductionClobHealthOrigin {
 
 /// Purpose-closed fixed CLOB `GET /ok` role.
 ///
-/// Production construction accepts only timeouts. It has no caller-selected
-/// origin, path, method, body, retry, proxy, hash, or clock. The underlying
+/// The default production constructor accepts only timeouts; the selected
+/// form additionally accepts non-authoritative local socket configuration.
+/// Neither accepts a caller-selected origin, path, method, body, retry, proxy,
+/// hash, or clock. The underlying
 /// transport is the same no-proxy/no-retry bounded CLOB transport used by the
 /// other fixed public roles, but this independent observation does not prove
 /// that another connection used the same route or egress.
@@ -148,6 +150,24 @@ impl PmClobLivenessHealthHttpRole {
             PM_CLOB_PRODUCTION_ORIGIN,
             connect_timeout,
             request_timeout,
+        )?;
+        Self::from_config(config)
+    }
+
+    /// Construct the fixed production `GET /ok` role with a validated,
+    /// caller-provided interface name and local source IP applied to its
+    /// private client. The selection remains non-authoritative configuration and
+    /// grants no mutation authority.
+    pub fn production_on_selected_local_egress(
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        selected_local_egress: reap_polymarket_egress_binding::PmLocalEgressSelection,
+    ) -> Result<Self, PmLiveAdapterError> {
+        let config = PmPublicHttpConfig::production_on_selected_local_egress(
+            PM_CLOB_PRODUCTION_ORIGIN,
+            connect_timeout,
+            request_timeout,
+            selected_local_egress,
         )?;
         Self::from_config(config)
     }

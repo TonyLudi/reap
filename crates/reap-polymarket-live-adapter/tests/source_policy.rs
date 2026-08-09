@@ -14,6 +14,7 @@ const PUBLIC_CONNECTIVITY: &str = include_str!("../src/public_connectivity.rs");
 const PUBLIC_HTTP: &str = include_str!("../src/public_http.rs");
 const PUBLIC_WS: &str = include_str!("../src/public_ws.rs");
 const PUBLIC_WS_CONFIG: &str = include_str!("../src/public_ws_config.rs");
+const READ_AUTHORITY: &str = include_str!("../src/read_authority.rs");
 const READ_ONLY_PRIVATE: &str = include_str!("../src/read_only_private.rs");
 const RECONCILIATION: &str = include_str!("../src/reconciliation.rs");
 const STATUS_ANNOUNCEMENT_HTTP: &str = include_str!("../src/status_announcement_http.rs");
@@ -21,6 +22,7 @@ const ACCOUNT: &str = include_str!("../src/account.rs");
 const USER_WS: &str = include_str!("../src/user_ws.rs");
 const USER_WS_CONFIG: &str = include_str!("../src/user_ws_config.rs");
 const TASK_GUARD: &str = include_str!("../src/task_guard.rs");
+const WS_TRANSPORT: &str = include_str!("../src/ws_transport.rs");
 
 fn production_prefix(source: &str) -> &str {
     source
@@ -42,6 +44,7 @@ fn phase3_foundation_has_only_role_specific_dependencies() {
         "reap-polymarket-adapter.workspace = true",
         "async-trait.workspace = true",
         "reap-polymarket-auth.workspace = true",
+        "reap-polymarket-egress-binding.workspace = true",
         "reap-polymarket-wire.workspace = true",
         "reqwest.workspace = true",
         "serde.workspace = true",
@@ -63,6 +66,133 @@ fn phase3_foundation_has_only_role_specific_dependencies() {
             !MANIFEST.contains(forbidden),
             "forbidden dependency: {forbidden}"
         );
+    }
+}
+
+#[test]
+fn selected_local_http_egress_is_configuration_only_and_never_a_combined_owner_claim() {
+    for required in [
+        "loopback-evidence = [\"reap-polymarket-egress-binding/loopback-evidence\"]",
+        "read-only-evidence = [\"reap-polymarket-egress-binding/loopback-evidence\"]",
+    ] {
+        assert!(
+            MANIFEST.contains(required),
+            "missing selected feature pin: {required}"
+        );
+    }
+    assert_eq!(
+        CONFIG
+            .matches("selected_local_egress: Option<PmLocalEgressSelection>")
+            .count(),
+        4,
+        "every HTTP configuration family must retain the same optional local selection"
+    );
+    assert_eq!(
+        CONFIG
+            .matches("pub fn production_on_selected_local_egress(")
+            .count(),
+        2,
+        "only private-read and geoblock configs expose selected production setup externally"
+    );
+    assert_eq!(
+        CONFIG
+            .matches("pub(crate) fn production_on_selected_local_egress(")
+            .count(),
+        2,
+        "status and mixed-purpose public configuration remain crate-private"
+    );
+    assert_eq!(
+        CONFIG
+            .matches("pub(crate) const fn selected_local_egress(&self)")
+            .count(),
+        4,
+        "raw config selection is borrowed only by private transports"
+    );
+    assert_eq!(
+        CONFIG
+            .matches("require_production_local_egress(&selected_local_egress)?;")
+            .count(),
+        4,
+        "every selected production configuration must reject evidence mode"
+    );
+    assert_eq!(
+        CONFIG
+            .matches("require_loopback_local_egress(&selected_local_egress)?;")
+            .count(),
+        4,
+        "every selected loopback configuration must reject production mode"
+    );
+    for required in [
+        ".require_production()",
+        ".require_loopback_evidence()",
+        "production HTTP requires a production local-egress selection",
+        "loopback HTTP evidence requires a loopback local-egress selection",
+    ] {
+        assert!(
+            CONFIG.contains(required),
+            "missing mode boundary: {required}"
+        );
+    }
+
+    for transport in [HTTP_TRANSPORT, PRIVATE_HTTP] {
+        let production = production_prefix(transport);
+        assert_eq!(production.matches(".interface(").count(), 1);
+        assert_eq!(production.matches(".local_address(").count(), 1);
+        assert!(production.contains("#[cfg(target_os = \"linux\")]"));
+        assert!(production.contains("selected local egress requires Linux"));
+        for escape in [
+            "pub fn client(",
+            "pub fn request(",
+            "pub fn execute(",
+            "pub fn post(",
+            "pub fn delete(",
+        ] {
+            assert!(
+                !production.contains(escape),
+                "selected transport escape: {escape}"
+            );
+        }
+    }
+    for role in [CLOB_HEALTH_HTTP, STATUS_ANNOUNCEMENT_HTTP] {
+        assert!(role.contains("pub fn production_on_selected_local_egress("));
+        assert!(
+            role.contains("selection remains non-authoritative")
+                || role.contains("selection is configuration only")
+        );
+    }
+    for combined_owner in [PUBLIC_CONNECTIVITY, READ_AUTHORITY, READ_ONLY_PRIVATE] {
+        assert!(
+            !production_prefix(combined_owner).contains("production_on_selected_local_egress"),
+            "an owner containing a generic WebSocket must not claim selected egress"
+        );
+    }
+    assert!(
+        CONFIG
+            .contains("pub(crate) fn production_on_selected_local_egress(\n        origin: &str,")
+    );
+    assert!(!production_prefix(PUBLIC_CONNECTIVITY).contains("selected_local_egress"));
+    for (consumer, purpose) in [
+        (READ_AUTHORITY, "loopback external read owner"),
+        (LOOPBACK_MUTATION_CREDENTIALS, "loopback mutation authority"),
+    ] {
+        assert!(consumer.contains(
+            "http_config.mode() != OriginMode::LocalEvidence || user_ws_config.is_production()"
+        ));
+        assert!(consumer.contains(purpose));
+    }
+    assert!(!LIB.contains("pub use reap_polymarket_egress_binding"));
+    for transport_test in [HTTP_TRANSPORT, PRIVATE_HTTP] {
+        for required in [
+            "TcpListener::bind(\"0.0.0.0:0\")",
+            "\"127.0.0.2\"",
+            "peer_ip",
+            "\"missing0\"",
+        ] {
+            assert!(
+                transport_test.contains(required),
+                "selected socket test does not prove {required}"
+            );
+        }
     }
 }
 
@@ -90,6 +220,7 @@ fn modules_are_separate_and_raw_transport_remains_private() {
         "mod account;",
         "mod user_ws;",
         "mod user_ws_config;",
+        "mod ws_transport;",
     ] {
         assert!(LIB.contains(module), "missing private module: {module}");
     }
@@ -1095,7 +1226,11 @@ fn account_only_facade_releases_no_websocket_reconciliation_or_mutation_role() {
 
 #[test]
 fn read_only_evidence_feature_cannot_enable_mutation_constructors() {
-    assert!(MANIFEST.contains("read-only-evidence = []"));
+    assert!(
+        MANIFEST.contains(
+            "read-only-evidence = [\"reap-polymarket-egress-binding/loopback-evidence\"]"
+        )
+    );
     assert!(!MANIFEST.contains("read-only-evidence = [\"loopback-evidence\"]"));
     for source in [CONFIG, USER_WS_CONFIG, READ_ONLY_PRIVATE] {
         assert!(source.contains("feature = \"read-only-evidence\""));
@@ -1118,12 +1253,92 @@ fn websocket_socket_workers_are_abort_on_outer_drop_and_explicitly_joined() {
     for source in [PUBLIC_WS, USER_WS] {
         assert!(source.contains("AbortOnDropTask::new(tokio::spawn"));
         assert!(source.contains("worker.abort_and_join().await"));
-        assert!(source.contains("worker\n            .join()\n            .await"));
+        assert!(source.contains("worker\n        .join()\n        .await"));
         assert!(!source.contains("let worker = tokio::spawn"));
     }
     assert!(TASK_GUARD.contains("impl<T> Drop for AbortOnDropTask<T>"));
     assert!(TASK_GUARD.contains("task.abort()"));
     assert!(TASK_GUARD.contains("pub(crate) async fn join(mut self)"));
+}
+
+#[test]
+fn websocket_dial_strategy_is_private_default_preserving_and_selected_only_in_tests() {
+    assert!(LIB.contains("mod ws_transport;"));
+    assert!(!LIB.contains("pub mod ws_transport;"));
+    assert!(!LIB.contains("pub use ws_transport"));
+    assert!(!LIB.contains("PmWsDialStrategy"));
+    assert!(!LIB.contains("PmWsSocket"));
+    for required in [
+        "pub(crate) trait PmWsDialStrategy",
+        "pub(crate) struct PmDefaultWsDialer",
+        "connect_async_with_config(request.endpoint, Some(request.websocket_config), true)",
+        "pub(crate) struct PmTestSelectedLoopbackWsDialer",
+        "TcpSocket::new_v4()",
+        "TcpSocket::new_v6()",
+        ".bind(SocketAddr::new(self.local_source_ip, 0))",
+        ".connect(self.peer)",
+        "client_async_tls_with_config(",
+        "thread_confinement: Rc<()>",
+    ] {
+        assert!(
+            WS_TRANSPORT.contains(required),
+            "missing private WebSocket dial invariant: {required}"
+        );
+    }
+    assert_eq!(
+        WS_TRANSPORT.matches("connect_async_with_config(").count(),
+        1
+    );
+    assert!(!PUBLIC_WS.contains("connect_async_with_config("));
+    assert!(!USER_WS.contains("connect_async_with_config("));
+    for (source, test_impl) in [
+        (PUBLIC_WS, "#[cfg(test)]\nimpl PmPublicMarketWsRole"),
+        (USER_WS, "#[cfg(test)]\nimpl PmAuthenticatedUserWsRole"),
+    ] {
+        let default_run = between(
+            source,
+            "pub async fn run<S>(",
+            "\n}\n\nasync fn serve_worker_events",
+        );
+        assert!(default_run.contains("AbortOnDropTask::new(tokio::spawn"));
+        assert!(default_run.contains("PmDefaultWsDialer"));
+        assert!(!default_run.contains("spawn_local"));
+        assert!(source.contains("AbortOnDropTask::new(tokio::spawn"));
+        assert!(source.contains("PmDefaultWsDialer"));
+        assert!(source.contains(test_impl));
+        assert!(source.contains("async fn run_with_test_selected_loopback"));
+        assert!(source.contains("tokio::task::spawn_local(run_worker("));
+    }
+    assert!(
+        WS_TRANSPORT.contains("#[cfg(test)]\npub(crate) struct PmTestSelectedLoopbackWsDialer")
+    );
+    assert!(!WS_TRANSPORT.contains("pub struct PmTestSelectedLoopbackWsDialer"));
+    for forbidden in [
+        "pub fn socket(",
+        "pub fn client(",
+        "pub fn endpoint(",
+        "pub fn send(",
+        "production_on_selected",
+        "PmProductionSelected",
+        "AuthenticatedPlaceRequest",
+        "PmRetainedPlaceRequest",
+        "authenticate_place",
+        "authenticate_owned_cancel",
+        "POST /order",
+        "DELETE /order",
+    ] {
+        assert!(
+            !WS_TRANSPORT.contains(forbidden),
+            "private WebSocket dial seam gained forbidden production/capability surface: {forbidden}"
+        );
+    }
+    assert!(
+        PUBLIC_WS
+            .contains("selected_loopback_dialer_preserves_public_worker_protocol_across_reconnect")
+    );
+    assert!(
+        USER_WS.contains("selected_loopback_dialer_preserves_user_worker_protocol_on_local_set")
+    );
 }
 
 #[test]

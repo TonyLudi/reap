@@ -1,6 +1,6 @@
 use std::{
     io::{Read, Write},
-    net::TcpListener,
+    net::{IpAddr, TcpListener},
     sync::{Arc, Mutex},
     thread,
     time::Duration,
@@ -10,6 +10,7 @@ use reap_pm_core::{
     EvmAddress, PmAccountHandle, PmAccountScope, PmChainId, PmEnvironmentId, PmFunderId,
     PmSignerId, U256,
 };
+use reap_polymarket_egress_binding::PmLocalEgressSelection;
 
 use super::*;
 use crate::{PmPolygonExchangeSpender, PmPolygonSystemClockObservation};
@@ -44,6 +45,7 @@ impl MockReply {
 struct RecordedRequest {
     head: String,
     body: String,
+    peer_ip: IpAddr,
 }
 
 struct MockServer {
@@ -54,17 +56,18 @@ struct MockServer {
 
 impl MockServer {
     fn spawn(replies: Vec<MockReply>) -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let listener = TcpListener::bind(("0.0.0.0", 0)).unwrap();
         let address = listener.local_addr().unwrap();
+        let origin = format!("http://127.0.0.1:{}/", address.port());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let worker_requests = Arc::clone(&requests);
         let worker = thread::spawn(move || {
             for reply in replies {
-                let (mut stream, _) = listener.accept().unwrap();
+                let (mut stream, peer) = listener.accept().unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
-                let request = read_request(&mut stream);
+                let request = read_request(&mut stream, peer.ip());
                 worker_requests.lock().unwrap().push(request);
                 if !reply.delay.is_zero() {
                     thread::sleep(reply.delay);
@@ -78,7 +81,7 @@ impl MockServer {
             }
         });
         Self {
-            origin: format!("http://{address}/"),
+            origin,
             requests,
             worker,
         }
@@ -93,7 +96,7 @@ impl MockServer {
     }
 }
 
-fn read_request(stream: &mut std::net::TcpStream) -> RecordedRequest {
+fn read_request(stream: &mut std::net::TcpStream, peer_ip: IpAddr) -> RecordedRequest {
     let mut bytes = Vec::new();
     let header_end = loop {
         if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
@@ -127,6 +130,7 @@ fn read_request(stream: &mut std::net::TcpStream) -> RecordedRequest {
         body: std::str::from_utf8(&bytes[header_end..header_end + content_length])
             .unwrap()
             .to_string(),
+        peer_ip,
     }
 }
 
@@ -197,6 +201,23 @@ fn loopback_source(
         origin,
         PmPolygonSystemClockObservation::for_loopback_evidence(timestamp),
         timeout,
+    )
+    .unwrap()
+}
+
+#[cfg(target_os = "linux")]
+fn selected_loopback_source(
+    origin: &str,
+    timestamp: u64,
+    timeout: Duration,
+) -> PmPolygonAuthorizationSource {
+    let selection =
+        PmLocalEgressSelection::loopback_evidence("lo", "127.0.0.2".parse().unwrap()).unwrap();
+    PmPolygonAuthorizationSource::loopback_evidence_on_selected_local_egress(
+        origin,
+        PmPolygonSystemClockObservation::for_loopback_evidence(timestamp),
+        timeout,
+        &selection,
     )
     .unwrap()
 }
@@ -273,6 +294,64 @@ async fn exact_five_request_bodies_produce_one_bound_cut() {
         assert!(!lower.contains("authorization:"));
         assert!(!lower.contains("proxy-authorization:"));
     }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn selected_loopback_interface_and_source_ip_preserve_the_exact_fixed_cut() {
+    let server = MockServer::spawn(successful_replies());
+    let source =
+        selected_loopback_source(&server.origin, BLOCK_TIMESTAMP + 10, Duration::from_secs(1));
+    let cut = source
+        .finalized_authorization_cut(proxy_scope(PmPolygonExchangeSpender::StandardV2))
+        .await
+        .unwrap();
+
+    assert_eq!(cut.block().number(), 0x1234);
+    let requests = server.finish();
+    assert_eq!(requests.len(), 5);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.peer_ip == "127.0.0.2".parse::<IpAddr>().unwrap())
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn selected_production_constructor_changes_no_fixed_source_authority() {
+    let selection =
+        PmLocalEgressSelection::production("pm-tunnel0", "192.0.2.10".parse().unwrap()).unwrap();
+    assert!(!selection.production_order_entry_authorized());
+    PmPolygonAuthorizationSource::production_on_selected_local_egress(&selection)
+        .expect("client construction does not perform network I/O");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn selected_production_and_loopback_modes_cannot_cross_source_constructors() {
+    let production =
+        PmLocalEgressSelection::production("pm0", "192.0.2.10".parse().unwrap()).unwrap();
+    assert!(matches!(
+        PmPolygonAuthorizationSource::loopback_evidence_on_selected_local_egress(
+            "http://127.0.0.1:9/",
+            PmPolygonSystemClockObservation::for_loopback_evidence(BLOCK_TIMESTAMP),
+            Duration::from_millis(100),
+            &production,
+        ),
+        Err(PmPolygonChainSourceError::LocalEgressSelection(
+            reap_polymarket_egress_binding::PmLocalEgressSelectionError::LoopbackEvidenceSelectionRequired
+        ))
+    ));
+
+    let loopback =
+        PmLocalEgressSelection::loopback_evidence("lo", "127.0.0.2".parse().unwrap()).unwrap();
+    assert!(matches!(
+        PmPolygonAuthorizationSource::production_on_selected_local_egress(&loopback),
+        Err(PmPolygonChainSourceError::LocalEgressSelection(
+            reap_polymarket_egress_binding::PmLocalEgressSelectionError::ProductionSelectionRequired
+        ))
+    ));
 }
 
 #[tokio::test]

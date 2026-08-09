@@ -153,6 +153,7 @@ impl PmPrivateHttpTransport {
             config.request_timeout(),
             config.mode(),
             configured_address,
+            config.selected_local_egress(),
         )
     }
 
@@ -166,6 +167,7 @@ impl PmPrivateHttpTransport {
             config.request_timeout(),
             config.mode(),
             configured_address,
+            config.selected_local_egress(),
         )
     }
 
@@ -175,6 +177,7 @@ impl PmPrivateHttpTransport {
         request_timeout: std::time::Duration,
         mode: OriginMode,
         configured_address: EoaAddress,
+        selected_local_egress: Option<&reap_polymarket_egress_binding::PmLocalEgressSelection>,
     ) -> Result<Self, PmLiveAdapterError> {
         let mut builder = Client::builder()
             .connect_timeout(connect_timeout)
@@ -184,6 +187,21 @@ impl PmPrivateHttpTransport {
             .no_proxy();
         if mode == OriginMode::Production {
             builder = builder.https_only(true);
+        }
+        if let Some(selected_local_egress) = selected_local_egress {
+            #[cfg(target_os = "linux")]
+            {
+                builder = builder
+                    .interface(selected_local_egress.interface_name())
+                    .local_address(selected_local_egress.local_source_ip());
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = selected_local_egress;
+                return Err(PmLiveAdapterError::InvalidConfiguration(
+                    "selected local egress requires Linux",
+                ));
+            }
         }
         let client = builder
             .build()
@@ -639,17 +657,18 @@ fn map_body_error(error: reqwest::Error) -> PmLiveAdapterError {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{net::IpAddr, time::Duration};
 
     use reap_pm_core::{PmConditionId, PmMarketId, PmTokenId, U256};
     use reap_polymarket_auth::{L2CredentialInput, L2Credentials};
+    use reap_polymarket_egress_binding::PmLocalEgressSelection;
     use reap_polymarket_wire::PmWireScope;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
         sync::mpsc,
         task::JoinHandle,
-        time::sleep,
+        time::{sleep, timeout},
     };
     use zeroize::Zeroize;
 
@@ -754,6 +773,37 @@ mod tests {
         (format!("http://{address}"), requests_rx, task)
     }
 
+    async fn selected_one_response_server(
+        body: &'static [u8],
+    ) -> (String, JoinHandle<(IpAddr, String)>) {
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let (mut stream, peer) = listener.accept().await.unwrap();
+            let mut raw = Vec::new();
+            let mut chunk = [0_u8; 1_024];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&chunk[..read]);
+                if raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8(raw).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+            (peer.ip(), request)
+        });
+        (format!("http://127.0.0.1:{port}"), task)
+    }
+
     fn scope() -> PmWireScope {
         PmWireScope::new(
             PmConditionId::parse(CONDITION).unwrap(),
@@ -786,6 +836,28 @@ mod tests {
             Duration::from_millis(100),
             request_timeout,
             scope(),
+        )
+        .unwrap();
+        crate::PmAuthenticatedHttpOwner::new(config, credentials()).unwrap()
+    }
+
+    fn selected_local_owner(
+        origin: &str,
+        request_timeout: Duration,
+        interface_name: &str,
+    ) -> (
+        crate::PmAuthenticatedHttpOwner,
+        crate::PmCredentialAuthoritySupervisor,
+    ) {
+        let selection =
+            PmLocalEgressSelection::loopback_evidence(interface_name, "127.0.0.2".parse().unwrap())
+                .unwrap();
+        let config = PmPrivateHttpConfig::local_evidence_on_selected_local_egress(
+            origin,
+            Duration::from_millis(100),
+            request_timeout,
+            scope(),
+            selection,
         )
         .unwrap();
         crate::PmAuthenticatedHttpOwner::new(config, credentials()).unwrap()
@@ -1093,6 +1165,36 @@ mod tests {
 
         task.await.unwrap();
         assert!(requests.try_recv().is_err());
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn selected_private_client_uses_the_nondefault_loopback_source_ip() {
+        let (origin, server) = selected_one_response_server(br#"{"closed_only":false}"#).await;
+        let (mut owner, supervisor) = selected_local_owner(&origin, Duration::from_secs(1), "lo");
+        let status = owner.preflight().closed_only(timestamp()).await.unwrap();
+        assert!(!status.closed_only());
+        let (peer_ip, request) = server.await.unwrap();
+        assert_eq!(peer_ip, "127.0.0.2".parse::<IpAddr>().unwrap());
+        assert!(request.starts_with("GET /auth/ban-status/closed-only HTTP/1.1\r\n"));
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn nonexistent_private_selected_interface_fails_before_a_request_arrives() {
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let origin = format!("http://127.0.0.1:{port}");
+        let (mut owner, supervisor) =
+            selected_local_owner(&origin, Duration::from_millis(100), "missing0");
+        assert!(owner.preflight().closed_only(timestamp()).await.is_err());
+        assert!(
+            timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
         supervisor.shutdown().await.unwrap();
     }
 

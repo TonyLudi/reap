@@ -1689,6 +1689,7 @@ name = "reap-polymarket-chain-source"
 version = "0.1.0"
 dependencies = [
  "reap-pm-core",
+ "reap-polymarket-egress-binding",
  "reqwest",
  "serde",
  "serde_json",
@@ -1700,6 +1701,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "reap-polymarket-egress-binding"
+version = "0.1.0"
+
+[[package]]
 name = "reap-polymarket-live-adapter"
 version = "0.1.0"
 dependencies = [
@@ -1708,6 +1713,7 @@ dependencies = [
  "reap-pm-core",
  "reap-polymarket-adapter",
  "reap-polymarket-auth",
+ "reap-polymarket-egress-binding",
  "reap-polymarket-wire",
  "reap-transport",
  "reqwest",
@@ -1728,6 +1734,7 @@ name = "reap-polymarket-public-source"
 version = "0.1.0"
 dependencies = [
  "reap-pm-core",
+ "reap-polymarket-egress-binding",
  "reqwest",
  "serde",
  "serde_json",

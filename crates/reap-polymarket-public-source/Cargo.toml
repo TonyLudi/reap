@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 reap-pm-core.workspace = true
+reap-polymarket-egress-binding.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -12,5 +13,6 @@ sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+reap-polymarket-egress-binding = { workspace = true, features = ["loopback-evidence"] }
 tokio.workspace = true
 trybuild.workspace = true

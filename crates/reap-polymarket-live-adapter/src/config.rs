@@ -3,6 +3,7 @@ use std::time::Duration;
 #[cfg(any(test, feature = "loopback-evidence", feature = "read-only-evidence"))]
 use std::net::IpAddr;
 
+use reap_polymarket_egress_binding::PmLocalEgressSelection;
 use reap_polymarket_wire::PmWireScope;
 use url::Url;
 
@@ -26,6 +27,7 @@ pub struct PmPublicHttpConfig {
     connect_timeout: Duration,
     request_timeout: Duration,
     mode: OriginMode,
+    selected_local_egress: Option<PmLocalEgressSelection>,
 }
 
 /// Fixed public-safety endpoint configuration. Production construction has no
@@ -36,6 +38,7 @@ pub struct PmGeoblockHttpConfig {
     connect_timeout: Duration,
     request_timeout: Duration,
     mode: OriginMode,
+    selected_local_egress: Option<PmLocalEgressSelection>,
 }
 
 /// Crate-private configuration for the fixed Polymarket status-page source.
@@ -46,6 +49,7 @@ pub(crate) struct PmStatusHttpConfig {
     connect_timeout: Duration,
     request_timeout: Duration,
     mode: OriginMode,
+    selected_local_egress: Option<PmLocalEgressSelection>,
 }
 
 impl PmStatusHttpConfig {
@@ -61,7 +65,19 @@ impl PmStatusHttpConfig {
             connect_timeout,
             request_timeout,
             mode: OriginMode::Production,
+            selected_local_egress: None,
         })
+    }
+
+    pub(crate) fn production_on_selected_local_egress(
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        selected_local_egress: PmLocalEgressSelection,
+    ) -> Result<Self, PmLiveAdapterError> {
+        require_production_local_egress(&selected_local_egress)?;
+        let mut config = Self::production(connect_timeout, request_timeout)?;
+        config.selected_local_egress = Some(selected_local_egress);
+        Ok(config)
     }
 
     #[cfg(any(test, feature = "read-only-evidence"))]
@@ -76,7 +92,21 @@ impl PmStatusHttpConfig {
             connect_timeout,
             request_timeout,
             mode: OriginMode::LocalEvidence,
+            selected_local_egress: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_evidence_on_selected_local_egress(
+        origin: &str,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        selected_local_egress: PmLocalEgressSelection,
+    ) -> Result<Self, PmLiveAdapterError> {
+        require_loopback_local_egress(&selected_local_egress)?;
+        let mut config = Self::local_evidence(origin, connect_timeout, request_timeout)?;
+        config.selected_local_egress = Some(selected_local_egress);
+        Ok(config)
     }
 
     pub(crate) fn origin(&self) -> &Url {
@@ -94,6 +124,10 @@ impl PmStatusHttpConfig {
     pub(crate) const fn mode(&self) -> OriginMode {
         self.mode
     }
+
+    pub(crate) const fn selected_local_egress(&self) -> Option<&PmLocalEgressSelection> {
+        self.selected_local_egress.as_ref()
+    }
 }
 
 impl PmGeoblockHttpConfig {
@@ -109,7 +143,19 @@ impl PmGeoblockHttpConfig {
             connect_timeout,
             request_timeout,
             mode: OriginMode::Production,
+            selected_local_egress: None,
         })
+    }
+
+    pub fn production_on_selected_local_egress(
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        selected_local_egress: PmLocalEgressSelection,
+    ) -> Result<Self, PmLiveAdapterError> {
+        require_production_local_egress(&selected_local_egress)?;
+        let mut config = Self::production(connect_timeout, request_timeout)?;
+        config.selected_local_egress = Some(selected_local_egress);
+        Ok(config)
     }
 
     #[cfg(any(test, feature = "read-only-evidence"))]
@@ -133,7 +179,21 @@ impl PmGeoblockHttpConfig {
             connect_timeout,
             request_timeout,
             mode: OriginMode::LocalEvidence,
+            selected_local_egress: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_evidence_on_selected_local_egress(
+        origin: &str,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        selected_local_egress: PmLocalEgressSelection,
+    ) -> Result<Self, PmLiveAdapterError> {
+        require_loopback_local_egress(&selected_local_egress)?;
+        let mut config = Self::local_evidence(origin, connect_timeout, request_timeout)?;
+        config.selected_local_egress = Some(selected_local_egress);
+        Ok(config)
     }
 
     pub(crate) fn origin(&self) -> &Url {
@@ -150,6 +210,10 @@ impl PmGeoblockHttpConfig {
 
     pub(crate) const fn mode(&self) -> OriginMode {
         self.mode
+    }
+
+    pub(crate) const fn selected_local_egress(&self) -> Option<&PmLocalEgressSelection> {
+        self.selected_local_egress.as_ref()
     }
 
     #[must_use]
@@ -170,6 +234,7 @@ pub struct PmPrivateHttpConfig {
     request_timeout: Duration,
     exact_order_scope: PmWireScope,
     mode: OriginMode,
+    selected_local_egress: Option<PmLocalEgressSelection>,
 }
 
 impl PmPrivateHttpConfig {
@@ -186,7 +251,20 @@ impl PmPrivateHttpConfig {
             request_timeout,
             exact_order_scope,
             mode: OriginMode::Production,
+            selected_local_egress: None,
         })
+    }
+
+    pub fn production_on_selected_local_egress(
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        exact_order_scope: PmWireScope,
+        selected_local_egress: PmLocalEgressSelection,
+    ) -> Result<Self, PmLiveAdapterError> {
+        require_production_local_egress(&selected_local_egress)?;
+        let mut config = Self::production(connect_timeout, request_timeout, exact_order_scope)?;
+        config.selected_local_egress = Some(selected_local_egress);
+        Ok(config)
     }
 
     #[cfg(any(test, feature = "loopback-evidence"))]
@@ -224,6 +302,7 @@ impl PmPrivateHttpConfig {
             request_timeout,
             exact_order_scope,
             mode: OriginMode::LocalEvidence,
+            selected_local_egress: None,
         })
     }
 
@@ -235,6 +314,21 @@ impl PmPrivateHttpConfig {
         exact_order_scope: PmWireScope,
     ) -> Result<Self, PmLiveAdapterError> {
         Self::local_read_config(origin, connect_timeout, request_timeout, exact_order_scope)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_evidence_on_selected_local_egress(
+        origin: &str,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        exact_order_scope: PmWireScope,
+        selected_local_egress: PmLocalEgressSelection,
+    ) -> Result<Self, PmLiveAdapterError> {
+        require_loopback_local_egress(&selected_local_egress)?;
+        let mut config =
+            Self::local_evidence(origin, connect_timeout, request_timeout, exact_order_scope)?;
+        config.selected_local_egress = Some(selected_local_egress);
+        Ok(config)
     }
 
     #[must_use]
@@ -262,6 +356,10 @@ impl PmPrivateHttpConfig {
     pub(crate) const fn mode(&self) -> OriginMode {
         self.mode
     }
+
+    pub(crate) const fn selected_local_egress(&self) -> Option<&PmLocalEgressSelection> {
+        self.selected_local_egress.as_ref()
+    }
 }
 
 impl PmPublicHttpConfig {
@@ -277,7 +375,20 @@ impl PmPublicHttpConfig {
             connect_timeout,
             request_timeout,
             mode: OriginMode::Production,
+            selected_local_egress: None,
         })
+    }
+
+    pub(crate) fn production_on_selected_local_egress(
+        origin: &str,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        selected_local_egress: PmLocalEgressSelection,
+    ) -> Result<Self, PmLiveAdapterError> {
+        require_production_local_egress(&selected_local_egress)?;
+        let mut config = Self::production(origin, connect_timeout, request_timeout)?;
+        config.selected_local_egress = Some(selected_local_egress);
+        Ok(config)
     }
 
     #[cfg(any(test, feature = "loopback-evidence"))]
@@ -311,6 +422,7 @@ impl PmPublicHttpConfig {
             connect_timeout,
             request_timeout,
             mode: OriginMode::LocalEvidence,
+            selected_local_egress: None,
         })
     }
 
@@ -321,6 +433,19 @@ impl PmPublicHttpConfig {
         request_timeout: Duration,
     ) -> Result<Self, PmLiveAdapterError> {
         Self::local_read_config(origin, connect_timeout, request_timeout)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_evidence_on_selected_local_egress(
+        origin: &str,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        selected_local_egress: PmLocalEgressSelection,
+    ) -> Result<Self, PmLiveAdapterError> {
+        require_loopback_local_egress(&selected_local_egress)?;
+        let mut config = Self::local_evidence(origin, connect_timeout, request_timeout)?;
+        config.selected_local_egress = Some(selected_local_egress);
+        Ok(config)
     }
 
     #[must_use]
@@ -345,6 +470,33 @@ impl PmPublicHttpConfig {
     pub(crate) const fn mode(&self) -> OriginMode {
         self.mode
     }
+
+    pub(crate) const fn selected_local_egress(&self) -> Option<&PmLocalEgressSelection> {
+        self.selected_local_egress.as_ref()
+    }
+}
+
+fn require_production_local_egress(
+    selected_local_egress: &PmLocalEgressSelection,
+) -> Result<(), PmLiveAdapterError> {
+    selected_local_egress.require_production().map_err(|_| {
+        PmLiveAdapterError::InvalidConfiguration(
+            "production HTTP requires a production local-egress selection",
+        )
+    })
+}
+
+#[cfg(test)]
+fn require_loopback_local_egress(
+    selected_local_egress: &PmLocalEgressSelection,
+) -> Result<(), PmLiveAdapterError> {
+    selected_local_egress
+        .require_loopback_evidence()
+        .map_err(|_| {
+            PmLiveAdapterError::InvalidConfiguration(
+                "loopback HTTP evidence requires a loopback local-egress selection",
+            )
+        })
 }
 
 fn validate_timeouts(
@@ -485,6 +637,115 @@ mod tests {
             PmStatusHttpConfig::production(CONNECT, REQUEST).expect("official status origin");
         assert_eq!(config.origin().as_str(), "https://status.polymarket.com/");
         assert_eq!(config.mode(), OriginMode::Production);
+    }
+
+    #[test]
+    fn selected_production_configs_retain_only_the_validated_local_selection() {
+        let selection = PmLocalEgressSelection::production(
+            "pm-tunnel0",
+            "192.0.2.10".parse().expect("test IP"),
+        )
+        .expect("valid local selection");
+        let public = PmPublicHttpConfig::production_on_selected_local_egress(
+            PM_CLOB_PRODUCTION_ORIGIN,
+            CONNECT,
+            REQUEST,
+            selection.clone(),
+        )
+        .expect("selected public config");
+        let geoblock = PmGeoblockHttpConfig::production_on_selected_local_egress(
+            CONNECT,
+            REQUEST,
+            selection.clone(),
+        )
+        .expect("selected geoblock config");
+        let status = PmStatusHttpConfig::production_on_selected_local_egress(
+            CONNECT,
+            REQUEST,
+            selection.clone(),
+        )
+        .expect("selected status config");
+
+        for retained in [
+            public.selected_local_egress(),
+            geoblock.selected_local_egress(),
+            status.selected_local_egress(),
+        ] {
+            let retained = retained.expect("selected config retains binding");
+            assert_eq!(retained.interface_name(), "pm-tunnel0");
+            assert_eq!(retained.local_source_ip(), selection.local_source_ip());
+            assert!(!retained.production_order_entry_authorized());
+        }
+        assert!(
+            PmPublicHttpConfig::production(PM_CLOB_PRODUCTION_ORIGIN, CONNECT, REQUEST)
+                .unwrap()
+                .selected_local_egress()
+                .is_none()
+        );
+
+        let loopback = PmLocalEgressSelection::loopback_evidence(
+            "lo",
+            "127.0.0.2".parse().expect("test loopback IP"),
+        )
+        .expect("loopback selection");
+        let local_geoblock = PmGeoblockHttpConfig::local_evidence_on_selected_local_egress(
+            "http://127.0.0.1:18080",
+            CONNECT,
+            REQUEST,
+            loopback.clone(),
+        )
+        .expect("selected loopback geoblock config");
+        let local_status = PmStatusHttpConfig::local_evidence_on_selected_local_egress(
+            "http://127.0.0.1:18080",
+            CONNECT,
+            REQUEST,
+            loopback.clone(),
+        )
+        .expect("selected loopback status config");
+        assert_eq!(
+            local_geoblock
+                .selected_local_egress()
+                .unwrap()
+                .local_source_ip(),
+            "127.0.0.2".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            local_status
+                .selected_local_egress()
+                .unwrap()
+                .local_source_ip(),
+            "127.0.0.2".parse::<IpAddr>().unwrap()
+        );
+        assert!(
+            PmPublicHttpConfig::production_on_selected_local_egress(
+                PM_CLOB_PRODUCTION_ORIGIN,
+                CONNECT,
+                REQUEST,
+                loopback.clone(),
+            )
+            .is_err()
+        );
+        assert!(
+            PmGeoblockHttpConfig::production_on_selected_local_egress(
+                CONNECT,
+                REQUEST,
+                loopback.clone(),
+            )
+            .is_err()
+        );
+        assert!(
+            PmStatusHttpConfig::production_on_selected_local_egress(CONNECT, REQUEST, loopback,)
+                .is_err()
+        );
+        assert!(
+            PmPublicHttpConfig::local_evidence_on_selected_local_egress(
+                "http://127.0.0.1:18080",
+                CONNECT,
+                REQUEST,
+                selection,
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -220,6 +220,10 @@ fn origin_transport_and_clock_policy_cannot_be_widened_silently() {
     );
     assert!(source.contains("pub fn production()"));
     assert_eq!(source.matches("pub fn production()").count(), 1);
+    assert!(source.contains("pub fn production_on_selected_local_egress("));
+    assert!(source.contains("local_egress: &PmLocalEgressSelection"));
+    assert!(source.contains("local_egress.require_production()?;"));
+    assert!(source.contains("local_egress.require_loopback_evidence()?;"));
     assert!(source.contains("#[cfg(any(test, feature = \"loopback-evidence\"))]"));
     assert!(source.contains("pub fn loopback_evidence("));
     assert!(source.contains("Host::Ipv4"));
@@ -228,11 +232,50 @@ fn origin_transport_and_clock_policy_cannot_be_widened_silently() {
     assert!(source.contains(".redirect(Policy::none())"));
     assert!(source.contains(".retry(reqwest::retry::never())"));
     assert!(source.contains(".no_proxy()"));
+    assert!(source.contains(".interface(local_egress.interface_name())"));
+    assert!(source.contains(".local_address(local_egress.local_source_ip())"));
+    assert!(source.contains("#[cfg(target_os = \"linux\")]"));
+    assert!(source.contains("SelectedLocalEgressUnsupported"));
     assert!(source.contains("builder.https_only(true)"));
     assert!(source.contains("MAX_JSON_RPC_RESPONSE_BYTES"));
     assert!(source.contains("ClockSource::System"));
     assert!(source.contains("MAX_FINALIZED_BLOCK_AGE_SECONDS: u64 = 30"));
     assert!(source.contains("MAX_FINALIZED_BLOCK_FUTURE_SECONDS: u64 = 5"));
+}
+
+#[test]
+fn selected_local_egress_is_configuration_only_and_preserves_the_fixed_rpc_surface() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    let source = std::fs::read_to_string(root.join("src/source.rs")).unwrap();
+    assert!(manifest.contains("reap-polymarket-egress-binding.workspace = true"));
+    for required in [
+        "Self::production_with_local_egress(None)",
+        "Self::production_with_local_egress(Some(local_egress))",
+        "local_egress.require_production()?;",
+        "local_egress.require_loopback_evidence()?;",
+        "PmPolygonRpcTransport::build(",
+        ".interface(local_egress.interface_name())",
+        ".local_address(local_egress.local_source_ip())",
+    ] {
+        assert!(
+            source.contains(required),
+            "missing selected source pin: {required}"
+        );
+    }
+    for forbidden in [
+        "pub fn client(",
+        "pub fn request(",
+        "pub fn post(",
+        "pub fn local_egress(",
+        "PmSelectedEgressGeoblockObservation",
+        "production_order_entry_authorized: true",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "selected egress escape: {forbidden}"
+        );
+    }
 }
 
 #[test]

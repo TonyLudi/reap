@@ -1,3 +1,4 @@
+use reap_polymarket_egress_binding::PmLocalEgressSelectionError;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -6,6 +7,10 @@ pub enum PmPublicPositionError {
     InvalidConfiguration,
     #[error("PM Data API HTTP transport could not be built")]
     TransportBuild,
+    #[error("selected local egress is supported only on Linux")]
+    SelectedLocalEgressUnsupported,
+    #[error(transparent)]
+    LocalEgressSelection(#[from] PmLocalEgressSelectionError),
     #[error("PM Data API position request timed out")]
     RequestTimeout,
     #[error("PM Data API position request failed")]

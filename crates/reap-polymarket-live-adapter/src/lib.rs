@@ -34,6 +34,7 @@ mod status_announcement_http;
 mod task_guard;
 mod user_ws;
 mod user_ws_config;
+mod ws_transport;
 
 pub use account::{
     PmAccountAsset, PmAccountBalanceAllowance, PmAccountBalanceAllowanceObservation,

@@ -5,8 +5,8 @@ edition.workspace = true
 
 [features]
 default = []
-loopback-evidence = []
-read-only-evidence = []
+loopback-evidence = ["reap-polymarket-egress-binding/loopback-evidence"]
+read-only-evidence = ["reap-polymarket-egress-binding/loopback-evidence"]
 test-support = []
 
 [dependencies]
@@ -15,6 +15,7 @@ futures-util.workspace = true
 reap-pm-core.workspace = true
 reap-polymarket-adapter.workspace = true
 reap-polymarket-auth.workspace = true
+reap-polymarket-egress-binding.workspace = true
 reap-polymarket-wire.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -28,5 +29,6 @@ url.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+reap-polymarket-egress-binding = { workspace = true, features = ["loopback-evidence"] }
 reap-transport.workspace = true
 trybuild.workspace = true

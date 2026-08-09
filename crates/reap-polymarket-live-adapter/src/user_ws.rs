@@ -13,18 +13,18 @@ use reap_polymarket_auth::{
 };
 use reap_polymarket_wire::{PmLiveUserEvent, parse_live_user_frame};
 use thiserror::Error;
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, sleep_until, timeout};
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async_with_config,
-    tungstenite::{Error as WebSocketError, Message, protocol::WebSocketConfig},
-};
+use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message, protocol::WebSocketConfig};
 use zeroize::Zeroizing;
 
 use crate::{
-    PmLiveAdapterError, PmUserWsConfig, read_authority::PmUserWsReadAuthorityProvider,
+    PmLiveAdapterError, PmUserWsConfig,
+    read_authority::PmUserWsReadAuthorityProvider,
     task_guard::AbortOnDropTask,
+    ws_transport::{
+        PmDefaultWsDialer, PmFixedWsRoute, PmWsDialRequest, PmWsDialStrategy, PmWsSocket,
+    },
 };
 
 const APPLICATION_PING: &str = "PING";
@@ -491,26 +491,38 @@ impl PmAuthenticatedUserWsRole {
         S: PmUserWsEventSink,
     {
         let (sender, mut receiver) = mpsc::channel(self.config.event_channel_capacity());
-        let mut worker = AbortOnDropTask::new(tokio::spawn(run_worker(
+        let worker = AbortOnDropTask::new(tokio::spawn(run_worker(
             self.config,
             self.credentials,
             self.clock,
             self.activity,
             shutdown.receiver,
             sender,
+            PmDefaultWsDialer,
         )));
-        while let Some(event) = receiver.recv().await {
-            if let Err(error) = sink.deliver_user_ws_event(event).await {
-                let _ = worker.abort_and_join().await;
-                return Err(PmUserWsRunError::Sink(error));
-            }
-        }
-        worker
-            .join()
-            .await
-            .map_err(|_| PmUserWsTransportError::WorkerFailed)??;
-        Ok(())
+        serve_worker_events(worker, &mut receiver, sink).await
     }
+}
+
+async fn serve_worker_events<S>(
+    mut worker: AbortOnDropTask<Result<(), PmUserWsTransportError>>,
+    receiver: &mut mpsc::Receiver<PmUserWsEvent>,
+    sink: &mut S,
+) -> Result<(), PmUserWsRunError<S::Error>>
+where
+    S: PmUserWsEventSink,
+{
+    while let Some(event) = receiver.recv().await {
+        if let Err(error) = sink.deliver_user_ws_event(event).await {
+            let _ = worker.abort_and_join().await;
+            return Err(PmUserWsRunError::Sink(error));
+        }
+    }
+    worker
+        .join()
+        .await
+        .map_err(|_| PmUserWsTransportError::WorkerFailed)??;
+    Ok(())
 }
 
 impl fmt::Debug for PmAuthenticatedUserWsRole {
@@ -523,14 +535,18 @@ impl fmt::Debug for PmAuthenticatedUserWsRole {
     }
 }
 
-async fn run_worker(
+async fn run_worker<D>(
     config: PmUserWsConfig,
     mut credentials: Box<dyn PmUserWsReadAuthorityProvider>,
     mut clock: Box<dyn PmUserWsClockSource>,
     activity: PmUserWsActivityView,
     mut shutdown: watch::Receiver<bool>,
     events: mpsc::Sender<PmUserWsEvent>,
-) -> Result<(), PmUserWsTransportError> {
+    mut dialer: D,
+) -> Result<(), PmUserWsTransportError>
+where
+    D: PmWsDialStrategy,
+{
     let mut epoch = config.initial_connection_epoch();
     let mut reconnects = 0_u8;
     loop {
@@ -544,8 +560,11 @@ async fn run_worker(
             connection,
             clock.as_mut(),
             &activity,
-            &mut shutdown,
-            &events,
+            AttemptControl {
+                shutdown: &mut shutdown,
+                events: &events,
+            },
+            &mut dialer,
         )
         .await?;
         let retired = match outcome {
@@ -602,23 +621,35 @@ enum AttemptOutcome {
     Retired(PmUserWsRetirement),
 }
 
-async fn run_attempt(
+struct AttemptControl<'a> {
+    shutdown: &'a mut watch::Receiver<bool>,
+    events: &'a mpsc::Sender<PmUserWsEvent>,
+}
+
+async fn run_attempt<D>(
     config: &PmUserWsConfig,
     credentials: &mut dyn PmUserWsReadAuthorityProvider,
     connection: PmUserWsConnection,
     clock: &mut dyn PmUserWsClockSource,
     activity: &PmUserWsActivityView,
-    shutdown: &mut watch::Receiver<bool>,
-    events: &mpsc::Sender<PmUserWsEvent>,
-) -> Result<AttemptOutcome, PmUserWsTransportError> {
+    control: AttemptControl<'_>,
+    dialer: &mut D,
+) -> Result<AttemptOutcome, PmUserWsTransportError>
+where
+    D: PmWsDialStrategy,
+{
+    let AttemptControl { shutdown, events } = control;
     let websocket_config = WebSocketConfig::default()
         .read_buffer_size(config.max_frame_bytes().clamp(1_024, 64 * 1_024))
         .write_buffer_size(1_024)
         .max_write_buffer_size(8 * 1_024)
         .max_message_size(Some(config.max_frame_bytes()))
         .max_frame_size(Some(config.max_frame_bytes()));
-    let connect =
-        connect_async_with_config(config.endpoint().as_str(), Some(websocket_config), true);
+    let connect = dialer.dial(PmWsDialRequest::new(
+        PmFixedWsRoute::AuthenticatedUser,
+        config.endpoint().as_str(),
+        websocket_config,
+    ));
     let socket = tokio::select! {
         () = wait_for_shutdown(shutdown) => {
             return Ok(AttemptOutcome::Shutdown(reserve_observation(activity, connection, clock)?));
@@ -626,7 +657,7 @@ async fn run_attempt(
         result = timeout(config.connect_timeout(), connect) => match result {
             Err(_) => return retired(activity, clock, connection, PmUserWsDisconnectReason::ConnectTimeout),
             Ok(Err(_)) => return retired(activity, clock, connection, PmUserWsDisconnectReason::ConnectFailed),
-            Ok(Ok((socket, _))) => socket,
+            Ok(Ok(socket)) => socket,
         },
     };
     let opened = reserve_observation(activity, connection, clock)?;
@@ -658,7 +689,7 @@ struct ConnectedContext<'a> {
 
 async fn run_connected(
     context: ConnectedContext<'_>,
-    mut socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    mut socket: PmWsSocket,
 ) -> Result<AttemptOutcome, PmUserWsTransportError> {
     let ConnectedContext {
         config,
@@ -901,6 +932,31 @@ fn classify_read_error(error: &WebSocketError) -> PmUserWsDisconnectReason {
     }
 }
 
+#[cfg(test)]
+impl PmAuthenticatedUserWsRole {
+    async fn run_with_test_selected_loopback<S>(
+        self,
+        shutdown: PmUserWsShutdownSignal,
+        sink: &mut S,
+        dialer: crate::ws_transport::PmTestSelectedLoopbackWsDialer,
+    ) -> Result<(), PmUserWsRunError<S::Error>>
+    where
+        S: PmUserWsEventSink,
+    {
+        let (sender, mut receiver) = mpsc::channel(self.config.event_channel_capacity());
+        let worker = AbortOnDropTask::new(tokio::task::spawn_local(run_worker(
+            self.config,
+            self.credentials,
+            self.clock,
+            self.activity,
+            shutdown.receiver,
+            sender,
+            dialer,
+        )));
+        serve_worker_events(worker, &mut receiver, sink).await
+    }
+}
+
 async fn emit(
     events: &mpsc::Sender<PmUserWsEvent>,
     event: PmUserWsEvent,
@@ -934,11 +990,14 @@ mod tests {
     use reap_polymarket_wire::PmWireScope;
     use tokio::net::TcpListener;
     use tokio::sync::Notify;
-    use tokio::task::JoinHandle;
-    use tokio_tungstenite::{accept_async, tungstenite::Message};
+    use tokio::task::{JoinHandle, LocalSet};
+    use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
     use super::*;
-    use crate::{PmPrivateConnectivityOwner, PmPrivateHttpConfig, PmUserWsConfig};
+    use crate::{
+        PmPrivateConnectivityOwner, PmPrivateHttpConfig, PmUserWsConfig,
+        ws_transport::PmTestSelectedLoopbackWsDialer,
+    };
 
     const ADDRESS: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
     const API_KEY: &str = "00000000-0000-4000-8000-000000000001";
@@ -1219,6 +1278,68 @@ mod tests {
         let text = message.into_text().unwrap();
         assert!(!text.contains("initial_dump"));
         assert!(!text.contains("operation"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn selected_loopback_dialer_preserves_user_worker_protocol_on_local_set() {
+        LocalSet::new()
+            .run_until(async {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::task::spawn_local(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut socket = accept_async(stream).await.unwrap();
+                    read_exact_subscription(&mut socket).await;
+                    while let Some(message) = socket.next().await {
+                        match message {
+                            Ok(Message::Close(_)) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                });
+
+                let endpoint = format!("ws://{address}/ws/user");
+                let (role, supervisor) = role(local_user_config(address, 0));
+                let dialer = PmTestSelectedLoopbackWsDialer::new(
+                    PmFixedWsRoute::AuthenticatedUser,
+                    &endpoint,
+                    address,
+                    address.ip(),
+                )
+                .unwrap();
+                let (shutdown, signal) = pm_user_ws_shutdown_channel();
+                let (sender, mut receiver) = mpsc::unbounded_channel();
+                let rendered = Arc::new(Mutex::new(Vec::new()));
+                let sink_rendered = Arc::clone(&rendered);
+                let generations = Arc::new(Mutex::new(Vec::new()));
+                let sink_generations = Arc::clone(&generations);
+                let task = tokio::task::spawn_local(async move {
+                    let mut sink = TestSink {
+                        sender,
+                        rendered: sink_rendered,
+                        generations: sink_generations,
+                    };
+                    role.run_with_test_selected_loopback(signal, &mut sink, dialer)
+                        .await
+                });
+
+                assert_eq!(next(&mut receiver).await, Seen::Open(5));
+                assert_eq!(next(&mut receiver).await, Seen::Subscription(5));
+                shutdown.request_shutdown();
+                assert_eq!(next(&mut receiver).await, Seen::Shutdown(5));
+                task.await.unwrap().unwrap();
+                supervisor.shutdown().await.unwrap();
+                server.await.unwrap();
+                assert_eq!(generations.lock().unwrap().as_slice(), [1, 2, 3]);
+                assert!(
+                    rendered
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|event| !event.contains(API_SECRET)),
+                );
+            })
+            .await;
     }
 
     #[tokio::test]

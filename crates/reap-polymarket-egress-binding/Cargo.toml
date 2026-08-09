@@ -1,0 +1,8 @@
+[package]
+name = "reap-polymarket-egress-binding"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+loopback-evidence = []
