@@ -25,6 +25,7 @@ fn dependency_surface_is_public_read_only_and_credential_free() {
         "reqwest.workspace = true",
         "serde.workspace = true",
         "serde_json.workspace = true",
+        "sha2.workspace = true",
     ] {
         assert!(
             MANIFEST.contains(required),
@@ -113,6 +114,8 @@ fn observation_language_and_authority_remain_narrow() {
     for required in [
         "PmMonitoredPositionObservation",
         "PmConfiguredTokenPosition",
+        "PmDataApiPositionObservationCommitment",
+        "PmDataApiReceiveClockObservation",
         "Absent",
         "Present(Box<PmDataApiPositionEvidence>)",
         "neither funder-wide inventory",
@@ -133,6 +136,38 @@ fn observation_language_and_authority_remain_narrow() {
         assert!(
             !POSITION.contains(forbidden),
             "false authority: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn provenance_is_source_computed_secret_free_and_non_authoritative() {
+    for required in [
+        "reap.polymarket.public-source.position-observation.v1\\0",
+        "PositionObservationCommitmentBuilder::new(",
+        "commitment.observe_page(offset, &body, &rows, received_clock)",
+        "update_position_evidence",
+        "received_clock.unix_milliseconds().to_be_bytes()",
+        "PmDataApiPositionObservationCommitment::from_source_bytes(",
+        "pub const fn commitment(&self) -> PmDataApiPositionObservationCommitment",
+    ] {
+        assert!(
+            POSITION.contains(required) || SOURCE.contains(required),
+            "missing provenance boundary: {required}"
+        );
+    }
+    assert!(POSITION.contains("pub(crate) const fn from_source_bytes("));
+    for forbidden in [
+        "pub const fn from_source_bytes(",
+        "pub fn from_source_bytes(",
+        "pub fn raw_body(",
+        "pub fn response_body(",
+        "commitment: [u8; 32]",
+        "production_order_entry_authorized(self) -> bool {\n        true",
+    ] {
+        assert!(
+            !POSITION.contains(forbidden) && !SOURCE.contains(forbidden),
+            "provenance capability escape: {forbidden}"
         );
     }
 }

@@ -4,21 +4,23 @@ use std::time::Duration;
 use std::net::IpAddr;
 
 use reqwest::{Client, StatusCode, Url, redirect::Policy};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 #[cfg(any(test, feature = "loopback-evidence"))]
 use url::Host;
 
 use crate::{
     PM_POLYGON_CHAIN_ID, PM_POLYGON_CONDITIONAL_TOKENS_ADDRESS, PM_POLYGON_PUSD_PROXY_ADDRESS,
-    PM_POLYGON_RPC_ORIGIN, PmPolygonAuthorizationScope, PmPolygonFinalizedAuthorizationCut,
-    PmPolygonSystemClockObservation,
+    PM_POLYGON_RPC_ORIGIN, PmPolygonAuthorizationScope, PmPolygonFinalizedAuthorizationCommitment,
+    PmPolygonFinalizedAuthorizationCut, PmPolygonFinalizedBlock, PmPolygonSystemClockObservation,
     rpc::{
-        BLOCK_REREAD_REQUEST_ID, allowance_request, approval_request, block_reread_request,
-        chain_id_request, decode_allowance, decode_approval, decode_chain_id,
+        BLOCK_REREAD_REQUEST_ID, CHAIN_ID_REQUEST_ID, CONDITIONAL_TOKENS_APPROVAL_REQUEST_ID,
+        FINALIZED_BLOCK_REQUEST_ID, PUSD_ALLOWANCE_REQUEST_ID, allowance_request, approval_request,
+        block_reread_request, chain_id_request, decode_allowance, decode_approval, decode_chain_id,
         decode_finalized_block, finalized_block_request,
     },
 };
-use reap_pm_core::EvmAddress;
+use reap_pm_core::{EvmAddress, PmErc1155OperatorApproval, PmSpenderDomain, U256};
 
 const PRODUCTION_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const PRODUCTION_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -29,6 +31,9 @@ const MIN_LOOPBACK_REQUEST_TIMEOUT: Duration = Duration::from_millis(1);
 const MAX_JSON_RPC_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_FINALIZED_BLOCK_AGE_SECONDS: u64 = 30;
 const MAX_FINALIZED_BLOCK_FUTURE_SECONDS: u64 = 5;
+const AUTHORIZATION_CUT_COMMITMENT_DOMAIN: &[u8] =
+    b"reap.polymarket.chain-source.finalized-authorization-cut.v1\0";
+const AUTHORIZATION_CUT_REQUEST_COUNT: u8 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum PmPolygonChainSourceError {
@@ -99,6 +104,13 @@ enum ClockSource {
     Fixed(PmPolygonSystemClockObservation),
 }
 
+#[derive(Clone, Copy)]
+enum SourceMode {
+    Production,
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    LoopbackEvidence,
+}
+
 impl ClockSource {
     fn observe(self) -> Result<PmPolygonSystemClockObservation, PmPolygonChainSourceError> {
         match self {
@@ -114,6 +126,7 @@ impl ClockSource {
 pub struct PmPolygonAuthorizationSource {
     transport: PmPolygonRpcTransport,
     clock: ClockSource,
+    mode: SourceMode,
 }
 
 impl PmPolygonAuthorizationSource {
@@ -130,6 +143,7 @@ impl PmPolygonAuthorizationSource {
                 true,
             )?,
             clock: ClockSource::System,
+            mode: SourceMode::Production,
         })
     }
 
@@ -155,6 +169,7 @@ impl PmPolygonAuthorizationSource {
                 false,
             )?,
             clock: ClockSource::Fixed(clock),
+            mode: SourceMode::LoopbackEvidence,
         })
     }
 
@@ -164,55 +179,67 @@ impl PmPolygonAuthorizationSource {
         &self,
         scope: PmPolygonAuthorizationScope,
     ) -> Result<PmPolygonFinalizedAuthorizationCut, PmPolygonChainSourceError> {
-        let chain_id = decode_chain_id(&self.transport.post(chain_id_request()?).await?)?;
+        let chain_id_body = self.transport.post(chain_id_request()?).await?;
+        let chain_id = decode_chain_id(&chain_id_body)?;
         if chain_id != PM_POLYGON_CHAIN_ID {
             return Err(PmPolygonChainSourceError::WrongRpcChain);
         }
 
-        let finalized = decode_finalized_block(
-            &self.transport.post(finalized_block_request()?).await?,
-            crate::rpc::FINALIZED_BLOCK_REQUEST_ID,
-        )?;
+        let finalized_body = self.transport.post(finalized_block_request()?).await?;
+        let finalized = decode_finalized_block(&finalized_body, FINALIZED_BLOCK_REQUEST_ID)?;
         let owner = scope.owner();
         let spender = scope.spender().address();
         let pusd = frozen_address(PM_POLYGON_PUSD_PROXY_ADDRESS);
         let conditional_tokens = frozen_address(PM_POLYGON_CONDITIONAL_TOKENS_ADDRESS);
 
-        let pusd_allowance = decode_allowance(
-            &self
-                .transport
-                .post(allowance_request(
-                    pusd,
-                    owner,
-                    spender,
-                    &finalized.canonical_number,
-                )?)
-                .await?,
-        )?;
-        let conditional_tokens_approval = decode_approval(
-            &self
-                .transport
-                .post(approval_request(
-                    conditional_tokens,
-                    owner,
-                    spender,
-                    &finalized.canonical_number,
-                )?)
-                .await?,
-        )?;
-        let reread = decode_finalized_block(
-            &self
-                .transport
-                .post(block_reread_request(&finalized.canonical_number)?)
-                .await?,
-            BLOCK_REREAD_REQUEST_ID,
-        )?;
+        let allowance_body = self
+            .transport
+            .post(allowance_request(
+                pusd,
+                owner,
+                spender,
+                &finalized.canonical_number,
+            )?)
+            .await?;
+        let pusd_allowance = decode_allowance(&allowance_body)?;
+        let approval_body = self
+            .transport
+            .post(approval_request(
+                conditional_tokens,
+                owner,
+                spender,
+                &finalized.canonical_number,
+            )?)
+            .await?;
+        let conditional_tokens_approval = decode_approval(&approval_body)?;
+        let reread_body = self
+            .transport
+            .post(block_reread_request(&finalized.canonical_number)?)
+            .await?;
+        let reread = decode_finalized_block(&reread_body, BLOCK_REREAD_REQUEST_ID)?;
         if reread.identity != finalized.identity {
             return Err(PmPolygonChainSourceError::FinalizedBlockChanged);
         }
 
         let observed_clock = self.clock.observe()?;
         validate_freshness(finalized.identity.timestamp, observed_clock.unix_seconds())?;
+        let commitment = authorization_cut_commitment(AuthorizationCommitmentBasis {
+            mode: self.mode,
+            scope,
+            chain_id,
+            finalized: finalized.identity,
+            pusd_allowance,
+            conditional_tokens_approval,
+            reread: reread.identity,
+            observed_clock,
+            response_bodies: [
+                &chain_id_body,
+                &finalized_body,
+                &allowance_body,
+                &approval_body,
+                &reread_body,
+            ],
+        });
 
         Ok(PmPolygonFinalizedAuthorizationCut {
             scope,
@@ -220,8 +247,113 @@ impl PmPolygonAuthorizationSource {
             pusd_allowance,
             conditional_tokens_approval,
             observed_clock,
+            commitment,
         })
     }
+}
+
+struct AuthorizationCommitmentBasis<'a> {
+    mode: SourceMode,
+    scope: PmPolygonAuthorizationScope,
+    chain_id: u64,
+    finalized: PmPolygonFinalizedBlock,
+    pusd_allowance: U256,
+    conditional_tokens_approval: PmErc1155OperatorApproval,
+    reread: PmPolygonFinalizedBlock,
+    observed_clock: PmPolygonSystemClockObservation,
+    response_bodies: [&'a [u8]; 5],
+}
+
+fn authorization_cut_commitment(
+    basis: AuthorizationCommitmentBasis<'_>,
+) -> PmPolygonFinalizedAuthorizationCommitment {
+    let mut hasher = Sha256::new();
+    hasher.update(AUTHORIZATION_CUT_COMMITMENT_DOMAIN);
+    update_commitment_bytes(&mut hasher, PM_POLYGON_RPC_ORIGIN.as_bytes());
+    hasher.update([match basis.mode {
+        SourceMode::Production => 0,
+        #[cfg(any(test, feature = "loopback-evidence"))]
+        SourceMode::LoopbackEvidence => 1,
+    }]);
+
+    let account = basis.scope.account_scope();
+    update_commitment_bytes(&mut hasher, account.environment().as_str().as_bytes());
+    hasher.update(account.chain().value().to_be_bytes());
+    hasher.update(account.signer().address().bytes());
+    hasher.update(account.funder().address().bytes());
+    hasher.update(account.handle().ordinal().to_be_bytes());
+    hasher.update([match basis.scope.spender() {
+        crate::PmPolygonExchangeSpender::StandardV2 => 0,
+        crate::PmPolygonExchangeSpender::NegativeRiskV2 => 1,
+    }]);
+    hasher.update([match basis.scope.spender().domain() {
+        PmSpenderDomain::Standard => 0,
+        PmSpenderDomain::NegativeRisk => 1,
+    }]);
+    hasher.update(basis.scope.owner().bytes());
+    hasher.update(basis.scope.spender().address().bytes());
+    hasher.update(frozen_address(PM_POLYGON_PUSD_PROXY_ADDRESS).bytes());
+    hasher.update(frozen_address(PM_POLYGON_CONDITIONAL_TOKENS_ADDRESS).bytes());
+
+    hasher.update([AUTHORIZATION_CUT_REQUEST_COUNT]);
+    update_rpc_observation(
+        &mut hasher,
+        0,
+        CHAIN_ID_REQUEST_ID,
+        basis.response_bodies[0],
+    );
+    hasher.update(basis.chain_id.to_be_bytes());
+    update_rpc_observation(
+        &mut hasher,
+        1,
+        FINALIZED_BLOCK_REQUEST_ID,
+        basis.response_bodies[1],
+    );
+    update_block(&mut hasher, basis.finalized);
+    update_rpc_observation(
+        &mut hasher,
+        2,
+        PUSD_ALLOWANCE_REQUEST_ID,
+        basis.response_bodies[2],
+    );
+    hasher.update(basis.pusd_allowance.to_be_bytes());
+    update_rpc_observation(
+        &mut hasher,
+        3,
+        CONDITIONAL_TOKENS_APPROVAL_REQUEST_ID,
+        basis.response_bodies[3],
+    );
+    hasher.update([u8::from(basis.conditional_tokens_approval.is_approved())]);
+    update_rpc_observation(
+        &mut hasher,
+        4,
+        BLOCK_REREAD_REQUEST_ID,
+        basis.response_bodies[4],
+    );
+    update_block(&mut hasher, basis.reread);
+    hasher.update(basis.observed_clock.unix_seconds().to_be_bytes());
+    PmPolygonFinalizedAuthorizationCommitment::from_source_bytes(hasher.finalize().into())
+}
+
+fn update_rpc_observation(hasher: &mut Sha256, ordinal: u8, request_id: u64, body: &[u8]) {
+    hasher.update([ordinal]);
+    hasher.update(request_id.to_be_bytes());
+    update_commitment_bytes(hasher, body);
+}
+
+fn update_block(hasher: &mut Sha256, block: PmPolygonFinalizedBlock) {
+    hasher.update(block.number().to_be_bytes());
+    hasher.update(block.hash());
+    hasher.update(block.timestamp().to_be_bytes());
+}
+
+fn update_commitment_bytes(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update(
+        u64::try_from(value.len())
+            .expect("bounded chain observation length")
+            .to_be_bytes(),
+    );
+    hasher.update(value);
 }
 
 fn frozen_address(encoded: &str) -> EvmAddress {

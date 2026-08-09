@@ -173,6 +173,21 @@ fn account_scope(chain: u64, identities_match: bool) -> PmAccountScope {
     )
 }
 
+fn account_scope_with(
+    environment: &str,
+    signer: &str,
+    funder: &str,
+    handle: u16,
+) -> PmAccountScope {
+    PmAccountScope::new(
+        PmEnvironmentId::new(environment).unwrap(),
+        PmChainId::new(PM_POLYGON_CHAIN_ID).unwrap(),
+        PmSignerId::new(EvmAddress::parse(signer).unwrap()),
+        PmFunderId::new(EvmAddress::parse(funder).unwrap()),
+        PmAccountHandle::from_ordinal(handle),
+    )
+}
+
 fn loopback_source(
     origin: &str,
     timestamp: u64,
@@ -184,6 +199,22 @@ fn loopback_source(
         timeout,
     )
     .unwrap()
+}
+
+async fn commitment_for(
+    replies: Vec<MockReply>,
+    scope: PmPolygonAuthorizationScope,
+    clock: u64,
+) -> PmPolygonFinalizedAuthorizationCommitment {
+    let server = MockServer::spawn(replies);
+    let source = loopback_source(&server.origin, clock, Duration::from_secs(1));
+    let commitment = source
+        .finalized_authorization_cut(scope)
+        .await
+        .unwrap()
+        .commitment();
+    assert_eq!(server.finish().len(), 5);
+    commitment
 }
 
 #[tokio::test]
@@ -205,6 +236,8 @@ async fn exact_five_request_bodies_produce_one_bound_cut() {
     assert_eq!(cut.pusd_allowance(), U256::from_u64(1_000));
     assert!(cut.conditional_tokens_approval().is_approved());
     assert_eq!(cut.observed_clock().unix_seconds(), BLOCK_TIMESTAMP + 10);
+    assert_eq!(cut.commitment().bytes().len(), 32);
+    assert_eq!(cut.commitment().to_string().len(), 66);
     assert!(!cut.production_order_entry_authorized());
 
     let requests = server.finish();
@@ -240,6 +273,131 @@ async fn exact_five_request_bodies_produce_one_bound_cut() {
         assert!(!lower.contains("authorization:"));
         assert!(!lower.contains("proxy-authorization:"));
     }
+}
+
+#[tokio::test]
+async fn cut_commitment_binds_exact_scope_ordered_responses_values_and_receive_clock() {
+    let standard_scope = proxy_scope(PmPolygonExchangeSpender::StandardV2);
+    let exact = commitment_for(successful_replies(), standard_scope, BLOCK_TIMESTAMP + 10).await;
+
+    let account_mutations = [
+        account_scope_with(
+            "pm-chain-other",
+            "0x1111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+            7,
+        ),
+        account_scope_with(
+            "pm-chain-evidence",
+            "0x3333333333333333333333333333333333333333",
+            "0x2222222222222222222222222222222222222222",
+            7,
+        ),
+        account_scope_with(
+            "pm-chain-evidence",
+            "0x1111111111111111111111111111111111111111",
+            "0x4444444444444444444444444444444444444444",
+            7,
+        ),
+        account_scope_with(
+            "pm-chain-evidence",
+            "0x1111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+            8,
+        ),
+    ];
+    for account in account_mutations {
+        let scope = PmPolygonAuthorizationScope::new_pm_t2_proxy(
+            account,
+            PmPolygonExchangeSpender::StandardV2,
+        )
+        .unwrap();
+        assert_ne!(
+            commitment_for(successful_replies(), scope, BLOCK_TIMESTAMP + 10).await,
+            exact,
+            "account scope field is unbound"
+        );
+    }
+    assert_ne!(
+        commitment_for(
+            successful_replies(),
+            proxy_scope(PmPolygonExchangeSpender::NegativeRiskV2),
+            BLOCK_TIMESTAMP + 10,
+        )
+        .await,
+        exact,
+        "spender profile is unbound"
+    );
+
+    let mut allowance = successful_replies();
+    allowance[2] = MockReply::json(rpc_result(
+        3,
+        r#""0x00000000000000000000000000000000000000000000000000000000000003e9""#,
+    ));
+    assert_ne!(
+        commitment_for(allowance, standard_scope, BLOCK_TIMESTAMP + 10).await,
+        exact,
+        "allowance value is unbound"
+    );
+
+    let mut approval = successful_replies();
+    approval[3] = MockReply::json(rpc_result(4, &format!(r#""{ZERO_WORD}""#)));
+    assert_ne!(
+        commitment_for(approval, standard_scope, BLOCK_TIMESTAMP + 10).await,
+        exact,
+        "approval value is unbound"
+    );
+
+    let mut number = successful_replies();
+    number[1] = MockReply::json(block_result(2, "0x1235", BLOCK_HASH, BLOCK_TIMESTAMP_HEX));
+    number[4] = MockReply::json(block_result(5, "0x1235", BLOCK_HASH, BLOCK_TIMESTAMP_HEX));
+    assert_ne!(
+        commitment_for(number, standard_scope, BLOCK_TIMESTAMP + 10).await,
+        exact,
+        "block number is unbound"
+    );
+
+    let other_hash = "0x2222222222222222222222222222222222222222222222222222222222222222";
+    let mut hash = successful_replies();
+    hash[1] = MockReply::json(block_result(2, "0x1234", other_hash, BLOCK_TIMESTAMP_HEX));
+    hash[4] = MockReply::json(block_result(5, "0x1234", other_hash, BLOCK_TIMESTAMP_HEX));
+    assert_ne!(
+        commitment_for(hash, standard_scope, BLOCK_TIMESTAMP + 10).await,
+        exact,
+        "block hash is unbound"
+    );
+
+    let mut timestamp = successful_replies();
+    timestamp[1] = MockReply::json(block_result(2, "0x1234", BLOCK_HASH, "0x6553f101"));
+    timestamp[4] = MockReply::json(block_result(5, "0x1234", BLOCK_HASH, "0x6553f101"));
+    assert_ne!(
+        commitment_for(timestamp, standard_scope, BLOCK_TIMESTAMP + 10).await,
+        exact,
+        "block timestamp is unbound"
+    );
+    assert_ne!(
+        commitment_for(successful_replies(), standard_scope, BLOCK_TIMESTAMP + 11,).await,
+        exact,
+        "receive clock is unbound"
+    );
+
+    let mut exact_body = successful_replies();
+    exact_body[0].body.insert(0, ' ');
+    assert_ne!(
+        commitment_for(exact_body, standard_scope, BLOCK_TIMESTAMP + 10).await,
+        exact,
+        "exact ordered response bytes are unbound"
+    );
+
+    let mut reread_body = successful_replies();
+    reread_body[4].body = reread_body[4]
+        .body
+        .replace("\"transactions\":[]", "\"transactions\":[\"0x01\"]");
+    assert_ne!(
+        commitment_for(reread_body, standard_scope, BLOCK_TIMESTAMP + 10).await,
+        exact,
+        "fifth response is unbound"
+    );
 }
 
 #[tokio::test]

@@ -34,4 +34,8 @@ pub enum PmPublicPositionError {
     DuplicateAsset,
     #[error("PM Data API position pagination reached a full page at the offset cap")]
     FullPageAtOffsetCap,
+    #[error("system clock precedes the Unix epoch")]
+    SystemClockBeforeUnixEpoch,
+    #[error("system clock observation exceeds the exact millisecond range")]
+    SystemClockOutOfRange,
 }

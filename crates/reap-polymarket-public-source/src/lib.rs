@@ -11,7 +11,8 @@ pub use decimal::{MAX_POSITION_DECIMAL_BYTES, PmExactPositionDecimal};
 pub use error::PmPublicPositionError;
 pub use position::{
     MAX_POSITION_PAGE_ROWS, PM_POSITION_API_SOURCE_AUTHORITY, PM_POSITION_API_SOURCE_SHA256,
-    PmConfiguredTokenPosition, PmDataApiPositionEvidence, PmMonitoredPositionObservation,
+    PmConfiguredTokenPosition, PmDataApiPositionEvidence, PmDataApiPositionObservationCommitment,
+    PmDataApiReceiveClockObservation, PmMonitoredPositionObservation,
 };
 pub use source::{MAX_POSITION_PAGE_BODY_BYTES, PmDataApiCurrentPositionSource};
 

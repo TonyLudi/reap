@@ -5,22 +5,47 @@ use reqwest::{
     header::{ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, HeaderMap, HeaderName},
     redirect::Policy,
 };
+use sha2::{Digest, Sha256};
 
 use crate::{
-    PmConfiguredTokenPosition, PmDataApiPositionConfig, PmDataApiPositionScope,
-    PmMonitoredPositionObservation, PmPublicPositionError,
+    PM_DATA_API_PRODUCTION_ORIGIN, PmConfiguredTokenPosition, PmDataApiPositionConfig,
+    PmDataApiPositionEvidence, PmDataApiPositionObservationCommitment, PmDataApiPositionScope,
+    PmDataApiReceiveClockObservation, PmExactPositionDecimal, PmMonitoredPositionObservation,
+    PmPublicPositionError,
     config::OriginMode,
-    position::{MAX_POSITION_PAGE_ROWS, parse_position_page},
+    position::{MAX_POSITION_PAGE_ROWS, ParsedPositionRow, parse_position_page},
 };
 
 pub const MAX_POSITION_PAGE_BODY_BYTES: usize = 1_048_576;
 const POSITION_PAGE_LIMIT: u16 = 500;
 const MAX_POSITION_OFFSET: u16 = 10_000;
+const POSITION_OBSERVATION_COMMITMENT_DOMAIN: &[u8] =
+    b"reap.polymarket.public-source.position-observation.v1\0";
+const POSITION_OBSERVATION_METHOD: &[u8] = b"GET";
+const POSITION_OBSERVATION_ROUTE: &[u8] = b"/positions";
+
+#[derive(Clone, Copy)]
+enum ClockSource {
+    System,
+    #[cfg(test)]
+    Fixed(PmDataApiReceiveClockObservation),
+}
+
+impl ClockSource {
+    fn observe(self) -> Result<PmDataApiReceiveClockObservation, PmPublicPositionError> {
+        match self {
+            Self::System => PmDataApiReceiveClockObservation::capture(),
+            #[cfg(test)]
+            Self::Fixed(observation) => Ok(observation),
+        }
+    }
+}
 
 struct PmDataApiPositionTransport {
     client: Client,
     origin: Url,
     scope: PmDataApiPositionScope,
+    mode: OriginMode,
 }
 
 impl PmDataApiPositionTransport {
@@ -41,6 +66,7 @@ impl PmDataApiPositionTransport {
             client,
             origin: config.origin().clone(),
             scope: config.scope(),
+            mode: config.mode(),
         })
     }
 
@@ -110,6 +136,7 @@ impl PmDataApiPositionTransport {
 /// authentication, or mutation method.
 pub struct PmDataApiCurrentPositionSource {
     transport: PmDataApiPositionTransport,
+    clock: ClockSource,
 }
 
 impl PmDataApiCurrentPositionSource {
@@ -118,16 +145,19 @@ impl PmDataApiCurrentPositionSource {
         connect_timeout: Duration,
         request_timeout: Duration,
     ) -> Result<Self, PmPublicPositionError> {
-        Self::new(PmDataApiPositionConfig::production(
-            scope,
-            connect_timeout,
-            request_timeout,
-        )?)
+        Self::new(
+            PmDataApiPositionConfig::production(scope, connect_timeout, request_timeout)?,
+            ClockSource::System,
+        )
     }
 
-    fn new(config: PmDataApiPositionConfig) -> Result<Self, PmPublicPositionError> {
+    fn new(
+        config: PmDataApiPositionConfig,
+        clock: ClockSource,
+    ) -> Result<Self, PmPublicPositionError> {
         Ok(Self {
             transport: PmDataApiPositionTransport::new(&config)?,
+            clock,
         })
     }
 
@@ -137,13 +167,17 @@ impl PmDataApiCurrentPositionSource {
         scope: PmDataApiPositionScope,
         connect_timeout: Duration,
         request_timeout: Duration,
+        clock: PmDataApiReceiveClockObservation,
     ) -> Result<Self, PmPublicPositionError> {
-        Self::new(PmDataApiPositionConfig::numeric_loopback_evidence(
-            origin,
-            scope,
-            connect_timeout,
-            request_timeout,
-        )?)
+        Self::new(
+            PmDataApiPositionConfig::numeric_loopback_evidence(
+                origin,
+                scope,
+                connect_timeout,
+                request_timeout,
+            )?,
+            ClockSource::Fixed(clock),
+        )
     }
 
     #[must_use]
@@ -158,19 +192,14 @@ impl PmDataApiCurrentPositionSource {
         let mut seen_assets = BTreeSet::new();
         let mut configured_token = None;
         let mut offset = 0_u16;
-        let mut pages_observed = 0_u8;
-        let mut rows_observed = 0_u16;
+        let mut commitment = PositionObservationCommitmentBuilder::new(scope, self.transport.mode);
 
         loop {
             let body = self.transport.fetch_page(offset).await?;
+            let received_clock = self.clock.observe()?;
             let rows = parse_position_page(&body, scope)?;
             let page_rows = rows.len();
-            pages_observed = pages_observed
-                .checked_add(1)
-                .expect("fixed 21-page position bound");
-            rows_observed = rows_observed
-                .checked_add(u16::try_from(page_rows).expect("500-row page bound"))
-                .expect("fixed position aggregate bound");
+            commitment.observe_page(offset, &body, &rows, received_clock);
 
             for row in rows {
                 if !seen_assets.insert(row.asset) {
@@ -192,15 +221,165 @@ impl PmDataApiCurrentPositionSource {
                 .expect("fixed position offset bound");
         }
 
+        let configured_token = configured_token
+            .map_or(PmConfiguredTokenPosition::Absent, |position| {
+                PmConfiguredTokenPosition::Present(Box::new(position))
+            });
+        let (pages_observed, rows_observed, completed_clock, commitment) =
+            commitment.finish(&configured_token);
         Ok(PmMonitoredPositionObservation::new(
             scope,
             pages_observed,
             rows_observed,
-            configured_token.map_or(PmConfiguredTokenPosition::Absent, |position| {
-                PmConfiguredTokenPosition::Present(Box::new(position))
-            }),
+            configured_token,
+            completed_clock,
+            commitment,
         ))
     }
+}
+
+struct PositionObservationCommitmentBuilder {
+    hasher: Sha256,
+    pages_observed: u8,
+    rows_observed: u16,
+    completed_clock: Option<PmDataApiReceiveClockObservation>,
+}
+
+impl PositionObservationCommitmentBuilder {
+    fn new(scope: PmDataApiPositionScope, mode: OriginMode) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(POSITION_OBSERVATION_COMMITMENT_DOMAIN);
+        update_commitment_bytes(&mut hasher, POSITION_OBSERVATION_METHOD);
+        update_commitment_bytes(&mut hasher, POSITION_OBSERVATION_ROUTE);
+        update_commitment_bytes(&mut hasher, PM_DATA_API_PRODUCTION_ORIGIN.as_bytes());
+        hasher.update([match mode {
+            OriginMode::Production => 0,
+            #[cfg(test)]
+            OriginMode::NumericLoopback => 1,
+        }]);
+        hasher.update(scope.proxy_funder().bytes());
+        hasher.update(scope.condition().bytes());
+        hasher.update(scope.configured_token().units().to_be_bytes());
+        Self {
+            hasher,
+            pages_observed: 0,
+            rows_observed: 0,
+            completed_clock: None,
+        }
+    }
+
+    fn observe_page(
+        &mut self,
+        offset: u16,
+        body: &[u8],
+        rows: &[ParsedPositionRow],
+        received_clock: PmDataApiReceiveClockObservation,
+    ) {
+        let page_sequence = self.pages_observed;
+        self.pages_observed = self
+            .pages_observed
+            .checked_add(1)
+            .expect("fixed 21-page position bound");
+        self.rows_observed = self
+            .rows_observed
+            .checked_add(u16::try_from(rows.len()).expect("500-row page bound"))
+            .expect("fixed position aggregate bound");
+        self.completed_clock = Some(received_clock);
+
+        self.hasher.update([page_sequence]);
+        self.hasher.update(offset.to_be_bytes());
+        self.hasher
+            .update(received_clock.unix_milliseconds().to_be_bytes());
+        update_commitment_bytes(&mut self.hasher, body);
+        self.hasher.update(
+            u16::try_from(rows.len())
+                .expect("500-row page bound")
+                .to_be_bytes(),
+        );
+        for (row_index, row) in rows.iter().enumerate() {
+            self.hasher.update(
+                u16::try_from(row_index)
+                    .expect("500-row page bound")
+                    .to_be_bytes(),
+            );
+            update_position_evidence(&mut self.hasher, &row.evidence);
+        }
+    }
+
+    fn finish(
+        mut self,
+        configured_token: &PmConfiguredTokenPosition,
+    ) -> (
+        u8,
+        u16,
+        PmDataApiReceiveClockObservation,
+        PmDataApiPositionObservationCommitment,
+    ) {
+        self.hasher.update(self.pages_observed.to_be_bytes());
+        self.hasher.update(self.rows_observed.to_be_bytes());
+        match configured_token {
+            PmConfiguredTokenPosition::Absent => self.hasher.update([0]),
+            PmConfiguredTokenPosition::Present(position) => {
+                self.hasher.update([1]);
+                update_position_evidence(&mut self.hasher, position);
+            }
+        }
+        let completed_clock = self
+            .completed_clock
+            .expect("one response is required to complete a page walk");
+        let commitment = PmDataApiPositionObservationCommitment::from_source_bytes(
+            self.hasher.finalize().into(),
+        );
+        (
+            self.pages_observed,
+            self.rows_observed,
+            completed_clock,
+            commitment,
+        )
+    }
+}
+
+fn update_position_evidence(hasher: &mut Sha256, evidence: &PmDataApiPositionEvidence) {
+    hasher.update(evidence.asset().units().to_be_bytes());
+    hasher.update(evidence.opposite_asset().units().to_be_bytes());
+    for decimal in [
+        evidence.size(),
+        evidence.average_price(),
+        evidence.initial_value(),
+        evidence.current_value(),
+        evidence.cash_pnl(),
+        evidence.percent_pnl(),
+        evidence.total_bought(),
+        evidence.realized_pnl(),
+        evidence.percent_realized_pnl(),
+        evidence.current_price(),
+    ] {
+        update_exact_decimal(hasher, decimal);
+    }
+    hasher.update(evidence.outcome_index().to_be_bytes());
+    update_commitment_bytes(hasher, evidence.outcome().as_bytes());
+    update_commitment_bytes(hasher, evidence.opposite_outcome().as_bytes());
+    hasher.update([
+        u8::from(evidence.redeemable()),
+        u8::from(evidence.mergeable()),
+        u8::from(evidence.negative_risk()),
+    ]);
+}
+
+fn update_exact_decimal(hasher: &mut Sha256, decimal: &PmExactPositionDecimal) {
+    update_commitment_bytes(hasher, decimal.lexeme().as_bytes());
+    hasher.update([u8::from(decimal.is_negative())]);
+    hasher.update(decimal.coefficient().to_be_bytes());
+    hasher.update(decimal.decimal_exponent().to_be_bytes());
+}
+
+fn update_commitment_bytes(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update(
+        u64::try_from(value.len())
+            .expect("bounded source observation length")
+            .to_be_bytes(),
+    );
+    hasher.update(value);
 }
 
 fn validate_application_headers(headers: &HeaderMap) -> Result<(), PmPublicPositionError> {
@@ -280,6 +459,7 @@ fn map_body_error(error: reqwest::Error) -> PmPublicPositionError {
 mod tests {
     use std::collections::VecDeque;
 
+    use reap_pm_core::{EvmAddress, PmConditionId, PmTokenId, U256};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -371,6 +551,7 @@ mod tests {
             scope(token),
             Duration::from_secs(2),
             Duration::from_secs(5),
+            PmDataApiReceiveClockObservation::for_loopback_evidence(1_700_000_000_123),
         )
         .unwrap()
     }
@@ -387,6 +568,33 @@ mod tests {
         format!("[{rows}]")
     }
 
+    fn commitment_for_pages(
+        scope: PmDataApiPositionScope,
+        pages: &[(u16, String, u64)],
+        mode: OriginMode,
+    ) -> PmDataApiPositionObservationCommitment {
+        let mut builder = PositionObservationCommitmentBuilder::new(scope, mode);
+        let mut configured = None;
+        for (offset, body, clock) in pages {
+            let rows = parse_position_page(body.as_bytes(), scope).unwrap();
+            builder.observe_page(
+                *offset,
+                body.as_bytes(),
+                &rows,
+                PmDataApiReceiveClockObservation::for_loopback_evidence(*clock),
+            );
+            for parsed in rows {
+                if parsed.asset == scope.configured_token() {
+                    configured = Some(parsed.evidence);
+                }
+            }
+        }
+        let configured = configured.map_or(PmConfiguredTokenPosition::Absent, |position| {
+            PmConfiguredTokenPosition::Present(Box::new(position))
+        });
+        builder.finish(&configured).3
+    }
+
     #[tokio::test]
     async fn exact_pagination_route_and_present_zero_are_preserved() {
         let responses = vec![
@@ -400,6 +608,12 @@ mod tests {
             .unwrap();
         assert_eq!(observation.pages_observed(), 2);
         assert_eq!(observation.rows_observed(), 501);
+        assert_eq!(
+            observation.completed_clock().unix_milliseconds(),
+            1_700_000_000_123
+        );
+        assert_eq!(observation.commitment().bytes().len(), 32);
+        assert!(!observation.production_order_entry_authorized());
         let present = observation.configured_token().as_present().unwrap();
         assert!(present.size().is_zero());
         assert_eq!(present.size().lexeme(), "0");
@@ -431,6 +645,143 @@ mod tests {
         assert!(observation.configured_token().is_absent());
         assert_eq!(observation.rows_observed(), 0);
         server.await.unwrap();
+    }
+
+    #[test]
+    fn observation_commitment_binds_scope_page_order_counts_values_and_receive_clock() {
+        let baseline_body = format!("[{}]", row(7, "1"));
+        let baseline_pages = [(0, baseline_body.clone(), 1_700_000_000_123)];
+        let exact = commitment_for_pages(scope(7), &baseline_pages, OriginMode::NumericLoopback);
+        assert_eq!(exact.bytes().len(), 32);
+        assert_eq!(exact.to_string().len(), 66);
+
+        let row_mutations = [
+            ("\"asset\":\"7\"", "\"asset\":\"8\""),
+            (
+                "\"oppositeAsset\":\"1000007\"",
+                "\"oppositeAsset\":\"1000008\"",
+            ),
+            ("\"size\":1", "\"size\":2"),
+            ("\"avgPrice\":0.42", "\"avgPrice\":0.43"),
+            ("\"initialValue\":1.25", "\"initialValue\":1.26"),
+            ("\"currentValue\":1.5", "\"currentValue\":1.6"),
+            ("\"cashPnl\":-0.25", "\"cashPnl\":-0.24"),
+            ("\"percentPnl\":-20", "\"percentPnl\":-19"),
+            ("\"totalBought\":3e0", "\"totalBought\":4e0"),
+            ("\"realizedPnl\":0", "\"realizedPnl\":1"),
+            ("\"percentRealizedPnl\":0", "\"percentRealizedPnl\":1"),
+            ("\"curPrice\":0.5", "\"curPrice\":0.6"),
+            ("\"outcomeIndex\":0", "\"outcomeIndex\":1"),
+            ("\"outcome\":\"Yes\"", "\"outcome\":\"Up\""),
+            ("\"oppositeOutcome\":\"No\"", "\"oppositeOutcome\":\"Down\""),
+            ("\"redeemable\":false", "\"redeemable\":true"),
+            ("\"mergeable\":false", "\"mergeable\":true"),
+            ("\"negativeRisk\":false", "\"negativeRisk\":true"),
+            (
+                "\"title\":\"Synthetic market\"",
+                "\"title\":\"Other market\"",
+            ),
+            ("\"slug\":\"synthetic\"", "\"slug\":\"other\""),
+            (
+                "\"icon\":\"https://example.invalid/icon\"",
+                "\"icon\":\"https://example.invalid/other\"",
+            ),
+            (
+                "\"eventSlug\":\"synthetic-event\"",
+                "\"eventSlug\":\"other-event\"",
+            ),
+            (
+                "\"endDate\":\"2030-01-01T00:00:00Z\"",
+                "\"endDate\":\"2030-01-02T00:00:00Z\"",
+            ),
+        ];
+        for (from, to) in row_mutations {
+            let changed_body = baseline_body.replace(from, to);
+            assert_ne!(changed_body, baseline_body, "missing fixture field {from}");
+            let changed = commitment_for_pages(
+                scope(7),
+                &[(0, changed_body, 1_700_000_000_123)],
+                OriginMode::NumericLoopback,
+            );
+            assert_ne!(changed, exact, "unbound observation field {from}");
+        }
+
+        let changed_funder = "0x3333333333333333333333333333333333333333";
+        let changed_condition =
+            "0x4444444444444444444444444444444444444444444444444444444444444444";
+        let changed_scope = PmDataApiPositionScope::new(
+            EvmAddress::parse(changed_funder).unwrap(),
+            PmConditionId::parse(changed_condition).unwrap(),
+            PmTokenId::new(U256::from_u64(7)).unwrap(),
+        );
+        let changed_scope_body = baseline_body
+            .replace(FUNDER, changed_funder)
+            .replace(CONDITION, changed_condition);
+        assert_ne!(
+            commitment_for_pages(
+                changed_scope,
+                &[(0, changed_scope_body, 1_700_000_000_123)],
+                OriginMode::NumericLoopback,
+            ),
+            exact
+        );
+        assert_ne!(
+            commitment_for_pages(scope(8), &baseline_pages, OriginMode::NumericLoopback),
+            exact
+        );
+
+        let two_rows = format!("[{},{}]", row(7, "1"), row(8, "1"));
+        let reversed_rows = format!("[{},{}]", row(8, "1"), row(7, "1"));
+        let two_row_commitment = commitment_for_pages(
+            scope(7),
+            &[(0, two_rows, 1_700_000_000_123)],
+            OriginMode::NumericLoopback,
+        );
+        assert_ne!(two_row_commitment, exact, "row count is unbound");
+        assert_ne!(
+            commitment_for_pages(
+                scope(7),
+                &[(0, reversed_rows, 1_700_000_000_123)],
+                OriginMode::NumericLoopback,
+            ),
+            two_row_commitment,
+            "row order is unbound"
+        );
+        assert_ne!(
+            commitment_for_pages(
+                scope(7),
+                &[
+                    (0, format!("[{}]", row(7, "1")), 1_700_000_000_122),
+                    (500, format!("[{}]", row(8, "1")), 1_700_000_000_123),
+                ],
+                OriginMode::NumericLoopback,
+            ),
+            two_row_commitment,
+            "page count and boundaries are unbound"
+        );
+        assert_ne!(
+            commitment_for_pages(
+                scope(7),
+                &[(0, baseline_body.clone(), 1_700_000_000_124)],
+                OriginMode::NumericLoopback,
+            ),
+            exact,
+            "receive clock is unbound"
+        );
+        assert_ne!(
+            commitment_for_pages(scope(7), &baseline_pages, OriginMode::Production),
+            exact,
+            "source mode is unbound"
+        );
+        assert_ne!(
+            commitment_for_pages(
+                scope(7),
+                &[(0, format!("[ {} ]", row(7, "1")), 1_700_000_000_123)],
+                OriginMode::NumericLoopback,
+            ),
+            exact,
+            "exact received body is unbound"
+        );
     }
 
     #[tokio::test]

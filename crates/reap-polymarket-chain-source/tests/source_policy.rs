@@ -117,3 +117,46 @@ fn contracts_owner_spenders_and_assets_are_frozen() {
     assert!(contract.contains("production_order_entry_authorized"));
     assert!(contract.contains("false"));
 }
+
+#[test]
+fn provenance_is_source_computed_exact_and_non_authoritative() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let contract = std::fs::read_to_string(root.join("contract.rs")).unwrap();
+    let source = std::fs::read_to_string(root.join("source.rs")).unwrap();
+
+    for required in [
+        "reap.polymarket.chain-source.finalized-authorization-cut.v1\\0",
+        "AUTHORIZATION_CUT_REQUEST_COUNT: u8 = 5",
+        "AuthorizationCommitmentBasis {",
+        "response_bodies:",
+        "update_rpc_observation(",
+        "update_block(&mut hasher, basis.finalized)",
+        "basis.pusd_allowance.to_be_bytes()",
+        "basis.conditional_tokens_approval.is_approved()",
+        "basis.observed_clock.unix_seconds().to_be_bytes()",
+        "PmPolygonFinalizedAuthorizationCommitment::from_source_bytes(",
+    ] {
+        assert!(
+            source.contains(required),
+            "missing provenance binding: {required}"
+        );
+    }
+    assert!(contract.contains("pub(crate) const fn from_source_bytes("));
+    assert!(
+        contract
+            .contains("pub const fn commitment(self) -> PmPolygonFinalizedAuthorizationCommitment")
+    );
+    for forbidden in [
+        "pub const fn from_source_bytes(",
+        "pub fn from_source_bytes(",
+        "pub fn raw_body(",
+        "pub fn response_body(",
+        "commitment: [u8; 32]",
+        "production_order_entry_authorized(self) -> bool {\n        true",
+    ] {
+        assert!(
+            !contract.contains(forbidden) && !source.contains(forbidden),
+            "provenance capability escape: {forbidden}"
+        );
+    }
+}

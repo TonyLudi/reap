@@ -26,6 +26,7 @@ fn dependency_edges_are_exactly_the_read_only_chain_source_set() {
             "reqwest".to_string(),
             "serde".to_string(),
             "serde_json".to_string(),
+            "sha2".to_string(),
             "thiserror".to_string(),
             "url".to_string(),
         ])

@@ -1,4 +1,7 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    fmt,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use reap_pm_core::{EvmAddress, PmAccountScope, PmErc1155OperatorApproval, PmSpenderDomain, U256};
 
@@ -126,6 +129,45 @@ pub struct PmPolygonFinalizedBlock {
     pub(crate) timestamp: u64,
 }
 
+/// Secret-free SHA-256 identity of one exact finalized authorization cut.
+///
+/// Only the closed source can construct this type. It binds the source
+/// profile, exact proxy/spender scope, all five responses in order, decoded
+/// block/allowance/approval values, and the source-owned receive clock. It is
+/// durable correlation evidence, never a dispatch permit.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PmPolygonFinalizedAuthorizationCommitment([u8; 32]);
+
+impl PmPolygonFinalizedAuthorizationCommitment {
+    pub(crate) const fn from_source_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl fmt::Display for PmPolygonFinalizedAuthorizationCommitment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("0x")?;
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for PmPolygonFinalizedAuthorizationCommitment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("PmPolygonFinalizedAuthorizationCommitment")
+            .field(&self.to_string())
+            .finish()
+    }
+}
+
 impl PmPolygonFinalizedBlock {
     #[must_use]
     pub const fn number(self) -> u64 {
@@ -155,6 +197,7 @@ pub struct PmPolygonFinalizedAuthorizationCut {
     pub(crate) pusd_allowance: U256,
     pub(crate) conditional_tokens_approval: PmErc1155OperatorApproval,
     pub(crate) observed_clock: PmPolygonSystemClockObservation,
+    pub(crate) commitment: PmPolygonFinalizedAuthorizationCommitment,
 }
 
 impl PmPolygonFinalizedAuthorizationCut {
@@ -181,6 +224,11 @@ impl PmPolygonFinalizedAuthorizationCut {
     #[must_use]
     pub const fn observed_clock(self) -> PmPolygonSystemClockObservation {
         self.observed_clock
+    }
+
+    #[must_use]
+    pub const fn commitment(self) -> PmPolygonFinalizedAuthorizationCommitment {
+        self.commitment
     }
 
     /// This read-only observation is deliberately not mutation authority.

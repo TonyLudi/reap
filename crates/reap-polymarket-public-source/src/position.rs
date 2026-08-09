@@ -1,4 +1,8 @@
-use std::str::FromStr;
+use std::{
+    fmt,
+    str::FromStr,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use reap_pm_core::{EvmAddress, PmConditionId, PmTokenId, U256};
 use serde::Deserialize;
@@ -20,6 +24,75 @@ pub const PM_POSITION_API_SOURCE_AUTHORITY: &str =
     "https://docs.polymarket.com/api-reference/core/get-current-positions-for-a-user.md";
 pub const PM_POSITION_API_SOURCE_SHA256: &str =
     "ff5ae34274c305970f85741997f70149ed284350229a8d417386c3986a62db57";
+
+/// Source-owned wall-clock observation captured after receipt of a position
+/// page. The completed observation exposes the clock attached to its last
+/// page; its commitment binds the receive clock of every page in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PmDataApiReceiveClockObservation {
+    unix_milliseconds: u64,
+}
+
+impl PmDataApiReceiveClockObservation {
+    pub(crate) fn capture() -> Result<Self, PmPublicPositionError> {
+        let elapsed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| PmPublicPositionError::SystemClockBeforeUnixEpoch)?;
+        let unix_milliseconds = u64::try_from(elapsed.as_millis())
+            .map_err(|_| PmPublicPositionError::SystemClockOutOfRange)?;
+        Ok(Self { unix_milliseconds })
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn for_loopback_evidence(unix_milliseconds: u64) -> Self {
+        Self { unix_milliseconds }
+    }
+
+    #[must_use]
+    pub const fn unix_milliseconds(self) -> u64 {
+        self.unix_milliseconds
+    }
+}
+
+/// Secret-free SHA-256 identity of one exact, ordered position observation.
+///
+/// Only this source can construct the type. It binds the source profile,
+/// configured scope, exact ordered page bodies and parsed values, counts,
+/// configured-token classification, and source-owned page receive clocks.
+/// It is durable correlation evidence, never order-entry authority.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PmDataApiPositionObservationCommitment([u8; 32]);
+
+impl PmDataApiPositionObservationCommitment {
+    pub(crate) const fn from_source_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl fmt::Display for PmDataApiPositionObservationCommitment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("0x")?;
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for PmDataApiPositionObservationCommitment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("PmDataApiPositionObservationCommitment")
+            .field(&self.to_string())
+            .finish()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PmDataApiPositionEvidence {
@@ -168,6 +241,8 @@ pub struct PmMonitoredPositionObservation {
     pages_observed: u8,
     rows_observed: u16,
     configured_token: PmConfiguredTokenPosition,
+    completed_clock: PmDataApiReceiveClockObservation,
+    commitment: PmDataApiPositionObservationCommitment,
 }
 
 impl PmMonitoredPositionObservation {
@@ -176,12 +251,16 @@ impl PmMonitoredPositionObservation {
         pages_observed: u8,
         rows_observed: u16,
         configured_token: PmConfiguredTokenPosition,
+        completed_clock: PmDataApiReceiveClockObservation,
+        commitment: PmDataApiPositionObservationCommitment,
     ) -> Self {
         Self {
             scope,
             pages_observed,
             rows_observed,
             configured_token,
+            completed_clock,
+            commitment,
         }
     }
 
@@ -203,6 +282,22 @@ impl PmMonitoredPositionObservation {
     #[must_use]
     pub const fn configured_token(&self) -> &PmConfiguredTokenPosition {
         &self.configured_token
+    }
+
+    #[must_use]
+    pub const fn completed_clock(&self) -> PmDataApiReceiveClockObservation {
+        self.completed_clock
+    }
+
+    #[must_use]
+    pub const fn commitment(&self) -> PmDataApiPositionObservationCommitment {
+        self.commitment
+    }
+
+    /// This credential-free public observation is never mutation authority.
+    #[must_use]
+    pub const fn production_order_entry_authorized(&self) -> bool {
+        false
     }
 }
 
