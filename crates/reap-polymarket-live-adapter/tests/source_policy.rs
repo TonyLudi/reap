@@ -91,12 +91,8 @@ fn modules_are_separate_and_raw_transport_remains_private() {
 
 #[test]
 fn public_preflight_observations_are_source_clocked_committed_and_sealed() {
-    assert!(METADATA_HTTP.contains(
-        r#"reap.pm.live-adapter.public-metadata-observation.v2\0"#
-    ));
-    assert!(!METADATA_HTTP.contains(
-        r#"reap.pm.live-adapter.public-metadata-observation.v1\0"#
-    ));
+    assert!(METADATA_HTTP.contains(r#"reap.pm.live-adapter.public-metadata-observation.v2\0"#));
+    assert!(!METADATA_HTTP.contains(r#"reap.pm.live-adapter.public-metadata-observation.v1\0"#));
     for required in [
         "pub struct PmHttpReceiveClock",
         "pub(crate) struct PmHttpReceiveClockSource",
@@ -284,6 +280,225 @@ fn server_time_and_type_one_account_observations_are_sealed_and_source_clocked()
     }
     assert!(PRIVATE_HTTP.contains("response does not remotely attest"));
     assert!(ACCOUNT.contains("was echoed or remotely attested"));
+}
+
+#[test]
+fn authenticated_reconciliation_observations_are_source_owned_terminal_clocked_and_sealed() {
+    let source = [PRIVATE_HTTP, RECONCILIATION].join("\n");
+    for required in [
+        r#"reap.pm.live-adapter.open-orders-page-source.v1\0"#,
+        r#"reap.pm.live-adapter.trades-page-source.v1\0"#,
+        r#"reap.pm.live-adapter.complete-open-orders-observation.v1\0"#,
+        r#"reap.pm.live-adapter.complete-trades-observation.v1\0"#,
+        r#"reap.pm.live-adapter.exact-order-source.v1\0"#,
+        r#"reap.pm.live-adapter.exact-order-observation.v1\0"#,
+        "struct AuthenticatedPageSource",
+        "struct LiveCutSource",
+        "terminal_receive_clock: Option<PmPrivateReadEdgeClock>",
+        "pub struct PmCompleteOpenOrdersObservation",
+        "pub struct PmCompleteTradesObservation",
+        "pub struct PmExactOrderDetailObservation",
+        "pub async fn begin_open_orders_observation(",
+        "pub async fn continue_open_orders_observation(",
+        "pub async fn begin_trades_observation(",
+        "pub async fn continue_trades_observation(",
+        "fn observe_terminal_page<P: ReconciliationPage>(",
+        "pub fn seal_complete_open_orders(",
+        "pub fn seal_complete_trades(",
+        "pub async fn exact_local_order_detail_observation(",
+        "PmPrivateHttpObservation::NotFound =>",
+        "exact_order_source_commitment(",
+        "encode_reconciliation_bytes(&mut digest, b\"next_cursor\");",
+        "encode_page_projection(&mut digest, parsed);",
+        "encode_exact_order_classification(&mut digest, classification);",
+        "fn encode_live_order(",
+        "for trade in self.trades()",
+        "configured_expected_maker",
+        "signature_type.value()",
+        "PM_CLOB_PRODUCTION_ORIGIN.as_bytes()",
+        "live_source: None",
+        "does not claim a separately echoed funder identity",
+        "reconciliation_commitments_exclude_api_key_but_owner_binding_stays_strict",
+    ] {
+        assert!(
+            source.contains(required),
+            "missing reconciliation provenance invariant: {required}"
+        );
+    }
+
+    for retired in [
+        r#"reap.pm.live-adapter.open-orders-page-source.v0\0"#,
+        r#"reap.pm.live-adapter.trades-page-source.v0\0"#,
+        r#"reap.pm.live-adapter.complete-open-orders-observation.v0\0"#,
+        r#"reap.pm.live-adapter.complete-trades-observation.v0\0"#,
+        r#"reap.pm.live-adapter.exact-order-source.v0\0"#,
+        r#"reap.pm.live-adapter.exact-order-observation.v0\0"#,
+    ] {
+        assert!(!RECONCILIATION.contains(retired));
+    }
+
+    for forbidden in [
+        "pub fn from_source(",
+        "pub const fn from_source_bytes(",
+        "pub fn raw_response(",
+        "pub fn raw_body(",
+        "pub fn source_commitment(",
+        "PRODUCTION_ORDER_ENTRY_AUTHORIZED: bool = true",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "reconciliation construction/raw/authority escape: {forbidden}"
+        );
+    }
+
+    let begin = RECONCILIATION
+        .find("async fn begin_open_orders_source(")
+        .unwrap();
+    let begin_end = RECONCILIATION[begin..]
+        .find("/// Consume the only authority to continue")
+        .map(|offset| begin + offset)
+        .unwrap();
+    let begin = &RECONCILIATION[begin..begin_end];
+    assert!(
+        begin.find(".open_orders_page(").unwrap()
+            < begin.find("observe_terminal_page(&fetched.parsed").unwrap()
+    );
+
+    let continue_cut = RECONCILIATION
+        .find("async fn continue_open_orders_source(")
+        .unwrap();
+    let continue_cut_end = RECONCILIATION[continue_cut..]
+        .find("/// Start an unfiltered full-account trade cut")
+        .map(|offset| continue_cut + offset)
+        .unwrap();
+    let continue_cut = &RECONCILIATION[continue_cut..continue_cut_end];
+    assert!(
+        continue_cut.find(".open_orders_page(").unwrap()
+            < continue_cut
+                .find("observe_terminal_page(&fetched.parsed")
+                .unwrap()
+    );
+
+    for seal_name in [
+        "pub fn seal_complete_open_orders(",
+        "pub fn seal_complete_trades(",
+    ] {
+        let seal = RECONCILIATION.find(seal_name).unwrap();
+        let seal_end = RECONCILIATION[seal..]
+            .find("\n    ///")
+            .map(|offset| seal + offset)
+            .unwrap();
+        let seal = &RECONCILIATION[seal..seal_end];
+        assert!(!seal.contains("PmPrivateReadProductClock"));
+        assert!(!seal.contains("observe_authenticated_read_complete"));
+        assert!(seal.contains("terminal_receive_clock"));
+    }
+
+    let open_page = RECONCILIATION.find("async fn open_orders_page(").unwrap();
+    let open_page_end = RECONCILIATION[open_page..]
+        .find("async fn trades_page(")
+        .map(|offset| open_page + offset)
+        .unwrap();
+    let open_page = &RECONCILIATION[open_page..open_page_end];
+    assert!(open_page.contains("let body = found("));
+    assert!(
+        open_page.find("bind_open_orders(").unwrap()
+            < open_page.find("authenticated_page_source(").unwrap()
+    );
+    assert!(PRIVATE_HTTP.contains("Found(Zeroizing<Vec<u8>>)"));
+    assert!(PRIVATE_HTTP.contains("PmPrivateHttpObservation::NotFound"));
+
+    let page_source = RECONCILIATION
+        .find("fn authenticated_page_source<P: ReconciliationPage>(")
+        .unwrap();
+    let page_source_end = RECONCILIATION[page_source..]
+        .find("fn exact_order_source_commitment(")
+        .map(|offset| page_source + offset)
+        .unwrap();
+    let page_source = &RECONCILIATION[page_source..page_source_end];
+    let exact_source = RECONCILIATION
+        .find("fn exact_order_source_commitment(")
+        .unwrap();
+    let exact_source_end = RECONCILIATION[exact_source..]
+        .find("fn complete_open_orders_observation_commitment(")
+        .map(|offset| exact_source + offset)
+        .unwrap();
+    let exact_source = &RECONCILIATION[exact_source..exact_source_end];
+    for secret_escape in [
+        "raw_response",
+        "raw_body",
+        "&body",
+        ".owner()",
+        ".trade_owner()",
+        "api_key",
+        "API_KEY",
+    ] {
+        assert!(
+            !page_source.contains(secret_escape) && !exact_source.contains(secret_escape),
+            "durable reconciliation source commitment is secret-derived: {secret_escape}"
+        );
+    }
+    assert!(page_source.contains("encode_page_projection(&mut digest, parsed)"));
+    assert!(exact_source.contains("encode_exact_order_classification"));
+    for secret_projection in ["raw_response", "raw_body", ".owner()", ".trade_owner()"] {
+        assert!(
+            !RECONCILIATION.contains(secret_projection),
+            "reconciliation provenance retains secret-bearing projection: {secret_projection}"
+        );
+    }
+
+    let exact_fetch = RECONCILIATION.find("async fn exact_order_source(").unwrap();
+    let exact_fetch_end = RECONCILIATION[exact_fetch..]
+        .find("async fn open_orders_page(")
+        .map(|offset| exact_fetch + offset)
+        .unwrap();
+    let exact_found = RECONCILIATION[exact_fetch..exact_fetch_end]
+        .find("PmPrivateHttpObservation::Found(body)")
+        .map(|offset| exact_fetch + offset)
+        .unwrap();
+    let exact_found = &RECONCILIATION[exact_found..exact_fetch_end];
+    assert!(
+        exact_found.find(".bind_exact_order(").unwrap()
+            < exact_found.find("exact_order_source_commitment(").unwrap()
+    );
+
+    for carrier in [
+        "PmCompleteOpenOrdersObservation",
+        "PmCompleteTradesObservation",
+        "PmExactOrderDetailObservation",
+    ] {
+        let declaration = format!("pub struct {carrier} {{");
+        let start = RECONCILIATION.find(&declaration).unwrap();
+        let end = RECONCILIATION[start..]
+            .find("\n}")
+            .map(|offset| start + offset)
+            .unwrap();
+        let body = &RECONCILIATION[start..end];
+        assert!(!body.contains("raw_response:"));
+        assert!(!body.contains("raw_body:"));
+    }
+
+    let move_only_start = RECONCILIATION
+        .find("/// Move-only terminal observation of a real authenticated open-order cut.")
+        .unwrap();
+    let move_only_end = RECONCILIATION[move_only_start..]
+        .find("/// Borrowed authenticated capability")
+        .map(|offset| move_only_start + offset)
+        .unwrap();
+    let move_only_carriers = &RECONCILIATION[move_only_start..move_only_end];
+    for forbidden_trait in [
+        "#[derive(",
+        "Serialize",
+        "Deserialize",
+        "impl Clone",
+        "impl Copy",
+    ] {
+        assert!(
+            !move_only_carriers.contains(forbidden_trait),
+            "sealed reconciliation carrier gains forgeable trait: {forbidden_trait}"
+        );
+    }
+    assert!(RECONCILIATION.matches("live_source: None").count() >= 2);
 }
 
 #[test]

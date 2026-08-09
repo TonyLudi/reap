@@ -221,10 +221,8 @@ impl PmPrivateHttpTransport {
                 status: status.as_u16(),
             });
         }
-        if status == StatusCode::NOT_FOUND && accepts_not_found {
-            return Ok(PmPrivateHttpObservation::NotFound);
-        }
-        if status != StatusCode::OK {
+        let accepted_not_found = status == StatusCode::NOT_FOUND && accepts_not_found;
+        if status != StatusCode::OK && !accepted_not_found {
             return Err(PmLiveAdapterError::UnexpectedStatus {
                 status: status.as_u16(),
             });
@@ -257,7 +255,11 @@ impl PmPrivateHttpTransport {
             }
             body.extend_from_slice(&chunk);
         }
-        Ok(PmPrivateHttpObservation::Found(body))
+        if accepted_not_found {
+            Ok(PmPrivateHttpObservation::NotFound)
+        } else {
+            Ok(PmPrivateHttpObservation::Found(body))
+        }
     }
 
     fn route_url(&self, route: PmPrivateRoute<'_>) -> Url {
@@ -393,6 +395,7 @@ impl PmAuthenticatedHttpOwner {
             &self.transport,
             self.exact_order_scope,
             self.expected_order_maker,
+            self.balance_signature_type,
         )
     }
 
@@ -741,9 +744,13 @@ mod tests {
     }
 
     fn credentials() -> L2Credentials {
+        credentials_for(API_KEY)
+    }
+
+    fn credentials_for(api_key: &str) -> L2Credentials {
         L2Credentials::bind(
             ADDRESS,
-            L2CredentialInput::new(API_KEY.into(), SECRET.into(), PASSPHRASE.into()),
+            L2CredentialInput::new(api_key.to_owned(), SECRET.into(), PASSPHRASE.into()),
         )
         .unwrap()
     }
@@ -763,6 +770,24 @@ mod tests {
         )
         .unwrap();
         crate::PmAuthenticatedHttpOwner::new(config, credentials()).unwrap()
+    }
+
+    fn local_owner_for_api_key(
+        origin: &str,
+        request_timeout: Duration,
+        api_key: &str,
+    ) -> (
+        crate::PmAuthenticatedHttpOwner,
+        crate::PmCredentialAuthoritySupervisor,
+    ) {
+        let config = PmPrivateHttpConfig::local_evidence(
+            origin,
+            Duration::from_millis(100),
+            request_timeout,
+            scope(),
+        )
+        .unwrap();
+        crate::PmAuthenticatedHttpOwner::new(config, credentials_for(api_key)).unwrap()
     }
 
     fn local_proxy_owner(
@@ -820,6 +845,51 @@ mod tests {
         let owner = crate::PmProductClockOwner::test_support_scripted(readings).unwrap();
         let (_, _, _, _, private_read, _, _, _, _, _) = owner.split().into_views();
         private_read
+    }
+
+    async fn reconciliation_commitments_for_api_key(
+        origin: &str,
+        api_key: &str,
+    ) -> ([u8; 32], [u8; 32], [u8; 32]) {
+        let (mut owner, supervisor) =
+            local_owner_for_api_key(origin, Duration::from_secs(1), api_key);
+        let mut clock = private_read_clock(&[(1_000, 10), (1_001, 11), (1_002, 12)]);
+        let commitments = {
+            let mut role = owner.reconciliation();
+            let open_cut = role
+                .begin_open_orders_observation(timestamp(), &mut clock)
+                .await
+                .unwrap();
+            let crate::PmOpenOrdersCutProgress::Complete(open_cut) = open_cut else {
+                panic!("terminal open-order response must complete")
+            };
+            let open = role.seal_complete_open_orders(open_cut).unwrap();
+
+            let trade_cut = role
+                .begin_trades_observation(timestamp(), &mut clock)
+                .await
+                .unwrap();
+            let crate::PmTradesCutProgress::Complete(trade_cut) = trade_cut else {
+                panic!("terminal trade response must complete")
+            };
+            let trades = role.seal_complete_trades(trade_cut).unwrap();
+
+            let exact = role
+                .exact_local_order_detail_observation(
+                    timestamp(),
+                    FixedOrderId::parse(ORDER_ID).unwrap(),
+                    &mut clock,
+                )
+                .await
+                .unwrap();
+            (
+                open.commitment().bytes(),
+                trades.commitment().bytes(),
+                exact.commitment().bytes(),
+            )
+        };
+        supervisor.shutdown().await.unwrap();
+        commitments
     }
 
     #[tokio::test]
@@ -1381,6 +1451,185 @@ mod tests {
             Ok(PmExactOrderObservation::Absent)
         );
         task.await.unwrap();
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconciliation_observations_are_terminal_clocked_and_cannot_be_resealed() {
+        let open_order = order(ORDER_ID, CONDITION, "123", ADDRESS, API_KEY);
+        let live_trade = trade(CONDITION, "123", ADDRESS, API_KEY);
+        let exact_order = order(ORDER_ID, CONDITION, "123", ADDRESS, API_KEY);
+        let missing_body = br#"{"error":"authenticated missing order"}"#.to_vec();
+        let missing_length = missing_body.len();
+        let responses = vec![
+            MockResponse::ok(page(&open_order, "LTE=")),
+            MockResponse::ok(page(&live_trade, "LTE=")),
+            MockResponse::ok(page(&live_trade, "LTE=")),
+            MockResponse::ok(exact_order),
+            MockResponse {
+                status: 404,
+                body: missing_body,
+                delay: Duration::ZERO,
+                location: None,
+                content_length: Some(missing_length),
+            },
+        ];
+        let (origin, mut requests, task) = mock_server(responses).await;
+        let (mut owner, supervisor) = local_owner(&origin, Duration::from_secs(1));
+        let mut clock = private_read_clock(&[
+            (1_000, 10),
+            (1_001, 11),
+            (1_002, 12),
+            (1_003, 13),
+            (1_004, 14),
+        ]);
+        let mut role = owner.reconciliation();
+
+        #[cfg(feature = "test-support")]
+        {
+            let open_page =
+                reap_polymarket_wire::parse_live_open_order_page(empty_page("LTE=").as_bytes())
+                    .unwrap();
+            let forged_open =
+                crate::PmCompleteOpenOrdersCut::test_support_from_pages(Box::new([open_page]))
+                    .unwrap();
+            assert!(matches!(
+                role.seal_complete_open_orders(forged_open),
+                Err(PmLiveAdapterError::InvalidConfiguration(_))
+            ));
+
+            let trade_page =
+                reap_polymarket_wire::parse_live_trade_page(empty_page("LTE=").as_bytes()).unwrap();
+            let forged_trades =
+                crate::PmCompleteTradesCut::test_support_from_pages(Box::new([trade_page]))
+                    .unwrap();
+            assert!(matches!(
+                role.seal_complete_trades(forged_trades),
+                Err(PmLiveAdapterError::InvalidConfiguration(_))
+            ));
+        }
+
+        let open_cut = role
+            .begin_open_orders_observation(timestamp(), &mut clock)
+            .await
+            .unwrap();
+        let crate::PmOpenOrdersCutProgress::Complete(open_cut) = open_cut else {
+            panic!("terminal open-order response must complete")
+        };
+        let post_fetch_clock = clock.observe_authenticated_read_complete().unwrap();
+        assert_eq!(post_fetch_clock.monotonic_receive_ns(), 11);
+        let open_observation = role.seal_complete_open_orders(open_cut).unwrap();
+        assert_eq!(open_observation.receive_clock().monotonic_receive_ns(), 10);
+        assert_ne!(open_observation.receive_clock(), post_fetch_clock);
+        let consumed_cut = open_observation.into_cut();
+        assert!(matches!(
+            role.seal_complete_open_orders(consumed_cut),
+            Err(PmLiveAdapterError::InvalidConfiguration(_))
+        ));
+
+        let legacy_trade_cut = role.begin_trades(timestamp()).await.unwrap();
+        let crate::PmTradesCutProgress::Complete(legacy_trade_cut) = legacy_trade_cut else {
+            panic!("terminal trade response must complete")
+        };
+        assert!(matches!(
+            role.seal_complete_trades(legacy_trade_cut),
+            Err(PmLiveAdapterError::InvalidConfiguration(_))
+        ));
+
+        let trade_cut = role
+            .begin_trades_observation(timestamp(), &mut clock)
+            .await
+            .unwrap();
+        let crate::PmTradesCutProgress::Complete(trade_cut) = trade_cut else {
+            panic!("terminal trade response must complete")
+        };
+        let trade_observation = role.seal_complete_trades(trade_cut).unwrap();
+        assert_eq!(trade_observation.receive_clock().monotonic_receive_ns(), 12);
+        assert_eq!(trade_observation.cut().row_count(), 1);
+
+        let id = FixedOrderId::parse(ORDER_ID).unwrap();
+        let present = role
+            .exact_local_order_detail_observation(timestamp(), id, &mut clock)
+            .await
+            .unwrap();
+        assert!(matches!(
+            present.classification(),
+            PmExactOrderObservation::Present(_)
+        ));
+        assert_eq!(present.receive_clock().monotonic_receive_ns(), 13);
+        let absent = role
+            .exact_local_order_detail_observation(timestamp(), id, &mut clock)
+            .await
+            .unwrap();
+        assert_eq!(absent.classification(), &PmExactOrderObservation::Absent);
+        assert_eq!(absent.receive_clock().monotonic_receive_ns(), 14);
+        assert_ne!(present.commitment(), absent.commitment());
+
+        let mut request_lines = Vec::new();
+        for _ in 0..5 {
+            request_lines.push(
+                requests
+                    .recv()
+                    .await
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_owned(),
+            );
+        }
+        assert_eq!(
+            request_lines,
+            [
+                "GET /data/orders?next_cursor=MA%3D%3D HTTP/1.1",
+                "GET /data/trades?next_cursor=MA%3D%3D HTTP/1.1",
+                "GET /data/trades?next_cursor=MA%3D%3D HTTP/1.1",
+                &format!("GET /data/order/{ORDER_ID} HTTP/1.1"),
+                &format!("GET /data/order/{ORDER_ID} HTTP/1.1"),
+            ]
+        );
+        task.await.unwrap();
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconciliation_commitments_exclude_api_key_but_owner_binding_stays_strict() {
+        let responses_for = |owner: &str| {
+            vec![
+                MockResponse::ok(page(
+                    &order(ORDER_ID, CONDITION, "123", ADDRESS, owner),
+                    "LTE=",
+                )),
+                MockResponse::ok(page(&trade(CONDITION, "123", ADDRESS, owner), "LTE=")),
+                MockResponse::ok(order(ORDER_ID, CONDITION, "123", ADDRESS, owner)),
+            ]
+        };
+        let (first_origin, _first_requests, first_task) = mock_server(responses_for(API_KEY)).await;
+        let (second_origin, _second_requests, second_task) =
+            mock_server(responses_for(FOREIGN_API_KEY)).await;
+
+        let first = reconciliation_commitments_for_api_key(&first_origin, API_KEY).await;
+        let second = reconciliation_commitments_for_api_key(&second_origin, FOREIGN_API_KEY).await;
+        assert_eq!(
+            first, second,
+            "durable commitments must not derive from the credential owner/API key"
+        );
+        first_task.await.unwrap();
+        second_task.await.unwrap();
+
+        let mismatched = order(ORDER_ID, CONDITION, "123", ADDRESS, FOREIGN_API_KEY);
+        let (mismatch_origin, _mismatch_requests, mismatch_task) =
+            mock_server(vec![MockResponse::ok(page(&mismatched, "LTE="))]).await;
+        let (mut owner, supervisor) = local_owner(&mismatch_origin, Duration::from_secs(1));
+        let mut clock = private_read_clock(&[(2_000, 20)]);
+        assert!(matches!(
+            owner
+                .reconciliation()
+                .begin_open_orders_observation(timestamp(), &mut clock)
+                .await,
+            Err(PmLiveAdapterError::CredentialOwnerMismatch)
+        ));
+        mismatch_task.await.unwrap();
         supervisor.shutdown().await.unwrap();
     }
 

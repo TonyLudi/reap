@@ -108,9 +108,11 @@ pub use read_only_private::{
 };
 pub use reconciliation::{
     MAX_PM_AUTHENTICATED_CUT_PAGES, MAX_PM_AUTHENTICATED_ORDER_ROWS,
-    MAX_PM_AUTHENTICATED_TRADE_ROWS, PmCompleteOpenOrdersCut, PmCompleteTradesCut,
-    PmExactOrderObservation, PmOpenOrdersAssembly, PmOpenOrdersCutProgress,
-    PmReconciliationHttpRole, PmTradesAssembly, PmTradesCutProgress,
+    MAX_PM_AUTHENTICATED_TRADE_ROWS, PmCompleteOpenOrdersCut, PmCompleteOpenOrdersObservation,
+    PmCompleteOpenOrdersObservationCommitment, PmCompleteTradesCut, PmCompleteTradesObservation,
+    PmCompleteTradesObservationCommitment, PmExactOrderDetailObservation,
+    PmExactOrderDetailObservationCommitment, PmExactOrderObservation, PmOpenOrdersAssembly,
+    PmOpenOrdersCutProgress, PmReconciliationHttpRole, PmTradesAssembly, PmTradesCutProgress,
 };
 pub use user_ws::{
     PmAuthenticatedUserWsRole, PmUserWsBoundFrame, PmUserWsClockError, PmUserWsClockSource,
