@@ -1516,9 +1516,12 @@ name = "reap-pm-controlled-trial-runner"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "reap-pm-core",
  "reap-polymarket-auth",
+ "reap-polymarket-wire",
  "tempfile",
  "thiserror",
+ "tokio",
  "zeroize",
 ]
 

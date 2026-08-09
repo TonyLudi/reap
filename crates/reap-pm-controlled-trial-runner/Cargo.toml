@@ -9,8 +9,11 @@ path = "src/main.rs"
 
 [dependencies]
 libc.workspace = true
+reap-pm-core.workspace = true
 reap-polymarket-auth.workspace = true
+reap-polymarket-wire.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
