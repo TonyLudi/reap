@@ -15,7 +15,7 @@ use thiserror::Error;
 use crate::{
     AuthorizationHostBinding, CanonicalAuthorization, CanonicalTrialConfig,
     OfflineAuthorizationState, TrialDomain, TrialJournalBinding, TrialPhase, TrialSide,
-    verify_authorization,
+    config::MAX_PREFLIGHT_OBSERVATION_AGE_MS, verify_authorization,
 };
 
 pub const TRIAL_PREFLIGHT_SCHEMA_VERSION: u32 = 1;
@@ -26,9 +26,11 @@ const MAX_GEOBLOCK_AGE_NS: u64 = 5_000_000_000;
 const MAX_FINALIZED_BLOCK_AGE_MS: u64 = 30_000;
 const MAX_FINALIZED_BLOCK_FUTURE_MS: u64 = 5_000;
 const MAX_ACCOUNT_WIDE_CUT_PAGES: u16 = 1_024;
-const MAX_ACCOUNT_WIDE_ROWS: u32 = 65_536;
-const MAX_POSITION_PAGES: u8 = 100;
-const MAX_POSITION_ROWS: u16 = 50_000;
+const MAX_OPEN_ORDER_ROWS: u32 = 1_024;
+const MAX_TRADE_ROWS: u32 = 8_192;
+const MAX_EXACT_DETAIL_ROWS: u32 = 1_024;
+const MAX_POSITION_PAGES: u8 = 21;
+const MAX_POSITION_ROWS: u16 = 10_499;
 const PREFLIGHT_FINGERPRINT_DOMAIN: &[u8] = b"reap.pm-t2.controlled-trial.preflight.v1\0";
 
 const GEOBLOCK_ENDPOINT: &str = "https://polymarket.com/api/geoblock";
@@ -514,7 +516,7 @@ impl TrialPreflightEvidence {
             now_monotonic_ns,
         )?;
         self.validate_environment(config, &bounds)?;
-        self.validate_market(config, &bounds)?;
+        self.validate_market(config, authorization, &bounds)?;
         self.validate_book(config, &bounds)?;
         self.validate_account(config, &bounds)?;
         self.validate_chain(config, &bounds)?;
@@ -602,6 +604,7 @@ impl TrialPreflightEvidence {
     fn validate_market(
         &self,
         config: &CanonicalTrialConfig,
+        authorization: &CanonicalAuthorization,
         bounds: &ObservationBounds,
     ) -> Result<(), PmTrialPreflightError> {
         let expected = config.value();
@@ -630,6 +633,11 @@ impl TrialPreflightEvidence {
             || !market.order_book_enabled
             || market.tick != expected.order.tick
             || market.minimum_order_size != expected.order.minimum_order_size
+            || market.maker_base_fee_bps != expected.market.maker_base_fee_bps
+            || market.taker_base_fee_bps != expected.market.taker_base_fee_bps
+            || market.fee_rate.as_deref() != Some(expected.market.fee_rate.as_str())
+            || market.fee_exponent.as_deref() != Some(expected.market.fee_exponent.as_str())
+            || market.fee_taker_only != Some(expected.market.fee_taker_only)
         {
             return Err(invalid(
                 "market identity, lifecycle, domain, or numerics drifted",
@@ -640,9 +648,7 @@ impl TrialPreflightEvidence {
         validate_fee_decimal(market.fee_rate.as_deref())?;
         validate_fee_decimal(market.fee_exponent.as_deref())?;
         if market.maker_base_fee_bps != 0
-            || market.fee_rate.is_none()
-            || market.fee_exponent.is_none()
-            || market.fee_taker_only.is_none()
+            || market.fee_taker_only != Some(true)
             || !market.fee_policy_reviewed_and_supported
             || market.take_only_delay_enabled
             || market.seconds_delay != 0
@@ -655,15 +661,27 @@ impl TrialPreflightEvidence {
                 "market fee, delay, order-age, or lifecycle policy is unsupported",
             ));
         }
-        for timestamp in [
-            market.accepting_order_timestamp_utc.as_deref(),
-            market.game_start_time_utc.as_deref(),
-            market.end_time_utc.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
+        let accepting_order_timestamp = market
+            .accepting_order_timestamp_utc
+            .as_deref()
+            .map(parse_canonical_utc)
+            .transpose()?;
+        let end_time = market
+            .end_time_utc
+            .as_deref()
+            .ok_or_else(|| invalid("non-sports market lacks an exact end timestamp"))
+            .and_then(parse_canonical_utc)?;
+        let cleanup_not_after = parse_canonical_utc(&authorization.value().cleanup_not_after_utc)?;
+        if market.game_start_time_utc.is_some()
+            || accepting_order_timestamp
+                .map(positive_unix_millis)
+                .transpose()?
+                .is_some_and(|timestamp| timestamp > bounds.validated_unix_ms)
+            || end_time <= cleanup_not_after
         {
-            parse_canonical_utc(timestamp)?;
+            return Err(invalid(
+                "non-sports market lifecycle does not remain safe through cleanup",
+            ));
         }
         Ok(())
     }
@@ -698,6 +716,10 @@ impl TrialPreflightEvidence {
         price
             .validate_tick(tick)
             .map_err(|_| invalid("exact order price is no longer tick aligned"))?;
+        bid.validate_tick(tick)
+            .map_err(|_| invalid("best bid is no longer tick aligned"))?;
+        ask.validate_tick(tick)
+            .map_err(|_| invalid("best ask is no longer tick aligned"))?;
         if bid >= ask {
             return Err(invalid("book is crossed or locked"));
         }
@@ -1043,6 +1065,8 @@ impl TrialPreflightWindow {
             .checked_add(maximum_age_ns)
             .ok_or_else(|| invalid("preflight monotonic deadline overflows"))?;
         if self.maximum_observation_age_ms == 0
+            || self.maximum_observation_age_ms > MAX_PREFLIGHT_OBSERVATION_AGE_MS
+            || expected_maximum_age_ms > MAX_PREFLIGHT_OBSERVATION_AGE_MS
             || self.maximum_observation_age_ms != expected_maximum_age_ms
             || deadline != expected_deadline
             || self.dispatch_deadline_monotonic_ns != expected_monotonic_deadline
@@ -1216,16 +1240,24 @@ impl TrialCompleteCutEvidence {
     ) -> Result<(), PmTrialPreflightError> {
         bounds.validate_stamp(&self.stamp)?;
         validate_sha256(&self.response_set_sha256)?;
+        let (maximum_rows, incomplete) = match label {
+            "open-order" => (
+                MAX_OPEN_ORDER_ROWS,
+                invalid("account-wide open-order cut is incomplete"),
+            ),
+            "trade" => (
+                MAX_TRADE_ROWS,
+                invalid("account-wide trade cut is incomplete"),
+            ),
+            _ => return Err(invalid("account-wide cut kind is unsupported")),
+        };
         if self.pages_observed == 0
             || self.pages_observed > MAX_ACCOUNT_WIDE_CUT_PAGES
-            || self.rows_observed > MAX_ACCOUNT_WIDE_ROWS
+            || self.rows_observed > maximum_rows
             || !self.terminal_cursor_observed
             || !self.complete
         {
-            return Err(match label {
-                "open-order" => invalid("account-wide open-order cut is incomplete"),
-                _ => invalid("account-wide trade cut is incomplete"),
-            });
+            return Err(incomplete);
         }
         Ok(())
     }
@@ -1235,8 +1267,8 @@ impl TrialExactDetailCutEvidence {
     fn validate(&self, bounds: &ObservationBounds) -> Result<(), PmTrialPreflightError> {
         bounds.validate_stamp(&self.stamp)?;
         validate_sha256(&self.response_set_sha256)?;
-        if self.implicated_order_id_count > MAX_ACCOUNT_WIDE_ROWS
-            || self.exact_detail_count > MAX_ACCOUNT_WIDE_ROWS
+        if self.implicated_order_id_count > MAX_EXACT_DETAIL_ROWS
+            || self.exact_detail_count > MAX_EXACT_DETAIL_ROWS
             || !self.complete
         {
             return Err(invalid("exact-order detail cut is incomplete"));
@@ -1522,7 +1554,7 @@ mod tests {
 
     #[test]
     fn reconnect_fee_order_age_book_and_chain_fail_closed() {
-        let mutations: [fn(&mut TrialPreflightEvidence); 7] = [
+        let mutations: [fn(&mut TrialPreflightEvidence); 11] = [
             |value| {
                 value.reconciliation.user_stream.reconnect_count = 1;
                 value
@@ -1535,6 +1567,10 @@ mod tests {
                     .complete_cuts_refreshed_after_latest_reconnect = false;
             },
             |value| value.market.maker_base_fee_bps = 1,
+            |value| value.market.taker_base_fee_bps = 1,
+            |value| value.market.fee_rate = Some("0.021".into()),
+            |value| value.market.fee_exponent = Some("3.0".into()),
+            |value| value.market.fee_taker_only = Some(false),
             |value| value.market.fee_policy_reviewed_and_supported = false,
             |value| value.market.minimum_order_age_seconds = 1,
             |value| value.book.best_ask = "0.5".into(),
@@ -1542,6 +1578,70 @@ mod tests {
             |value| value.finalized_chain.conditional_tokens_operator_approved = false,
         ];
         assert_mutations_rejected(TrialPhase::APlaceCancel, &mutations);
+    }
+
+    #[test]
+    fn lifecycle_tick_and_collection_caps_are_derived_and_fail_closed() {
+        let mutations: [fn(&mut TrialPreflightEvidence); 11] = [
+            |value| {
+                value.market.accepting_order_timestamp_utc = Some("2026-08-09T12:05:05Z".into())
+            },
+            |value| value.market.game_start_time_utc = Some("2026-08-10T12:00:00Z".into()),
+            |value| value.market.end_time_utc = None,
+            |value| value.market.end_time_utc = Some("2026-08-09T12:20:00Z".into()),
+            |value| value.market.resolution_not_imminent = false,
+            |value| value.book.best_bid = "0.491".into(),
+            |value| value.book.best_ask = "0.519".into(),
+            |value| value.data_api_position.pages_observed = 22,
+            |value| value.data_api_position.rows_observed = 10_500,
+            |value| value.reconciliation.account_wide_open_orders.rows_observed = 1_025,
+            |value| value.reconciliation.account_wide_trades.rows_observed = 8_193,
+        ];
+        assert_mutations_rejected(TrialPhase::APlaceCancel, &mutations);
+
+        let fixture = Fixture::new(TrialPhase::APlaceCancel);
+        let mut exact_detail_overflow = evidence(&fixture.config, &fixture.authorization);
+        exact_detail_overflow
+            .reconciliation
+            .user_stream
+            .business_event_count = 1;
+        exact_detail_overflow
+            .reconciliation
+            .account_wide_trades
+            .rows_observed = 1_025;
+        exact_detail_overflow
+            .reconciliation
+            .exact_details
+            .implicated_order_id_count = 1_025;
+        exact_detail_overflow
+            .reconciliation
+            .exact_details
+            .exact_detail_count = 1_025;
+        assert!(validate_evidence(&fixture, &exact_detail_overflow).is_err());
+    }
+
+    #[test]
+    fn position_trade_and_exact_detail_caps_accept_the_exact_inclusive_boundary() {
+        let fixture = Fixture::new(TrialPhase::APlaceCancel);
+        let mut position = evidence(&fixture.config, &fixture.authorization);
+        position.data_api_position.pages_observed = 21;
+        position.data_api_position.rows_observed = 10_499;
+        assert!(validate_evidence(&fixture, &position).is_ok());
+
+        let mut trades = evidence(&fixture.config, &fixture.authorization);
+        trades.reconciliation.user_stream.business_event_count = 1;
+        trades.reconciliation.account_wide_trades.rows_observed = 8_192;
+        assert!(validate_evidence(&fixture, &trades).is_ok());
+
+        let mut details = evidence(&fixture.config, &fixture.authorization);
+        details.reconciliation.user_stream.business_event_count = 1;
+        details.reconciliation.account_wide_trades.rows_observed = 1_024;
+        details
+            .reconciliation
+            .exact_details
+            .implicated_order_id_count = 1_024;
+        details.reconciliation.exact_details.exact_detail_count = 1_024;
+        assert!(validate_evidence(&fixture, &details).is_ok());
     }
 
     #[test]
@@ -1795,11 +1895,11 @@ mod tests {
                 order_book_enabled: true,
                 tick: value.order.tick.clone(),
                 minimum_order_size: value.order.minimum_order_size.clone(),
-                maker_base_fee_bps: 0,
-                taker_base_fee_bps: 0,
-                fee_rate: Some("0.020".into()),
-                fee_exponent: Some("2.0".into()),
-                fee_taker_only: Some(true),
+                maker_base_fee_bps: value.market.maker_base_fee_bps,
+                taker_base_fee_bps: value.market.taker_base_fee_bps,
+                fee_rate: Some(value.market.fee_rate.clone()),
+                fee_exponent: Some(value.market.fee_exponent.clone()),
+                fee_taker_only: Some(value.market.fee_taker_only),
                 fee_policy_reviewed_and_supported: true,
                 take_only_delay_enabled: false,
                 seconds_delay: 0,
@@ -2054,6 +2154,11 @@ mod tests {
                 exchange: "0xE111180000d2663C0091e4f400237545B87B996B".into(),
                 pusd_contract: "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB".into(),
                 conditional_tokens_contract: "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045".into(),
+                maker_base_fee_bps: 0,
+                taker_base_fee_bps: 0,
+                fee_rate: "0.020".into(),
+                fee_exponent: "2.0".into(),
+                fee_taker_only: true,
             },
             order: TrialOrder {
                 salt: 1,

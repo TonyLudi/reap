@@ -162,6 +162,26 @@ fn order_profile_rejects_type_zero_equal_identity_wrong_amount_and_phase_b_sell(
 }
 
 #[test]
+fn canonical_config_binds_exact_fee_tuple_and_five_second_preflight_age_cap() {
+    let mutations: [fn(&mut TrialConfig); 6] = [
+        |config| config.time_limits.maximum_preflight_observation_age_ms = 5_001,
+        |config| config.market.maker_base_fee_bps = 1,
+        |config| config.market.taker_base_fee_bps = 10_001,
+        |config| config.market.fee_rate = "1e-2".into(),
+        |config| config.market.fee_exponent = "2.".into(),
+        |config| config.market.fee_taker_only = false,
+    ];
+    for mutate in mutations {
+        let directory = protected_dir();
+        let path = directory.path().join("invalid-fee-or-age.json");
+        let mut config = trial_config();
+        mutate(&mut config);
+        write_0600(&path, &serde_json::to_vec(&config).unwrap());
+        assert!(load_canonical_trial_config(&path).is_err());
+    }
+}
+
+#[test]
 fn canonical_config_derives_one_exact_no_secret_public_place_identity() {
     let directory = protected_dir();
     let path = directory.path().join("identity-config.json");
@@ -613,6 +633,11 @@ fn trial_config() -> TrialConfig {
             exchange: "0xE111180000d2663C0091e4f400237545B87B996B".into(),
             pusd_contract: "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB".into(),
             conditional_tokens_contract: "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045".into(),
+            maker_base_fee_bps: 0,
+            taker_base_fee_bps: 0,
+            fee_rate: "0.020".into(),
+            fee_exponent: "2.0".into(),
+            fee_taker_only: true,
         },
         order: TrialOrder {
             salt: 1,

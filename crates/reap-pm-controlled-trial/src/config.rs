@@ -28,6 +28,8 @@ pub const PM_T2_LIVE_DISPATCH_JOURNAL_FILE_V1: &str =
     "pm-t2-controlled-trial-live-dispatch-v1.jsonl";
 const MAX_CANONICAL_RECORD_BYTES: usize = 128 * 1024;
 const MAX_AUTHORIZATION_LIFETIME_SECONDS: i64 = 15 * 60;
+pub(crate) const MAX_PREFLIGHT_OBSERVATION_AGE_MS: u64 = 5_000;
+const MAX_BASE_FEE_BPS: u64 = 10_000;
 const CONFIG_FINGERPRINT_DOMAIN: &[u8] = b"reap.pm-t2.controlled-trial.config.v1\0";
 const PLAN_FINGERPRINT_DOMAIN: &[u8] = b"reap.pm-t2.controlled-trial.plan.v1\0";
 const AUTHORIZATION_FINGERPRINT_DOMAIN: &[u8] = b"reap.pm-t2.controlled-trial.authorization.v1\0";
@@ -96,6 +98,11 @@ pub struct TrialMarket {
     pub exchange: String,
     pub pusd_contract: String,
     pub conditional_tokens_contract: String,
+    pub maker_base_fee_bps: u64,
+    pub taker_base_fee_bps: u64,
+    pub fee_rate: String,
+    pub fee_exponent: String,
+    pub fee_taker_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,6 +273,16 @@ impl TrialConfig {
         parse_address(&self.market.exchange)?;
         parse_address(&self.market.pusd_contract)?;
         parse_address(&self.market.conditional_tokens_contract)?;
+        validate_fee_lexeme(&self.market.fee_rate)?;
+        validate_fee_lexeme(&self.market.fee_exponent)?;
+        if self.market.maker_base_fee_bps != 0
+            || self.market.taker_base_fee_bps > MAX_BASE_FEE_BPS
+            || !self.market.fee_taker_only
+        {
+            return Err(invalid(
+                "reviewed market fee tuple is outside the maker-zero taker-only profile",
+            ));
+        }
 
         let price = PmPrice::parse_decimal(&self.order.price)
             .map_err(|_| invalid("order price is not canonical"))?;
@@ -365,6 +382,7 @@ impl TrialConfig {
     fn validate_time(&self) -> Result<(), PmTrialConfigError> {
         let limits = &self.time_limits;
         if limits.maximum_preflight_observation_age_ms == 0
+            || limits.maximum_preflight_observation_age_ms > MAX_PREFLIGHT_OBSERVATION_AGE_MS
             || limits.maximum_resting_duration_ms == 0
             || limits.primary_cancel_deadline_ms == 0
             || limits.cleanup_not_after_ms == 0
@@ -786,6 +804,27 @@ fn validate_reference(value: &str, message: &'static str) -> Result<(), PmTrialC
         || value.bytes().any(|byte| !(0x21..=0x7e).contains(&byte))
     {
         return Err(invalid(message));
+    }
+    Ok(())
+}
+
+fn validate_fee_lexeme(value: &str) -> Result<(), PmTrialConfigError> {
+    let mut dot_seen = false;
+    if value.is_empty()
+        || value.len() > 64
+        || !value.as_bytes()[0].is_ascii_digit()
+        || !value.as_bytes()[value.len() - 1].is_ascii_digit()
+        || serde_json::from_str::<serde_json::Number>(value).is_err()
+        || value.bytes().any(|byte| {
+            if byte == b'.' && !dot_seen {
+                dot_seen = true;
+                false
+            } else {
+                !byte.is_ascii_digit()
+            }
+        })
+    {
+        return Err(invalid("reviewed market fee lexeme is invalid"));
     }
     Ok(())
 }
