@@ -190,7 +190,6 @@ pub fn derive_owned_cancel_semantic_request_commitment(
 /// One fixed-profile signed order. It can only be consumed into the fixed
 /// GTC/post-only place body.
 pub struct SignedClobV2Order {
-    domain: PmClobDomain,
     salt: PmOrderSalt,
     maker: EoaAddress,
     signer: EoaAddress,
@@ -202,6 +201,7 @@ pub struct SignedClobV2Order {
     timestamp_ms: u64,
     signature: Zeroizing<[u8; 65]>,
     expected_order_id: ExpectedOrderId,
+    semantic_request_commitment: PlaceSemanticRequestCommitment,
 }
 
 impl SignedClobV2Order {
@@ -329,7 +329,6 @@ impl FixedEoaSigner {
         encoded_signature[64] = 27 + recovery_id.to_byte();
 
         Ok(SignedClobV2Order {
-            domain,
             salt: order.salt(),
             maker: EoaAddress::from_bytes(order.maker().bytes()),
             signer: self.address(),
@@ -341,6 +340,7 @@ impl FixedEoaSigner {
             timestamp_ms: order.timestamp_ms(),
             signature: encoded_signature,
             expected_order_id: public_identity.expected_order_id(),
+            semantic_request_commitment: public_identity.semantic_request_commitment(),
         })
     }
 }
@@ -357,7 +357,7 @@ impl L2Credentials {
             return Err(PmAuthError::CredentialIdentityMismatch);
         }
 
-        let semantic_request_commitment = place_semantic_request_commitment(&order);
+        let semantic_request_commitment = order.semantic_request_commitment;
         let maker = order.maker.to_string();
         let signer = order.signer.to_string();
         let mut signature_text = Zeroizing::new(String::with_capacity(132));
@@ -537,25 +537,6 @@ fn u8_word(value: u8) -> [u8; 32] {
 
 fn runtime_exact_body_commitment(body: &[u8]) -> RuntimeExactBodyCommitment {
     RuntimeExactBodyCommitment::from_bytes(Sha256::digest(body).into())
-}
-
-fn place_semantic_request_commitment(order: &SignedClobV2Order) -> PlaceSemanticRequestCommitment {
-    hash_place_semantic_basis(PlaceSemanticCommitmentBasis {
-        profile: match order.signature_profile {
-            PmClobV2SignatureType::Eoa => FIXED_PLACE_SEMANTIC_PROFILE,
-            PmClobV2SignatureType::Proxy => FIXED_PROXY_PLACE_SEMANTIC_PROFILE,
-        },
-        expected_order_id: order.expected_order_id,
-        domain: order.domain,
-        salt: order.salt,
-        maker: order.maker,
-        signer: order.signer,
-        token_id: order.token_id,
-        maker_amount: order.maker_amount,
-        taker_amount: order.taker_amount,
-        side: order.side,
-        order_timestamp_ms: order.timestamp_ms,
-    })
 }
 
 fn hash_place_semantic_basis(
