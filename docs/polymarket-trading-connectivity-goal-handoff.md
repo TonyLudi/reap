@@ -181,8 +181,10 @@ git diff --check
   (`feat(pm): implement PM-T1 authenticated connectivity`). This atomic commit
   contains 265 non-documentation paths: the complete implementation, schemas,
   fixtures, and executable acceptance evidence.
-- Documentation closeout is the immediately following local commit containing
-  this handoff and the five other PM-T1 documents. No commit was pushed.
+- Documentation/ledger closeout:
+  `b8e4f8801d37cb069de9a6e2d15a4d9a517ee9ad`
+  (`docs(pm): record PM-T1 acceptance ledger exception`). The implementation
+  and documentation commits were published to `origin/master` on 2026-08-09.
 
 The phase work was performed and validated in one shared working tree. A final
 Git audit found no recoverable per-phase refs, reflog checkpoints, stashes, or
