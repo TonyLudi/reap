@@ -240,6 +240,31 @@ impl PreparedAuthorizationConsumption {
         &self.prepared_record
     }
 
+    /// Refresh the held ledger's parent-directory snapshot after the caller
+    /// durably creates one separately bound artifact, then immediately
+    /// revalidate the fixed Prepared ledger identity and exact bytes.
+    ///
+    /// This is evidence custody only. It neither consumes the authorization
+    /// nor grants dispatch authority.
+    pub fn refresh_after_bound_artifact_create(
+        &mut self,
+    ) -> Result<(), PmAuthorizationConsumptionError> {
+        self.journal
+            .refresh_parent_after_bound_create()
+            .map_err(|_| {
+                PmAuthorizationConsumptionError::Ambiguous(
+                    "Prepared authorization-consumption parent changed after bound artifact creation",
+                )
+            })?;
+        self.journal
+            .validate_exact_bytes(&self.ledger_bytes)
+            .map_err(|_| {
+                PmAuthorizationConsumptionError::Ambiguous(
+                    "held Prepared authorization-consumption ledger changed",
+                )
+            })
+    }
+
     /// Atomically burn the authorization before a future runner may consider
     /// constructing any authenticated dispatch grant or signed-send capability.
     pub fn consume(

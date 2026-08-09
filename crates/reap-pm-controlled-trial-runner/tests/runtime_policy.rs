@@ -1,5 +1,7 @@
 const AUTHORITY: &str = include_str!("../src/controlled_trial/authority.rs");
 const CURRENT_RUNTIME: &str = include_str!("../src/controlled_trial/runtime/current_runtime.rs");
+const LINUX_EGRESS_LOCAL_FACTS: &str =
+    include_str!("../src/controlled_trial/runtime/linux_egress_local_facts.rs");
 const PRIVATE_READS: &str = include_str!("../src/controlled_trial/runtime/private_reads.rs");
 const PUBLIC_BOOK: &str = include_str!("../src/controlled_trial/runtime/public_book.rs");
 const USER_STREAM: &str = include_str!("../src/controlled_trial/runtime/user_stream.rs");
@@ -22,6 +24,7 @@ fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
 #[test]
 fn runtime_is_binary_private_read_only_evidence_without_a_transport_escape() {
     assert!(RUNTIME_MOD.contains("mod current_runtime;"));
+    assert!(RUNTIME_MOD.contains("mod linux_egress_local_facts;"));
     assert!(RUNTIME_MOD.contains("mod private_reads;"));
     assert!(RUNTIME_MOD.contains("mod public_book;"));
     assert!(RUNTIME_MOD.contains("mod user_stream;"));
@@ -29,6 +32,10 @@ fn runtime_is_binary_private_read_only_evidence_without_a_transport_escape() {
 
     for (name, source) in [
         ("current runtime", production_prefix(CURRENT_RUNTIME)),
+        (
+            "Linux local-egress facts",
+            production_prefix(LINUX_EGRESS_LOCAL_FACTS),
+        ),
         ("private reads", production_prefix(PRIVATE_READS)),
         ("public book", production_prefix(PUBLIC_BOOK)),
         ("user stream", production_prefix(USER_STREAM)),
@@ -249,7 +256,7 @@ fn current_runtime_is_source_owned_move_only_and_consumingly_rechecked() {
     assert!(MANIFEST.contains("chrono.workspace = true"));
     assert!(MANIFEST.contains("reap-pm-controlled-trial.workspace = true"));
     assert!(MANIFEST.contains(
-        "rustix = { version = \"=1.1.4\", features = [\"fs\", \"process\", \"system\"] }"
+        "rustix = { version = \"=1.1.4\", features = [\"fs\", \"net\", \"process\", \"system\", \"thread\"] }"
     ));
     assert!(MANIFEST.contains("sha2.workspace = true"));
     assert_eq!(
@@ -299,6 +306,287 @@ fn current_runtime_is_source_owned_move_only_and_consumingly_rechecked() {
         assert!(
             !final_witness_impl.contains(forbidden),
             "non-authoritative runtime witness gained decomposition/authority `{forbidden}`",
+        );
+    }
+}
+
+#[test]
+fn linux_egress_local_facts_are_fd_held_source_facts_without_a_stale_positive_bearer() {
+    let production = production_prefix(LINUX_EGRESS_LOCAL_FACTS);
+    let capture_signature = between(
+        production,
+        "pub(super) fn capture(",
+        ") -> Result<Self, PmLinuxEgressLocalFactError>",
+    );
+    for required in [
+        "authorization: &CanonicalOnlineAuthorizationV2",
+        "reviewed_nonsecret_profile_path: &Path",
+    ] {
+        assert!(capture_signature.contains(required));
+    }
+    for forbidden in [
+        "network_namespace_device:",
+        "network_namespace_inode:",
+        "interface_name:",
+        "interface_index:",
+        "local_source_ip:",
+        "profile_sha256:",
+        "process_id:",
+        "thread_id:",
+        "now:",
+        "clock:",
+    ] {
+        assert!(
+            !capture_signature.contains(forbidden),
+            "local-egress capture gained caller fact `{forbidden}`",
+        );
+    }
+
+    for required in [
+        "pub(super) struct PmLinuxEgressLocalFactCustody",
+        "held_network_namespace: File",
+        "network_namespace_device: u64",
+        "network_namespace_inode: u64",
+        "interface_name: Box<str>",
+        "interface_index: u32",
+        "local_source_ip: IpAddr",
+        "reviewed_profile: HeldReviewedEgressProfile",
+        "online_authorization_fingerprint: Box<str>",
+        "source_thread_id: u32",
+        "effective_user_id: u32",
+        "wall_started: SystemTime",
+        "wall_completed: SystemTime",
+        "monotonic_started: Instant",
+        "monotonic_completed: Instant",
+        "thread_confinement: Rc<()>",
+        "thread_confinement: Rc::new(())",
+        "path_text != reviewed_reference",
+        "!path.is_absolute()",
+        "components.next() != Some(Component::RootDir)",
+        "let Component::Normal(segment) = component else",
+        "if normalized != path_text",
+        "const PROC_THREAD_NET_NAMESPACE_ENTRY: &str = \"thread-self/ns/net\"",
+        "const NSFS_MAGIC: rustix::fs::FsWord = 0x6e73_6673",
+        "rustix::fs::fstatfs(&descriptor)",
+        "filesystem.f_type != NSFS_MAGIC",
+        "rustix::thread::gettid().as_raw_pid()",
+        "let effective_user_id = rustix::process::geteuid().as_raw()",
+        "authorization.value().host.linux_euid",
+        "let final_effective_user_id = rustix::process::geteuid().as_raw()",
+        "final_effective_user_id != effective_user_id",
+        "rustix::net::netdevice::name_to_index(&ioctl, expected_name)",
+        "rustix::net::netdevice::index_to_name(&ioctl, expected_index)",
+        "getifaddrs()",
+        "InterfaceFlags::IFF_UP",
+        "InterfaceFlags::IFF_LOOPBACK",
+        "as_sockaddr_in()",
+        "as_sockaddr_in6()",
+        "ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS",
+        "regular_file: metadata.file_type().is_file()",
+        "if !identity.regular_file",
+        "identity.mode != 0o600",
+        "identity.link_count != 1",
+        "lower_hex(&sha256) != expected_sha256",
+        "online_authorization_fingerprint: authorization.fingerprint().into()",
+        "<move-only; held-local-facts; non-authoritative>",
+        "observes no",
+        "route, destination, DNS answer, connected socket, geoblock response, NAT",
+        "cannot construct an online runtime binding",
+        "must never become a stale positive bearer on its own",
+        "future actor must invoke",
+        "capture on its own dedicated OS thread",
+        "structurally neither `Send` nor `Sync`",
+        "final identity check and rehash are deliberately absent here",
+        "selected actor's immediate connection boundary",
+    ] {
+        assert!(
+            production.contains(required),
+            "Linux local-egress source lost `{required}`",
+        );
+    }
+
+    let final_interface = production
+        .find("let final_interface = observe_exact_assigned_interface(")
+        .expect("final exact-interface observation");
+    let final_namespace = production
+        .find("let final_namespace = observe_thread_network_namespace_identity()?")
+        .expect("post-interface namespace observation");
+    let final_thread = production
+        .find("current_thread_id()? != source_thread_id")
+        .expect("post-interface thread observation");
+    let final_effective_user = production
+        .find("let final_effective_user_id = rustix::process::geteuid().as_raw()")
+        .expect("post-interface effective-user observation");
+    assert!(
+        final_interface < final_namespace
+            && final_namespace < final_thread
+            && final_thread < final_effective_user,
+        "final interface read must be followed by namespace, thread, and EUID checks",
+    );
+    assert_eq!(
+        production
+            .matches("authorization.value().host.linux_euid")
+            .count(),
+        2,
+        "both initial and final EUID samples must bind to authorization",
+    );
+
+    let attributes = production
+        .split_once("pub(super) struct PmLinuxEgressLocalFactCustody")
+        .expect("local-egress custody declaration")
+        .0
+        .rsplit("\n\n")
+        .next()
+        .expect("local-egress custody attributes");
+    for forbidden in ["Clone", "Copy", "Serialize", "Deserialize"] {
+        assert!(!attributes.contains(forbidden));
+        assert!(!production.contains(&format!("{forbidden} for PmLinuxEgressLocalFactCustody")));
+    }
+
+    let custody_fields = between(
+        production,
+        "pub(super) struct PmLinuxEgressLocalFactCustody {\n",
+        "\n}\n\nimpl PmLinuxEgressLocalFactCustody",
+    );
+    for field in custody_fields
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+    {
+        assert!(
+            !field.trim_start().starts_with("pub"),
+            "local-egress custody field visibility escaped: `{field}`",
+        );
+    }
+
+    let custody_impl = between(
+        production,
+        "impl PmLinuxEgressLocalFactCustody {",
+        "impl fmt::Debug for PmLinuxEgressLocalFactCustody",
+    );
+    assert_eq!(custody_impl.matches("pub(super) fn ").count(), 1);
+    assert_eq!(
+        custody_impl.matches("fn ").count(),
+        1,
+        "local-egress custody must have only its one runner-private capture constructor",
+    );
+    assert_eq!(
+        custody_impl.matches("Self {").count(),
+        1,
+        "only capture may construct local-egress custody",
+    );
+    for forbidden in [
+        "fn facts",
+        "fn into_",
+        "fn consume",
+        "fn recheck",
+        "fn revalidate",
+        "fn refresh",
+        "fn authorize",
+        "fn permit",
+        "fn dispatch",
+        "fn transport",
+        "fn route",
+        "fn socket",
+    ] {
+        assert!(
+            !custody_impl.contains(forbidden),
+            "local-egress custody gained stale or authoritative method `{forbidden}`",
+        );
+    }
+    for forbidden in [
+        "pub(crate) fn ",
+        "\npub fn ",
+        "-> PmLinuxEgressLocalFactCustody",
+        "Result<PmLinuxEgressLocalFactCustody",
+        "impl From<",
+        "impl TryFrom<",
+        "impl Into<",
+        "impl TryInto<",
+        "impl AsRef<",
+        "impl Deref",
+        "impl std::ops::Deref",
+        "impl Borrow<",
+        "impl std::borrow::Borrow",
+        "impl std::convert::",
+        "unsafe impl",
+        "impl Send for PmLinuxEgressLocalFactCustody",
+        "impl Sync for PmLinuxEgressLocalFactCustody",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "local-egress custody gained constructor, conversion, or confinement escape `{forbidden}`",
+        );
+    }
+    let custody_impl_headers: Vec<_> = production
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("impl ") && line.contains("PmLinuxEgressLocalFactCustody"))
+        .collect();
+    assert_eq!(
+        custody_impl_headers,
+        [
+            "impl PmLinuxEgressLocalFactCustody {",
+            "impl fmt::Debug for PmLinuxEgressLocalFactCustody {",
+        ],
+        "local-egress custody gained an unreviewed trait or inherent impl",
+    );
+    assert_eq!(
+        production
+            .matches("PmLinuxEgressLocalFactCustody {")
+            .count(),
+        3,
+        "local-egress custody gained a free construction site",
+    );
+    for forbidden in [
+        "reqwest",
+        "tokio_tungstenite",
+        "getaddrinfo",
+        "lookup_host",
+        "OnlineAuthorizationRuntimeBindingV2",
+        "prepare_online_authorization_consumption_v2",
+        "PmProductionGeoblockObservation",
+        "AuthenticatedPlaceRequest",
+        "PmRetainedPlaceRequest",
+        ".connect(",
+        ".bind(",
+        ".send(",
+        ".recv(",
+        "POST /order",
+        "DELETE /order",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "local-egress facts gained forbidden network/authority surface `{forbidden}`",
+        );
+    }
+
+    assert!(MANIFEST.contains(
+        "nix = { version = \"=0.30.1\", default-features = false, features = [\"net\", \"socket\"] }"
+    ));
+    assert!(MANIFEST.contains(
+        "rustix = { version = \"=1.1.4\", features = [\"fs\", \"net\", \"process\", \"system\", \"thread\"] }"
+    ));
+}
+
+#[test]
+fn linux_egress_local_facts_have_no_network_test_matrix() {
+    for required in [
+        "reviewed_profile_path_must_be_exact_absolute_utf8",
+        "numeric_effective_user_must_match_authorization",
+        "current_thread_namespace_source_is_descriptor_pinned_and_stable",
+        "profile_source_holds_exact_nonsecret_bytes_and_rejects_wrong_hash",
+        "capture_clock_window_rejects_regression_and_expiry",
+        "debug_output_is_redacted_and_non_authoritative",
+        "for noncanonical in [",
+        "\"/run/reap/./reviewed-egress.json\"",
+        "\"/run/reap/../reap/reviewed-egress.json\"",
+        "\"/run//reap/reviewed-egress.json\"",
+        "\"/run/reap/reviewed-egress.json/\"",
+        "validate_exact_reviewed_profile_path(Path::new(noncanonical), noncanonical,)",
+    ] {
+        assert!(
+            LINUX_EGRESS_LOCAL_FACTS.contains(required),
+            "Linux local-egress test matrix lost `{required}`",
         );
     }
 }

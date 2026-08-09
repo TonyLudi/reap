@@ -15,6 +15,7 @@ mod error;
 mod hash;
 mod journal;
 mod live_dispatch;
+mod online_preflight_v2;
 mod protected;
 mod recovery;
 mod recovery_continuation;
@@ -44,6 +45,14 @@ pub use journal::{
 };
 pub use live_dispatch::{
     PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1, PmPhaseAPlaceLiveDispatchProfileV1,
+};
+pub use online_preflight_v2::{
+    PM_PHASE_A_ONLINE_PREFLIGHT_SIDECAR_FILE_V2, PmPendingPhaseAOnlinePreflightBasisV2,
+    PmPhaseAOnlinePreflightDispatchOwnerV2, PmPhaseAOnlinePreflightEvidenceManifestV2,
+    PmPhaseAOnlinePreflightInspectionV2, PmPhaseAOnlinePreflightNetworkDispatchOwnerV2,
+    PmPhaseAOnlinePreflightPostA3FailureReasonV2, PmPhaseAOnlinePreflightPostA3FailureV2,
+    PmPhaseAOnlinePreflightV2Error, create_phase_a_online_preflight_basis_v2,
+    inspect_phase_a_online_preflight_v2,
 };
 pub use recovery::{
     PmPhaseALiveCancelRecoveryRequiredActionV1, PmTrialLiveRecoveryClassificationV1,

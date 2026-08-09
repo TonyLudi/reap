@@ -5,6 +5,7 @@
 //! none of them can construct a production mutation request or transport.
 
 mod current_runtime;
+mod linux_egress_local_facts;
 mod private_reads;
 mod public_book;
 mod user_stream;

@@ -30,6 +30,7 @@ fn crate_has_no_transport_auth_secret_or_mutation_dependency() {
         source("lib.rs"),
         source("journal.rs"),
         source("live_dispatch.rs"),
+        source("online_preflight_v2.rs"),
         source("recovery.rs"),
         source("recovery_continuation.rs"),
         source("schema.rs"),
@@ -51,6 +52,73 @@ fn crate_has_no_transport_auth_secret_or_mutation_dependency() {
             "forbidden source surface: {forbidden}"
         );
     }
+}
+
+#[test]
+fn online_preflight_v2_is_an_additive_denied_two_record_conjunct() {
+    let online = source("online_preflight_v2.rs");
+    let journal = source("journal.rs");
+    let recovery = source("recovery.rs");
+    let continuation = source("recovery_continuation.rs");
+    let schema = source("schema.rs");
+
+    assert!(online.contains("PM_PHASE_A_ONLINE_PREFLIGHT_SIDECAR_FILE_V2"));
+    assert!(online.contains("OnlinePreflightSidecarBodyV2::Basis"));
+    assert!(online.contains("OnlinePreflightSidecarBodyV2::A3Conjunct"));
+    assert!(online.contains("ProtectedJournal::create_new"));
+    assert!(online.contains("sidecar.append_durable(&[], &encoded)"));
+    assert!(online.contains("append_durable(&expected_sidecar_bytes, &encoded)"));
+    assert!(online.contains("OfflineAuthorizationState::DENIED"));
+    assert!(online.contains("network_send_authority"));
+    assert!(online.contains("v2_consumption\n            .consume"));
+    assert!(online.contains("v1_consumption\n            .consume"));
+    assert!(online.contains("record_phase_a_place_live_dispatch_authorized"));
+    assert!(!online.contains("ExistingV1LifecycleOnlyNoPlacementResume"));
+    assert!(!online.contains("pub fn into_parts"));
+    assert!(!online.contains("pub fn send"));
+    assert!(!online.contains("Hmac"));
+    assert!(!online.contains("SerializedPlaceRequest"));
+    for owner in [
+        "PmPendingPhaseAOnlinePreflightBasisV2",
+        "PmPhaseAOnlinePreflightDispatchOwnerV2",
+        "PmPhaseAOnlinePreflightNetworkDispatchOwnerV2",
+        "PmPhaseAOnlinePreflightPostA3FailureV2",
+    ] {
+        assert!(online.contains(&format!("pub struct {owner}")));
+        assert!(!online.contains(&format!("impl Clone for {owner}")));
+        assert!(!online.contains(&format!("impl Serialize for {owner}")));
+        assert!(!online.contains(&format!("impl Deserialize for {owner}")));
+    }
+    let pending_impl = online
+        .split_once("impl PmPendingPhaseAOnlinePreflightBasisV2 {")
+        .expect("pending V2 owner impl")
+        .1
+        .split_once("impl fmt::Debug for PmPendingPhaseAOnlinePreflightBasisV2")
+        .expect("bounded pending V2 owner impl")
+        .0;
+    assert!(!pending_impl.contains("public_request_identity"));
+    assert!(!pending_impl.contains("l2_timestamp_seconds"));
+    let composite_impl = online
+        .split_once("impl PmPhaseAOnlinePreflightDispatchOwnerV2 {")
+        .expect("composite V2 owner impl")
+        .1
+        .split_once("impl fmt::Debug for PmPhaseAOnlinePreflightDispatchOwnerV2")
+        .expect("bounded composite V2 owner impl")
+        .0;
+    assert!(composite_impl.contains("pub const fn public_request_identity(&self)"));
+    assert!(composite_impl.contains("pub const fn l2_timestamp_seconds(&self)"));
+    assert!(online.contains("revalidate_phase_a_online_preflight_v2_for_network_dispatch"));
+    assert!(online.contains("self.revalidate_phase_a_place_for_network_dispatch(v1)"));
+    assert!(online.contains("pub fn into_may_have_been_dispatched("));
+    assert!(online.contains("pub fn into_definitely_not_dispatched("));
+    assert!(!online.contains("Deref for PmPhaseAOnlinePreflight"));
+    assert!(!online.contains("pub fn v1("));
+    assert!(!online.contains("pub fn profile("));
+
+    assert!(journal.contains("refresh_after_online_preflight_v2_artifact_create"));
+    assert!(!schema.contains("OnlinePreflight"));
+    assert!(!recovery.contains("OnlinePreflight"));
+    assert!(!continuation.contains("OnlinePreflight"));
 }
 
 #[test]

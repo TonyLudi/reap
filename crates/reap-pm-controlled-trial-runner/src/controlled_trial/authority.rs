@@ -10,7 +10,7 @@ use std::{
 use async_trait::async_trait;
 use reap_pm_controlled_trial_live::{
     PmCancelDispatchClassV1, PmDurablePlacePreparedAckV1,
-    PmRevalidatedPhaseALiveCancelDispatchOwnerV1, PmRevalidatedPhaseAPlaceLiveDispatchOwnerV1,
+    PmRevalidatedPhaseALiveCancelDispatchOwnerV1,
 };
 use reap_pm_core::PmConditionId;
 use reap_polymarket_auth::{
@@ -570,9 +570,9 @@ impl fmt::Debug for SealedPmT2ProxyPlacePreparation {
 }
 
 /// The only continuation produced by successful preparation. It exposes the
-/// public journal identity and nothing from the signed body or L2 bundle. Its
-/// finalize method consumes both this continuation and a later private
-/// authorization/time proof.
+/// public journal identity and nothing from the signed body or L2 bundle.
+/// Production intentionally has no final-HMAC method until a sealed,
+/// runner-private online permit exists.
 #[must_use = "the signer-dropped prepared place must be durably joined or shut down"]
 pub(super) struct SignerDroppedPlacePreparation {
     public_identity: PlacePublicRequestIdentity,
@@ -583,26 +583,11 @@ impl SignerDroppedPlacePreparation {
     pub(super) const fn public_identity(&self) -> PlacePublicRequestIdentity {
         self.public_identity
     }
+}
 
-    pub(super) async fn finalize_place_once(
-        self,
-        dispatch: &PmRevalidatedPhaseAPlaceLiveDispatchOwnerV1,
-        proof: PmPlaceMutationTimeProof,
-    ) -> Result<OpaqueAuthenticatedPlaceRequest, CredentialAuthorityError> {
-        let profile = dispatch.profile();
-        if profile.public_request_identity() != self.public_identity {
-            return Err(CredentialAuthorityError::PlaceDispatchBindingMismatch);
-        }
-        let authorization = PlaceHmacAdmission {
-            public_identity: profile.public_request_identity(),
-            expected_l2_timestamp_seconds: profile.l2_timestamp_seconds(),
-            proof,
-            #[cfg(test)]
-            test_pause: None,
-        };
-        self.finalize_with_admission(authorization).await
-    }
-
+// BEGIN TEST_ONLY_PLACE_HMAC_ADMISSION
+#[cfg(test)]
+impl SignerDroppedPlacePreparation {
     async fn finalize_with_admission(
         self,
         authorization: PlaceHmacAdmission,
@@ -614,7 +599,6 @@ impl SignerDroppedPlacePreparation {
         .await
     }
 
-    #[cfg(test)]
     async fn finalize_place_once_for_test(
         self,
         public_identity: PlacePublicRequestIdentity,
@@ -630,7 +614,6 @@ impl SignerDroppedPlacePreparation {
         .await
     }
 
-    #[cfg(test)]
     async fn finalize_place_once_paused_for_test(
         self,
         public_identity: PlacePublicRequestIdentity,
@@ -647,6 +630,7 @@ impl SignerDroppedPlacePreparation {
         .await
     }
 }
+// END TEST_ONLY_PLACE_HMAC_ADMISSION
 
 impl fmt::Debug for SignerDroppedPlacePreparation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -658,11 +642,9 @@ impl fmt::Debug for SignerDroppedPlacePreparation {
     }
 }
 
-/// Task-bound join of one positive durable Phase-A dispatch owner and the
-/// source-issued place-time proof. Construction is private to
-/// `SignerDroppedPlacePreparation::finalize_place_once`, which borrows the
-/// unsplittable durable owner while the caller retains it for the later final
-/// network-boundary recheck or a definitely-not-dispatched exchange.
+/// Task-bound join of an eventual sealed online permit and the source-issued
+/// place-time proof. Production currently has no constructor or admission
+/// method; only the explicitly test-gated scalar harness can construct it.
 struct PlaceHmacAdmission {
     public_identity: PlacePublicRequestIdentity,
     expected_l2_timestamp_seconds: u64,

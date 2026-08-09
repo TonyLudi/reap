@@ -10,6 +10,16 @@ fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
         .expect("source policy markers must remain paired")
 }
 
+fn without_between(source: &str, start: &str, end: &str) -> String {
+    let (prefix, tail) = source
+        .split_once(start)
+        .expect("source policy start marker must remain present");
+    let (_, suffix) = tail
+        .split_once(end)
+        .expect("source policy end marker must remain present");
+    format!("{prefix}{suffix}")
+}
+
 fn declaration_prefix<'a>(source: &'a str, declaration: &str) -> &'a str {
     source
         .split_once(declaration)
@@ -97,7 +107,9 @@ fn authority_is_binary_private_and_has_no_raw_secret_or_generic_signing_escape()
 #[test]
 fn place_is_two_stage_consume_once_cancel_is_bounded_and_supervision_is_fail_stop() {
     assert!(AUTHORITY_SOURCE.contains("pub(super) async fn prepare_place_once(\n        self,"));
-    assert!(AUTHORITY_SOURCE.contains("pub(super) async fn finalize_place_once(\n        self,"));
+    assert!(!AUTHORITY_SOURCE.contains("pub(super) async fn finalize_place_once("));
+    assert!(AUTHORITY_SOURCE.contains("async fn finalize_place_once_for_test("));
+    assert!(AUTHORITY_SOURCE.contains("// BEGIN TEST_ONLY_PLACE_HMAC_ADMISSION"));
     assert!(!AUTHORITY_SOURCE.contains("authenticate_place_once"));
     let code = AUTHORITY_SOURCE
         .lines()
@@ -156,19 +168,27 @@ fn place_is_two_stage_consume_once_cancel_is_bounded_and_supervision_is_fail_sto
 }
 
 #[test]
-fn place_preparation_returns_only_public_identity_and_final_hmac_needs_private_proof() {
+fn place_preparation_is_fail_closed_until_a_sealed_online_permit_exists() {
     let production = AUTHORITY_SOURCE
         .split_once("#[cfg(all(test, target_os = \"linux\"))]")
         .map(|(production, _)| production)
         .expect("unit tests must remain after the production authority");
+    let test_only = between(
+        production,
+        "// BEGIN TEST_ONLY_PLACE_HMAC_ADMISSION",
+        "// END TEST_ONLY_PLACE_HMAC_ADMISSION",
+    );
+    let production_without_test_hmac = without_between(
+        production,
+        "// BEGIN TEST_ONLY_PLACE_HMAC_ADMISSION",
+        "// END TEST_ONLY_PLACE_HMAC_ADMISSION",
+    );
     for required in [
         "struct SealedPmT2ProxyPlacePreparation",
         "struct SignerDroppedPlacePreparation",
         "pub(super) const fn public_identity(&self) -> PlacePublicRequestIdentity",
-        "dispatch: &PmRevalidatedPhaseAPlaceLiveDispatchOwnerV1",
         "struct PlaceHmacAdmission",
         "proof: PmPlaceMutationTimeProof",
-        "expected_l2_timestamp_seconds: profile.l2_timestamp_seconds()",
         "struct OpaqueAuthenticatedPlaceRequest",
         ".authenticate_exact_place(",
         "authorization.expected_l2_timestamp_seconds",
@@ -183,20 +203,60 @@ fn place_preparation_returns_only_public_identity_and_final_hmac_needs_private_p
     assert!(production.contains("let Some(prepared) = retained_place.take()"));
     assert!(!production.contains("pub(super) fn new_place_hmac_admission"));
     assert!(!production.contains("pub(super) fn place_hmac_admission"));
-    let finalizer = between(
-        production,
+    for forbidden in [
+        "PmPhaseAOnlinePreflightDispatchOwnerV2",
+        "PmRevalidatedPhaseAPlaceLiveDispatchOwnerV1",
         "pub(super) async fn finalize_place_once(",
         "async fn finalize_with_admission(",
-    );
+    ] {
+        assert!(
+            !production_without_test_hmac.contains(forbidden),
+            "production place authority gained forbidden admission `{forbidden}`",
+        );
+    }
     assert_eq!(
-        finalizer.matches("PlaceHmacAdmission {").count(),
+        production_without_test_hmac
+            .matches("struct PlaceHmacAdmission {")
+            .count(),
         1,
-        "production admission must be minted only from the borrowed durable owner",
+        "the task-private admission declaration must remain unique",
     );
+    let admission_brace_lines = production_without_test_hmac
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains("PlaceHmacAdmission {"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        admission_brace_lines,
+        [
+            "struct PlaceHmacAdmission {",
+            "impl PlaceHmacAdmission {",
+            "impl fmt::Debug for PlaceHmacAdmission {",
+        ],
+        "production must not contain a PlaceHmacAdmission struct literal",
+    );
+    for required in [
+        "#[cfg(test)]\nimpl SignerDroppedPlacePreparation",
+        "async fn finalize_with_admission(",
+        "async fn finalize_place_once_for_test(",
+        "async fn finalize_place_once_paused_for_test(",
+        "expected_l2_timestamp_seconds",
+        "proof: PmPlaceMutationTimeProof",
+    ] {
+        assert!(
+            test_only.contains(required),
+            "test-only HMAC harness is missing `{required}`",
+        );
+    }
+    assert_eq!(test_only.matches("PlaceHmacAdmission {").count(), 2);
+    assert_eq!(test_only.matches("request_place(&self.sender").count(), 1);
     assert!(!production.contains("impl Clone for SignerDroppedPlacePreparation"));
     assert!(!production.contains("impl Clone for PlaceHmacAdmission"));
     assert!(!production.contains("impl Clone for PmPlaceMutationTimeProof"));
     assert!(!production.contains("impl Clone for OpaqueAuthenticatedPlaceRequest"));
+    assert!(!production.contains("PmPhaseAOnlinePreflightDispatchOwnerV2"));
+    assert!(!production.contains("PmRevalidatedPhaseAPlaceLiveDispatchOwnerV1"));
+    assert!(!production.contains("dispatch.profile()"));
     for name in [
         "pub(super) struct FreshPlaceAuthenticationOnce",
         "pub(super) struct SignerDroppedPlacePreparation",
@@ -215,6 +275,8 @@ fn place_preparation_returns_only_public_identity_and_final_hmac_needs_private_p
         "impl PlaceHmacAdmission",
     );
     assert!(admission.contains("proof: PmPlaceMutationTimeProof,"));
+    assert!(!admission.contains("PmPhaseAOnlinePreflightDispatchOwnerV2"));
+    assert!(!admission.contains("dispatch"));
     assert!(!admission.contains("AuthorizedL2Timestamp"));
     assert!(!admission.contains("timestamp: L2Timestamp"));
     let opaque = between(
@@ -236,6 +298,10 @@ fn place_preparation_returns_only_public_identity_and_final_hmac_needs_private_p
         "opaque authenticated request field became visible to sibling composition",
     );
     for forbidden in [
+        "dispatch: &PmPhaseAOnlinePreflightDispatchOwnerV2",
+        "dispatch: &PmRevalidatedPhaseAPlaceLiveDispatchOwnerV1",
+        "dispatch.profile()",
+        "let profile = dispatch",
         "pub(super) fn sender(",
         "pub(super) fn timestamp(",
         "pub(super) fn credentials(",
@@ -248,13 +314,16 @@ fn place_preparation_returns_only_public_identity_and_final_hmac_needs_private_p
         "pub(super) fn into_parts(",
         "pub(super) fn dispatch(",
         "pub(super) fn decompose(",
+        "pub(super) fn owner(",
+        "pub(super) fn v1(",
+        "pub(super) fn profile(",
         "pub(super) fn authenticated_request(",
         "impl OpaqueAuthenticatedPlaceRequest",
         "impl FixedPlaceRequestSink",
     ] {
         assert!(
-            !production.contains(forbidden),
-            "two-stage place seam gained forbidden escape `{forbidden}`",
+            !production_without_test_hmac.contains(forbidden),
+            "fail-closed place seam gained forbidden escape `{forbidden}`",
         );
     }
 }

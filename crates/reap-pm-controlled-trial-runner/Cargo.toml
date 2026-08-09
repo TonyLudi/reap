@@ -11,6 +11,7 @@ path = "src/main.rs"
 async-trait.workspace = true
 chrono.workspace = true
 libc.workspace = true
+nix = { version = "=0.30.1", default-features = false, features = ["net", "socket"] }
 reap-pm-core.workspace = true
 reap-pm-controlled-trial.workspace = true
 reap-pm-controlled-trial-live.workspace = true
@@ -20,7 +21,7 @@ reap-polymarket-auth.workspace = true
 reap-polymarket-live-adapter.workspace = true
 reap-polymarket-wire.workspace = true
 reap-transport.workspace = true
-rustix = { version = "=1.1.4", features = ["fs", "process", "system"] }
+rustix = { version = "=1.1.4", features = ["fs", "net", "process", "system", "thread"] }
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

@@ -1684,6 +1684,40 @@ impl PmControlledTrialLiveJournals {
         Ok(())
     }
 
+    pub(crate) fn validate_online_preflight_v2_place_prepared(
+        &self,
+        prepared: &PmDurablePlacePreparedAckV1,
+    ) -> Result<(), PmTrialLiveJournalError> {
+        prepared.core.require_runtime(&self.runtime)?;
+        let line = self
+            .dispatch
+            .lines
+            .last()
+            .ok_or(PmTrialLiveJournalError::InvalidTransition)?;
+        if line.sequence != prepared.core.sequence
+            || dispatch_fingerprint(line)? != prepared.core.record_fingerprint
+            || !matches!(line.body, DispatchRecordV1::PlacePrepared { .. })
+        {
+            return Err(PmTrialLiveJournalError::ForeignAcknowledgement);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn online_preflight_v2_scope_fingerprint(&self) -> &str {
+        &self.scope.scope_fingerprint
+    }
+
+    /// Refresh every V1 journal parent view after an additive V2 artifact is
+    /// durably created in the same protected artifact directory.
+    pub(crate) fn refresh_after_online_preflight_v2_artifact_create(
+        &mut self,
+    ) -> Result<(), PmTrialLiveJournalError> {
+        self.artifact_lease.refresh_after_bound_create()?;
+        self.intent.file.refresh_parent_after_bound_create()?;
+        self.dispatch.file.refresh_parent_after_bound_create()?;
+        self.validate_phase_a_live_journal_files()
+    }
+
     fn validate_phase_a_live_journal_files(&mut self) -> Result<(), PmTrialLiveJournalError> {
         self.intent.file.validate_exact_bytes(&self.intent.bytes)?;
         self.dispatch
