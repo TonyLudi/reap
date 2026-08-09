@@ -10,12 +10,18 @@
 //!
 //! The V2 authorization is a distinct future authorization lineage, not a
 //! wrapper around or proof of any V1 authorization. It binds the historical
-//! V1 *config* only. A later V2 consumption/A3 design must consume and
-//! fingerprint these exact V2 authorization bytes directly; pairing this
-//! record with, converting from, or falling back to an arbitrary V1
-//! authorization is forbidden.
+//! V1 *config* only. The separate V2 consumption ledger consumes and
+//! fingerprints these exact V2 authorization bytes directly. A later V2 A3
+//! integration must consume that exact V2 authorization and its take-once
+//! evidence; pairing this record with or converting from V1 is forbidden, as is
+//! falling back to an arbitrary V1 authorization is forbidden.
 
-use std::{fmt, net::IpAddr, path::Path, str::FromStr as _};
+use std::{
+    fmt,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    path::Path,
+    str::FromStr as _,
+};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -254,8 +260,41 @@ pub struct OnlineAuthorizationHostBindingV2 {
     pub nss_username: String,
     /// Numeric effective Linux UID. Root is forbidden for this run profile.
     pub linux_euid: u32,
-    /// Canonical textual spelling of one exact authorized egress IP.
-    pub authorized_egress_ip: String,
+    /// Reviewer-owned Linux routing and same-local-egress profile.
+    ///
+    /// The destination-independent NAT statement below is a reviewed
+    /// tunnel/gateway assumption, not an observation that two destinations
+    /// exposed one identical public address. Current source evidence may only
+    /// claim the narrower `SameLocalEgressSelection` fact until a signed
+    /// gateway flow attestor exists.
+    pub egress: ReviewedLinuxEgressProfileV2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewedDestinationIndependentNatV2 {
+    OnePublicIpForPolymarketComAndClobPolymarketCom,
+}
+
+/// Reviewed Linux egress identity for the future current-runtime gate.
+///
+/// `authorized_geoblock_reported_public_ip` is the canonical global-unicast
+/// public IP reported by the reviewed geoblock source. The namespace,
+/// interface, and local source IP identify same-local-egress selection; the
+/// dedicated tunnel/gateway profile is separate reviewer evidence. It supplies
+/// the reviewed destination-independent NAT assumption.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewedLinuxEgressProfileV2 {
+    pub network_namespace_device: u64,
+    pub network_namespace_inode: u64,
+    pub interface_name: String,
+    pub interface_index: u32,
+    pub local_source_ip: String,
+    pub dedicated_tunnel_or_gateway_profile_reference: String,
+    pub dedicated_tunnel_or_gateway_profile_sha256: String,
+    pub destination_independent_nat_assumption: ReviewedDestinationIndependentNatV2,
+    pub authorized_geoblock_reported_public_ip: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -372,7 +411,7 @@ pub struct OnlineAuthorizationV2 {
 impl OnlineAuthorizationV2 {
     fn validate_intrinsic(
         &self,
-    ) -> Result<ParsedOnlineAuthorizationTimesV2, PmOnlinePolicyV2Error> {
+    ) -> Result<ValidatedOnlineAuthorizationTimesV2, PmOnlinePolicyV2Error> {
         if self.schema_version != ONLINE_AUTHORIZATION_V2_SCHEMA_VERSION {
             return Err(invalid("unsupported online-authorization V2 schema"));
         }
@@ -414,10 +453,11 @@ impl OnlineAuthorizationV2 {
             return Err(invalid("online-authorization V2 time envelope is invalid"));
         }
 
-        Ok(ParsedOnlineAuthorizationTimesV2 {
+        Ok(ValidatedOnlineAuthorizationTimesV2 {
             reviewed_at,
             not_before,
             expires_at,
+            cleanup_not_after,
             history_window_start,
             history_reviewed_through,
         })
@@ -448,13 +488,41 @@ impl OnlineAuthorizationV2 {
                 "online-authorization Linux EUID is invalid for the controlled-run profile",
             ));
         }
-        let parsed = IpAddr::from_str(&self.host.authorized_egress_ip)
-            .map_err(|_| invalid("authorized egress identity must be one exact IP address"))?;
-        if parsed.to_string() != self.host.authorized_egress_ip {
+        let egress = &self.host.egress;
+        if egress.network_namespace_device == 0 || egress.network_namespace_inode == 0 {
             return Err(invalid(
-                "authorized egress identity is not in canonical textual form",
+                "online-authorization network namespace identity is invalid",
             ));
         }
+        if egress.interface_name.is_empty()
+            || egress.interface_name.len() > 15
+            || egress
+                .interface_name
+                .bytes()
+                .any(|byte| !byte.is_ascii_alphanumeric() && !matches!(byte, b'_' | b'.' | b'-'))
+        {
+            return Err(invalid(
+                "online-authorization Linux egress interface name is invalid",
+            ));
+        }
+        if egress.interface_index == 0 || egress.interface_index > 2_147_483_647 {
+            return Err(invalid(
+                "online-authorization Linux egress interface index is invalid",
+            ));
+        }
+        validate_egress_ip(
+            &egress.local_source_ip,
+            "online-authorization local source IP is invalid",
+        )?;
+        validate_reference(
+            &egress.dedicated_tunnel_or_gateway_profile_reference,
+            "online-authorization tunnel or gateway profile reference is invalid",
+        )?;
+        validate_sha256(&egress.dedicated_tunnel_or_gateway_profile_sha256)?;
+        validate_public_egress_ip(
+            &egress.authorized_geoblock_reported_public_ip,
+            "online-authorization geoblock-reported public IP is invalid",
+        )?;
         Ok(())
     }
 
@@ -468,12 +536,13 @@ impl OnlineAuthorizationV2 {
     }
 }
 
-struct ParsedOnlineAuthorizationTimesV2 {
-    reviewed_at: DateTime<Utc>,
-    not_before: DateTime<Utc>,
-    expires_at: DateTime<Utc>,
-    history_window_start: DateTime<Utc>,
-    history_reviewed_through: DateTime<Utc>,
+pub(crate) struct ValidatedOnlineAuthorizationTimesV2 {
+    pub(crate) reviewed_at: DateTime<Utc>,
+    pub(crate) not_before: DateTime<Utc>,
+    pub(crate) expires_at: DateTime<Utc>,
+    pub(crate) cleanup_not_after: DateTime<Utc>,
+    pub(crate) history_window_start: DateTime<Utc>,
+    pub(crate) history_reviewed_through: DateTime<Utc>,
 }
 
 /// Move-only, redacted holder of exact canonical online-policy V2 bytes.
@@ -576,7 +645,8 @@ pub struct OnlineAuthorizationVerificationV2 {
     /// or transport.
     pub within_short_lived_window_at_verification: bool,
     pub component_scoped_history_window_structurally_valid: bool,
-    /// Durable consumption is a later, separate gate.
+    /// Durable consumption is a separate gate that this display does not
+    /// inspect.
     pub authorization_consumption_checked: bool,
     #[serde(flatten)]
     pub authorization: OfflineAuthorizationState,
@@ -668,6 +738,37 @@ pub fn verify_online_authorization_v2(
     authorization: &CanonicalOnlineAuthorizationV2,
     now: DateTime<Utc>,
 ) -> Result<OnlineAuthorizationVerificationV2, PmOnlinePolicyV2Error> {
+    let times = validate_online_authorization_contract_v2(config, policy, authorization)?;
+    if now < times.not_before || now >= times.expires_at {
+        return Err(invalid(
+            "online-authorization V2 is early or expired at verification time",
+        ));
+    }
+
+    Ok(OnlineAuthorizationVerificationV2 {
+        schema_version: authorization.value.schema_version,
+        phase: authorization.value.phase,
+        authorization_id: authorization.value.authorization_id.clone(),
+        config_fingerprint: config.fingerprint().to_owned(),
+        online_policy_fingerprint: policy.fingerprint.clone(),
+        online_authorization_fingerprint: authorization.fingerprint.clone(),
+        exact_bindings_structurally_valid: true,
+        within_short_lived_window_at_verification: true,
+        component_scoped_history_window_structurally_valid: true,
+        authorization_consumption_checked: false,
+        authorization: OfflineAuthorizationState::DENIED,
+    })
+}
+
+/// Validate the immutable V2 reviewer contract without consulting a caller
+/// clock. The V2 consumption ledger uses this helper and then checks its own
+/// source-owned runtime observation. It must not call the public offline
+/// `verify_online_authorization_v2(..., now)` display check.
+pub(crate) fn validate_online_authorization_contract_v2(
+    config: &CanonicalTrialConfig,
+    policy: &CanonicalOnlinePolicyV2,
+    authorization: &CanonicalOnlineAuthorizationV2,
+) -> Result<ValidatedOnlineAuthorizationTimesV2, PmOnlinePolicyV2Error> {
     let _ = verify_online_policy_v2(config, policy)?;
     let times = authorization.value.validate_intrinsic()?;
     if authorization.value.phase != TrialPhase::APlaceCancel
@@ -705,25 +806,7 @@ pub fn verify_online_authorization_v2(
             "reviewed status notice history does not cover the configured quiet interval",
         ));
     }
-    if now < times.not_before || now >= times.expires_at {
-        return Err(invalid(
-            "online-authorization V2 is early or expired at verification time",
-        ));
-    }
-
-    Ok(OnlineAuthorizationVerificationV2 {
-        schema_version: authorization.value.schema_version,
-        phase: authorization.value.phase,
-        authorization_id: authorization.value.authorization_id.clone(),
-        config_fingerprint: config.fingerprint().to_owned(),
-        online_policy_fingerprint: policy.fingerprint.clone(),
-        online_authorization_fingerprint: authorization.fingerprint.clone(),
-        exact_bindings_structurally_valid: true,
-        within_short_lived_window_at_verification: true,
-        component_scoped_history_window_structurally_valid: true,
-        authorization_consumption_checked: false,
-        authorization: OfflineAuthorizationState::DENIED,
-    })
+    Ok(times)
 }
 
 #[derive(Debug, Error)]
@@ -848,6 +931,71 @@ fn validate_status_component_id(value: &str) -> Result<(), PmOnlinePolicyV2Error
         return Err(invalid("reviewed status component ID is invalid"));
     }
     Ok(())
+}
+
+fn validate_egress_ip(value: &str, message: &'static str) -> Result<(), PmOnlinePolicyV2Error> {
+    let parsed = IpAddr::from_str(value).map_err(|_| invalid(message))?;
+    if parsed.to_string() != value
+        || parsed.is_unspecified()
+        || parsed.is_loopback()
+        || parsed.is_multicast()
+    {
+        return Err(invalid(message));
+    }
+    Ok(())
+}
+
+/// Require a canonical, globally routable unicast address for the reviewed
+/// geoblock-reported identity. This predicate is deliberately explicit and
+/// conservative instead of inheriting toolchain-dependent `is_global`
+/// semantics. Tunnel-local `local_source_ip` uses the distinct, less
+/// restrictive validator above and may remain private.
+fn validate_public_egress_ip(
+    value: &str,
+    message: &'static str,
+) -> Result<(), PmOnlinePolicyV2Error> {
+    let parsed = IpAddr::from_str(value).map_err(|_| invalid(message))?;
+    if parsed.to_string() != value || !is_public_global_unicast(parsed) {
+        return Err(invalid(message));
+    }
+    Ok(())
+}
+
+fn is_public_global_unicast(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => is_public_global_unicast_v4(address),
+        IpAddr::V6(address) => is_public_global_unicast_v6(address),
+    }
+}
+
+fn is_public_global_unicast_v4(address: Ipv4Addr) -> bool {
+    let [a, b, c, _] = address.octets();
+    !(a == 0
+        || a == 10
+        || (a == 100 && (64..=127).contains(&b))
+        || a == 127
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 192 && b == 88 && c == 99)
+        || (a == 192 && b == 168)
+        || (a == 198 && matches!(b, 18 | 19))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        || a >= 224)
+}
+
+fn is_public_global_unicast_v6(address: Ipv6Addr) -> bool {
+    let segments = address.segments();
+    // Ordinary IPv6 global unicast is 2000::/3. Conservatively exclude the
+    // IETF special-purpose 2001:0000::/23 block, both documentation ranges,
+    // and deprecated 6to4 even though they sit within that aggregate.
+    segments[0] & 0xe000 == 0x2000
+        && !(segments[0] == 0x2001 && segments[1] <= 0x01ff)
+        && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+        && segments[0] != 0x2002
+        && !(segments[0] == 0x3fff && segments[1] & 0xf000 == 0)
 }
 
 fn parse_utc(value: &str) -> Result<DateTime<Utc>, PmOnlinePolicyV2Error> {

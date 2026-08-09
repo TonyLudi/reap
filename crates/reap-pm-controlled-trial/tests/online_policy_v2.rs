@@ -12,7 +12,8 @@ use reap_pm_controlled_trial::{
     OnlineCleanupApprovalV2, OnlineFillRiskApprovalV2, OnlinePhaseScopeApprovalV2,
     OnlinePolicyPinsV2, OnlinePolicyV2, OnlinePostOnlySemanticsApprovalV2,
     OnlineProxyConcurrencyApprovalV2, OnlineSourceSeparationApprovalV2,
-    OperationalObservationProfileV2, ReviewedMarketClassificationV2, ReviewedMarketEvidenceV2,
+    OperationalObservationProfileV2, ReviewedDestinationIndependentNatV2,
+    ReviewedLinuxEgressProfileV2, ReviewedMarketClassificationV2, ReviewedMarketEvidenceV2,
     ReviewedMarketObservationRequirementV2, ReviewedRepositoryStateV2,
     ReviewedStatusClobComponentV2, ReviewedStatusHistoryObservationRequirementV2,
     ReviewedStatusNoticeHistoryCutV2, ReviewedStatusNoticeHistoryFindingV2,
@@ -275,6 +276,19 @@ fn authorization_loader_rejects_duplicate_unknown_noncanonical_null_type_and_sou
     ] {
         assert_authorization_bytes_rejected(drifted.as_bytes());
     }
+
+    let mut legacy_scalar =
+        serde_json::to_value(online_authorization(&fixture.config, &policy)).unwrap();
+    let host = legacy_scalar
+        .get_mut("host")
+        .and_then(serde_json::Value::as_object_mut)
+        .unwrap();
+    host.remove("egress");
+    host.insert(
+        "authorized_egress_ip".into(),
+        serde_json::Value::String("8.8.8.8".into()),
+    );
+    assert_authorization_bytes_rejected(&serde_json::to_vec(&legacy_scalar).unwrap());
 }
 
 #[test]
@@ -306,7 +320,7 @@ fn authorization_rejects_config_policy_build_host_and_component_drift() {
         assert_loaded_authorization_fails_verification(&fixture, &policy, &record);
     }
 
-    let intrinsic_mutations: [fn(&mut OnlineAuthorizationV2); 12] = [
+    let intrinsic_mutations: [fn(&mut OnlineAuthorizationV2); 23] = [
         |record: &mut OnlineAuthorizationV2| record.build.repository_commit = "A1".repeat(20),
         |record: &mut OnlineAuthorizationV2| record.build.cargo_lock_sha256 = "GG".repeat(32),
         |record: &mut OnlineAuthorizationV2| record.build.release_binary_sha256 = "00".repeat(31),
@@ -316,9 +330,38 @@ fn authorization_rejects_config_policy_build_host_and_component_drift() {
         |record: &mut OnlineAuthorizationV2| record.host.nss_username = "bad:user".into(),
         |record: &mut OnlineAuthorizationV2| record.host.linux_euid = 0,
         |record: &mut OnlineAuthorizationV2| record.host.linux_euid = u32::MAX,
-        |record: &mut OnlineAuthorizationV2| record.host.authorized_egress_ip = "not-an-ip".into(),
+        |record: &mut OnlineAuthorizationV2| record.host.egress.network_namespace_device = 0,
+        |record: &mut OnlineAuthorizationV2| record.host.egress.network_namespace_inode = 0,
+        |record: &mut OnlineAuthorizationV2| record.host.egress.interface_name = "".into(),
         |record: &mut OnlineAuthorizationV2| {
-            record.host.authorized_egress_ip = "2001:0db8::1".into()
+            record.host.egress.interface_name = "interface-name-is-too-long".into()
+        },
+        |record: &mut OnlineAuthorizationV2| record.host.egress.interface_name = "eth 0".into(),
+        |record: &mut OnlineAuthorizationV2| record.host.egress.interface_index = 0,
+        |record: &mut OnlineAuthorizationV2| record.host.egress.interface_index = 2_147_483_648,
+        |record: &mut OnlineAuthorizationV2| {
+            record.host.egress.local_source_ip = "not-an-ip".into()
+        },
+        |record: &mut OnlineAuthorizationV2| {
+            record.host.egress.local_source_ip = "127.0.0.1".into()
+        },
+        |record: &mut OnlineAuthorizationV2| {
+            record
+                .host
+                .egress
+                .dedicated_tunnel_or_gateway_profile_reference = "bad reference".into()
+        },
+        |record: &mut OnlineAuthorizationV2| {
+            record
+                .host
+                .egress
+                .dedicated_tunnel_or_gateway_profile_sha256 = "GG".repeat(32)
+        },
+        |record: &mut OnlineAuthorizationV2| {
+            record.host.egress.authorized_geoblock_reported_public_ip = "0.0.0.0".into()
+        },
+        |record: &mut OnlineAuthorizationV2| {
+            record.host.egress.authorized_geoblock_reported_public_ip = "2001:0db8::1".into()
         },
         |record: &mut OnlineAuthorizationV2| {
             record.status_notice_history.clob_component.component_name = "CLOB\n".into()
@@ -327,6 +370,35 @@ fn authorization_rejects_config_policy_build_host_and_component_drift() {
     for mutate in intrinsic_mutations {
         let mut record = online_authorization(&fixture.config, &policy);
         mutate(&mut record);
+        assert_authorization_record_rejected(&record);
+    }
+
+    for non_public in [
+        "0.0.0.0",
+        "10.0.0.1",
+        "100.64.0.1",
+        "127.0.0.1",
+        "169.254.1.1",
+        "192.0.0.1",
+        "192.0.2.1",
+        "192.88.99.1",
+        "192.168.1.1",
+        "198.18.0.1",
+        "198.51.100.1",
+        "203.0.113.7",
+        "224.0.0.1",
+        "240.0.0.1",
+        "::",
+        "::1",
+        "2001:db8::1",
+        "2002:808:808::1",
+        "3fff::1",
+        "fc00::1",
+        "fe80::1",
+        "ff02::1",
+    ] {
+        let mut record = online_authorization(&fixture.config, &policy);
+        record.host.egress.authorized_geoblock_reported_public_ip = non_public.into();
         assert_authorization_record_rejected(&record);
     }
 
@@ -362,6 +434,23 @@ fn authorization_rejects_config_policy_build_host_and_component_drift() {
         "unicode-internal-space-host.json",
         &unicode_internal_space_host,
     );
+    let loaded = load_canonical_online_authorization_v2(&path).unwrap();
+    assert!(
+        verify_online_authorization_v2(
+            &fixture.config,
+            &policy,
+            &loaded,
+            utc("2026-08-09T12:05:00Z"),
+        )
+        .is_ok()
+    );
+
+    let mut global_ipv6 = online_authorization(&fixture.config, &policy);
+    global_ipv6
+        .host
+        .egress
+        .authorized_geoblock_reported_public_ip = "2606:4700:4700::1111".into();
+    let path = fixture.write_json("global-ipv6-egress.json", &global_ipv6);
     let loaded = load_canonical_online_authorization_v2(&path).unwrap();
     assert!(
         verify_online_authorization_v2(
@@ -505,7 +594,19 @@ fn online_authorization(
             boot_id: "01234567-89ab-cdef-0123-456789abcdef".into(),
             nss_username: "reap-trial".into(),
             linux_euid: 1_000,
-            authorized_egress_ip: "203.0.113.7".into(),
+            egress: ReviewedLinuxEgressProfileV2 {
+                network_namespace_device: 4,
+                network_namespace_inode: 4_026_531_999,
+                interface_name: "wg0".into(),
+                interface_index: 7,
+                local_source_ip: "10.0.0.2".into(),
+                dedicated_tunnel_or_gateway_profile_reference:
+                    "reviewed-egress:dedicated-wg0-v2".into(),
+                dedicated_tunnel_or_gateway_profile_sha256: "ab".repeat(32),
+                destination_independent_nat_assumption:
+                    ReviewedDestinationIndependentNatV2::OnePublicIpForPolymarketComAndClobPolymarketCom,
+                authorized_geoblock_reported_public_ip: "8.8.8.8".into(),
+            },
         },
         status_notice_history: ReviewedStatusNoticeHistoryCutV2 {
             source_kind: ReviewedStatusNoticeHistorySourceV2::OfficialPolymarketStatusHistory,

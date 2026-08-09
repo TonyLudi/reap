@@ -17,6 +17,7 @@ pub(crate) enum ProtectedFileKind {
     Authorization,
     OnlinePolicyV2,
     OnlineAuthorizationV2,
+    OnlineAuthorizationConsumptionV2,
     ConsumptionEvidence,
     PrivateKey,
     ApiKey,
@@ -31,6 +32,9 @@ impl std::fmt::Display for ProtectedFileKind {
             Self::Authorization => "authorization",
             Self::OnlinePolicyV2 => "online-policy V2",
             Self::OnlineAuthorizationV2 => "online-authorization V2",
+            Self::OnlineAuthorizationConsumptionV2 => {
+                "online-authorization-consumption V2 evidence"
+            }
             Self::ConsumptionEvidence => "authorization-consumption evidence",
             Self::PrivateKey => "private-key",
             Self::ApiKey => "API-key",

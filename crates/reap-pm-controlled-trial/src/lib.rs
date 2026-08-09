@@ -8,6 +8,7 @@
 mod config;
 mod consumption;
 mod custody;
+mod online_consumption_v2;
 mod online_policy_v2;
 mod preflight;
 mod protected_file;
@@ -35,6 +36,17 @@ pub use consumption::{
 pub use custody::{
     CustodyInspection, CustodyPaths, CustodySummary, PmTrialCustodyError, inspect_custody,
 };
+pub use online_consumption_v2::{
+    ConsumedOnlineAuthorizationConsumptionV2, ONLINE_AUTHORIZATION_CONSUMPTION_V2_SCHEMA_VERSION,
+    OnlineAuthorizationConsumptionAttemptV2, OnlineAuthorizationConsumptionBindingV2,
+    OnlineAuthorizationConsumptionEvidenceV2, OnlineAuthorizationConsumptionStateV2,
+    OnlineAuthorizationConsumptionVerificationV2, OnlineAuthorizationCrashRecoveryV2,
+    OnlineAuthorizationPinsV2, OnlineAuthorizationPlacementReuseV2,
+    OnlineAuthorizationRuntimeBindingV2, PM_T2_ONLINE_AUTHORIZATION_CONSUMPTION_CLAIM_FILE_V2,
+    PM_T2_ONLINE_AUTHORIZATION_CONSUMPTION_LEDGER_FILE_V2, PM_T2_ONLINE_PREFLIGHT_SIDECAR_FILE_V2,
+    PmOnlineAuthorizationConsumptionV2Error, PreparedOnlineAuthorizationConsumptionV2,
+    prepare_online_authorization_consumption_v2, verify_online_authorization_consumption_v2,
+};
 pub use online_policy_v2::{
     CanonicalOnlineAuthorizationV2, CanonicalOnlinePolicyV2,
     ClobLivenessHealthObservationRequirementV2, FreshStatusAnnouncementObservationRequirementV2,
@@ -47,6 +59,7 @@ pub use online_policy_v2::{
     OnlinePolicyPinsV2, OnlinePolicyV2, OnlinePolicyVerificationV2,
     OnlinePostOnlySemanticsApprovalV2, OnlineProxyConcurrencyApprovalV2,
     OnlineSourceSeparationApprovalV2, OperationalObservationProfileV2, PmOnlinePolicyV2Error,
+    ReviewedDestinationIndependentNatV2, ReviewedLinuxEgressProfileV2,
     ReviewedMarketClassificationV2, ReviewedMarketEvidenceV2,
     ReviewedMarketObservationRequirementV2, ReviewedRepositoryStateV2,
     ReviewedStatusClobComponentV2, ReviewedStatusHistoryObservationRequirementV2,

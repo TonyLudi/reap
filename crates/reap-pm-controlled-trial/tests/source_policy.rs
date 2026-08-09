@@ -3,6 +3,7 @@ const LIB: &str = include_str!("../src/lib.rs");
 const CONFIG: &str = include_str!("../src/config.rs");
 const CONSUMPTION: &str = include_str!("../src/consumption.rs");
 const CUSTODY: &str = include_str!("../src/custody.rs");
+const ONLINE_CONSUMPTION_V2: &str = include_str!("../src/online_consumption_v2.rs");
 const ONLINE_POLICY_V2: &str = include_str!("../src/online_policy_v2.rs");
 const PREFLIGHT: &str = include_str!("../src/preflight.rs");
 const PROTECTED: &str = include_str!("../src/protected_file.rs");
@@ -32,6 +33,7 @@ fn source_exposes_only_offline_dry_run_commands_and_no_mutation_route_or_body() 
         CONFIG,
         CONSUMPTION,
         CUSTODY,
+        ONLINE_CONSUMPTION_V2,
         ONLINE_POLICY_V2,
         PREFLIGHT,
         PROTECTED,
@@ -71,8 +73,9 @@ fn online_v2_is_a_separate_canonical_denied_evidence_lineage() {
         "CanonicalOnlinePolicyV2(<reviewed-evidence; exact-canonical-bytes>)",
         "CanonicalOnlineAuthorizationV2(<reviewed-evidence; exact-canonical-bytes>)",
         "OfflineAuthorizationState::DENIED",
-        "A later V2 consumption/A3 design must consume and",
-        "fingerprint these exact V2 authorization bytes directly",
+        "The separate V2 consumption ledger consumes and",
+        "fingerprints these exact V2 authorization bytes directly",
+        "A later V2 A3",
         "falling back to an arbitrary V1",
         "authorization is forbidden",
         "Perform an offline reviewer/CLI structural display check",
@@ -128,12 +131,116 @@ fn online_v2_pins_exact_runtime_and_status_source_domains() {
         "!= policy.value.reviewed_status_clob_component",
         "config.value().phase != TrialPhase::APlaceCancel",
         "!policy.value.v1_config.matches(config)",
+        "pub egress: ReviewedLinuxEgressProfileV2",
+        "pub network_namespace_device: u64",
+        "pub network_namespace_inode: u64",
+        "pub interface_name: String",
+        "pub interface_index: u32",
+        "pub local_source_ip: String",
+        "pub dedicated_tunnel_or_gateway_profile_reference: String",
+        "pub dedicated_tunnel_or_gateway_profile_sha256: String",
+        "pub destination_independent_nat_assumption: ReviewedDestinationIndependentNatV2",
+        "pub authorized_geoblock_reported_public_ip: String",
+        "egress.interface_name.len() > 15",
+        "egress.interface_index > 2_147_483_647",
+        "parsed.is_unspecified()",
+        "parsed.is_loopback()",
+        "parsed.is_multicast()",
+        "validate_public_egress_ip(",
+        "is_public_global_unicast_v4",
+        "is_public_global_unicast_v6",
+        "(a == 100 && (64..=127).contains(&b))",
+        "(a == 198 && b == 51 && c == 100)",
+        "(a == 203 && b == 0 && c == 113)",
+        "segments[0] & 0xe000 == 0x2000",
+        "segments[0] == 0x2001 && segments[1] == 0x0db8",
+        "segments[0] == 0x3fff",
+        "Tunnel-local `local_source_ip` uses the distinct",
+        "restrictive validator above and may remain private",
+        "reviewed destination-independent NAT assumption",
+        "SameLocalEgressSelection",
     ] {
         assert!(
             ONLINE_POLICY_V2.contains(required),
             "missing exact online V2 domain pin `{required}`"
         );
     }
+    assert!(!ONLINE_POLICY_V2.contains("pub authorized_egress_ip: String"));
+    assert!(!ONLINE_POLICY_V2.contains(".is_global()"));
+}
+
+#[test]
+fn online_v2_take_once_consumption_is_separate_denied_evidence_only() {
+    for required in [
+        "ONLINE_AUTHORIZATION_CONSUMPTION_V2_SCHEMA_VERSION",
+        "pm-t2-online-authorization-consumption-v2.jsonl",
+        "pm-t2-online-authorization-consumed-v2.claim",
+        "pm-t2-phase-a-online-preflight-v2.jsonl",
+        "reap.pm-t2.controlled-trial.online-authorization-consumption.binding.v2\\0",
+        "reap.pm-t2.controlled-trial.online-authorization-consumption.record.v2\\0",
+        "reap.pm-t2.controlled-trial.online-authorization-consumption.claim.v2\\0",
+        "PreparedOnlineAuthorizationConsumptionV2",
+        "ConsumedOnlineAuthorizationConsumptionV2",
+        "create_new(",
+        "The create-new, fsynced claim is the take-once linearization point",
+        "OnlineAuthorizationPlacementReuseV2::PermanentlyBurned",
+        "OnlineAuthorizationCrashRecoveryV2::ExistingV1LifecycleOnlyNoPlacementResume",
+        "OfflineAuthorizationState::DENIED",
+        "SameLocalEgressSelection",
+        "validate_online_authorization_contract_v2",
+        ".timestamp_millis()",
+        ".checked_add(cleanup_runway_ms)",
+        "times.cleanup_not_after.timestamp_millis()",
+        "pub fn prepare_online_authorization_consumption_v2(",
+        "pub fn verify_online_authorization_consumption_v2(",
+        "pub fn consume(",
+        "revalidate_held_consumption_evidence",
+        "refresh_after_bound_artifact_create",
+        "ProtectedFileKind::OnlineAuthorizationConsumptionV2",
+        "monotonic crash-durability",
+        "trusted local storage",
+        "post-crash same-EUID actor",
+        "TPM counter, WORM storage, or a",
+        "trusted remote registry",
+        "atomic V2 claim creation may have created its marker; placement is burned",
+        "post_create_claim_errors_are_always_reported_as_burned",
+    ] {
+        assert!(
+            ONLINE_CONSUMPTION_V2.contains(required),
+            "missing V2 consumption source pin `{required}`"
+        );
+    }
+    for forbidden in [
+        "CanonicalAuthorization,",
+        "TrialAuthorization",
+        "CanonicalTrialPreflight",
+        "TrialPreflightEvidence",
+        "response_sha256",
+        "preflight_fingerprint",
+        "claim_prepared_authorization_consumption",
+        "reopen_consumed_authorization_consumption",
+        "PmRevalidatedPhaseAPlaceLiveDispatchOwnerV1",
+        "SignedClobV2Order",
+        "AuthenticatedPlaceRequest",
+        "production_order_entry_authorized: true",
+        "real_order_submission_authorized: true",
+        "impl Clone for PreparedOnlineAuthorizationConsumptionV2",
+        "impl Clone for ConsumedOnlineAuthorizationConsumptionV2",
+        "impl Serialize for PreparedOnlineAuthorizationConsumptionV2",
+        "impl Serialize for ConsumedOnlineAuthorizationConsumptionV2",
+    ] {
+        assert!(
+            !ONLINE_CONSUMPTION_V2.contains(forbidden),
+            "forbidden V1 fallback or authority in V2 consumption: {forbidden}"
+        );
+    }
+    assert!(!ONLINE_CONSUMPTION_V2.contains("verify_online_authorization_v2(config"));
+    assert!(
+        !ONLINE_CONSUMPTION_V2
+            .contains("_ => invalid(\"atomic V2 consume claim cannot be created safely\")")
+    );
+    assert!(PROTECTED.contains("OnlineAuthorizationConsumptionV2"));
+    assert!(LIB.contains("mod online_consumption_v2;"));
 }
 
 #[test]
