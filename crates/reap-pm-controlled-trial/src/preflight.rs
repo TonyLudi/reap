@@ -930,7 +930,6 @@ impl TrialPreflightEvidence {
             && reconciliation.account_wide_open_orders.complete
             && reconciliation.account_wide_open_orders.rows_observed == 0
             && reconciliation.account_wide_trades.complete
-            && reconciliation.account_wide_trades.rows_observed == 0
             && reconciliation.exact_details.complete
             && reconciliation.exact_details.implicated_order_id_count == 0
             && reconciliation.exact_details.exact_detail_count == 0
@@ -1704,6 +1703,11 @@ mod tests {
         let fixture = Fixture::new(TrialPhase::APlaceCancel);
         let mut evidence = evidence(&fixture.config, &fixture.authorization);
         assert_eq!(evidence.reconciliation.user_stream.business_event_count, 0);
+        assert!(validate_evidence(&fixture, &evidence).is_ok());
+
+        // A complete historical trade cut remains non-vacuous owner evidence;
+        // quiet current-epoch streaming must not require a never-used account.
+        evidence.reconciliation.account_wide_trades.rows_observed = 7;
         assert!(validate_evidence(&fixture, &evidence).is_ok());
 
         evidence
