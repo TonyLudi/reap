@@ -17,6 +17,7 @@ members = [
     "crates/reap-pm-readiness",
     "crates/reap-pm-controlled-trial",
     "crates/reap-pm-controlled-trial-live",
+    "crates/reap-pm-controlled-trial-runner",
     "crates/reap-polymarket-public-source",
     "crates/reap-polymarket-chain-source",
     "crates/reap-okx-public-source",

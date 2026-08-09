@@ -5,6 +5,7 @@ const GEOBLOCK_HTTP: &str = include_str!("../src/geoblock_http.rs");
 const HTTP_TRANSPORT: &str = include_str!("../src/http_transport.rs");
 const LOOPBACK_MUTATION_CREDENTIALS: &str = include_str!("../src/loopback_mutation_credentials.rs");
 const METADATA_HTTP: &str = include_str!("../src/metadata_http.rs");
+const OBSERVATION_CLOCK: &str = include_str!("../src/observation_clock.rs");
 const PRIVATE_HTTP: &str = include_str!("../src/private_http.rs");
 const PRIVATE_CREDENTIALS: &str = include_str!("../src/private_credentials.rs");
 const PRODUCT_CLOCK: &str = include_str!("../src/product_clock.rs");
@@ -31,6 +32,7 @@ fn phase3_foundation_has_only_role_specific_dependencies() {
         "futures-util.workspace = true",
         "tokio.workspace = true",
         "tokio-tungstenite.workspace = true",
+        "sha2.workspace = true",
         "sha3.workspace = true",
         "zeroize.workspace = true",
     ] {
@@ -55,6 +57,7 @@ fn modules_are_separate_and_raw_transport_remains_private() {
         "mod geoblock_http;",
         "mod http_transport;",
         "mod metadata_http;",
+        "mod observation_clock;",
         "mod private_http;",
         "mod private_credentials;",
         "mod product_clock;",
@@ -84,6 +87,78 @@ fn modules_are_separate_and_raw_transport_remains_private() {
     }
     assert!(CONFIG.contains("#[cfg(test)]\n    pub(crate) fn local_evidence"));
     assert!(!LIB.contains("local_evidence"));
+}
+
+#[test]
+fn public_preflight_observations_are_source_clocked_committed_and_sealed() {
+    for required in [
+        "pub struct PmHttpReceiveClock",
+        "pub(crate) struct PmHttpReceiveClockSource",
+        "SystemTime::now()",
+        "pub(crate) fn observe(&self) -> Result<PmHttpReceiveClock",
+        "pub async fn refresh_typed_observation(",
+        "let receive_clock = self.clock.observe()?;",
+        "LIVE_METADATA_OBSERVATION_COMMITMENT_DOMAIN",
+        "live_metadata_observation_commitment(",
+        "encode_metadata_bytes(&mut digest, market_bytes);",
+        "encode_metadata_bytes(&mut digest, clob_v2_bytes);",
+        "details.lifecycle()",
+        "details.clob()",
+        "pub async fn status_observation(&self)",
+        "GEOBLOCK_OBSERVATION_COMMITMENT_DOMAIN",
+        "geoblock_observation_commitment(",
+        "encode_geoblock_bytes(&mut digest, raw_response);",
+        "status.blocked()",
+        "status.ip()",
+        "origin_mode_name(mode)",
+    ] {
+        let source = [OBSERVATION_CLOCK, METADATA_HTTP, GEOBLOCK_HTTP].join("\n");
+        assert!(
+            source.contains(required),
+            "missing sealed public observation invariant: {required}"
+        );
+    }
+
+    for forbidden in [
+        "pub fn from_source(",
+        "pub const fn from_source_bytes(",
+        "pub fn raw_body(",
+        "pub const fn raw_body(",
+        "pub fn test_support_new(",
+        "PRODUCTION_ORDER_ENTRY_AUTHORIZED: bool = true",
+    ] {
+        let source = [OBSERVATION_CLOCK, METADATA_HTTP, GEOBLOCK_HTTP].join("\n");
+        assert!(
+            !source.contains(forbidden),
+            "public observation construction/raw/authority escape: {forbidden}"
+        );
+    }
+
+    let metadata_start = METADATA_HTTP
+        .find("pub struct PmLiveMetadataObservationCommitment")
+        .unwrap();
+    let metadata_end = METADATA_HTTP[metadata_start..]
+        .find("pub struct PmPublicMetadataHttpRole")
+        .map(|offset| metadata_start + offset)
+        .unwrap();
+    let metadata_carriers = &METADATA_HTTP[metadata_start..metadata_end];
+    for forbidden_field in ["market_bytes:", "clob_v2_bytes:", "raw_response:"] {
+        assert!(
+            !metadata_carriers.contains(forbidden_field),
+            "metadata carrier leaks native response bytes: {forbidden_field}"
+        );
+    }
+
+    let geoblock_start = GEOBLOCK_HTTP
+        .find("pub struct PmGeoblockObservationCommitment")
+        .unwrap();
+    let geoblock_end = GEOBLOCK_HTTP[geoblock_start..]
+        .find("pub struct PmGeoblockHttpRole")
+        .map(|offset| geoblock_start + offset)
+        .unwrap();
+    let geoblock_carriers = &GEOBLOCK_HTTP[geoblock_start..geoblock_end];
+    assert!(!geoblock_carriers.contains("raw_response:"));
+    assert!(!geoblock_carriers.contains("body:"));
 }
 
 #[test]

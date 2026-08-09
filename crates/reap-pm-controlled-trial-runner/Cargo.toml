@@ -1,0 +1,17 @@
+[package]
+name = "reap-pm-controlled-trial-runner"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "reap-pm-controlled-trial-runner"
+path = "src/main.rs"
+
+[dependencies]
+libc.workspace = true
+reap-polymarket-auth.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

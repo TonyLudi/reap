@@ -1,34 +1,158 @@
 use reap_polymarket_wire::{MAX_PM_GEOBLOCK_BODY_BYTES, PmGeoblockStatus, parse_pm_geoblock};
+use sha2::{Digest as _, Sha256};
 
 use crate::{
-    PmGeoblockHttpConfig, PmLiveAdapterError,
+    PM_GEOBLOCK_PRODUCTION_ORIGIN, PmGeoblockHttpConfig, PmHttpReceiveClock, PmLiveAdapterError,
+    config::OriginMode,
     http_transport::{PmHttpTransport, PmPublicRoute},
+    observation_clock::PmHttpReceiveClockSource,
 };
+
+const GEOBLOCK_OBSERVATION_COMMITMENT_DOMAIN: &[u8] =
+    b"reap.pm.live-adapter.geoblock-observation.v1\0";
+
+/// Domain-separated SHA-256 commitment to one fixed geoblock observation.
+/// It binds the production/evidence mode, exact route, raw response, parsed
+/// status, and source-captured receive edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PmGeoblockObservationCommitment([u8; 32]);
+
+impl PmGeoblockObservationCommitment {
+    const fn from_source_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+/// Sealed result of the fixed public geoblock source. The raw response is
+/// committed but cannot escape this carrier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PmGeoblockObservation {
+    status: PmGeoblockStatus,
+    receive_clock: PmHttpReceiveClock,
+    commitment: PmGeoblockObservationCommitment,
+}
+
+impl PmGeoblockObservation {
+    fn from_source(
+        status: PmGeoblockStatus,
+        receive_clock: PmHttpReceiveClock,
+        commitment: PmGeoblockObservationCommitment,
+    ) -> Self {
+        Self {
+            status,
+            receive_clock,
+            commitment,
+        }
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> &PmGeoblockStatus {
+        &self.status
+    }
+
+    #[must_use]
+    pub const fn receive_clock(&self) -> PmHttpReceiveClock {
+        self.receive_clock
+    }
+
+    #[must_use]
+    pub const fn commitment(&self) -> PmGeoblockObservationCommitment {
+        self.commitment
+    }
+
+    #[must_use]
+    pub fn into_status(self) -> PmGeoblockStatus {
+        self.status
+    }
+}
 
 /// Fixed public geoblock GET. It has no route, origin, body, retry, or mutation
 /// input after construction.
 pub struct PmGeoblockHttpRole {
     transport: PmHttpTransport,
+    mode: OriginMode,
+    clock: PmHttpReceiveClockSource,
 }
 
 impl PmGeoblockHttpRole {
     pub fn new(config: PmGeoblockHttpConfig) -> Result<Self, PmLiveAdapterError> {
+        let mode = config.mode();
         Ok(Self {
             transport: PmHttpTransport::geoblock(&config)?,
+            mode,
+            clock: PmHttpReceiveClockSource::system(),
         })
     }
 
     pub async fn status(&self) -> Result<PmGeoblockStatus, PmLiveAdapterError> {
+        Ok(self.status_observation().await?.into_status())
+    }
+
+    /// Fetch, source-time, strictly parse, and seal the fixed geoblock
+    /// response. The receive edge is sampled after the bounded body completes
+    /// and before parsing.
+    pub async fn status_observation(&self) -> Result<PmGeoblockObservation, PmLiveAdapterError> {
         let body = self
             .transport
             .get(PmPublicRoute::Geoblock, MAX_PM_GEOBLOCK_BODY_BYTES)
             .await?;
-        parse_pm_geoblock(&body).map_err(Into::into)
+        let receive_clock = self.clock.observe()?;
+        let status = parse_pm_geoblock(&body)?;
+        let commitment = geoblock_observation_commitment(self.mode, &body, &status, receive_clock);
+        Ok(PmGeoblockObservation::from_source(
+            status,
+            receive_clock,
+            commitment,
+        ))
     }
 
     #[must_use]
     pub const fn production_order_entry_authorized(&self) -> bool {
         false
+    }
+}
+
+fn geoblock_observation_commitment(
+    mode: OriginMode,
+    raw_response: &[u8],
+    status: &PmGeoblockStatus,
+    receive_clock: PmHttpReceiveClock,
+) -> PmGeoblockObservationCommitment {
+    let mut digest = Sha256::new();
+    encode_geoblock_bytes(&mut digest, GEOBLOCK_OBSERVATION_COMMITMENT_DOMAIN);
+    encode_geoblock_bytes(&mut digest, origin_mode_name(mode));
+    encode_geoblock_bytes(&mut digest, PM_GEOBLOCK_PRODUCTION_ORIGIN.as_bytes());
+    encode_geoblock_bytes(&mut digest, b"GET");
+    encode_geoblock_bytes(&mut digest, b"/api/geoblock");
+    digest.update(receive_clock.local_wall_receive_ns().to_be_bytes());
+    digest.update(receive_clock.monotonic_receive_ns().to_be_bytes());
+    encode_geoblock_bytes(&mut digest, raw_response);
+    digest.update([u8::from(status.blocked())]);
+    encode_geoblock_bytes(&mut digest, status.ip().to_string().as_bytes());
+    encode_geoblock_bytes(&mut digest, status.country().as_bytes());
+    encode_geoblock_bytes(&mut digest, status.region().as_bytes());
+    PmGeoblockObservationCommitment::from_source_bytes(digest.finalize().into())
+}
+
+fn encode_geoblock_bytes(digest: &mut Sha256, value: &[u8]) {
+    digest.update(
+        u64::try_from(value.len())
+            .expect("bounded geoblock commitment field length fits u64")
+            .to_be_bytes(),
+    );
+    digest.update(value);
+}
+
+const fn origin_mode_name(mode: OriginMode) -> &'static [u8] {
+    match mode {
+        OriginMode::Production => b"production",
+        #[cfg(any(test, feature = "loopback-evidence", feature = "read-only-evidence"))]
+        OriginMode::LocalEvidence => b"local-evidence",
     }
 }
 
@@ -153,6 +277,92 @@ mod tests {
         );
         task.await.unwrap();
         assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn observation_seals_status_at_the_source_receive_edge() {
+        let raw = br#"{"blocked":false,"ip":"203.0.113.9","country":"US","region":"NY"}"#;
+        let (origin, mut requests, task) = mock_server(vec![MockResponse::ok(raw)]).await;
+        let role = local_role(&origin, Duration::from_secs(1));
+        let observation = role.status_observation().await.unwrap();
+
+        assert!(!observation.status().blocked());
+        assert_eq!(observation.status().ip().to_string(), "203.0.113.9");
+        assert_eq!(observation.status().country(), "US");
+        assert_eq!(observation.status().region(), "NY");
+        assert!(observation.receive_clock().local_wall_receive_ns() > 0);
+        assert!(observation.receive_clock().monotonic_receive_ns() > 0);
+        assert_ne!(observation.commitment().bytes(), [0; 32]);
+        assert_eq!(
+            requests.recv().await.unwrap().lines().next(),
+            Some("GET /api/geoblock HTTP/1.1")
+        );
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn loopback_geoblock_commitment_changes_for_every_observed_input_class() {
+        let raw = br#"{"blocked":false,"ip":"203.0.113.9","country":"US","region":"NY"}"#;
+        let (origin, _requests, task) = mock_server(vec![MockResponse::ok(raw)]).await;
+        let role = local_role(&origin, Duration::from_secs(1));
+        let observation = role.status_observation().await.unwrap();
+        let received = observation.receive_clock();
+        let base = geoblock_observation_commitment(
+            OriginMode::LocalEvidence,
+            raw,
+            observation.status(),
+            received,
+        );
+        assert_eq!(base, observation.commitment());
+
+        assert_ne!(
+            base,
+            geoblock_observation_commitment(
+                OriginMode::Production,
+                raw,
+                observation.status(),
+                received,
+            )
+        );
+
+        let mut raw_mutation = raw.to_vec();
+        raw_mutation.push(b' ');
+        assert_ne!(
+            base,
+            geoblock_observation_commitment(
+                OriginMode::LocalEvidence,
+                &raw_mutation,
+                observation.status(),
+                received,
+            )
+        );
+
+        let alternate = parse_pm_geoblock(
+            br#"{"blocked":true,"ip":"203.0.113.9","country":"US","region":"NY"}"#,
+        )
+        .unwrap();
+        assert_ne!(
+            base,
+            geoblock_observation_commitment(OriginMode::LocalEvidence, raw, &alternate, received,)
+        );
+
+        let later_receive = loop {
+            let candidate = role.clock.observe().unwrap();
+            if candidate != received {
+                break candidate;
+            }
+            std::hint::spin_loop();
+        };
+        assert_ne!(
+            base,
+            geoblock_observation_commitment(
+                OriginMode::LocalEvidence,
+                raw,
+                observation.status(),
+                later_receive,
+            )
+        );
+        task.await.unwrap();
     }
 
     #[tokio::test]

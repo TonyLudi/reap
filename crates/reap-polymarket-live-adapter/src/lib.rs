@@ -18,6 +18,7 @@ mod http_transport;
 mod loopback_mutation_credentials;
 mod metadata_http;
 mod mutation;
+mod observation_clock;
 mod private_credentials;
 mod private_http;
 mod product_clock;
@@ -40,7 +41,9 @@ pub use config::{
     PmPrivateHttpConfig, PmPublicHttpConfig,
 };
 pub use error::{PmLiveAdapterError, PmPublicMetadataDeliveryError, PmRestBookDeliveryError};
-pub use geoblock_http::PmGeoblockHttpRole;
+pub use geoblock_http::{
+    PmGeoblockHttpRole, PmGeoblockObservation, PmGeoblockObservationCommitment,
+};
 #[cfg(any(test, feature = "loopback-evidence"))]
 pub use loopback_mutation_credentials::{
     PmLoopbackCancelAuthenticationFailure, PmLoopbackCancelAuthenticationRole,
@@ -49,7 +52,8 @@ pub use loopback_mutation_credentials::{
     PmLoopbackPlaceAuthenticationFailure, PmLoopbackPlaceAuthenticationRole,
 };
 pub use metadata_http::{
-    PmLiveMetadataPair, PmLiveMetadataPairSink, PmPublicMetadataHttpRole, PmTypedLiveMarketDetails,
+    PmLiveMetadataObservation, PmLiveMetadataObservationCommitment, PmLiveMetadataPair,
+    PmLiveMetadataPairSink, PmPublicMetadataHttpRole, PmTypedLiveMarketDetails,
 };
 pub use mutation::{
     PmCancelMutationOutcome, PmExactOwnedCancelLoopbackRole, PmFixedPlaceLoopbackRole,
@@ -57,6 +61,7 @@ pub use mutation::{
     PmMutationDiagnosticKind, PmMutationEdgeError, PmPlaceMutationOutcome,
     PmRetainedOwnedCancelRequest, PmRetainedPlaceRequest,
 };
+pub use observation_clock::PmHttpReceiveClock;
 pub use private_credentials::{
     PM_CREDENTIAL_AUTHORITY_DEFAULT_SHUTDOWN_BOUNDS,
     PM_CREDENTIAL_AUTHORITY_READ_ONLY_SHUTDOWN_BOUNDS, PmCredentialAuthorityShutdownBounds,

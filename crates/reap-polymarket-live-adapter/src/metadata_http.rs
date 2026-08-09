@@ -4,11 +4,18 @@ use reap_polymarket_wire::{
     MAX_PUBLIC_REST_BODY_BYTES, PmClobV2Metadata, PmClobV2RequestScope, PmLifecycleMetadata,
     PmWireScope, parse_live_clob_market_lifecycle, parse_live_clob_v2_metadata,
 };
+use sha2::{Digest as _, Sha256};
 
 use crate::{
-    PmLiveAdapterError, PmPublicHttpConfig, PmPublicMetadataDeliveryError,
+    PM_CLOB_PRODUCTION_ORIGIN, PmHttpReceiveClock, PmLiveAdapterError, PmPublicHttpConfig,
+    PmPublicMetadataDeliveryError,
+    config::OriginMode,
     http_transport::{PmHttpTransport, PmPublicRoute},
+    observation_clock::PmHttpReceiveClockSource,
 };
+
+const LIVE_METADATA_OBSERVATION_COMMITMENT_DOMAIN: &[u8] =
+    b"reap.pm.live-adapter.public-metadata-observation.v1\0";
 
 /// The two native public metadata bodies bound to one configured scope.
 /// Neither constituent body is delivered independently.
@@ -77,17 +84,96 @@ impl PmTypedLiveMarketDetails {
     }
 }
 
+/// Domain-separated SHA-256 commitment to one complete live metadata
+/// observation. It binds the fixed production/evidence mode, exact scope,
+/// ordered native response bodies, parsed lifecycle/CLOB facts, and the
+/// source-captured receive edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PmLiveMetadataObservationCommitment([u8; 32]);
+
+impl PmLiveMetadataObservationCommitment {
+    const fn from_source_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+/// Sealed parsed observation returned by the fixed two-route metadata source.
+/// Raw bodies participate in the commitment but cannot escape this carrier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PmLiveMetadataObservation {
+    details: PmTypedLiveMarketDetails,
+    receive_clock: PmHttpReceiveClock,
+    commitment: PmLiveMetadataObservationCommitment,
+}
+
+impl PmLiveMetadataObservation {
+    fn from_source(
+        details: PmTypedLiveMarketDetails,
+        receive_clock: PmHttpReceiveClock,
+        commitment: PmLiveMetadataObservationCommitment,
+    ) -> Self {
+        Self {
+            details,
+            receive_clock,
+            commitment,
+        }
+    }
+
+    #[must_use]
+    pub const fn details(&self) -> &PmTypedLiveMarketDetails {
+        &self.details
+    }
+
+    #[must_use]
+    pub const fn lifecycle(&self) -> &PmLifecycleMetadata {
+        self.details.lifecycle()
+    }
+
+    #[must_use]
+    pub const fn clob(&self) -> &PmClobV2Metadata {
+        self.details.clob()
+    }
+
+    #[must_use]
+    pub const fn receive_clock(&self) -> PmHttpReceiveClock {
+        self.receive_clock
+    }
+
+    #[must_use]
+    pub const fn commitment(&self) -> PmLiveMetadataObservationCommitment {
+        self.commitment
+    }
+
+    #[must_use]
+    pub fn into_details(self) -> PmTypedLiveMarketDetails {
+        self.details
+    }
+}
+
 /// Exact two-route public metadata capability for one configured PM outcome.
 #[derive(Clone)]
 pub struct PmPublicMetadataHttpRole {
     transport: PmHttpTransport,
     scope: PmWireScope,
+    mode: OriginMode,
+    clock: PmHttpReceiveClockSource,
 }
 
 impl PmPublicMetadataHttpRole {
     pub fn new(config: PmPublicHttpConfig, scope: PmWireScope) -> Result<Self, PmLiveAdapterError> {
+        let mode = config.mode();
         let transport = PmHttpTransport::new(&config)?;
-        Ok(Self { transport, scope })
+        Ok(Self {
+            transport,
+            scope,
+            mode,
+            clock: PmHttpReceiveClockSource::system(),
+        })
     }
 
     #[must_use]
@@ -119,13 +205,36 @@ impl PmPublicMetadataHttpRole {
 
     /// Fetch and strictly parse the complete configured market preflight pair.
     pub async fn refresh_typed(&self) -> Result<PmTypedLiveMarketDetails, PmLiveAdapterError> {
+        Ok(self.refresh_typed_observation().await?.into_details())
+    }
+
+    /// Fetch, source-time, strictly parse, and seal the complete configured
+    /// market preflight pair. The receive edge is sampled after the second
+    /// bounded body completes and before either body is parsed.
+    pub async fn refresh_typed_observation(
+        &self,
+    ) -> Result<PmLiveMetadataObservation, PmLiveAdapterError> {
         let (market_bytes, clob_v2_bytes) = self.fetch_pair().await?;
+        let receive_clock = self.clock.observe()?;
         let lifecycle = parse_live_clob_market_lifecycle(&market_bytes, self.scope)?;
         let clob = parse_live_clob_v2_metadata(
             &clob_v2_bytes,
             PmClobV2RequestScope::new(self.scope.condition(), self.scope.token()),
         )?;
-        Ok(PmTypedLiveMarketDetails { lifecycle, clob })
+        let details = PmTypedLiveMarketDetails { lifecycle, clob };
+        let commitment = live_metadata_observation_commitment(
+            self.mode,
+            self.scope,
+            &market_bytes,
+            &clob_v2_bytes,
+            &details,
+            receive_clock,
+        );
+        Ok(PmLiveMetadataObservation::from_source(
+            details,
+            receive_clock,
+            commitment,
+        ))
     }
 
     async fn fetch_pair(&self) -> Result<(Vec<u8>, Vec<u8>), PmLiveAdapterError> {
@@ -144,6 +253,117 @@ impl PmPublicMetadataHttpRole {
             )
             .await?;
         Ok((market_bytes, clob_v2_bytes))
+    }
+}
+
+fn live_metadata_observation_commitment(
+    mode: OriginMode,
+    scope: PmWireScope,
+    market_bytes: &[u8],
+    clob_v2_bytes: &[u8],
+    details: &PmTypedLiveMarketDetails,
+    receive_clock: PmHttpReceiveClock,
+) -> PmLiveMetadataObservationCommitment {
+    let mut digest = Sha256::new();
+    encode_metadata_bytes(&mut digest, LIVE_METADATA_OBSERVATION_COMMITMENT_DOMAIN);
+    encode_metadata_bytes(&mut digest, origin_mode_name(mode));
+    encode_metadata_bytes(&mut digest, PM_CLOB_PRODUCTION_ORIGIN.as_bytes());
+    encode_metadata_bytes(&mut digest, b"GET");
+    encode_metadata_bytes(&mut digest, b"/markets/{condition_id}");
+    encode_metadata_bytes(&mut digest, b"GET");
+    encode_metadata_bytes(&mut digest, b"/clob-markets/{condition_id}");
+
+    digest.update(scope.condition().bytes());
+    digest.update(scope.market().bytes());
+    digest.update(scope.token().units().to_be_bytes());
+    digest.update(receive_clock.local_wall_receive_ns().to_be_bytes());
+    digest.update(receive_clock.monotonic_receive_ns().to_be_bytes());
+
+    // Response order is protocol-significant: long market first, abbreviated
+    // CLOB details second.
+    encode_metadata_bytes(&mut digest, market_bytes);
+    encode_metadata_bytes(&mut digest, clob_v2_bytes);
+
+    let lifecycle = details.lifecycle();
+    digest.update(lifecycle.condition().bytes());
+    digest.update(lifecycle.market().bytes());
+    let state = lifecycle.lifecycle();
+    digest.update([
+        u8::from(state.active()),
+        u8::from(state.closed()),
+        u8::from(state.archived()),
+        u8::from(state.accepting_orders()),
+        u8::from(state.order_book_enabled()),
+    ]);
+
+    let clob = details.clob();
+    digest.update(clob.requested_condition().bytes());
+    match clob.reported_condition() {
+        Some(condition) => {
+            digest.update([1]);
+            digest.update(condition.bytes());
+        }
+        None => digest.update([0]),
+    }
+    digest.update(
+        u32::try_from(clob.tokens().len())
+            .expect("bounded CLOB token count fits u32")
+            .to_be_bytes(),
+    );
+    for token in clob.tokens() {
+        digest.update(token.token().units().to_be_bytes());
+        encode_metadata_bytes(&mut digest, token.label().as_str().as_bytes());
+    }
+    let configured_outcome = clob.configured_outcome();
+    digest.update(configured_outcome.token().units().to_be_bytes());
+    encode_metadata_bytes(&mut digest, configured_outcome.label().as_str().as_bytes());
+    digest.update(clob.tick().units().to_be_bytes());
+    digest.update(clob.minimum_order_size().protocol_units().to_be_bytes());
+    digest.update([u8::from(clob.negative_risk())]);
+    digest.update(clob.maker_base_fee_bps().to_be_bytes());
+    digest.update(clob.taker_base_fee_bps().to_be_bytes());
+    encode_optional_metadata_ascii(
+        &mut digest,
+        clob.fee_details().rate().map(|value| value.as_str()),
+    );
+    encode_optional_metadata_ascii(
+        &mut digest,
+        clob.fee_details().exponent().map(|value| value.as_str()),
+    );
+    match clob.fee_details().taker_only() {
+        Some(value) => digest.update([1, u8::from(value)]),
+        None => digest.update([0]),
+    }
+    digest.update([u8::from(clob.take_only_delay_enabled())]);
+    digest.update(clob.minimum_order_age_seconds().to_be_bytes());
+
+    PmLiveMetadataObservationCommitment::from_source_bytes(digest.finalize().into())
+}
+
+fn encode_metadata_bytes(digest: &mut Sha256, value: &[u8]) {
+    digest.update(
+        u64::try_from(value.len())
+            .expect("bounded metadata commitment field length fits u64")
+            .to_be_bytes(),
+    );
+    digest.update(value);
+}
+
+fn encode_optional_metadata_ascii(digest: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            digest.update([1]);
+            encode_metadata_bytes(digest, value.as_bytes());
+        }
+        None => digest.update([0]),
+    }
+}
+
+const fn origin_mode_name(mode: OriginMode) -> &'static [u8] {
+    match mode {
+        OriginMode::Production => b"production",
+        #[cfg(any(test, feature = "loopback-evidence", feature = "read-only-evidence"))]
+        OriginMode::LocalEvidence => b"local-evidence",
     }
 }
 
@@ -328,6 +548,149 @@ mod tests {
         assert_eq!(
             requests.recv().await.unwrap(),
             format!("GET /clob-markets/{CONDITION} HTTP/1.1")
+        );
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_observation_seals_the_ordered_pair_at_the_source_receive_edge() {
+        let market = long_market();
+        let clob = short_market();
+        let (origin, mut requests, task) =
+            mock_server(vec![MockResponse::ok(market), MockResponse::ok(clob)]).await;
+        let role = local_role(&origin);
+        let observation = role.refresh_typed_observation().await.unwrap();
+
+        assert_eq!(observation.lifecycle().condition(), scope().condition());
+        assert_eq!(observation.lifecycle().market(), scope().market());
+        assert_eq!(
+            observation.clob().configured_outcome().token(),
+            scope().token()
+        );
+        assert!(observation.receive_clock().local_wall_receive_ns() > 0);
+        assert!(observation.receive_clock().monotonic_receive_ns() > 0);
+        assert_ne!(observation.commitment().bytes(), [0; 32]);
+        assert_eq!(
+            requests.recv().await.unwrap(),
+            format!("GET /markets/{CONDITION} HTTP/1.1")
+        );
+        assert_eq!(
+            requests.recv().await.unwrap(),
+            format!("GET /clob-markets/{CONDITION} HTTP/1.1")
+        );
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn loopback_metadata_commitment_changes_for_every_observed_input_class() {
+        let market = long_market();
+        let clob = short_market();
+        let (origin, _requests, task) = mock_server(vec![
+            MockResponse::ok(market.clone()),
+            MockResponse::ok(clob.clone()),
+        ])
+        .await;
+        let role = local_role(&origin);
+        let observation = role.refresh_typed_observation().await.unwrap();
+        let received = observation.receive_clock();
+        let base = live_metadata_observation_commitment(
+            OriginMode::LocalEvidence,
+            scope(),
+            market.as_bytes(),
+            clob.as_bytes(),
+            observation.details(),
+            received,
+        );
+        assert_eq!(base, observation.commitment());
+
+        assert_ne!(
+            base,
+            live_metadata_observation_commitment(
+                OriginMode::Production,
+                scope(),
+                market.as_bytes(),
+                clob.as_bytes(),
+                observation.details(),
+                received,
+            )
+        );
+
+        let alternate_scope = PmWireScope::new(
+            scope().condition(),
+            scope().market(),
+            PmTokenId::new(U256::from_u64(456)).unwrap(),
+        );
+        assert_ne!(
+            base,
+            live_metadata_observation_commitment(
+                OriginMode::LocalEvidence,
+                alternate_scope,
+                market.as_bytes(),
+                clob.as_bytes(),
+                observation.details(),
+                received,
+            )
+        );
+
+        let raw_mutation = format!("{market} ");
+        assert_ne!(
+            base,
+            live_metadata_observation_commitment(
+                OriginMode::LocalEvidence,
+                scope(),
+                raw_mutation.as_bytes(),
+                clob.as_bytes(),
+                observation.details(),
+                received,
+            )
+        );
+        assert_ne!(
+            base,
+            live_metadata_observation_commitment(
+                OriginMode::LocalEvidence,
+                scope(),
+                clob.as_bytes(),
+                market.as_bytes(),
+                observation.details(),
+                received,
+            )
+        );
+
+        let inactive_market = market.replace("\"active\":true", "\"active\":false");
+        let inactive_details = PmTypedLiveMarketDetails {
+            lifecycle: parse_live_clob_market_lifecycle(inactive_market.as_bytes(), scope())
+                .unwrap(),
+            clob: observation.clob().clone(),
+        };
+        assert_ne!(
+            base,
+            live_metadata_observation_commitment(
+                OriginMode::LocalEvidence,
+                scope(),
+                market.as_bytes(),
+                clob.as_bytes(),
+                &inactive_details,
+                received,
+            )
+        );
+
+        let later_receive = loop {
+            let candidate = role.clock.observe().unwrap();
+            if candidate != received {
+                break candidate;
+            }
+            std::hint::spin_loop();
+        };
+        assert_ne!(
+            base,
+            live_metadata_observation_commitment(
+                OriginMode::LocalEvidence,
+                scope(),
+                market.as_bytes(),
+                clob.as_bytes(),
+                observation.details(),
+                later_receive,
+            )
         );
         task.await.unwrap();
     }
